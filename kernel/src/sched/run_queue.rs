@@ -14,10 +14,6 @@
 //! disables interrupts while held, preventing timer-driven deadlock.
 //! Acquire before any `enqueue`, `dequeue_highest`, or `set_current` call.
 //!
-//! # TODO Phase 9
-//! - Invoke `arch::current::gdt::set_rsp0` (x86-64) or update `sscratch` (RISC-V)
-//!   with `next_tcb.kernel_stack_top` inside `context_switch`.
-//!
 //! # TODO (SMP)
 //! - Implement `load_balance` across CPUs.
 //! - Add `preemption_pending: bool` flag per CPU.

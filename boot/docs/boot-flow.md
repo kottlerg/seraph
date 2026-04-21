@@ -234,8 +234,8 @@ until the kernel installs its own. SSE/AVX are not initialised.
 5. JALR to kernel_entry — does not return
 ```
 
-Secondary harts remain in the UEFI firmware's spin loop or halted state. The kernel
-will release them during SMP bringup (WSMP work item) via SBI HSM calls.
+Secondary harts remain in the UEFI firmware's spin loop or halted state until the
+kernel releases them via SBI HSM calls during SMP bringup.
 
 ---
 

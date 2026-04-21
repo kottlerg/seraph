@@ -34,8 +34,8 @@ pub fn kernel_version(_ctx: &TestContext) -> TestResult
 
 /// `system_info(CpuCount)` returns a value ≥ 1.
 ///
-/// The exact count depends on the QEMU `-smp` setting and whether SMP has
-/// been initialised. Until WSMP (SMP) the kernel reports 1 regardless.
+/// The exact count reflects the number of APs that successfully started
+/// in addition to the BSP, so it tracks the QEMU `-smp` setting.
 pub fn cpu_count(_ctx: &TestContext) -> TestResult
 {
     let cpus =

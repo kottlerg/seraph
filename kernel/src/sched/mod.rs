@@ -42,8 +42,9 @@ pub const NUM_PRIORITY_LEVELS: usize = 32;
 /// Priority assigned to idle threads.
 pub const IDLE_PRIORITY: u8 = 0;
 
-/// Default time-slice length in preemption-timer ticks.
-/// TODO Phase 9: decrement in the timer interrupt handler.
+/// Default time-slice length in preemption-timer ticks. Decremented by
+/// `timer_tick` on every tick; a thread is preempted when its counter
+/// reaches zero.
 pub const TIME_SLICE_TICKS: u32 = 10;
 
 /// Number of 4 KiB pages in each idle thread's kernel stack (16 KiB total).
@@ -70,9 +71,10 @@ pub const INIT_PRIORITY: u8 = 15;
 /// initialised by `init`.
 ///
 /// # Safety
-/// Accessed exclusively from the owning CPU after SMP bringup (WSMP).
-/// During Phase 8 there is only one CPU, so no concurrent access is possible.
-// SAFETY: single-threaded Phase 8 boot; real per-CPU locks required for WSMP.
+/// Each `PerCpuScheduler` is accessed only from its owning CPU. Trap-time
+/// access from the same CPU (timer, IPC wakeup) is serialised by the
+/// scheduler's inner `lock`; see `schedule` for the locking discipline.
+// SAFETY: per-CPU ownership plus per-scheduler lock covers all accesses.
 #[cfg(not(test))]
 static mut SCHEDULERS: [PerCpuScheduler; MAX_CPUS] = {
     // Manual const-init: PerCpuScheduler is not Copy, so we cannot use
@@ -772,8 +774,8 @@ unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 
 /// Select the next thread to run and switch to it.
 ///
-/// Called from `sys_yield`, timer preemption, and the idle thread. On a
-/// single CPU (until WSMP) this always uses `SCHEDULERS[0]`.
+/// Called from `sys_yield`, timer preemption, and the idle thread. Uses
+/// the current CPU's entry in `SCHEDULERS` (indexed by `current_cpu()`).
 ///
 /// `requeue_current`: if `true`, the current thread is placed back in the
 /// run queue at its priority (timer preemption, yield). If `false`, the

@@ -138,13 +138,13 @@ are never reassigned or reused.
                                 48  SYS_CAP_DERIVE_TOKEN
 ```
 
-**W6 implementation status:** Handlers implemented as of W6: 0–9 (IPC,
-signal, event queue creation and I/O), 7–8 (endpoint/signal creation),
-10–13 (thread, aspace, cspace, wait set creation), 14–18 (cap management
-and memory), 21–28 (thread lifecycle, wait set operations), 29–30 (IRQ ACK
-and register), 31–36 (cap delete/insert, frame split, MMIO map, ioport bind,
-DMA grant), 41–43 (aspace query, ipc buffer set, system info).
-All other numbers return `UnknownSyscall`.
+**Implementation status.** Handlers implemented: 0–9 (IPC, signal, event
+queue creation and I/O), 7–8 (endpoint/signal creation), 10–13 (thread,
+aspace, cspace, wait set creation), 14–18 (cap management and memory),
+21–28 (thread lifecycle, wait set operations), 29–30 (IRQ ACK and
+register), 31–36 (cap delete/insert, frame split, MMIO map, ioport bind,
+DMA grant), 41–43 (aspace query, ipc buffer set, system info). All other
+numbers return `UnknownSyscall`.
 
 ---
 

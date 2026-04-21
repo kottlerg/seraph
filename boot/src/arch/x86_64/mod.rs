@@ -48,7 +48,7 @@ pub unsafe fn discover_boot_hart_id(_st: *mut EfiSystemTable) -> u64
 /// bits and valid for systems with up to 256 logical CPUs.
 ///
 /// For x2APIC systems (> 256 CPUs), CPUID leaf 0x0B would be needed, but
-/// Seraph WSMP is limited to 64 CPUs so xAPIC IDs suffice.
+/// Seraph is capped at 64 CPUs (`MAX_CPUS`) so xAPIC IDs suffice.
 #[cfg(not(test))]
 pub fn bsp_hardware_id() -> u32
 {

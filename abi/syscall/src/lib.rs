@@ -216,7 +216,7 @@ pub const PRIORITY_MAX: u8 = 30;
 /// IOMMU-isolated and accepts the security implications.
 ///
 /// Required when no IOMMU is present (or not configured for the device).
-// TODO(W6-deferred): When an IOMMU driver is added, this flag is ignored for
+// TODO(iommu): When an IOMMU driver is added, this flag is ignored for
 // devices covered by an active IOMMU domain; it only applies to the
 // no-IOMMU fallback path. Pick up alongside the VT-d / IOMMU driver.
 pub const FLAG_DMA_UNSAFE: u64 = 1 << 2;

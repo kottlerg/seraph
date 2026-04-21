@@ -19,7 +19,7 @@
 /// CPU entry contract changes in a non-backwards-compatible way.
 ///
 /// v4: Added `cpu_count`, `bsp_id`, `cpu_ids`, and `ap_trampoline_page` for
-///     SMP bringup (WSMP work item).
+///     SMP bringup.
 pub const BOOT_PROTOCOL_VERSION: u32 = 4;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
@@ -434,7 +434,7 @@ mod tests
         assert_eq!(FramebufferInfo::empty().pixel_format, PixelFormat::Rgbx8);
     }
 
-    /// BOOT_PROTOCOL_VERSION must be 4 after the SMP (WSMP) cpu_count addition.
+    /// BOOT_PROTOCOL_VERSION must be 4 after the SMP cpu_count addition.
     #[test]
     fn protocol_version_is_4()
     {

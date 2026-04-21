@@ -1396,7 +1396,7 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(token) }
 }
 
-// ── Hardware access wrappers (W6) ─────────────────────────────────────────────
+// ── Hardware access wrappers ──────────────────────────────────────────────────
 
 /// Bind `signal_cap` to receive notifications when `irq_cap`'s interrupt fires.
 ///
@@ -1545,7 +1545,8 @@ pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Res
 /// Set a thread's CPU affinity.
 ///
 /// `cpu_id` must be a valid CPU ID or `u32::MAX` (clear affinity / any CPU).
-/// On single-CPU systems this is recorded but not yet enforced until WSMP.
+/// Takes effect on the thread's next enqueue. A thread already running
+/// on or queued on another CPU is not actively migrated.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid or

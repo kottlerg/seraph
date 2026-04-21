@@ -18,7 +18,7 @@
 //! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall).
 //! - Phase 6: validate `platform_resources` slice; reject malformed entries before capability minting.
 //! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps.
-//! - Phase 8: initialise per-CPU scheduler state and idle threads (BSP only; SMP in WSMP work item).
+//! - Phase 8: initialise per-CPU scheduler state and per-CPU idle threads for all online CPUs.
 //! - Phase 9: create init process address space + TCB; hand off root `CSpace`; enter user mode.
 
 #![cfg_attr(not(test), no_std)]

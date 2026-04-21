@@ -3,7 +3,7 @@
 
 // kernel/src/syscall/ipc.rs
 
-//! IPC syscall handlers — W4.
+//! IPC syscall handlers.
 //!
 //! All handlers look up the target capability in the current thread's `CSpace`,
 //! call the corresponding IPC kernel function, and enqueue/dequeue threads
@@ -12,7 +12,7 @@
 //! Data words (up to `MSG_DATA_WORDS_MAX`) are read from / written to the
 //! per-thread IPC buffer page registered via `SYS_IPC_BUFFER_SET`.
 //!
-//! Capability transfer (W4): up to `MSG_CAP_SLOTS_MAX` capabilities can be moved
+//! Capability transfer: up to `MSG_CAP_SLOTS_MAX` capabilities can be moved
 //! atomically with each message. See `transfer_caps` for the protocol.
 
 #[cfg(not(test))]

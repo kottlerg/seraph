@@ -258,7 +258,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             {
                 // Thread is in a run queue or currently running. Set state to Stopped;
                 // the scheduler's skip loop will handle it on the next context switch.
-                // TODO(Phase-11): send IPI when target is running on another CPU.
+                // TODO(SMP): send IPI when target is running on another CPU.
             }
         }
 
@@ -510,8 +510,11 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = Thread cap index (must have CONTROL).
 /// arg1 = CPU ID, or `AFFINITY_ANY` (`u32::MAX`) to clear hard affinity.
 ///
-/// The change is recorded immediately. On single-CPU systems this is a
-/// bookkeeping operation; WSMP (SMP) will enforce it during migration.
+/// Takes effect on the thread's next enqueue (`select_target_cpu`
+/// consults `cpu_affinity`). A thread that is currently running on or
+/// queued on another CPU is not migrated.
+/// TODO(SMP): active migration so affinity changes apply to already-
+/// running or already-queued threads.
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]

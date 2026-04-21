@@ -18,7 +18,7 @@ use crate::util::step;
 
 const SECTOR_SIZE: u64 = 512;
 
-/// Both partitions are 128 MiB. Debug binaries have grown (allocsmoke added
+/// Both partitions are 128 MiB. Debug binaries have grown (usertest added
 /// alloc-crate codegen, bringing total ESP contents close to the old 64 MiB
 /// limit); release builds remain comfortable well under half of this.
 const PARTITION_SIZE: u64 = 128 * 1024 * 1024;
@@ -253,7 +253,7 @@ fn write_gpt(image_path: &Path) -> Result<()>
 /// Skips `.arch`, `NvVars`, and the `esp` subdirectory (which is the ESP
 /// mount point, not root content) when populating.
 fn format_and_populate_partition(image_path: &Path, start_lba: u64, source_dir: &Path)
-    -> Result<()>
+-> Result<()>
 {
     let offset = start_lba * SECTOR_SIZE;
 

@@ -6,62 +6,177 @@
 //! Build command: cross-compile Seraph components and populate the sysroot.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::{BuildArgs, BuildComponent};
 use crate::context::Context as BuildContext;
+use crate::rust_src;
 use crate::sysroot;
 use crate::util::{find_llvm_objcopy, run_cmd, step};
 
-// Modules built with the kernel target triple, placed under EFI/seraph/.
-// All modules follow the same build pattern: `-p <name> --bin <name>`, output
-// at target/<triple>/<profile>/<name>, sysroot dest EFI/seraph/<name>.
-//
-// TODO: rework to support per-module configuration (different output paths,
-// target triples, sysroot destinations, extra build flags). For now every
-// module uses the same kernel target and flags.
-const MODULES: &[&str] = &[
-    "procmgr",
-    "devmgr",
-    "vfsd",
-    "virtio-blk",
-    "fatfs",
-    "crasher",
-    "allocsmoke",
+// ── Component classification ──────────────────────────────────────────────────
+
+/// Build profile for a component.
+///
+/// Determines the target triple and the `-Z build-std` component list.
+/// The bootloader is special-cased — see [`build_boot`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildProfile
+{
+    /// The microkernel itself. Kernel triple, `core+alloc+compiler_builtins`.
+    Kernel,
+    /// Low-level userspace that bootstraps std or stays on core+alloc
+    /// deliberately (init, procmgr, ktest). Kernel triple,
+    /// `core+alloc+compiler_builtins`.
+    LowLevelUser,
+    /// Std-enabled userspace service. Uses `user_target_triple` +
+    /// `core+alloc+std+panic_abort` through the overlaid ruststd mirror.
+    StdUser,
+}
+
+/// Where the built binary is installed in the sysroot.
+#[derive(Clone, Copy, Debug)]
+enum InstallDest
+{
+    /// Installed under `sysroot/EFI/seraph/<name>` — boot modules loaded by
+    /// the bootloader.
+    EfiSeraph,
+    /// Installed under `sysroot/bin/<name>` — loaded by procmgr from the
+    /// root partition via VFS at runtime.
+    RootfsBin,
+}
+
+/// Static description of a single buildable component (other than boot).
+struct Spec
+{
+    /// Cargo package/bin name (they match for every component today).
+    name: &'static str,
+    profile: BuildProfile,
+    dest: InstallDest,
+}
+
+/// Every buildable component except `boot`. Order matters for `All` builds:
+/// kernel → init → ktest → procmgr → dependent services → rootfs binaries.
+const SPECS: &[Spec] = &[
+    Spec {
+        name: "kernel",
+        profile: BuildProfile::Kernel,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "init",
+        profile: BuildProfile::LowLevelUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "ktest",
+        profile: BuildProfile::LowLevelUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "procmgr",
+        profile: BuildProfile::LowLevelUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "devmgr",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "vfsd",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "virtio-blk",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "fatfs",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "crasher",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "usertest",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "svcmgr",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+    },
+    Spec {
+        name: "hello",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+    },
+    Spec {
+        name: "stdiotest",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+    },
 ];
+
+fn spec_for(component: BuildComponent) -> Option<&'static Spec>
+{
+    let name = match component
+    {
+        BuildComponent::Boot | BuildComponent::All => return None,
+        BuildComponent::Kernel => "kernel",
+        BuildComponent::Init => "init",
+        BuildComponent::Ktest => "ktest",
+        BuildComponent::Procmgr => "procmgr",
+        BuildComponent::Devmgr => "devmgr",
+        BuildComponent::Vfsd => "vfsd",
+        BuildComponent::VirtioBlk => "virtio-blk",
+        BuildComponent::Fatfs => "fatfs",
+        BuildComponent::Crasher => "crasher",
+        BuildComponent::Usertest => "usertest",
+        BuildComponent::Svcmgr => "svcmgr",
+        BuildComponent::Hello => "hello",
+        BuildComponent::Stdiotest => "stdiotest",
+    };
+    SPECS.iter().find(|s| s.name == name)
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Entry point for `cargo xtask build`.
 pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
     sysroot::check_arch(ctx, args.arch)?;
-    fmt_workspace(ctx)?;
+    if !args.skip_lints
+    {
+        fmt_workspace(ctx)?;
+    }
 
     match args.component
     {
         BuildComponent::Boot => build_boot(ctx, args)?,
-        BuildComponent::Kernel => build_kernel(ctx, args)?,
-        BuildComponent::Init => build_init(ctx, args)?,
-        BuildComponent::Ktest => build_ktest(ctx, args)?,
-        BuildComponent::Procmgr => build_module(ctx, args, "procmgr")?,
-        BuildComponent::Devmgr => build_module(ctx, args, "devmgr")?,
-        BuildComponent::Vfsd => build_module(ctx, args, "vfsd")?,
-        BuildComponent::VirtioBlk => build_module(ctx, args, "virtio-blk")?,
-        BuildComponent::Fatfs => build_module(ctx, args, "fatfs")?,
-        BuildComponent::Crasher => build_module(ctx, args, "crasher")?,
         BuildComponent::All =>
         {
             build_boot(ctx, args)?;
-            build_kernel(ctx, args)?;
-            build_init(ctx, args)?;
-            build_ktest(ctx, args)?;
-            build_modules(ctx, args)?;
-            build_rootfs_binaries(ctx, args)?;
+            build_all_specs(ctx, args)?;
             sysroot::install_rootfs(ctx)?;
             crate::disk::create_disk_image(ctx)?;
+        }
+        c =>
+        {
+            let spec = spec_for(c)
+                .with_context(|| format!("no build spec registered for component {c:?}"))?;
+            build_spec(ctx, args, spec)?;
         }
     }
 
@@ -71,7 +186,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     Ok(())
 }
 
-// ── Component builders ────────────────────────────────────────────────────────
+// ── Bootloader (special-cased: RISC-V objcopy + dual install path) ────────────
 
 fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
@@ -97,7 +212,10 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         flags.push("--release");
     }
 
-    clippy_check(ctx, &flags)?;
+    if !args.skip_lints
+    {
+        clippy_check(ctx, &flags)?;
+    }
 
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags);
@@ -169,275 +287,240 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     Ok(())
 }
 
-fn build_kernel(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
+// ── Grouped component build ───────────────────────────────────────────────────
+
+/// Build every non-boot component, one `cargo build` invocation per
+/// [`BuildProfile`]. A single cargo invocation walks the dependency graph
+/// once, re-uses one `-Z build-std` cache, and shares fingerprint work
+/// across packages — on a no-change tree this turns roughly
+/// `N_specs × 5s` of cargo re-entry overhead into a single pass.
+fn build_all_specs(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
+    // Preserve SPECS ordering inside each group so initial-boot output
+    // order (kernel → init → ktest → procmgr → StdUser …) is stable.
+    for profile in [
+        BuildProfile::Kernel,
+        BuildProfile::LowLevelUser,
+        BuildProfile::StdUser,
+    ]
+    {
+        let group: Vec<&Spec> = SPECS.iter().filter(|s| s.profile == profile).collect();
+        if group.is_empty()
+        {
+            continue;
+        }
+        build_group(ctx, args, profile, &group)?;
+    }
+    Ok(())
+}
+
+fn build_group(
+    ctx: &BuildContext,
+    args: &BuildArgs,
+    profile: BuildProfile,
+    group: &[&Spec],
+) -> Result<()>
+{
+    let (triple, build_std, needs_seraph_rustc) = profile_params(args.arch, profile);
+    let names: Vec<&str> = group.iter().map(|s| s.name).collect();
+
     step(&format!(
-        "Building kernel for {} ({})",
+        "Building {} ({:?}) for {} ({})",
+        names.join(", "),
+        profile,
         args.arch,
         profile_name(args.release)
     ));
 
-    let triple = args.arch.kernel_target_triple();
-    let mut flags = vec![
-        "-p",
-        "kernel",
-        "--bin",
-        "kernel",
-        "--target",
-        triple,
-        "-Zbuild-std=core,alloc,compiler_builtins",
-        "-Zbuild-std-features=compiler-builtins-mem",
-    ];
+    let build_std_flag = format!("-Zbuild-std={build_std}");
+    let mut flags: Vec<String> = Vec::new();
+    for name in &names
+    {
+        flags.push("-p".into());
+        flags.push((*name).to_string());
+        flags.push("--bin".into());
+        flags.push((*name).to_string());
+    }
+    flags.extend([
+        "--target".into(),
+        triple.into(),
+        build_std_flag,
+        "-Zbuild-std-features=compiler-builtins-mem".into(),
+    ]);
     if args.release
     {
-        flags.push("--release");
+        flags.push("--release".into());
     }
 
-    clippy_check(ctx, &flags)?;
+    let seraph: Option<rust_src::SeraphToolchain> = if needs_seraph_rustc
+    {
+        Some(
+            rust_src::ensure_seraph_toolchain(ctx)
+                .context("materialising seraph toolchain mirror")?,
+        )
+    }
+    else
+    {
+        None
+    };
+
+    let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
+    if !args.skip_lints
+    {
+        clippy_check_ext(ctx, &flags_ref, seraph.as_ref())?;
+    }
 
     let mut cmd = cargo(&ctx.root);
-    cmd.arg("build").args(&flags);
+    cmd.arg("build").args(&flags_ref);
+    if let Some(s) = seraph.as_ref()
+    {
+        cmd.env("RUSTC", &s.rustc);
+        cmd.env("RUSTC_BOOTSTRAP", "1");
+    }
     run_cmd(&mut cmd)?;
 
-    let cargo_out = ctx.cargo_output_dir(triple, args.release).join("kernel");
-    if !cargo_out.exists()
+    // Install each spec's binary from the shared cargo output directory.
+    for spec in group
     {
-        bail!("expected kernel binary not found: {}", cargo_out.display());
+        let cargo_out = ctx.cargo_output_dir(triple, args.release).join(spec.name);
+        if !cargo_out.exists()
+        {
+            bail!(
+                "expected {} binary not found: {}",
+                spec.name,
+                cargo_out.display()
+            );
+        }
+        let dst = install_path(ctx, spec)?;
+        if let Some(parent) = dst.parent()
+        {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        copy_file(&cargo_out, &dst)?;
+        step(&format!("{}: {}", spec.name, dst.display()));
     }
-
-    let dst = ctx.sysroot_efi_seraph().join("kernel");
-    fs::create_dir_all(ctx.sysroot_efi_seraph())
-        .with_context(|| format!("creating {}", ctx.sysroot_efi_seraph().display()))?;
-    copy_file(&cargo_out, &dst)?;
-    step(&format!("Kernel: {}", dst.display()));
 
     Ok(())
 }
 
-fn build_init(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
+// ── Single component build ────────────────────────────────────────────────────
+
+/// Build a single component per its [`Spec`] and install to the sysroot.
+fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
 {
+    let (triple, build_std, needs_seraph_rustc) = profile_params(args.arch, spec.profile);
+
     step(&format!(
-        "Building init for {} ({})",
+        "Building {} ({:?}) for {} ({})",
+        spec.name,
+        spec.profile,
         args.arch,
         profile_name(args.release)
     ));
 
-    let triple = args.arch.kernel_target_triple();
-    let mut flags = vec![
-        "-p",
-        "init",
-        "--bin",
-        "init",
-        "--target",
-        triple,
-        "-Zbuild-std=core,alloc,compiler_builtins",
-        "-Zbuild-std-features=compiler-builtins-mem",
+    let build_std_flag = format!("-Zbuild-std={build_std}");
+    let mut flags: Vec<String> = vec![
+        "-p".into(),
+        spec.name.into(),
+        "--bin".into(),
+        spec.name.into(),
+        "--target".into(),
+        triple.into(),
+        build_std_flag,
+        "-Zbuild-std-features=compiler-builtins-mem".into(),
     ];
     if args.release
     {
-        flags.push("--release");
+        flags.push("--release".into());
     }
 
-    clippy_check(ctx, &flags)?;
+    // StdUser builds materialise the seraph toolchain mirror and point
+    // RUSTC at the mirror's rustc wrapper so `-Z build-std` reads our
+    // overlay. Clippy additionally needs RUSTC_WORKSPACE_WRAPPER pointed
+    // at the mirror's ws-clippy wrapper; see rust_src.rs for why.
+    // Default (non-StdUser) builds leave both env vars alone.
+    let seraph: Option<rust_src::SeraphToolchain> = if needs_seraph_rustc
+    {
+        Some(
+            rust_src::ensure_seraph_toolchain(ctx)
+                .context("materialising seraph toolchain mirror")?,
+        )
+    }
+    else
+    {
+        None
+    };
+
+    let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
+    if !args.skip_lints
+    {
+        clippy_check_ext(ctx, &flags_ref, seraph.as_ref())?;
+    }
 
     let mut cmd = cargo(&ctx.root);
-    cmd.arg("build").args(&flags);
+    cmd.arg("build").args(&flags_ref);
+    if let Some(s) = seraph.as_ref()
+    {
+        cmd.env("RUSTC", &s.rustc);
+        // StdUser bins sit on a custom target ("seraph") that rustc does not
+        // recognise in its built-in list, which makes the whole std surface
+        // `restricted_std`-gated. They also see `ProcessInfo`-derived
+        // helpers that feel "sysroot-private" when their backing crates
+        // (process-abi, syscall, ipc, va_layout) get loaded as std deps.
+        // Setting RUSTC_BOOTSTRAP=1 for the build treats those gates as
+        // unlocked — matches how hermit and other tier-3 custom-std
+        // targets ship. Service code stays free of feature preambles.
+        cmd.env("RUSTC_BOOTSTRAP", "1");
+    }
     run_cmd(&mut cmd)?;
 
-    let cargo_out = ctx.cargo_output_dir(triple, args.release).join("init");
-    if !cargo_out.exists()
-    {
-        bail!("expected init binary not found: {}", cargo_out.display());
-    }
-
-    let dst = ctx.sysroot_efi_seraph().join("init");
-    fs::create_dir_all(ctx.sysroot_efi_seraph())
-        .with_context(|| format!("creating {}", ctx.sysroot_efi_seraph().display()))?;
-    copy_file(&cargo_out, &dst)?;
-    step(&format!("Init: {}", dst.display()));
-
-    Ok(())
-}
-
-fn build_ktest(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
-{
-    step(&format!(
-        "Building ktest for {} ({})",
-        args.arch,
-        profile_name(args.release)
-    ));
-
-    let triple = args.arch.kernel_target_triple();
-    let mut flags = vec![
-        "-p",
-        "ktest",
-        "--bin",
-        "ktest",
-        "--target",
-        triple,
-        "-Zbuild-std=core,alloc,compiler_builtins",
-        "-Zbuild-std-features=compiler-builtins-mem",
-    ];
-    if args.release
-    {
-        flags.push("--release");
-    }
-
-    clippy_check(ctx, &flags)?;
-
-    let mut cmd = cargo(&ctx.root);
-    cmd.arg("build").args(&flags);
-    run_cmd(&mut cmd)?;
-
-    let cargo_out = ctx.cargo_output_dir(triple, args.release).join("ktest");
-    if !cargo_out.exists()
-    {
-        bail!("expected ktest binary not found: {}", cargo_out.display());
-    }
-
-    let dst = ctx.sysroot_efi_seraph().join("ktest");
-    fs::create_dir_all(ctx.sysroot_efi_seraph())
-        .with_context(|| format!("creating {}", ctx.sysroot_efi_seraph().display()))?;
-    copy_file(&cargo_out, &dst)?;
-    step(&format!("Ktest: {}", dst.display()));
-
-    Ok(())
-}
-
-/// Build a single module and copy it to the sysroot.
-///
-/// All modules use the same kernel target triple and build flags. `name` must
-/// match the crate's `package.name` in Cargo.toml and the desired sysroot
-/// filename under `EFI/seraph/`.
-///
-/// If a module ever needs special treatment (different target, extra flags,
-/// different sysroot path), extract it into its own build function — same
-/// pattern as `build_boot`, `build_kernel`, and `build_init` above.
-fn build_module(ctx: &BuildContext, args: &BuildArgs, name: &str) -> Result<()>
-{
-    step(&format!(
-        "Building {} for {} ({})",
-        name,
-        args.arch,
-        profile_name(args.release)
-    ));
-
-    let triple = args.arch.kernel_target_triple();
-    let mut flags = vec![
-        "-p",
-        name,
-        "--bin",
-        name,
-        "--target",
-        triple,
-        "-Zbuild-std=core,alloc,compiler_builtins",
-        "-Zbuild-std-features=compiler-builtins-mem",
-    ];
-    if args.release
-    {
-        flags.push("--release");
-    }
-
-    clippy_check(ctx, &flags)?;
-
-    let mut cmd = cargo(&ctx.root);
-    cmd.arg("build").args(&flags);
-    run_cmd(&mut cmd)?;
-
-    let cargo_out = ctx.cargo_output_dir(triple, args.release).join(name);
-    if !cargo_out.exists()
-    {
-        bail!(
-            "expected {} binary not found: {}",
-            name,
-            cargo_out.display()
-        );
-    }
-
-    let dst = ctx.sysroot_efi_seraph().join(name);
-    fs::create_dir_all(ctx.sysroot_efi_seraph())
-        .with_context(|| format!("creating {}", ctx.sysroot_efi_seraph().display()))?;
-    copy_file(&cargo_out, &dst)?;
-    step(&format!("{}: {}", name, dst.display()));
-
-    Ok(())
-}
-
-/// Build all modules listed in `MODULES`.
-fn build_modules(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
-{
-    for &name in MODULES
-    {
-        build_module(ctx, args, name)?;
-    }
-    Ok(())
-}
-
-/// Binaries installed to the root partition (loaded from VFS, not boot modules).
-const ROOTFS_BINARIES: &[&str] = &["svcmgr"];
-
-/// Build binaries that are installed to the root filesystem (not boot modules).
-///
-/// These are loaded by procmgr via VFS at runtime, not by the bootloader.
-fn build_rootfs_binaries(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
-{
-    for &name in ROOTFS_BINARIES
-    {
-        build_rootfs_binary(ctx, args, name)?;
-    }
-    Ok(())
-}
-
-/// Build a binary and install it to the sysroot root partition at `/bin/<name>`.
-fn build_rootfs_binary(ctx: &BuildContext, args: &BuildArgs, name: &str) -> Result<()>
-{
-    step(&format!(
-        "Building {} (rootfs) for {} ({})",
-        name,
-        args.arch,
-        profile_name(args.release)
-    ));
-
-    let triple = args.arch.kernel_target_triple();
-    let mut flags = vec![
-        "-p",
-        name,
-        "--bin",
-        name,
-        "--target",
-        triple,
-        "-Zbuild-std=core,alloc,compiler_builtins",
-        "-Zbuild-std-features=compiler-builtins-mem",
-    ];
-    if args.release
-    {
-        flags.push("--release");
-    }
-
-    clippy_check(ctx, &flags)?;
-
-    let mut cmd = cargo(&ctx.root);
-    cmd.arg("build").args(&flags);
-    run_cmd(&mut cmd)?;
-
-    let cargo_out = ctx.cargo_output_dir(triple, args.release).join(name);
+    let cargo_out = ctx.cargo_output_dir(triple, args.release).join(spec.name);
     if !cargo_out.exists()
     {
         bail!(
             "expected {} binary not found: {}",
-            name,
+            spec.name,
             cargo_out.display()
         );
     }
 
-    // Install to sysroot/bin/ (root partition, not ESP).
-    let bin_dir = ctx.sysroot.join("bin");
-    fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
-    let dst = bin_dir.join(name);
+    let dst = install_path(ctx, spec)?;
+    if let Some(parent) = dst.parent()
+    {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
     copy_file(&cargo_out, &dst)?;
-    step(&format!("{} (rootfs): {}", name, dst.display()));
+    step(&format!("{}: {}", spec.name, dst.display()));
 
     Ok(())
+}
+
+/// Resolve profile → (target triple, build-std component list, needs patched
+/// rust-src).
+fn profile_params(arch: Arch, profile: BuildProfile) -> (&'static str, &'static str, bool)
+{
+    match profile
+    {
+        BuildProfile::Kernel | BuildProfile::LowLevelUser => (
+            arch.kernel_target_triple(),
+            "core,alloc,compiler_builtins",
+            false,
+        ),
+        BuildProfile::StdUser => (
+            arch.user_target_triple(),
+            "core,alloc,std,panic_abort",
+            true,
+        ),
+    }
+}
+
+fn install_path(ctx: &BuildContext, spec: &Spec) -> Result<PathBuf>
+{
+    Ok(match spec.dest
+    {
+        InstallDest::EfiSeraph => ctx.sysroot_efi_seraph().join(spec.name),
+        InstallDest::RootfsBin => ctx.sysroot.join("bin").join(spec.name),
+    })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -456,8 +539,53 @@ fn fmt_workspace(ctx: &BuildContext) -> Result<()>
 /// are enforced on every component build — not just on dedicated lint passes.
 fn clippy_check(ctx: &BuildContext, flags: &[&str]) -> Result<()>
 {
+    clippy_check_ext(ctx, flags, None)
+}
+
+/// Clippy invocation that optionally wires the seraph toolchain mirror so
+/// StdUser lints see the overlaid `std::sys::seraph`.
+///
+/// For non-StdUser builds this is a straightforward `cargo clippy -- -D
+/// warnings`. For StdUser builds the path differs: `cargo clippy` hard-
+/// sets `RUSTC_WORKSPACE_WRAPPER=clippy-driver` itself, clobbering any
+/// value callers set. That baked-in clippy-driver reports the real rustup
+/// sysroot regardless of `RUSTC`, so cargo's build-std probe reads std
+/// from rustup instead of our mirror and the overlay never takes effect.
+/// To keep our wrapper in place we drive clippy ourselves: `cargo check`
+/// with `RUSTC_WORKSPACE_WRAPPER=<ws-clippy>` runs the mirror-aware
+/// wrapper on every workspace crate, and `CLIPPY_ARGS` feeds the same
+/// lint args that `cargo clippy -- …` would pass through.
+fn clippy_check_ext(
+    ctx: &BuildContext,
+    flags: &[&str],
+    seraph: Option<&rust_src::SeraphToolchain>,
+) -> Result<()>
+{
     let mut cmd = cargo(&ctx.root);
-    cmd.arg("clippy").args(flags).args(["--", "-D", "warnings"]);
+    match seraph
+    {
+        Some(s) =>
+        {
+            cmd.arg("check").args(flags);
+            cmd.env("RUSTC", &s.rustc);
+            cmd.env("RUSTC_WORKSPACE_WRAPPER", &s.ws_clippy);
+            // Match the `cargo build` env: unlock `restricted_std` +
+            // `rustc_private` gates so service code stays preamble-free.
+            cmd.env("RUSTC_BOOTSTRAP", "1");
+            // Clippy-driver splits CLIPPY_ARGS on __CLIPPY_HACKERY__; this
+            // matches the encoding cargo-clippy uses internally when
+            // forwarding post-`--` args.
+            cmd.env(
+                "CLIPPY_ARGS",
+                "__CLIPPY_HACKERY__-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__",
+            );
+        }
+        None =>
+        {
+            cmd.arg("clippy").args(flags);
+            cmd.args(["--", "-D", "warnings"]);
+        }
+    }
     run_cmd(&mut cmd)
 }
 
@@ -480,12 +608,5 @@ fn copy_file(src: &Path, dst: &Path) -> Result<()>
 /// Human-readable profile name matching Cargo's output directory naming.
 fn profile_name(release: bool) -> &'static str
 {
-    if release
-    {
-        "release"
-    }
-    else
-    {
-        "debug"
-    }
+    if release { "release" } else { "debug" }
 }

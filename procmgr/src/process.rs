@@ -13,7 +13,8 @@ use crate::frames::{FramePool, PAGE_SIZE};
 use crate::loader::{self, TEMP_FRAME_VA, TEMP_MODULE_VA, TEMP_VFS_VA};
 use ipc::procmgr_errors;
 use process_abi::{
-    PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, PROCESS_STACK_PAGES, PROCESS_STACK_TOP,
+    PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, PROCESS_MAIN_TLS_MAX_PAGES, PROCESS_MAIN_TLS_VADDR,
+    PROCESS_STACK_PAGES, PROCESS_STACK_TOP,
 };
 
 /// IPC buffer VA for child processes.
@@ -25,7 +26,13 @@ const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 /// Next token value (monotonically increasing, never zero).
 static NEXT_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
-const MAX_PROCESSES: usize = 32;
+/// Maximum concurrent child processes procmgr tracks.
+///
+/// Independent of any wait-set capacity — the shared death queue fans in
+/// all children's exit events with kernel-side multi-bind, so there is no
+/// per-child wait-set slot. Raise this (and the death queue capacity in
+/// `main.rs`) as real workloads demand.
+pub const MAX_PROCESSES: usize = 32;
 
 // ── Process table ───────────────────────────────────────────────────────────
 
@@ -38,7 +45,9 @@ pub struct ProcessEntry
     cspace_cap: u32,
     thread_cap: u32,
     pi_frame_cap: u32,
+    tls_frame_cap: u32,
     entry_point: u64,
+    tls_base_va: u64,
     started: bool,
     frames_allocated: u32,
 }
@@ -78,6 +87,52 @@ impl ProcessTable
             .filter_map(|s| s.as_mut())
             .find(|e| e.token == token)
     }
+
+    fn take_by_token(&mut self, token: u64) -> Option<ProcessEntry>
+    {
+        for slot in &mut self.entries
+        {
+            if let Some(entry) = slot.as_ref()
+                && entry.token == token
+            {
+                return slot.take();
+            }
+        }
+        None
+    }
+
+    /// Remove and return the entry whose token matches `correlator` in its
+    /// low 32 bits. Used by the auto-reap dispatch to resolve a death event
+    /// back to its process. Stale correlators (entry already reaped)
+    /// return `None`; callers drop such events silently.
+    #[allow(dead_code)]
+    fn take_by_correlator(&mut self, correlator: u32) -> Option<ProcessEntry>
+    {
+        for slot in &mut self.entries
+        {
+            if let Some(entry) = slot.as_ref()
+                && (entry.token as u32) == correlator
+            {
+                return slot.take();
+            }
+        }
+        None
+    }
+
+    /// Lightweight status lookup for `QUERY_PROCESS`. Returns `started` as
+    /// a bool when an entry is present; `None` if the token is unknown
+    /// (already reaped or never existed).
+    ///
+    /// Exit-reason reporting is deferred until auto-reap lands and stores
+    /// it on the entry during the death path.
+    pub fn query_by_token(&self, token: u64) -> Option<bool>
+    {
+        self.entries
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .find(|e| e.token == token)
+            .map(|e| e.started)
+    }
 }
 
 // ── Result type ─────────────────────────────────────────────────────────────
@@ -93,13 +148,103 @@ pub struct CreateResult
 
 // ── Child setup helpers ─────────────────────────────────────────────────────
 
+/// Universal bootstrap caps procmgr threads through into every child.
+///
+/// `procmgr_endpoint` is procmgr's own service endpoint (the child receives
+/// a tokened SEND copy so it can call `REQUEST_FRAMES`). `log_endpoint` is
+/// the un-tokened SEND cap procmgr holds on the system log endpoint;
+/// procmgr derives per-child tokened SEND caps from it for stdout/stderr.
+/// Zero `log_endpoint` means no log sink is available (very early boot).
+pub struct UniversalCaps
+{
+    pub procmgr_endpoint: u32,
+    pub log_endpoint: u32,
+}
+
+/// Program arguments delivered to a child process at spawn time.
+///
+/// `blob` is a concatenation of `count` NUL-terminated UTF-8 strings. Empty
+/// slice + zero count means "no argv". See `project_argv_env_invariants.md`:
+/// plain data only, no caps, no security-relevant content, capped to what
+/// fits in the `ProcessInfo` page after the struct.
+#[derive(Clone, Copy, Default)]
+pub struct ChildArgs<'a>
+{
+    pub blob: &'a [u8],
+    pub count: u32,
+}
+
+/// Environment variables delivered to a child process at spawn time.
+///
+/// Same shape as [`ChildArgs`] except each entry is `KEY=VALUE`. Empty
+/// slice + zero count means "no env". Same page-remainder bound.
+#[derive(Clone, Copy, Default)]
+pub struct ChildEnv<'a>
+{
+    pub blob: &'a [u8],
+    pub count: u32,
+}
+
+/// Per-child stdio configuration accompanying a `CREATE_PROCESS` call.
+///
+/// `stdio_token` is the unforgeable identity attached to the child's
+/// stdout/stderr SEND caps via `cap_derive_token`. The receiver of the
+/// stdio bytes (currently init's log thread, later logd) reads this token
+/// from each IPC message to attribute the bytes to a sender. Zero means
+/// "anonymous" — procmgr falls back to an un-tokened SEND copy.
+///
+/// `stdin_cap` is the RECEIVE-side cap the child uses for `std::io::stdin`.
+/// Zero means "no stdin attached"; reads return EOF immediately. Common
+/// case for services spawned by init or svcmgr.
+#[derive(Clone, Copy, Default)]
+pub struct ChildStdio
+{
+    pub stdio_token: u64,
+    pub stdin_cap: u32,
+}
+
+/// TLS template metadata extracted from a child's `PT_TLS` segment,
+/// propagated verbatim into `ProcessInfo` for spawned-thread block
+/// population. `memsz == 0` signals "binary has no TLS segment".
+#[derive(Clone, Copy, Default)]
+pub struct ChildTlsTemplate
+{
+    pub vaddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+    pub align: u64,
+}
+
+/// Result of `prepare_main_tls`: the frame cap procmgr retains for teardown
+/// plus the `tls_base` VA to pass to `SYS_THREAD_CONFIGURE`.
+///
+/// Both fields are zero when the child has no `PT_TLS` segment.
+#[derive(Clone, Copy, Default)]
+pub struct MainTls
+{
+    pub frame_cap: u32,
+    pub base_va: u64,
+}
+
 /// Populate a `ProcessInfo` page for a child process and map it read-only.
 ///
 /// Installs the creator endpoint cap (if any) into the child `CSpace` and
-/// records its slot in the child's `ProcessInfo`. The cap identifies the
-/// creator so the child can issue bootstrap requests on it.
+/// records its slot in the child's `ProcessInfo`. Also installs the two
+/// universal caps (procmgr service endpoint + log endpoint) so the child's
+/// `_start` can bootstrap the heap and log without a service-specific
+/// bootstrap round. Caps supplied as zero are propagated as zero.
 // similar_names: child_aspace/child_cspace are intentionally parallel.
-#[allow(clippy::similar_names)]
+// too_many_arguments: each cluster is a small fixed-size bundle; collapsing
+// them into one struct shifts the verbosity to the call sites without
+// reducing the total parameter count. too_many_lines: this is the single
+// transaction that owns the temporary mapping at TEMP_FRAME_VA — splitting
+// would require threading the partial state through helpers that all need
+// the same self_aspace + child_cspace + write context.
+#[allow(
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn populate_child_info(
     pool: &mut FramePool,
     self_aspace: u32,
@@ -107,6 +252,11 @@ fn populate_child_info(
     child_cspace: u32,
     child_thread: u32,
     creator_endpoint: u32,
+    universals: &UniversalCaps,
+    tls: &ChildTlsTemplate,
+    args: &ChildArgs<'_>,
+    env: &ChildEnv<'_>,
+    stdio: &ChildStdio,
 ) -> Option<u32>
 {
     let pi_frame = pool.alloc_page()?;
@@ -143,6 +293,65 @@ fn populate_child_info(
         0
     };
 
+    // procmgr's own service endpoint: install a SEND+GRANT copy so the child
+    // can use it for `REQUEST_FRAMES` (send-only) and `CREATE_PROCESS` (needs
+    // grant to transfer the module frame and creator endpoint in the same
+    // call). Zero when procmgr has no procmgr above it — e.g. procmgr itself,
+    // when init populates its `ProcessInfo`.
+    let procmgr_ep_in_child = if universals.procmgr_endpoint != 0
+    {
+        syscall::cap_copy(
+            universals.procmgr_endpoint,
+            child_cspace,
+            syscall::RIGHTS_SEND_GRANT,
+        )
+        .ok()?
+    }
+    else
+    {
+        0
+    };
+
+    // Per-child stdio caps. stdout and stderr are derived from the log
+    // endpoint with the per-spawn token so the receiver can attribute
+    // bytes to a sender without on-wire self-identification. They share
+    // the same kernel cap (different CSpace slots, same underlying
+    // endpoint + token). stdin is the RECV cap the spawner produced for
+    // this child, or zero (EOF on read).
+    let (stdout_in_child, stderr_in_child) = if universals.log_endpoint != 0
+    {
+        let intermediate = if stdio.stdio_token != 0
+        {
+            syscall::cap_derive_token(
+                universals.log_endpoint,
+                syscall::RIGHTS_SEND,
+                stdio.stdio_token,
+            )
+            .ok()?
+        }
+        else
+        {
+            syscall::cap_derive(universals.log_endpoint, syscall::RIGHTS_SEND).ok()?
+        };
+        let out_slot = syscall::cap_copy(intermediate, child_cspace, syscall::RIGHTS_SEND).ok()?;
+        let err_slot = syscall::cap_copy(intermediate, child_cspace, syscall::RIGHTS_SEND).ok()?;
+        let _ = syscall::cap_delete(intermediate);
+        (out_slot, err_slot)
+    }
+    else
+    {
+        (0, 0)
+    };
+
+    let stdin_in_child = if stdio.stdin_cap != 0
+    {
+        syscall::cap_copy(stdio.stdin_cap, child_cspace, syscall::RIGHTS_RECEIVE).ok()?
+    }
+    else
+    {
+        0
+    };
+
     // SAFETY: TEMP_FRAME_VA is page-aligned and mapped writable.
     let pi = unsafe { process_abi::process_info_mut(TEMP_FRAME_VA) };
     pi.version = PROCESS_ABI_VERSION;
@@ -151,6 +360,77 @@ fn populate_child_info(
     pi.self_cspace_cap = child_cspace_in_child;
     pi.ipc_buffer_vaddr = CHILD_IPC_BUF_VA;
     pi.creator_endpoint_cap = creator_ep_in_child;
+    pi.procmgr_endpoint_cap = procmgr_ep_in_child;
+    pi.stdin_cap = stdin_in_child;
+    pi.stdout_cap = stdout_in_child;
+    pi.stderr_cap = stderr_in_child;
+    pi.tls_template_vaddr = tls.vaddr;
+    pi.tls_template_filesz = tls.filesz;
+    pi.tls_template_memsz = tls.memsz;
+    pi.tls_template_align = tls.align;
+
+    // Write the argv blob, then the env blob, into the page region
+    // following the struct. Each blob begins at a u64-aligned offset so
+    // std can read whole words safely; both must fit inside the remaining
+    // page bytes — caller validates size before reaching here.
+    let pi_size = core::mem::size_of::<process_abi::ProcessInfo>() as u64;
+    let args_offset = (pi_size + 7) & !7;
+    let args_end = if args.count > 0 && !args.blob.is_empty()
+    {
+        let blob_len = args.blob.len() as u64;
+        if args_offset + blob_len > PAGE_SIZE
+        {
+            let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+            return None;
+        }
+        // SAFETY: range within the mapped page; source is plain bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                args.blob.as_ptr(),
+                (TEMP_FRAME_VA + args_offset) as *mut u8,
+                args.blob.len(),
+            );
+        }
+        pi.args_offset = args_offset as u32;
+        pi.args_bytes = args.blob.len() as u32;
+        pi.args_count = args.count;
+        args_offset + blob_len
+    }
+    else
+    {
+        pi.args_offset = 0;
+        pi.args_bytes = 0;
+        pi.args_count = 0;
+        args_offset
+    };
+
+    let env_offset = (args_end + 7) & !7;
+    if env.count > 0 && !env.blob.is_empty()
+    {
+        let blob_len = env.blob.len() as u64;
+        if env_offset + blob_len > PAGE_SIZE
+        {
+            let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+            return None;
+        }
+        // SAFETY: range within the mapped page; source is plain bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                env.blob.as_ptr(),
+                (TEMP_FRAME_VA + env_offset) as *mut u8,
+                env.blob.len(),
+            );
+        }
+        pi.env_offset = env_offset as u32;
+        pi.env_bytes = env.blob.len() as u32;
+        pi.env_count = env.count;
+    }
+    else
+    {
+        pi.env_offset = 0;
+        pi.env_bytes = 0;
+        pi.env_count = 0;
+    }
 
     let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
 
@@ -158,6 +438,163 @@ fn populate_child_info(
     syscall::mem_map(pi_ro, child_aspace, PROCESS_INFO_VADDR, 0, 1, 0).ok()?;
 
     Some(pi_frame)
+}
+
+/// Intermediate state returned by [`alloc_main_tls_frame`] — a frame mapped
+/// writable at [`TEMP_FRAME_VA`] plus the layout numbers needed to populate
+/// it and to finalise the mapping into the child.
+#[derive(Clone, Copy)]
+struct MainTlsAlloc
+{
+    frame_cap: u32,
+    tls_base_offset: u64,
+    tls_base_va: u64,
+}
+
+/// Allocate a frame for the main thread's TLS block, map it writable in
+/// procmgr's own aspace at [`TEMP_FRAME_VA`], and zero it.
+///
+/// Returns `None` when the binary has no TLS, when the block exceeds the
+/// single-frame budget, or when alignment demands would outrun the page
+/// mapping. Callers write the `.tdata` template starting at `TEMP_FRAME_VA`
+/// and then call [`finalize_main_tls`] to install the TCB self-pointer and
+/// remap the frame into the child.
+fn alloc_main_tls_frame(
+    pool: &mut FramePool,
+    self_aspace: u32,
+    tls: &ChildTlsTemplate,
+) -> Option<MainTlsAlloc>
+{
+    let (block_size, block_align, tls_base_offset) =
+        process_abi::tls_block_layout(tls.memsz, tls.align);
+
+    if block_size == 0
+        || block_size > PAGE_SIZE * PROCESS_MAIN_TLS_MAX_PAGES
+        || block_size > PAGE_SIZE
+        || block_align > PAGE_SIZE
+    {
+        return None;
+    }
+
+    let tls_frame = pool.alloc_page()?;
+    syscall::mem_map(
+        tls_frame,
+        self_aspace,
+        TEMP_FRAME_VA,
+        0,
+        1,
+        syscall::MAP_WRITABLE,
+    )
+    .ok()?;
+
+    // SAFETY: TEMP_FRAME_VA is mapped writable for one page.
+    unsafe { core::ptr::write_bytes(TEMP_FRAME_VA as *mut u8, 0, PAGE_SIZE as usize) };
+
+    Some(MainTlsAlloc {
+        frame_cap: tls_frame,
+        tls_base_offset,
+        tls_base_va: PROCESS_MAIN_TLS_VADDR + tls_base_offset,
+    })
+}
+
+/// Install the TCB self-pointer at `TEMP_FRAME_VA + tls_base_offset`, unmap
+/// the scratch mapping from procmgr's aspace, derive an RW cap, and map
+/// the block into the child at [`PROCESS_MAIN_TLS_VADDR`].
+fn finalize_main_tls(alloc: MainTlsAlloc, self_aspace: u32, child_aspace: u32) -> Option<MainTls>
+{
+    // SAFETY: TEMP_FRAME_VA is mapped writable for one page; the block fits.
+    unsafe {
+        process_abi::tls_install_tcb(
+            TEMP_FRAME_VA as *mut u8,
+            alloc.tls_base_offset,
+            alloc.tls_base_va,
+        );
+    }
+
+    let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+
+    let tls_rw = syscall::cap_derive(alloc.frame_cap, syscall::RIGHTS_MAP_RW).ok()?;
+    syscall::mem_map(tls_rw, child_aspace, PROCESS_MAIN_TLS_VADDR, 0, 1, 0).ok()?;
+
+    Some(MainTls {
+        frame_cap: alloc.frame_cap,
+        base_va: alloc.tls_base_va,
+    })
+}
+
+/// Allocate, populate from an in-memory `.tdata` slice, and map the main
+/// thread's TLS block. Wraps the two-phase helpers above for the
+/// create-from-bytes path.
+fn prepare_main_tls_from_bytes(
+    pool: &mut FramePool,
+    self_aspace: u32,
+    child_aspace: u32,
+    tls: &ChildTlsTemplate,
+    template_bytes: &[u8],
+) -> Option<MainTls>
+{
+    if tls.memsz == 0
+    {
+        return Some(MainTls::default());
+    }
+    if template_bytes.len() > PAGE_SIZE as usize
+    {
+        return None;
+    }
+    let alloc = alloc_main_tls_frame(pool, self_aspace, tls)?;
+    // SAFETY: TEMP_FRAME_VA is mapped writable; length was bounded above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            template_bytes.as_ptr(),
+            TEMP_FRAME_VA as *mut u8,
+            template_bytes.len(),
+        );
+    }
+    finalize_main_tls(alloc, self_aspace, child_aspace)
+}
+
+/// Allocate, populate by streaming `.tdata` from an open VFS file handle,
+/// and map the main thread's TLS block.
+fn prepare_main_tls_from_vfs(
+    pool: &mut FramePool,
+    self_aspace: u32,
+    child_aspace: u32,
+    tls: &ChildTlsTemplate,
+    file_offset: u64,
+    file_cap: u32,
+    ipc_buf: *mut u64,
+) -> Option<MainTls>
+{
+    if tls.memsz == 0
+    {
+        return Some(MainTls::default());
+    }
+    let alloc = alloc_main_tls_frame(pool, self_aspace, tls)?;
+
+    let mut read_pos: u64 = 0;
+    while read_pos < tls.filesz
+    {
+        let chunk = VFS_CHUNK_SIZE.min(tls.filesz - read_pos);
+        let bytes_read = vfs_read(file_cap, ipc_buf, file_offset + read_pos, chunk)?;
+        if bytes_read == 0
+        {
+            let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+            return None;
+        }
+        let safe_len = (bytes_read as u64).min(tls.filesz - read_pos) as usize;
+        // SAFETY: ipc_buf data[1..] contains file data; TEMP_FRAME_VA mapped
+        // writable; (read_pos + safe_len) <= tls.filesz <= PAGE_SIZE.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ipc_buf.add(1) as *const u8,
+                (TEMP_FRAME_VA as *mut u8).add(read_pos as usize),
+                safe_len,
+            );
+        }
+        read_pos += safe_len as u64;
+    }
+
+    finalize_main_tls(alloc, self_aspace, child_aspace)
 }
 
 /// Map stack and IPC buffer pages into a child address space.
@@ -216,11 +653,20 @@ fn finalize_creation(
     child_thread: u32,
     pi_frame_cap: u32,
     entry_point: u64,
+    main_tls: MainTls,
     table: &mut ProcessTable,
     self_endpoint: u32,
+    death_eq: u32,
 ) -> Option<CreateResult>
 {
     let token = NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    // Procmgr auto-reap death-notification bind is temporarily disabled —
+    // adding procmgr as a second observer on spawn-path threads (where the
+    // spawner's ruststd also binds) surfaces a hang that has not yet been
+    // root-caused. Kernel multi-bind is proven working via svcmgr (crasher
+    // path). Re-enable once the interaction is diagnosed.
+    let _ = death_eq;
 
     // Derive a tokened endpoint cap for the caller. The token identifies this
     // process on subsequent START_PROCESS / REQUEST_FRAMES calls.
@@ -234,7 +680,9 @@ fn finalize_creation(
         cspace_cap: child_cspace,
         thread_cap: child_thread,
         pi_frame_cap,
+        tls_frame_cap: main_tls.frame_cap,
         entry_point,
+        tls_base_va: main_tls.base_va,
         started: false,
         frames_allocated: pool.allocated_pages - pages_before,
     });
@@ -257,6 +705,11 @@ fn create_process_from_bytes(
     table: &mut ProcessTable,
     self_endpoint: u32,
     creator_endpoint: u32,
+    universals: &UniversalCaps,
+    args: &ChildArgs<'_>,
+    env: &ChildEnv<'_>,
+    stdio: &ChildStdio,
+    death_eq: u32,
 ) -> Option<CreateResult>
 {
     let pages_before = pool.allocated_pages;
@@ -297,6 +750,38 @@ fn create_process_from_bytes(
         }
     }
 
+    let tls_seg = elf::tls_segment(ehdr, module_bytes).ok()?;
+    let tls_template = tls_seg
+        .map(|s| ChildTlsTemplate {
+            vaddr: s.vaddr,
+            filesz: s.filesz,
+            memsz: s.memsz,
+            align: s.align,
+        })
+        .unwrap_or_default();
+
+    let main_tls = if let Some(seg) = tls_seg
+        && tls_template.memsz != 0
+    {
+        let start = seg.offset as usize;
+        let end = start + seg.filesz as usize;
+        if end > module_bytes.len()
+        {
+            return None;
+        }
+        prepare_main_tls_from_bytes(
+            pool,
+            self_aspace,
+            child_aspace,
+            &tls_template,
+            &module_bytes[start..end],
+        )?
+    }
+    else
+    {
+        MainTls::default()
+    };
+
     let pi_frame_cap = populate_child_info(
         pool,
         self_aspace,
@@ -304,6 +789,11 @@ fn create_process_from_bytes(
         child_cspace,
         child_thread,
         creator_endpoint,
+        universals,
+        &tls_template,
+        args,
+        env,
+        stdio,
     )?;
     map_child_stack_and_ipc(pool, child_aspace)?;
 
@@ -315,14 +805,17 @@ fn create_process_from_bytes(
         child_thread,
         pi_frame_cap,
         entry,
+        main_tls,
         table,
         self_endpoint,
+        death_eq,
     )
 }
 
 /// Create a process from an ELF module frame cap (suspended).
 ///
 /// Maps the frame, delegates to `create_process_from_bytes`, then unmaps.
+#[allow(clippy::too_many_arguments)]
 pub fn create_process(
     module_frame_cap: u32,
     pool: &mut FramePool,
@@ -330,6 +823,11 @@ pub fn create_process(
     table: &mut ProcessTable,
     self_endpoint: u32,
     creator_endpoint: u32,
+    universals: &UniversalCaps,
+    args: &ChildArgs<'_>,
+    env: &ChildEnv<'_>,
+    stdio: &ChildStdio,
+    death_eq: u32,
 ) -> Option<CreateResult>
 {
     let module_pages = loader::map_module(module_frame_cap, self_aspace)?;
@@ -346,6 +844,11 @@ pub fn create_process(
         table,
         self_endpoint,
         creator_endpoint,
+        universals,
+        args,
+        env,
+        stdio,
+        death_eq,
     );
 
     let _ = syscall::mem_unmap(self_aspace, TEMP_MODULE_VA, module_pages);
@@ -534,7 +1037,11 @@ fn stream_segment_to_frame(
 // (vfs_open/stat/read/close, load_elf_page_streaming, populate_child_info,
 // map_child_stack_and_ipc, finalize_creation); what remains is the linear
 // orchestration.
-#[allow(clippy::similar_names, clippy::too_many_lines)]
+#[allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 pub fn create_process_from_vfs(
     ctx: &crate::ProcmgrCtx,
     path: &[u8],
@@ -542,6 +1049,10 @@ pub fn create_process_from_vfs(
     table: &mut ProcessTable,
     ipc_buf: *mut u64,
     creator_endpoint: u32,
+    args: &ChildArgs<'_>,
+    env: &ChildEnv<'_>,
+    stdio: &ChildStdio,
+    death_eq: u32,
 ) -> Result<CreateResult, u64>
 {
     let vfsd_ep = ctx.vfsd_ep;
@@ -645,11 +1156,50 @@ pub fn create_process_from_vfs(
         }
     }
 
-    // Done reading — unmap header page and close file.
+    // Extract PT_TLS metadata before closing the file — we may need another
+    // VFS read to pull `.tdata` into the main thread's TLS block.
+    let tls_seg = elf::tls_segment_metadata(ehdr, header_data, file_size)
+        .map_err(|_| procmgr_errors::INVALID_ELF)?;
+    let tls_template = tls_seg
+        .map(|s| ChildTlsTemplate {
+            vaddr: s.vaddr,
+            filesz: s.filesz,
+            memsz: s.memsz,
+            align: s.align,
+        })
+        .unwrap_or_default();
+
+    // Done with the header page; the next VFS read (if any) overwrites
+    // TEMP_FRAME_VA, not TEMP_VFS_VA, so it is safe to release the header
+    // mapping now.
     let _ = syscall::mem_unmap(self_aspace, TEMP_VFS_VA, 1);
     pool.free_page(hdr_frame);
+
+    let main_tls = if let Some(seg) = tls_seg
+        && tls_template.memsz != 0
+    {
+        prepare_main_tls_from_vfs(
+            pool,
+            self_aspace,
+            child_aspace,
+            &tls_template,
+            seg.offset,
+            file_cap,
+            ipc_buf,
+        )
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)?
+    }
+    else
+    {
+        MainTls::default()
+    };
+
     vfs_close(file_cap, ipc_buf);
 
+    let universals = UniversalCaps {
+        procmgr_endpoint: ctx.self_endpoint,
+        log_endpoint: ctx.log_ep,
+    };
     let pi_frame_cap = populate_child_info(
         pool,
         self_aspace,
@@ -657,6 +1207,11 @@ pub fn create_process_from_vfs(
         child_cspace,
         child_thread,
         creator_endpoint,
+        &universals,
+        &tls_template,
+        args,
+        env,
+        stdio,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     map_child_stack_and_ipc(pool, child_aspace).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
@@ -669,18 +1224,108 @@ pub fn create_process_from_vfs(
         child_thread,
         pi_frame_cap,
         entry,
+        main_tls,
         table,
         self_endpoint,
+        death_eq,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)
+}
+
+// ── Process destruction ─────────────────────────────────────────────────────
+
+/// Auto-reap path — called when the shared death queue fires with a
+/// correlator matching some entry.
+///
+/// Idempotent: stale correlators (already reaped via explicit
+/// `DESTROY_PROCESS`) drop silently. Takes the same cleanup path as the
+/// IPC-driven `destroy_process` — the only difference is the lookup key.
+#[allow(dead_code)]
+pub fn reap_by_correlator(correlator: u32, table: &mut ProcessTable)
+{
+    let Some(entry) = table.take_by_correlator(correlator)
+    else
+    {
+        return;
+    };
+    teardown_entry(entry);
+}
+
+/// Destroy a process identified by `token`.
+///
+/// For each kernel object procmgr held on behalf of the child
+/// (`thread`, `aspace`, `cspace`, `ProcessInfo` frame) we first `cap_revoke`
+/// to kill every descendant cap anywhere in the system — crucially, the
+/// self-ref copies procmgr installed inside the child's `CSpace` during
+/// `populate_child_info`. Without the revoke, those descendants keep the
+/// object alive: e.g. the child's own `cspace_cap` slot inside its `CSpace`
+/// holds a reference to the `CSpace` itself, so `cap_delete` on procmgr's
+/// copy alone would leave refcount at 1 and leak the whole aspace +
+/// everything the `CSpace` references.
+///
+/// Once revoked, `cap_delete` on procmgr's remaining root cap drops the
+/// final reference. The kernel's `dealloc_object` path then tears down the
+/// `CSpace` (dec-refing every slot it contains), walks the `AddressSpace`'s
+/// user page tables to return intermediate frames to the buddy, and — via
+/// `FrameObject::owns_memory` — releases heap / stack / IPC / `ProcessInfo`
+/// pages to the buddy as their refcounts hit zero.
+///
+/// Idempotent: returns silently if the token is unknown (already destroyed).
+pub fn destroy_process(token: u64, table: &mut ProcessTable)
+{
+    let Some(entry) = table.take_by_token(token)
+    else
+    {
+        return;
+    };
+    teardown_entry(entry);
+}
+
+/// Shared cleanup for both the explicit-IPC reap path (`destroy_process`)
+/// and the auto-reap path (`reap_by_correlator`). Revokes and deletes
+/// every kernel object procmgr held on behalf of the child.
+///
+/// Note: the bound death-notification observer in the child thread's TCB
+/// is released automatically when the thread is torn down by the
+/// cap-revoke below — no explicit unbind syscall is required.
+// needless_pass_by_value: consumes the entry's cap slots; passing by
+// reference would invite accidental double-free on subsequent reuse.
+#[allow(clippy::needless_pass_by_value)]
+fn teardown_entry(entry: ProcessEntry)
+{
+    // Order: thread first so the scheduler drops any residual reference to
+    // the aspace before we tear down its page tables. Then cspace (which
+    // owns every cap the child held) before aspace (whose dealloc walks the
+    // page tables). pi_frame last — it was a leaf resource the child used
+    // read-only; no other object references it.
+    let _ = syscall::cap_revoke(entry.thread_cap);
+    let _ = syscall::cap_delete(entry.thread_cap);
+    let _ = syscall::cap_revoke(entry.cspace_cap);
+    let _ = syscall::cap_delete(entry.cspace_cap);
+    let _ = syscall::cap_revoke(entry.aspace_cap);
+    let _ = syscall::cap_delete(entry.aspace_cap);
+    let _ = syscall::cap_revoke(entry.pi_frame_cap);
+    let _ = syscall::cap_delete(entry.pi_frame_cap);
+    if entry.tls_frame_cap != 0
+    {
+        let _ = syscall::cap_revoke(entry.tls_frame_cap);
+        let _ = syscall::cap_delete(entry.tls_frame_cap);
+    }
 }
 
 // ── Process start ───────────────────────────────────────────────────────────
 
 /// Start a previously created (suspended) process.
 ///
-/// Calls `thread_configure` and `thread_start` on the process's thread.
-pub fn start_process(token: u64, table: &mut ProcessTable) -> Result<(), u64>
+/// Binds the child's main thread to procmgr's shared death queue (for
+/// auto-reap on exit or fault), configures the thread, and starts it.
+/// The bind happens BEFORE `thread_start` so a short-lived child cannot
+/// exit before procmgr installs its observer and leak the child's frames.
+///
+/// Correlator: `entry.token as u32`. Procmgr's `NEXT_TOKEN` is monotonic
+/// u64; truncation is unambiguous in practice (wrap at 4B process spawns).
+#[allow(clippy::cast_possible_truncation)]
+pub fn start_process(token: u64, table: &mut ProcessTable, death_eq: u32) -> Result<(), u64>
 {
     let entry = table
         .find_mut_by_token(token)
@@ -691,15 +1336,19 @@ pub fn start_process(token: u64, table: &mut ProcessTable) -> Result<(), u64>
         return Err(procmgr_errors::ALREADY_STARTED);
     }
 
-    syscall::thread_configure(
+    // Bind happens in finalize_creation — no-op here.
+    let _ = death_eq;
+
+    syscall::thread_configure_with_tls(
         entry.thread_cap,
         entry.entry_point,
         PROCESS_STACK_TOP,
         PROCESS_INFO_VADDR,
+        entry.tls_base_va,
     )
     .map_err(|_| 3u64)?;
 
-    syscall::thread_start(entry.thread_cap).map_err(|_| 3u64)?;
+    syscall::thread_start(entry.thread_cap).map_err(|_| 6u64)?;
 
     entry.started = true;
     Ok(())

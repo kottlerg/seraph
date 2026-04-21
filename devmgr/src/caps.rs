@@ -9,7 +9,7 @@
 //! into typed fields for use by PCI enumeration and driver spawning.
 
 use ipc::IpcBuf;
-use process_abi::StartupInfo;
+use std::os::seraph::StartupInfo;
 
 pub struct PciMmioWindow
 {
@@ -28,8 +28,8 @@ pub struct DevmgrCaps
     pub pci_mmio_window_count: usize,
     pub irq_slots: [(u32, u32); 64], // (slot, irq_id)
     pub irq_count: usize,
+    /// Tokened SEND cap on procmgr's service endpoint (from `StartupInfo`).
     pub procmgr_ep: u32,
-    pub log_ep: u32,
     pub registry_ep: u32,
     /// devmgr's own bootstrap endpoint (receives bootstrap requests from
     /// drivers it spawns).
@@ -41,7 +41,7 @@ pub struct DevmgrCaps
 
 impl DevmgrCaps
 {
-    pub fn new(startup: &StartupInfo) -> Self
+    pub fn new(info: &StartupInfo) -> Self
     {
         Self {
             ecam_slot: 0,
@@ -62,11 +62,10 @@ impl DevmgrCaps
             pci_mmio_window_count: 0,
             irq_slots: [(0, 0); 64],
             irq_count: 0,
-            procmgr_ep: 0,
-            log_ep: 0,
+            procmgr_ep: info.procmgr_endpoint,
             registry_ep: 0,
             self_bootstrap_ep: 0,
-            self_aspace: startup.self_aspace,
+            self_aspace: info.self_aspace,
             driver_module_slots: [0; 8],
             driver_module_count: 0,
         }
@@ -75,7 +74,7 @@ impl DevmgrCaps
 
 // ── Bootstrap plan layout (init → devmgr) ──────────────────────────────────
 //
-// Round 1 (4 caps, 0 data): [log_ep, registry_ep, procmgr_ep, ecam_cap]
+// Round 1 (2 caps, 2 data): [registry_ep, ecam_cap]
 //   data words:
 //     word 0: ecam_base
 //     word 1: ecam_size
@@ -93,20 +92,21 @@ impl DevmgrCaps
 // Round N: driver module caps, up to 4 per round, no data words.
 //   First module cap is always the virtio-blk module (module index 3 today);
 //   additional modules may follow in later releases.
+//
+// log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through
+// this protocol.
 
-/// Round 1: receive endpoint caps and ECAM region. Fails if the caller
-/// provided fewer than four caps.
+/// Round 1: receive registry endpoint and ECAM region. Fails if the caller
+/// provided fewer than two caps.
 fn bootstrap_round_endpoints(creator: u32, ipc: IpcBuf, caps: &mut DevmgrCaps) -> Option<()>
 {
     let round1 = ipc::bootstrap::request_round(creator, ipc).ok()?;
-    if round1.cap_count < 4
+    if round1.cap_count < 2
     {
         return None;
     }
-    caps.log_ep = round1.caps[0];
-    caps.registry_ep = round1.caps[1];
-    caps.procmgr_ep = round1.caps[2];
-    caps.ecam_slot = round1.caps[3];
+    caps.registry_ep = round1.caps[0];
+    caps.ecam_slot = round1.caps[1];
     caps.ecam_base = ipc.read_word(0);
     caps.ecam_size = ipc.read_word(1);
     Some(())
@@ -172,10 +172,10 @@ fn bootstrap_rounds_irq_and_modules(
 }
 
 /// Pull devmgr's initial cap set from init via multi-round bootstrap.
-pub fn bootstrap_caps(startup: &StartupInfo, ipc: IpcBuf) -> Option<DevmgrCaps>
+pub fn bootstrap_caps(info: &StartupInfo, ipc: IpcBuf) -> Option<DevmgrCaps>
 {
-    let mut caps = DevmgrCaps::new(startup);
-    let creator = startup.creator_endpoint;
+    let mut caps = DevmgrCaps::new(info);
+    let creator = info.creator_endpoint;
     if creator == 0
     {
         return None;

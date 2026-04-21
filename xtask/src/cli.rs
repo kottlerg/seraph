@@ -57,6 +57,14 @@ pub struct BuildArgs
     /// Build only one component (default: all).
     #[arg(long, default_value = "all")]
     pub component: BuildComponent,
+
+    /// Skip `cargo fmt` and per-component `cargo check` (clippy). `cargo
+    /// xtask run` sets this internally to keep the tight edit → rebuild →
+    /// launch loop responsive — an unchanged tree would otherwise pay for
+    /// ~2× cargo invocations per component (check + build) on every
+    /// re-run. Use `cargo xtask build` when you want the full lint pass.
+    #[arg(long, hide = true)]
+    pub skip_lints: bool,
 }
 
 /// Components that can be built individually.
@@ -73,6 +81,10 @@ pub enum BuildComponent
     VirtioBlk,
     Fatfs,
     Crasher,
+    Usertest,
+    Svcmgr,
+    Hello,
+    Stdiotest,
     All,
 }
 
@@ -107,6 +119,15 @@ pub struct RunArgs
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,
+
+    /// Skip the pre-launch build and use the existing sysroot / disk image
+    /// as-is. Intended for tight loops — re-running the same image many
+    /// times to shake out non-determinism (races, timer-dependent bugs)
+    /// without paying cargo's fingerprint walk each iteration. Fails fast
+    /// if the sysroot artifacts are missing; run `cargo xtask build` (or
+    /// one `cargo xtask run` without the flag) to populate them first.
+    #[arg(long)]
+    pub no_build: bool,
 }
 
 // ── Clean ─────────────────────────────────────────────────────────────────────

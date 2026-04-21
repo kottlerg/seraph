@@ -184,19 +184,59 @@ pub fn sleep_list_add(tcb: *mut ThreadControlBlock)
     unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
 }
 
+/// Remove a thread from the sleep list if present. Called by `signal_send`
+/// when waking a waiter that was registered with a timeout, so the timer
+/// path does not later try to double-wake it.
+///
+/// Returns `true` if the thread was on the list and was removed.
+#[cfg(not(test))]
+pub fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
+{
+    // SAFETY: lock serialises all sleep list access.
+    let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
+    let mut removed = false;
+    // SAFETY: single-writer access under lock.
+    unsafe {
+        let mut i = 0;
+        while i < SLEEP_COUNT
+        {
+            if SLEEP_LIST[i] == tcb
+            {
+                SLEEP_COUNT -= 1;
+                SLEEP_LIST[i] = SLEEP_LIST[SLEEP_COUNT];
+                SLEEP_LIST[SLEEP_COUNT] = core::ptr::null_mut();
+                removed = true;
+                break;
+            }
+            i += 1;
+        }
+    }
+    // SAFETY: paired with lock_raw above.
+    unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
+    removed
+}
+
 /// Check sleeping threads and wake any whose deadline has passed.
 ///
 /// Called from `timer_tick()` on the BSP. Collects expired threads under the
 /// sleep list lock, then wakes them after releasing it.
+///
+/// Signal-wait-with-timeout threads are on this list AND registered as a
+/// signal waiter. If `signal_send` claims the waiter first, it removes the
+/// tcb from the sleep list under `sig.lock`, so we will not see it here.
+/// If we reach a signal-waiter tcb here, we must arbitrate against a
+/// concurrent `signal_send` by taking `sig.lock` and checking whether we
+/// are still registered as the waiter before claiming the wake.
 #[cfg(not(test))]
 pub fn sleep_check_wakeups()
 {
     let now = crate::arch::current::timer::current_tick();
 
-    // Collect expired threads under the lock.
-    let mut to_wake: [(*mut ThreadControlBlock, usize, u8); MAX_SLEEPING] =
-        [(core::ptr::null_mut(), 0, 0); MAX_SLEEPING];
-    let mut wake_count = 0usize;
+    // Collect expired threads under the lock. Do not touch state yet — for
+    // signal-wait-timeout entries we need to take the signal's lock first.
+    let mut expired: [*mut ThreadControlBlock; MAX_SLEEPING] =
+        [core::ptr::null_mut(); MAX_SLEEPING];
+    let mut n = 0usize;
 
     // SAFETY: lock serialises all sleep list access.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
@@ -209,12 +249,8 @@ pub fn sleep_check_wakeups()
             let tcb = SLEEP_LIST[i];
             if !tcb.is_null() && (*tcb).sleep_deadline <= now
             {
-                (*tcb).sleep_deadline = 0;
-                (*tcb).state = ThreadState::Ready;
-
-                to_wake[wake_count] = (tcb, (*tcb).preferred_cpu as usize, (*tcb).priority);
-                wake_count += 1;
-
+                expired[n] = tcb;
+                n += 1;
                 // Remove from list by swapping with last entry.
                 SLEEP_COUNT -= 1;
                 SLEEP_LIST[i] = SLEEP_LIST[SLEEP_COUNT];
@@ -231,11 +267,77 @@ pub fn sleep_check_wakeups()
     // SAFETY: paired with lock_raw above.
     unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
 
-    // Enqueue woken threads outside the sleep list lock.
-    for &(tcb, cpu, priority) in to_wake.iter().take(wake_count)
+    // For each expired tcb, try to claim the wake. Signal-wait-timeout
+    // entries arbitrate via `sig.lock` against a concurrent `signal_send`.
+    for &tcb in expired.iter().take(n)
     {
-        // SAFETY: tcb is valid; was in Blocked state, now Ready.
-        unsafe { enqueue_and_wake(tcb, cpu, priority) };
+        if tcb.is_null()
+        {
+            continue;
+        }
+        // SAFETY: tcb pointer was placed on the sleep list by a live thread
+        // and is only removed when the thread is destroyed (exit/fault),
+        // both of which first stop the thread's blocked state. At this
+        // point the thread is still Blocked.
+        let (ipc_state, blocked_on) = unsafe { ((*tcb).ipc_state, (*tcb).blocked_on_object) };
+
+        let claimed = if matches!(
+            ipc_state,
+            crate::sched::thread::IpcThreadState::BlockedOnSignal
+        ) && !blocked_on.is_null()
+        {
+            // SAFETY: BlockedOnSignal implies blocked_on_object is a valid
+            // *mut SignalState (see `ipc::signal::signal_wait`). The
+            // kernel allocator guarantees SignalState alignment; the
+            // cast_ptr_alignment lint is suppressed here because the
+            // pointer is type-erased as *mut u8 in the TCB to break a
+            // circular module import.
+            #[allow(clippy::cast_ptr_alignment)]
+            let sig_state = blocked_on.cast::<crate::ipc::signal::SignalState>();
+            // SAFETY: sig_state is valid for the duration of the wait;
+            // lock serialises against signal_send.
+            let saved_sig = unsafe { (*sig_state).lock.lock_raw() };
+            // SAFETY: same as above.
+            let we_win = unsafe { (*sig_state).waiter } == tcb;
+            if we_win
+            {
+                // SAFETY: we hold sig.lock; clear waiter state and hand
+                // the thread a zero wakeup_value to signal "timeout".
+                unsafe {
+                    (*sig_state).waiter = core::ptr::null_mut();
+                    (*sig_state).has_observer.store(
+                        u8::from(!(*sig_state).wait_set.is_null()),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    (*tcb).wakeup_value = 0;
+                    (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
+                    (*tcb).blocked_on_object = core::ptr::null_mut();
+                    (*tcb).sleep_deadline = 0;
+                    (*tcb).state = ThreadState::Ready;
+                }
+            }
+            // SAFETY: paired with lock_raw above.
+            unsafe { (*sig_state).lock.unlock_raw(saved_sig) };
+            we_win
+        }
+        else
+        {
+            // Plain sleep — we are the only waker.
+            // SAFETY: tcb still valid; see above.
+            unsafe {
+                (*tcb).sleep_deadline = 0;
+                (*tcb).state = ThreadState::Ready;
+            }
+            true
+        };
+
+        if claimed
+        {
+            // SAFETY: tcb is valid; transitioned to Ready above.
+            let (cpu, priority) = unsafe { ((*tcb).preferred_cpu as usize, (*tcb).priority) };
+            // SAFETY: tcb valid, Ready.
+            unsafe { enqueue_and_wake(tcb, cpu, priority) };
+        }
     }
 }
 
@@ -423,7 +525,8 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
             blocked_on_object: core::ptr::null_mut(),
             thread_id: alloc_thread_id(),
             context_saved: core::sync::atomic::AtomicU32::new(1),
-            death_notification: core::ptr::null_mut(),
+            death_observers: [thread::DeathObserver::empty(); thread::MAX_DEATH_OBSERVERS],
+            death_observer_count: 0,
             sleep_deadline: 0,
             magic: thread::TCB_MAGIC,
         }));
@@ -1026,8 +1129,10 @@ pub unsafe fn schedule(requeue_current: bool)
 
 /// Post a death notification for a thread that is about to exit or has faulted.
 ///
-/// If the thread has a bound `death_notification` `EventQueue`, posts
-/// `exit_reason` to it. If a waiter is woken, enqueues it.
+/// Walks the thread's `death_observers` array and posts
+/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to each
+/// registered `EventQueue`. If any post wakes a blocked receiver, enqueues
+/// it on the local run queue.
 ///
 /// # Safety
 /// `tcb` must be a valid, non-null TCB pointer. Must be called with the
@@ -1036,24 +1141,38 @@ pub unsafe fn schedule(requeue_current: bool)
 pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit_reason: u64)
 {
     // SAFETY: tcb validated by caller.
-    let eq = unsafe { (*tcb).death_notification };
-    if eq.is_null()
+    let count = unsafe { (*tcb).death_observer_count } as usize;
+    if count == 0
     {
         return;
     }
 
-    // SAFETY: eq is a valid EventQueueState pointer stored by
-    // SYS_THREAD_BIND_NOTIFICATION; event_queue_post acquires its own lock.
-    let result = unsafe { crate::ipc::event_queue::event_queue_post(eq, exit_reason) };
-    if let Ok(Some(woken_tcb)) = result
+    let exit_bits = exit_reason & 0xFFFF_FFFF;
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+
+    for i in 0..count
     {
-        // Enqueue the woken thread so the scheduler can pick it up.
-        let cpu = crate::arch::current::cpu::current_cpu() as usize;
-        // SAFETY: woken_tcb is a valid TCB returned by event_queue_post.
-        let priority = unsafe { (*woken_tcb).priority };
-        // SAFETY: cpu is valid; woken_tcb is valid and Ready.
-        unsafe {
-            enqueue_and_wake(woken_tcb, cpu, priority);
+        // SAFETY: indices below count were populated by
+        // sys_thread_bind_notification; array has fixed length
+        // MAX_DEATH_OBSERVERS.
+        let observer = unsafe { (*tcb).death_observers[i] };
+        if observer.eq.is_null()
+        {
+            continue;
+        }
+        let payload = (u64::from(observer.correlator) << 32) | exit_bits;
+
+        // SAFETY: observer.eq is a valid EventQueueState pointer stored by
+        // SYS_THREAD_BIND_NOTIFICATION; event_queue_post acquires its own lock.
+        let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
+        if let Ok(Some(woken_tcb)) = result
+        {
+            // SAFETY: woken_tcb is a valid TCB returned by event_queue_post.
+            let priority = unsafe { (*woken_tcb).priority };
+            // SAFETY: cpu is valid; woken_tcb is valid and Ready.
+            unsafe {
+                enqueue_and_wake(woken_tcb, cpu, priority);
+            }
         }
     }
 }

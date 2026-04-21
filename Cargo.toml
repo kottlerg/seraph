@@ -19,13 +19,15 @@ members = [
     "shared/elf",
     "shared/font",
     "shared/mmio",
-    "shared/runtime",
     "shared/syscall",
     "shared/ipc",
     "shared/registry",
+    "shared/shmem",
     "shared/va_layout",
     "base/crasher",
-    "base/allocsmoke",
+    "base/hello",
+    "base/stdiotest",
+    "base/usertest",
     "xtask",
 ]
 
@@ -45,7 +47,6 @@ cast_ptr_alignment               = "warn"
 boot-protocol = { path = "abi/boot-protocol" }
 init-protocol = { path = "abi/init-protocol" }
 process-abi = { path = "abi/process-abi" }
-runtime = { path = "shared/runtime" }
 font = { path = "shared/font" }
 mmio = { path = "shared/mmio" }
 syscall = { path = "abi/syscall", package = "syscall-abi" }

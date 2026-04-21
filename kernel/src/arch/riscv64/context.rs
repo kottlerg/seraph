@@ -90,6 +90,16 @@ impl SavedState
     }
 }
 
+/// Seed the initial TLS base for a thread being configured.
+///
+/// RISC-V carries the user-mode TLS pointer in `TrapFrame.tp`, which
+/// `return_to_user` restores on every U-mode entry (including the first).
+/// `SavedState` holds only kernel-mode callee-saved registers; `tp` is a
+/// per-hart kernel register here and is never thread-switched. This hook is
+/// therefore a no-op on RISC-V — `TrapFrame::set_tls_base` handles it.
+#[inline]
+pub fn seed_tls_base(_saved: &mut SavedState, _tls_base: u64) {}
+
 // ── new_state ─────────────────────────────────────────────────────────────────
 
 /// Construct the initial [`SavedState`] for a new thread.

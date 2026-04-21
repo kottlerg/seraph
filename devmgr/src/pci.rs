@@ -9,8 +9,8 @@
 //! and parses `VirtIO` PCI capability structures for modern register locations.
 
 use virtio_core::{
-    VirtioCapLocation, VirtioPciStartupInfo, VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_DEVICE_CFG,
-    VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_NOTIFY_CFG,
+    VIRTIO_PCI_CAP_COMMON_CFG, VIRTIO_PCI_CAP_DEVICE_CFG, VIRTIO_PCI_CAP_ISR_CFG,
+    VIRTIO_PCI_CAP_NOTIFY_CFG, VirtioCapLocation, VirtioPciStartupInfo,
 };
 
 pub const MAX_DEVICES: usize = 8;

@@ -195,14 +195,7 @@ fn name_matches(entry_name: &[u8; 11], component: &[u8]) -> bool
 
 fn to_upper(b: u8) -> u8
 {
-    if b.is_ascii_lowercase()
-    {
-        b - 32
-    }
-    else
-    {
-        b
-    }
+    if b.is_ascii_lowercase() { b - 32 } else { b }
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────
@@ -410,11 +403,9 @@ fn scan_sector_for_name(
         }
         // Regular 8.3 entry. Check LFN match first, then 8.3.
         if let Some(entry) = parse_dir_entry(raw)
+            && (lfn.matches(name) || name_matches(&entry.name, name))
         {
-            if lfn.matches(name) || name_matches(&entry.name, name)
-            {
-                return Some(entry);
-            }
+            return Some(entry);
         }
         lfn.reset();
     }

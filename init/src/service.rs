@@ -11,9 +11,32 @@
 
 use crate::bootstrap::NEXT_BOOTSTRAP_TOKEN;
 use crate::idle_loop;
-use crate::logging::log;
+use crate::logging::{log, pack_name};
 use init_protocol::{CapDescriptor, CapType, InitInfo};
-use ipc::{procmgr_labels, svcmgr_labels, write_path_to_ipc, IpcBuf};
+use ipc::{IpcBuf, procmgr_labels, svcmgr_labels};
+
+/// Pack `path` bytes into IPC data words starting at `word_offset`. Returns
+/// the number of words written. Mirrors `ipc::write_path_to_ipc` but accepts
+/// a starting word index, used here to leave word 0 free for the stdio token.
+fn write_path_at_offset(ipc: IpcBuf, word_offset: usize, path: &[u8]) -> usize
+{
+    let n = path.len().min(ipc::MAX_PATH_LEN);
+    let words = n.div_ceil(8);
+    for i in 0..words
+    {
+        let mut word: u64 = 0;
+        let base = i * 8;
+        for j in 0..8
+        {
+            if base + j < n
+            {
+                word |= u64::from(path[base + j]) << (j * 8);
+            }
+        }
+        ipc.write_word(word_offset + i, word);
+    }
+    words
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -134,7 +157,6 @@ pub fn create_devmgr_with_caps(
     info: &InitInfo,
     procmgr_ep: u32,
     bootstrap_ep: u32,
-    log_ep: u32,
     registry_ep: u32,
     ipc: IpcBuf,
 )
@@ -148,10 +170,12 @@ pub fn create_devmgr_with_caps(
         return;
     };
 
+    // Stdio token = packed name "devmgr"; stdin not attached.
+    ipc.write_word(0, pack_name(b"devmgr"));
     let Ok((reply_label, _)) = syscall::ipc_call(
         procmgr_ep,
         procmgr_labels::CREATE_PROCESS,
-        0,
+        1,
         &[devmgr_frame_cap, tokened_creator],
     )
     else
@@ -176,23 +200,13 @@ pub fn create_devmgr_with_caps(
 
     let hw = collect_hw_caps(crate::descriptors(info));
 
-    // Derive all caps for delivery.
-    let Ok(log_copy) = syscall::cap_derive(log_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        log("init: devmgr: log cap derive failed");
-        return;
-    };
+    // log + procmgr are auto-delivered via ProcessInfo by procmgr; only the
+    // devmgr-specific caps traverse this bootstrap protocol.
+    let _ = procmgr_ep;
     let Ok(registry_copy) = syscall::cap_derive(registry_ep, syscall::RIGHTS_ALL)
     else
     {
         log("init: devmgr: registry cap derive failed");
-        return;
-    };
-    let Ok(procmgr_copy) = syscall::cap_derive(procmgr_ep, syscall::RIGHTS_SEND_GRANT)
-    else
-    {
-        log("init: devmgr: procmgr cap derive failed");
         return;
     };
     let Ok(ecam_copy) = syscall::cap_derive(hw.ecam_slot, syscall::RIGHTS_ALL)
@@ -212,13 +226,13 @@ pub fn create_devmgr_with_caps(
         return;
     }
 
-    // Round 1: [log, registry, procmgr, ecam]; data [ecam_base, ecam_size].
+    // Round 1: [registry, ecam]; data [ecam_base, ecam_size].
     if !serve(
         bootstrap_ep,
         child_token,
         ipc,
         false,
-        &[log_copy, registry_copy, procmgr_copy, ecam_copy],
+        &[registry_copy, ecam_copy],
         &[hw.ecam_base, hw.ecam_size],
         "init: devmgr: bootstrap round 1 failed",
     )
@@ -331,7 +345,6 @@ pub fn create_devmgr_with_caps(
 #[allow(clippy::struct_field_names)]
 pub struct VfsdSpawnCaps
 {
-    pub log_ep: u32,
     pub registry_ep: u32,
     pub vfsd_service_ep: u32,
 }
@@ -354,10 +367,11 @@ pub fn create_vfsd_with_caps(
         return;
     };
 
+    ipc.write_word(0, pack_name(b"vfsd"));
     let Ok((reply_label, _)) = syscall::ipc_call(
         procmgr_ep,
         procmgr_labels::CREATE_PROCESS,
-        0,
+        1,
         &[vfsd_frame_cap, tokened_creator],
     )
     else
@@ -380,22 +394,12 @@ pub fn create_vfsd_with_caps(
     }
     let process_handle = reply_caps[0];
 
-    let Ok(log_copy) = syscall::cap_derive(spawn.log_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        return;
-    };
     let Ok(service_copy) = syscall::cap_derive(spawn.vfsd_service_ep, syscall::RIGHTS_ALL)
     else
     {
         return;
     };
     let Ok(registry_copy) = syscall::cap_derive(spawn.registry_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        return;
-    };
-    let Ok(procmgr_copy) = syscall::cap_derive(procmgr_ep, syscall::RIGHTS_SEND_GRANT)
     else
     {
         return;
@@ -410,13 +414,14 @@ pub fn create_vfsd_with_caps(
         return;
     }
 
-    // Round 1: [log, service, registry, procmgr]
+    // Round 1: [service, registry]
+    // (log + procmgr auto-delivered via ProcessInfo.)
     if !serve(
         bootstrap_ep,
         child_token,
         ipc,
         false,
-        &[log_copy, service_copy, registry_copy, procmgr_copy],
+        &[service_copy, registry_copy],
         &[],
         "init: vfsd: bootstrap round 1 failed",
     )
@@ -467,11 +472,14 @@ pub fn send_vfsd_endpoint_to_procmgr(procmgr_ep: u32, vfsd_ep: u32)
 ///
 /// Returns `(process_handle, child_token)` on success.
 pub fn create_svcmgr_from_vfs(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
-    -> Option<(u32, u64)>
+-> Option<(u32, u64)>
 {
     let path = b"/bin/svcmgr";
 
-    let word_count = write_path_to_ipc(ipc, path);
+    // Word 0 = stdio_token; words 1+ = path bytes.
+    ipc.write_word(0, pack_name(b"svcmgr"));
+    let path_words = write_path_at_offset(ipc, 1, path);
+    let word_count = 1 + path_words;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -503,14 +511,12 @@ pub fn create_svcmgr_from_vfs(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
 #[allow(clippy::struct_field_names)]
 pub struct SvcmgrHandoverCaps
 {
-    pub log_ep: u32,
     pub svcmgr_service_ep: u32,
     pub svcmgr_bootstrap_ep: u32,
 }
 
 /// Start svcmgr, then serve its bootstrap.
 pub fn setup_and_start_svcmgr(
-    procmgr_ep: u32,
     bootstrap_ep: u32,
     process_handle: u32,
     child_token: u64,
@@ -527,17 +533,7 @@ pub fn setup_and_start_svcmgr(
         return;
     }
 
-    let Ok(log_copy) = syscall::cap_derive(handover.log_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        return;
-    };
     let Ok(service_copy) = syscall::cap_derive(handover.svcmgr_service_ep, syscall::RIGHTS_ALL)
-    else
-    {
-        return;
-    };
-    let Ok(procmgr_copy) = syscall::cap_derive(procmgr_ep, syscall::RIGHTS_SEND_GRANT)
     else
     {
         return;
@@ -548,13 +544,14 @@ pub fn setup_and_start_svcmgr(
         return;
     };
 
-    // One round: [log, service, procmgr, bootstrap_ep].
+    // One round: [service, bootstrap_ep].
+    // (log + procmgr auto-delivered via ProcessInfo.)
     let _ = serve(
         bootstrap_ep,
         child_token,
         ipc,
         true,
-        &[log_copy, service_copy, procmgr_copy, boot_copy],
+        &[service_copy, boot_copy],
         &[],
         "init: phase 3: svcmgr bootstrap failed",
     );
@@ -580,10 +577,11 @@ pub fn create_crasher_suspended(
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
+    ipc.write_word(0, pack_name(b"crasher"));
     let Ok((reply_label, _)) = syscall::ipc_call(
         procmgr_ep,
         procmgr_labels::CREATE_PROCESS,
-        0,
+        1,
         &[frame_for_procmgr, tokened_creator],
     )
     else
@@ -612,16 +610,11 @@ pub fn create_crasher_suspended(
     Some((process_handle, thread_cap, crasher_frame_cap, child_token))
 }
 
-/// Create allocsmoke from its boot module (suspended), start it, and serve
-/// its bootstrap with `[log_ep, procmgr_ep]`. allocsmoke exits cleanly on
-/// completion and is not registered with svcmgr.
-pub fn create_and_run_allocsmoke(
-    info: &InitInfo,
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    log_ep: u32,
-    ipc: IpcBuf,
-)
+/// Create usertest from its boot module (suspended), start it, and serve an
+/// empty terminal bootstrap round. usertest exits cleanly on completion and
+/// is not registered with svcmgr. log + procmgr caps arrive via
+/// `ProcessInfo`, so the round carries no caps.
+pub fn create_and_run_usertest(info: &InitInfo, procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
 {
     if info.module_frame_count < 7
     {
@@ -640,10 +633,36 @@ pub fn create_and_run_allocsmoke(
         return;
     };
 
+    // Hand usertest a minimal argv + env so its args/env assertions have
+    // real content to verify. argv: two NUL-terminated entries. env: two
+    // `KEY=VALUE` NUL-terminated entries.
+    let argv: &[u8] = b"usertest\0run\0";
+    let argv_count: u32 = 2;
+    let argv_bytes = argv.len();
+    let argv_words = argv_bytes.div_ceil(8);
+
+    let env_blob: &[u8] = b"SERAPH_TEST=1\0SERAPH_MODE=boot\0";
+    let env_count: u32 = 2;
+    let env_bytes = env_blob.len();
+    let env_words = env_bytes.div_ceil(8);
+
+    // Layout: word 0 = stdio_token, words 1..1+argv_words = argv blob,
+    // next word = env_bytes header, next env_words = env blob.
+    ipc.write_word(0, pack_name(b"usertest"));
+    let _ = ipc::write_blob_to_ipc(ipc, 1, argv);
+    ipc.write_word(1 + argv_words, env_bytes as u64);
+    let _ = ipc::write_blob_to_ipc(ipc, 1 + argv_words + 1, env_blob);
+
+    let label = procmgr_labels::CREATE_PROCESS
+        | ((argv_bytes as u64) << 32)
+        | ((u64::from(argv_count)) << 48)
+        | ((u64::from(env_count)) << 56);
+    let data_count = 1 + argv_words + 1 + env_words;
+
     let Ok((reply_label, _)) = syscall::ipc_call(
         procmgr_ep,
-        procmgr_labels::CREATE_PROCESS,
-        0,
+        label,
+        data_count,
         &[frame_for_procmgr, tokened_creator],
     )
     else
@@ -663,13 +682,10 @@ pub fn create_and_run_allocsmoke(
     }
     let process_handle = reply_caps[0];
 
-    let log_copy = syscall::cap_derive(log_ep, syscall::RIGHTS_SEND).unwrap_or(0);
-    let procmgr_copy = syscall::cap_derive(procmgr_ep, syscall::RIGHTS_SEND_GRANT).unwrap_or(0);
-
     if !start_process(
         process_handle,
-        "init: phase 3: allocsmoke started",
-        "init: phase 3: allocsmoke START_PROCESS failed",
+        "init: phase 3: usertest started",
+        "init: phase 3: usertest START_PROCESS failed",
     )
     {
         return;
@@ -680,23 +696,22 @@ pub fn create_and_run_allocsmoke(
         child_token,
         ipc,
         true,
-        &[log_copy, procmgr_copy],
         &[],
-        "init: phase 3: allocsmoke bootstrap failed",
+        &[],
+        "init: phase 3: usertest bootstrap failed",
     );
 }
 
-/// Start crasher and serve its bootstrap with `[log_ep, svcmgr_ep]`.
+/// Start crasher and serve its bootstrap with `[svcmgr_ep]`.
 ///
 /// `svcmgr_service_ep` is the same cap that svcmgr will re-inject from the
 /// restart bundle under the name `"svcmgr"`. Providing it on first boot as
-/// well keeps the cap layout identical across first-boot and restart paths,
-/// so crasher sees the same `cap_count` and entry in both.
+/// well keeps the cap layout identical across first-boot and restart paths.
+/// The log endpoint is delivered via `ProcessInfo`, not this round.
 pub fn start_and_bootstrap_crasher(
     process_handle: u32,
     child_token: u64,
     bootstrap_ep: u32,
-    log_ep: u32,
     svcmgr_service_ep: u32,
     ipc: IpcBuf,
 ) -> bool
@@ -710,14 +725,6 @@ pub fn start_and_bootstrap_crasher(
         return false;
     }
 
-    let log_copy = if log_ep != 0
-    {
-        syscall::cap_derive(log_ep, syscall::RIGHTS_SEND).unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
     let svcmgr_copy = if svcmgr_service_ep != 0
     {
         syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND).unwrap_or(0)
@@ -732,7 +739,7 @@ pub fn start_and_bootstrap_crasher(
         child_token,
         ipc,
         true,
-        &[log_copy, svcmgr_copy],
+        &[svcmgr_copy],
         &[],
         "init: phase 3: crasher bootstrap failed",
     )
@@ -746,7 +753,6 @@ pub struct ServiceRegistration<'a>
     pub criticality: u8,
     pub thread_cap: u32,
     pub module_cap: u32,
-    pub log_ep: u32,
     /// Optional extra named cap for svcmgr's restart bundle. If both
     /// `bundle_name` is non-empty and `bundle_cap != 0`, the cap will be
     /// re-injected into every restart of this service under the given name.
@@ -779,7 +785,6 @@ pub fn register_service(svcmgr_ep: u32, ipc: IpcBuf, reg: &ServiceRegistration)
     // the service name. Zero if no bundle cap is being sent.
     let bundle_name_len_word = 2 + name_words;
     let include_bundle = reg.module_cap != 0
-        && reg.log_ep != 0
         && reg.bundle_cap != 0
         && !reg.bundle_name.is_empty()
         && reg.bundle_name.len() <= 16;
@@ -822,21 +827,10 @@ pub fn register_service(svcmgr_ep: u32, ipc: IpcBuf, reg: &ServiceRegistration)
         caps[cap_count] = reg.module_cap;
         cap_count += 1;
     }
-    if reg.log_ep != 0 && reg.module_cap != 0
+    if include_bundle && let Ok(derived) = syscall::cap_derive(reg.bundle_cap, syscall::RIGHTS_SEND)
     {
-        if let Ok(derived) = syscall::cap_derive(reg.log_ep, syscall::RIGHTS_SEND)
-        {
-            caps[cap_count] = derived;
-            cap_count += 1;
-        }
-    }
-    if include_bundle
-    {
-        if let Ok(derived) = syscall::cap_derive(reg.bundle_cap, syscall::RIGHTS_SEND)
-        {
-            caps[cap_count] = derived;
-            cap_count += 1;
-        }
+        caps[cap_count] = derived;
+        cap_count += 1;
     }
 
     match syscall::ipc_call(svcmgr_ep, label, data_count, &caps[..cap_count])
@@ -844,6 +838,182 @@ pub fn register_service(svcmgr_ep: u32, ipc: IpcBuf, reg: &ServiceRegistration)
         Ok((0, _)) =>
         {}
         _ => log("init: phase 3: REGISTER_SERVICE failed"),
+    }
+}
+
+/// Create `/bin/hello` via `CREATE_FROM_VFS`, start it, serve an empty
+/// bootstrap round. Tier-2 sanity demo — no caps beyond what `ProcessInfo`
+/// auto-delivers.
+pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
+{
+    let path = b"/bin/hello";
+
+    ipc.write_word(0, pack_name(b"hello"));
+    let path_words = write_path_at_offset(ipc, 1, path);
+    let word_count = 1 + path_words;
+
+    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
+    else
+    {
+        return;
+    };
+
+    let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
+    let Ok((reply_label, _)) = syscall::ipc_call(procmgr_ep, label, word_count, &[tokened_creator])
+    else
+    {
+        log("init: phase 3: hello CREATE_FROM_VFS failed");
+        return;
+    };
+    if reply_label != 0
+    {
+        log("init: phase 3: hello CREATE_FROM_VFS error");
+        return;
+    }
+
+    // SAFETY: ipc wraps the registered IPC buffer.
+    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
+    if cap_count < 1
+    {
+        return;
+    }
+    let process_handle = reply_caps[0];
+
+    // Tier-2 binaries don't speak the bootstrap protocol — `child_token`
+    // and `tokened_creator` are unused on the child side. Skip the serve
+    // round; init would otherwise block on a REQUEST that never comes.
+    let _ = child_token;
+
+    let _ = start_process(
+        process_handle,
+        "init: phase 3: hello started",
+        "init: phase 3: hello START_PROCESS failed",
+    );
+}
+
+/// Create `/bin/stdiotest` via `CREATE_FROM_VFS` with a stdin endpoint init
+/// holds the SEND side of, then push a probe payload through stdin so the
+/// child's `read_line` returns. Exercises the full spawner-writes →
+/// child-reads → child-writes-stdout cycle end-to-end.
+pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
+{
+    let path = b"/bin/stdiotest";
+
+    let Ok(stdin_ep) = syscall::cap_create_endpoint()
+    else
+    {
+        log("init: phase 3: stdiotest cannot create stdin endpoint");
+        return;
+    };
+
+    // RECV side: handed to the child as its stdin cap.
+    let Ok(stdin_recv) = syscall::cap_derive(stdin_ep, syscall::RIGHTS_RECEIVE)
+    else
+    {
+        log("init: phase 3: stdiotest cannot derive stdin RECV");
+        return;
+    };
+    // SEND side: kept by init for writing the probe payload.
+    let Ok(stdin_send) = syscall::cap_derive(stdin_ep, syscall::RIGHTS_SEND)
+    else
+    {
+        log("init: phase 3: stdiotest cannot derive stdin SEND");
+        return;
+    };
+
+    ipc.write_word(0, pack_name(b"stdiotst"));
+    let path_words = write_path_at_offset(ipc, 1, path);
+    let word_count = 1 + path_words;
+
+    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
+    else
+    {
+        return;
+    };
+
+    let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
+    let Ok((reply_label, _)) = syscall::ipc_call(
+        procmgr_ep,
+        label,
+        word_count,
+        &[tokened_creator, stdin_recv],
+    )
+    else
+    {
+        log("init: phase 3: stdiotest CREATE_FROM_VFS failed");
+        return;
+    };
+    if reply_label != 0
+    {
+        log("init: phase 3: stdiotest CREATE_FROM_VFS error");
+        return;
+    }
+
+    // SAFETY: ipc wraps the registered IPC buffer.
+    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
+    if cap_count < 1
+    {
+        return;
+    }
+    let process_handle = reply_caps[0];
+
+    // Tier-2 binary: skip the bootstrap serve round (see hello).
+    let _ = child_token;
+
+    if !start_process(
+        process_handle,
+        "init: phase 3: stdiotest started",
+        "init: phase 3: stdiotest START_PROCESS failed",
+    )
+    {
+        return;
+    }
+
+    // Push the probe payload. Synchronous IPC: blocks until the child reaches
+    // `stdin().read_line(..)`. After `ipc_call` returns, the child has the
+    // bytes and will print its result on stdout.
+    let payload = b"hello seraph\n";
+    write_stream_bytes(stdin_send, ipc, payload);
+
+    // Cap hygiene: the stdin SEND cap has done its single job.
+    let _ = syscall::cap_delete(stdin_send);
+}
+
+/// Send `bytes` on `cap` using the same `STREAM_BYTES` wire protocol that
+/// ruststd's stdio path speaks. Used by init to push stdiotest's stdin
+/// payload. Mirrors `init::logging::ipc_log` but exposed here so callers
+/// outside the log path can write to byte-stream caps.
+fn write_stream_bytes(cap: u32, ipc: IpcBuf, bytes: &[u8])
+{
+    if bytes.is_empty()
+    {
+        return;
+    }
+    let mut offset = 0;
+    while offset < bytes.len()
+    {
+        let chunk_len = (bytes.len() - offset).min(syscall_abi::MSG_DATA_WORDS_MAX * 8);
+        let label = ipc::stream_labels::STREAM_BYTES | ((chunk_len as u64 & 0xFFFF) << 16);
+        let word_count = chunk_len.div_ceil(8);
+        for i in 0..syscall_abi::MSG_DATA_WORDS_MAX
+        {
+            let mut word: u64 = 0;
+            if i < word_count
+            {
+                let base = offset + i * 8;
+                for j in 0..8
+                {
+                    let idx = base + j;
+                    if idx < offset + chunk_len
+                    {
+                        word |= u64::from(bytes[idx]) << (j * 8);
+                    }
+                }
+            }
+            ipc.write_word(i, word);
+        }
+        let _ = syscall::ipc_call(cap, label, word_count, &[]);
+        offset += chunk_len;
     }
 }
 
@@ -861,7 +1031,6 @@ pub fn phase3_svcmgr_handover(
     info: &InitInfo,
     procmgr_ep: u32,
     bootstrap_ep: u32,
-    log_ep: u32,
     vfsd_service_ep: u32,
     ipc: IpcBuf,
 ) -> !
@@ -892,18 +1061,10 @@ pub fn phase3_svcmgr_handover(
     };
 
     let handover = SvcmgrHandoverCaps {
-        log_ep,
         svcmgr_service_ep,
         svcmgr_bootstrap_ep,
     };
-    setup_and_start_svcmgr(
-        procmgr_ep,
-        bootstrap_ep,
-        svcmgr_handle,
-        svcmgr_token,
-        &handover,
-        ipc,
-    );
+    setup_and_start_svcmgr(bootstrap_ep, svcmgr_handle, svcmgr_token, &handover, ipc);
 
     let crasher = create_crasher_suspended(info, procmgr_ep, bootstrap_ep, ipc);
 
@@ -920,7 +1081,6 @@ pub fn phase3_svcmgr_handover(
                 criticality: 1,    // CRITICALITY_NORMAL
                 thread_cap: crasher_thread,
                 module_cap: crasher_module,
-                log_ep,
                 bundle_name: b"svcmgr",
                 bundle_cap: svcmgr_service_ep,
             },
@@ -930,14 +1090,18 @@ pub fn phase3_svcmgr_handover(
             crasher_handle,
             crasher_token,
             bootstrap_ep,
-            log_ep,
             svcmgr_service_ep,
             ipc,
         );
     }
 
-    // Spawn allocsmoke (run-once test; no svcmgr registration).
-    create_and_run_allocsmoke(info, procmgr_ep, bootstrap_ep, log_ep, ipc);
+    // Spawn usertest (run-once test driver; no svcmgr registration).
+    create_and_run_usertest(info, procmgr_ep, bootstrap_ep, ipc);
+
+    // Cap-oblivious tier-2 demos: hello (write-only) and stdiotest (full
+    // stdin→process→stdout cycle, fed by init).
+    create_and_run_hello(procmgr_ep, bootstrap_ep, ipc);
+    create_and_run_stdiotest(procmgr_ep, bootstrap_ep, ipc);
 
     match syscall::ipc_call(svcmgr_service_ep, svcmgr_labels::HANDOVER_COMPLETE, 0, &[])
     {

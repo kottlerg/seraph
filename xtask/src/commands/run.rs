@@ -9,13 +9,14 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::{BuildArgs, BuildComponent, RunArgs};
 use crate::commands::build;
 use crate::context::Context as BuildContext;
-use crate::util::{run_with_sigint_ignored, step, TempFile, TerminalGuard};
+use crate::sysroot;
+use crate::util::{TempFile, TerminalGuard, run_with_sigint_ignored, step};
 
 /// OVMF firmware search paths (Fedora, Debian/Ubuntu, Arch).
 const OVMF_CODE_PATHS: &[&str] = &[
@@ -39,20 +40,38 @@ const PFLASH_SIZE: u64 = 32 * 1024 * 1024;
 /// Entry point for `cargo xtask run`.
 pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
 {
-    // Always build first. Cargo's incremental compilation makes this near-instant
-    // when nothing has changed. Use `cargo xtask clean` to force a full rebuild.
-    let build_args = BuildArgs {
-        arch: args.arch,
-        release: args.release,
-        component: BuildComponent::All,
-    };
-    build::run(ctx, &build_args)?;
+    // Build unless the caller opted out (`--no-build` for tight re-run
+    // loops that chase non-determinism in an existing image). Cargo's
+    // incremental compilation makes the default near-instant when nothing
+    // has changed; `cargo xtask clean` forces a full rebuild.
+    if !args.no_build
+    {
+        let build_args = BuildArgs {
+            arch: args.arch,
+            release: args.release,
+            component: BuildComponent::All,
+            // `xtask run` is the tight-loop command: skip fmt and clippy to
+            // avoid ~2× cargo invocations per component on a no-change
+            // re-run. `xtask build` still does the full pass.
+            skip_lints: true,
+        };
+        build::run(ctx, &build_args)?;
+    }
+
+    // With `--no-build` we skipped build::run, which also skipped the
+    // sysroot arch-stamp check. Re-run it here so a mismatched architecture
+    // is caught before QEMU ever starts.
+    if args.no_build
+    {
+        sysroot::check_arch(ctx, args.arch)?;
+    }
 
     // Validate that sysroot artifacts exist before launching QEMU.
     let efi_name = args.arch.boot_efi_filename();
     let boot_efi = ctx.sysroot_efi_boot().join(efi_name);
     let kernel_bin = ctx.sysroot_efi_seraph().join("kernel");
     let init_bin = ctx.sysroot_efi_seraph().join("init");
+    let disk_img = ctx.disk_image();
 
     if !boot_efi.exists()
     {
@@ -65,6 +84,13 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
     if !init_bin.exists()
     {
         bail!("init not found: {}", init_bin.display());
+    }
+    if !disk_img.exists()
+    {
+        bail!(
+            "disk image not found: {} (run `cargo xtask build` to produce it)",
+            disk_img.display()
+        );
     }
 
     if args.gdb
@@ -342,13 +368,26 @@ fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Resu
         // Pipe stdout: suppress all output until '[--------] boot:' appears.
         // This filters out UEFI DEBUG spam and OpenSBI banners on RISC-V.
         // Note: piping stdout disables the QEMU monitor (Ctrl+A c).
+        //
+        // Use byte-level reading with `from_utf8_lossy` so non-UTF-8 bytes in
+        // kernel fault dumps (e.g. raw memory content) don't abort the reader.
         let stdout = child.stdout.take().expect("stdout was piped");
-        let reader = BufReader::new(stdout);
+        let mut reader = BufReader::new(stdout);
         let mut show = false;
+        let mut buf: Vec<u8> = Vec::new();
 
-        for line in reader.lines()
+        loop
         {
-            let line = line.context("reading QEMU stdout")?;
+            buf.clear();
+            let n = reader
+                .read_until(b'\n', &mut buf)
+                .context("reading QEMU stdout")?;
+            if n == 0
+            {
+                break;
+            }
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end_matches(['\n', '\r']);
             if !show && line.contains("[--------] boot:")
             {
                 show = true;

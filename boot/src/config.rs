@@ -362,14 +362,7 @@ fn trim_ascii(s: &[u8]) -> &[u8]
     let is_ws = |b: &u8| *b == b' ' || *b == b'\t' || *b == b'\r';
     let start = s.iter().position(|b| !is_ws(b)).unwrap_or(s.len());
     let end = s.iter().rposition(|b| !is_ws(b)).map_or(0, |i| i + 1);
-    if start >= end
-    {
-        &[]
-    }
-    else
-    {
-        &s[start..end]
-    }
+    if start >= end { &[] } else { &s[start..end] }
 }
 
 /// Open `\EFI\seraph\boot.conf`, read it into a 4096-byte stack buffer, and

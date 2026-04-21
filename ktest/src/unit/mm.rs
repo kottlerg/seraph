@@ -16,7 +16,7 @@
 //! `frame_split` consumes the RODATA frame (`aspace_cap + 2`). TEXT and BSS
 //! frames are left intact for the tests that use them directly.
 
-use syscall::{aspace_query, mem_map, mem_unmap, MAP_READONLY, MAP_WRITABLE};
+use syscall::{MAP_READONLY, MAP_WRITABLE, aspace_query, mem_map, mem_unmap};
 
 use crate::{TestContext, TestResult};
 
@@ -147,7 +147,7 @@ pub fn mem_unmap_idempotent(ctx: &TestContext) -> TestResult
 /// ktest's own `_start` page is always mapped R-X; use it as a stable target.
 pub fn aspace_query_mapped(ctx: &TestContext) -> TestResult
 {
-    extern "C" {
+    unsafe extern "C" {
         fn _start();
     }
     let code_va = (_start as *const () as u64) & !0xFFF;

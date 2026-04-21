@@ -88,7 +88,7 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     // Validate boot signature.
     if sector_data[510] != 0x55 || sector_data[511] != 0xAA
     {
-        runtime::log!("fatfs: invalid boot signature");
+        println!("fatfs: invalid boot signature");
         return false;
     }
 
@@ -101,7 +101,7 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     // Validate fields used as divisors to prevent division by zero.
     if state.bytes_per_sector == 0 || state.sectors_per_cluster == 0
     {
-        runtime::log!("fatfs: invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
+        println!("fatfs: invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
         return false;
     }
 
@@ -161,20 +161,20 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     if total_clusters < 65525
     {
         state.fat_type = FatType::Fat16;
-        runtime::log!("fatfs: detected FAT16");
+        println!("fatfs: detected FAT16");
     }
     else
     {
         state.fat_type = FatType::Fat32;
-        runtime::log!("fatfs: detected FAT32");
+        println!("fatfs: detected FAT32");
     }
 
-    runtime::log!(
+    println!(
         "fatfs: sectors_per_cluster={:#018x}",
         u64::from(state.sectors_per_cluster)
     );
-    runtime::log!("fatfs: total_clusters={:#018x}", u64::from(total_clusters));
-    runtime::log!(
+    println!("fatfs: total_clusters={:#018x}", u64::from(total_clusters));
+    println!(
         "fatfs: data_start_sector={:#018x}",
         u64::from(state.data_start_sector)
     );

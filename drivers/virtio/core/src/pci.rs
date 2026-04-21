@@ -8,7 +8,7 @@
 //! Provides register-level access to the four `VirtIO` PCI capability regions
 //! (common cfg, notification, ISR, device cfg) mapped via MMIO BARs.
 
-use crate::{VirtioPciStartupInfo, STATUS_FEATURES_OK};
+use crate::{STATUS_FEATURES_OK, VirtioPciStartupInfo};
 
 /// Modern PCI transport backed by MMIO-mapped BAR regions.
 ///

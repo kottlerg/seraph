@@ -1,20 +1,18 @@
 [package]
-name = "allocsmoke"
+name = "usertest"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [[bin]]
-name = "allocsmoke"
+name = "usertest"
 path = "src/main.rs"
 test = false
 
 [dependencies]
-process-abi = { path = "../../abi/process-abi" }
 ipc = { path = "../../shared/ipc" }
-runtime = { path = "../../shared/runtime" }
 syscall = { path = "../../shared/syscall" }
-syscall-abi = { path = "../../abi/syscall" }
+shmem = { path = "../../shared/shmem" }
 
 [lints]
 workspace = true

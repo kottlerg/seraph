@@ -26,9 +26,9 @@ use syscall::SyscallError;
 #[cfg(not(test))]
 use super::{current_tcb, lookup_cap};
 #[cfg(not(test))]
-use crate::cap::slot::{CapTag, Rights};
-#[cfg(not(test))]
 use crate::cap::CSpace;
+#[cfg(not(test))]
+use crate::cap::slot::{CapTag, Rights};
 #[cfg(not(test))]
 use crate::ipc::message::Message;
 #[cfg(not(test))]
@@ -120,10 +120,13 @@ unsafe fn write_ipc_buf(buf: u64, count: usize, src: &[u64; MSG_DATA_WORDS_MAX])
 #[cfg(not(test))]
 unsafe fn write_cap_results(buf: u64, cap_count: usize, indices: &[u32; MSG_CAP_SLOTS_MAX])
 {
-    if buf == 0 || cap_count == 0
+    if buf == 0
     {
         return;
     }
+    // Always write the cap_count word, even when 0: stale values from a prior
+    // IPC round would otherwise be read by `read_recv_caps` and mismatch the
+    // declared cap count, tripping `debug_assert_eq!` on the caller side.
     // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
     #[allow(clippy::cast_possible_truncation)]
     let ptr = buf as *mut u64;
@@ -757,14 +760,19 @@ pub fn sys_signal_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_SIGNAL_WAIT` (4): block until a signal bit is set, then return the bits.
 ///
 /// arg0 = signal cap index.
+/// arg1 = `timeout_ms`. `0` blocks indefinitely (original behaviour). `> 0`
+///        blocks until bits are delivered *or* `timeout_ms` milliseconds
+///        have elapsed. On timeout the syscall returns `0` — unambiguous
+///        because `signal_send` rejects zero-bit sends.
 ///
-/// Returns the acquired bitmask in rax/a0.
+/// Returns the acquired bitmask in rax/a0 (0 = timeout).
 #[cfg(not(test))]
 pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
     let sig_idx = tf.arg(0) as u32;
+    let timeout_ms = tf.arg(1);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -795,14 +803,32 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Ok(bits);
     }
 
-    // No bits; thread is Blocked. Yield CPU.
+    // No bits; thread is Blocked on the signal. For a timed wait we also
+    // register in the sleep list so the timer tick wakes us if no signal
+    // arrives. Arbitration between signal_send and the timer path is done
+    // in `sleep_check_wakeups` (see there).
+    if timeout_ms != 0
+    {
+        let tps = crate::arch::current::timer::ticks_per_second();
+        let now = crate::arch::current::timer::current_tick();
+        let deadline = now.saturating_add(timeout_ms.saturating_mul(tps) / 1000);
+        // SAFETY: tcb valid; thread already Blocked above.
+        unsafe {
+            (*tcb).sleep_deadline = deadline;
+        }
+        crate::sched::sleep_list_add(tcb);
+    }
+
+    // Yield CPU.
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(false);
     }
 
-    // On resume, `signal_send` stored the delivered bits in wakeup_value.
-    // SAFETY: tcb still valid after resume; wakeup_value set by signal_send.
+    // On resume, either `signal_send` stored delivered bits in wakeup_value,
+    // or the timer path cleared wakeup_value to 0 (timeout). Both paths
+    // clear `sleep_deadline` as part of claiming the wake.
+    // SAFETY: tcb still valid after resume; wakeup_value set by the waker.
     let bits = unsafe { (*tcb).wakeup_value };
     // SAFETY: tcb validated above.
     unsafe {
@@ -876,15 +902,20 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_EVENT_RECV` (6): dequeue the next entry from an event queue.
 ///
 /// arg0 = event queue cap index (must have RECV right).
+/// arg1 = non-blocking flag: `0` = block (wait until an entry is posted,
+///        the pre-timeout behaviour); `1` = try once and return
+///        `WouldBlock` if the queue is empty.
 ///
-/// Blocks if the queue is empty. On return, the payload is in the secondary
-/// return register (rdx on x86-64, a1 on RISC-V).
+/// On success returns `0` in rax/a0 and the payload in the secondary return
+/// register (rdx/a1). A timed-wait variant may be added on the same syscall
+/// later; for now only block / try-once are exposed.
 #[cfg(not(test))]
 pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
     let eq_idx = tf.arg(0) as u32;
+    let nonblocking = tf.arg(1) != 0;
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -915,8 +946,26 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         tf.set_ipc_return(0, payload);
         return Ok(0);
     }
-    // else: Queue empty; thread is Blocked. Yield CPU.
 
+    // Queue was empty; `event_queue_recv` has parked `tcb` (state = Blocked,
+    // eq.waiter = tcb). In non-blocking mode we roll that back and return
+    // `WouldBlock` instead of yielding.
+    if nonblocking
+    {
+        // SAFETY: tcb parked above; eq_state still valid. Single-threaded
+        // procmgr-style callers invoke this between scheduler ticks; no
+        // concurrent post can race with this rollback against this eq
+        // because we were just written as the sole waiter.
+        unsafe {
+            (*eq_state).waiter = core::ptr::null_mut();
+            (*tcb).state = crate::sched::thread::ThreadState::Ready;
+            (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
+            (*tcb).blocked_on_object = core::ptr::null_mut();
+        }
+        return Err(SyscallError::WouldBlock);
+    }
+
+    // Blocking case (arg1 == 0): yield CPU.
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(false);

@@ -16,9 +16,11 @@ Process startup in Seraph has two layers:
    initial capability layout, IPC buffer, and startup context.
 
 2. **`main()` convention** — the universal entry point signature. Every Seraph
-   userspace binary defines `main()` with a `&StartupInfo` argument.
-   `_start()` (provided by a runtime crate) reads the handover struct,
-   constructs a `StartupInfo`, and calls `main()`.
+   userspace binary defines `main()`; `_start()` reads the handover struct,
+   constructs a `StartupInfo`, and calls `main()`. std-built services use an
+   idiomatic `fn main()` that reaches the caps via `std::os::seraph::startup_info()`.
+   procmgr, init, and ktest run on bespoke runtimes and take `&StartupInfo`
+   directly.
 
 Both layers are defined in this crate. Init is a special case: its handover
 struct is `InitInfo` (from [`abi/init-protocol`](../init-protocol/README.md)),
@@ -64,62 +66,47 @@ pub struct ProcessInfo {
     /// before the process starts.
     pub ipc_buffer_vaddr: u64,
 
-    /// CSpace slot of an IPC endpoint back to the creating service.
+    /// CSpace slot of a tokened send cap to the creator's bootstrap
+    /// endpoint.
     ///
-    /// For processes created by procmgr directly, this is an endpoint to
-    /// procmgr. For processes created on behalf of another service (e.g.
-    /// devmgr requesting a driver), the endpoint MAY point to the
-    /// requesting service instead. Zero if no creator endpoint is provided.
+    /// For processes created by procmgr directly, this points at procmgr's
+    /// bootstrap endpoint or, for services created on behalf of another
+    /// service (devmgr spawning a driver, vfsd spawning a filesystem
+    /// driver), at that service's bootstrap endpoint. The child issues
+    /// `ipc::bootstrap::REQUEST` rounds on this cap to collect its
+    /// service-specific capability set. Zero when no creator endpoint is
+    /// supplied (e.g. processes that receive all of their caps through
+    /// `ProcessInfo` alone).
     pub creator_endpoint_cap: u32,
 
-    // ── Initial capabilities ────────────────────────────────────────
+    // ── Universal service endpoints ─────────────────────────────────
 
-    /// First CSpace slot containing service-specific initial capabilities.
+    /// CSpace slot of a tokened SEND cap on procmgr's service endpoint.
     ///
-    /// The capabilities in slots `initial_caps_base` through
-    /// `initial_caps_base + initial_caps_count - 1` are the process's
-    /// initial authority, delegated by the creating service.
-    pub initial_caps_base: u32,
+    /// Populated for every procmgr-spawned child so `std::os::seraph::
+    /// _start` can bootstrap the `System` allocator via `REQUEST_FRAMES`
+    /// before the user's `fn main()` runs. Zero for processes with no
+    /// procmgr above them (procmgr itself, or init/ktest which receive
+    /// `InitInfo` instead).
+    pub procmgr_endpoint_cap: u32,
 
-    /// Number of initial capability slots.
-    pub initial_caps_count: u32,
-
-    /// Number of `CapDescriptor` entries following this struct.
-    pub cap_descriptor_count: u32,
-
-    /// Byte offset from the start of this struct to the first
-    /// `CapDescriptor` entry.
+    /// CSpace slot of a SEND cap on the system log endpoint.
     ///
-    /// The descriptor array describes each initial capability so the
-    /// process can identify what each slot represents without probing.
-    pub cap_descriptors_offset: u32,
-
-    // ── Startup message ─────────────────────────────────────────────
-
-    /// Byte offset from the start of this struct to the startup message.
-    /// Zero if no startup message is present.
-    ///
-    /// The startup message is an opaque byte sequence provided by the
-    /// creating service. Typical contents: service name, configuration
-    /// parameters, or a serialised argument structure.
-    pub startup_message_offset: u32,
-
-    /// Length of the startup message in bytes. Zero if absent.
-    pub startup_message_len: u32,
-
-    /// Padding to maintain 8-byte alignment for the trailing
-    /// `CapDescriptor` array.
-    pub _pad: u32,
+    /// Bound to `Stdout`/`Stderr` by `std::os::seraph::_start`, so
+    /// `println!`/`eprintln!` work without per-service bootstrap-round
+    /// wiring. Zero when no log sink is available — consumers MUST
+    /// tolerate zero (stdio writes are silently dropped, matching
+    /// `unsupported` semantics).
+    pub log_endpoint_cap: u32,
 }
 ```
 
-The `CapDescriptor` type is shared with `abi/init-protocol` (or defined
-identically) so that both init and normal processes use the same descriptor
-format for identifying capabilities by type and metadata.
-
 ### Fixed CSpace slot conventions
 
-Slots 0 through `initial_caps_base - 1` have fixed assignments:
+The fields listed above are the only well-known slots. Service-specific
+capabilities (device handles, BAR/IRQ caps, block-device endpoints, registry
+caps, …) are delivered by the creator to the child over the `ipc::bootstrap`
+protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 
 | Slot | Content |
 |---|---|
@@ -127,10 +114,9 @@ Slots 0 through `initial_caps_base - 1` have fixed assignments:
 | `self_thread_cap` | Thread capability (Control) |
 | `self_aspace_cap` | AddressSpace capability |
 | `self_cspace_cap` | CSpace capability |
-| `creator_endpoint_cap` | Endpoint to creating service (if nonzero) |
-
-Slots from `initial_caps_base` onward are service-specific and described by the
-`CapDescriptor` array.
+| `creator_endpoint_cap` | Tokened send cap back to the creator's bootstrap endpoint (if nonzero) |
+| `procmgr_endpoint_cap` | Tokened SEND cap on procmgr's service endpoint (if nonzero) |
+| `log_endpoint_cap` | SEND cap on the system log endpoint (if nonzero) |
 
 ---
 
@@ -141,18 +127,12 @@ providing ergonomic access to the handover data. It is constructed by `_start()`
 from either `ProcessInfo` (normal processes) or `InitInfo` (init/ktest).
 
 ```rust
-pub struct StartupInfo<'a> {
-    /// Capability descriptors for initial capabilities.
-    pub initial_caps: &'a [CapDescriptor],
-
+pub struct StartupInfo {
     /// Virtual address of the IPC buffer page.
     pub ipc_buffer: *mut u8,
 
-    /// CSpace slot of the parent endpoint. Zero if none.
+    /// CSpace slot of the creator endpoint. Zero if none.
     pub creator_endpoint: u32,
-
-    /// Startup message bytes. Empty slice if none.
-    pub startup_message: &'a [u8],
 
     /// CSpace slot of own Thread capability.
     pub self_thread: u32,
@@ -162,11 +142,19 @@ pub struct StartupInfo<'a> {
 
     /// CSpace slot of own CSpace capability.
     pub self_cspace: u32,
+
+    /// CSpace slot of a tokened SEND cap on procmgr's service endpoint.
+    /// Zero when unreachable.
+    pub procmgr_endpoint: u32,
+
+    /// CSpace slot of a SEND cap on the system log endpoint. Zero when
+    /// no log sink has been attached yet.
+    pub log_endpoint: u32,
 }
 ```
 
-`StartupInfo` borrows from the handover page — the page remains mapped
-(read-only) for the lifetime of the process, so the borrow is valid.
+Values are copied out of the handover page verbatim, so the struct does
+not borrow from it.
 
 ---
 
@@ -183,21 +171,22 @@ It MUST NOT return — processes terminate by calling `sys_thread_exit`. If
 `main()` could return, the `_start()` stub calls `sys_thread_exit(0)` as a
 safety net.
 
-A runtime crate (anticipated in `shared/`) will provide the `_start()`
-implementation that:
+`_start()` is provided by three distinct runtimes, chosen by build profile:
 
-1. Reads the handover struct from the well-known virtual address
-2. Validates the protocol version
-3. Constructs `StartupInfo` from the handover fields
-4. Calls `main()`
-5. Calls `sys_thread_exit` if `main()` returns (defensive; should not happen)
+- **std-built services** — `std::os::seraph::_start` (shipped via the
+  `ruststd/` overlay) reads `ProcessInfo`, registers the IPC buffer,
+  bootstraps the heap against the `procmgr_endpoint` delivered in
+  `ProcessInfo`, then jumps to `lang_start` → user `fn main`.
+- **procmgr** — `procmgr/src/rt.rs` ships a minimal `core`-only `_start`
+  and panic handler. procmgr cannot heap-bootstrap against itself and
+  uses no `alloc` collections.
+- **init / ktest** — bespoke `_start` entries that consume `InitInfo`
+  from `INIT_INFO_VADDR` (defined in `abi/init-protocol`) rather than
+  `ProcessInfo`, because the kernel — not procmgr — is their producer.
 
-Two `_start()` variants will exist:
-- **Normal process `_start()`** — reads `ProcessInfo` from `PROCESS_INFO_VADDR`
-- **Init/ktest `_start()`** — reads `InitInfo` from `INIT_INFO_VADDR`
-  (defined in `abi/init-protocol`)
-
-Both produce the same `StartupInfo` and call the same `main()`.
+All variants produce the same `StartupInfo` shape and invoke `main()`,
+then call `sys_thread_exit` if `main()` returns (defensive — should not
+happen).
 
 ---
 

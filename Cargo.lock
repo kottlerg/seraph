@@ -3,17 +3,6 @@
 version = 4
 
 [[package]]
-name = "allocsmoke"
-version = "0.1.0"
-dependencies = [
- "ipc",
- "process-abi",
- "runtime",
- "syscall",
- "syscall-abi",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,8 +195,6 @@ name = "crasher"
 version = "0.1.0"
 dependencies = [
  "ipc",
- "process-abi",
- "runtime",
  "syscall",
 ]
 
@@ -231,8 +218,6 @@ name = "devmgr"
 version = "0.1.0"
 dependencies = [
  "ipc",
- "process-abi",
- "runtime",
  "syscall",
  "syscall-abi",
  "virtio-core",
@@ -253,8 +238,6 @@ name = "fatfs"
 version = "0.1.0"
 dependencies = [
  "ipc",
- "process-abi",
- "runtime",
  "syscall",
  "syscall-abi",
 ]
@@ -334,6 +317,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hello"
+version = "0.1.0"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -395,6 +382,7 @@ version = "0.1.0"
 name = "ipc"
 version = "0.1.0"
 dependencies = [
+ "rustc-std-workspace-core",
  "syscall",
  "syscall-abi",
 ]
@@ -513,6 +501,9 @@ dependencies = [
 [[package]]
 name = "process-abi"
 version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+]
 
 [[package]]
 name = "procmgr"
@@ -521,7 +512,6 @@ dependencies = [
  "elf",
  "ipc",
  "process-abi",
- "runtime",
  "syscall",
  "syscall-abi",
 ]
@@ -546,15 +536,10 @@ name = "registry"
 version = "0.1.0"
 
 [[package]]
-name = "runtime"
-version = "0.1.0"
-dependencies = [
- "ipc",
- "process-abi",
- "syscall",
- "syscall-abi",
- "va_layout",
-]
+name = "rustc-std-workspace-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa9c45b374136f52f2d6311062c7146bff20fec063c3f5d46a410bd937746955"
 
 [[package]]
 name = "rustversion"
@@ -617,10 +602,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "shmem"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "simple-bytes"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c11532d9d241904f095185f35dcdaf930b1427a94d5b01d7002d74ba19b44cc4"
+
+[[package]]
+name = "stdiotest"
+version = "0.1.0"
 
 [[package]]
 name = "strsim"
@@ -633,9 +631,7 @@ name = "svcmgr"
 version = "0.1.0"
 dependencies = [
  "ipc",
- "process-abi",
  "registry",
- "runtime",
  "syscall",
  "syscall-abi",
 ]
@@ -655,12 +651,16 @@ dependencies = [
 name = "syscall"
 version = "0.1.0"
 dependencies = [
+ "rustc-std-workspace-core",
  "syscall-abi",
 ]
 
 [[package]]
 name = "syscall-abi"
 version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+]
 
 [[package]]
 name = "unicode-ident"
@@ -673,6 +673,15 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "usertest"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "shmem",
+ "syscall",
+]
 
 [[package]]
 name = "utf8parse"
@@ -694,14 +703,15 @@ dependencies = [
 [[package]]
 name = "va_layout"
 version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+]
 
 [[package]]
 name = "vfsd"
 version = "0.1.0"
 dependencies = [
  "ipc",
- "process-abi",
- "runtime",
  "syscall",
  "syscall-abi",
 ]
@@ -711,8 +721,6 @@ name = "virtio-blk"
 version = "0.1.0"
 dependencies = [
  "ipc",
- "process-abi",
- "runtime",
  "syscall",
  "syscall-abi",
  "virtio-core",

@@ -9,7 +9,7 @@
 //! discriminant).
 
 use syscall::system_info;
-use syscall_abi::{SyscallError, SystemInfoType, KERNEL_VERSION};
+use syscall_abi::{KERNEL_VERSION, SyscallError, SystemInfoType};
 
 use crate::{TestContext, TestResult};
 

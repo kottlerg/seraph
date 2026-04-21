@@ -17,7 +17,7 @@ use crate::acpi;
 use crate::dtb;
 use crate::error::BootError;
 use crate::firmware::FirmwareInfo;
-use crate::uefi::{allocate_pages, EfiBootServices};
+use crate::uefi::{EfiBootServices, allocate_pages};
 use crate::{bprint, bprintln};
 use boot_protocol::{FramebufferInfo, PlatformResource, ResourceType};
 

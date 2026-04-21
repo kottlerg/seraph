@@ -37,7 +37,7 @@ core::arch::global_asm!(
     "_handoff_trampoline_end:",
 );
 
-extern "C" {
+unsafe extern "C" {
     static _handoff_trampoline: u8;
     static _handoff_trampoline_end: u8;
 }

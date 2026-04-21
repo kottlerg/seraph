@@ -27,7 +27,7 @@ use boot_protocol::{BootInfo, MemoryMapEntry, MemoryType, PlatformResource, Reso
 
 use crate::arch::current::{HAS_IO_PORTS, MAX_IRQ_ID, MIN_IRQ_ID};
 use crate::kprintln;
-use crate::mm::{paging::phys_to_virt, PAGE_SIZE};
+use crate::mm::{PAGE_SIZE, paging::phys_to_virt};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 

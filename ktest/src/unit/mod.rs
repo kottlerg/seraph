@@ -31,8 +31,8 @@ pub mod sysinfo;
 pub mod thread;
 pub mod wait_set;
 
-use crate::run_test;
 use crate::TestContext;
+use crate::run_test;
 
 /// Run all Tier 1 tests in order.
 ///

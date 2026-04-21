@@ -1,7 +1,7 @@
 [package]
 name = "syscall"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lib]
@@ -10,6 +10,14 @@ doctest = false
 
 [dependencies]
 syscall-abi = { path = "../../abi/syscall" }
+# When std lists this crate as a dep, build-std activates
+# `rustc-dep-of-std`; that enables the same feature in syscall-abi and the
+# rustc-std-workspace-core facade so `core::arch::asm!` and friends resolve
+# against the build-std core. No source changes required.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = ["rustc-std-workspace-core", "syscall-abi/rustc-dep-of-std"]
 
 [lints]
 workspace = true

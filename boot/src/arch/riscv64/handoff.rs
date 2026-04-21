@@ -21,7 +21,7 @@ core::arch::global_asm!(
     "_handoff_trampoline_end:",
 );
 
-extern "C" {
+unsafe extern "C" {
     /// Linker symbol at the first byte of the handoff trampoline stub.
     pub static _handoff_trampoline: u8;
     static _handoff_trampoline_end: u8;

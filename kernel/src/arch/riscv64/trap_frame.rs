@@ -149,6 +149,16 @@ impl TrapFrame
     {
         self.a0 = val;
     }
+
+    /// Set the thread-local-storage pointer (`tp`, x4) in the frame.
+    ///
+    /// `return_to_user` restores `tp` from this field on every U-mode entry,
+    /// so this is the canonical per-thread TLS storage on RISC-V. Pass 0 for
+    /// a thread that does not use TLS.
+    pub fn set_tls_base(&mut self, tls_base: u64)
+    {
+        self.tp = tls_base;
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

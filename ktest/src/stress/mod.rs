@@ -12,6 +12,7 @@
 //! Each stress test uses [`run_integration_test!`](crate::run_integration_test)
 //! for logging and PASS/FAIL counting.
 
+mod cap_delete_running;
 mod cap_revoke_under_use;
 mod cap_tree_deep;
 mod concurrent_ipc;
@@ -20,7 +21,7 @@ mod concurrent_signal;
 mod event_queue_fill_drain;
 mod thread_churn;
 
-use crate::{run_integration_test, ChildStack, TestContext};
+use crate::{ChildStack, TestContext, run_integration_test};
 
 /// Maximum concurrent child threads across all stress tests.
 const MAX_STRESS_THREADS: usize = 16;
@@ -40,6 +41,7 @@ pub fn run_all(ctx: &TestContext)
         event_queue_fill_drain::run(ctx)
     );
     run_integration_test!("stress::thread_churn", thread_churn::run(ctx));
+    run_integration_test!("stress::cap_delete_running", cap_delete_running::run(ctx));
     run_integration_test!("stress::concurrent_signal", concurrent_signal::run(ctx));
     run_integration_test!("stress::concurrent_ipc", concurrent_ipc::run(ctx));
     run_integration_test!(

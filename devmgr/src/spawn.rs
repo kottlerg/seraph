@@ -7,9 +7,10 @@
 //!
 //! Creates driver processes via procmgr, then serves the driver's bootstrap
 //! over IPC to deliver its per-device capability set (BAR MMIO, IRQ, service
-//! endpoint, log, procmgr endpoint, devmgr query endpoint).
+//! endpoint, devmgr query endpoint). log + procmgr caps arrive via
+//! `ProcessInfo` and are not part of this protocol.
 
-use ipc::{procmgr_labels, IpcBuf};
+use ipc::{IpcBuf, procmgr_labels};
 
 /// Monotonic counter for driver-child bootstrap tokens.
 static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -34,7 +35,6 @@ pub struct DriverSpawnConfig<'a>
     pub module_cap: u32,
     pub bars: BarSpec<'a>,
     pub irq_cap: Option<u32>,
-    pub log_ep: u32,
     pub service_ep: u32,
     pub registry_ep: u32,
     pub device_token: u64,
@@ -48,9 +48,11 @@ pub struct DriverSpawnConfig<'a>
 /// driver can query devmgr for its device configuration.
 ///
 /// Layout matches `drivers/virtio/blk/src/main.rs::bootstrap_caps`:
-///   Round 1 (4 caps): BAR MMIO, IRQ, driver service endpoint, log endpoint.
-///   Round 2 (2 caps): procmgr endpoint, devmgr query endpoint.
-// clippy::too_many_lines: driver spawn is a single transaction — derive six
+///   Round 1 (3 caps): BAR MMIO, IRQ, driver service endpoint.
+///   Round 2 (1 cap): devmgr query endpoint.
+///
+/// log + procmgr endpoints arrive via `ProcessInfo`.
+// clippy::too_many_lines: driver spawn is a single transaction — derive the
 // per-child caps, install them into the suspended child, and serve two
 // bootstrap rounds against one shared `ipc` buffer. Each derive owns a slot
 // that must be released cooperatively on partial failure; extracting helpers
@@ -65,19 +67,18 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
     let Some(bar_cap) = config.bars.caps.first().copied()
     else
     {
-        runtime::log!("devmgr: driver spawn: no BAR cap");
+        println!("devmgr: driver spawn: no BAR cap");
         return;
     };
     let Some(irq_slot) = config.irq_cap
     else
     {
-        runtime::log!("devmgr: driver spawn: no IRQ cap");
+        println!("devmgr: driver spawn: no IRQ cap");
         return;
     };
     let procmgr_ep = config.procmgr_ep;
     let bootstrap_ep = config.bootstrap_ep;
     let module_cap = config.module_cap;
-    let log_ep = config.log_ep;
     let service_ep = config.service_ep;
     let registry_ep = config.registry_ep;
     let device_token = config.device_token;
@@ -88,7 +89,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
         syscall::cap_derive_token(bootstrap_ep, syscall::RIGHTS_SEND, child_token)
     else
     {
-        runtime::log!("devmgr: driver spawn: tokened creator derivation failed");
+        println!("devmgr: driver spawn: tokened creator derivation failed");
         return;
     };
 
@@ -101,12 +102,12 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
     )
     else
     {
-        runtime::log!("devmgr: driver CREATE_PROCESS ipc_call failed");
+        println!("devmgr: driver CREATE_PROCESS ipc_call failed");
         return;
     };
     if reply_label != 0
     {
-        runtime::log!("devmgr: driver CREATE_PROCESS failed");
+        println!("devmgr: driver CREATE_PROCESS failed");
         return;
     }
 
@@ -114,7 +115,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
     let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
     if cap_count < 2
     {
-        runtime::log!("devmgr: driver CREATE_PROCESS reply missing caps");
+        println!("devmgr: driver CREATE_PROCESS reply missing caps");
         return;
     }
     let process_handle = reply_caps[0];
@@ -129,19 +130,6 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
     else
     {
         return;
-    };
-    let Ok(procmgr_copy) = syscall::cap_derive(procmgr_ep, syscall::RIGHTS_SEND_GRANT)
-    else
-    {
-        return;
-    };
-    let log_copy = if log_ep != 0
-    {
-        syscall::cap_derive(log_ep, syscall::RIGHTS_SEND).unwrap_or(0)
-    }
-    else
-    {
-        0
     };
     let service_copy = if service_ep != 0
     {
@@ -164,39 +152,32 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
         Ok((0, _))
     )
     {
-        runtime::log!("devmgr: driver START_PROCESS failed");
+        println!("devmgr: driver START_PROCESS failed");
         return;
     }
 
-    // Serve bootstrap round 1: [bar, irq, service, log].
+    // Serve bootstrap round 1: [bar, irq, service].
     if ipc::bootstrap::serve_round(
         bootstrap_ep,
         child_token,
         ipc,
         false,
-        &[bar_copy, irq_copy, service_copy, log_copy],
+        &[bar_copy, irq_copy, service_copy],
         &[],
     )
     .is_err()
     {
-        runtime::log!("devmgr: driver bootstrap round 1 failed");
+        println!("devmgr: driver bootstrap round 1 failed");
         return;
     }
 
-    // Round 2: [procmgr, devmgr_query], done.
-    if ipc::bootstrap::serve_round(
-        bootstrap_ep,
-        child_token,
-        ipc,
-        true,
-        &[procmgr_copy, devmgr_copy],
-        &[],
-    )
-    .is_err()
+    // Round 2: [devmgr_query], done.
+    if ipc::bootstrap::serve_round(bootstrap_ep, child_token, ipc, true, &[devmgr_copy], &[])
+        .is_err()
     {
-        runtime::log!("devmgr: driver bootstrap round 2 failed");
+        println!("devmgr: driver bootstrap round 2 failed");
         return;
     }
 
-    runtime::log!("devmgr: driver started");
+    println!("devmgr: driver started");
 }

@@ -31,9 +31,9 @@ use core::sync::atomic::AtomicBool;
 #[cfg(not(test))]
 use core::sync::atomic::Ordering;
 
+use super::BuddyAllocator;
 use super::size_class::SizeClassAllocator;
 use super::slab::SlabCache;
-use super::BuddyAllocator;
 
 // ── KernelHeapInner ───────────────────────────────────────────────────────────
 

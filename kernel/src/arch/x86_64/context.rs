@@ -78,6 +78,19 @@ impl SavedState
     }
 }
 
+/// Seed the initial TLS base for a thread being configured.
+///
+/// x86-64 carries the canonical per-thread TLS pointer in
+/// `SavedState.fs_base`. The first `switch()` into this thread loads the
+/// value into `IA32_FS_BASE` via `wrmsr` before jumping to the user-thread
+/// trampoline; subsequent switches `rdmsr` the live MSR on save and `wrmsr`
+/// on restore.
+#[inline]
+pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64)
+{
+    saved.fs_base = tls_base;
+}
+
 // ── new_state ─────────────────────────────────────────────────────────────────
 
 /// Construct the initial [`SavedState`] for a new thread.
@@ -135,9 +148,6 @@ pub unsafe extern "C" fn switch(
         "mov [rdi + 40], r13",
         "mov [rdi + 48], r14",
         "mov [rdi + 56], r15",
-        // fs_base: phase 9 kernel threads use 0; skip RDMSR for simplicity.
-        "xor eax, eax",
-        "mov [rdi + 64], rax",
         // rflags
         "pushfq",
         "pop rax",
@@ -145,16 +155,33 @@ pub unsafe extern "C" fn switch(
         // ── Signal save complete + release lock ───────────────────────────
         // On x86-64 TSO, stores are globally visible in program order and
         // the lock was released by release_lock_only() before the call.
-        // Set the context_saved flag for cross-arch consistency.
+        // Set the context_saved flag for cross-arch consistency. Do this
+        // BEFORE the rdmsr below, which clobbers rdx (the save_flag ptr).
         "test rdx, rdx",
         "jz 1f",
         "mov dword ptr [rdx], 1", // *save_flag = 1 (TSO: implicitly ordered)
         "1:",
+        // fs_base: read the currently-live user TLS base from IA32_FS_BASE
+        // (MSR 0xc0000100). rdmsr returns high 32 bits in edx, low 32 in
+        // eax; combine into rax. Clobbers rcx/rdx/rax (all caller-saved,
+        // and rdx/save_flag is no longer needed at this point).
+        "mov ecx, 0xc0000100",
+        "rdmsr",
+        "shl rdx, 32",
+        "or  rax, rdx",
+        "mov [rdi + 64], rax",
         // ── Restore next thread ───────────────────────────────────────────
         // Restore rflags first so the restored flags take effect early.
         "mov rax, [rsi + 72]",
         "push rax",
         "popfq",
+        // Restore fs_base into IA32_FS_BASE before any register the wrmsr
+        // clobbers (rcx/rdx/rax) is finalised for the jump.
+        "mov rax, [rsi + 64]",
+        "mov rdx, rax",
+        "shr rdx, 32", // edx = high 32 bits
+        "mov ecx, 0xc0000100",
+        "wrmsr", // IA32_FS_BASE = next.fs_base
         "mov r15, [rsi + 56]",
         "mov r14, [rsi + 48]",
         "mov r13, [rsi + 40]",

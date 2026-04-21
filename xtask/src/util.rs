@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 // ── SIGINT isolation ──────────────────────────────────────────────────────────
 
@@ -27,7 +27,7 @@ where
 {
     // POSIX guarantees: SIGINT = 2, SIG_DFL = 0, SIG_IGN = 1 on all targets
     // we care about (Linux x86-64, Linux riscv64). xtask is host-only.
-    extern "C" {
+    unsafe extern "C" {
         fn signal(signum: i32, handler: usize) -> usize;
     }
     // SAFETY: signal() is async-signal-safe. We restore the previous disposition
@@ -190,7 +190,7 @@ struct Winsize
     ws_ypixel: u16,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
 }
 

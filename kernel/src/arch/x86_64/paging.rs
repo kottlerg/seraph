@@ -454,8 +454,8 @@ fn user_walk_or_alloc(
     allocator: &mut crate::mm::BuddyAllocator,
 ) -> Result<u64, ()>
 {
-    use crate::mm::paging::phys_to_virt;
     use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
 
     // Set USER bit so lower-level tables are accessible from ring 3.
     const USER: u64 = 1 << 2;
@@ -478,6 +478,86 @@ fn user_walk_or_alloc(
     *entry = table_pte;
 
     Ok(frame_pa)
+}
+
+/// Walk the user half of the page table rooted at `root_virt` and free every
+/// intermediate table frame (PDPT, PD, PT) back to `allocator`.
+///
+/// Leaf PTEs (4 KiB and 2 MiB large pages) point at physical memory owned by
+/// Frame capabilities; those frames are freed through `FrameObject` teardown
+/// when the owning `CSpace` is destroyed, not here. This function only
+/// reclaims the *page-table* pages the aspace allocated via
+/// `user_walk_or_alloc`. The root PML4 itself is not freed here; the caller
+/// in `dealloc_object(AddressSpace)` frees it after this walk completes.
+///
+/// Only entries in PML4 indices 0..256 (user half) are examined. Kernel-half
+/// entries (256..512) are copies of the global kernel PML4; freeing any of
+/// their descendants would corrupt every other address space.
+///
+/// # Safety
+/// `root_virt` must be the direct-map virtual address of a valid 4 KiB PML4
+/// frame. No CPU may still be using this address space (the caller verifies
+/// `active_cpu_mask() == 0` before invocation).
+#[cfg(not(test))]
+pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::BuddyAllocator)
+{
+    use crate::mm::paging::phys_to_virt;
+
+    const LARGE_PAGE_BIT: u64 = 1 << 7;
+
+    // SAFETY: root_virt is direct-map VA of a valid PML4 page; caller's contract.
+    let pml4 = unsafe { table_at(root_virt) };
+    for pml4e in pml4.iter().take(256)
+    {
+        if !pml4e.is_present()
+        {
+            continue;
+        }
+        // PML4 entries never encode a leaf on x86-64 (no 512 GiB page support
+        // on this target). Treat every present entry as a PDPT pointer.
+        let pdpt_pa = pml4e.phys_addr();
+        // SAFETY: pdpt_pa from a present PML4E points at a live PDPT frame.
+        let pdpt = unsafe { table_at(phys_to_virt(pdpt_pa)) };
+        for pdpte in pdpt.iter()
+        {
+            if !pdpte.is_present()
+            {
+                continue;
+            }
+            // 1 GiB large-page leaves are not produced by the user mapping
+            // path today; guard against them anyway so future additions don't
+            // leak or crash.
+            if pdpte.0 & LARGE_PAGE_BIT != 0
+            {
+                continue;
+            }
+            let pd_pa = pdpte.phys_addr();
+            // SAFETY: pd_pa from a present PDPTE points at a live PD frame.
+            let pd = unsafe { table_at(phys_to_virt(pd_pa)) };
+            for pde in pd.iter()
+            {
+                if !pde.is_present()
+                {
+                    continue;
+                }
+                // 2 MiB large-page leaves skip the PT level — no PT to free.
+                if pde.0 & LARGE_PAGE_BIT != 0
+                {
+                    continue;
+                }
+                let pt_pa = pde.phys_addr();
+                // SAFETY: pt_pa allocated by `user_walk_or_alloc` from the
+                // buddy as order-0; caller guarantees no CPU still references it.
+                unsafe { allocator.free(pt_pa, 0) };
+            }
+            // SAFETY: pd_pa allocated by `user_walk_or_alloc` from the buddy
+            // as order-0; all descendant PT frames just freed above.
+            unsafe { allocator.free(pd_pa, 0) };
+        }
+        // SAFETY: pdpt_pa allocated by `user_walk_or_alloc` from the buddy
+        // as order-0; all descendant PD frames just freed above.
+        unsafe { allocator.free(pdpt_pa, 0) };
+    }
 }
 
 /// Flush the TLB entry for a single page at `virt` using `invlpg`.
@@ -570,7 +650,7 @@ pub unsafe fn protect_user_page(
     flags: crate::mm::paging::PageFlags,
 ) -> Result<(), crate::mm::paging::PagingError>
 {
-    use crate::mm::paging::{phys_to_virt, PagingError};
+    use crate::mm::paging::{PagingError, phys_to_virt};
 
     // Set USER bit (bit 2) to preserve user accessibility.
     const USER: u64 = 1 << 2;

@@ -272,7 +272,8 @@ unsafe fn send_sipi(target_apic_id: u32, vector: u8)
 pub unsafe fn send_tlb_shootdown_ipi(target_apic_id: u32)
 {
     // Wait for previous IPI to complete before sending a new one.
-    wait_icr_idle();
+    // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
+    unsafe { wait_icr_idle() };
 
     // SAFETY: APIC MMIO region is valid; ICR_HIGH takes destination in bits [31:24].
     unsafe {
@@ -297,7 +298,7 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
 {
     // Wait for previous IPI to complete before sending a new one.
     // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
-    wait_icr_idle();
+    unsafe { wait_icr_idle() };
 
     // SAFETY: APIC MMIO region is valid; ICR_HIGH takes destination in bits [31:24].
     unsafe {

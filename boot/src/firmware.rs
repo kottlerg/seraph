@@ -10,7 +10,7 @@
 //! are present. Full ACPI and Device Tree parsing is deferred to userspace
 //! (`devmgr`).
 
-use crate::uefi::{find_config_table, EfiSystemTable, EFI_ACPI_20_TABLE_GUID, EFI_DTB_TABLE_GUID};
+use crate::uefi::{EFI_ACPI_20_TABLE_GUID, EFI_DTB_TABLE_GUID, EfiSystemTable, find_config_table};
 
 /// Physical addresses of firmware tables discovered from the UEFI configuration table.
 pub struct FirmwareInfo

@@ -22,7 +22,7 @@
 //! Replace `waiter` with an intrusive queue of TCBs and wake all of them
 //! on signal delivery.
 
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::sched::thread::ThreadControlBlock;
 
@@ -148,6 +148,21 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
             (*waiter).ipc_state = IpcThreadState::None;
             (*waiter).blocked_on_object = core::ptr::null_mut();
         }
+        // If the waiter was registered with a `SYS_SIGNAL_WAIT` timeout, it
+        // is also on the global sleep list. Remove it here so the timer
+        // path will not try to double-wake this thread. We hold `sig.lock`;
+        // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
+        // (lock order: sig.lock → SLEEP_LIST_LOCK; the timer path takes
+        // SLEEP_LIST_LOCK first, releases it, and only then reaches for
+        // sig.lock — so no circular wait).
+        // SAFETY: waiter is the TCB we just dequeued from sig.waiter.
+        unsafe {
+            if (*waiter).sleep_deadline != 0
+            {
+                (*waiter).sleep_deadline = 0;
+                crate::sched::sleep_list_remove(waiter);
+            }
+        }
         Some(waiter)
     }
     else if !sig.wait_set.is_null()
@@ -187,7 +202,7 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
 /// `sig` and `caller` must be valid pointers.
 #[cfg(not(test))]
 pub unsafe fn signal_wait(sig: *mut SignalState, caller: *mut ThreadControlBlock)
-    -> Result<u64, ()>
+-> Result<u64, ()>
 {
     // SAFETY: caller guarantees sig is valid.
     let sig = unsafe { &mut *sig };

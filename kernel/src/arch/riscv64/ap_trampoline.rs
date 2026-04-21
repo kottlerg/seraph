@@ -128,7 +128,7 @@ core::arch::global_asm!(
     "_rv_ap_trampoline_end:",
 );
 
-extern "C" {
+unsafe extern "C" {
     /// First byte of the AP trampoline code.
     static _rv_ap_trampoline: u8;
     /// First byte past the AP trampoline code.

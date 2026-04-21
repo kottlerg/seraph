@@ -40,7 +40,7 @@ pub(crate) const SDT_OFF_LENGTH: usize = 4;
 
 // MADT offsets (relative to table start, after SDT header):
 const MADT_OFF_LAPIC_BASE: usize = SDT_HDR_LEN; // u32
-                                                // MADT entries start at offset 44.
+// MADT entries start at offset 44.
 const MADT_ENTRIES_OFF: usize = 44;
 
 // MADT entry types:

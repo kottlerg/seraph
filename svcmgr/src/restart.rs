@@ -9,17 +9,16 @@
 //! policy and criticality, then creates a new process instance via procmgr,
 //! serves its bootstrap, and rebinds death notification.
 //!
-//! Bootstrap delivery re-injects the full cap set the service was registered
-//! with: `log_ep` plus any extra named caps in the restart bundle. This is
-//! F4.3's resolution — restarted services come back with the same cap set
-//! they had at registration, not a reduced subset.
+//! Bootstrap delivery re-injects the extra named caps registered in the
+//! service's restart bundle. log and procmgr endpoints arrive via
+//! `ProcessInfo`, so they are not part of the restart cap set.
 
 use crate::halt_loop;
 use crate::service::{
-    ServiceEntry, CRITICALITY_FATAL, CRITICALITY_NORMAL, MAX_RESTARTS, POLICY_ALWAYS,
-    POLICY_ON_FAILURE,
+    CRITICALITY_FATAL, CRITICALITY_NORMAL, MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE,
+    ServiceEntry,
 };
-use ipc::{procmgr_labels, IpcBuf};
+use ipc::{IpcBuf, procmgr_labels};
 
 /// Monotonic counter for restart-child bootstrap tokens.
 static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -41,18 +40,18 @@ pub struct RestartCtx
 /// fails.
 pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx)
 {
-    runtime::log!("svcmgr: service died: {}", svc.name_str());
-    runtime::log!("svcmgr:   exit_reason={:#018x}", exit_reason);
+    println!("svcmgr: service died: {}", svc.name_str());
+    println!("svcmgr:   exit_reason={exit_reason:#018x}");
 
     if svc.criticality == CRITICALITY_FATAL
     {
-        runtime::log!("svcmgr: FATAL service crashed, halting");
+        println!("svcmgr: FATAL service crashed, halting");
         halt_loop();
     }
 
     if svc.criticality != CRITICALITY_NORMAL
     {
-        runtime::log!("svcmgr: unknown criticality, not restarting");
+        println!("svcmgr: unknown criticality, not restarting");
         svc.active = false;
         return;
     }
@@ -63,7 +62,7 @@ pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx)
         return;
     }
 
-    runtime::log!(
+    println!(
         "svcmgr: restarting (attempt {:#018x})",
         u64::from(svc.restart_count + 1)
     );
@@ -75,7 +74,7 @@ pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx)
     }
 
     svc.restart_count += 1;
-    runtime::log!("svcmgr: service restarted: {}", svc.name_str());
+    println!("svcmgr: service restarted: {}", svc.name_str());
 }
 
 /// Determine whether a service should be restarted based on its policy and
@@ -91,19 +90,19 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
 
     if !restart
     {
-        runtime::log!("svcmgr: restart policy says no restart");
+        println!("svcmgr: restart policy says no restart");
         return false;
     }
 
     if svc.restart_count >= MAX_RESTARTS
     {
-        runtime::log!("svcmgr: max restarts reached, marking degraded");
+        println!("svcmgr: max restarts reached, marking degraded");
         return false;
     }
 
     if svc.module_cap == 0
     {
-        runtime::log!("svcmgr: no module cap, cannot restart");
+        println!("svcmgr: no module cap, cannot restart");
         return false;
     }
 
@@ -114,11 +113,26 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
 /// and rebind death notification. Returns `true` on success.
 fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
 {
+    // Reclaim the previous instance's kernel objects (thread/aspace/cspace/
+    // ProcessInfo frame) before spawning a fresh one. CSpace teardown
+    // cascades: frames handed to the dead process via `REQUEST_FRAMES`
+    // (which procmgr no longer holds caps on) get dec-ref'd and recycled
+    // back to the kernel buddy allocator. The initial instance was created
+    // by init, not svcmgr, so svcmgr has no handle for it — `process_handle
+    // == 0` on first death, and we skip; subsequent deaths reclaim.
+    if svc.process_handle != 0
+    {
+        let _ = syscall::ipc_call(svc.process_handle, procmgr_labels::DESTROY_PROCESS, 0, &[]);
+        let _ = syscall::cap_delete(svc.process_handle);
+        svc.process_handle = 0;
+    }
+
     let Some((process_handle, new_thread_cap, child_token)) = create_process(svc, ctx)
     else
     {
         return false;
     };
+    svc.process_handle = process_handle;
 
     // Start the new process.
     if !start_process(process_handle)
@@ -126,26 +140,14 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
         return false;
     }
 
-    // Assemble the full restart cap set: [log_ep, bundle_caps...]. Each is
-    // freshly derived from the stored authoritative cap so the restarted
-    // child owns its own copies. Bundle order is positional — children that
-    // registered with bundle caps must expect them in the same order on
-    // restart as at first boot.
+    // Assemble the restart cap set: bundle caps only. Each is freshly derived
+    // from the stored authoritative cap so the restarted child owns its own
+    // copies. Bundle order is positional — children that registered with
+    // bundle caps must expect them in the same order on restart as at first
+    // boot.
     let mut restart_caps: [u32; syscall_abi::MSG_CAP_SLOTS_MAX] =
         [0; syscall_abi::MSG_CAP_SLOTS_MAX];
     let mut cap_count = 0usize;
-
-    if svc.log_ep_cap != 0
-    {
-        let Ok(c) = syscall::cap_derive(svc.log_ep_cap, syscall::RIGHTS_SEND)
-        else
-        {
-            runtime::log!("svcmgr: cannot derive log cap for restart");
-            return false;
-        };
-        restart_caps[cap_count] = c;
-        cap_count += 1;
-    }
 
     for i in 0..(svc.bundle_count as usize)
     {
@@ -161,7 +163,7 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
         let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_SEND)
         else
         {
-            runtime::log!("svcmgr: cannot derive bundle cap for restart");
+            println!("svcmgr: cannot derive bundle cap for restart");
             return false;
         };
         restart_caps[cap_count] = c;
@@ -178,7 +180,7 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
     )
     .is_err()
     {
-        runtime::log!("svcmgr: bootstrap serve failed");
+        println!("svcmgr: bootstrap serve failed");
         return false;
     }
 
@@ -200,16 +202,27 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
     let tokened_creator =
         syscall::cap_derive_token(ctx.bootstrap_ep, syscall::RIGHTS_SEND, child_token).ok()?;
 
+    // Pack the service name into a u64 for the stdio token. Receiver-side
+    // (init's log thread today, real logd later) reads it from each STREAM_BYTES
+    // message to attribute output. Continuity by name across restart.
+    let stdio_token = {
+        let mut buf = [0u8; 8];
+        let n = (svc.name_len as usize).min(8);
+        buf[..n].copy_from_slice(&svc.name[..n]);
+        u64::from_le_bytes(buf)
+    };
+    ctx.ipc.write_word(0, stdio_token);
+
     let (reply_label, _) = syscall::ipc_call(
         ctx.procmgr_ep,
         procmgr_labels::CREATE_PROCESS,
-        0,
+        1,
         &[module_copy, tokened_creator],
     )
     .ok()?;
     if reply_label != 0
     {
-        runtime::log!("svcmgr: restart CREATE_PROCESS failed");
+        println!("svcmgr: restart CREATE_PROCESS failed");
         return None;
     }
 
@@ -217,7 +230,7 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
     let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ctx.ipc.as_ptr()) };
     if cap_count < 2
     {
-        runtime::log!("svcmgr: restart reply missing caps");
+        println!("svcmgr: restart reply missing caps");
         return None;
     }
 
@@ -232,7 +245,7 @@ fn start_process(process_handle: u32) -> bool
         Ok((0, _))
     )
     {
-        runtime::log!("svcmgr: restart START_PROCESS failed");
+        println!("svcmgr: restart START_PROCESS failed");
         return false;
     }
     true
@@ -248,13 +261,15 @@ fn rebind_death_notification(svc: &mut ServiceEntry, ws_cap: u32, new_thread_cap
     let Ok(new_eq) = syscall::event_queue_create(4)
     else
     {
-        runtime::log!("svcmgr: failed to create new event queue for restart");
+        println!("svcmgr: failed to create new event queue for restart");
         return false;
     };
 
-    if syscall::thread_bind_notification(new_thread_cap, new_eq).is_err()
+    // Correlator 0: payload is the bare exit_reason (see rebind rationale
+    // in `handle_register`).
+    if syscall::thread_bind_notification(new_thread_cap, new_eq, 0).is_err()
     {
-        runtime::log!("svcmgr: failed to rebind death notification");
+        println!("svcmgr: failed to rebind death notification");
         return false;
     }
 

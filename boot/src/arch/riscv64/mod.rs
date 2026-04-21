@@ -15,7 +15,7 @@ pub use handoff::{perform_handoff, trampoline_page_range};
 pub use paging::BootPageTable;
 
 use crate::elf::EM_RISCV;
-use crate::uefi::{EfiGuid, EfiStatus, EfiSystemTable, EFI_SUCCESS};
+use crate::uefi::{EFI_SUCCESS, EfiGuid, EfiStatus, EfiSystemTable};
 
 /// `EFI_RISCV_BOOT_PROTOCOL_GUID`
 /// `{CCD15FEC-6F73-4EEC-8395-3E69E4B940BF}`
@@ -91,14 +91,7 @@ pub unsafe fn discover_boot_hart_id(st: *mut EfiSystemTable) -> u64
     // SAFETY: proto is a valid protocol pointer returned by LocateProtocol.
     let s: EfiStatus =
         unsafe { ((*proto).get_boot_hartid)(proto, core::ptr::addr_of_mut!(hart_id)) };
-    if s == EFI_SUCCESS
-    {
-        hart_id
-    }
-    else
-    {
-        0
-    }
+    if s == EFI_SUCCESS { hart_id } else { 0 }
 }
 
 /// Return 0: on RISC-V, the BSP hardware ID (hart ID) comes from

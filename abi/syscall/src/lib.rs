@@ -27,7 +27,24 @@
 //! - All cross-boundary types are `#[repr(C)]` with stable layout.
 //! - No dependencies outside `core`.
 
-#![no_std]
+// When pulled into std's dep graph via build-std (feature
+// `rustc-dep-of-std` on), `core` isn't yet a conventional crate — we
+// import the `rustc-std-workspace-core` facade and alias it so
+// `use core::…` continues to resolve. Mirror of the libc / hermit-abi
+// pattern. The normal userspace build path keeps plain `#![no_std]`.
+#![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
+#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
+#![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+
+#[cfg(feature = "rustc-dep-of-std")]
+extern crate rustc_std_workspace_core as core;
+
+// `no_core` disables the automatic prelude; bring it in by hand so
+// `#[derive(…)]`, Copy/Clone, the operator traits, etc. resolve.
+#[cfg(feature = "rustc-dep-of-std")]
+#[allow(unused_imports)]
+use core::prelude::rust_2024::*;
 
 // ── Syscall numbers ───────────────────────────────────────────────────────────
 
@@ -40,6 +57,13 @@ pub const SYS_IPC_RECV: u64 = 2;
 /// Signal: send (OR bits into signal object).
 pub const SYS_SIGNAL_SEND: u64 = 3;
 /// Signal: wait (read-and-clear; blocks if zero).
+///
+/// arg0 = signal cap index (WAIT right). arg1 = `timeout_ms`: `0` means
+/// block indefinitely (the only behaviour before the timeout extension);
+/// `> 0` means block until bits are delivered *or* `timeout_ms`
+/// milliseconds have elapsed, whichever comes first. On timeout the
+/// syscall returns `0` (unambiguous — `signal_send` rejects zero-bit
+/// sends, so a legitimate wake always carries non-zero bits).
 pub const SYS_SIGNAL_WAIT: u64 = 4;
 /// `EventQueue`: post an entry.
 pub const SYS_EVENT_POST: u64 = 5;
@@ -242,6 +266,9 @@ pub const RIGHTS_ALL: u64 = !0u64;
 
 /// Send-only IPC endpoint: may call but not receive or grant caps.
 pub const RIGHTS_SEND: u64 = 1 << 4;
+
+/// Receive-only IPC endpoint: may accept calls but not call out or grant caps.
+pub const RIGHTS_RECEIVE: u64 = 1 << 5;
 
 /// Send + grant: may call and include capabilities in messages.
 pub const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);

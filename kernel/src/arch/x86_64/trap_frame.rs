@@ -175,6 +175,17 @@ impl TrapFrame
     {
         self.rdi = val;
     }
+
+    /// Set the thread-local-storage pointer (`fs_base` field, unused on x86-64).
+    ///
+    /// x86-64 carries the canonical TLS base in `SavedState.fs_base`, which
+    /// the context switch rdmsr/wrmsrs around `IA32_FS_BASE`. This trap-frame
+    /// field is retained for layout stability only. See
+    /// [`crate::arch::x86_64::context::seed_tls_base`].
+    pub fn set_tls_base(&mut self, tls_base: u64)
+    {
+        self.fs_base = tls_base;
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -113,7 +113,8 @@ impl SplitVirtqueue
         // following one.
         for i in 0..queue_size
         {
-            let desc = desc_va.add(i as usize);
+            // SAFETY: i < queue_size; caller guarantees desc_va points to a table of queue_size entries.
+            let desc = unsafe { desc_va.add(i as usize) };
             // SAFETY: desc is within the descriptor table allocation.
             unsafe {
                 (*desc).next = i + 1;

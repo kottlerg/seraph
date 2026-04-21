@@ -104,7 +104,9 @@ pub unsafe fn init_apic_ids(cpu_ids: &[u32; MAX_CPUS])
     let dst = core::ptr::addr_of_mut!(CPU_APIC_IDS);
     // SAFETY: dst points to a valid [u32; MAX_CPUS] array; cpu_ids is a valid
     // source of the same size; no aliasing during single-threaded boot.
-    core::ptr::copy_nonoverlapping(cpu_ids.as_ptr(), (*dst).as_mut_ptr(), MAX_CPUS);
+    unsafe {
+        core::ptr::copy_nonoverlapping(cpu_ids.as_ptr(), (*dst).as_mut_ptr(), MAX_CPUS);
+    }
 }
 
 /// Retrieve the hardware APIC ID (x86-64) or hart ID (RISC-V) for a logical CPU.

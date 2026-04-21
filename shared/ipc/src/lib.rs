@@ -10,10 +10,23 @@
 //! creator), the [`IpcBuf`] accessor, typed error-code constants, label
 //! modules, and the path codec used across VFS/FS interfaces.
 
-#![no_std]
+// When built as a std dep via `rustc-dep-of-std`, we switch to `no_core`
+// and rebind `core` to the `rustc_std_workspace_core` facade — same dance
+// as abi/syscall and shared/syscall.
+#![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
+#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
+#![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 // cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
 // are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
 #![allow(clippy::cast_possible_truncation)]
+
+#[cfg(feature = "rustc-dep-of-std")]
+extern crate rustc_std_workspace_core as core;
+
+#[cfg(feature = "rustc-dep-of-std")]
+#[allow(unused_imports)]
+use core::prelude::rust_2024::*;
 
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
@@ -31,10 +44,47 @@ pub mod procmgr_labels
     pub const START_PROCESS: u64 = 2;
     /// Request physical memory frames from procmgr's pool.
     pub const REQUEST_FRAMES: u64 = 5;
-    /// Create a new process from a VFS path (ELF binary).
+    /// Create a new process from a VFS path (ELF binary). Wire format
+    /// carries `stdio_token`, the path, and optional argv + env blobs;
+    /// see procmgr's `handle_create_from_vfs` for the full label and data
+    /// layout.
     pub const CREATE_FROM_VFS: u64 = 6;
     /// Provide procmgr with the vfsd endpoint for VFS-based loading.
     pub const SET_VFSD_EP: u64 = 7;
+    /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
+    /// cspace, `ProcessInfo` frame), dec-refing any frames the child still
+    /// holds so they recycle back into the kernel buddy allocator. The
+    /// caller identifies the process via the tokened `process_handle`
+    /// received from `CREATE_PROCESS` / `CREATE_FROM_VFS`; the token is
+    /// delivered by `ipc_recv` and looked up in procmgr's table. Idempotent
+    /// on already-destroyed tokens.
+    pub const DESTROY_PROCESS: u64 = 8;
+    /// Query a process's state. Caller identifies the target via the tokened
+    /// `process_handle` (delivered by `ipc_recv` on procmgr's side). Reply
+    /// carries one data word encoding the state (see
+    /// [`procmgr_process_state`]) and a second word carrying the exit reason
+    /// if known (zero for still-alive processes). Intended for monitoring
+    /// tools and `std::process::Child::try_wait`-style probes that want to
+    /// peek without blocking on a death event.
+    pub const QUERY_PROCESS: u64 = 9;
+}
+
+/// Process-state codes returned by `procmgr_labels::QUERY_PROCESS`.
+///
+/// Populated in data word 0 of the reply. Word 1 carries an accompanying
+/// exit reason (kernel death-notification encoding: 0 = clean, `0x1000+vec`
+/// = fault, `0x2000` = killed); it is zero for states in which the exit
+/// reason is not meaningful (ALIVE, CREATED, UNKNOWN).
+pub mod procmgr_process_state
+{
+    /// Entry exists and the process has been started. Running or blocked.
+    pub const ALIVE: u64 = 0;
+    /// Entry exists but the process has not yet been started (still in the
+    /// suspended post-CREATE state). Rare for external queriers to see.
+    pub const CREATED: u64 = 1;
+    /// No entry for this token — already reaped, or the token was never
+    /// valid. Equivalent to `ESRCH`.
+    pub const UNKNOWN: u64 = 2;
 }
 
 /// IPC labels for the service manager (`svcmgr`).
@@ -113,6 +163,26 @@ pub mod blk_labels
     /// Data words: `[token, base_lba, length_lba]`. Callable only over the
     /// un-tokened (whole-disk) endpoint; tokened callers are rejected.
     pub const REGISTER_PARTITION: u64 = 2;
+}
+
+/// IPC labels for byte-stream endpoints (stdin/stdout/stderr backing).
+///
+/// One label, one direction, bytes inline. The producer issues
+/// `ipc_call(cap, label=STREAM_BYTES | (byte_len << 16), …)` per write
+/// (chunked at `MSG_DATA_WORDS_MAX * 8` per call). The receiver reads
+/// `byte_len.div_ceil(8)` data words from its IPC buffer and unpacks
+/// `byte_len` bytes. The receiver replies empty to unblock the writer.
+///
+/// No multi-chunk reassembly framing on the wire — line buffering
+/// (e.g. logd's `[name]` per-newline prefix) lives in the receiver.
+///
+/// # Label encoding
+/// - Bits 0-15: label ID ([`STREAM_BYTES`])
+/// - Bits 16-31: byte length of the payload in this call (0..=512).
+pub mod stream_labels
+{
+    /// Base label ID for stream-bytes messages (bits 0-15).
+    pub const STREAM_BYTES: u64 = 10;
 }
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────
@@ -361,6 +431,15 @@ pub const MAX_PATH_LEN: usize = 48;
 /// Maximum data words used for a path (6 words of 8 bytes each).
 const MAX_PATH_WORDS: usize = 6;
 
+/// Maximum argv blob size in bytes across an IPC. Constrained by
+/// `MSG_DATA_WORDS_MAX * 8 = 512` (full data area) minus room for any
+/// path that coexists in the same message (6 words / 48 bytes). 256
+/// comfortably fits typical service-argv cases and leaves slack for the
+/// path field in `CREATE_FROM_VFS`. The `ProcessInfo` page can hold more,
+/// but expanding this also requires extending the label encoding
+/// (currently 16 bits).
+pub const ARGS_BLOB_MAX: usize = 256;
+
 /// Read path bytes from IPC buffer data words.
 ///
 /// Unpacks `path_len` bytes from little-endian u64 words in `ipc`.
@@ -409,6 +488,52 @@ pub fn write_path_to_ipc(ipc: IpcBuf, path: &[u8]) -> usize
             }
         }
         ipc.write_word(i, word);
+    }
+    word_count
+}
+
+/// Read `len` bytes from IPC buffer data words starting at word
+/// `word_offset`, unpacking little-endian u64s into `buf`.
+///
+/// Returns the number of bytes actually written (capped at
+/// `buf.len()` and `len`).
+pub fn read_blob_from_ipc(ipc: IpcBuf, word_offset: usize, len: usize, buf: &mut [u8]) -> usize
+{
+    let effective_len = len.min(buf.len());
+    let word_count = effective_len.div_ceil(8);
+    for i in 0..word_count
+    {
+        let word = ipc.read_word(word_offset + i);
+        let base = i * 8;
+        for j in 0..8
+        {
+            if base + j < effective_len
+            {
+                buf[base + j] = (word >> (j * 8)) as u8;
+            }
+        }
+    }
+    effective_len
+}
+
+/// Pack `blob` bytes into IPC buffer data words, starting at word
+/// `word_offset`. Returns the number of words written.
+#[must_use]
+pub fn write_blob_to_ipc(ipc: IpcBuf, word_offset: usize, blob: &[u8]) -> usize
+{
+    let word_count = blob.len().div_ceil(8);
+    for i in 0..word_count
+    {
+        let mut word: u64 = 0;
+        let base = i * 8;
+        for j in 0..8
+        {
+            if base + j < blob.len()
+            {
+                word |= u64::from(blob[base + j]) << (j * 8);
+            }
+        }
+        ipc.write_word(word_offset + i, word);
     }
     word_count
 }

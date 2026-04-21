@@ -22,8 +22,8 @@
 //! - Implement `load_balance` across CPUs.
 //! - Add `preemption_pending: bool` flag per CPU.
 
-use super::thread::ThreadControlBlock;
 use super::NUM_PRIORITY_LEVELS;
+use super::thread::ThreadControlBlock;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::MAX_CPUS;

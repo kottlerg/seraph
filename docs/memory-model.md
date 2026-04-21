@@ -85,7 +85,7 @@ Stack and heap placement will be randomised (ASLR) once the kernel's random numb
 source is available. Exact base addresses are not fixed at this stage.
 
 Concrete VA zone assignments, the heap-grow protocol, and ownership boundaries
-between the kernel, procmgr, and `shared/runtime` are documented in
+between the kernel, procmgr, and `std::sys::seraph` are documented in
 [userspace-memory-model.md](userspace-memory-model.md).
 
 ---

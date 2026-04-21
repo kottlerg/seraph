@@ -18,12 +18,15 @@
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
-/// `SYS_THREAD_CONFIGURE` (23): set entry point, stack, and argument for a thread.
+/// `SYS_THREAD_CONFIGURE` (23): set entry point, stack, argument, and TLS base
+/// for a thread.
 ///
 /// arg0 = Thread cap index (must have CONTROL).
 /// arg1 = user entry point (virtual address).
 /// arg2 = user stack pointer (virtual address).
 /// arg3 = argument value (passed in rdi/a0 when the thread first runs).
+/// arg4 = initial TLS base (x86-64 `IA32_FS_BASE`; RISC-V `tp`).
+///        Pass 0 for a thread that does not use thread-local storage.
 ///
 /// The thread must be in `Created` state (not yet started). Builds the initial
 /// user-mode `TrapFrame` on the thread's kernel stack. The thread is not enqueued;
@@ -44,6 +47,7 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let entry = tf.arg(1);
     let stack_ptr = tf.arg(2);
     let arg = tf.arg(3);
+    let tls_base = tf.arg(4);
 
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let caller_tcb = unsafe { current_tcb() };
@@ -95,12 +99,23 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*tf_ptr).init_user(entry, stack_ptr);
         // Pass the argument in the first argument register.
         (*tf_ptr).set_arg0(arg);
+        (*tf_ptr).set_tls_base(tls_base);
     }
 
     // Store the trap frame pointer so sched::schedule() can find it.
     // SAFETY: target_tcb validated non-null; trap_frame field assignment is valid.
     unsafe {
         (*target_tcb).trap_frame = tf_ptr;
+    }
+
+    // The first scheduler switch into this thread pulls `SavedState.fs_base`
+    // from the TCB directly into `IA32_FS_BASE` (x86-64). Seed it from the
+    // caller-supplied value; no-op on architectures that carry TLS state in
+    // the trap frame (RISC-V uses `tp` there).
+    // SAFETY: target_tcb validated non-null; saved_state has no interior
+    // mutability and is exclusively owned by this thread in Created state.
+    unsafe {
+        crate::arch::current::context::seed_tls_base(&mut (*target_tcb).saved_state, tls_base);
     }
 
     Ok(0)
@@ -270,7 +285,7 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
-    use crate::ipc::endpoint::{unlink_from_wait_queue, EndpointState};
+    use crate::ipc::endpoint::{EndpointState, unlink_from_wait_queue};
     use crate::ipc::event_queue::EventQueueState;
     use crate::ipc::signal::SignalState;
     use crate::ipc::wait_set::WaitSetState;
@@ -654,7 +669,7 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::{CapTag, Rights};
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
-    use core::mem::{size_of, MaybeUninit};
+    use core::mem::{MaybeUninit, size_of};
 
     let thread_idx = tf.arg(0) as u32;
     let buf_ptr = tf.arg(1);

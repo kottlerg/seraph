@@ -422,8 +422,8 @@ fn rv_walk_or_alloc(
     allocator: &mut crate::mm::BuddyAllocator,
 ) -> Result<u64, ()>
 {
-    use crate::mm::paging::phys_to_virt;
     use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
 
     if entry.is_present()
     {
@@ -441,6 +441,91 @@ fn rv_walk_or_alloc(
 
     *entry = PageTableEntry::new_table(frame_pa);
     Ok(frame_pa)
+}
+
+/// Walk the user half of the Sv48 page table rooted at `root_virt` and free
+/// every intermediate table frame (VPN\[2\], VPN\[1\], VPN\[0\]) back to
+/// `allocator`.
+///
+/// Leaf PTEs (R/W/X any set) point at physical memory owned by Frame
+/// capabilities; those frames are freed through `FrameObject` teardown when
+/// the owning `CSpace` is destroyed, not here. This function only reclaims
+/// the *page-table* pages the aspace allocated via `rv_walk_or_alloc`. The
+/// root VPN\[3\] frame itself is not freed here; the caller in
+/// `dealloc_object(AddressSpace)` frees it after this walk completes.
+///
+/// Only entries in VPN\[3\] indices 0..256 (user half) are examined. Entries
+/// 256..512 are copies of the global kernel root; freeing any of their
+/// descendants would corrupt every other address space.
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB Sv48 root frame.
+/// No CPU may still be using this address space (the caller verifies
+/// `active_cpu_mask() == 0` before invocation).
+#[cfg(not(test))]
+pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::BuddyAllocator)
+{
+    use crate::mm::paging::phys_to_virt;
+
+    // Sv48 leaf detection: R/W/X bits; non-leaves are V=1 with R=W=X=0.
+    const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
+    let is_leaf = |e: PageTableEntry| e.0 & LEAF_BITS != 0;
+
+    // SAFETY: root_virt is direct-map VA of a valid Sv48 root; caller's contract.
+    let root = unsafe { table_at(root_virt) };
+    for root_e in root.iter().take(256)
+    {
+        if !root_e.is_present()
+        {
+            continue;
+        }
+        // VPN[3] leaves (512 GiB pages) aren't produced by the mapping path;
+        // guard against them regardless.
+        if is_leaf(*root_e)
+        {
+            continue;
+        }
+        let l2_pa = root_e.phys_addr();
+        // SAFETY: l2_pa from a present VPN[3] entry points at a live L2 frame.
+        let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
+        for l2_e in l2.iter()
+        {
+            if !l2_e.is_present()
+            {
+                continue;
+            }
+            // VPN[2] leaf = 1 GiB gigapage — no L1 to free under it.
+            if is_leaf(*l2_e)
+            {
+                continue;
+            }
+            let l1_pa = l2_e.phys_addr();
+            // SAFETY: l1_pa from a present VPN[2] entry points at a live L1 frame.
+            let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
+            for l1_e in l1.iter()
+            {
+                if !l1_e.is_present()
+                {
+                    continue;
+                }
+                // VPN[1] leaf = 2 MiB megapage — no L0 to free under it.
+                if is_leaf(*l1_e)
+                {
+                    continue;
+                }
+                let l0_pa = l1_e.phys_addr();
+                // SAFETY: l0_pa allocated by `rv_walk_or_alloc` from the
+                // buddy as order-0; no CPU references it (caller's contract).
+                unsafe { allocator.free(l0_pa, 0) };
+            }
+            // SAFETY: l1_pa allocated by `rv_walk_or_alloc` from the buddy
+            // as order-0; all descendant L0 frames just freed above.
+            unsafe { allocator.free(l1_pa, 0) };
+        }
+        // SAFETY: l2_pa allocated by `rv_walk_or_alloc` from the buddy as
+        // order-0; all descendant L1 frames just freed above.
+        unsafe { allocator.free(l2_pa, 0) };
+    }
 }
 
 /// Flush the TLB entry for a single virtual address using `sfence.vma addr`.
@@ -524,7 +609,7 @@ pub unsafe fn protect_user_page(
     flags: crate::mm::paging::PageFlags,
 ) -> Result<(), crate::mm::paging::PagingError>
 {
-    use crate::mm::paging::{phys_to_virt, PagingError};
+    use crate::mm::paging::{PagingError, phys_to_virt};
     // Set USER (U) bit (bit 4) to preserve user accessibility.
     const USER: u64 = 1 << 4;
 

@@ -236,22 +236,31 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // ── SYS_THREAD_BIND_NOTIFICATION ─────────────────────────────────────────────
 
-/// `SYS_THREAD_BIND_NOTIFICATION` (47): bind a death notification `EventQueue`
-/// to a thread.
+/// `SYS_THREAD_BIND_NOTIFICATION` (47): register a death-notification
+/// observer on a thread.
 ///
 /// arg0 = Thread cap slot (CONTROL right required).
 /// arg1 = `EventQueue` cap slot (POST right required).
+/// arg2 = caller-chosen `correlator: u32` (opaque routing tag).
 ///
-/// When the target thread exits or faults, the kernel posts the exit reason
-/// to the bound `EventQueue`.
+/// When the target thread exits or faults, the kernel posts
+/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to the bound
+/// `EventQueue`. Passing `correlator = 0` makes the payload equal to the
+/// exit reason (the pre-multi-bind behaviour).
+///
+/// Multiple independent observers may be registered (up to
+/// `MAX_DEATH_OBSERVERS`); all fire on death. Returns
+/// `OutOfMemory` if the per-thread observer array is full.
 #[cfg(not(test))]
 #[allow(clippy::cast_possible_truncation)]
 fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::{CapTag, Rights};
+    use crate::sched::thread::{DeathObserver, MAX_DEATH_OBSERVERS};
 
     let thread_cap_idx = tf.arg(0) as u32;
     let eq_cap_idx = tf.arg(1) as u32;
+    let correlator = tf.arg(2) as u32;
 
     // SAFETY: current_tcb valid in syscall context.
     let caller = unsafe { current_tcb() };
@@ -290,10 +299,26 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         .state
     };
 
-    // Bind the notification.
+    // Append a new observer. `death_observer_count` is only mutated here
+    // (and cleared on TCB init); the death-post path reads under scheduler
+    // lock so the append must also be protected.
+    //
+    // SAFETY: target_tcb is a valid TCB from a validated Thread cap; the
+    // scheduler lock is held across this syscall entry, so the TCB's
+    // observer array is not concurrently mutated.
+    // SAFETY: target_tcb validated non-null; read pre-append snapshot.
     // SAFETY: target_tcb is a valid TCB from a validated Thread cap.
     unsafe {
-        (*target_tcb).death_notification = eq_state;
+        let count = (*target_tcb).death_observer_count as usize;
+        if count >= MAX_DEATH_OBSERVERS
+        {
+            return Err(SyscallError::OutOfMemory);
+        }
+        (*target_tcb).death_observers[count] = DeathObserver {
+            eq: eq_state,
+            correlator,
+        };
+        (*target_tcb).death_observer_count = (count + 1) as u8;
     }
 
     Ok(0)

@@ -93,7 +93,8 @@ unsafe fn split_frame_recursive(frame_cap: u32, count: &mut usize)
             *count += 1;
 
             // Recursively split frame B (remaining pages) to extract more.
-            split_frame_recursive(b, count);
+            // SAFETY: same preconditions as the outer unsafe fn (init phase only).
+            unsafe { split_frame_recursive(b, count) };
         }
         Err(_) =>
         {
@@ -129,7 +130,8 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
     // Recursively split the BSS frame into individual pages.
     // Each split produces two child frames; we store both and continue splitting
     // the larger child until we've filled the pool or run out of splittable frames.
-    split_frame_recursive(bss_frame, &mut count);
+    // SAFETY: called from init() which is documented as single-threaded boot-time only.
+    unsafe { split_frame_recursive(bss_frame, &mut count) };
 
     // Mark all slots as available
     let mask = if count >= 64

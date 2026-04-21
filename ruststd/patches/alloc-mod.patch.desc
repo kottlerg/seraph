@@ -1,0 +1,22 @@
+Patch description: add a `target_os = "seraph" => { mod seraph; }` arm to
+`library/std/src/sys/alloc/mod.rs`.
+
+Rather than a unified diff (fragile across toolchain bumps), the overlay
+code in `xtask/src/rust_src.rs` applies this change by string surgery:
+
+ 1. Read `library/std/src/sys/alloc/mod.rs` from the toolchain rust-src.
+ 2. If the marker `seraph-overlay` is already present, skip.
+ 3. Otherwise locate the final `}` closing `cfg_select! { … }` and insert
+    the seraph arm immediately before it.
+ 4. Copy `ruststd/src/sys/alloc/seraph.rs` into the toolchain rust-src at
+    `library/std/src/sys/alloc/seraph.rs`.
+
+Applied in-place to the toolchain rust-src, idempotent across invocations,
+auto-reapplied after `rustup update` wipes the patch.
+
+The snippet inserted:
+
+    // seraph-overlay: seraph OS alloc
+    target_os = "seraph" => {
+        mod seraph;
+    }

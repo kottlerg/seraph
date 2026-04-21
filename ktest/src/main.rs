@@ -182,7 +182,7 @@ pub(crate) static mut IPC_BUF: IpcBuf = IpcBuf([0u64; 512]);
 ///
 /// `info_ptr` — virtual address of the read-only [`InitInfo`](init_protocol::InitInfo)
 /// page mapped by the kernel. Provided as the initial argument (same as for real init).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start(info_ptr: u64) -> !
 {
     run(info_ptr)

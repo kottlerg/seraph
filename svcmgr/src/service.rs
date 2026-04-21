@@ -10,7 +10,7 @@
 //! protocol at startup.
 
 use ipc::IpcBuf;
-use process_abi::StartupInfo;
+use std::os::seraph::StartupInfo;
 
 /// Maximum number of monitored services.
 pub const MAX_SERVICES: usize = 16;
@@ -23,7 +23,7 @@ pub const MAX_SERVICES: usize = 16;
 pub const MAX_BUNDLE_CAPS: usize = 1;
 
 /// Maximum restart attempts before marking degraded.
-pub const MAX_RESTARTS: u32 = 5;
+pub const MAX_RESTARTS: u32 = 1;
 
 /// Restart policy: restart unconditionally on any exit.
 pub const POLICY_ALWAYS: u8 = 0;
@@ -50,9 +50,7 @@ pub struct ServiceEntry
     pub thread_cap: u32,
     /// Capability slot for the service's boot module (used for restart).
     pub module_cap: u32,
-    /// Capability slot for the service's log endpoint.
-    pub log_ep_cap: u32,
-    /// Extra named restart-bundle caps beyond `thread/module/log`. Each
+    /// Extra named restart-bundle caps beyond `thread/module`. Each
     /// entry is re-derived and re-delivered over the bootstrap protocol
     /// after a restart so the child comes back with its full cap set.
     pub bundle: [registry::Entry; MAX_BUNDLE_CAPS],
@@ -71,6 +69,14 @@ pub struct ServiceEntry
     /// Per-child token used on the svcmgr bootstrap endpoint for restart
     /// bootstrap (`cap_derive_token(svcmgr_bootstrap_ep, SEND, token)`).
     pub bootstrap_token: u64,
+    /// Tokened SEND cap on procmgr's service endpoint identifying the
+    /// current process instance. Populated by the restart path after the
+    /// first successful `CREATE_PROCESS` reply; used to call
+    /// `DESTROY_PROCESS` before spawning the next restart so procmgr can
+    /// reclaim kernel objects and free frames back to the buddy allocator.
+    /// Zero for the initial instance (which svcmgr never created — init
+    /// did), so the first death cannot destroy; subsequent deaths can.
+    pub process_handle: u32,
 }
 
 impl ServiceEntry
@@ -83,7 +89,6 @@ impl ServiceEntry
             name_len: 0,
             thread_cap: 0,
             module_cap: 0,
-            log_ep_cap: 0,
             bundle: [registry::Entry {
                 name: [0; registry::NAME_MAX],
                 name_len: 0,
@@ -96,6 +101,7 @@ impl ServiceEntry
             restart_count: 0,
             active: false,
             bootstrap_token: 0,
+            process_handle: 0,
         }
     }
 
@@ -108,44 +114,39 @@ impl ServiceEntry
 
 // ── Bootstrap ───────────────────────────────────────────────────────────────
 //
-// init → svcmgr bootstrap plan (one round, 4 caps):
-//   caps[0]: log endpoint
-//   caps[1]: service endpoint (svcmgr receives on this for registrations)
-//   caps[2]: procmgr service endpoint (svcmgr uses this for restarts)
-//   caps[3]: svcmgr's own bootstrap endpoint (svcmgr receives on this when
+// init → svcmgr bootstrap plan (one round, 2 caps):
+//   caps[0]: service endpoint (svcmgr receives on this for registrations)
+//   caps[1]: svcmgr's own bootstrap endpoint (svcmgr receives on this when
 //            serving bootstrap requests from restarted children)
+//
+// log and procmgr endpoints arrive via `ProcessInfo` / `StartupInfo` and are
+// not part of this round.
 
 /// Well-known capability slots acquired from the bootstrap protocol.
 #[allow(clippy::struct_field_names)]
 pub struct SvcmgrCaps
 {
-    /// Log endpoint capability slot.
-    pub log_ep: u32,
     /// Service protocol endpoint capability slot.
     pub service_ep: u32,
-    /// Process manager service endpoint capability slot.
-    pub procmgr_ep: u32,
     /// svcmgr's own bootstrap endpoint (receives bootstrap requests from
     /// restarted children).
     pub bootstrap_ep: u32,
 }
 
 /// Acquire svcmgr's initial cap set from its creator (init) via bootstrap IPC.
-pub fn bootstrap_caps(startup: &StartupInfo, ipc: IpcBuf) -> Option<SvcmgrCaps>
+pub fn bootstrap_caps(info: &StartupInfo, ipc: IpcBuf) -> Option<SvcmgrCaps>
 {
-    if startup.creator_endpoint == 0
+    if info.creator_endpoint == 0
     {
         return None;
     }
-    let round = ipc::bootstrap::request_round(startup.creator_endpoint, ipc).ok()?;
-    if round.cap_count < 4 || !round.done
+    let round = ipc::bootstrap::request_round(info.creator_endpoint, ipc).ok()?;
+    if round.cap_count < 2 || !round.done
     {
         return None;
     }
     Some(SvcmgrCaps {
-        log_ep: round.caps[0],
-        service_ep: round.caps[1],
-        procmgr_ep: round.caps[2],
-        bootstrap_ep: round.caps[3],
+        service_ep: round.caps[0],
+        bootstrap_ep: round.caps[1],
     })
 }

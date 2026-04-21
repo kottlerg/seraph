@@ -13,18 +13,18 @@
 //! See `devmgr/README.md` for the full design and `devmgr/docs/pci-enumeration.md`
 //! for PCI enumeration details.
 
-#![no_std]
-#![no_main]
+// The `seraph` target is not in rustc's recognised-OS list, so `std` is
+// `restricted_std`-gated for downstream bins. Every std-built service on
+// seraph carries this preamble.
+#![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
-
-extern crate runtime;
 
 mod caps;
 mod pci;
 mod spawn;
 
 use ipc::IpcBuf;
-use process_abi::StartupInfo;
+use std::os::seraph::startup_info;
 
 const PAGE_SIZE: u64 = 0x1000;
 
@@ -43,48 +43,38 @@ const MMIO_MAP_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
 // is pure type-level overhead; the phase comments in-line keep the flow
 // visible without the indirection.
 #[allow(clippy::too_many_lines)]
-#[no_mangle]
-extern "Rust" fn main(startup: &StartupInfo) -> !
+fn main() -> !
 {
-    if syscall::ipc_buffer_set(startup.ipc_buffer as u64).is_err()
-    {
-        syscall::thread_exit();
-    }
+    let info = startup_info();
 
-    // SAFETY: IPC buffer is registered and page-aligned.
-    let ipc = unsafe { IpcBuf::from_bytes(startup.ipc_buffer) };
+    // SAFETY: IPC buffer is registered by `std::os::seraph::_start` and
+    // page-aligned by the boot protocol.
+    let ipc = unsafe { IpcBuf::from_bytes(info.ipc_buffer) };
     let ipc_buf = ipc.as_ptr();
 
-    let Some(mut caps) = caps::bootstrap_caps(startup, ipc)
+    let Some(mut caps) = caps::bootstrap_caps(info, ipc)
     else
     {
         syscall::thread_exit();
     };
 
-    if caps.log_ep != 0
-    {
-        // SAFETY: single-threaded; called once before any log calls.
-        runtime::log::log_init(caps.log_ep, startup.ipc_buffer);
-    }
-
     // PCI device discovery.
     if caps.ecam_slot == 0
     {
-        runtime::log!("devmgr: no PCI ECAM capability, halting");
+        println!("devmgr: no PCI ECAM capability, halting");
         halt_loop();
     }
 
     let ecam_pages = caps.ecam_size.div_ceil(PAGE_SIZE);
     if syscall::mmio_map(caps.self_aspace, caps.ecam_slot, MMIO_MAP_VA, 0).is_err()
     {
-        runtime::log!("devmgr: failed to map ECAM region");
+        println!("devmgr: failed to map ECAM region");
         halt_loop();
     }
-    runtime::log!("devmgr: ECAM mapped ok");
-    runtime::log!(
+    println!("devmgr: ECAM mapped ok");
+    println!(
         "devmgr: ECAM base={:#018x} size={:#018x}",
-        caps.ecam_base,
-        caps.ecam_size
+        caps.ecam_base, caps.ecam_size
     );
 
     let start_bus = 0u8;
@@ -95,7 +85,7 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
     // SAFETY: MMIO_MAP_VA is a valid ECAM mapping.
     let dev_count = unsafe { pci::pci_enumerate(MMIO_MAP_VA, start_bus, end_bus, &mut devices) };
 
-    runtime::log!("devmgr: PCI devices found: {:#018x}", dev_count as u64);
+    println!("devmgr: PCI devices found: {:#018x}", dev_count as u64);
 
     let _ = syscall::mem_unmap(caps.self_aspace, MMIO_MAP_VA, ecam_pages);
 
@@ -103,7 +93,7 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
     let blk_ep = syscall::cap_create_endpoint().unwrap_or(0);
     if blk_ep == 0
     {
-        runtime::log!("devmgr: failed to create block device endpoint");
+        println!("devmgr: failed to create block device endpoint");
     }
 
     // Per-device info table: stores VirtIO config for QUERY_DEVICE_INFO.
@@ -126,11 +116,11 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
 
     if caps.registry_ep == 0
     {
-        runtime::log!("devmgr: no registry endpoint injected, halting");
+        println!("devmgr: no registry endpoint injected, halting");
         halt_loop();
     }
 
-    runtime::log!("devmgr: enumeration complete, entering registry loop");
+    println!("devmgr: enumeration complete, entering registry loop");
     loop
     {
         let Ok((label, token)) = syscall::ipc_recv(caps.registry_ep)
@@ -213,7 +203,7 @@ fn spawn_virtio_blk(
             continue;
         }
 
-        runtime::log!(
+        println!(
             "devmgr: found virtio-blk PCI device IRQ line={:#x} pin={:#x}",
             u64::from(pci_dev.irq_line),
             u64::from(pci_dev.irq_pin)
@@ -221,7 +211,7 @@ fn spawn_virtio_blk(
 
         if caps.driver_module_count == 0
         {
-            runtime::log!("devmgr: no driver modules available");
+            println!("devmgr: no driver modules available");
             return false;
         }
 
@@ -249,7 +239,6 @@ fn spawn_virtio_blk(
                 sizes: &bar_info.3[..bar_info.2],
             },
             irq_cap,
-            log_ep: caps.log_ep,
             service_ep: blk_ep,
             registry_ep: caps.registry_ep,
             device_token,
@@ -286,10 +275,9 @@ fn find_virtio_bar_cap(
         {
             continue;
         }
-        runtime::log!(
+        println!(
             "devmgr: VirtIO BAR phys={:#018x} size={:#018x}",
-            pci_dev.bar_phys[b],
-            pci_dev.bar_size[b]
+            pci_dev.bar_phys[b], pci_dev.bar_size[b]
         );
 
         for w in 0..caps.pci_mmio_window_count
@@ -316,7 +304,7 @@ fn find_virtio_bar_cap(
         }
         if count == 0
         {
-            runtime::log!(
+            println!(
                 "devmgr: VirtIO BAR not found in PCI windows virtio_bar_idx={:#018x}",
                 u64::from(virtio_bar_idx)
             );

@@ -27,13 +27,31 @@ pub enum Arch
 
 impl Arch
 {
-    /// Rust target triple for the kernel and userspace binaries.
+    /// Rust target triple for the kernel and low-level userspace binaries.
+    ///
+    /// Used by the kernel itself and for userspace components that bootstrap
+    /// std (init, procmgr) or that deliberately stay on core+alloc (ktest).
+    /// `"os": "none"` on this triple — std is not available.
     pub fn kernel_target_triple(self) -> &'static str
     {
         match self
         {
             Arch::X86_64 => "x86_64-seraph-none",
             Arch::Riscv64 => "riscv64gc-seraph-none",
+        }
+    }
+
+    /// Rust target triple for std-enabled userspace binaries.
+    ///
+    /// Distinct from `kernel_target_triple` because `"os": "seraph"` enables
+    /// `std::sys::seraph` via `-Z build-std`. Services compiled against this
+    /// triple depend on the patched rust-src tree materialised by xtask.
+    pub fn user_target_triple(self) -> &'static str
+    {
+        match self
+        {
+            Arch::X86_64 => "x86_64-seraph",
+            Arch::Riscv64 => "riscv64gc-seraph",
         }
     }
 

@@ -1,13 +1,22 @@
 [package]
 name = "process-abi"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 # no_std: this crate defines the process startup ABI and must be usable in
 # both kernel (no_std) and userspace (no_std) contexts.
 [lib]
 doctest = false
+
+[dependencies]
+# When std pulls this crate in via build-std, `rustc-dep-of-std` activates
+# and we use the core facade rather than the regular `core` prelude. Same
+# pattern as abi/syscall, shared/syscall, shared/ipc, shared/va_layout.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = ["rustc-std-workspace-core"]
 
 [lints]
 workspace = true

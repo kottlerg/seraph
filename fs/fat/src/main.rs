@@ -15,37 +15,38 @@
 //! call file operations directly on the tokened cap; the token delivered by
 //! `ipc_recv` identifies the open file.
 
-#![no_std]
-#![no_main]
+// The `seraph` target is not in rustc's recognised-OS list, so `std` is
+// `restricted_std`-gated for downstream bins. Every std-built service on
+// seraph carries this preamble.
+#![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
-
-extern crate runtime;
 
 mod bpb;
 mod dir;
 mod fat;
 mod file;
 
-use process_abi::StartupInfo;
+use std::os::seraph::{StartupInfo, startup_info};
 
 use bpb::{FatState, SECTOR_SIZE};
 use dir::{format_83_name, read_dir_entry_at_index, resolve_path};
 use fat::read_file_data;
-use file::{OpenFile, MAX_OPEN_FILES};
-use ipc::{fs_labels, IpcBuf};
+use file::{MAX_OPEN_FILES, OpenFile};
+use ipc::{IpcBuf, fs_labels};
 
 /// Monotonic counter for token allocation. Starts at 1 (0 = untokened).
 static NEXT_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 //
-// vfsd → fatfs bootstrap plan (one round, 3 caps, 0 data words):
+// vfsd → fatfs bootstrap plan (one round, 2 caps, 0 data words):
 //   caps[0]: block device (SEND) — partition-scoped tokened cap on virtio-blk.
 //            vfsd registers the partition bound with virtio-blk before
 //            delivering this cap; fatfs reads by partition-relative LBA and
 //            virtio-blk enforces the bound per-token.
-//   caps[1]: log endpoint (SEND; 0 if logging unavailable)
-//   caps[2]: fatfs service endpoint (RIGHTS_ALL — receive + derive tokens)
+//   caps[1]: fatfs service endpoint (RIGHTS_ALL — receive + derive tokens)
+//
+// log and procmgr endpoints arrive via `ProcessInfo`/`StartupInfo`.
 //
 // After bootstrap, vfsd probes fatfs with an empty `FS_MOUNT` so the driver
 // can validate the BPB and report mount success/failure before vfsd replies
@@ -54,33 +55,29 @@ static NEXT_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 struct FatCaps
 {
     block_dev: u32,
-    log_sink: u32,
     service: u32,
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
-#[no_mangle]
-extern "Rust" fn main(startup: &StartupInfo) -> !
+fn main() -> !
 {
-    let _ = syscall::ipc_buffer_set(startup.ipc_buffer as u64);
+    let info = startup_info();
 
-    // SAFETY: IPC buffer is registered and page-aligned.
-    let ipc = unsafe { IpcBuf::from_bytes(startup.ipc_buffer) };
+    // IPC buffer was registered by `std::os::seraph::_start`; no need to
+    // re-register. Build a typed view over the same page for local use.
+    // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
+    // boot protocol.
+    let ipc = unsafe { IpcBuf::from_bytes(info.ipc_buffer) };
     let ipc_buf = ipc.as_ptr();
 
-    let Some(caps) = bootstrap_caps(startup, ipc)
+    let Some(caps) = bootstrap_caps(info, ipc)
     else
     {
         syscall::thread_exit();
     };
 
-    if caps.log_sink != 0
-    {
-        runtime::log::log_init(caps.log_sink, startup.ipc_buffer);
-    }
-
-    runtime::log!("fatfs: starting");
+    println!("fatfs: starting");
 
     let mut state = FatState::new();
 
@@ -100,21 +97,20 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
 
 /// Issue a single bootstrap round against the creator endpoint and assemble
 /// [`FatCaps`].
-fn bootstrap_caps(startup: &StartupInfo, ipc: IpcBuf) -> Option<FatCaps>
+fn bootstrap_caps(info: &StartupInfo, ipc: IpcBuf) -> Option<FatCaps>
 {
-    if startup.creator_endpoint == 0
+    if info.creator_endpoint == 0
     {
         return None;
     }
-    let round = ipc::bootstrap::request_round(startup.creator_endpoint, ipc).ok()?;
-    if round.cap_count < 3 || !round.done
+    let round = ipc::bootstrap::request_round(info.creator_endpoint, ipc).ok()?;
+    if round.cap_count < 2 || !round.done
     {
         return None;
     }
     Some(FatCaps {
         block_dev: round.caps[0],
-        log_sink: round.caps[1],
-        service: round.caps[2],
+        service: round.caps[1],
     })
 }
 

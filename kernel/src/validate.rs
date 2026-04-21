@@ -9,7 +9,7 @@
 //! are silent on failure — the caller halts the CPU immediately. No output is
 //! produced here because the serial port has not been initialized yet.
 
-use boot_protocol::{BootInfo, BOOT_PROTOCOL_VERSION};
+use boot_protocol::{BOOT_PROTOCOL_VERSION, BootInfo};
 
 /// Validate the boot info pointer received from the bootloader.
 ///

@@ -624,7 +624,7 @@ pub unsafe fn load_init(
     expected_machine: u16,
 ) -> Result<boot_protocol::InitImage, BootError>
 {
-    use boot_protocol::{InitImage, InitSegment, SegmentFlags, INIT_MAX_SEGMENTS};
+    use boot_protocol::{INIT_MAX_SEGMENTS, InitImage, InitSegment, SegmentFlags};
 
     let ehdr = validate_elf_header(data, expected_machine)?;
 

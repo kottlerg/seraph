@@ -9,22 +9,22 @@
 //! from devmgr. Initialises the `VirtIO` device via the modern PCI transport,
 //! sets up a split virtqueue, and serves block read requests over IPC.
 
-#![no_std]
-#![no_main]
+// The `seraph` target is not in rustc's recognised-OS list, so `std` is
+// `restricted_std`-gated for downstream bins. Every std-built service on
+// seraph carries this preamble.
+#![feature(restricted_std)]
 // cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
 // are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
 #![allow(clippy::cast_possible_truncation)]
 
-extern crate runtime;
-
 mod io;
 
-use ipc::{blk_labels, devmgr_labels, procmgr_labels, IpcBuf};
-use process_abi::StartupInfo;
+use ipc::{IpcBuf, blk_labels, devmgr_labels, procmgr_labels};
+use std::os::seraph::{StartupInfo, startup_info};
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
-    VirtioPciStartupInfo, STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK,
+    STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK, VirtioPciStartupInfo,
 };
 
 use crate::io::IoLayout;
@@ -129,42 +129,43 @@ impl PartitionTable
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
 //
-// devmgr → virtio-blk bootstrap plan (one round, 4 caps):
+// devmgr → virtio-blk bootstrap plan:
+// Round 1 (3 caps):
 //   caps[0]: BAR MMIO region
 //   caps[1]: IRQ line
 //   caps[2]: service endpoint (virtio-blk receives on this)
-//   caps[3]: log endpoint
-// Round 2 (2 caps):
-//   caps[0]: procmgr endpoint (for REQUEST_FRAMES)
-//   caps[1]: devmgr query endpoint (tokened per-device — for QUERY_DEVICE_INFO)
+// Round 2 (1 cap):
+//   caps[0]: devmgr query endpoint (tokened per-device — for QUERY_DEVICE_INFO)
+//
+// log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through
+// this protocol.
 
 struct DriverCaps
 {
     bar_mmio_slot: u32,
     irq_slot: u32,
     procmgr_ep: u32,
-    log_ep: u32,
     service_ep: u32,
     devmgr_ep: u32,
     self_aspace: u32,
 }
 
-fn bootstrap_caps(startup: &StartupInfo, ipc: IpcBuf) -> Option<DriverCaps>
+fn bootstrap_caps(info: &StartupInfo, ipc: IpcBuf) -> Option<DriverCaps>
 {
-    let creator = startup.creator_endpoint;
+    let creator = info.creator_endpoint;
     if creator == 0
     {
         return None;
     }
 
     let round1 = ipc::bootstrap::request_round(creator, ipc).ok()?;
-    if round1.cap_count < 4 || round1.done
+    if round1.cap_count < 3 || round1.done
     {
         return None;
     }
 
     let round2 = ipc::bootstrap::request_round(creator, ipc).ok()?;
-    if round2.cap_count < 2 || !round2.done
+    if round2.cap_count < 1 || !round2.done
     {
         return None;
     }
@@ -173,10 +174,9 @@ fn bootstrap_caps(startup: &StartupInfo, ipc: IpcBuf) -> Option<DriverCaps>
         bar_mmio_slot: round1.caps[0],
         irq_slot: round1.caps[1],
         service_ep: round1.caps[2],
-        log_ep: round1.caps[3],
-        procmgr_ep: round2.caps[0],
-        devmgr_ep: round2.caps[1],
-        self_aspace: startup.self_aspace,
+        procmgr_ep: info.procmgr_endpoint,
+        devmgr_ep: round2.caps[0],
+        self_aspace: info.self_aspace,
     })
 }
 
@@ -190,12 +190,12 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     let Ok((label, _)) = syscall::ipc_call(devmgr_ep, devmgr_labels::QUERY_DEVICE_INFO, 0, &[])
     else
     {
-        runtime::log!("virtio-blk: QUERY_DEVICE_INFO ipc_call failed");
+        println!("virtio-blk: QUERY_DEVICE_INFO ipc_call failed");
         syscall::thread_exit();
     };
     if label != 0
     {
-        runtime::log!("virtio-blk: QUERY_DEVICE_INFO returned error");
+        println!("virtio-blk: QUERY_DEVICE_INFO returned error");
         syscall::thread_exit();
     }
     // SAFETY: ipc_buf is the registered IPC buffer; devmgr wrote IPC_WORD_COUNT words.
@@ -247,7 +247,7 @@ fn init_device(transport: &PciTransport) -> u64
     });
     if features.is_none()
     {
-        runtime::log!("virtio-blk: feature negotiation failed");
+        println!("virtio-blk: feature negotiation failed");
         syscall::thread_exit();
     }
 
@@ -273,7 +273,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     let Some(ring_frame) = request_frames(caps.procmgr_ep, ring_pages, ipc_buf)
     else
     {
-        runtime::log!("virtio-blk: failed to allocate ring frames");
+        println!("virtio-blk: failed to allocate ring frames");
         syscall::thread_exit();
     };
     if syscall::mem_map(
@@ -286,7 +286,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     )
     .is_err()
     {
-        runtime::log!("virtio-blk: ring mem_map failed");
+        println!("virtio-blk: ring mem_map failed");
         syscall::thread_exit();
     }
     // SAFETY: RING_MAP_VA is mapped writable, ring_pages * PAGE_SIZE bytes.
@@ -296,7 +296,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     let Ok(ring_phys) = syscall::dma_grant(ring_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
     else
     {
-        runtime::log!("virtio-blk: ring dma_grant failed");
+        println!("virtio-blk: ring dma_grant failed");
         syscall::thread_exit();
     };
     (ring_phys, ring_pages)
@@ -370,7 +370,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     let Some(data_frame) = request_frames(caps.procmgr_ep, 1, ipc_buf)
     else
     {
-        runtime::log!("virtio-blk: failed to allocate data frame");
+        println!("virtio-blk: failed to allocate data frame");
         syscall::thread_exit();
     };
 
@@ -384,7 +384,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     )
     .is_err()
     {
-        runtime::log!("virtio-blk: data mem_map failed");
+        println!("virtio-blk: data mem_map failed");
         syscall::thread_exit();
     }
 
@@ -395,7 +395,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     let Ok(data_phys) = syscall::dma_grant(data_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
     else
     {
-        runtime::log!("virtio-blk: data dma_grant failed");
+        println!("virtio-blk: data dma_grant failed");
         syscall::thread_exit();
     };
 
@@ -424,7 +424,7 @@ pub struct BlkRuntime<'a>
 /// Handle incoming IPC requests on the service endpoint.
 fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 {
-    runtime::log!("virtio-blk: ready, entering service loop");
+    println!("virtio-blk: ready, entering service loop");
     loop
     {
         let Ok((label, token)) = syscall::ipc_recv(service_ep)
@@ -576,47 +576,41 @@ fn handle_register_partition(caller_token: u64, ipc_buf: *mut u64, rt: &mut BlkR
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
-#[no_mangle]
-extern "Rust" fn main(startup: &StartupInfo) -> !
+fn main() -> !
 {
-    // Register IPC buffer (must be first — needed for IPC logging).
-    if syscall::ipc_buffer_set(startup.ipc_buffer as u64).is_err()
-    {
-        syscall::thread_exit();
-    }
-    // SAFETY: IPC buffer is registered and page-aligned.
-    let ipc = unsafe { IpcBuf::from_bytes(startup.ipc_buffer) };
+    let info = startup_info();
+
+    // IPC buffer was registered by `std::os::seraph::_start`; no need to
+    // re-register. Build a typed view over the same page for local use.
+    // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
+    // boot protocol.
+    let ipc = unsafe { IpcBuf::from_bytes(info.ipc_buffer) };
     let ipc_buf = ipc.as_ptr();
 
-    // Bootstrap caps from devmgr.
-    let Some(caps) = bootstrap_caps(startup, ipc)
+    // Bootstrap caps from devmgr. log + procmgr + stdio are wired by
+    // `std::os::seraph::_start` from `ProcessInfo`.
+    let Some(caps) = bootstrap_caps(info, ipc)
     else
     {
         syscall::thread_exit();
     };
 
-    // Initialise IPC logging.
-    if caps.log_ep != 0
-    {
-        runtime::log::log_init(caps.log_ep, startup.ipc_buffer);
-    }
-
-    runtime::log!("virtio-blk: starting");
+    println!("virtio-blk: starting");
     if caps.bar_mmio_slot == 0
     {
-        runtime::log!("virtio-blk: no BAR MMIO cap");
+        println!("virtio-blk: no BAR MMIO cap");
         syscall::thread_exit();
     }
     if caps.procmgr_ep == 0
     {
-        runtime::log!("virtio-blk: no procmgr endpoint");
+        println!("virtio-blk: no procmgr endpoint");
         syscall::thread_exit();
     }
 
     // Query devmgr for VirtIO PCI capability locations via IPC.
     if caps.devmgr_ep == 0
     {
-        runtime::log!("virtio-blk: no devmgr query endpoint");
+        println!("virtio-blk: no devmgr query endpoint");
         syscall::thread_exit();
     }
     let pci_info = query_device_info(caps.devmgr_ep, ipc_buf);
@@ -624,14 +618,14 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
     // Map BAR MMIO.
     if syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, BAR_MAP_VA, 0).is_err()
     {
-        runtime::log!("virtio-blk: BAR mmio_map failed");
+        println!("virtio-blk: BAR mmio_map failed");
         syscall::thread_exit();
     }
 
     // Create PCI transport and initialise device.
     let transport = PciTransport::new(BAR_MAP_VA, &pci_info);
     let capacity = init_device(&transport);
-    runtime::log!("virtio-blk: capacity (sectors)={:#018x}", capacity);
+    println!("virtio-blk: capacity (sectors)={capacity:#018x}");
 
     // Set up virtqueue and data buffer.
     let (mut vq, queue_notify_off) = setup_virtqueue(&transport, &caps, ipc_buf);
@@ -639,23 +633,23 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
     // DRIVER_OK.
     transport
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
-    runtime::log!("virtio-blk: device ready");
+    println!("virtio-blk: device ready");
 
     // Set up IRQ-driven completion: create a signal and bind it to the IRQ.
     if caps.irq_slot == 0
     {
-        runtime::log!("virtio-blk: no IRQ cap, cannot operate");
+        println!("virtio-blk: no IRQ cap, cannot operate");
         syscall::thread_exit();
     }
     let Ok(irq_signal) = syscall::cap_create_signal()
     else
     {
-        runtime::log!("virtio-blk: failed to create IRQ signal");
+        println!("virtio-blk: failed to create IRQ signal");
         syscall::thread_exit();
     };
     if syscall::irq_register(caps.irq_slot, irq_signal).is_err()
     {
-        runtime::log!("virtio-blk: irq_register failed");
+        println!("virtio-blk: irq_register failed");
         syscall::thread_exit();
     }
     // Unmask the interrupt at the controller (IOAPIC/PLIC).
@@ -676,15 +670,15 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
         irq_cap,
     )
     {
-        runtime::log!("virtio-blk: sector 0 test read failed");
+        println!("virtio-blk: sector 0 test read failed");
         syscall::thread_exit();
     }
-    runtime::log!("virtio-blk: sector 0 read OK");
+    println!("virtio-blk: sector 0 read OK");
 
     // Enter service loop.
     if caps.service_ep == 0
     {
-        runtime::log!("virtio-blk: no service endpoint, entering idle loop");
+        println!("virtio-blk: no service endpoint, entering idle loop");
         loop
         {
             let _ = syscall::thread_yield();

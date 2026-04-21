@@ -71,6 +71,13 @@ pub struct Slab
 
 // ── SlabCache ─────────────────────────────────────────────────────────────────
 
+/// Maximum slabs per cache. Each slab is a buddy-allocated block holding
+/// multiple fixed-size slots. System-wide concurrent live objects of size
+/// `obj_size` cap at `MAX_SLABS * slots_per_slab`; increase this constant if
+/// any slab-* OOM fires in practice (the arrays that rely on it are static,
+/// so the RAM cost is paid once at boot, not per cache-grow).
+pub const MAX_SLABS: usize = 128;
+
 /// Cache of same-size slabs.
 ///
 /// `obj_size` is rounded up to an 8-byte multiple; minimum 8.
@@ -79,10 +86,11 @@ pub struct Slab
 /// - ≤ 1024 bytes → order 1 (2 pages, 8 KiB)
 /// - ≤ 4096 bytes → order 2 (4 pages, 16 KiB)
 ///
-/// Holds up to 16 slabs. If all are full and a 17th alloc arrives, returns `None`.
+/// Holds up to [`MAX_SLABS`] slabs. If all are full and the next alloc arrives,
+/// returns `None`.
 ///
 /// To add support for larger object sizes: extend the `slab_order` formula and
-/// increase the slabs array (with a corresponding `SlabCache` struct size increase).
+/// adjust [`MAX_SLABS`] (paid once per cache at boot).
 pub struct SlabCache
 {
     /// Diagnostic label (shown in future debug/stats output).
@@ -93,7 +101,7 @@ pub struct SlabCache
     /// Buddy order for each slab backing allocation.
     pub slab_order: usize,
     /// Fixed-capacity slab table (out-of-band headers).
-    pub slabs: [Option<Slab>; 16],
+    pub slabs: [Option<Slab>; MAX_SLABS],
     /// Number of live entries in `slabs`.
     pub slab_count: usize,
 }
@@ -125,10 +133,7 @@ impl SlabCache
             name,
             obj_size,
             slab_order,
-            slabs: [
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None,
-            ],
+            slabs: [const { None }; MAX_SLABS],
             slab_count: 0,
         }
     }
@@ -157,7 +162,7 @@ impl SlabCache
         else
         {
             // All slabs are full (or there are none); allocate a new one.
-            if self.slab_count >= 16
+            if self.slab_count >= MAX_SLABS
             {
                 return None;
             }

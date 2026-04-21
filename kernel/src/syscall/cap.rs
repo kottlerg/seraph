@@ -263,7 +263,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::message::Message;
     use crate::mm::paging::phys_to_virt;
-    use crate::mm::{with_frame_allocator, PAGE_SIZE};
+    use crate::mm::{PAGE_SIZE, with_frame_allocator};
     use crate::sched::alloc_thread_id;
     use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
     use crate::sched::{AFFINITY_ANY, INIT_PRIORITY, KERNEL_STACK_PAGES, TIME_SLICE_TICKS};
@@ -379,7 +379,9 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         blocked_on_object: core::ptr::null_mut(),
         thread_id: alloc_thread_id(),
         context_saved: core::sync::atomic::AtomicU32::new(1),
-        death_notification: core::ptr::null_mut(),
+        death_observers: [crate::sched::thread::DeathObserver::empty();
+            crate::sched::thread::MAX_DEATH_OBSERVERS],
+        death_observer_count: 0,
         sleep_deadline: 0,
         magic: crate::sched::thread::TCB_MAGIC,
     }));
@@ -1048,47 +1050,35 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Update parent's child pointer.
     if let Some(parent_id) = src_parent
+        && let Some(parent_cs) = crate::cap::lookup_cspace(parent_id.cspace_id)
     {
-        if let Some(parent_cs) = crate::cap::lookup_cspace(parent_id.cspace_id)
+        // SAFETY: parent_cs from registry; DERIVATION_LOCK held.
+        if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(parent_id.index.get()) }
+            && parent_slot.deriv_first_child == Some(src_slot_id)
         {
-            // SAFETY: parent_cs from registry; DERIVATION_LOCK held.
-            if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(parent_id.index.get()) }
-            {
-                if parent_slot.deriv_first_child == Some(src_slot_id)
-                {
-                    parent_slot.deriv_first_child = Some(dst_slot_id);
-                }
-            }
+            parent_slot.deriv_first_child = Some(dst_slot_id);
         }
     }
 
     // Update siblings' pointers.
     if let Some(prev_id) = src_prev
+        && let Some(prev_cs) = crate::cap::lookup_cspace(prev_id.cspace_id)
     {
-        if let Some(prev_cs) = crate::cap::lookup_cspace(prev_id.cspace_id)
+        // SAFETY: prev_cs from registry; DERIVATION_LOCK held.
+        if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(prev_id.index.get()) }
+            && prev_slot.deriv_next_sibling == Some(src_slot_id)
         {
-            // SAFETY: prev_cs from registry; DERIVATION_LOCK held.
-            if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(prev_id.index.get()) }
-            {
-                if prev_slot.deriv_next_sibling == Some(src_slot_id)
-                {
-                    prev_slot.deriv_next_sibling = Some(dst_slot_id);
-                }
-            }
+            prev_slot.deriv_next_sibling = Some(dst_slot_id);
         }
     }
     if let Some(next_id) = src_next
+        && let Some(next_cs) = crate::cap::lookup_cspace(next_id.cspace_id)
     {
-        if let Some(next_cs) = crate::cap::lookup_cspace(next_id.cspace_id)
+        // SAFETY: next_cs from registry; DERIVATION_LOCK held.
+        if let Some(next_slot) = unsafe { (*next_cs).slot_mut(next_id.index.get()) }
+            && next_slot.deriv_prev_sibling == Some(src_slot_id)
         {
-            // SAFETY: next_cs from registry; DERIVATION_LOCK held.
-            if let Some(next_slot) = unsafe { (*next_cs).slot_mut(next_id.index.get()) }
-            {
-                if next_slot.deriv_prev_sibling == Some(src_slot_id)
-                {
-                    next_slot.deriv_prev_sibling = Some(dst_slot_id);
-                }
-            }
+            next_slot.deriv_prev_sibling = Some(dst_slot_id);
         }
     }
 

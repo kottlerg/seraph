@@ -43,9 +43,9 @@ use boot_protocol::BootInfo;
 // Production-only imports (linker symbols and arch paging are unavailable
 // when running unit tests on the host).
 #[cfg(not(test))]
-use super::buddy::BuddyAllocator;
-#[cfg(not(test))]
 use super::PAGE_SIZE;
+#[cfg(not(test))]
+use super::buddy::BuddyAllocator;
 #[cfg(not(test))]
 use crate::arch::current::paging as arch_paging;
 
@@ -308,7 +308,7 @@ pub fn compute_max_physical_address(info: &BootInfo) -> u64
 // Excluded from unit test builds: references linker symbols and arch hardware.
 
 #[cfg(not(test))]
-extern "C" {
+unsafe extern "C" {
     /// Start of the kernel `.text` section (virtual address).
     static __text_start: u8;
     /// End of the kernel `.text` section (virtual address).
@@ -468,7 +468,7 @@ pub fn init_kernel_page_tables(
 /// Physical addresses are derived from the kernel VA/PA offset in `info`.
 #[cfg(not(test))]
 fn map_kernel_image(root_va: u64, info: &BootInfo, pool: &mut PoolState)
-    -> Result<(), PagingError>
+-> Result<(), PagingError>
 {
     let kv = info.kernel_virtual_base;
     let kp = info.kernel_physical_base;

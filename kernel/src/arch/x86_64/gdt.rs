@@ -252,7 +252,7 @@ pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
     gdt[2] = data_desc_64(0); // 0x10 kernel DS
     gdt[3] = data_desc_64(3); // 0x18 user DS (RPL=3 via selector constant)
     gdt[4] = code_desc_64(3); // 0x20 user CS (RPL=3 via selector constant)
-                              // TSS descriptor limit must cover the full TssWithIopb struct.
+    // TSS descriptor limit must cover the full TssWithIopb struct.
     let tss_addr = core::ptr::addr_of!(*tss_with_iopb) as u64;
     let (tss_lo, tss_hi) = tss_desc(tss_addr);
     gdt[5] = tss_lo; // 0x28 TSS low

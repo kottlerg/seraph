@@ -312,19 +312,22 @@ OR bits into a signal object. Non-blocking; wakes the waiter if one is present.
 
 ### `SYS_SIGNAL_WAIT` (4)
 
-Block until at least one bit is set in the signal object. Returns and atomically
-clears the entire bitmask.
+Block until at least one bit is set in the signal object, or until the
+optional millisecond timeout elapses. Returns and atomically clears the
+entire bitmask.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `signal_cap` | Signal capability with Wait rights |
+| 1 | `timeout_ms` | `0` = block indefinitely; `>0` = wake after at most `timeout_ms` ms |
 
 **Return:**
 
-- `rax`/`a0`: the bitmask that was set (positive, non-zero) on success;
-  `SyscallError` on failure
+- `rax`/`a0`: the bitmask that was set (positive, non-zero) on signal wake;
+  `0` on timeout (unambiguous: `signal_send` rejects zero-bit sends, so a
+  real wake always carries a non-zero mask). `SyscallError` on failure.
 
 **Capability requirement:** `signal_cap` must have Wait rights.
 

@@ -212,7 +212,27 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
             f.vector,
             f.error_code,
         );
-        crate::kprintln_serial!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
+        // Include fs_base (IA32_FS_BASE) to aid TLS-plumbing diagnosis.
+        // SAFETY: interrupts are disabled above; rdmsr on IA32_FS_BASE is
+        // always legal in ring 0 and has no side effects.
+        let fs_base: u64 = unsafe {
+            let low: u32;
+            let high: u32;
+            core::arch::asm!(
+                "rdmsr",
+                in("ecx") 0xc000_0100u32,
+                out("eax") low,
+                out("edx") high,
+                options(nomem, nostack, preserves_flags),
+            );
+            (u64::from(high) << 32) | u64::from(low)
+        };
+        crate::kprintln_serial!(
+            "  rip={:#018x}  cr2={:#018x}  fs_base={:#018x}",
+            f.rip,
+            cr2,
+            fs_base
+        );
         dump_x86_regs(f);
 
         if !tcb.is_null()

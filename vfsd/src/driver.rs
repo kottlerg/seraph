@@ -8,9 +8,10 @@
 //! Creates fatfs driver processes via procmgr's two-phase protocol. The child
 //! is spawned with a tokened SEND cap on vfsd's worker-owned bootstrap
 //! endpoint as its creator endpoint. Main publishes a plan keyed by that
-//! token, then blocks on `done_sig` while the worker thread delivers the
-//! bootstrap round. After the worker signals completion, main sends a
-//! zero-payload `FS_MOUNT` to the driver as a BPB-validation probe.
+//! token through the shared [`worker::Channel`], then blocks on the channel's
+//! condvar while the worker thread delivers the bootstrap round. After the
+//! worker signals completion, main sends a zero-payload `FS_MOUNT` to the
+//! driver as a BPB-validation probe.
 //!
 //! This routes fatfs through the generic bootstrap protocol without
 //! clobbering the main thread's reply target (= init) while servicing MOUNT.
@@ -20,12 +21,14 @@
 //! fatfs is never handed the whole-disk cap and cannot escape the partition
 //! regardless of what sector number it computes.
 
-use ipc::{fs_labels, procmgr_labels, IpcBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{worker, VfsdCaps};
+use ipc::{IpcBuf, fs_labels, procmgr_labels};
+
+use crate::{VfsdCaps, worker};
 
 /// Monotonic counter for fatfs-child bootstrap tokens.
-static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static NEXT_BOOTSTRAP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Spawn the fatfs driver via procmgr, deliver its cap set over the bootstrap
 /// protocol, and probe it with `FS_MOUNT` to confirm BPB validation.
@@ -34,11 +37,16 @@ static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic:
 /// already bound in virtio-blk's partition table to the partition's LBA range.
 ///
 /// Returns the driver's IPC endpoint (send cap) on success.
-pub fn spawn_fatfs_driver(caps: &VfsdCaps, partition_ep: u32, ipc: IpcBuf) -> Option<u32>
+pub fn spawn_fatfs_driver(
+    caps: &VfsdCaps,
+    channel: &worker::Channel,
+    partition_ep: u32,
+    ipc: IpcBuf,
+) -> Option<u32>
 {
-    if caps.bootstrap_ep == 0 || caps.done_sig == 0
+    if caps.bootstrap_ep == 0
     {
-        runtime::log!("vfsd: spawn_fatfs: worker thread not initialised");
+        println!("vfsd: spawn_fatfs: worker thread not initialised");
         return None;
     }
 
@@ -52,20 +60,21 @@ pub fn spawn_fatfs_driver(caps: &VfsdCaps, partition_ep: u32, ipc: IpcBuf) -> Op
 
     // partition_ep is already a tokened SEND cap; hand it to the child as-is.
     // A fresh derive would discard the token, so this is moved into the plan.
-    let log_copy = if caps.log_ep != 0
-    {
-        syscall::cap_derive(caps.log_ep, syscall::RIGHTS_SEND).unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
+    // log_ep arrives via the child's ProcessInfo, so it's not part of the
+    // publish plan.
 
     // Allocate a bootstrap token and publish the plan for the worker.
-    let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, Ordering::Relaxed);
     let tokened_creator =
         syscall::cap_derive_token(caps.bootstrap_ep, syscall::RIGHTS_SEND, token).ok()?;
-    worker::publish_plan(token, partition_ep, log_copy, driver_ep_for_child);
+    worker::publish_plan(
+        channel,
+        worker::Plan {
+            token,
+            blk: partition_ep,
+            service: driver_ep_for_child,
+        },
+    );
 
     // Phase 1: CREATE_PROCESS with [module, tokened bootstrap cap].
     let (reply_label, _) = syscall::ipc_call(
@@ -77,7 +86,7 @@ pub fn spawn_fatfs_driver(caps: &VfsdCaps, partition_ep: u32, ipc: IpcBuf) -> Op
     .ok()?;
     if reply_label != 0
     {
-        runtime::log!("vfsd: fatfs CREATE_PROCESS failed");
+        println!("vfsd: fatfs CREATE_PROCESS failed");
         return None;
     }
 
@@ -85,7 +94,7 @@ pub fn spawn_fatfs_driver(caps: &VfsdCaps, partition_ep: u32, ipc: IpcBuf) -> Op
     let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
     if cap_count < 2
     {
-        runtime::log!("vfsd: fatfs CREATE_PROCESS reply missing caps");
+        println!("vfsd: fatfs CREATE_PROCESS reply missing caps");
         return None;
     }
     let process_handle = reply_caps[0];
@@ -96,20 +105,14 @@ pub fn spawn_fatfs_driver(caps: &VfsdCaps, partition_ep: u32, ipc: IpcBuf) -> Op
         Ok((0, _))
     )
     {
-        runtime::log!("vfsd: fatfs START_PROCESS failed");
+        println!("vfsd: fatfs START_PROCESS failed");
         return None;
     }
 
     // Wait for the worker to deliver the bootstrap round.
-    let Ok(bits) = syscall::signal_wait(caps.done_sig)
-    else
+    if !worker::wait_result(channel)
     {
-        runtime::log!("vfsd: fatfs bootstrap signal_wait failed");
-        return None;
-    };
-    if bits != 1
-    {
-        runtime::log!("vfsd: fatfs bootstrap delivery failed (bits={:#x})", bits);
+        println!("vfsd: fatfs bootstrap delivery failed");
         return None;
     }
 
@@ -118,10 +121,10 @@ pub fn spawn_fatfs_driver(caps: &VfsdCaps, partition_ep: u32, ipc: IpcBuf) -> Op
     let (mount_reply, _) = syscall::ipc_call(driver_send, fs_labels::FS_MOUNT, 0, &[]).ok()?;
     if mount_reply != 0
     {
-        runtime::log!("vfsd: fatfs FS_MOUNT probe failed (label={})", mount_reply);
+        println!("vfsd: fatfs FS_MOUNT probe failed (label={mount_reply})");
         return None;
     }
 
-    runtime::log!("vfsd: fatfs driver started");
+    println!("vfsd: fatfs driver started");
     Some(driver_send)
 }

@@ -18,7 +18,7 @@
 
 use core::panic::PanicInfo;
 
-use init_protocol::{CapDescriptor, CapType, InitInfo, INIT_INFO_MAX_PAGES, INIT_PROTOCOL_VERSION};
+use init_protocol::{CapDescriptor, CapType, INIT_INFO_MAX_PAGES, INIT_PROTOCOL_VERSION, InitInfo};
 
 mod arch;
 mod bootstrap;
@@ -180,7 +180,7 @@ impl FrameAlloc
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start(info_ptr: u64) -> !
 {
     run(info_ptr)
@@ -263,10 +263,28 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
+    // Create the log endpoint before bootstrapping procmgr so procmgr
+    // receives a SEND copy in its bootstrap round and can install it in
+    // every subsequent child's `ProcessInfo.log_endpoint_cap`. procmgr
+    // itself never logs, so the log thread need not exist yet — it is
+    // spawned later, before any child that could log has actually started.
+    let Ok(log_ep) = syscall::cap_create_endpoint()
+    else
+    {
+        logging::log("init: FATAL: cannot create log endpoint");
+        syscall::thread_exit();
+    };
+    logging::log("init: log endpoint created");
+
     // ── Bootstrap procmgr (raw ELF load + creator_endpoint install) ──────────
 
-    let Some(pm) =
-        bootstrap::bootstrap_procmgr(info, &mut alloc, init_bootstrap_ep, procmgr_service_ep)
+    let Some(pm) = bootstrap::bootstrap_procmgr(
+        info,
+        &mut alloc,
+        init_bootstrap_ep,
+        procmgr_service_ep,
+        log_ep,
+    )
     else
     {
         logging::log("init: FATAL: failed to bootstrap procmgr");
@@ -279,7 +297,15 @@ fn run(info_ptr: u64) -> !
     // SAFETY: same invariants as above.
     let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
 
-    // Serve procmgr's bootstrap round: cap [pm_service_ep_copy], data [frame_base, frame_count].
+    // Serve procmgr's bootstrap round.
+    //
+    // Caps:
+    //   [0] procmgr's own service endpoint (RECV; procmgr ipc_recv on it)
+    //   [1] un-tokened SEND on the log endpoint, slotted in procmgr's
+    //       CSpace by `bootstrap_procmgr`. Procmgr re-derives tokened
+    //       SEND caps from this for every child it spawns.
+    //
+    // Data: [frame_base, frame_count].
     let Ok(pm_service_cap_for_pm) = syscall::cap_derive(procmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
@@ -295,7 +321,7 @@ fn run(info_ptr: u64) -> !
         pm.bootstrap_token,
         ipc,
         true,
-        &[pm_service_cap_for_pm],
+        &[pm_service_cap_for_pm, pm.log_endpoint_slot],
         &procmgr_boot_data,
     )
     .is_err()
@@ -307,14 +333,6 @@ fn run(info_ptr: u64) -> !
     let endpoint_cap = pm.service_ep;
 
     // ── Create remaining endpoints ───────────────────────────────────────────
-
-    let Ok(log_ep) = syscall::cap_create_endpoint()
-    else
-    {
-        logging::log("init: FATAL: cannot create log endpoint");
-        syscall::thread_exit();
-    };
-    logging::log("init: log endpoint created");
 
     let Ok(devmgr_registry_ep) = syscall::cap_create_endpoint()
     else
@@ -338,7 +356,6 @@ fn run(info_ptr: u64) -> !
             info,
             endpoint_cap,
             init_bootstrap_ep,
-            log_ep,
             devmgr_registry_ep,
             ipc,
         );
@@ -356,7 +373,6 @@ fn run(info_ptr: u64) -> !
             endpoint_cap,
             init_bootstrap_ep,
             &service::VfsdSpawnCaps {
-                log_ep,
                 registry_ep: devmgr_registry_ep,
                 vfsd_service_ep,
             },
@@ -372,7 +388,17 @@ fn run(info_ptr: u64) -> !
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
     logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
 
-    logging::set_ipc_logging(log_ep, ipc_buf);
+    // Tokened SEND on the log endpoint for init's own `log()` lines so they
+    // appear under `[init]`. cap_derive_token won't accept a zero token, so
+    // pack_name(b"init") (always non-zero) is used.
+    let Ok(init_log_send) =
+        syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, logging::pack_name(b"init"))
+    else
+    {
+        logging::log("init: FATAL: cannot derive tokened log SEND");
+        syscall::thread_exit();
+    };
+    logging::set_ipc_logging(init_log_send, ipc_buf);
     logging::log("init: log thread started");
     logging::log("init: phase 1 bootstrap complete");
 
@@ -444,14 +470,7 @@ fn run(info_ptr: u64) -> !
 
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
 
-    service::phase3_svcmgr_handover(
-        info,
-        endpoint_cap,
-        init_bootstrap_ep,
-        log_ep,
-        vfsd_service_ep,
-        ipc,
-    );
+    service::phase3_svcmgr_handover(info, endpoint_cap, init_bootstrap_ep, vfsd_service_ep, ipc);
 }
 
 /// Idle loop fallback when Phase 3 cannot proceed.

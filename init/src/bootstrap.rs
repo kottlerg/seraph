@@ -14,7 +14,7 @@
 //! All subsequent services are created through procmgr IPC.
 
 use crate::logging::log;
-use crate::{arch, FrameAlloc, PAGE_SIZE, TEMP_MAP_BASE};
+use crate::{FrameAlloc, PAGE_SIZE, TEMP_MAP_BASE, arch};
 use init_protocol::InitInfo;
 use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, PROCESS_STACK_PAGES, PROCESS_STACK_TOP,
@@ -185,6 +185,11 @@ struct ProcmgrCaps
 }
 
 /// Populate procmgr's `ProcessInfo` page and map it read-only into procmgr.
+///
+/// procmgr is `no_std` and doesn't drive `std::io::stdio`, so the three
+/// stdio cap slots are left zero. Procmgr receives the un-tokened log SEND
+/// it needs (for deriving per-child tokened stdio caps) via its bootstrap
+/// round, not via `ProcessInfo`.
 #[allow(clippy::similar_names)]
 fn populate_procmgr_info(
     alloc: &mut FrameAlloc,
@@ -209,6 +214,11 @@ fn populate_procmgr_info(
     pi.self_cspace_cap = pm_cspace_in_pm;
     pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
     pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+    // procmgr has no procmgr above it; leave zero.
+    pi.procmgr_endpoint_cap = 0;
+    pi.stdin_cap = 0;
+    pi.stdout_cap = 0;
+    pi.stderr_cap = 0;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
 
@@ -255,6 +265,10 @@ pub struct ProcmgrBootstrap
     pub memory_frame_base: u32,
     /// Memory pool count.
     pub memory_frame_count: u32,
+    /// Slot in procmgr's `CSpace` holding an un-tokened SEND cap on the
+    /// system log endpoint. Procmgr derives per-child tokened SEND caps
+    /// from this for stdout/stderr. Zero when no log sink is available.
+    pub log_endpoint_slot: u32,
 }
 
 /// Monotonic counter for init-side bootstrap tokens.
@@ -269,6 +283,10 @@ pub static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 =
 /// `pm_service_ep` is procmgr's own service endpoint (created by init, copied
 /// into procmgr's `CSpace` so procmgr can `ipc_recv` on it).
 ///
+/// `log_ep` is the system log endpoint; a SEND cap is copied into procmgr's
+/// `CSpace` and recorded in `ProcessInfo.log_endpoint_cap` so procmgr (and
+/// every child it populates `ProcessInfo` for) has an ambient log sink.
+///
 /// Returns the [`ProcmgrBootstrap`] record so the caller can issue bootstrap
 /// rounds and subsequent `CREATE_PROCESS` calls.
 #[allow(clippy::similar_names)]
@@ -277,6 +295,7 @@ pub fn bootstrap_procmgr(
     alloc: &mut FrameAlloc,
     init_bootstrap_ep: u32,
     pm_service_ep: u32,
+    log_ep: u32,
 ) -> Option<ProcmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;
@@ -330,14 +349,25 @@ pub fn bootstrap_procmgr(
     {
         let src_slot = info.memory_frame_base + alloc.next_idx + i;
         if let Ok(intermediary) = syscall::cap_derive(src_slot, syscall::RIGHTS_ALL)
+            && syscall::cap_copy(intermediary, pm_cspace, syscall::RIGHTS_ALL).is_ok()
         {
-            if syscall::cap_copy(intermediary, pm_cspace, syscall::RIGHTS_ALL).is_ok()
-            {
-                pm_frame_count += 1;
-            }
+            pm_frame_count += 1;
         }
     }
     alloc.next_idx += frames_to_give;
+
+    // Derive an un-tokened SEND cap on the log endpoint, kept in init's CSpace.
+    // Sent to procmgr via the bootstrap round (ipc transfer moves it into
+    // procmgr's CSpace at a fresh slot). Procmgr uses it as the source for
+    // `cap_derive_token` per-child to mint stdout/stderr caps.
+    let pm_log_send = if log_ep == 0
+    {
+        0
+    }
+    else
+    {
+        syscall::cap_derive(log_ep, syscall::RIGHTS_SEND).ok()?
+    };
 
     let pm_caps = ProcmgrCaps {
         aspace: pm_aspace,
@@ -363,5 +393,6 @@ pub fn bootstrap_procmgr(
         bootstrap_token: procmgr_token,
         memory_frame_base: pm_frame_base,
         memory_frame_count: pm_frame_count,
+        log_endpoint_slot: pm_log_send,
     })
 }

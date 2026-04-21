@@ -417,11 +417,9 @@ impl CSpace
                 {
                     let slot = &page.slots[slot_idx];
                     if slot.tag != CapTag::Null
+                        && let Some(obj) = slot.object
                     {
-                        if let Some(obj) = slot.object
-                        {
-                            f(obj);
-                        }
+                        f(obj);
                     }
                 }
             }
@@ -446,6 +444,7 @@ mod tests
             header: KernelObjectHeader::new(ObjectType::Frame),
             base: 0,
             size: 0x1000,
+            owns_memory: core::sync::atomic::AtomicBool::new(false),
         });
         let raw = Box::into_raw(obj) as *mut KernelObjectHeader;
         // SAFETY: Box::into_raw never returns null.

@@ -27,8 +27,8 @@ pub mod thread_lifecycle;
 pub mod tlb_coherency;
 pub mod wait_concurrency;
 
-use crate::run_integration_test;
 use crate::TestContext;
+use crate::run_integration_test;
 
 /// Run all Tier 2 integration tests.
 ///

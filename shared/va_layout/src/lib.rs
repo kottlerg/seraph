@@ -17,7 +17,28 @@
 //!
 //! Boundaries come from `docs/userspace-memory-model.md`.
 
-#![no_std]
+// When built as a std dep via `rustc-dep-of-std`, we switch to `no_core`
+// and rebind `core` to the `rustc_std_workspace_core` facade — same dance
+// as abi/syscall and shared/syscall. This crate has no runtime code, but
+// build-std still needs the crate root to resolve against the std-local
+// `core`.
+#![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
+#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
+#![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+
+#[cfg(feature = "rustc-dep-of-std")]
+extern crate rustc_std_workspace_core as core;
+
+#[cfg(feature = "rustc-dep-of-std")]
+#[allow(unused_imports)]
+use core::prelude::rust_2024::*;
+
+// ── Architectural constants ─────────────────────────────────────────────────
+
+/// Userspace page size in bytes. All VAs declared in this module are
+/// multiples of this value.
+pub const PAGE_SIZE: u64 = 0x1000;
 
 // ── Common: ProcessInfo + main-thread stack (every normal process) ──────────
 //
@@ -49,21 +70,25 @@ pub const PROCESS_STACK_BOTTOM: u64 = PROCESS_STACK_TOP - PROCESS_STACK_PAGES * 
 /// overflow faults here instead of corrupting heap or adjacent mappings.
 pub const PROCESS_STACK_GUARD_VA: u64 = PROCESS_STACK_BOTTOM - 0x1000;
 
-// ── Heap (every process using shared/runtime) ───────────────────────────────
+// ── Heap (every std-built service) ──────────────────────────────────────────
 
-/// Heap base (inclusive). Services linking `shared/runtime` get a
-/// `#[global_allocator]` managing this region.
+/// Heap base (inclusive). std-built services get a `#[global_allocator]`
+/// (from `std::sys::seraph`) managing this region.
 pub const HEAP_BASE: u64 = 0x0000_0000_4000_0000;
 
 /// Heap zone upper bound (exclusive). Maximum heap size = `HEAP_MAX -
 /// HEAP_BASE` = 1 GiB. Growth beyond this bound surfaces OOM.
 pub const HEAP_MAX: u64 = 0x0000_0000_8000_0000;
 
-/// Initial heap size at `_start`, in 4 KiB pages. Small enough that a
-/// service with no allocations pays little boot cost; large enough that
-/// typical workloads avoid an immediate grow. Requested in
-/// `FRAMES_PER_REQUEST`-sized batches (procmgr's per-call limit).
-pub const HEAP_INITIAL_PAGES: u64 = 16;
+/// Initial heap size at `_start`, in 4 KiB pages. Large enough to cover
+/// stdio's lazy 1 KiB line-buffer, two 64 KiB worker-thread stacks plus
+/// their per-thread IPC buffer pages (std `thread::spawn` on seraph
+/// allocates both from the heap), and typical collection workloads. Cost
+/// is a one-off `REQUEST_FRAMES` round-trip at bootstrap, ≈ 512 KiB of
+/// physical RAM per process — cheap relative to fragmentation / contended
+/// grow-path cost later. Requested in `FRAMES_PER_REQUEST`-sized batches
+/// (procmgr's per-call limit).
+pub const HEAP_INITIAL_PAGES: u64 = 128;
 
 /// Maximum frames procmgr returns per `REQUEST_FRAMES` call. Fixed by the
 /// IPC cap-slot limit on the reply side.

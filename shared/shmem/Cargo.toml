@@ -1,0 +1,21 @@
+[package]
+name = "shmem"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# no_std: shared-memory helpers for cross-process byte transport. Wraps
+# procmgr frame allocation + cap transfer + mem_map on top of a Lamport-
+# style single-producer / single-consumer byte ring. Target consumers are
+# `std::process::Child::stdin/stdout` once `Stdio::MakePipe` is wired.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ipc = { path = "../ipc" }
+syscall = { path = "../syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+
+[lints]
+workspace = true

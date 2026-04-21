@@ -21,22 +21,98 @@
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 
-extern crate runtime;
-
 mod arch;
 mod frames;
 mod loader;
 mod process;
 
 use frames::FramePool;
-use ipc::{procmgr_errors, procmgr_labels, IpcBuf};
-use process_abi::StartupInfo;
+use ipc::{IpcBuf, procmgr_errors, procmgr_labels};
+use process_abi::{
+    PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, ProcessInfo, StartupInfo, process_info_ref,
+};
+
+// ── Bespoke runtime ─────────────────────────────────────────────────────────
+//
+// procmgr cannot share the `std::sys::seraph::_start` path used by every
+// other service: that `_start` bootstraps its heap by calling
+// `REQUEST_FRAMES` against a procmgr endpoint, which has not yet run.
+// procmgr therefore ships its own ELF entry symbol and panic handler here
+// and runs on `core` + raw syscalls only (no heap, no `alloc` collections).
+
+/// Process entry point. Reads [`ProcessInfo`] from [`PROCESS_INFO_VADDR`],
+/// validates the protocol version, constructs [`StartupInfo`], and calls
+/// [`main`].
+///
+/// # Safety
+///
+/// init's loader must have mapped a valid [`ProcessInfo`] page at
+/// [`PROCESS_INFO_VADDR`] before starting this thread. The page must remain
+/// mapped for the process's lifetime.
+#[unsafe(no_mangle)]
+pub extern "C" fn _start(_info_ptr: u64) -> !
+{
+    // SAFETY: a valid ProcessInfo page is mapped at PROCESS_INFO_VADDR before
+    // the thread starts; it is read-only and remains mapped for the process's
+    // lifetime.
+    let info: &ProcessInfo = unsafe { process_info_ref(PROCESS_INFO_VADDR) };
+
+    if info.version != PROCESS_ABI_VERSION
+    {
+        // Version mismatch — cannot safely interpret the struct. Exit.
+        syscall::thread_exit();
+    }
+
+    // procmgr ignores argv/env (it only accepts caps via its bootstrap IPC);
+    // build StartupInfo with empty blobs regardless of what init passed.
+    let startup = StartupInfo {
+        ipc_buffer: info.ipc_buffer_vaddr as *mut u8,
+        creator_endpoint: info.creator_endpoint_cap,
+        self_thread: info.self_thread_cap,
+        self_aspace: info.self_aspace_cap,
+        self_cspace: info.self_cspace_cap,
+        procmgr_endpoint: info.procmgr_endpoint_cap,
+        stdin_cap: info.stdin_cap,
+        stdout_cap: info.stdout_cap,
+        stderr_cap: info.stderr_cap,
+        tls_template_vaddr: info.tls_template_vaddr,
+        tls_template_filesz: info.tls_template_filesz,
+        tls_template_memsz: info.tls_template_memsz,
+        tls_template_align: info.tls_template_align,
+        args_blob: &[],
+        args_count: 0,
+        env_blob: &[],
+        env_count: 0,
+    };
+
+    main(&startup)
+}
+
+/// Panic handler. No recovery path: exit the thread and let the supervisor
+/// observe the death.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> !
+{
+    syscall::thread_exit();
+}
 
 /// Init → procmgr bootstrap plan (one round):
 ///   caps[0]: service endpoint (procmgr receives requests on this)
+///   caps[1]: un-tokened SEND cap on the system log endpoint. procmgr
+///            uses this as the source for `cap_derive_token` when
+///            producing per-child stdout/stderr caps. Zero means no log
+///            sink — children get zero stdio caps (silent drops).
 ///   data word 0: `memory_frame_base`
 ///   data word 1: `memory_frame_count`
-fn bootstrap_from_init(creator_ep: u32, ipc: IpcBuf) -> Option<(u32, u32, u32)>
+struct InitBootstrap
+{
+    service_ep: u32,
+    log_ep: u32,
+    frame_base: u32,
+    frame_count: u32,
+}
+
+fn bootstrap_from_init(creator_ep: u32, ipc: IpcBuf) -> Option<InitBootstrap>
 {
     if creator_ep == 0
     {
@@ -47,14 +123,23 @@ fn bootstrap_from_init(creator_ep: u32, ipc: IpcBuf) -> Option<(u32, u32, u32)>
     {
         return None;
     }
-    let service_ep = round.caps[0];
-    let frame_base = ipc.read_word(0) as u32;
-    let frame_count = ipc.read_word(1) as u32;
-    Some((service_ep, frame_base, frame_count))
+    Some(InitBootstrap {
+        service_ep: round.caps[0],
+        log_ep: if round.cap_count >= 2
+        {
+            round.caps[1]
+        }
+        else
+        {
+            0
+        },
+        frame_base: ipc.read_word(0) as u32,
+        frame_count: ipc.read_word(1) as u32,
+    })
 }
 
-#[no_mangle]
-extern "Rust" fn main(startup: &StartupInfo) -> !
+#[allow(clippy::too_many_lines)]
+fn main(startup: &StartupInfo) -> !
 {
     if syscall::ipc_buffer_set(startup.ipc_buffer as u64).is_err()
     {
@@ -66,21 +151,25 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
     let ipc = unsafe { IpcBuf::from_bytes(startup.ipc_buffer) };
     let ipc_buf = ipc.as_ptr();
 
-    // Bootstrap service endpoint + memory pool bounds from init.
-    let Some((service_ep, frame_base, frame_count)) =
-        bootstrap_from_init(startup.creator_endpoint, ipc)
+    // Bootstrap service endpoint + memory pool bounds + log endpoint from init.
+    let Some(boot) = bootstrap_from_init(startup.creator_endpoint, ipc)
     else
     {
         syscall::thread_exit();
     };
 
-    let mut pool = FramePool::new(frame_base, frame_count);
+    let mut pool = FramePool::new(boot.frame_base, boot.frame_count);
     let mut table = process::ProcessTable::new();
+
     let mut ctx = ProcmgrCtx {
         self_aspace,
-        self_endpoint: service_ep,
+        self_endpoint: boot.service_ep,
         vfsd_ep: 0,
+        log_ep: boot.log_ep,
+        death_eq: 0,
+        ws_cap: 0,
     };
+    let service_ep = boot.service_ep;
 
     loop
     {
@@ -94,19 +183,13 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
         {
             procmgr_labels::CREATE_PROCESS =>
             {
-                handle_create(
-                    ipc_buf,
-                    &mut pool,
-                    ctx.self_aspace,
-                    &mut table,
-                    ctx.self_endpoint,
-                );
+                handle_create(label, ipc_buf, &mut pool, &ctx, &mut table);
             }
 
             procmgr_labels::START_PROCESS =>
             {
                 // Token from ipc_recv identifies which process to start.
-                match process::start_process(token, &mut table)
+                match process::start_process(token, &mut table, ctx.death_eq)
                 {
                     Ok(()) =>
                     {
@@ -122,6 +205,32 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
             procmgr_labels::REQUEST_FRAMES =>
             {
                 handle_request_frames(ipc_buf, &mut pool);
+            }
+
+            procmgr_labels::DESTROY_PROCESS =>
+            {
+                // Token from ipc_recv identifies which process to destroy.
+                process::destroy_process(token, &mut table);
+                let _ = syscall::ipc_reply(procmgr_errors::SUCCESS, 0, &[]);
+            }
+
+            procmgr_labels::QUERY_PROCESS =>
+            {
+                // Token identifies which process to query. Reply data:
+                //   word 0 = state code (see `procmgr_process_state`)
+                //   word 1 = exit_reason (0 until auto-reap lands)
+                use ipc::procmgr_process_state;
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let ipc_ref = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
+                let (state, exit_reason) = match table.query_by_token(token)
+                {
+                    Some(true) => (procmgr_process_state::ALIVE, 0u64),
+                    Some(false) => (procmgr_process_state::CREATED, 0u64),
+                    None => (procmgr_process_state::UNKNOWN, 0u64),
+                };
+                ipc_ref.write_word(0, state);
+                ipc_ref.write_word(1, exit_reason);
+                let _ = syscall::ipc_reply(procmgr_errors::SUCCESS, 2, &[]);
             }
 
             procmgr_labels::CREATE_FROM_VFS =>
@@ -167,13 +276,32 @@ fn reply_create_result(result: &process::CreateResult)
 
 /// Handle `CREATE_PROCESS` — create a process from a boot module frame.
 ///
-/// Expects `caps = [module_frame, creator_endpoint]`.
+/// Label layout:
+///   bits [0..16]  = opcode (`CREATE_PROCESS`)
+///   bits [16..32] = reserved
+///   bits [32..48] = `args_bytes` (total byte length of the argv blob; u16)
+///   bits [48..56] = `args_count` (number of NUL-terminated strings; u8)
+///   bits [56..64] = `env_count` (number of NUL-terminated `KEY=VALUE`
+///                    strings; u8). Zero means "no env"; any value >0
+///                    requires an env header word + blob after argv.
+///
+/// IPC data words:
+///   word 0                       = `stdio_token` (packed short ASCII name, u64)
+///   word `1..1+argv_words`       = argv blob, `args_bytes.div_ceil(8)` words
+///   word `1+argv_words`          = `env_bytes` (low 16 bits; only present
+///                                  when `env_count > 0`)
+///   word `1+argv_words+1..`      = env blob, `env_bytes.div_ceil(8)` words
+///                                  (only present when `env_count > 0`)
+///
+/// Expects `caps = [module_frame, creator_endpoint, stdin_cap?]`. `stdin_cap`
+/// is optional — pass zero / omit when the child has no stdin.
+#[allow(clippy::cast_possible_truncation)]
 fn handle_create(
+    label: u64,
     ipc_buf: *mut u64,
     pool: &mut FramePool,
-    self_aspace: u32,
+    ctx: &ProcmgrCtx,
     table: &mut process::ProcessTable,
-    self_endpoint: u32,
 )
 {
     // SAFETY: ipc_buf is the registered IPC buffer page, page-aligned.
@@ -187,15 +315,100 @@ fn handle_create(
 
     let module_cap = caps[0];
     let creator_ep = if cap_count >= 2 { caps[1] } else { 0 };
+    let stdin_cap = if cap_count >= 3 { caps[2] } else { 0 };
 
-    match process::create_process(
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let ipc_ref = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
+    let stdio_token = ipc_ref.read_word(0);
+
+    let args_bytes = ((label >> 32) & 0xFFFF) as usize;
+    let args_count = ((label >> 48) & 0xFF) as u32;
+    let env_count = ((label >> 56) & 0xFF) as u32;
+
+    let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
+    let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
+    {
+        ipc::read_blob_from_ipc(ipc_ref, 1, args_bytes, &mut args_buf);
+        &args_buf[..args_bytes]
+    }
+    else
+    {
+        &[]
+    };
+
+    // Env blob (when present) sits after the argv words: 1 header word
+    // carrying env_bytes, then the blob itself. Bounds: same ARGS_BLOB_MAX
+    // as argv — env must also fit in the ProcessInfo page tail.
+    let argv_words = args_bytes.div_ceil(8);
+    let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
+    let env_blob: &[u8] = if env_count > 0
+    {
+        let env_bytes = (ipc_ref.read_word(1 + argv_words) & 0xFFFF) as usize;
+        if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
+        {
+            ipc::read_blob_from_ipc(ipc_ref, 1 + argv_words + 1, env_bytes, &mut env_buf);
+            &env_buf[..env_bytes]
+        }
+        else
+        {
+            &[]
+        }
+    }
+    else
+    {
+        &[]
+    };
+
+    let args = process::ChildArgs {
+        blob: args_blob,
+        count: args_count,
+    };
+    let env = process::ChildEnv {
+        blob: env_blob,
+        count: env_count,
+    };
+    let stdio = process::ChildStdio {
+        stdio_token,
+        stdin_cap,
+    };
+
+    let universals = process::UniversalCaps {
+        procmgr_endpoint: ctx.self_endpoint,
+        log_endpoint: ctx.log_ep,
+    };
+
+    let result = process::create_process(
         module_cap,
         pool,
-        self_aspace,
+        ctx.self_aspace,
         table,
-        self_endpoint,
+        ctx.self_endpoint,
         creator_ep,
-    )
+        &universals,
+        &args,
+        &env,
+        &stdio,
+        ctx.death_eq,
+    );
+
+    // Transferred caps (`module_cap`, `creator_ep`, `stdin_cap`) entered
+    // procmgr's CSpace via `ipc_recv` and were either cap_copy'd into the
+    // child's CSpace or consumed only for the ELF-load scratch map.
+    // procmgr has no further use for any of them; drop them so their
+    // underlying object refcounts decrement and — once the child dies —
+    // the module Frame (cap_copy descendants in the child's CSpace) can
+    // free its backing memory. Idempotent on zero slots.
+    let _ = syscall::cap_delete(module_cap);
+    if creator_ep != 0
+    {
+        let _ = syscall::cap_delete(creator_ep);
+    }
+    if stdin_cap != 0
+    {
+        let _ = syscall::cap_delete(stdin_cap);
+    }
+
+    match result
     {
         Some(result) => reply_create_result(&result),
         None =>
@@ -254,11 +467,47 @@ pub struct ProcmgrCtx
     pub self_aspace: u32,
     pub self_endpoint: u32,
     pub vfsd_ep: u32,
+    /// Log endpoint (SEND) received from init during procmgr's own bootstrap.
+    /// Propagated into every child's `ProcessInfo.log_endpoint_cap` so std
+    /// `Stdout`/`Stderr` work without per-service wiring. Zero if init did
+    /// not provide one (very early boot; no child logs in that window).
+    pub log_ep: u32,
+    /// Single shared death-notification event queue. Every spawned child
+    /// binds its thread to this queue (via multi-bind in the kernel) with
+    /// `correlator = entry.token as u32`. Auto-reap fan-in: one queue
+    /// scales with process count, while procmgr's wait-set stays a
+    /// constant two members.
+    pub death_eq: u32,
+    /// Wait-set cap. Multiplexes procmgr's service endpoint (token 0) and
+    /// the shared death event queue (token 1). Fixed two members — does
+    /// not grow with `MAX_PROCESSES`.
+    pub ws_cap: u32,
 }
 
 /// Handle `CREATE_FROM_VFS` — create a process from a VFS path.
 ///
-/// Expects `caps = [creator_endpoint]` (module is loaded from VFS, not passed in).
+/// Label layout:
+///   bits [0..16]  = opcode (`CREATE_FROM_VFS`)
+///   bits [16..32] = `path_len`
+///   bits [32..48] = `args_bytes` (total byte length of the argv blob; u16)
+///   bits [48..56] = `args_count` (number of NUL-terminated strings; u8)
+///   bits [56..64] = `env_count` (number of NUL-terminated `KEY=VALUE`
+///                    strings; u8). Zero means "no env"; any value >0
+///                    requires an env header word + blob after argv.
+///
+/// IPC data words:
+///   word 0                           = `stdio_token` (packed short ASCII name, u64)
+///   word `1..1+path_words`           = path bytes (up to `MAX_PATH_LEN` = 48 bytes)
+///   word `1+path_words..+argv_words` = argv blob, `args_bytes.div_ceil(8)` words
+///   word `1+path_words+argv_words`   = `env_bytes` (low 16 bits; only present
+///                                       when `env_count > 0`)
+///   word after env header            = env blob, `env_bytes.div_ceil(8)` words
+///                                       (only present when `env_count > 0`)
+///
+/// Expects `caps = [creator_endpoint, stdin_cap?]`. Module bytes come from
+/// the VFS, not the caller's `CSpace`. Mirrors `CREATE_PROCESS`'s argv/env
+/// encoding (see `handle_create`).
+#[allow(clippy::cast_possible_truncation)]
 fn handle_create_from_vfs(
     label: u64,
     ipc_buf: *mut u64,
@@ -283,20 +532,89 @@ fn handle_create_from_vfs(
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let (cap_count, caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
     let creator_ep = if cap_count >= 1 { caps[0] } else { 0 };
+    let stdin_cap = if cap_count >= 2 { caps[1] } else { 0 };
 
-    let mut path_buf = [0u8; ipc::MAX_PATH_LEN];
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let ipc_ref = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    let effective_len = ipc::read_path_from_ipc(ipc_ref, path_len, &mut path_buf);
+    let stdio_token = ipc_ref.read_word(0);
 
-    match process::create_process_from_vfs(
+    let mut path_buf = [0u8; ipc::MAX_PATH_LEN];
+    // Path begins at word 1 (word 0 is stdio_token).
+    let effective_path_len = read_path_at_offset(ipc_ref, 1, path_len, &mut path_buf);
+    let path_words = path_len.div_ceil(8);
+
+    let args_bytes = ((label >> 32) & 0xFFFF) as usize;
+    let args_count = ((label >> 48) & 0xFF) as u32;
+    let env_count = ((label >> 56) & 0xFF) as u32;
+
+    let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
+    let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
+    {
+        ipc::read_blob_from_ipc(ipc_ref, 1 + path_words, args_bytes, &mut args_buf);
+        &args_buf[..args_bytes]
+    }
+    else
+    {
+        &[]
+    };
+
+    let argv_words = args_bytes.div_ceil(8);
+    let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
+    let env_blob: &[u8] = if env_count > 0
+    {
+        let env_bytes = (ipc_ref.read_word(1 + path_words + argv_words) & 0xFFFF) as usize;
+        if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
+        {
+            ipc::read_blob_from_ipc(
+                ipc_ref,
+                1 + path_words + argv_words + 1,
+                env_bytes,
+                &mut env_buf,
+            );
+            &env_buf[..env_bytes]
+        }
+        else
+        {
+            &[]
+        }
+    }
+    else
+    {
+        &[]
+    };
+
+    let args = process::ChildArgs {
+        blob: args_blob,
+        count: args_count,
+    };
+    let env = process::ChildEnv {
+        blob: env_blob,
+        count: env_count,
+    };
+    let stdio = process::ChildStdio {
+        stdio_token,
+        stdin_cap,
+    };
+
+    let result = process::create_process_from_vfs(
         ctx,
-        &path_buf[..effective_len],
+        &path_buf[..effective_path_len],
         pool,
         table,
         ipc_buf,
         creator_ep,
-    )
+        &args,
+        &env,
+        &stdio,
+        ctx.death_eq,
+    );
+
+    if stdin_cap != 0
+    {
+        let _ = syscall::cap_delete(stdin_cap);
+    }
+
+    match result
     {
         Ok(result) => reply_create_result(&result),
         Err(code) =>
@@ -304,4 +622,30 @@ fn handle_create_from_vfs(
             let _ = syscall::ipc_reply(code, 0, &[]);
         }
     }
+}
+
+/// Unpack `path_len` bytes from u64 words starting at `word_offset`. Local
+/// helper because `ipc::read_path_from_ipc` is hard-coded to start at word 0.
+fn read_path_at_offset(
+    ipc: ipc::IpcBuf,
+    word_offset: usize,
+    path_len: usize,
+    buf: &mut [u8],
+) -> usize
+{
+    let effective_len = path_len.min(buf.len()).min(ipc::MAX_PATH_LEN);
+    let word_count = effective_len.div_ceil(8);
+    for i in 0..word_count
+    {
+        let word = ipc.read_word(word_offset + i);
+        let base = i * 8;
+        for j in 0..8
+        {
+            if base + j < effective_len
+            {
+                buf[base + j] = (word >> (j * 8)) as u8;
+            }
+        }
+    }
+    effective_len
 }

@@ -188,11 +188,7 @@ fn iter_entries(
                 length_lba,
                 active: true,
             };
-            runtime::log!(
-                "vfsd: GPT: partition at LBA {:#018x} length {:#018x}",
-                first_lba,
-                length_lba
-            );
+            println!("vfsd: GPT: partition at LBA {first_lba:#018x} length {length_lba:#018x}");
             found += 1;
             entries_checked += 1;
         }
@@ -211,7 +207,7 @@ pub fn parse_gpt(
 {
     let header = read_and_validate_header(blk_ep, ipc_buf)?;
     let found = iter_entries(blk_ep, ipc_buf, &header, parts);
-    runtime::log!("vfsd: GPT: partitions found: {}", found);
+    println!("vfsd: GPT: partitions found: {found}");
     Ok(found)
 }
 

@@ -13,10 +13,10 @@
 //! discovery is skipped or fails, the hardcoded QEMU default is used silently.
 
 use crate::acpi::{
-    phys_slice, read_u32, read_u64, read_u8, RSDP_OFF_REVISION, RSDP_OFF_XSDT, RSDP_SIG,
-    SDT_HDR_LEN, SDT_OFF_LENGTH, SDT_OFF_SIGNATURE,
+    RSDP_OFF_REVISION, RSDP_OFF_XSDT, RSDP_SIG, SDT_HDR_LEN, SDT_OFF_LENGTH, SDT_OFF_SIGNATURE,
+    phys_slice, read_u8, read_u32, read_u64,
 };
-use crate::uefi::{EfiSystemTable, EFI_ACPI_20_TABLE_GUID, EFI_DTB_TABLE_GUID};
+use crate::uefi::{EFI_ACPI_20_TABLE_GUID, EFI_DTB_TABLE_GUID, EfiSystemTable};
 
 /// UART MMIO base address; updated by `discover_uart` before first use.
 ///

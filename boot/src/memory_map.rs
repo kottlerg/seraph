@@ -9,8 +9,9 @@
 //! `MemoryMapEntry` format and sorts the result by physical base address.
 
 use crate::uefi::{
-    EfiMemoryDescriptor, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA,
+    EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA,
     EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA, EFI_PERSISTENT_MEMORY,
+    EfiMemoryDescriptor,
 };
 use boot_protocol::{MemoryMapEntry, MemoryType};
 
@@ -102,10 +103,10 @@ mod tests
 
     use super::{insertion_sort_memory_map, translate_memory_map, translate_memory_type};
     use crate::uefi::{
-        EfiMemoryDescriptor, MemoryMapResult, EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY,
-        EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE,
-        EFI_LOADER_DATA, EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE,
-        EFI_PERSISTENT_MEMORY, EFI_RUNTIME_SERVICES_CODE, EFI_RUNTIME_SERVICES_DATA,
+        EFI_ACPI_MEMORY_NVS, EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE,
+        EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA,
+        EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_PERSISTENT_MEMORY,
+        EFI_RUNTIME_SERVICES_CODE, EFI_RUNTIME_SERVICES_DATA, EfiMemoryDescriptor, MemoryMapResult,
     };
     use boot_protocol::{MemoryMapEntry, MemoryType};
 

@@ -20,6 +20,46 @@
 
 use crate::arch::current::context::SavedState;
 
+// ── Death notification observers ─────────────────────────────────────────────
+
+/// Maximum number of independent death observers a single thread may have.
+///
+/// A child thread can in practice be watched by: (1) procmgr for auto-reap,
+/// (2) svcmgr for service-restart policy, (3) the spawner's
+/// `std::process::Child::wait`. Three is the realistic upper bound. Four
+/// gives headroom for a future terminal / session manager binding without
+/// needing dynamic allocation per TCB.
+pub const MAX_DEATH_OBSERVERS: usize = 4;
+
+/// A single registered death observer: an event queue plus a caller-chosen
+/// correlator. See `ThreadControlBlock::death_observers`.
+#[derive(Clone, Copy)]
+pub struct DeathObserver
+{
+    /// Target event queue. `null` means this slot is unused.
+    pub eq: *mut crate::ipc::event_queue::EventQueueState,
+    /// Caller-chosen routing tag. Delivered as the upper 32 bits of the
+    /// posted payload. Opaque to the kernel.
+    pub correlator: u32,
+}
+
+impl DeathObserver
+{
+    pub const fn empty() -> Self
+    {
+        Self {
+            eq: core::ptr::null_mut(),
+            correlator: 0,
+        }
+    }
+}
+
+// SAFETY: `DeathObserver::eq` is only read with the scheduler lock held; raw
+// pointer does not imply any shared mutable state beyond the lock.
+unsafe impl Send for DeathObserver {}
+// SAFETY: same rationale as `Send`.
+unsafe impl Sync for DeathObserver {}
+
 // ── IpcThreadState ────────────────────────────────────────────────────────────
 
 /// IPC blocking reason for a thread in the `Blocked` state.
@@ -203,9 +243,27 @@ pub struct ThreadControlBlock
     pub context_saved: core::sync::atomic::AtomicU32,
 
     // === Death notification ===
-    /// Pointer to the `EventQueueState` to post when this thread exits or faults.
-    /// Set by `SYS_THREAD_BIND_NOTIFICATION`; null means no notification.
-    pub death_notification: *mut crate::ipc::event_queue::EventQueueState,
+    /// Observers to notify when this thread exits or faults.
+    ///
+    /// Each observer pairs an `EventQueueState` pointer (post target) with a
+    /// caller-chosen `correlator: u32`. On death, the kernel posts a packed
+    /// payload `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
+    /// each observer's queue. Observers past `death_observer_count` are
+    /// invalid.
+    ///
+    /// Correlator semantics: opaque to the kernel, scoped to one
+    /// `(EventQueue, binder)` pair. Not a system-wide identifier, not a PID;
+    /// it is whatever the binder needs to route the event to its own
+    /// bookkeeping (e.g. procmgr stashes its internal `ProcessTable` token
+    /// in the low 32 bits). Passing `0` recovers the pre-multi-bind
+    /// behaviour where the payload is just `exit_reason`.
+    ///
+    /// Multiple binders (e.g. procmgr auto-reap + svcmgr restart manager)
+    /// can each install their own observer; all fire on death independently.
+    pub death_observers: [DeathObserver; MAX_DEATH_OBSERVERS],
+    /// Number of populated entries in `death_observers`
+    /// (`0..=MAX_DEATH_OBSERVERS`).
+    pub death_observer_count: u8,
 
     // === Sleep ===
     /// Tick deadline for `SYS_THREAD_SLEEP`. 0 = not sleeping.

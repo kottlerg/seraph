@@ -14,8 +14,11 @@ Memory authority flows downward:
 - **procmgr** — holds root authority over the userspace physical-frame pool
   (delegated by the kernel at the end of boot phase 7). Serves
   `REQUEST_FRAMES` over IPC. Knows nothing about VAs.
-- **shared/runtime** — per-process. Owns the process's virtual address space
-  layout, hosts the `#[global_allocator]`, and drives the `alloc` crate.
+- **std::sys::seraph** — per-process. Owns the process's virtual address space
+  layout, hosts the `#[global_allocator]`, and drives the `alloc` crate for
+  every std-built service (shipped as the `ruststd/` overlay folded into
+  `library/std`). procmgr keeps a bespoke `core + alloc`-free runtime (no
+  heap, no std collections); see `procmgr/src/rt.rs`.
 
 No process manipulates another process's aspace. Sharing is explicit and
 capability-mediated: a `Frame` cap is sent over IPC and the receiver maps
@@ -46,20 +49,23 @@ the workspace defines VA constants; every site imports from `va_layout`.
 
 ## The heap
 
-`shared/runtime` declares `#[global_allocator]`, so the full `alloc` crate
-surface (`Box`, `Vec`, `String`, `BTreeMap`, …) is available to every
-service linking runtime.
+`std::sys::seraph::alloc` declares `#[global_allocator]`, so the full
+`alloc` / `std` collections surface (`Box`, `Vec`, `String`, `BTreeMap`,
+…) is available to every std-built service.
 
-- **Initial allocation** — services call
-  `runtime::heap::bootstrap_from_procmgr` after acquiring their procmgr
-  endpoint. Initial frames are requested via `REQUEST_FRAMES` and mapped
-  at `va_layout::HEAP_BASE`.
+- **Initial allocation** — `std::os::seraph::_start` bootstraps the heap
+  against the process's `procmgr_endpoint` (delivered in `ProcessInfo`)
+  before `fn main` runs. Initial frames are requested via `REQUEST_FRAMES`
+  and mapped at `va_layout::HEAP_BASE`.
 - **Out-of-memory** — `GlobalAlloc::alloc` returns null; the `alloc` crate
-  panics; the runtime panic handler exits the thread. svcmgr observes the
+  panics; the std panic handler exits the thread. svcmgr observes the
   death via its event queue and applies restart policy. No kernel panic.
 - **Thread safety** — a spinlock guards the allocator. Multi-threaded
   services (init main + log thread; vfsd main + worker) share a single
   allocator.
+- **procmgr exception** — procmgr cannot bootstrap its heap against
+  itself, so it ships without one: `procmgr/src/rt.rs` provides `_start`
+  + panic handler and the service runs on `core` + raw syscalls only.
 
 ---
 

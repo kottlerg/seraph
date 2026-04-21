@@ -31,7 +31,10 @@ See [docs/documentation-standards.md](docs/documentation-standards.md) — non-n
 
 ## Validation
 - Changes MUST be validated beyond successful compilation.
-- At minimum: the relevant build and a runnable smoke path MUST succeed.
+- At minimum: the relevant build MUST succeed, and functional tests MUST
+  execute against the running OS (`cargo xtask run` booting ktest or
+  userspace services under QEMU). Host-side compilation, unit tests, and
+  `cargo check` alone do not satisfy this requirement.
 
 ## Conflicts
 - If any instruction, plan, or change conflicts with documented invariants or these constraints,

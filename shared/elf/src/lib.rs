@@ -46,6 +46,9 @@ pub const EM_RISCV: u16 = 0xF3;
 /// Program header type: loadable segment.
 const PT_LOAD: u32 = 1;
 
+/// Program header type: thread-local storage template.
+const PT_TLS: u32 = 7;
+
 /// Segment flag: execute permission.
 const PF_X: u32 = 1;
 /// Segment flag: write permission.
@@ -171,6 +174,29 @@ pub struct LoadSegment
     pub writable: bool,
     /// Segment is executable.
     pub executable: bool,
+}
+
+/// A `PT_TLS` segment extracted from an ELF image.
+///
+/// Describes the thread-local-storage template: the initialized part
+/// (`.tdata`, `filesz` bytes) followed by the zero-initialized part
+/// (`.tbss`, `memsz - filesz` bytes). Each thread gets its own copy of
+/// this template at runtime; the loader is responsible for allocating
+/// per-thread TLS blocks and copying the template into them.
+#[derive(Debug, Clone, Copy)]
+pub struct TlsSegment
+{
+    /// Virtual address of the TLS template in the loaded image (the `.tdata`
+    /// section, which a `PT_LOAD` segment also maps at the same VA).
+    pub vaddr: u64,
+    /// Byte offset within the ELF file where the template's `.tdata` starts.
+    pub offset: u64,
+    /// Number of `.tdata` bytes (initialized portion).
+    pub filesz: u64,
+    /// Total template size (`.tdata` + `.tbss`).
+    pub memsz: u64,
+    /// Required alignment of the per-thread TLS block.
+    pub align: u64,
 }
 
 // ── Validation ───────────────────────────────────────────────────────────────
@@ -416,4 +442,110 @@ pub fn load_segments_metadata<'a>(
         phdr_count: ehdr.e_phnum as usize,
         index: 0,
     }
+}
+
+// ── PT_TLS lookup ────────────────────────────────────────────────────────────
+
+/// Return the `PT_TLS` segment from a validated ELF image, or `None` if the
+/// binary has no thread-local storage template.
+///
+/// `ehdr` must have been returned by a successful [`validate`] call on `data`.
+///
+/// The ELF spec guarantees at most one `PT_TLS` program header per object.
+/// The returned [`TlsSegment`] describes where the `.tdata` template lives in
+/// the file and in the loaded image; the loader is responsible for
+/// allocating a per-thread block and copying the template into it.
+///
+/// # Errors
+///
+/// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
+/// extends beyond the ELF image.
+pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, ElfError>
+{
+    let phdr_base = ehdr.e_phoff as usize;
+    let phdr_count = ehdr.e_phnum as usize;
+
+    for i in 0..phdr_count
+    {
+        let offset = phdr_base + i * size_of::<Elf64Phdr>();
+        // SAFETY: validate() confirmed the phdr table fits within data.
+        // cast_ptr_alignment: ELF data is page-aligned (see validate()).
+        #[allow(clippy::cast_ptr_alignment)]
+        let phdr = unsafe { &*data.as_ptr().add(offset).cast::<Elf64Phdr>() };
+
+        if phdr.p_type != PT_TLS
+        {
+            continue;
+        }
+
+        let seg_end = (phdr.p_offset as usize).checked_add(phdr.p_filesz as usize);
+        match seg_end
+        {
+            Some(end) if end <= data.len() =>
+            {}
+            _ => return Err(ElfError::SegmentOverflow),
+        }
+
+        return Ok(Some(TlsSegment {
+            vaddr: phdr.p_vaddr,
+            offset: phdr.p_offset,
+            filesz: phdr.p_filesz,
+            memsz: phdr.p_memsz,
+            align: phdr.p_align,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// Locate the `PT_TLS` segment using only the ELF header page, validating
+/// `p_filesz` against a declared `file_size` instead of a buffer length.
+///
+/// Mirror of [`tls_segment`] for the streaming-from-VFS loader path, which
+/// holds only the first file page in memory during ELF parsing.
+///
+/// # Errors
+///
+/// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
+/// extends beyond `file_size`.
+pub fn tls_segment_metadata(
+    ehdr: &Elf64Ehdr,
+    header_data: &[u8],
+    file_size: u64,
+) -> Result<Option<TlsSegment>, ElfError>
+{
+    let phdr_base = ehdr.e_phoff as usize;
+    let phdr_count = ehdr.e_phnum as usize;
+
+    for i in 0..phdr_count
+    {
+        let offset = phdr_base + i * size_of::<Elf64Phdr>();
+        // SAFETY: validate() confirmed the phdr table fits within header_data.
+        // cast_ptr_alignment: ELF data is page-aligned (see validate()).
+        #[allow(clippy::cast_ptr_alignment)]
+        let phdr = unsafe { &*header_data.as_ptr().add(offset).cast::<Elf64Phdr>() };
+
+        if phdr.p_type != PT_TLS
+        {
+            continue;
+        }
+
+        let seg_end = phdr.p_offset.checked_add(phdr.p_filesz);
+        match seg_end
+        {
+            Some(end) if end <= file_size =>
+            {}
+            _ => return Err(ElfError::SegmentOverflow),
+        }
+
+        return Ok(Some(TlsSegment {
+            vaddr: phdr.p_vaddr,
+            offset: phdr.p_offset,
+            filesz: phdr.p_filesz,
+            memsz: phdr.p_memsz,
+            align: phdr.p_align,
+        }));
+    }
+
+    Ok(None)
 }

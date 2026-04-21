@@ -78,7 +78,8 @@ pub unsafe fn take_root_cspace() -> Option<Box<CSpace>>
 {
     // SAFETY: single-threaded boot; no concurrent access.
     let ptr = core::ptr::addr_of_mut!(ROOT_CSPACE);
-    core::ptr::replace(ptr, None)
+    // SAFETY: ptr is a valid writable pointer to ROOT_CSPACE; single-threaded boot.
+    unsafe { core::ptr::replace(ptr, None) }
 }
 
 /// Borrow the root `CSpace` mutably.
@@ -161,14 +162,7 @@ pub fn lookup_cspace(id: CSpaceId) -> Option<*mut CSpace>
         return None;
     }
     let ptr = CSPACE_REGISTRY[id as usize].load(Ordering::Acquire);
-    if ptr.is_null()
-    {
-        None
-    }
-    else
-    {
-        Some(ptr)
-    }
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 /// Allocate a unique `CSpace` ID.
@@ -340,6 +334,8 @@ fn populate_cspace(
                 header: KernelObjectHeader::new(ObjectType::Frame),
                 base: addr,
                 size,
+                // Buddy-backed: responsible for freeing on final destruction.
+                owns_memory: core::sync::atomic::AtomicBool::new(true),
             });
             let ptr = nonnull_from_box(obj);
             let slot = insert_or_fatal(
@@ -384,6 +380,9 @@ fn populate_cspace(
             header: KernelObjectHeader::new(ObjectType::Frame),
             base: entry.physical_base,
             size: entry.size,
+            // Test stub: buddy not active; leaking on destruction is the
+            // expected unit-test behaviour.
+            owns_memory: core::sync::atomic::AtomicBool::new(false),
         });
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
@@ -466,6 +465,9 @@ fn populate_cspace(
                     header: KernelObjectHeader::new(ObjectType::Frame),
                     base: res.base,
                     size: rounded_size,
+                    // Firmware table: physical memory is not part of the
+                    // buddy pool; never return it.
+                    owns_memory: core::sync::atomic::AtomicBool::new(false),
                 });
                 let ptr = nonnull_from_box(obj);
                 let slot = insert_or_fatal(
@@ -681,6 +683,9 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             header: KernelObjectHeader::new(ObjectType::Frame),
             base: module.physical_base,
             size: rounded_size,
+            // Boot module pages are pre-loaded by the bootloader outside
+            // the buddy pool; never return them.
+            owns_memory: core::sync::atomic::AtomicBool::new(false),
         });
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
@@ -811,49 +816,37 @@ pub unsafe fn move_cap_between_cspaces(
 
     // Update parent's first_child if it pointed to source.
     if let Some(parent_id) = src_parent
+        && let Some(parent_cs) = lookup_cspace(parent_id.cspace_id)
     {
-        if let Some(parent_cs) = lookup_cspace(parent_id.cspace_id)
+        // SAFETY: parent_cs returned by lookup_cspace is valid; parent_id.index from derivation link is within bounds.
+        if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(parent_id.index.get()) }
+            && parent_slot.deriv_first_child == Some(src_slot_id)
         {
-            // SAFETY: parent_cs returned by lookup_cspace is valid; parent_id.index from derivation link is within bounds.
-            if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(parent_id.index.get()) }
-            {
-                if parent_slot.deriv_first_child == Some(src_slot_id)
-                {
-                    parent_slot.deriv_first_child = Some(dst_slot_id);
-                }
-            }
+            parent_slot.deriv_first_child = Some(dst_slot_id);
         }
     }
 
     // Update prev sibling's next pointer.
     if let Some(prev_id) = src_prev
+        && let Some(prev_cs) = lookup_cspace(prev_id.cspace_id)
     {
-        if let Some(prev_cs) = lookup_cspace(prev_id.cspace_id)
+        // SAFETY: prev_cs returned by lookup_cspace is valid; prev_id.index from derivation link is within bounds.
+        if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(prev_id.index.get()) }
+            && prev_slot.deriv_next_sibling == Some(src_slot_id)
         {
-            // SAFETY: prev_cs returned by lookup_cspace is valid; prev_id.index from derivation link is within bounds.
-            if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(prev_id.index.get()) }
-            {
-                if prev_slot.deriv_next_sibling == Some(src_slot_id)
-                {
-                    prev_slot.deriv_next_sibling = Some(dst_slot_id);
-                }
-            }
+            prev_slot.deriv_next_sibling = Some(dst_slot_id);
         }
     }
 
     // Update next sibling's prev pointer.
     if let Some(next_id) = src_next
+        && let Some(next_cs) = lookup_cspace(next_id.cspace_id)
     {
-        if let Some(next_cs) = lookup_cspace(next_id.cspace_id)
+        // SAFETY: next_cs returned by lookup_cspace is valid; next_id.index from derivation link is within bounds.
+        if let Some(next_slot) = unsafe { (*next_cs).slot_mut(next_id.index.get()) }
+            && next_slot.deriv_prev_sibling == Some(src_slot_id)
         {
-            // SAFETY: next_cs returned by lookup_cspace is valid; next_id.index from derivation link is within bounds.
-            if let Some(next_slot) = unsafe { (*next_cs).slot_mut(next_id.index.get()) }
-            {
-                if next_slot.deriv_prev_sibling == Some(src_slot_id)
-                {
-                    next_slot.deriv_prev_sibling = Some(dst_slot_id);
-                }
-            }
+            next_slot.deriv_prev_sibling = Some(dst_slot_id);
         }
     }
 

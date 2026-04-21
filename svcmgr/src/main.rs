@@ -12,20 +12,20 @@
 //!
 //! See `svcmgr/docs/ipc-interface.md` and `svcmgr/docs/restart-protocol.md`.
 
-#![no_std]
-#![no_main]
+// The `seraph` target is not in rustc's recognised-OS list, so `std` is
+// `restricted_std`-gated for downstream bins. Every std-built service on
+// seraph carries this preamble.
+#![feature(restricted_std)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
-
-extern crate runtime;
 
 mod arch;
 mod restart;
 mod service;
 
-use ipc::{svcmgr_labels, IpcBuf};
-use process_abi::StartupInfo;
-use service::{bootstrap_caps, ServiceEntry, MAX_BUNDLE_CAPS, MAX_SERVICES};
+use ipc::{IpcBuf, svcmgr_labels};
+use service::{MAX_BUNDLE_CAPS, MAX_SERVICES, ServiceEntry, bootstrap_caps};
+use std::os::seraph::{StartupInfo, startup_info};
 
 /// Global discovery registry size. Enough for a handful of top-level named
 /// endpoints (vfsd, logd, procmgr, …) plus slack.
@@ -71,8 +71,8 @@ fn handle_register(
     // Read transferred caps. Layout:
     //   cap[0] = thread
     //   cap[1] = module
-    //   cap[2] = log_ep (optional)
-    //   cap[3] = optional bundle cap (named by the tail-word `bundle_name_len`)
+    //   cap[2] = optional bundle cap (named by the tail-word `bundle_name_len`)
+    // log endpoint is delivered via `ProcessInfo`, not this protocol.
     // SAFETY: ipc_buf is the registered IPC buffer, page-aligned.
     let (cap_count, recv_caps) = unsafe { syscall::read_recv_caps(ipc_buf.cast::<u64>()) };
 
@@ -83,7 +83,6 @@ fn handle_register(
 
     let thread_cap = recv_caps[0];
     let module_cap = recv_caps[1];
-    let log_ep_cap = if cap_count >= 3 { recv_caps[2] } else { 0 };
 
     if thread_cap == 0 || module_cap == 0
     {
@@ -102,7 +101,6 @@ fn handle_register(
         name_len: name_len as u8,
         thread_cap,
         module_cap,
-        log_ep_cap,
         bundle: [registry::Entry {
             name: [0; registry::NAME_MAX],
             name_len: 0,
@@ -115,11 +113,12 @@ fn handle_register(
         restart_count: 0,
         active: true,
         bootstrap_token: 0,
+        process_handle: 0,
     };
 
     // If a bundle cap was sent alongside, stash it in the first bundle slot.
-    if cap_count >= 4
-        && recv_caps[3] != 0
+    if cap_count >= 3
+        && recv_caps[2] != 0
         && bundle_name_len > 0
         && bundle_name_len <= registry::NAME_MAX
     {
@@ -128,13 +127,13 @@ fn handle_register(
         let entry = &mut services[idx].bundle[0];
         entry.name[..bundle_name_len].copy_from_slice(&bundle_name[..bundle_name_len]);
         entry.name_len = bundle_name_len as u8;
-        entry.cap = recv_caps[3];
+        entry.cap = recv_caps[2];
         services[idx].bundle_count = 1;
     }
 
     *service_count += 1;
 
-    runtime::log!(
+    println!(
         "svcmgr: registered service: {} (bundle caps={})",
         services[idx].name_str(),
         u64::from(services[idx].bundle_count)
@@ -198,13 +197,15 @@ fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usiz
     let Ok(eq_cap) = syscall::event_queue_create(4)
     else
     {
-        runtime::log!("svcmgr: failed to create event queue for service");
+        println!("svcmgr: failed to create event queue for service");
         return None;
     };
 
-    if syscall::thread_bind_notification(thread_cap, eq_cap).is_err()
+    // Correlator 0: svcmgr uses a per-service EventQueue plus WaitSet token
+    // for routing; the payload is just `exit_reason`. No correlator needed.
+    if syscall::thread_bind_notification(thread_cap, eq_cap, 0).is_err()
     {
-        runtime::log!("svcmgr: failed to bind death notification");
+        println!("svcmgr: failed to bind death notification");
         return None;
     }
 
@@ -212,7 +213,7 @@ fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usiz
     let token = (service_index as u64) + 1;
     if syscall::wait_set_add(ws_cap, eq_cap, token).is_err()
     {
-        runtime::log!("svcmgr: failed to add event queue to wait set");
+        println!("svcmgr: failed to add event queue to wait set");
         return None;
     }
 
@@ -232,53 +233,46 @@ pub fn halt_loop() -> !
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
-#[no_mangle]
-extern "Rust" fn main(startup: &StartupInfo) -> !
+fn main() -> !
 {
-    // Register IPC buffer.
-    if syscall::ipc_buffer_set(startup.ipc_buffer as u64).is_err()
-    {
-        syscall::thread_exit();
-    }
+    let info = startup_info();
 
-    // SAFETY: IPC buffer is registered and page-aligned.
-    let ipc = unsafe { IpcBuf::from_bytes(startup.ipc_buffer) };
+    // IPC buffer was registered by `std::os::seraph::_start`. Build a typed
+    // view over the same page for local use.
+    // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
+    // boot protocol.
+    let ipc = unsafe { IpcBuf::from_bytes(info.ipc_buffer) };
     let ipc_buf = ipc.as_ptr();
 
-    let Some(caps) = bootstrap_caps(startup, ipc)
+    let Some(caps) = bootstrap_caps(info, ipc)
     else
     {
         syscall::thread_exit();
     };
 
-    if caps.log_ep != 0
-    {
-        runtime::log::log_init(caps.log_ep, startup.ipc_buffer);
-    }
-
-    runtime::log!("svcmgr: started");
+    println!("svcmgr: started");
 
     if caps.service_ep == 0
     {
-        runtime::log!("svcmgr: no service endpoint, halting");
+        println!("svcmgr: no service endpoint, halting");
         halt_loop();
     }
-    if caps.procmgr_ep == 0
+    if info.procmgr_endpoint == 0
     {
-        runtime::log!("svcmgr: no procmgr endpoint, halting");
+        println!("svcmgr: no procmgr endpoint, halting");
         halt_loop();
     }
 
     let Ok(ws_cap) = syscall::wait_set_create()
     else
     {
-        runtime::log!("svcmgr: failed to create wait set");
+        println!("svcmgr: failed to create wait set");
         halt_loop();
     };
 
     if syscall::wait_set_add(ws_cap, caps.service_ep, 0).is_err()
     {
-        runtime::log!("svcmgr: failed to add service endpoint to wait set");
+        println!("svcmgr: failed to add service endpoint to wait set");
         halt_loop();
     }
 
@@ -289,9 +283,9 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
         registry: registry::Registry::new(),
     };
 
-    runtime::log!("svcmgr: waiting for registrations");
+    println!("svcmgr: waiting for registrations");
 
-    event_loop(&caps, ws_cap, ipc, ipc_buf, &mut state);
+    event_loop(info, &caps, ws_cap, ipc, ipc_buf, &mut state);
 }
 
 /// Monitored service table, global discovery registry, and handover flag.
@@ -306,6 +300,7 @@ pub struct SvcmgrState
 
 /// Main event loop: dispatches IPC registrations and death notifications.
 fn event_loop(
+    info: &StartupInfo,
     caps: &service::SvcmgrCaps,
     ws_cap: u32,
     ipc: IpcBuf,
@@ -314,7 +309,7 @@ fn event_loop(
 ) -> !
 {
     let restart_ctx = restart::RestartCtx {
-        procmgr_ep: caps.procmgr_ep,
+        procmgr_ep: info.procmgr_endpoint,
         bootstrap_ep: caps.bootstrap_ep,
         ipc,
         ws_cap,
@@ -325,7 +320,7 @@ fn event_loop(
         let Ok(token) = syscall::wait_set_wait(ws_cap)
         else
         {
-            runtime::log!("svcmgr: wait_set_wait failed");
+            println!("svcmgr: wait_set_wait failed");
             continue;
         };
 
@@ -368,7 +363,7 @@ fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, ws_
         {
             state.handover_complete = true;
             let _ = syscall::ipc_reply(ipc::svcmgr_errors::SUCCESS, 0, &[]);
-            runtime::log!(
+            println!(
                 "svcmgr: handover complete, monitoring services: {:#018x}",
                 state.service_count as u64
             );
@@ -453,14 +448,14 @@ fn dispatch_death(token: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx
     let idx = (token - 1) as usize;
     if idx >= state.service_count
     {
-        runtime::log!("svcmgr: invalid death notification token");
+        println!("svcmgr: invalid death notification token");
         return;
     }
 
     let Ok(exit_reason) = syscall::event_recv(state.services[idx].event_queue_cap)
     else
     {
-        runtime::log!("svcmgr: event_recv failed");
+        println!("svcmgr: event_recv failed");
         return;
     };
 
@@ -475,7 +470,7 @@ fn dispatch_death(token: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx
     if state.services[idx].active
         && syscall::wait_set_add(ctx.ws_cap, state.services[idx].event_queue_cap, token).is_err()
     {
-        runtime::log!("svcmgr: failed to re-add event queue to wait set after restart");
+        println!("svcmgr: failed to re-add event queue to wait set after restart");
         state.services[idx].active = false;
     }
 }

@@ -212,6 +212,38 @@ impl BuddyAllocator
         self.free_pages
     }
 
+    /// Free a range `[base, base + size_bytes)` into the buddy as order-0
+    /// pages, one per iteration. Adjacent buddies merge inside `free`, so
+    /// the range re-coalesces into the largest naturally-aligned blocks
+    /// available once all pages are returned.
+    ///
+    /// Used by [`FrameObject`](crate::cap::object::FrameObject) teardown to
+    /// return an entire cap-backed region (which need not be a single
+    /// power-of-two block after `frame_split`) in one call.
+    ///
+    /// # Safety
+    ///
+    /// Every 4 KiB page in `[base, base + size_bytes)` must have been
+    /// previously allocated from this buddy (directly or via a `frame_split`
+    /// sub-region) and must not be accessed by any code during or after
+    /// this call. `base` and `size_bytes` must be `PAGE_SIZE`-aligned.
+    pub unsafe fn free_range(&mut self, base: u64, size_bytes: u64)
+    {
+        debug_assert!(base.is_multiple_of(PAGE_SIZE as u64));
+        debug_assert!(size_bytes.is_multiple_of(PAGE_SIZE as u64));
+
+        let page_size = PAGE_SIZE as u64;
+        let mut addr = base;
+        let end = base + size_bytes;
+        while addr < end
+        {
+            // SAFETY: caller's contract — each page was previously allocated
+            // and is no longer accessed.
+            unsafe { self.free(addr, 0) };
+            addr += page_size;
+        }
+    }
+
     /// Total number of 4 KiB pages ever added via [`add_region`][Self::add_region].
     ///
     /// Fixed after boot. Use `free_page_count / total_page_count` for memory pressure.

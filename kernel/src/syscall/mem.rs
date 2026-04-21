@@ -39,8 +39,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{AddressSpaceObject, FrameObject};
     use crate::cap::slot::{CapTag, Rights};
-    use crate::mm::paging::PageFlags;
     use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::PageFlags;
     use crate::syscall::current_tcb;
 
     const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
@@ -316,8 +316,8 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::AddressSpaceObject;
     use crate::cap::slot::{CapTag, Rights};
-    use crate::mm::paging::{PageFlags, PagingError};
     use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::{PageFlags, PagingError};
     use crate::syscall::current_tcb;
     const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
 
@@ -451,6 +451,12 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// revocability semantics as the sibling caps).
 ///
 /// Returns `slot1 | (slot2 << 32)` on success.
+// too_many_lines: `sys_frame_split` is one transactional operation — validate
+// the source cap, create two child `FrameObject`s, wire them into the
+// derivation tree, and consume the original. Splitting further would thread
+// half-constructed children and derivation locks through helpers without
+// reducing complexity.
+#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -458,8 +464,8 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use alloc::boxed::Box;
     use core::ptr::NonNull;
 
-    use crate::cap::derivation::{link_child, reparent_children, unlink_node, DERIVATION_LOCK};
-    use crate::cap::object::{dealloc_object, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
+    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, dealloc_object};
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
@@ -494,7 +500,7 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    let (frame_phys, frame_size, frame_rights, cspace_id, orig_obj_ptr) = {
+    let (frame_phys, frame_size, frame_rights, cspace_id, orig_obj_ptr, orig_owns_memory) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
         let slot =
             unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::MAP) }?;
@@ -506,7 +512,14 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let fo = unsafe { &*(obj_ptr.as_ptr().cast::<FrameObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
         let cspace_id = unsafe { (*caller_cspace).id() };
-        (fo.base, fo.size, slot.rights, cspace_id, obj_ptr)
+        (
+            fo.base,
+            fo.size,
+            slot.rights,
+            cspace_id,
+            obj_ptr,
+            fo.owns_memory.load(core::sync::atomic::Ordering::Acquire),
+        )
     };
 
     // split_offset must be strictly within [1, frame_size).
@@ -523,10 +536,16 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // ── Create two child FrameObjects ─────────────────────────────────────────
 
     // Allocate child1: [base, base + split_offset).
+    //
+    // Inherit the original's memory-ownership state: if the original was
+    // buddy-backed (owns_memory = true), ownership transfers to the two
+    // children; if it was an MMIO / firmware / boot-module frame, neither
+    // child owns its sub-region either.
     let child1_obj = Box::new(FrameObject {
         header: crate::cap::object::KernelObjectHeader::new(ObjectType::Frame),
         base: frame_phys,
         size: split_offset,
+        owns_memory: core::sync::atomic::AtomicBool::new(orig_owns_memory),
     });
     let child1_ptr: NonNull<KernelObjectHeader> = {
         let raw = Box::into_raw(child1_obj).cast::<KernelObjectHeader>();
@@ -540,6 +559,7 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         header: crate::cap::object::KernelObjectHeader::new(ObjectType::Frame),
         base: frame_phys + split_offset,
         size: frame_size - split_offset,
+        owns_memory: core::sync::atomic::AtomicBool::new(orig_owns_memory),
     });
     let child2_ptr: NonNull<KernelObjectHeader> = {
         let raw = Box::into_raw(child2_obj).cast::<KernelObjectHeader>();
@@ -601,6 +621,22 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     DERIVATION_LOCK.write_unlock();
 
     // ── Consume the original cap ──────────────────────────────────────────────
+
+    // Transfer memory ownership to the children before the original's
+    // refcount drops: both halves of the physical region now belong to
+    // child1/child2. Clearing `owns_memory` here ensures that, if the
+    // original's refcount hits zero below, `dealloc_object` does not free
+    // the backing memory that is still in use by the children.
+    //
+    // SAFETY: orig_obj_ptr is live (ref > 0 at lookup); FrameObject is
+    // #[repr(C)] with header at offset 0; AtomicBool store is well-defined
+    // through a shared reference.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe {
+        (*orig_obj_ptr.as_ptr().cast::<FrameObject>())
+            .owns_memory
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
 
     // Return original slot to free list (tag becomes Null).
     // SAFETY: caller_cspace validated; frame_idx within CSpace bounds.

@@ -31,15 +31,17 @@
 //! Increase `WAIT_SET_MAX_MEMBERS` and the fixed-size arrays. `WAIT_SET_MAX_MEMBERS`
 //! must fit in a u8 index.
 
-// cast_possible_truncation: member indices are bounded by WAIT_SET_MAX_MEMBERS (16),
+// cast_possible_truncation: member indices are bounded by WAIT_SET_MAX_MEMBERS (64),
 // which fits in u8. WAIT_SET_MAX_MEMBERS itself (usize) fits in u8. All truncations safe.
 #![allow(clippy::cast_possible_truncation)]
 
 use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 
 /// Maximum number of sources a wait set can monitor simultaneously.
-/// Must be ≤ 255 (`member_idx` is u8).
-pub const WAIT_SET_MAX_MEMBERS: usize = 16;
+/// Must be ≤ 255 (`member_idx` is u8). Sized to fit procmgr's
+/// `MAX_PROCESSES` (32) + service endpoint + headroom, and svcmgr's
+/// `MAX_SERVICES` (16) + service endpoint + headroom.
+pub const WAIT_SET_MAX_MEMBERS: usize = 64;
 
 // ── Member tag ────────────────────────────────────────────────────────────────
 
@@ -389,7 +391,7 @@ pub unsafe fn wait_set_drop(ws: *mut WaitSetState)
     // Clear back-pointers on all registered sources.
     for slot in &mut ws.members
     {
-        if let Some(ref m) = slot
+        if let Some(m) = slot.as_ref()
         {
             // SAFETY: source_ptr is a valid pointer to the source's state struct; tag determines concrete type.
             unsafe { clear_source_backpointer(m.source_ptr, m.source_tag) };

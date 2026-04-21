@@ -202,8 +202,8 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{AddressSpaceObject, MmioRegionObject};
     use crate::cap::slot::{CapTag, Rights};
-    use crate::mm::paging::PageFlags;
     use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::PageFlags;
     use crate::syscall::current_tcb;
 
     // Virtual address must be page-aligned and in user half.
@@ -517,8 +517,8 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use alloc::boxed::Box;
     use core::ptr::NonNull;
 
-    use crate::cap::derivation::{link_child, reparent_children, unlink_node, DERIVATION_LOCK};
-    use crate::cap::object::{dealloc_object, KernelObjectHeader, MmioRegionObject, ObjectType};
+    use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
+    use crate::cap::object::{KernelObjectHeader, MmioRegionObject, ObjectType, dealloc_object};
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;

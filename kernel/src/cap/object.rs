@@ -129,6 +129,16 @@ pub struct FrameObject
     pub base: u64,
     /// Size of the region in bytes.
     pub size: u64,
+    /// `true` if this Frame is responsible for returning `[base, base + size)`
+    /// to the buddy allocator on final destruction. Buddy-backed frames set
+    /// this at creation (Phase 7 `drain_for_usercaps`, `frame_split` children).
+    /// Caps over non-buddy-managed physical memory (MMIO regions, firmware
+    /// tables, boot modules, boot-loaded ELF segments) leave it `false`.
+    ///
+    /// `frame_split` atomically transfers ownership by clearing this flag on
+    /// the original and setting it on both children before the original is
+    /// dec-ref'd — so only the children's destruction ever reaches the buddy.
+    pub owns_memory: core::sync::atomic::AtomicBool,
 }
 
 /// Kernel object for a memory-mapped I/O region (`MmioRegion` capability).
@@ -338,6 +348,31 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
         // ── Simple objects (no sub-resources) ─────────────────────────────
         ObjectType::Frame =>
         {
+            // Return buddy-backed physical memory before freeing the Rust
+            // object. `owns_memory` is false for MMIO / firmware / boot
+            // module / init-segment caps (the physical memory is not part
+            // of the buddy pool at all) and for split originals (ownership
+            // was atomically transferred to the children).
+            // SAFETY: ptr points to a live FrameObject; single-owner access
+            // since refcount reached zero at the call site.
+            let (base, size, owned) = unsafe {
+                let obj = &*ptr.as_ptr().cast::<FrameObject>();
+                (
+                    obj.base,
+                    obj.size,
+                    obj.owns_memory.load(core::sync::atomic::Ordering::Acquire),
+                )
+            };
+            if owned
+            {
+                // SAFETY: buddy free-range frees the pages we originally
+                // allocated from the buddy. Pages are not mapped anywhere
+                // once we are here: CSpace teardown on the owning process
+                // has already cleared every mapping that referenced them.
+                unsafe {
+                    crate::mm::with_frame_allocator(|alloc| alloc.free_range(base, size));
+                }
+            }
             // SAFETY: ptr originally from Box<FrameObject>::into_raw; header at offset 0.
             unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<FrameObject>())) };
         }
@@ -613,12 +648,28 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                     "dealloc AddressSpace: freeing root while active_cpus != 0"
                 );
 
-                // Free the root page-table frame (one 4 KiB page, order 0).
-                // TODO: walk and free intermediate page-table frames to avoid
-                // leaking them. Requires arch-specific paging teardown logic.
-                // SAFETY: as_ptr validated non-null; root_phys allocated at creation.
-                let root_phys = unsafe { (*as_ptr).root_phys };
-                // SAFETY: root_phys from buddy allocator; order 0 matches allocation.
+                // SAFETY: as_ptr validated non-null; root_phys/root_virt
+                // allocated at creation; active_cpu_mask == 0 asserted above.
+                let (root_phys, root_virt) = unsafe { ((*as_ptr).root_phys, (*as_ptr).root_virt) };
+
+                // Walk the user half of the page table and return every
+                // intermediate frame (PDPT/PD/PT on x86-64; L2/L1/L0 on
+                // Sv48) to the buddy. Leaf pages are Frame-cap-backed and
+                // are freed separately when the owning CSpace is torn down.
+                //
+                // SAFETY: root_virt is the direct-map VA of the root frame,
+                // still mapped until we free it below; caller-arranged
+                // CSpace teardown has released every mapping that referenced
+                // leaf frames.
+                unsafe {
+                    crate::mm::with_frame_allocator(|alloc| {
+                        crate::arch::current::paging::free_user_page_tables(root_virt, alloc);
+                    });
+                }
+
+                // Free the root page-table frame itself (order 0).
+                // SAFETY: root_phys was allocated order-0 from the buddy at
+                // `AddressSpace::new_user` time.
                 unsafe {
                     crate::mm::with_frame_allocator(|alloc| alloc.free(root_phys, 0));
                 }
@@ -910,7 +961,9 @@ mod tests
     fn struct_sizes()
     {
         assert_eq!(size_of::<KernelObjectHeader>(), 8);
-        assert_eq!(size_of::<FrameObject>(), 24);
+        // FrameObject: 8 header + 8 base + 8 size + 1 owns_memory + 7 tail
+        // padding (struct aligned to 8 via u64 fields) = 32 bytes.
+        assert_eq!(size_of::<FrameObject>(), 32);
         assert_eq!(size_of::<MmioRegionObject>(), 32);
         assert_eq!(size_of::<InterruptObject>(), 16);
         assert_eq!(size_of::<IoPortRangeObject>(), 16); // 8 header + 4 ports + 4 pad

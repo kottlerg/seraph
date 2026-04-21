@@ -98,6 +98,12 @@ pub struct SizeClassAllocator
 impl SizeClassAllocator
 {
     /// Construct an empty size-class allocator with all bins initialised.
+    //
+    // large_stack_arrays: bins aggregate 9 SlabCaches, each holding
+    // [Option<Slab>; MAX_SLABS]. Total is ~46 KiB — well above clippy's 16 KiB
+    // threshold — but this is a const fn that const-evaluates into a static,
+    // so the array is materialised in `.bss`, never on the stack.
+    #[allow(clippy::large_stack_arrays)]
     pub const fn new() -> Self
     {
         Self {

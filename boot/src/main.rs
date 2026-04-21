@@ -39,17 +39,16 @@ use crate::config::load_boot_config;
 use crate::elf::{load_init, load_kernel, load_module};
 use crate::error::BootError;
 use crate::firmware::discover_firmware;
-use crate::paging::{build_initial_tables, PageTableBuilder};
+use crate::paging::{PageTableBuilder, build_initial_tables};
 #[cfg(target_arch = "x86_64")]
 use crate::uefi::allocate_pages_max_addr;
 use crate::uefi::{
-    allocate_pages, connect_all_controllers, exit_boot_services, file_read, file_size,
-    get_loaded_image, get_memory_map, open_esp_volume, open_file, query_gop, EfiHandle,
-    EfiSystemTable,
+    EfiHandle, EfiSystemTable, allocate_pages, connect_all_controllers, exit_boot_services,
+    file_read, file_size, get_loaded_image, get_memory_map, open_esp_volume, open_file, query_gop,
 };
 use boot_protocol::{
-    BootInfo, BootModule, MemoryMapEntry, MemoryMapSlice, ModuleSlice, PlatformResource,
-    PlatformResourceSlice, BOOT_PROTOCOL_VERSION,
+    BOOT_PROTOCOL_VERSION, BootInfo, BootModule, MemoryMapEntry, MemoryMapSlice, ModuleSlice,
+    PlatformResource, PlatformResourceSlice,
 };
 
 // ── Size constants ────────────────────────────────────────────────────────────
@@ -80,7 +79,7 @@ const MAX_IDENTITY_REGIONS: usize = 64;
 // UEFI entry point — must be a public non-unsafe `extern "efiapi"` function per the UEFI spec;
 // the raw-pointer parameters are validated before first deref inside the unsafe blocks below.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable) -> usize
 {
     // Discover the UART MMIO base from ACPI SPCR or DTB before initializing
@@ -552,7 +551,9 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
         }
         else
         {
-            bprintln!("[--------] boot: WARNING: cannot allocate AP trampoline page below 1 MiB — SMP disabled");
+            bprintln!(
+                "[--------] boot: WARNING: cannot allocate AP trampoline page below 1 MiB — SMP disabled"
+            );
             0
         }
     };
@@ -662,7 +663,10 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // format and sort by physical_base ascending.
     let entry_out = mem_entries_phys as *mut MemoryMapEntry;
     let max_entries = (MEM_MAP_ENTRY_PAGES * 4096) / core::mem::size_of::<MemoryMapEntry>();
-    let entry_count = memory_map::translate_memory_map(&uefi_map, entry_out, max_entries);
+    // SAFETY: entry_out is a valid allocated buffer of max_entries entries; uefi_map
+    // is a valid map buffer populated by UEFI GetMemoryMap above.
+    let entry_count =
+        unsafe { memory_map::translate_memory_map(&uefi_map, entry_out, max_entries) };
 
     // Sort the output array by physical_base ascending (insertion sort).
     // SAFETY: entry_out is a valid allocated array of max_entries entries;

@@ -1,7 +1,7 @@
 [package]
 name = "syscall-abi"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 # no_std: this crate defines the syscall ABI and must be usable in both
@@ -10,6 +10,18 @@ publish = false
 name = "syscall_abi"
 test = false
 doctest = false
+
+# When std lists this crate as a dep (library/std/Cargo.toml, target_os =
+# "seraph"), build-std activates `rustc-dep-of-std`. The feature pulls in
+# the `rustc-std-workspace-core` facade, which cargo silently substitutes
+# for `core` during the build-std pipeline — the crate itself continues
+# to say `use core::…`, with no source changes required here. Matches the
+# hermit-abi / fortanix-sgx-abi pattern used upstream.
+[dependencies]
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = ["rustc-std-workspace-core"]
 
 [lints]
 workspace = true

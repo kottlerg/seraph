@@ -72,7 +72,7 @@ mod validate;
 // the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
 // needless_range_loop/cast_possible_truncation: cpu_idx loop uses the index directly
 // as both slice index and CPU ID; Seraph never has > 2^32 CPUs.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(
     clippy::too_many_lines,
     clippy::not_unsafe_ptr_arg_deref,
@@ -350,6 +350,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     header: KernelObjectHeader::new(ObjectType::Frame),
                     base: seg.phys_addr,
                     size: seg.size,
+                    // Init ELF segments are bootloader-loaded pages outside
+                    // the buddy pool; never return them.
+                    owns_memory: core::sync::atomic::AtomicBool::new(false),
                 });
                 // SAFETY: Box::into_raw returns non-null pointer; cast preserves validity.
                 let fo_nn = unsafe {
@@ -376,7 +379,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         // command line, fill them via the direct map, then map read-only into
         // init's address space starting at INIT_INFO_VADDR.
         let info_page_virt = {
-            use init_protocol::{InitInfo, INIT_INFO_VADDR, INIT_PROTOCOL_VERSION};
+            use init_protocol::{INIT_INFO_VADDR, INIT_PROTOCOL_VERSION, InitInfo};
 
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
             let desc_count = cspace_layout.descriptors.len();
@@ -564,7 +567,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 cspace: core::ptr::null_mut(),
                 thread_id: 1, // 0 = idle BSP, 1 = init
                 context_saved: core::sync::atomic::AtomicU32::new(1),
-                death_notification: core::ptr::null_mut(),
+                death_observers: [sched::thread::DeathObserver::empty();
+                    sched::thread::MAX_DEATH_OBSERVERS],
+                death_observer_count: 0,
                 sleep_deadline: 0,
                 magic: sched::thread::TCB_MAGIC,
             },
@@ -747,7 +752,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 /// Runs on a fresh kernel stack. All Phase 3–8 globals (direct map, heap,
 /// scheduler, IDT) must have been set up by the BSP before this is called.
 #[cfg(not(test))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> !
 {
     // 1. Load per-CPU GDT + TSS with the idle thread's kernel stack as RSP0.

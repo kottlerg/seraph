@@ -5,64 +5,49 @@
 
 //! Deliberate-crash test service for svcmgr monitoring validation.
 //!
-//! Bootstraps up to two caps from its creator (init on first start, svcmgr on
-//! restarts): `caps[0]` = log endpoint, `caps[1]` = optional tokened SEND cap
-//! on svcmgr's service endpoint (registered at init-time under the bundle
-//! name "svcmgr"). Logs its bootstrap state, exercises the bundle cap with a
-//! harmless `QUERY_ENDPOINT` probe, sleeps for 2 seconds, then triggers a
-//! fault.
+//! Bootstraps one cap from its creator (init on first start, svcmgr on
+//! restarts): `caps[0]` = optional tokened SEND cap on svcmgr's service
+//! endpoint (registered at init-time under the bundle name "svcmgr"). Log
+//! endpoint and procmgr endpoint arrive via `ProcessInfo`, so they are
+//! available from `std::os::seraph::startup_info()` without a bootstrap round.
 //!
-//! This also acts as the Batch 5b validation fixture: if svcmgr's restart
-//! path fails to re-inject the bundle cap, the post-restart bootstrap will
-//! report `cap_count < 2` and the `QUERY_ENDPOINT` probe will be skipped,
-//! making the regression visible in the log.
+//! Logs its bootstrap state, exercises the bundle cap with a harmless
+//! `QUERY_ENDPOINT` probe, sleeps for 5 seconds, then triggers a fault.
+//! The 5 s window lets other tests (usertest threading/mutex)
+//! complete cleanly before the kernel's fault report interleaves with
+//! their log output.
+//!
+//! Also validates svcmgr's restart path: if cap re-injection regresses,
+//! the post-restart bootstrap reports `cap_count < 1` and the
+//! `QUERY_ENDPOINT` probe is skipped, making the regression visible in the
+//! log.
 
-#![no_std]
-#![no_main]
+// The `seraph` target is not in rustc's recognised-OS list, so `std` is
+// `restricted_std`-gated for downstream bins. Every std-built service on
+// seraph carries this preamble; RUSTC_BOOTSTRAP=1 (set by xtask for StdUser
+// builds) lets the attribute compile without a nightly-tagged toolchain.
+#![feature(restricted_std)]
 
-extern crate runtime;
+use std::os::seraph::startup_info;
+use std::thread;
+use std::time::Duration;
 
-use process_abi::StartupInfo;
-
-#[no_mangle]
-extern "Rust" fn main(startup: &StartupInfo) -> !
+fn main()
 {
-    if syscall::ipc_buffer_set(startup.ipc_buffer as u64).is_err()
-    {
-        syscall::thread_exit();
-    }
+    let info = startup_info();
 
-    let mut cap_count = 0usize;
-    let mut svcmgr_cap: u32 = 0;
+    let (svcmgr_cap, cap_count) = bootstrap_caps(info.creator_endpoint, info.ipc_buffer);
 
-    if startup.creator_endpoint != 0
-    {
-        // SAFETY: IPC buffer is registered and page-aligned.
-        let ipc = unsafe { ipc::IpcBuf::from_bytes(startup.ipc_buffer) };
-        if let Ok(round) = ipc::bootstrap::request_round(startup.creator_endpoint, ipc)
-        {
-            cap_count = round.cap_count;
-            if cap_count >= 1
-            {
-                runtime::log::log_init(round.caps[0], startup.ipc_buffer);
-            }
-            if cap_count >= 2
-            {
-                svcmgr_cap = round.caps[1];
-            }
-        }
-    }
-
-    runtime::log!("crasher: alive (bootstrap caps={})", cap_count as u64);
+    println!("crasher: alive (bootstrap caps={cap_count})");
 
     if svcmgr_cap != 0
     {
-        probe_svcmgr(svcmgr_cap, startup.ipc_buffer);
+        probe_svcmgr(svcmgr_cap, info.ipc_buffer);
     }
 
-    let _ = syscall::thread_sleep(2_000);
+    thread::sleep(Duration::from_secs(5));
 
-    runtime::log!("crasher: triggering fault");
+    println!("crasher: triggering fault");
 
     // Trigger a fault: write to null pointer.
     // x86-64: #PF (vector 14) for unmapped page.
@@ -74,6 +59,33 @@ extern "Rust" fn main(startup: &StartupInfo) -> !
 
     // SAFETY: unreachable — the write above faults and the kernel kills this thread.
     unsafe { core::hint::unreachable_unchecked() }
+}
+
+/// Request the generic bootstrap round, returning `(svcmgr_cap, cap_count)`.
+/// Missing cap is zero.
+fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, usize)
+{
+    if creator_ep == 0
+    {
+        return (0, 0);
+    }
+    // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
+    // boot protocol.
+    let ipc = unsafe { ipc::IpcBuf::from_bytes(ipc_buffer) };
+    let Ok(round) = ipc::bootstrap::request_round(creator_ep, ipc)
+    else
+    {
+        return (0, 0);
+    };
+    let svcmgr_cap = if round.cap_count >= 1
+    {
+        round.caps[0]
+    }
+    else
+    {
+        0
+    };
+    (svcmgr_cap, round.cap_count)
 }
 
 /// Liveness probe: call `QUERY_ENDPOINT` on the svcmgr cap for a name that
@@ -99,7 +111,7 @@ fn probe_svcmgr(svcmgr_cap: u32, ipc_buffer: *mut u8)
     let data_words = name_len.div_ceil(8);
     match syscall::ipc_call(svcmgr_cap, label, data_words, &[])
     {
-        Ok((reply, _)) => runtime::log!("crasher: svcmgr probe reply={}", reply),
-        Err(_) => runtime::log!("crasher: svcmgr probe ipc_call failed"),
+        Ok((reply, _)) => println!("crasher: svcmgr probe reply={reply}"),
+        Err(_) => println!("crasher: svcmgr probe ipc_call failed"),
     }
 }

@@ -15,7 +15,16 @@
 //! Per-(creator, child-type) payload formats are defined in each child's
 //! crate. This module only implements the generic protocol.
 
-use crate::{bootstrap_errors, IpcBuf};
+// When this crate is compiled as a std dep via rustc-dep-of-std, the
+// crate root is `no_core` and the usual prelude is not auto-imported.
+// The crate-root `use core::prelude::rust_2024::*;` only covers the
+// root module; submodules need their own import. Harmless no-op
+// otherwise.
+#[cfg(feature = "rustc-dep-of-std")]
+#[allow(unused_imports)]
+use core::prelude::rust_2024::*;
+
+use crate::{IpcBuf, bootstrap_errors};
 use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 // ── Protocol labels ─────────────────────────────────────────────────────────

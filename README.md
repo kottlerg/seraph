@@ -2,17 +2,8 @@
 
 Seraph is a microkernel operating system written in Rust, targeting x86-64 and RISC-V (RV64GC).
 
-Everything below is a summary of content owned by documents under [`docs/`](docs/)
-and the component READMEs it references. Each summary links its authoritative
-source; follow the links for the definitive statement. Nothing in this README
-introduces new rules — if a detail here ever conflicts with a linked document,
-the linked document wins.
-
 ## Goals
 
-Summarized from the Project Goals and Philosophy sections of
-[docs/architecture.md](docs/architecture.md); see there for the authoritative
-statement and the reasoning behind each goal.
 
 - Minimal, modular microkernel; most functionality in userspace
 - Capability-based security model throughout
@@ -20,10 +11,9 @@ statement and the reasoning behind each goal.
 - Architecture-specific code isolated behind shared traits
 - Self-hosting as a long-term goal
 
-Seraph does not aim for binary compatibility with other operating systems.
-32-bit and legacy x86 are not targeted. See
-[docs/architecture.md](docs/architecture.md) §"Non-Goals" for the
-authoritative non-goals list.
+Summarized from the Project Goals and Philosophy sections of
+[docs/architecture.md](docs/architecture.md); see there for the authoritative
+statement and the reasoning behind each goal.
 
 ## Structure
 
@@ -70,8 +60,8 @@ cargo xtask clean --all                  # remove sysroot/ and target/
 cargo xtask test                         # run all workspace tests on the host
 ```
 
-`cargo xtask test` runs host-side unit tests (fast, no QEMU). For in-kernel
-tests, set `init=ktest` in `rootfs/EFI/seraph/boot.conf`, then run
+`cargo xtask test` runs host-side unit tests, for all algorithmic components.
+For kernel testing, set `init=ktest` in `rootfs/esp/EFI/seraph/boot.conf`, then run
 `cargo xtask run`. ktest exercises every syscall through real trap/return
 paths, runs cross-subsystem integration scenarios, and measures hardware
 cycle counts for key operations. See [ktest/README.md](ktest/README.md) for
@@ -95,4 +85,4 @@ Overall project design documents live in [`docs/`](docs/):
 - [Coding Standards](docs/coding-standards.md) — Rust conventions, safety contracts, documentation rules
 - [Documentation Standards](docs/documentation-standards.md) — document hierarchy, authority, backlinks, required structure
 
-Each module contains a `README.md` that references the design docs relevant to that module.
+Each component contains a `README.md` that references the design docs relevant to that module.

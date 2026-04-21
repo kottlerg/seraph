@@ -67,7 +67,9 @@ pub fn new_channel() -> Channel
 /// the plan when the child's `REQUEST` arrives.
 pub fn publish_plan(ch: &Channel, plan: Plan)
 {
-    let mut st = ch.0.lock().unwrap();
+    let mut st =
+        ch.0.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     st.plan = Some(plan);
     st.result = None;
 }
@@ -77,12 +79,16 @@ pub fn publish_plan(ch: &Channel, plan: Plan)
 /// Returns `true` on successful bootstrap delivery, `false` on reply failure.
 pub fn wait_result(ch: &Channel) -> bool
 {
-    let mut st = ch.0.lock().unwrap();
+    let mut st =
+        ch.0.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     while st.result.is_none()
     {
-        st = ch.1.wait(st).unwrap();
+        st =
+            ch.1.wait(st)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
-    st.result.take().unwrap()
+    st.result.take().unwrap_or(false)
 }
 
 /// Worker-thread entry. Runs for the process lifetime.
@@ -102,7 +108,9 @@ pub fn worker_loop(bootstrap_ep: u32, ch: &Channel) -> !
         // Look at the pending plan without taking it: we only consume caps
         // when we are confident we can deliver them.
         let match_ok = {
-            let st = ch.0.lock().unwrap();
+            let st =
+                ch.0.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             token != 0 && st.plan.as_ref().is_some_and(|p| p.token == token)
         };
         if !match_ok
@@ -117,22 +125,40 @@ pub fn worker_loop(bootstrap_ep: u32, ch: &Channel) -> !
             // Plan remains published; the child (if well-formed) will retry
             // or the mount will time out at the driver-probe stage. Main is
             // still waiting on `result`; report failure so it unblocks.
-            let mut st = ch.0.lock().unwrap();
+            let mut st =
+                ch.0.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             st.plan = None;
             st.result = Some(false);
             ch.1.notify_one();
             continue;
         }
 
-        let plan = {
-            let mut st = ch.0.lock().unwrap();
-            st.plan.take().unwrap()
+        let Some(plan) = ({
+            let mut st =
+                ch.0.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            st.plan.take()
+        })
+        else
+        {
+            // match_ok above observed a plan, but another REQUEST racing on the
+            // same token took it first. Report failure so the waiter unblocks.
+            let _ = bootstrap::reply_error(bootstrap_errors::NO_CHILD);
+            let mut st =
+                ch.0.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            st.result = Some(false);
+            ch.1.notify_one();
+            continue;
         };
 
         let caps = [plan.blk, plan.service];
         let ok = bootstrap::reply_round(true, &caps, 0).is_ok();
 
-        let mut st = ch.0.lock().unwrap();
+        let mut st =
+            ch.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.result = Some(ok);
         ch.1.notify_one();
     }

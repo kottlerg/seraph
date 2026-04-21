@@ -21,6 +21,11 @@
 // builds) lets the attribute compile without a nightly-tagged toolchain.
 #![feature(restricted_std)]
 #![feature(thread_local)]
+// usertest is an integration test harness: a standalone binary that panics
+// on failure so faults surface in the log. `expect`/`unwrap` are the
+// intended idiom here (coding-standards §D permits them in test code and §E
+// permits narrowly-justified blanket allows).
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::cell::Cell;
 use std::collections::BTreeMap;

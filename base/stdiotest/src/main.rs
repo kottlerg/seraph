@@ -22,9 +22,15 @@ fn main()
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
-        .expect("stdiotest: read stdin failed");
+    let n = match reader.read_line(&mut line)
+    {
+        Ok(n) => n,
+        Err(e) =>
+        {
+            eprintln!("stdiotest: read stdin failed: {e}");
+            return;
+        }
+    };
     let trimmed = line.trim_end_matches('\n');
     println!("stdiotest: got {n} bytes: {trimmed:?}");
     println!("stdiotest: shouted: {}", trimmed.to_uppercase());

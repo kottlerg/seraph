@@ -510,6 +510,11 @@ pub fn sys_dma_grant(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// cap's derivation parent (same revocability semantics as sibling caps).
 ///
 /// Returns `slot1 | (slot2 << 32)` on success.
+// too_many_lines: splitting an MMIO cap requires validating the original,
+// building two child objects, wiring both into the derivation tree, and
+// freeing the original — each step has its own bookkeeping and no meaningful
+// split-point between them.
+#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -610,10 +615,11 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Insert both children into the caller's CSpace (auto-allocate slots).
     // SAFETY: caller_cspace validated non-null; CSpace methods handle slot allocation.
     let cs = unsafe { &mut *caller_cspace };
-    let slot1 = cs
+    let slot1_nz = cs
         .insert_cap(CapTag::MmioRegion, mmio_rights, child1_ptr)
         .map_err(|_| SyscallError::OutOfMemory)?;
-    let slot2 = cs
+    let slot1 = slot1_nz.get();
+    let slot2_nz = cs
         .insert_cap(CapTag::MmioRegion, mmio_rights, child2_ptr)
         .map_err(|_| {
             // Undo slot1 insertion on failure.
@@ -622,17 +628,21 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             unsafe { dealloc_object(child1_ptr) };
             SyscallError::OutOfMemory
         })?;
+    let slot2 = slot2_nz.get();
 
     // ── Wire derivation tree ──────────────────────────────────────────────────
     //
     // Pattern mirrors sys_frame_split: reparent original's children to its
     // parent, unlink original, then link both new caps to that same parent.
 
+    let mmio_idx_nz =
+        core::num::NonZeroU32::new(mmio_idx).ok_or(SyscallError::InvalidCapability)?;
+
     DERIVATION_LOCK.write_lock();
 
-    let orig_node = SlotId::new(cspace_id, mmio_idx);
-    let child1_id = SlotId::new(cspace_id, slot1);
-    let child2_id = SlotId::new(cspace_id, slot2);
+    let orig_node = SlotId::new(cspace_id, mmio_idx_nz);
+    let child1_id = SlotId::new(cspace_id, slot1_nz);
+    let child2_id = SlotId::new(cspace_id, slot2_nz);
 
     // Read the original's parent before we modify anything.
     // SAFETY: caller_cspace validated; mmio_idx within CSpace bounds.

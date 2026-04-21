@@ -782,11 +782,13 @@ pub unsafe fn move_cap_between_cspaces(
 
     // Insert into destination (auto-allocate free slot).
     // SAFETY: dst_cspace is a valid CSpace pointer; guaranteed by caller contract.
-    let new_idx = unsafe { (*dst_cspace).insert_cap(src_tag, src_rights, src_object) }
+    let new_idx_nz = unsafe { (*dst_cspace).insert_cap(src_tag, src_rights, src_object) }
         .map_err(|_| SyscallError::OutOfMemory)?;
+    let new_idx = new_idx_nz.get();
 
-    let src_slot_id = SlotId::new(src_cspace_id, src_idx);
-    let dst_slot_id = SlotId::new(dst_cspace_id, new_idx);
+    let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
+    let src_slot_id = SlotId::new(src_cspace_id, src_idx_nz);
+    let dst_slot_id = SlotId::new(dst_cspace_id, new_idx_nz);
 
     // Read derivation links from the source slot.
     let (src_parent, src_first_child, src_prev, src_next) = {
@@ -894,7 +896,7 @@ fn insert_or_fatal(
 {
     match cspace.insert_cap(tag, rights, object)
     {
-        Ok(idx) => idx,
+        Ok(idx) => idx.get(),
         #[cfg(not(test))]
         Err(_) => crate::fatal(msg),
         // In test mode, panic with the message instead of halting the CPU.

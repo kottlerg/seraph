@@ -28,6 +28,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use super::object::KernelObjectHeader;
@@ -97,7 +98,10 @@ pub struct CSpace
     /// Maximum number of usable slots this `CSpace` may hold.
     max_slots: usize,
     /// Head of the intrusive free list; None if no free slots.
-    free_head: Option<u32>,
+    ///
+    /// Slot 0 is permanently null and never placed on the free list, so the
+    /// head index is always non-zero when present — encoded in the type.
+    free_head: Option<NonZeroU32>,
     /// Number of slots currently on the free list (for O(1) `pre_allocate`).
     free_count: usize,
     /// Protects concurrent access to all `CSpace` state.
@@ -131,7 +135,9 @@ impl CSpace
     ///
     /// Returns an error if `max_slots` is reached or heap allocation fails.
     /// The returned slot is cleared to null; callers must populate it.
-    pub fn allocate_slot(&mut self) -> Result<u32, CapError>
+    ///
+    /// The returned index is always non-zero (slot 0 is reserved).
+    pub fn allocate_slot(&mut self) -> Result<NonZeroU32, CapError>
     {
         if self.free_head.is_none()
         {
@@ -143,15 +149,14 @@ impl CSpace
         // Read next_free through a shared borrow, then drop it before the
         // mutable borrow so the borrow checker is satisfied.
         let next = {
-            let slot = self.slot(idx).ok_or(CapError::InvalidIndex)?;
+            let slot = self.slot(idx.get()).ok_or(CapError::InvalidIndex)?;
             slot.next_free()
         };
 
         self.free_head = next;
         // Clear the slot (removes free-list encoding).
-        // SAFETY: We just validated this slot exists at line 135
-        #[allow(clippy::unwrap_used)]
-        self.slot_mut(idx).unwrap().clear();
+        let slot = self.slot_mut(idx.get()).ok_or(CapError::InvalidIndex)?;
+        slot.clear();
         self.free_count -= 1;
         Ok(idx)
     }
@@ -196,7 +201,11 @@ impl CSpace
         let mut next = old_head;
         for i in (start_slot..end_slot).rev()
         {
-            let idx = (base + i) as u32;
+            // `base + i` is structurally non-zero: the first page sets
+            // `start_slot = 1`, and every later page has `base >= L2_SIZE`.
+            // The `ok_or` propagates an impossible error rather than
+            // panicking, keeping the free-list type honest.
+            let idx = NonZeroU32::new((base + i) as u32).ok_or(CapError::InvalidIndex)?;
             page.slots[i].set_next_free(next);
             next = Some(idx);
         }
@@ -233,31 +242,38 @@ impl CSpace
 
     /// Return a slot to the free list and clear its contents.
     ///
-    /// Silently ignores an out-of-range or unmapped index.
+    /// Silently ignores an out-of-range, unmapped, or zero index.
     pub fn free_slot(&mut self, index: u32)
     {
+        let Some(nz_index) = NonZeroU32::new(index)
+        else
+        {
+            return;
+        };
         let old_head = self.free_head;
         if let Some(slot) = self.slot_mut(index)
         {
             slot.set_next_free(old_head);
-            self.free_head = Some(index);
+            self.free_head = Some(nz_index);
             self.free_count += 1;
         }
     }
 
     /// Allocate a slot, populate it with the given capability, and return the
     /// slot index.
+    ///
+    /// The returned index is always non-zero (inherited from `allocate_slot`).
     pub fn insert_cap(
         &mut self,
         tag: CapTag,
         rights: Rights,
         object: NonNull<KernelObjectHeader>,
-    ) -> Result<u32, CapError>
+    ) -> Result<NonZeroU32, CapError>
     {
         let index = self.allocate_slot()?;
 
         // SAFETY: allocate_slot returned a valid index into an allocated page.
-        let slot = self.slot_mut(index).ok_or(CapError::InvalidIndex)?;
+        let slot = self.slot_mut(index.get()).ok_or(CapError::InvalidIndex)?;
         slot.tag = tag;
         slot.rights = rights;
         slot.token = 0;
@@ -289,7 +305,12 @@ impl CSpace
     /// (`insert_cap_at`) are infrequent (only init populating child `CSpaces`).
     pub fn remove_from_free_list(&mut self, target: u32) -> bool
     {
-        if self.free_head == Some(target)
+        let Some(target_nz) = NonZeroU32::new(target)
+        else
+        {
+            return false;
+        };
+        if self.free_head == Some(target_nz)
         {
             // Target is the head: pop it.
             let next = self
@@ -308,21 +329,24 @@ impl CSpace
         loop
         {
             let Some(next_idx) = self
-                .slot(cur_idx)
+                .slot(cur_idx.get())
                 .and_then(super::slot::CapabilitySlot::next_free)
             else
             {
                 return false;
             };
-            if next_idx == target
+            if next_idx == target_nz
             {
                 // Splice out: cur.next = target.next
                 let after = self
                     .slot(target)
                     .and_then(super::slot::CapabilitySlot::next_free);
-                // SAFETY: We validated cur_idx exists when getting next_idx at line 299
-                #[allow(clippy::unwrap_used)]
-                self.slot_mut(cur_idx).unwrap().set_next_free(after);
+                let Some(cur_slot) = self.slot_mut(cur_idx.get())
+                else
+                {
+                    return false;
+                };
+                cur_slot.set_next_free(after);
                 self.free_count -= 1;
                 return true;
             }
@@ -464,8 +488,7 @@ mod tests
     {
         let mut cs = CSpace::new(0, 16384);
         // Force page 0 to be allocated by requesting slot 1.
-        let idx = cs.allocate_slot().unwrap();
-        assert_ne!(idx, 0, "allocate_slot must never return slot 0");
+        let _idx = cs.allocate_slot().unwrap();
         // Slot 0 must exist and be null.
         let s = cs.slot(0).expect("slot 0 should exist after grow");
         assert!(s.is_null());
@@ -475,8 +498,7 @@ mod tests
     fn allocate_returns_nonzero_index()
     {
         let mut cs = CSpace::new(0, 16384);
-        let idx = cs.allocate_slot().unwrap();
-        assert_ne!(idx, 0);
+        let _idx = cs.allocate_slot().unwrap();
     }
 
     #[test]
@@ -487,7 +509,7 @@ mod tests
         let idx = cs
             .insert_cap(CapTag::Frame, Rights::MAP | Rights::WRITE, obj)
             .unwrap();
-        let slot = cs.slot(idx).unwrap();
+        let slot = cs.slot(idx.get()).unwrap();
         assert_eq!(slot.tag, CapTag::Frame);
         assert!(slot.rights.contains(Rights::MAP));
         assert!(slot.rights.contains(Rights::WRITE));
@@ -507,7 +529,7 @@ mod tests
         // Next allocation must cross into page 1.
         let idx = cs.allocate_slot().unwrap();
         assert!(
-            idx as usize >= L2_SIZE,
+            idx.get() as usize >= L2_SIZE,
             "expected index in page 1 or beyond"
         );
         assert!(!indices.contains(&idx));
@@ -518,7 +540,7 @@ mod tests
     {
         let mut cs = CSpace::new(0, 16384);
         let idx1 = cs.allocate_slot().unwrap();
-        cs.free_slot(idx1);
+        cs.free_slot(idx1.get());
         // After freeing, the next allocate should return the same index.
         let idx2 = cs.allocate_slot().unwrap();
         assert_eq!(idx1, idx2, "freed slot should be reused");
@@ -545,7 +567,7 @@ mod tests
         let slot = cs
             .insert_cap(CapTag::Frame, Rights::WRITE | Rights::EXECUTE, obj)
             .expect("WRITE|EXECUTE cap should be allowed at cap level");
-        let s = cs.slot(slot).unwrap();
+        let s = cs.slot(slot.get()).unwrap();
         assert!(s.rights.contains(Rights::WRITE | Rights::EXECUTE));
     }
 
@@ -577,7 +599,7 @@ mod tests
         let s2 = cs.allocate_slot().unwrap();
         let s3 = cs.allocate_slot().unwrap();
 
-        cs.free_slot(s1);
+        cs.free_slot(s1.get());
 
         // Must return s1 (from free list), not a fresh slot past s3.
         let s4 = cs.allocate_slot().unwrap();
@@ -586,8 +608,8 @@ mod tests
             "free list entry must be reused before consuming new slot space"
         );
         assert_ne!(
-            s4,
-            s3 + 1,
+            s4.get(),
+            s3.get() + 1,
             "should not allocate a brand-new slot when free list is non-empty"
         );
         let _ = (s2, s3);

@@ -249,9 +249,17 @@ impl PerCpuScheduler
         }
         // Highest set bit gives the highest non-empty priority level.
         let priority = 31 - ne.leading_zeros() as usize;
-        let tcb = self.queues[priority]
-            .dequeue()
-            .expect("non_empty bit set but queue is empty");
+        let Some(tcb) = self.queues[priority].dequeue()
+        else
+        {
+            // Invariant: the `non_empty` bit is set iff the queue is
+            // non-empty. If desynchronised, heal the stale bit and fall back
+            // to idle rather than panicking the whole kernel.
+            debug_assert!(false, "non_empty bit set but queue {priority} is empty");
+            self.non_empty
+                .fetch_and(!(1 << priority), Ordering::Relaxed);
+            return self.idle;
+        };
         // Debug: detect use-after-free via magic cookie.
         // SAFETY: tcb is from the run queue; magic field is always readable on valid TCB.
         #[allow(clippy::undocumented_unsafe_blocks)]

@@ -47,13 +47,15 @@ pub struct SlotId
 
 impl SlotId
 {
-    /// Construct a `SlotId`. Panics in debug builds if `index == 0`.
-    pub fn new(cspace_id: CSpaceId, index: u32) -> Self
+    /// Construct a `SlotId` from a statically non-zero index.
+    ///
+    /// Callers holding a raw `u32` must first convert via [`NonZeroU32::new`]
+    /// and route the `None` case through their subsystem's error channel
+    /// (e.g. `SyscallError::InvalidCapability`), so that user-controlled
+    /// zero indices become graceful errors rather than kernel panics.
+    pub fn new(cspace_id: CSpaceId, index: NonZeroU32) -> Self
     {
-        Self {
-            cspace_id,
-            index: NonZeroU32::new(index).expect("SlotId index must not be zero"),
-        }
+        Self { cspace_id, index }
     }
 }
 
@@ -324,10 +326,9 @@ impl CapabilitySlot
     /// list). Only call when placing a slot on the free list; `deriv_parent`
     /// has a different meaning on occupied slots.
     ///
-    /// # Panics
-    ///
-    /// Panics if `next == Some(0)` — slot 0 is never placed on the free list.
-    pub fn set_next_free(&mut self, next: Option<u32>)
+    /// The free list never contains slot 0 (it is permanently null), so the
+    /// non-zero invariant is encoded in the argument type.
+    pub fn set_next_free(&mut self, next: Option<NonZeroU32>)
     {
         self.tag = CapTag::Null;
         self.pad = [0; 3];
@@ -337,22 +338,22 @@ impl CapabilitySlot
         self.deriv_first_child = None;
         self.deriv_next_sibling = None;
         self.deriv_prev_sibling = None;
-        self.deriv_parent = next.map(|i| SlotId {
+        self.deriv_parent = next.map(|index| SlotId {
             cspace_id: 0,
-            index: NonZeroU32::new(i).expect("free list index must not be zero"),
+            index,
         });
     }
 
     /// Read the next-free-list successor index from `deriv_parent`.
     ///
     /// Only valid when `tag == Null`. Returns `None` if end of list.
-    pub fn next_free(&self) -> Option<u32>
+    pub fn next_free(&self) -> Option<NonZeroU32>
     {
         debug_assert!(
             self.tag == CapTag::Null,
             "next_free called on occupied slot"
         );
-        self.deriv_parent.map(|s| s.index.get())
+        self.deriv_parent.map(|s| s.index)
     }
 }
 
@@ -451,8 +452,9 @@ mod tests
     fn free_list_encoding_round_trip()
     {
         let mut s = CapabilitySlot::null();
-        s.set_next_free(Some(42));
-        assert_eq!(s.next_free(), Some(42));
+        let next = NonZeroU32::new(42).unwrap();
+        s.set_next_free(Some(next));
+        assert_eq!(s.next_free(), Some(next));
         assert_eq!(s.tag, CapTag::Null);
     }
 
@@ -467,7 +469,7 @@ mod tests
     #[test]
     fn slot_id_new_nonzero()
     {
-        let id = SlotId::new(1, 5);
+        let id = SlotId::new(1, NonZeroU32::new(5).unwrap());
         assert_eq!(id.cspace_id, 1);
         assert_eq!(id.index.get(), 5);
     }

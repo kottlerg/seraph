@@ -363,15 +363,15 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Frame cap"));
                 if i == 0
                 {
-                    seg_base = slot;
+                    seg_base = slot.get();
                 }
             }
             kprintln!(
                 "init: aspace cap={} + {} frame caps",
-                aspace_slot,
+                aspace_slot.get(),
                 seg_count,
             );
-            (aspace_slot, seg_base, seg_count as u32)
+            (aspace_slot.get(), seg_base, seg_count as u32)
         };
 
         // ── Populate InitInfo region ─────────────────────────────────────────
@@ -596,6 +596,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing for Thread cap"));
             cs.insert_cap(CapTag::Thread, Rights::CONTROL, th_nn)
                 .unwrap_or_else(|_| fatal("Phase 9: cannot insert init Thread cap"))
+                .get()
         };
 
         kprintln!("init: thread cap={}", init_thread_cap_slot);
@@ -628,6 +629,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 cs_nn,
             )
             .unwrap_or_else(|_| fatal("Phase 9: cannot insert init CSpace cap"))
+            .get()
         };
 
         // Patch thread_cap and cspace_cap in the InitInfo page.

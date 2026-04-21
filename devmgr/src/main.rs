@@ -25,11 +25,7 @@ mod spawn;
 
 use ipc::IpcBuf;
 use std::os::seraph::startup_info;
-
-const PAGE_SIZE: u64 = 0x1000;
-
-/// VA base for mapping ECAM (x86-64) or `VirtIO` MMIO regions (RISC-V).
-const MMIO_MAP_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
+use va_layout::{DEVMGR_MMIO_MAP_VA as MMIO_MAP_VA, PAGE_SIZE};
 
 // clippy::too_many_lines: devmgr main sequences eleven discrete hardware
 // and software stages — register IPC buffer, acquire caps, map ECAM,

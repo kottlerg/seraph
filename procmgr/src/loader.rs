@@ -11,14 +11,10 @@
 
 use crate::frames::{FramePool, PAGE_SIZE};
 
-/// Temp VA base for mapping module frames during ELF parsing.
-pub const TEMP_MODULE_VA: u64 = 0x0000_0000_8000_0000;
-
-/// Temp VA for writing into freshly allocated frames.
-pub const TEMP_FRAME_VA: u64 = 0x0000_0000_9000_0000;
-
-/// Temp VA for mapping VFS buffer frames during ELF loading.
-pub const TEMP_VFS_VA: u64 = 0x0000_0000_A000_0000;
+pub use va_layout::{
+    PROCMGR_TEMP_FRAME_VA as TEMP_FRAME_VA, PROCMGR_TEMP_MODULE_VA as TEMP_MODULE_VA,
+    PROCMGR_TEMP_VFS_VA as TEMP_VFS_VA,
+};
 
 /// Map a module frame read-only, probing for the exact mappable page count.
 ///

@@ -65,13 +65,62 @@ fn main()
     tls_main_phase();
     alloc_phase();
     churn_phase();
+    alloc_grow_phase();
     threading_phase();
     tls_macro_phase();
     timeout_phase();
     spawn_phase();
+    stack_overflow_phase();
     shmem_phase();
 
     println!("usertest: PASS");
+}
+
+/// Verify the main-thread stack guard page. Spawns `/bin/stackoverflow`
+/// (a deliberate recursive stack consumer), waits for death, and asserts
+/// the kernel reported a fault exit reason (`>= 0x1000`, the
+/// `EXIT_FAULT_BASE` encoding used by both arches). Confirms that stack
+/// overflow lands on `PROCESS_STACK_GUARD_VA` rather than corrupting
+/// adjacent mappings.
+// cast_sign_loss: ExitStatus::code() returns i32; exit_reason is always
+// non-negative in practice (kernel-set 0, clean-exit 0, fault 0x1000+vec,
+// killed 0x2000). Casting to u64 is safe.
+#[allow(clippy::cast_sign_loss)]
+fn stack_overflow_phase()
+{
+    use std::process::Command;
+
+    // `EXIT_FAULT_BASE` from `syscall_abi` — any fault reports
+    // `EXIT_FAULT_BASE + vector`. x86-64 page fault = 0x100E;
+    // RISC-V store page fault = 0x100F; load page fault = 0x100D.
+    // Accept any fault in the 0x1000..0x2000 range.
+    const EXIT_FAULT_BASE: u64 = 0x1000;
+    const EXIT_KILLED: u64 = 0x2000;
+
+    let mut child = Command::new("/bin/stackoverflow")
+        .spawn()
+        .expect("spawn /bin/stackoverflow failed");
+
+    let id = child.id();
+    println!("usertest: spawned /bin/stackoverflow handle={id:#x}");
+
+    let status = child.wait().expect("stackoverflow wait failed");
+    println!("usertest: stackoverflow exited: {status}");
+
+    assert!(
+        !status.success(),
+        "stackoverflow child must not exit cleanly: {status}"
+    );
+
+    let raw = status
+        .code()
+        .expect("stackoverflow ExitStatus must carry a code") as u64;
+    assert!(
+        (EXIT_FAULT_BASE..EXIT_KILLED).contains(&raw),
+        "expected fault exit_reason in 0x1000..0x2000, got {raw:#x}"
+    );
+
+    println!("usertest: stack_overflow phase passed (exit_reason={raw:#x})");
 }
 
 /// Sanity-check the `shmem::SpscRing` in-process: build a ring over a
@@ -328,6 +377,64 @@ fn churn_phase()
     }
     drop(keep);
     println!("usertest: churn phase passed ({ITERS} iters)");
+}
+
+/// Exercise the allocator's grow-on-failure path. Allocates a buffer
+/// larger than `HEAP_INITIAL_PAGES * PAGE_SIZE`, forcing the first-fit
+/// search to fail and the retry in `System::alloc` to request fresh
+/// frames from procmgr, map them above `mapped_end`, extend the free
+/// list, and re-serve the allocation. Without the grow path this
+/// allocation aborts the process before reaching `usertest: PASS`.
+// cast_possible_truncation: index-to-u8 casts use `& 0xFF` or small counts;
+// truncation is the intended identity fingerprint for spot-checks.
+#[allow(clippy::cast_possible_truncation)]
+fn alloc_grow_phase()
+{
+    // Initial heap is 128 pages (512 KiB). Allocate 600 KiB — large
+    // enough to miss first-fit against the initial heap and force the
+    // allocator's grow path, small enough to stay within one
+    // `GROW_MAX_PAGES` increment (64 pages = 256 KiB) and well within
+    // the usertest CSpace's remaining cap-slot headroom. Pushing the
+    // upper bound higher exposes the CSpace-exhaustion wedge documented
+    // in `ruststd/src/sys/alloc/seraph.rs` at the grow-path comment.
+    const BIG: usize = 600 * 1024;
+
+    let mut big: Vec<u8> = Vec::with_capacity(BIG);
+    for i in 0..BIG
+    {
+        big.push((i & 0xFF) as u8);
+    }
+    assert_eq!(big.len(), BIG, "grow-path push count mismatch");
+
+    // Spot-check a handful of indices to catch any corruption in the
+    // grown region (e.g. misaligned free-list insert).
+    for &idx in &[0, 1, 4095, 4096, 65_535, 65_536, BIG / 2, BIG - 1]
+    {
+        let expected = (idx & 0xFF) as u8;
+        assert_eq!(big[idx], expected, "grow buffer[{idx}] mismatch");
+    }
+
+    // Interleave smaller allocations against the live big buffer so
+    // coalescing across a grow-boundary has to work.
+    let mut small: Vec<Vec<u8>> = Vec::with_capacity(8);
+    for k in 0..8usize
+    {
+        small.push(vec![k as u8; 1024]);
+    }
+    for (k, v) in small.iter().enumerate()
+    {
+        assert_eq!(v.len(), 1024);
+        assert_eq!(v[0], k as u8);
+    }
+
+    drop(small);
+    drop(big);
+
+    // Heap must still be usable after the grow + drop cycle.
+    let post: Vec<u32> = (0..4096u32).collect();
+    assert_eq!(post.last().copied(), Some(4095));
+
+    println!("usertest: alloc_grow phase passed ({BIG} bytes + 8 KiB interleaved)");
 }
 
 /// Minimum-viable threading test: two workers each increment a shared

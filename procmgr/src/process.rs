@@ -16,9 +16,7 @@ use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, PROCESS_MAIN_TLS_MAX_PAGES, PROCESS_MAIN_TLS_VADDR,
     PROCESS_STACK_PAGES, PROCESS_STACK_TOP,
 };
-
-/// IPC buffer VA for child processes.
-const CHILD_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
+use va_layout::CHILD_IPC_BUF_VA;
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
@@ -598,6 +596,13 @@ fn prepare_main_tls_from_vfs(
 }
 
 /// Map stack and IPC buffer pages into a child address space.
+///
+/// No explicit guard-page map. `va_layout::PROCESS_STACK_GUARD_VA` sits one
+/// page below `PROCESS_STACK_BOTTOM` and stays unmapped by construction —
+/// compile-time assertions in `shared/va_layout` (ordering vs. stack
+/// bottom and `PROCESS_INFO_VA`) guarantee that invariant. Stack overflow
+/// faults on the guard VA instead of silently writing into adjacent
+/// mappings.
 fn map_child_stack_and_ipc(pool: &mut FramePool, child_aspace: u32) -> Option<()>
 {
     let stack_base = PROCESS_STACK_TOP - (PROCESS_STACK_PAGES as u64) * PAGE_SIZE;

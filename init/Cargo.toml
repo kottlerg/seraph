@@ -16,6 +16,7 @@ elf = { path = "../shared/elf" }
 ipc = { path = "../shared/ipc" }
 syscall = { path = "../shared/syscall" }
 syscall-abi = { path = "../abi/syscall" }
+va_layout = { path = "../shared/va_layout" }
 
 [lints]
 workspace = true

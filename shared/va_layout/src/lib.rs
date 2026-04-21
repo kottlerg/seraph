@@ -16,6 +16,29 @@
 //! `const_assert!` enforces the critical non-overlaps.
 //!
 //! Boundaries come from `docs/userspace-memory-model.md`.
+//!
+//! # Enforcement
+//! No new userspace VA constant may be declared outside this crate. Every
+//! addition goes here; callers `use va_layout::*`. VA constants follow
+//! the workspace convention of a trailing `_VA` segment (e.g.
+//! `PROCESS_STACK_GUARD_VA`, `CHILD_IPC_BUF_VA`, `VIRTIO_BLK_BAR_MAP_VA`).
+//! Verify with:
+//!
+//! ```text
+//! grep -rnE 'const\s+[A-Z0-9_]+_VA\s*[:=]' . --include='*.rs' \
+//!   | grep -v '/shared/va_layout/' \
+//!   | grep -v '/target/' \
+//!   | grep -v '/abi/' \
+//!   | grep -v '/ktest/' \
+//!   | grep -v 'SERIAL_VA'
+//! ```
+//!
+//! Expected output: empty. Exclusions:
+//! - `abi/init-protocol`, `abi/process-abi`: stable ABI surfaces mirror
+//!   their own VA constants independently.
+//! - `ktest/`: kernel-only test harness with local test fixtures.
+//! - `SERIAL_VA` in `init/src/arch/riscv64/mod.rs`: platform-specific
+//!   UART MMIO, single consumer, not cross-component.
 
 // When built as a std dep via `rustc-dep-of-std`, we switch to `no_core`
 // and rebind `core` to the `rustc_std_workspace_core` facade — same dance
@@ -115,6 +138,10 @@ pub const INIT_TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;
 
 /// procmgr's IPC buffer VA as seen from init while bootstrapping procmgr.
 pub const PROCMGR_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
+
+/// Per-page ELF write scratch during init's procmgr bootstrap. Sits inside
+/// the `INIT_TEMP_MAP_BASE` scratch region, offset 256 MiB.
+pub const INIT_ELF_PAGE_TEMP_VA: u64 = INIT_TEMP_MAP_BASE + 0x1000_0000;
 
 // ── procmgr process ─────────────────────────────────────────────────────────
 

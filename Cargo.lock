@@ -220,6 +220,7 @@ dependencies = [
  "ipc",
  "syscall",
  "syscall-abi",
+ "va_layout",
  "virtio-core",
 ]
 
@@ -372,6 +373,7 @@ dependencies = [
  "process-abi",
  "syscall",
  "syscall-abi",
+ "va_layout",
 ]
 
 [[package]]
@@ -514,6 +516,7 @@ dependencies = [
  "process-abi",
  "syscall",
  "syscall-abi",
+ "va_layout",
 ]
 
 [[package]]
@@ -615,6 +618,10 @@ name = "simple-bytes"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c11532d9d241904f095185f35dcdaf930b1427a94d5b01d7002d74ba19b44cc4"
+
+[[package]]
+name = "stackoverflow"
+version = "0.1.0"
 
 [[package]]
 name = "stdiotest"
@@ -723,6 +730,7 @@ dependencies = [
  "ipc",
  "syscall",
  "syscall-abi",
+ "va_layout",
  "virtio-core",
 ]
 

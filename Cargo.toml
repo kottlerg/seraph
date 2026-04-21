@@ -26,6 +26,7 @@ members = [
     "shared/va_layout",
     "base/crasher",
     "base/hello",
+    "base/stackoverflow",
     "base/stdiotest",
     "base/usertest",
     "xtask",

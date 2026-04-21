@@ -28,15 +28,7 @@ mod vfs;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Page size (4 KiB).
-pub(crate) const PAGE_SIZE: u64 = 0x1000;
-
-/// Base virtual address for temporary mappings in init's address space.
-/// Well above init's code/data/stack to avoid conflicts.
-pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000; // 4 GiB
-
-/// Virtual address for init's own IPC buffer page (explicitly mapped).
-const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000; // 3 GiB
+pub(crate) use va_layout::{INIT_IPC_BUF_VA, INIT_TEMP_MAP_BASE as TEMP_MAP_BASE, PAGE_SIZE};
 
 // ── Cap descriptor helpers ───────────────────────────────────────────────────
 

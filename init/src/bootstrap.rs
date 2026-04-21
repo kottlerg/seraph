@@ -22,11 +22,7 @@ use process_abi::{
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Virtual address for the IPC buffer in procmgr's address space.
-const PROCMGR_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
-
-/// Scratch VA for per-page frame writes during ELF loading.
-const ELF_PAGE_TEMP_VA: u64 = TEMP_MAP_BASE + 0x1000_0000;
+use va_layout::{INIT_ELF_PAGE_TEMP_VA as ELF_PAGE_TEMP_VA, PROCMGR_IPC_BUF_VA};
 
 // ── ELF loading ──────────────────────────────────────────────────────────────
 

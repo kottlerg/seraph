@@ -28,19 +28,12 @@ use virtio_core::{
 };
 
 use crate::io::IoLayout;
+use va_layout::{
+    PAGE_SIZE, VIRTIO_BLK_BAR_MAP_VA as BAR_MAP_VA, VIRTIO_BLK_DATA_MAP_VA as DATA_MAP_VA,
+    VIRTIO_BLK_RING_MAP_VA as RING_MAP_VA,
+};
 
 // ── Constants ──────────────────────────────────────────────────────────────
-
-const PAGE_SIZE: u64 = 0x1000;
-
-/// VA for mapping BAR0 MMIO.
-const BAR_MAP_VA: u64 = 0x0000_0001_0000_0000; // 4 GiB
-
-/// VA for mapping virtqueue ring pages (DMA memory).
-const RING_MAP_VA: u64 = 0x0000_0001_0001_0000;
-
-/// VA for mapping the data buffer page (DMA memory).
-const DATA_MAP_VA: u64 = 0x0000_0001_0010_0000;
 
 /// Queue size we request (must be <= device max).
 const QUEUE_SIZE: u16 = 128;

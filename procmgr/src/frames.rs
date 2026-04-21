@@ -9,7 +9,7 @@
 //! from large initial caps via `frame_split`, and freed pages are tracked in
 //! a fixed-size free list for reuse.
 
-pub const PAGE_SIZE: u64 = 0x1000;
+pub use va_layout::PAGE_SIZE;
 
 const MAX_FREE_PAGES: usize = 64;
 

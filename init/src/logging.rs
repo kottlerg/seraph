@@ -28,11 +28,10 @@ use ipc::stream_labels::STREAM_BYTES;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Virtual address for the log thread's IPC buffer (separate from main thread).
-const LOG_THREAD_IPC_BUF_VA: u64 = 0x0000_0000_C000_1000; // main IPC buf + 1 page
-
-/// Virtual address for the log thread's stack base.
-const LOG_THREAD_STACK_VA: u64 = 0x0000_0000_D000_0000;
+use va_layout::{
+    INIT_LOG_THREAD_IPC_BUF_VA as LOG_THREAD_IPC_BUF_VA,
+    INIT_LOG_THREAD_STACK_VA as LOG_THREAD_STACK_VA,
+};
 
 /// Number of stack pages for the log thread (16 KiB).
 const LOG_THREAD_STACK_PAGES: u64 = 4;

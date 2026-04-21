@@ -26,7 +26,25 @@ use crate::sync::atomic::{AtomicBool, Ordering};
 
 use ipc::procmgr_labels::REQUEST_FRAMES;
 use syscall_abi::{MAP_WRITABLE, MSG_CAP_SLOTS_MAX};
-use va_layout::{FRAMES_PER_REQUEST, HEAP_BASE, HEAP_INITIAL_PAGES, PAGE_SIZE};
+use va_layout::{FRAMES_PER_REQUEST, HEAP_BASE, HEAP_INITIAL_PAGES, HEAP_MAX, PAGE_SIZE};
+
+/// Minimum grow increment in pages. Allocation-failure retries extend the
+/// heap by at least this many 4 KiB pages to amortise the procmgr IPC
+/// round-trip over many small follow-up allocations. 16 pages = 64 KiB.
+const GROW_MIN_PAGES: u64 = 16;
+
+/// Upper bound on a single `grow` call's page count. Each page received
+/// from procmgr consumes one CSpace slot in the requesting process, and
+/// procmgr's `REQUEST_FRAMES` ABI is one cap per page. Mapping hundreds
+/// of pages in one grow risks filling the child's 256-slot CSpace and
+/// wedging the next `ipc_reply` when the kernel cannot complete the
+/// cap transfer. Keep per-grow consumption well under the typical
+/// CSpace-free headroom at runtime (~100 slots after bootstrap). Larger
+/// allocations split across multiple grow rounds via the retry loop in
+/// `System::alloc`. Revisit once procmgr gains a multi-page-cap ABI or
+/// kernel `ipc_reply` fails cleanly on cap-transfer OOM instead of
+/// leaving the caller blocked.
+const GROW_MAX_PAGES: u64 = 64;
 
 // ── Spinlock ────────────────────────────────────────────────────────────────
 
@@ -74,11 +92,28 @@ fn align_up(addr: usize, align: usize) -> usize {
 
 struct Heap {
     head: Option<NonNull<FreeNode>>,
+    /// First VA above the currently mapped heap region. Grows upward toward
+    /// `HEAP_MAX` as `grow` maps fresh frames. Zero before bootstrap.
+    mapped_end: usize,
+    /// Cached procmgr endpoint cap used by `grow` to request additional
+    /// frames. Zero before bootstrap; `grow` returns false in that state.
+    procmgr_ep: u32,
+    /// Cached aspace cap for mapping grow-path frames. Zero before bootstrap.
+    self_aspace: u32,
+    /// IPC buffer VA for the `grow` call. Kernel-registered, page-aligned;
+    /// equal to the buffer used at bootstrap. Zero before bootstrap.
+    ipc_buffer_vaddr: u64,
 }
 
 impl Heap {
     const fn new() -> Self {
-        Self { head: None }
+        Self {
+            head: None,
+            mapped_end: 0,
+            procmgr_ep: 0,
+            self_aspace: 0,
+            ipc_buffer_vaddr: 0,
+        }
     }
 
     /// # Safety
@@ -188,6 +223,96 @@ impl Heap {
         }
         null_mut()
     }
+
+    /// Extend the heap by requesting fresh frames from procmgr, mapping
+    /// them immediately above `mapped_end`, and appending the new region
+    /// to the free list.
+    ///
+    /// Returns `true` if the heap grew by enough pages to cover
+    /// `want_bytes`, `false` on any IPC / map failure or when the heap
+    /// has reached `HEAP_MAX`. A partial failure (some frames mapped,
+    /// then a later batch fails) leaves the successfully-mapped pages
+    /// outside the free list — effectively leaked address space until
+    /// a future successful grow. This keeps the failure path simple and
+    /// avoids a half-formed free-list node.
+    ///
+    /// # Safety
+    /// Caller must hold the heap lock. IPC wrappers and `mem_map` are
+    /// themselves non-allocating — the bootstrap IPC buffer is the
+    /// pre-registered page, not heap-backed — so `grow` is safe to call
+    /// under the allocator lock without re-entrant allocation.
+    fn grow(&mut self, want_bytes: usize) -> bool {
+        if self.procmgr_ep == 0 || self.ipc_buffer_vaddr == 0 || self.self_aspace == 0 {
+            return false;
+        }
+        let start_va = self.mapped_end as u64;
+        if start_va >= HEAP_MAX {
+            return false;
+        }
+
+        let page_size_usize = PAGE_SIZE as usize;
+        let pages_needed = want_bytes.div_ceil(page_size_usize) as u64;
+        let pages_wanted = core::cmp::max(pages_needed, GROW_MIN_PAGES).min(GROW_MAX_PAGES);
+
+        // Clamp to what fits in the remaining [mapped_end, HEAP_MAX) window.
+        let remaining_pages = (HEAP_MAX - start_va) / PAGE_SIZE;
+        let pages = pages_wanted.min(remaining_pages);
+        if pages == 0 {
+            return false;
+        }
+
+        self.grow_exact(pages, start_va)
+    }
+
+    /// Request and map exactly `pages` frames starting at `start_va`,
+    /// then append the new region to the free list. Returns true on
+    /// full success.
+    fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
+        let ipc_buf_u64 = self.ipc_buffer_vaddr as *mut u64;
+        let mut mapped: u64 = 0;
+        while mapped < pages {
+            let want = (pages - mapped).min(FRAMES_PER_REQUEST);
+            // SAFETY: ipc_buffer_vaddr is the kernel-registered,
+            // page-aligned IPC buffer.
+            unsafe { core::ptr::write_volatile(ipc_buf_u64, want) };
+
+            let Ok((ret_label, _)) = syscall::ipc_call(self.procmgr_ep, REQUEST_FRAMES, 1, &[])
+            else {
+                return false;
+            };
+            if ret_label != 0 {
+                return false;
+            }
+
+            // SAFETY: same invariants as bootstrap — ipc_buf_u64 valid,
+            // metadata at documented offset.
+            let (cap_count, cap_slots) = unsafe { syscall::read_recv_caps(ipc_buf_u64) };
+            let got = cap_count.min(MSG_CAP_SLOTS_MAX) as u64;
+            if got < want {
+                return false;
+            }
+
+            for i in 0..want {
+                let cap_slot = cap_slots[i as usize];
+                let va = start_va + (mapped + i) * PAGE_SIZE;
+                if syscall::mem_map(cap_slot, self.self_aspace, va, 0, 1, MAP_WRITABLE).is_err() {
+                    return false;
+                }
+            }
+            mapped += want;
+        }
+
+        let region_bytes = (mapped * PAGE_SIZE) as usize;
+        let region_base = start_va as usize;
+        // SAFETY: region just mapped writable, exclusively owned, size is
+        // a page multiple (therefore NODE_ALIGN-aligned); base is
+        // page-aligned (therefore NODE_ALIGN-aligned). `insert` coalesces
+        // with an existing tail free block if adjacent, preserving the
+        // free-list invariant.
+        unsafe { self.insert(region_base, region_bytes) };
+        self.mapped_end = region_base + region_bytes;
+        true
+    }
 }
 
 // ── Global heap ─────────────────────────────────────────────────────────────
@@ -271,7 +396,14 @@ pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32, ipc_buffer_vaddr: u64) 
     let size = (HEAP_INITIAL_PAGES as usize) * (PAGE_SIZE as usize);
     HEAP.lock.lock();
     // SAFETY: freshly-mapped, exclusively-owned region; lock held.
-    unsafe { (*HEAP.inner.get()).init(base, size) };
+    unsafe {
+        let heap = &mut *HEAP.inner.get();
+        heap.init(base, size);
+        heap.mapped_end = base + size;
+        heap.procmgr_ep = procmgr_ep;
+        heap.self_aspace = self_aspace;
+        heap.ipc_buffer_vaddr = ipc_buffer_vaddr;
+    }
     HEAP.lock.unlock();
     true
 }
@@ -295,7 +427,28 @@ unsafe impl GlobalAlloc for System {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         HEAP.lock.lock();
         // SAFETY: lock held, single mutator.
-        let ptr = unsafe { (*HEAP.inner.get()).alloc(layout) };
+        let heap = unsafe { &mut *HEAP.inner.get() };
+        let mut ptr = heap.alloc(layout);
+        if ptr.is_null() {
+            // Grow once, bounded by `GROW_MAX_PAGES`, then retry. A
+            // successful grow covers single allocations up to one
+            // grow-increment larger than the largest existing free block;
+            // anything beyond that returns null to `handle_alloc_error`.
+            // Multiple grow rounds are NOT attempted: each grown page
+            // consumes one CSpace slot (procmgr's `REQUEST_FRAMES` ABI
+            // is one cap per page), and the fixed 256-slot child CSpace
+            // saturates after a few hundred pages. Once that cap-transfer
+            // fails, the kernel's `ipc_reply` currently leaves the caller
+            // blocked rather than returning an error. Bounded grow keeps
+            // grow within CSpace headroom. IPC wrappers under the lock
+            // are non-allocating (the IPC buffer is the pre-registered
+            // page, not heap-backed), so there is no re-entrant
+            // allocation here.
+            let want = layout.size().saturating_add(layout.align());
+            if heap.grow(want) {
+                ptr = heap.alloc(layout);
+            }
+        }
         HEAP.lock.unlock();
         ptr
     }

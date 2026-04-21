@@ -30,6 +30,11 @@ Clippy defines the baseline for correct Rust code. The following lint groups are
 - `clippy::pedantic`
 - `clippy::cargo`
 
+The following individual lints are additionally mandatory:
+
+- `clippy::unwrap_used`
+- `clippy::expect_used`
+
 `cargo xtask build` runs Clippy with all warnings treated as errors. Code that does
 not pass this configuration is non-compliant. Configuration lives in `[workspace.lints]`
 in the root `Cargo.toml`; all member crates opt in via `[lints] workspace = true`.
@@ -134,7 +139,7 @@ Global symbols are prefixed with the component name to avoid collisions
 
 ### Function Design
 
-- Functions MUST do one thing. If a function needs a comment to separate phases, split it.
+- Functions SHOULD do one thing. If a function needs a comment to separate phases, split it.
 - Functions SHOULD be under 50 lines. Functions over 100 lines require strong justification.
 - Boolean parameters that alter behaviour MUST NOT be used — prefer separate functions or
   an explicit enum.
@@ -182,7 +187,9 @@ correct. They are not error handling.
 - Every unsafe block MUST be preceded by a `// SAFETY:` comment explaining why the
   operation is sound: what invariants hold, what has been checked, and why safe Rust
   cannot express it.
-- Unsafe MUST NOT be used to work around a design problem — reconsider the design first.
+- Unsafe SHOULD NOT be used to work around a design problem — reconsider the design
+  first. This is a review gate, not a lint-checkable rule; violations are design-smell
+  and should surface in code review.
 - `unsafe fn` MUST document their safety contract under a `# Safety` rustdoc heading.
 
 ```rust
@@ -211,7 +218,7 @@ let value = unsafe { ptr.read() };
   not the default.
 - Lock ordering MUST be documented and consistent. When acquiring multiple locks, always
   take them in the documented order.
-- A lock MUST NOT be held across an IPC call or any operation that may block.
+- A lock SHOULD NOT be held across an IPC call or any operation that may block.
 
 ---
 
@@ -231,6 +238,24 @@ let value = unsafe { ptr.read() };
 
 - All architecture-specific behaviour MUST be behind a trait or module boundary.
   No `#[cfg(target_arch)]` blocks in architecture-neutral code.
+- Arch-specific code in a crate MUST live under an `arch/<target>/` submodule
+  (for example `arch/x86_64/`, `arch/riscv64/`). A sibling `arch/mod.rs` (or
+  equivalent parent module) MUST expose the arch-dispatch surface — traits,
+  type aliases, or re-exports — so that arch-neutral callers reach arch
+  behaviour through a single anchor module.
+- Each function in the arch-dispatch surface MUST be defined on every
+  supported architecture. A function present on one architecture and
+  absent on another is not permitted; the dispatch surface is the contract.
+- Where a surface function has no meaningful behaviour on an architecture
+  because the underlying hardware concept does not apply (for example,
+  x86-64 GDT/IDT setup on RISC-V), the implementation MAY be a no-op stub.
+  The stub's rustdoc MUST state that it is a no-op and briefly explain why
+  the concept does not apply on that architecture. Silent no-op stubs
+  without a documented reason are not permitted.
+- `#[cfg(target_arch = ...)]` MUST appear only at arch-module declaration
+  sites (for example, on `mod x86_64;` in `arch/mod.rs`). Items inside
+  `arch/<target>/` inherit the parent's cfg gate and MUST NOT carry their
+  own `cfg(target_arch)` attribute.
 - Inline assembly MUST be isolated to dedicated functions or modules; never inlined
   alongside logic.
 - Every inline assembly block MUST comment what it does, what registers it clobbers,
@@ -314,4 +339,10 @@ capacity: usize,
 `cargo xtask build` is the single mandatory build command; it runs Clippy with the
 mandated lint groups and treats all warnings as errors. Invocation details are in
 [build-system.md](build-system.md).
+
+---
+
+## Summarized By
+
+None
 

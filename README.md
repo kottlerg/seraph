@@ -2,7 +2,17 @@
 
 Seraph is a microkernel operating system written in Rust, targeting x86-64 and RISC-V (RV64GC).
 
+Everything below is a summary of content owned by documents under [`docs/`](docs/)
+and the component READMEs it references. Each summary links its authoritative
+source; follow the links for the definitive statement. Nothing in this README
+introduces new rules — if a detail here ever conflicts with a linked document,
+the linked document wins.
+
 ## Goals
+
+Summarized from the Project Goals and Philosophy sections of
+[docs/architecture.md](docs/architecture.md); see there for the authoritative
+statement and the reasoning behind each goal.
 
 - Minimal, modular microkernel; most functionality in userspace
 - Capability-based security model throughout
@@ -10,8 +20,10 @@ Seraph is a microkernel operating system written in Rust, targeting x86-64 and R
 - Architecture-specific code isolated behind shared traits
 - Self-hosting as a long-term goal
 
-No binary compatibility with other operating systems.
-No support for 32-bit or legacy x86.
+Seraph does not aim for binary compatibility with other operating systems.
+32-bit and legacy x86 are not targeted. See
+[docs/architecture.md](docs/architecture.md) §"Non-Goals" for the
+authoritative non-goals list.
 
 ## Structure
 
@@ -36,13 +48,16 @@ No support for 32-bit or legacy x86.
 | `svcmgr/` | Service health monitor and restart manager |
 | `targets/` | Custom Rust target JSON specs for cross-compilation |
 | `vfsd/` | Virtual filesystem daemon |
-| `ktest/` | In-kernel test binary — loaded as init to exercise syscalls, integration scenarios, and benchmarks |
+| `ktest/` | In-kernel test binary, loaded in place of init for syscall and integration testing |
 | `xtask/` | Build task runner (`cargo xtask`) |
 
 ## Usage
 
-All build, run, and test operations go through `cargo xtask`. See `xtask/README.md`
-for the full command reference.
+All build, run, and test operations are driven by `cargo xtask`. The full
+command reference lives in [xtask/README.md](xtask/README.md); toolchain
+requirements, sysroot layout, and QEMU / firmware configuration are in
+[docs/build-system.md](docs/build-system.md). The common recipes are
+summarized here for quick reference:
 
 ```sh
 cargo xtask build                        # build all components (x86_64, debug)
@@ -55,10 +70,12 @@ cargo xtask clean --all                  # remove sysroot/ and target/
 cargo xtask test                         # run all workspace tests on the host
 ```
 
-`cargo xtask test` runs host-side unit tests (fast, no QEMU). For in-kernel tests, set
-`init=ktest` in `rootfs/EFI/seraph/boot.conf`, then run `cargo xtask run`. ktest exercises
-every syscall through real trap/return paths, runs cross-subsystem integration scenarios,
-and measures hardware cycle counts for key operations. See [`ktest/README.md`](ktest/README.md).
+`cargo xtask test` runs host-side unit tests (fast, no QEMU). For in-kernel
+tests, set `init=ktest` in `rootfs/EFI/seraph/boot.conf`, then run
+`cargo xtask run`. ktest exercises every syscall through real trap/return
+paths, runs cross-subsystem integration scenarios, and measures hardware
+cycle counts for key operations. See [ktest/README.md](ktest/README.md) for
+authoritative detail.
 
 ---
 
@@ -68,9 +85,11 @@ Overall project design documents live in [`docs/`](docs/):
 
 - [Architecture Overview](docs/architecture.md) — component structure and design philosophy
 - [Memory Model](docs/memory-model.md) — virtual address space layout, paging, allocation
+- [Userspace Memory Model](docs/userspace-memory-model.md) — VA zones, heap ownership, std↔procmgr frame authority
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
-- [Boot Protocol](docs/boot-protocol.md) — UEFI boot flow, boot info contract, kernel entry requirements
+- [Boot Protocol](docs/boot-protocol.md) — kernel-entry ABI gate: CPU/memory state and `BootInfo`
+- [System Bootstrap](docs/bootstrap.md) — end-to-end boot lifecycle summary (bootloader steps, kernel phases, init bootstrap)
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr, driver binding, DMA safety
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands
 - [Coding Standards](docs/coding-standards.md) — Rust conventions, safety contracts, documentation rules

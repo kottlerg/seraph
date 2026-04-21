@@ -13,18 +13,13 @@ that satisfies this contract MAY be used in its place. Shared types are in
 
 ## Boot Flow
 
-1. UEFI firmware loads the bootloader from the EFI System Partition
-2. Bootloader reads `\EFI\seraph\boot.conf` to obtain kernel, init, module paths, and command line
-3. Bootloader locates and reads the kernel ELF and boot modules from disk
-4. Bootloader allocates physical memory for all loaded images
-5. Bootloader queries the UEFI memory map
-6. Bootloader sets up initial page tables mapping the kernel at its virtual addresses
-7. Bootloader calls `ExitBootServices` — firmware services are no longer available
-8. Bootloader populates the boot information structure
-9. Bootloader jumps to the kernel entry point
-
-After step 6, the system is under full bootloader and then kernel control. UEFI
-runtime services are not used; the firmware is considered done.
+The authoritative enumeration of bootloader execution — ten bootloader
+steps from UEFI entry through kernel handoff — lives in
+[`boot/docs/boot-flow.md`](../boot/docs/boot-flow.md). This document
+specifies the contract at the boundary only: the CPU state, memory state,
+and `BootInfo` layout established by the time the kernel entry point
+runs. UEFI runtime services are not used by the kernel; the firmware is
+considered done once the bootloader has completed its steps.
 
 ---
 
@@ -435,4 +430,4 @@ The bootloader must not:
 
 ## Summarized By
 
-[Architecture Overview](architecture.md)
+[Architecture Overview](architecture.md), [init](../init/README.md)

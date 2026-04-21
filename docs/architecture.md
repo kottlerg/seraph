@@ -5,6 +5,19 @@ kernel mechanisms and userspace policy.
 
 ---
 
+## Project Goals
+
+- Minimal, modular microkernel; most functionality in userspace
+- Capability-based security model throughout
+- Clear component boundaries with explicit IPC contracts
+- Architecture-specific code isolated behind shared traits
+- Self-hosting as a long-term goal
+
+Seraph does not provide binary compatibility with other operating systems.
+32-bit and legacy x86 are not targeted.
+
+---
+
 ## Philosophy
 
 Seraph is a microkernel‑based operating system. The kernel is a minimal, trusted
@@ -124,29 +137,18 @@ enforces isolation via AddressSpace and CSpace boundaries, not via a process abs
 
 ## Bootstrap Sequence
 
-```
-Bootloader → kernel_entry
-    → Phase 0–8: memory, paging, caps, scheduler init
-    → Phase 9: map init from pre-parsed InitImage segments
-    → Phase 9: scheduler handoff — init runs in userspace
+The end-to-end boot lifecycle — power-on through svcmgr handover — is
+summarized in [`bootstrap.md`](bootstrap.md). Authoritative enumerations
+live in the component scope:
 
-init
-    → start procmgr (built-in ELF parser + raw syscalls)
-    → request: start devmgr, svcmgr, drivers, vfsd [, netd]
-    → delegate capabilities to each service
-    → exit
+- Bootloader steps 1–10 — [`boot/docs/boot-flow.md`](../boot/docs/boot-flow.md).
+- Kernel phases 0–9 — [`kernel/docs/initialization.md`](../kernel/docs/initialization.md).
+- init's userspace bootstrap — [`init/README.md`](../init/README.md) and
+  [`init/docs/bootstrap.md`](../init/docs/bootstrap.md).
 
-procmgr    — all subsequent process creation goes through here
-devmgr     — platform enumeration, driver binding
-drivers    — block, FS, [net], etc.
-vfsd       — unified filesystem namespace
-svcmgr     — service monitoring, restarts, procmgr fallback
-[netd]     — network stack (optional early-boot module)
-```
-
-Boot modules (procmgr, devmgr, drivers, etc.) are configurable via `boot.conf`.
-The bootloader loads the configured set from the ESP; init starts them in order.
-The minimum set is: procmgr, devmgr, one block driver, one FS driver, vfsd.
+Boot modules (procmgr, devmgr, drivers, etc.) are configurable via `boot.conf`
+per [`boot-protocol.md`](boot-protocol.md); the minimum set is procmgr, devmgr,
+one block driver, one FS driver, and vfsd.
 
 ---
 
@@ -214,7 +216,7 @@ Uses APIC, PCIDs, IOMMU where available. 32-bit and legacy x86 are not supported
 RV64GC base ISA (IMAFD + compressed). Embedded or non-standard configurations are
 not targeted.
 
-See [coding-standards.md#architecture-specific-code](coding-standards.md#architecture-specific-code)
+See [coding-standards.md#c-architecture-invariants](coding-standards.md#c-architecture-invariants)
 for the architectural code isolation rules.
 
 ---
@@ -232,5 +234,5 @@ Seraph does not aim to run Linux or other OS binaries.
 
 ## Summarized By
 
-None
+[README.md](../README.md), [init/README.md](../init/README.md)
 

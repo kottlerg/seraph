@@ -14,12 +14,21 @@ Four documentation scopes exist:
 | System | `docs/*.md` | Authoritative for system-wide behavior and invariants |
 | Component | `<component>/README.md` | Authoritative for that component's scope and structure |
 | Design-authority | `<component>/docs/*.md` | Authoritative for component-internal design decisions |
-| Routing | Root `README.md` | Routes to authoritative documents; carries no normative content |
+| Routing | Root `README.md` | Routes to authoritative documents; may summarize their content; carries no original behavior |
 
 - Every component MUST have a `README.md`.
 - A component MAY have a `docs/` directory.
 - If a component has no `docs/` directory, its `README.md` is the sole authoritative
   document for that component.
+- A component README carries original authoritative content only if the component has
+  no `docs/` subdirectory. If a `docs/` subdirectory exists, the README contains only
+  summaries of its `docs/*.md` files and the system-scope documents it depends on;
+  every such summary MUST link the authoritative source.
+- The root README routes to `docs/*.md` via its link list and MAY contain
+  summaries of content owned by `docs/*.md` or by top-level non-component
+  targets (for example `xtask/README.md`). Every summary MUST link its
+  authoritative source. Summaries MUST NOT introduce normative or
+  behavior-bearing content not present in the authoritative source.
 
 ---
 
@@ -37,13 +46,10 @@ Four documentation scopes exist:
 ## Backlinks and Change Propagation
 
 Every authoritative document MUST include a `## Summarized By` section at the end of the
-document (after a `---` separator), listing all non-structural documents that contain
-summaries of it.
-
-A **structural** summarizer is a README.md that links to documents within its own `docs/`
-directory. These backlinks are implicit from the document hierarchy and MUST NOT be listed
-in `## Summarized By`. Only documents outside the immediate structural parent that derive or
-condense content from this document MUST be listed.
+document (after a `---` separator) listing every document that contains a summary of its
+content, regardless of hierarchical relationship. Structural parent READMEs are not
+implicitly exempt; if a parent README summarizes a child doc, the parent MUST appear in
+the child's `## Summarized By` list.
 
 ```markdown
 ---
@@ -114,12 +120,17 @@ Root README.md
 - MUST describe the project structure and purpose of each top-level directory.
 - MUST link to every document in `docs/`.
 - SHOULD NOT list or link to individual component `README.md` files.
+- MUST NOT contain original normative or behavior-bearing content. Project-level
+  framing (goals, positioning) lives in `docs/architecture.md`.
 
 ### Component README.md
 
 - MUST describe the component's internal structure.
 - MUST link to all documents in its `docs/` directory, if present.
 - MUST link to any system-level documents it directly summarizes.
+- MUST NOT restate authoritative content owned by its own `docs/*.md` files. If it
+  mentions that content, it MUST link the authoritative source and contain only
+  summary-form prose.
 
 ---
 

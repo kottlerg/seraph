@@ -74,44 +74,60 @@ revocable; init can kill devmgr and restart it with a fresh capability set.
 
 ## DMA Safety Model
 
-DMA access in Seraph operates in one of two explicit modes:
+DMA access in Seraph operates in one of two modes, distinguished by whether an
+IOMMU is present and whether devmgr has programmed it to scope DMA for a given
+device:
 
-**IOMMU-isolated (safe):** When an IOMMU is present and active, `SYS_DMA_GRANT`
-programs the IOMMU to confine a device's DMA to the specified physical frames.
-A driver cannot DMA outside its authorised regions even if its process is compromised.
-This is the expected mode on modern x86-64 hardware and on RISC-V platforms that
-implement the IOMMU extension.
+**IOMMU-isolated (safe):** When an IOMMU is present and devmgr has configured
+it for the target device, DMA transactions initiated by that device are
+confined by the IOMMU's translation tables to the physical frames devmgr has
+explicitly mapped. A driver cannot DMA outside its authorised regions even if
+its process is compromised. This is the expected mode on modern x86-64
+hardware and on RISC-V platforms that implement the IOMMU extension.
 
-**DMA-unsafe:** When no IOMMU is present (or when the IOMMU has not been configured
-for a device), unconfined DMA is physically possible. In this mode, `SYS_DMA_GRANT`
-requires the caller to pass `FLAG_DMA_UNSAFE` (bit 2 in the flags argument),
-explicitly acknowledging that DMA isolation is not enforced. Without this flag,
-`SYS_DMA_GRANT` returns `DmaUnsafe`.
+**DMA-unsafe:** When no IOMMU is present, or when devmgr chooses not to
+configure an available IOMMU for a device, unconfined DMA is physically
+possible. A driver may still be authorised by devmgr to DMA in this mode,
+but no hardware enforcement constrains the device; a compromised driver
+can reach any physical address the device can address.
 
-devmgr is responsible for querying `SYS_SYSTEM_INFO(DMA_MODE)` at startup to
-determine which mode is active, and for making the policy decision of whether to
-proceed with unsafe DMA for a given device. devmgr may choose to:
-- Refuse to bind a driver that requires DMA on a platform without IOMMU protection.
-- Bind the driver but pass `FLAG_DMA_UNSAFE` and warn the operator.
+devmgr is responsible for detecting the platform IOMMU situation, deciding
+per-device policy, and programming the IOMMU itself when present. For
+devices that require DMA on a platform without IOMMU protection, devmgr may:
+- Refuse to bind the driver.
+- Bind the driver after warning the operator.
 - Bind the driver in a restricted mode that avoids DMA entirely.
 
-This decision is a userspace policy choice. The kernel only enforces the boundary
-between modes — it does not silently degrade.
+This decision is entirely userspace policy. The kernel is agnostic to DMA
+mode: it does not read or write IOMMU registers, does not track per-device
+DMA state, and does not return a DMA-safety verdict.
 
 ---
 
 ## IommuUnit Resources
 
-`IommuUnit` entries in `PlatformResources` describe the register base and scope of
-one IOMMU. devmgr receives an MMIO capability for each IOMMU's register range and
-is responsible for configuring domain mappings before allowing any device under that
-IOMMU's scope to perform DMA.
+`IommuUnit` entries in `PlatformResource` describe the register base and scope
+of one IOMMU. The kernel mints one MMIO capability per `IommuUnit` during the
+capability-minting phase of kernel initialization and hands the set to init at
+the init ABI gate; init delegates the IOMMU MMIO caps to devmgr. devmgr
+programs the IOMMU directly through those MMIO capabilities — the kernel does
+not read or write IOMMU registers and holds no per-IOMMU state.
 
-The kernel does not configure IOMMU domains itself. It relies on devmgr to program
-the IOMMU before issuing `SYS_DMA_GRANT` calls. If devmgr has not configured the
-IOMMU and a driver calls `SYS_DMA_GRANT`, the kernel programs the IOMMU grant at
-that point using whatever domain state devmgr has established — or returns an error
-if the IOMMU state is inconsistent.
+When devmgr binds a DMA-capable driver, devmgr (a) programs the IOMMU
+translation tables for that driver's device, and (b) derives and transfers a
+DMA-authorising capability to the driver. On platforms without an IOMMU,
+devmgr still derives the authorising capability, but the physical isolation is
+absent — this is a userspace policy decision (refuse / warn / restrict), not a
+kernel-enforced mode. The kernel is agnostic to both outcomes.
+
+### Known Divergence
+
+*Known divergence from current implementation.* As of this writing, kernel
+code includes an `IommuUnit` capability type and IOMMU-programming paths
+that this section describes as devmgr-owned. The kernel-side IOMMU surface
+is scheduled for removal; see the repo-local `TODO.md` entry "IOMMU
+stripping (Shape A migration)" for the plan. Until that migration lands,
+kernel code and this document will disagree on the kernel/userspace split.
 
 ---
 

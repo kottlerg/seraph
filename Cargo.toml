@@ -43,6 +43,8 @@ cargo    = { level = "warn", priority = -1 }
 
 undocumented_unsafe_blocks       = "warn"
 cast_ptr_alignment               = "warn"
+unwrap_used                      = "deny"
+expect_used                      = "deny"
 
 [workspace.dependencies]
 boot-protocol = { path = "abi/boot-protocol" }

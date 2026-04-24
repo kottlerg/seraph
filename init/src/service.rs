@@ -11,7 +11,7 @@
 
 use crate::bootstrap::NEXT_BOOTSTRAP_TOKEN;
 use crate::idle_loop;
-use crate::logging::{log, pack_name};
+use crate::logging::{derive_log_stdio_pair, log};
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
@@ -28,6 +28,45 @@ fn derive_tokened_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
     let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let tokened = syscall::cap_derive_token(bootstrap_ep, syscall::RIGHTS_SEND, token).ok()?;
     Some((tokened, token))
+}
+
+/// Issue `CONFIGURE_STDIO` on a suspended child's `process_handle`,
+/// installing the given stdout/stderr/stdin caps. Zero slots are omitted
+/// (trailing zeros only — the kernel rejects null slot indices in a cap
+/// list). Returns true on success.
+fn configure_stdio(
+    process_handle: u32,
+    ipc_buf: *mut u64,
+    stdout: u32,
+    stderr: u32,
+    stdin: u32,
+    context: &str,
+) -> bool
+{
+    let mut builder = IpcMessage::builder(procmgr_labels::CONFIGURE_STDIO);
+    if stdout != 0
+    {
+        builder = builder.cap(stdout);
+        if stderr != 0
+        {
+            builder = builder.cap(stderr);
+            if stdin != 0
+            {
+                builder = builder.cap(stdin);
+            }
+        }
+    }
+    let msg = builder.build();
+    // SAFETY: ipc_buf is caller's registered IPC buffer.
+    match unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == 0 => true,
+        _ =>
+        {
+            log(context);
+            false
+        }
+    }
 }
 
 /// Start a process by calling `START_PROCESS` on its tokened process handle.
@@ -230,13 +269,12 @@ pub fn create_devmgr_with_caps(
     let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
     else
     {
-        log("init: devmgr: token derivation failed");
+        log("devmgr: token derivation failed");
         return;
     };
 
-    // Stdio token = packed name "devmgr"; stdin not attached.
+    // caps: [module, creator]. Stdio configured via CONFIGURE_STDIO below.
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .word(0, pack_name(b"devmgr"))
         .cap(devmgr_frame_cap)
         .cap(tokened_creator)
         .build();
@@ -244,19 +282,19 @@ pub fn create_devmgr_with_caps(
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        log("init: devmgr: CREATE_PROCESS ipc_call failed");
+        log("devmgr: CREATE_PROCESS ipc_call failed");
         return;
     };
     if reply.label != 0
     {
-        log("init: devmgr: CREATE_PROCESS failed");
+        log("devmgr: CREATE_PROCESS failed");
         return;
     }
 
     let reply_caps = reply.caps();
     if reply_caps.is_empty()
     {
-        log("init: devmgr: CREATE_PROCESS reply missing caps");
+        log("devmgr: CREATE_PROCESS reply missing caps");
         return;
     }
     let process_handle = reply_caps[0];
@@ -269,7 +307,7 @@ pub fn create_devmgr_with_caps(
     let Ok(registry_copy) = syscall::cap_derive(registry_ep, syscall::RIGHTS_ALL)
     else
     {
-        log("init: devmgr: registry cap derive failed");
+        log("devmgr: registry cap derive failed");
         return;
     };
 
@@ -300,12 +338,25 @@ pub fn create_devmgr_with_caps(
         0
     };
 
+    // CONFIGURE_STDIO: install a matched stdout+stderr pair on the
+    // suspended child so devmgr's log lines appear under its registered
+    // display name. No stdin for devmgr.
+    let (stdout, stderr) = derive_log_stdio_pair();
+    configure_stdio(
+        process_handle,
+        ipc_buf,
+        stdout,
+        stderr,
+        0,
+        "devmgr: CONFIGURE_STDIO failed",
+    );
+
     // START_PROCESS.
     if !start_process(
         process_handle,
         ipc_buf,
-        "init: devmgr started; serving bootstrap",
-        "init: devmgr: START_PROCESS failed",
+        "devmgr started; serving bootstrap",
+        "devmgr: START_PROCESS failed",
     )
     {
         return;
@@ -343,7 +394,7 @@ pub fn create_devmgr_with_caps(
         false,
         &r1_caps[..r1_cap_count],
         &[presence, hw.rsdp_page_base, hw.dtb_page_base, hw.dtb_size],
-        "init: devmgr: bootstrap round 1 failed",
+        "devmgr: bootstrap round 1 failed",
     )
     {
         return;
@@ -385,7 +436,7 @@ pub fn create_devmgr_with_caps(
             done_here,
             &caps[..batch_count],
             &data[..2 + batch_count * 2],
-            "init: devmgr: bootstrap aperture round failed",
+            "devmgr: bootstrap aperture round failed",
         )
         {
             return;
@@ -428,7 +479,7 @@ pub fn create_devmgr_with_caps(
             done_here,
             &caps[..batch_count],
             &data[..2 + batch_count * 2],
-            "init: devmgr: bootstrap ACPI region round failed",
+            "devmgr: bootstrap ACPI region round failed",
         )
         {
             return;
@@ -447,7 +498,7 @@ pub fn create_devmgr_with_caps(
         let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
         else
         {
-            log("init: devmgr: module cap derive failed");
+            log("devmgr: module cap derive failed");
             return;
         };
 
@@ -458,7 +509,7 @@ pub fn create_devmgr_with_caps(
             true,
             &[module_copy],
             &[kind::MODULE, 1],
-            "init: devmgr: bootstrap module round failed",
+            "devmgr: bootstrap module round failed",
         );
     }
     else if !remaining_apertures && !remaining_acpi
@@ -472,7 +523,7 @@ pub fn create_devmgr_with_caps(
             true,
             &[],
             &[kind::MODULE, 0],
-            "init: devmgr: bootstrap terminal round failed",
+            "devmgr: bootstrap terminal round failed",
         );
     }
 }
@@ -501,12 +552,11 @@ pub fn create_vfsd_with_caps(
     let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
     else
     {
-        log("init: vfsd: token derivation failed");
+        log("vfsd: token derivation failed");
         return;
     };
 
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .word(0, pack_name(b"vfsd"))
         .cap(vfsd_frame_cap)
         .cap(tokened_creator)
         .build();
@@ -514,19 +564,19 @@ pub fn create_vfsd_with_caps(
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        log("init: vfsd: CREATE_PROCESS ipc_call failed");
+        log("vfsd: CREATE_PROCESS ipc_call failed");
         return;
     };
     if reply.label != 0
     {
-        log("init: vfsd: CREATE_PROCESS failed");
+        log("vfsd: CREATE_PROCESS failed");
         return;
     }
 
     let reply_caps = reply.caps();
     if reply_caps.is_empty()
     {
-        log("init: vfsd: CREATE_PROCESS reply missing caps");
+        log("vfsd: CREATE_PROCESS reply missing caps");
         return;
     }
     let process_handle = reply_caps[0];
@@ -542,11 +592,21 @@ pub fn create_vfsd_with_caps(
         return;
     };
 
+    let (stdout, stderr) = derive_log_stdio_pair();
+    configure_stdio(
+        process_handle,
+        ipc_buf,
+        stdout,
+        stderr,
+        0,
+        "vfsd: CONFIGURE_STDIO failed",
+    );
+
     if !start_process(
         process_handle,
         ipc_buf,
-        "init: vfsd started; serving bootstrap",
-        "init: vfsd: START_PROCESS failed",
+        "vfsd started; serving bootstrap",
+        "vfsd: START_PROCESS failed",
     )
     {
         return;
@@ -561,7 +621,7 @@ pub fn create_vfsd_with_caps(
         false,
         &[service_copy, registry_copy],
         &[],
-        "init: vfsd: bootstrap round 1 failed",
+        "vfsd: bootstrap round 1 failed",
     )
     {
         return;
@@ -584,7 +644,7 @@ pub fn create_vfsd_with_caps(
         true,
         &[fatfs_cap],
         &[],
-        "init: vfsd: bootstrap round 2 failed",
+        "vfsd: bootstrap round 2 failed",
     );
 }
 
@@ -596,7 +656,7 @@ pub fn send_vfsd_endpoint_to_procmgr(procmgr_ep: u32, vfsd_ep: u32, ipc_buf: *mu
     let Ok(vfsd_copy) = syscall::cap_derive(vfsd_ep, syscall::RIGHTS_SEND_GRANT)
     else
     {
-        log("init: phase 3: failed to derive vfsd endpoint");
+        log("phase 3: failed to derive vfsd endpoint");
         return;
     };
     let msg = IpcMessage::builder(procmgr_labels::SET_VFSD_EP)
@@ -605,8 +665,8 @@ pub fn send_vfsd_endpoint_to_procmgr(procmgr_ep: u32, vfsd_ep: u32, ipc_buf: *mu
     // SAFETY: ipc_buf is the registered IPC buffer.
     match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) }
     {
-        Ok(reply) if reply.label == 0 => log("init: phase 3: vfsd endpoint sent to procmgr"),
-        _ => log("init: phase 3: SET_VFSD_ENDPOINT failed"),
+        Ok(reply) if reply.label == 0 => log("phase 3: vfsd endpoint sent to procmgr"),
+        _ => log("phase 3: SET_VFSD_ENDPOINT failed"),
     }
 }
 
@@ -623,11 +683,10 @@ pub fn create_svcmgr_from_vfs(
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
-    // Word 0 = stdio_token; words 1+ = path bytes.
+    // Path bytes start at word 0.
     let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
     let msg = IpcMessage::builder(label)
-        .word(0, pack_name(b"svcmgr"))
-        .bytes(1, path)
+        .bytes(0, path)
         .cap(tokened_creator)
         .build();
 
@@ -635,19 +694,19 @@ pub fn create_svcmgr_from_vfs(
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
-        log("init: phase 3: CREATE_FROM_VFS ipc_call failed");
+        log("phase 3: CREATE_FROM_VFS ipc_call failed");
         return None;
     };
     if reply.label != 0
     {
-        log("init: phase 3: CREATE_FROM_VFS failed");
+        log("phase 3: CREATE_FROM_VFS failed");
         return None;
     }
 
     let reply_caps = reply.caps();
     if reply_caps.is_empty()
     {
-        log("init: phase 3: svcmgr reply missing caps");
+        log("phase 3: svcmgr reply missing caps");
         return None;
     }
 
@@ -671,11 +730,21 @@ pub fn setup_and_start_svcmgr(
     ipc_buf: *mut u64,
 )
 {
+    let (stdout, stderr) = derive_log_stdio_pair();
+    configure_stdio(
+        process_handle,
+        ipc_buf,
+        stdout,
+        stderr,
+        0,
+        "phase 3: svcmgr CONFIGURE_STDIO failed",
+    );
+
     if !start_process(
         process_handle,
         ipc_buf,
-        "init: phase 3: svcmgr started; serving bootstrap",
-        "init: phase 3: svcmgr START_PROCESS failed",
+        "phase 3: svcmgr started; serving bootstrap",
+        "phase 3: svcmgr START_PROCESS failed",
     )
     {
         return;
@@ -701,7 +770,7 @@ pub fn setup_and_start_svcmgr(
         true,
         &[service_copy, boot_copy],
         &[],
-        "init: phase 3: svcmgr bootstrap failed",
+        "phase 3: svcmgr bootstrap failed",
     );
 }
 
@@ -716,7 +785,7 @@ pub fn create_crasher_suspended(
 {
     if info.module_frame_count < 6
     {
-        log("init: phase 3: no crasher module available");
+        log("phase 3: no crasher module available");
         return None;
     }
 
@@ -726,7 +795,6 @@ pub fn create_crasher_suspended(
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
     let msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .word(0, pack_name(b"crasher"))
         .cap(frame_for_procmgr)
         .cap(tokened_creator)
         .build();
@@ -734,26 +802,26 @@ pub fn create_crasher_suspended(
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
-        log("init: phase 3: crasher CREATE_PROCESS failed");
+        log("phase 3: crasher CREATE_PROCESS failed");
         return None;
     };
     if reply.label != 0
     {
-        log("init: phase 3: crasher CREATE_PROCESS error");
+        log("phase 3: crasher CREATE_PROCESS error");
         return None;
     }
 
     let reply_caps = reply.caps();
     if reply_caps.len() < 2
     {
-        log("init: phase 3: crasher reply missing caps");
+        log("phase 3: crasher reply missing caps");
         return None;
     }
 
     let process_handle = reply_caps[0];
     let thread_cap = reply_caps[1];
 
-    log("init: phase 3: crasher created (suspended)");
+    log("phase 3: crasher created (suspended)");
     Some((process_handle, thread_cap, crasher_frame_cap, child_token))
 }
 
@@ -798,18 +866,17 @@ pub fn create_and_run_usertest(
     let env_bytes = env_blob.len();
     let env_words = env_bytes.div_ceil(8);
 
-    // Layout: word 0 = stdio_token, words 1..1+argv_words = argv blob,
-    // next word = env_bytes header, next env_words = env blob.
+    // Layout: words 0..argv_words = argv blob, next word = env_bytes
+    // header, next env_words = env blob.
     let label = procmgr_labels::CREATE_PROCESS
         | ((argv_bytes as u64) << 32)
         | ((u64::from(argv_count)) << 48)
         | ((u64::from(env_count)) << 56);
-    let data_count = 1 + argv_words + 1 + env_words;
+    let data_count = argv_words + 1 + env_words;
     let msg = IpcMessage::builder(label)
-        .word(0, pack_name(b"usertest"))
-        .bytes(1, argv)
-        .word(1 + argv_words, env_bytes as u64)
-        .bytes(1 + argv_words + 1, env_blob)
+        .bytes(0, argv)
+        .word(argv_words, env_bytes as u64)
+        .bytes(argv_words + 1, env_blob)
         .word_count(data_count)
         .cap(frame_for_procmgr)
         .cap(tokened_creator)
@@ -833,11 +900,21 @@ pub fn create_and_run_usertest(
     }
     let process_handle = reply_caps[0];
 
+    let (stdout, stderr) = derive_log_stdio_pair();
+    configure_stdio(
+        process_handle,
+        ipc_buf,
+        stdout,
+        stderr,
+        0,
+        "phase 3: usertest CONFIGURE_STDIO failed",
+    );
+
     if !start_process(
         process_handle,
         ipc_buf,
-        "init: phase 3: usertest started",
-        "init: phase 3: usertest START_PROCESS failed",
+        "phase 3: usertest started",
+        "phase 3: usertest START_PROCESS failed",
     )
     {
         return;
@@ -850,7 +927,7 @@ pub fn create_and_run_usertest(
         true,
         &[],
         &[],
-        "init: phase 3: usertest bootstrap failed",
+        "phase 3: usertest bootstrap failed",
     );
 }
 
@@ -868,11 +945,21 @@ pub fn start_and_bootstrap_crasher(
     ipc_buf: *mut u64,
 ) -> bool
 {
+    let (stdout, stderr) = derive_log_stdio_pair();
+    configure_stdio(
+        process_handle,
+        ipc_buf,
+        stdout,
+        stderr,
+        0,
+        "phase 3: crasher CONFIGURE_STDIO failed",
+    );
+
     if !start_process(
         process_handle,
         ipc_buf,
-        "init: phase 3: crasher started",
-        "init: phase 3: crasher START_PROCESS failed",
+        "phase 3: crasher started",
+        "phase 3: crasher START_PROCESS failed",
     )
     {
         return false;
@@ -894,7 +981,7 @@ pub fn start_and_bootstrap_crasher(
         true,
         &[svcmgr_copy],
         &[],
-        "init: phase 3: crasher bootstrap failed",
+        "phase 3: crasher bootstrap failed",
     )
 }
 
@@ -971,7 +1058,7 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
     {
         Ok(reply) if reply.label == 0 =>
         {}
-        _ => log("init: phase 3: REGISTER_SERVICE failed"),
+        _ => log("phase 3: REGISTER_SERVICE failed"),
     }
 }
 
@@ -989,10 +1076,9 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u6
     };
 
     let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
-    let word_count = 1 + path_word_count(path);
+    let word_count = path_word_count(path);
     let msg = IpcMessage::builder(label)
-        .word(0, pack_name(b"hello"))
-        .bytes(1, path)
+        .bytes(0, path)
         .word_count(word_count)
         .cap(tokened_creator)
         .build();
@@ -1001,12 +1087,12 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u6
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
-        log("init: phase 3: hello CREATE_FROM_VFS failed");
+        log("phase 3: hello CREATE_FROM_VFS failed");
         return;
     };
     if reply.label != 0
     {
-        log("init: phase 3: hello CREATE_FROM_VFS error");
+        log("phase 3: hello CREATE_FROM_VFS error");
         return;
     }
 
@@ -1022,11 +1108,21 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u6
     // round; init would otherwise block on a REQUEST that never comes.
     let _ = child_token;
 
+    let (stdout, stderr) = derive_log_stdio_pair();
+    configure_stdio(
+        process_handle,
+        ipc_buf,
+        stdout,
+        stderr,
+        0,
+        "phase 3: hello CONFIGURE_STDIO failed",
+    );
+
     let _ = start_process(
         process_handle,
         ipc_buf,
-        "init: phase 3: hello started",
-        "init: phase 3: hello START_PROCESS failed",
+        "phase 3: hello started",
+        "phase 3: hello START_PROCESS failed",
     );
 }
 
@@ -1041,7 +1137,7 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mu
     let Ok(stdin_ep) = syscall::cap_create_endpoint()
     else
     {
-        log("init: phase 3: stdiotest cannot create stdin endpoint");
+        log("phase 3: stdiotest cannot create stdin endpoint");
         return;
     };
 
@@ -1049,14 +1145,14 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mu
     let Ok(stdin_recv) = syscall::cap_derive(stdin_ep, syscall::RIGHTS_RECEIVE)
     else
     {
-        log("init: phase 3: stdiotest cannot derive stdin RECV");
+        log("phase 3: stdiotest cannot derive stdin RECV");
         return;
     };
     // SEND side: kept by init for writing the probe payload.
     let Ok(stdin_send) = syscall::cap_derive(stdin_ep, syscall::RIGHTS_SEND)
     else
     {
-        log("init: phase 3: stdiotest cannot derive stdin SEND");
+        log("phase 3: stdiotest cannot derive stdin SEND");
         return;
     };
 
@@ -1067,25 +1163,23 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mu
     };
 
     let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
-    let word_count = 1 + path_word_count(path);
+    let word_count = path_word_count(path);
     let msg = IpcMessage::builder(label)
-        .word(0, pack_name(b"stdiotst"))
-        .bytes(1, path)
+        .bytes(0, path)
         .word_count(word_count)
         .cap(tokened_creator)
-        .cap(stdin_recv)
         .build();
 
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
-        log("init: phase 3: stdiotest CREATE_FROM_VFS failed");
+        log("phase 3: stdiotest CREATE_FROM_VFS failed");
         return;
     };
     if reply.label != 0
     {
-        log("init: phase 3: stdiotest CREATE_FROM_VFS error");
+        log("phase 3: stdiotest CREATE_FROM_VFS error");
         return;
     }
 
@@ -1099,11 +1193,23 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mu
     // Tier-2 binary: skip the bootstrap serve round (see hello).
     let _ = child_token;
 
+    // CONFIGURE_STDIO with all three caps (stdout + stderr tokened pair,
+    // plus the stdin RECV cap init just derived).
+    let (stdout, stderr) = derive_log_stdio_pair();
+    configure_stdio(
+        process_handle,
+        ipc_buf,
+        stdout,
+        stderr,
+        stdin_recv,
+        "phase 3: stdiotest CONFIGURE_STDIO failed",
+    );
+
     if !start_process(
         process_handle,
         ipc_buf,
-        "init: phase 3: stdiotest started",
-        "init: phase 3: stdiotest START_PROCESS failed",
+        "phase 3: stdiotest started",
+        "phase 3: stdiotest START_PROCESS failed",
     )
     {
         return;
@@ -1168,22 +1274,22 @@ pub fn phase3_svcmgr_handover(
     let Ok(svcmgr_service_ep) = syscall::cap_create_endpoint()
     else
     {
-        log("init: phase 3: cannot create svcmgr endpoint");
+        log("phase 3: cannot create svcmgr endpoint");
         idle_loop();
     };
     let Ok(svcmgr_bootstrap_ep) = syscall::cap_create_endpoint()
     else
     {
-        log("init: phase 3: cannot create svcmgr bootstrap endpoint");
+        log("phase 3: cannot create svcmgr bootstrap endpoint");
         idle_loop();
     };
 
-    log("init: phase 3: loading svcmgr from /bin/svcmgr");
+    log("phase 3: loading svcmgr from /bin/svcmgr");
     let Some((svcmgr_handle, svcmgr_token)) =
         create_svcmgr_from_vfs(procmgr_ep, bootstrap_ep, ipc_buf)
     else
     {
-        log("init: phase 3: failed to create svcmgr, idling");
+        log("phase 3: failed to create svcmgr, idling");
         idle_loop();
     };
 
@@ -1201,7 +1307,7 @@ pub fn phase3_svcmgr_handover(
 
     let crasher = create_crasher_suspended(info, procmgr_ep, bootstrap_ep, ipc_buf);
 
-    log("init: phase 3: registering services with svcmgr");
+    log("phase 3: registering services with svcmgr");
 
     if let Some((crasher_handle, crasher_thread, crasher_module, crasher_token)) = crasher
     {
@@ -1240,10 +1346,10 @@ pub fn phase3_svcmgr_handover(
     // SAFETY: ipc_buf is caller's registered IPC buffer.
     match unsafe { ipc::ipc_call(svcmgr_service_ep, &handover_msg, ipc_buf) }
     {
-        Ok(reply) if reply.label == 0 => log("init: phase 3: handover complete"),
-        _ => log("init: phase 3: handover failed"),
+        Ok(reply) if reply.label == 0 => log("phase 3: handover complete"),
+        _ => log("phase 3: handover failed"),
     }
 
-    log("init: main thread exiting, log thread continues");
+    log("main thread exiting, log thread continues");
     syscall::thread_exit();
 }

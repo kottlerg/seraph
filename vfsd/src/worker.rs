@@ -103,7 +103,7 @@ pub fn worker_loop(bootstrap_ep: u32, ch: &Channel) -> !
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        println!("vfsd: worker has no registered IPC buffer");
+        println!("worker has no registered IPC buffer");
         syscall::thread_exit();
     }
 

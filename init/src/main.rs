@@ -204,9 +204,8 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     }
 
-    // Set up serial output.
+    // Set up serial output (FATAL pre-IPC errors fall back to this).
     arch::current::serial_init(info, info.thread_cap);
-    logging::log("init: starting");
 
     let mut alloc = FrameAlloc::new(info);
 
@@ -238,7 +237,6 @@ fn run(info_ptr: u64) -> !
         logging::log("init: FATAL: ipc_buffer_set failed");
         syscall::thread_exit();
     }
-    logging::log("init: IPC buffer registered");
 
     // ── Create endpoints ─────────────────────────────────────────────────────
 
@@ -255,18 +253,43 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // Create the log endpoint before bootstrapping procmgr so procmgr
-    // receives a SEND copy in its bootstrap round and can install it in
-    // every subsequent child's `ProcessInfo.log_endpoint_cap`. procmgr
-    // itself never logs, so the log thread need not exist yet — it is
-    // spawned later, before any child that could log has actually started.
+    // Create the log endpoint. Init holds the full-rights cap; procmgr
+    // receives a SEND copy in its bootstrap round for `MINT_LOG_CAP`
+    // dispensing. Spawn the log thread as soon as its prerequisites
+    // (allocator, IPC buffer, log_ep) are satisfied so init's own
+    // subsequent log lines ride IPC through the mediator instead of
+    // direct serial.
+    //
+    // TODO: real `logd` — a late-boot service loaded from the real root
+    // (not the ESP) — will eventually own the receive side and the
+    // mediator role. At that point init hands over `log_ep` to logd and
+    // retires the in-init thread.
     let Ok(log_ep) = syscall::cap_create_endpoint()
     else
     {
         logging::log("init: FATAL: cannot create log endpoint");
         syscall::thread_exit();
     };
-    logging::log("init: log endpoint created");
+
+    // TODO: see above — log-thread ownership transfers to real logd.
+    let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
+    logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
+
+    // Tokened SEND on the log endpoint for init's own `log()` lines so
+    // they appear under `[init]`. Token `1` is reserved for init.
+    let Ok(init_log_send) = syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, 1)
+    else
+    {
+        logging::log("init: FATAL: cannot derive tokened log SEND");
+        syscall::thread_exit();
+    };
+    // SAFETY: INIT_IPC_BUF_VA is registered and page-aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = INIT_IPC_BUF_VA as *mut u64;
+    logging::set_ipc_logging(init_log_send, ipc_buf);
+    logging::set_log_ep(log_ep);
+    logging::set_cspace_cap(info.cspace_cap);
+    logging::register_name(b"init");
 
     // ── Bootstrap procmgr (raw ELF load + creator_endpoint install) ──────────
 
@@ -279,13 +302,9 @@ fn run(info_ptr: u64) -> !
     )
     else
     {
-        logging::log("init: FATAL: failed to bootstrap procmgr");
+        logging::log("FATAL: failed to bootstrap procmgr");
         syscall::thread_exit();
     };
-
-    // SAFETY: INIT_IPC_BUF_VA is registered and page-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = INIT_IPC_BUF_VA as *mut u64;
 
     // Serve procmgr's bootstrap round.
     //
@@ -299,7 +318,7 @@ fn run(info_ptr: u64) -> !
     let Ok(pm_service_cap_for_pm) = syscall::cap_derive(procmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
-        logging::log("init: FATAL: cannot derive procmgr service cap for bootstrap");
+        logging::log("FATAL: cannot derive procmgr service cap for bootstrap");
         syscall::thread_exit();
     };
     let procmgr_boot_data = [
@@ -319,7 +338,7 @@ fn run(info_ptr: u64) -> !
     }
     .is_err()
     {
-        logging::log("init: FATAL: procmgr bootstrap serve failed");
+        logging::log("FATAL: procmgr bootstrap serve failed");
         syscall::thread_exit();
     }
 
@@ -330,13 +349,13 @@ fn run(info_ptr: u64) -> !
     let Ok(devmgr_registry_ep) = syscall::cap_create_endpoint()
     else
     {
-        logging::log("init: FATAL: cannot create devmgr registry endpoint");
+        logging::log("FATAL: cannot create devmgr registry endpoint");
         syscall::thread_exit();
     };
     let Ok(vfsd_service_ep) = syscall::cap_create_endpoint()
     else
     {
-        logging::log("init: FATAL: cannot create vfsd service endpoint");
+        logging::log("FATAL: cannot create vfsd service endpoint");
         syscall::thread_exit();
     };
 
@@ -344,7 +363,7 @@ fn run(info_ptr: u64) -> !
 
     if info.module_frame_count >= 2
     {
-        logging::log("init: requesting procmgr to create devmgr (with hw caps)");
+        logging::log("requesting procmgr to create devmgr (with hw caps)");
         service::create_devmgr_with_caps(
             info,
             endpoint_cap,
@@ -355,12 +374,12 @@ fn run(info_ptr: u64) -> !
     }
     else
     {
-        logging::log("init: no devmgr module available");
+        logging::log("no devmgr module available");
     }
 
     if info.module_frame_count >= 3
     {
-        logging::log("init: requesting procmgr to create vfsd (with caps)");
+        logging::log("requesting procmgr to create vfsd (with caps)");
         service::create_vfsd_with_caps(
             info,
             endpoint_cap,
@@ -374,49 +393,33 @@ fn run(info_ptr: u64) -> !
     }
     else
     {
-        logging::log("init: no vfsd module available");
+        logging::log("no vfsd module available");
     }
 
-    // Spawn log thread so services can log while main thread continues.
-    let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
-    logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
-
-    // Tokened SEND on the log endpoint for init's own `log()` lines so they
-    // appear under `[init]`. cap_derive_token won't accept a zero token, so
-    // pack_name(b"init") (always non-zero) is used.
-    let Ok(init_log_send) =
-        syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, logging::pack_name(b"init"))
-    else
-    {
-        logging::log("init: FATAL: cannot derive tokened log SEND");
-        syscall::thread_exit();
-    };
-    logging::set_ipc_logging(init_log_send, ipc_buf);
-    logging::log("init: log thread started");
-    logging::log("init: phase 1 bootstrap complete");
+    logging::log("phase 1 bootstrap complete");
 
     // ── Phase 2: mount root filesystem ──────────────────────────────────────
 
     // SAFETY: InitInfo page is valid and contains cmdline data.
     let cmdline = unsafe { init_protocol::cmdline_bytes(info) };
-    logging::log("init: phase 2: parsing cmdline");
+    logging::log("phase 2: parsing cmdline");
 
     let mut root_uuid = [0u8; 16];
     if !vfs::parse_root_uuid(cmdline, &mut root_uuid)
     {
-        logging::log("init: FATAL: no root=UUID= in cmdline");
+        logging::log("FATAL: no root=UUID= in cmdline");
         syscall::thread_exit();
     }
 
-    logging::log("init: phase 2: mounting root filesystem");
+    logging::log("phase 2: mounting root filesystem");
     if !vfs::send_mount(vfsd_service_ep, ipc_buf, &root_uuid, b"/")
     {
-        logging::log("init: FATAL: root mount failed");
+        logging::log("FATAL: root mount failed");
         syscall::thread_exit();
     }
-    logging::log("init: phase 2: root mounted at /");
+    logging::log("phase 2: root mounted at /");
 
-    logging::log("init: phase 2: reading /config/mounts.conf");
+    logging::log("phase 2: reading /config/mounts.conf");
     let mut conf_buf = [0u8; 512];
     let conf_len = vfs::vfs_read_file(
         vfsd_service_ep,
@@ -427,15 +430,15 @@ fn run(info_ptr: u64) -> !
 
     if conf_len > 0
     {
-        logging::log("init: phase 2: processing mounts.conf");
+        logging::log("phase 2: processing mounts.conf");
         vfs::process_mounts_conf(&conf_buf[..conf_len], vfsd_service_ep, ipc_buf);
     }
     else
     {
-        logging::log("init: phase 2: no mounts.conf or empty");
+        logging::log("phase 2: no mounts.conf or empty");
     }
 
-    logging::log("init: phase 2: verifying /esp/EFI/seraph/boot.conf");
+    logging::log("phase 2: verifying /esp/EFI/seraph/boot.conf");
     let mut verify_buf = [0u8; 512];
     let verify_len = vfs::vfs_read_file(
         vfsd_service_ep,
@@ -456,10 +459,10 @@ fn run(info_ptr: u64) -> !
     }
     else
     {
-        logging::log("init: phase 2: boot.conf read FAILED");
+        logging::log("phase 2: boot.conf read FAILED");
     }
 
-    logging::log("init: phase 2 bootstrap complete");
+    logging::log("phase 2 bootstrap complete");
 
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
 
@@ -484,6 +487,6 @@ pub(crate) fn idle_loop() -> !
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> !
 {
-    logging::log("init: PANIC");
+    logging::log("PANIC");
     syscall::thread_exit();
 }

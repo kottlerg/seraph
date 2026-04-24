@@ -187,12 +187,12 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     let Ok(reply) = (unsafe { ipc::ipc_call(devmgr_ep, &request, ipc_buf) })
     else
     {
-        println!("virtio-blk: QUERY_DEVICE_INFO ipc_call failed");
+        println!("QUERY_DEVICE_INFO ipc_call failed");
         syscall::thread_exit();
     };
     if reply.label != 0
     {
-        println!("virtio-blk: QUERY_DEVICE_INFO returned error");
+        println!("QUERY_DEVICE_INFO returned error");
         syscall::thread_exit();
     }
     VirtioPciStartupInfo::from_words(reply.words())
@@ -238,7 +238,7 @@ fn init_device(transport: &PciTransport) -> u64
     });
     if features.is_none()
     {
-        println!("virtio-blk: feature negotiation failed");
+        println!("feature negotiation failed");
         syscall::thread_exit();
     }
 
@@ -264,7 +264,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     let Some(ring_frame) = request_frames(caps.procmgr_ep, ring_pages, ipc_buf)
     else
     {
-        println!("virtio-blk: failed to allocate ring frames");
+        println!("failed to allocate ring frames");
         syscall::thread_exit();
     };
     if syscall::mem_map(
@@ -277,7 +277,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     )
     .is_err()
     {
-        println!("virtio-blk: ring mem_map failed");
+        println!("ring mem_map failed");
         syscall::thread_exit();
     }
     // SAFETY: RING_MAP_VA is mapped writable, ring_pages * PAGE_SIZE bytes.
@@ -287,7 +287,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     let Ok(ring_phys) = syscall::dma_grant(ring_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
     else
     {
-        println!("virtio-blk: ring dma_grant failed");
+        println!("ring dma_grant failed");
         syscall::thread_exit();
     };
     (ring_phys, ring_pages)
@@ -361,7 +361,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     let Some(data_frame) = request_frames(caps.procmgr_ep, 1, ipc_buf)
     else
     {
-        println!("virtio-blk: failed to allocate data frame");
+        println!("failed to allocate data frame");
         syscall::thread_exit();
     };
 
@@ -375,7 +375,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     )
     .is_err()
     {
-        println!("virtio-blk: data mem_map failed");
+        println!("data mem_map failed");
         syscall::thread_exit();
     }
 
@@ -386,7 +386,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     let Ok(data_phys) = syscall::dma_grant(data_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
     else
     {
-        println!("virtio-blk: data dma_grant failed");
+        println!("data dma_grant failed");
         syscall::thread_exit();
     };
 
@@ -415,7 +415,7 @@ pub struct BlkRuntime<'a>
 /// Handle incoming IPC requests on the service endpoint.
 fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 {
-    println!("virtio-blk: ready, entering service loop");
+    println!("ready, entering service loop");
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -596,6 +596,7 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
 
 fn main() -> !
 {
+    std::os::seraph::register_log_name(b"virtio-blk");
     let info = startup_info();
 
     // IPC buffer was registered by `std::os::seraph::_start`; no need to
@@ -613,22 +614,22 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    println!("virtio-blk: starting");
+    println!("starting");
     if caps.bar_mmio_slot == 0
     {
-        println!("virtio-blk: no BAR MMIO cap");
+        println!("no BAR MMIO cap");
         syscall::thread_exit();
     }
     if caps.procmgr_ep == 0
     {
-        println!("virtio-blk: no procmgr endpoint");
+        println!("no procmgr endpoint");
         syscall::thread_exit();
     }
 
     // Query devmgr for VirtIO PCI capability locations via IPC.
     if caps.devmgr_ep == 0
     {
-        println!("virtio-blk: no devmgr query endpoint");
+        println!("no devmgr query endpoint");
         syscall::thread_exit();
     }
     let pci_info = query_device_info(caps.devmgr_ep, ipc_buf);
@@ -636,14 +637,14 @@ fn main() -> !
     // Map BAR MMIO.
     if syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, BAR_MAP_VA, 0).is_err()
     {
-        println!("virtio-blk: BAR mmio_map failed");
+        println!("BAR mmio_map failed");
         syscall::thread_exit();
     }
 
     // Create PCI transport and initialise device.
     let transport = PciTransport::new(BAR_MAP_VA, &pci_info);
     let capacity = init_device(&transport);
-    println!("virtio-blk: capacity (sectors)={capacity:#018x}");
+    println!("capacity (sectors)={capacity:#018x}");
 
     // Set up virtqueue and data buffer.
     let (mut vq, queue_notify_off) = setup_virtqueue(&transport, &caps, ipc_buf);
@@ -651,23 +652,23 @@ fn main() -> !
     // DRIVER_OK.
     transport
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
-    println!("virtio-blk: device ready");
+    println!("device ready");
 
     // Set up IRQ-driven completion: create a signal and bind it to the IRQ.
     if caps.irq_slot == 0
     {
-        println!("virtio-blk: no IRQ cap, cannot operate");
+        println!("no IRQ cap, cannot operate");
         syscall::thread_exit();
     }
     let Ok(irq_signal) = syscall::cap_create_signal()
     else
     {
-        println!("virtio-blk: failed to create IRQ signal");
+        println!("failed to create IRQ signal");
         syscall::thread_exit();
     };
     if syscall::irq_register(caps.irq_slot, irq_signal).is_err()
     {
-        println!("virtio-blk: irq_register failed");
+        println!("irq_register failed");
         syscall::thread_exit();
     }
     // Unmask the interrupt at the controller (IOAPIC/PLIC).
@@ -688,15 +689,15 @@ fn main() -> !
         irq_cap,
     )
     {
-        println!("virtio-blk: sector 0 test read failed");
+        println!("sector 0 test read failed");
         syscall::thread_exit();
     }
-    println!("virtio-blk: sector 0 read OK");
+    println!("sector 0 read OK");
 
     // Enter service loop.
     if caps.service_ep == 0
     {
-        println!("virtio-blk: no service endpoint, entering idle loop");
+        println!("no service endpoint, entering idle loop");
         loop
         {
             let _ = syscall::thread_yield();

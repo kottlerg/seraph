@@ -131,6 +131,80 @@ impl ProcessTable
             .find(|e| e.token == token)
             .map(|e| e.started)
     }
+
+    /// Install stdio caps on a suspended child identified by `token`.
+    ///
+    /// Looks up the entry, confirms the child has not yet been started,
+    /// remaps its `ProcessInfo` frame writable in procmgr's own aspace,
+    /// `cap_copy`s each non-zero stdio cap from procmgr's `CSpace` into
+    /// the child's `CSpace` with the appropriate rights (`RIGHTS_SEND` for
+    /// stdout/stderr, `RIGHTS_RECEIVE` for stdin), writes the resulting
+    /// slot indices into the PI page, and unmaps.
+    ///
+    /// Idempotent before start — later calls overwrite earlier slots.
+    ///
+    /// # Errors
+    /// - `procmgr_errors::INVALID_TOKEN` — no entry for `token`.
+    /// - `procmgr_errors::ALREADY_STARTED` — target is already running.
+    /// - `procmgr_errors::OUT_OF_MEMORY` — mapping / `cap_copy` failure.
+    pub fn configure_stdio(
+        &mut self,
+        token: u64,
+        self_aspace: u32,
+        stdout: u32,
+        stderr: u32,
+        stdin: u32,
+    ) -> Result<(), u64>
+    {
+        let entry = self
+            .find_mut_by_token(token)
+            .ok_or(procmgr_errors::INVALID_TOKEN)?;
+        if entry.started
+        {
+            return Err(procmgr_errors::ALREADY_STARTED);
+        }
+        let pi_frame = entry.pi_frame_cap;
+        let child_cspace = entry.cspace_cap;
+
+        // Remap the PI frame writable in procmgr's aspace so we can poke
+        // stdio slots. Safe: the child has not started (checked above), so
+        // there's no reader of the PI page yet.
+        syscall::mem_map(
+            pi_frame,
+            self_aspace,
+            TEMP_FRAME_VA,
+            0,
+            1,
+            syscall::MAP_WRITABLE,
+        )
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+
+        // SAFETY: TEMP_FRAME_VA is mapped writable for one page; PI struct
+        // lives at offset 0 per the ABI.
+        let pi = unsafe { process_abi::process_info_mut(TEMP_FRAME_VA) };
+
+        if stdout != 0
+        {
+            let slot = syscall::cap_copy(stdout, child_cspace, syscall::RIGHTS_SEND)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            pi.stdout_cap = slot;
+        }
+        if stderr != 0
+        {
+            let slot = syscall::cap_copy(stderr, child_cspace, syscall::RIGHTS_SEND)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            pi.stderr_cap = slot;
+        }
+        if stdin != 0
+        {
+            let slot = syscall::cap_copy(stdin, child_cspace, syscall::RIGHTS_RECEIVE)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            pi.stdin_cap = slot;
+        }
+
+        let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+        Ok(())
+    }
 }
 
 // ── Result type ─────────────────────────────────────────────────────────────
@@ -148,15 +222,17 @@ pub struct CreateResult
 
 /// Universal bootstrap caps procmgr threads through into every child.
 ///
-/// `procmgr_endpoint` is procmgr's own service endpoint (the child receives
-/// a tokened SEND copy so it can call `REQUEST_FRAMES`). `log_endpoint` is
-/// the un-tokened SEND cap procmgr holds on the system log endpoint;
-/// procmgr derives per-child tokened SEND caps from it for stdout/stderr.
-/// Zero `log_endpoint` means no log sink is available (very early boot).
+/// Only procmgr's own service endpoint. The child receives a tokened SEND
+/// copy so it can call `REQUEST_FRAMES` / `MINT_LOG_CAP` / `CREATE_PROCESS`.
+///
+/// Stdio caps (stdin, stdout, stderr) are intentionally NOT part of this
+/// struct: they are not a universal property of processes, and each can
+/// route to a different endpoint. A spawner that wants the child to have
+/// any stdio wiring installs it via the separate `CONFIGURE_STDIO` IPC
+/// between `CREATE_PROCESS` and `START_PROCESS`.
 pub struct UniversalCaps
 {
     pub procmgr_endpoint: u32,
-    pub log_endpoint: u32,
 }
 
 /// Program arguments delivered to a child process at spawn time.
@@ -181,24 +257,6 @@ pub struct ChildEnv<'a>
 {
     pub blob: &'a [u8],
     pub count: u32,
-}
-
-/// Per-child stdio configuration accompanying a `CREATE_PROCESS` call.
-///
-/// `stdio_token` is the unforgeable identity attached to the child's
-/// stdout/stderr SEND caps via `cap_derive_token`. The receiver of the
-/// stdio bytes (currently init's log thread, later logd) reads this token
-/// from each IPC message to attribute the bytes to a sender. Zero means
-/// "anonymous" — procmgr falls back to an un-tokened SEND copy.
-///
-/// `stdin_cap` is the RECEIVE-side cap the child uses for `std::io::stdin`.
-/// Zero means "no stdin attached"; reads return EOF immediately. Common
-/// case for services spawned by init or svcmgr.
-#[derive(Clone, Copy, Default)]
-pub struct ChildStdio
-{
-    pub stdio_token: u64,
-    pub stdin_cap: u32,
 }
 
 /// TLS template metadata extracted from a child's `PT_TLS` segment,
@@ -226,11 +284,15 @@ pub struct MainTls
 
 /// Populate a `ProcessInfo` page for a child process and map it read-only.
 ///
-/// Installs the creator endpoint cap (if any) into the child `CSpace` and
-/// records its slot in the child's `ProcessInfo`. Also installs the two
-/// universal caps (procmgr service endpoint + log endpoint) so the child's
-/// `_start` can bootstrap the heap and log without a service-specific
-/// bootstrap round. Caps supplied as zero are propagated as zero.
+/// Installs the creator endpoint cap (if any) and the procmgr service
+/// endpoint into the child `CSpace` and records their slots in the child's
+/// `ProcessInfo`. Stdio slots (`stdin_cap`, `stdout_cap`, `stderr_cap`)
+/// are left zero here and are populated afterwards by
+/// [`configure_stdio`], which remaps the same `pi_frame` writable, installs
+/// caller-supplied caps via `cap_copy` into the child's `CSpace`, and
+/// writes the slot indices into the PI page. This split keeps the core
+/// `CREATE_PROCESS` path stdio-agnostic and lets spawners route stdout
+/// and stderr independently.
 // similar_names: child_aspace/child_cspace are intentionally parallel.
 // too_many_arguments: each cluster is a small fixed-size bundle; collapsing
 // them into one struct shifts the verbosity to the call sites without
@@ -254,7 +316,6 @@ fn populate_child_info(
     tls: &ChildTlsTemplate,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
-    stdio: &ChildStdio,
 ) -> Option<u32>
 {
     let pi_frame = pool.alloc_page()?;
@@ -310,45 +371,11 @@ fn populate_child_info(
         0
     };
 
-    // Per-child stdio caps. stdout and stderr are derived from the log
-    // endpoint with the per-spawn token so the receiver can attribute
-    // bytes to a sender without on-wire self-identification. They share
-    // the same kernel cap (different CSpace slots, same underlying
-    // endpoint + token). stdin is the RECV cap the spawner produced for
-    // this child, or zero (EOF on read).
-    let (stdout_in_child, stderr_in_child) = if universals.log_endpoint != 0
-    {
-        let intermediate = if stdio.stdio_token != 0
-        {
-            syscall::cap_derive_token(
-                universals.log_endpoint,
-                syscall::RIGHTS_SEND,
-                stdio.stdio_token,
-            )
-            .ok()?
-        }
-        else
-        {
-            syscall::cap_derive(universals.log_endpoint, syscall::RIGHTS_SEND).ok()?
-        };
-        let out_slot = syscall::cap_copy(intermediate, child_cspace, syscall::RIGHTS_SEND).ok()?;
-        let err_slot = syscall::cap_copy(intermediate, child_cspace, syscall::RIGHTS_SEND).ok()?;
-        let _ = syscall::cap_delete(intermediate);
-        (out_slot, err_slot)
-    }
-    else
-    {
-        (0, 0)
-    };
-
-    let stdin_in_child = if stdio.stdin_cap != 0
-    {
-        syscall::cap_copy(stdio.stdin_cap, child_cspace, syscall::RIGHTS_RECEIVE).ok()?
-    }
-    else
-    {
-        0
-    };
+    // Stdio caps are not installed here — CONFIGURE_STDIO remaps this
+    // same pi_frame writable and fills them in before the child is
+    // started. Leave the PI slots as zero so a child that ships without a
+    // CONFIGURE_STDIO call sees "no stream attached" (silent println!,
+    // EOF on stdin read).
 
     // SAFETY: TEMP_FRAME_VA is page-aligned and mapped writable.
     let pi = unsafe { process_abi::process_info_mut(TEMP_FRAME_VA) };
@@ -359,9 +386,9 @@ fn populate_child_info(
     pi.ipc_buffer_vaddr = CHILD_IPC_BUF_VA;
     pi.creator_endpoint_cap = creator_ep_in_child;
     pi.procmgr_endpoint_cap = procmgr_ep_in_child;
-    pi.stdin_cap = stdin_in_child;
-    pi.stdout_cap = stdout_in_child;
-    pi.stderr_cap = stderr_in_child;
+    pi.stdin_cap = 0;
+    pi.stdout_cap = 0;
+    pi.stderr_cap = 0;
     pi.tls_template_vaddr = tls.vaddr;
     pi.tls_template_filesz = tls.filesz;
     pi.tls_template_memsz = tls.memsz;
@@ -720,7 +747,6 @@ fn create_process_from_bytes(
     universals: &UniversalCaps,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
-    stdio: &ChildStdio,
     death_eq: u32,
 ) -> Option<CreateResult>
 {
@@ -805,7 +831,6 @@ fn create_process_from_bytes(
         &tls_template,
         args,
         env,
-        stdio,
     )?;
     map_child_stack_and_ipc(pool, child_aspace)?;
 
@@ -838,7 +863,6 @@ pub fn create_process(
     universals: &UniversalCaps,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
-    stdio: &ChildStdio,
     death_eq: u32,
 ) -> Option<CreateResult>
 {
@@ -859,7 +883,6 @@ pub fn create_process(
         universals,
         args,
         env,
-        stdio,
         death_eq,
     );
 
@@ -1076,7 +1099,6 @@ pub fn create_process_from_vfs(
     creator_endpoint: u32,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
-    stdio: &ChildStdio,
     death_eq: u32,
 ) -> Result<CreateResult, u64>
 {
@@ -1224,7 +1246,6 @@ pub fn create_process_from_vfs(
 
     let universals = UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
-        log_endpoint: ctx.log_ep,
     };
     let pi_frame_cap = populate_child_info(
         pool,
@@ -1237,7 +1258,6 @@ pub fn create_process_from_vfs(
         &tls_template,
         args,
         env,
-        stdio,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     map_child_stack_and_ipc(pool, child_aspace).ok_or(procmgr_errors::OUT_OF_MEMORY)?;

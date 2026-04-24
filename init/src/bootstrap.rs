@@ -58,7 +58,7 @@ fn load_elf_page(
     let Some(frame_cap) = alloc.alloc_page()
     else
     {
-        log("init: ELF load: frame alloc failed");
+        log("ELF load: frame alloc failed");
         return None;
     };
 
@@ -72,7 +72,7 @@ fn load_elf_page(
     )
     .is_err()
     {
-        log("init: ELF load: temp map failed");
+        log("ELF load: temp map failed");
         return None;
     }
 
@@ -183,9 +183,9 @@ struct ProcmgrCaps
 /// Populate procmgr's `ProcessInfo` page and map it read-only into procmgr.
 ///
 /// procmgr is `no_std` and doesn't drive `std::io::stdio`, so the three
-/// stdio cap slots are left zero. Procmgr receives the un-tokened log SEND
-/// it needs (for deriving per-child tokened stdio caps) via its bootstrap
-/// round, not via `ProcessInfo`.
+/// stdio cap slots are left zero. The log endpoint procmgr needs (as the
+/// dispensing source for `MINT_LOG_CAP`) arrives via its bootstrap round,
+/// not via `ProcessInfo`.
 #[allow(clippy::similar_names)]
 fn populate_procmgr_info(
     alloc: &mut FrameAlloc,
@@ -262,8 +262,10 @@ pub struct ProcmgrBootstrap
     /// Memory pool count.
     pub memory_frame_count: u32,
     /// Slot in procmgr's `CSpace` holding an un-tokened SEND cap on the
-    /// system log endpoint. Procmgr derives per-child tokened SEND caps
-    /// from this for stdout/stderr. Zero when no log sink is available.
+    /// system log endpoint. Procmgr uses this exclusively as the dispensing
+    /// source for `MINT_LOG_CAP` requests — it does not consult it during
+    /// `CREATE_PROCESS`. Zero when no log endpoint is available (very early
+    /// boot); `MINT_LOG_CAP` refuses requests in that window.
     pub log_endpoint_slot: u32,
 }
 
@@ -322,13 +324,13 @@ pub fn bootstrap_procmgr(
     let pm_cspace = syscall::cap_create_cspace(8192).ok()?;
     let pm_thread = syscall::cap_create_thread(pm_aspace, pm_cspace).ok()?;
 
-    log("init: created procmgr kernel objects");
-    log("init: loading procmgr ELF segments");
+    log("created procmgr kernel objects");
+    log("loading procmgr ELF segments");
 
     let entry = load_elf(module_bytes, pm_aspace, alloc, init_aspace)?;
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
 
-    log("init: loaded procmgr ELF");
+    log("loaded procmgr ELF");
 
     // Derive tokened creator endpoint for procmgr.
     let procmgr_token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -352,10 +354,11 @@ pub fn bootstrap_procmgr(
     }
     alloc.next_idx += frames_to_give;
 
-    // Derive an un-tokened SEND cap on the log endpoint, kept in init's CSpace.
-    // Sent to procmgr via the bootstrap round (ipc transfer moves it into
-    // procmgr's CSpace at a fresh slot). Procmgr uses it as the source for
-    // `cap_derive_token` per-child to mint stdout/stderr caps.
+    // Derive an un-tokened SEND cap on the log endpoint for procmgr's
+    // dispensing role (source for `MINT_LOG_CAP`). Kept in init's CSpace
+    // and sent to procmgr via the bootstrap round (ipc transfer moves it
+    // into procmgr's CSpace at a fresh slot). Procmgr never uses this cap
+    // during `CREATE_PROCESS` — only when servicing `MINT_LOG_CAP`.
     let pm_log_send = if log_ep == 0
     {
         0
@@ -378,7 +381,7 @@ pub fn bootstrap_procmgr(
     syscall::thread_configure(pm_thread, entry, PROCESS_STACK_TOP, PROCESS_INFO_VADDR).ok()?;
     syscall::thread_start(pm_thread).ok()?;
 
-    log("init: procmgr started");
+    log("procmgr started");
 
     // Derive a send cap to procmgr's service endpoint for init's own use.
     let service_ep_for_init =

@@ -40,16 +40,22 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
-    /// Create a new process from a boot module frame.
+    /// Create a new process from a boot module frame. Caps: `[module,
+    /// creator_endpoint?]`. Stdio (stdout/stderr/stdin) is configured
+    /// through a separate [`CONFIGURE_STDIO`] call against the returned
+    /// tokened `process_handle` — procmgr's CREATE path carries no stdio
+    /// caps so stdout and stderr can be routed independently and so the
+    /// core process-creation primitive has no logging concept baked in.
     pub const CREATE_PROCESS: u64 = 1;
     /// Start a previously created (suspended) process.
     pub const START_PROCESS: u64 = 2;
     /// Request physical memory frames from procmgr's pool.
     pub const REQUEST_FRAMES: u64 = 5;
     /// Create a new process from a VFS path (ELF binary). Wire format
-    /// carries `stdio_token`, the path, and optional argv + env blobs;
-    /// see procmgr's `handle_create_from_vfs` for the full label and data
-    /// layout.
+    /// carries the path plus optional argv + env blobs; see procmgr's
+    /// `handle_create_from_vfs` for the full label and data layout. Caps:
+    /// `[creator_endpoint?]`. Stdio via [`CONFIGURE_STDIO`] as for
+    /// `CREATE_PROCESS`.
     pub const CREATE_FROM_VFS: u64 = 6;
     /// Provide procmgr with the vfsd endpoint for VFS-based loading.
     pub const SET_VFSD_EP: u64 = 7;
@@ -69,6 +75,37 @@ pub mod procmgr_labels
     /// tools and `std::process::Child::try_wait`-style probes that want to
     /// peek without blocking on a death event.
     pub const QUERY_PROCESS: u64 = 9;
+    /// Mint a fresh tokened SEND cap on the system log endpoint.
+    ///
+    /// Request: empty. Reply: one cap — a SEND cap on the log endpoint with
+    /// a procmgr-minted unique token identifying this caller's log stream.
+    /// Callers typically `cap_copy` the returned cap into a second `CSpace`
+    /// slot with the same rights so both stdout and stderr of the spawned
+    /// child can be wired through [`CONFIGURE_STDIO`] to the same
+    /// tokened sink (both write sites appear under the same mediator name).
+    ///
+    /// procmgr performs no authorization beyond cap possession: any holder
+    /// of a SEND cap on procmgr's service endpoint may call this. The
+    /// capability itself is the authorization.
+    pub const MINT_LOG_CAP: u64 = 10;
+    /// Install per-child stdio caps on a process created via
+    /// [`CREATE_PROCESS`] / [`CREATE_FROM_VFS`] but not yet started.
+    ///
+    /// Request: caller invokes on the tokened `process_handle` returned by
+    /// the creation call; procmgr uses `recv.token` to find the entry.
+    /// Caps (positional, trailing zeros omitted): `[stdout_cap?,
+    /// stderr_cap?, stdin_cap?]`. procmgr installs each verbatim into the
+    /// corresponding slot of the child's `ProcessInfo` (stdout/stderr
+    /// with `RIGHTS_SEND`; stdin with `RIGHTS_RECEIVE`). All three are
+    /// independent — callers that want stdout and stderr routed differently
+    /// pass two distinct caps; callers that want the same sink pass two
+    /// `cap_copy`'d views of one cap.
+    ///
+    /// Ordering: valid only between `CREATE_PROCESS` and `START_PROCESS`.
+    /// Replies `ALREADY_STARTED` if the target is running.
+    /// `INVALID_TOKEN` if the `process_handle` is unknown. Idempotent before
+    /// start; later calls overwrite earlier slots.
+    pub const CONFIGURE_STDIO: u64 = 11;
 }
 
 /// Process-state codes returned by `procmgr_labels::QUERY_PROCESS`.
@@ -185,6 +222,15 @@ pub mod stream_labels
 {
     /// Base label ID for stream-bytes messages (bits 0-15).
     pub const STREAM_BYTES: u64 = 10;
+    /// Register (or update) the display name for the sender's log stream.
+    ///
+    /// Payload: name bytes via `.bytes(0, name)` with byte length in bits
+    /// 16-31 of the label, same encoding as `STREAM_BYTES`. The mediator
+    /// looks up the slot for the sender's token (delivered by the kernel
+    /// from the tokened SEND cap) and stores the bytes as that slot's
+    /// display name. Idempotent — later registrations replace earlier.
+    /// Names longer than the mediator's per-slot buffer are truncated.
+    pub const STREAM_REGISTER_NAME: u64 = 11;
 }
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────

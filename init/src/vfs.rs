@@ -163,19 +163,19 @@ pub fn vfs_read_file(vfsd_ep: u32, ipc_buf: *mut u64, path: &[u8], buf: &mut [u8
     let Ok(open_reply) = (unsafe { ipc::ipc_call(vfsd_ep, &open_msg, ipc_buf) })
     else
     {
-        log("init: vfs_read: OPEN failed");
+        log("vfs_read: OPEN failed");
         return 0;
     };
     if open_reply.label != 0
     {
-        log("init: vfs_read: OPEN error (not found?)");
+        log("vfs_read: OPEN error (not found?)");
         return 0;
     }
 
     let caps = open_reply.caps();
     if caps.is_empty()
     {
-        log("init: vfs_read: OPEN returned no file cap");
+        log("vfs_read: OPEN returned no file cap");
         return 0;
     }
     let file_cap = caps[0];
@@ -191,13 +191,13 @@ pub fn vfs_read_file(vfsd_ep: u32, ipc_buf: *mut u64, path: &[u8], buf: &mut [u8
     let Ok(read_reply) = (unsafe { ipc::ipc_call(file_cap, &read_msg, ipc_buf) })
     else
     {
-        log("init: vfs_read: READ failed");
+        log("vfs_read: READ failed");
         let _ = syscall::cap_delete(file_cap);
         return 0;
     };
     if read_reply.label != 0
     {
-        log("init: vfs_read: READ error");
+        log("vfs_read: READ error");
         let _ = syscall::cap_delete(file_cap);
         return 0;
     }
@@ -260,7 +260,7 @@ pub fn process_mounts_conf(data: &[u8], vfsd_ep: u32, ipc_buf: *mut u64)
         if line.len() < 43 || &line[..5] != b"UUID="
         {
             // Unrecognised line — log and skip.
-            log("init: mounts.conf: skipping unrecognised line");
+            log("mounts.conf: skipping unrecognised line");
             continue;
         }
 
@@ -268,7 +268,7 @@ pub fn process_mounts_conf(data: &[u8], vfsd_ep: u32, ipc_buf: *mut u64)
         let mut uuid = [0u8; 16];
         if !parse_uuid_to_gpt_bytes(uuid_str, &mut uuid)
         {
-            log("init: mounts.conf: invalid UUID");
+            log("mounts.conf: invalid UUID");
             continue;
         }
 
@@ -286,11 +286,11 @@ pub fn process_mounts_conf(data: &[u8], vfsd_ep: u32, ipc_buf: *mut u64)
 
         if send_mount(vfsd_ep, ipc_buf, &uuid, mount_path)
         {
-            log("init: mounts.conf: mount ok");
+            log("mounts.conf: mount ok");
         }
         else
         {
-            log("init: mounts.conf: mount failed");
+            log("mounts.conf: mount failed");
         }
     }
 }

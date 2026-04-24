@@ -49,11 +49,11 @@ static TLS_COUNTER: Cell<u32> = Cell::new(0);
 
 fn main()
 {
-    // std::os::seraph::_start wires log_endpoint + heap from ProcessInfo
-    // (universal caps), so `println!` and the System allocator are live on
-    // entry. init still serves an empty terminal bootstrap round for
-    // protocol parity; we consume it to keep the creator from hanging on a
-    // pending REQUEST.
+    std::os::seraph::register_log_name(b"usertest");
+    // std::os::seraph::_start wires stdout cap + heap from ProcessInfo,
+    // so `println!` and the System allocator are live on entry. init still
+    // serves an empty terminal bootstrap round for protocol parity; we
+    // consume it to keep the creator from hanging on a pending REQUEST.
     let info = startup_info();
     if info.creator_endpoint != 0
     {
@@ -65,7 +65,7 @@ fn main()
         let _ = unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) };
     }
 
-    println!("usertest: starting");
+    println!("starting");
 
     args_phase();
     env_phase();
@@ -82,7 +82,7 @@ fn main()
     stack_overflow_phase();
     shmem_phase();
 
-    println!("usertest: PASS");
+    println!("PASS");
 }
 
 /// Verify the main-thread stack guard page. Spawns `/bin/stackoverflow`
@@ -111,10 +111,10 @@ fn stack_overflow_phase()
         .expect("spawn /bin/stackoverflow failed");
 
     let id = child.id();
-    println!("usertest: spawned /bin/stackoverflow handle={id:#x}");
+    println!("spawned /bin/stackoverflow handle={id:#x}");
 
     let status = child.wait().expect("stackoverflow wait failed");
-    println!("usertest: stackoverflow exited: {status}");
+    println!("stackoverflow exited: {status}");
 
     assert!(
         !status.success(),
@@ -129,7 +129,7 @@ fn stack_overflow_phase()
         "expected fault exit_reason in 0x1000..0x2000, got {raw:#x}"
     );
 
-    println!("usertest: stack_overflow phase passed (exit_reason={raw:#x})");
+    println!("stack_overflow phase passed (exit_reason={raw:#x})");
 }
 
 /// Sanity-check the `shmem::SpscRing` in-process: build a ring over a
@@ -186,7 +186,7 @@ fn shmem_phase()
     assert_eq!(drained, CAP, "reader must drain capacity");
     assert!(sink.iter().all(|&b| b == 0xAA), "drained bytes mismatch");
 
-    println!("usertest: shmem phase passed");
+    println!("shmem phase passed");
 }
 
 /// Verify `std::env::args()` returns exactly what init wrote into the
@@ -198,7 +198,7 @@ fn args_phase()
     let collected: Vec<String> = std::env::args().collect();
     for (i, a) in collected.iter().enumerate()
     {
-        println!("usertest: argv[{i}]={a:?}");
+        println!("argv[{i}]={a:?}");
     }
     assert_eq!(
         collected.len(),
@@ -208,7 +208,7 @@ fn args_phase()
     );
     assert_eq!(collected[0], "usertest", "argv[0] mismatch");
     assert_eq!(collected[1], "run", "argv[1] mismatch");
-    println!("usertest: args phase passed");
+    println!("args phase passed");
 }
 
 /// Exercise `std::env::{var, vars, set_var, remove_var}`.
@@ -266,7 +266,7 @@ fn env_phase()
     assert!(env::var("FOO").is_err(), "removed key must return Err");
     assert_eq!(env::vars().count(), 3, "three entries must remain");
 
-    println!("usertest: env phase passed");
+    println!("env phase passed");
 }
 
 /// Verify the main thread sees the template-initialised value of a
@@ -277,8 +277,8 @@ fn tls_main_phase()
 {
     let init = TLS_INIT;
     let bss = TLS_BSS;
-    println!("usertest: TLS_INIT ={init:#018x}");
-    println!("usertest: TLS_BSS  ={bss:#018x}");
+    println!("TLS_INIT ={init:#018x}");
+    println!("TLS_BSS  ={bss:#018x}");
     assert_eq!(init, 0xDEAD_BEEF_CAFE_BABE, "TLS_INIT tdata readback");
     assert_eq!(bss, 0, "TLS_BSS tbss readback");
     for i in 1..=4u32
@@ -286,14 +286,14 @@ fn tls_main_phase()
         TLS_COUNTER.set(i);
         assert_eq!(TLS_COUNTER.get(), i, "TLS_COUNTER set/get");
     }
-    println!("usertest: TLS main-thread phase passed");
+    println!("TLS main-thread phase passed");
 }
 
 /// Exercise the allocator across the canonical collection types.
 fn alloc_phase()
 {
     let boxed: Box<u64> = Box::new(0xDEAD_BEEF_CAFE_BABE);
-    println!("usertest: Box<u64>={:#018x}", *boxed);
+    println!("Box<u64>={:#018x}", *boxed);
 
     let mut v: Vec<u64> = Vec::new();
     for i in 0u64..64
@@ -301,33 +301,33 @@ fn alloc_phase()
         v.push(i);
     }
     let sum: u64 = v.iter().sum();
-    println!("usertest: Vec sum(0..64)={sum:#018x}");
+    println!("Vec sum(0..64)={sum:#018x}");
     let popped = v.pop().unwrap_or(0);
-    println!("usertest: Vec::pop={popped:#018x}");
+    println!("Vec::pop={popped:#018x}");
 
     let mut s = String::new();
     for _ in 0..8
     {
         s.push_str("seraph ");
     }
-    println!("usertest: String::len={:#018x}", s.len() as u64);
+    println!("String::len={:#018x}", s.len() as u64);
 
     let mut m: BTreeMap<u64, u64> = BTreeMap::new();
     for k in 0u64..16
     {
         m.insert(k, k * 100);
     }
-    println!("usertest: BTreeMap::len={:#018x}", m.len() as u64);
+    println!("BTreeMap::len={:#018x}", m.len() as u64);
     if let Some(&v10) = m.get(&10)
     {
-        println!("usertest: BTreeMap[10]={v10:#018x}");
+        println!("BTreeMap[10]={v10:#018x}");
     }
 
     drop(boxed);
     drop(v);
     drop(s);
     drop(m);
-    println!("usertest: dealloc churn complete");
+    println!("dealloc churn complete");
 }
 
 /// Stress-test the free-list allocator across many alloc/dealloc pairs at
@@ -385,7 +385,7 @@ fn churn_phase()
         }
     }
     drop(keep);
-    println!("usertest: churn phase passed ({ITERS} iters)");
+    println!("churn phase passed ({ITERS} iters)");
 }
 
 /// Exercise the allocator's grow-on-failure path. Allocates a buffer
@@ -443,7 +443,7 @@ fn alloc_grow_phase()
     let post: Vec<u32> = (0..4096u32).collect();
     assert_eq!(post.last().copied(), Some(4095));
 
-    println!("usertest: alloc_grow phase passed ({BIG} bytes + 8 KiB interleaved)");
+    println!("alloc_grow phase passed ({BIG} bytes + 8 KiB interleaved)");
 }
 
 /// Minimum-viable threading test: two workers each increment a shared
@@ -475,7 +475,7 @@ fn threading_phase()
 
     let final_value = *counter.lock().expect("mutex poisoned");
     println!(
-        "usertest: threading workers joined, counter={:#018x} expected={:#018x}",
+        "threading workers joined, counter={:#018x} expected={:#018x}",
         u64::from(final_value),
         u64::from(2 * ITERS),
     );
@@ -485,7 +485,7 @@ fn threading_phase()
         "threading test: counter mismatch (expected {})",
         2 * ITERS
     );
-    println!("usertest: threading phase passed");
+    println!("threading phase passed");
 }
 
 /// Regression guard for the per-thread stdio IPC buffer invariant.
@@ -501,10 +501,10 @@ fn threading_phase()
 fn stdio_spawned_phase()
 {
     let handle = thread::spawn(|| {
-        println!("usertest: stdio_spawned marker line");
+        println!("stdio_spawned marker line");
     });
     handle.join().expect("stdio_spawned worker thread panicked");
-    println!("usertest: stdio_spawned phase passed");
+    println!("stdio_spawned phase passed");
 }
 
 /// Regression guard for the per-thread IPC buffer invariant in the
@@ -542,7 +542,7 @@ fn alloc_spawned_phase()
         }
     });
     handle.join().expect("alloc_spawned worker thread panicked");
-    println!("usertest: alloc_spawned phase passed ({BIG} bytes)");
+    println!("alloc_spawned phase passed ({BIG} bytes)");
 }
 
 /// Exercise the `thread_local!` macro. This drives the `LazyStorage` +
@@ -571,7 +571,7 @@ fn tls_macro_phase()
         c.set(v);
         s
     });
-    println!("usertest: thread_local! Vec<u32> sum(0..8)={sum:#018x}");
+    println!("thread_local! Vec<u32> sum(0..8)={sum:#018x}");
     assert_eq!(sum, 28, "thread_local! macro sum mismatch");
 
     let handle = thread::spawn(|| {
@@ -595,8 +595,8 @@ fn tls_macro_phase()
     let (was_empty, got) = handle.join().expect("tls_macro child panicked");
     assert!(was_empty, "child thread_local! should start empty");
     assert_eq!(got, 0xAAu32 + 0xBBu32, "child thread_local! sum mismatch");
-    println!("usertest: thread_local! child sum={got:#018x}");
-    println!("usertest: thread_local! macro phase passed");
+    println!("thread_local! child sum={got:#018x}");
+    println!("thread_local! macro phase passed");
 }
 
 /// Exercise `Condvar::wait_timeout` over the kernel's `SYS_SIGNAL_WAIT`
@@ -624,7 +624,7 @@ fn timeout_phase()
         "timeout returned too early: {elapsed:?}",
     );
     println!(
-        "usertest: wait_timeout: timed_out after {:#x} us",
+        "wait_timeout: timed_out after {:#x} us",
         u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
     );
 
@@ -656,10 +656,10 @@ fn timeout_phase()
         "notify did not wake early: {elapsed:?}",
     );
     println!(
-        "usertest: wait_timeout: notified after {:#x} us",
+        "wait_timeout: notified after {:#x} us",
         u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
     );
-    println!("usertest: timeout phase passed");
+    println!("timeout phase passed");
 }
 
 /// Exercise `std::process::Command::spawn` + `Child::wait`.
@@ -691,7 +691,7 @@ fn spawn_phase()
         .expect("spawn /bin/hello failed");
 
     let id = child.id();
-    println!("usertest: spawned /bin/hello handle={id:#x}");
+    println!("spawned /bin/hello handle={id:#x}");
 
     // Exercise procmgr's QUERY_PROCESS IPC before reaping: the child is
     // post-spawn, pre-drop, so procmgr's ProcessTable still has an entry
@@ -720,11 +720,11 @@ fn spawn_phase()
             "expected ALIVE for live child, got {state}"
         );
         assert_eq!(exit_reason, 0, "ALIVE process must report exit_reason=0");
-        println!("usertest: query_process (ALIVE) passed");
+        println!("query_process (ALIVE) passed");
     }
 
     let status = child.wait().expect("child wait failed");
-    println!("usertest: child exited: {status}");
+    println!("child exited: {status}");
     assert!(
         status.success(),
         "child /bin/hello did not exit cleanly: {status}"
@@ -737,7 +737,7 @@ fn spawn_phase()
         again.is_some(),
         "try_wait after wait must surface cached status"
     );
-    println!("usertest: try_wait phase passed");
+    println!("try_wait phase passed");
 
-    println!("usertest: spawn phase passed");
+    println!("spawn phase passed");
 }

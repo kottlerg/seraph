@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader};
 
 fn main()
 {
+    std::os::seraph::register_log_name(b"stdiotest");
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
@@ -27,12 +28,12 @@ fn main()
         Ok(n) => n,
         Err(e) =>
         {
-            eprintln!("stdiotest: read stdin failed: {e}");
+            eprintln!("read stdin failed: {e}");
             return;
         }
     };
     let trimmed = line.trim_end_matches('\n');
-    println!("stdiotest: got {n} bytes: {trimmed:?}");
-    println!("stdiotest: shouted: {}", trimmed.to_uppercase());
-    println!("stdiotest: PASS");
+    println!("got {n} bytes: {trimmed:?}");
+    println!("shouted: {}", trimmed.to_uppercase());
+    println!("PASS");
 }

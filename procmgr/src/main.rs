@@ -26,8 +26,17 @@ mod frames;
 mod loader;
 mod process;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use frames::FramePool;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+/// Monotonic source for per-child log stream tokens minted via
+/// `MINT_LOG_CAP`. Starts at 1024 so tokens never collide with init's
+/// reserved range (1..=16) for services init creates directly before
+/// procmgr's service loop is running. TODO: replace with RNG once kernel
+/// exposes a getrandom/ElapsedUs-seeded mixer.
+static NEXT_LOG_TOKEN: AtomicU64 = AtomicU64::new(1024);
 use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, ProcessInfo, StartupInfo, process_info_ref,
 };
@@ -98,10 +107,11 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 
 /// Init → procmgr bootstrap plan (one round):
 ///   caps[0]: service endpoint (procmgr receives requests on this)
-///   caps[1]: un-tokened SEND cap on the system log endpoint. procmgr
-///            uses this as the source for `cap_derive_token` when
-///            producing per-child stdout/stderr caps. Zero means no log
-///            sink — children get zero stdio caps (silent drops).
+///   caps[1]: full-rights copy of the system log endpoint. procmgr holds
+///            this solely as the dispensing source for `MINT_LOG_CAP`; it
+///            is not consulted during `CREATE_PROCESS`. Zero means no log
+///            endpoint is available yet and `MINT_LOG_CAP` will refuse
+///            requests in that window.
 ///   data word 0: `memory_frame_base`
 ///   data word 1: `memory_frame_count`
 struct InitBootstrap
@@ -253,6 +263,16 @@ fn main(startup: &StartupInfo) -> !
                 }
             }
 
+            procmgr_labels::MINT_LOG_CAP =>
+            {
+                handle_mint_log_cap(ctx.log_ep, ipc_buf);
+            }
+
+            procmgr_labels::CONFIGURE_STDIO =>
+            {
+                handle_configure_stdio(&req, ipc_buf, ctx.self_aspace, &mut table);
+            }
+
             _ =>
             {
                 reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
@@ -267,6 +287,84 @@ fn reply_empty(ipc_buf: *mut u64, code: u64)
     let msg = IpcMessage::new(code);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
+}
+
+/// Handle `CONFIGURE_STDIO` — install stdin/stdout/stderr caps on a
+/// suspended child.
+///
+/// Caller identifies the target via the request's tokened `process_handle`
+/// (token delivered by `ipc_recv`). Caps are positional: `[stdout,
+/// stderr?, stdin?]`. Trailing zeros are omitted by the sender (the
+/// kernel rejects null cap slot indices). procmgr `cap_copy`s each into
+/// the child's `CSpace` and writes the slot index into the child's
+/// `ProcessInfo`. Rejects if the child has already been started.
+fn handle_configure_stdio(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    self_aspace: u32,
+    table: &mut process::ProcessTable,
+)
+{
+    let token = req.token;
+    let caps = req.caps();
+    let stdout = caps.first().copied().unwrap_or(0);
+    let stderr = if caps.len() >= 2 { caps[1] } else { 0 };
+    let stdin = if caps.len() >= 3 { caps[2] } else { 0 };
+
+    let code = match table.configure_stdio(token, self_aspace, stdout, stderr, stdin)
+    {
+        Ok(()) => procmgr_errors::SUCCESS,
+        Err(code) => code,
+    };
+
+    // procmgr's copies of the transferred caps have been moved into the
+    // child's CSpace by cap_copy above (configure_stdio uses src-slot in
+    // procmgr's CSpace → dst-slot in child_cspace). Drop procmgr-side
+    // slots so their underlying refcounts don't keep the caller's
+    // references alive unnecessarily. Idempotent on zero.
+    if stdout != 0
+    {
+        let _ = syscall::cap_delete(stdout);
+    }
+    if stderr != 0
+    {
+        let _ = syscall::cap_delete(stderr);
+    }
+    if stdin != 0
+    {
+        let _ = syscall::cap_delete(stdin);
+    }
+
+    reply_empty(ipc_buf, code);
+}
+
+/// Handle `MINT_LOG_CAP` — derive and return a fresh tokened SEND cap on
+/// the system log endpoint. Token is drawn from `NEXT_LOG_TOKEN` and is
+/// unique per call. Callers typically `cap_copy` the returned cap and hand
+/// both copies to `CONFIGURE_STDIO` so the child's stdout and stderr
+/// stream through the mediator under the same registered name.
+///
+/// Fails (returns `INVALID_ARGUMENT`) when procmgr holds no log endpoint —
+/// very early boot before init delivered one.
+fn handle_mint_log_cap(log_ep: u32, ipc_buf: *mut u64)
+{
+    if log_ep == 0
+    {
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    let token = NEXT_LOG_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let Ok(cap) = syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, token)
+    else
+    {
+        reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+        return;
+    };
+    let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+        .cap(cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Reply with a successful process creation result.
@@ -294,15 +392,18 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 ///                    requires an env header word + blob after argv.
 ///
 /// IPC data words:
-///   word 0                       = `stdio_token` (packed short ASCII name, u64)
-///   word `1..1+argv_words`       = argv blob, `args_bytes.div_ceil(8)` words
-///   word `1+argv_words`          = `env_bytes` (low 16 bits; only present
+///   word `0..argv_words`         = argv blob, `args_bytes.div_ceil(8)` words
+///   word `argv_words`            = `env_bytes` (low 16 bits; only present
 ///                                  when `env_count > 0`)
-///   word `1+argv_words+1..`      = env blob, `env_bytes.div_ceil(8)` words
+///   word `argv_words+1..`        = env blob, `env_bytes.div_ceil(8)` words
 ///                                  (only present when `env_count > 0`)
 ///
-/// Expects `caps = [module_frame, creator_endpoint, stdin_cap?]`. `stdin_cap`
-/// is optional — pass zero / omit when the child has no stdin.
+/// Expects `caps = [module_frame, creator_endpoint?]`. Stdio wiring is
+/// configured via a separate `CONFIGURE_STDIO` IPC on the returned
+/// tokened `process_handle` before `START_PROCESS`; it is intentionally
+/// not part of this protocol so that stdout and stderr can be routed
+/// independently and so the core creation path has no logging concept
+/// baked in.
 #[allow(clippy::cast_possible_truncation)]
 fn handle_create(
     req: &IpcMessage,
@@ -323,9 +424,6 @@ fn handle_create(
 
     let module_cap = caps[0];
     let creator_ep = if caps.len() >= 2 { caps[1] } else { 0 };
-    let stdin_cap = if caps.len() >= 3 { caps[2] } else { 0 };
-
-    let stdio_token = req.word(0);
 
     let args_bytes = ((label >> 32) & 0xFFFF) as usize;
     let args_count = ((label >> 48) & 0xFF) as u32;
@@ -334,7 +432,7 @@ fn handle_create(
     let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
     {
-        copy_bytes_from_msg(req, 1, args_bytes, &mut args_buf);
+        copy_bytes_from_msg(req, 0, args_bytes, &mut args_buf);
         &args_buf[..args_bytes]
     }
     else
@@ -349,10 +447,10 @@ fn handle_create(
     let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let env_blob: &[u8] = if env_count > 0
     {
-        let env_bytes = (req.word(1 + argv_words) & 0xFFFF) as usize;
+        let env_bytes = (req.word(argv_words) & 0xFFFF) as usize;
         if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
         {
-            copy_bytes_from_msg(req, 1 + argv_words + 1, env_bytes, &mut env_buf);
+            copy_bytes_from_msg(req, argv_words + 1, env_bytes, &mut env_buf);
             &env_buf[..env_bytes]
         }
         else
@@ -373,14 +471,9 @@ fn handle_create(
         blob: env_blob,
         count: env_count,
     };
-    let stdio = process::ChildStdio {
-        stdio_token,
-        stdin_cap,
-    };
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
-        log_endpoint: ctx.log_ep,
     };
 
     let result = process::create_process(
@@ -393,25 +486,20 @@ fn handle_create(
         &universals,
         &args,
         &env,
-        &stdio,
         ctx.death_eq,
     );
 
-    // Transferred caps (`module_cap`, `creator_ep`, `stdin_cap`) entered
-    // procmgr's CSpace via `ipc_recv` and were either cap_copy'd into the
-    // child's CSpace or consumed only for the ELF-load scratch map.
-    // procmgr has no further use for any of them; drop them so their
-    // underlying object refcounts decrement and — once the child dies —
-    // the module Frame (cap_copy descendants in the child's CSpace) can
-    // free its backing memory. Idempotent on zero slots.
+    // Transferred caps (`module_cap`, `creator_ep`) entered procmgr's
+    // CSpace via `ipc_recv` and were either cap_copy'd into the child's
+    // CSpace or consumed only for the ELF-load scratch map. procmgr has
+    // no further use for any of them; drop them so their underlying
+    // object refcounts decrement and — once the child dies — the module
+    // Frame (cap_copy descendants in the child's CSpace) can free its
+    // backing memory. Idempotent on zero slots.
     let _ = syscall::cap_delete(module_cap);
     if creator_ep != 0
     {
         let _ = syscall::cap_delete(creator_ep);
-    }
-    if stdin_cap != 0
-    {
-        let _ = syscall::cap_delete(stdin_cap);
     }
 
     match result
@@ -478,9 +566,10 @@ pub struct ProcmgrCtx
     pub self_endpoint: u32,
     pub vfsd_ep: u32,
     /// Log endpoint (SEND) received from init during procmgr's own bootstrap.
-    /// Propagated into every child's `ProcessInfo.log_endpoint_cap` so std
-    /// `Stdout`/`Stderr` work without per-service wiring. Zero if init did
-    /// not provide one (very early boot; no child logs in that window).
+    /// procmgr uses this only as the dispensing source for `MINT_LOG_CAP` —
+    /// it does not touch `log_ep` during `CREATE_PROCESS`. Zero if init did
+    /// not provide one (very early boot); `MINT_LOG_CAP` returns
+    /// `INVALID_ARGUMENT` in that window.
     pub log_ep: u32,
     /// Single shared death-notification event queue. Every spawned child
     /// binds its thread to this queue (via multi-bind in the kernel) with
@@ -506,17 +595,18 @@ pub struct ProcmgrCtx
 ///                    requires an env header word + blob after argv.
 ///
 /// IPC data words:
-///   word 0                           = `stdio_token` (packed short ASCII name, u64)
-///   word `1..1+path_words`           = path bytes (up to `MAX_PATH_LEN` = 48 bytes)
-///   word `1+path_words..+argv_words` = argv blob, `args_bytes.div_ceil(8)` words
-///   word `1+path_words+argv_words`   = `env_bytes` (low 16 bits; only present
+///   word `0..path_words`             = path bytes (up to `MAX_PATH_LEN` = 48 bytes)
+///   word `path_words..+argv_words`   = argv blob, `args_bytes.div_ceil(8)` words
+///   word `path_words+argv_words`     = `env_bytes` (low 16 bits; only present
 ///                                       when `env_count > 0`)
 ///   word after env header            = env blob, `env_bytes.div_ceil(8)` words
 ///                                       (only present when `env_count > 0`)
 ///
-/// Expects `caps = [creator_endpoint, stdin_cap?]`. Module bytes come from
-/// the VFS, not the caller's `CSpace`. Mirrors `CREATE_PROCESS`'s argv/env
-/// encoding (see `handle_create`).
+/// Expects `caps = [creator_endpoint?, log_output_cap?, stdin_cap?]`. All
+/// caps optional; trailing zeros omitted. Module bytes come from the VFS,
+/// not the caller's `CSpace`. `log_output_cap` is installed verbatim into
+/// the child's stdout/stderr — zero means no log output. Mirrors
+/// `CREATE_PROCESS`'s argv/env encoding (see `handle_create`).
 #[allow(clippy::cast_possible_truncation)]
 fn handle_create_from_vfs(
     req: &IpcMessage,
@@ -543,13 +633,10 @@ fn handle_create_from_vfs(
 
     let caps = req.caps();
     let creator_ep = caps.first().copied().unwrap_or(0);
-    let stdin_cap = if caps.len() >= 2 { caps[1] } else { 0 };
-
-    let stdio_token = req.word(0);
 
     let mut path_buf = [0u8; ipc::MAX_PATH_LEN];
-    // Path begins at word 1 (word 0 is stdio_token).
-    let effective_path_len = read_path_from_msg(req, 1, path_len, &mut path_buf);
+    // Path begins at word 0 (word 0 is no longer used as stdio_token).
+    let effective_path_len = read_path_from_msg(req, 0, path_len, &mut path_buf);
     let path_words = path_len.div_ceil(8);
 
     let args_bytes = ((label >> 32) & 0xFFFF) as usize;
@@ -559,7 +646,7 @@ fn handle_create_from_vfs(
     let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
     {
-        copy_bytes_from_msg(req, 1 + path_words, args_bytes, &mut args_buf);
+        copy_bytes_from_msg(req, path_words, args_bytes, &mut args_buf);
         &args_buf[..args_bytes]
     }
     else
@@ -571,15 +658,10 @@ fn handle_create_from_vfs(
     let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let env_blob: &[u8] = if env_count > 0
     {
-        let env_bytes = (req.word(1 + path_words + argv_words) & 0xFFFF) as usize;
+        let env_bytes = (req.word(path_words + argv_words) & 0xFFFF) as usize;
         if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
         {
-            copy_bytes_from_msg(
-                req,
-                1 + path_words + argv_words + 1,
-                env_bytes,
-                &mut env_buf,
-            );
+            copy_bytes_from_msg(req, path_words + argv_words + 1, env_bytes, &mut env_buf);
             &env_buf[..env_bytes]
         }
         else
@@ -600,10 +682,6 @@ fn handle_create_from_vfs(
         blob: env_blob,
         count: env_count,
     };
-    let stdio = process::ChildStdio {
-        stdio_token,
-        stdin_cap,
-    };
 
     let result = process::create_process_from_vfs(
         ctx,
@@ -614,14 +692,8 @@ fn handle_create_from_vfs(
         creator_ep,
         &args,
         &env,
-        &stdio,
         ctx.death_eq,
     );
-
-    if stdin_cap != 0
-    {
-        let _ = syscall::cap_delete(stdin_cap);
-    }
 
     match result
     {

@@ -391,6 +391,24 @@ pub fn diag_write(bytes: &[u8]) {
     pal_stdio::diag_write_raw(bytes);
 }
 
+/// Register a display name for this process's log stream with the system
+/// log mediator. Opt-in — services that want their log lines to appear
+/// under a specific `[name]` prefix call this once at startup (or again
+/// to update the name with runtime context, e.g. a mountpoint).
+///
+/// Non-logging services should not call this: the mediator only observes
+/// senders whose stdout cap points at the log endpoint, and the mediator
+/// is the only receiver that interprets `STREAM_REGISTER_NAME`. Sending
+/// this message to an unrelated stdout sink (a pipe, a terminal) would
+/// appear as arbitrary bytes in that sink.
+///
+/// Silently dropped if the process has no stdout cap or the IPC buffer
+/// is not yet registered.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn register_log_name(name: &[u8]) {
+    pal_stdio::register_log_name_raw(name);
+}
+
 /// Format `args` into a 512-byte stack buffer and emit through
 /// [`diag_write`], appending a trailing newline. Non-allocating — callers
 /// without a live heap can use this in place of `eprintln!`. Messages

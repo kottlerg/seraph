@@ -46,6 +46,11 @@ const LINE_BUF_SIZE: usize = 256;
 /// Maximum number of distinct sender tokens the log receiver tracks at once.
 const MAX_SENDERS: usize = 16;
 
+/// Maximum per-slot display-name length in bytes. Sized for typical
+/// contextual names like `"fatfs /some/deeply/nested/mount"`. Longer names
+/// are truncated.
+const MAX_NAME_LEN: usize = 48;
+
 // ── Mutable state (sender side, main-thread bound) ──────────────────────────
 
 /// Tokened SEND cap on the log endpoint that init's own `log()` writes to.
@@ -55,6 +60,23 @@ static mut INIT_LOG_SEND: u32 = 0;
 
 /// IPC buffer pointer for the main thread (set after IPC buffer is mapped).
 static mut MAIN_IPC_BUF: *mut u64 = core::ptr::null_mut();
+
+/// Init's full-rights cap on the system log endpoint, retained as the
+/// source for deriving tokened SEND caps for the handful of services init
+/// spawns directly during early boot (procmgr, devmgr, vfsd, svcmgr,
+/// crasher, usertest, ...). Zero until `set_log_ep` is called right after
+/// the log thread starts.
+static mut INIT_LOG_EP: u32 = 0;
+
+/// Init's own `CSpace` cap, stashed at startup so `derive_log_stdio_pair`
+/// can `cap_copy` within init's `CSpace` to produce a second slot pointing
+/// at the same tokened endpoint. Zero until `set_cspace_cap` is called.
+static mut INIT_CSPACE: u32 = 0;
+
+/// Monotonic counter for init-reserved log stream tokens. Range 2..=16 is
+/// reserved for services init spawns directly; procmgr's `NEXT_LOG_TOKEN`
+/// starts at 1024 to guarantee no overlap. Token 1 is init's own self-cap.
+static INIT_NEXT_LOG_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2);
 
 // ── Public interface ─────────────────────────────────────────────────────────
 
@@ -84,7 +106,7 @@ pub fn log(s: &str)
 ///
 /// Must be called exactly once after the log thread has started. `cap` must
 /// be a tokened SEND cap on the log endpoint with the token identifying the
-/// sender (`pack_name(b"init")` for init's own diagnostics).
+/// sender (token `1` — init's self-identity — for init's own diagnostics).
 pub fn set_ipc_logging(cap: u32, ipc_buf: *mut u64)
 {
     // SAFETY: single main thread; log thread only reads its own argument.
@@ -92,6 +114,101 @@ pub fn set_ipc_logging(cap: u32, ipc_buf: *mut u64)
         INIT_LOG_SEND = cap;
         MAIN_IPC_BUF = ipc_buf;
     }
+}
+
+/// Install the init-retained log endpoint cap so [`derive_log_output_cap`]
+/// can mint per-child tokened SEND caps for direct spawns.
+pub fn set_log_ep(log_ep: u32)
+{
+    // SAFETY: single main thread; only main reads this.
+    unsafe {
+        INIT_LOG_EP = log_ep;
+    }
+}
+
+/// Install init's own `CSpace` cap so the log-stdio pair helpers can
+/// `cap_copy` within init's `CSpace`.
+pub fn set_cspace_cap(cspace: u32)
+{
+    // SAFETY: single main thread; only main reads this.
+    unsafe {
+        INIT_CSPACE = cspace;
+    }
+}
+
+/// Derive a tokened SEND cap on init's log endpoint for a child process's
+/// stdout/stderr. Token is drawn from init's reserved range (2..=16) so it
+/// does not collide with procmgr-minted tokens (starting at 1024).
+///
+/// Returns zero on failure (`log_ep` not installed, `cap_derive_token`
+/// refused, or reserved range exhausted). Callers typically use
+/// [`derive_log_stdio_pair`] instead — it returns two slots that both
+/// refer to the same tokened endpoint and are ready to hand to
+/// `CONFIGURE_STDIO` as stdout + stderr.
+pub fn derive_log_output_cap() -> u32
+{
+    use core::sync::atomic::Ordering;
+    // SAFETY: see above — single main thread reads INIT_LOG_EP.
+    let log_ep = unsafe { INIT_LOG_EP };
+    if log_ep == 0
+    {
+        return 0;
+    }
+    let token = INIT_NEXT_LOG_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if token > 16
+    {
+        // Reserved range exhausted — refuse rather than collide with
+        // procmgr's range. Caller logs the failure.
+        return 0;
+    }
+    syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, token).unwrap_or(0)
+}
+
+/// Derive a pair of tokened SEND caps on init's log endpoint that both
+/// refer to the same underlying cap (same endpoint + same token). Meant
+/// for `CONFIGURE_STDIO`: one slot used for `stdout_cap`, the other for
+/// `stderr_cap`, so the mediator attributes both writes to the same
+/// registered display name.
+///
+/// Returns `(stdout_slot, stderr_slot)`. Either is zero on failure.
+pub fn derive_log_stdio_pair() -> (u32, u32)
+{
+    let stdout = derive_log_output_cap();
+    if stdout == 0
+    {
+        return (0, 0);
+    }
+    // SAFETY: single main thread; INIT_CSPACE is written once at startup.
+    let cspace = unsafe { INIT_CSPACE };
+    if cspace == 0
+    {
+        return (stdout, 0);
+    }
+    let stderr = syscall::cap_copy(stdout, cspace, syscall::RIGHTS_SEND).unwrap_or(0);
+    (stdout, stderr)
+}
+
+/// Send a `STREAM_REGISTER_NAME` message on init's own log SEND cap so the
+/// mediator labels `[init]` lines correctly. Must be called exactly once
+/// after `set_ipc_logging`.
+pub fn register_name(name: &[u8])
+{
+    // SAFETY: INIT_LOG_SEND and MAIN_IPC_BUF are written once by the main
+    // thread; log thread only reads its own argument.
+    let cap = unsafe { INIT_LOG_SEND };
+    // SAFETY: see above.
+    let ipc_buf = unsafe { MAIN_IPC_BUF };
+    if cap == 0 || ipc_buf.is_null() || name.is_empty()
+    {
+        return;
+    }
+    let len = name.len().min(STREAM_CHUNK_SIZE);
+    let label = ipc::stream_labels::STREAM_REGISTER_NAME | ((len as u64 & 0xFFFF) << 16);
+    let msg = ipc::IpcMessage::builder(label)
+        .bytes(0, &name[..len])
+        .build();
+    // SAFETY: ipc_buf registered by main thread.
+    let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
 }
 
 // ── Serial output ────────────────────────────────────────────────────────────
@@ -135,19 +252,6 @@ fn ipc_log(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
         let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
         offset += chunk_len;
     }
-}
-
-// ── Token packing helpers (also used by service.rs) ─────────────────────────
-
-/// Pack up to 8 ASCII bytes into a u64. Used as the `cap_derive_token` value
-/// for per-service stdio attribution. Truncates names longer than 8 bytes.
-#[must_use]
-pub fn pack_name(name: &[u8]) -> u64
-{
-    let mut buf = [0u8; 8];
-    let n = name.len().min(8);
-    buf[..n].copy_from_slice(&name[..n]);
-    u64::from_le_bytes(buf)
 }
 
 // ── Log thread ───────────────────────────────────────────────────────────────
@@ -271,12 +375,15 @@ extern "C" fn log_thread_entry(arg: u64) -> !
 
 // ── Log receive loop ─────────────────────────────────────────────────────────
 
-/// Per-sender state: the sender's token (== identity, packed name) and a
-/// short buffer of bytes accumulated since the last newline.
+/// Per-sender state: the sender's token (opaque u64 identity), the display
+/// name registered via `STREAM_REGISTER_NAME`, and the bytes accumulated
+/// since the last newline.
 #[derive(Clone, Copy)]
 struct SenderSlot
 {
     token: u64,
+    name: [u8; MAX_NAME_LEN],
+    name_used: usize,
     buf: [u8; LINE_BUF_SIZE],
     used: usize,
 }
@@ -287,6 +394,8 @@ impl SenderSlot
     {
         Self {
             token: 0,
+            name: [0u8; MAX_NAME_LEN],
+            name_used: 0,
             buf: [0u8; LINE_BUF_SIZE],
             used: 0,
         }
@@ -312,16 +421,38 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         };
 
         let label_id = recv.label & 0xFFFF;
+        let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;
         if label_id == STREAM_BYTES
         {
-            let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;
             consume_bytes(&mut slots, &mut next_evict, &recv, recv.token, byte_len);
+        }
+        else if label_id == ipc::stream_labels::STREAM_REGISTER_NAME
+        {
+            register_sender_name(&mut slots, &mut next_evict, &recv, recv.token, byte_len);
         }
 
         // Reply to unblock the sender (call/reply protocol; payload empty).
         // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
     }
+}
+
+/// Record a display name for the sender identified by `token`. Called from
+/// `log_receive_loop` when a `STREAM_REGISTER_NAME` message arrives.
+/// Idempotent — later registrations replace earlier.
+fn register_sender_name(
+    slots: &mut [SenderSlot; MAX_SENDERS],
+    next_evict: &mut usize,
+    msg: &ipc::IpcMessage,
+    token: u64,
+    byte_len: usize,
+)
+{
+    let bytes = msg.data_bytes();
+    let len = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
+    let slot_idx = find_or_alloc_slot(slots, next_evict, token);
+    slots[slot_idx].name[..len].copy_from_slice(&bytes[..len]);
+    slots[slot_idx].name_used = len;
 }
 
 /// Append `byte_len` bytes from the IPC buffer onto the slot for `token`,
@@ -396,25 +527,37 @@ fn find_or_alloc_slot(
     victim
 }
 
-/// Emit `[name] <buffered bytes>\r\n` to the serial port. `name` is unpacked
-/// from `slot.token` (trailing zeros stripped). Anonymous senders (token = 0)
-/// get `[?]`.
+/// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port.
+/// `[name]` uses the display name registered via `STREAM_REGISTER_NAME`;
+/// senders that have not registered yet render as `[?]`.
 fn flush_line(slot: &SenderSlot)
 {
+    // ── Timestamp: [sec.usfrac:06] ─────────────────────────────────────
+    //
+    // Source: `SYS_SYSTEM_INFO(ElapsedUs)` — kernel handler returns
+    // `unwrap_or(0)` and never errors. Format matches the kernel's
+    // `[sec.usfrac:06] ` prefix in `kernel/src/console.rs`.
+    let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
+    let sec = us / 1_000_000;
+    let usfrac = (us % 1_000_000) as u32;
+
     arch::current::serial_write_byte(b'[');
-    if slot.token == 0
+    write_decimal(sec);
+    arch::current::serial_write_byte(b'.');
+    write_decimal_padded(u64::from(usfrac), 6);
+    arch::current::serial_write_byte(b']');
+    arch::current::serial_write_byte(b' ');
+
+    // ── Name: [<registered name>] or [?] ───────────────────────────────
+    arch::current::serial_write_byte(b'[');
+    if slot.name_used == 0
     {
         arch::current::serial_write_byte(b'?');
     }
     else
     {
-        let name_bytes = slot.token.to_le_bytes();
-        for &b in &name_bytes
+        for &b in &slot.name[..slot.name_used]
         {
-            if b == 0
-            {
-                break;
-            }
             arch::current::serial_write_byte(b);
         }
     }
@@ -431,4 +574,50 @@ fn flush_line(slot: &SenderSlot)
     }
     arch::current::serial_write_byte(b'\r');
     arch::current::serial_write_byte(b'\n');
+}
+
+/// Write `value` as base-10 ASCII to the serial port with no padding.
+fn write_decimal(value: u64)
+{
+    let mut buf = [0u8; 20];
+    let mut n = value;
+    let mut idx = buf.len();
+    if n == 0
+    {
+        idx -= 1;
+        buf[idx] = b'0';
+    }
+    else
+    {
+        while n > 0
+        {
+            idx -= 1;
+            buf[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    for &b in &buf[idx..]
+    {
+        arch::current::serial_write_byte(b);
+    }
+}
+
+/// Write `value` as zero-padded base-10 ASCII of exactly `width` digits.
+/// `width` must be <= 20 (max decimal digits in a u64).
+fn write_decimal_padded(value: u64, width: usize)
+{
+    let mut buf = [b'0'; 20];
+    let mut n = value;
+    let mut idx = buf.len();
+    while n > 0 && idx > 0
+    {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let start = buf.len().saturating_sub(width);
+    for &b in &buf[start..]
+    {
+        arch::current::serial_write_byte(b);
+    }
 }

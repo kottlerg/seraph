@@ -62,6 +62,7 @@ struct FatCaps
 
 fn main() -> !
 {
+    std::os::seraph::register_log_name(b"fatfs");
     let info = startup_info();
 
     // IPC buffer is registered by `std::os::seraph::_start` and page-aligned
@@ -76,7 +77,7 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    println!("fatfs: starting");
+    println!("starting");
 
     let mut state = FatState::new();
 

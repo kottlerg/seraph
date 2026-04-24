@@ -120,6 +120,7 @@ fn spawn_worker() -> Option<(u32, Channel)>
 
 fn main() -> !
 {
+    std::os::seraph::register_log_name(b"vfsd");
     let info = startup_info();
 
     // IPC buffer is registered by `std::os::seraph::_start` and page-aligned
@@ -134,11 +135,11 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    println!("vfsd: starting");
+    println!("starting");
 
     if caps.service_ep == 0 || caps.registry_ep == 0
     {
-        println!("vfsd: missing required endpoints");
+        println!("missing required endpoints");
         idle_loop();
     }
 
@@ -146,53 +147,53 @@ fn main() -> !
     let Some((bootstrap_ep, channel)) = spawn_worker()
     else
     {
-        println!("vfsd: FATAL: worker thread setup failed");
+        println!("FATAL: worker thread setup failed");
         idle_loop();
     };
     caps.bootstrap_ep = bootstrap_ep;
 
     // Query devmgr for the block device endpoint.
-    println!("vfsd: querying devmgr for block device");
+    println!("querying devmgr for block device");
     let query_msg = IpcMessage::new(ipc::devmgr_labels::QUERY_BLOCK_DEVICE);
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(query_reply) = (unsafe { ipc::ipc_call(caps.registry_ep, &query_msg, ipc_buf) })
     else
     {
-        println!("vfsd: QUERY_BLOCK_DEVICE ipc_call failed");
+        println!("QUERY_BLOCK_DEVICE ipc_call failed");
         idle_loop();
     };
     if query_reply.label != 0
     {
-        println!("vfsd: no block device available");
+        println!("no block device available");
         idle_loop();
     }
 
     let reply_caps = query_reply.caps();
     if reply_caps.is_empty()
     {
-        println!("vfsd: QUERY_BLOCK_DEVICE returned no caps");
+        println!("QUERY_BLOCK_DEVICE returned no caps");
         idle_loop();
     }
     let blk_ep = reply_caps[0];
-    println!("vfsd: block device endpoint acquired");
+    println!("block device endpoint acquired");
 
     // Parse GPT partition table — stored for UUID lookups on MOUNT requests.
     let mut gpt_parts = gpt::new_gpt_table();
     match gpt::parse_gpt(blk_ep, ipc_buf, &mut gpt_parts)
     {
-        Ok(count) => println!("vfsd: GPT parsed, {count} partitions"),
-        Err(gpt::GptError::IoError) => println!("vfsd: GPT parse failed: I/O error"),
+        Ok(count) => println!("GPT parsed, {count} partitions"),
+        Err(gpt::GptError::IoError) => println!("GPT parse failed: I/O error"),
         Err(gpt::GptError::InvalidSignature) =>
         {
-            println!("vfsd: GPT parse failed: invalid signature");
+            println!("GPT parse failed: invalid signature");
         }
         Err(gpt::GptError::InvalidEntrySize) =>
         {
-            println!("vfsd: GPT parse failed: invalid entry size");
+            println!("GPT parse failed: invalid entry size");
         }
     }
 
-    println!("vfsd: entering service loop");
+    println!("entering service loop");
     let runtime = VfsdRuntime {
         caps: &caps,
         blk_ep,
@@ -229,7 +230,7 @@ fn service_loop(ipc_buf: *mut u64, rt: &VfsdRuntime) -> !
         let Ok(recv) = (unsafe { ipc::ipc_recv(rt.caps.service_ep, ipc_buf) })
         else
         {
-            println!("vfsd: ipc_recv failed, retrying");
+            println!("ipc_recv failed, retrying");
             continue;
         };
 
@@ -280,7 +281,7 @@ fn handle_mount_request(
     let path_len = recv.word(2) as usize;
     if path_len == 0 || path_len > 64
     {
-        println!("vfsd: MOUNT: invalid path length");
+        println!("MOUNT: invalid path length");
         let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -303,18 +304,18 @@ fn handle_mount_request(
     let Some((partition_lba, partition_len)) = gpt::lookup_partition_by_uuid(&uuid, rt.gpt_parts)
     else
     {
-        println!("vfsd: MOUNT: partition UUID not found");
+        println!("MOUNT: partition UUID not found");
         let err = IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     };
-    println!("vfsd: MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}");
+    println!("MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}");
 
     // Spawn fatfs driver for this partition.
     if rt.caps.fatfs_module_cap == 0
     {
-        println!("vfsd: MOUNT: no fatfs module cap");
+        println!("MOUNT: no fatfs module cap");
         let err = IpcMessage::new(ipc::vfsd_errors::NO_FS_MODULE);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -328,7 +329,7 @@ fn handle_mount_request(
         derive_and_register_partition(rt, partition_lba, partition_len, ipc_buf)
     else
     {
-        println!("vfsd: MOUNT: partition cap registration failed");
+        println!("MOUNT: partition cap registration failed");
         let err = IpcMessage::new(ipc::vfsd_errors::SPAWN_FAILED);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -338,7 +339,7 @@ fn handle_mount_request(
     let Some(driver_ep) = driver::spawn_fatfs_driver(rt.caps, rt.channel, partition_ep, ipc_buf)
     else
     {
-        println!("vfsd: MOUNT: failed to spawn fatfs");
+        println!("MOUNT: failed to spawn fatfs");
         let err = IpcMessage::new(ipc::vfsd_errors::SPAWN_FAILED);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -351,14 +352,14 @@ fn handle_mount_request(
         let ok = IpcMessage::new(ipc::vfsd_errors::SUCCESS);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&ok, ipc_buf) };
-        println!("vfsd: MOUNT: registered");
+        println!("MOUNT: registered");
     }
     else
     {
         let err = IpcMessage::new(ipc::vfsd_errors::TABLE_FULL);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-        println!("vfsd: MOUNT: mount table full");
+        println!("MOUNT: mount table full");
     }
 }
 
@@ -426,7 +427,7 @@ fn handle_open(recv: &IpcMessage, ipc_buf: *mut u64, mounts: &[MountEntry; MAX_M
     let drv_caps = drv_reply.caps();
     if drv_caps.is_empty()
     {
-        println!("vfsd: OPEN: driver returned no file cap");
+        println!("OPEN: driver returned no file cap");
         let err = IpcMessage::new(ipc::vfsd_errors::IO_ERROR);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -472,12 +473,12 @@ fn derive_and_register_partition(
     let Ok(reply) = (unsafe { ipc::ipc_call(rt.blk_ep, &msg, ipc_buf) })
     else
     {
-        println!("vfsd: REGISTER_PARTITION ipc_call failed");
+        println!("REGISTER_PARTITION ipc_call failed");
         return None;
     };
     if reply.label != ipc::blk_errors::SUCCESS
     {
-        println!("vfsd: REGISTER_PARTITION rejected (code={})", reply.label);
+        println!("REGISTER_PARTITION rejected (code={})", reply.label);
         return None;
     }
     Some(partition_ep)

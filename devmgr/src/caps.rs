@@ -103,6 +103,7 @@ pub struct DevmgrCaps
     pub registry_ep: u32,
     pub self_bootstrap_ep: u32,
     pub self_aspace: u32,
+    pub self_cspace: u32,
 
     // Driver module caps.
     pub driver_module_slots: [u32; 8],
@@ -128,6 +129,7 @@ impl DevmgrCaps
             registry_ep: 0,
             self_bootstrap_ep: 0,
             self_aspace: info.self_aspace,
+            self_cspace: info.self_cspace,
             driver_module_slots: [0; 8],
             driver_module_count: 0,
         }

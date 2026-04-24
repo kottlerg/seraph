@@ -131,7 +131,7 @@ fn handle_register(
     *service_count += 1;
 
     println!(
-        "svcmgr: registered service: {} (bundle caps={})",
+        "registered service: {} (bundle caps={})",
         services[idx].name_str(),
         u64::from(services[idx].bundle_count)
     );
@@ -190,7 +190,7 @@ fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usiz
     let Ok(eq_cap) = syscall::event_queue_create(4)
     else
     {
-        println!("svcmgr: failed to create event queue for service");
+        println!("failed to create event queue for service");
         return None;
     };
 
@@ -198,7 +198,7 @@ fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usiz
     // for routing; the payload is just `exit_reason`. No correlator needed.
     if syscall::thread_bind_notification(thread_cap, eq_cap, 0).is_err()
     {
-        println!("svcmgr: failed to bind death notification");
+        println!("failed to bind death notification");
         return None;
     }
 
@@ -206,7 +206,7 @@ fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usiz
     let token = (service_index as u64) + 1;
     if syscall::wait_set_add(ws_cap, eq_cap, token).is_err()
     {
-        println!("svcmgr: failed to add event queue to wait set");
+        println!("failed to add event queue to wait set");
         return None;
     }
 
@@ -228,6 +228,7 @@ pub fn halt_loop() -> !
 
 fn main() -> !
 {
+    std::os::seraph::register_log_name(b"svcmgr");
     let info = startup_info();
 
     // IPC buffer was registered by `std::os::seraph::_start`. The raw
@@ -243,29 +244,29 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    println!("svcmgr: started");
+    println!("started");
 
     if caps.service_ep == 0
     {
-        println!("svcmgr: no service endpoint, halting");
+        println!("no service endpoint, halting");
         halt_loop();
     }
     if info.procmgr_endpoint == 0
     {
-        println!("svcmgr: no procmgr endpoint, halting");
+        println!("no procmgr endpoint, halting");
         halt_loop();
     }
 
     let Ok(ws_cap) = syscall::wait_set_create()
     else
     {
-        println!("svcmgr: failed to create wait set");
+        println!("failed to create wait set");
         halt_loop();
     };
 
     if syscall::wait_set_add(ws_cap, caps.service_ep, 0).is_err()
     {
-        println!("svcmgr: failed to add service endpoint to wait set");
+        println!("failed to add service endpoint to wait set");
         halt_loop();
     }
 
@@ -276,7 +277,7 @@ fn main() -> !
         registry: registry::Registry::new(),
     };
 
-    println!("svcmgr: waiting for registrations");
+    println!("waiting for registrations");
 
     event_loop(info, &caps, ws_cap, ipc_buf, &mut state);
 }
@@ -305,6 +306,7 @@ fn event_loop(
         bootstrap_ep: caps.bootstrap_ep,
         ipc_buf,
         ws_cap,
+        self_cspace: info.self_cspace,
     };
 
     loop
@@ -312,7 +314,7 @@ fn event_loop(
         let Ok(token) = syscall::wait_set_wait(ws_cap)
         else
         {
-            println!("svcmgr: wait_set_wait failed");
+            println!("wait_set_wait failed");
             continue;
         };
 
@@ -356,7 +358,7 @@ fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, ws_
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             println!(
-                "svcmgr: handover complete, monitoring services: {:#018x}",
+                "handover complete, monitoring services: {:#018x}",
                 state.service_count as u64
             );
         }
@@ -452,14 +454,14 @@ fn dispatch_death(token: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx
     let idx = (token - 1) as usize;
     if idx >= state.service_count
     {
-        println!("svcmgr: invalid death notification token");
+        println!("invalid death notification token");
         return;
     }
 
     let Ok(exit_reason) = syscall::event_recv(state.services[idx].event_queue_cap)
     else
     {
-        println!("svcmgr: event_recv failed");
+        println!("event_recv failed");
         return;
     };
 
@@ -474,7 +476,7 @@ fn dispatch_death(token: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx
     if state.services[idx].active
         && syscall::wait_set_add(ctx.ws_cap, state.services[idx].event_queue_cap, token).is_err()
     {
-        println!("svcmgr: failed to re-add event queue to wait set after restart");
+        println!("failed to re-add event queue to wait set after restart");
         state.services[idx].active = false;
     }
 }

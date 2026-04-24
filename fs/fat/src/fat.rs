@@ -77,7 +77,7 @@ pub fn next_cluster(
     // read failure (the usual cause) is visible.
     if cluster < 2
     {
-        println!("fatfs: WARNING: next_cluster called with reserved cluster {cluster}");
+        println!("WARNING: next_cluster called with reserved cluster {cluster}");
         return None;
     }
 
@@ -162,7 +162,7 @@ pub fn next_cluster(
     if val < 2
     {
         println!(
-            "fatfs: WARNING: FAT chain at cluster {cluster} points to reserved cluster \
+            "WARNING: FAT chain at cluster {cluster} points to reserved cluster \
              {val} (fat_sector={fat_sector}, entry_offset={entry_offset}) \
              — possible block-read corruption"
         );

@@ -46,7 +46,7 @@ pub fn spawn_fatfs_driver(
 {
     if caps.bootstrap_ep == 0
     {
-        println!("vfsd: spawn_fatfs: worker thread not initialised");
+        println!("spawn_fatfs: worker thread not initialised");
         return None;
     }
 
@@ -60,8 +60,8 @@ pub fn spawn_fatfs_driver(
 
     // partition_ep is already a tokened SEND cap; hand it to the child as-is.
     // A fresh derive would discard the token, so this is moved into the plan.
-    // log_ep arrives via the child's ProcessInfo, so it's not part of the
-    // publish plan.
+    // log_ep arrives via stdout_cap in ProcessInfo (minted below via
+    // MINT_LOG_CAP), so it's not part of the publish plan either.
 
     // Allocate a bootstrap token and publish the plan for the worker.
     let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, Ordering::Relaxed);
@@ -76,7 +76,8 @@ pub fn spawn_fatfs_driver(
         },
     );
 
-    // Phase 1: CREATE_PROCESS with [module, tokened bootstrap cap].
+    // Phase 1: CREATE_PROCESS. Caps [module, creator]. Stdio wiring
+    // happens via CONFIGURE_STDIO below.
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
         .cap(module_copy)
         .cap(tokened_creator)
@@ -85,22 +86,36 @@ pub fn spawn_fatfs_driver(
     let Ok(create_reply) = (unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        println!("vfsd: fatfs CREATE_PROCESS ipc_call failed");
+        println!("fatfs CREATE_PROCESS ipc_call failed");
         return None;
     };
     if create_reply.label != 0
     {
-        println!("vfsd: fatfs CREATE_PROCESS failed");
+        println!("fatfs CREATE_PROCESS failed");
         return None;
     }
 
     let reply_caps = create_reply.caps();
     if reply_caps.len() < 2
     {
-        println!("vfsd: fatfs CREATE_PROCESS reply missing caps");
+        println!("fatfs CREATE_PROCESS reply missing caps");
         return None;
     }
     let process_handle = reply_caps[0];
+
+    // CONFIGURE_STDIO: mint a tokened log SEND and cap_copy it into a
+    // second slot in vfsd's own CSpace so the child's stdout and stderr
+    // share the same registered display name in the mediator.
+    let log_out = mint_log_cap(caps.procmgr_ep, ipc_buf);
+    let log_err = if log_out != 0
+    {
+        syscall::cap_copy(log_out, caps.self_cspace, syscall::RIGHTS_SEND).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    configure_stdio(process_handle, ipc_buf, log_out, log_err, 0);
 
     // START_PROCESS — fatfs begins executing and issues its bootstrap request.
     let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
@@ -111,14 +126,14 @@ pub fn spawn_fatfs_driver(
     );
     if !start_ok
     {
-        println!("vfsd: fatfs START_PROCESS failed");
+        println!("fatfs START_PROCESS failed");
         return None;
     }
 
     // Wait for the worker to deliver the bootstrap round.
     if !worker::wait_result(channel)
     {
-        println!("vfsd: fatfs bootstrap delivery failed");
+        println!("fatfs bootstrap delivery failed");
         return None;
     }
 
@@ -129,13 +144,50 @@ pub fn spawn_fatfs_driver(
     let mount_reply = unsafe { ipc::ipc_call(driver_send, &mount_msg, ipc_buf) }.ok()?;
     if mount_reply.label != 0
     {
-        println!(
-            "vfsd: fatfs FS_MOUNT probe failed (label={})",
-            mount_reply.label
-        );
+        println!("fatfs FS_MOUNT probe failed (label={})", mount_reply.label);
         return None;
     }
 
-    println!("vfsd: fatfs driver started");
+    println!("fatfs driver started");
     Some(driver_send)
+}
+
+/// Call `MINT_LOG_CAP` on procmgr, returning the minted tokened SEND cap
+/// slot. Zero on failure.
+fn mint_log_cap(procmgr_ep: u32, ipc_buf: *mut u64) -> u32
+{
+    let req = IpcMessage::new(ipc::procmgr_labels::MINT_LOG_CAP);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &req, ipc_buf) })
+    else
+    {
+        return 0;
+    };
+    if reply.label != 0
+    {
+        return 0;
+    }
+    reply.caps().first().copied().unwrap_or(0)
+}
+
+/// Issue `CONFIGURE_STDIO` on a suspended child's `process_handle`. All
+/// three caps optional — trailing zeros omitted.
+fn configure_stdio(process_handle: u32, ipc_buf: *mut u64, stdout: u32, stderr: u32, stdin: u32)
+{
+    let mut builder = IpcMessage::builder(ipc::procmgr_labels::CONFIGURE_STDIO);
+    if stdout != 0
+    {
+        builder = builder.cap(stdout);
+        if stderr != 0
+        {
+            builder = builder.cap(stderr);
+            if stdin != 0
+            {
+                builder = builder.cap(stdin);
+            }
+        }
+    }
+    let msg = builder.build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) };
 }

@@ -75,7 +75,7 @@ impl FatState
         if cluster < 2
         {
             println!(
-                "fatfs: WARNING: cluster_to_sector({cluster}) — reserved cluster \
+                "WARNING: cluster_to_sector({cluster}) — reserved cluster \
                  reached; caller should filter"
             );
             return self.data_start_sector;
@@ -103,7 +103,7 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     // Validate boot signature.
     if sector_data[510] != 0x55 || sector_data[511] != 0xAA
     {
-        println!("fatfs: invalid boot signature");
+        println!("invalid boot signature");
         return false;
     }
 
@@ -116,7 +116,7 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     // Validate fields used as divisors to prevent division by zero.
     if state.bytes_per_sector == 0 || state.sectors_per_cluster == 0
     {
-        println!("fatfs: invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
+        println!("invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
         return false;
     }
 
@@ -176,21 +176,21 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     if total_clusters < 65525
     {
         state.fat_type = FatType::Fat16;
-        println!("fatfs: detected FAT16");
+        println!("detected FAT16");
     }
     else
     {
         state.fat_type = FatType::Fat32;
-        println!("fatfs: detected FAT32");
+        println!("detected FAT32");
     }
 
     println!(
-        "fatfs: sectors_per_cluster={:#018x}",
+        "sectors_per_cluster={:#018x}",
         u64::from(state.sectors_per_cluster)
     );
-    println!("fatfs: total_clusters={:#018x}", u64::from(total_clusters));
+    println!("total_clusters={:#018x}", u64::from(total_clusters));
     println!(
-        "fatfs: data_start_sector={:#018x}",
+        "data_start_sector={:#018x}",
         u64::from(state.data_start_sector)
     );
 

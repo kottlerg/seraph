@@ -31,6 +31,10 @@ pub struct RestartCtx
     pub bootstrap_ep: u32,
     pub ipc_buf: *mut u64,
     pub ws_cap: u32,
+    /// Svcmgr's own `CSpace` cap, used to `cap_copy` the tokened log SEND
+    /// minted via `MINT_LOG_CAP` so the restarted child's stdout and
+    /// stderr share the same registered display name.
+    pub self_cspace: u32,
 }
 
 /// Handle a service death detected via event queue notification.
@@ -40,18 +44,18 @@ pub struct RestartCtx
 /// fails.
 pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx)
 {
-    println!("svcmgr: service died: {}", svc.name_str());
-    println!("svcmgr:   exit_reason={exit_reason:#018x}");
+    println!("service died: {}", svc.name_str());
+    println!("  exit_reason={exit_reason:#018x}");
 
     if svc.criticality == CRITICALITY_FATAL
     {
-        println!("svcmgr: FATAL service crashed, halting");
+        println!("FATAL service crashed, halting");
         halt_loop();
     }
 
     if svc.criticality != CRITICALITY_NORMAL
     {
-        println!("svcmgr: unknown criticality, not restarting");
+        println!("unknown criticality, not restarting");
         svc.active = false;
         return;
     }
@@ -63,7 +67,7 @@ pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx)
     }
 
     println!(
-        "svcmgr: restarting (attempt {:#018x})",
+        "restarting (attempt {:#018x})",
         u64::from(svc.restart_count + 1)
     );
 
@@ -74,7 +78,7 @@ pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx)
     }
 
     svc.restart_count += 1;
-    println!("svcmgr: service restarted: {}", svc.name_str());
+    println!("service restarted: {}", svc.name_str());
 }
 
 /// Determine whether a service should be restarted based on its policy and
@@ -90,19 +94,19 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
 
     if !restart
     {
-        println!("svcmgr: restart policy says no restart");
+        println!("restart policy says no restart");
         return false;
     }
 
     if svc.restart_count >= MAX_RESTARTS
     {
-        println!("svcmgr: max restarts reached, marking degraded");
+        println!("max restarts reached, marking degraded");
         return false;
     }
 
     if svc.module_cap == 0
     {
-        println!("svcmgr: no module cap, cannot restart");
+        println!("no module cap, cannot restart");
         return false;
     }
 
@@ -165,7 +169,7 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
         let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_SEND)
         else
         {
-            println!("svcmgr: cannot derive bundle cap for restart");
+            println!("cannot derive bundle cap for restart");
             return false;
         };
         restart_caps[cap_count] = c;
@@ -185,7 +189,7 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
     }
     .is_err()
     {
-        println!("svcmgr: bootstrap serve failed");
+        println!("bootstrap serve failed");
         return false;
     }
 
@@ -207,18 +211,7 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
     let tokened_creator =
         syscall::cap_derive_token(ctx.bootstrap_ep, syscall::RIGHTS_SEND, child_token).ok()?;
 
-    // Pack the service name into a u64 for the stdio token. Receiver-side
-    // (init's log thread today, real logd later) reads it from each STREAM_BYTES
-    // message to attribute output. Continuity by name across restart.
-    let stdio_token = {
-        let mut buf = [0u8; 8];
-        let n = (svc.name_len as usize).min(8);
-        buf[..n].copy_from_slice(&svc.name[..n]);
-        u64::from_le_bytes(buf)
-    };
-
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .word(0, stdio_token)
         .cap(module_copy)
         .cap(tokened_creator)
         .build();
@@ -226,18 +219,44 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
     let reply = unsafe { ipc::ipc_call(ctx.procmgr_ep, &create_msg, ctx.ipc_buf) }.ok()?;
     if reply.label != 0
     {
-        println!("svcmgr: restart CREATE_PROCESS failed");
+        println!("restart CREATE_PROCESS failed");
         return None;
     }
 
     let reply_caps = reply.caps();
     if reply_caps.len() < 2
     {
-        println!("svcmgr: restart reply missing caps");
+        println!("restart reply missing caps");
         return None;
     }
 
-    Some((reply_caps[0], reply_caps[1], child_token))
+    let process_handle = reply_caps[0];
+
+    // CONFIGURE_STDIO on the suspended child: mint a tokened log SEND,
+    // cap_copy for stderr so both share one display name in the mediator.
+    let log_out = mint_log_cap(ctx.procmgr_ep, ctx.ipc_buf);
+    let log_err = if log_out != 0
+    {
+        syscall::cap_copy(log_out, ctx.self_cspace, syscall::RIGHTS_SEND).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    let mut stdio_builder = IpcMessage::builder(procmgr_labels::CONFIGURE_STDIO);
+    if log_out != 0
+    {
+        stdio_builder = stdio_builder.cap(log_out);
+        if log_err != 0
+        {
+            stdio_builder = stdio_builder.cap(log_err);
+        }
+    }
+    let stdio_msg = stdio_builder.build();
+    // SAFETY: ctx.ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(process_handle, &stdio_msg, ctx.ipc_buf) };
+
+    Some((process_handle, reply_caps[1], child_token))
 }
 
 /// Send `START_PROCESS` via the tokened process handle.
@@ -248,7 +267,7 @@ fn start_process(process_handle: u32, ipc_buf: *mut u64) -> bool
     let reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) };
     if !matches!(reply, Ok(r) if r.label == 0)
     {
-        println!("svcmgr: restart START_PROCESS failed");
+        println!("restart START_PROCESS failed");
         return false;
     }
     true
@@ -264,7 +283,7 @@ fn rebind_death_notification(svc: &mut ServiceEntry, ws_cap: u32, new_thread_cap
     let Ok(new_eq) = syscall::event_queue_create(4)
     else
     {
-        println!("svcmgr: failed to create new event queue for restart");
+        println!("failed to create new event queue for restart");
         return false;
     };
 
@@ -272,11 +291,29 @@ fn rebind_death_notification(svc: &mut ServiceEntry, ws_cap: u32, new_thread_cap
     // in `handle_register`).
     if syscall::thread_bind_notification(new_thread_cap, new_eq, 0).is_err()
     {
-        println!("svcmgr: failed to rebind death notification");
+        println!("failed to rebind death notification");
         return false;
     }
 
     svc.event_queue_cap = new_eq;
     svc.thread_cap = new_thread_cap;
     true
+}
+
+/// Call `MINT_LOG_CAP` on procmgr, returning the minted tokened SEND cap
+/// slot. Zero on failure.
+fn mint_log_cap(procmgr_ep: u32, ipc_buf: *mut u64) -> u32
+{
+    let req = IpcMessage::new(procmgr_labels::MINT_LOG_CAP);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &req, ipc_buf) })
+    else
+    {
+        return 0;
+    };
+    if reply.label != 0
+    {
+        return 0;
+    }
+    reply.caps().first().copied().unwrap_or(0)
 }

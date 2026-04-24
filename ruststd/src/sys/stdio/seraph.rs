@@ -29,7 +29,7 @@ use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::os::seraph::current_ipc_buf;
 use crate::sync::atomic::{AtomicU32, Ordering};
 
-use ipc::{IpcMessage, stream_labels::STREAM_BYTES};
+use ipc::{IpcMessage, stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME}};
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
 /// Maximum bytes per IPC chunk (one full IPC data area).
@@ -55,6 +55,28 @@ pub fn stdio_init(stdin: u32, stdout: u32, stderr: u32) {
     STDIN_CAP.store(stdin, Ordering::Release);
     STDOUT_CAP.store(stdout, Ordering::Release);
     STDERR_CAP.store(stderr, Ordering::Release);
+}
+
+/// Send a `STREAM_REGISTER_NAME` message on the stdout cap so the log
+/// mediator attaches this display name to the sender's stream. Opt-in —
+/// services that want their `[name]` prefix to reflect something other
+/// than the default `[?]` call this once at startup (or again to change
+/// the name to include runtime context like a mountpoint). Silently does
+/// nothing when stdout is not wired or the IPC buffer isn't registered.
+pub(crate) fn register_log_name_raw(name: &[u8]) {
+    let ipc_ptr = current_ipc_buf();
+    if ipc_ptr.is_null() {
+        return;
+    }
+    let cap = STDOUT_CAP.load(Ordering::Acquire);
+    if cap == 0 || name.is_empty() {
+        return;
+    }
+    let len = name.len().min(CHUNK_SIZE);
+    let label = STREAM_REGISTER_NAME | ((len as u64 & 0xFFFF) << 16);
+    let msg = IpcMessage::builder(label).bytes(0, &name[..len]).build();
+    // SAFETY: ipc_ptr is the calling thread's kernel-registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_ptr) };
 }
 
 /// Best-effort raw write to the stderr cap, used by panic / pre-heap

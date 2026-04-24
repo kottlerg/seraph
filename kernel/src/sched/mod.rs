@@ -107,37 +107,45 @@ static NEXT_THREAD_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 /// Written once during boot by `init`, then read by `SYS_SYSTEM_INFO(CpuCount)`.
 pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-// ── Reschedule-pending flag (RISC-V) ─────────────────────────────────────────
+// ── Reschedule-pending flag ──────────────────────────────────────────────────
 
 /// Per-CPU reschedule-pending bitmask.
 ///
-/// On RISC-V, the wakeup IPI handler cannot call `schedule()` directly
-/// (reentrancy risk — the interrupt may fire while `schedule()` is on the
-/// call stack). Instead, the handler sets the target CPU's bit here.
+/// Load-bearing for the idle-wake primitive. Set producer-side in
+/// `enqueue_and_wake` before the wake signal (IPI) is sent. Consumed by the
+/// target CPU's idle loop with interrupts disabled, paired with
+/// `halt_until_interrupt`:
 ///
-/// The flag is consumed in two places:
-/// 1. **Trap return path** (`trap_dispatch`): after handling an interrupt,
-///    if the CPU is idle and the flag is set, `schedule()` runs before
-///    `sret`. This eliminates the `wfi` lost-wakeup race.
-/// 2. **Idle loop**: checks the flag before `wfi` as a fallback
-///    (defense-in-depth for flags set without a corresponding interrupt).
+/// - Producer: enqueue (under lock) → `set_reschedule_pending_for(target)` →
+///   unlock → `wake_idle_cpu(target)`.
+/// - Consumer (target CPU, idle loop): disable interrupts → check flag +
+///   run queue → if either set, clear flag and dispatch; else
+///   `halt_until_interrupt` (atomic enable+halt).
 ///
-/// On x86-64 this flag is unused because `sti; hlt` is atomic.
+/// This closes the "window B" race: a wake signal that races between the
+/// consumer's check and its halt lands either as an observed flag (via
+/// `take_reschedule_pending`) or as a pending interrupt that
+/// `halt_until_interrupt` wakes on atomically.
+///
+/// Arch-uniform. On RISC-V the IPI handler does **not** set this flag; the
+/// producer does. On x86-64 the same contract holds.
 static RESCHEDULE_PENDING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Signal that the current CPU should reschedule.
+/// Set the reschedule-pending bit for `cpu` (producer side).
 ///
-/// Called from the RISC-V software interrupt handler after a wakeup IPI.
-#[allow(dead_code)] // Only called from riscv64 interrupt handler
-pub fn set_reschedule_pending()
+/// Release ordering ensures the preceding enqueue store is published to
+/// any CPU that subsequently observes this bit via the Acquire/AcqRel in
+/// `take_reschedule_pending`.
+pub fn set_reschedule_pending_for(cpu: usize)
 {
-    let cpu = u64::from(crate::arch::current::cpu::current_cpu());
-    RESCHEDULE_PENDING.fetch_or(1u64 << cpu, core::sync::atomic::Ordering::Release);
+    let bit = 1u64 << cpu;
+    RESCHEDULE_PENDING.fetch_or(bit, core::sync::atomic::Ordering::Release);
 }
 
 /// Check and clear the reschedule-pending flag for a CPU.
 ///
 /// Returns `true` if a reschedule was pending (and clears the flag).
+/// `AcqRel`: Acquire side pairs with Release in `set_reschedule_pending_for`.
 pub fn take_reschedule_pending(cpu: usize) -> bool
 {
     let bit = 1u64 << cpu;
@@ -357,88 +365,79 @@ pub fn alloc_thread_id() -> u32
 
 /// Entry function for idle threads.
 ///
-/// Runs at priority 0. If any runnable threads are available, yields to the
-/// scheduler; otherwise halts the CPU until the next interrupt.
+/// Runs at priority 0. Implements the flag-first idle-wake primitive:
+/// each iteration disables interrupts, checks `take_reschedule_pending`
+/// and `has_runnable` together, and halts atomically if neither is set.
+///
+/// Correctness sketch — for every producer `enqueue_and_wake(T)` racing
+/// with this loop on CPU T:
+/// - If the flag-set or the enqueue becomes visible before the check:
+///   observed, dispatched immediately.
+/// - If the flag-set happens after the check but before the halt:
+///   interrupts are disabled, so the subsequent IPI is held pending at
+///   the halt boundary; `halt_until_interrupt` wakes atomically, the loop
+///   iterates, observes the flag, dispatches.
+/// - If the signal arrives during the halt: standard halt wake; loop
+///   iterates, observes the flag, dispatches.
+///
+/// No reliance on timer-tick recovery. See `RESCHEDULE_PENDING` doc and
+/// `halt_until_interrupt` on each arch.
 ///
 /// `_cpu_id` — logical CPU index (0-based).
 fn idle_thread_entry(_cpu_id: u64) -> !
 {
-    // Enable supervisor interrupts so wfi can be woken by the timer.
-    // switch() does not touch sstatus; SIE starts at 0 (from lock_raw).
-    // Idle must enable SIE explicitly here; sscratch=0 at this point
-    // (idle is !is_user) so any S-mode interrupt correctly takes the
-    // S-mode trap path.
-    #[cfg(not(test))]
-    // SAFETY: idle thread runs in supervisor mode with sscratch=0; enabling
-    // interrupts allows wfi wakeup without corrupting user-mode state.
-    unsafe {
-        crate::arch::current::interrupts::enable();
-    }
-
     loop
     {
-        // Check this CPU's run queue before halting. Each CPU consults its
-        // own scheduler via current_cpu().
         #[cfg(not(test))]
         {
             let cpu = crate::arch::current::cpu::current_cpu() as usize;
 
-            // Mark idle BEFORE checking the run queue. Any concurrent
-            // enqueue_and_wake that adds work after our check will see
-            // is_idle=true and send a wakeup IPI.
-            crate::percpu::mark_idle(cpu);
-
-            // Disable interrupts before the check on x86-64 only.
-            // sti;hlt atomically re-enables and halts — no lost wakeup.
-            //
-            // On RISC-V, SIE stays enabled (wfi with SIE=0 does not
-            // wake on QEMU). The reschedule_pending flag catches IPIs
-            // consumed between the check and wfi.
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: disabling interrupts is safe in ring-0; sti;hlt
-            // in halt_until_interrupt re-enables atomically.
+            // Step 1: disable interrupts. The check below and the halt must
+            // be on the same side of the interrupt-masking boundary so a
+            // concurrent producer-signal races into a pending interrupt
+            // rather than disappearing.
+            // SAFETY: ring-0 / S-mode; halt_until_interrupt re-enables.
             unsafe {
                 crate::arch::current::cpu::disable_interrupts();
             }
 
-            // SAFETY: SCHEDULERS[cpu] is initialized for this CPU.
+            // Step 2: mark idle inside the masked region. Advisory —
+            // `CPU_IDLE_MASK` is consulted by `wake_idle_cpu` as an
+            // optimisation hint; correctness does not depend on it.
+            crate::percpu::mark_idle(cpu);
+
+            // Step 3: atomic check of flag + run queue.
+            let pending = take_reschedule_pending(cpu);
+            // SAFETY: SCHEDULERS[cpu] is initialised for this CPU.
             let has_work = unsafe { SCHEDULERS[cpu].has_runnable() };
-            if has_work
+
+            if pending || has_work
             {
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: re-enables interrupts after the cli above.
+                crate::percpu::mark_active(cpu);
+                // SAFETY: paired with the `disable_interrupts` above.
                 unsafe {
                     crate::arch::current::interrupts::enable();
                 }
-                crate::percpu::mark_active(cpu);
-                // SAFETY: called from scheduler context on a valid kernel stack.
-                // requeue=true: idle thread is Running and should go back in queue.
-                unsafe {
-                    schedule(true);
+                if has_work
+                {
+                    // SAFETY: scheduler context on a valid kernel stack;
+                    // requeue=true so the idle thread goes back in queue.
+                    unsafe {
+                        schedule(true);
+                    }
                 }
+                continue;
             }
-            else if take_reschedule_pending(cpu)
-            {
-                // IPI handler set the flag — work was enqueued.
-                // Skip halt and re-check on next iteration.
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: re-enables interrupts after the cli above.
-                unsafe {
-                    crate::arch::current::interrupts::enable();
-                }
-                crate::percpu::mark_active(cpu);
-            }
-            else
-            {
-                // Genuinely idle. Halt until next interrupt.
-                //   x86-64: sti;hlt (atomic enable+halt)
-                //   RISC-V: wfi (SIE=1; timer provides bounded wakeup)
-                halt_until_interrupt();
-                crate::percpu::mark_active(cpu);
-            }
+
+            // Step 4: no work and no pending flag → halt. Atomic on both
+            // arches: x86 `sti;hlt`, RISC-V `wfi; csrsi sstatus, SIE`.
+            // Returns with interrupts enabled; any pending wake interrupt
+            // has been recognised.
+            halt_until_interrupt();
+            crate::percpu::mark_active(cpu);
         }
 
-        // Test mode: no actual halt; just loop.
+        // Test mode: no real halt; the primitive is a host-side no-op.
         #[cfg(test)]
         halt_until_interrupt();
     }
@@ -659,13 +658,25 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize, 
     // SAFETY: tcb is valid; lock is held.
     unsafe { (*tcb).preferred_cpu = target_cpu as u32 };
 
+    // Set the target's reschedule-pending flag under the lock, before
+    // releasing. This is load-bearing for the atomic wake primitive:
+    //
+    //   - The flag set is Release-ordered; the subsequent unlock publishes
+    //     both the enqueue and the flag to any CPU that observes the bit.
+    //   - A concurrent idle-loop `take_reschedule_pending` on the target
+    //     either sees the flag set (and skips halt), or sees it clear and
+    //     proceeds to halt — in which case the post-unlock IPI is pending
+    //     at the halt boundary and wakes it atomically.
+    set_reschedule_pending_for(target_cpu);
+
     // Release the lock before sending the IPI.
     // SAFETY: saved was returned by the matching lock_raw above.
     unsafe { sched.lock.unlock_raw(saved) };
 
-    // Wake the target CPU if it's idle. This breaks the CPU out of hlt/wfi
-    // so it can immediately pick up the newly enqueued work. The IPI is sent
-    // AFTER releasing the lock to minimize lock hold time.
+    // Send a wakeup IPI as a latency hint. Correctness no longer depends on
+    // the IPI arriving: the producer-side flag plus the atomic
+    // check-and-halt in the idle loop close the race. The IPI merely
+    // shortens the time until the target observes the wake.
     // SAFETY: target_cpu is validated < MAX_CPUS by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
 }
@@ -727,11 +738,12 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
     0
 }
 
-/// Wake an idle CPU if needed after enqueueing work.
+/// Send a wakeup IPI to `target_cpu`.
 ///
-/// If the target CPU is idle and not the current CPU, sends a wakeup IPI to
-/// break it out of `hlt`/`wfi`. No IPI is sent if the target is already active
-/// or if it is the current CPU (work will be picked up naturally on next schedule).
+/// Latency hint only. Correctness of `enqueue_and_wake` does not depend on
+/// this IPI being sent or delivered: the producer-side `RESCHEDULE_PENDING`
+/// bit plus the atomic check-and-halt in the idle loop guarantee the wake.
+/// The IPI merely shortens the time until the target observes the wake.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`).
@@ -740,26 +752,28 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
 {
     let current = crate::arch::current::cpu::current_cpu() as usize;
 
-    // Don't IPI ourselves; the newly enqueued thread will be picked up on the
-    // next schedule() call (either from sys_yield or timer preemption).
+    // Don't IPI ourselves; the newly enqueued thread is picked up on the
+    // next schedule() call (sys_yield, timer preemption, or the producer's
+    // own later return to scheduler context).
     if target_cpu == current
     {
         return;
     }
 
-    // Check if target is idle. Acquire ordering ensures we observe the idle bit
-    // after the target CPU completed its run queue check and set the bit.
+    // Skip the IPI if the target is not idle. The producer-side
+    // `RESCHEDULE_PENDING` flag is already set; a running target will
+    // observe it on its next scheduler entry without needing an
+    // interrupt to break anything.
     if !crate::percpu::is_idle(target_cpu)
     {
         return;
     }
 
-    // Send wakeup IPI. The IPI breaks the halt state; the handler just sends EOI.
-    // SAFETY: target_cpu is valid; apic_id_for returns the APIC/hart ID for the CPU.
+    // SAFETY: target_cpu is valid; apic_id_for returns the APIC/hart ID.
     let hw_id = unsafe { crate::percpu::apic_id_for(target_cpu) };
 
-    // SAFETY: hw_id is valid for an online CPU (APIC ID on x86-64, hart ID on RISC-V);
-    // send_wakeup_ipi is safe with a valid hardware ID.
+    // SAFETY: hw_id is valid for an online CPU (APIC ID on x86-64, hart ID
+    // on RISC-V); send_wakeup_ipi is safe with a valid hardware ID.
     unsafe {
         crate::arch::current::interrupts::send_wakeup_ipi(hw_id);
     }

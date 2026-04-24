@@ -6,8 +6,10 @@ each with a completion criterion and a defined failure mode.
 
 Any phase failure is fatal; the kernel halts with a diagnostic message.
 
-For the boot protocol contract (CPU state, BootInfo layout) that Phase 0 depends on,
-see [docs/boot-protocol.md](../../docs/boot-protocol.md).
+For the boot protocol contract (CPU state and register contents, BootInfo
+layout) that Phase 0 depends on, see
+[`boot/docs/kernel-handoff.md`](../../boot/docs/kernel-handoff.md) and the
+[`abi/boot-protocol/`](../../abi/boot-protocol/) crate.
 
 ---
 
@@ -220,35 +222,29 @@ and the syscall entry mechanism is installed.
 
 ## Phase 6: Platform Resource Validation
 
-Validates `platform_resources` entries before Phase 7 mints capabilities from them.
+Caches `kernel_mmio` and validates `mmio_apertures` before Phase 7 mints
+capabilities from it.
 
 ```
-1. If platform_resources.count == 0: skip validation, proceed with empty set.
-2. Verify platform_resources.entries is non-null (required when count > 0).
-3. Verify the slice falls within boot-provided physical memory:
-   - The entire range [entries, entries + count * size_of::<PlatformResource>())
+1. Copy BootInfo.kernel_mmio into the kernel-local KERNEL_MMIO cache.
+2. If mmio_apertures.count == 0: skip aperture validation, proceed with empty set.
+3. Verify mmio_apertures.entries is non-null (required when count > 0).
+4. Verify the slice falls within boot-provided physical memory:
+   - The entire range [entries, entries + count * size_of::<MmioAperture>())
      must be within regions the memory map marks as Usable or Loaded.
-4. For each PlatformResource entry:
-   a. Check resource_type is a known discriminant; skip with warning if not.
-   b. For MmioRange, PciEcam, PlatformTable, IommuUnit:
-      - Verify base is page-aligned; skip with warning if not.
-      - Verify size > 0 and size is page-aligned; skip with warning if not.
-      - Verify base + size does not wrap around; skip with warning if not.
-   c. For IoPortRange (x86-64 only):
-      - Verify base <= 0xFFFF; skip with warning if not.
-      - Verify base + size <= 0x10000; skip with warning if not.
-      - On RISC-V: skip all IoPortRange entries silently.
-   d. For IrqLine:
-      - Verify id is within the platform's interrupt number range; skip if not.
-5. Check for overlapping MmioRange and PciEcam entries (overlaps within a type
-   are invalid); skip the later entry with a warning.
-6. Emit: "platform resources: N entries validated (M skipped)"
+5. For each MmioAperture entry:
+   - Verify phys_base is page-aligned; skip with warning if not.
+   - Verify size > 0 and size is page-aligned; skip with warning if not.
+   - Verify phys_base + size does not wrap u64; skip with warning if not.
+6. Emit: "mmio apertures: N validated (M skipped)".
 ```
 
-**Failure mode:** Null `entries` when `count > 0`: halt with "fatal: platform_resources
-pointer is null with non-zero count". Individual bad entries: emit a warning and skip.
+**Failure mode:** Null `entries` when `count > 0`: halt with "fatal:
+mmio_apertures.entries is null with non-zero count". Individual bad
+entries: emit a warning and skip.
 
-**Completion criterion:** The validated platform resource list is available to Phase 7.
+**Completion criterion:** The validated aperture list is available to
+Phase 7, and `KERNEL_MMIO` is populated.
 
 ---
 
@@ -262,18 +258,18 @@ pointer is null with non-zero count". Individual bad entries: emit a warning and
 3. Populate the root CSpace with initial capabilities:
    a. Frame capabilities for all usable physical memory ranges
       (one capability per contiguous usable region from the memory map)
-   b. Capabilities from boot-provided platform resources (one per validated entry):
-      - MmioRange entries → MmioRegion capabilities (Map rights)
-      - IrqLine entries → Interrupt capabilities
-      - PciEcam entries → MmioRegion capabilities (ECAM is an MMIO range)
-      - PlatformTable entries → read-only Frame capabilities (Map rights only;
-        no Write or Execute — these are firmware tables for userspace reading)
-      - IoPortRange entries → IoPortRange capabilities (x86-64 only; Use rights)
-      - IommuUnit entries → MmioRegion capabilities (for devmgr to configure DMA)
-   c. One SchedControl capability (Elevate rights) — allows the holder to set
+   b. One MmioRegion capability (Map | Write rights) per validated
+      `BootInfo.mmio_apertures` entry. Userspace narrows these into
+      per-device sub-caps and distributes them to drivers.
+   c. One root IoPortRange capability (x86-64 only, Use rights) covering
+      the full 64K I/O port space; init subdivides for services that
+      need port I/O.
+   d. One SchedControl capability (Elevate rights) — allows the holder to set
       thread priorities in the elevated range (21–30); delegated by init to
       services that require real-time-ish scheduling priority
-   d. (Thread and process capabilities for init are added in Phase 9)
+   e. One SbiControl capability (RISC-V only; Call rights) for init to
+      forward SBI calls.
+   f. (Thread and process capabilities for init are added in Phase 9)
 4. Record the root CSpace pointer in a global for use in Phase 9
 5. Emit: "capability system initialised, N slots populated"
 ```

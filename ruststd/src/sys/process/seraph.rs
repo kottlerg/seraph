@@ -58,7 +58,7 @@ use crate::sys::unsupported;
 use super::CommandEnvs;
 use super::env::CommandEnv;
 
-use ipc::{IpcBuf, procmgr_errors, procmgr_labels};
+use ipc::{procmgr_errors, procmgr_labels};
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
 
@@ -253,42 +253,52 @@ impl Command {
         // this thread, installed at `_start` time; page-aligned, u64-aligned,
         // and mapped for the process lifetime.
         let ipc_ptr = info.ipc_buffer as *mut u64;
-        let ipc = unsafe { IpcBuf::from_raw(ipc_ptr) };
 
-        ipc.write_word(0, stdio_token);
-        let path_words = write_path_at_offset(ipc, 1, path_bytes);
-
+        let path_len = path_bytes.len().min(ipc::MAX_PATH_LEN);
+        let path_words = path_len.div_ceil(8);
         let argv_words = if args_blob.is_empty() {
             0
         } else {
-            ipc::write_blob_to_ipc(ipc, 1 + path_words, &args_blob)
+            args_blob.len().div_ceil(8)
         };
-
         let env_header_words = if env_count > 0 && !env_blob.is_empty() {
-            ipc.write_word(1 + path_words + argv_words, env_blob.len() as u64);
-            let ew = ipc::write_blob_to_ipc(ipc, 1 + path_words + argv_words + 1, &env_blob);
-            1 + ew
+            1 + env_blob.len().div_ceil(8)
         } else {
             0
         };
 
-        let data_words = 1 + path_words + argv_words + env_header_words;
+        let argv_word_offset = 1 + path_words;
+        let env_len_word_offset = argv_word_offset + argv_words;
+        let env_blob_word_offset = env_len_word_offset + 1;
 
-        let label = procmgr_labels::CREATE_FROM_VFS
+        let mut builder = ipc::IpcMessage::builder(procmgr_labels::CREATE_FROM_VFS
             | ((path_bytes.len() as u64) << 16)
             | ((args_blob.len() as u64) << 32)
             | ((u64::from(args_count)) << 48)
-            | ((u64::from(env_count)) << 56);
-        let (reply_label, _) = syscall::ipc_call(procmgr_ep, label, data_words, &[])
+            | ((u64::from(env_count)) << 56))
+            .word(0, stdio_token)
+            .bytes(1, &path_bytes[..path_len]);
+        if !args_blob.is_empty() {
+            builder = builder.bytes(argv_word_offset, &args_blob);
+        }
+        if env_count > 0 && !env_blob.is_empty() {
+            builder = builder
+                .word(env_len_word_offset, env_blob.len() as u64)
+                .bytes(env_blob_word_offset, &env_blob);
+        }
+        let total_words = 1 + path_words + argv_words + env_header_words;
+        let msg = builder.word_count(total_words).build();
+
+        // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page for
+        // this thread, installed at `_start` time.
+        let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) }
             .map_err(|_| io::Error::other("CREATE_FROM_VFS syscall failed"))?;
-        if reply_label != procmgr_errors::SUCCESS {
-            return Err(map_procmgr_error(reply_label));
+        if reply.label != procmgr_errors::SUCCESS {
+            return Err(map_procmgr_error(reply.label));
         }
 
-        // SAFETY: `ipc_ptr` is the registered IPC buffer; reply caps were
-        // written by the kernel before resuming the caller.
-        let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc_ptr) };
-        if cap_count < 2 {
+        let reply_caps = reply.caps();
+        if reply_caps.len() < 2 {
             return Err(io::Error::other(
                 "CREATE_FROM_VFS reply missing process_handle or thread cap",
             ));
@@ -299,16 +309,13 @@ impl Command {
         // Bind an `EventQueue` to the child's main thread BEFORE start, so a
         // short-lived child cannot exit before the binding lands and leave
         // `wait()` blocked forever.
+        let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
         let death_eq = match syscall::event_queue_create(4) {
             Ok(eq) => eq,
             Err(_) => {
                 let _ = syscall::cap_delete(thread_cap);
-                let _ = syscall::ipc_call(
-                    process_handle,
-                    procmgr_labels::DESTROY_PROCESS,
-                    0,
-                    &[],
-                );
+                // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
                 let _ = syscall::cap_delete(process_handle);
                 return Err(io::Error::other("event_queue_create for child failed"));
             }
@@ -319,31 +326,24 @@ impl Command {
         if syscall::thread_bind_notification(thread_cap, death_eq, 0).is_err() {
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
-            let _ = syscall::ipc_call(
-                process_handle,
-                procmgr_labels::DESTROY_PROCESS,
-                0,
-                &[],
-            );
+            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
             let _ = syscall::cap_delete(process_handle);
             return Err(io::Error::other("thread_bind_notification for child failed"));
         }
 
         // Kick the child off.
-        let (start_reply, _) =
-            syscall::ipc_call(process_handle, procmgr_labels::START_PROCESS, 0, &[])
-                .map_err(|_| io::Error::other("START_PROCESS syscall failed"))?;
-        if start_reply != procmgr_errors::SUCCESS {
+        let start_msg = ipc::IpcMessage::new(procmgr_labels::START_PROCESS);
+        // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+        let start_reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_ptr) }
+            .map_err(|_| io::Error::other("START_PROCESS syscall failed"))?;
+        if start_reply.label != procmgr_errors::SUCCESS {
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
-            let _ = syscall::ipc_call(
-                process_handle,
-                procmgr_labels::DESTROY_PROCESS,
-                0,
-                &[],
-            );
+            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
             let _ = syscall::cap_delete(process_handle);
-            return Err(map_procmgr_error(start_reply));
+            return Err(map_procmgr_error(start_reply.label));
         }
 
         Ok((
@@ -436,12 +436,12 @@ impl Process {
         // a user-initiated kill from a hardware fault.
         const EXIT_KILLED: u64 = 0x2000;
         let _ = syscall::event_post(self.death_eq, EXIT_KILLED);
-        let _ = syscall::ipc_call(
-            self.process_handle,
-            procmgr_labels::DESTROY_PROCESS,
-            0,
-            &[],
-        );
+        if let Some(info) = crate::os::seraph::try_startup_info() {
+            let ipc_ptr = info.ipc_buffer as *mut u64;
+            let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_call(self.process_handle, &destroy_msg, ipc_ptr) };
+        }
         Ok(())
     }
 
@@ -482,12 +482,12 @@ impl Drop for Process {
             // here — cap_revoke-driven teardown posts nothing to the queue,
             // so a recv would block forever. `cap_delete` on the queue
             // below is sufficient.
-            let _ = syscall::ipc_call(
-                self.process_handle,
-                procmgr_labels::DESTROY_PROCESS,
-                0,
-                &[],
-            );
+            if let Some(info) = crate::os::seraph::try_startup_info() {
+                let ipc_ptr = info.ipc_buffer as *mut u64;
+                let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+                // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_call(self.process_handle, &destroy_msg, ipc_ptr) };
+            }
         }
         let _ = syscall::cap_delete(self.death_eq);
         let _ = syscall::cap_delete(self.thread_cap);
@@ -635,22 +635,6 @@ fn pack_short_name(name: &[u8]) -> u64 {
     let n = name.len().min(8);
     buf[..n].copy_from_slice(&name[..n]);
     u64::from_le_bytes(buf)
-}
-
-fn write_path_at_offset(ipc: IpcBuf, word_offset: usize, path: &[u8]) -> usize {
-    let n = path.len().min(ipc::MAX_PATH_LEN);
-    let words = n.div_ceil(8);
-    for i in 0..words {
-        let mut word: u64 = 0;
-        let base = i * 8;
-        for j in 0..8 {
-            if base + j < n {
-                word |= u64::from(path[base + j]) << (j * 8);
-            }
-        }
-        ipc.write_word(word_offset + i, word);
-    }
-    words
 }
 
 fn map_procmgr_error(code: u64) -> io::Error {

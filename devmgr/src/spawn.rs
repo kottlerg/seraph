@@ -10,7 +10,7 @@
 //! endpoint, devmgr query endpoint). log + procmgr caps arrive via
 //! `ProcessInfo` and are not part of this protocol.
 
-use ipc::{IpcBuf, procmgr_labels};
+use ipc::{IpcMessage, procmgr_labels};
 
 /// Monotonic counter for driver-child bootstrap tokens.
 static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -59,7 +59,7 @@ pub struct DriverSpawnConfig<'a>
 // requires passing the same `DriverSpawnConfig` to each. The linear
 // presentation matches the bootstrap protocol one-to-one.
 #[allow(clippy::too_many_lines)]
-pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
+pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
 {
     let _ = config.bars.bases;
     let _ = config.bars.sizes;
@@ -93,27 +93,29 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
         return;
     };
 
-    // Phase 1: CREATE_PROCESS via procmgr.
-    let Ok((reply_label, _)) = syscall::ipc_call(
-        procmgr_ep,
-        procmgr_labels::CREATE_PROCESS,
-        0,
-        &[module_cap, tokened_creator],
-    )
+    // Phase 1: CREATE_PROCESS via procmgr. Word 0 is the stdio_token; zero
+    // means "no stdio attached" (drivers emit their log lines via the log
+    // endpoint delivered in ProcessInfo, not stdout).
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+        .word(0, 0)
+        .cap(module_cap)
+        .cap(tokened_creator)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
         println!("devmgr: driver CREATE_PROCESS ipc_call failed");
         return;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         println!("devmgr: driver CREATE_PROCESS failed");
         return;
     }
 
-    // SAFETY: ipc is registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 2
+    let reply_caps = reply.caps();
+    if reply_caps.len() < 2
     {
         println!("devmgr: driver CREATE_PROCESS reply missing caps");
         return;
@@ -147,24 +149,30 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
     };
 
     // START_PROCESS.
-    if !matches!(
-        syscall::ipc_call(process_handle, procmgr_labels::START_PROCESS, 0, &[]),
-        Ok((0, _))
-    )
+    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let start_ok = matches!(
+        unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) },
+        Ok(r) if r.label == 0
+    );
+    if !start_ok
     {
         println!("devmgr: driver START_PROCESS failed");
         return;
     }
 
     // Serve bootstrap round 1: [bar, irq, service].
-    if ipc::bootstrap::serve_round(
-        bootstrap_ep,
-        child_token,
-        ipc,
-        false,
-        &[bar_copy, irq_copy, service_copy],
-        &[],
-    )
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    if unsafe {
+        ipc::bootstrap::serve_round(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            false,
+            &[bar_copy, irq_copy, service_copy],
+            &[],
+        )
+    }
     .is_err()
     {
         println!("devmgr: driver bootstrap round 1 failed");
@@ -172,8 +180,18 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc: IpcBuf)
     }
 
     // Round 2: [devmgr_query], done.
-    if ipc::bootstrap::serve_round(bootstrap_ep, child_token, ipc, true, &[devmgr_copy], &[])
-        .is_err()
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    if unsafe {
+        ipc::bootstrap::serve_round(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            true,
+            &[devmgr_copy],
+            &[],
+        )
+    }
+    .is_err()
     {
         println!("devmgr: driver bootstrap round 2 failed");
         return;

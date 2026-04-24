@@ -59,9 +59,13 @@ how devmgr uses them.
 | MMIO Region (per platform resource) | Map | Map device register regions into driver address spaces |
 | Interrupt (per IRQ line) | — | Delegate to drivers for hardware interrupt delivery |
 | IoPortRange (x86-64, per range) | Use | Delegate to drivers requiring port I/O |
-| IommuUnit (per IOMMU) | Map | Configure IOMMU domain mappings for DMA isolation |
-| Frame (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob |
+| Frame (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob, including full IOMMU topology (DMAR on x86-64, `iommu` / `iommu-map` on RISC-V) |
 | SchedControl | Elevate | Assign elevated priorities to latency-sensitive drivers |
+
+IOMMU register regions are not pre-minted as distinct capabilities.
+`devmgr` discovers IOMMU units from the firmware passthrough (DMAR or
+DTB) and acquires MMIO-region caps for their register ranges through
+the same `MmioRegion` flow as any other device.
 
 ---
 
@@ -83,7 +87,7 @@ MUST NOT be started independently of devmgr. See
 | [docs/capability-model.md](../docs/capability-model.md) | Capability types, rights, delegation, revocation |
 | [docs/architecture.md](../docs/architecture.md) | Bootstrap sequence, service roles |
 | [docs/ipc-design.md](../docs/ipc-design.md) | IPC semantics, device registry endpoint |
-| [docs/boot-protocol.md](../docs/boot-protocol.md) | Platform resource descriptors, firmware table passthrough |
+| [abi/boot-protocol/](../abi/boot-protocol/) | Platform resource descriptors, firmware table passthrough |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

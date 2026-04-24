@@ -25,30 +25,26 @@ pub fn read_sector(
     ipc_buf: *mut u64,
 ) -> bool
 {
+    let msg = ipc::IpcMessage::builder(blk_labels::READ_BLOCK)
+        .word(0, sector)
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    ipc.write_word(0, sector);
-
-    let Ok((reply_label, _data_count)) =
-        syscall::ipc_call(block_dev, blk_labels::READ_BLOCK, 1, &[])
+    let Ok(reply) = (unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) })
     else
     {
         return false;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         return false;
     }
 
-    // Copy sector data from IPC buffer BEFORE any log() calls — log() uses
-    // the same IPC buffer and would overwrite the reply data.
-    for i in 0..64
+    let bytes = reply.data_bytes();
+    if bytes.len() < SECTOR_SIZE
     {
-        let word = ipc.read_word(i);
-        let base = i * 8;
-        let bytes = word.to_le_bytes();
-        buf[base..base + 8].copy_from_slice(&bytes);
+        return false;
     }
+    buf.copy_from_slice(&bytes[..SECTOR_SIZE]);
 
     true
 }
@@ -76,6 +72,15 @@ pub fn next_cluster(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
+    // Clusters 0 and 1 are reserved by the FAT spec and never valid as a
+    // chain continuation. Noisy-return rather than panic so the upstream
+    // read failure (the usual cause) is visible.
+    if cluster < 2
+    {
+        println!("fatfs: WARNING: next_cluster called with reserved cluster {cluster}");
+        return None;
+    }
+
     let (fat_offset, fat_sector, entry_offset) = match state.fat_type
     {
         FatType::Fat16 =>
@@ -149,6 +154,20 @@ pub fn next_cluster(
             raw
         }
     };
+
+    // Clusters 0 and 1 are reserved; a FAT entry pointing at them
+    // means either the chain is corrupt or the FAT-sector read returned
+    // zeros (common failure mode for a racing block driver). Log loud
+    // and stop walking — silent return would mask the real problem.
+    if val < 2
+    {
+        println!(
+            "fatfs: WARNING: FAT chain at cluster {cluster} points to reserved cluster \
+             {val} (fat_sector={fat_sector}, entry_offset={entry_offset}) \
+             — possible block-read corruption"
+        );
+        return None;
+    }
 
     Some(val)
 }

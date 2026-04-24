@@ -19,6 +19,7 @@ mod concurrent_ipc;
 mod concurrent_map_unmap;
 mod concurrent_signal;
 mod event_queue_fill_drain;
+mod idle_wake_race;
 mod thread_churn;
 
 use crate::{ChildStack, TestContext, run_integration_test};
@@ -40,6 +41,7 @@ pub fn run_all(ctx: &TestContext)
         "stress::event_queue_fill_drain",
         event_queue_fill_drain::run(ctx)
     );
+    run_integration_test!("stress::idle_wake_race", idle_wake_race::run(ctx));
     run_integration_test!("stress::thread_churn", thread_churn::run(ctx));
     run_integration_test!("stress::cap_delete_running", cap_delete_running::run(ctx));
     run_integration_test!("stress::concurrent_signal", concurrent_signal::run(ctx));

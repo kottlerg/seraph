@@ -27,7 +27,7 @@ mod loader;
 mod process;
 
 use frames::FramePool;
-use ipc::{IpcBuf, procmgr_errors, procmgr_labels};
+use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, ProcessInfo, StartupInfo, process_info_ref,
 };
@@ -112,13 +112,14 @@ struct InitBootstrap
     frame_count: u32,
 }
 
-fn bootstrap_from_init(creator_ep: u32, ipc: IpcBuf) -> Option<InitBootstrap>
+fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstrap>
 {
     if creator_ep == 0
     {
         return None;
     }
-    let round = ipc::bootstrap::request_round(creator_ep, ipc).ok()?;
+    // SAFETY: caller passes the registered IPC buffer page.
+    let round = unsafe { ipc::bootstrap::request_round(creator_ep, ipc_buf) }.ok()?;
     if round.data_words < 2 || round.cap_count < 1 || !round.done
     {
         return None;
@@ -133,8 +134,8 @@ fn bootstrap_from_init(creator_ep: u32, ipc: IpcBuf) -> Option<InitBootstrap>
         {
             0
         },
-        frame_base: ipc.read_word(0) as u32,
-        frame_count: ipc.read_word(1) as u32,
+        frame_base: round.data[0] as u32,
+        frame_count: round.data[1] as u32,
     })
 }
 
@@ -147,12 +148,13 @@ fn main(startup: &StartupInfo) -> !
     }
 
     let self_aspace = startup.self_aspace;
-    // SAFETY: IPC buffer is page-aligned and registered.
-    let ipc = unsafe { IpcBuf::from_bytes(startup.ipc_buffer) };
-    let ipc_buf = ipc.as_ptr();
+    // IPC buffer page is page-aligned and registered; treat as `*mut u64` for
+    // the new IpcMessage-snapshot IPC wrappers.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = startup.ipc_buffer.cast::<u64>();
 
     // Bootstrap service endpoint + memory pool bounds + log endpoint from init.
-    let Some(boot) = bootstrap_from_init(startup.creator_endpoint, ipc)
+    let Some(boot) = bootstrap_from_init(startup.creator_endpoint, ipc_buf)
     else
     {
         syscall::thread_exit();
@@ -173,45 +175,43 @@ fn main(startup: &StartupInfo) -> !
 
     loop
     {
-        let Ok((label, token)) = syscall::ipc_recv(service_ep)
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let Ok(req) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
         else
         {
             continue;
         };
+        let label = req.label;
+        let token = req.token;
 
         match label & 0xFFFF
         {
             procmgr_labels::CREATE_PROCESS =>
             {
-                handle_create(label, ipc_buf, &mut pool, &ctx, &mut table);
+                handle_create(&req, ipc_buf, &mut pool, &ctx, &mut table);
             }
 
             procmgr_labels::START_PROCESS =>
             {
                 // Token from ipc_recv identifies which process to start.
-                match process::start_process(token, &mut table, ctx.death_eq)
+                let code = match process::start_process(token, &mut table, ctx.death_eq)
                 {
-                    Ok(()) =>
-                    {
-                        let _ = syscall::ipc_reply(procmgr_errors::SUCCESS, 0, &[]);
-                    }
-                    Err(code) =>
-                    {
-                        let _ = syscall::ipc_reply(code, 0, &[]);
-                    }
-                }
+                    Ok(()) => procmgr_errors::SUCCESS,
+                    Err(code) => code,
+                };
+                reply_empty(ipc_buf, code);
             }
 
             procmgr_labels::REQUEST_FRAMES =>
             {
-                handle_request_frames(ipc_buf, &mut pool);
+                handle_request_frames(&req, ipc_buf, &mut pool);
             }
 
             procmgr_labels::DESTROY_PROCESS =>
             {
                 // Token from ipc_recv identifies which process to destroy.
                 process::destroy_process(token, &mut table);
-                let _ = syscall::ipc_reply(procmgr_errors::SUCCESS, 0, &[]);
+                reply_empty(ipc_buf, procmgr_errors::SUCCESS);
             }
 
             procmgr_labels::QUERY_PROCESS =>
@@ -220,58 +220,66 @@ fn main(startup: &StartupInfo) -> !
                 //   word 0 = state code (see `procmgr_process_state`)
                 //   word 1 = exit_reason (0 until auto-reap lands)
                 use ipc::procmgr_process_state;
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let ipc_ref = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
                 let (state, exit_reason) = match table.query_by_token(token)
                 {
                     Some(true) => (procmgr_process_state::ALIVE, 0u64),
                     Some(false) => (procmgr_process_state::CREATED, 0u64),
                     None => (procmgr_process_state::UNKNOWN, 0u64),
                 };
-                ipc_ref.write_word(0, state);
-                ipc_ref.write_word(1, exit_reason);
-                let _ = syscall::ipc_reply(procmgr_errors::SUCCESS, 2, &[]);
+                let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+                    .word(0, state)
+                    .word(1, exit_reason)
+                    .build();
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             }
 
             procmgr_labels::CREATE_FROM_VFS =>
             {
-                handle_create_from_vfs(label, ipc_buf, &ctx, &mut pool, &mut table);
+                handle_create_from_vfs(&req, ipc_buf, &ctx, &mut pool, &mut table);
             }
 
             procmgr_labels::SET_VFSD_EP =>
             {
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let (cap_count, caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
-
-                if cap_count > 0
+                let caps = req.caps();
+                if caps.is_empty()
                 {
-                    ctx.vfsd_ep = caps[0];
-                    let _ = syscall::ipc_reply(procmgr_errors::SUCCESS, 0, &[]);
+                    reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
                 }
                 else
                 {
-                    let _ = syscall::ipc_reply(procmgr_errors::INVALID_ARGUMENT, 0, &[]);
+                    ctx.vfsd_ep = caps[0];
+                    reply_empty(ipc_buf, procmgr_errors::SUCCESS);
                 }
             }
 
             _ =>
             {
-                let _ = syscall::ipc_reply(procmgr_errors::UNKNOWN_OPCODE, 0, &[]);
+                reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
             }
         }
     }
 }
 
+/// Reply with the given label code and no data / no caps.
+fn reply_empty(ipc_buf: *mut u64, code: u64)
+{
+    let msg = IpcMessage::new(code);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
+}
+
 /// Reply with a successful process creation result.
 ///
 /// Reply caps: `[process_handle, thread]`.
-fn reply_create_result(result: &process::CreateResult)
+fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 {
-    let _ = syscall::ipc_reply(
-        procmgr_errors::SUCCESS,
-        0,
-        &[result.process_handle, result.thread_for_caller],
-    );
+    let msg = IpcMessage::builder(procmgr_errors::SUCCESS)
+        .cap(result.process_handle)
+        .cap(result.thread_for_caller)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
 }
 
 /// Handle `CREATE_PROCESS` — create a process from a boot module frame.
@@ -297,29 +305,27 @@ fn reply_create_result(result: &process::CreateResult)
 /// is optional — pass zero / omit when the child has no stdin.
 #[allow(clippy::cast_possible_truncation)]
 fn handle_create(
-    label: u64,
+    req: &IpcMessage,
     ipc_buf: *mut u64,
     pool: &mut FramePool,
     ctx: &ProcmgrCtx,
     table: &mut process::ProcessTable,
 )
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page, page-aligned.
-    let (cap_count, caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
+    let label = req.label;
+    let caps = req.caps();
 
-    if cap_count == 0
+    if caps.is_empty()
     {
-        let _ = syscall::ipc_reply(procmgr_errors::INVALID_ELF, 0, &[]);
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ELF);
         return;
     }
 
     let module_cap = caps[0];
-    let creator_ep = if cap_count >= 2 { caps[1] } else { 0 };
-    let stdin_cap = if cap_count >= 3 { caps[2] } else { 0 };
+    let creator_ep = if caps.len() >= 2 { caps[1] } else { 0 };
+    let stdin_cap = if caps.len() >= 3 { caps[2] } else { 0 };
 
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc_ref = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    let stdio_token = ipc_ref.read_word(0);
+    let stdio_token = req.word(0);
 
     let args_bytes = ((label >> 32) & 0xFFFF) as usize;
     let args_count = ((label >> 48) & 0xFF) as u32;
@@ -328,7 +334,7 @@ fn handle_create(
     let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
     {
-        ipc::read_blob_from_ipc(ipc_ref, 1, args_bytes, &mut args_buf);
+        copy_bytes_from_msg(req, 1, args_bytes, &mut args_buf);
         &args_buf[..args_bytes]
     }
     else
@@ -343,10 +349,10 @@ fn handle_create(
     let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let env_blob: &[u8] = if env_count > 0
     {
-        let env_bytes = (ipc_ref.read_word(1 + argv_words) & 0xFFFF) as usize;
+        let env_bytes = (req.word(1 + argv_words) & 0xFFFF) as usize;
         if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
         {
-            ipc::read_blob_from_ipc(ipc_ref, 1 + argv_words + 1, env_bytes, &mut env_buf);
+            copy_bytes_from_msg(req, 1 + argv_words + 1, env_bytes, &mut env_buf);
             &env_buf[..env_bytes]
         }
         else
@@ -410,24 +416,22 @@ fn handle_create(
 
     match result
     {
-        Some(result) => reply_create_result(&result),
+        Some(result) => reply_create_result(&result, ipc_buf),
         None =>
         {
-            let _ = syscall::ipc_reply(procmgr_errors::OUT_OF_MEMORY, 0, &[]);
+            reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
         }
     }
 }
 
 /// Handle `REQUEST_FRAMES` — allocate and return physical memory frames.
-fn handle_request_frames(ipc_buf: *mut u64, pool: &mut FramePool)
+fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64, pool: &mut FramePool)
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    let requested = ipc.read_word(0);
+    let requested = req.word(0);
 
     if requested == 0 || requested > 4
     {
-        let _ = syscall::ipc_reply(procmgr_errors::INVALID_ARGUMENT, 0, &[]);
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     }
 
@@ -449,12 +453,18 @@ fn handle_request_frames(ipc_buf: *mut u64, pool: &mut FramePool)
 
     if granted == 0
     {
-        let _ = syscall::ipc_reply(procmgr_errors::REQUEST_FRAMES_OOM, 0, &[]);
+        reply_empty(ipc_buf, procmgr_errors::REQUEST_FRAMES_OOM);
     }
     else
     {
-        ipc.write_word(0, granted);
-        let _ = syscall::ipc_reply(procmgr_errors::SUCCESS, 1, &caps[..granted as usize]);
+        let mut builder = IpcMessage::builder(procmgr_errors::SUCCESS).word(0, granted);
+        for &cap in caps.iter().take(granted as usize)
+        {
+            builder = builder.cap(cap);
+        }
+        let reply = builder.build();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     }
 }
 
@@ -509,38 +519,37 @@ pub struct ProcmgrCtx
 /// encoding (see `handle_create`).
 #[allow(clippy::cast_possible_truncation)]
 fn handle_create_from_vfs(
-    label: u64,
+    req: &IpcMessage,
     ipc_buf: *mut u64,
     ctx: &ProcmgrCtx,
     pool: &mut FramePool,
     table: &mut process::ProcessTable,
 )
 {
+    let label = req.label;
+
     if ctx.vfsd_ep == 0
     {
-        let _ = syscall::ipc_reply(procmgr_errors::NO_VFSD_ENDPOINT, 0, &[]);
+        reply_empty(ipc_buf, procmgr_errors::NO_VFSD_ENDPOINT);
         return;
     }
 
     let path_len = ((label >> 16) & 0xFFFF) as usize;
     if path_len == 0 || path_len > ipc::MAX_PATH_LEN
     {
-        let _ = syscall::ipc_reply(procmgr_errors::FILE_NOT_FOUND, 0, &[]);
+        reply_empty(ipc_buf, procmgr_errors::FILE_NOT_FOUND);
         return;
     }
 
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let (cap_count, caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
-    let creator_ep = if cap_count >= 1 { caps[0] } else { 0 };
-    let stdin_cap = if cap_count >= 2 { caps[1] } else { 0 };
+    let caps = req.caps();
+    let creator_ep = caps.first().copied().unwrap_or(0);
+    let stdin_cap = if caps.len() >= 2 { caps[1] } else { 0 };
 
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc_ref = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    let stdio_token = ipc_ref.read_word(0);
+    let stdio_token = req.word(0);
 
     let mut path_buf = [0u8; ipc::MAX_PATH_LEN];
     // Path begins at word 1 (word 0 is stdio_token).
-    let effective_path_len = read_path_at_offset(ipc_ref, 1, path_len, &mut path_buf);
+    let effective_path_len = read_path_from_msg(req, 1, path_len, &mut path_buf);
     let path_words = path_len.div_ceil(8);
 
     let args_bytes = ((label >> 32) & 0xFFFF) as usize;
@@ -550,7 +559,7 @@ fn handle_create_from_vfs(
     let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
     {
-        ipc::read_blob_from_ipc(ipc_ref, 1 + path_words, args_bytes, &mut args_buf);
+        copy_bytes_from_msg(req, 1 + path_words, args_bytes, &mut args_buf);
         &args_buf[..args_bytes]
     }
     else
@@ -562,11 +571,11 @@ fn handle_create_from_vfs(
     let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let env_blob: &[u8] = if env_count > 0
     {
-        let env_bytes = (ipc_ref.read_word(1 + path_words + argv_words) & 0xFFFF) as usize;
+        let env_bytes = (req.word(1 + path_words + argv_words) & 0xFFFF) as usize;
         if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
         {
-            ipc::read_blob_from_ipc(
-                ipc_ref,
+            copy_bytes_from_msg(
+                req,
                 1 + path_words + argv_words + 1,
                 env_bytes,
                 &mut env_buf,
@@ -616,36 +625,47 @@ fn handle_create_from_vfs(
 
     match result
     {
-        Ok(result) => reply_create_result(&result),
+        Ok(result) => reply_create_result(&result, ipc_buf),
         Err(code) =>
         {
-            let _ = syscall::ipc_reply(code, 0, &[]);
+            reply_empty(ipc_buf, code);
         }
     }
 }
 
-/// Unpack `path_len` bytes from u64 words starting at `word_offset`. Local
-/// helper because `ipc::read_path_from_ipc` is hard-coded to start at word 0.
-fn read_path_at_offset(
-    ipc: ipc::IpcBuf,
+/// Unpack `path_len` bytes from the IPC message's data bytes starting at
+/// word offset `word_offset`. Returns the number of bytes actually written
+/// to `buf`, capped at `buf.len()` and `MAX_PATH_LEN`.
+fn read_path_from_msg(
+    msg: &IpcMessage,
     word_offset: usize,
     path_len: usize,
     buf: &mut [u8],
 ) -> usize
 {
     let effective_len = path_len.min(buf.len()).min(ipc::MAX_PATH_LEN);
-    let word_count = effective_len.div_ceil(8);
-    for i in 0..word_count
+    let bytes = msg.data_bytes();
+    let src_start = word_offset * 8;
+    let avail = bytes.len().saturating_sub(src_start);
+    let copy_len = effective_len.min(avail);
+    if copy_len > 0
     {
-        let word = ipc.read_word(word_offset + i);
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < effective_len
-            {
-                buf[base + j] = (word >> (j * 8)) as u8;
-            }
-        }
+        buf[..copy_len].copy_from_slice(&bytes[src_start..src_start + copy_len]);
     }
-    effective_len
+    copy_len
+}
+
+/// Copy up to `len` bytes from the IPC message's data-byte view into `dst`,
+/// starting at word offset `word_offset`. Used to extract argv/env blobs
+/// from positions other than the start of the data area.
+fn copy_bytes_from_msg(msg: &IpcMessage, word_offset: usize, len: usize, dst: &mut [u8])
+{
+    let bytes = msg.data_bytes();
+    let src_start = word_offset * 8;
+    let avail = bytes.len().saturating_sub(src_start);
+    let copy_len = len.min(dst.len()).min(avail);
+    if copy_len > 0
+    {
+        dst[..copy_len].copy_from_slice(&bytes[src_start..src_start + copy_len]);
+    }
 }

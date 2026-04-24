@@ -143,7 +143,11 @@ pub struct Elf64Phdr
     pub p_offset: u64,
     /// Virtual address at which the segment is to be loaded.
     pub p_vaddr: u64,
-    /// Physical address of the segment (unused for userspace loading).
+    /// Physical address of the segment.
+    ///
+    /// Userspace loaders ignore this field (they place segments at any
+    /// available physical address). The bootloader honours it for the
+    /// kernel image, where the ELF dictates a fixed physical placement.
     pub p_paddr: u64,
     /// Number of bytes in the file image of the segment.
     pub p_filesz: u64,
@@ -164,6 +168,12 @@ pub struct LoadSegment
 {
     /// Virtual address at which this segment must be mapped.
     pub vaddr: u64,
+    /// Physical address declared by the ELF (`p_paddr`).
+    ///
+    /// Userspace loaders ignore this and pick any available physical
+    /// address. The bootloader honours it for the kernel image, which
+    /// requires fixed placement.
+    pub paddr: u64,
     /// Byte offset within the ELF file where segment data starts.
     pub offset: u64,
     /// Number of bytes of file data to copy (`p_filesz`).
@@ -325,6 +335,7 @@ impl Iterator for LoadSegmentIter<'_>
 
             return Some(Ok(LoadSegment {
                 vaddr: phdr.p_vaddr,
+                paddr: phdr.p_paddr,
                 offset: phdr.p_offset,
                 filesz: phdr.p_filesz,
                 memsz: phdr.p_memsz,
@@ -406,6 +417,7 @@ impl Iterator for LoadSegmentMetaIter<'_>
 
             return Some(Ok(LoadSegment {
                 vaddr: phdr.p_vaddr,
+                paddr: phdr.p_paddr,
                 offset: phdr.p_offset,
                 filesz: phdr.p_filesz,
                 memsz: phdr.p_memsz,

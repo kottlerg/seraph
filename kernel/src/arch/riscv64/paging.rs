@@ -69,12 +69,11 @@ impl PageTableEntry
     ///
     /// `phys` must be 4 KiB-aligned.
     ///
-    /// Note: `flags.uncacheable` has no effect on RISC-V QEMU virt — MMIO
-    /// physical addresses are inherently device-ordered by the platform memory
-    /// map. No PTE bits need to be set for correct behavior on this target.
-    // TODO: On hardware with Svpbmt, set PTE bits [62:61] = 01
-    // (NC) when flags.uncacheable is true. Pick up when targeting non-QEMU
-    // RISC-V hardware.
+    /// Note: `flags.uncacheable` has no effect under Sv48 without Svpbmt —
+    /// MMIO physical addresses are inherently device-ordered by the platform
+    /// memory map. No PTE bits need to be set for correct behavior.
+    // TODO: With Svpbmt, set PTE bits [62:61] = 01 (NC) when
+    // flags.uncacheable is true. Pick up when adding Svpbmt support.
     pub fn new_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");

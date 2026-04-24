@@ -232,7 +232,11 @@ impl PerCpuScheduler
         );
         self.increment_load();
         self.queues[p].enqueue(tcb);
-        self.non_empty.fetch_or(1 << p, Ordering::Relaxed);
+        // Release: publishes the queue write and the increment_load store to any
+        // CPU that observes this bit via Acquire in `has_runnable`. The idle
+        // loop relies on this: it is lockless, so the Acquire load of
+        // `non_empty` is the only synchronisation edge with cross-CPU enqueues.
+        self.non_empty.fetch_or(1 << p, Ordering::Release);
     }
 
     /// Dequeue the highest-priority ready TCB, or return `idle` if all queues
@@ -271,8 +275,10 @@ impl PerCpuScheduler
         }
         if self.queues[priority].is_empty()
         {
+            // Release: a later Acquire load that sees this bit cleared has
+            // also seen the dequeue store above.
             self.non_empty
-                .fetch_and(!(1 << priority), Ordering::Relaxed);
+                .fetch_and(!(1 << priority), Ordering::Release);
         }
         self.decrement_load();
         tcb
@@ -292,10 +298,11 @@ impl PerCpuScheduler
 
     /// Return `true` if any thread is ready to run (non-empty run queues).
     ///
-    /// Acquire ordering synchronizes with the Release in the scheduler
-    /// lock unlock on the enqueueing CPU. On RISC-V (RVWMO) this ensures
-    /// the idle loop sees enqueue stores from other CPUs without holding
-    /// the lock.
+    /// Lockless. Acquire pairs with the Release `fetch_or` in `enqueue`
+    /// (and the Release `fetch_and` in `remove_from_queue`/dequeue paths):
+    /// observing a set bit means the queue-entry stores from the enqueueing
+    /// CPU are visible; observing a clear bit means the dequeue that cleared
+    /// it is visible. Used by the idle loop without holding `self.lock`.
     pub fn has_runnable(&self) -> bool
     {
         self.non_empty.load(Ordering::Acquire) != 0
@@ -317,7 +324,7 @@ impl PerCpuScheduler
         }
         if self.queues[p].remove(tcb) && self.queues[p].is_empty()
         {
-            self.non_empty.fetch_and(!(1 << p), Ordering::Relaxed);
+            self.non_empty.fetch_and(!(1 << p), Ordering::Release);
         }
     }
 
@@ -342,12 +349,13 @@ impl PerCpuScheduler
         // Remove from old queue (best-effort; TCB may have been dequeued already).
         if self.queues[old].remove(tcb) && self.queues[old].is_empty()
         {
-            self.non_empty.fetch_and(!(1 << old), Ordering::Relaxed);
+            self.non_empty.fetch_and(!(1 << old), Ordering::Release);
         }
 
-        // Enqueue at new priority.
+        // Enqueue at new priority. Release pairs with the idle loop's
+        // Acquire in `has_runnable`.
         self.queues[new].enqueue(tcb);
-        self.non_empty.fetch_or(1 << new, Ordering::Relaxed);
+        self.non_empty.fetch_or(1 << new, Ordering::Release);
     }
 
     /// Increment the load counter when a thread becomes runnable.

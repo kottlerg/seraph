@@ -20,10 +20,10 @@
 //!   4. Replies to the child.
 //!   5. Waits for the child's post-transfer verification result.
 
+use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, ipc_call, ipc_recv, ipc_reply, read_recv_caps, signal_send, signal_wait,
-    thread_configure, thread_exit, thread_start,
+    cap_delete, signal_send, signal_wait, thread_configure, thread_exit, thread_start,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -88,19 +88,19 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Server: receive the child's IPC call. ─────────────────────────────────
     crate::log("cap_transfer: server blocking on ipc_recv");
-    ipc_recv(ep).map_err(|_| "integration::cap_transfer: ipc_recv failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "integration::cap_transfer: ipc_recv failed")?;
     crate::log("cap_transfer: server ipc_recv returned");
 
-    // Read the transferred cap from the IPC buffer.
-    // SAFETY: ctx.ipc_buf is the registered IPC buffer; the kernel wrote cap
-    // results here as part of ipc_recv.
-    let (cap_count, cap_indices) = unsafe { read_recv_caps(ctx.ipc_buf) };
-    crate::log_u64("cap_transfer: cap_count=", cap_count as u64);
-    if cap_count != 1
+    // Transferred cap slot indices live on the returned IpcMessage.
+    let caps = msg.caps();
+    crate::log_u64("cap_transfer: cap_count=", caps.len() as u64);
+    if caps.len() != 1
     {
         return Err("integration::cap_transfer: expected exactly 1 transferred cap");
     }
-    let recv_sig = cap_indices[0];
+    let recv_sig = caps[0];
     crate::log_u64("cap_transfer: recv_sig slot=", u64::from(recv_sig));
 
     // Verify the transferred cap is usable.
@@ -110,7 +110,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     crate::log("cap_transfer: signal_send OK, calling ipc_reply");
 
     // Reply to the child (no caps, no data).
-    ipc_reply(0, 0, &[]).map_err(|_| "integration::cap_transfer: ipc_reply failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
+        .map_err(|_| "integration::cap_transfer: ipc_reply failed")?;
     crate::log("cap_transfer: ipc_reply done, waiting for child sync");
 
     // Wait for the child to confirm its original cap slot is now null.
@@ -143,9 +145,19 @@ fn child_entry(arg: u64) -> !
     let test_sig_slot = ((arg >> 16) & 0xFFFF) as u32;
     let sync_sig_slot = ((arg >> 32) & 0xFFFF) as u32;
 
+    // Register the shared IPC buffer for this child thread.
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        signal_send(sync_sig_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
     // Call the endpoint, passing test_sig in cap_slots[0].
     // The kernel moves test_sig to the server's CSpace on transfer.
-    if ipc_call(ep_slot, 0, 0, &[test_sig_slot]).is_err()
+    let msg = IpcMessage::builder(0).cap(test_sig_slot).build();
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    if unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) }.is_err()
     {
         signal_send(sync_sig_slot, 0xBAD).ok();
         thread_exit()

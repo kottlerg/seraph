@@ -299,8 +299,8 @@ pub unsafe fn activate(root_phys: u64)
 /// because bit 63 of a PTE is "reserved" when NXE = 0.
 ///
 /// # Safety
-/// Must execute at privilege level 0. Does not check CPUID; all QEMU
-/// configurations and modern x86-64 hardware support NX.
+/// Must execute at privilege level 0. Does not check CPUID; NX is mandatory
+/// on the x86_64-v3 baseline this kernel targets.
 #[cfg(not(test))]
 pub unsafe fn enable_nx()
 {

@@ -8,8 +8,10 @@
 //! The RISC-V time-compare mechanism works by scheduling a deadline:
 //! when `time` CSR ≥ `timecmp`, a supervisor timer interrupt fires.
 //!
-//! The timebase frequency is hardcoded to 10 MHz (QEMU virt machine default).
-//! Future work: parse the DTB `timebase-frequency` property.
+//! The timebase frequency is hardcoded to 10 MHz, which matches the reference
+//! platform and every test target the kernel runs on. The boot protocol does
+//! not yet carry this value; on hardware whose timebase differs the kernel
+//! would still boot but its time-derived deadlines would be miscalibrated.
 //!
 //! # SBI timer extension
 //! Extension ID `0x54494D45` ("TIME"), function ID 0.
@@ -18,8 +20,6 @@
 //! - a0 = timer value (next deadline)
 //!
 //! # Modification notes
-//! - To read the real timebase: parse the DTB passed by the bootloader and
-//!   initialise `TIMEBASE_FREQ` from the `timebase-frequency` property.
 //! - To use the `sstc` extension instead of SBI: write `stimecmp` CSR directly.
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -28,9 +28,8 @@ use super::interrupts;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// QEMU virt machine timer frequency (10 MHz).
-///
-/// Replace with DTB-parsed value in a later phase.
+/// Default RISC-V `time` CSR tick rate (10 MHz). Matches the reference
+/// platform; bootloader handoff for the discovered value is not yet wired.
 const TIMEBASE_FREQ: u64 = 10_000_000;
 
 /// SBI TIME extension ID: ASCII "TIME" = 0x54494D45.
@@ -223,7 +222,7 @@ mod tests
     use super::*;
 
     #[test]
-    fn timebase_freq_is_10_mhz()
+    fn default_timebase_freq_is_10_mhz()
     {
         assert_eq!(TIMEBASE_FREQ, 10_000_000);
     }

@@ -17,10 +17,11 @@
 //! ktest thread as the "server". The child calls the endpoint, the server
 //! receives, verifies the label, and replies.
 
+use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, cap_derive, ipc_buffer_set, ipc_call, ipc_recv, ipc_reply, signal_send,
-    signal_wait, thread_configure, thread_exit, thread_start, thread_yield,
+    cap_delete, cap_derive, ipc_buffer_set, signal_send, signal_wait, thread_configure,
+    thread_exit, thread_start, thread_yield,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -36,6 +37,7 @@ static mut RECV_BLOCKS_STACK: ChildStack = ChildStack::ZERO;
 static mut DATA_WORDS_STACK: ChildStack = ChildStack::ZERO;
 static mut CAP_XFER_STACK: ChildStack = ChildStack::ZERO;
 static mut TOKEN_STACK: ChildStack = ChildStack::ZERO;
+static mut SNAPSHOT_STACK: ChildStack = ChildStack::ZERO;
 
 // ── SYS_IPC_CALL / SYS_IPC_RECV / SYS_IPC_REPLY ─────────────────────────────
 
@@ -78,14 +80,17 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
     thread_start(child_th).map_err(|_| "thread_start for IPC test failed")?;
 
     // Server: wait for the child's IPC call.
-    let (label, _) = ipc_recv(ep).map_err(|_| "ipc_recv failed")?;
-    if label != 0xCAFE
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }.map_err(|_| "ipc_recv failed")?;
+    if msg.label != 0xCAFE
     {
         return Err("ipc_recv returned wrong label (expected 0xCAFE)");
     }
 
     // Reply with label 0xBEEF and no data or caps.
-    ipc_reply(0xBEEF, 0, &[]).map_err(|_| "ipc_reply failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0xBEEF), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply failed")?;
 
     // Wait for child confirmation.
     let result_bits = signal_wait(notify).map_err(|_| "signal_wait for IPC done failed")?;
@@ -141,13 +146,17 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
     thread_yield().map_err(|_| "thread_yield for recv_finds_queued_caller failed")?;
 
     // Now call ipc_recv — the child should be on the send queue.
-    let (label, _) = ipc_recv(ep).map_err(|_| "ipc_recv for recv_finds_queued_caller failed")?;
-    if label != 0xFACE
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for recv_finds_queued_caller failed")?;
+    if msg.label != 0xFACE
     {
         return Err("ipc_recv returned wrong label (expected 0xFACE)");
     }
 
-    ipc_reply(0xC0DE, 0, &[]).map_err(|_| "ipc_reply for recv_finds_queued_caller failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0xC0DE), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply for recv_finds_queued_caller failed")?;
 
     let result =
         signal_wait(done).map_err(|_| "signal_wait done for recv_finds_queued_caller failed")?;
@@ -182,7 +191,7 @@ pub fn ipc_buffer_misaligned_err(_ctx: &TestContext) -> TestResult
 // ── SYS_IPC_CALL (insufficient rights) ───────────────────────────────────────
 
 /// `ipc_call` on an endpoint cap with only RECV right (no SEND) must fail.
-pub fn send_insufficient_rights_err(_ctx: &TestContext) -> TestResult
+pub fn send_insufficient_rights_err(ctx: &TestContext) -> TestResult
 {
     let ep =
         cap_create_endpoint().map_err(|_| "cap_create_endpoint for send_rights test failed")?;
@@ -192,7 +201,8 @@ pub fn send_insufficient_rights_err(_ctx: &TestContext) -> TestResult
         cap_derive(ep, RIGHTS_RECV_ONLY).map_err(|_| "cap_derive for send_rights test failed")?;
 
     // ipc_call requires SEND right.
-    let err = ipc_call(recv_only, 0xABCD, 0, &[]);
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let err = unsafe { ipc::ipc_call(recv_only, &IpcMessage::new(0xABCD), ctx.ipc_buf) };
     if err.is_ok()
     {
         return Err("ipc_call on RECV-only cap should fail (InsufficientRights)");
@@ -235,24 +245,25 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
     thread_start(child_th).map_err(|_| "thread_start for data_words test failed")?;
 
     // Server: receive the call.
-    let (label, _) = ipc_recv(ep).map_err(|_| "ipc_recv for data_words test failed")?;
-    if label != 0xDA7A
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for data_words test failed")?;
+    if msg.label != 0xDA7A
     {
         return Err("ipc_recv returned wrong label for data_words test");
     }
+    if msg.word_count() < 2
+    {
+        return Err("ipc_recv for data_words test delivered fewer than 2 words");
+    }
 
-    // Read data words from our IPC buffer.
-    // SAFETY: ctx.ipc_buf is the registered IPC buffer (4 KiB, page-aligned);
-    // kernel wrote data words at indices 0 and 1 during ipc_recv; volatile reads
-    // required for kernel-written data.
-    let (word0, word1) = unsafe {
-        (
-            core::ptr::read_volatile(ctx.ipc_buf),
-            core::ptr::read_volatile(ctx.ipc_buf.add(1)),
-        )
-    };
+    // Data words are snapshotted onto the returned message.
+    let word0 = msg.word(0);
+    let word1 = msg.word(1);
 
-    ipc_reply(0, 0, &[]).map_err(|_| "ipc_reply for data_words test failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply for data_words test failed")?;
 
     signal_wait(done).map_err(|_| "signal_wait for data_words test failed")?;
 
@@ -304,25 +315,27 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
     thread_start(child_th).map_err(|_| "thread_start for cap_xfer test failed")?;
 
     // Server: receive the call with cap transfer.
-    let (label, _) = ipc_recv(ep).map_err(|_| "ipc_recv for cap_xfer test failed")?;
-    if label != 0xCAFE
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for cap_xfer test failed")?;
+    if msg.label != 0xCAFE
     {
         return Err("ipc_recv returned wrong label for cap_xfer test");
     }
 
-    // Read cap transfer results from IPC buffer.
-    // SAFETY: ctx.ipc_buf points to the registered IPC buffer.
-    let (cap_count, cap_indices) = unsafe { syscall::read_recv_caps(ctx.ipc_buf) };
-    if cap_count != 1
+    // Transferred cap slot indices are snapshotted onto the returned message.
+    if msg.caps().len() != 1
     {
         return Err("expected 1 transferred cap, got different count");
     }
 
     // The transferred cap should be a valid signal — try sending on it.
-    let transferred_sig = cap_indices[0];
+    let transferred_sig = msg.caps()[0];
     let send_result = syscall::signal_send(transferred_sig, 0x1);
 
-    ipc_reply(0, 0, &[]).map_err(|_| "ipc_reply for cap_xfer test failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply for cap_xfer test failed")?;
 
     signal_wait(done).map_err(|_| "signal_wait for cap_xfer test failed")?;
 
@@ -379,19 +392,23 @@ pub fn recv_delivers_token(ctx: &TestContext) -> TestResult
     thread_start(th).map_err(|_| "thread_start for recv_delivers_token failed")?;
 
     // Server: receive and check token.
-    let (label, token) = ipc_recv(ep).map_err(|_| "ipc_recv for recv_delivers_token failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for recv_delivers_token failed")?;
 
-    if label != 0xD00D
+    if msg.label != 0xD00D
     {
         return Err("recv_delivers_token: wrong label (expected 0xD00D)");
     }
-    if token != 0x1234
+    if msg.token != 0x1234
     {
         return Err("recv_delivers_token: wrong token (expected 0x1234)");
     }
 
     // Reply so child can finish.
-    ipc_reply(0, 0, &[]).map_err(|_| "ipc_reply for recv_delivers_token failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply for recv_delivers_token failed")?;
 
     signal_wait(done).map_err(|_| "signal_wait for recv_delivers_token failed")?;
 
@@ -427,18 +444,22 @@ pub fn recv_untokened_returns_zero(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread_configure for recv_untokened failed")?;
     thread_start(th).map_err(|_| "thread_start for recv_untokened failed")?;
 
-    let (label, token) = ipc_recv(ep).map_err(|_| "ipc_recv for recv_untokened failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for recv_untokened failed")?;
 
-    if label != 0xCAFE
+    if msg.label != 0xCAFE
     {
         return Err("recv_untokened: wrong label");
     }
-    if token != 0
+    if msg.token != 0
     {
         return Err("recv_untokened: token should be 0 for untokened cap");
     }
 
-    ipc_reply(0xBEEF, 0, &[]).map_err(|_| "ipc_reply for recv_untokened failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0xBEEF), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply for recv_untokened failed")?;
 
     signal_wait(done).map_err(|_| "signal_wait for recv_untokened failed")?;
 
@@ -459,12 +480,23 @@ fn caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF) as u32;
     let notify_slot = ((arg >> 16) & 0xFFFF) as u32;
 
-    // Call the server. Blocks until server calls ipc_reply.
-    match ipc_call(ep_slot, 0xCAFE, 0, &[])
+    // Register the shared IPC buffer for this child thread. Each thread has its
+    // own IPC buffer pointer in its TCB; the child must register before calling.
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
     {
-        Ok((reply_label, _)) =>
+        signal_send(notify_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    // Call the server. Blocks until server calls ipc_reply.
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    let reply = unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(0xCAFE), buf_addr as *mut u64) };
+    match reply
+    {
+        Ok(msg) =>
         {
-            if reply_label == 0xBEEF
+            if msg.label == 0xBEEF
             {
                 signal_send(notify_slot, 0xDEAD).ok();
             }
@@ -490,12 +522,22 @@ fn queued_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF) as u32;
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
 
-    // ipc_call with no server yet — blocks on the endpoint's send queue.
-    match ipc_call(ep_slot, 0xFACE, 0, &[])
+    // Register the shared IPC buffer for this child thread.
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
     {
-        Ok((reply_label, _)) =>
+        signal_send(done_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    // ipc_call with no server yet — blocks on the endpoint's send queue.
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    let reply = unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(0xFACE), buf_addr as *mut u64) };
+    match reply
+    {
+        Ok(msg) =>
         {
-            let result = if reply_label == 0xC0DE { 0xDEAD } else { 0xBAD };
+            let result = if msg.label == 0xC0DE { 0xDEAD } else { 0xBAD };
             signal_send(done_slot, result).ok();
         }
         Err(_) =>
@@ -506,8 +548,8 @@ fn queued_caller_entry(arg: u64) -> !
     thread_exit()
 }
 
-/// Child for `call_with_data_words`: registers its IPC buffer, writes two data
-/// words, then calls with `data_count`=2.
+/// Child for `call_with_data_words`: registers its IPC buffer, builds a two-word
+/// message, then calls.
 ///
 /// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`.
 fn data_caller_entry(arg: u64) -> !
@@ -517,22 +559,20 @@ fn data_caller_entry(arg: u64) -> !
 
     // Register the shared IPC buffer for this child thread. Each thread has its
     // own IPC buffer pointer in its TCB; the child must register before calling.
-    let buf_addr = core::ptr::addr_of!(crate::IPC_BUF) as u64;
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
     {
         signal_send(done_slot, 0xBAD).ok();
         thread_exit()
     }
 
-    // Write data words to the IPC buffer before calling.
-    // SAFETY: IPC_BUF is page-aligned and within our address space.
-    unsafe {
-        let buf = buf_addr as *mut u64;
-        core::ptr::write_volatile(buf, 0xAAAA_BBBB);
-        core::ptr::write_volatile(buf.add(1), 0xCCCC_DDDD);
-    }
+    let msg = IpcMessage::builder(0xDA7A)
+        .word(0, 0xAAAA_BBBB)
+        .word(1, 0xCCCC_DDDD)
+        .build();
 
-    match ipc_call(ep_slot, 0xDA7A, 2, &[])
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    match unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) }
     {
         Ok(_) => signal_send(done_slot, 0xDEAD).ok(),
         Err(_) => signal_send(done_slot, 0xBAD).ok(),
@@ -549,7 +589,7 @@ fn cap_xfer_caller_entry(arg: u64) -> !
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
 
     // Register IPC buffer for cap transfer.
-    let buf_addr = core::ptr::addr_of!(crate::IPC_BUF) as u64;
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
     {
         signal_send(done_slot, 0xBAD).ok();
@@ -565,7 +605,9 @@ fn cap_xfer_caller_entry(arg: u64) -> !
     };
 
     // Call with 1 cap to transfer.
-    match ipc_call(ep_slot, 0xCAFE, 0, &[sig])
+    let msg = IpcMessage::builder(0xCAFE).cap(sig).build();
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    match unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) }
     {
         Ok(_) => signal_send(done_slot, 0xDEAD).ok(),
         Err(_) => signal_send(done_slot, 0xBAD).ok(),
@@ -581,7 +623,134 @@ fn token_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF) as u32;
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
 
-    match ipc_call(ep_slot, 0xD00D, 0, &[])
+    // Register the shared IPC buffer for this child thread.
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        signal_send(done_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    match unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(0xD00D), buf_addr as *mut u64) }
+    {
+        Ok(_) => signal_send(done_slot, 0xDEAD).ok(),
+        Err(_) => signal_send(done_slot, 0xBAD).ok(),
+    };
+    thread_exit()
+}
+
+// ── SYS_IPC_RECV snapshot independence ───────────────────────────────────────
+
+/// Regression guard: the `IpcMessage` returned by `ipc_recv` must own its
+/// payload, so subsequent buffer writes (e.g. a nested `ipc_call` inside a
+/// logging helper, or any other IPC issued before the caller consumes the
+/// received data) cannot clobber it.
+///
+/// Historically the IPC buffer was caller-visible state across the
+/// post-recv / pre-read window; a `println!` between recv and the word
+/// read would scribble `STREAM_BYTES` over the received payload. The
+/// snapshot wrapper eliminates that window at the type level. This test
+/// locks the invariant in: receive a message with known words, scribble
+/// garbage directly over the IPC buffer (the worst case of any nested IPC
+/// activity), then verify the message's view is unchanged.
+pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for snapshot test failed")?;
+    let done = cap_create_signal().map_err(|_| "cap_create_signal for snapshot test failed")?;
+
+    let child_cs =
+        cap_create_cspace(16).map_err(|_| "cap_create_cspace for snapshot test failed")?;
+    let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
+        .map_err(|_| "cap_copy ep for snapshot test failed")?;
+    let child_done =
+        cap_copy(done, child_cs, 1 << 7).map_err(|_| "cap_copy done for snapshot test failed")?;
+    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+
+    let child_th = cap_create_thread(ctx.aspace_cap, child_cs)
+        .map_err(|_| "cap_create_thread for snapshot test failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(SNAPSHOT_STACK));
+    thread_configure(
+        child_th,
+        snapshot_caller_entry as *const () as u64,
+        stack_top,
+        child_arg,
+    )
+    .map_err(|_| "thread_configure for snapshot test failed")?;
+    thread_start(child_th).map_err(|_| "thread_start for snapshot test failed")?;
+
+    // Server: receive the call with two known data words.
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for snapshot test failed")?;
+    if msg.label != 0x5A15
+    {
+        return Err("snapshot test: ipc_recv returned wrong label");
+    }
+    if msg.word_count() < 2
+    {
+        return Err("snapshot test: received fewer than 2 data words");
+    }
+
+    // Simulate any nested IPC activity between recv and read. A real
+    // `println!` here would issue a `SYS_IPC_CALL` that the kernel serves
+    // by overwriting the same buffer page. We skip the orchestration and
+    // directly scribble garbage over every data slot — a strictly worse
+    // case than any real IPC would produce.
+    for i in 0..syscall_abi::MSG_DATA_WORDS_MAX
+    {
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer; i is
+        // bounded by MSG_DATA_WORDS_MAX, well within the 4 KiB page.
+        unsafe { core::ptr::write_volatile(ctx.ipc_buf.add(i), 0xDEAD_BEEF_DEAD_BEEF) };
+    }
+
+    // Now consume the message. Must still see the sender's original words.
+    let word0 = msg.word(0);
+    let word1 = msg.word(1);
+
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
+        .map_err(|_| "ipc_reply for snapshot test failed")?;
+
+    signal_wait(done).map_err(|_| "signal_wait for snapshot test failed")?;
+
+    if word0 != 0x1234_5678_9ABC_DEF0
+    {
+        return Err("snapshot test: word[0] clobbered by buffer write");
+    }
+    if word1 != 0x0FED_CBA9_8765_4321
+    {
+        return Err("snapshot test: word[1] clobbered by buffer write");
+    }
+
+    cap_delete(child_th).ok();
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    cap_delete(child_cs).ok();
+    Ok(())
+}
+
+/// Child for `recv_snapshot_survives_buffer_clobber`: calls with two known
+/// data words and exits.
+fn snapshot_caller_entry(arg: u64) -> !
+{
+    let ep_slot = (arg & 0xFFFF) as u32;
+    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        signal_send(done_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    let msg = IpcMessage::builder(0x5A15)
+        .word(0, 0x1234_5678_9ABC_DEF0)
+        .word(1, 0x0FED_CBA9_8765_4321)
+        .build();
+
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    match unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) }
     {
         Ok(_) => signal_send(done_slot, 0xDEAD).ok(),
         Err(_) => signal_send(done_slot, 0xBAD).ok(),

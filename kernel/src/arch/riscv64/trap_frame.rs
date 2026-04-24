@@ -129,6 +129,25 @@ impl TrapFrame
         self.a2 = token;
     }
 
+    /// Write `SYS_IPC_CALL` return values: primary in a0, reply label in a1,
+    /// reply data-word count in a2. Matches `shared/syscall::syscall5_ret3`.
+    pub fn set_ipc_call_return(&mut self, primary: u64, reply_label: u64, reply_word_count: u64)
+    {
+        self.a0 = primary;
+        self.a1 = reply_label;
+        self.a2 = reply_word_count;
+    }
+
+    /// Write `SYS_IPC_RECV` return values: primary in a0, label in a1,
+    /// token in a2, data-word count in a3. Matches `shared/syscall::syscall1_ret4`.
+    pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, token: u64, word_count: u64)
+    {
+        self.a0 = primary;
+        self.a1 = label;
+        self.a2 = token;
+        self.a3 = word_count;
+    }
+
     /// Initialise the frame for first entry to user mode.
     ///
     /// Sets the supervisor exception PC (`sepc`, the user entry point) and

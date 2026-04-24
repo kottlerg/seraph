@@ -102,7 +102,7 @@ All allocation before `ExitBootServices` goes through `AllocatePages`. Two alloc
 modes are used:
 
 **`AllocateAnyPages`** — used for data whose physical address does not matter:
-`BootInfo` structure, `PlatformResource` array, memory map buffer, `MemoryMapEntry`
+`BootInfo` structure, `MmioAperture` array, memory map buffer, `MemoryMapEntry`
 array. The firmware selects a free physical page range.
 
 **`AllocateAddress`** — used for ELF LOAD segments that specify a physical address
@@ -121,6 +121,12 @@ before any reclamation would be relevant.
 ---
 
 ## Memory Map Acquisition
+
+The acquisition protocol (map-key lifecycle, retry on stale key) lives
+here; the translation policy from UEFI memory types into
+`BootInfo.memory_map` entries and the per-entry invariants the kernel
+can assume at handoff are owned by [memory-map.md](memory-map.md).
+
 
 The UEFI memory map must be queried as the last action before `ExitBootServices`.
 Every call to `AllocatePages` (or any other `BootServices` function that allocates
@@ -147,23 +153,10 @@ is sufficient.
 
 ### UEFI Memory Type Translation
 
-| UEFI `EFI_MEMORY_TYPE` | `MemoryType` |
-|---|---|
-| `EfiConventionalMemory` | `Usable` |
-| `EfiLoaderCode`, `EfiLoaderData` | `Loaded` |
-| `EfiBootServicesCode`, `EfiBootServicesData` | `Usable` (reclaimable after UEFI exit) |
-| `EfiRuntimeServicesCode`, `EfiRuntimeServicesData` | `Reserved` |
-| `EfiACPIReclaimMemory` | `AcpiReclaimable` |
-| `EfiACPIMemoryNVS` | `Reserved` |
-| `EfiMemoryMappedIO`, `EfiMemoryMappedIOPortSpace` | `Reserved` |
-| `EfiPersistentMemory` | `Persistent` |
-| All other types | `Reserved` |
-
-`EfiBootServicesCode` and `EfiBootServicesData` are translated to `Usable` because
-those regions are no longer in use once UEFI boot services have exited. The kernel
-may reclaim them. `EfiRuntimeServicesCode` and `EfiRuntimeServicesData` are marked
-`Reserved` because Seraph does not use UEFI runtime services; those regions are
-treated as off-limits rather than reclaimed.
+The per-type translation policy and the post-translation invariants the
+kernel may assume live in [memory-map.md](memory-map.md). This document
+only owns the *acquisition* sequence above; the *meaning* of each UEFI
+type in Seraph's memory model is authoritative there.
 
 ---
 
@@ -211,39 +204,16 @@ the single `ExitBootServices` retry described above, and no fallback configurati
 
 ### BootError Type
 
-```rust
-#[derive(Debug)]
-pub enum BootError
-{
-    /// A required UEFI protocol was not found.
-    ProtocolNotFound(&'static str),
+All fallible functions in the bootloader return `Result<T, BootError>`,
+defined in [`boot/src/error.rs`](../src/error.rs). The variant set covers
+protocol-location failure, UEFI status-code propagation, ESP file-not-found,
+ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
+failure after retry, and `boot.conf` parse failure; the source is the
+authority on the variant list and payloads.
 
-    /// A UEFI call returned an unexpected status code.
-    UefiError(usize),
-
-    /// A required file was not found on the ESP.
-    FileNotFound(&'static str),
-
-    /// The kernel ELF failed validation.
-    InvalidElf(&'static str),
-
-    /// An ELF segment has both writable and executable permissions (W^X violation).
-    WxViolation,
-
-    /// A physical memory allocation failed.
-    OutOfMemory,
-
-    /// ExitBootServices failed after retry.
-    ExitBootServicesFailed,
-
-    /// The boot configuration file is missing, malformed, or contains invalid values.
-    InvalidConfig(&'static str),
-}
-```
-
-All fallible functions in the bootloader return `Result<T, BootError>`. The top-level
-`efi_main` function propagates errors to a single fatal handler that reports the error
-and halts.
+The top-level `efi_main` propagates errors to a single fatal handler that
+reports the error and halts. There is no recovery path and no retry beyond
+the single `ExitBootServices` retry described above.
 
 ### Error Reporting
 
@@ -288,4 +258,4 @@ population and kernel handoff without any further output.
 
 ## Summarized By
 
-None
+[boot/README.md](../README.md)

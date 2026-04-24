@@ -59,28 +59,26 @@ fn read_block_sector(
     ipc_buf: *mut u64,
 ) -> bool
 {
+    let msg = ipc::IpcMessage::builder(ipc::blk_labels::READ_BLOCK)
+        .word(0, sector)
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    ipc.write_word(0, sector);
-
-    let Ok((reply_label, _)) = syscall::ipc_call(blk_ep, ipc::blk_labels::READ_BLOCK, 1, &[])
+    let Ok(reply) = (unsafe { ipc::ipc_call(blk_ep, &msg, ipc_buf) })
     else
     {
         return false;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         return false;
     }
 
-    // Copy sector data from IPC buffer BEFORE any log() calls.
-    for i in 0..64
+    let bytes = reply.data_bytes();
+    if bytes.len() < SECTOR_SIZE
     {
-        let word = ipc.read_word(i);
-        let base = i * 8;
-        let bytes = word.to_le_bytes();
-        buf[base..base + 8].copy_from_slice(&bytes);
+        return false;
     }
+    buf.copy_from_slice(&bytes[..SECTOR_SIZE]);
 
     true
 }

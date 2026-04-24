@@ -4,7 +4,7 @@
 //! util.rs
 //!
 //! Shared utilities: step printing, command execution, tool discovery,
-//! and RAII guards for terminal state and temporary files.
+//! and an RAII guard for terminal state.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 /// Ctrl+C sends SIGINT to the entire foreground process group (both xtask and
 /// the child process). By ignoring it here the child (QEMU) still receives and
 /// handles SIGINT normally while our process survives long enough to run cleanup
-/// (TerminalGuard restore, TempFile deletion, etc.).
+/// (TerminalGuard restore, etc.).
 pub fn run_with_sigint_ignored<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -236,47 +236,4 @@ fn tiocswinsz(fd: i32, rows: u16, cols: u16)
     unsafe {
         ioctl(fd, 0x5414 /* TIOCSWINSZ */, &ws)
     };
-}
-
-// ── Temporary file ────────────────────────────────────────────────────────────
-
-/// RAII wrapper for a temporary file path. Deletes the file on drop.
-///
-/// Used by the RISC-V run path to clean up padded pflash images after QEMU exits.
-/// The file is not created by this struct — callers write to `path` themselves.
-pub struct TempFile
-{
-    pub path: PathBuf,
-}
-
-impl TempFile
-{
-    /// Generate a unique path under the system temp directory with the given suffix.
-    ///
-    /// The caller is responsible for creating the file at `path`.
-    pub fn new(suffix: &str) -> Result<Self>
-    {
-        // Use PID + subsecond timestamp for a collision-resistant name.
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let pid = std::process::id();
-        let name = format!("seraph-xtask-{}-{}{}", pid, ts, suffix);
-        Ok(TempFile {
-            path: std::env::temp_dir().join(name),
-        })
-    }
-}
-
-impl Drop for TempFile
-{
-    fn drop(&mut self)
-    {
-        if self.path.exists()
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
 }

@@ -18,10 +18,11 @@
 //! Each caller ORs a distinct bit into the shared `done` signal after receiving
 //! its reply; the server waits for all three bits before returning.
 
+use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, ipc_call, ipc_recv, ipc_reply, signal_send, signal_wait, thread_configure,
-    thread_exit, thread_set_affinity, thread_start, thread_yield,
+    cap_delete, signal_send, signal_wait, thread_configure, thread_exit, thread_set_affinity,
+    thread_start, thread_yield,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -97,29 +98,42 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after C failed")?;
 
     // ── Drain send queue in FIFO order ────────────────────────────────────────
+    let reply = IpcMessage::new(0);
     crate::log("multi_caller_ipc_fifo: recv 1 (expect label=1)");
-    let (label_a, _) = ipc_recv(ep).map_err(|_| "multi_caller_ipc_fifo: ipc_recv[0] failed")?;
-    if label_a != 1
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg_a = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "multi_caller_ipc_fifo: ipc_recv[0] failed")?;
+    if msg_a.label != 1
     {
         return Err("FIFO violated: expected label 1 first");
     }
-    ipc_reply(0, 0, &[]).map_err(|_| "multi_caller_ipc_fifo: ipc_reply[0] failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }
+        .map_err(|_| "multi_caller_ipc_fifo: ipc_reply[0] failed")?;
 
     crate::log("multi_caller_ipc_fifo: recv 2 (expect label=2)");
-    let (label_b, _) = ipc_recv(ep).map_err(|_| "multi_caller_ipc_fifo: ipc_recv[1] failed")?;
-    if label_b != 2
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg_b = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "multi_caller_ipc_fifo: ipc_recv[1] failed")?;
+    if msg_b.label != 2
     {
         return Err("FIFO violated: expected label 2 second");
     }
-    ipc_reply(0, 0, &[]).map_err(|_| "multi_caller_ipc_fifo: ipc_reply[1] failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }
+        .map_err(|_| "multi_caller_ipc_fifo: ipc_reply[1] failed")?;
 
     crate::log("multi_caller_ipc_fifo: recv 3 (expect label=3)");
-    let (label_c, _) = ipc_recv(ep).map_err(|_| "multi_caller_ipc_fifo: ipc_recv[2] failed")?;
-    if label_c != 3
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg_c = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "multi_caller_ipc_fifo: ipc_recv[2] failed")?;
+    if msg_c.label != 3
     {
         return Err("FIFO violated: expected label 3 third");
     }
-    ipc_reply(0, 0, &[]).map_err(|_| "multi_caller_ipc_fifo: ipc_reply[2] failed")?;
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }
+        .map_err(|_| "multi_caller_ipc_fifo: ipc_reply[2] failed")?;
 
     // Wait for all three callers to confirm they received their reply.
     //
@@ -159,7 +173,15 @@ fn caller_entry(arg: u64) -> !
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
     let label = (arg >> 32) & 0xFFFF;
 
-    if ipc_call(ep_slot, label, 0, &[]).is_ok()
+    // Register the shared IPC buffer for this child thread.
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        thread_exit()
+    }
+
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    if unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(label), buf_addr as *mut u64) }.is_ok()
     {
         // OR the bit for this caller's label (label 1→bit0, 2→bit1, 3→bit2).
         let bit = 1u64 << (label - 1);

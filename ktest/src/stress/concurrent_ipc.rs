@@ -6,10 +6,10 @@
 //! 4 callers simultaneously block on one endpoint. The server drains all 4,
 //! verifying no callers are lost. Repeats for 10 cycles.
 
+use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, ipc_call, ipc_recv, ipc_reply, signal_send, signal_wait, thread_configure,
-    thread_exit, thread_start,
+    cap_delete, signal_send, signal_wait, thread_configure, thread_exit, thread_start,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -61,13 +61,16 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // Server: receive and reply to all callers.
         let mut received_bitmap: u32 = 0;
+        let reply = IpcMessage::new(0);
         for _ in 0..NUM_CALLERS
         {
-            let (label, _) = ipc_recv(ep).map_err(|_| "concurrent_ipc: ipc_recv failed")?;
+            // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+            let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+                .map_err(|_| "concurrent_ipc: ipc_recv failed")?;
             // Label values are 1..=NUM_CALLERS; fits in u32. Truncation is safe
             // because we validate idx is in [1, NUM_CALLERS] immediately below.
             #[allow(clippy::cast_possible_truncation)]
-            let idx = label as u32;
+            let idx = msg.label as u32;
             if idx == 0 || idx as usize > NUM_CALLERS
             {
                 return Err("concurrent_ipc: received out-of-range label");
@@ -78,7 +81,9 @@ pub fn run(ctx: &TestContext) -> TestResult
                 return Err("concurrent_ipc: duplicate label received");
             }
             received_bitmap |= bit;
-            ipc_reply(0, 0, &[]).map_err(|_| "concurrent_ipc: ipc_reply failed")?;
+            // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+            unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }
+                .map_err(|_| "concurrent_ipc: ipc_reply failed")?;
         }
 
         // Verify all callers received.
@@ -120,7 +125,16 @@ fn caller_entry(arg: u64) -> !
     let label = (arg >> 32) & 0xFFFF;
     let done_bit = arg >> 48;
 
-    let _ = ipc_call(ep_slot, label, 0, &[]);
+    // Register the shared IPC buffer for this child thread.
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        signal_send(done_slot, done_bit).ok();
+        thread_exit()
+    }
+
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    let _ = unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(label), buf_addr as *mut u64) };
     signal_send(done_slot, done_bit).ok();
     thread_exit()
 }

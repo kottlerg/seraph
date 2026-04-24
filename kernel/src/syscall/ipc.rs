@@ -440,8 +440,8 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         write_cap_results(reply_buf, reply_cap_count, &reply_cap_indices);
     }
 
-    tf.set_ipc_return(0, reply_label);
-    Ok(0) // primary return; set_ipc_return already wrote both values
+    tf.set_ipc_call_return(0, reply_label, reply_count as u64);
+    Ok(0) // primary return; set_ipc_call_return already wrote all three values
 }
 
 /// `SYS_IPC_RECV` (2): receive the next message on an endpoint.
@@ -522,7 +522,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 write_ipc_buf(server_buf, msg.data_count, &msg.data);
             }
         }
-        tf.set_ipc_return_with_token(0, msg.label, msg.token);
+        tf.set_ipc_recv_return(0, msg.label, msg.token, msg.data_count as u64);
         return Ok(0);
     }
     // else: No caller; server is now Blocked on recv queue. Yield.
@@ -576,7 +576,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             write_ipc_buf(server_buf, msg.data_count, &msg.data);
         }
     }
-    tf.set_ipc_return_with_token(0, msg.label, msg.token);
+    tf.set_ipc_recv_return(0, msg.label, msg.token, msg.data_count as u64);
     Ok(0)
 }
 

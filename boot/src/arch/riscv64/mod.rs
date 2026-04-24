@@ -8,6 +8,17 @@
 //! Exports arch-specific constants, the kernel handoff function, and
 //! pre-serial-init / boot-hart-ID discovery helpers.
 
+// Hand-crafted PE/COFF header for RISC-V UEFI builds. LLVM has no PE/COFF
+// backend for RISC-V, so we prepend this header and convert with
+// llvm-objcopy. See boot/src/arch/riscv64/header.S and
+// boot/linker/riscv64-uefi.ld. The assembly is emitted at crate top-level
+// regardless of where the `global_asm!` invocation lives; placing it inside
+// this arch module keeps `#[cfg(target_arch)]` discipline clean.
+core::arch::global_asm!(include_str!("header.S"));
+
+pub mod acpi_kernel_mmio;
+pub mod acpi_spcr;
+pub mod dtb_kernel_mmio;
 pub mod handoff;
 pub mod paging;
 pub mod serial;
@@ -15,7 +26,11 @@ pub use handoff::{perform_handoff, trampoline_page_range};
 pub use paging::BootPageTable;
 
 use crate::elf::EM_RISCV;
-use crate::uefi::{EFI_SUCCESS, EfiGuid, EfiStatus, EfiSystemTable};
+use crate::firmware::FirmwareInfo;
+use crate::uefi::{
+    EFI_SUCCESS, EfiBootServices, EfiGuid, EfiStatus, EfiSystemTable, allocate_pages,
+};
+use boot_protocol::KernelMmio;
 
 /// `EFI_RISCV_BOOT_PROTOCOL_GUID`
 /// `{CCD15FEC-6F73-4EEC-8395-3E69E4B940BF}`
@@ -62,6 +77,31 @@ pub fn uart_mmio_region() -> u64
     serial::uart_base() as u64
 }
 
+/// Populate `km` from firmware tables for RISC-V.
+///
+/// ACPI is consulted first; DTB then fills any field ACPI left zero.
+/// Both sources are consulted because UEFI RISC-V firmware may publish
+/// either (or both) of [`crate::uefi::EFI_ACPI_20_TABLE_GUID`] and
+/// [`crate::uefi::EFI_DTB_TABLE_GUID`]. Fields neither source populates
+/// stay zero; the kernel falls back to its compiled-in defaults.
+///
+/// # Safety
+/// `firmware.acpi_rsdp` and `firmware.device_tree`, when non-zero, must
+/// each be the physical address of a valid, identity-mapped RSDP / FDT.
+pub unsafe fn populate_kernel_mmio(firmware: &FirmwareInfo, km: &mut KernelMmio)
+{
+    if firmware.acpi_rsdp != 0
+    {
+        // SAFETY: caller guarantees acpi_rsdp is valid when non-zero.
+        unsafe { acpi_kernel_mmio::parse_kernel_mmio(firmware.acpi_rsdp, km) };
+    }
+    if firmware.device_tree != 0
+    {
+        // SAFETY: caller guarantees device_tree is valid when non-zero.
+        unsafe { dtb_kernel_mmio::parse_kernel_mmio(firmware.device_tree, km) };
+    }
+}
+
 /// Query `EFI_RISCV_BOOT_PROTOCOL` for the boot hart ID.
 ///
 /// Returns 0 if the protocol is not available or the call fails.
@@ -94,12 +134,29 @@ pub unsafe fn discover_boot_hart_id(st: *mut EfiSystemTable) -> u64
     if s == EFI_SUCCESS { hart_id } else { 0 }
 }
 
-/// Return 0: on RISC-V, the BSP hardware ID (hart ID) comes from
-/// `discover_boot_hart_id` (`EFI_RISCV_BOOT_PROTOCOL`). This function is a
-/// placeholder to satisfy the x86-64 arch interface; callers should use
-/// the value from `discover_boot_hart_id` directly.
-#[allow(dead_code)]
-pub fn bsp_hardware_id() -> u32
+/// Return the hardware identifier of the bootstrap processor.
+///
+/// On RISC-V the BSP identifier is the boot hart ID, which the caller has
+/// already obtained via [`discover_boot_hart_id`]. Hart IDs are `u64` in
+/// the SBI ABI but fit in `u32` for every platform Seraph targets; the
+/// lower 32 bits are taken.
+#[allow(clippy::cast_possible_truncation)]
+pub fn bsp_hardware_id(boot_hart_id: u64) -> u32
 {
-    0
+    boot_hart_id as u32
+}
+
+/// Reserve a 4 KiB page for the AP startup trampoline.
+///
+/// On RISC-V SBI `HART_START` accepts any physical address for the AP
+/// entry point, so no placement constraint applies beyond page alignment
+/// (guaranteed by `allocate_pages`). Returns `None` if the allocation
+/// fails (SMP is then disabled).
+///
+/// # Safety
+/// `bs` must be valid UEFI boot services; call before `ExitBootServices`.
+pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
+{
+    // SAFETY: bs is valid per the caller's contract.
+    unsafe { allocate_pages(bs, 1).ok() }
 }

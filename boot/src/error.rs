@@ -45,6 +45,31 @@ pub enum BootError
     InvalidConfig(&'static str),
 }
 
+impl From<elf::ElfError> for BootError
+{
+    fn from(err: elf::ElfError) -> Self
+    {
+        let s = match err
+        {
+            elf::ElfError::TooSmall => "file too small to contain ELF header",
+            elf::ElfError::BadMagic => "bad ELF magic number",
+            elf::ElfError::Not64Bit => "ELF is not 64-bit (ELFCLASS64 required)",
+            elf::ElfError::NotLittleEndian => "ELF is not little-endian (ELFDATA2LSB required)",
+            elf::ElfError::BadVersion => "ELF ident version is not EV_CURRENT",
+            elf::ElfError::NotExecutable => "ELF type is not ET_EXEC",
+            elf::ElfError::WrongMachine =>
+            {
+                "ELF machine type does not match bootloader architecture"
+            }
+            elf::ElfError::BadPhentsize => "e_phentsize does not match sizeof(Elf64_Phdr)",
+            elf::ElfError::NoSegments => "ELF has no program headers",
+            elf::ElfError::PhdrTableOverflow => "program header table extends beyond end of file",
+            elf::ElfError::SegmentOverflow => "LOAD segment file data extends beyond end of file",
+        };
+        BootError::InvalidElf(s)
+    }
+}
+
 impl BootError
 {
     /// Return the variant-specific detail string, if any.

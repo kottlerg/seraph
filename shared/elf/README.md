@@ -27,7 +27,7 @@ shared/elf/
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System design, init/procmgr roles |
-| [docs/boot-protocol.md](../../docs/boot-protocol.md) | Boot module format |
+| [abi/boot-protocol/](../../abi/boot-protocol/) | Boot module format (`BootModule` type) |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

@@ -23,7 +23,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ipc::{IpcBuf, fs_labels, procmgr_labels};
+use ipc::{IpcMessage, fs_labels, procmgr_labels};
 
 use crate::{VfsdCaps, worker};
 
@@ -41,7 +41,7 @@ pub fn spawn_fatfs_driver(
     caps: &VfsdCaps,
     channel: &worker::Channel,
     partition_ep: u32,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
 ) -> Option<u32>
 {
     if caps.bootstrap_ep == 0
@@ -77,22 +77,25 @@ pub fn spawn_fatfs_driver(
     );
 
     // Phase 1: CREATE_PROCESS with [module, tokened bootstrap cap].
-    let (reply_label, _) = syscall::ipc_call(
-        caps.procmgr_ep,
-        procmgr_labels::CREATE_PROCESS,
-        0,
-        &[module_copy, tokened_creator],
-    )
-    .ok()?;
-    if reply_label != 0
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+        .cap(module_copy)
+        .cap(tokened_creator)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(create_reply) = (unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) })
+    else
+    {
+        println!("vfsd: fatfs CREATE_PROCESS ipc_call failed");
+        return None;
+    };
+    if create_reply.label != 0
     {
         println!("vfsd: fatfs CREATE_PROCESS failed");
         return None;
     }
 
-    // SAFETY: ipc wraps the registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 2
+    let reply_caps = create_reply.caps();
+    if reply_caps.len() < 2
     {
         println!("vfsd: fatfs CREATE_PROCESS reply missing caps");
         return None;
@@ -100,10 +103,13 @@ pub fn spawn_fatfs_driver(
     let process_handle = reply_caps[0];
 
     // START_PROCESS — fatfs begins executing and issues its bootstrap request.
-    if !matches!(
-        syscall::ipc_call(process_handle, procmgr_labels::START_PROCESS, 0, &[]),
-        Ok((0, _))
-    )
+    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let start_ok = matches!(
+        unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) },
+        Ok(ref r) if r.label == 0
+    );
+    if !start_ok
     {
         println!("vfsd: fatfs START_PROCESS failed");
         return None;
@@ -118,10 +124,15 @@ pub fn spawn_fatfs_driver(
 
     // Probe the driver with an empty FS_MOUNT: fatfs validates the BPB in its
     // handler and replies with fs_errors::SUCCESS or an error label.
-    let (mount_reply, _) = syscall::ipc_call(driver_send, fs_labels::FS_MOUNT, 0, &[]).ok()?;
-    if mount_reply != 0
+    let mount_msg = IpcMessage::new(fs_labels::FS_MOUNT);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let mount_reply = unsafe { ipc::ipc_call(driver_send, &mount_msg, ipc_buf) }.ok()?;
+    if mount_reply.label != 0
     {
-        println!("vfsd: fatfs FS_MOUNT probe failed (label={mount_reply})");
+        println!(
+            "vfsd: fatfs FS_MOUNT probe failed (label={})",
+            mount_reply.label
+        );
         return None;
     }
 

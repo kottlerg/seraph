@@ -26,11 +26,11 @@
 //! 3. Use `cycles_now()` to bracket the measured operation.
 //! 4. Log results with `crate::log_u64` (no heap required).
 
+use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, event_post, event_queue_create, event_recv, ipc_recv, ipc_reply, signal_send,
-    signal_wait, thread_configure, thread_exit, thread_start, wait_set_add, wait_set_remove,
-    wait_set_wait,
+    cap_delete, event_post, event_queue_create, event_recv, signal_send, signal_wait,
+    thread_configure, thread_exit, thread_start, wait_set_add, wait_set_remove, wait_set_wait,
 };
 use syscall_abi::SystemInfoType;
 
@@ -176,9 +176,20 @@ fn ipc_caller_entry(arg: u64) -> !
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
     let n = arg >> 32;
 
+    // Register the shared IPC buffer for this child thread.
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        signal_send(done_slot, 1).ok();
+        thread_exit()
+    }
+    let ipc_buf = buf_addr as *mut u64;
+    let msg = IpcMessage::new(0);
+
     for _ in 0..n
     {
-        if syscall::ipc_call(ep_slot, 0, 0, &[]).is_err()
+        // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+        if unsafe { ipc::ipc_call(ep_slot, &msg, ipc_buf) }.is_err()
         {
             break;
         }
@@ -233,14 +244,17 @@ fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         return;
     }
 
+    let reply = IpcMessage::new(0);
     let t0 = cycles_now();
     for _ in 0..n
     {
-        if ipc_recv(ep).is_err()
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        if unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }.is_err()
         {
             break;
         }
-        if ipc_reply(0, 0, &[]).is_err()
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        if unsafe { ipc::ipc_reply(&reply, ctx.ipc_buf) }.is_err()
         {
             break;
         }
@@ -250,7 +264,7 @@ fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     signal_wait(done).ok();
 
     let total = t1.saturating_sub(t0);
-    log_bench_header("ipc_round_trip", iters);
+    log_bench_header("ipc_round_trip_wrapped", iters);
     crate::log_u64("ktest: bench  cycles_mean=", total / n);
 
     cap_delete(th).ok();

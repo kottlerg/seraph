@@ -136,12 +136,11 @@ pub struct PageFlags
     /// Force device/uncacheable memory type.
     ///
     /// On x86-64: sets PCD|PWT in the PTE (strong uncacheable).
-    /// On RISC-V: QEMU virt MMIO regions are inherently device-ordered by
-    /// physical address; this field is a documentation marker only.
+    /// On RISC-V: under Sv48 without Svpbmt, MMIO regions are device-ordered
+    /// by physical address and this field is a documentation marker only.
     ///
-    // TODO: On real RISC-V hardware with Svpbmt, set PTE bits
-    // [62:61] = 01 (NC) when this is true. Pick up when targeting non-QEMU
-    // RISC-V hardware.
+    // TODO: With Svpbmt, set PTE bits [62:61] = 01 (NC) when
+    // this is true. Pick up when adding Svpbmt support.
     pub uncacheable: bool,
 }
 
@@ -404,9 +403,16 @@ pub fn init_kernel_page_tables(
     map_framebuffer_if_needed(root_va, info, max_phys_rounded, &mut pool)?;
 
     // ── Architecture-specific MMIO regions ────────────────────────────────────
-    // Map regions listed in arch::current::MMIO_DIRECT_MAP_REGIONS that fall
-    // above max_phys_rounded (and thus outside the large-page direct map loop).
-    for &(phys_base, size) in crate::arch::current::MMIO_DIRECT_MAP_REGIONS
+    // Ask the arch layer which kernel-internal MMIO regions need to be mapped
+    // (xAPIC + I/O APIC bases on x86-64; nothing on RISC-V where PLIC/UART live
+    // inside the RAM range). Bases come from `BootInfo.kernel_mmio` directly
+    // because the per-CPU cache is not yet populated at Phase 3.
+    let mut mmio_regions = [(0u64, 0u64); 16];
+    let mmio_count = crate::arch::current::platform::collect_mmio_direct_map_regions(
+        &info.kernel_mmio,
+        &mut mmio_regions,
+    );
+    for &(phys_base, size) in &mmio_regions[..mmio_count]
     {
         if phys_base < max_phys_rounded
         {

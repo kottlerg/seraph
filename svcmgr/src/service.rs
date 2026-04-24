@@ -9,7 +9,6 @@
 //! `SvcmgrCaps` struct for well-known capabilities acquired via the bootstrap
 //! protocol at startup.
 
-use ipc::IpcBuf;
 use std::os::seraph::StartupInfo;
 
 /// Maximum number of monitored services.
@@ -134,13 +133,14 @@ pub struct SvcmgrCaps
 }
 
 /// Acquire svcmgr's initial cap set from its creator (init) via bootstrap IPC.
-pub fn bootstrap_caps(info: &StartupInfo, ipc: IpcBuf) -> Option<SvcmgrCaps>
+pub fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<SvcmgrCaps>
 {
     if info.creator_endpoint == 0
     {
         return None;
     }
-    let round = ipc::bootstrap::request_round(info.creator_endpoint, ipc).ok()?;
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let round = unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) }.ok()?;
     if round.cap_count < 2 || !round.done
     {
         return None;

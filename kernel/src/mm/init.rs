@@ -286,7 +286,51 @@ fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
         );
     }
 
+    // DTB blob pages. Commonly reported as EfiBootServicesData → Usable by
+    // UEFI; userspace parses the DTB through a read-only Frame cap minted
+    // in Phase 7. Excluding the pages from the buddy keeps that cap's
+    // backing memory live.
+    if info.device_tree != 0
+        && let Some(size) = read_dtb_totalsize(info.device_tree)
+    {
+        add(info.device_tree, info.device_tree + size);
+    }
+
     excl
+}
+
+/// Read the `totalsize` field of a flattened device tree blob.
+///
+/// Returns `None` if the magic does not match or the reported size is
+/// implausible. Size is clamped to `DTB_MAX_SIZE` to bound the Frame cap.
+fn read_dtb_totalsize(phys: u64) -> Option<u64>
+{
+    /// FDT magic in big-endian: bytes `d0 0d fe ed`.
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    /// Safety clamp on the DTB blob size — 64 KiB is far above any realistic
+    /// DTB; bounds the exclusion on malformed firmware.
+    const DTB_MAX_SIZE: u64 = 64 * 1024;
+
+    // `phys` is a bootloader-provided identity-mapped physical address
+    // during Phase 2 (before page tables are rewritten in Phase 3). The
+    // first 8 bytes of an FDT blob are magic + totalsize by spec.
+    let ptr = phys as *const u8;
+    // SAFETY: identity-mapped physical address; FDT header is defined by
+    // the FDT spec to occupy the first bytes of the blob.
+    let magic_bytes = unsafe { core::ptr::read_volatile(ptr.cast::<[u8; 4]>()) };
+    let magic = u32::from_be_bytes(magic_bytes);
+    if magic != FDT_MAGIC
+    {
+        return None;
+    }
+    // SAFETY: identity-mapped; totalsize is the 4 bytes following the magic.
+    let size_bytes = unsafe { core::ptr::read_volatile(ptr.add(4).cast::<[u8; 4]>()) };
+    let size = u64::from(u32::from_be_bytes(size_bytes));
+    if size == 0 || size > DTB_MAX_SIZE
+    {
+        return None;
+    }
+    Some(size)
 }
 
 // ── Range subtraction ─────────────────────────────────────────────────────────

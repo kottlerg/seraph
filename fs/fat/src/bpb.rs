@@ -63,8 +63,23 @@ impl FatState
     }
 
     /// First sector of a given cluster.
+    ///
+    /// Clusters 0 and 1 are reserved by the FAT spec (0 = free-marker,
+    /// 1 = reserved); valid data-region clusters start at 2. Callers
+    /// MUST filter those sentinels out before reaching this helper.
+    /// The clamp here only avoids a panic; every hit is noisy so the
+    /// underlying cause (corrupt FAT chain or a block read that
+    /// returned zeroed bytes) is visible rather than swallowed.
     pub fn cluster_to_sector(&self, cluster: u32) -> u32
     {
+        if cluster < 2
+        {
+            println!(
+                "fatfs: WARNING: cluster_to_sector({cluster}) — reserved cluster \
+                 reached; caller should filter"
+            );
+            return self.data_start_sector;
+        }
         self.data_start_sector + (cluster - 2) * u32::from(self.sectors_per_cluster)
     }
 

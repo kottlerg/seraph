@@ -82,7 +82,7 @@ process is created without going through procmgr.
 | [docs/architecture.md](../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
 | [docs/capability-model.md](../docs/capability-model.md) | CSpace, AddressSpace, Thread caps |
 | [procmgr/docs/frame-management.md](docs/frame-management.md) | Frame pool design, allocation, per-process accounting |
-| [docs/boot-protocol.md](../docs/boot-protocol.md) | Boot module format |
+| [abi/boot-protocol/](../abi/boot-protocol/) | Boot module format (`BootModule` type) |
 | [abi/process-abi](../abi/process-abi/README.md) | Process startup ABI: ProcessInfo, StartupInfo, main() |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
 

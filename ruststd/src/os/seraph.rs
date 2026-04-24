@@ -21,7 +21,7 @@
 // feature name is a placeholder and has no std-wide meaning.
 #![stable(feature = "seraph_ext", since = "1.0.0")]
 
-use crate::cell::UnsafeCell;
+use crate::cell::{Cell, UnsafeCell};
 use crate::mem::MaybeUninit;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sys::alloc::seraph as pal_alloc;
@@ -113,6 +113,47 @@ unsafe impl Send for StartupInfo {}
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 unsafe impl Sync for StartupInfo {}
 
+// ── Per-thread IPC buffer pointer ──────────────────────────────────────────
+//
+// Each thread registers its own 4 KiB IPC buffer page with the kernel via
+// `SYS_IPC_BUFFER_SET`. The kernel writes IPC payload into this page on
+// `ipc_recv` / `ipc_call` and reads from it on send; userspace IPC wrappers
+// (`ipc::ipc_call`/`ipc_recv`/`ipc_reply`) need the same VA to stage/consume
+// payloads. The VA is known only to the code that registered it — `_start`
+// for the main thread, the thread trampoline for spawned threads — so we
+// stash it in a thread-local slot here and expose it via
+// [`current_ipc_buf`].
+//
+// Every in-tree IPC-issuing subsystem (stdio, heap `grow`, future
+// services) reads the buffer pointer from this TLS slot at the call
+// site. Caching a buffer VA on behalf of another thread silently
+// targets the wrong page from spawned threads, because the kernel
+// services IPC from the caller thread's `tcb.ipc_buffer` — not the
+// pointer user code passes in.
+
+#[thread_local]
+static IPC_BUF_TLS: Cell<*mut u64> = Cell::new(core::ptr::null_mut());
+
+/// Record the current thread's IPC buffer VA. Called by `_start` and by the
+/// thread trampoline immediately after `syscall::ipc_buffer_set`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn set_current_ipc_buf(buf: *mut u64) {
+    IPC_BUF_TLS.set(buf);
+}
+
+/// Return the current thread's registered IPC buffer VA, or null if the
+/// current thread has not registered one. Safe accessor for code that issues
+/// IPC from non-main threads (bootstrap workers, user-spawned threads).
+///
+/// Returns null if called before `_start` has completed on the main thread,
+/// or before the thread trampoline has registered a buffer on a spawned
+/// thread.
+#[must_use]
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn current_ipc_buf() -> *mut u64 {
+    IPC_BUF_TLS.get()
+}
+
 // ── Startup storage ─────────────────────────────────────────────────────────
 
 struct StartupCell(UnsafeCell<MaybeUninit<StartupInfo>>);
@@ -185,6 +226,7 @@ pub extern "C" fn _start() -> ! {
     // Register the IPC buffer before any IPC-using code runs. Idempotent in
     // the kernel, so services that call `ipc_buffer_set` again are fine.
     let _ = syscall::ipc_buffer_set(info.ipc_buffer_vaddr);
+    set_current_ipc_buf(info.ipc_buffer_vaddr as *mut u64);
 
     // Build the argv slice from the ProcessInfo-page region procmgr wrote.
     // `args_offset` is a byte offset within the mapped ProcessInfo page;
@@ -252,7 +294,6 @@ pub extern "C" fn _start() -> ! {
         info.stdin_cap,
         info.stdout_cap,
         info.stderr_cap,
-        info.ipc_buffer_vaddr as *mut u8,
     );
 
     // Bootstrap the heap so `fn main()` can allocate from its first line
@@ -269,7 +310,6 @@ pub extern "C" fn _start() -> ! {
         let ok = pal_alloc::heap_bootstrap(
             info.procmgr_endpoint_cap,
             info.self_aspace_cap,
-            info.ipc_buffer_vaddr,
         );
         if !ok {
             diag_writeln_args(format_args!(
@@ -312,16 +352,15 @@ static _START_REF: unsafe extern "C" fn() -> ! = _start;
 /// `procmgr_ep`, before the first allocation through the `System`
 /// allocator. Idempotent — subsequent calls are no-ops.
 ///
-/// `self_aspace` is the process's own `AddressSpace` cap slot.
-/// `ipc_buffer_vaddr` is the VA of the pre-mapped IPC buffer
-/// (from `ProcessInfo::ipc_buffer_vaddr`). The call registers that buffer
-/// with the kernel; callers that already called `SYS_IPC_BUFFER_SET`
-/// themselves can pass the same address safely.
+/// `self_aspace` is the process's own `AddressSpace` cap slot. The
+/// bootstrap IPC round uses the calling thread's registered IPC buffer
+/// (read from TLS via [`current_ipc_buf`]); `_start` populates that
+/// slot before invoking `heap_bootstrap`.
 ///
 /// Returns `true` if the heap is usable after this call.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32, ipc_buffer_vaddr: u64) -> bool {
-    pal_alloc::heap_bootstrap(procmgr_ep, self_aspace, ipc_buffer_vaddr)
+pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32) -> bool {
+    pal_alloc::heap_bootstrap(procmgr_ep, self_aspace)
 }
 
 /// Returns `true` once `heap_bootstrap` has completed successfully.

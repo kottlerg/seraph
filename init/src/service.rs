@@ -12,30 +12,13 @@
 use crate::bootstrap::NEXT_BOOTSTRAP_TOKEN;
 use crate::idle_loop;
 use crate::logging::{log, pack_name};
-use init_protocol::{CapDescriptor, CapType, InitInfo};
-use ipc::{IpcBuf, procmgr_labels, svcmgr_labels};
+use init_protocol::{CapType, InitInfo};
+use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
-/// Pack `path` bytes into IPC data words starting at `word_offset`. Returns
-/// the number of words written. Mirrors `ipc::write_path_to_ipc` but accepts
-/// a starting word index, used here to leave word 0 free for the stdio token.
-fn write_path_at_offset(ipc: IpcBuf, word_offset: usize, path: &[u8]) -> usize
+/// Returns the number of u64 words `path` fills when packed little-endian.
+fn path_word_count(path: &[u8]) -> usize
 {
-    let n = path.len().min(ipc::MAX_PATH_LEN);
-    let words = n.div_ceil(8);
-    for i in 0..words
-    {
-        let mut word: u64 = 0;
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < n
-            {
-                word |= u64::from(path[base + j]) << (j * 8);
-            }
-        }
-        ipc.write_word(word_offset + i, word);
-    }
-    words
+    path.len().min(ipc::MAX_PATH_LEN).div_ceil(8)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -48,17 +31,22 @@ fn derive_tokened_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
 }
 
 /// Start a process by calling `START_PROCESS` on its tokened process handle.
-fn start_process(process_handle: u32, ok_msg: &str, fail_msg: &str) -> bool
+fn start_process(process_handle: u32, ipc_buf: *mut u64, ok_msg: &str, fail_msg: &str) -> bool
 {
-    if let Ok((0, _)) = syscall::ipc_call(process_handle, procmgr_labels::START_PROCESS, 0, &[])
+    let msg = IpcMessage::new(procmgr_labels::START_PROCESS);
+    // SAFETY: ipc_buf is caller's registered IPC buffer.
+    match unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }
     {
-        log(ok_msg);
-        true
-    }
-    else
-    {
-        log(fail_msg);
-        false
+        Ok(reply) if reply.label == 0 =>
+        {
+            log(ok_msg);
+            true
+        }
+        _ =>
+        {
+            log(fail_msg);
+            false
+        }
     }
 }
 
@@ -66,14 +54,16 @@ fn start_process(process_handle: u32, ok_msg: &str, fail_msg: &str) -> bool
 fn serve(
     bootstrap_ep: u32,
     token: u64,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
     done: bool,
     caps: &[u32],
     data: &[u64],
     context: &str,
 ) -> bool
 {
-    if ipc::bootstrap::serve_round(bootstrap_ep, token, ipc, done, caps, data).is_err()
+    // SAFETY: ipc_buf is caller's registered IPC buffer.
+    if unsafe { ipc::bootstrap::serve_round(bootstrap_ep, token, ipc_buf, done, caps, data) }
+        .is_err()
     {
         log(context);
         return false;
@@ -83,16 +73,34 @@ fn serve(
 
 // ── Hardware cap partitioning for devmgr ────────────────────────────────────
 
-/// Collected hardware caps from init's kernel-delivered `CapDescriptor` table.
+/// Maximum number of MMIO apertures init forwards to devmgr in one go.
+/// Kernel's `MmioApertureSlice` is sized at `MAX_APERTURES = 16` today; 32
+/// is a comfortable upper bound.
+const MAX_APERTURE_CAPS: usize = 32;
+
+/// Maximum number of ACPI reclaimable-region Frame caps. Matches the
+/// kernel's `MAX_ACPI_REGIONS`; 8 is generous.
+const MAX_ACPI_REGION_CAPS: usize = 8;
+
+/// Collected hardware caps: init forwards raw firmware + MMIO surfaces
+/// to devmgr. Parsing (MCFG → ECAM, MADT → GSI routing) lives in devmgr.
 struct HwCaps
 {
-    ecam_slot: u32,
-    ecam_base: u64,
-    ecam_size: u64,
-    mmio_windows: [(u32, u64, u64); 2], // (slot, base, size)
-    mmio_count: usize,
-    irqs: [(u32, u32); 64], // (slot, irq_id)
-    irq_count: usize,
+    /// Root `Interrupt` range cap. Zero if the kernel did not mint one.
+    irq_range_slot: u32,
+    /// RO Frame cap covering the ACPI RSDP page. Zero if none.
+    rsdp_slot: u32,
+    rsdp_page_base: u64,
+    /// RO Frame cap covering the DTB blob. Zero if none.
+    dtb_slot: u32,
+    dtb_page_base: u64,
+    dtb_size: u64,
+    /// All MMIO aperture caps (slot, base, size).
+    apertures: [(u32, u64, u64); MAX_APERTURE_CAPS],
+    aperture_count: usize,
+    /// ACPI reclaimable-region Frame caps (slot, base, size).
+    acpi_regions: [(u32, u64, u64); MAX_ACPI_REGION_CAPS],
+    acpi_region_count: usize,
 }
 
 impl HwCaps
@@ -100,65 +108,121 @@ impl HwCaps
     const fn new() -> Self
     {
         Self {
-            ecam_slot: 0,
-            ecam_base: 0,
-            ecam_size: 0,
-            mmio_windows: [(0, 0, 0); 2],
-            mmio_count: 0,
-            irqs: [(0, 0); 64],
-            irq_count: 0,
+            irq_range_slot: 0,
+            rsdp_slot: 0,
+            rsdp_page_base: 0,
+            dtb_slot: 0,
+            dtb_page_base: 0,
+            dtb_size: 0,
+            apertures: [(0, 0, 0); MAX_APERTURE_CAPS],
+            aperture_count: 0,
+            acpi_regions: [(0, 0, 0); MAX_ACPI_REGION_CAPS],
+            acpi_region_count: 0,
         }
     }
 }
 
-fn collect_hw_caps(init_descs: &[CapDescriptor]) -> HwCaps
+fn collect_hw_caps(info: &InitInfo) -> HwCaps
 {
     let mut hw = HwCaps::new();
-    for d in init_descs
+
+    // Named slots from InitInfo (protocol v5).
+    hw.irq_range_slot = info.irq_range_cap;
+    hw.rsdp_slot = info.acpi_rsdp_frame_cap;
+    hw.dtb_slot = info.dtb_frame_cap;
+
+    // Walk the descriptor array once to capture aperture + ACPI-region
+    // metadata. RSDP / DTB base + size come from their descriptors too.
+    for d in crate::descriptors(info)
     {
         match d.cap_type
         {
-            CapType::PciEcam =>
+            CapType::MmioRegion if hw.aperture_count < MAX_APERTURE_CAPS =>
             {
-                hw.ecam_slot = d.slot;
-                hw.ecam_base = d.aux0;
-                hw.ecam_size = d.aux1;
+                hw.apertures[hw.aperture_count] = (d.slot, d.aux0, d.aux1);
+                hw.aperture_count += 1;
             }
-            CapType::MmioRegion if d.aux1 >= 0x1000_0000 && hw.mmio_count < 2 =>
+            CapType::Frame if d.slot == hw.rsdp_slot && hw.rsdp_slot != 0 =>
             {
-                hw.mmio_windows[hw.mmio_count] = (d.slot, d.aux0, d.aux1);
-                hw.mmio_count += 1;
+                hw.rsdp_page_base = d.aux0;
             }
-            CapType::Interrupt if hw.irq_count < hw.irqs.len() =>
+            CapType::Frame if d.slot == hw.dtb_slot && hw.dtb_slot != 0 =>
             {
-                hw.irqs[hw.irq_count] = (d.slot, d.aux0 as u32);
-                hw.irq_count += 1;
+                hw.dtb_page_base = d.aux0;
+                hw.dtb_size = d.aux1;
             }
             _ =>
             {}
         }
     }
+
+    // ACPI region caps occupy a contiguous slot range starting at
+    // `acpi_region_frame_base`. Walk the descriptor array a second time
+    // to pick them out by slot range; their aux0/aux1 carry (base, size).
+    let ar_start = info.acpi_region_frame_base;
+    let ar_end = ar_start + info.acpi_region_frame_count;
+    if info.acpi_region_frame_count != 0
+    {
+        for d in crate::descriptors(info)
+        {
+            if d.cap_type == CapType::Frame
+                && d.slot >= ar_start
+                && d.slot < ar_end
+                && hw.acpi_region_count < MAX_ACPI_REGION_CAPS
+            {
+                hw.acpi_regions[hw.acpi_region_count] = (d.slot, d.aux0, d.aux1);
+                hw.acpi_region_count += 1;
+            }
+        }
+    }
+
     hw
 }
 
 // ── devmgr creation ──────────────────────────────────────────────────────────
 
-/// Create devmgr via procmgr and serve its bootstrap (hardware caps).
+/// Round-kind discriminator for post-R1 bootstrap rounds (devmgr side).
+/// Matches `devmgr/src/caps.rs::BootstrapKind`.
+mod kind
+{
+    pub const MODULE: u64 = 1;
+    pub const APERTURE: u64 = 2;
+    pub const ACPI_REGION: u64 = 3;
+}
+
+/// Presence-bitmap bits on R1's `data[0]`. Tells devmgr which optional
+/// caps (in order after `registry_ep`) are present in the cap list.
+mod present
+{
+    pub const IRQ_RANGE: u64 = 1 << 0;
+    pub const RSDP: u64 = 1 << 1;
+    pub const DTB: u64 = 1 << 2;
+}
+
+/// Create devmgr via procmgr and serve its bootstrap (raw firmware caps).
+///
+/// The bootstrap protocol is:
+///
+/// * Round 1 (fixed, 4 caps, 3 data words)
+///   - caps: `[registry_ep, irq_range, rsdp_frame, dtb_frame]`
+///     (zero-slots pass through where the kernel minted none)
+///   - data: `[rsdp_page_base, dtb_page_base, dtb_size]`
+/// * Round 2+ (variable, ≤4 caps, up to 9 data words)
+///   - `data[0]` = round kind (`APERTURE` / `ACPI_REGION` / `MODULE`)
+///   - `data[1]` = count of caps in this round
+///   - `data[2..]` = kind-specific payload:
+///       - aperture / ACPI: `(base, size)` pairs per cap
+///       - module: none
+///   - terminal round has `done = true`.
 ///
 /// The bootstrap layout mirrors `devmgr/src/caps.rs::bootstrap_caps`.
-// clippy::too_many_lines: delivery of devmgr's initial cap set is a
-// transaction — derive each cap, package it with the collected hardware
-// descriptors, then serve two bootstrap rounds. All the per-cap derive
-// sites must unwind cooperatively on failure; splitting requires threading
-// the partial-state rollback through multiple helpers with no gain in
-// clarity over the inline, linear presentation.
 #[allow(clippy::too_many_lines)]
 pub fn create_devmgr_with_caps(
     info: &InitInfo,
     procmgr_ep: u32,
     bootstrap_ep: u32,
     registry_ep: u32,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
 )
 {
     let devmgr_frame_cap = info.module_frame_base + 1;
@@ -171,37 +235,36 @@ pub fn create_devmgr_with_caps(
     };
 
     // Stdio token = packed name "devmgr"; stdin not attached.
-    ipc.write_word(0, pack_name(b"devmgr"));
-    let Ok((reply_label, _)) = syscall::ipc_call(
-        procmgr_ep,
-        procmgr_labels::CREATE_PROCESS,
-        1,
-        &[devmgr_frame_cap, tokened_creator],
-    )
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+        .word(0, pack_name(b"devmgr"))
+        .cap(devmgr_frame_cap)
+        .cap(tokened_creator)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
         log("init: devmgr: CREATE_PROCESS ipc_call failed");
         return;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         log("init: devmgr: CREATE_PROCESS failed");
         return;
     }
 
-    // SAFETY: ipc is the registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 1
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
     {
         log("init: devmgr: CREATE_PROCESS reply missing caps");
         return;
     }
     let process_handle = reply_caps[0];
 
-    let hw = collect_hw_caps(crate::descriptors(info));
+    let hw = collect_hw_caps(info);
 
-    // log + procmgr are auto-delivered via ProcessInfo by procmgr; only the
-    // devmgr-specific caps traverse this bootstrap protocol.
+    // log + procmgr are auto-delivered via ProcessInfo; only the devmgr-
+    // specific caps traverse this bootstrap protocol.
     let _ = procmgr_ep;
     let Ok(registry_copy) = syscall::cap_derive(registry_ep, syscall::RIGHTS_ALL)
     else
@@ -209,16 +272,38 @@ pub fn create_devmgr_with_caps(
         log("init: devmgr: registry cap derive failed");
         return;
     };
-    let Ok(ecam_copy) = syscall::cap_derive(hw.ecam_slot, syscall::RIGHTS_ALL)
+
+    // Derive sendable copies of the firmware-authority caps. Zero slots
+    // stay zero (devmgr handles the absence).
+    let irq_copy = if hw.irq_range_slot != 0
+    {
+        syscall::cap_derive(hw.irq_range_slot, syscall::RIGHTS_ALL).unwrap_or(0)
+    }
     else
     {
-        log("init: devmgr: ecam cap derive failed");
-        return;
+        0
+    };
+    let rsdp_copy = if hw.rsdp_slot != 0
+    {
+        syscall::cap_derive(hw.rsdp_slot, syscall::RIGHTS_ALL).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    let dtb_copy = if hw.dtb_slot != 0
+    {
+        syscall::cap_derive(hw.dtb_slot, syscall::RIGHTS_ALL).unwrap_or(0)
+    }
+    else
+    {
+        0
     };
 
     // START_PROCESS.
     if !start_process(
         process_handle,
+        ipc_buf,
         "init: devmgr started; serving bootstrap",
         "init: devmgr: START_PROCESS failed",
     )
@@ -226,84 +311,81 @@ pub fn create_devmgr_with_caps(
         return;
     }
 
-    // Round 1: [registry, ecam]; data [ecam_base, ecam_size].
+    // Round 1: [registry, ...present(irq,rsdp,dtb)].
+    // data[0] = presence bitmap; data[1]=rsdp_base, data[2]=dtb_base,
+    // data[3]=dtb_size (always written; bitmap indicates validity).
+    let mut r1_caps = [0u32; 4];
+    let mut r1_cap_count: usize = 1;
+    r1_caps[0] = registry_copy;
+    let mut presence: u64 = 0;
+    if irq_copy != 0
+    {
+        presence |= present::IRQ_RANGE;
+        r1_caps[r1_cap_count] = irq_copy;
+        r1_cap_count += 1;
+    }
+    if rsdp_copy != 0
+    {
+        presence |= present::RSDP;
+        r1_caps[r1_cap_count] = rsdp_copy;
+        r1_cap_count += 1;
+    }
+    if dtb_copy != 0
+    {
+        presence |= present::DTB;
+        r1_caps[r1_cap_count] = dtb_copy;
+        r1_cap_count += 1;
+    }
     if !serve(
         bootstrap_ep,
         child_token,
-        ipc,
+        ipc_buf,
         false,
-        &[registry_copy, ecam_copy],
-        &[hw.ecam_base, hw.ecam_size],
+        &r1_caps[..r1_cap_count],
+        &[presence, hw.rsdp_page_base, hw.dtb_page_base, hw.dtb_size],
         "init: devmgr: bootstrap round 1 failed",
     )
     {
         return;
     }
 
-    // Round 2: MMIO windows. Data: [count, base0, size0, base1, size1].
-    let mut mmio_caps = [0u32; 2];
-    let mut mmio_data = [0u64; 5];
-    mmio_data[0] = hw.mmio_count as u64;
-    for i in 0..hw.mmio_count
-    {
-        let (slot, base, size) = hw.mmio_windows[i];
-        if let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
-        {
-            mmio_caps[i] = c;
-        }
-        mmio_data[1 + i * 2] = base;
-        mmio_data[2 + i * 2] = size;
-    }
+    // Helper: does any content remain after this point?
+    let has_module = info.module_frame_count > 3;
+    let remaining_apertures = hw.aperture_count > 0;
+    let remaining_acpi = hw.acpi_region_count > 0;
 
-    let done_after_mmio = hw.irq_count == 0 && info.module_frame_count <= 3;
-
-    if !serve(
-        bootstrap_ep,
-        child_token,
-        ipc,
-        done_after_mmio,
-        &mmio_caps[..hw.mmio_count],
-        &mmio_data[..=hw.mmio_count * 2],
-        "init: devmgr: bootstrap round 2 (MMIO) failed",
-    )
+    // ── Aperture rounds ─────────────────────────────────────────────────
+    let mut idx = 0;
+    while idx < hw.aperture_count
     {
-        return;
-    }
-    if done_after_mmio
-    {
-        return;
-    }
-
-    // IRQ rounds: 4 caps per round with kind=0 tag.
-    let mut irq_idx = 0;
-    while irq_idx < hw.irq_count
-    {
-        let batch_end = (irq_idx + 4).min(hw.irq_count);
-        let batch_count = batch_end - irq_idx;
-        let mut irq_caps = [0u32; 4];
-        let mut irq_data = [0u64; 5];
-        irq_data[0] = 0; // kind=0 (IRQ round)
+        let batch_end = (idx + 4).min(hw.aperture_count);
+        let batch_count = batch_end - idx;
+        let mut caps = [0u32; 4];
+        let mut data = [0u64; 2 + 4 * 2];
+        data[0] = kind::APERTURE;
+        data[1] = batch_count as u64;
         for j in 0..batch_count
         {
-            let (slot, id) = hw.irqs[irq_idx + j];
+            let (slot, base, size) = hw.apertures[idx + j];
             if let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
             {
-                irq_caps[j] = c;
+                caps[j] = c;
             }
-            irq_data[1 + j] = u64::from(id);
+            data[2 + j * 2] = base;
+            data[3 + j * 2] = size;
         }
 
-        let is_last_irq = batch_end == hw.irq_count;
-        let done_here = is_last_irq && info.module_frame_count <= 3;
+        let is_last = batch_end == hw.aperture_count;
+        let done_here = is_last && !remaining_acpi && !has_module;
 
         if !serve(
             bootstrap_ep,
             child_token,
-            ipc,
+            ipc_buf,
             done_here,
-            &irq_caps[..batch_count],
-            &irq_data[..=batch_count],
-            "init: devmgr: bootstrap IRQ round failed",
+            &caps[..batch_count],
+            &data[..2 + batch_count * 2],
+            "init: devmgr: bootstrap aperture round failed",
         )
         {
             return;
@@ -312,11 +394,54 @@ pub fn create_devmgr_with_caps(
         {
             return;
         }
-        irq_idx = batch_end;
+        idx = batch_end;
     }
 
-    // Module rounds: driver module frames (virtio-blk = module 3).
-    if info.module_frame_count > 3
+    // ── ACPI region rounds ──────────────────────────────────────────────
+    let mut idx = 0;
+    while idx < hw.acpi_region_count
+    {
+        let batch_end = (idx + 4).min(hw.acpi_region_count);
+        let batch_count = batch_end - idx;
+        let mut caps = [0u32; 4];
+        let mut data = [0u64; 2 + 4 * 2];
+        data[0] = kind::ACPI_REGION;
+        data[1] = batch_count as u64;
+        for j in 0..batch_count
+        {
+            let (slot, base, size) = hw.acpi_regions[idx + j];
+            if let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+            {
+                caps[j] = c;
+            }
+            data[2 + j * 2] = base;
+            data[3 + j * 2] = size;
+        }
+
+        let is_last = batch_end == hw.acpi_region_count;
+        let done_here = is_last && !has_module;
+
+        if !serve(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            done_here,
+            &caps[..batch_count],
+            &data[..2 + batch_count * 2],
+            "init: devmgr: bootstrap ACPI region round failed",
+        )
+        {
+            return;
+        }
+        if done_here
+        {
+            return;
+        }
+        idx = batch_end;
+    }
+
+    // ── Module round (virtio-blk = module 3) ────────────────────────────
+    if has_module
     {
         let module_cap = info.module_frame_base + 3;
         let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
@@ -326,15 +451,28 @@ pub fn create_devmgr_with_caps(
             return;
         };
 
-        // kind=1 (module round), one cap.
         let _ = serve(
             bootstrap_ep,
             child_token,
-            ipc,
+            ipc_buf,
             true,
             &[module_copy],
-            &[1u64],
+            &[kind::MODULE, 1],
             "init: devmgr: bootstrap module round failed",
+        );
+    }
+    else if !remaining_apertures && !remaining_acpi
+    {
+        // All three kinds empty and R1 didn't mark done — close the
+        // stream with an empty terminal round so devmgr's loop exits.
+        let _ = serve(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            true,
+            &[],
+            &[kind::MODULE, 0],
+            "init: devmgr: bootstrap terminal round failed",
         );
     }
 }
@@ -355,7 +493,7 @@ pub fn create_vfsd_with_caps(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     spawn: &VfsdSpawnCaps,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
 )
 {
     let vfsd_frame_cap = info.module_frame_base + 2;
@@ -367,27 +505,26 @@ pub fn create_vfsd_with_caps(
         return;
     };
 
-    ipc.write_word(0, pack_name(b"vfsd"));
-    let Ok((reply_label, _)) = syscall::ipc_call(
-        procmgr_ep,
-        procmgr_labels::CREATE_PROCESS,
-        1,
-        &[vfsd_frame_cap, tokened_creator],
-    )
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+        .word(0, pack_name(b"vfsd"))
+        .cap(vfsd_frame_cap)
+        .cap(tokened_creator)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
         log("init: vfsd: CREATE_PROCESS ipc_call failed");
         return;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         log("init: vfsd: CREATE_PROCESS failed");
         return;
     }
 
-    // SAFETY: ipc is the registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 1
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
     {
         log("init: vfsd: CREATE_PROCESS reply missing caps");
         return;
@@ -407,6 +544,7 @@ pub fn create_vfsd_with_caps(
 
     if !start_process(
         process_handle,
+        ipc_buf,
         "init: vfsd started; serving bootstrap",
         "init: vfsd: START_PROCESS failed",
     )
@@ -419,7 +557,7 @@ pub fn create_vfsd_with_caps(
     if !serve(
         bootstrap_ep,
         child_token,
-        ipc,
+        ipc_buf,
         false,
         &[service_copy, registry_copy],
         &[],
@@ -442,7 +580,7 @@ pub fn create_vfsd_with_caps(
     let _ = serve(
         bootstrap_ep,
         child_token,
-        ipc,
+        ipc_buf,
         true,
         &[fatfs_cap],
         &[],
@@ -453,7 +591,7 @@ pub fn create_vfsd_with_caps(
 // ── svcmgr / procmgr coordination ───────────────────────────────────────────
 
 /// Send `SET_VFSD_ENDPOINT` to procmgr so it can do VFS-based ELF loading.
-pub fn send_vfsd_endpoint_to_procmgr(procmgr_ep: u32, vfsd_ep: u32)
+pub fn send_vfsd_endpoint_to_procmgr(procmgr_ep: u32, vfsd_ep: u32, ipc_buf: *mut u64)
 {
     let Ok(vfsd_copy) = syscall::cap_derive(vfsd_ep, syscall::RIGHTS_SEND_GRANT)
     else
@@ -461,9 +599,13 @@ pub fn send_vfsd_endpoint_to_procmgr(procmgr_ep: u32, vfsd_ep: u32)
         log("init: phase 3: failed to derive vfsd endpoint");
         return;
     };
-    match syscall::ipc_call(procmgr_ep, procmgr_labels::SET_VFSD_EP, 0, &[vfsd_copy])
+    let msg = IpcMessage::builder(procmgr_labels::SET_VFSD_EP)
+        .cap(vfsd_copy)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) }
     {
-        Ok((0, _)) => log("init: phase 3: vfsd endpoint sent to procmgr"),
+        Ok(reply) if reply.label == 0 => log("init: phase 3: vfsd endpoint sent to procmgr"),
         _ => log("init: phase 3: SET_VFSD_ENDPOINT failed"),
     }
 }
@@ -471,34 +613,39 @@ pub fn send_vfsd_endpoint_to_procmgr(procmgr_ep: u32, vfsd_ep: u32)
 /// Create svcmgr from VFS (`/bin/svcmgr`) via `CREATE_FROM_VFS`.
 ///
 /// Returns `(process_handle, child_token)` on success.
-pub fn create_svcmgr_from_vfs(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
--> Option<(u32, u64)>
+pub fn create_svcmgr_from_vfs(
+    procmgr_ep: u32,
+    bootstrap_ep: u32,
+    ipc_buf: *mut u64,
+) -> Option<(u32, u64)>
 {
-    let path = b"/bin/svcmgr";
-
-    // Word 0 = stdio_token; words 1+ = path bytes.
-    ipc.write_word(0, pack_name(b"svcmgr"));
-    let path_words = write_path_at_offset(ipc, 1, path);
-    let word_count = 1 + path_words;
+    let path: &[u8] = b"/bin/svcmgr";
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
+    // Word 0 = stdio_token; words 1+ = path bytes.
     let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
-    let Ok((reply_label, _)) = syscall::ipc_call(procmgr_ep, label, word_count, &[tokened_creator])
+    let msg = IpcMessage::builder(label)
+        .word(0, pack_name(b"svcmgr"))
+        .bytes(1, path)
+        .cap(tokened_creator)
+        .build();
+
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
         log("init: phase 3: CREATE_FROM_VFS ipc_call failed");
         return None;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         log("init: phase 3: CREATE_FROM_VFS failed");
         return None;
     }
 
-    // SAFETY: ipc is the registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 1
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
     {
         log("init: phase 3: svcmgr reply missing caps");
         return None;
@@ -521,11 +668,12 @@ pub fn setup_and_start_svcmgr(
     process_handle: u32,
     child_token: u64,
     handover: &SvcmgrHandoverCaps,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
 )
 {
     if !start_process(
         process_handle,
+        ipc_buf,
         "init: phase 3: svcmgr started; serving bootstrap",
         "init: phase 3: svcmgr START_PROCESS failed",
     )
@@ -549,7 +697,7 @@ pub fn setup_and_start_svcmgr(
     let _ = serve(
         bootstrap_ep,
         child_token,
-        ipc,
+        ipc_buf,
         true,
         &[service_copy, boot_copy],
         &[],
@@ -563,7 +711,7 @@ pub fn create_crasher_suspended(
     info: &InitInfo,
     procmgr_ep: u32,
     bootstrap_ep: u32,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
 ) -> Option<(u32, u32, u32, u64)>
 {
     if info.module_frame_count < 6
@@ -577,27 +725,26 @@ pub fn create_crasher_suspended(
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
-    ipc.write_word(0, pack_name(b"crasher"));
-    let Ok((reply_label, _)) = syscall::ipc_call(
-        procmgr_ep,
-        procmgr_labels::CREATE_PROCESS,
-        1,
-        &[frame_for_procmgr, tokened_creator],
-    )
+    let msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+        .word(0, pack_name(b"crasher"))
+        .cap(frame_for_procmgr)
+        .cap(tokened_creator)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
         log("init: phase 3: crasher CREATE_PROCESS failed");
         return None;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         log("init: phase 3: crasher CREATE_PROCESS error");
         return None;
     }
 
-    // SAFETY: ipc is the registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 2
+    let reply_caps = reply.caps();
+    if reply_caps.len() < 2
     {
         log("init: phase 3: crasher reply missing caps");
         return None;
@@ -614,7 +761,12 @@ pub fn create_crasher_suspended(
 /// empty terminal bootstrap round. usertest exits cleanly on completion and
 /// is not registered with svcmgr. log + procmgr caps arrive via
 /// `ProcessInfo`, so the round carries no caps.
-pub fn create_and_run_usertest(info: &InitInfo, procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
+pub fn create_and_run_usertest(
+    info: &InitInfo,
+    procmgr_ep: u32,
+    bootstrap_ep: u32,
+    ipc_buf: *mut u64,
+)
 {
     if info.module_frame_count < 7
     {
@@ -648,35 +800,34 @@ pub fn create_and_run_usertest(info: &InitInfo, procmgr_ep: u32, bootstrap_ep: u
 
     // Layout: word 0 = stdio_token, words 1..1+argv_words = argv blob,
     // next word = env_bytes header, next env_words = env blob.
-    ipc.write_word(0, pack_name(b"usertest"));
-    let _ = ipc::write_blob_to_ipc(ipc, 1, argv);
-    ipc.write_word(1 + argv_words, env_bytes as u64);
-    let _ = ipc::write_blob_to_ipc(ipc, 1 + argv_words + 1, env_blob);
-
     let label = procmgr_labels::CREATE_PROCESS
         | ((argv_bytes as u64) << 32)
         | ((u64::from(argv_count)) << 48)
         | ((u64::from(env_count)) << 56);
     let data_count = 1 + argv_words + 1 + env_words;
+    let msg = IpcMessage::builder(label)
+        .word(0, pack_name(b"usertest"))
+        .bytes(1, argv)
+        .word(1 + argv_words, env_bytes as u64)
+        .bytes(1 + argv_words + 1, env_blob)
+        .word_count(data_count)
+        .cap(frame_for_procmgr)
+        .cap(tokened_creator)
+        .build();
 
-    let Ok((reply_label, _)) = syscall::ipc_call(
-        procmgr_ep,
-        label,
-        data_count,
-        &[frame_for_procmgr, tokened_creator],
-    )
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
         return;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         return;
     }
 
-    // SAFETY: ipc wraps the registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 1
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
     {
         return;
     }
@@ -684,6 +835,7 @@ pub fn create_and_run_usertest(info: &InitInfo, procmgr_ep: u32, bootstrap_ep: u
 
     if !start_process(
         process_handle,
+        ipc_buf,
         "init: phase 3: usertest started",
         "init: phase 3: usertest START_PROCESS failed",
     )
@@ -694,7 +846,7 @@ pub fn create_and_run_usertest(info: &InitInfo, procmgr_ep: u32, bootstrap_ep: u
     let _ = serve(
         bootstrap_ep,
         child_token,
-        ipc,
+        ipc_buf,
         true,
         &[],
         &[],
@@ -713,11 +865,12 @@ pub fn start_and_bootstrap_crasher(
     child_token: u64,
     bootstrap_ep: u32,
     svcmgr_service_ep: u32,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
 ) -> bool
 {
     if !start_process(
         process_handle,
+        ipc_buf,
         "init: phase 3: crasher started",
         "init: phase 3: crasher START_PROCESS failed",
     )
@@ -737,7 +890,7 @@ pub fn start_and_bootstrap_crasher(
     serve(
         bootstrap_ep,
         child_token,
-        ipc,
+        ipc_buf,
         true,
         &[svcmgr_copy],
         &[],
@@ -761,25 +914,9 @@ pub struct ServiceRegistration<'a>
 }
 
 /// Register a service with svcmgr via `REGISTER_SERVICE`.
-pub fn register_service(svcmgr_ep: u32, ipc: IpcBuf, reg: &ServiceRegistration)
+pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistration)
 {
-    ipc.write_word(0, u64::from(reg.restart_policy));
-    ipc.write_word(1, u64::from(reg.criticality));
-
     let name_words = reg.name.len().div_ceil(8);
-    for w in 0..name_words
-    {
-        let mut word: u64 = 0;
-        for b in 0..8
-        {
-            let idx = w * 8 + b;
-            if idx < reg.name.len()
-            {
-                word |= u64::from(reg.name[idx]) << (b * 8);
-            }
-        }
-        ipc.write_word(2 + w, word);
-    }
 
     // Bundle-name tail: [bundle_name_len, bundle_name_words...] packed after
     // the service name. Zero if no bundle cap is being sent.
@@ -796,46 +933,43 @@ pub fn register_service(svcmgr_ep: u32, ipc: IpcBuf, reg: &ServiceRegistration)
     {
         0
     };
-    ipc.write_word(bundle_name_len_word, bundle_name_len as u64);
     let bundle_name_words = bundle_name_len.div_ceil(8);
-    for w in 0..bundle_name_words
-    {
-        let mut word: u64 = 0;
-        for b in 0..8
-        {
-            let idx = w * 8 + b;
-            if idx < bundle_name_len
-            {
-                word |= u64::from(reg.bundle_name[idx]) << (b * 8);
-            }
-        }
-        ipc.write_word(bundle_name_len_word + 1 + w, word);
-    }
 
     let data_count = bundle_name_len_word + 1 + bundle_name_words;
     let label = svcmgr_labels::REGISTER_SERVICE | ((reg.name.len() as u64) << 16);
 
-    let mut caps = [0u32; 4];
-    let mut cap_count = 0;
+    let mut builder = IpcMessage::builder(label)
+        .word(0, u64::from(reg.restart_policy))
+        .word(1, u64::from(reg.criticality))
+        .bytes(2, reg.name)
+        .word(bundle_name_len_word, bundle_name_len as u64);
+    if bundle_name_len > 0
+    {
+        builder = builder.bytes(
+            bundle_name_len_word + 1,
+            &reg.bundle_name[..bundle_name_len],
+        );
+    }
+    builder = builder.word_count(data_count);
+
     if reg.thread_cap != 0
     {
-        caps[cap_count] = reg.thread_cap;
-        cap_count += 1;
+        builder = builder.cap(reg.thread_cap);
     }
     if reg.module_cap != 0
     {
-        caps[cap_count] = reg.module_cap;
-        cap_count += 1;
+        builder = builder.cap(reg.module_cap);
     }
     if include_bundle && let Ok(derived) = syscall::cap_derive(reg.bundle_cap, syscall::RIGHTS_SEND)
     {
-        caps[cap_count] = derived;
-        cap_count += 1;
+        builder = builder.cap(derived);
     }
 
-    match syscall::ipc_call(svcmgr_ep, label, data_count, &caps[..cap_count])
+    let msg = builder.build();
+    // SAFETY: ipc_buf is the caller's registered IPC buffer.
+    match unsafe { ipc::ipc_call(svcmgr_ep, &msg, ipc_buf) }
     {
-        Ok((0, _)) =>
+        Ok(reply) if reply.label == 0 =>
         {}
         _ => log("init: phase 3: REGISTER_SERVICE failed"),
     }
@@ -844,13 +978,9 @@ pub fn register_service(svcmgr_ep: u32, ipc: IpcBuf, reg: &ServiceRegistration)
 /// Create `/bin/hello` via `CREATE_FROM_VFS`, start it, serve an empty
 /// bootstrap round. Tier-2 sanity demo — no caps beyond what `ProcessInfo`
 /// auto-delivers.
-pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
+pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u64)
 {
-    let path = b"/bin/hello";
-
-    ipc.write_word(0, pack_name(b"hello"));
-    let path_words = write_path_at_offset(ipc, 1, path);
-    let word_count = 1 + path_words;
+    let path: &[u8] = b"/bin/hello";
 
     let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
     else
@@ -859,21 +989,29 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
     };
 
     let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
-    let Ok((reply_label, _)) = syscall::ipc_call(procmgr_ep, label, word_count, &[tokened_creator])
+    let word_count = 1 + path_word_count(path);
+    let msg = IpcMessage::builder(label)
+        .word(0, pack_name(b"hello"))
+        .bytes(1, path)
+        .word_count(word_count)
+        .cap(tokened_creator)
+        .build();
+
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
         log("init: phase 3: hello CREATE_FROM_VFS failed");
         return;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         log("init: phase 3: hello CREATE_FROM_VFS error");
         return;
     }
 
-    // SAFETY: ipc wraps the registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 1
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
     {
         return;
     }
@@ -886,6 +1024,7 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
 
     let _ = start_process(
         process_handle,
+        ipc_buf,
         "init: phase 3: hello started",
         "init: phase 3: hello START_PROCESS failed",
     );
@@ -895,9 +1034,9 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
 /// holds the SEND side of, then push a probe payload through stdin so the
 /// child's `read_line` returns. Exercises the full spawner-writes →
 /// child-reads → child-writes-stdout cycle end-to-end.
-pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
+pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u64)
 {
-    let path = b"/bin/stdiotest";
+    let path: &[u8] = b"/bin/stdiotest";
 
     let Ok(stdin_ep) = syscall::cap_create_endpoint()
     else
@@ -921,10 +1060,6 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
         return;
     };
 
-    ipc.write_word(0, pack_name(b"stdiotst"));
-    let path_words = write_path_at_offset(ipc, 1, path);
-    let word_count = 1 + path_words;
-
     let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
     else
     {
@@ -932,26 +1067,30 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
     };
 
     let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
-    let Ok((reply_label, _)) = syscall::ipc_call(
-        procmgr_ep,
-        label,
-        word_count,
-        &[tokened_creator, stdin_recv],
-    )
+    let word_count = 1 + path_word_count(path);
+    let msg = IpcMessage::builder(label)
+        .word(0, pack_name(b"stdiotst"))
+        .bytes(1, path)
+        .word_count(word_count)
+        .cap(tokened_creator)
+        .cap(stdin_recv)
+        .build();
+
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
         log("init: phase 3: stdiotest CREATE_FROM_VFS failed");
         return;
     };
-    if reply_label != 0
+    if reply.label != 0
     {
         log("init: phase 3: stdiotest CREATE_FROM_VFS error");
         return;
     }
 
-    // SAFETY: ipc wraps the registered IPC buffer.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-    if cap_count < 1
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
     {
         return;
     }
@@ -962,6 +1101,7 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
 
     if !start_process(
         process_handle,
+        ipc_buf,
         "init: phase 3: stdiotest started",
         "init: phase 3: stdiotest START_PROCESS failed",
     )
@@ -973,7 +1113,7 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
     // `stdin().read_line(..)`. After `ipc_call` returns, the child has the
     // bytes and will print its result on stdout.
     let payload = b"hello seraph\n";
-    write_stream_bytes(stdin_send, ipc, payload);
+    write_stream_bytes(stdin_send, ipc_buf, payload);
 
     // Cap hygiene: the stdin SEND cap has done its single job.
     let _ = syscall::cap_delete(stdin_send);
@@ -983,7 +1123,7 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc: IpcBuf)
 /// ruststd's stdio path speaks. Used by init to push stdiotest's stdin
 /// payload. Mirrors `init::logging::ipc_log` but exposed here so callers
 /// outside the log path can write to byte-stream caps.
-fn write_stream_bytes(cap: u32, ipc: IpcBuf, bytes: &[u8])
+fn write_stream_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 {
     if bytes.is_empty()
     {
@@ -994,25 +1134,11 @@ fn write_stream_bytes(cap: u32, ipc: IpcBuf, bytes: &[u8])
     {
         let chunk_len = (bytes.len() - offset).min(syscall_abi::MSG_DATA_WORDS_MAX * 8);
         let label = ipc::stream_labels::STREAM_BYTES | ((chunk_len as u64 & 0xFFFF) << 16);
-        let word_count = chunk_len.div_ceil(8);
-        for i in 0..syscall_abi::MSG_DATA_WORDS_MAX
-        {
-            let mut word: u64 = 0;
-            if i < word_count
-            {
-                let base = offset + i * 8;
-                for j in 0..8
-                {
-                    let idx = base + j;
-                    if idx < offset + chunk_len
-                    {
-                        word |= u64::from(bytes[idx]) << (j * 8);
-                    }
-                }
-            }
-            ipc.write_word(i, word);
-        }
-        let _ = syscall::ipc_call(cap, label, word_count, &[]);
+        let msg = IpcMessage::builder(label)
+            .bytes(0, &bytes[offset..offset + chunk_len])
+            .build();
+        // SAFETY: ipc_buf is caller's registered IPC buffer.
+        let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
         offset += chunk_len;
     }
 }
@@ -1032,12 +1158,12 @@ pub fn phase3_svcmgr_handover(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     vfsd_service_ep: u32,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
 ) -> !
 {
     let _ = info;
 
-    send_vfsd_endpoint_to_procmgr(procmgr_ep, vfsd_service_ep);
+    send_vfsd_endpoint_to_procmgr(procmgr_ep, vfsd_service_ep, ipc_buf);
 
     let Ok(svcmgr_service_ep) = syscall::cap_create_endpoint()
     else
@@ -1053,7 +1179,8 @@ pub fn phase3_svcmgr_handover(
     };
 
     log("init: phase 3: loading svcmgr from /bin/svcmgr");
-    let Some((svcmgr_handle, svcmgr_token)) = create_svcmgr_from_vfs(procmgr_ep, bootstrap_ep, ipc)
+    let Some((svcmgr_handle, svcmgr_token)) =
+        create_svcmgr_from_vfs(procmgr_ep, bootstrap_ep, ipc_buf)
     else
     {
         log("init: phase 3: failed to create svcmgr, idling");
@@ -1064,9 +1191,15 @@ pub fn phase3_svcmgr_handover(
         svcmgr_service_ep,
         svcmgr_bootstrap_ep,
     };
-    setup_and_start_svcmgr(bootstrap_ep, svcmgr_handle, svcmgr_token, &handover, ipc);
+    setup_and_start_svcmgr(
+        bootstrap_ep,
+        svcmgr_handle,
+        svcmgr_token,
+        &handover,
+        ipc_buf,
+    );
 
-    let crasher = create_crasher_suspended(info, procmgr_ep, bootstrap_ep, ipc);
+    let crasher = create_crasher_suspended(info, procmgr_ep, bootstrap_ep, ipc_buf);
 
     log("init: phase 3: registering services with svcmgr");
 
@@ -1074,7 +1207,7 @@ pub fn phase3_svcmgr_handover(
     {
         register_service(
             svcmgr_service_ep,
-            ipc,
+            ipc_buf,
             &ServiceRegistration {
                 name: b"crasher",
                 restart_policy: 0, // POLICY_ALWAYS
@@ -1091,21 +1224,23 @@ pub fn phase3_svcmgr_handover(
             crasher_token,
             bootstrap_ep,
             svcmgr_service_ep,
-            ipc,
+            ipc_buf,
         );
     }
 
     // Spawn usertest (run-once test driver; no svcmgr registration).
-    create_and_run_usertest(info, procmgr_ep, bootstrap_ep, ipc);
+    create_and_run_usertest(info, procmgr_ep, bootstrap_ep, ipc_buf);
 
     // Cap-oblivious tier-2 demos: hello (write-only) and stdiotest (full
     // stdin→process→stdout cycle, fed by init).
-    create_and_run_hello(procmgr_ep, bootstrap_ep, ipc);
-    create_and_run_stdiotest(procmgr_ep, bootstrap_ep, ipc);
+    create_and_run_hello(procmgr_ep, bootstrap_ep, ipc_buf);
+    create_and_run_stdiotest(procmgr_ep, bootstrap_ep, ipc_buf);
 
-    match syscall::ipc_call(svcmgr_service_ep, svcmgr_labels::HANDOVER_COMPLETE, 0, &[])
+    let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
+    // SAFETY: ipc_buf is caller's registered IPC buffer.
+    match unsafe { ipc::ipc_call(svcmgr_service_ep, &handover_msg, ipc_buf) }
     {
-        Ok((0, _)) => log("init: phase 3: handover complete"),
+        Ok(reply) if reply.label == 0 => log("init: phase 3: handover complete"),
         _ => log("init: phase 3: handover failed"),
     }
 

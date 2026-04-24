@@ -367,7 +367,7 @@ layout via a well-known structure at the top of init's stack.
 | 3 | Init's own CSpace capability |
 | 4 | SchedControl capability (Elevate rights) |
 | 5..N | Frame capabilities (one per usable physical region) |
-| N+1..M | MMIO region capabilities (one per MmioRange / PciEcam / IommuUnit entry) |
+| N+1..M | MMIO region capabilities (one per MmioRange / PciEcam entry) |
 | M+1..K | Interrupt capabilities (one per IrqLine entry) |
 | K+1..L | Read-only Frame capabilities (one per PlatformTable entry) |
 | L+1..P | IoPortRange capabilities (one per IoPortRange entry; x86-64 only) |

@@ -178,7 +178,9 @@ reversible — a failure at any phase is a fatal boot error.
 
 The kernel entry point is `kernel_entry()` in `src/main.rs`. Its calling convention
 and the CPU state guaranteed at entry are specified in
-[docs/boot-protocol.md](../docs/boot-protocol.md).
+[`boot/docs/kernel-handoff.md`](../boot/docs/kernel-handoff.md); the
+`BootInfo` layout is owned by the
+[`abi/boot-protocol/`](../abi/boot-protocol/) crate.
 
 The entry point is `#[no_mangle] pub extern "C"` and marked `-> !`. It receives a
 single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
@@ -194,7 +196,8 @@ single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
 | [docs/memory-model.md](../docs/memory-model.md) | Virtual address space layout, paging |
 | [docs/ipc-design.md](../docs/ipc-design.md) | IPC semantics and message format |
 | [docs/capability-model.md](../docs/capability-model.md) | Capability types, rights, revocation |
-| [docs/boot-protocol.md](../docs/boot-protocol.md) | Entry point contract, BootInfo structure |
+| [abi/boot-protocol/](../abi/boot-protocol/) | `BootInfo` structure, `BOOT_PROTOCOL_VERSION` |
+| [boot/docs/kernel-handoff.md](../boot/docs/kernel-handoff.md) | CPU state and register contents at kernel entry |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

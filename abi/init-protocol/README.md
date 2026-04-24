@@ -17,7 +17,7 @@ increment `INIT_PROTOCOL_VERSION`.
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, init role |
-| [docs/boot-protocol.md](../../docs/boot-protocol.md) | Bootloader-to-kernel contract; InitImage, boot modules |
+| [abi/boot-protocol/](../boot-protocol/) | Bootloader-to-kernel contract; InitImage, boot modules |
 | [docs/capability-model.md](../../docs/capability-model.md) | Initial capability distribution |
 
 ---

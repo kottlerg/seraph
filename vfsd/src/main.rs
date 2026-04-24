@@ -27,7 +27,7 @@ mod mount;
 mod worker;
 
 use gpt::MAX_GPT_PARTS;
-use ipc::{IpcBuf, blk_labels};
+use ipc::{IpcMessage, blk_labels};
 use mount::{MAX_MOUNTS, MountEntry};
 use std::os::seraph::startup_info;
 use worker::Channel;
@@ -67,18 +67,20 @@ pub struct VfsdCaps
 // log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through
 // this protocol.
 
-fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc: IpcBuf) -> Option<VfsdCaps>
+fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Option<VfsdCaps>
 {
     if info.creator_endpoint == 0
     {
         return None;
     }
-    let round1 = ipc::bootstrap::request_round(info.creator_endpoint, ipc).ok()?;
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let round1 = unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) }.ok()?;
     if round1.cap_count < 2 || round1.done
     {
         return None;
     }
-    let round2 = ipc::bootstrap::request_round(info.creator_endpoint, ipc).ok()?;
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let round2 = unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) }.ok()?;
     if round2.cap_count < 1 || !round2.done
     {
         return None;
@@ -120,12 +122,13 @@ fn main() -> !
 {
     let info = startup_info();
 
-    // SAFETY: IPC buffer is registered by `std::os::seraph::_start` and
-    // page-aligned by the boot protocol.
-    let ipc = unsafe { IpcBuf::from_bytes(info.ipc_buffer) };
-    let ipc_buf = ipc.as_ptr();
+    // IPC buffer is registered by `std::os::seraph::_start` and page-aligned
+    // by the boot protocol; `info.ipc_buffer` carries the same VA as a
+    // `*mut u8` we reinterpret as `*mut u64` (4 KiB page alignment ≫ u64).
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(mut caps) = bootstrap_caps(info, ipc)
+    let Some(mut caps) = bootstrap_caps(info, ipc_buf)
     else
     {
         syscall::thread_exit();
@@ -150,27 +153,22 @@ fn main() -> !
 
     // Query devmgr for the block device endpoint.
     println!("vfsd: querying devmgr for block device");
-    let Ok((reply_label, _)) = syscall::ipc_call(
-        caps.registry_ep,
-        ipc::devmgr_labels::QUERY_BLOCK_DEVICE,
-        0,
-        &[],
-    )
+    let query_msg = IpcMessage::new(ipc::devmgr_labels::QUERY_BLOCK_DEVICE);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(query_reply) = (unsafe { ipc::ipc_call(caps.registry_ep, &query_msg, ipc_buf) })
     else
     {
         println!("vfsd: QUERY_BLOCK_DEVICE ipc_call failed");
         idle_loop();
     };
-    if reply_label != 0
+    if query_reply.label != 0
     {
         println!("vfsd: no block device available");
         idle_loop();
     }
 
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    #[allow(clippy::cast_ptr_alignment)]
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
-    if cap_count == 0
+    let reply_caps = query_reply.caps();
+    if reply_caps.is_empty()
     {
         println!("vfsd: QUERY_BLOCK_DEVICE returned no caps");
         idle_loop();
@@ -227,25 +225,29 @@ fn service_loop(ipc_buf: *mut u64, rt: &VfsdRuntime) -> !
 
     loop
     {
-        let Ok((label, _token)) = syscall::ipc_recv(rt.caps.service_ep)
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let Ok(recv) = (unsafe { ipc::ipc_recv(rt.caps.service_ep, ipc_buf) })
         else
         {
             println!("vfsd: ipc_recv failed, retrying");
             continue;
         };
 
+        let label = recv.label;
         let opcode = label & 0xFFFF;
 
         match opcode
         {
-            ipc::vfsd_labels::OPEN => handle_open(label, ipc_buf, &mounts),
+            ipc::vfsd_labels::OPEN => handle_open(&recv, ipc_buf, &mounts),
             ipc::vfsd_labels::MOUNT =>
             {
-                handle_mount_request(ipc_buf, rt, &mut mounts);
+                handle_mount_request(&recv, ipc_buf, rt, &mut mounts);
             }
             _ =>
             {
-                let _ = syscall::ipc_reply(ipc::vfsd_errors::UNKNOWN_OPCODE, 0, &[]);
+                let err = IpcMessage::new(ipc::vfsd_errors::UNKNOWN_OPCODE);
+                // SAFETY: ipc_buf is the registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
             }
         }
     }
@@ -262,38 +264,39 @@ fn service_loop(ipc_buf: *mut u64, rt: &VfsdRuntime) -> !
 ///
 /// Looks up the UUID in the GPT table, spawns a fatfs driver with the
 /// partition's LBA offset, and registers a mount entry at the given path.
-fn handle_mount_request(ipc_buf: *mut u64, rt: &VfsdRuntime, mounts: &mut [MountEntry; MAX_MOUNTS])
+fn handle_mount_request(
+    recv: &IpcMessage,
+    ipc_buf: *mut u64,
+    rt: &VfsdRuntime,
+    mounts: &mut [MountEntry; MAX_MOUNTS],
+)
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page for vfsd.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    let w0 = ipc.read_word(0);
-    let w1 = ipc.read_word(1);
+    let w0 = recv.word(0);
+    let w1 = recv.word(1);
     let mut uuid = [0u8; 16];
     uuid[..8].copy_from_slice(&w0.to_le_bytes());
     uuid[8..].copy_from_slice(&w1.to_le_bytes());
 
-    let path_len = ipc.read_word(2) as usize;
+    let path_len = recv.word(2) as usize;
     if path_len == 0 || path_len > 64
     {
         println!("vfsd: MOUNT: invalid path length");
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::NOT_FOUND, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     }
 
     let mut path_buf = [0u8; 64];
-    let word_count = path_len.div_ceil(8).min(8);
-    for i in 0..word_count
+    let path_bytes = recv.data_bytes();
+    // Path bytes start at word 3 (byte offset 24).
+    let path_src_start = 3 * 8;
+    let path_src_end = (path_src_start + path_len).min(path_bytes.len());
+    let copy_len = path_src_end.saturating_sub(path_src_start).min(path_len);
+    if copy_len > 0
     {
-        let word = ipc.read_word(3 + i);
-        let base = i * 8;
-        let bytes = word.to_le_bytes();
-        for j in 0..8
-        {
-            if base + j < path_len
-            {
-                path_buf[base + j] = bytes[j];
-            }
-        }
+        path_buf[..copy_len]
+            .copy_from_slice(&path_bytes[path_src_start..path_src_start + copy_len]);
     }
 
     // Look up UUID in GPT partition table.
@@ -301,7 +304,9 @@ fn handle_mount_request(ipc_buf: *mut u64, rt: &VfsdRuntime, mounts: &mut [Mount
     else
     {
         println!("vfsd: MOUNT: partition UUID not found");
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::NO_MOUNT, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     };
     println!("vfsd: MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}");
@@ -310,7 +315,9 @@ fn handle_mount_request(ipc_buf: *mut u64, rt: &VfsdRuntime, mounts: &mut [Mount
     if rt.caps.fatfs_module_cap == 0
     {
         println!("vfsd: MOUNT: no fatfs module cap");
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::NO_FS_MODULE, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::NO_FS_MODULE);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     }
 
@@ -322,29 +329,35 @@ fn handle_mount_request(ipc_buf: *mut u64, rt: &VfsdRuntime, mounts: &mut [Mount
     else
     {
         println!("vfsd: MOUNT: partition cap registration failed");
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::SPAWN_FAILED, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::SPAWN_FAILED);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     };
 
-    // SAFETY: ipc_buf wraps the registered IPC page.
-    let ipc_wrap = unsafe { IpcBuf::from_raw(ipc_buf) };
-    let Some(driver_ep) = driver::spawn_fatfs_driver(rt.caps, rt.channel, partition_ep, ipc_wrap)
+    let Some(driver_ep) = driver::spawn_fatfs_driver(rt.caps, rt.channel, partition_ep, ipc_buf)
     else
     {
         println!("vfsd: MOUNT: failed to spawn fatfs");
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::SPAWN_FAILED, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::SPAWN_FAILED);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     };
 
     // Register mount entry.
     if mount::register_mount(mounts, &path_buf, path_len, driver_ep)
     {
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::SUCCESS, 0, &[]);
+        let ok = IpcMessage::new(ipc::vfsd_errors::SUCCESS);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&ok, ipc_buf) };
         println!("vfsd: MOUNT: registered");
     }
     else
     {
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::TABLE_FULL, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::TABLE_FULL);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         println!("vfsd: MOUNT: mount table full");
     }
 }
@@ -356,25 +369,30 @@ fn handle_mount_request(ipc_buf: *mut u64, rt: &VfsdRuntime, mounts: &mut [Mount
 ///
 /// After this call, the client holds a direct tokened capability to the fs
 /// driver for file operations (read/close/stat/readdir).
-fn handle_open(label: u64, ipc_buf: *mut u64, mounts: &[MountEntry; MAX_MOUNTS])
+fn handle_open(recv: &IpcMessage, ipc_buf: *mut u64, mounts: &[MountEntry; MAX_MOUNTS])
 {
+    let label = recv.label;
     let path_len = ((label >> 16) & 0xFFFF) as usize;
     if path_len == 0 || path_len > ipc::MAX_PATH_LEN
     {
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::NOT_FOUND, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     }
 
     let mut path_buf = [0u8; ipc::MAX_PATH_LEN];
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc_ref = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    let _ = ipc::read_path_from_ipc(ipc_ref, path_len, &mut path_buf);
+    let recv_bytes = recv.data_bytes();
+    let copy_len = path_len.min(recv_bytes.len()).min(ipc::MAX_PATH_LEN);
+    path_buf[..copy_len].copy_from_slice(&recv_bytes[..copy_len]);
     let path = &path_buf[..path_len];
 
     let Some((mount_idx, driver_path)) = mount::resolve_mount(path, mounts)
     else
     {
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::NO_MOUNT, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     };
 
@@ -382,37 +400,45 @@ fn handle_open(label: u64, ipc_buf: *mut u64, mounts: &[MountEntry; MAX_MOUNTS])
 
     // Forward FS_OPEN to driver with the driver-relative path.
     let fwd_path_len = driver_path.len();
-    let _ = ipc::write_path_to_ipc(ipc_ref, driver_path);
-
     let fwd_label = ipc::fs_labels::FS_OPEN | ((fwd_path_len as u64) << 16);
-    let data_words = fwd_path_len.div_ceil(8).min(6);
-    let Ok((drv_reply, _)) = syscall::ipc_call(driver_ep, fwd_label, data_words, &[])
+    let fwd_msg = IpcMessage::builder(fwd_label).bytes(0, driver_path).build();
+
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(drv_reply) = (unsafe { ipc::ipc_call(driver_ep, &fwd_msg, ipc_buf) })
     else
     {
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::IO_ERROR, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::IO_ERROR);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     };
 
-    if drv_reply != 0
+    if drv_reply.label != 0
     {
         // Driver returned an error — relay it to client.
-        let _ = syscall::ipc_reply(drv_reply, 0, &[]);
+        let err = IpcMessage::new(drv_reply.label);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     }
 
     // Read the per-file capability from the driver's reply.
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    #[allow(clippy::cast_ptr_alignment)]
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
-    if cap_count == 0
+    let drv_caps = drv_reply.caps();
+    if drv_caps.is_empty()
     {
         println!("vfsd: OPEN: driver returned no file cap");
-        let _ = syscall::ipc_reply(ipc::vfsd_errors::IO_ERROR, 0, &[]);
+        let err = IpcMessage::new(ipc::vfsd_errors::IO_ERROR);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     }
 
     // Relay the file cap to the client.
-    let _ = syscall::ipc_reply(ipc::vfsd_errors::SUCCESS, 0, &[reply_caps[0]]);
+    let ok = IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
+        .cap(drv_caps[0])
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let _ = unsafe { ipc::ipc_reply(&ok, ipc_buf) };
 }
 
 fn idle_loop() -> !
@@ -437,20 +463,21 @@ fn derive_and_register_partition(
     let partition_ep = syscall::cap_derive_token(rt.blk_ep, syscall::RIGHTS_SEND, token).ok()?;
 
     // REGISTER_PARTITION on the un-tokened (whole-disk) endpoint.
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    ipc.write_word(0, token);
-    ipc.write_word(1, base_lba);
-    ipc.write_word(2, length_lba);
-    let Ok((reply, _)) = syscall::ipc_call(rt.blk_ep, blk_labels::REGISTER_PARTITION, 3, &[])
+    let msg = IpcMessage::builder(blk_labels::REGISTER_PARTITION)
+        .word(0, token)
+        .word(1, base_lba)
+        .word(2, length_lba)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(rt.blk_ep, &msg, ipc_buf) })
     else
     {
         println!("vfsd: REGISTER_PARTITION ipc_call failed");
         return None;
     };
-    if reply != ipc::blk_errors::SUCCESS
+    if reply.label != ipc::blk_errors::SUCCESS
     {
-        println!("vfsd: REGISTER_PARTITION rejected (code={reply})");
+        println!("vfsd: REGISTER_PARTITION rejected (code={})", reply.label);
         return None;
     }
     Some(partition_ep)

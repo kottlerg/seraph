@@ -286,8 +286,6 @@ fn run(info_ptr: u64) -> !
     // SAFETY: INIT_IPC_BUF_VA is registered and page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = INIT_IPC_BUF_VA as *mut u64;
-    // SAFETY: same invariants as above.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
 
     // Serve procmgr's bootstrap round.
     //
@@ -308,14 +306,17 @@ fn run(info_ptr: u64) -> !
         u64::from(pm.memory_frame_base),
         u64::from(pm.memory_frame_count),
     ];
-    if ipc::bootstrap::serve_round(
-        init_bootstrap_ep,
-        pm.bootstrap_token,
-        ipc,
-        true,
-        &[pm_service_cap_for_pm, pm.log_endpoint_slot],
-        &procmgr_boot_data,
-    )
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe {
+        ipc::bootstrap::serve_round(
+            init_bootstrap_ep,
+            pm.bootstrap_token,
+            ipc_buf,
+            true,
+            &[pm_service_cap_for_pm, pm.log_endpoint_slot],
+            &procmgr_boot_data,
+        )
+    }
     .is_err()
     {
         logging::log("init: FATAL: procmgr bootstrap serve failed");
@@ -349,7 +350,7 @@ fn run(info_ptr: u64) -> !
             endpoint_cap,
             init_bootstrap_ep,
             devmgr_registry_ep,
-            ipc,
+            ipc_buf,
         );
     }
     else
@@ -368,7 +369,7 @@ fn run(info_ptr: u64) -> !
                 registry_ep: devmgr_registry_ep,
                 vfsd_service_ep,
             },
-            ipc,
+            ipc_buf,
         );
     }
     else
@@ -462,7 +463,13 @@ fn run(info_ptr: u64) -> !
 
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
 
-    service::phase3_svcmgr_handover(info, endpoint_cap, init_bootstrap_ep, vfsd_service_ep, ipc);
+    service::phase3_svcmgr_handover(
+        info,
+        endpoint_cap,
+        init_bootstrap_ep,
+        vfsd_service_ep,
+        ipc_buf,
+    );
 }
 
 /// Idle loop fallback when Phase 3 cannot proceed.

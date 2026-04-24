@@ -31,8 +31,11 @@ pub const EFI_NOT_FOUND: EfiStatus = 0x8000_0000_0000_000E;
 
 /// Allocate pages at any available physical address.
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
-/// Allocate pages at or below a specified maximum physical address (x86-64 only).
-#[cfg(target_arch = "x86_64")]
+/// Allocate pages at or below a specified maximum physical address.
+///
+/// Used by the x86-64 arch module to reserve a < 1 MiB page for the AP
+/// SIPI trampoline. Public because the x86-64 helper in
+/// `arch::current::allocate_ap_trampoline` lives in a different module.
 pub const ALLOCATE_MAX_ADDRESS: u32 = 1;
 /// Allocate pages at a specified physical address.
 pub const ALLOCATE_ADDRESS: u32 = 2;
@@ -185,9 +188,7 @@ pub const EFI_RUNTIME_SERVICES_DATA: u32 = 6;
 pub const EFI_ACPI_RECLAIM_MEMORY: u32 = 9;
 #[allow(dead_code)]
 pub const EFI_ACPI_MEMORY_NVS: u32 = 10;
-#[allow(dead_code)]
 pub const EFI_MEMORY_MAPPED_IO: u32 = 11;
-#[allow(dead_code)]
 pub const EFI_MEMORY_MAPPED_IO_PORT_SPACE: u32 = 12;
 pub const EFI_PERSISTENT_MEMORY: u32 = 14;
 
@@ -679,11 +680,15 @@ pub unsafe fn allocate_address(
 /// pages with physical base ≤ `max_phys`. `max_phys` is an in-out parameter;
 /// on success it holds the actual allocated physical base.
 ///
-/// Only used on x86-64 (AP SIPI trampoline must be below 1 MiB).
+/// This is the arch-neutral UEFI wrapper. The only current caller is
+/// x86-64's `arch::current::allocate_ap_trampoline`, whose SIPI-vector
+/// constraint requires a frame below 1 MiB; the helper is not gated on
+/// architecture because `AllocateMaxAddress` is part of the UEFI spec on
+/// every supported platform.
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)] // Used only by x86-64 arch::current::allocate_ap_trampoline.
 pub unsafe fn allocate_pages_max_addr(
     bs: *mut EfiBootServices,
     max_phys: u64,

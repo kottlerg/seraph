@@ -6,38 +6,77 @@
 //! Boot protocol types shared between the bootloader and kernel.
 //!
 //! Defines the [`BootInfo`] structure and associated types that form the
-//! contract between the bootloader and the kernel entry point. See
-//! `docs/boot-protocol.md` for the full specification.
+//! contract between the bootloader and the kernel entry point. The crate
+//! source is the authoritative layout specification; this module-level
+//! comment is an index, not the contract.
 //!
 //! All types are `#[repr(C)]` with stable layout. The [`BOOT_PROTOCOL_VERSION`]
 //! constant must match between the bootloader and kernel; the kernel halts at
 //! entry if the versions differ.
+//!
+//! See [`README.md`](../README.md) for the compliant-bootloader policy and
+//! `boot/docs/kernel-handoff.md` for the CPU-state contract at kernel entry.
 
 #![no_std]
 
 /// Current boot protocol version. Increment when `BootInfo` layout or the
 /// CPU entry contract changes in a non-backwards-compatible way.
 ///
+/// The kernel enforces **strict equality** against this constant at entry:
+/// any mismatch — including a bootloader that is layout-compatible but
+/// announces a higher version — is rejected. The rationale is TCB
+/// minimization: the kernel refuses to interpret a `BootInfo` whose exact
+/// layout it was not compiled against. A protocol bump therefore requires
+/// the bootloader and kernel to be updated together in the same commit.
+///
 /// v4: Added `cpu_count`, `bsp_id`, `cpu_ids`, and `ap_trampoline_page` for
 ///     SMP bringup.
-pub const BOOT_PROTOCOL_VERSION: u32 = 4;
+/// v5: Raised `cpu_ids` to `[u32; 512]`; removed `IommuUnit` from
+///     `ResourceType` (IOMMU discovery is userspace-only, done by `devmgr`).
+/// v6: Replaced per-device `PlatformResource` array with two narrower
+///     descriptors: `kernel_mmio` (arch-specific struct carrying the small
+///     MMIO bases the kernel itself consumes) and `mmio_apertures` (coarse
+///     non-RAM physical ranges from which the kernel mints MMIO caps).
+pub const BOOT_PROTOCOL_VERSION: u32 = 6;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
 /// Classification of a physical memory region.
+///
+/// This enum intentionally collapses the ~15 UEFI `EFI_MEMORY_TYPE` values
+/// into a small, consumer-facing set. Distinctions within each variant below
+/// are not preserved; downstream code MUST NOT assume any sub-kind.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MemoryType
 {
     /// Available for use by the kernel.
+    ///
+    /// Subsumes `EfiConventionalMemory`, and — after `ExitBootServices` —
+    /// `EfiBootServicesCode` and `EfiBootServicesData`.
     Usable = 0,
     /// In use by the kernel image or boot modules.
+    ///
+    /// Subsumes `EfiLoaderCode` and `EfiLoaderData` for the regions the
+    /// bootloader deliberately staged for kernel consumption.
     Loaded = 1,
     /// Reserved by firmware or hardware; must not be used.
+    ///
+    /// Subsumes every UEFI variant that is not safely writable by the
+    /// kernel after exit: `EfiRuntimeServicesCode`, `EfiRuntimeServicesData`,
+    /// `EfiACPIMemoryNVS`, `EfiMemoryMappedIO`, `EfiMemoryMappedIOPortSpace`,
+    /// `EfiPalCode`, `EfiUnusableMemory`, and anything unknown to the
+    /// translator. The kernel cannot distinguish genuine device MMIO from
+    /// firmware-exclusive regions via this enum; MMIO intended for driver
+    /// use is delivered separately via [`MmioApertureSlice`].
     Reserved = 2,
     /// ACPI reclaimable after userspace firmware parsing (devmgr) is complete.
+    ///
+    /// Subsumes `EfiACPIReclaimMemory`.
     AcpiReclaimable = 3,
     /// Persistent memory (NVDIMM or similar).
+    ///
+    /// Subsumes `EfiPersistentMemory`.
     Persistent = 4,
 }
 
@@ -56,7 +95,11 @@ pub struct MemoryMapEntry
 
 /// A slice of [`MemoryMapEntry`] values, passed by physical address.
 ///
-/// Entries are sorted by `physical_base` in ascending order and do not overlap.
+/// Entries are sorted by `physical_base` in ascending order and do not
+/// overlap — the kernel may rely on both invariants without
+/// re-validating. The kernel must not write to `Reserved` regions;
+/// `Loaded` regions containing boot modules may be reclaimed once the
+/// kernel has consumed them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryMapSlice
@@ -114,6 +157,16 @@ unsafe impl Sync for ModuleSlice {}
 // ── Init pre-parsed segments ──────────────────────────────────────────────────
 
 /// Permission flags for a loaded ELF segment.
+///
+/// Read permission is implied for every loaded segment — there is no
+/// execute-only or write-only variant. A producer encountering an ELF
+/// segment whose ELF `p_flags` bits express `PF_X` without `PF_R` MUST
+/// map it as [`ReadExecute`](Self::ReadExecute) (read is necessary for
+/// instruction fetch to be observable alongside other accesses and for
+/// the kernel's page-table builder to encode a coherent PTE). Similarly,
+/// `PF_W` without `PF_R` is mapped as [`ReadWrite`](Self::ReadWrite).
+/// `W^X` (simultaneous `PF_W` and `PF_X`) MUST be rejected by the
+/// producer, not silently collapsed.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SegmentFlags
@@ -149,6 +202,13 @@ pub struct InitSegment
 ///
 /// Must match the bootloader's segment array capacity.
 pub const INIT_MAX_SEGMENTS: usize = 8;
+
+/// Maximum number of logical CPUs representable in [`BootInfo::cpu_ids`].
+///
+/// Sizes the fixed array at the ABI boundary. Producers MUST cap
+/// `cpu_count` at this value and diagnose truncation; consumers may assume
+/// `cpu_count <= MAX_CPUS` and `cpu_ids[cpu_count..]` is zero.
+pub const MAX_CPUS: usize = 512;
 
 /// Pre-parsed init ELF information provided by the bootloader.
 ///
@@ -216,92 +276,171 @@ impl FramebufferInfo
     }
 }
 
-// ── Platform resources ───────────────────────────────────────────────────────
+// ── Kernel MMIO (arch-specific) ──────────────────────────────────────────────
+//
+// `KernelMmio` carries the small set of MMIO bases the kernel itself reads
+// during its own operation (interrupts, timer). It is **not** a capability
+// surface — the kernel consumes it directly and does not mint caps from it.
+// The `mmio_apertures` slice below is the capability-minting surface.
+//
+// Shape is arch-specific: each arch's fields are the bases that arch's
+// kernel actually uses. Today these values are hardcoded in kernel code;
+// the field is forward-looking preparation for replacing those hardcodes
+// with bootloader-provided values.
 
-/// Discriminant identifying the kind of platform resource.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ResourceType
-{
-    /// A memory-mapped I/O region.
-    ///
-    /// `base`+`size`: physical address range.
-    /// `flags` bit 0: 0 = device (uncacheable), 1 = write-combine.
-    /// `id`: opaque platform identifier (e.g. ACPI UID); zero if unknown.
-    MmioRange = 0,
-
-    /// A hardware interrupt line.
-    ///
-    /// `base`: unused (zero). `size`: unused (zero).
-    /// `id`: interrupt number (GSI on x86-64, PLIC source on RISC-V).
-    /// `flags` bit 0: 0 = level, 1 = edge triggered.
-    /// `flags` bit 1: 0 = active-high, 1 = active-low.
-    IrqLine = 1,
-
-    /// A PCI Express ECAM window.
-    ///
-    /// `base`+`size`: physical ECAM MMIO range.
-    /// `flags`: encoded bus range — bits 7:0 = start bus, bits 15:8 = end bus.
-    /// `id`: segment group number (usually zero).
-    PciEcam = 2,
-
-    /// A firmware table region passed through to userspace as read-only.
-    ///
-    /// `base`+`size`: physical address range of the table.
-    /// `flags`: reserved, zero.
-    /// `id`: opaque identifier for the table type (platform-defined).
-    PlatformTable = 3,
-
-    /// An x86 I/O port range (x86-64 only).
-    ///
-    /// `base`: first port number. `size`: number of consecutive ports.
-    /// `flags`: reserved, zero. `id`: opaque platform identifier; zero if unknown.
-    IoPortRange = 4,
-
-    /// An IOMMU unit's register range and scope.
-    ///
-    /// `base`+`size`: physical MMIO range of the IOMMU's registers.
-    /// `flags`: reserved for future scope encoding; zero in protocol version 3.
-    /// `id`: opaque platform identifier (e.g. ACPI DMAR unit index).
-    IommuUnit = 5,
-}
-
-/// A structured descriptor for a platform hardware resource.
+/// One I/O APIC instance description (x86-64).
 ///
-/// The array of `PlatformResource` entries in [`BootInfo`] is sorted by
-/// `(resource_type, base)` in ascending order. Within a type, entries do not
-/// overlap where overlap is nonsensical.
+/// ACPI MADT type 1 (`IOAPIC`) supplies `id`, `phys_base`, and `gsi_base`
+/// for each I/O APIC. Real systems typically have one; the array in
+/// [`KernelMmio`] admits up to [`MAX_IOAPICS`].
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PlatformResource
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoApicEntry
 {
-    /// Discriminant identifying the kind of resource.
-    pub resource_type: ResourceType,
-    /// Type-specific flags (see [`ResourceType`] documentation).
-    pub flags: u32,
-    /// Physical base address of the resource (zero for [`ResourceType::IrqLine`]).
-    pub base: u64,
-    /// Size of the resource in bytes (zero for [`ResourceType::IrqLine`]).
-    pub size: u64,
-    /// Opaque, type-specific identifier. Do not compare across resource types.
-    pub id: u64,
+    /// APIC ID reported by the MADT record.
+    pub id: u32,
+    /// Physical base address of the I/O APIC register window.
+    pub phys_base: u64,
+    /// Global system interrupt number of the first pin on this IOAPIC.
+    pub gsi_base: u32,
 }
 
-/// A slice of [`PlatformResource`] values, passed by physical address.
+/// Maximum number of I/O APICs the bootloader records.
+///
+/// Oversize MADTs are truncated at this bound with a diagnostic; real
+/// systems with more than eight IOAPICs are out of the targeted envelope.
+#[cfg(target_arch = "x86_64")]
+pub const MAX_IOAPICS: usize = 8;
+
+/// Kernel-facing MMIO bases on x86-64.
+///
+/// Fields are what `kernel/src/arch/x86_64/` needs to reach the interrupt
+/// controllers today. The COM1 UART is I/O-port-mapped (not MMIO) and is
+/// not included.
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct PlatformResourceSlice
+pub struct KernelMmio
+{
+    /// Physical base of the local APIC register window. On Q35 / every
+    /// currently targeted host this is `0xFEE0_0000`, but MADT
+    /// `LocalApicAddress` or the later `LocalApicAddressOverride` entry
+    /// may relocate it.
+    pub lapic_base: u64,
+    /// Number of valid entries in [`Self::ioapics`].
+    pub ioapic_count: u32,
+    /// I/O APIC instances discovered in the MADT. `[ioapic_count..]` is zeroed.
+    pub ioapics: [IoApicEntry; MAX_IOAPICS],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl KernelMmio
+{
+    /// Zeroed `KernelMmio` for bootloaders that cannot populate it (e.g.
+    /// ACPI tables absent). The kernel falls back to its hardcoded
+    /// constants when the corresponding field is zero.
+    #[must_use]
+    pub const fn zero() -> Self
+    {
+        Self {
+            lapic_base: 0,
+            ioapic_count: 0,
+            ioapics: [IoApicEntry {
+                id: 0,
+                phys_base: 0,
+                gsi_base: 0,
+            }; MAX_IOAPICS],
+        }
+    }
+}
+
+/// Kernel-facing MMIO bases on RISC-V 64.
+///
+/// Fields are what `kernel/src/arch/riscv64/` needs today. CLINT is not
+/// included because the kernel uses SBI `sbi_set_timer` rather than CLINT
+/// MMIO.
+#[cfg(target_arch = "riscv64")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct KernelMmio
+{
+    /// Physical base of the PLIC register window.
+    pub plic_base: u64,
+    /// Size of the PLIC register window in bytes.
+    pub plic_size: u64,
+    /// Physical base of the kernel console UART (ns16550-compatible).
+    pub uart_base: u64,
+    /// Size of the UART register window in bytes.
+    pub uart_size: u64,
+}
+
+#[cfg(target_arch = "riscv64")]
+impl KernelMmio
+{
+    /// Zeroed `KernelMmio` for bootloaders that cannot populate it. The
+    /// kernel falls back to its hardcoded constants when the corresponding
+    /// field is zero.
+    #[must_use]
+    pub const fn zero() -> Self
+    {
+        Self {
+            plic_base: 0,
+            plic_size: 0,
+            uart_base: 0,
+            uart_size: 0,
+        }
+    }
+}
+
+// ── MMIO apertures ───────────────────────────────────────────────────────────
+
+/// A coarse-grained MMIO physical range covering some subset of the
+/// platform's non-RAM address space.
+///
+/// Each entry is a region from which the kernel mints exactly one
+/// `MmioRegion` capability (MAP | WRITE) and hands it to init. Userspace
+/// narrows these to per-device ranges via `mmio_split` (not in this
+/// protocol revision) and distributes them to drivers. Apertures are
+/// intentionally coarse; device-level enumeration is `devmgr`'s job from
+/// ACPI / DTB passthrough.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MmioAperture
+{
+    /// Physical base address of the aperture (page-aligned).
+    pub phys_base: u64,
+    /// Size of the aperture in bytes (page-aligned, non-zero).
+    pub size: u64,
+}
+
+/// Maximum number of MMIO apertures the bootloader records.
+///
+/// Derived from `EfiMemoryMappedIO` / `EfiMemoryMappedIOPortSpace`
+/// regions of the UEFI memory map, unioned with firmware-advertised PCI
+/// apertures (MCFG on x86-64, `/soc ranges` on RISC-V), then
+/// sorted-and-merged. Platforms with more than sixteen disjoint
+/// non-RAM regions are out of the targeted envelope.
+pub const MAX_APERTURES: usize = 16;
+
+/// A slice of [`MmioAperture`] values, passed by physical address.
+///
+/// Entries are sorted by `phys_base` ascending and do not overlap.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MmioApertureSlice
 {
     /// Physical address of the first entry. Null if `count` is zero.
-    pub entries: *const PlatformResource,
+    pub entries: *const MmioAperture,
     /// Number of entries.
     pub count: u64,
 }
 
+// SAFETY: Same rationale as MemoryMapSlice — boot-time physical memory,
+// produced pre-ExitBootServices and read-only after handoff.
+unsafe impl Send for MmioApertureSlice {}
 // SAFETY: Same rationale as MemoryMapSlice.
-unsafe impl Send for PlatformResourceSlice {}
-// SAFETY: Same rationale as MemoryMapSlice.
-unsafe impl Sync for PlatformResourceSlice {}
+unsafe impl Sync for MmioApertureSlice {}
 
 // ── BootInfo ─────────────────────────────────────────────────────────────────
 
@@ -356,11 +495,21 @@ pub struct BootInfo
     /// not parse the Device Tree.
     pub device_tree: u64,
 
-    /// Structured platform resource descriptors extracted from firmware tables.
+    /// Arch-specific MMIO bases the kernel itself consumes.
     ///
-    /// The kernel mints initial capabilities from these entries. Sorted by
-    /// `(resource_type, base)` in ascending order.
-    pub platform_resources: PlatformResourceSlice,
+    /// Not a capability surface. The kernel reads these values directly
+    /// during its own initialisation (interrupt controller, timer). Fields
+    /// not populated by the bootloader are zero; the kernel falls back to
+    /// its compiled-in defaults in that case.
+    pub kernel_mmio: KernelMmio,
+
+    /// Coarse-grained MMIO apertures from which the kernel mints
+    /// `MmioRegion` capabilities.
+    ///
+    /// One cap minted per entry, handed to init, narrowed and distributed
+    /// by userspace. Replaces the per-device `PlatformResource` array from
+    /// protocol versions 4 and 5.
+    pub mmio_apertures: MmioApertureSlice,
 
     /// Physical address of a null-terminated kernel command line string.
     ///
@@ -389,16 +538,31 @@ pub struct BootInfo
     /// `cpu_ids[0]` is always the BSP (`bsp_id`). `cpu_ids[1..cpu_count]` are
     /// the APs in discovery order. Entries beyond `cpu_count` are zero.
     ///
-    /// On x86-64: APIC IDs. On RISC-V: hart IDs.
-    pub cpu_ids: [u32; 64],
+    /// On x86-64: APIC IDs (LAPIC `ApicId` field from ACPI MADT).
+    /// On RISC-V: hart IDs.
+    ///
+    /// The fixed array length is [`MAX_CPUS`] (512), chosen to cover
+    /// current dual-socket high-end server hardware (e.g. 192-core ×
+    /// 2-socket EPYC without SMT = 384; 128-core × 2-socket × 2-thread
+    /// Intel = 512) while keeping `BootInfo` inside a single 4 KiB page.
+    /// Producers that discover more enabled CPUs MUST cap at this length
+    /// and MUST diagnose the truncation.
+    pub cpu_ids: [u32; MAX_CPUS],
 
-    /// Physical address of the AP startup trampoline page (x86-64 only).
+    /// Physical address of a 4 KiB page reserved for the AP startup
+    /// trampoline. The kernel writes AP startup code into this page before
+    /// bringing secondary processors online.
     ///
-    /// On x86-64: a 4 KiB frame below 1 MiB reserved by the bootloader before
-    /// `ExitBootServices` for use as the SIPI real-mode entry point. The kernel
-    /// writes AP startup code here before sending INIT/SIPI IPIs.
+    /// Arch-specific constraints on the physical address:
+    /// - **x86-64**: MUST be below 1 MiB. The SIPI vector encodes the
+    ///   real-mode start address in bits `[19:12]` of the IPI ICR, so the
+    ///   trampoline must live in the first megabyte.
+    /// - **RISC-V**: any 4 KiB frame. SBI HSM (`HART_START`) accepts any
+    ///   physical address for the entry point, so no placement constraint
+    ///   applies beyond page alignment.
     ///
-    /// On RISC-V (or when no trampoline is needed): zero.
+    /// Zero if the bootloader could not reserve a trampoline page (SMP will
+    /// then be unavailable; the kernel continues BSP-only).
     pub ap_trampoline_page: u64,
 }
 
@@ -434,11 +598,28 @@ mod tests
         assert_eq!(FramebufferInfo::empty().pixel_format, PixelFormat::Rgbx8);
     }
 
-    /// BOOT_PROTOCOL_VERSION must be 4 after the SMP cpu_count addition.
+    /// BOOT_PROTOCOL_VERSION must be 6 after the PlatformResource → kernel_mmio
+    /// + mmio_apertures replacement.
     #[test]
-    fn protocol_version_is_4()
+    fn protocol_version_is_6()
     {
-        assert_eq!(BOOT_PROTOCOL_VERSION, 4);
+        assert_eq!(BOOT_PROTOCOL_VERSION, 6);
+    }
+
+    /// `MmioApertureSlice` is layout-compatible across builds and trivially
+    /// Send/Sync (the unsafe impls above); this test exists mostly to catch
+    /// accidental reordering / size drift at review time.
+    #[test]
+    fn mmio_aperture_slice_size_is_16_bytes()
+    {
+        assert_eq!(core::mem::size_of::<MmioApertureSlice>(), 16);
+    }
+
+    /// `MmioAperture` is 16 bytes: two u64s, no padding.
+    #[test]
+    fn mmio_aperture_size_is_16_bytes()
+    {
+        assert_eq!(core::mem::size_of::<MmioAperture>(), 16);
     }
 
     /// InitImage segment_count field must fit within INIT_MAX_SEGMENTS.
@@ -446,5 +627,12 @@ mod tests
     fn init_image_segment_count_fits_max()
     {
         assert!(INIT_MAX_SEGMENTS <= u32::MAX as usize);
+    }
+
+    /// `BootInfo` must fit a single 4 KiB page; the field-size docs depend on it.
+    #[test]
+    fn boot_info_fits_4kib_page()
+    {
+        assert!(core::mem::size_of::<BootInfo>() <= 4096);
     }
 }

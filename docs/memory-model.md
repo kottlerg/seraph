@@ -146,7 +146,7 @@ unit and the `SUM` bit in `sstatus`, which controls supervisor access to user pa
 ### Boot-Time Memory Map
 
 At boot, the bootloader provides a memory map via the `BootInfo` structure
-(see [boot-protocol.md](boot-protocol.md)) describing which physical address ranges
+(see [`abi/boot-protocol/`](../abi/boot-protocol/)) describing which physical address ranges
 are usable RAM, reserved, or used by firmware. The kernel parses this map during early
 initialisation before the frame allocator is active. Memory used by the kernel image,
 boot modules, and reserved regions is marked unavailable.

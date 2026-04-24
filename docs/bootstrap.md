@@ -21,9 +21,11 @@ The sequence is specified in ten bootloader steps in
 ## Kernel entry (ABI gate)
 
 The bootloader hands control to the kernel at a single entry-point symbol
-with `BootInfo` supplied by register. The CPU state, memory state, and
-`BootInfo` layout established at this gate are specified in
-[`boot-protocol.md`](boot-protocol.md).
+with `BootInfo` supplied by register. The CPU state and register contents
+at this gate are specified in
+[`boot/docs/kernel-handoff.md`](../boot/docs/kernel-handoff.md); the
+`BootInfo` layout and `BOOT_PROTOCOL_VERSION` contract are owned by the
+[`abi/boot-protocol/`](../abi/boot-protocol/) crate.
 
 ---
 
@@ -47,8 +49,9 @@ timing claims to kernel phase 7.
 At the end of kernel phase 9, the kernel maps the init image — pre-parsed
 by the bootloader and delivered via `BootInfo.init_image` — into a new
 address space, creates init's initial thread, and enters userspace. The
-init-image contract is specified in [`boot-protocol.md`](boot-protocol.md)
-under "InitImage"; the kernel side of the handoff is the last phase in
+init-image contract is specified by the `InitImage` type in the
+[`abi/boot-protocol/`](../abi/boot-protocol/) crate; the kernel side of
+the handoff is the last phase in
 [`kernel/docs/initialization.md`](../kernel/docs/initialization.md). The
 kernel's only baked-in knowledge of userspace is this handoff — it has no
 notion of `init`, `procmgr`, or any other userspace role beyond starting

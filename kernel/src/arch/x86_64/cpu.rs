@@ -177,8 +177,8 @@ pub unsafe fn user_access_end()
 ///
 /// # Safety
 /// Must execute at ring 0. May only be called after the IDT is loaded so that
-/// a CR4 write fault is catchable (in practice SMEP/SMAP are always present
-/// on any QEMU configuration we support).
+/// a CR4 write fault is catchable (in practice both features are mandatory
+/// on the x86_64-v3 baseline this kernel targets).
 // similar_names: smep_present and smap_present are distinct CPU security features.
 #[cfg(not(test))]
 #[allow(clippy::similar_names)]
@@ -206,24 +206,35 @@ pub unsafe fn enable_smep_smap()
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
 
-/// Enable interrupts and halt until the next interrupt fires, then return.
+/// Atomically enable interrupts and halt until an interrupt is recognised.
 ///
-/// Used in the idle loop once the timer is running. Unlike `halt_loop`, this
-/// re-enables interrupts so the preemption timer can fire.
+/// Precondition: interrupts are **disabled** (IF=0) on entry.
+/// Postcondition: interrupts are **enabled** (IF=1) on return; any pending
+/// interrupt at the halt boundary has been recognised (handler ran during
+/// halt).
+///
+/// Per Intel SDM Vol. 2B (STI): when `STI` is immediately followed by `HLT`,
+/// the processor delays interrupt recognition until after `HLT` begins
+/// execution. The pair is therefore atomic: no interrupt is lost between
+/// the enable and the halt. A producer that raises a wake signal (IPI)
+/// between the idle loop's flag check and this call will find the signal
+/// pending in the local APIC at `HLT`, waking it immediately.
+///
+/// `nomem` is intentionally omitted so the compiler may not reorder
+/// preceding atomic loads across this call.
 pub fn halt_until_interrupt()
 {
-    // SAFETY: sti enables interrupts, hlt suspends until one arrives.
-    // The instruction sequence is atomic: no interrupt can occur between
-    // sti and hlt (x86 guarantee).
+    // SAFETY: `sti; hlt` is atomic per Intel SDM; correct only when
+    // interrupts were disabled on entry (caller contract).
     unsafe {
-        core::arch::asm!("sti; hlt", options(nostack, nomem));
+        core::arch::asm!("sti; hlt", options(nostack, preserves_flags));
     }
 }
 
 /// Return the local APIC ID of the current CPU (from CPUID.01H:EBX[31:24]).
 ///
-/// Phase 5 only starts the BSP (Bootstrap Processor); this will return 0
-/// on a single-CPU QEMU configuration.
+/// Phase 5 only starts the BSP (Bootstrap Processor); this returns 0 on a
+/// single-CPU system.
 #[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
 pub fn current_id() -> u32
 {
@@ -356,11 +367,14 @@ pub unsafe fn restore_interrupts(saved: u64)
 /// # Safety
 /// Changes global CPU interrupt state. Caller is responsible for re-enabling
 /// interrupts when appropriate (the kernel does not enable them during early boot).
+///
+/// `nomem` is intentionally omitted: the idle loop relies on no atomic
+/// loads being reordered across this call.
 pub unsafe fn disable_interrupts()
 {
     // SAFETY: caller guarantees this is called in an appropriate context.
     unsafe {
-        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("cli", options(nostack, preserves_flags));
     }
 }
 

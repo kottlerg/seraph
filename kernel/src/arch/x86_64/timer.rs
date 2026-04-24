@@ -47,8 +47,8 @@ use crate::mm::paging::DIRECT_MAP_BASE;
 /// Vector number assigned to the APIC timer interrupt.
 pub const TIMER_VECTOR: u8 = 32;
 
-/// APIC register offsets (from `DIRECT_MAP_BASE + APIC_BASE_PHYS`).
-const APIC_BASE_PHYS: u64 = 0xFEE0_0000;
+/// APIC register offsets (relative to the APIC base reported by
+/// [`super::platform::lapic_base`]).
 const APIC_LVT_TIMER: usize = 0x320;
 const APIC_TIMER_INITIAL: usize = 0x380;
 const APIC_TIMER_CURRENT: usize = 0x390;
@@ -121,9 +121,9 @@ fn read_tsc() -> u64
 #[cfg(not(test))]
 unsafe fn apic_write(offset: usize, val: u32)
 {
-    let vaddr = (DIRECT_MAP_BASE + APIC_BASE_PHYS) as usize + offset;
-    // SAFETY: APIC_BASE_PHYS (0xFEE0_0000) is identity-mapped in DIRECT_MAP_BASE;
-    // vaddr points to a valid APIC MMIO register within the 4 KiB APIC page.
+    let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
+    // SAFETY: APIC base mapped via direct map (Phase 3); vaddr points to a
+    // valid APIC MMIO register within the 4 KiB APIC page.
     unsafe {
         core::ptr::write_volatile(vaddr as *mut u32, val);
     }
@@ -132,9 +132,9 @@ unsafe fn apic_write(offset: usize, val: u32)
 #[cfg(not(test))]
 fn apic_read(offset: usize) -> u32
 {
-    let vaddr = (DIRECT_MAP_BASE + APIC_BASE_PHYS) as usize + offset;
-    // SAFETY: APIC_BASE_PHYS (0xFEE0_0000) is identity-mapped in DIRECT_MAP_BASE;
-    // vaddr points to a valid APIC MMIO register within the 4 KiB APIC page.
+    let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
+    // SAFETY: APIC base mapped via direct map (Phase 3); vaddr points to a
+    // valid APIC MMIO register within the 4 KiB APIC page.
     unsafe { core::ptr::read_volatile(vaddr as *const u32) }
 }
 

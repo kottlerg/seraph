@@ -3,39 +3,34 @@
 
 // kernel/src/arch/x86_64/ioapic.rs
 
-//! Minimal I/O APIC driver for x86-64.
+//! I/O APIC driver for x86-64.
 //!
 //! Programs interrupt redirection entries so device IRQs (GSIs) are delivered
-//! to the CPU as IDT vectors. Only a single I/O APIC is supported.
+//! to the CPU as IDT vectors. Supports up to [`boot_protocol::MAX_IOAPICS`]
+//! per system; per-IOAPIC bases and `gsi_base` are read from
+//! `BootInfo.kernel_mmio.ioapics[..]` (cached at boot via
+//! [`crate::platform::capture_kernel_mmio`]) with a single-IOAPIC fallback at
+//! [`super::platform`]'s default.
 //!
 //! # Hardware interface
-//! The I/O APIC is memory-mapped at [`IOAPIC_BASE_PHYS`], accessible via
-//! the kernel direct map. Two 32-bit registers control access:
+//! Each I/O APIC is memory-mapped at its `phys_base`, accessible via the
+//! kernel direct map. Two 32-bit registers control access:
 //! - `IOREGSEL` (offset 0x00): index of the register to read/write.
 //! - `IOWIN`    (offset 0x10): data window for the selected register.
 //!
 //! Redirection entries are 64-bit values spanning two 32-bit registers:
-//! - Low  dword at index `0x10 + 2 * gsi`
-//! - High dword at index `0x11 + 2 * gsi`
+//! - Low  dword at index `0x10 + 2 * pin`
+//! - High dword at index `0x11 + 2 * pin`
+//!
+//! `pin` is the intra-IOAPIC pin number; the global GSI is `gsi_base + pin`.
 //!
 //! # Vector assignment
-//! GSI `n` is assigned to IDT vector `DEVICE_VECTOR_BASE + n` (33 + n).
-//! This keeps the mapping trivial and avoids a vector allocator.
-//! Vectors 33–55 cover 23 IOAPIC inputs (typical Q35 has 24 entries).
+//! GSI `n` is assigned to IDT vector `DEVICE_VECTOR_BASE + n` (33 + n). This
+//! keeps the mapping trivial and avoids a vector allocator.
 //!
 //! # Limitations / deferred work
 //!
-//! - **Single IOAPIC only.** Real machines may have multiple I/O APICs.
-//!   // TODO: Discover all IOAPICs from the ACPI MADT and maintain a per-IOAPIC
-//!   // table. Pick up alongside ACPI parsing.
-//!
-//! - **Hardcoded base address.** QEMU Q35 always puts the I/O APIC at
-//!   `0xFEC0_0000`. On real hardware this may differ.
-//!   // TODO: Read IOAPIC base from ACPI MADT IOAPIC record. Pick up when
-//!   // ACPI table parsing is added.
-//!
 //! - **No MSI/MSI-X support.** Required for modern `PCIe` devices.
-//!   // TODO: Add MSI/MSI-X programming when `PCIe` enumeration is implemented.
 //!
 //! - **Edge-triggered, active-high only.** Level-triggered and active-low
 //!   sources (some legacy ISA IRQs via PCI interrupt routing) are not handled.
@@ -51,12 +46,11 @@
 // cast_lossless: u8→u32 vector widening casts.
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
 
+use boot_protocol::{IoApicEntry, MAX_IOAPICS};
+
 use crate::mm::paging::DIRECT_MAP_BASE;
 
 // ── Hardware constants ────────────────────────────────────────────────────────
-
-/// Physical base address of the I/O APIC (standard Q35 / QEMU location).
-const IOAPIC_BASE_PHYS: u64 = 0xFEC0_0000;
 
 /// Register select offset (write GSI index here).
 const IOREGSEL: usize = 0x00;
@@ -79,34 +73,78 @@ const REDIR_MASK: u32 = 1 << 16;
 /// Logical destination mode would be bit 11; we leave it clear (physical).
 const REDIR_FIXED: u32 = 0x0000_0000;
 
+// ── Per-IOAPIC state ──────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone)]
+struct IoApicState
+{
+    phys_base: u64,
+    gsi_base: u32,
+    pin_count: u32,
+}
+
+const EMPTY_STATE: IoApicState = IoApicState {
+    phys_base: 0,
+    gsi_base: 0,
+    pin_count: 0,
+};
+
+/// Discovered I/O APICs, populated once by [`init`] from
+/// `kernel_mmio.ioapics[..]` (with a single-entry fallback when the bootloader
+/// reports none).
+///
+/// SAFETY: written exactly once during Phase 5 `init`, single-threaded;
+/// subsequent reads happen from IRQ paths after SMP is active and observe a
+/// fully-written value because the write precedes SMP bring-up.
+static mut IOAPICS: [IoApicState; MAX_IOAPICS] = [EMPTY_STATE; MAX_IOAPICS];
+static mut IOAPIC_COUNT: usize = 0;
+
+/// Locate the IOAPIC owning `gsi`. Returns `(phys_base, intra_ioapic_pin)`.
+fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
+{
+    // SAFETY: IOAPIC_COUNT and IOAPICS are written exactly once during init,
+    // before any IRQ delivery; reads observe the fully-written value.
+    let count = unsafe { IOAPIC_COUNT };
+    let base = core::ptr::addr_of!(IOAPICS).cast::<IoApicState>();
+    for i in 0..count
+    {
+        // SAFETY: i < count ≤ MAX_IOAPICS; entries [0..count) are initialized.
+        let s = unsafe { *base.add(i) };
+        if gsi >= s.gsi_base && gsi < s.gsi_base + s.pin_count
+        {
+            return Some((s.phys_base, gsi - s.gsi_base));
+        }
+    }
+    None
+}
+
 // ── Register access ───────────────────────────────────────────────────────────
 
-/// Write `val` to IOAPIC register `reg`.
+/// Write `val` to register `reg` of the IOAPIC at `phys_base`.
 ///
 /// # Safety
-/// Must only be called after Phase 3 (direct map active).
-unsafe fn ioapic_write(reg: u32, val: u32)
+/// Must only be called after Phase 3 (direct map active) with a valid IOAPIC
+/// physical base.
+unsafe fn ioapic_write(phys_base: u64, reg: u32, val: u32)
 {
-    let base = (DIRECT_MAP_BASE + IOAPIC_BASE_PHYS) as usize;
-    // SAFETY: IOAPIC_BASE_PHYS is a valid kernel mapping via direct map at
-    // DIRECT_MAP_BASE; IOREGSEL/IOWIN offsets are within IOAPIC register range;
-    // volatile ensures proper ordering of register select and data writes.
+    let base = (DIRECT_MAP_BASE + phys_base) as usize;
+    // SAFETY: phys_base is a valid IOAPIC MMIO base mapped through the direct
+    // map; IOREGSEL/IOWIN offsets are within IOAPIC register range; volatile
+    // ensures proper ordering of register select and data writes.
     unsafe {
         core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);
         core::ptr::write_volatile((base + IOWIN) as *mut u32, val);
     }
 }
 
-/// Read IOAPIC register `reg`.
+/// Read register `reg` of the IOAPIC at `phys_base`.
 ///
 /// # Safety
-/// Must only be called after Phase 3 (direct map active).
-unsafe fn ioapic_read(reg: u32) -> u32
+/// Same as [`ioapic_write`].
+unsafe fn ioapic_read(phys_base: u64, reg: u32) -> u32
 {
-    let base = (DIRECT_MAP_BASE + IOAPIC_BASE_PHYS) as usize;
-    // SAFETY: IOAPIC_BASE_PHYS is a valid kernel mapping via direct map at
-    // DIRECT_MAP_BASE; IOREGSEL/IOWIN offsets are within IOAPIC register range;
-    // volatile ensures proper ordering of register select and data read.
+    let base = (DIRECT_MAP_BASE + phys_base) as usize;
+    // SAFETY: see ioapic_write.
     unsafe {
         core::ptr::write_volatile((base + IOREGSEL) as *mut u32, reg);
         core::ptr::read_volatile((base + IOWIN) as *const u32)
@@ -115,43 +153,66 @@ unsafe fn ioapic_read(reg: u32) -> u32
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-/// Initialise the I/O APIC: mask all redirection entries.
-///
-/// Called once during Phase 5 boot after the direct map is active.
+/// Initialise every I/O APIC reported by the bootloader: read its pin count
+/// from the version register, mask all entries.
 ///
 /// # Safety
-/// Must be called from a single-threaded context after Phase 3 completes.
+/// Must be called from a single-threaded context after Phase 3 completes and
+/// after `kernel_mmio` has been captured.
 #[cfg(not(test))]
 pub unsafe fn init()
 {
-    // Read the version register to determine the number of redirection entries.
-    // Bits [23:16] hold (max_entry_index), so num_entries = max_index + 1.
-    // SAFETY: single-threaded init phase after Phase 3; direct map is active.
-    let ver = unsafe { ioapic_read(IOAPICVER) };
-    let max_entry = (ver >> 16) & 0xFF;
+    let mut buf = [IoApicEntry::default(); MAX_IOAPICS];
+    let entries = super::platform::ioapics_into(&mut buf);
 
-    // SAFETY: single-threaded init phase; reading IOAPICID register.
-    let ioapic_id = unsafe { ioapic_read(IOAPICID) };
-    crate::kprintln!(
-        "ioapic: base={:#x} id={:#x} max_redir={}",
-        IOAPIC_BASE_PHYS,
-        ioapic_id,
-        max_entry
-    );
-
-    // Mask all entries (bit 16 = interrupt mask = 1).
-    for gsi in 0..=max_entry
+    let count = entries.len().min(MAX_IOAPICS);
+    for (i, entry) in entries.iter().take(count).enumerate()
     {
-        // SAFETY: single-threaded init phase; programming redirection entries
-        // to masked state; no concurrent access or IRQ delivery possible.
+        // SAFETY: single-threaded init phase after Phase 3; direct map active.
+        let ver = unsafe { ioapic_read(entry.phys_base, IOAPICVER) };
+        let max_entry = (ver >> 16) & 0xFF;
+        let pin_count = max_entry + 1;
+
+        // SAFETY: single-threaded init phase; reading IOAPICID register.
+        let ioapic_id = unsafe { ioapic_read(entry.phys_base, IOAPICID) };
+
+        // SAFETY: single-threaded init phase; pre-SMP write.
         unsafe {
-            ioapic_write(0x10 + 2 * gsi, REDIR_MASK);
-            ioapic_write(0x11 + 2 * gsi, 0);
+            IOAPICS[i] = IoApicState {
+                phys_base: entry.phys_base,
+                gsi_base: entry.gsi_base,
+                pin_count,
+            };
         }
+
+        crate::kprintln!(
+            "ioapic[{}]: base={:#x} id={:#x} gsi_base={} pins={}",
+            i,
+            entry.phys_base,
+            ioapic_id,
+            entry.gsi_base,
+            pin_count
+        );
+
+        // Mask all entries on this IOAPIC (bit 16 = interrupt mask = 1).
+        for pin in 0..pin_count
+        {
+            // SAFETY: single-threaded init phase; programming redirection
+            // entries to masked state; no concurrent access or IRQ delivery.
+            unsafe {
+                ioapic_write(entry.phys_base, 0x10 + 2 * pin, REDIR_MASK);
+                ioapic_write(entry.phys_base, 0x11 + 2 * pin, 0);
+            }
+        }
+    }
+
+    // SAFETY: single-threaded init phase; pre-SMP write.
+    unsafe {
+        IOAPIC_COUNT = count;
     }
 }
 
-/// Program a redirection entry for `gsi` to deliver vector `vector`.
+/// Program a redirection entry for `gsi` to deliver `vector`.
 ///
 /// The entry is programmed masked; call [`unmask`] when ready to receive.
 /// Uses edge-triggered, active-high, fixed delivery to LAPIC 0.
@@ -168,16 +229,22 @@ pub unsafe fn init()
 #[cfg(not(test))]
 pub unsafe fn route(gsi: u32, vector: u8)
 {
+    let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
+    else
+    {
+        crate::kprintln!("ioapic: no IOAPIC owns GSI {} — route ignored", gsi);
+        return;
+    };
     // Low dword: vector | fixed delivery | masked.
     // High dword: destination LAPIC ID 0 in bits [27:24].
     let low = REDIR_MASK | REDIR_FIXED | (vector as u32);
     let high: u32 = 0; // dest LAPIC ID 0
 
-    // SAFETY: caller ensures init() has completed; programming redirection entry
-    // for specified GSI with masked delivery; entry remains masked until unmask().
+    // SAFETY: caller ensures init() has completed; entry remains masked
+    // until unmask().
     unsafe {
-        ioapic_write(0x10 + 2 * gsi, low);
-        ioapic_write(0x11 + 2 * gsi, high);
+        ioapic_write(base, 0x10 + 2 * pin, low);
+        ioapic_write(base, 0x11 + 2 * pin, high);
     }
 }
 
@@ -188,12 +255,17 @@ pub unsafe fn route(gsi: u32, vector: u8)
 #[cfg(not(test))]
 pub unsafe fn mask(gsi: u32)
 {
-    let reg = 0x10 + 2 * gsi;
-    // SAFETY: caller ensures init() has completed; reading current redirection entry.
-    let current = unsafe { ioapic_read(reg) };
-    // SAFETY: setting mask bit in redirection entry; serializes with IRQ dispatch.
+    let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
+    else
+    {
+        return;
+    };
+    let reg = 0x10 + 2 * pin;
+    // SAFETY: caller ensures init() has completed; reading current entry.
+    let current = unsafe { ioapic_read(base, reg) };
+    // SAFETY: setting mask bit; serializes with IRQ dispatch.
     unsafe {
-        ioapic_write(reg, current | REDIR_MASK);
+        ioapic_write(base, reg, current | REDIR_MASK);
     }
 }
 
@@ -204,12 +276,17 @@ pub unsafe fn mask(gsi: u32)
 #[cfg(not(test))]
 pub unsafe fn unmask(gsi: u32)
 {
-    let reg = 0x10 + 2 * gsi;
-    // SAFETY: caller ensures init() and route() have completed; reading current entry.
-    let current = unsafe { ioapic_read(reg) };
-    // SAFETY: clearing mask bit enables IRQ delivery; caller must have registered handler.
+    let Some((base, pin)) = lookup_ioapic_for_gsi(gsi)
+    else
+    {
+        return;
+    };
+    let reg = 0x10 + 2 * pin;
+    // SAFETY: caller ensures init() and route() have completed; reading entry.
+    let current = unsafe { ioapic_read(base, reg) };
+    // SAFETY: clearing mask bit enables IRQ delivery; caller registered handler.
     unsafe {
-        ioapic_write(reg, current & !REDIR_MASK);
+        ioapic_write(base, reg, current & !REDIR_MASK);
     }
 }
 
@@ -219,12 +296,6 @@ pub unsafe fn unmask(gsi: u32)
 mod tests
 {
     use super::*;
-
-    #[test]
-    fn ioapic_base_phys_constant()
-    {
-        assert_eq!(IOAPIC_BASE_PHYS, 0xFEC0_0000);
-    }
 
     #[test]
     fn device_vector_base_is_33()

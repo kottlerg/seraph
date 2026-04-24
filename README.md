@@ -78,7 +78,7 @@ Overall project design documents live in [`docs/`](docs/):
 - [Userspace Memory Model](docs/userspace-memory-model.md) — VA zones, heap ownership, std↔procmgr frame authority
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
-- [Boot Protocol](docs/boot-protocol.md) — kernel-entry ABI gate: CPU/memory state and `BootInfo`
+- [Boot Protocol ABI crate](abi/boot-protocol/) — kernel-entry contract: `BootInfo` layout, `BOOT_PROTOCOL_VERSION`, and compliant-bootloader requirements
 - [System Bootstrap](docs/bootstrap.md) — end-to-end boot lifecycle summary (bootloader steps, kernel phases, init bootstrap)
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr, driver binding, DMA safety
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands

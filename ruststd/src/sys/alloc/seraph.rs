@@ -9,10 +9,16 @@
 // and duplicates no protocol numbers.
 //
 // Bootstrap is explicit: `std::os::seraph::heap_bootstrap(procmgr_ep,
-// self_aspace, ipc_buffer_vaddr)` must be called once, after the
-// bootstrap IPC round that produces `procmgr_ep`, before the first
-// allocation. An allocation before bootstrap returns a null pointer and
-// the alloc crate aborts via `handle_alloc_error`.
+// self_aspace)` must be called once, after the bootstrap IPC round
+// that produces `procmgr_ep`, before the first allocation. An
+// allocation before bootstrap returns a null pointer and the alloc
+// crate aborts via `handle_alloc_error`.
+//
+// The IPC buffer pointer used by `grow` is read from the TLS slot
+// populated in `_start` / the thread trampoline (see
+// `std::os::seraph::current_ipc_buf`). Each thread's allocation-
+// triggered grow thus targets the buffer the kernel actually reads
+// from for that thread.
 //
 // `unsafe impl GlobalAlloc for System` below delegates to the static
 // heap; services that want this allocator simply omit a custom
@@ -21,11 +27,12 @@
 use crate::alloc::{GlobalAlloc, Layout, System};
 use crate::cell::UnsafeCell;
 use crate::mem::{align_of, size_of};
+use crate::os::seraph::current_ipc_buf;
 use crate::ptr::{NonNull, null_mut};
 use crate::sync::atomic::{AtomicBool, Ordering};
 
 use ipc::procmgr_labels::REQUEST_FRAMES;
-use syscall_abi::{MAP_WRITABLE, MSG_CAP_SLOTS_MAX};
+use syscall_abi::MAP_WRITABLE;
 use va_layout::{FRAMES_PER_REQUEST, HEAP_BASE, HEAP_INITIAL_PAGES, HEAP_MAX, PAGE_SIZE};
 
 /// Minimum grow increment in pages. Allocation-failure retries extend the
@@ -100,9 +107,6 @@ struct Heap {
     procmgr_ep: u32,
     /// Cached aspace cap for mapping grow-path frames. Zero before bootstrap.
     self_aspace: u32,
-    /// IPC buffer VA for the `grow` call. Kernel-registered, page-aligned;
-    /// equal to the buffer used at bootstrap. Zero before bootstrap.
-    ipc_buffer_vaddr: u64,
 }
 
 impl Heap {
@@ -112,7 +116,6 @@ impl Heap {
             mapped_end: 0,
             procmgr_ep: 0,
             self_aspace: 0,
-            ipc_buffer_vaddr: 0,
         }
     }
 
@@ -242,7 +245,7 @@ impl Heap {
     /// pre-registered page, not heap-backed — so `grow` is safe to call
     /// under the allocator lock without re-entrant allocation.
     fn grow(&mut self, want_bytes: usize) -> bool {
-        if self.procmgr_ep == 0 || self.ipc_buffer_vaddr == 0 || self.self_aspace == 0 {
+        if self.procmgr_ep == 0 || self.self_aspace == 0 {
             return false;
         }
         let start_va = self.mapped_end as u64;
@@ -268,26 +271,31 @@ impl Heap {
     /// then append the new region to the free list. Returns true on
     /// full success.
     fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
-        let ipc_buf_u64 = self.ipc_buffer_vaddr as *mut u64;
+        // Read the calling thread's registered IPC buffer from TLS. The
+        // kernel services `ipc_call` by reading the payload from that
+        // thread's `tcb.ipc_buffer`; targeting any other VA silently
+        // writes to the wrong page.
+        let ipc_buf_u64 = current_ipc_buf();
+        if ipc_buf_u64.is_null() {
+            return false;
+        }
         let mut mapped: u64 = 0;
         while mapped < pages {
             let want = (pages - mapped).min(FRAMES_PER_REQUEST);
-            // SAFETY: ipc_buffer_vaddr is the kernel-registered,
-            // page-aligned IPC buffer.
-            unsafe { core::ptr::write_volatile(ipc_buf_u64, want) };
-
-            let Ok((ret_label, _)) = syscall::ipc_call(self.procmgr_ep, REQUEST_FRAMES, 1, &[])
-            else {
-                return false;
+            let msg = ipc::IpcMessage::builder(REQUEST_FRAMES).word(0, want).build();
+            // SAFETY: ipc_buf_u64 is the current thread's kernel-registered,
+            // page-aligned IPC buffer (TLS slot populated by `_start` or
+            // the thread trampoline before any user code runs).
+            let reply = match unsafe { ipc::ipc_call(self.procmgr_ep, &msg, ipc_buf_u64) } {
+                Ok(r) => r,
+                Err(_) => return false,
             };
-            if ret_label != 0 {
+            if reply.label != 0 {
                 return false;
             }
 
-            // SAFETY: same invariants as bootstrap — ipc_buf_u64 valid,
-            // metadata at documented offset.
-            let (cap_count, cap_slots) = unsafe { syscall::read_recv_caps(ipc_buf_u64) };
-            let got = cap_count.min(MSG_CAP_SLOTS_MAX) as u64;
+            let cap_slots = reply.caps();
+            let got = cap_slots.len() as u64;
             if got < want {
                 return false;
             }
@@ -337,47 +345,44 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Initialise the heap by requesting frames from procmgr and mapping them
 /// at `HEAP_BASE`. Idempotent — only the first call performs real work.
 ///
-/// `ipc_buffer_vaddr` must be the VA of the process's pre-mapped IPC
-/// buffer (from `ProcessInfo`). The bootstrap registers that buffer with
-/// the kernel first, so callers that have already registered it
-/// themselves can safely pass the same address.
+/// The IPC buffer used for the bootstrap round is taken from the calling
+/// thread's TLS slot ([`crate::os::seraph::current_ipc_buf`]). `_start`
+/// populates that slot before calling `heap_bootstrap`, so bootstrap
+/// runs on the main thread's registered buffer.
 ///
 /// Returns `true` if the heap is usable after this call.
-pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32, ipc_buffer_vaddr: u64) -> bool {
+pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32) -> bool {
     if INITIALIZED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         return true;
     }
-    if procmgr_ep == 0 || ipc_buffer_vaddr == 0 {
+    if procmgr_ep == 0 {
         return false;
     }
 
-    // Registering the IPC buffer twice is a no-op in the kernel.
-    let _ = syscall::ipc_buffer_set(ipc_buffer_vaddr);
-
-    let ipc_buf_u64 = ipc_buffer_vaddr as *mut u64;
+    let ipc_buf_u64 = current_ipc_buf();
+    if ipc_buf_u64.is_null() {
+        return false;
+    }
 
     let mut mapped: u64 = 0;
     while mapped < HEAP_INITIAL_PAGES {
         let want = (HEAP_INITIAL_PAGES - mapped).min(FRAMES_PER_REQUEST);
 
-        // SAFETY: ipc_buffer_vaddr is the page-aligned IPC buffer registered above.
-        unsafe { core::ptr::write_volatile(ipc_buf_u64, want) };
-
-        let Ok((ret_label, _)) = syscall::ipc_call(procmgr_ep, REQUEST_FRAMES, 1, &[]) else {
-            return false;
+        let msg = ipc::IpcMessage::builder(REQUEST_FRAMES).word(0, want).build();
+        // SAFETY: ipc_buf_u64 is the registered, page-aligned buffer.
+        let reply = match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf_u64) } {
+            Ok(r) => r,
+            Err(_) => return false,
         };
-        if ret_label != 0 {
+        if reply.label != 0 {
             return false;
         }
 
-        // SAFETY: ipc_buf_u64 is the registered, page-aligned buffer; shared
-        // helper reads the cap-transfer metadata using the documented offset
-        // `MSG_DATA_WORDS_MAX`.
-        let (cap_count, cap_slots) = unsafe { syscall::read_recv_caps(ipc_buf_u64) };
-        let got = cap_count.min(MSG_CAP_SLOTS_MAX) as u64;
+        let cap_slots = reply.caps();
+        let got = cap_slots.len() as u64;
         if got < want {
             return false;
         }
@@ -402,7 +407,6 @@ pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32, ipc_buffer_vaddr: u64) 
         heap.mapped_end = base + size;
         heap.procmgr_ep = procmgr_ep;
         heap.self_aspace = self_aspace;
-        heap.ipc_buffer_vaddr = ipc_buffer_vaddr;
     }
     HEAP.lock.unlock();
     true

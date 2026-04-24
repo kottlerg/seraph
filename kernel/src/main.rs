@@ -6,8 +6,9 @@
 //! Seraph microkernel — kernel entry point.
 //!
 //! Receives control from the bootloader after page tables are installed and
-//! UEFI boot services have exited. See `docs/boot-protocol.md` for the CPU
-//! state contract and `BootInfo` layout.
+//! UEFI boot services have exited. See `boot/docs/kernel-handoff.md` for the
+//! CPU-state contract and the `abi/boot-protocol` crate for the `BootInfo`
+//! layout.
 //!
 //! Initialization phases implemented here:
 //! - Phase 0: validate `BootInfo` (pre-console; halts silently on failure).
@@ -16,7 +17,7 @@
 //! - Phase 3: install kernel page tables (direct physical map + W^X image).
 //! - Phase 4: activate kernel heap (`GlobalAlloc` via slab/size-class allocator).
 //! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall).
-//! - Phase 6: validate `platform_resources` slice; reject malformed entries before capability minting.
+//! - Phase 6: cache `kernel_mmio` and validate `mmio_apertures` slice before capability minting.
 //! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps.
 //! - Phase 8: initialise per-CPU scheduler state and per-CPU idle threads for all online CPUs.
 //! - Phase 9: create init process address space + TCB; hand off root `CSpace`; enter user mode.
@@ -62,7 +63,7 @@ mod validate;
 
 /// Kernel entry point.
 ///
-/// Called by the bootloader with CPU state per `docs/boot-protocol.md`.
+/// Called by the bootloader with CPU state per `boot/docs/kernel-handoff.md`.
 /// `boot_info` is the physical address of a populated [`BootInfo`] structure,
 /// accessible before the kernel's own page tables are established because the
 /// bootloader identity-maps the `BootInfo` region.
@@ -170,7 +171,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // SAFETY: kernel page tables active with direct physical map covering all
     // RAM and UART MMIO region; framebuffer physical base from validated BootInfo.
     unsafe {
-        let uart_phys = arch::current::console::UART_PHYS_BASE;
+        let uart_phys = arch::current::console::uart_phys_base();
         if uart_phys != 0
         {
             arch::current::console::rebase_serial(mm::paging::phys_to_virt(uart_phys));
@@ -197,6 +198,12 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     mm::heap::init();
     kprintln!("Phase 4: Slab Allocator and Kernel Heap");
     kprintln!("kernel heap active");
+
+    // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read
+    // bootloader-discovered MMIO bases instead of compile-time defaults. This
+    // is heap-free and depends only on the direct physical map (Phase 3).
+    // SAFETY: single-threaded boot; called exactly once, after Phase 3.
+    unsafe { platform::capture_kernel_mmio(boot_info as u64) };
 
     // ── Phase 5: architecture hardware initialization ─────────────────────────
     kprintln!("Phase 5: Architecture Hardware Initialisation");
@@ -242,16 +249,17 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     }
 
     // ── Phase 6: platform resource validation ─────────────────────────────────
-    // Validate platform_resources from BootInfo before Phase 7 mints
-    // capabilities from them. Returns only valid, non-overlapping entries.
+    // Validate mmio_apertures from BootInfo before Phase 7 mints caps from
+    // them. (kernel_mmio was cached earlier, after Phase 4, so Phase 5 arch
+    // init can read it.)
     kprintln!("Phase 6: Platform Resource Validation");
-    let platform_resources = platform::validate_platform_resources(boot_info as u64);
+    let mmio_apertures = platform::validate_mmio_apertures(boot_info as u64);
 
     // ── Phase 7: capability system ─────────────────────────────────────────────
     // Initialises the root CSpace and mints initial capabilities for all
     // boot-provided hardware resources.
     kprintln!("Phase 7: Capability System");
-    let cspace_layout = cap::init_capability_system(&platform_resources, boot_info as u64);
+    let cspace_layout = cap::init_capability_system(&mmio_apertures, boot_info as u64);
     kprintln!(
         "capability system initialised, {} slots populated",
         cspace_layout.total_populated
@@ -460,6 +468,12 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 cmdline_len: cmdline_copy_len as u32,
                 sbi_control_cap: cspace_layout.sbi_control_slot,
                 cspace_cap: 0, // patched below after CSpace cap is minted
+                irq_range_cap: cspace_layout.irq_range_slot,
+                acpi_rsdp_frame_cap: cspace_layout.acpi_rsdp_frame_slot,
+                acpi_region_frame_base: cspace_layout.acpi_region_frame_base,
+                acpi_region_frame_count: cspace_layout.acpi_region_frame_count,
+                dtb_frame_cap: cspace_layout.dtb_frame_slot,
+                _pad_tail: 0,
             };
 
             // Write InitInfo header (always fits in first page).

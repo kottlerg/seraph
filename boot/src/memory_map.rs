@@ -8,12 +8,13 @@
 //! Converts the UEFI memory descriptor list into the boot protocol's
 //! `MemoryMapEntry` format and sorts the result by physical base address.
 
+use crate::bprintln;
 use crate::uefi::{
     EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA,
-    EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA, EFI_PERSISTENT_MEMORY,
-    EfiMemoryDescriptor,
+    EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA, EFI_MEMORY_MAPPED_IO,
+    EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_PERSISTENT_MEMORY, EfiMemoryDescriptor,
 };
-use boot_protocol::{MemoryMapEntry, MemoryType};
+use boot_protocol::{MAX_APERTURES, MemoryMapEntry, MemoryType, MmioAperture};
 
 /// Translate a UEFI memory map into the boot protocol's `MemoryMapEntry` format.
 ///
@@ -92,6 +93,136 @@ fn translate_memory_type(uefi_type: u32) -> MemoryType
         // EfiMemoryMappedIOPortSpace, and all unrecognised types are Reserved.
         _ => MemoryType::Reserved,
     }
+}
+
+// ── MMIO aperture derivation ─────────────────────────────────────────────────
+
+/// Derive the coarse MMIO aperture array from the raw UEFI memory map.
+///
+/// Iterates all UEFI memory descriptors, collects those classified as
+/// `EfiMemoryMappedIO` or `EfiMemoryMappedIOPortSpace` into a scratch
+/// buffer, merges any additional firmware-advertised apertures supplied
+/// by `seed` (e.g. MCFG ECAM extents on x86-64, `/soc` bus ranges on
+/// RISC-V), sorts the result by base address, and merges adjacent or
+/// overlapping entries. Writes at most `MAX_APERTURES` entries to
+/// `out`. Returns the number of entries written; surplus is dropped
+/// with a diagnostic.
+///
+/// Apertures are coarse by design: per-device granularity is left to
+/// userspace (`devmgr`), which re-walks ACPI or DTB from the raw
+/// passthrough addresses already in `BootInfo`.
+///
+/// # Safety
+/// `uefi_map.buffer_phys` must be the UEFI raw map buffer from the most
+/// recent `GetMemoryMap` call, with valid descriptors covering
+/// `uefi_map.map_size` bytes. `seed` is a caller-owned slice of already
+/// validated apertures.
+pub unsafe fn derive_mmio_apertures(
+    uefi_map: &crate::uefi::MemoryMapResult,
+    seed: &[MmioAperture],
+    out: &mut [MmioAperture; MAX_APERTURES],
+) -> usize
+{
+    // Scratch buffer: MAX_APERTURES * 4 gives headroom for fragmented UEFI
+    // maps plus seed entries before the merge pass. 16 apertures × 4 × 16
+    // bytes = 1 KiB, stack-safe.
+    const SCRATCH: usize = MAX_APERTURES * 4;
+    let mut buf: [MmioAperture; SCRATCH] = [MmioAperture {
+        phys_base: 0,
+        size: 0,
+    }; SCRATCH];
+    let mut n: usize = 0;
+
+    // Collect MMIO-class descriptors from the UEFI map.
+    let mut offset: usize = 0;
+    while offset + uefi_map.descriptor_size <= uefi_map.map_size
+    {
+        // SAFETY: uefi_map.buffer_phys is the UEFI raw map buffer; offset is
+        // within map_size; the descriptor at this offset is a valid
+        // EfiMemoryDescriptor produced by firmware.
+        // cast_possible_truncation: buffer_phys is a UEFI physical address;
+        // on all supported UEFI targets (x86_64, riscv64) usize == u64.
+        #[allow(clippy::cast_possible_truncation)]
+        let desc =
+            unsafe { &*((uefi_map.buffer_phys as usize + offset) as *const EfiMemoryDescriptor) };
+        offset += uefi_map.descriptor_size;
+
+        let is_mmio = desc.memory_type == EFI_MEMORY_MAPPED_IO
+            || desc.memory_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE;
+        if is_mmio && n < SCRATCH
+        {
+            buf[n] = MmioAperture {
+                phys_base: desc.physical_start,
+                size: desc.number_of_pages * 4096,
+            };
+            n += 1;
+        }
+    }
+
+    // Fold in firmware-seeded apertures.
+    for s in seed
+    {
+        if s.size == 0
+        {
+            continue;
+        }
+        if n < SCRATCH
+        {
+            buf[n] = *s;
+            n += 1;
+        }
+    }
+
+    if n == 0
+    {
+        return 0;
+    }
+
+    // Insertion sort by phys_base; O(n²) is fine with n ≤ 64.
+    for i in 1..n
+    {
+        let mut j = i;
+        while j > 0 && buf[j - 1].phys_base > buf[j].phys_base
+        {
+            buf.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+
+    // Merge adjacent / overlapping entries in one pass.
+    let mut out_count: usize = 0;
+    let mut i: usize = 0;
+    while i < n
+    {
+        let base = buf[i].phys_base;
+        let mut end = base.saturating_add(buf[i].size);
+        let mut j = i + 1;
+        while j < n && buf[j].phys_base <= end
+        {
+            let j_end = buf[j].phys_base.saturating_add(buf[j].size);
+            if j_end > end
+            {
+                end = j_end;
+            }
+            j += 1;
+        }
+        if out_count < out.len()
+        {
+            out[out_count] = MmioAperture {
+                phys_base: base,
+                size: end - base,
+            };
+            out_count += 1;
+        }
+        i = j;
+    }
+
+    if out_count >= out.len()
+    {
+        bprintln!("[--------] boot: MMIO apertures: > MAX_APERTURES after merge; truncated");
+    }
+
+    out_count
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

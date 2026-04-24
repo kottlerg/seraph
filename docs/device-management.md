@@ -6,25 +6,30 @@ enumeration, binding, and policy live in `devmgr`.
 
 ---
 
-## Boot-Provided Resource Descriptors (summary — [boot-protocol.md](boot-protocol.md))
+## Boot-Provided Resource Descriptors (summary — [`abi/boot-protocol/`](../abi/boot-protocol/))
 
-The kernel consumes `PlatformResource` entries from `BootInfo.platform_resources`
-and mints capabilities from them during Phase 7 of initialization. Firmware parsing
-is outside the kernel's TCB.
+The kernel consumes `BootInfo.mmio_apertures` during Phase 7 of
+initialization and mints one `MmioRegion` capability per entry. These
+coarse apertures, together with the arch-specific `BootInfo.kernel_mmio`
+the kernel reads directly, are the only structured hardware descriptors
+the bootloader produces. Firmware parsing (ACPI / DTB table walking) is
+a userspace concern; the kernel's TCB contains no parser.
 
-See [boot-protocol.md](boot-protocol.md) for the `PlatformResource` type and field
+See [`abi/boot-protocol/src/lib.rs`](../abi/boot-protocol/src/lib.rs) for
+the `MmioAperture`, `MmioApertureSlice`, and `KernelMmio` type
 definitions.
 
 ---
 
 ## Raw Firmware Passthrough
 
-The `acpi_rsdp` and `device_tree` fields in `BootInfo` are passed through to
-userspace as opaque physical addresses. The kernel creates read-only frame
-capabilities for these regions so that devmgr (or any other process init authorises)
-can parse them directly.
+The `acpi_rsdp` and `device_tree` fields in `BootInfo` are passed through
+to userspace as opaque physical addresses. Device-level discovery —
+resolving which aperture covers which device, which GSI goes to which
+pin, the PCI bus topology — happens in userspace by re-walking ACPI and
+DTB from these passthrough addresses.
 
-The kernel treats these regions as opaque byte ranges.
+The kernel treats the regions they point at as opaque byte ranges.
 
 ---
 
@@ -38,10 +43,16 @@ binding in a running system.
 
 At startup, devmgr receives from init (via `SYS_CAP_INSERT`):
 
-- **Platform resource capabilities** — one per `PlatformResource` entry: MMIO,
-  interrupt, IoPortRange, and IOMMU unit caps.
-- **Firmware table capabilities** — read-only frame caps for the ACPI RSDP and/or
-  Device Tree blob.
+- **MMIO aperture capabilities** — one `MmioRegion` cap per
+  `BootInfo.mmio_apertures` entry, covering coarse non-RAM physical
+  regions. Init narrows these into device-sized sub-caps as needed and
+  delegates them to drivers.
+- **Interrupt capabilities** — produced on demand via the runtime
+  IRQ-registration syscall (`SYS_IRQ_REGISTER`) after init has walked
+  firmware tables and located the relevant GSI / PLIC source.
+- **Firmware-table access** — access to ACPI and DTB physical memory so
+  devmgr can resolve per-device descriptors that the bootloader no longer
+  enumerates.
 - **SchedControl capability** — for assigning elevated priorities to latency-sensitive
   driver threads.
 
@@ -104,14 +115,18 @@ DMA state, and does not return a DMA-safety verdict.
 
 ---
 
-## IommuUnit Resources
+## IOMMU Discovery and Programming
 
-`IommuUnit` entries in `PlatformResource` describe the register base and scope
-of one IOMMU. The kernel mints one MMIO capability per `IommuUnit` during the
-capability-minting phase of kernel initialization and hands the set to init at
-the init ABI gate; init delegates the IOMMU MMIO caps to devmgr. devmgr
-programs the IOMMU directly through those MMIO capabilities — the kernel does
-not read or write IOMMU registers and holds no per-IOMMU state.
+IOMMU topology is a userspace concern. The bootloader does **not** emit a
+dedicated resource variant for IOMMU units; it passes ACPI and DTB tables
+through unchanged via `PlatformTable` entries, and `devmgr` performs the
+IOMMU-topology walk itself (DMAR on x86-64, `iommu` / `iommu-map` nodes on
+RISC-V).
+
+For each IOMMU discovered, `devmgr` acquires an MMIO-region capability for
+that IOMMU's register range and programs the translation tables directly.
+The kernel does not read or write IOMMU registers and holds no per-IOMMU
+state.
 
 When devmgr binds a DMA-capable driver, devmgr (a) programs the IOMMU
 translation tables for that driver's device, and (b) derives and transfers a
@@ -122,12 +137,13 @@ kernel-enforced mode. The kernel is agnostic to both outcomes.
 
 ### Known Divergence
 
-*Known divergence from current implementation.* As of this writing, kernel
-code includes an `IommuUnit` capability type and IOMMU-programming paths
-that this section describes as devmgr-owned. The kernel-side IOMMU surface
-is scheduled for removal; see the repo-local `TODO.md` entry "IOMMU
-stripping (Shape A migration)" for the plan. Until that migration lands,
-kernel code and this document will disagree on the kernel/userspace split.
+*Known divergence from current implementation.* The boot ABI has been
+stripped of its `IommuUnit` resource variant as of `BOOT_PROTOCOL_VERSION`
+5; boot-side IOMMU discovery is gone. Residual kernel-side IOMMU
+capability types and programming paths remain, scheduled for removal per
+the repo-local `TODO.md` entry "IOMMU stripping (Shape A migration)".
+Until that migration lands, the kernel's internal IOMMU surface exists
+alongside the boot-side stripping documented here.
 
 ---
 

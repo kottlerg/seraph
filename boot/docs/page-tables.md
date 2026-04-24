@@ -9,6 +9,31 @@ no page table allocation occurs after the firmware exits.
 
 ---
 
+## Contract at Kernel Entry
+
+The state the **kernel may assume** at entry — distinct from what the
+bootloader *builds*, described in later sections — is:
+
+- The kernel image is mapped at its ELF-specified virtual addresses
+  (text, rodata, data, bss), with page permissions matching each
+  segment's ELF flags (W^X enforced).
+- An identity map covers the physical memory region containing the
+  `BootInfo` structure and every physical region it references
+  (memory-map buffer, `MmioAperture` array, `InitImage` segments,
+  all boot modules), so the kernel can read them using physical
+  addresses before its own direct-physical map is established.
+- The bootloader's stack in use at handoff is mapped at its current
+  virtual address, read-write, non-executable.
+- Nothing else is mapped. Any access outside these ranges faults.
+
+The initial tables are **not** intended to be permanent. The kernel
+replaces them during Phase 3. The CPU state at the moment of jump —
+paging bit set, interrupts disabled, BootInfo pointer in the
+first-argument register — is specified in
+[kernel-handoff.md](kernel-handoff.md).
+
+---
+
 ## What Gets Mapped
 
 The initial page tables contain exactly three categories of mappings. Nothing else is
@@ -18,7 +43,7 @@ mapped; an access outside these ranges faults.
 permissions derived from the ELF segment flags. This allows the kernel to execute from
 the first instruction.
 
-**Identity map of the boot region** — the `BootInfo` structure, the `PlatformResource`
+**Identity map of the boot region** — the `BootInfo` structure, the `MmioAperture`
 array, the memory map buffer, and all boot modules are identity-mapped (virtual address
 equals physical address). This allows the kernel to read them using physical addresses
 before its direct physical map is established in Phase 3.
@@ -38,57 +63,33 @@ no longer in use; the bootloader installs its own minimal tables.
 ## Architecture Abstraction
 
 Within the bootloader, page table construction is separated into an arch-neutral
-interface and architecture-specific implementations:
+interface and architecture-specific implementations. The trait, its error type,
+and the permission-flags record are defined in [`boot/src/paging.rs`](../src/paging.rs)
+and re-used by each arch implementation without duplication.
 
-```rust
-/// Trait implemented by each architecture's page table builder.
-pub trait PageTableBuilder: Sized
-{
-    /// Allocate a new, empty root page table. Frames come from UEFI AllocatePages.
-    /// Returns None on allocation failure.
-    fn new(bs: *mut crate::uefi::EfiBootServices) -> Option<Self>;
+The trait exposes three operations: allocate a fresh root table, map a
+virtual range onto a physical range with requested permissions, and
+return the root's physical address (the value written to `CR3` on x86-64
+or encoded into the `satp` PPN on RISC-V). All page table frames are
+obtained from UEFI `AllocatePages`; no allocation occurs after
+`ExitBootServices`.
 
-    /// Map the virtual range [virt, virt+size) to [phys, phys+size) with the
-    /// given flags. Size must be page-aligned. Returns Err on allocation failure
-    /// or W^X violation.
-    fn map(
-        &mut self,
-        virt: u64,
-        phys: u64,
-        size: u64,
-        flags: PageFlags,
-    ) -> Result<(), MapError>;
+Permissions carry only *writable* and *executable* booleans. Every
+mapping is implicitly readable — the architectures have no way to mark
+a present page unreadable while keeping it present — so a dedicated
+`readable` flag would be dead weight. W^X is rejected at the trait
+contract: any call requesting both `writable` and `executable` returns
+an error without modifying any table. This check is redundant with the
+ELF loading check in [elf-loading.md](elf-loading.md), but both sites
+enforce W^X independently to prevent a single failure mode from being
+missed.
 
-    /// Return the physical address of the root page table frame. This is the
-    /// value written to CR3 (x86-64) or the PPN field of satp (RISC-V).
-    fn root_physical(&self) -> u64;
-}
-
-#[derive(Debug)]
-pub enum MapError
-{
-    /// Physical memory allocation for an intermediate table frame failed.
-    OutOfMemory,
-    /// The flags request both writable and executable permissions (W^X violation).
-    WxViolation,
-}
-
-pub struct PageFlags
-{
-    pub readable:   bool,
-    pub writable:   bool,
-    pub executable: bool,
-}
-```
-
-`PageFlags::writable && PageFlags::executable` is rejected by every `map`
-implementation and returns `MapError::WxViolation`. This check is redundant with the
-ELF loading check in [elf-loading.md](elf-loading.md), but both sites enforce W^X
-independently to prevent a single failure mode from being missed.
-
-Architecture-specific implementations live in `boot/loader/src/arch/x86_64/paging.rs`
-and `boot/loader/src/arch/riscv64/paging.rs`. The `boot/loader/src/paging.rs` module
-re-exports the active architecture's implementation.
+Intermediate-frame allocation failures and W^X violations are the only
+two map-error variants; both are fatal. The arch implementations live
+in [`boot/src/arch/x86_64/paging.rs`](../src/arch/x86_64/paging.rs) and
+[`boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs);
+[`boot/src/paging.rs`](../src/paging.rs) re-exports the active
+architecture's implementation.
 
 ---
 
@@ -146,19 +147,13 @@ an absent entry regardless of other bits.
 
 ### Activation
 
-```rust
-// SAFETY: root_phys is the physical address of a valid, complete PML4 table.
-// Interrupts are disabled. After this instruction, virtual addresses are
-// interpreted according to the new table; all required mappings are present.
-unsafe
-{
-    core::arch::asm!("mov cr3, {0}", in(reg) root_phys, options(nostack));
-}
-```
-
-Writing CR3 flushes all TLB entries that are not tagged as global. The bootloader's
-tables do not use the Global bit (`G=0` in all PTEs) because TLB flushing is correct
-and the tables are short-lived.
+Activation writes the root PML4's physical address to `CR3`. The write
+flushes all non-global TLB entries; because the bootloader never sets
+the Global bit (`G=0` in every PTE), the flush is complete. Interrupts
+are disabled at activation time; the required mappings are all present
+before `CR3` is written. See
+[`boot/src/arch/x86_64/paging.rs`](../src/arch/x86_64/paging.rs) for the
+asm and the full SAFETY justification.
 
 ---
 
@@ -217,26 +212,18 @@ PTE has V=0 and is invalid, which is the correct initial state.
 
 ### Activation
 
-```rust
-// Construct satp: MODE=9 (Sv48), ASID=0, PPN=root_phys>>12
-let satp = (9u64 << 60) | (root_phys >> 12);
-// SAFETY: satp encodes a valid Sv48 root table at root_phys. All mappings
-// required for continued execution are present. SFENCE.VMA flushes stale
-// TLB entries before the new translation takes effect.
-unsafe
-{
-    core::arch::asm!(
-        "csrw satp, {satp}",
-        "sfence.vma",
-        satp = in(reg) satp,
-        options(nostack),
-    );
-}
-```
+Activation constructs `satp` from `MODE = 9` (Sv48), `ASID = 0`, and
+`PPN = root_phys >> 12`, writes it via `csrw satp`, then issues
+`sfence.vma` to flush stale TLB entries before the new translation
+takes effect. All mappings required for continued execution are present
+before `satp` is written. See
+[`boot/src/arch/riscv64/paging.rs`](../src/arch/riscv64/paging.rs) for
+the asm and the full SAFETY justification.
 
-ASID 0 is used for the bootloader's tables. The kernel uses ASID 0 for its own
-initial context (per the boot protocol's description of kernel entry state) and
-reassigns ASIDs when it brings up its own page table management in Phase 3.
+ASID 0 is used for the bootloader's tables. The kernel uses ASID 0 for
+its own initial context (per the boot protocol's description of kernel
+entry state) and reassigns ASIDs when it brings up its own page table
+management in Phase 3.
 
 ---
 
@@ -273,4 +260,4 @@ frames become reclaimable as `EfiLoaderData` entries in the memory map are proce
 
 ## Summarized By
 
-None
+[boot/README.md](../README.md)

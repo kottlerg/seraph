@@ -4,30 +4,49 @@
 // kernel/src/arch/riscv64/cpu.rs
 
 //! RISC-V 64-bit CPU control primitives.
-//!
-//! # Phase 5 additions
-//! - `halt_until_interrupt` — execute `wfi` with SIE enabled so the timer fires.
-//! - `current_id` — returns 0 (BSP only; real hart ID deferred to SMP phase).
 
-// ── Phase 5 additions ─────────────────────────────────────────────────────────
+// ── Halt / interrupt helpers ─────────────────────────────────────────────────
 
-/// Suspend the hart until the next interrupt fires, then return.
+/// Atomically wait for an interrupt and enable interrupts on return.
 ///
-/// On RISC-V, `wfi` only wakes for **enabled** interrupts (SIE must be
-/// set). The caller (idle loop) keeps SIE=1 on RISC-V, so `wfi` wakes
-/// on the next timer tick, wakeup IPI, or external interrupt.
+/// Precondition: `sstatus.SIE = 0` on entry (supervisor interrupts
+/// disabled). The caller — the idle loop — disables SIE before its
+/// flag/run-queue check and invokes this primitive if neither is set.
 ///
-/// A wakeup IPI can be consumed between the idle loop's `has_runnable`
-/// check and `wfi`. The IPI handler sets a reschedule-pending flag that
-/// the idle loop checks before calling this function; this catches most
-/// cases. For the remaining window (IPI between flag check and `wfi`),
-/// the timer interrupt (10 ms) provides a bounded fallback wakeup.
+/// Postcondition: `sstatus.SIE = 1` on return. Any interrupt that became
+/// pending in `sip` during the halt (or before the halt, while SIE was
+/// still 0) traps immediately as SIE is re-enabled; the handler runs
+/// before control returns to the caller.
+///
+/// Per RISC-V privileged spec §3.3.2 (20211203 / 20250508):
+///
+/// > The operation of WFI must be unaffected by the global interrupt bits
+/// > in `mstatus` (MIE and SIE) [...], but should honor the individual
+/// > interrupt enables (e.g., `mie`), allowing these to be used as
+/// > intended to simply control the set of interrupts that would cause
+/// > the hart to resume.
+///
+/// So `wfi` with `SIE=0` still resumes when a supervisor interrupt
+/// becomes pending and individually enabled (via `sie`). This is the
+/// spec-correct idiom for atomic "enable + halt": during the halt the
+/// interrupt is held pending (because SIE=0 defers trap entry); `wfi`
+/// wakes on the pending bit; the subsequent `csrsi sstatus, SIE` sets
+/// SIE=1 and the pending interrupt traps immediately.
+///
+/// `nomem` is intentionally omitted so the compiler may not reorder
+/// preceding atomic loads across this call.
 pub fn halt_until_interrupt()
 {
-    // SAFETY: wfi suspends until an enabled interrupt arrives.
-    // SIE is already set by the caller (idle loop keeps SIE=1 on RISC-V).
+    // SAFETY: `wfi` is privileged and safe in S-mode with MSTATUS.TW=0
+    // (the kernel never sets TW). The subsequent `csrsi` sets SIE=1,
+    // releasing any pending supervisor interrupt into the trap path.
+    // Caller contract: SIE=0 on entry.
     unsafe {
-        core::arch::asm!("wfi", options(nostack, nomem));
+        core::arch::asm!(
+            "wfi",
+            "csrsi sstatus, 0x2",
+            options(nostack, preserves_flags),
+        );
     }
 }
 
@@ -228,12 +247,15 @@ pub unsafe fn restore_interrupts(saved: u64)
 /// # Safety
 /// Changes global CPU interrupt state. Caller is responsible for managing
 /// interrupt state across the transition.
+///
+/// `nomem` is intentionally omitted: the idle loop relies on no atomic
+/// loads being reordered across this call.
 pub unsafe fn disable_interrupts()
 {
     // SAFETY: csrci clears the SIE bit (bit 1) in sstatus.
     // Caller guarantees this is called in supervisor mode.
     unsafe {
-        core::arch::asm!("csrci sstatus, 0x2", options(nomem, nostack));
+        core::arch::asm!("csrci sstatus, 0x2", options(nostack, preserves_flags));
     }
 }
 

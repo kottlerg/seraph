@@ -128,10 +128,11 @@ pub struct TestContext
 
     /// Pointer to the registered IPC buffer page (4 KiB, page-aligned).
     ///
-    /// Registered with `ipc_buffer_set` before any tests run. Pass to
-    /// `read_recv_caps` to inspect received capability indices after an
-    /// `ipc_recv` or `ipc_call` returns.
-    pub ipc_buf: *const u64,
+    /// Registered with `ipc_buffer_set` before any tests run. Passed into
+    /// `ipc::ipc_call` / `ipc::ipc_recv` / `ipc::ipc_reply` as the buffer
+    /// for the snapshot copy. The returned `IpcMessage` owns data words
+    /// and received cap-slot indices.
+    pub ipc_buf: *mut u64,
 }
 
 /// 16 KiB stack for a child thread, aligned per the System V ABI.
@@ -167,8 +168,10 @@ impl ChildStack
 /// Static IPC buffer — 4 KiB, page-aligned.
 ///
 /// Registered once in `run()` via `ipc_buffer_set`. The kernel writes received
-/// message data and capability slot indices here. Tests read it via
-/// `read_recv_caps(ctx.ipc_buf)`.
+/// message data and capability slot indices here; the `ipc::IpcMessage`
+/// wrappers snapshot those values into a stack-owned message before returning,
+/// so tests read from the returned `IpcMessage` rather than from the buffer
+/// directly.
 #[repr(C, align(4096))]
 struct IpcBuf([u64; 512]);
 
@@ -215,9 +218,9 @@ fn run(info_ptr: u64) -> !
     let aspace_cap = info.aspace_cap;
 
     // Register the IPC buffer before any IPC syscall. All Tier 1 IPC tests
-    // and integration tests that use ipc_recv or read_recv_caps depend on this.
+    // and integration tests depend on this.
     // SAFETY: IPC_BUF is a page-aligned static in ktest's BSS; single-threaded here.
-    let ipc_buf_ptr = core::ptr::addr_of!(IPC_BUF).cast::<u64>();
+    let ipc_buf_ptr = core::ptr::addr_of_mut!(IPC_BUF).cast::<u64>();
     syscall::ipc_buffer_set(ipc_buf_ptr as u64).unwrap_or_else(|_| {
         log("ktest: FATAL: ipc_buffer_set failed");
         halt()

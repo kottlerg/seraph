@@ -9,15 +9,21 @@
 //! (id 0) populated with initial capabilities for all boot-provided hardware
 //! resources:
 //!
-//! - Usable physical memory → [`CapTag::Frame`] caps (MAP | WRITE)
-//! - MMIO ranges (`MmioRange`, `PciEcam`, `IommuUnit`) → [`CapTag::MmioRegion`] caps (MAP | WRITE)
-//! - Interrupt lines → [`CapTag::Interrupt`] caps
-//! - Firmware tables → [`CapTag::Frame`] caps (MAP only, no WRITE)
-//! - One root [`CapTag::IoPortRange`] cap covering the full 64K I/O port space (x86-64, USE)
+//! - Usable physical memory → [`CapTag::Frame`] caps (MAP | WRITE | EXECUTE)
+//! - MMIO apertures (coarse non-RAM ranges from the boot protocol)
+//!   → [`CapTag::MmioRegion`] caps (MAP | WRITE)
+//! - One root [`CapTag::Interrupt`] range cap covering every valid IRQ id
+//!   (userspace narrows via `sys_irq_split`)
+//! - Per `AcpiReclaimable` region, the ACPI RSDP page, and the DTB blob →
+//!   read-only [`CapTag::Frame`] caps so userspace can parse firmware tables
+//! - One root [`CapTag::IoPortRange`] cap covering the full 64K I/O port
+//!   space (x86-64, USE)
 //! - One [`CapTag::SchedControl`] cap (ELEVATE)
+//! - One [`CapTag::SbiControl`] cap on RISC-V (CALL)
 //!
 //! The populated `CSpace` is stored in [`ROOT_CSPACE`] until Phase 9 hands it
-//! to the init process.
+//! to the init process. Boot module ELF images get their own RO Frame caps
+//! in [`mint_module_frame_caps`].
 
 // cast_possible_truncation: u64→usize/u32/u16 capability field extractions bounded by capability space.
 #![allow(clippy::cast_possible_truncation)]
@@ -46,9 +52,7 @@ pub use object::{
 #[allow(unused_imports)]
 pub use slot::{CSpaceId, CapTag, CapabilitySlot, Rights, SlotId};
 
-#[cfg(test)]
-use boot_protocol::MemoryType;
-use boot_protocol::{BootInfo, MemoryMapEntry, PlatformResource, ResourceType};
+use boot_protocol::{BootInfo, MemoryMapEntry, MemoryType, MmioAperture};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use init_protocol::CapDescriptor;
@@ -204,6 +208,20 @@ pub struct CSpaceLayout
     pub sched_control_slot: u32,
     /// Slot index of the `SbiControl` capability (RISC-V only; 0 on x86-64).
     pub sbi_control_slot: u32,
+    /// Slot index of the root `Interrupt` range capability. Zero if no
+    /// valid range could be determined at boot.
+    pub irq_range_slot: u32,
+    /// Slot index of the RO `Frame` cap covering the ACPI RSDP page.
+    /// Zero if `BootInfo.acpi_rsdp` is zero.
+    pub acpi_rsdp_frame_slot: u32,
+    /// First slot index of the RO `Frame` caps covering the
+    /// `AcpiReclaimable` regions from the boot memory map.
+    pub acpi_region_frame_base: u32,
+    /// Number of ACPI reclaimable-region `Frame` caps.
+    pub acpi_region_frame_count: u32,
+    /// Slot index of the RO `Frame` cap covering the DTB blob.
+    /// Zero if `BootInfo.device_tree` is zero.
+    pub dtb_frame_slot: u32,
     /// Total number of populated slots.
     pub total_populated: usize,
     /// Per-capability descriptors for all populated slots.
@@ -212,9 +230,10 @@ pub struct CSpaceLayout
 
 /// Initialise the capability system and populate the root `CSpace.`
 ///
-/// `platform_resources` is the validated list from Phase 6. `boot_info_phys`
-/// is the physical address of the [`BootInfo`] structure; re-derived here via
-/// the direct physical map (active since Phase 3) to access the memory map.
+/// `mmio_apertures` is the validated aperture list from Phase 6.
+/// `boot_info_phys` is the physical address of the [`BootInfo`] structure;
+/// re-derived here via the direct physical map (active since Phase 3) to
+/// access the memory map.
 ///
 /// Returns a [`CSpaceLayout`] describing the slot ranges populated. Calls
 /// [`crate::fatal`] on any allocation failure.
@@ -223,10 +242,8 @@ pub struct CSpaceLayout
 ///
 /// Must be called exactly once, single-threaded, after Phase 4 (heap active)
 /// and Phase 3 (direct map active).
-pub fn init_capability_system(
-    platform_resources: &[PlatformResource],
-    boot_info_phys: u64,
-) -> CSpaceLayout
+pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u64)
+-> CSpaceLayout
 {
     let id = NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
     let mut cspace = Box::new(CSpace::new(id, ROOT_CSPACE_MAX_SLOTS));
@@ -251,7 +268,7 @@ pub fn init_capability_system(
         }
     };
 
-    let mut layout = populate_cspace(&mut cspace, mmap, platform_resources);
+    let mut layout = populate_cspace(&mut cspace, mmap, mmio_apertures, info);
 
     // Mint Frame caps for boot modules (raw ELF images for early services).
     // Each module gets a read-only Frame cap so init can map and parse the ELF.
@@ -277,19 +294,36 @@ pub fn init_capability_system(
 
 /// Core `CSpace` population logic, separated for testability.
 ///
-/// Creates one capability per usable memory region, per platform resource,
-/// and one `SchedControl` capability. Returns a [`CSpaceLayout`] describing
-/// the slot ranges and per-cap descriptors.
+/// Creates one capability per usable memory region, one `MmioRegion`
+/// capability per MMIO aperture, and one `SchedControl` capability (plus
+/// the arch-specific root `IoPortRange` on x86-64 and `SbiControl` on
+/// RISC-V). Returns a [`CSpaceLayout`] describing the slot ranges and
+/// per-cap descriptors.
 // too_many_lines: one logical pass over all boot-time resource types; splitting
 // would require threading shared state (cspace) through multiple helper functions.
 #[allow(clippy::too_many_lines)]
 fn populate_cspace(
     cspace: &mut CSpace,
-    #[cfg_attr(not(test), allow(unused))] mmap: &[MemoryMapEntry],
-    platform_resources: &[PlatformResource],
+    mmap: &[MemoryMapEntry],
+    mmio_apertures: &[MmioAperture],
+    info: &BootInfo,
 ) -> CSpaceLayout
 {
     use init_protocol::CapType;
+
+    /// Width of the root `Interrupt` range cap minted at Phase 7.
+    /// x86-64 IOAPICs cover GSI 0..256; RISC-V PLIC spec max is 1024
+    /// sources. Sized at the per-arch spec max — arch helpers reject
+    /// out-of-range ids, so oversizing is safe.
+    #[cfg(target_arch = "x86_64")]
+    const ROOT_IRQ_COUNT: u32 = 256;
+    #[cfg(target_arch = "riscv64")]
+    const ROOT_IRQ_COUNT: u32 = 1024;
+
+    /// Maximum number of `AcpiReclaimable` regions to mint caps for.
+    /// Real firmware reports 1–2; the cap guards against pathological
+    /// memory maps exhausting the `CSpace`.
+    const MAX_ACPI_REGIONS: usize = 8;
 
     let mut descriptors = alloc::vec::Vec::new();
 
@@ -406,153 +440,81 @@ fn populate_cspace(
         memory_frame_count += 1;
     }
 
-    // Platform resources → type-specific capabilities.
+    // MMIO apertures → one MmioRegion cap each, MAP | WRITE. Init is root
+    // authority and holds these coarse caps until userspace narrows them
+    // (via `mmio_split`) and delegates device-sized sub-caps to drivers.
+    //
+    // On RISC-V the kernel's UART MMIO range is advertised via
+    // `BootInfo.kernel_mmio.uart_base` rather than the coarse aperture
+    // list (the ns16550 UART sits outside both the PLIC aperture and the
+    // PCIe apertures on every supported platform). Synthesise an extra
+    // MmioRegion cap here so userspace init has a cap for it — init's
+    // serial scan looks for any aperture containing the resolved UART base.
     let mut hw_cap_base: u32 = 0;
     let mut hw_cap_count: u32 = 0;
-    for res in platform_resources
+
+    #[cfg(target_arch = "riscv64")]
     {
-        match res.resource_type
+        let uart_base = crate::arch::current::platform::uart_base();
+        let uart_size = crate::arch::current::platform::uart_size();
+        let obj = Box::new(MmioRegionObject {
+            header: KernelObjectHeader::new(ObjectType::MmioRegion),
+            base: uart_base,
+            size: uart_size,
+            flags: 0,
+            _pad: 0,
+        });
+        let ptr = nonnull_from_box(obj);
+        let slot = insert_or_fatal(
+            cspace,
+            CapTag::MmioRegion,
+            Rights::MAP | Rights::WRITE,
+            ptr,
+            "Phase 7: cannot allocate MmioRegion capability for console UART",
+        );
+        if hw_cap_count == 0
         {
-            // MMIO regions: MAP | WRITE (init is root authority; it delegates
-            // narrower rights to child services).
-            ResourceType::MmioRange | ResourceType::PciEcam | ResourceType::IommuUnit =>
-            {
-                let obj = Box::new(MmioRegionObject {
-                    header: KernelObjectHeader::new(ObjectType::MmioRegion),
-                    base: res.base,
-                    size: res.size,
-                    flags: res.flags,
-                    _pad: 0,
-                });
-                let ptr = nonnull_from_box(obj);
-                let slot = insert_or_fatal(
-                    cspace,
-                    CapTag::MmioRegion,
-                    Rights::MAP | Rights::WRITE,
-                    ptr,
-                    "Phase 7: cannot allocate MmioRegion capability",
-                );
-                if hw_cap_count == 0
-                {
-                    hw_cap_base = slot;
-                }
-                let desc_cap_type = if res.resource_type == ResourceType::PciEcam
-                {
-                    CapType::PciEcam
-                }
-                else
-                {
-                    CapType::MmioRegion
-                };
-                descriptors.push(CapDescriptor {
-                    slot,
-                    cap_type: desc_cap_type,
-                    pad: [0; 3],
-                    aux0: res.base,
-                    aux1: res.size,
-                });
-                hw_cap_count += 1;
-            }
-
-            // Firmware tables: Frame cap with MAP only (read-only, no WRITE/EXECUTE).
-            // Size is rounded up to cover whole pages so mem_map can map them.
-            // The intra-page offset of base is preserved; userspace accounts for it.
-            ResourceType::PlatformTable =>
-            {
-                let page_offset = res.base & 0xFFF;
-                let rounded_size = (page_offset + res.size + 0xFFF) & !0xFFF;
-                let obj = Box::new(FrameObject {
-                    header: KernelObjectHeader::new(ObjectType::Frame),
-                    base: res.base,
-                    size: rounded_size,
-                    // Firmware table: physical memory is not part of the
-                    // buddy pool; never return it.
-                    owns_memory: core::sync::atomic::AtomicBool::new(false),
-                });
-                let ptr = nonnull_from_box(obj);
-                let slot = insert_or_fatal(
-                    cspace,
-                    CapTag::Frame,
-                    Rights::MAP,
-                    ptr,
-                    "Phase 7: cannot allocate Frame capability for firmware table",
-                );
-                if hw_cap_count == 0
-                {
-                    hw_cap_base = slot;
-                }
-                descriptors.push(CapDescriptor {
-                    slot,
-                    cap_type: CapType::Frame,
-                    pad: [0; 3],
-                    aux0: res.base,
-                    aux1: res.size,
-                });
-                hw_cap_count += 1;
-            }
-
-            // Interrupt lines: Interrupt cap with SIGNAL right so drivers can
-            // call SYS_IRQ_REGISTER and SYS_IRQ_ACK.
-            ResourceType::IrqLine =>
-            {
-                let obj = Box::new(InterruptObject {
-                    header: KernelObjectHeader::new(ObjectType::Interrupt),
-                    irq_id: res.id as u32,
-                    flags: res.flags,
-                });
-                let ptr = nonnull_from_box(obj);
-                let slot = insert_or_fatal(
-                    cspace,
-                    CapTag::Interrupt,
-                    Rights::SIGNAL,
-                    ptr,
-                    "Phase 7: cannot allocate Interrupt capability",
-                );
-                if hw_cap_count == 0
-                {
-                    hw_cap_base = slot;
-                }
-                descriptors.push(CapDescriptor {
-                    slot,
-                    cap_type: CapType::Interrupt,
-                    pad: [0; 3],
-                    aux0: u64::from(res.id as u32),
-                    aux1: u64::from(res.flags),
-                });
-                hw_cap_count += 1;
-            }
-
-            // I/O port ranges (x86-64 only — validated/filtered in Phase 6).
-            ResourceType::IoPortRange =>
-            {
-                let obj = Box::new(IoPortRangeObject {
-                    header: KernelObjectHeader::new(ObjectType::IoPortRange),
-                    base: res.base as u16,
-                    size: res.size as u16,
-                    _pad: 0,
-                });
-                let ptr = nonnull_from_box(obj);
-                let slot = insert_or_fatal(
-                    cspace,
-                    CapTag::IoPortRange,
-                    Rights::USE,
-                    ptr,
-                    "Phase 7: cannot allocate IoPortRange capability",
-                );
-                if hw_cap_count == 0
-                {
-                    hw_cap_base = slot;
-                }
-                descriptors.push(CapDescriptor {
-                    slot,
-                    cap_type: CapType::IoPortRange,
-                    pad: [0; 3],
-                    aux0: res.base,
-                    aux1: res.size,
-                });
-                hw_cap_count += 1;
-            }
+            hw_cap_base = slot;
         }
+        hw_cap_count += 1;
+        descriptors.push(CapDescriptor {
+            slot,
+            cap_type: CapType::MmioRegion,
+            pad: [0; 3],
+            aux0: uart_base,
+            aux1: uart_size,
+        });
+    }
+
+    for ap in mmio_apertures
+    {
+        let obj = Box::new(MmioRegionObject {
+            header: KernelObjectHeader::new(ObjectType::MmioRegion),
+            base: ap.phys_base,
+            size: ap.size,
+            flags: 0,
+            _pad: 0,
+        });
+        let ptr = nonnull_from_box(obj);
+        let slot = insert_or_fatal(
+            cspace,
+            CapTag::MmioRegion,
+            Rights::MAP | Rights::WRITE,
+            ptr,
+            "Phase 7: cannot allocate MmioRegion capability for aperture",
+        );
+        if hw_cap_count == 0
+        {
+            hw_cap_base = slot;
+        }
+        descriptors.push(CapDescriptor {
+            slot,
+            cap_type: CapType::MmioRegion,
+            pad: [0; 3],
+            aux0: ap.phys_base,
+            aux1: ap.size,
+        });
+        hw_cap_count += 1;
     }
 
     // One SchedControl capability — grants elevated scheduling authority.
@@ -575,9 +537,172 @@ fn populate_cspace(
         aux1: 0,
     });
 
+    // Root Interrupt range capability — covers every valid IRQ source on
+    // this arch. Userspace narrows it to single-IRQ children via
+    // `SYS_IRQ_SPLIT` and delegates one per device.
+    //
+    // x86-64: 256 GSI lines covers every IOAPIC pin in the currently
+    // targeted systems. RISC-V: 1024 PLIC sources is the spec maximum;
+    // most platforms expose far fewer (e.g. 128). Sizing the root at the
+    // spec max is safe because `plic_enable` rejects out-of-range ids.
+    let irq_obj = Box::new(InterruptObject {
+        header: KernelObjectHeader::new(ObjectType::Interrupt),
+        start: 0,
+        count: ROOT_IRQ_COUNT,
+    });
+    let irq_ptr = nonnull_from_box(irq_obj);
+    let irq_range_slot = insert_or_fatal(
+        cspace,
+        CapTag::Interrupt,
+        Rights::SIGNAL,
+        irq_ptr,
+        "Phase 7: cannot allocate root Interrupt range capability",
+    );
+    descriptors.push(CapDescriptor {
+        slot: irq_range_slot,
+        cap_type: CapType::Interrupt,
+        pad: [0; 3],
+        aux0: 0,
+        aux1: u64::from(ROOT_IRQ_COUNT),
+    });
+
+    // Read-only Frame caps covering each AcpiReclaimable region. userspace
+    // parses XSDT / MADT / MCFG through these. Capped by `MAX_ACPI_REGIONS`
+    // so a pathological firmware cannot exhaust the CSpace here.
+    let mut acpi_region_frame_base: u32 = 0;
+    let mut acpi_region_frame_count: u32 = 0;
+    for entry in mmap
+    {
+        if entry.memory_type != MemoryType::AcpiReclaimable
+        {
+            continue;
+        }
+        if (acpi_region_frame_count as usize) >= MAX_ACPI_REGIONS
+        {
+            #[cfg(not(test))]
+            crate::kprintln!(
+                "Phase 7: AcpiReclaimable region count exceeds {}; truncating",
+                MAX_ACPI_REGIONS
+            );
+            break;
+        }
+        let size = (entry.size + 0xFFF) & !0xFFF;
+        if size == 0
+        {
+            continue;
+        }
+        let obj = Box::new(FrameObject {
+            header: KernelObjectHeader::new(ObjectType::Frame),
+            base: entry.physical_base,
+            size,
+            // Firmware-reserved memory; not buddy-backed.
+            owns_memory: core::sync::atomic::AtomicBool::new(false),
+        });
+        let ptr = nonnull_from_box(obj);
+        let slot = insert_or_fatal(
+            cspace,
+            CapTag::Frame,
+            Rights::MAP | Rights::READ,
+            ptr,
+            "Phase 7: cannot allocate Frame capability for ACPI region",
+        );
+        if acpi_region_frame_count == 0
+        {
+            acpi_region_frame_base = slot;
+        }
+        descriptors.push(CapDescriptor {
+            slot,
+            cap_type: CapType::Frame,
+            pad: [0; 3],
+            aux0: entry.physical_base,
+            aux1: size,
+        });
+        acpi_region_frame_count += 1;
+    }
+
+    // RO Frame cap over the single 4 KiB page containing the ACPI RSDP.
+    // RSDP commonly sits in firmware-reserved memory outside
+    // `AcpiReclaimable`, so it gets its own cap regardless of the region scan.
+    //
+    // The cap's backing Frame covers the page (aligned base, 4 KiB size),
+    // but the descriptor's `aux0` carries the exact RSDP physical address
+    // so userspace knows where inside the page to start reading.
+    let acpi_rsdp_frame_slot: u32 = if info.acpi_rsdp != 0
+    {
+        let page_base = info.acpi_rsdp & !0xFFF;
+        let obj = Box::new(FrameObject {
+            header: KernelObjectHeader::new(ObjectType::Frame),
+            base: page_base,
+            size: 0x1000,
+            owns_memory: core::sync::atomic::AtomicBool::new(false),
+        });
+        let ptr = nonnull_from_box(obj);
+        let slot = insert_or_fatal(
+            cspace,
+            CapTag::Frame,
+            Rights::MAP | Rights::READ,
+            ptr,
+            "Phase 7: cannot allocate Frame capability for ACPI RSDP page",
+        );
+        descriptors.push(CapDescriptor {
+            slot,
+            cap_type: CapType::Frame,
+            pad: [0; 3],
+            aux0: info.acpi_rsdp,
+            aux1: 0x1000,
+        });
+        slot
+    }
+    else
+    {
+        0
+    };
+
+    // RO Frame cap covering the DTB blob. The kernel read the totalsize
+    // header in `mm::init::collect_exclusions` to keep these pages out of
+    // the buddy pool; repeat the read here to size the cap.
+    let dtb_frame_slot: u32 = if info.device_tree != 0
+    {
+        let dtb_size = read_dtb_totalsize(info.device_tree).unwrap_or(0);
+        if dtb_size != 0
+        {
+            let rounded = (dtb_size + 0xFFF) & !0xFFF;
+            let obj = Box::new(FrameObject {
+                header: KernelObjectHeader::new(ObjectType::Frame),
+                base: info.device_tree & !0xFFF,
+                size: rounded,
+                owns_memory: core::sync::atomic::AtomicBool::new(false),
+            });
+            let ptr = nonnull_from_box(obj);
+            let slot = insert_or_fatal(
+                cspace,
+                CapTag::Frame,
+                Rights::MAP | Rights::READ,
+                ptr,
+                "Phase 7: cannot allocate Frame capability for DTB blob",
+            );
+            descriptors.push(CapDescriptor {
+                slot,
+                cap_type: CapType::Frame,
+                pad: [0; 3],
+                aux0: info.device_tree & !0xFFF,
+                aux1: rounded,
+            });
+            slot
+        }
+        else
+        {
+            0
+        }
+    }
+    else
+    {
+        0
+    };
+
     // x86-64: root IoPortRange covering the full 64K I/O port space.
-    // This is a static architectural fact — not from bootloader PlatformResources.
-    // Init subdivides and delegates sub-ranges to services as needed.
+    // This is a static architectural fact, not derived from any bootloader
+    // field. Init subdivides and delegates sub-ranges to services as needed.
     #[cfg(target_arch = "x86_64")]
     {
         let obj = Box::new(IoPortRangeObject {
@@ -638,9 +763,44 @@ fn populate_cspace(
         module_frame_count: 0,
         sched_control_slot,
         sbi_control_slot,
+        irq_range_slot,
+        acpi_rsdp_frame_slot,
+        acpi_region_frame_base,
+        acpi_region_frame_count,
+        dtb_frame_slot,
         total_populated: cspace.populated_count(),
         descriptors,
     }
+}
+
+/// Read the `totalsize` field of a flattened device tree blob.
+///
+/// Mirror of `crate::mm::init::read_dtb_totalsize`, duplicated here because
+/// the buddy-init and cap-mint phases both need to bound DTB page accesses
+/// without creating a public dep between the two modules.
+fn read_dtb_totalsize(phys: u64) -> Option<u64>
+{
+    const FDT_MAGIC: u32 = 0xd00d_feed;
+    const DTB_MAX_SIZE: u64 = 64 * 1024;
+
+    // `phys` is in the direct physical map (active since Phase 3). The
+    // FDT spec places magic + totalsize in the first 8 bytes of the blob.
+    let base = phys_to_virt(phys) as *const u8;
+    // SAFETY: direct physical map; first 4 bytes are the FDT magic field.
+    let magic_bytes = unsafe { core::ptr::read_volatile(base.cast::<[u8; 4]>()) };
+    let magic = u32::from_be_bytes(magic_bytes);
+    if magic != FDT_MAGIC
+    {
+        return None;
+    }
+    // SAFETY: direct physical map; bytes 4..8 are the totalsize field.
+    let size_bytes = unsafe { core::ptr::read_volatile(base.add(4).cast::<[u8; 4]>()) };
+    let size = u64::from(u32::from_be_bytes(size_bytes));
+    if size == 0 || size > DTB_MAX_SIZE
+    {
+        return None;
+    }
+    Some(size)
 }
 
 /// Mint `Frame` capabilities for boot modules into the root `CSpace`.

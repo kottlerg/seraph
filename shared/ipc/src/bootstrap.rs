@@ -24,7 +24,7 @@
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
-use crate::{IpcBuf, bootstrap_errors};
+use crate::{IpcMessage, bootstrap_errors};
 use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 // ── Protocol labels ─────────────────────────────────────────────────────────
@@ -41,6 +41,9 @@ pub const DONE: u64 = 1;
 // ── Round data ──────────────────────────────────────────────────────────────
 
 /// One round's worth of data delivered to a child.
+///
+/// Owns its payload: `data[..data_words]` is a stack-owned snapshot of the
+/// data words delivered in this round. Subsequent IPC cannot clobber it.
 pub struct BootstrapRound
 {
     /// Child-CSpace slot indices of received caps. Only the first
@@ -48,7 +51,10 @@ pub struct BootstrapRound
     pub caps: [u32; MSG_CAP_SLOTS_MAX],
     /// Number of valid cap indices in `caps`.
     pub cap_count: usize,
-    /// Number of valid data words in the IPC buffer at offsets `0..data_words`.
+    /// Owned data words delivered with this round. Only the first
+    /// `data_words` entries are valid.
+    pub data: [u64; MSG_DATA_WORDS_MAX],
+    /// Number of valid data words in `data`.
     pub data_words: usize,
     /// `true` when this is the final round.
     pub done: bool,
@@ -89,37 +95,45 @@ pub const fn unpack_data_words(label: u64) -> usize
 
 /// Request the next bootstrap round from the creator.
 ///
-/// Blocks until the creator replies. On a `MORE`/`DONE` reply, returns the
-/// round's caps and data-word count. On an error reply, returns the base
-/// error label from [`bootstrap_errors`].
+/// Blocks until the creator replies. On a `MORE`/`DONE` reply, returns a
+/// [`BootstrapRound`] whose `caps` and `data` fields are stack-owned copies
+/// of the received payload — the per-thread IPC buffer is scratch after
+/// return and nested IPC cannot clobber the round.
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
 ///
 /// # Errors
-///
 /// * `Err(code)` where `code` is [`bootstrap_errors::NO_CHILD`],
 ///   [`bootstrap_errors::EXHAUSTED`], or [`bootstrap_errors::INVALID`].
-/// * `Err(bootstrap_errors::INVALID)` if the underlying `ipc_call` fails.
-pub fn request_round(creator_ep: u32, ipc: IpcBuf) -> Result<BootstrapRound, u64>
+/// * `Err(bootstrap_errors::INVALID)` if the underlying IPC fails.
+pub unsafe fn request_round(creator_ep: u32, ipc_buf: *mut u64) -> Result<BootstrapRound, u64>
 {
-    let (reply_label, _) =
-        syscall::ipc_call(creator_ep, REQUEST, 0, &[]).map_err(|_| bootstrap_errors::INVALID)?;
+    let request = IpcMessage::new(REQUEST);
+    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { crate::ipc_call(creator_ep, &request, ipc_buf) }
+        .map_err(|_| bootstrap_errors::INVALID)?;
 
-    // SAFETY: `ipc` wraps the registered IPC buffer; kernel just wrote cap
-    // transfer metadata there.
-    let (cap_count, caps) = unsafe { syscall::read_recv_caps(ipc.as_ptr()) };
-
-    let base = unpack_base(reply_label);
+    let base = unpack_base(reply.label);
     match base
     {
         MORE | DONE =>
         {
-            let declared_cap_count = unpack_cap_count(reply_label);
-            let data_words = unpack_data_words(reply_label);
-            debug_assert_eq!(cap_count, declared_cap_count);
+            let reply_caps = reply.caps();
+            let declared_cap_count = unpack_cap_count(reply.label);
+            let data_words = unpack_data_words(reply.label);
+            debug_assert_eq!(reply_caps.len(), declared_cap_count);
             debug_assert!(data_words <= MSG_DATA_WORDS_MAX);
+            let mut caps = [0u32; MSG_CAP_SLOTS_MAX];
+            caps[..reply_caps.len()].copy_from_slice(reply_caps);
+            let mut data = [0u64; MSG_DATA_WORDS_MAX];
+            let words = reply.words();
+            data[..words.len()].copy_from_slice(words);
             Ok(BootstrapRound {
                 caps,
-                cap_count,
-                data_words: data_words.min(MSG_DATA_WORDS_MAX),
+                cap_count: reply_caps.len(),
+                data,
+                data_words: data_words.min(words.len()),
                 done: base == DONE,
             })
         }
@@ -131,67 +145,90 @@ pub fn request_round(creator_ep: u32, ipc: IpcBuf) -> Result<BootstrapRound, u64
 
 /// Reply to a pending `BOOTSTRAP_REQUEST` with the next round.
 ///
-/// # Errors
+/// # Safety
+/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
 ///
-/// Returns a negative kernel error code from the underlying `ipc_reply`.
-pub fn reply_round(done: bool, cap_slots: &[u32], data_words: usize) -> Result<(), i64>
+/// # Errors
+/// Returns a negative kernel error code from the underlying IPC.
+pub unsafe fn reply_round(
+    done: bool,
+    cap_slots: &[u32],
+    data: &[u64],
+    ipc_buf: *mut u64,
+) -> Result<(), i64>
 {
     let cap_count = cap_slots.len().min(MSG_CAP_SLOTS_MAX);
-    let label = pack_reply_label(done, cap_count, data_words);
-    syscall::ipc_reply(label, data_words, cap_slots)
+    let label = pack_reply_label(done, cap_count, data.len());
+    let mut builder = IpcMessage::builder(label);
+    if !data.is_empty()
+    {
+        builder = builder.words(0, data);
+    }
+    for &slot in cap_slots.iter().take(cap_count)
+    {
+        builder = builder.cap(slot);
+    }
+    let msg = builder.build();
+    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe { crate::ipc_reply(&msg, ipc_buf) }
 }
 
 /// Reply to a pending `BOOTSTRAP_REQUEST` with an error code.
 ///
-/// # Errors
+/// # Safety
+/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
 ///
-/// Returns a negative kernel error code from the underlying `ipc_reply`.
-pub fn reply_error(code: u64) -> Result<(), i64>
+/// # Errors
+/// Returns a negative kernel error code from the underlying IPC.
+pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
 {
-    syscall::ipc_reply(code, 0, &[])
+    let msg = IpcMessage::new(code);
+    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe { crate::ipc_reply(&msg, ipc_buf) }
 }
 
-/// Receive one bootstrap request, verify the sender's token, pack data words,
-/// and reply with the given round.
+/// Receive one bootstrap request, verify the sender's token, and reply
+/// with the given round.
 ///
 /// Blocks until a `BOOTSTRAP_REQUEST` arrives on `bootstrap_ep`. If the token
 /// embedded in the received cap does not match `expected_token`, replies with
 /// [`bootstrap_errors::NO_CHILD`] and returns `Err`. If the label is not
 /// [`REQUEST`], replies with [`bootstrap_errors::INVALID`] and returns `Err`.
-/// Otherwise, writes `data` to the IPC buffer and replies with the round
-/// (caps + data words + done flag).
+/// Otherwise, replies with the round (caps + data + done flag).
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
 ///
 /// # Errors
-///
 /// * `Err(bootstrap_errors::NO_CHILD)` — unexpected token.
 /// * `Err(bootstrap_errors::INVALID)` — protocol error.
-pub fn serve_round(
+pub unsafe fn serve_round(
     bootstrap_ep: u32,
     expected_token: u64,
-    ipc: IpcBuf,
+    ipc_buf: *mut u64,
     done: bool,
     caps: &[u32],
     data: &[u64],
 ) -> Result<(), u64>
 {
-    let (label, token) = syscall::ipc_recv(bootstrap_ep).map_err(|_| bootstrap_errors::INVALID)?;
+    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+    let request =
+        unsafe { crate::ipc_recv(bootstrap_ep, ipc_buf) }.map_err(|_| bootstrap_errors::INVALID)?;
 
-    if token != expected_token
+    if request.token != expected_token
     {
-        let _ = reply_error(bootstrap_errors::NO_CHILD);
+        // SAFETY: same invariant.
+        let _ = unsafe { reply_error(bootstrap_errors::NO_CHILD, ipc_buf) };
         return Err(bootstrap_errors::NO_CHILD);
     }
 
-    if (label & 0xFFFF) != REQUEST
+    if (request.label & 0xFFFF) != REQUEST
     {
-        let _ = reply_error(bootstrap_errors::INVALID);
+        // SAFETY: same invariant.
+        let _ = unsafe { reply_error(bootstrap_errors::INVALID, ipc_buf) };
         return Err(bootstrap_errors::INVALID);
     }
 
-    if !data.is_empty()
-    {
-        ipc.write_words(0, data);
-    }
-
-    reply_round(done, caps, data.len()).map_err(|_| bootstrap_errors::INVALID)
+    // SAFETY: same invariant.
+    unsafe { reply_round(done, caps, data, ipc_buf) }.map_err(|_| bootstrap_errors::INVALID)
 }

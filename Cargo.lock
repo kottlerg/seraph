@@ -90,6 +90,7 @@ name = "boot"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
+ "elf",
  "font",
 ]
 
@@ -428,6 +429,7 @@ version = "0.1.0"
 dependencies = [
  "font",
  "init-protocol",
+ "ipc",
  "syscall",
  "syscall-abi",
 ]

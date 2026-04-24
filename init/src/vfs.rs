@@ -117,38 +117,25 @@ fn parse_uuid_to_gpt_bytes(s: &[u8], out: &mut [u8; 16]) -> bool
 /// `data[3..]` = path.
 pub fn send_mount(vfsd_ep: u32, ipc_buf: *mut u64, uuid: &[u8; 16], path: &[u8]) -> bool
 {
-    // SAFETY: ipc_buf is the caller's registered IPC buffer page.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
     // Pack UUID into data[0..2].
     let w0 = u64::from_le_bytes(uuid[..8].try_into().unwrap_or([0; 8]));
     let w1 = u64::from_le_bytes(uuid[8..].try_into().unwrap_or([0; 8]));
-    ipc.write_word(0, w0);
-    ipc.write_word(1, w1);
-    ipc.write_word(2, path.len() as u64);
 
-    // Pack path bytes into data[3..].
-    let word_count = path.len().div_ceil(8).min(8);
-    for i in 0..word_count
-    {
-        let mut word: u64 = 0;
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < path.len()
-            {
-                word |= u64::from(path[base + j]) << (j * 8);
-            }
-        }
-        ipc.write_word(3 + i, word);
-    }
+    let path_bytes = path.len().min(8 * 8);
+    let msg = ipc::IpcMessage::builder(vfsd_labels::MOUNT)
+        .word(0, w0)
+        .word(1, w1)
+        .word(2, path.len() as u64)
+        .bytes(3, &path[..path_bytes])
+        .build();
 
-    let total_words = 3 + word_count;
-    let Ok((reply_label, _)) = syscall::ipc_call(vfsd_ep, vfsd_labels::MOUNT, total_words, &[])
+    // SAFETY: ipc_buf is the caller's registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(vfsd_ep, &msg, ipc_buf) })
     else
     {
         return false;
     };
-    reply_label == 0
+    reply.label == 0
 }
 
 /// Read a file from the VFS into a buffer. Returns bytes read (0 on error).
@@ -165,61 +152,50 @@ pub fn send_mount(vfsd_ep: u32, ipc_buf: *mut u64, uuid: &[u8; 16], path: &[u8])
 #[allow(clippy::too_many_lines)]
 pub fn vfs_read_file(vfsd_ep: u32, ipc_buf: *mut u64, path: &[u8], buf: &mut [u8; 512]) -> usize
 {
-    // SAFETY: ipc_buf is the caller's registered IPC buffer page.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
     // OPEN — send to vfsd for mount resolution.
-    let word_count = path.len().div_ceil(8).min(6);
-    for i in 0..word_count
-    {
-        let mut word: u64 = 0;
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < path.len()
-            {
-                word |= u64::from(path[base + j]) << (j * 8);
-            }
-        }
-        ipc.write_word(i, word);
-    }
-
+    let path_bytes = path.len().min(6 * 8);
     let open_label = vfsd_labels::OPEN | ((path.len() as u64) << 16);
-    let Ok((reply_label, _)) = syscall::ipc_call(vfsd_ep, open_label, word_count, &[])
+    let open_msg = ipc::IpcMessage::builder(open_label)
+        .bytes(0, &path[..path_bytes])
+        .build();
+
+    // SAFETY: ipc_buf is the caller's registered IPC buffer page.
+    let Ok(open_reply) = (unsafe { ipc::ipc_call(vfsd_ep, &open_msg, ipc_buf) })
     else
     {
         log("init: vfs_read: OPEN failed");
         return 0;
     };
-    if reply_label != 0
+    if open_reply.label != 0
     {
         log("init: vfs_read: OPEN error (not found?)");
         return 0;
     }
 
-    // Read the per-file capability from the reply.
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    #[allow(clippy::cast_ptr_alignment)]
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
-    if cap_count == 0
+    let caps = open_reply.caps();
+    if caps.is_empty()
     {
         log("init: vfs_read: OPEN returned no file cap");
         return 0;
     }
-    let file_cap = reply_caps[0];
+    let file_cap = caps[0];
 
     // READ — call directly on the file cap (not vfsd).
     // New protocol: data[0] = offset, data[1] = max_len (no FD field).
-    ipc.write_word(0, 0u64);
-    ipc.write_word(1, 512u64);
+    let read_msg = ipc::IpcMessage::builder(fs_labels::FS_READ)
+        .word(0, 0u64)
+        .word(1, 512u64)
+        .build();
 
-    let Ok((reply_label, _)) = syscall::ipc_call(file_cap, fs_labels::FS_READ, 2, &[])
+    // SAFETY: ipc_buf is the caller's registered IPC buffer page.
+    let Ok(read_reply) = (unsafe { ipc::ipc_call(file_cap, &read_msg, ipc_buf) })
     else
     {
         log("init: vfs_read: READ failed");
         let _ = syscall::cap_delete(file_cap);
         return 0;
     };
-    if reply_label != 0
+    if read_reply.label != 0
     {
         log("init: vfs_read: READ error");
         let _ = syscall::cap_delete(file_cap);
@@ -227,24 +203,22 @@ pub fn vfs_read_file(vfsd_ep: u32, ipc_buf: *mut u64, path: &[u8], buf: &mut [u8
     }
 
     // data[0] = bytes_read, data[1..] = content.
-    // Copy BEFORE any log() calls (IPC buffer shared).
-    let bytes_read = ipc.read_word(0) as usize;
-    let content_words = bytes_read.div_ceil(8);
-    for i in 0..content_words
+    let bytes_read = read_reply.word(0) as usize;
+    let content_bytes = read_reply.data_bytes();
+    // Content begins at byte 8 (second word onward).
+    let src_start = 8usize;
+    let copy_len = bytes_read
+        .min(buf.len())
+        .min(content_bytes.len().saturating_sub(src_start));
+    if copy_len > 0
     {
-        let word = ipc.read_word(1 + i);
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < bytes_read && base + j < buf.len()
-            {
-                buf[base + j] = ((word >> (j * 8)) & 0xFF) as u8;
-            }
-        }
+        buf[..copy_len].copy_from_slice(&content_bytes[src_start..src_start + copy_len]);
     }
 
     // CLOSE — call directly on the file cap.
-    let _ = syscall::ipc_call(file_cap, fs_labels::FS_CLOSE, 0, &[]);
+    let close_msg = ipc::IpcMessage::new(fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the caller's registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(file_cap, &close_msg, ipc_buf) };
     let _ = syscall::cap_delete(file_cap);
 
     bytes_read

@@ -153,6 +153,8 @@ pub const SYS_THREAD_SLEEP: u64 = 46;
 pub const SYS_THREAD_BIND_NOTIFICATION: u64 = 47;
 /// Capability: derive with an attached token value.
 pub const SYS_CAP_DERIVE_TOKEN: u64 = 48;
+/// Split an `Interrupt` range cap into two non-overlapping children.
+pub const SYS_IRQ_SPLIT: u64 = 49;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 

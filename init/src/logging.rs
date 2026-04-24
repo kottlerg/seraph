@@ -122,35 +122,17 @@ fn ipc_log(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
     {
         return;
     }
-    // SAFETY: ipc_buf was registered by the caller (init main thread).
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
 
     let mut offset = 0;
     while offset < bytes.len()
     {
         let chunk_len = (bytes.len() - offset).min(STREAM_CHUNK_SIZE);
         let label = STREAM_BYTES | ((chunk_len as u64 & 0xFFFF) << 16);
-        let word_count = chunk_len.div_ceil(8);
-
-        for i in 0..syscall_abi::MSG_DATA_WORDS_MAX
-        {
-            let mut word: u64 = 0;
-            if i < word_count
-            {
-                let base = offset + i * 8;
-                for j in 0..8
-                {
-                    let idx = base + j;
-                    if idx < offset + chunk_len
-                    {
-                        word |= u64::from(bytes[idx]) << (j * 8);
-                    }
-                }
-            }
-            ipc.write_word(i, word);
-        }
-
-        let _ = syscall::ipc_call(cap, label, word_count, &[]);
+        let msg = ipc::IpcMessage::builder(label)
+            .bytes(0, &bytes[offset..offset + chunk_len])
+            .build();
+        // SAFETY: ipc_buf was registered by the caller (init main thread).
+        let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
         offset += chunk_len;
     }
 }
@@ -316,29 +298,29 @@ impl SenderSlot
 /// per-message kernel-delivered token).
 fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
 {
-    // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf_raw) };
     let mut slots: [SenderSlot; MAX_SENDERS] = [SenderSlot::empty(); MAX_SENDERS];
     // Round-robin pointer used to evict when all slots are in use.
     let mut next_evict: usize = 0;
 
     loop
     {
-        let Ok((label, token)) = syscall::ipc_recv(log_ep)
+        // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+        let Ok(recv) = (unsafe { ipc::ipc_recv(log_ep, ipc_buf_raw) })
         else
         {
             continue;
         };
 
-        let label_id = label & 0xFFFF;
+        let label_id = recv.label & 0xFFFF;
         if label_id == STREAM_BYTES
         {
-            let byte_len = ((label >> 16) & 0xFFFF) as usize;
-            consume_bytes(&mut slots, &mut next_evict, ipc, token, byte_len);
+            let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;
+            consume_bytes(&mut slots, &mut next_evict, &recv, recv.token, byte_len);
         }
 
         // Reply to unblock the sender (call/reply protocol; payload empty).
-        let _ = syscall::ipc_reply(0, 0, &[]);
+        // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
     }
 }
 
@@ -347,28 +329,17 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
 fn consume_bytes(
     slots: &mut [SenderSlot; MAX_SENDERS],
     next_evict: &mut usize,
-    ipc: ipc::IpcBuf,
+    msg: &ipc::IpcMessage,
     token: u64,
     byte_len: usize,
 )
 {
     let len = byte_len.min(STREAM_CHUNK_SIZE);
-    let word_count = len.div_ceil(8);
-    // Stack temporary so we can iterate after extracting from IPC words.
+    let bytes = msg.data_bytes();
+    let copy_len = len.min(bytes.len());
     let mut tmp = [0u8; STREAM_CHUNK_SIZE];
-    for i in 0..word_count
-    {
-        let word = ipc.read_word(i);
-        let base = i * 8;
-        for j in 0..8
-        {
-            let idx = base + j;
-            if idx < len
-            {
-                tmp[idx] = ((word >> (j * 8)) & 0xFF) as u8;
-            }
-        }
-    }
+    tmp[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    let len = copy_len;
 
     let slot_idx = find_or_alloc_slot(slots, next_evict, token);
     for &b in &tmp[..len]

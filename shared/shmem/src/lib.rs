@@ -111,23 +111,28 @@ impl SharedBuffer
 
         // Ask procmgr for `pages` frames. REQUEST_FRAMES returns up to 4
         // in one round; for our MAX_PAGES=4 cap, one round is sufficient.
-        //
+        let request = ipc::IpcMessage::builder(ipc::procmgr_labels::REQUEST_FRAMES)
+            .word(0, u64::from(pages))
+            .build();
         // SAFETY: ipc_buf is the caller's registered IPC buffer page.
-        let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-        ipc.write_word(0, u64::from(pages));
-        let (reply_label, _) =
-            syscall::ipc_call(procmgr_ep, ipc::procmgr_labels::REQUEST_FRAMES, 1, &[])
-                .map_err(|_| ShmemError::RequestFailed)?;
-        if reply_label != ipc::procmgr_errors::SUCCESS
+        let reply = unsafe { ipc::ipc_call(procmgr_ep, &request, ipc_buf) }
+            .map_err(|_| ShmemError::RequestFailed)?;
+        if reply.label != ipc::procmgr_errors::SUCCESS
         {
             return Err(ShmemError::RequestFailed);
         }
-        let granted = ipc.read_word(0) as u32;
+        let granted = if reply.word_count() >= 1
+        {
+            reply.word(0) as u32
+        }
+        else
+        {
+            0
+        };
+        let caps = reply.caps();
         if granted < pages
         {
             // Partial grant — release what we got, report failure.
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            let (_, caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
             for &c in caps.iter().take(granted as usize)
             {
                 let _ = syscall::cap_delete(c);
@@ -135,8 +140,6 @@ impl SharedBuffer
             return Err(ShmemError::RequestFailed);
         }
 
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let (_, caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
         let mut frames = [0u32; MAX_PAGES as usize];
         for i in 0..pages as usize
         {

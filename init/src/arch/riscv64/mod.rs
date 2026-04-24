@@ -15,9 +15,28 @@ const SERIAL_VA: u64 = 0x0000_0000_3000_0000;
 static mut UART_BASE: u64 = 0;
 
 /// Initialise UART serial output via MMIO.
+///
+/// Scans `MmioRegion` descriptors for the aperture containing `UART_PHYS`,
+/// maps the full aperture at `SERIAL_VA`, and records the UART's virtual
+/// address including its in-aperture offset. v6 apertures are coarse —
+/// the UART is typically one of several devices inside the aperture.
 pub fn serial_init(info: &InitInfo, _thread_cap: u32)
 {
-    let Some(slot) = crate::find_cap(info, CapType::MmioRegion, UART_PHYS)
+    let descriptors = crate::descriptors(info);
+    let mut aperture: Option<(u32, u64, u64)> = None;
+    for d in descriptors
+    {
+        if d.cap_type != CapType::MmioRegion
+        {
+            continue;
+        }
+        if UART_PHYS >= d.aux0 && UART_PHYS < d.aux0 + d.aux1
+        {
+            aperture = Some((d.slot, d.aux0, d.aux1));
+            break;
+        }
+    }
+    let Some((slot, base, _size)) = aperture
     else
     {
         return;
@@ -26,16 +45,18 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u32)
     {
         return;
     }
-    // SAFETY: single-threaded init; UART MMIO programming. SERIAL_VA is
-    // mapped via mmio_map above.
+    let uart_offset = UART_PHYS - base;
+    let uart_va = SERIAL_VA + uart_offset;
+    // SAFETY: single-threaded init; UART MMIO programming. The full
+    // aperture is mapped at SERIAL_VA; UART sits at uart_offset inside it.
     unsafe {
-        UART_BASE = SERIAL_VA;
-        let base = SERIAL_VA as *mut u8;
-        core::ptr::write_volatile(base.add(1), 0x00);
-        core::ptr::write_volatile(base.add(3), 0x80);
-        core::ptr::write_volatile(base, 0x01);
-        core::ptr::write_volatile(base.add(1), 0x00);
-        core::ptr::write_volatile(base.add(3), 0x03);
+        UART_BASE = uart_va;
+        let ptr = uart_va as *mut u8;
+        core::ptr::write_volatile(ptr.add(1), 0x00);
+        core::ptr::write_volatile(ptr.add(3), 0x80);
+        core::ptr::write_volatile(ptr, 0x01);
+        core::ptr::write_volatile(ptr.add(1), 0x00);
+        core::ptr::write_volatile(ptr.add(3), 0x03);
     }
 }
 

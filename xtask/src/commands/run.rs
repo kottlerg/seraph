@@ -16,7 +16,7 @@ use crate::cli::{BuildArgs, BuildComponent, RunArgs};
 use crate::commands::build;
 use crate::context::Context as BuildContext;
 use crate::sysroot;
-use crate::util::{TempFile, TerminalGuard, run_with_sigint_ignored, step};
+use crate::util::{TerminalGuard, run_with_sigint_ignored, step};
 
 /// OVMF firmware search paths (Fedora, Debian/Ubuntu, Arch).
 const OVMF_CODE_PATHS: &[&str] = &[
@@ -133,12 +133,12 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         qemu_args.extend(["-s".into(), "-S".into()]);
     }
 
-    // Architecture-specific setup. The ArchSetup struct holds any TempFiles
-    // that must stay alive until QEMU exits (RISC-V pflash images).
+    // Architecture-specific setup: extends `qemu_args` with arch-specific
+    // devices and firmware paths, returns a short description for logging.
     let setup = match args.arch
     {
         Arch::X86_64 => arch_setup_x86(&mut qemu_args, args)?,
-        Arch::Riscv64 => arch_setup_riscv(&mut qemu_args, args)?,
+        Arch::Riscv64 => arch_setup_riscv(ctx, &mut qemu_args, args)?,
     };
 
     launch_qemu(
@@ -147,9 +147,6 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         &setup.desc,
         args.verbose,
     )?;
-
-    // setup is dropped here, cleaning up any TempFiles.
-    drop(setup);
 
     Ok(())
 }
@@ -160,8 +157,6 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
 struct ArchSetup
 {
     desc: String,
-    /// TempFiles that must outlive the QEMU process (e.g. padded pflash images).
-    _temp_files: Vec<TempFile>,
 }
 
 fn arch_setup_x86(args: &mut Vec<String>, run_args: &RunArgs) -> Result<ArchSetup>
@@ -198,11 +193,14 @@ fn arch_setup_x86(args: &mut Vec<String>, run_args: &RunArgs) -> Result<ArchSetu
 
     Ok(ArchSetup {
         desc: "x86_64, UEFI".into(),
-        _temp_files: Vec::new(),
     })
 }
 
-fn arch_setup_riscv(args: &mut Vec<String>, run_args: &RunArgs) -> Result<ArchSetup>
+fn arch_setup_riscv(
+    ctx: &BuildContext,
+    args: &mut Vec<String>,
+    run_args: &RunArgs,
+) -> Result<ArchSetup>
 {
     let firmware_dir = EDK2_RISCV_DIRS
         .iter()
@@ -218,39 +216,66 @@ fn arch_setup_riscv(args: &mut Vec<String>, run_args: &RunArgs) -> Result<ArchSe
         })?;
 
     let base = std::path::Path::new(firmware_dir);
-    let riscv_code = base.join("RISCV_VIRT_CODE.fd");
-    let riscv_vars_template = base.join("RISCV_VIRT_VARS.fd");
+    let src_code = base.join("RISCV_VIRT_CODE.fd");
+    let src_vars = base.join("RISCV_VIRT_VARS.fd");
 
-    if !riscv_vars_template.exists()
+    if !src_vars.exists()
     {
-        bail!(
-            "RISC-V NVRAM template not found: {}",
-            riscv_vars_template.display()
-        );
+        bail!("RISC-V NVRAM template not found: {}", src_vars.display());
     }
 
-    // QEMU virt (>=9.0) requires pflash images exactly 32 MiB. Some distro
-    // packages ship smaller .fd files. Pad in temp files; originals are unchanged.
-    let code_tmp = TempFile::new(".fd")?;
-    std::fs::copy(&riscv_code, &code_tmp.path).context("copying RISC-V code firmware to temp")?;
-    pad_file_to(&code_tmp.path, PFLASH_SIZE)?;
+    // Pflash images live under target/xtask/firmware/riscv/ rather than /tmp.
+    // QEMU virt (>=9.0) requires exactly 32 MiB per pflash slot; distro edk2
+    // packages ship smaller raw .fd files, so we pad once here.
+    //
+    // CODE is deterministic: cache across runs, regenerate only if the source
+    // is newer or the cached copy is missing/wrong-sized.
+    //
+    // VARS is UEFI NVRAM: overwrite in place every run to preserve the
+    // existing "fresh NVRAM per boot" invariant (matches x86, which runs
+    // without a VARS pflash and therefore uses volatile NVRAM).
+    let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("creating firmware cache {}", cache_dir.display()))?;
 
-    // The VARS pflash must be writable (UEFI stores boot variables there).
-    // Use a fresh temp copy each run for a reproducible UEFI state.
-    let vars_tmp = TempFile::new(".fd")?;
-    std::fs::copy(&riscv_vars_template, &vars_tmp.path)
-        .context("copying RISC-V vars firmware to temp")?;
-    pad_file_to(&vars_tmp.path, PFLASH_SIZE)?;
+    let cached_code = cache_dir.join("RISCV_VIRT_CODE.32M.fd");
+    let cached_vars = cache_dir.join("RISCV_VIRT_VARS.fd");
+
+    if pflash_cache_stale(&cached_code, &src_code, PFLASH_SIZE)?
+    {
+        std::fs::copy(&src_code, &cached_code).with_context(|| {
+            format!(
+                "copying {} to {}",
+                src_code.display(),
+                cached_code.display()
+            )
+        })?;
+        pad_file_to(&cached_code, PFLASH_SIZE)?;
+    }
+
+    std::fs::copy(&src_vars, &cached_vars).with_context(|| {
+        format!(
+            "copying {} to {}",
+            src_vars.display(),
+            cached_vars.display()
+        )
+    })?;
+    pad_file_to(&cached_vars, PFLASH_SIZE)?;
 
     args.extend(["-machine".into(), "virt".into()]);
+    // Explicit multi-threaded TCG: `-smp 4` without this falls back to the
+    // per-arch default, which can be single-threaded round-robin. SMP
+    // correctness under real parallel execution needs genuine
+    // multi-threaded emulation.
+    args.extend(["-accel".into(), "tcg,thread=multi".into()]);
     args.extend([
         "-drive".into(),
         format!(
             "if=pflash,format=raw,readonly=on,file={}",
-            code_tmp.path.display()
+            cached_code.display()
         ),
         "-drive".into(),
-        format!("if=pflash,format=raw,file={}", vars_tmp.path.display()),
+        format!("if=pflash,format=raw,file={}", cached_vars.display()),
     ]);
 
     if !run_args.headless
@@ -277,7 +302,6 @@ fn arch_setup_riscv(args: &mut Vec<String>, run_args: &RunArgs) -> Result<ArchSe
 
     Ok(ArchSetup {
         desc: "riscv64, TCG, UEFI".into(),
-        _temp_files: vec![code_tmp, vars_tmp],
     })
 }
 
@@ -311,6 +335,35 @@ fn preferred_display_backend(qemu_binary: &str) -> Option<String>
     None
 }
 
+/// Returns true if `cached` is missing, wrong-sized, or older than `source`.
+///
+/// Used to decide whether a cached pflash image needs to be regenerated from
+/// its distro-supplied source. Source mtime moves forward when the user
+/// updates their edk2 package, so an mtime comparison is sufficient.
+fn pflash_cache_stale(
+    cached: &std::path::Path,
+    source: &std::path::Path,
+    target_size: u64,
+) -> Result<bool>
+{
+    let cached_md = match std::fs::metadata(cached)
+    {
+        Ok(m) => m,
+        Err(_) => return Ok(true),
+    };
+    if cached_md.len() != target_size
+    {
+        return Ok(true);
+    }
+    let source_md =
+        std::fs::metadata(source).with_context(|| format!("stat {}", source.display()))?;
+    match (source_md.modified(), cached_md.modified())
+    {
+        (Ok(s), Ok(c)) => Ok(s > c),
+        _ => Ok(true),
+    }
+}
+
 /// Extend a file with zero bytes until it reaches `target_size`.
 ///
 /// Does nothing if the file is already at or above `target_size`.
@@ -341,7 +394,7 @@ fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Resu
     {
         step(&format!("Starting QEMU ({})", desc));
         // Ignore SIGINT in our process so Ctrl+C kills QEMU but lets us run
-        // cleanup (TerminalGuard restore, TempFile deletion) before exiting.
+        // cleanup (TerminalGuard restore) before exiting.
         let status = run_with_sigint_ignored(|| {
             Command::new(binary)
                 .args(args)

@@ -44,8 +44,11 @@ Cargo.toml                    # Virtual workspace root (default-members = ["xtas
 
 `abi/boot-protocol` is a `#![no_std]` library containing the `BootInfo` structure
 and associated types. Both the bootloader and kernel depend on it. This crate is the
-single source of truth for the boot protocol ABI; the design is specified in
-[`docs/boot-protocol.md`](boot-protocol.md).
+single source of truth for the boot protocol ABI; the types, layout, and
+version invariants live in the crate itself at
+[`abi/boot-protocol/`](../abi/boot-protocol/), and the kernel-entry
+contract the ABI supports is in
+[`boot/docs/kernel-handoff.md`](../boot/docs/kernel-handoff.md).
 
 `abi/syscall` defines syscall numbers, argument layout, and return codes. It is
 the single source of truth for the syscall ABI; both the kernel and userspace

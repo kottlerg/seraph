@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 boot-protocol = { workspace = true }
+elf = { path = "../shared/elf" }
 font = { workspace = true }
 
 [lints]

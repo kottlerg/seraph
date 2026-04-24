@@ -96,25 +96,22 @@ impl IoLayout
         unsafe { core::ptr::read_volatile(self.status_va() as *const u8) }
     }
 
-    /// Copy the 512-byte sector data into the IPC buffer for reply.
+    /// Copy the 512-byte sector data into a stack-owned 64-word array.
     ///
-    /// Writes 64 words (512 bytes) from the data buffer into `ipc_buf`.
-    ///
-    /// # Safety
-    ///
-    /// `ipc_buf` must point to a valid IPC buffer with at least 64 writable
-    /// words.
-    pub unsafe fn copy_sector_to_ipc(&self, ipc_buf: *mut u64)
+    /// Volatile reads pull from the DMA data buffer; the returned array is
+    /// plain memory suitable for packing into an [`ipc::IpcMessage`].
+    #[must_use]
+    pub fn sector_words(&self) -> [u64; 64]
     {
-        // SAFETY: caller guarantees ipc_buf points at a registered IPC buffer page.
-        let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
+        let mut out = [0u64; 64];
         let buf_va = self.data_buf_va();
-        for i in 0..64u64
+        for (i, slot) in out.iter_mut().enumerate()
         {
-            // SAFETY: buf_va + i*8 is within the mapped data page.
-            let word = unsafe { core::ptr::read_volatile((buf_va + i * 8) as *const u64) };
-            ipc.write_word(i as usize, word);
+            // SAFETY: buf_va + i*8 is within the mapped data page (one page,
+            // 64 * 8 = 512 bytes read starting at offset 512).
+            *slot = unsafe { core::ptr::read_volatile((buf_va + (i as u64) * 8) as *const u64) };
         }
+        out
     }
 }
 

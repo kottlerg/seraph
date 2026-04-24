@@ -157,15 +157,19 @@ pub struct MmioRegionObject
     pub _pad: u32,
 }
 
-/// Kernel object for a hardware interrupt line (Interrupt capability).
+/// Kernel object for a hardware interrupt range (Interrupt capability).
+///
+/// A cap with `count == 1` is a single-IRQ cap usable with
+/// `sys_irq_register` / `sys_irq_ack`. Wider caps are delegatable
+/// range authorities: narrow them with `sys_irq_split` before use.
 #[repr(C)]
 pub struct InterruptObject
 {
     pub header: KernelObjectHeader,
-    /// Interrupt number (GSI on x86-64, PLIC source on RISC-V).
-    pub irq_id: u32,
-    /// Flags from the platform resource entry (edge/level, polarity).
-    pub flags: u32,
+    /// First IRQ line in the range (GSI on x86-64, PLIC source on RISC-V).
+    pub start: u32,
+    /// Number of consecutive IRQ lines covered by the cap.
+    pub count: u32,
 }
 
 /// Kernel object for an x86-64 I/O port range (`IoPortRange` capability).
@@ -385,18 +389,24 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
         {
             // SAFETY: ptr originally from Box<InterruptObject>::into_raw; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<InterruptObject>()) };
-            let irq_id = obj.irq_id;
+            let start = obj.start;
+            let count = obj.count;
 
-            // Clear the routing table entry and mask the IRQ line so no further
-            // interrupts are delivered after this cap is freed.
-            // SAFETY: single-CPU; disable interrupts to serialise with
-            //         dispatch_device_irq (interrupt context).
-            unsafe {
-                let saved = crate::arch::current::cpu::save_and_disable_interrupts();
-                crate::irq::unregister(irq_id);
-                crate::arch::current::cpu::restore_interrupts(saved);
+            // Only single-IRQ caps ever register a signal with the routing
+            // table and program the controller (sys_irq_register asserts
+            // `count == 1`). Range caps are delegation authorities; they
+            // have no routing-table footprint to clean up.
+            if count == 1
+            {
+                // SAFETY: single-CPU; disable interrupts to serialise with
+                //         dispatch_device_irq (interrupt context).
+                unsafe {
+                    let saved = crate::arch::current::cpu::save_and_disable_interrupts();
+                    crate::irq::unregister(start);
+                    crate::arch::current::cpu::restore_interrupts(saved);
+                }
+                crate::arch::current::interrupts::mask(start);
             }
-            crate::arch::current::interrupts::mask(irq_id);
 
             // SAFETY: ptr originally from Box<InterruptObject>::into_raw.
             unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<InterruptObject>())) };

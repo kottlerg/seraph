@@ -18,8 +18,10 @@
 //! APIC timer is calibrated and configured.
 //!
 //! # xAPIC layout
-//! The local APIC is accessed at physical address `0xFEE0_0000`, which is
-//! accessible via the kernel's direct physical map at `DIRECT_MAP_BASE + phys`.
+//! The local APIC base physical address is supplied by the bootloader through
+//! `BootInfo.kernel_mmio.lapic_base` (see [`super::platform::lapic_base`]),
+//! and accessed via the kernel's direct physical map at
+//! `DIRECT_MAP_BASE + lapic_base()`.
 //!
 //! # Modification notes
 //! - To handle a new device IRQ: call `register_handler(vec, handler)` and
@@ -44,9 +46,6 @@ use super::{cpu, gdt, idt};
 use crate::mm::paging::DIRECT_MAP_BASE;
 
 // ── xAPIC constants ───────────────────────────────────────────────────────────
-
-/// Physical base of the memory-mapped local APIC registers.
-const APIC_BASE_PHYS: u64 = 0xFEE0_0000;
 
 /// Spurious Interrupt Vector Register offset.
 const APIC_SVR: usize = 0xF0;
@@ -81,7 +80,7 @@ const IST_STACK_SIZE: usize = 8192;
 #[cfg(not(test))]
 unsafe fn apic_write(offset: usize, val: u32)
 {
-    let vaddr = (DIRECT_MAP_BASE + APIC_BASE_PHYS) as usize + offset;
+    let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
     // SAFETY: vaddr is within the direct-mapped APIC MMIO region.
     unsafe {
         core::ptr::write_volatile(vaddr as *mut u32, val);
@@ -92,7 +91,7 @@ unsafe fn apic_write(offset: usize, val: u32)
 #[cfg(not(test))]
 fn apic_read(offset: usize) -> u32
 {
-    let vaddr = (DIRECT_MAP_BASE + APIC_BASE_PHYS) as usize + offset;
+    let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
     // SAFETY: vaddr is within the direct-mapped APIC MMIO region.
     unsafe { core::ptr::read_volatile(vaddr as *const u32) }
 }
@@ -162,7 +161,8 @@ pub unsafe fn init()
     }
 
     // 7. Initialise the I/O APIC: discover entry count and mask all entries.
-    // SAFETY: direct map is active; IOAPIC MMIO region is in MMIO_DIRECT_MAP_REGIONS.
+    // SAFETY: direct map is active; per-IOAPIC MMIO bases are mapped via the
+    // arch platform layer's contribution to Phase 3 direct-map regions.
     unsafe {
         super::ioapic::init();
     }
@@ -468,13 +468,6 @@ pub fn unmask(_irq: u32) {}
 mod tests
 {
     use super::*;
-
-    #[test]
-    fn apic_base_phys_constant()
-    {
-        // Ensure the constant matches the xAPIC fixed address.
-        assert_eq!(APIC_BASE_PHYS, 0xFEE0_0000);
-    }
 
     #[test]
     fn apic_svr_offset()

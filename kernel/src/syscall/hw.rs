@@ -13,6 +13,7 @@
 //! - `SYS_DMA_GRANT` (36): return a frame's physical address for DMA use
 //!   (no-IOMMU fallback; requires `FLAG_DMA_UNSAFE`).
 //! - `SYS_MMIO_SPLIT` (45): split an `MmioRegion` cap into two sub-regions.
+//! - `SYS_IRQ_SPLIT` (49): split an `Interrupt` range cap into two sub-ranges.
 //!
 //! # Adding new hardware syscalls
 //! 1. Add a new `pub fn sys_hw_*` in this file.
@@ -64,9 +65,12 @@ pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
         #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            (*obj.as_ptr().cast::<InterruptObject>()).irq_id
+        let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
+        if io.count != 1
+        {
+            return Err(SyscallError::InvalidArgument);
         }
+        io.start
     };
 
     // Unmask at the interrupt controller to re-enable delivery.
@@ -125,9 +129,13 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
         #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            (*obj.as_ptr().cast::<InterruptObject>()).irq_id
+        let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
+        if io.count != 1
+        {
+            // Range caps must be narrowed via SYS_IRQ_SPLIT before register.
+            return Err(SyscallError::InvalidArgument);
         }
+        io.start
     };
 
     // Resolve Signal cap.
@@ -194,7 +202,7 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg3 = flags (bit 1 = WRITE; executable mappings are always rejected).
 ///
 /// All pages are mapped with `uncacheable = true` (PCD|PWT on `x86_64`,
-/// no-op on RISC-V QEMU — see [`PageFlags`] comment).
+/// no-op on RISC-V under the current MMU mode — see [`PageFlags`] comment).
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -686,6 +694,169 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 #[cfg(test)]
 pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+// ── SYS_IRQ_SPLIT ───────────────────────────────────────────────────────────
+
+/// `SYS_IRQ_SPLIT` (49): split an `Interrupt` range cap into two non-overlapping children.
+///
+/// arg0 = `Interrupt` cap index (must have SIGNAL right).
+/// arg1 = `split_at` IRQ id. Must satisfy `start < split_at < start + count`.
+///        The lower child covers `[start, split_at)`; the upper child covers
+///        `[split_at, start + count)`.
+///
+/// Consumes the original cap and creates two new `Interrupt` caps with the
+/// same rights, covering the two halves. Both children are reparented to the
+/// original's derivation parent.
+///
+/// Returns `slot1 | (slot2 << 32)` on success.
+// too_many_lines: mirrors sys_mmio_split exactly; the shape is unavoidable.
+#[allow(clippy::too_many_lines)]
+#[cfg(not(test))]
+pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    extern crate alloc;
+    use alloc::boxed::Box;
+    use core::ptr::NonNull;
+
+    use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
+    use crate::cap::object::{InterruptObject, KernelObjectHeader, ObjectType, dealloc_object};
+    use crate::cap::slot::{CapTag, Rights, SlotId};
+    use crate::syscall::current_tcb;
+
+    let irq_idx = tf.arg(0) as u32;
+    let split_at = tf.arg(1) as u32;
+    // arg2 reserved.
+
+    // ── Capability lookup ─────────────────────────────────────────────────────
+
+    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*tcb).cspace };
+    if caller_cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    let (start, count, rights, cspace_id, orig_obj_ptr) = {
+        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+        let slot = unsafe {
+            super::lookup_cap(caller_cspace, irq_idx, CapTag::Interrupt, Rights::SIGNAL)
+        }?;
+        let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // SAFETY: tag confirmed Interrupt; pointer is valid InterruptObject.
+        #[allow(clippy::cast_ptr_alignment)]
+        let io = unsafe { &*(obj_ptr.as_ptr().cast::<InterruptObject>()) };
+        // SAFETY: caller_cspace validated non-null; id() reads discriminator.
+        let cspace_id = unsafe { (*caller_cspace).id() };
+        (io.start, io.count, slot.rights, cspace_id, obj_ptr)
+    };
+
+    // ── Validation ────────────────────────────────────────────────────────────
+
+    // split_at must lie strictly inside the cap's range.
+    if split_at <= start || split_at >= start.saturating_add(count)
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // ── Create two child InterruptObjects ─────────────────────────────────────
+
+    let lower_count = split_at - start;
+    let upper_count = count - lower_count;
+
+    let child1_obj = Box::new(InterruptObject {
+        header: KernelObjectHeader::new(ObjectType::Interrupt),
+        start,
+        count: lower_count,
+    });
+    let child1_ptr: NonNull<KernelObjectHeader> = {
+        let raw = Box::into_raw(child1_obj).cast::<KernelObjectHeader>();
+        // SAFETY: Box::into_raw returns non-null; header at offset 0.
+        unsafe { NonNull::new_unchecked(raw) }
+    };
+
+    let child2_obj = Box::new(InterruptObject {
+        header: KernelObjectHeader::new(ObjectType::Interrupt),
+        start: split_at,
+        count: upper_count,
+    });
+    let child2_ptr: NonNull<KernelObjectHeader> = {
+        let raw = Box::into_raw(child2_obj).cast::<KernelObjectHeader>();
+        // SAFETY: Box::into_raw is non-null; header at offset 0.
+        unsafe { NonNull::new_unchecked(raw) }
+    };
+
+    // Insert both children into the caller's CSpace.
+    // SAFETY: caller_cspace validated non-null; CSpace methods handle slot allocation.
+    let cs = unsafe { &mut *caller_cspace };
+    let slot1_nz = cs
+        .insert_cap(CapTag::Interrupt, rights, child1_ptr)
+        .map_err(|_| SyscallError::OutOfMemory)?;
+    let slot1 = slot1_nz.get();
+    let slot2_nz = cs
+        .insert_cap(CapTag::Interrupt, rights, child2_ptr)
+        .map_err(|_| {
+            cs.free_slot(slot1);
+            // SAFETY: child1_ptr just allocated above; ref count is 1.
+            unsafe { dealloc_object(child1_ptr) };
+            SyscallError::OutOfMemory
+        })?;
+    let slot2 = slot2_nz.get();
+
+    // ── Wire derivation tree ──────────────────────────────────────────────────
+
+    let irq_idx_nz = core::num::NonZeroU32::new(irq_idx).ok_or(SyscallError::InvalidCapability)?;
+
+    DERIVATION_LOCK.write_lock();
+
+    let orig_node = SlotId::new(cspace_id, irq_idx_nz);
+    let child1_id = SlotId::new(cspace_id, slot1_nz);
+    let child2_id = SlotId::new(cspace_id, slot2_nz);
+
+    // SAFETY: caller_cspace validated; irq_idx within CSpace bounds.
+    let orig_parent = unsafe { (*caller_cspace).slot(irq_idx).and_then(|s| s.deriv_parent) };
+
+    // SAFETY: DERIVATION_LOCK held; orig_node/orig_parent valid.
+    unsafe { reparent_children(orig_node, orig_parent) };
+    // SAFETY: DERIVATION_LOCK held; orig_node valid.
+    unsafe { unlink_node(orig_node) };
+
+    if let Some(parent_id) = orig_parent
+    {
+        // SAFETY: DERIVATION_LOCK held; parent_id/child1_id/child2_id valid.
+        unsafe { link_child(parent_id, child1_id) };
+        // SAFETY: DERIVATION_LOCK held; parent_id/child2_id valid.
+        unsafe { link_child(parent_id, child2_id) };
+    }
+
+    DERIVATION_LOCK.write_unlock();
+
+    // ── Consume the original cap ──────────────────────────────────────────────
+
+    // SAFETY: caller_cspace validated; irq_idx within CSpace bounds.
+    unsafe { (*caller_cspace).free_slot(irq_idx) };
+
+    // SAFETY: orig_obj_ptr from lookup_cap; object still valid (ref > 0 at lookup).
+    let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };
+    if remaining == 0
+    {
+        // SAFETY: ref count reached zero; no other references exist.
+        unsafe { dealloc_object(orig_obj_ptr) };
+    }
+
+    Ok(u64::from(slot1) | (u64::from(slot2) << 32))
+}
+
+#[cfg(test)]
+pub fn sys_irq_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

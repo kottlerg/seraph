@@ -86,9 +86,13 @@ impl core::fmt::Write for Console
 /// valid `boot_info` pointer (Phase 0 validation must have passed).
 pub unsafe fn init(boot_info: &BootInfo)
 {
+    // Resolve the UART physical base for this architecture. RISC-V reads it
+    // from `BootInfo.kernel_mmio.uart_base` (with a default fallback);
+    // x86-64 ignores the value because COM1 is I/O-mapped.
+    let uart_phys = crate::arch::current::platform::uart_base_for_boot_info(&boot_info.kernel_mmio);
     // SAFETY: serial_init is called exactly once at kernel entry.
     unsafe {
-        serial_init();
+        serial_init(uart_phys);
     }
     // SAFETY: CONSOLE is only accessed from the single boot thread.
     unsafe {

@@ -42,38 +42,34 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Bitmask of CPUs currently idle (halted).
 ///
-/// Bit N set = CPU N is in idle loop waiting for interrupts. Set by
-/// [`mark_idle`] before `hlt`/`wfi`, cleared by [`mark_active`] after wakeup.
+/// **Advisory.** Consulted by [`sched::wake_idle_cpu`] as an optimisation
+/// hint: if the target is observably not idle, skip the wakeup IPI.
+/// Correctness of `enqueue_and_wake` does **not** depend on the accuracy of
+/// this mask — the producer-side `RESCHEDULE_PENDING` flag plus the atomic
+/// check-and-halt in the idle loop guarantee the wake regardless. A stale
+/// read here at worst causes a spurious IPI or a skipped-IPI that the
+/// target observes later via its own check.
+///
+/// Because the mask is advisory, `Relaxed` is sufficient on all sides.
 pub static CPU_IDLE_MASK: AtomicU64 = AtomicU64::new(0);
 
-/// Mark a CPU as idle (about to halt).
-///
-/// # Memory ordering
-/// Release ensures all prior work (run queue checks) completes before the
-/// idle bit becomes visible to other CPUs checking [`is_idle`].
+/// Mark a CPU as idle (about to halt). Called inside the idle loop's
+/// interrupt-masked region. Relaxed — advisory.
 pub fn mark_idle(cpu: usize)
 {
-    CPU_IDLE_MASK.fetch_or(1u64 << cpu, Ordering::Release);
+    CPU_IDLE_MASK.fetch_or(1u64 << cpu, Ordering::Relaxed);
 }
 
-/// Mark a CPU as active (woke from halt or has work).
-///
-/// # Memory ordering
-/// Release ensures the idle bit is cleared before any subsequent work
-/// becomes visible.
+/// Mark a CPU as active (woke from halt or has work). Relaxed — advisory.
 pub fn mark_active(cpu: usize)
 {
-    CPU_IDLE_MASK.fetch_and(!(1u64 << cpu), Ordering::Release);
+    CPU_IDLE_MASK.fetch_and(!(1u64 << cpu), Ordering::Relaxed);
 }
 
-/// Check if a CPU is currently idle.
-///
-/// # Memory ordering
-/// Acquire ensures we observe the idle bit after the CPU set it and completed
-/// its run queue checks.
+/// Observe whether a CPU is currently idle. Relaxed — advisory.
 pub fn is_idle(cpu: usize) -> bool
 {
-    (CPU_IDLE_MASK.load(Ordering::Acquire) & (1u64 << cpu)) != 0
+    (CPU_IDLE_MASK.load(Ordering::Relaxed) & (1u64 << cpu)) != 0
 }
 
 // ── APIC ID mapping ───────────────────────────────────────────────────────────
@@ -91,21 +87,26 @@ static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 /// Initialize the CPU-to-APIC-ID mapping from `BootInfo::cpu_ids`.
 ///
 /// Must be called once during boot before any SMP operations that require
-/// sending IPIs to specific CPUs.
+/// sending IPIs to specific CPUs. Accepts a slice rather than a fixed-size
+/// array so the kernel's internal [`MAX_CPUS`] can diverge from the ABI's
+/// `BootInfo::cpu_ids` length; the ABI cap is larger today and only the
+/// leading [`MAX_CPUS`] entries are consumed. See the `TODO.md` entry
+/// "Kernel `MAX_CPUS` raise to match ABI".
 ///
 /// # Safety
 /// Single-threaded boot phase; must be called before SMP is active.
 #[cfg(not(test))]
-pub unsafe fn init_apic_ids(cpu_ids: &[u32; MAX_CPUS])
+pub unsafe fn init_apic_ids(cpu_ids: &[u32])
 {
+    let take = core::cmp::min(cpu_ids.len(), MAX_CPUS);
     // SAFETY: single-threaded boot; CPU_APIC_IDS is not accessed concurrently.
-    // Use raw pointer to avoid static-mut-refs lint. The outer unsafe block
-    // covers both addr_of_mut and copy_nonoverlapping.
+    // Use raw pointer to avoid static-mut-refs lint.
     let dst = core::ptr::addr_of_mut!(CPU_APIC_IDS);
-    // SAFETY: dst points to a valid [u32; MAX_CPUS] array; cpu_ids is a valid
-    // source of the same size; no aliasing during single-threaded boot.
+    // SAFETY: dst points to a valid [u32; MAX_CPUS] array; `take` is bounded
+    // above by both source and destination length; no aliasing during
+    // single-threaded boot.
     unsafe {
-        core::ptr::copy_nonoverlapping(cpu_ids.as_ptr(), (*dst).as_mut_ptr(), MAX_CPUS);
+        core::ptr::copy_nonoverlapping(cpu_ids.as_ptr(), (*dst).as_mut_ptr(), take);
     }
 }
 

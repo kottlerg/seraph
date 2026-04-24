@@ -153,6 +153,25 @@ impl TrapFrame
         self.rsi = token;
     }
 
+    /// Write `SYS_IPC_CALL` return values: primary in rax, reply label in
+    /// rdx, reply data-word count in r9. Matches `shared/syscall::syscall5_ret3`.
+    pub fn set_ipc_call_return(&mut self, primary: u64, reply_label: u64, reply_word_count: u64)
+    {
+        self.rax = primary;
+        self.rdx = reply_label;
+        self.r9 = reply_word_count;
+    }
+
+    /// Write `SYS_IPC_RECV` return values: primary in rax, label in rdx,
+    /// token in rsi, data-word count in r8. Matches `shared/syscall::syscall1_ret4`.
+    pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, token: u64, word_count: u64)
+    {
+        self.rax = primary;
+        self.rdx = label;
+        self.rsi = token;
+        self.r8 = word_count;
+    }
+
     /// Initialise the frame for first entry to user mode.
     ///
     /// Sets the user entry point (`rip`), user stack (`rsp`), segment

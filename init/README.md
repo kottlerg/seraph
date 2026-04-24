@@ -63,7 +63,11 @@ Init's responsibilities are strictly bounded:
 At entry, init holds the full initial CSpace populated by the kernel:
 - Thread, AddressSpace, and CSpace caps for itself
 - Frame caps for all usable physical memory
-- MMIO, IRQ, IoPortRange, IommuUnit, and PlatformTable caps from platform resources
+- One MmioRegion cap per coarse MMIO aperture
+- One root Interrupt range cap (narrowed per-device in userspace via `sys_irq_split`)
+- IoPortRange cap covering the full 64K port space (x86-64)
+- SbiControl cap (RISC-V)
+- Read-only Frame caps covering the ACPI RSDP page, each `AcpiReclaimable` region, and the DTB blob — devmgr parses firmware tables from these
 - SchedControl cap
 - Frame caps for boot module images (procmgr, devmgr, drivers, etc.)
 
@@ -77,7 +81,7 @@ Init derives and transfers these to services using the "derive twice" pattern
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../docs/architecture.md) | Bootstrap sequence, init/procmgr/svcmgr roles |
-| [docs/boot-protocol.md](../docs/boot-protocol.md) | InitImage, boot modules, initial CSpace |
+| [abi/boot-protocol/](../abi/boot-protocol/) | InitImage, boot modules, initial CSpace |
 | [docs/capability-model.md](../docs/capability-model.md) | Initial capability distribution |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
 

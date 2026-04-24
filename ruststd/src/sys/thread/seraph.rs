@@ -303,6 +303,7 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // in Thread::new; this is the sole consumer.
     let args = unsafe { Box::from_raw(arg as *mut SpawnArgs) };
     let _ = syscall::ipc_buffer_set(args.ipc_buffer_vaddr);
+    crate::os::seraph::set_current_ipc_buf(args.ipc_buffer_vaddr as *mut u64);
 
     // SAFETY: args.init was produced via `Box::into_raw(init)` in
     // Thread::new; consumed exactly once here.

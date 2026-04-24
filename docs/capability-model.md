@@ -247,7 +247,7 @@ the CSpace with an initial set of capabilities covering all available resources:
 
 - Frame capabilities for all usable physical memory
 - MMIO region capabilities for all boot-provided platform resource regions
-  (MmioRange, PciEcam, IommuUnit entries from `BootInfo.platform_resources`)
+  (MmioRange and PciEcam entries from `BootInfo.platform_resources`)
 - Interrupt capabilities for all boot-provided interrupt lines
 - Read-only Frame capabilities for firmware table regions (PlatformTable entries),
   allowing userspace to parse ACPI or Device Tree data

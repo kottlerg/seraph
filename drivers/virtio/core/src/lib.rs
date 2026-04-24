@@ -108,20 +108,15 @@ impl VirtioPciStartupInfo
     /// Number of IPC data words needed to hold the serialised form (7 words).
     pub const IPC_WORD_COUNT: usize = 7;
 
-    /// Write into IPC buffer data words.
+    /// Pack the startup info into 7 `u64` data words for an `IpcMessage`.
     ///
     /// Layout: 2 words per cap location (bar|offset in lo, length in hi),
     /// except the last cap shares its hi word with `notify_off_multiplier`.
-    ///
-    /// # Safety
-    ///
-    /// `ipc_buf` must point to a valid IPC buffer with at least
-    /// [`Self::IPC_WORD_COUNT`] writable words.
+    #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub unsafe fn write_to_ipc(&self, ipc_buf: *mut u64)
+    pub fn to_words(&self) -> [u64; Self::IPC_WORD_COUNT]
     {
-        // SAFETY: caller guarantees ipc_buf points at a registered IPC buffer page.
-        let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
+        let mut out = [0u64; Self::IPC_WORD_COUNT];
         let caps = [
             &self.common_cfg,
             &self.notify_cfg,
@@ -130,33 +125,27 @@ impl VirtioPciStartupInfo
         ];
         for (i, cap) in caps.iter().enumerate()
         {
-            let lo = u64::from(cap.bar) | (u64::from(cap.offset) << 32);
-            ipc.write_word(i * 2, lo);
+            out[i * 2] = u64::from(cap.bar) | (u64::from(cap.offset) << 32);
             if i < 3
             {
-                ipc.write_word(i * 2 + 1, u64::from(cap.length));
+                out[i * 2 + 1] = u64::from(cap.length);
             }
         }
         // Word 6: device_cfg.length | (notify_off_multiplier << 32).
-        let last =
-            u64::from(self.device_cfg.length) | (u64::from(self.notify_off_multiplier) << 32);
-        ipc.write_word(6, last);
+        out[6] = u64::from(self.device_cfg.length) | (u64::from(self.notify_off_multiplier) << 32);
+        out
     }
 
-    /// Read from IPC buffer data words.
+    /// Unpack the startup info from 7 `u64` data words delivered over IPC.
     ///
-    /// # Safety
-    ///
-    /// `ipc_buf` must point to a valid IPC buffer with at least
-    /// [`Self::IPC_WORD_COUNT`] readable words.
+    /// If `words` has fewer than [`Self::IPC_WORD_COUNT`] entries the
+    /// remaining fields are read as zero.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub unsafe fn read_from_ipc(ipc_buf: *const u64) -> Self
+    pub fn from_words(words: &[u64]) -> Self
     {
-        // SAFETY: caller guarantees ipc_buf points at a registered IPC buffer page.
-        // IpcBuf takes *mut but only reads here; the underlying page is writable.
-        let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf.cast_mut()) };
         let mut info = Self::default();
+        let read = |i: usize| -> u64 { words.get(i).copied().unwrap_or(0) };
 
         let caps = [
             &mut info.common_cfg,
@@ -166,17 +155,17 @@ impl VirtioPciStartupInfo
         ];
         for (i, cap) in caps.into_iter().enumerate()
         {
-            let lo = ipc.read_word(i * 2);
+            let lo = read(i * 2);
             cap.bar = lo as u8;
             cap.offset = (lo >> 32) as u32;
             if i < 3
             {
-                let hi = ipc.read_word(i * 2 + 1);
+                let hi = read(i * 2 + 1);
                 cap.length = hi as u32;
             }
         }
         // Word 6: device_cfg.length | (notify_off_multiplier << 32).
-        let last = ipc.read_word(6);
+        let last = read(6);
         info.device_cfg.length = last as u32;
         info.notify_off_multiplier = (last >> 32) as u32;
 

@@ -3,49 +3,55 @@
 
 // kernel/src/arch/riscv64/console.rs
 
-//! QEMU virt UART backend for RISC-V (MMIO 16550 at 0x10000000).
+//! ns16550-compatible UART backend for RISC-V.
 //!
-//! QEMU's virt machine pre-initializes the UART; this module performs a
-//! minimal reset and provides byte-level write access.
+//! The physical base is supplied by the bootloader through
+//! `BootInfo.kernel_mmio.uart_base` and resolved at Phase 1 console init via
+//! [`crate::arch::riscv64::platform::uart_base_for_boot_info`]. After Phase 3
+//! activates the kernel's page tables, the UART is no longer accessible at
+//! its physical address; call [`rebase_serial`] to switch the accessor to the
+//! direct-map virtual address.
 //!
-//! After Phase 3 activates the kernel's page tables, the UART is no longer
-//! accessible at its physical address (0x10000000); call [`rebase_serial`]
-//! to switch to the direct-map virtual address.
-//!
-//! # UART base address
-//! The physical base is currently hardcoded to the QEMU virt default.
-//! The bootloader discovers the actual base via ACPI SPCR (primary path with
-//! EDK2) or DTB ns16550a node, but does not yet pass it to the kernel — there
-//! is no dedicated field in `BootInfo` for this. On QEMU virt both resolve to
-//! 0x10000000, so the hardcode is correct for the supported target.
-//!
-//! TODO: Pass the discovered UART base through `BootInfo` to the kernel.
-//! Steps: add `uart_phys_base: u64` to `BootInfo` (bump protocol version),
-//! set it from `arch::current::uart_mmio_region()` in the bootloader's
-//! Step 9, and replace `UART_PHYS_BASE` here with `info.uart_phys_base`.
-
-/// Physical address of the QEMU virt UART MMIO region.
-///
-/// Exported so callers can compute `DIRECT_MAP_BASE + UART_PHYS_BASE` and
-/// pass it to [`rebase_serial`] after the page table switch.
-pub const UART_PHYS_BASE: u64 = 0x1000_0000;
+//! Firmware is assumed to have pre-configured the UART clock (divisor 1).
+//! The init sequence here performs a minimal re-enable in case a prior stage
+//! left the device in an unexpected state.
 
 /// UART register offsets (byte-addressed).
 const UART_TX: usize = 0; // transmit holding register
 const UART_LSR: usize = 5; // line status register
+
+/// Resolved UART physical base, recorded by [`serial_init`] so [`uart_phys_base`]
+/// can return it across the Phase 3 page-table switch (when `BootInfo` is no
+/// longer accessible).
+///
+/// SAFETY: written exactly once during Phase 1, single-threaded; subsequent
+/// reads happen after SMP is active but observe a fully-written value because
+/// the write precedes SMP bring-up.
+static mut UART_PHYS: u64 = 0;
 
 /// Current UART virtual base address.
 ///
 /// Initialized to the physical address (identity-mapped by the bootloader).
 /// Updated by [`rebase_serial`] after Phase 3 switches to the direct map.
 /// Single-threaded early boot: no locking required.
-// SAFETY: accessed only from the single kernel boot thread.
-static mut UART_BASE: u64 = UART_PHYS_BASE;
+// SAFETY: accessed only from the single kernel boot thread before SMP, then
+// read-only across all CPUs once SMP is active.
+static mut UART_BASE: u64 = 0;
+
+/// Resolved UART physical base captured at [`serial_init`] time.
+///
+/// Returns 0 before [`serial_init`] has been called.
+#[must_use]
+pub fn uart_phys_base() -> u64
+{
+    // SAFETY: see UART_PHYS doc; written once pre-SMP, read after.
+    unsafe { UART_PHYS }
+}
 
 /// Switch the UART accessor to a new virtual base address.
 ///
 /// Call this after Phase 3 activates the kernel's page tables, passing
-/// `phys_to_virt(UART_PHYS_BASE)` so subsequent serial output uses the
+/// `phys_to_virt(uart_phys_base())` so subsequent serial output uses the
 /// direct-map address instead of the now-unmapped physical address.
 ///
 /// # Safety
@@ -57,30 +63,36 @@ pub unsafe fn rebase_serial(new_base: u64)
     unsafe { UART_BASE = new_base };
 }
 
-/// Initialize the QEMU virt UART.
+/// Initialize the ns16550 UART at `phys_base`.
 ///
-/// QEMU pre-initializes the UART at reset; this performs a minimal re-enable
-/// (8N1, no FIFO) in case a prior stage left it in an unexpected state.
+/// Records the physical base for later [`uart_phys_base`] queries, sets the
+/// initial virtual base to the (identity-mapped) physical address, then
+/// performs a minimal re-enable (8N1, no FIFO, divisor 1).
 ///
 /// # Safety
-/// Caller must ensure this is called at most once and that the MMIO region
-/// at `UART_BASE` is accessible and not protected by the MMU.
-pub unsafe fn serial_init()
+/// Caller must ensure this is called at most once, that the MMIO region at
+/// `phys_base` is accessible (identity-mapped pre-Phase 3), and not protected
+/// by the MMU.
+pub unsafe fn serial_init(phys_base: u64)
 {
-    // SAFETY: UART_BASE is valid (identity-mapped by bootloader at init time).
-    let base = unsafe { UART_BASE } as *mut u8;
+    // SAFETY: single-threaded Phase 1; called exactly once.
+    unsafe {
+        UART_PHYS = phys_base;
+        UART_BASE = phys_base;
+    }
+    let base = phys_base as *mut u8;
     // SAFETY: UART MMIO region is valid at base; volatile writes configure the 16550.
     unsafe {
         // IER = 0: disable all interrupts.
         core::ptr::write_volatile(base.add(1), 0x00);
         // LCR DLAB = 1: access divisor latch.
         core::ptr::write_volatile(base.add(3), 0x80);
-        // Divisor = 1 (assume clock pre-configured by QEMU).
+        // Divisor = 1 (firmware pre-configured the clock).
         core::ptr::write_volatile(base.add(0), 0x01);
         core::ptr::write_volatile(base.add(1), 0x00);
         // LCR = 0x03: 8N1, DLAB = 0.
         core::ptr::write_volatile(base.add(3), 0x03);
-        // FCR = 0: disable FIFO (QEMU virt does not need it).
+        // FCR = 0: disable FIFO.
         core::ptr::write_volatile(base.add(2), 0x00);
     }
 }

@@ -13,11 +13,11 @@ core::arch::global_asm!(
     ".global _handoff_trampoline",
     ".global _handoff_trampoline_end",
     "_handoff_trampoline:",
-    "    csrci sstatus, 2",  // clear SIE (bit 1)
-    "    csrw  satp, t0",    // install new page table
-    "    sfence.vma x0, x0", // flush all TLB entries
-    "    mv    sp, t2",      // set stack
-    "    jr    t1",          // jump to entry (t1)
+    "    csrci sstatus, 0b10", // clear bit 1 (SIE) — disables S-mode interrupts
+    "    csrw  satp, t0",      // install new page table
+    "    sfence.vma x0, x0",   // flush all TLB entries
+    "    mv    sp, t2",        // set stack
+    "    jr    t1",            // jump to entry (t1)
     "_handoff_trampoline_end:",
 );
 

@@ -4,13 +4,28 @@
 // Uncontended lock/unlock is a single CAS on `state`. Contention allocates
 // a Signal (once per Mutex, cached in `signal`) and blocks via
 // `SYS_SIGNAL_WAIT`; the releasing thread wakes one waiter via
-// `SYS_SIGNAL_SEND`. Matches the state machine of the upstream
-// `sync/mutex/futex.rs` impl.
+// `SYS_SIGNAL_SEND`. Matches the state machine of upstream
+// `sync/mutex/futex.rs` with one structural deviation.
+//
+// Seraph's Signal cap is a separately-allocated kernel object (unlike
+// upstream futex where the state atom address IS the wait key), so the
+// slot is populated lazily on first contention. The contender in
+// `lock_contended` installs the Signal cap BEFORE publishing `CONTENDED`
+// so that any concurrent `unlock` observing `CONTENDED` is guaranteed to
+// see a non-zero slot and deliver the wake. Skipping this step allowed
+// a lost-wakeup deadlock when the slot was populated after the unlock's
+// check — `threading_phase` intermittently parked one worker on a cap
+// nobody would ever signal.
+//
+// `swap` on `state` uses `AcqRel`: Release publishes the install (and
+// any critical-section stores on unlock); Acquire synchronizes with the
+// other side's Release so the subsequent `signal` load is guaranteed to
+// observe the install on weak-memory architectures (RVWMO).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use crate::sync::atomic::AtomicU32;
-use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 
 const UNLOCKED: u32 = 0;
 const LOCKED: u32 = 1;
@@ -47,11 +62,14 @@ impl Mutex {
         {
             return;
         }
+        // Install the Signal cap BEFORE publishing `CONTENDED` so a
+        // concurrent unlock that observes `CONTENDED` is guaranteed to see
+        // a non-zero slot and deliver the wake.
+        let sig = ensure_signal(&self.signal);
         loop {
-            if state != CONTENDED && self.state.swap(CONTENDED, Acquire) == UNLOCKED {
+            if state != CONTENDED && self.state.swap(CONTENDED, AcqRel) == UNLOCKED {
                 return;
             }
-            let sig = ensure_signal(&self.signal);
             if sig != 0 {
                 let _ = syscall::signal_wait(sig);
             } else {
@@ -78,7 +96,7 @@ impl Mutex {
     /// successful `try_lock` without a matching unlock).
     #[inline]
     pub unsafe fn unlock(&self) {
-        if self.state.swap(UNLOCKED, Release) == CONTENDED {
+        if self.state.swap(UNLOCKED, AcqRel) == CONTENDED {
             let sig = self.signal.load(Relaxed);
             if sig != 0 {
                 let _ = syscall::signal_send(sig, 1);
@@ -96,9 +114,8 @@ impl Drop for Mutex {
     }
 }
 
-/// Lazily allocate a Signal cap the first time a primitive experiences
-/// contention. Returns 0 if allocation fails; callers fall back to busy-
-/// spinning in that case.
+/// Lazily allocate a Signal cap on first contention. Returns 0 if allocation
+/// fails; callers fall back to busy-spinning.
 fn ensure_signal(slot: &AtomicU32) -> u32 {
     let existing = slot.load(Acquire);
     if existing != 0 {

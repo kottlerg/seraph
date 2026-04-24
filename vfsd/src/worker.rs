@@ -97,13 +97,26 @@ pub fn wait_result(ch: &Channel) -> bool
 /// caps onto it (as the creator endpoint handed to each spawned child).
 pub fn worker_loop(bootstrap_ep: u32, ch: &Channel) -> !
 {
+    // The ruststd thread trampoline allocates and registers this thread's
+    // own 4 KiB IPC buffer before calling user code, and records the VA in
+    // `std::os::seraph::current_ipc_buf()`. The worker just reads it.
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null()
+    {
+        println!("vfsd: worker has no registered IPC buffer");
+        syscall::thread_exit();
+    }
+
     loop
     {
-        let Ok((label, token)) = syscall::ipc_recv(bootstrap_ep)
+        // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+        let Ok(recv) = (unsafe { ipc::ipc_recv(bootstrap_ep, ipc_buf) })
         else
         {
             continue;
         };
+        let label = recv.label;
+        let token = recv.token;
 
         // Look at the pending plan without taking it: we only consume caps
         // when we are confident we can deliver them.
@@ -115,13 +128,15 @@ pub fn worker_loop(bootstrap_ep: u32, ch: &Channel) -> !
         };
         if !match_ok
         {
-            let _ = bootstrap::reply_error(bootstrap_errors::NO_CHILD);
+            // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+            let _ = unsafe { bootstrap::reply_error(bootstrap_errors::NO_CHILD, ipc_buf) };
             continue;
         }
 
         if (label & 0xFFFF) != bootstrap::REQUEST
         {
-            let _ = bootstrap::reply_error(bootstrap_errors::INVALID);
+            // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+            let _ = unsafe { bootstrap::reply_error(bootstrap_errors::INVALID, ipc_buf) };
             // Plan remains published; the child (if well-formed) will retry
             // or the mount will time out at the driver-probe stage. Main is
             // still waiting on `result`; report failure so it unblocks.
@@ -144,7 +159,8 @@ pub fn worker_loop(bootstrap_ep: u32, ch: &Channel) -> !
         {
             // match_ok above observed a plan, but another REQUEST racing on the
             // same token took it first. Report failure so the waiter unblocks.
-            let _ = bootstrap::reply_error(bootstrap_errors::NO_CHILD);
+            // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+            let _ = unsafe { bootstrap::reply_error(bootstrap_errors::NO_CHILD, ipc_buf) };
             let mut st =
                 ch.0.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -154,7 +170,8 @@ pub fn worker_loop(bootstrap_ep: u32, ch: &Channel) -> !
         };
 
         let caps = [plan.blk, plan.service];
-        let ok = bootstrap::reply_round(true, &caps, 0).is_ok();
+        // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+        let ok = unsafe { bootstrap::reply_round(true, &caps, &[], ipc_buf) }.is_ok();
 
         let mut st =
             ch.0.lock()

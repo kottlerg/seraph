@@ -44,12 +44,13 @@ use syscall_abi::{
     SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
     SYS_CAP_DERIVE_TOKEN, SYS_CAP_INSERT, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_DMA_GRANT,
     SYS_EVENT_POST, SYS_EVENT_RECV, SYS_FRAME_SPLIT, SYS_IOPORT_BIND, SYS_IPC_BUFFER_SET,
-    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_MEM_MAP,
-    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_SBI_CALL, SYS_SIGNAL_SEND,
-    SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
-    SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
-    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
+    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_SBI_CALL,
+    SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT,
 };
 
 pub use syscall_abi::{
@@ -269,6 +270,10 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 }
 
 /// Issue a syscall with up to 5 arguments. Returns (primary, secondary).
+///
+/// r9 is marked clobbered because `SYS_IPC_CALL`'s kernel handler writes
+/// `reply_word_count` into r9 via `set_ipc_call_return`; even though this
+/// wrapper does not read r9, LLVM must not assume r9 is preserved.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -280,7 +285,135 @@ unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
     let secondary: u64;
     let nr = nr as i64;
     // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // args in rdi/rsi/rdx/r10/r8; clobbers rcx/r11; reads secondary return from rdx (lateout).
+    // args in rdi/rsi/rdx/r10/r8; clobbers rcx/r11/r9; reads secondary return from rdx (lateout).
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") nr => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8")  a4,
+            out("rcx") _,
+            out("r11") _,
+            out("r9")  _,
+            lateout("rdx") secondary,
+            options(nostack),
+        );
+    }
+    (ret, secondary)
+}
+
+#[cfg(target_arch = "riscv64")]
+// inline_always: syscall wrapper contains inline asm; must inline to call site.
+// cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
+#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[inline(always)]
+unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> (i64, u64)
+{
+    let ret: i64;
+    let secondary: u64;
+    let a0 = a0 as i64;
+    // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
+    // args in a0-a4; reads secondary return from a1 (inout). a2 is inout-to-discard
+    // because `SYS_IPC_CALL` writes `reply_word_count` into a2 via
+    // `set_ipc_call_return`; this wrapper does not consume it, but LLVM must not
+    // assume a2 is preserved.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inout("a0") a0 => ret,
+            inout("a1") a1 => secondary,
+            inout("a2") a2 => _,
+            in("a3") a3,
+            in("a4") a4,
+            in("a7") nr,
+            options(nostack),
+        );
+    }
+    (ret, secondary)
+}
+
+/// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
+///
+/// Used by `ipc_recv` to retrieve `(ret, label, token, word_count)`.
+#[cfg(target_arch = "x86_64")]
+// inline_always: syscall wrapper contains inline asm; must inline to call site.
+// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
+#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[inline(always)]
+unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
+{
+    let ret: i64;
+    let secondary: u64;
+    let tertiary: u64;
+    let quaternary: u64;
+    let nr = nr as i64;
+    // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
+    // arg in rdi; clobbers rcx/r11; reads secondary from rdx, tertiary from rsi, quaternary
+    // from r8 (all lateout, caller-saved; kernel writes them in the trap frame before SYSRET).
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") nr => ret,
+            in("rdi") a0,
+            out("rcx") _,
+            out("r11") _,
+            lateout("rdx") secondary,
+            lateout("rsi") tertiary,
+            lateout("r8")  quaternary,
+            options(nostack),
+        );
+    }
+    (ret, secondary, tertiary, quaternary)
+}
+
+#[cfg(target_arch = "riscv64")]
+// inline_always: syscall wrapper contains inline asm; must inline to call site.
+// cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
+#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[inline(always)]
+unsafe fn syscall1_ret4(nr: u64, a0: u64) -> (i64, u64, u64, u64)
+{
+    let ret: i64;
+    let secondary: u64;
+    let tertiary: u64;
+    let quaternary: u64;
+    let a0 = a0 as i64;
+    // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
+    // arg in a0 (inout); reads secondary from a1, tertiary from a2, quaternary from a3.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inout("a0") a0 => ret,
+            lateout("a1") secondary,
+            lateout("a2") tertiary,
+            lateout("a3") quaternary,
+            in("a7") nr,
+            options(nostack),
+        );
+    }
+    (ret, secondary, tertiary, quaternary)
+}
+
+/// Issue a syscall with up to 5 arguments. Returns (primary, secondary, tertiary).
+///
+/// Used by `ipc_call` to retrieve `(ret, reply_label, reply_word_count)`.
+#[cfg(target_arch = "x86_64")]
+// inline_always: syscall wrapper contains inline asm; must inline to call site.
+// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
+#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[inline(always)]
+unsafe fn syscall5_ret3(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> (i64, u64, u64)
+{
+    let ret: i64;
+    let secondary: u64;
+    let tertiary: u64;
+    let nr = nr as i64;
+    // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
+    // args in rdi/rsi/rdx/r10/r8; clobbers rcx/r11; reads secondary from rdx (lateout),
+    // tertiary from r9 (lateout — r9 is unused as input since we have 5 args, not 6).
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -293,91 +426,34 @@ unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
             out("rcx") _,
             out("r11") _,
             lateout("rdx") secondary,
-            options(nostack),
-        );
-    }
-    (ret, secondary)
-}
-
-#[cfg(target_arch = "riscv64")]
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
-#[inline(always)]
-unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> (i64, u64)
-{
-    let ret: i64;
-    let secondary: u64;
-    let a0 = a0 as i64;
-    // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // args in a0-a4; reads secondary return from a1 (inout); no memory side effects.
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inout("a0") a0 => ret,
-            inout("a1") a1 => secondary,
-            in("a2") a2,
-            in("a3") a3,
-            in("a4") a4,
-            in("a7") nr,
-            options(nostack),
-        );
-    }
-    (ret, secondary)
-}
-
-/// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary).
-///
-/// Used by `ipc_recv` to retrieve the token alongside label.
-#[cfg(target_arch = "x86_64")]
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
-#[inline(always)]
-unsafe fn syscall1_ret3(nr: u64, a0: u64) -> (i64, u64, u64)
-{
-    let ret: i64;
-    let secondary: u64;
-    let tertiary: u64;
-    let nr = nr as i64;
-    // SAFETY: inline asm issues syscall instruction per x86-64 ABI; syscall number in rax,
-    // arg in rdi; clobbers rcx/r11; reads secondary return from rdx (lateout),
-    // tertiary return from rsi (lateout). rsi is not used as input (only 1 arg).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inout("rax") nr => ret,
-            in("rdi") a0,
-            out("rcx") _,
-            out("r11") _,
-            lateout("rdx") secondary,
-            lateout("rsi") tertiary,
+            lateout("r9")  tertiary,
             options(nostack),
         );
     }
     (ret, secondary, tertiary)
 }
 
-/// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary).
 #[cfg(target_arch = "riscv64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 arg reinterpreted as i64 register value; bit pattern preserved.
 #[allow(clippy::inline_always, clippy::cast_possible_wrap)]
 #[inline(always)]
-unsafe fn syscall1_ret3(nr: u64, a0: u64) -> (i64, u64, u64)
+unsafe fn syscall5_ret3(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> (i64, u64, u64)
 {
     let ret: i64;
     let secondary: u64;
     let tertiary: u64;
     let a0 = a0 as i64;
     // SAFETY: inline asm issues ecall instruction per RISC-V ABI; syscall number in a7,
-    // arg in a0; reads secondary from a1 (lateout), tertiary from a2 (lateout).
+    // args in a0-a4; reads secondary from a1 (inout), tertiary from a2 (inout).
     unsafe {
         core::arch::asm!(
             "ecall",
             inout("a0") a0 => ret,
-            lateout("a1") secondary,
-            lateout("a2") tertiary,
+            inout("a1") a1 => secondary,
+            inout("a2") a2 => tertiary,
+            in("a3") a3,
+            in("a4") a4,
             in("a7") nr,
             options(nostack),
         );
@@ -478,42 +554,6 @@ pub fn unpack_cap_slots(packed: u64, count: usize) -> [u32; MSG_CAP_SLOTS_MAX]
     out
 }
 
-/// Read cap transfer results from the IPC buffer after a receive or call.
-///
-/// The kernel writes the following layout starting at word index `MSG_DATA_WORDS_MAX`:
-/// ```text
-/// word[MSG_DATA_WORDS_MAX + 0] = cap_count as u64
-/// word[MSG_DATA_WORDS_MAX + 1] = idx[0] as u64
-/// word[MSG_DATA_WORDS_MAX + 2] = idx[1] as u64
-/// ...
-/// ```
-///
-/// Returns `(cap_count, [idx0, idx1, idx2, idx3])`.
-///
-/// # Safety
-/// `ipc_buf` must point to the registered IPC buffer page (4 KiB, aligned).
-#[must_use]
-pub unsafe fn read_recv_caps(ipc_buf: *const u64) -> (usize, [u32; MSG_CAP_SLOTS_MAX])
-{
-    // cast_possible_truncation: Seraph targets 64-bit only (x86_64, riscv64);
-    // usize == u64 on all supported targets.
-    #[allow(clippy::cast_possible_truncation)]
-    // SAFETY: caller guarantees ipc_buf points to registered IPC buffer (4 KiB aligned);
-    // offset MSG_DATA_WORDS_MAX is within buffer bounds; volatile read required for kernel-written data.
-    let cap_count = (unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX)) } as usize)
-        .min(MSG_CAP_SLOTS_MAX);
-    let mut indices = [0u32; MSG_CAP_SLOTS_MAX];
-    // cast_possible_truncation: cap slot indices are at most 16-bit values; fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
-    for (i, slot) in indices.iter_mut().take(cap_count).enumerate()
-    {
-        // SAFETY: caller guarantees ipc_buf points to registered IPC buffer; offset is bounded
-        // by cap_count <= MSG_CAP_SLOTS_MAX; volatile read required for kernel-written cap indices.
-        *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX + 1 + i)) } as u32;
-    }
-    (cap_count, indices)
-}
-
 // ── Public syscall wrappers ───────────────────────────────────────────────────
 
 /// Voluntarily yield the CPU to the next runnable thread.
@@ -557,43 +597,35 @@ pub fn ipc_buffer_set(virt: u64) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Synchronous IPC call on an endpoint cap.
+/// Raw `SYS_IPC_CALL` issuing syscall5_ret3. Intended for `shared/ipc`'s
+/// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
+/// entry point.
 ///
-/// Sends `label`, up to `MSG_DATA_WORDS_MAX` data words (written to the IPC
-/// buffer before the call), and up to `MSG_CAP_SLOTS_MAX` capability slots.
-/// Blocks until a server replies.
-///
-/// Returns `(reply_label, reply_data_count)`. After return, call
-/// [`read_recv_caps`] on the IPC buffer to retrieve any caps the server
-/// sent in its reply.
-///
-/// Requires endpoint cap to have `Rights::GRANT` when `cap_slots` is non-empty.
-///
-/// # Note
-/// The caller must have registered an IPC buffer via [`ipc_buffer_set`].
-///
-/// # Errors
-/// Returns a negative `i64` error code if the endpoint cap is invalid, the
-/// caller has insufficient rights, or the call is interrupted.
+/// Returns `(reply_label, reply_word_count)` on success.
+#[doc(hidden)]
 #[inline]
-pub fn ipc_call(
+pub fn raw_ipc_call(
     ep: u32,
     label: u64,
     data_count: usize,
-    cap_slots: &[u32],
+    cap_count: usize,
+    cap_packed: u64,
 ) -> Result<(u64, usize), i64>
 {
-    let cap_count = cap_slots.len().min(MSG_CAP_SLOTS_MAX);
-    let cap_packed = pack_cap_slots(cap_slots);
-    // SAFETY: syscall5_ret2 issues raw syscall instruction; all arguments are scalar u64 values
-    // (cap indices and packed slot array); kernel validates caps and reads IPC buffer.
-    let (ret, secondary) = unsafe {
-        syscall5_ret2(
+    // cast_possible_truncation: word count fits in 16 bits by invariant.
+    #[allow(clippy::cast_possible_truncation)]
+    let data_count_u64 = data_count as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let cap_count_u64 = cap_count as u64;
+    // SAFETY: syscall5_ret3 issues raw syscall; args are scalar u64; kernel
+    // validates caps and reads/writes the per-thread IPC buffer.
+    let (ret, reply_label, reply_word_count) = unsafe {
+        syscall5_ret3(
             SYS_IPC_CALL,
             u64::from(ep),
             label,
-            data_count as u64,
-            cap_count as u64,
+            data_count_u64,
+            cap_count_u64,
             cap_packed,
         )
     };
@@ -603,61 +635,64 @@ pub fn ipc_call(
     }
     else
     {
-        Ok((secondary, 0))
+        // cast_possible_truncation: Seraph targets 64-bit only (usize == u64);
+        // kernel clamps reply_word_count to MSG_DATA_WORDS_MAX = 64 before write.
+        #[allow(clippy::cast_possible_truncation)]
+        let word_count = (reply_word_count as usize).min(MSG_DATA_WORDS_MAX);
+        Ok((reply_label, word_count))
     }
 }
 
-/// Receive a call on an endpoint cap.
+/// Raw `SYS_IPC_RECV` issuing syscall1_ret4. Intended for `shared/ipc`'s
+/// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
+/// entry point.
 ///
-/// Blocks until a caller sends. Returns `(label, token)`.
-/// Data words are written to the registered IPC buffer.
-/// The `token` is the value attached to the sender's endpoint capability
-/// via `cap_derive_token`. Zero if the sender used an untokened cap.
-///
-/// # Errors
-/// Returns a negative `i64` error code if the endpoint cap is invalid or
-/// the receive is interrupted.
+/// Returns `(label, token, word_count)` on success.
+#[doc(hidden)]
 #[inline]
-pub fn ipc_recv(ep: u32) -> Result<(u64, u64), i64>
+pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 {
-    // SAFETY: syscall1_ret3 issues raw syscall instruction; ep is endpoint cap index as u64;
-    // kernel validates cap and writes to IPC buffer; returns label in secondary register,
-    // token in tertiary register.
-    let (ret, secondary, tertiary) = unsafe { syscall1_ret3(SYS_IPC_RECV, u64::from(ep)) };
+    // SAFETY: syscall1_ret4 issues raw syscall; kernel writes into the
+    // per-thread IPC buffer and returns four values in return registers.
+    let (ret, label, token, word_count) = unsafe { syscall1_ret4(SYS_IPC_RECV, u64::from(ep)) };
     if ret < 0
     {
         Err(ret)
     }
     else
     {
-        Ok((secondary, tertiary))
+        // cast_possible_truncation: Seraph targets 64-bit only (usize == u64);
+        // kernel clamps word_count to MSG_DATA_WORDS_MAX = 64 before write.
+        #[allow(clippy::cast_possible_truncation)]
+        let word_count = (word_count as usize).min(MSG_DATA_WORDS_MAX);
+        Ok((label, token, word_count))
     }
 }
 
-/// Reply to the thread that called us.
-///
-/// Sends `label`, `data_count` words from the IPC buffer, and up to
-/// `MSG_CAP_SLOTS_MAX` capability slots from the current `CSpace`.
-///
-/// After the reply, `cap_slots` entries are moved to the caller's `CSpace`.
-/// The caller can read the resulting slot indices via [`read_recv_caps`].
-///
-/// # Errors
-/// Returns a negative `i64` error code if there is no pending reply target
-/// or the call is otherwise invalid.
+/// Raw `SYS_IPC_REPLY`. Intended for `shared/ipc`'s `IpcMessage`-snapshot
+/// wrapper; other callers should use that higher-level entry point.
+#[doc(hidden)]
 #[inline]
-pub fn ipc_reply(label: u64, data_count: usize, cap_slots: &[u32]) -> Result<(), i64>
+pub fn raw_ipc_reply(
+    label: u64,
+    data_count: usize,
+    cap_count: usize,
+    cap_packed: u64,
+) -> Result<(), i64>
 {
-    let cap_count = cap_slots.len().min(MSG_CAP_SLOTS_MAX);
-    let cap_packed = pack_cap_slots(cap_slots);
-    // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
-    // (label, counts, packed cap slots); kernel reads IPC buffer and validates caps.
+    // cast_possible_truncation: Seraph targets 64-bit only (usize == u64).
+    #[allow(clippy::cast_possible_truncation)]
+    let data_count_u64 = data_count as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let cap_count_u64 = cap_count as u64;
+    // SAFETY: syscall4 issues raw syscall; all args scalar; kernel reads IPC
+    // buffer and validates caps.
     let ret = unsafe {
         syscall4(
             SYS_IPC_REPLY,
             label,
-            data_count as u64,
-            cap_count as u64,
+            data_count_u64,
+            cap_count_u64,
             cap_packed,
         )
     };
@@ -948,6 +983,35 @@ pub fn mmio_split(mmio_cap: u32, split_offset: u64) -> Result<(u32, u32), i64>
     // SAFETY: syscall3 issues raw syscall instruction; mmio_cap is cap index as u64, split_offset
     // is byte offset; kernel validates cap and offset, returns packed slot indices.
     let ret = unsafe { syscall3(SYS_MMIO_SPLIT, u64::from(mmio_cap), split_offset, 0) };
+    if ret < 0
+    {
+        Err(ret)
+    }
+    else
+    {
+        let v = ret as u64;
+        Ok(((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32))
+    }
+}
+
+/// Split an `Interrupt` range cap into two non-overlapping children.
+///
+/// `split_at` is the first IRQ id of the upper child (and the exclusive
+/// upper bound of the lower child); it must satisfy
+/// `start < split_at < start + count` on the cap being split. The
+/// original cap is revoked on success; both children inherit the parent's
+/// rights. Returns packed `(lower_slot, upper_slot)`.
+///
+/// # Errors
+/// Returns a negative `i64` error code if the cap is invalid or `split_at`
+/// falls outside the cap's range.
+// cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[inline]
+pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
+{
+    // SAFETY: syscall3 issues raw syscall instruction; kernel validates cap and split point.
+    let ret = unsafe { syscall3(SYS_IRQ_SPLIT, u64::from(irq_cap), u64::from(split_at), 0) };
     if ret < 0
     {
         Err(ret)

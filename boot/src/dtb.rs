@@ -12,13 +12,18 @@
 //! Error handling: malformed nodes are skipped; partial results are returned.
 //! Fatal errors (bad magic, out-of-range offsets) return `None` / zero count.
 //!
-//! # Extending
-//! To add new resource types, add a `for_each_compatible` call in
-//! `parse_dtb_resources` with the appropriate compatible string and fill in
-//! the `PlatformResource` fields per the boot-protocol spec.
+//! # Surface
+//! - [`parse_cpu_count`]: enumerate RISC-V hart IDs from the `/cpus` node.
+//! - [`parse_aperture_seed`]: collect MMIO extents (PLIC, CLINT, UART, PCI
+//!   ECAM + ranges, `virtio,mmio` transports) as seeds for
+//!   [`super::memory_map::derive_mmio_apertures`].
+//!
+//! The arch-specific `kernel_mmio` extractor for RISC-V (PLIC + UART
+//! from compatible nodes) lives under [`crate::arch::riscv64`] and
+//! consumes the [`Fdt`] surface exposed here.
 
 use crate::bprintln;
-use boot_protocol::{PlatformResource, ResourceType};
+use boot_protocol::{MAX_CPUS, MmioAperture};
 
 // ── FDT constants ─────────────────────────────────────────────────────────────
 
@@ -52,8 +57,6 @@ pub struct Fdt
 {
     /// Physical base address of the DTB blob.
     base: u64,
-    /// Total blob size in bytes (from header field `totalsize`).
-    total_size: u32,
     /// Byte offset of the struct block from blob start.
     off_struct: u32,
     /// Size of the struct block in bytes.
@@ -65,6 +68,12 @@ pub struct Fdt
 }
 
 /// Data extracted from a single FDT node.
+///
+/// The `irq_*` fields capture the node's `interrupts` property so the
+/// walker can expose raw interrupt specifiers to callers that need them;
+/// no current consumer does, but the field is part of the node's data
+/// shape and the walker would have to be edited either way to remove it.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct FdtNode
 {
@@ -160,18 +169,11 @@ impl Fdt
 
         Some(Fdt {
             base,
-            total_size,
             off_struct,
             size_struct,
             off_strings,
             size_strings,
         })
-    }
-
-    /// Total size of the DTB blob in bytes (from the FDT `totalsize` field).
-    pub fn total_size(&self) -> u32
-    {
-        self.total_size
     }
 
     /// Read a big-endian u32 from the struct block at byte offset `off`.
@@ -232,7 +234,7 @@ impl Fdt
     // too_many_lines: DTB traversal state machine; splitting would fragment the
     // node-tracking logic across functions without meaningful abstraction.
     #[allow(clippy::too_many_lines)]
-    fn walk_compatible<F>(&self, compat: &[u8], mut callback: F)
+    pub(crate) fn walk_compatible<F>(&self, compat: &[u8], mut callback: F)
     where
         F: FnMut(FdtNode) -> bool,
     {
@@ -373,6 +375,10 @@ impl Fdt
     }
 
     /// Call `f` for each node whose `compatible` property contains `compat`.
+    ///
+    /// Only called from `arch/riscv64/serial.rs`; on x86-64 the DTB parser
+    /// is still compiled but no caller for this helper exists.
+    #[allow(dead_code)]
     pub fn for_each_compatible<F: FnMut(&FdtNode)>(&self, compat: &[u8], mut f: F)
     {
         self.walk_compatible(compat, |node| {
@@ -591,195 +597,143 @@ fn read_be64(buf: &[u8]) -> u64
 /// The generic [`Fdt::walk_compatible`] assumes `#address-cells=2`, so this
 /// function contains its own property reader for the u32 `reg` field.
 ///
-/// Returns `(0, [0;64])` if no CPU nodes are found or DTB is invalid — the
-/// caller falls back to ACPI or single-CPU operation.
+/// Returns `(0, [0; MAX_CPUS])` if no CPU nodes are found or DTB is invalid
+/// — the caller falls back to ACPI or single-CPU operation. Harts beyond
+/// [`MAX_CPUS`] are dropped with a diagnostic.
 ///
 /// # Safety
 /// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
-pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; 64])
+pub unsafe fn parse_cpu_count(dtb_addr: u64) -> (u32, [u32; MAX_CPUS])
 {
     // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
     let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
     else
     {
-        return (0, [0u32; 64]);
+        return (0, [0u32; MAX_CPUS]);
     };
 
-    let mut hart_ids = [0u32; 64];
+    let mut hart_ids = [0u32; MAX_CPUS];
     let mut count: u32 = 0;
+    let mut truncated = false;
 
     // Walk nodes compatible with "riscv". Each CPU node will have this as
     // a (prefix) compatible string. We extract reg as a single BE u32.
+    // MAX_CPUS fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let max_cpus_u32 = MAX_CPUS as u32;
     fdt.walk_cpu_nodes(|reg_u32| {
-        if count < 64
+        if count < max_cpus_u32
         {
             hart_ids[count as usize] = reg_u32;
             count += 1;
         }
+        else
+        {
+            truncated = true;
+        }
         true // continue
     });
+
+    if truncated
+    {
+        bprintln!("[--------] boot: DTB: more than MAX_CPUS hart nodes; surplus dropped");
+    }
 
     (count, hart_ids)
 }
 
-// ── Public parsing functions ──────────────────────────────────────────────────
+// ── Aperture seeder (protocol v6) ────────────────────────────────────────────
 
-/// Parse DTB and extract [`PlatformResource`] entries into `out`.
+/// Walk the DTB and collect MMIO extents into `out` for aperture seeding.
 ///
-/// Returns the number of entries written. Non-fatal on malformed nodes —
-/// logs a warning and returns partial results.
+/// Writes up to `out.len()` [`MmioAperture`] entries covering:
+/// - PLIC register window (`sifive,plic-1.0.0` / `riscv,plic0`).
+/// - CLINT register window (`riscv,clint0` / `sifive,clint0`).
+/// - UART register window (`ns16550a`).
+/// - PCI host bridge ECAM window (`pci-host-ecam-generic`, from `reg`).
+/// - PCI host bridge BAR windows (from the `ranges` property; 32-bit and
+///   64-bit MMIO spaces).
+/// - Each `virtio,mmio` register window.
 ///
-/// Resources extracted:
-/// - `riscv,plic0` / `sifive,plic-1.0.0`  → `MmioRange`
-/// - `riscv,clint0` / `sifive,clint0`      → `MmioRange`
-/// - `pci-host-ecam-generic`                → `PciEcam` + `MmioRange` (MMIO windows from `ranges`)
-/// - `virtio,mmio`                          → `MmioRange` + `IrqLine`
-/// - `ns16550a`                             → `MmioRange`
-/// - DTB blob itself                        → `PlatformTable`
+/// Callable unconditionally on every supported architecture; a zero
+/// `dtb_addr` (no DTB) is a fast no-op that returns 0. The caller
+/// typically also calls [`super::acpi::parse_aperture_seed`] to cover
+/// ACPI-only platforms (and RISC-V platforms such as QEMU+EDK2 that
+/// expose ACPI alongside a DTB); both feeds merge inside
+/// [`super::memory_map::derive_mmio_apertures`].
+///
+/// Returns the number of entries written.
 ///
 /// # Safety
-/// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
-// too_many_lines: resource extraction from multiple compatible strings is
-// inherently sequential; splitting would add indirection without clarity.
-#[allow(clippy::too_many_lines)]
-pub unsafe fn parse_dtb_resources(dtb_addr: u64, out: &mut [PlatformResource]) -> usize
+/// `dtb_addr` must be the physical address of a valid, identity-mapped
+/// FDT blob. A zero `dtb_addr` returns 0 without reading.
+pub unsafe fn parse_aperture_seed(dtb_addr: u64, out: &mut [MmioAperture]) -> usize
 {
-    // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
+    if dtb_addr == 0
+    {
+        return 0;
+    }
+    // SAFETY: caller contract.
     let Some(fdt) = (unsafe { Fdt::from_raw(dtb_addr) })
     else
     {
-        bprintln!("[--------] boot:     DTB: invalid magic, skipping");
         return 0;
     };
 
-    let mut count = 0;
+    let mut n: usize = 0;
 
-    /// Push a [`PlatformResource`] into `out` if space remains.
-    macro_rules! push_resource {
-        ($res:expr) => {
-            if count < out.len()
-            {
-                out[count] = $res;
-                count += 1;
-            }
-        };
-    }
-
-    // PLIC: riscv,plic0 or sifive,plic-1.0.0
-    for compat in [b"riscv,plic0".as_ref(), b"sifive,plic-1.0.0".as_ref()]
-    {
-        fdt.for_each_compatible(compat, |node| {
-            if node.reg_count > 0
-            {
-                push_resource!(PlatformResource {
-                    resource_type: ResourceType::MmioRange,
-                    flags: 0,
-                    base: node.reg_entries[0].0,
-                    size: node.reg_entries[0].1.max(4096),
-                    id: 0,
-                });
-            }
-        });
-    }
-
-    // CLINT: riscv,clint0 or sifive,clint0
-    for compat in [b"riscv,clint0".as_ref(), b"sifive,clint0".as_ref()]
-    {
-        fdt.for_each_compatible(compat, |node| {
-            if node.reg_count > 0
-            {
-                push_resource!(PlatformResource {
-                    resource_type: ResourceType::MmioRange,
-                    flags: 0,
-                    base: node.reg_entries[0].0,
-                    size: node.reg_entries[0].1.max(4096),
-                    id: 0,
-                });
-            }
-        });
-    }
-
-    // PCIe ECAM: pci-host-ecam-generic
-    // flags = (start_bus=0) | (end_bus=255 << 8) = 0xFF00 (default full range).
-    // To-do: parse `bus-range` property for accurate values.
-    fdt.for_each_compatible(b"pci-host-ecam-generic", |node| {
-        if node.reg_count > 0
+    // Helper closure factory for each compatible string that contributes
+    // its first `reg` entry.
+    let push_first_reg = |out: &mut [MmioAperture], n: &mut usize, node: &FdtNode| {
+        if *n < out.len() && node.reg_count > 0 && node.reg_entries[0].1 > 0
         {
-            push_resource!(PlatformResource {
-                resource_type: ResourceType::PciEcam,
-                flags: 0xFF00, // start_bus=0, end_bus=255
-                base: node.reg_entries[0].0,
-                size: node.reg_entries[0].1.max(4096),
-                id: 0,
-            });
+            out[*n] = MmioAperture {
+                phys_base: node.reg_entries[0].0,
+                size: node.reg_entries[0].1,
+            };
+            *n += 1;
         }
+    };
 
-        // PCI MMIO windows from `ranges` property.
-        // child_flags bits 25:24 encode space type: 2 = 32-bit MMIO, 3 = 64-bit MMIO.
+    for compat in [
+        &b"sifive,plic-1.0.0"[..],
+        &b"riscv,plic0"[..],
+        &b"riscv,clint0"[..],
+        &b"sifive,clint0"[..],
+        &b"ns16550a"[..],
+    ]
+    {
+        fdt.walk_compatible(compat, |node| {
+            push_first_reg(out, &mut n, &node);
+            true
+        });
+    }
+
+    // PCI host bridge — reg is the ECAM window; ranges entries with
+    // child-space 2 (32-bit MMIO) or 3 (64-bit MMIO) are BAR windows.
+    fdt.walk_compatible(b"pci-host-ecam-generic", |node| {
+        push_first_reg(out, &mut n, &node);
         for i in 0..node.ranges_count
         {
             let (flags, cpu_addr, size) = node.ranges_entries[i];
-            let space_type = (flags >> 24) & 0x03;
-            if space_type == 2 || space_type == 3
+            let space = (flags >> 24) & 0x3;
+            if (space == 2 || space == 3) && n < out.len() && size > 0
             {
-                push_resource!(PlatformResource {
-                    resource_type: ResourceType::MmioRange,
-                    flags: 0,
-                    base: cpu_addr,
+                out[n] = MmioAperture {
+                    phys_base: cpu_addr,
                     size,
-                    id: 0,
-                });
+                };
+                n += 1;
             }
         }
+        true
     });
 
-    // VirtIO MMIO devices: virtio,mmio
-    fdt.for_each_compatible(b"virtio,mmio", |node| {
-        if node.reg_count > 0
-        {
-            push_resource!(PlatformResource {
-                resource_type: ResourceType::MmioRange,
-                flags: 0,
-                base: node.reg_entries[0].0,
-                size: node.reg_entries[0].1.max(4096),
-                id: 0,
-            });
-        }
-        // Emit interrupt line for this device.
-        if node.irq_count > 0
-        {
-            push_resource!(PlatformResource {
-                resource_type: ResourceType::IrqLine,
-                flags: 0, // edge/level determined by platform
-                base: 0,
-                size: 0,
-                id: u64::from(node.irq_entries[0]),
-            });
-        }
+    // Each VirtIO MMIO transport advertises its own register window.
+    fdt.walk_compatible(b"virtio,mmio", |node| {
+        push_first_reg(out, &mut n, &node);
+        true
     });
 
-    // UART: ns16550a
-    fdt.for_each_compatible(b"ns16550a", |node| {
-        if node.reg_count > 0
-        {
-            push_resource!(PlatformResource {
-                resource_type: ResourceType::MmioRange,
-                flags: 0,
-                base: node.reg_entries[0].0,
-                size: node.reg_entries[0].1.max(4096),
-                id: 0,
-            });
-        }
-    });
-
-    // DTB blob itself → PlatformTable (id=0: DTB).
-    push_resource!(PlatformResource {
-        resource_type: ResourceType::PlatformTable,
-        flags: 0,
-        base: dtb_addr,
-        size: u64::from(fdt.total_size()),
-        id: 0,
-    });
-
-    count
+    n
 }

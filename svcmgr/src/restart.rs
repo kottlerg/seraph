@@ -18,7 +18,7 @@ use crate::service::{
     CRITICALITY_FATAL, CRITICALITY_NORMAL, MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE,
     ServiceEntry,
 };
-use ipc::{IpcBuf, procmgr_labels};
+use ipc::{IpcMessage, procmgr_labels};
 
 /// Monotonic counter for restart-child bootstrap tokens.
 static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -29,7 +29,7 @@ pub struct RestartCtx
 {
     pub procmgr_ep: u32,
     pub bootstrap_ep: u32,
-    pub ipc: IpcBuf,
+    pub ipc_buf: *mut u64,
     pub ws_cap: u32,
 }
 
@@ -122,7 +122,9 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
     // == 0` on first death, and we skip; subsequent deaths reclaim.
     if svc.process_handle != 0
     {
-        let _ = syscall::ipc_call(svc.process_handle, procmgr_labels::DESTROY_PROCESS, 0, &[]);
+        let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+        // SAFETY: ctx.ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_call(svc.process_handle, &destroy_msg, ctx.ipc_buf) };
         let _ = syscall::cap_delete(svc.process_handle);
         svc.process_handle = 0;
     }
@@ -135,7 +137,7 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
     svc.process_handle = process_handle;
 
     // Start the new process.
-    if !start_process(process_handle)
+    if !start_process(process_handle, ctx.ipc_buf)
     {
         return false;
     }
@@ -170,14 +172,17 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
         cap_count += 1;
     }
 
-    if ipc::bootstrap::serve_round(
-        ctx.bootstrap_ep,
-        child_token,
-        ctx.ipc,
-        true,
-        &restart_caps[..cap_count],
-        &[],
-    )
+    // SAFETY: ctx.ipc_buf is the registered IPC buffer.
+    if unsafe {
+        ipc::bootstrap::serve_round(
+            ctx.bootstrap_ep,
+            child_token,
+            ctx.ipc_buf,
+            true,
+            &restart_caps[..cap_count],
+            &[],
+        )
+    }
     .is_err()
     {
         println!("svcmgr: bootstrap serve failed");
@@ -211,24 +216,22 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
         buf[..n].copy_from_slice(&svc.name[..n]);
         u64::from_le_bytes(buf)
     };
-    ctx.ipc.write_word(0, stdio_token);
 
-    let (reply_label, _) = syscall::ipc_call(
-        ctx.procmgr_ep,
-        procmgr_labels::CREATE_PROCESS,
-        1,
-        &[module_copy, tokened_creator],
-    )
-    .ok()?;
-    if reply_label != 0
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+        .word(0, stdio_token)
+        .cap(module_copy)
+        .cap(tokened_creator)
+        .build();
+    // SAFETY: ctx.ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(ctx.procmgr_ep, &create_msg, ctx.ipc_buf) }.ok()?;
+    if reply.label != 0
     {
         println!("svcmgr: restart CREATE_PROCESS failed");
         return None;
     }
 
-    // SAFETY: ipc buffer wraps the registered IPC page.
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ctx.ipc.as_ptr()) };
-    if cap_count < 2
+    let reply_caps = reply.caps();
+    if reply_caps.len() < 2
     {
         println!("svcmgr: restart reply missing caps");
         return None;
@@ -238,12 +241,12 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
 }
 
 /// Send `START_PROCESS` via the tokened process handle.
-fn start_process(process_handle: u32) -> bool
+fn start_process(process_handle: u32, ipc_buf: *mut u64) -> bool
 {
-    if !matches!(
-        syscall::ipc_call(process_handle, procmgr_labels::START_PROCESS, 0, &[]),
-        Ok((0, _))
-    )
+    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) };
+    if !matches!(reply, Ok(r) if r.label == 0)
     {
         println!("svcmgr: restart START_PROCESS failed");
         return false;

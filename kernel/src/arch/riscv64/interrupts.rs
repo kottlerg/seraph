@@ -18,9 +18,11 @@
 //! - U-mode ecall (scause = 8) → `syscall::syscall_stub()`
 //! - All other exceptions → print diagnostics + `fatal()`
 //!
-//! # PLIC layout (QEMU virt machine)
-//! Base physical address `0x0C00_0000`, accessed via the direct map.
-//! - Priority registers: base + 4*source (sources 1–127).
+//! # PLIC layout
+//! Base physical address is supplied by the bootloader through
+//! `BootInfo.kernel_mmio.plic_base` (see [`super::platform::plic_base`]) and
+//! accessed via the direct map. Register offsets follow the RISC-V PLIC spec:
+//! - Priority registers: base + 4*source (sources `1..=PLIC_NUM_SOURCES`).
 //! - Enable registers:  base + 0x2080 + 4*word  (hart 0 S-mode context).
 //! - Threshold:         base + `0x20_1000`.
 //! - Claim/Complete:    base + `0x20_1004`.
@@ -35,9 +37,6 @@ use super::trap_frame::TrapFrame;
 use crate::mm::paging::DIRECT_MAP_BASE;
 
 // ── PLIC constants ────────────────────────────────────────────────────────────
-
-/// PLIC physical base address (QEMU virt machine).
-const PLIC_BASE_PHYS: u64 = 0x0C00_0000;
 
 /// PLIC priority register base: base + 4 * `source_id` (source 1..=127).
 const PLIC_PRIORITY_BASE: u64 = 0x0000;
@@ -59,7 +58,7 @@ fn plic_enable_base() -> u64
 
 /// Compute the PLIC S-mode enable-bits base for the given hart.
 ///
-/// Context numbering on QEMU `virt`: M-mode = `hart*2`, S-mode = `hart*2+1`.
+/// Standard PLIC context numbering: M-mode = `hart*2`, S-mode = `hart*2+1`.
 /// Enable base = 0x2000 + context * 0x80.
 const fn plic_enable_base_for(hart: u32) -> u64
 {
@@ -86,23 +85,26 @@ fn plic_claim_complete_offset() -> u64
     plic_threshold_offset() + 4
 }
 
-/// Number of PLIC interrupt sources supported on the QEMU virt machine.
+/// Conservative cap on the PLIC source number the kernel programs. The
+/// RISC-V PLIC spec admits up to 1023 sources; every targeted platform
+/// exposes far fewer, and the buddy-walked enable bitmap stays cheap at this
+/// bound.
 const PLIC_NUM_SOURCES: u32 = 127;
 
 // ── PLIC access helpers ───────────────────────────────────────────────────────
 
 fn plic_read(offset: u64) -> u32
 {
-    let vaddr = DIRECT_MAP_BASE + PLIC_BASE_PHYS + offset;
-    // SAFETY: PLIC_BASE_PHYS mapped via direct map; offset within PLIC MMIO range;
+    let vaddr = DIRECT_MAP_BASE + super::platform::plic_base() + offset;
+    // SAFETY: PLIC base mapped via direct map; offset within PLIC MMIO range;
     // volatile read ensures ordering and prevents compiler reordering.
     unsafe { core::ptr::read_volatile(vaddr as *const u32) }
 }
 
 unsafe fn plic_write(offset: u64, val: u32)
 {
-    let vaddr = DIRECT_MAP_BASE + PLIC_BASE_PHYS + offset;
-    // SAFETY: PLIC_BASE_PHYS mapped via direct map; offset within PLIC MMIO range;
+    let vaddr = DIRECT_MAP_BASE + super::platform::plic_base() + offset;
+    // SAFETY: PLIC base mapped via direct map; offset within PLIC MMIO range;
     // volatile write ensures the access is not elided or reordered by the
     // compiler.
     unsafe { core::ptr::write_volatile(vaddr as *mut u32, val) };
@@ -398,15 +400,15 @@ fn handle_software_interrupt()
             .fetch_and(!my_bit, core::sync::atomic::Ordering::Release);
     }
 
-    // Signal the idle loop that a wakeup IPI was received. The idle loop
-    // checks this flag before wfi and skips the halt if set, ensuring
-    // enqueued work is noticed immediately without waiting for the timer.
+    // Wakeup IPIs carry no handler work beyond the hardware-mandated SSIP
+    // acknowledgement (performed by the caller via `clear_sip_ssip`). The
+    // reschedule-pending flag is set producer-side in `enqueue_and_wake`,
+    // so the handler does not need to touch it here.
     //
-    // We cannot call schedule() directly from the interrupt handler
-    // because schedule() is not reentrant — this interrupt may fire
-    // while schedule() is already on the call stack (interrupts are
-    // briefly enabled between scheduler lock release and switch).
-    crate::sched::set_reschedule_pending();
+    // The IPI's purpose is purely to break the target hart out of `wfi`;
+    // correctness of the wake is provided by the producer-side flag plus
+    // the atomic check-and-halt in the idle loop. See
+    // `kernel/src/sched/mod.rs` `RESCHEDULE_PENDING` doc.
 }
 
 /// Clear the supervisor software interrupt pending bit (SIP.SSIP).
@@ -1110,12 +1112,6 @@ fn dump_riscv_regs_to(f: &super::trap_frame::TrapFrame, console: bool)
 mod tests
 {
     use super::*;
-
-    #[test]
-    fn plic_base_phys()
-    {
-        assert_eq!(PLIC_BASE_PHYS, 0x0C00_0000);
-    }
 
     #[test]
     fn plic_threshold_offset()

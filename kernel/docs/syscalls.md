@@ -1384,7 +1384,7 @@ all its descendants (including C2) but leaves C and any other children of C inta
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `FLAG_DMA_UNSAFE` | bit 2 | `SYS_DMA_GRANT` flag acknowledging unprotected DMA |
 | `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |
-| `BOOT_PROTOCOL_VERSION` | 2 | Expected version in `BootInfo.version` |
+| `BOOT_PROTOCOL_VERSION` | 5 | Expected version in `BootInfo.version` |
 
 `MSG_DATA_WORDS_MAX` is fixed at implementation time. A value of 4–8 words balances
 message capacity against syscall overhead. The exact value becomes stable ABI.

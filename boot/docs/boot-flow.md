@@ -1,8 +1,10 @@
 # Boot Flow
 
 This document describes the bootloader's execution from `efi_main` to kernel handoff.
-The contract at handoff is defined in [docs/boot-protocol.md](../../docs/boot-protocol.md);
-this document covers how the bootloader fulfils that contract.
+The contract at handoff is defined in [kernel-handoff.md](kernel-handoff.md)
+(CPU state and register contents) and in the
+[`abi/boot-protocol/`](../../abi/boot-protocol/) crate (`BootInfo` layout
+and version); this document covers how the bootloader fulfils that contract.
 
 ---
 
@@ -96,26 +98,30 @@ for identity mapping so they remain accessible after page table switch.
 
 Detail: [elf-loading.md](elf-loading.md)
 
-### Step 5: Firmware Discovery and Platform Resources
+### Step 5: Firmware Discovery and CPU Topology
 
 The UEFI configuration table is scanned for two GUIDs:
 - `EFI_ACPI_20_TABLE_GUID` → physical address of the ACPI RSDP
 - `EFI_DTB_TABLE_GUID` → physical address of the Device Tree blob
 
 Both GUIDs are searched unconditionally; absent entries produce a zero field in
-`BootInfo`. After discovery, the bootloader immediately parses whichever firmware
-tables are present:
+`BootInfo`. Whichever tables are present are passed through to userspace as
+opaque physical addresses (`BootInfo.acpi_rsdp`, `BootInfo.device_tree`).
 
-- If ACPI is present: `parse_acpi_resources()` walks the XSDT and extracts MADT
-  (local APIC base, I/O APIC addresses), MCFG (PCI ECAM windows), and SPCR entries
-  into `PlatformResource` descriptors.
-- If a DTB is present: `parse_dtb_resources()` walks the FDT and extracts PLIC,
-  CLINT, PCIe ECAM, and UART nodes.
+The bootloader also extracts two narrow views from the firmware tables for
+the kernel's own consumption:
 
-The resulting descriptors are sorted by `(resource_type, base)` and stored in a
-physical page that is passed to the kernel via `BootInfo.platform_resources`. Deep
-interpretation of these resources (driver binding, DMA configuration) is left to
-`devmgr` in userspace; the bootloader only produces the raw descriptors.
+- **CPU topology** — MADT `LocalApic` / `RINTC` entries (ACPI) and `/cpus`
+  nodes (DTB) populate `BootInfo.cpu_count`, `bsp_id`, and `cpu_ids`.
+- **`kernel_mmio`** — arch-specific MMIO bases: LAPIC / IOAPIC on x86-64
+  (from MADT), PLIC / UART on RISC-V (from MADT `PLIC` type or DTB
+  compatible nodes).
+
+A third extraction produces **seed entries** for `mmio_apertures` —
+coarse `{phys_base, size}` regions the kernel mints as `MmioRegion`
+capabilities. The seed covers LAPIC / IOAPIC / PLIC / ECAM / BAR
+windows / `virtio,mmio` transports from the firmware tables and is
+merged with the UEFI memory map's `MemoryMappedIO` regions in step 8.
 
 Detail: [firmware-parsing.md](firmware-parsing.md)
 
@@ -155,7 +161,7 @@ Detail: [uefi-environment.md](uefi-environment.md)
 
 `BootInfo` is populated in-place in a physical memory region allocated before step 8.
 All pointer and address fields hold physical addresses; no virtual addresses appear in
-`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `3`).
+`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `6`).
 Fields are populated as follows:
 
 | Field | Source |
@@ -170,8 +176,13 @@ Fields are populated as follows:
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
-| `platform_resources` | Sorted `PlatformResource` array from step 5 (ACPI/DTB parsing); count = 0 if no firmware tables found |
+| `kernel_mmio` | Arch-specific MMIO bases extracted from firmware tables in step 5 (see `firmware-parsing.md`). Fields the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults. |
+| `mmio_apertures` | Coarse `{phys_base, size}` array from step 8 (UEFI MMIO regions merged with firmware-table seeds). Empty if no MMIO regions were reported. |
 | `command_line` | Physical address of null-terminated ASCII string; may be empty |
+| `cpu_count` | Enabled LAPIC count from MADT (x86-64) or enabled RINTC / DTB hart count (RISC-V); always ≥ 1 |
+| `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
+| `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
+| `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed (SMP disabled). |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
 memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel
@@ -183,7 +194,8 @@ CPU state is established per the boot protocol and the kernel entry point is cal
 This step is the point of no return: the bootloader has no code to execute after the
 jump, and `kernel_entry` is declared `-> !`.
 
-See [Kernel Handoff](#kernel-handoff) for the architecture-specific setup.
+The architecture-specific CPU-state contract and register-setup sequence are owned
+by [kernel-handoff.md](kernel-handoff.md).
 
 ---
 
@@ -199,67 +211,12 @@ reclaim before reading all fields. In practice this means placing it in a range 
 memory map marks as `Loaded`, which the kernel treats as in-use until it explicitly
 chooses to reclaim it.
 
-Slices within `BootInfo` (`memory_map`, `modules`, `platform_resources`) point to
+Slices within `BootInfo` (`memory_map`, `modules`, `mmio_apertures`) point to
 separately allocated physical regions. These regions must also remain readable until
 the kernel has consumed them.
 
 ---
 
-## Kernel Handoff
-
-### x86-64
-
-```
-1. Clear DF (direction flag) via CLD
-2. CLI — interrupts remain disabled (they are already disabled post-ExitBootServices,
-   but this is explicit)
-3. Install the page table: MOV cr3, <root PML4 physical address>
-   (a full TLB flush occurs because the previous CR3 is replaced)
-4. Set rdi = physical address of BootInfo (first argument register, System V AMD64 ABI)
-5. JMP to kernel_entry — does not return
-```
-
-The bootloader-provided GDT remains active. The kernel replaces it in Phase 5 of
-its initialisation sequence. The IDT is not loaded; interrupts must stay disabled
-until the kernel installs its own. SSE/AVX are not initialised.
-
-### RISC-V (RV64GC)
-
-```
-1. Ensure sstatus.SIE = 0 (interrupts disabled)
-2. Install the page table: write Sv48 satp value (MODE=9, ASID=0, PPN=root/4096)
-   via CSRW satp; execute SFENCE.VMA to flush the TLB
-3. Set a0 = physical address of BootInfo (first argument register)
-4. Set a1 = hart ID obtained from EFI_RISCV_BOOT_PROTOCOL during step 1
-5. JALR to kernel_entry — does not return
-```
-
-Secondary harts remain in the UEFI firmware's spin loop or halted state until the
-kernel releases them via SBI HSM calls during SMP bringup.
-
----
-
-## Shared Types: boot-protocol Crate
-
-The `boot-protocol` crate (`boot/protocol/`) defines all types shared between the
-bootloader and the kernel. Its constraints:
-
-- **`#![no_std]`** — no standard library dependency; the crate links into both the
-  UEFI bootloader and the `no_std` kernel without modification
-- **`#[repr(C)]`** on all shared types — layout must be stable across independently
-  compiled crates and future compiler versions
-- **`BOOT_PROTOCOL_VERSION: u32 = 3`** — a version constant embedded by both the
-  bootloader and the kernel; the kernel halts at entry if the field value does not
-  match this constant
-
-The crate contains no logic — only type definitions and the version constant. It must
-not import any crate that has an `std` dependency. When the boot protocol changes in
-an incompatible way (new fields, reordered fields, changed enum discriminants),
-`BOOT_PROTOCOL_VERSION` is incremented and both the bootloader and the kernel are
-updated in the same commit.
-
----
-
 ## Summarized By
 
-None
+[boot/README.md](../README.md)

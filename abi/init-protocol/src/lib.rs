@@ -29,9 +29,14 @@
 
 /// Init protocol version. Incremented on any breaking layout or semantic change.
 ///
+/// v5: Range-cap semantics on `CapType::Interrupt` (`aux0 = start`,
+///     `aux1 = count`). Dropped `CapType::PciEcam`. Added named
+///     `InitInfo` slots for the root IRQ range cap and firmware-table
+///     Frame caps (RSDP, ACPI reclaimable regions, DTB).
+/// v4: Added `cspace_cap` slot for init's own `CSpace` cap.
 /// v3: Added `cmdline_offset`, `cmdline_len`, and `sbi_control_cap` for kernel
 ///     command line passthrough and RISC-V SBI forwarding.
-pub const INIT_PROTOCOL_VERSION: u32 = 4;
+pub const INIT_PROTOCOL_VERSION: u32 = 5;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -145,6 +150,41 @@ pub struct InitInfo
     /// Init needs this to create threads bound to its own `CSpace` (e.g. a log
     /// thread that shares init's capability namespace). Added in protocol v4.
     pub cspace_cap: u32,
+
+    // ── Root IRQ range + firmware-table caps (added in protocol v5) ─────
+    /// Slot index of the root `Interrupt` range capability.
+    ///
+    /// Covers the full valid IRQ range for the target arch (x86-64: GSI
+    /// 0..256; RISC-V: PLIC sources 0..N). Userspace splits this cap
+    /// with `SYS_IRQ_SPLIT` to produce single-IRQ sub-caps for device
+    /// drivers. Zero if no valid range could be determined at boot.
+    pub irq_range_cap: u32,
+
+    /// Slot index of the read-only `Frame` cap covering the 4 KiB page
+    /// that contains the ACPI RSDP.
+    ///
+    /// RSDP commonly lives in firmware-reserved memory outside
+    /// `AcpiReclaimable`, so it gets its own slot. Zero if no RSDP
+    /// address was reported (pure-DTB platforms).
+    pub acpi_rsdp_frame_cap: u32,
+
+    /// First slot index of the read-only `Frame` caps covering each
+    /// `MemoryType::AcpiReclaimable` region in the boot memory map.
+    pub acpi_region_frame_base: u32,
+
+    /// Number of ACPI reclaimable-region `Frame` caps.
+    pub acpi_region_frame_count: u32,
+
+    /// Slot index of the read-only `Frame` cap covering the DTB blob,
+    /// or zero if no DTB was supplied (pure-ACPI platforms).
+    pub dtb_frame_cap: u32,
+
+    /// Explicit 4-byte tail pad so `size_of::<InitInfo>()` stays 8-byte
+    /// aligned. Consumers of `cap_descriptors_offset` rely on this: the
+    /// `CapDescriptor` array that immediately follows contains u64
+    /// fields and must start on an 8-byte boundary.
+    #[doc(hidden)]
+    pub _pad_tail: u32,
 }
 
 // ── CapDescriptor / CapType ──────────────────────────────────────────────────
@@ -172,7 +212,7 @@ pub struct CapDescriptor
     /// Type-specific primary metadata:
     /// - `Frame`: physical base address
     /// - `MmioRegion`: physical base address
-    /// - `Interrupt`: IRQ line number
+    /// - `Interrupt`: starting IRQ line number (range cap; split via `SYS_IRQ_SPLIT`)
     /// - `IoPortRange`: I/O port base
     /// - `SchedControl`: 0 (unused)
     pub aux0: u64,
@@ -180,7 +220,7 @@ pub struct CapDescriptor
     /// Type-specific secondary metadata:
     /// - `Frame`: size in bytes
     /// - `MmioRegion`: size in bytes
-    /// - `Interrupt`: flags
+    /// - `Interrupt`: number of consecutive IRQ lines covered by the cap
     /// - `IoPortRange`: port count
     /// - `SchedControl`: 0 (unused)
     pub aux1: u64,
@@ -197,7 +237,8 @@ pub enum CapType
 {
     /// Physical memory frame(s). Matches `CapTag::Frame = 1`.
     Frame = 1,
-    /// Hardware interrupt line. Matches `CapTag::Interrupt = 6`.
+    /// Hardware interrupt range. Matches `CapTag::Interrupt = 6`.
+    /// `aux0 = start`, `aux1 = count`. Use `SYS_IRQ_SPLIT` to narrow.
     Interrupt = 6,
     /// Memory-mapped I/O region. Matches `CapTag::MmioRegion = 7`.
     MmioRegion = 7,
@@ -207,9 +248,6 @@ pub enum CapType
     SchedControl = 12,
     /// SBI forwarding authority (RISC-V only). Matches `CapTag::SbiControl = 13`.
     SbiControl = 13,
-    /// PCI ECAM configuration space region. Underlying cap is `MmioRegion`;
-    /// this discriminant lets userspace distinguish ECAM windows from other MMIO.
-    PciEcam = 14,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

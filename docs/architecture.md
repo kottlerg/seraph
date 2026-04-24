@@ -79,7 +79,8 @@ under explicit capability grants.
 
 **init**
 First userspace process. Starts procmgr, requests early services (devmgr, svcmgr,
-drivers, vfsd), delegates capabilities, and exits. See [boot-protocol.md](boot-protocol.md).
+drivers, vfsd), delegates capabilities, and exits. See
+[`abi/boot-protocol/`](../abi/boot-protocol/).
 
 **procmgr**
 Process lifecycle manager. All post-boot process creation, ELF loading, and teardown
@@ -147,7 +148,7 @@ live in the component scope:
   [`init/docs/bootstrap.md`](../init/docs/bootstrap.md).
 
 Boot modules (procmgr, devmgr, drivers, etc.) are configurable via `boot.conf`
-per [`boot-protocol.md`](boot-protocol.md); the minimum set is procmgr, devmgr,
+per [`abi/boot-protocol/`](../abi/boot-protocol/); the minimum set is procmgr, devmgr,
 one block driver, one FS driver, and vfsd.
 
 ---

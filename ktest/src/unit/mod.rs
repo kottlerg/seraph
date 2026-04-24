@@ -227,6 +227,10 @@ pub fn run_all(ctx: &TestContext)
         "ipc::recv_untokened_returns_zero",
         ipc::recv_untokened_returns_zero(ctx)
     );
+    run_test!(
+        "ipc::recv_snapshot_survives_buffer_clobber",
+        ipc::recv_snapshot_survives_buffer_clobber(ctx)
+    );
 
     // ── Thread syscalls ───────────────────────────────────────────────────────
     run_test!("thread::configure_start", thread::configure_start(ctx));

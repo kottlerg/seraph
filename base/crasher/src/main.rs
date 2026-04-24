@@ -69,10 +69,12 @@ fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, usize)
     {
         return (0, 0);
     }
+    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = ipc_buffer.cast::<u64>();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
     // boot protocol.
-    let ipc = unsafe { ipc::IpcBuf::from_bytes(ipc_buffer) };
-    let Ok(round) = ipc::bootstrap::request_round(creator_ep, ipc)
+    let Ok(round) = (unsafe { ipc::bootstrap::request_round(creator_ep, ipc_buf) })
     else
     {
         return (0, 0);
@@ -94,24 +96,18 @@ fn bootstrap_caps(creator_ep: u32, ipc_buffer: *mut u8) -> (u32, usize)
 /// bundle cap was not re-injected after restart.
 fn probe_svcmgr(svcmgr_cap: u32, ipc_buffer: *mut u8)
 {
-    // SAFETY: IPC buffer is registered and page-aligned.
-    let ipc = unsafe { ipc::IpcBuf::from_bytes(ipc_buffer) };
+    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = ipc_buffer.cast::<u64>();
     let probe_name = b"__probe__";
     let name_len = probe_name.len();
-    for (i, &b) in probe_name.iter().enumerate()
-    {
-        let word_idx = i / 8;
-        let byte_idx = i % 8;
-        let existing = ipc.read_word(word_idx);
-        let shifted = u64::from(b) << (byte_idx * 8);
-        let mask = 0xFFu64 << (byte_idx * 8);
-        ipc.write_word(word_idx, (existing & !mask) | shifted);
-    }
     let label = ipc::svcmgr_labels::QUERY_ENDPOINT | ((name_len as u64) << 16);
-    let data_words = name_len.div_ceil(8);
-    match syscall::ipc_call(svcmgr_cap, label, data_words, &[])
+    let msg = ipc::IpcMessage::builder(label).bytes(0, probe_name).build();
+    // SAFETY: `ipc_buf` is the kernel-registered, page-aligned IPC buffer
+    // page installed by `_start`.
+    match unsafe { ipc::ipc_call(svcmgr_cap, &msg, ipc_buf) }
     {
-        Ok((reply, _)) => println!("crasher: svcmgr probe reply={reply}"),
+        Ok(reply) => println!("crasher: svcmgr probe reply={}", reply.label),
         Err(_) => println!("crasher: svcmgr probe ipc_call failed"),
     }
 }

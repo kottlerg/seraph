@@ -13,6 +13,7 @@ test = false
 [dependencies]
 font          = { workspace = true }
 init-protocol = { path = "../abi/init-protocol" }
+ipc           = { path = "../shared/ipc" }
 syscall       = { path = "../shared/syscall" }
 syscall-abi   = { path = "../abi/syscall" }
 

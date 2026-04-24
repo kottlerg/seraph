@@ -19,7 +19,7 @@
 
 mod io;
 
-use ipc::{IpcBuf, blk_labels, devmgr_labels, procmgr_labels};
+use ipc::{IpcMessage, blk_labels, devmgr_labels, procmgr_labels};
 use std::os::seraph::{StartupInfo, startup_info};
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
@@ -143,7 +143,7 @@ struct DriverCaps
     self_aspace: u32,
 }
 
-fn bootstrap_caps(info: &StartupInfo, ipc: IpcBuf) -> Option<DriverCaps>
+fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
 {
     let creator = info.creator_endpoint;
     if creator == 0
@@ -151,13 +151,15 @@ fn bootstrap_caps(info: &StartupInfo, ipc: IpcBuf) -> Option<DriverCaps>
         return None;
     }
 
-    let round1 = ipc::bootstrap::request_round(creator, ipc).ok()?;
+    // SAFETY: `ipc_buf` is the registered IPC buffer for this thread.
+    let round1 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
     if round1.cap_count < 3 || round1.done
     {
         return None;
     }
 
-    let round2 = ipc::bootstrap::request_round(creator, ipc).ok()?;
+    // SAFETY: same invariant.
+    let round2 = unsafe { ipc::bootstrap::request_round(creator, ipc_buf) }.ok()?;
     if round2.cap_count < 1 || !round2.done
     {
         return None;
@@ -180,19 +182,20 @@ fn bootstrap_caps(info: &StartupInfo, ipc: IpcBuf) -> Option<DriverCaps>
 /// The driver's devmgr endpoint is tokened — the token identifies the device.
 fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 {
-    let Ok((label, _)) = syscall::ipc_call(devmgr_ep, devmgr_labels::QUERY_DEVICE_INFO, 0, &[])
+    let request = IpcMessage::new(devmgr_labels::QUERY_DEVICE_INFO);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(devmgr_ep, &request, ipc_buf) })
     else
     {
         println!("virtio-blk: QUERY_DEVICE_INFO ipc_call failed");
         syscall::thread_exit();
     };
-    if label != 0
+    if reply.label != 0
     {
         println!("virtio-blk: QUERY_DEVICE_INFO returned error");
         syscall::thread_exit();
     }
-    // SAFETY: ipc_buf is the registered IPC buffer; devmgr wrote IPC_WORD_COUNT words.
-    unsafe { VirtioPciStartupInfo::read_from_ipc(ipc_buf.cast_const()) }
+    VirtioPciStartupInfo::from_words(reply.words())
 }
 
 // ── Frame allocation via procmgr IPC ───────────────────────────────────────
@@ -201,27 +204,22 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 /// on success.
 fn request_frames(procmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<u32>
 {
+    let request = IpcMessage::builder(procmgr_labels::REQUEST_FRAMES)
+        .word(0, page_count)
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    unsafe { ipc::IpcBuf::from_raw(ipc_buf) }.write_word(0, page_count);
-
-    let Ok((label, _)) = syscall::ipc_call(procmgr_ep, procmgr_labels::REQUEST_FRAMES, 1, &[])
-    else
-    {
-        return None;
-    };
-    if label != 0
+    let reply = unsafe { ipc::ipc_call(procmgr_ep, &request, ipc_buf) }.ok()?;
+    if reply.label != 0
     {
         return None;
     }
 
-    // SAFETY: ipc_buf is registered IPC buffer.
-    #[allow(clippy::cast_ptr_alignment)]
-    let (cap_count, cap_slots) = unsafe { syscall::read_recv_caps(ipc_buf) };
-    if (cap_count as u64) < page_count
+    let caps = reply.caps();
+    if (caps.len() as u64) < page_count
     {
         return None;
     }
-    Some(cap_slots[0])
+    Some(caps[0])
 }
 
 // ── Device initialisation ──────────────────────────────────────────────────
@@ -420,25 +418,28 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
     println!("virtio-blk: ready, entering service loop");
     loop
     {
-        let Ok((label, token)) = syscall::ipc_recv(service_ep)
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let Ok(msg) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
         else
         {
             continue;
         };
 
-        match label
+        match msg.label
         {
             blk_labels::READ_BLOCK =>
             {
-                handle_read_block(token, ipc_buf, rt);
+                handle_read_block(&msg, ipc_buf, rt);
             }
             blk_labels::REGISTER_PARTITION =>
             {
-                handle_register_partition(token, ipc_buf, rt);
+                handle_register_partition(&msg, ipc_buf, rt);
             }
             _ =>
             {
-                let _ = syscall::ipc_reply(ipc::blk_errors::UNKNOWN_OPCODE, 0, &[]);
+                let reply = IpcMessage::new(ipc::blk_errors::UNKNOWN_OPCODE);
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             }
         }
     }
@@ -453,17 +454,25 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 /// - `token != 0`: tokened (partition-scoped) endpoint. The `sector` word
 ///   is partition-relative; the driver translates to absolute LBA using
 ///   the registered bound and rejects out-of-range reads.
-fn handle_read_block(token: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+fn handle_read_block(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let sector = unsafe { ipc::IpcBuf::from_raw(ipc_buf) }.read_word(0);
+    let sector = if msg.word_count() >= 1
+    {
+        msg.word(0)
+    }
+    else
+    {
+        0
+    };
 
-    let absolute_sector = match resolve_sector(token, sector, rt)
+    let absolute_sector = match resolve_sector(msg.token, sector, rt)
     {
         Ok(s) => s,
         Err(code) =>
         {
-            let _ = syscall::ipc_reply(code, 0, &[]);
+            let reply = IpcMessage::new(code);
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             return;
         }
     };
@@ -480,13 +489,18 @@ fn handle_read_block(token: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime)
     {
         let status = rt.layout.read_status();
         let code = u64::from(status);
-        let _ = syscall::ipc_reply(code, 0, &[]);
+        let reply = IpcMessage::new(code);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     }
 
-    // SAFETY: ipc_buf is the registered IPC buffer with at least 64 writable words.
-    unsafe { rt.layout.copy_sector_to_ipc(ipc_buf) };
-    let _ = syscall::ipc_reply(ipc::blk_errors::SUCCESS, 64, &[]);
+    let sector_words = rt.layout.sector_words();
+    let reply = IpcMessage::builder(ipc::blk_errors::SUCCESS)
+        .words(0, &sector_words)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Translate a caller-supplied sector number into an absolute device LBA,
@@ -529,25 +543,34 @@ fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 ///
 /// Data words: `[token, base_lba, length_lba]`. The registered bound must
 /// lie within device capacity; a zero token or zero length is rejected.
-fn handle_register_partition(caller_token: u64, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
-    if caller_token != 0
+    let reject = |ipc_buf: *mut u64| {
+        let reply = IpcMessage::new(ipc::blk_errors::REGISTER_REJECTED);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    };
+
+    if msg.token != 0
     {
-        let _ = syscall::ipc_reply(ipc::blk_errors::REGISTER_REJECTED, 0, &[]);
+        reject(ipc_buf);
         return;
     }
 
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let buf = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    let new_token = buf.read_word(0);
-    let base_lba = buf.read_word(1);
-    let length_lba = buf.read_word(2);
+    if msg.word_count() < 3
+    {
+        reject(ipc_buf);
+        return;
+    }
+    let new_token = msg.word(0);
+    let base_lba = msg.word(1);
+    let length_lba = msg.word(2);
 
     // Bound must fit inside device capacity.
     let end = base_lba.saturating_add(length_lba);
     if end > rt.capacity || length_lba == 0 || new_token == 0
     {
-        let _ = syscall::ipc_reply(ipc::blk_errors::REGISTER_REJECTED, 0, &[]);
+        reject(ipc_buf);
         return;
     }
 
@@ -560,11 +583,13 @@ fn handle_register_partition(caller_token: u64, ipc_buf: *mut u64, rt: &mut BlkR
         })
         .is_err()
     {
-        let _ = syscall::ipc_reply(ipc::blk_errors::REGISTER_REJECTED, 0, &[]);
+        reject(ipc_buf);
         return;
     }
 
-    let _ = syscall::ipc_reply(ipc::blk_errors::SUCCESS, 0, &[]);
+    let reply = IpcMessage::new(ipc::blk_errors::SUCCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -574,15 +599,15 @@ fn main() -> !
     let info = startup_info();
 
     // IPC buffer was registered by `std::os::seraph::_start`; no need to
-    // re-register. Build a typed view over the same page for local use.
-    // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
-    // boot protocol.
-    let ipc = unsafe { IpcBuf::from_bytes(info.ipc_buffer) };
-    let ipc_buf = ipc.as_ptr();
+    // re-register. `info.ipc_buffer` is page-aligned by the boot protocol,
+    // so reinterpreting as `*mut u64` satisfies alignment.
+    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned, stricter than u64.
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // Bootstrap caps from devmgr. log + procmgr + stdio are wired by
     // `std::os::seraph::_start` from `ProcessInfo`.
-    let Some(caps) = bootstrap_caps(info, ipc)
+    let Some(caps) = bootstrap_caps(info, ipc_buf)
     else
     {
         syscall::thread_exit();

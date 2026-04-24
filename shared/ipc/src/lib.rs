@@ -5,10 +5,12 @@
 
 //! Shared IPC helpers for Seraph userspace services.
 //!
-//! Provides common patterns used across multiple services: the bootstrap
+//! Provides the stack-owned [`IpcMessage`] snapshot type plus thin
+//! `ipc_call` / `ipc_recv` / `ipc_reply` wrappers that keep the kernel's
+//! per-thread IPC buffer as scratch at the syscall boundary (nested IPC
+//! cannot clobber a received/reply message). Also hosts the bootstrap
 //! protocol (children receive their initial cap set via IPC from their
-//! creator), the [`IpcBuf`] accessor, typed error-code constants, label
-//! modules, and the path codec used across VFS/FS interfaces.
+//! creator), typed error-code constants, and label modules.
 
 // When built as a std dep via `rustc-dep-of-std`, we switch to `no_core`
 // and rebind `core` to the `rustc_std_workspace_core` facade — same dance
@@ -28,7 +30,7 @@ extern crate rustc_std_workspace_core as core;
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
-use syscall_abi::MSG_DATA_WORDS_MAX;
+use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 // ── IPC label constants ─────────────────────────────────────────────────────
 //
@@ -325,111 +327,10 @@ pub mod blk_errors
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
 
-// ── IpcBuf ──────────────────────────────────────────────────────────────────
-
-/// Typed wrapper around a registered IPC buffer page.
-///
-/// Page-aligned (4 KiB), u64-aligned, mapped for the holding thread's
-/// lifetime. Encapsulates the volatile read/write invariants required for
-/// kernel-shared memory: the kernel may read or write the IPC buffer at any
-/// IPC syscall boundary, so all accesses are volatile.
-///
-/// `Copy` and bit-identical to `*mut u64`; passing by value is zero-overhead.
-/// Bounds on data-word accesses are enforced in debug builds.
-#[derive(Clone, Copy)]
-pub struct IpcBuf(*mut u64);
-
-impl IpcBuf
-{
-    /// Wrap a raw pointer to the registered IPC buffer.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must point to a 4 KiB-aligned, registered IPC buffer page
-    /// mapped into the calling thread's address space. The page must
-    /// remain mapped for the lifetime of every access through the
-    /// returned `IpcBuf`.
-    #[must_use]
-    pub const unsafe fn from_raw(ptr: *mut u64) -> Self
-    {
-        Self(ptr)
-    }
-
-    /// Wrap a `*mut u8` pointing at the IPC buffer (common case in
-    /// startup code where `StartupInfo::ipc_buffer` is a `*mut u8`).
-    ///
-    /// # Safety
-    ///
-    /// Same requirements as [`Self::from_raw`]. Additionally, `ptr` must be
-    /// 8-byte aligned — guaranteed when it is page-aligned.
-    #[must_use]
-    pub unsafe fn from_bytes(ptr: *mut u8) -> Self
-    {
-        // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
-        #[allow(clippy::cast_ptr_alignment)]
-        Self(ptr.cast::<u64>())
-    }
-
-    /// Read data word `idx`.
-    #[must_use]
-    pub fn read_word(self, idx: usize) -> u64
-    {
-        debug_assert!(idx < MSG_DATA_WORDS_MAX);
-        // SAFETY: IPC buffer is page-aligned (u64-aligned), mapped for the
-        // holding thread's lifetime (invariant of `from_raw`). `idx` is bounded
-        // by `MSG_DATA_WORDS_MAX` in debug; volatile required for kernel-shared memory.
-        unsafe { core::ptr::read_volatile(self.0.add(idx)) }
-    }
-
-    /// Write data word `idx`.
-    pub fn write_word(self, idx: usize, val: u64)
-    {
-        debug_assert!(idx < MSG_DATA_WORDS_MAX);
-        // SAFETY: same invariants as `read_word`.
-        unsafe { core::ptr::write_volatile(self.0.add(idx), val) };
-    }
-
-    /// Read a contiguous range of data words into `dst`.
-    ///
-    /// Reads `dst.len()` words starting at `start`. Panics (in debug) if the
-    /// range would exceed `MSG_DATA_WORDS_MAX`.
-    pub fn read_words(self, start: usize, dst: &mut [u64])
-    {
-        debug_assert!(start + dst.len() <= MSG_DATA_WORDS_MAX);
-        for (i, slot) in dst.iter_mut().enumerate()
-        {
-            *slot = self.read_word(start + i);
-        }
-    }
-
-    /// Write a contiguous range of data words from `src`.
-    ///
-    /// Writes `src.len()` words starting at `start`. Panics (in debug) if the
-    /// range would exceed `MSG_DATA_WORDS_MAX`.
-    pub fn write_words(self, start: usize, src: &[u64])
-    {
-        debug_assert!(start + src.len() <= MSG_DATA_WORDS_MAX);
-        for (i, &val) in src.iter().enumerate()
-        {
-            self.write_word(start + i, val);
-        }
-    }
-
-    /// Escape hatch for syscall wrappers that accept raw pointers.
-    #[must_use]
-    pub fn as_ptr(self) -> *mut u64
-    {
-        self.0
-    }
-}
-
-// ── Path codec ──────────────────────────────────────────────────────────────
+// ── Protocol constants ─────────────────────────────────────────────────────
 
 /// Maximum path length in bytes (6 IPC data words = 48 bytes).
 pub const MAX_PATH_LEN: usize = 48;
-
-/// Maximum data words used for a path (6 words of 8 bytes each).
-const MAX_PATH_WORDS: usize = 6;
 
 /// Maximum argv blob size in bytes across an IPC. Constrained by
 /// `MSG_DATA_WORDS_MAX * 8 = 512` (full data area) minus room for any
@@ -440,100 +341,400 @@ const MAX_PATH_WORDS: usize = 6;
 /// (currently 16 bits).
 pub const ARGS_BLOB_MAX: usize = 256;
 
-/// Read path bytes from IPC buffer data words.
+// ── IpcMessage ──────────────────────────────────────────────────────────────
+
+/// Stack-owned snapshot of an IPC message — label, token, data words, and
+/// received cap-slot indices, carried by value across the IPC wrapper
+/// boundary.
 ///
-/// Unpacks `path_len` bytes from little-endian u64 words in `ipc`.
-/// Writes into `buf`; returns the number of bytes written (capped at `buf.len()`
-/// and `path_len`). Callers typically discard the return value when `path_len`
-/// is known in advance.
-pub fn read_path_from_ipc(ipc: IpcBuf, path_len: usize, buf: &mut [u8]) -> usize
+/// `ipc_recv` and the reply path of `ipc_call` return an `IpcMessage`;
+/// `ipc_call` and `ipc_reply` consume one built via [`IpcMessageBuilder`].
+/// Received data is copied out of the per-thread IPC buffer before the
+/// wrapper returns, which leaves the buffer as pure scratch at the syscall
+/// boundary — nested IPC (stdio, logging, any IPC-using helper) is safe by
+/// construction.
+///
+/// Fixed-size inline payload (`MSG_DATA_WORDS_MAX` = 64 data words, 512 B)
+/// plus `MSG_CAP_SLOTS_MAX` cap indices. No allocation; `no_std`-clean;
+/// cheap to return by value.
+#[derive(Clone, Copy)]
+pub struct IpcMessage
 {
-    let effective_len = path_len.min(buf.len()).min(MAX_PATH_LEN);
-    let word_count = effective_len.div_ceil(8).min(MAX_PATH_WORDS);
-    for i in 0..word_count
-    {
-        let word = ipc.read_word(i);
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < effective_len
-            {
-                buf[base + j] = (word >> (j * 8)) as u8;
-            }
-        }
-    }
-    effective_len
+    /// Protocol label (opcode / reply code / bit-packed header).
+    pub label: u64,
+    /// Endpoint-badge token delivered by `ipc_recv`; zero on send paths
+    /// and for untokened endpoints.
+    pub token: u64,
+    data: [u64; MSG_DATA_WORDS_MAX],
+    /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`.
+    data_len: u8,
+    /// Number of valid slots in `cap_slots`. `<= MSG_CAP_SLOTS_MAX`.
+    cap_count: u8,
+    cap_slots: [u32; MSG_CAP_SLOTS_MAX],
 }
 
-/// Write path bytes into IPC buffer data words.
-///
-/// Packs `path` bytes into little-endian u64 words in `ipc`. Returns the
-/// number of words written (callers use this for the `data_count` argument
-/// to `ipc_call`; some callers compute it from path length directly and may
-/// discard the return).
-#[must_use]
-pub fn write_path_to_ipc(ipc: IpcBuf, path: &[u8]) -> usize
+impl IpcMessage
 {
-    let effective_len = path.len().min(MAX_PATH_LEN);
-    let word_count = effective_len.div_ceil(8).min(MAX_PATH_WORDS);
-    for i in 0..word_count
+    /// Zero-length message carrying only a label (no data, no caps, no
+    /// token).
+    #[must_use]
+    pub const fn new(label: u64) -> Self
     {
-        let mut word: u64 = 0;
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < effective_len
-            {
-                word |= u64::from(path[base + j]) << (j * 8);
-            }
+        Self {
+            label,
+            token: 0,
+            data: [0; MSG_DATA_WORDS_MAX],
+            data_len: 0,
+            cap_count: 0,
+            cap_slots: [0; MSG_CAP_SLOTS_MAX],
         }
-        ipc.write_word(i, word);
     }
-    word_count
+
+    /// Start a builder. Equivalent to [`IpcMessageBuilder::new`].
+    #[must_use]
+    pub const fn builder(label: u64) -> IpcMessageBuilder
+    {
+        IpcMessageBuilder::new(label)
+    }
+
+    /// Read data word `idx`. Debug-panics only on the outer array bound
+    /// (`idx >= MSG_DATA_WORDS_MAX`). Reading past the sender's declared
+    /// `word_count()` returns zero — the unused array slots are zero-init
+    /// and the kernel does not write them past the declared range. This
+    /// matches the old `IpcBuf::read_word` contract so protocols that
+    /// carry optional trailing words at fixed offsets keep working.
+    #[must_use]
+    pub fn word(&self, idx: usize) -> u64
+    {
+        debug_assert!(idx < MSG_DATA_WORDS_MAX);
+        self.data[idx]
+    }
+
+    /// Slice view of the populated data words: `&data[..word_count()]`.
+    #[must_use]
+    pub fn words(&self) -> &[u64]
+    {
+        &self.data[..self.data_len as usize]
+    }
+
+    /// Number of populated data words.
+    #[must_use]
+    pub fn word_count(&self) -> usize
+    {
+        self.data_len as usize
+    }
+
+    /// Byte-slice view of the populated data words (little-endian).
+    ///
+    /// Length is `word_count() * 8`. Byte-level protocols (path, blob)
+    /// typically carry their byte length separately in the label or a
+    /// data word; callers slice this view accordingly.
+    #[must_use]
+    pub fn data_bytes(&self) -> &[u8]
+    {
+        // SAFETY: `data` is `[u64; MSG_DATA_WORDS_MAX]` — contiguous and
+        // u64-aligned, which is stricter than u8 alignment. Length
+        // `word_count * 8` stays inside the array (`word_count <=
+        // MSG_DATA_WORDS_MAX` by invariant).
+        unsafe {
+            core::slice::from_raw_parts(
+                self.data.as_ptr().cast::<u8>(),
+                self.data_len as usize * core::mem::size_of::<u64>(),
+            )
+        }
+    }
+
+    /// Slice view of the received / replied cap-slot indices.
+    #[must_use]
+    pub fn caps(&self) -> &[u32]
+    {
+        &self.cap_slots[..self.cap_count as usize]
+    }
+
+    /// Snapshot the IPC buffer into an owned `IpcMessage`.
+    ///
+    /// Reads `word_count` data words plus cap metadata from the registered
+    /// IPC buffer page. Used by the `ipc_recv` / `ipc_call` wrappers after
+    /// the kernel returns.
+    ///
+    /// # Safety
+    /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC
+    /// buffer page as registered via `ipc_buffer_set`. `word_count` must
+    /// be `<= MSG_DATA_WORDS_MAX`.
+    #[must_use]
+    pub unsafe fn from_ipc_buf(
+        ipc_buf: *const u64,
+        label: u64,
+        token: u64,
+        word_count: usize,
+    ) -> Self
+    {
+        debug_assert!(word_count <= MSG_DATA_WORDS_MAX);
+        let mut data = [0u64; MSG_DATA_WORDS_MAX];
+        for (i, slot) in data.iter_mut().take(word_count).enumerate()
+        {
+            // SAFETY: caller guarantees `ipc_buf` is valid, page-aligned,
+            // and mapped. `i < word_count <= MSG_DATA_WORDS_MAX`, so
+            // offset is in-bounds of the 4 KiB buffer. Volatile required
+            // for kernel-shared memory.
+            *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(i)) };
+        }
+        // Cap metadata: cap_count at word[MSG_DATA_WORDS_MAX], slot
+        // indices at word[MSG_DATA_WORDS_MAX + 1 ..].
+        // SAFETY: same invariants; MSG_DATA_WORDS_MAX + 1 + MSG_CAP_SLOTS_MAX
+        // = 64 + 1 + 4 = 69 < 512 (4 KiB / 8 B).
+        let cap_count_raw = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX)) };
+        let cap_count = (cap_count_raw as usize).min(MSG_CAP_SLOTS_MAX);
+        let mut cap_slots = [0u32; MSG_CAP_SLOTS_MAX];
+        for (i, slot) in cap_slots.iter_mut().take(cap_count).enumerate()
+        {
+            // SAFETY: offset bounded as above.
+            *slot =
+                unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX + 1 + i)) } as u32;
+        }
+        Self {
+            label,
+            token,
+            data,
+            data_len: word_count as u8,
+            cap_count: cap_count as u8,
+            cap_slots,
+        }
+    }
+
+    /// Write the populated data words into the IPC buffer.
+    ///
+    /// Used by the `ipc_call` / `ipc_reply` wrappers before issuing the
+    /// syscall. Cap slots are passed as syscall arguments; the sender
+    /// does not write cap metadata into the buffer (the kernel installs
+    /// caps in the receiver and writes the receiver-side slot indices
+    /// into the receiver's buffer).
+    ///
+    /// # Safety
+    /// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC
+    /// buffer page as registered via `ipc_buffer_set`.
+    pub unsafe fn write_to_ipc_buf(&self, ipc_buf: *mut u64)
+    {
+        for (i, &val) in self.words().iter().enumerate()
+        {
+            // SAFETY: `data_len <= MSG_DATA_WORDS_MAX` invariant, so
+            // `i < MSG_DATA_WORDS_MAX` and the offset is within the
+            // 4 KiB buffer. Caller guarantees pointer validity.
+            unsafe { core::ptr::write_volatile(ipc_buf.add(i), val) };
+        }
+    }
 }
 
-/// Read `len` bytes from IPC buffer data words starting at word
-/// `word_offset`, unpacking little-endian u64s into `buf`.
+// ── IpcMessageBuilder ──────────────────────────────────────────────────────
+
+/// Chainable builder that assembles an [`IpcMessage`] on the caller's
+/// stack, without touching the per-thread IPC buffer.
 ///
-/// Returns the number of bytes actually written (capped at
-/// `buf.len()` and `len`).
-pub fn read_blob_from_ipc(ipc: IpcBuf, word_offset: usize, len: usize, buf: &mut [u8]) -> usize
+/// Typical use at a send site:
+/// ```ignore
+/// ipc_call(
+///     ep,
+///     &IpcMessage::builder(label).word(0, value).cap(slot).build(),
+///     ipc_buf,
+/// )
+/// ```
+#[derive(Clone, Copy)]
+pub struct IpcMessageBuilder
 {
-    let effective_len = len.min(buf.len());
-    let word_count = effective_len.div_ceil(8);
-    for i in 0..word_count
-    {
-        let word = ipc.read_word(word_offset + i);
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < effective_len
-            {
-                buf[base + j] = (word >> (j * 8)) as u8;
-            }
-        }
-    }
-    effective_len
+    msg: IpcMessage,
 }
 
-/// Pack `blob` bytes into IPC buffer data words, starting at word
-/// `word_offset`. Returns the number of words written.
-#[must_use]
-pub fn write_blob_to_ipc(ipc: IpcBuf, word_offset: usize, blob: &[u8]) -> usize
+impl IpcMessageBuilder
 {
-    let word_count = blob.len().div_ceil(8);
-    for i in 0..word_count
+    /// New builder with the given label and nothing else set.
+    #[must_use]
+    pub const fn new(label: u64) -> Self
     {
-        let mut word: u64 = 0;
-        let base = i * 8;
-        for j in 0..8
-        {
-            if base + j < blob.len()
-            {
-                word |= u64::from(blob[base + j]) << (j * 8);
-            }
+        Self {
+            msg: IpcMessage::new(label),
         }
-        ipc.write_word(word_offset + i, word);
     }
-    word_count
+
+    /// Set data word `idx`; grow `word_count` to cover it if needed.
+    #[must_use]
+    pub fn word(mut self, idx: usize, val: u64) -> Self
+    {
+        debug_assert!(idx < MSG_DATA_WORDS_MAX);
+        self.msg.data[idx] = val;
+        let needed = (idx as u8) + 1;
+        if self.msg.data_len < needed
+        {
+            self.msg.data_len = needed;
+        }
+        self
+    }
+
+    /// Write `src` words contiguously starting at word `start`; grow
+    /// `word_count` to cover the range.
+    #[must_use]
+    pub fn words(mut self, start: usize, src: &[u64]) -> Self
+    {
+        debug_assert!(start + src.len() <= MSG_DATA_WORDS_MAX);
+        for (i, &val) in src.iter().enumerate()
+        {
+            self.msg.data[start + i] = val;
+        }
+        let needed = (start + src.len()) as u8;
+        if self.msg.data_len < needed
+        {
+            self.msg.data_len = needed;
+        }
+        self
+    }
+
+    /// Pack `src` bytes into data words (little-endian u64), starting at
+    /// word `start_word`. Grows `word_count` to cover the packed bytes.
+    #[must_use]
+    pub fn bytes(mut self, start_word: usize, src: &[u8]) -> Self
+    {
+        let word_count = src.len().div_ceil(8);
+        debug_assert!(start_word + word_count <= MSG_DATA_WORDS_MAX);
+        for i in 0..word_count
+        {
+            let base = i * 8;
+            let mut w: u64 = 0;
+            for j in 0..8
+            {
+                if base + j < src.len()
+                {
+                    w |= u64::from(src[base + j]) << (j * 8);
+                }
+            }
+            self.msg.data[start_word + i] = w;
+        }
+        let needed = (start_word + word_count) as u8;
+        if self.msg.data_len < needed
+        {
+            self.msg.data_len = needed;
+        }
+        self
+    }
+
+    /// Append one cap slot. Debug-panics if the slot array is full.
+    #[must_use]
+    pub fn cap(mut self, slot: u32) -> Self
+    {
+        debug_assert!((self.msg.cap_count as usize) < MSG_CAP_SLOTS_MAX);
+        let i = self.msg.cap_count as usize;
+        self.msg.cap_slots[i] = slot;
+        self.msg.cap_count += 1;
+        self
+    }
+
+    /// Replace the label set at construction.
+    #[must_use]
+    pub fn label(mut self, label: u64) -> Self
+    {
+        self.msg.label = label;
+        self
+    }
+
+    /// Explicitly set `word_count`. Useful when a protocol wants padding
+    /// words counted (`words`/`word`/`bytes` auto-grow only to the
+    /// highest touched word).
+    #[must_use]
+    pub fn word_count(mut self, len: usize) -> Self
+    {
+        debug_assert!(len <= MSG_DATA_WORDS_MAX);
+        self.msg.data_len = len as u8;
+        self
+    }
+
+    /// Finalize the message.
+    #[must_use]
+    pub const fn build(self) -> IpcMessage
+    {
+        self.msg
+    }
+}
+
+// ── IPC wrappers (IpcMessage-snapshot) ──────────────────────────────────────
+
+/// Synchronous IPC call on an endpoint, returning a stack-owned reply snapshot.
+///
+/// Writes `msg`'s payload into the registered IPC buffer, issues
+/// `SYS_IPC_CALL`, then copies the reply (label + data words + cap metadata)
+/// back out of the buffer into a fresh [`IpcMessage`]. After return the IPC
+/// buffer is scratch — nested IPC (stdio, logging, any IPC-using helper)
+/// cannot clobber the returned message.
+///
+/// The endpoint cap must have `Rights::GRANT` when `msg.caps()` is non-empty.
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
+/// page as registered via `syscall::ipc_buffer_set`.
+///
+/// # Errors
+/// Returns a negative `i64` error code if the endpoint cap is invalid, the
+/// caller has insufficient rights, or the call is interrupted.
+#[inline]
+pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+{
+    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe {
+        msg.write_to_ipc_buf(ipc_buf);
+    }
+    let caps = msg.caps();
+    let cap_packed = syscall::pack_cap_slots(caps);
+    let (reply_label, reply_word_count) =
+        syscall::raw_ipc_call(ep, msg.label, msg.word_count(), caps.len(), cap_packed)?;
+    // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote the
+    // reply (data + cap metadata) into it before return. `reply_word_count`
+    // is already clamped to MSG_DATA_WORDS_MAX by `raw_ipc_call`.
+    Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, reply_label, 0, reply_word_count) })
+}
+
+/// Receive on an endpoint cap, returning a stack-owned message snapshot.
+///
+/// Blocks until a caller sends. Copies the message (label, token, data
+/// words, cap metadata) from the registered IPC buffer into a fresh
+/// [`IpcMessage`] before returning. After return the IPC buffer is scratch
+/// — nested IPC between `ipc_recv` and reading the message is safe.
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
+/// page as registered via `syscall::ipc_buffer_set`.
+///
+/// # Errors
+/// Returns a negative `i64` error code if the endpoint cap is invalid or
+/// the receive is interrupted.
+#[inline]
+pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+{
+    let (label, token, word_count) = syscall::raw_ipc_recv(ep)?;
+    // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote data +
+    // cap metadata there before return. `word_count` is already clamped to
+    // MSG_DATA_WORDS_MAX by `raw_ipc_recv`.
+    Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, label, token, word_count) })
+}
+
+/// Reply to the current thread's pending caller with `msg`.
+///
+/// Writes `msg`'s data words into the registered IPC buffer, then issues
+/// `SYS_IPC_REPLY` with `msg.word_count()` words and `msg.caps()` cap slots.
+/// Cap slots are moved from the server's `CSpace` to the caller's `CSpace`
+/// atomically with the reply.
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's 4 KiB-aligned IPC buffer
+/// page as registered via `syscall::ipc_buffer_set`.
+///
+/// # Errors
+/// Returns a negative `i64` error code if there is no pending reply target
+/// or the reply is otherwise invalid.
+#[inline]
+pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
+{
+    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe {
+        msg.write_to_ipc_buf(ipc_buf);
+    }
+    let caps = msg.caps();
+    let cap_packed = syscall::pack_cap_slots(caps);
+    syscall::raw_ipc_reply(msg.label, msg.word_count(), caps.len(), cap_packed)
 }

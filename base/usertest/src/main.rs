@@ -57,10 +57,12 @@ fn main()
     let info = startup_info();
     if info.creator_endpoint != 0
     {
+        // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        let ipc_buf = info.ipc_buffer.cast::<u64>();
         // SAFETY: IPC buffer is registered by `_start` and page-aligned by
         // the boot protocol.
-        let ipc = unsafe { ipc::IpcBuf::from_bytes(info.ipc_buffer) };
-        let _ = ipc::bootstrap::request_round(info.creator_endpoint, ipc);
+        let _ = unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) };
     }
 
     println!("usertest: starting");
@@ -72,6 +74,8 @@ fn main()
     churn_phase();
     alloc_grow_phase();
     threading_phase();
+    stdio_spawned_phase();
+    alloc_spawned_phase();
     tls_macro_phase();
     timeout_phase();
     spawn_phase();
@@ -484,6 +488,63 @@ fn threading_phase()
     println!("usertest: threading phase passed");
 }
 
+/// Regression guard for the per-thread stdio IPC buffer invariant.
+/// Pre-fix, stdio cached the main thread's IPC buffer VA in a
+/// process-global pointer; a `println!` on a spawned thread wrote into
+/// that page while the kernel serviced `SYS_IPC_CALL` by reading the
+/// spawned thread's registered buffer (`tcb.ipc_buffer`). The message
+/// was silently dropped. This phase spawns a thread that calls
+/// `println!` from the spawned thread and joins; the assertion is that
+/// the operation does not panic, hang, or crash — the actual payload
+/// landing in the log is confirmed by the harness grepping for the
+/// marker line.
+fn stdio_spawned_phase()
+{
+    let handle = thread::spawn(|| {
+        println!("usertest: stdio_spawned marker line");
+    });
+    handle.join().expect("stdio_spawned worker thread panicked");
+    println!("usertest: stdio_spawned phase passed");
+}
+
+/// Regression guard for the per-thread IPC buffer invariant in the
+/// allocator. Pre-fix, `Heap::grow_exact` issued its `REQUEST_FRAMES`
+/// IPC to procmgr using the main thread's IPC buffer VA, while the
+/// kernel read the calling thread's registered buffer. On a spawned
+/// thread the call silently produced a zero-label reply (stale buffer
+/// contents), `grow` returned false, and the alloc aborted via
+/// `handle_alloc_error`. This phase spawns a thread and pushes enough
+/// bytes to exhaust the post-bootstrap free list and force at least
+/// one grow round. If grow is wired through the per-thread TLS buffer,
+/// the push completes and join succeeds.
+// cast_possible_truncation: index-to-u8 casts use `& 0xFF` as a
+// deliberate identity fingerprint, matching `alloc_grow_phase`.
+#[allow(clippy::cast_possible_truncation)]
+fn alloc_spawned_phase()
+{
+    // Same sizing reasoning as `alloc_grow_phase` — large enough to
+    // miss first-fit, small enough to stay within one grow increment
+    // and well within CSpace headroom.
+    const BIG: usize = 600 * 1024;
+
+    let handle = thread::spawn(|| {
+        let mut v: Vec<u8> = Vec::with_capacity(BIG);
+        for i in 0..BIG
+        {
+            v.push((i & 0xFF) as u8);
+        }
+        assert_eq!(v.len(), BIG, "spawned-grow push count mismatch");
+        // Spot-check a few indices past the first grow boundary.
+        for &idx in &[0, 4095, 4096, 65_535, BIG / 2, BIG - 1]
+        {
+            let expected = (idx & 0xFF) as u8;
+            assert_eq!(v[idx], expected, "spawned-grow buffer[{idx}] mismatch");
+        }
+    });
+    handle.join().expect("alloc_spawned worker thread panicked");
+    println!("usertest: alloc_spawned phase passed ({BIG} bytes)");
+}
+
 /// Exercise the `thread_local!` macro. This drives the `LazyStorage` +
 /// `destructors::register` path (unlike the raw `#[thread_local]` statics in
 /// `tls_main_phase`, which skip the lazy wrapper). The inner type is `Drop`
@@ -637,21 +698,22 @@ fn spawn_phase()
     // with `started=true`, which maps to `ALIVE`.
     {
         let info = startup_info();
-        // SAFETY: IPC buffer is the kernel-registered, page-aligned buffer
-        // installed by `_start`.
-        let ipc_raw = unsafe { ipc::IpcBuf::from_bytes(info.ipc_buffer) };
+        // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        let ipc_buf = info.ipc_buffer.cast::<u64>();
         let id = child.id();
-        let (reply_label, _) = syscall::ipc_call(id, ipc::procmgr_labels::QUERY_PROCESS, 0, &[])
-            .expect("QUERY_PROCESS call failed");
+        let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
+        // SAFETY: `ipc_buf` is the kernel-registered, page-aligned IPC
+        // buffer page installed by `_start`.
+        let reply =
+            unsafe { ipc::ipc_call(id, &query, ipc_buf) }.expect("QUERY_PROCESS call failed");
         assert_eq!(
-            reply_label,
+            reply.label,
             ipc::procmgr_errors::SUCCESS,
             "QUERY_PROCESS non-success label"
         );
-        // ipc_call's secondary "data_count" is unused in this ABI — the
-        // reply data lives in the registered IPC buffer regardless.
-        let state = ipc_raw.read_word(0);
-        let exit_reason = ipc_raw.read_word(1);
+        let state = reply.word(0);
+        let exit_reason = reply.word(1);
         assert_eq!(
             state,
             ipc::procmgr_process_state::ALIVE,

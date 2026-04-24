@@ -11,7 +11,7 @@
 
 use crate::frames::{FramePool, PAGE_SIZE};
 use crate::loader::{self, TEMP_FRAME_VA, TEMP_MODULE_VA, TEMP_VFS_VA};
-use ipc::procmgr_errors;
+use ipc::{IpcMessage, procmgr_errors};
 use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, PROCESS_MAIN_TLS_MAX_PAGES, PROCESS_MAIN_TLS_VADDR,
     PROCESS_STACK_PAGES, PROCESS_STACK_TOP,
@@ -573,18 +573,25 @@ fn prepare_main_tls_from_vfs(
     while read_pos < tls.filesz
     {
         let chunk = VFS_CHUNK_SIZE.min(tls.filesz - read_pos);
-        let bytes_read = vfs_read(file_cap, ipc_buf, file_offset + read_pos, chunk)?;
+        let mut buf = [0u8; VFS_CHUNK_SIZE as usize];
+        let bytes_read = vfs_read(
+            file_cap,
+            ipc_buf,
+            file_offset + read_pos,
+            chunk,
+            &mut buf[..chunk as usize],
+        )?;
         if bytes_read == 0
         {
             let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
             return None;
         }
         let safe_len = (bytes_read as u64).min(tls.filesz - read_pos) as usize;
-        // SAFETY: ipc_buf data[1..] contains file data; TEMP_FRAME_VA mapped
-        // writable; (read_pos + safe_len) <= tls.filesz <= PAGE_SIZE.
+        // SAFETY: TEMP_FRAME_VA mapped writable; (read_pos + safe_len) <=
+        // tls.filesz <= PAGE_SIZE; `buf` holds `safe_len` bytes of payload.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                ipc_buf.add(1) as *const u8,
+                buf.as_ptr(),
                 (TEMP_FRAME_VA as *mut u8).add(read_pos as usize),
                 safe_len,
             );
@@ -867,23 +874,16 @@ pub fn create_process(
 fn vfs_open(vfsd_ep: u32, ipc_buf: *mut u64, path: &[u8]) -> Option<u32>
 {
     let label = ipc::vfsd_labels::OPEN | ((path.len() as u64) << 16);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc_ref = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    let word_count = ipc::write_path_to_ipc(ipc_ref, path);
+    let msg = IpcMessage::builder(label).bytes(0, path).build();
 
-    let Ok((reply_label, _)) = syscall::ipc_call(vfsd_ep, label, word_count, &[])
-    else
-    {
-        return None;
-    };
-    if reply_label != 0
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(vfsd_ep, &msg, ipc_buf) }.ok()?;
+    if reply.label != 0
     {
         return None;
     }
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    #[allow(clippy::cast_ptr_alignment)]
-    let (cap_count, reply_caps) = unsafe { syscall::read_recv_caps(ipc_buf) };
-    if cap_count == 0
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
     {
         return None;
     }
@@ -891,46 +891,59 @@ fn vfs_open(vfsd_ep: u32, ipc_buf: *mut u64, path: &[u8]) -> Option<u32>
 }
 
 /// Read from an open file via its per-file capability.
-fn vfs_read(file_cap: u32, ipc_buf: *mut u64, offset: u64, max_len: u64) -> Option<usize>
+///
+/// Copies up to `max_len` bytes of file data into `dst`. Returns the number
+/// of bytes the server reported reading (which may exceed `dst.len()` if the
+/// caller intentionally requested more than it is staging this call; callers
+/// clamp as needed).
+fn vfs_read(
+    file_cap: u32,
+    ipc_buf: *mut u64,
+    offset: u64,
+    max_len: u64,
+    dst: &mut [u8],
+) -> Option<usize>
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    ipc.write_word(0, offset);
-    ipc.write_word(1, max_len);
+    let msg = IpcMessage::builder(ipc::fs_labels::FS_READ)
+        .word(0, offset)
+        .word(1, max_len)
+        .build();
 
-    let Ok((reply_label, _)) = syscall::ipc_call(file_cap, ipc::fs_labels::FS_READ, 2, &[])
-    else
-    {
-        return None;
-    };
-    if reply_label != 0
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    if reply.label != 0
     {
         return None;
     }
-    Some(ipc.read_word(0) as usize)
+    let bytes_read = reply.word(0) as usize;
+    // Data bytes live in words 1..; the message byte view covers all
+    // populated words starting at word 0. Skip the 8-byte header.
+    let data_view = reply.data_bytes();
+    let payload = data_view.get(core::mem::size_of::<u64>()..).unwrap_or(&[]);
+    let copy_len = bytes_read.min(dst.len()).min(payload.len());
+    dst[..copy_len].copy_from_slice(&payload[..copy_len]);
+    Some(bytes_read)
 }
 
 /// Stat an open file via its per-file capability.
 fn vfs_stat(file_cap: u32, ipc_buf: *mut u64) -> Option<u64>
 {
-    let Ok((reply_label, _)) = syscall::ipc_call(file_cap, ipc::fs_labels::FS_STAT, 0, &[])
-    else
-    {
-        return None;
-    };
-    if reply_label != 0
+    let msg = IpcMessage::new(ipc::fs_labels::FS_STAT);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    if reply.label != 0
     {
         return None;
     }
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let ipc = unsafe { ipc::IpcBuf::from_raw(ipc_buf) };
-    Some(ipc.read_word(0))
+    Some(reply.word(0))
 }
 
 /// Close an open file via its per-file capability and delete the cap.
-fn vfs_close(file_cap: u32, _ipc_buf: *mut u64)
+fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 {
-    let _ = syscall::ipc_call(file_cap, ipc::fs_labels::FS_CLOSE, 0, &[]);
+    let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
     let _ = syscall::cap_delete(file_cap);
 }
 
@@ -1005,7 +1018,14 @@ fn stream_segment_to_frame(
     while read_pos < bytes_to_read
     {
         let chunk = VFS_CHUNK_SIZE.min(bytes_to_read - read_pos);
-        let Some(bytes_read) = vfs_read(file_cap, ipc_buf, file_offset + read_pos, chunk)
+        let mut buf = [0u8; VFS_CHUNK_SIZE as usize];
+        let Some(bytes_read) = vfs_read(
+            file_cap,
+            ipc_buf,
+            file_offset + read_pos,
+            chunk,
+            &mut buf[..chunk as usize],
+        )
         else
         {
             break;
@@ -1016,11 +1036,11 @@ fn stream_segment_to_frame(
         }
         let safe_len = (bytes_read as u64).min(bytes_to_read - read_pos) as usize;
 
-        // SAFETY: ipc_buf data[1..] contains file data; TEMP_FRAME_VA is
-        // mapped writable; dest_offset + read_pos + safe_len <= PAGE_SIZE.
+        // SAFETY: TEMP_FRAME_VA is mapped writable; dest_offset + read_pos +
+        // safe_len <= PAGE_SIZE; `buf` holds `safe_len` bytes of payload.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                ipc_buf.add(1) as *const u8,
+                buf.as_ptr(),
                 (TEMP_FRAME_VA as *mut u8).add(dest_offset + read_pos as usize),
                 safe_len,
             );
@@ -1098,17 +1118,18 @@ pub fn create_process_from_vfs(
     while offset < hdr_size
     {
         let chunk = VFS_CHUNK_SIZE.min(hdr_size - offset);
-        let bytes_read =
-            vfs_read(file_cap, ipc_buf, offset, chunk).ok_or(procmgr_errors::IO_ERROR)?;
+        let mut buf = [0u8; VFS_CHUNK_SIZE as usize];
+        let bytes_read = vfs_read(file_cap, ipc_buf, offset, chunk, &mut buf[..chunk as usize])
+            .ok_or(procmgr_errors::IO_ERROR)?;
         if bytes_read == 0
         {
             break;
         }
         let safe_len = bytes_read.min(VFS_CHUNK_SIZE as usize);
-        // SAFETY: ipc_buf data[1..] contains file data; TEMP_VFS_VA mapped writable.
+        // SAFETY: TEMP_VFS_VA mapped writable; `buf` holds `safe_len` bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                ipc_buf.add(1) as *const u8,
+                buf.as_ptr(),
                 (TEMP_VFS_VA as *mut u8).add(offset as usize),
                 safe_len,
             );

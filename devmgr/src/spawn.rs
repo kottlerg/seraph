@@ -38,11 +38,6 @@ pub struct DriverSpawnConfig<'a>
     pub service_ep: u32,
     pub registry_ep: u32,
     pub device_token: u64,
-    /// Devmgr's own `CSpace` cap, used to `cap_copy` the tokened log SEND
-    /// minted via `MINT_LOG_CAP` so the child's stdout and stderr can
-    /// share the same underlying endpoint+token (same `[name]` in the
-    /// mediator).
-    pub self_cspace: u32,
 }
 
 /// Spawn a driver process with per-device capabilities.
@@ -72,13 +67,13 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     let Some(bar_cap) = config.bars.caps.first().copied()
     else
     {
-        println!("driver spawn: no BAR cap");
+        std::os::seraph::log!("driver spawn: no BAR cap");
         return;
     };
     let Some(irq_slot) = config.irq_cap
     else
     {
-        println!("driver spawn: no IRQ cap");
+        std::os::seraph::log!("driver spawn: no IRQ cap");
         return;
     };
     let procmgr_ep = config.procmgr_ep;
@@ -94,14 +89,13 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
         syscall::cap_derive_token(bootstrap_ep, syscall::RIGHTS_SEND, child_token)
     else
     {
-        println!("driver spawn: tokened creator derivation failed");
+        std::os::seraph::log!("driver spawn: tokened creator derivation failed");
         return;
     };
 
-    // Phase 1: CREATE_PROCESS via procmgr. Caps [module, creator]. Stdio
-    // wiring happens afterwards via CONFIGURE_STDIO — keeps CREATE_PROCESS
-    // free of logging-specific concepts and allows the spawner to route
-    // stdout and stderr independently in the future.
+    // CREATE_PROCESS via procmgr. Caps [module, creator]. The child has no
+    // stdio wired by default — it logs through `seraph::log!` via the
+    // discovery cap procmgr installs in `ProcessInfo`.
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
         .cap(module_cap)
         .cap(tokened_creator)
@@ -110,19 +104,19 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        println!("driver CREATE_PROCESS ipc_call failed");
+        std::os::seraph::log!("driver CREATE_PROCESS ipc_call failed");
         return;
     };
     if reply.label != 0
     {
-        println!("driver CREATE_PROCESS failed");
+        std::os::seraph::log!("driver CREATE_PROCESS failed");
         return;
     }
 
     let reply_caps = reply.caps();
     if reply_caps.len() < 2
     {
-        println!("driver CREATE_PROCESS reply missing caps");
+        std::os::seraph::log!("driver CREATE_PROCESS reply missing caps");
         return;
     }
     let process_handle = reply_caps[0];
@@ -153,21 +147,6 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
         return;
     };
 
-    // CONFIGURE_STDIO: mint a tokened SEND on the log endpoint via
-    // procmgr, cap_copy in our own CSpace to produce a second slot with
-    // the same token, hand both to the child as stdout + stderr. Best-
-    // effort — zero caps mean the child runs silently.
-    let log_out = mint_log_cap(procmgr_ep, ipc_buf);
-    let log_err = if log_out != 0
-    {
-        syscall::cap_copy(log_out, config.self_cspace, syscall::RIGHTS_SEND).unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
-    configure_stdio(process_handle, ipc_buf, log_out, log_err, 0);
-
     // START_PROCESS.
     let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -177,7 +156,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     );
     if !start_ok
     {
-        println!("driver START_PROCESS failed");
+        std::os::seraph::log!("driver START_PROCESS failed");
         return;
     }
 
@@ -195,7 +174,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     }
     .is_err()
     {
-        println!("driver bootstrap round 1 failed");
+        std::os::seraph::log!("driver bootstrap round 1 failed");
         return;
     }
 
@@ -213,52 +192,9 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     }
     .is_err()
     {
-        println!("driver bootstrap round 2 failed");
+        std::os::seraph::log!("driver bootstrap round 2 failed");
         return;
     }
 
-    println!("driver started");
-}
-
-/// Call `MINT_LOG_CAP` on procmgr, returning the minted tokened SEND cap
-/// slot. Zero on failure.
-fn mint_log_cap(procmgr_ep: u32, ipc_buf: *mut u64) -> u32
-{
-    let req = IpcMessage::new(ipc::procmgr_labels::MINT_LOG_CAP);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &req, ipc_buf) })
-    else
-    {
-        return 0;
-    };
-    if reply.label != 0
-    {
-        return 0;
-    }
-    reply.caps().first().copied().unwrap_or(0)
-}
-
-/// Issue `CONFIGURE_STDIO` on a suspended child's `process_handle`. All
-/// three caps are optional — trailing zeros are omitted (the kernel
-/// rejects null slot indices in a cap list). Best-effort; logs nothing on
-/// failure (spawn-path println would itself need the target's stdout to
-/// be wired, which is what we're setting up).
-fn configure_stdio(process_handle: u32, ipc_buf: *mut u64, stdout: u32, stderr: u32, stdin: u32)
-{
-    let mut builder = IpcMessage::builder(ipc::procmgr_labels::CONFIGURE_STDIO);
-    if stdout != 0
-    {
-        builder = builder.cap(stdout);
-        if stderr != 0
-        {
-            builder = builder.cap(stderr);
-            if stdin != 0
-            {
-                builder = builder.cap(stdin);
-            }
-        }
-    }
-    let msg = builder.build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) };
+    std::os::seraph::log!("driver started");
 }

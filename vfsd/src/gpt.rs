@@ -186,7 +186,9 @@ fn iter_entries(
                 length_lba,
                 active: true,
             };
-            println!("GPT: partition at LBA {first_lba:#018x} length {length_lba:#018x}");
+            std::os::seraph::log!(
+                "GPT: partition at LBA {first_lba:#018x} length {length_lba:#018x}"
+            );
             found += 1;
             entries_checked += 1;
         }
@@ -205,7 +207,7 @@ pub fn parse_gpt(
 {
     let header = read_and_validate_header(blk_ep, ipc_buf)?;
     let found = iter_entries(blk_ep, ipc_buf, &header, parts);
-    println!("GPT: partitions found: {found}");
+    std::os::seraph::log!("GPT: partitions found: {found}");
     Ok(found)
 }
 

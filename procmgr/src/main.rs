@@ -26,17 +26,9 @@ mod frames;
 mod loader;
 mod process;
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use frames::FramePool;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
-/// Monotonic source for per-child log stream tokens minted via
-/// `MINT_LOG_CAP`. Starts at 1024 so tokens never collide with init's
-/// reserved range (1..=16) for services init creates directly before
-/// procmgr's service loop is running. TODO: replace with RNG once kernel
-/// exposes a getrandom/ElapsedUs-seeded mixer.
-static NEXT_LOG_TOKEN: AtomicU64 = AtomicU64::new(1024);
 use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, ProcessInfo, StartupInfo, process_info_ref,
 };
@@ -107,11 +99,12 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 
 /// Init → procmgr bootstrap plan (one round):
 ///   caps[0]: service endpoint (procmgr receives requests on this)
-///   caps[1]: full-rights copy of the system log endpoint. procmgr holds
-///            this solely as the dispensing source for `MINT_LOG_CAP`; it
-///            is not consulted during `CREATE_PROCESS`. Zero means no log
-///            endpoint is available yet and `MINT_LOG_CAP` will refuse
-///            requests in that window.
+///   caps[1]: un-tokened SEND copy of the system log endpoint. Procmgr
+///            `cap_copy`s this into every child's
+///            `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time.
+///            Zero means no log endpoint is available yet; children
+///            born in that window receive zero and silent-drop
+///            `seraph::log!`.
 ///   data word 0: `memory_frame_base`
 ///   data word 1: `memory_frame_count`
 struct InitBootstrap
@@ -263,11 +256,6 @@ fn main(startup: &StartupInfo) -> !
                 }
             }
 
-            procmgr_labels::MINT_LOG_CAP =>
-            {
-                handle_mint_log_cap(ctx.log_ep, ipc_buf);
-            }
-
             procmgr_labels::CONFIGURE_STDIO =>
             {
                 handle_configure_stdio(&req, ipc_buf, ctx.self_aspace, &mut table);
@@ -336,35 +324,6 @@ fn handle_configure_stdio(
     }
 
     reply_empty(ipc_buf, code);
-}
-
-/// Handle `MINT_LOG_CAP` — derive and return a fresh tokened SEND cap on
-/// the system log endpoint. Token is drawn from `NEXT_LOG_TOKEN` and is
-/// unique per call. Callers typically `cap_copy` the returned cap and hand
-/// both copies to `CONFIGURE_STDIO` so the child's stdout and stderr
-/// stream through the mediator under the same registered name.
-///
-/// Fails (returns `INVALID_ARGUMENT`) when procmgr holds no log endpoint —
-/// very early boot before init delivered one.
-fn handle_mint_log_cap(log_ep: u32, ipc_buf: *mut u64)
-{
-    if log_ep == 0
-    {
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-        return;
-    }
-    let token = NEXT_LOG_TOKEN.fetch_add(1, Ordering::Relaxed);
-    let Ok(cap) = syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, token)
-    else
-    {
-        reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-        return;
-    };
-    let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
-        .cap(cap)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Reply with a successful process creation result.
@@ -567,10 +526,10 @@ pub struct ProcmgrCtx
     pub self_endpoint: u32,
     pub vfsd_ep: u32,
     /// Log endpoint (SEND) received from init during procmgr's own bootstrap.
-    /// procmgr uses this only as the dispensing source for `MINT_LOG_CAP` —
-    /// it does not touch `log_ep` during `CREATE_PROCESS`. Zero if init did
-    /// not provide one (very early boot); `MINT_LOG_CAP` returns
-    /// `INVALID_ARGUMENT` in that window.
+    /// Procmgr `cap_copy`s this into every child's
+    /// `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time. Zero if
+    /// init did not provide one (very early boot); children born in that
+    /// window receive zero and silent-drop `seraph::log!`.
     pub log_ep: u32,
     /// Single shared death-notification event queue. Every spawned child
     /// binds its thread to this queue (via multi-bind in the kernel) with

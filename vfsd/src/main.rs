@@ -48,7 +48,6 @@ pub struct VfsdCaps
     pub service_ep: u32,
     pub fatfs_module_cap: u32,
     pub self_aspace: u32,
-    pub self_cspace: u32,
     /// Worker-owned bootstrap endpoint. Populated after the bootstrap worker
     /// thread is spawned. Main derives tokened SEND caps on this slot to hand
     /// to each fatfs child as its creator endpoint.
@@ -92,7 +91,6 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
         procmgr_ep: info.procmgr_endpoint,
         fatfs_module_cap: round2.caps[0],
         self_aspace: info.self_aspace,
-        self_cspace: info.self_cspace,
         bootstrap_ep: 0,
     })
 }
@@ -120,7 +118,7 @@ fn spawn_worker() -> Option<(u32, Channel)>
 
 fn main() -> !
 {
-    std::os::seraph::register_log_name(b"vfsd");
+    std::os::seraph::log::register_name(b"vfsd");
     let info = startup_info();
 
     // IPC buffer is registered by `std::os::seraph::_start` and page-aligned
@@ -135,11 +133,11 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    println!("starting");
+    std::os::seraph::log!("starting");
 
     if caps.service_ep == 0 || caps.registry_ep == 0
     {
-        println!("missing required endpoints");
+        std::os::seraph::log!("missing required endpoints");
         idle_loop();
     }
 
@@ -147,53 +145,53 @@ fn main() -> !
     let Some((bootstrap_ep, channel)) = spawn_worker()
     else
     {
-        println!("FATAL: worker thread setup failed");
+        std::os::seraph::log!("FATAL: worker thread setup failed");
         idle_loop();
     };
     caps.bootstrap_ep = bootstrap_ep;
 
     // Query devmgr for the block device endpoint.
-    println!("querying devmgr for block device");
+    std::os::seraph::log!("querying devmgr for block device");
     let query_msg = IpcMessage::new(ipc::devmgr_labels::QUERY_BLOCK_DEVICE);
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(query_reply) = (unsafe { ipc::ipc_call(caps.registry_ep, &query_msg, ipc_buf) })
     else
     {
-        println!("QUERY_BLOCK_DEVICE ipc_call failed");
+        std::os::seraph::log!("QUERY_BLOCK_DEVICE ipc_call failed");
         idle_loop();
     };
     if query_reply.label != 0
     {
-        println!("no block device available");
+        std::os::seraph::log!("no block device available");
         idle_loop();
     }
 
     let reply_caps = query_reply.caps();
     if reply_caps.is_empty()
     {
-        println!("QUERY_BLOCK_DEVICE returned no caps");
+        std::os::seraph::log!("QUERY_BLOCK_DEVICE returned no caps");
         idle_loop();
     }
     let blk_ep = reply_caps[0];
-    println!("block device endpoint acquired");
+    std::os::seraph::log!("block device endpoint acquired");
 
     // Parse GPT partition table — stored for UUID lookups on MOUNT requests.
     let mut gpt_parts = gpt::new_gpt_table();
     match gpt::parse_gpt(blk_ep, ipc_buf, &mut gpt_parts)
     {
-        Ok(count) => println!("GPT parsed, {count} partitions"),
-        Err(gpt::GptError::IoError) => println!("GPT parse failed: I/O error"),
+        Ok(count) => std::os::seraph::log!("GPT parsed, {count} partitions"),
+        Err(gpt::GptError::IoError) => std::os::seraph::log!("GPT parse failed: I/O error"),
         Err(gpt::GptError::InvalidSignature) =>
         {
-            println!("GPT parse failed: invalid signature");
+            std::os::seraph::log!("GPT parse failed: invalid signature");
         }
         Err(gpt::GptError::InvalidEntrySize) =>
         {
-            println!("GPT parse failed: invalid entry size");
+            std::os::seraph::log!("GPT parse failed: invalid entry size");
         }
     }
 
-    println!("entering service loop");
+    std::os::seraph::log!("entering service loop");
     let runtime = VfsdRuntime {
         caps: &caps,
         blk_ep,
@@ -230,7 +228,7 @@ fn service_loop(ipc_buf: *mut u64, rt: &VfsdRuntime) -> !
         let Ok(recv) = (unsafe { ipc::ipc_recv(rt.caps.service_ep, ipc_buf) })
         else
         {
-            println!("ipc_recv failed, retrying");
+            std::os::seraph::log!("ipc_recv failed, retrying");
             continue;
         };
 
@@ -281,7 +279,7 @@ fn handle_mount_request(
     let path_len = recv.word(2) as usize;
     if path_len == 0 || path_len > 64
     {
-        println!("MOUNT: invalid path length");
+        std::os::seraph::log!("MOUNT: invalid path length");
         let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -304,18 +302,20 @@ fn handle_mount_request(
     let Some((partition_lba, partition_len)) = gpt::lookup_partition_by_uuid(&uuid, rt.gpt_parts)
     else
     {
-        println!("MOUNT: partition UUID not found");
+        std::os::seraph::log!("MOUNT: partition UUID not found");
         let err = IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     };
-    println!("MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}");
+    std::os::seraph::log!(
+        "MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}"
+    );
 
     // Spawn fatfs driver for this partition.
     if rt.caps.fatfs_module_cap == 0
     {
-        println!("MOUNT: no fatfs module cap");
+        std::os::seraph::log!("MOUNT: no fatfs module cap");
         let err = IpcMessage::new(ipc::vfsd_errors::NO_FS_MODULE);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -329,7 +329,7 @@ fn handle_mount_request(
         derive_and_register_partition(rt, partition_lba, partition_len, ipc_buf)
     else
     {
-        println!("MOUNT: partition cap registration failed");
+        std::os::seraph::log!("MOUNT: partition cap registration failed");
         let err = IpcMessage::new(ipc::vfsd_errors::SPAWN_FAILED);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -339,7 +339,7 @@ fn handle_mount_request(
     let Some(driver_ep) = driver::spawn_fatfs_driver(rt.caps, rt.channel, partition_ep, ipc_buf)
     else
     {
-        println!("MOUNT: failed to spawn fatfs");
+        std::os::seraph::log!("MOUNT: failed to spawn fatfs");
         let err = IpcMessage::new(ipc::vfsd_errors::SPAWN_FAILED);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -352,14 +352,14 @@ fn handle_mount_request(
         let ok = IpcMessage::new(ipc::vfsd_errors::SUCCESS);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&ok, ipc_buf) };
-        println!("MOUNT: registered");
+        std::os::seraph::log!("MOUNT: registered");
     }
     else
     {
         let err = IpcMessage::new(ipc::vfsd_errors::TABLE_FULL);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-        println!("MOUNT: mount table full");
+        std::os::seraph::log!("MOUNT: mount table full");
     }
 }
 
@@ -427,7 +427,7 @@ fn handle_open(recv: &IpcMessage, ipc_buf: *mut u64, mounts: &[MountEntry; MAX_M
     let drv_caps = drv_reply.caps();
     if drv_caps.is_empty()
     {
-        println!("OPEN: driver returned no file cap");
+        std::os::seraph::log!("OPEN: driver returned no file cap");
         let err = IpcMessage::new(ipc::vfsd_errors::IO_ERROR);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -473,12 +473,12 @@ fn derive_and_register_partition(
     let Ok(reply) = (unsafe { ipc::ipc_call(rt.blk_ep, &msg, ipc_buf) })
     else
     {
-        println!("REGISTER_PARTITION ipc_call failed");
+        std::os::seraph::log!("REGISTER_PARTITION ipc_call failed");
         return None;
     };
     if reply.label != ipc::blk_errors::SUCCESS
     {
-        println!("REGISTER_PARTITION rejected (code={})", reply.label);
+        std::os::seraph::log!("REGISTER_PARTITION rejected (code={})", reply.label);
         return None;
     }
     Some(partition_ep)

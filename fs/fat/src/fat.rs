@@ -77,7 +77,7 @@ pub fn next_cluster(
     // read failure (the usual cause) is visible.
     if cluster < 2
     {
-        println!("WARNING: next_cluster called with reserved cluster {cluster}");
+        std::os::seraph::log!("WARNING: next_cluster called with reserved cluster {cluster}");
         return None;
     }
 
@@ -161,7 +161,7 @@ pub fn next_cluster(
     // and stop walking — silent return would mask the real problem.
     if val < 2
     {
-        println!(
+        std::os::seraph::log!(
             "WARNING: FAT chain at cluster {cluster} points to reserved cluster \
              {val} (fat_sector={fat_sector}, entry_offset={entry_offset}) \
              — possible block-read corruption"

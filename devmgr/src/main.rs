@@ -37,7 +37,7 @@ const FIRMWARE_MAP_MAX_PAGES: u64 = 256;
 #[allow(clippy::too_many_lines)]
 fn main() -> !
 {
-    std::os::seraph::register_log_name(b"devmgr");
+    std::os::seraph::log::register_name(b"devmgr");
     let info = startup_info();
 
     // SAFETY: IPC buffer is registered by `std::os::seraph::_start` and
@@ -51,7 +51,7 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    println!(
+    std::os::seraph::log!(
         "got {} apertures, {} ACPI regions, irq_range={:#x}, rsdp={:#x}, dtb={:#x}",
         caps.aperture_count as u64,
         caps.acpi_region_count as u64,
@@ -65,12 +65,15 @@ fn main() -> !
     let Some(ecam_loc) = discover_ecam(&caps)
     else
     {
-        println!("failed to locate PCI ECAM via ACPI or DTB, halting");
+        std::os::seraph::log!("failed to locate PCI ECAM via ACPI or DTB, halting");
         halt_loop();
     };
-    println!(
+    std::os::seraph::log!(
         "devmgr: ECAM phys={:#x} size={:#x} buses {}..={}",
-        ecam_loc.phys_base, ecam_loc.size, ecam_loc.start_bus, ecam_loc.end_bus
+        ecam_loc.phys_base,
+        ecam_loc.size,
+        ecam_loc.start_bus,
+        ecam_loc.end_bus
     );
 
     // Find the aperture covering ECAM and carve a narrow ECAM MmioRegion cap.
@@ -81,14 +84,14 @@ fn main() -> !
     )
     else
     {
-        println!("no aperture covers the ECAM range, halting");
+        std::os::seraph::log!("no aperture covers the ECAM range, halting");
         halt_loop();
     };
 
     let ecam_pages = ecam_loc.size.div_ceil(PAGE_SIZE);
     if syscall::mmio_map(caps.self_aspace, ecam_cap, MMIO_MAP_VA, 0).is_err()
     {
-        println!("failed to map ECAM region");
+        std::os::seraph::log!("failed to map ECAM region");
         halt_loop();
     }
 
@@ -98,7 +101,7 @@ fn main() -> !
     let mut devices = [pci::PciDevice::empty(); pci::MAX_DEVICES];
     // SAFETY: MMIO_MAP_VA is a valid ECAM mapping of (end_bus-start_bus+1) * 1 MiB.
     let dev_count = unsafe { pci::pci_enumerate(MMIO_MAP_VA, start_bus, end_bus, &mut devices) };
-    println!("PCI devices found: {:#x}", dev_count as u64);
+    std::os::seraph::log!("PCI devices found: {:#x}", dev_count as u64);
 
     let _ = syscall::mem_unmap(caps.self_aspace, MMIO_MAP_VA, ecam_pages);
 
@@ -106,7 +109,7 @@ fn main() -> !
     let blk_ep = syscall::cap_create_endpoint().unwrap_or(0);
     if blk_ep == 0
     {
-        println!("failed to create block device endpoint");
+        std::os::seraph::log!("failed to create block device endpoint");
     }
 
     // IRQ allocator state: consume the root range cap ascending.
@@ -130,11 +133,11 @@ fn main() -> !
 
     if caps.registry_ep == 0
     {
-        println!("no registry endpoint injected, halting");
+        std::os::seraph::log!("no registry endpoint injected, halting");
         halt_loop();
     }
 
-    println!("enumeration complete, entering registry loop");
+    std::os::seraph::log!("enumeration complete, entering registry loop");
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer.
@@ -492,7 +495,7 @@ fn spawn_virtio_blk(
             continue;
         }
 
-        println!(
+        std::os::seraph::log!(
             "devmgr: found virtio-blk PCI device IRQ line={:#x} pin={:#x}",
             u64::from(pci_dev.irq_line),
             u64::from(pci_dev.irq_pin)
@@ -500,7 +503,7 @@ fn spawn_virtio_blk(
 
         if caps.driver_module_count == 0
         {
-            println!("no driver modules available");
+            std::os::seraph::log!("no driver modules available");
             return false;
         }
 
@@ -530,7 +533,6 @@ fn spawn_virtio_blk(
             service_ep: blk_ep,
             registry_ep: caps.registry_ep,
             device_token,
-            self_cspace: caps.self_cspace,
         };
         spawn::spawn_driver(&config, ipc_buf);
 
@@ -548,11 +550,11 @@ fn acquire_single_irq_cap(pci_dev: &pci::PciDevice, irq_root: &mut IrqRootAlloca
     let cap = irq_root.isolate_one(gsi);
     if cap.is_some()
     {
-        println!("split single-IRQ cap for GSI {:#x}", u64::from(gsi));
+        std::os::seraph::log!("split single-IRQ cap for GSI {:#x}", u64::from(gsi));
     }
     else
     {
-        println!("irq_split failed for GSI {:#x}", u64::from(gsi));
+        std::os::seraph::log!("irq_split failed for GSI {:#x}", u64::from(gsi));
     }
     cap
 }
@@ -594,9 +596,10 @@ fn find_virtio_bar_cap(
         {
             continue;
         }
-        println!(
+        std::os::seraph::log!(
             "devmgr: VirtIO BAR phys={:#018x} size={:#018x}",
-            pci_dev.bar_phys[b], pci_dev.bar_size[b]
+            pci_dev.bar_phys[b],
+            pci_dev.bar_size[b]
         );
 
         if let Some(cap) = carve_subrange(
@@ -612,7 +615,7 @@ fn find_virtio_bar_cap(
         }
         else
         {
-            println!(
+            std::os::seraph::log!(
                 "devmgr: VirtIO BAR not covered by any aperture virtio_bar_idx={:#x}",
                 u64::from(virtio_bar_idx)
             );

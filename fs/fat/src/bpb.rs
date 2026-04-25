@@ -74,7 +74,7 @@ impl FatState
     {
         if cluster < 2
         {
-            println!(
+            std::os::seraph::log!(
                 "WARNING: cluster_to_sector({cluster}) — reserved cluster \
                  reached; caller should filter"
             );
@@ -103,7 +103,7 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     // Validate boot signature.
     if sector_data[510] != 0x55 || sector_data[511] != 0xAA
     {
-        println!("invalid boot signature");
+        std::os::seraph::log!("invalid boot signature");
         return false;
     }
 
@@ -116,7 +116,7 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     // Validate fields used as divisors to prevent division by zero.
     if state.bytes_per_sector == 0 || state.sectors_per_cluster == 0
     {
-        println!("invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
+        std::os::seraph::log!("invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
         return false;
     }
 
@@ -176,20 +176,20 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     if total_clusters < 65525
     {
         state.fat_type = FatType::Fat16;
-        println!("detected FAT16");
+        std::os::seraph::log!("detected FAT16");
     }
     else
     {
         state.fat_type = FatType::Fat32;
-        println!("detected FAT32");
+        std::os::seraph::log!("detected FAT32");
     }
 
-    println!(
+    std::os::seraph::log!(
         "sectors_per_cluster={:#018x}",
         u64::from(state.sectors_per_cluster)
     );
-    println!("total_clusters={:#018x}", u64::from(total_clusters));
-    println!(
+    std::os::seraph::log!("total_clusters={:#018x}", u64::from(total_clusters));
+    std::os::seraph::log!(
         "data_start_sector={:#018x}",
         u64::from(state.data_start_sector)
     );

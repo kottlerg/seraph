@@ -336,28 +336,11 @@ impl Command {
             return Err(io::Error::other("thread_bind_notification for child failed"));
         }
 
-        // CONFIGURE_STDIO on the suspended child: mint a tokened SEND on
-        // the log endpoint via `MINT_LOG_CAP`, `cap_copy` it into a
-        // second slot in our own CSpace so stdout and stderr share the
-        // same endpoint+token (same display name in the mediator), and
-        // hand both to the child. Best-effort — on failure the child
-        // runs with no stdio (silent `println!`).
-        let log_out = mint_log_output_cap(procmgr_ep, ipc_ptr);
-        let log_err = if log_out != 0 {
-            syscall::cap_copy(log_out, info.self_cspace, syscall::RIGHTS_SEND).unwrap_or(0)
-        } else {
-            0
-        };
-        let mut stdio_builder = ipc::IpcMessage::builder(procmgr_labels::CONFIGURE_STDIO);
-        if log_out != 0 {
-            stdio_builder = stdio_builder.cap(log_out);
-            if log_err != 0 {
-                stdio_builder = stdio_builder.cap(log_err);
-            }
-        }
-        let stdio_msg = stdio_builder.build();
-        // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_call(process_handle, &stdio_msg, ipc_ptr) };
+        // The child has no stdio caps wired by default — `Stdio::piped()`
+        // is not yet implemented, and the child reaches the system log
+        // through the discovery cap procmgr installs in its
+        // `ProcessInfo`. The `CONFIGURE_STDIO` plumbing is preserved for
+        // Phase 3, which will route shmem-backed pipes through it.
 
         // Kick the child off.
         let start_msg = ipc::IpcMessage::new(procmgr_labels::START_PROCESS);
@@ -648,23 +631,6 @@ pub fn getpid() -> u32 {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Call `MINT_LOG_CAP` on procmgr to get a tokened SEND cap on the log
-/// endpoint. Returned cap is handed to the child as its `log_output_cap`
-/// so its stdout/stderr carry a unique identity in the mediator. Returns
-/// `0` on any failure; callers tolerate this by passing zero to
-/// `CREATE_FROM_VFS`, which produces a child with no log output.
-fn mint_log_output_cap(procmgr_ep: u32, ipc_ptr: *mut u64) -> u32 {
-    let req = ipc::IpcMessage::new(procmgr_labels::MINT_LOG_CAP);
-    // SAFETY: ipc_ptr is the calling thread's kernel-registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &req, ipc_ptr) }) else {
-        return 0;
-    };
-    if reply.label != procmgr_errors::SUCCESS {
-        return 0;
-    }
-    reply.caps().first().copied().unwrap_or(0)
-}
 
 fn map_procmgr_error(code: u64) -> io::Error {
     match code {

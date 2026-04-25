@@ -254,11 +254,11 @@ fn run(info_ptr: u64) -> !
     };
 
     // Create the log endpoint. Init holds the full-rights cap; procmgr
-    // receives a SEND copy in its bootstrap round for `MINT_LOG_CAP`
-    // dispensing. Spawn the log thread as soon as its prerequisites
-    // (allocator, IPC buffer, log_ep) are satisfied so init's own
-    // subsequent log lines ride IPC through the mediator instead of
-    // direct serial.
+    // receives a SEND copy in its bootstrap round and `cap_copy`s it
+    // into every child's `ProcessInfo.log_discovery_cap`. Spawn the log
+    // thread as soon as its prerequisites (allocator, IPC buffer,
+    // log_ep) are satisfied so init's own subsequent log lines ride IPC
+    // through the mediator instead of direct serial.
     //
     // TODO: real `logd` — a late-boot service loaded from the real root
     // (not the ESP) — will eventually own the receive side and the
@@ -287,8 +287,6 @@ fn run(info_ptr: u64) -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = INIT_IPC_BUF_VA as *mut u64;
     logging::set_ipc_logging(init_log_send, ipc_buf);
-    logging::set_log_ep(log_ep);
-    logging::set_cspace_cap(info.cspace_cap);
     logging::register_name(b"init");
 
     // ── Bootstrap procmgr (raw ELF load + creator_endpoint install) ──────────

@@ -34,12 +34,12 @@ use std::time::Duration;
 
 fn main()
 {
-    std::os::seraph::register_log_name(b"crasher");
+    std::os::seraph::log::register_name(b"crasher");
     let info = startup_info();
 
     let (svcmgr_cap, cap_count) = bootstrap_caps(info.creator_endpoint, info.ipc_buffer);
 
-    println!("alive (bootstrap caps={cap_count})");
+    std::os::seraph::log!("alive (bootstrap caps={cap_count})");
 
     if svcmgr_cap != 0
     {
@@ -48,7 +48,7 @@ fn main()
 
     thread::sleep(Duration::from_secs(5));
 
-    println!("triggering fault");
+    std::os::seraph::log!("triggering fault");
 
     // Trigger a fault: write to null pointer.
     // x86-64: #PF (vector 14) for unmapped page.
@@ -108,7 +108,7 @@ fn probe_svcmgr(svcmgr_cap: u32, ipc_buffer: *mut u8)
     // page installed by `_start`.
     match unsafe { ipc::ipc_call(svcmgr_cap, &msg, ipc_buf) }
     {
-        Ok(reply) => println!("svcmgr probe reply={}", reply.label),
-        Err(_) => println!("svcmgr probe ipc_call failed"),
+        Ok(reply) => std::os::seraph::log!("svcmgr probe reply={}", reply.label),
+        Err(_) => std::os::seraph::log!("svcmgr probe ipc_call failed"),
     }
 }

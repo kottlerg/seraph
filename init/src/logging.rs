@@ -62,29 +62,13 @@ static mut INIT_LOG_SEND: u32 = 0;
 /// IPC buffer pointer for the main thread (set after IPC buffer is mapped).
 static mut MAIN_IPC_BUF: *mut u64 = core::ptr::null_mut();
 
-/// Init's full-rights cap on the system log endpoint, retained as the
-/// source for deriving tokened SEND caps for the handful of services init
-/// spawns directly during early boot (procmgr, devmgr, vfsd, svcmgr,
-/// crasher, usertest, ...). Zero until `set_log_ep` is called right after
-/// the log thread starts.
-static mut INIT_LOG_EP: u32 = 0;
-
-/// Init's own `CSpace` cap, stashed at startup so `derive_log_stdio_pair`
-/// can `cap_copy` within init's `CSpace` to produce a second slot pointing
-/// at the same tokened endpoint. Zero until `set_cspace_cap` is called.
-static mut INIT_CSPACE: u32 = 0;
-
-/// Monotonic counter for init-reserved log stream tokens. Range 2..=16 is
-/// reserved for services init spawns directly; procmgr's `NEXT_LOG_TOKEN`
-/// starts at 1024 to guarantee no overlap. Token 1 is init's own self-cap.
-static INIT_NEXT_LOG_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2);
-
-/// Monotonic counter for tokens minted on the new `GET_LOG_CAP` discovery
-/// path. Range 32..=1023 — disjoint from init's pre-spawn reserved
-/// 1..=16 range and procmgr's `MINT_LOG_CAP` 1024+ range. Phase 2 retires
-/// `MINT_LOG_CAP` and the band split collapses.
+/// Monotonic counter for tokens minted on the `GET_LOG_CAP` discovery
+/// path. Token 0 is reserved for the untokened sentinel; token 1 is
+/// reserved for init's self-identity cap, derived directly from the
+/// log endpoint init owns; every other process gets its token from
+/// this counter.
 static INIT_DISCOVERY_NEXT_TOKEN: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(32);
+    core::sync::atomic::AtomicU64::new(2);
 
 // ── Public interface ─────────────────────────────────────────────────────────
 
@@ -122,78 +106,6 @@ pub fn set_ipc_logging(cap: u32, ipc_buf: *mut u64)
         INIT_LOG_SEND = cap;
         MAIN_IPC_BUF = ipc_buf;
     }
-}
-
-/// Install the init-retained log endpoint cap so [`derive_log_output_cap`]
-/// can mint per-child tokened SEND caps for direct spawns.
-pub fn set_log_ep(log_ep: u32)
-{
-    // SAFETY: single main thread; only main reads this.
-    unsafe {
-        INIT_LOG_EP = log_ep;
-    }
-}
-
-/// Install init's own `CSpace` cap so the log-stdio pair helpers can
-/// `cap_copy` within init's `CSpace`.
-pub fn set_cspace_cap(cspace: u32)
-{
-    // SAFETY: single main thread; only main reads this.
-    unsafe {
-        INIT_CSPACE = cspace;
-    }
-}
-
-/// Derive a tokened SEND cap on init's log endpoint for a child process's
-/// stdout/stderr. Token is drawn from init's reserved range (2..=16) so it
-/// does not collide with procmgr-minted tokens (starting at 1024).
-///
-/// Returns zero on failure (`log_ep` not installed, `cap_derive_token`
-/// refused, or reserved range exhausted). Callers typically use
-/// [`derive_log_stdio_pair`] instead — it returns two slots that both
-/// refer to the same tokened endpoint and are ready to hand to
-/// `CONFIGURE_STDIO` as stdout + stderr.
-pub fn derive_log_output_cap() -> u32
-{
-    use core::sync::atomic::Ordering;
-    // SAFETY: see above — single main thread reads INIT_LOG_EP.
-    let log_ep = unsafe { INIT_LOG_EP };
-    if log_ep == 0
-    {
-        return 0;
-    }
-    let token = INIT_NEXT_LOG_TOKEN.fetch_add(1, Ordering::Relaxed);
-    if token > 16
-    {
-        // Reserved range exhausted — refuse rather than collide with
-        // procmgr's range. Caller logs the failure.
-        return 0;
-    }
-    syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, token).unwrap_or(0)
-}
-
-/// Derive a pair of tokened SEND caps on init's log endpoint that both
-/// refer to the same underlying cap (same endpoint + same token). Meant
-/// for `CONFIGURE_STDIO`: one slot used for `stdout_cap`, the other for
-/// `stderr_cap`, so the mediator attributes both writes to the same
-/// registered display name.
-///
-/// Returns `(stdout_slot, stderr_slot)`. Either is zero on failure.
-pub fn derive_log_stdio_pair() -> (u32, u32)
-{
-    let stdout = derive_log_output_cap();
-    if stdout == 0
-    {
-        return (0, 0);
-    }
-    // SAFETY: single main thread; INIT_CSPACE is written once at startup.
-    let cspace = unsafe { INIT_CSPACE };
-    if cspace == 0
-    {
-        return (stdout, 0);
-    }
-    let stderr = syscall::cap_copy(stdout, cspace, syscall::RIGHTS_SEND).unwrap_or(0);
-    (stdout, stderr)
 }
 
 /// Send a `STREAM_REGISTER_NAME` message on init's own log SEND cap so the
@@ -459,19 +371,20 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
 }
 
 /// Handler for `log_labels::GET_LOG_CAP`. Mints a fresh tokened SEND cap
-/// on the system log endpoint (token from the discovery range
-/// 32..=1023), transfers it back to the caller in the reply, and frees
-/// our local slot when the kernel performs the transfer.
+/// on the system log endpoint (token=0 reserved as the untokened sentinel,
+/// token=1 reserved for init's self-identity), transfers it back to the
+/// caller in the reply, and frees our local slot when the kernel performs
+/// the transfer.
 fn handle_get_log_cap(log_ep: u32, ipc_buf: *mut u64)
 {
     use core::sync::atomic::Ordering;
 
     let token = INIT_DISCOVERY_NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    if !(32..=1023).contains(&token)
+    if token == 0
     {
-        // Range exhausted; reply empty and surface a synthetic warning
-        // line so operators can spot the saturation.
-        flush_synthetic_logd_line(b"GET_LOG_CAP: token range 32..=1023 exhausted");
+        // Counter wrapped — vanishingly unlikely (u64), but bail rather
+        // than mint a token that aliases the untokened sentinel.
+        flush_synthetic_logd_line(b"GET_LOG_CAP: token counter wrapped");
         // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(1), ipc_buf) };
         return;

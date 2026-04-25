@@ -130,7 +130,7 @@ fn handle_register(
 
     *service_count += 1;
 
-    println!(
+    std::os::seraph::log!(
         "registered service: {} (bundle caps={})",
         services[idx].name_str(),
         u64::from(services[idx].bundle_count)
@@ -190,7 +190,7 @@ fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usiz
     let Ok(eq_cap) = syscall::event_queue_create(4)
     else
     {
-        println!("failed to create event queue for service");
+        std::os::seraph::log!("failed to create event queue for service");
         return None;
     };
 
@@ -198,7 +198,7 @@ fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usiz
     // for routing; the payload is just `exit_reason`. No correlator needed.
     if syscall::thread_bind_notification(thread_cap, eq_cap, 0).is_err()
     {
-        println!("failed to bind death notification");
+        std::os::seraph::log!("failed to bind death notification");
         return None;
     }
 
@@ -206,7 +206,7 @@ fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usiz
     let token = (service_index as u64) + 1;
     if syscall::wait_set_add(ws_cap, eq_cap, token).is_err()
     {
-        println!("failed to add event queue to wait set");
+        std::os::seraph::log!("failed to add event queue to wait set");
         return None;
     }
 
@@ -228,7 +228,7 @@ pub fn halt_loop() -> !
 
 fn main() -> !
 {
-    std::os::seraph::register_log_name(b"svcmgr");
+    std::os::seraph::log::register_name(b"svcmgr");
     let info = startup_info();
 
     // IPC buffer was registered by `std::os::seraph::_start`. The raw
@@ -244,29 +244,29 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    println!("started");
+    std::os::seraph::log!("started");
 
     if caps.service_ep == 0
     {
-        println!("no service endpoint, halting");
+        std::os::seraph::log!("no service endpoint, halting");
         halt_loop();
     }
     if info.procmgr_endpoint == 0
     {
-        println!("no procmgr endpoint, halting");
+        std::os::seraph::log!("no procmgr endpoint, halting");
         halt_loop();
     }
 
     let Ok(ws_cap) = syscall::wait_set_create()
     else
     {
-        println!("failed to create wait set");
+        std::os::seraph::log!("failed to create wait set");
         halt_loop();
     };
 
     if syscall::wait_set_add(ws_cap, caps.service_ep, 0).is_err()
     {
-        println!("failed to add service endpoint to wait set");
+        std::os::seraph::log!("failed to add service endpoint to wait set");
         halt_loop();
     }
 
@@ -277,7 +277,7 @@ fn main() -> !
         registry: registry::Registry::new(),
     };
 
-    println!("waiting for registrations");
+    std::os::seraph::log!("waiting for registrations");
 
     event_loop(info, &caps, ws_cap, ipc_buf, &mut state);
 }
@@ -306,7 +306,6 @@ fn event_loop(
         bootstrap_ep: caps.bootstrap_ep,
         ipc_buf,
         ws_cap,
-        self_cspace: info.self_cspace,
     };
 
     loop
@@ -314,7 +313,7 @@ fn event_loop(
         let Ok(token) = syscall::wait_set_wait(ws_cap)
         else
         {
-            println!("wait_set_wait failed");
+            std::os::seraph::log!("wait_set_wait failed");
             continue;
         };
 
@@ -357,7 +356,7 @@ fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, ws_
             let reply = IpcMessage::new(ipc::svcmgr_errors::SUCCESS);
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-            println!(
+            std::os::seraph::log!(
                 "handover complete, monitoring services: {:#018x}",
                 state.service_count as u64
             );
@@ -454,14 +453,14 @@ fn dispatch_death(token: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx
     let idx = (token - 1) as usize;
     if idx >= state.service_count
     {
-        println!("invalid death notification token");
+        std::os::seraph::log!("invalid death notification token");
         return;
     }
 
     let Ok(exit_reason) = syscall::event_recv(state.services[idx].event_queue_cap)
     else
     {
-        println!("event_recv failed");
+        std::os::seraph::log!("event_recv failed");
         return;
     };
 
@@ -476,7 +475,7 @@ fn dispatch_death(token: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx
     if state.services[idx].active
         && syscall::wait_set_add(ctx.ws_cap, state.services[idx].event_queue_cap, token).is_err()
     {
-        println!("failed to re-add event queue to wait set after restart");
+        std::os::seraph::log!("failed to re-add event queue to wait set after restart");
         state.services[idx].active = false;
     }
 }

@@ -29,7 +29,7 @@ use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::os::seraph::current_ipc_buf;
 use crate::sync::atomic::{AtomicU32, Ordering};
 
-use ipc::{IpcMessage, stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME}};
+use ipc::{IpcMessage, stream_labels::STREAM_BYTES};
 use syscall_abi::MSG_DATA_WORDS_MAX;
 
 /// Maximum bytes per IPC chunk (one full IPC data area).
@@ -55,45 +55,6 @@ pub fn stdio_init(stdin: u32, stdout: u32, stderr: u32) {
     STDIN_CAP.store(stdin, Ordering::Release);
     STDOUT_CAP.store(stdout, Ordering::Release);
     STDERR_CAP.store(stderr, Ordering::Release);
-}
-
-/// Send a `STREAM_REGISTER_NAME` message on the stdout cap so the log
-/// mediator attaches this display name to the sender's stream. Opt-in —
-/// services that want their `[name]` prefix to reflect something other
-/// than the default `[?]` call this once at startup (or again to change
-/// the name to include runtime context like a mountpoint). Silently does
-/// nothing when stdout is not wired or the IPC buffer isn't registered.
-pub(crate) fn register_log_name_raw(name: &[u8]) {
-    let ipc_ptr = current_ipc_buf();
-    if ipc_ptr.is_null() {
-        return;
-    }
-    let cap = STDOUT_CAP.load(Ordering::Acquire);
-    if cap == 0 || name.is_empty() {
-        return;
-    }
-    let len = name.len().min(CHUNK_SIZE);
-    let label = STREAM_REGISTER_NAME | ((len as u64 & 0xFFFF) << 16);
-    let msg = IpcMessage::builder(label).bytes(0, &name[..len]).build();
-    // SAFETY: ipc_ptr is the calling thread's kernel-registered IPC buffer.
-    let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_ptr) };
-}
-
-/// Best-effort raw write to the stderr cap, used by panic / pre-heap
-/// diagnostic paths that cannot afford a `LineWriter` allocation. Silently
-/// drops if the current thread's IPC buffer is not yet registered or the
-/// stderr slot is zero. Does not fall back to stdout — a process without
-/// stderr was created that way intentionally, and cross-stream
-/// redirection crosses the semantics the spawner set.
-pub(crate) fn diag_write_raw(bytes: &[u8]) {
-    let ipc_ptr = current_ipc_buf();
-    if ipc_ptr.is_null() {
-        return;
-    }
-    let cap = STDERR_CAP.load(Ordering::Acquire);
-    if cap != 0 {
-        let _ = send_bytes(cap, ipc_ptr, bytes);
-    }
 }
 
 /// Send raw bytes on `cap`, splitting across multiple IPC calls if the
@@ -319,16 +280,38 @@ pub fn is_ebadf(_err: &io::Error) -> bool {
     true
 }
 
+/// Panic-output sink that emits through the system log endpoint.
+///
+/// Lazy-acquires the process's tokened SEND cap on first write (one
+/// `GET_LOG_CAP` round-trip against the discovery cap), then sends each
+/// `write` as `STREAM_BYTES` chunks. Non-allocating — `log::write_bytes`
+/// stages bytes into the per-thread IPC buffer, so panics survive
+/// allocator failure. Silent-drops on a zero cap or any IPC error.
+pub struct LogPanicWriter;
+
+impl io::Write for LogPanicWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let ipc_ptr = current_ipc_buf();
+        let cap = ::log::ensure_tokened_cap(ipc_ptr);
+        if cap == 0 || ipc_ptr.is_null() {
+            return Ok(buf.len());
+        }
+        ::log::write_bytes(cap, ipc_ptr, buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn panic_output() -> Option<impl io::Write> {
-    // Panic diagnostics go to stderr exclusively. A process whose stderr is
-    // unwired was deliberately created without one, and stdout is not a
-    // substitute — silently redirecting panic text to stdout crosses the
-    // stream semantics the spawner set. Returning `None` when stderr is
-    // absent makes the default panic hook drop the message; callers that
-    // want a visible panic must wire stderr.
-    let cap = STDERR_CAP.load(Ordering::Acquire);
-    if current_ipc_buf().is_null() || cap == 0 {
+    // Route panics through the system log endpoint. The tokened cap is
+    // acquired lazily on first write, so processes that never logged
+    // before still surface their panic. Discovery cap absent or IPC
+    // failure → silent drop, matching every other log site.
+    if current_ipc_buf().is_null() {
         return None;
     }
-    Some(Stderr::new())
+    Some(LogPanicWriter)
 }

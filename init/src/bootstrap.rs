@@ -184,8 +184,8 @@ struct ProcmgrCaps
 ///
 /// procmgr is `no_std` and doesn't drive `std::io::stdio`, so the three
 /// stdio cap slots are left zero. The log endpoint procmgr needs (as the
-/// dispensing source for `MINT_LOG_CAP`) arrives via its bootstrap round,
-/// not via `ProcessInfo`.
+/// source `cap_copy`'d into every child's `ProcessInfo.log_discovery_cap`)
+/// arrives via its bootstrap round, not via `ProcessInfo`.
 #[allow(clippy::similar_names)]
 fn populate_procmgr_info(
     alloc: &mut FrameAlloc,
@@ -215,10 +215,9 @@ fn populate_procmgr_info(
     pi.stdin_cap = 0;
     pi.stdout_cap = 0;
     pi.stderr_cap = 0;
-    // Procmgr is the source of the log discovery cap (it holds the un-
-    // tokened SEND on the log endpoint, used as the dispensing source
-    // for `MINT_LOG_CAP` and now also as the source procmgr `cap_copy`s
-    // into every child it creates). Procmgr itself does not consume
+    // Procmgr holds the un-tokened SEND on the log endpoint and
+    // `cap_copy`s it into every child's `ProcessInfo.log_discovery_cap`
+    // at `CREATE_PROCESS` time. Procmgr itself does not consume
     // `seraph::log!`, so its own slot stays zero.
     pi.log_discovery_cap = 0;
 
@@ -268,10 +267,10 @@ pub struct ProcmgrBootstrap
     /// Memory pool count.
     pub memory_frame_count: u32,
     /// Slot in procmgr's `CSpace` holding an un-tokened SEND cap on the
-    /// system log endpoint. Procmgr uses this exclusively as the dispensing
-    /// source for `MINT_LOG_CAP` requests — it does not consult it during
-    /// `CREATE_PROCESS`. Zero when no log endpoint is available (very early
-    /// boot); `MINT_LOG_CAP` refuses requests in that window.
+    /// system log endpoint. Procmgr `cap_copy`s this into every child's
+    /// `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time. Zero
+    /// when no log endpoint is available (very early boot); children
+    /// born in that window receive zero and silent-drop `seraph::log!`.
     pub log_endpoint_slot: u32,
 }
 
@@ -360,11 +359,11 @@ pub fn bootstrap_procmgr(
     }
     alloc.next_idx += frames_to_give;
 
-    // Derive an un-tokened SEND cap on the log endpoint for procmgr's
-    // dispensing role (source for `MINT_LOG_CAP`). Kept in init's CSpace
-    // and sent to procmgr via the bootstrap round (ipc transfer moves it
-    // into procmgr's CSpace at a fresh slot). Procmgr never uses this cap
-    // during `CREATE_PROCESS` — only when servicing `MINT_LOG_CAP`.
+    // Derive an un-tokened SEND cap on the log endpoint for procmgr.
+    // Kept in init's CSpace and sent to procmgr via the bootstrap round
+    // (ipc transfer moves it into procmgr's CSpace at a fresh slot).
+    // Procmgr `cap_copy`s this into every child's
+    // `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time.
     let pm_log_send = if log_ep == 0
     {
         0

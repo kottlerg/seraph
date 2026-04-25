@@ -19,7 +19,6 @@ use std::io::{BufRead, BufReader};
 
 fn main()
 {
-    std::os::seraph::register_log_name(b"stdiotest");
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();

@@ -14,6 +14,5 @@
 
 fn main()
 {
-    std::os::seraph::register_log_name(b"hello");
     println!("hello from seraph userspace");
 }

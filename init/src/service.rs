@@ -11,7 +11,7 @@
 
 use crate::bootstrap::NEXT_BOOTSTRAP_TOKEN;
 use crate::idle_loop;
-use crate::logging::{derive_log_stdio_pair, log};
+use crate::logging::log;
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
@@ -28,45 +28,6 @@ fn derive_tokened_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
     let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let tokened = syscall::cap_derive_token(bootstrap_ep, syscall::RIGHTS_SEND, token).ok()?;
     Some((tokened, token))
-}
-
-/// Issue `CONFIGURE_STDIO` on a suspended child's `process_handle`,
-/// installing the given stdout/stderr/stdin caps. Zero slots are omitted
-/// (trailing zeros only — the kernel rejects null slot indices in a cap
-/// list). Returns true on success.
-fn configure_stdio(
-    process_handle: u32,
-    ipc_buf: *mut u64,
-    stdout: u32,
-    stderr: u32,
-    stdin: u32,
-    context: &str,
-) -> bool
-{
-    let mut builder = IpcMessage::builder(procmgr_labels::CONFIGURE_STDIO);
-    if stdout != 0
-    {
-        builder = builder.cap(stdout);
-        if stderr != 0
-        {
-            builder = builder.cap(stderr);
-            if stdin != 0
-            {
-                builder = builder.cap(stdin);
-            }
-        }
-    }
-    let msg = builder.build();
-    // SAFETY: ipc_buf is caller's registered IPC buffer.
-    match unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }
-    {
-        Ok(reply) if reply.label == 0 => true,
-        _ =>
-        {
-            log(context);
-            false
-        }
-    }
 }
 
 /// Start a process by calling `START_PROCESS` on its tokened process handle.
@@ -338,18 +299,8 @@ pub fn create_devmgr_with_caps(
         0
     };
 
-    // CONFIGURE_STDIO: install a matched stdout+stderr pair on the
-    // suspended child so devmgr's log lines appear under its registered
-    // display name. No stdin for devmgr.
-    let (stdout, stderr) = derive_log_stdio_pair();
-    configure_stdio(
-        process_handle,
-        ipc_buf,
-        stdout,
-        stderr,
-        0,
-        "devmgr: CONFIGURE_STDIO failed",
-    );
+    // No stdio caps wired: devmgr reaches the system log via the
+    // discovery cap procmgr installs in `ProcessInfo`.
 
     // START_PROCESS.
     if !start_process(
@@ -592,16 +543,6 @@ pub fn create_vfsd_with_caps(
         return;
     };
 
-    let (stdout, stderr) = derive_log_stdio_pair();
-    configure_stdio(
-        process_handle,
-        ipc_buf,
-        stdout,
-        stderr,
-        0,
-        "vfsd: CONFIGURE_STDIO failed",
-    );
-
     if !start_process(
         process_handle,
         ipc_buf,
@@ -730,16 +671,6 @@ pub fn setup_and_start_svcmgr(
     ipc_buf: *mut u64,
 )
 {
-    let (stdout, stderr) = derive_log_stdio_pair();
-    configure_stdio(
-        process_handle,
-        ipc_buf,
-        stdout,
-        stderr,
-        0,
-        "phase 3: svcmgr CONFIGURE_STDIO failed",
-    );
-
     if !start_process(
         process_handle,
         ipc_buf,
@@ -900,16 +831,6 @@ pub fn create_and_run_usertest(
     }
     let process_handle = reply_caps[0];
 
-    let (stdout, stderr) = derive_log_stdio_pair();
-    configure_stdio(
-        process_handle,
-        ipc_buf,
-        stdout,
-        stderr,
-        0,
-        "phase 3: usertest CONFIGURE_STDIO failed",
-    );
-
     if !start_process(
         process_handle,
         ipc_buf,
@@ -945,16 +866,6 @@ pub fn start_and_bootstrap_crasher(
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let (stdout, stderr) = derive_log_stdio_pair();
-    configure_stdio(
-        process_handle,
-        ipc_buf,
-        stdout,
-        stderr,
-        0,
-        "phase 3: crasher CONFIGURE_STDIO failed",
-    );
-
     if !start_process(
         process_handle,
         ipc_buf,
@@ -1108,16 +1019,6 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u6
     // round; init would otherwise block on a REQUEST that never comes.
     let _ = child_token;
 
-    let (stdout, stderr) = derive_log_stdio_pair();
-    configure_stdio(
-        process_handle,
-        ipc_buf,
-        stdout,
-        stderr,
-        0,
-        "phase 3: hello CONFIGURE_STDIO failed",
-    );
-
     let _ = start_process(
         process_handle,
         ipc_buf,
@@ -1126,107 +1027,12 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u6
     );
 }
 
-/// Create `/bin/probe` via `CREATE_FROM_VFS`, start it, serve an empty
-/// bootstrap round. Phase-1 verification probe for the new
-/// `seraph::log!` path — calls `seraph::log::register_name(b"probe")`
-/// and `seraph::log!("probe message")` once each, then exits. Output
-/// `[probe] probe message` in boot log proves the discovery cap →
-/// `GET_LOG_CAP` → tokened cap → `STREAM_REGISTER_NAME` /
-/// `STREAM_BYTES` chain works end-to-end.
-pub fn create_and_run_probe(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u64)
-{
-    let path: &[u8] = b"/bin/probe";
-
-    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
-    else
-    {
-        return;
-    };
-
-    let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
-    let word_count = path_word_count(path);
-    let msg = IpcMessage::builder(label)
-        .bytes(0, path)
-        .word_count(word_count)
-        .cap(tokened_creator)
-        .build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
-    else
-    {
-        log("phase 3: probe CREATE_FROM_VFS failed");
-        return;
-    };
-    if reply.label != 0
-    {
-        log("phase 3: probe CREATE_FROM_VFS error");
-        return;
-    }
-
-    let reply_caps = reply.caps();
-    if reply_caps.is_empty()
-    {
-        return;
-    }
-    let process_handle = reply_caps[0];
-
-    // Probe does not speak the bootstrap protocol — child_token/tokened_creator
-    // are unused on the child side. Skip the serve round.
-    let _ = child_token;
-
-    // Configure stdio with log-endpoint caps the same way hello does.
-    // The probe's own `seraph::log!` calls go through the discovery
-    // cap (from ProcessInfo, installed by procmgr) and bypass stdio
-    // entirely; stdio is wired so any stray `println!` (none today)
-    // would still land in the log under `[probe]`.
-    let (stdout, stderr) = derive_log_stdio_pair();
-    configure_stdio(
-        process_handle,
-        ipc_buf,
-        stdout,
-        stderr,
-        0,
-        "phase 3: probe CONFIGURE_STDIO failed",
-    );
-
-    let _ = start_process(
-        process_handle,
-        ipc_buf,
-        "phase 3: probe started",
-        "phase 3: probe START_PROCESS failed",
-    );
-}
-
-/// Create `/bin/stdiotest` via `CREATE_FROM_VFS` with a stdin endpoint init
-/// holds the SEND side of, then push a probe payload through stdin so the
-/// child's `read_line` returns. Exercises the full spawner-writes →
-/// child-reads → child-writes-stdout cycle end-to-end.
+/// Create `/bin/stdiotest` via `CREATE_FROM_VFS`. With no stdio caps wired,
+/// stdin reads return EOF and stdout writes silent-drop — the deliberate
+/// interim shape until Phase 3 wires shmem-backed pipes.
 pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u64)
 {
     let path: &[u8] = b"/bin/stdiotest";
-
-    let Ok(stdin_ep) = syscall::cap_create_endpoint()
-    else
-    {
-        log("phase 3: stdiotest cannot create stdin endpoint");
-        return;
-    };
-
-    // RECV side: handed to the child as its stdin cap.
-    let Ok(stdin_recv) = syscall::cap_derive(stdin_ep, syscall::RIGHTS_RECEIVE)
-    else
-    {
-        log("phase 3: stdiotest cannot derive stdin RECV");
-        return;
-    };
-    // SEND side: kept by init for writing the probe payload.
-    let Ok(stdin_send) = syscall::cap_derive(stdin_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        log("phase 3: stdiotest cannot derive stdin SEND");
-        return;
-    };
 
     let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
     else
@@ -1265,60 +1071,12 @@ pub fn create_and_run_stdiotest(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mu
     // Tier-2 binary: skip the bootstrap serve round (see hello).
     let _ = child_token;
 
-    // CONFIGURE_STDIO with all three caps (stdout + stderr tokened pair,
-    // plus the stdin RECV cap init just derived).
-    let (stdout, stderr) = derive_log_stdio_pair();
-    configure_stdio(
-        process_handle,
-        ipc_buf,
-        stdout,
-        stderr,
-        stdin_recv,
-        "phase 3: stdiotest CONFIGURE_STDIO failed",
-    );
-
-    if !start_process(
+    let _ = start_process(
         process_handle,
         ipc_buf,
         "phase 3: stdiotest started",
         "phase 3: stdiotest START_PROCESS failed",
-    )
-    {
-        return;
-    }
-
-    // Push the probe payload. Synchronous IPC: blocks until the child reaches
-    // `stdin().read_line(..)`. After `ipc_call` returns, the child has the
-    // bytes and will print its result on stdout.
-    let payload = b"hello seraph\n";
-    write_stream_bytes(stdin_send, ipc_buf, payload);
-
-    // Cap hygiene: the stdin SEND cap has done its single job.
-    let _ = syscall::cap_delete(stdin_send);
-}
-
-/// Send `bytes` on `cap` using the same `STREAM_BYTES` wire protocol that
-/// ruststd's stdio path speaks. Used by init to push stdiotest's stdin
-/// payload. Mirrors `init::logging::ipc_log` but exposed here so callers
-/// outside the log path can write to byte-stream caps.
-fn write_stream_bytes(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
-{
-    if bytes.is_empty()
-    {
-        return;
-    }
-    let mut offset = 0;
-    while offset < bytes.len()
-    {
-        let chunk_len = (bytes.len() - offset).min(syscall_abi::MSG_DATA_WORDS_MAX * 8);
-        let label = ipc::stream_labels::STREAM_BYTES | ((chunk_len as u64 & 0xFFFF) << 16);
-        let msg = IpcMessage::builder(label)
-            .bytes(0, &bytes[offset..offset + chunk_len])
-            .build();
-        // SAFETY: ipc_buf is caller's registered IPC buffer.
-        let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
-        offset += chunk_len;
-    }
+    );
 }
 
 // ── Phase 3 orchestration ───────────────────────────────────────────────────
@@ -1413,12 +1171,6 @@ pub fn phase3_svcmgr_handover(
     // stdin→process→stdout cycle, fed by init).
     create_and_run_hello(procmgr_ep, bootstrap_ep, ipc_buf);
     create_and_run_stdiotest(procmgr_ep, bootstrap_ep, ipc_buf);
-
-    // Phase-1 verification probe for the new `seraph::log!` path. Uses
-    // the `log_discovery_cap` field of `ProcessInfo` (installed by
-    // procmgr) to lazy-acquire a tokened SEND cap via `GET_LOG_CAP`,
-    // then registers as `[probe]` and emits one log line.
-    create_and_run_probe(procmgr_ep, bootstrap_ep, ipc_buf);
 
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
     // SAFETY: ipc_buf is caller's registered IPC buffer.

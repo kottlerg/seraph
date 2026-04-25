@@ -86,7 +86,6 @@ pub enum BuildComponent
     Hello,
     Stackoverflow,
     Stdiotest,
-    Probe,
     All,
 }
 

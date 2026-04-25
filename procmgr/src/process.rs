@@ -225,7 +225,7 @@ pub struct CreateResult
 /// Procmgr's own service endpoint plus the system log discovery cap.
 ///
 /// The child receives a tokened SEND copy of `procmgr_endpoint` so it
-/// can call `REQUEST_FRAMES` / `MINT_LOG_CAP` / `CREATE_PROCESS`, and
+/// can call `REQUEST_FRAMES` / `CREATE_PROCESS`, and
 /// an un-tokened SEND copy of `log_discovery` so it can `GET_LOG_CAP`
 /// against the system log endpoint on first `seraph::log!` call (the
 /// discovery cap by itself grants no log identity and no observability;

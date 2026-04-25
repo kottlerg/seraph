@@ -324,11 +324,14 @@ pub extern "C" fn _start() -> ! {
             info.self_aspace_cap,
         );
         if !ok {
-            diag_writeln_args(format_args!(
-                "std::os::seraph: FATAL: heap_bootstrap failed (procmgr_ep={}); \
-                 likely procmgr frame-pool exhaustion — aborting",
-                info.procmgr_endpoint_cap,
-            ));
+            ::log::emit(
+                current_ipc_buf(),
+                format_args!(
+                    "std::os::seraph: FATAL: heap_bootstrap failed (procmgr_ep={}); \
+                     likely procmgr frame-pool exhaustion — aborting",
+                    info.procmgr_endpoint_cap,
+                ),
+            );
             syscall::thread_exit();
         }
     }
@@ -390,46 +393,13 @@ pub fn abort_thread() -> ! {
     pal_alloc::abort_thread()
 }
 
-/// Write pre-formatted bytes directly to the stderr cap (falling back to
-/// stdout if stderr is unset), bypassing `std::io::stdout`'s `LineWriter`.
-/// Intended for services that cannot guarantee a live heap when they need
-/// to emit diagnostics: the standard `println!` path lazily allocates a
-/// 1 KiB line-buffer on first use, which fails for processes that do not
-/// bootstrap the heap.
-///
-/// Silently dropped if `_start` has not yet wired the stdio caps.
-#[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn diag_write(bytes: &[u8]) {
-    pal_stdio::diag_write_raw(bytes);
-}
-
-/// Register a display name for this process's log stream with the system
-/// log mediator. Opt-in — services that want their log lines to appear
-/// under a specific `[name]` prefix call this once at startup (or again
-/// to update the name with runtime context, e.g. a mountpoint).
-///
-/// Non-logging services should not call this: the mediator only observes
-/// senders whose stdout cap points at the log endpoint, and the mediator
-/// is the only receiver that interprets `STREAM_REGISTER_NAME`. Sending
-/// this message to an unrelated stdout sink (a pipe, a terminal) would
-/// appear as arbitrary bytes in that sink.
-///
-/// Silently dropped if the process has no stdout cap or the IPC buffer
-/// is not yet registered.
-#[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn register_log_name(name: &[u8]) {
-    pal_stdio::register_log_name_raw(name);
-}
-
 // ── System log macro surface ────────────────────────────────────────────────
 //
 // The discovery cap installed at process create-time (recorded in
 // `StartupInfo::log_discovery_cap` and forwarded to `::log::set_discovery_cap`
 // during `_start`) drives a lazy `GET_LOG_CAP` round on first
 // `seraph::log!` call; the tokened cap is then cached process-globally for
-// the lifetime of the process. Distinct from `diag_write` /
-// `register_log_name` (which sit on the stdout/stderr stdio caps and are
-// retained for Phase 2's panic-handler routing).
+// the lifetime of the process.
 
 /// System-log access surface. Re-exports the `shared/log` wire-format
 /// helpers wrapped against the calling thread's registered IPC buffer.
@@ -452,11 +422,7 @@ pub mod log {
     /// no-op at the receiver. Names longer than the receiver's
     /// per-slot buffer are truncated; collisions with other senders'
     /// names are resolved server-side via `name.2` / `name.3` /
-    /// suffixes (see `ipc::stream_labels::STREAM_REGISTER_NAME`).
-    ///
-    /// Drives the new tokened SEND cap (acquired lazily); does not
-    /// touch `STDOUT_CAP` and is therefore independent of the legacy
-    /// `register_log_name` path.
+    /// suffixes.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn register_name(name: &[u8]) {
         let buf = current_ipc_buf();
@@ -497,35 +463,3 @@ macro_rules! __seraph_log {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub use crate::__seraph_log as log;
 
-/// Format `args` into a 512-byte stack buffer and emit through
-/// [`diag_write`], appending a trailing newline. Non-allocating — callers
-/// without a live heap can use this in place of `eprintln!`. Messages
-/// exceeding 511 bytes are truncated.
-#[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn diag_writeln_args(args: core::fmt::Arguments<'_>) {
-    use core::fmt::Write;
-
-    struct StackBuf {
-        data: [u8; 512],
-        used: usize,
-    }
-
-    impl Write for StackBuf {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let remaining = self.data.len() - self.used;
-            let n = remaining.min(s.len());
-            self.data[self.used..self.used + n].copy_from_slice(&s.as_bytes()[..n]);
-            self.used += n;
-            if n < s.len() { Err(core::fmt::Error) } else { Ok(()) }
-        }
-    }
-
-    let mut buf = StackBuf { data: [0; 512], used: 0 };
-    let _ = buf.write_fmt(args);
-    // Newline best-effort; if buf is full we drop it to keep the useful prefix.
-    if buf.used < buf.data.len() {
-        buf.data[buf.used] = b'\n';
-        buf.used += 1;
-    }
-    pal_stdio::diag_write_raw(&buf.data[..buf.used]);
-}

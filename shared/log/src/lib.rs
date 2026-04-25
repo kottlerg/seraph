@@ -242,7 +242,7 @@ pub fn write_args(cap: u32, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
         used: 0,
     };
     // write_fmt may return Err on truncation; the partial buffer is still
-    // worth emitting (matches diag_writeln_args's behavior).
+    // worth emitting (truncation is preferable to silent drop).
     let _ = buf.write_fmt(args);
     if buf.used < buf.data.len()
     {

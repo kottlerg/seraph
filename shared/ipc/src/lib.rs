@@ -75,19 +75,6 @@ pub mod procmgr_labels
     /// tools and `std::process::Child::try_wait`-style probes that want to
     /// peek without blocking on a death event.
     pub const QUERY_PROCESS: u64 = 9;
-    /// Mint a fresh tokened SEND cap on the system log endpoint.
-    ///
-    /// Request: empty. Reply: one cap — a SEND cap on the log endpoint with
-    /// a procmgr-minted unique token identifying this caller's log stream.
-    /// Callers typically `cap_copy` the returned cap into a second `CSpace`
-    /// slot with the same rights so both stdout and stderr of the spawned
-    /// child can be wired through [`CONFIGURE_STDIO`] to the same
-    /// tokened sink (both write sites appear under the same mediator name).
-    ///
-    /// procmgr performs no authorization beyond cap possession: any holder
-    /// of a SEND cap on procmgr's service endpoint may call this. The
-    /// capability itself is the authorization.
-    pub const MINT_LOG_CAP: u64 = 10;
     /// Install per-child stdio caps on a process created via
     /// [`CREATE_PROCESS`] / [`CREATE_FROM_VFS`] but not yet started.
     ///

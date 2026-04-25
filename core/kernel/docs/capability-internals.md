@@ -2,7 +2,7 @@
 
 This document covers the implementation of the capability subsystem. The design —
 capability types, rights, derivation, revocation, and transfer semantics — is
-specified in [docs/capability-model.md](../../docs/capability-model.md). This document
+specified in [docs/capability-model.md](../../../docs/capability-model.md). This document
 covers the data structures and algorithms that realise those semantics.
 
 The capability subsystem comprises three components:

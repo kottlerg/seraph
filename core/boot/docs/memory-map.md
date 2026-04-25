@@ -103,7 +103,7 @@ firmware implementation.
   are owned by [uefi-environment.md](uefi-environment.md).
 - Per-region sort/no-overlap invariants as contract requirements are
   owned by the boot-protocol specification; see the crate
-  [`abi/boot-protocol/src/lib.rs`](../../abi/boot-protocol/src/lib.rs).
+  [`abi/boot-protocol/src/lib.rs`](../../../abi/boot-protocol/src/lib.rs).
 - The page-table identity-map region list (what the bootloader maps so
   the kernel can read `BootInfo` at entry) is owned by
   [page-tables.md](page-tables.md).

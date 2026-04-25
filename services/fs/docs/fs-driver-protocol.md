@@ -276,10 +276,10 @@ sentinel identification).
 
 | Document | Content |
 |---|---|
-| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC message format, cap transfer protocol |
+| [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, cap transfer protocol |
 | [vfsd/docs/vfs-ipc-interface.md](../../vfsd/docs/vfs-ipc-interface.md) | Client-facing namespace IPC |
-| [docs/capability-model.md](../../docs/capability-model.md) | Tokens and capability derivation |
-| [docs/device-management.md](../../docs/device-management.md) | Block device endpoint origin |
+| [docs/capability-model.md](../../../docs/capability-model.md) | Tokens and capability derivation |
+| [docs/device-management.md](../../../docs/device-management.md) | Block device endpoint origin |
 
 ---
 

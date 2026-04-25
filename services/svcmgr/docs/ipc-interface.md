@@ -139,8 +139,8 @@ system-level failure that cannot be recovered by simple restart.
 
 | Document | Content |
 |---|---|
-| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC message format, EventQueue semantics |
-| [docs/capability-model.md](../../docs/capability-model.md) | Thread cap rights, EventQueue cap rights |
+| [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, EventQueue semantics |
+| [docs/capability-model.md](../../../docs/capability-model.md) | Thread cap rights, EventQueue cap rights |
 | [restart-protocol.md](restart-protocol.md) | Restart sequencing and cap re-delegation |
 
 ---

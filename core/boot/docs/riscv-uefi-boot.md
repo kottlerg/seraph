@@ -171,7 +171,7 @@ Internally the pipeline runs in three steps:
 The intermediate ELF is not a usable UEFI image — UEFI does not
 understand ELF headers — but it shares a symbol table with the flat
 binary, so GDB / LLDB can set symbolic breakpoints against the ELF even
-though UEFI loads the flat binary. See [xtask/README.md](../../xtask/README.md)
+though UEFI loads the flat binary. See [xtask/README.md](../../../xtask/README.md)
 for the authoritative command surface; the steps above are descriptive,
 not a manual recipe.
 

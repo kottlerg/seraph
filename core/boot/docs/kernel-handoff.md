@@ -44,7 +44,7 @@ calling convention is an ABI break and MUST accompany a
 `BOOT_PROTOCOL_VERSION` bump.
 
 The `BootInfo` type and all its fields are defined in the
-[`abi/boot-protocol`](../../abi/boot-protocol/) crate. The kernel must
+[`abi/boot-protocol`](../../../abi/boot-protocol/) crate. The kernel must
 validate `BootInfo.version == BOOT_PROTOCOL_VERSION` on entry and halt
 rather than proceed with a mismatched structure.
 
@@ -103,9 +103,9 @@ at entry; the kernel replaces them during its own initialisation.
 - `BootInfo` field layout, `BOOT_PROTOCOL_VERSION`, `MmioAperture`
   format, memory-map sort/overlap rules, and every other ABI-level
   invariant are owned by the
-  [`abi/boot-protocol`](../../abi/boot-protocol/) crate; see its
-  [`src/lib.rs`](../../abi/boot-protocol/src/lib.rs) and
-  [`README.md`](../../abi/boot-protocol/README.md).
+  [`abi/boot-protocol`](../../../abi/boot-protocol/) crate; see its
+  [`src/lib.rs`](../../../abi/boot-protocol/src/lib.rs) and
+  [`README.md`](../../../abi/boot-protocol/README.md).
 - The ten-step boot sequence that leads up to handoff is owned by
   [boot-flow.md](boot-flow.md).
 - The page-table state at entry (what pages are mapped, with which
@@ -116,4 +116,4 @@ at entry; the kernel replaces them during its own initialisation.
 
 ## Summarized By
 
-[docs/bootstrap.md](../../docs/bootstrap.md), [boot/README.md](../README.md)
+[docs/bootstrap.md](../../../docs/bootstrap.md), [boot/README.md](../README.md)

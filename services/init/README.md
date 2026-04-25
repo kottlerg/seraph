@@ -80,10 +80,10 @@ Init derives and transfers these to services using the "derive twice" pattern
 
 | Document | Content |
 |---|---|
-| [docs/architecture.md](../docs/architecture.md) | Bootstrap sequence, init/procmgr/svcmgr roles |
-| [abi/boot-protocol/](../abi/boot-protocol/) | InitImage, boot modules, initial CSpace |
-| [docs/capability-model.md](../docs/capability-model.md) | Initial capability distribution |
-| [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, init/procmgr/svcmgr roles |
+| [abi/boot-protocol/](../../abi/boot-protocol/) | InitImage, boot modules, initial CSpace |
+| [docs/capability-model.md](../../docs/capability-model.md) | Initial capability distribution |
+| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---
 

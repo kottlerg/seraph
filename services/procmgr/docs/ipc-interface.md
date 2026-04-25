@@ -244,9 +244,9 @@ procmgr retains the original caps for process lifecycle management.
 
 | Document | Content |
 |---|---|
-| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC message format, cap transfer protocol |
-| [abi/process-abi](../../abi/process-abi/README.md) | ProcessInfo handover struct |
-| [abi/syscall](../../abi/syscall/README.md) | Syscall numbers and register conventions |
+| [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, cap transfer protocol |
+| [abi/process-abi](../../../abi/process-abi/README.md) | ProcessInfo handover struct |
+| [abi/syscall](../../../abi/syscall/README.md) | Syscall numbers and register conventions |
 
 ---
 

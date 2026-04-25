@@ -9,7 +9,7 @@ point.
 The boot protocol contract — `BootInfo` layout, `BOOT_PROTOCOL_VERSION`,
 `KernelMmio` / `MmioAperture` shape, and the compliant-bootloader
 requirements — is owned by the
-[`abi/boot-protocol/`](../abi/boot-protocol/) crate.
+[`abi/boot-protocol/`](../../abi/boot-protocol/) crate.
 The CPU state and register contents at the kernel entry point are
 documented in [docs/kernel-handoff.md](docs/kernel-handoff.md).
 
@@ -88,7 +88,7 @@ in boot as `elf::ElfError` and bridge to `BootError::InvalidElf` via the
 ## Build
 
 The bootloader is built as part of the Seraph workspace. Refer to
-[xtask/README.md](../xtask/README.md) for the full build procedure. Key points:
+[xtask/README.md](../../xtask/README.md) for the full build procedure. Key points:
 
 | Architecture | Target triple | Output |
 |---|---|---|
@@ -154,11 +154,11 @@ The CPU state established at the kernel entry point is specified in
 
 | Document | Content |
 |---|---|
-| [docs/architecture.md](../docs/architecture.md) | System-wide design philosophy and microkernel boundary |
-| [docs/memory-model.md](../docs/memory-model.md) | Virtual address space layout the bootloader must establish |
-| [docs/capability-model.md](../docs/capability-model.md) | Initial capabilities minted from `mmio_apertures` and memory-map regions |
-| [docs/device-management.md](../docs/device-management.md) | How `devmgr` uses the resources the bootloader provides |
-| [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/architecture.md](../../docs/architecture.md) | System-wide design philosophy and microkernel boundary |
+| [docs/memory-model.md](../../docs/memory-model.md) | Virtual address space layout the bootloader must establish |
+| [docs/capability-model.md](../../docs/capability-model.md) | Initial capabilities minted from `mmio_apertures` and memory-map regions |
+| [docs/device-management.md](../../docs/device-management.md) | How `devmgr` uses the resources the bootloader provides |
+| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---
 

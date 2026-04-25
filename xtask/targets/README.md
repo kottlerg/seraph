@@ -12,7 +12,7 @@ target triples against this directory via `RUST_TARGET_PATH` (set in
 
 `x86_64-unknown-uefi` is a built-in Rust target and has no JSON here.
 
-See [../docs/build-system.md](../docs/build-system.md) for target properties and rationale.
+See [../../docs/build-system.md](../../docs/build-system.md) for target properties and rationale.
 
 ---
 

@@ -2,7 +2,7 @@
 
 This document covers the implementation of the kernel's memory subsystem. The design
 goals (higher-half layout, buddy + slab allocation, W^X enforcement, PCID/ASID
-management) are specified in [docs/memory-model.md](../../docs/memory-model.md). This
+management) are specified in [docs/memory-model.md](../../../docs/memory-model.md). This
 document describes how those goals are realised in code.
 
 The memory subsystem comprises five components:

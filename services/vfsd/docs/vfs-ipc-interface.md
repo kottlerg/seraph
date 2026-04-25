@@ -121,10 +121,10 @@ vfsd is not involved in any file operation after the initial `OPEN`.
 
 | Document | Content |
 |---|---|
-| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC message format, cap transfer protocol |
+| [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, cap transfer protocol |
 | [fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Per-file capability protocol |
-| [docs/architecture.md](../../docs/architecture.md) | vfsd role in the system |
-| [docs/capability-model.md](../../docs/capability-model.md) | Tokens and capability derivation |
+| [docs/architecture.md](../../../docs/architecture.md) | vfsd role in the system |
+| [docs/capability-model.md](../../../docs/capability-model.md) | Tokens and capability derivation |
 
 ---
 

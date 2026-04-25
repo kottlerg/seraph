@@ -57,11 +57,11 @@ When procmgr creates a new process, it populates a `ProcessInfo` handover
 struct at a well-known virtual address in the new process's address space.
 This struct tells the process where to find its initial capabilities, IPC
 buffer, and startup context. The handover contract is defined in
-[`abi/process-abi`](../abi/process-abi/README.md).
+[`abi/process-abi`](../../abi/process-abi/README.md).
 
 procmgr is the sole producer of `ProcessInfo` for all non-init processes.
 Init and ktest use a different handover path (kernel-produced `InitInfo` from
-[`abi/init-protocol`](../abi/init-protocol/README.md)) but share the same
+[`abi/init-protocol`](../../abi/init-protocol/README.md)) but share the same
 `main()` signature defined in `abi/process-abi`.
 
 ---
@@ -79,12 +79,12 @@ process is created without going through procmgr.
 
 | Document | Content |
 |---|---|
-| [docs/architecture.md](../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
-| [docs/capability-model.md](../docs/capability-model.md) | CSpace, AddressSpace, Thread caps |
+| [docs/architecture.md](../../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
+| [docs/capability-model.md](../../docs/capability-model.md) | CSpace, AddressSpace, Thread caps |
 | [procmgr/docs/frame-management.md](docs/frame-management.md) | Frame pool design, allocation, per-process accounting |
-| [abi/boot-protocol/](../abi/boot-protocol/) | Boot module format (`BootModule` type) |
-| [abi/process-abi](../abi/process-abi/README.md) | Process startup ABI: ProcessInfo, StartupInfo, main() |
-| [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [abi/boot-protocol/](../../abi/boot-protocol/) | Boot module format (`BootModule` type) |
+| [abi/process-abi](../../abi/process-abi/README.md) | Process startup ABI: ProcessInfo, StartupInfo, main() |
+| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---
 

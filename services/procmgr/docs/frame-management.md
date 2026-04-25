@@ -77,8 +77,8 @@ requester's CSpace. This is not implemented in Tier 2.
 
 | Document | Content |
 |---|---|
-| [docs/capability-model.md](../../docs/capability-model.md) | Frame cap rights, derivation, revocation |
-| [docs/memory-model.md](../../docs/memory-model.md) | Virtual address layout, page sizes |
+| [docs/capability-model.md](../../../docs/capability-model.md) | Frame cap rights, derivation, revocation |
+| [docs/memory-model.md](../../../docs/memory-model.md) | Virtual address layout, page sizes |
 | [procmgr/docs/ipc-interface.md](ipc-interface.md) | IPC operations including CREATE_PROCESS |
 
 ---

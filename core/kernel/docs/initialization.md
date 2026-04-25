@@ -9,7 +9,7 @@ Any phase failure is fatal; the kernel halts with a diagnostic message.
 For the boot protocol contract (CPU state and register contents, BootInfo
 layout) that Phase 0 depends on, see
 [`boot/docs/kernel-handoff.md`](../../boot/docs/kernel-handoff.md) and the
-[`abi/boot-protocol/`](../../abi/boot-protocol/) crate.
+[`abi/boot-protocol/`](../../../abi/boot-protocol/) crate.
 
 ---
 

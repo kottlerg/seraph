@@ -9,7 +9,7 @@ init-review cycle.
 ## Status
 
 This document exists so that top-level summaries (notably
-[`docs/bootstrap.md`](../../docs/bootstrap.md)) can link an authoritative
+[`docs/bootstrap.md`](../../../docs/bootstrap.md)) can link an authoritative
 component-scope target for init's bootstrap sequence. The actual enumeration
 of stages — starting procmgr via raw syscalls, requesting early-service
 startup, delegating capabilities, registering services with svcmgr, exiting —
@@ -22,4 +22,4 @@ Tracked in the repo-local `TODO.md` under "init docs restructure".
 
 ## Summarized By
 
-[docs/bootstrap.md](../../docs/bootstrap.md)
+[docs/bootstrap.md](../../../docs/bootstrap.md)

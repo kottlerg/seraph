@@ -26,7 +26,7 @@ devmgr is launched by init early in the bootstrap sequence. It is a privileged
 service but holds only the capabilities init delegates to it — init retains
 intermediary copies so that devmgr's authority can be revoked and re-delegated
 on restart. The full design is specified in
-[docs/device-management.md](../docs/device-management.md); devmgr's
+[docs/device-management.md](../../docs/device-management.md); devmgr's
 responsibilities are:
 
 - **Parse firmware tables** — read ACPI tables (x86-64) or Device Tree blob
@@ -50,8 +50,8 @@ responsibilities are:
 ## Capabilities Received
 
 devmgr receives the following capabilities from init during bootstrap. See
-[docs/capability-model.md](../docs/capability-model.md) for capability type
-definitions and [docs/device-management.md](../docs/device-management.md) for
+[docs/capability-model.md](../../docs/capability-model.md) for capability type
+definitions and [docs/device-management.md](../../docs/device-management.md) for
 how devmgr uses them.
 
 | Capability | Rights | Purpose |
@@ -83,12 +83,12 @@ MUST NOT be started independently of devmgr. See
 
 | Document | Content |
 |---|---|
-| [docs/device-management.md](../docs/device-management.md) | Full device management design, DMA safety, security boundary |
-| [docs/capability-model.md](../docs/capability-model.md) | Capability types, rights, delegation, revocation |
-| [docs/architecture.md](../docs/architecture.md) | Bootstrap sequence, service roles |
-| [docs/ipc-design.md](../docs/ipc-design.md) | IPC semantics, device registry endpoint |
-| [abi/boot-protocol/](../abi/boot-protocol/) | Platform resource descriptors, firmware table passthrough |
-| [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/device-management.md](../../docs/device-management.md) | Full device management design, DMA safety, security boundary |
+| [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, delegation, revocation |
+| [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, service roles |
+| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, device registry endpoint |
+| [abi/boot-protocol/](../../abi/boot-protocol/) | Platform resource descriptors, firmware table passthrough |
+| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---
 

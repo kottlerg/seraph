@@ -998,7 +998,7 @@ interrupt controller.
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 The kernel masks the interrupt line before delivering the notification to the driver
-(see [docs/architecture.md](../../docs/architecture.md) — Driver Model). The driver
+(see [docs/architecture.md](../../../docs/architecture.md) — Driver Model). The driver
 must call `SYS_IRQ_ACK` to re-enable the line. Calling `SYS_IRQ_ACK` without a
 prior interrupt delivery has no effect.
 

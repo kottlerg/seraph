@@ -4,7 +4,7 @@ This directory contains the Seraph microkernel. It handles four core responsibil
 IPC, scheduling, memory management, and capabilities — along with the minimal
 supporting mechanism they require (traps, timers, syscall entry, platform resource
 validation). Everything else runs in userspace. See
-[docs/architecture.md](../docs/architecture.md) for the design philosophy behind
+[docs/architecture.md](../../docs/architecture.md) for the design philosophy behind
 this boundary.
 
 ---
@@ -142,7 +142,7 @@ initialization, for example).
 
 `build.rs` selects the appropriate linker script from `linker/` based on the active
 target. Linker scripts place sections at the intended virtual addresses and establish
-the higher-half layout described in [docs/memory-model.md](../docs/memory-model.md).
+the higher-half layout described in [docs/memory-model.md](../../docs/memory-model.md).
 
 ---
 
@@ -180,7 +180,7 @@ The kernel entry point is `kernel_entry()` in `src/main.rs`. Its calling convent
 and the CPU state guaranteed at entry are specified in
 [`boot/docs/kernel-handoff.md`](../boot/docs/kernel-handoff.md); the
 `BootInfo` layout is owned by the
-[`abi/boot-protocol/`](../abi/boot-protocol/) crate.
+[`abi/boot-protocol/`](../../abi/boot-protocol/) crate.
 
 The entry point is `#[no_mangle] pub extern "C"` and marked `-> !`. It receives a
 single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
@@ -192,13 +192,13 @@ single argument: a `*const BootInfo` pointer whose physical address is in `rdi`
 
 | Document | Content |
 |---|---|
-| [docs/architecture.md](../docs/architecture.md) | System-wide design philosophy |
-| [docs/memory-model.md](../docs/memory-model.md) | Virtual address space layout, paging |
-| [docs/ipc-design.md](../docs/ipc-design.md) | IPC semantics and message format |
-| [docs/capability-model.md](../docs/capability-model.md) | Capability types, rights, revocation |
-| [abi/boot-protocol/](../abi/boot-protocol/) | `BootInfo` structure, `BOOT_PROTOCOL_VERSION` |
+| [docs/architecture.md](../../docs/architecture.md) | System-wide design philosophy |
+| [docs/memory-model.md](../../docs/memory-model.md) | Virtual address space layout, paging |
+| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics and message format |
+| [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, revocation |
+| [abi/boot-protocol/](../../abi/boot-protocol/) | `BootInfo` structure, `BOOT_PROTOCOL_VERSION` |
 | [boot/docs/kernel-handoff.md](../boot/docs/kernel-handoff.md) | CPU state and register contents at kernel entry |
-| [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---
 

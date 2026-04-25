@@ -13,9 +13,11 @@
 - `docs/documentation-standards.md` is a system-wide, non-negotiable authority.
   - All documentation changes MUST comply with its rules.
 
+## Coding invariants
+See [docs/coding-standards.md](../docs/coding-standards.md) — non-negotiable authority.
 
 ## Documentation invariants
-See [docs/documentation-standards.md](docs/documentation-standards.md) — non-negotiable authority.
+See [docs/documentation-standards.md](../docs/documentation-standards.md) — non-negotiable authority.
 
 ## Operating procedure
 - Documentation MUST be consumed by scope:

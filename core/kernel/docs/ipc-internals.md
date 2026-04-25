@@ -2,7 +2,7 @@
 
 This document covers the implementation of the IPC subsystem. IPC semantics —
 the call/reply model, signals, event queues, wait sets, and capability transfer —
-are specified in [docs/ipc-design.md](../../docs/ipc-design.md). This document
+are specified in [docs/ipc-design.md](../../../docs/ipc-design.md). This document
 describes how those semantics are implemented in the kernel.
 
 The IPC subsystem comprises four kernel object types:

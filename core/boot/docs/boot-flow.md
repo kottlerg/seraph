@@ -3,7 +3,7 @@
 This document describes the bootloader's execution from `efi_main` to kernel handoff.
 The contract at handoff is defined in [kernel-handoff.md](kernel-handoff.md)
 (CPU state and register contents) and in the
-[`abi/boot-protocol/`](../../abi/boot-protocol/) crate (`BootInfo` layout
+[`abi/boot-protocol/`](../../../abi/boot-protocol/) crate (`BootInfo` layout
 and version); this document covers how the bootloader fulfils that contract.
 
 ---

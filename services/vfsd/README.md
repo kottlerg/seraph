@@ -69,7 +69,7 @@ vfsd receives block device IPC endpoints indirectly: devmgr discovers storage
 hardware, spawns block device drivers, and registers their endpoints in the
 device registry. vfsd queries the device registry (or receives endpoints via
 init's bootstrap sequence) to obtain block device endpoints for mounting. See
-[docs/device-management.md](../docs/device-management.md) for the device
+[docs/device-management.md](../../docs/device-management.md) for the device
 registry and endpoint flow.
 
 ---
@@ -78,10 +78,10 @@ registry and endpoint flow.
 
 | Document | Content |
 |---|---|
-| [docs/ipc-design.md](../docs/ipc-design.md) | IPC semantics, endpoints, message format |
-| [docs/architecture.md](../docs/architecture.md) | Bootstrap sequence, vfsd role |
-| [docs/device-management.md](../docs/device-management.md) | Device registry, block device endpoints |
-| [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
+| [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, vfsd role |
+| [docs/device-management.md](../../docs/device-management.md) | Device registry, block device endpoints |
+| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---
 

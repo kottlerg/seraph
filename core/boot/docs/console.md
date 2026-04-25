@@ -8,7 +8,7 @@ Implementations:
 - Framebuffer backend: [`boot/src/framebuffer.rs`](../src/framebuffer.rs).
 - Serial backend (x86-64): [`boot/src/arch/x86_64/serial.rs`](../src/arch/x86_64/serial.rs).
 - Serial backend (RISC-V): [`boot/src/arch/riscv64/serial.rs`](../src/arch/riscv64/serial.rs).
-- Bitmap font (framebuffer): [`shared/font/`](../../shared/font/).
+- Bitmap font (framebuffer): [`shared/font/`](../../../shared/font/).
 
 ---
 
@@ -96,7 +96,7 @@ field.
 ### Glyph Rendering
 
 The font is the `9×20` bitmap array exposed by
-[`shared/font/`](../../shared/font/): 256 glyphs, each stored as a
+[`shared/font/`](../../../shared/font/): 256 glyphs, each stored as a
 flat `[u16; 5120]` with `FONT_9X20[N * 20 + R]` yielding scanline `R`
 of glyph `N`. Bits 15–7 of each scanline are the 9 pixels, MSB first.
 
@@ -140,9 +140,9 @@ all is a userspace policy decision, not a bootloader concern.
   by [uefi-environment.md](uefi-environment.md).
 - The `FramebufferInfo` contract (meaning of `physical_base == 0`,
   pixel-format enum values) is owned by the boot-protocol crate
-  [`abi/boot-protocol/src/lib.rs`](../../abi/boot-protocol/src/lib.rs).
+  [`abi/boot-protocol/src/lib.rs`](../../../abi/boot-protocol/src/lib.rs).
 - Font data, layout, and lookup formula are owned by
-  [`shared/font/README.md`](../../shared/font/README.md).
+  [`shared/font/README.md`](../../../shared/font/README.md).
 - Detailed ACPI SPCR and DTB `ns16550a` walk invariants belong to
   [acpi.md](acpi.md) and [dtb.md](dtb.md); this document names the
   RISC-V discovery *order* and the pre-Step-1 placement, not the

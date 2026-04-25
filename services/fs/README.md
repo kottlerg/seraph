@@ -30,7 +30,7 @@ readdir) to the appropriate driver via IPC. See
 Filesystem drivers do not access hardware directly. They receive block device
 IPC endpoints from vfsd (originating from devmgr's device registry) and
 perform all storage I/O through those endpoints. See
-[docs/device-management.md](../docs/device-management.md) for how block device
+[docs/device-management.md](../../docs/device-management.md) for how block device
 endpoints are established.
 
 This isolation means a filesystem driver crash does not affect other mounted
@@ -65,9 +65,9 @@ re-mount.
 
 | Document | Content |
 |---|---|
-| [docs/ipc-design.md](../docs/ipc-design.md) | IPC semantics, message format |
-| [docs/device-management.md](../docs/device-management.md) | Block device endpoint origin |
-| [docs/coding-standards.md](../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, message format |
+| [docs/device-management.md](../../docs/device-management.md) | Block device endpoint origin |
+| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---
 

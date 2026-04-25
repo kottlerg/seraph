@@ -44,7 +44,7 @@ unknown keys, so old bootloader binaries are unaffected by additions.
 ELF-header and program-header validation is performed by the shared ELF crate; the
 ruleset (magic, class, data encoding, version, type, machine, program-header
 geometry, entry-point-in-LOAD) is owned by
-[`shared/elf/README.md`](../../shared/elf/README.md). Any
+[`shared/elf/README.md`](../../../shared/elf/README.md). Any
 `elf::ElfError` returned by the shared crate is surfaced by the bootloader as
 [`BootError::InvalidElf`](../src/error.rs).
 
@@ -56,7 +56,7 @@ as opaque flat binaries. Their validation and execution is init's responsibility
 
 ## LOAD Segment Processing
 
-Once [`shared/elf`](../../shared/elf/README.md) has yielded the validated
+Once [`shared/elf`](../../../shared/elf/README.md) has yielded the validated
 `PT_LOAD` program-header array, the bootloader layers UEFI-specific placement
 on each segment:
 

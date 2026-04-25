@@ -68,6 +68,21 @@ pub const SYS_SIGNAL_WAIT: u64 = 4;
 /// `EventQueue`: post an entry.
 pub const SYS_EVENT_POST: u64 = 5;
 /// `EventQueue`: receive an entry.
+///
+/// arg0 = event queue cap index (RECV right). arg1 = `timeout_ms`:
+/// - `0` blocks indefinitely until a post arrives.
+/// - `u64::MAX` is non-blocking try-once: returns `WouldBlock` immediately
+///   if the queue is empty.
+/// - `1 ..= u64::MAX-1` blocks until a post arrives or the timeout
+///   elapses, whichever comes first. On timeout returns `WouldBlock`
+///   (same code as the try-once-empty case — both mean "no payload
+///   available"; the caller already knows which mode it asked for).
+///
+/// On success returns `0` plus the payload in the secondary return
+/// register. Sentinel layout matches `SYS_SIGNAL_WAIT` (`0` = forever),
+/// but event-queue payloads may be any `u64` including 0, so the kernel
+/// uses an out-of-band `tcb.timed_out` marker instead of an in-band
+/// sentinel on the payload register.
 pub const SYS_EVENT_RECV: u64 = 6;
 /// Capability: create an `Endpoint` object.
 pub const SYS_CAP_CREATE_ENDPOINT: u64 = 7;

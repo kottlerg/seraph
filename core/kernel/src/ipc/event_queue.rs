@@ -122,6 +122,21 @@ pub unsafe fn event_queue_post(
             (*waiter).ipc_state = IpcThreadState::None;
             (*waiter).blocked_on_object = core::ptr::null_mut();
         }
+        // If the waiter was registered with a `SYS_EVENT_RECV` timeout, it
+        // is also on the global sleep list. Remove it here so the timer
+        // path will not try to double-wake this thread. We hold `eq.lock`;
+        // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
+        // (lock order: eq.lock → SLEEP_LIST_LOCK; the timer path takes
+        // SLEEP_LIST_LOCK first, releases it, and only then reaches for
+        // eq.lock — so no circular wait).
+        // SAFETY: waiter is the TCB we just dequeued from eq.waiter.
+        unsafe {
+            if (*waiter).sleep_deadline != 0
+            {
+                (*waiter).sleep_deadline = 0;
+                crate::sched::sleep_list_remove(waiter);
+            }
+        }
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
         return Ok(Some(waiter));

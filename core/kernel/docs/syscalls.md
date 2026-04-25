@@ -356,13 +356,22 @@ Append one entry to an event queue. Non-blocking; returns `QueueFull` if at capa
 
 ### `SYS_EVENT_RECV` (6)
 
-Wait for and dequeue the next entry from an event queue.
+Dequeue the next entry from an event queue with optional bounded wait.
 
 **Arguments:**
 
-| # | Name | Description |
-|---|---|---|
-| 0 | `queue_cap` | Event queue capability with Recv rights |
+| # | Name         | Description                                             |
+|---|--------------|---------------------------------------------------------|
+| 0 | `queue_cap`  | Event queue capability with Recv rights                 |
+| 1 | `timeout_ms` | Wait policy: see sentinels below                        |
+
+`timeout_ms` sentinels (matches `SYS_SIGNAL_WAIT`):
+
+| Value             | Behaviour                                                       |
+|-------------------|-----------------------------------------------------------------|
+| `0`               | Block forever until a post arrives                              |
+| `u64::MAX`        | Non-blocking try-once; return `WouldBlock` if empty             |
+| `1 ..= MAX-1`     | Block until post arrives or `timeout_ms` ms elapse              |
 
 **Return:**
 
@@ -371,7 +380,14 @@ Wait for and dequeue the next entry from an event queue.
 
 **Capability requirement:** `queue_cap` must have Recv rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `Interrupted`.
+**Errors:** `InvalidCapability`, `AccessDenied`, `WouldBlock`, `Interrupted`.
+
+`WouldBlock` covers both the try-once-empty case and the timer-fired case;
+the caller already knows which mode it asked for. The kernel uses an
+out-of-band marker (`tcb.timed_out`) rather than an in-band
+`wakeup_value` sentinel because event-queue payloads may be any `u64`
+(including 0) — contrast `SYS_SIGNAL_WAIT`, where `wakeup_value == 0`
+suffices because `signal_send` rejects zero-bit sends.
 
 ---
 

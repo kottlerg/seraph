@@ -940,20 +940,28 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_EVENT_RECV` (6): dequeue the next entry from an event queue.
 ///
 /// arg0 = event queue cap index (must have RECV right).
-/// arg1 = non-blocking flag: `0` = block (wait until an entry is posted,
-///        the pre-timeout behaviour); `1` = try once and return
-///        `WouldBlock` if the queue is empty.
+/// arg1 = `timeout_ms`:
+///        - `0` blocks indefinitely until a post arrives.
+///        - `u64::MAX` is non-blocking try-once: returns `WouldBlock`
+///          immediately if the queue is empty.
+///        - `1 .. u64::MAX-1` blocks until a post arrives or the timeout
+///          elapses, whichever comes first. On timeout returns
+///          `WouldBlock` (same code as the try-once-empty case — both
+///          mean "no payload available").
 ///
 /// On success returns `0` in rax/a0 and the payload in the secondary return
-/// register (rdx/a1). A timed-wait variant may be added on the same syscall
-/// later; for now only block / try-once are exposed.
+/// register (rdx/a1). The disambiguation between "data wake" and "timer
+/// wake" uses `tcb.timed_out` rather than an in-band sentinel on
+/// `wakeup_value`, because event payloads may be any `u64` including 0
+/// (contrast `sys_signal_wait`, where `wakeup_value == 0` works because
+/// `signal_send` rejects zero-bit sends).
 #[cfg(not(test))]
 pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
     let eq_idx = tf.arg(0) as u32;
-    let nonblocking = tf.arg(1) != 0;
+    let timeout_ms = tf.arg(1);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -986,14 +994,13 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Queue was empty; `event_queue_recv` has parked `tcb` (state = Blocked,
-    // eq.waiter = tcb). In non-blocking mode we roll that back and return
-    // `WouldBlock` instead of yielding.
-    if nonblocking
+    // eq.waiter = tcb). Branch on the timeout sentinel.
+    if timeout_ms == u64::MAX
     {
-        // SAFETY: tcb parked above; eq_state still valid. Single-threaded
-        // procmgr-style callers invoke this between scheduler ticks; no
-        // concurrent post can race with this rollback against this eq
-        // because we were just written as the sole waiter.
+        // Non-blocking try-once: roll back the park and return WouldBlock.
+        // SAFETY: tcb parked above; eq_state still valid. The parker was
+        // just written as the sole waiter; no concurrent post can race
+        // with this rollback against this eq.
         unsafe {
             (*eq_state).waiter = core::ptr::null_mut();
             (*tcb).state = crate::sched::thread::ThreadState::Ready;
@@ -1003,18 +1010,42 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::WouldBlock);
     }
 
-    // Blocking case (arg1 == 0): yield CPU.
+    // Bounded wait: arm the sleep-list timer. Arbitration between
+    // `event_queue_post` and the timer path lives in `sleep_check_wakeups`
+    // (see the `BlockedOnEventQueue` arm there).
+    if timeout_ms != 0
+    {
+        let tps = crate::arch::current::timer::ticks_per_second();
+        let now = crate::arch::current::timer::current_tick();
+        let deadline = now.saturating_add(timeout_ms.saturating_mul(tps) / 1000);
+        // SAFETY: tcb valid; thread already Blocked above.
+        unsafe {
+            (*tcb).sleep_deadline = deadline;
+        }
+        crate::sched::sleep_list_add(tcb);
+    }
+
+    // Yield CPU.
     // SAFETY: scheduler initialized; called from syscall context.
     unsafe {
         crate::sched::schedule(false);
     }
 
-    // On resume, event_queue_post stored the payload in wakeup_value.
-    // SAFETY: tcb still valid after resume; wakeup_value set by event_queue_post.
-    let payload = unsafe { (*tcb).wakeup_value };
-    // SAFETY: tcb validated above.
-    unsafe {
+    // On resume, exactly one of two outcomes: `event_queue_post` stored a
+    // payload in `wakeup_value`, or the sleep-list timer arm set
+    // `timed_out = true`. Both paths clear `sleep_deadline`.
+    // SAFETY: tcb still valid after resume.
+    let (payload, timed_out) = unsafe {
+        let p = (*tcb).wakeup_value;
+        let t = (*tcb).timed_out;
         (*tcb).wakeup_value = 0;
+        (*tcb).timed_out = false;
+        (p, t)
+    };
+
+    if timed_out
+    {
+        return Err(SyscallError::WouldBlock);
     }
     tf.set_ipc_return(0, payload);
     Ok(0)

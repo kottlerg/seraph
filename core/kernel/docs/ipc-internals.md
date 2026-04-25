@@ -302,11 +302,28 @@ exactly N usable slots as requested.
    b. read_idx = (read_idx + 1) % capacity
    c. Release lock; return payload
 3. else:
-   // Queue empty; block
+   // Queue empty; park the caller as eq.waiter
    a. waiter = current_tcb
    b. Release lock
-   c. Block current thread; return payload from wakeup_value when woken
+   c. Branch on arg1 (`timeout_ms`):
+      - `u64::MAX`     -> roll back the park; return WouldBlock
+      - `0`            -> schedule(); resume reads payload from wakeup_value
+      - 1..=MAX-1      -> set sleep_deadline = now + ms*tps/1000;
+                          sleep_list_add(tcb); schedule(); on resume,
+                          if tcb.timed_out -> return WouldBlock,
+                          else             -> return payload from wakeup_value
 ```
+
+The `tcb.timed_out` flag is the out-of-band timeout marker — required
+because event-queue payloads may be any `u64` (including 0), so an
+in-band sentinel on `wakeup_value` is unavailable. The flag is set by
+the `BlockedOnEventQueue` arm of `sleep_check_wakeups` when the timer
+arbitrates against `event_queue_post` and wins; cleared by the resuming
+syscall.
+
+Lock order: `eq.lock → SLEEP_LIST_LOCK` (post path).
+`SLEEP_LIST_LOCK` is released before `eq.lock` is taken on the timer
+path — sequential, not nested, so no cycle.
 
 ---
 

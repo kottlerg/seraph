@@ -282,6 +282,9 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// # Safety
 /// `tcb` must be a valid TCB in `Blocked` state. Must be called with the
 /// scheduler lock held (or in single-CPU context).
+// too_many_lines: flat dispatch over every `IpcThreadState` variant; splitting
+// adds no clarity (each arm is independent and short).
+#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
@@ -396,6 +399,19 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 
         IpcThreadState::None =>
         {}
+    }
+
+    // If the thread was parked with a timeout (signal-wait or event-recv
+    // with `timeout_ms != 0`), it is also on the global sleep list. Drop
+    // the entry now so a later timer tick does not dereference a freed TCB.
+    // SAFETY: tcb is valid; sleep_list_remove is safe to call when the
+    // thread is not registered (returns without effect).
+    unsafe {
+        if (*tcb).sleep_deadline != 0
+        {
+            (*tcb).sleep_deadline = 0;
+            crate::sched::sleep_list_remove(tcb);
+        }
     }
 
     // Reset IPC state and blocked_on_object.

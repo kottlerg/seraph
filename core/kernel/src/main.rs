@@ -576,6 +576,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 address_space: init_as_ptr,
                 ipc_buffer: 0,
                 wakeup_value: 0,
+                timed_out: false,
                 iopb: core::ptr::null_mut(),
                 blocked_on_object: core::ptr::null_mut(),
                 cspace: core::ptr::null_mut(),

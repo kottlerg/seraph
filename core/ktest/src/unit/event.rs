@@ -12,15 +12,19 @@
 
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, event_post,
-    event_queue_create, event_recv, signal_send, signal_wait, thread_configure, thread_exit,
-    thread_start, thread_yield,
+    event_queue_create, event_recv, event_recv_timeout, event_try_recv, signal_send, signal_wait,
+    system_info, thread_configure, thread_exit, thread_sleep, thread_start, thread_yield,
 };
-use syscall_abi::SyscallError;
+use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult};
 
 // Child stack for the recv_blocks_until_post test.
 static mut RECV_BLOCKS_STACK: ChildStack = ChildStack::ZERO;
+// Child stacks for the timeout tests (each test owns its own stack).
+static mut TIMEOUT_ZERO_PAYLOAD_STACK: ChildStack = ChildStack::ZERO;
+static mut TIMEOUT_NONZERO_PAYLOAD_STACK: ChildStack = ChildStack::ZERO;
+static mut TIMEOUT_FOREVER_STACK: ChildStack = ChildStack::ZERO;
 
 // ── SYS_CAP_CREATE_EVENT_Q ───────────────────────────────────────────────────
 
@@ -187,6 +191,166 @@ pub fn recv_insufficient_rights(_ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+// ── SYS_EVENT_RECV (timeout sentinels) ───────────────────────────────────────
+
+/// `event_try_recv` (`arg1 = u64::MAX`) on an empty queue returns `WouldBlock`.
+///
+/// Positive control: pre-post then `event_try_recv` returns the payload.
+pub fn try_recv_empty_returns_wouldblock(_ctx: &TestContext) -> TestResult
+{
+    let eq = event_queue_create(4).map_err(|_| "event_queue_create for try_recv test failed")?;
+
+    let err = event_try_recv(eq);
+    if err != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err("event_try_recv on empty queue did not return WouldBlock");
+    }
+
+    event_post(eq, 0xABCD).map_err(|_| "event_post for try_recv positive control failed")?;
+    let payload = event_try_recv(eq).map_err(|_| "event_try_recv after post failed")?;
+    if payload != 0xABCD
+    {
+        return Err("event_try_recv returned wrong payload (expected 0xABCD)");
+    }
+
+    cap_delete(eq).map_err(|_| "cap_delete after try_recv test failed")?;
+    Ok(())
+}
+
+/// `event_recv_timeout` fires the timer when no post arrives within the bound.
+///
+/// Asserts the call returns `WouldBlock` and that elapsed wall-clock time is
+/// at least most of the requested 50 ms (generous lower bound to absorb QEMU
+/// timer jitter; no upper bound enforced — only correctness, not latency).
+pub fn recv_timeout_fires_on_empty_queue(_ctx: &TestContext) -> TestResult
+{
+    let eq = event_queue_create(4).map_err(|_| "event_queue_create for timeout test failed")?;
+
+    let t0 = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "system_info(ElapsedUs) before recv failed")?;
+    let err = event_recv_timeout(eq, 50);
+    let t1 = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "system_info(ElapsedUs) after recv failed")?;
+
+    if err != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err("event_recv_timeout on empty queue did not return WouldBlock");
+    }
+    let elapsed_us = t1.saturating_sub(t0);
+    // Allow some slack below 50 ms for tick boundary alignment.
+    if elapsed_us < 30_000
+    {
+        return Err("event_recv_timeout returned too quickly — timer did not bound the wait");
+    }
+
+    cap_delete(eq).map_err(|_| "cap_delete after timeout test failed")?;
+    Ok(())
+}
+
+/// Critical disambiguation test: a legitimate-zero payload must NOT be
+/// confused with the timer-fired outcome. Without `tcb.timed_out`, this
+/// regresses to `WouldBlock` even though a real post arrived.
+pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
+{
+    let eq =
+        event_queue_create(4).map_err(|_| "event_queue_create for zero-payload test failed")?;
+    let cs = cap_create_cspace(16).map_err(|_| "cap_create_cspace failed")?;
+    let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
+    // Encode the post payload as 0; the child will sleep ~10 ms, then post 0.
+    let child_arg = u64::from(child_eq);
+
+    let th = cap_create_thread(ctx.aspace_cap, cs).map_err(|_| "cap_create_thread failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_ZERO_PAYLOAD_STACK));
+    thread_configure(
+        th,
+        post_zero_after_sleep_entry as *const () as u64,
+        stack_top,
+        child_arg,
+    )
+    .map_err(|_| "thread_configure failed")?;
+    thread_start(th).map_err(|_| "thread_start failed")?;
+
+    // Wait up to 1 s for the child's post; 0 is the legitimate payload.
+    let payload = event_recv_timeout(eq, 1000)
+        .map_err(|_| "event_recv_timeout with pending post returned an error (timeout misread?)")?;
+    if payload != 0
+    {
+        return Err("event_recv_timeout returned wrong payload (expected legitimate 0)");
+    }
+
+    cap_delete(th).ok();
+    cap_delete(eq).ok();
+    cap_delete(cs).ok();
+    Ok(())
+}
+
+/// Same as the zero-payload disambiguation test but with a non-zero payload,
+/// guarding the data path itself.
+pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
+{
+    let eq =
+        event_queue_create(4).map_err(|_| "event_queue_create for nonzero-payload test failed")?;
+    let cs = cap_create_cspace(16).map_err(|_| "cap_create_cspace failed")?;
+    let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
+    let child_arg = u64::from(child_eq);
+
+    let th = cap_create_thread(ctx.aspace_cap, cs).map_err(|_| "cap_create_thread failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_NONZERO_PAYLOAD_STACK));
+    thread_configure(
+        th,
+        post_cafe_after_sleep_entry as *const () as u64,
+        stack_top,
+        child_arg,
+    )
+    .map_err(|_| "thread_configure failed")?;
+    thread_start(th).map_err(|_| "thread_start failed")?;
+
+    let payload = event_recv_timeout(eq, 1000).map_err(|_| "event_recv_timeout failed")?;
+    if payload != 0xCAFE
+    {
+        return Err("event_recv_timeout returned wrong payload (expected 0xCAFE)");
+    }
+
+    cap_delete(th).ok();
+    cap_delete(eq).ok();
+    cap_delete(cs).ok();
+    Ok(())
+}
+
+/// `event_recv_timeout(eq, 0)` blocks indefinitely (sentinel preserves the
+/// `arg1 = 0` semantics of `event_recv`).
+pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
+{
+    let eq =
+        event_queue_create(4).map_err(|_| "event_queue_create for forever-block test failed")?;
+    let cs = cap_create_cspace(16).map_err(|_| "cap_create_cspace failed")?;
+    let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
+    let child_arg = u64::from(child_eq);
+
+    let th = cap_create_thread(ctx.aspace_cap, cs).map_err(|_| "cap_create_thread failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_FOREVER_STACK));
+    thread_configure(
+        th,
+        post_beef_after_sleep_entry as *const () as u64,
+        stack_top,
+        child_arg,
+    )
+    .map_err(|_| "thread_configure failed")?;
+    thread_start(th).map_err(|_| "thread_start failed")?;
+
+    let payload = event_recv_timeout(eq, 0)
+        .map_err(|_| "event_recv_timeout(eq, 0) returned error (forever-block sentinel broken)")?;
+    if payload != 0xBEEF
+    {
+        return Err("event_recv_timeout(eq, 0) returned wrong payload (expected 0xBEEF)");
+    }
+
+    cap_delete(th).ok();
+    cap_delete(eq).ok();
+    cap_delete(cs).ok();
+    Ok(())
+}
+
 // ── Child thread entry ────────────────────────────────────────────────────────
 
 /// Child: blocks on `event_recv` then signals the received payload back.
@@ -208,5 +372,34 @@ fn recv_and_report_entry(arg: u64) -> !
             signal_send(sync_slot, 0xBAD).ok();
         }
     }
+    thread_exit()
+}
+
+/// Child: sleeps ~10 ms then posts payload `0` (the legitimate-zero
+/// disambiguation case).
+fn post_zero_after_sleep_entry(arg: u64) -> !
+{
+    let eq_slot = (arg & 0xFFFF_FFFF) as u32;
+    let _ = thread_sleep(10);
+    let _ = event_post(eq_slot, 0);
+    thread_exit()
+}
+
+/// Child: sleeps ~10 ms then posts payload `0xCAFE`.
+fn post_cafe_after_sleep_entry(arg: u64) -> !
+{
+    let eq_slot = (arg & 0xFFFF_FFFF) as u32;
+    let _ = thread_sleep(10);
+    let _ = event_post(eq_slot, 0xCAFE);
+    thread_exit()
+}
+
+/// Child: sleeps ~10 ms then posts payload `0xBEEF` (used by the
+/// `arg1=0` "block forever" sentinel test).
+fn post_beef_after_sleep_entry(arg: u64) -> !
+{
+    let eq_slot = (arg & 0xFFFF_FFFF) as u32;
+    let _ = thread_sleep(10);
+    let _ = event_post(eq_slot, 0xBEEF);
     thread_exit()
 }

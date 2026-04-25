@@ -204,6 +204,17 @@ pub struct ThreadControlBlock
     /// were acquired on the waiter's behalf. Read by `sys_signal_wait` on resume.
     pub wakeup_value: u64,
 
+    /// Out-of-band timeout marker. True iff the most recent wake came from
+    /// the sleep-list timer arm in `sleep_check_wakeups`. Read-and-cleared by
+    /// the resuming syscall.
+    ///
+    /// Required by `sys_event_recv` because event-queue payloads may be any
+    /// `u64` (including 0), so `wakeup_value` cannot itself encode the
+    /// distinction between "data delivered" and "timer fired" — contrast
+    /// `sys_signal_wait`, which uses `wakeup_value == 0` because
+    /// `signal_send` rejects zero-bit sends.
+    pub timed_out: bool,
+
     // === I/O port permissions (x86_64 only) ===
     /// Per-thread I/O Permission Bitmap (8 KiB, heap-allocated on first
     /// `SYS_IOPORT_BIND`). Null if this thread has no port bindings.

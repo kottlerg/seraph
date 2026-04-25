@@ -190,6 +190,26 @@ pub fn run_all(ctx: &TestContext)
         "event::recv_insufficient_rights",
         event::recv_insufficient_rights(ctx)
     );
+    run_test!(
+        "event::try_recv_empty_returns_wouldblock",
+        event::try_recv_empty_returns_wouldblock(ctx)
+    );
+    run_test!(
+        "event::recv_timeout_fires_on_empty_queue",
+        event::recv_timeout_fires_on_empty_queue(ctx)
+    );
+    run_test!(
+        "event::recv_timeout_payload_zero_wins",
+        event::recv_timeout_payload_zero_wins(ctx)
+    );
+    run_test!(
+        "event::recv_timeout_payload_nonzero_wins",
+        event::recv_timeout_payload_nonzero_wins(ctx)
+    );
+    run_test!(
+        "event::recv_timeout_zero_blocks_forever",
+        event::recv_timeout_zero_blocks_forever(ctx)
+    );
 
     // ── Wait set syscalls ─────────────────────────────────────────────────────
     run_test!(

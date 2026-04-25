@@ -1356,8 +1356,8 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 #[inline]
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
-    // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 = 0 selects
-    // the blocking path in the kernel.
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 = 0 is the
+    // "block forever" sentinel for `SYS_EVENT_RECV` (matches `SYS_SIGNAL_WAIT`).
     let (ret, payload) = unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), 0, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(payload) }
 }
@@ -1371,9 +1371,28 @@ pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 #[inline]
 pub fn event_try_recv(queue_cap: u32) -> Result<u64, i64>
 {
-    // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 = 1 selects
-    // the non-blocking / try-once path in the kernel.
-    let (ret, payload) = unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), 1, 0, 0, 0) };
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 = u64::MAX
+    // is the "non-blocking try-once" sentinel for `SYS_EVENT_RECV`.
+    let (ret, payload) =
+        unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), u64::MAX, 0, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(payload) }
+}
+
+/// Dequeue with a timeout. `timeout_ms == 0` blocks indefinitely (same as
+/// [`event_recv`]); `timeout_ms == u64::MAX` is a non-blocking poll (same as
+/// [`event_try_recv`]); any other value blocks for up to `timeout_ms`
+/// milliseconds, then returns `Err(-6)` (`WouldBlock`) if no post arrived.
+///
+/// # Errors
+/// Returns `-6` (`WouldBlock`) on timeout or empty try-once, or another
+/// negative `i64` error code on invalid cap.
+#[inline]
+pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 carries the
+    // timeout sentinel directly to the kernel.
+    let (ret, payload) =
+        unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), timeout_ms, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(payload) }
 }
 

@@ -277,8 +277,8 @@ pub fn sleep_check_wakeups()
     // SAFETY: paired with lock_raw above.
     unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
 
-    // For each expired tcb, try to claim the wake. Signal-wait-timeout
-    // entries arbitrate via `sig.lock` against a concurrent `signal_send`.
+    // For each expired tcb, try to claim the wake. Timed-wait IPC entries
+    // arbitrate via the IPC object's lock against a concurrent sender.
     for &tcb in expired.iter().take(n)
     {
         if tcb.is_null()
@@ -291,54 +291,95 @@ pub fn sleep_check_wakeups()
         // point the thread is still Blocked.
         let (ipc_state, blocked_on) = unsafe { ((*tcb).ipc_state, (*tcb).blocked_on_object) };
 
-        let claimed = if matches!(
-            ipc_state,
-            crate::sched::thread::IpcThreadState::BlockedOnSignal
-        ) && !blocked_on.is_null()
+        let claimed = match ipc_state
         {
-            // SAFETY: BlockedOnSignal implies blocked_on_object is a valid
-            // *mut SignalState (see `ipc::signal::signal_wait`). The
-            // kernel allocator guarantees SignalState alignment; the
-            // cast_ptr_alignment lint is suppressed here because the
-            // pointer is type-erased as *mut u8 in the TCB to break a
-            // circular module import.
-            #[allow(clippy::cast_ptr_alignment)]
-            let sig_state = blocked_on.cast::<crate::ipc::signal::SignalState>();
-            // SAFETY: sig_state is valid for the duration of the wait;
-            // lock serialises against signal_send.
-            let saved_sig = unsafe { (*sig_state).lock.lock_raw() };
-            // SAFETY: same as above.
-            let we_win = unsafe { (*sig_state).waiter } == tcb;
-            if we_win
+            crate::sched::thread::IpcThreadState::BlockedOnSignal if !blocked_on.is_null() =>
             {
-                // SAFETY: we hold sig.lock; clear waiter state and hand
-                // the thread a zero wakeup_value to signal "timeout".
+                // SAFETY: BlockedOnSignal implies blocked_on_object is a
+                // valid *mut SignalState (see `ipc::signal::signal_wait`).
+                // The kernel allocator guarantees SignalState alignment;
+                // the cast_ptr_alignment lint is suppressed here because
+                // the pointer is type-erased as *mut u8 in the TCB to
+                // break a circular module import.
+                #[allow(clippy::cast_ptr_alignment)]
+                let sig_state = blocked_on.cast::<crate::ipc::signal::SignalState>();
+                // SAFETY: sig_state is valid for the duration of the wait;
+                // lock serialises against signal_send.
+                let saved_sig = unsafe { (*sig_state).lock.lock_raw() };
+                // SAFETY: same as above.
+                let we_win = unsafe { (*sig_state).waiter } == tcb;
+                if we_win
+                {
+                    // SAFETY: we hold sig.lock; clear waiter state and
+                    // hand the thread a zero wakeup_value to signal
+                    // "timeout" (`signal_send` rejects zero-bit sends, so
+                    // 0 is unambiguous for signals).
+                    unsafe {
+                        (*sig_state).waiter = core::ptr::null_mut();
+                        (*sig_state).has_observer.store(
+                            u8::from(!(*sig_state).wait_set.is_null()),
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                        (*tcb).wakeup_value = 0;
+                        (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
+                        (*tcb).blocked_on_object = core::ptr::null_mut();
+                        (*tcb).sleep_deadline = 0;
+                        (*tcb).state = ThreadState::Ready;
+                    }
+                }
+                // SAFETY: paired with lock_raw above.
+                unsafe { (*sig_state).lock.unlock_raw(saved_sig) };
+                we_win
+            }
+
+            crate::sched::thread::IpcThreadState::BlockedOnEventQueue if !blocked_on.is_null() =>
+            {
+                // SAFETY: BlockedOnEventQueue implies blocked_on_object is
+                // a valid *mut EventQueueState (see
+                // `ipc::event_queue::event_queue_recv`). cast_ptr_alignment
+                // suppressed for the same reason as the signal arm above.
+                #[allow(clippy::cast_ptr_alignment)]
+                let eq_state = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
+                // SAFETY: eq_state is valid for the duration of the wait;
+                // lock serialises against event_queue_post. Lock order:
+                // SLEEP_LIST_LOCK was already released above; we now take
+                // eq.lock alone — no cycle (post path is eq.lock →
+                // SLEEP_LIST_LOCK).
+                let saved_eq = unsafe { (*eq_state).lock.lock_raw() };
+                // SAFETY: same as above.
+                let we_win = unsafe { (*eq_state).waiter } == tcb;
+                if we_win
+                {
+                    // SAFETY: we hold eq.lock. Event payloads can be any
+                    // u64 (including 0), so we use an out-of-band marker
+                    // — `tcb.timed_out` — instead of an in-band sentinel
+                    // on `wakeup_value`. The resuming `sys_event_recv`
+                    // reads-and-clears it.
+                    unsafe {
+                        (*eq_state).waiter = core::ptr::null_mut();
+                        (*tcb).wakeup_value = 0;
+                        (*tcb).timed_out = true;
+                        (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
+                        (*tcb).blocked_on_object = core::ptr::null_mut();
+                        (*tcb).sleep_deadline = 0;
+                        (*tcb).state = ThreadState::Ready;
+                    }
+                }
+                // SAFETY: paired with lock_raw above.
+                unsafe { (*eq_state).lock.unlock_raw(saved_eq) };
+                we_win
+            }
+
+            _ =>
+            {
+                // Plain sleep — we are the only waker.
+                // SAFETY: tcb still valid; see above.
                 unsafe {
-                    (*sig_state).waiter = core::ptr::null_mut();
-                    (*sig_state).has_observer.store(
-                        u8::from(!(*sig_state).wait_set.is_null()),
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                    (*tcb).wakeup_value = 0;
-                    (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
-                    (*tcb).blocked_on_object = core::ptr::null_mut();
                     (*tcb).sleep_deadline = 0;
                     (*tcb).state = ThreadState::Ready;
                 }
+                true
             }
-            // SAFETY: paired with lock_raw above.
-            unsafe { (*sig_state).lock.unlock_raw(saved_sig) };
-            we_win
-        }
-        else
-        {
-            // Plain sleep — we are the only waker.
-            // SAFETY: tcb still valid; see above.
-            unsafe {
-                (*tcb).sleep_deadline = 0;
-                (*tcb).state = ThreadState::Ready;
-            }
-            true
         };
 
         if claimed
@@ -522,6 +563,7 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
             cspace: core::ptr::null_mut(),
             ipc_buffer: 0,
             wakeup_value: 0,
+            timed_out: false,
             iopb: core::ptr::null_mut(),
             blocked_on_object: core::ptr::null_mut(),
             thread_id: alloc_thread_id(),

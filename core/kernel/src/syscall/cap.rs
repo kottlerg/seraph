@@ -375,6 +375,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         cspace: new_cs_ptr,
         ipc_buffer: 0,
         wakeup_value: 0,
+        timed_out: false,
         iopb: core::ptr::null_mut(),
         blocked_on_object: core::ptr::null_mut(),
         thread_id: alloc_thread_id(),

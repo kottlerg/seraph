@@ -82,6 +82,7 @@ fn main()
     stack_overflow_phase();
     shmem_phase();
     pipes_phase();
+    pipe_fault_eof_phase();
 
     std::os::seraph::log!("PASS");
 }
@@ -365,6 +366,97 @@ fn pipes_phase()
     }
 
     std::os::seraph::log!("pipes phase passed");
+}
+
+/// Spawn `/bin/pipefault` with `Stdio::piped()` on stdout. The child
+/// writes `b"prefix\n"`, flushes, and faults — `Pipe::Drop` never
+/// runs, so the ring header's `closed` flag is never set. Without
+/// the death-bridge the parent's `read_to_end` would park forever in
+/// `signal_wait` after draining the prefix. With the bridge, the
+/// kernel posts the fault on the spawner's death-EQ, the bridge
+/// translates it into `peer_dead.store(true)` plus a kick on the
+/// data signal, and the next `Pipe::read` returns EOF.
+///
+/// Asserts:
+///   * `read_to_end` returns Ok with the prefix bytes (no hang).
+///   * `child.wait()` returns a fault `exit_reason` in
+///     `EXIT_FAULT_BASE..EXIT_KILLED`.
+///   * `QUERY_PROCESS` reports `EXITED` with the same `exit_reason`
+///     (auto-reap from §7 still works through the new bridge).
+// cast_sign_loss: ExitStatus::code() returns i32; exit_reason is always
+// non-negative in practice (clean=0, fault 0x1000+vec, killed 0x2000).
+#[allow(clippy::cast_sign_loss)]
+fn pipe_fault_eof_phase()
+{
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    const EXIT_FAULT_BASE: u64 = 0x1000;
+    const EXIT_KILLED: u64 = 0x2000;
+
+    let mut child = Command::new("/bin/pipefault")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn /bin/pipefault failed");
+
+    let id = child.id();
+    std::os::seraph::log!("spawned /bin/pipefault handle={id:#x}");
+
+    let mut stdout = child.stdout.take().expect("piped stdout missing");
+    let mut bytes = Vec::new();
+    let n = stdout
+        .read_to_end(&mut bytes)
+        .expect("read_to_end on pipefault stdout failed");
+    assert_eq!(
+        n,
+        bytes.len(),
+        "read_to_end length mismatch ({n} vs {})",
+        bytes.len()
+    );
+    assert!(
+        bytes.starts_with(b"prefix\n"),
+        "pipefault stdout missing prefix: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    std::os::seraph::log!(
+        "pipe_fault_eof: drained {} bytes, EOF observed without hang",
+        bytes.len()
+    );
+
+    let status = child.wait().expect("pipefault wait failed");
+    let raw = status
+        .code()
+        .expect("pipefault ExitStatus must carry a code") as u64;
+    assert!(
+        (EXIT_FAULT_BASE..EXIT_KILLED).contains(&raw),
+        "expected pipefault fault exit_reason in 0x1000..0x2000, got {raw:#x}"
+    );
+
+    // Auto-reap mirror check.
+    {
+        let info = startup_info();
+        // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
+        #[allow(clippy::cast_ptr_alignment)]
+        let ipc_buf = info.ipc_buffer.cast::<u64>();
+        let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
+        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(id, &query, ipc_buf) }
+            .expect("QUERY_PROCESS for pipefault failed");
+        assert_eq!(reply.label, ipc::procmgr_errors::SUCCESS);
+        let state = reply.word(0);
+        let exit_reason = reply.word(1);
+        assert_eq!(
+            state,
+            ipc::procmgr_process_state::EXITED,
+            "expected EXITED for faulted piped child, got {state}"
+        );
+        assert_eq!(
+            exit_reason, raw,
+            "auto-reap exit_reason {exit_reason:#x} disagrees with spawner-observed {raw:#x}"
+        );
+    }
+
+    std::os::seraph::log!("pipe_fault_eof phase passed (exit_reason={raw:#x})");
 }
 
 /// Verify `std::env::args()` returns exactly what init wrote into the

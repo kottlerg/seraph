@@ -84,6 +84,7 @@ pub enum BuildComponent
     Usertest,
     Svcmgr,
     Hello,
+    Pipefault,
     Stackoverflow,
     Stdiotest,
     All,

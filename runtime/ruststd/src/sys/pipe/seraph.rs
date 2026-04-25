@@ -27,7 +27,8 @@
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::os::seraph::{current_ipc_buf, try_startup_info};
-use crate::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use shmem::{SharedBuffer, SpscHeader, SpscReader, SpscWriter};
 
@@ -98,7 +99,9 @@ pub struct PipeCaps {
 /// Read and write operations are non-blocking on partial progress and
 /// block (via `signal_wait`) only when the ring is empty (reader) or
 /// full (writer). EOF / BrokenPipe is observed via the ring header's
-/// `closed` flag, set by the peer's `Drop`.
+/// `closed` flag, set by the peer's `Drop`, OR via the parent-side
+/// `peer_dead` flag set by the spawner's death-bridge thread when the
+/// peer process exits without running `Drop` (fault, abort).
 pub struct Pipe {
     frame_cap: u32,
     ring_vaddr: u64,
@@ -110,6 +113,14 @@ pub struct Pipe {
     /// (`alloc_parent_va`). Child-side ends map at fixed per-direction
     /// VAs and clear this bit so Drop does not free a parent slot.
     owns_parent_slot: bool,
+    /// Spawner-side abnormal-exit flag, shared with the per-spawn
+    /// death-bridge thread. `None` for child-side ends and for
+    /// parent-side ends not yet attached to a spawn (the bridge sets
+    /// it after the child is constructed). When set, `read` returns
+    /// EOF and `write` returns `BrokenPipe` regardless of the ring
+    /// header's `closed` flag — covering the abnormal-exit case where
+    /// the peer never ran `Pipe::Drop` to mark the ring closed.
+    peer_dead: Option<Arc<AtomicBool>>,
 }
 
 // SAFETY: Pipe holds raw cap-slot indices and a process-local VA; no
@@ -272,6 +283,7 @@ impl Pipe {
                 role: parent_role,
                 aspace,
                 owns_parent_slot: true,
+                peer_dead: None,
             },
             PipeCaps {
                 frame: frame_handoff,
@@ -307,7 +319,37 @@ impl Pipe {
             role,
             aspace,
             owns_parent_slot: false,
+            peer_dead: None,
         })
+    }
+
+    /// Attach a spawner-side abnormal-exit flag. Called by
+    /// `Command::spawn` after constructing each parent-side end so the
+    /// per-spawn death-bridge thread can flip the flag on child fault
+    /// and have the next `read` / `write` see EOF / `BrokenPipe`.
+    pub fn set_peer_dead(&mut self, flag: Arc<AtomicBool>) {
+        self.peer_dead = Some(flag);
+    }
+
+    /// Parent-side `data_signal` cap slot. Exposed for the death-bridge
+    /// thread to `signal_send` on, to wake any blocked reader after
+    /// `peer_dead` is flipped.
+    pub fn data_signal_cap(&self) -> u32 {
+        self.data_signal
+    }
+
+    /// Parent-side `space_signal` cap slot. Symmetric to
+    /// `data_signal_cap`; the bridge kicks this to wake any blocked
+    /// writer.
+    pub fn space_signal_cap(&self) -> u32 {
+        self.space_signal
+    }
+
+    /// Snapshot the abnormal-exit flag if attached.
+    fn peer_dead(&self) -> bool {
+        self.peer_dead
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Acquire))
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
@@ -347,12 +389,20 @@ impl Pipe {
                 }
                 return Ok(0);
             }
+            if self.peer_dead() {
+                // Peer process exited without running `Drop` (fault,
+                // abort). Bridge has flipped the flag and kicked our
+                // signal; ring may still hold buffered bytes the peer
+                // wrote before faulting, but we already drained above.
+                return Ok(0);
+            }
             if self.data_signal == 0 {
                 // No wakeup signal attached — fall back to immediate EOF
                 // rather than spin (silent-drop init path).
                 return Ok(0);
             }
-            // Block until writer kicks the data signal or peer closes.
+            // Block until writer kicks the data signal, peer closes,
+            // or the death bridge fires.
             let _ = syscall::signal_wait(self.data_signal);
         }
     }
@@ -412,6 +462,12 @@ impl Pipe {
                     "seraph pipe: peer closed",
                 ));
             }
+            if self.peer_dead() {
+                return Err(io::const_error!(
+                    io::ErrorKind::BrokenPipe,
+                    "seraph pipe: peer died abnormally",
+                ));
+            }
             let mut writer = self.writer();
             let n = writer.write(buf);
             if n > 0 {
@@ -423,7 +479,8 @@ impl Pipe {
                 // No wakeup signal — drop bytes silently to avoid spin.
                 return Ok(buf.len());
             }
-            // Block until reader kicks the space signal or peer closes.
+            // Block until reader kicks the space signal, peer closes,
+            // or the death bridge fires.
             let _ = syscall::signal_wait(self.space_signal);
         }
     }

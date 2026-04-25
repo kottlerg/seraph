@@ -128,6 +128,11 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::RootfsBin,
     },
     Spec {
+        name: "pipefault",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+    },
+    Spec {
         name: "stdiotest",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
@@ -152,6 +157,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Svcmgr => "svcmgr",
         BuildComponent::Hello => "hello",
         BuildComponent::Stackoverflow => "stackoverflow",
+        BuildComponent::Pipefault => "pipefault",
         BuildComponent::Stdiotest => "stdiotest",
     };
     SPECS.iter().find(|s| s.name == name)

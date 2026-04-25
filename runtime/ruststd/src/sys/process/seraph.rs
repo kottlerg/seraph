@@ -52,11 +52,26 @@ use crate::io;
 use crate::num::NonZero;
 use crate::path::Path;
 use crate::process::StdioPipes;
+use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sys::fs::File;
+use crate::thread::JoinHandle;
 use super::CommandEnvs;
 use super::env::CommandEnv;
 
 use ipc::{procmgr_errors, procmgr_labels};
+
+/// Sentinel `event_post` payload used by `Process::Drop` to unblock the
+/// bridge thread cleanly when the spawner discards the child without
+/// waiting. Real death payloads pack `(correlator << 32) | exit_reason`
+/// and the spawner uses correlator=0 (the high 32 bits are always zero
+/// on a real death), so `u64::MAX` is unambiguous.
+const BRIDGE_SENTINEL_DROP: u64 = u64::MAX;
+
+/// Reasons the bridge writes to the shared `exit_reason` atom outside
+/// the normal kernel-encoded range. Outside `EXIT_FAULT_BASE..0x2000`
+/// to remain distinguishable from real fault codes.
+const EXIT_KILLED: u64 = 0x2000;
 
 // ── Stdio ───────────────────────────────────────────────────────────────────
 
@@ -373,18 +388,84 @@ impl Command {
             };
             Ok((stdin, stdout, stderr))
         })();
-        let (child_stdin_pipe, child_stdout_pipe, child_stderr_pipe) = match pipes_result {
-            Ok(triple) => triple,
-            Err(e) => {
-                // Pipes built before the error already ran Drop (closer
-                // protocol + unmap + cap_delete). Tear down the child.
-                let _ = syscall::cap_delete(death_eq);
-                let _ = syscall::cap_delete(thread_cap);
-                // SAFETY: ipc_ptr is the kernel-registered IPC buffer.
-                let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
-                let _ = syscall::cap_delete(process_handle);
-                return Err(e);
+        let (mut child_stdin_pipe, mut child_stdout_pipe, mut child_stderr_pipe) =
+            match pipes_result {
+                Ok(triple) => triple,
+                Err(e) => {
+                    // Pipes built before the error already ran Drop (closer
+                    // protocol + unmap + cap_delete). Tear down the child.
+                    let _ = syscall::cap_delete(death_eq);
+                    let _ = syscall::cap_delete(thread_cap);
+                    // SAFETY: ipc_ptr is the kernel-registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    let _ = syscall::cap_delete(process_handle);
+                    return Err(e);
+                }
+            };
+
+        // Spawn the death-bridge thread only when at least one stdio
+        // direction is piped — non-piped spawns use `event_recv` on
+        // `death_eq` directly and skip the per-spawn thread entirely.
+        // Built BEFORE `START_PROCESS` so a child that faults
+        // immediately still has the bridge in place to wake the
+        // parent-side pipe waits.
+        let any_pipe = child_stdin_pipe.is_some()
+            || child_stdout_pipe.is_some()
+            || child_stderr_pipe.is_some();
+        let bridge = if any_pipe {
+            let bridge_setup = (|| -> io::Result<Bridge> {
+                let completion_signal = syscall::cap_create_signal()
+                    .map_err(|_| io::Error::other("cap_create_signal for completion failed"))?;
+                let exit_reason = Arc::new(AtomicU64::new(0));
+                let peer_dead = Arc::new(AtomicBool::new(false));
+
+                let mut pipe_signals: [Option<PipeBridgeSignals>; 3] = [None, None, None];
+                for (slot, pipe) in pipe_signals.iter_mut().zip([
+                    child_stdin_pipe.as_mut(),
+                    child_stdout_pipe.as_mut(),
+                    child_stderr_pipe.as_mut(),
+                ]) {
+                    if let Some(p) = pipe {
+                        p.set_peer_dead(peer_dead.clone());
+                        *slot = Some(PipeBridgeSignals {
+                            data_signal: p.data_signal_cap(),
+                            space_signal: p.space_signal_cap(),
+                        });
+                    }
+                }
+
+                let handles = BridgeHandles {
+                    death_eq,
+                    completion_signal,
+                    pipe_signals,
+                    exit_reason: exit_reason.clone(),
+                    peer_dead,
+                };
+                let handle = crate::thread::Builder::new()
+                    .name(crate::string::String::from("seraph-deathbridge"))
+                    .spawn(move || bridge_main(handles))
+                    .map_err(|e| io::Error::other(crate::format!(
+                        "spawn death-bridge thread failed: {e}"
+                    )))?;
+                Ok(Bridge {
+                    completion_signal,
+                    handle: Some(handle),
+                    exit_reason,
+                })
+            })();
+            match bridge_setup {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    let _ = syscall::cap_delete(death_eq);
+                    let _ = syscall::cap_delete(thread_cap);
+                    // SAFETY: ipc_ptr is the kernel-registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    let _ = syscall::cap_delete(process_handle);
+                    return Err(e);
+                }
             }
+        } else {
+            None
         };
 
         // Kick the child off.
@@ -393,6 +474,15 @@ impl Command {
         let start_reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_ptr) }
             .map_err(|_| io::Error::other("START_PROCESS syscall failed"))?;
         if start_reply.label != procmgr_errors::SUCCESS {
+            // If a bridge is running, wake it with the sentinel so it
+            // joins cleanly before we delete the caps it holds.
+            if let Some(b) = bridge {
+                let _ = syscall::event_post(death_eq, BRIDGE_SENTINEL_DROP);
+                if let Some(h) = b.handle {
+                    let _ = h.join();
+                }
+                let _ = syscall::cap_delete(b.completion_signal);
+            }
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
             // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
@@ -406,6 +496,7 @@ impl Command {
                 process_handle,
                 thread_cap,
                 death_eq,
+                bridge,
                 exit_status: None,
             },
             StdioPipes {
@@ -498,10 +589,35 @@ impl fmt::Debug for Stdio {
 
 // ── Process ─────────────────────────────────────────────────────────────────
 
+/// Per-spawn state used only when stdio is piped. Non-piped spawns
+/// skip the bridge thread entirely and use `event_recv(death_eq)`
+/// directly — no signal cap, no Arcs, no extra thread.
+struct Bridge {
+    /// Bridge → `wait` rendezvous. Bridge `signal_send`s once after
+    /// publishing `exit_reason`; `wait` `signal_wait`s.
+    completion_signal: u32,
+    /// Bridge thread handle. Taken by `wait` (after completion fires)
+    /// or `Drop` (after sentinel post).
+    handle: Option<JoinHandle<()>>,
+    /// Exit reason published by the bridge before raising
+    /// `completion_signal`. Read by `wait` after the wake.
+    exit_reason: Arc<AtomicU64>,
+}
+
 pub struct Process {
     process_handle: u32,
     thread_cap: u32,
+    /// Death-notification queue bound to the child thread. Owned by
+    /// `Process` regardless of stdio mode. With `bridge` present the
+    /// bridge thread consumes the EQ; otherwise `wait` does so directly.
     death_eq: u32,
+    /// Per-spawn bridge state — only allocated for piped spawns. The
+    /// bridge translates a child death into the parent-side `peer_dead`
+    /// atomic + pipe-signal wakes that unblock any blocked
+    /// `Pipe::read` / `write`. Non-piped spawns leave this `None` and
+    /// `wait` reads `death_eq` directly, saving an entire userspace
+    /// thread per spawn.
+    bridge: Option<Bridge>,
     exit_status: Option<ExitStatus>,
 }
 
@@ -515,11 +631,11 @@ impl Process {
     pub fn kill(&mut self) -> io::Result<()> {
         // Kernel posts to `death_notification` only on voluntary exit
         // (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
-        // silent. Synthesize the event ourselves so `wait()` returns a
+        // silent. Synthesize the event ourselves on `death_eq` so the
+        // bridge (or `wait` directly, for non-piped spawns) returns a
         // well-defined status after kill. Value chosen outside the
         // kernel fault range (0x1000..0x2000) so callers can tell apart
         // a user-initiated kill from a hardware fault.
-        const EXIT_KILLED: u64 = 0x2000;
         let _ = syscall::event_post(self.death_eq, EXIT_KILLED);
         if let Some(info) = crate::os::seraph::try_startup_info() {
             let ipc_ptr = info.ipc_buffer as *mut u64;
@@ -534,8 +650,27 @@ impl Process {
         if let Some(cached) = self.exit_status {
             return Ok(cached);
         }
-        let reason = syscall::event_recv(self.death_eq)
-            .map_err(|_| io::Error::other("event_recv on child death queue failed"))?;
+        let reason = if let Some(b) = self.bridge.as_mut() {
+            // Bridge raises `completion_signal` exactly once after
+            // publishing `exit_reason`. Loop on zero-bit wakes
+            // (e.g. spurious / timeout) until real bits arrive.
+            loop {
+                let bits = syscall::signal_wait(b.completion_signal)
+                    .map_err(|_| io::Error::other("signal_wait on completion_signal failed"))?;
+                if bits != 0 {
+                    break;
+                }
+            }
+            if let Some(h) = b.handle.take() {
+                let _ = h.join();
+            }
+            b.exit_reason.load(Ordering::Acquire)
+        } else {
+            // Non-piped: `wait` consumes the kernel's death post on
+            // `death_eq` directly. No bridge thread allocated.
+            syscall::event_recv(self.death_eq)
+                .map_err(|_| io::Error::other("event_recv on child death queue failed"))?
+        };
         let status = ExitStatus(reason);
         self.exit_status = Some(status);
         Ok(status)
@@ -545,28 +680,55 @@ impl Process {
         if let Some(cached) = self.exit_status {
             return Ok(Some(cached));
         }
-        // Kernel returns `WouldBlock` (-6) if the death event queue is
-        // empty (child still running). Any other error is genuine.
-        match syscall::event_try_recv(self.death_eq) {
-            Ok(reason) => {
-                let status = ExitStatus(reason);
-                self.exit_status = Some(status);
-                Ok(Some(status))
+        let reason = if let Some(b) = self.bridge.as_mut() {
+            // `signal_wait_timeout(_, 0)` returns immediately. Non-zero
+            // wakeup_value means the bridge published `exit_reason` and
+            // raised `completion_signal`; zero means "nothing pending".
+            match syscall::signal_wait_timeout(b.completion_signal, 0) {
+                Ok(bits) if bits != 0 => {
+                    if let Some(h) = b.handle.take() {
+                        let _ = h.join();
+                    }
+                    b.exit_reason.load(Ordering::Acquire)
+                }
+                Ok(_) => return Ok(None),
+                Err(_) => {
+                    return Err(io::Error::other(
+                        "signal_wait_timeout on completion_signal failed",
+                    ));
+                }
             }
-            Err(-6) => Ok(None),
-            Err(_) => Err(io::Error::other("event_try_recv on child death queue failed")),
-        }
+        } else {
+            // Non-piped: `event_try_recv` returns `WouldBlock` (-6) if
+            // the kernel hasn't posted yet.
+            match syscall::event_try_recv(self.death_eq) {
+                Ok(r) => r,
+                Err(-6) => return Ok(None),
+                Err(_) => {
+                    return Err(io::Error::other(
+                        "event_try_recv on child death queue failed",
+                    ));
+                }
+            }
+        };
+        let status = ExitStatus(reason);
+        self.exit_status = Some(status);
+        Ok(Some(status))
     }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
         if self.exit_status.is_none() {
-            // Caller dropped Child without waiting. Tear the child down and
-            // release the per-child kernel objects. We do not `event_recv`
-            // here — cap_revoke-driven teardown posts nothing to the queue,
-            // so a recv would block forever. `cap_delete` on the queue
-            // below is sufficient.
+            // Caller dropped Child without waiting. If the bridge is
+            // running, wake it with the sentinel and join before
+            // freeing caps it holds. Then tear the child down.
+            if let Some(b) = self.bridge.as_mut() {
+                let _ = syscall::event_post(self.death_eq, BRIDGE_SENTINEL_DROP);
+                if let Some(h) = b.handle.take() {
+                    let _ = h.join();
+                }
+            }
             if let Some(info) = crate::os::seraph::try_startup_info() {
                 let ipc_ptr = info.ipc_buffer as *mut u64;
                 let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
@@ -574,10 +736,78 @@ impl Drop for Process {
                 let _ = unsafe { ipc::ipc_call(self.process_handle, &destroy_msg, ipc_ptr) };
             }
         }
+        if let Some(b) = self.bridge.as_ref() {
+            let _ = syscall::cap_delete(b.completion_signal);
+        }
         let _ = syscall::cap_delete(self.death_eq);
         let _ = syscall::cap_delete(self.thread_cap);
         let _ = syscall::cap_delete(self.process_handle);
     }
+}
+
+// ── Death bridge ───────────────────────────────────────────────────────────
+//
+// One thread per piped spawn (the bridge runs unconditionally — even
+// non-piped children benefit from the `completion_signal` rendezvous,
+// and the per-pipe arrays are simply empty). Receives the kernel's
+// death notification on `death_eq` and translates it into:
+//   * `peer_dead.store(true)` — every parent-side `Pipe` checks this
+//     atom before each `signal_wait`, so the next read/write observes
+//     EOF / `BrokenPipe` regardless of the ring header's `closed`
+//     flag (which the child may not have set if it exited
+//     abnormally).
+//   * `signal_send` on each piped direction's data and space signals,
+//     so any reader/writer currently parked in `signal_wait` wakes
+//     and re-checks the flag.
+//   * `exit_reason.store(reason)` + `signal_send(completion_signal)`
+//     — the rendezvous point `Process::wait` blocks on.
+//
+// Bridge does NOT touch the ring memory: the parent's `Pipe::Drop`
+// can run before, during, or after the bridge fires without aliasing
+// concerns. The atomics live on heap-allocated `Arc`s independent of
+// any frame mapping.
+//
+// The bridge also recognises `BRIDGE_SENTINEL_DROP` posted by
+// `Process::Drop` and exits without firing any wakes — the spawner
+// is discarding the child anyway.
+
+#[derive(Clone, Copy)]
+struct PipeBridgeSignals {
+    data_signal: u32,
+    space_signal: u32,
+}
+
+struct BridgeHandles {
+    death_eq: u32,
+    completion_signal: u32,
+    pipe_signals: [Option<PipeBridgeSignals>; 3],
+    exit_reason: Arc<AtomicU64>,
+    peer_dead: Arc<AtomicBool>,
+}
+
+fn bridge_main(h: BridgeHandles) {
+    let payload = match syscall::event_recv(h.death_eq) {
+        Ok(p) => p,
+        // event_recv error => death_eq is gone (cap_revoke from a
+        // misbehaving spawner) — nothing to do, exit cleanly.
+        Err(_) => return,
+    };
+    if payload == BRIDGE_SENTINEL_DROP {
+        // Spawner is dropping the Process; do not fire any wakes.
+        return;
+    }
+    let reason = payload & 0xFFFF_FFFF;
+    h.exit_reason.store(reason, Ordering::Release);
+    h.peer_dead.store(true, Ordering::Release);
+    for sig in h.pipe_signals.iter().flatten() {
+        // Any non-zero bits — the wake is just a kick; the reader /
+        // writer re-checks `peer_dead` on its next loop turn.
+        let _ = syscall::signal_send(sig.data_signal, 1);
+        let _ = syscall::signal_send(sig.space_signal, 1);
+    }
+    // Raise the rendezvous signal last so a `wait` that wakes
+    // observes `exit_reason` already published.
+    let _ = syscall::signal_send(h.completion_signal, 1);
 }
 
 // ── ExitStatus / ExitCode ───────────────────────────────────────────────────

@@ -1,14 +1,19 @@
 // seraph-overlay: std::sys::process::seraph
 //
 // `std::process::Command` for Seraph: spawns the target binary via
-// `CREATE_FROM_VFS` to procmgr, binds a death-notification `EventQueue` to
-// the child's main thread, starts it, and surfaces `Child::wait` /
+// `CREATE_FROM_VFS` to procmgr, optionally installs shmem-backed stdio
+// pipes via `CONFIGURE_PIPE`, binds a death-notification `EventQueue`
+// to the child's main thread, starts it, and surfaces `Child::wait` /
 // `Child::kill` on top of the resulting caps.
 //
 // Wire-up:
-//   * Spawn: ipc_call(procmgr_endpoint, CREATE_FROM_VFS | path_len<<16,
-//            data=[stdio_token, path_words], caps=[creator_endpoint?])
-//            Reply caps: [process_handle, thread_for_caller].
+//   * Create: ipc_call(procmgr_endpoint, CREATE_FROM_VFS, ...).
+//             Reply caps: [process_handle, thread_for_caller].
+//   * Pipe (per piped direction): allocate (frame, data_sig, space_sig)
+//             via Pipe::create_for_child; ipc_call(process_handle,
+//             CONFIGURE_PIPE, data=[direction, ring_capacity],
+//             caps=[frame_handoff, data_sig_handoff, space_sig_handoff]).
+//             Parent retains its own Pipe end (the originals).
 //   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
 //   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
 //   * Wait: syscall::event_recv(event_queue_cap) — blocks until kernel posts
@@ -19,17 +24,12 @@
 //           EventQueue is woken with exit reason 0.
 //
 // Stdio:
-//   * `Stdio::Inherit` (default) — child inherits the spawner's stdout/stderr
-//     surfaces (procmgr populates the child's stdout/stderr caps from its
-//     own log_endpoint at `CREATE_FROM_VFS` time) and has no stdin (zero cap
-//     → read returns EOF).
-//   * `Stdio::Null` — same as Inherit on the stdout/stderr side; stdin also
-//     zero (EOF on read). Redirection to a user-chosen sink is not
-//     implemented yet.
-//   * `Stdio::MakePipe` — not supported yet; returns `Unsupported`. Pipes
-//     require wiring the shared-memory SPSC ring in `shared/shmem` into
-//     `ProcessInfo` stdio slots. Until that lands, `Command::output()` and
-//     friends that default to `MakePipe` fail.
+//   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
+//     for that direction. Child reads return EOF; child writes silent-
+//     drop. Same shape as a Unix daemon with no stderr.
+//   * `Stdio::MakePipe` — allocates a shmem SPSC ring + 2 signal caps,
+//     calls CONFIGURE_PIPE, and retains the parent-side Pipe end as
+//     `ChildStdin` / `ChildStdout` / `ChildStderr`.
 //
 // Identity:
 //   * `Process::id()` returns the low 32 bits of procmgr's internal process
@@ -53,8 +53,6 @@ use crate::num::NonZero;
 use crate::path::Path;
 use crate::process::StdioPipes;
 use crate::sys::fs::File;
-use crate::sys::unsupported;
-
 use super::CommandEnvs;
 use super::env::CommandEnv;
 
@@ -172,16 +170,12 @@ impl Command {
         default: Stdio,
         _needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
-        // Pipe-backed stdio is not wired yet — see module-level comment.
         let effective_stdin = self.stdin.as_ref().unwrap_or(&default);
         let effective_stdout = self.stdout.as_ref().unwrap_or(&default);
         let effective_stderr = self.stderr.as_ref().unwrap_or(&default);
-        if matches!(effective_stdin, Stdio::MakePipe)
-            || matches!(effective_stdout, Stdio::MakePipe)
-            || matches!(effective_stderr, Stdio::MakePipe)
-        {
-            return unsupported();
-        }
+        let want_stdin_pipe = matches!(effective_stdin, Stdio::MakePipe);
+        let want_stdout_pipe = matches!(effective_stdout, Stdio::MakePipe);
+        let want_stderr_pipe = matches!(effective_stderr, Stdio::MakePipe);
 
         let info = crate::os::seraph::try_startup_info().ok_or_else(|| {
             io::Error::other("std::process on seraph: startup info not installed")
@@ -336,11 +330,62 @@ impl Command {
             return Err(io::Error::other("thread_bind_notification for child failed"));
         }
 
-        // The child has no stdio caps wired by default — `Stdio::piped()`
-        // is not yet implemented, and the child reaches the system log
-        // through the discovery cap procmgr installs in its
-        // `ProcessInfo`. The `CONFIGURE_STDIO` plumbing is preserved for
-        // Phase 3, which will route shmem-backed pipes through it.
+        // For each piped direction, allocate a parent-side `Pipe` end
+        // (frame + 2 signal caps) and install the corresponding triple
+        // into the child's CSpace via `CONFIGURE_PIPE`. Per-direction
+        // calls are independent — we issue 0–3 IPC rounds depending on
+        // which directions the caller piped. Errors tear the partial
+        // child down before returning.
+        let pipes_result = (|| -> io::Result<(
+            Option<crate::sys::pipe::seraph::Pipe>,
+            Option<crate::sys::pipe::seraph::Pipe>,
+            Option<crate::sys::pipe::seraph::Pipe>,
+        )> {
+            let stdin = if want_stdin_pipe {
+                Some(install_pipe(
+                    process_handle,
+                    ipc_ptr,
+                    procmgr_labels::PIPE_DIR_STDIN,
+                    crate::sys::pipe::seraph::Role::Writer,
+                )?)
+            } else {
+                None
+            };
+            let stdout = if want_stdout_pipe {
+                Some(install_pipe(
+                    process_handle,
+                    ipc_ptr,
+                    procmgr_labels::PIPE_DIR_STDOUT,
+                    crate::sys::pipe::seraph::Role::Reader,
+                )?)
+            } else {
+                None
+            };
+            let stderr = if want_stderr_pipe {
+                Some(install_pipe(
+                    process_handle,
+                    ipc_ptr,
+                    procmgr_labels::PIPE_DIR_STDERR,
+                    crate::sys::pipe::seraph::Role::Reader,
+                )?)
+            } else {
+                None
+            };
+            Ok((stdin, stdout, stderr))
+        })();
+        let (child_stdin_pipe, child_stdout_pipe, child_stderr_pipe) = match pipes_result {
+            Ok(triple) => triple,
+            Err(e) => {
+                // Pipes built before the error already ran Drop (closer
+                // protocol + unmap + cap_delete). Tear down the child.
+                let _ = syscall::cap_delete(death_eq);
+                let _ = syscall::cap_delete(thread_cap);
+                // SAFETY: ipc_ptr is the kernel-registered IPC buffer.
+                let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                let _ = syscall::cap_delete(process_handle);
+                return Err(e);
+            }
+        };
 
         // Kick the child off.
         let start_msg = ipc::IpcMessage::new(procmgr_labels::START_PROCESS);
@@ -364,12 +409,42 @@ impl Command {
                 exit_status: None,
             },
             StdioPipes {
-                stdin: None,
-                stdout: None,
-                stderr: None,
+                stdin: child_stdin_pipe,
+                stdout: child_stdout_pipe,
+                stderr: child_stderr_pipe,
             },
         ))
     }
+}
+
+/// Allocate a parent-side `Pipe` end for one direction and install the
+/// matching cap triple into the child's CSpace via `CONFIGURE_PIPE`.
+/// Returns the parent-side end on success; the parent retains its
+/// originals (the IPC transfers `cap_derive`'d handoff slots), so the
+/// returned `Pipe` is valid for read/write through its full lifetime.
+fn install_pipe(
+    process_handle: u32,
+    ipc_ptr: *mut u64,
+    direction: u64,
+    parent_role: crate::sys::pipe::seraph::Role,
+) -> io::Result<crate::sys::pipe::seraph::Pipe> {
+    use crate::sys::pipe::seraph::{Pipe, RING_CAPACITY};
+    let (parent, caps) = Pipe::create_for_child(parent_role)?;
+    let cap_msg = ipc::IpcMessage::builder(procmgr_labels::CONFIGURE_PIPE)
+        .word(0, direction)
+        .word(1, u64::from(RING_CAPACITY))
+        .cap(caps.frame)
+        .cap(caps.data_signal)
+        .cap(caps.space_signal)
+        .build();
+    // SAFETY: `ipc_ptr` is the calling thread's kernel-registered IPC
+    // buffer (installed by `_start`).
+    let reply = unsafe { ipc::ipc_call(process_handle, &cap_msg, ipc_ptr) }
+        .map_err(|_| io::Error::other("CONFIGURE_PIPE syscall failed"))?;
+    if reply.label != procmgr_errors::SUCCESS {
+        return Err(map_procmgr_error(reply.label));
+    }
+    Ok(parent)
 }
 
 impl fmt::Debug for Command {
@@ -603,25 +678,51 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
     }
 }
 
-// ── ChildPipe (no pipes yet — stub) ─────────────────────────────────────────
+// ── ChildPipe ───────────────────────────────────────────────────────────────
 
 pub type ChildPipe = crate::sys::pipe::Pipe;
 
+/// Drain `out` and `err` to their respective vectors. Sequential v1
+/// implementation: stdout first, then stderr. Children that fill the
+/// stderr ring before the parent finishes draining stdout can stall —
+/// signal-based wakeup unblocks them once the parent moves to stderr.
+/// True deadlock is impossible because each ring is bounded and
+/// `closed`-flag-aware; pathological children that depend on
+/// interleaved drain semantics are not supported.
 pub fn read_output(
-    _out: ChildPipe,
-    _stdout: &mut Vec<u8>,
-    _err: ChildPipe,
-    _stderr: &mut Vec<u8>,
+    out: ChildPipe,
+    stdout: &mut Vec<u8>,
+    err: ChildPipe,
+    stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // `Pipe` is the upstream unsupported impl on seraph; any ChildPipe
-    // reaching here is an uninhabited `!`, so this branch is unreachable.
-    unsupported()
+    out.read_to_end(stdout)?;
+    err.read_to_end(stderr)?;
+    Ok(())
 }
 
-pub fn output(_cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    // `Command::output` captures stdout/stderr, which requires pipe-backed
-    // stdio — not implemented on seraph yet (see module-level note).
-    unsupported()
+/// Spawn `cmd` with stdout and stderr piped, drain both to vectors,
+/// wait for the child to exit, return the status and captured output.
+/// Stdin defaults to no pipe (silent-drop / immediate EOF on the child
+/// side); callers that need to feed stdin should use `Command::spawn`
+/// directly.
+pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+    let (mut process, pipes) = cmd.spawn(Stdio::MakePipe, false)?;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    match (pipes.stdout, pipes.stderr) {
+        (Some(out), Some(err)) => {
+            read_output(out, &mut stdout_bytes, err, &mut stderr_bytes)?;
+        }
+        (Some(out), None) => {
+            out.read_to_end(&mut stdout_bytes)?;
+        }
+        (None, Some(err)) => {
+            err.read_to_end(&mut stderr_bytes)?;
+        }
+        (None, None) => {}
+    }
+    let status = process.wait()?;
+    Ok((status, stdout_bytes, stderr_bytes))
 }
 
 pub fn getpid() -> u32 {

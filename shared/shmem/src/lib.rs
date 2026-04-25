@@ -22,7 +22,14 @@
 //! "reader waits until writer has pushed N bytes" — is out of scope; use a
 //! signal cap out-of-band when that is wanted (pipes).
 
-#![no_std]
+// Under `rustc-dep-of-std` (build-std), use the core facade and no_core
+// so this crate can sit inside std's dep graph. Mirrors abi/syscall,
+// shared/syscall, shared/ipc, shared/log. Normal userspace builds (no
+// feature) retain `#![no_std]`.
+#![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
+#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
+#![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 // Clippy pedantic concessions for this small helper crate:
 // - from_raw constructors are documented as unsafe via `# Safety` and
 //   return types that hold raw pointers; clippy flags ctor methods that
@@ -46,6 +53,13 @@
     clippy::used_underscore_items,
     clippy::manual_let_else
 )]
+
+#[cfg(feature = "rustc-dep-of-std")]
+extern crate rustc_std_workspace_core as core;
+
+#[cfg(feature = "rustc-dep-of-std")]
+#[allow(unused_imports)]
+use core::prelude::rust_2024::*;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -289,8 +303,9 @@ fn unmap_range(aspace: u32, vaddr: u64, count: u32)
 /// Fixed in-memory header at the start of an SPSC shared region.
 ///
 /// Two atomic indices plus a u32 `capacity` (byte buffer length, must be a
-/// power of two). The byte buffer follows immediately after this struct,
-/// aligned to the ring's alignment (u64 is enough for our use case).
+/// power of two) and a `closed` flag used by pipe peers to signal EOF.
+/// The byte buffer follows immediately after this struct, aligned to the
+/// ring's alignment (u64 is enough for our use case).
 #[repr(C)]
 pub struct SpscHeader
 {
@@ -302,8 +317,12 @@ pub struct SpscHeader
     pub tail: AtomicU32,
     /// Capacity of the byte buffer. Power of two.
     pub capacity: u32,
-    /// Reserved for alignment; kept zero.
-    pub _reserved: u32,
+    /// Closer flag: set to 1 (Release) by whichever peer drops first
+    /// (writer drop → reader sees EOF; reader drop → writer sees
+    /// `BrokenPipe`). Read by the surviving peer (Acquire) after a
+    /// zero-progress read/write to disambiguate "ring empty/full" from
+    /// "peer gone". Reset to 0 by `init`.
+    pub closed: AtomicU32,
 }
 
 impl SpscHeader
@@ -327,8 +346,25 @@ impl SpscHeader
             (*ptr).head.store(0, Ordering::Relaxed);
             (*ptr).tail.store(0, Ordering::Relaxed);
             core::ptr::write(&raw mut (*ptr).capacity, capacity);
-            core::ptr::write(&raw mut (*ptr)._reserved, 0);
+            (*ptr).closed.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// Mark the ring closed. Called by whichever peer drops first.
+    /// Idempotent; later loads with [`Self::is_closed`] observe the flag
+    /// via Acquire ordering.
+    pub fn mark_closed(&self)
+    {
+        self.closed.store(1, Ordering::Release);
+    }
+
+    /// Returns `true` if the ring has been marked closed by either peer.
+    /// Reader EOF and writer `BrokenPipe` are derived from this plus a
+    /// zero-progress read/write.
+    #[must_use]
+    pub fn is_closed(&self) -> bool
+    {
+        self.closed.load(Ordering::Acquire) != 0
     }
 }
 

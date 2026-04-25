@@ -73,9 +73,15 @@ pub extern "C" fn _start(_info_ptr: u64) -> !
         self_aspace: info.self_aspace_cap,
         self_cspace: info.self_cspace_cap,
         procmgr_endpoint: info.procmgr_endpoint_cap,
-        stdin_cap: info.stdin_cap,
-        stdout_cap: info.stdout_cap,
-        stderr_cap: info.stderr_cap,
+        stdin_frame_cap: info.stdin_frame_cap,
+        stdout_frame_cap: info.stdout_frame_cap,
+        stderr_frame_cap: info.stderr_frame_cap,
+        stdin_data_signal_cap: info.stdin_data_signal_cap,
+        stdin_space_signal_cap: info.stdin_space_signal_cap,
+        stdout_data_signal_cap: info.stdout_data_signal_cap,
+        stdout_space_signal_cap: info.stdout_space_signal_cap,
+        stderr_data_signal_cap: info.stderr_data_signal_cap,
+        stderr_space_signal_cap: info.stderr_space_signal_cap,
         tls_template_vaddr: info.tls_template_vaddr,
         tls_template_filesz: info.tls_template_filesz,
         tls_template_memsz: info.tls_template_memsz,
@@ -256,9 +262,9 @@ fn main(startup: &StartupInfo) -> !
                 }
             }
 
-            procmgr_labels::CONFIGURE_STDIO =>
+            procmgr_labels::CONFIGURE_PIPE =>
             {
-                handle_configure_stdio(&req, ipc_buf, ctx.self_aspace, &mut table);
+                handle_configure_pipe(&req, ipc_buf, ctx.self_aspace, &mut table);
             }
 
             _ =>
@@ -277,16 +283,17 @@ fn reply_empty(ipc_buf: *mut u64, code: u64)
     let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
 }
 
-/// Handle `CONFIGURE_STDIO` — install stdin/stdout/stderr caps on a
-/// suspended child.
+/// Handle `CONFIGURE_PIPE` — install one direction's shmem-backed
+/// stdio pipe on a suspended child.
 ///
-/// Caller identifies the target via the request's tokened `process_handle`
-/// (token delivered by `ipc_recv`). Caps are positional: `[stdout,
-/// stderr?, stdin?]`. Trailing zeros are omitted by the sender (the
-/// kernel rejects null cap slot indices). procmgr `cap_copy`s each into
-/// the child's `CSpace` and writes the slot index into the child's
-/// `ProcessInfo`. Rejects if the child has already been started.
-fn handle_configure_stdio(
+/// Wire format (see `ipc::procmgr_labels::CONFIGURE_PIPE`):
+/// * `data[0]` = direction (`PIPE_DIR_STDIN` / `STDOUT` / `STDERR`)
+/// * `data[1]` = ring byte capacity (informational; procmgr does not
+///   re-init the header — the spawner already called `SpscHeader::init`)
+/// * `caps[0]` = frame cap (one shmem page)
+/// * `caps[1]` = data-available signal cap
+/// * `caps[2]` = space-available signal cap
+fn handle_configure_pipe(
     req: &IpcMessage,
     ipc_buf: *mut u64,
     self_aspace: u32,
@@ -294,34 +301,37 @@ fn handle_configure_stdio(
 )
 {
     let token = req.token;
+    let direction = req.word(0);
     let caps = req.caps();
-    let stdout = caps.first().copied().unwrap_or(0);
-    let stderr = if caps.len() >= 2 { caps[1] } else { 0 };
-    let stdin = if caps.len() >= 3 { caps[2] } else { 0 };
+    if caps.len() < 3
+    {
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    let frame = caps[0];
+    let data_signal = caps[1];
+    let space_signal = caps[2];
 
-    let code = match table.configure_stdio(token, self_aspace, stdout, stderr, stdin)
+    let code = match table.configure_pipe(
+        token,
+        self_aspace,
+        direction,
+        frame,
+        data_signal,
+        space_signal,
+    )
     {
         Ok(()) => procmgr_errors::SUCCESS,
         Err(code) => code,
     };
 
-    // procmgr's copies of the transferred caps have been moved into the
-    // child's CSpace by cap_copy above (configure_stdio uses src-slot in
-    // procmgr's CSpace → dst-slot in child_cspace). Drop procmgr-side
-    // slots so their underlying refcounts don't keep the caller's
-    // references alive unnecessarily. Idempotent on zero.
-    if stdout != 0
-    {
-        let _ = syscall::cap_delete(stdout);
-    }
-    if stderr != 0
-    {
-        let _ = syscall::cap_delete(stderr);
-    }
-    if stdin != 0
-    {
-        let _ = syscall::cap_delete(stdin);
-    }
+    // configure_pipe cap_copy'd each cap into the child's CSpace; drop
+    // procmgr-side slots so refcounts hit zero when both peers later
+    // release. Idempotent on zero. On the failure path the cap_copy may
+    // not have happened yet — cap_delete on a stale slot is a no-op.
+    let _ = syscall::cap_delete(frame);
+    let _ = syscall::cap_delete(data_signal);
+    let _ = syscall::cap_delete(space_signal);
 
     reply_empty(ipc_buf, code);
 }
@@ -357,12 +367,11 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 ///   word `argv_words+1..`        = env blob, `env_bytes.div_ceil(8)` words
 ///                                  (only present when `env_count > 0`)
 ///
-/// Expects `caps = [module_frame, creator_endpoint?]`. Stdio wiring is
-/// configured via a separate `CONFIGURE_STDIO` IPC on the returned
-/// tokened `process_handle` before `START_PROCESS`; it is intentionally
-/// not part of this protocol so that stdout and stderr can be routed
-/// independently and so the core creation path has no logging concept
-/// baked in.
+/// Expects `caps = [module_frame, creator_endpoint?]`. Stdio pipe
+/// wiring is installed via separate `CONFIGURE_PIPE` IPCs (one per
+/// piped direction) on the returned tokened `process_handle` between
+/// create and `START_PROCESS`; the create path itself stays
+/// stdio-agnostic.
 #[allow(clippy::cast_possible_truncation)]
 fn handle_create(
     req: &IpcMessage,
@@ -562,10 +571,9 @@ pub struct ProcmgrCtx
 ///   word after env header            = env blob, `env_bytes.div_ceil(8)` words
 ///                                       (only present when `env_count > 0`)
 ///
-/// Expects `caps = [creator_endpoint?, log_output_cap?, stdin_cap?]`. All
-/// caps optional; trailing zeros omitted. Module bytes come from the VFS,
-/// not the caller's `CSpace`. `log_output_cap` is installed verbatim into
-/// the child's stdout/stderr — zero means no log output. Mirrors
+/// Expects `caps = [creator_endpoint?]`. Module bytes come from the VFS,
+/// not the caller's `CSpace`. Stdio pipes are installed via separate
+/// `CONFIGURE_PIPE` calls between create and start. Mirrors
 /// `CREATE_PROCESS`'s argv/env encoding (see `handle_create`).
 #[allow(clippy::cast_possible_truncation)]
 fn handle_create_from_vfs(

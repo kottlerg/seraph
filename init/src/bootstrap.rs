@@ -212,14 +212,20 @@ fn populate_procmgr_info(
     pi.creator_endpoint_cap = caps.creator_endpoint_slot;
     // procmgr has no procmgr above it; leave zero.
     pi.procmgr_endpoint_cap = 0;
-    pi.stdin_cap = 0;
-    pi.stdout_cap = 0;
-    pi.stderr_cap = 0;
+    pi.stdin_frame_cap = 0;
+    pi.stdout_frame_cap = 0;
+    pi.stderr_frame_cap = 0;
     // Procmgr holds the un-tokened SEND on the log endpoint and
     // `cap_copy`s it into every child's `ProcessInfo.log_discovery_cap`
     // at `CREATE_PROCESS` time. Procmgr itself does not consume
     // `seraph::log!`, so its own slot stays zero.
     pi.log_discovery_cap = 0;
+    pi.stdin_data_signal_cap = 0;
+    pi.stdin_space_signal_cap = 0;
+    pi.stdout_data_signal_cap = 0;
+    pi.stdout_space_signal_cap = 0;
+    pi.stderr_data_signal_cap = 0;
+    pi.stderr_space_signal_cap = 0;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
 

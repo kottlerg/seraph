@@ -81,6 +81,7 @@ fn main()
     spawn_phase();
     stack_overflow_phase();
     shmem_phase();
+    pipes_phase();
 
     std::os::seraph::log!("PASS");
 }
@@ -153,7 +154,7 @@ fn shmem_phase()
             head: core::sync::atomic::AtomicU32::new(0),
             tail: core::sync::atomic::AtomicU32::new(0),
             capacity: CAP as u32,
-            _reserved: 0,
+            closed: core::sync::atomic::AtomicU32::new(0),
         },
         body: [0u8; CAP],
     };
@@ -187,6 +188,154 @@ fn shmem_phase()
     assert!(sink.iter().all(|&b| b == 0xAA), "drained bytes mismatch");
 
     std::os::seraph::log!("shmem phase passed");
+}
+
+/// Exercise `Stdio::piped()` and `Command::output()` end-to-end.
+///
+/// Three sub-checks:
+///   1. Spawn `/bin/hello` with `Stdio::piped()` on stdout. Drain the
+///      ring to EOF, assert the captured bytes match what hello prints,
+///      re-emit each line through `seraph::log!` so the boot log
+///      surfaces hello's output indirectly under `[usertest]`.
+///   2. Spawn `/bin/stdiotest` with all three streams piped. Write
+///      `b"hello\n"` to its stdin (drop `ChildStdin` to flag EOF on the
+///      child's `read_line`), drain its stdout to EOF, assert the
+///      uppercased echo, re-emit through the log.
+///   3. Run `Command::new("/bin/hello").output()` — round-trips through
+///      the symmetric pipe + stdout-capture path. Assert clean exit
+///      and matching captured stdout.
+// pipes_phase orchestrates three sub-checks against a single
+// `Stdio::piped()` integration; splitting hides the round-trip rather
+// than clarifying it.
+#[allow(clippy::too_many_lines)]
+fn pipes_phase()
+{
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    // ── (1) hello capture ─────────────────────────────────────────────
+    {
+        let mut child = Command::new("/bin/hello")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/hello (piped) failed");
+        let mut stdout_bytes = Vec::new();
+        {
+            let mut out = child
+                .stdout
+                .take()
+                .expect("piped child must have stdout handle");
+            out.read_to_end(&mut stdout_bytes)
+                .expect("read_to_end on hello stdout failed");
+        }
+        let body = String::from_utf8_lossy(&stdout_bytes);
+        for line in body.lines()
+        {
+            std::os::seraph::log!("hello: {line}");
+        }
+        assert!(
+            !stdout_bytes.is_empty(),
+            "hello produced no stdout bytes — pipe wiring broken"
+        );
+        let status = child.wait().expect("hello wait failed");
+        assert!(status.success(), "hello did not exit cleanly: {status}");
+        std::os::seraph::log!("pipes: hello capture ok ({} bytes)", stdout_bytes.len());
+    }
+
+    // ── (2) stdiotest round-trip ──────────────────────────────────────
+    {
+        let mut child = Command::new("/bin/stdiotest")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/stdiotest (piped) failed");
+
+        // Feed the input line, then drop ChildStdin so the child's
+        // BufReader::read_line observes EOF and returns.
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("piped child must have stdin handle");
+            stdin
+                .write_all(b"hello\n")
+                .expect("write to stdiotest stdin failed");
+        }
+
+        let mut stdout_bytes = Vec::new();
+        {
+            let mut out = child
+                .stdout
+                .take()
+                .expect("piped child must have stdout handle");
+            out.read_to_end(&mut stdout_bytes)
+                .expect("read_to_end on stdiotest stdout failed");
+        }
+        let body = String::from_utf8_lossy(&stdout_bytes);
+        for line in body.lines()
+        {
+            std::os::seraph::log!("stdiotest: {line}");
+        }
+        // stdiotest's `read_line` counts include the trailing newline,
+        // so 6 bytes for `b"hello\n"`.
+        assert!(
+            body.contains("got 6 bytes"),
+            "stdiotest stdout missing byte-count line: {body:?}"
+        );
+        assert!(
+            body.contains("shouted: HELLO"),
+            "stdiotest stdout missing shout line: {body:?}"
+        );
+        assert!(
+            body.contains("PASS"),
+            "stdiotest stdout missing PASS marker: {body:?}"
+        );
+
+        // Drain stderr too (stdiotest only writes to stderr on
+        // unexpected error paths; expected to be empty).
+        if let Some(mut err) = child.stderr.take()
+        {
+            let mut stderr_bytes = Vec::new();
+            err.read_to_end(&mut stderr_bytes)
+                .expect("read_to_end on stdiotest stderr failed");
+            if !stderr_bytes.is_empty()
+            {
+                let body = String::from_utf8_lossy(&stderr_bytes);
+                for line in body.lines()
+                {
+                    std::os::seraph::log!("stdiotest.err: {line}");
+                }
+            }
+        }
+
+        let status = child.wait().expect("stdiotest wait failed");
+        assert!(status.success(), "stdiotest did not exit cleanly: {status}");
+        std::os::seraph::log!("pipes: stdiotest round-trip ok");
+    }
+
+    // ── (3) Command::output() round-trip ──────────────────────────────
+    {
+        let output = Command::new("/bin/hello")
+            .output()
+            .expect("Command::output on hello failed");
+        assert!(
+            output.status.success(),
+            "hello via output() did not exit cleanly: {}",
+            output.status
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "Command::output captured zero stdout bytes"
+        );
+        std::os::seraph::log!(
+            "pipes: Command::output ok ({} stdout, {} stderr)",
+            output.stdout.len(),
+            output.stderr.len(),
+        );
+    }
+
+    std::os::seraph::log!("pipes phase passed");
 }
 
 /// Verify `std::env::args()` returns exactly what init wrote into the

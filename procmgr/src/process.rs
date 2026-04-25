@@ -132,30 +132,43 @@ impl ProcessTable
             .map(|e| e.started)
     }
 
-    /// Install stdio caps on a suspended child identified by `token`.
+    /// Install one direction's shmem pipe on a suspended child
+    /// identified by `token`.
     ///
-    /// Looks up the entry, confirms the child has not yet been started,
-    /// remaps its `ProcessInfo` frame writable in procmgr's own aspace,
-    /// `cap_copy`s each non-zero stdio cap from procmgr's `CSpace` into
-    /// the child's `CSpace` with the appropriate rights (`RIGHTS_SEND` for
-    /// stdout/stderr, `RIGHTS_RECEIVE` for stdin), writes the resulting
-    /// slot indices into the PI page, and unmaps.
+    /// `direction` is one of `ipc::procmgr_labels::PIPE_DIR_STDIN`,
+    /// `PIPE_DIR_STDOUT`, `PIPE_DIR_STDERR`. The three caps are
+    /// `cap_copy`'d into the child's `CSpace` with `RIGHTS_MAP_RW` for
+    /// the frame and `RIGHTS_ALL` for the two signals (signal objects
+    /// don't currently distinguish send/wait at the cap-rights level —
+    /// each peer holds a full cap and uses send or wait as appropriate).
+    /// The resulting slot indices are written into the matching
+    /// `<dir>_frame_cap` / `<dir>_data_signal_cap` /
+    /// `<dir>_space_signal_cap` fields of the child's `ProcessInfo`.
     ///
-    /// Idempotent before start — later calls overwrite earlier slots.
+    /// Idempotent per direction before start; later calls overwrite the
+    /// previous triple for that direction. Different directions are
+    /// independent.
     ///
     /// # Errors
     /// - `procmgr_errors::INVALID_TOKEN` — no entry for `token`.
     /// - `procmgr_errors::ALREADY_STARTED` — target is already running.
+    /// - `procmgr_errors::INVALID_ARGUMENT` — bad direction selector or
+    ///   any cap is zero.
     /// - `procmgr_errors::OUT_OF_MEMORY` — mapping / `cap_copy` failure.
-    pub fn configure_stdio(
+    pub fn configure_pipe(
         &mut self,
         token: u64,
         self_aspace: u32,
-        stdout: u32,
-        stderr: u32,
-        stdin: u32,
+        direction: u64,
+        frame: u32,
+        data_signal: u32,
+        space_signal: u32,
     ) -> Result<(), u64>
     {
+        if frame == 0 || data_signal == 0 || space_signal == 0
+        {
+            return Err(procmgr_errors::INVALID_ARGUMENT);
+        }
         let entry = self
             .find_mut_by_token(token)
             .ok_or(procmgr_errors::INVALID_TOKEN)?;
@@ -166,9 +179,6 @@ impl ProcessTable
         let pi_frame = entry.pi_frame_cap;
         let child_cspace = entry.cspace_cap;
 
-        // Remap the PI frame writable in procmgr's aspace so we can poke
-        // stdio slots. Safe: the child has not started (checked above), so
-        // there's no reader of the PI page yet.
         syscall::mem_map(
             pi_frame,
             self_aspace,
@@ -183,23 +193,38 @@ impl ProcessTable
         // lives at offset 0 per the ABI.
         let pi = unsafe { process_abi::process_info_mut(TEMP_FRAME_VA) };
 
-        if stdout != 0
+        let frame_slot = syscall::cap_copy(frame, child_cspace, syscall::RIGHTS_MAP_RW)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        let data_slot = syscall::cap_copy(data_signal, child_cspace, syscall::RIGHTS_ALL)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        let space_slot = syscall::cap_copy(space_signal, child_cspace, syscall::RIGHTS_ALL)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+
+        match direction
         {
-            let slot = syscall::cap_copy(stdout, child_cspace, syscall::RIGHTS_SEND)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-            pi.stdout_cap = slot;
-        }
-        if stderr != 0
-        {
-            let slot = syscall::cap_copy(stderr, child_cspace, syscall::RIGHTS_SEND)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-            pi.stderr_cap = slot;
-        }
-        if stdin != 0
-        {
-            let slot = syscall::cap_copy(stdin, child_cspace, syscall::RIGHTS_RECEIVE)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-            pi.stdin_cap = slot;
+            ipc::procmgr_labels::PIPE_DIR_STDIN =>
+            {
+                pi.stdin_frame_cap = frame_slot;
+                pi.stdin_data_signal_cap = data_slot;
+                pi.stdin_space_signal_cap = space_slot;
+            }
+            ipc::procmgr_labels::PIPE_DIR_STDOUT =>
+            {
+                pi.stdout_frame_cap = frame_slot;
+                pi.stdout_data_signal_cap = data_slot;
+                pi.stdout_space_signal_cap = space_slot;
+            }
+            ipc::procmgr_labels::PIPE_DIR_STDERR =>
+            {
+                pi.stderr_frame_cap = frame_slot;
+                pi.stderr_data_signal_cap = data_slot;
+                pi.stderr_space_signal_cap = space_slot;
+            }
+            _ =>
+            {
+                let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+                return Err(procmgr_errors::INVALID_ARGUMENT);
+            }
         }
 
         let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
@@ -234,8 +259,9 @@ pub struct CreateResult
 /// Stdio caps (stdin, stdout, stderr) are intentionally NOT part of this
 /// struct: they are not a universal property of processes, and each can
 /// route to a different endpoint. A spawner that wants the child to have
-/// any stdio wiring installs it via the separate `CONFIGURE_STDIO` IPC
-/// between `CREATE_PROCESS` and `START_PROCESS`.
+/// any stdio pipe wiring installs it via separate `CONFIGURE_PIPE`
+/// IPCs (one per piped direction) between `CREATE_PROCESS` and
+/// `START_PROCESS`.
 pub struct UniversalCaps
 {
     pub procmgr_endpoint: u32,
@@ -296,13 +322,13 @@ pub struct MainTls
 ///
 /// Installs the creator endpoint cap (if any) and the procmgr service
 /// endpoint into the child `CSpace` and records their slots in the child's
-/// `ProcessInfo`. Stdio slots (`stdin_cap`, `stdout_cap`, `stderr_cap`)
-/// are left zero here and are populated afterwards by
-/// [`configure_stdio`], which remaps the same `pi_frame` writable, installs
-/// caller-supplied caps via `cap_copy` into the child's `CSpace`, and
-/// writes the slot indices into the PI page. This split keeps the core
-/// `CREATE_PROCESS` path stdio-agnostic and lets spawners route stdout
-/// and stderr independently.
+/// `ProcessInfo`. Stdio pipe slots (frame + two signal caps per
+/// direction) are left zero here and are populated afterwards by
+/// [`ProcessTable::configure_pipe`], which remaps the same `pi_frame`
+/// writable, installs caller-supplied caps via `cap_copy` into the
+/// child's `CSpace`, and writes the slot indices into the PI page. This
+/// split keeps the core `CREATE_PROCESS` path stdio-agnostic and lets
+/// spawners pipe each direction independently.
 // similar_names: child_aspace/child_cspace are intentionally parallel.
 // too_many_arguments: each cluster is a small fixed-size bundle; collapsing
 // them into one struct shifts the verbosity to the call sites without
@@ -395,11 +421,12 @@ fn populate_child_info(
         0
     };
 
-    // Stdio caps are not installed here — CONFIGURE_STDIO remaps this
-    // same pi_frame writable and fills them in before the child is
-    // started. Leave the PI slots as zero so a child that ships without a
-    // CONFIGURE_STDIO call sees "no stream attached" (silent println!,
-    // EOF on stdin read).
+    // Stdio pipe caps are not installed here — CONFIGURE_PIPE remaps
+    // this same pi_frame writable and fills in one direction's triple
+    // (frame + data signal + space signal) per call, before the child
+    // is started. Children that ship without any CONFIGURE_PIPE call
+    // see all-zero stdio frame/signal slots, which std maps to silent
+    // println! / EOF on stdin.
 
     // SAFETY: TEMP_FRAME_VA is page-aligned and mapped writable.
     let pi = unsafe { process_abi::process_info_mut(TEMP_FRAME_VA) };
@@ -410,10 +437,16 @@ fn populate_child_info(
     pi.ipc_buffer_vaddr = CHILD_IPC_BUF_VA;
     pi.creator_endpoint_cap = creator_ep_in_child;
     pi.procmgr_endpoint_cap = procmgr_ep_in_child;
-    pi.stdin_cap = 0;
-    pi.stdout_cap = 0;
-    pi.stderr_cap = 0;
+    pi.stdin_frame_cap = 0;
+    pi.stdout_frame_cap = 0;
+    pi.stderr_frame_cap = 0;
     pi.log_discovery_cap = log_discovery_in_child;
+    pi.stdin_data_signal_cap = 0;
+    pi.stdin_space_signal_cap = 0;
+    pi.stdout_data_signal_cap = 0;
+    pi.stdout_space_signal_cap = 0;
+    pi.stderr_data_signal_cap = 0;
+    pi.stderr_space_signal_cap = 0;
     pi.tls_template_vaddr = tls.vaddr;
     pi.tls_template_filesz = tls.filesz;
     pi.tls_template_memsz = tls.memsz;

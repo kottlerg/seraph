@@ -16,6 +16,20 @@ doctest = false
 ipc = { path = "../ipc" }
 syscall = { path = "../syscall" }
 syscall-abi = { path = "../../abi/syscall" }
+# When std lists this crate as a dep (Phase 3 of the logging/stdio
+# split — see ruststd/src/sys/pipe/seraph.rs), build-std activates
+# `rustc-dep-of-std` and forwards the feature to our workspace deps,
+# so `use core::…` resolves against the build-std core facade. Same
+# pattern as shared/log, shared/ipc, abi/syscall, shared/syscall.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = [
+    "rustc-std-workspace-core",
+    "ipc/rustc-dep-of-std",
+    "syscall/rustc-dep-of-std",
+    "syscall-abi/rustc-dep-of-std",
+]
 
 [lints]
 workspace = true

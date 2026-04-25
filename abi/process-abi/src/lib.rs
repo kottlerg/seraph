@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 8;
+pub const PROCESS_ABI_VERSION: u32 = 9;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -123,34 +123,34 @@ pub struct ProcessInfo
     /// before procmgr exists). Consumers must tolerate zero.
     pub procmgr_endpoint_cap: u32,
 
-    /// `CSpace` slot of the cap backing `std::io::stdin`.
+    /// `CSpace` slot of the shmem frame cap backing `std::io::stdin`.
     ///
-    /// Receive-side of a byte-stream endpoint. `std::io::stdin().read(buf)`
-    /// performs `ipc_recv` on this cap to obtain the next chunk written by
-    /// the spawner (or its delegate). Zero means "no input attached"; reads
-    /// return `Ok(0)` (EOF) immediately. The standard case for services
-    /// spawned by init.
-    pub stdin_cap: u32,
+    /// One 4 KiB page laid out as `shmem::SpscHeader` followed by a
+    /// power-of-two byte ring. The frame is shared with the spawner; the
+    /// spawner is the writer (parent → child), the child is the reader.
+    /// Wakeup signals live in `stdin_data_signal_cap` (writer-kicks-reader)
+    /// and `stdin_space_signal_cap` (reader-kicks-writer); EOF rides on the
+    /// header's `closed` flag plus a final signal kick.
+    ///
+    /// Zero means "no stdin attached"; reads return `Ok(0)` (EOF)
+    /// immediately. The standard case for services spawned by init.
+    pub stdin_frame_cap: u32,
 
-    /// `CSpace` slot of the cap backing `std::io::stdout`.
+    /// `CSpace` slot of the shmem frame cap backing `std::io::stdout`.
     ///
-    /// SEND side of a byte-stream endpoint. `std::io::stdout().write(buf)`
-    /// performs `ipc_call` on this cap with `STREAM_BYTES` label and the
-    /// bytes packed into IPC data words. The receiver decides what to do
-    /// with the bytes — current spawners (init/svcmgr) point this at the
-    /// log endpoint with a per-service token, so a log daemon can attribute
-    /// output without on-wire self-identification.
+    /// Same layout as `stdin_frame_cap` but with the child as the writer
+    /// (child → parent) and the spawner as the reader. Wakeup pair is
+    /// `stdout_data_signal_cap` / `stdout_space_signal_cap`.
     ///
-    /// Zero when no sink is attached (very early boot); writes are silently
-    /// dropped, matching `unsupported` stdio semantics.
-    pub stdout_cap: u32,
+    /// Zero when no sink is attached; writes are silently dropped.
+    pub stdout_frame_cap: u32,
 
-    /// `CSpace` slot of the cap backing `std::io::stderr`.
+    /// `CSpace` slot of the shmem frame cap backing `std::io::stderr`.
     ///
-    /// Same shape as `stdout_cap`. Spawners may point it at the same
-    /// endpoint as `stdout_cap` (current default) or at a different sink for
-    /// stream-separated diagnostics. Zero means writes are silently dropped.
-    pub stderr_cap: u32,
+    /// Same shape as `stdout_frame_cap`; an independent ring so stdout and
+    /// stderr stream separately. Wakeup pair is `stderr_data_signal_cap` /
+    /// `stderr_space_signal_cap`. Zero means writes are silently dropped.
+    pub stderr_frame_cap: u32,
 
     // ── Thread-local storage template ──────────────────────────────────
     //
@@ -229,6 +229,36 @@ pub struct ProcessInfo
     /// created before the log infrastructure is wired). Logger-using
     /// callers must tolerate zero (writes silently drop).
     pub log_discovery_cap: u32,
+
+    // ── Stdio pipe wakeup signals ──────────────────────────────────────
+    //
+    // Each piped direction gets two signal caps:
+    //   * `data_signal`  — writer kicks reader after producing bytes;
+    //                      reader awaits this when the ring is empty.
+    //   * `space_signal` — reader kicks writer after consuming bytes;
+    //                      writer awaits this when the ring is full.
+    //
+    // Both processes hold caps to both signals (kernel signal objects do
+    // not distinguish send/wait rights at the cap level). Single-waiter
+    // invariant holds because at most one side blocks on each signal at
+    // any given moment.
+    //
+    // Zero in any slot means the corresponding signal is not attached;
+    // the AnonPipe peer treats `signal_wait` as a no-op and falls back
+    // to spinning on the ring header (used during silent-drop init when
+    // a frame cap is also zero).
+    /// Data-available signal for the stdin pipe. Writer-kicked.
+    pub stdin_data_signal_cap: u32,
+    /// Space-available signal for the stdin pipe. Reader-kicked.
+    pub stdin_space_signal_cap: u32,
+    /// Data-available signal for the stdout pipe. Writer-kicked.
+    pub stdout_data_signal_cap: u32,
+    /// Space-available signal for the stdout pipe. Reader-kicked.
+    pub stdout_space_signal_cap: u32,
+    /// Data-available signal for the stderr pipe. Writer-kicked.
+    pub stderr_data_signal_cap: u32,
+    /// Space-available signal for the stderr pipe. Reader-kicked.
+    pub stderr_space_signal_cap: u32,
 }
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────
@@ -257,14 +287,27 @@ pub struct StartupInfo
     /// Zero when unreachable (procmgr itself, or earlier in the boot chain).
     pub procmgr_endpoint: u32,
 
-    /// `CSpace` slot of the stdin cap. Zero when no input stream is attached.
-    pub stdin_cap: u32,
+    /// `CSpace` slot of the stdin shmem frame cap. Zero when no input
+    /// pipe is attached.
+    pub stdin_frame_cap: u32,
 
-    /// `CSpace` slot of the stdout cap. Zero when no sink is attached.
-    pub stdout_cap: u32,
+    /// `CSpace` slot of the stdout shmem frame cap. Zero when no sink
+    /// is attached.
+    pub stdout_frame_cap: u32,
 
-    /// `CSpace` slot of the stderr cap. Zero when no sink is attached.
-    pub stderr_cap: u32,
+    /// `CSpace` slot of the stderr shmem frame cap. Zero when no sink
+    /// is attached.
+    pub stderr_frame_cap: u32,
+
+    /// Wakeup signal caps for the three stdio pipes. Zero when the
+    /// corresponding direction is not piped. See `ProcessInfo` for the
+    /// full data-vs-space and writer-vs-reader semantics.
+    pub stdin_data_signal_cap: u32,
+    pub stdin_space_signal_cap: u32,
+    pub stdout_data_signal_cap: u32,
+    pub stdout_space_signal_cap: u32,
+    pub stderr_data_signal_cap: u32,
+    pub stderr_space_signal_cap: u32,
 
     /// Virtual address of the `PT_TLS` template in the loaded image.
     /// `tls_template_memsz == 0` signals that the process has no TLS.

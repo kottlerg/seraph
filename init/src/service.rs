@@ -234,7 +234,8 @@ pub fn create_devmgr_with_caps(
         return;
     };
 
-    // caps: [module, creator]. Stdio configured via CONFIGURE_STDIO below.
+    // caps: [module, creator]. No stdio pipes — devmgr reaches the
+    // system log via the discovery cap procmgr installs in ProcessInfo.
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
         .cap(devmgr_frame_cap)
         .cap(tokened_creator)

@@ -621,6 +621,7 @@ name = "shmem"
 version = "0.1.0"
 dependencies = [
  "ipc",
+ "rustc-std-workspace-core",
  "syscall",
  "syscall-abi",
 ]

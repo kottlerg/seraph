@@ -554,6 +554,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
     apply_args_overlay(&rust_src, overlay_root).context("args overlay")?;
     apply_env_overlay(&rust_src, overlay_root).context("env overlay")?;
     apply_process_overlay(&rust_src, overlay_root).context("process overlay")?;
+    apply_pipe_overlay(&rust_src, overlay_root).context("pipe overlay")?;
     Ok(())
 }
 
@@ -589,6 +590,10 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         .join("abi/process-abi")
         .canonicalize()
         .context("canonicalising abi/process-abi")?;
+    let shmem_path = project_root
+        .join("shared/shmem")
+        .canonicalize()
+        .context("canonicalising shared/shmem")?;
 
     let block = format!(
         "\n\
@@ -603,13 +608,15 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
          ipc = {{ path = \"{ipc}\", features = [\"rustc-dep-of-std\"] }}\n\
          log = {{ path = \"{log}\", features = [\"rustc-dep-of-std\"] }}\n\
          va_layout = {{ path = \"{va}\", features = [\"rustc-dep-of-std\"] }}\n\
-         process-abi = {{ path = \"{proc}\", features = [\"rustc-dep-of-std\"] }}\n",
+         process-abi = {{ path = \"{proc}\", features = [\"rustc-dep-of-std\"] }}\n\
+         shmem = {{ path = \"{shmem}\", features = [\"rustc-dep-of-std\"] }}\n",
         abi = syscall_abi_path.display(),
         sys = syscall_path.display(),
         ipc = ipc_path.display(),
         log = log_path.display(),
         va = va_layout_path.display(),
         proc = process_abi_path.display(),
+        shmem = shmem_path.display(),
     );
 
     let text = fs::read_to_string(&cargo_toml)
@@ -620,7 +627,8 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
     // later overlay revision), strip the old block and re-apply.
     let marker = "seraph-overlay: workspace ABI crates";
     let has_log_dep = text.contains("log = { path");
-    if text.contains(marker) && has_log_dep
+    let has_shmem_dep = text.contains("shmem = { path");
+    if text.contains(marker) && has_log_dep && has_shmem_dep
     {
         return Ok(());
     }
@@ -818,7 +826,9 @@ fn apply_stdio_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 /// Patch `library/std/src/sys/exit.rs` to route `exit(code)` through
 /// `syscall::thread_exit()` on seraph, so `std::process::exit` exits the
 /// calling thread cleanly instead of trapping via `intrinsics::abort()` (the
-/// unsupported-fallback behaviour).
+/// unsupported-fallback behaviour). Closes stdio pipes first so any
+/// parent blocked on a `read_to_end` / `write` observes EOF /
+/// `BrokenPipe` instead of hanging.
 fn apply_exit_overlay(rust_src: &Path) -> Result<()>
 {
     let exit_rs = rust_src.join("library/std/src/sys/exit.rs");
@@ -829,6 +839,7 @@ fn apply_exit_overlay(rust_src: &Path) -> Result<()>
         "        target_os = \"xous\" => {\n            crate::os::xous::ffi::exit(code as u32)\n        }\n        \
          // seraph-overlay: exit via SYS_THREAD_EXIT for clean shutdown\n        \
          target_os = \"seraph\" => {\n            let _ = code;\n            \
+         crate::sys::stdio::seraph::close_all();\n            \
          syscall::thread_exit()\n        }\n",
     )
 }
@@ -1022,6 +1033,26 @@ fn apply_time_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
          // seraph-overlay: Instant via SYS_SYSTEM_INFO ElapsedUs\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          use seraph as imp;\n    }\n",
+    )
+}
+
+fn apply_pipe_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
+{
+    let pipe_dir = rust_src.join("library/std/src/sys/pipe");
+    let mod_rs = pipe_dir.join("mod.rs");
+    let seraph_rs_dst = pipe_dir.join("seraph.rs");
+    let seraph_rs_src = overlay_root.join("sys/pipe/seraph.rs");
+
+    write_if_changed(&seraph_rs_src, &seraph_rs_dst, "pipe/seraph.rs")?;
+
+    patch_file(
+        &mod_rs,
+        "pipe/mod.rs",
+        "    target_os = \"motor\" => {\n        mod motor;\n        pub use motor::{Pipe, pipe};\n    }\n",
+        "    target_os = \"motor\" => {\n        mod motor;\n        pub use motor::{Pipe, pipe};\n    }\n    \
+         // seraph-overlay: shmem-backed Stdio::piped via SPSC ring + signal caps\n    \
+         target_os = \"seraph\" => {\n        pub mod seraph;\n        \
+         pub use seraph::{Pipe, pipe};\n    }\n",
     )
 }
 

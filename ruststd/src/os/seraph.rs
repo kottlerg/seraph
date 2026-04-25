@@ -58,18 +58,33 @@ pub struct StartupInfo {
     /// exists). `_start` consumes this to bootstrap the heap.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub procmgr_endpoint: u32,
-    /// Cap backing `std::io::stdin`. Zero when no input stream is attached;
-    /// reads return `Ok(0)` (EOF).
+    /// Shmem frame cap backing `std::io::stdin`. Zero when no input
+    /// pipe is attached; reads return `Ok(0)` (EOF).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdin_cap: u32,
-    /// Cap backing `std::io::stdout`. Zero when no sink is attached; writes
-    /// silently drop.
+    pub stdin_frame_cap: u32,
+    /// Shmem frame cap backing `std::io::stdout`. Zero when no sink is
+    /// attached; writes silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdout_cap: u32,
-    /// Cap backing `std::io::stderr`. Zero when no sink is attached; writes
-    /// silently drop.
+    pub stdout_frame_cap: u32,
+    /// Shmem frame cap backing `std::io::stderr`. Zero when no sink is
+    /// attached; writes silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stderr_cap: u32,
+    pub stderr_frame_cap: u32,
+    /// Wakeup signal caps for the stdio pipes. See `process_abi::ProcessInfo`
+    /// for full data-vs-space and writer-vs-reader semantics. Zero when
+    /// the corresponding direction is not piped.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub stdin_data_signal_cap: u32,
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub stdin_space_signal_cap: u32,
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub stdout_data_signal_cap: u32,
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub stdout_space_signal_cap: u32,
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub stderr_data_signal_cap: u32,
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub stderr_space_signal_cap: u32,
     /// Un-tokened SEND cap on the system log endpoint (the "discovery
     /// cap"). Used by [`log!`] to lazy-acquire a tokened SEND cap on
     /// first call via the `GET_LOG_CAP` IPC. Zero when no logger is
@@ -275,9 +290,15 @@ pub extern "C" fn _start() -> ! {
         self_aspace: info.self_aspace_cap,
         self_cspace: info.self_cspace_cap,
         procmgr_endpoint: info.procmgr_endpoint_cap,
-        stdin_cap: info.stdin_cap,
-        stdout_cap: info.stdout_cap,
-        stderr_cap: info.stderr_cap,
+        stdin_frame_cap: info.stdin_frame_cap,
+        stdout_frame_cap: info.stdout_frame_cap,
+        stderr_frame_cap: info.stderr_frame_cap,
+        stdin_data_signal_cap: info.stdin_data_signal_cap,
+        stdin_space_signal_cap: info.stdin_space_signal_cap,
+        stdout_data_signal_cap: info.stdout_data_signal_cap,
+        stdout_space_signal_cap: info.stdout_space_signal_cap,
+        stderr_data_signal_cap: info.stderr_data_signal_cap,
+        stderr_space_signal_cap: info.stderr_space_signal_cap,
         log_discovery_cap: info.log_discovery_cap,
         tls_template_vaddr: info.tls_template_vaddr,
         tls_template_filesz: info.tls_template_filesz,
@@ -293,14 +314,22 @@ pub extern "C" fn _start() -> ! {
     unsafe { (*STARTUP.0.get()).write(startup) };
     STARTUP_READY.store(true, Ordering::Release);
 
-    // Wire the three stdio caps before the heap bootstrap so any diagnostic
-    // emitted by bootstrap failure is visible. Zero slots are tolerated
-    // (writes silently drop / reads return EOF), matching the "no stream
-    // attached yet" state during very-early boot.
+    // Wire the three stdio pipes before the heap bootstrap. Each
+    // direction takes (frame_cap, data_signal_cap, space_signal_cap);
+    // zero frame caps are tolerated (writes silently drop / reads
+    // return EOF), matching the "no pipe attached" state for processes
+    // born without `Stdio::piped()`.
     pal_stdio::stdio_init(
-        info.stdin_cap,
-        info.stdout_cap,
-        info.stderr_cap,
+        info.stdin_frame_cap,
+        info.stdin_data_signal_cap,
+        info.stdin_space_signal_cap,
+        info.stdout_frame_cap,
+        info.stdout_data_signal_cap,
+        info.stdout_space_signal_cap,
+        info.stderr_frame_cap,
+        info.stderr_data_signal_cap,
+        info.stderr_space_signal_cap,
+        info.self_aspace_cap,
     );
 
     // Install the log discovery cap so `seraph::log!` can lazy-acquire
@@ -344,6 +373,11 @@ pub extern "C" fn _start() -> ! {
     // `fn main` (i.e., not `#![no_main]`). It invokes `lang_start` and the
     // user's `fn main`.
     let _ = unsafe { main(0, core::ptr::null()) };
+
+    // Tear down stdio pipes before exit so the close protocol fires
+    // (header `closed` flag + signal kick) and any parent blocked on
+    // a read/write returns cleanly.
+    pal_stdio::close_all();
 
     syscall::thread_exit();
 }

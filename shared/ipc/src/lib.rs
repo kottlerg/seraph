@@ -41,11 +41,12 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 pub mod procmgr_labels
 {
     /// Create a new process from a boot module frame. Caps: `[module,
-    /// creator_endpoint?]`. Stdio (stdout/stderr/stdin) is configured
-    /// through a separate [`CONFIGURE_STDIO`] call against the returned
-    /// tokened `process_handle` — procmgr's CREATE path carries no stdio
-    /// caps so stdout and stderr can be routed independently and so the
-    /// core process-creation primitive has no logging concept baked in.
+    /// creator_endpoint?]`. Stdio pipes (stdin/stdout/stderr) are
+    /// configured through one or more [`CONFIGURE_PIPE`] calls against
+    /// the returned tokened `process_handle` — procmgr's CREATE path
+    /// carries no stdio caps so stdout and stderr can be piped
+    /// independently and so the core process-creation primitive stays
+    /// stdio-agnostic.
     pub const CREATE_PROCESS: u64 = 1;
     /// Start a previously created (suspended) process.
     pub const START_PROCESS: u64 = 2;
@@ -54,7 +55,7 @@ pub mod procmgr_labels
     /// Create a new process from a VFS path (ELF binary). Wire format
     /// carries the path plus optional argv + env blobs; see procmgr's
     /// `handle_create_from_vfs` for the full label and data layout. Caps:
-    /// `[creator_endpoint?]`. Stdio via [`CONFIGURE_STDIO`] as for
+    /// `[creator_endpoint?]`. Stdio pipes via [`CONFIGURE_PIPE`] as for
     /// `CREATE_PROCESS`.
     pub const CREATE_FROM_VFS: u64 = 6;
     /// Provide procmgr with the vfsd endpoint for VFS-based loading.
@@ -75,24 +76,49 @@ pub mod procmgr_labels
     /// tools and `std::process::Child::try_wait`-style probes that want to
     /// peek without blocking on a death event.
     pub const QUERY_PROCESS: u64 = 9;
-    /// Install per-child stdio caps on a process created via
-    /// [`CREATE_PROCESS`] / [`CREATE_FROM_VFS`] but not yet started.
+    /// Install one direction's shmem-backed stdio pipe on a child
+    /// created via [`CREATE_PROCESS`] / [`CREATE_FROM_VFS`] but not yet
+    /// started.
     ///
-    /// Request: caller invokes on the tokened `process_handle` returned by
-    /// the creation call; procmgr uses `recv.token` to find the entry.
-    /// Caps (positional, trailing zeros omitted): `[stdout_cap?,
-    /// stderr_cap?, stdin_cap?]`. procmgr installs each verbatim into the
-    /// corresponding slot of the child's `ProcessInfo` (stdout/stderr
-    /// with `RIGHTS_SEND`; stdin with `RIGHTS_RECEIVE`). All three are
-    /// independent — callers that want stdout and stderr routed differently
-    /// pass two distinct caps; callers that want the same sink pass two
-    /// `cap_copy`'d views of one cap.
+    /// Request: caller invokes on the tokened `process_handle` returned
+    /// by the creation call; procmgr uses `recv.token` to find the entry.
+    /// Wire format:
+    /// * `data[0]` — direction selector ([`PIPE_DIR_STDIN`] /
+    ///   [`PIPE_DIR_STDOUT`] / [`PIPE_DIR_STDERR`]).
+    /// * `data[1]` — ring byte capacity (power of two, ≤ ring page bytes
+    ///   minus header). v1 uses 2048.
+    /// * `caps[0]` — frame cap (one shmem page; spawner has already
+    ///   initialised the [`SpscHeader`] via `init`).
+    /// * `caps[1]` — data-available signal cap.
+    /// * `caps[2]` — space-available signal cap.
+    ///
+    /// procmgr `cap_copy`s each cap into the child's `CSpace` and writes
+    /// the resulting slot indices into the matching `<dir>_frame_cap`,
+    /// `<dir>_data_signal_cap`, and `<dir>_space_signal_cap` slots of
+    /// the child's `ProcessInfo`. All three caps are required; missing
+    /// cap slots reply `INVALID_ARGUMENT`.
     ///
     /// Ordering: valid only between `CREATE_PROCESS` and `START_PROCESS`.
     /// Replies `ALREADY_STARTED` if the target is running.
-    /// `INVALID_TOKEN` if the `process_handle` is unknown. Idempotent before
-    /// start; later calls overwrite earlier slots.
-    pub const CONFIGURE_STDIO: u64 = 11;
+    /// `INVALID_TOKEN` if the `process_handle` is unknown. Idempotent
+    /// per direction before start; later calls overwrite the previous
+    /// triple for that direction.
+    ///
+    /// Spawners call this 0–3 times depending on which directions are
+    /// piped. The 3 caps × 3 directions = 9 caps total exceeds
+    /// `MSG_CAP_SLOTS_MAX = 4`, so per-direction is the minimal-call
+    /// shape — non-piped directions cost zero IPC round trips.
+    pub const CONFIGURE_PIPE: u64 = 11;
+
+    /// Direction selector for [`CONFIGURE_PIPE`] — child stdin (parent
+    /// is the writer, child is the reader).
+    pub const PIPE_DIR_STDIN: u64 = 0;
+    /// Direction selector for [`CONFIGURE_PIPE`] — child stdout (child
+    /// is the writer, parent is the reader).
+    pub const PIPE_DIR_STDOUT: u64 = 1;
+    /// Direction selector for [`CONFIGURE_PIPE`] — child stderr (child
+    /// is the writer, parent is the reader).
+    pub const PIPE_DIR_STDERR: u64 = 2;
 }
 
 /// Process-state codes returned by `procmgr_labels::QUERY_PROCESS`.

@@ -10,10 +10,10 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-ipc = { path = "../shared/ipc" }
-syscall = { path = "../shared/syscall" }
-syscall-abi = { path = "../abi/syscall" }
-va_layout = { path = "../shared/va_layout" }
+ipc = { path = "../../shared/ipc" }
+syscall = { path = "../../shared/syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+va_layout = { path = "../../shared/va_layout" }
 virtio-core = { path = "../drivers/virtio/core" }
 
 [lints]

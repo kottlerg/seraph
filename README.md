@@ -19,27 +19,15 @@ statement and the reasoning behind each goal.
 
 | Directory | Purpose |
 |---|---|
-| `abi/` | ABI-defining crates (boot-protocol, syscall) — stable cross-boundary contracts |
+| `abi/` | Stable cross-boundary contracts |
 | `base/` | General-purpose userspace applications and utilities |
-| `boot/` | UEFI bootloader |
-| `devmgr/` | Device manager (platform enumeration, driver binding) |
+| `core/` | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
 | `docs/` | Architecture and design documentation |
-| `drivers/` | Hardware device drivers (userspace, managed by devmgr) |
-| `fs/` | Filesystem driver implementations (FAT, ext4, tmpfs, …; managed by vfsd) |
-| `init/` | Bootstrap service — starts early services and exits |
-| `kernel/` | Microkernel (scheduler, IPC, memory, capabilities) |
-| `libc/` | C standard library and POSIX compatibility layer |
-| `logd/` | Logging daemon — receives log messages from kernel and userspace via IPC |
-| `netd/` | Network stack daemon |
-| `procmgr/` | Userspace process lifecycle manager (ELF loading, creation, teardown) |
-| `rootfs/` | System files installed into the sysroot during builds (boot.conf, fonts, …) |
-| `ruststd/` | Rust standard library platform layer (`std::sys::seraph`) |
-| `shared/` | Shared utility crates (ELF parsing, syscall wrappers) |
-| `svcmgr/` | Service health monitor and restart manager |
-| `targets/` | Custom Rust target JSON specs for cross-compilation |
-| `vfsd/` | Virtual filesystem daemon |
-| `ktest/` | In-kernel test binary, loaded in place of init for syscall and integration testing |
-| `xtask/` | Build task runner (`cargo xtask`) |
+| `rootfs/` | System files installed into the sysroot during builds (config files, etc) |
+| `runtime/` | Language runtime layers consumed by userspace (libc, ruststd) |
+| `services/` | Userspace OS processes: managers, drivers, filesystems, daemons |
+| `shared/` | Shared utility crates |
+| `xtask/` | Build task runner (`cargo xtask`); custom target JSON specs under `xtask/targets/` |
 
 ## Usage
 
@@ -64,7 +52,7 @@ cargo xtask test                         # run all workspace tests on the host
 For kernel testing, set `init=ktest` in `rootfs/esp/EFI/seraph/boot.conf`, then run
 `cargo xtask run`. ktest exercises every syscall through real trap/return
 paths, runs cross-subsystem integration scenarios, and measures hardware
-cycle counts for key operations. See [ktest/README.md](ktest/README.md) for
+cycle counts for key operations. See [core/ktest/README.md](core/ktest/README.md) for
 authoritative detail.
 
 ---

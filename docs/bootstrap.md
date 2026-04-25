@@ -14,7 +14,7 @@ bootloader reads `boot.conf`, loads the kernel and init ELFs plus any boot
 modules, queries the UEFI memory map, builds initial page tables, calls
 `ExitBootServices`, populates `BootInfo`, and jumps to the kernel entry point.
 The sequence is specified in ten bootloader steps in
-[`boot/docs/boot-flow.md`](../boot/docs/boot-flow.md).
+[`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).
 
 ---
 
@@ -23,7 +23,7 @@ The sequence is specified in ten bootloader steps in
 The bootloader hands control to the kernel at a single entry-point symbol
 with `BootInfo` supplied by register. The CPU state and register contents
 at this gate are specified in
-[`boot/docs/kernel-handoff.md`](../boot/docs/kernel-handoff.md); the
+[`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md); the
 `BootInfo` layout and `BOOT_PROTOCOL_VERSION` contract are owned by the
 [`abi/boot-protocol/`](../abi/boot-protocol/) crate.
 
@@ -34,7 +34,7 @@ at this gate are specified in
 The kernel runs ten numbered phases (kernel phase 0 through kernel phase 9)
 from entry-point validation to scheduler handoff. Authoritative enumeration
 and per-phase failure behavior are in
-[`kernel/docs/initialization.md`](../kernel/docs/initialization.md). Phase 7
+[`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md). Phase 7
 is the capability-minting phase: the kernel synthesizes the initial
 capability set from `BootInfo.platform_resources` and populates init's root
 CSpace. Downstream documents
@@ -52,7 +52,7 @@ address space, creates init's initial thread, and enters userspace. The
 init-image contract is specified by the `InitImage` type in the
 [`abi/boot-protocol/`](../abi/boot-protocol/) crate; the kernel side of
 the handoff is the last phase in
-[`kernel/docs/initialization.md`](../kernel/docs/initialization.md). The
+[`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md). The
 kernel's only baked-in knowledge of userspace is this handoff — it has no
 notion of `init`, `procmgr`, or any other userspace role beyond starting
 whatever binary was staged in the init slot.
@@ -65,10 +65,10 @@ The init binary starts procmgr via raw syscalls (no IPC yet), requests
 procmgr to start the remaining early services (devmgr, svcmgr, drivers,
 vfsd, optionally netd), delegates the appropriate subsets of its initial
 capability set to each service, registers services with svcmgr, and exits.
-Role-level description is in [`init/README.md`](../init/README.md);
+Role-level description is in [`services/init/README.md`](../services/init/README.md);
 authoritative stage enumeration lives in
-[`init/docs/bootstrap.md`](../init/docs/bootstrap.md). Alternative init
-binaries (for example [`ktest/README.md`](../ktest/README.md)) may occupy
+[`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md). Alternative init
+binaries (for example [`core/ktest/README.md`](../core/ktest/README.md)) may occupy
 the init slot for specialized purposes and follow their own bootstrap
 shape.
 
@@ -79,7 +79,7 @@ shape.
 Once init exits, svcmgr is the resident supervisor: it monitors registered
 services, handles restarts, and holds the direct process-creation
 capabilities needed to recover procmgr itself. See
-[`svcmgr/README.md`](../svcmgr/README.md).
+[`services/svcmgr/README.md`](../services/svcmgr/README.md).
 
 ---
 

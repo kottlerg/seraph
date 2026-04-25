@@ -19,17 +19,17 @@ bootloader.
 
 The compile-time view of what each phase of boot establishes, and the
 sequence of steps the reference bootloader takes, is documented at the
-component level in [`boot/docs/`](../../boot/docs/) — particularly
-[`boot/docs/kernel-handoff.md`](../../boot/docs/kernel-handoff.md) for the
+component level in [`boot/docs/`](../../core/boot/docs/) — particularly
+[`boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md) for the
 CPU-state contract at entry, and
-[`boot/docs/boot-flow.md`](../../boot/docs/boot-flow.md) for the ten-step
+[`boot/docs/boot-flow.md`](../../core/boot/docs/boot-flow.md) for the ten-step
 sequence.
 
 ---
 
 ## Compliant Bootloader
 
-The Seraph bootloader in [`boot/`](../../boot/) is the **reference
+The Seraph bootloader in [`boot/`](../../core/boot/) is the **reference
 implementation**. Any compliant bootloader that satisfies the contract
 defined by this crate — the `BootInfo` layout, the
 `BOOT_PROTOCOL_VERSION` check, and the CPU/memory state at kernel entry
@@ -55,7 +55,7 @@ A compliant bootloader MUST, before jumping to the kernel entry point:
 - Guarantee that the `BootInfo` structure and all referenced data
   remain mapped and readable at kernel entry.
 - Establish the CPU state documented in
-  [`boot/docs/kernel-handoff.md`](../../boot/docs/kernel-handoff.md)
+  [`boot/docs/kernel-handoff.md`](../../core/boot/docs/kernel-handoff.md)
   for the target architecture.
 
 A compliant bootloader MUST NOT:
@@ -71,16 +71,16 @@ A compliant bootloader MUST NOT:
 
 ## Summarized By
 
-[README.md](../../README.md), [boot/README.md](../../boot/README.md),
+[README.md](../../README.md), [core/boot/README.md](../../core/boot/README.md),
 [docs/bootstrap.md](../../docs/bootstrap.md),
 [docs/build-system.md](../../docs/build-system.md),
 [docs/architecture.md](../../docs/architecture.md),
 [docs/memory-model.md](../../docs/memory-model.md),
 [docs/device-management.md](../../docs/device-management.md),
-[kernel/README.md](../../kernel/README.md),
-[kernel/docs/initialization.md](../../kernel/docs/initialization.md),
-[init/README.md](../../init/README.md),
-[procmgr/README.md](../../procmgr/README.md),
-[devmgr/README.md](../../devmgr/README.md),
+[core/kernel/README.md](../../core/kernel/README.md),
+[core/kernel/docs/initialization.md](../../core/kernel/docs/initialization.md),
+[services/init/README.md](../../services/init/README.md),
+[services/procmgr/README.md](../../services/procmgr/README.md),
+[services/devmgr/README.md](../../services/devmgr/README.md),
 [shared/elf/README.md](../../shared/elf/README.md),
 [abi/init-protocol/README.md](../init-protocol/README.md)

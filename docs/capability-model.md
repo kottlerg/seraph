@@ -143,7 +143,7 @@ There is one SchedControl capability, created at boot. Init holds it and delegat
 derived copies to services that need real-time-ish scheduling (e.g. audio servers,
 device managers). Without a SchedControl capability, a process can only set thread
 priorities in the normal range. For priority levels, ranges, and constants, see
-[kernel/docs/scheduler.md § Priority Levels](../kernel/docs/scheduler.md#priority-levels).
+[core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
 
 ---
 
@@ -284,4 +284,4 @@ The kernel does not provide:
 
 ## Summarized By
 
-[Architecture Overview](architecture.md), [init](../init/README.md)
+[Architecture Overview](architecture.md), [init](../services/init/README.md)

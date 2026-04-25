@@ -10,10 +10,10 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-ipc = { path = "../shared/ipc" }
-syscall = { path = "../shared/syscall" }
-syscall-abi = { path = "../abi/syscall" }
-registry = { path = "../shared/registry" }
+ipc = { path = "../../shared/ipc" }
+syscall = { path = "../../shared/syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+registry = { path = "../../shared/registry" }
 
 [lints]
 workspace = true

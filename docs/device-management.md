@@ -168,4 +168,4 @@ managed by init's bootstrap sequence (for early boot) and svcmgr (for restarts).
 
 ## Summarized By
 
-[Architecture Overview](architecture.md), [devmgr](../devmgr/README.md), [drivers](../drivers/README.md)
+[Architecture Overview](architecture.md), [devmgr](../services/devmgr/README.md), [drivers](../services/drivers/README.md)

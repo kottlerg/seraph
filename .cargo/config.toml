@@ -16,7 +16,7 @@ xtask = "run --package xtask --release --"
 json-target-spec = true
 
 [env]
-RUST_TARGET_PATH = { value = "targets", relative = true }
+RUST_TARGET_PATH = { value = "xtask/targets", relative = true }
 
 [build]
 rustflags = ["-Zunstable-options"]
@@ -27,6 +27,6 @@ rustflags = ["-Zunstable-options"]
 [target.riscv64gc-seraph-uefi]
 rustflags = [
     "-Zunstable-options",
-    "-C", "link-arg=-Tboot/linker/riscv64-uefi.ld",
+    "-C", "link-arg=-Tcore/boot/linker/riscv64-uefi.ld",
     "-C", "jump-tables=no",
 ]

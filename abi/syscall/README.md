@@ -12,7 +12,7 @@ increment the kernel version major or minor field accordingly.
 Both the kernel and all userspace components import this crate. The bootloader
 does not.
 
-See [kernel/docs/syscalls.md](../../kernel/docs/syscalls.md) for the full
+See [core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md) for the full
 specification — per-syscall semantics, argument layouts, error conditions, and
 calling convention.
 

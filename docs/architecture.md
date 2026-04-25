@@ -142,10 +142,10 @@ The end-to-end boot lifecycle — power-on through svcmgr handover — is
 summarized in [`bootstrap.md`](bootstrap.md). Authoritative enumerations
 live in the component scope:
 
-- Bootloader steps 1–10 — [`boot/docs/boot-flow.md`](../boot/docs/boot-flow.md).
-- Kernel phases 0–9 — [`kernel/docs/initialization.md`](../kernel/docs/initialization.md).
-- init's userspace bootstrap — [`init/README.md`](../init/README.md) and
-  [`init/docs/bootstrap.md`](../init/docs/bootstrap.md).
+- Bootloader steps 1–10 — [`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).
+- Kernel phases 0–9 — [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md).
+- init's userspace bootstrap — [`services/init/README.md`](../services/init/README.md) and
+  [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md).
 
 Boot modules (procmgr, devmgr, drivers, etc.) are configurable via `boot.conf`
 per [`abi/boot-protocol/`](../abi/boot-protocol/); the minimum set is procmgr, devmgr,
@@ -235,5 +235,5 @@ Seraph does not aim to run Linux or other OS binaries.
 
 ## Summarized By
 
-[README.md](../README.md), [init/README.md](../init/README.md)
+[README.md](../README.md), [init/README.md](../services/init/README.md)
 

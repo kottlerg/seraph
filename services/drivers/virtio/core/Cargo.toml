@@ -9,8 +9,8 @@ test = false
 doctest = false
 
 [dependencies]
-ipc = { path = "../../../shared/ipc" }
-mmio = { path = "../../../shared/mmio" }
+ipc = { path = "../../../../shared/ipc" }
+mmio = { path = "../../../../shared/mmio" }
 
 [lints]
 workspace = true

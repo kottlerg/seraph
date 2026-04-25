@@ -105,7 +105,7 @@ pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
         );
     }
 
-    let overlay_root = ctx.root.join("ruststd").join("src");
+    let overlay_root = ctx.root.join("runtime").join("ruststd").join("src");
     if !overlay_root.exists()
     {
         bail!(
@@ -277,7 +277,7 @@ fn hard_link_tree(src: &Path, dst: &Path) -> Result<()>
 }
 
 /// Identity string for the mirror. Combines the underlying rustc version
-/// with a content fingerprint for the overlay sources (`ruststd/`) and
+/// with a content fingerprint for the overlay sources (`runtime/ruststd/`) and
 /// the patch logic (`xtask/src/rust_src.rs`). Any change to those
 /// invalidates the mirror, triggering a clean rebuild.
 fn compute_stamp(real: &Path, overlay_root: &Path, project_root: &Path) -> Result<String>
@@ -530,8 +530,10 @@ fn install_ws_clippy_wrapper(real: &Path, mirror: &Path) -> Result<()>
 fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
 {
     let rust_src = mirror.join("lib/rustlib/src/rust");
+    // overlay_root = <project_root>/runtime/ruststd/src — walk up 3 levels.
     let project_root = overlay_root
         .parent()
+        .and_then(Path::parent)
         .and_then(Path::parent)
         .context("deriving project root from overlay_root")?;
     apply_sys_visibility_overlay(&rust_src).context("sys visibility overlay")?;
@@ -737,7 +739,7 @@ fn apply_random_overlay(rust_src: &Path) -> Result<()>
 
 /// Route `std::sys::args` through a seraph module that reads argv from
 /// the read-only ProcessInfo page. See
-/// `ruststd/src/sys/args/seraph.rs` for the backing.
+/// `runtime/ruststd/src/sys/args/seraph.rs` for the backing.
 fn apply_args_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 {
     let args_dir = rust_src.join("library/std/src/sys/args");
@@ -760,7 +762,7 @@ fn apply_args_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 
 /// Route `std::sys::process` through a seraph module that implements
 /// `Command::spawn` via procmgr `CREATE_FROM_VFS` plus death notifications
-/// bound to the child's main thread. See `ruststd/src/sys/process/seraph.rs`.
+/// bound to the child's main thread. See `runtime/ruststd/src/sys/process/seraph.rs`.
 fn apply_process_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 {
     let process_dir = rust_src.join("library/std/src/sys/process");
@@ -782,7 +784,7 @@ fn apply_process_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 }
 
 /// Route `std::sys::env` through a seraph module that owns a process-global
-/// `Mutex<BTreeMap<OsString, OsString>>`. See `ruststd/src/sys/env/seraph.rs`.
+/// `Mutex<BTreeMap<OsString, OsString>>`. See `runtime/ruststd/src/sys/env/seraph.rs`.
 fn apply_env_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 {
     let env_dir = rust_src.join("library/std/src/sys/env");

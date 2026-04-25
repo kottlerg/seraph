@@ -1,18 +1,21 @@
 [package]
-name = "fatfs"
+name = "procmgr"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [[bin]]
-name = "fatfs"
+name = "procmgr"
 path = "src/main.rs"
 test = false
 
 [dependencies]
+process-abi = { path = "../../abi/process-abi" }
+elf = { path = "../../shared/elf" }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
+va_layout = { path = "../../shared/va_layout" }
 
 [lints]
 workspace = true

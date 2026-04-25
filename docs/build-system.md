@@ -48,7 +48,7 @@ single source of truth for the boot protocol ABI; the types, layout, and
 version invariants live in the crate itself at
 [`abi/boot-protocol/`](../abi/boot-protocol/), and the kernel-entry
 contract the ABI supports is in
-[`boot/docs/kernel-handoff.md`](../boot/docs/kernel-handoff.md).
+[`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md).
 
 `abi/syscall` defines syscall numbers, argument layout, and return codes. It is
 the single source of truth for the syscall ABI; both the kernel and userspace

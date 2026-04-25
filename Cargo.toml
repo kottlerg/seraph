@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "kernel",
-    "boot",
-    "init",
-    "ktest",
-    "procmgr",
-    "svcmgr",
-    "devmgr",
-    "vfsd",
-    "drivers/virtio/core",
-    "drivers/virtio/blk",
-    "fs/fat",
+    "core/kernel",
+    "core/boot",
+    "core/ktest",
+    "services/init",
+    "services/procmgr",
+    "services/svcmgr",
+    "services/devmgr",
+    "services/vfsd",
+    "services/drivers/virtio/core",
+    "services/drivers/virtio/blk",
+    "services/fs/fat",
     "abi/boot-protocol",
     "abi/init-protocol",
     "abi/process-abi",
@@ -55,7 +55,7 @@ font = { path = "shared/font" }
 mmio = { path = "shared/mmio" }
 syscall = { path = "abi/syscall", package = "syscall-abi" }
 syscall-abi = { path = "abi/syscall" }
-virtio-core = { path = "drivers/virtio/core" }
+virtio-core = { path = "services/drivers/virtio/core" }
 
 [profile.dev]
 panic = "abort"

@@ -231,6 +231,14 @@ pub fn run_all(ctx: &TestContext)
         "ipc::recv_snapshot_survives_buffer_clobber",
         ipc::recv_snapshot_survives_buffer_clobber(ctx)
     );
+    run_test!(
+        "ipc::reply_oom_keeps_caller_blocked",
+        ipc::reply_oom_keeps_caller_blocked(ctx)
+    );
+    run_test!(
+        "ipc::recv_oom_returns_cleanly",
+        ipc::recv_oom_returns_cleanly(ctx)
+    );
 
     // ── Thread syscalls ───────────────────────────────────────────────────────
     run_test!("thread::configure_start", thread::configure_start(ctx));

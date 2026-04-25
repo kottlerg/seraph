@@ -38,6 +38,8 @@ static mut DATA_WORDS_STACK: ChildStack = ChildStack::ZERO;
 static mut CAP_XFER_STACK: ChildStack = ChildStack::ZERO;
 static mut TOKEN_STACK: ChildStack = ChildStack::ZERO;
 static mut SNAPSHOT_STACK: ChildStack = ChildStack::ZERO;
+static mut REPLY_OOM_STACK: ChildStack = ChildStack::ZERO;
+static mut RECV_OOM_STACK: ChildStack = ChildStack::ZERO;
 
 // ── SYS_IPC_CALL / SYS_IPC_RECV / SYS_IPC_REPLY ─────────────────────────────
 
@@ -755,5 +757,255 @@ fn snapshot_caller_entry(arg: u64) -> !
         Ok(_) => signal_send(done_slot, 0xDEAD).ok(),
         Err(_) => signal_send(done_slot, 0xBAD).ok(),
     };
+    thread_exit()
+}
+
+// ── sys_ipc_reply cap-transfer OOM regression ────────────────────────────────
+
+/// Server's cap-bearing `ipc_reply` to a caller whose `CSpace` is full
+/// must return `OutOfMemory` *and* leave the caller still `BlockedOnReply`,
+/// so that a subsequent no-cap `ipc_reply` from the same server still
+/// resolves the call cleanly.
+///
+/// Without the kernel fix, the first reply runs `endpoint_reply` (which
+/// flips the caller to `Ready` and clears `(*server).reply_tcb`) before
+/// the cap-transfer OOM is caught — wedging the caller in `Ready`/off-
+/// runqueue and leaving the server with no reply target. The second
+/// reply would then see a null `reply_tcb` and return `InvalidCapability`,
+/// and the child's `done` signal would never arrive. With the fix the
+/// caller's `CSpace` is pre-allocated before `endpoint_reply`, so the
+/// first reply fails atomically with no IPC state mutated, and the retry
+/// succeeds.
+pub fn reply_oom_keeps_caller_blocked(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for reply_oom test failed")?;
+    let ready =
+        cap_create_signal().map_err(|_| "cap_create_signal(ready) for reply_oom test failed")?;
+    let done =
+        cap_create_signal().map_err(|_| "cap_create_signal(done) for reply_oom test failed")?;
+    // Extra signal we will try to transfer in the cap-bearing reply. Created
+    // in the server's CSpace; the failing reply must leave it untouched.
+    let xfer =
+        cap_create_signal().map_err(|_| "cap_create_signal(xfer) for reply_oom test failed")?;
+
+    // Small child CSpace: the child consumes its remaining headroom by
+    // creating signals until full so that pre_allocate(1) on the reply path
+    // returns OutOfMemory.
+    let child_cs =
+        cap_create_cspace(8).map_err(|_| "cap_create_cspace for reply_oom test failed")?;
+    let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
+        .map_err(|_| "cap_copy ep for reply_oom test failed")?;
+    let child_ready = cap_copy(ready, child_cs, 1 << 7)
+        .map_err(|_| "cap_copy ready for reply_oom test failed")?;
+    let child_done =
+        cap_copy(done, child_cs, 1 << 7).map_err(|_| "cap_copy done for reply_oom test failed")?;
+
+    let child_arg =
+        u64::from(child_ep) | (u64::from(child_ready) << 16) | (u64::from(child_done) << 32);
+
+    let child_th = cap_create_thread(ctx.aspace_cap, child_cs)
+        .map_err(|_| "cap_create_thread for reply_oom test failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(REPLY_OOM_STACK));
+    thread_configure(
+        child_th,
+        reply_oom_caller_entry as *const () as u64,
+        stack_top,
+        child_arg,
+    )
+    .map_err(|_| "thread_configure for reply_oom test failed")?;
+    thread_start(child_th).map_err(|_| "thread_start for reply_oom test failed")?;
+
+    // Wait until the child has filled its CSpace and is about to ipc_call.
+    let ready_bits = signal_wait(ready).map_err(|_| "signal_wait(ready) for reply_oom failed")?;
+    if ready_bits != 0x1
+    {
+        return Err("reply_oom: child reported failure filling its CSpace");
+    }
+
+    // Receive the child's call. No caps in the incoming message, so the
+    // server-side `pre_allocate(MSG_CAP_SLOTS_MAX)` succeeds.
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map_err(|_| "ipc_recv for reply_oom test failed")?;
+    if msg.label != 0xCAFE
+    {
+        return Err("reply_oom: ipc_recv returned wrong label");
+    }
+
+    // Try a cap-bearing reply. Child's CSpace is full, so the kernel's
+    // pre_allocate on the caller side must fail before any IPC state
+    // mutates, returning OutOfMemory.
+    let cap_reply = IpcMessage::builder(0xBEEF).cap(xfer).build();
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    let first_attempt = unsafe { ipc::ipc_reply(&cap_reply, ctx.ipc_buf) };
+    match first_attempt
+    {
+        Err(code) if code == syscall_abi::SyscallError::OutOfMemory as i64 =>
+        {}
+        Err(_) => return Err("reply_oom: cap-bearing reply returned wrong error code"),
+        Ok(()) => return Err("reply_oom: cap-bearing reply succeeded unexpectedly"),
+    }
+
+    // Retry without caps. The fix guarantees `(*server).reply_tcb` was not
+    // cleared by the failed first attempt, so the child is still
+    // BlockedOnReply and this reply must succeed.
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_reply(&IpcMessage::new(0xBEEF), ctx.ipc_buf) }
+        .map_err(|_| "reply_oom: no-cap retry reply failed")?;
+
+    let done_bits = signal_wait(done).map_err(|_| "signal_wait(done) for reply_oom failed")?;
+    if done_bits != 0xDEAD
+    {
+        return Err("reply_oom: child did not see the retry reply");
+    }
+
+    cap_delete(child_th).ok();
+    cap_delete(ep).ok();
+    cap_delete(ready).ok();
+    cap_delete(done).ok();
+    cap_delete(xfer).ok();
+    cap_delete(child_cs).ok();
+    Ok(())
+}
+
+/// Child for `reply_oom_keeps_caller_blocked`: registers IPC buffer, fills
+/// its own `CSpace`, signals readiness, then issues an `ipc_call`. Reports
+/// success when the server's eventual no-cap reply arrives.
+fn reply_oom_caller_entry(arg: u64) -> !
+{
+    let ep_slot = (arg & 0xFFFF) as u32;
+    let ready_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let done_slot = ((arg >> 32) & 0xFFFF) as u32;
+
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        signal_send(ready_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    // Saturate the child's CSpace so the server-side reply's caller-CSpace
+    // pre_allocate must fail. Bounded loop guards against an unbounded
+    // CSpace if the test setup ever changes.
+    for _ in 0..1024
+    {
+        if cap_create_signal().is_err()
+        {
+            break;
+        }
+    }
+    if cap_create_signal().is_ok()
+    {
+        // Still has free slots — test setup did not actually fill the CSpace.
+        signal_send(ready_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    signal_send(ready_slot, 0x1).ok();
+
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    let reply = unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(0xCAFE), buf_addr as *mut u64) };
+    match reply
+    {
+        Ok(msg) =>
+        {
+            let bits = if msg.label == 0xBEEF { 0xDEAD } else { 0xBAD };
+            signal_send(done_slot, bits).ok();
+        }
+        Err(_) =>
+        {
+            signal_send(done_slot, 0xBAD).ok();
+        }
+    }
+    thread_exit()
+}
+
+// ── sys_ipc_recv cap-transfer OOM regression ─────────────────────────────────
+
+/// `sys_ipc_recv` on a thread whose `CSpace` cannot absorb
+/// `MSG_CAP_SLOTS_MAX` more caps must return `OutOfMemory` cleanly without
+/// blocking on the recv queue, so the recv-side cap-transfer OOM cannot
+/// wedge any IPC participant.
+///
+/// Verifies the symmetric pre-allocation hoisted to the top of
+/// `sys_ipc_recv`. The victim thread fills its own `CSpace`, then issues
+/// `ipc_recv`. With the fix the syscall returns `OutOfMemory` immediately;
+/// without the fix the victim would either block on the recv queue or hit
+/// the bug only when caps actually arrive.
+pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for recv_oom test failed")?;
+    let done =
+        cap_create_signal().map_err(|_| "cap_create_signal(done) for recv_oom test failed")?;
+
+    let victim_cs =
+        cap_create_cspace(8).map_err(|_| "cap_create_cspace for recv_oom test failed")?;
+    let victim_ep = cap_copy(ep, victim_cs, syscall_abi::RIGHTS_RECEIVE)
+        .map_err(|_| "cap_copy ep for recv_oom test failed")?;
+    let victim_done =
+        cap_copy(done, victim_cs, 1 << 7).map_err(|_| "cap_copy done for recv_oom test failed")?;
+    let victim_arg = u64::from(victim_ep) | (u64::from(victim_done) << 16);
+
+    let victim_th = cap_create_thread(ctx.aspace_cap, victim_cs)
+        .map_err(|_| "cap_create_thread for recv_oom test failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_OOM_STACK));
+    thread_configure(
+        victim_th,
+        recv_oom_victim_entry as *const () as u64,
+        stack_top,
+        victim_arg,
+    )
+    .map_err(|_| "thread_configure for recv_oom test failed")?;
+    thread_start(victim_th).map_err(|_| "thread_start for recv_oom test failed")?;
+
+    let bits = signal_wait(done).map_err(|_| "signal_wait(done) for recv_oom failed")?;
+    if bits != 0xDEAD
+    {
+        return Err("recv_oom: victim did not see OutOfMemory from ipc_recv");
+    }
+
+    cap_delete(victim_th).ok();
+    cap_delete(ep).ok();
+    cap_delete(done).ok();
+    cap_delete(victim_cs).ok();
+    Ok(())
+}
+
+/// Victim for `recv_oom_returns_cleanly`: fills its `CSpace` then issues
+/// `ipc_recv`. Reports `0xDEAD` if the syscall returns `OutOfMemory`
+/// (post-fix behavior), `0xBAD` otherwise.
+fn recv_oom_victim_entry(arg: u64) -> !
+{
+    let ep_slot = (arg & 0xFFFF) as u32;
+    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+
+    let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
+    if syscall::ipc_buffer_set(buf_addr).is_err()
+    {
+        signal_send(done_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    for _ in 0..1024
+    {
+        if cap_create_signal().is_err()
+        {
+            break;
+        }
+    }
+    if cap_create_signal().is_ok()
+    {
+        signal_send(done_slot, 0xBAD).ok();
+        thread_exit()
+    }
+
+    // SAFETY: buf_addr was registered as this thread's IPC buffer above.
+    let result = unsafe { ipc::ipc_recv(ep_slot, buf_addr as *mut u64) };
+    let bits = match result
+    {
+        Err(code) if code == syscall_abi::SyscallError::OutOfMemory as i64 => 0xDEAD,
+        _ => 0xBAD,
+    };
+    signal_send(done_slot, bits).ok();
     thread_exit()
 }

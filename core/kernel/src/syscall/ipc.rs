@@ -479,6 +479,19 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*ep_obj).state
     };
 
+    // Pre-allocate server's CSpace for the worst-case incoming cap_count
+    // (`MSG_CAP_SLOTS_MAX`) before either delivery path can transition any
+    // IPC state. `endpoint_recv` flips the caller from BlockedOnSend to
+    // BlockedOnReply on the immediate-delivery path; a later cap-transfer
+    // OOM would leave the caller stuck in BlockedOnReply with no message
+    // ever reaching the server. By pre-growing the destination here, the
+    // immediate-delivery cap transfer cannot OOM, and the resumed-recv path
+    // gets the same guarantee modulo the existing race window covered by
+    // `transfer_caps`'s inner pre_allocate.
+    // SAFETY: cspace_ptr validated above.
+    unsafe { (*cspace_ptr).pre_allocate(MSG_CAP_SLOTS_MAX) }
+        .map_err(|_| SyscallError::OutOfMemory)?;
+
     // SAFETY: ep_state extracted from validated Endpoint object; scheduler lock not held.
     let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
 
@@ -488,9 +501,10 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: tcb validated above.
         let server_buf = unsafe { (*tcb).ipc_buffer };
 
-        // Transfer caps from caller to server (if any).
-        // On failure: all-or-nothing — return error. Caller stays blocked
-        // on reply (TODO: for robustness, re-enqueue caller on send queue).
+        // Transfer caps from caller to server (if any). The pre_allocate
+        // above guarantees the destination has the worst-case headroom; the
+        // `?` propagation here is now reachable only on the unlocked race
+        // window covered by the inner pre_allocate inside `transfer_caps`.
         if msg.cap_count > 0
         {
             // SAFETY: caller returned by endpoint_recv; is valid TCB.
@@ -637,6 +651,30 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         msg.cap_slots = indices;
         msg.cap_count = cap_count;
+
+        // Pre-allocate caller's CSpace destination slots before transitioning
+        // its state. `endpoint_reply` atomically moves the caller from
+        // BlockedOnReply to Ready and clears (*server).reply_tcb; if cap
+        // transfer were to fail after that, the caller would be Ready but
+        // never enqueued and unreachable by cancel_ipc_block. Pre-allocating
+        // here guarantees the post-`endpoint_reply` cap move cannot OOM.
+        // The inner pre_allocate inside `transfer_caps` remains as
+        // defense-in-depth against concurrent CSpace mutation in the
+        // unlocked window before its dst-CSpace lock acquisition.
+        // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
+        let caller_peek = unsafe { (*tcb).reply_tcb };
+        if caller_peek.is_null()
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+        // SAFETY: caller_peek non-null; magic check guards UAF in debug builds.
+        debug_assert!(unsafe { (*caller_peek).magic } == crate::sched::thread::TCB_MAGIC);
+        // SAFETY: caller_peek is a valid TCB; cspace is set at TCB creation
+        // and never reassigned.
+        let caller_cspace = unsafe { (*caller_peek).cspace };
+        // SAFETY: caller_cspace extracted from valid TCB.
+        unsafe { (*caller_cspace).pre_allocate(cap_count) }
+            .map_err(|_| SyscallError::OutOfMemory)?;
     }
 
     // SAFETY: tcb validated above; endpoint_reply operates on reply_tcb field.

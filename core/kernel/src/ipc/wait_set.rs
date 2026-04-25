@@ -253,6 +253,30 @@ pub unsafe fn waitset_wait(
         return Ok(token);
     }
 
+    // Level-state self-heal. Source notifications are edge-triggered:
+    // `endpoint_call` fires `waitset_notify` only on the empty→non-empty
+    // send-queue transition, and `event_queue_post` only on the
+    // empty→non-empty count transition. A second event arriving while a
+    // first is still queued does NOT fire a notify, and would otherwise
+    // be invisible to a consumer that processes one item per wakeup and
+    // returns here. Walk the registered members and return the first
+    // source that is level-ready right now; symmetric with the level
+    // check already performed in `waitset_add`.
+    for idx in 0..ws.members.len()
+    {
+        let (source_ptr, source_tag, token) = match ws.members[idx].as_ref()
+        {
+            Some(m) => (m.source_ptr, m.source_tag, m.token),
+            None => continue,
+        };
+        // SAFETY: source_ptr was registered via waitset_add and outlives
+        // the wait set (caller's CSpace still holds the cap).
+        if unsafe { source_is_ready(source_ptr, source_tag) }
+        {
+            return Ok(token);
+        }
+    }
+
     // Nothing ready — block caller.
     //
     // Clear context_saved before making the thread visible as a waiter.

@@ -38,6 +38,11 @@ const REGISTRY_CAPACITY: usize = 8;
 /// Reads name, policy, criticality from data words. Reads `thread_cap`,
 /// `module_cap`, `log_ep` from transferred caps. Creates an event queue, binds
 /// it to the thread, adds to the wait set.
+///
+/// Two restart sources are supported, distinguished by `vfs_path_len` in
+/// label bits [32..48]:
+///   - module-loaded (`vfs_path_len` == 0): caps = [thread, module, optional bundle]
+///   - VFS-loaded    (`vfs_path_len`  > 0): caps = [thread, optional bundle]
 fn handle_register(
     msg: &IpcMessage,
     services: &mut [ServiceEntry; MAX_SERVICES],
@@ -47,7 +52,12 @@ fn handle_register(
 {
     let label = msg.label;
     let name_len = ((label >> 16) & 0xFFFF) as usize;
+    let vfs_path_len = ((label >> 32) & 0xFFFF) as usize;
     if name_len == 0 || name_len > 32
+    {
+        return ipc::svcmgr_errors::INVALID_NAME;
+    }
+    if vfs_path_len > ipc::MAX_PATH_LEN
     {
         return ipc::svcmgr_errors::INVALID_NAME;
     }
@@ -65,27 +75,38 @@ fn handle_register(
     let name_words = name_len.div_ceil(8);
     let bundle_name_len_word = 2 + name_words;
     let bundle_name_len = msg.word(bundle_name_len_word) as usize;
+    let bundle_name_words = bundle_name_len.div_ceil(8);
 
-    // Read transferred caps. Layout:
-    //   cap[0] = thread
-    //   cap[1] = module
-    //   cap[2] = optional bundle cap (named by the tail-word `bundle_name_len`)
-    // log endpoint is delivered via `ProcessInfo`, not this protocol.
+    // VFS path (when present) is tail-packed after the bundle-name tail.
+    let vfs_path_word = bundle_name_len_word + 1 + bundle_name_words;
+    let vfs_loaded = vfs_path_len > 0;
+
     let recv_caps = msg.caps();
     let cap_count = recv_caps.len();
 
-    if cap_count < 2
+    if cap_count < 1
     {
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
 
     let thread_cap = recv_caps[0];
-    let module_cap = recv_caps[1];
-
-    if thread_cap == 0 || module_cap == 0
+    if thread_cap == 0
     {
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
+
+    let (module_cap, bundle_cap_idx) = if vfs_loaded
+    {
+        (0u32, 1usize)
+    }
+    else
+    {
+        if cap_count < 2 || recv_caps[1] == 0
+        {
+            return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
+        }
+        (recv_caps[1], 2usize)
+    };
 
     let Some(eq_cap) = create_and_bind_event_queue(thread_cap, ws_cap, *service_count)
     else
@@ -93,12 +114,20 @@ fn handle_register(
         return ipc::svcmgr_errors::EVENT_QUEUE_FAILED;
     };
 
+    let mut vfs_path_buf = [0u8; ipc::MAX_PATH_LEN];
+    if vfs_loaded
+    {
+        read_path_bytes(msg, vfs_path_word, vfs_path_len, &mut vfs_path_buf);
+    }
+
     let idx = *service_count;
     services[idx] = ServiceEntry {
         name,
         name_len: name_len as u8,
         thread_cap,
         module_cap,
+        vfs_path: vfs_path_buf,
+        vfs_path_len: vfs_path_len as u8,
         bundle: [registry::Entry {
             name: [0; registry::NAME_MAX],
             name_len: 0,
@@ -115,8 +144,8 @@ fn handle_register(
     };
 
     // If a bundle cap was sent alongside, stash it in the first bundle slot.
-    if cap_count >= 3
-        && recv_caps[2] != 0
+    if cap_count > bundle_cap_idx
+        && recv_caps[bundle_cap_idx] != 0
         && bundle_name_len > 0
         && bundle_name_len <= registry::NAME_MAX
     {
@@ -124,7 +153,7 @@ fn handle_register(
         let entry = &mut services[idx].bundle[0];
         entry.name[..bundle_name_len].copy_from_slice(&bundle_name[..bundle_name_len]);
         entry.name_len = bundle_name_len as u8;
-        entry.cap = recv_caps[2];
+        entry.cap = recv_caps[bundle_cap_idx];
         services[idx].bundle_count = 1;
     }
 
@@ -161,6 +190,25 @@ fn read_tail_name_from_msg(
         }
     }
     out
+}
+
+/// Unpack `path_len` bytes from IPC data words starting at `first_word`
+/// into `out`. Caller must ensure `path_len <= out.len()`.
+fn read_path_bytes(msg: &IpcMessage, first_word: usize, path_len: usize, out: &mut [u8])
+{
+    let words = path_len.div_ceil(8);
+    for w in 0..words
+    {
+        let word = msg.word(first_word + w);
+        for b in 0..8
+        {
+            let idx = w * 8 + b;
+            if idx < path_len && idx < out.len()
+            {
+                out[idx] = (word >> (b * 8)) as u8;
+            }
+        }
+    }
 }
 
 /// Read a service name from message data words starting at offset 2.

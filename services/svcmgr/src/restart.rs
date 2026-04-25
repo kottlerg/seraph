@@ -100,9 +100,9 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
         return false;
     }
 
-    if svc.module_cap == 0
+    if svc.module_cap == 0 && svc.vfs_path_len == 0
     {
-        std::os::seraph::log!("no module cap, cannot restart");
+        std::os::seraph::log!("no restart source (module or vfs_path), cannot restart");
         return false;
     }
 
@@ -194,11 +194,11 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
     rebind_death_notification(svc, ctx.ws_cap, new_thread_cap)
 }
 
-/// Send `CREATE_PROCESS` to procmgr. Returns `(process_handle, thread, child_token)`.
+/// Spawn a fresh instance of `svc` via procmgr. Branches on the recorded
+/// restart source: VFS path → `CREATE_FROM_VFS`; module cap →
+/// `CREATE_PROCESS`. Returns `(process_handle, thread, child_token)`.
 fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64)>
 {
-    let module_copy = syscall::cap_derive(svc.module_cap, syscall::RIGHTS_ALL).ok()?;
-
     // Allocate a fresh bootstrap token for this child.
     let child_token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
@@ -207,15 +207,32 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
     let tokened_creator =
         syscall::cap_derive_token(ctx.bootstrap_ep, syscall::RIGHTS_SEND, child_token).ok()?;
 
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(module_copy)
-        .cap(tokened_creator)
-        .build();
+    let create_msg = if svc.vfs_path_len > 0
+    {
+        let path_len = svc.vfs_path_len as usize;
+        let path_bytes = &svc.vfs_path[..path_len];
+        let label = procmgr_labels::CREATE_FROM_VFS | ((path_len as u64) << 16);
+        let path_words = path_len.div_ceil(8);
+        IpcMessage::builder(label)
+            .bytes(0, path_bytes)
+            .word_count(path_words)
+            .cap(tokened_creator)
+            .build()
+    }
+    else
+    {
+        let module_copy = syscall::cap_derive(svc.module_cap, syscall::RIGHTS_ALL).ok()?;
+        IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+            .cap(module_copy)
+            .cap(tokened_creator)
+            .build()
+    };
+
     // SAFETY: ctx.ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(ctx.procmgr_ep, &create_msg, ctx.ipc_buf) }.ok()?;
     if reply.label != 0
     {
-        std::os::seraph::log!("restart CREATE_PROCESS failed");
+        std::os::seraph::log!("restart create failed");
         return None;
     }
 

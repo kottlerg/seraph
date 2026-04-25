@@ -706,40 +706,37 @@ pub fn setup_and_start_svcmgr(
     );
 }
 
-/// Create crasher from its boot module (suspended).
-/// Returns `(process_handle, thread_cap, module_cap, child_token)`.
-pub fn create_crasher_suspended(
-    info: &InitInfo,
+/// Load `/bin/crasher` via `CREATE_FROM_VFS` (suspended). Returns
+/// `(process_handle, thread_cap, child_token)`. Restart goes through
+/// svcmgr's VFS-restart path; no module cap is held.
+pub fn create_crasher_suspended_from_vfs(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     ipc_buf: *mut u64,
-) -> Option<(u32, u32, u32, u64)>
+) -> Option<(u32, u32, u64)>
 {
-    if info.module_frame_count < 6
-    {
-        log("phase 3: no crasher module available");
-        return None;
-    }
-
-    let crasher_frame_cap = info.module_frame_base + 5;
-    let frame_for_procmgr = syscall::cap_derive(crasher_frame_cap, syscall::RIGHTS_ALL).ok()?;
+    let path: &[u8] = b"/bin/crasher";
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
-    let msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(frame_for_procmgr)
+    let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
+    let word_count = path_word_count(path);
+    let msg = IpcMessage::builder(label)
+        .bytes(0, path)
+        .word_count(word_count)
         .cap(tokened_creator)
         .build();
+
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
-        log("phase 3: crasher CREATE_PROCESS failed");
+        log("phase 3: crasher CREATE_FROM_VFS failed");
         return None;
     };
     if reply.label != 0
     {
-        log("phase 3: crasher CREATE_PROCESS error");
+        log("phase 3: crasher CREATE_FROM_VFS error");
         return None;
     }
 
@@ -753,31 +750,18 @@ pub fn create_crasher_suspended(
     let process_handle = reply_caps[0];
     let thread_cap = reply_caps[1];
 
-    log("phase 3: crasher created (suspended)");
-    Some((process_handle, thread_cap, crasher_frame_cap, child_token))
+    log("phase 3: crasher created (suspended) from /bin/crasher");
+    Some((process_handle, thread_cap, child_token))
 }
 
-/// Create usertest from its boot module (suspended), start it, and serve an
-/// empty terminal bootstrap round. usertest exits cleanly on completion and
-/// is not registered with svcmgr. log + procmgr caps arrive via
+/// Load `/bin/usertest` via `CREATE_FROM_VFS`, start it, and serve an empty
+/// terminal bootstrap round. usertest exits cleanly on completion and is
+/// not registered with svcmgr. log + procmgr caps arrive via
 /// `ProcessInfo`, so the round carries no caps.
-pub fn create_and_run_usertest(
-    info: &InitInfo,
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    ipc_buf: *mut u64,
-)
+pub fn create_and_run_usertest(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u64)
 {
-    if info.module_frame_count < 7
-    {
-        return;
-    }
-    let module_frame = info.module_frame_base + 6;
-    let Ok(frame_for_procmgr) = syscall::cap_derive(module_frame, syscall::RIGHTS_ALL)
-    else
-    {
-        return;
-    };
+    let path: &[u8] = b"/bin/usertest";
+    let path_words = path_word_count(path);
 
     let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
     else
@@ -798,19 +782,18 @@ pub fn create_and_run_usertest(
     let env_bytes = env_blob.len();
     let env_words = env_bytes.div_ceil(8);
 
-    // Layout: words 0..argv_words = argv blob, next word = env_bytes
-    // header, next env_words = env blob.
-    let label = procmgr_labels::CREATE_PROCESS
+    let label = procmgr_labels::CREATE_FROM_VFS
+        | ((path.len() as u64) << 16)
         | ((argv_bytes as u64) << 32)
         | ((u64::from(argv_count)) << 48)
         | ((u64::from(env_count)) << 56);
-    let data_count = argv_words + 1 + env_words;
+    let data_count = path_words + argv_words + 1 + env_words;
     let msg = IpcMessage::builder(label)
-        .bytes(0, argv)
-        .word(argv_words, env_bytes as u64)
-        .bytes(argv_words + 1, env_blob)
+        .bytes(0, path)
+        .bytes(path_words, argv)
+        .word(path_words + argv_words, env_bytes as u64)
+        .bytes(path_words + argv_words + 1, env_blob)
         .word_count(data_count)
-        .cap(frame_for_procmgr)
         .cap(tokened_creator)
         .build();
 
@@ -818,10 +801,12 @@ pub fn create_and_run_usertest(
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
     else
     {
+        log("phase 3: usertest CREATE_FROM_VFS failed");
         return;
     };
     if reply.label != 0
     {
+        log("phase 3: usertest CREATE_FROM_VFS error");
         return;
     }
 
@@ -898,6 +883,12 @@ pub fn start_and_bootstrap_crasher(
 }
 
 /// One service's registration data, passed to `register_service`.
+///
+/// Two restart sources are supported:
+///   - Module-loaded: pass `module_cap` (frame cap holding the ELF), leave
+///     `vfs_path` empty. svcmgr restarts via `CREATE_PROCESS`.
+///   - VFS-loaded: pass `vfs_path` (e.g. `b"/bin/crasher"`), leave
+///     `module_cap` zero. svcmgr restarts via `CREATE_FROM_VFS`.
 pub struct ServiceRegistration<'a>
 {
     pub name: &'a [u8],
@@ -910,17 +901,44 @@ pub struct ServiceRegistration<'a>
     /// re-injected into every restart of this service under the given name.
     pub bundle_name: &'a [u8],
     pub bundle_cap: u32,
+    /// VFS path for restart via `CREATE_FROM_VFS`. Empty for module-loaded
+    /// services. Mutually exclusive with `module_cap` at the protocol level
+    /// (presence is signalled by a non-zero `vfs_path_len` in the label).
+    pub vfs_path: &'a [u8],
 }
 
 /// Register a service with svcmgr via `REGISTER_SERVICE`.
+///
+/// Label layout:
+///   bits [0..16]  = opcode
+///   bits [16..32] = `name_len`
+///   bits [32..48] = `vfs_path_len` (0 = module-loaded, >0 = VFS-loaded)
+///
+/// Data layout (in order):
+///   word 0:                        `restart_policy`
+///   word 1:                        `criticality`
+///   words 2..:                     name bytes (`name_words`)
+///   word `bundle_name_len_word`:   `bundle_name_len`
+///   words ..:                      `bundle_name` bytes (`bundle_name_words`)
+///   words ..:                      `vfs_path` bytes (`vfs_path_words`; only
+///                                  when `vfs_path_len` > 0)
+///
+/// Cap layout depends on the load mode:
+///   module-loaded (`vfs_path_len` == 0): [thread, module, optional bundle]
+///   VFS-loaded    (`vfs_path_len`  > 0): [thread, optional bundle]
 pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistration)
 {
     let name_words = reg.name.len().div_ceil(8);
 
+    let vfs_loaded = !reg.vfs_path.is_empty();
+    let vfs_path_len = if vfs_loaded { reg.vfs_path.len() } else { 0 };
+    let vfs_path_words = vfs_path_len.div_ceil(8);
+
     // Bundle-name tail: [bundle_name_len, bundle_name_words...] packed after
     // the service name. Zero if no bundle cap is being sent.
     let bundle_name_len_word = 2 + name_words;
-    let include_bundle = reg.module_cap != 0
+    let has_restart_source = reg.module_cap != 0 || vfs_loaded;
+    let include_bundle = has_restart_source
         && reg.bundle_cap != 0
         && !reg.bundle_name.is_empty()
         && reg.bundle_name.len() <= 16;
@@ -933,9 +951,12 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
         0
     };
     let bundle_name_words = bundle_name_len.div_ceil(8);
+    let vfs_path_word = bundle_name_len_word + 1 + bundle_name_words;
 
-    let data_count = bundle_name_len_word + 1 + bundle_name_words;
-    let label = svcmgr_labels::REGISTER_SERVICE | ((reg.name.len() as u64) << 16);
+    let data_count = vfs_path_word + vfs_path_words;
+    let label = svcmgr_labels::REGISTER_SERVICE
+        | ((reg.name.len() as u64) << 16)
+        | ((vfs_path_len as u64) << 32);
 
     let mut builder = IpcMessage::builder(label)
         .word(0, u64::from(reg.restart_policy))
@@ -949,13 +970,17 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
             &reg.bundle_name[..bundle_name_len],
         );
     }
+    if vfs_path_len > 0
+    {
+        builder = builder.bytes(vfs_path_word, reg.vfs_path);
+    }
     builder = builder.word_count(data_count);
 
     if reg.thread_cap != 0
     {
         builder = builder.cap(reg.thread_cap);
     }
-    if reg.module_cap != 0
+    if !vfs_loaded && reg.module_cap != 0
     {
         builder = builder.cap(reg.module_cap);
     }
@@ -1136,11 +1161,11 @@ pub fn phase3_svcmgr_handover(
         ipc_buf,
     );
 
-    let crasher = create_crasher_suspended(info, procmgr_ep, bootstrap_ep, ipc_buf);
+    let crasher = create_crasher_suspended_from_vfs(procmgr_ep, bootstrap_ep, ipc_buf);
 
     log("phase 3: registering services with svcmgr");
 
-    if let Some((crasher_handle, crasher_thread, crasher_module, crasher_token)) = crasher
+    if let Some((crasher_handle, crasher_thread, crasher_token)) = crasher
     {
         register_service(
             svcmgr_service_ep,
@@ -1150,9 +1175,10 @@ pub fn phase3_svcmgr_handover(
                 restart_policy: 0, // POLICY_ALWAYS
                 criticality: 1,    // CRITICALITY_NORMAL
                 thread_cap: crasher_thread,
-                module_cap: crasher_module,
+                module_cap: 0,
                 bundle_name: b"svcmgr",
                 bundle_cap: svcmgr_service_ep,
+                vfs_path: b"/bin/crasher",
             },
         );
 
@@ -1166,7 +1192,7 @@ pub fn phase3_svcmgr_handover(
     }
 
     // Spawn usertest (run-once test driver; no svcmgr registration).
-    create_and_run_usertest(info, procmgr_ep, bootstrap_ep, ipc_buf);
+    create_and_run_usertest(procmgr_ep, bootstrap_ep, ipc_buf);
 
     // Cap-oblivious tier-2 demos: hello (write-only) and stdiotest (full
     // stdin→process→stdout cycle, fed by init).

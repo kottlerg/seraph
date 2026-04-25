@@ -57,10 +57,15 @@ When a restart is permitted:
 1. **Check restart count.** If the service has been restarted 5 times (the
    maximum), mark it as **degraded** and do not restart. Log a warning.
 
-2. **Create new process.** Send `CREATE_PROCESS` to procmgr with the stored
-   module Frame capability. For VFS-loaded services, send
-   `CREATE_PROCESS_FROM_VFS` with the stored path (deferred — not needed for
-   the initial implementation).
+2. **Create new process.** Branch on the recorded restart source:
+   - Module-loaded service (`module_cap != 0`): send `CREATE_PROCESS` to
+     procmgr with a fresh derivation of the stored module Frame capability.
+   - VFS-loaded service (`vfs_path_len > 0`): send `CREATE_FROM_VFS` to
+     procmgr with the stored path bytes. No module cap is held, so the
+     binary is reloaded from the filesystem on every restart.
+
+   The two are mutually exclusive at registration time and surfaced via the
+   `vfs_path_len` field in the `REGISTER_SERVICE` label (bits [32..48]).
 
 3. **Inject capabilities.** Using the child CSpace cap returned by procmgr,
    inject the stored restart recipe caps (e.g., log endpoint) into the new
@@ -85,7 +90,9 @@ metadata needed to recreate the service. Init transfers these during
 
 For the initial implementation, the recipe consists of:
 
-- Module Frame capability (for `CREATE_PROCESS`)
+- One of the following restart sources (mutually exclusive):
+  - Module Frame capability (for `CREATE_PROCESS`), or
+  - VFS path bytes (for `CREATE_FROM_VFS`).
 - Log endpoint Send capability (injected into child CSpace)
 
 Future services may require additional caps (procmgr endpoint, device
@@ -99,12 +106,12 @@ message; multi-message registration can be added if needed.
 
 svcmgr only supervises top-level services registered by init:
 
-| Service | Criticality | Restart Policy |
-|---------|-------------|---------------|
-| procmgr | Fatal | Never |
-| devmgr | Fatal | Never |
-| vfsd | Fatal | Never |
-| crasher (test) | Normal | Always |
+| Service | Criticality | Restart Policy | Source |
+|---------|-------------|---------------|--------|
+| procmgr | Fatal | Never | Module |
+| devmgr | Fatal | Never | Module |
+| vfsd | Fatal | Never | Module |
+| crasher (test) | Normal | Always | VFS (`/bin/crasher`) |
 
 Device drivers (virtio-blk, etc.) are supervised by devmgr. Filesystem
 drivers (fatfs, etc.) are supervised by vfsd. All supervisors use the same

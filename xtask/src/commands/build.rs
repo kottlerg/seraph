@@ -105,12 +105,12 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "crasher",
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::RootfsBin,
     },
     Spec {
         name: "usertest",
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::RootfsBin,
     },
     Spec {
         name: "svcmgr",

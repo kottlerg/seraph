@@ -191,16 +191,9 @@ pub unsafe fn shootdown(root_phys: u64, cpu_mask: u64, virt: u64)
     // Interrupts are enabled (set above), so we can receive and service
     // incoming TLB shootdown IPIs from other CPUs while we wait. The IPI
     // handler acquires no locks — only atomic operations and TLB flush.
-    //
-    // On QEMU TCG single-thread, this spin can stall if the target hart
-    // doesn't get scheduled. The IPI re-send on each iteration ensures
-    // that a lost SSIP edge is recovered as soon as QEMU switches to
-    // the target hart.
     while TLB_SHOOTDOWN.pending_cpus.load(Ordering::Acquire) != 0
     {
         core::hint::spin_loop();
-        // Re-send to any CPUs that haven't acknowledged.
-        send_ipis(TLB_SHOOTDOWN.pending_cpus.load(Ordering::Acquire));
     }
 
     shootdown_unlock();

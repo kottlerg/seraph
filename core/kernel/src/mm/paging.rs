@@ -703,9 +703,10 @@ mod tests
         assert_eq!(compute_max_physical_address(&info), 0x8000_1000);
     }
 
-    /// Reserved entries (e.g. PCIe MMIO BARs reported by OVMF under TCG) must
-    /// not inflate max_phys. This is the scenario that causes pool exhaustion
-    /// when running under QEMU with TCG (e.g. `--no-kvm`).
+    /// `Reserved` entries (e.g. 64-bit PCIe MMIO windows reported by UEFI
+    /// firmware) must not inflate `max_phys`, otherwise the frame allocator
+    /// sizes its bitmap for an aperture that holds no usable RAM and
+    /// exhausts the metadata pool.
     #[test]
     fn max_phys_reserved_entries_are_excluded()
     {
@@ -716,8 +717,7 @@ mod tests
                 memory_type: MemoryType::Usable,
             },
             MemoryMapEntry {
-                // Simulates a 64-bit PCIe MMIO window at 512 GiB — the kind
-                // OVMF/Q35 exposes under TCG that caused pool exhaustion.
+                // Simulates a 64-bit PCIe MMIO window at 512 GiB.
                 physical_base: 0x80_0000_0000,
                 size: 0x80_0000_0000,
                 memory_type: MemoryType::Reserved,

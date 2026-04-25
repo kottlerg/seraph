@@ -995,12 +995,10 @@ pub unsafe fn schedule(requeue_current: bool)
         // Case (b): user AS → kernel/idle thread.
         // Load the kernel root page table so satp/CR3 never points to a
         // potentially-freeable user page table root. sfence.vma is
-        // deliberately omitted: idle/kernel code accesses only kernel-
-        // mapped addresses whose translations are identical in all page
-        // tables, and avoiding the full TLB flush works around a QEMU TCG
-        // bug where sfence.vma zero, zero can leave the iTLB inconsistent.
-        // The next case-(a) activate flushes stale user entries before any
-        // user code runs.
+        // deliberately omitted: kernel-mapped translations are identical
+        // across every address space (global mappings), and the next
+        // case-(a) activate flushes stale user entries before user code
+        // runs again.
         if nxt_as.is_null() && !cur_as.is_null()
         {
             crate::arch::current::paging::write_satp_no_fence(crate::mm::paging::kernel_pml4_pa());

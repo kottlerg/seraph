@@ -34,9 +34,10 @@ const WRITE: u64 = 1 << 2;
 const EXECUTE: u64 = 1 << 3;
 /// Accessed — must be pre-set in leaf PTEs.
 ///
-/// Some RISC-V implementations (including QEMU TCG) do not perform hardware
-/// A-bit updates and instead raise a page fault when A=0 is encountered.
-/// Pre-setting A=1 avoids this on first access.
+/// Per RISC-V Privileged Spec §5.4.1, an implementation may either update
+/// the A bit in hardware or raise a page fault when a load/store/fetch
+/// observes A=0. Hardware update is opt-in via the Svadu extension; absent
+/// Svadu, software must pre-set A=1.
 const ACCESSED: u64 = 1 << 6;
 /// Dirty — must be pre-set in writable leaf PTEs (same rationale as ACCESSED).
 const DIRTY: u64 = 1 << 7;
@@ -77,9 +78,8 @@ impl PageTableEntry
     pub fn new_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");
-        // ACCESSED must be pre-set: QEMU TCG raises a page fault on A=0 rather
-        // than setting it in hardware. DIRTY is pre-set for writable pages for
-        // the same reason.
+        // Pre-set A (and D for writable leaves) — see `ACCESSED` const for
+        // the Priv-Spec §5.4.1 / Svadu rationale.
         let mut bits = VALID | ACCESSED | ((phys >> 2) & PPN_MASK);
         if flags.readable
         {

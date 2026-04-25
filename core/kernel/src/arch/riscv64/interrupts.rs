@@ -365,9 +365,8 @@ fn handle_software_interrupt()
     if pending & my_bit != 0
     {
         // TLB shootdown request: flush the requested VA and acknowledge.
-        // Per-VA sfence.vma avoids flushing kernel text iTLB entries, which
-        // works around a QEMU TCG bug where full TLB flush (sfence.vma x0, x0)
-        // can leave the instruction TLB in an inconsistent state.
+        // Per-VA sfence.vma preserves global kernel-text iTLB entries that
+        // a full sfence.vma x0, x0 would otherwise discard.
         let va = crate::mm::tlb_shootdown::TLB_SHOOTDOWN
             .flush_va
             .load(core::sync::atomic::Ordering::Acquire);
@@ -601,9 +600,8 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
 /// Device IRQs are routed to a single hart (the BSP). Routing to one hart
 /// avoids the PLIC thundering-herd: with N harts all enabled for the same
 /// source, each trap fires on all N, N-1 of them lose the claim race
-/// (`plic_claim` returns 0), and at QEMU SMP `cpus>1` the BQL contention
-/// this causes between vCPU threads can leave the IRQ undelivered and the
-/// driver's signal waiter blocked indefinitely. Pinning to a single context
+/// (`plic_claim` returns 0), and the redundant traps waste cycles on every
+/// hart. Pinning to a single context
 /// makes IRQ delivery deterministic. This matches the `x86_64` side, which
 /// programs every IOAPIC redirection entry for destination LAPIC ID 0 (see
 /// `arch/x86_64/ioapic.rs::route`).
@@ -767,9 +765,8 @@ pub unsafe fn init()
 
     // Allow U-mode to read the hardware cycle performance counter
     // (scounteren.CY = bit 0). Required for userspace cycle-count benchmarks
-    // (equivalent to rdtsc on x86-64). OpenSBI sets mcounteren.CY on QEMU
-    // virt so S-mode access is already granted; this propagates it to U-mode.
-    // Also enables the VDSO-style clock_gettime fast path in the future libc.
+    // (equivalent to rdtsc on x86-64). The SBI firmware is responsible for
+    // granting S-mode access via mcounteren.CY; this propagates it to U-mode.
     // SAFETY: csrs scounteren is a privileged S-mode instruction; caller ensures S-mode.
     unsafe {
         core::arch::asm!(

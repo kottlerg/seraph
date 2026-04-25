@@ -228,9 +228,36 @@ pub mod stream_labels
     /// 16-31 of the label, same encoding as `STREAM_BYTES`. The mediator
     /// looks up the slot for the sender's token (delivered by the kernel
     /// from the tokened SEND cap) and stores the bytes as that slot's
-    /// display name. Idempotent — later registrations replace earlier.
-    /// Names longer than the mediator's per-slot buffer are truncated.
+    /// display name. Names that would collide with another token's name
+    /// are stored with a `.2` / `.3` / … suffix; re-registration by the
+    /// same token with its own current name is a silent no-op. Names
+    /// longer than the mediator's per-slot buffer are truncated.
     pub const STREAM_REGISTER_NAME: u64 = 11;
+}
+
+/// IPC labels for the system log endpoint's discovery interface.
+///
+/// Distinct from [`stream_labels`]: the latter carry payload (bytes,
+/// names) on tokened SEND caps that have already been minted; these
+/// labels are spoken on an un-tokened SEND cap (the "discovery cap"
+/// installed in every process at create time) and are how a process
+/// acquires its tokened cap in the first place.
+pub mod log_labels
+{
+    /// Request a freshly-minted tokened SEND cap on the log endpoint.
+    ///
+    /// Request: empty (label only). Reply: one cap — a SEND cap on the
+    /// log endpoint whose token uniquely identifies this caller's log
+    /// stream — plus a single data word carrying a status code (zero on
+    /// success). Callers cache the returned cap process-globally and
+    /// reuse it for every subsequent `STREAM_BYTES` /
+    /// `STREAM_REGISTER_NAME` message.
+    ///
+    /// The receiver mints the token (callers cannot pick their own).
+    /// Tokens are unforgeable and serve as the immutable identity of a
+    /// log sender; display names registered later via
+    /// `STREAM_REGISTER_NAME` are mutable labels bound to that identity.
+    pub const GET_LOG_CAP: u64 = 12;
 }
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────

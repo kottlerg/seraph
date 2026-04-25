@@ -70,6 +70,12 @@ pub struct StartupInfo {
     /// silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stderr_cap: u32,
+    /// Un-tokened SEND cap on the system log endpoint (the "discovery
+    /// cap"). Used by [`log!`] to lazy-acquire a tokened SEND cap on
+    /// first call via the `GET_LOG_CAP` IPC. Zero when no logger is
+    /// reachable; the macro silently drops.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub log_discovery_cap: u32,
     /// Virtual address of the `PT_TLS` template in the loaded image, or 0
     /// when the binary has no TLS segment.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -272,6 +278,7 @@ pub extern "C" fn _start() -> ! {
         stdin_cap: info.stdin_cap,
         stdout_cap: info.stdout_cap,
         stderr_cap: info.stderr_cap,
+        log_discovery_cap: info.log_discovery_cap,
         tls_template_vaddr: info.tls_template_vaddr,
         tls_template_filesz: info.tls_template_filesz,
         tls_template_memsz: info.tls_template_memsz,
@@ -295,6 +302,11 @@ pub extern "C" fn _start() -> ! {
         info.stdout_cap,
         info.stderr_cap,
     );
+
+    // Install the log discovery cap so `seraph::log!` can lazy-acquire
+    // a tokened SEND cap on first call. Zero is tolerated (the macro
+    // silently drops in processes without a logger).
+    ::log::set_discovery_cap(info.log_discovery_cap);
 
     // Bootstrap the heap so `fn main()` can allocate from its first line
     // (lazy `LineWriter` behind `std::io::stdout`, `String::new`, any `Vec`
@@ -408,6 +420,82 @@ pub fn diag_write(bytes: &[u8]) {
 pub fn register_log_name(name: &[u8]) {
     pal_stdio::register_log_name_raw(name);
 }
+
+// ── System log macro surface ────────────────────────────────────────────────
+//
+// The discovery cap installed at process create-time (recorded in
+// `StartupInfo::log_discovery_cap` and forwarded to `::log::set_discovery_cap`
+// during `_start`) drives a lazy `GET_LOG_CAP` round on first
+// `seraph::log!` call; the tokened cap is then cached process-globally for
+// the lifetime of the process. Distinct from `diag_write` /
+// `register_log_name` (which sit on the stdout/stderr stdio caps and are
+// retained for Phase 2's panic-handler routing).
+
+/// System-log access surface. Re-exports the `shared/log` wire-format
+/// helpers wrapped against the calling thread's registered IPC buffer.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod log {
+    use super::current_ipc_buf;
+
+    /// Acquire (or fetch the cached) tokened SEND cap on the system log
+    /// endpoint. First call performs one `GET_LOG_CAP` round-trip;
+    /// subsequent calls return the same cap from the process-global
+    /// cache. Returns `0` when no discovery cap is reachable or the
+    /// IPC buffer is not yet registered.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn acquire() -> u32 {
+        ::log::ensure_tokened_cap(current_ipc_buf())
+    }
+
+    /// Register a display name for this process's log stream.
+    /// Idempotent — re-registration with the same name is a silent
+    /// no-op at the receiver. Names longer than the receiver's
+    /// per-slot buffer are truncated; collisions with other senders'
+    /// names are resolved server-side via `name.2` / `name.3` /
+    /// suffixes (see `ipc::stream_labels::STREAM_REGISTER_NAME`).
+    ///
+    /// Drives the new tokened SEND cap (acquired lazily); does not
+    /// touch `STDOUT_CAP` and is therefore independent of the legacy
+    /// `register_log_name` path.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn register_name(name: &[u8]) {
+        let buf = current_ipc_buf();
+        let cap = ::log::ensure_tokened_cap(buf);
+        ::log::register_name(cap, buf, name);
+    }
+
+    /// Macro entry point. Resolves the calling thread's IPC buffer and
+    /// the process-global tokened cap, then formats `args` and emits
+    /// one `STREAM_BYTES` message (split across IPC chunks if longer
+    /// than 512 bytes). Silently drops when no log cap is acquirable.
+    #[doc(hidden)]
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn __emit(args: core::fmt::Arguments<'_>) {
+        ::log::emit(current_ipc_buf(), args);
+    }
+}
+
+/// System-log macro. Formats and emits one log line on the process's
+/// tokened SEND cap, lazy-acquired from the discovery cap on first
+/// call. The receiver tags each line with the registered display name
+/// (default `[?]`); see [`log::register_name`].
+///
+/// Non-allocating — uses a 512-byte stack buffer; messages exceeding
+/// that are silently truncated.
+#[macro_export]
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+macro_rules! __seraph_log {
+    ($($arg:tt)*) => {{
+        $crate::os::seraph::log::__emit(::core::format_args!($($arg)*))
+    }};
+}
+
+// Re-export the macro at `std::os::seraph::log!` as well as the
+// crate-root `std::__seraph_log!` placement that `#[macro_export]`
+// generated. Macros and modules live in separate namespaces, so this
+// re-export coexists with the `pub mod log { … }` above.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub use crate::__seraph_log as log;
 
 /// Format `args` into a 512-byte stack buffer and emit through
 /// [`diag_write`], appending a trailing newline. Non-allocating — callers

@@ -1126,6 +1126,78 @@ pub fn create_and_run_hello(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u6
     );
 }
 
+/// Create `/bin/probe` via `CREATE_FROM_VFS`, start it, serve an empty
+/// bootstrap round. Phase-1 verification probe for the new
+/// `seraph::log!` path — calls `seraph::log::register_name(b"probe")`
+/// and `seraph::log!("probe message")` once each, then exits. Output
+/// `[probe] probe message` in boot log proves the discovery cap →
+/// `GET_LOG_CAP` → tokened cap → `STREAM_REGISTER_NAME` /
+/// `STREAM_BYTES` chain works end-to-end.
+pub fn create_and_run_probe(procmgr_ep: u32, bootstrap_ep: u32, ipc_buf: *mut u64)
+{
+    let path: &[u8] = b"/bin/probe";
+
+    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
+    else
+    {
+        return;
+    };
+
+    let label = procmgr_labels::CREATE_FROM_VFS | ((path.len() as u64) << 16);
+    let word_count = path_word_count(path);
+    let msg = IpcMessage::builder(label)
+        .bytes(0, path)
+        .word_count(word_count)
+        .cap(tokened_creator)
+        .build();
+
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
+    else
+    {
+        log("phase 3: probe CREATE_FROM_VFS failed");
+        return;
+    };
+    if reply.label != 0
+    {
+        log("phase 3: probe CREATE_FROM_VFS error");
+        return;
+    }
+
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
+    {
+        return;
+    }
+    let process_handle = reply_caps[0];
+
+    // Probe does not speak the bootstrap protocol — child_token/tokened_creator
+    // are unused on the child side. Skip the serve round.
+    let _ = child_token;
+
+    // Configure stdio with log-endpoint caps the same way hello does.
+    // The probe's own `seraph::log!` calls go through the discovery
+    // cap (from ProcessInfo, installed by procmgr) and bypass stdio
+    // entirely; stdio is wired so any stray `println!` (none today)
+    // would still land in the log under `[probe]`.
+    let (stdout, stderr) = derive_log_stdio_pair();
+    configure_stdio(
+        process_handle,
+        ipc_buf,
+        stdout,
+        stderr,
+        0,
+        "phase 3: probe CONFIGURE_STDIO failed",
+    );
+
+    let _ = start_process(
+        process_handle,
+        ipc_buf,
+        "phase 3: probe started",
+        "phase 3: probe START_PROCESS failed",
+    );
+}
+
 /// Create `/bin/stdiotest` via `CREATE_FROM_VFS` with a stdin endpoint init
 /// holds the SEND side of, then push a probe payload through stdin so the
 /// child's `read_line` returns. Exercises the full spawner-writes →
@@ -1341,6 +1413,12 @@ pub fn phase3_svcmgr_handover(
     // stdin→process→stdout cycle, fed by init).
     create_and_run_hello(procmgr_ep, bootstrap_ep, ipc_buf);
     create_and_run_stdiotest(procmgr_ep, bootstrap_ep, ipc_buf);
+
+    // Phase-1 verification probe for the new `seraph::log!` path. Uses
+    // the `log_discovery_cap` field of `ProcessInfo` (installed by
+    // procmgr) to lazy-acquire a tokened SEND cap via `GET_LOG_CAP`,
+    // then registers as `[probe]` and emits one log line.
+    create_and_run_probe(procmgr_ep, bootstrap_ep, ipc_buf);
 
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
     // SAFETY: ipc_buf is caller's registered IPC buffer.

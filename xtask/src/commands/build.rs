@@ -132,6 +132,11 @@ const SPECS: &[Spec] = &[
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
     },
+    Spec {
+        name: "probe",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+    },
 ];
 
 fn spec_for(component: BuildComponent) -> Option<&'static Spec>
@@ -153,6 +158,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Hello => "hello",
         BuildComponent::Stackoverflow => "stackoverflow",
         BuildComponent::Stdiotest => "stdiotest",
+        BuildComponent::Probe => "probe",
     };
     SPECS.iter().find(|s| s.name == name)
 }

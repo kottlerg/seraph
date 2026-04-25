@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 7;
+pub const PROCESS_ABI_VERSION: u32 = 8;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -215,6 +215,20 @@ pub struct ProcessInfo
 
     /// Number of env entries (NUL-terminated `KEY=VALUE` strings) in the blob.
     pub env_count: u32,
+
+    /// `CSpace` slot of an un-tokened SEND cap on the system log endpoint
+    /// (the *discovery* cap).
+    ///
+    /// Used by the `seraph::log!` macro path to lazy-acquire a tokened
+    /// SEND cap on first call, via the `log_labels::GET_LOG_CAP` IPC. The
+    /// discovery cap by itself grants no identity and no observability —
+    /// it merely lets the holder request a freshly-minted tokened cap.
+    /// Distributing it widely is therefore harmless.
+    ///
+    /// Zero when no logger is reachable (very early boot, processes
+    /// created before the log infrastructure is wired). Logger-using
+    /// callers must tolerate zero (writes silently drop).
+    pub log_discovery_cap: u32,
 }
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────

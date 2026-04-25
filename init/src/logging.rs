@@ -24,6 +24,7 @@ use crate::arch;
 use crate::{FrameAlloc, PAGE_SIZE};
 use init_protocol::InitInfo;
 
+use ipc::log_labels::GET_LOG_CAP;
 use ipc::stream_labels::STREAM_BYTES;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -77,6 +78,13 @@ static mut INIT_CSPACE: u32 = 0;
 /// reserved for services init spawns directly; procmgr's `NEXT_LOG_TOKEN`
 /// starts at 1024 to guarantee no overlap. Token 1 is init's own self-cap.
 static INIT_NEXT_LOG_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2);
+
+/// Monotonic counter for tokens minted on the new `GET_LOG_CAP` discovery
+/// path. Range 32..=1023 — disjoint from init's pre-spawn reserved
+/// 1..=16 range and procmgr's `MINT_LOG_CAP` 1024+ range. Phase 2 retires
+/// `MINT_LOG_CAP` and the band split collapses.
+static INIT_DISCOVERY_NEXT_TOKEN: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(32);
 
 // ── Public interface ─────────────────────────────────────────────────────────
 
@@ -425,21 +433,79 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         if label_id == STREAM_BYTES
         {
             consume_bytes(&mut slots, &mut next_evict, &recv, recv.token, byte_len);
+            // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
         else if label_id == ipc::stream_labels::STREAM_REGISTER_NAME
         {
             register_sender_name(&mut slots, &mut next_evict, &recv, recv.token, byte_len);
+            // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
-
-        // Reply to unblock the sender (call/reply protocol; payload empty).
-        // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
+        else if label_id == GET_LOG_CAP
+        {
+            handle_get_log_cap(log_ep, ipc_buf_raw);
+            // handle_get_log_cap performs its own ipc_reply (with the
+            // minted cap or an error code), so we do not double-reply
+            // here.
+        }
+        else
+        {
+            // Unknown label — reply empty so the sender unblocks.
+            // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
+        }
     }
 }
 
-/// Record a display name for the sender identified by `token`. Called from
-/// `log_receive_loop` when a `STREAM_REGISTER_NAME` message arrives.
-/// Idempotent — later registrations replace earlier.
+/// Handler for `log_labels::GET_LOG_CAP`. Mints a fresh tokened SEND cap
+/// on the system log endpoint (token from the discovery range
+/// 32..=1023), transfers it back to the caller in the reply, and frees
+/// our local slot when the kernel performs the transfer.
+fn handle_get_log_cap(log_ep: u32, ipc_buf: *mut u64)
+{
+    use core::sync::atomic::Ordering;
+
+    let token = INIT_DISCOVERY_NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if !(32..=1023).contains(&token)
+    {
+        // Range exhausted; reply empty and surface a synthetic warning
+        // line so operators can spot the saturation.
+        flush_synthetic_logd_line(b"GET_LOG_CAP: token range 32..=1023 exhausted");
+        // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(1), ipc_buf) };
+        return;
+    }
+
+    let Ok(cap) = syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, token)
+    else
+    {
+        // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(2), ipc_buf) };
+        return;
+    };
+
+    let reply = ipc::IpcMessage::builder(0).cap(cap).build();
+    // SAFETY: ipc_buf is the log thread's registered IPC buffer page;
+    // the kernel transfers the cap from init's CSpace to the caller's
+    // CSpace, so the local slot is released.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Record a display name for the sender identified by `token`. Called
+/// from `log_receive_loop` when a `STREAM_REGISTER_NAME` message
+/// arrives. Implements the roadmap collision-suffix policy:
+///
+/// * Re-registration by the same token with its own current name is a
+///   silent no-op (no map mutation, no synthetic line).
+/// * Otherwise the sender's previous name slot is freed first, then the
+///   requested name is resolved against the rest of the table — if
+///   another active token holds the bare name, the applicant is stored
+///   as `name.2`, `name.3`, …; the first free suffix wins.
+/// * Every non-no-op registration emits a synthetic
+///   `[init-logd] token=<N> registered name='<stored-name>'` line so the
+///   full `token → name` history is reconstructable from log output
+///   alone.
 fn register_sender_name(
     slots: &mut [SenderSlot; MAX_SENDERS],
     next_evict: &mut usize,
@@ -449,10 +515,229 @@ fn register_sender_name(
 )
 {
     let bytes = msg.data_bytes();
-    let len = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
+    let requested_len = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
+    if requested_len == 0
+    {
+        return;
+    }
+    let requested = &bytes[..requested_len];
+
     let slot_idx = find_or_alloc_slot(slots, next_evict, token);
-    slots[slot_idx].name[..len].copy_from_slice(&bytes[..len]);
-    slots[slot_idx].name_used = len;
+
+    // Same token, same current name — silent no-op.
+    if slots[slot_idx].name_used == requested_len
+        && &slots[slot_idx].name[..slots[slot_idx].name_used] == requested
+    {
+        return;
+    }
+
+    // Free this token's current name before resolving collisions, so a
+    // rename liberates the previous slot for the new applicant.
+    slots[slot_idx].name_used = 0;
+    slots[slot_idx].name = [0u8; MAX_NAME_LEN];
+
+    let mut stored = [0u8; MAX_NAME_LEN];
+    let stored_len = resolve_unique_name(slots, requested, &mut stored);
+
+    slots[slot_idx].name[..stored_len].copy_from_slice(&stored[..stored_len]);
+    slots[slot_idx].name_used = stored_len;
+
+    emit_registration_event(token, &stored[..stored_len]);
+}
+
+/// Try the bare `requested` name first; if any other active slot
+/// already holds that exact name, append `.2`, `.3`, … until a free
+/// candidate is found. Writes the chosen bytes into `out` and returns
+/// the byte count. If every suffix collides the bare name is returned
+/// (collision is preserved rather than dropped — the synthetic line
+/// will still reflect what was stored).
+fn resolve_unique_name(
+    slots: &[SenderSlot; MAX_SENDERS],
+    requested: &[u8],
+    out: &mut [u8; MAX_NAME_LEN],
+) -> usize
+{
+    if !name_in_use(slots, requested)
+    {
+        let n = requested.len().min(out.len());
+        out[..n].copy_from_slice(&requested[..n]);
+        return n;
+    }
+    let max_suffix = (MAX_SENDERS as u32) + 1;
+    let mut suffix: u32 = 2;
+    while suffix <= max_suffix
+    {
+        let n = compose_suffixed(requested, suffix, out);
+        if !name_in_use(slots, &out[..n])
+        {
+            return n;
+        }
+        suffix += 1;
+    }
+    let n = requested.len().min(out.len());
+    out[..n].copy_from_slice(&requested[..n]);
+    n
+}
+
+/// Return `true` if any active slot already stores `name` verbatim.
+fn name_in_use(slots: &[SenderSlot; MAX_SENDERS], name: &[u8]) -> bool
+{
+    slots
+        .iter()
+        .any(|s| s.token != 0 && s.name_used == name.len() && &s.name[..s.name_used] == name)
+}
+
+/// Write `name` followed by `.<n>` into `out`, return the total byte
+/// count. Truncates if the composed form exceeds [`MAX_NAME_LEN`].
+fn compose_suffixed(name: &[u8], n: u32, out: &mut [u8; MAX_NAME_LEN]) -> usize
+{
+    let copy_len = name.len().min(out.len());
+    out[..copy_len].copy_from_slice(&name[..copy_len]);
+    let mut idx = copy_len;
+    if idx < out.len()
+    {
+        out[idx] = b'.';
+        idx += 1;
+    }
+    let mut digits = [0u8; 10];
+    let mut dlen = 0;
+    let mut value = n;
+    if value == 0
+    {
+        digits[0] = b'0';
+        dlen = 1;
+    }
+    else
+    {
+        while value > 0 && dlen < digits.len()
+        {
+            digits[dlen] = b'0' + (value % 10) as u8;
+            dlen += 1;
+            value /= 10;
+        }
+    }
+    while dlen > 0 && idx < out.len()
+    {
+        dlen -= 1;
+        out[idx] = digits[dlen];
+        idx += 1;
+    }
+    idx
+}
+
+/// Emit a synthetic registration-event line attributed to the receiver
+/// itself: `[sec.usfrac] [init-logd] token=<N> registered name='<name>'`.
+/// Bypasses the slot machinery so it does not interfere with active
+/// senders' line buffers.
+fn emit_registration_event(token: u64, name: &[u8])
+{
+    let mut payload = [0u8; LINE_BUF_SIZE];
+    let mut idx = 0usize;
+
+    let prefix = b"token=";
+    for &b in prefix
+    {
+        if idx < payload.len()
+        {
+            payload[idx] = b;
+            idx += 1;
+        }
+    }
+    idx = write_decimal_into(token, &mut payload, idx);
+    let middle = b" registered name='";
+    for &b in middle
+    {
+        if idx < payload.len()
+        {
+            payload[idx] = b;
+            idx += 1;
+        }
+    }
+    let name_room = payload.len().saturating_sub(idx + 1);
+    let name_len = name.len().min(name_room);
+    if name_len > 0
+    {
+        payload[idx..idx + name_len].copy_from_slice(&name[..name_len]);
+        idx += name_len;
+    }
+    if idx < payload.len()
+    {
+        payload[idx] = b'\'';
+        idx += 1;
+    }
+
+    flush_synthetic_logd_line(&payload[..idx]);
+}
+
+/// Write `value` as base-10 ASCII into `buf` starting at `start`,
+/// returning the new write index. Caps at `buf.len()`.
+fn write_decimal_into(value: u64, buf: &mut [u8; LINE_BUF_SIZE], start: usize) -> usize
+{
+    let mut digits = [0u8; 20];
+    let mut dlen = 0;
+    let mut n = value;
+    if n == 0
+    {
+        digits[0] = b'0';
+        dlen = 1;
+    }
+    else
+    {
+        while n > 0 && dlen < digits.len()
+        {
+            digits[dlen] = b'0' + (n % 10) as u8;
+            dlen += 1;
+            n /= 10;
+        }
+    }
+    let mut idx = start;
+    while dlen > 0 && idx < buf.len()
+    {
+        dlen -= 1;
+        buf[idx] = digits[dlen];
+        idx += 1;
+    }
+    idx
+}
+
+/// Emit `[sec.usfrac] [init-logd] <payload>\r\n` directly to the
+/// serial port. Used for synthetic registration-event lines and
+/// saturation warnings; bypasses the per-token slot/buffer machinery
+/// so it does not collide with in-flight log streams. The `init-`
+/// prefix marks the receiver as init's interim log thread; a future
+/// real `logd` service will emit the same line shape under bare
+/// `[logd]`.
+fn flush_synthetic_logd_line(payload: &[u8])
+{
+    let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
+    let sec = us / 1_000_000;
+    let usfrac = (us % 1_000_000) as u32;
+
+    arch::current::serial_write_byte(b'[');
+    write_decimal(sec);
+    arch::current::serial_write_byte(b'.');
+    write_decimal_padded(u64::from(usfrac), 6);
+    arch::current::serial_write_byte(b']');
+    arch::current::serial_write_byte(b' ');
+
+    arch::current::serial_write_byte(b'[');
+    for &b in b"init-logd"
+    {
+        arch::current::serial_write_byte(b);
+    }
+    arch::current::serial_write_byte(b']');
+    arch::current::serial_write_byte(b' ');
+
+    for &b in payload
+    {
+        if b == b'\n'
+        {
+            arch::current::serial_write_byte(b'\r');
+        }
+        arch::current::serial_write_byte(b);
+    }
+    arch::current::serial_write_byte(b'\r');
+    arch::current::serial_write_byte(b'\n');
 }
 
 /// Append `byte_len` bytes from the IPC buffer onto the slot for `token`,

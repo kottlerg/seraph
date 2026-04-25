@@ -474,6 +474,7 @@ fn handle_create(
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
+        log_discovery: ctx.log_ep,
     };
 
     let result = process::create_process(

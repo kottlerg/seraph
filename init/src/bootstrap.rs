@@ -215,6 +215,12 @@ fn populate_procmgr_info(
     pi.stdin_cap = 0;
     pi.stdout_cap = 0;
     pi.stderr_cap = 0;
+    // Procmgr is the source of the log discovery cap (it holds the un-
+    // tokened SEND on the log endpoint, used as the dispensing source
+    // for `MINT_LOG_CAP` and now also as the source procmgr `cap_copy`s
+    // into every child it creates). Procmgr itself does not consume
+    // `seraph::log!`, so its own slot stays zero.
+    pi.log_discovery_cap = 0;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
 

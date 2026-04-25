@@ -1,0 +1,34 @@
+[package]
+name = "log"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# no_std: the system log macro (`seraph::log!`) and its supporting wire-
+# format helpers. Used directly by init (no_std) and re-exported through
+# the std overlay so std-built services reach it as
+# `std::os::seraph::log!` / `std::os::seraph::log::{acquire, register_name}`.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ipc = { path = "../ipc" }
+syscall = { path = "../syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+# When std lists this crate as a dep, build-std activates
+# `rustc-dep-of-std` and forwards the feature to our workspace deps, so
+# `use core::…` resolves against the build-std core facade. Same pattern
+# as abi/syscall, shared/syscall, shared/ipc.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = [
+    "rustc-std-workspace-core",
+    "ipc/rustc-dep-of-std",
+    "syscall/rustc-dep-of-std",
+    "syscall-abi/rustc-dep-of-std",
+]
+
+[lints]
+workspace = true

@@ -222,8 +222,14 @@ pub struct CreateResult
 
 /// Universal bootstrap caps procmgr threads through into every child.
 ///
-/// Only procmgr's own service endpoint. The child receives a tokened SEND
-/// copy so it can call `REQUEST_FRAMES` / `MINT_LOG_CAP` / `CREATE_PROCESS`.
+/// Procmgr's own service endpoint plus the system log discovery cap.
+///
+/// The child receives a tokened SEND copy of `procmgr_endpoint` so it
+/// can call `REQUEST_FRAMES` / `MINT_LOG_CAP` / `CREATE_PROCESS`, and
+/// an un-tokened SEND copy of `log_discovery` so it can `GET_LOG_CAP`
+/// against the system log endpoint on first `seraph::log!` call (the
+/// discovery cap by itself grants no log identity and no observability;
+/// it merely lets the holder request a freshly-minted tokened cap).
 ///
 /// Stdio caps (stdin, stdout, stderr) are intentionally NOT part of this
 /// struct: they are not a universal property of processes, and each can
@@ -233,6 +239,10 @@ pub struct CreateResult
 pub struct UniversalCaps
 {
     pub procmgr_endpoint: u32,
+    /// Un-tokened SEND cap on the system log endpoint, sourced from the
+    /// `log_ep` slot procmgr received during init bootstrap. Zero when
+    /// procmgr has no log endpoint (e.g. a future no-log boot mode).
+    pub log_discovery: u32,
 }
 
 /// Program arguments delivered to a child process at spawn time.
@@ -371,6 +381,20 @@ fn populate_child_info(
         0
     };
 
+    // Discovery cap on the system log endpoint: SEND-only copy of the
+    // procmgr-held un-tokened log endpoint cap. Lets the child issue
+    // `GET_LOG_CAP` to lazy-acquire its tokened SEND cap on first
+    // `seraph::log!` call. Zero when procmgr has no log endpoint, in
+    // which case the macro silently drops.
+    let log_discovery_in_child = if universals.log_discovery != 0
+    {
+        syscall::cap_copy(universals.log_discovery, child_cspace, syscall::RIGHTS_SEND).ok()?
+    }
+    else
+    {
+        0
+    };
+
     // Stdio caps are not installed here — CONFIGURE_STDIO remaps this
     // same pi_frame writable and fills them in before the child is
     // started. Leave the PI slots as zero so a child that ships without a
@@ -389,6 +413,7 @@ fn populate_child_info(
     pi.stdin_cap = 0;
     pi.stdout_cap = 0;
     pi.stderr_cap = 0;
+    pi.log_discovery_cap = log_discovery_in_child;
     pi.tls_template_vaddr = tls.vaddr;
     pi.tls_template_filesz = tls.filesz;
     pi.tls_template_memsz = tls.memsz;
@@ -1246,6 +1271,7 @@ pub fn create_process_from_vfs(
 
     let universals = UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
+        log_discovery: ctx.log_ep,
     };
     let pi_frame_cap = populate_child_info(
         pool,

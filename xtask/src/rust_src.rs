@@ -577,6 +577,10 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         .join("shared/ipc")
         .canonicalize()
         .context("canonicalising shared/ipc")?;
+    let log_path = project_root
+        .join("shared/log")
+        .canonicalize()
+        .context("canonicalising shared/log")?;
     let va_layout_path = project_root
         .join("shared/va_layout")
         .canonicalize()
@@ -597,11 +601,13 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
          syscall-abi = {{ path = \"{abi}\", features = [\"rustc-dep-of-std\"] }}\n\
          syscall = {{ path = \"{sys}\", features = [\"rustc-dep-of-std\"] }}\n\
          ipc = {{ path = \"{ipc}\", features = [\"rustc-dep-of-std\"] }}\n\
+         log = {{ path = \"{log}\", features = [\"rustc-dep-of-std\"] }}\n\
          va_layout = {{ path = \"{va}\", features = [\"rustc-dep-of-std\"] }}\n\
          process-abi = {{ path = \"{proc}\", features = [\"rustc-dep-of-std\"] }}\n",
         abi = syscall_abi_path.display(),
         sys = syscall_path.display(),
         ipc = ipc_path.display(),
+        log = log_path.display(),
         va = va_layout_path.display(),
         proc = process_abi_path.display(),
     );
@@ -609,12 +615,31 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
     let text = fs::read_to_string(&cargo_toml)
         .with_context(|| format!("reading {}", cargo_toml.display()))?;
     // Cargo.toml uses `#` comments, not `//`; MARKER was tuned for Rust
-    // sources. Match the comment-stripped marker body instead.
-    if text.contains("seraph-overlay: workspace ABI crates")
+    // sources. Match the comment-stripped marker body instead. If the
+    // marker is present but a known dep line is missing (added in a
+    // later overlay revision), strip the old block and re-apply.
+    let marker = "seraph-overlay: workspace ABI crates";
+    let has_log_dep = text.contains("log = { path");
+    if text.contains(marker) && has_log_dep
     {
         return Ok(());
     }
-    let patched = text + &block;
+    let patched = if let Some(start) = text.find(marker)
+    {
+        // Old block present but stale — locate the start of the comment
+        // line that contains the marker (one '\n' before the marker, or
+        // the file head) and truncate from there. The block extends to
+        // EOF in our format.
+        let block_start = text[..start].rfind('\n').map_or(0, |p| p + 1);
+        let mut head = String::with_capacity(block_start + block.len());
+        head.push_str(&text[..block_start]);
+        head.push_str(&block);
+        head
+    }
+    else
+    {
+        text + &block
+    };
     write_new_file(&cargo_toml, &patched)?;
     step(&format!(
         "seraph-toolchain: patched {}",

@@ -50,6 +50,60 @@ pub struct ProcessEntry
     frames_allocated: u32,
 }
 
+impl ProcessEntry
+{
+    pub fn token(&self) -> u64
+    {
+        self.token
+    }
+}
+
+/// Ring of recently auto-reaped processes, queried on `QUERY_PROCESS`
+/// table miss to distinguish "exited recently" from "never existed".
+/// Best-effort retention: oldest entries are overwritten as new ones
+/// arrive; queries on rotated-out tokens return `None`.
+#[derive(Clone, Copy)]
+pub struct RecentExits
+{
+    ring: [Option<RecentExit>; RECENT_EXITS_SLOTS],
+    head: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RecentExit
+{
+    token: u64,
+    exit_reason: u64,
+}
+
+const RECENT_EXITS_SLOTS: usize = 16;
+
+impl RecentExits
+{
+    pub const fn new() -> Self
+    {
+        Self {
+            ring: [None; RECENT_EXITS_SLOTS],
+            head: 0,
+        }
+    }
+
+    pub fn record(&mut self, token: u64, exit_reason: u64)
+    {
+        self.ring[self.head] = Some(RecentExit { token, exit_reason });
+        self.head = (self.head + 1) % RECENT_EXITS_SLOTS;
+    }
+
+    pub fn find(&self, token: u64) -> Option<u64>
+    {
+        self.ring
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .find(|e| e.token == token)
+            .map(|e| e.exit_reason)
+    }
+}
+
 pub struct ProcessTable
 {
     entries: [Option<ProcessEntry>; MAX_PROCESSES],
@@ -103,8 +157,7 @@ impl ProcessTable
     /// low 32 bits. Used by the auto-reap dispatch to resolve a death event
     /// back to its process. Stale correlators (entry already reaped)
     /// return `None`; callers drop such events silently.
-    #[allow(dead_code)]
-    fn take_by_correlator(&mut self, correlator: u32) -> Option<ProcessEntry>
+    pub fn take_by_correlator(&mut self, correlator: u32) -> Option<ProcessEntry>
     {
         for slot in &mut self.entries
         {
@@ -758,12 +811,11 @@ fn finalize_creation(
 {
     let token = NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-    // Procmgr auto-reap death-notification bind is temporarily disabled —
-    // adding procmgr as a second observer on spawn-path threads (where the
-    // spawner's ruststd also binds) surfaces a hang that has not yet been
-    // root-caused. Kernel multi-bind is proven working via svcmgr (crasher
-    // path). Re-enable once the interaction is diagnosed.
-    let _ = death_eq;
+    // Bind procmgr's shared death queue as an observer on the child's
+    // main thread. Correlator = low 32 bits of the table token; on death,
+    // dispatch_death recovers the entry via `take_by_correlator`.
+    let correlator = token as u32;
+    syscall::thread_bind_notification(child_thread, death_eq, correlator).ok()?;
 
     // Derive a tokened endpoint cap for the caller. The token identifies this
     // process on subsequent START_PROCESS / REQUEST_FRAMES calls.
@@ -1396,7 +1448,7 @@ pub fn destroy_process(token: u64, table: &mut ProcessTable)
 // needless_pass_by_value: consumes the entry's cap slots; passing by
 // reference would invite accidental double-free on subsequent reuse.
 #[allow(clippy::needless_pass_by_value)]
-fn teardown_entry(entry: ProcessEntry)
+pub fn teardown_entry(entry: ProcessEntry)
 {
     // Order: thread first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables. Then cspace (which
@@ -1422,15 +1474,9 @@ fn teardown_entry(entry: ProcessEntry)
 
 /// Start a previously created (suspended) process.
 ///
-/// Binds the child's main thread to procmgr's shared death queue (for
-/// auto-reap on exit or fault), configures the thread, and starts it.
-/// The bind happens BEFORE `thread_start` so a short-lived child cannot
-/// exit before procmgr installs its observer and leak the child's frames.
-///
-/// Correlator: `entry.token as u32`. Procmgr's `NEXT_TOKEN` is monotonic
-/// u64; truncation is unambiguous in practice (wrap at 4B process spawns).
-#[allow(clippy::cast_possible_truncation)]
-pub fn start_process(token: u64, table: &mut ProcessTable, death_eq: u32) -> Result<(), u64>
+/// `finalize_creation` already bound the child's main thread to procmgr's
+/// shared death queue, so this just configures the thread and kicks it.
+pub fn start_process(token: u64, table: &mut ProcessTable) -> Result<(), u64>
 {
     let entry = table
         .find_mut_by_token(token)
@@ -1440,9 +1486,6 @@ pub fn start_process(token: u64, table: &mut ProcessTable, death_eq: u32) -> Res
     {
         return Err(procmgr_errors::ALREADY_STARTED);
     }
-
-    // Bind happens in finalize_creation — no-op here.
-    let _ = death_eq;
 
     syscall::thread_configure_with_tls(
         entry.thread_cap,

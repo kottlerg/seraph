@@ -171,106 +171,196 @@ fn main(startup: &StartupInfo) -> !
 
     let mut pool = FramePool::new(boot.frame_base, boot.frame_count);
     let mut table = process::ProcessTable::new();
+    let mut recent = process::RecentExits::new();
+
+    let Ok(death_eq) = syscall::event_queue_create((process::MAX_PROCESSES as u32) * 2)
+    else
+    {
+        syscall::thread_exit();
+    };
+    let Ok(ws_cap) = syscall::wait_set_create()
+    else
+    {
+        syscall::thread_exit();
+    };
+    if syscall::wait_set_add(ws_cap, boot.service_ep, WS_TOKEN_SERVICE).is_err()
+    {
+        syscall::thread_exit();
+    }
+    if syscall::wait_set_add(ws_cap, death_eq, WS_TOKEN_DEATH).is_err()
+    {
+        syscall::thread_exit();
+    }
 
     let mut ctx = ProcmgrCtx {
         self_aspace,
         self_endpoint: boot.service_ep,
         vfsd_ep: 0,
         log_ep: boot.log_ep,
-        death_eq: 0,
-        ws_cap: 0,
+        death_eq,
+        ws_cap,
     };
     let service_ep = boot.service_ep;
 
     loop
     {
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let Ok(req) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
+        let Ok(token) = syscall::wait_set_wait(ws_cap)
         else
         {
             continue;
         };
-        let label = req.label;
-        let token = req.token;
 
-        match label & 0xFFFF
+        match token
         {
-            procmgr_labels::CREATE_PROCESS =>
+            WS_TOKEN_SERVICE =>
             {
-                handle_create(&req, ipc_buf, &mut pool, &ctx, &mut table);
+                dispatch_ipc(
+                    service_ep, ipc_buf, &mut ctx, &mut pool, &mut table, &recent,
+                );
             }
-
-            procmgr_labels::START_PROCESS =>
+            WS_TOKEN_DEATH =>
             {
-                // Token from ipc_recv identifies which process to start.
-                let code = match process::start_process(token, &mut table, ctx.death_eq)
+                dispatch_death(ctx.death_eq, &mut table, &mut recent);
+            }
+            _ => (),
+        }
+    }
+}
+
+/// `WaitSet` token for procmgr's service endpoint.
+const WS_TOKEN_SERVICE: u64 = 0;
+/// `WaitSet` token for procmgr's shared death event queue.
+const WS_TOKEN_DEATH: u64 = 1;
+
+/// Service-endpoint dispatch. Called when the wait-set wakes for the
+/// service endpoint; the sender is already queued so `ipc_recv` returns
+/// without blocking.
+fn dispatch_ipc(
+    service_ep: u32,
+    ipc_buf: *mut u64,
+    ctx: &mut ProcmgrCtx,
+    pool: &mut FramePool,
+    table: &mut process::ProcessTable,
+    recent: &process::RecentExits,
+)
+{
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(req) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
+    else
+    {
+        return;
+    };
+    let label = req.label;
+    let token = req.token;
+
+    match label & 0xFFFF
+    {
+        procmgr_labels::CREATE_PROCESS =>
+        {
+            handle_create(&req, ipc_buf, pool, ctx, table);
+        }
+
+        procmgr_labels::START_PROCESS =>
+        {
+            // Token from ipc_recv identifies which process to start.
+            let code = match process::start_process(token, table)
+            {
+                Ok(()) => procmgr_errors::SUCCESS,
+                Err(code) => code,
+            };
+            reply_empty(ipc_buf, code);
+        }
+
+        procmgr_labels::REQUEST_FRAMES =>
+        {
+            handle_request_frames(&req, ipc_buf, pool);
+        }
+
+        procmgr_labels::DESTROY_PROCESS =>
+        {
+            // Token from ipc_recv identifies which process to destroy.
+            process::destroy_process(token, table);
+            reply_empty(ipc_buf, procmgr_errors::SUCCESS);
+        }
+
+        procmgr_labels::QUERY_PROCESS =>
+        {
+            // Token identifies which process to query. Reply data:
+            //   word 0 = state code (see `procmgr_process_state`)
+            //   word 1 = exit_reason (only meaningful for `EXITED`)
+            use ipc::procmgr_process_state;
+            let (state, exit_reason) = match table.query_by_token(token)
+            {
+                Some(true) => (procmgr_process_state::ALIVE, 0u64),
+                Some(false) => (procmgr_process_state::CREATED, 0u64),
+                None => match recent.find(token)
                 {
-                    Ok(()) => procmgr_errors::SUCCESS,
-                    Err(code) => code,
-                };
-                reply_empty(ipc_buf, code);
-            }
+                    Some(reason) => (procmgr_process_state::EXITED, reason),
+                    None => (procmgr_process_state::UNKNOWN, 0u64),
+                },
+            };
+            let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+                .word(0, state)
+                .word(1, exit_reason)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        }
 
-            procmgr_labels::REQUEST_FRAMES =>
-            {
-                handle_request_frames(&req, ipc_buf, &mut pool);
-            }
+        procmgr_labels::CREATE_FROM_VFS =>
+        {
+            handle_create_from_vfs(&req, ipc_buf, ctx, pool, table);
+        }
 
-            procmgr_labels::DESTROY_PROCESS =>
+        procmgr_labels::SET_VFSD_EP =>
+        {
+            let caps = req.caps();
+            if caps.is_empty()
             {
-                // Token from ipc_recv identifies which process to destroy.
-                process::destroy_process(token, &mut table);
+                reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+            }
+            else
+            {
+                ctx.vfsd_ep = caps[0];
                 reply_empty(ipc_buf, procmgr_errors::SUCCESS);
             }
+        }
 
-            procmgr_labels::QUERY_PROCESS =>
-            {
-                // Token identifies which process to query. Reply data:
-                //   word 0 = state code (see `procmgr_process_state`)
-                //   word 1 = exit_reason (0 until auto-reap lands)
-                use ipc::procmgr_process_state;
-                let (state, exit_reason) = match table.query_by_token(token)
-                {
-                    Some(true) => (procmgr_process_state::ALIVE, 0u64),
-                    Some(false) => (procmgr_process_state::CREATED, 0u64),
-                    None => (procmgr_process_state::UNKNOWN, 0u64),
-                };
-                let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
-                    .word(0, state)
-                    .word(1, exit_reason)
-                    .build();
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-            }
+        procmgr_labels::CONFIGURE_PIPE =>
+        {
+            handle_configure_pipe(&req, ipc_buf, ctx.self_aspace, table);
+        }
 
-            procmgr_labels::CREATE_FROM_VFS =>
-            {
-                handle_create_from_vfs(&req, ipc_buf, &ctx, &mut pool, &mut table);
-            }
+        _ =>
+        {
+            reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
+        }
+    }
+}
 
-            procmgr_labels::SET_VFSD_EP =>
-            {
-                let caps = req.caps();
-                if caps.is_empty()
-                {
-                    reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-                }
-                else
-                {
-                    ctx.vfsd_ep = caps[0];
-                    reply_empty(ipc_buf, procmgr_errors::SUCCESS);
-                }
-            }
-
-            procmgr_labels::CONFIGURE_PIPE =>
-            {
-                handle_configure_pipe(&req, ipc_buf, ctx.self_aspace, &mut table);
-            }
-
-            _ =>
-            {
-                reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
-            }
+/// Death-queue dispatch. Drains all pending death events on the shared
+/// queue, reaps each by correlator, and records the exit reason in the
+/// recent-exits ring for `QUERY_PROCESS`.
+fn dispatch_death(
+    death_eq: u32,
+    table: &mut process::ProcessTable,
+    recent: &mut process::RecentExits,
+)
+{
+    loop
+    {
+        let Ok(payload) = syscall::event_try_recv(death_eq)
+        else
+        {
+            return;
+        };
+        let correlator = (payload >> 32) as u32;
+        let exit_reason = payload & 0xFFFF_FFFF;
+        if let Some(entry) = table.take_by_correlator(correlator)
+        {
+            let entry_token = entry.token();
+            recent.record(entry_token, exit_reason);
+            process::teardown_entry(entry);
         }
     }
 }
@@ -542,13 +632,12 @@ pub struct ProcmgrCtx
     pub log_ep: u32,
     /// Single shared death-notification event queue. Every spawned child
     /// binds its thread to this queue (via multi-bind in the kernel) with
-    /// `correlator = entry.token as u32`. Auto-reap fan-in: one queue
-    /// scales with process count, while procmgr's wait-set stays a
-    /// constant two members.
+    /// `correlator = entry.token as u32`. Multiplexed alongside the
+    /// service endpoint via the wait-set in `ws_cap`.
     pub death_eq: u32,
-    /// Wait-set cap. Multiplexes procmgr's service endpoint (token 0) and
-    /// the shared death event queue (token 1). Fixed two members — does
-    /// not grow with `MAX_PROCESSES`.
+    /// Wait-set cap. Multiplexes procmgr's service endpoint
+    /// (`WS_TOKEN_SERVICE`) and the shared death event queue
+    /// (`WS_TOKEN_DEATH`). Fixed two members.
     pub ws_cap: u32,
 }
 

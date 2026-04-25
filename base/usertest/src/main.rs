@@ -130,6 +130,35 @@ fn stack_overflow_phase()
         "expected fault exit_reason in 0x1000..0x2000, got {raw:#x}"
     );
 
+    // Auto-reap verification on the fault path. Procmgr's recent-exits
+    // ring must record the same fault reason the spawner observed,
+    // confirming `dispatch_death` runs on fault-exit observers as well as
+    // clean-exit observers (both come from the same kernel
+    // `post_death_notification` walk).
+    {
+        let info = startup_info();
+        // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
+        #[allow(clippy::cast_ptr_alignment)]
+        let ipc_buf = info.ipc_buffer.cast::<u64>();
+        let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
+        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(id, &query, ipc_buf) }
+            .expect("QUERY_PROCESS call after fault failed");
+        assert_eq!(reply.label, ipc::procmgr_errors::SUCCESS);
+        let state = reply.word(0);
+        let exit_reason = reply.word(1);
+        assert_eq!(
+            state,
+            ipc::procmgr_process_state::EXITED,
+            "expected EXITED for faulted child, got {state}"
+        );
+        assert_eq!(
+            exit_reason, raw,
+            "auto-reap exit_reason {exit_reason:#x} does not match spawner-observed {raw:#x}"
+        );
+        std::os::seraph::log!("auto_reap_fault (EXITED) passed");
+    }
+
     std::os::seraph::log!("stack_overflow phase passed (exit_reason={raw:#x})");
 }
 
@@ -842,9 +871,11 @@ fn spawn_phase()
     let id = child.id();
     std::os::seraph::log!("spawned /bin/hello handle={id:#x}");
 
-    // Exercise procmgr's QUERY_PROCESS IPC before reaping: the child is
-    // post-spawn, pre-drop, so procmgr's ProcessTable still has an entry
-    // with `started=true`, which maps to `ALIVE`.
+    // Exercise procmgr's QUERY_PROCESS IPC before `wait()`. Two valid
+    // outcomes: `ALIVE` (we won the race against the child's exit + the
+    // auto-reap drain) or `EXITED` (auto-reap already saw the death and
+    // moved the entry to the recent-exits ring). `/bin/hello` exits in
+    // microseconds; either result indicates the IPC plumbing works.
     {
         let info = startup_info();
         // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
@@ -863,13 +894,22 @@ fn spawn_phase()
         );
         let state = reply.word(0);
         let exit_reason = reply.word(1);
-        assert_eq!(
-            state,
-            ipc::procmgr_process_state::ALIVE,
-            "expected ALIVE for live child, got {state}"
-        );
-        assert_eq!(exit_reason, 0, "ALIVE process must report exit_reason=0");
-        std::os::seraph::log!("query_process (ALIVE) passed");
+        match state
+        {
+            s if s == ipc::procmgr_process_state::ALIVE =>
+            {
+                assert_eq!(exit_reason, 0, "ALIVE process must report exit_reason=0");
+            }
+            s if s == ipc::procmgr_process_state::EXITED =>
+            {
+                assert_eq!(
+                    exit_reason, 0,
+                    "clean child must report exit_reason=0, got {exit_reason:#x}"
+                );
+            }
+            other => panic!("expected ALIVE or EXITED, got {other}"),
+        }
+        std::os::seraph::log!("query_process pre-wait passed (state={state})");
     }
 
     let status = child.wait().expect("child wait failed");
@@ -887,6 +927,43 @@ fn spawn_phase()
         "try_wait after wait must surface cached status"
     );
     std::os::seraph::log!("try_wait phase passed");
+
+    // Auto-reap verification. Procmgr's `dispatch_death` runs on the next
+    // service-endpoint wakeup; the child's death event was posted to
+    // procmgr's shared `death_eq` when the kernel wrote `Exited`, and
+    // procmgr drains the queue at the top of every iteration. By the time
+    // this `QUERY_PROCESS` lands, procmgr has already consumed the death
+    // event, removed the table entry, and stashed the exit reason in the
+    // recent-exits ring — so the reply must be `EXITED` with
+    // `exit_reason == 0` (clean voluntary exit).
+    {
+        let info = startup_info();
+        // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
+        #[allow(clippy::cast_ptr_alignment)]
+        let ipc_buf = info.ipc_buffer.cast::<u64>();
+        let query = ipc::IpcMessage::new(ipc::procmgr_labels::QUERY_PROCESS);
+        // SAFETY: `ipc_buf` is the kernel-registered, page-aligned IPC
+        // buffer page installed by `_start`.
+        let reply =
+            unsafe { ipc::ipc_call(id, &query, ipc_buf) }.expect("QUERY_PROCESS call failed");
+        assert_eq!(
+            reply.label,
+            ipc::procmgr_errors::SUCCESS,
+            "QUERY_PROCESS non-success label after auto-reap"
+        );
+        let state = reply.word(0);
+        let exit_reason = reply.word(1);
+        assert_eq!(
+            state,
+            ipc::procmgr_process_state::EXITED,
+            "expected EXITED after auto-reap, got {state}"
+        );
+        assert_eq!(
+            exit_reason, 0,
+            "clean child must report exit_reason=0, got {exit_reason:#x}"
+        );
+        std::os::seraph::log!("auto_reap (EXITED) passed");
+    }
 
     std::os::seraph::log!("spawn phase passed");
 }

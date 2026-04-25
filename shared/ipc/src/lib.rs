@@ -137,6 +137,11 @@ pub mod procmgr_process_state
     /// No entry for this token — already reaped, or the token was never
     /// valid. Equivalent to `ESRCH`.
     pub const UNKNOWN: u64 = 2;
+    /// Entry has been auto-reaped by procmgr but the token is still in the
+    /// recent-exits ring. Reply word 1 carries the kernel-encoded
+    /// `exit_reason`. Recent-exit retention is best-effort; once the ring
+    /// rotates, queries on the same token return `UNKNOWN`.
+    pub const EXITED: u64 = 3;
 }
 
 /// IPC labels for the service manager (`svcmgr`).

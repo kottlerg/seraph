@@ -128,9 +128,16 @@ the child's `_start` will find them.
 - **`InitInfo` page.** The kernel maps a read-only page at
   `INIT_INFO_VADDR` (today an ABI constant in
   [`abi/init-protocol`](../abi/init-protocol/)) for init only.
-- **Main-thread stack.** Procmgr maps `PROCESS_STACK_PAGES` pages
-  ending at `PROCESS_STACK_TOP` (today an ABI constant) with a guard
-  page below.
+- **Main-thread stack.** The loader (procmgr or, for memmgr/procmgr,
+  init) maps `ProcessInfo.stack_pages` pages ending at
+  `ProcessInfo.stack_top_vaddr` (today equal to the
+  `PROCESS_STACK_TOP` ABI constant) with a guard page below. The page
+  count comes from the binary's optional `.note.seraph.stack` ELF note
+  (declared via the `process_abi::stack_pages!` / `seraph::stack_pages!`
+  macro); binaries that omit the note inherit
+  `DEFAULT_PROCESS_STACK_PAGES`. Loaders clamp to
+  `MAX_PROCESS_STACK_PAGES`; memmgr's per-process quota remains the
+  policy gate on the resulting `REQUEST_FRAMES` calls.
 - **Main-thread IPC buffer.** Procmgr picks a per-process VA and writes
   it into `ProcessInfo.ipc_buffer_vaddr` — this is already a runtime
   field, not an ABI constant.

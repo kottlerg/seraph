@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 10;
+pub const PROCESS_ABI_VERSION: u32 = 11;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -47,12 +47,121 @@ pub const PROCESS_INFO_VADDR: u64 = 0x0000_7FFF_FFFF_0000;
 
 /// Virtual address of the top of a normal process's user stack.
 ///
-/// `PROCESS_STACK_PAGES` pages are mapped immediately below this address.
-/// One additional guard page (unmapped) sits below the stack.
+/// `ProcessInfo.stack_pages` pages are mapped immediately below this
+/// address. One additional guard page (unmapped) sits below the stack.
 pub const PROCESS_STACK_TOP: u64 = 0x0000_7FFF_FFFF_E000;
 
-/// Number of 4 KiB pages in a normal process's user stack (32 KiB total).
-pub const PROCESS_STACK_PAGES: usize = 8;
+/// Default main-thread stack size in 4 KiB pages (32 KiB total).
+///
+/// Loaders use this when the binary does not declare a custom size via
+/// the `.note.seraph.stack` ELF note. Binaries with deeper stack
+/// pressure (memmgr's bootstrap parser, future fs-cache workers)
+/// declare a larger value through the `elf::stack_pages!` macro.
+pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
+
+/// Hard cap on the declared main-thread stack size, in 4 KiB pages.
+///
+/// Loaders clamp the note value to this bound before allocation;
+/// memmgr's existing per-process quota remains the actual policy gate.
+/// 256 pages = 1 MiB — far above any realistic in-tree need, sized to
+/// catch a corrupt or hostile note rather than to ration memory.
+pub const MAX_PROCESS_STACK_PAGES: u32 = 256;
+
+// ── Stack-size ELF note (`.note.seraph.stack`) ──────────────────────────────
+//
+// Binary-side declaration: every binary may emit one custom ELF note
+// declaring its desired main-thread stack size. Loaders (init, procmgr)
+// read the note when loading the binary and substitute the declared
+// value for [`DEFAULT_PROCESS_STACK_PAGES`].
+//
+// The format lives in `process-abi` rather than `shared/elf` because
+// it is a contract between binary producers and the spawner, in the
+// same shape as `ProcessInfo` — binaries opt in via the
+// [`stack_pages!`] macro which expands to a `#[link_section]` static of
+// type [`StackNote`]. `shared/elf` consumes these constants on the
+// loader side via `parse_stack_note` / `parse_stack_note_streaming`.
+//
+// Standard ELF note layout: a header (`namesz`, `descsz`, `ntype`)
+// followed by `name` (padded to 4-byte alignment) and `desc` (likewise).
+// For this note: `namesz = 7`, `descsz = 8`, `ntype = NT_SERAPH_STACK`,
+// `name = b"seraph\0\0"` (7 bytes + 1 align padding), `desc =
+// StackNoteDesc { pages, reserved: 0 }`.
+
+/// Vendor name for Seraph-specific ELF notes. Seven bytes plus the
+/// terminating NUL, then one padding byte to 8-byte alignment for the
+/// descriptor that follows.
+pub const SERAPH_NOTE_NAME: [u8; 8] = *b"seraph\0\0";
+
+/// Note type for the main-thread stack-size declaration.
+pub const NT_SERAPH_STACK: u32 = 1;
+
+/// Section name carrying the stack-size note.
+pub const SERAPH_STACK_NOTE_SECTION: &str = ".note.seraph.stack";
+
+/// Descriptor bytes for the stack-size note. Eight bytes, naturally
+/// 4-byte aligned so no trailing pad is required.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StackNoteDesc
+{
+    /// Declared main-thread stack size in 4 KiB pages.
+    pub pages: u32,
+    /// Reserved for future flags. Must be zero on emit; ignored on parse.
+    pub reserved: u32,
+}
+
+/// Full on-disk repr of the Seraph stack-size note. Place into
+/// `.note.seraph.stack` via the [`stack_pages!`] macro; loaders
+/// recognise it by section name and the embedded `name`/`ntype` fields.
+#[repr(C)]
+pub struct StackNote
+{
+    /// Length of `name` (must be 7 for `b"seraph\0"`).
+    pub namesz: u32,
+    /// Length of `desc` (must be 8 for `StackNoteDesc`).
+    pub descsz: u32,
+    /// Note type (`NT_SERAPH_STACK`).
+    pub ntype: u32,
+    /// Vendor name, NUL-terminated and padded to 4-byte alignment.
+    pub name: [u8; 8],
+    /// Stack size descriptor.
+    pub desc: StackNoteDesc,
+}
+
+impl StackNote
+{
+    /// Build a stack-size note declaring the given page count.
+    #[must_use]
+    pub const fn new(pages: u32) -> Self
+    {
+        Self {
+            namesz: 7,
+            descsz: 8,
+            ntype: NT_SERAPH_STACK,
+            name: SERAPH_NOTE_NAME,
+            desc: StackNoteDesc { pages, reserved: 0 },
+        }
+    }
+}
+
+/// Declare the main-thread stack size for this binary as `$pages` 4 KiB
+/// pages. Expands to a `#[used]` static placed in
+/// `.note.seraph.stack`; loaders (init, procmgr) read it before mapping
+/// the child's stack. Binaries that omit the macro inherit
+/// [`DEFAULT_PROCESS_STACK_PAGES`].
+///
+/// Usable from any crate that depends on `process-abi` (every Seraph
+/// userspace component already does, directly or indirectly through
+/// std). std re-exports it as `seraph::stack_pages!` for ergonomic use
+/// from std-built binaries.
+#[macro_export]
+macro_rules! stack_pages {
+    ($pages:expr) => {
+        #[used]
+        #[unsafe(link_section = ".note.seraph.stack")]
+        static __SERAPH_STACK_NOTE: $crate::StackNote = $crate::StackNote::new($pages);
+    };
+}
 
 /// Virtual address of the main thread's TLS block in a normal process.
 ///
@@ -272,6 +381,20 @@ pub struct ProcessInfo
     pub stderr_data_signal_cap: u32,
     /// Space-available signal for the stderr pipe. Reader-kicked.
     pub stderr_space_signal_cap: u32,
+
+    // ── Main-thread stack envelope ─────────────────────────────────────
+    //
+    // Loaders pick the stack size per-binary (see `.note.seraph.stack`)
+    // and write the resulting envelope here. Children that want to
+    // introspect their own stack range (overflow diagnostics, future
+    // crash dumpers) read these fields. `stack_top_vaddr` is the value
+    // of the SP register at thread entry; the live mapping covers
+    // `[stack_top_vaddr - stack_pages * PAGE_SIZE, stack_top_vaddr)`.
+    /// Virtual address of the top of the main-thread stack.
+    pub stack_top_vaddr: u64,
+
+    /// Number of 4 KiB pages mapped for the main-thread stack.
+    pub stack_pages: u32,
 }
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────
@@ -356,6 +479,14 @@ pub struct StartupInfo
 
     /// Number of env entries in [`Self::env_blob`].
     pub env_count: usize,
+
+    /// Virtual address of the top of the main-thread stack — the value
+    /// of SP at thread entry. Live mapping covers
+    /// `[stack_top_vaddr - stack_pages * PAGE_SIZE, stack_top_vaddr)`.
+    pub stack_top_vaddr: u64,
+
+    /// Number of 4 KiB pages mapped for the main-thread stack.
+    pub stack_pages: u32,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

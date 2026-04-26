@@ -510,6 +510,310 @@ pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, 
     Ok(None)
 }
 
+// ── Seraph stack-size note parser ───────────────────────────────────────────
+//
+// The on-disk note format and the `stack_pages!` macro live in
+// `process-abi` (the binary contract between spawner and child). This
+// crate consumes the same constants on the loader side: section header
+// walking and note-payload validation.
+
+/// Section type: notes (`SHT_NOTE`).
+const SHT_NOTE: u32 = 7;
+
+/// 64-bit ELF section header (`Elf64_Shdr`). Used only when locating the
+/// stack-size note; loaders never depend on section headers for segment
+/// data (which lives in `PT_LOAD`).
+#[repr(C)]
+#[allow(clippy::struct_field_names)]
+struct Elf64Shdr
+{
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+}
+
+/// Locate the `.note.seraph.stack` note in a fully-mapped ELF image and
+/// return the declared page count.
+///
+/// Returns `None` when the binary has no note, or when the note is
+/// malformed (wrong name, wrong type, wrong descsz). Loaders should
+/// treat `None` as "use default."
+///
+/// `ehdr` must come from a successful [`validate`] on `data`. Walks the
+/// section header table; the descriptor is read directly from the byte
+/// slice without allocating.
+#[must_use]
+pub fn parse_stack_note(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<u32>
+{
+    let shoff = ehdr.e_shoff as usize;
+    let shnum = ehdr.e_shnum as usize;
+    let shentsize = ehdr.e_shentsize as usize;
+    if shoff == 0 || shnum == 0 || shentsize < size_of::<Elf64Shdr>()
+    {
+        return None;
+    }
+    let table_end = shoff.checked_add(shnum.checked_mul(shentsize)?)?;
+    if table_end > data.len()
+    {
+        return None;
+    }
+    let strtab_idx = ehdr.e_shstrndx as usize;
+    if strtab_idx >= shnum
+    {
+        return None;
+    }
+
+    let strtab = read_shdr(data, shoff, shentsize, strtab_idx)?;
+    let strtab_off = strtab.sh_offset as usize;
+    let strtab_size = strtab.sh_size as usize;
+    let strtab_end = strtab_off.checked_add(strtab_size)?;
+    if strtab_end > data.len()
+    {
+        return None;
+    }
+    let strtab_bytes = &data[strtab_off..strtab_end];
+
+    for i in 0..shnum
+    {
+        let Some(shdr) = read_shdr(data, shoff, shentsize, i)
+        else
+        {
+            continue;
+        };
+        if shdr.sh_type != SHT_NOTE
+        {
+            continue;
+        }
+        if !section_name_eq(
+            strtab_bytes,
+            shdr.sh_name as usize,
+            process_abi::SERAPH_STACK_NOTE_SECTION,
+        )
+        {
+            continue;
+        }
+        let off = shdr.sh_offset as usize;
+        let size = shdr.sh_size as usize;
+        let end = off.checked_add(size)?;
+        if end > data.len()
+        {
+            return None;
+        }
+        return parse_note_payload(&data[off..end]);
+    }
+    None
+}
+
+/// Locate `.note.seraph.stack` when only the ELF header page is in
+/// memory. `read_at` fetches `dst.len()` bytes from `file_offset` and
+/// returns the number of bytes copied (or `None` on I/O error).
+///
+/// Used by procmgr's VFS-streaming spawn path: the section header table
+/// and the matching note section are fetched on demand via the same
+/// `vfs_read` primitive that loads `PT_LOAD` pages.
+pub fn parse_stack_note_streaming<F>(
+    ehdr: &Elf64Ehdr,
+    file_size: u64,
+    mut read_at: F,
+) -> Option<u32>
+where
+    F: FnMut(u64, &mut [u8]) -> Option<usize>,
+{
+    let shoff = ehdr.e_shoff;
+    let shnum = ehdr.e_shnum as usize;
+    let shentsize = ehdr.e_shentsize as usize;
+    if shoff == 0 || shnum == 0 || shentsize < size_of::<Elf64Shdr>()
+    {
+        return None;
+    }
+    let table_size = (shnum as u64).checked_mul(shentsize as u64)?;
+    let table_end = shoff.checked_add(table_size)?;
+    if table_end > file_size
+    {
+        return None;
+    }
+    let strtab_idx = ehdr.e_shstrndx as usize;
+    if strtab_idx >= shnum
+    {
+        return None;
+    }
+
+    let strtab_shdr = read_shdr_streaming(shoff, shentsize, strtab_idx, &mut read_at)?;
+    let strtab_off = strtab_shdr.sh_offset;
+    let strtab_size = strtab_shdr.sh_size as usize;
+    if strtab_size == 0 || strtab_size > MAX_STREAMING_STRTAB
+    {
+        return None;
+    }
+    if strtab_off.checked_add(strtab_size as u64)? > file_size
+    {
+        return None;
+    }
+    let mut strtab_buf = [0u8; MAX_STREAMING_STRTAB];
+    let got = read_at(strtab_off, &mut strtab_buf[..strtab_size])?;
+    if got < strtab_size
+    {
+        return None;
+    }
+    let strtab_bytes = &strtab_buf[..strtab_size];
+
+    for i in 0..shnum
+    {
+        let Some(shdr) = read_shdr_streaming(shoff, shentsize, i, &mut read_at)
+        else
+        {
+            continue;
+        };
+        if shdr.sh_type != SHT_NOTE
+        {
+            continue;
+        }
+        if !section_name_eq(
+            strtab_bytes,
+            shdr.sh_name as usize,
+            process_abi::SERAPH_STACK_NOTE_SECTION,
+        )
+        {
+            continue;
+        }
+        let size = shdr.sh_size as usize;
+        if size == 0 || size > MAX_STREAMING_NOTE
+        {
+            return None;
+        }
+        if shdr.sh_offset.checked_add(size as u64)? > file_size
+        {
+            return None;
+        }
+        let mut buf = [0u8; MAX_STREAMING_NOTE];
+        let got = read_at(shdr.sh_offset, &mut buf[..size])?;
+        if got < size
+        {
+            return None;
+        }
+        return parse_note_payload(&buf[..size]);
+    }
+    None
+}
+
+/// Upper bound on the section name string table size accepted by the
+/// streaming parser. Tier-1/2 binaries land well under 4 KiB; the cap
+/// keeps the on-stack buffer fixed without heap allocation.
+const MAX_STREAMING_STRTAB: usize = 4096;
+
+/// Upper bound on the note section size accepted by the streaming
+/// parser. Our note is 28 bytes; 64 leaves headroom for future fields.
+const MAX_STREAMING_NOTE: usize = 64;
+
+fn read_shdr(data: &[u8], shoff: usize, shentsize: usize, idx: usize) -> Option<Elf64Shdr>
+{
+    let offset = shoff.checked_add(idx.checked_mul(shentsize)?)?;
+    let end = offset.checked_add(size_of::<Elf64Shdr>())?;
+    if end > data.len()
+    {
+        return None;
+    }
+    // SAFETY: bounds-checked above. cast_ptr_alignment: we read fields one
+    // at a time below to avoid any alignment requirement on `data`.
+    let bytes = &data[offset..end];
+    Some(decode_shdr(bytes))
+}
+
+fn read_shdr_streaming<F>(
+    shoff: u64,
+    shentsize: usize,
+    idx: usize,
+    read_at: &mut F,
+) -> Option<Elf64Shdr>
+where
+    F: FnMut(u64, &mut [u8]) -> Option<usize>,
+{
+    let offset = shoff.checked_add((idx as u64).checked_mul(shentsize as u64)?)?;
+    let mut buf = [0u8; size_of::<Elf64Shdr>()];
+    let got = read_at(offset, &mut buf)?;
+    if got < buf.len()
+    {
+        return None;
+    }
+    Some(decode_shdr(&buf))
+}
+
+fn decode_shdr(bytes: &[u8]) -> Elf64Shdr
+{
+    Elf64Shdr {
+        sh_name: u32_le(&bytes[0..4]),
+        sh_type: u32_le(&bytes[4..8]),
+        sh_flags: u64_le(&bytes[8..16]),
+        sh_addr: u64_le(&bytes[16..24]),
+        sh_offset: u64_le(&bytes[24..32]),
+        sh_size: u64_le(&bytes[32..40]),
+        sh_link: u32_le(&bytes[40..44]),
+        sh_info: u32_le(&bytes[44..48]),
+        sh_addralign: u64_le(&bytes[48..56]),
+        sh_entsize: u64_le(&bytes[56..64]),
+    }
+}
+
+fn u32_le(b: &[u8]) -> u32
+{
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn u64_le(b: &[u8]) -> u64
+{
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+fn section_name_eq(strtab: &[u8], offset: usize, expected: &str) -> bool
+{
+    if offset >= strtab.len()
+    {
+        return false;
+    }
+    let bytes = expected.as_bytes();
+    let end = offset.saturating_add(bytes.len());
+    if end >= strtab.len() || strtab[offset..end] != *bytes
+    {
+        return false;
+    }
+    strtab[end] == 0
+}
+
+fn parse_note_payload(bytes: &[u8]) -> Option<u32>
+{
+    if bytes.len() < 12
+    {
+        return None;
+    }
+    let namesz = u32_le(&bytes[0..4]) as usize;
+    let descsz = u32_le(&bytes[4..8]) as usize;
+    let ntype = u32_le(&bytes[8..12]);
+    if ntype != process_abi::NT_SERAPH_STACK || namesz != 7 || descsz != 8
+    {
+        return None;
+    }
+    let name_padded = (namesz + 3) & !3;
+    let name_end = 12usize.checked_add(name_padded)?;
+    let desc_end = name_end.checked_add(descsz)?;
+    if desc_end > bytes.len()
+    {
+        return None;
+    }
+    if bytes[12..12 + 7] != process_abi::SERAPH_NOTE_NAME[..7]
+    {
+        return None;
+    }
+    let pages = u32_le(&bytes[name_end..name_end + 4]);
+    Some(pages)
+}
+
 /// Locate the `PT_TLS` segment using only the ELF header page, validating
 /// `p_filesz` against a declared `file_size` instead of a buffer length.
 ///

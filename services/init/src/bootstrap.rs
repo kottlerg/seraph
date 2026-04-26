@@ -17,7 +17,8 @@ use crate::logging::log;
 use crate::{FrameAlloc, PAGE_SIZE, TEMP_MAP_BASE, arch};
 use init_protocol::{CapDescriptor, InitInfo};
 use process_abi::{
-    PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, PROCESS_STACK_PAGES, PROCESS_STACK_TOP,
+    DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION, PROCESS_INFO_VADDR,
+    PROCESS_STACK_TOP,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -221,16 +222,23 @@ fn prepare_main_tls(
 
 /// Load an ELF image into a target address space.
 ///
-/// Returns the entry point virtual address.
+/// Returns `(entry_point_vaddr, stack_pages)` — `stack_pages` reflects
+/// the binary's `.note.seraph.stack` declaration when present, falling
+/// back to [`DEFAULT_PROCESS_STACK_PAGES`] otherwise. The caller passes
+/// `stack_pages` into [`map_stack_and_ipc`] and the matching
+/// `populate_*_info` so the child sees a consistent envelope.
 fn load_elf(
     module_bytes: &[u8],
     target_aspace: u32,
     alloc: &mut FrameAlloc,
     init_aspace: u32,
-) -> Option<u64>
+) -> Option<(u64, u32)>
 {
     let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
     let entry = elf::entry_point(ehdr);
+    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
+        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
+        .clamp(1, MAX_PROCESS_STACK_PAGES);
 
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
@@ -274,7 +282,7 @@ fn load_elf(
         }
     }
 
-    Some(entry)
+    Some((entry, stack_pages))
 }
 
 // ── Memmgr bootstrap ────────────────────────────────────────────────────────
@@ -340,8 +348,12 @@ struct MemmgrCaps
 
 /// Populate memmgr's `ProcessInfo` page and map it read-only into memmgr.
 #[allow(clippy::similar_names)]
-fn populate_memmgr_info(alloc: &mut FrameAlloc, init_aspace: u32, caps: &MemmgrCaps)
--> Option<u32>
+fn populate_memmgr_info(
+    alloc: &mut FrameAlloc,
+    init_aspace: u32,
+    caps: &MemmgrCaps,
+    stack_pages: u32,
+) -> Option<u32>
 {
     let pi_frame = alloc.alloc_zero_page(init_aspace, TEMP_MAP_BASE)?;
     // SAFETY: TEMP_MAP_BASE is mapped writable and zeroed, one page.
@@ -371,6 +383,8 @@ fn populate_memmgr_info(alloc: &mut FrameAlloc, init_aspace: u32, caps: &MemmgrC
     pi.stdout_space_signal_cap = 0;
     pi.stderr_data_signal_cap = 0;
     pi.stderr_space_signal_cap = 0;
+    pi.stack_top_vaddr = PROCESS_STACK_TOP;
+    pi.stack_pages = stack_pages;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
 
@@ -436,7 +450,7 @@ pub fn bootstrap_memmgr(
     log("created memmgr kernel objects");
     log("loading memmgr ELF segments");
 
-    let entry = load_elf(module_bytes, mm_aspace, alloc, init_aspace)?;
+    let (entry, stack_pages) = load_elf(module_bytes, mm_aspace, alloc, init_aspace)?;
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
     log("loaded memmgr ELF");
 
@@ -455,8 +469,8 @@ pub fn bootstrap_memmgr(
         thread: mm_thread,
         creator_endpoint_slot: mm_creator_slot,
     };
-    populate_memmgr_info(alloc, init_aspace, &mm_caps)?;
-    map_stack_and_ipc(alloc, mm_aspace, PROCMGR_IPC_BUF_VA)?;
+    populate_memmgr_info(alloc, init_aspace, &mm_caps, stack_pages)?;
+    map_stack_and_ipc(alloc, mm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
 
     // Mint procmgr's tokened SEND cap on memmgr's endpoint. Memmgr will
     // recognise calls bearing this token as authorised for the
@@ -588,6 +602,7 @@ fn populate_procmgr_info(
     alloc: &mut FrameAlloc,
     init_aspace: u32,
     caps: &ProcmgrCaps,
+    stack_pages: u32,
 ) -> Option<u32>
 {
     let pi_frame = alloc.alloc_zero_page(init_aspace, TEMP_MAP_BASE)?;
@@ -629,6 +644,8 @@ fn populate_procmgr_info(
     pi.tls_template_filesz = caps.tls.filesz;
     pi.tls_template_memsz = caps.tls.memsz;
     pi.tls_template_align = caps.tls.align;
+    pi.stack_top_vaddr = PROCESS_STACK_TOP;
+    pi.stack_pages = stack_pages;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
 
@@ -639,17 +656,22 @@ fn populate_procmgr_info(
 }
 
 /// Map stack and IPC buffer pages into the target address space.
-fn map_stack_and_ipc(alloc: &mut FrameAlloc, target_aspace: u32, ipc_buf_va: u64) -> Option<()>
+fn map_stack_and_ipc(
+    alloc: &mut FrameAlloc,
+    target_aspace: u32,
+    ipc_buf_va: u64,
+    stack_pages: u32,
+) -> Option<()>
 {
-    let stack_base = PROCESS_STACK_TOP - (PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
-    for i in 0..PROCESS_STACK_PAGES
+    let stack_base = PROCESS_STACK_TOP - u64::from(stack_pages) * PAGE_SIZE;
+    for i in 0..stack_pages
     {
         let frame = alloc.alloc_page()?;
         let rw_cap = syscall::cap_derive(frame, syscall::RIGHTS_MAP_RW).ok()?;
         syscall::mem_map(
             rw_cap,
             target_aspace,
-            stack_base + (i as u64) * PAGE_SIZE,
+            stack_base + u64::from(i) * PAGE_SIZE,
             0,
             1,
             0,
@@ -744,7 +766,7 @@ pub fn bootstrap_procmgr(
     log("created procmgr kernel objects");
     log("loading procmgr ELF segments");
 
-    let entry = load_elf(module_bytes, pm_aspace, alloc, init_aspace)?;
+    let (entry, stack_pages) = load_elf(module_bytes, pm_aspace, alloc, init_aspace)?;
 
     // Allocate, populate, and map the main thread's TLS block while the
     // module is still mapped — `prepare_main_tls` re-validates the ELF
@@ -821,9 +843,9 @@ pub fn bootstrap_procmgr(
         log_discovery_slot,
         tls: pm_tls_meta,
     };
-    populate_procmgr_info(alloc, init_aspace, &pm_caps)?;
+    populate_procmgr_info(alloc, init_aspace, &pm_caps, stack_pages)?;
 
-    map_stack_and_ipc(alloc, pm_aspace, PROCMGR_IPC_BUF_VA)?;
+    map_stack_and_ipc(alloc, pm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
 
     syscall::thread_configure_with_tls(
         pm_thread,

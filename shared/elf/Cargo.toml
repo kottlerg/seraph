@@ -9,6 +9,7 @@ test = false
 doctest = false
 
 [dependencies]
+process-abi = { path = "../../abi/process-abi" }
 
 [lints]
 workspace = true

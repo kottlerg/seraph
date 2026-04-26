@@ -228,6 +228,39 @@ dependency or identical definition) to avoid divergence.
 
 ---
 
+## Stack-size note (`.note.seraph.stack`)
+
+A binary may declare its main-thread stack size by emitting a custom
+ELF note in section `.note.seraph.stack`. The loader (init for
+memmgr/procmgr; procmgr for everyone else) reads the note before
+mapping the child's stack and substitutes the declared value for
+`DEFAULT_PROCESS_STACK_PAGES`. Binaries that omit the note inherit
+the default.
+
+```rust
+// In any std-built binary:
+seraph::stack_pages!(12);   // declare a 48 KiB main-thread stack
+
+// In any no_std binary that depends on `process-abi`:
+process_abi::stack_pages!(12);
+```
+
+The note expands to a `#[used] #[link_section = ".note.seraph.stack"]`
+static of type `StackNote` (defined in this crate). Both macro paths
+emit identical bytes; the std re-export simply lets std-using binaries
+declare a stack size without an extra Cargo dep on `process-abi`.
+
+`MAX_PROCESS_STACK_PAGES` is a loader-side hard cap (256 pages = 1 MiB)
+that catches a corrupt or hostile note. memmgr's existing per-process
+quota remains the actual policy gate on the resulting `REQUEST_FRAMES`
+calls.
+
+The on-disk shape is read by `elf::parse_stack_note` (full-bytes path,
+used by init) and `elf::parse_stack_note_streaming` (header-page +
+on-demand reads, used by procmgr's VFS-streaming spawn path).
+
+---
+
 ## Versioning
 
 `PROCESS_ABI_VERSION` MUST be incremented on any breaking change to the

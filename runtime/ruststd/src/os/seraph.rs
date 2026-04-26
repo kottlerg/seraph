@@ -30,6 +30,13 @@ use crate::sys::stdio::seraph as pal_stdio;
 
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, process_info_ref};
 
+/// Re-export of [`process_abi::StackNote`]. Lets the [`stack_pages!`]
+/// macro emit a typed static through `std::os::seraph::StackNote`,
+/// keeping std-using binaries free of a direct `process-abi` Cargo
+/// dependency.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub use process_abi::StackNote;
+
 /// Startup information the kernel+procmgr hand to a process at spawn time,
 /// materialised by `_start` from the read-only `ProcessInfo` page and made
 /// available through [`startup_info`]. A std-local copy of the shape defined in
@@ -131,6 +138,14 @@ pub struct StartupInfo {
     /// Number of NUL-terminated `KEY=VALUE` entries in [`Self::env_blob`].
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub env_count: usize,
+    /// Virtual address of the top of the main-thread stack — the value
+    /// SP held at `_start`. The live mapping covers
+    /// `[stack_top_vaddr - stack_pages * PAGE_SIZE, stack_top_vaddr)`.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub stack_top_vaddr: u64,
+    /// Number of 4 KiB pages mapped for the main-thread stack.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub stack_pages: u32,
 }
 
 // SAFETY: `ipc_buffer` points at a process-global page mapped for the life of
@@ -315,6 +330,8 @@ pub extern "C" fn _start() -> ! {
         args_count: info.args_count as usize,
         env_blob,
         env_count: info.env_count as usize,
+        stack_top_vaddr: info.stack_top_vaddr,
+        stack_pages: info.stack_pages,
     };
 
     // SAFETY: single writer; we are the only code running at this point.
@@ -514,4 +531,30 @@ macro_rules! __seraph_log {
 // re-export coexists with the `pub mod log { … }` above.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub use crate::__seraph_log as log;
+
+// ── Stack-size declaration macro ────────────────────────────────────────────
+//
+// Mirrors `process_abi::stack_pages!` but expands to a static typed via
+// `std::os::seraph::StackNote` (a re-export of `process_abi::StackNote`),
+// so std-using binaries can declare a custom main-thread stack without
+// adding `process-abi` to their Cargo manifest.
+
+/// Declare the main-thread stack size for this binary as `$pages` 4 KiB
+/// pages. Expands to a `#[used]` static placed in
+/// `.note.seraph.stack`; loaders read it before mapping the child's
+/// stack. Binaries that omit the macro inherit
+/// `process_abi::DEFAULT_PROCESS_STACK_PAGES`.
+#[macro_export]
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+macro_rules! __seraph_stack_pages {
+    ($pages:expr) => {
+        #[used]
+        #[unsafe(link_section = ".note.seraph.stack")]
+        static __SERAPH_STACK_NOTE: $crate::os::seraph::StackNote =
+            $crate::os::seraph::StackNote::new($pages);
+    };
+}
+
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub use crate::__seraph_stack_pages as stack_pages;
 

@@ -12,8 +12,8 @@
 use crate::loader::{self, ScratchMapping};
 use ipc::{IpcMessage, memmgr_labels, procmgr_errors};
 use process_abi::{
-    PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, PROCESS_MAIN_TLS_MAX_PAGES, PROCESS_MAIN_TLS_VADDR,
-    PROCESS_STACK_PAGES, PROCESS_STACK_TOP,
+    DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION, PROCESS_INFO_VADDR,
+    PROCESS_MAIN_TLS_MAX_PAGES, PROCESS_MAIN_TLS_VADDR, PROCESS_STACK_TOP,
 };
 use syscall_abi::PAGE_SIZE;
 
@@ -421,6 +421,7 @@ fn populate_child_info(
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
     ipc_buf: *mut u64,
+    stack_pages: u32,
 ) -> Option<u32>
 {
     let pi_frame = crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)?;
@@ -530,6 +531,8 @@ fn populate_child_info(
     pi.tls_template_filesz = tls.filesz;
     pi.tls_template_memsz = tls.memsz;
     pi.tls_template_align = tls.align;
+    pi.stack_top_vaddr = PROCESS_STACK_TOP;
+    pi.stack_pages = stack_pages;
 
     // Write the argv blob, then the env blob, into the page region
     // following the struct. Each blob begins at a u64-aligned offset so
@@ -782,17 +785,18 @@ fn map_child_stack_and_ipc(
     child_aspace: u32,
     child_memmgr_send: u32,
     ipc_buf: *mut u64,
+    stack_pages: u32,
 ) -> Option<()>
 {
-    let stack_base = PROCESS_STACK_TOP - (PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
-    for i in 0..PROCESS_STACK_PAGES
+    let stack_base = PROCESS_STACK_TOP - u64::from(stack_pages) * PAGE_SIZE;
+    for i in 0..stack_pages
     {
         let frame = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
         let rw = syscall::cap_derive(frame, syscall::RIGHTS_MAP_RW).ok()?;
         syscall::mem_map(
             rw,
             child_aspace,
-            stack_base + (i as u64) * PAGE_SIZE,
+            stack_base + u64::from(i) * PAGE_SIZE,
             0,
             1,
             0,
@@ -897,6 +901,9 @@ fn create_process_from_bytes(
 {
     let ehdr = elf::validate(module_bytes, crate::arch::current::EXPECTED_ELF_MACHINE).ok()?;
     let entry = elf::entry_point(ehdr);
+    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
+        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
+        .clamp(1, MAX_PROCESS_STACK_PAGES);
 
     let child_aspace = syscall::cap_create_aspace().ok()?;
     let child_cspace = syscall::cap_create_cspace(256).ok()?;
@@ -978,8 +985,9 @@ fn create_process_from_bytes(
         args,
         env,
         ipc_buf,
+        stack_pages,
     )?;
-    map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf)?;
+    map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf, stack_pages)?;
 
     finalize_creation(
         child_aspace,
@@ -1313,6 +1321,41 @@ pub fn create_process_from_vfs(
         .map_err(|_| procmgr_errors::INVALID_ELF)?;
     let entry = elf::entry_point(ehdr);
 
+    // Parse the optional stack-size note. Section headers and the note
+    // section are fetched on demand via `vfs_read`; the helper hands a
+    // closure that drives the same primitive used to stream `PT_LOAD`
+    // pages, so no extra IPC machinery is involved.
+    let stack_pages = elf::parse_stack_note_streaming(ehdr, file_size, |off, dst| {
+        // SAFETY: dst is a caller-supplied mutable byte buffer.
+        let mut tmp = [0u8; VFS_CHUNK_SIZE as usize];
+        let mut total = 0usize;
+        while total < dst.len()
+        {
+            let want = (dst.len() - total).min(VFS_CHUNK_SIZE as usize);
+            let bytes_read = vfs_read(
+                file_cap,
+                ipc_buf,
+                off + total as u64,
+                want as u64,
+                &mut tmp[..want],
+            )?;
+            if bytes_read == 0
+            {
+                break;
+            }
+            let copy_len = bytes_read.min(want);
+            dst[total..total + copy_len].copy_from_slice(&tmp[..copy_len]);
+            total += copy_len;
+            if bytes_read < want
+            {
+                break;
+            }
+        }
+        Some(total)
+    })
+    .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
+    .clamp(1, MAX_PROCESS_STACK_PAGES);
+
     let child_aspace = syscall::cap_create_aspace().map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     let child_cspace =
         syscall::cap_create_cspace(256).map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
@@ -1405,9 +1448,10 @@ pub fn create_process_from_vfs(
         args,
         env,
         ipc_buf,
+        stack_pages,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
-    map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf)
+    map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf, stack_pages)
         .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
 
     finalize_creation(

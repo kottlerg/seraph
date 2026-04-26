@@ -69,6 +69,7 @@ fn main()
 
     args_phase();
     env_phase();
+    stack_envelope_phase();
     tls_main_phase();
     alloc_phase();
     churn_phase();
@@ -537,6 +538,48 @@ fn env_phase()
     assert_eq!(env::vars().count(), 3, "three entries must remain");
 
     std::os::seraph::log!("env phase passed");
+}
+
+/// Verify the main-thread stack envelope reported through `ProcessInfo`.
+///
+/// usertest declares no `.note.seraph.stack` note, so it inherits
+/// `DEFAULT_PROCESS_STACK_PAGES = 8`. Reads the envelope from the
+/// `StartupInfo` populated by `_start` and asserts the page count and
+/// stack-top VA match the loader-side defaults. Also walks down through
+/// the stack with a probing local to confirm the live mapping really
+/// covers the declared range.
+fn stack_envelope_phase()
+{
+    let info = startup_info();
+    assert_eq!(
+        info.stack_pages, 8,
+        "usertest declares no stack note; expected default of 8 pages, got {}",
+        info.stack_pages
+    );
+    assert_eq!(
+        info.stack_top_vaddr, 0x0000_7FFF_FFFF_E000,
+        "stack_top_vaddr {:#x} does not match PROCESS_STACK_TOP",
+        info.stack_top_vaddr
+    );
+
+    // SP at this point sits inside the live stack range. The reported
+    // envelope must contain it — proves loader and child agree on the
+    // mapping.
+    let sp_probe = 0u64;
+    let sp = core::ptr::addr_of!(sp_probe) as u64;
+    let stack_base = info.stack_top_vaddr - u64::from(info.stack_pages) * 4096;
+    assert!(
+        (stack_base..info.stack_top_vaddr).contains(&sp),
+        "SP {sp:#x} outside reported stack range \
+         [{stack_base:#x}, {top:#x})",
+        top = info.stack_top_vaddr
+    );
+
+    std::os::seraph::log!(
+        "stack envelope phase passed (pages={}, top={:#x})",
+        info.stack_pages,
+        info.stack_top_vaddr
+    );
 }
 
 /// Verify the main thread sees the template-initialised value of a

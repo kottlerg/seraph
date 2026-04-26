@@ -23,6 +23,11 @@ use process_abi::{
 };
 use syscall_abi::PAGE_SIZE;
 
+// memmgr's bootstrap parser carries page-count buffers on stack and
+// pushes deeper through `bootstrap_from_init`; declare a 12-page
+// (48 KiB) main-thread stack instead of the default 8 (32 KiB).
+process_abi::stack_pages!(12);
+
 // ── Bespoke runtime ─────────────────────────────────────────────────────────
 //
 // memmgr cannot share `std::sys::seraph::_start`: that path bootstraps a heap
@@ -67,6 +72,8 @@ pub extern "C" fn _start(_info_ptr: u64) -> !
         args_count: 0,
         env_blob: &[],
         env_count: 0,
+        stack_top_vaddr: info.stack_top_vaddr,
+        stack_pages: info.stack_pages,
     };
 
     main(&startup)

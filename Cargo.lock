@@ -227,6 +227,9 @@ dependencies = [
 [[package]]
 name = "elf"
 version = "0.1.0"
+dependencies = [
+ "process-abi",
+]
 
 [[package]]
 name = "equivalent"

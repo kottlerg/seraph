@@ -29,8 +29,8 @@ fn main()
 fn overflow(depth: usize)
 {
     // One full page of stack per frame guarantees that overflow reaches
-    // the guard page in a bounded number of recursions
-    // (`PROCESS_STACK_PAGES + 1` at most). `black_box` prevents the
+    // the guard page in a bounded number of recursions (one per
+    // `stack_pages`, plus one for the guard). `black_box` prevents the
     // optimiser from eliding the buffer or the tail call.
     let buf = [depth as u8; 4096];
     std::hint::black_box(&buf);

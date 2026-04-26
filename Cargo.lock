@@ -221,7 +221,6 @@ dependencies = [
  "ipc",
  "syscall",
  "syscall-abi",
- "va_layout",
  "virtio-core",
 ]
 
@@ -374,7 +373,6 @@ dependencies = [
  "process-abi",
  "syscall",
  "syscall-abi",
- "va_layout",
 ]
 
 [[package]]
@@ -469,6 +467,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memmgr"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "process-abi",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "mmio"
 version = "0.1.0"
 
@@ -532,7 +540,6 @@ dependencies = [
  "process-abi",
  "syscall",
  "syscall-abi",
- "va_layout",
 ]
 
 [[package]]
@@ -725,13 +732,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "va_layout"
-version = "0.1.0"
-dependencies = [
- "rustc-std-workspace-core",
-]
-
-[[package]]
 name = "vfsd"
 version = "0.1.0"
 dependencies = [
@@ -747,7 +747,6 @@ dependencies = [
  "ipc",
  "syscall",
  "syscall-abi",
- "va_layout",
  "virtio-core",
 ]
 

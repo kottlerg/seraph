@@ -9,32 +9,80 @@
 //! appropriate protection rights, and loading ELF segment pages from memory
 //! into freshly allocated frames.
 
-use crate::frames::{FramePool, PAGE_SIZE};
+use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
+use syscall_abi::PAGE_SIZE;
 
-pub use va_layout::{
-    PROCMGR_TEMP_FRAME_VA as TEMP_FRAME_VA, PROCMGR_TEMP_MODULE_VA as TEMP_MODULE_VA,
-    PROCMGR_TEMP_VFS_VA as TEMP_VFS_VA,
-};
+/// RAII handle for a transient scratch mapping in procmgr's own aspace.
+///
+/// `new` reserves a contiguous unmapped VA range, calls `mem_map` against
+/// `frame_cap` with the requested rights, and stores the range so `Drop`
+/// can mirror the cleanup. Forgets the range on map-failure (allocator
+/// only tracks VA — the failed map leaves no kernel-side state).
+pub struct ScratchMapping
+{
+    range: Option<ReservedRange>,
+    self_aspace: u32,
+    pages: u64,
+}
+
+impl ScratchMapping
+{
+    /// Reserve `pages` VA pages, then `mem_map` the frame at the reserved
+    /// base with the given protection flags. Returns `None` on either
+    /// reservation or mapping failure.
+    pub fn map(self_aspace: u32, frame_cap: u32, pages: u64, prot: u64) -> Option<Self>
+    {
+        let range = reserve_pages(pages).ok()?;
+        let va = range.va_start();
+        if syscall::mem_map(frame_cap, self_aspace, va, 0, pages, prot).is_err()
+        {
+            unreserve_pages(range);
+            return None;
+        }
+        Some(Self {
+            range: Some(range),
+            self_aspace,
+            pages,
+        })
+    }
+
+    /// Base VA of the mapping. Stable for the lifetime of `self`.
+    #[inline]
+    pub fn va(&self) -> u64
+    {
+        self.range
+            .as_ref()
+            .map_or(0, std::os::seraph::ReservedRange::va_start)
+    }
+}
+
+impl Drop for ScratchMapping
+{
+    fn drop(&mut self)
+    {
+        if let Some(range) = self.range.take()
+        {
+            let va = range.va_start();
+            let _ = syscall::mem_unmap(self.self_aspace, va, self.pages);
+            unreserve_pages(range);
+        }
+    }
+}
 
 /// Map a module frame read-only, probing for the exact mappable page count.
 ///
-/// Starts from 128 pages and decrements until the mapping succeeds.
-pub fn map_module(module_frame_cap: u32, self_aspace: u32) -> Option<u64>
+/// Starts from 128 pages and decrements until the mapping succeeds. The
+/// returned [`ScratchMapping`] owns the reservation; dropping it unmaps
+/// and releases the VA.
+pub fn map_module(module_frame_cap: u32, self_aspace: u32) -> Option<(ScratchMapping, u64)>
 {
     let mut pages: u64 = 128;
     while pages > 0
     {
-        if syscall::mem_map(
-            module_frame_cap,
-            self_aspace,
-            TEMP_MODULE_VA,
-            0,
-            pages,
-            syscall::MAP_READONLY,
-        )
-        .is_ok()
+        if let Some(scratch) =
+            ScratchMapping::map(self_aspace, module_frame_cap, pages, syscall::MAP_READONLY)
         {
-            return Some(pages);
+            return Some((scratch, pages));
         }
         pages -= 1;
     }
@@ -59,33 +107,32 @@ pub fn derive_frame_for_prot(frame_cap: u32, prot: u64) -> Option<u32>
 }
 
 /// Copy one ELF segment page into a fresh frame and map it into the child.
+///
+/// Frames are allocated against `child_memmgr_send` so memmgr accounts them
+/// to the child from the moment they leave the pool — `PROCESS_DIED`
+/// reclaims the entire set when the child exits.
+#[allow(clippy::too_many_arguments)]
 pub fn load_elf_page(
     page_vaddr: u64,
     seg_vaddr: u64,
     file_data: &[u8],
     prot: u64,
-    pool: &mut FramePool,
     self_aspace: u32,
     child_aspace: u32,
+    child_memmgr_send: u32,
+    ipc_buf: *mut u64,
 ) -> Option<()>
 {
-    let frame_cap = pool.alloc_page()?;
+    let frame_cap = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
 
-    syscall::mem_map(
-        frame_cap,
-        self_aspace,
-        TEMP_FRAME_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
-    .ok()?;
-    // SAFETY: TEMP_FRAME_VA mapped writable, one page.
-    unsafe { core::ptr::write_bytes(TEMP_FRAME_VA as *mut u8, 0, PAGE_SIZE as usize) };
+    let scratch = ScratchMapping::map(self_aspace, frame_cap, 1, syscall::MAP_WRITABLE)?;
+    let scratch_va = scratch.va();
+    // SAFETY: scratch_va is mapped writable, one page.
+    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
 
-    copy_segment_data(page_vaddr, seg_vaddr, file_data);
+    copy_segment_data(scratch_va, page_vaddr, seg_vaddr, file_data);
 
-    let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+    drop(scratch);
 
     let derived = derive_frame_for_prot(frame_cap, prot)?;
     syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0).ok()?;
@@ -93,8 +140,8 @@ pub fn load_elf_page(
     Some(())
 }
 
-/// Copy file data for one segment page into the frame mapped at `TEMP_FRAME_VA`.
-fn copy_segment_data(page_vaddr: u64, seg_vaddr: u64, file_data: &[u8])
+/// Copy file data for one segment page into the frame mapped at `scratch_va`.
+fn copy_segment_data(scratch_va: u64, page_vaddr: u64, seg_vaddr: u64, file_data: &[u8])
 {
     let page_start_in_seg = page_vaddr.saturating_sub(seg_vaddr) as usize;
     let page_end_in_seg = page_start_in_seg + PAGE_SIZE as usize;
@@ -113,11 +160,11 @@ fn copy_segment_data(page_vaddr: u64, seg_vaddr: u64, file_data: &[u8])
         let avail = PAGE_SIZE as usize - dest_offset;
         let copy_len = (file_end - file_start).min(avail);
         let src = &file_data[file_start..file_start + copy_len];
-        // SAFETY: TEMP_FRAME_VA mapped writable; copy stays within one page.
+        // SAFETY: scratch_va mapped writable; copy stays within one page.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr(),
-                (TEMP_FRAME_VA as *mut u8).add(dest_offset),
+                (scratch_va as *mut u8).add(dest_offset),
                 src.len(),
             );
         }

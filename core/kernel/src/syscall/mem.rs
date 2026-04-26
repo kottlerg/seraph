@@ -665,3 +665,286 @@ pub fn sys_frame_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }
+
+// ── SYS_FRAME_MERGE ───────────────────────────────────────────────────────────
+
+/// `SYS_FRAME_MERGE` (50): merge two adjacent sibling Frame caps into one.
+///
+/// arg0 = left Frame cap index (must have MAP right; physically-lower half).
+/// arg1 = right Frame cap index (must have MAP right; physically-upper half).
+/// arg2 = reserved (must be 0).
+///
+/// Both caps must:
+/// - Be physically contiguous (`left.base + left.size == right.base`).
+/// - Carry the same rights bitmask.
+/// - Agree on `owns_memory` (mixed-ownership merges are rejected).
+/// - Be siblings under the same derivation parent (typical case: both are
+///   children of a prior `frame_split`).
+/// - Have no descendants of their own — merging a cap that has been further
+///   split would orphan its children, so merge is rejected.
+///
+/// Both originals are consumed; a fresh Frame cap covering
+/// `[left.base, right.base + right.size)` is inserted in the caller's `CSpace`
+/// and reparented to the originals' shared parent (or made a root if both
+/// originals were roots). Memory ownership transfers to the merged cap; the
+/// originals are dec-ref'd without freeing the underlying physical region.
+///
+/// Returns the merged slot index on success.
+#[allow(clippy::too_many_lines)]
+#[cfg(not(test))]
+pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    extern crate alloc;
+    use alloc::boxed::Box;
+    use core::ptr::NonNull;
+
+    use crate::cap::derivation::{DERIVATION_LOCK, link_child, unlink_node};
+    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, dealloc_object};
+    use crate::cap::slot::{CapTag, Rights, SlotId};
+    use crate::syscall::current_tcb;
+
+    let left_idx = tf.arg(0) as u32;
+    let right_idx = tf.arg(1) as u32;
+    // arg2 reserved.
+
+    if left_idx == right_idx
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // ── Capability lookup ─────────────────────────────────────────────────────
+
+    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*tcb).cspace };
+    if caller_cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    // Snapshot left.
+    let (left_base, left_size, left_rights, left_obj_ptr, left_owns) = {
+        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+        let slot =
+            unsafe { super::lookup_cap(caller_cspace, left_idx, CapTag::Frame, Rights::MAP) }?;
+        let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // cast_ptr_alignment: Box<FrameObject> guarantees 8-byte alignment.
+        // SAFETY: tag confirmed Frame; pointer is valid FrameObject.
+        #[allow(clippy::cast_ptr_alignment)]
+        let fo = unsafe { &*(obj_ptr.as_ptr().cast::<FrameObject>()) };
+        (
+            fo.base,
+            fo.size,
+            slot.rights,
+            obj_ptr,
+            fo.owns_memory.load(core::sync::atomic::Ordering::Acquire),
+        )
+    };
+
+    // Snapshot right.
+    let (right_base, right_size, right_rights, right_obj_ptr, right_owns) = {
+        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+        let slot =
+            unsafe { super::lookup_cap(caller_cspace, right_idx, CapTag::Frame, Rights::MAP) }?;
+        let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // SAFETY: tag confirmed Frame; pointer is valid.
+        #[allow(clippy::cast_ptr_alignment)]
+        let fo = unsafe { &*(obj_ptr.as_ptr().cast::<FrameObject>()) };
+        (
+            fo.base,
+            fo.size,
+            slot.rights,
+            obj_ptr,
+            fo.owns_memory.load(core::sync::atomic::Ordering::Acquire),
+        )
+    };
+
+    // Physical contiguity.
+    if left_base.checked_add(left_size) != Some(right_base)
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // Rights must match exactly — the merged cap's rights would otherwise be
+    // ambiguous between the two parents.
+    if left_rights != right_rights
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // Memory-ownership state must match. A merge that mixed buddy-backed and
+    // non-buddy halves would either leak (clear both) or double-free (set both).
+    if left_owns != right_owns
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // Two distinct caps must point to two distinct objects (a slot referencing
+    // the same FrameObject twice is not a meaningful merge).
+    if left_obj_ptr == right_obj_ptr
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let merged_size = left_size
+        .checked_add(right_size)
+        .ok_or(SyscallError::InvalidArgument)?;
+
+    // ── Derivation-tree validation ────────────────────────────────────────────
+    // Both slots must have the same parent and no descendants.
+
+    // SAFETY: caller_cspace validated non-null.
+    let cspace_id = unsafe { (*caller_cspace).id() };
+
+    DERIVATION_LOCK.write_lock();
+
+    let (left_parent, left_first_child) = {
+        // SAFETY: caller_cspace validated; index resolves under derivation lock.
+        let Some(slot) = (unsafe { (*caller_cspace).slot(left_idx) })
+        else
+        {
+            DERIVATION_LOCK.write_unlock();
+            return Err(SyscallError::InvalidCapability);
+        };
+        (slot.deriv_parent, slot.deriv_first_child)
+    };
+    let (right_parent, right_first_child) = {
+        // SAFETY: caller_cspace validated; index resolves under derivation lock.
+        let Some(slot) = (unsafe { (*caller_cspace).slot(right_idx) })
+        else
+        {
+            DERIVATION_LOCK.write_unlock();
+            return Err(SyscallError::InvalidCapability);
+        };
+        (slot.deriv_parent, slot.deriv_first_child)
+    };
+
+    if left_parent != right_parent
+    {
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidArgument);
+    }
+    if left_first_child.is_some() || right_first_child.is_some()
+    {
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // ── Build the merged FrameObject ──────────────────────────────────────────
+    //
+    // `owns_memory` on the new cap inherits the (matching) state of the
+    // originals. The originals are cleared further below so dec_ref does not
+    // attempt to return the still-live region to the buddy.
+
+    let merged_obj = Box::new(FrameObject {
+        header: KernelObjectHeader::new(ObjectType::Frame),
+        base: left_base,
+        size: merged_size,
+        owns_memory: core::sync::atomic::AtomicBool::new(left_owns),
+    });
+    let merged_ptr: NonNull<KernelObjectHeader> = {
+        let raw = Box::into_raw(merged_obj).cast::<KernelObjectHeader>();
+        // SAFETY: Box::into_raw returns non-null; FrameObject.header at offset 0.
+        unsafe { NonNull::new_unchecked(raw) }
+    };
+
+    // ── Insert merged cap into caller's CSpace ────────────────────────────────
+    // SAFETY: caller_cspace validated non-null.
+    let cs = unsafe { &mut *caller_cspace };
+    let Ok(merged_slot_nz) = cs.insert_cap(CapTag::Frame, left_rights, merged_ptr)
+    else
+    {
+        DERIVATION_LOCK.write_unlock();
+        // SAFETY: merged_ptr just allocated; refcount is 1 with no other holders.
+        unsafe { dealloc_object(merged_ptr) };
+        return Err(SyscallError::OutOfMemory);
+    };
+    let merged_slot = merged_slot_nz.get();
+
+    // ── Wire derivation tree ──────────────────────────────────────────────────
+
+    let Some(left_idx_nz) = core::num::NonZeroU32::new(left_idx)
+    else
+    {
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidCapability);
+    };
+    let Some(right_idx_nz) = core::num::NonZeroU32::new(right_idx)
+    else
+    {
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidCapability);
+    };
+    let left_id = SlotId::new(cspace_id, left_idx_nz);
+    let right_id = SlotId::new(cspace_id, right_idx_nz);
+    let merged_id = SlotId::new(cspace_id, merged_slot_nz);
+
+    // Detach both originals; siblings (if any) and the parent's first_child
+    // pointer are mended by unlink_node.
+    // SAFETY: DERIVATION_LOCK held; both ids are valid live slots.
+    unsafe { unlink_node(left_id) };
+    // SAFETY: DERIVATION_LOCK held.
+    unsafe { unlink_node(right_id) };
+
+    // Attach merged to the shared parent (or leave as a root if both
+    // originals were roots).
+    if let Some(parent_id) = left_parent
+    {
+        // SAFETY: DERIVATION_LOCK held; parent_id and merged_id are valid.
+        unsafe { link_child(parent_id, merged_id) };
+    }
+
+    DERIVATION_LOCK.write_unlock();
+
+    // ── Consume originals ─────────────────────────────────────────────────────
+    //
+    // Transfer memory ownership to the merged cap by clearing both originals.
+    // Mirrors sys_frame_split's transfer pattern: only the merged cap can ever
+    // reach `dealloc_object`'s "owns_memory == true" branch.
+    //
+    // SAFETY: orig pointers are live (refcount > 0 at lookup); FrameObject is
+    // #[repr(C)] with header at offset 0; AtomicBool store on shared ref is well-defined.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe {
+        (*left_obj_ptr.as_ptr().cast::<FrameObject>())
+            .owns_memory
+            .store(false, core::sync::atomic::Ordering::Release);
+        (*right_obj_ptr.as_ptr().cast::<FrameObject>())
+            .owns_memory
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+
+    // Return both original slots to the free list.
+    // SAFETY: caller_cspace validated; indices within CSpace bounds.
+    unsafe { (*caller_cspace).free_slot(left_idx) };
+    // SAFETY: caller_cspace validated; indices within CSpace bounds.
+    unsafe { (*caller_cspace).free_slot(right_idx) };
+
+    // Dec-ref both originals; free if no references remain.
+    // SAFETY: originals from lookup_cap; objects still valid (ref > 0 at lookup).
+    let left_remaining = unsafe { (*left_obj_ptr.as_ptr()).dec_ref() };
+    if left_remaining == 0
+    {
+        // SAFETY: refcount reached zero; owns_memory cleared above so the
+        // dealloc path will not double-free the buddy region.
+        unsafe { dealloc_object(left_obj_ptr) };
+    }
+    // SAFETY: same as above.
+    let right_remaining = unsafe { (*right_obj_ptr.as_ptr()).dec_ref() };
+    if right_remaining == 0
+    {
+        // SAFETY: refcount reached zero; owns_memory cleared above.
+        unsafe { dealloc_object(right_obj_ptr) };
+    }
+
+    Ok(u64::from(merged_slot))
+}
+
+// Test stub.
+#[cfg(test)]
+pub fn sys_frame_merge(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}

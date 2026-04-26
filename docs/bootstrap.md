@@ -61,16 +61,20 @@ whatever binary was staged in the init slot.
 
 ## Userspace bootstrap (init)
 
-The init binary starts procmgr via raw syscalls (no IPC yet), requests
-procmgr to start the remaining early services (devmgr, svcmgr, drivers,
-vfsd, optionally netd), delegates the appropriate subsets of its initial
-capability set to each service, registers services with svcmgr, and exits.
-Role-level description is in [`services/init/README.md`](../services/init/README.md);
-authoritative stage enumeration lives in
-[`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md). Alternative init
-binaries (for example [`core/ktest/README.md`](../core/ktest/README.md)) may occupy
-the init slot for specialized purposes and follow their own bootstrap
-shape.
+The init binary starts memmgr and procmgr via raw syscalls (no IPC yet),
+transferring the RAM frame pool to memmgr and minting procmgr's
+`memmgr_endpoint_cap` so procmgr's std heap bootstrap finds memmgr on its
+first call. Init then requests procmgr to start the remaining early services
+(devmgr, svcmgr, drivers, vfsd, optionally netd), delegates the appropriate
+subsets of its initial capability set to each service, registers services
+with svcmgr, and exits. The system-scope userspace boot order lives in
+[`process-lifecycle.md`](process-lifecycle.md); role-level description is in
+[`services/init/README.md`](../services/init/README.md); authoritative stage
+enumeration lives in
+[`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md).
+Alternative init binaries (for example
+[`core/ktest/README.md`](../core/ktest/README.md)) may occupy the init slot
+for specialized purposes and follow their own bootstrap shape.
 
 ---
 

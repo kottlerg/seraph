@@ -49,6 +49,15 @@ authorities over the same physical memory. W^X is enforced at mapping time: the
 kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
+The kernel mints Frame caps for all usable RAM at boot and places them in
+init's CSpace. Init transfers them (via the derive-twice pattern) to memmgr,
+which thereafter owns userspace RAM frame allocation and answers
+`REQUEST_FRAMES` for every std-built service. See
+[`userspace-memory-model.md`](userspace-memory-model.md) and
+[`services/memmgr/README.md`](../services/memmgr/README.md). MMIO Frame caps
+follow a separate flow through devmgr; see
+[`device-management.md`](device-management.md).
+
 ### Address Space
 
 A capability to a process's virtual address space. Rights:

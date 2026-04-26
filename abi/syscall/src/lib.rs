@@ -46,6 +46,14 @@ extern crate rustc_std_workspace_core as core;
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
+// ── Architectural constants ───────────────────────────────────────────────────
+
+/// Userspace page size in bytes. The kernel maps and unmaps memory at this
+/// granularity; `mem_map`'s `offset_pages` and `page_count` arguments are
+/// scaled by this constant. Both supported architectures (x86-64 and RISC-V
+/// RV64GC under Sv48) use 4 KiB base pages.
+pub const PAGE_SIZE: u64 = 0x1000;
+
 // ── Syscall numbers ───────────────────────────────────────────────────────────
 
 /// IPC: synchronous call (send + block waiting for reply).
@@ -170,6 +178,8 @@ pub const SYS_THREAD_BIND_NOTIFICATION: u64 = 47;
 pub const SYS_CAP_DERIVE_TOKEN: u64 = 48;
 /// Split an `Interrupt` range cap into two non-overlapping children.
 pub const SYS_IRQ_SPLIT: u64 = 49;
+/// Merge two adjacent sibling Frame caps into one covering both ranges.
+pub const SYS_FRAME_MERGE: u64 = 50;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 

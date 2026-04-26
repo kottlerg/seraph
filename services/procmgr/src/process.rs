@@ -9,20 +9,25 @@
 //! from in-memory ELF images or by streaming from VFS, as well as starting
 //! suspended processes.
 
-use crate::frames::{FramePool, PAGE_SIZE};
-use crate::loader::{self, TEMP_FRAME_VA, TEMP_MODULE_VA, TEMP_VFS_VA};
-use ipc::{IpcMessage, procmgr_errors};
+use crate::loader::{self, ScratchMapping};
+use ipc::{IpcMessage, memmgr_labels, procmgr_errors};
 use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, PROCESS_MAIN_TLS_MAX_PAGES, PROCESS_MAIN_TLS_VADDR,
     PROCESS_STACK_PAGES, PROCESS_STACK_TOP,
 };
-use va_layout::CHILD_IPC_BUF_VA;
+use syscall_abi::PAGE_SIZE;
+
+// Bootstrap-cross-boundary VA: procmgr picks the per-child main-thread
+// IPC-buffer VA and writes it into `ProcessInfo.ipc_buffer_vaddr`. The
+// child's `_start` reads it back. Disjoint from the page-reservation
+// arena (above 0x1_0000_0000) and from the heap zone (0x4000_0000..0x8000_0000).
+const CHILD_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 
 /// Next token value (monotonically increasing, never zero).
-static NEXT_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Maximum concurrent child processes procmgr tracks.
 ///
@@ -44,10 +49,17 @@ pub struct ProcessEntry
     thread_cap: u32,
     pi_frame_cap: u32,
     tls_frame_cap: u32,
+    /// Slot in procmgr's `CSpace` of the tokened SEND cap on memmgr's
+    /// endpoint that procmgr minted via `REGISTER_PROCESS` for this child.
+    /// Held until `PROCESS_DIED`. Zero when memmgr was unwired at create
+    /// time (early-boot regression path).
+    memmgr_send_cap: u32,
+    /// Memmgr-side process token for this child. Sent in the
+    /// `PROCESS_DIED` payload so memmgr can reclaim the right record.
+    memmgr_token: u64,
     entry_point: u64,
     tls_base_va: u64,
     started: bool,
-    frames_allocated: u32,
 }
 
 impl ProcessEntry
@@ -232,19 +244,13 @@ impl ProcessTable
         let pi_frame = entry.pi_frame_cap;
         let child_cspace = entry.cspace_cap;
 
-        syscall::mem_map(
-            pi_frame,
-            self_aspace,
-            TEMP_FRAME_VA,
-            0,
-            1,
-            syscall::MAP_WRITABLE,
-        )
-        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        let scratch = ScratchMapping::map(self_aspace, pi_frame, 1, syscall::MAP_WRITABLE)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        let scratch_va = scratch.va();
 
-        // SAFETY: TEMP_FRAME_VA is mapped writable for one page; PI struct
+        // SAFETY: scratch_va is mapped writable for one page; PI struct
         // lives at offset 0 per the ABI.
-        let pi = unsafe { process_abi::process_info_mut(TEMP_FRAME_VA) };
+        let pi = unsafe { process_abi::process_info_mut(scratch_va) };
 
         let frame_slot = syscall::cap_copy(frame, child_cspace, syscall::RIGHTS_MAP_RW)
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
@@ -275,12 +281,10 @@ impl ProcessTable
             }
             _ =>
             {
-                let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
                 return Err(procmgr_errors::INVALID_ARGUMENT);
             }
         }
 
-        let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
         Ok(())
     }
 }
@@ -322,6 +326,18 @@ pub struct UniversalCaps
     /// `log_ep` slot procmgr received during init bootstrap. Zero when
     /// procmgr has no log endpoint (e.g. a future no-log boot mode).
     pub log_discovery: u32,
+    /// Tokened SEND cap on memmgr's service endpoint, freshly minted by
+    /// `memmgr_labels::REGISTER_PROCESS` for this child. The cap lives in
+    /// procmgr's `CSpace` on entry; `populate_child_info` copies it into
+    /// the child's `CSpace` and records the destination slot in
+    /// `ProcessInfo.memmgr_endpoint_cap`. Zero when memmgr is not yet
+    /// reachable (procmgr itself, init); the child's heap-bootstrap then
+    /// no-ops and the child cannot allocate.
+    pub memmgr_endpoint: u32,
+    /// Memmgr-side process token paired with `memmgr_endpoint`. Sent in
+    /// `memmgr_labels::PROCESS_DIED` at child teardown so memmgr can
+    /// reclaim the right ledger entry. Zero when memmgr is not wired.
+    pub memmgr_token: u64,
 }
 
 /// Program arguments delivered to a child process at spawn time.
@@ -386,16 +402,15 @@ pub struct MainTls
 // too_many_arguments: each cluster is a small fixed-size bundle; collapsing
 // them into one struct shifts the verbosity to the call sites without
 // reducing the total parameter count. too_many_lines: this is the single
-// transaction that owns the temporary mapping at TEMP_FRAME_VA — splitting
-// would require threading the partial state through helpers that all need
-// the same self_aspace + child_cspace + write context.
+// transaction that owns one temporary scratch mapping for the PI page —
+// splitting would require threading the partial state through helpers
+// that all need the same self_aspace + child_cspace + write context.
 #[allow(
     clippy::similar_names,
     clippy::too_many_arguments,
     clippy::too_many_lines
 )]
 fn populate_child_info(
-    pool: &mut FramePool,
     self_aspace: u32,
     child_aspace: u32,
     child_cspace: u32,
@@ -405,20 +420,14 @@ fn populate_child_info(
     tls: &ChildTlsTemplate,
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
+    ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    let pi_frame = pool.alloc_page()?;
-    syscall::mem_map(
-        pi_frame,
-        self_aspace,
-        TEMP_FRAME_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
-    .ok()?;
-    // SAFETY: TEMP_FRAME_VA mapped writable, one page.
-    unsafe { core::ptr::write_bytes(TEMP_FRAME_VA as *mut u8, 0, PAGE_SIZE as usize) };
+    let pi_frame = crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)?;
+    let scratch = ScratchMapping::map(self_aspace, pi_frame, 1, syscall::MAP_WRITABLE)?;
+    let scratch_va = scratch.va();
+    // SAFETY: scratch_va mapped writable, one page.
+    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
 
     let child_thread_in_child =
         syscall::cap_copy(child_thread, child_cspace, syscall::RIGHTS_THREAD).ok()?;
@@ -481,8 +490,8 @@ fn populate_child_info(
     // see all-zero stdio frame/signal slots, which std maps to silent
     // println! / EOF on stdin.
 
-    // SAFETY: TEMP_FRAME_VA is page-aligned and mapped writable.
-    let pi = unsafe { process_abi::process_info_mut(TEMP_FRAME_VA) };
+    // SAFETY: scratch_va is page-aligned and mapped writable.
+    let pi = unsafe { process_abi::process_info_mut(scratch_va) };
     pi.version = PROCESS_ABI_VERSION;
     pi.self_thread_cap = child_thread_in_child;
     pi.self_aspace_cap = child_aspace_in_child;
@@ -490,6 +499,23 @@ fn populate_child_info(
     pi.ipc_buffer_vaddr = CHILD_IPC_BUF_VA;
     pi.creator_endpoint_cap = creator_ep_in_child;
     pi.procmgr_endpoint_cap = procmgr_ep_in_child;
+    pi.memmgr_endpoint_cap = if universals.memmgr_endpoint != 0
+    {
+        // SEND_GRANT so the child can attach memmgr's tokened SEND to
+        // outgoing messages it makes on the same endpoint (no current
+        // protocol exercises that capability, but the rights mirror
+        // `procmgr_endpoint_cap`'s shape).
+        syscall::cap_copy(
+            universals.memmgr_endpoint,
+            child_cspace,
+            syscall::RIGHTS_SEND_GRANT,
+        )
+        .ok()?
+    }
+    else
+    {
+        0
+    };
     pi.stdin_frame_cap = 0;
     pi.stdout_frame_cap = 0;
     pi.stderr_frame_cap = 0;
@@ -516,14 +542,13 @@ fn populate_child_info(
         let blob_len = args.blob.len() as u64;
         if args_offset + blob_len > PAGE_SIZE
         {
-            let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
             return None;
         }
         // SAFETY: range within the mapped page; source is plain bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 args.blob.as_ptr(),
-                (TEMP_FRAME_VA + args_offset) as *mut u8,
+                (scratch_va + args_offset) as *mut u8,
                 args.blob.len(),
             );
         }
@@ -546,14 +571,13 @@ fn populate_child_info(
         let blob_len = env.blob.len() as u64;
         if env_offset + blob_len > PAGE_SIZE
         {
-            let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
             return None;
         }
         // SAFETY: range within the mapped page; source is plain bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 env.blob.as_ptr(),
-                (TEMP_FRAME_VA + env_offset) as *mut u8,
+                (scratch_va + env_offset) as *mut u8,
                 env.blob.len(),
             );
         }
@@ -568,7 +592,7 @@ fn populate_child_info(
         pi.env_count = 0;
     }
 
-    let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+    drop(scratch);
 
     let pi_ro = syscall::cap_derive(pi_frame, syscall::RIGHTS_MAP_READ).ok()?;
     syscall::mem_map(pi_ro, child_aspace, PROCESS_INFO_VADDR, 0, 1, 0).ok()?;
@@ -576,29 +600,39 @@ fn populate_child_info(
     Some(pi_frame)
 }
 
-/// Intermediate state returned by [`alloc_main_tls_frame`] — a frame mapped
-/// writable at [`TEMP_FRAME_VA`] plus the layout numbers needed to populate
-/// it and to finalise the mapping into the child.
-#[derive(Clone, Copy)]
+/// Intermediate state returned by [`alloc_main_tls_frame`] — a frame
+/// mapped writable in procmgr's aspace at `scratch.va()` plus the layout
+/// numbers needed to populate it and to finalise the mapping into the
+/// child.
 struct MainTlsAlloc
 {
     frame_cap: u32,
     tls_base_offset: u64,
     tls_base_va: u64,
+    scratch: ScratchMapping,
+}
+
+impl MainTlsAlloc
+{
+    fn scratch_va(&self) -> u64
+    {
+        self.scratch.va()
+    }
 }
 
 /// Allocate a frame for the main thread's TLS block, map it writable in
-/// procmgr's own aspace at [`TEMP_FRAME_VA`], and zero it.
+/// procmgr's own aspace at a transient scratch VA, and zero it.
 ///
 /// Returns `None` when the binary has no TLS, when the block exceeds the
 /// single-frame budget, or when alignment demands would outrun the page
-/// mapping. Callers write the `.tdata` template starting at `TEMP_FRAME_VA`
-/// and then call [`finalize_main_tls`] to install the TCB self-pointer and
-/// remap the frame into the child.
+/// mapping. Callers write the `.tdata` template starting at the scratch
+/// VA and then call [`finalize_main_tls`] to install the TCB self-pointer
+/// and remap the frame into the child.
 fn alloc_main_tls_frame(
-    pool: &mut FramePool,
     self_aspace: u32,
     tls: &ChildTlsTemplate,
+    child_memmgr_send: u32,
+    ipc_buf: *mut u64,
 ) -> Option<MainTlsAlloc>
 {
     let (block_size, block_align, tls_base_offset) =
@@ -612,42 +646,36 @@ fn alloc_main_tls_frame(
         return None;
     }
 
-    let tls_frame = pool.alloc_page()?;
-    syscall::mem_map(
-        tls_frame,
-        self_aspace,
-        TEMP_FRAME_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
-    .ok()?;
+    let tls_frame = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
+    let scratch = ScratchMapping::map(self_aspace, tls_frame, 1, syscall::MAP_WRITABLE)?;
+    let scratch_va = scratch.va();
 
-    // SAFETY: TEMP_FRAME_VA is mapped writable for one page.
-    unsafe { core::ptr::write_bytes(TEMP_FRAME_VA as *mut u8, 0, PAGE_SIZE as usize) };
+    // SAFETY: scratch_va is mapped writable for one page.
+    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
 
     Some(MainTlsAlloc {
         frame_cap: tls_frame,
         tls_base_offset,
         tls_base_va: PROCESS_MAIN_TLS_VADDR + tls_base_offset,
+        scratch,
     })
 }
 
-/// Install the TCB self-pointer at `TEMP_FRAME_VA + tls_base_offset`, unmap
+/// Install the TCB self-pointer at `scratch_va + tls_base_offset`, drop
 /// the scratch mapping from procmgr's aspace, derive an RW cap, and map
 /// the block into the child at [`PROCESS_MAIN_TLS_VADDR`].
-fn finalize_main_tls(alloc: MainTlsAlloc, self_aspace: u32, child_aspace: u32) -> Option<MainTls>
+fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) -> Option<MainTls>
 {
-    // SAFETY: TEMP_FRAME_VA is mapped writable for one page; the block fits.
+    // SAFETY: scratch_va is mapped writable for one page; the block fits.
     unsafe {
         process_abi::tls_install_tcb(
-            TEMP_FRAME_VA as *mut u8,
+            alloc.scratch_va() as *mut u8,
             alloc.tls_base_offset,
             alloc.tls_base_va,
         );
     }
 
-    let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
+    drop(alloc.scratch);
 
     let tls_rw = syscall::cap_derive(alloc.frame_cap, syscall::RIGHTS_MAP_RW).ok()?;
     syscall::mem_map(tls_rw, child_aspace, PROCESS_MAIN_TLS_VADDR, 0, 1, 0).ok()?;
@@ -662,11 +690,12 @@ fn finalize_main_tls(alloc: MainTlsAlloc, self_aspace: u32, child_aspace: u32) -
 /// thread's TLS block. Wraps the two-phase helpers above for the
 /// create-from-bytes path.
 fn prepare_main_tls_from_bytes(
-    pool: &mut FramePool,
     self_aspace: u32,
     child_aspace: u32,
     tls: &ChildTlsTemplate,
     template_bytes: &[u8],
+    child_memmgr_send: u32,
+    ipc_buf: *mut u64,
 ) -> Option<MainTls>
 {
     if tls.memsz == 0
@@ -677,12 +706,13 @@ fn prepare_main_tls_from_bytes(
     {
         return None;
     }
-    let alloc = alloc_main_tls_frame(pool, self_aspace, tls)?;
-    // SAFETY: TEMP_FRAME_VA is mapped writable; length was bounded above.
+    let alloc = alloc_main_tls_frame(self_aspace, tls, child_memmgr_send, ipc_buf)?;
+    let scratch_va = alloc.scratch_va();
+    // SAFETY: scratch_va is mapped writable; length was bounded above.
     unsafe {
         core::ptr::copy_nonoverlapping(
             template_bytes.as_ptr(),
-            TEMP_FRAME_VA as *mut u8,
+            scratch_va as *mut u8,
             template_bytes.len(),
         );
     }
@@ -692,12 +722,12 @@ fn prepare_main_tls_from_bytes(
 /// Allocate, populate by streaming `.tdata` from an open VFS file handle,
 /// and map the main thread's TLS block.
 fn prepare_main_tls_from_vfs(
-    pool: &mut FramePool,
     self_aspace: u32,
     child_aspace: u32,
     tls: &ChildTlsTemplate,
     file_offset: u64,
     file_cap: u32,
+    child_memmgr_send: u32,
     ipc_buf: *mut u64,
 ) -> Option<MainTls>
 {
@@ -705,7 +735,8 @@ fn prepare_main_tls_from_vfs(
     {
         return Some(MainTls::default());
     }
-    let alloc = alloc_main_tls_frame(pool, self_aspace, tls)?;
+    let alloc = alloc_main_tls_frame(self_aspace, tls, child_memmgr_send, ipc_buf)?;
+    let scratch_va = alloc.scratch_va();
 
     let mut read_pos: u64 = 0;
     while read_pos < tls.filesz
@@ -721,16 +752,15 @@ fn prepare_main_tls_from_vfs(
         )?;
         if bytes_read == 0
         {
-            let _ = syscall::mem_unmap(self_aspace, TEMP_FRAME_VA, 1);
             return None;
         }
         let safe_len = (bytes_read as u64).min(tls.filesz - read_pos) as usize;
-        // SAFETY: TEMP_FRAME_VA mapped writable; (read_pos + safe_len) <=
+        // SAFETY: scratch_va mapped writable; (read_pos + safe_len) <=
         // tls.filesz <= PAGE_SIZE; `buf` holds `safe_len` bytes of payload.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 buf.as_ptr(),
-                (TEMP_FRAME_VA as *mut u8).add(read_pos as usize),
+                (scratch_va as *mut u8).add(read_pos as usize),
                 safe_len,
             );
         }
@@ -742,18 +772,22 @@ fn prepare_main_tls_from_vfs(
 
 /// Map stack and IPC buffer pages into a child address space.
 ///
-/// No explicit guard-page map. `va_layout::PROCESS_STACK_GUARD_VA` sits one
-/// page below `PROCESS_STACK_BOTTOM` and stays unmapped by construction —
-/// compile-time assertions in `shared/va_layout` (ordering vs. stack
-/// bottom and `PROCESS_INFO_VA`) guarantee that invariant. Stack overflow
+/// No explicit guard-page map. The page immediately below the stack
+/// (`PROCESS_STACK_TOP - PROCESS_STACK_PAGES * PAGE_SIZE - PAGE_SIZE`)
+/// stays unmapped by construction — `process-abi` lays out the stack and
+/// `ProcessInfo` page so the gap is always present. Stack overflow
 /// faults on the guard VA instead of silently writing into adjacent
 /// mappings.
-fn map_child_stack_and_ipc(pool: &mut FramePool, child_aspace: u32) -> Option<()>
+fn map_child_stack_and_ipc(
+    child_aspace: u32,
+    child_memmgr_send: u32,
+    ipc_buf: *mut u64,
+) -> Option<()>
 {
     let stack_base = PROCESS_STACK_TOP - (PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
     for i in 0..PROCESS_STACK_PAGES
     {
-        let frame = pool.alloc_page()?;
+        let frame = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
         let rw = syscall::cap_derive(frame, syscall::RIGHTS_MAP_RW).ok()?;
         syscall::mem_map(
             rw,
@@ -766,7 +800,7 @@ fn map_child_stack_and_ipc(pool: &mut FramePool, child_aspace: u32) -> Option<()
         .ok()?;
     }
 
-    let ipc_frame = pool.alloc_page()?;
+    let ipc_frame = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
     let ipc_rw = syscall::cap_derive(ipc_frame, syscall::RIGHTS_MAP_RW).ok()?;
     syscall::mem_map(ipc_rw, child_aspace, CHILD_IPC_BUF_VA, 0, 1, 0).ok()?;
 
@@ -796,8 +830,6 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
 // reducing call sites — this helper is called from exactly two places.
 #[allow(clippy::similar_names, clippy::too_many_arguments)]
 fn finalize_creation(
-    pool: &FramePool,
-    pages_before: u32,
     child_aspace: u32,
     child_cspace: u32,
     child_thread: u32,
@@ -807,9 +839,11 @@ fn finalize_creation(
     table: &mut ProcessTable,
     self_endpoint: u32,
     death_eq: u32,
+    memmgr_send_cap: u32,
+    memmgr_token: u64,
 ) -> Option<CreateResult>
 {
-    let token = NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Bind procmgr's shared death queue as an observer on the child's
     // main thread. Correlator = low 32 bits of the table token; on death,
@@ -830,10 +864,11 @@ fn finalize_creation(
         thread_cap: child_thread,
         pi_frame_cap,
         tls_frame_cap: main_tls.frame_cap,
+        memmgr_send_cap,
+        memmgr_token,
         entry_point,
         tls_base_va: main_tls.base_va,
         started: false,
-        frames_allocated: pool.allocated_pages - pages_before,
     });
 
     Some(CreateResult {
@@ -849,7 +884,6 @@ fn finalize_creation(
 #[allow(clippy::similar_names, clippy::too_many_arguments)]
 fn create_process_from_bytes(
     module_bytes: &[u8],
-    pool: &mut FramePool,
     self_aspace: u32,
     table: &mut ProcessTable,
     self_endpoint: u32,
@@ -858,16 +892,17 @@ fn create_process_from_bytes(
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
     death_eq: u32,
+    ipc_buf: *mut u64,
 ) -> Option<CreateResult>
 {
-    let pages_before = pool.allocated_pages;
-
     let ehdr = elf::validate(module_bytes, crate::arch::current::EXPECTED_ELF_MACHINE).ok()?;
     let entry = elf::entry_point(ehdr);
 
     let child_aspace = syscall::cap_create_aspace().ok()?;
     let child_cspace = syscall::cap_create_cspace(256).ok()?;
     let child_thread = syscall::cap_create_thread(child_aspace, child_cspace).ok()?;
+
+    let child_memmgr_send = universals.memmgr_endpoint;
 
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
@@ -891,9 +926,10 @@ fn create_process_from_bytes(
                 seg.vaddr,
                 file_data,
                 prot,
-                pool,
                 self_aspace,
                 child_aspace,
+                child_memmgr_send,
+                ipc_buf,
             )?;
         }
     }
@@ -918,11 +954,12 @@ fn create_process_from_bytes(
             return None;
         }
         prepare_main_tls_from_bytes(
-            pool,
             self_aspace,
             child_aspace,
             &tls_template,
             &module_bytes[start..end],
+            child_memmgr_send,
+            ipc_buf,
         )?
     }
     else
@@ -931,7 +968,6 @@ fn create_process_from_bytes(
     };
 
     let pi_frame_cap = populate_child_info(
-        pool,
         self_aspace,
         child_aspace,
         child_cspace,
@@ -941,12 +977,11 @@ fn create_process_from_bytes(
         &tls_template,
         args,
         env,
+        ipc_buf,
     )?;
-    map_child_stack_and_ipc(pool, child_aspace)?;
+    map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf)?;
 
     finalize_creation(
-        pool,
-        pages_before,
         child_aspace,
         child_cspace,
         child_thread,
@@ -956,6 +991,8 @@ fn create_process_from_bytes(
         table,
         self_endpoint,
         death_eq,
+        child_memmgr_send,
+        universals.memmgr_token,
     )
 }
 
@@ -965,8 +1002,9 @@ fn create_process_from_bytes(
 #[allow(clippy::too_many_arguments)]
 pub fn create_process(
     module_frame_cap: u32,
-    pool: &mut FramePool,
     self_aspace: u32,
+    _self_memmgr_ep: u32,
+    ipc_buf: *mut u64,
     table: &mut ProcessTable,
     self_endpoint: u32,
     creator_endpoint: u32,
@@ -976,16 +1014,16 @@ pub fn create_process(
     death_eq: u32,
 ) -> Option<CreateResult>
 {
-    let module_pages = loader::map_module(module_frame_cap, self_aspace)?;
+    let (module_scratch, module_pages) = loader::map_module(module_frame_cap, self_aspace)?;
     let module_size = module_pages * PAGE_SIZE;
+    let module_va = module_scratch.va();
 
-    // SAFETY: module frame mapped read-only at TEMP_MODULE_VA for module_size bytes.
+    // SAFETY: module frame mapped read-only at module_va for module_size bytes.
     let module_bytes =
-        unsafe { core::slice::from_raw_parts(TEMP_MODULE_VA as *const u8, module_size as usize) };
+        unsafe { core::slice::from_raw_parts(module_va as *const u8, module_size as usize) };
 
     let result = create_process_from_bytes(
         module_bytes,
-        pool,
         self_aspace,
         table,
         self_endpoint,
@@ -994,9 +1032,10 @@ pub fn create_process(
         args,
         env,
         death_eq,
+        ipc_buf,
     );
 
-    let _ = syscall::mem_unmap(self_aspace, TEMP_MODULE_VA, module_pages);
+    drop(module_scratch);
 
     result
 }
@@ -1084,15 +1123,14 @@ fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 
 /// Everything `load_elf_page_streaming` needs beyond the per-page arguments:
 /// the VFS file handle, IPC buffer, parent/child address spaces, and the
-/// shared frame pool. The borrow on `pool` is mutable for alloc/free; the
-/// rest is by value.
-pub struct ElfLoadCtx<'a>
+/// child's tokened SEND on memmgr (so frames are billed to the child).
+pub struct ElfLoadCtx
 {
     pub file_cap: u32,
     pub ipc_buf: *mut u64,
     pub self_aspace: u32,
     pub child_aspace: u32,
-    pub pool: &'a mut FramePool,
+    pub child_memmgr_send: u32,
 }
 
 /// Load one ELF segment page by streaming file data from VFS.
@@ -1100,26 +1138,19 @@ fn load_elf_page_streaming(
     page_vaddr: u64,
     seg: &elf::LoadSegment,
     prot: u64,
-    ctx: &mut ElfLoadCtx,
+    ctx: &ElfLoadCtx,
 ) -> Option<()>
 {
-    let frame_cap = ctx.pool.alloc_page()?;
+    let frame_cap = crate::memmgr_alloc_page(ctx.child_memmgr_send, ctx.ipc_buf)?;
 
-    syscall::mem_map(
-        frame_cap,
-        ctx.self_aspace,
-        TEMP_FRAME_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
-    .ok()?;
-    // SAFETY: TEMP_FRAME_VA mapped writable, one page.
-    unsafe { core::ptr::write_bytes(TEMP_FRAME_VA as *mut u8, 0, PAGE_SIZE as usize) };
+    let scratch = ScratchMapping::map(ctx.self_aspace, frame_cap, 1, syscall::MAP_WRITABLE)?;
+    let scratch_va = scratch.va();
+    // SAFETY: scratch_va mapped writable, one page.
+    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
 
-    stream_segment_to_frame(page_vaddr, seg, ctx.file_cap, ctx.ipc_buf);
+    stream_segment_to_frame(scratch_va, page_vaddr, seg, ctx.file_cap, ctx.ipc_buf);
 
-    let _ = syscall::mem_unmap(ctx.self_aspace, TEMP_FRAME_VA, 1);
+    drop(scratch);
 
     let derived = loader::derive_frame_for_prot(frame_cap, prot)?;
     syscall::mem_map(derived, ctx.child_aspace, page_vaddr, 0, 1, 0).ok()?;
@@ -1127,8 +1158,9 @@ fn load_elf_page_streaming(
     Some(())
 }
 
-/// Stream segment file data from VFS into the frame mapped at `TEMP_FRAME_VA`.
+/// Stream segment file data from VFS into the frame mapped at `scratch_va`.
 fn stream_segment_to_frame(
+    scratch_va: u64,
     page_vaddr: u64,
     seg: &elf::LoadSegment,
     file_cap: u32,
@@ -1169,12 +1201,12 @@ fn stream_segment_to_frame(
         }
         let safe_len = (bytes_read as u64).min(bytes_to_read - read_pos) as usize;
 
-        // SAFETY: TEMP_FRAME_VA is mapped writable; dest_offset + read_pos +
+        // SAFETY: scratch_va is mapped writable; dest_offset + read_pos +
         // safe_len <= PAGE_SIZE; `buf` holds `safe_len` bytes of payload.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 buf.as_ptr(),
-                (TEMP_FRAME_VA as *mut u8).add(dest_offset + read_pos as usize),
+                (scratch_va as *mut u8).add(dest_offset + read_pos as usize),
                 safe_len,
             );
         }
@@ -1188,13 +1220,7 @@ fn stream_segment_to_frame(
 /// directly from vfsd into target frames. No intermediate file buffer.
 // clippy::too_many_lines: VFS-based process creation is one transaction that
 // owns the lifetime of the ELF-header scratch frame, the child's kernel
-// objects, and the per-page streaming loop. Splitting scatters the
-// error/cleanup paths that must unwind in a fixed order against a single
-// `FramePool` borrow, and introduces helpers that each need the full context
-// struct anyway. The sub-phases are already factored through named helpers
-// (vfs_open/stat/read/close, load_elf_page_streaming, populate_child_info,
-// map_child_stack_and_ipc, finalize_creation); what remains is the linear
-// orchestration.
+// objects, and the per-page streaming loop.
 #[allow(
     clippy::similar_names,
     clippy::too_many_lines,
@@ -1203,7 +1229,6 @@ fn stream_segment_to_frame(
 pub fn create_process_from_vfs(
     ctx: &crate::ProcmgrCtx,
     path: &[u8],
-    pool: &mut FramePool,
     table: &mut ProcessTable,
     ipc_buf: *mut u64,
     creator_endpoint: u32,
@@ -1224,25 +1249,37 @@ pub fn create_process_from_vfs(
         return Err(procmgr_errors::INVALID_ELF);
     }
 
+    // Mint a fresh tokened SEND on memmgr's endpoint for this child up
+    // front; the header scratch frame, the per-segment frames, and all
+    // subsequent allocations route through this cap so memmgr accounts
+    // them to the child's record from the moment they leave the pool.
+    let (child_memmgr_send, child_memmgr_token) =
+        crate::register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+    if child_memmgr_send == 0
+    {
+        vfs_close(file_cap, ipc_buf);
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    }
+
     // Allocate one frame for the ELF header page.
-    let hdr_frame = pool.alloc_page().ok_or_else(|| {
+    let Some(hdr_frame) = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
+    else
+    {
         vfs_close(file_cap, ipc_buf);
-        procmgr_errors::OUT_OF_MEMORY
-    })?;
-    syscall::mem_map(
-        hdr_frame,
-        self_aspace,
-        TEMP_VFS_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
-    .map_err(|_| {
+        let _ = syscall::cap_delete(child_memmgr_send);
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    };
+    let Some(hdr_scratch) = ScratchMapping::map(self_aspace, hdr_frame, 1, syscall::MAP_WRITABLE)
+    else
+    {
         vfs_close(file_cap, ipc_buf);
-        procmgr_errors::OUT_OF_MEMORY
-    })?;
-    // SAFETY: TEMP_VFS_VA mapped writable, one page.
-    unsafe { core::ptr::write_bytes(TEMP_VFS_VA as *mut u8, 0, PAGE_SIZE as usize) };
+        let _ = syscall::cap_delete(hdr_frame);
+        let _ = syscall::cap_delete(child_memmgr_send);
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    };
+    let hdr_va = hdr_scratch.va();
+    // SAFETY: hdr_va mapped writable, one page.
+    unsafe { core::ptr::write_bytes(hdr_va as *mut u8, 0, PAGE_SIZE as usize) };
 
     // Read the first page (ELF header + program headers).
     let hdr_size = file_size.min(PAGE_SIZE);
@@ -1258,11 +1295,11 @@ pub fn create_process_from_vfs(
             break;
         }
         let safe_len = bytes_read.min(VFS_CHUNK_SIZE as usize);
-        // SAFETY: TEMP_VFS_VA mapped writable; `buf` holds `safe_len` bytes.
+        // SAFETY: hdr_va mapped writable; `buf` holds `safe_len` bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 buf.as_ptr(),
-                (TEMP_VFS_VA as *mut u8).add(offset as usize),
+                (hdr_va as *mut u8).add(offset as usize),
                 safe_len,
             );
         }
@@ -1270,14 +1307,11 @@ pub fn create_process_from_vfs(
     }
 
     // Parse ELF headers from the header page.
-    // SAFETY: TEMP_VFS_VA is mapped and contains `offset` bytes of file data.
-    let header_data =
-        unsafe { core::slice::from_raw_parts(TEMP_VFS_VA as *const u8, offset as usize) };
+    // SAFETY: hdr_va is mapped and contains `offset` bytes of file data.
+    let header_data = unsafe { core::slice::from_raw_parts(hdr_va as *const u8, offset as usize) };
     let ehdr = elf::validate(header_data, crate::arch::current::EXPECTED_ELF_MACHINE)
         .map_err(|_| procmgr_errors::INVALID_ELF)?;
     let entry = elf::entry_point(ehdr);
-
-    let pages_before = pool.allocated_pages;
 
     let child_aspace = syscall::cap_create_aspace().map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     let child_cspace =
@@ -1302,14 +1336,14 @@ pub fn create_process_from_vfs(
         for page_idx in 0..num_pages
         {
             let page_vaddr = first_page + (page_idx as u64) * PAGE_SIZE;
-            let mut load_ctx = ElfLoadCtx {
+            let load_ctx = ElfLoadCtx {
                 file_cap,
                 ipc_buf,
                 self_aspace,
                 child_aspace,
-                pool,
+                child_memmgr_send,
             };
-            load_elf_page_streaming(page_vaddr, &seg, prot, &mut load_ctx)
+            load_elf_page_streaming(page_vaddr, &seg, prot, &load_ctx)
                 .ok_or(procmgr_errors::INVALID_ELF)?;
         }
     }
@@ -1327,22 +1361,22 @@ pub fn create_process_from_vfs(
         })
         .unwrap_or_default();
 
-    // Done with the header page; the next VFS read (if any) overwrites
-    // TEMP_FRAME_VA, not TEMP_VFS_VA, so it is safe to release the header
-    // mapping now.
-    let _ = syscall::mem_unmap(self_aspace, TEMP_VFS_VA, 1);
-    pool.free_page(hdr_frame);
+    // Done with the header page; subsequent VFS reads operate against
+    // their own scratch reservations, so it is safe to release the header
+    // mapping now. The frame itself stays attributed to the child's memmgr
+    // record and is reclaimed via PROCESS_DIED at child exit.
+    drop(hdr_scratch);
 
     let main_tls = if let Some(seg) = tls_seg
         && tls_template.memsz != 0
     {
         prepare_main_tls_from_vfs(
-            pool,
             self_aspace,
             child_aspace,
             &tls_template,
             seg.offset,
             file_cap,
+            child_memmgr_send,
             ipc_buf,
         )
         .ok_or(procmgr_errors::OUT_OF_MEMORY)?
@@ -1357,9 +1391,10 @@ pub fn create_process_from_vfs(
     let universals = UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
         log_discovery: ctx.log_ep,
+        memmgr_endpoint: child_memmgr_send,
+        memmgr_token: child_memmgr_token,
     };
     let pi_frame_cap = populate_child_info(
-        pool,
         self_aspace,
         child_aspace,
         child_cspace,
@@ -1369,13 +1404,13 @@ pub fn create_process_from_vfs(
         &tls_template,
         args,
         env,
+        ipc_buf,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
-    map_child_stack_and_ipc(pool, child_aspace).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf)
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
 
     finalize_creation(
-        pool,
-        pages_before,
         child_aspace,
         child_cspace,
         child_thread,
@@ -1385,6 +1420,8 @@ pub fn create_process_from_vfs(
         table,
         self_endpoint,
         death_eq,
+        child_memmgr_send,
+        child_memmgr_token,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)
 }
@@ -1398,14 +1435,19 @@ pub fn create_process_from_vfs(
 /// `DESTROY_PROCESS`) drop silently. Takes the same cleanup path as the
 /// IPC-driven `destroy_process` — the only difference is the lookup key.
 #[allow(dead_code)]
-pub fn reap_by_correlator(correlator: u32, table: &mut ProcessTable)
+pub fn reap_by_correlator(
+    correlator: u32,
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
+    table: &mut ProcessTable,
+)
 {
     let Some(entry) = table.take_by_correlator(correlator)
     else
     {
         return;
     };
-    teardown_entry(entry);
+    teardown_entry(entry, memmgr_ep, ipc_buf);
 }
 
 /// Destroy a process identified by `token`.
@@ -1428,14 +1470,29 @@ pub fn reap_by_correlator(correlator: u32, table: &mut ProcessTable)
 /// pages to the buddy as their refcounts hit zero.
 ///
 /// Idempotent: returns silently if the token is unknown (already destroyed).
-pub fn destroy_process(token: u64, table: &mut ProcessTable)
+pub fn destroy_process(token: u64, memmgr_ep: u32, ipc_buf: *mut u64, table: &mut ProcessTable)
 {
     let Some(entry) = table.take_by_token(token)
     else
     {
         return;
     };
-    teardown_entry(entry);
+    teardown_entry(entry, memmgr_ep, ipc_buf);
+}
+
+/// Notify memmgr that a process died. Memmgr returns every frame attributed
+/// to the process token to the free pool. Idempotent on memmgr's side.
+fn notify_memmgr_died(memmgr_ep: u32, memmgr_token: u64, ipc_buf: *mut u64)
+{
+    if memmgr_ep == 0 || memmgr_token == 0
+    {
+        return;
+    }
+    let msg = IpcMessage::builder(memmgr_labels::PROCESS_DIED)
+        .word(0, memmgr_token)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
 }
 
 /// Shared cleanup for both the explicit-IPC reap path (`destroy_process`)
@@ -1448,7 +1505,7 @@ pub fn destroy_process(token: u64, table: &mut ProcessTable)
 // needless_pass_by_value: consumes the entry's cap slots; passing by
 // reference would invite accidental double-free on subsequent reuse.
 #[allow(clippy::needless_pass_by_value)]
-pub fn teardown_entry(entry: ProcessEntry)
+pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
 {
     // Order: thread first so the scheduler drops any residual reference to
     // the aspace before we tear down its page tables. Then cspace (which
@@ -1467,6 +1524,14 @@ pub fn teardown_entry(entry: ProcessEntry)
     {
         let _ = syscall::cap_revoke(entry.tls_frame_cap);
         let _ = syscall::cap_delete(entry.tls_frame_cap);
+    }
+
+    // Notify memmgr to reclaim every frame attributed to this child's
+    // memmgr token, then drop procmgr's tokened SEND copy.
+    notify_memmgr_died(memmgr_ep, entry.memmgr_token, ipc_buf);
+    if entry.memmgr_send_cap != 0
+    {
+        let _ = syscall::cap_delete(entry.memmgr_send_cap);
     }
 }
 

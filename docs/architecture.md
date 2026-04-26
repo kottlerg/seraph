@@ -78,13 +78,22 @@ services and applications. All services communicate exclusively via IPC and oper
 under explicit capability grants.
 
 **init**
-First userspace process. Starts procmgr, requests early services (devmgr, svcmgr,
-drivers, vfsd), delegates capabilities, and exits. See
-[`abi/boot-protocol/`](../abi/boot-protocol/).
+First userspace process. Starts memmgr and procmgr, requests early services
+(devmgr, svcmgr, drivers, vfsd), delegates capabilities, and exits. See
+[`abi/boot-protocol/`](../abi/boot-protocol/) and
+[`process-lifecycle.md`](process-lifecycle.md) for the userspace boot order.
+
+**memmgr**
+Owns the userspace RAM frame pool. Receives all RAM Frame caps from init at
+boot and serves frame allocation IPC to all std-built services. Tracks
+per-process frame ownership and reclaims on process death. `no_std`. See
+[`process-lifecycle.md`](process-lifecycle.md) and
+[`userspace-memory-model.md`](userspace-memory-model.md).
 
 **procmgr**
-Process lifecycle manager. All post-boot process creation, ELF loading, and teardown
-go through procmgr.
+Process lifecycle manager. All post-boot process creation, ELF loading, and
+teardown go through procmgr. Procmgr is itself a memmgr client and
+bootstraps its heap by calling memmgr.
 
 **svcmgr**
 Service health monitor. Detects crashes and requests restarts via procmgr; holds
@@ -144,6 +153,8 @@ live in the component scope:
 
 - Bootloader steps 1–10 — [`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).
 - Kernel phases 0–9 — [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md).
+- Userspace boot order (init → memmgr → procmgr → svcmgr) and
+  ProcessInfo/InitInfo handover — [`process-lifecycle.md`](process-lifecycle.md).
 - init's userspace bootstrap — [`services/init/README.md`](../services/init/README.md) and
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md).
 
@@ -235,5 +246,5 @@ Seraph does not aim to run Linux or other OS binaries.
 
 ## Summarized By
 
-[README.md](../README.md), [init/README.md](../services/init/README.md)
+[README.md](../README.md), [init/README.md](../services/init/README.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md)
 

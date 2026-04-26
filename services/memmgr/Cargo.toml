@@ -1,18 +1,16 @@
 [package]
-name = "init"
+name = "memmgr"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [[bin]]
-name = "init"
+name = "memmgr"
 path = "src/main.rs"
 test = false
 
 [dependencies]
-init-protocol = { path = "../../abi/init-protocol" }
 process-abi = { path = "../../abi/process-abi" }
-elf = { path = "../../shared/elf" }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }

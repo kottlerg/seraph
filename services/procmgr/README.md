@@ -1,13 +1,15 @@
 # procmgr
 
-Userspace process lifecycle manager. The first service started by init during
-bootstrap. All subsequent process creation, ELF loading, and teardown in the
+Userspace process lifecycle manager. After init transfers authority,
+procmgr owns ELF loading, kernel-object allocation
+(`AddressSpace`/`CSpace`/`Thread`), `ProcessInfo` population, and
+process-death observation. All non-bootstrap process creation in the
 running system goes through procmgr.
 
-procmgr holds the authority to create address spaces, CSpaces, and threads
-(delegated by init). It exposes an IPC interface for process creation and
-teardown. init starts procmgr directly using its minimal built-in ELF parser;
-all other services are started by requesting procmgr via IPC.
+procmgr is itself a memmgr client: it is std-using and bootstraps its
+heap by calling memmgr on its first IPC. Frame caps for child stacks,
+IPC buffers, `ProcessInfo` pages, TLS blocks, and ELF segments come
+from memmgr, not from a procmgr-owned pool.
 
 ---
 
@@ -15,10 +17,12 @@ all other services are started by requesting procmgr via IPC.
 
 ```
 procmgr/
-├── Cargo.toml                  # Workspace member; no_std binary
+├── Cargo.toml                  # Workspace member; std-using binary
 ├── README.md
 ├── src/
-│   └── main.rs                 # _start() entry point, process manager stub
+│   ├── main.rs                 # _start() entry point, IPC dispatch loop
+│   ├── loader.rs               # ELF load pipeline
+│   └── process.rs              # Per-process state, kernel-object allocation
 └── docs/
     └── ipc-interface.md        # procmgr IPC interface specification
 ```
@@ -27,16 +31,39 @@ procmgr/
 
 ## Responsibilities
 
-- **ELF loading** — parse ELF images from boot modules or filesystem, allocate
-  address spaces and frames, map segments with correct permissions
-- **Process creation** — create AddressSpace, CSpace, and Thread kernel objects;
-  configure the thread's address space, CSpace, and IPC buffer bindings
-- **Capability delegation** — receive caps from callers (e.g. svcmgr, devmgr),
-  mint and pass per-process initial caps to newly created processes
-- **Process teardown** — on exit or crash, revoke the process's address space
-  capability (which stops all threads bound to it) and reclaim resources
-- **Process registry** — maintain a table of running processes; answer queries
-  from svcmgr and other services
+- **ELF loading** — parse ELF images from boot modules or filesystem,
+  request frames from memmgr, map LOAD segments with correct
+  permissions.
+- **Process creation** — create `AddressSpace`, `CSpace`, and `Thread`
+  kernel objects; configure the thread's address space, CSpace, and
+  IPC buffer bindings.
+- **Capability delegation** — receive caps from callers (e.g. svcmgr,
+  devmgr) for inclusion in the child's CSpace; mint and pass per-process
+  initial caps to newly created processes via `ProcessInfo`.
+- **memmgr coordination** — call `memmgr.REGISTER_PROCESS` before
+  spawning a child to obtain the child's `memmgr_endpoint_cap`; call
+  `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim.
+- **Process teardown** — on exit or crash, revoke the process's
+  `AddressSpace` capability (which stops all threads bound to it) and
+  notify memmgr.
+- **Process registry** — maintain a table of running processes; answer
+  queries from svcmgr and other services.
+
+---
+
+## What procmgr does NOT do
+
+- **Allocate or own frames.** memmgr holds the RAM frame pool. procmgr
+  is a memmgr client like every other std-built service.
+- **Track per-process frame ownership.** memmgr's per-process records
+  cover this; procmgr only tracks the kernel objects it owns
+  (`AddressSpace`, `Thread`, etc.) plus the procmgr-side process
+  registry.
+- **Choose virtual addresses inside the running child.** procmgr picks
+  bootstrap-cross-boundary VAs (stack, IPC buffer, `ProcessInfo`, TLS
+  block); the child's `std::sys::seraph` owns every other VA.
+- **Supervise services.** Crash detection and restart policy are
+  svcmgr's role.
 
 ---
 
@@ -45,33 +72,52 @@ procmgr/
 The full procmgr IPC specification is in
 [`docs/ipc-interface.md`](docs/ipc-interface.md). Key operations:
 
-- `create_process(elf_module_cap, initial_caps[]) → (process_handle, thread_handle)`
-- `exit_process(process_handle)`
-- `query_process(process_handle) → ProcessInfo`
+- `CREATE_PROCESS(elf_module_cap)` → suspended process handle, child caps
+- `START_PROCESS(process_handle)` — start a previously created process
+- `CREATE_PROCESS_FROM_VFS(path)` — same as `CREATE_PROCESS` with the
+  ELF source loaded from vfsd
+- `SET_VFSD_ENDPOINT(vfsd_send_cap)` — one-time configuration
+
+Frame allocation is not part of procmgr's interface; see
+[`services/memmgr/docs/ipc-interface.md`](../memmgr/docs/ipc-interface.md).
 
 ---
 
 ## Process Startup ABI
 
-When procmgr creates a new process, it populates a `ProcessInfo` handover
-struct at a well-known virtual address in the new process's address space.
-This struct tells the process where to find its initial capabilities, IPC
-buffer, and startup context. The handover contract is defined in
+When procmgr creates a new process, it populates a `ProcessInfo`
+handover struct at a well-known virtual address in the new process's
+address space. This struct tells the process where to find its initial
+capabilities, IPC buffer, memmgr endpoint, and startup context. The
+handover contract is defined in
 [`abi/process-abi`](../../abi/process-abi/README.md).
 
-procmgr is the sole producer of `ProcessInfo` for all non-init processes.
-Init and ktest use a different handover path (kernel-produced `InitInfo` from
-[`abi/init-protocol`](../../abi/init-protocol/README.md)) but share the same
-`main()` signature defined in `abi/process-abi`.
+procmgr is the sole producer of `ProcessInfo` for all non-init
+processes. Init and ktest use a different handover path
+(kernel-produced `InitInfo` from
+[`abi/init-protocol`](../../abi/init-protocol/README.md)) but share the
+same `main()` signature defined in `abi/process-abi`.
+
+---
+
+## Relationship to memmgr
+
+procmgr and memmgr are sister tier-1 services with disjoint authority.
+memmgr owns the frame pool; procmgr owns process lifecycle. procmgr is
+the only privileged caller of memmgr's procmgr-only labels
+(`REGISTER_PROCESS`, `PROCESS_DIED`); no other service can mint or
+retire process tokens against memmgr. See
+[`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Authority
+Boundaries Between memmgr and procmgr" for the full split.
 
 ---
 
 ## Relationship to svcmgr
 
-svcmgr monitors services and requests restarts via procmgr's IPC interface.
-svcmgr also holds raw process-creation syscall capabilities as a fallback to
-restart procmgr itself if procmgr crashes. This is the only case where a
-process is created without going through procmgr.
+svcmgr monitors services and requests restarts via procmgr's IPC
+interface. svcmgr also holds raw process-creation syscall capabilities
+as a fallback to restart procmgr itself if procmgr crashes. This is the
+only case where a process is created without going through procmgr.
 
 ---
 
@@ -80,8 +126,10 @@ process is created without going through procmgr.
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Boot order, ProcessInfo handover, process-death flow |
+| [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Memory ownership, frame contract, page-reservation contract |
 | [docs/capability-model.md](../../docs/capability-model.md) | CSpace, AddressSpace, Thread caps |
-| [procmgr/docs/frame-management.md](docs/frame-management.md) | Frame pool design, allocation, per-process accounting |
+| [services/memmgr/README.md](../memmgr/README.md) | Sister tier-1 service for the frame pool |
 | [abi/boot-protocol/](../../abi/boot-protocol/) | Boot module format (`BootModule` type) |
 | [abi/process-abi](../../abi/process-abi/README.md) | Process startup ABI: ProcessInfo, StartupInfo, main() |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
@@ -90,4 +138,4 @@ process is created without going through procmgr.
 
 ## Summarized By
 
-None
+[Architecture Overview](../../docs/architecture.md), [Process Lifecycle](../../docs/process-lifecycle.md)

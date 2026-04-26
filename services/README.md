@@ -5,6 +5,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | Crate | Purpose |
 |---|---|
 | `init/` | Bootstrap service — starts early services and exits |
+| `memmgr/` | Userspace RAM frame pool owner |
 | `procmgr/` | Process lifecycle manager |
 | `svcmgr/` | Service health monitor and restart manager |
 | `devmgr/` | Device manager — platform enumeration, driver binding |

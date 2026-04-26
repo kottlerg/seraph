@@ -10,6 +10,13 @@ MUST check the version field before accessing any other fields.
 `core`. Changes that alter `InitInfo` layout or CSpace population order MUST
 increment `INIT_PROTOCOL_VERSION`.
 
+The kernel-to-init contract is unchanged by the memmgr split. `InitInfo`
+delivers the full RAM Frame cap range
+(`memory_frame_base`/`memory_frame_count`) to init's CSpace; init then
+transfers those caps to memmgr via the derive-twice pattern before spawning
+procmgr. Authoritative description of the userspace boot order lives in
+[`docs/process-lifecycle.md`](../../docs/process-lifecycle.md).
+
 ---
 
 ## Relevant Design Documents
@@ -17,6 +24,7 @@ increment `INIT_PROTOCOL_VERSION`.
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, init role |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, init→memmgr→procmgr capability transfer |
 | [abi/boot-protocol/](../boot-protocol/) | Bootloader-to-kernel contract; InitImage, boot modules |
 | [docs/capability-model.md](../../docs/capability-model.md) | Initial capability distribution |
 

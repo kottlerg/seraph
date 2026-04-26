@@ -24,29 +24,61 @@ use crate::{TestContext, TestResult};
 /// Used consistently across mm tests to avoid mapping conflicts.
 const TEST_VA: u64 = 0x4000_0000;
 
-// ── SYS_FRAME_SPLIT ───────────────────────────────────────────────────────────
+// ── SYS_FRAME_SPLIT / SYS_FRAME_MERGE ─────────────────────────────────────────
 
-/// `frame_split` divides a multi-page frame into two non-overlapping children.
+/// Split-merge round-trip on the RODATA frame.
 ///
-/// Uses the RODATA frame (`aspace_cap + 2`) which spans multiple pages.
-/// The split consumes the original cap and returns two new caps, both deleted
-/// as cleanup. TEXT and BSS frames are intentionally left untouched.
-pub fn frame_split(ctx: &TestContext) -> TestResult
+/// Validates the full inverse relationship between `frame_split` and
+/// `frame_merge`:
+///
+/// 1. Splitting RODATA at one page yields two adjacent sibling caps with
+///    distinct slot indices.
+/// 2. Merging in the wrong order (right, left) is rejected — the contiguity
+///    check requires `left.base + left.size == right.base`.
+/// 3. Merging in the correct order yields a single Frame cap.
+/// 4. The merged cap can be re-split at the same offset, restoring the two
+///    halves — proving the merged cap's size and base were preserved across
+///    the round-trip.
+///
+/// Consumes RODATA (`aspace_cap + 2`); TEXT and BSS frames are left intact.
+/// The merged cap is not exercised through `mem_map` because RODATA's
+/// underlying physical base is sub-page-offset by ELF loading and is not
+/// usable as a leaf-page mapping target — a separate concern from frame
+/// merging.
+pub fn frame_split_merge(ctx: &TestContext) -> TestResult
 {
     const PAGE: u64 = 0x1000;
-    // RODATA frame spans multiple pages; always splittable at one page boundary.
-    let rodata_cap = ctx.aspace_cap + 2;
-    let (a, b) =
-        syscall::frame_split(rodata_cap, PAGE).map_err(|_| "frame_split failed on RODATA frame")?;
 
-    if a == b
+    // ── Split ─────────────────────────────────────────────────────────────
+    let rodata_cap = ctx.aspace_cap + 2;
+    let (left, right) =
+        syscall::frame_split(rodata_cap, PAGE).map_err(|_| "frame_split on RODATA failed")?;
+    if left == right
     {
         return Err("frame_split returned identical slot indices for both halves");
     }
 
-    // Clean up — delete both child frames (original cap is now gone).
-    syscall::cap_delete(a).map_err(|_| "cap_delete frame_a failed")?;
-    syscall::cap_delete(b).map_err(|_| "cap_delete frame_b failed")?;
+    // ── Wrong-order merge must fail ───────────────────────────────────────
+    if syscall::frame_merge(right, left).is_ok()
+    {
+        return Err("frame_merge in wrong order (right, left) should fail (non-contiguous)");
+    }
+
+    // ── Correct-order merge ──────────────────────────────────────────────
+    let merged = syscall::frame_merge(left, right).map_err(|_| "frame_merge halves failed")?;
+
+    // ── Re-split must work on the merged cap ──────────────────────────────
+    // If the merged FrameObject's size or base were broken, splitting at the
+    // original offset would either fail or produce halves of the wrong size.
+    let (l2, r2) =
+        syscall::frame_split(merged, PAGE).map_err(|_| "re-split of merged cap failed")?;
+    if l2 == r2
+    {
+        return Err("re-split returned identical slot indices");
+    }
+
+    syscall::cap_delete(l2).map_err(|_| "cap_delete re-split left failed")?;
+    syscall::cap_delete(r2).map_err(|_| "cap_delete re-split right failed")?;
     Ok(())
 }
 

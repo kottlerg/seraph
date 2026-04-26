@@ -16,94 +16,20 @@
 //! caller over IPC at startup. procmgr itself has no knowledge of the child's
 //! service-specific capabilities.
 
-#![no_std]
-#![no_main]
+// The `seraph` target is not in rustc's recognised-OS list, so `std` is
+// `restricted_std`-gated for downstream bins.
+#![feature(restricted_std)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
-mod frames;
 mod loader;
 mod process;
 
-use frames::FramePool;
-use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
+use std::os::seraph::startup_info;
 
-use process_abi::{
-    PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, ProcessInfo, StartupInfo, process_info_ref,
-};
-
-// ── Bespoke runtime ─────────────────────────────────────────────────────────
-//
-// procmgr cannot share the `std::sys::seraph::_start` path used by every
-// other service: that `_start` bootstraps its heap by calling
-// `REQUEST_FRAMES` against a procmgr endpoint, which has not yet run.
-// procmgr therefore ships its own ELF entry symbol and panic handler here
-// and runs on `core` + raw syscalls only (no heap, no `alloc` collections).
-
-/// Process entry point. Reads [`ProcessInfo`] from [`PROCESS_INFO_VADDR`],
-/// validates the protocol version, constructs [`StartupInfo`], and calls
-/// [`main`].
-///
-/// # Safety
-///
-/// init's loader must have mapped a valid [`ProcessInfo`] page at
-/// [`PROCESS_INFO_VADDR`] before starting this thread. The page must remain
-/// mapped for the process's lifetime.
-#[unsafe(no_mangle)]
-pub extern "C" fn _start(_info_ptr: u64) -> !
-{
-    // SAFETY: a valid ProcessInfo page is mapped at PROCESS_INFO_VADDR before
-    // the thread starts; it is read-only and remains mapped for the process's
-    // lifetime.
-    let info: &ProcessInfo = unsafe { process_info_ref(PROCESS_INFO_VADDR) };
-
-    if info.version != PROCESS_ABI_VERSION
-    {
-        // Version mismatch — cannot safely interpret the struct. Exit.
-        syscall::thread_exit();
-    }
-
-    // procmgr ignores argv/env (it only accepts caps via its bootstrap IPC);
-    // build StartupInfo with empty blobs regardless of what init passed.
-    let startup = StartupInfo {
-        ipc_buffer: info.ipc_buffer_vaddr as *mut u8,
-        creator_endpoint: info.creator_endpoint_cap,
-        self_thread: info.self_thread_cap,
-        self_aspace: info.self_aspace_cap,
-        self_cspace: info.self_cspace_cap,
-        procmgr_endpoint: info.procmgr_endpoint_cap,
-        stdin_frame_cap: info.stdin_frame_cap,
-        stdout_frame_cap: info.stdout_frame_cap,
-        stderr_frame_cap: info.stderr_frame_cap,
-        stdin_data_signal_cap: info.stdin_data_signal_cap,
-        stdin_space_signal_cap: info.stdin_space_signal_cap,
-        stdout_data_signal_cap: info.stdout_data_signal_cap,
-        stdout_space_signal_cap: info.stdout_space_signal_cap,
-        stderr_data_signal_cap: info.stderr_data_signal_cap,
-        stderr_space_signal_cap: info.stderr_space_signal_cap,
-        tls_template_vaddr: info.tls_template_vaddr,
-        tls_template_filesz: info.tls_template_filesz,
-        tls_template_memsz: info.tls_template_memsz,
-        tls_template_align: info.tls_template_align,
-        args_blob: &[],
-        args_count: 0,
-        env_blob: &[],
-        env_count: 0,
-    };
-
-    main(&startup)
-}
-
-/// Panic handler. No recovery path: exit the thread and let the supervisor
-/// observe the death.
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> !
-{
-    syscall::thread_exit();
-}
-
-/// Init → procmgr bootstrap plan (one round):
+/// Init → procmgr bootstrap plan (one round on procmgr's creator endpoint):
 ///   caps[0]: service endpoint (procmgr receives requests on this)
 ///   caps[1]: un-tokened SEND copy of the system log endpoint. Procmgr
 ///            `cap_copy`s this into every child's
@@ -111,14 +37,10 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 ///            Zero means no log endpoint is available yet; children
 ///            born in that window receive zero and silent-drop
 ///            `seraph::log!`.
-///   data word 0: `memory_frame_base`
-///   data word 1: `memory_frame_count`
 struct InitBootstrap
 {
     service_ep: u32,
     log_ep: u32,
-    frame_base: u32,
-    frame_count: u32,
 }
 
 fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstrap>
@@ -129,7 +51,7 @@ fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstr
     }
     // SAFETY: caller passes the registered IPC buffer page.
     let round = unsafe { ipc::bootstrap::request_round(creator_ep, ipc_buf) }.ok()?;
-    if round.data_words < 2 || round.cap_count < 1 || !round.done
+    if round.cap_count < 1 || !round.done
     {
         return None;
     }
@@ -143,33 +65,27 @@ fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstr
         {
             0
         },
-        frame_base: round.data[0] as u32,
-        frame_count: round.data[1] as u32,
     })
 }
 
-#[allow(clippy::too_many_lines)]
-fn main(startup: &StartupInfo) -> !
+fn main() -> !
 {
-    if syscall::ipc_buffer_set(startup.ipc_buffer as u64).is_err()
-    {
-        syscall::thread_exit();
-    }
+    std::os::seraph::log::register_name(b"procmgr");
+    let startup = startup_info();
 
-    let self_aspace = startup.self_aspace;
-    // IPC buffer page is page-aligned and registered; treat as `*mut u64` for
-    // the new IpcMessage-snapshot IPC wrappers.
+    // IPC buffer is registered by `_start`; reinterpret as `*mut u64`.
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = startup.ipc_buffer.cast::<u64>();
 
-    // Bootstrap service endpoint + memory pool bounds + log endpoint from init.
+    let self_aspace = startup.self_aspace;
+
+    // Bootstrap service endpoint + log endpoint from init.
     let Some(boot) = bootstrap_from_init(startup.creator_endpoint, ipc_buf)
     else
     {
         syscall::thread_exit();
     };
 
-    let mut pool = FramePool::new(boot.frame_base, boot.frame_count);
     let mut table = process::ProcessTable::new();
     let mut recent = process::RecentExits::new();
 
@@ -197,6 +113,7 @@ fn main(startup: &StartupInfo) -> !
         self_endpoint: boot.service_ep,
         vfsd_ep: 0,
         log_ep: boot.log_ep,
+        memmgr_ep: startup.memmgr_endpoint,
         death_eq,
         ws_cap,
     };
@@ -214,13 +131,17 @@ fn main(startup: &StartupInfo) -> !
         {
             WS_TOKEN_SERVICE =>
             {
-                dispatch_ipc(
-                    service_ep, ipc_buf, &mut ctx, &mut pool, &mut table, &recent,
-                );
+                dispatch_ipc(service_ep, ipc_buf, &mut ctx, &mut table, &recent);
             }
             WS_TOKEN_DEATH =>
             {
-                dispatch_death(ctx.death_eq, &mut table, &mut recent);
+                dispatch_death(
+                    ctx.death_eq,
+                    ctx.memmgr_ep,
+                    ipc_buf,
+                    &mut table,
+                    &mut recent,
+                );
             }
             _ => (),
         }
@@ -232,6 +153,79 @@ const WS_TOKEN_SERVICE: u64 = 0;
 /// `WaitSet` token for procmgr's shared death event queue.
 const WS_TOKEN_DEATH: u64 = 1;
 
+/// Register a new child with memmgr. On success returns
+/// `(memmgr_send_cap_slot, memmgr_token)`. On any failure (memmgr
+/// unwired, IPC error, OOM) returns `(0, 0)`.
+///
+/// The cap slot lands in procmgr's `CSpace`; procmgr both:
+///  * uses it for every per-child frame allocation (so memmgr accounts
+///    them to the child's record from the moment they leave the pool); and
+///  * copies it into the child's `ProcessInfo.memmgr_endpoint_cap` so the
+///    child's std heap-bootstrap can call `REQUEST_FRAMES` on it.
+///
+/// The token is opaque to procmgr but is sent back in the
+/// `PROCESS_DIED` payload at child teardown so memmgr can reclaim the
+/// right record.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn register_with_memmgr(memmgr_ep: u32, ipc_buf: *mut u64) -> (u32, u64)
+{
+    if memmgr_ep == 0
+    {
+        return (0, 0);
+    }
+    let msg = IpcMessage::new(memmgr_labels::REGISTER_PROCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) })
+    else
+    {
+        return (0, 0);
+    };
+    if reply.label != memmgr_errors::SUCCESS
+    {
+        return (0, 0);
+    }
+    let cap = reply.caps().first().copied().unwrap_or(0);
+    let token = reply.word(0);
+    (cap, token)
+}
+
+/// Allocate exactly one page from memmgr. Returns the cap slot of the
+/// (single-page) Frame in procmgr's `CSpace`, or zero on any failure
+/// (memmgr not wired, OOM, derive failure). Caller is responsible for
+/// `mem_map`-ping it where appropriate.
+///
+/// Frames allocated against `child_send_cap` are accounted to that child's
+/// memmgr record and reclaimed on `PROCESS_DIED`. Frames allocated against
+/// procmgr's own `pi.memmgr_endpoint_cap` are accounted to procmgr.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
+{
+    if memmgr_send == 0
+    {
+        return None;
+    }
+    let msg = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+        .word(0, 1)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(memmgr_send, &msg, ipc_buf) }.ok()?;
+    if reply.label != memmgr_errors::SUCCESS
+    {
+        return None;
+    }
+    if reply.word(0) != 1
+    {
+        // Best-effort came back with zero or many caps; unexpected for n=1.
+        // Drop any caps that did arrive.
+        for &slot in reply.caps()
+        {
+            let _ = syscall::cap_delete(slot);
+        }
+        return None;
+    }
+    reply.caps().first().copied()
+}
+
 /// Service-endpoint dispatch. Called when the wait-set wakes for the
 /// service endpoint; the sender is already queued so `ipc_recv` returns
 /// without blocking.
@@ -239,7 +233,6 @@ fn dispatch_ipc(
     service_ep: u32,
     ipc_buf: *mut u64,
     ctx: &mut ProcmgrCtx,
-    pool: &mut FramePool,
     table: &mut process::ProcessTable,
     recent: &process::RecentExits,
 )
@@ -257,7 +250,7 @@ fn dispatch_ipc(
     {
         procmgr_labels::CREATE_PROCESS =>
         {
-            handle_create(&req, ipc_buf, pool, ctx, table);
+            handle_create(&req, ipc_buf, ctx, table);
         }
 
         procmgr_labels::START_PROCESS =>
@@ -271,15 +264,10 @@ fn dispatch_ipc(
             reply_empty(ipc_buf, code);
         }
 
-        procmgr_labels::REQUEST_FRAMES =>
-        {
-            handle_request_frames(&req, ipc_buf, pool);
-        }
-
         procmgr_labels::DESTROY_PROCESS =>
         {
             // Token from ipc_recv identifies which process to destroy.
-            process::destroy_process(token, table);
+            process::destroy_process(token, ctx.memmgr_ep, ipc_buf, table);
             reply_empty(ipc_buf, procmgr_errors::SUCCESS);
         }
 
@@ -309,7 +297,7 @@ fn dispatch_ipc(
 
         procmgr_labels::CREATE_FROM_VFS =>
         {
-            handle_create_from_vfs(&req, ipc_buf, ctx, pool, table);
+            handle_create_from_vfs(&req, ipc_buf, ctx, table);
         }
 
         procmgr_labels::SET_VFSD_EP =>
@@ -343,6 +331,8 @@ fn dispatch_ipc(
 /// recent-exits ring for `QUERY_PROCESS`.
 fn dispatch_death(
     death_eq: u32,
+    memmgr_ep: u32,
+    ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
     recent: &mut process::RecentExits,
 )
@@ -360,7 +350,7 @@ fn dispatch_death(
         {
             let entry_token = entry.token();
             recent.record(entry_token, exit_reason);
-            process::teardown_entry(entry);
+            process::teardown_entry(entry, memmgr_ep, ipc_buf);
         }
     }
 }
@@ -462,11 +452,9 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 /// piped direction) on the returned tokened `process_handle` between
 /// create and `START_PROCESS`; the create path itself stays
 /// stdio-agnostic.
-#[allow(clippy::cast_possible_truncation)]
 fn handle_create(
     req: &IpcMessage,
     ipc_buf: *mut u64,
-    pool: &mut FramePool,
     ctx: &ProcmgrCtx,
     table: &mut process::ProcessTable,
 )
@@ -530,15 +518,28 @@ fn handle_create(
         count: env_count,
     };
 
+    // Register this child with memmgr. memmgr replies with a tokened SEND
+    // cap on its endpoint plus the memmgr-side process token. Procmgr:
+    //   - uses the cap for every per-child frame allocation (so memmgr
+    //     accounts them to the child's record from the moment they leave
+    //     the pool); and
+    //   - copies the cap into the child's `ProcessInfo.memmgr_endpoint_cap`
+    //     so the child's std heap-bootstrap can call `REQUEST_FRAMES`; and
+    //   - sends the token in `PROCESS_DIED` at child teardown.
+    let (memmgr_send, memmgr_token) = register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
         log_discovery: ctx.log_ep,
+        memmgr_endpoint: memmgr_send,
+        memmgr_token,
     };
 
     let result = process::create_process(
         module_cap,
-        pool,
         ctx.self_aspace,
+        ctx.memmgr_ep,
+        ipc_buf,
         table,
         ctx.self_endpoint,
         creator_ep,
@@ -547,6 +548,17 @@ fn handle_create(
         &env,
         ctx.death_eq,
     );
+
+    // Procmgr's parent-side copy of the tokened cap stays in procmgr's
+    // CSpace as long as the child is alive: it's the channel procmgr
+    // uses to call `PROCESS_DIED` at teardown. The slot is recorded in
+    // ProcessEntry.memmgr_send_cap and dropped only after PROCESS_DIED.
+    // On create failure (no entry) it must be dropped immediately to
+    // avoid leaking the slot.
+    if result.is_none() && memmgr_send != 0
+    {
+        let _ = syscall::cap_delete(memmgr_send);
+    }
 
     // Transferred caps (`module_cap`, `creator_ep`) entered procmgr's
     // CSpace via `ipc_recv` and were either cap_copy'd into the child's
@@ -571,50 +583,6 @@ fn handle_create(
     }
 }
 
-/// Handle `REQUEST_FRAMES` — allocate and return physical memory frames.
-fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64, pool: &mut FramePool)
-{
-    let requested = req.word(0);
-
-    if requested == 0 || requested > 4
-    {
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-        return;
-    }
-
-    let mut caps = [0u32; 4];
-    let mut granted: u64 = 0;
-
-    for cap_slot in caps.iter_mut().take(requested as usize)
-    {
-        if let Some(page_cap) = pool.alloc_page()
-        {
-            *cap_slot = page_cap;
-            granted += 1;
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    if granted == 0
-    {
-        reply_empty(ipc_buf, procmgr_errors::REQUEST_FRAMES_OOM);
-    }
-    else
-    {
-        let mut builder = IpcMessage::builder(procmgr_errors::SUCCESS).word(0, granted);
-        for &cap in caps.iter().take(granted as usize)
-        {
-            builder = builder.cap(cap);
-        }
-        let reply = builder.build();
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-    }
-}
-
 /// Long-lived procmgr state used by all request handlers.
 ///
 /// `vfsd_ep` starts zero and is populated by `SET_VFSD_EP` once init has
@@ -630,6 +598,12 @@ pub struct ProcmgrCtx
     /// init did not provide one (very early boot); children born in that
     /// window receive zero and silent-drop `seraph::log!`.
     pub log_ep: u32,
+    /// Tokened SEND cap on memmgr's service endpoint, identifying procmgr.
+    /// Used to mint per-child memmgr SENDs via `REGISTER_PROCESS`, to
+    /// notify `PROCESS_DIED`, and as the destination for procmgr's own
+    /// frame allocations (memmgr auto-registers procmgr's token at
+    /// bootstrap so `REQUEST_FRAMES` on this cap is allowed).
+    pub memmgr_ep: u32,
     /// Single shared death-notification event queue. Every spawned child
     /// binds its thread to this queue (via multi-bind in the kernel) with
     /// `correlator = entry.token as u32`. Multiplexed alongside the
@@ -664,12 +638,10 @@ pub struct ProcmgrCtx
 /// not the caller's `CSpace`. Stdio pipes are installed via separate
 /// `CONFIGURE_PIPE` calls between create and start. Mirrors
 /// `CREATE_PROCESS`'s argv/env encoding (see `handle_create`).
-#[allow(clippy::cast_possible_truncation)]
 fn handle_create_from_vfs(
     req: &IpcMessage,
     ipc_buf: *mut u64,
     ctx: &ProcmgrCtx,
-    pool: &mut FramePool,
     table: &mut process::ProcessTable,
 )
 {
@@ -743,7 +715,6 @@ fn handle_create_from_vfs(
     let result = process::create_process_from_vfs(
         ctx,
         &path_buf[..effective_path_len],
-        pool,
         table,
         ipc_buf,
         creator_ep,

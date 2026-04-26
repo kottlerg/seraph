@@ -505,15 +505,16 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // above guarantees the destination has the worst-case headroom; the
         // `?` propagation here is now reachable only on the unlocked race
         // window covered by the inner pre_allocate inside `transfer_caps`.
+        let mut transferred: usize = 0;
+        let mut dst_indices = [0u32; MSG_CAP_SLOTS_MAX];
         if msg.cap_count > 0
         {
             // SAFETY: caller returned by endpoint_recv; is valid TCB.
             let caller_cspace = unsafe { (*caller).cspace };
             // SAFETY: tcb validated above.
             let server_cspace = unsafe { (*tcb).cspace };
-            let mut dst_indices = [0u32; MSG_CAP_SLOTS_MAX];
             // SAFETY: CSpace pointers extracted from valid TCBs.
-            let transferred = unsafe {
+            transferred = unsafe {
                 transfer_caps(
                     caller_cspace,
                     &msg.cap_slots[..msg.cap_count],
@@ -521,12 +522,17 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     &mut dst_indices,
                 )
             }?;
-            // Write cap results to server's IPC buffer (server is current
-            // thread, so its address space is active).
-            // SAFETY: server_buf is user-mapped or 0.
-            unsafe {
-                write_cap_results(server_buf, transferred, &dst_indices);
-            }
+        }
+        // Always write cap_count to the receiver's IPC buffer — including
+        // the zero-cap case — so a prior IPC's cap metadata cannot be
+        // mis-read as if it belonged to this delivery. The kernel's
+        // `read_recv_caps` / userspace's `IpcMessage::from_ipc_buf` both
+        // read `cap_count` from a fixed buffer slot; without an
+        // unconditional write here, stale values trip handlers that loop
+        // over `req.caps()`.
+        // SAFETY: server_buf is user-mapped or 0.
+        unsafe {
+            write_cap_results(server_buf, transferred, &dst_indices);
         }
 
         if msg.data_count > 0
@@ -552,6 +558,8 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated above; ipc_buffer is immutable.
     let server_buf = unsafe { (*tcb).ipc_buffer };
 
+    let mut transferred: usize = 0;
+    let mut dst_indices = [0u32; MSG_CAP_SLOTS_MAX];
     if msg.cap_count > 0
     {
         // SAFETY: tcb validated; reply_tcb set by endpoint_recv to caller's TCB.
@@ -560,12 +568,11 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let caller_cspace = unsafe { (*caller).cspace };
         // SAFETY: tcb validated above.
         let server_cspace = unsafe { (*tcb).cspace };
-        let mut dst_indices = [0u32; MSG_CAP_SLOTS_MAX];
         // On failure: deliver message data without caps (cap_count=0 in buf).
         // The caller stays blocked awaiting a reply; the server receives an
         // incomplete message but is not crashed.
         // SAFETY: CSpace pointers extracted from valid TCBs.
-        if let Ok(transferred) = unsafe {
+        if let Ok(t) = unsafe {
             transfer_caps(
                 caller_cspace,
                 &msg.cap_slots[..msg.cap_count],
@@ -574,13 +581,14 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             )
         }
         {
-            // Write cap results to server's IPC buffer (server is current
-            // thread, so its address space is active).
-            // SAFETY: server_buf is user-mapped or 0.
-            unsafe {
-                write_cap_results(server_buf, transferred, &dst_indices);
-            }
+            transferred = t;
         }
+    }
+    // Always write cap_count (see immediate-delivery path above for the
+    // rationale).
+    // SAFETY: server_buf is user-mapped or 0.
+    unsafe {
+        write_cap_results(server_buf, transferred, &dst_indices);
     }
 
     if msg.data_count > 0

@@ -27,8 +27,20 @@ mod service;
 mod vfs;
 
 // ── Constants ────────────────────────────────────────────────────────────────
+//
+// init runs no_std with no `std::os::seraph::reserve_pages` allocator; its
+// scratch and IPC-buffer VAs are picked here as private constants. They
+// only need to be disjoint from each other and from the InitInfo page
+// (`INIT_INFO_VADDR` in `abi/init-protocol`) and the kernel-supplied
+// stack range — both of which live high in the lower-canonical half.
 
-pub(crate) use va_layout::{INIT_IPC_BUF_VA, INIT_TEMP_MAP_BASE as TEMP_MAP_BASE, PAGE_SIZE};
+pub(crate) use syscall_abi::PAGE_SIZE;
+
+/// init main-thread IPC buffer.
+pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
+
+/// Base for init's scratch mappings (`ProcessInfo` frames, ELF pages).
+pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;
 
 // ── Cap descriptor helpers ───────────────────────────────────────────────────
 
@@ -252,6 +264,12 @@ fn run(info_ptr: u64) -> !
         logging::log("init: FATAL: cannot create procmgr service endpoint");
         syscall::thread_exit();
     };
+    let Ok(memmgr_service_ep) = syscall::cap_create_endpoint()
+    else
+    {
+        logging::log("init: FATAL: cannot create memmgr service endpoint");
+        syscall::thread_exit();
+    };
 
     // Create the log endpoint. Init holds the full-rights cap; procmgr
     // receives a SEND copy in its bootstrap round and `cap_copy`s it
@@ -289,20 +307,113 @@ fn run(info_ptr: u64) -> !
     logging::set_ipc_logging(init_log_send, ipc_buf);
     logging::register_name(b"init");
 
-    // ── Bootstrap procmgr (raw ELF load + creator_endpoint install) ──────────
+    // ── Bootstrap memmgr (raw ELF load; first half of remaining frames) ──────
 
+    if info.module_frame_count < 6
+    {
+        logging::log("FATAL: memmgr boot module missing (expect 6 modules)");
+        syscall::thread_exit();
+    }
+    let memmgr_module_idx: u32 = 5;
+
+    // Memmgr's setup phase: kernel objects, ELF load, PI page, stack/IPC
+    // mappings, creator + procmgr SEND caps. Frame delegation and
+    // thread_start are deferred to `finalize_memmgr` so procmgr's setup
+    // can still draw from init's frame pool.
+    let Some(mm) = bootstrap::bootstrap_memmgr(
+        info,
+        &mut alloc,
+        init_bootstrap_ep,
+        memmgr_module_idx,
+        memmgr_service_ep,
+    )
+    else
+    {
+        logging::log("FATAL: failed to bootstrap memmgr");
+        syscall::thread_exit();
+    };
+
+    // Procmgr's setup phase: same shape; thread is configured but not
+    // yet started.
     let Some(pm) = bootstrap::bootstrap_procmgr(
         info,
         &mut alloc,
         init_bootstrap_ep,
         procmgr_service_ep,
         log_ep,
+        mm.procmgr_send_cap,
     )
     else
     {
         logging::log("FATAL: failed to bootstrap procmgr");
         syscall::thread_exit();
     };
+
+    // Now every alloc-from-init's-pool consumer has run. Delegate ALL
+    // remaining RAM frames to memmgr and start memmgr's thread. Memmgr
+    // ingests its pool and enters the dispatch loop before procmgr
+    // starts (procmgr's std `_start` calls `heap_bootstrap` which calls
+    // memmgr's `REQUEST_FRAMES`, so memmgr must be live first).
+    let Some(mm_final) = bootstrap::finalize_memmgr(info, &mut alloc, &mm)
+    else
+    {
+        logging::log("FATAL: finalize_memmgr failed");
+        syscall::thread_exit();
+    };
+
+    // Serve memmgr's bootstrap round.
+    //
+    // Caps: [0] memmgr's own service endpoint (RECV).
+    // Data: [frame_base, frame_count, procmgr_token, page_counts...].
+    let Ok(mm_service_cap_for_mm) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_ALL)
+    else
+    {
+        logging::log("FATAL: cannot derive memmgr service cap for bootstrap");
+        syscall::thread_exit();
+    };
+    // Pack 2 page_counts per data word: low 32 bits = even index, high
+    // 32 bits = odd index. Mirror this on memmgr's parser.
+    let mut mm_boot_data = [0u64; 64];
+    mm_boot_data[0] = u64::from(mm_final.mm_frame_base);
+    mm_boot_data[1] = u64::from(mm_final.mm_frame_count);
+    mm_boot_data[2] = mm.procmgr_token;
+    let count = mm_final.mm_frame_count as usize;
+    let packed_words = count.div_ceil(2);
+    for w in 0..packed_words
+    {
+        let i0 = w * 2;
+        let i1 = i0 + 1;
+        let lo = u64::from(mm_final.page_counts[i0]);
+        let hi = if i1 < count
+        {
+            u64::from(mm_final.page_counts[i1])
+        }
+        else
+        {
+            0
+        };
+        mm_boot_data[3 + w] = lo | (hi << 32);
+    }
+    let mm_data_words = 3 + packed_words;
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe {
+        ipc::bootstrap::serve_round(
+            init_bootstrap_ep,
+            mm.bootstrap_token,
+            ipc_buf,
+            true,
+            &[mm_service_cap_for_mm],
+            &mm_boot_data[..mm_data_words],
+        )
+    }
+    .is_err()
+    {
+        logging::log("FATAL: memmgr bootstrap serve failed");
+        syscall::thread_exit();
+    }
+
+    // Memmgr is now ingesting; start procmgr.
+    bootstrap::start_procmgr(&pm);
 
     // Serve procmgr's bootstrap round.
     //
@@ -312,17 +423,14 @@ fn run(info_ptr: u64) -> !
     //       CSpace by `bootstrap_procmgr`. Procmgr re-derives tokened
     //       SEND caps from this for every child it spawns.
     //
-    // Data: [frame_base, frame_count].
+    // No data words: procmgr no longer maintains a frame pool; every
+    // per-child allocation routes through memmgr.
     let Ok(pm_service_cap_for_pm) = syscall::cap_derive(procmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
         logging::log("FATAL: cannot derive procmgr service cap for bootstrap");
         syscall::thread_exit();
     };
-    let procmgr_boot_data = [
-        u64::from(pm.memory_frame_base),
-        u64::from(pm.memory_frame_count),
-    ];
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe {
         ipc::bootstrap::serve_round(
@@ -331,7 +439,7 @@ fn run(info_ptr: u64) -> !
             ipc_buf,
             true,
             &[pm_service_cap_for_pm, pm.log_endpoint_slot],
-            &procmgr_boot_data,
+            &[],
         )
     }
     .is_err()

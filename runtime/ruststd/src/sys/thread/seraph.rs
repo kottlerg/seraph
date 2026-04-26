@@ -22,7 +22,7 @@ use crate::num::NonZero;
 use crate::thread::ThreadInit;
 use crate::time::Duration;
 
-use va_layout::PAGE_SIZE;
+use syscall_abi::PAGE_SIZE;
 
 /// Default minimum stack size. Matches the upstream unsupported-PAL value.
 pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;

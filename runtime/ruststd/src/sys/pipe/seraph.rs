@@ -165,10 +165,10 @@ impl Pipe {
         let info = try_startup_info().ok_or_else(|| {
             io::Error::other("seraph pipe: startup info not installed")
         })?;
-        let procmgr_ep = info.procmgr_endpoint;
-        if procmgr_ep == 0 {
+        let memmgr_ep = info.memmgr_endpoint;
+        if memmgr_ep == 0 {
             return Err(io::Error::other(
-                "seraph pipe: spawning process has no procmgr endpoint",
+                "seraph pipe: spawning process has no memmgr endpoint",
             ));
         }
         let aspace = info.self_aspace;
@@ -183,7 +183,7 @@ impl Pipe {
             .ok_or_else(|| io::Error::other("seraph pipe: parent VA pool exhausted"))?;
 
         // Allocate one shmem page mapped at parent_va in this process.
-        let (sb, frames) = SharedBuffer::create(procmgr_ep, aspace, parent_va, 1, ipc_buf)
+        let (sb, frames) = SharedBuffer::create(memmgr_ep, aspace, parent_va, 1, ipc_buf)
             .map_err(|_| {
                 free_parent_va(parent_va);
                 io::Error::other("seraph pipe: SharedBuffer::create failed")

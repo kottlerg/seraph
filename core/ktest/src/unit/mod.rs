@@ -98,7 +98,7 @@ pub fn run_all(ctx: &TestContext)
     );
 
     // ── Memory management syscalls ────────────────────────────────────────────
-    run_test!("mm::frame_split", mm::frame_split(ctx));
+    run_test!("mm::frame_split_merge", mm::frame_split_merge(ctx));
     run_test!("mm::mem_map_unmap", mm::mem_map_unmap(ctx));
     run_test!("mm::mem_protect", mm::mem_protect(ctx));
     run_test!(

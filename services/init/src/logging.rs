@@ -28,11 +28,17 @@ use ipc::log_labels::GET_LOG_CAP;
 use ipc::stream_labels::STREAM_BYTES;
 
 // ── Constants ────────────────────────────────────────────────────────────────
+//
+// init's log-thread VAs sit one page above its main IPC buffer to keep
+// the two adjacent for human readability of address dumps; both live in
+// init's private no_std VA space (init does not use the std page-
+// reservation allocator).
 
-use va_layout::{
-    INIT_LOG_THREAD_IPC_BUF_VA as LOG_THREAD_IPC_BUF_VA,
-    INIT_LOG_THREAD_STACK_VA as LOG_THREAD_STACK_VA,
-};
+/// init log-thread IPC buffer (one page above the main IPC buffer).
+const LOG_THREAD_IPC_BUF_VA: u64 = crate::INIT_IPC_BUF_VA + crate::PAGE_SIZE;
+
+/// init log-thread stack base.
+const LOG_THREAD_STACK_VA: u64 = 0x0000_0000_D000_0000;
 
 /// Number of stack pages for the log thread (16 KiB).
 const LOG_THREAD_STACK_PAGES: u64 = 4;

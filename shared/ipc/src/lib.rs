@@ -50,8 +50,6 @@ pub mod procmgr_labels
     pub const CREATE_PROCESS: u64 = 1;
     /// Start a previously created (suspended) process.
     pub const START_PROCESS: u64 = 2;
-    /// Request physical memory frames from procmgr's pool.
-    pub const REQUEST_FRAMES: u64 = 5;
     /// Create a new process from a VFS path (ELF binary). Wire format
     /// carries the path plus optional argv + env blobs; see procmgr's
     /// `handle_create_from_vfs` for the full label and data layout. Caps:
@@ -119,6 +117,80 @@ pub mod procmgr_labels
     /// Direction selector for [`CONFIGURE_PIPE`] — child stderr (child
     /// is the writer, parent is the reader).
     pub const PIPE_DIR_STDERR: u64 = 2;
+}
+
+/// IPC labels for the memory manager (`memmgr`).
+///
+/// memmgr owns the userspace RAM frame pool. All std-built processes
+/// bootstrap their heap by calling `REQUEST_FRAMES` on a tokened SEND
+/// cap installed in `ProcessInfo.memmgr_endpoint_cap`. Procmgr is the
+/// privileged caller that registers and retires process tokens.
+///
+/// See `services/memmgr/docs/ipc-interface.md` for the authoritative wire
+/// shape.
+pub mod memmgr_labels
+{
+    /// Allocate one or more Frame caps covering at least `want_pages` pages.
+    ///
+    /// Universal label — callable from any tokened cap on memmgr's
+    /// endpoint. Wire format:
+    ///
+    /// * `data[0]` low 32 bits — `want_pages: u32`.
+    /// * `data[0]` high 32 bits — `flags: u32` (see flag constants below).
+    ///
+    /// Reply (success): `data[0]` = `returned_cap_count: u32`;
+    /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Frame
+    /// capabilities (MAP|WRITE rights). `sum(page_count_for_cap_i) ==
+    /// want_pages` for both contiguous and best-effort replies.
+    pub const REQUEST_FRAMES: u64 = 1;
+    /// Voluntarily return Frame caps to the pool. Callable from any
+    /// tokened cap. Wire format: `data[0]` = `cap_count`; `data[1+i]` =
+    /// `page_count_for_cap_i`; `caps[0..cap_count]` = Frame caps to release.
+    /// memmgr verifies each cap was previously issued to the caller's token.
+    pub const RELEASE_FRAMES: u64 = 2;
+    /// Procmgr-only: register a new process. memmgr allocates a per-process
+    /// tracking entry and replies with a tokened SEND cap on its endpoint
+    /// identifying the new process. Procmgr installs the returned cap in
+    /// the new process's `ProcessInfo.memmgr_endpoint_cap`.
+    pub const REGISTER_PROCESS: u64 = 3;
+    /// Procmgr-only: signal process death. The transferred cap (`caps[0]`)
+    /// carries the dead process's token; memmgr reclaims every Frame cap
+    /// it had issued to that token, runs coalescing, and clears the
+    /// per-process record. Idempotent on unknown tokens.
+    pub const PROCESS_DIED: u64 = 4;
+
+    /// `REQUEST_FRAMES` flag: reply MUST contain exactly one Frame cap
+    /// covering all `want_pages`, or fail with
+    /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
+    /// the flags half of `data[0]`.
+    pub const REQUIRE_CONTIGUOUS: u32 = 1 << 0;
+}
+
+/// Error replies from memmgr.
+///
+/// memmgr never panics on allocation failure; the caller decides whether
+/// to retry, fall back, or propagate the OOM upstream.
+pub mod memmgr_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// `REQUIRE_CONTIGUOUS` was set and no free run satisfies `want_pages`.
+    /// Caller may retry without the flag, or fail.
+    pub const OUT_OF_MEMORY_CONTIGUOUS: u64 = 1;
+    /// Pool cannot cover `want_pages` even fragmented. System-wide RAM
+    /// exhaustion.
+    pub const OUT_OF_MEMORY_BEST_EFFORT: u64 = 2;
+    /// Per-process frame-record list at static cap. The caller is
+    /// consuming an unreasonable number of frames.
+    pub const QUOTA: u64 = 3;
+    /// `want_pages == 0`, reserved flag bits set, page-count mismatch on
+    /// `RELEASE_FRAMES`, or token unknown.
+    pub const INVALID_ARGUMENT: u64 = 4;
+    /// Procmgr-only label called over a non-procmgr token.
+    pub const UNAUTHORIZED: u64 = 5;
+    /// `REGISTER_PROCESS` failed because the per-process tracking table
+    /// is at static cap. Procmgr handles this as a process-creation
+    /// failure.
+    pub const TOO_MANY_PROCESSES: u64 = 6;
 }
 
 /// Process-state codes returned by `procmgr_labels::QUERY_PROCESS`.
@@ -322,8 +394,6 @@ pub mod procmgr_errors
     pub const INVALID_TOKEN: u64 = 4;
     /// Attempt to start a process that was already started.
     pub const ALREADY_STARTED: u64 = 5;
-    /// Out of memory while fulfilling a frame request.
-    pub const REQUEST_FRAMES_OOM: u64 = 6;
     /// Invalid argument to an IPC request.
     pub const INVALID_ARGUMENT: u64 = 7;
     /// `CREATE_FROM_VFS` without a registered vfsd endpoint.

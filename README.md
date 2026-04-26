@@ -63,7 +63,8 @@ Overall project design documents live in [`docs/`](docs/):
 
 - [Architecture Overview](docs/architecture.md) — component structure and design philosophy
 - [Memory Model](docs/memory-model.md) — virtual address space layout, paging, allocation
-- [Userspace Memory Model](docs/userspace-memory-model.md) — VA zones, heap ownership, std↔procmgr frame authority
+- [Userspace Memory Model](docs/userspace-memory-model.md) — three-surface VA model, memmgr authority, page-reservation contract
+- [Process Lifecycle](docs/process-lifecycle.md) — userspace boot order, ProcessInfo/InitInfo handover, process-death flow
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
 - [Boot Protocol ABI crate](abi/boot-protocol/) — kernel-entry contract: `BootInfo` layout, `BOOT_PROTOCOL_VERSION`, and compliant-bootloader requirements

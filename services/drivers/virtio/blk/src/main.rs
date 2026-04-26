@@ -19,8 +19,9 @@
 
 mod io;
 
-use ipc::{IpcMessage, blk_labels, devmgr_labels, procmgr_labels};
-use std::os::seraph::{StartupInfo, startup_info};
+use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
+use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
+use syscall_abi::PAGE_SIZE;
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
 use virtio_core::{
@@ -28,10 +29,6 @@ use virtio_core::{
 };
 
 use crate::io::IoLayout;
-use va_layout::{
-    PAGE_SIZE, VIRTIO_BLK_BAR_MAP_VA as BAR_MAP_VA, VIRTIO_BLK_DATA_MAP_VA as DATA_MAP_VA,
-    VIRTIO_BLK_RING_MAP_VA as RING_MAP_VA,
-};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -137,7 +134,7 @@ struct DriverCaps
 {
     bar_mmio_slot: u32,
     irq_slot: u32,
-    procmgr_ep: u32,
+    memmgr_ep: u32,
     service_ep: u32,
     devmgr_ep: u32,
     self_aspace: u32,
@@ -169,7 +166,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
         bar_mmio_slot: round1.caps[0],
         irq_slot: round1.caps[1],
         service_ep: round1.caps[2],
-        procmgr_ep: info.procmgr_endpoint,
+        memmgr_ep: info.memmgr_endpoint,
         devmgr_ep: round2.caps[0],
         self_aspace: info.self_aspace,
     })
@@ -198,28 +195,33 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     VirtioPciStartupInfo::from_words(reply.words())
 }
 
-// ── Frame allocation via procmgr IPC ───────────────────────────────────────
+// ── Frame allocation via memmgr IPC ────────────────────────────────────────
 
-/// Request `page_count` frame caps from procmgr. Returns the first cap slot
-/// on success.
-fn request_frames(procmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<u32>
+/// Request a single contiguous Frame cap covering `page_count` pages from
+/// memmgr. Returns the cap slot on success.
+fn request_frames(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<u32>
 {
-    let request = IpcMessage::builder(procmgr_labels::REQUEST_FRAMES)
-        .word(0, page_count)
+    let arg = page_count | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
+    let request = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+        .word(0, arg)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(procmgr_ep, &request, ipc_buf) }.ok()?;
-    if reply.label != 0
+    let reply = unsafe { ipc::ipc_call(memmgr_ep, &request, ipc_buf) }.ok()?;
+    if reply.label != memmgr_errors::SUCCESS
     {
         return None;
     }
 
-    let caps = reply.caps();
-    if (caps.len() as u64) < page_count
+    // REQUIRE_CONTIGUOUS guarantees exactly one cap covering page_count pages.
+    if reply.word(0) != 1
     {
+        for &c in reply.caps()
+        {
+            let _ = syscall::cap_delete(c);
+        }
         return None;
     }
-    Some(caps[0])
+    reply.caps().first().copied()
 }
 
 // ── Device initialisation ──────────────────────────────────────────────────
@@ -256,21 +258,31 @@ fn configure_queue_size(transport: &PciTransport) -> u16
 }
 
 /// Allocate the backing DMA memory for the virtqueue rings and map it into
-/// the driver's address space. Returns the ring physical address and the
-/// ring page count.
-fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64) -> (u64, u64)
+/// the driver's address space. Returns `(ring_phys, ring_pages, ring_va)`.
+fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
+-> (u64, u64, u64)
 {
     let ring_pages = virtqueue::ring_pages(queue_size) as u64;
-    let Some(ring_frame) = request_frames(caps.procmgr_ep, ring_pages, ipc_buf)
+    let Some(ring_frame) = request_frames(caps.memmgr_ep, ring_pages, ipc_buf)
     else
     {
         std::os::seraph::log!("failed to allocate ring frames");
         syscall::thread_exit();
     };
+    // The ring mapping lives for the driver process's lifetime; the
+    // reservation is intentionally never returned to the arena (the
+    // ReservedRange has no Drop impl, so falling out of scope is a no-op).
+    let Ok(ring_range) = reserve_pages(ring_pages)
+    else
+    {
+        std::os::seraph::log!("ring reserve_pages failed");
+        syscall::thread_exit();
+    };
+    let ring_va = ring_range.va_start();
     if syscall::mem_map(
         ring_frame,
         caps.self_aspace,
-        RING_MAP_VA,
+        ring_va,
         0,
         ring_pages,
         syscall::MAP_READONLY | syscall::MAP_WRITABLE,
@@ -280,9 +292,9 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
         std::os::seraph::log!("ring mem_map failed");
         syscall::thread_exit();
     }
-    // SAFETY: RING_MAP_VA is mapped writable, ring_pages * PAGE_SIZE bytes.
+    // SAFETY: ring_va is mapped writable, ring_pages * PAGE_SIZE bytes.
     unsafe {
-        core::ptr::write_bytes(RING_MAP_VA as *mut u8, 0, (ring_pages * PAGE_SIZE) as usize);
+        core::ptr::write_bytes(ring_va as *mut u8, 0, (ring_pages * PAGE_SIZE) as usize);
     }
     let Ok(ring_phys) = syscall::dma_grant(ring_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
     else
@@ -290,7 +302,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
         std::os::seraph::log!("ring dma_grant failed");
         syscall::thread_exit();
     };
-    (ring_phys, ring_pages)
+    (ring_phys, ring_pages, ring_va)
 }
 
 /// Write the descriptor/avail/used ring physical addresses into the PCI
@@ -327,7 +339,7 @@ fn setup_virtqueue(
 ) -> (SplitVirtqueue, u16)
 {
     let queue_size = configure_queue_size(transport);
-    let (ring_phys, _ring_pages) = allocate_and_map_rings(queue_size, caps, ipc_buf);
+    let (ring_phys, _ring_pages, ring_va) = allocate_and_map_rings(queue_size, caps, ipc_buf);
     program_transport_rings(transport, queue_size, ring_phys);
 
     // Save notification offset for this queue before changing selection.
@@ -335,9 +347,9 @@ fn setup_virtqueue(
 
     let desc_size = virtqueue::desc_table_size(queue_size);
     let used_off = virtqueue::used_ring_offset(queue_size);
-    let desc_va = RING_MAP_VA;
-    let avail_va = RING_MAP_VA + desc_size as u64;
-    let used_va = RING_MAP_VA + used_off as u64;
+    let desc_va = ring_va;
+    let avail_va = ring_va + desc_size as u64;
+    let used_va = ring_va + used_off as u64;
 
     // SAFETY: ring memory is zeroed, properly sized, and exclusively owned.
     // Pointers are aligned: desc_va is page-aligned; avail_va is at desc_va +
@@ -358,17 +370,26 @@ fn setup_virtqueue(
 /// Allocate and map the data buffer page for block I/O, returning an `IoLayout`.
 fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
 {
-    let Some(data_frame) = request_frames(caps.procmgr_ep, 1, ipc_buf)
+    let Some(data_frame) = request_frames(caps.memmgr_ep, 1, ipc_buf)
     else
     {
         std::os::seraph::log!("failed to allocate data frame");
         syscall::thread_exit();
     };
-
+    // The data mapping lives for the driver process's lifetime; the
+    // reservation falls out of scope as a no-op (ReservedRange has no
+    // Drop impl).
+    let Ok(data_range) = reserve_pages(1)
+    else
+    {
+        std::os::seraph::log!("data reserve_pages failed");
+        syscall::thread_exit();
+    };
+    let data_va = data_range.va_start();
     if syscall::mem_map(
         data_frame,
         caps.self_aspace,
-        DATA_MAP_VA,
+        data_va,
         0,
         1,
         syscall::MAP_READONLY | syscall::MAP_WRITABLE,
@@ -380,8 +401,8 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     }
 
     // Fill data buffer with sentinel pattern (0xAA) to detect untouched regions.
-    // SAFETY: DATA_MAP_VA is mapped writable, one page.
-    unsafe { core::ptr::write_bytes(DATA_MAP_VA as *mut u8, 0xAA, PAGE_SIZE as usize) };
+    // SAFETY: data_va is mapped writable, one page.
+    unsafe { core::ptr::write_bytes(data_va as *mut u8, 0xAA, PAGE_SIZE as usize) };
 
     let Ok(data_phys) = syscall::dma_grant(data_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
     else
@@ -390,10 +411,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
         syscall::thread_exit();
     };
 
-    IoLayout {
-        data_va: DATA_MAP_VA,
-        data_phys,
-    }
+    IoLayout { data_va, data_phys }
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
@@ -620,7 +638,7 @@ fn main() -> !
         std::os::seraph::log!("no BAR MMIO cap");
         syscall::thread_exit();
     }
-    if caps.procmgr_ep == 0
+    if caps.memmgr_ep == 0
     {
         std::os::seraph::log!("no procmgr endpoint");
         syscall::thread_exit();
@@ -634,15 +652,25 @@ fn main() -> !
     }
     let pci_info = query_device_info(caps.devmgr_ep, ipc_buf);
 
-    // Map BAR MMIO.
-    if syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, BAR_MAP_VA, 0).is_err()
+    // Map BAR MMIO. Reservation covers the highest reach across the four
+    // VirtIO PCI capability regions (rounded up to whole pages); the BAR
+    // mapping lives for the driver process's lifetime.
+    let bar_pages = pci_info.bar_aperture_pages();
+    let Ok(bar_range) = reserve_pages(bar_pages)
+    else
+    {
+        std::os::seraph::log!("BAR reserve_pages failed");
+        syscall::thread_exit();
+    };
+    let bar_va = bar_range.va_start();
+    if syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, bar_va, 0).is_err()
     {
         std::os::seraph::log!("BAR mmio_map failed");
         syscall::thread_exit();
     }
 
     // Create PCI transport and initialise device.
-    let transport = PciTransport::new(BAR_MAP_VA, &pci_info);
+    let transport = PciTransport::new(bar_va, &pci_info);
     let capacity = init_device(&transport);
     std::os::seraph::log!("capacity (sectors)={capacity:#018x}");
 

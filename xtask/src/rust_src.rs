@@ -539,6 +539,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
     apply_sys_visibility_overlay(&rust_src).context("sys visibility overlay")?;
     apply_std_cargo_deps_overlay(&rust_src, project_root).context("std Cargo.toml deps overlay")?;
     apply_alloc_overlay(&rust_src, overlay_root).context("alloc overlay")?;
+    apply_reserve_overlay(&rust_src, overlay_root).context("reserve overlay")?;
     apply_io_error_overlay(&rust_src).context("io/error overlay")?;
     apply_random_overlay(&rust_src).context("random overlay")?;
     apply_thread_local_overlay(&rust_src).context("thread_local overlay")?;
@@ -584,10 +585,6 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         .join("shared/log")
         .canonicalize()
         .context("canonicalising shared/log")?;
-    let va_layout_path = project_root
-        .join("shared/va_layout")
-        .canonicalize()
-        .context("canonicalising shared/va_layout")?;
     let process_abi_path = project_root
         .join("abi/process-abi")
         .canonicalize()
@@ -609,14 +606,12 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
          syscall = {{ path = \"{sys}\", features = [\"rustc-dep-of-std\"] }}\n\
          ipc = {{ path = \"{ipc}\", features = [\"rustc-dep-of-std\"] }}\n\
          log = {{ path = \"{log}\", features = [\"rustc-dep-of-std\"] }}\n\
-         va_layout = {{ path = \"{va}\", features = [\"rustc-dep-of-std\"] }}\n\
          process-abi = {{ path = \"{proc}\", features = [\"rustc-dep-of-std\"] }}\n\
          shmem = {{ path = \"{shmem}\", features = [\"rustc-dep-of-std\"] }}\n",
         abi = syscall_abi_path.display(),
         sys = syscall_path.display(),
         ipc = ipc_path.display(),
         log = log_path.display(),
-        va = va_layout_path.display(),
         proc = process_abi_path.display(),
         shmem = shmem_path.display(),
     );
@@ -659,17 +654,47 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
 }
 
 /// Widen `mod alloc;` in `sys/mod.rs` to `pub(crate) mod alloc;` so
-/// `std::os::seraph` can reach the seraph PAL's public helpers.
+/// `std::os::seraph` can reach the seraph PAL's public helpers, and
+/// declare the seraph-only `pub(crate) mod reserve;` (the page-
+/// reservation allocator). Both overlays touch the same file, so they
+/// share one idempotent surgery pass.
 fn apply_sys_visibility_overlay(rust_src: &Path) -> Result<()>
 {
     let mod_rs = rust_src.join("library/std/src/sys/mod.rs");
-    patch_file(
-        &mod_rs,
-        "sys/mod.rs",
-        "mod alloc;\n",
-        "// seraph-overlay: expose sys::alloc to the crate for os::seraph\n\
-         pub(crate) mod alloc;\n",
-    )
+    let original = "mod alloc;\n";
+    let stale_visibility_only = "// seraph-overlay: expose sys::alloc to the crate for os::seraph\n\
+         pub(crate) mod alloc;\n";
+    let final_block = "// seraph-overlay: expose sys::alloc to the crate for os::seraph\n\
+         pub(crate) mod alloc;\n\
+         // seraph-overlay: page-reservation allocator (seraph-only)\n\
+         #[cfg(target_os = \"seraph\")]\n\
+         pub(crate) mod reserve;\n";
+
+    let text =
+        fs::read_to_string(&mod_rs).with_context(|| format!("reading {}", mod_rs.display()))?;
+    if text.contains(final_block)
+    {
+        return Ok(());
+    }
+    let patched = if text.contains(stale_visibility_only)
+    {
+        text.replace(stale_visibility_only, final_block)
+    }
+    else if text.contains(original)
+    {
+        text.replace(original, final_block)
+    }
+    else
+    {
+        bail!(
+            "sys/mod.rs has an unexpected shape — neither the upstream `mod alloc;` \
+             nor the prior overlay block was found at {}",
+            mod_rs.display()
+        );
+    };
+    write_new_file(&mod_rs, &patched)?;
+    step(&format!("seraph-toolchain: patched {}", mod_rs.display()));
+    Ok(())
 }
 
 fn apply_alloc_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
@@ -689,6 +714,21 @@ fn apply_alloc_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
          // seraph-overlay: seraph alloc (pub(crate) so os::seraph can reach it)\n    \
          target_os = \"seraph\" => {\n        pub(crate) mod seraph;\n    }\n",
     )
+}
+
+/// Install the seraph-only page-reservation allocator at
+/// `library/std/src/sys/reserve.rs`. The module declaration lives in
+/// `sys/mod.rs` (added by `apply_sys_visibility_overlay`); this overlay
+/// supplies the implementation. The overlay source is kept under the
+/// conventional `sys/reserve/seraph.rs` name in the project tree even
+/// though the toolchain destination is a single `reserve.rs` file —
+/// `reserve` exists only on seraph, so a per-target `seraph.rs` would
+/// be redundant.
+fn apply_reserve_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
+{
+    let dst = rust_src.join("library/std/src/sys/reserve.rs");
+    let src = overlay_root.join("sys/reserve/seraph.rs");
+    write_if_changed(&src, &dst, "sys/reserve.rs")
 }
 
 fn apply_io_error_overlay(rust_src: &Path) -> Result<()>

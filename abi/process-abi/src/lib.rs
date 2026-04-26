@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 9;
+pub const PROCESS_ABI_VERSION: u32 = 10;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -51,8 +51,8 @@ pub const PROCESS_INFO_VADDR: u64 = 0x0000_7FFF_FFFF_0000;
 /// One additional guard page (unmapped) sits below the stack.
 pub const PROCESS_STACK_TOP: u64 = 0x0000_7FFF_FFFF_E000;
 
-/// Number of 4 KiB pages in a normal process's user stack (16 KiB total).
-pub const PROCESS_STACK_PAGES: usize = 4;
+/// Number of 4 KiB pages in a normal process's user stack (32 KiB total).
+pub const PROCESS_STACK_PAGES: usize = 8;
 
 /// Virtual address of the main thread's TLS block in a normal process.
 ///
@@ -114,14 +114,27 @@ pub struct ProcessInfo
 
     /// `CSpace` slot of a tokened SEND cap on procmgr's service endpoint.
     ///
-    /// Every std-built process needs this to bootstrap its heap via
-    /// `REQUEST_FRAMES`. `std::os::seraph::_start` reads this slot and
-    /// initialises the allocator before `lang_start` runs, so idiomatic
-    /// `fn main()` code can allocate from the very first statement.
+    /// Used for process-lifecycle queries (`QUERY_PROCESS`,
+    /// `DESTROY_PROCESS`, future supervision RPCs) and for any future
+    /// procmgr-served operation that is not heap-bootstrap.
     ///
     /// Zero when no procmgr is reachable (procmgr itself, init, anything
     /// before procmgr exists). Consumers must tolerate zero.
     pub procmgr_endpoint_cap: u32,
+
+    /// `CSpace` slot of a tokened SEND cap on memmgr's service endpoint.
+    ///
+    /// Every std-built process needs this to bootstrap its heap via
+    /// `memmgr_labels::REQUEST_FRAMES`. `std::os::seraph::_start` reads
+    /// this slot and initialises the allocator before `lang_start` runs,
+    /// so idiomatic `fn main()` code can allocate from the very first
+    /// statement. The tokened cap identifies the holder to memmgr's
+    /// per-process tracking, so allocations are accounted to the correct
+    /// process.
+    ///
+    /// Zero when no memmgr is reachable (memmgr itself, init, anything
+    /// before memmgr exists). Consumers must tolerate zero.
+    pub memmgr_endpoint_cap: u32,
 
     /// `CSpace` slot of the shmem frame cap backing `std::io::stdin`.
     ///
@@ -286,6 +299,12 @@ pub struct StartupInfo
     /// `CSpace` slot of a tokened SEND cap on procmgr's service endpoint.
     /// Zero when unreachable (procmgr itself, or earlier in the boot chain).
     pub procmgr_endpoint: u32,
+
+    /// `CSpace` slot of a tokened SEND cap on memmgr's service endpoint.
+    /// Used by `std::os::seraph::_start` to bootstrap the heap allocator.
+    /// Zero when unreachable (memmgr itself, init, or earlier in the boot
+    /// chain).
+    pub memmgr_endpoint: u32,
 
     /// `CSpace` slot of the stdin shmem frame cap. Zero when no input
     /// pipe is attached.

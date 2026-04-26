@@ -79,6 +79,11 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "procmgr",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::EfiSeraph,
+    },
+    Spec {
+        name: "memmgr",
         profile: BuildProfile::LowLevelUser,
         dest: InstallDest::EfiSeraph,
     },
@@ -148,6 +153,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Init => "init",
         BuildComponent::Ktest => "ktest",
         BuildComponent::Procmgr => "procmgr",
+        BuildComponent::Memmgr => "memmgr",
         BuildComponent::Devmgr => "devmgr",
         BuildComponent::Vfsd => "vfsd",
         BuildComponent::VirtioBlk => "virtio-blk",
@@ -478,7 +484,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         // recognise in its built-in list, which makes the whole std surface
         // `restricted_std`-gated. They also see `ProcessInfo`-derived
         // helpers that feel "sysroot-private" when their backing crates
-        // (process-abi, syscall, ipc, va_layout) get loaded as std deps.
+        // (process-abi, syscall, ipc, shmem, log) get loaded as std deps.
         // Setting RUSTC_BOOTSTRAP=1 for the build treats those gates as
         // unlocked — matches how hermit and other tier-3 custom-std
         // targets ship. Service code stays free of feature preambles.

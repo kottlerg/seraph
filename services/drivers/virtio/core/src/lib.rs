@@ -171,6 +171,30 @@ impl VirtioPciStartupInfo
 
         info
     }
+
+    /// Number of 4 KiB pages spanned by the highest reach across all four
+    /// capability regions in BAR 0. Drivers use this to size the VA
+    /// reservation backing `mmio_map` for the BAR.
+    #[must_use]
+    pub fn bar_aperture_pages(&self) -> u64
+    {
+        const PAGE_SIZE: u64 = 0x1000;
+        let mut max_reach: u64 = 0;
+        for cap in [
+            &self.common_cfg,
+            &self.notify_cfg,
+            &self.isr_cfg,
+            &self.device_cfg,
+        ]
+        {
+            let reach = u64::from(cap.offset).saturating_add(u64::from(cap.length));
+            if reach > max_reach
+            {
+                max_reach = reach;
+            }
+        }
+        max_reach.div_ceil(PAGE_SIZE).max(1)
+    }
 }
 
 // ── VirtIO PCI capability types (VirtIO 1.2 §4.1.4) ────────────────────────

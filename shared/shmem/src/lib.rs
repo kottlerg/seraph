@@ -68,8 +68,9 @@ const PAGE_SIZE: u64 = 4096;
 
 /// Maximum number of pages per `SharedBuffer`.
 ///
-/// Bounded by `procmgr_labels::REQUEST_FRAMES`'s 4-caps-per-call limit and
-/// `MSG_CAP_SLOTS_MAX` on IPC transfer. Keep in lockstep with procmgr.
+/// Bounded by `MSG_CAP_SLOTS_MAX` on IPC transfer (each frame travels in
+/// its own cap slot when the peer attaches). Keep in lockstep with the
+/// IPC abi.
 pub const MAX_PAGES: u32 = 4;
 
 /// Errors that can surface from [`SharedBuffer`] operations.
@@ -100,18 +101,22 @@ pub struct SharedBuffer
 
 impl SharedBuffer
 {
-    /// Allocate `pages` pages via procmgr's `REQUEST_FRAMES` and map them
+    /// Allocate `pages` pages via memmgr's `REQUEST_FRAMES` and map them
     /// read-write at `vaddr` in `aspace`. Returns the handle plus the
     /// frame caps; the caller moves those caps to the peer (e.g. via
     /// `ipc_call` with caps attached) and the peer calls
     /// [`SharedBuffer::attach`].
     ///
+    /// Pages are requested one at a time so each entry in the returned
+    /// `frames` array is a single-page Frame cap — peers expect to map
+    /// each cap as one page.
+    ///
     /// # Errors
     /// * [`ShmemError::InvalidPageCount`] if `pages == 0` or `> MAX_PAGES`.
-    /// * [`ShmemError::RequestFailed`] if procmgr rejects the request.
+    /// * [`ShmemError::RequestFailed`] if memmgr rejects the request.
     /// * [`ShmemError::MapFailed`] if mapping the returned frames fails.
     pub fn create(
-        procmgr_ep: u32,
+        memmgr_ep: u32,
         aspace: u32,
         vaddr: u64,
         pages: u32,
@@ -123,41 +128,50 @@ impl SharedBuffer
             return Err(ShmemError::InvalidPageCount);
         }
 
-        // Ask procmgr for `pages` frames. REQUEST_FRAMES returns up to 4
-        // in one round; for our MAX_PAGES=4 cap, one round is sufficient.
-        let request = ipc::IpcMessage::builder(ipc::procmgr_labels::REQUEST_FRAMES)
-            .word(0, u64::from(pages))
-            .build();
-        // SAFETY: ipc_buf is the caller's registered IPC buffer page.
-        let reply = unsafe { ipc::ipc_call(procmgr_ep, &request, ipc_buf) }
-            .map_err(|_| ShmemError::RequestFailed)?;
-        if reply.label != ipc::procmgr_errors::SUCCESS
-        {
-            return Err(ShmemError::RequestFailed);
-        }
-        let granted = if reply.word_count() >= 1
-        {
-            reply.word(0) as u32
-        }
-        else
-        {
-            0
-        };
-        let caps = reply.caps();
-        if granted < pages
-        {
-            // Partial grant — release what we got, report failure.
-            for &c in caps.iter().take(granted as usize)
-            {
-                let _ = syscall::cap_delete(c);
-            }
-            return Err(ShmemError::RequestFailed);
-        }
-
+        // Request pages one at a time. memmgr's REQUEST_FRAMES with
+        // want_pages=1 always returns exactly one cap covering one page,
+        // which is what shmem's per-cap mapping contract requires.
         let mut frames = [0u32; MAX_PAGES as usize];
         for i in 0..pages as usize
         {
-            frames[i] = caps[i];
+            let request = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_FRAMES)
+                .word(0, 1)
+                .build();
+            // SAFETY: ipc_buf is the caller's registered IPC buffer page.
+            let reply = match unsafe { ipc::ipc_call(memmgr_ep, &request, ipc_buf) }
+            {
+                Ok(r) => r,
+                Err(_) =>
+                {
+                    for &c in frames.iter().take(i)
+                    {
+                        let _ = syscall::cap_delete(c);
+                    }
+                    return Err(ShmemError::RequestFailed);
+                }
+            };
+            if reply.label != ipc::memmgr_errors::SUCCESS || reply.word(0) != 1
+            {
+                for &c in reply.caps()
+                {
+                    let _ = syscall::cap_delete(c);
+                }
+                for &c in frames.iter().take(i)
+                {
+                    let _ = syscall::cap_delete(c);
+                }
+                return Err(ShmemError::RequestFailed);
+            }
+            let Some(&cap) = reply.caps().first()
+            else
+            {
+                for &c in frames.iter().take(i)
+                {
+                    let _ = syscall::cap_delete(c);
+                }
+                return Err(ShmemError::RequestFailed);
+            };
+            frames[i] = cap;
         }
 
         // Map each frame sequentially at vaddr + i*PAGE_SIZE.

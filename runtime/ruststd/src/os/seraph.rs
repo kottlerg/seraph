@@ -25,6 +25,7 @@ use crate::cell::{Cell, UnsafeCell};
 use crate::mem::MaybeUninit;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sys::alloc::seraph as pal_alloc;
+use crate::sys::reserve as pal_reserve;
 use crate::sys::stdio::seraph as pal_stdio;
 
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, process_info_ref};
@@ -55,9 +56,14 @@ pub struct StartupInfo {
     pub self_cspace: u32,
     /// Cap slot of a tokened SEND cap on procmgr. Zero if procmgr is not
     /// reachable (the process is procmgr itself, or runs before procmgr
-    /// exists). `_start` consumes this to bootstrap the heap.
+    /// exists). Used for process-lifecycle queries.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub procmgr_endpoint: u32,
+    /// Cap slot of a tokened SEND cap on memmgr. Zero if memmgr is not
+    /// reachable (memmgr itself, init, or anything earlier in the boot
+    /// chain). `_start` consumes this to bootstrap the heap.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub memmgr_endpoint: u32,
     /// Shmem frame cap backing `std::io::stdin`. Zero when no input
     /// pipe is attached; reads return `Ok(0)` (EOF).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -290,6 +296,7 @@ pub extern "C" fn _start() -> ! {
         self_aspace: info.self_aspace_cap,
         self_cspace: info.self_cspace_cap,
         procmgr_endpoint: info.procmgr_endpoint_cap,
+        memmgr_endpoint: info.memmgr_endpoint_cap,
         stdin_frame_cap: info.stdin_frame_cap,
         stdout_frame_cap: info.stdout_frame_cap,
         stderr_frame_cap: info.stderr_frame_cap,
@@ -339,26 +346,26 @@ pub extern "C" fn _start() -> ! {
 
     // Bootstrap the heap so `fn main()` can allocate from its first line
     // (lazy `LineWriter` behind `std::io::stdout`, `String::new`, any `Vec`
-    // push, etc.). Zero `procmgr_endpoint_cap` means we are procmgr itself
-    // or something earlier in the chain; such processes manage their own
-    // storage and do not use std collections.
+    // push, etc.). Zero `memmgr_endpoint_cap` means we are memmgr itself,
+    // init, or something earlier in the chain; such processes manage their
+    // own storage and do not use std collections.
     //
     // Hard-fail with a visible diagnostic when bootstrap attempts to run
-    // but procmgr refuses (frame-pool exhaustion is the common cause). An
+    // but memmgr refuses (frame-pool exhaustion is the common cause). An
     // uninitialised heap surfaces later as a cryptic `handle_alloc_error`
     // deep inside `lang_start`; exiting here puts the failure in context.
-    if info.procmgr_endpoint_cap != 0 {
+    if info.memmgr_endpoint_cap != 0 {
         let ok = pal_alloc::heap_bootstrap(
-            info.procmgr_endpoint_cap,
+            info.memmgr_endpoint_cap,
             info.self_aspace_cap,
         );
         if !ok {
             ::log::emit(
                 current_ipc_buf(),
                 format_args!(
-                    "std::os::seraph: FATAL: heap_bootstrap failed (procmgr_ep={}); \
-                     likely procmgr frame-pool exhaustion — aborting",
-                    info.procmgr_endpoint_cap,
+                    "std::os::seraph: FATAL: heap_bootstrap failed (memmgr_ep={}); \
+                     likely memmgr frame-pool exhaustion — aborting",
+                    info.memmgr_endpoint_cap,
                 ),
             );
             syscall::thread_exit();
@@ -426,6 +433,17 @@ pub fn heap_is_initialized() -> bool {
 pub fn abort_thread() -> ! {
     pal_alloc::abort_thread()
 }
+
+// ── Page-reservation allocator ──────────────────────────────────────────────
+//
+// Re-exports from `crate::sys::reserve`. See that module for the per-process
+// arena layout and concurrency model. Used for foreign Frame mappings —
+// MMIO from devmgr, DMA buffers from drivers, shmem backings, zero-copy
+// file pages from fs drivers, ELF-load scratch in procmgr — i.e. every
+// page-granular VA need that is not the byte heap.
+
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_pages};
 
 // ── System log macro surface ────────────────────────────────────────────────
 //

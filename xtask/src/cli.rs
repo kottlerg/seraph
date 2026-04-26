@@ -76,6 +76,7 @@ pub enum BuildComponent
     Init,
     Ktest,
     Procmgr,
+    Memmgr,
     Devmgr,
     Vfsd,
     VirtioBlk,

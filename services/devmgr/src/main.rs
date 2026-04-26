@@ -23,15 +23,13 @@ mod pci;
 mod spawn;
 
 use ipc::IpcMessage;
-use std::os::seraph::startup_info;
-use va_layout::{DEVMGR_MMIO_MAP_VA as MMIO_MAP_VA, PAGE_SIZE};
+use std::os::seraph::{reserve_pages, startup_info, unreserve_pages};
+use syscall_abi::PAGE_SIZE;
 
-// Scratch VA for firmware-table RO Frame mappings. Placed below the ECAM
-// mapping VA so the two never overlap. 16 MiB reservation is generous:
-// real firmware tables fit in well under 1 MiB. The max-page cap covers
-// any realistic AcpiReclaimable region (QEMU typically reports ~72 KiB
-// but leave comfortable headroom for real hardware).
-const FIRMWARE_MAP_VA: u64 = MMIO_MAP_VA - 0x0100_0000;
+/// Cap on the number of pages devmgr will reserve for a single firmware
+/// table mapping. QEMU typically reports ~72 KiB `AcpiReclaimable`
+/// regions; 256 pages = 1 MiB leaves comfortable headroom for real
+/// hardware.
 const FIRMWARE_MAP_MAX_PAGES: u64 = 256;
 
 #[allow(clippy::too_many_lines)]
@@ -89,7 +87,14 @@ fn main() -> !
     };
 
     let ecam_pages = ecam_loc.size.div_ceil(PAGE_SIZE);
-    if syscall::mmio_map(caps.self_aspace, ecam_cap, MMIO_MAP_VA, 0).is_err()
+    let Ok(ecam_range) = reserve_pages(ecam_pages)
+    else
+    {
+        std::os::seraph::log!("failed to reserve VA for ECAM region");
+        halt_loop();
+    };
+    let ecam_va = ecam_range.va_start();
+    if syscall::mmio_map(caps.self_aspace, ecam_cap, ecam_va, 0).is_err()
     {
         std::os::seraph::log!("failed to map ECAM region");
         halt_loop();
@@ -99,11 +104,12 @@ fn main() -> !
     let end_bus = ecam_loc.end_bus;
 
     let mut devices = [pci::PciDevice::empty(); pci::MAX_DEVICES];
-    // SAFETY: MMIO_MAP_VA is a valid ECAM mapping of (end_bus-start_bus+1) * 1 MiB.
-    let dev_count = unsafe { pci::pci_enumerate(MMIO_MAP_VA, start_bus, end_bus, &mut devices) };
+    // SAFETY: ecam_va is a valid ECAM mapping of (end_bus-start_bus+1) * 1 MiB.
+    let dev_count = unsafe { pci::pci_enumerate(ecam_va, start_bus, end_bus, &mut devices) };
     std::os::seraph::log!("PCI devices found: {:#x}", dev_count as u64);
 
-    let _ = syscall::mem_unmap(caps.self_aspace, MMIO_MAP_VA, ecam_pages);
+    let _ = syscall::mem_unmap(caps.self_aspace, ecam_va, ecam_pages);
+    unreserve_pages(ecam_range);
 
     // Create block device service endpoint for the driver to receive on.
     let blk_ep = syscall::cap_create_endpoint().unwrap_or(0);
@@ -257,21 +263,27 @@ fn discover_ecam_acpi(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
     // init-protocol v5 docs); the backing Frame cap covers the page.
     let rsdp_phys = caps.rsdp_page_base;
     let rsdp_page_offset = (rsdp_phys & 0xFFF) as usize;
-    syscall::mem_map(
+    let range = reserve_pages(1).ok()?;
+    let va = range.va_start();
+    if syscall::mem_map(
         caps.rsdp_frame_cap,
         caps.self_aspace,
-        FIRMWARE_MAP_VA,
+        va,
         0,
         1,
         syscall_abi::MAP_READONLY,
     )
-    .ok()?;
+    .is_err()
+    {
+        unreserve_pages(range);
+        return None;
+    }
     // SAFETY: one page mapped read-only above.
-    let rsdp_bytes = unsafe {
-        core::slice::from_raw_parts((FIRMWARE_MAP_VA as *const u8).add(rsdp_page_offset), 36)
-    };
+    let rsdp_bytes =
+        unsafe { core::slice::from_raw_parts((va as *const u8).add(rsdp_page_offset), 36) };
     let xsdt_phys = firmware::acpi::rsdp_xsdt_phys(rsdp_bytes);
-    let _ = syscall::mem_unmap(caps.self_aspace, FIRMWARE_MAP_VA, 1);
+    let _ = syscall::mem_unmap(caps.self_aspace, va, 1);
+    unreserve_pages(range);
     let xsdt_phys = xsdt_phys?;
 
     // Copy XSDT entry pointers into a heap vec so we can release the XSDT
@@ -296,22 +308,24 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
     let (region, off) = find_region_for(caps, xsdt_phys)?;
     let region_pages = region.size.div_ceil(PAGE_SIZE);
     let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
-    syscall::mem_map(
+    let range = reserve_pages(map_pages).ok()?;
+    let va = range.va_start();
+    if syscall::mem_map(
         region.slot,
         caps.self_aspace,
-        FIRMWARE_MAP_VA,
+        va,
         0,
         map_pages,
         syscall_abi::MAP_READONLY,
     )
-    .ok()?;
-    // SAFETY: map_pages × PAGE_SIZE bytes mapped RO from FIRMWARE_MAP_VA.
-    let region_bytes = unsafe {
-        core::slice::from_raw_parts(
-            FIRMWARE_MAP_VA as *const u8,
-            (map_pages * PAGE_SIZE) as usize,
-        )
-    };
+    .is_err()
+    {
+        unreserve_pages(range);
+        return None;
+    }
+    // SAFETY: map_pages × PAGE_SIZE bytes mapped RO from `va`.
+    let region_bytes =
+        unsafe { core::slice::from_raw_parts(va as *const u8, (map_pages * PAGE_SIZE) as usize) };
     let mut entries = std::vec::Vec::new();
     if off + 36 <= region_bytes.len()
     {
@@ -325,7 +339,8 @@ fn read_xsdt_entries(caps: &caps::DevmgrCaps, xsdt_phys: u64) -> Option<std::vec
             }
         }
     }
-    let _ = syscall::mem_unmap(caps.self_aspace, FIRMWARE_MAP_VA, map_pages);
+    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    unreserve_pages(range);
     Some(entries)
 }
 
@@ -336,22 +351,24 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
     let (region, off) = find_region_for(caps, tbl_phys)?;
     let region_pages = region.size.div_ceil(PAGE_SIZE);
     let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
-    syscall::mem_map(
+    let range = reserve_pages(map_pages).ok()?;
+    let va = range.va_start();
+    if syscall::mem_map(
         region.slot,
         caps.self_aspace,
-        FIRMWARE_MAP_VA,
+        va,
         0,
         map_pages,
         syscall_abi::MAP_READONLY,
     )
-    .ok()?;
-    // SAFETY: map_pages × PAGE_SIZE bytes mapped RO from FIRMWARE_MAP_VA.
-    let region_bytes = unsafe {
-        core::slice::from_raw_parts(
-            FIRMWARE_MAP_VA as *const u8,
-            (map_pages * PAGE_SIZE) as usize,
-        )
-    };
+    .is_err()
+    {
+        unreserve_pages(range);
+        return None;
+    }
+    // SAFETY: map_pages × PAGE_SIZE bytes mapped RO from `va`.
+    let region_bytes =
+        unsafe { core::slice::from_raw_parts(va as *const u8, (map_pages * PAGE_SIZE) as usize) };
     let mut ecam = None;
     if off + 36 <= region_bytes.len()
     {
@@ -363,7 +380,8 @@ fn read_mcfg_at(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<firmware::Ecam
             ecam = firmware::acpi::parse_mcfg_ecam(&region_bytes[off..tbl_end]);
         }
     }
-    let _ = syscall::mem_unmap(caps.self_aspace, FIRMWARE_MAP_VA, map_pages);
+    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    unreserve_pages(range);
     ecam
 }
 
@@ -371,25 +389,32 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
 {
     let dtb_pages = caps.dtb_size.div_ceil(PAGE_SIZE).max(1);
     let map_pages = dtb_pages.min(FIRMWARE_MAP_MAX_PAGES);
-    syscall::mem_map(
+    let range = reserve_pages(map_pages).ok()?;
+    let va = range.va_start();
+    if syscall::mem_map(
         caps.dtb_frame_cap,
         caps.self_aspace,
-        FIRMWARE_MAP_VA,
+        va,
         0,
         map_pages,
         syscall_abi::MAP_READONLY,
     )
-    .ok()?;
+    .is_err()
+    {
+        unreserve_pages(range);
+        return None;
+    }
     let in_page_off = (caps.dtb_page_base & 0xFFF) as usize;
-    // SAFETY: map_pages × PAGE_SIZE mapped RO from FIRMWARE_MAP_VA.
+    // SAFETY: map_pages × PAGE_SIZE mapped RO from `va`.
     let blob_bytes = unsafe {
         core::slice::from_raw_parts(
-            (FIRMWARE_MAP_VA as *const u8).add(in_page_off),
+            (va as *const u8).add(in_page_off),
             (map_pages * PAGE_SIZE) as usize - in_page_off,
         )
     };
     let ecam = firmware::dtb::Fdt::new(blob_bytes).and_then(|fdt| fdt.find_pci_ecam());
-    let _ = syscall::mem_unmap(caps.self_aspace, FIRMWARE_MAP_VA, map_pages);
+    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    unreserve_pages(range);
     ecam
 }
 

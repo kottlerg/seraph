@@ -26,24 +26,41 @@ process without IPC).
 
 Init's responsibilities are strictly bounded:
 
-1. **Start procmgr** — init contains a minimal ELF parser (from `shared/elf`)
-   and uses raw syscall wrappers (from `shared/syscall`) to create procmgr's
-   process directly, without IPC. This is the only process init creates itself.
+1. **Start memmgr** — init contains a minimal ELF parser (from
+   `shared/elf`) and uses raw syscall wrappers (from `shared/syscall`)
+   to create memmgr's process directly, without IPC. Init transfers the
+   full RAM Frame cap pool from its own CSpace into memmgr's CSpace via
+   the derive-twice pattern, then serves a single bootstrap-IPC round
+   carrying the slot range so memmgr knows where its pool lives.
 
-2. **Request early service startup** — init requests procmgr to start the
-   remaining early services in order: devmgr, svcmgr, drivers, VFS, and
-   optionally net.
+2. **Start procmgr** — init creates procmgr the same way (raw syscalls,
+   no IPC). Before starting procmgr's thread, init calls
+   `memmgr.REGISTER_PROCESS` to mint procmgr's `memmgr_endpoint_cap`
+   and writes it into procmgr's `ProcessInfo` so procmgr's std heap
+   bootstrap reaches memmgr on its first call.
 
-3. **Delegate capabilities** — for each service, init derives and transfers the
-   appropriate subset of its initial capabilities via IPC. Init retains derived
-   intermediary copies (for potential revocation), not the roots.
+3. **Request early service startup** — init requests procmgr to start
+   the remaining early services in order: devmgr, svcmgr, drivers, VFS,
+   and optionally net.
 
-4. **Register services with svcmgr** — before exiting, init registers all
-   started services with svcmgr along with their restart policies and capability
-   sets.
+4. **Delegate capabilities** — for each service, init derives and
+   transfers the appropriate subset of its initial capabilities via
+   IPC. Init retains derived intermediary copies (for potential
+   revocation), not the roots.
 
-5. **Exit** — init calls `sys_thread_exit`. It holds no long-lived state, no
-   supervision capability, and no restart authority. svcmgr takes over.
+5. **Register services with svcmgr** — before exiting, init registers
+   all started services with svcmgr along with their restart policies
+   and capability sets.
+
+6. **Exit** — init calls `sys_thread_exit`. It holds no long-lived
+   state, no supervision capability, and no restart authority. svcmgr
+   takes over.
+
+memmgr and procmgr are the only two processes init creates via raw
+syscalls. Every later service is spawned via IPC to procmgr.
+
+After the split, the only `no_std` userspace services in the running
+system are init and memmgr; everything else is std-built.
 
 ---
 
@@ -80,9 +97,12 @@ Init derives and transfers these to services using the "derive twice" pattern
 
 | Document | Content |
 |---|---|
-| [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, init/procmgr/svcmgr roles |
+| [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, init/memmgr/procmgr/svcmgr roles |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, ProcessInfo/InitInfo handover, authority transfer |
 | [abi/boot-protocol/](../../abi/boot-protocol/) | InitImage, boot modules, initial CSpace |
+| [abi/init-protocol/](../../abi/init-protocol/) | Kernel-to-init handover (`InitInfo`) |
 | [docs/capability-model.md](../../docs/capability-model.md) | Initial capability distribution |
+| [services/memmgr/README.md](../memmgr/README.md) | First service init creates; receives the RAM frame pool |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

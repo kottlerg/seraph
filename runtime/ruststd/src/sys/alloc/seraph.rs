@@ -1,12 +1,14 @@
 // seraph-overlay: std::sys::alloc::seraph
 //
 // Seraph PAL allocator: a spinlock-guarded first-fit free list whose
-// backing pages are lazily requested from procmgr. All syscall wrappers,
-// protocol labels, and VA constants come from the workspace crates
-// `syscall-abi`, `syscall`, `ipc`, and `va_layout`, pulled into std's
-// dep graph through `library/std/Cargo.toml` — mirrors the `hermit-abi`
-// / `fortanix-sgx-abi` pattern. The overlay itself holds no inline asm
-// and duplicates no protocol numbers.
+// backing pages are lazily requested from memmgr. All syscall wrappers
+// and protocol labels come from the workspace crates `syscall-abi`,
+// `syscall`, and `ipc`, pulled into std's dep graph through
+// `library/std/Cargo.toml` — mirrors the `hermit-abi` /
+// `fortanix-sgx-abi` pattern. The overlay itself holds no inline asm
+// and duplicates no protocol numbers. Heap-zone VAs are private
+// constants below; the page-reservation allocator (`std::sys::reserve`)
+// owns its own arena disjoint from the heap.
 //
 // Bootstrap is explicit: `std::os::seraph::heap_bootstrap(procmgr_ep,
 // self_aspace)` must be called once, after the bootstrap IPC round
@@ -31,27 +33,39 @@ use crate::os::seraph::current_ipc_buf;
 use crate::ptr::{NonNull, null_mut};
 use crate::sync::atomic::{AtomicBool, Ordering};
 
-use ipc::procmgr_labels::REQUEST_FRAMES;
-use syscall_abi::MAP_WRITABLE;
-use va_layout::{FRAMES_PER_REQUEST, HEAP_BASE, HEAP_INITIAL_PAGES, HEAP_MAX, PAGE_SIZE};
+use ipc::memmgr_labels::REQUEST_FRAMES;
+use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
+
+// Heap-zone VAs are private to the std-overlay allocator. They sit
+// well below the page-reservation arena (`RESERVE_ARENA_BASE = 0x1_0000_0000`)
+// and are ASLR-pending: a one-line change here switches each constant
+// to a per-process RNG draw once the kernel RNG lands.
+
+/// Heap base (inclusive).
+const HEAP_BASE: u64 = 0x0000_0000_4000_0000;
+
+/// Heap zone upper bound (exclusive). Maximum heap size = `HEAP_MAX -
+/// HEAP_BASE` = 1 GiB. Growth beyond this surfaces OOM.
+const HEAP_MAX: u64 = 0x0000_0000_8000_0000;
+
+/// Initial heap size at `_start`, in 4 KiB pages. Sized to cover stdio's
+/// lazy line-buffer, two worker-thread stacks plus their per-thread IPC
+/// buffer pages, and typical collection workloads. Cost is one
+/// `REQUEST_FRAMES` round-trip at bootstrap, ≈ 512 KiB of physical RAM.
+const HEAP_INITIAL_PAGES: u64 = 128;
 
 /// Minimum grow increment in pages. Allocation-failure retries extend the
-/// heap by at least this many 4 KiB pages to amortise the procmgr IPC
+/// heap by at least this many 4 KiB pages to amortise the memmgr IPC
 /// round-trip over many small follow-up allocations. 16 pages = 64 KiB.
 const GROW_MIN_PAGES: u64 = 16;
 
-/// Upper bound on a single `grow` call's page count. Each page received
-/// from procmgr consumes one CSpace slot in the requesting process, and
-/// procmgr's `REQUEST_FRAMES` ABI is one cap per page. Mapping hundreds
-/// of pages in one grow risks filling the child's 256-slot CSpace and
-/// wedging the next `ipc_reply` when the kernel cannot complete the
-/// cap transfer. Keep per-grow consumption well under the typical
-/// CSpace-free headroom at runtime (~100 slots after bootstrap). Larger
-/// allocations split across multiple grow rounds via the retry loop in
-/// `System::alloc`. Revisit once procmgr gains a multi-page-cap ABI or
-/// kernel `ipc_reply` fails cleanly on cap-transfer OOM instead of
-/// leaving the caller blocked.
-const GROW_MAX_PAGES: u64 = 64;
+/// Upper bound on a single `grow` call's page count. memmgr's reply is
+/// bounded by `MSG_CAP_SLOTS_MAX = 4` Frame caps per round; with
+/// best-effort allocation each cap may cover many pages, so this cap is
+/// no longer driven by per-page CSpace consumption (as it was under
+/// procmgr's one-cap-per-page ABI). Kept large enough that typical
+/// large `Vec` reallocations stay within a single round.
+const GROW_MAX_PAGES: u64 = 256;
 
 // ── Spinlock ────────────────────────────────────────────────────────────────
 
@@ -102,9 +116,9 @@ struct Heap {
     /// First VA above the currently mapped heap region. Grows upward toward
     /// `HEAP_MAX` as `grow` maps fresh frames. Zero before bootstrap.
     mapped_end: usize,
-    /// Cached procmgr endpoint cap used by `grow` to request additional
+    /// Cached memmgr endpoint cap used by `grow` to request additional
     /// frames. Zero before bootstrap; `grow` returns false in that state.
-    procmgr_ep: u32,
+    memmgr_ep: u32,
     /// Cached aspace cap for mapping grow-path frames. Zero before bootstrap.
     self_aspace: u32,
 }
@@ -114,7 +128,7 @@ impl Heap {
         Self {
             head: None,
             mapped_end: 0,
-            procmgr_ep: 0,
+            memmgr_ep: 0,
             self_aspace: 0,
         }
     }
@@ -245,7 +259,7 @@ impl Heap {
     /// pre-registered page, not heap-backed — so `grow` is safe to call
     /// under the allocator lock without re-entrant allocation.
     fn grow(&mut self, want_bytes: usize) -> bool {
-        if self.procmgr_ep == 0 || self.self_aspace == 0 {
+        if self.memmgr_ep == 0 || self.self_aspace == 0 {
             return false;
         }
         let start_va = self.mapped_end as u64;
@@ -270,6 +284,14 @@ impl Heap {
     /// Request and map exactly `pages` frames starting at `start_va`,
     /// then append the new region to the free list. Returns true on
     /// full success.
+    ///
+    /// memmgr's `REQUEST_FRAMES` reply may carry up to
+    /// `MSG_CAP_SLOTS_MAX = 4` Frame caps in best-effort mode, each
+    /// covering one or more contiguous pages. The reply layout:
+    /// `data[0]` = `returned_cap_count`; `data[1+i]` = `page_count_for_cap_i`;
+    /// `caps[0..count]` = Frame caps. We map each returned cap with its
+    /// declared `page_count` in a single `mem_map` call, advancing
+    /// `start_va` by the same number of pages.
     fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
         // Read the calling thread's registered IPC buffer from TLS. The
         // kernel services `ipc_call` by reading the payload from that
@@ -280,13 +302,23 @@ impl Heap {
             return false;
         }
         let mut mapped: u64 = 0;
+        // memmgr's reply slot count is bounded; if a single best-effort
+        // call satisfies fewer pages than requested, loop. Bound the
+        // retry count so a misbehaving memmgr cannot wedge the caller.
+        const MAX_ROUNDS: u32 = 16;
+        let mut rounds: u32 = 0;
         while mapped < pages {
-            let want = (pages - mapped).min(FRAMES_PER_REQUEST);
+            if rounds >= MAX_ROUNDS {
+                return false;
+            }
+            rounds += 1;
+
+            let want = pages - mapped;
+            // data[0] low half = want_pages, high half = flags (best-effort = 0).
             let msg = ipc::IpcMessage::builder(REQUEST_FRAMES).word(0, want).build();
             // SAFETY: ipc_buf_u64 is the current thread's kernel-registered,
-            // page-aligned IPC buffer (TLS slot populated by `_start` or
-            // the thread trampoline before any user code runs).
-            let reply = match unsafe { ipc::ipc_call(self.procmgr_ep, &msg, ipc_buf_u64) } {
+            // page-aligned IPC buffer.
+            let reply = match unsafe { ipc::ipc_call(self.memmgr_ep, &msg, ipc_buf_u64) } {
                 Ok(r) => r,
                 Err(_) => return false,
             };
@@ -294,20 +326,25 @@ impl Heap {
                 return false;
             }
 
+            let returned_count = reply.word(0) as usize;
             let cap_slots = reply.caps();
-            let got = cap_slots.len() as u64;
-            if got < want {
+            if cap_slots.len() != returned_count || returned_count == 0 {
                 return false;
             }
 
-            for i in 0..want {
-                let cap_slot = cap_slots[i as usize];
-                let va = start_va + (mapped + i) * PAGE_SIZE;
-                if syscall::mem_map(cap_slot, self.self_aspace, va, 0, 1, MAP_WRITABLE).is_err() {
+            for (i, &cap_slot) in cap_slots.iter().take(returned_count).enumerate() {
+                let pages_in_cap = reply.word(1 + i);
+                if pages_in_cap == 0 {
                     return false;
                 }
+                let va = start_va + mapped * PAGE_SIZE;
+                if syscall::mem_map(cap_slot, self.self_aspace, va, 0, pages_in_cap, MAP_WRITABLE)
+                    .is_err()
+                {
+                    return false;
+                }
+                mapped += pages_in_cap;
             }
-            mapped += want;
         }
 
         let region_bytes = (mapped * PAGE_SIZE) as usize;
@@ -342,7 +379,7 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ── Bootstrap ───────────────────────────────────────────────────────────────
 
-/// Initialise the heap by requesting frames from procmgr and mapping them
+/// Initialise the heap by requesting frames from memmgr and mapping them
 /// at `HEAP_BASE`. Idempotent — only the first call performs real work.
 ///
 /// The IPC buffer used for the bootstrap round is taken from the calling
@@ -351,14 +388,14 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// runs on the main thread's registered buffer.
 ///
 /// Returns `true` if the heap is usable after this call.
-pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32) -> bool {
+pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
     if INITIALIZED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         return true;
     }
-    if procmgr_ep == 0 {
+    if memmgr_ep == 0 {
         return false;
     }
 
@@ -367,13 +404,22 @@ pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32) -> bool {
         return false;
     }
 
+    // Bounded retry: memmgr's best-effort reply may cover only a portion
+    // of the request when the pool is fragmented; loop until the full
+    // initial heap is mapped or memmgr stops making progress.
+    const MAX_ROUNDS: u32 = 16;
     let mut mapped: u64 = 0;
+    let mut rounds: u32 = 0;
     while mapped < HEAP_INITIAL_PAGES {
-        let want = (HEAP_INITIAL_PAGES - mapped).min(FRAMES_PER_REQUEST);
+        if rounds >= MAX_ROUNDS {
+            return false;
+        }
+        rounds += 1;
 
+        let want = HEAP_INITIAL_PAGES - mapped;
         let msg = ipc::IpcMessage::builder(REQUEST_FRAMES).word(0, want).build();
         // SAFETY: ipc_buf_u64 is the registered, page-aligned buffer.
-        let reply = match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf_u64) } {
+        let reply = match unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf_u64) } {
             Ok(r) => r,
             Err(_) => return false,
         };
@@ -381,20 +427,24 @@ pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32) -> bool {
             return false;
         }
 
+        let returned_count = reply.word(0) as usize;
         let cap_slots = reply.caps();
-        let got = cap_slots.len() as u64;
-        if got < want {
+        if cap_slots.len() != returned_count || returned_count == 0 {
             return false;
         }
 
-        for i in 0..want {
-            let cap_slot = cap_slots[i as usize];
-            let va = HEAP_BASE + (mapped + i) * PAGE_SIZE;
-            if syscall::mem_map(cap_slot, self_aspace, va, 0, 1, MAP_WRITABLE).is_err() {
+        for (i, &cap_slot) in cap_slots.iter().take(returned_count).enumerate() {
+            let pages_in_cap = reply.word(1 + i);
+            if pages_in_cap == 0 {
                 return false;
             }
+            let va = HEAP_BASE + mapped * PAGE_SIZE;
+            if syscall::mem_map(cap_slot, self_aspace, va, 0, pages_in_cap, MAP_WRITABLE).is_err()
+            {
+                return false;
+            }
+            mapped += pages_in_cap;
         }
-        mapped += want;
     }
 
     let base = HEAP_BASE as usize;
@@ -405,7 +455,7 @@ pub fn heap_bootstrap(procmgr_ep: u32, self_aspace: u32) -> bool {
         let heap = &mut *HEAP.inner.get();
         heap.init(base, size);
         heap.mapped_end = base + size;
-        heap.procmgr_ep = procmgr_ep;
+        heap.memmgr_ep = memmgr_ep;
         heap.self_aspace = self_aspace;
     }
     HEAP.lock.unlock();

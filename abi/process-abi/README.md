@@ -81,13 +81,23 @@ pub struct ProcessInfo {
 
     // ── Universal service endpoints ─────────────────────────────────
 
+    /// CSpace slot of a tokened SEND cap on memmgr's service endpoint.
+    ///
+    /// Populated for every procmgr-spawned child. `std::os::seraph::
+    /// _start` calls `memmgr_labels::REQUEST_FRAMES` on this cap to
+    /// bootstrap the `System` allocator before the user's `fn main()`
+    /// runs. The tokened cap identifies this process to memmgr, so
+    /// memmgr accounts allocations against the correct per-process
+    /// frame record. Zero for processes with no memmgr above them
+    /// (init and memmgr itself).
+    pub memmgr_endpoint_cap: u32,
+
     /// CSpace slot of a tokened SEND cap on procmgr's service endpoint.
     ///
-    /// Populated for every procmgr-spawned child so `std::os::seraph::
-    /// _start` can bootstrap the `System` allocator via `REQUEST_FRAMES`
-    /// before the user's `fn main()` runs. Zero for processes with no
-    /// procmgr above them (procmgr itself, or init/ktest which receive
-    /// `InitInfo` instead).
+    /// Used for process-lifecycle queries (and any future
+    /// procmgr-served operation that is not heap-bootstrap). Zero for
+    /// processes with no procmgr above them (procmgr itself, or
+    /// init/ktest which receive `InitInfo` instead).
     pub procmgr_endpoint_cap: u32,
 
     /// CSpace slot of a SEND cap on the system log endpoint.
@@ -115,6 +125,7 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 | `self_aspace_cap` | AddressSpace capability |
 | `self_cspace_cap` | CSpace capability |
 | `creator_endpoint_cap` | Tokened send cap back to the creator's bootstrap endpoint (if nonzero) |
+| `memmgr_endpoint_cap` | Tokened SEND cap on memmgr's service endpoint (if nonzero) |
 | `procmgr_endpoint_cap` | Tokened SEND cap on procmgr's service endpoint (if nonzero) |
 | `log_endpoint_cap` | SEND cap on the system log endpoint (if nonzero) |
 
@@ -142,6 +153,10 @@ pub struct StartupInfo {
 
     /// CSpace slot of own CSpace capability.
     pub self_cspace: u32,
+
+    /// CSpace slot of a tokened SEND cap on memmgr's service endpoint.
+    /// Zero when unreachable.
+    pub memmgr_endpoint: u32,
 
     /// CSpace slot of a tokened SEND cap on procmgr's service endpoint.
     /// Zero when unreachable.
@@ -175,11 +190,13 @@ safety net.
 
 - **std-built services** — `std::os::seraph::_start` (shipped via the
   `ruststd/` overlay) reads `ProcessInfo`, registers the IPC buffer,
-  bootstraps the heap against the `procmgr_endpoint` delivered in
-  `ProcessInfo`, then jumps to `lang_start` → user `fn main`.
-- **procmgr** — `procmgr/src/rt.rs` ships a minimal `core`-only `_start`
-  and panic handler. procmgr cannot heap-bootstrap against itself and
-  uses no `alloc` collections.
+  bootstraps the heap against the `memmgr_endpoint` delivered in
+  `ProcessInfo`, then jumps to `lang_start` → user `fn main`. procmgr
+  is itself a std-built service and follows this path.
+- **memmgr** — bespoke `core`-only `_start` and panic handler. memmgr
+  cannot heap-bootstrap against itself (it owns the frame pool) and
+  uses no `alloc` collections. It is the only std-less process spawned
+  by init via raw syscalls besides init itself.
 - **init / ktest** — bespoke `_start` entries that consume `InitInfo`
   from `INIT_INFO_VADDR` (defined in `abi/init-protocol`) rather than
   `ProcessInfo`, because the kernel — not procmgr — is their producer.
@@ -229,8 +246,10 @@ they are always compiled together with the consuming binary.
 |---|---|
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, CSpace, derivation, rights |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC buffer, message format, endpoints |
-| [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, procmgr role |
+| [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, memmgr/procmgr roles |
+| [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, ProcessInfo handover, memmgr/procmgr authority split |
 | [abi/init-protocol](../init-protocol/README.md) | Kernel-to-init handover contract |
+| [services/memmgr/README.md](../../services/memmgr/README.md) | Producer of `memmgr_endpoint_cap` (via procmgr-issued REGISTER_PROCESS) |
 
 ---
 

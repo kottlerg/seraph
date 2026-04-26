@@ -13,7 +13,6 @@ Internal utility crates with no cross-boundary stability obligation. See
 | `registry/` | Fixed-capacity name→endpoint-cap registry used by supervisor services |
 | `shmem/` | Shared-memory byte transport — multi-frame `SharedBuffer` plus SPSC ring |
 | `syscall/` | Userspace syscall wrappers — inline asm over `abi/syscall/` |
-| `va_layout/` | Centralised userspace virtual-address layout constants |
 
 ---
 

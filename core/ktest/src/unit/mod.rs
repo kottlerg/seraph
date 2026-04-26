@@ -18,7 +18,7 @@
 //! - `wait_set.rs`— wait set add, remove, wait
 //! - `ipc.rs`     — IPC call, reply, recv, buffer set
 //! - `thread.rs`  — thread lifecycle, register read/write, priority, affinity
-//! - `hw.rs`      — DMA, MMIO, IRQ, I/O ports
+//! - `hw.rs`      — MMIO, IRQ, I/O ports
 //! - `sysinfo.rs` — system info queries and debug log
 
 pub mod cap;
@@ -315,11 +315,6 @@ pub fn run_all(ctx: &TestContext)
     );
 
     // ── Hardware access syscalls ──────────────────────────────────────────────
-    run_test!(
-        "hw::dma_grant_unsafe_flag_required",
-        hw::dma_grant_unsafe_flag_required(ctx)
-    );
-    run_test!("hw::dma_grant_with_flag", hw::dma_grant_with_flag(ctx));
     run_test!("hw::mmio_map", hw::mmio_map(ctx));
     run_test!("hw::irq_register_ack", hw::irq_register_ack(ctx));
     run_test!("hw::ioport_bind", hw::ioport_bind(ctx));

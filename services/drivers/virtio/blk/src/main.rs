@@ -198,8 +198,10 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 // ── Frame allocation via memmgr IPC ────────────────────────────────────────
 
 /// Request a single contiguous Frame cap covering `page_count` pages from
-/// memmgr. Returns the cap slot on success.
-fn request_frames(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<u32>
+/// memmgr. Returns `(cap_slot, phys_base)` on success — the physical base
+/// address is needed for DMA programming on no-IOMMU systems and is
+/// supplied by memmgr in the `REQUEST_FRAMES` reply alongside the cap.
+fn request_frames(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<(u32, u64)>
 {
     let arg = page_count | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let request = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
@@ -221,7 +223,12 @@ fn request_frames(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<
         }
         return None;
     }
-    reply.caps().first().copied()
+    // Reply layout: data[0] = count, data[1..1+count] = page_counts,
+    // data[1+count..1+2*count] = phys_bases. With count == 1, phys_base
+    // sits at data[2].
+    let cap = reply.caps().first().copied()?;
+    let phys_base = reply.word(2);
+    Some((cap, phys_base))
 }
 
 // ── Device initialisation ──────────────────────────────────────────────────
@@ -263,7 +270,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
 -> (u64, u64, u64)
 {
     let ring_pages = virtqueue::ring_pages(queue_size) as u64;
-    let Some(ring_frame) = request_frames(caps.memmgr_ep, ring_pages, ipc_buf)
+    let Some((ring_frame, ring_phys)) = request_frames(caps.memmgr_ep, ring_pages, ipc_buf)
     else
     {
         std::os::seraph::log!("failed to allocate ring frames");
@@ -296,12 +303,6 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     unsafe {
         core::ptr::write_bytes(ring_va as *mut u8, 0, (ring_pages * PAGE_SIZE) as usize);
     }
-    let Ok(ring_phys) = syscall::dma_grant(ring_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
-    else
-    {
-        std::os::seraph::log!("ring dma_grant failed");
-        syscall::thread_exit();
-    };
     (ring_phys, ring_pages, ring_va)
 }
 
@@ -370,7 +371,7 @@ fn setup_virtqueue(
 /// Allocate and map the data buffer page for block I/O, returning an `IoLayout`.
 fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
 {
-    let Some(data_frame) = request_frames(caps.memmgr_ep, 1, ipc_buf)
+    let Some((data_frame, data_phys)) = request_frames(caps.memmgr_ep, 1, ipc_buf)
     else
     {
         std::os::seraph::log!("failed to allocate data frame");
@@ -403,13 +404,6 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     // Fill data buffer with sentinel pattern (0xAA) to detect untouched regions.
     // SAFETY: data_va is mapped writable, one page.
     unsafe { core::ptr::write_bytes(data_va as *mut u8, 0xAA, PAGE_SIZE as usize) };
-
-    let Ok(data_phys) = syscall::dma_grant(data_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
-    else
-    {
-        std::os::seraph::log!("data dma_grant failed");
-        syscall::thread_exit();
-    };
 
     IoLayout { data_va, data_phys }
 }

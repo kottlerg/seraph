@@ -42,11 +42,11 @@ use syscall_abi::{
     MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
     SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_SIGNAL,
     SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_TOKEN, SYS_CAP_INSERT, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_DMA_GRANT,
-    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND,
-    SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER,
-    SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
-    SYS_SBI_CALL, SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_CAP_DERIVE_TOKEN, SYS_CAP_INSERT, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
+    SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND, SYS_IPC_BUFFER_SET,
+    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_SBI_CALL,
+    SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
     SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
     SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
     SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
@@ -1595,28 +1595,6 @@ pub fn ioport_bind(thread_cap: u32, ioport_cap: u32) -> Result<(), i64>
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }
-}
-
-/// Return the physical address of `frame_cap` for use as a DMA buffer.
-///
-/// `flags` must include [`syscall_abi::FLAG_DMA_UNSAFE`] to acknowledge that
-/// the DMA transfer is not IOMMU-isolated. Without the flag `DmaUnsafe` (-14)
-/// is returned. `device_id` is reserved; pass 0.
-///
-/// Returns the physical base address of the frame on success.
-///
-/// # Errors
-/// Returns a negative `i64` error code if the frame cap is invalid or
-/// `FLAG_DMA_UNSAFE` is not set in `flags`.
-// cast_sign_loss: ret is proven non-negative in the Ok branch; it is a physical address.
-#[allow(clippy::cast_sign_loss)]
-#[inline]
-pub fn dma_grant(frame_cap: u32, device_id: u64, flags: u64) -> Result<u64, i64>
-{
-    // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
-    // (cap index, device ID, flags); kernel validates cap and FLAG_DMA_UNSAFE, returns physical address.
-    let ret = unsafe { syscall3(SYS_DMA_GRANT, u64::from(frame_cap), device_id, flags) };
-    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Stop a running, ready, or blocked thread. The thread transitions to `Stopped`.

@@ -37,8 +37,12 @@ responsibilities are:
   [`docs/pci-enumeration.md`](docs/pci-enumeration.md).
 - **Bind drivers** — match discovered devices to driver binaries in
   [`drivers/`](../drivers/README.md), request procmgr to create driver
-  processes, and delegate per-device capabilities (MMIO, interrupt, optional
-  DMA grant and IoPortRange).
+  processes, and delegate per-device capabilities (MMIO, interrupt, and
+  IoPortRange where applicable). Drivers that need physical-base
+  addresses for device DMA programming obtain them from memmgr's
+  `REQUEST_FRAMES` reply alongside the Frame caps; DMA isolation, when
+  established, is programmed by devmgr through IOMMU hardware it
+  acquires via the `MmioRegion` cap flow.
 - **Expose device registry** — maintain an IPC service that other services
   (vfsd, netd) query to discover device endpoints after drivers are bound.
 - **Handle hotplug** — on platforms that support it, receive hotplug

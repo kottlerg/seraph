@@ -135,15 +135,11 @@ devmgr still derives the authorising capability, but the physical isolation is
 absent — this is a userspace policy decision (refuse / warn / restrict), not a
 kernel-enforced mode. The kernel is agnostic to both outcomes.
 
-### Known Divergence
-
-*Known divergence from current implementation.* The boot ABI has been
-stripped of its `IommuUnit` resource variant as of `BOOT_PROTOCOL_VERSION`
-5; boot-side IOMMU discovery is gone. Residual kernel-side IOMMU
-capability types and programming paths remain, scheduled for removal per
-the repo-local `TODO.md` entry "IOMMU stripping (Shape A migration)".
-Until that migration lands, the kernel's internal IOMMU surface exists
-alongside the boot-side stripping documented here.
+Frame physical-base addresses, where drivers need them (e.g. to program
+device DMA transports on no-IOMMU systems), are supplied to drivers by
+memmgr in the `REQUEST_FRAMES` reply alongside the Frame caps themselves.
+The kernel exposes no syscall for translating a Frame cap into its
+physical address.
 
 ---
 
@@ -152,9 +148,9 @@ alongside the boot-side stripping documented here.
 ```
 init
  ├── devmgr  (platform caps + firmware table caps)
- │    ├── driver/ethernet  (MMIO cap, IRQ cap, DMA grant)
- │    ├── driver/nvme      (MMIO cap, IRQ cap, DMA grant)
- │    └── driver/usb-hcd   (MMIO cap, IRQ cap, DMA grant)
+ │    ├── driver/ethernet  (MMIO cap, IRQ cap)
+ │    ├── driver/nvme      (MMIO cap, IRQ cap)
+ │    └── driver/usb-hcd   (MMIO cap, IRQ cap)
  ├── vfsd  (receives storage endpoint from devmgr)
  ├── netd  (receives network endpoint from devmgr)
  └── ...

@@ -78,12 +78,20 @@ pages. Privilege: universal.
 |---|---|
 | label | 0 (success) |
 | data[0] | `returned_cap_count` (u32) |
-| data[1+i] | `page_count_for_cap_i` (u32) for each returned cap |
+| data[1 + i] | `page_count_for_cap_i` (u32) for each returned cap, `i ∈ [0, count)` |
+| data[1 + count + i] | `phys_base_for_cap_i` (u64) — physical base address of the contiguous frame run described by `page_count_for_cap_i`, `i ∈ [0, count)` |
 | cap[0..returned_cap_count] | Frame capabilities (MAP\|WRITE rights) |
 
 The cumulative `sum(page_count_for_cap_i) == want_pages` for both
 contiguous and best-effort replies. With `REQUIRE_CONTIGUOUS` the reply
 always carries exactly one cap with `page_count_for_cap_0 == want_pages`.
+
+The `phys_base_for_cap_i` field is the host physical address of the
+first page of the i-th returned cap. It is what DMA-issuing drivers
+program into device transports (VirtIO PCI rings, e.g.). DMA isolation,
+when present, is established through devmgr-managed IOMMU policy
+outside the kernel surface; memmgr exposes only the addresses, not the
+isolation policy.
 
 There is no fixed ceiling on `returned_cap_count` other than the IPC
 reply-side cap-slot limit (see [`docs/ipc-design.md`](../../../docs/ipc-design.md)).

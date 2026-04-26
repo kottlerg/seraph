@@ -10,8 +10,6 @@
 //! - `SYS_IRQ_REGISTER` (30): bind a Signal to an interrupt line.
 //! - `SYS_MMIO_MAP` (34): map an MMIO region into an address space.
 //! - `SYS_IOPORT_BIND` (35): bind an I/O port range to a thread (`x86_64` only).
-//! - `SYS_DMA_GRANT` (36): return a frame's physical address for DMA use
-//!   (no-IOMMU fallback; requires `FLAG_DMA_UNSAFE`).
 //! - `SYS_MMIO_SPLIT` (45): split an `MmioRegion` cap into two sub-regions.
 //! - `SYS_IRQ_SPLIT` (49): split an `Interrupt` range cap into two sub-ranges.
 //!
@@ -433,73 +431,6 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 #[cfg(test)]
 pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
-{
-    Err(SyscallError::NotSupported)
-}
-
-// ── SYS_DMA_GRANT ────────────────────────────────────────────────────────────
-
-/// `SYS_DMA_GRANT` (36): return the physical address of a frame for DMA use.
-///
-/// arg0 = Frame cap index (must have MAP right).
-/// arg1 = `device_id` (reserved; unused in no-IOMMU path).
-/// arg2 = flags (must include `FLAG_DMA_UNSAFE` when no IOMMU is present).
-///
-/// Without an IOMMU, the DMA transfer is not hardware-isolated: the device
-/// can access the full physical frame. The caller must set `FLAG_DMA_UNSAFE`
-/// to acknowledge this and accept the security implications. If the flag is
-/// absent, `DmaUnsafe` is returned instead of the physical address.
-///
-/// Returns the physical base address of the frame on success.
-///
-// TODO: When an IOMMU driver is present, program the device's
-// second-level page table instead of returning the raw physical address.
-// FLAG_DMA_UNSAFE is then only checked for devices without an active IOMMU
-// domain. See also: IOMMU grant revocation (track active DMA grants per
-// frame for teardown on cap revocation).
-#[cfg(not(test))]
-pub fn sys_dma_grant(tf: &mut TrapFrame) -> Result<u64, SyscallError>
-{
-    use crate::cap::object::FrameObject;
-    use crate::cap::slot::{CapTag, Rights};
-    use crate::syscall::current_tcb;
-    use syscall::FLAG_DMA_UNSAFE;
-
-    let frame_idx = tf.arg(0) as u32;
-    // arg1 = device_id: reserved for future IOMMU domain lookup; unused now.
-    let flags = tf.arg(2);
-
-    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
-    let tcb = unsafe { current_tcb() };
-    if tcb.is_null()
-    {
-        return Err(SyscallError::InvalidCapability);
-    }
-    // SAFETY: tcb validated non-null; cspace set at thread creation.
-    let cspace = unsafe { (*tcb).cspace };
-
-    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let frame_slot = unsafe { super::lookup_cap(cspace, frame_idx, CapTag::Frame, Rights::MAP) }?;
-    let frame_phys = {
-        let obj = frame_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Frame; object was allocated as Box<FrameObject>.
-        #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            (*obj.as_ptr().cast::<FrameObject>()).base
-        }
-    };
-
-    // No IOMMU present: require explicit unsafe acknowledgment.
-    if flags & FLAG_DMA_UNSAFE == 0
-    {
-        return Err(SyscallError::DmaUnsafe);
-    }
-
-    Ok(frame_phys)
-}
-
-#[cfg(test)]
-pub fn sys_dma_grant(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

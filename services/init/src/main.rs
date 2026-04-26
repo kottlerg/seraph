@@ -349,11 +349,19 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // Now every alloc-from-init's-pool consumer has run. Delegate ALL
-    // remaining RAM frames to memmgr and start memmgr's thread. Memmgr
-    // ingests its pool and enters the dispatch loop before procmgr
-    // starts (procmgr's std `_start` calls `heap_bootstrap` which calls
-    // memmgr's `REQUEST_FRAMES`, so memmgr must be live first).
+    // Now every alloc-from-init's-pool consumer has run. Reserve one
+    // page for the memmgr phys-table (written below; sent in caps[1] of
+    // memmgr's bootstrap reply), then delegate all remaining RAM frames
+    // to memmgr and start memmgr's thread. Memmgr ingests its pool and
+    // enters the dispatch loop before procmgr starts (procmgr's std
+    // `_start` calls `heap_bootstrap` which calls memmgr's
+    // `REQUEST_FRAMES`, so memmgr must be live first).
+    let Some(phys_table_frame) = alloc.alloc_zero_page(info.aspace_cap, TEMP_MAP_BASE)
+    else
+    {
+        logging::log("FATAL: phys-table page alloc failed");
+        syscall::thread_exit();
+    };
     let Some(mm_final) = bootstrap::finalize_memmgr(info, &mut alloc, &mm)
     else
     {
@@ -361,9 +369,32 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
+    // Populate the phys-table page with the parallel `[u64; mm_frame_count]`
+    // array of physical bases for every Frame cap delegated to memmgr.
+    // SAFETY: TEMP_MAP_BASE is mapped writable, one page; the table fits
+    // (max 122 entries × 8 B = 976 B << 4 KiB). The pointer is page-aligned
+    // (4 KiB), satisfying u64 alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let phys_dst = TEMP_MAP_BASE as *mut u64;
+    for i in 0..(mm_final.mm_frame_count as usize)
+    {
+        // SAFETY: i < mm_frame_count <= 122; bounded above.
+        unsafe { core::ptr::write_volatile(phys_dst.add(i), mm_final.phys_bases[i]) };
+    }
+    let _ = syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1);
+    let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_frame, syscall::RIGHTS_MAP_READ)
+    else
+    {
+        logging::log("FATAL: phys-table RO derive failed");
+        syscall::thread_exit();
+    };
+
     // Serve memmgr's bootstrap round.
     //
     // Caps: [0] memmgr's own service endpoint (RECV).
+    //       [1] read-only Frame cap covering the phys-table page; memmgr
+    //           reads `mm_frame_count` u64 phys_base entries from it
+    //           parallel to the page-count array, then drops the cap.
     // Data: [frame_base, frame_count, procmgr_token, page_counts...].
     let Ok(mm_service_cap_for_mm) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_ALL)
     else
@@ -402,7 +433,7 @@ fn run(info_ptr: u64) -> !
             mm.bootstrap_token,
             ipc_buf,
             true,
-            &[mm_service_cap_for_mm],
+            &[mm_service_cap_for_mm, phys_table_ro_cap],
             &mm_boot_data[..mm_data_words],
         )
     }

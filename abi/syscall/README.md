@@ -3,7 +3,7 @@
 Binary syscall ABI contract for Seraph.
 
 Defines `SYS_*` syscall number constants, the `SyscallError` enum, and all
-scheduling, message, and DMA constants that cross the kernel/userspace boundary.
+scheduling and message constants that cross the kernel/userspace boundary.
 
 **Constraints:** `no_std`, `#[repr(C)]` for all cross-boundary types, no
 dependencies outside `core`. Changes to this crate are ABI breaks and MUST

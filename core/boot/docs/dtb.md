@@ -14,9 +14,12 @@ The implementation lives in [`boot/src/dtb.rs`](../src/dtb.rs).
 
 The bootloader extracts a minimal set of platform resources from the
 DTB: MMIO-backed peripherals matched by known `compatible` strings,
-PLIC interrupt controllers, PCI host bridges, and IOMMU units. The
-full DTB is additionally recorded as a single `PlatformTable` entry so
-`devmgr` can perform its own complete walk.
+PLIC interrupt controllers, and PCI host bridges. The full DTB is
+additionally recorded as a single `PlatformTable` entry so `devmgr` can
+perform its own complete walk — including IOMMU-topology discovery,
+which is exclusively a userspace concern. See
+[`docs/device-management.md`](../../../docs/device-management.md) for
+the system-scope IOMMU model.
 
 The bootloader does **not** resolve `interrupt-map` tables, complex
 `ranges` translations, phandle graphs, or node-tree semantics beyond a
@@ -72,9 +75,8 @@ without warning; `devmgr` is responsible for identifying every other
 device.
 
 PCI host bridges match `pci-host-ecam-generic` (and close variants).
-IOMMU units match `riscv,iommu` and close variants. Interrupt lines
-come from `interrupts` values on nodes whose `interrupt-parent`
-resolves to a PLIC node.
+Interrupt lines come from `interrupts` values on nodes whose
+`interrupt-parent` resolves to a PLIC node.
 
 ---
 

@@ -5,15 +5,15 @@
 
 //! Tier 1 tests for hardware access syscalls.
 //!
-//! Covers: `SYS_DMA_GRANT`, `SYS_MMIO_MAP`, `SYS_IRQ_REGISTER`,
-//! `SYS_IRQ_ACK`, `SYS_IOPORT_BIND`.
+//! Covers: `SYS_MMIO_MAP`, `SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`,
+//! `SYS_IOPORT_BIND`.
 //!
 //! Tests that require specific hardware capability types (`MmioRegion`, Interrupt,
 //! `IoPortRange`) scan the initial capability set for a matching cap. If none is
 //! found in the current boot configuration, the test is skipped and reports Ok.
 //! Skips are logged to serial so they are visible in the test run output.
 
-use syscall::{aspace_query, cap_create_signal, dma_grant, irq_ack, irq_register};
+use syscall::{aspace_query, cap_create_signal, irq_ack, irq_register};
 #[cfg(target_arch = "x86_64")]
 use syscall::{cap_create_cspace, cap_create_thread};
 use syscall_abi::SyscallError;
@@ -22,42 +22,6 @@ use crate::{TestContext, TestResult};
 
 /// Test virtual address for MMIO mapping. 1.25 GiB — above ktest's load address.
 const MMIO_TEST_VA: u64 = 0x5000_0000;
-
-// ── SYS_DMA_GRANT ─────────────────────────────────────────────────────────────
-
-/// `dma_grant` without `FLAG_DMA_UNSAFE` must return `DmaUnsafe`.
-///
-/// Uses the TEXT frame cap (`aspace_cap + 1`) as the frame source.
-pub fn dma_grant_unsafe_flag_required(ctx: &TestContext) -> TestResult
-{
-    let text_frame = ctx.aspace_cap + 1;
-
-    let err = dma_grant(text_frame, 0, 0);
-    if err != Err(SyscallError::DmaUnsafe as i64)
-    {
-        return Err("dma_grant without FLAG_DMA_UNSAFE did not return DmaUnsafe");
-    }
-    Ok(())
-}
-
-/// `dma_grant` with `FLAG_DMA_UNSAFE` returns a non-zero, page-aligned physical address.
-pub fn dma_grant_with_flag(ctx: &TestContext) -> TestResult
-{
-    let text_frame = ctx.aspace_cap + 1;
-
-    let phys = dma_grant(text_frame, 0, syscall_abi::FLAG_DMA_UNSAFE)
-        .map_err(|_| "dma_grant with FLAG_DMA_UNSAFE failed")?;
-
-    if phys == 0
-    {
-        return Err("dma_grant returned zero physical address");
-    }
-    if phys & 0xFFF != 0
-    {
-        return Err("dma_grant returned non-page-aligned physical address");
-    }
-    Ok(())
-}
 
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
 

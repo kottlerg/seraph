@@ -318,7 +318,11 @@ pub struct MemmgrBootstrap
 ///
 /// Page counts are packed two per `u64` (low 32 bits = even index,
 /// high 32 bits = odd index) so the 64-word IPC data field can carry
-/// up to 122 entries after the 3-word prefix.
+/// up to 122 entries after the 3-word prefix. Physical bases travel
+/// out-of-band via a read-only Frame cap (`caps[1]` in the bootstrap
+/// reply); init writes `phys_bases` into the page before deriving the
+/// RO cap. Memmgr maps the page, copies the values into its `FreeRun`
+/// records, and drops the cap.
 pub struct MemmgrFinalize
 {
     /// First slot of the RAM Frame caps init copied into memmgr's
@@ -328,6 +332,10 @@ pub struct MemmgrFinalize
     pub mm_frame_count: u32,
     /// Page count for each delegated frame, in slot order.
     pub page_counts: [u32; 122],
+    /// Physical base address for each delegated frame, in slot order.
+    /// Sourced from `CapDescriptor.aux0` of the underlying RAM Frame
+    /// caps minted by the kernel at boot.
+    pub phys_bases: [u64; 122],
 }
 
 /// Maximum number of frames init can delegate to memmgr in one
@@ -515,6 +523,7 @@ pub fn finalize_memmgr(
     // cover any plausible init frame count; raise the bound (or move to
     // multi-round bootstrap) if a target ever exceeds it.
     let mut page_counts = [0u32; MEMMGR_BOOTSTRAP_MAX_FRAMES as usize];
+    let mut phys_bases = [0u64; MEMMGR_BOOTSTRAP_MAX_FRAMES as usize];
     let mut mm_frame_base: u32 = 0;
     let mut mm_frame_count: u32 = 0;
     let total_remaining = info.memory_frame_count.saturating_sub(alloc.next_idx);
@@ -525,11 +534,13 @@ pub fn finalize_memmgr(
             break;
         }
         let src_slot = info.memory_frame_base + alloc.next_idx + i;
-        let bytes = match descriptor_for(info, src_slot)
+        let Some(desc) = descriptor_for(info, src_slot)
+        else
         {
-            Some(d) => d.aux1,
-            None => continue,
+            continue;
         };
+        let bytes = desc.aux1;
+        let phys_base = desc.aux0;
         let Ok(intermediary) = syscall::cap_derive(src_slot, syscall::RIGHTS_ALL)
         else
         {
@@ -545,6 +556,7 @@ pub fn finalize_memmgr(
             mm_frame_base = dst_slot;
         }
         page_counts[mm_frame_count as usize] = (bytes / PAGE_SIZE) as u32;
+        phys_bases[mm_frame_count as usize] = phys_base;
         mm_frame_count += 1;
     }
     alloc.next_idx += total_remaining;
@@ -563,6 +575,7 @@ pub fn finalize_memmgr(
         mm_frame_base,
         mm_frame_count,
         page_counts,
+        phys_bases,
     })
 }
 

@@ -181,10 +181,13 @@ Access is revoked automatically when the capability is revoked. RISC‑V does no
 support port I/O.
 
 **DMA**
-DMA access requires an explicit DMA capability. On platforms with an IOMMU, the
-kernel programs the IOMMU to restrict DMA to authorised regions. On platforms
-without an IOMMU, DMA isolation is not enforced; callers MUST explicitly acknowledge
-this when granting DMA access. See `device-management.md`.
+DMA isolation is exclusively a userspace concern. devmgr discovers IOMMU
+hardware (via firmware-table passthrough), programs the translation tables
+itself, and authorises DMA on a per-device basis. The kernel reads no
+IOMMU registers, holds no per-device DMA state, and exposes no DMA-grant
+syscall. Frame physical-base addresses (which DMA-issuing drivers program
+into device transports) reach drivers through memmgr's `REQUEST_FRAMES`
+reply. See `device-management.md`.
 
 **Interrupts**
 Hardware interrupts are received by the kernel and delivered to drivers as
@@ -222,7 +225,9 @@ a capability; threads MUST hold a valid capability to access any resource.
 Seraph targets 64‑bit architectures with modern MMU and privilege support.
 
 **x86‑64**
-Uses APIC, PCIDs, IOMMU where available. 32-bit and legacy x86 are not supported.
+Uses APIC and PCIDs. IOMMU hardware, when present, is discovered and
+programmed by devmgr in userspace; the kernel does not touch it. 32-bit
+and legacy x86 are not supported.
 
 **RISC‑V (RV64GC)**
 RV64GC base ISA (IMAFD + compressed). Embedded or non-standard configurations are

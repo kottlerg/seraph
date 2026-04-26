@@ -123,7 +123,7 @@ are never reassigned or reused.
 11  SYS_CAP_CREATE_ASPACE     33  SYS_FRAME_SPLIT
 12  SYS_CAP_CREATE_CSPACE     34  SYS_MMIO_MAP
 13  SYS_CAP_CREATE_WAIT_SET   35  SYS_IOPORT_BIND
-14  SYS_CAP_DERIVE            36  SYS_DMA_GRANT
+14  SYS_CAP_DERIVE            36  (reserved)
 15  SYS_CAP_REVOKE            37  SYS_THREAD_SET_PRIORITY
 16  SYS_MEM_MAP               38  SYS_THREAD_SET_AFFINITY
 17  SYS_MEM_UNMAP             39  SYS_THREAD_READ_REGS
@@ -142,9 +142,10 @@ are never reassigned or reused.
 queue creation and I/O), 7–8 (endpoint/signal creation), 10–13 (thread,
 aspace, cspace, wait set creation), 14–18 (cap management and memory),
 21–28 (thread lifecycle, wait set operations), 29–30 (IRQ ACK and
-register), 31–36 (cap delete/insert, frame split, MMIO map, ioport bind,
-DMA grant), 41–43 (aspace query, ipc buffer set, system info). All other
-numbers return `UnknownSyscall`.
+register), 31–35 (cap delete/insert, frame split, MMIO map, ioport
+bind), 41–43 (aspace query, ipc buffer set, system info). Slot 36 is
+reserved and returns `UnknownSyscall`. All other unallocated numbers
+return `UnknownSyscall`.
 
 ---
 
@@ -179,9 +180,6 @@ pub enum SyscallError
     AlignmentError     = -10,
     /// The requested mapping would exceed the address space's limit.
     AddressSpaceFull   = -11,
-    /// DMA was requested on a platform without IOMMU protection, and the caller
-    /// did not pass FLAG_DMA_UNSAFE to acknowledge unprotected DMA.
-    DmaUnsafe          = -12,
 }
 ```
 
@@ -722,32 +720,6 @@ regardless of the flags value; callers MUST NOT set both writable and executable
 **Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (unaligned
 `virt`, W^X violation, or non-canonical address), `AlignmentError`,
 `AddressSpaceFull`.
-
----
-
-### `SYS_DMA_GRANT` (36)
-
-Return the physical address of a frame for use as a DMA buffer. Currently implements
-the no-IOMMU fallback path only; full IOMMU support is deferred.
-
-**Arguments:**
-
-| # | Name | Description |
-|---|---|---|
-| 0 | `frame_cap` | Frame capability (Map rights) to grant DMA access to |
-| 1 | `device_id` | Reserved; pass 0. |
-| 2 | `flags` | MUST include `FLAG_DMA_UNSAFE` (bit 2) to acknowledge no hardware isolation. |
-
-**Return:** `rax`/`a0`: physical base address of the frame on success;
-`SyscallError` on failure.
-
-Without an IOMMU the granting device can access the entire physical frame without
-hardware-enforced isolation. The caller MUST set `FLAG_DMA_UNSAFE` (bit 2 of
-`flags`) to acknowledge this; if absent, `DmaUnsafe` is returned.
-
-**Capability requirements:** `frame_cap` (Map rights).
-
-**Errors:** `InvalidCapability`, `DmaUnsafe` (FLAG_DMA_UNSAFE not set).
 
 ---
 
@@ -1398,7 +1370,6 @@ all its descendants (including C2) but leaves C and any other children of C inta
 | `PRIORITY_DEFAULT` | 10 | Default priority for newly created threads |
 | `SCHED_ELEVATED_MIN` | 21 | First priority level requiring SchedControl capability |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
-| `FLAG_DMA_UNSAFE` | bit 2 | `SYS_DMA_GRANT` flag acknowledging unprotected DMA |
 | `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |
 | `BOOT_PROTOCOL_VERSION` | 5 | Expected version in `BootInfo.version` |
 

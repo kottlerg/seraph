@@ -150,8 +150,6 @@ pub const SYS_FRAME_SPLIT: u64 = 33;
 pub const SYS_MMIO_MAP: u64 = 34;
 /// I/O: bind an `IoPortRange` to the calling thread.
 pub const SYS_IOPORT_BIND: u64 = 35;
-/// DMA: grant a frame for DMA use.
-pub const SYS_DMA_GRANT: u64 = 36;
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;
 /// Thread: set CPU affinity.
@@ -217,9 +215,6 @@ pub enum SyscallError
     Deadlock = -12,
     /// Event queue is full; post would be lost.
     QueueFull = -13,
-    /// DMA grant requested but no IOMMU is present; caller must set
-    /// `FLAG_DMA_UNSAFE` to acknowledge the absence of hardware isolation.
-    DmaUnsafe = -14,
     /// The target object is not in the required state for this operation
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
@@ -236,17 +231,6 @@ pub const PRIORITY_DEFAULT: u8 = 10;
 pub const SCHED_ELEVATED_MIN: u8 = 21;
 /// Maximum priority available to userspace threads.
 pub const PRIORITY_MAX: u8 = 30;
-
-// ── DMA constants ─────────────────────────────────────────────────────────────
-
-/// Flag for `SYS_DMA_GRANT`: caller acknowledges DMA will not be
-/// IOMMU-isolated and accepts the security implications.
-///
-/// Required when no IOMMU is present (or not configured for the device).
-// TODO(iommu): When an IOMMU driver is added, this flag is ignored for
-// devices covered by an active IOMMU domain; it only applies to the
-// no-IOMMU fallback path. Pick up alongside the VT-d / IOMMU driver.
-pub const FLAG_DMA_UNSAFE: u64 = 1 << 2;
 
 // ── Event Queue constants ─────────────────────────────────────────────────────
 

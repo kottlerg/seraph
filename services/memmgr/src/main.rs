@@ -95,12 +95,14 @@ const MAX_PER_PROC: usize = 512;
 /// or more contiguous pages.
 const MAX_FREE_RUNS: usize = 512;
 
-/// One free run: a Frame cap memmgr owns, covering `page_count` pages.
+/// One free run: a Frame cap memmgr owns, covering `page_count` pages
+/// starting at physical address `phys_base`.
 #[derive(Clone, Copy)]
 struct FreeRun
 {
     cap_slot: u32,
     page_count: u32,
+    phys_base: u64,
 }
 
 /// One per-process frame record.
@@ -113,6 +115,7 @@ struct OwnedFrame
     /// re-add the underlying region to the free pool when the process dies.
     cap_slot: u32,
     page_count: u32,
+    phys_base: u64,
 }
 
 /// Process accounting record: token plus the list of frames memmgr has
@@ -248,11 +251,15 @@ impl FreePool
                     // physical contiguity and identical rights/parents;
                     // it rejects every non-adjacent pair, so blind probing
                     // is correct (just O(N²)).
+                    // frame_merge requires arg0 to be the lower-address
+                    // sibling; the merged region's phys_base is therefore
+                    // the lower of the two siblings' phys_base values.
                     if let Ok(merged) = syscall::frame_merge(run_a.cap_slot, run_b.cap_slot)
                     {
                         self.runs[i] = Some(FreeRun {
                             cap_slot: merged,
                             page_count: run_a.page_count + run_b.page_count,
+                            phys_base: run_a.phys_base.min(run_b.phys_base),
                         });
                         self.runs[j] = None;
                         merged_any = true;
@@ -263,6 +270,7 @@ impl FreePool
                         self.runs[i] = Some(FreeRun {
                             cap_slot: merged,
                             page_count: run_a.page_count + run_b.page_count,
+                            phys_base: run_a.phys_base.min(run_b.phys_base),
                         });
                         self.runs[j] = None;
                         merged_any = true;
@@ -372,23 +380,34 @@ fn table_mut() -> &'static mut ProcessTable
 //
 // Init → memmgr bootstrap (one round on memmgr's creator endpoint):
 //   caps[0]: memmgr's service endpoint (full rights; memmgr's RECV side).
-//   caps[1]: log endpoint (un-tokened SEND), or zero.
+//   caps[1]: read-only Frame cap (one page) carrying `[u64; frame_count]`
+//            of physical-base addresses, parallel to `page_counts`. memmgr
+//            maps it RO at `PHYS_TABLE_TEMP_VA`, copies the values into
+//            its `FreeRun` records, then unmaps + cap-deletes.
 //   data[0]: frame_base — first slot index of the RAM Frame caps already
 //            copied into memmgr's `CSpace`.
 //   data[1]: frame_count — number of consecutive RAM frames.
 //   data[2]: procmgr_token — the token init burned into procmgr's tokened
 //            SEND on memmgr's endpoint. memmgr stores this and gates the
 //            procmgr-only labels (REGISTER_PROCESS, PROCESS_DIED) on it.
-//   data[3..3+frame_count]: page_count per frame, low 32 bits of each word.
+//   data[3..3+ceil(frame_count/2)]: page_count per frame, packed two per
+//            word (low 32 bits = even index, high 32 bits = odd index).
 //
-// MSG_DATA_WORDS_MAX = 64; this layout supports up to 61 RAM frames per
-// bootstrap round.
+// MSG_DATA_WORDS_MAX = 64; this layout supports up to 122 RAM frames per
+// bootstrap round (same as before phys_base was plumbed: phys travels via
+// the auxiliary frame in caps[1] rather than competing for data-field
+// budget).
 
 /// Maximum number of frames init can deliver in one bootstrap round.
 /// Mirrors `MEMMGR_BOOTSTRAP_MAX_FRAMES` in init's `bootstrap.rs`:
 /// 64-word data field minus 3-word prefix, two `page_counts` packed
 /// per word.
 const BOOTSTRAP_MAX_FRAMES: usize = 122;
+
+/// Scratch VA in memmgr's address space for mapping the bootstrap
+/// phys-table frame. One page; mapped RO during `bootstrap_from_init`,
+/// unmapped before the dispatch loop entry.
+const PHYS_TABLE_TEMP_VA: u64 = 0x0000_5000_0000_0000;
 
 struct InitBootstrap
 {
@@ -397,9 +416,14 @@ struct InitBootstrap
     frame_base: u32,
     frame_count: u32,
     page_counts: [u32; BOOTSTRAP_MAX_FRAMES],
+    phys_bases: [u64; BOOTSTRAP_MAX_FRAMES],
 }
 
-fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstrap>
+fn bootstrap_from_init(
+    creator_ep: u32,
+    self_aspace: u32,
+    ipc_buf: *mut u64,
+) -> Option<InitBootstrap>
 {
     if creator_ep == 0
     {
@@ -407,7 +431,7 @@ fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstr
     }
     // SAFETY: caller passes the registered IPC buffer page.
     let round = unsafe { ipc::bootstrap::request_round(creator_ep, ipc_buf) }.ok()?;
-    if round.cap_count < 1 || round.data_words < 3 || !round.done
+    if round.cap_count < 2 || round.data_words < 3 || !round.done
     {
         return None;
     }
@@ -432,12 +456,35 @@ fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstr
             page_counts[i0 + 1] = hi;
         }
     }
+
+    // Map the phys-table frame and copy out frame_count u64 entries.
+    let phys_table_cap = round.caps[1];
+    let mut phys_bases = [0u64; BOOTSTRAP_MAX_FRAMES];
+    if syscall::mem_map(phys_table_cap, self_aspace, PHYS_TABLE_TEMP_VA, 0, 1, 0).is_err()
+    {
+        return None;
+    }
+    // SAFETY: PHYS_TABLE_TEMP_VA is mapped RO, one page. Init wrote the
+    // first `frame_count` u64 entries; the rest is zero. The pointer is
+    // page-aligned (4 KiB) so u64 alignment is satisfied.
+    #[allow(clippy::cast_ptr_alignment)]
+    let phys_ptr = PHYS_TABLE_TEMP_VA as *const u64;
+    for (i, slot) in phys_bases.iter_mut().enumerate().take(frame_count as usize)
+    {
+        // SAFETY: i < frame_count <= BOOTSTRAP_MAX_FRAMES = 122; 122 * 8 =
+        // 976 B fits in one 4 KiB page.
+        *slot = unsafe { core::ptr::read_volatile(phys_ptr.add(i)) };
+    }
+    let _ = syscall::mem_unmap(self_aspace, PHYS_TABLE_TEMP_VA, 1);
+    let _ = syscall::cap_delete(phys_table_cap);
+
     Some(InitBootstrap {
         service_ep: round.caps[0],
         procmgr_token: round.data[2],
         frame_base: round.data[0] as u32,
         frame_count,
         page_counts,
+        phys_bases,
     })
 }
 
@@ -446,14 +493,14 @@ fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstr
 /// Peel exactly `want` pages off the run at index `idx`. If the run is
 /// larger, splits via `frame_split`; the residue is reinserted into the
 /// pool. Returns the cap slot (in memmgr's `CSpace`) covering exactly `want`
-/// pages.
-fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<u32>
+/// pages plus that slot's physical base address.
+fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<(u32, u64)>
 {
     let run = pool.runs[idx]?;
     if run.page_count == want
     {
         pool.runs[idx] = None;
-        return Some(run.cap_slot);
+        return Some((run.cap_slot, run.phys_base));
     }
     if run.page_count < want
     {
@@ -461,11 +508,15 @@ fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<u32>
     }
     let split_offset = u64::from(want) * PAGE_SIZE;
     let (left, right) = syscall::frame_split(run.cap_slot, split_offset).ok()?;
+    // frame_split: `left` covers the first `split_offset` bytes (same
+    // phys_base as the original run); `right` covers the remainder, at
+    // `phys_base + split_offset`.
     pool.runs[idx] = Some(FreeRun {
         cap_slot: right,
         page_count: run.page_count - want,
+        phys_base: run.phys_base + split_offset,
     });
-    Some(left)
+    Some((left, run.phys_base))
 }
 
 /// Derive an inner copy of the outer cap to hand to the caller. The outer
@@ -488,27 +539,34 @@ fn derive_for_caller(outer_slot: u32) -> Option<u32>
 /// `data[1..1+count]`; `data[0]` holds the count itself.
 const MAX_REPLY_CAPS: usize = syscall_abi::MSG_CAP_SLOTS_MAX;
 
+/// One peeled selection entry: `(outer_cap_slot, page_count, phys_base)`.
+type GrantEntry = (u32, u32, u64);
+
+/// Result of a single `select_frames` call: the array of peeled entries
+/// plus the count of valid entries.
+type GrantArray = [GrantEntry; MAX_REPLY_CAPS];
+
 /// Pool selection for a single `REQUEST_FRAMES` call. Returns the array of
-/// peeled `(outer_cap, page_count)` entries plus their count, or an error
-/// code on failure. On error the pool is unchanged; on success the caller
-/// owns each outer cap and is responsible for either accounting it to a
-/// process record or pushing it back via `pool.push`.
+/// peeled `(outer_cap, page_count, phys_base)` entries plus their count, or
+/// an error code on failure. On error the pool is unchanged; on success the
+/// caller owns each outer cap and is responsible for either accounting it
+/// to a process record or pushing it back via `pool.push`.
 fn select_frames(
     pool: &mut FreePool,
     want_pages: u32,
     contiguous: bool,
-) -> Result<([(u32, u32); MAX_REPLY_CAPS], usize), u64>
+) -> Result<(GrantArray, usize), u64>
 {
-    let mut granted: [(u32, u32); MAX_REPLY_CAPS] = [(0, 0); MAX_REPLY_CAPS];
+    let mut granted: GrantArray = [(0, 0, 0); MAX_REPLY_CAPS];
 
     if contiguous
     {
         let idx = pool
             .smallest_fit(want_pages)
             .ok_or(memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS)?;
-        let outer =
+        let (outer, phys) =
             take_exactly(pool, idx, want_pages).ok_or(memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS)?;
-        granted[0] = (outer, want_pages);
+        granted[0] = (outer, want_pages, phys);
         return Ok((granted, 1));
     }
 
@@ -528,22 +586,23 @@ fn select_frames(
             break;
         }
         let take_pages = avail.min(remaining);
-        let Some(outer) = take_exactly(pool, idx, take_pages)
+        let Some((outer, phys)) = take_exactly(pool, idx, take_pages)
         else
         {
             break;
         };
-        granted[count] = (outer, take_pages);
+        granted[count] = (outer, take_pages, phys);
         count += 1;
         remaining -= take_pages;
     }
     if remaining > 0
     {
-        for &(outer, pages) in granted.iter().take(count)
+        for &(outer, pages, phys) in granted.iter().take(count)
         {
             let _ = pool.push(FreeRun {
                 cap_slot: outer,
                 page_count: pages,
+                phys_base: phys,
             });
         }
         return Err(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
@@ -555,17 +614,18 @@ fn select_frames(
 /// delete any inner derivations already minted.
 fn rollback_selection(
     pool: &mut FreePool,
-    granted: &[(u32, u32); MAX_REPLY_CAPS],
+    granted: &GrantArray,
     granted_count: usize,
     inner: &[u32; MAX_REPLY_CAPS],
     inner_count: usize,
 )
 {
-    for &(o, p) in granted.iter().take(granted_count)
+    for &(o, p, phys) in granted.iter().take(granted_count)
     {
         let _ = pool.push(FreeRun {
             cap_slot: o,
             page_count: p,
+            phys_base: phys,
         });
     }
     for &slot in inner.iter().take(inner_count)
@@ -610,12 +670,13 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
     // inner copy that ships in the reply. On any failure, roll the entire
     // selection back to the pool.
     let mut inner: [u32; MAX_REPLY_CAPS] = [0; MAX_REPLY_CAPS];
-    for (i, &(outer, pages)) in granted.iter().take(granted_count).enumerate()
+    for (i, &(outer, pages, phys)) in granted.iter().take(granted_count).enumerate()
     {
         if record
             .push(OwnedFrame {
                 cap_slot: outer,
                 page_count: pages,
+                phys_base: phys,
             })
             .is_err()
         {
@@ -636,11 +697,16 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
         inner[i] = d;
     }
 
-    // Build the reply: data[0] = cap_count, data[1+i] = page_count_i.
+    // Build the reply:
+    //   data[0]                  = cap_count
+    //   data[1..1+count]         = page_count_for_cap_i (u32 in low half)
+    //   data[1+count..1+2*count] = phys_base_for_cap_i (u64)
+    //   caps[0..count]           = Frame caps (MAP|WRITE)
     let mut builder = IpcMessage::builder(memmgr_errors::SUCCESS).word(0, granted_count as u64);
-    for (i, &(_, pages)) in granted.iter().take(granted_count).enumerate()
+    for (i, &(_, pages, phys)) in granted.iter().take(granted_count).enumerate()
     {
         builder = builder.word(1 + i, u64::from(pages));
+        builder = builder.word(1 + granted_count + i, phys);
     }
     for &slot in inner.iter().take(granted_count)
     {
@@ -722,6 +788,7 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
             let _ = pool.push(FreeRun {
                 cap_slot: frame.cap_slot,
                 page_count: frame.page_count,
+                phys_base: frame.phys_base,
             });
         }
         // Coalesce reclaimed runs back into larger contiguous chunks via
@@ -761,15 +828,12 @@ fn reply_label(ipc_buf: *mut u64, label: u64)
 fn ingest_pool(boot: &InitBootstrap)
 {
     let pool = pool_mut();
-    for (i, &page_count) in boot
-        .page_counts
-        .iter()
-        .take(boot.frame_count as usize)
-        .enumerate()
+    for i in 0..(boot.frame_count as usize)
     {
         let _ = pool.push(FreeRun {
             cap_slot: boot.frame_base + i as u32,
-            page_count,
+            page_count: boot.page_counts[i],
+            phys_base: boot.phys_bases[i],
         });
     }
 }
@@ -812,7 +876,7 @@ fn main(startup: &StartupInfo) -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = startup.ipc_buffer.cast::<u64>();
 
-    let Some(boot) = bootstrap_from_init(startup.creator_endpoint, ipc_buf)
+    let Some(boot) = bootstrap_from_init(startup.creator_endpoint, startup.self_aspace, ipc_buf)
     else
     {
         syscall::thread_exit();

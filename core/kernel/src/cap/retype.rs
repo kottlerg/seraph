@@ -706,6 +706,78 @@ pub fn boot_retype_body<T>(seed: &FrameObject, body: T) -> NonNull<KernelObjectH
     unsafe { NonNull::new_unchecked(virt.cast::<KernelObjectHeader>()) }
 }
 
+/// Runtime mint: allocate `size_of::<T>()` bytes from the kernel SEED Frame
+/// cap, write `body` in place, bump SEED's refcount, and return a pointer
+/// suitable for `CSpace::insert_cap`.
+///
+/// SEED is the only kernel-internal Frame cap; it backs the wrapper bodies
+/// of split-derived caps (`sys_mmio_split`, `sys_irq_split`, the tail of
+/// `sys_frame_split`) and lazy per-thread state (`sys_iopb_set`'s IOPB).
+/// All callers debit `SEED.available_bytes`; runtime exhaustion returns
+/// `OutOfMemory` to the syscall surface (unlike [`boot_retype_body`] which
+/// fatals).
+///
+/// `body.header.ancestor` MUST be stamped by the caller via
+/// [`KernelObjectHeader::with_ancestor`] using
+/// [`crate::cap::seed_header_nn`] so the dealloc cascade returns the body
+/// to SEED.
+///
+/// `T` must be `#[repr(C)]` with [`KernelObjectHeader`] at offset 0.
+#[cfg(not(test))]
+pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallError>
+{
+    let seed = crate::cap::seed_frame_ref();
+    let bytes = core::mem::size_of::<T>() as u64;
+    let offset = retype_allocate(seed, bytes)?;
+    let virt = crate::mm::paging::phys_to_virt(seed.base + offset) as *mut T;
+    // SAFETY: `virt` is in the kernel direct map, freshly carved by
+    // `retype_allocate`, and not aliased.
+    unsafe { core::ptr::write(virt, body) };
+    seed.header.inc_ref();
+    // SAFETY: T is repr(C) with KernelObjectHeader at offset 0.
+    Ok(unsafe { NonNull::new_unchecked(virt.cast::<KernelObjectHeader>()) })
+}
+
+/// Reserve `bytes` of opaque scratch from SEED for non-cap kernel state
+/// (currently x86_64-only: per-thread IOPB pages). Returns a kernel-
+/// direct-map pointer to the freshly-carved region; bumps SEED's
+/// refcount once so the bytes outlive any holder.
+///
+/// Caller frees via [`free_seed_scratch`] giving back the matching
+/// `(ptr, bytes)` pair.
+///
+/// Unlike [`alloc_in_seed`], no `KernelObjectHeader` is written and the
+/// region does not enter any `CSpace`; the returned pointer is opaque.
+///
+/// Gated `cfg(target_arch = "x86_64")` because the only consumer is the
+/// IOPB allocation in `sys_iopb_set`. RISC-V has no I/O port permission
+/// bitmap and never calls this.
+#[cfg(all(not(test), target_arch = "x86_64"))]
+pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
+{
+    let seed = crate::cap::seed_frame_ref();
+    let offset = retype_allocate(seed, bytes)?;
+    seed.header.inc_ref();
+    Ok(crate::mm::paging::phys_to_virt(seed.base + offset) as *mut u8)
+}
+
+/// Return a [`alloc_seed_scratch`] reservation to SEED. `ptr` and `bytes`
+/// must match the values returned/passed at allocation time. Decrements
+/// SEED's refcount once.
+///
+/// SEED is statically pinned (initial refcount 1 + Phase-7 `inc_ref` pin),
+/// so its refcount can never drop to zero in normal operation; the
+/// `dec_ref` here is bookkeeping for the scratch lease.
+#[cfg(all(not(test), target_arch = "x86_64"))]
+pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
+{
+    let seed = crate::cap::seed_frame_ref();
+    let phys = crate::mm::paging::virt_to_phys(ptr as u64);
+    let offset = phys - seed.base;
+    retype_free(seed, offset, bytes);
+    seed.header.dec_ref();
+}
+
 /// Per-`ObjectType` retype dispatch entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DispatchEntry

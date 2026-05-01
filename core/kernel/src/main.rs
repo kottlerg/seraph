@@ -15,7 +15,7 @@
 //! - Phase 1: initialize early console (serial + framebuffer); emit startup banner.
 //! - Phase 2: parse memory map, populate buddy frame allocator.
 //! - Phase 3: install kernel page tables (direct physical map + W^X image).
-//! - Phase 4: activate kernel heap (`GlobalAlloc` via slab/size-class allocator).
+//! - Phase 4: typed-memory cap surface (no `GlobalAlloc`; bodies sourced from caps).
 //! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall).
 //! - Phase 6: cache `kernel_mmio` and validate `mmio_apertures` slice before capability minting.
 //! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps.
@@ -29,11 +29,6 @@
 use core::panic::PanicInfo;
 #[cfg(not(test))]
 use core::sync::atomic::{AtomicU32, Ordering};
-
-// Pull in the `alloc` crate (Box, Vec, …) for no_std kernel builds.
-// In test mode the standard library provides alloc implicitly.
-#[cfg(not(test))]
-extern crate alloc;
 
 // ── AP ready counter ──────────────────────────────────────────────────────────
 
@@ -184,9 +179,13 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         mm::paging::DIRECT_MAP_BASE
     );
 
-    // ── Phase 4: kernel heap ─────────────────────────────────────────────────
-    // Flip the GlobalAlloc ready flag. The SizeClassAllocator and KernelCaches
-    // are const-initialised in their statics; no heap memory is consumed here.
+    // ── Phase 4: typed-memory cap surface ────────────────────────────────────
+    // The kernel does not run a `GlobalAlloc`; every kernel-object body is
+    // sourced from a Frame cap via `crate::cap::retype` (caller-supplied at
+    // userspace `cap_create_*` boundaries; SEED-backed at boot time and for
+    // split-derived wrappers). Phase 4 carries no setup cost — the typed-
+    // memory machinery is ready as soon as `SEED_FRAME` is installed in
+    // Phase 7.
     //
     // Note on bootloader page table frame reclamation:
     // Two categories of frames are NOT reclaimed:
@@ -195,9 +194,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     //   2. Bootloader's original page tables: BootInfo does not record their
     //      physical addresses, so they cannot be identified. Future enhancement:
     //      have the bootloader pass old CR3/satp in BootInfo.
-    mm::heap::init();
-    kprintln!("Phase 4: Slab Allocator and Kernel Heap");
-    kprintln!("kernel heap active");
+    kprintln!("Phase 4: Typed-Memory Cap Surface (no kernel heap)");
 
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read
     // bootloader-discovered MMIO bases instead of compile-time defaults. This
@@ -253,13 +250,14 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // them. (kernel_mmio was cached earlier, after Phase 4, so Phase 5 arch
     // init can read it.)
     kprintln!("Phase 6: Platform Resource Validation");
-    let mmio_apertures = platform::validate_mmio_apertures(boot_info as u64);
+    // SAFETY: single-threaded boot Phase 6; first and only call.
+    let mmio_apertures = unsafe { platform::validate_mmio_apertures(boot_info as u64) };
 
     // ── Phase 7: capability system ─────────────────────────────────────────────
     // Initialises the root CSpace and mints initial capabilities for all
     // boot-provided hardware resources.
     kprintln!("Phase 7: Capability System");
-    let cspace_layout = cap::init_capability_system(&mmio_apertures, boot_info as u64);
+    let cspace_layout = cap::init_capability_system(mmio_apertures, boot_info as u64);
     kprintln!(
         "capability system initialised, {} slots populated",
         cspace_layout.total_populated
@@ -402,8 +400,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             use init_protocol::{INIT_INFO_VADDR, INIT_PROTOCOL_VERSION, InitInfo};
 
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
-            let desc_count = cspace_layout.descriptors.len();
-            let desc_byte_len = desc_count * core::mem::size_of::<init_protocol::CapDescriptor>();
+            // SAFETY: single-threaded boot; cspace_layout produced by Phase 7.
+            let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
+            let desc_count = desc_slice.len();
+            let desc_byte_len = core::mem::size_of_val(desc_slice);
             let cmdline_start = descriptors_offset as usize + desc_byte_len;
             let total_bytes = cmdline_start + cmdline_len;
             let info_pages = total_bytes.div_ceil(mm::PAGE_SIZE).max(1);
@@ -496,7 +496,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             }
 
             // Write CapDescriptor array — may span page boundaries.
-            let desc_src = cspace_layout.descriptors.as_ptr().cast::<u8>();
+            let desc_src = desc_slice.as_ptr().cast::<u8>();
             let mut written = 0usize;
             while written < desc_byte_len
             {
@@ -713,6 +713,34 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             "init: TCB tid=1 priority={} stack={:#x}",
             sched::INIT_PRIORITY,
             init_kstack_top
+        );
+
+        // ── Boot-handover ledger ────────────────────────────────────────────
+        // Sum FrameObject.available_bytes across every Frame cap in init's
+        // CSpace plus SEED's residual reserve. After 4b, SEED is the kernel's
+        // ongoing body source for split-derived wrappers and per-thread IOPB
+        // pages; printing both makes the invariant
+        //
+        //   total_RAM == kernel_static_image_size + Σ per-CPU kstack pages
+        //                + SEED_available + Σ caps_available
+        //                + bootloader-loaded modules
+        //
+        // observable byte-for-byte. The kernel heap is deleted; no `Box::new`
+        // path remains in production.
+        // SAFETY: init_cspace_ptr is the root CSpace, single-threaded boot.
+        let cap_available_bytes = unsafe { cap::sum_frame_available_bytes(&*init_cspace_ptr) };
+        let seed_available_bytes = cap::seed_frame_ref()
+            .available_bytes
+            .load(core::sync::atomic::Ordering::Acquire);
+        let kstack_bytes =
+            u64::from(boot_cpu_count) * (sched::KERNEL_STACK_PAGES as u64) * (mm::PAGE_SIZE as u64);
+        kprintln!(
+            "ledger: caps_available={} KiB, seed_available={} KiB, kstack_total={} KiB ({} CPUs × {} KiB)",
+            cap_available_bytes / 1024,
+            seed_available_bytes / 1024,
+            kstack_bytes / 1024,
+            boot_cpu_count,
+            (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE / 1024) as u64,
         );
 
         // ── SMP: start Application Processors ────────────────────────────────

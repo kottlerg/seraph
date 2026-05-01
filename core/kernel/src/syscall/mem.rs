@@ -494,13 +494,10 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    extern crate alloc;
-    use alloc::boxed::Box;
-    use core::ptr::NonNull;
-
     use crate::cap::derivation::{DERIVATION_LOCK, link_child};
     use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType};
     use crate::cap::retype;
+    use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
@@ -608,8 +605,13 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let tail_avail = if parent_retypable { tail_size } else { 0 };
 
     // ── Mint tail FrameObject ─────────────────────────────────────────────────
-    let tail_obj = Box::new(FrameObject {
-        header: KernelObjectHeader::new(ObjectType::Frame),
+    //
+    // The wrapper body lives in the kernel SEED Frame cap; on tail
+    // dealloc, two independent reclaims fire: `owns_memory` returns the
+    // tail's region to the buddy, and `header.ancestor=SEED` returns the
+    // wrapper bytes via `retype_free`.
+    let tail_ptr = retype::alloc_in_seed(FrameObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
         base: parent_phys + split_offset,
         size: tail_size,
         available_bytes: core::sync::atomic::AtomicU64::new(tail_avail),
@@ -619,12 +621,11 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         owns_memory: core::sync::atomic::AtomicBool::new(parent_owns),
         allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         lock: core::sync::atomic::AtomicU32::new(0),
-    });
-    let tail_ptr: NonNull<KernelObjectHeader> = {
-        let raw = Box::into_raw(tail_obj).cast::<KernelObjectHeader>();
-        // SAFETY: Box::into_raw returns non-null; header at offset 0.
-        unsafe { NonNull::new_unchecked(raw) }
-    };
+    })
+    .inspect_err(|_| {
+        parent_ref.write_unlock();
+        DERIVATION_LOCK.write_unlock();
+    })?;
 
     // SAFETY: caller_cspace validated non-null.
     let cs = unsafe { &mut *caller_cspace };

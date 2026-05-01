@@ -8,7 +8,7 @@
 //! Orchestrates GDT, IDT, SMEP/SMAP, and the local APIC in the correct order:
 //!
 //! 1. Enable SMEP + SMAP (fatal if CPU lacks support).
-//! 2. Allocate IST stacks (2 × 8 KiB) from the heap via `Box::leak`.
+//! 2. Carve IST stacks (2 × 8 KiB) out of the [`BSP_IST_STACKS`] BSS array.
 //! 3. Load GDT + TSS with the IST stack pointers.
 //! 4. Load IDT.
 //! 5. Software-enable the local APIC: set SVR bit 8, spurious vector 255.
@@ -32,13 +32,6 @@
 // cast_possible_truncation: u64→usize/u8 APIC address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector casts are always widening.
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
-
-#[cfg(not(test))]
-extern crate alloc;
-#[cfg(not(test))]
-use alloc::boxed::Box;
-#[cfg(not(test))]
-use alloc::vec;
 
 #[cfg(not(test))]
 use super::{cpu, gdt, idt};
@@ -69,6 +62,15 @@ const LVT_MASK: u32 = 1 << 16;
 
 /// IST stack size: 8 KiB.
 const IST_STACK_SIZE: usize = 8192;
+
+/// BSP IST stacks, in BSS. The BSP installs these at Phase-5 init.
+///
+/// Two stacks: IST1 for double-fault, IST2 for NMI. AP IST stacks live in
+/// [`crate::arch::x86_64::ap_trampoline::AP_IST_STACKS`].
+///
+/// `static mut` is written only at single-threaded boot init.
+#[cfg(not(test))]
+static mut BSP_IST_STACKS: [u8; IST_STACK_SIZE * 2] = [0u8; IST_STACK_SIZE * 2];
 
 // ── APIC register access ──────────────────────────────────────────────────────
 
@@ -114,12 +116,10 @@ pub unsafe fn init()
         cpu::enable_smep_smap();
     }
 
-    // 2. Allocate IST stacks from the heap.
-    // 8 KiB each, leaked so they live for the rest of kernel execution.
-    let ist1_stack = Box::leak(vec![0u8; IST_STACK_SIZE].into_boxed_slice());
-    let ist2_stack = Box::leak(vec![0u8; IST_STACK_SIZE].into_boxed_slice());
-    let ist1_top = ist1_stack.as_ptr() as u64 + IST_STACK_SIZE as u64;
-    let ist2_top = ist2_stack.as_ptr() as u64 + IST_STACK_SIZE as u64;
+    // 2. Carve the BSP IST stacks out of [`BSP_IST_STACKS`] (BSS).
+    let ist_base = core::ptr::addr_of_mut!(BSP_IST_STACKS) as u64;
+    let ist1_top = ist_base + IST_STACK_SIZE as u64;
+    let ist2_top = ist_base + (IST_STACK_SIZE * 2) as u64;
 
     // Derive the current kernel stack top from RSP for the initial TSS RSP0.
     // This is updated on each context switch in later phases.

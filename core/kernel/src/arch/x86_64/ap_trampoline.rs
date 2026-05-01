@@ -108,6 +108,23 @@ const GDT_CODE64: u64 = 0x0020_9A00_0000_0000;
 /// Base=0, limit=4GiB, G=1, D=1, data/writable, present.
 const GDT_DATA: u64 = 0x00CF_9200_0000_FFFF;
 
+/// IST stack pair size: 8 KiB IST1 + 8 KiB IST2 = 16 KiB per AP.
+const AP_IST_PAIR_SIZE: usize = 16384;
+
+/// Per-AP IST stacks, in BSS. Slot `cpu_idx` holds the 16 KiB pair (IST1 +
+/// IST2) for AP with that id; slot 0 is unused (BSP has its own
+/// [`crate::arch::x86_64::interrupts`] `BSP_IST_STACKS` static).
+///
+/// Sized at [`crate::sched::MAX_CPUS`] so the kernel image embeds the BSS
+/// at link time — no heap allocation on AP startup. `MAX_CPUS=64` → ~1 MiB
+/// BSS.
+///
+/// `static mut` is only written under single-threaded AP bringup or as a
+/// stack by the AP itself.
+#[cfg(not(test))]
+static mut AP_IST_STACKS: [[u8; AP_IST_PAIR_SIZE]; crate::sched::MAX_CPUS] =
+    [[0u8; AP_IST_PAIR_SIZE]; crate::sched::MAX_CPUS];
+
 // ── Trampoline machine-code template ─────────────────────────────────────────
 
 /// Fixed-content trampoline bytes copied to the AP trampoline page.
@@ -474,7 +491,8 @@ pub unsafe fn setup_ap_params(
 ///
 /// # Safety
 /// - [`setup_trampoline`] must have been called.
-/// - Phase 3–8 must be active (direct map, heap, IDT, scheduler state).
+/// - Phase 3–8 must be active (direct map, IDT, scheduler state).
+/// - `cpu_idx` must be `< MAX_CPUS` (asserted in debug).
 #[cfg(not(test))]
 pub unsafe fn start_ap(
     trampoline_pa: u64,
@@ -484,12 +502,14 @@ pub unsafe fn start_ap(
     stack_top: u64,
 ) -> bool
 {
-    // Allocate IST stacks (8 KiB each, leaked so they live for the CPU's lifetime).
-    // SAFETY: heap is active (Phase 4); these are never freed.
-    let ist1 = alloc::boxed::Box::leak(alloc::vec![0u8; 8192].into_boxed_slice());
-    let ist1_top = ist1.as_ptr() as u64 + 8192;
-    let ist2 = alloc::boxed::Box::leak(alloc::vec![0u8; 8192].into_boxed_slice());
-    let ist2_top = ist2.as_ptr() as u64 + 8192;
+    debug_assert!((cpu_idx as usize) < crate::sched::MAX_CPUS);
+
+    // Carve this AP's IST stacks out of [`AP_IST_STACKS`] (BSS).
+    // SAFETY: cpu_idx < MAX_CPUS asserted; the AP_IST_STACKS slot for this
+    // CPU is exclusively owned by this AP for the kernel's lifetime.
+    let ist_base = unsafe { core::ptr::addr_of_mut!(AP_IST_STACKS[cpu_idx as usize]) } as u64;
+    let ist1_top = ist_base + 8192;
+    let ist2_top = ist_base + 16384;
 
     let pml4_pa = crate::mm::paging::kernel_pml4_pa() as u32;
 

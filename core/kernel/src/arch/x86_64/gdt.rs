@@ -19,7 +19,7 @@
 //! so the layout `user_ds(0x18), user_cs(0x20)` is required for SYSRET.
 //!
 //! IST stacks for double-fault (IST1) and NMI (IST2) are passed in by the
-//! caller (allocated from the heap via `Box::leak`).
+//! caller as kernel-direct-map virtual addresses backed by static BSS.
 //!
 //! # Modification notes
 //! - To add a new ring-3 segment: insert it after `user_cs` and before the TSS
@@ -31,11 +31,6 @@
 // the struct sizes and array counts that are verified by the unit tests.
 // cast_lossless: u8→u64 DPL shifts; u8 always fits in u64.
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
-
-// Unit tests exercise descriptor encoding only; hardware ops are #[cfg(not(test))].
-// AP GDT/TSS init uses Box (heap allocation); alloc is available from Phase 4 onward.
-#[cfg(not(test))]
-extern crate alloc;
 
 // ── Selector constants ────────────────────────────────────────────────────────
 
@@ -141,6 +136,46 @@ static mut TSS: TssWithIopb = TssWithIopb {
 /// GDT: 7 × 64-bit descriptors, in BSS.
 #[cfg(not(test))]
 static mut GDT: [u64; 7] = [0u64; 7];
+
+/// Per-CPU TSS+IOPB array for Application Processors. Slot `cpu_id` is the
+/// AP with that id; slot 0 is unused (BSP has its own [`TSS`] static).
+///
+/// Sized at [`crate::sched::MAX_CPUS`] so the kernel image embeds the BSS
+/// space at link time — no heap allocation on AP startup. Each entry is
+/// ~8 KiB (`TssWithIopb`); `MAX_CPUS=64` → ~520 KiB BSS.
+///
+/// `static mut` is only written during single-threaded AP bringup
+/// (`init_ap`) or with interrupts disabled during context switch.
+#[cfg(not(test))]
+static mut AP_TSS: [TssWithIopb; crate::sched::MAX_CPUS] = {
+    const VACANT: TssWithIopb = TssWithIopb {
+        tss: Tss {
+            _reserved0: 0,
+            rsp0: 0,
+            _rsp1: 0,
+            _rsp2: 0,
+            _reserved1: 0,
+            ist1: 0,
+            ist2: 0,
+            _ist3: 0,
+            _ist4: 0,
+            _ist5: 0,
+            _ist6: 0,
+            _ist7: 0,
+            _reserved2: 0,
+            _reserved3: 0,
+            iopb_offset: 104,
+        },
+        iopb: [0xFF; IOPB_SIZE],
+        terminator: 0xFF,
+    };
+    [VACANT; crate::sched::MAX_CPUS]
+};
+
+/// Per-CPU GDT array for Application Processors. Slot indexing matches
+/// [`AP_TSS`].
+#[cfg(not(test))]
+static mut AP_GDT: [[u64; 7]; crate::sched::MAX_CPUS] = [[0u64; 7]; crate::sched::MAX_CPUS];
 
 // ── GDTR ──────────────────────────────────────────────────────────────────────
 
@@ -361,13 +396,14 @@ pub unsafe fn set_rsp0(stack_top: u64)
 
 /// Initialise and load a per-CPU GDT and TSS for an AP (Application Processor).
 ///
-/// Heap-allocates a `TssWithIopb` and a 7-entry GDT, configures them with
-/// the same layout as the BSP's static GDT, loads them via `lgdt` + `ltr`,
-/// and stores the TSS pointer in `PER_CPU[cpu_id].tss_ptr`.
+/// Configures `AP_TSS[cpu_id]` and `AP_GDT[cpu_id]` (both BSS-resident, no
+/// heap involvement) with the same layout as the BSP's static GDT, loads
+/// them via `lgdt` + `ltr`, and stores the TSS pointer in
+/// `PER_CPU[cpu_id].tss_ptr`.
 ///
 /// Called from `kernel_entry_ap` during AP startup, after GS-base is
-/// installed. The BSP calls `gdt::init()` (static GDT/TSS) — this function is
-/// only for APs.
+/// installed. The BSP calls `gdt::init()` (static [`GDT`] / [`TSS`]) — this
+/// function is only for APs.
 ///
 /// # Safety
 /// Must execute at ring 0 on the AP being initialised. `cpu_id` must be < `MAX_CPUS.`
@@ -376,46 +412,64 @@ pub unsafe fn set_rsp0(stack_top: u64)
 #[cfg(not(test))]
 pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
 {
-    use alloc::boxed::Box;
+    debug_assert!((cpu_id as usize) < crate::sched::MAX_CPUS);
 
-    // Allocate and configure the TSS for this AP.
-    let tss_box = Box::new(TssWithIopb {
-        tss: Tss {
-            _reserved0: 0,
-            rsp0,
-            _rsp1: 0,
-            _rsp2: 0,
-            _reserved1: 0,
-            ist1: ist1_top,
-            ist2: ist2_top,
-            _ist3: 0,
-            _ist4: 0,
-            _ist5: 0,
-            _ist6: 0,
-            _ist7: 0,
-            _reserved2: 0,
-            _reserved3: 0,
-            iopb_offset: core::mem::size_of::<Tss>() as u16,
-        },
-        iopb: [0xFF; IOPB_SIZE],
-        terminator: 0xFF,
-    });
-    let tss_addr = core::ptr::addr_of!(*tss_box) as u64;
+    // Configure this AP's TSS slot in BSS.
+    // SAFETY: cpu_id < MAX_CPUS asserted; AP_TSS[cpu_id] is exclusively
+    // owned by this AP during single-threaded bringup.
+    let tss_ptr_mut = unsafe { core::ptr::addr_of_mut!(AP_TSS[cpu_id as usize]) };
+    let tss_addr = tss_ptr_mut as u64;
+    // Packed-struct field writes via raw-pointer offsets — packed structs
+    // forbid `&mut` to fields that aren't naturally aligned, but raw
+    // pointer writes are sound.
+    // SAFETY: tss_ptr_mut is unaliased; field writes stay within the struct.
+    unsafe {
+        let tss_inner = core::ptr::addr_of_mut!((*tss_ptr_mut).tss);
+        core::ptr::write(
+            tss_inner,
+            Tss {
+                _reserved0: 0,
+                rsp0,
+                _rsp1: 0,
+                _rsp2: 0,
+                _reserved1: 0,
+                ist1: ist1_top,
+                ist2: ist2_top,
+                _ist3: 0,
+                _ist4: 0,
+                _ist5: 0,
+                _ist6: 0,
+                _ist7: 0,
+                _reserved2: 0,
+                _reserved3: 0,
+                iopb_offset: core::mem::size_of::<Tss>() as u16,
+            },
+        );
+        // The IOPB and terminator are pre-initialised in the static
+        // initializer (0xFF / 0xFF). Re-deny on every init in case a prior
+        // owner had granted ports — caller invariant says cpu_id is
+        // exclusively owned, but explicit reset keeps the contract local.
+        let iopb = core::ptr::addr_of_mut!((*tss_ptr_mut).iopb);
+        core::ptr::write_bytes(iopb.cast::<u8>(), 0xFF, IOPB_SIZE);
+    }
 
-    // Allocate and fill the GDT for this AP (identical layout to BSP).
-    let mut gdt_box = Box::new([0u64; 7]);
-    gdt_box[0] = 0; // null
-    gdt_box[1] = code_desc_64(0); // 0x08 kernel CS
-    gdt_box[2] = data_desc_64(0); // 0x10 kernel DS
-    gdt_box[3] = data_desc_64(3); // 0x18 user DS
-    gdt_box[4] = code_desc_64(3); // 0x20 user CS
-    let (tss_lo, tss_hi) = tss_desc(tss_addr);
-    gdt_box[5] = tss_lo; // 0x28 TSS low
-    gdt_box[6] = tss_hi; // 0x30 TSS high
+    // Configure this AP's GDT slot in BSS.
+    // SAFETY: cpu_id < MAX_CPUS asserted; AP_GDT[cpu_id] is exclusively
+    // owned by this AP during single-threaded bringup.
+    let gdt_ptr_mut = unsafe { core::ptr::addr_of_mut!(AP_GDT[cpu_id as usize]) };
+    // SAFETY: gdt_ptr_mut is unaliased; writes stay within the array.
+    unsafe {
+        (*gdt_ptr_mut)[0] = 0; // null
+        (*gdt_ptr_mut)[1] = code_desc_64(0); // 0x08 kernel CS
+        (*gdt_ptr_mut)[2] = data_desc_64(0); // 0x10 kernel DS
+        (*gdt_ptr_mut)[3] = data_desc_64(3); // 0x18 user DS
+        (*gdt_ptr_mut)[4] = code_desc_64(3); // 0x20 user CS
+        let (tss_lo, tss_hi) = tss_desc(tss_addr);
+        (*gdt_ptr_mut)[5] = tss_lo; // 0x28 TSS low
+        (*gdt_ptr_mut)[6] = tss_hi; // 0x30 TSS high
+    }
 
-    // Leak both boxes — the AP runs on them for the lifetime of the kernel.
-    let gdt_ptr: *const [u64; 7] = Box::into_raw(gdt_box).cast_const();
-    let _tss_ptr: *mut TssWithIopb = Box::into_raw(tss_box);
+    let gdt_ptr: *const [u64; 7] = gdt_ptr_mut.cast_const();
 
     // Load GDTR.
     let gdtr = Gdtr {

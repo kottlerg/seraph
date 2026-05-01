@@ -16,9 +16,6 @@
 //! atomically with each message. See `transfer_caps` for the protocol.
 
 #[cfg(not(test))]
-extern crate alloc;
-
-#[cfg(not(test))]
 use crate::arch::current::trap_frame::TrapFrame;
 #[cfg(not(test))]
 use syscall::SyscallError;

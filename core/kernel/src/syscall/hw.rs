@@ -385,14 +385,21 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             (po.base, po.size)
         };
 
-        // Allocate per-thread IOPB on first bind.
+        // Allocate per-thread IOPB on first bind. Sourced from the kernel
+        // SEED Frame cap (no heap alloc); freed back to SEED on thread
+        // dealloc via the Thread arm of `dealloc_object`.
         // SAFETY: target_tcb validated non-null; iopb field always valid.
         if unsafe { (*target_tcb).iopb.is_null() }
         {
-            let bitmap = alloc::boxed::Box::new([0xFFu8; gdt::IOPB_SIZE]);
-            // SAFETY: target_tcb validated non-null; iopb field owned by TCB.
+            let raw = crate::cap::retype::alloc_seed_scratch(gdt::IOPB_SIZE as u64)?;
+            // SAFETY: raw points at a freshly-carved IOPB-sized block in
+            // SEED's region; not aliased; we own it for the IOPB's lifetime.
             unsafe {
-                (*target_tcb).iopb = alloc::boxed::Box::into_raw(bitmap);
+                core::ptr::write_bytes(raw, 0xFFu8, gdt::IOPB_SIZE);
+                #[allow(clippy::cast_ptr_alignment)]
+                {
+                    (*target_tcb).iopb = raw.cast::<[u8; gdt::IOPB_SIZE]>();
+                }
             }
         }
 
@@ -457,12 +464,10 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    extern crate alloc;
-    use alloc::boxed::Box;
-    use core::ptr::NonNull;
-
     use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
     use crate::cap::object::{KernelObjectHeader, MmioRegionObject, ObjectType, dealloc_object};
+    use crate::cap::retype::alloc_in_seed;
+    use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
@@ -522,33 +527,37 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // ── Create two child MmioRegionObjects ────────────────────────────────────
+    //
+    // Both wrapper bodies live in the kernel SEED Frame cap; their
+    // `header.ancestor` points at SEED so dealloc returns the bytes via
+    // `retype_free`.
 
     // child1: [base, base + split_offset).
-    let child1_obj = Box::new(MmioRegionObject {
-        header: KernelObjectHeader::new(ObjectType::MmioRegion),
+    let child1_ptr = alloc_in_seed(MmioRegionObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
         base: mmio_phys,
         size: split_offset,
         flags: mmio_flags,
         _pad: 0,
-    });
-    let child1_ptr: NonNull<KernelObjectHeader> = {
-        let raw = Box::into_raw(child1_obj).cast::<KernelObjectHeader>();
-        // SAFETY: Box::into_raw returns non-null; MmioRegionObject.header is at offset 0.
-        unsafe { NonNull::new_unchecked(raw) }
-    };
+    })?;
 
     // child2: [base + split_offset, end).
-    let child2_obj = Box::new(MmioRegionObject {
-        header: KernelObjectHeader::new(ObjectType::MmioRegion),
+    let child2_ptr = match alloc_in_seed(MmioRegionObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
         base: mmio_phys + split_offset,
         size: mmio_size - split_offset,
         flags: mmio_flags,
         _pad: 0,
-    });
-    let child2_ptr: NonNull<KernelObjectHeader> = {
-        let raw = Box::into_raw(child2_obj).cast::<KernelObjectHeader>();
-        // SAFETY: Box::into_raw is non-null; header at offset 0.
-        unsafe { NonNull::new_unchecked(raw) }
+    })
+    {
+        Ok(p) => p,
+        Err(e) =>
+        {
+            // SAFETY: child1_ptr is a freshly-allocated SEED-backed body
+            // with refcount 1 and not yet inserted into any CSpace.
+            unsafe { dealloc_object(child1_ptr) };
+            return Err(e);
+        }
     };
 
     // Insert both children into the caller's CSpace (auto-allocate slots).
@@ -648,12 +657,10 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    extern crate alloc;
-    use alloc::boxed::Box;
-    use core::ptr::NonNull;
-
     use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
     use crate::cap::object::{InterruptObject, KernelObjectHeader, ObjectType, dealloc_object};
+    use crate::cap::retype::alloc_in_seed;
+    use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::syscall::current_tcb;
 
@@ -703,26 +710,30 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let lower_count = split_at - start;
     let upper_count = count - lower_count;
 
-    let child1_obj = Box::new(InterruptObject {
-        header: KernelObjectHeader::new(ObjectType::Interrupt),
+    // Both wrapper bodies live in the kernel SEED Frame cap; their
+    // `header.ancestor` points at SEED so dealloc returns the bytes via
+    // `retype_free`.
+
+    let child1_ptr = alloc_in_seed(InterruptObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
         start,
         count: lower_count,
-    });
-    let child1_ptr: NonNull<KernelObjectHeader> = {
-        let raw = Box::into_raw(child1_obj).cast::<KernelObjectHeader>();
-        // SAFETY: Box::into_raw returns non-null; header at offset 0.
-        unsafe { NonNull::new_unchecked(raw) }
-    };
+    })?;
 
-    let child2_obj = Box::new(InterruptObject {
-        header: KernelObjectHeader::new(ObjectType::Interrupt),
+    let child2_ptr = match alloc_in_seed(InterruptObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
         start: split_at,
         count: upper_count,
-    });
-    let child2_ptr: NonNull<KernelObjectHeader> = {
-        let raw = Box::into_raw(child2_obj).cast::<KernelObjectHeader>();
-        // SAFETY: Box::into_raw is non-null; header at offset 0.
-        unsafe { NonNull::new_unchecked(raw) }
+    })
+    {
+        Ok(p) => p,
+        Err(e) =>
+        {
+            // SAFETY: child1_ptr is a freshly-allocated SEED-backed body
+            // with refcount 1 and not yet inserted into any CSpace.
+            unsafe { dealloc_object(child1_ptr) };
+            return Err(e);
+        }
     };
 
     // Insert both children into the caller's CSpace.

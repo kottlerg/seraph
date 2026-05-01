@@ -28,6 +28,9 @@
 // cast_possible_truncation: u64→usize/u32/u16 capability field extractions bounded by capability space.
 #![allow(clippy::cast_possible_truncation)]
 
+// `alloc` is only required by the test build (heap-backed CSpace stub +
+// `nonnull_from_box` test helper). Production has no `GlobalAlloc`.
+#[cfg(test)]
 extern crate alloc;
 
 #[cfg(test)]
@@ -195,6 +198,33 @@ pub fn lookup_cspace(id: CSpaceId) -> Option<*mut CSpace>
 /// Called by `SYS_CAP_CREATE_CSPACE` when creating new `CSpace` objects at
 /// runtime. The root `CSpace` is assigned ID 0 at init time via this same
 /// counter.
+/// Sum [`FrameObject::available_bytes`] across every [`CapTag::Frame`] cap
+/// in `cspace`. Used by Phase 9 to print the boot-handover ledger so that
+/// "RAM granted to userspace as retypable bytes" can be reconciled against
+/// the buddy/SEED bookkeeping over time.
+///
+/// Must be called single-threaded with no concurrent retype/dealloc.
+#[cfg(not(test))]
+#[must_use]
+pub fn sum_frame_available_bytes(cspace: &cspace::CSpace) -> u64
+{
+    use core::sync::atomic::Ordering;
+    let mut sum: u64 = 0;
+    cspace.for_each_object(|obj_nn| {
+        // SAFETY: for_each_object yields live KernelObjectHeader pointers.
+        let obj_type = unsafe { obj_nn.as_ref().obj_type };
+        if obj_type == object::ObjectType::Frame
+        {
+            // cast_ptr_alignment: header at offset 0; FrameObject is repr(C).
+            #[allow(clippy::cast_ptr_alignment)]
+            // SAFETY: obj_type confirms FrameObject layout; pointer live.
+            let frame = unsafe { &*obj_nn.as_ptr().cast::<object::FrameObject>() };
+            sum += frame.available_bytes.load(Ordering::Acquire);
+        }
+    });
+    sum
+}
+
 pub fn alloc_cspace_id() -> CSpaceId
 {
     NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed)
@@ -352,6 +382,16 @@ pub(crate) type RamBlock = (u64, u64);
 #[cfg(not(test))]
 pub(crate) const MAX_DRAIN_BLOCKS: usize = 4096;
 
+/// Backing storage for the buddy drain in [`drain_and_install_seed`] and
+/// the per-block (base, size) results consumed by [`populate_cspace`].
+/// Lives in BSS so the kernel never grows the heap during Phase 7. Cost:
+/// 4096 × 16 B (`RamBlock`) + 4096 × 16 B (`(u64, usize)` order tuple) ≈ 128 KiB.
+#[cfg(not(test))]
+static mut DRAIN_ORDER_BUF: [(u64, usize); MAX_DRAIN_BLOCKS] = [(0u64, 0usize); MAX_DRAIN_BLOCKS];
+
+#[cfg(not(test))]
+static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_DRAIN_BLOCKS];
+
 /// Drain user-cap RAM from the buddy and install [`SEED_FRAME`] over the
 /// largest drained block, reserving its first [`SEED_RESERVE_BYTES`] for
 /// kernel-internal cap-identity storage. Returns the per-block
@@ -374,9 +414,12 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
 
     debug_assert!(out.len() >= MAX_DRAIN_BLOCKS);
 
-    let mut order_buf = alloc::vec![(0u64, 0usize); MAX_DRAIN_BLOCKS];
+    // SAFETY: single-threaded Phase 7; DRAIN_ORDER_BUF is exclusively
+    // used by this call.
+    let order_buf: &mut [(u64, usize); MAX_DRAIN_BLOCKS] =
+        unsafe { &mut *core::ptr::addr_of_mut!(DRAIN_ORDER_BUF) };
     let block_count = crate::mm::with_frame_allocator(|alloc| {
-        alloc.drain_for_usercaps(KERNEL_RESERVE_PAGES, &mut order_buf)
+        alloc.drain_for_usercaps(KERNEL_RESERVE_PAGES, order_buf)
     });
 
     if block_count == 0
@@ -683,8 +726,89 @@ pub struct CSpaceLayout
     pub dtb_frame_slot: u32,
     /// Total number of populated slots.
     pub total_populated: usize,
-    /// Per-capability descriptors for all populated slots.
-    pub descriptors: alloc::vec::Vec<CapDescriptor>,
+    /// Number of valid entries in the global [`CSPACE_LAYOUT_DESCRIPTORS`]
+    /// buffer for this layout. Use [`descriptors`] to obtain the slice.
+    pub descriptor_count: usize,
+}
+
+/// Capacity of the [`CSPACE_LAYOUT_DESCRIPTORS`] backing buffer. Bounded
+/// by every cap kind minted at boot:
+/// - [`MAX_DRAIN_BLOCKS`] RAM Frame caps (worst case from the buddy drain).
+/// - ~32 hardware caps (MMIO + IRQ + `IoPortRange`/`SbiControl` + `SchedControl`).
+/// - 8 ACPI region caps (`MAX_ACPI_REGIONS`), 1 ACPI RSDP, 1 DTB.
+/// - ~8 init segment caps + ~16 boot module caps.
+///
+/// `4096 + 64 = 4160` covers the worst case with headroom; BSS cost is
+/// 4160 × 24 B ≈ 100 KiB, comfortably small relative to total system RAM.
+pub const CSPACE_LAYOUT_MAX_DESCRIPTORS: usize = 4096 + 64;
+
+/// Backing storage for [`CSpaceLayout::descriptor_count`]. `static mut`
+/// because [`populate_cspace`] writes entries during single-threaded
+/// Phase 7, and Phase 9 reads them as `&[CapDescriptor]` to build the
+/// `InitInfo` page. After hand-off init owns its `InitInfo` copy and
+/// the kernel never re-reads this buffer.
+#[cfg(not(test))]
+pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESCRIPTORS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const VACANT: CapDescriptor = CapDescriptor {
+        slot: 0,
+        cap_type: init_protocol::CapType::Frame,
+        pad: [0; 3],
+        aux0: 0,
+        aux1: 0,
+    };
+    [VACANT; CSPACE_LAYOUT_MAX_DESCRIPTORS]
+};
+
+/// Test-build duplicate so test code can reference the symbol unconditionally.
+#[cfg(test)]
+pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESCRIPTORS] =
+    [CapDescriptor {
+        slot: 0,
+        cap_type: init_protocol::CapType::Frame,
+        pad: [0; 3],
+        aux0: 0,
+        aux1: 0,
+    }; CSPACE_LAYOUT_MAX_DESCRIPTORS];
+
+/// Borrow the descriptor slice for the supplied [`CSpaceLayout`].
+///
+/// Returns the first `layout.descriptor_count` entries of the global
+/// [`CSPACE_LAYOUT_DESCRIPTORS`] buffer.
+///
+/// # Safety
+/// `layout.descriptor_count` must reflect the entries written by the
+/// `populate_cspace` / `mint_module_frame_caps` pass that produced
+/// `layout`. Single-threaded boot guarantees no concurrent writer.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn descriptors(layout: &CSpaceLayout) -> &'static [CapDescriptor]
+{
+    debug_assert!(layout.descriptor_count <= CSPACE_LAYOUT_MAX_DESCRIPTORS);
+    // SAFETY: see function-level doc; single-threaded boot read of
+    // CSPACE_LAYOUT_DESCRIPTORS, no writer can race. The intermediate
+    // shared reference to the static array is taken explicitly to satisfy
+    // the `dangerous_implicit_autorefs` lint.
+    let p = core::ptr::addr_of!(CSPACE_LAYOUT_DESCRIPTORS);
+    // SAFETY: `p` is the address of a valid 'static array; single-threaded
+    // boot read with no concurrent writer.
+    let arr_ref: &[CapDescriptor; CSPACE_LAYOUT_MAX_DESCRIPTORS] = unsafe { &*p };
+    &arr_ref[..layout.descriptor_count]
+}
+
+/// Append a `CapDescriptor` to the global buffer and bump `descriptor_count`.
+/// Calls [`crate::fatal`] if the buffer is full.
+fn push_descriptor(count: &mut usize, desc: CapDescriptor)
+{
+    if *count >= CSPACE_LAYOUT_MAX_DESCRIPTORS
+    {
+        crate::fatal("cap: CSPACE_LAYOUT_DESCRIPTORS buffer exhausted");
+    }
+    // SAFETY: single-threaded boot; `count` is the only writer index.
+    unsafe {
+        let p = core::ptr::addr_of_mut!(CSPACE_LAYOUT_DESCRIPTORS);
+        (*p)[*count] = desc;
+    }
+    *count += 1;
 }
 
 /// Initialise the capability system and populate the root `CSpace.`
@@ -734,10 +858,13 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
     // 5. Stash the root CSpace pointer; Phase 9 hands it to init.
     #[cfg(not(test))]
     {
-        let mut ram_blocks: alloc::vec::Vec<RamBlock> = alloc::vec![(0u64, 0u64); MAX_DRAIN_BLOCKS];
+        // SAFETY: single-threaded Phase 7; DRAIN_RAM_BLOCKS is exclusively
+        // used by this call.
+        let ram_buf: &mut [RamBlock; MAX_DRAIN_BLOCKS] =
+            unsafe { &mut *core::ptr::addr_of_mut!(DRAIN_RAM_BLOCKS) };
         // SAFETY: first call; single-threaded Phase 7.
-        let block_count = unsafe { drain_and_install_seed(&mut ram_blocks) };
-        ram_blocks.truncate(block_count);
+        let block_count = unsafe { drain_and_install_seed(ram_buf) };
+        let ram_blocks: &[RamBlock] = &ram_buf[..block_count];
 
         let id = NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
         // SAFETY: SEED installed above.
@@ -754,7 +881,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         // SAFETY: cs_ptr is freshly constructed and exclusively owned
         // (single-threaded Phase 7).
         let cspace = unsafe { &mut *cs_ptr };
-        let mut layout = populate_cspace(cspace, &ram_blocks, mmap, mmio_apertures, info);
+        let mut layout = populate_cspace(cspace, ram_blocks, mmap, mmio_apertures, info);
         mint_module_frame_caps(cspace, info, &mut layout);
 
         // SAFETY: single-threaded boot; ROOT_CSPACE not yet observed.
@@ -817,7 +944,9 @@ fn populate_cspace(
     /// memory maps exhausting the `CSpace`.
     const MAX_ACPI_REGIONS: usize = 8;
 
-    let mut descriptors = alloc::vec::Vec::new();
+    // Descriptor entries land in the global CSPACE_LAYOUT_DESCRIPTORS
+    // buffer; this counter tracks how many have been written.
+    let mut desc_count: usize = 0;
 
     // Usable physical memory → Frame caps with MAP | WRITE | EXECUTE.
     // Init is root authority; it holds the full right set for each frame.
@@ -874,13 +1003,16 @@ fn populate_cspace(
             {
                 memory_frame_base = slot;
             }
-            descriptors.push(CapDescriptor {
-                slot,
-                cap_type: CapType::Frame,
-                pad: [0; 3],
-                aux0: cap_base,
-                aux1: cap_size,
-            });
+            push_descriptor(
+                &mut desc_count,
+                CapDescriptor {
+                    slot,
+                    cap_type: CapType::Frame,
+                    pad: [0; 3],
+                    aux0: cap_base,
+                    aux1: cap_size,
+                },
+            );
             memory_frame_count += 1;
         }
 
@@ -925,13 +1057,16 @@ fn populate_cspace(
         {
             memory_frame_base = slot;
         }
-        descriptors.push(CapDescriptor {
-            slot,
-            cap_type: CapType::Frame,
-            pad: [0; 3],
-            aux0: entry.physical_base,
-            aux1: entry.size,
-        });
+        push_descriptor(
+            &mut desc_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::Frame,
+                pad: [0; 3],
+                aux0: entry.physical_base,
+                aux1: entry.size,
+            },
+        );
         memory_frame_count += 1;
     }
 
@@ -971,13 +1106,16 @@ fn populate_cspace(
             hw_cap_base = slot;
         }
         hw_cap_count += 1;
-        descriptors.push(CapDescriptor {
-            slot,
-            cap_type: CapType::MmioRegion,
-            pad: [0; 3],
-            aux0: uart_base,
-            aux1: uart_size,
-        });
+        push_descriptor(
+            &mut desc_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::MmioRegion,
+                pad: [0; 3],
+                aux0: uart_base,
+                aux1: uart_size,
+            },
+        );
     }
 
     for ap in mmio_apertures
@@ -1000,13 +1138,16 @@ fn populate_cspace(
         {
             hw_cap_base = slot;
         }
-        descriptors.push(CapDescriptor {
-            slot,
-            cap_type: CapType::MmioRegion,
-            pad: [0; 3],
-            aux0: ap.phys_base,
-            aux1: ap.size,
-        });
+        push_descriptor(
+            &mut desc_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::MmioRegion,
+                pad: [0; 3],
+                aux0: ap.phys_base,
+                aux1: ap.size,
+            },
+        );
         hw_cap_count += 1;
     }
 
@@ -1021,13 +1162,16 @@ fn populate_cspace(
         ptr,
         "Phase 7: cannot allocate SchedControl capability",
     );
-    descriptors.push(CapDescriptor {
-        slot: sched_control_slot,
-        cap_type: CapType::SchedControl,
-        pad: [0; 3],
-        aux0: 0,
-        aux1: 0,
-    });
+    push_descriptor(
+        &mut desc_count,
+        CapDescriptor {
+            slot: sched_control_slot,
+            cap_type: CapType::SchedControl,
+            pad: [0; 3],
+            aux0: 0,
+            aux1: 0,
+        },
+    );
 
     // Root Interrupt range capability — covers every valid IRQ source on
     // this arch. Userspace narrows it to single-IRQ children via
@@ -1049,13 +1193,16 @@ fn populate_cspace(
         irq_ptr,
         "Phase 7: cannot allocate root Interrupt range capability",
     );
-    descriptors.push(CapDescriptor {
-        slot: irq_range_slot,
-        cap_type: CapType::Interrupt,
-        pad: [0; 3],
-        aux0: 0,
-        aux1: u64::from(ROOT_IRQ_COUNT),
-    });
+    push_descriptor(
+        &mut desc_count,
+        CapDescriptor {
+            slot: irq_range_slot,
+            cap_type: CapType::Interrupt,
+            pad: [0; 3],
+            aux0: 0,
+            aux1: u64::from(ROOT_IRQ_COUNT),
+        },
+    );
 
     // Read-only Frame caps covering each AcpiReclaimable region. userspace
     // parses XSDT / MADT / MCFG through these. Capped by `MAX_ACPI_REGIONS`
@@ -1104,13 +1251,16 @@ fn populate_cspace(
         {
             acpi_region_frame_base = slot;
         }
-        descriptors.push(CapDescriptor {
-            slot,
-            cap_type: CapType::Frame,
-            pad: [0; 3],
-            aux0: entry.physical_base,
-            aux1: size,
-        });
+        push_descriptor(
+            &mut desc_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::Frame,
+                pad: [0; 3],
+                aux0: entry.physical_base,
+                aux1: size,
+            },
+        );
         acpi_region_frame_count += 1;
     }
 
@@ -1141,13 +1291,16 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate Frame capability for ACPI RSDP page",
         );
-        descriptors.push(CapDescriptor {
-            slot,
-            cap_type: CapType::Frame,
-            pad: [0; 3],
-            aux0: info.acpi_rsdp,
-            aux1: 0x1000,
-        });
+        push_descriptor(
+            &mut desc_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::Frame,
+                pad: [0; 3],
+                aux0: info.acpi_rsdp,
+                aux1: 0x1000,
+            },
+        );
         slot
     }
     else
@@ -1181,13 +1334,16 @@ fn populate_cspace(
                 ptr,
                 "Phase 7: cannot allocate Frame capability for DTB blob",
             );
-            descriptors.push(CapDescriptor {
-                slot,
-                cap_type: CapType::Frame,
-                pad: [0; 3],
-                aux0: info.device_tree & !0xFFF,
-                aux1: rounded,
-            });
+            push_descriptor(
+                &mut desc_count,
+                CapDescriptor {
+                    slot,
+                    cap_type: CapType::Frame,
+                    pad: [0; 3],
+                    aux0: info.device_tree & !0xFFF,
+                    aux1: rounded,
+                },
+            );
             slot
         }
         else
@@ -1218,13 +1374,16 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate root IoPortRange capability",
         );
-        descriptors.push(CapDescriptor {
-            slot: ioport_root_slot,
-            cap_type: CapType::IoPortRange,
-            pad: [0; 3],
-            aux0: 0,
-            aux1: 0x10000, // full 64K range
-        });
+        push_descriptor(
+            &mut desc_count,
+            CapDescriptor {
+                slot: ioport_root_slot,
+                cap_type: CapType::IoPortRange,
+                pad: [0; 3],
+                aux0: 0,
+                aux1: 0x10000, // full 64K range
+            },
+        );
     }
 
     // RISC-V: one SbiControl capability — grants authority to forward SBI calls.
@@ -1240,13 +1399,16 @@ fn populate_cspace(
             ptr,
             "Phase 7: cannot allocate SbiControl capability",
         );
-        descriptors.push(CapDescriptor {
-            slot,
-            cap_type: CapType::SbiControl,
-            pad: [0; 3],
-            aux0: 0,
-            aux1: 0,
-        });
+        push_descriptor(
+            &mut desc_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::SbiControl,
+                pad: [0; 3],
+                aux0: 0,
+                aux1: 0,
+            },
+        );
         slot
     };
     #[cfg(not(target_arch = "riscv64"))]
@@ -1267,7 +1429,7 @@ fn populate_cspace(
         acpi_region_frame_count,
         dtb_frame_slot,
         total_populated: cspace.populated_count(),
-        descriptors,
+        descriptor_count: desc_count,
     }
 }
 
@@ -1360,13 +1522,16 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
         {
             base_slot = slot;
         }
-        layout.descriptors.push(CapDescriptor {
-            slot,
-            cap_type: CapType::Frame,
-            pad: [0; 3],
-            aux0: module.physical_base,
-            aux1: module.size,
-        });
+        push_descriptor(
+            &mut layout.descriptor_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::Frame,
+                pad: [0; 3],
+                aux0: module.physical_base,
+                aux1: module.size,
+            },
+        );
         count += 1;
     }
 

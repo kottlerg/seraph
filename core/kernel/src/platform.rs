@@ -18,11 +18,6 @@
 // cast_possible_truncation: u64→usize address arithmetic bounded by platform memory layout.
 #![allow(clippy::cast_possible_truncation)]
 
-#[cfg(not(test))]
-extern crate alloc;
-#[cfg(not(test))]
-use alloc::vec::Vec;
-
 use boot_protocol::{BootInfo, KernelMmio, MemoryMapEntry, MemoryType, MmioAperture};
 use core::cell::UnsafeCell;
 
@@ -82,7 +77,31 @@ pub unsafe fn capture_kernel_mmio(boot_info_phys: u64)
 
 // ── MMIO aperture validation ─────────────────────────────────────────────────
 
-/// Validate MMIO apertures from `BootInfo` and return the accepted list.
+/// Maximum number of MMIO apertures the kernel accepts at boot.
+///
+/// Bounded so the validated-aperture buffer can live in BSS instead of the
+/// kernel heap. Real platforms (UEFI `x86_64` or RISC-V virt) report at most
+/// a handful of apertures (`PCIe` ECAM + a few platform MMIO ranges); 64 is
+/// generous headroom. Apertures beyond this cap are ignored with a
+/// `kprintln` warning.
+pub const MAX_MMIO_APERTURES: usize = 64;
+
+/// Validated apertures: BSS-resident, populated once in Phase 6 by
+/// [`validate_mmio_apertures`] and consumed by Phase 7. The first
+/// `count` entries (returned by `validate_mmio_apertures`) are valid.
+///
+/// `static mut` is written exactly once, single-threaded, during Phase 6.
+#[cfg(not(test))]
+static mut VALIDATED_APERTURES: [MmioAperture; MAX_MMIO_APERTURES] = {
+    const VACANT: MmioAperture = MmioAperture {
+        phys_base: 0,
+        size: 0,
+    };
+    [VACANT; MAX_MMIO_APERTURES]
+};
+
+/// Validate MMIO apertures from `BootInfo` and return them as a static
+/// slice into [`VALIDATED_APERTURES`].
 ///
 /// Re-derives the `BootInfo` reference via `phys_to_virt`, then delegates to
 /// [`validate_apertures_inner`].
@@ -90,23 +109,47 @@ pub unsafe fn capture_kernel_mmio(boot_info_phys: u64)
 /// Fatally halts if:
 /// - `entries` is null with a non-zero count (`BootInfo` corruption).
 /// - The entries slice falls outside Usable/Loaded memory map regions.
-pub fn validate_mmio_apertures(boot_info_phys: u64) -> Vec<MmioAperture>
+///
+/// # Safety
+/// Must be called exactly once during Phase 6, single-threaded.
+#[cfg(not(test))]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn validate_mmio_apertures(boot_info_phys: u64) -> &'static [MmioAperture]
 {
     // SAFETY: boot_info_phys was validated in Phase 0; the direct physical map
     // is active since Phase 3.
     let info: &BootInfo = unsafe { &*(phys_to_virt(boot_info_phys) as *const BootInfo) };
-    validate_apertures_inner(info)
+    // SAFETY: single-threaded Phase 6; VALIDATED_APERTURES not yet aliased.
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(VALIDATED_APERTURES) };
+    let count = validate_apertures_inner(info, buf);
+    // SAFETY: validate_apertures_inner wrote `count` entries; the rest are vacant.
+    let p = core::ptr::addr_of!(VALIDATED_APERTURES);
+    // SAFETY: `p` points at the valid 'static VALIDATED_APERTURES array;
+    // the just-completed write has finished, no other reader is active.
+    let arr_ref: &[MmioAperture; MAX_MMIO_APERTURES] = unsafe { &*p };
+    &arr_ref[..count]
+}
+
+/// Test stub. `kernel_entry` is built in test mode but never executed; this
+/// satisfies the call-site type without exercising any of the production
+/// validation/storage path.
+#[cfg(test)]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe fn validate_mmio_apertures(_boot_info_phys: u64) -> &'static [MmioAperture]
+{
+    &[]
 }
 
 /// Core validation, separated from the entry point for unit-test access.
-fn validate_apertures_inner(info: &BootInfo) -> Vec<MmioAperture>
+/// Returns the number of accepted apertures written to the head of `out`.
+fn validate_apertures_inner(info: &BootInfo, out: &mut [MmioAperture]) -> usize
 {
     let ap = &info.mmio_apertures;
 
     if ap.count == 0
     {
         kprintln!("mmio apertures: 0 validated (0 skipped)");
-        return Vec::new();
+        return 0;
     }
 
     if ap.entries.is_null()
@@ -148,28 +191,45 @@ fn validate_apertures_inner(info: &BootInfo) -> Vec<MmioAperture>
         )
     };
 
-    let mut validated: Vec<MmioAperture> = Vec::with_capacity(ap.count as usize);
+    let mut accepted: usize = 0;
     let mut skip_count: usize = 0;
+    let mut overflow_count: usize = 0;
 
     for (i, entry) in raw.iter().enumerate()
     {
-        if aperture_valid(entry, i)
-        {
-            validated.push(*entry);
-        }
-        else
+        if !aperture_valid(entry, i)
         {
             skip_count += 1;
+            continue;
         }
+        if accepted >= out.len()
+        {
+            overflow_count += 1;
+            continue;
+        }
+        out[accepted] = *entry;
+        accepted += 1;
     }
 
-    kprintln!(
-        "mmio apertures: {} validated ({} skipped)",
-        validated.len(),
-        skip_count
-    );
+    if overflow_count > 0
+    {
+        kprintln!(
+            "mmio apertures: {} validated ({} skipped, {} dropped — exceeded MAX_MMIO_APERTURES)",
+            accepted,
+            skip_count,
+            overflow_count
+        );
+    }
+    else
+    {
+        kprintln!(
+            "mmio apertures: {} validated ({} skipped)",
+            accepted,
+            skip_count
+        );
+    }
 
-    validated
+    accepted
 }
 
 /// Accept an aperture iff its base is page-aligned, its size is non-zero
@@ -311,8 +371,12 @@ mod tests
     fn empty_apertures_returns_empty_vec()
     {
         let info = make_boot_info(&[], &[]);
-        let result = validate_apertures_inner(&info);
-        assert!(result.is_empty());
+        let mut out = [MmioAperture {
+            phys_base: 0,
+            size: 0,
+        }; MAX_MMIO_APERTURES];
+        let count = validate_apertures_inner(&info, &mut out);
+        assert_eq!(count, 0);
     }
 
     #[test]

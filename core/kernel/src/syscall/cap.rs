@@ -20,15 +20,6 @@
 // defined as u32 and always fit. No truncation occurs in practice.
 #![allow(clippy::cast_possible_truncation)]
 
-#[cfg(not(test))]
-// `alloc` and `Box` are needed only by the test stubs (cfg(test) handlers).
-#[cfg(test)]
-extern crate alloc;
-
-#[cfg(not(test))]
-#[cfg(test)]
-use alloc::boxed::Box;
-
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
@@ -1355,15 +1346,29 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         core::num::NonZeroU32::new(slot_idx).ok_or(SyscallError::InvalidCapability)?;
     let root = crate::cap::slot::SlotId::new(cspace_id, slot_idx_nz);
 
-    // Revoke the subtree under the lock; collect objects for deallocation.
+    // Revoke the subtree under the lock; snapshot the dealloc list to a
+    // stack-local array so we can release the lock before calling
+    // `dealloc_object` (which may acquire the frame allocator and other
+    // inner locks — see the safety doc on `dealloc_object`).
+    let mut snapshot: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
+        crate::cap::derivation::MAX_REVOKE_NODES] =
+        [None; crate::cap::derivation::MAX_REVOKE_NODES];
     crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: DERIVATION_LOCK held; root is valid SlotId.
     let objects = unsafe { crate::cap::derivation::revoke_subtree(root) };
+    let snapshot_count = objects.len();
+    debug_assert!(snapshot_count <= crate::cap::derivation::MAX_REVOKE_NODES);
+    snapshot[..snapshot_count].copy_from_slice(objects);
     crate::cap::DERIVATION_LOCK.write_unlock();
 
-    // Dec-ref and free objects outside the lock (may acquire other locks).
-    for obj_ptr in objects
+    // Dec-ref and free objects outside the lock.
+    for entry in &snapshot[..snapshot_count]
     {
+        let Some(obj_ptr) = *entry
+        else
+        {
+            continue;
+        };
         // SAFETY: obj_ptr from revoke_subtree; was a live capability object.
         let remaining = unsafe { (*obj_ptr.as_ptr()).dec_ref() };
         if remaining == 0

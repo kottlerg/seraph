@@ -17,14 +17,11 @@
 // cast_possible_truncation: usize→u32 CPU index and u64→usize address bounded by MAX_CPUS.
 #![allow(clippy::cast_possible_truncation)]
 
-#[cfg(not(test))]
-extern crate alloc;
-
-#[cfg(not(test))]
-use alloc::boxed::Box;
-
 pub mod run_queue;
 pub mod thread;
+
+#[cfg(not(test))]
+use core::mem::MaybeUninit;
 
 use run_queue::PerCpuScheduler;
 use thread::{IpcThreadState, ThreadControlBlock, ThreadState};
@@ -95,6 +92,25 @@ static mut SCHEDULERS: [PerCpuScheduler; MAX_CPUS] = {
         S, S, S, S, S, S, S, S, // 56
         S, S, S, S, S, S, S, S, // 64
     ]
+};
+
+// ── Idle TCB storage ──────────────────────────────────────────────────────────
+
+/// Per-CPU idle [`ThreadControlBlock`]s, in BSS. Slot `cpu_id` is the
+/// idle thread for that CPU. Initialised in [`init`] by writing through
+/// `MaybeUninit::as_mut_ptr` once per active CPU; uninitialised slots
+/// (CPUs beyond the boot count) stay at `MaybeUninit::uninit()` and are
+/// never accessed.
+///
+/// `static mut` is written only at single-threaded `sched::init` time;
+/// thereafter every TCB pointer is owned by its corresponding
+/// `PerCpuScheduler` and accessed only from that CPU (or via the
+/// scheduler's lock).
+#[cfg(not(test))]
+static mut IDLE_TCBS: [MaybeUninit<ThreadControlBlock>; MAX_CPUS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const VACANT: MaybeUninit<ThreadControlBlock> = MaybeUninit::uninit();
+    [VACANT; MAX_CPUS]
 };
 
 // ── Thread ID counter ─────────────────────────────────────────────────────────
@@ -544,35 +560,49 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
             false,
         );
 
-        let tcb = Box::into_raw(Box::new(ThreadControlBlock {
-            state: ThreadState::Running,
-            priority: IDLE_PRIORITY,
-            slice_remaining: 0, // idle threads are never preempted by the timer
-            cpu_affinity: cpu as u32,
-            preferred_cpu: cpu as u32,
-            run_queue_next: None,
-            ipc_state: IpcThreadState::None,
-            ipc_msg: crate::ipc::message::Message::default(),
-            reply_tcb: core::ptr::null_mut(),
-            ipc_wait_next: None,
-            is_user: false,
-            saved_state: saved,
-            kernel_stack_top: stack_top,
-            trap_frame: core::ptr::null_mut(),
-            address_space: core::ptr::null_mut(),
-            cspace: core::ptr::null_mut(),
-            ipc_buffer: 0,
-            wakeup_value: 0,
-            timed_out: false,
-            iopb: core::ptr::null_mut(),
-            blocked_on_object: core::ptr::null_mut(),
-            thread_id: alloc_thread_id(),
-            context_saved: core::sync::atomic::AtomicU32::new(1),
-            death_observers: [thread::DeathObserver::empty(); thread::MAX_DEATH_OBSERVERS],
-            death_observer_count: 0,
-            sleep_deadline: 0,
-            magic: thread::TCB_MAGIC,
-        }));
+        // Initialise this CPU's idle TCB in place inside [`IDLE_TCBS`].
+        // SAFETY: single-threaded boot init; IDLE_TCBS[cpu] is exclusively
+        // owned by this iteration. The slot is MaybeUninit::uninit until
+        // we write through it.
+        let tcb_slot = unsafe { core::ptr::addr_of_mut!(IDLE_TCBS[cpu]) };
+        // SAFETY: tcb_slot is a valid pointer to MaybeUninit<TCB>; reading
+        // through it produces the slot's `as_mut_ptr` which is valid for write.
+        let tcb = unsafe { (*tcb_slot).as_mut_ptr() };
+        // SAFETY: tcb is a valid uninitialized ThreadControlBlock slot.
+        unsafe {
+            core::ptr::write(
+                tcb,
+                ThreadControlBlock {
+                    state: ThreadState::Running,
+                    priority: IDLE_PRIORITY,
+                    slice_remaining: 0,
+                    cpu_affinity: cpu as u32,
+                    preferred_cpu: cpu as u32,
+                    run_queue_next: None,
+                    ipc_state: IpcThreadState::None,
+                    ipc_msg: crate::ipc::message::Message::default(),
+                    reply_tcb: core::ptr::null_mut(),
+                    ipc_wait_next: None,
+                    is_user: false,
+                    saved_state: saved,
+                    kernel_stack_top: stack_top,
+                    trap_frame: core::ptr::null_mut(),
+                    address_space: core::ptr::null_mut(),
+                    cspace: core::ptr::null_mut(),
+                    ipc_buffer: 0,
+                    wakeup_value: 0,
+                    timed_out: false,
+                    iopb: core::ptr::null_mut(),
+                    blocked_on_object: core::ptr::null_mut(),
+                    thread_id: alloc_thread_id(),
+                    context_saved: core::sync::atomic::AtomicU32::new(1),
+                    death_observers: [thread::DeathObserver::empty(); thread::MAX_DEATH_OBSERVERS],
+                    death_observer_count: 0,
+                    sleep_deadline: 0,
+                    magic: thread::TCB_MAGIC,
+                },
+            );
+        }
 
         // 4. Register in per-CPU scheduler.
         // SAFETY: single-threaded boot; SCHEDULERS[cpu] is exclusively owned during init.

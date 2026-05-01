@@ -952,7 +952,11 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 // type's alignment even when stored as KernelObjectHeader*.
 // too_many_lines: structural dispatch over all object types; splitting further
 // would obscure the type hierarchy without reducing complexity.
-#[allow(clippy::cast_ptr_alignment, clippy::too_many_lines)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    clippy::too_many_lines,
+    clippy::items_after_statements
+)]
 #[cfg(not(test))]
 unsafe fn dealloc_object_one(
     ptr: core::ptr::NonNull<KernelObjectHeader>,
@@ -960,8 +964,6 @@ unsafe fn dealloc_object_one(
     head: &mut usize,
 )
 {
-    use alloc::boxed::Box;
-
     /// Push `anc` onto the cascade worklist. Drops the entry on overflow —
     /// see `MAX_CASCADE` in `dealloc_object`. Overflow is unreachable in
     /// practice for the derivation depths this kernel actually produces;
@@ -1017,67 +1019,58 @@ unsafe fn dealloc_object_one(
             }
 
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "Frame: every production cap is retype-backed (Phase-7 SEED, sys_frame_split SEED)"
+            );
+            // Retype-backed body lives inside the ancestor (the seed
+            // Frame). Drop in place, return the body bytes to the
+            // seed's per-Frame allocator, drop the retype-time lease.
+            use crate::cap::retype::retype_free;
+            // SAFETY: ancestor_ptr non-null per debug_assert and 4b invariant.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let offset = body_phys - ancestor_frame.base;
+            // SAFETY: ptr is the in-place FrameObject; refcount 0 — unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<FrameObject>()) };
+            retype_free(
+                ancestor_frame,
+                offset,
+                core::mem::size_of::<FrameObject>() as u64,
+            );
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // Legacy heap path (e.g. sys_frame_split tail children).
-                // SAFETY: ptr originally from Box<FrameObject>::into_raw; header at offset 0.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<FrameObject>())) };
-            }
-            else
-            {
-                // Retype-backed body lives inside the ancestor (the seed
-                // Frame). Drop in place, return the body bytes to the
-                // seed's per-Frame allocator, drop the retype-time lease.
-                use crate::cap::retype::retype_free;
-                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let offset = body_phys - ancestor_frame.base;
-                // SAFETY: ptr is the in-place FrameObject; refcount 0 — unique access.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<FrameObject>()) };
-                retype_free(
-                    ancestor_frame,
-                    offset,
-                    core::mem::size_of::<FrameObject>() as u64,
-                );
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: ancestor_ptr non-null per the outer branch.
-                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: ancestor_ptr non-null.
+                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
         ObjectType::MmioRegion =>
         {
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "MmioRegion: every production cap is retype-backed (Phase-7 SEED, sys_mmio_split SEED)"
+            );
+            use crate::cap::retype::retype_free;
+            // SAFETY: ancestor_ptr non-null per debug_assert and 4b invariant.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let offset = body_phys - ancestor_frame.base;
+            // SAFETY: in-place body; refcount 0 — unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<MmioRegionObject>()) };
+            retype_free(
+                ancestor_frame,
+                offset,
+                core::mem::size_of::<MmioRegionObject>() as u64,
+            );
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // SAFETY: ptr originally from Box<MmioRegionObject>::into_raw; header at offset 0.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<MmioRegionObject>())) };
-            }
-            else
-            {
-                use crate::cap::retype::retype_free;
-                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let offset = body_phys - ancestor_frame.base;
-                // SAFETY: in-place body; refcount 0 — unique access.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<MmioRegionObject>()) };
-                retype_free(
-                    ancestor_frame,
-                    offset,
-                    core::mem::size_of::<MmioRegionObject>() as u64,
-                );
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: ancestor_ptr non-null per the outer branch.
-                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: ancestor_ptr non-null.
+                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
         ObjectType::Interrupt =>
@@ -1104,125 +1097,109 @@ unsafe fn dealloc_object_one(
             }
 
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "Interrupt: every production cap is retype-backed (Phase-7 SEED, sys_irq_split SEED)"
+            );
+            use crate::cap::retype::retype_free;
+            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let offset = body_phys - ancestor_frame.base;
+            // SAFETY: in-place body; refcount 0 — unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<InterruptObject>()) };
+            retype_free(
+                ancestor_frame,
+                offset,
+                core::mem::size_of::<InterruptObject>() as u64,
+            );
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // SAFETY: ptr originally from Box<InterruptObject>::into_raw.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<InterruptObject>())) };
-            }
-            else
-            {
-                use crate::cap::retype::retype_free;
-                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let offset = body_phys - ancestor_frame.base;
-                // SAFETY: in-place body; refcount 0 — unique access.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<InterruptObject>()) };
-                retype_free(
-                    ancestor_frame,
-                    offset,
-                    core::mem::size_of::<InterruptObject>() as u64,
-                );
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: ancestor_ptr non-null per the outer branch.
-                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: ancestor_ptr non-null.
+                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
         ObjectType::IoPortRange =>
         {
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "IoPortRange: every production cap is retype-backed (Phase-7 SEED)"
+            );
+            use crate::cap::retype::retype_free;
+            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let offset = body_phys - ancestor_frame.base;
+            // SAFETY: in-place body; refcount 0 — unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<IoPortRangeObject>()) };
+            retype_free(
+                ancestor_frame,
+                offset,
+                core::mem::size_of::<IoPortRangeObject>() as u64,
+            );
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // SAFETY: ptr originally from Box<IoPortRangeObject>::into_raw; header at offset 0.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<IoPortRangeObject>())) };
-            }
-            else
-            {
-                use crate::cap::retype::retype_free;
-                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let offset = body_phys - ancestor_frame.base;
-                // SAFETY: in-place body; refcount 0 — unique access.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<IoPortRangeObject>()) };
-                retype_free(
-                    ancestor_frame,
-                    offset,
-                    core::mem::size_of::<IoPortRangeObject>() as u64,
-                );
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: ancestor_ptr non-null per the outer branch.
-                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: ancestor_ptr non-null.
+                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
         ObjectType::SchedControl =>
         {
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "SchedControl: every production cap is retype-backed (Phase-7 SEED)"
+            );
+            use crate::cap::retype::retype_free;
+            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let offset = body_phys - ancestor_frame.base;
+            // SAFETY: in-place body; refcount 0 — unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SchedControlObject>()) };
+            retype_free(
+                ancestor_frame,
+                offset,
+                core::mem::size_of::<SchedControlObject>() as u64,
+            );
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // SAFETY: ptr originally from Box<SchedControlObject>::into_raw; header at offset 0.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SchedControlObject>())) };
-            }
-            else
-            {
-                use crate::cap::retype::retype_free;
-                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let offset = body_phys - ancestor_frame.base;
-                // SAFETY: in-place body; refcount 0 — unique access.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SchedControlObject>()) };
-                retype_free(
-                    ancestor_frame,
-                    offset,
-                    core::mem::size_of::<SchedControlObject>() as u64,
-                );
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: ancestor_ptr non-null per the outer branch.
-                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: ancestor_ptr non-null.
+                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
         ObjectType::SbiControl =>
         {
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "SbiControl: every production cap is retype-backed (Phase-7 SEED)"
+            );
+            use crate::cap::retype::retype_free;
+            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let offset = body_phys - ancestor_frame.base;
+            // SAFETY: in-place body; refcount 0 — unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SbiControlObject>()) };
+            retype_free(
+                ancestor_frame,
+                offset,
+                core::mem::size_of::<SbiControlObject>() as u64,
+            );
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // SAFETY: ptr originally from Box<SbiControlObject>::into_raw; header at offset 0.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SbiControlObject>())) };
-            }
-            else
-            {
-                use crate::cap::retype::retype_free;
-                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let offset = body_phys - ancestor_frame.base;
-                // SAFETY: in-place body; refcount 0 — unique access.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SbiControlObject>()) };
-                retype_free(
-                    ancestor_frame,
-                    offset,
-                    core::mem::size_of::<SbiControlObject>() as u64,
-                );
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: ancestor_ptr non-null per the outer branch.
-                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: ancestor_ptr non-null.
+                let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
 
@@ -1237,10 +1214,6 @@ unsafe fn dealloc_object_one(
 
             if !tcb.is_null()
             {
-                // 2^2 = 4 pages; must match KERNEL_STACK_PAGES (sys_cap_create_thread).
-                #[allow(dead_code)]
-                const STACK_ORDER: usize = 2;
-
                 // Remove the TCB from the scheduler's run queue before freeing.
                 // Without this, the scheduler could dequeue a freed TCB pointer
                 // after this cap_delete completes — a use-after-free that
@@ -1410,24 +1383,23 @@ unsafe fn dealloc_object_one(
                     }
                 }
 
-                // For the legacy (heap-backed) path we still hand the
-                // kstack back to the buddy allocator and Box::from_raw the
-                // TCB. The retype-backed path takes neither step — both
-                // the kstack and the TCB live inside the source Frame
-                // cap's slot and are returned together via `retype_free`
-                // after the in-place drops below.
-                if ancestor_ptr.is_null()
+                // x86-64: release the per-thread IOPB to SEED if one was
+                // bound via `sys_iopb_set`. RISC-V threads never set this
+                // field; it stays null and the cleanup is a no-op.
+                #[cfg(target_arch = "x86_64")]
                 {
-                    // SAFETY: tcb validated non-null; kernel_stack_top set at creation.
-                    let kstack_top = unsafe { (*tcb).kernel_stack_top };
-                    let kstack_virt = kstack_top
-                        - (crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE) as u64;
-                    let kstack_phys = crate::mm::paging::virt_to_phys(kstack_virt);
-                    // SAFETY: kstack_phys from buddy allocator; order matches allocation.
-                    unsafe {
-                        crate::mm::with_frame_allocator(|alloc| {
-                            alloc.free(kstack_phys, STACK_ORDER);
-                        });
+                    // SAFETY: tcb validated non-null; iopb field always valid.
+                    let iopb_ptr = unsafe { (*tcb).iopb };
+                    if !iopb_ptr.is_null()
+                    {
+                        crate::cap::retype::free_seed_scratch(
+                            iopb_ptr.cast::<u8>(),
+                            crate::arch::current::gdt::IOPB_SIZE as u64,
+                        );
+                        // SAFETY: tcb validated non-null.
+                        unsafe {
+                            (*tcb).iopb = core::ptr::null_mut();
+                        }
                     }
                 }
 
@@ -1439,55 +1411,43 @@ unsafe fn dealloc_object_one(
                     (*tcb).priority = 0xFF;
                 }
 
-                if ancestor_ptr.is_null()
-                {
-                    // SAFETY: tcb originally from Box::into_raw at thread creation.
-                    unsafe { drop(Box::from_raw(tcb)) };
-                }
-                else
-                {
-                    // SAFETY: tcb lives in-place inside the retype slot;
-                    // refcount has reached 0, no scheduler holds it.
-                    unsafe { core::ptr::drop_in_place(tcb) };
-                }
+                // SAFETY: tcb lives in-place inside the retype slot;
+                // refcount has reached 0, no scheduler holds it.
+                unsafe { core::ptr::drop_in_place(tcb) };
             }
 
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "Thread: every production cap is retype-backed"
+            );
+            use crate::cap::retype::{dispatch_for, retype_free};
+            let raw_bytes = dispatch_for(ObjectType::Thread, 0).map_or(
+                (crate::sched::KERNEL_STACK_PAGES as u64 + 1) * crate::mm::PAGE_SIZE as u64,
+                |e| e.raw_bytes,
+            );
+            // SAFETY: ancestor_ptr non-null per 4b invariant.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            // The wrapper sits one full page above the slot's base,
+            // immediately after the kstack pages.
+            let wrapper_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let kstack_pages_bytes =
+                (crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE) as u64;
+            let block_phys = wrapper_phys - kstack_pages_bytes;
+            let offset = block_phys - ancestor_frame.base;
+
+            // SAFETY: ptr is in-place ThreadObject.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };
+
+            retype_free(ancestor_frame, offset, raw_bytes);
+
+            let ancestor_nn =
+                // SAFETY: ancestor_ptr non-null.
+                unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // SAFETY: ptr originally from Box<ThreadObject>::into_raw.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<ThreadObject>())) };
-            }
-            else
-            {
-                use crate::cap::retype::{dispatch_for, retype_free};
-                let raw_bytes = dispatch_for(ObjectType::Thread, 0).map_or(
-                    (crate::sched::KERNEL_STACK_PAGES as u64 + 1) * crate::mm::PAGE_SIZE as u64,
-                    |e| e.raw_bytes,
-                );
-                // SAFETY: ancestor_ptr non-null per the outer branch.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                // The wrapper sits one full page above the slot's base,
-                // immediately after the kstack pages.
-                let wrapper_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let kstack_pages_bytes =
-                    (crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE) as u64;
-                let block_phys = wrapper_phys - kstack_pages_bytes;
-                let offset = block_phys - ancestor_frame.base;
-
-                // SAFETY: ptr is in-place ThreadObject.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };
-
-                retype_free(ancestor_frame, offset, raw_bytes);
-
-                let ancestor_nn =
-                    // SAFETY: ancestor_ptr non-null.
-                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: refcount reached 0.
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: refcount reached 0.
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
 
@@ -1746,70 +1706,58 @@ unsafe fn dealloc_object_one(
                 }
             }
 
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "Endpoint: every production cap is retype-backed via cap_create_endpoint"
+            );
+            // Wrapper + state live in-place inside the ancestor Frame cap's
+            // region. Drop in place, return the slot to the per-Frame
+            // allocator, then dec_ref the ancestor — recursing if it hits zero.
+            use crate::cap::retype::{dispatch_for, retype_free};
+            // dispatch_for is total over the kernel's retypable types; the
+            // Endpoint arm always returns Some. Unwrap-or-fall-through with
+            // a fallback raw size keeps the lint quiet without panicking.
+            let raw_bytes = dispatch_for(ObjectType::Endpoint, 0).map_or(88, |e| e.raw_bytes);
+
+            // SAFETY: ancestor_ptr is non-null; it was set by `with_ancestor`
+            // at retype time and points at the source FrameObject's header.
+            // The retype primitive holds a +1 refcount on the FrameObject
+            // for the lifetime of every retyped descendant, so the target
+            // is still live.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+
+            let header_virt = ptr.as_ptr() as u64;
+            let header_phys = crate::mm::paging::virt_to_phys(header_virt);
+            let offset = header_phys - ancestor_frame.base;
+
+            // Drop in place. EndpointObject and EndpointState contain only
+            // primitive fields and Spinlock; no Drop impl, but the call is
+            // explicit for clarity and to keep parity with future types
+            // that may require it.
+            if !state.is_null()
             {
-                // Legacy heap path: the wrapper and state are separate Box
-                // allocations.
-                if !state.is_null()
-                {
-                    // SAFETY: state originally from Box::into_raw at endpoint creation.
-                    unsafe { drop(Box::from_raw(state)) };
-                }
-                // SAFETY: ptr originally from Box<EndpointObject>::into_raw.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<EndpointObject>())) };
+                // SAFETY: state points into the ancestor Frame cap region;
+                // refcount reached 0 so we are the unique accessor.
+                unsafe { core::ptr::drop_in_place(state) };
             }
-            else
+            // SAFETY: ptr is the in-place EndpointObject; unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<EndpointObject>()) };
+
+            // Return the bytes to the per-Frame allocator.
+            retype_free(ancestor_frame, offset, raw_bytes);
+
+            // Drop the retype-time refcount lease. If this Frame cap has no
+            // remaining slots and no descendants, recurse to free the cap
+            // itself; the recursion is bounded by ancestor depth.
+            let ancestor_nn =
+                // SAFETY: ancestor_ptr is non-null per debug_assert.
+                unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // Retype path: wrapper + state live in-place inside the
-                // ancestor Frame cap's region. Drop in place (no Box::from_raw),
-                // return the slot to the per-Frame allocator, then dec_ref the
-                // ancestor — recursing if it hits zero.
-                use crate::cap::retype::{dispatch_for, retype_free};
-                // dispatch_for is total over the kernel's retypable types; the
-                // Endpoint arm always returns Some. Unwrap-or-fall-through with
-                // a fallback raw size keeps the lint quiet without panicking.
-                let raw_bytes = dispatch_for(ObjectType::Endpoint, 0).map_or(88, |e| e.raw_bytes);
-
-                // SAFETY: ancestor_ptr is non-null; it was set by `with_ancestor`
-                // at retype time and points at the source FrameObject's header.
-                // The retype primitive holds a +1 refcount on the FrameObject
-                // for the lifetime of every retyped descendant, so the target
-                // is still live.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-
-                let header_virt = ptr.as_ptr() as u64;
-                let header_phys = crate::mm::paging::virt_to_phys(header_virt);
-                let offset = header_phys - ancestor_frame.base;
-
-                // Drop in place. EndpointObject and EndpointState contain only
-                // primitive fields and Spinlock; no Drop impl, but the call is
-                // explicit for clarity and to keep parity with future types
-                // that may require it.
-                if !state.is_null()
-                {
-                    // SAFETY: state points into the ancestor Frame cap region;
-                    // refcount reached 0 so we are the unique accessor.
-                    unsafe { core::ptr::drop_in_place(state) };
-                }
-                // SAFETY: ptr is the in-place EndpointObject; unique access.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<EndpointObject>()) };
-
-                // Return the bytes to the per-Frame allocator.
-                retype_free(ancestor_frame, offset, raw_bytes);
-
-                // Drop the retype-time refcount lease. If this Frame cap has no
-                // remaining slots and no descendants, recurse to free the cap
-                // itself; the recursion is bounded by ancestor depth.
-                let ancestor_nn =
-                    // SAFETY: ancestor_ptr is non-null per the outer branch.
-                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: refcount reached 0; recursion handles the Frame
-                    // arm above (which frees the buddy pages and Box).
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: refcount reached 0; recursion handles the Frame
+                // arm above (which frees the buddy pages and Box).
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
 
@@ -1872,53 +1820,43 @@ unsafe fn dealloc_object_one(
                 }
             }
 
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "Signal: every production cap is retype-backed via cap_create_signal"
+            );
+            // Wrapper + state are in-place inside the ancestor Frame cap's
+            // region.
+            use crate::cap::retype::{dispatch_for, retype_free};
+            let raw_bytes = dispatch_for(ObjectType::Signal, 0).map_or(120, |e| e.raw_bytes);
+
+            // SAFETY: ancestor_ptr is non-null per debug_assert; the
+            // FrameObject is kept alive by the retype-time refcount lease.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+
+            let header_virt = ptr.as_ptr() as u64;
+            let header_phys = crate::mm::paging::virt_to_phys(header_virt);
+            let offset = header_phys - ancestor_frame.base;
+
+            if !state.is_null()
             {
-                // Legacy heap path.
-                if !state.is_null()
-                {
-                    // SAFETY: state originally from Box::into_raw at creation.
-                    unsafe { drop(Box::from_raw(state)) };
-                }
-                // SAFETY: ptr originally from Box<SignalObject>::into_raw.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SignalObject>())) };
+                // SAFETY: state lives in-place inside the ancestor Frame
+                // cap; refcount reached 0 — unique accessor.
+                unsafe { core::ptr::drop_in_place(state) };
             }
-            else
+            // SAFETY: ptr is the in-place SignalObject; unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SignalObject>()) };
+
+            retype_free(ancestor_frame, offset, raw_bytes);
+
+            // Drop the retype-time refcount lease; recurse on full release.
+            let ancestor_nn =
+                // SAFETY: ancestor_ptr non-null.
+                unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                // Retype path: wrapper + state are in-place inside the ancestor
-                // Frame cap's region.
-                use crate::cap::retype::{dispatch_for, retype_free};
-                let raw_bytes = dispatch_for(ObjectType::Signal, 0).map_or(120, |e| e.raw_bytes);
-
-                // SAFETY: ancestor_ptr is non-null, set by `with_ancestor`; the
-                // FrameObject is kept alive by the retype-time refcount lease.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-
-                let header_virt = ptr.as_ptr() as u64;
-                let header_phys = crate::mm::paging::virt_to_phys(header_virt);
-                let offset = header_phys - ancestor_frame.base;
-
-                if !state.is_null()
-                {
-                    // SAFETY: state lives in-place inside the ancestor Frame
-                    // cap; refcount reached 0 — unique accessor.
-                    unsafe { core::ptr::drop_in_place(state) };
-                }
-                // SAFETY: ptr is the in-place SignalObject; unique access.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SignalObject>()) };
-
-                retype_free(ancestor_frame, offset, raw_bytes);
-
-                // Drop the retype-time refcount lease; recurse on full release.
-                let ancestor_nn =
-                    // SAFETY: ancestor_ptr non-null per the outer branch.
-                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: refcount reached 0; recurse to free the Frame.
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: refcount reached 0; recurse to free the Frame.
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
 
@@ -1966,39 +1904,35 @@ unsafe fn dealloc_object_one(
                 unsafe { crate::ipc::event_queue::event_queue_drop(state) };
             }
 
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "EventQueue: every production cap is retype-backed via cap_create_event_queue"
+            );
+            use crate::cap::retype::{event_queue_raw_bytes, retype_free};
+            let raw_bytes = event_queue_raw_bytes(u64::from(capacity));
+            // SAFETY: ancestor_ptr non-null.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let offset = header_phys - ancestor_frame.base;
+
+            if !state.is_null()
             {
-                // SAFETY: ptr originally from Box<EventQueueObject>::into_raw.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<EventQueueObject>())) };
+                // SAFETY: state lives in-place; refcount reached 0.
+                unsafe { core::ptr::drop_in_place(state) };
             }
-            else
+            // SAFETY: ptr is in-place EventQueueObject.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<EventQueueObject>()) };
+
+            retype_free(ancestor_frame, offset, raw_bytes);
+
+            let ancestor_nn =
+                // SAFETY: ancestor_ptr non-null.
+                unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
             {
-                use crate::cap::retype::{event_queue_raw_bytes, retype_free};
-                let raw_bytes = event_queue_raw_bytes(u64::from(capacity));
-                // SAFETY: ancestor_ptr non-null per the outer branch.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let offset = header_phys - ancestor_frame.base;
-
-                if !state.is_null()
-                {
-                    // SAFETY: state lives in-place; refcount reached 0.
-                    unsafe { core::ptr::drop_in_place(state) };
-                }
-                // SAFETY: ptr is in-place EventQueueObject.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<EventQueueObject>()) };
-
-                retype_free(ancestor_frame, offset, raw_bytes);
-
-                let ancestor_nn =
-                    // SAFETY: ancestor_ptr non-null.
-                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: refcount reached 0.
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                // SAFETY: refcount reached 0.
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
 
@@ -2019,40 +1953,36 @@ unsafe fn dealloc_object_one(
                 unsafe { crate::ipc::wait_set::wait_set_drop(state) };
             }
 
-            if ancestor_ptr.is_null()
+            debug_assert!(
+                !ancestor_ptr.is_null(),
+                "WaitSet: every production cap is retype-backed via cap_create_wait_set"
+            );
+            use crate::cap::retype::{dispatch_for, retype_free};
+            let raw_bytes = dispatch_for(ObjectType::WaitSet, 0)
+                .map_or(crate::mm::PAGE_SIZE as u64, |e| e.raw_bytes);
+            // SAFETY: ancestor_ptr non-null.
+            let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+            let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+            let offset = header_phys - ancestor_frame.base;
+
+            if !state.is_null()
             {
-                // SAFETY: ptr originally from Box<WaitSetObject>::into_raw.
-                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<WaitSetObject>())) };
+                // SAFETY: state lives in-place.
+                unsafe { core::ptr::drop_in_place(state) };
             }
-            else
-            {
-                use crate::cap::retype::{dispatch_for, retype_free};
-                let raw_bytes = dispatch_for(ObjectType::WaitSet, 0)
-                    .map_or(crate::mm::PAGE_SIZE as u64, |e| e.raw_bytes);
+            // SAFETY: ptr is in-place WaitSetObject.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<WaitSetObject>()) };
+
+            retype_free(ancestor_frame, offset, raw_bytes);
+
+            let ancestor_nn =
                 // SAFETY: ancestor_ptr non-null.
-                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
-                let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-                let offset = header_phys - ancestor_frame.base;
-
-                if !state.is_null()
-                {
-                    // SAFETY: state lives in-place.
-                    unsafe { core::ptr::drop_in_place(state) };
-                }
-                // SAFETY: ptr is in-place WaitSetObject.
-                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<WaitSetObject>()) };
-
-                retype_free(ancestor_frame, offset, raw_bytes);
-
-                let ancestor_nn =
-                    // SAFETY: ancestor_ptr non-null.
-                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-                let new_rc = ancestor_frame.header.dec_ref();
-                if new_rc == 0
-                {
-                    // SAFETY: refcount reached 0.
-                    push_ancestor(worklist, head, ancestor_nn);
-                }
+                unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+            let new_rc = ancestor_frame.header.dec_ref();
+            if new_rc == 0
+            {
+                // SAFETY: refcount reached 0.
+                push_ancestor(worklist, head, ancestor_nn);
             }
         }
     }

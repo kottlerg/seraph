@@ -19,9 +19,6 @@
 //! 2. Add a handler function in the appropriate `syscall/` submodule.
 //! 3. Add a `match` arm in `dispatch` below.
 
-#[cfg(not(test))]
-extern crate alloc;
-
 pub mod cap;
 pub mod hw;
 pub mod ipc;

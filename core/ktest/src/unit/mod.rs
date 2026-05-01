@@ -11,21 +11,24 @@
 //! to the appropriate file.
 //!
 //! Files:
-//! - `cap.rs`     — capability creation, copy, move, insert, derive, revoke, delete
-//! - `mm.rs`      — memory map/unmap/protect, frame split, address space query
-//! - `signal.rs`  — signal send and wait
-//! - `event.rs`   — event queue post and receive
-//! - `wait_set.rs`— wait set add, remove, wait
-//! - `ipc.rs`     — IPC call, reply, recv, buffer set
-//! - `thread.rs`  — thread lifecycle, register read/write, priority, affinity
-//! - `hw.rs`      — MMIO, IRQ, I/O ports
-//! - `sysinfo.rs` — system info queries and debug log
+//! - `cap.rs`      — capability creation, copy, move, insert, derive, revoke, delete
+//! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
+//! - `mm.rs`       — memory map/unmap/protect, frame split, address space query
+//! - `signal.rs`   — signal send and wait
+//! - `event.rs`    — event queue post and receive
+//! - `wait_set.rs` — wait set add, remove, wait
+//! - `ipc.rs`      — IPC call, reply, recv, buffer set
+//! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity
+//! - `hw.rs`       — MMIO, IRQ, I/O ports
+//! - `sysinfo.rs`  — system info queries and debug log
 
 pub mod cap;
+pub mod cap_info;
 pub mod event;
 pub mod hw;
 pub mod ipc;
 pub mod mm;
+pub mod retype;
 pub mod signal;
 pub mod sysinfo;
 pub mod thread;
@@ -95,6 +98,60 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "cap::derive_token_on_signal",
         cap::derive_token_on_signal(ctx)
+    );
+
+    // ── Capability inspection (SYS_CAP_INFO) ──────────────────────────────────
+    run_test!(
+        "cap_info::tag_rights_aspace",
+        cap_info::tag_rights_aspace(ctx)
+    );
+    run_test!(
+        "cap_info::tag_rights_frame",
+        cap_info::tag_rights_frame(ctx)
+    );
+    run_test!(
+        "cap_info::tag_rights_signal",
+        cap_info::tag_rights_signal(ctx)
+    );
+    run_test!("cap_info::frame_fields", cap_info::frame_fields(ctx));
+    run_test!(
+        "cap_info::frame_caps_carry_retype_right",
+        cap_info::frame_caps_carry_retype_right(ctx)
+    );
+    run_test!("cap_info::cspace_fields", cap_info::cspace_fields(ctx));
+    run_test!(
+        "cap_info::null_slot_invalid",
+        cap_info::null_slot_invalid(ctx)
+    );
+    run_test!(
+        "cap_info::tag_mismatch_invalid_arg",
+        cap_info::tag_mismatch_invalid_arg(ctx)
+    );
+    run_test!(
+        "cap_info::unknown_field_invalid_arg",
+        cap_info::unknown_field_invalid_arg(ctx)
+    );
+
+    // ── Retype primitive (augment, budget exhaustion, deep PT walk) ──────────
+    run_test!(
+        "retype::aspace_augment_grows_budget",
+        retype::aspace_augment_grows_budget(ctx)
+    );
+    run_test!(
+        "retype::cspace_augment_grows_budget",
+        retype::cspace_augment_grows_budget(ctx)
+    );
+    run_test!(
+        "retype::pt_budget_exhaustion_returns_oom",
+        retype::pt_budget_exhaustion_returns_oom(ctx)
+    );
+    run_test!(
+        "retype::deep_pt_walk_consumes_pool",
+        retype::deep_pt_walk_consumes_pool(ctx)
+    );
+    run_test!(
+        "retype::cspace_grow_consumes_pool",
+        retype::cspace_grow_consumes_pool(ctx)
     );
 
     // ── Memory management syscalls ────────────────────────────────────────────

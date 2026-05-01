@@ -387,6 +387,10 @@ pub extern "C" fn _start() -> ! {
             );
             syscall::thread_exit();
         }
+        // Wire the object-slab refill path against the same memmgr endpoint.
+        // Cap-create syscalls retype memory out of a slab Frame cap acquired
+        // lazily on first use.
+        pal_alloc::object_slab_init(info.memmgr_endpoint_cap);
     }
 
     unsafe extern "C" {
@@ -449,6 +453,21 @@ pub fn heap_is_initialized() -> bool {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn abort_thread() -> ! {
     pal_alloc::abort_thread()
+}
+
+/// Return a Frame-cap slot suitable as the source for a `cap_create_*`
+/// retype, with at least `min_bytes` of `available_bytes`.
+///
+/// `min_bytes` is the raw byte cost of the kernel object the caller is
+/// about to create (e.g. 88 for `Endpoint`); the runtime rounds up to the
+/// kernel's size-class granularity and debits a per-process local ledger.
+/// The returned slot is reused across calls until exhausted, at which
+/// point a fresh slab page is fetched from memmgr.
+///
+/// Returns `None` if memmgr is unreachable or refuses the request.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
+    pal_alloc::object_slab_acquire(min_bytes)
 }
 
 // ── Page-reservation allocator ──────────────────────────────────────────────

@@ -36,7 +36,7 @@ use std::os::seraph::startup_info;
 ///            `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time.
 ///            Zero means no log endpoint is available yet; children
 ///            born in that window receive zero and silent-drop
-///            `seraph::log!`.
+///            `std::os::seraph::log!`.
 struct InitBootstrap
 {
     service_ep: u32,
@@ -89,12 +89,27 @@ fn main() -> !
     let mut table = process::ProcessTable::new();
     let mut recent = process::RecentExits::new();
 
-    let Ok(death_eq) = syscall::event_queue_create((process::MAX_PROCESSES as u32) * 2)
+    // Death-EQ inline slot (matches `cap::retype::event_queue_raw_bytes`):
+    // 24 wrapper + 56 state + (capacity + 1) * 8 ring bytes. Capacity is
+    // `MAX_PROCESSES * 2` to absorb a simultaneous-crash burst without
+    // dropping notifications between drain calls.
+    let death_eq_slab_bytes: u64 = 24 + 56 + ((process::MAX_PROCESSES as u64 * 2) + 1) * 8;
+    let Some(eq_slab) = std::os::seraph::object_slab_acquire(death_eq_slab_bytes)
     else
     {
         syscall::thread_exit();
     };
-    let Ok(ws_cap) = syscall::wait_set_create()
+    let Ok(death_eq) = syscall::event_queue_create(eq_slab, (process::MAX_PROCESSES as u32) * 2)
+    else
+    {
+        syscall::thread_exit();
+    };
+    let Some(ws_slab) = std::os::seraph::object_slab_acquire(4096)
+    else
+    {
+        syscall::thread_exit();
+    };
+    let Ok(ws_cap) = syscall::wait_set_create(ws_slab)
     else
     {
         syscall::thread_exit();
@@ -152,6 +167,33 @@ fn main() -> !
 const WS_TOKEN_SERVICE: u64 = 0;
 /// `WaitSet` token for procmgr's shared death event queue.
 const WS_TOKEN_DEATH: u64 = 1;
+
+/// Pages requested from memmgr per spawned child for the child's Thread
+/// retype slab. The kernel consumes `KERNEL_STACK_PAGES + 1 = 5` pages
+/// (4 kstack + 1 wrapper/TCB) plus a small one-time per-`FrameObject`
+/// allocator metadata footprint; one extra page is included so the
+/// retype's `available_bytes >= raw_bytes` check passes after that
+/// metadata debit.
+pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
+
+/// Pages requested from memmgr for the child's `AddressSpace` retype slab.
+/// Page 0 becomes the root PT; the remaining pages form the initial PT
+/// growth pool. The +1 covers the ~64 B per-Frame allocator metadata
+/// footprint debited at the first retype.
+///
+/// Sized to cover the typical small-process mapping pattern: 3-6 LOAD
+/// segments + stack + IPC buffer + TLS + `ProcessInfo` frame. Each
+/// distinct user VA region whose PT entry isn't already populated
+/// consumes up to 3 intermediate PT pages (PDPT/PD/PT on x86-64).
+/// Larger processes refill via augment-mode `cap_create_aspace`.
+pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
+
+/// Pages requested from memmgr for the child's `CSpace` retype slab.
+/// Each slot page holds 64 capability slots (3584 B); the +1 covers the
+/// per-Frame allocator metadata footprint. Larger `CSpace`s refill via
+/// augment-mode `cap_create_cspace`. Five pages → 4 slot pages → 256
+/// slots covers a small driver's lifetime.
+pub(crate) const CSPACE_RETYPE_PAGES: u64 = 5;
 
 /// Register a new child with memmgr. On success returns
 /// `(memmgr_send_cap_slot, memmgr_token)`. On any failure (memmgr
@@ -224,6 +266,54 @@ pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
         return None;
     }
     reply.caps().first().copied()
+}
+
+/// Allocate exactly `pages` contiguous pages from `memmgr_send` as a
+/// single Frame cap. Returns the cap slot in procmgr's `CSpace`, or
+/// `None` on any failure (memmgr unwired, OOM, fragmented reply).
+///
+/// Used to back kernel-object retypes whose source Frame cap must be
+/// contiguous (e.g. `Thread`, `AddressSpace`, `CSpace`). Unlike
+/// `memmgr_alloc_page`, this rejects multi-cap replies and any cap
+/// whose declared `page_count` does not equal `pages` — retypes
+/// require one contiguous span and must not silently accept a smaller
+/// cap.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn memmgr_alloc_pages_contig(memmgr_send: u32, pages: u64, ipc_buf: *mut u64) -> Option<u32>
+{
+    if memmgr_send == 0 || pages == 0
+    {
+        return None;
+    }
+    let msg = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+        .word(0, pages)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(memmgr_send, &msg, ipc_buf) }.ok()?;
+    if reply.label != memmgr_errors::SUCCESS
+    {
+        return None;
+    }
+    let caps = reply.caps();
+    if caps.len() != 1
+    {
+        for &slot in caps
+        {
+            let _ = syscall::cap_delete(slot);
+        }
+        return None;
+    }
+    let cap = caps[0];
+    if syscall::cap_info(cap, syscall_abi::CAP_INFO_FRAME_SIZE)
+        .is_ok_and(|size| size == pages * 4096)
+    {
+        Some(cap)
+    }
+    else
+    {
+        let _ = syscall::cap_delete(cap);
+        None
+    }
 }
 
 /// Service-endpoint dispatch. Called when the wait-set wakes for the
@@ -596,7 +686,7 @@ pub struct ProcmgrCtx
     /// Procmgr `cap_copy`s this into every child's
     /// `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time. Zero if
     /// init did not provide one (very early boot); children born in that
-    /// window receive zero and silent-drop `seraph::log!`.
+    /// window receive zero and silent-drop `std::os::seraph::log!`.
     pub log_ep: u32,
     /// Tokened SEND cap on memmgr's service endpoint, identifying procmgr.
     /// Used to mint per-child memmgr SENDs via `REGISTER_PROCESS`, to

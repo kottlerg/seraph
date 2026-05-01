@@ -14,10 +14,10 @@ use crate::{TestContext, TestResult};
 const CAPACITY: u32 = 8;
 const CYCLES: usize = 200;
 
-pub fn run(_ctx: &TestContext) -> TestResult
+pub fn run(ctx: &TestContext) -> TestResult
 {
-    let eq =
-        event_queue_create(CAPACITY).map_err(|_| "event_fill_drain: event_queue_create failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, CAPACITY)
+        .map_err(|_| "event_fill_drain: event_queue_create failed")?;
 
     for cycle in 0..CYCLES
     {

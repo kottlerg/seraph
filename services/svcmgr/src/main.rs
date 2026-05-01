@@ -3,12 +3,21 @@
 
 // svcmgr/src/main.rs
 
-//! Seraph service manager — monitors services, detects crashes via death
-//! notification event queues, and restarts them per their restart policy.
+//! Seraph service manager — monitors services, detects crashes via a
+//! single shared death-notification event queue, and restarts them per
+//! their restart policy.
 //!
 //! svcmgr is loaded from the root filesystem by init (via procmgr's
 //! `CREATE_PROCESS_FROM_VFS`). Init registers services via IPC, then sends
 //! `HANDOVER_COMPLETE` and exits. svcmgr runs for the lifetime of the system.
+//!
+//! Every supervised service binds death notification onto the same
+//! `deaths_eq` with `correlator = service_index`. The wait set has two
+//! members: the service endpoint (token 0) and the deaths queue
+//! (token 1). On death wakeup svcmgr drains the queue and routes each
+//! payload to its `ServiceEntry` via the correlator. Multiplexing
+//! avoids consuming a wait-set slot per supervised process and keeps
+//! the wait set inside the 16-member retype-bin sizing.
 //!
 //! See `svcmgr/docs/ipc-interface.md` and `svcmgr/docs/restart-protocol.md`.
 
@@ -36,8 +45,9 @@ const REGISTRY_CAPACITY: usize = 8;
 /// Handle a `REGISTER_SERVICE` IPC message.
 ///
 /// Reads name, policy, criticality from data words. Reads `thread_cap`,
-/// `module_cap`, `log_ep` from transferred caps. Creates an event queue, binds
-/// it to the thread, adds to the wait set.
+/// `module_cap`, `log_ep` from transferred caps. Binds the thread's death
+/// notification onto the shared `deaths_eq` with the service's table
+/// index as the correlator.
 ///
 /// Two restart sources are supported, distinguished by `vfs_path_len` in
 /// label bits [32..48]:
@@ -47,7 +57,7 @@ fn handle_register(
     msg: &IpcMessage,
     services: &mut [ServiceEntry; MAX_SERVICES],
     service_count: &mut usize,
-    ws_cap: u32,
+    deaths_eq: u32,
 ) -> u64
 {
     let label = msg.label;
@@ -108,11 +118,11 @@ fn handle_register(
         (recv_caps[1], 2usize)
     };
 
-    let Some(eq_cap) = create_and_bind_event_queue(thread_cap, ws_cap, *service_count)
-    else
+    let idx = *service_count;
+    if bind_thread_to_deaths_eq(thread_cap, deaths_eq, idx as u32).is_err()
     {
         return ipc::svcmgr_errors::EVENT_QUEUE_FAILED;
-    };
+    }
 
     let mut vfs_path_buf = [0u8; ipc::MAX_PATH_LEN];
     if vfs_loaded
@@ -120,7 +130,6 @@ fn handle_register(
         read_path_bytes(msg, vfs_path_word, vfs_path_len, &mut vfs_path_buf);
     }
 
-    let idx = *service_count;
     services[idx] = ServiceEntry {
         name,
         name_len: name_len as u8,
@@ -136,7 +145,6 @@ fn handle_register(
         bundle_count: 0,
         restart_policy,
         criticality,
-        event_queue_cap: eq_cap,
         restart_count: 0,
         active: true,
         bootstrap_token: 0,
@@ -231,34 +239,15 @@ fn read_name_from_msg(msg: &IpcMessage, name_len: usize) -> [u8; 32]
     name
 }
 
-/// Create an event queue, bind it to a thread for death notification, and add
-/// it to the wait set. Returns the event queue cap on success.
-fn create_and_bind_event_queue(thread_cap: u32, ws_cap: u32, service_index: usize) -> Option<u32>
+/// Bind a service's main thread to the shared death-notification queue,
+/// using the service's table index as the correlator. The correlator is
+/// recovered from the high 32 bits of the death payload to route the
+/// event back to its `ServiceEntry`.
+fn bind_thread_to_deaths_eq(thread_cap: u32, deaths_eq: u32, correlator: u32) -> Result<(), ()>
 {
-    let Ok(eq_cap) = syscall::event_queue_create(4)
-    else
-    {
-        std::os::seraph::log!("failed to create event queue for service");
-        return None;
-    };
-
-    // Correlator 0: svcmgr uses a per-service EventQueue plus WaitSet token
-    // for routing; the payload is just `exit_reason`. No correlator needed.
-    if syscall::thread_bind_notification(thread_cap, eq_cap, 0).is_err()
-    {
+    syscall::thread_bind_notification(thread_cap, deaths_eq, correlator).map_err(|_| {
         std::os::seraph::log!("failed to bind death notification");
-        return None;
-    }
-
-    // Token = service_index + 1 (token 0 = service endpoint).
-    let token = (service_index as u64) + 1;
-    if syscall::wait_set_add(ws_cap, eq_cap, token).is_err()
-    {
-        std::os::seraph::log!("failed to add event queue to wait set");
-        return None;
-    }
-
-    Some(eq_cap)
+    })
 }
 
 // ── Halt ───────────────────────────────────────────────────────────────────
@@ -305,16 +294,46 @@ fn main() -> !
         halt_loop();
     }
 
-    let Ok(ws_cap) = syscall::wait_set_create()
+    let Some(ws_slab) = std::os::seraph::object_slab_acquire(512)
+    else
+    {
+        std::os::seraph::log!("failed to acquire frame for wait set");
+        halt_loop();
+    };
+    let Ok(ws_cap) = syscall::wait_set_create(ws_slab)
     else
     {
         std::os::seraph::log!("failed to create wait set");
         halt_loop();
     };
 
-    if syscall::wait_set_add(ws_cap, caps.service_ep, 0).is_err()
+    // One shared death-notification queue, capacity sized so a burst of
+    // simultaneous service crashes (worst case `MAX_SERVICES`) cannot
+    // overflow before svcmgr drains. Inline-slot bytes follow
+    // `cap::retype::event_queue_raw_bytes`: 24 wrapper + 56 state +
+    // (capacity + 1) * 8 ring.
+    let deaths_eq_slab_bytes: u64 = 24 + 56 + ((MAX_SERVICES as u64 * 2) + 1) * 8;
+    let Some(eq_slab) = std::os::seraph::object_slab_acquire(deaths_eq_slab_bytes)
+    else
+    {
+        std::os::seraph::log!("failed to acquire frame for deaths event queue");
+        halt_loop();
+    };
+    let Ok(deaths_eq) = syscall::event_queue_create(eq_slab, (MAX_SERVICES as u32) * 2)
+    else
+    {
+        std::os::seraph::log!("failed to create deaths event queue");
+        halt_loop();
+    };
+
+    if syscall::wait_set_add(ws_cap, caps.service_ep, WS_TOKEN_SERVICE).is_err()
     {
         std::os::seraph::log!("failed to add service endpoint to wait set");
+        halt_loop();
+    }
+    if syscall::wait_set_add(ws_cap, deaths_eq, WS_TOKEN_DEATHS).is_err()
+    {
+        std::os::seraph::log!("failed to add deaths event queue to wait set");
         halt_loop();
     }
 
@@ -327,8 +346,13 @@ fn main() -> !
 
     std::os::seraph::log!("waiting for registrations");
 
-    event_loop(info, &caps, ws_cap, ipc_buf, &mut state);
+    event_loop(info, &caps, ws_cap, deaths_eq, ipc_buf, &mut state);
 }
+
+/// `WaitSet` token for svcmgr's service endpoint.
+const WS_TOKEN_SERVICE: u64 = 0;
+/// `WaitSet` token for svcmgr's shared death event queue.
+const WS_TOKEN_DEATHS: u64 = 1;
 
 /// Monitored service table, global discovery registry, and handover flag.
 /// Held across the event loop for the lifetime of the process.
@@ -345,6 +369,7 @@ fn event_loop(
     info: &StartupInfo,
     caps: &service::SvcmgrCaps,
     ws_cap: u32,
+    deaths_eq: u32,
     ipc_buf: *mut u64,
     state: &mut SvcmgrState,
 ) -> !
@@ -353,7 +378,7 @@ fn event_loop(
         procmgr_ep: info.procmgr_endpoint,
         bootstrap_ep: caps.bootstrap_ep,
         ipc_buf,
-        ws_cap,
+        deaths_eq,
     };
 
     loop
@@ -365,20 +390,18 @@ fn event_loop(
             continue;
         };
 
-        if token == 0
+        match token
         {
-            dispatch_ipc(caps.service_ep, ipc_buf, state, ws_cap);
-        }
-        else
-        {
-            dispatch_death(token, state, &restart_ctx);
+            WS_TOKEN_SERVICE => dispatch_ipc(caps.service_ep, ipc_buf, state, deaths_eq),
+            WS_TOKEN_DEATHS => dispatch_deaths(deaths_eq, state, &restart_ctx),
+            _ => std::os::seraph::log!("unexpected wait-set token"),
         }
     }
 }
 
 /// Handle an IPC message on the service endpoint (registration, handover,
 /// or discovery-registry publish/query).
-fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, ws_cap: u32)
+fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, deaths_eq: u32)
 {
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(msg) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
@@ -392,8 +415,12 @@ fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, ws_
     {
         svcmgr_labels::REGISTER_SERVICE =>
         {
-            let result =
-                handle_register(&msg, &mut state.services, &mut state.service_count, ws_cap);
+            let result = handle_register(
+                &msg,
+                &mut state.services,
+                &mut state.service_count,
+                deaths_eq,
+            );
             let reply = IpcMessage::new(result);
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -495,35 +522,35 @@ fn handle_query_endpoint(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Handle a death notification from a monitored service.
-fn dispatch_death(token: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
+/// Drain all pending death notifications from the shared queue. Each
+/// payload encodes the dying service's table index in the high 32 bits
+/// (set as the correlator at `thread_bind_notification` time) and the
+/// exit reason in the low 32. The wait-set notifies once per
+/// not-empty → empty transition, so a single wakeup may cover several
+/// deaths; the try-recv loop runs until the queue empties.
+fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
-    let idx = (token - 1) as usize;
-    if idx >= state.service_count
+    loop
     {
-        std::os::seraph::log!("invalid death notification token");
-        return;
-    }
+        let Ok(payload) = syscall::event_try_recv(deaths_eq)
+        else
+        {
+            return;
+        };
+        let correlator = (payload >> 32) as u32;
+        let exit_reason = payload & 0xFFFF_FFFF;
+        let idx = correlator as usize;
 
-    let Ok(exit_reason) = syscall::event_recv(state.services[idx].event_queue_cap)
-    else
-    {
-        std::os::seraph::log!("event_recv failed");
-        return;
-    };
+        if idx >= state.service_count
+        {
+            std::os::seraph::log!("death notification with unknown correlator");
+            continue;
+        }
+        if !state.services[idx].active
+        {
+            continue;
+        }
 
-    if !state.services[idx].active
-    {
-        return;
-    }
-
-    restart::handle_death(&mut state.services[idx], exit_reason, ctx);
-
-    // Re-add event queue to wait set with same token (if still active).
-    if state.services[idx].active
-        && syscall::wait_set_add(ctx.ws_cap, state.services[idx].event_queue_cap, token).is_err()
-    {
-        std::os::seraph::log!("failed to re-add event queue to wait set after restart");
-        state.services[idx].active = false;
+        restart::handle_death(&mut state.services[idx], exit_reason, ctx, correlator);
     }
 }

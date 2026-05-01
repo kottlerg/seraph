@@ -17,13 +17,15 @@ const ITERATIONS: usize = 100;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let done = cap_create_signal().map_err(|_| "thread_churn: create_signal failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "thread_churn: create_signal failed")?;
 
     for _i in 0..ITERATIONS
     {
-        let cs = cap_create_cspace(16).map_err(|_| "thread_churn: create_cspace failed")?;
+        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+            .map_err(|_| "thread_churn: create_cspace failed")?;
         let child_done = cap_copy(done, cs, 1 << 7).map_err(|_| "thread_churn: cap_copy failed")?;
-        let th = cap_create_thread(ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
             .map_err(|_| "thread_churn: create_thread failed")?;
 
         // SAFETY: Sequential execution; only one child uses STRESS_STACKS[0] at a time.

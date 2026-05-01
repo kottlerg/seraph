@@ -885,7 +885,11 @@ fn finalize_creation(
 
 /// Create a process from an in-memory ELF byte slice (suspended).
 // similar_names: aspace/cspace are intentionally parallel kernel object names.
-#[allow(clippy::similar_names, clippy::too_many_arguments)]
+#[allow(
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn create_process_from_bytes(
     module_bytes: &[u8],
     self_aspace: u32,
@@ -905,9 +909,26 @@ fn create_process_from_bytes(
         .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
         .clamp(1, MAX_PROCESS_STACK_PAGES);
 
-    let child_aspace = syscall::cap_create_aspace().ok()?;
-    let child_cspace = syscall::cap_create_cspace(256).ok()?;
-    let child_thread = syscall::cap_create_thread(child_aspace, child_cspace).ok()?;
+    let aspace_slab = crate::memmgr_alloc_pages_contig(
+        universals.memmgr_endpoint,
+        crate::ASPACE_RETYPE_PAGES,
+        ipc_buf,
+    )?;
+    let child_aspace =
+        syscall::cap_create_aspace(aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
+    let cspace_slab = crate::memmgr_alloc_pages_contig(
+        universals.memmgr_endpoint,
+        crate::CSPACE_RETYPE_PAGES,
+        ipc_buf,
+    )?;
+    let child_cspace =
+        syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 256).ok()?;
+    let thread_slab = crate::memmgr_alloc_pages_contig(
+        universals.memmgr_endpoint,
+        crate::THREAD_RETYPE_PAGES,
+        ipc_buf,
+    )?;
+    let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace).ok()?;
 
     let child_memmgr_send = universals.memmgr_endpoint;
 
@@ -1356,10 +1377,21 @@ pub fn create_process_from_vfs(
     .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
     .clamp(1, MAX_PROCESS_STACK_PAGES);
 
-    let child_aspace = syscall::cap_create_aspace().map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let aspace_slab =
+        crate::memmgr_alloc_pages_contig(child_memmgr_send, crate::ASPACE_RETYPE_PAGES, ipc_buf)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let child_aspace = syscall::cap_create_aspace(aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1)
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let cspace_slab =
+        crate::memmgr_alloc_pages_contig(child_memmgr_send, crate::CSPACE_RETYPE_PAGES, ipc_buf)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let child_cspace =
-        syscall::cap_create_cspace(256).map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-    let child_thread = syscall::cap_create_thread(child_aspace, child_cspace)
+        syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 256)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let thread_slab =
+        crate::memmgr_alloc_pages_contig(child_memmgr_send, crate::THREAD_RETYPE_PAGES, ipc_buf)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace)
         .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
 
     // Stream each LOAD segment page-by-page from VFS.

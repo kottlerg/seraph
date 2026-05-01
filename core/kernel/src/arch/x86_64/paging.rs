@@ -480,6 +480,75 @@ fn user_walk_or_alloc(
     Ok(frame_pa)
 }
 
+/// Map a single 4 KiB user page, drawing intermediate page-table frames from
+/// an `AddressSpaceObject`'s growth pool instead of the buddy allocator.
+///
+/// The pool is the typed-memory equivalent of buddy-backed PT allocation:
+/// each new PT page debits the AS's `pt_growth_budget_bytes`. Exhaustion
+/// returns `Err(())`; the caller surfaces this as `SyscallError::NoMemory`
+/// so userspace can refill via augment-mode `cap_create_aspace`.
+///
+/// # Safety
+/// Same contract as [`map_user_page`]. `aso` must be the wrapper paired
+/// with the page table at `root_virt`.
+#[cfg(not(test))]
+pub unsafe fn map_user_page_pooled(
+    root_virt: u64,
+    virt: u64,
+    phys: u64,
+    flags: crate::mm::paging::PageFlags,
+    aso: &crate::cap::object::AddressSpaceObject,
+) -> Result<(), ()>
+{
+    use crate::mm::paging::phys_to_virt;
+    const USER: u64 = 1 << 2;
+
+    // SAFETY: root_virt is direct-map VA of valid user PML4.
+    let pml4 = unsafe { table_at(root_virt) };
+
+    let pdpt_pa = user_walk_or_alloc_pooled(&mut pml4[pml4_index(virt)], aso)?;
+    // SAFETY: pdpt_pa is a valid PT frame phys addr; phys_to_virt yields direct-map VA.
+    let pdpt = unsafe { table_at(phys_to_virt(pdpt_pa)) };
+
+    let pd_pa = user_walk_or_alloc_pooled(&mut pdpt[pdpt_index(virt)], aso)?;
+    // SAFETY: pd_pa is a valid PT frame phys addr.
+    let pd = unsafe { table_at(phys_to_virt(pd_pa)) };
+
+    let pt_pa = user_walk_or_alloc_pooled(&mut pd[pd_index(virt)], aso)?;
+    // SAFETY: pt_pa is a valid PT frame phys addr.
+    let pt = unsafe { table_at(phys_to_virt(pt_pa)) };
+
+    let mut pte = PageTableEntry::new_page(phys, flags);
+    pte.0 |= USER;
+    pt[pt_index(virt)] = pte;
+
+    Ok(())
+}
+
+/// Pooled equivalent of [`user_walk_or_alloc`]: pulls a freshly-zeroed PT
+/// frame from the AS's growth pool when an entry is absent.
+#[cfg(not(test))]
+fn user_walk_or_alloc_pooled(
+    entry: &mut PageTableEntry,
+    aso: &crate::cap::object::AddressSpaceObject,
+) -> Result<u64, ()>
+{
+    const USER: u64 = 1 << 2;
+
+    if entry.is_present()
+    {
+        return Ok(entry.phys_addr());
+    }
+
+    let frame_pa = aso.alloc_pt_page().ok_or(())?;
+
+    let mut table_pte = PageTableEntry::new_table(frame_pa);
+    table_pte.0 |= USER;
+    *entry = table_pte;
+
+    Ok(frame_pa)
+}
+
 /// Walk the user half of the page table rooted at `root_virt` and free every
 /// intermediate table frame (PDPT, PD, PT) back to `allocator`.
 ///

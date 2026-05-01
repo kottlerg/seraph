@@ -73,11 +73,13 @@ static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 /// The child signals 0xBEEF back to confirm it executed.
 pub fn configure_start(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal().map_err(|_| "create_signal for configure_start failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "create_cspace for configure_start failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for configure_start failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for configure_start failed")?;
     let child_sig = cap_copy(sig, cs, 1 << 7) // SIGNAL right only
         .map_err(|_| "cap_copy for configure_start failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for configure_start failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE));
@@ -121,12 +123,14 @@ pub fn r#yield(_ctx: &TestContext) -> TestResult
 pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 {
     const BUF_SIZE: usize = 512; // Larger than any architecture's TrapFrame.
-    let sync = cap_create_signal().map_err(|_| "create_signal for stop_read_regs failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "create_cspace for stop_read_regs failed")?;
+    let sync = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for stop_read_regs failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for stop_read_regs failed")?;
     // Child needs SIGNAL+WAIT so it can both send (readiness) and block (signal_wait).
     let child_sync =
         cap_copy(sync, cs, RIGHTS_SIGNAL_WAIT).map_err(|_| "cap_copy for stop_read_regs failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for stop_read_regs failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_STOP_REGS));
@@ -181,11 +185,13 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 /// Stopping an already-stopped thread returns `InvalidState`.
 pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal().map_err(|_| "create_signal for double-stop test failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "create_cspace for double-stop test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for double-stop test failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for double-stop test failed")?;
     let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "cap_copy for double-stop test failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for double-stop test failed")?;
 
     // Tests run sequentially; STACK_STOP_REGS contents are stale but the child
@@ -226,11 +232,13 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 {
     const BUF_SIZE: usize = 512;
-    let sync = cap_create_signal().map_err(|_| "create_signal for write_regs_resume failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "create_cspace for write_regs_resume failed")?;
+    let sync = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for write_regs_resume failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for write_regs_resume failed")?;
     let child_sync = cap_copy(sync, cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "cap_copy for write_regs_resume failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for write_regs_resume failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
@@ -281,8 +289,9 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 /// `SchedControl` capability.
 pub fn set_priority_normal(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(8).map_err(|_| "create_cspace for set_priority_normal failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "create_cspace for set_priority_normal failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for set_priority_normal failed")?;
 
     // Priority 5 is in the normal range (1–20); sched_cap = 0 → not required.
@@ -297,8 +306,9 @@ pub fn set_priority_normal(ctx: &TestContext) -> TestResult
 /// no `SchedControl` capability is provided.
 pub fn set_priority_elevated_no_cap_err(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(8).map_err(|_| "create_cspace for elevated_no_cap test failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "create_cspace for elevated_no_cap test failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for elevated_no_cap test failed")?;
 
     // Priority 25 requires a SchedControl cap; passing 0 must fail.
@@ -321,8 +331,9 @@ pub fn set_priority_elevated_no_cap_err(ctx: &TestContext) -> TestResult
 /// (reports Ok — the test was not applicable, not a failure).
 pub fn set_priority_elevated_with_cap(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(8).map_err(|_| "create_cspace for elevated_with_cap test failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "create_cspace for elevated_with_cap test failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for elevated_with_cap test failed")?;
 
     // Scan for a SchedControl cap in the initial capability set.
@@ -351,8 +362,9 @@ pub fn set_priority_elevated_with_cap(ctx: &TestContext) -> TestResult
 /// `thread_set_affinity` with a valid CPU ID succeeds.
 pub fn set_affinity_valid(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(8).map_err(|_| "create_cspace for set_affinity_valid failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "create_cspace for set_affinity_valid failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for set_affinity_valid failed")?;
 
     // CPU 0 is always valid on any boot configuration.
@@ -366,9 +378,9 @@ pub fn set_affinity_valid(ctx: &TestContext) -> TestResult
 /// `thread_set_affinity` with an out-of-range CPU ID returns `InvalidArgument`.
 pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 {
-    let cs =
-        cap_create_cspace(8).map_err(|_| "create_cspace for set_affinity_invalid test failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "create_cspace for set_affinity_invalid test failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for set_affinity_invalid test failed")?;
 
     // CPU 999 is beyond any reasonable CPU count.
@@ -391,13 +403,13 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 /// a stable point at which the thread is no longer in `Created` state.
 pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 {
-    let sig =
-        cap_create_signal().map_err(|_| "create_signal for configure_running_thread_err failed")?;
-    let cs = cap_create_cspace(16)
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for configure_running_thread_err failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "create_cspace for configure_running_thread_err failed")?;
     let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "cap_copy for configure_running_thread_err failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for configure_running_thread_err failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_ERR));
@@ -437,8 +449,9 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 /// a userspace thread.
 pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(8).map_err(|_| "create_cspace for set_priority_zero_err failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "create_cspace for set_priority_zero_err failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for set_priority_zero_err failed")?;
 
     let err = thread_set_priority(th, 0, 0);
@@ -457,8 +470,9 @@ pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
 /// Priority 31 is reserved and may not be assigned to any thread.
 pub fn set_priority_31_err(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(8).map_err(|_| "create_cspace for set_priority_31_err failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "create_cspace for set_priority_31_err failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for set_priority_31_err failed")?;
 
     let err = thread_set_priority(th, 31, 0);
@@ -490,11 +504,13 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_signal().map_err(|_| "create_signal for affinity_bind_cpu1 failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "create_cspace for affinity_bind_cpu1 failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for affinity_bind_cpu1 failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for affinity_bind_cpu1 failed")?;
     let child_sig = cap_copy(sig, cs, 1 << 7) // SIGNAL right only
         .map_err(|_| "cap_copy for affinity_bind_cpu1 failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for affinity_bind_cpu1 failed")?;
 
     // Bind to CPU 1 before starting.
@@ -543,11 +559,13 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_signal().map_err(|_| "create_signal for affinity_respected failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "create_cspace for affinity_respected failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for affinity_respected failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for affinity_respected failed")?;
     let child_sig = cap_copy(sig, cs, 1 << 7) // SIGNAL right only
         .map_err(|_| "cap_copy for affinity_respected failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for affinity_respected failed")?;
 
     // Bind to CPU 1 before starting.
@@ -598,11 +616,13 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_signal().map_err(|_| "create_signal for default_affinity_bsp failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "create_cspace for default_affinity_bsp failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for default_affinity_bsp failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for default_affinity_bsp failed")?;
     let child_sig = cap_copy(sig, cs, 1 << 7) // SIGNAL right only
         .map_err(|_| "cap_copy for default_affinity_bsp failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for default_affinity_bsp failed")?;
 
     // Do NOT set affinity — leave it at default (AFFINITY_ANY).

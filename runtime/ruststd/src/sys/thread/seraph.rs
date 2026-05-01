@@ -110,9 +110,11 @@ impl Thread {
             }
         };
 
-        let done_signal = match syscall::cap_create_signal() {
-            Ok(cap) => cap,
-            Err(_) => {
+        let done_signal = match crate::sys::alloc::seraph::object_slab_acquire(120)
+            .and_then(|slab| syscall::cap_create_signal(slab).ok())
+        {
+            Some(cap) => cap,
+            None => {
                 // SAFETY: allocations owned by this function.
                 unsafe {
                     if let Some(l) = tls_layout {
@@ -131,10 +133,33 @@ impl Thread {
             done_signal,
         }));
 
+        // 5-page slab for the Thread retype slot (kstack + wrapper/TCB).
+        // Matches `cap::retype::dispatch_for(Thread)` in the kernel.
+        const THREAD_RETYPE_BYTES: u64 = 5 * 4096;
+        let thread_slab =
+            match crate::sys::alloc::seraph::object_slab_acquire(THREAD_RETYPE_BYTES) {
+                Some(cap) => cap,
+                None => {
+                    // SAFETY: `args` was just leaked via `Box::into_raw`.
+                    let args_owned = unsafe { Box::from_raw(args) };
+                    // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
+                    let _init = unsafe { Box::from_raw(args_owned.init) };
+                    // SAFETY: allocations owned by this function.
+                    unsafe {
+                        if let Some(l) = tls_layout {
+                            dealloc(tls_block, l);
+                        }
+                        dealloc(ipc_buf_base, ipc_buf_layout);
+                        dealloc(stack_base, stack_layout);
+                    }
+                    return Err(io::Error::other("seraph: thread retype slab alloc failed"));
+                }
+            };
         let thread_cap =
-            match syscall::cap_create_thread(info.self_aspace, info.self_cspace) {
+            match syscall::cap_create_thread(thread_slab, info.self_aspace, info.self_cspace) {
                 Ok(cap) => cap,
                 Err(_) => {
+                    let _ = syscall::cap_delete(thread_slab);
                     // SAFETY: `args` was just leaked via `Box::into_raw`.
                     let args_owned = unsafe { Box::from_raw(args) };
                     // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.

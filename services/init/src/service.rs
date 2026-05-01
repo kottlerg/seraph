@@ -1127,13 +1127,13 @@ pub fn phase3_svcmgr_handover(
 
     send_vfsd_endpoint_to_procmgr(procmgr_ep, vfsd_service_ep, ipc_buf);
 
-    let Ok(svcmgr_service_ep) = syscall::cap_create_endpoint()
+    let Ok(svcmgr_service_ep) = syscall::cap_create_endpoint(crate::endpoint_slab())
     else
     {
         log("phase 3: cannot create svcmgr endpoint");
         idle_loop();
     };
-    let Ok(svcmgr_bootstrap_ep) = syscall::cap_create_endpoint()
+    let Ok(svcmgr_bootstrap_ep) = syscall::cap_create_endpoint(crate::endpoint_slab())
     else
     {
         log("phase 3: cannot create svcmgr bootstrap endpoint");

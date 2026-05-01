@@ -52,14 +52,16 @@ static mut RECV_OOM_STACK: ChildStack = ChildStack::ZERO;
 /// complete its post-reply verification before the test returns.
 pub fn call_reply_recv(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for IPC test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for IPC test failed")?;
 
     // Notification signal: child sends 0xDEAD (success) or 0xBAD (failure).
-    let notify =
-        syscall::cap_create_signal().map_err(|_| "cap_create_signal for IPC notify failed")?;
+    let notify = syscall::cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for IPC notify failed")?;
 
     // Build child CSpace: endpoint (SEND | GRANT) + notify signal (SIGNAL only).
-    let child_cs = cap_create_cspace(16).map_err(|_| "child CSpace create failed")?;
+    let child_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "child CSpace create failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_copy ep into child CSpace failed")?;
     let child_notify = cap_copy(notify, child_cs, 1 << 7)
@@ -68,7 +70,7 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
     // Pack child ep and notify slots into the arg u64.
     let child_arg = u64::from(child_ep) | (u64::from(child_notify) << 16);
 
-    let child_th = cap_create_thread(ctx.aspace_cap, child_cs)
+    let child_th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, child_cs)
         .map_err(|_| "cap_create_thread for IPC test failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -119,12 +121,12 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
 /// and tests the recv-queue path.)
 pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint()
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
         .map_err(|_| "cap_create_endpoint for recv_finds_queued_caller failed")?;
-    let done =
-        cap_create_signal().map_err(|_| "cap_create_signal for recv_finds_queued_caller failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for recv_finds_queued_caller failed")?;
 
-    let child_cs = cap_create_cspace(16)
+    let child_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "cap_create_cspace for recv_finds_queued_caller failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_copy ep for recv_finds_queued_caller failed")?;
@@ -132,7 +134,7 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy done for recv_finds_queued_caller failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
-    let th = cap_create_thread(ctx.aspace_cap, child_cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, child_cs)
         .map_err(|_| "cap_create_thread for recv_finds_queued_caller failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
     thread_configure(
@@ -195,8 +197,8 @@ pub fn ipc_buffer_misaligned_err(_ctx: &TestContext) -> TestResult
 /// `ipc_call` on an endpoint cap with only RECV right (no SEND) must fail.
 pub fn send_insufficient_rights_err(ctx: &TestContext) -> TestResult
 {
-    let ep =
-        cap_create_endpoint().map_err(|_| "cap_create_endpoint for send_rights test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for send_rights test failed")?;
 
     // Derive with RECV right only (bit 10), no SEND (bit 4).
     let recv_only =
@@ -223,18 +225,20 @@ pub fn send_insufficient_rights_err(ctx: &TestContext) -> TestResult
 /// The server receives them and verifies the values.
 pub fn call_with_data_words(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for data_words test failed")?;
-    let done = cap_create_signal().map_err(|_| "cap_create_signal for data_words test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for data_words test failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for data_words test failed")?;
 
-    let child_cs =
-        cap_create_cspace(16).map_err(|_| "cap_create_cspace for data_words test failed")?;
+    let child_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace for data_words test failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_copy ep for data_words test failed")?;
     let child_done =
         cap_copy(done, child_cs, 1 << 7).map_err(|_| "cap_copy done for data_words test failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
-    let child_th = cap_create_thread(ctx.aspace_cap, child_cs)
+    let child_th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, child_cs)
         .map_err(|_| "cap_create_thread for data_words test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(DATA_WORDS_STACK));
     thread_configure(
@@ -293,18 +297,23 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
 /// The server receives it and verifies it can use the transferred cap.
 pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for cap_xfer test failed")?;
-    let done = cap_create_signal().map_err(|_| "cap_create_signal for cap_xfer test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for cap_xfer test failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for cap_xfer test failed")?;
 
-    let child_cs =
-        cap_create_cspace(16).map_err(|_| "cap_create_cspace for cap_xfer test failed")?;
+    let child_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace for cap_xfer test failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_copy ep for cap_xfer test failed")?;
     let child_done =
         cap_copy(done, child_cs, 1 << 7).map_err(|_| "cap_copy done for cap_xfer test failed")?;
-    let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
+    let child_frame = cap_copy(ctx.memory_frame_base, child_cs, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_copy frame for cap_xfer test failed")?;
+    let child_arg =
+        u64::from(child_ep) | (u64::from(child_done) << 16) | (u64::from(child_frame) << 32);
 
-    let child_th = cap_create_thread(ctx.aspace_cap, child_cs)
+    let child_th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, child_cs)
         .map_err(|_| "cap_create_thread for cap_xfer test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(CAP_XFER_STACK));
     thread_configure(
@@ -363,24 +372,24 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
 /// receives and verifies the token value in the third return register.
 pub fn recv_delivers_token(ctx: &TestContext) -> TestResult
 {
-    let ep =
-        cap_create_endpoint().map_err(|_| "cap_create_endpoint for recv_delivers_token failed")?;
-    let done =
-        cap_create_signal().map_err(|_| "cap_create_signal for recv_delivers_token failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for recv_delivers_token failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for recv_delivers_token failed")?;
 
     // Derive a tokened send+grant cap.
     let tokened_ep = syscall::cap_derive_token(ep, RIGHTS_SEND_GRANT, 0x1234)
         .map_err(|_| "cap_derive_token for recv_delivers_token failed")?;
 
-    let child_cs =
-        cap_create_cspace(16).map_err(|_| "cap_create_cspace for recv_delivers_token failed")?;
+    let child_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace for recv_delivers_token failed")?;
     let child_ep = cap_copy(tokened_ep, child_cs, syscall::RIGHTS_ALL)
         .map_err(|_| "cap_copy tokened ep for recv_delivers_token failed")?;
     let child_done = cap_copy(done, child_cs, 1 << 7)
         .map_err(|_| "cap_copy done for recv_delivers_token failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
-    let th = cap_create_thread(ctx.aspace_cap, child_cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, child_cs)
         .map_err(|_| "cap_create_thread for recv_delivers_token failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(TOKEN_STACK));
@@ -425,19 +434,21 @@ pub fn recv_delivers_token(ctx: &TestContext) -> TestResult
 /// `ipc_recv` returns token=0 when the sender uses an untokened cap.
 pub fn recv_untokened_returns_zero(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for recv_untokened failed")?;
-    let done = cap_create_signal().map_err(|_| "cap_create_signal for recv_untokened failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for recv_untokened failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for recv_untokened failed")?;
 
     // Give child an untokened send+grant cap (regular derive, no token).
-    let child_cs =
-        cap_create_cspace(16).map_err(|_| "cap_create_cspace for recv_untokened failed")?;
+    let child_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace for recv_untokened failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_copy ep for recv_untokened failed")?;
     let child_done =
         cap_copy(done, child_cs, 1 << 7).map_err(|_| "cap_copy done for recv_untokened failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
-    let th = cap_create_thread(ctx.aspace_cap, child_cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, child_cs)
         .map_err(|_| "cap_create_thread for recv_untokened failed")?;
 
     // Reuse the caller_entry (sends 0xCAFE, expects reply 0xBEEF).
@@ -584,11 +595,13 @@ fn data_caller_entry(arg: u64) -> !
 
 /// Child for `call_with_cap_transfer`: creates a signal and transfers it via IPC.
 ///
-/// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`.
+/// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`,
+/// bits[47:32] = `frame_slot` (Frame cap with RETYPE for `cap_create_signal`).
 fn cap_xfer_caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF) as u32;
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let frame_slot = ((arg >> 32) & 0xFFFF) as u32;
 
     // Register IPC buffer for cap transfer.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
@@ -599,7 +612,7 @@ fn cap_xfer_caller_entry(arg: u64) -> !
     }
 
     // Create a signal in the child's CSpace.
-    let Ok(sig) = syscall::cap_create_signal()
+    let Ok(sig) = syscall::cap_create_signal(frame_slot)
     else
     {
         signal_send(done_slot, 0xBAD).ok();
@@ -658,18 +671,20 @@ fn token_caller_entry(arg: u64) -> !
 /// activity), then verify the message's view is unchanged.
 pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for snapshot test failed")?;
-    let done = cap_create_signal().map_err(|_| "cap_create_signal for snapshot test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for snapshot test failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for snapshot test failed")?;
 
-    let child_cs =
-        cap_create_cspace(16).map_err(|_| "cap_create_cspace for snapshot test failed")?;
+    let child_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace for snapshot test failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_copy ep for snapshot test failed")?;
     let child_done =
         cap_copy(done, child_cs, 1 << 7).map_err(|_| "cap_copy done for snapshot test failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
-    let child_th = cap_create_thread(ctx.aspace_cap, child_cs)
+    let child_th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, child_cs)
         .map_err(|_| "cap_create_thread for snapshot test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(SNAPSHOT_STACK));
     thread_configure(
@@ -778,32 +793,37 @@ fn snapshot_caller_entry(arg: u64) -> !
 /// succeeds.
 pub fn reply_oom_keeps_caller_blocked(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for reply_oom test failed")?;
-    let ready =
-        cap_create_signal().map_err(|_| "cap_create_signal(ready) for reply_oom test failed")?;
-    let done =
-        cap_create_signal().map_err(|_| "cap_create_signal(done) for reply_oom test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for reply_oom test failed")?;
+    let ready = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal(ready) for reply_oom test failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal(done) for reply_oom test failed")?;
     // Extra signal we will try to transfer in the cap-bearing reply. Created
     // in the server's CSpace; the failing reply must leave it untouched.
-    let xfer =
-        cap_create_signal().map_err(|_| "cap_create_signal(xfer) for reply_oom test failed")?;
+    let xfer = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal(xfer) for reply_oom test failed")?;
 
     // Small child CSpace: the child consumes its remaining headroom by
     // creating signals until full so that pre_allocate(1) on the reply path
     // returns OutOfMemory.
-    let child_cs =
-        cap_create_cspace(8).map_err(|_| "cap_create_cspace for reply_oom test failed")?;
+    let child_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "cap_create_cspace for reply_oom test failed")?;
     let child_ep = cap_copy(ep, child_cs, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_copy ep for reply_oom test failed")?;
     let child_ready = cap_copy(ready, child_cs, 1 << 7)
         .map_err(|_| "cap_copy ready for reply_oom test failed")?;
     let child_done =
         cap_copy(done, child_cs, 1 << 7).map_err(|_| "cap_copy done for reply_oom test failed")?;
+    let child_frame = cap_copy(ctx.memory_frame_base, child_cs, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_copy frame for reply_oom test failed")?;
 
-    let child_arg =
-        u64::from(child_ep) | (u64::from(child_ready) << 16) | (u64::from(child_done) << 32);
+    let child_arg = u64::from(child_ep)
+        | (u64::from(child_ready) << 16)
+        | (u64::from(child_done) << 32)
+        | (u64::from(child_frame) << 48);
 
-    let child_th = cap_create_thread(ctx.aspace_cap, child_cs)
+    let child_th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, child_cs)
         .map_err(|_| "cap_create_thread for reply_oom test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(REPLY_OOM_STACK));
     thread_configure(
@@ -876,6 +896,7 @@ fn reply_oom_caller_entry(arg: u64) -> !
     let ep_slot = (arg & 0xFFFF) as u32;
     let ready_slot = ((arg >> 16) & 0xFFFF) as u32;
     let done_slot = ((arg >> 32) & 0xFFFF) as u32;
+    let frame_slot = ((arg >> 48) & 0xFFFF) as u32;
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
@@ -889,12 +910,12 @@ fn reply_oom_caller_entry(arg: u64) -> !
     // CSpace if the test setup ever changes.
     for _ in 0..1024
     {
-        if cap_create_signal().is_err()
+        if cap_create_signal(frame_slot).is_err()
         {
             break;
         }
     }
-    if cap_create_signal().is_ok()
+    if cap_create_signal(frame_slot).is_ok()
     {
         // Still has free slots — test setup did not actually fill the CSpace.
         signal_send(ready_slot, 0xBAD).ok();
@@ -934,19 +955,23 @@ fn reply_oom_caller_entry(arg: u64) -> !
 /// the bug only when caps actually arrive.
 pub fn recv_oom_returns_cleanly(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint().map_err(|_| "cap_create_endpoint for recv_oom test failed")?;
-    let done =
-        cap_create_signal().map_err(|_| "cap_create_signal(done) for recv_oom test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_endpoint for recv_oom test failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal(done) for recv_oom test failed")?;
 
-    let victim_cs =
-        cap_create_cspace(8).map_err(|_| "cap_create_cspace for recv_oom test failed")?;
+    let victim_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        .map_err(|_| "cap_create_cspace for recv_oom test failed")?;
     let victim_ep = cap_copy(ep, victim_cs, syscall_abi::RIGHTS_RECEIVE)
         .map_err(|_| "cap_copy ep for recv_oom test failed")?;
     let victim_done =
         cap_copy(done, victim_cs, 1 << 7).map_err(|_| "cap_copy done for recv_oom test failed")?;
-    let victim_arg = u64::from(victim_ep) | (u64::from(victim_done) << 16);
+    let victim_frame = cap_copy(ctx.memory_frame_base, victim_cs, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_copy frame for recv_oom test failed")?;
+    let victim_arg =
+        u64::from(victim_ep) | (u64::from(victim_done) << 16) | (u64::from(victim_frame) << 32);
 
-    let victim_th = cap_create_thread(ctx.aspace_cap, victim_cs)
+    let victim_th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, victim_cs)
         .map_err(|_| "cap_create_thread for recv_oom test failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_OOM_STACK));
     thread_configure(
@@ -978,6 +1003,7 @@ fn recv_oom_victim_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF) as u32;
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let frame_slot = ((arg >> 32) & 0xFFFF) as u32;
 
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
@@ -988,12 +1014,12 @@ fn recv_oom_victim_entry(arg: u64) -> !
 
     for _ in 0..1024
     {
-        if cap_create_signal().is_err()
+        if cap_create_signal(frame_slot).is_err()
         {
             break;
         }
     }
-    if cap_create_signal().is_ok()
+    if cap_create_signal(frame_slot).is_ok()
     {
         signal_send(done_slot, 0xBAD).ok();
         thread_exit()

@@ -26,8 +26,10 @@ const ALL_BITS: u64 = 0xFFFF;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let target = cap_create_signal().map_err(|_| "concurrent_signal: create target failed")?;
-    let done = cap_create_signal().map_err(|_| "concurrent_signal: create done failed")?;
+    let target = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "concurrent_signal: create target failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "concurrent_signal: create done failed")?;
 
     // Spawn 4 sender threads.
     let mut threads = [0u32; NUM_SENDERS];
@@ -35,14 +37,15 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for i in 0..NUM_SENDERS
     {
-        let cs = cap_create_cspace(16).map_err(|_| "concurrent_signal: create_cspace failed")?;
+        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+            .map_err(|_| "concurrent_signal: create_cspace failed")?;
         // Child needs SIGNAL right on target and done.
         let child_target = cap_copy(target, cs, 1 << 7)
             .map_err(|_| "concurrent_signal: cap_copy target failed")?;
         let child_done =
             cap_copy(done, cs, 1 << 7).map_err(|_| "concurrent_signal: cap_copy done failed")?;
 
-        let th = cap_create_thread(ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
             .map_err(|_| "concurrent_signal: create_thread failed")?;
 
         // Pack: bits[15:0]=target_slot, bits[31:16]=done_slot, bits[47:32]=bit_index

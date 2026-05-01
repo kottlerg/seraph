@@ -102,7 +102,8 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
 /// tokened SEND caps on the endpoint to each spawned driver.
 fn spawn_worker() -> Option<(u32, Channel)>
 {
-    let bootstrap_ep = syscall::cap_create_endpoint().ok()?;
+    let slab = std::os::seraph::object_slab_acquire(88)?;
+    let bootstrap_ep = syscall::cap_create_endpoint(slab).ok()?;
     let channel = worker::new_channel();
 
     let worker_channel = channel.clone();

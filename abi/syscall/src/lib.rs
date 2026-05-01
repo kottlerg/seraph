@@ -150,6 +150,86 @@ pub const SYS_FRAME_SPLIT: u64 = 33;
 pub const SYS_MMIO_MAP: u64 = 34;
 /// I/O: bind an `IoPortRange` to the calling thread.
 pub const SYS_IOPORT_BIND: u64 = 35;
+/// Capability: read-only inspection of a cap's runtime state.
+///
+/// Returns a discriminated union keyed by `CapTag`:
+/// - `Frame` → `(size_bytes, available_bytes, has_retype_right)`
+/// - `AddressSpace` → `(pt_growth_budget_bytes)`
+/// - `CSpace` → `(slot_capacity, slots_used, growth_budget_bytes)`
+/// - all other tags → `(tag, rights)` only
+///
+/// Cannot fail except on null/invalid slot. Slot 36 was vacated by the
+/// `SYS_DMA_GRANT` removal (commit `704c1b4`).
+///
+/// arg0 = slot index in the caller's `CSpace`.
+/// arg1 = field selector — one of the [`CAP_INFO_*`](CAP_INFO_TAG_RIGHTS)
+///        constants below. The value returned in the primary register
+///        depends on the selector. Field selectors that are tag-specific
+///        (every constant other than [`CAP_INFO_TAG_RIGHTS`]) require the
+///        slot's `CapTag` to match the field's owning tag; calls with a
+///        mismatched slot return [`SyscallError::InvalidArgument`].
+///        Selectors not listed below also return
+///        [`SyscallError::InvalidArgument`].
+pub const SYS_CAP_INFO: u64 = 36;
+
+// ── SYS_CAP_INFO field selectors ──────────────────────────────────────────────
+//
+// Pass one of these constants as `arg1` to `SYS_CAP_INFO`. Each call returns a
+// single `u64`. Userspace assembles a full picture by issuing repeated calls.
+// The pattern mirrors `SYS_SYSTEM_INFO` (single-register return + discriminant
+// argument) so the wrapper shape stays uniform.
+
+/// Universal field — valid for any non-null capability slot.
+///
+/// Returns the packed value `((tag as u8 as u64) << 32) | (rights as u32 as u64)`.
+/// Userspace recovers the components with:
+/// ```text
+/// tag    = (value >> 32) as u8;       // matches CapTag discriminant
+/// rights =  value        as u32;      // matches Rights bitmask
+/// ```
+pub const CAP_INFO_TAG_RIGHTS: u64 = 0;
+
+/// `Frame` only — total byte size of the frame region.
+///
+/// Returns `FrameObject::size`. Calling on a non-Frame slot returns
+/// [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_FRAME_SIZE: u64 = 1;
+
+/// `Frame` only — bytes still available to retype or map from this frame.
+///
+/// Returns the current value of `FrameObject::available_bytes`. Calling on
+/// a non-Frame slot returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_FRAME_AVAILABLE: u64 = 2;
+
+/// `Frame` only — `1` if the cap holds the `RETYPE` right, otherwise `0`.
+///
+/// Returns `1` or `0`. Calling on a non-Frame slot returns
+/// [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_FRAME_HAS_RETYPE: u64 = 3;
+
+/// `AddressSpace` only — bytes available to back new intermediate page-table pages.
+///
+/// Returns the current value of `AddressSpaceObject::pt_growth_budget_bytes`.
+/// Calling on a non-`AddressSpace` slot returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_ASPACE_PT_BUDGET: u64 = 4;
+
+/// `CSpace` only — total slot capacity (`max_slots`).
+///
+/// Returns the `CSpace`'s `max_slots` value. Calling on a non-`CSpace` slot
+/// returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_CSPACE_CAPACITY: u64 = 5;
+
+/// `CSpace` only — number of currently populated (non-null) slots.
+///
+/// Returns the `CSpace`'s `populated_count()`. Calling on a non-`CSpace` slot
+/// returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_CSPACE_USED: u64 = 6;
+
+/// `CSpace` only — bytes available to back new slot pages.
+///
+/// Returns the current value of `CSpaceKernelObject::cspace_growth_budget_bytes`.
+/// Calling on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_CSPACE_BUDGET: u64 = 7;
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;
 /// Thread: set CPU affinity.
@@ -298,6 +378,13 @@ pub const RIGHTS_THREAD: u64 = (1 << 11) | (1 << 12);
 
 /// `CSpace`: full management (insert, delete, derive, revoke).
 pub const RIGHTS_CSPACE: u64 = (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
+
+/// Frame: authority to retype memory into kernel objects.
+///
+/// Held by RAM Frame caps minted from buddy at boot; never held by firmware-
+/// table / boot-module / init-segment Frame caps. Required by every retype-
+/// consuming syscall.
+pub const RIGHTS_RETYPE: u64 = 1 << 21;
 
 // ── Exit reason constants ─────────────────────────────────────────────────────
 //

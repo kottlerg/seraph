@@ -26,9 +26,10 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 // ── SYS_SIGNAL_SEND ───────────────────────────────────────────────────────────
 
 /// `signal_send` ORs bits into a signal object. Non-blocking.
-pub fn send(_ctx: &TestContext) -> TestResult
+pub fn send(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal().map_err(|_| "create_signal for send test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for send test failed")?;
     signal_send(sig, 0xABCD).map_err(|_| "signal_send failed")?;
     // Drain the bits so subsequent tests are not surprised by a pre-set signal.
     signal_wait(sig).map_err(|_| "signal_wait after send failed")?;
@@ -41,14 +42,16 @@ pub fn send(_ctx: &TestContext) -> TestResult
 /// `signal_wait` blocks until a child sends bits; returns the sent bitmask.
 pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal().map_err(|_| "create_signal for blocking-wait test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for blocking-wait test failed")?;
 
     // Create a child CSpace and copy the signal cap (SIGNAL right only).
-    let cs = cap_create_cspace(16).map_err(|_| "create_cspace for blocking-wait test failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for blocking-wait test failed")?;
     let child_sig =
         cap_copy(sig, cs, RIGHTS_SIGNAL).map_err(|_| "cap_copy signal into child CSpace failed")?;
 
-    let child_th = cap_create_thread(ctx.aspace_cap, cs)
+    let child_th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for blocking-wait test failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -74,9 +77,10 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
 }
 
 /// `signal_wait` returns immediately when bits are already set.
-pub fn send_before_wait_immediate(_ctx: &TestContext) -> TestResult
+pub fn send_before_wait_immediate(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal().map_err(|_| "create_signal for immediate-wait test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for immediate-wait test failed")?;
     signal_send(sig, 0x1234).map_err(|_| "signal_send failed")?;
     // Bits are already set — signal_wait must return without blocking.
     let bits = signal_wait(sig).map_err(|_| "signal_wait (immediate) failed")?;
@@ -92,9 +96,10 @@ pub fn send_before_wait_immediate(_ctx: &TestContext) -> TestResult
 
 /// Calling `signal_wait` on a cap with SIGNAL-only rights (no WAIT) must fail
 /// with `InsufficientRights`.
-pub fn wait_insufficient_rights(_ctx: &TestContext) -> TestResult
+pub fn wait_insufficient_rights(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal().map_err(|_| "create_signal for rights test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for rights test failed")?;
     // Derive a cap with SIGNAL (send) right only — no WAIT (receive) right.
     let send_only =
         cap_derive(sig, RIGHTS_SIGNAL).map_err(|_| "cap_derive for rights test failed")?;
@@ -122,9 +127,10 @@ pub fn wait_insufficient_rights(_ctx: &TestContext) -> TestResult
 ///
 /// Sends 0x1, 0x2, and 0x4 without waiting between them; `signal_wait` must
 /// return the OR of all three (0x7), not just the last value.
-pub fn multiple_sends_before_wait_accumulate_bits(_ctx: &TestContext) -> TestResult
+pub fn multiple_sends_before_wait_accumulate_bits(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal().map_err(|_| "create_signal for multi-send test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for multi-send test failed")?;
 
     signal_send(sig, 0x1).map_err(|_| "signal_send(0x1) failed")?;
     signal_send(sig, 0x2).map_err(|_| "signal_send(0x2) failed")?;
@@ -147,9 +153,10 @@ pub fn multiple_sends_before_wait_accumulate_bits(_ctx: &TestContext) -> TestRes
 /// The kernel rejects zero-bit sends (no-op sends are not valid). Verifies:
 /// 1. `signal_send(sig, 0)` returns an error.
 /// 2. A subsequent non-zero send arrives intact (error did not corrupt state).
-pub fn send_zero_bits_is_noop(_ctx: &TestContext) -> TestResult
+pub fn send_zero_bits_is_noop(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal().map_err(|_| "create_signal for zero-send test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for zero-send test failed")?;
 
     // Kernel rejects zero-bit send.
     let zero_err = signal_send(sig, 0);
@@ -173,10 +180,10 @@ pub fn send_zero_bits_is_noop(_ctx: &TestContext) -> TestResult
 // ── SYS_SIGNAL_SEND (insufficient rights) ────────────────────────────────────
 
 /// `signal_send` on a cap with only WAIT right (no SIGNAL) must fail.
-pub fn send_insufficient_rights(_ctx: &TestContext) -> TestResult
+pub fn send_insufficient_rights(ctx: &TestContext) -> TestResult
 {
-    let sig =
-        cap_create_signal().map_err(|_| "create_signal for send_insufficient_rights failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for send_insufficient_rights failed")?;
 
     // Derive a cap with WAIT right only — no SIGNAL (send) right.
     let wait_only = cap_derive(sig, RIGHTS_WAIT)

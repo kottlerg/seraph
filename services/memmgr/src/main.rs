@@ -247,30 +247,33 @@ impl FreePool
                     {
                         continue;
                     };
-                    // Try merging in both orders. frame_merge requires
-                    // physical contiguity and identical rights/parents;
-                    // it rejects every non-adjacent pair, so blind probing
-                    // is correct (just O(N²)).
-                    // frame_merge requires arg0 to be the lower-address
-                    // sibling; the merged region's phys_base is therefore
-                    // the lower of the two siblings' phys_base values.
-                    if let Ok(merged) = syscall::frame_merge(run_a.cap_slot, run_b.cap_slot)
+                    // Try merging in both orders. Option-D frame_merge
+                    // requires physical contiguity (parent first, tail
+                    // second) and identical rights/parents; it rejects every
+                    // non-adjacent pair, so blind probing is correct (just
+                    // O(N²)). On success the parent's slot stays valid and
+                    // the tail's slot is freed; the merged run's cap_slot
+                    // is therefore the parent (lower-address) cap.
+                    if syscall::frame_merge(run_a.cap_slot, run_b.cap_slot).is_ok()
                     {
+                        // run_a was parent (lower base); its slot survives
+                        // and now covers run_a.size + run_b.size.
                         self.runs[i] = Some(FreeRun {
-                            cap_slot: merged,
+                            cap_slot: run_a.cap_slot,
                             page_count: run_a.page_count + run_b.page_count,
-                            phys_base: run_a.phys_base.min(run_b.phys_base),
+                            phys_base: run_a.phys_base,
                         });
                         self.runs[j] = None;
                         merged_any = true;
                         break 'outer;
                     }
-                    if let Ok(merged) = syscall::frame_merge(run_b.cap_slot, run_a.cap_slot)
+                    if syscall::frame_merge(run_b.cap_slot, run_a.cap_slot).is_ok()
                     {
+                        // run_b was parent; its slot survives.
                         self.runs[i] = Some(FreeRun {
-                            cap_slot: merged,
+                            cap_slot: run_b.cap_slot,
                             page_count: run_a.page_count + run_b.page_count,
-                            phys_base: run_a.phys_base.min(run_b.phys_base),
+                            phys_base: run_b.phys_base,
                         });
                         self.runs[j] = None;
                         merged_any = true;
@@ -507,16 +510,16 @@ fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<(u32, u64)
         return None;
     }
     let split_offset = u64::from(want) * PAGE_SIZE;
-    let (left, right) = syscall::frame_split(run.cap_slot, split_offset).ok()?;
-    // frame_split: `left` covers the first `split_offset` bytes (same
-    // phys_base as the original run); `right` covers the remainder, at
-    // `phys_base + split_offset`.
+    // Option-D frame_split: `run.cap_slot` shrinks in place to cover the
+    // first `split_offset` bytes; the returned slot is the new tail covering
+    // the remainder at `phys_base + split_offset`.
+    let tail = syscall::frame_split(run.cap_slot, split_offset).ok()?;
     pool.runs[idx] = Some(FreeRun {
-        cap_slot: right,
+        cap_slot: tail,
         page_count: run.page_count - want,
         phys_base: run.phys_base + split_offset,
     });
-    Some((left, run.phys_base))
+    Some((run.cap_slot, run.phys_base))
 }
 
 /// Derive an inner copy of the outer cap to hand to the caller. The outer
@@ -780,6 +783,25 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
     // token in `data[0]` for memmgr's table lookup.
     let dead_token = req.word(0);
 
+    // Auto-reclaim invariant (documented, not asserted in-line):
+    //
+    // By the time PROCESS_DIED reaches memmgr, procmgr has revoked +
+    // deleted the child's CSpace, which cascades through every derived
+    // inner Frame cap *and* every kernel object retyped from those caps.
+    // Auto-reclaim (`KernelObjectHeader.ancestor`) credits each retype's
+    // bytes back to the source `FrameObject` — which memmgr's outer cap
+    // and the child's inner cap share. With the child gone, only the
+    // outer cap remains.
+    //
+    // We do *not* assert `available_bytes == size` here: the per-cap
+    // `RetypeAllocator` metadata cost (~64 B per cap, debited on first
+    // retype) stays charged for as long as the FrameObject lives, which
+    // is until memmgr's outer cap is also released — i.e. forever for
+    // pool caps. A correct cross-check would compare against the
+    // available value snapshotted at grant time, which is more state
+    // than memmgr's record currently carries; the ktest
+    // `integration::retype_reclaim` covers the same invariant on a
+    // dedicated source cap with no allocator residual.
     let pool = pool_mut();
     if let Some(record) = table_mut().take(dead_token)
     {
@@ -830,8 +852,37 @@ fn ingest_pool(boot: &InitBootstrap)
     let pool = pool_mut();
     for i in 0..(boot.frame_count as usize)
     {
+        let cap_slot = boot.frame_base + i as u32;
+        // Every RAM Frame cap memmgr ingests from init MUST carry
+        // `Rights::RETYPE`. The kernel stamps RETYPE on usable RAM at
+        // Phase-7 mint (`core/kernel/src/cap/mod.rs`), and init's
+        // `finalize_memmgr` forwards caps through `cap_derive(_, RIGHTS_ALL)`
+        // which preserves RETYPE. If this ever fires, memmgr cannot retype
+        // these frames into kernel objects on its consumers' behalf and the
+        // typed-memory contract is broken — fail fast at boot. The check
+        // fires for at least the first cap (gating panic on i == 0);
+        // subsequent caps would be debit-cheap to also check, but the
+        // kernel mints them as a uniform batch so one is sufficient.
+        if i == 0
+        {
+            // `packed` is `(tag << 32) | rights`; low 32 bits are rights, and
+            // `RIGHTS_RETYPE` (1 << 21) is a low-bit-position right so the
+            // comparison against the full u64 is exact. cap_info(slot,
+            // TAG_RIGHTS) cannot fail on a non-null slot — init has just
+            // forwarded the cap, so an Err here means the cap-routing graph
+            // is broken and the bootstrap invariant fails.
+            let Ok(packed) = syscall::cap_info(cap_slot, syscall::CAP_INFO_TAG_RIGHTS)
+            else
+            {
+                panic!("memmgr: cap_info failed on bootstrap Frame cap");
+            };
+            assert!(
+                packed & syscall::RIGHTS_RETYPE != 0,
+                "memmgr: ingested RAM Frame cap missing RIGHTS_RETYPE",
+            );
+        }
         let _ = pool.push(FreeRun {
-            cap_slot: boot.frame_base + i as u32,
+            cap_slot,
             page_count: boot.page_counts[i],
             phys_base: boot.phys_bases[i],
         });

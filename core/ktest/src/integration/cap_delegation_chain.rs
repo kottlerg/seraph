@@ -33,12 +33,13 @@ const RIGHTS_SIGNAL: u64 = 1 << 7;
 // SIGNAL + WAIT rights (bits 7 and 8) — full signal capability.
 const RIGHTS_SIGNAL_WAIT: u64 = (1 << 7) | (1 << 8);
 
-pub fn run(_ctx: &TestContext) -> TestResult
+pub fn run(ctx: &TestContext) -> TestResult
 {
     crate::log("cap_delegation_chain: starting");
 
     // Root cap: full SIGNAL+WAIT rights.
-    let root = cap_create_signal().map_err(|_| "cap_delegation_chain: cap_create_signal failed")?;
+    let root = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_delegation_chain: cap_create_signal failed")?;
 
     // ── Level 1: derive from root with SIGNAL only ────────────────────────────
     let level1 = cap_derive(root, RIGHTS_SIGNAL)

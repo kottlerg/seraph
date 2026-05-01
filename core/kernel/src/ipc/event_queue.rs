@@ -26,13 +26,19 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
 
 /// Kernel state backing an `EventQueue` capability.
 ///
-/// The ring buffer body is a separate heap allocation (`ring: *mut u64`).
-/// `capacity` is the user-visible max entry count; the ring has `capacity + 1`
-/// slots to distinguish full from empty using the one-slot-gap strategy.
+/// The ring buffer body lives inline in the same retype slot — directly
+/// after this struct, at the offset returned by
+/// `cap::retype::dispatch_for(EventQueue, capacity)`. `capacity` is the
+/// user-visible max entry count; the ring has `capacity + 1` slots to
+/// distinguish full from empty using the one-slot-gap strategy. The ring
+/// pointer is set at construction by `EventQueueState::new` and remains
+/// stable for the lifetime of the cap; reclaim is uniform with the rest
+/// of the slot via `retype_free` against the source `Frame` cap.
 pub struct EventQueueState
 {
-    /// Raw pointer to the ring buffer; allocated via `Box<[u64]>` with
-    /// `capacity + 1` elements. Reconstructed for drop in `event_queue_drop`.
+    /// Raw pointer to the inline ring buffer of `capacity + 1` `u64`
+    /// slots. Owned by the surrounding retype slot, not by this struct;
+    /// no separate free is required at drop.
     pub ring: *mut u64,
     /// User-visible capacity (max concurrent entries).
     pub capacity: u32,
@@ -58,19 +64,27 @@ unsafe impl Send for EventQueueState {}
 // SAFETY: EventQueueState is accessed only under the scheduler lock; no Sync violation.
 unsafe impl Sync for EventQueueState {}
 
+// `cap::retype::EVENT_QUEUE_STATE_BYTES` must match the actual size of
+// this struct — the retype slot layout depends on the constant when
+// computing where the inline ring starts. Update both sides together.
+const _: () = {
+    assert!(core::mem::size_of::<EventQueueState>() == 56);
+};
+
 impl EventQueueState
 {
-    /// Allocate a new empty event queue with the given capacity.
+    /// Construct a new empty event queue against a caller-supplied ring.
     ///
-    /// `capacity` must be in `[1, EVENT_QUEUE_MAX_CAPACITY]`.
-    /// The ring buffer is allocated via `Box<[u64]>` with `capacity + 1` slots.
-    pub fn new(capacity: u32) -> Self
+    /// `ring` must point to `capacity + 1` zeroed `u64` slots and remain
+    /// valid for the lifetime of the `EventQueueState`. The retype path
+    /// places the ring inline in the same slot as the state; reclaim
+    /// frees both regions together via `retype_free`.
+    ///
+    /// # Safety
+    /// `ring` must be 8-byte aligned, point to writable memory of at
+    /// least `(capacity + 1) * 8` bytes, and outlive this state.
+    pub unsafe fn new(capacity: u32, ring: *mut u64) -> Self
     {
-        // Allocate ring buffer; Box guarantees heap placement.
-        let ring_len = (capacity + 1) as usize;
-        let mut ring_vec: alloc::vec::Vec<u64> = alloc::vec![0u64; ring_len];
-        let ring = ring_vec.as_mut_ptr();
-        core::mem::forget(ring_vec); // ownership transferred to raw pointer
         Self {
             ring,
             capacity,
@@ -226,22 +240,22 @@ pub unsafe fn event_queue_recv(
     Err(())
 }
 
-/// Free all resources held by `eq` and wake any blocked waiter.
+/// Wake any thread blocked on `eq` with a zero payload (`ObjectGone`).
 ///
-/// Called from `dealloc_object` when the `EventQueue` cap's ref count hits zero.
+/// Called from `dealloc_object` when the `EventQueue` cap's ref count
+/// hits zero. The ring buffer lives inline in the surrounding retype
+/// slot and is reclaimed by the caller via `retype_free`; there is
+/// nothing for this function to deallocate.
 ///
 /// # Safety
-/// Must be called with the scheduler lock held. `eq` must be a valid pointer
-/// originally produced by `Box::into_raw(Box::new(EventQueueState::new(...)))`.
-/// After this call `eq` itself is NOT freed — the caller drops the outer
-/// `EventQueueObject` box.
+/// Must be called with the scheduler lock held. `eq` must be a valid
+/// pointer to a live `EventQueueState`.
 #[cfg(not(test))]
 pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
 {
     // SAFETY: eq is a valid pointer.
     let eq = unsafe { &mut *eq };
 
-    // Wake blocked waiter with wakeup_value = 0 (ObjectGone).
     if !eq.waiter.is_null()
     {
         let waiter = eq.waiter;
@@ -256,22 +270,4 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
             crate::sched::enqueue_and_wake(waiter, target_cpu, prio);
         }
     }
-
-    // Reconstruct and drop the ring buffer allocation.
-    if !eq.ring.is_null()
-    {
-        let ring_len = (eq.capacity + 1) as usize;
-        // SAFETY: ring was allocated as Vec<u64> of ring_len zeros via vec![]; len==cap,
-        // so Box::from_raw reconstructs the same allocation for drop.
-        // same_length_and_capacity: intentional — ring was allocated as vec![0; ring_len],
-        // so len == cap. Reconstructing with equal len/cap is the correct way to free it.
-        #[allow(clippy::same_length_and_capacity)]
-        unsafe {
-            // Reconstruct the Vec that was forgotten in new() and drop it.
-            drop(alloc::vec::Vec::from_raw_parts(eq.ring, ring_len, ring_len));
-        }
-        eq.ring = core::ptr::null_mut();
-    }
 }
-
-extern crate alloc;

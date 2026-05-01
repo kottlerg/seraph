@@ -239,8 +239,15 @@ pub fn spawn_log_thread(info: &InitInfo, alloc: &mut FrameAlloc, log_ep: u32, io
     // SAFETY: LOG_THREAD_IPC_BUF_VA is mapped writable and covers one page.
     unsafe { core::ptr::write_bytes(LOG_THREAD_IPC_BUF_VA as *mut u8, 0, PAGE_SIZE as usize) };
 
-    // Create the thread bound to init's address space and CSpace.
-    let Ok(thread_cap) = syscall::cap_create_thread(info.aspace_cap, info.cspace_cap)
+    // Reserve a Thread-retype slab and create the log thread bound to
+    // init's address space and CSpace.
+    let Some(thread_slab) = alloc.alloc_pages(crate::THREAD_RETYPE_PAGES)
+    else
+    {
+        log("init: FATAL: cannot allocate log thread frame slab");
+        syscall::thread_exit();
+    };
+    let Ok(thread_cap) = syscall::cap_create_thread(thread_slab, info.aspace_cap, info.cspace_cap)
     else
     {
         log("init: FATAL: cannot create log thread");

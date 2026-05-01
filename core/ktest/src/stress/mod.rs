@@ -20,6 +20,7 @@ mod concurrent_map_unmap;
 mod concurrent_signal;
 mod event_queue_fill_drain;
 mod idle_wake_race;
+mod retype_concurrent;
 mod thread_churn;
 
 use crate::{ChildStack, TestContext, run_integration_test};
@@ -54,4 +55,5 @@ pub fn run_all(ctx: &TestContext)
         "stress::concurrent_map_unmap",
         concurrent_map_unmap::run(ctx)
     );
+    run_integration_test!("stress::retype_concurrent", retype_concurrent::run(ctx));
 }

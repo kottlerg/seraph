@@ -30,15 +30,21 @@ pub struct RestartCtx
     pub procmgr_ep: u32,
     pub bootstrap_ep: u32,
     pub ipc_buf: *mut u64,
-    pub ws_cap: u32,
+    /// Shared death-notification queue. Restarted services are
+    /// rebound here with the same correlator they used pre-crash, so
+    /// the routing in `dispatch_deaths` continues to land on the
+    /// correct `ServiceEntry`.
+    pub deaths_eq: u32,
 }
 
 /// Handle a service death detected via event queue notification.
 ///
 /// Checks criticality and restart policy, then attempts to restart the service
 /// if appropriate. Marks the service inactive if restart is not attempted or
-/// fails.
-pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx)
+/// fails. `correlator` is the death-payload tag used to route this entry —
+/// the restarted thread is rebound under the same value so subsequent
+/// crashes route back to the same `ServiceEntry`.
+pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx, correlator: u32)
 {
     std::os::seraph::log!("service died: {}", svc.name_str());
     std::os::seraph::log!("  exit_reason={exit_reason:#018x}");
@@ -67,7 +73,7 @@ pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx)
         u64::from(svc.restart_count + 1)
     );
 
-    if !restart_process(svc, ctx)
+    if !restart_process(svc, ctx, correlator)
     {
         svc.active = false;
         return;
@@ -111,7 +117,7 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
 
 /// Create a new process via procmgr, serve bootstrap (log endpoint), start it,
 /// and rebind death notification. Returns `true` on success.
-fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
+fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx, correlator: u32) -> bool
 {
     // Reclaim the previous instance's kernel objects (thread/aspace/cspace/
     // ProcessInfo frame) before spawning a fresh one. CSpace teardown
@@ -191,7 +197,7 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx) -> bool
 
     svc.bootstrap_token = child_token;
 
-    rebind_death_notification(svc, ctx.ws_cap, new_thread_cap)
+    rebind_death_notification(svc, ctx.deaths_eq, new_thread_cap, correlator)
 }
 
 /// Spawn a fresh instance of `svc` via procmgr. Branches on the recorded
@@ -262,29 +268,23 @@ fn start_process(process_handle: u32, ipc_buf: *mut u64) -> bool
     true
 }
 
-/// Rebind death notification: create a new event queue on the new thread,
-/// remove the old one from the wait set.
-fn rebind_death_notification(svc: &mut ServiceEntry, ws_cap: u32, new_thread_cap: u32) -> bool
+/// Rebind death notification onto the shared queue using the same
+/// correlator the dead instance used. No new event queue is created —
+/// every supervised service routes through `ctx.deaths_eq`, and the
+/// payload tag is what links a death back to its `ServiceEntry`.
+fn rebind_death_notification(
+    svc: &mut ServiceEntry,
+    deaths_eq: u32,
+    new_thread_cap: u32,
+    correlator: u32,
+) -> bool
 {
-    let _ = syscall::wait_set_remove(ws_cap, svc.event_queue_cap);
-    let _ = syscall::cap_delete(svc.event_queue_cap);
-
-    let Ok(new_eq) = syscall::event_queue_create(4)
-    else
-    {
-        std::os::seraph::log!("failed to create new event queue for restart");
-        return false;
-    };
-
-    // Correlator 0: payload is the bare exit_reason (see rebind rationale
-    // in `handle_register`).
-    if syscall::thread_bind_notification(new_thread_cap, new_eq, 0).is_err()
+    if syscall::thread_bind_notification(new_thread_cap, deaths_eq, correlator).is_err()
     {
         std::os::seraph::log!("failed to rebind death notification");
         return false;
     }
 
-    svc.event_queue_cap = new_eq;
     svc.thread_cap = new_thread_cap;
     true
 }

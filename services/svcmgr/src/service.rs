@@ -66,8 +66,6 @@ pub struct ServiceEntry
     pub restart_policy: u8,
     /// Criticality level (`CRITICALITY_FATAL`, `CRITICALITY_NORMAL`).
     pub criticality: u8,
-    /// Capability slot for the death-notification event queue.
-    pub event_queue_cap: u32,
     /// Number of restart attempts so far.
     pub restart_count: u32,
     /// Whether this service is currently active.
@@ -105,7 +103,6 @@ impl ServiceEntry
             bundle_count: 0,
             restart_policy: 0,
             criticality: 0,
-            event_queue_cap: 0,
             restart_count: 0,
             active: false,
             bootstrap_token: 0,

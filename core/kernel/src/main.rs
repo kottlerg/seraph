@@ -330,10 +330,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing"));
 
             // AddressSpace cap: init can use this to spawn threads in its space.
-            let as_obj = Box::new(AddressSpaceObject {
-                header: KernelObjectHeader::new(ObjectType::AddressSpace),
-                address_space: init_as_ptr,
-            });
+            // Init's bootstrap AS is heap-backed (PT pages from the buddy);
+            // the typed-memory deferral retypes init's bootstrap state in a
+            // follow-up task. Budget=0 and empty pool are informational here.
+            let as_obj = Box::new(AddressSpaceObject::heap_backed(init_as_ptr));
             // SAFETY: Box::into_raw returns non-null pointer; cast preserves validity.
             let as_nn = unsafe {
                 NonNull::new_unchecked(Box::into_raw(as_obj).cast::<KernelObjectHeader>())
@@ -358,9 +358,13 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     header: KernelObjectHeader::new(ObjectType::Frame),
                     base: seg.phys_addr,
                     size: seg.size,
+                    // Init ELF segment: not retypable; cap minted without RETYPE.
+                    available_bytes: core::sync::atomic::AtomicU64::new(0),
                     // Init ELF segments are bootloader-loaded pages outside
                     // the buddy pool; never return them.
                     owns_memory: core::sync::atomic::AtomicBool::new(false),
+                    allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                    lock: core::sync::atomic::AtomicU32::new(0),
                 });
                 // SAFETY: Box::into_raw returns non-null pointer; cast preserves validity.
                 let fo_nn = unsafe {
@@ -620,7 +624,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         // (e.g. a log-serving thread that shares init's capability namespace).
         let init_cspace_cap_slot = {
             use alloc::boxed::Box;
-            use cap::object::{CSpaceKernelObject, KernelObjectHeader, ObjectType};
+            use cap::object::{CSpaceKernelObject, KernelObjectHeader};
             use cap::slot::{CapTag, Rights};
             use core::ptr::NonNull;
 
@@ -630,10 +634,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             // Get a raw pointer to the CSpace itself (the one being transferred to
             // init below). The CSpaceKernelObject wraps this pointer.
             let cspace_ptr: *mut cap::cspace::CSpace = core::ptr::from_mut(cs);
-            let cs_obj = Box::new(CSpaceKernelObject {
-                header: KernelObjectHeader::new(ObjectType::CSpaceObj),
-                cspace: cspace_ptr,
-            });
+            // Init's bootstrap CSpace is heap-backed; deferred task retypes
+            // init's bootstrap state. Budget=0 and empty pool informational.
+            let cs_obj = Box::new(CSpaceKernelObject::heap_backed(cspace_ptr));
             // SAFETY: Box::into_raw returns non-null pointer; cast preserves validity.
             let cs_nn = unsafe {
                 NonNull::new_unchecked(Box::into_raw(cs_obj).cast::<KernelObjectHeader>())

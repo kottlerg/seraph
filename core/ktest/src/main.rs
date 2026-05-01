@@ -133,6 +133,14 @@ pub struct TestContext
     /// for the snapshot copy. The returned `IpcMessage` owns data words
     /// and received cap-slot indices.
     pub ipc_buf: *mut u64,
+
+    /// First RAM Frame cap slot in ktest's `CSpace`, kernel-minted at
+    /// Phase 7. ktest is loaded as init and inherits the RAM Frame caps
+    /// directly (the same caps init forwards to memmgr). Used by tests
+    /// that need to inspect the rights/state of an actual RAM cap; the
+    /// `frame_pool` slots elsewhere are derived from a segment cap and
+    /// therefore lack the RETYPE right.
+    pub memory_frame_base: u32,
 }
 
 /// 16 KiB stack for a child thread, aligned per the System V ABI.
@@ -236,6 +244,7 @@ fn run(info_ptr: u64) -> !
     let ctx = TestContext {
         aspace_cap,
         ipc_buf: ipc_buf_ptr,
+        memory_frame_base: info.memory_frame_base,
     };
 
     // Parse config early so we can gate tier execution and pass bench_iters.

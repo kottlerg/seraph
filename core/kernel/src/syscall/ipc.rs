@@ -1173,81 +1173,106 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Check the source is not already in a wait set (single wait set invariant).
-    // The `wait_set` field is at the same offset for all three source types.
-    // We check it by reading the field directly based on the tag.
-    // SAFETY: source_ptr extracted from validated cap; tag determines object layout.
-    let already_registered = unsafe {
+    // Hold source.lock outer for the entire registration sequence:
+    // duplicate-registration check, waitset_add (which takes ws.lock
+    // INNER — see WaitSetState::lock for the ordering rationale), and
+    // the back-pointer write must all be atomic from the source's
+    // perspective. Otherwise signal_send / event_post / endpoint_call
+    // could read a partially-installed back-pointer and call into
+    // waitset_notify with an unregistered member, or skip the notify
+    // when the source is in fact ready.
+    //
+    // SAFETY: source_ptr extracted from validated cap; member_idx returned
+    // from waitset_add. Lock acquired and released for each branch; the
+    // helper closure cannot be used here because the source types differ
+    // and the field accesses do not share a trait.
+    let member_idx_result = unsafe {
         match source_tag
         {
             WaitSetSourceTag::Endpoint =>
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
+                // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = source_ptr.cast::<crate::ipc::endpoint::EndpointState>();
-                !(*ep).wait_set.is_null()
+                let saved = (*ep).lock.lock_raw();
+                let res = if (*ep).wait_set.is_null()
+                {
+                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, token)
+                    {
+                        Ok(idx) =>
+                        {
+                            (*ep).wait_set = ws_state.cast::<u8>();
+                            (*ep).wait_set_member_idx = idx;
+                            Ok(idx)
+                        }
+                        Err(()) => Err(SyscallError::InvalidArgument),
+                    }
+                }
+                else
+                {
+                    Err(SyscallError::InvalidArgument)
+                };
+                (*ep).lock.unlock_raw(saved);
+                res
             }
             WaitSetSourceTag::Signal =>
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
+                // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig = source_ptr.cast::<crate::ipc::signal::SignalState>();
-                !(*sig).wait_set.is_null()
+                let saved = (*sig).lock.lock_raw();
+                let res = if (*sig).wait_set.is_null()
+                {
+                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, token)
+                    {
+                        Ok(idx) =>
+                        {
+                            (*sig).wait_set = ws_state.cast::<u8>();
+                            (*sig).wait_set_member_idx = idx;
+                            (*sig)
+                                .has_observer
+                                .store(1, core::sync::atomic::Ordering::Relaxed);
+                            Ok(idx)
+                        }
+                        Err(()) => Err(SyscallError::InvalidArgument),
+                    }
+                }
+                else
+                {
+                    Err(SyscallError::InvalidArgument)
+                };
+                (*sig).lock.unlock_raw(saved);
+                res
             }
             WaitSetSourceTag::EventQueue =>
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
+                // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq = source_ptr.cast::<crate::ipc::event_queue::EventQueueState>();
-                !(*eq).wait_set.is_null()
+                let saved = (*eq).lock.lock_raw();
+                let res = if (*eq).wait_set.is_null()
+                {
+                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, token)
+                    {
+                        Ok(idx) =>
+                        {
+                            (*eq).wait_set = ws_state.cast::<u8>();
+                            (*eq).wait_set_member_idx = idx;
+                            Ok(idx)
+                        }
+                        Err(()) => Err(SyscallError::InvalidArgument),
+                    }
+                }
+                else
+                {
+                    Err(SyscallError::InvalidArgument)
+                };
+                (*eq).lock.unlock_raw(saved);
+                res
             }
         }
     };
-    if already_registered
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-
-    // Register in the wait set.
-    // SAFETY: ws_state, source_ptr valid; scheduler lock not held.
-    let member_idx =
-        unsafe { crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, token) }
-            .map_err(|()| SyscallError::InvalidArgument)?;
-
-    // Write back-pointer on the source.
-    // SAFETY: source_ptr extracted from validated cap; member_idx from waitset_add.
-    unsafe {
-        match source_tag
-        {
-            WaitSetSourceTag::Endpoint =>
-            {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let ep = source_ptr.cast::<crate::ipc::endpoint::EndpointState>();
-                (*ep).wait_set = ws_state.cast::<u8>();
-                (*ep).wait_set_member_idx = member_idx;
-            }
-            WaitSetSourceTag::Signal =>
-            {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let sig = source_ptr.cast::<crate::ipc::signal::SignalState>();
-                (*sig).wait_set = ws_state.cast::<u8>();
-                (*sig).wait_set_member_idx = member_idx;
-                (*sig)
-                    .has_observer
-                    .store(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            WaitSetSourceTag::EventQueue =>
-            {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-                #[allow(clippy::cast_ptr_alignment)]
-                let eq = source_ptr.cast::<crate::ipc::event_queue::EventQueueState>();
-                (*eq).wait_set = ws_state.cast::<u8>();
-                (*eq).wait_set_member_idx = member_idx;
-            }
-        }
-    }
+    member_idx_result?;
 
     Ok(0)
 }
@@ -1260,6 +1285,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Clears the back-pointer on the source. Stale entries for the removed
 /// member are silently skipped by subsequent `SYS_WAIT_SET_WAIT` calls.
 #[cfg(not(test))]
+#[allow(clippy::too_many_lines)]
 pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::ipc::wait_set::WaitSetSourceTag;
@@ -1339,42 +1365,67 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Remove from wait set.
-    // SAFETY: ws_state, source_ptr validated above.
-    unsafe { crate::ipc::wait_set::waitset_remove(ws_state, source_ptr) }
-        .map_err(|()| SyscallError::InvalidCapability)?;
-
-    // Clear source back-pointer.
+    // Hold source.lock outer for both waitset_remove (ws.lock INNER) and
+    // the back-pointer clear, mirroring the lock order in sys_wait_set_add
+    // and signal_send → waitset_notify.
+    //
     // SAFETY: source_ptr extracted from validated cap.
-    unsafe {
+    let remove_result = unsafe {
         match source_tag
         {
             WaitSetSourceTag::Endpoint =>
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
+                // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = source_ptr.cast::<crate::ipc::endpoint::EndpointState>();
-                (*ep).wait_set = core::ptr::null_mut();
-                (*ep).wait_set_member_idx = 0;
+                let saved = (*ep).lock.lock_raw();
+                let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
+                if res.is_ok()
+                {
+                    (*ep).wait_set = core::ptr::null_mut();
+                    (*ep).wait_set_member_idx = 0;
+                }
+                (*ep).lock.unlock_raw(saved);
+                res
             }
             WaitSetSourceTag::Signal =>
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
+                // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig = source_ptr.cast::<crate::ipc::signal::SignalState>();
-                (*sig).wait_set = core::ptr::null_mut();
-                (*sig).wait_set_member_idx = 0;
+                let saved = (*sig).lock.lock_raw();
+                let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
+                if res.is_ok()
+                {
+                    (*sig).wait_set = core::ptr::null_mut();
+                    (*sig).wait_set_member_idx = 0;
+                    // Update has_observer: keep 1 only if a direct waiter is still registered.
+                    (*sig).has_observer.store(
+                        u8::from(!(*sig).waiter.is_null()),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                (*sig).lock.unlock_raw(saved);
+                res
             }
             WaitSetSourceTag::EventQueue =>
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
+                // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq = source_ptr.cast::<crate::ipc::event_queue::EventQueueState>();
-                (*eq).wait_set = core::ptr::null_mut();
-                (*eq).wait_set_member_idx = 0;
+                let saved = (*eq).lock.lock_raw();
+                let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
+                if res.is_ok()
+                {
+                    (*eq).wait_set = core::ptr::null_mut();
+                    (*eq).wait_set_member_idx = 0;
+                }
+                (*eq).lock.unlock_raw(saved);
+                res
             }
         }
-    }
+    };
+    remove_result.map_err(|()| SyscallError::InvalidCapability)?;
 
     Ok(0)
 }

@@ -112,7 +112,9 @@ fn main() -> !
     unreserve_pages(ecam_range);
 
     // Create block device service endpoint for the driver to receive on.
-    let blk_ep = syscall::cap_create_endpoint().unwrap_or(0);
+    let blk_ep = std::os::seraph::object_slab_acquire(88)
+        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
+        .unwrap_or(0);
     if blk_ep == 0
     {
         std::os::seraph::log!("failed to create block device endpoint");

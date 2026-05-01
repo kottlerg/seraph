@@ -197,27 +197,37 @@ impl Pipe {
             SpscHeader::init(parent_va as *mut SpscHeader, RING_CAPACITY);
         }
 
-        let data_signal = match syscall::cap_create_signal() {
+        let data_slab = crate::sys::alloc::seraph::object_slab_acquire(120).ok_or_else(|| {
+            // Tear down what we have so far before reporting.
+            // Allocator failure here is rare (memmgr unreachable / OOM).
+            io::Error::other("seraph pipe: object_slab_acquire (data) failed")
+        });
+        let data_signal = match data_slab.and_then(|slab| {
+            syscall::cap_create_signal(slab)
+                .map_err(|_| io::Error::other("seraph pipe: cap_create_signal (data) failed"))
+        }) {
             Ok(s) => s,
-            Err(_) => {
+            Err(e) => {
                 drop(sb);
                 let _ = syscall::cap_delete(frame_cap);
                 free_parent_va(parent_va);
-                return Err(io::Error::other(
-                    "seraph pipe: cap_create_signal (data) failed",
-                ));
+                return Err(e);
             }
         };
-        let space_signal = match syscall::cap_create_signal() {
+        let space_slab = crate::sys::alloc::seraph::object_slab_acquire(120).ok_or_else(|| {
+            io::Error::other("seraph pipe: object_slab_acquire (space) failed")
+        });
+        let space_signal = match space_slab.and_then(|slab| {
+            syscall::cap_create_signal(slab)
+                .map_err(|_| io::Error::other("seraph pipe: cap_create_signal (space) failed"))
+        }) {
             Ok(s) => s,
-            Err(_) => {
+            Err(e) => {
                 let _ = syscall::cap_delete(data_signal);
                 drop(sb);
                 let _ = syscall::cap_delete(frame_cap);
                 free_parent_va(parent_va);
-                return Err(io::Error::other(
-                    "seraph pipe: cap_create_signal (space) failed",
-                ));
+                return Err(e);
             }
         };
 

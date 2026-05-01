@@ -43,16 +43,24 @@ A capability to one or more contiguous physical frames. Rights:
 - **Map** — may map these frames into an address space
 - **Write** — authority to create writable mappings
 - **Execute** — authority to create executable mappings
+- **Retype** — authority to consume bytes of this Frame's region as the
+  backing storage for a newly created kernel object (see
+  [Typed Memory](#typed-memory))
 
 A capability may carry both Write and Execute rights, representing independent
 authorities over the same physical memory. W^X is enforced at mapping time: the
 kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
-The kernel mints Frame caps for all usable RAM at boot and places them in
-init's CSpace. Init transfers them (via the derive-twice pattern) to memmgr,
-which thereafter owns userspace RAM frame allocation and answers
-`REQUEST_FRAMES` for every std-built service. See
+The kernel mints Frame caps for all usable RAM at boot with `Map | Write |
+Execute | Retype` and places them in init's CSpace. Frame caps minted for
+firmware tables (ACPI regions, RSDP, DTB), boot modules, and init's own
+ELF segments mint without `Retype` — they are mappable read-only references
+to fixed-purpose memory and cannot be consumed for kernel-object creation.
+
+Init transfers RAM Frame caps (via the derive-twice pattern) to memmgr, which
+thereafter owns userspace RAM frame allocation and answers `REQUEST_FRAMES`
+for every std-built service. See
 [`userspace-memory-model.md`](userspace-memory-model.md) and
 [`services/memmgr/README.md`](../services/memmgr/README.md). MMIO Frame caps
 follow a separate flow through devmgr; see
@@ -226,26 +234,91 @@ withdrawn. If the revoker still holds the parent capability, it retains access.
 
 ## Object Creation
 
-New kernel objects are created via typed syscalls. Each object type has a
-corresponding creation call:
+New kernel objects are created via typed syscalls. Every creation call
+consumes a Frame capability with the `Retype` right as its first
+argument; the kernel constructs the new object inside that Frame's
+backing region, debiting bytes from the Frame's available-bytes ledger.
 
 ```
-create_endpoint()      → endpoint_cap  (Send + Receive + Grant)
-create_signal()        → signal_cap    (Signal + Wait)
-create_event_queue(n)  → queue_cap     (Post + Recv)
-create_thread(...)     → thread_cap    (Control)
-create_address_space() → aspace_cap    (Map)
-create_cspace()        → cspace_cap    (Insert + Delete + Derive + Revoke)
-create_wait_set()      → wait_set_cap  (Modify + Wait)
+create_endpoint(frame)             → endpoint_cap  (Send + Receive + Grant)
+create_signal(frame)               → signal_cap    (Signal + Wait)
+create_event_queue(frame, n)       → queue_cap     (Post + Recv)
+create_thread(frame, aspace, cs)   → thread_cap    (Control)
+create_address_space(frame, ...)   → aspace_cap    (Map)
+create_cspace(frame, ...)          → cspace_cap    (Insert + Delete + Derive + Revoke)
+create_wait_set(frame)             → wait_set_cap  (Modify + Wait)
 ```
 
-The returned capability is placed in a free slot in the caller's CSpace. The caller
-holds all rights on a freshly created object. It may then derive and delegate narrower
-capabilities to other processes as appropriate.
+The kernel rejects creation if the Frame cap lacks `Retype` rights or
+if its available-bytes ledger has insufficient room for the requested
+object. The returned capability is placed in a free slot in the caller's
+CSpace. The caller holds all rights on a freshly created object.
 
 The kernel does not track ownership beyond the derivation tree. If a process destroys
 all capabilities in the derivation tree for an object — including its own — the kernel
-frees the object. Objects do not outlive all references to them.
+reclaims the object's bytes (returning them to the Frame cap from which the object
+was retyped) and frees the slot. Objects do not outlive all references to them.
+
+---
+
+## Typed Memory
+
+Every kernel object's backing storage is accounted to a specific Frame
+capability. There is no ambient kernel pool from which a process can
+draw kernel-object memory; a process can only create kernel objects
+against Frame caps it holds with `Retype` rights.
+
+### Available-bytes ledger
+
+Each retypable Frame capability carries an `available_bytes` counter.
+Creating a kernel object against the cap debits the counter by the
+object's byte cost (rounded up to a fixed size class). Destroying
+the object credits the bytes back. The counter is observable via
+[`SYS_CAP_INFO`](#cap-introspection).
+
+The ledger gives userspace memory managers a single primitive for
+budgeting both *mapped* memory (via `mem_map`) and *kernel-object*
+memory (via the create syscalls above): one Frame cap, two consuming
+operations, one budget. A misbehaving service cannot inflate kernel
+memory through a back channel — every byte of kernel-object backing
+is debited from a cap the service holds.
+
+### Auto-reclaim
+
+When a kernel object's reference count reaches zero (every cap referring
+to it has been destroyed), the kernel reclaims its bytes back to the
+Frame capability the object was retyped from. If the source Frame cap's
+own reference count then reaches zero, the reclamation cascades upward
+through the derivation chain. Process death is an instance of this
+cascade: revoking a child's CSpace destroys all caps the child held,
+which deallocates every kernel object the child created, which credits
+all bytes back to memmgr's frame pool — closing the loop without
+explicit cleanup.
+
+### Address-space and CSpace growth budgets
+
+Page tables and CSpace slot pages are kernel-half memory that grows
+during normal operation as a process maps memory or accumulates caps.
+Each `AddressSpace` and `CSpace` capability carries its own growth
+budget — a pool of pages donated at creation time from a Retype-bearing
+Frame cap — from which `mem_map` and `cap_insert` allocate. Exhausting
+the budget returns `NoMemory`; the budget refills via *augment mode* on
+the same create syscall (passing the existing AS/CS slot as the augment
+target merges a new slab of pages into its growth budget).
+
+This means every kernel-half page-table and slot-page allocation is
+gated by a Frame cap the owning process holds. There is no untracked
+kernel growth path.
+
+### Cap introspection
+
+`SYS_CAP_INFO` is a read-only inquiry that returns runtime state for
+a held capability: tag and rights for any cap; size, available-bytes,
+and retype-rights flag for Frame caps; PT growth budget for AddressSpace
+caps; slot capacity, slots used, and growth budget for CSpace caps.
+The syscall enables defensive ledger checks (e.g. memmgr can verify a
+returning cap's available-bytes), and lets receivers of a cap from a
+less-trusted source validate its shape before relying on it.
 
 ---
 

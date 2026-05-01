@@ -20,8 +20,10 @@ const RIGHTS_SIGNAL: u64 = 1 << 7;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let root = cap_create_signal().map_err(|_| "cap_revoke_under_use: create root failed")?;
-    let done = cap_create_signal().map_err(|_| "cap_revoke_under_use: create done failed")?;
+    let root = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_revoke_under_use: create root failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_revoke_under_use: create done failed")?;
 
     // Derive 4 children from root.
     let mut derived = [0u32; NUM_CHILDREN];
@@ -36,13 +38,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut cspaces = [0u32; NUM_CHILDREN];
     for i in 0..NUM_CHILDREN
     {
-        let cs = cap_create_cspace(16).map_err(|_| "cap_revoke_under_use: create_cspace failed")?;
+        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+            .map_err(|_| "cap_revoke_under_use: create_cspace failed")?;
         let child_sig = cap_copy(derived[i], cs, RIGHTS_SIGNAL)
             .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
         let child_done =
             cap_copy(done, cs, 1 << 7).map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
 
-        let th = cap_create_thread(ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
             .map_err(|_| "cap_revoke_under_use: create_thread failed")?;
 
         let done_bit = 1u64 << i;

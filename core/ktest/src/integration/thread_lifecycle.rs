@@ -47,13 +47,13 @@ static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 pub fn run(ctx: &TestContext) -> TestResult
 {
     const BUF: usize = 512;
-    let sync = cap_create_signal()
+    let sync = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "integration::thread_lifecycle: cap_create_signal failed")?;
-    let cs = cap_create_cspace(16)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "integration::thread_lifecycle: cap_create_cspace failed")?;
     let child_sync = cap_copy(sync, cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "integration::thread_lifecycle: cap_copy failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -113,9 +113,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // The thread cap is still valid even after the thread exits; the kernel
     // allows these operations on any Thread object. Create a fresh thread just
     // to test these without depending on child exit timing.
-    let cs2 = cap_create_cspace(8)
+    let cs2 = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
         .map_err(|_| "integration::thread_lifecycle: cap_create_cspace (step 8) failed")?;
-    let th2 = cap_create_thread(ctx.aspace_cap, cs2)
+    let th2 = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs2)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread (step 8) failed")?;
 
     thread_set_priority(th2, 5, 0)

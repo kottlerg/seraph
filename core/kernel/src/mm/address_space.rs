@@ -184,6 +184,44 @@ impl AddressSpace
         }
     }
 
+    /// Allocate a fresh user address space backed by a caller-supplied root
+    /// page-table frame.
+    ///
+    /// Used by the typed-memory retype path (`sys_cap_create_aspace`): the
+    /// caller pops a page from the `AddressSpaceObject`'s growth pool and
+    /// passes its physical address here. This function:
+    /// 1. Zeroes the frame.
+    /// 2. Copies the kernel-half PT entries (indices 256-511) from the
+    ///    currently active root.
+    /// 3. Returns an [`AddressSpace`] wrapping the supplied frame.
+    ///
+    /// # Safety
+    /// `root_phys` must be a freshly-allocated, page-aligned 4 KiB physical
+    /// frame mapped in the kernel direct map and not aliased anywhere.
+    /// Phase 3 (page tables) and Phase 4 (heap) must already be active.
+    #[cfg(not(test))]
+    pub unsafe fn new_user_with_root(root_phys: u64) -> Self
+    {
+        let root_virt = phys_to_virt(root_phys);
+
+        // SAFETY: caller's contract.
+        unsafe {
+            core::ptr::write_bytes(root_virt as *mut u8, 0, PAGE_SIZE);
+        }
+
+        // SAFETY: root_virt is valid and page-aligned.
+        unsafe {
+            Self::copy_kernel_entries(root_virt);
+        }
+
+        Self {
+            root_phys,
+            root_virt,
+            active_cpus: AtomicU64::new(0),
+            pt_lock: AtomicBool::new(false),
+        }
+    }
+
     /// Copy entries 256–511 from the currently active page table root into
     /// the new user page table at `new_root_virt`.
     ///
@@ -268,6 +306,63 @@ impl AddressSpace
 
         // Local TLB invalidation for the mapped page. The current CPU does not
         // send an IPI to itself; it performs the invalidation directly.
+        // SAFETY: virt is a valid user virtual address.
+        unsafe {
+            flush_page(virt);
+        }
+
+        self.pt_unlock();
+        crate::percpu::preempt_enable();
+
+        Ok(())
+    }
+
+    /// Pooled variant of [`map_page`]: draws intermediate PT frames from
+    /// the supplied `AddressSpaceObject`'s growth pool instead of the
+    /// buddy allocator.
+    ///
+    /// The `aso` MUST wrap *this* `AddressSpace`. `mem_map` enforces this
+    /// implicitly because it resolves both via the same capability.
+    ///
+    /// # Safety
+    /// Same contract as [`map_page`].
+    #[cfg(not(test))]
+    pub unsafe fn map_page_pooled(
+        &self,
+        virt: u64,
+        phys: u64,
+        flags: crate::mm::paging::PageFlags,
+        aso: &crate::cap::object::AddressSpaceObject,
+    ) -> Result<(), ()>
+    {
+        use crate::arch::current::paging::{flush_page, map_user_page_pooled};
+
+        crate::percpu::preempt_disable();
+        self.pt_lock();
+
+        // SAFETY: caller's contract; aso is the wrapper paired with this AS.
+        let result = unsafe { map_user_page_pooled(self.root_virt, virt, phys, flags, aso) };
+
+        if result.is_err()
+        {
+            self.pt_unlock();
+            crate::percpu::preempt_enable();
+            return Err(());
+        }
+
+        let active = self.active_cpu_mask();
+        let current = crate::arch::current::cpu::current_cpu();
+        let remote_cpus = active & !(1u64 << current);
+
+        if remote_cpus != 0
+        {
+            // SAFETY: root_phys is a valid PT root; remote_cpus mask is a
+            // subset of online CPUs.
+            unsafe {
+                crate::mm::tlb_shootdown::shootdown(self.root_phys, remote_cpus, virt);
+            }
+        }
+
         // SAFETY: virt is a valid user virtual address.
         unsafe {
             flush_page(virt);

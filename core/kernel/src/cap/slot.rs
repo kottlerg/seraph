@@ -180,6 +180,15 @@ impl Rights
     /// May forward SBI calls to M-mode firmware (RISC-V only).
     pub const CALL: Rights = Rights(1 << 20);
 
+    // ── Frame retype ──────────────────────────────────────────────────────────
+    /// Authority to retype this Frame's memory into kernel objects.
+    ///
+    /// Stamped on RAM Frame caps minted from the buddy allocator at boot.
+    /// Firmware-table / boot-module / init-segment Frame caps never hold this
+    /// bit. Every retype-consuming syscall checks
+    /// `tag == Frame && rights.contains(RETYPE)`.
+    pub const RETYPE: Rights = Rights(1 << 21);
+
     /// Return `true` if all bits in `mask` are present in `self`.
     pub fn contains(self, mask: Rights) -> bool
     {
@@ -472,5 +481,37 @@ mod tests
         let id = SlotId::new(1, NonZeroU32::new(5).unwrap());
         assert_eq!(id.cspace_id, 1);
         assert_eq!(id.index.get(), 5);
+    }
+
+    #[test]
+    fn rights_retype_bit_position()
+    {
+        // Bit 21 — must match `RIGHTS_RETYPE` in `abi/syscall/src/lib.rs`
+        // and remain disjoint from every other Rights bit (last existing bit
+        // is CALL at 20).
+        assert_eq!(Rights::RETYPE.0, 1 << 21);
+        // Disjoint from all other rights.
+        let combined = Rights::MAP
+            | Rights::WRITE
+            | Rights::EXECUTE
+            | Rights::READ
+            | Rights::SEND
+            | Rights::RECEIVE
+            | Rights::GRANT
+            | Rights::SIGNAL
+            | Rights::WAIT
+            | Rights::POST
+            | Rights::RECV
+            | Rights::CONTROL
+            | Rights::OBSERVE
+            | Rights::INSERT
+            | Rights::DELETE
+            | Rights::DERIVE
+            | Rights::REVOKE
+            | Rights::MODIFY
+            | Rights::USE
+            | Rights::ELEVATE
+            | Rights::CALL;
+        assert_eq!((combined & Rights::RETYPE).0, 0);
     }
 }

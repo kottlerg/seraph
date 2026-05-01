@@ -70,13 +70,13 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let p2c = cap_create_signal()
+    let p2c = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "stress::idle_wake_race: cap_create_signal (p2c) failed")?;
-    let c2p = cap_create_signal()
+    let c2p = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "stress::idle_wake_race: cap_create_signal (c2p) failed")?;
 
-    let cs =
-        cap_create_cspace(16).map_err(|_| "stress::idle_wake_race: cap_create_cspace failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "stress::idle_wake_race: cap_create_cspace failed")?;
 
     let child_p2c = cap_copy(p2c, cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "stress::idle_wake_race: cap_copy (p2c) failed")?;
@@ -86,7 +86,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // SAFETY: single-threaded at this point; child not yet started.
     unsafe { CHILD_C2P_SLOT = child_c2p };
 
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "stress::idle_wake_race: cap_create_thread failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));

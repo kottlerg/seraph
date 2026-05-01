@@ -32,11 +32,11 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let ws =
-        wait_set_create().map_err(|_| "integration::wait_concurrency: wait_set_create failed")?;
-    let sig = cap_create_signal()
+    let ws = wait_set_create(ctx.memory_frame_base)
+        .map_err(|_| "integration::wait_concurrency: wait_set_create failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "integration::wait_concurrency: cap_create_signal failed")?;
-    let eq = event_queue_create(4)
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
         .map_err(|_| "integration::wait_concurrency: event_queue_create failed")?;
 
     wait_set_add(ws, sig, 1)
@@ -60,11 +60,11 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::wait_concurrency: event_recv (drain part A) failed")?;
 
     // ── Part B: Child fires signal — blocking wake. ───────────────────────────
-    let cs = cap_create_cspace(16)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "integration::wait_concurrency: cap_create_cspace failed")?;
     let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::wait_concurrency: cap_copy sig failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "integration::wait_concurrency: cap_create_thread failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));

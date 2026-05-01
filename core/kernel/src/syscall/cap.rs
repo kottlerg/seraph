@@ -32,18 +32,28 @@ use syscall::SyscallError;
 #[cfg(not(test))]
 use super::current_tcb;
 
-/// `SYS_CAP_CREATE_ENDPOINT` (7): create a new Endpoint object.
+/// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Frame cap into a new Endpoint.
 ///
-/// Allocates `EndpointState` and `EndpointObject`, inserts a cap with
-/// `SEND | RECEIVE | GRANT` rights into the current thread's `CSpace`.
-/// Returns the slot index in rax/a0.
+/// arg0 = Frame-cap slot index in the caller's `CSpace`. The Frame cap
+/// MUST carry `Rights::RETYPE` and have at least
+/// `dispatch_for(Endpoint, 0).raw_bytes` (88 B) of `available_bytes`.
+///
+/// On success, the wrapper + `EndpointState` are constructed in place inside
+/// the source Frame cap's region; a cap with `SEND | RECEIVE | GRANT` rights
+/// is inserted into the caller's `CSpace`; returns the slot index.
+///
+/// On `dec_ref → 0`, auto-reclaim returns the bytes to the source Frame cap
+/// via [`crate::cap::object::dealloc_object`] consulting `header.ancestor`.
 #[cfg(not(test))]
-pub fn sys_cap_create_endpoint(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{EndpointObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{EndpointObject, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::endpoint::EndpointState;
     use core::ptr::NonNull;
+
+    let frame_slot = tf.arg(0) as u32;
 
     // SAFETY: syscall entry ensures current_tcb() returns the active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -51,53 +61,120 @@ pub fn sys_cap_create_endpoint(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidCapability);
     }
-    // SAFETY: tcb validated non-null above; cspace field is immutable after thread creation.
+    // SAFETY: tcb validated non-null; cspace field is immutable after thread creation.
     let cspace = unsafe { (*tcb).cspace };
     if cspace.is_null()
     {
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Allocate EndpointState.
-    let ep_state_ptr = Box::into_raw(Box::new(EndpointState::new()));
+    // Resolve the source Frame cap. Requires Rights::RETYPE.
+    // SAFETY: cspace validated non-null above.
+    let frame_slot_ref =
+        unsafe { super::lookup_cap(cspace, frame_slot, CapTag::Frame, Rights::RETYPE)? };
+    let frame_obj_nn = frame_slot_ref
+        .object
+        .ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: lookup_cap returned a live Frame slot whose object pointer is
+    // valid for the lifetime of the slot.
+    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
 
-    // Allocate EndpointObject (header at offset 0 for safe *-to-header cast).
-    let ep_obj_ptr = Box::into_raw(Box::new(EndpointObject {
-        header: KernelObjectHeader::new(ObjectType::Endpoint),
-        state: ep_state_ptr,
-    }));
+    let entry = dispatch_for(ObjectType::Endpoint, 0).ok_or(SyscallError::InvalidArgument)?;
 
-    // Build NonNull<KernelObjectHeader> by casting (header is at offset 0).
-    // SAFETY: ep_obj_ptr is valid Box allocation; header at offset 0.
+    // Reserve bytes in the Frame cap region.
+    let offset = retype_allocate(frame, entry.raw_bytes)?;
+
+    // Compute the kernel direct-map virtual address of the new object.
+    let block_phys = frame.base + offset;
+    let block_virt = crate::mm::paging::phys_to_virt(block_phys);
+
+    // Layout: EndpointObject at offset 0; EndpointState at offset
+    // size_of::<EndpointObject>() (24). Total 24 + 56 = 80 B, rounds to 128 B.
+    let ep_obj_ptr = block_virt as *mut EndpointObject;
+    let state_offset = core::mem::size_of::<EndpointObject>() as u64;
+    let ep_state_ptr = (block_virt + state_offset) as *mut EndpointState;
+
+    let ancestor = frame_obj_nn;
+
+    // SAFETY: ep_state_ptr / ep_obj_ptr point into the just-allocated region;
+    // alignment: the region is page-aligned (frame.base is page-aligned, and
+    // BIN_128 sub-page slots inherit 8-byte alignment from `bump_offset`'s
+    // initialisation at zero plus 128 B granularity, which exceeds the
+    // 8-byte alignment requirement of both structs).
+    unsafe {
+        core::ptr::write(ep_state_ptr, EndpointState::new());
+        core::ptr::write(
+            ep_obj_ptr,
+            EndpointObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::Endpoint, ancestor),
+                state: ep_state_ptr,
+            },
+        );
+    }
+
+    // Bump the ancestor's refcount: each retyped descendant holds a lease.
+    // SAFETY: ancestor is the FrameObject's header (offset 0 of FrameObject);
+    // dereferencing through the header is safe.
+    unsafe { ancestor.as_ref().inc_ref() };
+
+    // SAFETY: ep_obj_ptr is a freshly-constructed EndpointObject; header at
+    // offset 0 makes the cast safe.
     let nonnull = unsafe { NonNull::new_unchecked(ep_obj_ptr.cast::<KernelObjectHeader>()) };
 
-    // Insert into CSpace.
+    // Insert into the caller's CSpace.
     // SAFETY: cspace validated non-null above.
-    let idx = unsafe {
+    let idx_res = unsafe {
         (*cspace).insert_cap(
             CapTag::Endpoint,
             Rights::SEND | Rights::RECEIVE | Rights::GRANT,
             nonnull,
         )
-    }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    };
 
-    Ok(u64::from(idx.get()))
+    if let Ok(idx) = idx_res
+    {
+        Ok(u64::from(idx.get()))
+    }
+    else
+    {
+        // CSpace is full; roll back the allocation. Drop in place, return
+        // the bytes, drop the lease.
+        // SAFETY: we just constructed both objects in place above; nothing
+        // else has observed them yet.
+        unsafe {
+            core::ptr::drop_in_place(ep_obj_ptr);
+            core::ptr::drop_in_place(ep_state_ptr);
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        // SAFETY: matches the inc_ref above.
+        unsafe { ancestor.as_ref().dec_ref() };
+        Err(SyscallError::OutOfMemory)
+    }
 }
 
-/// `SYS_CAP_CREATE_SIGNAL` (8): create a new Signal object.
+/// `SYS_CAP_CREATE_SIGNAL` (8): retype a Frame cap into a new Signal.
 ///
-/// Allocates `SignalState` and `SignalObject`, inserts a cap with
-/// `SIGNAL | WAIT` rights into the current thread's `CSpace`.
-/// Returns the slot index in rax/a0.
+/// arg0 = Frame-cap slot index in the caller's `CSpace`. The Frame cap MUST
+/// carry `Rights::RETYPE` and have at least `dispatch_for(Signal, 0).raw_bytes`
+/// of `available_bytes`.
+///
+/// On success, the wrapper + `SignalState` are constructed in place inside
+/// the source Frame cap's region; a cap with `SIGNAL | WAIT` rights is
+/// inserted into the caller's `CSpace`; returns the slot index.
+///
+/// Auto-reclaim (`dec_ref → 0`) consults `header.ancestor` and credits bytes
+/// back to the source Frame cap.
 #[cfg(not(test))]
-pub fn sys_cap_create_signal(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_signal(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{KernelObjectHeader, ObjectType, SignalObject};
+    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, SignalObject};
+    use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::signal::SignalState;
     use core::ptr::NonNull;
 
+    let frame_slot = tf.arg(0) as u32;
+
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
     if tcb.is_null()
@@ -111,33 +188,114 @@ pub fn sys_cap_create_signal(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    let sig_state_ptr = Box::into_raw(Box::new(SignalState::new()));
-    let sig_obj_ptr = Box::into_raw(Box::new(SignalObject {
-        header: KernelObjectHeader::new(ObjectType::Signal),
-        state: sig_state_ptr,
-    }));
-    // SAFETY: sig_obj_ptr is valid Box allocation; header at offset 0.
+    // SAFETY: cspace validated; lookup_cap checks tag and rights.
+    let frame_slot_ref =
+        unsafe { super::lookup_cap(cspace, frame_slot, CapTag::Frame, Rights::RETYPE)? };
+    let frame_obj_nn = frame_slot_ref
+        .object
+        .ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: lookup_cap returned a live Frame slot.
+    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+
+    let entry = dispatch_for(ObjectType::Signal, 0).ok_or(SyscallError::InvalidArgument)?;
+
+    let offset = retype_allocate(frame, entry.raw_bytes)?;
+
+    let block_phys = frame.base + offset;
+    let block_virt = crate::mm::paging::phys_to_virt(block_phys);
+
+    // Layout: SignalObject at offset 0; SignalState at offset
+    // size_of::<SignalObject>() (24).
+    let sig_obj_ptr = block_virt as *mut SignalObject;
+    let state_offset = core::mem::size_of::<SignalObject>() as u64;
+    let sig_state_ptr = (block_virt + state_offset) as *mut SignalState;
+
+    let ancestor = frame_obj_nn;
+
+    // SAFETY: pointers are inside the freshly-allocated retype slot;
+    // size-class alignment (BIN_128 = 128 B granular) exceeds the 8-byte
+    // alignment requirement of both structs.
+    unsafe {
+        core::ptr::write(sig_state_ptr, SignalState::new());
+        core::ptr::write(
+            sig_obj_ptr,
+            SignalObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::Signal, ancestor),
+                state: sig_state_ptr,
+            },
+        );
+    }
+
+    // SAFETY: ancestor is the FrameObject's header at offset 0.
+    unsafe { ancestor.as_ref().inc_ref() };
+
+    // SAFETY: header at offset 0 of SignalObject.
     let nonnull = unsafe { NonNull::new_unchecked(sig_obj_ptr.cast::<KernelObjectHeader>()) };
-    // SAFETY: cspace validated non-null above.
-    let idx =
-        unsafe { (*cspace).insert_cap(CapTag::Signal, Rights::SIGNAL | Rights::WAIT, nonnull) }
-            .map_err(|_| SyscallError::OutOfMemory)?;
-    Ok(u64::from(idx.get()))
+
+    // SAFETY: cspace validated non-null.
+    let idx_res =
+        unsafe { (*cspace).insert_cap(CapTag::Signal, Rights::SIGNAL | Rights::WAIT, nonnull) };
+
+    if let Ok(idx) = idx_res
+    {
+        Ok(u64::from(idx.get()))
+    }
+    else
+    {
+        // CSpace full: roll back the in-place construction.
+        // SAFETY: nothing else has observed these constructed objects.
+        unsafe {
+            core::ptr::drop_in_place(sig_obj_ptr);
+            core::ptr::drop_in_place(sig_state_ptr);
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        // SAFETY: matches the inc_ref above.
+        unsafe { ancestor.as_ref().dec_ref() };
+        Err(SyscallError::OutOfMemory)
+    }
 }
 
-/// `SYS_CAP_CREATE_ASPACE` (11): create a new `AddressSpace` object.
+/// `SYS_CAP_CREATE_ASPACE` (11): create a new `AddressSpace` object, or
+/// augment an existing one's PT growth budget.
 ///
-/// Allocates a fresh user address space (root page table + kernel-half copy)
-/// and inserts a cap with `MAP | READ` rights into the caller's `CSpace`.
-/// Returns the slot index in rax/a0.
+/// arg0 = source Frame-cap slot (must carry `Rights::RETYPE`, with at least
+///        `init_pages * PAGE_SIZE` available bytes).
+/// arg1 = augment-target `AddressSpace` cap slot, or `0` to create new.
+/// arg2 = `init_pages`: number of PT pages to carve from the Frame cap.
+///        Create-mode requires `init_pages >= 1` (root PT consumes one);
+///        augment-mode accepts `init_pages >= 1`.
+///
+/// Create-mode: pops the first carved page as the root PT (initialised with
+/// the kernel-half PT entries), pushes the remainder onto the new AS's PT
+/// growth pool, and inserts a cap with `MAP | READ` rights into the caller's
+/// `CSpace`. Returns the new slot index.
+///
+/// Augment-mode: pushes all carved pages onto the target AS's PT growth pool
+/// and increases its `pt_growth_budget_bytes`. Returns `0` on success.
 #[cfg(not(test))]
-pub fn sys_cap_create_aspace(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{AddressSpaceObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{AddressSpaceObject, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
+    use crate::mm::PAGE_SIZE;
     use crate::mm::address_space::AddressSpace;
-    use crate::mm::with_frame_allocator;
     use core::ptr::NonNull;
+
+    let frame_idx = tf.arg(0) as u32;
+    let augment_idx = tf.arg(1) as u32;
+    let init_pages = tf.arg(2);
+
+    if init_pages == 0
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // Reject `init_pages` that would overflow `init_pages * PAGE_SIZE` when
+    // `dispatch_for` computes the byte cost. Caller-controlled value; an
+    // attacker passing `u64::MAX` must not wrap into a small target size.
+    let init_bytes = init_pages
+        .checked_mul(PAGE_SIZE as u64)
+        .ok_or(SyscallError::InvalidArgument)?;
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -152,46 +310,145 @@ pub fn sys_cap_create_aspace(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Allocate the root page table frame and initialise the address space.
-    // SAFETY: Phase 3 (page tables) and Phase 4 (heap) are active.
-    let as_obj = with_frame_allocator(|alloc| unsafe { AddressSpace::new_user(alloc) });
+    // Resolve the source Frame cap (RETYPE-rights gated).
+    // SAFETY: cspace validated non-null above.
+    let frame_slot_ref =
+        unsafe { super::lookup_cap(cspace, frame_idx, CapTag::Frame, Rights::RETYPE)? };
+    let frame_obj_nn = frame_slot_ref
+        .object
+        .ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: lookup_cap returned a live Frame slot.
+    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
 
-    // Allocate the AddressSpaceObject kernel wrapper (heap allocation, outside
-    // the frame allocator lock — see with_frame_allocator docs).
-    let as_obj_ptr = Box::into_raw(Box::new(AddressSpaceObject {
-        header: KernelObjectHeader::new(ObjectType::AddressSpace),
-        address_space: Box::into_raw(Box::new(as_obj)),
-    }));
+    // Validate dispatch math against the user-provided init_pages.
+    let entry =
+        dispatch_for(ObjectType::AddressSpace, init_pages).ok_or(SyscallError::InvalidArgument)?;
+    debug_assert!(entry.split);
+    debug_assert_eq!(entry.raw_bytes, init_bytes);
 
-    // SAFETY: as_obj_ptr is valid Box allocation; header at offset 0.
-    let nonnull = unsafe { NonNull::new_unchecked(as_obj_ptr.cast::<KernelObjectHeader>()) };
+    // Reserve the contiguous slab from the Frame cap. The slab will be split
+    // page-by-page onto the target AS's pool.
+    let offset = retype_allocate(frame, entry.raw_bytes)?;
+    let frame_base = frame.base;
+
+    // Augment-mode: push all carved pages onto the target AS's pool.
+    if augment_idx != 0
+    {
+        // SAFETY: cspace validated non-null above.
+        let target_slot =
+            unsafe { super::lookup_cap(cspace, augment_idx, CapTag::AddressSpace, Rights::MAP) }?;
+        let target_aso_nn = target_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // SAFETY: tag confirmed AddressSpace.
+        #[allow(clippy::cast_ptr_alignment)]
+        let target_aso = unsafe { &*target_aso_nn.as_ptr().cast::<AddressSpaceObject>() };
+
+        // SAFETY: ref is held until AS-dealloc (released per chunk slot).
+        unsafe { frame_obj_nn.as_ref().inc_ref() };
+
+        // SAFETY: target_aso wraps a live AS; offset/init_pages are from a
+        // successful retype against `frame`.
+        let res = unsafe {
+            target_aso.add_chunk(frame_obj_nn, frame_base, offset, init_pages, init_pages)
+        };
+        if res.is_err()
+        {
+            retype_free(frame, offset, entry.raw_bytes);
+            // SAFETY: matches the inc_ref above.
+            unsafe { frame_obj_nn.as_ref().dec_ref() };
+            return Err(SyscallError::OutOfMemory);
+        }
+        return Ok(0);
+    }
+
+    // Create-mode: page 0 of the slab becomes the root PT; pages 1..init_pages
+    // form the initial PT growth pool. The chunk slot records the entire
+    // init_pages span so dealloc reclaims it wholesale.
+    let root_phys = frame_base + offset;
+
+    // SAFETY: root_phys is a freshly-retyped page, exclusively owned and
+    // page-aligned.
+    let address_space = unsafe { AddressSpace::new_user_with_root(root_phys) };
+    let as_ptr = Box::into_raw(Box::new(address_space));
+
+    let aso_box = Box::new(AddressSpaceObject::heap_backed(as_ptr));
+    let aso_raw = Box::into_raw(aso_box);
+    // SAFETY: aso_raw is valid Box; header at offset 0.
+    let aso_ref = unsafe { &*aso_raw };
+
+    // Hold a reference on the source Frame cap for the AS's lifetime.
+    // SAFETY: frame_obj_nn is a live FrameObject.
+    unsafe { frame_obj_nn.as_ref().inc_ref() };
+
+    // Record one chunk covering all init_pages; only the upper (init_pages - 1)
+    // pages go onto the pool (page 0 is the live root PT).
+    let pool_pages = init_pages - 1;
+    // SAFETY: aso_ref just constructed; offset/init_pages are from a
+    // successful retype against `frame`.
+    let res =
+        unsafe { aso_ref.add_chunk(frame_obj_nn, frame_base, offset, init_pages, pool_pages) };
+    if res.is_err()
+    {
+        // SAFETY: aso/as not observed externally yet.
+        unsafe {
+            drop(Box::from_raw(aso_raw));
+            drop(Box::from_raw(as_ptr));
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        // SAFETY: matches inc_ref above.
+        unsafe { frame_obj_nn.as_ref().dec_ref() };
+        return Err(SyscallError::OutOfMemory);
+    }
+
+    // SAFETY: aso_raw is valid; header at offset 0.
+    let nonnull = unsafe { NonNull::new_unchecked(aso_raw.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null above.
     let idx =
         unsafe { (*cspace).insert_cap(CapTag::AddressSpace, Rights::MAP | Rights::READ, nonnull) }
             .map_err(|_| SyscallError::OutOfMemory)?;
 
+    let _ = PAGE_SIZE;
     Ok(u64::from(idx.get()))
 }
 
-/// `SYS_CAP_CREATE_CSPACE` (12): create a new `CSpace` object.
+/// `SYS_CAP_CREATE_CSPACE` (12): retype a Frame cap into a new `CSpace`,
+/// or augment an existing one's slot-page growth budget.
 ///
-/// arg0 = `max_slots` (clamped to 16384; 0 → default 256).
+/// arg0 = source Frame-cap slot (must carry `Rights::RETYPE`).
+/// arg1 = augment-target `CSpace` cap slot, or `0` to create new.
+/// arg2 = `init_pages`: number of slot pages to carve from the Frame cap.
+///        Must be `>= 1`.
+/// arg3 = `max_slots` (create-mode only): hard cap on usable slots
+///        (clamped to `[1, 16384]`). Ignored in augment mode.
 ///
-/// Inserts a cap with `INSERT | DELETE | DERIVE` rights into the caller's
-/// `CSpace`. Returns the new `CSpace` slot index.
+/// Create-mode returns the new `CSpace` slot index. Augment-mode returns 0.
 #[cfg(not(test))]
 pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::alloc_cspace_id;
     use crate::cap::cspace::CSpace;
-    use crate::cap::object::{CSpaceKernelObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{CSpaceKernelObject, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
+    use crate::mm::PAGE_SIZE;
     use core::ptr::NonNull;
 
-    // Clamp: 0 → 256 (small default), anything above 16384 → 16384.
-    const DEFAULT_SLOTS: usize = 256;
     const MAX_SLOTS: usize = 16384;
+
+    let frame_idx = tf.arg(0) as u32;
+    let augment_idx = tf.arg(1) as u32;
+    let init_pages = tf.arg(2);
+    let requested_max_slots = tf.arg(3);
+
+    if init_pages == 0
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // Reject overflow on `init_pages * PAGE_SIZE` — caller-controlled, must
+    // not wrap into a small target size.
+    let init_bytes = init_pages
+        .checked_mul(PAGE_SIZE as u64)
+        .ok_or(SyscallError::InvalidArgument)?;
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -206,32 +463,103 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    // cast_possible_truncation: Seraph targets 64-bit only; usize == u64.
-    let requested = tf.arg(0) as usize;
-    let max_slots = if requested == 0
+    // Resolve the source Frame cap.
+    // SAFETY: cspace validated non-null above.
+    let frame_slot_ref =
+        unsafe { super::lookup_cap(cspace, frame_idx, CapTag::Frame, Rights::RETYPE)? };
+    let frame_obj_nn = frame_slot_ref
+        .object
+        .ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: lookup_cap returned a live Frame slot.
+    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+
+    let entry =
+        dispatch_for(ObjectType::CSpaceObj, init_pages).ok_or(SyscallError::InvalidArgument)?;
+    debug_assert!(entry.split);
+    debug_assert_eq!(entry.raw_bytes, init_bytes);
+
+    let offset = retype_allocate(frame, entry.raw_bytes)?;
+    let frame_base = frame.base;
+
+    // Augment-mode.
+    if augment_idx != 0
     {
-        DEFAULT_SLOTS
+        // SAFETY: cspace validated non-null above.
+        let target_slot =
+            unsafe { super::lookup_cap(cspace, augment_idx, CapTag::CSpace, Rights::INSERT) }?;
+        let target_kobj_nn = target_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // SAFETY: tag confirmed CSpace.
+        #[allow(clippy::cast_ptr_alignment)]
+        let target_kobj = unsafe { &*target_kobj_nn.as_ptr().cast::<CSpaceKernelObject>() };
+
+        // SAFETY: ref kept until CS-dealloc.
+        unsafe { frame_obj_nn.as_ref().inc_ref() };
+
+        // SAFETY: target_kobj is live.
+        let res = unsafe {
+            target_kobj.add_chunk(frame_obj_nn, frame_base, offset, init_pages, init_pages)
+        };
+        if res.is_err()
+        {
+            retype_free(frame, offset, entry.raw_bytes);
+            // SAFETY: matches inc_ref above.
+            unsafe { frame_obj_nn.as_ref().dec_ref() };
+            return Err(SyscallError::OutOfMemory);
+        }
+        return Ok(0);
+    }
+
+    // Create-mode.
+    let max_slots = if requested_max_slots == 0
+    {
+        MAX_SLOTS
     }
     else
     {
-        requested.min(MAX_SLOTS)
+        (requested_max_slots as usize).clamp(1, MAX_SLOTS)
     };
 
     let id = alloc_cspace_id();
     let new_cs_raw = Box::into_raw(Box::new(CSpace::new(id, max_slots)));
 
-    // Register in global registry before wiring into the capability system,
-    // so cross-CSpace derivation tree operations can resolve it immediately.
+    // Register in the global registry first so derivation lookups resolve.
     crate::cap::register_cspace(id, new_cs_raw);
 
-    let cs_obj_ptr = Box::into_raw(Box::new(CSpaceKernelObject {
-        header: KernelObjectHeader::new(ObjectType::CSpaceObj),
-        cspace: new_cs_raw,
-    }));
+    let cs_kobj = Box::new(CSpaceKernelObject::heap_backed(new_cs_raw));
+    let cs_kobj_raw = Box::into_raw(cs_kobj);
+    // SAFETY: cs_kobj_raw is a valid Box.
+    let cs_kobj_ref = unsafe { &*cs_kobj_raw };
 
-    // SAFETY: cs_obj_ptr is valid Box allocation; header at offset 0.
-    let nonnull = unsafe { NonNull::new_unchecked(cs_obj_ptr.cast::<KernelObjectHeader>()) };
+    // Wire the back-pointer so the first CSpace::grow uses the pool.
+    // SAFETY: new_cs_raw is the freshly-Boxed CSpace.
+    unsafe { (*new_cs_raw).set_kobj(cs_kobj_raw) };
+
+    // Hold a reference on the source Frame cap.
+    // SAFETY: frame_obj_nn is live.
+    unsafe { frame_obj_nn.as_ref().inc_ref() };
+
+    // Seed the entire init_pages slab onto the pool. CSpace::grow consumes
+    // pages on demand.
+    // SAFETY: cs_kobj_ref just constructed.
+    let res =
+        unsafe { cs_kobj_ref.add_chunk(frame_obj_nn, frame_base, offset, init_pages, init_pages) };
+    if res.is_err()
+    {
+        // SAFETY: cs_kobj/cs not observed externally yet.
+        unsafe {
+            drop(Box::from_raw(cs_kobj_raw));
+            // Unregister + drop the CSpace.
+            crate::cap::unregister_cspace(id);
+            drop(Box::from_raw(new_cs_raw));
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        // SAFETY: matches inc_ref above.
+        unsafe { frame_obj_nn.as_ref().dec_ref() };
+        return Err(SyscallError::OutOfMemory);
+    }
+
+    // SAFETY: cs_kobj_raw is valid; header at offset 0.
+    let nonnull = unsafe { NonNull::new_unchecked(cs_kobj_raw.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null above.
     let idx = unsafe {
@@ -259,11 +587,12 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
-    use crate::cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
+    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, ThreadObject};
+    use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::message::Message;
+    use crate::mm::PAGE_SIZE;
     use crate::mm::paging::phys_to_virt;
-    use crate::mm::{PAGE_SIZE, with_frame_allocator};
     use crate::sched::alloc_thread_id;
     use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
     use crate::sched::{AFFINITY_ANY, INIT_PRIORITY, KERNEL_STACK_PAGES, TIME_SLICE_TICKS};
@@ -275,10 +604,13 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
-    let as_idx = tf.arg(0) as u32;
+    let frame_idx = tf.arg(0) as u32;
     #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
-    let cs_idx = tf.arg(1) as u32;
+    let as_idx = tf.arg(1) as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
+    let cs_idx = tf.arg(2) as u32;
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -293,6 +625,17 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
+    // Resolve the source Frame cap; consumes 5 retype-pages (4 kstack +
+    // 1 wrapper/TCB).
+    // SAFETY: caller_cspace validated non-null above.
+    let frame_slot_ref =
+        unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::RETYPE)? };
+    let frame_obj_nn = frame_slot_ref
+        .object
+        .ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: lookup_cap returned a live Frame slot.
+    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated non-null above.
     let as_slot =
@@ -301,9 +644,6 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         use crate::cap::object::AddressSpaceObject;
         let obj = as_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: cap tag confirmed AddressSpace; object pointer is valid.
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the slab allocation.
-        #[allow(clippy::cast_ptr_alignment)]
-        // cast_ptr_alignment: header is at offset 0 of AddressSpaceObject; allocator guarantees alignment.
         #[allow(clippy::cast_ptr_alignment)]
         let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
         as_obj.address_space
@@ -317,27 +657,28 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         use crate::cap::object::CSpaceKernelObject;
         let obj = cs_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: cap tag confirmed CSpace; object pointer is valid.
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the slab allocation.
-        #[allow(clippy::cast_ptr_alignment)]
-        // cast_ptr_alignment: header is at offset 0 of CSpaceKernelObject; allocator guarantees alignment.
         #[allow(clippy::cast_ptr_alignment)]
         let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
         cs_obj.cspace
     };
 
-    // Allocate a kernel stack (4 pages = order 2) from the frame allocator.
-    let stack_order = {
-        let mut o = 0u32;
-        while (1usize << o) < KERNEL_STACK_PAGES
-        {
-            o += 1;
-        }
-        o as usize
-    };
-    let kstack_phys =
-        with_frame_allocator(|alloc| alloc.alloc(stack_order)).ok_or(SyscallError::OutOfMemory)?;
-    let kstack_virt = phys_to_virt(kstack_phys);
-    let kstack_top = kstack_virt + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+    // Reserve the 5-page slot from the source Frame cap. Layout (a):
+    //   pages 0..4 (16 KiB) — kstack
+    //   page 4              — ThreadObject (24 B) followed by TCB
+    let entry = dispatch_for(ObjectType::Thread, 0).ok_or(SyscallError::InvalidArgument)?;
+    debug_assert_eq!(
+        entry.raw_bytes,
+        (KERNEL_STACK_PAGES as u64 + 1) * PAGE_SIZE as u64
+    );
+    let offset = retype_allocate(frame, entry.raw_bytes)?;
+    let block_phys = frame.base + offset;
+    let block_virt = phys_to_virt(block_phys);
+
+    let kstack_virt = block_virt;
+    let kstack_top = block_virt + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+    let thread_obj_ptr = kstack_top as *mut ThreadObject;
+    let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
+    let tcb_ptr = (kstack_top + tcb_offset) as *mut ThreadControlBlock;
 
     // Build the initial SavedState. The "entry point" is the user_thread_trampoline
     // so that when schedule() first switches to this thread, switch() jumps to
@@ -356,53 +697,91 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         true,
     );
 
-    let new_tcb = Box::into_raw(Box::new(ThreadControlBlock {
-        state: ThreadState::Created,
-        priority: INIT_PRIORITY,
-        slice_remaining: TIME_SLICE_TICKS,
-        cpu_affinity: AFFINITY_ANY,
-        preferred_cpu: 0,
-        run_queue_next: None,
-        ipc_state: IpcThreadState::None,
-        ipc_msg: Message::default(),
-        reply_tcb: core::ptr::null_mut(),
-        ipc_wait_next: None,
-        is_user: true,
-        saved_state: saved,
-        kernel_stack_top: kstack_top,
-        trap_frame: core::ptr::null_mut(), // set by SYS_THREAD_CONFIGURE
-        address_space: as_ptr,
-        cspace: new_cs_ptr,
-        ipc_buffer: 0,
-        wakeup_value: 0,
-        timed_out: false,
-        iopb: core::ptr::null_mut(),
-        blocked_on_object: core::ptr::null_mut(),
-        thread_id: alloc_thread_id(),
-        context_saved: core::sync::atomic::AtomicU32::new(1),
-        death_observers: [crate::sched::thread::DeathObserver::empty();
-            crate::sched::thread::MAX_DEATH_OBSERVERS],
-        death_observer_count: 0,
-        sleep_deadline: 0,
-        magic: crate::sched::thread::TCB_MAGIC,
-    }));
+    let ancestor = frame_obj_nn;
 
-    // Wrap in a ThreadObject and insert into the caller's CSpace.
-    let thread_obj_ptr = Box::into_raw(Box::new(ThreadObject {
-        header: KernelObjectHeader::new(ObjectType::Thread),
-        tcb: new_tcb,
-    }));
+    // SAFETY: pointers are inside the freshly-allocated retype slot.
+    // Both the wrapper and the TCB land on page 4 of the slot, so they
+    // are 8-byte aligned (page-aligned, in fact). The kstack pages are
+    // intentionally left uninitialised — they are written from the top
+    // down by the first context switch, and `kstack_top` excludes the
+    // wrapper page.
+    unsafe {
+        core::ptr::write(
+            tcb_ptr,
+            ThreadControlBlock {
+                state: ThreadState::Created,
+                priority: INIT_PRIORITY,
+                slice_remaining: TIME_SLICE_TICKS,
+                cpu_affinity: AFFINITY_ANY,
+                preferred_cpu: 0,
+                run_queue_next: None,
+                ipc_state: IpcThreadState::None,
+                ipc_msg: Message::default(),
+                reply_tcb: core::ptr::null_mut(),
+                ipc_wait_next: None,
+                is_user: true,
+                saved_state: saved,
+                kernel_stack_top: kstack_top,
+                trap_frame: core::ptr::null_mut(),
+                address_space: as_ptr,
+                cspace: new_cs_ptr,
+                ipc_buffer: 0,
+                wakeup_value: 0,
+                timed_out: false,
+                iopb: core::ptr::null_mut(),
+                blocked_on_object: core::ptr::null_mut(),
+                thread_id: alloc_thread_id(),
+                context_saved: core::sync::atomic::AtomicU32::new(1),
+                death_observers: [crate::sched::thread::DeathObserver::empty();
+                    crate::sched::thread::MAX_DEATH_OBSERVERS],
+                death_observer_count: 0,
+                sleep_deadline: 0,
+                magic: crate::sched::thread::TCB_MAGIC,
+            },
+        );
+        core::ptr::write(
+            thread_obj_ptr,
+            ThreadObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::Thread, ancestor),
+                tcb: tcb_ptr,
+            },
+        );
+    }
 
-    // SAFETY: thread_obj_ptr is valid Box allocation; header at offset 0.
+    // SAFETY: ancestor is the FrameObject's header at offset 0; this lease
+    // bump is undone on rollback below or when the Thread cap is dealloc'd.
+    unsafe { ancestor.as_ref().inc_ref() };
+
+    // SAFETY: thread_obj_ptr is in-place; header at offset 0.
     let nonnull = unsafe { NonNull::new_unchecked(thread_obj_ptr.cast::<KernelObjectHeader>()) };
 
     // SAFETY: caller_cspace validated non-null above.
-    let idx = unsafe {
+    let idx_res = unsafe {
         (*caller_cspace).insert_cap(CapTag::Thread, Rights::CONTROL | Rights::OBSERVE, nonnull)
-    }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    };
 
-    Ok(u64::from(idx.get()))
+    if let Ok(idx) = idx_res
+    {
+        let _ = kstack_virt;
+        Ok(u64::from(idx.get()))
+    }
+    else
+    {
+        // The cap never reached visibility, so no scheduler queue can hold
+        // this TCB and no IPC object has a back-pointer to it. Drop both
+        // in-place objects, return the slot bytes (all 5 pages) to the
+        // ancestor cap, and undo the lease bump.
+        // SAFETY: tcb and wrapper were just constructed in place above and
+        // have not been observed by any other thread.
+        unsafe {
+            core::ptr::drop_in_place(tcb_ptr);
+            core::ptr::drop_in_place(thread_obj_ptr);
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        // SAFETY: matches the inc_ref above.
+        unsafe { ancestor.as_ref().dec_ref() };
+        Err(SyscallError::OutOfMemory)
+    }
 }
 
 /// `SYS_CAP_COPY` (24): copy a capability into another `CSpace.`
@@ -1301,13 +1680,15 @@ pub fn sys_cap_insert(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{EventQueueObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{EventQueueObject, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::retype::{EVENT_QUEUE_RING_OFFSET, dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::event_queue::EventQueueState;
     use core::ptr::NonNull;
     use syscall::EVENT_QUEUE_MAX_CAPACITY;
 
-    let capacity = tf.arg(0) as u32;
+    let frame_slot = tf.arg(0) as u32;
+    let capacity = tf.arg(1) as u32;
     if capacity == 0 || capacity > EVENT_QUEUE_MAX_CAPACITY
     {
         return Err(SyscallError::InvalidArgument);
@@ -1326,40 +1707,98 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Allocate EventQueueState (also allocates the ring buffer internally).
-    let eq_state_ptr = Box::into_raw(Box::new(EventQueueState::new(capacity)));
+    // SAFETY: cspace validated; lookup_cap checks tag and rights.
+    let frame_slot_ref =
+        unsafe { super::lookup_cap(cspace, frame_slot, CapTag::Frame, Rights::RETYPE)? };
+    let frame_obj_nn = frame_slot_ref
+        .object
+        .ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: lookup_cap returned a live Frame slot.
+    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
 
-    // Allocate EventQueueObject.
-    let eq_obj_ptr = Box::into_raw(Box::new(EventQueueObject {
-        header: KernelObjectHeader::new(ObjectType::EventQueue),
-        state: eq_state_ptr,
-    }));
+    let entry = dispatch_for(ObjectType::EventQueue, u64::from(capacity))
+        .ok_or(SyscallError::InvalidArgument)?;
 
-    // SAFETY: eq_obj_ptr is valid Box allocation; header at offset 0.
+    let offset = retype_allocate(frame, entry.raw_bytes)?;
+
+    let block_phys = frame.base + offset;
+    let block_virt = crate::mm::paging::phys_to_virt(block_phys);
+
+    // Layout (matches `cap::retype::event_queue_raw_bytes`):
+    //   offset  0: EventQueueObject (24 B)
+    //   offset 24: EventQueueState  (56 B)
+    //   offset 80: ring buffer ((capacity + 1) * 8 B)
+    let eq_obj_ptr = block_virt as *mut EventQueueObject;
+    let state_offset = core::mem::size_of::<EventQueueObject>() as u64;
+    let eq_state_ptr = (block_virt + state_offset) as *mut EventQueueState;
+    let ring_ptr = (block_virt + EVENT_QUEUE_RING_OFFSET) as *mut u64;
+    let ring_len = (capacity as usize) + 1;
+
+    let ancestor = frame_obj_nn;
+
+    // SAFETY: pointers are inside the freshly-allocated retype slot.
+    // The ring lives inline; zero it first since retype memory is not
+    // guaranteed clean (bump path returns uninitialised bytes; free-list
+    // reuse may also return stale contents).
+    unsafe {
+        core::ptr::write_bytes(ring_ptr, 0, ring_len);
+        core::ptr::write(eq_state_ptr, EventQueueState::new(capacity, ring_ptr));
+        core::ptr::write(
+            eq_obj_ptr,
+            EventQueueObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::EventQueue, ancestor),
+                state: eq_state_ptr,
+            },
+        );
+    }
+
+    // SAFETY: ancestor is the FrameObject's header at offset 0.
+    unsafe { ancestor.as_ref().inc_ref() };
+
+    // SAFETY: header at offset 0 of EventQueueObject.
     let nonnull = unsafe { NonNull::new_unchecked(eq_obj_ptr.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null above.
-    let idx =
-        unsafe { (*cspace).insert_cap(CapTag::EventQueue, Rights::POST | Rights::RECV, nonnull) }
-            .map_err(|_| SyscallError::OutOfMemory)?;
+    let idx_res =
+        unsafe { (*cspace).insert_cap(CapTag::EventQueue, Rights::POST | Rights::RECV, nonnull) };
 
-    Ok(u64::from(idx.get()))
+    if let Ok(idx) = idx_res
+    {
+        Ok(u64::from(idx.get()))
+    }
+    else
+    {
+        // The cap never reached visibility, so no waiter or `wait_set`
+        // back-pointer can exist. Drop the in-place state and wrapper,
+        // return the slot bytes (which include the inline ring) to the
+        // ancestor cap, and undo the lease bump.
+        // SAFETY: state and wrapper were just constructed in place above
+        // and have not been observed by any other thread.
+        unsafe {
+            core::ptr::drop_in_place(eq_state_ptr);
+            core::ptr::drop_in_place(eq_obj_ptr);
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        // SAFETY: matches the inc_ref above.
+        unsafe { ancestor.as_ref().dec_ref() };
+        Err(SyscallError::OutOfMemory)
+    }
 }
 
-/// `SYS_CAP_CREATE_WAIT_SET` (13): create a new `WaitSet` object.
+/// `SYS_CAP_CREATE_WAIT_SET` (13): retype a Frame cap into a new `WaitSet`.
 ///
-/// No arguments.
-///
-/// Allocates `WaitSetState` and `WaitSetObject`, inserts a cap with
-/// `MODIFY | WAIT` rights into the caller's `CSpace.`
-/// Returns the slot index in rax/a0.
+/// arg0 = Frame-cap slot. The Frame cap MUST carry `Rights::RETYPE` and have
+/// at least `dispatch_for(WaitSet, 0).raw_bytes` (504) of `available_bytes`.
 #[cfg(not(test))]
-pub fn sys_cap_create_wait_set(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{KernelObjectHeader, ObjectType, WaitSetObject};
+    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, WaitSetObject};
+    use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::wait_set::WaitSetState;
     use core::ptr::NonNull;
+
+    let frame_slot = tf.arg(0) as u32;
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1374,24 +1813,246 @@ pub fn sys_cap_create_wait_set(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Allocate WaitSetState (~480 bytes, heap-allocated).
-    let ws_state_ptr = Box::into_raw(Box::new(WaitSetState::new()));
+    // SAFETY: cspace validated; lookup_cap checks tag and rights.
+    let frame_slot_ref =
+        unsafe { super::lookup_cap(cspace, frame_slot, CapTag::Frame, Rights::RETYPE)? };
+    let frame_obj_nn = frame_slot_ref
+        .object
+        .ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: lookup_cap returned a live Frame slot.
+    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
 
-    // Allocate WaitSetObject (header + pointer, 16 bytes).
-    let ws_obj_ptr = Box::into_raw(Box::new(WaitSetObject {
-        header: KernelObjectHeader::new(ObjectType::WaitSet),
-        state: ws_state_ptr,
-    }));
+    let entry = dispatch_for(ObjectType::WaitSet, 0).ok_or(SyscallError::InvalidArgument)?;
 
-    // SAFETY: ws_obj_ptr is valid Box allocation; header at offset 0.
+    let offset = retype_allocate(frame, entry.raw_bytes)?;
+
+    let block_phys = frame.base + offset;
+    let block_virt = crate::mm::paging::phys_to_virt(block_phys);
+
+    // Layout: WaitSetObject at offset 0; WaitSetState at offset 24.
+    let ws_obj_ptr = block_virt as *mut WaitSetObject;
+    let state_offset = core::mem::size_of::<WaitSetObject>() as u64;
+    let ws_state_ptr = (block_virt + state_offset) as *mut WaitSetState;
+
+    let ancestor = frame_obj_nn;
+
+    // SAFETY: pointers are inside the freshly-allocated retype slot.
+    unsafe {
+        core::ptr::write(ws_state_ptr, WaitSetState::new());
+        core::ptr::write(
+            ws_obj_ptr,
+            WaitSetObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::WaitSet, ancestor),
+                state: ws_state_ptr,
+            },
+        );
+    }
+
+    // SAFETY: ancestor is the FrameObject's header at offset 0.
+    unsafe { ancestor.as_ref().inc_ref() };
+
+    // SAFETY: header at offset 0 of WaitSetObject.
     let nonnull = unsafe { NonNull::new_unchecked(ws_obj_ptr.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null above.
-    let idx =
-        unsafe { (*cspace).insert_cap(CapTag::WaitSet, Rights::MODIFY | Rights::WAIT, nonnull) }
-            .map_err(|_| SyscallError::OutOfMemory)?;
+    let idx_res =
+        unsafe { (*cspace).insert_cap(CapTag::WaitSet, Rights::MODIFY | Rights::WAIT, nonnull) };
 
-    Ok(u64::from(idx.get()))
+    if let Ok(idx) = idx_res
+    {
+        Ok(u64::from(idx.get()))
+    }
+    else
+    {
+        // Roll back: nothing else has observed these constructed objects.
+        // SAFETY: pointers are unique-ownership for this caller.
+        unsafe {
+            core::ptr::drop_in_place(ws_obj_ptr);
+            core::ptr::drop_in_place(ws_state_ptr);
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        // SAFETY: matches the inc_ref above.
+        unsafe { ancestor.as_ref().dec_ref() };
+        Err(SyscallError::OutOfMemory)
+    }
+}
+
+/// `SYS_CAP_INFO` (36): read-only inspection of a capability slot's runtime state.
+///
+/// arg0 = slot index in the caller's `CSpace`.
+/// arg1 = field selector (one of `syscall::CAP_INFO_*`).
+///
+/// Returns a single `u64`. Userspace assembles the full picture of a cap
+/// by issuing repeated calls with different selectors. The shape mirrors
+/// `SYS_SYSTEM_INFO`.
+///
+/// # Field selectors
+/// - [`syscall::CAP_INFO_TAG_RIGHTS`] — universal; returns
+///   `((tag as u8 as u64) << 32) | (rights.0 as u64)`.
+/// - [`syscall::CAP_INFO_FRAME_SIZE`] / `_AVAILABLE` / `_HAS_RETYPE` —
+///   require `CapTag::Frame`.
+/// - [`syscall::CAP_INFO_ASPACE_PT_BUDGET`] — requires `CapTag::AddressSpace`.
+/// - [`syscall::CAP_INFO_CSPACE_CAPACITY`] / `_USED` / `_BUDGET` —
+///   require `CapTag::CSpace`.
+///
+/// # Errors
+/// - [`SyscallError::InvalidCapability`] if the slot is null or out of range.
+/// - [`SyscallError::InvalidArgument`] if the selector is unknown or
+///   tag-specific and the slot's tag does not match.
+///
+/// This handler does not gate on rights — holding the slot is sufficient to
+/// inspect its state. No mutation occurs.
+// too_many_lines: a single flat dispatch on the field selector is the clearest
+// shape for this read-only inquiry handler. Splitting it adds only indirection.
+#[allow(clippy::too_many_lines)]
+#[cfg(not(test))]
+pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    use core::sync::atomic::Ordering;
+
+    use syscall::{
+        CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
+        CAP_INFO_CSPACE_USED, CAP_INFO_FRAME_AVAILABLE, CAP_INFO_FRAME_HAS_RETYPE,
+        CAP_INFO_FRAME_SIZE, CAP_INFO_TAG_RIGHTS,
+    };
+
+    use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, FrameObject};
+    use crate::cap::slot::{CapTag, Rights};
+
+    let slot_idx = tf.arg(0) as u32;
+    let field = tf.arg(1);
+
+    // Resolve the caller's CSpace via its TCB.
+    // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null above; cspace field set at thread creation.
+    let caller_cspace = unsafe { (*tcb).cspace };
+    if caller_cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    // Snapshot the slot's tag, rights, and object pointer. cap_info is a
+    // read-only inquiry: holding the slot is sufficient — no per-field rights
+    // check is required.
+    // SAFETY: caller_cspace validated non-null above.
+    let cs = unsafe { &*caller_cspace };
+    let slot = cs.slot(slot_idx).ok_or(SyscallError::InvalidCapability)?;
+    if slot.tag == CapTag::Null
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    let tag = slot.tag;
+    let rights = slot.rights;
+    let obj = slot.object.ok_or(SyscallError::InvalidCapability)?;
+
+    match field
+    {
+        CAP_INFO_TAG_RIGHTS =>
+        {
+            // Pack the discriminant and bitmask. CapTag is repr(u8), so the
+            // u8 cast is total; widening to u64 then shifting left 32 keeps
+            // the rights bitmask in the low 32 bits with no overlap.
+            let packed = (u64::from(tag as u8) << 32) | u64::from(rights.0);
+            Ok(packed)
+        }
+        CAP_INFO_FRAME_SIZE =>
+        {
+            if tag != CapTag::Frame
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed Frame; header is at offset 0 of FrameObject.
+            // cast_ptr_alignment: FrameObject (8-byte aligned via Box) holds the header at offset 0.
+            #[allow(clippy::cast_ptr_alignment)]
+            let frame = unsafe { &*(obj.as_ptr().cast::<FrameObject>()) };
+            Ok(frame.size)
+        }
+        CAP_INFO_FRAME_AVAILABLE =>
+        {
+            if tag != CapTag::Frame
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed Frame.
+            #[allow(clippy::cast_ptr_alignment)]
+            let frame = unsafe { &*(obj.as_ptr().cast::<FrameObject>()) };
+            Ok(frame.available_bytes.load(Ordering::Acquire))
+        }
+        CAP_INFO_FRAME_HAS_RETYPE =>
+        {
+            if tag != CapTag::Frame
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            Ok(u64::from(rights.contains(Rights::RETYPE)))
+        }
+        CAP_INFO_ASPACE_PT_BUDGET =>
+        {
+            if tag != CapTag::AddressSpace
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed AddressSpace.
+            #[allow(clippy::cast_ptr_alignment)]
+            let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
+            Ok(as_obj.pt_growth_budget_bytes.load(Ordering::Acquire))
+        }
+        CAP_INFO_CSPACE_CAPACITY =>
+        {
+            if tag != CapTag::CSpace
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed CSpace; header at offset 0 of CSpaceKernelObject.
+            #[allow(clippy::cast_ptr_alignment)]
+            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            let target = cs_obj.cspace;
+            if target.is_null()
+            {
+                return Err(SyscallError::InvalidCapability);
+            }
+            // SAFETY: cs_obj.cspace validated non-null; max_slots is immutable after construction.
+            let cap = unsafe { (*target).max_slots() };
+            Ok(cap as u64)
+        }
+        CAP_INFO_CSPACE_USED =>
+        {
+            if tag != CapTag::CSpace
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed CSpace.
+            #[allow(clippy::cast_ptr_alignment)]
+            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            let target = cs_obj.cspace;
+            if target.is_null()
+            {
+                return Err(SyscallError::InvalidCapability);
+            }
+            // SAFETY: cs_obj.cspace validated non-null; populated_count is O(1) read of two usize fields.
+            // The kernel runs with the scheduler lock effectively held during a syscall, so
+            // concurrent mutation of these fields by another CPU is not possible at this point.
+            let used = unsafe { (*target).populated_count() };
+            Ok(used as u64)
+        }
+        CAP_INFO_CSPACE_BUDGET =>
+        {
+            if tag != CapTag::CSpace
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed CSpace.
+            #[allow(clippy::cast_ptr_alignment)]
+            let cs_obj = unsafe { &*(obj.as_ptr().cast::<CSpaceKernelObject>()) };
+            Ok(cs_obj.cspace_growth_budget_bytes.load(Ordering::Acquire))
+        }
+        _ => Err(SyscallError::InvalidArgument),
+    }
 }
 
 // ── Test stubs ─────────────────────────────────────────────────────────────────

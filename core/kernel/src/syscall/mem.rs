@@ -103,14 +103,21 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let frame_slot =
         unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::MAP) }?;
-    let (frame_phys, frame_size) = {
-        let obj = frame_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Frame; pointer is valid.
-        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
-        #[allow(clippy::cast_ptr_alignment)]
-        let fo = unsafe { &*(obj.as_ptr().cast::<FrameObject>()) };
-        (fo.base, fo.size)
-    };
+    let frame_obj_nn = frame_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
+    // SAFETY: tag confirmed Frame; pointer remains valid for the whole syscall
+    // (cap held by caller's CSpace; refcount > 0).
+    #[allow(clippy::cast_ptr_alignment)]
+    let frame_ref = unsafe { &*(frame_obj_nn.as_ptr().cast::<FrameObject>()) };
+
+    // Read-lock the cap across the validate-and-commit sequence: shrinks of
+    // `frame.size` by a concurrent `sys_frame_split` would otherwise race
+    // with the bound check below or the mapping loop. RAII guard releases on
+    // every return path.
+    let _frame_guard = crate::cap::object::FrameReadGuard::acquire(frame_ref);
+
+    let frame_phys = frame_ref.base;
+    let frame_size = frame_ref.size;
     let frame_rights = frame_slot.rights;
 
     // Validate that offset + page_count stays within the frame.
@@ -165,13 +172,25 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let aspace_slot =
         unsafe { super::lookup_cap(caller_cspace, aspace_idx, CapTag::AddressSpace, Rights::MAP) }?;
-    let as_ptr = {
+    let (as_ptr, aso_raw) = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed AddressSpace; pointer is valid.
         // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
         #[allow(clippy::cast_ptr_alignment)]
-        let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
-        as_obj.address_space
+        let aso = obj.as_ptr().cast::<AddressSpaceObject>();
+        // SAFETY: aso is a valid pointer to an AddressSpaceObject.
+        let as_inner = unsafe { (*aso).address_space };
+        (as_inner, aso)
+    };
+
+    // Choose the PT-page source. Retype-backed AS (any chunk slot occupied)
+    // pulls intermediate PT pages from its own growth pool; the legacy
+    // heap-backed bootstrap AS falls back to the kernel buddy.
+    // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
+    let pooled = !unsafe {
+        (*aso_raw).pt_chunks[0]
+            .ancestor
+            .load(core::sync::atomic::Ordering::Acquire)
+            .is_null()
     };
 
     // ── Mapping loop ──────────────────────────────────────────────────────────
@@ -183,10 +202,20 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         // SAFETY: virt is in user range (validated above); phys is from a
         // Frame cap confirmed by the kernel at capability creation.
-        // as_ptr validated non-null. map_page acquires pt_lock and
-        // FRAME_ALLOC_LOCK internally.
-        unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
-            .map_err(|()| SyscallError::OutOfMemory)?;
+        // as_ptr validated non-null. Pooled vs heap-backed dispatch is
+        // chosen once above based on the AS's typed-memory state.
+        let result = if pooled
+        {
+            // SAFETY: aso_raw is valid; it wraps as_ptr.
+            unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, &*aso_raw) }
+        }
+        else
+        {
+            // SAFETY: legacy heap-backed AS; map_page acquires pt_lock and
+            // FRAME_ALLOC_LOCK internally.
+            unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
+        };
+        result.map_err(|()| SyscallError::OutOfMemory)?;
     }
 
     Ok(0)
@@ -439,23 +468,27 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // ── SYS_FRAME_SPLIT ───────────────────────────────────────────────────────────
 
-/// `SYS_FRAME_SPLIT` (33): split a Frame cap into two non-overlapping children.
+/// `SYS_FRAME_SPLIT` (33): carve a virgin tail off a Frame cap.
 ///
 /// arg0 = Frame cap index (must have MAP right).
-/// arg1 = split offset in bytes (page-aligned; must be > 0 and < frame size).
+/// arg1 = split offset in bytes (page-aligned; > 0 and < cap size; must be
+///        at or above the cap's highest live retype offset, page-aligned).
 /// arg2 = reserved (must be 0).
 ///
-/// Consumes the original cap and creates two new Frame caps with the same
-/// rights, covering `[base, base+split_offset)` and `[base+split_offset, end)`.
-/// Both children are reparented to the original cap's derivation parent (same
-/// revocability semantics as the sibling caps).
+/// The parent cap stays in its slot; its `size` shrinks to `split_offset`
+/// and its `available_bytes` debits by `(orig_size - split_offset)` (when
+/// the cap carries `Rights::RETYPE`). A new child cap covering
+/// `[base + split_offset, base + orig_size)` is inserted in the caller's
+/// `CSpace` and linked as a derivation child of the parent's existing
+/// derivation parent — making it a co-equal sibling of the (now shrunken)
+/// parent in the derivation tree.
 ///
-/// Returns `slot1 | (slot2 << 32)` on success.
-// too_many_lines: `sys_frame_split` is one transactional operation — validate
-// the source cap, create two child `FrameObject`s, wire them into the
-// derivation tree, and consume the original. Splitting further would thread
-// half-constructed children and derivation locks through helpers without
-// reducing complexity.
+/// Live retypes against the parent always sit below `bump_offset`; any
+/// `split_offset >= round_up(bump_offset, PAGE_SIZE)` is therefore safe —
+/// the new tail is virgin (no live descendants). Smaller offsets are
+/// refused.
+///
+/// Returns the new tail-cap slot on success.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
@@ -464,8 +497,9 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use alloc::boxed::Box;
     use core::ptr::NonNull;
 
-    use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
-    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, dealloc_object};
+    use crate::cap::derivation::{DERIVATION_LOCK, link_child};
+    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::retype;
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
@@ -500,163 +534,155 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    let (frame_phys, frame_size, frame_rights, cspace_id, orig_obj_ptr, orig_owns_memory) = {
-        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let slot =
-            unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::MAP) }?;
-        let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: FrameObject (8-byte) behind KernelObjectHeader (4-byte header);
-        // Box<FrameObject> allocation guarantees 8-byte alignment.
-        // SAFETY: tag confirmed Frame; pointer is valid FrameObject.
-        #[allow(clippy::cast_ptr_alignment)]
-        let fo = unsafe { &*(obj_ptr.as_ptr().cast::<FrameObject>()) };
-        // SAFETY: caller_cspace validated non-null; id() reads discriminator.
-        let cspace_id = unsafe { (*caller_cspace).id() };
-        (
-            fo.base,
-            fo.size,
-            slot.rights,
-            cspace_id,
-            obj_ptr,
-            fo.owns_memory.load(core::sync::atomic::Ordering::Acquire),
-        )
-    };
-
-    // split_offset must be strictly within [1, frame_size).
-    if split_offset >= frame_size
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-    // At least one page must remain on each side.
-    if frame_size - split_offset < PAGE_SIZE as u64
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-
-    // ── Create two child FrameObjects ─────────────────────────────────────────
-
-    // Allocate child1: [base, base + split_offset).
-    //
-    // Inherit the original's memory-ownership state: if the original was
-    // buddy-backed (owns_memory = true), ownership transfers to the two
-    // children; if it was an MMIO / firmware / boot-module frame, neither
-    // child owns its sub-region either.
-    let child1_obj = Box::new(FrameObject {
-        header: crate::cap::object::KernelObjectHeader::new(ObjectType::Frame),
-        base: frame_phys,
-        size: split_offset,
-        owns_memory: core::sync::atomic::AtomicBool::new(orig_owns_memory),
-    });
-    let child1_ptr: NonNull<KernelObjectHeader> = {
-        let raw = Box::into_raw(child1_obj).cast::<KernelObjectHeader>();
-        // SAFETY: Box::into_raw returns non-null; FrameObject.header is at offset 0;
-        // cast preserves alignment and validity.
-        unsafe { NonNull::new_unchecked(raw) }
-    };
-
-    // Allocate child2: [base + split_offset, end).
-    let child2_obj = Box::new(FrameObject {
-        header: crate::cap::object::KernelObjectHeader::new(ObjectType::Frame),
-        base: frame_phys + split_offset,
-        size: frame_size - split_offset,
-        owns_memory: core::sync::atomic::AtomicBool::new(orig_owns_memory),
-    });
-    let child2_ptr: NonNull<KernelObjectHeader> = {
-        let raw = Box::into_raw(child2_obj).cast::<KernelObjectHeader>();
-        // SAFETY: Box::into_raw is non-null; header at offset 0.
-        unsafe { NonNull::new_unchecked(raw) }
-    };
-
-    // Insert both children into the caller's CSpace (auto-allocate slots).
-    // SAFETY: caller_cspace validated non-null; CSpace methods handle slot allocation.
-    let cs = unsafe { &mut *caller_cspace };
-    let slot1_nz = cs
-        .insert_cap(CapTag::Frame, frame_rights, child1_ptr)
-        .map_err(|_| SyscallError::OutOfMemory)?;
-    let slot1 = slot1_nz.get();
-    let slot2_nz = cs
-        .insert_cap(CapTag::Frame, frame_rights, child2_ptr)
-        .map_err(|_| {
-            // Undo slot1 insertion on failure.
-            cs.free_slot(slot1);
-            // SAFETY: child1_ptr just allocated above; ref count is 1.
-            unsafe { crate::cap::object::dealloc_object(child1_ptr) };
-            SyscallError::OutOfMemory
-        })?;
-    let slot2 = slot2_nz.get();
-
-    // ── Wire derivation tree ──────────────────────────────────────────────────
-    //
-    // Pattern mirrors sys_cap_delete: reparent original's children to its
-    // parent, unlink original, then link both new caps to that same parent.
+    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    let parent_slot =
+        unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::MAP) }?;
+    let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // cast_ptr_alignment: FrameObject (8-byte) behind KernelObjectHeader header.
+    // SAFETY: tag confirmed Frame; pointer is valid FrameObject.
+    #[allow(clippy::cast_ptr_alignment)]
+    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<FrameObject>()) };
+    let parent_rights = parent_slot.rights;
+    let parent_retypable = parent_rights.contains(Rights::RETYPE);
+    // SAFETY: caller_cspace validated non-null; id() reads discriminator.
+    let cspace_id = unsafe { (*caller_cspace).id() };
 
     let frame_idx_nz =
         core::num::NonZeroU32::new(frame_idx).ok_or(SyscallError::InvalidCapability)?;
+    let parent_id = SlotId::new(cspace_id, frame_idx_nz);
 
+    // ── Acquire locks (DERIVATION outer, frame-write inner) ──────────────────
     DERIVATION_LOCK.write_lock();
+    parent_ref.write_lock();
 
-    let orig_node = SlotId::new(cspace_id, frame_idx_nz);
-    let child1_id = SlotId::new(cspace_id, slot1_nz);
-    let child2_id = SlotId::new(cspace_id, slot2_nz);
+    // Snapshot parent state under the write lock. From here until unlock,
+    // no concurrent mem_map / retype_allocate can observe a torn `size`.
+    let orig_size = parent_ref.size;
+    let parent_phys = parent_ref.base;
+    let parent_owns = parent_ref
+        .owns_memory
+        .load(core::sync::atomic::Ordering::Acquire);
 
-    // Read the original's parent before we modify anything.
-    // SAFETY: caller_cspace validated; frame_idx within CSpace bounds.
-    let orig_parent = unsafe {
+    // Refuse split when the parent has cap-derivation children. Their
+    // FrameObject pointer would still alias the (shrunken) parent and could
+    // observe a region the parent no longer owns. memmgr / init / ktest's
+    // split callers never derive before splitting.
+    // SAFETY: caller_cspace validated; frame_idx within CSpace bounds;
+    // DERIVATION_LOCK held.
+    let parent_first_child = unsafe {
+        (*caller_cspace)
+            .slot(frame_idx)
+            .and_then(|s| s.deriv_first_child)
+    };
+    if parent_first_child.is_some()
+    {
+        parent_ref.write_unlock();
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // split_offset must be strictly within (0, orig_size) with at least
+    // one page on each side.
+    if split_offset >= orig_size || orig_size - split_offset < PAGE_SIZE as u64
+    {
+        parent_ref.write_unlock();
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // Live retypes against the parent occupy `[0, bump_offset)`. The split
+    // point must sit at or above the next page boundary so the carved tail
+    // is virgin.
+    let bump = retype::current_bump(parent_ref);
+    let page_size = PAGE_SIZE as u64;
+    let bump_aligned = bump.div_ceil(page_size).saturating_mul(page_size);
+    if split_offset < bump_aligned
+    {
+        parent_ref.write_unlock();
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let tail_size = orig_size - split_offset;
+    let tail_avail = if parent_retypable { tail_size } else { 0 };
+
+    // ── Mint tail FrameObject ─────────────────────────────────────────────────
+    let tail_obj = Box::new(FrameObject {
+        header: KernelObjectHeader::new(ObjectType::Frame),
+        base: parent_phys + split_offset,
+        size: tail_size,
+        available_bytes: core::sync::atomic::AtomicU64::new(tail_avail),
+        // Tail inherits the parent's ownership flag. On dealloc each half
+        // buddy-frees its own (now disjoint) range; together they cover the
+        // original allocation.
+        owns_memory: core::sync::atomic::AtomicBool::new(parent_owns),
+        allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        lock: core::sync::atomic::AtomicU32::new(0),
+    });
+    let tail_ptr: NonNull<KernelObjectHeader> = {
+        let raw = Box::into_raw(tail_obj).cast::<KernelObjectHeader>();
+        // SAFETY: Box::into_raw returns non-null; header at offset 0.
+        unsafe { NonNull::new_unchecked(raw) }
+    };
+
+    // SAFETY: caller_cspace validated non-null.
+    let cs = unsafe { &mut *caller_cspace };
+    let Ok(tail_slot_nz) = cs.insert_cap(CapTag::Frame, parent_rights, tail_ptr)
+    else
+    {
+        // SAFETY: tail_ptr just allocated; refcount is 1 with no other holders.
+        unsafe { crate::cap::object::dealloc_object(tail_ptr) };
+        parent_ref.write_unlock();
+        DERIVATION_LOCK.write_unlock();
+        return Err(SyscallError::OutOfMemory);
+    };
+    let tail_slot = tail_slot_nz.get();
+    let tail_id = SlotId::new(cspace_id, tail_slot_nz);
+
+    // ── Wire derivation: tail becomes a sibling of parent under parent's parent ──
+
+    // SAFETY: DERIVATION_LOCK held; frame_idx within CSpace bounds.
+    let parent_deriv_parent = unsafe {
         (*caller_cspace)
             .slot(frame_idx)
             .and_then(|s| s.deriv_parent)
     };
-
-    // Reparent original's existing children (if any) to its parent.
-    // SAFETY: DERIVATION_LOCK held; orig_node/orig_parent valid.
-    unsafe { reparent_children(orig_node, orig_parent) };
-    // Unlink the original node from the tree.
-    // SAFETY: DERIVATION_LOCK held; orig_node valid.
-    unsafe { unlink_node(orig_node) };
-
-    // Link both new caps to the original's parent (if any).
-    if let Some(parent_id) = orig_parent
+    if let Some(grandparent) = parent_deriv_parent
     {
-        // SAFETY: DERIVATION_LOCK held; parent_id/child1_id/child2_id valid.
-        unsafe { link_child(parent_id, child1_id) };
-        // SAFETY: DERIVATION_LOCK held; parent_id/child2_id valid.
-        unsafe { link_child(parent_id, child2_id) };
+        // SAFETY: DERIVATION_LOCK held; ids valid.
+        unsafe { link_child(grandparent, tail_id) };
+    }
+    // If the parent was a derivation root, the tail is also a root: no
+    // parent edge needed.
+    let _ = parent_id; // silence unused if no grandparent
+
+    // ── Mutate parent in place ────────────────────────────────────────────────
+    //
+    // Shrink size; debit the carved bytes from `available_bytes` (only when
+    // the cap is retypable — non-RETYPE caps already have available = 0).
+    // The parent's allocator state, derivation children (none — refused
+    // above), and slot identity all stay intact. Live retypes against the
+    // parent (`ancestor` pointers) continue to refer to the same
+    // `KernelObjectHeader` — no re-ancestoring required.
+    //
+    // SAFETY: write_lock held; this is the only mutator of `parent_ref.size`.
+    // No reference is created from the raw pointer; the write goes directly
+    // through `parent_obj_nn` (a NonNull obtained from the cap slot).
+    unsafe {
+        let parent_mut = parent_obj_nn.as_ptr().cast::<FrameObject>();
+        (*parent_mut).size = split_offset;
+    }
+    if parent_retypable
+    {
+        parent_ref
+            .available_bytes
+            .fetch_sub(tail_size, core::sync::atomic::Ordering::AcqRel);
     }
 
+    parent_ref.write_unlock();
     DERIVATION_LOCK.write_unlock();
 
-    // ── Consume the original cap ──────────────────────────────────────────────
-
-    // Transfer memory ownership to the children before the original's
-    // refcount drops: both halves of the physical region now belong to
-    // child1/child2. Clearing `owns_memory` here ensures that, if the
-    // original's refcount hits zero below, `dealloc_object` does not free
-    // the backing memory that is still in use by the children.
-    //
-    // SAFETY: orig_obj_ptr is live (ref > 0 at lookup); FrameObject is
-    // #[repr(C)] with header at offset 0; AtomicBool store is well-defined
-    // through a shared reference.
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        (*orig_obj_ptr.as_ptr().cast::<FrameObject>())
-            .owns_memory
-            .store(false, core::sync::atomic::Ordering::Release);
-    }
-
-    // Return original slot to free list (tag becomes Null).
-    // SAFETY: caller_cspace validated; frame_idx within CSpace bounds.
-    unsafe { (*caller_cspace).free_slot(frame_idx) };
-
-    // Dec-ref original object; free if no references remain.
-    // SAFETY: orig_obj_ptr from lookup_cap; object still valid (ref > 0 at lookup).
-    let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };
-    if remaining == 0
-    {
-        // SAFETY: ref count reached zero; no other references exist.
-        unsafe { dealloc_object(orig_obj_ptr) };
-    }
-
-    Ok(u64::from(slot1) | (u64::from(slot2) << 32))
+    Ok(u64::from(tail_slot))
 }
 
 // Test stub.
@@ -668,46 +694,40 @@ pub fn sys_frame_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // ── SYS_FRAME_MERGE ───────────────────────────────────────────────────────────
 
-/// `SYS_FRAME_MERGE` (50): merge two adjacent sibling Frame caps into one.
+/// `SYS_FRAME_MERGE` (50): absorb a virgin tail Frame cap back into its parent.
 ///
-/// arg0 = left Frame cap index (must have MAP right; physically-lower half).
-/// arg1 = right Frame cap index (must have MAP right; physically-upper half).
+/// arg0 = parent Frame cap index (must have MAP right; physically-lower half).
+///        Stays valid; its `size` grows to cover the absorbed tail's region.
+/// arg1 = tail Frame cap index (must have MAP right; physically-upper half).
+///        Consumed; its slot is freed.
 /// arg2 = reserved (must be 0).
 ///
-/// Both caps must:
-/// - Be physically contiguous (`left.base + left.size == right.base`).
-/// - Carry the same rights bitmask.
-/// - Agree on `owns_memory` (mixed-ownership merges are rejected).
-/// - Be siblings under the same derivation parent (typical case: both are
-///   children of a prior `frame_split`).
-/// - Have no descendants of their own — merging a cap that has been further
-///   split would orphan its children, so merge is rejected.
+/// Inverse of [`sys_frame_split`] under Option D. Both caps must:
+/// - Be physically contiguous (`parent.base + parent.size == tail.base`).
+/// - Carry identical rights.
+/// - Agree on `owns_memory`.
+/// - Be siblings under the same derivation parent.
+/// - Have no derivation children of their own.
+/// - The tail must be virgin (no live retypes — `allocator == null` and
+///   `available_bytes == size` for retypable caps; non-retypable caps
+///   trivially satisfy this).
 ///
-/// Both originals are consumed; a fresh Frame cap covering
-/// `[left.base, right.base + right.size)` is inserted in the caller's `CSpace`
-/// and reparented to the originals' shared parent (or made a root if both
-/// originals were roots). Memory ownership transfers to the merged cap; the
-/// originals are dec-ref'd without freeing the underlying physical region.
-///
-/// Returns the merged slot index on success.
+/// Returns 0 on success. The parent's slot index is unchanged; the tail's
+/// slot is returned to the caller's `CSpace` free list.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    extern crate alloc;
-    use alloc::boxed::Box;
-    use core::ptr::NonNull;
-
-    use crate::cap::derivation::{DERIVATION_LOCK, link_child, unlink_node};
-    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, dealloc_object};
+    use crate::cap::derivation::{DERIVATION_LOCK, unlink_node};
+    use crate::cap::object::{FrameObject, dealloc_object};
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::syscall::current_tcb;
 
-    let left_idx = tf.arg(0) as u32;
-    let right_idx = tf.arg(1) as u32;
+    let parent_idx = tf.arg(0) as u32;
+    let tail_idx = tf.arg(1) as u32;
     // arg2 reserved.
 
-    if left_idx == right_idx
+    if parent_idx == tail_idx
     {
         return Err(SyscallError::InvalidArgument);
     }
@@ -727,219 +747,201 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Snapshot left.
-    let (left_base, left_size, left_rights, left_obj_ptr, left_owns) = {
-        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let slot =
-            unsafe { super::lookup_cap(caller_cspace, left_idx, CapTag::Frame, Rights::MAP) }?;
-        let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: Box<FrameObject> guarantees 8-byte alignment.
-        // SAFETY: tag confirmed Frame; pointer is valid FrameObject.
-        #[allow(clippy::cast_ptr_alignment)]
-        let fo = unsafe { &*(obj_ptr.as_ptr().cast::<FrameObject>()) };
-        (
-            fo.base,
-            fo.size,
-            slot.rights,
-            obj_ptr,
-            fo.owns_memory.load(core::sync::atomic::Ordering::Acquire),
-        )
-    };
+    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    let parent_slot =
+        unsafe { super::lookup_cap(caller_cspace, parent_idx, CapTag::Frame, Rights::MAP) }?;
+    let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    let tail_slot =
+        unsafe { super::lookup_cap(caller_cspace, tail_idx, CapTag::Frame, Rights::MAP) }?;
+    let tail_obj_nn = tail_slot.object.ok_or(SyscallError::InvalidCapability)?;
 
-    // Snapshot right.
-    let (right_base, right_size, right_rights, right_obj_ptr, right_owns) = {
-        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        let slot =
-            unsafe { super::lookup_cap(caller_cspace, right_idx, CapTag::Frame, Rights::MAP) }?;
-        let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Frame; pointer is valid.
-        #[allow(clippy::cast_ptr_alignment)]
-        let fo = unsafe { &*(obj_ptr.as_ptr().cast::<FrameObject>()) };
-        (
-            fo.base,
-            fo.size,
-            slot.rights,
-            obj_ptr,
-            fo.owns_memory.load(core::sync::atomic::Ordering::Acquire),
-        )
-    };
-
-    // Physical contiguity.
-    if left_base.checked_add(left_size) != Some(right_base)
+    if parent_obj_nn == tail_obj_nn
     {
         return Err(SyscallError::InvalidArgument);
     }
-    // Rights must match exactly — the merged cap's rights would otherwise be
-    // ambiguous between the two parents.
-    if left_rights != right_rights
+    if parent_slot.rights != tail_slot.rights
     {
         return Err(SyscallError::InvalidArgument);
     }
-    // Memory-ownership state must match. A merge that mixed buddy-backed and
-    // non-buddy halves would either leak (clear both) or double-free (set both).
-    if left_owns != right_owns
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-    // Two distinct caps must point to two distinct objects (a slot referencing
-    // the same FrameObject twice is not a meaningful merge).
-    if left_obj_ptr == right_obj_ptr
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
+    let merged_rights = parent_slot.rights;
+    let merged_retypable = merged_rights.contains(Rights::RETYPE);
 
-    let merged_size = left_size
-        .checked_add(right_size)
-        .ok_or(SyscallError::InvalidArgument)?;
+    #[allow(clippy::cast_ptr_alignment)]
+    // SAFETY: tag confirmed Frame; cap held by caller's CSpace, ref count > 0.
+    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<FrameObject>()) };
+    #[allow(clippy::cast_ptr_alignment)]
+    // SAFETY: tag confirmed Frame; cap held by caller's CSpace, ref count > 0.
+    let tail_ref = unsafe { &*(tail_obj_nn.as_ptr().cast::<FrameObject>()) };
 
-    // ── Derivation-tree validation ────────────────────────────────────────────
-    // Both slots must have the same parent and no descendants.
-
-    // SAFETY: caller_cspace validated non-null.
-    let cspace_id = unsafe { (*caller_cspace).id() };
-
+    // ── Acquire locks (DERIVATION outer; per-cap write locks inner, ordered
+    // by FrameObject pointer to avoid deadlocks against concurrent merges) ──
     DERIVATION_LOCK.write_lock();
 
-    let (left_parent, left_first_child) = {
-        // SAFETY: caller_cspace validated; index resolves under derivation lock.
-        let Some(slot) = (unsafe { (*caller_cspace).slot(left_idx) })
-        else
-        {
-            DERIVATION_LOCK.write_unlock();
-            return Err(SyscallError::InvalidCapability);
-        };
-        (slot.deriv_parent, slot.deriv_first_child)
+    let (lock_first, lock_second) = if core::ptr::from_ref(parent_ref)
+        < core::ptr::from_ref(tail_ref)
+    {
+        (parent_ref, tail_ref)
+    }
+    else
+    {
+        (tail_ref, parent_ref)
     };
-    let (right_parent, right_first_child) = {
-        // SAFETY: caller_cspace validated; index resolves under derivation lock.
-        let Some(slot) = (unsafe { (*caller_cspace).slot(right_idx) })
-        else
-        {
-            DERIVATION_LOCK.write_unlock();
-            return Err(SyscallError::InvalidCapability);
-        };
-        (slot.deriv_parent, slot.deriv_first_child)
+    lock_first.write_lock();
+    lock_second.write_lock();
+
+    let release_locks = || {
+        lock_second.write_unlock();
+        lock_first.write_unlock();
+        DERIVATION_LOCK.write_unlock();
     };
 
-    if left_parent != right_parent
+    // Snapshot under locks.
+    let parent_base = parent_ref.base;
+    let parent_size = parent_ref.size;
+    let parent_owns = parent_ref
+        .owns_memory
+        .load(core::sync::atomic::Ordering::Acquire);
+    let tail_base = tail_ref.base;
+    let tail_size = tail_ref.size;
+    let tail_owns = tail_ref
+        .owns_memory
+        .load(core::sync::atomic::Ordering::Acquire);
+    let tail_avail = tail_ref
+        .available_bytes
+        .load(core::sync::atomic::Ordering::Acquire);
+    let tail_alloc = tail_ref
+        .allocator
+        .load(core::sync::atomic::Ordering::Acquire);
+
+    // Physical contiguity.
+    if parent_base.checked_add(parent_size) != Some(tail_base)
     {
-        DERIVATION_LOCK.write_unlock();
+        release_locks();
         return Err(SyscallError::InvalidArgument);
     }
-    if left_first_child.is_some() || right_first_child.is_some()
+    // Memory-ownership state must match.
+    if parent_owns != tail_owns
     {
-        DERIVATION_LOCK.write_unlock();
+        release_locks();
+        return Err(SyscallError::InvalidArgument);
+    }
+    // Tail must be virgin: no retype allocator installed, and
+    // available_bytes matches the rights state.
+    if !tail_alloc.is_null()
+    {
+        release_locks();
+        return Err(SyscallError::InvalidArgument);
+    }
+    let expected_tail_avail = if merged_retypable { tail_size } else { 0 };
+    if tail_avail != expected_tail_avail
+    {
+        release_locks();
         return Err(SyscallError::InvalidArgument);
     }
 
-    // ── Build the merged FrameObject ──────────────────────────────────────────
-    //
-    // `owns_memory` on the new cap inherits the (matching) state of the
-    // originals. The originals are cleared further below so dec_ref does not
-    // attempt to return the still-live region to the buddy.
-
-    let merged_obj = Box::new(FrameObject {
-        header: KernelObjectHeader::new(ObjectType::Frame),
-        base: left_base,
-        size: merged_size,
-        owns_memory: core::sync::atomic::AtomicBool::new(left_owns),
-    });
-    let merged_ptr: NonNull<KernelObjectHeader> = {
-        let raw = Box::into_raw(merged_obj).cast::<KernelObjectHeader>();
-        // SAFETY: Box::into_raw returns non-null; FrameObject.header at offset 0.
-        unsafe { NonNull::new_unchecked(raw) }
+    // ── Derivation-tree validation: parent and tail must be siblings, and
+    //    neither may have derivation children. ────────────────────────────────
+    let parent_idx_nz = core::num::NonZeroU32::new(parent_idx);
+    let tail_idx_nz = core::num::NonZeroU32::new(tail_idx);
+    let (Some(parent_idx_nz), Some(tail_idx_nz)) = (parent_idx_nz, tail_idx_nz)
+    else
+    {
+        release_locks();
+        return Err(SyscallError::InvalidCapability);
     };
-
-    // ── Insert merged cap into caller's CSpace ────────────────────────────────
     // SAFETY: caller_cspace validated non-null.
-    let cs = unsafe { &mut *caller_cspace };
-    let Ok(merged_slot_nz) = cs.insert_cap(CapTag::Frame, left_rights, merged_ptr)
-    else
-    {
-        DERIVATION_LOCK.write_unlock();
-        // SAFETY: merged_ptr just allocated; refcount is 1 with no other holders.
-        unsafe { dealloc_object(merged_ptr) };
-        return Err(SyscallError::OutOfMemory);
+    let cspace_id = unsafe { (*caller_cspace).id() };
+    let tail_id = SlotId::new(cspace_id, tail_idx_nz);
+    let _ = parent_idx_nz; // parent slot not unlinked (it stays alive)
+
+    // SAFETY: DERIVATION_LOCK held; indices within CSpace bounds.
+    let parent_deriv = unsafe {
+        (*caller_cspace)
+            .slot(parent_idx)
+            .ok_or(SyscallError::InvalidCapability)
     };
-    let merged_slot = merged_slot_nz.get();
-
-    // ── Wire derivation tree ──────────────────────────────────────────────────
-
-    let Some(left_idx_nz) = core::num::NonZeroU32::new(left_idx)
-    else
-    {
-        DERIVATION_LOCK.write_unlock();
-        return Err(SyscallError::InvalidCapability);
+    // SAFETY: DERIVATION_LOCK held; indices within CSpace bounds.
+    let tail_deriv = unsafe {
+        (*caller_cspace)
+            .slot(tail_idx)
+            .ok_or(SyscallError::InvalidCapability)
     };
-    let Some(right_idx_nz) = core::num::NonZeroU32::new(right_idx)
-    else
+    let (parent_dp, parent_fc) = match parent_deriv
     {
-        DERIVATION_LOCK.write_unlock();
-        return Err(SyscallError::InvalidCapability);
+        Ok(s) => (s.deriv_parent, s.deriv_first_child),
+        Err(e) =>
+        {
+            release_locks();
+            return Err(e);
+        }
     };
-    let left_id = SlotId::new(cspace_id, left_idx_nz);
-    let right_id = SlotId::new(cspace_id, right_idx_nz);
-    let merged_id = SlotId::new(cspace_id, merged_slot_nz);
-
-    // Detach both originals; siblings (if any) and the parent's first_child
-    // pointer are mended by unlink_node.
-    // SAFETY: DERIVATION_LOCK held; both ids are valid live slots.
-    unsafe { unlink_node(left_id) };
-    // SAFETY: DERIVATION_LOCK held.
-    unsafe { unlink_node(right_id) };
-
-    // Attach merged to the shared parent (or leave as a root if both
-    // originals were roots).
-    if let Some(parent_id) = left_parent
+    let (tail_dp, tail_fc) = match tail_deriv
     {
-        // SAFETY: DERIVATION_LOCK held; parent_id and merged_id are valid.
-        unsafe { link_child(parent_id, merged_id) };
+        Ok(s) => (s.deriv_parent, s.deriv_first_child),
+        Err(e) =>
+        {
+            release_locks();
+            return Err(e);
+        }
+    };
+
+    if parent_dp != tail_dp
+    {
+        release_locks();
+        return Err(SyscallError::InvalidArgument);
+    }
+    if parent_fc.is_some() || tail_fc.is_some()
+    {
+        release_locks();
+        return Err(SyscallError::InvalidArgument);
     }
 
+    // ── Detach the tail from the derivation tree ─────────────────────────────
+    // SAFETY: DERIVATION_LOCK held; tail_id is a valid live slot.
+    unsafe { unlink_node(tail_id) };
+
+    // ── Mutate parent in place: grow size, credit available ──────────────────
+    let merged_size = parent_size + tail_size; // contiguity already verified
+    // SAFETY: parent's write_lock held; this is the only mutator of size.
+    unsafe {
+        let parent_mut = parent_obj_nn.as_ptr().cast::<FrameObject>();
+        (*parent_mut).size = merged_size;
+    }
+    if merged_retypable
+    {
+        parent_ref
+            .available_bytes
+            .fetch_add(tail_size, core::sync::atomic::Ordering::AcqRel);
+    }
+
+    // ── Consume tail: clear owns_memory (parent now owns the merged range)
+    //    and release the tail's slot. ──────────────────────────────────────────
+    // SAFETY: tail's write_lock held; this is the only mutator.
+    tail_ref
+        .owns_memory
+        .store(false, core::sync::atomic::Ordering::Release);
+
+    // SAFETY: caller_cspace validated; tail_idx within CSpace bounds.
+    unsafe { (*caller_cspace).free_slot(tail_idx) };
+
+    // Drop both write locks before dec_ref'ing the tail (dec_ref can take
+    // dealloc_object, which may itself acquire other locks).
+    lock_second.write_unlock();
+    lock_first.write_unlock();
     DERIVATION_LOCK.write_unlock();
 
-    // ── Consume originals ─────────────────────────────────────────────────────
-    //
-    // Transfer memory ownership to the merged cap by clearing both originals.
-    // Mirrors sys_frame_split's transfer pattern: only the merged cap can ever
-    // reach `dealloc_object`'s "owns_memory == true" branch.
-    //
-    // SAFETY: orig pointers are live (refcount > 0 at lookup); FrameObject is
-    // #[repr(C)] with header at offset 0; AtomicBool store on shared ref is well-defined.
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        (*left_obj_ptr.as_ptr().cast::<FrameObject>())
-            .owns_memory
-            .store(false, core::sync::atomic::Ordering::Release);
-        (*right_obj_ptr.as_ptr().cast::<FrameObject>())
-            .owns_memory
-            .store(false, core::sync::atomic::Ordering::Release);
-    }
-
-    // Return both original slots to the free list.
-    // SAFETY: caller_cspace validated; indices within CSpace bounds.
-    unsafe { (*caller_cspace).free_slot(left_idx) };
-    // SAFETY: caller_cspace validated; indices within CSpace bounds.
-    unsafe { (*caller_cspace).free_slot(right_idx) };
-
-    // Dec-ref both originals; free if no references remain.
-    // SAFETY: originals from lookup_cap; objects still valid (ref > 0 at lookup).
-    let left_remaining = unsafe { (*left_obj_ptr.as_ptr()).dec_ref() };
-    if left_remaining == 0
+    // SAFETY: tail_obj_nn from lookup_cap; object valid (ref > 0 at lookup).
+    let remaining = unsafe { (*tail_obj_nn.as_ptr()).dec_ref() };
+    if remaining == 0
     {
         // SAFETY: refcount reached zero; owns_memory cleared above so the
-        // dealloc path will not double-free the buddy region.
-        unsafe { dealloc_object(left_obj_ptr) };
-    }
-    // SAFETY: same as above.
-    let right_remaining = unsafe { (*right_obj_ptr.as_ptr()).dec_ref() };
-    if right_remaining == 0
-    {
-        // SAFETY: refcount reached zero; owns_memory cleared above.
-        unsafe { dealloc_object(right_obj_ptr) };
+        // dealloc path will not double-free the buddy region (parent now
+        // covers it).
+        unsafe { dealloc_object(tail_obj_nn) };
     }
 
-    Ok(u64::from(merged_slot))
+    Ok(0)
 }
 
 // Test stub.

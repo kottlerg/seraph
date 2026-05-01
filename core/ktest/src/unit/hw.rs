@@ -68,7 +68,8 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
 /// cap is found, the test is skipped.
 pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 {
-    let irq_sig = cap_create_signal().map_err(|_| "cap_create_signal for IRQ test failed")?;
+    let irq_sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for IRQ test failed")?;
 
     for slot in 1..ctx.aspace_cap
     {
@@ -120,8 +121,9 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
     // x86_64: create a thread to receive the port range and scan for a cap.
     #[cfg(target_arch = "x86_64")]
     {
-        let cs = cap_create_cspace(8).map_err(|_| "create_cspace for ioport_bind test failed")?;
-        let th = cap_create_thread(ctx.aspace_cap, cs)
+        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+            .map_err(|_| "create_cspace for ioport_bind test failed")?;
+        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
             .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
 
         for slot in 1..ctx.aspace_cap

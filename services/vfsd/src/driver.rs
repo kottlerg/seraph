@@ -54,7 +54,8 @@ pub fn spawn_fatfs_driver(
 
     // Create fatfs's service endpoint. fatfs receives service calls on this;
     // vfsd holds a SEND_GRANT copy for forwarding FS_OPEN.
-    let driver_ep = syscall::cap_create_endpoint().ok()?;
+    let slab = std::os::seraph::object_slab_acquire(88)?;
+    let driver_ep = syscall::cap_create_endpoint(slab).ok()?;
     let driver_ep_for_child = syscall::cap_derive(driver_ep, syscall::RIGHTS_ALL).ok()?;
     let driver_send = syscall::cap_derive(driver_ep, syscall::RIGHTS_SEND_GRANT).ok()?;
 

@@ -141,7 +141,11 @@ pub mod memmgr_labels
     /// Reply (success): `data[0]` = `returned_cap_count: u32`;
     /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Frame
     /// capabilities (MAP|WRITE rights). `sum(page_count_for_cap_i) ==
-    /// want_pages` for both contiguous and best-effort replies.
+    /// want_pages` for both contiguous and best-effort replies. Each reply
+    /// cap MUST additionally carry `Rights::RETYPE` so the caller can
+    /// retype the frame into kernel objects via the `SYS_CAP_CREATE_*`
+    /// syscalls; memmgr derives reply caps with `RIGHTS_ALL`, which
+    /// preserves the RETYPE bit stamped at boot by the kernel.
     pub const REQUEST_FRAMES: u64 = 1;
     /// Voluntarily return Frame caps to the pool. Callable from any
     /// tokened cap. Wire format: `data[0]` = `cap_count`; `data[1+i]` =

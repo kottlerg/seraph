@@ -81,20 +81,22 @@ unsafe fn split_frame_recursive(frame_cap: u32, count: &mut usize)
         return;
     }
 
+    // Option-D frame_split: `frame_cap` shrinks in place to one page; the
+    // returned slot is the new tail covering the remainder. Store the
+    // (now-single-page) original in the pool, then recurse on the tail.
     match syscall::frame_split(frame_cap, PAGE_SIZE)
     {
-        Ok((a, b)) =>
+        Ok(tail) =>
         {
-            // Store frame A (single-page first half) in the pool.
             // SAFETY: count < POOL_SIZE, checked above.
             unsafe {
-                POOL_SLOTS[*count] = a;
+                POOL_SLOTS[*count] = frame_cap;
             }
             *count += 1;
 
-            // Recursively split frame B (remaining pages) to extract more.
+            // Recursively split the tail to extract more pages.
             // SAFETY: same preconditions as the outer unsafe fn (init phase only).
-            unsafe { split_frame_recursive(b, count) };
+            unsafe { split_frame_recursive(tail, count) };
         }
         Err(_) =>
         {

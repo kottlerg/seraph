@@ -24,7 +24,8 @@ const VA_STRIDE: u64 = 0x1_0000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let done = cap_create_signal().map_err(|_| "concurrent_map_unmap: create done failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
     // Allocate frames from pool for each child.
     let mut frames = [0u32; NUM_CHILDREN];
@@ -39,7 +40,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut cspaces = [0u32; NUM_CHILDREN];
     for i in 0..NUM_CHILDREN
     {
-        let cs = cap_create_cspace(16).map_err(|_| "concurrent_map_unmap: create_cspace failed")?;
+        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+            .map_err(|_| "concurrent_map_unmap: create_cspace failed")?;
         let child_done =
             cap_copy(done, cs, 1 << 7).map_err(|_| "concurrent_map_unmap: cap_copy done failed")?;
         // Copy frame and aspace caps into child's CSpace with full rights.
@@ -48,7 +50,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         let child_aspace = cap_copy(ctx.aspace_cap, cs, syscall::RIGHTS_ALL)
             .map_err(|_| "concurrent_map_unmap: cap_copy aspace failed")?;
 
-        let th = cap_create_thread(ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
             .map_err(|_| "concurrent_map_unmap: create_thread failed")?;
 
         let done_bit = 1u64 << i;

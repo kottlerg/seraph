@@ -30,10 +30,11 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 /// Adding a signal with pre-set bits to a wait set causes `wait_set_wait`
 /// to return immediately with the correct token.
-pub fn add_signal_immediate(_ctx: &TestContext) -> TestResult
+pub fn add_signal_immediate(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create().map_err(|_| "wait_set_create failed")?;
-    let sig = cap_create_signal().map_err(|_| "cap_create_signal for ws-signal test failed")?;
+    let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for ws-signal test failed")?;
 
     wait_set_add(ws, sig, 42).map_err(|_| "wait_set_add(signal) failed")?;
 
@@ -58,10 +59,12 @@ pub fn add_signal_immediate(_ctx: &TestContext) -> TestResult
 
 /// Adding an event queue with a pre-posted entry causes `wait_set_wait`
 /// to return immediately with the correct token.
-pub fn add_queue_immediate(_ctx: &TestContext) -> TestResult
+pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create().map_err(|_| "wait_set_create for ws-queue test failed")?;
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create for ws-queue test failed")?;
+    let ws = wait_set_create(ctx.memory_frame_base)
+        .map_err(|_| "wait_set_create for ws-queue test failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for ws-queue test failed")?;
 
     wait_set_add(ws, eq, 99).map_err(|_| "wait_set_add(queue) failed")?;
 
@@ -91,16 +94,19 @@ pub fn add_queue_immediate(_ctx: &TestContext) -> TestResult
 /// `wait_set_wait` blocks until a child thread fires a registered signal.
 pub fn blocking_wait(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create().map_err(|_| "wait_set_create for blocking test failed")?;
-    let sig = cap_create_signal().map_err(|_| "cap_create_signal for blocking test failed")?;
+    let ws = wait_set_create(ctx.memory_frame_base)
+        .map_err(|_| "wait_set_create for blocking test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for blocking test failed")?;
 
     wait_set_add(ws, sig, 7).map_err(|_| "wait_set_add for blocking test failed")?;
 
     // Set up a child thread that sends on the signal.
-    let cs = cap_create_cspace(16).map_err(|_| "cap_create_cspace for blocking test failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace for blocking test failed")?;
     let child_sig =
         cap_copy(sig, cs, RIGHTS_SIGNAL).map_err(|_| "cap_copy for blocking test failed")?;
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for blocking test failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
@@ -140,11 +146,14 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
 ///
 /// Registers a signal (token 1) and an event queue (token 2). Removes the
 /// signal. Posts to the event queue and verifies only token 2 fires.
-pub fn remove(_ctx: &TestContext) -> TestResult
+pub fn remove(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create().map_err(|_| "wait_set_create for remove test failed")?;
-    let sig = cap_create_signal().map_err(|_| "cap_create_signal for remove test failed")?;
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create for remove test failed")?;
+    let ws = wait_set_create(ctx.memory_frame_base)
+        .map_err(|_| "wait_set_create for remove test failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for remove test failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for remove test failed")?;
 
     wait_set_add(ws, sig, 1).map_err(|_| "wait_set_add(sig) for remove test failed")?;
     wait_set_add(ws, eq, 2).map_err(|_| "wait_set_add(eq) for remove test failed")?;

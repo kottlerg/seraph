@@ -39,8 +39,46 @@ pub(crate) use syscall_abi::PAGE_SIZE;
 /// init main-thread IPC buffer.
 pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 
+/// Pages requested per spawned thread when carving a Thread-retype slab
+/// off `FrameAlloc`. The kernel consumes `KERNEL_STACK_PAGES + 1 = 5`
+/// pages (4 kstack + 1 wrapper/TCB) plus a small one-time per-`FrameObject`
+/// allocator metadata footprint; one extra page is included so a fresh
+/// slab always has headroom and the retype lookup does not fail
+/// `available_bytes >= raw_bytes` after the metadata debit.
+pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
+
+/// Pages init carves for memmgr/procmgr's `AddressSpace`. Page 0 becomes
+/// the root PT; pages 1..N-1 form the initial PT growth pool; the +1
+/// covers per-FrameObject allocator metadata. Mirrors procmgr's constant.
+pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
+
+/// Pages init carves for memmgr/procmgr's `CSpace`. Each slot page holds
+/// 64 capability slots (3584 B); the +1 covers per-FrameObject allocator
+/// metadata. Mirrors procmgr's constant.
+///
+/// Sized for the long-lived service's full lifetime: procmgr accumulates
+/// per-child caps (aspace, cspace, thread, frame slabs, derived rights
+/// caps) while children are alive. 33 pages → 32 slot pages → 2048 slots
+/// = ~32 children (aspace/cspace/thread/4 frame caps each) plus working
+/// caps. Larger workloads refill via augment-mode `cap_create_cspace`.
+pub(crate) const CSPACE_RETYPE_PAGES: u64 = 33;
+
 /// Base for init's scratch mappings (`ProcessInfo` frames, ELF pages).
 pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;
+
+/// Frame cap that backs init's kernel-object retypes (currently endpoints).
+///
+/// Set once early in `run()` from `FrameAlloc::alloc_page`; carries
+/// `Rights::RETYPE` and ≈ 4 KiB of `available_bytes`. Read by every
+/// `cap_create_endpoint` callsite — main.rs, service.rs.
+pub(crate) static ENDPOINT_SLAB: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Read the current endpoint-slab cap. Panics in debug if unset.
+pub(crate) fn endpoint_slab() -> u32
+{
+    ENDPOINT_SLAB.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 // ── Cap descriptor helpers ───────────────────────────────────────────────────
 
@@ -119,52 +157,54 @@ impl FrameAlloc
         }
     }
 
+    /// Advance `self.current` to the next memory-pool Frame cap and read its
+    /// size into `self.remaining`. Returns `false` when the pool is exhausted.
+    fn advance_cap(&mut self) -> bool
+    {
+        if self.next_idx >= self.frame_count
+        {
+            return false;
+        }
+        self.current = self.frame_base + self.next_idx;
+        self.next_idx += 1;
+        // cap_info on a live Frame slot returns the cap's current size; we
+        // track it locally and decrement on each split/take so subsequent
+        // `alloc_pages` requests correctly detect when this cap is too
+        // small and advance to the next.
+        self.remaining = syscall::cap_info(self.current, syscall::CAP_INFO_FRAME_SIZE).unwrap_or(0);
+        true
+    }
+
     /// Allocate a single 4 KiB page frame. Returns the Frame cap slot index.
     pub(crate) fn alloc_page(&mut self) -> Option<u32>
     {
-        // If current frame is exhausted or not yet set, advance to next.
         while self.remaining < PAGE_SIZE
         {
-            if self.next_idx >= self.frame_count
+            if !self.advance_cap()
             {
-                return None; // Out of memory
+                return None;
             }
-            self.current = self.frame_base + self.next_idx;
-            self.next_idx += 1;
-
-            // Look up the frame size from the cap descriptor.
-            // For simplicity, try splitting; if the frame is exactly one page,
-            // frame_split will fail and we use it directly.
-            // We don't know the frame size without querying, so we try a split
-            // and handle the error.
-            self.remaining = u64::MAX; // Will be refined on first split
         }
 
         if self.remaining == PAGE_SIZE
         {
-            // Exactly one page left — use the cap directly.
+            // Exactly one page left — use the cap directly. (frame_split
+            // refuses size-equal splits; the kernel requires both halves to
+            // be at least one page.)
             self.remaining = 0;
             Some(self.current)
         }
         else
         {
-            // Split off one page from the front.
-            if let Ok((page_cap, rest_cap)) = syscall::frame_split(self.current, PAGE_SIZE)
-            {
-                self.current = rest_cap;
-                if self.remaining != u64::MAX
-                {
-                    self.remaining -= PAGE_SIZE;
-                }
-                Some(page_cap)
-            }
-            else
-            {
-                // Split failed — frame may be exactly one page or smaller.
-                // Use it directly and mark as exhausted.
-                self.remaining = 0;
-                Some(self.current)
-            }
+            // Option-D frame_split: `self.current` shrinks in place to one
+            // page; the returned slot is the new tail covering the remainder.
+            // The original slot becomes the page handed out to the caller;
+            // continue from the tail.
+            let rest_cap = syscall::frame_split(self.current, PAGE_SIZE).ok()?;
+            let page_cap = self.current;
+            self.current = rest_cap;
+            self.remaining -= PAGE_SIZE;
+            Some(page_cap)
         }
     }
 
@@ -179,6 +219,44 @@ impl FrameAlloc
             core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE as usize);
         }
         Some(cap)
+    }
+
+    /// Carve `pages` contiguous frames off the front of the current cap and
+    /// return a single Frame cap covering the whole range. Used when a
+    /// caller needs a multi-page region (e.g. a Thread-retype slab).
+    pub(crate) fn alloc_pages(&mut self, pages: u64) -> Option<u32>
+    {
+        if pages == 0
+        {
+            return None;
+        }
+        let need = pages * PAGE_SIZE;
+        // Bootstrap is single-threaded; the simplest correct behaviour is
+        // to scan forward to the first cap large enough for the request.
+        // Caps that get skipped here are not "lost" — earlier `alloc_page`
+        // calls already carved their first pages; whatever fragments
+        // remain cannot satisfy a multi-page contiguous request anyway.
+        while self.remaining < need
+        {
+            if !self.advance_cap()
+            {
+                return None;
+            }
+        }
+
+        if self.remaining == need
+        {
+            self.remaining = 0;
+            return Some(self.current);
+        }
+
+        // Option-D frame_split: `self.current` shrinks in place to `need`
+        // bytes; returned slot is the new tail covering the remainder.
+        let rest_cap = syscall::frame_split(self.current, need).ok()?;
+        let slab_cap = self.current;
+        self.current = rest_cap;
+        self.remaining -= need;
+        Some(slab_cap)
     }
 }
 
@@ -221,6 +299,17 @@ fn run(info_ptr: u64) -> !
 
     let mut alloc = FrameAlloc::new(info);
 
+    // Reserve a Frame cap to back all of init's kernel-object retypes
+    // (currently endpoints; later: signals, threads, etc.). One page is
+    // enough for ~30 endpoints at 128 B each — init creates 8.
+    let Some(slab_cap) = alloc.alloc_page()
+    else
+    {
+        logging::log("init: FATAL: cannot allocate endpoint slab frame");
+        syscall::thread_exit();
+    };
+    ENDPOINT_SLAB.store(slab_cap, core::sync::atomic::Ordering::Relaxed);
+
     // Map a fresh page for init's IPC buffer.
     let Some(ipc_cap) = alloc.alloc_page()
     else
@@ -252,19 +341,19 @@ fn run(info_ptr: u64) -> !
 
     // ── Create endpoints ─────────────────────────────────────────────────────
 
-    let Ok(init_bootstrap_ep) = syscall::cap_create_endpoint()
+    let Ok(init_bootstrap_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
         logging::log("init: FATAL: cannot create init bootstrap endpoint");
         syscall::thread_exit();
     };
-    let Ok(procmgr_service_ep) = syscall::cap_create_endpoint()
+    let Ok(procmgr_service_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
         logging::log("init: FATAL: cannot create procmgr service endpoint");
         syscall::thread_exit();
     };
-    let Ok(memmgr_service_ep) = syscall::cap_create_endpoint()
+    let Ok(memmgr_service_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
         logging::log("init: FATAL: cannot create memmgr service endpoint");
@@ -282,7 +371,7 @@ fn run(info_ptr: u64) -> !
     // (not the ESP) — will eventually own the receive side and the
     // mediator role. At that point init hands over `log_ep` to logd and
     // retires the in-init thread.
-    let Ok(log_ep) = syscall::cap_create_endpoint()
+    let Ok(log_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
         logging::log("init: FATAL: cannot create log endpoint");
@@ -483,13 +572,13 @@ fn run(info_ptr: u64) -> !
 
     // ── Create remaining endpoints ───────────────────────────────────────────
 
-    let Ok(devmgr_registry_ep) = syscall::cap_create_endpoint()
+    let Ok(devmgr_registry_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
         logging::log("FATAL: cannot create devmgr registry endpoint");
         syscall::thread_exit();
     };
-    let Ok(vfsd_service_ep) = syscall::cap_create_endpoint()
+    let Ok(vfsd_service_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
         logging::log("FATAL: cannot create vfsd service endpoint");

@@ -442,6 +442,64 @@ fn rv_walk_or_alloc(
     Ok(frame_pa)
 }
 
+/// Map a single 4 KiB user page, drawing intermediate page-table frames from
+/// an `AddressSpaceObject`'s growth pool instead of the buddy allocator.
+///
+/// # Safety
+/// Same contract as [`map_user_page`]. `aso` must be the wrapper paired
+/// with the page table at `root_virt`.
+#[cfg(not(test))]
+pub unsafe fn map_user_page_pooled(
+    root_virt: u64,
+    virt: u64,
+    phys: u64,
+    flags: crate::mm::paging::PageFlags,
+    aso: &crate::cap::object::AddressSpaceObject,
+) -> Result<(), ()>
+{
+    use crate::mm::paging::phys_to_virt;
+    const USER: u64 = 1 << 4;
+
+    // SAFETY: root_virt is direct-map VA of valid user Sv48 root PT.
+    let root = unsafe { table_at(root_virt) };
+
+    let l2_pa = rv_walk_or_alloc_pooled(&mut root[vpn3_index(virt)], aso)?;
+    // SAFETY: l2_pa is a valid PT frame phys addr.
+    let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
+
+    let l1_pa = rv_walk_or_alloc_pooled(&mut l2[vpn2_index(virt)], aso)?;
+    // SAFETY: l1_pa is a valid PT frame phys addr.
+    let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
+
+    let l0_pa = rv_walk_or_alloc_pooled(&mut l1[vpn1_index(virt)], aso)?;
+    // SAFETY: l0_pa is a valid PT frame phys addr.
+    let l0 = unsafe { table_at(phys_to_virt(l0_pa)) };
+
+    let mut pte = PageTableEntry::new_page(phys, flags);
+    pte.0 |= USER;
+    l0[vpn0_index(virt)] = pte;
+
+    Ok(())
+}
+
+/// Pooled equivalent of [`rv_walk_or_alloc`]: pulls a freshly-zeroed PT
+/// frame from the AS's growth pool when an entry is absent.
+#[cfg(not(test))]
+fn rv_walk_or_alloc_pooled(
+    entry: &mut PageTableEntry,
+    aso: &crate::cap::object::AddressSpaceObject,
+) -> Result<u64, ()>
+{
+    if entry.is_present()
+    {
+        return Ok(entry.phys_addr());
+    }
+
+    let frame_pa = aso.alloc_pt_page().ok_or(())?;
+    *entry = PageTableEntry::new_table(frame_pa);
+    Ok(frame_pa)
+}
+
 /// Walk the user half of the Sv48 page table rooted at `root_virt` and free
 /// every intermediate table frame (VPN\[2\], VPN\[1\], VPN\[0\]) back to
 /// `allocator`.

@@ -30,8 +30,9 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-use super::object::KernelObjectHeader;
+use super::object::{CSpaceKernelObject, KernelObjectHeader};
 use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -62,9 +63,9 @@ pub enum CapError
 
 /// One page of capability slots.
 ///
-/// Allocated as a `Box<CSpacePage>` when the `CSpace` grows. All-zeros is a
-/// valid initial state (every slot is null), so pages are allocated via
-/// `unsafe { core::mem::zeroed() }`.
+/// Allocated either from the kernel heap (legacy bootstrap path) or popped
+/// from the parent `CSpaceKernelObject`'s growth pool (typed-memory path).
+/// All-zeros is a valid initial state (every slot is null).
 #[repr(C)]
 struct CSpacePage
 {
@@ -92,7 +93,12 @@ pub struct CSpace
 {
     id: CSpaceId,
     /// Two-level directory; each Some entry is a 64-slot page.
-    directory: [Option<Box<CSpacePage>>; L1_SIZE],
+    /// Pages are stored as raw `NonNull` pointers so the heap-backed and
+    /// retype-pool-backed paths can coexist with different reclamation
+    /// semantics. The `kobj` field discriminates: null = heap (Drop walks
+    /// the directory and Box-frees each page); non-null = retype pool
+    /// (`dealloc_object(CSpaceObj)` reclaims chunks wholesale).
+    directory: [Option<NonNull<CSpacePage>>; L1_SIZE],
     /// Total usable slots allocated across all pages (excludes slot 0).
     allocated_slots: usize,
     /// Maximum number of usable slots this `CSpace` may hold.
@@ -106,12 +112,24 @@ pub struct CSpace
     free_count: usize,
     /// Protects concurrent access to all `CSpace` state.
     pub(crate) lock: crate::sync::Spinlock,
+    /// Pool source for new slot pages. Null = legacy heap path
+    /// (`Box::leak` from kernel heap); non-null = retype-pool path
+    /// (pop from `CSpaceKernelObject::alloc_slot_page`). Set once via
+    /// [`Self::set_kobj`] right after construction.
+    kobj: AtomicPtr<CSpaceKernelObject>,
 }
+
+// SAFETY: NonNull<CSpacePage> entries are accessed only under `self.lock`
+// or after the CSpace has reached refcount 0 (single-threaded teardown).
+unsafe impl Send for CSpace {}
+// SAFETY: see Send impl above.
+unsafe impl Sync for CSpace {}
 
 impl CSpace
 {
     /// Create an empty `CSpace`. No pages are allocated until the first slot
-    /// is requested.
+    /// is requested. The pool source defaults to null (heap path); call
+    /// [`Self::set_kobj`] to switch to a retype pool.
     pub fn new(id: CSpaceId, max_slots: usize) -> Self
     {
         Self {
@@ -122,7 +140,18 @@ impl CSpace
             free_head: None,
             free_count: 0,
             lock: crate::sync::Spinlock::new(),
+            kobj: AtomicPtr::new(core::ptr::null_mut()),
         }
+    }
+
+    /// Wire this `CSpace` to a `CSpaceKernelObject`'s slot-page pool.
+    ///
+    /// MUST be called before any `grow()` if the `CSpace` is retype-backed.
+    /// Calling on a `CSpace` that has already grown via the heap path
+    /// produces a mixed-allocation directory and is a kernel bug.
+    pub fn set_kobj(&self, kobj: *mut CSpaceKernelObject)
+    {
+        self.kobj.store(kobj, Ordering::Release);
     }
 
     /// Return this `CSpace`'s unique identifier.
@@ -165,21 +194,20 @@ impl CSpace
     ///
     /// Allocates the next unoccupied directory entry, threads all its slots
     /// onto the free list, then returns. Slot 0 in the first page is skipped.
+    /// The page comes from the retype-pool pool when [`Self::set_kobj`] has
+    /// installed a parent `CSpaceKernelObject`; otherwise from the kernel
+    /// heap (legacy bootstrap path).
     fn grow(&mut self) -> Result<(), CapError>
     {
         let page_idx = self
             .directory
             .iter()
-            .position(|p: &Option<Box<CSpacePage>>| p.is_none())
+            .position(|p: &Option<NonNull<CSpacePage>>| p.is_none())
             .ok_or(CapError::OutOfSlots)?;
 
         let base = page_idx * L2_SIZE;
-        // Skip slot 0 in the first page (permanently null, not in free list).
         let start_slot = usize::from(page_idx == 0);
 
-        // Clamp to the remaining quota. A full page may exceed max_slots (e.g.
-        // when max_slots < L2_SIZE); only add the permitted number of slots to
-        // the free list. The rest of the page is allocated but left unused.
         let available = L2_SIZE - start_slot;
         let remaining_quota = self.max_slots.saturating_sub(self.allocated_slots);
         let new_free = available.min(remaining_quota);
@@ -189,22 +217,42 @@ impl CSpace
             return Err(CapError::OutOfSlots);
         }
 
-        // Allocate page (all-zeros = all null slots).
-        // SAFETY: all-zeros is a valid CSpacePage: every CapabilitySlot is null
-        // (Null tag = 0, Rights::NONE = 0, NonNull/Option niches encode None at 0).
-        let mut page = Box::new(unsafe { core::mem::zeroed::<CSpacePage>() });
+        // Source the page from the retype-pool when wired, else from heap.
+        let kobj_ptr = self.kobj.load(Ordering::Acquire);
+        let page_nn: NonNull<CSpacePage> = if kobj_ptr.is_null()
+        {
+            // SAFETY: all-zeros is a valid CSpacePage (every slot null).
+            let boxed = Box::new(unsafe { core::mem::zeroed::<CSpacePage>() });
+            // SAFETY: Box::into_raw is non-null.
+            unsafe { NonNull::new_unchecked(Box::into_raw(boxed)) }
+        }
+        else
+        {
+            #[cfg(not(test))]
+            {
+                // SAFETY: kobj_ptr is the wrapper that owns this CSpace; its
+                // pool was seeded at retype time.
+                let phys = unsafe { (*kobj_ptr).alloc_slot_page() }.ok_or(CapError::OutOfMemory)?;
+                let virt = crate::mm::paging::phys_to_virt(phys);
+                // SAFETY: pool returns page-aligned, freshly-zeroed pages
+                // mapped in the kernel direct map.
+                unsafe { NonNull::new_unchecked(virt as *mut CSpacePage) }
+            }
+            #[cfg(test)]
+            {
+                // Tests never wire a kobj; this branch is unreachable.
+                return Err(CapError::OutOfMemory);
+            }
+        };
 
-        // Thread only the permitted slots onto the free list in reverse order so
-        // ascending indices are popped in ascending order.
+        // SAFETY: page_nn points at an exclusively-owned, zeroed CSpacePage.
+        let page = unsafe { page_nn.as_ptr().as_mut().unwrap_unchecked() };
+
         let end_slot = start_slot + new_free;
         let old_head = self.free_head;
         let mut next = old_head;
         for i in (start_slot..end_slot).rev()
         {
-            // `base + i` is structurally non-zero: the first page sets
-            // `start_slot = 1`, and every later page has `base >= L2_SIZE`.
-            // The `ok_or` propagates an impossible error rather than
-            // panicking, keeping the free-list type honest.
             let idx = NonZeroU32::new((base + i) as u32).ok_or(CapError::InvalidIndex)?;
             page.slots[i].set_next_free(next);
             next = Some(idx);
@@ -213,7 +261,7 @@ impl CSpace
 
         self.allocated_slots += new_free;
         self.free_count += new_free;
-        self.directory[page_idx] = Some(page);
+        self.directory[page_idx] = Some(page_nn);
         Ok(())
     }
 
@@ -224,9 +272,12 @@ impl CSpace
         let idx = index as usize;
         let page_idx = idx / L2_SIZE;
         let slot_idx = idx % L2_SIZE;
-        self.directory[page_idx]
-            .as_ref()
-            .map(|p| &p.slots[slot_idx])
+        let page_nn = self.directory[page_idx]?;
+        // SAFETY: directory entries are never aliased while the CSpace lock
+        // is held; CapabilitySlot is repr(C) and the page bytes are exclusively
+        // owned by this CSpace.
+        let page = unsafe { page_nn.as_ref() };
+        Some(&page.slots[slot_idx])
     }
 
     /// Mutable variant of [`slot`][Self::slot].
@@ -235,9 +286,10 @@ impl CSpace
         let idx = index as usize;
         let page_idx = idx / L2_SIZE;
         let slot_idx = idx % L2_SIZE;
-        self.directory[page_idx]
-            .as_mut()
-            .map(|p| &mut p.slots[slot_idx])
+        let mut page_nn = self.directory[page_idx]?;
+        // SAFETY: same as `slot`; `&mut self` excludes other readers.
+        let page = unsafe { page_nn.as_mut() };
+        Some(&mut page.slots[slot_idx])
     }
 
     /// Return a slot to the free list and clear its contents.
@@ -423,6 +475,17 @@ impl CSpace
         self.allocated_slots - self.free_count
     }
 
+    /// Return the configured maximum number of usable slots.
+    ///
+    /// Set at construction via [`Self::new`]; immutable thereafter.
+    /// Used by `SYS_CAP_INFO`'s `CAP_INFO_CSPACE_CAPACITY` field to expose
+    /// the slot capacity to userspace inspection without granting any
+    /// mutation authority.
+    pub fn max_slots(&self) -> usize
+    {
+        self.max_slots
+    }
+
     /// Call `f` for each non-null slot's kernel object pointer.
     ///
     /// Used by `dealloc_object(CSpaceObj)` to dec-ref all objects before
@@ -434,8 +497,11 @@ impl CSpace
     {
         for page_idx in 0..L1_SIZE
         {
-            if let Some(page) = &self.directory[page_idx]
+            if let Some(page_nn) = self.directory[page_idx]
             {
+                // SAFETY: page_nn is owned by this CSpace and not aliased
+                // outside the lock.
+                let page = unsafe { page_nn.as_ref() };
                 let start = usize::from(page_idx == 0);
                 for slot_idx in start..L2_SIZE
                 {
@@ -445,6 +511,38 @@ impl CSpace
                     {
                         f(obj);
                     }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CSpace
+{
+    /// Reclaim heap-backed pages on `CSpace` destruction.
+    ///
+    /// Heap path (`kobj == null`): every `Some(NonNull<CSpacePage>)` was
+    /// `Box::leak`ed in [`Self::grow`]; reconstruct each `Box` and let it
+    /// drop, returning the page to the kernel heap.
+    ///
+    /// Retype-pool path (`kobj != null`): pages live inside chunks tracked
+    /// by [`CSpaceKernelObject`] which `dealloc_object(CSpaceObj)` reclaims
+    /// wholesale via `retype_free`. Drop here is a no-op so we don't
+    /// double-free pool pages through the global allocator.
+    fn drop(&mut self)
+    {
+        if !self.kobj.load(Ordering::Acquire).is_null()
+        {
+            return;
+        }
+        for entry in &mut self.directory
+        {
+            if let Some(page_nn) = entry.take()
+            {
+                // SAFETY: heap path: page_nn came from Box::into_raw via
+                // grow's heap branch.
+                unsafe {
+                    drop(Box::from_raw(page_nn.as_ptr()));
                 }
             }
         }
@@ -468,7 +566,10 @@ mod tests
             header: KernelObjectHeader::new(ObjectType::Frame),
             base: 0,
             size: 0x1000,
+            available_bytes: core::sync::atomic::AtomicU64::new(0),
             owns_memory: core::sync::atomic::AtomicBool::new(false),
+            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            lock: core::sync::atomic::AtomicU32::new(0),
         });
         let raw = Box::into_raw(obj) as *mut KernelObjectHeader;
         // SAFETY: Box::into_raw never returns null.

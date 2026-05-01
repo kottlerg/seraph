@@ -300,7 +300,8 @@ pub fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DevmgrCap
     bootstrap_round1(creator, ipc_buf, &mut caps)?;
     bootstrap_rounds(creator, ipc_buf, &mut caps)?;
 
-    caps.self_bootstrap_ep = syscall::cap_create_endpoint().ok()?;
+    let slab = std::os::seraph::object_slab_acquire(88)?;
+    caps.self_bootstrap_ep = syscall::cap_create_endpoint(slab).ok()?;
 
     Some(caps)
 }

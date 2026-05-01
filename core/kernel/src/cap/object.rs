@@ -11,35 +11,43 @@
 //!
 //! ## Allocation pattern
 //!
-//! ```text
-//! Box::new(FrameObject { ... })
-//!   → Box::into_raw()            // *mut FrameObject
-//!   → cast to *mut KernelObjectHeader  // safe: header at offset 0
-//!   → NonNull::new_unchecked()
-//! ```
+//! Most kernel objects are *retyped* from a Frame capability with the
+//! `Retype` right: the kernel allocates a sub-region inside the Frame's
+//! backing memory via [`crate::cap::retype::retype_allocate`], constructs
+//! the object in place at the returned offset, and stores the source
+//! `FrameObject`'s header pointer in `header.ancestor` so dealloc can
+//! reclaim the bytes back to the source cap. Init's bootstrap state
+//! (root `CSpace`, init's own `AddressSpace`/`Thread`/`CSpace`) and the
+//! Phase-7 boot-time identity wrappers remain heap-allocated for now;
+//! they have `header.ancestor == null` and dealloc through the legacy
+//! `Box::from_raw` path.
 //!
-//! Deallocation: read `header.obj_type` from the raw pointer,
-//! then reconstruct the original `Box<ConcreteObject>` and drop it.
+//! Deallocation: read `header.obj_type` from the raw pointer; if
+//! `header.ancestor` is null, drop the originating `Box<ConcreteObject>`;
+//! otherwise drop the object in place and call `retype_free` against
+//! the ancestor `FrameObject`.
 //!
 //! ## Sizes (verified by tests below)
 //!
-//! | Type                | Size |
-//! |---------------------|------|
-//! | KernelObjectHeader  |  8 B |
-//! | FrameObject         | 24 B |
-//! | MmioRegionObject    | 32 B |
-//! | InterruptObject     | 16 B |
-//! | IoPortRangeObject   | 12 B |
-//! | SchedControlObject  |  8 B |
-//! | ThreadObject        | 16 B |
-//! | AddressSpaceObject  | 16 B |
-//! | CSpaceKernelObject  | 16 B |
-//! | EndpointObject      | 16 B |
-//! | SignalObject        | 16 B |
-//! | EventQueueObject    | 16 B |
-//! | WaitSetObject       | 16 B |
+//! | Type                | Size  |
+//! |---------------------|-------|
+//! | KernelObjectHeader  | 16 B  |
+//! | FrameObject         | 64 B  |
+//! | MmioRegionObject    | 40 B  |
+//! | InterruptObject     | 24 B  |
+//! | IoPortRangeObject   | 24 B  |
+//! | SchedControlObject  | 16 B  |
+//! | SbiControlObject    | 16 B  |
+//! | ThreadObject        | 24 B  |
+//! | AddressSpaceObject  | 432 B |
+//! | CSpaceKernelObject  | 432 B |
+//! | EndpointObject      | 24 B  |
+//! | SignalObject        | 24 B  |
+//! | EventQueueObject    | 24 B  |
+//! | WaitSetObject       | 24 B  |
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 // ── ObjectType ────────────────────────────────────────────────────────────────
 
@@ -74,8 +82,20 @@ pub enum ObjectType
 /// When `dec_ref` returns 0, the object has no remaining references and can
 /// be freed (future phases will handle deallocation via `obj_type`).
 ///
-/// `#[repr(C)]` with size 8 B, alignment 4. All concrete object structs place
-/// this as their first field so pointer casts are safe.
+/// `ancestor` is a direct pointer to the `FrameObject`'s header from which
+/// this object was retyped, or null if heap-allocated (legacy path).
+/// Auto-reclaim consults this on `dec_ref → 0` to credit bytes back to the
+/// source `FrameObject` and return the chunk to the per-Frame-cap allocator.
+///
+/// A direct pointer (rather than a `SlotId`) is necessary because the source
+/// Frame cap's *slot* may be deleted before all retyped descendants are freed
+/// — the `FrameObject` itself stays alive via the refcount bump that retype
+/// performs, but the slot index becomes `Null` as soon as `cap_delete` runs
+/// on the source. Reclaim must reach the live object regardless of slot
+/// state. `SYS_CAP_INFO` exposes ancestor lineage if introspection needs it.
+///
+/// `#[repr(C)]` with size 16 B, alignment 8. All concrete object structs
+/// place this as their first field so pointer casts are safe.
 #[repr(C)]
 pub struct KernelObjectHeader
 {
@@ -83,21 +103,52 @@ pub struct KernelObjectHeader
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
-    // Padding to reach 8 bytes; field is intentionally public for repr(C)
-    // interop but unused by name — allow the underscore prefix convention.
+    // Padding to reach 8-byte alignment for the ancestor pointer below.
     #[allow(clippy::pub_underscore_fields)]
     pub _pad: [u8; 3],
+    /// Pointer to the `FrameObject`'s header this object was retyped from,
+    /// or null if allocated via the legacy heap path. Set once at creation,
+    /// read at deallocation. `AtomicPtr` for the unforgeable null sentinel
+    /// without imposing const-init constraints on construction.
+    pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
+
+// SAFETY: ancestor is a back-pointer to a kernel object whose lifetime is
+// guaranteed by retype's refcount semantics. Send+Sync via the surrounding
+// object's existing locking discipline.
+unsafe impl Send for KernelObjectHeader {}
+// SAFETY: see Send impl above.
+unsafe impl Sync for KernelObjectHeader {}
 
 impl KernelObjectHeader
 {
-    /// Construct a new header with `ref_count = 1`.
+    /// Construct a new header with `ref_count = 1` and no ancestor cap.
+    ///
+    /// Used by the legacy heap-allocation path. The retype primitive uses
+    /// [`Self::with_ancestor`] to record the source `FrameObject` for
+    /// auto-reclaim.
     pub fn new(obj_type: ObjectType) -> Self
     {
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
             _pad: [0; 3],
+            ancestor: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Construct a new header tagged with the `FrameObject` it was retyped
+    /// from.
+    ///
+    /// Used by the retype primitive. On `dec_ref → 0`, auto-reclaim consults
+    /// this pointer to credit bytes back.
+    pub fn with_ancestor(obj_type: ObjectType, ancestor: NonNull<KernelObjectHeader>) -> Self
+    {
+        Self {
+            ref_count: AtomicU32::new(1),
+            obj_type,
+            _pad: [0; 3],
+            ancestor: AtomicPtr::new(ancestor.as_ptr()),
         }
     }
 
@@ -127,18 +178,136 @@ pub struct FrameObject
     pub header: KernelObjectHeader,
     /// Physical base address of the region.
     pub base: u64,
-    /// Size of the region in bytes.
+    /// Size of the region in bytes. Mutable: `sys_frame_split` shrinks it as
+    /// a tail child is carved off; `sys_frame_merge` grows it as a tail
+    /// child is absorbed back. Mutations require `lock` in write mode;
+    /// reads (`sys_mem_map`, `retype_allocate`) require `lock` in read mode.
     pub size: u64,
+    /// Bytes still available to retype into kernel objects, or to map.
+    ///
+    /// Initialised to `size` for RAM caps minted at boot with `Rights::RETYPE`.
+    /// Set to `0` for firmware-table / boot-module / init-segment Frame caps
+    /// (those caps don't carry RETYPE rights and never participate in retype
+    /// or auto-reclaim — their `available_bytes` is informational only).
+    /// `retype_allocate` debits this; `dealloc_object` auto-reclaim credits
+    /// it back.
+    pub available_bytes: AtomicU64,
     /// `true` if this Frame is responsible for returning `[base, base + size)`
     /// to the buddy allocator on final destruction. Buddy-backed frames set
-    /// this at creation (Phase 7 `drain_for_usercaps`, `frame_split` children).
-    /// Caps over non-buddy-managed physical memory (MMIO regions, firmware
-    /// tables, boot modules, boot-loaded ELF segments) leave it `false`.
+    /// this at creation. Caps over non-buddy-managed physical memory (MMIO
+    /// regions, firmware tables, boot modules, boot-loaded ELF segments)
+    /// leave it `false`.
     ///
-    /// `frame_split` atomically transfers ownership by clearing this flag on
-    /// the original and setting it on both children before the original is
-    /// dec-ref'd — so only the children's destruction ever reaches the buddy.
-    pub owns_memory: core::sync::atomic::AtomicBool,
+    /// `sys_frame_split` (Option D) leaves the parent's flag intact; the new
+    /// tail child inherits the parent's `owns_memory` so each half buddy-frees
+    /// its own `[base, base+size)` range on dealloc. `sys_frame_merge`
+    /// clears the absorbed tail's flag (so only the parent — which now
+    /// covers the merged range — buddy-frees on its eventual dealloc).
+    pub owns_memory: AtomicBool,
+    /// Lazy-initialised per-Frame-cap retype allocator. Null until the first
+    /// retype operation against this cap; `cap::retype::ensure_allocator`
+    /// installs a heap-backed allocator on first call. Its byte cost is
+    /// debited from `available_bytes` so the ledger remains honest;
+    /// the metadata storage will move inside the cap region itself in a
+    /// follow-up that seals the kernel heap.
+    pub allocator: AtomicPtr<crate::cap::retype::RetypeAllocator>,
+    /// Per-cap reader/writer lock guarding mutations of `size` (and the
+    /// implicit `[base, base+size)` region they describe).
+    ///
+    /// Encoding mirrors `cap::derivation::DerivationLock`:
+    /// - `0` → unlocked
+    /// - `0 < n < u32::MAX` → `n` concurrent readers
+    /// - `u32::MAX` → one writer
+    ///
+    /// Read-locked by `sys_mem_map` and `cap::retype::retype_allocate`
+    /// across the validate-and-commit sequence. Write-locked by
+    /// `sys_frame_split` and `sys_frame_merge` while the cap's region is
+    /// mutated. Lock order against `DERIVATION_LOCK`: derivation-lock outer,
+    /// frame-lock inner.
+    pub lock: AtomicU32,
+}
+
+/// Sentinel encoding a held write lock in [`FrameObject::lock`]. Matches
+/// `DerivationLock`'s convention.
+#[allow(dead_code)]
+const FRAME_WRITE_LOCKED: u32 = u32::MAX;
+
+#[allow(dead_code)]
+impl FrameObject
+{
+    /// Acquire a shared read lock. Spins while a writer holds the lock.
+    pub fn read_lock(&self)
+    {
+        loop
+        {
+            let cur = self.lock.load(Ordering::Relaxed);
+            if cur != FRAME_WRITE_LOCKED
+                && self
+                    .lock
+                    .compare_exchange_weak(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Release a shared read lock previously acquired with [`Self::read_lock`].
+    pub fn read_unlock(&self)
+    {
+        self.lock.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Acquire the write lock. Spins until no readers or writers hold it.
+    pub fn write_lock(&self)
+    {
+        loop
+        {
+            if self
+                .lock
+                .compare_exchange_weak(0, FRAME_WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Release the write lock previously acquired with [`Self::write_lock`].
+    pub fn write_unlock(&self)
+    {
+        self.lock.store(0, Ordering::Release);
+    }
+}
+
+/// RAII guard releasing a read lock on a [`FrameObject`] when dropped.
+///
+/// Used by `sys_mem_map` and `cap::retype::retype_allocate` to ensure the
+/// read lock is released on every return path, including `?` short-circuits.
+pub struct FrameReadGuard<'a>
+{
+    frame: &'a FrameObject,
+}
+
+impl<'a> FrameReadGuard<'a>
+{
+    /// Acquire `frame`'s read lock and return the guard. The lock is
+    /// released when the guard is dropped.
+    pub fn acquire(frame: &'a FrameObject) -> Self
+    {
+        frame.read_lock();
+        Self { frame }
+    }
+}
+
+impl Drop for FrameReadGuard<'_>
+{
+    fn drop(&mut self)
+    {
+        self.frame.read_unlock();
+    }
 }
 
 /// Kernel object for a memory-mapped I/O region (`MmioRegion` capability).
@@ -211,7 +380,9 @@ pub struct SbiControlObject
 pub struct ThreadObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the TCB (heap-allocated).
+    /// Pointer to the TCB. Heap-allocated for legacy threads; for retype-
+    /// backed threads it points inside the same five-page retype slot that
+    /// holds the kstack and this wrapper. Discriminated by `header.ancestor`.
     pub tcb: *mut crate::sched::thread::ThreadControlBlock,
 }
 
@@ -220,13 +391,74 @@ unsafe impl Send for ThreadObject {}
 // SAFETY: ThreadObject is accessed only under the scheduler lock.
 unsafe impl Sync for ThreadObject {}
 
+/// Maximum number of distinct retype-source chunks an `AddressSpaceObject`
+/// or `CSpaceKernelObject` may track.
+///
+/// Each augment-mode call (`cap_create_aspace(frame, target)` /
+/// `cap_create_cspace(frame, target)`) consumes one slot. The original
+/// create-time chunk also occupies one slot. Sixteen is enough to absorb
+/// many augment events without bloating the wrapper struct.
+pub const MAX_PT_CHUNKS: usize = 16;
+
+/// Per-chunk record of a retype-allocated multi-page region donated to an
+/// `AddressSpaceObject`'s PT pool or a `CSpaceKernelObject`'s slot-page
+/// pool.
+///
+/// At dealloc, every non-vacant slot is fed back to its `ancestor`
+/// `FrameObject` via `retype_free`, then the ancestor is `dec_ref`'d.
+#[repr(C)]
+pub struct PoolChunkSlot
+{
+    /// `FrameObject` ancestor this chunk was carved from. Null = vacant.
+    pub ancestor: AtomicPtr<KernelObjectHeader>,
+    /// Byte offset within the ancestor's region.
+    pub base_offset: AtomicU64,
+    /// Total pages carved (initial + grown).
+    pub page_count: AtomicU64,
+}
+
+impl PoolChunkSlot
+{
+    /// Construct a vacant slot (ancestor = null, offset = 0, count = 0).
+    #[must_use]
+    pub const fn vacant() -> Self
+    {
+        Self {
+            ancestor: AtomicPtr::new(core::ptr::null_mut()),
+            base_offset: AtomicU64::new(0),
+            page_count: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Kernel object for a user-mode address space (`AddressSpace` capability).
 #[repr(C)]
 pub struct AddressSpaceObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the `AddressSpace` (heap-allocated).
+    /// Pointer to the `AddressSpace` (heap-allocated; the wrapper's PT pool
+    /// is retype-backed but the `AddressSpace` struct itself, holding the
+    /// root-PT virtual base and per-arch fields, still lives on the kernel
+    /// heap pending a follow-up that retypes init's bootstrap state).
     pub address_space: *mut crate::mm::address_space::AddressSpace,
+    /// Bytes available to back new intermediate page-table pages on `mem_map`.
+    ///
+    /// Seeded at retype time from the source Frame cap's `available_bytes`.
+    /// Refilled via augment-mode on `SYS_CAP_CREATE_ASPACE`
+    /// (`cap_create_aspace(frame_cap, target_aspace_cap)`). `mem_map` returns
+    /// `NoMemory` if a new PT page is needed but the budget is exhausted.
+    pub pt_growth_budget_bytes: AtomicU64,
+    /// Spinlock guarding `pt_pool_head_phys` and the `pt_chunks` array.
+    /// `0` = unlocked, `1` = locked.
+    pub pt_pool_lock: AtomicU64,
+    /// Head of the intrusive free-list of available PT pages, by physical
+    /// address. `0` = empty. Each free page's first 8 bytes hold the
+    /// physical address of the next free page (read/written via the
+    /// kernel direct map).
+    pub pt_pool_head_phys: AtomicU64,
+    /// Records of every retype-source chunk donated to this AS. `dealloc`
+    /// walks this array and `retype_free`s each chunk wholesale.
+    pub pt_chunks: [PoolChunkSlot; MAX_PT_CHUNKS],
 }
 
 // SAFETY: AddressSpaceObject is accessed only with proper locks.
@@ -239,8 +471,26 @@ unsafe impl Sync for AddressSpaceObject {}
 pub struct CSpaceKernelObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the `CSpace` (heap-allocated).
+    /// Pointer to the `CSpace` (heap-allocated; the wrapper's slot-page
+    /// pool is retype-backed but the `CSpace` directory itself still lives
+    /// on the kernel heap pending the follow-up that retypes init's
+    /// bootstrap state).
     pub cspace: *mut crate::cap::cspace::CSpace,
+    /// Bytes available to back new slot pages when the `CSpace` grows.
+    ///
+    /// Seeded at retype time from the source Frame cap's `available_bytes`.
+    /// Refilled via augment-mode on `SYS_CAP_CREATE_CSPACE`
+    /// (`cap_create_cspace(frame_cap, target_cspace_cap)`).
+    /// `cspace_grow` returns `NoMemory` if a new slot page is needed but the
+    /// budget is exhausted.
+    pub cspace_growth_budget_bytes: AtomicU64,
+    /// Spinlock guarding `cs_pool_head_phys` and the `cs_chunks` array.
+    pub cs_pool_lock: AtomicU64,
+    /// Head of the intrusive free-list of available slot pages, by physical
+    /// address. `0` = empty.
+    pub cs_pool_head_phys: AtomicU64,
+    /// Records of every retype-source chunk donated to this `CSpace`.
+    pub cs_chunks: [PoolChunkSlot; MAX_PT_CHUNKS],
 }
 
 // SAFETY: CSpaceKernelObject is accessed only with proper locks.
@@ -248,12 +498,312 @@ unsafe impl Send for CSpaceKernelObject {}
 // SAFETY: CSpaceKernelObject is accessed only with proper locks.
 unsafe impl Sync for CSpaceKernelObject {}
 
+/// Acquire a pool spinlock (`pt_pool_lock` or `cs_pool_lock`).
+#[inline]
+#[allow(dead_code)]
+fn pool_lock(lock: &AtomicU64)
+{
+    while lock
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+/// Release a pool spinlock.
+#[inline]
+#[allow(dead_code)]
+fn pool_unlock(lock: &AtomicU64)
+{
+    lock.store(0, Ordering::Release);
+}
+
+/// Pop one page from the pool free-list rooted at `head_phys`. Returns the
+/// page's physical address, or `0` if the pool is empty.
+///
+/// Caller must hold the pool lock.
+///
+/// # Safety
+/// `head_phys` must point at the actual `AtomicU64` head field of a live
+/// pool. The free-list link slots in the pages must not be aliased.
+#[cfg(not(test))]
+#[allow(dead_code)]
+unsafe fn pool_pop(head_phys: &AtomicU64) -> u64
+{
+    let head = head_phys.load(Ordering::Acquire);
+    if head == 0
+    {
+        return 0;
+    }
+    let virt = crate::mm::paging::phys_to_virt(head);
+    // SAFETY: `head` was placed on the list by a prior pool_push and points
+    // inside a live retype chunk; its first 8 bytes hold the next link.
+    let next = unsafe { core::ptr::read_volatile(virt as *const u64) };
+    head_phys.store(next, Ordering::Release);
+    head
+}
+
+/// Push a page onto the pool free-list. Caller must hold the pool lock and
+/// must have ensured the page is no longer in use.
+///
+/// # Safety
+/// `phys` must be page-aligned, within a chunk owned by this pool, and not
+/// concurrently aliased.
+#[cfg(not(test))]
+#[allow(dead_code)]
+unsafe fn pool_push(head_phys: &AtomicU64, phys: u64)
+{
+    let prev = head_phys.load(Ordering::Acquire);
+    let virt = crate::mm::paging::phys_to_virt(phys);
+    // SAFETY: caller guarantees `phys` is exclusively owned and unaliased.
+    unsafe { core::ptr::write_volatile(virt as *mut u64, prev) };
+    head_phys.store(phys, Ordering::Release);
+}
+
+/// Stamp out a fresh `[PoolChunkSlot; MAX_PT_CHUNKS]` array of vacant slots.
+///
+/// Used by both `AddressSpaceObject` and `CSpaceKernelObject` constructors.
+#[must_use]
+pub fn vacant_chunk_slots() -> [PoolChunkSlot; MAX_PT_CHUNKS]
+{
+    core::array::from_fn(|_| PoolChunkSlot::vacant())
+}
+
+impl AddressSpaceObject
+{
+    /// Construct a heap-backed wrapper with empty pool (legacy path used for
+    /// init's bootstrap AS). Retype-backed wrappers are constructed by
+    /// `sys_cap_create_aspace`.
+    #[must_use]
+    pub fn heap_backed(address_space: *mut crate::mm::address_space::AddressSpace) -> Self
+    {
+        Self {
+            header: KernelObjectHeader::new(ObjectType::AddressSpace),
+            address_space,
+            pt_growth_budget_bytes: AtomicU64::new(0),
+            pt_pool_lock: AtomicU64::new(0),
+            pt_pool_head_phys: AtomicU64::new(0),
+            pt_chunks: vacant_chunk_slots(),
+        }
+    }
+
+    /// Pop a free PT page from this AS's pool, charging the growth budget.
+    /// Returns the page's physical address, or `None` if the pool is empty.
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    pub fn alloc_pt_page(&self) -> Option<u64>
+    {
+        pool_lock(&self.pt_pool_lock);
+        // SAFETY: lock held; pt_pool_head_phys points at our atomic head.
+        let phys = unsafe { pool_pop(&self.pt_pool_head_phys) };
+        pool_unlock(&self.pt_pool_lock);
+        if phys == 0
+        {
+            return None;
+        }
+        // Debit the growth budget. The free-list link bytes were written
+        // when the page was last freed; zero the page now so the caller
+        // sees a fresh PT.
+        self.pt_growth_budget_bytes
+            .fetch_sub(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
+        let virt = crate::mm::paging::phys_to_virt(phys);
+        // SAFETY: the page is now owned by the caller, no aliases.
+        unsafe { core::ptr::write_bytes(virt as *mut u8, 0, crate::mm::PAGE_SIZE) };
+        Some(phys)
+    }
+
+    /// Return a previously-allocated PT page to the pool.
+    ///
+    /// # Safety
+    /// `phys` must come from a prior [`alloc_pt_page`] call on this AS, and
+    /// the page must no longer be in use as a page table.
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    pub unsafe fn free_pt_page(&self, phys: u64)
+    {
+        pool_lock(&self.pt_pool_lock);
+        // SAFETY: lock held; caller's contract guarantees `phys` is owned by
+        // this pool and not aliased.
+        unsafe { pool_push(&self.pt_pool_head_phys, phys) };
+        pool_unlock(&self.pt_pool_lock);
+        self.pt_growth_budget_bytes
+            .fetch_add(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
+    }
+
+    /// Record a freshly-retyped chunk and seed its pages onto the pool.
+    /// Returns `Err(())` if every chunk slot is occupied.
+    ///
+    /// # Safety
+    /// `ancestor` must be a live `FrameObject`'s header; this call must
+    /// follow a successful `retype_allocate(.., page_count * PAGE_SIZE)`
+    /// against that ancestor returning `base_offset`. Caller has already
+    /// `inc_ref`'d `ancestor`.
+    ///
+    /// `pool_pages` controls how many of the chunk's pages are seeded onto
+    /// the free pool; the remainder are reserved (used for fixed-purpose
+    /// allocations like the root PT in create-mode). The chunk slot
+    /// always records the *full* `total_pages` so dealloc reclaims the
+    /// entire span.
+    ///
+    /// Pool pages are taken from the *high* end of the chunk; reserved
+    /// pages occupy `[base_offset, base_offset + (total_pages - pool_pages) * PAGE_SIZE)`.
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    pub unsafe fn add_chunk(
+        &self,
+        ancestor: NonNull<KernelObjectHeader>,
+        ancestor_frame_base: u64,
+        base_offset: u64,
+        total_pages: u64,
+        pool_pages: u64,
+    ) -> Result<(), ()>
+    {
+        debug_assert!(pool_pages <= total_pages);
+        let p = crate::mm::PAGE_SIZE as u64;
+        let reserved = total_pages - pool_pages;
+        pool_lock(&self.pt_pool_lock);
+
+        // Find a vacant chunk slot.
+        let mut slot_idx = MAX_PT_CHUNKS;
+        for (i, slot) in self.pt_chunks.iter().enumerate()
+        {
+            if slot.ancestor.load(Ordering::Relaxed).is_null()
+            {
+                slot_idx = i;
+                break;
+            }
+        }
+        if slot_idx == MAX_PT_CHUNKS
+        {
+            pool_unlock(&self.pt_pool_lock);
+            return Err(());
+        }
+
+        let slot = &self.pt_chunks[slot_idx];
+        slot.base_offset.store(base_offset, Ordering::Relaxed);
+        slot.page_count.store(total_pages, Ordering::Relaxed);
+        // Set ancestor LAST: a non-null ancestor signifies a fully-populated
+        // slot.
+        slot.ancestor.store(ancestor.as_ptr(), Ordering::Release);
+
+        // Push pool pages in reverse so the lowest address ends up at the
+        // head of the free list (purely cosmetic).
+        for i in (reserved..total_pages).rev()
+        {
+            let page_phys = ancestor_frame_base + base_offset + i * p;
+            // SAFETY: lock held; chunk was just retyped from `ancestor`.
+            unsafe { pool_push(&self.pt_pool_head_phys, page_phys) };
+        }
+
+        pool_unlock(&self.pt_pool_lock);
+        self.pt_growth_budget_bytes
+            .fetch_add(pool_pages * p, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+impl CSpaceKernelObject
+{
+    /// Construct a heap-backed wrapper with empty pool (legacy path).
+    #[must_use]
+    pub fn heap_backed(cspace: *mut crate::cap::cspace::CSpace) -> Self
+    {
+        Self {
+            header: KernelObjectHeader::new(ObjectType::CSpaceObj),
+            cspace,
+            cspace_growth_budget_bytes: AtomicU64::new(0),
+            cs_pool_lock: AtomicU64::new(0),
+            cs_pool_head_phys: AtomicU64::new(0),
+            cs_chunks: vacant_chunk_slots(),
+        }
+    }
+
+    /// Pop a free slot page from this `CSpace`'s pool, charging the growth
+    /// budget. Returns the page's physical address, or `None` if empty.
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    pub fn alloc_slot_page(&self) -> Option<u64>
+    {
+        pool_lock(&self.cs_pool_lock);
+        // SAFETY: lock held.
+        let phys = unsafe { pool_pop(&self.cs_pool_head_phys) };
+        pool_unlock(&self.cs_pool_lock);
+        if phys == 0
+        {
+            return None;
+        }
+        self.cspace_growth_budget_bytes
+            .fetch_sub(crate::mm::PAGE_SIZE as u64, Ordering::AcqRel);
+        let virt = crate::mm::paging::phys_to_virt(phys);
+        // SAFETY: page is now exclusively owned by the caller.
+        unsafe { core::ptr::write_bytes(virt as *mut u8, 0, crate::mm::PAGE_SIZE) };
+        Some(phys)
+    }
+
+    /// Record a freshly-retyped chunk and seed its pages onto the pool.
+    ///
+    /// # Safety
+    /// See [`AddressSpaceObject::add_chunk`].
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    pub unsafe fn add_chunk(
+        &self,
+        ancestor: NonNull<KernelObjectHeader>,
+        ancestor_frame_base: u64,
+        base_offset: u64,
+        total_pages: u64,
+        pool_pages: u64,
+    ) -> Result<(), ()>
+    {
+        debug_assert!(pool_pages <= total_pages);
+        let p = crate::mm::PAGE_SIZE as u64;
+        let reserved = total_pages - pool_pages;
+        pool_lock(&self.cs_pool_lock);
+
+        let mut slot_idx = MAX_PT_CHUNKS;
+        for (i, slot) in self.cs_chunks.iter().enumerate()
+        {
+            if slot.ancestor.load(Ordering::Relaxed).is_null()
+            {
+                slot_idx = i;
+                break;
+            }
+        }
+        if slot_idx == MAX_PT_CHUNKS
+        {
+            pool_unlock(&self.cs_pool_lock);
+            return Err(());
+        }
+
+        let slot = &self.cs_chunks[slot_idx];
+        slot.base_offset.store(base_offset, Ordering::Relaxed);
+        slot.page_count.store(total_pages, Ordering::Relaxed);
+        slot.ancestor.store(ancestor.as_ptr(), Ordering::Release);
+
+        for i in (reserved..total_pages).rev()
+        {
+            let page_phys = ancestor_frame_base + base_offset + i * p;
+            // SAFETY: see add_chunk on AddressSpaceObject.
+            unsafe { pool_push(&self.cs_pool_head_phys, page_phys) };
+        }
+
+        pool_unlock(&self.cs_pool_lock);
+        self.cspace_growth_budget_bytes
+            .fetch_add(pool_pages * p, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
 /// Kernel object for an IPC endpoint (Endpoint capability).
 #[repr(C)]
 pub struct EndpointObject
 {
     pub header: KernelObjectHeader,
-    /// Mutable endpoint state (heap-allocated).
+    /// Pointer to the endpoint's mutable state. For retype-backed Endpoints
+    /// the state lives inline at `wrapper + 8`; for legacy heap-allocated
+    /// Endpoints it points at a separate `Box<EndpointState>`. The
+    /// `header.ancestor` discriminant tells the dealloc path which is which.
     pub state: *mut crate::ipc::endpoint::EndpointState,
 }
 
@@ -267,7 +817,9 @@ unsafe impl Sync for EndpointObject {}
 pub struct SignalObject
 {
     pub header: KernelObjectHeader,
-    /// Mutable signal state (heap-allocated).
+    /// Pointer to the signal's mutable state. Inline for retype-backed
+    /// Signals, separately heap-allocated for legacy Signals; discriminated
+    /// by `header.ancestor`.
     pub state: *mut crate::ipc::signal::SignalState,
 }
 
@@ -278,12 +830,19 @@ unsafe impl Sync for SignalObject {}
 
 /// Kernel object for an event queue (`EventQueue` capability).
 ///
-/// The ring buffer body is a separate heap allocation stored in `EventQueueState`.
+/// For retype-backed `EventQueue`s the wrapper, `EventQueueState`, and
+/// the ring buffer all live in the same retype slot — the ring is at
+/// offset [`crate::cap::retype::EVENT_QUEUE_RING_OFFSET`] from the wrapper
+/// base, and the slot is reclaimed wholesale via `retype_free`. Legacy
+/// heap-allocated `EventQueue`s keep `EventQueueState` and the ring as
+/// separate heap allocations.
 #[repr(C)]
 pub struct EventQueueObject
 {
     pub header: KernelObjectHeader,
-    /// Mutable event queue state (heap-allocated).
+    /// Pointer to the event-queue state — inline for retype-backed,
+    /// separately heap-allocated for legacy. Discriminated by
+    /// `header.ancestor`.
     pub state: *mut crate::ipc::event_queue::EventQueueState,
 }
 
@@ -294,12 +853,17 @@ unsafe impl Sync for EventQueueObject {}
 
 /// Kernel object for a wait set (`WaitSet` capability).
 ///
-/// `WaitSetState` is a ~500-byte heap allocation; this object wrapper is 16 B.
+/// `WaitSetState` is the ~480-byte body holding member slots and the ready
+/// ring; for retype-backed wait sets it lives inline immediately after the
+/// 24-byte wrapper within a single `BIN_512` retype slot. Legacy heap-
+/// allocated wait sets keep the state as a separate heap allocation.
 #[repr(C)]
 pub struct WaitSetObject
 {
     pub header: KernelObjectHeader,
-    /// Mutable wait set state (heap-allocated).
+    /// Pointer to the wait-set state — inline for retype-backed,
+    /// separately heap-allocated for legacy. Discriminated by
+    /// `header.ancestor`.
     pub state: *mut crate::ipc::wait_set::WaitSetState,
 }
 
@@ -324,15 +888,54 @@ unsafe impl Sync for WaitSetObject {}
 /// - Must NOT be called with `DERIVATION_LOCK` held, since freeing complex
 ///   objects (Thread, `AddressSpace`) may acquire the frame-allocator lock.
 ///
-/// # Modification guide
+/// # Cascade handling
 ///
-/// Add a new arm when a new `ObjectType` variant is added. Each arm must:
-/// 1. Cast `ptr` to the concrete object type.
-/// 2. Free any sub-resources (nested allocations, physical frames).
-/// 3. `Box::from_raw(ptr as *mut ConcreteType)` to drop the box.
+/// Reclaiming a retype-backed object may credit bytes back to its ancestor
+/// `FrameObject` and decrement the ancestor's refcount. If the ancestor's
+/// refcount reaches zero (transitively, when reclaiming a chain of caps
+/// whose only ref was the descendant), the ancestor must also be freed.
+/// This is handled via an explicit stack-local worklist driven by this
+/// function rather than by recursion: each arm pushes the freshly-orphaned
+/// ancestor into the worklist, and the outer loop processes it on the next
+/// iteration. Recursion would risk deadlock if a future change introduced a
+/// lock above this point.
+#[cfg(not(test))]
+pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
+{
+    /// Maximum nested-cascade depth handled. Real-world derivation chains
+    /// (memmgr-frame → child-bootstrap split → kernel object) sit at depth
+    /// `<= 4`; sixteen is generous headroom that fits on the kernel stack.
+    const MAX_CASCADE: usize = 16;
+
+    let mut worklist: [Option<core::ptr::NonNull<KernelObjectHeader>>; MAX_CASCADE] =
+        [None; MAX_CASCADE];
+    worklist[0] = Some(ptr);
+    let mut head: usize = 1;
+
+    while head > 0
+    {
+        head -= 1;
+        let Some(next) = worklist[head]
+        else
+        {
+            continue;
+        };
+        worklist[head] = None;
+        // SAFETY: `next` is a NonNull<KernelObjectHeader> that was either the
+        // original caller-supplied pointer or pushed onto the worklist by an
+        // ancestor-reclaim arm — both contracts require ref_count == 0 and
+        // exclusive ownership at this point.
+        unsafe { dealloc_object_one(next, &mut worklist, &mut head) };
+    }
+}
+
+/// Reclaim one already-zero-refcount object. If the reclaim cascades into
+/// the ancestor (`dec_ref` returns 0 against the source `FrameObject`),
+/// pushes the ancestor's pointer onto the worklist instead of recursing.
 ///
-/// For objects with blocked threads (Endpoint, Signal), drain wait queues and
-/// re-enqueue threads so they are not permanently lost.
+/// # Safety
+///
+/// Same contract as [`dealloc_object`].
 // cast_ptr_alignment: every concrete object type is allocated as Box<ConcreteType>,
 // which guarantees alignment to align_of::<ConcreteType>(). The NonNull<KernelObjectHeader>
 // points to the first field (header at offset 0), so the pointer retains the concrete
@@ -341,9 +944,30 @@ unsafe impl Sync for WaitSetObject {}
 // would obscure the type hierarchy without reducing complexity.
 #[allow(clippy::cast_ptr_alignment, clippy::too_many_lines)]
 #[cfg(not(test))]
-pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
+unsafe fn dealloc_object_one(
+    ptr: core::ptr::NonNull<KernelObjectHeader>,
+    worklist: &mut [Option<core::ptr::NonNull<KernelObjectHeader>>],
+    head: &mut usize,
+)
 {
     use alloc::boxed::Box;
+
+    /// Push `anc` onto the cascade worklist. Drops the entry on overflow —
+    /// see `MAX_CASCADE` in `dealloc_object`. Overflow is unreachable in
+    /// practice for the derivation depths this kernel actually produces;
+    /// dropping is preferable to a panic in the dealloc path.
+    fn push_ancestor(
+        worklist: &mut [Option<core::ptr::NonNull<KernelObjectHeader>>],
+        head: &mut usize,
+        anc: core::ptr::NonNull<KernelObjectHeader>,
+    )
+    {
+        if *head < worklist.len()
+        {
+            worklist[*head] = Some(anc);
+            *head += 1;
+        }
+    }
 
     // SAFETY: ptr is NonNull<KernelObjectHeader>, validated at call site.
     let header = unsafe { ptr.as_ref() };
@@ -359,14 +983,25 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
             // was atomically transferred to the children).
             // SAFETY: ptr points to a live FrameObject; single-owner access
             // since refcount reached zero at the call site.
-            let (base, size, owned) = unsafe {
+            let (base, size, owned, alloc_ptr) = unsafe {
                 let obj = &*ptr.as_ptr().cast::<FrameObject>();
                 (
                     obj.base,
                     obj.size,
                     obj.owns_memory.load(core::sync::atomic::Ordering::Acquire),
+                    obj.allocator.load(core::sync::atomic::Ordering::Acquire),
                 )
             };
+            // Reclaim the lazily-installed retype allocator metadata. The
+            // cap region itself is about to be returned to the buddy; the
+            // heap-backed `RetypeAllocator` would otherwise leak.
+            if !alloc_ptr.is_null()
+            {
+                // SAFETY: alloc_ptr was installed by `cap::retype::ensure_allocator`
+                // via `Box::into_raw`; refcount has reached zero so no other
+                // path can observe or use it.
+                unsafe { drop(Box::from_raw(alloc_ptr)) };
+            }
             if owned
             {
                 // SAFETY: buddy free-range frees the pages we originally
@@ -430,13 +1065,16 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
         // ── Thread ────────────────────────────────────────────────────────
         ObjectType::Thread =>
         {
-            // SAFETY: ptr originally from Box<ThreadObject>::into_raw; header at offset 0.
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+
+            // SAFETY: ptr points to a ThreadObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<ThreadObject>()) };
             let tcb = obj.tcb;
 
             if !tcb.is_null()
             {
                 // 2^2 = 4 pages; must match KERNEL_STACK_PAGES (sys_cap_create_thread).
+                #[allow(dead_code)]
                 const STACK_ORDER: usize = 2;
 
                 // Remove the TCB from the scheduler's run queue before freeing.
@@ -608,17 +1246,25 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                     }
                 }
 
-                // Free the kernel stack back to the buddy allocator.
-                // SAFETY: tcb validated non-null; kernel_stack_top set at creation.
-                let kstack_top = unsafe { (*tcb).kernel_stack_top };
-                let kstack_virt =
-                    kstack_top - (crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE) as u64;
-                let kstack_phys = crate::mm::paging::virt_to_phys(kstack_virt);
-                // SAFETY: kstack_phys from buddy allocator; order matches allocation.
-                unsafe {
-                    crate::mm::with_frame_allocator(|alloc| {
-                        alloc.free(kstack_phys, STACK_ORDER);
-                    });
+                // For the legacy (heap-backed) path we still hand the
+                // kstack back to the buddy allocator and Box::from_raw the
+                // TCB. The retype-backed path takes neither step — both
+                // the kstack and the TCB live inside the source Frame
+                // cap's slot and are returned together via `retype_free`
+                // after the in-place drops below.
+                if ancestor_ptr.is_null()
+                {
+                    // SAFETY: tcb validated non-null; kernel_stack_top set at creation.
+                    let kstack_top = unsafe { (*tcb).kernel_stack_top };
+                    let kstack_virt = kstack_top
+                        - (crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE) as u64;
+                    let kstack_phys = crate::mm::paging::virt_to_phys(kstack_virt);
+                    // SAFETY: kstack_phys from buddy allocator; order matches allocation.
+                    unsafe {
+                        crate::mm::with_frame_allocator(|alloc| {
+                            alloc.free(kstack_phys, STACK_ORDER);
+                        });
+                    }
                 }
 
                 // Poison the TCB so any use-after-free reads garbage
@@ -629,13 +1275,56 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                     (*tcb).priority = 0xFF;
                 }
 
-                // Drop the TCB allocation.
-                // SAFETY: tcb originally from Box::into_raw at thread creation.
-                unsafe { drop(Box::from_raw(tcb)) };
+                if ancestor_ptr.is_null()
+                {
+                    // SAFETY: tcb originally from Box::into_raw at thread creation.
+                    unsafe { drop(Box::from_raw(tcb)) };
+                }
+                else
+                {
+                    // SAFETY: tcb lives in-place inside the retype slot;
+                    // refcount has reached 0, no scheduler holds it.
+                    unsafe { core::ptr::drop_in_place(tcb) };
+                }
             }
 
-            // SAFETY: ptr originally from Box<ThreadObject>::into_raw.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<ThreadObject>())) };
+            if ancestor_ptr.is_null()
+            {
+                // SAFETY: ptr originally from Box<ThreadObject>::into_raw.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<ThreadObject>())) };
+            }
+            else
+            {
+                use crate::cap::retype::{dispatch_for, retype_free};
+                let raw_bytes = dispatch_for(ObjectType::Thread, 0).map_or(
+                    (crate::sched::KERNEL_STACK_PAGES as u64 + 1) * crate::mm::PAGE_SIZE as u64,
+                    |e| e.raw_bytes,
+                );
+                // SAFETY: ancestor_ptr non-null per the outer branch.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                // The wrapper sits one full page above the slot's base,
+                // immediately after the kstack pages.
+                let wrapper_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let kstack_pages_bytes =
+                    (crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE) as u64;
+                let block_phys = wrapper_phys - kstack_pages_bytes;
+                let offset = block_phys - ancestor_frame.base;
+
+                // SAFETY: ptr is in-place ThreadObject.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };
+
+                retype_free(ancestor_frame, offset, raw_bytes);
+
+                let ancestor_nn =
+                    // SAFETY: ancestor_ptr non-null.
+                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: refcount reached 0.
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
 
         // ── AddressSpace ──────────────────────────────────────────────────
@@ -648,40 +1337,90 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
             if !as_ptr.is_null()
             {
                 // No CPU should still have this address space loaded in
-                // satp/CR3 when we free its root page table. The scheduler
-                // loads the kernel root on user→idle transitions, so
-                // active_cpus reaching zero guarantees all CPUs have
-                // switched away.
+                // satp/CR3 when we free its root page table.
                 debug_assert!(
                     // SAFETY: as_ptr validated non-null; active_cpu_mask is an Acquire load.
                     unsafe { (*as_ptr).active_cpu_mask() } == 0,
                     "dealloc AddressSpace: freeing root while active_cpus != 0"
                 );
 
-                // SAFETY: as_ptr validated non-null; root_phys/root_virt
-                // allocated at creation; active_cpu_mask == 0 asserted above.
+                // SAFETY: as_ptr validated non-null.
                 let (root_phys, root_virt) = unsafe { ((*as_ptr).root_phys, (*as_ptr).root_virt) };
 
-                // Walk the user half of the page table and return every
-                // intermediate frame (PDPT/PD/PT on x86-64; L2/L1/L0 on
-                // Sv48) to the buddy. Leaf pages are Frame-cap-backed and
-                // are freed separately when the owning CSpace is torn down.
-                //
-                // SAFETY: root_virt is the direct-map VA of the root frame,
-                // still mapped until we free it below; caller-arranged
-                // CSpace teardown has released every mapping that referenced
-                // leaf frames.
-                unsafe {
-                    crate::mm::with_frame_allocator(|alloc| {
-                        crate::arch::current::paging::free_user_page_tables(root_virt, alloc);
-                    });
-                }
+                // Discriminate retype-backed vs heap-backed AS by checking
+                // for any recorded chunk. Retype-backed: the chunks cover
+                // root + every PT page; reclaim wholesale via retype_free.
+                // Heap-backed (init's bootstrap AS): walk the page table
+                // tree and return intermediate pages plus the root to the
+                // buddy.
+                let retype_backed = !obj.pt_chunks[0].ancestor.load(Ordering::Acquire).is_null();
 
-                // Free the root page-table frame itself (order 0).
-                // SAFETY: root_phys was allocated order-0 from the buddy at
-                // `AddressSpace::new_user` time.
-                unsafe {
-                    crate::mm::with_frame_allocator(|alloc| alloc.free(root_phys, 0));
+                if retype_backed
+                {
+                    // Snapshot every chunk slot into a stack array before
+                    // freeing — `retype_free` may touch the chunk pages
+                    // (writing free-list links into them), and the chunk
+                    // slot array itself lives on the kernel heap so it's
+                    // safe across the call. After collecting, free each.
+                    let mut snapshot: [(u64, u64, *mut KernelObjectHeader); MAX_PT_CHUNKS] =
+                        [(0, 0, core::ptr::null_mut()); MAX_PT_CHUNKS];
+                    let mut count = 0;
+                    for slot in &obj.pt_chunks
+                    {
+                        let anc = slot.ancestor.load(Ordering::Acquire);
+                        if anc.is_null()
+                        {
+                            continue;
+                        }
+                        let off = slot.base_offset.load(Ordering::Relaxed);
+                        let pages = slot.page_count.load(Ordering::Relaxed);
+                        snapshot[count] = (off, pages, anc);
+                        count += 1;
+                    }
+
+                    let p = crate::mm::PAGE_SIZE as u64;
+                    for &(off, pages, anc_ptr) in &snapshot[..count]
+                    {
+                        // SAFETY: anc_ptr was set at chunk recording from a
+                        // live FrameObject's header; the inc_ref then is
+                        // matched by the dec_ref here.
+                        let anc_hdr = unsafe { &*anc_ptr };
+                        // Cast to FrameObject for retype_free; the
+                        // ancestor is always a Frame (header at offset 0).
+                        // cast_ptr_alignment: header at offset 0; FrameObject is repr(C).
+                        #[allow(clippy::cast_ptr_alignment)]
+                        // SAFETY: anc_ptr was set at chunk recording from a
+                        // live FrameObject's header; refcount kept alive
+                        // until the dec_ref below.
+                        let anc_frame = unsafe { &*anc_ptr.cast::<FrameObject>() };
+                        crate::cap::retype::retype_free(anc_frame, off, pages * p);
+                        let new_rc = anc_hdr.dec_ref();
+                        if new_rc == 0
+                        {
+                            // SAFETY: refcount reached 0; no live cap holds it.
+                            let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
+                            push_ancestor(worklist, head, anc_nn);
+                        }
+                    }
+                    let _ = root_phys;
+                    let _ = root_virt;
+                }
+                else
+                {
+                    // Legacy heap-backed AS: walk the user half of the
+                    // page table and return every intermediate frame to
+                    // the buddy. Then free the root frame itself.
+                    // SAFETY: root_virt is direct-map VA of root frame,
+                    // still mapped until we free it below.
+                    unsafe {
+                        crate::mm::with_frame_allocator(|alloc| {
+                            crate::arch::current::paging::free_user_page_tables(root_virt, alloc);
+                        });
+                    }
+                    // SAFETY: root_phys was allocated order-0 from the buddy.
+                    unsafe {
+                        crate::mm::with_frame_allocator(|alloc| alloc.free(root_phys, 0));
+                    }
                 }
 
                 // SAFETY: as_ptr originally from Box::into_raw.
@@ -703,19 +1442,9 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
             {
                 // SAFETY: cs_ptr validated non-null; allocated at creation.
                 let id = unsafe { (*cs_ptr).id() };
-                // Unregister before freeing so no window exists where the
-                // registry contains a dangling pointer.
                 crate::cap::unregister_cspace(id);
 
                 // Dec-ref all objects referenced by non-null slots.
-                // Without this, destroying a CSpace with live caps inside
-                // (e.g., cap_copy'd caps in a child CSpace) leaks the
-                // underlying kernel objects permanently.
-                //
-                // TODO: unlink derivation tree pointers in other CSpaces
-                // that reference slots in this dying CSpace. Currently
-                // those SlotId references become stale, which is harmless
-                // unless cap_revoke traverses them.
                 // SAFETY: cs_ptr validated non-null; for_each_object handles iteration.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {
@@ -728,8 +1457,50 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                     });
                 }
 
+                // CSpace::Drop reclaims heap-backed pages; for retype-backed
+                // CSpaces it's a no-op so the chunk reclaim below isn't
+                // racing with Box::from_raw on pool memory.
                 // SAFETY: cs_ptr originally from Box::into_raw.
                 unsafe { drop(Box::from_raw(cs_ptr)) };
+            }
+
+            // Reclaim retype chunks (if any) wholesale to their ancestors.
+            let retype_backed = !obj.cs_chunks[0].ancestor.load(Ordering::Acquire).is_null();
+            if retype_backed
+            {
+                let mut snapshot: [(u64, u64, *mut KernelObjectHeader); MAX_PT_CHUNKS] =
+                    [(0, 0, core::ptr::null_mut()); MAX_PT_CHUNKS];
+                let mut count = 0;
+                for slot in &obj.cs_chunks
+                {
+                    let anc = slot.ancestor.load(Ordering::Acquire);
+                    if anc.is_null()
+                    {
+                        continue;
+                    }
+                    let off = slot.base_offset.load(Ordering::Relaxed);
+                    let pages = slot.page_count.load(Ordering::Relaxed);
+                    snapshot[count] = (off, pages, anc);
+                    count += 1;
+                }
+                let p = crate::mm::PAGE_SIZE as u64;
+                for &(off, pages, anc_ptr) in &snapshot[..count]
+                {
+                    // SAFETY: anc_ptr was set at chunk recording.
+                    let anc_hdr = unsafe { &*anc_ptr };
+                    // cast_ptr_alignment: header at offset 0; FrameObject repr(C).
+                    #[allow(clippy::cast_ptr_alignment)]
+                    // SAFETY: ancestor live until dec_ref below.
+                    let anc_frame = unsafe { &*anc_ptr.cast::<FrameObject>() };
+                    crate::cap::retype::retype_free(anc_frame, off, pages * p);
+                    let new_rc = anc_hdr.dec_ref();
+                    if new_rc == 0
+                    {
+                        // SAFETY: refcount reached 0.
+                        let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
+                        push_ancestor(worklist, head, anc_nn);
+                    }
+                }
             }
 
             // SAFETY: ptr originally from Box<CSpaceKernelObject>::into_raw.
@@ -739,7 +1510,13 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
         // ── Endpoint ──────────────────────────────────────────────────────
         ObjectType::Endpoint =>
         {
-            // SAFETY: ptr originally from Box<EndpointObject>::into_raw; header at offset 0.
+            // Distinguish heap-allocated (legacy) Endpoints from retype-backed
+            // ones by inspecting `header.ancestor`. Both share the same teardown
+            // logic for blocked queues and wait-set linkage; only the final
+            // memory-reclaim step differs.
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+
+            // SAFETY: ptr originally points to an EndpointObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<EndpointObject>()) };
             let state = obj.state;
 
@@ -752,7 +1529,7 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                     if !ep.wait_set.is_null()
                     {
                         // cast_ptr_alignment: ep.wait_set stores a type-erased *mut WaitSetState;
-                        // the original Box<WaitSetState> allocation guarantees the alignment.
+                        // the original allocation guarantees the alignment.
                         #[allow(clippy::cast_ptr_alignment)]
                         let ws = ep.wait_set.cast::<crate::ipc::wait_set::WaitSetState>();
                         let _ = crate::ipc::wait_set::waitset_remove(ws, state.cast::<u8>());
@@ -800,28 +1577,90 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                     ep.recv_head = core::ptr::null_mut();
                     ep.recv_tail = core::ptr::null_mut();
                 }
-
-                // SAFETY: state originally from Box::into_raw at endpoint creation.
-                unsafe { drop(Box::from_raw(state)) };
             }
 
-            // SAFETY: ptr originally from Box<EndpointObject>::into_raw.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<EndpointObject>())) };
+            if ancestor_ptr.is_null()
+            {
+                // Legacy heap path: the wrapper and state are separate Box
+                // allocations.
+                if !state.is_null()
+                {
+                    // SAFETY: state originally from Box::into_raw at endpoint creation.
+                    unsafe { drop(Box::from_raw(state)) };
+                }
+                // SAFETY: ptr originally from Box<EndpointObject>::into_raw.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<EndpointObject>())) };
+            }
+            else
+            {
+                // Retype path: wrapper + state live in-place inside the
+                // ancestor Frame cap's region. Drop in place (no Box::from_raw),
+                // return the slot to the per-Frame allocator, then dec_ref the
+                // ancestor — recursing if it hits zero.
+                use crate::cap::retype::{dispatch_for, retype_free};
+                // dispatch_for is total over the kernel's retypable types; the
+                // Endpoint arm always returns Some. Unwrap-or-fall-through with
+                // a fallback raw size keeps the lint quiet without panicking.
+                let raw_bytes = dispatch_for(ObjectType::Endpoint, 0).map_or(88, |e| e.raw_bytes);
+
+                // SAFETY: ancestor_ptr is non-null; it was set by `with_ancestor`
+                // at retype time and points at the source FrameObject's header.
+                // The retype primitive holds a +1 refcount on the FrameObject
+                // for the lifetime of every retyped descendant, so the target
+                // is still live.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+
+                let header_virt = ptr.as_ptr() as u64;
+                let header_phys = crate::mm::paging::virt_to_phys(header_virt);
+                let offset = header_phys - ancestor_frame.base;
+
+                // Drop in place. EndpointObject and EndpointState contain only
+                // primitive fields and Spinlock; no Drop impl, but the call is
+                // explicit for clarity and to keep parity with future types
+                // that may require it.
+                if !state.is_null()
+                {
+                    // SAFETY: state points into the ancestor Frame cap region;
+                    // refcount reached 0 so we are the unique accessor.
+                    unsafe { core::ptr::drop_in_place(state) };
+                }
+                // SAFETY: ptr is the in-place EndpointObject; unique access.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<EndpointObject>()) };
+
+                // Return the bytes to the per-Frame allocator.
+                retype_free(ancestor_frame, offset, raw_bytes);
+
+                // Drop the retype-time refcount lease. If this Frame cap has no
+                // remaining slots and no descendants, recurse to free the cap
+                // itself; the recursion is bounded by ancestor depth.
+                let ancestor_nn =
+                    // SAFETY: ancestor_ptr is non-null per the outer branch.
+                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: refcount reached 0; recursion handles the Frame
+                    // arm above (which frees the buddy pages and Box).
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
 
         // ── Signal ────────────────────────────────────────────────────────
         ObjectType::Signal =>
         {
-            // SAFETY: ptr originally from Box<SignalObject>::into_raw; header at offset 0.
+            // Branch on `header.ancestor`: heap-backed (legacy) vs retype-backed.
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+
+            // SAFETY: ptr originally points to a SignalObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<SignalObject>()) };
             let state = obj.state;
 
             if !state.is_null()
             {
                 // Clear any IRQ routing table entries that point to this
-                // SignalState. Without this, a hardware interrupt firing after
-                // the signal is freed would call signal_send on a dead slot,
-                // corrupting the slab-32 free list via fetch_or on offset 0.
+                // SignalState. A hardware interrupt firing after the signal
+                // is freed would otherwise call signal_send on a dead slot.
                 // SAFETY: interrupts disabled to serialize with IRQ delivery.
                 unsafe {
                     let saved = crate::arch::current::cpu::save_and_disable_interrupts();
@@ -829,16 +1668,15 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                     crate::arch::current::cpu::restore_interrupts(saved);
                 }
 
-                // Unregister from wait set BEFORE freeing state. If the signal
-                // is registered with a wait set, the wait set's member array
-                // still holds a source_ptr to this SignalState. Failing to
-                // remove it causes wait_set_drop to write to freed memory.
-                // SAFETY: state validated non-null; SignalState allocated at creation.
+                // Unregister from wait set BEFORE freeing state. If registered
+                // with a wait set, the wait set's member array still holds a
+                // source_ptr to this SignalState; failing to remove it causes
+                // wait_set_drop to write to freed memory.
+                // SAFETY: state validated non-null; SignalState live.
                 unsafe {
                     let sig = &mut *state;
                     if !sig.wait_set.is_null()
                     {
-                        // cast_ptr_alignment: sig.wait_set stores a type-erased *mut WaitSetState.
                         #[allow(clippy::cast_ptr_alignment)]
                         let ws = sig.wait_set.cast::<crate::ipc::wait_set::WaitSetState>();
                         let _ = crate::ipc::wait_set::waitset_remove(ws, state.cast::<u8>());
@@ -865,31 +1703,87 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                         crate::sched::enqueue_and_wake(waiter, target_cpu, prio);
                     }
                 }
-
-                // SAFETY: state originally from Box::into_raw at signal creation.
-                unsafe { drop(Box::from_raw(state)) };
             }
 
-            // SAFETY: ptr originally from Box<SignalObject>::into_raw.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SignalObject>())) };
+            if ancestor_ptr.is_null()
+            {
+                // Legacy heap path.
+                if !state.is_null()
+                {
+                    // SAFETY: state originally from Box::into_raw at creation.
+                    unsafe { drop(Box::from_raw(state)) };
+                }
+                // SAFETY: ptr originally from Box<SignalObject>::into_raw.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SignalObject>())) };
+            }
+            else
+            {
+                // Retype path: wrapper + state are in-place inside the ancestor
+                // Frame cap's region.
+                use crate::cap::retype::{dispatch_for, retype_free};
+                let raw_bytes = dispatch_for(ObjectType::Signal, 0).map_or(120, |e| e.raw_bytes);
+
+                // SAFETY: ancestor_ptr is non-null, set by `with_ancestor`; the
+                // FrameObject is kept alive by the retype-time refcount lease.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+
+                let header_virt = ptr.as_ptr() as u64;
+                let header_phys = crate::mm::paging::virt_to_phys(header_virt);
+                let offset = header_phys - ancestor_frame.base;
+
+                if !state.is_null()
+                {
+                    // SAFETY: state lives in-place inside the ancestor Frame
+                    // cap; refcount reached 0 — unique accessor.
+                    unsafe { core::ptr::drop_in_place(state) };
+                }
+                // SAFETY: ptr is the in-place SignalObject; unique access.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SignalObject>()) };
+
+                retype_free(ancestor_frame, offset, raw_bytes);
+
+                // Drop the retype-time refcount lease; recurse on full release.
+                let ancestor_nn =
+                    // SAFETY: ancestor_ptr non-null per the outer branch.
+                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: refcount reached 0; recurse to free the Frame.
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
 
         // ── EventQueue ────────────────────────────────────────────────────
         ObjectType::EventQueue =>
         {
-            // SAFETY: ptr originally from Box<EventQueueObject>::into_raw; header at offset 0.
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+
+            // SAFETY: ptr points to an EventQueueObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<EventQueueObject>()) };
             let state = obj.state;
+
+            // Read the capacity before any drop; it determines how many
+            // bytes belong to the slot (wrapper + state + inline ring).
+            let capacity = if state.is_null()
+            {
+                0u32
+            }
+            else
+            {
+                // SAFETY: state non-null; EventQueueState live.
+                unsafe { (*state).capacity }
+            };
 
             if !state.is_null()
             {
                 // Unregister from wait set before freeing state.
-                // SAFETY: state validated non-null; EventQueueState allocated at creation.
+                // SAFETY: state non-null; EventQueueState live.
                 unsafe {
                     let eq = &mut *state;
                     if !eq.wait_set.is_null()
                     {
-                        // cast_ptr_alignment: eq.wait_set stores a type-erased *mut WaitSetState.
                         #[allow(clippy::cast_ptr_alignment)]
                         let ws = eq.wait_set.cast::<crate::ipc::wait_set::WaitSetState>();
                         let _ = crate::ipc::wait_set::waitset_remove(ws, state.cast::<u8>());
@@ -898,31 +1792,101 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
                     }
                 }
 
-                // SAFETY: state was allocated in sys_cap_create_event_queue.
-                // Wake any blocked waiter (wakeup_value = 0 signals object gone).
+                // Wake any blocked waiter with `ObjectGone`. The inline
+                // ring is part of this slot and gets reclaimed below
+                // alongside the wrapper + state via `retype_free`.
+                // SAFETY: state non-null and live.
                 unsafe { crate::ipc::event_queue::event_queue_drop(state) };
             }
 
-            // SAFETY: ptr originally from Box<EventQueueObject>::into_raw.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<EventQueueObject>())) };
+            if ancestor_ptr.is_null()
+            {
+                // SAFETY: ptr originally from Box<EventQueueObject>::into_raw.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<EventQueueObject>())) };
+            }
+            else
+            {
+                use crate::cap::retype::{event_queue_raw_bytes, retype_free};
+                let raw_bytes = event_queue_raw_bytes(u64::from(capacity));
+                // SAFETY: ancestor_ptr non-null per the outer branch.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let offset = header_phys - ancestor_frame.base;
+
+                if !state.is_null()
+                {
+                    // SAFETY: state lives in-place; refcount reached 0.
+                    unsafe { core::ptr::drop_in_place(state) };
+                }
+                // SAFETY: ptr is in-place EventQueueObject.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<EventQueueObject>()) };
+
+                retype_free(ancestor_frame, offset, raw_bytes);
+
+                let ancestor_nn =
+                    // SAFETY: ancestor_ptr non-null.
+                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: refcount reached 0.
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
 
         // ── WaitSet ───────────────────────────────────────────────────────
         ObjectType::WaitSet =>
         {
-            // SAFETY: ptr originally from Box<WaitSetObject>::into_raw; header at offset 0.
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+
+            // SAFETY: ptr points to a WaitSetObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<WaitSetObject>()) };
             let state = obj.state;
 
             if !state.is_null()
             {
-                // SAFETY: state was allocated in sys_cap_create_wait_set.
-                // Wakes any blocked waiter and clears all source back-pointers.
+                // wait_set_drop wakes any blocked waiter and clears every
+                // source back-pointer. It does NOT free the state Box itself.
+                // SAFETY: state non-null and live.
                 unsafe { crate::ipc::wait_set::wait_set_drop(state) };
             }
 
-            // SAFETY: ptr originally from Box<WaitSetObject>::into_raw.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<WaitSetObject>())) };
+            if ancestor_ptr.is_null()
+            {
+                // SAFETY: ptr originally from Box<WaitSetObject>::into_raw.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<WaitSetObject>())) };
+            }
+            else
+            {
+                use crate::cap::retype::{dispatch_for, retype_free};
+                let raw_bytes = dispatch_for(ObjectType::WaitSet, 0)
+                    .map_or(crate::mm::PAGE_SIZE as u64, |e| e.raw_bytes);
+                // SAFETY: ancestor_ptr non-null.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                let header_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let offset = header_phys - ancestor_frame.base;
+
+                if !state.is_null()
+                {
+                    // SAFETY: state lives in-place.
+                    unsafe { core::ptr::drop_in_place(state) };
+                }
+                // SAFETY: ptr is in-place WaitSetObject.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<WaitSetObject>()) };
+
+                retype_free(ancestor_frame, offset, raw_bytes);
+
+                let ancestor_nn =
+                    // SAFETY: ancestor_ptr non-null.
+                    unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: refcount reached 0.
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
     }
 }
@@ -970,14 +1934,33 @@ mod tests
     #[test]
     fn struct_sizes()
     {
-        assert_eq!(size_of::<KernelObjectHeader>(), 8);
-        // FrameObject: 8 header + 8 base + 8 size + 1 owns_memory + 7 tail
-        // padding (struct aligned to 8 via u64 fields) = 32 bytes.
-        assert_eq!(size_of::<FrameObject>(), 32);
-        assert_eq!(size_of::<MmioRegionObject>(), 32);
-        assert_eq!(size_of::<InterruptObject>(), 16);
-        assert_eq!(size_of::<IoPortRangeObject>(), 16); // 8 header + 4 ports + 4 pad
-        assert_eq!(size_of::<SchedControlObject>(), 8);
+        // Header: 4 ref_count + 1 obj_type + 3 pad + 8 ancestor (Option<SlotId>
+        // via NonZeroU32 niche) = 16 bytes, alignment 4.
+        assert_eq!(size_of::<KernelObjectHeader>(), 16);
+        // FrameObject: 16 header + 8 base + 8 size + 8 available_bytes +
+        // 1 owns_memory + 7 pad + 8 allocator pointer + 4 lock + 4 pad = 64 bytes.
+        assert_eq!(size_of::<FrameObject>(), 64);
+        // MmioRegionObject: 16 header + 8 base + 8 size + 4 flags + 4 pad = 40.
+        assert_eq!(size_of::<MmioRegionObject>(), 40);
+        // InterruptObject: 16 header + 4 start + 4 count = 24.
+        assert_eq!(size_of::<InterruptObject>(), 24);
+        // IoPortRangeObject: 16 header + 2 base + 2 size + 4 pad = 24.
+        assert_eq!(size_of::<IoPortRangeObject>(), 24);
+        // Wrapper objects: 16 header + 8 ptr = 24.
+        assert_eq!(size_of::<SchedControlObject>(), 16);
+        assert_eq!(size_of::<SbiControlObject>(), 16);
+        assert_eq!(size_of::<ThreadObject>(), 24);
+        assert_eq!(size_of::<EndpointObject>(), 24);
+        assert_eq!(size_of::<SignalObject>(), 24);
+        assert_eq!(size_of::<EventQueueObject>(), 24);
+        assert_eq!(size_of::<WaitSetObject>(), 24);
+        // PoolChunkSlot: 8 ancestor + 8 base_offset + 8 page_count = 24 B.
+        assert_eq!(size_of::<PoolChunkSlot>(), 24);
+        // AddressSpaceObject: 16 header + 8 ptr + 8 budget + 8 lock + 8 head
+        // + 16 * 24 chunks = 432 B.
+        assert_eq!(size_of::<AddressSpaceObject>(), 48 + 24 * MAX_PT_CHUNKS);
+        // CSpaceKernelObject: same shape.
+        assert_eq!(size_of::<CSpaceKernelObject>(), 48 + 24 * MAX_PT_CHUNKS);
     }
 
     #[test]
@@ -991,5 +1974,32 @@ mod tests
         assert_eq!(after_dec, 1);
         let after_dec2 = h.dec_ref();
         assert_eq!(after_dec2, 0);
+    }
+
+    #[test]
+    fn header_ancestor_default_null()
+    {
+        let h = KernelObjectHeader::new(ObjectType::Endpoint);
+        assert!(
+            h.ancestor
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn header_with_ancestor_records_pointer()
+    {
+        // Use a leaked Box as a stable target — the test only checks pointer
+        // equality, not that the target is a live FrameObject.
+        let target = Box::into_raw(Box::new(KernelObjectHeader::new(ObjectType::Frame)));
+        let nn = unsafe { NonNull::new_unchecked(target) };
+        let h = KernelObjectHeader::with_ancestor(ObjectType::Endpoint, nn);
+        assert_eq!(
+            h.ancestor.load(core::sync::atomic::Ordering::Relaxed),
+            target
+        );
+        // SAFETY: target is the leaked Box from above; reclaim it.
+        unsafe { drop(Box::from_raw(target)) };
     }
 }

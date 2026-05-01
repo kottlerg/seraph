@@ -323,9 +323,11 @@ impl Command {
         // short-lived child cannot exit before the binding lands and leave
         // `wait()` blocked forever.
         let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
-        let death_eq = match syscall::event_queue_create(4) {
-            Ok(eq) => eq,
-            Err(_) => {
+        let death_eq = match crate::sys::alloc::seraph::object_slab_acquire(88)
+            .and_then(|slab| syscall::event_queue_create(slab, 4).ok())
+        {
+            Some(eq) => eq,
+            None => {
                 let _ = syscall::cap_delete(thread_cap);
                 // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
                 let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
@@ -414,7 +416,9 @@ impl Command {
             || child_stderr_pipe.is_some();
         let bridge = if any_pipe {
             let bridge_setup = (|| -> io::Result<Bridge> {
-                let completion_signal = syscall::cap_create_signal()
+                let completion_slab = crate::sys::alloc::seraph::object_slab_acquire(120)
+                    .ok_or_else(|| io::Error::other("object_slab_acquire (completion) failed"))?;
+                let completion_signal = syscall::cap_create_signal(completion_slab)
                     .map_err(|_| io::Error::other("cap_create_signal for completion failed"))?;
                 let exit_reason = Arc::new(AtomicU64::new(0));
                 let peer_dead = Arc::new(AtomicBool::new(false));

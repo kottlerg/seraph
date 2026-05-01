@@ -55,12 +55,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     //
     // Fix B1: use separate signals for each direction to prevent bit
     // accumulation across directions (parent→child vs child→parent).
-    let p2c = cap_create_signal()
+    let p2c = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "integration::tlb_coherency: cap_create_signal (p2c) failed")?;
-    let c2p = cap_create_signal()
+    let c2p = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "integration::tlb_coherency: cap_create_signal (c2p) failed")?;
 
-    let cs = cap_create_cspace(16)
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "integration::tlb_coherency: cap_create_cspace failed")?;
 
     // Copy both signals into child's cspace.
@@ -74,7 +74,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     unsafe { CHILD_C2P_SLOT = child_c2p };
 
     // ── 3. Create a child thread pinned to CPU 1. ────────────────────────────
-    let th = cap_create_thread(ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "integration::tlb_coherency: cap_create_thread failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));

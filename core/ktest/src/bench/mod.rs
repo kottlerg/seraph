@@ -203,18 +203,18 @@ fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
     let n = u64::from(iters);
 
-    let Ok(ep) = cap_create_endpoint()
+    let Ok(ep) = cap_create_endpoint(ctx.memory_frame_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_signal()
+    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
     else
     {
         return;
     };
 
-    let Ok(cs) = cap_create_cspace(16)
+    let Ok(cs) = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
     else
     {
         return;
@@ -231,7 +231,7 @@ fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     };
 
     let arg = u64::from(child_ep) | (u64::from(child_done) << 16) | (n << 32);
-    let Ok(th) = cap_create_thread(ctx.aspace_cap, cs)
+    let Ok(th) = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
     else
     {
         return;
@@ -307,23 +307,23 @@ fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
     const RIGHTS_WAIT: u64 = 1 << 8;
     let n = u64::from(iters);
 
-    let Ok(ping) = cap_create_signal()
+    let Ok(ping) = cap_create_signal(ctx.memory_frame_base)
     else
     {
         return;
     };
-    let Ok(pong) = cap_create_signal()
+    let Ok(pong) = cap_create_signal(ctx.memory_frame_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_signal()
+    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
     else
     {
         return;
     };
 
-    let Ok(cs) = cap_create_cspace(16)
+    let Ok(cs) = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
     else
     {
         return;
@@ -348,7 +348,7 @@ fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
         | (u64::from(child_pong) << 16)
         | (u64::from(child_done) << 32)
         | (n << 48);
-    let Ok(th) = cap_create_thread(ctx.aspace_cap, cs)
+    let Ok(th) = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
     else
     {
         return;
@@ -391,7 +391,7 @@ fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
 // ── New benchmarks ───────────────────────────────────────────────────────────
 
 /// Benchmark: cap create + delete cycle.
-fn bench_cap_create_delete(_ctx: &crate::TestContext, iters: u32)
+fn bench_cap_create_delete(ctx: &crate::TestContext, iters: u32)
 {
     let n = u64::from(iters);
     let mut min = u64::MAX;
@@ -401,7 +401,7 @@ fn bench_cap_create_delete(_ctx: &crate::TestContext, iters: u32)
     for _ in 0..n
     {
         let t0 = cycles_now();
-        let Ok(sig) = cap_create_signal()
+        let Ok(sig) = cap_create_signal(ctx.memory_frame_base)
         else
         {
             break;
@@ -489,7 +489,7 @@ fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     let n = iters.min(100);
     let n64 = u64::from(n);
 
-    let Ok(done) = cap_create_signal()
+    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
     else
     {
         return;
@@ -504,7 +504,7 @@ fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     {
         let t0 = cycles_now();
 
-        let Ok(cs) = cap_create_cspace(16)
+        let Ok(cs) = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         else
         {
             break;
@@ -514,7 +514,7 @@ fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
         {
             break;
         };
-        let Ok(th) = cap_create_thread(ctx.aspace_cap, cs)
+        let Ok(th) = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         else
         {
             break;
@@ -556,11 +556,11 @@ fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
 }
 
 /// Benchmark: event queue post + recv cycle.
-fn bench_event_post_recv(_ctx: &crate::TestContext, iters: u32)
+fn bench_event_post_recv(ctx: &crate::TestContext, iters: u32)
 {
     let n = u64::from(iters);
 
-    let Ok(eq) = event_queue_create(4)
+    let Ok(eq) = event_queue_create(ctx.memory_frame_base, 4)
     else
     {
         return;
@@ -603,13 +603,13 @@ fn bench_event_post_recv(_ctx: &crate::TestContext, iters: u32)
 }
 
 /// Benchmark: wait set create + add + wait + remove + delete cycle.
-fn bench_wait_set(_ctx: &crate::TestContext, iters: u32)
+fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
 {
     // Cap this benchmark at 100 iterations; wait set create/delete involves
     // heap allocations that fragment under high churn.
     let n = u64::from(iters.min(100));
 
-    let Ok(sig) = cap_create_signal()
+    let Ok(sig) = cap_create_signal(ctx.memory_frame_base)
     else
     {
         return;
@@ -625,7 +625,7 @@ fn bench_wait_set(_ctx: &crate::TestContext, iters: u32)
         signal_send(sig, 0x1).ok();
 
         let t0 = cycles_now();
-        let Ok(ws) = cap_create_wait_set()
+        let Ok(ws) = cap_create_wait_set(ctx.memory_frame_base)
         else
         {
             break;
@@ -667,9 +667,9 @@ fn bench_wait_set(_ctx: &crate::TestContext, iters: u32)
 }
 
 // Thin wrapper — same as in unit/cap.rs.
-fn cap_create_wait_set() -> Result<u32, i64>
+fn cap_create_wait_set(frame_cap: u32) -> Result<u32, i64>
 {
-    syscall::wait_set_create()
+    syscall::wait_set_create(frame_cap)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

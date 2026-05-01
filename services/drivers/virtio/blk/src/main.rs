@@ -682,7 +682,8 @@ fn main() -> !
         std::os::seraph::log!("no IRQ cap, cannot operate");
         syscall::thread_exit();
     }
-    let Ok(irq_signal) = syscall::cap_create_signal()
+    let Some(irq_signal) = std::os::seraph::object_slab_acquire(120)
+        .and_then(|slab| syscall::cap_create_signal(slab).ok())
     else
     {
         std::os::seraph::log!("failed to create IRQ signal");

@@ -115,7 +115,10 @@ fn ensure_signal(slot: &AtomicU32) -> u32 {
     if existing != 0 {
         return existing;
     }
-    let Ok(fresh) = syscall::cap_create_signal() else {
+    let Some(slab) = crate::sys::alloc::seraph::object_slab_acquire(120) else {
+        return 0;
+    };
+    let Ok(fresh) = syscall::cap_create_signal(slab) else {
         return 0;
     };
     match slot.compare_exchange(0, fresh, AcqRel, Acquire) {

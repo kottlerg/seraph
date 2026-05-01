@@ -451,9 +451,14 @@ pub fn bootstrap_memmgr(
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
-    let mm_aspace = syscall::cap_create_aspace().ok()?;
-    let mm_cspace = syscall::cap_create_cspace(8192).ok()?;
-    let mm_thread = syscall::cap_create_thread(mm_aspace, mm_cspace).ok()?;
+    let mm_aspace_slab = alloc.alloc_pages(crate::ASPACE_RETYPE_PAGES)?;
+    let mm_aspace =
+        syscall::cap_create_aspace(mm_aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
+    let mm_cspace_slab = alloc.alloc_pages(crate::CSPACE_RETYPE_PAGES)?;
+    let mm_cspace =
+        syscall::cap_create_cspace(mm_cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
+    let mm_thread_slab = alloc.alloc_pages(crate::THREAD_RETYPE_PAGES)?;
+    let mm_thread = syscall::cap_create_thread(mm_thread_slab, mm_aspace, mm_cspace).ok()?;
 
     log("created memmgr kernel objects");
     log("loading memmgr ELF segments");
@@ -541,6 +546,25 @@ pub fn finalize_memmgr(
         };
         let bytes = desc.aux1;
         let phys_base = desc.aux0;
+        // Every RAM Frame cap init forwards to memmgr MUST carry
+        // `Rights::RETYPE`. The kernel stamps RETYPE on usable RAM at
+        // Phase-7 mint (`core/kernel/src/cap/mod.rs`); init holds these
+        // caps unchanged. If this assertion ever fires, memmgr will be
+        // unable to retype frames into kernel objects and the typed-memory
+        // contract is broken. `cap_info` on a non-null slot never fails for
+        // the universal `TAG_RIGHTS` field; an Err here means the cap-
+        // routing graph is broken and the bootstrap invariant fails.
+        let Ok(packed) = syscall::cap_info(src_slot, syscall::CAP_INFO_TAG_RIGHTS)
+        else
+        {
+            panic!("init: cap_info failed on RAM Frame cap before memmgr forward");
+        };
+        // Packed value is `(tag << 32) | rights`; `RIGHTS_RETYPE` is a
+        // low-bit-position right so the u64 mask is exact.
+        assert!(
+            packed & syscall::RIGHTS_RETYPE != 0,
+            "init: RAM Frame cap missing RIGHTS_RETYPE before memmgr forward",
+        );
         let Ok(intermediary) = syscall::cap_derive(src_slot, syscall::RIGHTS_ALL)
         else
         {
@@ -772,9 +796,14 @@ pub fn bootstrap_procmgr(
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
-    let pm_aspace = syscall::cap_create_aspace().ok()?;
-    let pm_cspace = syscall::cap_create_cspace(8192).ok()?;
-    let pm_thread = syscall::cap_create_thread(pm_aspace, pm_cspace).ok()?;
+    let pm_aspace_slab = alloc.alloc_pages(crate::ASPACE_RETYPE_PAGES)?;
+    let pm_aspace =
+        syscall::cap_create_aspace(pm_aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
+    let pm_cspace_slab = alloc.alloc_pages(crate::CSPACE_RETYPE_PAGES)?;
+    let pm_cspace =
+        syscall::cap_create_cspace(pm_cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
+    let pm_thread_slab = alloc.alloc_pages(crate::THREAD_RETYPE_PAGES)?;
+    let pm_thread = syscall::cap_create_thread(pm_thread_slab, pm_aspace, pm_cspace).ok()?;
 
     log("created procmgr kernel objects");
     log("loading procmgr ELF segments");

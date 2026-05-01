@@ -35,6 +35,7 @@ use alloc::boxed::Box;
 pub mod cspace;
 pub mod derivation;
 pub mod object;
+pub mod retype;
 pub mod slot;
 
 // Re-exports for convenience. Many are consumed by future phases; suppress the
@@ -368,14 +369,18 @@ fn populate_cspace(
                 header: KernelObjectHeader::new(ObjectType::Frame),
                 base: addr,
                 size,
+                // Full retypable budget: this is RAM, drained from the buddy.
+                available_bytes: core::sync::atomic::AtomicU64::new(size),
                 // Buddy-backed: responsible for freeing on final destruction.
                 owns_memory: core::sync::atomic::AtomicBool::new(true),
+                allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                lock: core::sync::atomic::AtomicU32::new(0),
             });
             let ptr = nonnull_from_box(obj);
             let slot = insert_or_fatal(
                 cspace,
                 CapTag::Frame,
-                Rights::MAP | Rights::WRITE | Rights::EXECUTE,
+                Rights::MAP | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
                 ptr,
                 "Phase 7: cannot allocate Frame capability for usable memory",
             );
@@ -414,15 +419,19 @@ fn populate_cspace(
             header: KernelObjectHeader::new(ObjectType::Frame),
             base: entry.physical_base,
             size: entry.size,
+            // RAM cap: full retypable budget mirrors the production path.
+            available_bytes: core::sync::atomic::AtomicU64::new(entry.size),
             // Test stub: buddy not active; leaking on destruction is the
             // expected unit-test behaviour.
             owns_memory: core::sync::atomic::AtomicBool::new(false),
+            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            lock: core::sync::atomic::AtomicU32::new(0),
         });
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
             CapTag::Frame,
-            Rights::MAP | Rights::WRITE | Rights::EXECUTE,
+            Rights::MAP | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
             ptr,
             "Phase 7: cannot allocate Frame capability for usable memory",
         );
@@ -595,8 +604,12 @@ fn populate_cspace(
             header: KernelObjectHeader::new(ObjectType::Frame),
             base: entry.physical_base,
             size,
+            // Firmware table: not retypable; cap minted without RETYPE.
+            available_bytes: core::sync::atomic::AtomicU64::new(0),
             // Firmware-reserved memory; not buddy-backed.
             owns_memory: core::sync::atomic::AtomicBool::new(false),
+            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            lock: core::sync::atomic::AtomicU32::new(0),
         });
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
@@ -634,7 +647,11 @@ fn populate_cspace(
             header: KernelObjectHeader::new(ObjectType::Frame),
             base: page_base,
             size: 0x1000,
+            // Firmware table: not retypable; cap minted without RETYPE.
+            available_bytes: core::sync::atomic::AtomicU64::new(0),
             owns_memory: core::sync::atomic::AtomicBool::new(false),
+            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            lock: core::sync::atomic::AtomicU32::new(0),
         });
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
@@ -671,7 +688,11 @@ fn populate_cspace(
                 header: KernelObjectHeader::new(ObjectType::Frame),
                 base: info.device_tree & !0xFFF,
                 size: rounded,
+                // Firmware table: not retypable; cap minted without RETYPE.
+                available_bytes: core::sync::atomic::AtomicU64::new(0),
                 owns_memory: core::sync::atomic::AtomicBool::new(false),
+                allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                lock: core::sync::atomic::AtomicU32::new(0),
             });
             let ptr = nonnull_from_box(obj);
             let slot = insert_or_fatal(
@@ -843,9 +864,13 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             header: KernelObjectHeader::new(ObjectType::Frame),
             base: module.physical_base,
             size: rounded_size,
+            // Boot module: not retypable; cap minted without RETYPE.
+            available_bytes: core::sync::atomic::AtomicU64::new(0),
             // Boot module pages are pre-loaded by the bootloader outside
             // the buddy pool; never return them.
             owns_memory: core::sync::atomic::AtomicBool::new(false),
+            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            lock: core::sync::atomic::AtomicU32::new(0),
         });
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(

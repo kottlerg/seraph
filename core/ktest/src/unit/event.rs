@@ -29,9 +29,10 @@ static mut TIMEOUT_FOREVER_STACK: ChildStack = ChildStack::ZERO;
 // ── SYS_CAP_CREATE_EVENT_Q ───────────────────────────────────────────────────
 
 /// `event_queue_create` returns a valid slot for a queue of the given capacity.
-pub fn create(_ctx: &TestContext) -> TestResult
+pub fn create(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create(4) failed")?;
+    let eq =
+        event_queue_create(ctx.memory_frame_base, 4).map_err(|_| "event_queue_create(4) failed")?;
     cap_delete(eq).map_err(|_| "cap_delete after event queue create failed")?;
     Ok(())
 }
@@ -39,9 +40,10 @@ pub fn create(_ctx: &TestContext) -> TestResult
 // ── SYS_EVENT_POST / SYS_EVENT_RECV ──────────────────────────────────────────
 
 /// `event_post` enqueues payloads and `event_recv` dequeues them in FIFO order.
-pub fn post_recv_fifo(_ctx: &TestContext) -> TestResult
+pub fn post_recv_fifo(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create for FIFO test failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for FIFO test failed")?;
 
     event_post(eq, 0x100).map_err(|_| "event_post(0x100) failed")?;
     event_post(eq, 0x200).map_err(|_| "event_post(0x200) failed")?;
@@ -73,9 +75,10 @@ pub fn post_recv_fifo(_ctx: &TestContext) -> TestResult
 /// `event_post` on a full queue returns `QueueFull`.
 ///
 /// A capacity-1 queue accepts exactly one post; the second returns an error.
-pub fn queue_full_err(_ctx: &TestContext) -> TestResult
+pub fn queue_full_err(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(1).map_err(|_| "event_queue_create(1) failed")?;
+    let eq =
+        event_queue_create(ctx.memory_frame_base, 1).map_err(|_| "event_queue_create(1) failed")?;
 
     event_post(eq, 0xAA).map_err(|_| "first event_post to capacity-1 queue failed")?;
 
@@ -100,16 +103,20 @@ pub fn queue_full_err(_ctx: &TestContext) -> TestResult
 /// verifies the received payload and reports it back via a signal.
 pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create failed")?;
-    let sync = cap_create_signal().map_err(|_| "cap_create_signal for sync failed")?;
+    let eq =
+        event_queue_create(ctx.memory_frame_base, 4).map_err(|_| "event_queue_create failed")?;
+    let sync = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_signal for sync failed")?;
 
-    let cs = cap_create_cspace(16).map_err(|_| "cap_create_cspace failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace failed")?;
     // Pass all rights for the queue; SIGNAL right for the sync signal.
     let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_sync = cap_copy(sync, cs, 1 << 7).map_err(|_| "cap_copy sync failed")?;
     let child_arg = u64::from(child_eq) | (u64::from(child_sync) << 16);
 
-    let th = cap_create_thread(ctx.aspace_cap, cs).map_err(|_| "cap_create_thread failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        .map_err(|_| "cap_create_thread failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
     thread_configure(
         th,
@@ -143,9 +150,10 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
 // ── SYS_EVENT_POST (insufficient rights) ─────────────────────────────────────
 
 /// `event_post` on a cap without POST right must fail.
-pub fn post_insufficient_rights(_ctx: &TestContext) -> TestResult
+pub fn post_insufficient_rights(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create for post_rights test failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for post_rights test failed")?;
 
     // Derive with RECV right only (bit 10), no POST (bit 9).
     let recv_only =
@@ -167,9 +175,10 @@ pub fn post_insufficient_rights(_ctx: &TestContext) -> TestResult
 /// `event_recv` on a cap without RECV right must fail.
 ///
 /// Pre-posts a value so we test rights, not blocking.
-pub fn recv_insufficient_rights(_ctx: &TestContext) -> TestResult
+pub fn recv_insufficient_rights(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create for recv_rights test failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for recv_rights test failed")?;
 
     // Post a value first so the queue is non-empty.
     event_post(eq, 0x42).map_err(|_| "event_post for recv_rights test failed")?;
@@ -196,9 +205,10 @@ pub fn recv_insufficient_rights(_ctx: &TestContext) -> TestResult
 /// `event_try_recv` (`arg1 = u64::MAX`) on an empty queue returns `WouldBlock`.
 ///
 /// Positive control: pre-post then `event_try_recv` returns the payload.
-pub fn try_recv_empty_returns_wouldblock(_ctx: &TestContext) -> TestResult
+pub fn try_recv_empty_returns_wouldblock(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create for try_recv test failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for try_recv test failed")?;
 
     let err = event_try_recv(eq);
     if err != Err(SyscallError::WouldBlock as i64)
@@ -222,9 +232,10 @@ pub fn try_recv_empty_returns_wouldblock(_ctx: &TestContext) -> TestResult
 /// Asserts the call returns `WouldBlock` and that elapsed wall-clock time is
 /// at least most of the requested 50 ms (generous lower bound to absorb QEMU
 /// timer jitter; no upper bound enforced — only correctness, not latency).
-pub fn recv_timeout_fires_on_empty_queue(_ctx: &TestContext) -> TestResult
+pub fn recv_timeout_fires_on_empty_queue(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(4).map_err(|_| "event_queue_create for timeout test failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for timeout test failed")?;
 
     let t0 = system_info(SystemInfoType::ElapsedUs as u64)
         .map_err(|_| "system_info(ElapsedUs) before recv failed")?;
@@ -252,14 +263,16 @@ pub fn recv_timeout_fires_on_empty_queue(_ctx: &TestContext) -> TestResult
 /// regresses to `WouldBlock` even though a real post arrived.
 pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
 {
-    let eq =
-        event_queue_create(4).map_err(|_| "event_queue_create for zero-payload test failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "cap_create_cspace failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for zero-payload test failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace failed")?;
     let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     // Encode the post payload as 0; the child will sleep ~10 ms, then post 0.
     let child_arg = u64::from(child_eq);
 
-    let th = cap_create_thread(ctx.aspace_cap, cs).map_err(|_| "cap_create_thread failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        .map_err(|_| "cap_create_thread failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_ZERO_PAYLOAD_STACK));
     thread_configure(
         th,
@@ -288,13 +301,15 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
 /// guarding the data path itself.
 pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
 {
-    let eq =
-        event_queue_create(4).map_err(|_| "event_queue_create for nonzero-payload test failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "cap_create_cspace failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for nonzero-payload test failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace failed")?;
     let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_arg = u64::from(child_eq);
 
-    let th = cap_create_thread(ctx.aspace_cap, cs).map_err(|_| "cap_create_thread failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        .map_err(|_| "cap_create_thread failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_NONZERO_PAYLOAD_STACK));
     thread_configure(
         th,
@@ -321,13 +336,15 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
 /// `arg1 = 0` semantics of `event_recv`).
 pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
 {
-    let eq =
-        event_queue_create(4).map_err(|_| "event_queue_create for forever-block test failed")?;
-    let cs = cap_create_cspace(16).map_err(|_| "cap_create_cspace failed")?;
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "event_queue_create for forever-block test failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "cap_create_cspace failed")?;
     let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_arg = u64::from(child_eq);
 
-    let th = cap_create_thread(ctx.aspace_cap, cs).map_err(|_| "cap_create_thread failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        .map_err(|_| "cap_create_thread failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_FOREVER_STACK));
     thread_configure(
         th,

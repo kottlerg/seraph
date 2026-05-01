@@ -39,20 +39,21 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     crate::log("multi_caller_ipc_fifo: starting");
 
-    let ep =
-        cap_create_endpoint().map_err(|_| "multi_caller_ipc_fifo: cap_create_endpoint failed")?;
-    let done =
-        cap_create_signal().map_err(|_| "multi_caller_ipc_fifo: cap_create_signal failed")?;
+    let ep = cap_create_endpoint(ctx.memory_frame_base)
+        .map_err(|_| "multi_caller_ipc_fifo: cap_create_endpoint failed")?;
+    let done = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "multi_caller_ipc_fifo: cap_create_signal failed")?;
 
     // ── Build and start caller A ──────────────────────────────────────────────
-    let cs_a = cap_create_cspace(16).map_err(|_| "multi_caller_ipc_fifo: cs_a failed")?;
+    let cs_a = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "multi_caller_ipc_fifo: cs_a failed")?;
     let ep_a =
         cap_copy(ep, cs_a, RIGHTS_SEND_GRANT).map_err(|_| "multi_caller_ipc_fifo: ep_a failed")?;
     let done_a =
         cap_copy(done, cs_a, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_a failed")?;
     // arg: ep_slot | (done_slot << 16) | (label << 32)
     let arg_a = u64::from(ep_a) | (u64::from(done_a) << 16) | (1u64 << 32);
-    let th_a = cap_create_thread(ctx.aspace_cap, cs_a)
+    let th_a = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_a)
         .map_err(|_| "multi_caller_ipc_fifo: th_a failed")?;
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
     thread_configure(th_a, caller_entry as *const () as u64, stack_a, arg_a)
@@ -64,13 +65,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after A failed")?;
 
     // ── Build and start caller B ──────────────────────────────────────────────
-    let cs_b = cap_create_cspace(16).map_err(|_| "multi_caller_ipc_fifo: cs_b failed")?;
+    let cs_b = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "multi_caller_ipc_fifo: cs_b failed")?;
     let ep_b =
         cap_copy(ep, cs_b, RIGHTS_SEND_GRANT).map_err(|_| "multi_caller_ipc_fifo: ep_b failed")?;
     let done_b =
         cap_copy(done, cs_b, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_b failed")?;
     let arg_b = u64::from(ep_b) | (u64::from(done_b) << 16) | (2u64 << 32);
-    let th_b = cap_create_thread(ctx.aspace_cap, cs_b)
+    let th_b = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_b)
         .map_err(|_| "multi_caller_ipc_fifo: th_b failed")?;
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
     thread_configure(th_b, caller_entry as *const () as u64, stack_b, arg_b)
@@ -81,13 +83,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after B failed")?;
 
     // ── Build and start caller C ──────────────────────────────────────────────
-    let cs_c = cap_create_cspace(16).map_err(|_| "multi_caller_ipc_fifo: cs_c failed")?;
+    let cs_c = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "multi_caller_ipc_fifo: cs_c failed")?;
     let ep_c =
         cap_copy(ep, cs_c, RIGHTS_SEND_GRANT).map_err(|_| "multi_caller_ipc_fifo: ep_c failed")?;
     let done_c =
         cap_copy(done, cs_c, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_c failed")?;
     let arg_c = u64::from(ep_c) | (u64::from(done_c) << 16) | (3u64 << 32);
-    let th_c = cap_create_thread(ctx.aspace_cap, cs_c)
+    let th_c = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_c)
         .map_err(|_| "multi_caller_ipc_fifo: th_c failed")?;
     let stack_c = ChildStack::top(core::ptr::addr_of!(STACK_C));
     thread_configure(th_c, caller_entry as *const () as u64, stack_c, arg_c)

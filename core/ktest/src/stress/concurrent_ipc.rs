@@ -24,8 +24,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     for _cycle in 0..CYCLES
     {
-        let ep = cap_create_endpoint().map_err(|_| "concurrent_ipc: create_endpoint failed")?;
-        let done = cap_create_signal().map_err(|_| "concurrent_ipc: create_signal failed")?;
+        let ep = cap_create_endpoint(ctx.memory_frame_base)
+            .map_err(|_| "concurrent_ipc: create_endpoint failed")?;
+        let done = cap_create_signal(ctx.memory_frame_base)
+            .map_err(|_| "concurrent_ipc: create_signal failed")?;
 
         let mut threads = [0u32; NUM_CALLERS];
         let mut cspaces = [0u32; NUM_CALLERS];
@@ -33,13 +35,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         // Start all callers simultaneously (no yields between starts).
         for i in 0..NUM_CALLERS
         {
-            let cs = cap_create_cspace(16).map_err(|_| "concurrent_ipc: create_cspace failed")?;
+            let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+                .map_err(|_| "concurrent_ipc: create_cspace failed")?;
             let child_ep = cap_copy(ep, cs, RIGHTS_SEND_GRANT)
                 .map_err(|_| "concurrent_ipc: cap_copy ep failed")?;
             let child_done =
                 cap_copy(done, cs, 1 << 7).map_err(|_| "concurrent_ipc: cap_copy done failed")?;
 
-            let th = cap_create_thread(ctx.aspace_cap, cs)
+            let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
                 .map_err(|_| "concurrent_ipc: create_thread failed")?;
 
             // Pack: label = i+1 (1-based), done_bit = 1<<i (unique per child).

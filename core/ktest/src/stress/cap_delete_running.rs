@@ -32,8 +32,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for i in 0..NUM_CHILDREN
     {
-        let cs = cap_create_cspace(8).map_err(|_| "cap_delete_running: create_cspace failed")?;
-        let th = cap_create_thread(ctx.aspace_cap, cs)
+        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+            .map_err(|_| "cap_delete_running: create_cspace failed")?;
+        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
             .map_err(|_| "cap_delete_running: create_thread failed")?;
 
         // SAFETY: stress tests run sequentially; only this test uses these

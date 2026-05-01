@@ -338,9 +338,7 @@ impl Heap {
                     return false;
                 }
                 let va = start_va + mapped * PAGE_SIZE;
-                if syscall::mem_map(cap_slot, self.self_aspace, va, 0, pages_in_cap, MAP_WRITABLE)
-                    .is_err()
-                {
+                if !self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) {
                     return false;
                 }
                 mapped += pages_in_cap;
@@ -357,6 +355,38 @@ impl Heap {
         unsafe { self.insert(region_base, region_bytes) };
         self.mapped_end = region_base + region_bytes;
         true
+    }
+
+    /// `mem_map` wrapper that augments the AS's PT growth budget once on
+    /// `OutOfMemory` and retries.
+    ///
+    /// `mem_map` returns `OutOfMemory` (-8) when the destination AS's PT
+    /// growth budget is exhausted (a new intermediate page-table page is
+    /// needed but the budget has none). We acquire a fresh Frame cap from
+    /// memmgr, augment the AS via `cap_create_aspace(frame, self_aspace,
+    /// init_pages=1)`, and retry the map. One augment per failure; if the
+    /// retry also fails the caller treats the grow as failed.
+    fn mem_map_with_augment_retry(&self, frame_cap: u32, va: u64, pages: u64) -> bool {
+        const SYSCALL_OUT_OF_MEMORY: i64 = -8;
+        match syscall::mem_map(frame_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
+            Ok(()) => return true,
+            Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
+            Err(_) => return false,
+        }
+        // Augment: request 1 page from memmgr, feed to cap_create_aspace
+        // in augment mode (target = self_aspace). Single page covers
+        // ~511 new PT-entries' worth of mappable VA.
+        let Some(aug_frame) = slab_acquire_fresh(PAGE_SIZE, 2) else {
+            return false;
+        };
+        if syscall::cap_create_aspace(aug_frame, self.self_aspace, 1).is_err() {
+            // Augment-mode returns 0 on success; treat any error as fatal
+            // for this grow. Drop the unused frame.
+            let _ = syscall::cap_delete(aug_frame);
+            return false;
+        }
+        // The augment cap is consumed by cap_create_aspace; do not delete.
+        syscall::mem_map(frame_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
     }
 }
 
@@ -465,6 +495,202 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
 /// Returns `true` once `heap_bootstrap` has completed successfully.
 pub fn heap_is_initialized() -> bool {
     INITIALIZED.load(Ordering::Acquire)
+}
+
+// ── Object slabs ────────────────────────────────────────────────────────────
+//
+// Per-process working Frame caps that back kernel-object retypes
+// (`SYS_CAP_CREATE_*`). Two cached slabs — one per kernel sub-page bin —
+// plus a no-cache path for page-aligned requests. Lazily acquired from
+// memmgr on first call; reused across all retypes until exhausted, then a
+// fresh slab cap is requested.
+//
+// Thread-safe via per-pool spinlocks. The cached `local_avail` mirrors the
+// kernel's `available_bytes` ledger on the slab cap — debited per acquire
+// without crediting on auto-reclaim (the kernel does, against the same cap).
+// When `local_avail` underflows our request, a fresh slab is requested
+// rather than calling `SYS_CAP_INFO`; this trades a small per-process leak
+// of "stuck" bytes on the previous slab for a simpler hot path.
+//
+// Two pools (one per BIN_128 / BIN_512 size class) prevents a 512-byte
+// request from blocking a 128-byte request that could otherwise have been
+// served from the same slab without refresh. Page-aligned requests bypass
+// the cache entirely — every retype consumes ≥ 1 page so caching offers
+// nothing.
+
+struct ObjectSlab {
+    cap: crate::sync::atomic::AtomicU32,
+    local_avail: crate::sync::atomic::AtomicU64,
+    lock: SpinLock,
+}
+
+const fn empty_slab() -> ObjectSlab {
+    ObjectSlab {
+        cap: crate::sync::atomic::AtomicU32::new(0),
+        local_avail: crate::sync::atomic::AtomicU64::new(0),
+        lock: SpinLock::new(),
+    }
+}
+
+/// Slab serving sub-page requests `<= 128 B` (Endpoint, Signal).
+static SLAB_BIN_128: ObjectSlab = empty_slab();
+/// Slab serving sub-page requests `> 128 B && <= 512 B` (WaitSet).
+static SLAB_BIN_512: ObjectSlab = empty_slab();
+
+/// memmgr endpoint shared by every slab path. Set once at process start.
+static SLAB_MEMMGR_EP: crate::sync::atomic::AtomicU32 = crate::sync::atomic::AtomicU32::new(0);
+
+/// Set the memmgr endpoint backing the object-slab refill path. Called once
+/// from `_start` after `heap_bootstrap`. Subsequent calls are ignored.
+pub fn object_slab_init(memmgr_ep: u32) {
+    SLAB_MEMMGR_EP.store(memmgr_ep, Ordering::Release);
+}
+
+/// Round `bytes` up to the same size class the kernel's retype primitive
+/// uses (`core::kernel::cap::retype::round_to_class`). Keeps the local
+/// ledger in sync with the kernel ledger without a syscall.
+fn slab_round_to_class(bytes: u64) -> u64 {
+    if bytes == 0 {
+        0
+    } else if bytes <= 128 {
+        128
+    } else if bytes <= 512 {
+        512
+    } else {
+        let p = PAGE_SIZE;
+        bytes.div_ceil(p) * p
+    }
+}
+
+/// Request a Frame cap from memmgr covering at least `min_pages` 4-KiB
+/// pages. memmgr's best-effort reply may return up to four Frame caps, each
+/// covering one or more contiguous pages. We accept the first cap whose
+/// declared `page_count` is `>= min_pages`; if none qualifies, we fall back
+/// to the first returned cap (any cap unblocks sub-page retypes; a too-small
+/// cap simply means the next page-sized retype request triggers a refresh).
+///
+/// Returns `Some((slot, pages))` on success, `None` on IPC failure or empty
+/// reply.
+fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64)> {
+    let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return None;
+    }
+    let msg = ipc::IpcMessage::builder(REQUEST_FRAMES).word(0, min_pages).build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }.ok()?;
+    if reply.label != 0 {
+        return None;
+    }
+    let returned = reply.word(0) as usize;
+    if returned == 0 {
+        return None;
+    }
+    let caps = reply.caps();
+    // Prefer the first cap that already covers `min_pages`.
+    for i in 0..returned {
+        let pages = reply.word(1 + i);
+        if pages >= min_pages {
+            return Some((caps[i], pages));
+        }
+    }
+    // Fallback: take the first (smaller) cap so sub-page retypes still work.
+    Some((caps[0], reply.word(1)))
+}
+
+/// Number of pages to request when refilling the object slab.
+///
+/// The kernel's per-Frame retype allocator carves a small metadata header
+/// (≈ 48 B) out of the cap's `available_bytes` on first use. A page-aligned
+/// retype therefore cannot fit in a single 4-KiB cap; we always grab two
+/// pages so a `PAGE_SIZE`-byte request (e.g. `WaitSet`) succeeds, and a
+/// follow-up sub-page request reuses the remaining ~4 KiB on the same cap.
+const SLAB_REFILL_PAGES: u64 = 2;
+
+/// Acquire from `pool`, refilling from memmgr if exhausted. `need` is the
+/// rounded class size; `pool` is the matching cached slab; `want_pages`
+/// is the request size used on refill.
+fn slab_acquire_pooled(pool: &ObjectSlab, need: u64, want_pages: u64) -> Option<u32> {
+    pool.lock.lock();
+    let res = (|| -> Option<u32> {
+        // Fast path: existing slab still has room.
+        let cur = pool.cap.load(Ordering::Acquire);
+        let avail = pool.local_avail.load(Ordering::Relaxed);
+        if cur != 0 && avail >= need {
+            pool.local_avail.store(avail - need, Ordering::Relaxed);
+            return Some(cur);
+        }
+        // Refill: request a fresh cap from memmgr. One attempt — propagate
+        // failure rather than loop on best-effort partial replies.
+        let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+        if ep == 0 {
+            return None;
+        }
+        let (new_cap, cap_pages) = slab_request_pages(ep, want_pages)?;
+        const ALLOCATOR_METADATA_RESERVE: u64 = 64;
+        let total = cap_pages.saturating_mul(PAGE_SIZE);
+        let usable = total.saturating_sub(ALLOCATOR_METADATA_RESERVE);
+        if usable < need {
+            // memmgr returned a cap too small for this request. Drop it
+            // (the caller will see None and decide what to do); don't
+            // install it as the slab — a smaller cap would just block the
+            // next bigger request the same way.
+            let _ = syscall::cap_delete(new_cap);
+            return None;
+        }
+        pool.cap.store(new_cap, Ordering::Release);
+        pool.local_avail.store(usable - need, Ordering::Relaxed);
+        Some(new_cap)
+    })();
+    pool.lock.unlock();
+    res
+}
+
+/// Acquire a fresh, dedicated Frame cap for a page-aligned retype. No
+/// caching — the cap is consumed entirely by the caller's single retype
+/// (or by a few retypes against the leftover sub-page tail, which the
+/// caller manages). Used by variable-size types (`EventQueue`, `Thread`,
+/// `AddressSpace`, `CSpace`) where caching offers no benefit.
+fn slab_acquire_fresh(need: u64, want_pages: u64) -> Option<u32> {
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    if ep == 0 {
+        return None;
+    }
+    let (new_cap, cap_pages) = slab_request_pages(ep, want_pages)?;
+    const ALLOCATOR_METADATA_RESERVE: u64 = 64;
+    let total = cap_pages.saturating_mul(PAGE_SIZE);
+    if total.saturating_sub(ALLOCATOR_METADATA_RESERVE) < need {
+        let _ = syscall::cap_delete(new_cap);
+        return None;
+    }
+    Some(new_cap)
+}
+
+/// Return a Frame-cap slot with at least `min_bytes` of `available_bytes`
+/// for retype.
+///
+/// Caller passes the raw byte cost of the upcoming retype (e.g. 88 for
+/// `Endpoint`); the function rounds up to the matching size class and
+/// dispatches to a per-class cached slab (sub-page) or a fresh dedicated
+/// cap (page-aligned). The returned slot index is fed directly to
+/// `cap_create_*`.
+///
+/// Returns `None` if memmgr is unreachable, refuses the request, or
+/// returns a cap too small to satisfy the request after refill (memmgr's
+/// best-effort policy may shrink the reply when the pool is fragmented).
+pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
+    let need = slab_round_to_class(min_bytes);
+    // Pages we need to safely contain `need` plus the kernel's per-cap
+    // allocator metadata. One extra page covers metadata for sub-page
+    // requests; page-aligned requests need their own pages plus one.
+    let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;
+    if need <= 128 {
+        slab_acquire_pooled(&SLAB_BIN_128, need, want_pages)
+    } else if need <= 512 {
+        slab_acquire_pooled(&SLAB_BIN_512, need, want_pages)
+    } else {
+        slab_acquire_fresh(need, want_pages)
+    }
 }
 
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-

@@ -14,11 +14,12 @@ const CHAIN_DEPTH: usize = 8;
 const PASSES: usize = 50;
 const RIGHTS_SIGNAL: u64 = 1 << 7;
 
-pub fn run(_ctx: &TestContext) -> TestResult
+pub fn run(ctx: &TestContext) -> TestResult
 {
     for _pass in 0..PASSES
     {
-        let root = cap_create_signal().map_err(|_| "cap_tree_deep: create_signal failed")?;
+        let root = cap_create_signal(ctx.memory_frame_base)
+            .map_err(|_| "cap_tree_deep: create_signal failed")?;
 
         // Build chain: root → level[0] → level[1] → ... → level[7]
         let mut chain = [0u32; CHAIN_DEPTH];

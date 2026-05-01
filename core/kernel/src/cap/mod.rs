@@ -183,6 +183,150 @@ pub fn alloc_cspace_id() -> CSpaceId
 /// Maximum slots in the root `CSpace` (full two-level directory).
 const ROOT_CSPACE_MAX_SLOTS: usize = 16384;
 
+// ── Phase-7 seed Frame cap ───────────────────────────────────────────────────
+
+/// Bytes carved off the front of the largest drained RAM block to host
+/// every initial cap-identity body.
+///
+/// Today's footprint on `x86_64` is ~15 KB (≈ 110 bin-128 slots: 91 other
+/// RAM `FrameObject`s + 10 `MmioRegion` wrappers + 1 `Interrupt` + 1
+/// `IoPortRange` + 1 `SchedControl` + 2 ACPI Frames + 6 module Frames +
+/// 3 init-segment Frames + 1 seed-tail Frame, plus the seed's own
+/// `RetypeAllocator` metadata). `SEED_RESERVE_BYTES` is sized at 256 KB
+/// — generous headroom so future cap types and longer module lists land
+/// without revisiting the constant.
+///
+/// The remainder of the largest block is exposed to userspace as a
+/// regular retype-backed RAM Frame cap (the "seed-tail"), so init and
+/// memmgr operate on virgin caps with zero behavioural change in their
+/// front-split allocators.
+#[cfg(not(test))]
+const SEED_RESERVE_BYTES: u64 = 256 * 1024;
+
+/// BSS-static `FrameObject` covering the seed RAM region.
+///
+/// Phase 7 mints every initial cap identity (`FrameObject` for every
+/// drained RAM block, `MmioRegion` / `Interrupt` / `IoPortRange` /
+/// `SchedControl` / `SbiControl` wrappers, plus firmware-table and
+/// boot-module `FrameObject`s, plus init's ELF-segment `FrameObject`s,
+/// plus the seed-tail `FrameObject` exposing the rest of the largest
+/// drained block) from this seed via [`crate::cap::retype::boot_retype_body`].
+/// The bodies land inside the seed's `SEED_RESERVE_BYTES` reservation,
+/// debited from `available_bytes` like every other byte.
+///
+/// The seed itself is **not** inserted into init's `CSpace`: it is pure
+/// kernel-internal storage. Userspace sees the largest drained block's
+/// RAM via the seed-tail cap, which is virgin (`bump_offset = 0`) and
+/// behaves like every other RAM Frame cap.
+///
+/// Pinned with a `+1` refcount in [`install_seed_frame`] so dealloc never
+/// fires against this static. The static's initial `ref_count = 1`
+/// represents that pin; every retyped descendant body adds another
+/// reference; reclaim of every descendant drops back to `1`, which is
+/// non-zero — `dec_ref` returns `1`, `dealloc_object` is never invoked,
+/// and the BSS storage stays valid for the lifetime of the kernel.
+///
+/// Single-threaded boot context permits `static mut`; `addr_of(_mut)!`
+/// access patterns sidestep the `static_mut_refs` lint.
+#[cfg(not(test))]
+static mut SEED_FRAME: object::FrameObject = object::FrameObject {
+    header: object::KernelObjectHeader {
+        ref_count: AtomicU32::new(1),
+        obj_type: object::ObjectType::Frame,
+        _pad: [0; 3],
+        ancestor: AtomicPtr::new(core::ptr::null_mut()),
+    },
+    base: 0,
+    size: 0,
+    available_bytes: core::sync::atomic::AtomicU64::new(0),
+    owns_memory: core::sync::atomic::AtomicBool::new(true),
+    allocator: AtomicPtr::new(core::ptr::null_mut()),
+    lock: AtomicU32::new(0),
+};
+
+/// Borrow the seed `FrameObject` shared.
+///
+/// `base`/`size` are mutated only during [`install_seed_frame`] (single-
+/// threaded Phase 7); after that, retype/dealloc paths see them as stable.
+#[cfg(not(test))]
+fn seed_frame_ref() -> &'static object::FrameObject
+{
+    let p = core::ptr::addr_of!(SEED_FRAME);
+    // SAFETY: `SEED_FRAME` is a non-null BSS static; `addr_of!` produces a
+    // valid pointer for shared access.
+    unsafe { &*p }
+}
+
+/// `NonNull` over the seed `FrameObject`'s header for use as a
+/// `KernelObjectHeader::with_ancestor` argument and as the seed slot's
+/// `object` pointer.
+#[cfg(not(test))]
+pub(crate) fn seed_header_nn() -> NonNull<object::KernelObjectHeader>
+{
+    // SAFETY: `SEED_FRAME` is a non-null BSS static; `addr_of_mut!` produces
+    // a valid pointer.
+    let p = unsafe { core::ptr::addr_of_mut!(SEED_FRAME.header) };
+    // SAFETY: `p` is non-null; the lifetime of the underlying storage is
+    // the kernel image lifetime (the seed is pinned).
+    unsafe { NonNull::new_unchecked(p) }
+}
+
+/// Test-build placeholder. The test path leaks every kernel object via
+/// `Box::leak` and never invokes `dealloc_object` (which is
+/// `cfg(not(test))`), so the ancestor pointer is written into bodies but
+/// never dereferenced; a dangling `NonNull` satisfies the type without
+/// allocating.
+#[cfg(test)]
+pub(crate) fn seed_header_nn() -> NonNull<object::KernelObjectHeader>
+{
+    NonNull::dangling()
+}
+
+/// One-shot Phase-7 seed initializer. Sets the seed `FrameObject`'s runtime
+/// fields (covering the front [`SEED_RESERVE_BYTES`] of the largest
+/// drained block) and bumps the refcount once for the kernel pin. Caller
+/// must invoke before any [`crate::cap::retype::boot_retype_body`] against
+/// the seed.
+///
+/// # Safety
+///
+/// Call exactly once during Phase 7, single-threaded.
+#[cfg(not(test))]
+unsafe fn install_seed_frame(base: u64)
+{
+    let p = core::ptr::addr_of_mut!(SEED_FRAME);
+    // SAFETY: single-threaded boot; the seed is not published anywhere
+    // until after this call, so no other reader exists.
+    unsafe {
+        (*p).base = base;
+        (*p).size = SEED_RESERVE_BYTES;
+        (*p).available_bytes
+            .store(SEED_RESERVE_BYTES, Ordering::Release);
+        (*p).header.inc_ref();
+    }
+}
+
+/// Phase-7 mint helper: in production, retype `body` in place inside the
+/// seed Frame cap and bump the seed's refcount; in tests, leak `body` via
+/// `Box`. Returns a `NonNull<KernelObjectHeader>` suitable for
+/// [`insert_or_fatal`].
+///
+/// `T` MUST be `#[repr(C)]` with [`object::KernelObjectHeader`] as its
+/// first field; callers stamp `header.ancestor` via
+/// [`object::KernelObjectHeader::with_ancestor`] using [`seed_header_nn`]
+/// so the dealloc cascade can reclaim the body's storage to the seed.
+pub(crate) fn mint_phase7_body<T>(body: T) -> NonNull<object::KernelObjectHeader>
+{
+    #[cfg(not(test))]
+    {
+        crate::cap::retype::boot_retype_body(seed_frame_ref(), body)
+    }
+    #[cfg(test)]
+    {
+        nonnull_from_box(Box::new(body))
+    }
+}
+
 // ── Phase 7 entry point ───────────────────────────────────────────────────────
 
 // ── CSpace layout ────────────────────────────────────────────────────────────
@@ -338,7 +482,12 @@ fn populate_cspace(
     // Frame caps are allocated FROM the buddy allocator so the same
     // physical pages are not double-booked between the kernel's internal
     // frame pool and userspace capabilities.
+    // Initialised to 0 so the test build (which uses an `if count == 0`
+    // guard inside its mmap loop to capture the first slot) compiles; the
+    // production build overwrites both before any read.
+    #[allow(unused_assignments)]
     let mut memory_frame_base: u32 = 0;
+    #[allow(unused_assignments)]
     let mut memory_frame_count: u32 = 0;
 
     #[cfg(not(test))]
@@ -359,24 +508,67 @@ fn populate_cspace(
             alloc.drain_for_usercaps(KERNEL_RESERVE_PAGES, &mut drain_buf)
         });
 
-        let mut drained_pages: usize = 0;
-        for &(addr, order) in &drain_buf[..block_count]
+        // Pick the largest drained block to host the seed reservation:
+        // its first `SEED_RESERVE_BYTES` (256 KB) become kernel-internal
+        // storage for every initial cap-identity body; the remainder is
+        // exposed to userspace as a virgin "seed-tail" RAM Frame cap. The
+        // seed itself is never inserted into init's CSpace.
+        let (seed_idx, _) = drain_buf[..block_count]
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &(_, order))| order)
+            .unwrap_or_else(|| {
+                crate::fatal("Phase 7: no drained RAM blocks to seed Frame caps");
+            });
+        let (seed_block_base, seed_block_order) = drain_buf[seed_idx];
+        let seed_block_size = (BUDDY_PAGE_SIZE << seed_block_order) as u64;
+        if seed_block_size <= SEED_RESERVE_BYTES
         {
-            let size = (BUDDY_PAGE_SIZE << order) as u64;
-            drained_pages += 1 << order;
+            crate::fatal("Phase 7: largest drained RAM block too small to host SEED_RESERVE_BYTES");
+        }
 
-            let obj = Box::new(FrameObject {
-                header: KernelObjectHeader::new(ObjectType::Frame),
-                base: addr,
-                size,
-                // Full retypable budget: this is RAM, drained from the buddy.
-                available_bytes: core::sync::atomic::AtomicU64::new(size),
-                // Buddy-backed: responsible for freeing on final destruction.
+        // SAFETY: first and only call; single-threaded Phase 7.
+        unsafe { install_seed_frame(seed_block_base) };
+
+        let seed_anc = seed_header_nn();
+        let mut drained_pages: usize = 0;
+
+        // Mint a Frame cap for every drained RAM block. The cap covering the
+        // seed block exposes only the post-reserve tail (virgin RAM); every
+        // other block exposes its full size. Bodies for ALL of these mints
+        // live inside the seed reservation.
+        for (i, &(addr, order)) in drain_buf[..block_count].iter().enumerate()
+        {
+            let block_size = (BUDDY_PAGE_SIZE << order) as u64;
+            drained_pages += 1usize << order;
+
+            let (cap_base, cap_size) = if i == seed_idx
+            {
+                (
+                    seed_block_base + SEED_RESERVE_BYTES,
+                    seed_block_size - SEED_RESERVE_BYTES,
+                )
+            }
+            else
+            {
+                (addr, block_size)
+            };
+
+            let ptr = mint_phase7_body(FrameObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_anc),
+                base: cap_base,
+                size: cap_size,
+                // Full retypable budget: this cap covers virgin RAM. The
+                // seed's ledger only debits for the FrameObject body bytes.
+                available_bytes: core::sync::atomic::AtomicU64::new(cap_size),
+                // Buddy-backed: responsible for freeing its (disjoint) range
+                // on final destruction. The seed's own SEED_RESERVE_BYTES
+                // prefix is owned by the pinned SEED_FRAME and never returns
+                // to the buddy.
                 owns_memory: core::sync::atomic::AtomicBool::new(true),
                 allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 lock: core::sync::atomic::AtomicU32::new(0),
             });
-            let ptr = nonnull_from_box(obj);
             let slot = insert_or_fatal(
                 cspace,
                 CapTag::Frame,
@@ -392,17 +584,19 @@ fn populate_cspace(
                 slot,
                 cap_type: CapType::Frame,
                 pad: [0; 3],
-                aux0: addr,
-                aux1: size,
+                aux0: cap_base,
+                aux1: cap_size,
             });
             memory_frame_count += 1;
         }
 
         crate::kprintln!(
-            "Phase 7: {} Frame caps ({} pages drained, {} blocks), kernel reserve {} pages",
+            "Phase 7: {} Frame caps ({} pages drained, {} blocks, seed reserve {} KiB), \
+             kernel reserve {} pages",
             memory_frame_count,
             drained_pages,
             block_count,
+            SEED_RESERVE_BYTES / 1024,
             KERNEL_RESERVE_PAGES,
         );
     }
@@ -466,14 +660,13 @@ fn populate_cspace(
     {
         let uart_base = crate::arch::current::platform::uart_base();
         let uart_size = crate::arch::current::platform::uart_size();
-        let obj = Box::new(MmioRegionObject {
-            header: KernelObjectHeader::new(ObjectType::MmioRegion),
+        let ptr = mint_phase7_body(MmioRegionObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
             base: uart_base,
             size: uart_size,
             flags: 0,
             _pad: 0,
         });
-        let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
             CapTag::MmioRegion,
@@ -497,14 +690,13 @@ fn populate_cspace(
 
     for ap in mmio_apertures
     {
-        let obj = Box::new(MmioRegionObject {
-            header: KernelObjectHeader::new(ObjectType::MmioRegion),
+        let ptr = mint_phase7_body(MmioRegionObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
             base: ap.phys_base,
             size: ap.size,
             flags: 0,
             _pad: 0,
         });
-        let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
             CapTag::MmioRegion,
@@ -527,10 +719,9 @@ fn populate_cspace(
     }
 
     // One SchedControl capability — grants elevated scheduling authority.
-    let obj = Box::new(SchedControlObject {
-        header: KernelObjectHeader::new(ObjectType::SchedControl),
+    let ptr = mint_phase7_body(SchedControlObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::SchedControl, seed_header_nn()),
     });
-    let ptr = nonnull_from_box(obj);
     let sched_control_slot = insert_or_fatal(
         cspace,
         CapTag::SchedControl,
@@ -554,12 +745,11 @@ fn populate_cspace(
     // targeted systems. RISC-V: 1024 PLIC sources is the spec maximum;
     // most platforms expose far fewer (e.g. 128). Sizing the root at the
     // spec max is safe because `plic_enable` rejects out-of-range ids.
-    let irq_obj = Box::new(InterruptObject {
-        header: KernelObjectHeader::new(ObjectType::Interrupt),
+    let irq_ptr = mint_phase7_body(InterruptObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Interrupt, seed_header_nn()),
         start: 0,
         count: ROOT_IRQ_COUNT,
     });
-    let irq_ptr = nonnull_from_box(irq_obj);
     let irq_range_slot = insert_or_fatal(
         cspace,
         CapTag::Interrupt,
@@ -600,8 +790,8 @@ fn populate_cspace(
         {
             continue;
         }
-        let obj = Box::new(FrameObject {
-            header: KernelObjectHeader::new(ObjectType::Frame),
+        let ptr = mint_phase7_body(FrameObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
             base: entry.physical_base,
             size,
             // Firmware table: not retypable; cap minted without RETYPE.
@@ -611,7 +801,6 @@ fn populate_cspace(
             allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
-        let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
             CapTag::Frame,
@@ -643,8 +832,8 @@ fn populate_cspace(
     let acpi_rsdp_frame_slot: u32 = if info.acpi_rsdp != 0
     {
         let page_base = info.acpi_rsdp & !0xFFF;
-        let obj = Box::new(FrameObject {
-            header: KernelObjectHeader::new(ObjectType::Frame),
+        let ptr = mint_phase7_body(FrameObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
             base: page_base,
             size: 0x1000,
             // Firmware table: not retypable; cap minted without RETYPE.
@@ -653,7 +842,6 @@ fn populate_cspace(
             allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
-        let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
             CapTag::Frame,
@@ -684,8 +872,8 @@ fn populate_cspace(
         if dtb_size != 0
         {
             let rounded = (dtb_size + 0xFFF) & !0xFFF;
-            let obj = Box::new(FrameObject {
-                header: KernelObjectHeader::new(ObjectType::Frame),
+            let ptr = mint_phase7_body(FrameObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
                 base: info.device_tree & !0xFFF,
                 size: rounded,
                 // Firmware table: not retypable; cap minted without RETYPE.
@@ -694,7 +882,6 @@ fn populate_cspace(
                 allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 lock: core::sync::atomic::AtomicU32::new(0),
             });
-            let ptr = nonnull_from_box(obj);
             let slot = insert_or_fatal(
                 cspace,
                 CapTag::Frame,
@@ -726,13 +913,12 @@ fn populate_cspace(
     // field. Init subdivides and delegates sub-ranges to services as needed.
     #[cfg(target_arch = "x86_64")]
     {
-        let obj = Box::new(IoPortRangeObject {
-            header: KernelObjectHeader::new(ObjectType::IoPortRange),
+        let ptr = mint_phase7_body(IoPortRangeObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::IoPortRange, seed_header_nn()),
             base: 0,
             size: 0, // 0 means 0x10000 (full range; u16 cannot hold 65536)
             _pad: 0,
         });
-        let ptr = nonnull_from_box(obj);
         let ioport_root_slot = insert_or_fatal(
             cspace,
             CapTag::IoPortRange,
@@ -752,10 +938,9 @@ fn populate_cspace(
     // RISC-V: one SbiControl capability — grants authority to forward SBI calls.
     #[cfg(target_arch = "riscv64")]
     let sbi_control_slot = {
-        let obj = Box::new(SbiControlObject {
-            header: KernelObjectHeader::new(ObjectType::SbiControl),
+        let ptr = mint_phase7_body(SbiControlObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::SbiControl, seed_header_nn()),
         });
-        let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
             CapTag::SbiControl,
@@ -860,8 +1045,8 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
         // Round size up to page boundary so mem_map can map whole pages.
         let rounded_size = (module.size + 0xFFF) & !0xFFF;
 
-        let obj = Box::new(FrameObject {
-            header: KernelObjectHeader::new(ObjectType::Frame),
+        let ptr = mint_phase7_body(FrameObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
             base: module.physical_base,
             size: rounded_size,
             // Boot module: not retypable; cap minted without RETYPE.
@@ -872,7 +1057,6 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
-        let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
             CapTag::Frame,
@@ -901,11 +1085,16 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
 
 /// Cast `Box<T>` to `NonNull<KernelObjectHeader>` by leaking the box.
 ///
+/// Used only by the test build's `mint_phase7_body` arm and by the test
+/// build's RAM-Frame mint loop; the production path mints exclusively
+/// through `cap::retype::boot_retype_body`.
+///
 /// # Safety contract
 ///
 /// `T` must be `#[repr(C)]` with `KernelObjectHeader` as its first field
 /// (offset 0). Dropping the returned pointer requires reconstructing the
 /// original `Box<T>` based on `header.obj_type` (future phases).
+#[cfg(test)]
 fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
 {
     let raw = Box::into_raw(b).cast::<KernelObjectHeader>();

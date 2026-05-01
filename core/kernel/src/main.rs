@@ -354,8 +354,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     SegmentFlags::ReadWrite => Rights::MAP | Rights::WRITE,
                     SegmentFlags::ReadExecute => Rights::MAP | Rights::EXECUTE,
                 };
-                let fo = Box::new(FrameObject {
-                    header: KernelObjectHeader::new(ObjectType::Frame),
+                let fo_nn = cap::mint_phase7_body(FrameObject {
+                    header: KernelObjectHeader::with_ancestor(
+                        ObjectType::Frame,
+                        cap::seed_header_nn(),
+                    ),
                     base: seg.phys_addr,
                     size: seg.size,
                     // Init ELF segment: not retypable; cap minted without RETYPE.
@@ -366,10 +369,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
-                // SAFETY: Box::into_raw returns non-null pointer; cast preserves validity.
-                let fo_nn = unsafe {
-                    NonNull::new_unchecked(Box::into_raw(fo).cast::<KernelObjectHeader>())
-                };
                 let slot = cs
                     .insert_cap(CapTag::Frame, rights, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Frame cap"));

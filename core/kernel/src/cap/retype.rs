@@ -46,9 +46,10 @@
 //! reading `available` without the lock get a snapshot, which is exactly
 //! what they want for budget queries).
 
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::cap::object::{FrameObject, ObjectType};
+use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType};
 use crate::mm::PAGE_SIZE;
 use syscall::SyscallError;
 
@@ -665,6 +666,44 @@ pub fn retype_free(frame: &FrameObject, offset: u64, bytes: u64)
 
     frame.available_bytes.fetch_add(need, Ordering::Release);
     alloc.unlock();
+}
+
+/// Phase-7 boot-time mint: allocate `size_of::<T>()` bytes from `seed`,
+/// write `body` in place, bump the seed's refcount once for the descendant's
+/// retype lease, and return a `NonNull<KernelObjectHeader>` to the body.
+///
+/// `body` must already carry an ancestor pointer matching `seed.header` set
+/// via [`KernelObjectHeader::with_ancestor`]; the helper does not synthesise
+/// it because the caller chooses the per-type fields and is the natural
+/// owner of the construction expression.
+///
+/// `T` must be `#[repr(C)]` with [`KernelObjectHeader`] as its first field at
+/// offset 0 — the standard layout shared by every concrete object type — so
+/// the returned pointer can be cast back to `*mut T` by the dealloc path via
+/// `header.obj_type` dispatch.
+///
+/// Used by `cap::populate_cspace` and `mint_module_frame_caps` (Phase 7) and
+/// by `core/kernel/src/main.rs` (Phase 9, init segment Frame caps).
+///
+/// Calls [`crate::fatal`] on `OutOfMemory` — Phase 7 boot-time mints cannot
+/// recover from a too-small seed.
+#[cfg(not(test))]
+pub fn boot_retype_body<T>(seed: &FrameObject, body: T) -> NonNull<KernelObjectHeader>
+{
+    let bytes = core::mem::size_of::<T>() as u64;
+    let Ok(offset) = retype_allocate(seed, bytes)
+    else
+    {
+        crate::fatal("Phase 7: seed Frame too small for boot mint");
+    };
+    let virt = crate::mm::paging::phys_to_virt(seed.base + offset) as *mut T;
+    // SAFETY: `virt` is in the kernel direct map, freshly carved out by
+    // `retype_allocate`, and not aliased.
+    unsafe { core::ptr::write(virt, body) };
+    seed.header.inc_ref();
+    // SAFETY: T is repr(C) with KernelObjectHeader at offset 0; the cast
+    // preserves the pointer validity established by the write above.
+    unsafe { NonNull::new_unchecked(virt.cast::<KernelObjectHeader>()) }
 }
 
 /// Per-`ObjectType` retype dispatch entry.

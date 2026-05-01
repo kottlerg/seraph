@@ -1011,17 +1011,74 @@ unsafe fn dealloc_object_one(
                     crate::mm::with_frame_allocator(|alloc| alloc.free_range(base, size));
                 }
             }
-            // SAFETY: ptr originally from Box<FrameObject>::into_raw; header at offset 0.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<FrameObject>())) };
+
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+            if ancestor_ptr.is_null()
+            {
+                // Legacy heap path (e.g. sys_frame_split tail children).
+                // SAFETY: ptr originally from Box<FrameObject>::into_raw; header at offset 0.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<FrameObject>())) };
+            }
+            else
+            {
+                // Retype-backed body lives inside the ancestor (the seed
+                // Frame). Drop in place, return the body bytes to the
+                // seed's per-Frame allocator, drop the retype-time lease.
+                use crate::cap::retype::retype_free;
+                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let offset = body_phys - ancestor_frame.base;
+                // SAFETY: ptr is the in-place FrameObject; refcount 0 — unique access.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<FrameObject>()) };
+                retype_free(
+                    ancestor_frame,
+                    offset,
+                    core::mem::size_of::<FrameObject>() as u64,
+                );
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: ancestor_ptr non-null per the outer branch.
+                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
         ObjectType::MmioRegion =>
         {
-            // SAFETY: ptr originally from Box<MmioRegionObject>::into_raw; header at offset 0.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<MmioRegionObject>())) };
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+            if ancestor_ptr.is_null()
+            {
+                // SAFETY: ptr originally from Box<MmioRegionObject>::into_raw; header at offset 0.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<MmioRegionObject>())) };
+            }
+            else
+            {
+                use crate::cap::retype::retype_free;
+                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let offset = body_phys - ancestor_frame.base;
+                // SAFETY: in-place body; refcount 0 — unique access.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<MmioRegionObject>()) };
+                retype_free(
+                    ancestor_frame,
+                    offset,
+                    core::mem::size_of::<MmioRegionObject>() as u64,
+                );
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: ancestor_ptr non-null per the outer branch.
+                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
         ObjectType::Interrupt =>
         {
-            // SAFETY: ptr originally from Box<InterruptObject>::into_raw; header at offset 0.
+            // SAFETY: ptr points to a live InterruptObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<InterruptObject>()) };
             let start = obj.start;
             let count = obj.count;
@@ -1042,23 +1099,127 @@ unsafe fn dealloc_object_one(
                 crate::arch::current::interrupts::mask(start);
             }
 
-            // SAFETY: ptr originally from Box<InterruptObject>::into_raw.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<InterruptObject>())) };
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+            if ancestor_ptr.is_null()
+            {
+                // SAFETY: ptr originally from Box<InterruptObject>::into_raw.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<InterruptObject>())) };
+            }
+            else
+            {
+                use crate::cap::retype::retype_free;
+                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let offset = body_phys - ancestor_frame.base;
+                // SAFETY: in-place body; refcount 0 — unique access.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<InterruptObject>()) };
+                retype_free(
+                    ancestor_frame,
+                    offset,
+                    core::mem::size_of::<InterruptObject>() as u64,
+                );
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: ancestor_ptr non-null per the outer branch.
+                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
         ObjectType::IoPortRange =>
         {
-            // SAFETY: ptr originally from Box<IoPortRangeObject>::into_raw; header at offset 0.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<IoPortRangeObject>())) };
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+            if ancestor_ptr.is_null()
+            {
+                // SAFETY: ptr originally from Box<IoPortRangeObject>::into_raw; header at offset 0.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<IoPortRangeObject>())) };
+            }
+            else
+            {
+                use crate::cap::retype::retype_free;
+                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let offset = body_phys - ancestor_frame.base;
+                // SAFETY: in-place body; refcount 0 — unique access.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<IoPortRangeObject>()) };
+                retype_free(
+                    ancestor_frame,
+                    offset,
+                    core::mem::size_of::<IoPortRangeObject>() as u64,
+                );
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: ancestor_ptr non-null per the outer branch.
+                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
         ObjectType::SchedControl =>
         {
-            // SAFETY: ptr originally from Box<SchedControlObject>::into_raw; header at offset 0.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SchedControlObject>())) };
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+            if ancestor_ptr.is_null()
+            {
+                // SAFETY: ptr originally from Box<SchedControlObject>::into_raw; header at offset 0.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SchedControlObject>())) };
+            }
+            else
+            {
+                use crate::cap::retype::retype_free;
+                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let offset = body_phys - ancestor_frame.base;
+                // SAFETY: in-place body; refcount 0 — unique access.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SchedControlObject>()) };
+                retype_free(
+                    ancestor_frame,
+                    offset,
+                    core::mem::size_of::<SchedControlObject>() as u64,
+                );
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: ancestor_ptr non-null per the outer branch.
+                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
         ObjectType::SbiControl =>
         {
-            // SAFETY: ptr originally from Box<SbiControlObject>::into_raw; header at offset 0.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SbiControlObject>())) };
+            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+            if ancestor_ptr.is_null()
+            {
+                // SAFETY: ptr originally from Box<SbiControlObject>::into_raw; header at offset 0.
+                unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<SbiControlObject>())) };
+            }
+            else
+            {
+                use crate::cap::retype::retype_free;
+                // SAFETY: ancestor_ptr non-null; kept alive by retype-time refcount.
+                let ancestor_frame = unsafe { &*ancestor_ptr.cast::<FrameObject>() };
+                let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+                let offset = body_phys - ancestor_frame.base;
+                // SAFETY: in-place body; refcount 0 — unique access.
+                unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SbiControlObject>()) };
+                retype_free(
+                    ancestor_frame,
+                    offset,
+                    core::mem::size_of::<SbiControlObject>() as u64,
+                );
+                let new_rc = ancestor_frame.header.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: ancestor_ptr non-null per the outer branch.
+                    let ancestor_nn = unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+                    push_ancestor(worklist, head, ancestor_nn);
+                }
+            }
         }
 
         // ── Thread ────────────────────────────────────────────────────────

@@ -10,13 +10,14 @@
 //! Post-typed-memory, the only ambient heap users are init's bootstrap state
 //! (root `CSpace`, `AddressSpace`/`Thread`/`CSpace` wrapper structs constructed
 //! by `sys_cap_create_*` while the kernel-half of those caps still has heap-
-//! backed identity), Phase-7 boot-time cap minting, and the per-`FrameObject`
-//! `RetypeAllocator` metadata. No userspace-pressure-driven allocation reaches
-//! this allocator: every cap-create syscall debits its source Frame cap's
-//! `available_bytes` ledger, every PT/slot page comes from a retype pool, and
-//! every kernel-object body lives inside its ancestor Frame cap's region.
-//! Kernel-heap occupancy is therefore bounded by the kernel image and the
-//! init-bootstrap working set; it does not scale with userspace activity.
+//! backed identity) and Phase-7 boot-time cap minting. No userspace-pressure-
+//! driven allocation reaches this allocator: every cap-create syscall debits
+//! its source Frame cap's `available_bytes` ledger, every PT/slot page comes
+//! from a retype pool, every kernel-object body lives inside its ancestor
+//! Frame cap's region, and the per-`FrameObject` `RetypeAllocator` metadata
+//! lives at offset 0 of the cap's own backing region. Kernel-heap occupancy
+//! is therefore bounded by the kernel image and the init-bootstrap working
+//! set; it does not scale with userspace activity.
 //!
 //! # `KernelHeap`
 //!

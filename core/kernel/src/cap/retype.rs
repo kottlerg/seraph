@@ -32,10 +32,11 @@
 //!   `>= requested pages`; on a larger fit, the block is split and the
 //!   remainder kept on the list. No coalesce on free.
 //!
-//! The allocator state itself is heap-backed; its byte cost is debited from
-//! `available_bytes` on creation so the ledger remains honest. The metadata
-//! storage will move inside the cap region itself in a follow-up that seals
-//! the kernel heap.
+//! The allocator state itself lives **inside the cap's own backing region**
+//! at offset 0. Its byte cost is debited from `available_bytes` like every
+//! other byte the cap consumes, so the ledger remains honest. The bump
+//! pointer starts past the metadata footprint; no separate kernel-heap
+//! allocation is involved.
 //!
 //! ## Concurrency
 //!
@@ -44,12 +45,6 @@
 //! mutations use atomic `fetch_*` and don't require the lock (callers
 //! reading `available` without the lock get a snapshot, which is exactly
 //! what they want for budget queries).
-
-#[cfg(not(test))]
-extern crate alloc;
-
-#[cfg(not(test))]
-use alloc::boxed::Box;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,8 +66,10 @@ const FREE_LIST_END: u64 = u64::MAX;
 
 /// Per-Frame-cap retype allocator.
 ///
-/// Lazy-initialised on first retype. Manages bump-allocation plus per-class
-/// free lists. Offset 0 is a valid allocation site.
+/// Lazy-initialised on first retype, with the storage living **inside the
+/// cap's own backing region** at offset 0. Manages bump-allocation plus
+/// per-class free lists. The first allocatable offset is past the metadata
+/// footprint (see [`metadata_bytes`]).
 #[repr(C)]
 pub struct RetypeAllocator
 {
@@ -80,6 +77,8 @@ pub struct RetypeAllocator
     /// `0` = unlocked, `1` = locked. Acquired with CAS.
     lock: AtomicU64,
     /// Next free byte (high water mark) within the Frame cap region.
+    /// Initialised to [`metadata_bytes`] so the metadata at offset 0 is
+    /// reserved.
     bump_offset: AtomicU64,
     /// Sub-page free-list heads, one per size class. `FREE_LIST_END` = empty.
     /// At each non-empty offset, the first 8 bytes of the freed slot hold
@@ -93,14 +92,13 @@ pub struct RetypeAllocator
 
 impl RetypeAllocator
 {
-    /// Construct a fresh allocator with empty free lists and `bump_offset` = 0.
-    ///
-    /// Heap-allocated by [`ensure_allocator`] on first retype against a cap.
-    pub const fn new() -> Self
+    /// Construct a fresh allocator with empty free lists and a `bump_offset`
+    /// reserving the metadata footprint at offset 0.
+    pub const fn new_inline() -> Self
     {
         Self {
             lock: AtomicU64::new(0),
-            bump_offset: AtomicU64::new(0),
+            bump_offset: AtomicU64::new(metadata_bytes()),
             subpage_free_lists: [AtomicU64::new(FREE_LIST_END), AtomicU64::new(FREE_LIST_END)],
             page_free_head: AtomicU64::new(FREE_LIST_END),
         }
@@ -123,12 +121,24 @@ impl RetypeAllocator
     }
 }
 
-impl Default for RetypeAllocator
+/// Bytes the [`RetypeAllocator`] occupies at offset 0 of a cap region.
+///
+/// Debited from `available_bytes` on first retype against a cap. The bump
+/// pointer is initialised past this value so allocations never overlap.
+pub const fn metadata_bytes() -> u64
 {
-    fn default() -> Self
-    {
-        Self::new()
-    }
+    core::mem::size_of::<RetypeAllocator>() as u64
+}
+
+/// Sentinel encoding "first-time install in progress" in
+/// [`FrameObject::allocator`]. Distinct from null (uninitialised) and from
+/// any real direct-map address (those live in the kernel-half VA range,
+/// well above any small integer). Used by [`ensure_allocator`] to serialise
+/// concurrent first retypes against a cap. The pointer is never
+/// dereferenced; the value matters only for atomic comparison.
+fn init_in_progress_sentinel() -> *mut RetypeAllocator
+{
+    core::ptr::without_provenance_mut(1)
 }
 
 /// Round `bytes` up to the smallest size class that fits.
@@ -214,64 +224,87 @@ unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
     unsafe { core::ptr::write_volatile(virt as *mut u64, value) };
 }
 
-/// Lazy-init: ensure `frame.allocator` points at a heap-allocated
-/// `RetypeAllocator`. Returns the (possibly newly-installed) allocator.
+/// Lazy-init: ensure `frame.allocator` points at an in-place
+/// `RetypeAllocator` at offset 0 of the cap's backing region. Returns the
+/// (possibly newly-installed) allocator pointer in the kernel direct map.
 ///
-/// Multiple concurrent callers race; only the winner's allocation is kept.
-/// Callable only when the kernel heap is live (post-Phase 4).
+/// Concurrent callers race. The winner of an initial null → sentinel CAS
+/// performs the install (debit + in-place construction + final pointer
+/// publish); losers spin on the pointer until they observe a real address.
 ///
 /// # Safety
 ///
-/// `frame` must be a valid `FrameObject` reference. The function uses
-/// `AtomicPtr::compare_exchange` to install the allocator atomically.
+/// `frame` must be a valid `FrameObject` reference. The caller MUST hold
+/// either `frame.read_lock()` or `frame.write_lock()` so that
+/// `sys_frame_split` cannot mutate `frame.size` during this call.
 #[cfg(not(test))]
 fn ensure_allocator(frame: &FrameObject) -> *mut RetypeAllocator
 {
     let cur = frame.allocator.load(Ordering::Acquire);
-    if !cur.is_null()
+    if !cur.is_null() && cur != init_in_progress_sentinel()
     {
         return cur;
     }
 
-    // Install a fresh allocator. Debit its byte cost from available_bytes
-    // so the ledger reflects total kernel memory consumed against this cap.
-    let new = Box::into_raw(Box::new(RetypeAllocator::new()));
-    let alloc_size = core::mem::size_of::<RetypeAllocator>() as u64;
+    // Race for the first install. Winner gets to write the metadata.
+    let won_race = cur.is_null()
+        && frame
+            .allocator
+            .compare_exchange(
+                core::ptr::null_mut(),
+                init_in_progress_sentinel(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
 
-    // Reserve bytes for the metadata. If the cap is too small, refuse —
-    // caller sees ensure failure as an OutOfMemory on the first retype.
-    let prev_avail = frame
-        .available_bytes
-        .fetch_sub(alloc_size, Ordering::AcqRel);
-    if prev_avail < alloc_size
+    if won_race
     {
-        // Roll back: restore available, drop the allocator we just made.
-        frame
-            .available_bytes
-            .fetch_add(alloc_size, Ordering::Release);
-        // SAFETY: new came from Box::into_raw above; nothing else holds it.
-        unsafe { drop(Box::from_raw(new)) };
-        return core::ptr::null_mut();
+        let need = metadata_bytes();
+
+        // The cap region must hold the metadata block.
+        if frame.size < need
+        {
+            frame
+                .allocator
+                .store(core::ptr::null_mut(), Ordering::Release);
+            return core::ptr::null_mut();
+        }
+        let prev_avail = frame.available_bytes.fetch_sub(need, Ordering::AcqRel);
+        if prev_avail < need
+        {
+            frame.available_bytes.fetch_add(need, Ordering::Release);
+            frame
+                .allocator
+                .store(core::ptr::null_mut(), Ordering::Release);
+            return core::ptr::null_mut();
+        }
+
+        let virt = crate::mm::paging::phys_to_virt(frame.base) as *mut RetypeAllocator;
+        // SAFETY: virt is in the kernel direct map; we hold the cap rwlock
+        // (via the caller) so the cap is live and `frame.size` cannot
+        // shrink under us. We won the CAS so no other thread can write to
+        // the metadata region until we publish the pointer.
+        unsafe { core::ptr::write(virt, RetypeAllocator::new_inline()) };
+        frame.allocator.store(virt, Ordering::Release);
+        return virt;
     }
 
-    match frame.allocator.compare_exchange(
-        core::ptr::null_mut(),
-        new,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    )
+    // Lost the race or arrived during another caller's install. Spin until
+    // the install completes (or fails back to null).
+    loop
     {
-        Ok(_) => new,
-        Err(other) =>
+        let p = frame.allocator.load(Ordering::Acquire);
+        if p.is_null()
         {
-            // Lost the race. Refund the bytes we reserved.
-            frame
-                .available_bytes
-                .fetch_add(alloc_size, Ordering::Release);
-            // SAFETY: new came from Box::into_raw; not yet observable.
-            unsafe { drop(Box::from_raw(new)) };
-            other
+            // Install raced and failed (cap too small / debit refused).
+            return core::ptr::null_mut();
         }
+        if p != init_in_progress_sentinel()
+        {
+            return p;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -320,9 +353,10 @@ unsafe fn push_subpage(alloc: &RetypeAllocator, frame: &FrameObject, bin: usize,
 
 /// Predecessor pointer for the page-aligned free-list walk.
 ///
-/// The list head lives in the (heap-backed) `RetypeAllocator`; mid-list
-/// next-pointers live inline at `frame.base + offset + 8`. The two storage
-/// shapes need different update paths, captured here.
+/// The list head lives in the `RetypeAllocator` (which itself sits at
+/// offset 0 of the cap region); mid-list next-pointers live inline at
+/// `frame.base + offset + 8`. The two storage shapes need different
+/// update paths, captured here.
 enum PagePrev
 {
     /// Predecessor is the allocator's `page_free_head` field.
@@ -577,12 +611,16 @@ pub fn retype_allocate(frame: &FrameObject, bytes: u64) -> Result<u64, SyscallEr
 pub fn current_bump(frame: &FrameObject) -> u64
 {
     let p = frame.allocator.load(Ordering::Acquire);
-    if p.is_null()
+    if p.is_null() || p == init_in_progress_sentinel()
     {
+        // No allocator yet, or one is mid-install (the metadata reservation
+        // hasn't been committed). Either way the cap presents as untouched
+        // for split-offset purposes.
         return 0;
     }
     // SAFETY: caller holds the cap rwlock; the allocator was installed by
-    // ensure_allocator and lives until the cap's refcount drops to zero.
+    // ensure_allocator into the cap region and lives until the cap's
+    // refcount drops to zero.
     unsafe { (*p).bump_offset.load(Ordering::Acquire) }
 }
 

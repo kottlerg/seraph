@@ -794,11 +794,11 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
     // outer cap remains.
     //
     // We do *not* assert `available_bytes == size` here: the per-cap
-    // `RetypeAllocator` metadata cost (~64 B per cap, debited on first
-    // retype) stays charged for as long as the FrameObject lives, which
-    // is until memmgr's outer cap is also released — i.e. forever for
-    // pool caps. A correct cross-check would compare against the
-    // available value snapshotted at grant time, which is more state
+    // `RetypeAllocator` metadata at offset 0 of the cap region (debited
+    // on first retype) stays charged for as long as the FrameObject
+    // lives, which is until memmgr's outer cap is also released — i.e.
+    // forever for pool caps. A correct cross-check would compare against
+    // the available value snapshotted at grant time, which is more state
     // than memmgr's record currently carries; the ktest
     // `integration::retype_reclaim` covers the same invariant on a
     // dedicated source cap with no allocator residual.

@@ -206,10 +206,16 @@ pub struct FrameObject
     pub owns_memory: AtomicBool,
     /// Lazy-initialised per-Frame-cap retype allocator. Null until the first
     /// retype operation against this cap; `cap::retype::ensure_allocator`
-    /// installs a heap-backed allocator on first call. Its byte cost is
-    /// debited from `available_bytes` so the ledger remains honest;
-    /// the metadata storage will move inside the cap region itself in a
-    /// follow-up that seals the kernel heap.
+    /// installs an in-place allocator at offset 0 of the cap's own backing
+    /// region on first call. The metadata's byte cost is debited from
+    /// `available_bytes` like every other byte the cap consumes, so the
+    /// ledger remains honest. Storage is reclaimed when the buddy frees
+    /// the cap pages on `dealloc_object` (no separate teardown).
+    ///
+    /// Holds `1usize as *mut _` (the `INIT_IN_PROGRESS` sentinel from
+    /// `cap::retype`) transiently while the install is racing; observers
+    /// (`current_bump`, `ensure_allocator`'s spin path) treat it as
+    /// "no allocator yet."
     pub allocator: AtomicPtr<crate::cap::retype::RetypeAllocator>,
     /// Per-cap reader/writer lock guarding mutations of `size` (and the
     /// implicit `[base, base+size)` region they describe).
@@ -983,25 +989,18 @@ unsafe fn dealloc_object_one(
             // was atomically transferred to the children).
             // SAFETY: ptr points to a live FrameObject; single-owner access
             // since refcount reached zero at the call site.
-            let (base, size, owned, alloc_ptr) = unsafe {
+            let (base, size, owned) = unsafe {
                 let obj = &*ptr.as_ptr().cast::<FrameObject>();
                 (
                     obj.base,
                     obj.size,
                     obj.owns_memory.load(core::sync::atomic::Ordering::Acquire),
-                    obj.allocator.load(core::sync::atomic::Ordering::Acquire),
                 )
             };
-            // Reclaim the lazily-installed retype allocator metadata. The
-            // cap region itself is about to be returned to the buddy; the
-            // heap-backed `RetypeAllocator` would otherwise leak.
-            if !alloc_ptr.is_null()
-            {
-                // SAFETY: alloc_ptr was installed by `cap::retype::ensure_allocator`
-                // via `Box::into_raw`; refcount has reached zero so no other
-                // path can observe or use it.
-                unsafe { drop(Box::from_raw(alloc_ptr)) };
-            }
+            // The lazily-installed retype-allocator metadata lives at offset
+            // 0 of the cap's own backing region; freeing the buddy pages
+            // below reclaims it wholesale. `RetypeAllocator` has no Drop
+            // implementation, so no in-place teardown is required.
             if owned
             {
                 // SAFETY: buddy free-range frees the pages we originally

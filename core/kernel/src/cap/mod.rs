@@ -30,6 +30,7 @@
 
 extern crate alloc;
 
+#[cfg(test)]
 use alloc::boxed::Box;
 
 pub mod cspace;
@@ -64,27 +65,36 @@ use crate::mm::paging::phys_to_virt;
 
 /// Root capability space, populated during Phase 7.
 ///
-/// Consumed (transferred to init) during Phase 9. Access is single-threaded
-/// during boot; `static mut` is safe here under that invariant.
+/// The pointer indexes into a SEED-derived retype slab whose storage is
+/// pinned for the lifetime of the kernel (the seed's pin keeps the chunk
+/// alive — see [`install_seed_frame`]). Set in [`init_capability_system`]
+/// via [`boot_retype_cspace`]; consumed (read out into init's TCB) during
+/// Phase 9. Access is single-threaded during boot; `static mut` is safe
+/// here under that invariant.
 #[cfg(not(test))]
-pub static mut ROOT_CSPACE: Option<Box<CSpace>> = None;
+pub static mut ROOT_CSPACE: *mut CSpace = core::ptr::null_mut();
 
-/// Take the root `CSpace` out of `ROOT_CSPACE`, leaving `None`.
+/// Take the root `CSpace` pointer, clearing the slot to null.
+///
+/// Returns the raw pointer (storage lives inside a SEED slab; ownership is
+/// "use by-pointer until init dies"). The slot is cleared so no other code
+/// can observe a live root cspace pointer afterwards.
 ///
 /// Uses raw pointer operations to avoid creating a mutable reference to a
-/// mutable static (which is undefined behaviour in concurrent contexts and
-/// warned by `static_mut_refs`). Safe here because access is single-threaded
-/// during boot.
+/// mutable static. Safe because access is single-threaded during boot.
 ///
 /// # Safety
 /// Must be called only in single-threaded boot context before init runs.
 #[cfg(not(test))]
-pub unsafe fn take_root_cspace() -> Option<Box<CSpace>>
+pub unsafe fn take_root_cspace() -> *mut CSpace
 {
+    let ptr_loc = core::ptr::addr_of_mut!(ROOT_CSPACE);
     // SAFETY: single-threaded boot; no concurrent access.
-    let ptr = core::ptr::addr_of_mut!(ROOT_CSPACE);
-    // SAFETY: ptr is a valid writable pointer to ROOT_CSPACE; single-threaded boot.
-    unsafe { core::ptr::replace(ptr, None) }
+    unsafe {
+        let prev = *ptr_loc;
+        *ptr_loc = core::ptr::null_mut();
+        prev
+    }
 }
 
 /// Borrow the root `CSpace` mutably.
@@ -97,9 +107,19 @@ pub unsafe fn take_root_cspace() -> Option<Box<CSpace>>
 #[cfg(not(test))]
 pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 {
-    let ptr = core::ptr::addr_of_mut!(ROOT_CSPACE);
+    let ptr_loc = core::ptr::addr_of_mut!(ROOT_CSPACE);
     // SAFETY: single-threaded boot; no concurrent access.
-    unsafe { (*ptr).as_mut().map(Box::as_mut) }
+    let raw = unsafe { *ptr_loc };
+    if raw.is_null()
+    {
+        None
+    }
+    else
+    {
+        // SAFETY: raw was set by `boot_retype_cspace` and points at a live
+        // `CSpace` inside a SEED-pinned slab; single-threaded boot.
+        unsafe { Some(&mut *raw) }
+    }
 }
 
 /// Monotonically increasing `CSpace` ID allocator. Root gets ID 0.
@@ -183,25 +203,37 @@ pub fn alloc_cspace_id() -> CSpaceId
 /// Maximum slots in the root `CSpace` (full two-level directory).
 const ROOT_CSPACE_MAX_SLOTS: usize = 16384;
 
+/// Pages carved from `SEED_FRAME` for the root `CSpace` slab: page 0 is the
+/// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining
+/// pages seed the slot-page pool. `populate_cspace` plus
+/// [`mint_module_frame_caps`] mint ~150 caps into the root, occupying ~3
+/// slot pages (64 slots each); 16 pool pages = 1 KiB-cap headroom.
+#[cfg(not(test))]
+const ROOT_CSPACE_INIT_PAGES: u64 = 17;
+
 // ── Phase-7 seed Frame cap ───────────────────────────────────────────────────
 
 /// Bytes carved off the front of the largest drained RAM block to host
 /// every initial cap-identity body.
 ///
-/// Today's footprint on `x86_64` is ~15 KB (≈ 110 bin-128 slots: 91 other
+/// Today's footprint on `x86_64` is ~150 KB:
+/// ~15 KB for sub-page cap-identity bodies (≈ 110 bin-128 slots: 91 other
 /// RAM `FrameObject`s + 10 `MmioRegion` wrappers + 1 `Interrupt` + 1
 /// `IoPortRange` + 1 `SchedControl` + 2 ACPI Frames + 6 module Frames +
 /// 3 init-segment Frames + 1 seed-tail Frame, plus the seed's own
-/// `RetypeAllocator` metadata). `SEED_RESERVE_BYTES` is sized at 256 KB
-/// — generous headroom so future cap types and longer module lists land
-/// without revisiting the constant.
+/// `RetypeAllocator` metadata), plus ~130 KB for init's bootstrap state
+/// (one [`AddressSpaceObject`] slab — wrapper page + root PT + PT growth
+/// pool, one [`CSpaceKernelObject`] slab — wrapper page + slot-page pool,
+/// one [`ThreadObject`] slab — kernel stack + wrapper/TCB).
+/// `SEED_RESERVE_BYTES` is sized at 512 KB — generous headroom so future
+/// cap types and longer module lists land without revisiting the constant.
 ///
 /// The remainder of the largest block is exposed to userspace as a
 /// regular retype-backed RAM Frame cap (the "seed-tail"), so init and
 /// memmgr operate on virgin caps with zero behavioural change in their
 /// front-split allocators.
 #[cfg(not(test))]
-const SEED_RESERVE_BYTES: u64 = 256 * 1024;
+const SEED_RESERVE_BYTES: u64 = 512 * 1024;
 
 /// BSS-static `FrameObject` covering the seed RAM region.
 ///
@@ -249,7 +281,7 @@ static mut SEED_FRAME: object::FrameObject = object::FrameObject {
 /// `base`/`size` are mutated only during [`install_seed_frame`] (single-
 /// threaded Phase 7); after that, retype/dealloc paths see them as stable.
 #[cfg(not(test))]
-fn seed_frame_ref() -> &'static object::FrameObject
+pub(crate) fn seed_frame_ref() -> &'static object::FrameObject
 {
     let p = core::ptr::addr_of!(SEED_FRAME);
     // SAFETY: `SEED_FRAME` is a non-null BSS static; `addr_of!` produces a
@@ -304,6 +336,288 @@ unsafe fn install_seed_frame(base: u64)
             .store(SEED_RESERVE_BYTES, Ordering::Release);
         (*p).header.inc_ref();
     }
+}
+
+/// Drain results: per-RAM-block (physical base, size in bytes). The seed
+/// block contributes only its post-reserve tail; every other block its
+/// full size. `populate_cspace` mints one Frame cap per entry.
+///
+/// Production path populates this from the buddy drain via
+/// [`drain_and_install_seed`]; the test path passes an empty slice and
+/// `populate_cspace`'s test-only branch mints from `mmap` directly.
+pub(crate) type RamBlock = (u64, u64);
+
+/// Maximum number of buddy blocks `drain_and_install_seed` collects. Each
+/// order can have at most `POOL_SIZE` entries; in practice far fewer.
+#[cfg(not(test))]
+pub(crate) const MAX_DRAIN_BLOCKS: usize = 4096;
+
+/// Drain user-cap RAM from the buddy and install [`SEED_FRAME`] over the
+/// largest drained block, reserving its first [`SEED_RESERVE_BYTES`] for
+/// kernel-internal cap-identity storage. Returns the per-block
+/// (base, size) records ready for `populate_cspace` to mint Frame caps.
+///
+/// MUST run before any [`mint_phase7_body`] / [`boot_retype_aspace`] /
+/// [`boot_retype_cspace`] / `boot_retype_thread_slab` call against the
+/// seed.
+///
+/// # Safety
+/// Single-threaded Phase 7. Buddy active.
+#[cfg(not(test))]
+pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
+{
+    use crate::mm::buddy::PAGE_SIZE as BUDDY_PAGE_SIZE;
+
+    /// Pages kept in the buddy for kernel-internal use (page tables, AP
+    /// kernel stacks, kernel heap residue). 16 MiB = 4096 pages.
+    const KERNEL_RESERVE_PAGES: usize = 4096;
+
+    debug_assert!(out.len() >= MAX_DRAIN_BLOCKS);
+
+    let mut order_buf = alloc::vec![(0u64, 0usize); MAX_DRAIN_BLOCKS];
+    let block_count = crate::mm::with_frame_allocator(|alloc| {
+        alloc.drain_for_usercaps(KERNEL_RESERVE_PAGES, &mut order_buf)
+    });
+
+    if block_count == 0
+    {
+        crate::fatal("Phase 7: no drained RAM blocks to seed Frame caps");
+    }
+
+    // Largest block hosts the seed; anything else is exposed verbatim.
+    let (seed_idx, _) = order_buf[..block_count]
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &(_, order))| order)
+        .unwrap_or_else(|| crate::fatal("Phase 7: drain returned only zero-order blocks"));
+    let (seed_block_base, seed_block_order) = order_buf[seed_idx];
+    let seed_block_size = (BUDDY_PAGE_SIZE << seed_block_order) as u64;
+    if seed_block_size <= SEED_RESERVE_BYTES
+    {
+        crate::fatal("Phase 7: largest drained RAM block too small to host SEED_RESERVE_BYTES");
+    }
+
+    // SAFETY: first and only call; single-threaded Phase 7.
+    unsafe { install_seed_frame(seed_block_base) };
+
+    let mut drained_pages: usize = 0;
+    for (i, &(addr, order)) in order_buf[..block_count].iter().enumerate()
+    {
+        let block_size = (BUDDY_PAGE_SIZE << order) as u64;
+        drained_pages += 1usize << order;
+        out[i] = if i == seed_idx
+        {
+            // Seed-tail: front SEED_RESERVE_BYTES go to the SEED's pool
+            // (kernel-internal); the remainder is exposed as a virgin RAM
+            // Frame cap.
+            (
+                seed_block_base + SEED_RESERVE_BYTES,
+                seed_block_size - SEED_RESERVE_BYTES,
+            )
+        }
+        else
+        {
+            (addr, block_size)
+        };
+    }
+
+    crate::kprintln!(
+        "Phase 7: drained {} pages across {} blocks; seed reserve {} KiB",
+        drained_pages,
+        block_count,
+        SEED_RESERVE_BYTES / 1024,
+    );
+
+    block_count
+}
+
+/// Boot-time helper: retype an `init_pages`-page slab from `seed` and
+/// in-place construct a new `AddressSpace` and `AddressSpaceObject` in
+/// page 0, with the root PT in page 1 and the remainder seeding the PT
+/// growth pool. Returns `(wrapper_header, address_space)` — the wrapper
+/// header is suitable for [`insert_or_fatal`] / direct cap insertion;
+/// the AS pointer is what TCBs store as `tcb.address_space`.
+///
+/// Mirrors `sys_cap_create_aspace` create-mode but skips the syscall
+/// boilerplate (no caller validation, no augment-mode); used by Phase 9
+/// for init's bootstrap AS.
+///
+/// `init_pages` MUST be `>= 2`. Calls [`crate::fatal`] on retype-allocator
+/// or chunk-slot exhaustion (boot cannot recover).
+#[cfg(not(test))]
+#[allow(clippy::missing_safety_doc)]
+pub(crate) unsafe fn boot_retype_aspace(
+    seed: &object::FrameObject,
+    init_pages: u64,
+) -> (
+    NonNull<object::KernelObjectHeader>,
+    *mut crate::mm::address_space::AddressSpace,
+)
+{
+    use crate::cap::object::{
+        AddressSpaceObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
+    };
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::address_space::AddressSpace;
+    use crate::mm::paging::phys_to_virt;
+    use core::sync::atomic::AtomicU64;
+
+    debug_assert!(init_pages >= 2);
+
+    let bytes = init_pages * PAGE_SIZE as u64;
+    let Ok(offset) = retype::retype_allocate(seed, bytes)
+    else
+    {
+        crate::fatal("boot_retype_aspace: seed Frame too small");
+    };
+    let frame_base = seed.base;
+    let wrapper_phys = frame_base + offset;
+    let root_pt_phys = wrapper_phys + PAGE_SIZE as u64;
+    let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
+
+    // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
+    // struct's alignment is at most 8.
+    #[allow(clippy::cast_ptr_alignment)]
+    let aso_ptr = wrapper_virt.cast::<AddressSpaceObject>();
+    let as_offset = core::mem::size_of::<AddressSpaceObject>();
+    debug_assert_eq!(as_offset % core::mem::align_of::<AddressSpace>(), 0);
+    debug_assert!(as_offset + core::mem::size_of::<AddressSpace>() <= PAGE_SIZE);
+    // cast_ptr_alignment: as_offset is a multiple of align_of::<AddressSpace>()
+    // (asserted above) and wrapper_virt is page-aligned.
+    // similar_names: aso_ptr / aspace_ptr both name pointers in the same
+    // wrapper page; the disambiguating prefixes (`aso` vs `aspace`) are
+    // intentional to mirror the wrapper-vs-body roles.
+    #[allow(clippy::cast_ptr_alignment, clippy::similar_names)]
+    // SAFETY: wrapper_virt page-aligned; as_offset stays inside page 0.
+    let aspace_ptr = unsafe { wrapper_virt.add(as_offset) }.cast::<AddressSpace>();
+
+    // SAFETY: root_pt_phys is freshly retyped, exclusively owned, page-aligned.
+    let aspace = unsafe { AddressSpace::new_user_with_root(root_pt_phys) };
+    // SAFETY: aspace_ptr lives in the wrapper page, exclusively owned.
+    unsafe { core::ptr::write(aspace_ptr, aspace) };
+
+    // SAFETY: aso_ptr is page-aligned and exclusively owned.
+    unsafe {
+        core::ptr::write(
+            aso_ptr,
+            AddressSpaceObject {
+                header: KernelObjectHeader::with_ancestor(
+                    ObjectType::AddressSpace,
+                    seed_header_nn(),
+                ),
+                address_space: aspace_ptr,
+                pt_growth_budget_bytes: AtomicU64::new(0),
+                pt_pool_lock: AtomicU64::new(0),
+                pt_pool_head_phys: AtomicU64::new(0),
+                pt_chunks: vacant_chunk_slots(),
+            },
+        );
+    }
+
+    seed.header.inc_ref();
+
+    let pool_pages = init_pages - 2;
+    // SAFETY: aso_ptr just constructed; offset/init_pages from a successful retype.
+    let res = unsafe {
+        (*aso_ptr).add_chunk(seed_header_nn(), frame_base, offset, init_pages, pool_pages)
+    };
+    if res.is_err()
+    {
+        crate::fatal("boot_retype_aspace: chunk slot exhausted");
+    }
+
+    // SAFETY: aso_ptr is in-place; header at offset 0.
+    let nonnull = unsafe { NonNull::new_unchecked(aso_ptr.cast::<KernelObjectHeader>()) };
+    (nonnull, aspace_ptr)
+}
+
+/// Boot-time helper: retype an `init_pages`-page slab from `seed` and
+/// in-place construct a new `CSpace` and `CSpaceKernelObject` in page 0,
+/// with pages `1..init_pages` seeding the slot-page pool. Returns
+/// `(wrapper_header, cspace)`.
+///
+/// Mirrors `sys_cap_create_cspace` create-mode; used by
+/// [`init_capability_system`] for the root `CSpace`.
+///
+/// `init_pages` MUST be `>= 1`. Calls [`crate::fatal`] on retype-allocator
+/// or chunk-slot exhaustion.
+#[cfg(not(test))]
+#[allow(clippy::missing_safety_doc)]
+pub(crate) unsafe fn boot_retype_cspace(
+    seed: &object::FrameObject,
+    init_pages: u64,
+    max_slots: usize,
+    id: CSpaceId,
+) -> (NonNull<object::KernelObjectHeader>, *mut cspace::CSpace)
+{
+    use crate::cap::cspace::CSpace;
+    use crate::cap::object::{
+        CSpaceKernelObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
+    };
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
+    use core::sync::atomic::AtomicU64;
+
+    debug_assert!(init_pages >= 1);
+
+    let bytes = init_pages * PAGE_SIZE as u64;
+    let Ok(offset) = retype::retype_allocate(seed, bytes)
+    else
+    {
+        crate::fatal("boot_retype_cspace: seed Frame too small");
+    };
+    let frame_base = seed.base;
+    let wrapper_phys = frame_base + offset;
+    let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
+
+    // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
+    // struct's alignment is at most 8.
+    #[allow(clippy::cast_ptr_alignment)]
+    let cs_kobj_ptr = wrapper_virt.cast::<CSpaceKernelObject>();
+    let cs_offset = core::mem::size_of::<CSpaceKernelObject>();
+    debug_assert_eq!(cs_offset % core::mem::align_of::<CSpace>(), 0);
+    debug_assert!(cs_offset + core::mem::size_of::<CSpace>() <= PAGE_SIZE);
+    // cast_ptr_alignment: cs_offset is a multiple of align_of::<CSpace>()
+    // (asserted above) and wrapper_virt is page-aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    // SAFETY: wrapper_virt page-aligned; cs_offset stays inside page 0.
+    let cs_ptr = unsafe { wrapper_virt.add(cs_offset) }.cast::<CSpace>();
+
+    // SAFETY: cs_ptr lives in the wrapper page, exclusively owned.
+    unsafe { core::ptr::write(cs_ptr, CSpace::new(id, max_slots)) };
+
+    // SAFETY: cs_kobj_ptr is page-aligned and exclusively owned.
+    unsafe {
+        core::ptr::write(
+            cs_kobj_ptr,
+            CSpaceKernelObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, seed_header_nn()),
+                cspace: cs_ptr,
+                cspace_growth_budget_bytes: AtomicU64::new(0),
+                cs_pool_lock: AtomicU64::new(0),
+                cs_pool_head_phys: AtomicU64::new(0),
+                cs_chunks: vacant_chunk_slots(),
+            },
+        );
+    }
+
+    // SAFETY: cs_ptr just constructed.
+    unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
+    seed.header.inc_ref();
+
+    let pool_pages = init_pages - 1;
+    // SAFETY: wrapper just constructed; offset/init_pages from a successful retype.
+    let res = unsafe {
+        (*cs_kobj_ptr).add_chunk(seed_header_nn(), frame_base, offset, init_pages, pool_pages)
+    };
+    if res.is_err()
+    {
+        crate::fatal("boot_retype_cspace: chunk slot exhausted");
+    }
+
+    // SAFETY: cs_kobj_ptr is in-place; header at offset 0.
+    let nonnull = unsafe { NonNull::new_unchecked(cs_kobj_ptr.cast::<KernelObjectHeader>()) };
+    (nonnull, cs_ptr)
 }
 
 /// Phase-7 mint helper: in production, retype `body` in place inside the
@@ -390,9 +704,6 @@ pub struct CSpaceLayout
 pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u64)
 -> CSpaceLayout
 {
-    let id = NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
-    let mut cspace = Box::new(CSpace::new(id, ROOT_CSPACE_MAX_SLOTS));
-
     // Re-derive BootInfo via the direct physical map to access the memory map.
     // SAFETY: boot_info_phys was validated in Phase 0; direct map active since Phase 3.
     let info: &BootInfo = unsafe { &*(phys_to_virt(boot_info_phys) as *const BootInfo) };
@@ -413,28 +724,63 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         }
     };
 
-    let mut layout = populate_cspace(&mut cspace, mmap, mmio_apertures, info);
-
-    // Mint Frame caps for boot modules (raw ELF images for early services).
-    // Each module gets a read-only Frame cap so init can map and parse the ELF.
-    mint_module_frame_caps(&mut cspace, info, &mut layout);
-
-    // Store in ROOT_CSPACE (kernel runtime only; test builds skip this).
+    // ── Production path ───────────────────────────────────────────────────
+    // 1. Drain the buddy + install SEED_FRAME (largest block hosts the seed
+    //    reserve; remainder exposed as the seed-tail cap).
+    // 2. Boot-retype the root CSpace from SEED into a typed-memory slab.
+    // 3. populate_cspace fills the root with Frame caps (from the drained
+    //    blocks) plus all hardware-resource caps.
+    // 4. mint_module_frame_caps appends boot-module Frame caps.
+    // 5. Stash the root CSpace pointer; Phase 9 hands it to init.
     #[cfg(not(test))]
-    // SAFETY: single-threaded boot; ROOT_CSPACE not yet accessed; no concurrent access.
-    unsafe {
-        // SAFETY: addr_of_mut valid on boxed heap allocation.
-        let raw = core::ptr::addr_of_mut!(*cspace);
-        register_cspace(id, raw);
-        ROOT_CSPACE = Some(cspace);
-    }
-    // In test mode the box is dropped here — kernel objects are leaked
-    // intentionally via Box::into_raw in nonnull_from_box, which is
-    // acceptable for isolated unit tests.
-    #[cfg(test)]
-    let _ = cspace;
+    {
+        let mut ram_blocks: alloc::vec::Vec<RamBlock> = alloc::vec![(0u64, 0u64); MAX_DRAIN_BLOCKS];
+        // SAFETY: first call; single-threaded Phase 7.
+        let block_count = unsafe { drain_and_install_seed(&mut ram_blocks) };
+        ram_blocks.truncate(block_count);
 
-    layout
+        let id = NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: SEED installed above.
+        let (_cs_kobj_nn, cs_ptr) = unsafe {
+            boot_retype_cspace(
+                seed_frame_ref(),
+                ROOT_CSPACE_INIT_PAGES,
+                ROOT_CSPACE_MAX_SLOTS,
+                id,
+            )
+        };
+        register_cspace(id, cs_ptr);
+
+        // SAFETY: cs_ptr is freshly constructed and exclusively owned
+        // (single-threaded Phase 7).
+        let cspace = unsafe { &mut *cs_ptr };
+        let mut layout = populate_cspace(cspace, &ram_blocks, mmap, mmio_apertures, info);
+        mint_module_frame_caps(cspace, info, &mut layout);
+
+        // SAFETY: single-threaded boot; ROOT_CSPACE not yet observed.
+        unsafe { ROOT_CSPACE = cs_ptr };
+
+        layout
+    }
+
+    // ── Test path ─────────────────────────────────────────────────────────
+    // Tests don't exercise the SEED / boot-retype machinery (no buddy, no
+    // direct map, no FrameObject lifecycle in the test stub). They allocate
+    // a heap-backed CSpace and let `populate_cspace`'s test-only RAM-mint
+    // branch iterate `mmap` directly — `ram_blocks` is empty.
+    #[cfg(test)]
+    {
+        let id = NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut cspace = Box::new(CSpace::new(id, ROOT_CSPACE_MAX_SLOTS));
+        let empty: [RamBlock; 0] = [];
+        let mut layout = populate_cspace(&mut cspace, &empty, mmap, mmio_apertures, info);
+        mint_module_frame_caps(&mut cspace, info, &mut layout);
+        // Tests intentionally leak the box; isolated unit-test invariants
+        // (every kernel object Boxed via `nonnull_from_box`) make explicit
+        // teardown unnecessary.
+        let _ = cspace;
+        layout
+    }
 }
 
 /// Core `CSpace` population logic, separated for testability.
@@ -449,6 +795,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
 #[allow(clippy::too_many_lines)]
 fn populate_cspace(
     cspace: &mut CSpace,
+    ram_blocks: &[RamBlock],
     mmap: &[MemoryMapEntry],
     mmio_apertures: &[MmioAperture],
     info: &BootInfo,
@@ -492,68 +839,15 @@ fn populate_cspace(
 
     #[cfg(not(test))]
     {
-        use crate::mm::buddy::PAGE_SIZE as BUDDY_PAGE_SIZE;
-
-        // Pages kept in the buddy for kernel-internal use (page tables,
-        // heap slabs, kernel stacks). 16 MiB = 4096 pages.
-        const KERNEL_RESERVE_PAGES: usize = 4096;
-
-        // Maximum number of buddy blocks that drain_for_usercaps can return.
-        // Each order can have at most POOL_SIZE entries; in practice far fewer.
-        const MAX_DRAIN_BLOCKS: usize = 4096;
-
-        let mut drain_buf = alloc::vec![(0u64, 0usize); MAX_DRAIN_BLOCKS];
-
-        let block_count = crate::mm::with_frame_allocator(|alloc| {
-            alloc.drain_for_usercaps(KERNEL_RESERVE_PAGES, &mut drain_buf)
-        });
-
-        // Pick the largest drained block to host the seed reservation:
-        // its first `SEED_RESERVE_BYTES` (256 KB) become kernel-internal
-        // storage for every initial cap-identity body; the remainder is
-        // exposed to userspace as a virgin "seed-tail" RAM Frame cap. The
-        // seed itself is never inserted into init's CSpace.
-        let (seed_idx, _) = drain_buf[..block_count]
-            .iter()
-            .enumerate()
-            .max_by_key(|&(_, &(_, order))| order)
-            .unwrap_or_else(|| {
-                crate::fatal("Phase 7: no drained RAM blocks to seed Frame caps");
-            });
-        let (seed_block_base, seed_block_order) = drain_buf[seed_idx];
-        let seed_block_size = (BUDDY_PAGE_SIZE << seed_block_order) as u64;
-        if seed_block_size <= SEED_RESERVE_BYTES
-        {
-            crate::fatal("Phase 7: largest drained RAM block too small to host SEED_RESERVE_BYTES");
-        }
-
-        // SAFETY: first and only call; single-threaded Phase 7.
-        unsafe { install_seed_frame(seed_block_base) };
-
         let seed_anc = seed_header_nn();
-        let mut drained_pages: usize = 0;
 
-        // Mint a Frame cap for every drained RAM block. The cap covering the
-        // seed block exposes only the post-reserve tail (virgin RAM); every
-        // other block exposes its full size. Bodies for ALL of these mints
-        // live inside the seed reservation.
-        for (i, &(addr, order)) in drain_buf[..block_count].iter().enumerate()
+        // Mint one Frame cap per drained RAM block. `ram_blocks` is the
+        // already-resolved (base, size) list from `drain_and_install_seed`:
+        // the seed block contributes only its post-reserve tail; every
+        // other block contributes its full size. SEED itself is never
+        // inserted into the CSpace — it's pure kernel-internal storage.
+        for &(cap_base, cap_size) in ram_blocks
         {
-            let block_size = (BUDDY_PAGE_SIZE << order) as u64;
-            drained_pages += 1usize << order;
-
-            let (cap_base, cap_size) = if i == seed_idx
-            {
-                (
-                    seed_block_base + SEED_RESERVE_BYTES,
-                    seed_block_size - SEED_RESERVE_BYTES,
-                )
-            }
-            else
-            {
-                (addr, block_size)
-            };
-
             let ptr = mint_phase7_body(FrameObject {
                 header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_anc),
                 base: cap_base,
@@ -591,15 +885,13 @@ fn populate_cspace(
         }
 
         crate::kprintln!(
-            "Phase 7: {} Frame caps ({} pages drained, {} blocks, seed reserve {} KiB), \
-             kernel reserve {} pages",
+            "Phase 7: {} Frame caps minted from {} drained RAM blocks",
             memory_frame_count,
-            drained_pages,
-            block_count,
-            SEED_RESERVE_BYTES / 1024,
-            KERNEL_RESERVE_PAGES,
+            ram_blocks.len(),
         );
     }
+    #[cfg(test)]
+    let _ = ram_blocks;
 
     // Test builds: create Frame caps directly from mmap entries (no buddy).
     #[cfg(test)]

@@ -183,8 +183,9 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     // Choose the PT-page source. Retype-backed AS (any chunk slot occupied)
-    // pulls intermediate PT pages from its own growth pool; the legacy
-    // heap-backed bootstrap AS falls back to the kernel buddy.
+    // pulls intermediate PT pages from its own growth pool; the heap-backed
+    // bootstrap AS (or any other AS without a recorded chunk) falls back
+    // to the kernel buddy via `map_page`.
     // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
     let pooled = !unsafe {
         (*aso_raw).pt_chunks[0]
@@ -211,7 +212,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
         else
         {
-            // SAFETY: legacy heap-backed AS; map_page acquires pt_lock and
+            // SAFETY: heap-backed AS; map_page acquires pt_lock and
             // FRAME_ALLOC_LOCK internally.
             unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
         };

@@ -578,9 +578,10 @@ pub fn vacant_chunk_slots() -> [PoolChunkSlot; MAX_PT_CHUNKS]
 
 impl AddressSpaceObject
 {
-    /// Construct a heap-backed wrapper with empty pool (legacy path used for
-    /// init's bootstrap AS). Retype-backed wrappers are constructed by
-    /// `sys_cap_create_aspace`.
+    /// Test-only heap-backed wrapper with empty pool. Retype-backed wrappers
+    /// are constructed in place by `sys_cap_create_aspace` and (for init's
+    /// bootstrap AS) by `cap::boot_retype_aspace`.
+    #[cfg(test)]
     #[must_use]
     pub fn heap_backed(address_space: *mut crate::mm::address_space::AddressSpace) -> Self
     {
@@ -711,7 +712,10 @@ impl AddressSpaceObject
 
 impl CSpaceKernelObject
 {
-    /// Construct a heap-backed wrapper with empty pool (legacy path).
+    /// Test-only heap-backed wrapper with empty pool. Retype-backed wrappers
+    /// are constructed in place by `sys_cap_create_cspace` and (for the
+    /// root CSpace) by `cap::boot_retype_cspace`.
+    #[cfg(test)]
     #[must_use]
     pub fn heap_backed(cspace: *mut crate::cap::cspace::CSpace) -> Self
     {
@@ -1488,9 +1492,18 @@ unsafe fn dealloc_object_one(
         }
 
         // ── AddressSpace ──────────────────────────────────────────────────
+        //
+        // All `AddressSpace` objects are retype-backed: init's bootstrap AS
+        // lands in a slab from `SEED_FRAME` (Phase 9), and every userspace
+        // AS lands in a slab from a Frame cap (`sys_cap_create_aspace`).
+        // Both inline `AddressSpace` into the same wrapper page as
+        // `AddressSpaceObject`; both record at least one chunk slot covering
+        // the wrapper, root PT, and PT growth pool. Reclamation walks the
+        // chunk slots and `retype_free`s each one wholesale, then `dec_ref`s
+        // the ancestor `FrameObject`.
         ObjectType::AddressSpace =>
         {
-            // SAFETY: ptr originally from Box<AddressSpaceObject>::into_raw; header at offset 0.
+            // SAFETY: ptr points at an in-place AddressSpaceObject; header at offset 0.
             let obj = unsafe { &*(ptr.as_ptr().cast::<AddressSpaceObject>()) };
             let as_ptr = obj.address_space;
 
@@ -1499,139 +1512,25 @@ unsafe fn dealloc_object_one(
                 // No CPU should still have this address space loaded in
                 // satp/CR3 when we free its root page table.
                 debug_assert!(
-                    // SAFETY: as_ptr validated non-null; active_cpu_mask is an Acquire load.
+                    // SAFETY: as_ptr non-null; active_cpu_mask is an Acquire load.
                     unsafe { (*as_ptr).active_cpu_mask() } == 0,
                     "dealloc AddressSpace: freeing root while active_cpus != 0"
                 );
 
-                // SAFETY: as_ptr validated non-null.
-                let (root_phys, root_virt) = unsafe { ((*as_ptr).root_phys, (*as_ptr).root_virt) };
+                debug_assert!(
+                    !obj.pt_chunks[0].ancestor.load(Ordering::Acquire).is_null(),
+                    "dealloc AddressSpace: heap-backed AS reached typed-memory dealloc path"
+                );
 
-                // Discriminate retype-backed vs heap-backed AS by checking
-                // for any recorded chunk. Retype-backed: the chunks cover
-                // root + every PT page; reclaim wholesale via retype_free.
-                // Heap-backed (init's bootstrap AS): walk the page table
-                // tree and return intermediate pages plus the root to the
-                // buddy.
-                let retype_backed = !obj.pt_chunks[0].ancestor.load(Ordering::Acquire).is_null();
-
-                if retype_backed
-                {
-                    // Snapshot every chunk slot into a stack array before
-                    // freeing — `retype_free` may touch the chunk pages
-                    // (writing free-list links into them), and the chunk
-                    // slot array itself lives on the kernel heap so it's
-                    // safe across the call. After collecting, free each.
-                    let mut snapshot: [(u64, u64, *mut KernelObjectHeader); MAX_PT_CHUNKS] =
-                        [(0, 0, core::ptr::null_mut()); MAX_PT_CHUNKS];
-                    let mut count = 0;
-                    for slot in &obj.pt_chunks
-                    {
-                        let anc = slot.ancestor.load(Ordering::Acquire);
-                        if anc.is_null()
-                        {
-                            continue;
-                        }
-                        let off = slot.base_offset.load(Ordering::Relaxed);
-                        let pages = slot.page_count.load(Ordering::Relaxed);
-                        snapshot[count] = (off, pages, anc);
-                        count += 1;
-                    }
-
-                    let p = crate::mm::PAGE_SIZE as u64;
-                    for &(off, pages, anc_ptr) in &snapshot[..count]
-                    {
-                        // SAFETY: anc_ptr was set at chunk recording from a
-                        // live FrameObject's header; the inc_ref then is
-                        // matched by the dec_ref here.
-                        let anc_hdr = unsafe { &*anc_ptr };
-                        // Cast to FrameObject for retype_free; the
-                        // ancestor is always a Frame (header at offset 0).
-                        // cast_ptr_alignment: header at offset 0; FrameObject is repr(C).
-                        #[allow(clippy::cast_ptr_alignment)]
-                        // SAFETY: anc_ptr was set at chunk recording from a
-                        // live FrameObject's header; refcount kept alive
-                        // until the dec_ref below.
-                        let anc_frame = unsafe { &*anc_ptr.cast::<FrameObject>() };
-                        crate::cap::retype::retype_free(anc_frame, off, pages * p);
-                        let new_rc = anc_hdr.dec_ref();
-                        if new_rc == 0
-                        {
-                            // SAFETY: refcount reached 0; no live cap holds it.
-                            let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
-                            push_ancestor(worklist, head, anc_nn);
-                        }
-                    }
-                    let _ = root_phys;
-                    let _ = root_virt;
-                }
-                else
-                {
-                    // Legacy heap-backed AS: walk the user half of the
-                    // page table and return every intermediate frame to
-                    // the buddy. Then free the root frame itself.
-                    // SAFETY: root_virt is direct-map VA of root frame,
-                    // still mapped until we free it below.
-                    unsafe {
-                        crate::mm::with_frame_allocator(|alloc| {
-                            crate::arch::current::paging::free_user_page_tables(root_virt, alloc);
-                        });
-                    }
-                    // SAFETY: root_phys was allocated order-0 from the buddy.
-                    unsafe {
-                        crate::mm::with_frame_allocator(|alloc| alloc.free(root_phys, 0));
-                    }
-                }
-
-                // SAFETY: as_ptr originally from Box::into_raw.
-                unsafe { drop(Box::from_raw(as_ptr)) };
-            }
-
-            // SAFETY: ptr originally from Box<AddressSpaceObject>::into_raw.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<AddressSpaceObject>())) };
-        }
-
-        // ── CSpaceObj ─────────────────────────────────────────────────────
-        ObjectType::CSpaceObj =>
-        {
-            // SAFETY: ptr originally from Box<CSpaceKernelObject>::into_raw; header at offset 0.
-            let obj = unsafe { &*(ptr.as_ptr().cast::<CSpaceKernelObject>()) };
-            let cs_ptr = obj.cspace;
-
-            if !cs_ptr.is_null()
-            {
-                // SAFETY: cs_ptr validated non-null; allocated at creation.
-                let id = unsafe { (*cs_ptr).id() };
-                crate::cap::unregister_cspace(id);
-
-                // Dec-ref all objects referenced by non-null slots.
-                // SAFETY: cs_ptr validated non-null; for_each_object handles iteration.
-                unsafe {
-                    (*cs_ptr).for_each_object(|obj_ptr| {
-                        let hdr = obj_ptr.as_ref();
-                        let rc = hdr.dec_ref();
-                        if rc == 0
-                        {
-                            dealloc_object(obj_ptr);
-                        }
-                    });
-                }
-
-                // CSpace::Drop reclaims heap-backed pages; for retype-backed
-                // CSpaces it's a no-op so the chunk reclaim below isn't
-                // racing with Box::from_raw on pool memory.
-                // SAFETY: cs_ptr originally from Box::into_raw.
-                unsafe { drop(Box::from_raw(cs_ptr)) };
-            }
-
-            // Reclaim retype chunks (if any) wholesale to their ancestors.
-            let retype_backed = !obj.cs_chunks[0].ancestor.load(Ordering::Acquire).is_null();
-            if retype_backed
-            {
+                // Snapshot every chunk slot into a stack array before
+                // freeing — `retype_free` may touch the chunk pages
+                // (writing free-list links into them), and the wrapper
+                // itself lives in the chunk being reclaimed, so the
+                // snapshot must finish before we free.
                 let mut snapshot: [(u64, u64, *mut KernelObjectHeader); MAX_PT_CHUNKS] =
                     [(0, 0, core::ptr::null_mut()); MAX_PT_CHUNKS];
                 let mut count = 0;
-                for slot in &obj.cs_chunks
+                for slot in &obj.pt_chunks
                 {
                     let anc = slot.ancestor.load(Ordering::Acquire);
                     if anc.is_null()
@@ -1643,28 +1542,136 @@ unsafe fn dealloc_object_one(
                     snapshot[count] = (off, pages, anc);
                     count += 1;
                 }
+
+                // Drop in-place objects before reclaiming their storage.
+                // `AddressSpace` and `AddressSpaceObject` have no Drop logic
+                // today; the explicit calls keep the contract correct if
+                // either grows one.
+                // SAFETY: as_ptr and obj are about to be reclaimed; no
+                // outside reference can outlive the cap deletion that
+                // brought us here.
+                unsafe {
+                    core::ptr::drop_in_place(as_ptr);
+                }
+
                 let p = crate::mm::PAGE_SIZE as u64;
                 for &(off, pages, anc_ptr) in &snapshot[..count]
                 {
-                    // SAFETY: anc_ptr was set at chunk recording.
+                    // SAFETY: anc_ptr was set at chunk recording from a
+                    // live FrameObject's header; the inc_ref then is
+                    // matched by the dec_ref here.
                     let anc_hdr = unsafe { &*anc_ptr };
-                    // cast_ptr_alignment: header at offset 0; FrameObject repr(C).
+                    // Cast to FrameObject for retype_free; the ancestor
+                    // is always a Frame (header at offset 0).
+                    // cast_ptr_alignment: header at offset 0; FrameObject is repr(C).
                     #[allow(clippy::cast_ptr_alignment)]
-                    // SAFETY: ancestor live until dec_ref below.
+                    // SAFETY: anc_ptr was set at chunk recording from a
+                    // live FrameObject's header; refcount kept alive
+                    // until the dec_ref below.
                     let anc_frame = unsafe { &*anc_ptr.cast::<FrameObject>() };
                     crate::cap::retype::retype_free(anc_frame, off, pages * p);
                     let new_rc = anc_hdr.dec_ref();
                     if new_rc == 0
                     {
-                        // SAFETY: refcount reached 0.
+                        // SAFETY: refcount reached 0; no live cap holds it.
                         let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
                         push_ancestor(worklist, head, anc_nn);
                     }
                 }
             }
 
-            // SAFETY: ptr originally from Box<CSpaceKernelObject>::into_raw.
-            unsafe { drop(Box::from_raw(ptr.as_ptr().cast::<CSpaceKernelObject>())) };
+            // No separate `Box::from_raw(obj)` — the wrapper lives inside
+            // the slab reclaimed above.
+        }
+
+        // ── CSpaceObj ─────────────────────────────────────────────────────
+        //
+        // All `CSpaceKernelObject`s are retype-backed: the root CSpace lands
+        // in a slab from `SEED_FRAME` (Phase 7), and every userspace CSpace
+        // lands in a slab from a Frame cap (`sys_cap_create_cspace`). Both
+        // inline `CSpace` directly into the wrapper page; both record at
+        // least one chunk slot covering the wrapper plus the slot-page pool.
+        // Reclamation walks the chunk slots and `retype_free`s each one
+        // wholesale, then `dec_ref`s the ancestor.
+        ObjectType::CSpaceObj =>
+        {
+            // SAFETY: ptr points at an in-place CSpaceKernelObject; header at offset 0.
+            let obj = unsafe { &*(ptr.as_ptr().cast::<CSpaceKernelObject>()) };
+            let cs_ptr = obj.cspace;
+
+            debug_assert!(
+                !obj.cs_chunks[0].ancestor.load(Ordering::Acquire).is_null(),
+                "dealloc CSpaceObj: heap-backed CSpace reached typed-memory dealloc path"
+            );
+
+            if !cs_ptr.is_null()
+            {
+                // SAFETY: cs_ptr non-null; allocated at creation.
+                let id = unsafe { (*cs_ptr).id() };
+                crate::cap::unregister_cspace(id);
+
+                // Dec-ref all objects referenced by non-null slots.
+                // SAFETY: cs_ptr non-null; for_each_object handles iteration.
+                unsafe {
+                    (*cs_ptr).for_each_object(|obj_ptr| {
+                        let hdr = obj_ptr.as_ref();
+                        let rc = hdr.dec_ref();
+                        if rc == 0
+                        {
+                            dealloc_object(obj_ptr);
+                        }
+                    });
+                }
+
+                // Drop the inline CSpace before reclaiming its storage; its
+                // own `Drop` is a no-op for retype-backed (pool pages flow
+                // back through the chunk reclaim below).
+                // SAFETY: cs_ptr is about to be reclaimed; no outside
+                // reference outlives the cap deletion that brought us here.
+                unsafe {
+                    core::ptr::drop_in_place(cs_ptr);
+                }
+            }
+
+            // Snapshot every chunk slot before freeing — `retype_free`
+            // touches the chunk pages (writing free-list links), and the
+            // wrapper itself lives in the chunk being reclaimed.
+            let mut snapshot: [(u64, u64, *mut KernelObjectHeader); MAX_PT_CHUNKS] =
+                [(0, 0, core::ptr::null_mut()); MAX_PT_CHUNKS];
+            let mut count = 0;
+            for slot in &obj.cs_chunks
+            {
+                let anc = slot.ancestor.load(Ordering::Acquire);
+                if anc.is_null()
+                {
+                    continue;
+                }
+                let off = slot.base_offset.load(Ordering::Relaxed);
+                let pages = slot.page_count.load(Ordering::Relaxed);
+                snapshot[count] = (off, pages, anc);
+                count += 1;
+            }
+            let p = crate::mm::PAGE_SIZE as u64;
+            for &(off, pages, anc_ptr) in &snapshot[..count]
+            {
+                // SAFETY: anc_ptr was set at chunk recording.
+                let anc_hdr = unsafe { &*anc_ptr };
+                // cast_ptr_alignment: header at offset 0; FrameObject repr(C).
+                #[allow(clippy::cast_ptr_alignment)]
+                // SAFETY: ancestor live until dec_ref below.
+                let anc_frame = unsafe { &*anc_ptr.cast::<FrameObject>() };
+                crate::cap::retype::retype_free(anc_frame, off, pages * p);
+                let new_rc = anc_hdr.dec_ref();
+                if new_rc == 0
+                {
+                    // SAFETY: refcount reached 0.
+                    let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
+                    push_ancestor(worklist, head, anc_nn);
+                }
+            }
+
+            // No separate `Box::from_raw(obj)` — the wrapper lives inside
+            // the slab reclaimed above.
         }
 
         // ── Endpoint ──────────────────────────────────────────────────────

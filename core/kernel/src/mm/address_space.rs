@@ -254,6 +254,13 @@ impl AddressSpace
     /// from the global frame allocator, and sends TLB shootdown IPIs if this
     /// address space is active on other CPUs.
     ///
+    /// Used by:
+    /// - [`map_segment`](Self::map_segment), [`map_stack`](Self::map_stack),
+    ///   and direct kernel callers (Phase 9 init bootstrap, [`sys_mmio_map`]
+    ///   for legacy MMIO mappings) — PT pages come from the kernel buddy.
+    /// - For userspace `sys_mem_map` against a retype-backed AS, see
+    ///   [`map_page_pooled`](Self::map_page_pooled).
+    ///
     /// # Safety
     /// `virt` must be in the user half (< `0x8000_0000_0000`). `phys` must be
     /// a valid 4 KiB-aligned physical address.
@@ -318,10 +325,10 @@ impl AddressSpace
     }
 
     /// Pooled variant of [`map_page`]: draws intermediate PT frames from
-    /// the supplied `AddressSpaceObject`'s growth pool instead of the
-    /// buddy allocator.
+    /// the supplied [`AddressSpaceObject`](crate::cap::object::AddressSpaceObject)'s
+    /// growth pool instead of the kernel buddy.
     ///
-    /// The `aso` MUST wrap *this* `AddressSpace`. `mem_map` enforces this
+    /// The `aso` MUST wrap *this* `AddressSpace`. `sys_mem_map` enforces this
     /// implicitly because it resolves both via the same capability.
     ///
     /// # Safety
@@ -340,7 +347,7 @@ impl AddressSpace
         crate::percpu::preempt_disable();
         self.pt_lock();
 
-        // SAFETY: caller's contract; aso is the wrapper paired with this AS.
+        // SAFETY: caller's contract; aso pairs with this AS.
         let result = unsafe { map_user_page_pooled(self.root_virt, virt, phys, flags, aso) };
 
         if result.is_err()

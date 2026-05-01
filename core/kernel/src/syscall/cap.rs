@@ -21,9 +21,12 @@
 #![allow(clippy::cast_possible_truncation)]
 
 #[cfg(not(test))]
+// `alloc` and `Box` are needed only by the test stubs (cfg(test) handlers).
+#[cfg(test)]
 extern crate alloc;
 
 #[cfg(not(test))]
+#[cfg(test)]
 use alloc::boxed::Box;
 
 use crate::arch::current::trap_frame::TrapFrame;
@@ -262,25 +265,40 @@ pub fn sys_cap_create_signal(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///        `init_pages * PAGE_SIZE` available bytes).
 /// arg1 = augment-target `AddressSpace` cap slot, or `0` to create new.
 /// arg2 = `init_pages`: number of PT pages to carve from the Frame cap.
-///        Create-mode requires `init_pages >= 1` (root PT consumes one);
-///        augment-mode accepts `init_pages >= 1`.
+///        Create-mode requires `init_pages >= 2` (one wrapper page + one
+///        root PT page; the remainder seed the PT growth pool).
+///        Augment-mode accepts `init_pages >= 1`.
 ///
-/// Create-mode: pops the first carved page as the root PT (initialised with
-/// the kernel-half PT entries), pushes the remainder onto the new AS's PT
-/// growth pool, and inserts a cap with `MAP | READ` rights into the caller's
-/// `CSpace`. Returns the new slot index.
+/// Create-mode slab layout:
+/// - page 0 — wrapper page: [`AddressSpaceObject`] at offset 0, immediately
+///   followed by the wrapped [`AddressSpace`]. Both are constructed in place
+///   via `core::ptr::write`; the wrapper's `address_space` pointer indexes
+///   into this same page.
+/// - page 1 — root page table (PML4 / Sv48 root), zeroed, kernel-half PT
+///   entries copied from the active root.
+/// - pages `2..init_pages` — PT growth pool. Drawn on demand by
+///   [`AddressSpace::map_page`](crate::mm::address_space::AddressSpace::map_page)
+///   for intermediate PT levels.
+///
+/// Inserts a cap with `MAP | READ` rights into the caller's `CSpace`.
+/// Returns the new slot index.
 ///
 /// Augment-mode: pushes all carved pages onto the target AS's PT growth pool
 /// and increases its `pt_growth_budget_bytes`. Returns `0` on success.
 #[cfg(not(test))]
+#[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{AddressSpaceObject, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{
+        AddressSpaceObject, FrameObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
+    };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::address_space::AddressSpace;
+    use crate::mm::paging::phys_to_virt;
     use core::ptr::NonNull;
+    use core::sync::atomic::AtomicU64;
 
     let frame_idx = tf.arg(0) as u32;
     let augment_idx = tf.arg(1) as u32;
@@ -360,38 +378,83 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Ok(0);
     }
 
-    // Create-mode: page 0 of the slab becomes the root PT; pages 1..init_pages
-    // form the initial PT growth pool. The chunk slot records the entire
-    // init_pages span so dealloc reclaims it wholesale.
-    let root_phys = frame_base + offset;
+    // Create-mode: slab layout is [wrapper page, root PT, pool pages...].
+    // Requires `init_pages >= 2`.
+    if init_pages < 2
+    {
+        retype_free(frame, offset, entry.raw_bytes);
+        return Err(SyscallError::InvalidArgument);
+    }
 
-    // SAFETY: root_phys is a freshly-retyped page, exclusively owned and
-    // page-aligned.
-    let address_space = unsafe { AddressSpace::new_user_with_root(root_phys) };
-    let as_ptr = Box::into_raw(Box::new(address_space));
+    let wrapper_phys = frame_base + offset;
+    let root_pt_phys = wrapper_phys + PAGE_SIZE as u64;
+    let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
-    let aso_box = Box::new(AddressSpaceObject::heap_backed(as_ptr));
-    let aso_raw = Box::into_raw(aso_box);
-    // SAFETY: aso_raw is valid Box; header at offset 0.
-    let aso_ref = unsafe { &*aso_raw };
+    // Wrapper page layout: AddressSpaceObject at offset 0 (header at 0),
+    // wrapped AddressSpace at offset size_of::<AddressSpaceObject>()
+    // (8-byte aligned because both structs have alignment 8).
+    // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
+    // struct's alignment is at most 8.
+    #[allow(clippy::cast_ptr_alignment)]
+    let aso_ptr = wrapper_virt.cast::<AddressSpaceObject>();
+    let as_offset = core::mem::size_of::<AddressSpaceObject>();
+    debug_assert_eq!(as_offset % core::mem::align_of::<AddressSpace>(), 0);
+    debug_assert!(as_offset + core::mem::size_of::<AddressSpace>() <= PAGE_SIZE);
+    // cast_ptr_alignment: as_offset is a multiple of align_of::<AddressSpace>()
+    // (asserted above) and wrapper_virt is page-aligned.
+    // similar_names: aso_ptr / aspace_ptr both name pointers in the same
+    // wrapper page; the disambiguating prefixes are intentional.
+    #[allow(clippy::cast_ptr_alignment, clippy::similar_names)]
+    // SAFETY: wrapper_virt is page-aligned; as_offset stays inside page 0.
+    let aspace_ptr = unsafe { wrapper_virt.add(as_offset) }.cast::<AddressSpace>();
 
-    // Hold a reference on the source Frame cap for the AS's lifetime.
+    // Construct AS in place at offset `as_offset`. The root PT sits in
+    // page 1 of the slab.
+    // SAFETY: root_pt_phys is a freshly-retyped page exclusively owned by
+    // this slab; phys_to_virt gives a valid kernel-direct-map VA.
+    let aspace = unsafe { AddressSpace::new_user_with_root(root_pt_phys) };
+    // SAFETY: aspace_ptr lives in the wrapper page, exclusively owned.
+    unsafe { core::ptr::write(aspace_ptr, aspace) };
+
+    // Construct the wrapper in place at offset 0; the back-pointer indexes
+    // into the same page.
+    // SAFETY: aso_ptr lives in the wrapper page, exclusively owned.
+    unsafe {
+        core::ptr::write(
+            aso_ptr,
+            AddressSpaceObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::AddressSpace, frame_obj_nn),
+                address_space: aspace_ptr,
+                pt_growth_budget_bytes: AtomicU64::new(0),
+                pt_pool_lock: AtomicU64::new(0),
+                pt_pool_head_phys: AtomicU64::new(0),
+                pt_chunks: vacant_chunk_slots(),
+            },
+        );
+    }
+
+    // Hold a reference on the source Frame cap for the AS's lifetime; the
+    // matching dec_ref happens in `dealloc_object(AddressSpace)` after the
+    // chunk is reclaimed.
     // SAFETY: frame_obj_nn is a live FrameObject.
     unsafe { frame_obj_nn.as_ref().inc_ref() };
 
-    // Record one chunk covering all init_pages; only the upper (init_pages - 1)
-    // pages go onto the pool (page 0 is the live root PT).
-    let pool_pages = init_pages - 1;
-    // SAFETY: aso_ref just constructed; offset/init_pages are from a
-    // successful retype against `frame`.
+    // Record the chunk covering all `init_pages`; the lower 2 pages
+    // (wrapper + root PT) are reserved, the remainder seeds the pool.
+    let pool_pages = init_pages - 2;
+    // SAFETY: aso just constructed; offset/init_pages from a successful
+    // retype against `frame`.
     let res =
-        unsafe { aso_ref.add_chunk(frame_obj_nn, frame_base, offset, init_pages, pool_pages) };
+        unsafe { (*aso_ptr).add_chunk(frame_obj_nn, frame_base, offset, init_pages, pool_pages) };
     if res.is_err()
     {
-        // SAFETY: aso/as not observed externally yet.
+        // Roll back: drop the in-place objects, free the slab, dec_ref the
+        // ancestor. AS has no Drop logic; the explicit drop_in_place is for
+        // future-proofing.
+        // SAFETY: aso/aspace not observed externally yet.
         unsafe {
-            drop(Box::from_raw(aso_raw));
-            drop(Box::from_raw(as_ptr));
+            core::ptr::drop_in_place(aso_ptr);
+            core::ptr::drop_in_place(aspace_ptr);
         }
         retype_free(frame, offset, entry.raw_bytes);
         // SAFETY: matches inc_ref above.
@@ -399,15 +462,14 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::OutOfMemory);
     }
 
-    // SAFETY: aso_raw is valid; header at offset 0.
-    let nonnull = unsafe { NonNull::new_unchecked(aso_raw.cast::<KernelObjectHeader>()) };
+    // SAFETY: aso_ptr is in-place at offset 0; header at offset 0 of ASObject.
+    let nonnull = unsafe { NonNull::new_unchecked(aso_ptr.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null above.
     let idx =
         unsafe { (*cspace).insert_cap(CapTag::AddressSpace, Rights::MAP | Rights::READ, nonnull) }
             .map_err(|_| SyscallError::OutOfMemory)?;
 
-    let _ = PAGE_SIZE;
     Ok(u64::from(idx.get()))
 }
 
@@ -416,22 +478,38 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// arg0 = source Frame-cap slot (must carry `Rights::RETYPE`).
 /// arg1 = augment-target `CSpace` cap slot, or `0` to create new.
-/// arg2 = `init_pages`: number of slot pages to carve from the Frame cap.
-///        Must be `>= 1`.
+/// arg2 = `init_pages`: number of pages to carve from the Frame cap.
+///        Create-mode requires `init_pages >= 1` (one wrapper page; the
+///        remainder seed the slot-page pool — `init_pages == 1` yields an
+///        empty pool that requires immediate augment-mode refill before any
+///        cap can be inserted). Augment-mode accepts `init_pages >= 1`.
 /// arg3 = `max_slots` (create-mode only): hard cap on usable slots
 ///        (clamped to `[1, 16384]`). Ignored in augment mode.
 ///
+/// Create-mode slab layout:
+/// - page 0 — wrapper page: [`CSpaceKernelObject`] at offset 0, immediately
+///   followed by the wrapped [`CSpace`] directory. The wrapper's `cspace`
+///   pointer indexes into this same page.
+/// - pages `1..init_pages` — slot-page pool, drawn on demand by
+///   [`CSpace::grow`](crate::cap::cspace::CSpace::grow) when the directory
+///   needs another 64-slot leaf.
+///
 /// Create-mode returns the new `CSpace` slot index. Augment-mode returns 0.
 #[cfg(not(test))]
+#[allow(clippy::too_many_lines)]
 pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::alloc_cspace_id;
     use crate::cap::cspace::CSpace;
-    use crate::cap::object::{CSpaceKernelObject, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{
+        CSpaceKernelObject, FrameObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
+    };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
     use core::ptr::NonNull;
+    use core::sync::atomic::AtomicU64;
 
     const MAX_SLOTS: usize = 16384;
 
@@ -509,7 +587,10 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Ok(0);
     }
 
-    // Create-mode.
+    // Create-mode: slab layout is [wrapper page, slot pool pages...].
+    // Page 0 holds CSpaceKernelObject at offset 0 followed by CSpace at
+    // offset size_of::<CSpaceKernelObject>(). Pages 1..init_pages seed the
+    // slot-page pool; CSpace::grow pops one when the directory needs a leaf.
     let max_slots = if requested_max_slots == 0
     {
         MAX_SLOTS
@@ -519,47 +600,80 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (requested_max_slots as usize).clamp(1, MAX_SLOTS)
     };
 
+    let wrapper_phys = frame_base + offset;
+    let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
+
+    // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
+    // struct's alignment is at most 8.
+    #[allow(clippy::cast_ptr_alignment)]
+    let cs_kobj_ptr = wrapper_virt.cast::<CSpaceKernelObject>();
+    let cs_offset = core::mem::size_of::<CSpaceKernelObject>();
+    debug_assert_eq!(cs_offset % core::mem::align_of::<CSpace>(), 0);
+    debug_assert!(cs_offset + core::mem::size_of::<CSpace>() <= PAGE_SIZE);
+    // cast_ptr_alignment: cs_offset is a multiple of align_of::<CSpace>()
+    // (asserted above) and wrapper_virt is page-aligned.
+    #[allow(clippy::cast_ptr_alignment)]
+    // SAFETY: wrapper_virt is page-aligned; cs_offset stays inside page 0.
+    let cs_ptr = unsafe { wrapper_virt.add(cs_offset) }.cast::<CSpace>();
+
     let id = alloc_cspace_id();
-    let new_cs_raw = Box::into_raw(Box::new(CSpace::new(id, max_slots)));
 
-    // Register in the global registry first so derivation lookups resolve.
-    crate::cap::register_cspace(id, new_cs_raw);
+    // Construct CSpace in place.
+    // SAFETY: cs_ptr lives inside the wrapper page, exclusively owned.
+    unsafe { core::ptr::write(cs_ptr, CSpace::new(id, max_slots)) };
 
-    let cs_kobj = Box::new(CSpaceKernelObject::heap_backed(new_cs_raw));
-    let cs_kobj_raw = Box::into_raw(cs_kobj);
-    // SAFETY: cs_kobj_raw is a valid Box.
-    let cs_kobj_ref = unsafe { &*cs_kobj_raw };
+    // Construct the wrapper in place; the back-pointer indexes into the
+    // same page.
+    // SAFETY: cs_kobj_ptr is page-aligned and exclusively owned.
+    unsafe {
+        core::ptr::write(
+            cs_kobj_ptr,
+            CSpaceKernelObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, frame_obj_nn),
+                cspace: cs_ptr,
+                cspace_growth_budget_bytes: AtomicU64::new(0),
+                cs_pool_lock: AtomicU64::new(0),
+                cs_pool_head_phys: AtomicU64::new(0),
+                cs_chunks: vacant_chunk_slots(),
+            },
+        );
+    }
 
     // Wire the back-pointer so the first CSpace::grow uses the pool.
-    // SAFETY: new_cs_raw is the freshly-Boxed CSpace.
-    unsafe { (*new_cs_raw).set_kobj(cs_kobj_raw) };
+    // SAFETY: cs_ptr just constructed.
+    unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
+
+    // Register in the global registry so derivation lookups resolve.
+    crate::cap::register_cspace(id, cs_ptr);
 
     // Hold a reference on the source Frame cap.
     // SAFETY: frame_obj_nn is live.
     unsafe { frame_obj_nn.as_ref().inc_ref() };
 
-    // Seed the entire init_pages slab onto the pool. CSpace::grow consumes
-    // pages on demand.
-    // SAFETY: cs_kobj_ref just constructed.
-    let res =
-        unsafe { cs_kobj_ref.add_chunk(frame_obj_nn, frame_base, offset, init_pages, init_pages) };
+    // Record the chunk covering all init_pages; reserve page 0 (wrapper),
+    // pool seeds pages 1..init_pages.
+    let pool_pages = init_pages - 1;
+    // SAFETY: wrapper just constructed; offset/init_pages from a successful
+    // retype against `frame`.
+    let res = unsafe {
+        (*cs_kobj_ptr).add_chunk(frame_obj_nn, frame_base, offset, init_pages, pool_pages)
+    };
     if res.is_err()
     {
-        // SAFETY: cs_kobj/cs not observed externally yet.
+        // SAFETY: wrapper/cs not observed externally yet.
         unsafe {
-            drop(Box::from_raw(cs_kobj_raw));
-            // Unregister + drop the CSpace.
-            crate::cap::unregister_cspace(id);
-            drop(Box::from_raw(new_cs_raw));
+            core::ptr::drop_in_place(cs_kobj_ptr);
+            core::ptr::drop_in_place(cs_ptr);
         }
+        crate::cap::unregister_cspace(id);
         retype_free(frame, offset, entry.raw_bytes);
         // SAFETY: matches inc_ref above.
         unsafe { frame_obj_nn.as_ref().dec_ref() };
         return Err(SyscallError::OutOfMemory);
     }
 
-    // SAFETY: cs_kobj_raw is valid; header at offset 0.
-    let nonnull = unsafe { NonNull::new_unchecked(cs_kobj_raw.cast::<KernelObjectHeader>()) };
+    // SAFETY: cs_kobj_ptr is in-place at offset 0; header at offset 0.
+    let nonnull = unsafe { NonNull::new_unchecked(cs_kobj_ptr.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null above.
     let idx = unsafe {

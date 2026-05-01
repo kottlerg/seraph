@@ -48,9 +48,9 @@ pub fn aspace_augment_grows_budget(ctx: &TestContext) -> TestResult
 {
     let frame = ctx.memory_frame_base;
 
-    // Create an AS with the minimum useful budget: page 0 = root PT, no
-    // pool pages.
-    let aspace = cap_create_aspace(frame, 0, 1)
+    // Create an AS with the minimum useful slab: page 0 = wrapper page,
+    // page 1 = root PT, no pool pages.
+    let aspace = cap_create_aspace(frame, 0, 2)
         .map_err(|_| "retype::aspace_augment: cap_create_aspace failed")?;
     let initial_budget = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
         .map_err(|_| "retype::aspace_augment: cap_info(initial budget) failed")?;
@@ -109,9 +109,10 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
 {
     let frame = ctx.memory_frame_base;
 
-    // 2 pool pages — enough to allocate a few intermediate PT pages but
+    // Slab layout: page 0 = wrapper, page 1 = root PT, pages 2..4 = 2
+    // pool pages — enough to allocate a few intermediate PT pages but
     // not unbounded. The map loop below is sized to exhaust this.
-    let aspace = cap_create_aspace(frame, 0, 3)
+    let aspace = cap_create_aspace(frame, 0, 4)
         .map_err(|_| "retype::pt_budget: cap_create_aspace failed")?;
 
     // Map further pages spaced by 1 GiB so each new mapping forces a

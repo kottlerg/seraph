@@ -552,6 +552,11 @@ fn user_walk_or_alloc_pooled(
 /// Walk the user half of the page table rooted at `root_virt` and free every
 /// intermediate table frame (PDPT, PD, PT) back to `allocator`.
 ///
+/// Retained for the case where a future caller needs to reclaim PT pages
+/// to the buddy directly. Production retype-backed `AddressSpace`s
+/// reclaim PT pages through `dealloc_object(AddressSpace)`'s chunk walk
+/// (`retype_free` per chunk → ancestor `dec_ref`), not via this function.
+///
 /// Leaf PTEs (4 KiB and 2 MiB large pages) point at physical memory owned by
 /// Frame capabilities; those frames are freed through `FrameObject` teardown
 /// when the owning `CSpace` is destroyed, not here. This function only
@@ -568,6 +573,7 @@ fn user_walk_or_alloc_pooled(
 /// frame. No CPU may still be using this address space (the caller verifies
 /// `active_cpu_mask() == 0` before invocation).
 #[cfg(not(test))]
+#[allow(dead_code)]
 pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::BuddyAllocator)
 {
     use crate::mm::paging::phys_to_virt;

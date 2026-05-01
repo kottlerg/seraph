@@ -297,18 +297,34 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             init_image.entry_point
         );
 
-        // Create init's user address space (PML4 / Sv48 root + kernel entries).
-        // SAFETY: page tables installed (Phase 3), heap active (Phase 4);
-        // frame allocator validated; single-threaded boot.
-        let init_as = unsafe { mm::address_space::AddressSpace::new_user(allocator) };
-        let init_as_ptr = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(init_as));
+        // Create init's user address space via the typed-memory boot path:
+        // a slab is retyped from `SEED_FRAME` (page 0 = wrapper page holding
+        // `AddressSpaceObject` + inlined `AddressSpace`; page 1 = root PT;
+        // pages 2..init_pages = PT growth pool). The wrapper header is the
+        // cap object inserted into init's CSpace below.
+        // 18 pages = 1 wrapper + 1 root PT + 16 PT pool. Phase 9 mappings
+        // (ELF segments, InitInfo, stack) go through the legacy buddy path
+        // via `map_page` (kernel-direct call); the wrapper's pool serves
+        // only init's userspace `sys_mem_map` calls (TEMP_MAP_BASE +
+        // ELF_PAGE_TEMP_VA scratch regions). 16 pool pages comfortably
+        // covers the bootstrap loop's PT footprint.
+        #[allow(clippy::items_after_statements)]
+        const INIT_ASPACE_PAGES: u64 = 18;
+        // SAFETY: SEED installed in Phase 7; single-threaded Phase 9.
+        let (init_as_obj_nn, init_as_ptr) =
+            unsafe { cap::boot_retype_aspace(cap::seed_frame_ref(), INIT_ASPACE_PAGES) };
+        let _ = allocator; // legacy buddy path no longer used for init's AS
 
-        // Map each ELF LOAD segment into the init address space.
+        // Map each ELF LOAD segment into the init address space. `map_page`
+        // self-dispatches via the wrapper back-pointer wired by
+        // `boot_retype_aspace`, so every intermediate PT page comes from
+        // the wrapper's growth pool.
         for i in 0..init_image.segment_count as usize
         {
             let seg = &init_image.segments[i];
-            // SAFETY: init_as_ptr valid (just allocated above); segment data in
-            // Loaded memory region accessible via direct physical map (Phase 3).
+            // SAFETY: init_as_ptr is freshly retyped above; segment data
+            // lives in bootloader-loaded memory accessible via the direct
+            // physical map (Phase 3).
             unsafe { (*init_as_ptr).map_segment(seg) }
                 .unwrap_or_else(|()| fatal("Phase 9: failed to map init segment"));
         }
@@ -318,28 +334,21 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         // so init can create child threads bound to its own address space and map
         // its code pages into child processes once a process manager is available.
         let (init_aspace_cap_slot, segment_frame_base, segment_frame_count) = {
-            use alloc::boxed::Box;
             use boot_protocol::SegmentFlags;
-            use cap::object::{AddressSpaceObject, FrameObject, KernelObjectHeader, ObjectType};
+            use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
             use cap::slot::{CapTag, Rights};
-            use core::ptr::NonNull;
 
             // SAFETY: ROOT_CSPACE initialized in Phase 7, still owned by kernel
             // (not yet transferred to init); single-threaded boot phase.
             let cs = unsafe { cap::root_cspace_mut() }
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing"));
 
-            // AddressSpace cap: init can use this to spawn threads in its space.
-            // Init's bootstrap AS is heap-backed (PT pages from the buddy);
-            // the typed-memory deferral retypes init's bootstrap state in a
-            // follow-up task. Budget=0 and empty pool are informational here.
-            let as_obj = Box::new(AddressSpaceObject::heap_backed(init_as_ptr));
-            // SAFETY: Box::into_raw returns non-null pointer; cast preserves validity.
-            let as_nn = unsafe {
-                NonNull::new_unchecked(Box::into_raw(as_obj).cast::<KernelObjectHeader>())
-            };
             let aspace_slot = cs
-                .insert_cap(CapTag::AddressSpace, Rights::MAP | Rights::READ, as_nn)
+                .insert_cap(
+                    CapTag::AddressSpace,
+                    Rights::MAP | Rights::READ,
+                    init_as_obj_nn,
+                )
                 .unwrap_or_else(|_| fatal("Phase 9: cannot insert init AddressSpace cap"));
 
             // Frame caps for each init segment (phys base + size + permissions).
@@ -541,78 +550,99 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         }
         .unwrap_or_else(|()| fatal("Phase 9: failed to map init stack"));
 
-        // Allocate init's kernel stack (KERNEL_STACK_PAGES = 4 pages = 16 KiB).
-        let init_kstack_phys = allocator
-            .alloc(2) // 2^2 = 4 pages
-            .unwrap_or_else(|| fatal("Phase 9: out of memory for init kernel stack"));
-        let init_kstack_virt = mm::paging::phys_to_virt(init_kstack_phys);
-        let init_kstack_top = init_kstack_virt + (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE) as u64;
+        // Retype a 5-page slab from SEED_FRAME for init's Thread:
+        //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)
+        //   page 4   — ThreadObject (24 B) followed by ThreadControlBlock
+        // Mirrors the layout established in `sys_cap_create_thread`.
+        #[allow(clippy::items_after_statements)]
+        const INIT_THREAD_PAGES: u64 = (sched::KERNEL_STACK_PAGES + 1) as u64;
+        let (init_thread_obj_nn, init_kstack_top, init_tcb) = {
+            use cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
 
-        // Prepare saved CPU state for init: user entry point + kernel stack.
-        // sched::enter() restores this state to begin init execution.
-        let init_saved = arch::current::context::new_state(
-            init_image.entry_point,
-            init_kstack_top,
-            init_protocol::INIT_INFO_VADDR, // forwarded to init's a0/rdi on first entry
-            true,
-        );
+            let bytes = INIT_THREAD_PAGES * mm::PAGE_SIZE as u64;
+            let seed = cap::seed_frame_ref();
+            let offset = cap::retype::retype_allocate(seed, bytes)
+                .unwrap_or_else(|_| fatal("Phase 9: SEED too small for init Thread slab"));
+            let block_phys = seed.base + offset;
+            let block_virt = mm::paging::phys_to_virt(block_phys);
+            let kstack_top = block_virt + (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE) as u64;
+            let thread_obj_ptr = kstack_top as *mut ThreadObject;
+            let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
+            let tcb_ptr = (kstack_top + tcb_offset) as *mut sched::thread::ThreadControlBlock;
 
-        // Build the init TCB with a null cspace; CSpace is assigned below after
-        // the Thread cap is minted (the cap must be inserted before the CSpace is
-        // transferred out of ROOT_CSPACE).
-        let init_tcb = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(
-            sched::thread::ThreadControlBlock {
-                state: sched::thread::ThreadState::Ready,
-                priority: sched::INIT_PRIORITY,
-                slice_remaining: sched::TIME_SLICE_TICKS,
-                cpu_affinity: sched::AFFINITY_ANY,
-                preferred_cpu: 0,
-                run_queue_next: None,
-                ipc_state: sched::thread::IpcThreadState::None,
-                ipc_msg: ipc::message::Message::default(),
-                reply_tcb: core::ptr::null_mut(),
-                ipc_wait_next: None,
-                is_user: true,
-                saved_state: init_saved,
-                kernel_stack_top: init_kstack_top,
-                trap_frame: core::ptr::null_mut(), // set in sched::enter()
-                address_space: init_as_ptr,
-                ipc_buffer: 0,
-                wakeup_value: 0,
-                timed_out: false,
-                iopb: core::ptr::null_mut(),
-                blocked_on_object: core::ptr::null_mut(),
-                cspace: core::ptr::null_mut(),
-                thread_id: 1, // 0 = idle BSP, 1 = init
-                context_saved: core::sync::atomic::AtomicU32::new(1),
-                death_observers: [sched::thread::DeathObserver::empty();
-                    sched::thread::MAX_DEATH_OBSERVERS],
-                death_observer_count: 0,
-                sleep_deadline: 0,
-                magic: sched::thread::TCB_MAGIC,
-            },
-        ));
+            // Prepare saved CPU state for init: user entry point + kernel stack.
+            let init_saved = arch::current::context::new_state(
+                init_image.entry_point,
+                kstack_top,
+                init_protocol::INIT_INFO_VADDR, // forwarded to init's a0/rdi on first entry
+                true,
+            );
+
+            // SAFETY: tcb_ptr lies on page 4 of the freshly-retyped slab,
+            // exclusively owned. CSpace is wired below (after take_root_cspace).
+            unsafe {
+                core::ptr::write(
+                    tcb_ptr,
+                    sched::thread::ThreadControlBlock {
+                        state: sched::thread::ThreadState::Ready,
+                        priority: sched::INIT_PRIORITY,
+                        slice_remaining: sched::TIME_SLICE_TICKS,
+                        cpu_affinity: sched::AFFINITY_ANY,
+                        preferred_cpu: 0,
+                        run_queue_next: None,
+                        ipc_state: sched::thread::IpcThreadState::None,
+                        ipc_msg: ipc::message::Message::default(),
+                        reply_tcb: core::ptr::null_mut(),
+                        ipc_wait_next: None,
+                        is_user: true,
+                        saved_state: init_saved,
+                        kernel_stack_top: kstack_top,
+                        trap_frame: core::ptr::null_mut(),
+                        address_space: init_as_ptr,
+                        ipc_buffer: 0,
+                        wakeup_value: 0,
+                        timed_out: false,
+                        iopb: core::ptr::null_mut(),
+                        blocked_on_object: core::ptr::null_mut(),
+                        cspace: core::ptr::null_mut(),
+                        thread_id: 1, // 0 = idle BSP, 1 = init
+                        context_saved: core::sync::atomic::AtomicU32::new(1),
+                        death_observers: [sched::thread::DeathObserver::empty();
+                            sched::thread::MAX_DEATH_OBSERVERS],
+                        death_observer_count: 0,
+                        sleep_deadline: 0,
+                        magic: sched::thread::TCB_MAGIC,
+                    },
+                );
+                core::ptr::write(
+                    thread_obj_ptr,
+                    ThreadObject {
+                        header: KernelObjectHeader::with_ancestor(
+                            ObjectType::Thread,
+                            cap::seed_header_nn(),
+                        ),
+                        tcb: tcb_ptr,
+                    },
+                );
+            }
+            seed.header.inc_ref();
+
+            // SAFETY: thread_obj_ptr in-place; header at offset 0.
+            let nn = unsafe {
+                core::ptr::NonNull::new_unchecked(thread_obj_ptr.cast::<KernelObjectHeader>())
+            };
+            (nn, kstack_top, tcb_ptr)
+        };
 
         // Mint a Thread cap for init's own thread (CONTROL right) into the root
         // CSpace. This must happen before take_root_cspace transfers ownership.
         let init_thread_cap_slot = {
-            use alloc::boxed::Box;
-            use cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
             use cap::slot::{CapTag, Rights};
-            use core::ptr::NonNull;
 
-            let th_obj = Box::new(ThreadObject {
-                header: KernelObjectHeader::new(ObjectType::Thread),
-                tcb: init_tcb,
-            });
-            // SAFETY: Box::into_raw returns non-null pointer; cast preserves validity.
-            let th_nn = unsafe {
-                NonNull::new_unchecked(Box::into_raw(th_obj).cast::<KernelObjectHeader>())
-            };
             // SAFETY: ROOT_CSPACE initialized in Phase 7; single-threaded boot.
             let cs = unsafe { cap::root_cspace_mut() }
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing for Thread cap"));
-            cs.insert_cap(CapTag::Thread, Rights::CONTROL, th_nn)
+            cs.insert_cap(CapTag::Thread, Rights::CONTROL, init_thread_obj_nn)
                 .unwrap_or_else(|_| fatal("Phase 9: cannot insert init Thread cap"))
                 .get()
         };
@@ -621,8 +651,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 
         // Mint a CSpace cap so init can create threads bound to its own CSpace
         // (e.g. a log-serving thread that shares init's capability namespace).
+        // The wrapper `CSpaceKernelObject` was constructed alongside the
+        // CSpace itself in Phase 7's `boot_retype_cspace` and is reachable
+        // via `CSpace::kobj`.
         let init_cspace_cap_slot = {
-            use alloc::boxed::Box;
             use cap::object::{CSpaceKernelObject, KernelObjectHeader};
             use cap::slot::{CapTag, Rights};
             use core::ptr::NonNull;
@@ -630,16 +662,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             // SAFETY: ROOT_CSPACE initialized in Phase 7; single-threaded boot.
             let cs = unsafe { cap::root_cspace_mut() }
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing for CSpace cap"));
-            // Get a raw pointer to the CSpace itself (the one being transferred to
-            // init below). The CSpaceKernelObject wraps this pointer.
-            let cspace_ptr: *mut cap::cspace::CSpace = core::ptr::from_mut(cs);
-            // Init's bootstrap CSpace is heap-backed; deferred task retypes
-            // init's bootstrap state. Budget=0 and empty pool informational.
-            let cs_obj = Box::new(CSpaceKernelObject::heap_backed(cspace_ptr));
-            // SAFETY: Box::into_raw returns non-null pointer; cast preserves validity.
-            let cs_nn = unsafe {
-                NonNull::new_unchecked(Box::into_raw(cs_obj).cast::<KernelObjectHeader>())
-            };
+            let cs_kobj_ptr: *mut CSpaceKernelObject = cs
+                .kobj_ptr()
+                .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE wrapper not wired"));
+            // SAFETY: cs_kobj_ptr is in-place inside the SEED slab; header at offset 0.
+            let cs_nn = unsafe { NonNull::new_unchecked(cs_kobj_ptr.cast::<KernelObjectHeader>()) };
             cs.insert_cap(
                 CapTag::CSpace,
                 Rights::INSERT | Rights::DELETE | Rights::DERIVE,
@@ -661,13 +688,18 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             (*info_ptr).cspace_cap = init_cspace_cap_slot;
         }
 
-        // Transfer root CSpace ownership to init.
-        // SAFETY: ROOT_CSPACE initialized in Phase 7; single-threaded boot;
-        // ownership transferred once to init process.
-        let init_cspace = unsafe { cap::take_root_cspace() }
-            .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing"));
-        // SAFETY: init_tcb was just allocated above and is valid; single-threaded boot.
-        unsafe { (*init_tcb).cspace = alloc::boxed::Box::into_raw(init_cspace) };
+        // Transfer the root CSpace pointer into init's TCB. The CSpace lives
+        // inside a SEED-pinned slab; ownership is conveyed by-pointer (no
+        // Box involved). `take_root_cspace` clears `ROOT_CSPACE` so no
+        // other code observes a live root pointer afterwards.
+        // SAFETY: ROOT_CSPACE wired in Phase 7; single-threaded boot.
+        let init_cspace_ptr = unsafe { cap::take_root_cspace() };
+        if init_cspace_ptr.is_null()
+        {
+            fatal("Phase 9: ROOT_CSPACE missing");
+        }
+        // SAFETY: init_tcb was just retyped above and is valid; single-threaded boot.
+        unsafe { (*init_tcb).cspace = init_cspace_ptr };
 
         // Enqueue init on the BSP scheduler at INIT_PRIORITY.
         // SAFETY: scheduler initialized in Phase 8; single-threaded boot phase;

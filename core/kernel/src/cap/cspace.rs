@@ -24,9 +24,13 @@
 // cast_possible_truncation: usize→u32 slot index bounded by L1_SIZE * L2_SIZE (16384).
 #![allow(clippy::cast_possible_truncation)]
 
-// In no_std builds alloc must be declared explicitly; std builds include it implicitly.
+// `alloc` is needed by the host-test stubs (CSpace::grow heap fallback,
+// CSpace::Drop heap reclaim, dummy-object factory). Production CSpace is
+// retype-pool-backed end-to-end and does not allocate from the kernel heap.
+#[cfg(test)]
 extern crate alloc;
 
+#[cfg(test)]
 use alloc::boxed::Box;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
@@ -154,6 +158,16 @@ impl CSpace
         self.kobj.store(kobj, Ordering::Release);
     }
 
+    /// Read the wrapping [`CSpaceKernelObject`] pointer wired by
+    /// [`set_kobj`]. Returns `None` for the host-test stub `CSpace`s that
+    /// never wire a wrapper. Phase 9 uses this to insert init's `CSpace` cap
+    /// without re-allocating a fresh wrapper.
+    pub fn kobj_ptr(&self) -> Option<*mut CSpaceKernelObject>
+    {
+        let p = self.kobj.load(Ordering::Acquire);
+        if p.is_null() { None } else { Some(p) }
+    }
+
     /// Return this `CSpace`'s unique identifier.
     pub fn id(&self) -> CSpaceId
     {
@@ -217,10 +231,29 @@ impl CSpace
             return Err(CapError::OutOfSlots);
         }
 
-        // Source the page from the retype-pool when wired, else from heap.
+        // Source the page from the retype-pool. Production CSpaces are
+        // always retype-backed (root CSpace via `boot_retype_cspace`,
+        // userspace CSpaces via `sys_cap_create_cspace`); the heap fallback
+        // is for the host-test stubs only.
         let kobj_ptr = self.kobj.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let page_nn: NonNull<CSpacePage> = {
+            debug_assert!(
+                !kobj_ptr.is_null(),
+                "CSpace::grow: production CSpace must be retype-backed"
+            );
+            // SAFETY: kobj_ptr is the wrapper that owns this CSpace; its
+            // pool was seeded at retype time.
+            let phys = unsafe { (*kobj_ptr).alloc_slot_page() }.ok_or(CapError::OutOfMemory)?;
+            let virt = crate::mm::paging::phys_to_virt(phys);
+            // SAFETY: pool returns page-aligned, freshly-zeroed pages mapped
+            // in the kernel direct map.
+            unsafe { NonNull::new_unchecked(virt as *mut CSpacePage) }
+        };
+        #[cfg(test)]
         let page_nn: NonNull<CSpacePage> = if kobj_ptr.is_null()
         {
+            // Test stub: no retype machinery, allocate via the host heap.
             // SAFETY: all-zeros is a valid CSpacePage (every slot null).
             let boxed = Box::new(unsafe { core::mem::zeroed::<CSpacePage>() });
             // SAFETY: Box::into_raw is non-null.
@@ -228,21 +261,7 @@ impl CSpace
         }
         else
         {
-            #[cfg(not(test))]
-            {
-                // SAFETY: kobj_ptr is the wrapper that owns this CSpace; its
-                // pool was seeded at retype time.
-                let phys = unsafe { (*kobj_ptr).alloc_slot_page() }.ok_or(CapError::OutOfMemory)?;
-                let virt = crate::mm::paging::phys_to_virt(phys);
-                // SAFETY: pool returns page-aligned, freshly-zeroed pages
-                // mapped in the kernel direct map.
-                unsafe { NonNull::new_unchecked(virt as *mut CSpacePage) }
-            }
-            #[cfg(test)]
-            {
-                // Tests never wire a kobj; this branch is unreachable.
-                return Err(CapError::OutOfMemory);
-            }
+            return Err(CapError::OutOfMemory);
         };
 
         // SAFETY: page_nn points at an exclusively-owned, zeroed CSpacePage.
@@ -519,30 +538,30 @@ impl CSpace
 
 impl Drop for CSpace
 {
-    /// Reclaim heap-backed pages on `CSpace` destruction.
-    ///
-    /// Heap path (`kobj == null`): every `Some(NonNull<CSpacePage>)` was
-    /// `Box::leak`ed in [`Self::grow`]; reconstruct each `Box` and let it
-    /// drop, returning the page to the kernel heap.
-    ///
-    /// Retype-pool path (`kobj != null`): pages live inside chunks tracked
-    /// by [`CSpaceKernelObject`] which `dealloc_object(CSpaceObj)` reclaims
-    /// wholesale via `retype_free`. Drop here is a no-op so we don't
+    /// Production `CSpace` is always retype-backed: pages live inside chunks
+    /// tracked by [`CSpaceKernelObject`] which `dealloc_object(CSpaceObj)`
+    /// reclaims wholesale via `retype_free`. Drop is a no-op so we don't
     /// double-free pool pages through the global allocator.
+    ///
+    /// The host-test stubs allocate `CSpace` directly without wiring a
+    /// `kobj`; in that build, Drop reconstructs each leaked `Box` to return
+    /// pages to the host heap so unit tests do not leak.
     fn drop(&mut self)
     {
-        if !self.kobj.load(Ordering::Acquire).is_null()
+        #[cfg(test)]
         {
-            return;
-        }
-        for entry in &mut self.directory
-        {
-            if let Some(page_nn) = entry.take()
+            if self.kobj.load(Ordering::Acquire).is_null()
             {
-                // SAFETY: heap path: page_nn came from Box::into_raw via
-                // grow's heap branch.
-                unsafe {
-                    drop(Box::from_raw(page_nn.as_ptr()));
+                for entry in &mut self.directory
+                {
+                    if let Some(page_nn) = entry.take()
+                    {
+                        // SAFETY: test stub: page_nn came from Box::into_raw
+                        // via grow's heap branch.
+                        unsafe {
+                            drop(Box::from_raw(page_nn.as_ptr()));
+                        }
+                    }
                 }
             }
         }

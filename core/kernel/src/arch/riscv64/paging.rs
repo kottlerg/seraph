@@ -520,6 +520,7 @@ fn rv_walk_or_alloc_pooled(
 /// No CPU may still be using this address space (the caller verifies
 /// `active_cpu_mask() == 0` before invocation).
 #[cfg(not(test))]
+#[allow(dead_code)]
 pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::BuddyAllocator)
 {
     use crate::mm::paging::phys_to_virt;

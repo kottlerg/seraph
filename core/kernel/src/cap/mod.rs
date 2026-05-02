@@ -1499,22 +1499,47 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
         // Round size up to page boundary so mem_map can map whole pages.
         let rounded_size = (module.size + 0xFFF) & !0xFFF;
 
+        // Register the module's pages as managed-but-not-free so that if
+        // the cap is ever destroyed, `dealloc_object`'s `buddy.free_range`
+        // path keeps `free / total` well-defined. Idempotent at boot
+        // since module page ranges are disjoint. Production-only:
+        // `with_frame_allocator` is `cfg(not(test))`.
+        #[cfg(not(test))]
+        // SAFETY: module pages were not added via `add_region`
+        // (`mm/init.rs` excludes loaded regions); single-threaded boot.
+        unsafe {
+            crate::mm::with_frame_allocator(|alloc| {
+                alloc.register_owned_range(module.physical_base, rounded_size);
+            });
+        }
+
         let ptr = mint_phase7_body(FrameObject {
             header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
             base: module.physical_base,
             size: rounded_size,
-            // Boot module: not retypable; cap minted without RETYPE.
-            available_bytes: core::sync::atomic::AtomicU64::new(0),
-            // Boot module pages are pre-loaded by the bootloader outside
-            // the buddy pool; never return them.
-            owns_memory: core::sync::atomic::AtomicBool::new(false),
+            // Boot module pages are reclaimable: full byte ledger so the
+            // pages can flow through `memmgr_labels::DONATE_FRAMES` into
+            // memmgr's pool once the loader (init or procmgr) has copied
+            // the ELF contents into the target process's AddressSpace.
+            available_bytes: core::sync::atomic::AtomicU64::new(rounded_size),
+            // Reclaimable: when this cap's last refcount drops, the pages
+            // are returned to the buddy via `dealloc_object`. In normal
+            // operation memmgr never destroys the cap (it ingests it into
+            // its pool); this is a safety net.
+            owns_memory: core::sync::atomic::AtomicBool::new(true),
             allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
+        // Full rights so the cap can flow through the donation chain into
+        // memmgr's pool (memmgr-issued reply caps must carry RETYPE for
+        // userspace to retype into kernel objects). Loaders (init,
+        // procmgr) map with `MAP_READONLY` for defence-in-depth on the
+        // ELF source — read-only at the page-table level despite the
+        // cap allowing WRITE.
         let slot = insert_or_fatal(
             cspace,
             CapTag::Frame,
-            Rights::MAP | Rights::READ,
+            Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
             ptr,
             "Phase 7: cannot allocate Frame capability for boot module",
         );

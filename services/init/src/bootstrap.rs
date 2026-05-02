@@ -438,8 +438,14 @@ pub fn bootstrap_memmgr(
     let module_size = descriptor_for(info, module_frame_cap).map(|d| d.aux1)?;
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
+    // Module Frame caps now carry full rights (R+W+X+RETYPE) so they can
+    // flow through the donation chain into memmgr's pool with rights its
+    // consumers need. Derive a read-only child cap for the load-time
+    // mapping so `mem_map`'s derive-from-cap path produces a strictly
+    // read-only page (otherwise W+X cap rights trip W^X).
+    let module_ro = syscall::cap_derive(module_frame_cap, syscall::RIGHTS_MAP_READ).ok()?;
     syscall::mem_map(
-        module_frame_cap,
+        module_ro,
         init_aspace,
         TEMP_MAP_BASE,
         0,
@@ -465,6 +471,7 @@ pub fn bootstrap_memmgr(
 
     let (entry, stack_pages) = load_elf(module_bytes, mm_aspace, alloc, init_aspace)?;
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
+    let _ = syscall::cap_delete(module_ro);
     log("loaded memmgr ELF");
 
     // Tokened creator endpoint for memmgr (init serves the bootstrap round
@@ -782,8 +789,10 @@ pub fn bootstrap_procmgr(
 
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
+    // Derive a read-only child cap (see `bootstrap_memmgr` for rationale).
+    let module_ro = syscall::cap_derive(module_frame_cap, syscall::RIGHTS_MAP_READ).ok()?;
     syscall::mem_map(
-        module_frame_cap,
+        module_ro,
         init_aspace,
         TEMP_MAP_BASE,
         0,
@@ -820,6 +829,7 @@ pub fn bootstrap_procmgr(
         prepare_main_tls(module_bytes, pm_aspace, alloc, init_aspace)?;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
+    let _ = syscall::cap_delete(module_ro);
 
     log("loaded procmgr ELF");
 

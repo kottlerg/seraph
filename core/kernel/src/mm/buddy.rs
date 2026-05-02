@@ -212,6 +212,29 @@ impl BuddyAllocator
         self.free_pages
     }
 
+    /// Register `size_bytes / PAGE_SIZE` pages as managed but not currently
+    /// free.
+    ///
+    /// Used at boot for owned regions whose pages live outside the free
+    /// list but may later be returned via [`free_range`][Self::free_range]
+    /// — e.g., boot-module Frame caps minted with `owns_memory = true`.
+    /// Bumping `total_pages` keeps the `free / total` memory-pressure
+    /// ratio well-defined if those pages are eventually reclaimed.
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure these pages are NOT also added via
+    /// [`add_region`][Self::add_region]; double-counting `total_pages`
+    /// would inflate the ratio incorrectly. `base` and `size_bytes` must
+    /// be `PAGE_SIZE`-aligned.
+    pub unsafe fn register_owned_range(&mut self, base: u64, size_bytes: u64)
+    {
+        debug_assert!(base.is_multiple_of(PAGE_SIZE as u64));
+        debug_assert!(size_bytes.is_multiple_of(PAGE_SIZE as u64));
+        let _ = base;
+        self.total_pages += (size_bytes / PAGE_SIZE as u64) as usize;
+    }
+
     /// Free a range `[base, base + size_bytes)` into the buddy as order-0
     /// pages, one per iteration. Adjacent buddies merge inside `free`, so
     /// the range re-coalesces into the largest naturally-aligned blocks

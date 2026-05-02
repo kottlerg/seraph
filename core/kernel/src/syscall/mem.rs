@@ -134,7 +134,9 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Determine page permissions. If prot_bits is nonzero, use explicit
     // permissions (must be a subset of the Frame cap's rights). If zero,
-    // derive from the cap's rights directly (backward compatibility).
+    // derive from the cap's rights directly. Callers that hold a cap with
+    // both WRITE and EXECUTE must use a derived sub-cap (or explicit
+    // prot_bits) to avoid the W^X check below.
     let (writable, executable) = if prot_bits != 0
     {
         let w = (prot_bits & 0x2) != 0;

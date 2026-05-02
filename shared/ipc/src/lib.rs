@@ -162,6 +162,23 @@ pub mod memmgr_labels
     /// it had issued to that token, runs coalescing, and clears the
     /// per-process record. Idempotent on unknown tokens.
     pub const PROCESS_DIED: u64 = 4;
+    /// Permanently transfer a Frame cap into memmgr's pool.
+    ///
+    /// Used by init and procmgr to return boot-module Frame caps after the
+    /// loader has copied the ELF contents into the target process's
+    /// `AddressSpace`. The transferred cap (`caps[0]`) becomes part of
+    /// memmgr's free pool; subsequent `REQUEST_FRAMES` callers may receive
+    /// pages derived from it.
+    ///
+    /// Wire format:
+    /// * `caps[0]` — the Frame cap to transfer (must carry `Rights::RETYPE`).
+    ///
+    /// memmgr derives `phys_base` and `size` from the cap itself via
+    /// `cap_info`, so no caller-side bookkeeping is required. Reply is
+    /// `memmgr_errors::SUCCESS` on ingestion, `INVALID_ARGUMENT` if the
+    /// cap is missing RETYPE or the pool is full (cap is dropped on
+    /// reject).
+    pub const DONATE_FRAMES: u64 = 5;
 
     /// `REQUEST_FRAMES` flag: reply MUST contain exactly one Frame cap
     /// covering all `want_pages`, or fail with

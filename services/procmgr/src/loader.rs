@@ -23,6 +23,10 @@ pub struct ScratchMapping
     range: Option<ReservedRange>,
     self_aspace: u32,
     pages: u64,
+    /// Optional Frame cap slot to `cap_delete` on drop. Used when the
+    /// caller derived a temporary read-only cap solely for this mapping
+    /// (see [`map_module`]).
+    owns_cap: u32,
 }
 
 impl ScratchMapping
@@ -43,6 +47,7 @@ impl ScratchMapping
             range: Some(range),
             self_aspace,
             pages,
+            owns_cap: 0,
         })
     }
 
@@ -53,6 +58,13 @@ impl ScratchMapping
         self.range
             .as_ref()
             .map_or(0, std::os::seraph::ReservedRange::va_start)
+    }
+
+    /// Transfer ownership of `cap_slot` to this mapping; the slot is
+    /// `cap_delete`d when the mapping is dropped.
+    pub fn set_owns_cap(&mut self, cap_slot: u32)
+    {
+        self.owns_cap = cap_slot;
     }
 }
 
@@ -66,6 +78,11 @@ impl Drop for ScratchMapping
             let _ = syscall::mem_unmap(self.self_aspace, va, self.pages);
             unreserve_pages(range);
         }
+        if self.owns_cap != 0
+        {
+            let _ = syscall::cap_delete(self.owns_cap);
+            self.owns_cap = 0;
+        }
     }
 }
 
@@ -74,18 +91,28 @@ impl Drop for ScratchMapping
 /// Starts from 128 pages and decrements until the mapping succeeds. The
 /// returned [`ScratchMapping`] owns the reservation; dropping it unmaps
 /// and releases the VA.
+///
+/// Module Frame caps now carry full rights so they can flow through the
+/// donation chain into memmgr's pool. We derive a read-only child cap for
+/// the load-time mapping; otherwise `mem_map`'s derive-from-cap path
+/// produces a writable+executable mapping that violates W^X. The derived
+/// cap is owned by the returned [`ScratchMapping`] and dropped alongside
+/// the unmap.
 pub fn map_module(module_frame_cap: u32, self_aspace: u32) -> Option<(ScratchMapping, u64)>
 {
+    let module_ro = syscall::cap_derive(module_frame_cap, syscall::RIGHTS_MAP_READ).ok()?;
     let mut pages: u64 = 128;
     while pages > 0
     {
-        if let Some(scratch) =
-            ScratchMapping::map(self_aspace, module_frame_cap, pages, syscall::MAP_READONLY)
+        if let Some(mut scratch) =
+            ScratchMapping::map(self_aspace, module_ro, pages, syscall::MAP_READONLY)
         {
+            scratch.set_owns_cap(module_ro);
             return Some((scratch, pages));
         }
         pages -= 1;
     }
+    let _ = syscall::cap_delete(module_ro);
     None
 }
 

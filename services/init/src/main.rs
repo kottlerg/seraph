@@ -18,6 +18,77 @@
 
 use core::panic::PanicInfo;
 
+/// Tiny `fmt::Write` adapter into a fixed byte slice. Truncates silently if
+/// the formatted output exceeds the slice. UTF-8 by construction (the
+/// formatter only emits valid UTF-8).
+struct SliceWriter<'a>
+{
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> SliceWriter<'a>
+{
+    fn new(buf: &'a mut [u8]) -> Self
+    {
+        Self { buf, len: 0 }
+    }
+
+    fn as_slice(&self) -> &[u8]
+    {
+        &self.buf[..self.len]
+    }
+}
+
+impl core::fmt::Write for SliceWriter<'_>
+{
+    fn write_str(&mut self, s: &str) -> core::fmt::Result
+    {
+        let bytes = s.as_bytes();
+        let cap = self.buf.len() - self.len;
+        let n = bytes.len().min(cap);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// Issue a no-cap `DONATE_FRAMES` to memmgr to read back the cumulative
+/// page-reclaim total (memmgr returns it in `word(2)` of every reply),
+/// then log a single line tagged with `phase`. Silent on any failure
+/// (memmgr unreachable, derive failure) — this is a diagnostic, not a
+/// correctness path.
+fn log_reclaim_total(memmgr_service_ep: u32, ipc_buf: *mut u64, phase: &str)
+{
+    use ipc::IpcMessage;
+    use ipc::memmgr_labels;
+
+    let Ok(probe_send) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_SEND)
+    else
+    {
+        return;
+    };
+    let msg = IpcMessage::new(memmgr_labels::DONATE_FRAMES);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if let Ok(reply) = unsafe { ipc::ipc_call(probe_send, &msg, ipc_buf) }
+    {
+        let total_pages = reply.word(2);
+        let mut buf = [0u8; 96];
+        let mut w = SliceWriter::new(&mut buf);
+        let _ = core::fmt::write(
+            &mut w,
+            format_args!(
+                "{phase} reclaim total: {total_pages} pages = {} KiB",
+                total_pages * 4,
+            ),
+        );
+        // SAFETY: SliceWriter only writes UTF-8 bytes from `core::fmt::write`.
+        let s = unsafe { core::str::from_utf8_unchecked(w.as_slice()) };
+        logging::log(s);
+    }
+    let _ = syscall::cap_delete(probe_send);
+}
+
 use init_protocol::{CapDescriptor, CapType, INIT_INFO_MAX_PAGES, INIT_PROTOCOL_VERSION, InitInfo};
 
 mod arch;
@@ -532,6 +603,55 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     }
 
+    // Donate the two self-loaded boot-module Frame caps (memmgr's and
+    // procmgr's ELFs) to memmgr's pool. Init has already finished
+    // ELF-loading both, so the source pages can flow back to userspace.
+    // memmgr is in its dispatch loop (its bootstrap completed above);
+    // any IPC sent now is queued and handled before procmgr's later
+    // REGISTER_PROCESS arrives.
+    {
+        use ipc::IpcMessage;
+        use ipc::memmgr_labels;
+
+        let memmgr_module_cap = info.module_frame_base + memmgr_module_idx;
+        let procmgr_module_cap = info.module_frame_base; // module 0
+        let Ok(donate_send) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_SEND_GRANT)
+        else
+        {
+            logging::log("FATAL: cannot derive donate-SEND cap on memmgr endpoint");
+            syscall::thread_exit();
+        };
+        let mut pages_donated: u64 = 0;
+        let mut last_total: u64 = 0;
+        for module_cap in [memmgr_module_cap, procmgr_module_cap]
+        {
+            let msg = IpcMessage::builder(memmgr_labels::DONATE_FRAMES)
+                .cap(module_cap)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer page; donate_send
+            // is a SEND_GRANT cap on memmgr's endpoint.
+            if let Ok(reply) = unsafe { ipc::ipc_call(donate_send, &msg, ipc_buf) }
+            {
+                pages_donated = pages_donated.saturating_add(reply.word(1));
+                last_total = reply.word(2);
+            }
+        }
+        let _ = syscall::cap_delete(donate_send);
+        let mut buf = [0u8; 96];
+        let mut w = SliceWriter::new(&mut buf);
+        let _ = core::fmt::write(
+            &mut w,
+            format_args!(
+                "donated boot modules: {pages_donated} pages = {} KiB (memmgr pool reclaim \
+                 total: {last_total} pages)",
+                pages_donated * 4,
+            ),
+        );
+        // SAFETY: SliceWriter only writes UTF-8 bytes from `core::fmt::write`.
+        let s = unsafe { core::str::from_utf8_unchecked(w.as_slice()) };
+        logging::log(s);
+    }
+
     // Memmgr is now ingesting; start procmgr.
     bootstrap::start_procmgr(&pm);
 
@@ -622,6 +742,10 @@ fn run(info_ptr: u64) -> !
         logging::log("no vfsd module available");
     }
 
+    // Re-probe memmgr's running donation counter so procmgr's per-spawn
+    // donations (devmgr, vfsd modules) become visible.
+    log_reclaim_total(memmgr_service_ep, ipc_buf, "phase 1");
+
     logging::log("phase 1 bootstrap complete");
 
     // ── Phase 2: mount root filesystem ──────────────────────────────────────
@@ -687,6 +811,8 @@ fn run(info_ptr: u64) -> !
     {
         logging::log("phase 2: boot.conf read FAILED");
     }
+
+    log_reclaim_total(memmgr_service_ep, ipc_buf, "phase 2");
 
     logging::log("phase 2 bootstrap complete");
 

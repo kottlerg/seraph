@@ -2032,7 +2032,7 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use syscall::{
         CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
         CAP_INFO_CSPACE_USED, CAP_INFO_FRAME_AVAILABLE, CAP_INFO_FRAME_HAS_RETYPE,
-        CAP_INFO_FRAME_SIZE, CAP_INFO_TAG_RIGHTS,
+        CAP_INFO_FRAME_PHYS_BASE, CAP_INFO_FRAME_SIZE, CAP_INFO_TAG_RIGHTS,
     };
 
     use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, FrameObject};
@@ -2109,6 +2109,17 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 return Err(SyscallError::InvalidArgument);
             }
             Ok(u64::from(rights.contains(Rights::RETYPE)))
+        }
+        CAP_INFO_FRAME_PHYS_BASE =>
+        {
+            if tag != CapTag::Frame
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed Frame.
+            #[allow(clippy::cast_ptr_alignment)]
+            let frame = unsafe { &*(obj.as_ptr().cast::<FrameObject>()) };
+            Ok(frame.base)
         }
         CAP_INFO_ASPACE_PT_BUDGET =>
         {

@@ -230,6 +230,14 @@ pub const CAP_INFO_CSPACE_USED: u64 = 6;
 /// Returns the current value of `CSpaceKernelObject::cspace_growth_budget_bytes`.
 /// Calling on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_CSPACE_BUDGET: u64 = 7;
+
+/// `Frame` only — physical base address of the frame region.
+///
+/// Returns `FrameObject::base`. Calling on a non-Frame slot returns
+/// [`SyscallError::InvalidArgument`]. Used by memmgr to track contiguity
+/// when ingesting Frame caps it did not itself mint (e.g., boot-module
+/// caps donated through `memmgr_labels::DONATE_FRAMES`).
+pub const CAP_INFO_FRAME_PHYS_BASE: u64 = 8;
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;
 /// Thread: set CPU affinity.

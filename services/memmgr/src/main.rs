@@ -836,6 +836,101 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
+fn handle_donate_frames(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    // Caller (init or procmgr) is permanently transferring boot-module
+    // Frame caps into memmgr's pool after loading the ELF contents. Each
+    // donated cap must carry RETYPE so memmgr's downstream `cap_derive`
+    // calls produce caps that consumers can retype into kernel objects.
+    //
+    // We trust the caller (single-tenant userspace; donation is gated by
+    // possessing a memmgr SEND cap, which only init and procmgr hold) but
+    // still validate the cap shape via `cap_info` — a malformed cap from
+    // a buggy loader should reject, not poison the pool.
+    let pool = pool_mut();
+    let mut accepted_caps: u32 = 0;
+    let mut accepted_pages: u64 = 0;
+    for &slot in req.caps()
+    {
+        // Required: Frame tag implied by FRAME_SIZE selector returning Ok.
+        // Required: RETYPE rights so derived caps can retype.
+        // Required: contiguous run (we read the whole cap as one run).
+        let Ok(packed) = syscall::cap_info(slot, syscall::CAP_INFO_TAG_RIGHTS)
+        else
+        {
+            let _ = syscall::cap_delete(slot);
+            continue;
+        };
+        if packed & syscall::RIGHTS_RETYPE == 0
+        {
+            let _ = syscall::cap_delete(slot);
+            continue;
+        }
+        let Ok(size_bytes) = syscall::cap_info(slot, syscall::CAP_INFO_FRAME_SIZE)
+        else
+        {
+            let _ = syscall::cap_delete(slot);
+            continue;
+        };
+        let Ok(phys_base) = syscall::cap_info(slot, syscall::CAP_INFO_FRAME_PHYS_BASE)
+        else
+        {
+            let _ = syscall::cap_delete(slot);
+            continue;
+        };
+        // cast_possible_truncation: page_count fits u32 for any single
+        // run we accept (4 GiB max ≈ 1M pages, well under u32::MAX).
+        #[allow(clippy::cast_possible_truncation)]
+        let page_count = (size_bytes / 4096) as u32;
+        if pool
+            .push(FreeRun {
+                cap_slot: slot,
+                page_count,
+                phys_base,
+            })
+            .is_err()
+        {
+            // Pool full: cap stays in memmgr's CSpace, leaking until
+            // shutdown. Bumping MAX_FREE_RUNS is the long-term fix.
+            continue;
+        }
+        accepted_caps += 1;
+        accepted_pages += u64::from(page_count);
+        donated_pages_total_add(u64::from(page_count));
+    }
+    if accepted_caps > 0
+    {
+        pool.coalesce();
+    }
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, u64::from(accepted_caps))
+        .word(1, accepted_pages)
+        .word(2, donated_pages_total())
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Cumulative count of pages reclaimed via `DONATE_FRAMES` since boot.
+/// Surfaced in the `DONATE_FRAMES` reply (`word(2)`) so callers can log
+/// running totals without separate IPC. Single-threaded memmgr — plain
+/// static suffices.
+static mut DONATED_PAGES_TOTAL: u64 = 0;
+
+fn donated_pages_total() -> u64
+{
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    unsafe { DONATED_PAGES_TOTAL }
+}
+
+fn donated_pages_total_add(pages: u64)
+{
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    unsafe {
+        DONATED_PAGES_TOTAL = DONATED_PAGES_TOTAL.saturating_add(pages);
+    }
+}
+
 // ── Reply helpers ────────────────────────────────────────────────────────────
 
 fn reply_label(ipc_buf: *mut u64, label: u64)
@@ -908,6 +1003,10 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         memmgr_labels::PROCESS_DIED =>
         {
             handle_process_died(req, ipc_buf, boot.procmgr_token);
+        }
+        memmgr_labels::DONATE_FRAMES =>
+        {
+            handle_donate_frames(req, ipc_buf);
         }
         _ =>
         {

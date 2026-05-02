@@ -231,6 +231,32 @@ pub fn register_with_memmgr(memmgr_ep: u32, ipc_buf: *mut u64) -> (u32, u64)
     (cap, token)
 }
 
+/// Permanently transfer a boot-module Frame cap into memmgr's pool via
+/// `DONATE_FRAMES`. Returns true on success (cap left procmgr's `CSpace`),
+/// false on any failure (caller should `cap_delete` to drop the slot).
+///
+/// Used after `CREATE_PROCESS` completes its ELF load: the source pages
+/// are no longer referenced by procmgr, and routing them through memmgr
+/// (rather than dropping the cap) returns the bytes to userspace.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn donate_module_cap(memmgr_ep: u32, module_cap: u32, ipc_buf: *mut u64) -> bool
+{
+    if memmgr_ep == 0
+    {
+        return false;
+    }
+    let msg = IpcMessage::builder(memmgr_labels::DONATE_FRAMES)
+        .cap(module_cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) })
+    else
+    {
+        return false;
+    };
+    reply.label == memmgr_errors::SUCCESS && reply.word(0) >= 1
+}
+
 /// Allocate exactly one page from memmgr. Returns the cap slot of the
 /// (single-page) Frame in procmgr's `CSpace`, or zero on any failure
 /// (memmgr not wired, OOM, derive failure). Caller is responsible for
@@ -650,14 +676,17 @@ fn handle_create(
         let _ = syscall::cap_delete(memmgr_send);
     }
 
-    // Transferred caps (`module_cap`, `creator_ep`) entered procmgr's
-    // CSpace via `ipc_recv` and were either cap_copy'd into the child's
-    // CSpace or consumed only for the ELF-load scratch map. procmgr has
-    // no further use for any of them; drop them so their underlying
-    // object refcounts decrement and — once the child dies — the module
-    // Frame (cap_copy descendants in the child's CSpace) can free its
-    // backing memory. Idempotent on zero slots.
-    let _ = syscall::cap_delete(module_cap);
+    // Donate the module Frame cap to memmgr's pool: the loader has
+    // copied the ELF contents into the child's AddressSpace and procmgr
+    // has no further use for the source pages. The cap moves through
+    // single-owner-chain semantics — procmgr → memmgr — so memmgr
+    // receives exclusive ownership and can derive child caps from it
+    // for future `REQUEST_FRAMES` consumers. On failure (memmgr not
+    // reachable, pool full) the cap is delete-dropped as the safety net.
+    if module_cap != 0 && !donate_module_cap(ctx.memmgr_ep, module_cap, ipc_buf)
+    {
+        let _ = syscall::cap_delete(module_cap);
+    }
     if creator_ep != 0
     {
         let _ = syscall::cap_delete(creator_ep);

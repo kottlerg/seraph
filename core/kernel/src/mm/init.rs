@@ -24,6 +24,53 @@ use super::buddy::{BuddyAllocator, PAGE_SIZE};
 
 use crate::kprintln;
 
+/// Lowest and highest physical addresses among entries that represent
+/// actual DRAM (`Usable`, `Loaded`, `AcpiReclaimable`, `Persistent`).
+/// A `Reserved` entry whose range falls entirely outside
+/// `[dram_bottom, dram_top)` is an address-space window
+/// (`PCIe MMCFG` / `LAPIC` above DRAM on x86-64,
+/// `PLIC` / `CLINT` below DRAM on riscv64-virt), not RAM.
+/// Returns `(0, 0)` if no DRAM-typed entries exist.
+fn compute_dram_bounds(entries: &[boot_protocol::MemoryMapEntry]) -> (u64, u64)
+{
+    let mut dram_bottom: u64 = u64::MAX;
+    let mut dram_top: u64 = 0;
+    for entry in entries
+    {
+        if entry.size == 0
+        {
+            continue;
+        }
+        if matches!(
+            entry.memory_type,
+            MemoryType::Usable
+                | MemoryType::Loaded
+                | MemoryType::AcpiReclaimable
+                | MemoryType::Persistent
+        )
+        {
+            let start = entry.physical_base;
+            let end = start + entry.size;
+            if start < dram_bottom
+            {
+                dram_bottom = start;
+            }
+            if end > dram_top
+            {
+                dram_top = end;
+            }
+        }
+    }
+    if dram_top == 0
+    {
+        (0, 0)
+    }
+    else
+    {
+        (dram_bottom, dram_top)
+    }
+}
+
 /// Print one merged memory map line.
 fn print_memory_line(idx: usize, start: u64, end: u64, ty: MemoryType)
 {
@@ -58,7 +105,13 @@ pub fn print_memory_map(info: &BootInfo)
     };
 
     let mut usable_bytes: u64 = 0;
-    let mut total_bytes: u64 = 0;
+    let mut loaded_bytes: u64 = 0;
+    let mut reserved_bytes: u64 = 0;
+    let mut acpi_bytes: u64 = 0;
+    let mut persistent_bytes: u64 = 0;
+
+    let (dram_bottom, dram_top) = compute_dram_bounds(entries);
+    let mut mmio_bytes: u64 = 0;
 
     // Merge contiguous entries of the same type to reduce output volume.
     // Track current run; emit when type changes or a gap appears.
@@ -77,10 +130,28 @@ pub fn print_memory_map(info: &BootInfo)
         let start = entry.physical_base;
         let end = start + entry.size;
 
-        total_bytes = total_bytes.saturating_add(entry.size);
-        if entry.memory_type == MemoryType::Usable
+        match entry.memory_type
         {
-            usable_bytes = usable_bytes.saturating_add(entry.size);
+            MemoryType::Usable => usable_bytes = usable_bytes.saturating_add(entry.size),
+            MemoryType::Loaded => loaded_bytes = loaded_bytes.saturating_add(entry.size),
+            MemoryType::Reserved =>
+            {
+                let entry_end = entry.physical_base + entry.size;
+                let outside_dram = entry.physical_base >= dram_top || entry_end <= dram_bottom;
+                if outside_dram
+                {
+                    mmio_bytes = mmio_bytes.saturating_add(entry.size);
+                }
+                else
+                {
+                    reserved_bytes = reserved_bytes.saturating_add(entry.size);
+                }
+            }
+            MemoryType::AcpiReclaimable => acpi_bytes = acpi_bytes.saturating_add(entry.size),
+            MemoryType::Persistent =>
+            {
+                persistent_bytes = persistent_bytes.saturating_add(entry.size);
+            }
         }
 
         if let Some(rt) = run_type
@@ -108,9 +179,69 @@ pub fn print_memory_map(info: &BootInfo)
         print_memory_line(line_idx, run_start, run_end, rt);
     }
 
-    let usable_mib = usable_bytes / (1024 * 1024);
-    let total_mib = total_bytes / (1024 * 1024);
-    kprintln!("RAM: {} MiB usable ({} MiB total)", usable_mib, total_mib);
+    // The bootloader-supplied map contains both DRAM regions and address-
+    // space windows that the firmware reports as `Reserved` (PCIe MMCFG,
+    // LAPIC, etc.). The latter are not memory; they are split off as
+    // `mmio` here so the DRAM sum is accurate.
+    let dram_total_bytes =
+        usable_bytes + loaded_bytes + reserved_bytes + acpi_bytes + persistent_bytes;
+    let (dram_v, dram_u) = scaled_unit(dram_total_bytes);
+    let (use_v, use_u) = scaled_unit(usable_bytes);
+    let (lod_v, lod_u) = scaled_unit(loaded_bytes);
+    let (res_v, res_u) = scaled_unit(reserved_bytes);
+    let (acp_v, acp_u) = scaled_unit(acpi_bytes);
+    kprintln!(
+        "RAM: {} {} DRAM = usable {} {} + loaded {} {} + firmware-reserved {} {} + \
+         acpi-reclaimable {} {}",
+        dram_v,
+        dram_u,
+        use_v,
+        use_u,
+        lod_v,
+        lod_u,
+        res_v,
+        res_u,
+        acp_v,
+        acp_u,
+    );
+    if persistent_bytes > 0
+    {
+        let (per_v, per_u) = scaled_unit(persistent_bytes);
+        kprintln!("RAM: persistent {} {}", per_v, per_u);
+    }
+    if mmio_bytes > 0
+    {
+        let (mm_v, mm_u) = scaled_unit(mmio_bytes);
+        kprintln!(
+            "MMIO: {} {} address-space windows outside DRAM (PCIe MMCFG / LAPIC / PLIC / CLINT \
+             / etc. — not RAM)",
+            mm_v,
+            mm_u,
+        );
+    }
+}
+
+/// Pick the largest base-1024 unit (`KiB`, `MiB`, `GiB`) such that the
+/// scaled value is at least 1, returning `(value, "unit")`. Sub-KiB
+/// inputs round to zero KiB rather than displaying bytes — boot-time
+/// memory totals are never that small in practice.
+fn scaled_unit(bytes: u64) -> (u64, &'static str)
+{
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB
+    {
+        (bytes / GIB, "GiB")
+    }
+    else if bytes >= MIB
+    {
+        (bytes / MIB, "MiB")
+    }
+    else
+    {
+        (bytes / KIB, "KiB")
+    }
 }
 
 /// Return a human-readable name for a [`MemoryType`] variant.

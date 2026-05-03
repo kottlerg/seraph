@@ -599,6 +599,10 @@ fn populate_child_info(
 
     let pi_ro = syscall::cap_derive(pi_frame, syscall::RIGHTS_MAP_READ).ok()?;
     syscall::mem_map(pi_ro, child_aspace, PROCESS_INFO_VADDR, 0, 1, 0).ok()?;
+    // pi_frame stays in procmgr's CSpace as the teardown handle (revoke
+    // cascades to any descendants); the mapping doesn't need pi_ro to
+    // outlive this call.
+    let _ = syscall::cap_delete(pi_ro);
 
     Some(pi_frame)
 }
@@ -682,6 +686,8 @@ fn finalize_main_tls(alloc: MainTlsAlloc, _self_aspace: u32, child_aspace: u32) 
 
     let tls_rw = syscall::cap_derive(alloc.frame_cap, syscall::RIGHTS_MAP_RW).ok()?;
     syscall::mem_map(tls_rw, child_aspace, PROCESS_MAIN_TLS_VADDR, 0, 1, 0).ok()?;
+    // alloc.frame_cap stays as the teardown handle; tls_rw is transient.
+    let _ = syscall::cap_delete(tls_rw);
 
     Some(MainTls {
         frame_cap: alloc.frame_cap,
@@ -802,11 +808,17 @@ fn map_child_stack_and_ipc(
             0,
         )
         .ok()?;
+        // Drop procmgr's transient slots; mapping owns no cap-refcount and
+        // memmgr's outer pins the frame until PROCESS_DIED.
+        let _ = syscall::cap_delete(rw);
+        let _ = syscall::cap_delete(frame);
     }
 
     let ipc_frame = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
     let ipc_rw = syscall::cap_derive(ipc_frame, syscall::RIGHTS_MAP_RW).ok()?;
     syscall::mem_map(ipc_rw, child_aspace, CHILD_IPC_BUF_VA, 0, 1, 0).ok()?;
+    let _ = syscall::cap_delete(ipc_rw);
+    let _ = syscall::cap_delete(ipc_frame);
 
     Some(())
 }
@@ -1184,6 +1196,10 @@ fn load_elf_page_streaming(
     let derived = loader::derive_frame_for_prot(frame_cap, prot)?;
     syscall::mem_map(derived, ctx.child_aspace, page_vaddr, 0, 1, 0).ok()?;
 
+    // See `loader::load_elf_page` for the cap-refcount story.
+    let _ = syscall::cap_delete(derived);
+    let _ = syscall::cap_delete(frame_cap);
+
     Some(())
 }
 
@@ -1438,9 +1454,10 @@ pub fn create_process_from_vfs(
 
     // Done with the header page; subsequent VFS reads operate against
     // their own scratch reservations, so it is safe to release the header
-    // mapping now. The frame itself stays attributed to the child's memmgr
-    // record and is reclaimed via PROCESS_DIED at child exit.
+    // mapping now. The frame itself is purely scratch — drop procmgr's slot
+    // and let memmgr's outer / auto-reclaim recycle the underlying page.
     drop(hdr_scratch);
+    let _ = syscall::cap_delete(hdr_frame);
 
     let main_tls = if let Some(seg) = tls_seg
         && tls_template.memsz != 0

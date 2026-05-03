@@ -164,6 +164,12 @@ pub fn load_elf_page(
     let derived = derive_frame_for_prot(frame_cap, prot)?;
     syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0).ok()?;
 
+    // The mapping owns no cap-refcount on the underlying FrameObject; memmgr's
+    // outer keeps it alive until PROCESS_DIED. Drop procmgr's transient slots
+    // so they don't accumulate across an unbounded create/destroy loop.
+    let _ = syscall::cap_delete(derived);
+    let _ = syscall::cap_delete(frame_cap);
+
     Some(())
 }
 

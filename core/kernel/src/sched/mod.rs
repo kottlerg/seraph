@@ -125,7 +125,8 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 
 // ── Reschedule-pending flag ──────────────────────────────────────────────────
 
-/// Per-CPU reschedule-pending bitmask.
+/// Per-CPU reschedule-pending bitmask, sized to support up to `MAX_CPUS`
+/// CPUs as a vector of `AtomicU64` words.
 ///
 /// Load-bearing for the idle-wake primitive. Set producer-side in
 /// `enqueue_and_wake` before the wake signal (IPI) is sent. Consumed by the
@@ -145,7 +146,9 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 ///
 /// Arch-uniform. On RISC-V the IPI handler does **not** set this flag; the
 /// producer does. On x86-64 the same contract holds.
-static RESCHEDULE_PENDING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const RESCHEDULE_WORDS: usize = MAX_CPUS.div_ceil(64);
+static RESCHEDULE_PENDING: [core::sync::atomic::AtomicU64; RESCHEDULE_WORDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; RESCHEDULE_WORDS];
 
 /// Set the reschedule-pending bit for `cpu` (producer side).
 ///
@@ -154,8 +157,9 @@ static RESCHEDULE_PENDING: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// `take_reschedule_pending`.
 pub fn set_reschedule_pending_for(cpu: usize)
 {
-    let bit = 1u64 << cpu;
-    RESCHEDULE_PENDING.fetch_or(bit, core::sync::atomic::Ordering::Release);
+    let word = cpu / 64;
+    let bit = 1u64 << (cpu % 64);
+    RESCHEDULE_PENDING[word].fetch_or(bit, core::sync::atomic::Ordering::Release);
 }
 
 /// Check and clear the reschedule-pending flag for a CPU.
@@ -164,8 +168,9 @@ pub fn set_reschedule_pending_for(cpu: usize)
 /// `AcqRel`: Acquire side pairs with Release in `set_reschedule_pending_for`.
 pub fn take_reschedule_pending(cpu: usize) -> bool
 {
-    let bit = 1u64 << cpu;
-    RESCHEDULE_PENDING.fetch_and(!bit, core::sync::atomic::Ordering::AcqRel) & bit != 0
+    let word = cpu / 64;
+    let bit = 1u64 << (cpu % 64);
+    RESCHEDULE_PENDING[word].fetch_and(!bit, core::sync::atomic::Ordering::AcqRel) & bit != 0
 }
 
 // ── Softlockup watchdog ──────────────────────────────────────────────────────

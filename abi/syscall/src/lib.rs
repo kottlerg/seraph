@@ -342,6 +342,14 @@ pub const MSG_CAP_SLOTS_MAX: usize = 4;
 /// Words beyond this limit require an IPC buffer in shared memory.
 pub const MSG_REGS_DATA_MAX: usize = 6;
 
+/// Synthetic reply label written to the caller's IPC message by the kernel
+/// when `SYS_IPC_REPLY` rejects the server's reply before delivery
+/// (caller's `CSpace` cannot accept reply caps, server cap-slot lookup
+/// failed, malformed IPC buffer, etc.). The caller un-parks with this
+/// label so it can surface a graceful failure instead of dead-locking.
+/// Reserved by the kernel; servers must not produce this label themselves.
+pub const IPC_REPLY_TRANSFER_FAILED: u64 = u64::MAX;
+
 // ── Mapping protection bits ──────────────────────────────────────────────────
 
 /// Mapping protection: writable. Bit 1, matching the kernel `Rights::WRITE` layout.

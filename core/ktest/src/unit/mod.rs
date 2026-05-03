@@ -309,8 +309,8 @@ pub fn run_all(ctx: &TestContext)
         ipc::recv_snapshot_survives_buffer_clobber(ctx)
     );
     run_test!(
-        "ipc::reply_oom_keeps_caller_blocked",
-        ipc::reply_oom_keeps_caller_blocked(ctx)
+        "ipc::reply_oom_wakes_caller_with_transfer_failed",
+        ipc::reply_oom_wakes_caller_with_transfer_failed(ctx)
     );
     run_test!(
         "ipc::recv_oom_returns_cleanly",

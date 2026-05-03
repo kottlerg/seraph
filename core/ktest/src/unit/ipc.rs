@@ -777,21 +777,20 @@ fn snapshot_caller_entry(arg: u64) -> !
 
 // ── sys_ipc_reply cap-transfer OOM regression ────────────────────────────────
 
-/// Server's cap-bearing `ipc_reply` to a caller whose `CSpace` is full
-/// must return `OutOfMemory` *and* leave the caller still `BlockedOnReply`,
-/// so that a subsequent no-cap `ipc_reply` from the same server still
-/// resolves the call cleanly.
+/// Server's cap-bearing `ipc_reply` to a caller whose `CSpace` is full must
+/// return `OutOfMemory` *and* wake the caller with the synthetic
+/// [`syscall_abi::IPC_REPLY_TRANSFER_FAILED`] label so it un-parks
+/// gracefully instead of dead-locking. The caller observes the synthetic
+/// label, knows its in-flight call cannot be replied to, and surfaces a
+/// graceful failure to its own caller.
 ///
-/// Without the kernel fix, the first reply runs `endpoint_reply` (which
-/// flips the caller to `Ready` and clears `(*server).reply_tcb`) before
-/// the cap-transfer OOM is caught — wedging the caller in `Ready`/off-
-/// runqueue and leaving the server with no reply target. The second
-/// reply would then see a null `reply_tcb` and return `InvalidCapability`,
-/// and the child's `done` signal would never arrive. With the fix the
-/// caller's `CSpace` is pre-allocated before `endpoint_reply`, so the
-/// first reply fails atomically with no IPC state mutated, and the retry
-/// succeeds.
-pub fn reply_oom_keeps_caller_blocked(ctx: &TestContext) -> TestResult
+/// Without the kernel fix, the failed reply leaves `(*server).reply_tcb`
+/// pointing at the caller and the caller `BlockedOnReply` indefinitely;
+/// any subsequent `ipc_recv` on the server's endpoint overwrites
+/// `reply_tcb` with the next caller, orphaning the original — eventually
+/// every active call chain that touches a cap-replying server collapses
+/// into a system-wide IPC stall.
+pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_frame_base)
         .map_err(|_| "cap_create_endpoint for reply_oom test failed")?;
@@ -852,13 +851,14 @@ pub fn reply_oom_keeps_caller_blocked(ctx: &TestContext) -> TestResult
         return Err("reply_oom: ipc_recv returned wrong label");
     }
 
-    // Try a cap-bearing reply. Child's CSpace is full, so the kernel's
-    // pre_allocate on the caller side must fail before any IPC state
-    // mutates, returning OutOfMemory.
+    // Cap-bearing reply: child's CSpace is full, so the kernel's
+    // pre_allocate on the caller side fails. The kernel returns
+    // OutOfMemory to the server *and* wakes the caller with the synthetic
+    // IPC_REPLY_TRANSFER_FAILED label.
     let cap_reply = IpcMessage::builder(0xBEEF).cap(xfer).build();
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    let first_attempt = unsafe { ipc::ipc_reply(&cap_reply, ctx.ipc_buf) };
-    match first_attempt
+    let attempt = unsafe { ipc::ipc_reply(&cap_reply, ctx.ipc_buf) };
+    match attempt
     {
         Err(code) if code == syscall_abi::SyscallError::OutOfMemory as i64 =>
         {}
@@ -866,17 +866,12 @@ pub fn reply_oom_keeps_caller_blocked(ctx: &TestContext) -> TestResult
         Ok(()) => return Err("reply_oom: cap-bearing reply succeeded unexpectedly"),
     }
 
-    // Retry without caps. The fix guarantees `(*server).reply_tcb` was not
-    // cleared by the failed first attempt, so the child is still
-    // BlockedOnReply and this reply must succeed.
-    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    unsafe { ipc::ipc_reply(&IpcMessage::new(0xBEEF), ctx.ipc_buf) }
-        .map_err(|_| "reply_oom: no-cap retry reply failed")?;
-
+    // The child must have un-parked observing the synthetic transfer-failed
+    // label. It signals 0xFA11 in that case (see reply_oom_caller_entry).
     let done_bits = signal_wait(done).map_err(|_| "signal_wait(done) for reply_oom failed")?;
-    if done_bits != 0xDEAD
+    if done_bits != 0xFA11
     {
-        return Err("reply_oom: child did not see the retry reply");
+        return Err("reply_oom: child did not observe IPC_REPLY_TRANSFER_FAILED");
     }
 
     cap_delete(child_th).ok();
@@ -888,9 +883,10 @@ pub fn reply_oom_keeps_caller_blocked(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Child for `reply_oom_keeps_caller_blocked`: registers IPC buffer, fills
-/// its own `CSpace`, signals readiness, then issues an `ipc_call`. Reports
-/// success when the server's eventual no-cap reply arrives.
+/// Child for `reply_oom_wakes_caller_with_transfer_failed`: registers IPC
+/// buffer, fills its own `CSpace`, signals readiness, then issues an
+/// `ipc_call`. Reports `0xFA11` if the kernel-synthesised
+/// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
 fn reply_oom_caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF) as u32;
@@ -930,7 +926,14 @@ fn reply_oom_caller_entry(arg: u64) -> !
     {
         Ok(msg) =>
         {
-            let bits = if msg.label == 0xBEEF { 0xDEAD } else { 0xBAD };
+            let bits = if msg.label == syscall_abi::IPC_REPLY_TRANSFER_FAILED
+            {
+                0xFA11
+            }
+            else
+            {
+                0xBAD
+            };
             signal_send(done_slot, bits).ok();
         }
         Err(_) =>

@@ -599,6 +599,48 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
+/// On any pre-`endpoint_reply` error in `sys_ipc_reply`, deliver a synthetic
+/// failure reply to the parked caller so it un-parks rather than waiting for
+/// a reply that will never come. Returns the error to bubble back to the
+/// server.
+///
+/// # Safety
+/// `server_tcb` must be a valid TCB pointer; its `reply_tcb` is read and
+/// cleared atomically. If `reply_tcb` is null (caller already cancelled), no
+/// caller-wake is performed.
+#[cfg(not(test))]
+unsafe fn fail_reply_and_wake_caller(
+    server_tcb: *mut crate::sched::thread::ThreadControlBlock,
+    err: SyscallError,
+) -> SyscallError
+{
+    // SAFETY: server_tcb validated by caller; reply_tcb is AtomicPtr.
+    let caller = unsafe {
+        (*server_tcb)
+            .reply_tcb
+            .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel)
+    };
+    if caller.is_null()
+    {
+        return err;
+    }
+    // Compose a failure reply.
+    let mut fail_msg = crate::ipc::message::Message::new(syscall::IPC_REPLY_TRANSFER_FAILED);
+    fail_msg.data_count = 0;
+    fail_msg.cap_count = 0;
+    // SAFETY: caller is the parked TCB; ipc_msg is owned while parked.
+    unsafe {
+        (*caller).ipc_msg = fail_msg;
+    }
+    // SAFETY: caller is a valid parked TCB; enqueue_and_wake transitions to Ready.
+    unsafe {
+        let prio = (*caller).priority;
+        let target_cpu = crate::sched::select_target_cpu(caller);
+        crate::sched::enqueue_and_wake(caller, target_cpu, prio);
+    }
+    err
+}
+
 /// `SYS_IPC_REPLY` (1): reply to a blocked caller.
 ///
 /// arg0 = label, arg1 = `data_count`,
@@ -633,7 +675,11 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: tcb validated above; ipc_buffer is user-mapped or 0.
         let buf = unsafe { (*tcb).ipc_buffer };
         // SAFETY: buf validated by read_ipc_buf.
-        unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }?;
+        if let Err(e) = unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }
+        {
+            // SAFETY: tcb validated above.
+            return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
+        }
     }
 
     // Populate cap_slots (indices in server's CSpace). Pre-validate before reply.
@@ -647,10 +693,20 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let cs = unsafe { &*server_cspace };
             for &idx in indices.iter().take(cap_count)
             {
-                let slot = cs.slot(idx).ok_or(SyscallError::InvalidCapability)?;
+                let Some(slot) = cs.slot(idx)
+                else
+                {
+                    // SAFETY: tcb validated above.
+                    return Err(unsafe {
+                        fail_reply_and_wake_caller(tcb, SyscallError::InvalidCapability)
+                    });
+                };
                 if slot.tag == CapTag::Null
                 {
-                    return Err(SyscallError::InvalidCapability);
+                    // SAFETY: tcb validated above.
+                    return Err(unsafe {
+                        fail_reply_and_wake_caller(tcb, SyscallError::InvalidCapability)
+                    });
                 }
             }
         }
@@ -670,6 +726,7 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let caller_peek = unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
         if caller_peek.is_null()
         {
+            // No parked caller (cancelled by SYS_THREAD_STOP); nothing to wake.
             return Err(SyscallError::InvalidCapability);
         }
         // SAFETY: caller_peek non-null; magic check guards UAF in debug builds.
@@ -678,8 +735,14 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // and never reassigned.
         let caller_cspace = unsafe { (*caller_peek).cspace };
         // SAFETY: caller_cspace extracted from valid TCB.
-        unsafe { (*caller_cspace).pre_allocate(cap_count) }
-            .map_err(|_| SyscallError::OutOfMemory)?;
+        if unsafe { (*caller_cspace).pre_allocate(cap_count) }.is_err()
+        {
+            // Caller's CSpace cannot accept reply caps. Wake the caller with
+            // a synthetic failure reply so it un-parks and surfaces the error
+            // rather than dead-locking; bubble OOM to the server.
+            // SAFETY: tcb validated above.
+            return Err(unsafe { fail_reply_and_wake_caller(tcb, SyscallError::OutOfMemory) });
+        }
     }
 
     // SAFETY: tcb validated above; endpoint_reply operates on reply_tcb field.

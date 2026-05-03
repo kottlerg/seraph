@@ -730,11 +730,15 @@ fn find_or_alloc_slot(
             return i;
         }
     }
-    // Eviction.
+    // Eviction. Clear the prior occupant's name so the new owner does not
+    // inherit it — otherwise unregistered byte writes would render under the
+    // evicted sender's display name.
     let victim = *next_evict % MAX_SENDERS;
     *next_evict = (victim + 1) % MAX_SENDERS;
     slots[victim].token = token;
     slots[victim].used = 0;
+    slots[victim].name = [0u8; MAX_NAME_LEN];
+    slots[victim].name_used = 0;
     victim
 }
 

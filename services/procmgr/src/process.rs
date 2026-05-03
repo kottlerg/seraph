@@ -928,6 +928,7 @@ fn create_process_from_bytes(
     )?;
     let child_aspace =
         syscall::cap_create_aspace(aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
+    let _ = syscall::cap_delete(aspace_slab);
     let cspace_slab = crate::memmgr_alloc_pages_contig(
         universals.memmgr_endpoint,
         crate::CSPACE_RETYPE_PAGES,
@@ -935,12 +936,14 @@ fn create_process_from_bytes(
     )?;
     let child_cspace =
         syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 256).ok()?;
+    let _ = syscall::cap_delete(cspace_slab);
     let thread_slab = crate::memmgr_alloc_pages_contig(
         universals.memmgr_endpoint,
         crate::THREAD_RETYPE_PAGES,
         ipc_buf,
     )?;
     let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace).ok()?;
+    let _ = syscall::cap_delete(thread_slab);
 
     let child_memmgr_send = universals.memmgr_endpoint;
 
@@ -1398,17 +1401,20 @@ pub fn create_process_from_vfs(
             .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let child_aspace = syscall::cap_create_aspace(aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1)
         .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let _ = syscall::cap_delete(aspace_slab);
     let cspace_slab =
         crate::memmgr_alloc_pages_contig(child_memmgr_send, crate::CSPACE_RETYPE_PAGES, ipc_buf)
             .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let child_cspace =
         syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 256)
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let _ = syscall::cap_delete(cspace_slab);
     let thread_slab =
         crate::memmgr_alloc_pages_contig(child_memmgr_send, crate::THREAD_RETYPE_PAGES, ipc_buf)
             .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace)
         .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let _ = syscall::cap_delete(thread_slab);
 
     // Stream each LOAD segment page-by-page from VFS.
     for seg_result in elf::load_segments_metadata(ehdr, header_data, file_size)

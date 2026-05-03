@@ -651,7 +651,21 @@ pub fn retype_free(frame: &FrameObject, offset: u64, bytes: u64)
 
     alloc.lock();
 
-    if let Some(bin) = subpage_bin_for(need)
+    // Bump rollback when the freed block sits at the top of the allocator's
+    // bump frontier: the freed range is contiguous with `bump_offset`, no
+    // live retype lives above it, so we can shrink the bump back to `offset`.
+    // This keeps `sys_frame_split` usable on caps that have been retyped and
+    // then freed — without it, a Frame that was once the source for a
+    // `cap_create_aspace` slab can never again be split into smaller pieces,
+    // even after the AS is dealloc'd. (The allocator's free list still
+    // services future retypes either way; this rollback only affects what
+    // the *split* primitive sees.)
+    let bump = alloc.bump_offset.load(Ordering::Relaxed);
+    if offset + need == bump
+    {
+        alloc.bump_offset.store(offset, Ordering::Release);
+    }
+    else if let Some(bin) = subpage_bin_for(need)
     {
         // SAFETY: lock held; offset is from a prior successful allocation.
         unsafe { push_subpage(alloc, frame, bin, offset) };

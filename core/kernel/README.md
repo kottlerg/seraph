@@ -59,11 +59,9 @@ kernel/
 │   │   ├── event_queue.rs      # Event queue: ring buffer
 │   │   └── wait_set.rs         # Wait set: multi-source aggregation
 │   ├── sched/                  # Scheduler
-│   │   ├── mod.rs
+│   │   ├── mod.rs              # Public API: init, schedule, timer_tick, wake protocol
 │   │   ├── thread.rs           # Thread control block (TCB) definition
-│   │   ├── run_queue.rs        # Per-CPU run queues and priority levels
-│   │   ├── switch.rs           # Context switch coordination
-│   │   └── load_balance.rs     # SMP load balancing and migration
+│   │   └── run_queue.rs        # Per-CPU run queues and priority levels
 │   └── syscall/                # Syscall dispatch
 │       ├── mod.rs              # Dispatch table and entry coordination
 │       ├── ipc.rs              # IPC syscall implementations
@@ -78,7 +76,9 @@ kernel/
     ├── memory-internals.md     # Memory subsystem implementation details
     ├── capability-internals.md # Capability subsystem implementation details
     ├── ipc-internals.md        # IPC subsystem implementation details
-    └── scheduler.md            # Scheduler internals and algorithms
+    ├── scheduler.md                  # Scheduler internals and algorithms
+    ├── scheduling-internals.md       # SMP locking, wake protocol, IPI taxonomy, BSP boot transient
+    └── thread-lifecycle-and-sleep.md # Lifecycle syscalls, sleep list, dealloc drain protocol
 ```
 
 ---
@@ -115,8 +115,13 @@ multiplexed waiting. See [`docs/ipc-internals.md`](docs/ipc-internals.md).
 ### `sched/`
 
 The preemptive, priority-based, SMP-aware scheduler. Per-CPU run queues, thread
-control blocks, context switch coordination, and load balancing live here.
-See [`docs/scheduler.md`](docs/scheduler.md).
+control blocks, and context switch coordination live here. See
+[`docs/scheduler.md`](docs/scheduler.md) for the scheduling algorithm,
+[`docs/scheduling-internals.md`](docs/scheduling-internals.md) for the SMP
+locking invariants, wake protocol, IPI taxonomy, and BSP boot transient,
+and [`docs/thread-lifecycle-and-sleep.md`](docs/thread-lifecycle-and-sleep.md)
+for the lifecycle-syscall, sleep-list, and `dealloc_object(Thread)` drain
+protocol.
 
 ### `syscall/`
 

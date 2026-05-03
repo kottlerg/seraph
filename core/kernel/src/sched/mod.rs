@@ -60,58 +60,58 @@ pub const AFFINITY_ANY: u32 = 0xFFFF_FFFF;
 /// reserved high-priority level (31).
 pub const INIT_PRIORITY: u8 = 15;
 
-// ── Global per-CPU scheduler array ────────────────────────────────────────────
+// ── Per-CPU dynamic storage ───────────────────────────────────────────────────
 
-/// One `PerCpuScheduler` per potential CPU.
-///
-/// Indexed by logical CPU ID (0-based). Only entries `0..cpu_count` are
-/// initialised by `init`.
+/// Base pointer for the `[PerCpuScheduler; cpu_count]` array allocated in
+/// [`init_per_cpu_storage`]. Sized at boot from `boot_cpu_count` rather than
+/// statically against `MAX_CPUS`; saves one slab per unused CPU on hosts
+/// where `boot_cpu_count < MAX_CPUS` (the common case).
 ///
 /// # Safety
 /// Each `PerCpuScheduler` is accessed only from its owning CPU. Trap-time
 /// access from the same CPU (timer, IPC wakeup) is serialised by the
 /// scheduler's inner `lock`; see `schedule` for the locking discipline.
-// SAFETY: per-CPU ownership plus per-scheduler lock covers all accesses.
 #[cfg(not(test))]
-static mut SCHEDULERS: [PerCpuScheduler; MAX_CPUS] = {
-    // Manual const-init: PerCpuScheduler is not Copy, so we cannot use
-    // array repeat syntax directly. A const block evaluating to a fixed
-    // 64-element literal is the correct approach until `[expr; N]` with
-    // non-Copy types is stabilised.
-    // declare_interior_mutable_const: S is only used to copy-initialise the static
-    // array below; it is never used as a shared mutable reference.
-    #[allow(clippy::declare_interior_mutable_const)]
-    const S: PerCpuScheduler = PerCpuScheduler::new();
-    [
-        S, S, S, S, S, S, S, S, // 8
-        S, S, S, S, S, S, S, S, // 16
-        S, S, S, S, S, S, S, S, // 24
-        S, S, S, S, S, S, S, S, // 32
-        S, S, S, S, S, S, S, S, // 40
-        S, S, S, S, S, S, S, S, // 48
-        S, S, S, S, S, S, S, S, // 56
-        S, S, S, S, S, S, S, S, // 64
-    ]
-};
+static SCHEDULERS_PTR: core::sync::atomic::AtomicPtr<PerCpuScheduler> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-// ── Idle TCB storage ──────────────────────────────────────────────────────────
-
-/// Per-CPU idle [`ThreadControlBlock`]s, in BSS. Slot `cpu_id` is the
-/// idle thread for that CPU. Initialised in [`init`] by writing through
-/// `MaybeUninit::as_mut_ptr` once per active CPU; uninitialised slots
-/// (CPUs beyond the boot count) stay at `MaybeUninit::uninit()` and are
-/// never accessed.
-///
-/// `static mut` is written only at single-threaded `sched::init` time;
-/// thereafter every TCB pointer is owned by its corresponding
-/// `PerCpuScheduler` and accessed only from that CPU (or via the
-/// scheduler's lock).
+/// Base pointer for the `[MaybeUninit<ThreadControlBlock>; cpu_count]`
+/// array allocated in [`init_per_cpu_storage`]. Slot `cpu_id` is the idle
+/// thread for that CPU; written once during [`init`] then referenced only
+/// via the corresponding `PerCpuScheduler::idle` pointer.
 #[cfg(not(test))]
-static mut IDLE_TCBS: [MaybeUninit<ThreadControlBlock>; MAX_CPUS] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const VACANT: MaybeUninit<ThreadControlBlock> = MaybeUninit::uninit();
-    [VACANT; MAX_CPUS]
-};
+static IDLE_TCBS_PTR: core::sync::atomic::AtomicPtr<MaybeUninit<ThreadControlBlock>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Return the `PerCpuScheduler` pointer for `cpu`. Caller must guarantee
+/// `cpu < CPU_COUNT` and that [`init_per_cpu_storage`] has run.
+#[cfg(not(test))]
+#[inline]
+unsafe fn scheduler_ptr(cpu: usize) -> *mut PerCpuScheduler
+{
+    let base = SCHEDULERS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(
+        !base.is_null(),
+        "scheduler_ptr: SCHEDULERS_PTR not initialised"
+    );
+    // SAFETY: cpu < cpu_count by caller contract; allocation covers cpu_count slots.
+    unsafe { base.add(cpu) }
+}
+
+/// Return the idle-TCB slot pointer for `cpu`. Same contract as
+/// [`scheduler_ptr`].
+#[cfg(not(test))]
+#[inline]
+unsafe fn idle_tcb_ptr(cpu: usize) -> *mut MaybeUninit<ThreadControlBlock>
+{
+    let base = IDLE_TCBS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(
+        !base.is_null(),
+        "idle_tcb_ptr: IDLE_TCBS_PTR not initialised"
+    );
+    // SAFETY: cpu < cpu_count by caller contract; allocation covers cpu_count slots.
+    unsafe { base.add(cpu) }
+}
 
 // ── Thread ID counter ─────────────────────────────────────────────────────────
 
@@ -168,10 +168,185 @@ pub fn take_reschedule_pending(cpu: usize) -> bool
     RESCHEDULE_PENDING.fetch_and(!bit, core::sync::atomic::Ordering::AcqRel) & bit != 0
 }
 
+// ── Softlockup watchdog ──────────────────────────────────────────────────────
+//
+// Detects "every CPU stalled in kernel mode" and dumps per-CPU TCB state.
+// Mechanism, cost, and limitations are specified in
+// docs/scheduling-internals.md § Softlockup Watchdog.
+
+const WATCHDOG_THRESHOLD_TICKS: u64 = 3_000; // ~3 s at the observed ~1 ms BSP tick.
+
+static LAST_NON_IDLE_TICK: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Mark `cpu` as having dispatched a non-idle thread at the current tick.
+pub fn watchdog_mark_non_idle(cpu: usize)
+{
+    let now = WATCHDOG_TICK_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
+    LAST_NON_IDLE_TICK[cpu].store(now, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// BSP-only: tick the global counter; if every CPU's last non-idle
+/// dispatch exceeds the threshold, dump per-CPU TCB state once.
+#[cfg(not(test))]
+#[allow(clippy::too_many_lines)]
+fn watchdog_tick_and_check()
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let now = WATCHDOG_TICK_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+
+    // Only fire once per stall to avoid log flood.
+    if WATCHDOG_FIRED.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+
+    // All CPUs must have last_dispatch older than threshold.
+    // needless_range_loop: parallel scheduler_for(cpu) below.
+    #[allow(clippy::needless_range_loop)]
+    for cpu in 0..cpu_count
+    {
+        let last = LAST_NON_IDLE_TICK[cpu].load(core::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < WATCHDOG_THRESHOLD_TICKS
+        {
+            return;
+        }
+    }
+
+    if WATCHDOG_FIRED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    // Stall detected. Dump per-CPU state.
+    crate::kprintln!("=== WATCHDOG: no non-idle dispatch on any CPU for >3s ===");
+    // needless_range_loop: parallel scheduler_for(cpu) accesses below.
+    #[allow(clippy::needless_range_loop)]
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: scheduler slabs initialised; we only read fields, no writes.
+        let (cur_is_null, tid, state, ipc, blocked_on, prio, pref, last_tick, mask) = unsafe {
+            let s = scheduler_for(cpu);
+            let cur = s.current;
+            let lt = LAST_NON_IDLE_TICK[cpu].load(core::sync::atomic::Ordering::Relaxed);
+            if cur.is_null()
+            {
+                (
+                    true,
+                    0u32,
+                    thread::ThreadState::Created,
+                    thread::IpcThreadState::None,
+                    core::ptr::null::<u8>(),
+                    0u8,
+                    0u32,
+                    lt,
+                    0u32,
+                )
+            }
+            else
+            {
+                (
+                    false,
+                    (*cur).thread_id,
+                    (*cur).state,
+                    (*cur).ipc_state,
+                    (*cur).blocked_on_object.cast_const(),
+                    (*cur).priority,
+                    (*cur).preferred_cpu,
+                    lt,
+                    (*scheduler_ptr(cpu)).non_empty_mask(),
+                )
+            }
+        };
+        if cur_is_null
+        {
+            crate::kprintln!(
+                "  cpu{} current=NULL last_tick={} now={}",
+                cpu,
+                last_tick,
+                now
+            );
+            continue;
+        }
+        crate::kprintln!(
+            "  cpu{} tid{} state={:?} ipc={:?} blocked_on={:p} prio={} pref={} \
+             idle_age={} mask=0x{:x}",
+            cpu,
+            tid,
+            state,
+            ipc,
+            blocked_on,
+            prio,
+            pref,
+            now.saturating_sub(last_tick),
+            mask
+        );
+    }
+    // Dump sleep list.
+    // SAFETY: read-only; SLEEP_LIST_LOCK protects writers.
+    let n = unsafe {
+        let saved = SLEEP_LIST_LOCK.lock_raw();
+        let count = SLEEP_COUNT;
+        SLEEP_LIST_LOCK.unlock_raw(saved);
+        count
+    };
+    crate::kprintln!("  SLEEP_LIST count={}", n);
+    // needless_range_loop: SLEEP_LIST is a static; iter().enumerate() obscures.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..n.min(8)
+    {
+        // SAFETY: read-only snapshot; benign racy load — we're already in stall.
+        let (tid, state, ipc, dl) = unsafe {
+            let t = SLEEP_LIST[i];
+            if t.is_null()
+            {
+                continue;
+            }
+            (
+                (*t).thread_id,
+                (*t).state,
+                (*t).ipc_state,
+                (*t).sleep_deadline,
+            )
+        };
+        crate::kprintln!(
+            "    sleep[{}] tid={} state={:?} ipc={:?} dl={}",
+            i,
+            tid,
+            state,
+            ipc,
+            dl
+        );
+    }
+    crate::kprintln!("=== END WATCHDOG ===");
+}
+
+// ── BSP boot transient ────────────────────────────────────────────────────────
+
+/// Set by `init_storage` (Phase 4), cleared by `sched::enter` (Phase 9).
+/// `timer_tick` returns immediately while set.
+/// See docs/scheduling-internals.md § BSP Boot Transient.
+pub static BOOT_TRANSIENT_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // ── Sleep list ───────────────────────────────────────────────────────────────
 
-/// Maximum number of concurrently sleeping threads.
-const MAX_SLEEPING: usize = 16;
+/// Maximum number of concurrently sleeping threads. Bounds the realistic
+/// envelope at `MAX_CPUS = 64` with a few timed waiters per CPU plus
+/// headroom; `sleep_list_add` returns `Err` past this cap rather than
+/// dropping silently.
+pub const MAX_SLEEPING: usize = 128;
 
 /// Global list of sleeping threads. Protected by its own spinlock.
 ///
@@ -188,26 +363,32 @@ static mut SLEEP_LIST: [*mut ThreadControlBlock; MAX_SLEEPING] =
 #[cfg(not(test))]
 static mut SLEEP_COUNT: usize = 0;
 
-/// Add a thread to the sleep list.
+/// Add a thread to the sleep list. The TCB must already have
+/// `sleep_deadline` set and state = Blocked.
 ///
-/// The thread must already have `sleep_deadline` set and state = Blocked.
+/// Returns `Err(())` at capacity; the caller MUST roll back the park.
+/// See docs/thread-lifecycle-and-sleep.md § Sleep List Invariants.
 #[cfg(not(test))]
-pub fn sleep_list_add(tcb: *mut ThreadControlBlock)
+pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), ()>
 {
     // SAFETY: lock serialises all sleep list access.
     let saved = unsafe { SLEEP_LIST_LOCK.lock_raw() };
     // SAFETY: single-writer access under lock.
-    unsafe {
+    let result = unsafe {
         if SLEEP_COUNT < MAX_SLEEPING
         {
             SLEEP_LIST[SLEEP_COUNT] = tcb;
             SLEEP_COUNT += 1;
+            Ok(())
         }
-        // If list is full, the thread will never wake. This is a bug, but
-        // better than crashing. Log would be nice but we're in a lock.
-    }
+        else
+        {
+            Err(())
+        }
+    };
     // SAFETY: paired with lock_raw above.
     unsafe { SLEEP_LIST_LOCK.unlock_raw(saved) };
+    result
 }
 
 /// Remove a thread from the sleep list if present. Called by `signal_send`
@@ -326,10 +507,10 @@ pub fn sleep_check_wakeups()
                 let we_win = unsafe { (*sig_state).waiter } == tcb;
                 if we_win
                 {
-                    // SAFETY: we hold sig.lock; clear waiter state and
-                    // hand the thread a zero wakeup_value to signal
-                    // "timeout" (`signal_send` rejects zero-bit sends, so
-                    // 0 is unambiguous for signals).
+                    // SAFETY: we hold sig.lock. wakeup_value=0 is the
+                    // timeout marker (signal_send rejects 0-bit sends, so
+                    // 0 is unambiguous). State/ipc_state/blocked_on are
+                    // committed by enqueue_and_wake under sched.lock.
                     unsafe {
                         (*sig_state).waiter = core::ptr::null_mut();
                         (*sig_state).has_observer.store(
@@ -337,10 +518,7 @@ pub fn sleep_check_wakeups()
                             core::sync::atomic::Ordering::Relaxed,
                         );
                         (*tcb).wakeup_value = 0;
-                        (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
-                        (*tcb).blocked_on_object = core::ptr::null_mut();
                         (*tcb).sleep_deadline = 0;
-                        (*tcb).state = ThreadState::Ready;
                     }
                 }
                 // SAFETY: paired with lock_raw above.
@@ -367,18 +545,14 @@ pub fn sleep_check_wakeups()
                 if we_win
                 {
                     // SAFETY: we hold eq.lock. Event payloads can be any
-                    // u64 (including 0), so we use an out-of-band marker
-                    // — `tcb.timed_out` — instead of an in-band sentinel
-                    // on `wakeup_value`. The resuming `sys_event_recv`
-                    // reads-and-clears it.
+                    // u64 (including 0); `timed_out` is the out-of-band
+                    // timeout marker, read-and-cleared by sys_event_recv
+                    // on resume. State/etc. committed by enqueue_and_wake.
                     unsafe {
                         (*eq_state).waiter = core::ptr::null_mut();
                         (*tcb).wakeup_value = 0;
                         (*tcb).timed_out = true;
-                        (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
-                        (*tcb).blocked_on_object = core::ptr::null_mut();
                         (*tcb).sleep_deadline = 0;
-                        (*tcb).state = ThreadState::Ready;
                     }
                 }
                 // SAFETY: paired with lock_raw above.
@@ -392,7 +566,6 @@ pub fn sleep_check_wakeups()
                 // SAFETY: tcb still valid; see above.
                 unsafe {
                     (*tcb).sleep_deadline = 0;
-                    (*tcb).state = ThreadState::Ready;
                 }
                 true
             }
@@ -458,19 +631,16 @@ fn idle_thread_entry(_cpu_id: u64) -> !
                 crate::arch::current::cpu::disable_interrupts();
             }
 
-            // Step 2: mark idle inside the masked region. Advisory —
-            // `CPU_IDLE_MASK` is consulted by `wake_idle_cpu` as an
-            // optimisation hint; correctness does not depend on it.
-            crate::percpu::mark_idle(cpu);
-
-            // Step 3: atomic check of flag + run queue.
+            // Step 2: atomic check of flag + run queue. (The previous
+            // `CPU_IDLE_MASK` advisory was removed alongside the always-IPI
+            // refactor; idle-state is no longer published — the wake protocol
+            // does not consult it. See docs/scheduling-internals.md.)
             let pending = take_reschedule_pending(cpu);
-            // SAFETY: SCHEDULERS[cpu] is initialised for this CPU.
-            let has_work = unsafe { SCHEDULERS[cpu].has_runnable() };
+            // SAFETY: scheduler slot is initialised for this CPU.
+            let has_work = unsafe { (*scheduler_ptr(cpu)).has_runnable() };
 
             if pending || has_work
             {
-                crate::percpu::mark_active(cpu);
                 // SAFETY: paired with the `disable_interrupts` above.
                 unsafe {
                     crate::arch::current::interrupts::enable();
@@ -486,12 +656,11 @@ fn idle_thread_entry(_cpu_id: u64) -> !
                 continue;
             }
 
-            // Step 4: no work and no pending flag → halt. Atomic on both
+            // Step 3: no work and no pending flag → halt. Atomic on both
             // arches: x86 `sti;hlt`, RISC-V `wfi; csrsi sstatus, SIE`.
             // Returns with interrupts enabled; any pending wake interrupt
             // has been recognised.
             halt_until_interrupt();
-            crate::percpu::mark_active(cpu);
         }
 
         // Test mode: no real halt; the primitive is a host-side no-op.
@@ -520,13 +689,14 @@ fn idle_thread_entry(_cpu_id: u64) -> !
 /// # Safety
 /// Must be called exactly once, from the single boot thread, after Phase 3
 /// (page tables active) and Phase 4 (heap active).
-// needless_range_loop: SCHEDULERS is static mut; iter_mut() requires unsafe coercion
-// that is less clear than explicit indexing here.
-#[allow(clippy::needless_range_loop)]
 #[cfg(not(test))]
 pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
 {
-    CPU_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
+    debug_assert_eq!(
+        CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+        cpu_count,
+        "sched::init: storage was not pre-initialised for this cpu_count"
+    );
 
     // Order for KERNEL_STACK_PAGES (4 pages = order 2).
     // 2^order pages >= KERNEL_STACK_PAGES.
@@ -560,13 +730,12 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
             false,
         );
 
-        // Initialise this CPU's idle TCB in place inside [`IDLE_TCBS`].
-        // SAFETY: single-threaded boot init; IDLE_TCBS[cpu] is exclusively
-        // owned by this iteration. The slot is MaybeUninit::uninit until
-        // we write through it.
-        let tcb_slot = unsafe { core::ptr::addr_of_mut!(IDLE_TCBS[cpu]) };
-        // SAFETY: tcb_slot is a valid pointer to MaybeUninit<TCB>; reading
-        // through it produces the slot's `as_mut_ptr` which is valid for write.
+        // Initialise this CPU's idle TCB in place inside the dynamic slab.
+        // SAFETY: single-threaded boot init; the slot for this cpu is
+        // exclusively owned by this iteration. The slab was zero-filled
+        // by init_per_cpu_storage above.
+        let tcb_slot = unsafe { idle_tcb_ptr(cpu) };
+        // SAFETY: tcb_slot is a valid pointer to MaybeUninit<TCB>.
         let tcb = unsafe { (*tcb_slot).as_mut_ptr() };
         // SAFETY: tcb is a valid uninitialized ThreadControlBlock slot.
         unsafe {
@@ -581,7 +750,7 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
                     run_queue_next: None,
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
-                    reply_tcb: core::ptr::null_mut(),
+                    reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     ipc_wait_next: None,
                     is_user: false,
                     saved_state: saved,
@@ -605,16 +774,108 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
         }
 
         // 4. Register in per-CPU scheduler.
-        // SAFETY: single-threaded boot; SCHEDULERS[cpu] is exclusively owned during init.
+        // SAFETY: single-threaded boot; the per-cpu Scheduler slot is
+        // exclusively owned during init.
         unsafe {
+            let s = &mut *scheduler_ptr(cpu);
             // Set CPU ID so the scheduler can index into the global CPU_LOAD array.
-            SCHEDULERS[cpu].cpu_id = cpu;
-            SCHEDULERS[cpu].set_idle(tcb);
-            SCHEDULERS[cpu].set_current(tcb);
+            s.cpu_id = cpu;
+            s.set_idle(tcb);
+            s.set_current(tcb);
         }
     }
 
     cpu_count
+}
+
+/// Allocate the per-CPU storage slabs (schedulers, idle TCBs, x86 AP
+/// TSS/GDT/IST) sized to `cpu_count`, publish `CPU_COUNT`, and arm the BSP
+/// boot transient. Must run before Phase 5 (timer arm) so that the timer
+/// ISR's first read of `SCHEDULERS_PTR` is non-null.
+///
+/// # Panics
+/// Halts via `crate::fatal` on buddy exhaustion.
+///
+/// # Safety
+/// Single-threaded. Must be called exactly once.
+#[cfg(not(test))]
+pub fn init_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
+{
+    debug_assert_eq!(
+        CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+        0,
+        "init_storage: must be called exactly once"
+    );
+    CPU_COUNT.store(cpu_count, core::sync::atomic::Ordering::Relaxed);
+    BOOT_TRANSIENT_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+    init_per_cpu_storage(cpu_count, allocator);
+}
+
+/// Test stub for `init_storage`.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub fn init_storage(cpu_count: u32, allocator: &mut crate::mm::BuddyAllocator) {}
+
+#[cfg(not(test))]
+fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
+{
+    let n = cpu_count as usize;
+
+    // SCHEDULERS slab.
+    let sched_bytes = n * core::mem::size_of::<PerCpuScheduler>();
+    let sched_ptr = alloc_zeroed_slab::<PerCpuScheduler>(sched_bytes, allocator, "SCHEDULERS");
+    // SAFETY: slab covers n * sizeof(PerCpuScheduler) bytes; we initialise
+    // each slot in-place. PerCpuScheduler::new() is const so the writes are
+    // straight stores; the previous zero-fill is overwritten.
+    unsafe {
+        for cpu in 0..n
+        {
+            core::ptr::write(sched_ptr.add(cpu), PerCpuScheduler::new());
+        }
+    }
+    SCHEDULERS_PTR.store(sched_ptr, core::sync::atomic::Ordering::Release);
+
+    // IDLE_TCBS slab — kept as MaybeUninit::uninit equivalent (zeroed by alloc).
+    let tcb_bytes = n * core::mem::size_of::<MaybeUninit<ThreadControlBlock>>();
+    let tcb_ptr =
+        alloc_zeroed_slab::<MaybeUninit<ThreadControlBlock>>(tcb_bytes, allocator, "IDLE_TCBS");
+    IDLE_TCBS_PTR.store(tcb_ptr, core::sync::atomic::Ordering::Release);
+
+    // Arch-specific per-CPU tables. x86_64 only.
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::current::gdt::init_ap_storage(n, allocator);
+        crate::arch::current::ap_trampoline::init_ap_ist_storage(n, allocator);
+    }
+}
+
+/// Allocate `bytes` of contiguous physical pages, zero-fill, return a
+/// typed pointer to the start. Halts on buddy exhaustion.
+#[cfg(not(test))]
+pub(crate) fn alloc_zeroed_slab<T>(
+    bytes: usize,
+    allocator: &mut BuddyAllocator,
+    label: &'static str,
+) -> *mut T
+{
+    let pages = bytes.div_ceil(PAGE_SIZE);
+    let order = {
+        let mut o = 0;
+        while (1usize << o) < pages
+        {
+            o += 1;
+        }
+        o
+    };
+    let phys = allocator.alloc(order).unwrap_or_else(|| {
+        crate::kprintln!("alloc_zeroed_slab: out of memory for {label}");
+        crate::fatal("alloc_zeroed_slab: buddy exhausted")
+    });
+    let virt = phys_to_virt(phys) as *mut T;
+    let alloc_bytes = (1usize << order) * PAGE_SIZE;
+    // SAFETY: virt covers alloc_bytes (>= bytes) of mapped, kernel-owned RAM.
+    unsafe { core::ptr::write_bytes(virt.cast::<u8>(), 0, alloc_bytes) };
+    virt
 }
 
 // ── Test stub ─────────────────────────────────────────────────────────────────
@@ -648,7 +909,7 @@ pub fn init(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) -> u32
 pub fn ap_enter(cpu_id: u32) -> !
 {
     // Idle loop: wait for interrupt. The idle TCB was created by sched::init();
-    // SCHEDULERS[cpu_id].current already points to it. Interrupts are enabled
+    // The scheduler slot's `current` already points to it. Interrupts are enabled
     // by idle_thread_entry which is the natural entry point of the idle thread.
     // We call it directly since we are "on" the idle thread's kernel stack.
     idle_thread_entry(u64::from(cpu_id))
@@ -667,7 +928,7 @@ pub unsafe fn idle_stack_top_for(cpu_id: usize) -> u64
 {
     // SAFETY: caller guarantees cpu_id is valid and sched::init was called;
     // idle TCB pointer is non-null; kernel_stack_top field is always valid.
-    unsafe { (*SCHEDULERS[cpu_id].idle).kernel_stack_top }
+    unsafe { (*(*scheduler_ptr(cpu_id)).idle).kernel_stack_top }
 }
 
 // ── Public accessor ───────────────────────────────────────────────────────────
@@ -682,14 +943,161 @@ pub unsafe fn idle_stack_top_for(cpu_id: usize) -> u64
 #[allow(dead_code)] // Multi-CPU accessor; called once SMP bringup is implemented.
 pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 {
-    if id >= MAX_CPUS
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    if id >= cpu_count
     {
-        crate::kprintln!("scheduler_for: id={id} >= MAX_CPUS={MAX_CPUS}");
+        crate::kprintln!("scheduler_for: id={id} >= CPU_COUNT={cpu_count}");
         panic!("scheduler_for: id out of range");
     }
-    // SAFETY: caller guarantees id < MAX_CPUS and exclusive access to this CPU's scheduler.
-    unsafe { &mut SCHEDULERS[id] }
+    // SAFETY: caller guarantees id < CPU_COUNT and exclusive access to this CPU's scheduler.
+    unsafe { &mut *scheduler_ptr(id) }
 }
+
+/// Write `tcb.state = new_state` under every CPU's scheduler.lock.
+///
+/// Returns the CPU whose `current == tcb` (if any), so `sys_thread_stop`
+/// can prod-and-drain a remote Running target. Cost: up to `MAX_CPUS`
+/// spinlock acquires; for lifecycle syscalls only, not hot paths.
+/// See docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+///
+/// # Safety
+/// `tcb` must be a valid TCB pointer.
+#[cfg(not(test))]
+pub unsafe fn set_state_under_all_locks(
+    tcb: *mut ThreadControlBlock,
+    new_state: thread::ThreadState,
+) -> Option<usize>
+{
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let mut saved_flags: [u64; MAX_CPUS] = [0; MAX_CPUS];
+
+    // Acquire all scheduler locks in ascending CPU order to prevent ABBA.
+    // needless_range_loop: explicit indexing keeps saved_flags[cpu] /
+    // scheduler_for(cpu) parallel and clear; iter_mut().enumerate() would
+    // obscure the all-CPU pattern.
+    #[allow(clippy::needless_range_loop)]
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+        saved_flags[cpu] = unsafe { scheduler_for(cpu).lock.lock_raw() };
+    }
+
+    // Write the state under all locks.
+    // SAFETY: tcb validated by caller; state field always valid.
+    unsafe {
+        (*tcb).state = new_state;
+    }
+
+    // Identify which CPU (if any) currently has tcb as `current`.
+    let mut running_on: Option<usize> = None;
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+        if unsafe { scheduler_for(cpu).current } == tcb
+        {
+            running_on = Some(cpu);
+            break;
+        }
+    }
+
+    // Release all locks in descending order.
+    for cpu in (0..cpu_count).rev()
+    {
+        // SAFETY: lock_raw above paired with this unlock.
+        unsafe { scheduler_for(cpu).lock.unlock_raw(saved_flags[cpu]) };
+    }
+
+    running_on
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn set_state_under_all_locks(
+    _tcb: *mut ThreadControlBlock,
+    _new_state: thread::ThreadState,
+) -> Option<usize>
+{
+    None
+}
+
+/// Commit `Running|Ready → Blocked` under the current CPU's scheduler.lock.
+/// Returns `false` if a concurrent stop or exit already won; the caller
+/// MUST roll back its source-side waiter registration on `false`.
+/// See docs/scheduling-internals.md § Lock Hierarchy rule 8.
+///
+/// # Safety
+/// `tcb` must point to the current CPU's running thread.
+#[cfg(not(test))]
+pub unsafe fn commit_blocked_under_local_lock(
+    tcb: *mut ThreadControlBlock,
+    ipc: thread::IpcThreadState,
+    blocked_on: *mut u8,
+) -> bool
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: cpu is the current CPU; scheduler slab initialised by init().
+    let sched = unsafe { scheduler_for(cpu) };
+    // SAFETY: lock_raw paired with unlock_raw below.
+    let saved = unsafe { sched.lock.lock_raw() };
+
+    // SAFETY: tcb validated by caller; state field always valid.
+    let cur = unsafe { (*tcb).state };
+    let committed = match cur
+    {
+        thread::ThreadState::Running | thread::ThreadState::Ready =>
+        {
+            // SAFETY: under sched.lock; cross-CPU stop writers are serialised.
+            unsafe {
+                (*tcb).state = thread::ThreadState::Blocked;
+                (*tcb).ipc_state = ipc;
+                (*tcb).blocked_on_object = blocked_on;
+            }
+            true
+        }
+        thread::ThreadState::Stopped
+        | thread::ThreadState::Exited
+        | thread::ThreadState::Created
+        | thread::ThreadState::Blocked => false,
+    };
+
+    // SAFETY: paired with lock_raw above.
+    unsafe { sched.lock.unlock_raw(saved) };
+    committed
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn commit_blocked_under_local_lock(
+    _tcb: *mut ThreadControlBlock,
+    _ipc: thread::IpcThreadState,
+    _blocked_on: *mut u8,
+) -> bool
+{
+    true
+}
+
+/// Send a wakeup IPI to `target_cpu` without enqueueing anything.
+///
+/// Used by `sys_thread_stop` to force a remote Running target to trap
+/// into kernel and run `schedule()`, which then drains the Stopped TCB
+/// via the skip-loop.
+///
+/// # Safety
+/// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`). Self-IPI
+/// is a no-op.
+#[cfg(not(test))]
+pub unsafe fn prod_remote_cpu(target_cpu: usize)
+{
+    // SAFETY: target_cpu validated by caller.
+    unsafe { wake_idle_cpu(target_cpu) };
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 
 /// Enqueue a thread on a target CPU's run queue and wake the CPU if idle.
 ///
@@ -720,6 +1128,29 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize, 
     // SAFETY: lock_raw must be paired with unlock_raw below.
     let saved = unsafe { sched.lock.lock_raw() };
 
+    // Skip the enqueue if a concurrent stop or dealloc has already won
+    // under all-CPU locks; otherwise commit the wake-side transition under
+    // this CPU's sched.lock. See docs/scheduling-internals.md § Lock
+    // Hierarchy rule 9.
+    // SAFETY: tcb valid; lock held.
+    let cur = unsafe { (*tcb).state };
+    if matches!(
+        cur,
+        thread::ThreadState::Stopped | thread::ThreadState::Exited
+    )
+    {
+        // SAFETY: paired with lock_raw above.
+        unsafe { sched.lock.unlock_raw(saved) };
+        return;
+    }
+
+    // SAFETY: tcb valid; lock held.
+    unsafe {
+        (*tcb).state = thread::ThreadState::Ready;
+        (*tcb).ipc_state = thread::IpcThreadState::None;
+        (*tcb).blocked_on_object = core::ptr::null_mut();
+    }
+
     // Enqueue the thread while holding the lock.
     // SAFETY: lock is held; tcb is valid.
     sched.enqueue(tcb, priority);
@@ -730,25 +1161,14 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize, 
     // SAFETY: tcb is valid; lock is held.
     unsafe { (*tcb).preferred_cpu = target_cpu as u32 };
 
-    // Set the target's reschedule-pending flag under the lock, before
-    // releasing. This is load-bearing for the atomic wake primitive:
-    //
-    //   - The flag set is Release-ordered; the subsequent unlock publishes
-    //     both the enqueue and the flag to any CPU that observes the bit.
-    //   - A concurrent idle-loop `take_reschedule_pending` on the target
-    //     either sees the flag set (and skips halt), or sees it clear and
-    //     proceeds to halt — in which case the post-unlock IPI is pending
-    //     at the halt boundary and wakes it atomically.
+    // Release-ordered: subsequent unlock publishes the enqueue + flag to any
+    // CPU observing the bit. Idle loop sees the flag (or the IPI hits its
+    // halt boundary). See docs/scheduling-internals.md § Wake Protocol.
     set_reschedule_pending_for(target_cpu);
 
-    // Release the lock before sending the IPI.
     // SAFETY: saved was returned by the matching lock_raw above.
     unsafe { sched.lock.unlock_raw(saved) };
 
-    // Send a wakeup IPI as a latency hint. Correctness no longer depends on
-    // the IPI arriving: the producer-side flag plus the atomic
-    // check-and-halt in the idle loop close the race. The IPI merely
-    // shortens the time until the target observes the wake.
     // SAFETY: target_cpu is validated < MAX_CPUS by scheduler_for.
     unsafe { wake_idle_cpu(target_cpu) };
 }
@@ -765,9 +1185,9 @@ pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize
 ///
 /// # Safety
 /// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
-// needless_range_loop: we must use indexing for explicit bounds control with
-// static mut SCHEDULERS; iter/enumerate would require unsafe coercion that is
-// less clear than explicit bounds checking here.
+// needless_range_loop: we must use indexing because the scheduler slab is
+// reached through scheduler_ptr(cpu); iter/enumerate would require unsafe
+// pointer-arithmetic plumbing that is less clear than indexed bounds checking.
 #[allow(clippy::needless_range_loop)]
 #[cfg(not(test))]
 pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
@@ -775,23 +1195,45 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
     // SAFETY: caller guarantees tcb is valid; cpu_affinity field is always valid.
     let affinity = unsafe { (*tcb).cpu_affinity };
 
-    // Hard affinity: use specified CPU
+    // Hard affinity: use specified CPU.
     if affinity != AFFINITY_ANY
     {
         return affinity as usize;
     }
 
-    // No preference: load balance across all CPUs
+    // Save-window pinning: while `context_saved == 0` the source CPU is
+    // mid-switch into `tcb.saved_state`. Migrating the wake to a different
+    // CPU would force its `schedule()` to spin on the publication barrier;
+    // two such migrations on different CPUs can cross-deadlock. Pinning
+    // to `preferred_cpu` (the CPU performing the save) avoids both.
+    // SAFETY: tcb valid; context_saved is AtomicU32; preferred_cpu always set.
+    let saved = unsafe {
+        (*tcb)
+            .context_saved
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    if saved == 0
+    {
+        // SAFETY: preferred_cpu is set by every prior enqueue_and_wake;
+        // bounded by CPU_COUNT at the source.
+        let pref = unsafe { (*tcb).preferred_cpu } as usize;
+        let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+        if pref < cpu_count
+        {
+            return pref;
+        }
+    }
+
+    // No preference: load balance across all CPUs.
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let mut min_load = u32::MAX;
     let mut min_cpu = 0;
 
-    // SAFETY: SCHEDULERS is a valid static array; cpu < cpu_count < MAX_CPUS
+    // SAFETY: scheduler slab covers cpu_count slots, all initialised by sched::init.
     for cpu in 0..cpu_count
     {
-        // SAFETY: cpu is in bounds [0, cpu_count); SCHEDULERS is initialized for
-        // all CPUs [0, cpu_count) by sched::init.
-        let load = unsafe { SCHEDULERS[cpu].current_load() };
+        // SAFETY: cpu < cpu_count; scheduler slab initialised for all CPUs by sched::init.
+        let load = unsafe { (*scheduler_ptr(cpu)).current_load() };
         if load < min_load
         {
             min_load = load;
@@ -810,12 +1252,10 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
     0
 }
 
-/// Send a wakeup IPI to `target_cpu`.
-///
-/// Latency hint only. Correctness of `enqueue_and_wake` does not depend on
-/// this IPI being sent or delivered: the producer-side `RESCHEDULE_PENDING`
-/// bit plus the atomic check-and-halt in the idle loop guarantee the wake.
-/// The IPI merely shortens the time until the target observes the wake.
+/// Send a wakeup IPI to `target_cpu`. Always sent (except for self) per
+/// the wake-protocol invariant in docs/scheduling-internals.md
+/// § Wake Protocol Invariants — predicating on a per-CPU "is idle" hint
+/// is a missed-wakeup race against the target's halt boundary.
 ///
 /// # Safety
 /// `target_cpu` must be a valid online CPU index (< `CPU_COUNT`).
@@ -828,15 +1268,6 @@ unsafe fn wake_idle_cpu(target_cpu: usize)
     // next schedule() call (sys_yield, timer preemption, or the producer's
     // own later return to scheduler context).
     if target_cpu == current
-    {
-        return;
-    }
-
-    // Skip the IPI if the target is not idle. The producer-side
-    // `RESCHEDULE_PENDING` flag is already set; a running target will
-    // observe it on its next scheduler entry without needing an
-    // interrupt to break anything.
-    if !crate::percpu::is_idle(target_cpu)
     {
         return;
     }
@@ -861,7 +1292,7 @@ unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 /// Select the next thread to run and switch to it.
 ///
 /// Called from `sys_yield`, timer preemption, and the idle thread. Uses
-/// the current CPU's entry in `SCHEDULERS` (indexed by `current_cpu()`).
+/// the current CPU's scheduler slot (indexed by `current_cpu()`).
 ///
 /// `requeue_current`: if `true`, the current thread is placed back in the
 /// run queue at its priority (timer preemption, yield). If `false`, the
@@ -894,13 +1325,14 @@ pub unsafe fn schedule(requeue_current: bool)
     use thread::ThreadState;
 
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    if cpu >= MAX_CPUS
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    if cpu >= cpu_count
     {
-        crate::kprintln!("schedule: current_cpu()={cpu} >= MAX_CPUS");
+        crate::kprintln!("schedule: current_cpu()={cpu} >= CPU_COUNT={cpu_count}");
         panic!("schedule: current_cpu out of range");
     }
-    // SAFETY: cpu < MAX_CPUS validated above; SCHEDULERS[cpu] initialized by init().
-    let sched = unsafe { &mut SCHEDULERS[cpu] };
+    // SAFETY: cpu < CPU_COUNT validated above; scheduler slab initialised by init().
+    let sched = unsafe { &mut *scheduler_ptr(cpu) };
 
     // Acquire the scheduler lock via lock_raw so we hold no borrow reference
     // to `sched` during the critical section — allowing us to call mutable
@@ -1002,6 +1434,12 @@ pub unsafe fn schedule(requeue_current: bool)
         (*next).preferred_cpu = crate::arch::current::cpu::current_cpu();
     }
     sched.set_current(next);
+
+    // Watchdog: mark this CPU as having dispatched a non-idle thread.
+    if !core::ptr::eq(next, sched.idle)
+    {
+        watchdog_mark_non_idle(cpu);
+    }
 
     // Update the kernel trap stack pointer so the next ring-3 → ring-0
     // transition (interrupt, exception, or syscall) lands on the correct
@@ -1150,6 +1588,7 @@ pub unsafe fn schedule(requeue_current: bool)
     // loads in the restore phase could see stale register values.
     if !core::ptr::eq(next, sched.idle) && !next.is_null()
     {
+        let mut spins: u64 = 0;
         // SAFETY: next is a valid TCB; context_saved field always valid.
         while unsafe {
             (*next)
@@ -1158,6 +1597,22 @@ pub unsafe fn schedule(requeue_current: bool)
         } == 0
         {
             core::hint::spin_loop();
+            spins += 1;
+            // Single-shot diagnostic when the publication barrier stalls;
+            // healthy is <100 iter, 100M is ~tens of ms even under TCG.
+            if spins == 100_000_000
+            {
+                // SAFETY: next is a valid TCB; thread_id is always valid.
+                let tid = unsafe { (*next).thread_id };
+                // SAFETY: next is a valid TCB; preferred_cpu is always valid.
+                let pref = unsafe { (*next).preferred_cpu };
+                crate::kprintln!(
+                    "schedule: cpu{} stuck spinning context_saved on next=tid{} pref={}",
+                    cpu,
+                    tid,
+                    pref
+                );
+            }
         }
     }
 
@@ -1275,10 +1730,18 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
 #[cfg(not(test))]
 pub unsafe fn timer_tick()
 {
+    // BSP boot transient: bail before touching scheduler state.
+    // See docs/scheduling-internals.md § BSP Boot Transient.
+    if BOOT_TRANSIENT_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    debug_assert!(cpu < MAX_CPUS, "timer_tick: cpu={cpu} out of range");
-    // SAFETY: cpu is in bounds [0, MAX_CPUS); SCHEDULERS is a valid static array
-    let sched = unsafe { &mut SCHEDULERS[cpu] };
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    debug_assert!(cpu < cpu_count, "timer_tick: cpu={cpu} out of range");
+    // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+    let sched = unsafe { &mut *scheduler_ptr(cpu) };
 
     // SAFETY: Acquire scheduler lock to prevent race with schedule().
     // lock_raw is used because we hold no borrow reference to sched during
@@ -1311,6 +1774,7 @@ pub unsafe fn timer_tick()
         // SAFETY: Paired with lock_raw above.
         unsafe { sched.lock.unlock_raw(saved) };
         sleep_check_wakeups();
+        watchdog_tick_and_check();
         // Re-acquire for the timeslice logic below.
         // SAFETY: lock was released above; re-acquiring for timeslice checks.
         saved = unsafe { sched.lock.lock_raw() };
@@ -1413,10 +1877,10 @@ pub fn enter() -> !
     use crate::mm::address_space::INIT_STACK_TOP;
 
     // Dequeue the highest-priority ready thread (init, at INIT_PRIORITY=15).
-    // SAFETY: single-threaded boot; SCHEDULERS[0] is exclusively owned; tcb is validated
-    // non-null before dereference; state field is always valid.
+    // SAFETY: single-threaded boot; BSP scheduler slot exclusively owned; tcb is
+    // validated non-null before dereference; state field is always valid.
     let init_tcb = unsafe {
-        let sched = &mut SCHEDULERS[0];
+        let sched = &mut *scheduler_ptr(0);
         let tcb = sched.dequeue_highest();
         if tcb.is_null()
         {
@@ -1491,6 +1955,10 @@ pub fn enter() -> !
     unsafe {
         (*init_tcb.address_space).mark_active_on_cpu(0);
     }
+
+    // End the BSP boot transient (Phase 9): timer_tick now performs
+    // normal preemption. See docs/scheduling-internals.md § BSP Boot Transient.
+    BOOT_TRANSIENT_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
 
     crate::kprintln!("sched: enter - handing control to init");
 

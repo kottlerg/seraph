@@ -129,41 +129,46 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
         // Swap all pending bits (including ours) to zero and deliver them.
         let delivered = sig.bits.swap(0, Ordering::Relaxed);
 
-        let waiter = sig.waiter;
-        sig.waiter = core::ptr::null_mut();
-        sig.has_observer
-            .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
-        // SAFETY: waiter is a valid TCB pointer placed here by signal_wait.
-        unsafe {
-            debug_assert!(
-                (*waiter).magic == crate::sched::thread::TCB_MAGIC,
-                "signal_send: waiter TCB magic corrupt — use-after-free?"
-            );
-            debug_assert!(
-                (*waiter).state == crate::sched::thread::ThreadState::Blocked,
-                "signal_send: waiter not Blocked"
-            );
-            (*waiter).wakeup_value = delivered;
-            (*waiter).state = crate::sched::thread::ThreadState::Ready;
-            (*waiter).ipc_state = IpcThreadState::None;
-            (*waiter).blocked_on_object = core::ptr::null_mut();
+        if delivered == 0
+        {
+            // A concurrent fast-path signal_wait already consumed our
+            // bits. The current sig.waiter is a *new* waiter; do NOT
+            // touch it (delivering wakeup_value=0 would be a spurious
+            // wake, since signal_send rejects 0-bit sends). See
+            // ipc-internals.md § Send Path.
+            None
         }
-        // If the waiter was registered with a `SYS_SIGNAL_WAIT` timeout, it
-        // is also on the global sleep list. Remove it here so the timer
-        // path will not try to double-wake this thread. We hold `sig.lock`;
-        // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
-        // (lock order: sig.lock → SLEEP_LIST_LOCK; the timer path takes
-        // SLEEP_LIST_LOCK first, releases it, and only then reaches for
-        // sig.lock — so no circular wait).
-        // SAFETY: waiter is the TCB we just dequeued from sig.waiter.
-        unsafe {
-            if (*waiter).sleep_deadline != 0
-            {
-                (*waiter).sleep_deadline = 0;
-                crate::sched::sleep_list_remove(waiter);
+        else
+        {
+            let waiter = sig.waiter;
+            sig.waiter = core::ptr::null_mut();
+            sig.has_observer
+                .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
+            // SAFETY: waiter is a valid TCB pointer placed here by signal_wait.
+            unsafe {
+                debug_assert!(
+                    (*waiter).magic == crate::sched::thread::TCB_MAGIC,
+                    "signal_send: waiter TCB magic corrupt — use-after-free?"
+                );
+                (*waiter).wakeup_value = delivered;
             }
+            // If the waiter was registered with a `SYS_SIGNAL_WAIT` timeout, it
+            // is also on the global sleep list. Remove it here so the timer
+            // path will not try to double-wake this thread. We hold `sig.lock`;
+            // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
+            // (lock order: sig.lock → SLEEP_LIST_LOCK; the timer path takes
+            // SLEEP_LIST_LOCK first, releases it, and only then reaches for
+            // sig.lock — so no circular wait).
+            // SAFETY: waiter is the TCB we just dequeued from sig.waiter.
+            unsafe {
+                if (*waiter).sleep_deadline != 0
+                {
+                    (*waiter).sleep_deadline = 0;
+                    crate::sched::sleep_list_remove(waiter);
+                }
+            }
+            Some(waiter)
         }
-        Some(waiter)
     }
     else if !sig.wait_set.is_null()
     {
@@ -253,12 +258,27 @@ pub unsafe fn signal_wait(sig: *mut SignalState, caller: *mut ThreadControlBlock
         return Ok(bits);
     }
 
-    // No bits available — block the caller.
-    // SAFETY: caller TCB is valid.
-    unsafe {
-        (*caller).state = crate::sched::thread::ThreadState::Blocked;
-        (*caller).ipc_state = IpcThreadState::BlockedOnSignal;
-        (*caller).blocked_on_object = core::ptr::addr_of_mut!(*sig).cast::<u8>();
+    let blocked_on = core::ptr::addr_of_mut!(*sig).cast::<u8>();
+    // SAFETY: caller TCB valid; sig.lock excludes concurrent waiter writes.
+    let committed = unsafe {
+        crate::sched::commit_blocked_under_local_lock(
+            caller,
+            IpcThreadState::BlockedOnSignal,
+            blocked_on,
+        )
+    };
+    if !committed
+    {
+        // Concurrent stop won; roll back the waiter slot.
+        sig.waiter = core::ptr::null_mut();
+        sig.has_observer
+            .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
+        // SAFETY: caller TCB is valid; context_saved is AtomicU32.
+        unsafe {
+            (*caller)
+                .context_saved
+                .store(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     // SAFETY: paired with lock_raw above.

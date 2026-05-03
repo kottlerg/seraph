@@ -560,7 +560,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     if msg.cap_count > 0
     {
         // SAFETY: tcb validated; reply_tcb set by endpoint_recv to caller's TCB.
-        let caller = unsafe { (*tcb).reply_tcb };
+        let caller = unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
         // SAFETY: caller is valid TCB from reply_tcb.
         let caller_cspace = unsafe { (*caller).cspace };
         // SAFETY: tcb validated above.
@@ -667,7 +667,7 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // defense-in-depth against concurrent CSpace mutation in the
         // unlocked window before its dst-CSpace lock acquisition.
         // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
-        let caller_peek = unsafe { (*tcb).reply_tcb };
+        let caller_peek = unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
         if caller_peek.is_null()
         {
             return Err(SyscallError::InvalidCapability);
@@ -846,20 +846,43 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Ok(bits);
     }
 
-    // No bits; thread is Blocked on the signal. For a timed wait we also
-    // register in the sleep list so the timer tick wakes us if no signal
-    // arrives. Arbitration between signal_send and the timer path is done
-    // in `sleep_check_wakeups` (see there).
+    // For a timed wait, arm the sleep list. Re-acquire sig.lock and check
+    // `sig.waiter == tcb` first: a concurrent signal_send may have woken
+    // us already; arming unconditionally would leave a stale entry that
+    // hijacks a later unrelated signal_wait. See
+    // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants rule 8.
     if timeout_ms != 0
     {
         let tps = crate::arch::current::timer::ticks_per_second();
         let now = crate::arch::current::timer::current_tick();
         let deadline = now.saturating_add(timeout_ms.saturating_mul(tps) / 1000);
-        // SAFETY: tcb valid; thread already Blocked above.
-        unsafe {
-            (*tcb).sleep_deadline = deadline;
+        // SAFETY: sig_state validated above; lock_raw paired with unlock_raw.
+        let saved = unsafe { (*sig_state).lock.lock_raw() };
+        // SAFETY: sig_state valid; lock held — waiter field is stable.
+        let still_waiter = unsafe { (*sig_state).waiter } == tcb;
+        if still_waiter
+        {
+            // SAFETY: tcb valid; sig.lock held excludes signal_send wake.
+            unsafe {
+                (*tcb).sleep_deadline = deadline;
+            }
+            if crate::sched::sleep_list_add(tcb).is_err()
+            {
+                // Sleep list full: fall back to indefinite wait — the IPC
+                // source can still wake us, only the timeout is lost.
+                crate::kprintln!(
+                    "kernel: sleep_list capacity reached ({}); signal_wait \
+                     falling back to indefinite wait",
+                    crate::sched::MAX_SLEEPING,
+                );
+                // SAFETY: tcb valid; sig.lock held.
+                unsafe {
+                    (*tcb).sleep_deadline = 0;
+                }
+            }
         }
-        crate::sched::sleep_list_add(tcb);
+        // SAFETY: paired with lock_raw above.
+        unsafe { (*sig_state).lock.unlock_raw(saved) };
     }
 
     // Yield CPU.
@@ -1015,19 +1038,40 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::WouldBlock);
     }
 
-    // Bounded wait: arm the sleep-list timer. Arbitration between
-    // `event_queue_post` and the timer path lives in `sleep_check_wakeups`
-    // (see the `BlockedOnEventQueue` arm there).
+    // Bounded wait: arm the sleep-list timer. Same waiter-recheck rule as
+    // sys_signal_wait — see docs/thread-lifecycle-and-sleep.md
+    // § Sleep List Invariants rule 8.
     if timeout_ms != 0
     {
         let tps = crate::arch::current::timer::ticks_per_second();
         let now = crate::arch::current::timer::current_tick();
         let deadline = now.saturating_add(timeout_ms.saturating_mul(tps) / 1000);
-        // SAFETY: tcb valid; thread already Blocked above.
-        unsafe {
-            (*tcb).sleep_deadline = deadline;
+        // SAFETY: eq_state validated above; lock_raw paired with unlock_raw.
+        let saved = unsafe { (*eq_state).lock.lock_raw() };
+        // SAFETY: eq_state valid; lock held — waiter field is stable.
+        let still_waiter = unsafe { (*eq_state).waiter } == tcb;
+        if still_waiter
+        {
+            // SAFETY: tcb valid; eq.lock held excludes event_queue_post wake.
+            unsafe {
+                (*tcb).sleep_deadline = deadline;
+            }
+            if crate::sched::sleep_list_add(tcb).is_err()
+            {
+                // Sleep list full: fall back to indefinite wait.
+                crate::kprintln!(
+                    "kernel: sleep_list capacity reached ({}); event_recv \
+                     falling back to indefinite wait",
+                    crate::sched::MAX_SLEEPING,
+                );
+                // SAFETY: tcb valid; eq.lock held.
+                unsafe {
+                    (*tcb).sleep_deadline = 0;
+                }
+            }
         }
-        crate::sched::sleep_list_add(tcb);
+        // SAFETY: paired with lock_raw above.
+        unsafe { (*eq_state).lock.unlock_raw(saved) };
     }
 
     // Yield CPU.

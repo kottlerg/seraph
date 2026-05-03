@@ -175,13 +175,14 @@ pub unsafe fn endpoint_call(
                 "endpoint_call: server not Blocked"
             );
         }
-        // SAFETY: server dequeued from recv_head.
+        // SAFETY: server dequeued from recv_head; ipc_msg / reply_tcb are
+        // data fields written under ep.lock. State transitions are
+        // committed by enqueue_and_wake.
         unsafe {
             (*server).ipc_msg = *msg;
-            (*server).reply_tcb = caller;
-            (*server).state = ThreadState::Ready;
-            (*server).ipc_state = IpcThreadState::None;
-            (*server).blocked_on_object = core::ptr::null_mut();
+            (*server)
+                .reply_tcb
+                .store(caller, core::sync::atomic::Ordering::Release);
         }
         // Clear context_saved before making the caller visible as blocked.
         // See signal.rs signal_wait for the full rationale.
@@ -191,11 +192,29 @@ pub unsafe fn endpoint_call(
                 .context_saved
                 .store(0, core::sync::atomic::Ordering::Relaxed);
         }
-        // SAFETY: caller validated by syscall layer.
-        unsafe {
-            (*caller).state = ThreadState::Blocked;
-            (*caller).ipc_state = IpcThreadState::BlockedOnReply;
-            (*caller).blocked_on_object = server.cast::<u8>();
+        // SAFETY: caller validated; held ep.lock excludes recv-queue writes.
+        let committed = unsafe {
+            crate::sched::commit_blocked_under_local_lock(
+                caller,
+                IpcThreadState::BlockedOnReply,
+                server.cast::<u8>(),
+            )
+        };
+        if !committed
+        {
+            // Concurrent stop won; tear down the reply linkage.
+            // SAFETY: caller / server validated.
+            unsafe {
+                let _ = (*server).reply_tcb.compare_exchange(
+                    caller,
+                    core::ptr::null_mut(),
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                );
+                (*caller)
+                    .context_saved
+                    .store(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         // SAFETY: paired with lock_raw above.
         unsafe { ep.lock.unlock_raw(saved) };
@@ -215,15 +234,30 @@ pub unsafe fn endpoint_call(
     // SAFETY: caller validated by syscall layer.
     unsafe {
         (*caller).ipc_msg = *msg;
-        (*caller).state = ThreadState::Blocked;
-        (*caller).ipc_state = IpcThreadState::BlockedOnSend;
-        #[allow(clippy::cast_ptr_alignment)]
-        {
-            (*caller).blocked_on_object = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
-        }
         enqueue(&mut ep.send_head, &mut ep.send_tail, caller);
     }
-    if was_empty && !ep.wait_set.is_null()
+    #[allow(clippy::cast_ptr_alignment)]
+    let blocked_on = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
+    // SAFETY: caller validated; held ep.lock excludes send-queue writes.
+    let committed = unsafe {
+        crate::sched::commit_blocked_under_local_lock(
+            caller,
+            IpcThreadState::BlockedOnSend,
+            blocked_on,
+        )
+    };
+    if !committed
+    {
+        // Concurrent stop won; unlink from the send queue.
+        // SAFETY: ep.lock held.
+        unsafe {
+            unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);
+            (*caller)
+                .context_saved
+                .store(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if was_empty && committed && !ep.wait_set.is_null()
     {
         // SAFETY: wait_set validated non-null.
         unsafe { crate::ipc::wait_set::waitset_notify(ep.wait_set, ep.wait_set_member_idx) };
@@ -261,7 +295,9 @@ pub unsafe fn endpoint_recv(
         let msg = unsafe { (*caller).ipc_msg };
         // SAFETY: server validated by syscall layer.
         unsafe {
-            (*server).reply_tcb = caller;
+            (*server)
+                .reply_tcb
+                .store(caller, core::sync::atomic::Ordering::Release);
         }
         // SAFETY: caller dequeued from send_head.
         unsafe {
@@ -284,13 +320,28 @@ pub unsafe fn endpoint_recv(
     }
     // SAFETY: server validated by syscall layer.
     unsafe {
-        (*server).state = ThreadState::Blocked;
-        (*server).ipc_state = IpcThreadState::BlockedOnRecv;
-        #[allow(clippy::cast_ptr_alignment)]
-        {
-            (*server).blocked_on_object = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
-        }
         enqueue(&mut ep.recv_head, &mut ep.recv_tail, server);
+    }
+    #[allow(clippy::cast_ptr_alignment)]
+    let blocked_on = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
+    // SAFETY: server validated; held ep.lock excludes recv-queue writes.
+    let committed = unsafe {
+        crate::sched::commit_blocked_under_local_lock(
+            server,
+            IpcThreadState::BlockedOnRecv,
+            blocked_on,
+        )
+    };
+    if !committed
+    {
+        // Concurrent stop won; unlink from the recv queue.
+        // SAFETY: ep.lock held.
+        unsafe {
+            unlink_from_wait_queue(server, &mut ep.recv_head, &mut ep.recv_tail);
+            (*server)
+                .context_saved
+                .store(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ep.lock.unlock_raw(saved) };
@@ -312,25 +363,29 @@ pub unsafe fn endpoint_reply(
 ) -> Option<*mut ThreadControlBlock>
 {
     // SAFETY: server validated by syscall layer; reply_tcb field always valid in TCB.
-    let caller = unsafe { (*server).reply_tcb };
+    let caller = unsafe {
+        (*server)
+            .reply_tcb
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
     if caller.is_null()
     {
         return None;
     }
-    // Clear the reply target.
-    // SAFETY: server validated by syscall layer; reply_tcb field always valid in TCB.
+    // Plain Release store is safe under ep.lock — concurrent
+    // cancel_ipc_block uses compare_exchange and only clears if it matched
+    // its own client, which already lost to our load above.
+    // SAFETY: server validated.
     unsafe {
-        (*server).reply_tcb = core::ptr::null_mut();
+        (*server)
+            .reply_tcb
+            .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
     }
 
-    // Deliver reply to caller.
-    // SAFETY: caller stored by endpoint_call/recv; scheduler lock held; ensures exclusive
-    // access to thread state.
+    // SAFETY: caller stored by endpoint_call/recv. State transitions
+    // committed by enqueue_and_wake at the call site.
     unsafe {
         (*caller).ipc_msg = *msg;
-        (*caller).state = ThreadState::Ready;
-        (*caller).ipc_state = IpcThreadState::None;
-        (*caller).blocked_on_object = core::ptr::null_mut();
     }
     Some(caller)
 }

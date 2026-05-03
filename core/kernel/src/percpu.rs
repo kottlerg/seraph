@@ -36,41 +36,6 @@
 //! the struct by offset.
 
 use crate::sched::MAX_CPUS;
-use core::sync::atomic::{AtomicU64, Ordering};
-
-// ── Idle CPU tracking ─────────────────────────────────────────────────────────
-
-/// Bitmask of CPUs currently idle (halted).
-///
-/// **Advisory.** Consulted by [`sched::wake_idle_cpu`] as an optimisation
-/// hint: if the target is observably not idle, skip the wakeup IPI.
-/// Correctness of `enqueue_and_wake` does **not** depend on the accuracy of
-/// this mask — the producer-side `RESCHEDULE_PENDING` flag plus the atomic
-/// check-and-halt in the idle loop guarantee the wake regardless. A stale
-/// read here at worst causes a spurious IPI or a skipped-IPI that the
-/// target observes later via its own check.
-///
-/// Because the mask is advisory, `Relaxed` is sufficient on all sides.
-pub static CPU_IDLE_MASK: AtomicU64 = AtomicU64::new(0);
-
-/// Mark a CPU as idle (about to halt). Called inside the idle loop's
-/// interrupt-masked region. Relaxed — advisory.
-pub fn mark_idle(cpu: usize)
-{
-    CPU_IDLE_MASK.fetch_or(1u64 << cpu, Ordering::Relaxed);
-}
-
-/// Mark a CPU as active (woke from halt or has work). Relaxed — advisory.
-pub fn mark_active(cpu: usize)
-{
-    CPU_IDLE_MASK.fetch_and(!(1u64 << cpu), Ordering::Relaxed);
-}
-
-/// Observe whether a CPU is currently idle. Relaxed — advisory.
-pub fn is_idle(cpu: usize) -> bool
-{
-    (CPU_IDLE_MASK.load(Ordering::Relaxed) & (1u64 << cpu)) != 0
-}
 
 // ── APIC ID mapping ───────────────────────────────────────────────────────────
 

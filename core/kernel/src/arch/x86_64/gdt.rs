@@ -137,45 +137,59 @@ static mut TSS: TssWithIopb = TssWithIopb {
 #[cfg(not(test))]
 static mut GDT: [u64; 7] = [0u64; 7];
 
-/// Per-CPU TSS+IOPB array for Application Processors. Slot `cpu_id` is the
-/// AP with that id; slot 0 is unused (BSP has its own [`TSS`] static).
+/// Base pointer for the dynamically-sized per-CPU `[TssWithIopb; cpu_count]`
+/// array. Allocated by [`init_ap_storage`] from the buddy in `sched::init`,
+/// before AP bringup. Slot `cpu_id` is the AP with that id; slot 0 is unused
+/// (BSP has its own [`TSS`] static).
 ///
-/// Sized at [`crate::sched::MAX_CPUS`] so the kernel image embeds the BSS
-/// space at link time — no heap allocation on AP startup. Each entry is
-/// ~8 KiB (`TssWithIopb`); `MAX_CPUS=64` → ~520 KiB BSS.
+/// Each entry is ~8 KiB; sized at `boot_cpu_count` rather than `MAX_CPUS`
+/// recovers ~516 KiB on a 4-CPU host (vs. the prior `MAX_CPUS=64` BSS).
 ///
-/// `static mut` is only written during single-threaded AP bringup
+/// Stored as a raw `*mut`; written only during single-threaded AP bringup
 /// (`init_ap`) or with interrupts disabled during context switch.
 #[cfg(not(test))]
-static mut AP_TSS: [TssWithIopb; crate::sched::MAX_CPUS] = {
-    const VACANT: TssWithIopb = TssWithIopb {
-        tss: Tss {
-            _reserved0: 0,
-            rsp0: 0,
-            _rsp1: 0,
-            _rsp2: 0,
-            _reserved1: 0,
-            ist1: 0,
-            ist2: 0,
-            _ist3: 0,
-            _ist4: 0,
-            _ist5: 0,
-            _ist6: 0,
-            _ist7: 0,
-            _reserved2: 0,
-            _reserved3: 0,
-            iopb_offset: 104,
-        },
-        iopb: [0xFF; IOPB_SIZE],
-        terminator: 0xFF,
-    };
-    [VACANT; crate::sched::MAX_CPUS]
-};
+static AP_TSS_PTR: core::sync::atomic::AtomicPtr<TssWithIopb> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// Per-CPU GDT array for Application Processors. Slot indexing matches
-/// [`AP_TSS`].
+/// Base pointer for the dynamically-sized per-CPU `[[u64; 7]; cpu_count]`
+/// AP-GDT array. Slot indexing matches [`AP_TSS_PTR`].
 #[cfg(not(test))]
-static mut AP_GDT: [[u64; 7]; crate::sched::MAX_CPUS] = [[0u64; 7]; crate::sched::MAX_CPUS];
+static AP_GDT_PTR: core::sync::atomic::AtomicPtr<[u64; 7]> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Allocate the per-CPU AP TSS and GDT slabs sized to `cpu_count`. Called
+/// from `sched::init`, before any AP startup. Each slab is page-aligned and
+/// zero-filled; `init_ap` overwrites the relevant fields per AP.
+///
+/// The IOPB region of every TSS is then filled with `0xFF` (deny-all) to
+/// match the historic BSS-init behaviour; `init_ap` re-applies on each AP
+/// for paranoia.
+#[cfg(not(test))]
+pub fn init_ap_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+{
+    let tss_bytes = cpu_count * core::mem::size_of::<TssWithIopb>();
+    let tss_ptr = crate::sched::alloc_zeroed_slab::<TssWithIopb>(tss_bytes, allocator, "AP_TSS");
+    // Initialise IOPB regions to 0xFF (all ports denied) for slots not yet
+    // touched by init_ap. iopb_offset is u16 inside a packed struct, so use
+    // write_unaligned. SAFETY: tss_ptr covers cpu_count entries.
+    unsafe {
+        for cpu in 0..cpu_count
+        {
+            let slot = tss_ptr.add(cpu);
+            let iopb = core::ptr::addr_of_mut!((*slot).iopb);
+            core::ptr::write_bytes(iopb.cast::<u8>(), 0xFF, IOPB_SIZE);
+            let term = core::ptr::addr_of_mut!((*slot).terminator);
+            core::ptr::write(term, 0xFF);
+            let ofs = core::ptr::addr_of_mut!((*slot).tss.iopb_offset);
+            core::ptr::write_unaligned(ofs, core::mem::size_of::<Tss>() as u16);
+        }
+    }
+    AP_TSS_PTR.store(tss_ptr, core::sync::atomic::Ordering::Release);
+
+    let gdt_bytes = cpu_count * core::mem::size_of::<[u64; 7]>();
+    let gdt_ptr = crate::sched::alloc_zeroed_slab::<[u64; 7]>(gdt_bytes, allocator, "AP_GDT");
+    AP_GDT_PTR.store(gdt_ptr, core::sync::atomic::Ordering::Release);
+}
 
 // ── GDTR ──────────────────────────────────────────────────────────────────────
 
@@ -396,28 +410,33 @@ pub unsafe fn set_rsp0(stack_top: u64)
 
 /// Initialise and load a per-CPU GDT and TSS for an AP (Application Processor).
 ///
-/// Configures `AP_TSS[cpu_id]` and `AP_GDT[cpu_id]` (both BSS-resident, no
-/// heap involvement) with the same layout as the BSP's static GDT, loads
-/// them via `lgdt` + `ltr`, and stores the TSS pointer in
-/// `PER_CPU[cpu_id].tss_ptr`.
+/// Configures the dynamic per-CPU `TssWithIopb` and `[u64; 7]` GDT slots
+/// (allocated by [`init_ap_storage`] in `sched::init`) with the same layout
+/// as the BSP's static GDT, loads them via `lgdt` + `ltr`, and stores the
+/// TSS pointer in `PER_CPU[cpu_id].tss_ptr`.
 ///
 /// Called from `kernel_entry_ap` during AP startup, after GS-base is
 /// installed. The BSP calls `gdt::init()` (static [`GDT`] / [`TSS`]) — this
 /// function is only for APs.
 ///
 /// # Safety
-/// Must execute at ring 0 on the AP being initialised. `cpu_id` must be < `MAX_CPUS.`
+/// Must execute at ring 0 on the AP being initialised. `cpu_id` must be <
+/// `CPU_COUNT`. [`init_ap_storage`] must have been called from `sched::init`.
 /// `percpu::init_ap(cpu_id)` must have been called first so GS-base and
 /// `PER_CPU[cpu_id].tss_ptr` are writable.
 #[cfg(not(test))]
 pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
 {
-    debug_assert!((cpu_id as usize) < crate::sched::MAX_CPUS);
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    debug_assert!(cpu_id < cpu_count);
 
-    // Configure this AP's TSS slot in BSS.
-    // SAFETY: cpu_id < MAX_CPUS asserted; AP_TSS[cpu_id] is exclusively
-    // owned by this AP during single-threaded bringup.
-    let tss_ptr_mut = unsafe { core::ptr::addr_of_mut!(AP_TSS[cpu_id as usize]) };
+    // Configure this AP's TSS slot in the dynamic per-CPU slab.
+    // SAFETY: cpu_id < CPU_COUNT asserted; AP_TSS_PTR slab covers cpu_count
+    // entries; this slot is exclusively owned by this AP during bringup.
+    let tss_base = AP_TSS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(!tss_base.is_null(), "init_ap: AP_TSS_PTR not initialised");
+    // SAFETY: cpu_id < CPU_COUNT asserted; tss_base slab covers cpu_count entries.
+    let tss_ptr_mut = unsafe { tss_base.add(cpu_id as usize) };
     let tss_addr = tss_ptr_mut as u64;
     // Packed-struct field writes via raw-pointer offsets — packed structs
     // forbid `&mut` to fields that aren't naturally aligned, but raw
@@ -453,10 +472,13 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
         core::ptr::write_bytes(iopb.cast::<u8>(), 0xFF, IOPB_SIZE);
     }
 
-    // Configure this AP's GDT slot in BSS.
-    // SAFETY: cpu_id < MAX_CPUS asserted; AP_GDT[cpu_id] is exclusively
-    // owned by this AP during single-threaded bringup.
-    let gdt_ptr_mut = unsafe { core::ptr::addr_of_mut!(AP_GDT[cpu_id as usize]) };
+    // Configure this AP's GDT slot in the dynamic per-CPU slab.
+    // SAFETY: cpu_id < CPU_COUNT asserted; AP_GDT_PTR slab covers cpu_count
+    // entries; this slot is exclusively owned by this AP during bringup.
+    let gdt_base = AP_GDT_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(!gdt_base.is_null(), "init_ap: AP_GDT_PTR not initialised");
+    // SAFETY: cpu_id < CPU_COUNT asserted; gdt_base slab covers cpu_count entries.
+    let gdt_ptr_mut = unsafe { gdt_base.add(cpu_id as usize) };
     // SAFETY: gdt_ptr_mut is unaliased; writes stay within the array.
     unsafe {
         (*gdt_ptr_mut)[0] = 0; // null

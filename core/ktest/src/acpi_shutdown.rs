@@ -5,9 +5,9 @@
 
 //! ACPI S5 (soft-off) shutdown for x86-64.
 //!
-//! Finds FADT and DSDT by scanning `PlatformTable` Frame caps for their ACPI
-//! signatures, extracts `PM1a_CNT_BLK` and `SLP_TYPa`, then writes the shutdown
-//! command to the `PM1a` control register.
+//! Locates FADT and DSDT by scanning each `AcpiReclaimable` Frame cap for
+//! the ACPI signatures, extracts `PM1a_CNT_BLK` and `SLP_TYPa`, then writes
+//! the shutdown command to the `PM1a` control register.
 //!
 //! All ACPI parsing happens in userspace — the kernel and bootloader are not
 //! involved beyond providing Frame caps for the firmware table regions.
@@ -20,15 +20,18 @@ const SLP_EN: u16 = 1 << 13;
 /// Virtual address base for mapping ACPI tables.
 const ACPI_MAP_BASE: u64 = 0x4000_0000;
 
+/// FADT field offsets (ACPI 6.x section 5.2.9).
+const FADT_OFF_DSDT: usize = 40;
+const FADT_OFF_PM1A_CNT_BLK: usize = 64;
+const FADT_OFF_X_DSDT: usize = 140;
+
 /// Attempt ACPI S5 shutdown. Logs progress and does not return on success.
 ///
 /// On failure (missing caps, unparseable tables), logs a warning and returns
 /// so the caller can fall through to `thread_exit()`.
 pub fn shutdown(info: &InitInfo)
 {
-    let fadt = find_acpi_table(info, b"FACP", ACPI_MAP_BASE);
-    let Some((pm1a_cnt_blk, _fadt_phys)) =
-        fadt.and_then(|(slot, phys)| map_and_read_fadt(info, slot, phys))
+    let Some((pm1a_cnt_blk, dsdt_phys)) = locate_fadt_fields(info)
     else
     {
         crate::log("ktest: shutdown failed (FADT not found)");
@@ -41,10 +44,7 @@ pub fn shutdown(info: &InitInfo)
         return;
     }
 
-    let dsdt_vaddr = ACPI_MAP_BASE + 0x10_0000;
-    let dsdt = find_acpi_table(info, b"DSDT", dsdt_vaddr);
-    let Some(slp_typa) =
-        dsdt.and_then(|(slot, phys)| map_and_scan_dsdt(info, slot, phys, dsdt_vaddr))
+    let Some(slp_typa) = locate_and_parse_dsdt(info, dsdt_phys)
     else
     {
         crate::log("ktest: shutdown failed (DSDT not found or \\_S5_ missing)");
@@ -83,26 +83,66 @@ pub fn shutdown(info: &InitInfo)
 
 // ── ACPI table discovery ────────────────────────────────────────────────────
 
-/// Find a Frame cap in the `hw_cap` range whose mapped content starts with
-/// the given 4-byte ACPI signature. Returns `(slot, phys_base)`.
-fn find_acpi_table(info: &InitInfo, sig: &[u8; 4], map_vaddr: u64) -> Option<(u32, u64)>
+/// Scan every `AcpiReclaimable` region cap for the FADT (`FACP`) signature.
+/// Returns `(pm1a_cnt_blk, dsdt_phys)` on success.
+fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
 {
-    for desc in descriptors(info)
+    let (_slot, region_phys, region_size, table_off) =
+        find_table_in_acpi_regions(info, *b"FACP", ACPI_MAP_BASE)?;
+
+    let table_vaddr = ACPI_MAP_BASE + (region_phys & 0xFFF) + table_off as u64;
+    // SAFETY: region was just mapped by find_table_in_acpi_regions; FADT
+    // header is at table_vaddr; offsets 64 and 140 are within ACPI 6.x size.
+    #[allow(clippy::cast_possible_truncation)]
+    let pm1a = unsafe { read_u32_at(table_vaddr, FADT_OFF_PM1A_CNT_BLK) } as u16;
+    // SAFETY: same mapping.
+    let dsdt32 = unsafe { read_u32_at(table_vaddr, FADT_OFF_DSDT) };
+    // SAFETY: same mapping; FADT minimum size in ACPI 6.x is 244 bytes.
+    let dsdt64 = unsafe { read_u64_at(table_vaddr, FADT_OFF_X_DSDT) };
+    let dsdt_phys = if dsdt64 != 0
     {
-        if desc.cap_type != CapType::Frame
-            || desc.slot < info.hw_cap_base
-            || desc.slot >= info.hw_cap_base + info.hw_cap_count
+        dsdt64
+    }
+    else
+    {
+        u64::from(dsdt32)
+    };
+
+    let pages = pages_for(region_phys, region_size);
+    let _ = syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages);
+    Some((pm1a, dsdt_phys))
+}
+
+/// Locate the DSDT by physical address (from FADT) inside the
+/// `AcpiReclaimable` region caps and parse `\_S5_` for `SLP_TYPa`.
+fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
+{
+    for d in descriptors(info)
+    {
+        if d.cap_type != CapType::Frame
+        {
+            continue;
+        }
+        if d.slot < info.acpi_region_frame_base
+            || d.slot >= info.acpi_region_frame_base + info.acpi_region_frame_count
+        {
+            continue;
+        }
+        if dsdt_phys < d.aux0 || dsdt_phys >= d.aux0 + d.aux1
         {
             continue;
         }
 
-        // Try to map this Frame cap and check its signature.
+        let region_phys = d.aux0;
+        let region_size = d.aux1;
+        let pages = pages_for(region_phys, region_size);
+        let vaddr = ACPI_MAP_BASE + 0x10_0000;
         if syscall::mem_map(
-            desc.slot,
+            d.slot,
             info.aspace_cap,
-            map_vaddr,
+            vaddr,
             0,
-            1,
+            pages,
             syscall::MAP_READONLY,
         )
         .is_err()
@@ -110,74 +150,96 @@ fn find_acpi_table(info: &InitInfo, sig: &[u8; 4], map_vaddr: u64) -> Option<(u3
             continue;
         }
 
-        let page_offset = desc.aux0 & 0xFFF;
-        let data = map_vaddr + page_offset;
-        // SAFETY: just mapped one page; reading 4 bytes at the data offset.
-        let table_sig = unsafe {
-            let p = data as *const u8;
-            [*p, *p.add(1), *p.add(2), *p.add(3)]
-        };
-
-        // Unmap before trying the next cap.
-        let _ = syscall::mem_unmap(info.aspace_cap, map_vaddr, 1);
-
-        if &table_sig == sig
-        {
-            return Some((desc.slot, desc.aux0));
-        }
+        let table_off = dsdt_phys - region_phys;
+        let dsdt_vaddr = vaddr + (region_phys & 0xFFF) + table_off;
+        // SAFETY: dsdt_vaddr is mapped; offset 4 is the SDT length field.
+        let dsdt_len = unsafe { read_u32_at(dsdt_vaddr, 4) } as usize;
+        let result = scan_dsdt_for_s5(dsdt_vaddr, dsdt_len);
+        let _ = syscall::mem_unmap(info.aspace_cap, vaddr, pages);
+        return result;
     }
     None
 }
 
-/// Map the FADT and read `PM1a_CNT_BLK`. Returns `(pm1a_cnt_blk, fadt_phys)`.
-fn map_and_read_fadt(info: &InitInfo, slot: u32, phys: u64) -> Option<(u16, u64)>
+/// Maps each `AcpiReclaimable` region one at a time and returns
+/// `(slot, region_phys_base, region_size, table_offset)` for the first
+/// signature match. The mapping at `map_vaddr` remains live so the caller
+/// can read the table; the caller is responsible for unmapping it.
+///
+/// Returns `None` if no region contains the signature.
+fn find_table_in_acpi_regions(
+    info: &InitInfo,
+    sig: [u8; 4],
+    map_vaddr: u64,
+) -> Option<(u32, u64, u64, usize)>
 {
-    let vaddr = ACPI_MAP_BASE;
-    if syscall::mem_map(slot, info.aspace_cap, vaddr, 0, 1, syscall::MAP_READONLY).is_err()
+    for d in descriptors(info)
     {
-        return None;
-    }
-    let data = vaddr + (phys & 0xFFF);
-    // FADT offset 64: `PM1a_CNT_BLK` (u32, I/O port address).
-    // SAFETY: mapped page contains FADT; offset 64 + 4 = 68 bytes, well within one page.
-    #[allow(clippy::cast_possible_truncation)]
-    let pm1a = unsafe { read_u32_at(data, 64) } as u16;
-    Some((pm1a, phys))
-}
+        if d.cap_type != CapType::Frame
+        {
+            continue;
+        }
+        if d.slot < info.acpi_region_frame_base
+            || d.slot >= info.acpi_region_frame_base + info.acpi_region_frame_count
+        {
+            continue;
+        }
 
-/// Map the DSDT and scan for `\_S5_` to extract `SLP_TYPa`.
-fn map_and_scan_dsdt(info: &InitInfo, slot: u32, phys: u64, vaddr: u64) -> Option<u16>
-{
-    // Map one page to read the header length.
-    if syscall::mem_map(slot, info.aspace_cap, vaddr, 0, 1, syscall::MAP_READONLY).is_err()
-    {
-        return None;
-    }
-    let data = vaddr + (phys & 0xFFF);
-    // SAFETY: mapped page contains DSDT header; offset 4 is the SDT length field.
-    let dsdt_len = unsafe { read_u32_at(data, 4) } as usize;
-
-    // Remap with enough pages to cover the full DSDT.
-    let page_offset = (phys & 0xFFF) as usize;
-    let total_pages = (page_offset + dsdt_len).div_ceil(0x1000);
-    if total_pages > 1
-    {
-        let _ = syscall::mem_unmap(info.aspace_cap, vaddr, 1);
+        let region_phys = d.aux0;
+        let region_size = d.aux1;
+        let pages = pages_for(region_phys, region_size);
         if syscall::mem_map(
-            slot,
+            d.slot,
             info.aspace_cap,
-            vaddr,
+            map_vaddr,
             0,
-            total_pages as u64,
+            pages,
             syscall::MAP_READONLY,
         )
         .is_err()
         {
-            return None;
+            continue;
         }
-    }
 
-    scan_dsdt_for_s5(data, dsdt_len)
+        let region_vaddr = map_vaddr + (region_phys & 0xFFF);
+        if let Some(off) = scan_for_signature(region_vaddr, region_size, sig)
+        {
+            return Some((d.slot, region_phys, region_size, off));
+        }
+
+        let _ = syscall::mem_unmap(info.aspace_cap, map_vaddr, pages);
+    }
+    None
+}
+
+/// Pages needed to cover a region whose physical base may be page-offset.
+fn pages_for(phys: u64, size: u64) -> u64
+{
+    ((phys & 0xFFF) + size).div_ceil(0x1000)
+}
+
+/// Scan `len` bytes starting at `vaddr` for a 4-byte ACPI signature on a
+/// 16-byte aligned offset (ACPI table header alignment per spec).
+fn scan_for_signature(vaddr: u64, len: u64, sig: [u8; 4]) -> Option<usize>
+{
+    let len = usize::try_from(len).ok()?;
+    if len < 4
+    {
+        return None;
+    }
+    // SAFETY: caller-mapped region of `len` bytes at vaddr.
+    let bytes = unsafe { core::slice::from_raw_parts(vaddr as *const u8, len) };
+    let last = len.saturating_sub(4);
+    let mut off = 0;
+    while off <= last
+    {
+        if bytes[off..off + 4] == sig
+        {
+            return Some(off);
+        }
+        off += 16;
+    }
+    None
 }
 
 // ── DSDT scanning ───────────────────────────────────────────────────────────
@@ -297,4 +359,27 @@ unsafe fn read_u32_at(vaddr: u64, off: usize) -> u32
     let p = unsafe { (vaddr as *const u8).add(off) };
     // SAFETY: reading 4 consecutive bytes from a valid mapped address.
     u32::from_le_bytes(unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] })
+}
+
+/// Read a little-endian u64 at byte offset `off` from virtual address `vaddr`.
+///
+/// # Safety
+/// `vaddr` must be mapped and valid for at least `off + 8` bytes.
+unsafe fn read_u64_at(vaddr: u64, off: usize) -> u64
+{
+    // SAFETY: caller guarantees vaddr is mapped for off+8 bytes.
+    let p = unsafe { (vaddr as *const u8).add(off) };
+    // SAFETY: reading 8 consecutive bytes from a valid mapped address.
+    u64::from_le_bytes(unsafe {
+        [
+            *p,
+            *p.add(1),
+            *p.add(2),
+            *p.add(3),
+            *p.add(4),
+            *p.add(5),
+            *p.add(6),
+            *p.add(7),
+        ]
+    })
 }

@@ -1227,15 +1227,16 @@ unsafe fn dealloc_object_one(
                 //
                 // If the thread is still sched.current on its CPU (actively
                 // running or mid-context-switch), we must wait for the context
-                // switch to complete before freeing, otherwise the scheduler
-                // holds stale pointers into freed memory.
-                // SAFETY: tcb validated non-null; sched lock protects queue access.
-                // Lock ALL schedulers, set Exited, remove from all queues.
-                //
-                // preferred_cpu can be stale: between reading it and acquiring
-                // the lock, enqueue_and_wake on another CPU may have moved the
-                // thread. Locking all schedulers eliminates this race entirely.
-                // With only 2 CPUs the overhead is trivial.
+                // Drain protocol per docs/thread-lifecycle-and-sleep.md
+                // § dealloc_object(Thread) Drain Protocol: lock every CPU
+                // (preferred_cpu is racy with concurrent enqueue_and_wake),
+                // commit Exited, drain queues, snapshot any reply-bound
+                // client for wake outside the all-locks region.
+                let server_reply_wake: Option<(
+                    *mut crate::sched::thread::ThreadControlBlock,
+                    u8,
+                    usize,
+                )>;
                 // needless_range_loop: explicit indexing is clearer for scheduler_for(cpu)
                 // and saved_flags[cpu] parallel access.
                 #[allow(clippy::needless_range_loop)]
@@ -1243,7 +1244,6 @@ unsafe fn dealloc_object_one(
                 // ascending order to prevent deadlock; lock_raw paired with unlock_raw.
                 unsafe {
                     use crate::sched::thread::ThreadState;
-                    let prio = (*tcb).priority;
                     let cpu_count = crate::sched::CPU_COUNT
                         .load(core::sync::atomic::Ordering::Relaxed)
                         as usize;
@@ -1257,6 +1257,10 @@ unsafe fn dealloc_object_one(
                         saved_flags[cpu] = crate::sched::scheduler_for(cpu).lock.lock_raw();
                     }
 
+                    // Read priority inside the all-locks region; a concurrent
+                    // sys_thread_set_priority would race outside.
+                    let prio = (*tcb).priority;
+
                     // Mark Exited under all locks — no schedule() on any CPU
                     // can see this thread as Ready/Running after this point.
                     (*tcb).state = ThreadState::Exited;
@@ -1266,6 +1270,47 @@ unsafe fn dealloc_object_one(
                     {
                         crate::sched::scheduler_for(cpu).remove_from_queue(tcb, prio);
                     }
+
+                    // Wake any reply-bound client with Interrupted; otherwise
+                    // they would remain BlockedOnReply with a dangling
+                    // blocked_on_object pointing at this freed server.
+                    // The enqueue is deferred until after the all-locks
+                    // release (enqueue_and_wake takes a scheduler.lock).
+                    server_reply_wake = {
+                        use core::sync::atomic::Ordering;
+                        let bound = (*tcb).reply_tcb.load(Ordering::Acquire);
+                        if bound.is_null()
+                        {
+                            None
+                        }
+                        else if (*tcb)
+                            .reply_tcb
+                            .compare_exchange(
+                                bound,
+                                core::ptr::null_mut(),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            (*bound).blocked_on_object = core::ptr::null_mut();
+                            (*bound).ipc_state = crate::sched::thread::IpcThreadState::None;
+                            (*bound).state = ThreadState::Ready;
+                            let trap_frame = (*bound).trap_frame;
+                            if !trap_frame.is_null()
+                            {
+                                (*trap_frame).set_return(syscall::SyscallError::Interrupted as i64);
+                            }
+                            let bp = (*bound).priority;
+                            let bcpu = crate::sched::select_target_cpu(bound);
+                            Some((bound, bp, bcpu))
+                        }
+                        else
+                        {
+                            // Concurrent cancel beat us.
+                            None
+                        }
+                    };
 
                     // Check if the thread is actively running (sched.current)
                     // on any CPU.
@@ -1287,8 +1332,12 @@ unsafe fn dealloc_object_one(
                             .unlock_raw(saved_flags[cpu]);
                     }
 
-                    // If the thread is mid-context-switch on another CPU, spin
-                    // until it finishes.
+                    // UAF gate: wait for the in-flight switch (if any) to
+                    // both move off `tcb` AND publish context_saved=1. The
+                    // context_saved spin is unconditional — the all-locks
+                    // running_on snapshot can race past schedule()'s
+                    // pre-save lock release. See
+                    // docs/scheduling-internals.md § Cross-CPU TCB Ownership.
                     if let Some(run_cpu) = running_on
                     {
                         let sched = crate::sched::scheduler_for(run_cpu);
@@ -1302,6 +1351,21 @@ unsafe fn dealloc_object_one(
                             core::hint::spin_loop();
                         }
                     }
+                    while (*tcb)
+                        .context_saved
+                        .load(core::sync::atomic::Ordering::Acquire)
+                        == 0
+                    {
+                        core::hint::spin_loop();
+                    }
+                }
+
+                // Wake the captured reply-bound client outside the all-locks
+                // region (enqueue_and_wake takes a scheduler.lock).
+                if let Some((bound, bp, bcpu)) = server_reply_wake
+                {
+                    // SAFETY: bound prepared under all-CPU locks above.
+                    unsafe { crate::sched::enqueue_and_wake(bound, bcpu, bp) };
                 }
 
                 // Unlink this thread from any IPC object it's blocked on.
@@ -1370,14 +1434,32 @@ unsafe fn dealloc_object_one(
                             IpcThreadState::BlockedOnWaitSet =>
                             {
                                 let ws = blocked_obj.cast::<crate::ipc::wait_set::WaitSetState>();
-                                // WaitSetState has a single waiter field.
+                                // SAFETY: ws is valid; lock serialises with waitset ops.
+                                let saved = (*ws).lock.lock_raw();
                                 if (*ws).waiter == tcb
                                 {
                                     (*ws).waiter = core::ptr::null_mut();
                                 }
+                                (*ws).lock.unlock_raw(saved);
                             }
-                            _ =>
-                            {} // None, BlockedOnReply: no cleanup needed
+                            IpcThreadState::BlockedOnReply =>
+                            {
+                                // blocked_obj is the server TCB. CAS-clear
+                                // the server's reply slot iff this dying
+                                // client is still bound — mirror
+                                // cancel_ipc_block.
+                                use core::sync::atomic::Ordering;
+                                let server =
+                                    blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
+                                let _ = (*server).reply_tcb.compare_exchange(
+                                    tcb,
+                                    core::ptr::null_mut(),
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                );
+                            }
+                            IpcThreadState::None =>
+                            {}
                         }
                         (*tcb).blocked_on_object = core::ptr::null_mut();
                     }
@@ -1673,14 +1755,14 @@ unsafe fn dealloc_object_one(
                 // SAFETY: state validated non-null; wake queue traversal under sched lock.
                 unsafe {
                     let ep = &mut *state;
-                    // Wake senders.
+                    // Wake senders. enqueue_and_wake commits the state
+                    // transitions under sched.lock; we only detach the
+                    // intrusive list pointers here.
                     let mut tcb = ep.send_head;
                     while !tcb.is_null()
                     {
                         let next = (*tcb).ipc_wait_next;
                         (*tcb).ipc_wait_next = None;
-                        (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
-                        (*tcb).state = crate::sched::thread::ThreadState::Ready;
                         let prio = (*tcb).priority;
                         let target_cpu = crate::sched::select_target_cpu(tcb);
                         crate::sched::enqueue_and_wake(tcb, target_cpu, prio);
@@ -1694,8 +1776,6 @@ unsafe fn dealloc_object_one(
                     {
                         let next = (*tcb).ipc_wait_next;
                         (*tcb).ipc_wait_next = None;
-                        (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
-                        (*tcb).state = crate::sched::thread::ThreadState::Ready;
                         let prio = (*tcb).priority;
                         let target_cpu = crate::sched::select_target_cpu(tcb);
                         crate::sched::enqueue_and_wake(tcb, target_cpu, prio);
@@ -1810,9 +1890,9 @@ unsafe fn dealloc_object_one(
                     if !waiter.is_null()
                     {
                         sig.waiter = core::ptr::null_mut();
+                        // wakeup_value=0 = drop semantics; state transitions
+                        // committed by enqueue_and_wake.
                         (*waiter).wakeup_value = 0;
-                        (*waiter).ipc_state = crate::sched::thread::IpcThreadState::None;
-                        (*waiter).state = crate::sched::thread::ThreadState::Ready;
                         let prio = (*waiter).priority;
                         let target_cpu = crate::sched::select_target_cpu(waiter);
                         crate::sched::enqueue_and_wake(waiter, target_cpu, prio);

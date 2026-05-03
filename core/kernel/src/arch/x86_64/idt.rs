@@ -237,9 +237,15 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
 
         if !tcb.is_null()
         {
-            // SAFETY: tcb validated non-null; state field always valid.
+            // Commit Exited under all-CPU scheduler.locks so a concurrent
+            // dealloc observes a coherent state. See
+            // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
+            // SAFETY: tcb validated non-null.
             unsafe {
-                (*tcb).state = crate::sched::thread::ThreadState::Exited;
+                crate::sched::set_state_under_all_locks(
+                    tcb,
+                    crate::sched::thread::ThreadState::Exited,
+                );
             }
 
             // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + vector).

@@ -168,9 +168,12 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let tcb = unsafe { current_tcb() };
     if !tcb.is_null()
     {
-        // SAFETY: tcb validated non-null; state field always valid for initialized TCB.
+        // Commit Exited under all-CPU scheduler.locks so a concurrent
+        // dealloc on another CPU observes a coherent state and the local
+        // schedule() below sees the Exited skip-bit.
+        // SAFETY: tcb validated non-null.
         unsafe {
-            (*tcb).state = ThreadState::Exited;
+            crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
         }
 
         // Post death notification if bound (exit_reason 0 = clean exit).
@@ -222,7 +225,19 @@ fn sys_thread_sleep(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*tcb).state = crate::sched::thread::ThreadState::Blocked;
     }
 
-    crate::sched::sleep_list_add(tcb);
+    if crate::sched::sleep_list_add(tcb).is_err()
+    {
+        // Sleep list at capacity. Roll back: sys_thread_sleep has no IPC
+        // source to fall back on; the only honest answer is to surface the
+        // failure to userspace. See docs/thread-lifecycle-and-sleep.md
+        // § Sleep List Invariants.
+        // SAFETY: tcb valid; restoring to Ready before any schedule().
+        unsafe {
+            (*tcb).sleep_deadline = 0;
+            (*tcb).state = crate::sched::thread::ThreadState::Running;
+        }
+        return Err(SyscallError::OutOfMemory);
+    }
 
     // SAFETY: called from syscall handler on valid kernel stack.
     unsafe {

@@ -180,7 +180,9 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidArgument);
         }
 
-        (*target_tcb).state = ThreadState::Ready;
+        // All-CPU lock commit closes the cross-CPU dealloc race; see
+        // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
+        crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready);
         let prio = (*target_tcb).priority;
         // Route to correct CPU based on affinity.
         let target_cpu = crate::sched::select_target_cpu(target_tcb);
@@ -256,18 +258,70 @@ pub fn sys_thread_stop(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
             ThreadState::Ready | ThreadState::Running =>
             {
-                // Thread is in a run queue or currently running. Set state to Stopped;
-                // the scheduler's skip loop will handle it on the next context switch.
-                // TODO(SMP): send IPI when target is running on another CPU.
+                // No source-side cleanup; the all-locks Stopped write
+                // below + the scheduler skip-loop + the cross-CPU IPI
+                // (Running case) drain the target.
             }
         }
 
-        (*target_tcb).state = ThreadState::Stopped;
+        // See docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine
+        // (sys_thread_stop rows).
+        let running_on = crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Stopped);
 
         // If stopping self (Running → Stopped): yield so another thread runs.
         if core::ptr::eq(target_tcb, caller_tcb)
         {
             crate::sched::schedule(false);
+        }
+        else if let Some(run_cpu) = running_on
+        {
+            // Cross-CPU drain: IPI forces the remote into schedule() so
+            // sys_thread_read_regs sees a fresh trap_frame.
+            let current_cpu = crate::arch::current::cpu::current_cpu() as usize;
+            if run_cpu != current_cpu
+            {
+                // SAFETY: run_cpu < CPU_COUNT.
+                crate::sched::prod_remote_cpu(run_cpu);
+
+                let sched_remote = crate::sched::scheduler_for(run_cpu);
+                let spin_start = crate::arch::current::timer::current_tick();
+                let mut warned = false;
+                while {
+                    let s = sched_remote.lock.lock_raw();
+                    let still_current = sched_remote.current == target_tcb;
+                    sched_remote.lock.unlock_raw(s);
+                    still_current
+                }
+                {
+                    // Single-shot diagnostic at >100 ms.
+                    if !warned
+                    {
+                        let now = crate::arch::current::timer::current_tick();
+                        let tps = crate::arch::current::timer::ticks_per_second();
+                        if tps != 0 && now.saturating_sub(spin_start) > tps / 10
+                        {
+                            warned = true;
+                            // SAFETY: target_tcb validated above; cur read racily for diagnostic.
+                            #[allow(unused_unsafe)]
+                            unsafe {
+                                let tid = (*target_tcb).thread_id;
+                                let st = (*target_tcb).state;
+                                let cur = sched_remote.current;
+                                let cur_tid = if cur.is_null() { 0 } else { (*cur).thread_id };
+                                crate::kprintln!(
+                                    "kernel: sys_thread_stop spin >100ms target_tid={} \
+                                     state={:?} run_cpu={} cur_tid={}",
+                                    tid,
+                                    st,
+                                    run_cpu,
+                                    cur_tid
+                                );
+                            }
+                        }
+                    }
+                    core::hint::spin_loop();
+                }
+            }
         }
     }
 
@@ -300,6 +354,10 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
     // SAFETY: tcb validated by caller; blocked_on_object field always valid.
     let blocked_on = unsafe { (*tcb).blocked_on_object };
 
+    // Each branch acquires the source IPC lock matching `ipc_state` before
+    // touching the source's waiter / queue. Lock order: scheduler.lock
+    // (outer, held by caller) → source IPC lock (inner). See
+    // docs/scheduling-internals.md § Lock Hierarchy rule 7.
     match ipc_state
     {
         IpcThreadState::BlockedOnSend =>
@@ -309,9 +367,11 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = blocked_on.cast::<EndpointState>();
-                // SAFETY: blocked_on_object is a valid EndpointState ptr.
+                // SAFETY: blocked_on is a valid EndpointState ptr.
                 unsafe {
+                    let saved = (*ep).lock.lock_raw();
                     unlink_from_wait_queue(tcb, &mut (*ep).send_head, &mut (*ep).send_tail);
+                    (*ep).lock.unlock_raw(saved);
                 }
             }
         }
@@ -323,25 +383,32 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep = blocked_on.cast::<EndpointState>();
-                // SAFETY: blocked_on_object is a valid EndpointState ptr.
+                // SAFETY: blocked_on is a valid EndpointState ptr.
                 unsafe {
+                    let saved = (*ep).lock.lock_raw();
                     unlink_from_wait_queue(tcb, &mut (*ep).recv_head, &mut (*ep).recv_tail);
+                    (*ep).lock.unlock_raw(saved);
                 }
             }
         }
 
         IpcThreadState::BlockedOnReply =>
         {
-            // blocked_on_object is the server TCB. Clear the server's reply
-            // target so its next reply call is a no-op for this caller.
+            // blocked_on is the server TCB. compare_exchange so we don't
+            // clobber a different client's binding (server may have moved on).
             if !blocked_on.is_null()
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
-                // SAFETY: server is a valid TCB pointer.
+                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
                 unsafe {
-                    (*server).reply_tcb = core::ptr::null_mut();
+                    let _ = (*server).reply_tcb.compare_exchange(
+                        tcb,
+                        core::ptr::null_mut(),
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    );
                 }
             }
         }
@@ -353,12 +420,14 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig = blocked_on.cast::<SignalState>();
-                // SAFETY: blocked_on_object is a valid SignalState ptr.
+                // SAFETY: blocked_on is a valid SignalState ptr.
                 unsafe {
+                    let saved = (*sig).lock.lock_raw();
                     if core::ptr::eq((*sig).waiter, tcb)
                     {
                         (*sig).waiter = core::ptr::null_mut();
                     }
+                    (*sig).lock.unlock_raw(saved);
                 }
             }
         }
@@ -370,12 +439,14 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq = blocked_on.cast::<EventQueueState>();
-                // SAFETY: blocked_on_object is a valid EventQueueState ptr.
+                // SAFETY: blocked_on is a valid EventQueueState ptr.
                 unsafe {
+                    let saved = (*eq).lock.lock_raw();
                     if core::ptr::eq((*eq).waiter, tcb)
                     {
                         (*eq).waiter = core::ptr::null_mut();
                     }
+                    (*eq).lock.unlock_raw(saved);
                 }
             }
         }
@@ -387,12 +458,14 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ws = blocked_on.cast::<WaitSetState>();
-                // SAFETY: blocked_on_object is a valid WaitSetState ptr.
+                // SAFETY: blocked_on is a valid WaitSetState ptr.
                 unsafe {
+                    let saved = (*ws).lock.lock_raw();
                     if core::ptr::eq((*ws).waiter, tcb)
                     {
                         (*ws).waiter = core::ptr::null_mut();
                     }
+                    (*ws).lock.unlock_raw(saved);
                 }
             }
         }

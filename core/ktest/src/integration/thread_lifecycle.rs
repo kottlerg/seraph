@@ -32,7 +32,8 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult};
 
-const RIGHTS_SIGNAL_WAIT: u64 = (1 << 7) | (1 << 8);
+const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_WAIT: u64 = 1 << 8;
 
 #[cfg(target_arch = "x86_64")]
 const IP_OFFSET: usize = 120;
@@ -47,29 +48,37 @@ static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 pub fn run(ctx: &TestContext) -> TestResult
 {
     const BUF: usize = 512;
-    let sync = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "integration::thread_lifecycle: cap_create_signal failed")?;
+    // Two distinct signals — child→parent readiness and child blocking
+    // primitive — so the child cannot self-deliver its own readiness send
+    // before the parent has registered as the waiter (race observed on SMP).
+    let ready = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "integration::thread_lifecycle: cap_create_signal (ready) failed")?;
+    let block = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "integration::thread_lifecycle: cap_create_signal (block) failed")?;
     let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "integration::thread_lifecycle: cap_create_cspace failed")?;
-    let child_sync = cap_copy(sync, cs, RIGHTS_SIGNAL_WAIT)
-        .map_err(|_| "integration::thread_lifecycle: cap_copy failed")?;
+    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+        .map_err(|_| "integration::thread_lifecycle: cap_copy (ready→child) failed")?;
+    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+        .map_err(|_| "integration::thread_lifecycle: cap_copy (block→child) failed")?;
     let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     thread_configure(
         th,
         blocker_entry as *const () as u64,
         stack_top,
-        u64::from(child_sync),
+        blocker_arg,
     )
     .map_err(|_| "integration::thread_lifecycle: thread_configure failed")?;
 
     // ── Step 3: Start — child signals readiness. ──────────────────────────────
     thread_start(th).map_err(|_| "integration::thread_lifecycle: thread_start failed")?;
-    let ready = signal_wait(sync)
+    let ready_bits = signal_wait(ready)
         .map_err(|_| "integration::thread_lifecycle: signal_wait (readiness) failed")?;
-    if ready != 0x1
+    if ready_bits != 0x1
     {
         return Err("integration::thread_lifecycle: child sent wrong readiness bits");
     }
@@ -93,7 +102,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── Step 6: Redirect IP to phase2_entry. ──────────────────────────────────
-    PHASE2_SIG.store(child_sync, Ordering::Release);
+    // phase2_entry will send 0x2 through the same `child_ready` cap parent
+    // is now about to wait on.
+    PHASE2_SIG.store(child_ready, Ordering::Release);
     let phase2_ptr = phase2_entry as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&phase2_ptr.to_le_bytes());
     thread_write_regs(th, reg_buf.as_ptr(), BUF)
@@ -101,7 +112,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // ── Step 7: Resume — child lands in phase2_entry and sends 0x2. ──────────
     thread_start(th).map_err(|_| "integration::thread_lifecycle: thread_start (resume) failed")?;
-    let phase2_bits = signal_wait(sync)
+    let phase2_bits = signal_wait(ready)
         .map_err(|_| "integration::thread_lifecycle: signal_wait (phase2) failed")?;
     if phase2_bits != 0x2
     {
@@ -126,17 +137,20 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(th2).ok();
     cap_delete(cs2).ok();
     cap_delete(th).ok();
-    cap_delete(sync).ok();
+    cap_delete(ready).ok();
+    cap_delete(block).ok();
     cap_delete(cs).ok();
     Ok(())
 }
 
-// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
+// cast_possible_truncation: cap slot indices are guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn blocker_entry(sig_slot: u64) -> !
+fn blocker_entry(arg: u64) -> !
 {
-    signal_send(sig_slot as u32, 0x1).ok();
-    signal_wait(sig_slot as u32).ok();
+    let ready_slot = (arg >> 32) as u32;
+    let block_slot = (arg & 0xFFFF_FFFF) as u32;
+    signal_send(ready_slot, 0x1).ok();
+    signal_wait(block_slot).ok();
     loop
     {
         core::hint::spin_loop();

@@ -170,17 +170,26 @@ The direct switch is only valid when:
 ### Object Structure
 
 ```rust
-pub struct Signal
+pub struct SignalState
 {
     /// Atomic bitmask: set bits represent pending events.
-    bits: AtomicU64,
+    pub bits: AtomicU64,
 
-    /// Waiter waiting in SYS_SIGNAL_WAIT, or None.
-    /// Protected by `waiter_lock` to prevent the common case of racing
-    /// between a send and a wait.
-    waiter: Mutex<Option<*mut ThreadControlBlock>>,
+    /// Waiter waiting in SYS_SIGNAL_WAIT, or null.
+    /// Protected by `lock` (see scheduling-internals.md § Lock Hierarchy).
+    pub waiter: *mut ThreadControlBlock,
 
-    header: KernelObjectHeader,
+    /// Optional wait-set back-pointer (null if not in any wait set).
+    pub wait_set: *mut u8,
+    pub wait_set_member_idx: u8,
+
+    /// Lock-free fast-path flag: non-zero iff a waiter or wait-set is registered.
+    /// Read with a SeqCst fence in the signal_send fast path; the Dekker pair
+    /// is documented in scheduling-internals.md § Atomic Ordering Invariants.
+    pub has_observer: AtomicU8,
+
+    /// Spinlock serialising slow-path send/wait and waiter-slot mutations.
+    pub lock: Spinlock,
 }
 ```
 
@@ -189,17 +198,24 @@ pub struct Signal
 `SYS_SIGNAL_SEND`:
 
 ```
-1. bits.fetch_or(bits_arg, Ordering::Release)
-2. Acquire waiter_lock
-3. if waiter is Some(tcb):
-   a. waiter = None
-   a2. acquired = bits.swap(0, Ordering::Acquire)
-       // Atomically read and clear the bits for the waking thread
-   a3. tcb.wakeup_value = acquired
-   b. Release waiter_lock
-   c. Mark tcb as Ready; enqueue
-4. else:
-   Release waiter_lock
+1. bits.fetch_or(bits_arg, Ordering::Relaxed)
+2. SeqCst fence (Dekker pair with signal_wait)
+3. if has_observer == 0: return None      // lock-free fast path
+4. Acquire sig.lock
+5. if waiter is Some(tcb):
+   a. delivered = bits.swap(0, Ordering::Relaxed)
+   b. if delivered == 0: release sig.lock; return None
+      (a fast-path signal_wait between steps 1 and 4 consumed our
+       bits; the current sig.waiter is a *new* waiter who must NOT
+       be touched, else they receive wakeup_value=0 — a spurious
+       wake, since 0-bit sends are rejected at step 1)
+   c. waiter = None; has_observer = (wait_set != null)
+   d. tcb.wakeup_value = delivered
+   e. if tcb.sleep_deadline != 0: clear it and sleep_list_remove(tcb)
+   f. Release sig.lock
+   g. enqueue_and_wake(tcb, target_cpu)        // outside the lock
+6. else if wait_set is Some(ws): waitset_notify(ws); release; return None
+7. else: release; return None                  // observer disappeared
 ```
 
 The atomic OR in step 1 is the only operation on the hot path when no waiter is
@@ -236,34 +252,33 @@ behaviour.
 ### Object Structure
 
 ```rust
-pub struct EventQueueHeader
+pub struct EventQueueState
 {
-    lock: Spinlock,
-
-    /// Ring buffer stored separately (allocated from size-class allocator).
-    ring: NonNull<u64>,
+    pub lock: Spinlock,
 
     /// Capacity of the ring (fixed at creation).
-    capacity: u32,
+    pub capacity: u32,
 
     /// Write index (producer position, modulo capacity).
-    write_idx: u32,
+    pub write_idx: u32,
 
     /// Read index (consumer position, modulo capacity).
-    read_idx: u32,
+    pub read_idx: u32,
 
-    /// Waiter blocked in SYS_EVENT_RECV, or None.
-    waiter: Option<*mut ThreadControlBlock>,
+    /// Waiter blocked in SYS_EVENT_RECV, or null.
+    pub waiter: *mut ThreadControlBlock,
 
-    header: KernelObjectHeader,
+    // ... additional bookkeeping fields ...
 }
 ```
 
-When the user requests capacity N, the kernel allocates a ring buffer of N+1 entries.
-The one-slot gap between `write_idx` and `read_idx` (used to distinguish full from
-empty) is thus internal. The user observes exactly N usable slots, matching the
-requested capacity. The ring buffer body is allocated from the size-class allocator
-at creation time. The `EventQueueHeader` is allocated from a slab cache.
+When the user requests capacity N, the kernel reserves a ring buffer of N+1
+entries laid out **inline within the same retype slot** that holds the
+`EventQueueState` (see the typed-memory cap design and
+[scheduling-internals.md](scheduling-internals.md)). The one-slot gap between
+`write_idx` and `read_idx` (used to distinguish full from empty) is internal;
+the user observes exactly N usable slots. The ring is reclaimed wholesale with
+the wrapper on `dealloc_object(EventQueue)`.
 
 ### Post Path
 
@@ -333,8 +348,9 @@ path — sequential, not nested, so no cycle.
 
 ```rust
 /// Maximum number of sources a single WaitSet may contain.
-/// Chosen so the WaitSet fits in a fixed-size slab allocation.
-const WAIT_SET_MAX_MEMBERS: usize = 64;
+/// Chosen so the WaitSet fits in the sub-page in-place retype slot
+/// (per scheduling-internals.md and the typed-memory cap design).
+pub const WAIT_SET_MAX_MEMBERS: usize = 16;
 
 pub struct WaitSet
 {
@@ -445,55 +461,21 @@ of readiness events are remembered.
 
 ### Lock Ordering
 
-The following global ordering must be observed everywhere in the kernel. Acquiring
-locks in the reverse order, or skipping levels, risks deadlock.
+The lock hierarchy that applies to IPC primitives, the cross-CPU TCB ownership
+rules, and the wake-protocol invariants are specified in
+[scheduling-internals.md](scheduling-internals.md). That document is
+authoritative for all cross-cutting concurrency rules touched by IPC.
 
-```
-Global lock ordering (acquire in this order; never reverse):
-
-1. Per-CPU scheduler lock
-   — when acquiring scheduler locks on two CPUs, always acquire the lower
-     CPU ID's lock first (prevents deadlock during load balancing)
-
-2. IPC object lock (endpoint / signal / event queue)
-   — one lock per object; never hold two IPC object locks simultaneously
-     except on a defined path that documents the ordering explicitly
-
-3. Wait set lock
-   — always acquired after the source IPC object lock that triggered the
-     notification (waitset_notify: source lock → wait set lock)
-   — SYS_WAIT_SET_REMOVE acquires in the same order: source lock first
-
-4. Buddy allocator lock
-
-5. Derivation tree lock (reader or writer)
-   — ordered after IPC object locks; SYS_CAP_REVOKE must NOT acquire IPC
-     object locks while holding the derivation tree write lock
-```
-
-**Deferred cleanup during revocation:** Because the derivation tree lock is ordered
-after IPC object locks, `SYS_CAP_REVOKE` cannot directly acquire IPC object locks
-while traversing the tree. Instead, revocation uses a two-phase approach:
-
-1. Hold the derivation tree write lock; collect a list of IPC objects that
-   reference any slot being revoked (e.g. endpoints with registered waitsets).
-2. Release the derivation tree write lock.
-3. For each collected object, acquire its IPC object lock and perform cleanup
-   (unregister wait set back-pointers, cancel blocked sends, etc.).
-
-This "deferred cleanup" pattern keeps lock ordering consistent at the cost of a
-second pass during revocation. Revocation is expected to be rare.
+The capability-revocation deferred-cleanup pattern remains specified in
+[capability-internals.md](capability-internals.md).
 
 ### Cross-CPU Wakeup
 
-When the kernel marks a TCB as `Ready` and enqueues it on a run queue, the TCB may
-belong to a different CPU's run queue (based on affinity). In this case:
-
-1. Enqueue the TCB on the target CPU's run queue (under the run queue lock)
-2. Send an IPI to the target CPU if it is idle (in the idle thread)
-
-The IPI wakes the target CPU's idle thread, which then picks up the newly ready TCB
-through the normal scheduler path.
+The wake protocol — producer-side enqueue plus RESCHEDULE_PENDING set, IPI
+delivery, consumer-side atomic check-and-halt — is specified in
+[scheduling-internals.md § Wake Protocol Invariants](scheduling-internals.md#wake-protocol-invariants).
+IPC primitives invoke `enqueue_and_wake` after releasing their source IPC lock
+per [§ Lock Hierarchy rule 5](scheduling-internals.md#lock-hierarchy).
 
 ### Lock-Free Signal Fast Path
 

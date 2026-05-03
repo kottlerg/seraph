@@ -308,6 +308,12 @@ impl PerCpuScheduler
         self.non_empty.load(Ordering::Acquire) != 0
     }
 
+    /// Diagnostic: snapshot of the per-priority `non_empty` bitmask.
+    pub fn non_empty_mask(&self) -> u32
+    {
+        self.non_empty.load(Ordering::Relaxed)
+    }
+
     /// Remove `tcb` from its priority queue. No-op if not found.
     ///
     /// Used by `dealloc_object(Thread)` to prevent use-after-free:

@@ -30,9 +30,12 @@ use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// Copy of SIGNAL + WAIT rights (bits 7 and 8). Child needs WAIT to block in
-// signal_wait, giving the parent a stable TrapFrame to read/write.
-const RIGHTS_SIGNAL_WAIT: u64 = (1 << 7) | (1 << 8);
+// SIGNAL = bit 7, WAIT = bit 8. Tests that pin a child in signal_wait give
+// the child SIGNAL on the readiness cap and WAIT on a *separate* blocking
+// cap, so the child cannot self-deliver its own readiness send before the
+// parent has registered as the waiter.
+const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_WAIT: u64 = 1 << 8;
 
 // Expected TrapFrame size per architecture (kernel/src/arch/*/trap_frame.rs).
 #[cfg(target_arch = "x86_64")]
@@ -123,29 +126,33 @@ pub fn r#yield(_ctx: &TestContext) -> TestResult
 pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 {
     const BUF_SIZE: usize = 512; // Larger than any architecture's TrapFrame.
-    let sync = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for stop_read_regs failed")?;
+    let ready = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal (ready) for stop_read_regs failed")?;
+    let block = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal (block) for stop_read_regs failed")?;
     let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "create_cspace for stop_read_regs failed")?;
-    // Child needs SIGNAL+WAIT so it can both send (readiness) and block (signal_wait).
-    let child_sync =
-        cap_copy(sync, cs, RIGHTS_SIGNAL_WAIT).map_err(|_| "cap_copy for stop_read_regs failed")?;
+    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+        .map_err(|_| "cap_copy (ready) for stop_read_regs failed")?;
+    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+        .map_err(|_| "cap_copy (block) for stop_read_regs failed")?;
     let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for stop_read_regs failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_STOP_REGS));
+    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     thread_configure(
         th,
         blocker_entry as *const () as u64,
         stack_top,
-        u64::from(child_sync),
+        blocker_arg,
     )
     .map_err(|_| "thread_configure for stop_read_regs failed")?;
     thread_start(th).map_err(|_| "thread_start for stop_read_regs failed")?;
 
     // Wait for the child to signal readiness then enter its blocking signal_wait.
-    let ready = signal_wait(sync).map_err(|_| "signal_wait (readiness) failed")?;
-    if ready != 0x1
+    let ready_bits = signal_wait(ready).map_err(|_| "signal_wait (readiness) failed")?;
+    if ready_bits != 0x1
     {
         return Err("child sent wrong readiness bits (expected 0x1)");
     }
@@ -175,7 +182,8 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(th).map_err(|_| "cap_delete th after stop_read_regs failed")?;
-    cap_delete(sync).map_err(|_| "cap_delete sync after stop_read_regs failed")?;
+    cap_delete(ready).map_err(|_| "cap_delete ready after stop_read_regs failed")?;
+    cap_delete(block).map_err(|_| "cap_delete block after stop_read_regs failed")?;
     cap_delete(cs).map_err(|_| "cap_delete cs after stop_read_regs failed")?;
     Ok(())
 }
@@ -185,28 +193,33 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 /// Stopping an already-stopped thread returns `InvalidState`.
 pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for double-stop test failed")?;
+    let ready = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal (ready) for double-stop test failed")?;
+    let block = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal (block) for double-stop test failed")?;
     let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "create_cspace for double-stop test failed")?;
-    let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL_WAIT)
-        .map_err(|_| "cap_copy for double-stop test failed")?;
+    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+        .map_err(|_| "cap_copy (ready) for double-stop test failed")?;
+    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+        .map_err(|_| "cap_copy (block) for double-stop test failed")?;
     let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for double-stop test failed")?;
 
     // Tests run sequentially; STACK_STOP_REGS contents are stale but the child
     // from the previous test is stopped. Using STACK_WRITE_REGS for safety.
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
+    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     thread_configure(
         th,
         blocker_entry as *const () as u64,
         stack_top,
-        u64::from(child_sig),
+        blocker_arg,
     )
     .map_err(|_| "thread_configure for double-stop test failed")?;
     thread_start(th).map_err(|_| "thread_start for double-stop test failed")?;
 
-    let _ = signal_wait(sig); // Wait for readiness signal.
+    let _ = signal_wait(ready); // Wait for readiness signal.
     thread_stop(th).map_err(|_| "first thread_stop failed")?;
 
     // Second stop on a Stopped thread must return InvalidState.
@@ -217,7 +230,8 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(th).map_err(|_| "cap_delete th after double-stop test failed")?;
-    cap_delete(sig).map_err(|_| "cap_delete sig after double-stop test failed")?;
+    cap_delete(ready).map_err(|_| "cap_delete ready after double-stop test failed")?;
+    cap_delete(block).map_err(|_| "cap_delete block after double-stop test failed")?;
     cap_delete(cs).map_err(|_| "cap_delete cs after double-stop test failed")?;
     Ok(())
 }
@@ -232,31 +246,36 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 {
     const BUF_SIZE: usize = 512;
-    let sync = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for write_regs_resume failed")?;
+    let ready = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal (ready) for write_regs_resume failed")?;
+    let block = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal (block) for write_regs_resume failed")?;
     let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "create_cspace for write_regs_resume failed")?;
-    let child_sync = cap_copy(sync, cs, RIGHTS_SIGNAL_WAIT)
-        .map_err(|_| "cap_copy for write_regs_resume failed")?;
+    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+        .map_err(|_| "cap_copy (ready) for write_regs_resume failed")?;
+    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+        .map_err(|_| "cap_copy (block) for write_regs_resume failed")?;
     let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for write_regs_resume failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
+    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     thread_configure(
         th,
         blocker_entry as *const () as u64,
         stack_top,
-        u64::from(child_sync),
+        blocker_arg,
     )
     .map_err(|_| "thread_configure for write_regs_resume failed")?;
     thread_start(th).map_err(|_| "thread_start for write_regs_resume failed")?;
 
     // Wait for readiness then stop while the child is blocked.
-    let _ = signal_wait(sync);
+    let _ = signal_wait(ready);
     thread_stop(th).map_err(|_| "thread_stop for write_regs_resume failed")?;
 
-    // Publish the signal cap for phase2 before rewriting the IP.
-    PHASE2_SIG.store(child_sync, Ordering::Release);
+    // Publish the signal cap phase2_entry will send through.
+    PHASE2_SIG.store(child_ready, Ordering::Release);
 
     let mut reg_buf = [0u8; BUF_SIZE];
     thread_read_regs(th, reg_buf.as_mut_ptr(), BUF_SIZE)
@@ -271,14 +290,15 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
     // Resume — child runs phase2_entry and sends 0x2.
     thread_start(th).map_err(|_| "thread_start (resume) for write_regs_resume failed")?;
 
-    let bits = signal_wait(sync).map_err(|_| "signal_wait for phase2 confirmation failed")?;
+    let bits = signal_wait(ready).map_err(|_| "signal_wait for phase2 confirmation failed")?;
     if bits != 0x2
     {
         return Err("phase2_entry did not send expected value 0x2 after write_regs resume");
     }
 
     cap_delete(th).map_err(|_| "cap_delete th after write_regs_resume failed")?;
-    cap_delete(sync).map_err(|_| "cap_delete sync after write_regs_resume failed")?;
+    cap_delete(ready).map_err(|_| "cap_delete ready after write_regs_resume failed")?;
+    cap_delete(block).map_err(|_| "cap_delete block after write_regs_resume failed")?;
     cap_delete(cs).map_err(|_| "cap_delete cs after write_regs_resume failed")?;
     Ok(())
 }
@@ -403,27 +423,32 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 /// a stable point at which the thread is no longer in `Created` state.
 pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for configure_running_thread_err failed")?;
+    let ready = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal (ready) for configure_running_thread_err failed")?;
+    let block = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal (block) for configure_running_thread_err failed")?;
     let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
         .map_err(|_| "create_cspace for configure_running_thread_err failed")?;
-    let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL_WAIT)
-        .map_err(|_| "cap_copy for configure_running_thread_err failed")?;
+    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+        .map_err(|_| "cap_copy (ready) for configure_running_thread_err failed")?;
+    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+        .map_err(|_| "cap_copy (block) for configure_running_thread_err failed")?;
     let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
         .map_err(|_| "cap_create_thread for configure_running_thread_err failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_ERR));
+    let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
     thread_configure(
         th,
         blocker_entry as *const () as u64,
         stack_top,
-        u64::from(child_sig),
+        blocker_arg,
     )
     .map_err(|_| "first thread_configure failed")?;
     thread_start(th).map_err(|_| "thread_start failed")?;
 
     // Wait for the child to signal readiness (it is now Running or Blocked).
-    signal_wait(sig).map_err(|_| "signal_wait for readiness failed")?;
+    signal_wait(ready).map_err(|_| "signal_wait for readiness failed")?;
 
     // Attempting to configure a non-Created thread must fail.
     let err = thread_configure(th, blocker_entry as *const () as u64, stack_top, 0);
@@ -431,7 +456,8 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
     // Stop the blocked child before cleanup.
     thread_stop(th).ok();
     cap_delete(th).map_err(|_| "cap_delete th after configure_running_thread_err failed")?;
-    cap_delete(sig).map_err(|_| "cap_delete sig after configure_running_thread_err failed")?;
+    cap_delete(ready).map_err(|_| "cap_delete ready after configure_running_thread_err failed")?;
+    cap_delete(block).map_err(|_| "cap_delete block after configure_running_thread_err failed")?;
     cap_delete(cs).map_err(|_| "cap_delete cs after configure_running_thread_err failed")?;
 
     if err.is_ok()
@@ -680,14 +706,19 @@ fn sender_entry(sig_slot: u64) -> !
 /// `TrapFrame` for `thread_read_regs` / `thread_write_regs`. If the parent
 /// later resumes it (via `write_regs` redirect), execution jumps to `phase2_entry`
 /// instead of returning from this `signal_wait`.
-// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
+// cast_possible_truncation: cap slot indices are guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
-fn blocker_entry(sig_slot: u64) -> !
+fn blocker_entry(arg: u64) -> !
 {
-    signal_send(sig_slot as u32, 0x1).ok();
+    // arg packs (ready_slot << 32) | block_slot. Two distinct caps so the
+    // child cannot self-deliver its own readiness send before the parent has
+    // registered as the waiter.
+    let ready_slot = (arg >> 32) as u32;
+    let block_slot = (arg & 0xFFFF_FFFF) as u32;
+    signal_send(ready_slot, 0x1).ok();
     // Block so the parent can stop us and read a stable TrapFrame.
     // If write_regs redirects our IP, we jump directly to phase2_entry on resume.
-    signal_wait(sig_slot as u32).ok();
+    signal_wait(block_slot).ok();
     // Not normally reached — parent always stops us while blocked.
     loop
     {

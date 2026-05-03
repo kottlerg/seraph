@@ -115,15 +115,26 @@ const AP_IST_PAIR_SIZE: usize = 16384;
 /// IST2) for AP with that id; slot 0 is unused (BSP has its own
 /// [`crate::arch::x86_64::interrupts`] `BSP_IST_STACKS` static).
 ///
-/// Sized at [`crate::sched::MAX_CPUS`] so the kernel image embeds the BSS
-/// at link time — no heap allocation on AP startup. `MAX_CPUS=64` → ~1 MiB
-/// BSS.
-///
-/// `static mut` is only written under single-threaded AP bringup or as a
-/// stack by the AP itself.
+/// Allocated at boot from the buddy by [`init_ap_ist_storage`], sized to
+/// `boot_cpu_count` rather than `MAX_CPUS`. On a 4-CPU host this saves
+/// ~960 KiB versus the prior `MAX_CPUS=64` BSS array.
 #[cfg(not(test))]
-static mut AP_IST_STACKS: [[u8; AP_IST_PAIR_SIZE]; crate::sched::MAX_CPUS] =
-    [[0u8; AP_IST_PAIR_SIZE]; crate::sched::MAX_CPUS];
+static AP_IST_STACKS_PTR: core::sync::atomic::AtomicPtr<[u8; AP_IST_PAIR_SIZE]> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Allocate the per-CPU IST-stack slab sized to `cpu_count`. Called from
+/// `sched::init`, before any AP startup.
+#[cfg(not(test))]
+pub fn init_ap_ist_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+{
+    let bytes = cpu_count * AP_IST_PAIR_SIZE;
+    let ptr = crate::sched::alloc_zeroed_slab::<[u8; AP_IST_PAIR_SIZE]>(
+        bytes,
+        allocator,
+        "AP_IST_STACKS",
+    );
+    AP_IST_STACKS_PTR.store(ptr, core::sync::atomic::Ordering::Release);
+}
 
 // ── Trampoline machine-code template ─────────────────────────────────────────
 
@@ -502,12 +513,19 @@ pub unsafe fn start_ap(
     stack_top: u64,
 ) -> bool
 {
-    debug_assert!((cpu_idx as usize) < crate::sched::MAX_CPUS);
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    debug_assert!(cpu_idx < cpu_count);
 
-    // Carve this AP's IST stacks out of [`AP_IST_STACKS`] (BSS).
-    // SAFETY: cpu_idx < MAX_CPUS asserted; the AP_IST_STACKS slot for this
+    // Carve this AP's IST stacks out of the dynamic per-CPU slab.
+    // SAFETY: cpu_idx < CPU_COUNT asserted; the AP_IST_STACKS slot for this
     // CPU is exclusively owned by this AP for the kernel's lifetime.
-    let ist_base = unsafe { core::ptr::addr_of_mut!(AP_IST_STACKS[cpu_idx as usize]) } as u64;
+    let ist_slab_base = AP_IST_STACKS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(
+        !ist_slab_base.is_null(),
+        "start_ap: AP_IST_STACKS_PTR not initialised"
+    );
+    // SAFETY: cpu_idx < CPU_COUNT asserted; IST slab covers cpu_count entries.
+    let ist_base = unsafe { ist_slab_base.add(cpu_idx as usize) } as u64;
     let ist1_top = ist_base + 8192;
     let ist2_top = ist_base + 16384;
 

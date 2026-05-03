@@ -208,8 +208,9 @@ Running ──(SYS_THREAD_STOP)──► Stopped
 Running ──(SYS_THREAD_EXIT)──► Exited (TCB freed)
 ```
 
-State transitions are protected by the TCB's implicit lock (the scheduler lock on
-the CPU that owns the TCB) combined with the IPC object lock where relevant.
+State transitions are governed by the per-field-group ownership rules in
+[scheduling-internals.md](scheduling-internals.md). Cross-CPU writes to TCB
+fields are subject to the lock hierarchy specified in that document.
 
 ---
 

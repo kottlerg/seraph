@@ -20,7 +20,7 @@
 //! - Multiple receivers: replace `waiter` with an intrusive TCB queue.
 //! - Non-blocking recv: return `Err(WouldBlock)` when empty instead of blocking.
 
-use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
+use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 
 // ── EventQueueState ───────────────────────────────────────────────────────────
 
@@ -132,9 +132,6 @@ pub unsafe fn event_queue_post(
         // SAFETY: waiter is a valid TCB placed by event_queue_recv.
         unsafe {
             (*waiter).wakeup_value = payload;
-            (*waiter).state = ThreadState::Ready;
-            (*waiter).ipc_state = IpcThreadState::None;
-            (*waiter).blocked_on_object = core::ptr::null_mut();
         }
         // If the waiter was registered with a `SYS_EVENT_RECV` timeout, it
         // is also on the global sleep list. Remove it here so the timer
@@ -229,11 +226,25 @@ pub unsafe fn event_queue_recv(
             .store(0, core::sync::atomic::Ordering::Relaxed);
     }
     eq.waiter = caller;
-    // SAFETY: caller is a valid TCB.
-    unsafe {
-        (*caller).state = ThreadState::Blocked;
-        (*caller).ipc_state = IpcThreadState::BlockedOnEventQueue;
-        (*caller).blocked_on_object = core::ptr::addr_of_mut!(*eq).cast::<u8>();
+    let blocked_on = core::ptr::addr_of_mut!(*eq).cast::<u8>();
+    // SAFETY: caller is a valid TCB; eq.lock excludes other waiter writes.
+    let committed = unsafe {
+        crate::sched::commit_blocked_under_local_lock(
+            caller,
+            IpcThreadState::BlockedOnEventQueue,
+            blocked_on,
+        )
+    };
+    if !committed
+    {
+        // Concurrent stop won; roll back the waiter slot.
+        eq.waiter = core::ptr::null_mut();
+        // SAFETY: caller is a valid TCB; context_saved is AtomicU32.
+        unsafe {
+            (*caller)
+                .context_saved
+                .store(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
     // SAFETY: paired with lock_raw above.
     unsafe { eq.lock.unlock_raw(saved) };
@@ -263,8 +274,6 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
         // SAFETY: waiter is a valid TCB.
         unsafe {
             (*waiter).wakeup_value = 0;
-            (*waiter).state = ThreadState::Ready;
-            (*waiter).ipc_state = IpcThreadState::None;
             let prio = (*waiter).priority;
             let target_cpu = crate::sched::select_target_cpu(waiter);
             crate::sched::enqueue_and_wake(waiter, target_cpu, prio);

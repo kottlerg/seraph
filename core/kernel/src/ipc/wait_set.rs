@@ -35,7 +35,7 @@
 // which fits in u8. WAIT_SET_MAX_MEMBERS itself (usize) fits in u8. All truncations safe.
 #![allow(clippy::cast_possible_truncation)]
 
-use crate::sched::thread::{IpcThreadState, ThreadControlBlock, ThreadState};
+use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 
 /// Maximum number of sources a wait set can monitor simultaneously.
 /// Must be ≤ 255 (`member_idx` is u8). Both procmgr and svcmgr
@@ -258,7 +258,8 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
         return;
     }
 
-    // Wake the blocked thread; deliver the token via wakeup_value.
+    // Snapshot under ws.lock, release, then enqueue_and_wake — see
+    // docs/scheduling-internals.md § Lock Hierarchy rule 5.
     let waiter = ws.waiter;
     ws.waiter = core::ptr::null_mut();
 
@@ -268,18 +269,18 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
     };
 
     // SAFETY: waiter is a valid TCB placed by waitset_wait.
-    unsafe {
+    let (prio, target_cpu) = unsafe {
         (*waiter).wakeup_value = token;
-        (*waiter).state = ThreadState::Ready;
-        (*waiter).ipc_state = IpcThreadState::None;
-        (*waiter).blocked_on_object = core::ptr::null_mut();
         let prio = (*waiter).priority;
         let target_cpu = crate::sched::select_target_cpu(waiter);
-        crate::sched::enqueue_and_wake(waiter, target_cpu, prio);
-    }
+        (prio, target_cpu)
+    };
 
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
+
+    // SAFETY: waiter remains valid; enqueue_and_wake commits state under sched.lock.
+    unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu, prio) };
 }
 
 /// Block `caller` until any member becomes ready, or return the next pending token.
@@ -350,11 +351,25 @@ pub unsafe fn waitset_wait(
             .store(0, core::sync::atomic::Ordering::Relaxed);
     }
     ws.waiter = caller;
-    // SAFETY: caller is a valid TCB.
-    unsafe {
-        (*caller).state = ThreadState::Blocked;
-        (*caller).ipc_state = IpcThreadState::BlockedOnWaitSet;
-        (*caller).blocked_on_object = core::ptr::addr_of_mut!(*ws).cast::<u8>();
+    let blocked_on = core::ptr::addr_of_mut!(*ws).cast::<u8>();
+    // SAFETY: caller is a valid TCB; ws.lock held excludes other waiter writes.
+    let committed = unsafe {
+        crate::sched::commit_blocked_under_local_lock(
+            caller,
+            IpcThreadState::BlockedOnWaitSet,
+            blocked_on,
+        )
+    };
+    if !committed
+    {
+        // Concurrent stop won; roll back the waiter slot.
+        ws.waiter = core::ptr::null_mut();
+        // SAFETY: caller is a valid TCB; context_saved is AtomicU32.
+        unsafe {
+            (*caller)
+                .context_saved
+                .store(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
@@ -404,30 +419,38 @@ pub unsafe fn waitset_add(
     // Check ready-at-add-time so notifications are not missed.
     // SAFETY: source_ptr is a valid pointer to the source's state struct; tag determines concrete type.
     let already_ready = unsafe { source_is_ready(source_ptr, source_tag) };
+    let mut deferred_wake: Option<(*mut ThreadControlBlock, u8, usize)> = None;
     if already_ready
     {
         // cast_possible_truncation: WAIT_SET_MAX_MEMBERS = 16; idx fits in u8.
         #[allow(clippy::cast_possible_truncation)]
         ws.push_ready(idx as u8);
-        // If a thread is already blocked, wake it immediately.
+        // Snapshot the wake; enqueue_and_wake runs after unlock per
+        // docs/scheduling-internals.md § Lock Hierarchy rule 5.
         if !ws.waiter.is_null()
         {
             let waiter = ws.waiter;
             ws.waiter = core::ptr::null_mut();
             // SAFETY: waiter is a valid TCB.
-            unsafe {
+            let (prio, target_cpu) = unsafe {
                 (*waiter).wakeup_value = token;
-                (*waiter).state = ThreadState::Ready;
-                (*waiter).ipc_state = IpcThreadState::None;
                 let prio = (*waiter).priority;
                 let target_cpu = crate::sched::select_target_cpu(waiter);
-                crate::sched::enqueue_and_wake(waiter, target_cpu, prio);
-            }
+                (prio, target_cpu)
+            };
+            deferred_wake = Some((waiter, prio, target_cpu));
         }
     }
 
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
+
+    if let Some((waiter, prio, target_cpu)) = deferred_wake
+    {
+        // SAFETY: waiter remains valid.
+        unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu, prio) };
+    }
+
     // cast_possible_truncation: idx < WAIT_SET_MAX_MEMBERS = 16.
     #[allow(clippy::cast_possible_truncation)]
     Ok(idx as u8)
@@ -516,25 +539,27 @@ pub unsafe fn wait_set_drop(ws: *mut WaitSetState)
         unsafe { clear_source_backpointer(source_ptr, source_tag) };
     }
 
-    // Step 2: take ws.lock and wake any blocked waiter, then clear member
-    // slots. Safe to drop ws.lock and let the storage be reclaimed —
-    // step 1 ensured no future notify references this ws.
+    // Step 2: detach any blocked waiter under ws.lock; defer the wake
+    // until after unlock per § Lock Hierarchy rule 5.
     // SAFETY: lock owned by ws; matched unlock_raw below.
     let saved = unsafe { ws_ref.lock.lock_raw() };
-    if !ws_ref.waiter.is_null()
+    let deferred_wake: Option<(*mut ThreadControlBlock, u8, usize)> = if ws_ref.waiter.is_null()
+    {
+        None
+    }
+    else
     {
         let waiter = ws_ref.waiter;
         ws_ref.waiter = core::ptr::null_mut();
-        // SAFETY: waiter is a valid TCB.
-        unsafe {
+        // SAFETY: waiter is a valid TCB; wakeup_value=0 = drop semantics.
+        let (prio, target_cpu) = unsafe {
             (*waiter).wakeup_value = 0;
-            (*waiter).state = ThreadState::Ready;
-            (*waiter).ipc_state = IpcThreadState::None;
             let prio = (*waiter).priority;
             let target_cpu = crate::sched::select_target_cpu(waiter);
-            crate::sched::enqueue_and_wake(waiter, target_cpu, prio);
-        }
-    }
+            (prio, target_cpu)
+        };
+        Some((waiter, prio, target_cpu))
+    };
     for slot in &mut ws_ref.members
     {
         *slot = WaitSetMember::vacant();
@@ -542,6 +567,12 @@ pub unsafe fn wait_set_drop(ws: *mut WaitSetState)
     ws_ref.member_count = 0;
     // SAFETY: paired with lock_raw above.
     unsafe { ws_ref.lock.unlock_raw(saved) };
+
+    if let Some((waiter, prio, target_cpu)) = deferred_wake
+    {
+        // SAFETY: waiter remains valid.
+        unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu, prio) };
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

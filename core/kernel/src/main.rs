@@ -202,6 +202,13 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // SAFETY: single-threaded boot; called exactly once, after Phase 3.
     unsafe { platform::capture_kernel_mmio(boot_info as u64) };
 
+    // Allocate per-CPU storage slabs (SCHEDULERS, IDLE_TCBS, AP TSS/GDT/IST
+    // on x86) sized to boot_cpu_count. Must precede Phase 5: timer::init
+    // arms the BSP timer, and timer_tick reads the scheduler slab via
+    // CPU_COUNT + SCHEDULERS_PTR. Replaces the prior MAX_CPUS-sized BSS
+    // tables with dynamically sized allocations.
+    sched::init_storage(boot_cpu_count, allocator);
+
     // ── Phase 5: architecture hardware initialization ─────────────────────────
     kprintln!("Phase 5: Architecture Hardware Initialisation");
     // SAFETY: single-threaded boot phase; heap and direct map active; called
@@ -592,7 +599,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                         run_queue_next: None,
                         ipc_state: sched::thread::IpcThreadState::None,
                         ipc_msg: ipc::message::Message::default(),
-                        reply_tcb: core::ptr::null_mut(),
+                        reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                         ipc_wait_next: None,
                         is_user: true,
                         saved_state: init_saved,

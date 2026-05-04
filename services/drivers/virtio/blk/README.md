@@ -64,17 +64,18 @@ the whole-disk endpoint; tokened callers are rejected.
 
 ### Label 3: `BLK_READ_INTO_FRAME`
 
-Read one 512-byte sector into a caller-supplied Frame. The driver writes the
-sector data at offset 512 of the supplied page; offsets 0..512 and
-1024..PAGE_SIZE are unspecified.
+Read one or more contiguous sectors into a caller-supplied Frame. The
+driver writes `count * 512` bytes starting at offset 0 of the supplied
+page, packed contiguously; the rest of the page is unspecified.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label | 3 |
-| data[0] | LBA (relative to the caller token's partition base) |
-| caps[0] | Target Frame, `MAP \| WRITE`, single page |
+| data[0] | Starting LBA (relative to the caller token's partition base) |
+| data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
+| caps[0] | Target Frame, `MAP \| WRITE`, at least `count * 512` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
 | caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
 
@@ -119,7 +120,7 @@ status byte (offsets 0 and 1024). The data segment of every read is the
 caller-supplied Frame: the driver queries `phys_base` via `cap_info`
 without mapping the frame into its own address space (the device DMAs to
 the physical address; the driver never reads the data), then programs
-the descriptor chain to point at `phys_base + 512`. The Frame cap is
+the descriptor chain to point at `phys_base`. The Frame cap is
 moved back to the caller in the reply on every outcome, so it never
 accumulates in the driver's `CSpace`.
 

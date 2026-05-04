@@ -294,8 +294,12 @@ pub mod fs_labels
     /// Request: token identifies the file (per-file cap), `data[0]` =
     /// page-aligned byte offset, `data[1]` = client-chosen release cookie.
     /// Reply: `data[0]` = bytes valid in the returned frame, `data[1]` = the
-    /// same release cookie echoed back, `caps[0]` = single-page Frame cap with
-    /// `MAP|READ` rights carrying the cached file page.
+    /// same release cookie echoed back, `data[2]` = byte offset within the
+    /// returned frame where the valid data starts (`0` when the underlying
+    /// disk sector is page-aligned; otherwise the cache page contains
+    /// padding sectors before the file's data and the client reads from
+    /// `data[2]` for `data[0]` bytes), `caps[0]` = single-page Frame cap
+    /// with `MAP|READ` rights carrying the cached file page.
     pub const FS_READ_FRAME: u64 = 7;
     /// Filesystem-driver request to a client to release a previously-returned
     /// Frame. Sent on the per-file release endpoint cap. Token identifies the
@@ -326,17 +330,20 @@ pub mod blk_labels
     /// Data words: `[token, base_lba, length_lba]`. Callable only over the
     /// un-tokened (whole-disk) endpoint; tokened callers are rejected.
     pub const REGISTER_PARTITION: u64 = 2;
-    /// Read a single sector into a caller-supplied Frame cap.
+    /// Read one or more contiguous sectors into a caller-supplied Frame cap.
     ///
-    /// Request: `data[0]` = LBA. Caps: `caps[0]` = target Frame
-    /// (`MAP|WRITE`, single page, the driver writes 512 B at offset 512 of
-    /// the page). `caps[1]` is reserved for a future per-request release
-    /// handle and is null today. `caps[2]` is a reserved IPC-shape slot for
-    /// a future userspace IOMMU-grant cap; the kernel transports nothing for
-    /// this slot and has no awareness of IOMMU semantics — IOMMU enforcement
-    /// is permanently userspace. Reply: empty body, label is the success or
-    /// error code; the target Frame is moved back to the caller in
-    /// `caps[0]` of the reply.
+    /// Request: `data[0]` = starting LBA, `data[1]` = sector count
+    /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
+    /// target Frame (`MAP|WRITE`; the driver writes `count * 512` bytes
+    /// starting at offset 0 of the frame, packed contiguously). The frame
+    /// must be at least `count * 512` bytes; the driver rejects with
+    /// `INVALID_FRAME_CAP` otherwise. `caps[1]` is reserved for a future
+    /// per-request release handle and is null today. `caps[2]` is a
+    /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
+    /// the kernel transports nothing for this slot and has no awareness
+    /// of IOMMU semantics — IOMMU enforcement is permanently userspace.
+    /// Reply: empty body, label is the success or error code; the target
+    /// Frame is moved back to the caller in `caps[0]` of the reply.
     pub const BLK_READ_INTO_FRAME: u64 = 3;
 }
 

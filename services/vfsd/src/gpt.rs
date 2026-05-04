@@ -27,7 +27,7 @@ const SECTOR_SIZE: usize = 512;
 
 /// Offset within the scratch page where `BLK_READ_INTO_FRAME` deposits the
 /// 512-byte sector (per the wire contract).
-const SECTOR_OFFSET_IN_FRAME: u64 = 512;
+const SECTOR_OFFSET_IN_FRAME: u64 = 0;
 
 /// A discovered GPT partition (UUID + LBA range).
 pub struct GptEntry

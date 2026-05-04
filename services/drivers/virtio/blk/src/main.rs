@@ -459,13 +459,26 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 
 /// Handle a `BLK_READ_INTO_FRAME` request.
 ///
-/// Reads `caps[0]` (target Frame) and DMAs one sector into it at offset 512
-/// of the page. `caps[1]` and `caps[2]` are reserved IPC-shape slots and
-/// remain null pre-IOMMU; the driver does not inspect them. The target
-/// Frame is moved back to the caller in `caps[0]` of the reply regardless
-/// of success — leaving the cap in the driver's `CSpace` would leak it.
+/// Reads `caps[0]` (target Frame) and DMAs `data[1]` consecutive sectors
+/// (default 1) starting at LBA `data[0]` into the frame at offset 0,
+/// packed contiguously. The frame must be at least `count * 512` bytes;
+/// the driver rejects with `INVALID_FRAME_CAP` otherwise.
+///
+/// `caps[1]` and `caps[2]` are reserved IPC-shape slots and remain null
+/// pre-IOMMU; the driver does not inspect them. The target Frame is
+/// moved back to the caller in `caps[0]` of the reply regardless of
+/// success — leaving the cap in the driver's `CSpace` would leak it.
+// too_many_lines: handle_read_block_into_frame folds nine validation
+// gates (cap presence, sector count, descriptor-length bound, three
+// cap_info lookups, partition resolution for start and end LBA) into
+// one flat dispatch; each rejection path replies with the cap moved
+// back so it never leaks. Extracting helpers would still leave the
+// reply-with-cap pattern wired through main.
+#[allow(clippy::too_many_lines)]
 fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
+    const SECTOR_SIZE: u64 = 512;
+
     let target_cap = msg.caps().first().copied().unwrap_or(0);
 
     let reply_with = |code: u64, ipc_buf: *mut u64| {
@@ -485,7 +498,30 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
         return;
     }
 
-    // Validate the target cap: must be a Frame, single page, MAP+WRITE rights.
+    let sector_count = if msg.word_count() >= 2
+    {
+        msg.word(1)
+    }
+    else
+    {
+        1
+    };
+    if sector_count == 0
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+    let data_len_bytes = sector_count * SECTOR_SIZE;
+    // VirtIO descriptor length is u32; this also bounds total transfer
+    // well below any plausible per-frame ask.
+    if data_len_bytes > u64::from(u32::MAX)
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+
+    // Validate the target cap: must be a Frame with MAP+WRITE rights and
+    // at least `data_len_bytes` of capacity.
     let Ok(tag_rights) = syscall::cap_info(target_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
     {
@@ -506,7 +542,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
         reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
         return;
     };
-    if size != PAGE_SIZE
+    if size < data_len_bytes
     {
         reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
         return;
@@ -535,11 +571,23 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
             return;
         }
     };
+    // Validate the entire run lies within the partition / device bounds:
+    // resolve_sector only checks the starting LBA. Re-check the inclusive
+    // end LBA so a multi-sector ask doesn't walk past the partition.
+    let last_relative = sector.saturating_add(sector_count - 1);
+    if resolve_sector(msg.token, last_relative, rt).is_err()
+    {
+        reply_with(ipc::blk_errors::OUT_OF_BOUNDS, ipc_buf);
+        return;
+    }
 
+    // cast_possible_truncation: data_len_bytes <= u32::MAX checked above.
+    #[allow(clippy::cast_possible_truncation)]
     if !io::submit_and_wait(
         rt.layout,
         absolute_sector,
-        phys_base + 512,
+        phys_base,
+        data_len_bytes as u32,
         rt.vq,
         rt.transport,
         rt.queue_notify_off,

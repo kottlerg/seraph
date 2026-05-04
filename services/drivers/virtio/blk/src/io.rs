@@ -55,20 +55,21 @@ impl IoLayout
     }
 
     /// Descriptor chain for a block read request whose data segment lands at
-    /// `data_phys`.
+    /// `data_phys` and is `data_len` bytes long (`data_len` must be a
+    /// non-zero multiple of 512).
     ///
     /// Three-element chain: header (readable), data (writable, at the
     /// caller-supplied physical address), status (writable). The header and
     /// status segments stay in the driver's own DMA page.
-    pub fn read_chain(&self, data_phys: u64) -> [(u64, u32, bool); 3]
+    pub fn read_chain(&self, data_phys: u64, data_len: u32) -> [(u64, u32, bool); 3]
     {
         let header_phys = self.data_phys;
         let status_phys = self.data_phys + 1024;
 
         [
-            (header_phys, 16, false), // request header
-            (data_phys, 512, true),   // data buffer (device writes)
-            (status_phys, 1, true),   // status byte (device writes)
+            (header_phys, 16, false),    // request header
+            (data_phys, data_len, true), // data buffer (device writes)
+            (status_phys, 1, true),      // status byte (device writes)
         ]
     }
 
@@ -105,22 +106,25 @@ const MAX_WAIT_ATTEMPTS: usize = 1000;
 
 /// Submit a read request and wait for completion via IRQ signal.
 ///
-/// `data_phys` is the physical address the device should DMA the 512-byte
-/// data segment into — the caller-supplied frame's `phys_base + 512` per
-/// the `BLK_READ_INTO_FRAME` contract.
+/// `data_phys` is the physical address the device should DMA the data
+/// segment into — the caller-supplied frame's `phys_base` per the
+/// `BLK_READ_INTO_FRAME` contract (data lands at offset 0 of the frame).
+/// `data_len` is `count * 512` for `count` consecutive sectors starting
+/// at `sector`; the device fills the entire run in one transfer.
 ///
 /// Blocks on `signal_wait` until the device raises an interrupt, reads the
 /// device ISR to deassert the level-triggered interrupt, then acknowledges
 /// at the controller for re-arming.
-// too_many_arguments: layout + sector + data_phys + four hardware handles
-// (virtqueue, transport, irq signal, irq cap) is the minimal set this path
-// needs; bundling for the lint would obscure the per-call inputs (sector,
-// data_phys) that vary per request.
+// too_many_arguments: layout + sector + data_phys + data_len + four
+// hardware handles (virtqueue, transport, irq signal, irq cap) is the
+// minimal set this path needs; bundling for the lint would obscure the
+// per-call inputs (sector, data_phys, data_len) that vary per request.
 #[allow(clippy::too_many_arguments)]
 pub fn submit_and_wait(
     layout: &IoLayout,
     sector: u64,
     data_phys: u64,
+    data_len: u32,
     vq: &mut SplitVirtqueue,
     transport: &PciTransport,
     queue_notify_off: u16,
@@ -130,7 +134,7 @@ pub fn submit_and_wait(
 {
     layout.prepare_read(sector);
 
-    let chain = layout.read_chain(data_phys);
+    let chain = layout.read_chain(data_phys, data_len);
     let Some(_head) = vq.add_chain(&chain)
     else
     {

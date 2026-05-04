@@ -3,22 +3,26 @@
 
 // fs/fat/src/cache.rs
 
-//! Sector-level page cache for FAT block I/O.
+//! Page-granular sector cache for FAT block I/O.
 //!
 //! 128 single-page slots, each backed by a Frame cap mapped into the fs
-//! process's address space at a fixed VA. LRU eviction by monotonic
-//! sequence counter; only slots with `refcount == 0` are eviction
-//! candidates.
+//! process's address space at a fixed VA. Each slot holds one *page* of
+//! contiguous on-disk sectors (`SECTORS_PER_PAGE` = 8 for a 4 KiB page).
+//! Slots are keyed on the page-aligned LBA-base (`lba & !7`); a single
+//! cache miss fills all 8 sectors via one `BLK_READ_INTO_FRAME` IPC,
+//! amortising the round-trip cost over the page. LRU eviction by
+//! monotonic sequence counter; only slots with `refcount == 0` are
+//! eviction candidates.
 //!
-//! Fill path: issue `BLK_READ_INTO_FRAME` against the partition-scoped
-//! block cap, transferring the slot's Frame cap as `caps[0]`. The driver
-//! DMAs the sector directly into the slot's frame at offset 512 of the
-//! page (per the `BLK_READ_INTO_FRAME` wire contract) and returns the cap
-//! in the reply. The cap may land at a different `CSpace` slot index on
-//! return, so the slot's `frame_cap` is updated from `reply.caps()[0]`;
-//! the underlying `FrameObject` identity is preserved through the move,
-//! and the existing AS mapping at the slot's VA continues to point at the
-//! same physical pages.
+//! Fill path: issue `BLK_READ_INTO_FRAME` with `data[0]` = page-base LBA
+//! and `data[1]` = `SECTORS_PER_PAGE`, transferring the slot's Frame cap
+//! as `caps[0]`. The driver DMAs `SECTORS_PER_PAGE * 512` bytes directly
+//! into the slot's frame at offset 0 (per the wire contract) and returns
+//! the cap in the reply. The cap may land at a different `CSpace` slot
+//! index on return, so the slot's `frame_cap` is updated from
+//! `reply.caps()[0]`; the underlying `FrameObject` identity is preserved
+//! through the move, and the existing AS mapping at the slot's VA
+//! continues to point at the same physical pages.
 //!
 //! Slot caps are minted once at startup via memmgr `REQUEST_FRAMES` with
 //! the `REQUIRE_CONTIGUOUS` flag (one IPC per slot — slot count is bounded
@@ -34,20 +38,26 @@ use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
 use crate::bpb::SECTOR_SIZE;
 
-/// Byte offset within a cache slot's frame where the sector's 512 B land,
-/// per the `BLK_READ_INTO_FRAME` wire contract.
-const SECTOR_OFFSET_IN_SLOT: u64 = 512;
-
 /// Number of cache slots.
 pub const SLOT_COUNT: usize = 128;
 
-/// Sentinel for an unfilled slot.
-const LBA_EMPTY: u64 = u64::MAX;
+/// Number of consecutive sectors held in one cache slot. Fixed by the
+/// page size and the FAT sector size: `PAGE_SIZE / SECTOR_SIZE` = 8.
+pub const SECTORS_PER_PAGE: u64 = PAGE_SIZE / SECTOR_SIZE as u64;
 
-/// One cache slot.
+/// Sentinel for an unfilled slot. Page-base LBAs are always
+/// `SECTORS_PER_PAGE`-aligned; `u64::MAX` cannot collide with any valid
+/// page base.
+const PAGE_BASE_EMPTY: u64 = u64::MAX;
+
+/// One cache slot. Holds `SECTORS_PER_PAGE` consecutive sectors starting
+/// at `page_lba_base`, packed contiguously from offset 0 of the slot's
+/// frame.
 struct CacheSlot
 {
-    sector_lba: AtomicU64,
+    /// Page-aligned starting LBA (`SECTORS_PER_PAGE`-multiple) of the
+    /// sector run cached here. `PAGE_BASE_EMPTY` if unfilled.
+    page_lba_base: AtomicU64,
     /// `CSpace` slot index of the Frame cap backing this cache page.
     ///
     /// Atomic because each `BLK_READ_INTO_FRAME` round trip moves the cap
@@ -108,7 +118,7 @@ impl PageCache
 
         let cache: &'static mut Self = Box::leak(Box::new(Self {
             slots: core::array::from_fn(|i| CacheSlot {
-                sector_lba: AtomicU64::new(LBA_EMPTY),
+                page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
                 frame_cap: AtomicU32::new(0),
                 va: base_va + (i as u64) * PAGE_SIZE,
                 refcount: AtomicU32::new(0),
@@ -131,8 +141,9 @@ impl PageCache
         Ok(&*cache)
     }
 
-    /// Read a sector through the cache into `buf`. Single-call helper for
-    /// the read path: handles fill-on-miss, hit refcounting, and release.
+    /// Read one 512-byte sector through the cache into `buf`. Single-call
+    /// helper for callers that don't need the underlying frame: handles
+    /// page-fill-on-miss, hit refcounting, and release.
     pub fn read_sector(
         &self,
         lba: u64,
@@ -141,19 +152,22 @@ impl PageCache
         ipc_buf: *mut u64,
     ) -> bool
     {
-        let Some(idx) = self.get_or_fill(lba, block_dev, ipc_buf)
+        let page_base = page_base_of(lba);
+        let Some(idx) = self.acquire_page(page_base, block_dev, ipc_buf)
         else
         {
             return false;
         };
         let slot = &self.slots[idx];
-        // SAFETY: refcount > 0 for the duration of this borrow; slot.va was
-        // mapped writable for one page at startup and is owned by this
-        // process. The cached sector lives at offset SECTOR_OFFSET_IN_SLOT
-        // of the page (per the BLK_READ_INTO_FRAME wire contract).
+        let sector_in_page = (lba - page_base) as usize;
+        let offset = sector_in_page * SECTOR_SIZE;
+        // SAFETY: refcount > 0 for the duration of this borrow; slot.va
+        // was mapped writable for one page at startup and is owned by
+        // this process. The page holds SECTORS_PER_PAGE contiguous
+        // sectors at offsets [0, 512, ..., (N-1)*512]; sector_in_page < N.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                (slot.va + SECTOR_OFFSET_IN_SLOT) as *const u8,
+                (slot.va + offset as u64) as *const u8,
                 buf.as_mut_ptr(),
                 SECTOR_SIZE,
             );
@@ -162,18 +176,53 @@ impl PageCache
         true
     }
 
-    fn get_or_fill(&self, lba: u64, block_dev: u32, ipc_buf: *mut u64) -> Option<usize>
+    /// Acquire a cache slot containing the page starting at
+    /// `page_lba_base`, filling on miss. `page_lba_base` MUST be
+    /// `SECTORS_PER_PAGE`-aligned; callers that have an arbitrary LBA
+    /// should pass `page_base_of(lba)`.
+    ///
+    /// Bumps the slot's refcount; the caller must drop it via
+    /// [`release_slot`] when done. On any failure path the refcount is
+    /// left at its prior value.
+    pub fn acquire_page(
+        &self,
+        page_lba_base: u64,
+        block_dev: u32,
+        ipc_buf: *mut u64,
+    ) -> Option<usize>
+    {
+        debug_assert!(page_lba_base.is_multiple_of(SECTORS_PER_PAGE));
+        self.get_or_fill(page_lba_base, block_dev, ipc_buf)
+    }
+
+    /// Snapshot the Frame cap currently backing slot `idx`.
+    ///
+    /// Returns `0` if the slot is in a degraded state (cap lost on a
+    /// previous fill failure). Callers must hold a refcount on the slot
+    /// before observing the cap.
+    pub fn slot_frame_cap(&self, idx: usize) -> u32
+    {
+        self.slots[idx].frame_cap.load(Ordering::Acquire)
+    }
+
+    /// Drop a refcount on slot `idx`. Pair with [`acquire_page`].
+    pub fn release_slot(&self, idx: usize)
+    {
+        self.release(idx);
+    }
+
+    fn get_or_fill(&self, page_lba_base: u64, block_dev: u32, ipc_buf: *mut u64) -> Option<usize>
     {
         for (i, slot) in self.slots.iter().enumerate()
         {
-            if slot.sector_lba.load(Ordering::Acquire) == lba
+            if slot.page_lba_base.load(Ordering::Acquire) == page_lba_base
             {
                 slot.refcount.fetch_add(1, Ordering::AcqRel);
                 // Re-check after the bump: a concurrent eviction could
-                // have just refilled the slot with another LBA. The
+                // have just refilled the slot with another page. The
                 // single-threaded fs of today never hits this, but the
                 // pattern is forward-compatible.
-                if slot.sector_lba.load(Ordering::Acquire) != lba
+                if slot.page_lba_base.load(Ordering::Acquire) != page_lba_base
                 {
                     slot.refcount.fetch_sub(1, Ordering::AcqRel);
                     continue;
@@ -187,16 +236,16 @@ impl PageCache
         // Refcount the victim before the fill so a racing `pick_victim`
         // will skip it.
         slot.refcount.fetch_add(1, Ordering::AcqRel);
-        // Invalidate the LBA up front: a fill failure leaves the slot
-        // without correct contents, so it must not satisfy a hit lookup
-        // even by stale LBA match.
-        slot.sector_lba.store(LBA_EMPTY, Ordering::Release);
-        if !fill_via_block_dev(slot, lba, block_dev, ipc_buf)
+        // Invalidate the page base up front: a fill failure leaves the
+        // slot without correct contents, so it must not satisfy a hit
+        // lookup even by stale page-base match.
+        slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        if !fill_via_block_dev(slot, page_lba_base, block_dev, ipc_buf)
         {
             slot.refcount.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        slot.sector_lba.store(lba, Ordering::Release);
+        slot.page_lba_base.store(page_lba_base, Ordering::Release);
         slot.lru_seq.store(self.bump_seq(), Ordering::Release);
         Some(victim)
     }
@@ -233,22 +282,36 @@ impl PageCache
     }
 }
 
-/// Fill `slot` by issuing `BLK_READ_INTO_FRAME` against the block device.
+/// Return the page-aligned LBA-base for `lba` (the first LBA in the
+/// `SECTORS_PER_PAGE`-sector run that contains `lba`).
+pub fn page_base_of(lba: u64) -> u64
+{
+    lba - (lba % SECTORS_PER_PAGE)
+}
+
+/// Fill `slot` with `SECTORS_PER_PAGE` consecutive sectors starting at
+/// `page_lba_base`, by issuing one `BLK_READ_INTO_FRAME` against the
+/// block device.
 ///
-/// The slot's Frame cap is moved to the driver as `caps[0]` and moved back
-/// in the reply (typically — but not necessarily — to the same `CSpace`
-/// slot index). `slot.frame_cap` is rewritten from `reply.caps()[0]` on
-/// every outcome so the cache and the kernel agree on where the cap lives.
-/// The AS mapping at `slot.va` is unaffected by the move because mappings
-/// are page-table-resident and keyed on the underlying `FrameObject`'s
-/// physical pages, which the move preserves.
+/// The slot's Frame cap is moved to the driver as `caps[0]` and moved
+/// back in the reply (typically — but not necessarily — to the same
+/// `CSpace` slot index). `slot.frame_cap` is rewritten from
+/// `reply.caps()[0]` on every outcome so the cache and the kernel agree
+/// on where the cap lives. The AS mapping at `slot.va` is unaffected by
+/// the move because mappings are page-table-resident and keyed on the
+/// underlying `FrameObject`'s physical pages, which the move preserves.
 ///
 /// Returns `false` on any failure path (IPC error, driver error, missing
 /// returned cap). On `false`, the slot's `frame_cap` is left at whatever
-/// the kernel put back: the caller invalidates the slot's LBA before
-/// calling, so a broken slot is naturally not hit by future lookups even
-/// if its cap is genuinely lost (`frame_cap == 0`).
-fn fill_via_block_dev(slot: &CacheSlot, lba: u64, block_dev: u32, ipc_buf: *mut u64) -> bool
+/// the kernel put back: the caller invalidates the slot's page base
+/// before calling, so a broken slot is naturally not hit by future
+/// lookups even if its cap is genuinely lost (`frame_cap == 0`).
+fn fill_via_block_dev(
+    slot: &CacheSlot,
+    page_lba_base: u64,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> bool
 {
     let cap = slot.frame_cap.load(Ordering::Acquire);
     if cap == 0
@@ -256,7 +319,8 @@ fn fill_via_block_dev(slot: &CacheSlot, lba: u64, block_dev: u32, ipc_buf: *mut 
         return false;
     }
     let msg = IpcMessage::builder(blk_labels::BLK_READ_INTO_FRAME)
-        .word(0, lba)
+        .word(0, page_lba_base)
+        .word(1, SECTORS_PER_PAGE)
         .cap(cap)
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.

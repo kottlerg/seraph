@@ -32,9 +32,10 @@ use std::os::seraph::{StartupInfo, startup_info};
 use bpb::{FatState, SECTOR_SIZE};
 use cache::PageCache;
 use dir::{format_83_name, read_dir_entry_at_index, resolve_path};
-use fat::read_file_data;
-use file::{MAX_OPEN_FILES, OpenFile};
+use fat::{next_cluster, read_file_data};
+use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels};
+use syscall_abi::{PAGE_SIZE, RIGHTS_MAP_READ};
 
 /// Monotonic counter for token allocation. Starts at 1 (0 = untokened).
 static NEXT_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -215,7 +216,11 @@ fn service_loop(
                 {
                     handle_read(&msg, state, files, cache, caps.block_dev, ipc_buf);
                 }
-                fs_labels::FS_CLOSE => handle_close(token, files, ipc_buf),
+                fs_labels::FS_READ_FRAME =>
+                {
+                    handle_read_frame(&msg, state, files, cache, caps.block_dev, ipc_buf);
+                }
+                fs_labels::FS_CLOSE => handle_close(token, files, cache, ipc_buf),
                 fs_labels::FS_STAT => handle_stat(token, files, ipc_buf),
                 fs_labels::FS_READDIR =>
                 {
@@ -296,6 +301,7 @@ fn handle_open(
         start_cluster: entry.cluster,
         file_size: entry.size,
         is_dir: entry.attr & 0x10 != 0,
+        outstanding: [None; file::MAX_OUTSTANDING],
     };
 
     // Reply with the file cap — no data words needed.
@@ -354,8 +360,199 @@ fn handle_read(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Handle `FS_READ_FRAME`: token identifies the file. Data layout:
+/// `data[0]` = page-aligned byte offset, `data[1]` = client-chosen
+/// release cookie. Reply: `data[0]` = bytes valid in the returned frame,
+/// `data[1]` = the same cookie echoed back, `caps[0]` = a single-page
+/// Frame cap with `MAP|READ` rights covering the cached file page.
+///
+/// V1 caches one sector (512 B) per cache slot, so `bytes_valid` is at
+/// most 512 (less near EOF). The wire shape supports widening when the
+/// cache evolves to multi-sector-per-slot fills.
+///
+/// The returned cap is a per-call grandchild of the cache slot's parent
+/// cap: the slot cap derives a per-cookie *ancestor* (kept in the fs's
+/// `CSpace` for revocation), and the ancestor derives the *child* moved
+/// to the caller. `cap_revoke` on the ancestor invalidates only this
+/// caller's child without touching the cache slot.
+// too_many_lines: handle_read_frame folds parameter validation, file
+// resolution, cluster-chain walk, cache acquisition, two-step cap
+// derivation, outstanding-page tracking, and reply assembly into one
+// flat procedure. The error paths each have to release whatever
+// resources the prior step took (refcount, ancestor cap), so extracting
+// helpers would still leave the rollback chain wired through main.
+#[allow(clippy::too_many_lines)]
+fn handle_read_frame(
+    msg: &IpcMessage,
+    state: &mut FatState,
+    files: &mut [OpenFile; MAX_OPEN_FILES],
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+)
+{
+    let token = msg.token;
+    let Some(idx) = file::find_by_token(files, token)
+    else
+    {
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    };
+    let offset = msg.word(0);
+    let cookie = msg.word(1);
+
+    if offset & (PAGE_SIZE - 1) != 0
+    {
+        let reply = IpcMessage::new(ipc::fs_errors::BAD_FRAME_OFFSET);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+    if cookie == 0
+    {
+        // Cookie 0 collides with the OutstandingPage::None sentinel.
+        let reply = IpcMessage::new(ipc::fs_errors::BAD_FRAME_OFFSET);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+
+    let (file_size, start_cluster) = {
+        let f = &files[idx];
+        (u64::from(f.file_size), f.start_cluster)
+    };
+
+    if offset >= file_size
+    {
+        // EOF: zero bytes valid, no cap.
+        let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+            .word(0, 0)
+            .word(1, cookie)
+            .build();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+
+    // Walk the cluster chain to find the sector at `offset`.
+    let cluster_size = u64::from(state.cluster_size());
+    let cluster_idx = offset / cluster_size;
+    let offset_in_cluster = offset % cluster_size;
+    let sector_in_cluster = (offset_in_cluster / u64::from(state.bytes_per_sector)) as u32;
+
+    let mut cluster = start_cluster;
+    for _ in 0..cluster_idx
+    {
+        if let Some(c) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
+        {
+            cluster = c;
+        }
+        else
+        {
+            let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            return;
+        }
+    }
+    let sector = u64::from(state.cluster_to_sector(cluster) + sector_in_cluster);
+    let page_base = cache::page_base_of(sector);
+    // The file's byte at `offset` lives at frame offset
+    // `(sector - page_base) * SECTOR_SIZE` within the returned slot. For
+    // page-aligned data areas (cluster_size >= PAGE_SIZE and the FS data
+    // area page-aligned at format time) this is always 0.
+    let frame_data_offset = (sector - page_base) * SECTOR_SIZE as u64;
+
+    let Some(slot_idx) = cache.acquire_page(page_base, block_dev, ipc_buf)
+    else
+    {
+        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    };
+    let slot_cap = cache.slot_frame_cap(slot_idx);
+    if slot_cap == 0
+    {
+        cache.release_slot(slot_idx);
+        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+
+    let Ok(ancestor) = syscall::cap_derive(slot_cap, RIGHTS_MAP_READ)
+    else
+    {
+        cache.release_slot(slot_idx);
+        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    };
+    let Ok(child) = syscall::cap_derive(ancestor, RIGHTS_MAP_READ)
+    else
+    {
+        let _ = syscall::cap_delete(ancestor);
+        cache.release_slot(slot_idx);
+        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    };
+
+    let entry = OutstandingPage {
+        cookie,
+        slot_idx,
+        ancestor_cap: ancestor,
+    };
+    if !files[idx].track_outstanding(entry)
+    {
+        let _ = syscall::cap_delete(child);
+        let _ = syscall::cap_delete(ancestor);
+        cache.release_slot(slot_idx);
+        let reply = IpcMessage::new(ipc::fs_errors::TOO_MANY_OPEN);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+
+    // bytes_valid is bounded by:
+    //   - file end:    file_size - offset
+    //   - one cluster: cluster_size - offset_in_cluster
+    //                  (we only read sectors from one cluster per call)
+    //   - frame tail:  PAGE_SIZE - frame_data_offset
+    //                  (sectors before frame_data_offset belong to other files)
+    let cluster_remaining = u64::from(state.cluster_size()) - offset_in_cluster;
+    let bytes_valid = (file_size - offset)
+        .min(cluster_remaining)
+        .min(PAGE_SIZE - frame_data_offset);
+    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .word(0, bytes_valid)
+        .word(1, cookie)
+        .word(2, frame_data_offset)
+        .cap(child)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
 /// Handle `FS_CLOSE`: token identifies the file. No data words.
-fn handle_close(token: u64, files: &mut [OpenFile; MAX_OPEN_FILES], ipc_buf: *mut u64)
+///
+/// Outstanding `FS_READ_FRAME` pages are revoked and released here:
+/// `cap_revoke` on each per-cookie ancestor cap kills the caller-side
+/// derived child cap (the kernel's derivation tree is the authority),
+/// and the cache slot's refcount is decremented so the slot becomes
+/// eligible for eviction. Phase 9 will add a cooperative round-trip
+/// before the hard revoke; Phase 7 hard-revokes unconditionally.
+fn handle_close(
+    token: u64,
+    files: &mut [OpenFile; MAX_OPEN_FILES],
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+)
 {
     let Some(idx) = file::find_by_token(files, token)
     else
@@ -365,6 +562,13 @@ fn handle_close(token: u64, files: &mut [OpenFile; MAX_OPEN_FILES], ipc_buf: *mu
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
+
+    for entry in files[idx].outstanding.iter().flatten()
+    {
+        let _ = syscall::cap_revoke(entry.ancestor_cap);
+        let _ = syscall::cap_delete(entry.ancestor_cap);
+        cache.release_slot(entry.slot_idx);
+    }
 
     files[idx] = OpenFile::empty();
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);

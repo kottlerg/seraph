@@ -265,8 +265,13 @@ fn format_and_populate_partition(image_path: &Path, start_lba: u64, source_dir: 
             .open(image_path)
             .context("failed to open image for partition format")?;
         let mut slice = PartitionSlice::new(file, offset, PARTITION_SIZE)?;
+        // 4 KiB clusters align cluster boundaries with the page-granular
+        // sector cache in fs/fat: each cluster holds exactly 8 sectors =
+        // one PAGE_SIZE, so file data within a cluster is page-contiguous
+        // and FS_READ_FRAME can return the cluster's page directly via
+        // cap without per-sector translation.
         let opts = fatfs::FormatVolumeOptions::new()
-            .bytes_per_cluster(512)
+            .bytes_per_cluster(4096)
             .fat_type(fatfs::FatType::Fat32);
         fatfs::format_volume(&mut slice, opts).context("failed to format partition as FAT32")?;
     }

@@ -25,12 +25,13 @@ mod driver;
 mod gpt;
 mod mount;
 mod worker;
+mod worker_pool;
 
 use gpt::MAX_GPT_PARTS;
 use ipc::{IpcMessage, blk_labels};
 use mount::{MAX_MOUNTS, MountEntry};
 use std::os::seraph::startup_info;
-use worker::Channel;
+use worker_pool::WorkerPool;
 
 /// Monotonic counter for per-partition block endpoint tokens.
 ///
@@ -95,26 +96,6 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
     })
 }
 
-// ── Worker thread setup ────────────────────────────────────────────────────
-
-/// Create the worker's bootstrap endpoint, spawn the worker thread, and
-/// return both so main can publish plans into the shared channel and hand
-/// tokened SEND caps on the endpoint to each spawned driver.
-fn spawn_worker() -> Option<(u32, Channel)>
-{
-    let slab = std::os::seraph::object_slab_acquire(88)?;
-    let bootstrap_ep = syscall::cap_create_endpoint(slab).ok()?;
-    let channel = worker::new_channel();
-
-    let worker_channel = channel.clone();
-    std::thread::Builder::new()
-        .name("vfsd-bootstrap".into())
-        .spawn(move || worker::worker_loop(bootstrap_ep, &worker_channel))
-        .ok()?;
-
-    Some((bootstrap_ep, channel))
-}
-
 // ── Entry point ────────────────────────────────────────────────────────────
 
 fn main() -> !
@@ -142,14 +123,14 @@ fn main() -> !
         idle_loop();
     }
 
-    // Spawn the bootstrap worker thread before any MOUNT can arrive.
-    let Some((bootstrap_ep, channel)) = spawn_worker()
+    // Spawn the worker pool before any MOUNT can arrive.
+    let Some(pool) = WorkerPool::new()
     else
     {
-        std::os::seraph::log!("FATAL: worker thread setup failed");
+        std::os::seraph::log!("FATAL: worker pool setup failed");
         idle_loop();
     };
-    caps.bootstrap_ep = bootstrap_ep;
+    caps.bootstrap_ep = pool.bootstrap_ep();
 
     // Query devmgr for the block device endpoint.
     std::os::seraph::log!("querying devmgr for block device");
@@ -197,7 +178,7 @@ fn main() -> !
         caps: &caps,
         blk_ep,
         gpt_parts: &gpt_parts,
-        channel: &channel,
+        pool: &pool,
     };
     service_loop(ipc_buf, &runtime);
 }
@@ -208,7 +189,7 @@ pub struct VfsdRuntime<'a>
     pub caps: &'a VfsdCaps,
     pub blk_ep: u32,
     pub gpt_parts: &'a [gpt::GptEntry; MAX_GPT_PARTS],
-    pub channel: &'a Channel,
+    pub pool: &'a WorkerPool,
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
@@ -337,7 +318,7 @@ fn handle_mount_request(
         return;
     };
 
-    let Some(driver_ep) = driver::spawn_fatfs_driver(rt.caps, rt.channel, partition_ep, ipc_buf)
+    let Some(driver_ep) = driver::spawn_fatfs_driver(rt.caps, rt.pool, partition_ep, ipc_buf)
     else
     {
         std::os::seraph::log!("MOUNT: failed to spawn fatfs");

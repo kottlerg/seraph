@@ -7,11 +7,11 @@
 //!
 //! Creates fatfs driver processes via procmgr's two-phase protocol. The child
 //! is spawned with a tokened SEND cap on vfsd's worker-owned bootstrap
-//! endpoint as its creator endpoint. Main publishes a plan keyed by that
-//! token through the shared [`worker::Channel`], then blocks on the channel's
-//! condvar while the worker thread delivers the bootstrap round. After the
-//! worker signals completion, main sends a zero-payload `FS_MOUNT` to the
-//! driver as a BPB-validation probe.
+//! endpoint as its creator endpoint. Main submits a [`BootstrapOrder`] to the
+//! [`WorkerPool`] and blocks on the returned `WorkHandle` while the bootstrap
+//! worker thread delivers the round. After the worker signals completion,
+//! main sends a zero-payload `FS_MOUNT` to the driver as a BPB-validation
+//! probe.
 //!
 //! This routes fatfs through the generic bootstrap protocol without
 //! clobbering the main thread's reply target (= init) while servicing MOUNT.
@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ipc::{IpcMessage, fs_labels, procmgr_labels};
 
-use crate::{VfsdCaps, worker};
+use crate::VfsdCaps;
+use crate::worker_pool::{BootstrapOrder, WorkOrder, WorkerPool};
 
 /// Monotonic counter for fatfs-child bootstrap tokens.
 static NEXT_BOOTSTRAP_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -39,7 +40,7 @@ static NEXT_BOOTSTRAP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// Returns the driver's IPC endpoint (send cap) on success.
 pub fn spawn_fatfs_driver(
     caps: &VfsdCaps,
-    channel: &worker::Channel,
+    pool: &WorkerPool,
     partition_ep: u32,
     ipc_buf: *mut u64,
 ) -> Option<u32>
@@ -64,18 +65,15 @@ pub fn spawn_fatfs_driver(
     // The child reaches the log endpoint via the discovery cap procmgr
     // installs in its `ProcessInfo`, not through stdout.
 
-    // Allocate a bootstrap token and publish the plan for the worker.
+    // Allocate a bootstrap token and submit the order to the worker pool.
     let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, Ordering::Relaxed);
     let tokened_creator =
         syscall::cap_derive_token(caps.bootstrap_ep, syscall::RIGHTS_SEND, token).ok()?;
-    worker::publish_plan(
-        channel,
-        worker::Plan {
-            token,
-            blk: partition_ep,
-            service: driver_ep_for_child,
-        },
-    );
+    let handle = pool.submit(WorkOrder::Bootstrap(BootstrapOrder {
+        token,
+        blk: partition_ep,
+        service: driver_ep_for_child,
+    }))?;
 
     // TEMPORARY: CREATE_PROCESS + PRESERVE_MODULE is the last
     // post-bootstrap use of the module-cap loading path. fatfs is
@@ -127,7 +125,7 @@ pub fn spawn_fatfs_driver(
     }
 
     // Wait for the worker to deliver the bootstrap round.
-    if !worker::wait_result(channel)
+    if !handle.wait()
     {
         std::os::seraph::log!("fatfs bootstrap delivery failed");
         return None;

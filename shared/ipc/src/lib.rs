@@ -48,23 +48,6 @@ pub mod procmgr_labels
     /// independently and so the core process-creation primitive stays
     /// stdio-agnostic.
     pub const CREATE_PROCESS: u64 = 1;
-    /// **TEMPORARY — slated for removal.** `CREATE_PROCESS` flag (bit 31
-    /// of the label) telling procmgr to drop its module-cap copy without
-    /// donating it to memmgr. Exists solely as a bridge for the one
-    /// remaining post-bootstrap caller of `CREATE_PROCESS` — vfsd
-    /// respawning fatfs per mount — until vfsd's worker-thread refactor
-    /// lets it issue `CREATE_FROM_VFS` against `/bin/fatfs` without
-    /// deadlocking on its own `OPEN` re-entry.
-    ///
-    /// Module-cap loading is a strict bootstrap activity. init uses it
-    /// once to bring memmgr / procmgr / devmgr / vfsd / virtio-blk /
-    /// fatfs up; after Phase 3 every process is loaded via
-    /// `CREATE_FROM_VFS` against a path on the root filesystem and the
-    /// boot-module cap chain is fully retired. `CREATE_PROCESS` (and
-    /// therefore this flag) goes away as soon as vfsd stops being the
-    /// last holdout. The flag must NOT be relied on as a permanent API
-    /// surface; new callers of `CREATE_PROCESS` should not be added.
-    pub const CREATE_PROCESS_PRESERVE_MODULE: u64 = 1 << 31;
     /// Start a previously created (suspended) process.
     pub const START_PROCESS: u64 = 2;
     /// Create a new process from a VFS path (ELF binary). Wire format

@@ -27,11 +27,20 @@ mod mount;
 mod worker;
 mod worker_pool;
 
+use std::os::seraph::startup_info;
+use std::sync::{Mutex, PoisonError};
+
 use gpt::MAX_GPT_PARTS;
 use ipc::{IpcMessage, blk_labels};
 use mount::{MAX_MOUNTS, MountEntry};
-use std::os::seraph::startup_info;
 use worker_pool::WorkerPool;
+
+/// Number of threads that recv on the service endpoint. More than one is
+/// required for correctness: when one thread blocks waiting on a worker
+/// pool order (e.g. `CREATE_FROM_VFS` for a fatfs respawn), procmgr
+/// re-enters vfsd's OPEN to read `/bin/fatfs`; another thread must be
+/// available to recv that OPEN and reply, otherwise the system deadlocks.
+const SERVICE_THREAD_COUNT: usize = 4;
 
 /// Monotonic counter for per-partition block endpoint tokens.
 ///
@@ -173,40 +182,71 @@ fn main() -> !
         }
     }
 
-    std::os::seraph::log!("entering service loop");
-    let runtime = VfsdRuntime {
-        caps: &caps,
+    let boot_module_cap = caps.fatfs_module_cap;
+    let runtime: &'static VfsdRuntime = Box::leak(Box::new(VfsdRuntime {
+        caps,
         blk_ep,
-        gpt_parts: &gpt_parts,
-        pool: &pool,
-    };
-    service_loop(ipc_buf, &runtime);
+        gpt_parts,
+        pool,
+        mounts: Mutex::new(mount::new_mount_table()),
+        boot_module_cap: Mutex::new(boot_module_cap),
+    }));
+
+    // Spawn N-1 helper service threads; main becomes the Nth handler. Each
+    // thread runs the same recv/dispatch loop on the shared service endpoint.
+    for i in 1..SERVICE_THREAD_COUNT
+    {
+        let name = std::format!("vfsd-service-{i}");
+        if std::thread::Builder::new()
+            .name(name)
+            .spawn(move || service_loop(runtime))
+            .is_err()
+        {
+            std::os::seraph::log!("FATAL: service helper thread spawn failed");
+            idle_loop();
+        }
+    }
+
+    std::os::seraph::log!("entering service loop");
+    service_loop(runtime);
 }
 
-/// Live references the service loop and its handlers need on every request.
-pub struct VfsdRuntime<'a>
+/// Live state shared by every service-handler thread. `Box::leak`ed at
+/// startup so workers and helper threads can reference it as `'static`
+/// without per-thread `Arc` clones.
+pub struct VfsdRuntime
 {
-    pub caps: &'a VfsdCaps,
+    pub caps: VfsdCaps,
     pub blk_ep: u32,
-    pub gpt_parts: &'a [gpt::GptEntry; MAX_GPT_PARTS],
-    pub pool: &'a WorkerPool,
+    pub gpt_parts: [gpt::GptEntry; MAX_GPT_PARTS],
+    pub pool: WorkerPool,
+    /// Mount table is mutated on MOUNT and read on OPEN, both from any of
+    /// the `SERVICE_THREAD_COUNT` handler threads.
+    pub mounts: Mutex<[MountEntry; MAX_MOUNTS]>,
+    /// Boot-module fatfs cap consumed (and zeroed) by the very first MOUNT.
+    /// Mutex-guarded because that MOUNT may land on any handler thread.
+    pub boot_module_cap: Mutex<u32>,
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
 
-/// Main VFS service loop — namespace resolution and mount management.
-///
-/// Handles `OPEN` (resolves mount point, forwards to driver, relays per-file
-/// capability to client) and `MOUNT` requests. Clients perform file operations
-/// (read/close/stat/readdir) directly on the per-file capability returned by
-/// `OPEN`, without further vfsd involvement.
-fn service_loop(ipc_buf: *mut u64, rt: &VfsdRuntime) -> !
+/// Service-handler entry. One copy of this loop runs per
+/// [`SERVICE_THREAD_COUNT`] thread; all share the [`VfsdRuntime`]. Multi-
+/// threaded recv on the service endpoint is required so that a handler
+/// blocked on a worker pool order (notably `CREATE_FROM_VFS`, which
+/// triggers a procmgr → vfsd OPEN re-entry) does not deadlock.
+fn service_loop(rt: &'static VfsdRuntime) -> !
 {
-    let mut mounts = mount::new_mount_table();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null()
+    {
+        std::os::seraph::log!("service thread has no registered IPC buffer");
+        syscall::thread_exit();
+    }
 
     loop
     {
-        // SAFETY: ipc_buf is the registered IPC buffer.
+        // SAFETY: ipc_buf is the thread-registered IPC buffer page.
         let Ok(recv) = (unsafe { ipc::ipc_recv(rt.caps.service_ep, ipc_buf) })
         else
         {
@@ -219,15 +259,12 @@ fn service_loop(ipc_buf: *mut u64, rt: &VfsdRuntime) -> !
 
         match opcode
         {
-            ipc::vfsd_labels::OPEN => handle_open(&recv, ipc_buf, &mounts),
-            ipc::vfsd_labels::MOUNT =>
-            {
-                handle_mount_request(&recv, ipc_buf, rt, &mut mounts);
-            }
+            ipc::vfsd_labels::OPEN => handle_open(&recv, ipc_buf, rt),
+            ipc::vfsd_labels::MOUNT => handle_mount_request(&recv, ipc_buf, rt),
             _ =>
             {
                 let err = IpcMessage::new(ipc::vfsd_errors::UNKNOWN_OPCODE);
-                // SAFETY: ipc_buf is the registered IPC buffer.
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
                 let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
             }
         }
@@ -245,12 +282,7 @@ fn service_loop(ipc_buf: *mut u64, rt: &VfsdRuntime) -> !
 ///
 /// Looks up the UUID in the GPT table, spawns a fatfs driver with the
 /// partition's LBA offset, and registers a mount entry at the given path.
-fn handle_mount_request(
-    recv: &IpcMessage,
-    ipc_buf: *mut u64,
-    rt: &VfsdRuntime,
-    mounts: &mut [MountEntry; MAX_MOUNTS],
-)
+fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
     let w0 = recv.word(0);
     let w1 = recv.word(1);
@@ -281,7 +313,7 @@ fn handle_mount_request(
     }
 
     // Look up UUID in GPT partition table.
-    let Some((partition_lba, partition_len)) = gpt::lookup_partition_by_uuid(&uuid, rt.gpt_parts)
+    let Some((partition_lba, partition_len)) = gpt::lookup_partition_by_uuid(&uuid, &rt.gpt_parts)
     else
     {
         std::os::seraph::log!("MOUNT: partition UUID not found");
@@ -293,16 +325,6 @@ fn handle_mount_request(
     std::os::seraph::log!(
         "MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}"
     );
-
-    // Spawn fatfs driver for this partition.
-    if rt.caps.fatfs_module_cap == 0
-    {
-        std::os::seraph::log!("MOUNT: no fatfs module cap");
-        let err = IpcMessage::new(ipc::vfsd_errors::NO_FS_MODULE);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-        return;
-    }
 
     // Derive a partition-scoped tokened SEND cap on the whole-disk block
     // endpoint, and register its bound with virtio-blk. fatfs will only
@@ -318,18 +340,52 @@ fn handle_mount_request(
         return;
     };
 
-    let Some(driver_ep) = driver::spawn_fatfs_driver(rt.caps, rt.pool, partition_ep, ipc_buf)
+    // First MOUNT (root) consumes the boot module cap; later mounts pass 0
+    // and the spawn path uses CREATE_FROM_VFS("/bin/fatfs") via a worker.
+    // Hold the lock only across the swap so other handlers can read it
+    // (and observe 0) immediately.
+    let module_cap_for_spawn = {
+        let mut bmc = rt
+            .boot_module_cap
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let v = *bmc;
+        *bmc = 0;
+        v
+    };
+
+    let Some(driver_ep) = driver::spawn_fatfs_driver(
+        &rt.caps,
+        &rt.pool,
+        partition_ep,
+        module_cap_for_spawn,
+        ipc_buf,
+    )
     else
     {
         std::os::seraph::log!("MOUNT: failed to spawn fatfs");
+        if module_cap_for_spawn != 0
+        {
+            let _ = syscall::cap_delete(module_cap_for_spawn);
+        }
         let err = IpcMessage::new(ipc::vfsd_errors::SPAWN_FAILED);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         return;
     };
 
-    // Register mount entry.
-    if mount::register_mount(mounts, &path_buf, path_len, driver_ep)
+    // Root MOUNT succeeded — drop the boot module cap. The IPC has already
+    // transferred a derived child to procmgr; this releases vfsd's outer slot.
+    if module_cap_for_spawn != 0
+    {
+        let _ = syscall::cap_delete(module_cap_for_spawn);
+    }
+
+    let registered = {
+        let mut mounts = rt.mounts.lock().unwrap_or_else(PoisonError::into_inner);
+        mount::register_mount(&mut mounts, &path_buf, path_len, driver_ep)
+    };
+    if registered
     {
         let ok = IpcMessage::new(ipc::vfsd_errors::SUCCESS);
         // SAFETY: ipc_buf is the registered IPC buffer.
@@ -352,7 +408,7 @@ fn handle_mount_request(
 ///
 /// After this call, the client holds a direct tokened capability to the fs
 /// driver for file operations (read/close/stat/readdir).
-fn handle_open(recv: &IpcMessage, ipc_buf: *mut u64, mounts: &[MountEntry; MAX_MOUNTS])
+fn handle_open(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
     let label = recv.label;
     let path_len = ((label >> 16) & 0xFFFF) as usize;
@@ -370,7 +426,18 @@ fn handle_open(recv: &IpcMessage, ipc_buf: *mut u64, mounts: &[MountEntry; MAX_M
     path_buf[..copy_len].copy_from_slice(&recv_bytes[..copy_len]);
     let path = &path_buf[..path_len];
 
-    let Some((mount_idx, driver_path)) = mount::resolve_mount(path, mounts)
+    // Resolve the mount and capture the driver endpoint and driver-relative
+    // path inside the lock; release before issuing the outbound `FS_OPEN`.
+    let resolved = {
+        let mounts = rt.mounts.lock().unwrap_or_else(PoisonError::into_inner);
+        mount::resolve_mount(path, &mounts).map(|(idx, drv_path)| {
+            let mut buf = [0u8; ipc::MAX_PATH_LEN];
+            let dl = drv_path.len().min(buf.len());
+            buf[..dl].copy_from_slice(&drv_path[..dl]);
+            (mounts[idx].driver_ep, buf, dl)
+        })
+    };
+    let Some((driver_ep, drv_path_buf, drv_path_len)) = resolved
     else
     {
         let err = IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
@@ -379,12 +446,11 @@ fn handle_open(recv: &IpcMessage, ipc_buf: *mut u64, mounts: &[MountEntry; MAX_M
         return;
     };
 
-    let driver_ep = mounts[mount_idx].driver_ep;
-
     // Forward FS_OPEN to driver with the driver-relative path.
-    let fwd_path_len = driver_path.len();
-    let fwd_label = ipc::fs_labels::FS_OPEN | ((fwd_path_len as u64) << 16);
-    let fwd_msg = IpcMessage::builder(fwd_label).bytes(0, driver_path).build();
+    let fwd_label = ipc::fs_labels::FS_OPEN | ((drv_path_len as u64) << 16);
+    let fwd_msg = IpcMessage::builder(fwd_label)
+        .bytes(0, &drv_path_buf[..drv_path_len])
+        .build();
 
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(drv_reply) = (unsafe { ipc::ipc_call(driver_ep, &fwd_msg, ipc_buf) })

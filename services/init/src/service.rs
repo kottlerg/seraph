@@ -1119,13 +1119,12 @@ pub fn phase3_svcmgr_handover(
     info: &InitInfo,
     procmgr_ep: u32,
     bootstrap_ep: u32,
-    vfsd_service_ep: u32,
     ipc_buf: *mut u64,
 ) -> !
 {
     let _ = info;
-
-    send_vfsd_endpoint_to_procmgr(procmgr_ep, vfsd_service_ep, ipc_buf);
+    // SET_VFSD_EP is sent earlier in phase 2 so mounts.conf processing can
+    // use procmgr's CREATE_FROM_VFS for fatfs respawn.
 
     let Ok(svcmgr_service_ep) = syscall::cap_create_endpoint(crate::endpoint_slab())
     else

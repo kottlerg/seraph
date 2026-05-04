@@ -769,6 +769,12 @@ fn run(info_ptr: u64) -> !
     }
     logging::log("phase 2: root mounted at /");
 
+    // Make /bin/fatfs reachable for procmgr's CREATE_FROM_VFS so additional
+    // mounts (mounts.conf, plus any later post-bootstrap fatfs respawns by
+    // vfsd) load through the just-mounted root filesystem instead of the
+    // boot-module path.
+    service::send_vfsd_endpoint_to_procmgr(endpoint_cap, vfsd_service_ep, ipc_buf);
+
     logging::log("phase 2: reading /config/mounts.conf");
     let mut conf_buf = [0u8; 512];
     let conf_len = vfs::vfs_read_file(
@@ -818,13 +824,8 @@ fn run(info_ptr: u64) -> !
 
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
 
-    service::phase3_svcmgr_handover(
-        info,
-        endpoint_cap,
-        init_bootstrap_ep,
-        vfsd_service_ep,
-        ipc_buf,
-    );
+    let _ = vfsd_service_ep;
+    service::phase3_svcmgr_handover(info, endpoint_cap, init_bootstrap_ep, ipc_buf);
 }
 
 /// Idle loop fallback when Phase 3 cannot proceed.

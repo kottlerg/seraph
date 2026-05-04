@@ -443,6 +443,10 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
             {
                 handle_read_block(&msg, ipc_buf, rt);
             }
+            blk_labels::BLK_READ_INTO_FRAME =>
+            {
+                handle_read_block_into_frame(&msg, ipc_buf, rt);
+            }
             blk_labels::REGISTER_PARTITION =>
             {
                 handle_register_partition(&msg, ipc_buf, rt);
@@ -492,6 +496,7 @@ fn handle_read_block(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
     if !io::submit_and_wait(
         rt.layout,
         absolute_sector,
+        rt.layout.inline_data_phys(),
         rt.vq,
         rt.transport,
         rt.queue_notify_off,
@@ -513,6 +518,104 @@ fn handle_read_block(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Handle a `BLK_READ_INTO_FRAME` request.
+///
+/// Reads `caps[0]` (target Frame) and DMAs one sector into it at offset 512
+/// of the page. `caps[1]` and `caps[2]` are reserved IPC-shape slots and
+/// remain null pre-IOMMU; the driver does not inspect them. The target
+/// Frame is moved back to the caller in `caps[0]` of the reply regardless
+/// of success — leaving the cap in the driver's `CSpace` would leak it.
+fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+{
+    let target_cap = msg.caps().first().copied().unwrap_or(0);
+
+    let reply_with = |code: u64, ipc_buf: *mut u64| {
+        let mut builder = IpcMessage::builder(code);
+        if target_cap != 0
+        {
+            builder = builder.cap(target_cap);
+        }
+        let reply = builder.build();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    };
+
+    if target_cap == 0
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+
+    // Validate the target cap: must be a Frame, single page, MAP+WRITE rights.
+    let Ok(tag_rights) = syscall::cap_info(target_cap, syscall::CAP_INFO_TAG_RIGHTS)
+    else
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    };
+    let tag = (tag_rights >> 32) as u8;
+    let rights = tag_rights & 0xFFFF_FFFF;
+    let required = syscall::RIGHTS_MAP_RW;
+    if u64::from(tag) != u64::from(syscall::CAP_TAG_FRAME) || (rights & required) != required
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+    let Ok(size) = syscall::cap_info(target_cap, syscall::CAP_INFO_FRAME_SIZE)
+    else
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    };
+    if size != PAGE_SIZE
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+    let Ok(phys_base) = syscall::cap_info(target_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+    else
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    };
+
+    let sector = if msg.word_count() >= 1
+    {
+        msg.word(0)
+    }
+    else
+    {
+        0
+    };
+    let absolute_sector = match resolve_sector(msg.token, sector, rt)
+    {
+        Ok(s) => s,
+        Err(code) =>
+        {
+            reply_with(code, ipc_buf);
+            return;
+        }
+    };
+
+    if !io::submit_and_wait(
+        rt.layout,
+        absolute_sector,
+        phys_base + 512,
+        rt.vq,
+        rt.transport,
+        rt.queue_notify_off,
+        rt.irq_signal,
+        rt.irq_cap,
+    )
+    {
+        let status = rt.layout.read_status();
+        reply_with(u64::from(status), ipc_buf);
+        return;
+    }
+
+    reply_with(ipc::blk_errors::SUCCESS, ipc_buf);
 }
 
 /// Translate a caller-supplied sector number into an absolute device LBA,
@@ -705,6 +808,7 @@ fn main() -> !
     if !io::submit_and_wait(
         &layout,
         0,
+        layout.inline_data_phys(),
         &mut vq,
         &transport,
         queue_notify_off,

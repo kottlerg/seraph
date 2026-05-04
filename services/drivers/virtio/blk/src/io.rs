@@ -8,6 +8,15 @@
 //! Provides the descriptor chain layout for `VirtIO` block read requests
 //! (`VirtIO` 1.2 section 5.2.6), and helpers for submitting sector reads and copying
 //! completed data into the IPC reply buffer.
+//!
+//! `IoLayout` owns the driver's permanent 1-page DMA buffer. The header
+//! (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live there
+//! permanently. The 512-byte data segment can either reuse the same page
+//! at offset 512 (legacy `READ_BLOCK` path, copied back inline) or land in
+//! a caller-supplied Frame at `phys + 512` (`BLK_READ_INTO_FRAME` path,
+//! returned by-cap). `read_chain` parameterises the data-segment physical
+//! address; header and status physical addresses are always derived from
+//! the driver's own page.
 
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::SplitVirtqueue;
@@ -53,19 +62,29 @@ impl IoLayout
         self.data_va + 1024
     }
 
-    /// Descriptor chain for a block read request.
+    /// Physical address of the inline data-buffer region (offset 512 of the
+    /// driver's permanent DMA page). Used by the legacy `READ_BLOCK` path
+    /// that copies the result back inline.
+    pub fn inline_data_phys(&self) -> u64
+    {
+        self.data_phys + 512
+    }
+
+    /// Descriptor chain for a block read request whose data segment lands at
+    /// `data_phys`.
     ///
-    /// Three-element chain: header (readable), data (writable), status (writable).
-    pub fn read_chain(&self) -> [(u64, u32, bool); 3]
+    /// Three-element chain: header (readable), data (writable, at the
+    /// caller-supplied physical address), status (writable). The header and
+    /// status segments stay in the driver's own DMA page.
+    pub fn read_chain(&self, data_phys: u64) -> [(u64, u32, bool); 3]
     {
         let header_phys = self.data_phys;
-        let data_buf_phys = self.data_phys + 512;
         let status_phys = self.data_phys + 1024;
 
         [
-            (header_phys, 16, false),   // request header
-            (data_buf_phys, 512, true), // data buffer (device writes)
-            (status_phys, 1, true),     // status byte (device writes)
+            (header_phys, 16, false), // request header
+            (data_phys, 512, true),   // data buffer (device writes)
+            (status_phys, 1, true),   // status byte (device writes)
         ]
     }
 
@@ -120,12 +139,23 @@ const MAX_WAIT_ATTEMPTS: usize = 1000;
 
 /// Submit a read request and wait for completion via IRQ signal.
 ///
+/// `data_phys` is the physical address the device should DMA the 512-byte
+/// data segment into. For the legacy inline `READ_BLOCK` path, callers pass
+/// `layout.inline_data_phys()`; for `BLK_READ_INTO_FRAME`, callers pass the
+/// caller-supplied frame's `phys_base + 512`.
+///
 /// Blocks on `signal_wait` until the device raises an interrupt, reads the
 /// device ISR to deassert the level-triggered interrupt, then acknowledges
 /// at the controller for re-arming.
+// too_many_arguments: layout + sector + data_phys + four hardware handles
+// (virtqueue, transport, irq signal, irq cap) is the minimal set this path
+// needs; bundling for the lint would obscure the per-call inputs (sector,
+// data_phys) that vary per request.
+#[allow(clippy::too_many_arguments)]
 pub fn submit_and_wait(
     layout: &IoLayout,
     sector: u64,
+    data_phys: u64,
     vq: &mut SplitVirtqueue,
     transport: &PciTransport,
     queue_notify_off: u16,
@@ -135,7 +165,7 @@ pub fn submit_and_wait(
 {
     layout.prepare_read(sector);
 
-    let chain = layout.read_chain();
+    let chain = layout.read_chain(data_phys);
     let Some(_head) = vq.add_chain(&chain)
     else
     {

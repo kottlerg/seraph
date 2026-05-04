@@ -238,6 +238,15 @@ pub const CAP_INFO_CSPACE_BUDGET: u64 = 7;
 /// when ingesting Frame caps it did not itself mint (e.g., boot-module
 /// caps donated through `memmgr_labels::DONATE_FRAMES`).
 pub const CAP_INFO_FRAME_PHYS_BASE: u64 = 8;
+
+// ── CapTag discriminants ─────────────────────────────────────────────────────
+//
+// Userspace constants matching the kernel `CapTag` enum, for callers that
+// extract the tag from a [`CAP_INFO_TAG_RIGHTS`] result. Only the variants
+// userspace currently needs to identify are exposed.
+
+/// `CapTag::Frame` discriminant.
+pub const CAP_TAG_FRAME: u8 = 1;
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;
 /// Thread: set CPU affinity.

@@ -109,6 +109,10 @@ On success, the driver:
 Read bytes from an open file. Sent by the client directly on the per-file
 capability; the token identifies the file.
 
+Used by clients for short reads (`< PAGE_SIZE` bytes). Reads of
+`>= PAGE_SIZE` bytes use [`FS_READ_FRAME`](#label-7-fs_read_frame). The
+threshold is fixed at vfsd / std and is not negotiable.
+
 **Request:**
 
 | Field | Value |
@@ -242,15 +246,94 @@ identifies the directory.
 |---|---|---|
 | 4 | `InvalidToken` | No open file for this token, or not a directory |
 
+### Label 7: `FS_READ_FRAME`
+
+Read one page of file content into a Frame capability returned in the reply.
+Sent on the per-file capability; the token identifies the file. Used for
+reads of `>= PAGE_SIZE` bytes; shorter reads use [`FS_READ`](#label-2-fs_read).
+
+The driver returns a Frame cap derived from its internal page cache with
+attenuated rights (`MAP | READ`). The client maps the frame, reads the
+bytes, and is then expected to release the frame via the cooperative
+release protocol (see [Label 8](#label-8-fs_release_frame) and
+[Label 9](#label-9-fs_release_ack)).
+
+The returned Frame is a single page. Offsets MUST be page-aligned. EOF is
+indicated by a short `data[0]` count; the trailing portion of the page
+is unspecified.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 7 |
+| data[0] | Page-aligned byte offset |
+| data[1] | Release cookie (client-chosen, opaque to the driver) |
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| data[0] | Bytes valid in the returned frame (`PAGE_SIZE` for full pages, short on EOF) |
+| data[1] | The release cookie echoed back |
+| caps[0] | Frame cap, `MAP | READ`, single page |
+
+**Reply (error):**
+
+| Field | Value |
+|---|---|
+| label | Nonzero error code |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `InvalidToken` | No open file for this token |
+| 6 | `BadFrameOffset` | Offset is not page-aligned |
+
+### Label 8: `FS_RELEASE_FRAME`
+
+Driver-to-client request to release a previously-returned Frame. Sent by
+the driver on the client's release endpoint cap (delivered with `FS_OPEN`
+when the client elects to use frame-cap reads). The token identifies the
+file; `data[0]` carries the release cookie originally returned by
+[`FS_READ_FRAME`](#label-7-fs_read_frame).
+
+The client unmaps the matching Frame and replies with
+[`FS_RELEASE_ACK`](#label-9-fs_release_ack).
+
+If the client does not acknowledge within the cooperative-release watchdog
+window (100 ms), the driver `cap_revoke`s the parent cap. The client's
+derived cap dies; subsequent access to the unmapped page faults.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 8 |
+| data[0] | Release cookie identifying which Frame to unmap |
+
+### Label 9: `FS_RELEASE_ACK`
+
+Synchronous client-to-driver reply to [`FS_RELEASE_FRAME`](#label-8-fs_release_frame).
+Empty body. The driver's outstanding-Frame refcount decrements on receipt.
+
+**Reply:**
+
+| Field | Value |
+|---|---|
+| label | 9 |
+
 ---
 
 ## Block Device Access
 
 Filesystem drivers perform all storage I/O through a block device endpoint
-received at creation time. The block device protocol uses label 1
-(`READ_BLOCK`): data[0] = sector number, reply contains 512 bytes (64 u64
-words) on success. See `drivers/virtio/blk` for the block device IPC
-specification.
+received at creation time. The block device protocol exposes
+`BLK_READ_INTO_FRAME` (label 3); see
+[services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md)
+for the block-device IPC specification.
 
 ---
 

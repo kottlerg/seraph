@@ -17,8 +17,10 @@ drivers/
 │   │       └── lib.rs
 │   └── blk/                        # VirtIO block device driver (binary)
 │       ├── Cargo.toml
+│       ├── README.md               # Block-driver IPC interface (BLK_READ_INTO_FRAME, REGISTER_PARTITION)
 │       └── src/
-│           └── main.rs
+│           ├── main.rs
+│           └── io.rs
 └── docs/
     ├── driver-model.md             # Driver lifecycle and capability delegation
     └── virtio-architecture.md      # VirtIO transport abstraction and queue internals
@@ -57,7 +59,7 @@ holds ambient hardware authority. The full driver lifecycle is specified in
 | Crate | Type | Purpose |
 |---|---|---|
 | `virtio/core/` | Library | Shared VirtIO transport primitives: device initialisation, virtqueue setup, descriptor chain management |
-| `virtio/blk/` | Binary | VirtIO block device driver — exposes block read/write IPC endpoint |
+| [`virtio/blk/`](virtio/blk/README.md) | Binary | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
 
 ---
 

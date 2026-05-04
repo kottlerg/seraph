@@ -289,6 +289,21 @@ pub mod fs_labels
     pub const FS_READDIR: u64 = 5;
     /// End-of-directory marker in readdir replies.
     pub const END_OF_DIR: u64 = 6;
+    /// Read one page of file content into a Frame cap returned in the reply.
+    ///
+    /// Request: token identifies the file (per-file cap), `data[0]` =
+    /// page-aligned byte offset, `data[1]` = client-chosen release cookie.
+    /// Reply: `data[0]` = bytes valid in the returned frame, `data[1]` = the
+    /// same release cookie echoed back, `caps[0]` = single-page Frame cap with
+    /// `MAP|READ` rights carrying the cached file page.
+    pub const FS_READ_FRAME: u64 = 7;
+    /// Filesystem-driver request to a client to release a previously-returned
+    /// Frame. Sent on the per-file release endpoint cap. Token identifies the
+    /// file; `data[0]` = the release cookie naming the Frame to unmap.
+    pub const FS_RELEASE_FRAME: u64 = 8;
+    /// Client acknowledgement of [`FS_RELEASE_FRAME`]: synchronous reply,
+    /// empty body.
+    pub const FS_RELEASE_ACK: u64 = 9;
     /// Mount notification from vfsd.
     pub const FS_MOUNT: u64 = 10;
 }
@@ -313,6 +328,18 @@ pub mod blk_labels
     /// Data words: `[token, base_lba, length_lba]`. Callable only over the
     /// un-tokened (whole-disk) endpoint; tokened callers are rejected.
     pub const REGISTER_PARTITION: u64 = 2;
+    /// Read a single sector into a caller-supplied Frame cap.
+    ///
+    /// Request: `data[0]` = LBA. Caps: `caps[0]` = target Frame
+    /// (`MAP|WRITE`, single page, the driver writes 512 B at offset 512 of
+    /// the page). `caps[1]` is reserved for a future per-request release
+    /// handle and is null today. `caps[2]` is a reserved IPC-shape slot for
+    /// a future userspace IOMMU-grant cap; the kernel transports nothing for
+    /// this slot and has no awareness of IOMMU semantics — IOMMU enforcement
+    /// is permanently userspace. Reply: empty body, label is the success or
+    /// error code; the target Frame is moved back to the caller in
+    /// `caps[0]` of the reply.
+    pub const BLK_READ_INTO_FRAME: u64 = 3;
 }
 
 /// IPC labels for byte-stream endpoints (stdin/stdout/stderr backing).
@@ -459,6 +486,11 @@ pub mod fs_errors
     pub const TOO_MANY_OPEN: u64 = 3;
     /// File token is invalid or expired.
     pub const INVALID_TOKEN: u64 = 4;
+    /// Cooperative-release watchdog fired; the driver revoked the parent
+    /// Frame cap and any derived caps the client still held are now dead.
+    pub const RELEASE_TIMEOUT: u64 = 5;
+    /// `FS_READ_FRAME` offset is not page-aligned.
+    pub const BAD_FRAME_OFFSET: u64 = 6;
     /// Unknown opcode on fs-driver endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -505,6 +537,9 @@ pub mod blk_errors
     pub const OUT_OF_BOUNDS: u64 = 3;
     /// Partition registration rejected (no authority, table full, or bad args).
     pub const REGISTER_REJECTED: u64 = 4;
+    /// `BLK_READ_INTO_FRAME` target cap missing `MAP|WRITE` rights, sized
+    /// other than one page, or absent.
+    pub const INVALID_FRAME_CAP: u64 = 5;
     /// Unknown opcode on block endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

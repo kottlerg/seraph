@@ -22,6 +22,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod bpb;
+mod cache;
 mod dir;
 mod fat;
 mod file;
@@ -29,6 +30,7 @@ mod file;
 use std::os::seraph::{StartupInfo, startup_info};
 
 use bpb::{FatState, SECTOR_SIZE};
+use cache::PageCache;
 use dir::{format_83_name, read_dir_entry_at_index, resolve_path};
 use fat::read_file_data;
 use file::{MAX_OPEN_FILES, OpenFile};
@@ -77,6 +79,16 @@ fn main() -> !
         syscall::thread_exit();
     };
 
+    let cache = match PageCache::init(info.memmgr_endpoint, info.self_aspace, ipc_buf)
+    {
+        Ok(c) => c,
+        Err(e) =>
+        {
+            std::os::seraph::log!("page-cache init failed: {e:?}");
+            syscall::thread_exit();
+        }
+    };
+
     std::os::seraph::log!("starting");
 
     let mut state = FatState::new();
@@ -92,7 +104,7 @@ fn main() -> !
         OpenFile::empty(),
     ];
 
-    service_loop(&caps, &mut state, &mut files, ipc_buf);
+    service_loop(&caps, &mut state, &mut files, cache, ipc_buf);
 }
 
 /// Issue a single bootstrap round against the creator endpoint and assemble
@@ -117,10 +129,10 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
 
 /// Validate the BPB by reading sector 0 through the block cap. Updates
 /// `state` in place; returns the IPC reply label to use.
-fn validate_bpb(caps: &FatCaps, state: &mut FatState, ipc_buf: *mut u64) -> u64
+fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf: *mut u64) -> u64
 {
     let mut sector_buf = [0u8; SECTOR_SIZE];
-    if !fat::read_sector(caps.block_dev, 0, &mut sector_buf, ipc_buf)
+    if !fat::read_sector(cache, caps.block_dev, 0, &mut sector_buf, ipc_buf)
     {
         return ipc::fs_errors::IO_ERROR;
     }
@@ -143,6 +155,7 @@ fn service_loop(
     caps: &FatCaps,
     state: &mut FatState,
     files: &mut [OpenFile; MAX_OPEN_FILES],
+    cache: &PageCache,
     ipc_buf: *mut u64,
 ) -> !
 {
@@ -171,7 +184,7 @@ fn service_loop(
                     // (populated by parse_bpb on success).
                     let code = if state.fat_size == 0
                     {
-                        validate_bpb(caps, state, ipc_buf)
+                        validate_bpb(caps, state, cache, ipc_buf)
                     }
                     else
                     {
@@ -183,7 +196,7 @@ fn service_loop(
                 }
                 fs_labels::FS_OPEN =>
                 {
-                    handle_open(&msg, state, files, caps, ipc_buf);
+                    handle_open(&msg, state, files, caps, cache, ipc_buf);
                 }
                 _ =>
                 {
@@ -200,13 +213,13 @@ fn service_loop(
             {
                 fs_labels::FS_READ =>
                 {
-                    handle_read(&msg, state, files, caps.block_dev, ipc_buf);
+                    handle_read(&msg, state, files, cache, caps.block_dev, ipc_buf);
                 }
                 fs_labels::FS_CLOSE => handle_close(token, files, ipc_buf),
                 fs_labels::FS_STAT => handle_stat(token, files, ipc_buf),
                 fs_labels::FS_READDIR =>
                 {
-                    handle_readdir(&msg, state, files, caps.block_dev, ipc_buf);
+                    handle_readdir(&msg, state, files, cache, caps.block_dev, ipc_buf);
                 }
                 _ =>
                 {
@@ -228,6 +241,7 @@ fn handle_open(
     state: &mut FatState,
     files: &mut [OpenFile; MAX_OPEN_FILES],
     caps: &FatCaps,
+    cache: &PageCache,
     ipc_buf: *mut u64,
 )
 {
@@ -247,7 +261,7 @@ fn handle_open(
     path_buf[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
     let path = &path_buf[..path_len];
 
-    let Some(entry) = resolve_path(path, state, caps.block_dev, ipc_buf)
+    let Some(entry) = resolve_path(path, state, cache, caps.block_dev, ipc_buf)
     else
     {
         let reply = IpcMessage::new(ipc::fs_errors::NOT_FOUND);
@@ -298,6 +312,7 @@ fn handle_read(
     msg: &IpcMessage,
     state: &mut FatState,
     files: &[OpenFile; MAX_OPEN_FILES],
+    cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 )
@@ -325,6 +340,7 @@ fn handle_read(
             max_len,
         },
         state,
+        cache,
         block_dev,
         ipc_buf,
         &mut out,
@@ -384,6 +400,7 @@ fn handle_readdir(
     msg: &IpcMessage,
     state: &mut FatState,
     files: &[OpenFile; MAX_OPEN_FILES],
+    cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 )
@@ -410,7 +427,8 @@ fn handle_readdir(
     let entry_idx = msg.word(0);
     let dir_cluster = files[idx].start_cluster;
 
-    let Some(entry) = read_dir_entry_at_index(dir_cluster, entry_idx, state, block_dev, ipc_buf)
+    let Some(entry) =
+        read_dir_entry_at_index(dir_cluster, entry_idx, state, cache, block_dev, ipc_buf)
     else
     {
         let reply = IpcMessage::new(fs_labels::END_OF_DIR);

@@ -8,45 +8,24 @@
 //! Provides sector-level reads via the block device IPC endpoint, FAT table
 //! lookups with single-sector caching, and cluster-chain-walking file reads.
 
-use ipc::blk_labels;
-
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
+use crate::cache::PageCache;
 
-/// Read a single 512-byte sector from the block device into `buf`.
+/// Read a single 512-byte sector via the page cache.
 ///
 /// `sector` is partition-relative. The block-device capability is
 /// partition-scoped by virtio-blk's per-token bound — vfsd registered the
 /// partition at mount time. Absolute-LBA translation happens driver-side;
 /// fatfs cannot read outside the partition regardless of the value it passes.
 pub fn read_sector(
+    cache: &PageCache,
     block_dev: u32,
     sector: u64,
     buf: &mut [u8; SECTOR_SIZE],
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let msg = ipc::IpcMessage::builder(blk_labels::READ_BLOCK)
-        .word(0, sector)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) })
-    else
-    {
-        return false;
-    };
-    if reply.label != 0
-    {
-        return false;
-    }
-
-    let bytes = reply.data_bytes();
-    if bytes.len() < SECTOR_SIZE
-    {
-        return false;
-    }
-    buf.copy_from_slice(&bytes[..SECTOR_SIZE]);
-
-    true
+    cache.read_sector(sector, block_dev, buf, ipc_buf)
 }
 
 /// Look up the next cluster in the FAT chain.
@@ -68,6 +47,7 @@ pub fn read_sector(
 pub fn next_cluster(
     state: &mut FatState,
     cluster: u32,
+    cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 ) -> Option<u32>
@@ -106,6 +86,7 @@ pub fn next_cluster(
     if state.cached_fat_sector != fat_sector
     {
         if !read_sector(
+            cache,
             block_dev,
             u64::from(fat_sector),
             &mut state.cached_fat_data,
@@ -190,6 +171,7 @@ pub struct FileRead
 pub fn read_file_data(
     req: &FileRead,
     state: &mut FatState,
+    cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
     out: &mut [u8; SECTOR_SIZE],
@@ -213,7 +195,7 @@ pub fn read_file_data(
     let mut cluster = req.start_cluster;
     for _ in 0..cluster_idx
     {
-        cluster = match next_cluster(state, cluster, block_dev, ipc_buf)
+        cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
         {
             Some(c) => c,
             None => return 0, // Premature end of chain.
@@ -222,7 +204,13 @@ pub fn read_file_data(
 
     let sector = state.cluster_to_sector(cluster) + sector_in_cluster;
     let mut sector_buf = [0u8; SECTOR_SIZE];
-    if !read_sector(block_dev, u64::from(sector), &mut sector_buf, ipc_buf)
+    if !read_sector(
+        cache,
+        block_dev,
+        u64::from(sector),
+        &mut sector_buf,
+        ipc_buf,
+    )
     {
         return 0;
     }

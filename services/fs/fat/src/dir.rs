@@ -10,6 +10,7 @@
 //! root and FAT32 clustered directories.
 
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
+use crate::cache::PageCache;
 use crate::fat::{next_cluster, read_sector};
 
 // ── Directory entry ────────────────────────────────────────────────────────
@@ -236,6 +237,7 @@ fn split_component(path: &[u8]) -> (&[u8], &[u8])
 pub fn resolve_path(
     path: &[u8],
     state: &mut FatState,
+    cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 ) -> Option<DirEntry>
@@ -272,7 +274,8 @@ pub fn resolve_path(
         }
 
         // Search the current directory for the component.
-        let entry = find_in_directory(current_cluster, component, state, block_dev, ipc_buf)?;
+        let entry =
+            find_in_directory(current_cluster, component, state, cache, block_dev, ipc_buf)?;
 
         if rest.is_empty()
         {
@@ -300,6 +303,7 @@ fn find_in_directory(
     dir_cluster: u32,
     name: &[u8],
     state: &mut FatState,
+    cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 ) -> Option<DirEntry>
@@ -310,7 +314,7 @@ fn find_in_directory(
     if dir_cluster == 0
     {
         // FAT16 root directory: fixed location, not in cluster chain.
-        return find_in_fat16_root(name, state, block_dev, ipc_buf);
+        return find_in_fat16_root(name, state, cache, block_dev, ipc_buf);
     }
 
     let mut cluster = dir_cluster;
@@ -320,6 +324,7 @@ fn find_in_directory(
         for s in 0..u32::from(state.sectors_per_cluster)
         {
             if !read_sector(
+                cache,
                 block_dev,
                 u64::from(base_sector + s),
                 &mut sector_buf,
@@ -334,7 +339,7 @@ fn find_in_directory(
             }
         }
 
-        cluster = next_cluster(state, cluster, block_dev, ipc_buf)?;
+        cluster = next_cluster(state, cluster, cache, block_dev, ipc_buf)?;
     }
 }
 
@@ -342,6 +347,7 @@ fn find_in_directory(
 fn find_in_fat16_root(
     name: &[u8],
     state: &mut FatState,
+    cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 ) -> Option<DirEntry>
@@ -354,6 +360,7 @@ fn find_in_fat16_root(
     for s in 0..root_sectors
     {
         if !read_sector(
+            cache,
             block_dev,
             u64::from(root_start + s),
             &mut sector_buf,
@@ -431,6 +438,7 @@ pub fn read_dir_entry_at_index(
     dir_cluster: u32,
     index: u64,
     state: &mut FatState,
+    cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 ) -> Option<DirEntry>
@@ -449,6 +457,7 @@ pub fn read_dir_entry_at_index(
         for s in 0..root_sectors
         {
             if !read_sector(
+                cache,
                 block_dev,
                 u64::from(root_start + s),
                 &mut sector_buf,
@@ -485,6 +494,7 @@ pub fn read_dir_entry_at_index(
         for s in 0..u32::from(state.sectors_per_cluster)
         {
             if !read_sector(
+                cache,
                 block_dev,
                 u64::from(base_sector + s),
                 &mut sector_buf,
@@ -512,7 +522,7 @@ pub fn read_dir_entry_at_index(
             }
         }
 
-        if let Some(next) = next_cluster(state, cluster, block_dev, ipc_buf)
+        if let Some(next) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
         {
             cluster = next;
         }

@@ -80,10 +80,23 @@ pub fn spawn_fatfs_driver(
     // CREATE_PROCESS. Caps [module, creator]. The child has no stdio
     // wired by default — it logs through `seraph::log!` via the
     // discovery cap procmgr installs in `ProcessInfo`.
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(module_copy)
-        .cap(tokened_creator)
-        .build();
+    //
+    // PRESERVE_MODULE is set because vfsd holds the long-lived
+    // authoritative cap on the fatfs binary (`caps.fatfs_module_cap`)
+    // and re-derives a copy on every mount. If procmgr donated the
+    // per-spawn copy to memmgr's pool, memmgr would retype the binary's
+    // pages for unrelated allocations and the next derive would hand
+    // back a Frame pointing to corrupted bytes — ELF validation on the
+    // second mount would fail. The flag tells procmgr to drop its copy
+    // without donating. See the doc on `CREATE_PROCESS_PRESERVE_MODULE`
+    // for the long-term migration to `CREATE_FROM_VFS` against
+    // `/bin/fatfs` (which would let us drop the flag entirely).
+    let create_msg = IpcMessage::builder(
+        procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_PROCESS_PRESERVE_MODULE,
+    )
+    .cap(module_copy)
+    .cap(tokened_creator)
+    .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let Ok(create_reply) = (unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) })
     else

@@ -48,6 +48,12 @@ enum InstallDest
     /// Installed under `sysroot/bin/<name>` — loaded by procmgr from the
     /// root partition via VFS at runtime.
     RootfsBin,
+    /// Installed under both `sysroot/EFI/seraph/<name>` (bootloader-loaded
+    /// boot module) AND `sysroot/bin/<name>` (root partition). Used by
+    /// services that bootstrap the VFS itself (fatfs is needed once as a
+    /// boot module to mount root, then re-spawned from `/bin/<name>` for
+    /// every subsequent mount via the regular VFS path).
+    EfiAndRootfsBin,
 }
 
 /// Static description of a single buildable component (other than boot).
@@ -105,7 +111,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "fatfs",
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::EfiAndRootfsBin,
     },
     Spec {
         name: "crasher",
@@ -409,13 +415,16 @@ fn build_group(
                 cargo_out.display()
             );
         }
-        let dst = install_path(ctx, spec)?;
-        if let Some(parent) = dst.parent()
+        for dst in install_paths(ctx, spec)?
         {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            if let Some(parent) = dst.parent()
+            {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            copy_file(&cargo_out, &dst)?;
+            step(&format!("{}: {}", spec.name, dst.display()));
         }
-        copy_file(&cargo_out, &dst)?;
-        step(&format!("{}: {}", spec.name, dst.display()));
     }
 
     Ok(())
@@ -502,13 +511,15 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         );
     }
 
-    let dst = install_path(ctx, spec)?;
-    if let Some(parent) = dst.parent()
+    for dst in install_paths(ctx, spec)?
     {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        if let Some(parent) = dst.parent()
+        {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        copy_file(&cargo_out, &dst)?;
+        step(&format!("{}: {}", spec.name, dst.display()));
     }
-    copy_file(&cargo_out, &dst)?;
-    step(&format!("{}: {}", spec.name, dst.display()));
 
     Ok(())
 }
@@ -532,12 +543,16 @@ fn profile_params(arch: Arch, profile: BuildProfile) -> (&'static str, &'static 
     }
 }
 
-fn install_path(ctx: &BuildContext, spec: &Spec) -> Result<PathBuf>
+fn install_paths(ctx: &BuildContext, spec: &Spec) -> Result<Vec<PathBuf>>
 {
     Ok(match spec.dest
     {
-        InstallDest::EfiSeraph => ctx.sysroot_efi_seraph().join(spec.name),
-        InstallDest::RootfsBin => ctx.sysroot.join("bin").join(spec.name),
+        InstallDest::EfiSeraph => vec![ctx.sysroot_efi_seraph().join(spec.name)],
+        InstallDest::RootfsBin => vec![ctx.sysroot.join("bin").join(spec.name)],
+        InstallDest::EfiAndRootfsBin => vec![
+            ctx.sysroot_efi_seraph().join(spec.name),
+            ctx.sysroot.join("bin").join(spec.name),
+        ],
     })
 }
 

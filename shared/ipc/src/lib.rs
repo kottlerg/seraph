@@ -48,6 +48,24 @@ pub mod procmgr_labels
     /// independently and so the core process-creation primitive stays
     /// stdio-agnostic.
     pub const CREATE_PROCESS: u64 = 1;
+    /// `CREATE_PROCESS` flag (bit 31 of the label): the caller will reuse the
+    /// supplied module Frame cap for future spawns and procmgr must NOT
+    /// donate it to memmgr after the load. Set by spawners that hold a
+    /// long-lived cap on the same `FrameObject` (vfsd respawning fatfs per
+    /// mount is the canonical case). Without the flag, procmgr donates the
+    /// module cap to memmgr's pool — memmgr then retypes from those pages
+    /// for unrelated allocations and the next derive from the same source
+    /// hands back a Frame pointing to corrupted bytes.
+    ///
+    /// Long-term migration: callers that hold a long-lived module cap
+    /// should switch to `CREATE_FROM_VFS` against a path on the root
+    /// filesystem so the module flows through the normal
+    /// allocation/donation cycle and procmgr never sees a shared boot
+    /// module. fatfs ships into `/bin/fatfs` for exactly this purpose;
+    /// vfsd still uses `CREATE_PROCESS` because issuing `CREATE_FROM_VFS`
+    /// from vfsd's main thread would deadlock (procmgr would re-enter
+    /// vfsd's `OPEN` while main blocks on the reply).
+    pub const CREATE_PROCESS_PRESERVE_MODULE: u64 = 1 << 31;
     /// Start a previously created (suspended) process.
     pub const START_PROCESS: u64 = 2;
     /// Create a new process from a VFS path (ELF binary). Wire format

@@ -590,6 +590,7 @@ fn handle_create(
     let args_bytes = ((label >> 32) & 0xFFFF) as usize;
     let args_count = ((label >> 48) & 0xFF) as u32;
     let env_count = ((label >> 56) & 0xFF) as u32;
+    let preserve_module = (label & procmgr_labels::CREATE_PROCESS_PRESERVE_MODULE) != 0;
 
     let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
@@ -676,16 +677,22 @@ fn handle_create(
         let _ = syscall::cap_delete(memmgr_send);
     }
 
-    // Donate the module Frame cap to memmgr's pool: the loader has
-    // copied the ELF contents into the child's AddressSpace and procmgr
-    // has no further use for the source pages. The cap moves through
-    // single-owner-chain semantics — procmgr → memmgr — so memmgr
-    // receives exclusive ownership and can derive child caps from it
-    // for future `REQUEST_FRAMES` consumers. On failure (memmgr not
-    // reachable, pool full) the cap is delete-dropped as the safety net.
-    if module_cap != 0 && !donate_module_cap(ctx.memmgr_ep, module_cap, ipc_buf)
+    // Module cap disposition. Default path donates the source frame to
+    // memmgr's pool: the loader has copied the ELF contents into the
+    // child's AddressSpace and procmgr has no further use for the source
+    // pages, so routing them through memmgr returns the bytes to userspace.
+    // When the caller sets `PRESERVE_MODULE`, the source FrameObject is
+    // shared with another long-lived holder (vfsd's fatfs cap is the
+    // canonical case) and donating would let memmgr retype-corrupt the
+    // binary; just drop procmgr's slot and let the external holder keep
+    // the FrameObject alive.
+    if module_cap != 0
     {
-        let _ = syscall::cap_delete(module_cap);
+        let donated = !preserve_module && donate_module_cap(ctx.memmgr_ep, module_cap, ipc_buf);
+        if !donated
+        {
+            let _ = syscall::cap_delete(module_cap);
+        }
     }
     if creator_ep != 0
     {

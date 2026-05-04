@@ -681,11 +681,12 @@ fn handle_create(
     // memmgr's pool: the loader has copied the ELF contents into the
     // child's AddressSpace and procmgr has no further use for the source
     // pages, so routing them through memmgr returns the bytes to userspace.
-    // When the caller sets `PRESERVE_MODULE`, the source FrameObject is
-    // shared with another long-lived holder (vfsd's fatfs cap is the
-    // canonical case) and donating would let memmgr retype-corrupt the
-    // binary; just drop procmgr's slot and let the external holder keep
-    // the FrameObject alive.
+    // TEMPORARY: when the caller sets `PRESERVE_MODULE`, the source
+    // FrameObject is shared with another long-lived holder (vfsd's fatfs
+    // cap, the last post-bootstrap module-cap caller) and donating would
+    // let memmgr retype-corrupt the binary; just drop procmgr's slot and
+    // let the external holder keep the FrameObject alive. The whole
+    // branch goes away once vfsd switches to `CREATE_FROM_VFS`.
     if module_cap != 0
     {
         let donated = !preserve_module && donate_module_cap(ctx.memmgr_ep, module_cap, ipc_buf);

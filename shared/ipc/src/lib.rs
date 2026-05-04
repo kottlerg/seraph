@@ -48,23 +48,22 @@ pub mod procmgr_labels
     /// independently and so the core process-creation primitive stays
     /// stdio-agnostic.
     pub const CREATE_PROCESS: u64 = 1;
-    /// `CREATE_PROCESS` flag (bit 31 of the label): the caller will reuse the
-    /// supplied module Frame cap for future spawns and procmgr must NOT
-    /// donate it to memmgr after the load. Set by spawners that hold a
-    /// long-lived cap on the same `FrameObject` (vfsd respawning fatfs per
-    /// mount is the canonical case). Without the flag, procmgr donates the
-    /// module cap to memmgr's pool — memmgr then retypes from those pages
-    /// for unrelated allocations and the next derive from the same source
-    /// hands back a Frame pointing to corrupted bytes.
+    /// **TEMPORARY — slated for removal.** `CREATE_PROCESS` flag (bit 31
+    /// of the label) telling procmgr to drop its module-cap copy without
+    /// donating it to memmgr. Exists solely as a bridge for the one
+    /// remaining post-bootstrap caller of `CREATE_PROCESS` — vfsd
+    /// respawning fatfs per mount — until vfsd's worker-thread refactor
+    /// lets it issue `CREATE_FROM_VFS` against `/bin/fatfs` without
+    /// deadlocking on its own `OPEN` re-entry.
     ///
-    /// Long-term migration: callers that hold a long-lived module cap
-    /// should switch to `CREATE_FROM_VFS` against a path on the root
-    /// filesystem so the module flows through the normal
-    /// allocation/donation cycle and procmgr never sees a shared boot
-    /// module. fatfs ships into `/bin/fatfs` for exactly this purpose;
-    /// vfsd still uses `CREATE_PROCESS` because issuing `CREATE_FROM_VFS`
-    /// from vfsd's main thread would deadlock (procmgr would re-enter
-    /// vfsd's `OPEN` while main blocks on the reply).
+    /// Module-cap loading is a strict bootstrap activity. init uses it
+    /// once to bring memmgr / procmgr / devmgr / vfsd / virtio-blk /
+    /// fatfs up; after Phase 3 every process is loaded via
+    /// `CREATE_FROM_VFS` against a path on the root filesystem and the
+    /// boot-module cap chain is fully retired. `CREATE_PROCESS` (and
+    /// therefore this flag) goes away as soon as vfsd stops being the
+    /// last holdout. The flag must NOT be relied on as a permanent API
+    /// surface; new callers of `CREATE_PROCESS` should not be added.
     pub const CREATE_PROCESS_PRESERVE_MODULE: u64 = 1 << 31;
     /// Start a previously created (suspended) process.
     pub const START_PROCESS: u64 = 2;

@@ -248,9 +248,9 @@ identifies the directory.
 
 ### Label 7: `FS_READ_FRAME`
 
-Read one page of file content into a Frame capability returned in the reply.
+Read file content into a cached Frame capability returned in the reply.
 Sent on the per-file capability; the token identifies the file. Used for
-reads of `>= PAGE_SIZE` bytes; shorter reads use [`FS_READ`](#label-2-fs_read).
+bulk reads (`>= PAGE_SIZE` bytes); shorter reads use [`FS_READ`](#label-2-fs_read).
 
 The driver returns a Frame cap derived from its internal page cache with
 attenuated rights (`MAP | READ`). The client maps the frame, reads the
@@ -258,26 +258,34 @@ bytes, and is then expected to release the frame via the cooperative
 release protocol (see [Label 8](#label-8-fs_release_frame) and
 [Label 9](#label-9-fs_release_ack)).
 
-The returned Frame is a single page. Offsets MUST be page-aligned. EOF is
-indicated by a short `data[0]` count; the trailing portion of the page
-is unspecified.
+The returned Frame is a single page. The request `offset` is a byte
+position in the file with no alignment requirement; the driver locates
+the containing sector inside its cache page and reports back where the
+file's content for `offset` lives within the returned frame
+(`frame_data_offset`) and how many contiguous valid bytes follow
+(`bytes_valid`). `bytes_valid` is bounded by file end, the underlying
+filesystem's cluster boundary, and the page tail
+(`PAGE_SIZE - frame_data_offset`); callers iterate forward from
+`offset + bytes_valid` to read past those boundaries. The cookie is
+client-chosen, opaque to the driver, and must be non-zero.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label | 7 |
-| data[0] | Page-aligned byte offset |
-| data[1] | Release cookie (client-chosen, opaque to the driver) |
+| data[0] | Byte offset (any) |
+| data[1] | Release cookie (non-zero, client-chosen, opaque to the driver) |
 
 **Reply (success):**
 
 | Field | Value |
 |---|---|
 | label | 0 (success) |
-| data[0] | Bytes valid in the returned frame (`PAGE_SIZE` for full pages, short on EOF) |
+| data[0] | Bytes valid in the returned frame starting at `frame_data_offset` (0 on EOF) |
 | data[1] | The release cookie echoed back |
-| caps[0] | Frame cap, `MAP | READ`, single page |
+| data[2] | `frame_data_offset` — byte offset within the frame where the file's data for `offset` begins |
+| caps[0] | Frame cap, `MAP \| READ`, single page (omitted on EOF) |
 
 **Reply (error):**
 
@@ -290,7 +298,7 @@ is unspecified.
 | Code | Name | Meaning |
 |---|---|---|
 | 4 | `InvalidToken` | No open file for this token |
-| 6 | `BadFrameOffset` | Offset is not page-aligned |
+| 6 | `BadFrameOffset` | Cookie is zero |
 
 ### Label 8: `FS_RELEASE_FRAME`
 

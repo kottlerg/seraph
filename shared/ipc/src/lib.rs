@@ -289,17 +289,21 @@ pub mod fs_labels
     pub const FS_READDIR: u64 = 5;
     /// End-of-directory marker in readdir replies.
     pub const END_OF_DIR: u64 = 6;
-    /// Read one page of file content into a Frame cap returned in the reply.
+    /// Read file content into a cached Frame cap returned in the reply.
     ///
     /// Request: token identifies the file (per-file cap), `data[0]` =
-    /// page-aligned byte offset, `data[1]` = client-chosen release cookie.
-    /// Reply: `data[0]` = bytes valid in the returned frame, `data[1]` = the
-    /// same release cookie echoed back, `data[2]` = byte offset within the
-    /// returned frame where the valid data starts (`0` when the underlying
-    /// disk sector is page-aligned; otherwise the cache page contains
-    /// padding sectors before the file's data and the client reads from
-    /// `data[2]` for `data[0]` bytes), `caps[0]` = single-page Frame cap
-    /// with `MAP|READ` rights carrying the cached file page.
+    /// byte offset (no alignment requirement), `data[1]` = client-chosen
+    /// release cookie (must be non-zero). Reply: `data[0]` = bytes valid
+    /// in the returned frame starting at the indicated frame offset,
+    /// `data[1]` = the same release cookie echoed back, `data[2]` = byte
+    /// offset within the returned frame where the file's content for the
+    /// requested `offset` begins, `caps[0]` = single-page Frame cap with
+    /// `MAP|READ` rights covering the cached file page.
+    ///
+    /// `bytes_valid` is bounded by file end, the current cluster
+    /// boundary on the underlying filesystem, and the page tail
+    /// (`PAGE_SIZE - frame_data_offset`); callers iterate forward from
+    /// `offset + bytes_valid` to read past those boundaries.
     pub const FS_READ_FRAME: u64 = 7;
     /// Filesystem-driver request to a client to release a previously-returned
     /// Frame. Sent on the per-file release endpoint cap. Token identifies the
@@ -494,7 +498,8 @@ pub mod fs_errors
     /// Cooperative-release watchdog fired; the driver revoked the parent
     /// Frame cap and any derived caps the client still held are now dead.
     pub const RELEASE_TIMEOUT: u64 = 5;
-    /// `FS_READ_FRAME` offset is not page-aligned.
+    /// `FS_READ_FRAME` cookie is invalid (zero — collides with the
+    /// `OutstandingPage::None` sentinel in fs driver tracking).
     pub const BAD_FRAME_OFFSET: u64 = 6;
     /// Unknown opcode on fs-driver endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;

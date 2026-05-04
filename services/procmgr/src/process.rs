@@ -1106,6 +1106,61 @@ fn vfs_open(vfsd_ep: u32, ipc_buf: *mut u64, path: &[u8]) -> Option<u32>
     Some(reply_caps[0])
 }
 
+/// Monotonic cookie counter for `FS_READ_FRAME`. Skips zero — fatfs
+/// rejects cookie 0 as the `OutstandingPage::None` sentinel.
+static NEXT_FRAME_COOKIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_frame_cookie() -> u64
+{
+    let mut c = NEXT_FRAME_COOKIE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    while c == 0
+    {
+        c = NEXT_FRAME_COOKIE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    c
+}
+
+/// Issue `FS_READ_FRAME` at byte `offset`.
+///
+/// On success returns `(frame_cap, bytes_valid, frame_data_offset)` per
+/// `fs/docs/fs-driver-protocol.md`: the file's byte at `offset + i` for
+/// `i ∈ [0, bytes_valid)` lives in the returned frame at byte offset
+/// `frame_data_offset + i`. The frame cap is a per-call grandchild of the
+/// fs cache slot and is owned by the caller; `cap_delete` releases the
+/// caller's reference. Pre-Phase-9 the fs holds the underlying cache-slot
+/// refcount until `FS_CLOSE`; cooperative early release arrives with
+/// Phase 9's `FS_RELEASE_FRAME`. `bytes_valid` is bounded by file end,
+/// cluster boundary, and frame tail — callers must iterate from
+/// `offset + bytes_valid` to read past the boundary.
+fn vfs_read_frame(file_cap: u32, ipc_buf: *mut u64, offset: u64)
+-> Option<(u32, usize, usize, u64)>
+{
+    let cookie = next_frame_cookie();
+    let msg = IpcMessage::builder(ipc::fs_labels::FS_READ_FRAME)
+        .word(0, offset)
+        .word(1, cookie)
+        .build();
+
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
+    if reply.label != 0
+    {
+        return None;
+    }
+    let bytes_valid = reply.word(0) as usize;
+    if bytes_valid == 0
+    {
+        return None;
+    }
+    let frame_data_offset = reply.word(2) as usize;
+    let caps = reply.caps();
+    if caps.is_empty()
+    {
+        return None;
+    }
+    Some((caps[0], bytes_valid, frame_data_offset, cookie))
+}
+
 /// Read from an open file via its per-file capability.
 ///
 /// Copies up to `max_len` bytes of file data into `dst`. Returns the number
@@ -1192,7 +1247,7 @@ fn load_elf_page_streaming(
     // SAFETY: scratch_va mapped writable, one page.
     unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
 
-    stream_segment_to_frame(scratch_va, page_vaddr, seg, ctx.file_cap, ctx.ipc_buf);
+    stream_segment_to_frame(scratch_va, page_vaddr, seg, ctx);
 
     drop(scratch);
 
@@ -1207,12 +1262,19 @@ fn load_elf_page_streaming(
 }
 
 /// Stream segment file data from VFS into the frame mapped at `scratch_va`.
+///
+/// Issues `FS_READ_FRAME` requests at the current file offset, mapping
+/// the returned cache-page Frame read-only into a scratch VA, then memcpys
+/// the requested slice into the child's destination page. The frame cap is
+/// the caller's grandchild of fs's cache slot — `cap_delete` (via the
+/// `ScratchMapping` `owns_cap` slot) drops the caller's reference. fs
+/// holds the underlying cache-slot refcount until `FS_CLOSE` (pre-Phase-9)
+/// or until cooperative `FS_RELEASE_FRAME` lands.
 fn stream_segment_to_frame(
     scratch_va: u64,
     page_vaddr: u64,
     seg: &elf::LoadSegment,
-    file_cap: u32,
-    ipc_buf: *mut u64,
+    ctx: &ElfLoadCtx,
 )
 {
     let copy_start_va = page_vaddr.max(seg.vaddr);
@@ -1225,41 +1287,64 @@ fn stream_segment_to_frame(
 
     let dest_offset = (copy_start_va - page_vaddr) as usize;
     let file_offset = seg.offset + (copy_start_va - seg.vaddr);
-    let bytes_to_read = copy_end_va - copy_start_va;
+    let bytes_to_read = (copy_end_va - copy_start_va) as usize;
 
-    let mut read_pos = 0u64;
-    while read_pos < bytes_to_read
+    let mut copied = 0usize;
+    while copied < bytes_to_read
     {
-        let chunk = VFS_CHUNK_SIZE.min(bytes_to_read - read_pos);
-        let mut buf = [0u8; VFS_CHUNK_SIZE as usize];
-        let Some(bytes_read) = vfs_read(
-            file_cap,
-            ipc_buf,
-            file_offset + read_pos,
-            chunk,
-            &mut buf[..chunk as usize],
-        )
+        let cur = file_offset + copied as u64;
+
+        let Some((frame_cap, bytes_valid, frame_data_offset, cookie)) =
+            vfs_read_frame(ctx.file_cap, ctx.ipc_buf, cur)
         else
         {
-            break;
+            return;
         };
-        if bytes_read == 0
-        {
-            break;
-        }
-        let safe_len = (bytes_read as u64).min(bytes_to_read - read_pos) as usize;
 
-        // SAFETY: scratch_va is mapped writable; dest_offset + read_pos +
-        // safe_len <= PAGE_SIZE; `buf` holds `safe_len` bytes of payload.
+        let Some(mut mapping) =
+            ScratchMapping::map(ctx.self_aspace, frame_cap, 1, syscall::MAP_READONLY)
+        else
+        {
+            let _ = syscall::cap_delete(frame_cap);
+            vfs_release_frame(ctx.file_cap, ctx.ipc_buf, cookie);
+            return;
+        };
+        mapping.set_owns_cap(frame_cap);
+
+        let chunk_len = bytes_valid.min(bytes_to_read - copied);
+
+        // SAFETY:
+        // - `mapping.va()` covers PAGE_SIZE bytes mapped read-only.
+        // - `frame_data_offset + chunk_len ≤ PAGE_SIZE` because
+        //   `frame_data_offset + bytes_valid ≤ PAGE_SIZE` is a fatfs
+        //   invariant and `chunk_len ≤ bytes_valid`.
+        // - `dest_offset + copied + chunk_len ≤ PAGE_SIZE` because
+        //   `dest_offset + bytes_to_read ≤ PAGE_SIZE` is enforced by the
+        //   `copy_start_va`/`copy_end_va` clamp to `[page_vaddr, page_vaddr + PAGE_SIZE)`.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                (scratch_va as *mut u8).add(dest_offset + read_pos as usize),
-                safe_len,
+                (mapping.va() as *const u8).add(frame_data_offset),
+                (scratch_va as *mut u8).add(dest_offset + copied),
+                chunk_len,
             );
         }
-        read_pos += safe_len as u64;
+        drop(mapping);
+        vfs_release_frame(ctx.file_cap, ctx.ipc_buf, cookie);
+        copied += chunk_len;
     }
+}
+
+/// Issue `FS_RELEASE_FRAME` on the file-cap to drop the fs-side cache
+/// refcount and clear the outstanding-page tracking entry for `cookie`.
+/// Failure is non-fatal — the slot will be reclaimed at `FS_CLOSE` time
+/// even if the proactive release is lost.
+fn vfs_release_frame(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
+{
+    let msg = IpcMessage::builder(ipc::fs_labels::FS_RELEASE_FRAME)
+        .word(0, cookie)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
 }
 
 /// Create a process by streaming an ELF binary from the VFS.

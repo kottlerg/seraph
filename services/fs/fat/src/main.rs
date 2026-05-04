@@ -220,6 +220,10 @@ fn service_loop(
                 {
                     handle_read_frame(&msg, state, files, cache, caps.block_dev, ipc_buf);
                 }
+                fs_labels::FS_RELEASE_FRAME =>
+                {
+                    handle_release_frame(&msg, files, cache, ipc_buf);
+                }
                 fs_labels::FS_CLOSE => handle_close(token, files, cache, ipc_buf),
                 fs_labels::FS_STAT => handle_stat(token, files, ipc_buf),
                 fs_labels::FS_READDIR =>
@@ -361,14 +365,21 @@ fn handle_read(
 }
 
 /// Handle `FS_READ_FRAME`: token identifies the file. Data layout:
-/// `data[0]` = page-aligned byte offset, `data[1]` = client-chosen
-/// release cookie. Reply: `data[0]` = bytes valid in the returned frame,
-/// `data[1]` = the same cookie echoed back, `caps[0]` = a single-page
-/// Frame cap with `MAP|READ` rights covering the cached file page.
+/// `data[0]` = byte offset (any), `data[1]` = client-chosen release
+/// cookie. Reply: `data[0]` = bytes valid in the returned frame,
+/// `data[1]` = the same cookie echoed back, `data[2]` = byte offset
+/// within the returned frame where the file content for `offset` begins,
+/// `caps[0]` = a single-page Frame cap with `MAP|READ` rights covering
+/// the cached file page.
 ///
-/// V1 caches one sector (512 B) per cache slot, so `bytes_valid` is at
-/// most 512 (less near EOF). The wire shape supports widening when the
-/// cache evolves to multi-sector-per-slot fills.
+/// `offset` is a byte position in the file; the handler walks to the
+/// containing sector. The wire imposes no alignment requirement —
+/// callers stream forward from arbitrary positions and use the reply's
+/// `frame_data_offset` to locate the requested byte within the cache
+/// page. `bytes_valid` is bounded per call by file end, current cluster
+/// boundary, and page tail (`PAGE_SIZE - frame_data_offset`); page-
+/// misaligned data areas may therefore require multiple calls per
+/// `PAGE_SIZE` of file data.
 ///
 /// The returned cap is a per-call grandchild of the cache slot's parent
 /// cap: the slot cap derives a per-cookie *ancestor* (kept in the fs's
@@ -403,13 +414,6 @@ fn handle_read_frame(
     let offset = msg.word(0);
     let cookie = msg.word(1);
 
-    if offset & (PAGE_SIZE - 1) != 0
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::BAD_FRAME_OFFSET);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    }
     if cookie == 0
     {
         // Cookie 0 collides with the OutstandingPage::None sentinel.
@@ -438,9 +442,11 @@ fn handle_read_frame(
 
     // Walk the cluster chain to find the sector at `offset`.
     let cluster_size = u64::from(state.cluster_size());
+    let bytes_per_sector = u64::from(state.bytes_per_sector);
     let cluster_idx = offset / cluster_size;
     let offset_in_cluster = offset % cluster_size;
-    let sector_in_cluster = (offset_in_cluster / u64::from(state.bytes_per_sector)) as u32;
+    let sector_in_cluster = (offset_in_cluster / bytes_per_sector) as u32;
+    let byte_in_sector = offset_in_cluster % bytes_per_sector;
 
     let mut cluster = start_cluster;
     for _ in 0..cluster_idx
@@ -460,10 +466,11 @@ fn handle_read_frame(
     let sector = u64::from(state.cluster_to_sector(cluster) + sector_in_cluster);
     let page_base = cache::page_base_of(sector);
     // The file's byte at `offset` lives at frame offset
-    // `(sector - page_base) * SECTOR_SIZE` within the returned slot. For
-    // page-aligned data areas (cluster_size >= PAGE_SIZE and the FS data
-    // area page-aligned at format time) this is always 0.
-    let frame_data_offset = (sector - page_base) * SECTOR_SIZE as u64;
+    // `(sector - page_base) * SECTOR_SIZE + byte_in_sector` within the
+    // returned slot. For sector- and page-aligned data areas this folds
+    // to zero; for misaligned data areas (data area starting mid-page)
+    // the sector-position term is non-zero on the page boundary.
+    let frame_data_offset = (sector - page_base) * SECTOR_SIZE as u64 + byte_in_sector;
 
     let Some(slot_idx) = cache.acquire_page(page_base, block_dev, ipc_buf)
     else
@@ -524,8 +531,9 @@ fn handle_read_frame(
     //   - one cluster: cluster_size - offset_in_cluster
     //                  (we only read sectors from one cluster per call)
     //   - frame tail:  PAGE_SIZE - frame_data_offset
-    //                  (sectors before frame_data_offset belong to other files)
-    let cluster_remaining = u64::from(state.cluster_size()) - offset_in_cluster;
+    //                  (bytes before frame_data_offset belong to other files
+    //                   or the previous cluster's leftover sectors)
+    let cluster_remaining = cluster_size - offset_in_cluster;
     let bytes_valid = (file_size - offset)
         .min(cluster_remaining)
         .min(PAGE_SIZE - frame_data_offset);
@@ -535,6 +543,49 @@ fn handle_read_frame(
         .word(2, frame_data_offset)
         .cap(child)
         .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Handle client-initiated `FS_RELEASE_FRAME`: caller signals it is done
+/// with `data[0] = cookie`. Revoke the per-cookie ancestor cap (the
+/// derivation tree invalidates the caller's child cap and tears down its
+/// mapping), drop the cap, and decrement the cache slot's refcount so
+/// the slot becomes eligible for eviction. Idempotent — unknown cookies
+/// reply success since the caller may race fs-side eviction (Phase 9
+/// fs→client release path) that already cleaned up the same entry.
+fn handle_release_frame(
+    msg: &IpcMessage,
+    files: &mut [OpenFile; MAX_OPEN_FILES],
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+)
+{
+    let token = msg.token;
+    let Some(idx) = file::find_by_token(files, token)
+    else
+    {
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    };
+    let cookie = msg.word(0);
+
+    for slot in &mut files[idx].outstanding
+    {
+        if let Some(entry) = slot
+            && entry.cookie == cookie
+        {
+            let _ = syscall::cap_revoke(entry.ancestor_cap);
+            let _ = syscall::cap_delete(entry.ancestor_cap);
+            cache.release_slot(entry.slot_idx);
+            *slot = None;
+            break;
+        }
+    }
+
+    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }

@@ -163,7 +163,7 @@ fn main() -> !
             {
                 if blk_driver_spawned && blk_ep != 0
                 {
-                    if let Ok(derived) = syscall::cap_derive(blk_ep, syscall::RIGHTS_SEND)
+                    if let Ok(derived) = syscall::cap_derive(blk_ep, syscall::RIGHTS_SEND_GRANT)
                     {
                         let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
                             .cap(derived)

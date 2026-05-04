@@ -54,6 +54,7 @@ static NEXT_PARTITION_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub struct VfsdCaps
 {
     pub procmgr_ep: u32,
+    pub memmgr_ep: u32,
     pub registry_ep: u32,
     pub service_ep: u32,
     pub fatfs_module_cap: u32,
@@ -99,6 +100,7 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
         service_ep: round1.caps[0],
         registry_ep: round1.caps[1],
         procmgr_ep: info.procmgr_endpoint,
+        memmgr_ep: info.memmgr_endpoint,
         fatfs_module_cap: round2.caps[0],
         self_aspace: info.self_aspace,
         bootstrap_ep: 0,
@@ -166,9 +168,27 @@ fn main() -> !
     let blk_ep = reply_caps[0];
     std::os::seraph::log!("block device endpoint acquired");
 
+    // Allocate a single scratch frame for GPT block reads. The
+    // BLK_READ_INTO_FRAME contract requires the caller to supply the DMA
+    // target frame; vfsd reuses one scratch page across all GPT reads.
+    // The frame and its VA reservation are process-lifetime-leaked.
+    let Some((mut scratch_cap, scratch_va)) =
+        gpt::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
+    else
+    {
+        std::os::seraph::log!("FATAL: GPT scratch allocation failed");
+        idle_loop();
+    };
+
     // Parse GPT partition table — stored for UUID lookups on MOUNT requests.
     let mut gpt_parts = gpt::new_gpt_table();
-    match gpt::parse_gpt(blk_ep, ipc_buf, &mut gpt_parts)
+    match gpt::parse_gpt(
+        blk_ep,
+        ipc_buf,
+        &mut gpt_parts,
+        &mut scratch_cap,
+        scratch_va,
+    )
     {
         Ok(count) => std::os::seraph::log!("GPT parsed, {count} partitions"),
         Err(gpt::GptError::IoError) => std::os::seraph::log!("GPT parse failed: I/O error"),
@@ -509,7 +529,10 @@ fn derive_and_register_partition(
 ) -> Option<u32>
 {
     let token = NEXT_PARTITION_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let partition_ep = syscall::cap_derive_token(rt.blk_ep, syscall::RIGHTS_SEND, token).ok()?;
+    // SEND_GRANT: fatfs sends per-cache-slot Frame caps as caps[0] on
+    // BLK_READ_INTO_FRAME, which requires GRANT on the endpoint cap.
+    let partition_ep =
+        syscall::cap_derive_token(rt.blk_ep, syscall::RIGHTS_SEND_GRANT, token).ok()?;
 
     // REGISTER_PARTITION on the un-tokened (whole-disk) endpoint.
     let msg = IpcMessage::builder(blk_labels::REGISTER_PARTITION)

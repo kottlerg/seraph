@@ -11,7 +11,7 @@
 
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
-use crate::fat::{next_cluster, read_sector};
+use crate::fat::next_cluster;
 
 // ── Directory entry ────────────────────────────────────────────────────────
 
@@ -323,10 +323,9 @@ fn find_in_directory(
         let base_sector = state.cluster_to_sector(cluster);
         for s in 0..u32::from(state.sectors_per_cluster)
         {
-            if !read_sector(
-                cache,
-                block_dev,
+            if !cache.read_sector(
                 u64::from(base_sector + s),
+                block_dev,
                 &mut sector_buf,
                 ipc_buf,
             )
@@ -359,10 +358,9 @@ fn find_in_fat16_root(
 
     for s in 0..root_sectors
     {
-        if !read_sector(
-            cache,
-            block_dev,
+        if !cache.read_sector(
             u64::from(root_start + s),
+            block_dev,
             &mut sector_buf,
             ipc_buf,
         )
@@ -456,10 +454,9 @@ pub fn read_dir_entry_at_index(
 
         for s in 0..root_sectors
         {
-            if !read_sector(
-                cache,
-                block_dev,
+            if !cache.read_sector(
                 u64::from(root_start + s),
+                block_dev,
                 &mut sector_buf,
                 ipc_buf,
             )
@@ -493,10 +490,9 @@ pub fn read_dir_entry_at_index(
         let base_sector = state.cluster_to_sector(cluster);
         for s in 0..u32::from(state.sectors_per_cluster)
         {
-            if !read_sector(
-                cache,
-                block_dev,
+            if !cache.read_sector(
                 u64::from(base_sector + s),
+                block_dev,
                 &mut sector_buf,
                 ipc_buf,
             )

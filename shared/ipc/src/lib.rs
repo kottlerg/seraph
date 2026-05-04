@@ -321,8 +321,6 @@ pub mod devmgr_labels
 /// IPC labels for block device drivers.
 pub mod blk_labels
 {
-    /// Read a single sector (512 bytes).
-    pub const READ_BLOCK: u64 = 1;
     /// Register a partition range for a tokened endpoint.
     ///
     /// Data words: `[token, base_lba, length_lba]`. Callable only over the

@@ -3,30 +3,15 @@
 
 // fs/fat/src/fat.rs
 
-//! Block I/O, FAT chain traversal, and file data reading.
+//! FAT chain traversal and file data reading.
 //!
-//! Provides sector-level reads via the block device IPC endpoint, FAT table
-//! lookups with single-sector caching, and cluster-chain-walking file reads.
+//! Provides FAT-table lookups with single-sector caching and
+//! cluster-chain-walking file reads. Sector reads go through
+//! [`PageCache::read_sector`] directly; partition-scoping is enforced by
+//! the block driver per the per-token bound vfsd registered at mount.
 
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
-
-/// Read a single 512-byte sector via the page cache.
-///
-/// `sector` is partition-relative. The block-device capability is
-/// partition-scoped by virtio-blk's per-token bound — vfsd registered the
-/// partition at mount time. Absolute-LBA translation happens driver-side;
-/// fatfs cannot read outside the partition regardless of the value it passes.
-pub fn read_sector(
-    cache: &PageCache,
-    block_dev: u32,
-    sector: u64,
-    buf: &mut [u8; SECTOR_SIZE],
-    ipc_buf: *mut u64,
-) -> bool
-{
-    cache.read_sector(sector, block_dev, buf, ipc_buf)
-}
 
 /// Look up the next cluster in the FAT chain.
 ///
@@ -85,10 +70,9 @@ pub fn next_cluster(
     // Read the FAT sector (with caching).
     if state.cached_fat_sector != fat_sector
     {
-        if !read_sector(
-            cache,
-            block_dev,
+        if !cache.read_sector(
             u64::from(fat_sector),
+            block_dev,
             &mut state.cached_fat_data,
             ipc_buf,
         )
@@ -204,13 +188,7 @@ pub fn read_file_data(
 
     let sector = state.cluster_to_sector(cluster) + sector_in_cluster;
     let mut sector_buf = [0u8; SECTOR_SIZE];
-    if !read_sector(
-        cache,
-        block_dev,
-        u64::from(sector),
-        &mut sector_buf,
-        ipc_buf,
-    )
+    if !cache.read_sector(u64::from(sector), block_dev, &mut sector_buf, ipc_buf)
     {
         return 0;
     }

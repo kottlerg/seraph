@@ -116,15 +116,16 @@ the slot is unused.
 
 The driver owns a single 1-page DMA buffer for the request header and
 status byte (offsets 0 and 1024). The data segment of every read is the
-caller-supplied Frame: the driver maps it into its own address space at a
-dedicated 1-page reservation, queries `phys_base` via `cap_info`, programs
-the descriptor chain to point at `phys_base + 512`, and unmaps after the
-request completes. Concurrency is bounded by the single shared mapping
-slot.
+caller-supplied Frame: the driver queries `phys_base` via `cap_info`
+without mapping the frame into its own address space (the device DMAs to
+the physical address; the driver never reads the data), then programs
+the descriptor chain to point at `phys_base + 512`. The Frame cap is
+moved back to the caller in the reply on every outcome, so it never
+accumulates in the driver's `CSpace`.
 
 The notify-after-avail-update memory-ordering pair (release fence on the
-producer, the device's implicit load-acquire on the doorbell MMIO) is
-unchanged from the prior `READ_BLOCK` path.
+producer, the device's implicit load-acquire on the doorbell MMIO)
+matches the VirtIO 1.2 §2.9.3 driver-notification contract.
 
 ---
 

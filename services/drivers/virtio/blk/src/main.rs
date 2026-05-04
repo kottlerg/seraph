@@ -439,10 +439,6 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 
         match msg.label
         {
-            blk_labels::READ_BLOCK =>
-            {
-                handle_read_block(&msg, ipc_buf, rt);
-            }
             blk_labels::BLK_READ_INTO_FRAME =>
             {
                 handle_read_block_into_frame(&msg, ipc_buf, rt);
@@ -459,65 +455,6 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
             }
         }
     }
-}
-
-/// Handle a `READ_BLOCK` request.
-///
-/// Token semantics:
-/// - `token == 0`: un-tokened (whole-disk) endpoint, held only by vfsd.
-///   The `sector` word is treated as an absolute LBA and bounded by device
-///   capacity.
-/// - `token != 0`: tokened (partition-scoped) endpoint. The `sector` word
-///   is partition-relative; the driver translates to absolute LBA using
-///   the registered bound and rejects out-of-range reads.
-fn handle_read_block(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
-{
-    let sector = if msg.word_count() >= 1
-    {
-        msg.word(0)
-    }
-    else
-    {
-        0
-    };
-
-    let absolute_sector = match resolve_sector(msg.token, sector, rt)
-    {
-        Ok(s) => s,
-        Err(code) =>
-        {
-            let reply = IpcMessage::new(code);
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-            return;
-        }
-    };
-
-    if !io::submit_and_wait(
-        rt.layout,
-        absolute_sector,
-        rt.layout.inline_data_phys(),
-        rt.vq,
-        rt.transport,
-        rt.queue_notify_off,
-        rt.irq_signal,
-        rt.irq_cap,
-    )
-    {
-        let status = rt.layout.read_status();
-        let code = u64::from(status);
-        let reply = IpcMessage::new(code);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    }
-
-    let sector_words = rt.layout.sector_words();
-    let reply = IpcMessage::builder(ipc::blk_errors::SUCCESS)
-        .words(0, &sector_words)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Handle a `BLK_READ_INTO_FRAME` request.
@@ -802,24 +739,12 @@ fn main() -> !
     let _ = syscall::irq_ack(caps.irq_slot);
     let irq_cap = caps.irq_slot;
 
-    // Set up I/O buffer and test-read sector 0.
+    // Set up I/O buffer (driver-owned page hosting request header at offset
+    // 0 and status byte at offset 1024). Data segments live in caller-supplied
+    // Frame caps per the BLK_READ_INTO_FRAME contract, so no driver-side
+    // smoke-read is possible without allocating a throwaway frame; the fs
+    // driver's first BPB read serves as the real first-use sanity check.
     let layout = setup_io_buffer(&caps, ipc_buf);
-
-    if !io::submit_and_wait(
-        &layout,
-        0,
-        layout.inline_data_phys(),
-        &mut vq,
-        &transport,
-        queue_notify_off,
-        irq_signal,
-        irq_cap,
-    )
-    {
-        std::os::seraph::log!("sector 0 test read failed");
-        syscall::thread_exit();
-    }
-    std::os::seraph::log!("sector 0 read OK");
 
     // Enter service loop.
     if caps.service_ep == 0

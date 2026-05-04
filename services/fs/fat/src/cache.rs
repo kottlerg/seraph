@@ -10,8 +10,15 @@
 //! sequence counter; only slots with `refcount == 0` are eviction
 //! candidates.
 //!
-//! Fill path: issue `READ_BLOCK` against the partition-scoped block cap,
-//! memcpy the inline 512-byte reply into the slot's frame at offset 0.
+//! Fill path: issue `BLK_READ_INTO_FRAME` against the partition-scoped
+//! block cap, transferring the slot's Frame cap as `caps[0]`. The driver
+//! DMAs the sector directly into the slot's frame at offset 512 of the
+//! page (per the `BLK_READ_INTO_FRAME` wire contract) and returns the cap
+//! in the reply. The cap may land at a different `CSpace` slot index on
+//! return, so the slot's `frame_cap` is updated from `reply.caps()[0]`;
+//! the underlying `FrameObject` identity is preserved through the move,
+//! and the existing AS mapping at the slot's VA continues to point at the
+//! same physical pages.
 //!
 //! Slot caps are minted once at startup via memmgr `REQUEST_FRAMES` with
 //! the `REQUIRE_CONTIGUOUS` flag (one IPC per slot — slot count is bounded
@@ -21,11 +28,15 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use ipc::{IpcMessage, blk_labels, memmgr_errors, memmgr_labels};
+use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
 use crate::bpb::SECTOR_SIZE;
+
+/// Byte offset within a cache slot's frame where the sector's 512 B land,
+/// per the `BLK_READ_INTO_FRAME` wire contract.
+const SECTOR_OFFSET_IN_SLOT: u64 = 512;
 
 /// Number of cache slots.
 pub const SLOT_COUNT: usize = 128;
@@ -37,7 +48,14 @@ const LBA_EMPTY: u64 = u64::MAX;
 struct CacheSlot
 {
     sector_lba: AtomicU64,
-    frame_cap: u32,
+    /// `CSpace` slot index of the Frame cap backing this cache page.
+    ///
+    /// Atomic because each `BLK_READ_INTO_FRAME` round trip moves the cap
+    /// out and back; the kernel may install the returned cap at a
+    /// different `CSpace` index, so the field is rewritten on every fill.
+    /// Synchronisation is via the slot `refcount` `AcqRel` pair — readers
+    /// load `frame_cap` only after a successful refcount bump.
+    frame_cap: AtomicU32,
     va: u64,
     refcount: AtomicU32,
     lru_seq: AtomicU64,
@@ -91,7 +109,7 @@ impl PageCache
         let cache: &'static mut Self = Box::leak(Box::new(Self {
             slots: core::array::from_fn(|i| CacheSlot {
                 sector_lba: AtomicU64::new(LBA_EMPTY),
-                frame_cap: 0,
+                frame_cap: AtomicU32::new(0),
                 va: base_va + (i as u64) * PAGE_SIZE,
                 refcount: AtomicU32::new(0),
                 lru_seq: AtomicU64::new(0),
@@ -107,7 +125,7 @@ impl PageCache
             // process exit (no caller-side cleanup needed).
             syscall::mem_map(cap, self_aspace, slot.va, 0, 1, MAP_WRITABLE)
                 .map_err(|_| InitError::Map)?;
-            slot.frame_cap = cap;
+            slot.frame_cap.store(cap, Ordering::Release);
         }
 
         Ok(&*cache)
@@ -131,9 +149,14 @@ impl PageCache
         let slot = &self.slots[idx];
         // SAFETY: refcount > 0 for the duration of this borrow; slot.va was
         // mapped writable for one page at startup and is owned by this
-        // process. The cached sector lives at offset 0 of the page.
+        // process. The cached sector lives at offset SECTOR_OFFSET_IN_SLOT
+        // of the page (per the BLK_READ_INTO_FRAME wire contract).
         unsafe {
-            core::ptr::copy_nonoverlapping(slot.va as *const u8, buf.as_mut_ptr(), SECTOR_SIZE);
+            core::ptr::copy_nonoverlapping(
+                (slot.va + SECTOR_OFFSET_IN_SLOT) as *const u8,
+                buf.as_mut_ptr(),
+                SECTOR_SIZE,
+            );
         }
         self.release(idx);
         true
@@ -164,7 +187,11 @@ impl PageCache
         // Refcount the victim before the fill so a racing `pick_victim`
         // will skip it.
         slot.refcount.fetch_add(1, Ordering::AcqRel);
-        if !fill_legacy(slot, lba, block_dev, ipc_buf)
+        // Invalidate the LBA up front: a fill failure leaves the slot
+        // without correct contents, so it must not satisfy a hit lookup
+        // even by stale LBA match.
+        slot.sector_lba.store(LBA_EMPTY, Ordering::Release);
+        if !fill_via_block_dev(slot, lba, block_dev, ipc_buf)
         {
             slot.refcount.fetch_sub(1, Ordering::AcqRel);
             return None;
@@ -206,36 +233,44 @@ impl PageCache
     }
 }
 
-/// Fill `slot` from the block device using the legacy inline-reply
-/// `READ_BLOCK` IPC. The reply's 512 bytes are memcpy'd into the slot's
-/// frame at offset 0.
-fn fill_legacy(slot: &CacheSlot, lba: u64, block_dev: u32, ipc_buf: *mut u64) -> bool
+/// Fill `slot` by issuing `BLK_READ_INTO_FRAME` against the block device.
+///
+/// The slot's Frame cap is moved to the driver as `caps[0]` and moved back
+/// in the reply (typically — but not necessarily — to the same `CSpace`
+/// slot index). `slot.frame_cap` is rewritten from `reply.caps()[0]` on
+/// every outcome so the cache and the kernel agree on where the cap lives.
+/// The AS mapping at `slot.va` is unaffected by the move because mappings
+/// are page-table-resident and keyed on the underlying `FrameObject`'s
+/// physical pages, which the move preserves.
+///
+/// Returns `false` on any failure path (IPC error, driver error, missing
+/// returned cap). On `false`, the slot's `frame_cap` is left at whatever
+/// the kernel put back: the caller invalidates the slot's LBA before
+/// calling, so a broken slot is naturally not hit by future lookups even
+/// if its cap is genuinely lost (`frame_cap == 0`).
+fn fill_via_block_dev(slot: &CacheSlot, lba: u64, block_dev: u32, ipc_buf: *mut u64) -> bool
 {
-    let msg = IpcMessage::builder(blk_labels::READ_BLOCK)
+    let cap = slot.frame_cap.load(Ordering::Acquire);
+    if cap == 0
+    {
+        return false;
+    }
+    let msg = IpcMessage::builder(blk_labels::BLK_READ_INTO_FRAME)
         .word(0, lba)
+        .cap(cap)
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) })
     else
     {
+        // Cap was moved out and never returned (kernel-level failure).
+        // Mark the slot as having no cap so it won't be reused for fills.
+        slot.frame_cap.store(0, Ordering::Release);
         return false;
     };
-    if reply.label != 0
-    {
-        return false;
-    }
-    let bytes = reply.data_bytes();
-    if bytes.len() < SECTOR_SIZE
-    {
-        return false;
-    }
-    // SAFETY: slot.va is a writable single-page mapping; the caller has
-    // bumped the refcount, so no other path will fill or read this slot
-    // until this call returns.
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.va as *mut u8, SECTOR_SIZE);
-    }
-    true
+    let returned = reply.caps().first().copied().unwrap_or(0);
+    slot.frame_cap.store(returned, Ordering::Release);
+    reply.label == blk_errors::SUCCESS && returned != 0
 }
 
 /// Acquire one single-page Frame cap from memmgr.

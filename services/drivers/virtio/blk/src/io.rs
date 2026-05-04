@@ -6,17 +6,13 @@
 //! Block I/O request submission and completion for the `VirtIO` block driver.
 //!
 //! Provides the descriptor chain layout for `VirtIO` block read requests
-//! (`VirtIO` 1.2 section 5.2.6), and helpers for submitting sector reads and copying
-//! completed data into the IPC reply buffer.
+//! (`VirtIO` 1.2 section 5.2.6) and helpers for submitting sector reads.
 //!
-//! `IoLayout` owns the driver's permanent 1-page DMA buffer. The header
-//! (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live there
-//! permanently. The 512-byte data segment can either reuse the same page
-//! at offset 512 (legacy `READ_BLOCK` path, copied back inline) or land in
-//! a caller-supplied Frame at `phys + 512` (`BLK_READ_INTO_FRAME` path,
-//! returned by-cap). `read_chain` parameterises the data-segment physical
-//! address; header and status physical addresses are always derived from
-//! the driver's own page.
+//! `IoLayout` owns the driver's permanent 1-page DMA buffer. The request
+//! header (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live
+//! there permanently. The 512-byte data segment is supplied per-request by
+//! the caller as a Frame cap; `read_chain` parameterises the data-segment
+//! physical address. The driver's own page never holds bulk data.
 
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::SplitVirtqueue;
@@ -33,15 +29,16 @@ pub struct VirtioBlkReqHeader
     pub sector: u64,
 }
 
-/// Physical/virtual layout for a single block I/O data page.
+/// Physical/virtual layout for the driver's permanent DMA page.
 ///
-/// The data page is carved into three regions: request header (offset 0),
-/// sector data buffer (offset 512), and status byte (offset 1024).
+/// Hosts the request header (offset 0, 16 bytes) and status byte (offset
+/// 1024, 1 byte). The 512-byte data segment is supplied per-request via
+/// [`read_chain`](IoLayout::read_chain).
 pub struct IoLayout
 {
-    /// Virtual address of the mapped data page.
+    /// Virtual address of the mapped page.
     pub data_va: u64,
-    /// Physical address of the mapped data page.
+    /// Physical address of the mapped page.
     pub data_phys: u64,
 }
 
@@ -52,22 +49,9 @@ impl IoLayout
         self.data_va as *mut VirtioBlkReqHeader
     }
 
-    fn data_buf_va(&self) -> u64
-    {
-        self.data_va + 512
-    }
-
     fn status_va(&self) -> u64
     {
         self.data_va + 1024
-    }
-
-    /// Physical address of the inline data-buffer region (offset 512 of the
-    /// driver's permanent DMA page). Used by the legacy `READ_BLOCK` path
-    /// that copies the result back inline.
-    pub fn inline_data_phys(&self) -> u64
-    {
-        self.data_phys + 512
     }
 
     /// Descriptor chain for a block read request whose data segment lands at
@@ -114,24 +98,6 @@ impl IoLayout
         // SAFETY: status_va is within the mapped data page.
         unsafe { core::ptr::read_volatile(self.status_va() as *const u8) }
     }
-
-    /// Copy the 512-byte sector data into a stack-owned 64-word array.
-    ///
-    /// Volatile reads pull from the DMA data buffer; the returned array is
-    /// plain memory suitable for packing into an [`ipc::IpcMessage`].
-    #[must_use]
-    pub fn sector_words(&self) -> [u64; 64]
-    {
-        let mut out = [0u64; 64];
-        let buf_va = self.data_buf_va();
-        for (i, slot) in out.iter_mut().enumerate()
-        {
-            // SAFETY: buf_va + i*8 is within the mapped data page (one page,
-            // 64 * 8 = 512 bytes read starting at offset 512).
-            *slot = unsafe { core::ptr::read_volatile((buf_va + (i as u64) * 8) as *const u64) };
-        }
-        out
-    }
 }
 
 /// Maximum `signal_wait` iterations before treating the request as timed out.
@@ -140,9 +106,8 @@ const MAX_WAIT_ATTEMPTS: usize = 1000;
 /// Submit a read request and wait for completion via IRQ signal.
 ///
 /// `data_phys` is the physical address the device should DMA the 512-byte
-/// data segment into. For the legacy inline `READ_BLOCK` path, callers pass
-/// `layout.inline_data_phys()`; for `BLK_READ_INTO_FRAME`, callers pass the
-/// caller-supplied frame's `phys_base + 512`.
+/// data segment into — the caller-supplied frame's `phys_base + 512` per
+/// the `BLK_READ_INTO_FRAME` contract.
 ///
 /// Blocks on `signal_wait` until the device raises an interrupt, reads the
 /// device ISR to deassert the level-triggered interrupt, then acknowledges

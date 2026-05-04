@@ -132,7 +132,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
 fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf: *mut u64) -> u64
 {
     let mut sector_buf = [0u8; SECTOR_SIZE];
-    if !fat::read_sector(cache, caps.block_dev, 0, &mut sector_buf, ipc_buf)
+    if !cache.read_sector(0, caps.block_dev, &mut sector_buf, ipc_buf)
     {
         return ipc::fs_errors::IO_ERROR;
     }

@@ -21,6 +21,7 @@ mod cli;
 mod commands;
 mod context;
 mod disk;
+mod qemu;
 mod rust_src;
 mod sysroot;
 mod util;
@@ -39,6 +40,7 @@ fn main()
         CliCommand::Run(args) => commands::run::run(&ctx, args),
         CliCommand::Clean(args) => commands::clean::run(&ctx, args),
         CliCommand::Test(args) => commands::test::run(&ctx, args),
+        CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
     };
 
     if let Err(err) = result

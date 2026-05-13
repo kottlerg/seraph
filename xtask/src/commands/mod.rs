@@ -8,4 +8,5 @@
 pub mod build;
 pub mod clean;
 pub mod run;
+pub mod run_parallel;
 pub mod test;

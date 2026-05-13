@@ -126,7 +126,7 @@ fn main()
     // cap-derivation pressure on TCG-emulated arches.
     fs_open_relative_phase();
 
-    std::os::seraph::log!("PASS");
+    std::os::seraph::log!("ALL TESTS PASSED");
 }
 
 /// Re-entry path used by `ns_sandbox_phase` (parent). The child runs
@@ -1674,7 +1674,7 @@ fn churn_phase()
 /// search to fail and the retry in `System::alloc` to request fresh
 /// frames from procmgr, map them above `mapped_end`, extend the free
 /// list, and re-serve the allocation. Without the grow path this
-/// allocation aborts the process before reaching `usertest: PASS`.
+/// allocation aborts the process before reaching `ALL TESTS PASSED`.
 // cast_possible_truncation: index-to-u8 casts use `& 0xFF` or small counts;
 // truncation is the intended identity fingerprint for spot-checks.
 #[allow(clippy::cast_possible_truncation)]

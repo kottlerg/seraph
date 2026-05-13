@@ -31,7 +31,8 @@ pub enum CliCommand
     /// Build Seraph components and populate the sysroot.
     Build(BuildArgs),
 
-    /// Build (if needed) and launch Seraph under QEMU.
+    /// Launch Seraph under QEMU. Requires a populated sysroot — run
+    /// `cargo xtask build` first.
     Run(RunArgs),
 
     /// Remove the sysroot (and optionally cargo target/).
@@ -39,6 +40,11 @@ pub enum CliCommand
 
     /// Run Seraph unit tests on the host.
     Test(TestArgs),
+
+    /// Launch N QEMU instances in parallel against an already-built image,
+    /// classifying each run's outcome via user-supplied pass/fail regexes.
+    /// Requires a populated sysroot — run `cargo xtask build` first.
+    RunParallel(RunParallelArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -100,10 +106,6 @@ pub struct RunArgs
     #[arg(long, default_value = "x86_64")]
     pub arch: Arch,
 
-    /// Use the release build.
-    #[arg(long)]
-    pub release: bool,
-
     /// Start QEMU with a GDB server on localhost:1234 (QEMU pauses at startup).
     #[arg(long)]
     pub gdb: bool,
@@ -122,15 +124,6 @@ pub struct RunArgs
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,
-
-    /// Skip the pre-launch build and use the existing sysroot / disk image
-    /// as-is. Intended for tight loops — re-running the same image many
-    /// times to shake out non-determinism (races, timer-dependent bugs)
-    /// without paying cargo's fingerprint walk each iteration. Fails fast
-    /// if the sysroot artifacts are missing; run `cargo xtask build` (or
-    /// one `cargo xtask run` without the flag) to populate them first.
-    #[arg(long)]
-    pub no_build: bool,
 }
 
 // ── Clean ─────────────────────────────────────────────────────────────────────
@@ -162,4 +155,44 @@ pub enum TestComponent
     Kernel,
     Init,
     All,
+}
+
+// ── RunParallel ───────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct RunParallelArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// Concurrency: number of QEMU instances in flight at once.
+    #[arg(long)]
+    pub parallel: u32,
+
+    /// Total runs to perform, dispatched in waves of `--parallel`.
+    #[arg(long)]
+    pub runs: u32,
+
+    /// Per-run timeout, in seconds. A run still alive at this point is
+    /// killed and classified as HANG.
+    #[arg(long, default_value = "30")]
+    pub timeout: u64,
+
+    /// Number of vCPUs to expose to each guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Regex marking a successful run. On match the log is discarded and
+    /// the run is classified PASS. The default matches the unique terminal
+    /// marker emitted by both ktest (`ktest: ALL TESTS PASSED`) and
+    /// usertest (`[usertest] ALL TESTS PASSED`); override for other rootfs
+    /// configurations.
+    #[arg(long, default_value = "ALL TESTS PASSED")]
+    pub pass: String,
+
+    /// Regex marking a failed run. On match the log is preserved as
+    /// FAIL-<run>.log. Failure takes precedence over success.
+    #[arg(long)]
+    pub fail: Option<String>,
 }

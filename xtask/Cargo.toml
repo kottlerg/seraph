@@ -18,6 +18,8 @@ anyhow = "1"
 gpt = "4"
 fatfs = "0.3"
 uuid = "1"
+# Regex matching for run-parallel pass/fail classification.
+regex = "1"
 
 [lints]
 workspace = true

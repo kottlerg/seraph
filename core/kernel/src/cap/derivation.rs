@@ -434,14 +434,22 @@ pub unsafe fn revoke_subtree(root: SlotId) -> &'static [Option<NonNull<KernelObj
         {
             continue;
         };
+
+        // Take cspace.lock around the slot read + free_slot so the freelist
+        // mutation cannot tear against a concurrent SYS_CAP_CREATE_* on the
+        // same cspace. Lock order: DERIVATION_LOCK → cspace.lock.
         // SAFETY: cspace registry lookup validated; CSpace pointer lives as
-        // long as the registry entry.
+        // long as the registry entry; lock_raw/unlock_raw paired.
+        let saved = unsafe { (*cs_ptr).lock.lock_raw() };
+        // SAFETY: lock held; aliasing prevented.
         let cs = unsafe { &mut *cs_ptr };
 
         let (obj_ptr, first_child) = {
             let Some(slot) = cs.slot_mut(node_id.index.get())
             else
             {
+                // SAFETY: paired with lock_raw above.
+                unsafe { (*cs_ptr).lock.unlock_raw(saved) };
                 continue;
             };
             let obj = slot.object;
@@ -451,6 +459,8 @@ pub unsafe fn revoke_subtree(root: SlotId) -> &'static [Option<NonNull<KernelObj
         };
 
         cs.free_slot(node_id.index.get());
+        // SAFETY: paired with lock_raw above.
+        unsafe { (*cs_ptr).lock.unlock_raw(saved) };
 
         if let Some(ptr) = obj_ptr
         {

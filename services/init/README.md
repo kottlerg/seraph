@@ -41,18 +41,39 @@ Init's responsibilities are strictly bounded:
 
 3. **Request early service startup** — init requests procmgr to start
    the remaining early services in order: devmgr, svcmgr, drivers, VFS,
-   and optionally net.
+   and optionally net. Tier-1 services (devmgr, vfsd, drivers) are
+   spawned via boot-module `CREATE_PROCESS` *before* init has a
+   namespace cap, so they hold none — their `ProcessInfo.system_root_cap`
+   is zero, which is correct for kernel-adjacent services that have no
+   business reading the filesystem.
 
-4. **Delegate capabilities** — for each service, init derives and
+4. **Acquire the seed system-root cap** — after the cmdline-driven
+   root mount completes, init issues
+   `vfsd_labels::GET_SYSTEM_ROOT_CAP` to vfsd. The returned tokened
+   SEND on vfsd's namespace endpoint at `NodeId::ROOT` with full
+   rights is init's seed: every later Phase 3 child receives a
+   `cap_copy` of it via `procmgr_labels::CONFIGURE_NAMESPACE`. Init
+   is the cap-distribution authority for tier-3 services; there is no
+   procmgr broadcast.
+
+5. **Delegate capabilities** — for each service, init derives and
    transfers the appropriate subset of its initial capabilities via
    IPC. Init retains derived intermediary copies (for potential
    revocation), not the roots.
 
-5. **Register services with svcmgr** — before exiting, init registers
+6. **Spawn Phase 3 services from VFS** — svcmgr, crasher, usertest,
+   hello, stdiotest are loaded by walking init's seed system-root cap
+   to `/bin/<name>`, then issuing `procmgr_labels::CREATE_FROM_FILE`
+   with the resolved file cap. Each child receives a `cap_copy` of
+   init's root via `CONFIGURE_NAMESPACE` before start. See
+   [`docs/namespace-model.md`](../../docs/namespace-model.md) for the
+   namespace-cap distribution invariants.
+
+7. **Register services with svcmgr** — before exiting, init registers
    all started services with svcmgr along with their restart policies
    and capability sets.
 
-6. **Exit** — init calls `sys_thread_exit`. It holds no long-lived
+8. **Exit** — init calls `sys_thread_exit`. It holds no long-lived
    state, no supervision capability, and no restart authority. svcmgr
    takes over.
 

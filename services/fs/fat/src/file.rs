@@ -28,12 +28,9 @@ pub const MAX_OUTSTANDING: usize = 16;
 pub struct OutstandingPage
 {
     /// Caller-visible identifier for this page; round-trips through
-    /// `FS_RELEASE_FRAME`. Looked up by the cooperative-release path
-    /// when it lands; unused by the on-close hard-revoke path.
-    // The release path is not yet wired (lands as a separate change),
-    // so this field has no readers today. Kept as a load-bearing
-    // identifier for the next change.
-    #[allow(dead_code)]
+    /// `FS_RELEASE_FRAME`. Disambiguates which outstanding entry an
+    /// inbound client release or worker-driven eviction targets when
+    /// multiple pages of the same file are mapped concurrently.
     pub cookie: u64,
     /// Cache slot index whose refcount is held by this entry.
     pub slot_idx: usize,
@@ -47,12 +44,24 @@ pub struct OutstandingPage
 /// A single open file, identified by its capability token.
 pub struct OpenFile
 {
-    /// Token value from `cap_derive_token` (0 = unused slot).
+    /// Monotonic identity stamped on slot allocation (0 = unused slot).
+    /// Used by the eviction worker to address a slot through
+    /// `find_by_token`; the slot itself is reached via
+    /// `FatNode.open_slot` on the cap-native path, so this token does
+    /// not appear on the wire.
     pub token: u64,
     pub start_cluster: u32,
     pub file_size: u32,
-    pub is_dir: bool,
     pub outstanding: [Option<OutstandingPage>; MAX_OUTSTANDING],
+    /// SEND cap on the client's release endpoint. Recorded from
+    /// `caps[0]` of the first `FS_READ_FRAME` against this slot's
+    /// node cap; the eviction worker addresses cooperative
+    /// `FS_RELEASE_FRAME` requests to it when reclaiming an
+    /// outstanding cache page. A zero cap indicates the client opted
+    /// out (no caps on the first frame request); eviction falls
+    /// straight through to the hard-revoke path. Deleted from the
+    /// fs's `CSpace` at `FS_CLOSE` time.
+    pub release_endpoint_cap: u32,
 }
 
 impl OpenFile
@@ -63,8 +72,8 @@ impl OpenFile
             token: 0,
             start_cluster: 0,
             file_size: 0,
-            is_dir: false,
             outstanding: [None; MAX_OUTSTANDING],
+            release_endpoint_cap: 0,
         }
     }
 

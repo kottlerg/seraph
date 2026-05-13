@@ -170,9 +170,12 @@ fn sys_exit(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         // Commit Exited under all-CPU scheduler.locks so a concurrent
         // dealloc on another CPU observes a coherent state and the local
-        // schedule() below sees the Exited skip-bit.
+        // schedule() below sees the Exited skip-bit. Write exit_reason
+        // first so any subsequent acquire of any sched.lock observes the
+        // reason alongside the Exited transition.
         // SAFETY: tcb validated non-null.
         unsafe {
+            (*tcb).exit_reason = 0;
             crate::sched::set_state_under_all_locks(tcb, ThreadState::Exited);
         }
 

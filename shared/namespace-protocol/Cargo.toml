@@ -1,0 +1,36 @@
+[package]
+name = "namespace-protocol"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# no_std: shared namespace-protocol implementation. Hosts the IPC dispatch
+# loop, name validation, rights composition, and token packing common to
+# every namespace server (vfsd synthetic root, fs/fat, future fs/ext4 /
+# tmpfs / etc.). Servers implement the `NamespaceBackend` trait against
+# their storage layer; this crate owns the security-relevant code path so
+# new backends do not re-implement access checks.
+[lib]
+test = true
+doctest = false
+
+[dependencies]
+ipc = { path = "../ipc" }
+syscall = { path = "../syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+# When std lists this crate as a dep, build-std activates
+# `rustc-dep-of-std` and forwards the feature to our workspace deps, so
+# `use core::…` resolves against the build-std core facade. Same pattern
+# as abi/syscall, shared/syscall, shared/ipc.
+rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+[features]
+rustc-dep-of-std = [
+    "rustc-std-workspace-core",
+    "ipc/rustc-dep-of-std",
+    "syscall/rustc-dep-of-std",
+    "syscall-abi/rustc-dep-of-std",
+]
+
+[lints]
+workspace = true

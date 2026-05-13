@@ -1,365 +1,255 @@
 # Filesystem Driver Protocol
 
-IPC protocol for filesystem drivers. Two communication channels exist:
+IPC surface a filesystem driver implements **on top of** the cap-
+native namespace protocol. The namespace surface (`NS_LOOKUP`,
+`NS_STAT`, `NS_READDIR`, name validation, rights composition, error
+codes) is specified in
+[`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md);
+this document covers the labels that remain fs-driver-specific:
 
-1. **Service endpoint** (untokened): vfsd sends `FS_MOUNT` and `FS_OPEN` on
-   the driver's service endpoint. The driver holds the Receive-side capability.
+- `FS_MOUNT` — vfsd-to-driver BPB-validation probe at mount time.
+- `FS_READ` — inline read on a per-node tokened cap.
+- `FS_READ_FRAME` / `FS_RELEASE_FRAME` / `FS_RELEASE_ACK` — frame-cap
+  read protocol with cooperative release.
+- `FS_CLOSE` — release driver-side per-node bookkeeping; the holder
+  still `cap_delete`s its node cap to drop the kernel reference.
+- `END_OF_DIR` — readdir terminator, reused by `NS_READDIR`.
 
-2. **Per-file capabilities** (tokened): On `FS_OPEN`, the driver derives a
-   tokened Send cap from its service endpoint and returns it. Clients send
-   file operations (`FS_READ`, `FS_CLOSE`, `FS_STAT`, `FS_READDIR`) directly
-   on this cap. The token delivered by `ipc_recv` identifies the open file.
+A driver runs as a separate process. After `FS_MOUNT` succeeds, the
+driver dispatches incoming requests by their token shape:
+
+- `token == 0` — service-level request from vfsd (only `FS_MOUNT`
+  today).
+- `token != 0` carrying namespace rights in bits 40..64 — node-cap
+  request. Per-node opcodes (`NS_*`, `FS_READ`, `FS_READ_FRAME`,
+  `FS_RELEASE_FRAME`, `FS_CLOSE`) are dispatched by label.
 
 ---
 
-## Endpoint
+## Endpoint surface
 
-vfsd creates a dedicated IPC endpoint for each filesystem driver at mount time.
-vfsd holds the Send-side capability; the driver holds the Receive-side
-capability, injected into the driver's CSpace during two-phase process creation.
+A filesystem driver exposes one IPC endpoint, used as both:
+
+- the un-tokened **service endpoint** (vfsd holds a SEND, derives
+  per-node tokened SENDs); and
+- the un-tokened **namespace endpoint** routed through
+  [`namespace_protocol::dispatch_request`] for `NS_*` dispatch.
+
+The receive-side cap is injected into the driver's CSpace at two-
+phase process creation. The same endpoint is also the kernel-
+derivation parent for every node cap the driver ever issues via
+`cap_derive_token`.
+
+Numeric label values live in [`ipc::fs_labels`] (this document) and
+[`ipc::ns_labels`] (namespace-protocol document).
 
 ---
 
-## Messages
+## Label 10: `FS_MOUNT`
 
-All operations use `SYS_IPC_CALL` (synchronous call/reply). The driver
-dispatches based on the token from `ipc_recv`:
+Mount-time probe. Sent by vfsd on the un-tokened service endpoint
+after the driver process is spawned and the partition is registered
+with virtio-blk. The driver MUST read the superblock / BPB through
+its block device endpoint and reply success or a typed error.
 
-- **token == 0**: service-level request from vfsd (`FS_MOUNT`, `FS_OPEN`)
-- **token != 0**: per-file request from a client, identified by the token
-
-### Label 10: `FS_MOUNT`
-
-Initialize the filesystem. Sent once after the driver starts, via the
-untokened service endpoint. The driver reads superblock/BPB metadata from the
-block device and prepares internal state.
-
-The block device endpoint is injected into the driver's CSpace at creation
-time (identified by `CapDescriptor` with `CapType::Frame` and
-`aux0 = BLOCK_ENDPOINT_SENTINEL`).
-
-**Request:**
+**Request**
 
 | Field | Value |
 |---|---|
-| label | 10 |
-| data[0] | Partition LBA offset |
+| `label` | `10` |
+| body | empty |
 
-**Reply (success):**
+**Reply (success)**: `label = 0`, empty body.
 
-| Field | Value |
-|---|---|
-| label | 0 (success) |
+**Reply (error)**: `label = ipc::fs_errors::*` (e.g. `IO_ERROR`,
+`NOT_FOUND` for a malformed BPB).
 
-**Reply (error):**
+The block device endpoint arrives in the driver's CSpace at creation
+time; see [Bootstrap caps](#bootstrap-caps).
 
-| Field | Value |
-|---|---|
-| label | Nonzero error code |
+---
 
-**Error codes:**
+## Label 2: `FS_READ`
 
-| Code | Name | Meaning |
-|---|---|---|
-| 1 | `InvalidFilesystem` | Superblock/BPB validation failed |
-| 2 | `IoError` | Block device read failed |
+Inline read against a per-node tokened cap. The kernel delivers the
+node's `(NodeId, NamespaceRights)` token to the driver via
+`ipc_recv.token`; the driver MUST verify the `READ` rights bit and
+reject with `NsError::PermissionDenied` otherwise.
 
-### Label 1: `FS_OPEN`
-
-Open a file or directory by path within this filesystem. Sent via the
-untokened service endpoint by vfsd.
-
-On success, the driver:
-1. Resolves the path to a directory entry
-2. Allocates an internal file slot and assigns a monotonic token value
-3. Derives a tokened Send cap from its service endpoint via
-   `SYS_CAP_DERIVE_TOKEN`
-4. Returns the tokened cap in the reply
-
-**Request:**
-
-| Field | Value |
-|---|---|
-| label | `1 \| (path_len << 16)` — bits 0–15 = opcode, bits 16–31 = path byte count |
-| data[0..5] | Path bytes (relative to this mount point, `/`-separated) |
-
-**Reply (success):**
-
-| Field | Value |
-|---|---|
-| label | 0 (success) |
-| cap[0] | Per-file capability (tokened Send endpoint) |
-
-**Reply (error):**
-
-| Field | Value |
-|---|---|
-| label | Nonzero error code |
-
-**Error codes:**
-
-| Code | Name | Meaning |
-|---|---|---|
-| 1 | `NotFound` | Path does not resolve to an existing entry |
-| 2 | `OutOfMemory` | Cap derivation failed |
-| 3 | `TooManyOpen` | Open file table is full |
-
-### Label 2: `FS_READ`
-
-Read bytes from an open file. Sent by the client directly on the per-file
-capability; the token identifies the file.
-
-Used by clients for short reads (`< PAGE_SIZE` bytes). Reads of
-`>= PAGE_SIZE` bytes use [`FS_READ_FRAME`](#label-7-fs_read_frame). The
-threshold is fixed at vfsd / std and is not negotiable.
-
-**Request:**
-
-| Field | Value |
-|---|---|
-| label | 2 |
-| data[0] | Byte offset |
-| data[1] | Maximum bytes to read (capped at 512) |
-
-**Reply (success):**
-
-| Field | Value |
-|---|---|
-| label | 0 (success) |
-| data[0] | Bytes actually read |
-| data[1..] | File data in IPC buffer (up to 512 bytes, 64 u64 words) |
-
-**Reply (error):**
-
-| Field | Value |
-|---|---|
-| label | Nonzero error code |
-
-**Error codes:**
-
-| Code | Name | Meaning |
-|---|---|---|
-| 4 | `InvalidToken` | No open file for this token |
-
-### Label 3: `FS_CLOSE`
-
-Close an open file. Sent by the client on the per-file capability; the token
-identifies the file. The client should call `SYS_CAP_DELETE` on the per-file
-capability after this call.
-
-**Request:**
-
-| Field | Value |
-|---|---|
-| label | 3 |
-
-No data words required — the file is identified by the token.
-
-**Reply (success):**
-
-| Field | Value |
-|---|---|
-| label | 0 (success) |
-
-**Reply (error):**
-
-| Field | Value |
-|---|---|
-| label | Nonzero error code |
-
-**Error codes:**
-
-| Code | Name | Meaning |
-|---|---|---|
-| 4 | `InvalidToken` | No open file for this token |
-
-### Label 4: `FS_STAT`
-
-Query metadata for an open file. Sent on the per-file capability; the token
-identifies the file.
-
-**Request:**
-
-| Field | Value |
-|---|---|
-| label | 4 |
-
-No data words required — the file is identified by the token.
-
-**Reply (success):**
-
-| Field | Value |
-|---|---|
-| label | 0 (success) |
-| data[0] | File size in bytes |
-| data[1] | Flags: bit 0 = directory, bit 1 = read-only |
-
-**Reply (error):**
-
-| Field | Value |
-|---|---|
-| label | Nonzero error code |
-
-**Error codes:**
-
-| Code | Name | Meaning |
-|---|---|---|
-| 4 | `InvalidToken` | No open file for this token |
-
-### Label 5: `FS_READDIR`
-
-Read a directory entry by index. Sent on the per-file capability; the token
-identifies the directory.
-
-**Request:**
-
-| Field | Value |
-|---|---|
-| label | 5 |
-| data[0] | Entry index (0-based) |
-
-**Reply (success):**
-
-| Field | Value |
-|---|---|
-| label | 0 (success) |
-| data[0] | Entry name length |
-| data[1] | File size |
-| data[2] | Flags: bit 0 = directory |
-| data[3..] | Entry name bytes (8.3 format, up to 12 bytes) |
-
-**Reply (end of directory):**
-
-| Field | Value |
-|---|---|
-| label | 6 (`EndOfDir`) |
-
-**Reply (error):**
-
-| Field | Value |
-|---|---|
-| label | Nonzero error code |
-
-**Error codes:**
-
-| Code | Name | Meaning |
-|---|---|---|
-| 4 | `InvalidToken` | No open file for this token, or not a directory |
-
-### Label 7: `FS_READ_FRAME`
-
-Read file content into a cached Frame capability returned in the reply.
-Sent on the per-file capability; the token identifies the file. Used for
-bulk reads (`>= PAGE_SIZE` bytes); shorter reads use [`FS_READ`](#label-2-fs_read).
-
-The driver returns a Frame cap derived from its internal page cache with
-attenuated rights (`MAP | READ`). The client maps the frame, reads the
-bytes, and is then expected to release the frame via the cooperative
-release protocol (see [Label 8](#label-8-fs_release_frame) and
-[Label 9](#label-9-fs_release_ack)).
-
-The returned Frame is a single page. The request `offset` is a byte
-position in the file with no alignment requirement; the driver locates
-the containing sector inside its cache page and reports back where the
-file's content for `offset` lives within the returned frame
-(`frame_data_offset`) and how many contiguous valid bytes follow
-(`bytes_valid`). `bytes_valid` is bounded by file end, the underlying
-filesystem's cluster boundary, and the page tail
-(`PAGE_SIZE - frame_data_offset`); callers iterate forward from
-`offset + bytes_valid` to read past those boundaries. The cookie is
-client-chosen, opaque to the driver, and must be non-zero.
-
-**Request:**
-
-| Field | Value |
-|---|---|
-| label | 7 |
-| data[0] | Byte offset (any) |
-| data[1] | Release cookie (non-zero, client-chosen, opaque to the driver) |
-
-**Reply (success):**
-
-| Field | Value |
-|---|---|
-| label | 0 (success) |
-| data[0] | Bytes valid in the returned frame starting at `frame_data_offset` (0 on EOF) |
-| data[1] | The release cookie echoed back |
-| data[2] | `frame_data_offset` — byte offset within the frame where the file's data for `offset` begins |
-| caps[0] | Frame cap, `MAP \| READ`, single page (omitted on EOF) |
-
-**Reply (error):**
-
-| Field | Value |
-|---|---|
-| label | Nonzero error code |
-
-**Error codes:**
-
-| Code | Name | Meaning |
-|---|---|---|
-| 4 | `InvalidToken` | No open file for this token |
-| 6 | `BadFrameOffset` | Cookie is zero |
-
-### Label 8: `FS_RELEASE_FRAME`
-
-Driver-to-client request to release a previously-returned Frame. Sent by
-the driver on the client's release endpoint cap (delivered with `FS_OPEN`
-when the client elects to use frame-cap reads). The token identifies the
-file; `data[0]` carries the release cookie originally returned by
+Used for short reads (`< PAGE_SIZE`); larger reads use
 [`FS_READ_FRAME`](#label-7-fs_read_frame).
 
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `2` |
+| `data[0]` | Byte offset |
+| `data[1]` | Maximum bytes to read (capped at the IPC inline ceiling, 512 bytes) |
+
+**Reply (success)**
+
+| Field | Value |
+|---|---|
+| `label` | `0` |
+| `data[0]` | Bytes actually read |
+| `data[1..]` | File data, packed little-endian |
+
+**Reply (error)**: `label = NsError::*` (`NotFound`,
+`PermissionDenied`, `IsADirectory`, `IoError`).
+
+---
+
+## Label 7: `FS_READ_FRAME`
+
+Frame-cap read. The driver returns a single-page Frame cap with
+attenuated rights (`MAP|READ`) covering the cached page that contains
+the requested byte. The client maps the frame, reads up to
+`bytes_valid` bytes starting at `frame_data_offset`, then releases
+the page either synchronously after the read or in response to a
+driver-initiated [`FS_RELEASE_FRAME`](#label-8-fs_release_frame)
+arriving on the per-process release endpoint.
+
+The request `offset` has no alignment requirement; the driver reports
+where the file's content for `offset` lives within the returned frame
+(`frame_data_offset`) and how many contiguous valid bytes follow
+(`bytes_valid`). `bytes_valid` is bounded by file end, the underlying
+filesystem cluster boundary, and the page tail
+(`PAGE_SIZE - frame_data_offset`).
+
+The cookie is client-chosen, opaque to the driver, and MUST be non-
+zero (`0` collides with the driver-side `OutstandingPage::None`
+sentinel).
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `7` |
+| `data[0]` | Byte offset (any) |
+| `data[1]` | Release cookie (non-zero, client-chosen) |
+| `caps[0]` | Per-process release-endpoint SEND, transferred only on the first `FS_READ_FRAME` for a given (client, file) pair (see below) |
+
+The first `FS_READ_FRAME` for a given (client, file) pair MAY carry
+the client's per-process release-endpoint SEND in `caps[0]`. The
+driver records it on the lazily-allocated `OpenFile` slot so the
+eviction worker can route cooperative
+[`FS_RELEASE_FRAME`](#label-8-fs_release_frame) back to the client.
+Subsequent `FS_READ_FRAME`s for the same pair carry no caps; clients
+that opt out of cooperative release omit the cap on every call,
+falling back to the eviction worker's hard-revoke path.
+
+**Reply (success)**
+
+| Field | Value |
+|---|---|
+| `label` | `0` |
+| `data[0]` | `bytes_valid` (zero on EOF) |
+| `data[1]` | Cookie echoed back |
+| `data[2]` | `frame_data_offset` |
+| `caps[0]` | Frame cap (`MAP\|READ`, single page; omitted on EOF) |
+
+**Reply (error)**: `label = NsError::*` or
+`fs_errors::BAD_FRAME_OFFSET` (cookie zero).
+
+---
+
+## Label 8: `FS_RELEASE_FRAME`
+
+Driver-to-client request to release a previously-returned Frame.
+Sent by the driver's eviction worker on the client's per-process
+release endpoint cap, recorded by the driver from `caps[0]` of the
+client's first [`FS_READ_FRAME`](#label-7-fs_read_frame) for the
+file. Clients that delivered the SEND get the cooperative path; the
+driver waits up to 100 ms for [`FS_RELEASE_ACK`](#label-9-fs_release_ack)
+before falling through to a hard `cap_revoke` of the parent Frame
+cap. Clients that omitted the SEND (opt-out) skip straight to the
+hard-revoke path on every eviction. See
+[`runtime/ruststd/src/sys/fs/release_handler.rs`](../../../runtime/ruststd/src/sys/fs/release_handler.rs)
+for the receive-side state machine.
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `8` |
+| `data[0]` | Release cookie identifying the Frame |
+
 The client unmaps the matching Frame and replies with
-[`FS_RELEASE_ACK`](#label-9-fs_release_ack).
-
-If the client does not acknowledge within the cooperative-release watchdog
-window (100 ms), the driver `cap_revoke`s the parent cap. The client's
-derived cap dies; subsequent access to the unmapped page faults.
-
-**Request:**
-
-| Field | Value |
-|---|---|
-| label | 8 |
-| data[0] | Release cookie identifying which Frame to unmap |
-
-### Label 9: `FS_RELEASE_ACK`
-
-Synchronous client-to-driver reply to [`FS_RELEASE_FRAME`](#label-8-fs_release_frame).
-Empty body. The driver's outstanding-Frame refcount decrements on receipt.
-
-**Reply:**
-
-| Field | Value |
-|---|---|
-| label | 9 |
+[`FS_RELEASE_ACK`](#label-9-fs_release_ack). If the client does not
+acknowledge within the cooperative-release watchdog window (100 ms),
+the driver `cap_revoke`s the parent Frame cap.
 
 ---
 
-## Block Device Access
+## Label 9: `FS_RELEASE_ACK`
 
-Filesystem drivers perform all storage I/O through a block device endpoint
-received at creation time. The block device protocol exposes
-`BLK_READ_INTO_FRAME` (label 3); see
-[services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md)
-for the block-device IPC specification.
+Synchronous client-to-driver reply to
+[`FS_RELEASE_FRAME`](#label-8-fs_release_frame). Empty body. The
+driver's outstanding-Frame refcount decrements on receipt.
+
+**Reply**
+
+| Field | Value |
+|---|---|
+| `label` | `9` |
 
 ---
 
-## Sentinel Values
+## Label 3: `FS_CLOSE`
 
-Capabilities injected into a filesystem driver's CSpace are identified by
-sentinel values in the `CapDescriptor.aux0` field:
+Release driver-side bookkeeping bound to a node cap (the lazily-
+allocated per-`OpenFile` slot, outstanding `FS_READ_FRAME` pages,
+the recorded release endpoint). The kernel-side cap is **not** freed
+here — the holder still `cap_delete`s its node cap to drop the
+kernel reference.
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `3` |
+| body | empty (target identified by token) |
+
+**Reply (success)**: `label = 0`, empty body.
+
+`FS_CLOSE` is best-effort cleanup. The driver MAY have already
+evicted the per-node slot under cache pressure; in that case
+`FS_CLOSE` is a no-op success.
+
+---
+
+## Label 6: `END_OF_DIR`
+
+End-of-directory marker reused as a reply label by `NS_READDIR`. See
+[`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md).
+No request side; clients distinguish "end of iteration" from "name
+at this index" by reply label.
+
+---
+
+## Bootstrap caps
+
+A filesystem driver receives the following caps in its CSpace at
+two-phase process creation, identified by sentinel values in the
+`CapDescriptor.aux0` field:
 
 | Sentinel | Meaning |
 |---|---|
 | `0xFFFF_FFFF_FFFF_FFFF` | Log endpoint |
-| `0xFFFF_FFFF_FFFF_FFFE` | Service endpoint (vfsd-to-driver IPC, Receive-side) |
-| `0xFFFF_FFFF_FFFF_FFFD` | Block device endpoint (Send-side) |
-| `0x0000_0000_0000_0000` (aux0 and aux1 both 0) | procmgr endpoint |
+| `0xFFFF_FFFF_FFFF_FFFE` | Service endpoint (Receive-side) |
+| `0xFFFF_FFFF_FFFF_FFFD` | Block device endpoint (Send-side, partition-scoped) |
+| `0x0000_0000_0000_0000` (aux0 and aux1 both zero) | procmgr endpoint |
 
-All sentinels use `CapType::Frame` as the discriminant (the actual kernel
-object is an Endpoint, but the CapDescriptor type field is overloaded for
-sentinel identification).
+All sentinels use `CapType::Frame` as the discriminant — the actual
+kernel object is an Endpoint, but the `CapType` field is overloaded
+for sentinel identification.
+
+The block device endpoint is partition-scoped: vfsd registers the
+partition bound with virtio-blk before delivering this cap, so the
+driver reads by partition-relative LBA and virtio-blk enforces the
+bound on every `BLK_READ_INTO_FRAME`. See
+[`services/drivers/virtio/blk/README.md`](../../drivers/virtio/blk/README.md).
 
 ---
 
@@ -367,13 +257,14 @@ sentinel identification).
 
 | Document | Content |
 |---|---|
-| [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, cap transfer protocol |
-| [vfsd/docs/vfs-ipc-interface.md](../../vfsd/docs/vfs-ipc-interface.md) | Client-facing namespace IPC |
-| [docs/capability-model.md](../../../docs/capability-model.md) | Tokens and capability derivation |
-| [docs/device-management.md](../../../docs/device-management.md) | Block device endpoint origin |
+| [shared/namespace-protocol/README.md](../../../shared/namespace-protocol/README.md) | `NS_*` wire surface, name and rights rules |
+| [docs/namespace-model.md](../../../docs/namespace-model.md) | Cap-as-namespace principles |
+| [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, cap transfer |
+| [services/vfsd/docs/namespace-composition.md](../../vfsd/docs/namespace-composition.md) | How vfsd composes the system root from per-mount caps |
+| [services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md) | Block device IPC, partition tokens |
 
 ---
 
 ## Summarized By
 
-None
+[services/fs/README.md](../README.md)

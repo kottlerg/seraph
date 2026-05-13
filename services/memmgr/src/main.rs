@@ -58,6 +58,8 @@ pub extern "C" fn _start(_info_ptr: u64) -> !
         stdin_frame_cap: info.stdin_frame_cap,
         stdout_frame_cap: info.stdout_frame_cap,
         stderr_frame_cap: info.stderr_frame_cap,
+        system_root_cap: info.system_root_cap,
+        current_dir_cap: info.current_dir_cap,
         stdin_data_signal_cap: info.stdin_data_signal_cap,
         stdin_space_signal_cap: info.stdin_space_signal_cap,
         stdout_data_signal_cap: info.stdout_data_signal_cap,
@@ -664,7 +666,25 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
         Ok(v) => v,
         Err(code) =>
         {
-            reply_label(ipc_buf, code);
+            let mut total_pages: u64 = 0;
+            let mut run_count: u32 = 0;
+            let mut max_run: u32 = 0;
+            for r in pool.runs.iter().flatten()
+            {
+                total_pages += u64::from(r.page_count);
+                run_count += 1;
+                if r.page_count > max_run
+                {
+                    max_run = r.page_count;
+                }
+            }
+            let reply = IpcMessage::builder(code)
+                .word(0, total_pages)
+                .word(1, u64::from(run_count))
+                .word(2, u64::from(max_run))
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             return;
         }
     };

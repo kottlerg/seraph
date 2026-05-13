@@ -239,6 +239,28 @@ pub const CAP_INFO_CSPACE_BUDGET: u64 = 7;
 /// caps donated through `memmgr_labels::DONATE_FRAMES`).
 pub const CAP_INFO_FRAME_PHYS_BASE: u64 = 8;
 
+/// `Thread` only — kernel-authoritative lifecycle snapshot.
+///
+/// Returns the packed value
+/// `(state_code << 32) | (exit_reason & 0xFFFF_FFFF)` where `state_code` is
+/// one of the [`THREAD_STATE_*`](THREAD_STATE_CREATED) constants and
+/// `exit_reason` is the kernel-recorded exit reason (meaningful only for
+/// [`THREAD_STATE_EXITED`]; zero for other states). Calling on a non-Thread
+/// slot returns [`SyscallError::InvalidArgument`].
+///
+/// Procmgr's `QUERY_PROCESS` handler consumes this so it can answer
+/// "exited" or "alive" without racing the userspace death-event drain.
+pub const CAP_INFO_THREAD_STATE: u64 = 9;
+
+/// State code for `CAP_INFO_THREAD_STATE`: thread allocated, never started.
+pub const THREAD_STATE_CREATED: u32 = 0;
+/// State code for `CAP_INFO_THREAD_STATE`: thread is started and not exited
+/// (Ready, Running, Blocked, or Stopped — distinctions are scheduler
+/// implementation details, irrelevant to external observers).
+pub const THREAD_STATE_ALIVE: u32 = 1;
+/// State code for `CAP_INFO_THREAD_STATE`: thread has exited or faulted.
+pub const THREAD_STATE_EXITED: u32 = 2;
+
 // ── CapTag discriminants ─────────────────────────────────────────────────────
 //
 // Userspace constants matching the kernel `CapTag` enum, for callers that

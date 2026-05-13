@@ -60,12 +60,20 @@ When a restart is permitted:
 2. **Create new process.** Branch on the recorded restart source:
    - Module-loaded service (`module_cap != 0`): send `CREATE_PROCESS` to
      procmgr with a fresh derivation of the stored module Frame capability.
-   - VFS-loaded service (`vfs_path_len > 0`): send `CREATE_FROM_VFS` to
-     procmgr with the stored path bytes. No module cap is held, so the
-     binary is reloaded from the filesystem on every restart.
+   - VFS-loaded service (`vfs_path_len > 0`): walk svcmgr's own
+     `root_dir_cap` (delivered at svcmgr's bootstrap via
+     `procmgr_labels::CONFIGURE_NAMESPACE`) to the stored path → file
+     cap, then send `CREATE_FROM_FILE` to procmgr. No file cap is
+     persisted across restarts; the walk re-runs on every restart so
+     the latest binary on disk is always loaded.
 
    The two are mutually exclusive at registration time and surfaced via the
    `vfs_path_len` field in the `REGISTER_SERVICE` label (bits [32..48]).
+
+   After the create reply, send `procmgr_labels::CONFIGURE_NAMESPACE`
+   to the new process handle with a `cap_copy` of svcmgr's own
+   `root_dir_cap` so the restarted child inherits svcmgr's namespace
+   view (parent-inherit default).
 
 3. **Inject capabilities.** Using the child CSpace cap returned by procmgr,
    inject the stored restart recipe caps (e.g., log endpoint) into the new
@@ -92,7 +100,8 @@ For the initial implementation, the recipe consists of:
 
 - One of the following restart sources (mutually exclusive):
   - Module Frame capability (for `CREATE_PROCESS`), or
-  - VFS path bytes (for `CREATE_FROM_VFS`).
+  - VFS path bytes — svcmgr re-walks `root_dir_cap` to the path on
+    every restart and uses `CREATE_FROM_FILE`.
 - Log endpoint Send capability (injected into child CSpace)
 
 Future services may require additional caps (procmgr endpoint, device

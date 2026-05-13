@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 11;
+pub const PROCESS_ABI_VERSION: u32 = 13;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -338,6 +338,29 @@ pub struct ProcessInfo
     /// Number of env entries (NUL-terminated `KEY=VALUE` strings) in the blob.
     pub env_count: u32,
 
+    /// `CSpace` slot of a tokened SEND cap on a namespace endpoint
+    /// addressing the directory the process should treat as its
+    /// system root. Anchors absolute-path resolution.
+    ///
+    /// Source: the spawner's `procmgr_labels::CONFIGURE_NAMESPACE`
+    /// call. Procmgr `cap_copy`s the supplied cap into the child's
+    /// `CSpace` at `START_PROCESS` time. Zero when no spawner-
+    /// supplied cap was delivered — the child has no namespace
+    /// authority and consumers (`std::fs`, namespace-walking code)
+    /// must tolerate zero by returning `Unsupported`.
+    pub system_root_cap: u32,
+
+    /// `CSpace` slot of a tokened SEND cap on a namespace endpoint
+    /// addressing the directory the process should treat as its initial
+    /// current working directory. Anchors relative-path resolution.
+    ///
+    /// Independent of [`Self::system_root_cap`] — typically a derivative
+    /// of it (e.g. `NS_LOOKUP("/srv")` against the root cap), but the
+    /// kernel imposes no relationship. Zero means "no cwd attached";
+    /// std treats relative paths as `Unsupported` until a non-zero cap
+    /// is installed (e.g. via `std::env::set_current_dir`).
+    pub current_dir_cap: u32,
+
     /// `CSpace` slot of an un-tokened SEND cap on the system log endpoint
     /// (the *discovery* cap).
     ///
@@ -440,6 +463,17 @@ pub struct StartupInfo
     /// `CSpace` slot of the stderr shmem frame cap. Zero when no sink
     /// is attached.
     pub stderr_frame_cap: u32,
+
+    /// Tokened SEND cap on vfsd's namespace endpoint addressing the
+    /// synthetic system root. Zero when vfsd is not reachable. See
+    /// `ProcessInfo::system_root_cap`.
+    pub system_root_cap: u32,
+
+    /// Tokened SEND cap on a namespace endpoint addressing the initial
+    /// current working directory. Zero means relative-path resolution
+    /// is unsupported until the process sets one. See
+    /// `ProcessInfo::current_dir_cap`.
+    pub current_dir_cap: u32,
 
     /// Wakeup signal caps for the three stdio pipes. Zero when the
     /// corresponding direction is not piped. See `ProcessInfo` for the

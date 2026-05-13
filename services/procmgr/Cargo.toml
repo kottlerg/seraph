@@ -13,6 +13,7 @@ test = false
 process-abi = { path = "../../abi/process-abi" }
 elf = { path = "../../shared/elf" }
 ipc = { path = "../../shared/ipc" }
+namespace-protocol = { path = "../../shared/namespace-protocol" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
 

@@ -50,19 +50,36 @@ pub mod procmgr_labels
     pub const CREATE_PROCESS: u64 = 1;
     /// Start a previously created (suspended) process.
     pub const START_PROCESS: u64 = 2;
-    /// Create a new process from a VFS path (ELF binary). Wire format
-    /// carries the path plus optional argv + env blobs; see procmgr's
-    /// `handle_create_from_vfs` for the full label and data layout. Caps:
-    /// `[creator_endpoint?]`. Stdio pipes via [`CONFIGURE_PIPE`] as for
-    /// `CREATE_PROCESS`.
-    pub const CREATE_FROM_VFS: u64 = 6;
-    /// Provide procmgr with the vfsd endpoint for VFS-based loading.
-    pub const SET_VFSD_EP: u64 = 7;
+    /// Create a new process from a caller-supplied file cap (ELF binary).
+    ///
+    /// The caller already walked its own namespace cap to the binary node
+    /// and attaches the resulting tokened file cap. Procmgr issues
+    /// `FS_READ` / `FS_READ_FRAME` against that cap to stream the ELF —
+    /// it never holds a namespace cap of its own.
+    ///
+    /// Label layout:
+    /// * bits `[0..16]` — opcode (`CREATE_FROM_FILE`)
+    /// * bits `[16..32]` — reserved (zero)
+    /// * bits `[32..48]` — `args_bytes` (total byte length of the argv blob; u16)
+    /// * bits `[48..56]` — `args_count` (number of NUL-terminated argv strings; u8)
+    /// * bits `[56..64]` — `env_count` (number of NUL-terminated `KEY=VALUE` strings; u8)
+    ///
+    /// IPC data words:
+    /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
+    /// * `word 1..1+argv_words` — argv blob, `args_bytes.div_ceil(8)` words
+    /// * `word 1+argv_words` — `env_bytes` (low 16 bits; only when `env_count > 0`)
+    /// * words after the env header — env blob, `env_bytes.div_ceil(8)` words
+    ///
+    /// Caps: `[file_cap, creator_endpoint?]`. `file_cap` ownership transfers
+    /// to procmgr; procmgr `FS_CLOSE`s and `cap_delete`s it after the load
+    /// completes (success or failure). Stdio pipes are installed via
+    /// separate [`CONFIGURE_PIPE`] calls between create and start.
+    pub const CREATE_FROM_FILE: u64 = 13;
     /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
     /// cspace, `ProcessInfo` frame), dec-refing any frames the child still
     /// holds so they recycle back into the kernel buddy allocator. The
     /// caller identifies the process via the tokened `process_handle`
-    /// received from `CREATE_PROCESS` / `CREATE_FROM_VFS`; the token is
+    /// received from `CREATE_PROCESS` / `CREATE_FROM_FILE`; the token is
     /// delivered by `ipc_recv` and looked up in procmgr's table. Idempotent
     /// on already-destroyed tokens.
     pub const DESTROY_PROCESS: u64 = 8;
@@ -75,7 +92,7 @@ pub mod procmgr_labels
     /// peek without blocking on a death event.
     pub const QUERY_PROCESS: u64 = 9;
     /// Install one direction's shmem-backed stdio pipe on a child
-    /// created via [`CREATE_PROCESS`] / [`CREATE_FROM_VFS`] but not yet
+    /// created via [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] but not yet
     /// started.
     ///
     /// Request: caller invokes on the tokened `process_handle` returned
@@ -117,6 +134,45 @@ pub mod procmgr_labels
     /// Direction selector for [`CONFIGURE_PIPE`] — child stderr (child
     /// is the writer, parent is the reader).
     pub const PIPE_DIR_STDERR: u64 = 2;
+
+    /// Install the namespace caps delivered to a suspended child via
+    /// `ProcessInfo.system_root_cap` and `ProcessInfo.current_dir_cap`.
+    ///
+    /// Procmgr holds no namespace cap of its own. Without this call,
+    /// both child slots stay zero — `std::os::seraph::root_dir_cap()`
+    /// reads zero, `std::fs` absolute paths return `Unsupported`,
+    /// `current_dir_cap()` reads zero, and relative paths return
+    /// `Unsupported`. The spawner is the cap-distribution authority;
+    /// this IPC is the only path that installs namespace caps on the
+    /// child.
+    ///
+    /// Request: caller invokes on the tokened `process_handle` returned
+    /// by [`CREATE_PROCESS`] or [`CREATE_FROM_FILE`]; procmgr uses
+    /// `recv.token` to find the entry. Wire format:
+    /// * `caps[0]` — root cap to deliver to the child (mandatory).
+    /// * `caps[1]` — cwd cap to deliver to the child (optional). When
+    ///   absent the child's `current_dir_cap` slot stays zero.
+    ///
+    /// Spawners obtain these caps by `cap_copy` of their own
+    /// `root_dir_cap()` / `current_dir_cap()` (parent-inherit default)
+    /// or by walk-and-attenuate against a sub-tree. procmgr does not
+    /// validate cap shape — any tokened SEND on a namespace endpoint
+    /// is accepted.
+    ///
+    /// procmgr stores the IPC-delivered copies in per-process state
+    /// and `cap_copy`s each into the child's `CSpace` at
+    /// `START_PROCESS` time. The caller's source slots are independent
+    /// of this transfer (kernel `cap_derive` semantics); callers that
+    /// wanted to relinquish authority over a cap MUST `cap_delete` the
+    /// source slot themselves after the call.
+    ///
+    /// Ordering: valid only between create and `START_PROCESS`.
+    /// Replies `ALREADY_STARTED` if the target is running.
+    /// `INVALID_TOKEN` if the `process_handle` is unknown.
+    /// `INVALID_ARGUMENT` if no cap was provided in `caps[0]`.
+    /// Idempotent before start; later calls overwrite the previous
+    /// caps (the prior caps are `cap_delete`'d procmgr-side).
+    pub const CONFIGURE_NAMESPACE: u64 = 12;
 }
 
 /// IPC labels for the memory manager (`memmgr`).
@@ -260,45 +316,128 @@ pub mod svcmgr_labels
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
 {
-    /// Open a file by path.
-    pub const OPEN: u64 = 1;
-    /// Read from an open file.
-    pub const READ: u64 = 2;
-    /// Close an open file.
-    pub const CLOSE: u64 = 3;
-    /// Stat an open file (get size/attributes).
-    pub const STAT: u64 = 4;
-    /// Read a directory entry.
-    pub const READDIR: u64 = 5;
     /// Mount a filesystem at a path.
     pub const MOUNT: u64 = 10;
+    /// Trigger vfsd to read `/config/mounts.conf` from the
+    /// freshly-mounted root filesystem and issue the additional
+    /// MOUNTs it describes.
+    ///
+    /// Empty body. Reply: `SUCCESS` on success (including missing or
+    /// empty config — both are legitimate system states);
+    /// `PARTIAL_INGEST` with `data[0]` carrying the failed-line count
+    /// when one or more mount entries failed; `CONFIG_INGEST_ERROR`
+    /// when vfsd's own NS walk or read against the root mount failed.
+    /// `UNAUTHORIZED` when the caller's token lacks
+    /// [`INGEST_AUTHORITY`]. Synchronous — vfsd does not reply until
+    /// every described mount has been attempted.
+    pub const INGEST_CONFIG_MOUNTS: u64 = 12;
+    /// Mint a fresh tokened SEND on vfsd's namespace endpoint addressing
+    /// the synthetic system root at full namespace rights and return it
+    /// to the caller.
+    ///
+    /// Empty request body. Reply: `SUCCESS` with `caps[0]` = the
+    /// system-root cap; `UNAUTHORIZED` when the caller's token lacks
+    /// [`SEED_AUTHORITY`]. Init calls this once during bootstrap
+    /// (after the cmdline-driven root mount completes) to obtain the
+    /// seed cap from which all later namespace-cap distribution flows.
+    pub const GET_SYSTEM_ROOT_CAP: u64 = 13;
+
+    /// Authority bit in the vfsd-service-endpoint token's high u64
+    /// bit. Set on caps minted for consumers permitted to call
+    /// [`INGEST_CONFIG_MOUNTS`]. Without it, the handler replies
+    /// `UNAUTHORIZED`. Distinct from [`SEED_AUTHORITY`]: a consumer
+    /// may hold either, both, or neither.
+    pub const INGEST_AUTHORITY: u64 = 1u64 << 63;
+    /// Authority bit in the vfsd-service-endpoint token. Set on caps
+    /// minted for consumers permitted to call
+    /// [`GET_SYSTEM_ROOT_CAP`]. Without it the handler replies
+    /// `UNAUTHORIZED`. Holding this cap is equivalent to holding the
+    /// system-root cap (the handler is a seed source), so it is only
+    /// distributed to init (and svcmgr's restart path, via init's
+    /// future per-service policy).
+    pub const SEED_AUTHORITY: u64 = 1u64 << 62;
+}
+
+/// IPC labels for the namespace protocol (cap-as-namespace surface).
+///
+/// Numbered in a reserved range above the surviving [`fs_labels`] codes
+/// (`FS_READ`, `FS_CLOSE`, `FS_READ_FRAME`, `FS_RELEASE_FRAME`,
+/// `FS_RELEASE_ACK`, `FS_MOUNT`, `END_OF_DIR`) so node-cap and per-file
+/// requests share one fs-driver endpoint with no opcode collisions.
+/// [`fs_labels::END_OF_DIR`] is reused unchanged as the readdir
+/// terminator.
+///
+/// Protocol semantics, including caller-rights checks, name validation,
+/// per-entry visibility, and child-cap minting, are owned by the
+/// `namespace-protocol` crate's `dispatch_request` function; backends
+/// implement the `NamespaceBackend` trait, run their own receive loop,
+/// and route each `NS_*` message through `dispatch_request` for reply.
+pub mod ns_labels
+{
+    /// Walk one path component within a directory cap.
+    ///
+    /// Request label encodes name length in bits 16..32. Request data:
+    /// `data[0]` = caller-requested namespace rights (low 24 bits;
+    /// `0xFFFF` is interpreted as "everything I'm allowed"); subsequent
+    /// data words carry the name bytes packed little-endian, length
+    /// taken from the label. No request caps. Reply on success: label =
+    /// 0, `data[0]` = entry kind (0 = File, 1 = Dir), `data[1]` =
+    /// cached size hint, `caps[0]` = derived child node cap. On error
+    /// the label is the matching `NsError` wire code with no caps.
+    pub const NS_LOOKUP: u64 = 20;
+    /// Attribute snapshot for the node addressed by the caller's token.
+    ///
+    /// Request: empty body. Reply on success: label = 0, `data[0]` =
+    /// size, `data[1]` = `mtime_us` (best-effort; zero on backends that
+    /// do not track it), `data[2]` = kind. Error replies match
+    /// [`NS_LOOKUP`].
+    pub const NS_STAT: u64 = 21;
+    /// One-entry-per-call enumeration of the directory addressed by the
+    /// caller's token.
+    ///
+    /// Request: `data[0]` = zero-based entry index. Reply on success:
+    /// label = 0, `data[0]` = kind, `data[1]` = name length in bytes,
+    /// subsequent data words carry the name bytes packed
+    /// little-endian. Reply label is [`fs_labels::END_OF_DIR`] (6) when
+    /// `index` is past the last entry. Error replies match
+    /// [`NS_LOOKUP`]. No caps in either direction — clients follow up
+    /// with [`NS_LOOKUP`] when they want a node cap for a returned
+    /// name.
+    pub const NS_READDIR: u64 = 22;
 }
 
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
 {
-    /// Open a file by path (driver-side).
-    pub const FS_OPEN: u64 = 1;
-    /// Read from an open file (driver-side).
+    /// Read from a node cap (driver-side). Inline reply: `data[0]` =
+    /// bytes read, payload follows starting at word 1. Drivers cap
+    /// per-call payload at the IPC inline ceiling; callers iterate.
     pub const FS_READ: u64 = 2;
-    /// Close an open file (driver-side).
+    /// Close a node cap, releasing any lazily-allocated driver-side
+    /// bookkeeping bound to the file (outstanding `FS_READ_FRAME`
+    /// pages, open-file slot, etc.). The caller still cap-deletes the
+    /// node cap to drop the kernel-side reference.
     pub const FS_CLOSE: u64 = 3;
-    /// Stat an open file (driver-side).
-    pub const FS_STAT: u64 = 4;
-    /// Read a directory entry (driver-side).
-    pub const FS_READDIR: u64 = 5;
-    /// End-of-directory marker in readdir replies.
+    /// End-of-directory marker in `NS_READDIR` replies.
     pub const END_OF_DIR: u64 = 6;
     /// Read file content into a cached Frame cap returned in the reply.
     ///
     /// Request: token identifies the file (per-file cap), `data[0]` =
     /// byte offset (no alignment requirement), `data[1]` = client-chosen
-    /// release cookie (must be non-zero). Reply: `data[0]` = bytes valid
-    /// in the returned frame starting at the indicated frame offset,
-    /// `data[1]` = the same release cookie echoed back, `data[2]` = byte
-    /// offset within the returned frame where the file's content for the
-    /// requested `offset` begins, `caps[0]` = single-page Frame cap with
-    /// `MAP|READ` rights covering the cached file page.
+    /// release cookie (must be non-zero). `caps[0]` = optional per-process
+    /// release-endpoint SEND, transferred only on the first
+    /// `FS_READ_FRAME` for a given (client, file) pair; the driver
+    /// records it on the lazy `OpenFile` slot allocated at that point
+    /// so its eviction worker can route cooperative `FS_RELEASE_FRAME`
+    /// back to the client. Subsequent `FS_READ_FRAME`s for the same
+    /// pair carry no caps. Clients that opt out of cooperative release
+    /// omit the cap on every call; eviction falls back to hard-revoke.
+    /// Reply: `data[0]` = bytes valid in the returned frame starting at
+    /// the indicated frame offset, `data[1]` = the same release cookie
+    /// echoed back, `data[2]` = byte offset within the returned frame
+    /// where the file's content for the requested `offset` begins,
+    /// `caps[0]` = single-page Frame cap with `MAP|READ` rights
+    /// covering the cached file page.
     ///
     /// `bytes_valid` is bounded by file end, the current cluster
     /// boundary on the underlying filesystem, and the page tail
@@ -320,19 +459,51 @@ pub mod fs_labels
 pub mod devmgr_labels
 {
     /// Query for a block device endpoint.
+    ///
+    /// Mints a `MOUNT_AUTHORITY`-tokened `SEND_GRANT` cap on
+    /// `blk_ep` to the caller. Caller's token must have
+    /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
+    /// `UNAUTHORIZED` otherwise.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query device configuration (`VirtIO` cap locations, etc.).
     /// The caller's token identifies the device.
     pub const QUERY_DEVICE_INFO: u64 = 2;
+
+    /// Authority bit in the devmgr-registry-endpoint token's high
+    /// u64 bit. Set on caps minted for consumers permitted to call
+    /// [`QUERY_BLOCK_DEVICE`] (today: vfsd). Without it the handler
+    /// replies `UNAUTHORIZED`. Gating `QUERY_BLOCK_DEVICE` upstream of
+    /// virtio-blk closes the minter-side surface: `MOUNT_AUTHORITY`
+    /// caps are never issued to consumers devmgr did not authorise.
+    pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
 }
 
 /// IPC labels for block device drivers.
 pub mod blk_labels
 {
-    /// Register a partition range for a tokened endpoint.
+    /// Authority bit in the block-service-endpoint token's high u64
+    /// bit. Set on caps minted for consumers that may invoke
+    /// [`REGISTER_PARTITION`] and may issue whole-disk sector reads
+    /// via [`BLK_READ_INTO_FRAME`]. The bit is a verb — "may invoke
+    /// these labels" — not an identity: multiple consumers may hold
+    /// it, and the bit alone does not encode "is vfsd."
     ///
-    /// Data words: `[token, base_lba, length_lba]`. Callable only over the
-    /// un-tokened (whole-disk) endpoint; tokened callers are rejected.
+    /// Disjoint from partition-identity tokens. The driver allocates
+    /// partition tokens from a monotonic counter in the low bits of
+    /// the u64 (top bit clear); the partition table is keyed by the
+    /// full token value so collision is impossible.
+    pub const MOUNT_AUTHORITY: u64 = 1u64 << 63;
+
+    /// Register a partition range, receiving back a tokened SEND cap
+    /// scoped to that partition.
+    ///
+    /// Caller's token must have [`MOUNT_AUTHORITY`] set; un-tokened
+    /// or partition-tokened callers are rejected. Data words:
+    /// `[base_lba, length_lba]`. The driver allocates a fresh
+    /// partition-identity token, inserts the bound, and replies with
+    /// the partition cap in `caps[0]` — server-side derivation is
+    /// required because [`MOUNT_AUTHORITY`] caps are tokened and the
+    /// kernel rejects re-tokening of a tokened source.
     pub const REGISTER_PARTITION: u64 = 2;
     /// Read one or more contiguous sectors into a caller-supplied Frame cap.
     ///
@@ -453,11 +624,12 @@ pub mod procmgr_errors
     pub const ALREADY_STARTED: u64 = 5;
     /// Invalid argument to an IPC request.
     pub const INVALID_ARGUMENT: u64 = 7;
-    /// `CREATE_FROM_VFS` without a registered vfsd endpoint.
-    pub const NO_VFSD_ENDPOINT: u64 = 8;
-    /// File not found via vfsd.
+    /// File not found while walking a namespace cap on the spawner side.
+    /// Reserved for callers that want a structured error before issuing
+    /// `CREATE_FROM_FILE`.
     pub const FILE_NOT_FOUND: u64 = 9;
-    /// I/O error reading file from vfsd (during `CREATE_FROM_VFS`).
+    /// I/O error reading file via the supplied file cap during
+    /// `CREATE_FROM_FILE`.
     pub const IO_ERROR: u64 = 10;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
@@ -479,6 +651,23 @@ pub mod vfsd_errors
     pub const IO_ERROR: u64 = 5;
     /// Mount table full.
     pub const TABLE_FULL: u64 = 6;
+    /// `INGEST_CONFIG_MOUNTS` walked the namespace successfully but
+    /// reading `/config/mounts.conf` itself failed (lookup error other
+    /// than `NotFound`, or `FS_READ` failure). Distinguishes "config
+    /// not present (legitimate)" from "config present but unreadable
+    /// (operator-relevant)" at the wire.
+    pub const CONFIG_INGEST_ERROR: u64 = 7;
+    /// `INGEST_CONFIG_MOUNTS` parsed the config but one or more
+    /// described mounts failed (invalid UUID, partition not found,
+    /// fatfs spawn failure, etc.). `data[0]` carries the failed-line
+    /// count. Distinct from `CONFIG_INGEST_ERROR` (the config itself
+    /// could not be read) and `SUCCESS` (every described mount
+    /// landed).
+    pub const PARTIAL_INGEST: u64 = 8;
+    /// Caller's token lacks the verb bit required by the handler
+    /// (e.g. `INGEST_AUTHORITY` for `INGEST_CONFIG_MOUNTS`,
+    /// `SEED_AUTHORITY` for `GET_SYSTEM_ROOT_CAP`).
+    pub const UNAUTHORIZED: u64 = 9;
     /// Unknown opcode on vfsd endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -501,6 +690,9 @@ pub mod fs_errors
     /// `FS_READ_FRAME` cookie is invalid (zero — collides with the
     /// `OutstandingPage::None` sentinel in fs driver tracking).
     pub const BAD_FRAME_OFFSET: u64 = 6;
+    /// Caller's node-cap token lacks a rights bit required by the
+    /// requested operation (see `namespace-protocol::rights`).
+    pub const PERMISSION_DENIED: u64 = 7;
     /// Unknown opcode on fs-driver endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -511,6 +703,9 @@ pub mod devmgr_errors
     pub const SUCCESS: u64 = 0;
     /// Cap derivation failed, or invalid device index.
     pub const INVALID_REQUEST: u64 = 1;
+    /// Caller's token lacks the verb bit required by the handler
+    /// (e.g. `REGISTRY_QUERY_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
+    pub const UNAUTHORIZED: u64 = 2;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -560,11 +755,10 @@ pub mod blk_errors
 pub const MAX_PATH_LEN: usize = 48;
 
 /// Maximum argv blob size in bytes across an IPC. Constrained by
-/// `MSG_DATA_WORDS_MAX * 8 = 512` (full data area) minus room for any
-/// path that coexists in the same message (6 words / 48 bytes). 256
-/// comfortably fits typical service-argv cases and leaves slack for the
-/// path field in `CREATE_FROM_VFS`. The `ProcessInfo` page can hold more,
-/// but expanding this also requires extending the label encoding
+/// `MSG_DATA_WORDS_MAX * 8 = 512` (full data area). 256 comfortably fits
+/// typical service-argv cases and leaves slack for any other words a
+/// message body may carry. The `ProcessInfo` page can hold more, but
+/// expanding this also requires extending the label encoding
 /// (currently 16 bits).
 pub const ARGS_BLOB_MAX: usize = 256;
 

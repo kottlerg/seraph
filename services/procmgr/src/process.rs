@@ -40,6 +40,17 @@ pub const MAX_PROCESSES: usize = 32;
 // ── Process table ───────────────────────────────────────────────────────────
 
 /// Per-process resource record. Fields read when teardown is implemented.
+///
+/// All fields are non-atomic. Concurrent access is precluded by
+/// procmgr's structurally single-threaded dispatch: every mutating
+/// path (`configure_namespace`, `start_process`, `teardown_entry`,
+/// memmgr reclaim handlers) runs sequentially under the lone
+/// `service_ep` recv loop in `main.rs`. If procmgr is ever made
+/// multi-threaded — as vfsd was, for spawn-deadlock avoidance — the
+/// `started` bool (read by `configure_namespace`, read+written by
+/// `start_process`) must become `AtomicBool` with compare-and-swap
+/// transitions, and the namespace/cwd-override slots need per-entry
+/// serialisation to keep the install-once contract.
 #[allow(dead_code)]
 pub struct ProcessEntry
 {
@@ -57,6 +68,22 @@ pub struct ProcessEntry
     /// Memmgr-side process token for this child. Sent in the
     /// `PROCESS_DIED` payload so memmgr can reclaim the right record.
     memmgr_token: u64,
+    /// Per-process system-root cap installed by
+    /// [`ProcessTable::configure_namespace`]. Zero means the child
+    /// runs with no namespace authority (`ProcessInfo.system_root_cap`
+    /// stays zero; std-side fs ops on absolute paths return
+    /// `Unsupported`). Held in procmgr's `CSpace` from
+    /// `CONFIGURE_NAMESPACE` until [`start_process`] consumes it
+    /// (`cap_copy` into the child, then `cap_delete` of the procmgr-side
+    /// slot) or the entry is torn down (`teardown_entry` deletes the
+    /// slot if still present).
+    namespace_override: u32,
+    /// Per-process cwd cap installed by
+    /// [`ProcessTable::configure_namespace`]. Zero means the child has
+    /// no cwd cap (`ProcessInfo.current_dir_cap` stays zero; relative
+    /// paths return `Unsupported` until installed). Same lifetime
+    /// rules as `namespace_override`.
+    cwd_override: u32,
     entry_point: u64,
     tls_base_va: u64,
     started: bool,
@@ -182,19 +209,20 @@ impl ProcessTable
         None
     }
 
-    /// Lightweight status lookup for `QUERY_PROCESS`. Returns `started` as
-    /// a bool when an entry is present; `None` if the token is unknown
-    /// (already reaped or never existed).
+    /// Lightweight status lookup for `QUERY_PROCESS`. Returns
+    /// `(started, thread_cap)` when an entry is present; `None` if the
+    /// token is unknown (already reaped or never existed).
     ///
-    /// Exit-reason reporting is deferred until auto-reap lands and stores
-    /// it on the entry during the death path.
-    pub fn query_by_token(&self, token: u64) -> Option<bool>
+    /// `thread_cap` is procmgr's `CSpace` slot for the child's main thread,
+    /// suitable for `cap_info`'s `CAP_INFO_THREAD_STATE` selector to
+    /// fetch the kernel-authoritative lifecycle snapshot.
+    pub fn query_by_token(&self, token: u64) -> Option<(bool, u32)>
     {
         self.entries
             .iter()
             .filter_map(|s| s.as_ref())
             .find(|e| e.token == token)
-            .map(|e| e.started)
+            .map(|e| (e.started, e.thread_cap))
     }
 
     /// Install one direction's shmem pipe on a suspended child
@@ -285,6 +313,64 @@ impl ProcessTable
             }
         }
 
+        Ok(())
+    }
+
+    /// Install per-process root and (optional) cwd caps on a suspended
+    /// child. Caps are consumed: ownership transfers to the entry on
+    /// success and they are `cap_delete`'d on failure (so the wire-side
+    /// caller never has to worry about cleanup after a successful call
+    /// returns). Previously-installed caps are `cap_delete`'d procmgr-
+    /// side before being replaced.
+    ///
+    /// # Errors
+    /// - `procmgr_errors::INVALID_TOKEN` — no entry for `token` (caps dropped).
+    /// - `procmgr_errors::ALREADY_STARTED` — target is already running (caps dropped).
+    /// - `procmgr_errors::INVALID_ARGUMENT` — `root_cap` is zero.
+    pub fn configure_namespace(
+        &mut self,
+        token: u64,
+        root_cap: u32,
+        cwd_cap: u32,
+    ) -> Result<(), u64>
+    {
+        if root_cap == 0
+        {
+            if cwd_cap != 0
+            {
+                let _ = syscall::cap_delete(cwd_cap);
+            }
+            return Err(procmgr_errors::INVALID_ARGUMENT);
+        }
+        let Some(entry) = self.find_mut_by_token(token)
+        else
+        {
+            let _ = syscall::cap_delete(root_cap);
+            if cwd_cap != 0
+            {
+                let _ = syscall::cap_delete(cwd_cap);
+            }
+            return Err(procmgr_errors::INVALID_TOKEN);
+        };
+        if entry.started
+        {
+            let _ = syscall::cap_delete(root_cap);
+            if cwd_cap != 0
+            {
+                let _ = syscall::cap_delete(cwd_cap);
+            }
+            return Err(procmgr_errors::ALREADY_STARTED);
+        }
+        if entry.namespace_override != 0
+        {
+            let _ = syscall::cap_delete(entry.namespace_override);
+        }
+        entry.namespace_override = root_cap;
+        if entry.cwd_override != 0
+        {
+            let _ = syscall::cap_delete(entry.cwd_override);
+        }
+        entry.cwd_override = cwd_cap;
         Ok(())
     }
 }
@@ -520,6 +606,12 @@ fn populate_child_info(
     pi.stdin_frame_cap = 0;
     pi.stdout_frame_cap = 0;
     pi.stderr_frame_cap = 0;
+    // System-root cap is installed at start_process time from the
+    // per-process cap delivered via CONFIGURE_NAMESPACE. Defer the
+    // copy so a child without an installed cap leaves the slot zero
+    // and there is no inter-CSpace cap_delete primitive to clean up.
+    pi.system_root_cap = 0;
+    pi.current_dir_cap = 0;
     pi.log_discovery_cap = log_discovery_in_child;
     pi.stdin_data_signal_cap = 0;
     pi.stdin_space_signal_cap = 0;
@@ -871,9 +963,14 @@ fn finalize_creation(
     // process on subsequent START_PROCESS / REQUEST_FRAMES calls.
     let process_handle =
         syscall::cap_derive_token(self_endpoint, syscall::RIGHTS_SEND_GRANT, token).ok()?;
-    let thread_for_caller = syscall::cap_derive(child_thread, syscall::RIGHTS_THREAD).ok()?;
+    let Ok(thread_for_caller) = syscall::cap_derive(child_thread, syscall::RIGHTS_THREAD)
+    else
+    {
+        let _ = syscall::cap_delete(process_handle);
+        return None;
+    };
 
-    table.insert(ProcessEntry {
+    if !table.insert(ProcessEntry {
         token,
         aspace_cap: child_aspace,
         cspace_cap: child_cspace,
@@ -882,10 +979,20 @@ fn finalize_creation(
         tls_frame_cap: main_tls.frame_cap,
         memmgr_send_cap,
         memmgr_token,
+        namespace_override: 0,
+        cwd_override: 0,
         entry_point,
         tls_base_va: main_tls.base_va,
         started: false,
-    });
+    })
+    {
+        // Table full: drop the caps we minted for the caller; the caller's
+        // guards still own the child kernel objects and per-child frames
+        // and will release them when finalize returns None.
+        let _ = syscall::cap_delete(thread_for_caller);
+        let _ = syscall::cap_delete(process_handle);
+        return None;
+    }
 
     Some(CreateResult {
         process_handle,
@@ -1084,28 +1191,6 @@ pub fn create_process(
     result
 }
 
-// ── VFS helpers ─────────────────────────────────────────────────────────────
-
-/// Open a file via vfsd namespace resolution. Returns the per-file capability.
-fn vfs_open(vfsd_ep: u32, ipc_buf: *mut u64, path: &[u8]) -> Option<u32>
-{
-    let label = ipc::vfsd_labels::OPEN | ((path.len() as u64) << 16);
-    let msg = IpcMessage::builder(label).bytes(0, path).build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(vfsd_ep, &msg, ipc_buf) }.ok()?;
-    if reply.label != 0
-    {
-        return None;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.is_empty()
-    {
-        return None;
-    }
-    Some(reply_caps[0])
-}
-
 /// Monotonic cookie counter for `FS_READ_FRAME`. Skips zero — fatfs
 /// rejects cookie 0 as the `OutstandingPage::None` sentinel.
 static NEXT_FRAME_COOKIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1196,19 +1281,6 @@ fn vfs_read(
     Some(bytes_read)
 }
 
-/// Stat an open file via its per-file capability.
-fn vfs_stat(file_cap: u32, ipc_buf: *mut u64) -> Option<u64>
-{
-    let msg = IpcMessage::new(ipc::fs_labels::FS_STAT);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.ok()?;
-    if reply.label != 0
-    {
-        return None;
-    }
-    Some(reply.word(0))
-}
-
 /// Close an open file via its per-file capability and delete the cap.
 fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
 {
@@ -1216,6 +1288,201 @@ fn vfs_close(file_cap: u32, ipc_buf: *mut u64)
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
     let _ = syscall::cap_delete(file_cap);
+}
+
+// ── Per-creation resource guards ────────────────────────────────────────────
+//
+// `create_process_from_file` accumulates resources whose ownership transfers
+// step by step: the caller-transferred file cap, a child-billed memmgr send
+// cap, the three child kernel-object caps, and the per-child PI/TLS frames.
+// Each guard's `Drop` releases the resource if it has not been transferred to
+// the success path via `disarm()`. Constructed at the point of acquisition;
+// disarmed only after the caps have been moved into the final destination.
+
+/// Holds the caller-transferred file cap until the success path consumes it.
+struct FileCapGuard
+{
+    cap: u32,
+    ipc_buf: *mut u64,
+}
+
+impl FileCapGuard
+{
+    fn new(cap: u32, ipc_buf: *mut u64) -> Self
+    {
+        Self { cap, ipc_buf }
+    }
+
+    fn cap(&self) -> u32
+    {
+        self.cap
+    }
+
+    fn disarm(mut self) -> u32
+    {
+        let c = self.cap;
+        self.cap = 0;
+        c
+    }
+}
+
+impl Drop for FileCapGuard
+{
+    fn drop(&mut self)
+    {
+        if self.cap != 0
+        {
+            vfs_close(self.cap, self.ipc_buf);
+        }
+    }
+}
+
+/// Holds a child-billed memmgr SEND cap and its memmgr-side token. The pair
+/// is moved into `UniversalCaps` and then into the `ProcessEntry` on success.
+struct MemmgrSendGuard
+{
+    cap: u32,
+    token: u64,
+}
+
+impl MemmgrSendGuard
+{
+    fn new(cap: u32, token: u64) -> Self
+    {
+        Self { cap, token }
+    }
+
+    fn cap(&self) -> u32
+    {
+        self.cap
+    }
+
+    fn token(&self) -> u64
+    {
+        self.token
+    }
+
+    fn disarm(mut self) -> (u32, u64)
+    {
+        let p = (self.cap, self.token);
+        self.cap = 0;
+        self.token = 0;
+        p
+    }
+}
+
+impl Drop for MemmgrSendGuard
+{
+    fn drop(&mut self)
+    {
+        if self.cap != 0
+        {
+            let _ = syscall::cap_delete(self.cap);
+        }
+    }
+}
+
+/// Holds the three child kernel-object caps (aspace, cspace, thread) until
+/// `finalize_creation` records them in the process table. Drops in
+/// reverse-creation order (thread → cspace → aspace).
+struct ChildKernelObjects
+{
+    aspace: u32,
+    cspace: u32,
+    thread: u32,
+}
+
+impl ChildKernelObjects
+{
+    fn new(aspace: u32, cspace: u32, thread: u32) -> Self
+    {
+        Self {
+            aspace,
+            cspace,
+            thread,
+        }
+    }
+
+    fn aspace(&self) -> u32
+    {
+        self.aspace
+    }
+
+    fn cspace(&self) -> u32
+    {
+        self.cspace
+    }
+
+    fn thread(&self) -> u32
+    {
+        self.thread
+    }
+
+    fn disarm(mut self) -> (u32, u32, u32)
+    {
+        let t = (self.aspace, self.cspace, self.thread);
+        self.aspace = 0;
+        self.cspace = 0;
+        self.thread = 0;
+        t
+    }
+}
+
+impl Drop for ChildKernelObjects
+{
+    fn drop(&mut self)
+    {
+        if self.thread != 0
+        {
+            let _ = syscall::cap_delete(self.thread);
+        }
+        if self.cspace != 0
+        {
+            let _ = syscall::cap_delete(self.cspace);
+        }
+        if self.aspace != 0
+        {
+            let _ = syscall::cap_delete(self.aspace);
+        }
+    }
+}
+
+/// `cap_delete`s a single cap slot on drop unless disarmed. Zero on
+/// construction means "no cap yet"; the guard becomes a no-op.
+struct CapGuard
+{
+    cap: u32,
+}
+
+impl CapGuard
+{
+    fn new(cap: u32) -> Self
+    {
+        Self { cap }
+    }
+
+    fn cap(&self) -> u32
+    {
+        self.cap
+    }
+
+    fn disarm(mut self) -> u32
+    {
+        let c = self.cap;
+        self.cap = 0;
+        c
+    }
+}
+
+impl Drop for CapGuard
+{
+    fn drop(&mut self)
+    {
+        if self.cap != 0
+        {
+            let _ = syscall::cap_delete(self.cap);
+        }
+    }
 }
 
 // ── VFS-based ELF loading ──────────────────────────────────────────────────
@@ -1240,9 +1507,26 @@ fn load_elf_page_streaming(
     ctx: &ElfLoadCtx,
 ) -> Option<()>
 {
-    let frame_cap = crate::memmgr_alloc_page(ctx.child_memmgr_send, ctx.ipc_buf)?;
+    let Some(frame_cap) = crate::memmgr_alloc_page(ctx.child_memmgr_send, ctx.ipc_buf)
+    else
+    {
+        std::os::seraph::log!(
+            "procmgr: load_elf_page_streaming: alloc_page None vaddr=0x{:x}",
+            page_vaddr
+        );
+        return None;
+    };
 
-    let scratch = ScratchMapping::map(ctx.self_aspace, frame_cap, 1, syscall::MAP_WRITABLE)?;
+    let Some(scratch) = ScratchMapping::map(ctx.self_aspace, frame_cap, 1, syscall::MAP_WRITABLE)
+    else
+    {
+        std::os::seraph::log!(
+            "procmgr: load_elf_page_streaming: ScratchMapping::map None vaddr=0x{:x}",
+            page_vaddr
+        );
+        let _ = syscall::cap_delete(frame_cap);
+        return None;
+    };
     let scratch_va = scratch.va();
     // SAFETY: scratch_va mapped writable, one page.
     unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
@@ -1251,8 +1535,28 @@ fn load_elf_page_streaming(
 
     drop(scratch);
 
-    let derived = loader::derive_frame_for_prot(frame_cap, prot)?;
-    syscall::mem_map(derived, ctx.child_aspace, page_vaddr, 0, 1, 0).ok()?;
+    let Some(derived) = loader::derive_frame_for_prot(frame_cap, prot)
+    else
+    {
+        std::os::seraph::log!(
+            "procmgr: load_elf_page_streaming: derive_frame_for_prot None vaddr=0x{:x} prot=0x{:x}",
+            page_vaddr,
+            prot
+        );
+        let _ = syscall::cap_delete(frame_cap);
+        return None;
+    };
+    if let Err(e) = syscall::mem_map(derived, ctx.child_aspace, page_vaddr, 0, 1, 0)
+    {
+        std::os::seraph::log!(
+            "procmgr: load_elf_page_streaming: mem_map err={} vaddr=0x{:x}",
+            e,
+            page_vaddr
+        );
+        let _ = syscall::cap_delete(derived);
+        let _ = syscall::cap_delete(frame_cap);
+        return None;
+    }
 
     // See `loader::load_elf_page` for the cap-refcount story.
     let _ = syscall::cap_delete(derived);
@@ -1347,21 +1651,24 @@ fn vfs_release_frame(file_cap: u32, ipc_buf: *mut u64, cookie: u64)
     let _ = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) };
 }
 
-/// Create a process by streaming an ELF binary from the VFS.
+/// Create a process from a caller-supplied file cap.
 ///
 /// Reads only the ELF header page, then loads each segment page-by-page
-/// directly from vfsd into target frames. No intermediate file buffer.
-// clippy::too_many_lines: VFS-based process creation is one transaction that
-// owns the lifetime of the ELF-header scratch frame, the child's kernel
+/// directly from the file cap into target frames. No intermediate file
+/// buffer. Procmgr `FS_CLOSE`s and `cap_delete`s `file_cap` before
+/// return regardless of outcome — ownership transfers in.
+// clippy::too_many_lines: file-cap-based process creation is one transaction
+// that owns the lifetime of the ELF-header scratch frame, the child's kernel
 // objects, and the per-page streaming loop.
 #[allow(
     clippy::similar_names,
     clippy::too_many_lines,
     clippy::too_many_arguments
 )]
-pub fn create_process_from_vfs(
+pub fn create_process_from_file(
     ctx: &crate::ProcmgrCtx,
-    path: &[u8],
+    file_cap: u32,
+    file_size: u64,
     table: &mut ProcessTable,
     ipc_buf: *mut u64,
     creator_endpoint: u32,
@@ -1370,15 +1677,16 @@ pub fn create_process_from_vfs(
     death_eq: u32,
 ) -> Result<CreateResult, u64>
 {
-    let vfsd_ep = ctx.vfsd_ep;
     let self_aspace = ctx.self_aspace;
     let self_endpoint = ctx.self_endpoint;
-    let file_cap = vfs_open(vfsd_ep, ipc_buf, path).ok_or(procmgr_errors::FILE_NOT_FOUND)?;
-    let file_size = vfs_stat(file_cap, ipc_buf).ok_or(procmgr_errors::IO_ERROR)?;
+
+    // Caller-transferred file cap: wrapped immediately so every early
+    // return between here and the success-path disarm closes the file
+    // (FS_CLOSE on the fs driver) and frees procmgr's CSpace slot.
+    let file_cap = FileCapGuard::new(file_cap, ipc_buf);
 
     if file_size == 0
     {
-        vfs_close(file_cap, ipc_buf);
         return Err(procmgr_errors::INVALID_ELF);
     }
 
@@ -1386,30 +1694,24 @@ pub fn create_process_from_vfs(
     // front; the header scratch frame, the per-segment frames, and all
     // subsequent allocations route through this cap so memmgr accounts
     // them to the child's record from the moment they leave the pool.
-    let (child_memmgr_send, child_memmgr_token) =
-        crate::register_with_memmgr(ctx.memmgr_ep, ipc_buf);
-    if child_memmgr_send == 0
+    let (mms_cap, mms_token) = crate::register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+    let mms = MemmgrSendGuard::new(mms_cap, mms_token);
+    if mms.cap() == 0
     {
-        vfs_close(file_cap, ipc_buf);
         return Err(procmgr_errors::OUT_OF_MEMORY);
     }
 
-    // Allocate one frame for the ELF header page.
-    let Some(hdr_frame) = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
-    else
-    {
-        vfs_close(file_cap, ipc_buf);
-        let _ = syscall::cap_delete(child_memmgr_send);
-        return Err(procmgr_errors::OUT_OF_MEMORY);
-    };
-    let Some(hdr_scratch) = ScratchMapping::map(self_aspace, hdr_frame, 1, syscall::MAP_WRITABLE)
-    else
-    {
-        vfs_close(file_cap, ipc_buf);
-        let _ = syscall::cap_delete(hdr_frame);
-        let _ = syscall::cap_delete(child_memmgr_send);
-        return Err(procmgr_errors::OUT_OF_MEMORY);
-    };
+    // Allocate one frame for the ELF header page. `ScratchMapping::map`
+    // takes ownership of the frame cap via `set_owns_cap` so the mapping's
+    // Drop releases both the VA reservation and the cap slot together.
+    let hdr_frame =
+        crate::memmgr_alloc_page(mms.cap(), ipc_buf).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let mut hdr_scratch = ScratchMapping::map(self_aspace, hdr_frame, 1, syscall::MAP_WRITABLE)
+        .ok_or_else(|| {
+            let _ = syscall::cap_delete(hdr_frame);
+            procmgr_errors::OUT_OF_MEMORY
+        })?;
+    hdr_scratch.set_owns_cap(hdr_frame);
     let hdr_va = hdr_scratch.va();
     // SAFETY: hdr_va mapped writable, one page.
     unsafe { core::ptr::write_bytes(hdr_va as *mut u8, 0, PAGE_SIZE as usize) };
@@ -1421,8 +1723,14 @@ pub fn create_process_from_vfs(
     {
         let chunk = VFS_CHUNK_SIZE.min(hdr_size - offset);
         let mut buf = [0u8; VFS_CHUNK_SIZE as usize];
-        let bytes_read = vfs_read(file_cap, ipc_buf, offset, chunk, &mut buf[..chunk as usize])
-            .ok_or(procmgr_errors::IO_ERROR)?;
+        let bytes_read = vfs_read(
+            file_cap.cap(),
+            ipc_buf,
+            offset,
+            chunk,
+            &mut buf[..chunk as usize],
+        )
+        .ok_or(procmgr_errors::IO_ERROR)?;
         if bytes_read == 0
         {
             break;
@@ -1458,7 +1766,7 @@ pub fn create_process_from_vfs(
         {
             let want = (dst.len() - total).min(VFS_CHUNK_SIZE as usize);
             let bytes_read = vfs_read(
-                file_cap,
+                file_cap.cap(),
                 ipc_buf,
                 off + total as u64,
                 want as u64,
@@ -1482,24 +1790,51 @@ pub fn create_process_from_vfs(
     .clamp(1, MAX_PROCESS_STACK_PAGES);
 
     let aspace_slab =
-        crate::memmgr_alloc_pages_contig(child_memmgr_send, crate::ASPACE_RETYPE_PAGES, ipc_buf)
+        crate::memmgr_alloc_pages_contig(mms.cap(), crate::ASPACE_RETYPE_PAGES, ipc_buf)
             .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let child_aspace = syscall::cap_create_aspace(aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1)
-        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        .map_err(|_| {
+        let _ = syscall::cap_delete(aspace_slab);
+        procmgr_errors::OUT_OF_MEMORY
+    })?;
     let _ = syscall::cap_delete(aspace_slab);
     let cspace_slab =
-        crate::memmgr_alloc_pages_contig(child_memmgr_send, crate::CSPACE_RETYPE_PAGES, ipc_buf)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        crate::memmgr_alloc_pages_contig(mms.cap(), crate::CSPACE_RETYPE_PAGES, ipc_buf)
+            .ok_or_else(|| {
+                let _ = syscall::cap_delete(child_aspace);
+                procmgr_errors::OUT_OF_MEMORY
+            })?;
     let child_cspace =
-        syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 256)
-            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        syscall::cap_create_cspace(cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 256).map_err(
+            |_| {
+                let _ = syscall::cap_delete(cspace_slab);
+                let _ = syscall::cap_delete(child_aspace);
+                procmgr_errors::OUT_OF_MEMORY
+            },
+        )?;
     let _ = syscall::cap_delete(cspace_slab);
     let thread_slab =
-        crate::memmgr_alloc_pages_contig(child_memmgr_send, crate::THREAD_RETYPE_PAGES, ipc_buf)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        crate::memmgr_alloc_pages_contig(mms.cap(), crate::THREAD_RETYPE_PAGES, ipc_buf)
+            .ok_or_else(|| {
+                let _ = syscall::cap_delete(child_cspace);
+                let _ = syscall::cap_delete(child_aspace);
+                procmgr_errors::OUT_OF_MEMORY
+            })?;
     let child_thread = syscall::cap_create_thread(thread_slab, child_aspace, child_cspace)
-        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        .map_err(|_| {
+            let _ = syscall::cap_delete(thread_slab);
+            let _ = syscall::cap_delete(child_cspace);
+            let _ = syscall::cap_delete(child_aspace);
+            procmgr_errors::OUT_OF_MEMORY
+        })?;
     let _ = syscall::cap_delete(thread_slab);
+
+    // All three child kernel-object caps are live; group them under a
+    // single guard so subsequent `?` returns release them in the correct
+    // order. Slab caps were consumed by `cap_create_*`; the post-create
+    // `cap_delete` of each slab is correct because `cap_create_*` keeps
+    // its own refcount on the underlying retyped region.
+    let child_objs = ChildKernelObjects::new(child_aspace, child_cspace, child_thread);
 
     // Stream each LOAD segment page-by-page from VFS.
     for seg_result in elf::load_segments_metadata(ehdr, header_data, file_size)
@@ -1519,14 +1854,14 @@ pub fn create_process_from_vfs(
         {
             let page_vaddr = first_page + (page_idx as u64) * PAGE_SIZE;
             let load_ctx = ElfLoadCtx {
-                file_cap,
+                file_cap: file_cap.cap(),
                 ipc_buf,
                 self_aspace,
-                child_aspace,
-                child_memmgr_send,
+                child_aspace: child_objs.aspace(),
+                child_memmgr_send: mms.cap(),
             };
             load_elf_page_streaming(page_vaddr, &seg, prot, &load_ctx)
-                .ok_or(procmgr_errors::INVALID_ELF)?;
+                .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
         }
     }
 
@@ -1543,23 +1878,20 @@ pub fn create_process_from_vfs(
         })
         .unwrap_or_default();
 
-    // Done with the header page; subsequent VFS reads operate against
-    // their own scratch reservations, so it is safe to release the header
-    // mapping now. The frame itself is purely scratch — drop procmgr's slot
-    // and let memmgr's outer / auto-reclaim recycle the underlying page.
+    // Done with the header page; the scratch mapping owns `hdr_frame` and
+    // its Drop releases both the VA reservation and the cap slot.
     drop(hdr_scratch);
-    let _ = syscall::cap_delete(hdr_frame);
 
     let main_tls = if let Some(seg) = tls_seg
         && tls_template.memsz != 0
     {
         prepare_main_tls_from_vfs(
             self_aspace,
-            child_aspace,
+            child_objs.aspace(),
             &tls_template,
             seg.offset,
-            file_cap,
-            child_memmgr_send,
+            file_cap.cap(),
+            mms.cap(),
             ipc_buf,
         )
         .ok_or(procmgr_errors::OUT_OF_MEMORY)?
@@ -1568,20 +1900,25 @@ pub fn create_process_from_vfs(
     {
         MainTls::default()
     };
+    let main_tls_frame_guard = CapGuard::new(main_tls.frame_cap);
 
-    vfs_close(file_cap, ipc_buf);
+    // Disarm and consume the file cap: success-path `vfs_close` issues
+    // FS_CLOSE and deletes the slot. From here on `file_cap` is no longer
+    // available; any subsequent failure must not depend on it.
+    let raw_file_cap = file_cap.disarm();
+    vfs_close(raw_file_cap, ipc_buf);
 
     let universals = UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
         log_discovery: ctx.log_ep,
-        memmgr_endpoint: child_memmgr_send,
-        memmgr_token: child_memmgr_token,
+        memmgr_endpoint: mms.cap(),
+        memmgr_token: mms.token(),
     };
     let pi_frame_cap = populate_child_info(
         self_aspace,
-        child_aspace,
-        child_cspace,
-        child_thread,
+        child_objs.aspace(),
+        child_objs.cspace(),
+        child_objs.thread(),
         creator_endpoint,
         &universals,
         &tls_template,
@@ -1591,23 +1928,44 @@ pub fn create_process_from_vfs(
         stack_pages,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
-    map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf, stack_pages)
+    let pi_frame_guard = CapGuard::new(pi_frame_cap);
+
+    map_child_stack_and_ipc(child_objs.aspace(), mms.cap(), ipc_buf, stack_pages)
         .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
 
-    finalize_creation(
-        child_aspace,
-        child_cspace,
-        child_thread,
-        pi_frame_cap,
+    // Commit point: hand the accumulated cap values to `finalize_creation`,
+    // which records them in the process table on success. The guards stay
+    // armed across the call so a `finalize_creation` failure releases every
+    // resource on Drop; only after Ok do we disarm the guards, transferring
+    // ownership to the table entry. `finalize_creation` cleans up the
+    // caller-facing caps it mints internally (process_handle,
+    // thread_for_caller) on any of its own failure arms.
+    let main_tls_for_finalize = MainTls {
+        frame_cap: main_tls_frame_guard.cap(),
+        base_va: main_tls.base_va,
+    };
+    let result = finalize_creation(
+        child_objs.aspace(),
+        child_objs.cspace(),
+        child_objs.thread(),
+        pi_frame_guard.cap(),
         entry,
-        main_tls,
+        main_tls_for_finalize,
         table,
         self_endpoint,
         death_eq,
-        child_memmgr_send,
-        child_memmgr_token,
+        mms.cap(),
+        mms.token(),
     )
-    .ok_or(procmgr_errors::OUT_OF_MEMORY)
+    .ok_or(procmgr_errors::OUT_OF_MEMORY);
+    if result.is_ok()
+    {
+        let _ = child_objs.disarm();
+        let _ = mms.disarm();
+        let _ = pi_frame_guard.disarm();
+        let _ = main_tls_frame_guard.disarm();
+    }
+    result
 }
 
 // ── Process destruction ─────────────────────────────────────────────────────
@@ -1710,6 +2068,19 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
         let _ = syscall::cap_delete(entry.tls_frame_cap);
     }
 
+    // Drop per-process root/cwd caps installed via `CONFIGURE_NAMESPACE`
+    // but never consumed by `start_process` (child destroyed before
+    // start). On the normal path these slots are already zero —
+    // `start_process` deletes them after `cap_copy`.
+    if entry.namespace_override != 0
+    {
+        let _ = syscall::cap_delete(entry.namespace_override);
+    }
+    if entry.cwd_override != 0
+    {
+        let _ = syscall::cap_delete(entry.cwd_override);
+    }
+
     // Notify memmgr to reclaim every frame attributed to this child's
     // memmgr token, then drop procmgr's tokened SEND copy.
     notify_memmgr_died(memmgr_ep, entry.memmgr_token, ipc_buf);
@@ -1723,9 +2094,13 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
 
 /// Start a previously created (suspended) process.
 ///
-/// `finalize_creation` already bound the child's main thread to procmgr's
-/// shared death queue, so this just configures the thread and kicks it.
-pub fn start_process(token: u64, table: &mut ProcessTable) -> Result<(), u64>
+/// Patches the child's `ProcessInfo.system_root_cap` slot from the
+/// per-process namespace cap installed via `CONFIGURE_NAMESPACE`. If
+/// no cap was installed, the slot stays zero — the child runs without
+/// namespace authority. `finalize_creation` already bound the child's
+/// main thread to procmgr's shared death queue, so this just configures
+/// the thread and kicks it.
+pub fn start_process(token: u64, table: &mut ProcessTable, self_aspace: u32) -> Result<(), u64>
 {
     let entry = table
         .find_mut_by_token(token)
@@ -1734,6 +2109,35 @@ pub fn start_process(token: u64, table: &mut ProcessTable) -> Result<(), u64>
     if entry.started
     {
         return Err(procmgr_errors::ALREADY_STARTED);
+    }
+
+    if entry.namespace_override != 0 || entry.cwd_override != 0
+    {
+        let pi_frame = entry.pi_frame_cap;
+        let child_cspace = entry.cspace_cap;
+        let scratch = ScratchMapping::map(self_aspace, pi_frame, 1, syscall::MAP_WRITABLE)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        let scratch_va = scratch.va();
+        // SAFETY: scratch_va is page-aligned and mapped writable; PI struct
+        // lives at offset 0 per the ABI.
+        let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+        if entry.namespace_override != 0
+        {
+            let slot =
+                syscall::cap_copy(entry.namespace_override, child_cspace, syscall::RIGHTS_SEND)
+                    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            pi.system_root_cap = slot;
+            let _ = syscall::cap_delete(entry.namespace_override);
+            entry.namespace_override = 0;
+        }
+        if entry.cwd_override != 0
+        {
+            let slot = syscall::cap_copy(entry.cwd_override, child_cspace, syscall::RIGHTS_SEND)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            pi.current_dir_cap = slot;
+            let _ = syscall::cap_delete(entry.cwd_override);
+            entry.cwd_override = 0;
+        }
     }
 
     syscall::thread_configure_with_tls(

@@ -1,13 +1,13 @@
 // seraph-overlay: std::sys::process::seraph
 //
 // `std::process::Command` for Seraph: spawns the target binary via
-// `CREATE_FROM_VFS` to procmgr, optionally installs shmem-backed stdio
+// `CREATE_FROM_FILE` to procmgr, optionally installs shmem-backed stdio
 // pipes via `CONFIGURE_PIPE`, binds a death-notification `EventQueue`
 // to the child's main thread, starts it, and surfaces `Child::wait` /
 // `Child::kill` on top of the resulting caps.
 //
 // Wire-up:
-//   * Create: ipc_call(procmgr_endpoint, CREATE_FROM_VFS, ...).
+//   * Create: ipc_call(procmgr_endpoint, CREATE_FROM_FILE, ...).
 //             Reply caps: [process_handle, thread_for_caller].
 //   * Pipe (per piped direction): allocate (frame, data_sig, space_sig)
 //             via Pipe::create_for_child; ipc_call(process_handle,
@@ -39,7 +39,7 @@
 // Argv/env:
 //   * `Command::arg(...)` accumulates into `self.args`; `Command::env_mut()`
 //     tracks into `CommandEnv`. Both are serialised at `spawn` time into the
-//     label + data of `CREATE_FROM_VFS` (same encoding as `CREATE_PROCESS`)
+//     label + data of `CREATE_FROM_FILE` (same encoding as `CREATE_PROCESS`
 //     and end up in the child's `ProcessInfo` page, surfaced via
 //     `std::env::{args, vars}` on the child side. Blobs are bounded by
 //     `ipc::ARGS_BLOB_MAX` and 8-bit counts; oversize returns
@@ -81,7 +81,9 @@ pub enum Stdio {
     MakePipe,
     ParentStdout,
     ParentStderr,
-    #[allow(dead_code)]
+    /// Constructed by the upstream `std::process::Stdio: From<fs::File>`
+    /// impl. `spawn` rejects it with `ErrorKind::Unsupported`; there is no
+    /// cap-native wire for handing a file off as a child's stdio yet.
     InheritFile(File),
 }
 
@@ -119,6 +121,19 @@ pub struct Command {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    /// Per-spawn override for the child's `ProcessInfo.system_root_cap`.
+    /// Zero means "use the parent-inherit default" — `Command::spawn`
+    /// `cap_copy`s the spawner's own `root_dir_cap()` and delivers
+    /// that. Non-zero caps are delivered to procmgr via
+    /// `CONFIGURE_NAMESPACE` between `CREATE_FROM_FILE` and
+    /// `START_PROCESS`; the wire transfers ownership, so the slot is
+    /// consumed by the spawn call (success or wire-level error).
+    namespace_cap: u32,
+    /// Per-spawn override for the child's `ProcessInfo.current_dir_cap`.
+    /// Zero defers to the cwd source chain (`self.cwd` path walk,
+    /// then `current_dir_cap()` parent inherit, then zero). Same
+    /// ownership contract as `namespace_cap`.
+    cwd_dir_cap: u32,
 }
 
 impl Command {
@@ -131,7 +146,23 @@ impl Command {
             stdin: None,
             stdout: None,
             stderr: None,
+            namespace_cap: 0,
+            cwd_dir_cap: 0,
         }
+    }
+
+    /// Install a per-spawn override for the child's
+    /// `ProcessInfo.system_root_cap`. Called by the seraph-specific
+    /// `CommandExt::namespace_cap` trait method; transfers ownership of
+    /// the cap to this `Command` (consumed by the next `spawn`).
+    pub fn set_namespace_cap(&mut self, cap: u32) {
+        self.namespace_cap = cap;
+    }
+
+    /// Install a per-spawn override for the child's
+    /// `ProcessInfo.current_dir_cap`. Called by `CommandExt::cwd_dir_cap`.
+    pub fn set_cwd_dir_cap(&mut self, cap: u32) {
+        self.cwd_dir_cap = cap;
     }
 
     pub fn arg(&mut self, arg: &OsStr) {
@@ -202,10 +233,23 @@ impl Command {
             ));
         }
 
+        if matches!(effective_stdin, Stdio::InheritFile(_))
+            || matches!(effective_stdout, Stdio::InheritFile(_))
+            || matches!(effective_stderr, Stdio::InheritFile(_))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Stdio::from(File) is not supported on seraph",
+            ));
+        }
+
         let path_bytes = self.program.as_encoded_bytes();
-        if path_bytes.is_empty() || path_bytes.len() > ipc::MAX_PATH_LEN {
+        if path_bytes.is_empty() {
             return Err(io::Error::from(io::ErrorKind::InvalidFilename));
         }
+        let path_str = self.program.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Command program path must be UTF-8")
+        })?;
 
         // Pack argv (NUL-terminated UTF-8 concatenation of self.args).
         let mut args_blob: Vec<u8> = Vec::new();
@@ -261,8 +305,27 @@ impl Command {
         // and mapped for the process lifetime.
         let ipc_ptr = info.ipc_buffer as *mut u64;
 
-        let path_len = path_bytes.len().min(ipc::MAX_PATH_LEN);
-        let path_words = path_len.div_ceil(8);
+        // Walk the spawner's namespace cap to the binary node. The
+        // resulting tokened SEND on the owning fs driver's namespace
+        // endpoint is transferred to procmgr in caps[0] of CREATE_FROM_FILE
+        // — procmgr never holds a namespace cap.
+        let parent_root = crate::os::seraph::root_dir_cap();
+        if parent_root == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Command::spawn: no root_dir_cap configured (cannot resolve binary path)",
+            ));
+        }
+        let walked = crate::sys::fs::walk_path_to_file(parent_root, path_str, ipc_ptr)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    crate::format!("Command::spawn: binary lookup failed: {e}"),
+                )
+            })?;
+        let file_cap = walked.file_cap;
+        let file_size = walked.size;
+
         let argv_words = if args_blob.is_empty() {
             0
         } else {
@@ -274,16 +337,19 @@ impl Command {
             0
         };
 
-        let argv_word_offset = path_words;
+        // CREATE_FROM_FILE wire: word 0 = file_size, words 1.. = argv,
+        // env header, env. Caps: [file_cap, creator_endpoint?]. Command-
+        // spawned children skip the creator endpoint slot.
+        let argv_word_offset: usize = 1;
         let env_len_word_offset = argv_word_offset + argv_words;
         let env_blob_word_offset = env_len_word_offset + 1;
 
-        let builder = ipc::IpcMessage::builder(procmgr_labels::CREATE_FROM_VFS
-            | ((path_bytes.len() as u64) << 16)
+        let builder = ipc::IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE
             | ((args_blob.len() as u64) << 32)
             | ((u64::from(args_count)) << 48)
             | ((u64::from(env_count)) << 56))
-            .bytes(0, &path_bytes[..path_len]);
+            .word(0, file_size)
+            .cap(file_cap);
         let builder = if !args_blob.is_empty() {
             builder.bytes(argv_word_offset, &args_blob)
         } else {
@@ -296,16 +362,14 @@ impl Command {
         } else {
             builder
         };
-        let total_words = path_words + argv_words + env_header_words;
-        // CREATE_FROM_VFS carries no caps for Command-spawned children:
-        // creator endpoint is not needed (Command children don't do the
-        // bootstrap handshake) and stdio is installed separately below.
+        let total_words = 1 + argv_words + env_header_words;
         let msg = builder.word_count(total_words).build();
 
         // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page for
-        // this thread, installed at `_start` time.
+        // this thread, installed at `_start` time. file_cap ownership
+        // transfers to procmgr via the IPC; procmgr cap_deletes it.
         let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) }
-            .map_err(|_| io::Error::other("CREATE_FROM_VFS syscall failed"))?;
+            .map_err(|_| io::Error::other("CREATE_FROM_FILE syscall failed"))?;
         if reply.label != procmgr_errors::SUCCESS {
             return Err(map_procmgr_error(reply.label));
         }
@@ -313,7 +377,7 @@ impl Command {
         let reply_caps = reply.caps();
         if reply_caps.len() < 2 {
             return Err(io::Error::other(
-                "CREATE_FROM_VFS reply missing process_handle or thread cap",
+                "CREATE_FROM_FILE reply missing process_handle or thread cap",
             ));
         }
         let process_handle = reply_caps[0];
@@ -471,6 +535,140 @@ impl Command {
         } else {
             None
         };
+
+        // Hand the child its namespace caps via `CONFIGURE_NAMESPACE`
+        // BEFORE start so they appear in `ProcessInfo.system_root_cap`
+        // and `ProcessInfo.current_dir_cap` at `_start`.
+        //
+        // Root cap source priority:
+        //   1. Explicit override via `CommandExt::namespace_cap`.
+        //   2. Parent-inherit default: `cap_copy` of `root_dir_cap()`.
+        //
+        // Cwd cap source priority:
+        //   1. Explicit override via `CommandExt::cwd_dir_cap`.
+        //   2. Walk parent's root to `self.cwd` (path-based override).
+        //   3. Parent-inherit default: `cap_copy` of `current_dir_cap()`.
+        //   4. Zero (child has no cwd cap).
+        //
+        // procmgr consumes both caps on the IPC regardless of reply label.
+        let ns_cap_to_send: u32 = if self.namespace_cap != 0 {
+            let cap = self.namespace_cap;
+            self.namespace_cap = 0;
+            cap
+        } else {
+            match syscall::cap_copy(parent_root, info.self_cspace, syscall::RIGHTS_SEND) {
+                Ok(slot) => slot,
+                Err(_) => 0,
+            }
+        };
+        let cwd_resolution: io::Result<u32> = if self.cwd_dir_cap != 0 {
+            let cap = self.cwd_dir_cap;
+            self.cwd_dir_cap = 0;
+            Ok(cap)
+        } else if let Some(cwd_os) = self.cwd.as_ref() {
+            match cwd_os.to_str() {
+                None => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Command::cwd: path must be UTF-8",
+                )),
+                Some(cwd_str) => crate::sys::fs::walk_path_to_dir(parent_root, cwd_str, ipc_ptr)
+                    .map(|walked| walked.dir_cap)
+                    .map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            crate::format!("Command::cwd: walk failed: {e}"),
+                        )
+                    }),
+            }
+        } else {
+            let parent_cwd = crate::os::seraph::current_dir_cap();
+            if parent_cwd != 0 {
+                Ok(
+                    match syscall::cap_copy(parent_cwd, info.self_cspace, syscall::RIGHTS_SEND) {
+                        Ok(slot) => slot,
+                        Err(_) => 0,
+                    },
+                )
+            } else {
+                Ok(0)
+            }
+        };
+        let cwd_cap_to_send: u32 = match cwd_resolution {
+            Ok(c) => c,
+            Err(e) => {
+                if ns_cap_to_send != 0 {
+                    let _ = syscall::cap_delete(ns_cap_to_send);
+                }
+                if let Some(b) = bridge {
+                    let _ = syscall::event_post(death_eq, BRIDGE_SENTINEL_DROP);
+                    if let Some(h) = b.handle {
+                        let _ = h.join();
+                    }
+                    let _ = syscall::cap_delete(b.completion_signal);
+                }
+                let _ = syscall::cap_delete(death_eq);
+                let _ = syscall::cap_delete(thread_cap);
+                // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                let _ = syscall::cap_delete(process_handle);
+                return Err(e);
+            }
+        };
+        if ns_cap_to_send == 0 && cwd_cap_to_send != 0 {
+            // Cwd without a root is rejected by procmgr (root is the
+            // mandatory cap). Drop the orphan slot and skip the IPC.
+            let _ = syscall::cap_delete(cwd_cap_to_send);
+        }
+        if ns_cap_to_send != 0 {
+            let ns_cap = ns_cap_to_send;
+            let mut ns_builder = ipc::IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE)
+                .cap(ns_cap);
+            if cwd_cap_to_send != 0 {
+                ns_builder = ns_builder.cap(cwd_cap_to_send);
+            }
+            let ns_msg = ns_builder.build();
+            // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+            let ns_reply = unsafe { ipc::ipc_call(process_handle, &ns_msg, ipc_ptr) };
+            // The caps were transferred by ipc_call regardless of the
+            // reply label; clear our slot indices unconditionally.
+            let _ = syscall::cap_delete(ns_cap);
+            if cwd_cap_to_send != 0 {
+                let _ = syscall::cap_delete(cwd_cap_to_send);
+            }
+            match ns_reply {
+                Ok(reply) if reply.label == procmgr_errors::SUCCESS => {}
+                Ok(reply) => {
+                    if let Some(b) = bridge {
+                        let _ = syscall::event_post(death_eq, BRIDGE_SENTINEL_DROP);
+                        if let Some(h) = b.handle {
+                            let _ = h.join();
+                        }
+                        let _ = syscall::cap_delete(b.completion_signal);
+                    }
+                    let _ = syscall::cap_delete(death_eq);
+                    let _ = syscall::cap_delete(thread_cap);
+                    // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    let _ = syscall::cap_delete(process_handle);
+                    return Err(map_procmgr_error(reply.label));
+                }
+                Err(_) => {
+                    if let Some(b) = bridge {
+                        let _ = syscall::event_post(death_eq, BRIDGE_SENTINEL_DROP);
+                        if let Some(h) = b.handle {
+                            let _ = h.join();
+                        }
+                        let _ = syscall::cap_delete(b.completion_signal);
+                    }
+                    let _ = syscall::cap_delete(death_eq);
+                    let _ = syscall::cap_delete(thread_cap);
+                    // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
+                    let _ = syscall::cap_delete(process_handle);
+                    return Err(io::Error::other("CONFIGURE_NAMESPACE syscall failed"));
+                }
+            }
+        }
 
         // Kick the child off.
         let start_msg = ipc::IpcMessage::new(procmgr_labels::START_PROCESS);
@@ -981,9 +1179,6 @@ fn map_procmgr_error(code: u64) -> io::Error {
         }
         procmgr_errors::INVALID_ARGUMENT => {
             io::Error::new(io::ErrorKind::InvalidInput, "INVALID_ARGUMENT")
-        }
-        procmgr_errors::NO_VFSD_ENDPOINT => {
-            io::Error::new(io::ErrorKind::NotConnected, "NO_VFSD_ENDPOINT")
         }
         procmgr_errors::FILE_NOT_FOUND => {
             io::Error::new(io::ErrorKind::NotFound, "FILE_NOT_FOUND")

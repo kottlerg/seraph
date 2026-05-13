@@ -20,6 +20,7 @@ members = [
     "shared/elf",
     "shared/font",
     "shared/mmio",
+    "shared/namespace-protocol",
     "shared/syscall",
     "shared/ipc",
     "shared/log",

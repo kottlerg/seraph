@@ -208,6 +208,42 @@ returns an error.
 
 ---
 
+## Capabilities as Namespaces
+
+The capability mechanism above suffices to express filesystem
+namespaces, sandbox views, and per-process roots without any kernel
+support beyond what is already documented. A **node capability** in
+Seraph is a tokened SEND on an IPC endpoint owned by a server
+process; the token's bits encode a server-private node identifier
+plus a per-cap rights mask, decoded by the server on every request.
+
+This composition gives:
+
+- **The capability is the namespace.** Holding a directory cap is
+  the authority to walk that directory; no path string carries
+  authority.
+- **Sandboxing as cap distribution.** A child process whose initial
+  bootstrap cap is a different node cap (or no cap at all) sees a
+  different root, with no kernel mount table or chroot syscall
+  involved.
+- **Per-child distribution at spawn.** procmgr installs each child's
+  `ProcessInfo.system_root_cap` from either the universal default
+  (a tokened SEND on vfsd's namespace endpoint) or a spawner-supplied
+  override. Spawners override via the `CONFIGURE_NAMESPACE` IPC
+  between create and start, transferring an attenuated cap they
+  obtained by walk-and-attenuate from a cap they already hold.
+  procmgr never mints namespace caps itself.
+- **Attenuation through rights bits.** The rights field in the token
+  narrows on every walk under server enforcement, mirroring the
+  derivation-tree attenuation the kernel enforces on the cap itself.
+
+The system-scope authority for the namespace model is
+[`namespace-model.md`](namespace-model.md); the wire format and
+dispatch crate are
+[`shared/namespace-protocol/README.md`](../shared/namespace-protocol/README.md).
+
+---
+
 ## Transfer
 
 A capability may be transferred via IPC (see [ipc-design.md](ipc-design.md)). Transfer

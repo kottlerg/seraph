@@ -1,7 +1,10 @@
 # vfsd
 
-Virtual filesystem daemon providing a unified namespace over multiple filesystem
-driver processes.
+Virtual filesystem daemon. vfsd is a namespace server with no on-disk
+storage: it composes a synthetic system root from per-mount tokened
+SEND caps on filesystem drivers, mints the root cap that every
+process receives in `ProcessInfo.system_root_cap`, and stays out of
+the I/O path after the walk.
 
 ---
 
@@ -12,65 +15,77 @@ vfsd/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   └── main.rs                     # Entry point (stub)
+│   ├── main.rs              # Entry, service + namespace loops, MOUNT handler
+│   ├── driver.rs            # Spawning fatfs driver instances
+│   ├── gpt.rs               # GPT partition table parsing
+│   ├── mount_conf.rs        # INGEST_CONFIG_MOUNTS reader
+│   ├── root_backend.rs      # VfsdRootBackend (NamespaceBackend impl)
+│   ├── worker.rs            # Worker thread implementation
+│   └── worker_pool.rs       # Bootstrap-endpoint pool for spawned drivers
 └── docs/
-    ├── namespace.md                # Mount points, path resolution, namespace hierarchy
-    └── vfs-ipc-interface.md        # Filesystem IPC interface for applications
+    ├── namespace-composition.md   # Synthetic root, root-mount delegation
+    └── vfs-ipc-interface.md       # MOUNT / INGEST_CONFIG_MOUNTS
 ```
 
 ---
 
 ## Responsibilities
 
-- **Launch filesystem drivers** — start filesystem driver processes from
-  [`fs/`](../fs/README.md) via procmgr and manage their lifecycle.
-- **Route namespace operations** — maintain a mount table mapping path prefixes
-  to filesystem driver endpoints. Incoming filesystem requests (open, read,
-  write, stat, readdir) are resolved to the correct driver and forwarded via
-  IPC.
-- **Manage mount table** — handle mount and unmount operations, associating
-  filesystem driver instances with namespace locations.
-- **Expose filesystem IPC** — provide a single filesystem IPC endpoint to
-  applications and other services. Clients interact with vfsd; vfsd handles
-  dispatch to the appropriate driver. See
+- **Namespace composition** — owns `VfsdRootBackend`, the in-process
+  [`NamespaceBackend`] that surfaces installed mounts as cross-server
+  entries on the synthetic system root, and forwards unmatched
+  lookups to the root mount via transparent delegation. See
+  [`docs/namespace-composition.md`](docs/namespace-composition.md).
+- **Service endpoint** — handles `MOUNT`, `INGEST_CONFIG_MOUNTS`, and
+  `GET_SYSTEM_ROOT_CAP` on its un-tokened service endpoint, with
+  multi-threaded recv so a worker-driven `CREATE_FROM_FILE` re-entry
+  cannot deadlock an in-flight reply. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md).
+- **System-root cap delivery** — vfsd does not push a system-root
+  cap anywhere at boot. Init pulls one via
+  `vfsd_labels::GET_SYSTEM_ROOT_CAP` after the cmdline-driven root
+  mount completes; init then distributes per-child copies via
+  `procmgr_labels::CONFIGURE_NAMESPACE` on every spawn. Procmgr
+  itself holds no namespace cap — children spawned without an
+  explicit `CONFIGURE_NAMESPACE` cap see
+  `ProcessInfo.system_root_cap == 0`.
+- **Filesystem driver lifecycle** — vfsd is the dispatcher for fs
+  driver processes. The first `MOUNT` (the cmdline-driven root)
+  spawns fatfs from a boot module cap; subsequent mounts walk
+  vfsd's own held system-root cap to `/bin/fatfs` and pass the
+  resulting file cap to procmgr via `CREATE_FROM_FILE`. The
+  first-mount path is permanent and structural — `/bin/fatfs` is
+  unreachable until root mounts, so spawning the fatfs that brings
+  the root online cannot be moved elsewhere. vfsd supplies each
+  driver with a partition-scoped block device endpoint and the
+  receive side of its own service endpoint.
+- **GPT enumeration** — parses the GPT partition table from a single
+  scratch frame at startup and retains `(uuid → (lba, length))`
+  entries for `MOUNT` lookups.
 
-vfsd does not touch hardware directly. All storage I/O is mediated through
-block device driver IPC endpoints.
+vfsd does not touch hardware directly. All storage I/O is mediated
+through partition-scoped block device IPC endpoints derived from
+virtio-blk's whole-disk endpoint.
 
 ---
 
-## Filesystem Driver Management
+## After the walk
 
-Filesystem implementations (FAT, ext4, tmpfs, etc.) live in
-[`fs/`](../fs/README.md) as separate binary crates. Each runs as an isolated
-process with its own address space.
-
-At mount time, vfsd:
-
-1. Requests procmgr to create the filesystem driver process.
-2. Passes the block device IPC endpoint (for disk-backed filesystems) to the
-   driver. In-memory filesystems (e.g. tmpfs) receive no block device endpoint.
-3. Registers the driver in the mount table at the specified namespace path.
-4. Routes all subsequent operations under that path to the driver.
-
-On unmount or driver crash, vfsd removes the mount table entry. Filesystem
-drivers can be restarted and re-mounted independently without affecting other
-mount points.
-
-The IPC protocol between vfsd and filesystem drivers is specified in
-[`fs/docs/fs-driver-protocol.md`](../fs/docs/fs-driver-protocol.md).
+Once a client holds a node cap returned by `NS_LOOKUP` through the
+synthetic root or via transparent root delegation, every subsequent
+operation (`NS_LOOKUP` on subdirectories, `NS_READ` / `NS_READ_FRAME`,
+`FS_CLOSE`) goes directly to the owning filesystem driver. vfsd is
+not on the request path.
 
 ---
 
 ## Relationship to devmgr
 
-vfsd receives block device IPC endpoints indirectly: devmgr discovers storage
-hardware, spawns block device drivers, and registers their endpoints in the
-device registry. vfsd queries the device registry (or receives endpoints via
-init's bootstrap sequence) to obtain block device endpoints for mounting. See
-[docs/device-management.md](../../docs/device-management.md) for the device
-registry and endpoint flow.
+devmgr discovers storage hardware, spawns block device drivers, and
+publishes their endpoints in the device registry. vfsd queries the
+registry at startup to obtain the whole-disk virtio-blk endpoint;
+per-mount partition tokens are derived from it. See
+[`docs/device-management.md`](../../docs/device-management.md).
 
 ---
 
@@ -78,10 +93,13 @@ registry and endpoint flow.
 
 | Document | Content |
 |---|---|
+| [docs/namespace-model.md](../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing |
+| [docs/capability-model.md](../../docs/capability-model.md) | Token semantics, derivation, revocation |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
-| [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, vfsd role |
 | [docs/device-management.md](../../docs/device-management.md) | Device registry, block device endpoints |
-| [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/architecture.md](../../docs/architecture.md) | vfsd role in the boot lifecycle |
+| [shared/namespace-protocol/README.md](../../shared/namespace-protocol/README.md) | NS_* wire surface |
+| [services/fs/docs/fs-driver-protocol.md](../fs/docs/fs-driver-protocol.md) | Filesystem-driver protocol (FS_MOUNT, FS_READ, FS_READ_FRAME, …) |
 
 ---
 

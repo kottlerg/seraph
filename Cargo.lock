@@ -242,6 +242,7 @@ name = "fatfs"
 version = "0.1.0"
 dependencies = [
  "ipc",
+ "namespace-protocol",
  "syscall",
  "syscall-abi",
 ]
@@ -484,6 +485,16 @@ name = "mmio"
 version = "0.1.0"
 
 [[package]]
+name = "namespace-protocol"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "rustc-std-workspace-core",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -540,6 +551,7 @@ version = "0.1.0"
 dependencies = [
  "elf",
  "ipc",
+ "namespace-protocol",
  "process-abi",
  "syscall",
  "syscall-abi",
@@ -713,6 +725,7 @@ name = "usertest"
 version = "0.1.0"
 dependencies = [
  "ipc",
+ "namespace-protocol",
  "shmem",
  "syscall",
 ]
@@ -739,6 +752,7 @@ name = "vfsd"
 version = "0.1.0"
 dependencies = [
  "ipc",
+ "namespace-protocol",
  "syscall",
  "syscall-abi",
 ]

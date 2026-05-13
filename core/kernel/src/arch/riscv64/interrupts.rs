@@ -539,8 +539,11 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             {
                 // Commit Exited under all-CPU scheduler.locks. See
                 // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
+                // Write exit_reason first so any subsequent sched.lock acquire
+                // observes the reason alongside the Exited transition.
                 // SAFETY: tcb validated non-null.
                 unsafe {
+                    (*tcb).exit_reason = 0x1000 + cause_code;
                     crate::sched::set_state_under_all_locks(
                         tcb,
                         crate::sched::thread::ThreadState::Exited,

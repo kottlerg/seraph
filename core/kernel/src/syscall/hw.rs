@@ -560,22 +560,36 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Insert both children into the caller's CSpace (auto-allocate slots).
-    // SAFETY: caller_cspace validated non-null; CSpace methods handle slot allocation.
-    let cs = unsafe { &mut *caller_cspace };
-    let slot1_nz = cs
-        .insert_cap(CapTag::MmioRegion, mmio_rights, child1_ptr)
-        .map_err(|_| SyscallError::OutOfMemory)?;
+    // Insert both children into the caller's CSpace under cspace.lock so the
+    // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*.
+    // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
+    let slot1_nz = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let r = (*caller_cspace).insert_cap(CapTag::MmioRegion, mmio_rights, child1_ptr);
+        (*caller_cspace).lock.unlock_raw(saved);
+        r
+    }
+    .map_err(|_| SyscallError::OutOfMemory)?;
     let slot1 = slot1_nz.get();
-    let slot2_nz = cs
-        .insert_cap(CapTag::MmioRegion, mmio_rights, child2_ptr)
-        .map_err(|_| {
-            // Undo slot1 insertion on failure.
-            cs.free_slot(slot1);
-            // SAFETY: child1_ptr just allocated above; ref count is 1.
-            unsafe { dealloc_object(child1_ptr) };
-            SyscallError::OutOfMemory
-        })?;
+    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
+    let slot2_nz = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let r = (*caller_cspace).insert_cap(CapTag::MmioRegion, mmio_rights, child2_ptr);
+        (*caller_cspace).lock.unlock_raw(saved);
+        r
+    }
+    .map_err(|_| {
+        // Undo slot1 insertion on failure.
+        // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
+        unsafe {
+            let saved = (*caller_cspace).lock.lock_raw();
+            (*caller_cspace).free_slot(slot1);
+            (*caller_cspace).lock.unlock_raw(saved);
+        }
+        // SAFETY: child1_ptr just allocated above; ref count is 1.
+        unsafe { dealloc_object(child1_ptr) };
+        SyscallError::OutOfMemory
+    })?;
     let slot2 = slot2_nz.get();
 
     // ── Wire derivation tree ──────────────────────────────────────────────────
@@ -616,9 +630,13 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Consume the original cap ──────────────────────────────────────────────
 
-    // Return original slot to free list (tag becomes Null).
+    // Return original slot to free list (tag becomes Null) under cspace.lock.
     // SAFETY: caller_cspace validated; mmio_idx within CSpace bounds.
-    unsafe { (*caller_cspace).free_slot(mmio_idx) };
+    unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        (*caller_cspace).free_slot(mmio_idx);
+        (*caller_cspace).lock.unlock_raw(saved);
+    }
 
     // Dec-ref original object; free if no references remain.
     // SAFETY: orig_obj_ptr from lookup_cap; object still valid (ref > 0 at lookup).
@@ -736,21 +754,35 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Insert both children into the caller's CSpace.
-    // SAFETY: caller_cspace validated non-null; CSpace methods handle slot allocation.
-    let cs = unsafe { &mut *caller_cspace };
-    let slot1_nz = cs
-        .insert_cap(CapTag::Interrupt, rights, child1_ptr)
-        .map_err(|_| SyscallError::OutOfMemory)?;
+    // Insert both children into the caller's CSpace under cspace.lock so the
+    // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*.
+    // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
+    let slot1_nz = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let r = (*caller_cspace).insert_cap(CapTag::Interrupt, rights, child1_ptr);
+        (*caller_cspace).lock.unlock_raw(saved);
+        r
+    }
+    .map_err(|_| SyscallError::OutOfMemory)?;
     let slot1 = slot1_nz.get();
-    let slot2_nz = cs
-        .insert_cap(CapTag::Interrupt, rights, child2_ptr)
-        .map_err(|_| {
-            cs.free_slot(slot1);
-            // SAFETY: child1_ptr just allocated above; ref count is 1.
-            unsafe { dealloc_object(child1_ptr) };
-            SyscallError::OutOfMemory
-        })?;
+    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
+    let slot2_nz = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let r = (*caller_cspace).insert_cap(CapTag::Interrupt, rights, child2_ptr);
+        (*caller_cspace).lock.unlock_raw(saved);
+        r
+    }
+    .map_err(|_| {
+        // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
+        unsafe {
+            let saved = (*caller_cspace).lock.lock_raw();
+            (*caller_cspace).free_slot(slot1);
+            (*caller_cspace).lock.unlock_raw(saved);
+        }
+        // SAFETY: child1_ptr just allocated above; ref count is 1.
+        unsafe { dealloc_object(child1_ptr) };
+        SyscallError::OutOfMemory
+    })?;
     let slot2 = slot2_nz.get();
 
     // ── Wire derivation tree ──────────────────────────────────────────────────
@@ -784,7 +816,11 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // ── Consume the original cap ──────────────────────────────────────────────
 
     // SAFETY: caller_cspace validated; irq_idx within CSpace bounds.
-    unsafe { (*caller_cspace).free_slot(irq_idx) };
+    unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        (*caller_cspace).free_slot(irq_idx);
+        (*caller_cspace).lock.unlock_raw(saved);
+    }
 
     // SAFETY: orig_obj_ptr from lookup_cap; object still valid (ref > 0 at lookup).
     let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };

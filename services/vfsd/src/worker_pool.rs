@@ -10,13 +10,14 @@
 //! * **Bootstrap worker** (always one): owns the bootstrap endpoint, sits in
 //!   `ipc_recv`, and matches inbound child REQUESTs against pending
 //!   [`BootstrapOrder`]s registered via [`WorkerPool::submit`].
-//! * **Active workers** (a small pool): pull [`CreateFromVfsOrder`]s off a
-//!   queue and issue the outbound IPC sequence (procmgr `CREATE_FROM_VFS` +
-//!   `START_PROCESS` + waiting on the bootstrap worker's per-request channel).
+//! * **Active workers** (a small pool): pull [`CreateFromFileOrder`]s
+//!   off a queue and issue the outbound IPC sequence (procmgr
+//!   `CREATE_FROM_FILE` + `START_PROCESS` + waiting on the bootstrap
+//!   worker's per-request channel).
 //!
 //! Active workers exist because the kernel's single-slot reply target
 //! prohibits nested server IPC: vfsd's main thread holds `reply_tcb = caller`
-//! while servicing OPEN/MOUNT, so it cannot issue a `CREATE_FROM_VFS` whose
+//! while servicing OPEN/MOUNT, so it cannot issue a `CREATE_FROM_FILE` whose
 //! reply path requires procmgr to re-enter vfsd's OPEN. Offloading the
 //! procmgr call to a worker thread keeps main's reply path intact.
 
@@ -39,10 +40,10 @@ pub enum WorkOrder
     /// Deliver caps to a fatfs child via `bootstrap::reply_round` when its
     /// REQUEST arrives on the worker-owned bootstrap endpoint.
     Bootstrap(BootstrapOrder),
-    /// Issue `procmgr_labels::CREATE_FROM_VFS` and `START_PROCESS` from a
+    /// Issue `procmgr_labels::CREATE_FROM_FILE` and `START_PROCESS` from a
     /// worker thread so vfsd's main thread can keep servicing OPEN while
     /// procmgr re-enters the VFS to load the binary.
-    CreateFromVfs(CreateFromVfsOrder),
+    CreateFromFile(CreateFromFileOrder),
 }
 
 /// Caps to deliver to one fatfs child during its bootstrap round.
@@ -56,13 +57,21 @@ pub struct BootstrapOrder
     pub service: u32,
 }
 
-/// Spawn a process from a VFS path via procmgr. The active worker submits
-/// the contained [`BootstrapOrder`] internally before driving the procmgr
-/// call sequence, so the bootstrap worker is ready when the child REQUESTs.
-pub struct CreateFromVfsOrder
+/// Spawn a process from a caller-resolved file cap via procmgr. The active
+/// worker submits the contained [`BootstrapOrder`] internally before
+/// driving the procmgr call sequence, so the bootstrap worker is ready
+/// when the child REQUESTs.
+pub struct CreateFromFileOrder
 {
     pub procmgr_ep: u32,
-    pub module_path: &'static [u8],
+    /// Tokened SEND on the owning fs driver's namespace endpoint
+    /// addressing the binary node. Ownership transferred to the worker;
+    /// the worker forwards it to procmgr in `caps[0]` of `CREATE_FROM_FILE`.
+    pub file_cap: u32,
+    /// File size as reported by the resolving `NS_LOOKUP`'s size hint;
+    /// rides as data word 0 of `CREATE_FROM_FILE` so procmgr can bound
+    /// header / section walks during ELF load.
+    pub file_size: u64,
     /// Tokened SEND cap on the bootstrap endpoint, derived by the caller and
     /// moved to the worker. Forwarded to procmgr as the child's
     /// `creator_endpoint`.
@@ -138,7 +147,7 @@ impl BootstrapState
 /// One pending active-worker job.
 pub struct ActiveJob
 {
-    pub order: CreateFromVfsOrder,
+    pub order: CreateFromFileOrder,
     pub completion: Channel,
 }
 
@@ -217,7 +226,7 @@ impl WorkerPool
         match order
         {
             WorkOrder::Bootstrap(b) => submit_bootstrap(&self.bootstrap_state, b),
-            WorkOrder::CreateFromVfs(c) =>
+            WorkOrder::CreateFromFile(c) =>
             {
                 let channel = new_channel();
                 let mut q = self

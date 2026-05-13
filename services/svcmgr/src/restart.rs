@@ -201,8 +201,10 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx, correlator: u32) ->
 }
 
 /// Spawn a fresh instance of `svc` via procmgr. Branches on the recorded
-/// restart source: VFS path → `CREATE_FROM_VFS`; module cap →
-/// `CREATE_PROCESS`. Returns `(process_handle, thread, child_token)`.
+/// restart source: VFS path → walk svcmgr's `root_dir_cap` to the binary
+/// then `CREATE_FROM_FILE`; module cap → `CREATE_PROCESS`. After create,
+/// installs a `cap_copy` of svcmgr's root cap on the child via
+/// `CONFIGURE_NAMESPACE`. Returns `(process_handle, thread, child_token)`.
 fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64)>
 {
     // Allocate a fresh bootstrap token for this child.
@@ -215,13 +217,34 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
 
     let create_msg = if svc.vfs_path_len > 0
     {
-        let path_len = svc.vfs_path_len as usize;
-        let path_bytes = &svc.vfs_path[..path_len];
-        let label = procmgr_labels::CREATE_FROM_VFS | ((path_len as u64) << 16);
-        let path_words = path_len.div_ceil(8);
-        IpcMessage::builder(label)
-            .bytes(0, path_bytes)
-            .word_count(path_words)
+        let root_cap = std::os::seraph::root_dir_cap();
+        if root_cap == 0
+        {
+            std::os::seraph::log!("restart: no root_dir_cap configured");
+            let _ = syscall::cap_delete(tokened_creator);
+            return None;
+        }
+        let path_bytes = &svc.vfs_path[..svc.vfs_path_len as usize];
+        let Ok(path_str) = core::str::from_utf8(path_bytes)
+        else
+        {
+            std::os::seraph::log!("restart: vfs_path is not UTF-8");
+            let _ = syscall::cap_delete(tokened_creator);
+            return None;
+        };
+        let (file_cap, file_size) = match std::os::seraph::namespace_lookup_file(root_cap, path_str)
+        {
+            Ok(p) => p,
+            Err(e) =>
+            {
+                std::os::seraph::log!("restart: NS_LOOKUP {path_str:?} failed: {e}");
+                let _ = syscall::cap_delete(tokened_creator);
+                return None;
+            }
+        };
+        IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+            .word(0, file_size)
+            .cap(file_cap)
             .cap(tokened_creator)
             .build()
     }
@@ -250,8 +273,67 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
     }
 
     let process_handle = reply_caps[0];
+    let thread_cap = reply_caps[1];
 
-    Some((process_handle, reply_caps[1], child_token))
+    // Install a `cap_copy` of svcmgr's own root cap on the child. The
+    // restart-created child needs its own namespace cap installed
+    // explicitly because procmgr no longer holds a broadcast root.
+    // A failure here means the restarted service would boot without
+    // namespace authority, presenting to the operator as "running but
+    // broken" — destroy the partial child instead so the supervision
+    // loop retries on the next death tick.
+    let info = std::os::seraph::try_startup_info()?;
+    let root_cap = std::os::seraph::root_dir_cap();
+    if root_cap != 0
+    {
+        let Ok(ns_cap) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_SEND)
+        else
+        {
+            std::os::seraph::log!("restart: cap_copy of root for child failed");
+            destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+            return None;
+        };
+        let ns_msg = IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE)
+            .cap(ns_cap)
+            .build();
+        // SAFETY: ctx.ipc_buf is the registered IPC buffer.
+        let ns_reply = unsafe { ipc::ipc_call(process_handle, &ns_msg, ctx.ipc_buf) };
+        // The kernel transferred the cap on the IPC regardless of the
+        // reply label; release svcmgr's source slot unconditionally.
+        let _ = syscall::cap_delete(ns_cap);
+        match ns_reply
+        {
+            Ok(r) if r.label == 0 =>
+            {}
+            Ok(r) =>
+            {
+                std::os::seraph::log!("restart: CONFIGURE_NAMESPACE returned {:#x}", r.label);
+                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+                return None;
+            }
+            Err(_) =>
+            {
+                std::os::seraph::log!("restart: CONFIGURE_NAMESPACE syscall failed");
+                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+                return None;
+            }
+        }
+    }
+
+    Some((process_handle, thread_cap, child_token))
+}
+
+/// Tear down a partially-created child: send `DESTROY_PROCESS` over its
+/// tokened handle and release procmgr-side cap slots. Called when a step
+/// between procmgr's CREATE and START fails and the partial child must
+/// be reaped before the supervision loop retries.
+fn destroy_partial_child(process_handle: u32, thread_cap: u32, ipc_buf: *mut u64)
+{
+    let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) };
+    let _ = syscall::cap_delete(process_handle);
+    let _ = syscall::cap_delete(thread_cap);
 }
 
 /// Send `START_PROCESS` via the tokened process handle.

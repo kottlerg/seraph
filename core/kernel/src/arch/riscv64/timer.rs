@@ -37,10 +37,7 @@ const SBI_EXT_TIME: u64 = 0x5449_4D45;
 
 // ── Tick state ────────────────────────────────────────────────────────────────
 
-/// Monotonic tick counter; incremented by `handle_tick`.
-static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// APIC-equivalent: number of timer ticks per period (stored for querying).
+/// Number of timer ticks per period; returned by [`ticks_per_second`].
 static TICKS_PER_SEC: AtomicU64 = AtomicU64::new(0);
 
 /// Ticks per period (stored to rearm the timer on each interrupt).
@@ -161,18 +158,13 @@ pub unsafe fn init_ap(_period_us: u64) {}
 /// Handle a supervisor timer interrupt.
 ///
 /// Called from `trap_dispatch` on scause = 5 (supervisor timer interrupt).
-/// Increments the tick count, rearms the timer, then calls the scheduler tick
-/// which may preempt the current thread.
+/// Rearms the timer, then calls the scheduler tick which may preempt the
+/// current thread. The monotonic tick counter is derived from the `time`
+/// CSR (see [`current_tick`]) so that sleep deadlines stay phase-locked
+/// with userspace `Instant::now()` regardless of which hart delivers the
+/// next ISR.
 pub fn handle_tick()
 {
-    // Only hart 0 increments the global tick counter. All harts receive timer
-    // interrupts, but TICK_COUNT must advance at the single-hart interrupt rate
-    // so that sleep deadline math (ms * ticks_per_second / 1000) produces
-    // correct wall-clock durations.
-    if crate::arch::current::cpu::current_cpu() == 0
-    {
-        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
     let period = TIMER_PERIOD_TICKS.load(Ordering::Relaxed);
     // Rearm timer before calling schedule() so the next tick is not missed.
     #[cfg(not(test))]
@@ -185,10 +177,32 @@ pub fn handle_tick()
 }
 
 /// Return the current monotonic tick count.
+///
+/// Derived from the `time` CSR so that sleep deadlines and userspace
+/// `Instant::now()` (which reads `elapsed_us` via `SYS_SYSTEM_INFO`) share
+/// a single counter. Returns `0` if `init()` has not yet been called.
 #[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+#[cfg(not(test))]
 pub fn current_tick() -> u64
 {
-    TICK_COUNT.load(Ordering::Relaxed)
+    let Some(us) = elapsed_us()
+    else
+    {
+        return 0;
+    };
+    let tps = TICKS_PER_SEC.load(Ordering::Relaxed);
+    if tps == 0
+    {
+        return 0;
+    }
+    us.saturating_mul(tps) / 1_000_000
+}
+
+/// Test stub — host tests have no `time` CSR.
+#[cfg(test)]
+pub fn current_tick() -> u64
+{
+    0
 }
 
 /// Return the configured number of ticks per second.
@@ -247,15 +261,5 @@ mod tests
     {
         // ASCII "TIME" = 0x54494D45.
         assert_eq!(SBI_EXT_TIME, 0x5449_4D45);
-    }
-
-    #[test]
-    fn tick_count_starts_at_zero()
-    {
-        // The global is module-level; this just validates the initial value.
-        // (Real state is reset between test runs since tests run in isolation.)
-        let t = TICK_COUNT.load(Ordering::Relaxed);
-        // May be non-zero if tests share state, but must be reasonable.
-        let _ = t; // just ensure it compiles and is accessible
     }
 }

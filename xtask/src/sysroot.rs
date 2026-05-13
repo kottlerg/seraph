@@ -91,6 +91,47 @@ pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
         step(&format!("Rootfs: {}", dst.display()));
     }
 
+    synthesise_usertest_large_bin(ctx)?;
+
+    Ok(())
+}
+
+const USERTEST_LARGE_BIN_PAGES: usize = 4;
+const USERTEST_LARGE_BIN_PAGE_SIZE: usize = 4096;
+
+/// Emit `/usertest/large.bin`, a 16 KiB deterministic fixture consumed by
+/// `usertest`'s `fs_release_on_close_phase`. Each 4 KiB page is filled with
+/// the ASCII tag `PAGE_NN_` repeated, where `NN` is the page index. The
+/// phase asserts the first 8 bytes equal `PAGE_00_` to confirm content
+/// integrity across the FS_READ_FRAME / mem_map / release sequence.
+/// Gitignored under `rootfs/usertest/` and treated as a build artifact.
+fn synthesise_usertest_large_bin(ctx: &BuildContext) -> Result<()>
+{
+    let dst = ctx.sysroot.join("usertest/large.bin");
+    if dst.exists()
+    {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent()
+    {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let total = USERTEST_LARGE_BIN_PAGES * USERTEST_LARGE_BIN_PAGE_SIZE;
+    let mut buf = Vec::with_capacity(total);
+    for page in 0..USERTEST_LARGE_BIN_PAGES
+    {
+        let tag = format!("PAGE_{page:02}_");
+        let tag_bytes = tag.as_bytes();
+        let mut written = 0usize;
+        while written < USERTEST_LARGE_BIN_PAGE_SIZE
+        {
+            buf.extend_from_slice(tag_bytes);
+            written += tag_bytes.len();
+        }
+    }
+    buf.truncate(total);
+    fs::write(&dst, &buf).with_context(|| format!("writing {}", dst.display()))?;
+    step(&format!("Rootfs: {} (synthesised, 16 KiB)", dst.display()));
     Ok(())
 }
 

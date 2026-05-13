@@ -302,7 +302,7 @@ static mut SEED_FRAME: object::FrameObject = object::FrameObject {
     size: 0,
     available_bytes: core::sync::atomic::AtomicU64::new(0),
     owns_memory: core::sync::atomic::AtomicBool::new(true),
-    allocator: AtomicPtr::new(core::ptr::null_mut()),
+    allocator: crate::cap::retype::RetypeAllocator::new_inline(),
     lock: AtomicU32::new(0),
 };
 
@@ -989,7 +989,7 @@ fn populate_cspace(
                 // prefix is owned by the pinned SEED_FRAME and never returns
                 // to the buddy.
                 owns_memory: core::sync::atomic::AtomicBool::new(true),
-                allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                 lock: core::sync::atomic::AtomicU32::new(0),
             });
             let slot = insert_or_fatal(
@@ -1042,7 +1042,7 @@ fn populate_cspace(
             // Test stub: buddy not active; leaking on destruction is the
             // expected unit-test behaviour.
             owns_memory: core::sync::atomic::AtomicBool::new(false),
-            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
         let ptr = nonnull_from_box(obj);
@@ -1237,7 +1237,7 @@ fn populate_cspace(
             available_bytes: core::sync::atomic::AtomicU64::new(0),
             // Firmware-reserved memory; not buddy-backed.
             owns_memory: core::sync::atomic::AtomicBool::new(false),
-            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
         let slot = insert_or_fatal(
@@ -1281,7 +1281,7 @@ fn populate_cspace(
             // Firmware table: not retypable; cap minted without RETYPE.
             available_bytes: core::sync::atomic::AtomicU64::new(0),
             owns_memory: core::sync::atomic::AtomicBool::new(false),
-            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
         let slot = insert_or_fatal(
@@ -1324,7 +1324,7 @@ fn populate_cspace(
                 // Firmware table: not retypable; cap minted without RETYPE.
                 available_bytes: core::sync::atomic::AtomicU64::new(0),
                 owns_memory: core::sync::atomic::AtomicBool::new(false),
-                allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                 lock: core::sync::atomic::AtomicU32::new(0),
             });
             let slot = insert_or_fatal(
@@ -1527,7 +1527,7 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             // operation memmgr never destroys the cap (it ingests it into
             // its pool); this is a safety net.
             owns_memory: core::sync::atomic::AtomicBool::new(true),
-            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
         // Full rights so the cap can flow through the donation chain into
@@ -1593,6 +1593,10 @@ fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
 ///
 /// # Contract
 /// - **Caller must hold [`DERIVATION_LOCK`]`.write_lock()`** for the duration.
+/// - **Caller must hold both `src_cspace.lock` and `dst_cspace.lock`** (or
+///   the single lock when both pointers are equal). Acquire in pointer
+///   address order to prevent ABBA deadlock; the same order
+///   `transfer_caps` uses.
 /// - Source slot must be non-null.
 /// - `dst_cspace` must have at least one free slot (call `pre_allocate` first).
 ///

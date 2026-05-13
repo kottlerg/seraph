@@ -83,6 +83,19 @@ pub struct StartupInfo {
     /// attached; writes silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stderr_frame_cap: u32,
+    /// Tokened SEND cap on vfsd's namespace endpoint at the synthetic
+    /// system root. Installed by the spawner via
+    /// `procmgr_labels::CONFIGURE_NAMESPACE` between create and start.
+    /// Zero when no spawner-supplied cap was delivered (or vfsd is not
+    /// reachable). Reachable application-side via [`root_dir_cap`].
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub system_root_cap: u32,
+    /// Tokened SEND cap on a namespace endpoint addressing the initial
+    /// current working directory. Anchors relative-path resolution.
+    /// Zero means relative paths are unsupported until the process
+    /// installs one (e.g. via `std::env::set_current_dir`).
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub current_dir_cap: u32,
     /// Wakeup signal caps for the stdio pipes. See `process_abi::ProcessInfo`
     /// for full data-vs-space and writer-vs-reader semantics. Zero when
     /// the corresponding direction is not piped.
@@ -315,6 +328,8 @@ pub extern "C" fn _start() -> ! {
         stdin_frame_cap: info.stdin_frame_cap,
         stdout_frame_cap: info.stdout_frame_cap,
         stderr_frame_cap: info.stderr_frame_cap,
+        system_root_cap: info.system_root_cap,
+        current_dir_cap: info.current_dir_cap,
         stdin_data_signal_cap: info.stdin_data_signal_cap,
         stdin_space_signal_cap: info.stdin_space_signal_cap,
         stdout_data_signal_cap: info.stdout_data_signal_cap,
@@ -360,6 +375,15 @@ pub extern "C" fn _start() -> ! {
     // a tokened SEND cap on first call. Zero is tolerated (the macro
     // silently drops in processes without a logger).
     ::log::set_discovery_cap(info.log_discovery_cap);
+
+    // Stash the system-root namespace cap so `std::fs` (or any other
+    // namespace-walking surface) can reach it. Zero passes through
+    // unchanged — `root_dir_cap()` returning 0 means "no system root
+    // attached", and the reading side degrades.
+    set_root_dir_cap(info.system_root_cap);
+    // Same for the cwd cap. Zero means "no cwd attached"; relative
+    // paths through `std::fs` return `Unsupported` until set.
+    set_current_dir_cap(info.current_dir_cap);
 
     // Bootstrap the heap so `fn main()` can allocate from its first line
     // (lazy `LineWriter` behind `std::io::stdout`, `String::new`, any `Vec`
@@ -453,6 +477,112 @@ pub fn heap_is_initialized() -> bool {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn abort_thread() -> ! {
     pal_alloc::abort_thread()
+}
+
+// ── System root namespace cap ──────────────────────────────────────────────
+//
+// Tokened SEND on vfsd's namespace endpoint addressing the synthetic
+// system root (`NodeId::ROOT`). `_start` reads
+// `ProcessInfo.system_root_cap` and installs it here; namespace-walking
+// code (`std::fs::File::open` once converted, plus any cap-native
+// service code) reads it via [`root_dir_cap`]. Zero means "no system
+// root attached" — the reading side degrades.
+
+static ROOT_DIR_CAP: crate::sync::atomic::AtomicU32 =
+    crate::sync::atomic::AtomicU32::new(0);
+
+static CURRENT_DIR_CAP: crate::sync::atomic::AtomicU32 =
+    crate::sync::atomic::AtomicU32::new(0);
+
+/// Install the process-wide root-directory namespace cap. Called by
+/// `_start` from `ProcessInfo.system_root_cap`. Demoted to crate-internal
+/// visibility because the only legitimate writer is std's own startup
+/// path; tier-2 callers must obtain a namespace cap through the spawner
+/// (`procmgr_labels::CONFIGURE_NAMESPACE`), not by overwriting this slot.
+pub(crate) fn set_root_dir_cap(cap: u32) {
+    ROOT_DIR_CAP.store(cap, crate::sync::atomic::Ordering::Release);
+}
+
+/// Read the installed root-directory namespace cap, or zero if unset.
+/// Used by namespace-walking code to anchor `NS_LOOKUP` walks.
+#[must_use]
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn root_dir_cap() -> u32 {
+    ROOT_DIR_CAP.load(crate::sync::atomic::Ordering::Acquire)
+}
+
+/// Install the process-wide current-directory namespace cap. Called by
+/// `_start` from `ProcessInfo.current_dir_cap` and by
+/// `std::env::set_current_dir`; both writers are inside std. Tier-2
+/// callers update cwd via `std::env::set_current_dir` (which performs
+/// the namespace walk and stores the result here).
+pub(crate) fn set_current_dir_cap(cap: u32) {
+    CURRENT_DIR_CAP.store(cap, crate::sync::atomic::Ordering::Release);
+}
+
+/// Read the installed current-directory namespace cap, or zero if
+/// unset. Used by relative-path resolution in `std::fs`.
+#[must_use]
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn current_dir_cap() -> u32 {
+    CURRENT_DIR_CAP.load(crate::sync::atomic::Ordering::Acquire)
+}
+
+/// Walk `path` from `root_dir_cap()` and install the resolved
+/// directory cap as the process-wide current-directory cap.
+///
+/// The seraph-native cwd primitive: cwd is a held cap, not a string.
+/// The existing cap (if any) is `cap_delete`'d and replaced.
+///
+/// `std::env::set_current_dir` is `Unsupported` on seraph because the
+/// upstream API is path-as-string-only and cannot express the cap
+/// model directly; this function is the seraph-specific shape.
+///
+/// # Errors
+/// - `Unsupported` if `root_dir_cap()` is zero.
+/// - Errors from the namespace walk (`NotFound`, `PermissionDenied`,
+///   `NotADirectory`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn set_current_dir(path: &str) -> crate::io::Result<()> {
+    let root = root_dir_cap();
+    if root == 0 {
+        return Err(crate::io::Error::new(
+            crate::io::ErrorKind::Unsupported,
+            "seraph: set_current_dir called with no root_dir_cap configured",
+        ));
+    }
+    let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return Err(crate::io::Error::other(
+            "seraph: set_current_dir called before IPC buffer registered",
+        ));
+    }
+    let walked = crate::sys::fs::walk_path_to_dir(root, path, ipc_buf)?;
+    let prev = CURRENT_DIR_CAP.swap(walked.dir_cap, crate::sync::atomic::Ordering::AcqRel);
+    if prev != 0 {
+        let _ = syscall::cap_delete(prev);
+    }
+    Ok(())
+}
+
+/// Walk `path` from the supplied namespace cap via `NS_LOOKUP` and return
+/// the resolved file's tokened SEND cap and its size hint.
+///
+/// Each non-final path component must resolve to a directory; the final
+/// component must resolve to a file. The returned cap is freshly derived
+/// — caller takes ownership and must `cap_delete` when done. On any
+/// error no cap is returned.
+///
+/// Used by services that hold an attenuated namespace cap and need to
+/// resolve a binary path before issuing `procmgr_labels::CREATE_FROM_FILE`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn namespace_lookup_file(root_cap: u32, path: &str) -> crate::io::Result<(u32, u64)> {
+    let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return Err(crate::io::Error::other("seraph: IPC buffer not registered"));
+    }
+    let walked = crate::sys::fs::walk_path_to_file(root_cap, path, ipc_buf)?;
+    Ok((walked.file_cap, walked.size))
 }
 
 /// Return a Frame-cap slot suitable as the source for a `cap_create_*`
@@ -576,4 +706,57 @@ macro_rules! __seraph_stack_pages {
 
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub use crate::__seraph_stack_pages as stack_pages;
+
+// ── Per-spawn namespace caps (CommandExt) ───────────────────────────────────
+//
+// Sandboxed spawns: caller walks-and-attenuates a namespace cap into a
+// reduced-rights sub-cap, then attaches it to the `Command` so the child's
+// `ProcessInfo.system_root_cap` / `ProcessInfo.current_dir_cap` carries
+// the attenuated cap rather than the parent-inherit default. Wire shape
+// lives in `procmgr_labels::CONFIGURE_NAMESPACE`.
+
+/// Seraph-specific extensions to `std::process::Command`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod process {
+    use crate::process::Command;
+    use crate::sys::AsInnerMut;
+
+    /// Seraph-specific extensions to [`Command`].
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub trait CommandExt {
+        /// Override the namespace cap delivered to the child via
+        /// `ProcessInfo.system_root_cap`. Cap ownership transfers to the
+        /// `Command` and is consumed by the next `spawn` (procmgr's
+        /// `CONFIGURE_NAMESPACE` handler installs a copy into the child's
+        /// `CSpace` at start time, and the source slot is `cap_delete`'d
+        /// post-IPC). Without this call, the child inherits the spawner's
+        /// `root_dir_cap()` by `cap_copy`. Passing `0` reverts to the
+        /// parent-inherit default.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn namespace_cap(&mut self, cap: u32) -> &mut Self;
+
+        /// Override the cwd cap delivered to the child via
+        /// `ProcessInfo.current_dir_cap`. Same lifetime contract as
+        /// [`Self::namespace_cap`]. Without this call, the child's
+        /// cwd cap is computed in `spawn` from (in priority order):
+        /// the path stored by `Command::cwd`, or the spawner's own
+        /// `current_dir_cap()`, or zero. Passing `0` reverts to that
+        /// default chain.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn cwd_dir_cap(&mut self, cap: u32) -> &mut Self;
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl CommandExt for Command {
+        fn namespace_cap(&mut self, cap: u32) -> &mut Command {
+            self.as_inner_mut().set_namespace_cap(cap);
+            self
+        }
+
+        fn cwd_dir_cap(&mut self, cap: u32) -> &mut Command {
+            self.as_inner_mut().set_cwd_dir_cap(cap);
+            self
+        }
+    }
+}
 

@@ -62,6 +62,57 @@ mappings go through the page-reservation allocator above.
 
 ---
 
+## Namespace capabilities
+
+`std::os::seraph` exposes two process-global namespace caps that anchor
+`std::fs` path resolution:
+
+- **System root cap** (`root_dir_cap()`) — tokened SEND on vfsd's
+  namespace endpoint addressing the synthetic system root. Absolute
+  paths (leading `/`) start every per-component `NS_LOOKUP` walk
+  here.
+- **Current directory cap** (`current_dir_cap()`) — tokened SEND on
+  some namespace endpoint addressing a directory node. Relative paths
+  resolve from this cap.
+
+```rust
+let root: u32 = std::os::seraph::root_dir_cap();    // 0 if no root attached
+let cwd:  u32 = std::os::seraph::current_dir_cap(); // 0 if no cwd attached
+
+// Walk the root cap to a path and install the resolved directory cap
+// as the process's cwd. The walk fails iff the path is unreachable
+// through the root.
+std::os::seraph::set_current_dir("/srv")?;
+```
+
+`_start` reads `ProcessInfo.system_root_cap` and
+`ProcessInfo.current_dir_cap` and installs both before `fn main()`
+runs. Caps are zero unless the spawner delivered them via
+`procmgr_labels::CONFIGURE_NAMESPACE` (`caps[0]` = root, `caps[1]`
+= cwd). A process given zero root has no filesystem access — `std::fs`
+returns `Unsupported`. A process with a non-zero root but zero cwd
+can open absolute paths only; relative paths return `Unsupported`
+until `set_current_dir` installs a cwd cap.
+
+The setter is the seraph-native cwd primitive. The upstream
+`std::env::set_current_dir` / `current_dir` currently return
+`Unsupported` because seraph lacks a `pal/` entry that bridges to the
+cap-native machinery.
+
+`Command::spawn` defaults the child's root cap to a `cap_copy` of the
+spawner's `root_dir_cap()` (parent-inherit); explicit override via
+`std::os::seraph::process::CommandExt::namespace_cap` or
+`cwd_dir_cap`. `Command::cwd("/srv")` walks the spawner's root to the
+path and delivers the resulting cap as the child's initial
+`current_dir_cap`.
+
+The cap-as-namespace model that defines this surface lives in
+[`docs/namespace-model.md`](../../docs/namespace-model.md); the wire
+protocol is in
+[`shared/namespace-protocol/README.md`](../../shared/namespace-protocol/README.md).
+
+---
+
 ## Implementation order
 
 ruststd is implemented before `libc/`. Native Rust `std` support does not

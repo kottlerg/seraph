@@ -165,7 +165,15 @@ impl KernelObjectHeader
     /// caller is responsible for freeing the object at that point.
     pub fn dec_ref(&self) -> u32
     {
-        self.ref_count.fetch_sub(1, Ordering::Release) - 1
+        let prev = self.ref_count.fetch_sub(1, Ordering::Release);
+        debug_assert!(
+            prev != 0,
+            "dec_ref underflow: obj_type={:?} self={:p} ancestor={:p}",
+            self.obj_type,
+            self,
+            self.ancestor.load(Ordering::Relaxed),
+        );
+        prev - 1
     }
 }
 
@@ -204,19 +212,12 @@ pub struct FrameObject
     /// clears the absorbed tail's flag (so only the parent — which now
     /// covers the merged range — buddy-frees on its eventual dealloc).
     pub owns_memory: AtomicBool,
-    /// Lazy-initialised per-Frame-cap retype allocator. Null until the first
-    /// retype operation against this cap; `cap::retype::ensure_allocator`
-    /// installs an in-place allocator at offset 0 of the cap's own backing
-    /// region on first call. The metadata's byte cost is debited from
-    /// `available_bytes` like every other byte the cap consumes, so the
-    /// ledger remains honest. Storage is reclaimed when the buddy frees
-    /// the cap pages on `dealloc_object` (no separate teardown).
-    ///
-    /// Holds `1usize as *mut _` (the `INIT_IN_PROGRESS` sentinel from
-    /// `cap::retype`) transiently while the install is racing; observers
-    /// (`current_bump`, `ensure_allocator`'s spin path) treat it as
-    /// "no allocator yet."
-    pub allocator: AtomicPtr<crate::cap::retype::RetypeAllocator>,
+    /// Per-Frame-cap retype allocator. Stored inline in kernel-owned memory
+    /// so userspace `sys_mem_map` writes against the cap's region cannot
+    /// corrupt the metadata. Zero-initialised: `bump_offset = 0` and every
+    /// free-list head = `FREE_LIST_END` give the same "fresh cap, all
+    /// bytes available" state the lazy install used to produce.
+    pub allocator: crate::cap::retype::RetypeAllocator,
     /// Per-cap reader/writer lock guarding mutations of `size` (and the
     /// implicit `[base, base+size)` region they describe).
     ///

@@ -67,6 +67,7 @@ Overall project design documents live in [`docs/`](docs/):
 - [Process Lifecycle](docs/process-lifecycle.md) — userspace boot order, ProcessInfo/InitInfo handover, process-death flow
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
+- [Namespace Model](docs/namespace-model.md) — node capabilities, per-entry rights and visibility, walking, sandboxing as cap-distribution
 - [Boot Protocol ABI crate](abi/boot-protocol/) — kernel-entry contract: `BootInfo` layout, `BOOT_PROTOCOL_VERSION`, and compliant-bootloader requirements
 - [System Bootstrap](docs/bootstrap.md) — end-to-end boot lifecycle summary (bootloader steps, kernel phases, init bootstrap)
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr, driver binding, DMA safety

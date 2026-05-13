@@ -10,17 +10,17 @@
 //!   [`BootstrapState`] registry and delivers caps via
 //!   `bootstrap::reply_round`. Keeps vfsd's main thread's `reply_tcb`
 //!   intact while servicing nested bootstrap rounds.
-//! * [`active_loop`] — pulls [`CreateFromVfsOrder`]s off the shared queue and
-//!   drives the procmgr `CREATE_FROM_VFS` + `START_PROCESS` sequence from a
-//!   thread that is *not* main, so procmgr can re-enter vfsd's OPEN to load
-//!   the binary without the deadlock that would arise on main.
+//! * [`active_loop`] — pulls [`CreateFromFileOrder`]s off the shared queue
+//!   and drives the procmgr `CREATE_FROM_FILE` + `START_PROCESS` sequence
+//!   from a thread that is *not* main, so procmgr can re-enter vfsd's OPEN
+//!   to load the binary without the deadlock that would arise on main.
 
 use std::sync::{Mutex, PoisonError};
 
 use ipc::{IpcMessage, bootstrap, bootstrap_errors, procmgr_labels};
 
 use crate::worker_pool::{
-    ActiveJob, ActiveState, BootstrapState, Channel, CreateFromVfsOrder, PendingBootstrap,
+    ActiveJob, ActiveState, BootstrapState, Channel, CreateFromFileOrder, PendingBootstrap,
     submit_bootstrap,
 };
 
@@ -80,8 +80,8 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
     }
 }
 
-/// Active worker entry. Pulls [`CreateFromVfsOrder`]s off the shared queue
-/// and drives the procmgr-facing IPC sequence per order.
+/// Active worker entry. Pulls [`CreateFromFileOrder`]s off the shared
+/// queue and drives the procmgr-facing IPC sequence per order.
 pub fn active_loop(active: &ActiveState, bootstrap_state: &Mutex<BootstrapState>) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -94,7 +94,7 @@ pub fn active_loop(active: &ActiveState, bootstrap_state: &Mutex<BootstrapState>
     loop
     {
         let job = take_next_active_job(active);
-        let ok = handle_create_from_vfs(job.order, bootstrap_state, ipc_buf);
+        let ok = handle_create_from_file(job.order, bootstrap_state, ipc_buf);
         signal_channel(&job.completion, ok);
     }
 }
@@ -119,17 +119,18 @@ fn take_next_active_job(active: &ActiveState) -> ActiveJob
     }
 }
 
-/// Drive `CREATE_FROM_VFS` + `START_PROCESS` for one child, then wait for the
+/// Drive `CREATE_FROM_FILE` + `START_PROCESS` for one child, then wait for the
 /// bootstrap delivery the bootstrap worker performs in parallel.
-fn handle_create_from_vfs(
-    order: CreateFromVfsOrder,
+fn handle_create_from_file(
+    order: CreateFromFileOrder,
     bootstrap_state: &Mutex<BootstrapState>,
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let CreateFromVfsOrder {
+    let CreateFromFileOrder {
         procmgr_ep,
-        module_path,
+        file_cap,
+        file_size,
         tokened_creator,
         bootstrap,
     } = order;
@@ -138,28 +139,29 @@ fn handle_create_from_vfs(
     else
     {
         // No room in the bootstrap registry — drop the caps we own.
+        let _ = syscall::cap_delete(file_cap);
         let _ = syscall::cap_delete(tokened_creator);
         return false;
     };
 
-    let path_len = module_path.len() as u64;
-    let create_label = procmgr_labels::CREATE_FROM_VFS | (path_len << 16);
-    let create_msg = IpcMessage::builder(create_label)
-        .bytes(0, module_path)
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+        .word(0, file_size)
+        .cap(file_cap)
         .cap(tokened_creator)
         .build();
 
     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+    // file_cap and tokened_creator ownership transfer via the IPC.
     let Ok(create_reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        std::os::seraph::log!("active worker: CREATE_FROM_VFS ipc_call failed");
+        std::os::seraph::log!("active worker: CREATE_FROM_FILE ipc_call failed");
         return false;
     };
     if create_reply.label != 0
     {
         std::os::seraph::log!(
-            "active worker: CREATE_FROM_VFS failed (code={})",
+            "active worker: CREATE_FROM_FILE failed (code={})",
             create_reply.label
         );
         return false;
@@ -168,7 +170,7 @@ fn handle_create_from_vfs(
     let Some(&process_handle) = create_reply.caps().first()
     else
     {
-        std::os::seraph::log!("active worker: CREATE_FROM_VFS reply missing process handle");
+        std::os::seraph::log!("active worker: CREATE_FROM_FILE reply missing process handle");
         return false;
     };
 

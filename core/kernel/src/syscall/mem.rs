@@ -621,7 +621,7 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // buddy-frees its own (now disjoint) range; together they cover the
         // original allocation.
         owns_memory: core::sync::atomic::AtomicBool::new(parent_owns),
-        allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        allocator: crate::cap::retype::RetypeAllocator::new_inline(),
         lock: core::sync::atomic::AtomicU32::new(0),
     })
     .inspect_err(|_| {
@@ -629,9 +629,17 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         DERIVATION_LOCK.write_unlock();
     })?;
 
-    // SAFETY: caller_cspace validated non-null.
-    let cs = unsafe { &mut *caller_cspace };
-    let Ok(tail_slot_nz) = cs.insert_cap(CapTag::Frame, parent_rights, tail_ptr)
+    // Insert under cspace.lock to keep the freelist/tag invariant against a
+    // concurrent SYS_CAP_CREATE_* on the same cspace. Lock order: parent
+    // FrameObject lock → DERIVATION_LOCK → cspace.lock.
+    // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
+    let insert_res = unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        let r = (*caller_cspace).insert_cap(CapTag::Frame, parent_rights, tail_ptr);
+        (*caller_cspace).lock.unlock_raw(saved);
+        r
+    };
+    let Ok(tail_slot_nz) = insert_res
     else
     {
         // SAFETY: tail_ptr just allocated; refcount is 1 with no other holders.
@@ -814,9 +822,7 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let tail_avail = tail_ref
         .available_bytes
         .load(core::sync::atomic::Ordering::Acquire);
-    let tail_alloc = tail_ref
-        .allocator
-        .load(core::sync::atomic::Ordering::Acquire);
+    let tail_bump = crate::cap::retype::current_bump(tail_ref);
 
     // Physical contiguity.
     if parent_base.checked_add(parent_size) != Some(tail_base)
@@ -830,9 +836,9 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         release_locks();
         return Err(SyscallError::InvalidArgument);
     }
-    // Tail must be virgin: no retype allocator installed, and
+    // Tail must be virgin: no retype allocations performed, and
     // available_bytes matches the rights state.
-    if !tail_alloc.is_null()
+    if tail_bump != 0
     {
         release_locks();
         return Err(SyscallError::InvalidArgument);
@@ -926,8 +932,15 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         .owns_memory
         .store(false, core::sync::atomic::Ordering::Release);
 
+    // Free the tail slot under cspace.lock so the freelist mutation cannot
+    // tear against a concurrent SYS_CAP_CREATE_* on the same cspace. Lock
+    // order: tail/parent locks → DERIVATION_LOCK → cspace.lock.
     // SAFETY: caller_cspace validated; tail_idx within CSpace bounds.
-    unsafe { (*caller_cspace).free_slot(tail_idx) };
+    unsafe {
+        let saved = (*caller_cspace).lock.lock_raw();
+        (*caller_cspace).free_slot(tail_idx);
+        (*caller_cspace).lock.unlock_raw(saved);
+    }
 
     // Drop both write locks before dec_ref'ing the tail (dec_ref can take
     // dealloc_object, which may itself acquire other locks).

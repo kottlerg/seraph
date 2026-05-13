@@ -380,7 +380,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     // Init ELF segments are bootloader-loaded pages outside
                     // the buddy pool; never return them.
                     owns_memory: core::sync::atomic::AtomicBool::new(false),
-                    allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                    allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
                 let slot = cs
@@ -617,6 +617,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                         death_observers: [sched::thread::DeathObserver::empty();
                             sched::thread::MAX_DEATH_OBSERVERS],
                         death_observer_count: 0,
+                        exit_reason: 0,
                         sleep_deadline: 0,
                         magic: sched::thread::TCB_MAGIC,
                     },

@@ -205,9 +205,17 @@ unsafe fn transfer_caps(
         }
     }
 
-    // Pre-allocate destination slots to avoid OOM mid-transfer.
-    // SAFETY: dst_cspace validated by caller.
-    unsafe { (*dst_cspace).pre_allocate(cap_count) }.map_err(|_| SyscallError::OutOfMemory)?;
+    // Pre-allocate destination slots to avoid OOM mid-transfer. Take
+    // cspace.lock so the freelist mutation cannot tear against a concurrent
+    // SYS_CAP_CREATE_* on the same cspace.
+    // SAFETY: dst_cspace validated by caller; lock_raw/unlock_raw paired.
+    unsafe {
+        let saved = (*dst_cspace).lock.lock_raw();
+        let r = (*dst_cspace).pre_allocate(cap_count);
+        (*dst_cspace).lock.unlock_raw(saved);
+        r
+    }
+    .map_err(|_| SyscallError::OutOfMemory)?;
 
     // Acquire derivation lock for the batch move.
     crate::cap::DERIVATION_LOCK.write_lock();
@@ -485,9 +493,14 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // immediate-delivery cap transfer cannot OOM, and the resumed-recv path
     // gets the same guarantee modulo the existing race window covered by
     // `transfer_caps`'s inner pre_allocate.
-    // SAFETY: cspace_ptr validated above.
-    unsafe { (*cspace_ptr).pre_allocate(MSG_CAP_SLOTS_MAX) }
-        .map_err(|_| SyscallError::OutOfMemory)?;
+    // SAFETY: cspace_ptr validated above; lock_raw/unlock_raw paired.
+    unsafe {
+        let saved = (*cspace_ptr).lock.lock_raw();
+        let r = (*cspace_ptr).pre_allocate(MSG_CAP_SLOTS_MAX);
+        (*cspace_ptr).lock.unlock_raw(saved);
+        r
+    }
+    .map_err(|_| SyscallError::OutOfMemory)?;
 
     // SAFETY: ep_state extracted from validated Endpoint object; scheduler lock not held.
     let result = unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb) };
@@ -734,8 +747,14 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: caller_peek is a valid TCB; cspace is set at TCB creation
         // and never reassigned.
         let caller_cspace = unsafe { (*caller_peek).cspace };
-        // SAFETY: caller_cspace extracted from valid TCB.
-        if unsafe { (*caller_cspace).pre_allocate(cap_count) }.is_err()
+        // SAFETY: caller_cspace extracted from valid TCB; lock_raw/unlock_raw paired.
+        let pre_res = unsafe {
+            let saved = (*caller_cspace).lock.lock_raw();
+            let r = (*caller_cspace).pre_allocate(cap_count);
+            (*caller_cspace).lock.unlock_raw(saved);
+            r
+        };
+        if pre_res.is_err()
         {
             // Caller's CSpace cannot accept reply caps. Wake the caller with
             // a synthetic failure reply so it un-parks and surfaces the error
@@ -1088,17 +1107,50 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // eq.waiter = tcb). Branch on the timeout sentinel.
     if timeout_ms == u64::MAX
     {
-        // Non-blocking try-once: roll back the park and return WouldBlock.
-        // SAFETY: tcb parked above; eq_state still valid. The parker was
-        // just written as the sole waiter; no concurrent post can race
-        // with this rollback against this eq.
+        // Non-blocking try-once: detect interception by a concurrent post
+        // before rolling back. `event_queue_recv` released eq.lock between
+        // setting eq.waiter=tcb and returning Err; in that window
+        // `event_queue_post` on another CPU may have observed eq.waiter,
+        // delivered the payload via tcb.wakeup_value, cleared eq.waiter,
+        // and called enqueue_and_wake. Rolling back unconditionally would
+        // discard that delivered payload. Re-acquire eq.lock and check
+        // whether eq.waiter still points at tcb: if yes, the rollback is
+        // safe; if no, the post intercepted and tcb.wakeup_value carries
+        // the payload.
+        // SAFETY: eq_state validated above; lock_raw paired with unlock_raw.
+        let saved = unsafe { (*eq_state).lock.lock_raw() };
+        // SAFETY: eq_state valid; lock held — waiter field is stable.
+        let still_waiter = unsafe { (*eq_state).waiter } == tcb;
+        if still_waiter
+        {
+            // SAFETY: tcb valid; eq.lock held excludes event_queue_post wake.
+            unsafe {
+                (*eq_state).waiter = core::ptr::null_mut();
+                (*tcb).state = crate::sched::thread::ThreadState::Ready;
+                (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
+                (*tcb).blocked_on_object = core::ptr::null_mut();
+            }
+            // SAFETY: paired with lock_raw above.
+            unsafe { (*eq_state).lock.unlock_raw(saved) };
+            return Err(SyscallError::WouldBlock);
+        }
+        // SAFETY: paired with lock_raw above.
+        unsafe { (*eq_state).lock.unlock_raw(saved) };
+        // Post intercepted: it ran `event_queue_post`'s waiter-delivery
+        // path, wrote tcb.wakeup_value, cleared eq.waiter, and woke us via
+        // enqueue_and_wake. tcb.state is already Ready; clear residual
+        // ipc_state and deliver the payload as if the queue had been
+        // non-empty on entry.
+        // SAFETY: tcb still valid; wakeup_value written by post.
+        let payload = unsafe { (*tcb).wakeup_value };
+        // SAFETY: tcb still valid; clear post-delivery scratch fields.
         unsafe {
-            (*eq_state).waiter = core::ptr::null_mut();
-            (*tcb).state = crate::sched::thread::ThreadState::Ready;
+            (*tcb).wakeup_value = 0;
             (*tcb).ipc_state = crate::sched::thread::IpcThreadState::None;
             (*tcb).blocked_on_object = core::ptr::null_mut();
         }
-        return Err(SyscallError::WouldBlock);
+        tf.set_ipc_return(0, payload);
+        return Ok(0);
     }
 
     // Bounded wait: arm the sleep-list timer. Same waiter-recheck rule as

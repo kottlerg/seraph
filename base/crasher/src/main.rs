@@ -12,10 +12,11 @@
 //! available from `std::os::seraph::startup_info()` without a bootstrap round.
 //!
 //! Logs its bootstrap state, exercises the bundle cap with a harmless
-//! `QUERY_ENDPOINT` probe, sleeps for 5 seconds, then triggers a fault.
-//! The 5 s window lets other tests (usertest threading/mutex)
-//! complete cleanly before the kernel's fault report interleaves with
-//! their log output.
+//! `QUERY_ENDPOINT` probe, sleeps briefly, then triggers a fault. The
+//! sleep gives other tests (usertest threading/mutex) room to complete
+//! before the kernel's fault report interleaves with their log output;
+//! 2 s is well past current init=init steady-state on both arches and
+//! short enough to clear the 3 s softlockup-watchdog idle window.
 //!
 //! Also validates svcmgr's restart path: if cap re-injection regresses,
 //! the post-restart bootstrap reports `cap_count < 1` and the
@@ -46,7 +47,7 @@ fn main()
         probe_svcmgr(svcmgr_cap, info.ipc_buffer);
     }
 
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(2));
 
     std::os::seraph::log!("triggering fault");
 

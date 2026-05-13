@@ -17,8 +17,10 @@
 //! The PIT output is readable on port 0x61 (bit 5: channel 2 output).
 //!
 //! # Timer ISR
-//! The ISR increments `TICK_COUNT` and sends EOI. It is called from the naked
-//! stub `idt::isr_timer`.
+//! The ISR sends EOI and invokes the scheduler tick for preemption. The
+//! monotonic tick counter is derived from the TSC (see [`current_tick`]) so
+//! that sleep deadlines stay phase-locked with userspace `Instant::now()`
+//! across host preemption windows.
 //!
 //! # Modification notes
 //! - To change the tick period: pass a different `period_us` to `init()`.
@@ -70,15 +72,12 @@ const PIT_HZ: u64 = 1_193_182;
 
 // ── Tick state ────────────────────────────────────────────────────────────────
 
-/// Monotonically increasing tick counter; incremented by the timer ISR.
-static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
-
 /// Raw APIC hardware ticks per second (computed during calibration).
 /// Used for initial-count computation; NOT the interrupt rate.
 static APIC_TICKS_PER_SEC: AtomicU64 = AtomicU64::new(0);
 
-/// Timer interrupt rate (interrupts per second) matching `TICK_COUNT`.
-/// Set to `1_000_000 / period_us` during init.
+/// Timer interrupt rate (interrupts per second) returned by
+/// [`ticks_per_second`]. Set to `1_000_000 / period_us` during init.
 static INTERRUPT_RATE: AtomicU64 = AtomicU64::new(0);
 
 // ── High-resolution time state ────────────────────────────────────────────────
@@ -365,20 +364,11 @@ pub fn delay_us(_us: u64) {}
 
 /// Timer ISR body — called from the naked stub in `idt.rs`.
 ///
-/// Increments the tick counter, sends EOI to the local APIC, then calls
-/// the scheduler tick which may preempt the current thread.
-/// Must not allocate or block.
+/// Sends EOI to the local APIC, then calls the scheduler tick which may
+/// preempt the current thread. Must not allocate or block.
 #[cfg(not(test))]
 pub extern "C" fn timer_isr()
 {
-    // Only the BSP increments the global tick counter. All CPUs fire this ISR
-    // via their local APIC timers, but TICK_COUNT must advance at the single-CPU
-    // interrupt rate so that sleep deadline math (ms * ticks_per_second / 1000)
-    // produces correct wall-clock durations.
-    if crate::arch::current::cpu::current_cpu() == 0
-    {
-        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
     // EOI must be sent before calling schedule() to avoid masking the APIC.
     interrupts::acknowledge(TIMER_VECTOR as u32);
     // SAFETY: called from interrupt handler on a valid kernel stack.
@@ -388,10 +378,24 @@ pub extern "C" fn timer_isr()
 }
 
 /// Return the current monotonic tick count.
+///
+/// Derived from the TSC so that sleep deadlines and userspace
+/// `Instant::now()` (which reads `elapsed_us` via `SYS_SYSTEM_INFO`) share
+/// a single counter.
 #[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
 pub fn current_tick() -> u64
 {
-    TICK_COUNT.load(Ordering::Relaxed)
+    let Some(us) = elapsed_us()
+    else
+    {
+        return 0;
+    };
+    let tps = INTERRUPT_RATE.load(Ordering::Relaxed);
+    if tps == 0
+    {
+        return 0;
+    }
+    us.saturating_mul(tps) / 1_000_000
 }
 
 /// Return the timer interrupt rate (interrupts per second, matching `current_tick()`).

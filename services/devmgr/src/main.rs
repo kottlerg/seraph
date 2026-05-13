@@ -161,9 +161,28 @@ fn main() -> !
         {
             ipc::devmgr_labels::QUERY_BLOCK_DEVICE =>
             {
-                if blk_driver_spawned && blk_ep != 0
+                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
                 {
-                    if let Ok(derived) = syscall::cap_derive(blk_ep, syscall::RIGHTS_SEND_GRANT)
+                    std::os::seraph::log!(
+                        "QUERY_BLOCK_DEVICE rejected: token lacks REGISTRY_QUERY_AUTHORITY"
+                    );
+                    let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if blk_driver_spawned && blk_ep != 0
+                {
+                    // Mint a tokened SEND_GRANT cap with the
+                    // MOUNT_AUTHORITY verb bit. The bit gates
+                    // REGISTER_PARTITION and whole-disk reads at
+                    // virtio-blk; consumers without it can only use
+                    // partition-tokened caps the driver issues in
+                    // response to a REGISTER_PARTITION call.
+                    if let Ok(derived) = syscall::cap_derive_token(
+                        blk_ep,
+                        syscall::RIGHTS_SEND_GRANT,
+                        ipc::blk_labels::MOUNT_AUTHORITY,
+                    )
                     {
                         let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
                             .cap(derived)

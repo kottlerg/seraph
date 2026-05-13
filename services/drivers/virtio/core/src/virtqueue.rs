@@ -259,9 +259,6 @@ impl SplitVirtqueue
 
     pub fn poll_used(&mut self) -> Option<(u16, u32)>
     {
-        // Memory barrier: ensure we read the latest used index.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-
         // SAFETY: used_va is valid.
         let used_idx =
             unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*self.used_va).idx)) };
@@ -270,6 +267,13 @@ impl SplitVirtqueue
         {
             return None;
         }
+
+        // VirtIO 1.2 §2.7.13.2: device publishes data buffer, status, ring
+        // elem, then used.idx with release ordering. The acquire fence here
+        // gives the used.idx load above acquire semantics so subsequent
+        // loads of the elem and the caller-visible data/status cannot hoist
+        // above it on RVWMO.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
         // SAFETY: used_va is valid; ring entry is within bounds.
         let elem = unsafe {

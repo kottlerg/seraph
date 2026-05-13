@@ -94,8 +94,9 @@ use init_protocol::{CapDescriptor, CapType, INIT_INFO_MAX_PAGES, INIT_PROTOCOL_V
 mod arch;
 mod bootstrap;
 pub(crate) mod logging;
+mod mount;
 mod service;
-mod vfs;
+pub(crate) mod walk;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 //
@@ -705,6 +706,32 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
+    // Derive tokened call caps with the per-verb authority bits set.
+    // INGEST_CONFIG_MOUNTS and GET_SYSTEM_ROOT_CAP gate on these at
+    // vfsd's service-loop dispatcher; un-tokened sends are rejected
+    // with `UNAUTHORIZED`. MOUNT (un-gated) keeps using the root
+    // un-tokened cap.
+    let Ok(vfsd_ingest_cap) = syscall::cap_derive_token(
+        vfsd_service_ep,
+        syscall::RIGHTS_SEND,
+        ipc::vfsd_labels::INGEST_AUTHORITY,
+    )
+    else
+    {
+        logging::log("FATAL: cannot derive INGEST_AUTHORITY cap on vfsd service ep");
+        syscall::thread_exit();
+    };
+    let Ok(vfsd_seed_cap) = syscall::cap_derive_token(
+        vfsd_service_ep,
+        syscall::RIGHTS_SEND,
+        ipc::vfsd_labels::SEED_AUTHORITY,
+    )
+    else
+    {
+        logging::log("FATAL: cannot derive SEED_AUTHORITY cap on vfsd service ep");
+        syscall::thread_exit();
+    };
+
     // ── Request procmgr to create early services ──────────────────────────────
 
     if info.module_frame_count >= 2
@@ -755,67 +782,53 @@ fn run(info_ptr: u64) -> !
     logging::log("phase 2: parsing cmdline");
 
     let mut root_uuid = [0u8; 16];
-    if !vfs::parse_root_uuid(cmdline, &mut root_uuid)
+    if !mount::parse_root_uuid(cmdline, &mut root_uuid)
     {
         logging::log("FATAL: no root=UUID= in cmdline");
         syscall::thread_exit();
     }
 
     logging::log("phase 2: mounting root filesystem");
-    if !vfs::send_mount(vfsd_service_ep, ipc_buf, &root_uuid, b"/")
+    let root_mount = mount::send_mount(vfsd_service_ep, ipc_buf, &root_uuid, b"/");
+    if !root_mount.success
     {
         logging::log("FATAL: root mount failed");
         syscall::thread_exit();
     }
     logging::log("phase 2: root mounted at /");
 
-    // Make /bin/fatfs reachable for procmgr's CREATE_FROM_VFS so additional
-    // mounts (mounts.conf, plus any later post-bootstrap fatfs respawns by
-    // vfsd) load through the just-mounted root filesystem instead of the
-    // boot-module path.
-    service::send_vfsd_endpoint_to_procmgr(endpoint_cap, vfsd_service_ep, ipc_buf);
-
-    logging::log("phase 2: reading /config/mounts.conf");
-    let mut conf_buf = [0u8; 512];
-    let conf_len = vfs::vfs_read_file(
-        vfsd_service_ep,
-        ipc_buf,
-        b"/config/mounts.conf",
-        &mut conf_buf,
-    );
-
-    if conf_len > 0
+    logging::log("phase 2: ingesting /config/mounts.conf via vfsd");
+    match mount::ingest_config_mounts(vfsd_ingest_cap, ipc_buf)
     {
-        logging::log("phase 2: processing mounts.conf");
-        vfs::process_mounts_conf(&conf_buf[..conf_len], vfsd_service_ep, ipc_buf);
-    }
-    else
-    {
-        logging::log("phase 2: no mounts.conf or empty");
+        mount::IngestOutcome::Success =>
+        {}
+        mount::IngestOutcome::Partial(n) =>
+        {
+            let mut buf = [0u8; 96];
+            let mut w = SliceWriter::new(&mut buf);
+            let _ = core::fmt::write(
+                &mut w,
+                format_args!("phase 2: INGEST_CONFIG_MOUNTS partial: {n} mount line(s) failed"),
+            );
+            // SAFETY: SliceWriter only writes UTF-8 bytes from `core::fmt::write`.
+            let s = unsafe { core::str::from_utf8_unchecked(w.as_slice()) };
+            logging::log(s);
+        }
+        mount::IngestOutcome::Fail =>
+        {
+            logging::log("phase 2: INGEST_CONFIG_MOUNTS failed");
+        }
     }
 
-    logging::log("phase 2: verifying /esp/EFI/seraph/boot.conf");
-    let mut verify_buf = [0u8; 512];
-    let verify_len = vfs::vfs_read_file(
-        vfsd_service_ep,
-        ipc_buf,
-        b"/esp/EFI/seraph/boot.conf",
-        &mut verify_buf,
-    );
-    if verify_len > 0
+    // Acquire init's seed system-root cap. Drives every Phase 3
+    // walk-and-spawn — children receive a `cap_copy` of this cap via
+    // `procmgr_labels::CONFIGURE_NAMESPACE`. The `SEED_AUTHORITY`
+    // tokened cap is required by vfsd's `GET_SYSTEM_ROOT_CAP` gate.
+    let system_root_cap = mount::request_system_root(vfsd_seed_cap, ipc_buf);
+    if system_root_cap == 0
     {
-        let first_nl = verify_buf[..verify_len]
-            .iter()
-            .position(|&b| b == b'\n')
-            .unwrap_or(verify_len);
-        let line = &verify_buf[..first_nl.min(80)];
-        // SAFETY: boot.conf is ASCII text.
-        let s = unsafe { core::str::from_utf8_unchecked(line) };
-        logging::log(s);
-    }
-    else
-    {
-        logging::log("phase 2: boot.conf read FAILED");
+        logging::log("FATAL: GET_SYSTEM_ROOT_CAP from vfsd failed");
+        syscall::thread_exit();
     }
 
     log_reclaim_total(memmgr_service_ep, ipc_buf, "phase 2");
@@ -825,7 +838,14 @@ fn run(info_ptr: u64) -> !
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
 
     let _ = vfsd_service_ep;
-    service::phase3_svcmgr_handover(info, endpoint_cap, init_bootstrap_ep, ipc_buf);
+    service::phase3_svcmgr_handover(
+        info,
+        endpoint_cap,
+        init_bootstrap_ep,
+        system_root_cap,
+        root_mount.root_cap,
+        ipc_buf,
+    );
 }
 
 /// Idle loop fallback when Phase 3 cannot proceed.

@@ -13,11 +13,12 @@
 //!   the cap chain `init → vfsd → procmgr` is unavoidable for the root
 //!   mount. After the root MOUNT succeeds, `/bin/fatfs` is reachable through
 //!   the just-mounted root filesystem and the boot module is dropped.
-//! * **VFS path** (every subsequent mount): vfsd asks procmgr to load
-//!   `/bin/fatfs` from the now-mounted root filesystem via
-//!   `procmgr_labels::CREATE_FROM_VFS`. procmgr re-enters vfsd's OPEN to
-//!   read the binary, which would deadlock if the call were made from
-//!   vfsd's main thread; the active worker pool absorbs this round.
+//! * **VFS path** (every subsequent mount): vfsd walks its own held
+//!   system-root cap to `/bin/fatfs` and asks procmgr to load that
+//!   resolved file cap via `procmgr_labels::CREATE_FROM_FILE`.
+//!   Procmgr issues `FS_READ` against the file cap, which lands on a
+//!   vfs node; the active worker pool absorbs this round so vfsd's
+//!   main reply path is not blocked while procmgr re-enters.
 //!
 //! Both paths route the per-child cap delivery through the bootstrap worker
 //! so the main thread's `reply_tcb` is never clobbered while servicing the
@@ -34,19 +35,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ipc::{IpcMessage, fs_labels, procmgr_labels};
 
 use crate::VfsdCaps;
-use crate::worker_pool::{BootstrapOrder, CreateFromVfsOrder, WorkOrder, WorkerPool};
+use crate::worker_pool::{BootstrapOrder, CreateFromFileOrder, WorkOrder, WorkerPool};
 
 /// Monotonic counter for fatfs-child bootstrap tokens.
 static NEXT_BOOTSTRAP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Spawn a fatfs driver instance for a partition and return its `SEND_GRANT`
 /// service endpoint. `module_cap` is non-zero only for the root mount; pass
-/// zero to use `CREATE_FROM_VFS("/bin/fatfs")` instead.
+/// zero to use the post-boot path that resolves `/bin/fatfs` via vfsd's
+/// own held namespace cap (`system_root_cap`) and submits
+/// `CREATE_FROM_FILE` to procmgr.
 pub fn spawn_fatfs_driver(
     caps: &VfsdCaps,
     pool: &WorkerPool,
     partition_ep: u32,
     module_cap: u32,
+    system_root_cap: u32,
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
@@ -56,8 +60,10 @@ pub fn spawn_fatfs_driver(
         return None;
     }
 
-    // Create fatfs's service endpoint. fatfs receives service calls on this;
-    // vfsd holds a SEND_GRANT copy for forwarding FS_OPEN.
+    // Create fatfs's service endpoint. fatfs receives service calls on
+    // this; vfsd holds a SEND_GRANT copy for the FS_MOUNT BPB-validation
+    // probe and for `cap_derive_token`-ing the synthetic-root and
+    // caller-root caps in `do_mount`.
     let slab = std::os::seraph::object_slab_acquire(88)?;
     let driver_ep = syscall::cap_create_endpoint(slab).ok()?;
     let driver_ep_for_child = syscall::cap_derive(driver_ep, syscall::RIGHTS_ALL).ok()?;
@@ -82,7 +88,7 @@ pub fn spawn_fatfs_driver(
     }
     else
     {
-        spawn_via_vfs(caps, pool, bootstrap, tokened_creator)
+        spawn_via_vfs(caps, pool, bootstrap, tokened_creator, system_root_cap)
     };
 
     if !spawn_ok
@@ -177,32 +183,50 @@ fn spawn_via_module(
     true
 }
 
-/// VFS spawn path: hand the order to an active worker that issues
-/// `CREATE_FROM_VFS` and `START_PROCESS` from outside main. The worker
-/// registers the bootstrap order before the call so the bootstrap worker is
-/// ready when the child REQUESTs.
+/// Post-boot spawn path: resolve `/bin/fatfs` via vfsd's held namespace
+/// cap, then hand the resulting file cap plus size hint to an active
+/// worker that issues `CREATE_FROM_FILE` and `START_PROCESS` from
+/// outside main. The walk runs on the calling thread (cross-thread to
+/// vfsd's own namespace dispatcher, so safe); the worker absorbs the
+/// procmgr round so a re-entry into vfsd's OPEN does not deadlock the
+/// caller's MOUNT reply path.
 fn spawn_via_vfs(
     caps: &VfsdCaps,
     pool: &WorkerPool,
     bootstrap: BootstrapOrder,
     tokened_creator: u32,
+    system_root_cap: u32,
 ) -> bool
 {
-    let Some(handle) = pool.submit(WorkOrder::CreateFromVfs(CreateFromVfsOrder {
+    let (file_cap, file_size) =
+        match std::os::seraph::namespace_lookup_file(system_root_cap, "/bin/fatfs")
+        {
+            Ok(p) => p,
+            Err(e) =>
+            {
+                std::os::seraph::log!("fatfs spawn: NS_LOOKUP /bin/fatfs failed: {e}");
+                let _ = syscall::cap_delete(tokened_creator);
+                return false;
+            }
+        };
+
+    let Some(handle) = pool.submit(WorkOrder::CreateFromFile(CreateFromFileOrder {
         procmgr_ep: caps.procmgr_ep,
-        module_path: b"/bin/fatfs",
+        file_cap,
+        file_size,
         tokened_creator,
         bootstrap,
     }))
     else
     {
+        let _ = syscall::cap_delete(file_cap);
         let _ = syscall::cap_delete(tokened_creator);
         return false;
     };
 
     if !handle.wait()
     {
-        std::os::seraph::log!("fatfs VFS spawn failed");
+        std::os::seraph::log!("fatfs spawn failed");
         return false;
     }
 

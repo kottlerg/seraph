@@ -170,7 +170,6 @@ pub fn submit_and_wait(
         // makes the driver tolerant of those lost IRQs.
         for _ in 0..100_000u32
         {
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             if vq.poll_used().is_some()
             {
                 let _ = transport.read_isr();
@@ -187,8 +186,6 @@ pub fn submit_and_wait(
         // unmasking at the controller, preventing immediate re-delivery.
         let _ = transport.read_isr();
         let _ = syscall::irq_ack(irq_cap);
-
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
         if vq.poll_used().is_some()
         {

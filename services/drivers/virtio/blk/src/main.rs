@@ -115,6 +115,20 @@ impl PartitionTable
             None => Err(()),
         }
     }
+
+    /// Remove the entry matching `token`, if any. Used to roll back an
+    /// insert when downstream cap derivation fails.
+    fn remove(&mut self, token: u64)
+    {
+        for entry in &mut self.entries
+        {
+            if matches!(entry, Some(b) if b.token == token)
+            {
+                *entry = None;
+                return;
+            }
+        }
+    }
 }
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
@@ -420,8 +434,19 @@ pub struct BlkRuntime<'a>
     pub queue_notify_off: u16,
     pub irq_signal: u32,
     pub irq_cap: u32,
+    /// Un-tokened `SEND_GRANT` cap on this driver's service endpoint;
+    /// kept so `handle_register_partition` can `cap_derive_token` per-
+    /// partition tokened caps from it. The kernel rejects re-tokening
+    /// of a tokened source, so partition cap derivation must happen
+    /// here (server-side) and not at the caller (which holds a
+    /// MOUNT_AUTHORITY-tokened cap).
+    pub service_ep: u32,
     partitions: PartitionTable,
     capacity: u64,
+    /// Monotonic counter for partition-identity tokens. The
+    /// `MOUNT_AUTHORITY` bit lives at `1 << 63`; this counter stays in
+    /// the low bits and so is bit-disjoint by construction.
+    next_partition_token: u64,
 }
 
 /// Handle incoming IPC requests on the service endpoint.
@@ -606,11 +631,27 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
 /// Translate a caller-supplied sector number into an absolute device LBA,
 /// enforcing per-token partition bounds. Returns a [`blk_errors`] code on
 /// rejection.
+///
+/// Token semantics:
+/// * Token bit [`MOUNT_AUTHORITY`] set → whole-disk read; bounded only
+///   by device capacity. Held by callers (currently just vfsd) that
+///   need to walk the partition table before partitioning is complete.
+/// * Token with [`MOUNT_AUTHORITY`] clear and non-zero low bits →
+///   partition-identity token issued by [`handle_register_partition`];
+///   bounded by the registered partition.
+/// * `token == 0` → un-tokened caller; rejected. Every consumer of
+///   this endpoint holds a tokened cap.
 fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 {
     if token == 0
     {
-        // Whole-disk endpoint: only device capacity bounds the read.
+        return Err(ipc::blk_errors::OUT_OF_BOUNDS);
+    }
+
+    if token & ipc::blk_labels::MOUNT_AUTHORITY != 0
+    {
+        // MOUNT_AUTHORITY holders read the whole disk directly,
+        // bounded only by device capacity.
         if sector >= rt.capacity
         {
             return Err(ipc::blk_errors::OUT_OF_BOUNDS);
@@ -637,12 +678,18 @@ fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 
 /// Handle a `REGISTER_PARTITION` request.
 ///
-/// Authority: only the un-tokened (whole-disk) endpoint holder may register
-/// partitions. A tokened caller is rejected — it is already partition-scoped
-/// and has no authority to create additional scopes.
+/// Authority: caller's token must have [`MOUNT_AUTHORITY`] set. Un-
+/// tokened callers and partition-tokened callers are rejected — the
+/// latter is already partition-scoped and has no authority to create
+/// additional scopes.
 ///
-/// Data words: `[token, base_lba, length_lba]`. The registered bound must
-/// lie within device capacity; a zero token or zero length is rejected.
+/// Data words: `[base_lba, length_lba]`. The driver allocates a fresh
+/// partition-identity token from its monotonic counter, inserts the
+/// bound, derives a tokened `SEND_GRANT` cap on its own service endpoint
+/// scoped to that token, and returns the cap in `caps[0]` of the reply.
+/// Server-side derivation is required because [`MOUNT_AUTHORITY`] caps
+/// are tokened and the kernel rejects re-tokening of a tokened source —
+/// the caller cannot mint partition caps itself.
 fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
     let reject = |ipc_buf: *mut u64| {
@@ -651,28 +698,38 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     };
 
-    if msg.token != 0
+    if msg.token & ipc::blk_labels::MOUNT_AUTHORITY == 0
     {
         reject(ipc_buf);
         return;
     }
 
-    if msg.word_count() < 3
+    if msg.word_count() < 2
     {
         reject(ipc_buf);
         return;
     }
-    let new_token = msg.word(0);
-    let base_lba = msg.word(1);
-    let length_lba = msg.word(2);
+    let base_lba = msg.word(0);
+    let length_lba = msg.word(1);
 
     // Bound must fit inside device capacity.
     let end = base_lba.saturating_add(length_lba);
-    if end > rt.capacity || length_lba == 0 || new_token == 0
+    if end > rt.capacity || length_lba == 0
     {
         reject(ipc_buf);
         return;
     }
+
+    let new_token = rt.next_partition_token;
+    // Saturating increment so a (theoretical) wrap collides with the
+    // MOUNT_AUTHORITY bit instead of silently aliasing a live partition
+    // token to a verb-bit value.
+    if new_token & ipc::blk_labels::MOUNT_AUTHORITY != 0
+    {
+        reject(ipc_buf);
+        return;
+    }
+    rt.next_partition_token = new_token.saturating_add(1);
 
     if rt
         .partitions
@@ -687,7 +744,20 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
         return;
     }
 
-    let reply = IpcMessage::new(ipc::blk_errors::SUCCESS);
+    let Ok(partition_cap) =
+        syscall::cap_derive_token(rt.service_ep, syscall::RIGHTS_SEND_GRANT, new_token)
+    else
+    {
+        // Roll back the partition insert so the table doesn't grow a
+        // bound the caller has no cap to address.
+        rt.partitions.remove(new_token);
+        reject(ipc_buf);
+        return;
+    };
+
+    let reply = IpcMessage::builder(ipc::blk_errors::SUCCESS)
+        .cap(partition_cap)
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
@@ -811,8 +881,10 @@ fn main() -> !
         queue_notify_off,
         irq_signal,
         irq_cap,
+        service_ep: caps.service_ep,
         partitions: PartitionTable::new(),
         capacity,
+        next_partition_token: 1,
     };
     service_loop(caps.service_ep, ipc_buf, &mut rt);
 }

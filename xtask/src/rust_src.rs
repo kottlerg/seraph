@@ -558,6 +558,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
     apply_env_overlay(&rust_src, overlay_root).context("env overlay")?;
     apply_process_overlay(&rust_src, overlay_root).context("process overlay")?;
     apply_pipe_overlay(&rust_src, overlay_root).context("pipe overlay")?;
+    apply_fs_overlay(&rust_src, overlay_root).context("fs overlay")?;
     Ok(())
 }
 
@@ -593,6 +594,10 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         .join("shared/shmem")
         .canonicalize()
         .context("canonicalising shared/shmem")?;
+    let namespace_protocol_path = project_root
+        .join("shared/namespace-protocol")
+        .canonicalize()
+        .context("canonicalising shared/namespace-protocol")?;
 
     let block = format!(
         "\n\
@@ -607,13 +612,15 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
          ipc = {{ path = \"{ipc}\", features = [\"rustc-dep-of-std\"] }}\n\
          log = {{ path = \"{log}\", features = [\"rustc-dep-of-std\"] }}\n\
          process-abi = {{ path = \"{proc}\", features = [\"rustc-dep-of-std\"] }}\n\
-         shmem = {{ path = \"{shmem}\", features = [\"rustc-dep-of-std\"] }}\n",
+         shmem = {{ path = \"{shmem}\", features = [\"rustc-dep-of-std\"] }}\n\
+         namespace-protocol = {{ path = \"{ns}\", features = [\"rustc-dep-of-std\"] }}\n",
         abi = syscall_abi_path.display(),
         sys = syscall_path.display(),
         ipc = ipc_path.display(),
         log = log_path.display(),
         proc = process_abi_path.display(),
         shmem = shmem_path.display(),
+        ns = namespace_protocol_path.display(),
     );
 
     let text = fs::read_to_string(&cargo_toml)
@@ -625,7 +632,8 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
     let marker = "seraph-overlay: workspace ABI crates";
     let has_log_dep = text.contains("log = { path");
     let has_shmem_dep = text.contains("shmem = { path");
-    if text.contains(marker) && has_log_dep && has_shmem_dep
+    let has_namespace_protocol_dep = text.contains("namespace-protocol = { path");
+    if text.contains(marker) && has_log_dep && has_shmem_dep && has_namespace_protocol_dep
     {
         return Ok(());
     }
@@ -801,7 +809,7 @@ fn apply_args_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 }
 
 /// Route `std::sys::process` through a seraph module that implements
-/// `Command::spawn` via procmgr `CREATE_FROM_VFS` plus death notifications
+/// `Command::spawn` via procmgr `CREATE_FROM_FILE` plus death notifications
 /// bound to the child's main thread. See `runtime/ruststd/src/sys/process/seraph.rs`.
 fn apply_process_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
 {
@@ -817,7 +825,7 @@ fn apply_process_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "sys/process/mod.rs",
         "    target_os = \"motor\" => {\n        mod motor;\n        use motor as imp;\n    }\n",
         "    target_os = \"motor\" => {\n        mod motor;\n        use motor as imp;\n    }\n    \
-         // seraph-overlay: std::process::Command via procmgr CREATE_FROM_VFS + EventQueue\n    \
+         // seraph-overlay: std::process::Command via procmgr CREATE_FROM_FILE + EventQueue\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          use seraph as imp;\n    }\n",
     )
@@ -1095,6 +1103,39 @@ fn apply_pipe_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
          // seraph-overlay: shmem-backed Stdio::piped via SPSC ring + signal caps\n    \
          target_os = \"seraph\" => {\n        pub mod seraph;\n        \
          pub use seraph::{Pipe, pipe};\n    }\n",
+    )
+}
+
+/// Route `std::sys::fs` through a seraph module that implements
+/// `std::fs::File` against vfsd / fs-driver IPC. Two source files: the
+/// public `seraph.rs` and an inner `release_handler.rs` (declared from
+/// `seraph.rs::mod release_handler;`). See
+/// `runtime/ruststd/src/sys/fs/seraph.rs`.
+fn apply_fs_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
+{
+    let fs_dir = rust_src.join("library/std/src/sys/fs");
+    let mod_rs = fs_dir.join("mod.rs");
+    let seraph_rs_dst = fs_dir.join("seraph.rs");
+    let seraph_rs_src = overlay_root.join("sys/fs/seraph.rs");
+    let release_handler_rs_dst = fs_dir.join("release_handler.rs");
+    let release_handler_rs_src = overlay_root.join("sys/fs/release_handler.rs");
+
+    write_if_changed(&seraph_rs_src, &seraph_rs_dst, "sys/fs/seraph.rs")?;
+    write_if_changed(
+        &release_handler_rs_src,
+        &release_handler_rs_dst,
+        "sys/fs/release_handler.rs",
+    )?;
+
+    patch_file(
+        &mod_rs,
+        "sys/fs/mod.rs",
+        "    target_os = \"motor\" => {\n        mod motor;\n        use motor as imp;\n    }\n",
+        "    target_os = \"motor\" => {\n        mod motor;\n        use motor as imp;\n    }\n    \
+         // seraph-overlay: std::fs::File via vfsd OPEN + fs-driver FS_READ/FS_READ_FRAME\n    \
+         target_os = \"seraph\" => {\n        mod seraph;\n        \
+         use seraph as imp;\n        \
+         pub(crate) use seraph::{walk_path_to_file, walk_path_to_dir, WalkedFile, WalkedDir};\n    }\n",
     )
 }
 

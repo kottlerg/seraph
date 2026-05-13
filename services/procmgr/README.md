@@ -62,6 +62,16 @@ procmgr/
 - **Choose virtual addresses inside the running child.** procmgr picks
   bootstrap-cross-boundary VAs (stack, IPC buffer, `ProcessInfo`, TLS
   block); the child's `std::sys::seraph` owns every other VA.
+- **Hold or distribute namespace caps.** procmgr holds no system-root
+  cap and has no broadcast path. A child's `ProcessInfo.system_root_cap`
+  is sourced exclusively from the spawner's
+  `CONFIGURE_NAMESPACE` call between create and start; if the spawner
+  delivered no cap, the slot stays zero and the child has no
+  namespace authority. See
+  [`docs/namespace-model.md`](../../docs/namespace-model.md).
+- **Walk paths.** procmgr never traverses the namespace tree.
+  `CREATE_FROM_FILE` requires the caller to pre-walk and supply a
+  resolved file cap.
 - **Supervise services.** Crash detection and restart policy are
   svcmgr's role.
 
@@ -73,10 +83,14 @@ The full procmgr IPC specification is in
 [`docs/ipc-interface.md`](docs/ipc-interface.md). Key operations:
 
 - `CREATE_PROCESS(elf_module_cap)` → suspended process handle, child caps
+- `CREATE_FROM_FILE(file_cap, file_size, …)` → suspended process handle,
+  child caps. Caller has already walked its own namespace cap to the
+  binary; procmgr issues `FS_READ` against the supplied file cap.
 - `START_PROCESS(process_handle)` — start a previously created process
-- `CREATE_PROCESS_FROM_VFS(path)` — same as `CREATE_PROCESS` with the
-  ELF source loaded from vfsd
-- `SET_VFSD_ENDPOINT(vfsd_send_cap)` — one-time configuration
+- `CONFIGURE_NAMESPACE(process_handle)` — install root and (optional)
+  cwd caps on the child before start; the sole path that writes
+  `ProcessInfo.system_root_cap` / `current_dir_cap`. Procmgr holds no
+  namespace cap of its own.
 
 Frame allocation is not part of procmgr's interface; see
 [`services/memmgr/docs/ipc-interface.md`](../memmgr/docs/ipc-interface.md).

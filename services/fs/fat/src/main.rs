@@ -5,15 +5,19 @@
 
 //! Seraph FAT filesystem driver.
 //!
-//! Implements read-only FAT16/FAT32 filesystem support. Receives IPC requests
-//! from vfsd (mount/open) and directly from clients (read/close/stat/readdir)
-//! conforming to `fs/docs/fs-driver-protocol.md`. All disk I/O is performed
-//! via the block device IPC endpoint received at creation time.
+//! Implements read-only FAT16/FAT32 filesystem support. Serves the
+//! cap-native namespace protocol (`NS_LOOKUP` / `NS_STAT` /
+//! `NS_READDIR`) for directory walks and `FS_READ` / `FS_READ_FRAME` /
+//! `FS_RELEASE_FRAME` / `FS_CLOSE` against per-node tokened caps.
+//! `FS_MOUNT` is the one untokened service-level request, used by
+//! vfsd as a BPB-validation probe at mount time. All disk I/O is
+//! performed via the block device IPC endpoint received at creation
+//! time.
 //!
-//! File identification uses capability tokens: `FS_OPEN` derives a tokened
-//! send cap from the service endpoint and returns it to the caller. Clients
-//! call file operations directly on the tokened cap; the token delivered by
-//! `ipc_recv` identifies the open file.
+//! Per-node tokens are minted by `NS_LOOKUP` (token = `(NodeId,
+//! NamespaceRights)`); `FS_READ` / `FS_READ_FRAME` / `FS_RELEASE_FRAME`
+//! / `FS_CLOSE` look the node up in `NodeTable` and act on the
+//! lazily-allocated `OpenFile` slot.
 
 // The `seraph` target is not in rustc's recognised-OS list, so `std` is
 // `restricted_std`-gated for downstream bins. Every std-built service on
@@ -21,20 +25,25 @@
 #![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
+mod backend;
 mod bpb;
 mod cache;
 mod dir;
+mod eviction;
 mod fat;
 mod file;
 
 use std::os::seraph::{StartupInfo, startup_info};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use backend::{FatfsBackend, NO_OPEN_SLOT, NodeTable};
 use bpb::{FatState, SECTOR_SIZE};
 use cache::PageCache;
-use dir::{format_83_name, read_dir_entry_at_index, resolve_path};
+use eviction::{EvictReq, EvictionState};
 use fat::{next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
-use ipc::{IpcMessage, fs_labels};
+use ipc::{IpcMessage, fs_labels, ns_labels};
+use namespace_protocol::{GateError, NodeId, NodeKind, gate};
 use syscall_abi::{PAGE_SIZE, RIGHTS_MAP_READ};
 
 /// Monotonic counter for token allocation. Starts at 1 (0 = untokened).
@@ -93,8 +102,9 @@ fn main() -> !
     std::os::seraph::log!("starting");
 
     let mut state = FatState::new();
+    let mut nodes = NodeTable::new();
 
-    let mut files = [
+    let files = Arc::new(Mutex::new([
         OpenFile::empty(),
         OpenFile::empty(),
         OpenFile::empty(),
@@ -103,9 +113,32 @@ fn main() -> !
         OpenFile::empty(),
         OpenFile::empty(),
         OpenFile::empty(),
-    ];
+    ]));
 
-    service_loop(&caps, &mut state, &mut files, cache, ipc_buf);
+    let eviction = Arc::new(EvictionState::new());
+
+    // Spawn the cache-pressure eviction worker. The worker owns
+    // outbound `FS_RELEASE_FRAME` issuance and the cooperative-
+    // release watchdog; main only enqueues. Spawn failure is
+    // process-fatal — without the worker, cache pressure cannot
+    // be relieved and reads degrade to permanent IO_ERROR once
+    // every slot is held.
+    {
+        let ev = eviction.clone();
+        let f = files.clone();
+        if std::thread::Builder::new()
+            .name("fatfs-eviction-worker".into())
+            .spawn(move || eviction::worker_loop(ev, f, cache))
+            .is_err()
+        {
+            std::os::seraph::log!("eviction worker spawn failed");
+            syscall::thread_exit();
+        }
+    }
+
+    service_loop(
+        &caps, &mut state, &mut nodes, &files, cache, ipc_buf, &eviction,
+    );
 }
 
 /// Issue a single bootstrap round against the creator endpoint and assemble
@@ -148,16 +181,27 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
 
 /// Main FAT service loop.
 ///
-/// Dispatches on the token delivered by `ipc_recv`:
-/// - token == 0: service-level request from vfsd (`FS_MOUNT`, `FS_OPEN`)
-/// - token != 0: per-file request from a client (`FS_READ`, `FS_CLOSE`,
-///   `FS_STAT`, `FS_READDIR`), identified by the token
+/// Three request shapes share one endpoint:
+/// - `FS_MOUNT` — untokened (token == 0); vfsd's BPB-validation probe.
+/// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
+///   the protocol crate.
+/// - Per-node `FS_READ` / `FS_READ_FRAME` / `FS_RELEASE_FRAME` /
+///   `FS_CLOSE` — token packs `(NodeId, NamespaceRights)`; the slot is
+///   resolved through `NodeTable` and the lazily-allocated `OpenFile`.
+///
+/// The open-file table is shared with the eviction worker via a
+/// `Mutex`; main acquires the lock once per request and holds it for
+/// the entire dispatch. The hot path is single-client and
+/// short-lived; lock contention with the worker is only material
+/// during cache-pressure releases.
 fn service_loop(
     caps: &FatCaps,
     state: &mut FatState,
-    files: &mut [OpenFile; MAX_OPEN_FILES],
-    cache: &PageCache,
+    nodes: &mut NodeTable,
+    files: &Arc<Mutex<[OpenFile; MAX_OPEN_FILES]>>,
+    cache: &'static PageCache,
     ipc_buf: *mut u64,
+    eviction: &EvictionState,
 ) -> !
 {
     loop
@@ -169,73 +213,105 @@ fn service_loop(
             continue;
         };
 
-        let label = msg.label;
-        let token = msg.token;
-        let opcode = label & 0xFFFF;
+        let opcode = msg.label & 0xFFFF;
 
-        if token == 0
+        // Untokened service-level requests: FS_MOUNT only.
+        if msg.token == 0
         {
-            // Service-level request from vfsd (untokened cap).
-            match opcode
+            let code = match opcode
             {
                 fs_labels::FS_MOUNT =>
                 {
-                    // First FS_MOUNT validates the BPB; subsequent calls are
-                    // idempotent. `fat_size == 0` is the pre-mount sentinel
-                    // (populated by parse_bpb on success).
-                    let code = if state.fat_size == 0
+                    if state.fat_size == 0
                     {
                         validate_bpb(caps, state, cache, ipc_buf)
                     }
                     else
                     {
                         ipc::fs_errors::SUCCESS
-                    };
-                    let reply = IpcMessage::new(code);
-                    // SAFETY: ipc_buf is the registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
                 }
-                fs_labels::FS_OPEN =>
-                {
-                    handle_open(&msg, state, files, caps, cache, ipc_buf);
-                }
-                _ =>
-                {
-                    let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
-                    // SAFETY: ipc_buf is the registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-                }
-            }
+                _ => ipc::fs_errors::UNKNOWN_OPCODE,
+            };
+            let reply = IpcMessage::new(code);
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            continue;
         }
-        else
+
+        // NS_* requests dispatch through the protocol crate, which owns
+        // both the wire-code namespace (NsError) and the rights checks
+        // for those opcodes.
+        if matches!(
+            opcode,
+            ns_labels::NS_LOOKUP | ns_labels::NS_STAT | ns_labels::NS_READDIR
+        )
         {
-            // Per-file request from client (tokened cap).
-            match opcode
+            let mut backend = FatfsBackend::new(state, cache, caps.block_dev, ipc_buf, nodes);
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            unsafe {
+                namespace_protocol::dispatch_request(&mut backend, &msg, caps.service, ipc_buf);
+            }
+            continue;
+        }
+
+        // FS_* requests: gate on the rights table, replying with
+        // fs_errors codes.
+        let node_id = match gate(msg.label, msg.token)
+        {
+            Ok((node, _)) => node,
+            Err(GateError::UnknownLabel) =>
             {
-                fs_labels::FS_READ =>
-                {
-                    handle_read(&msg, state, files, cache, caps.block_dev, ipc_buf);
-                }
-                fs_labels::FS_READ_FRAME =>
-                {
-                    handle_read_frame(&msg, state, files, cache, caps.block_dev, ipc_buf);
-                }
-                fs_labels::FS_RELEASE_FRAME =>
-                {
-                    handle_release_frame(&msg, files, cache, ipc_buf);
-                }
-                fs_labels::FS_CLOSE => handle_close(token, files, cache, ipc_buf),
-                fs_labels::FS_STAT => handle_stat(token, files, ipc_buf),
-                fs_labels::FS_READDIR =>
-                {
-                    handle_readdir(&msg, state, files, cache, caps.block_dev, ipc_buf);
-                }
-                _ =>
-                {
-                    let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
-                    // SAFETY: ipc_buf is the registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-                }
+                let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                continue;
+            }
+            Err(GateError::PermissionDenied) =>
+            {
+                let reply = IpcMessage::new(ipc::fs_errors::PERMISSION_DENIED);
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                continue;
+            }
+        };
+
+        if opcode == fs_labels::FS_READ
+        {
+            handle_read_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+            continue;
+        }
+
+        let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
+        match opcode
+        {
+            fs_labels::FS_READ_FRAME =>
+            {
+                handle_read_frame_node_cap(
+                    node_id,
+                    &msg,
+                    state,
+                    nodes,
+                    &mut files_g,
+                    caps,
+                    cache,
+                    ipc_buf,
+                    eviction,
+                );
+            }
+            fs_labels::FS_RELEASE_FRAME =>
+            {
+                handle_release_frame_node_cap(node_id, &msg, nodes, &mut files_g, cache, ipc_buf);
+            }
+            fs_labels::FS_CLOSE =>
+            {
+                handle_close_node_cap(node_id, nodes, &mut files_g, cache, ipc_buf);
+            }
+            _ =>
+            {
+                let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             }
         }
     }
@@ -243,92 +319,21 @@ fn service_loop(
 
 // ── Operation handlers ─────────────────────────────────────────────────────
 
-/// Handle `FS_OPEN`: resolve path, allocate file slot, derive a tokened
-/// send cap from the service endpoint, and return it in the reply cap slot.
-fn handle_open(
+/// `FS_READ` against a node cap. Resolves `node_id` against the
+/// `NodeTable` and reads from the FAT cluster chain. Inline reads
+/// allocate no `OpenFile` slot — no outstanding pages, no release
+/// bookkeeping.
+fn handle_read_node_cap(
+    node_id: NodeId,
     msg: &IpcMessage,
     state: &mut FatState,
-    files: &mut [OpenFile; MAX_OPEN_FILES],
-    caps: &FatCaps,
-    cache: &PageCache,
-    ipc_buf: *mut u64,
-)
-{
-    let label = msg.label;
-    let path_len = ((label >> 16) & 0xFFFF) as usize;
-    if path_len == 0 || path_len > ipc::MAX_PATH_LEN
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::NOT_FOUND);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    }
-
-    let mut path_buf = [0u8; ipc::MAX_PATH_LEN];
-    let path_bytes = msg.data_bytes();
-    let copy_len = path_len.min(path_bytes.len()).min(ipc::MAX_PATH_LEN);
-    path_buf[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
-    let path = &path_buf[..path_len];
-
-    let Some(entry) = resolve_path(path, state, cache, caps.block_dev, ipc_buf)
-    else
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::NOT_FOUND);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-
-    let Some(slot_idx) = file::alloc_slot(files)
-    else
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::TOO_MANY_OPEN);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-
-    let token = NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-    // Derive a tokened send cap from our service endpoint.
-    let Ok(file_cap) = syscall::cap_derive_token(caps.service, syscall_abi::RIGHTS_SEND, token)
-    else
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-
-    files[slot_idx] = OpenFile {
-        token,
-        start_cluster: entry.cluster,
-        file_size: entry.size,
-        is_dir: entry.attr & 0x10 != 0,
-        outstanding: [None; file::MAX_OUTSTANDING],
-    };
-
-    // Reply with the file cap — no data words needed.
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
-        .cap(file_cap)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-}
-
-/// Handle `FS_READ`: token identifies the file. Data layout:
-/// request `data[0]` = offset, `data[1]` = `max_len`.
-fn handle_read(
-    msg: &IpcMessage,
-    state: &mut FatState,
-    files: &[OpenFile; MAX_OPEN_FILES],
+    nodes: &NodeTable,
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 )
 {
-    let token = msg.token;
-    let Some(idx) = file::find_by_token(files, token)
+    let Some(node) = nodes.get(node_id)
     else
     {
         let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
@@ -336,16 +341,22 @@ fn handle_read(
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
+    if node.kind != NodeKind::File
+    {
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
 
     let offset = msg.word(0);
     let max_len = msg.word(1);
 
-    let file = &files[idx];
     let mut out = [0u8; SECTOR_SIZE];
     let bytes_read = read_file_data(
         &fat::FileRead {
-            start_cluster: file.start_cluster,
-            file_size: file.file_size,
+            start_cluster: node.cluster,
+            file_size: node.size,
             offset,
             max_len,
         },
@@ -364,53 +375,23 @@ fn handle_read(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Handle `FS_READ_FRAME`: token identifies the file. Data layout:
-/// `data[0]` = byte offset (any), `data[1]` = client-chosen release
-/// cookie. Reply: `data[0]` = bytes valid in the returned frame,
-/// `data[1]` = the same cookie echoed back, `data[2]` = byte offset
-/// within the returned frame where the file content for `offset` begins,
-/// `caps[0]` = a single-page Frame cap with `MAP|READ` rights covering
-/// the cached file page.
-///
-/// `offset` is a byte position in the file; the handler walks to the
-/// containing sector. The wire imposes no alignment requirement —
-/// callers stream forward from arbitrary positions and use the reply's
-/// `frame_data_offset` to locate the requested byte within the cache
-/// page. `bytes_valid` is bounded per call by file end, current cluster
-/// boundary, and page tail (`PAGE_SIZE - frame_data_offset`); page-
-/// misaligned data areas may therefore require multiple calls per
-/// `PAGE_SIZE` of file data.
-///
-/// The returned cap is a per-call grandchild of the cache slot's parent
-/// cap: the slot cap derives a per-cookie *ancestor* (kept in the fs's
-/// `CSpace` for revocation), and the ancestor derives the *child* moved
-/// to the caller. `cap_revoke` on the ancestor invalidates only this
-/// caller's child without touching the cache slot.
-// too_many_lines: handle_read_frame folds parameter validation, file
-// resolution, cluster-chain walk, cache acquisition, two-step cap
-// derivation, outstanding-page tracking, and reply assembly into one
-// flat procedure. The error paths each have to release whatever
-// resources the prior step took (refcount, ancestor cap), so extracting
-// helpers would still leave the rollback chain wired through main.
-#[allow(clippy::too_many_lines)]
-fn handle_read_frame(
+/// `FS_READ_FRAME` body, parameterised by a pre-resolved `OpenFile`
+/// slot index. `handle_read_frame_node_cap` resolves the token via
+/// `NodeTable.open_slot` (lazy-allocating on first call) and delegates
+/// here for the cluster walk, cache acquisition, two-step cap
+/// derivation, and outstanding-page tracking.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn read_frame_at_slot(
     msg: &IpcMessage,
+    idx: usize,
     state: &mut FatState,
     files: &mut [OpenFile; MAX_OPEN_FILES],
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
+    eviction: &EvictionState,
 )
 {
-    let token = msg.token;
-    let Some(idx) = file::find_by_token(files, token)
-    else
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
     let offset = msg.word(0);
     let cookie = msg.word(1);
 
@@ -475,6 +456,15 @@ fn handle_read_frame(
     let Some(slot_idx) = cache.acquire_page(page_base, block_dev, ipc_buf)
     else
     {
+        // Cache pressure: every slot is held by an outstanding
+        // page elsewhere. Pick one such page and submit it to
+        // the eviction worker; the client retries this read on
+        // IO_ERROR. Worker may take up to RELEASE_TIMEOUT_MS to
+        // free the slot.
+        if let Some(req) = pick_eviction_candidate(files)
+        {
+            eviction.enqueue(req);
+        }
         let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -547,22 +537,50 @@ fn handle_read_frame(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Handle client-initiated `FS_RELEASE_FRAME`: caller signals it is done
-/// with `data[0] = cookie`. Revoke the per-cookie ancestor cap (the
-/// derivation tree invalidates the caller's child cap and tears down its
-/// mapping), drop the cap, and decrement the cache slot's refcount so
-/// the slot becomes eligible for eviction. Idempotent — unknown cookies
-/// reply success since the caller may race fs-side eviction (Phase 9
-/// fs→client release path) that already cleaned up the same entry.
-fn handle_release_frame(
+/// Scan the open-file table for any outstanding cache page. Returns
+/// the first match as an [`EvictReq`]; `None` only if no file holds
+/// any outstanding page (in which case `acquire_page` failure is a
+/// cache-state bug rather than client-held pressure).
+fn pick_eviction_candidate(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<EvictReq>
+{
+    for file in files
+    {
+        if file.token == 0
+        {
+            continue;
+        }
+        if let Some(entry) = file.outstanding.iter().flatten().next()
+        {
+            return Some(EvictReq {
+                file_token: file.token,
+                cookie: entry.cookie,
+                slot_idx: entry.slot_idx,
+                ancestor_cap: entry.ancestor_cap,
+                release_endpoint_cap: file.release_endpoint_cap,
+            });
+        }
+    }
+    None
+}
+
+/// `FS_READ_FRAME` against a node cap. Lazily allocates an
+/// [`OpenFile`] slot bound to the node on first call (recorded into
+/// [`backend::FatNode::open_slot`]) and delegates to
+/// [`read_frame_at_slot`]. The slot is reaped at `FS_CLOSE`.
+#[allow(clippy::too_many_arguments)]
+fn handle_read_frame_node_cap(
+    node_id: NodeId,
     msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
     files: &mut [OpenFile; MAX_OPEN_FILES],
+    caps: &FatCaps,
     cache: &PageCache,
     ipc_buf: *mut u64,
+    eviction: &EvictionState,
 )
 {
-    let token = msg.token;
-    let Some(idx) = file::find_by_token(files, token)
+    let Some(node) = nodes.get(node_id)
     else
     {
         let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
@@ -570,138 +588,136 @@ fn handle_release_frame(
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
-    let cookie = msg.word(0);
-
-    for slot in &mut files[idx].outstanding
+    if node.kind != NodeKind::File
     {
-        if let Some(entry) = slot
-            && entry.cookie == cookie
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+
+    let idx = if node.open_slot == NO_OPEN_SLOT
+    {
+        let Some(slot_idx) = file::alloc_slot(files)
+        else
+        {
+            let reply = IpcMessage::new(ipc::fs_errors::TOO_MANY_OPEN);
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            return;
+        };
+        // Slot identity for the eviction worker's `find_by_token`
+        // lookup. Never seen on the wire — node-cap requests resolve
+        // through `FatNode.open_slot`.
+        let token = NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // First FS_READ_FRAME for a (client, node) pair MAY carry the
+        // client's per-process release-endpoint SEND in caps[0]. The
+        // kernel `transfer_caps` path moved it into our CSpace if
+        // present; record it on the slot so the eviction worker can
+        // route cooperative `FS_RELEASE_FRAME` back to the client.
+        // A zero cap indicates an opt-out client; eviction falls back
+        // to the hard-revoke path. Subsequent FS_READ_FRAMEs from
+        // the same client carry no caps.
+        let release_endpoint_cap = msg.caps().first().copied().unwrap_or(0);
+        files[slot_idx] = OpenFile {
+            token,
+            start_cluster: node.cluster,
+            file_size: node.size,
+            outstanding: [None; file::MAX_OUTSTANDING],
+            release_endpoint_cap,
+        };
+        // Cast safe: slot_idx ≤ MAX_OPEN_FILES (8) ≪ u32::MAX.
+        nodes.set_open_slot(node_id, slot_idx as u32);
+        slot_idx
+    }
+    else
+    {
+        node.open_slot as usize
+    };
+
+    read_frame_at_slot(
+        msg,
+        idx,
+        state,
+        files,
+        cache,
+        caps.block_dev,
+        ipc_buf,
+        eviction,
+    );
+}
+
+/// `FS_RELEASE_FRAME` against a node cap. Resolves the lazy
+/// [`OpenFile`] slot through [`backend::FatNode::open_slot`] and
+/// drops the matching outstanding page. Replies success when the
+/// cookie is unknown — release is idempotent.
+fn handle_release_frame_node_cap(
+    node_id: NodeId,
+    msg: &IpcMessage,
+    nodes: &NodeTable,
+    files: &mut [OpenFile; MAX_OPEN_FILES],
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+)
+{
+    let cookie = msg.word(0);
+    if let Some(node) = nodes.get(node_id)
+        && node.open_slot != NO_OPEN_SLOT
+    {
+        let idx = node.open_slot as usize;
+        for slot in &mut files[idx].outstanding
+        {
+            if let Some(entry) = slot
+                && entry.cookie == cookie
+            {
+                let _ = syscall::cap_revoke(entry.ancestor_cap);
+                let _ = syscall::cap_delete(entry.ancestor_cap);
+                cache.release_slot(entry.slot_idx);
+                *slot = None;
+                break;
+            }
+        }
+    }
+    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `FS_CLOSE` against a node cap. Releases any [`OpenFile`] slot
+/// bound to the node (revoking outstanding pages, freeing the slot)
+/// and clears [`backend::FatNode::open_slot`] back to
+/// [`NO_OPEN_SLOT`]. The kernel-side cap reference is dropped by
+/// the caller's paired `cap_delete`.
+fn handle_close_node_cap(
+    node_id: NodeId,
+    nodes: &mut NodeTable,
+    files: &mut [OpenFile; MAX_OPEN_FILES],
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+)
+{
+    if let Some(node) = nodes.get(node_id)
+        && node.open_slot != NO_OPEN_SLOT
+    {
+        let idx = node.open_slot as usize;
+        for entry in files[idx].outstanding.iter().flatten()
         {
             let _ = syscall::cap_revoke(entry.ancestor_cap);
             let _ = syscall::cap_delete(entry.ancestor_cap);
             cache.release_slot(entry.slot_idx);
-            *slot = None;
-            break;
         }
+        // Drop the per-File release-endpoint SEND the client transferred
+        // on first FS_READ_FRAME — leaving it in our CSpace would
+        // accumulate a stale SEND per opened file across the fs's
+        // lifetime.
+        if files[idx].release_endpoint_cap != 0
+        {
+            let _ = syscall::cap_delete(files[idx].release_endpoint_cap);
+        }
+        files[idx] = OpenFile::empty();
+        nodes.set_open_slot(node_id, NO_OPEN_SLOT);
     }
-
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-}
-
-/// Handle `FS_CLOSE`: token identifies the file. No data words.
-///
-/// Outstanding `FS_READ_FRAME` pages are revoked and released here:
-/// `cap_revoke` on each per-cookie ancestor cap kills the caller-side
-/// derived child cap (the kernel's derivation tree is the authority),
-/// and the cache slot's refcount is decremented so the slot becomes
-/// eligible for eviction. Phase 9 will add a cooperative round-trip
-/// before the hard revoke; Phase 7 hard-revokes unconditionally.
-fn handle_close(
-    token: u64,
-    files: &mut [OpenFile; MAX_OPEN_FILES],
-    cache: &PageCache,
-    ipc_buf: *mut u64,
-)
-{
-    let Some(idx) = file::find_by_token(files, token)
-    else
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-
-    for entry in files[idx].outstanding.iter().flatten()
-    {
-        let _ = syscall::cap_revoke(entry.ancestor_cap);
-        let _ = syscall::cap_delete(entry.ancestor_cap);
-        cache.release_slot(entry.slot_idx);
-    }
-
-    files[idx] = OpenFile::empty();
-    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-}
-
-/// Handle `FS_STAT`: token identifies the file. No data words in request.
-fn handle_stat(token: u64, files: &[OpenFile; MAX_OPEN_FILES], ipc_buf: *mut u64)
-{
-    let Some(idx) = file::find_by_token(files, token)
-    else
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-
-    let file = &files[idx];
-    let flags: u64 = u64::from(file.is_dir) | 2; // bit 0=dir, bit 1=read-only
-
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
-        .word(0, u64::from(file.file_size))
-        .word(1, flags)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-}
-
-/// Handle `FS_READDIR`: token identifies the directory. `data[0]` = `entry_idx`.
-fn handle_readdir(
-    msg: &IpcMessage,
-    state: &mut FatState,
-    files: &[OpenFile; MAX_OPEN_FILES],
-    cache: &PageCache,
-    block_dev: u32,
-    ipc_buf: *mut u64,
-)
-{
-    let token = msg.token;
-    let Some(idx) = file::find_by_token(files, token)
-    else
-    {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-
-    if !files[idx].is_dir
-    {
-        // InvalidToken: not a directory.
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    }
-
-    let entry_idx = msg.word(0);
-    let dir_cluster = files[idx].start_cluster;
-
-    let Some(entry) =
-        read_dir_entry_at_index(dir_cluster, entry_idx, state, cache, block_dev, ipc_buf)
-    else
-    {
-        let reply = IpcMessage::new(fs_labels::END_OF_DIR);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-
-    let mut name_buf = [0u8; 12];
-    let name_len = format_83_name(&entry.name, &mut name_buf);
-    let flags: u64 = u64::from(entry.attr & 0x10 != 0);
-
-    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
-        .word(0, name_len as u64)
-        .word(1, u64::from(entry.size))
-        .word(2, flags)
-        .bytes(3, &name_buf[..name_len])
-        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }

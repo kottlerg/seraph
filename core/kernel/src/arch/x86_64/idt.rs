@@ -240,8 +240,11 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
             // Commit Exited under all-CPU scheduler.locks so a concurrent
             // dealloc observes a coherent state. See
             // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
+            // Write exit_reason first so any subsequent sched.lock acquire
+            // observes the reason alongside the Exited transition.
             // SAFETY: tcb validated non-null.
             unsafe {
+                (*tcb).exit_reason = 0x1000 + f.vector;
                 crate::sched::set_state_under_all_locks(
                     tcb,
                     crate::sched::thread::ThreadState::Exited,

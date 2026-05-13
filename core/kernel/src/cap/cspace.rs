@@ -314,6 +314,12 @@ impl CSpace
     /// Return a slot to the free list and clear its contents.
     ///
     /// Silently ignores an out-of-range, unmapped, or zero index.
+    ///
+    /// Idempotent: a slot already on the free list (tag == Null) is left
+    /// alone. Pushing again would set `slot.next_free = slot` when the
+    /// caller passes the current `free_head` — a self-loop that turns the
+    /// next `allocate_slot` into an unbounded spin under IRQs-off
+    /// cspace.lock.
     pub fn free_slot(&mut self, index: u32)
     {
         let Some(nz_index) = NonZeroU32::new(index)
@@ -324,6 +330,15 @@ impl CSpace
         let old_head = self.free_head;
         if let Some(slot) = self.slot_mut(index)
         {
+            if slot.tag == super::slot::CapTag::Null
+            {
+                #[cfg(not(test))]
+                crate::kprintln!(
+                    "free_slot: double-free index={} ignored (slot already Null)",
+                    index
+                );
+                return;
+            }
             slot.set_next_free(old_head);
             self.free_head = Some(nz_index);
             self.free_count += 1;
@@ -587,7 +602,7 @@ mod tests
             size: 0x1000,
             available_bytes: core::sync::atomic::AtomicU64::new(0),
             owns_memory: core::sync::atomic::AtomicBool::new(false),
-            allocator: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
             lock: core::sync::atomic::AtomicU32::new(0),
         });
         let raw = Box::into_raw(obj) as *mut KernelObjectHeader;

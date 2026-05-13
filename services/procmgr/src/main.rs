@@ -9,7 +9,7 @@
 //! Supports both in-memory ELF loading from boot module frames and streaming
 //! from the VFS. See `procmgr/docs/ipc-interface.md`.
 //!
-//! `CREATE_PROCESS` and `CREATE_FROM_VFS` accept the child's module source and
+//! `CREATE_PROCESS` and `CREATE_FROM_FILE` accept the child's module source and
 //! the caller's bootstrap endpoint (a tokened send cap); the endpoint is
 //! installed in the child `CSpace` and recorded in `ProcessInfo` as the
 //! `creator_endpoint_cap`. The child requests its initial cap set from the
@@ -126,7 +126,6 @@ fn main() -> !
     let mut ctx = ProcmgrCtx {
         self_aspace,
         self_endpoint: boot.service_ep,
-        vfsd_ep: 0,
         log_ep: boot.log_ep,
         memmgr_ep: startup.memmgr_endpoint,
         death_eq,
@@ -142,6 +141,22 @@ fn main() -> !
             continue;
         };
 
+        // Drain any pending deaths before servicing a SERVICE request.
+        // SERVICE handlers may allocate from memmgr; without this, a child
+        // can die in the same wakeup batch as the parent's spawn-causing
+        // IPC, and the SERVICE branch wins the wait_set_wait dispatch
+        // ordering — leaving the dead child's frames pinned in memmgr's
+        // per-process record until the next loop iteration. Under fast
+        // spawn-after-wait churn that races allocations against pool
+        // reclaim. dispatch_death is a no-op when the EQ is empty.
+        dispatch_death(
+            ctx.death_eq,
+            ctx.memmgr_ep,
+            ipc_buf,
+            &mut table,
+            &mut recent,
+        );
+
         match token
         {
             WS_TOKEN_SERVICE =>
@@ -150,13 +165,7 @@ fn main() -> !
             }
             WS_TOKEN_DEATH =>
             {
-                dispatch_death(
-                    ctx.death_eq,
-                    ctx.memmgr_ep,
-                    ipc_buf,
-                    &mut table,
-                    &mut recent,
-                );
+                // Already drained above; nothing to do.
             }
             _ => (),
         }
@@ -270,21 +279,40 @@ pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
 {
     if memmgr_send == 0
     {
+        std::os::seraph::log!("procmgr: alloc_page: memmgr_send=0");
         return None;
     }
     let msg = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
         .word(0, 1)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(memmgr_send, &msg, ipc_buf) }.ok()?;
+    let reply = match unsafe { ipc::ipc_call(memmgr_send, &msg, ipc_buf) }
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            std::os::seraph::log!("procmgr: alloc_page: ipc_call err={}", e);
+            return None;
+        }
+    };
     if reply.label != memmgr_errors::SUCCESS
     {
+        std::os::seraph::log!(
+            "procmgr: alloc_page: memmgr label={} pool: total={} runs={} max={}",
+            reply.label,
+            reply.word(0),
+            reply.word(1),
+            reply.word(2)
+        );
         return None;
     }
     if reply.word(0) != 1
     {
-        // Best-effort came back with zero or many caps; unexpected for n=1.
-        // Drop any caps that did arrive.
+        std::os::seraph::log!(
+            "procmgr: alloc_page: count={} caps={}",
+            reply.word(0),
+            reply.caps().len()
+        );
         for &slot in reply.caps()
         {
             let _ = syscall::cap_delete(slot);
@@ -372,7 +400,7 @@ fn dispatch_ipc(
         procmgr_labels::START_PROCESS =>
         {
             // Token from ipc_recv identifies which process to start.
-            let code = match process::start_process(token, table)
+            let code = match process::start_process(token, table, ctx.self_aspace)
             {
                 Ok(()) => procmgr_errors::SUCCESS,
                 Err(code) => code,
@@ -392,17 +420,7 @@ fn dispatch_ipc(
             // Token identifies which process to query. Reply data:
             //   word 0 = state code (see `procmgr_process_state`)
             //   word 1 = exit_reason (only meaningful for `EXITED`)
-            use ipc::procmgr_process_state;
-            let (state, exit_reason) = match table.query_by_token(token)
-            {
-                Some(true) => (procmgr_process_state::ALIVE, 0u64),
-                Some(false) => (procmgr_process_state::CREATED, 0u64),
-                None => match recent.find(token)
-                {
-                    Some(reason) => (procmgr_process_state::EXITED, reason),
-                    None => (procmgr_process_state::UNKNOWN, 0u64),
-                },
-            };
+            let (state, exit_reason) = resolve_query_state(token, table, recent);
             let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
                 .word(0, state)
                 .word(1, exit_reason)
@@ -411,23 +429,9 @@ fn dispatch_ipc(
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         }
 
-        procmgr_labels::CREATE_FROM_VFS =>
+        procmgr_labels::CREATE_FROM_FILE =>
         {
-            handle_create_from_vfs(&req, ipc_buf, ctx, table);
-        }
-
-        procmgr_labels::SET_VFSD_EP =>
-        {
-            let caps = req.caps();
-            if caps.is_empty()
-            {
-                reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-            }
-            else
-            {
-                ctx.vfsd_ep = caps[0];
-                reply_empty(ipc_buf, procmgr_errors::SUCCESS);
-            }
+            handle_create_from_file(&req, ipc_buf, ctx, table);
         }
 
         procmgr_labels::CONFIGURE_PIPE =>
@@ -435,10 +439,63 @@ fn dispatch_ipc(
             handle_configure_pipe(&req, ipc_buf, ctx.self_aspace, table);
         }
 
+        procmgr_labels::CONFIGURE_NAMESPACE =>
+        {
+            handle_configure_namespace(&req, ipc_buf, table);
+        }
+
         _ =>
         {
             reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
         }
+    }
+}
+
+/// Answer `QUERY_PROCESS` for the addressed entry.
+///
+/// Consults the kernel for the authoritative thread-lifecycle snapshot
+/// (`CAP_INFO_THREAD_STATE`) so a freshly-faulted child is reported as
+/// EXITED even before procmgr's own death-event drain has reaped the
+/// entry. Without this, the userspace death-eq drain races a parent's
+/// "wait then `QUERY_PROCESS`" sequence and produces a transient ALIVE
+/// answer for an already-dead child.
+fn resolve_query_state(
+    token: u64,
+    table: &process::ProcessTable,
+    recent: &process::RecentExits,
+) -> (u64, u64)
+{
+    use ipc::procmgr_process_state;
+    if let Some((started, thread_cap)) = table.query_by_token(token)
+    {
+        // Kernel-authoritative override: if the thread has transitioned to
+        // Exited, report EXITED with the kernel-recorded reason regardless
+        // of whether `dispatch_death` has reaped the entry yet.
+        if let Ok(packed) = syscall::cap_info(thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
+        {
+            let state_code = (packed >> 32) as u32;
+            let reason = packed & 0xFFFF_FFFF;
+            if state_code == syscall_abi::THREAD_STATE_EXITED
+            {
+                return (procmgr_process_state::EXITED, reason);
+            }
+        }
+        if started
+        {
+            (procmgr_process_state::ALIVE, 0u64)
+        }
+        else
+        {
+            (procmgr_process_state::CREATED, 0u64)
+        }
+    }
+    else if let Some(reason) = recent.find(token)
+    {
+        (procmgr_process_state::EXITED, reason)
+    }
+    else
+    {
+        (procmgr_process_state::UNKNOWN, 0u64)
     }
 }
 
@@ -529,6 +586,38 @@ fn handle_configure_pipe(
     let _ = syscall::cap_delete(data_signal);
     let _ = syscall::cap_delete(space_signal);
 
+    reply_empty(ipc_buf, code);
+}
+
+/// Handle `CONFIGURE_NAMESPACE` — install per-process root and
+/// (optional) cwd caps on a suspended child. Caps are consumed by
+/// procmgr on both success and failure paths; the wire-side caller
+/// MUST NOT reuse the slots after the call.
+///
+/// Wire format (see `ipc::procmgr_labels::CONFIGURE_NAMESPACE`):
+/// * `caps[0]` — root cap to deliver to the child at start (mandatory).
+/// * `caps[1]` — cwd cap to deliver to the child at start (optional;
+///   absent leaves `current_dir_cap` zero in the child).
+fn handle_configure_namespace(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    table: &mut process::ProcessTable,
+)
+{
+    let token = req.token;
+    let caps = req.caps();
+    if caps.is_empty()
+    {
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    let root_cap = caps[0];
+    let cwd_cap = caps.get(1).copied().unwrap_or(0);
+    let code = match table.configure_namespace(token, root_cap, cwd_cap)
+    {
+        Ok(()) => procmgr_errors::SUCCESS,
+        Err(code) => code,
+    };
     reply_empty(ipc_buf, code);
 }
 
@@ -703,15 +792,12 @@ fn handle_create(
     }
 }
 
-/// Long-lived procmgr state used by all request handlers.
-///
-/// `vfsd_ep` starts zero and is populated by `SET_VFSD_EP` once init has
-/// handed over; the other fields are fixed for the lifetime of the process.
+/// Long-lived procmgr state used by all request handlers. All fields are
+/// fixed for the lifetime of the process.
 pub struct ProcmgrCtx
 {
     pub self_aspace: u32,
     pub self_endpoint: u32,
-    pub vfsd_ep: u32,
     /// Log endpoint (SEND) received from init during procmgr's own bootstrap.
     /// Procmgr `cap_copy`s this into every child's
     /// `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time. Zero if
@@ -735,30 +821,12 @@ pub struct ProcmgrCtx
     pub ws_cap: u32,
 }
 
-/// Handle `CREATE_FROM_VFS` — create a process from a VFS path.
+/// Handle `CREATE_FROM_FILE` — create a process from a caller-supplied file cap.
 ///
-/// Label layout:
-///   bits [0..16]  = opcode (`CREATE_FROM_VFS`)
-///   bits [16..32] = `path_len`
-///   bits [32..48] = `args_bytes` (total byte length of the argv blob; u16)
-///   bits [48..56] = `args_count` (number of NUL-terminated strings; u8)
-///   bits [56..64] = `env_count` (number of NUL-terminated `KEY=VALUE`
-///                    strings; u8). Zero means "no env"; any value >0
-///                    requires an env header word + blob after argv.
-///
-/// IPC data words:
-///   word `0..path_words`             = path bytes (up to `MAX_PATH_LEN` = 48 bytes)
-///   word `path_words..+argv_words`   = argv blob, `args_bytes.div_ceil(8)` words
-///   word `path_words+argv_words`     = `env_bytes` (low 16 bits; only present
-///                                       when `env_count > 0`)
-///   word after env header            = env blob, `env_bytes.div_ceil(8)` words
-///                                       (only present when `env_count > 0`)
-///
-/// Expects `caps = [creator_endpoint?]`. Module bytes come from the VFS,
-/// not the caller's `CSpace`. Stdio pipes are installed via separate
-/// `CONFIGURE_PIPE` calls between create and start. Mirrors
-/// `CREATE_PROCESS`'s argv/env encoding (see `handle_create`).
-fn handle_create_from_vfs(
+/// Wire layout: see [`procmgr_labels::CREATE_FROM_FILE`]. The caller has
+/// already walked its own namespace cap to the binary node; procmgr never
+/// touches the namespace tree on this path.
+fn handle_create_from_file(
     req: &IpcMessage,
     ipc_buf: *mut u64,
     ctx: &ProcmgrCtx,
@@ -767,26 +835,19 @@ fn handle_create_from_vfs(
 {
     let label = req.label;
 
-    if ctx.vfsd_ep == 0
-    {
-        reply_empty(ipc_buf, procmgr_errors::NO_VFSD_ENDPOINT);
-        return;
-    }
-
-    let path_len = ((label >> 16) & 0xFFFF) as usize;
-    if path_len == 0 || path_len > ipc::MAX_PATH_LEN
-    {
-        reply_empty(ipc_buf, procmgr_errors::FILE_NOT_FOUND);
-        return;
-    }
-
     let caps = req.caps();
-    let creator_ep = caps.first().copied().unwrap_or(0);
+    let file_cap = match caps.first().copied()
+    {
+        Some(c) if c != 0 => c,
+        _ =>
+        {
+            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+            return;
+        }
+    };
+    let creator_ep = caps.get(1).copied().unwrap_or(0);
 
-    let mut path_buf = [0u8; ipc::MAX_PATH_LEN];
-    // Path begins at word 0 (word 0 is no longer used as stdio_token).
-    let effective_path_len = read_path_from_msg(req, 0, path_len, &mut path_buf);
-    let path_words = path_len.div_ceil(8);
+    let file_size = req.word(0);
 
     let args_bytes = ((label >> 32) & 0xFFFF) as usize;
     let args_count = ((label >> 48) & 0xFF) as u32;
@@ -795,7 +856,7 @@ fn handle_create_from_vfs(
     let mut args_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let args_blob: &[u8] = if args_bytes > 0 && args_bytes <= ipc::ARGS_BLOB_MAX
     {
-        copy_bytes_from_msg(req, path_words, args_bytes, &mut args_buf);
+        copy_bytes_from_msg(req, 1, args_bytes, &mut args_buf);
         &args_buf[..args_bytes]
     }
     else
@@ -807,10 +868,10 @@ fn handle_create_from_vfs(
     let mut env_buf = [0u8; ipc::ARGS_BLOB_MAX];
     let env_blob: &[u8] = if env_count > 0
     {
-        let env_bytes = (req.word(path_words + argv_words) & 0xFFFF) as usize;
+        let env_bytes = (req.word(1 + argv_words) & 0xFFFF) as usize;
         if env_bytes > 0 && env_bytes <= ipc::ARGS_BLOB_MAX
         {
-            copy_bytes_from_msg(req, path_words + argv_words + 1, env_bytes, &mut env_buf);
+            copy_bytes_from_msg(req, 1 + argv_words + 1, env_bytes, &mut env_buf);
             &env_buf[..env_bytes]
         }
         else
@@ -832,9 +893,10 @@ fn handle_create_from_vfs(
         count: env_count,
     };
 
-    let result = process::create_process_from_vfs(
+    let result = process::create_process_from_file(
         ctx,
-        &path_buf[..effective_path_len],
+        file_cap,
+        file_size,
         table,
         ipc_buf,
         creator_ep,
@@ -851,28 +913,6 @@ fn handle_create_from_vfs(
             reply_empty(ipc_buf, code);
         }
     }
-}
-
-/// Unpack `path_len` bytes from the IPC message's data bytes starting at
-/// word offset `word_offset`. Returns the number of bytes actually written
-/// to `buf`, capped at `buf.len()` and `MAX_PATH_LEN`.
-fn read_path_from_msg(
-    msg: &IpcMessage,
-    word_offset: usize,
-    path_len: usize,
-    buf: &mut [u8],
-) -> usize
-{
-    let effective_len = path_len.min(buf.len()).min(ipc::MAX_PATH_LEN);
-    let bytes = msg.data_bytes();
-    let src_start = word_offset * 8;
-    let avail = bytes.len().saturating_sub(src_start);
-    let copy_len = effective_len.min(avail);
-    if copy_len > 0
-    {
-        buf[..copy_len].copy_from_slice(&bytes[src_start..src_start + copy_len]);
-    }
-    copy_len
 }
 
 /// Copy up to `len` bytes from the IPC message's data-byte view into `dst`,

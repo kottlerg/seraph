@@ -260,6 +260,16 @@ pub fn emit(ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
     let cap = ensure_tokened_cap(ipc_buf);
     if cap == 0
     {
+        // Reaching here means the binary linked `seraph::log!` but
+        // received neither a discovery cap at `_start` nor a pre-
+        // installed tokened cap. Tier-2 binaries that never call
+        // `log!` never reach this function (dead-code-eliminated).
+        // Loud in debug; silent drop in release for cap-oblivious
+        // tier-2 use.
+        debug_assert!(
+            false,
+            "seraph::log! invoked but no log cap was wired at startup",
+        );
         return;
     }
     write_args(cap, ipc_buf, args);

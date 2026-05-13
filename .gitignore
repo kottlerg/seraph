@@ -2,6 +2,7 @@
 /sysroot/
 /target/
 /disk.img
+/rootfs/usertest/large.bin
 
 # rustfmt backup files
 **/*.rs.bk

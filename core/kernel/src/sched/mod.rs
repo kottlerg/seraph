@@ -297,6 +297,42 @@ fn watchdog_tick_and_check()
             now.saturating_sub(last_tick),
             mask
         );
+        // Dump the user-mode trap frame if present: tells us where in
+        // userspace the thread entered its currently-stuck syscall.
+        // SAFETY: trap_frame is set by every userspace-syscall entry and
+        // cleared on userspace return; reading the pointed-to TrapFrame
+        // races benignly with concurrent writes (we're already in stall).
+        let (tf_present, tf_rip, tf_rax) = unsafe {
+            let s = scheduler_for(cpu);
+            let cur = s.current;
+            if cur.is_null()
+            {
+                (false, 0u64, 0u64)
+            }
+            else
+            {
+                let tf = (*cur).trap_frame;
+                if tf.is_null()
+                {
+                    (false, 0u64, 0u64)
+                }
+                else
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        (true, (*tf).rip, (*tf).rax)
+                    }
+                    #[cfg(target_arch = "riscv64")]
+                    {
+                        (true, (*tf).sepc, (*tf).a7)
+                    }
+                }
+            }
+        };
+        if tf_present
+        {
+            crate::kprintln!("    user_rip=0x{:x} syscall_nr={}", tf_rip, tf_rax);
+        }
     }
     // Dump sleep list.
     // SAFETY: read-only; SLEEP_LIST_LOCK protects writers.
@@ -772,6 +808,7 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
                     context_saved: core::sync::atomic::AtomicU32::new(1),
                     death_observers: [thread::DeathObserver::empty(); thread::MAX_DEATH_OBSERVERS],
                     death_observer_count: 0,
+                    exit_reason: 0,
                     sleep_deadline: 0,
                     magic: thread::TCB_MAGIC,
                 },
@@ -1423,6 +1460,14 @@ pub unsafe fn schedule(requeue_current: bool)
             unsafe {
                 (*current).state = ThreadState::Running;
             }
+        }
+        // Watchdog: count this as a non-idle dispatch so the softlockup
+        // detector does not false-positive on a CPU that correctly re-selects
+        // the same non-idle thread every tick (the only ready candidate at
+        // its priority level).
+        if !current.is_null() && !core::ptr::eq(current, sched.idle)
+        {
+            watchdog_mark_non_idle(cpu);
         }
         // SAFETY: saved_flags was returned by the matching lock_raw above.
         unsafe {

@@ -1,0 +1,107 @@
+name: build-test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: build-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-23
+          components: rust-src,rustfmt,clippy,llvm-tools
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host-tests
+
+      - name: cargo xtask test
+        run: cargo xtask test
+
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, riscv64]
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-system-misc \
+            ovmf \
+            qemu-efi-riscv64
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-23
+          components: rust-src,rustfmt,clippy,llvm-tools
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: validate-${{ matrix.arch }}-${{ matrix.profile }}
+
+      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }})
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo xtask build --arch ${{ matrix.arch }} --release
+          else
+            cargo xtask build --arch ${{ matrix.arch }}
+          fi
+
+      - name: usertest single-shot (default boot.conf, init=init)
+        run: |
+          cargo xtask run-parallel \
+            --arch ${{ matrix.arch }} \
+            --parallel 1 --runs 1 --timeout 60
+
+      - name: Swap boot.conf to init=ktest and rebuild
+        run: |
+          sed -i \
+            -e 's|^init=init$|#init=init|' \
+            -e 's|^#init=ktest$|init=ktest|' \
+            -e 's|^cmdline=root=|#cmdline=root=|' \
+            -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
+            rootfs/esp/EFI/seraph/boot.conf
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo xtask build --arch ${{ matrix.arch }} --release
+          else
+            cargo xtask build --arch ${{ matrix.arch }}
+          fi
+
+      - name: ktest single-shot
+        run: |
+          cargo xtask run-parallel \
+            --arch ${{ matrix.arch }} \
+            --parallel 1 --runs 1 --timeout 60
+
+      - name: Upload run-parallel logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}
+          path: target/xtask/run-parallel/**/*.log
+          if-no-files-found: ignore

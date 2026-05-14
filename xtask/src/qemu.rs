@@ -100,12 +100,22 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Vec<String>
 
 fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec)
 {
+    args.extend(["-machine".into(), "q35".into()]);
+
+    // KVM acceleration when /dev/kvm is present (local dev); fall back to
+    // multi-threaded TCG otherwise (CI runners, KVM-less containers). The
+    // riscv64 path is always TCG; this mirrors its `-accel tcg,thread=multi`
+    // shape when KVM is unavailable.
+    if Path::new("/dev/kvm").exists()
+    {
+        args.extend(["-enable-kvm".into(), "-cpu".into(), "host".into()]);
+    }
+    else
+    {
+        args.extend(["-accel".into(), "tcg,thread=multi".into()]);
+    }
+
     args.extend([
-        "-machine".into(),
-        "q35".into(),
-        "-enable-kvm".into(),
-        "-cpu".into(),
-        "host".into(),
         "-drive".into(),
         format!(
             "if=pflash,format=raw,readonly=on,file={}",

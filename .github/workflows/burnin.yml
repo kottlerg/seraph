@@ -1,0 +1,75 @@
+name: burn-in
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+concurrency:
+  group: burnin-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  burnin:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, riscv64]
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-system-misc \
+            ovmf \
+            qemu-efi-riscv64
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-23
+          components: rust-src,rustfmt,clippy,llvm-tools
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: burnin-${{ matrix.arch }}-${{ matrix.profile }}
+
+      - name: Swap boot.conf to init=ktest
+        run: |
+          sed -i \
+            -e 's|^init=init$|#init=init|' \
+            -e 's|^#init=ktest$|init=ktest|' \
+            -e 's|^cmdline=root=|#cmdline=root=|' \
+            -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
+            rootfs/esp/EFI/seraph/boot.conf
+
+      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }})
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo xtask build --arch ${{ matrix.arch }} --release
+          else
+            cargo xtask build --arch ${{ matrix.arch }}
+          fi
+
+      - name: ktest burn-in (4 × 40 iterations)
+        run: |
+          cargo xtask run-parallel \
+            --arch ${{ matrix.arch }} \
+            --parallel 4 --runs 40 --timeout 60
+
+      - name: Upload run-parallel logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}
+          path: target/xtask/run-parallel/**/*.log
+          if-no-files-found: ignore

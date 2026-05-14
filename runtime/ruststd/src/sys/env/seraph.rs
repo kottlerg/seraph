@@ -19,6 +19,7 @@ use crate::collections::BTreeMap;
 use crate::ffi::{OsStr, OsString};
 use crate::io;
 use crate::os::seraph::try_startup_info;
+use crate::path::{Path, PathBuf};
 use crate::sync::{Mutex, OnceLock};
 
 static ENV: OnceLock<Mutex<BTreeMap<OsString, OsString>>> = OnceLock::new();
@@ -101,4 +102,41 @@ pub unsafe fn unsetenv(key: &OsStr) -> io::Result<()> {
     let mut guard = env_map().lock().unwrap_or_else(|p| p.into_inner());
     guard.remove(key);
     Ok(())
+}
+
+// Cwd surface backing `std::env::current_dir` / `std::env::set_current_dir`
+// on seraph. Wired up by the `apply_env_dispatch_overlay` patch to
+// `library/std/src/env.rs`, which adds a `target_os = "seraph"` cfg arm
+// dispatching here instead of through `os_imp::*` (seraph has no PAL
+// under `sys/pal/seraph/`).
+//
+// `chdir` is a thin shim over `crate::os::seraph::set_current_dir`,
+// which performs the namespace walk from `root_dir_cap()` and stores
+// both the cap and the path string in lockstep. `getcwd` reads the
+// recorded path string back.
+//
+// Relative-path inputs (`"../foo"`, `"./bar"`) are NOT supported here:
+// the namespace protocol forbids `..`/`.` as name components
+// (`shared/namespace-protocol/src/name.rs` `NameError::DotOrDotDot`),
+// and seraph has no client-side lexical resolver yet. Tracked
+// separately; do not paper over with a pseudo-resolver.
+
+pub fn getcwd() -> io::Result<PathBuf> {
+    crate::os::seraph::current_dir_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "seraph: current_dir() called before set_current_dir() — \
+             the startup cap does not carry a path string",
+        )
+    })
+}
+
+pub fn chdir(p: &Path) -> io::Result<()> {
+    let s = p.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seraph: set_current_dir requires a UTF-8 path",
+        )
+    })?;
+    crate::os::seraph::set_current_dir(s)
 }

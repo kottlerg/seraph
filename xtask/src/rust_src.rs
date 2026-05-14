@@ -556,6 +556,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
     apply_time_overlay(&rust_src, overlay_root).context("time overlay")?;
     apply_args_overlay(&rust_src, overlay_root).context("args overlay")?;
     apply_env_overlay(&rust_src, overlay_root).context("env overlay")?;
+    apply_env_dispatch_overlay(&rust_src).context("env dispatch overlay")?;
     apply_process_overlay(&rust_src, overlay_root).context("process overlay")?;
     apply_pipe_overlay(&rust_src, overlay_root).context("pipe overlay")?;
     apply_fs_overlay(&rust_src, overlay_root).context("fs overlay")?;
@@ -851,6 +852,53 @@ fn apply_env_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::*;\n    }\n",
     )
+}
+
+/// Route `std::env::current_dir` / `std::env::set_current_dir` through
+/// the seraph env-imp module on seraph. Upstream dispatches both to
+/// `os_imp::*` (= `sys::pal::*::os`), but seraph has no PAL under
+/// `sys/pal/seraph/` — `os_imp` resolves to `sys::pal::unsupported::os`,
+/// which returns `Unsupported`. The two functions delegate to
+/// `crate::sys::env::seraph::{getcwd, chdir}` instead, which bridge to
+/// the cap-native cwd surface in `crate::os::seraph`.
+fn apply_env_dispatch_overlay(rust_src: &Path) -> Result<()>
+{
+    let env_rs = rust_src.join("library/std/src/env.rs");
+    let orig =
+        fs::read_to_string(&env_rs).with_context(|| format!("reading {}", env_rs.display()))?;
+    if orig.contains(MARKER)
+    {
+        return Ok(());
+    }
+
+    let a1 = "pub fn current_dir() -> io::Result<PathBuf> {\n    os_imp::getcwd()\n}";
+    let a1r = "pub fn current_dir() -> io::Result<PathBuf> {\n    \
+               // seraph-overlay: dispatch through sys::env for cwd-cap bridge\n    \
+               #[cfg(target_os = \"seraph\")]\n    \
+               { env_imp::getcwd() }\n    \
+               #[cfg(not(target_os = \"seraph\"))]\n    \
+               { os_imp::getcwd() }\n}";
+
+    let a2 = "pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {\n    \
+              os_imp::chdir(path.as_ref())\n}";
+    let a2r = "pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {\n    \
+               // seraph-overlay: dispatch through sys::env for cwd-cap bridge\n    \
+               #[cfg(target_os = \"seraph\")]\n    \
+               { env_imp::chdir(path.as_ref()) }\n    \
+               #[cfg(not(target_os = \"seraph\"))]\n    \
+               { os_imp::chdir(path.as_ref()) }\n}";
+
+    if !orig.contains(a1) || !orig.contains(a2)
+    {
+        bail!(
+            "env.rs anchors not found — upstream layout likely changed at {}",
+            env_rs.display()
+        );
+    }
+    let patched = orig.replace(a1, a1r).replace(a2, a2r);
+    write_new_file(&env_rs, &patched)?;
+    step(&format!("seraph-toolchain: patched {}", env_rs.display()));
+    Ok(())
 }
 
 fn apply_stdio_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>

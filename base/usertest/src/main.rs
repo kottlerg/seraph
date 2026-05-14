@@ -119,6 +119,7 @@ fn main()
     command_cwd_missing_phase();
     command_invalid_elf_loop_phase();
     stdio_file_unsupported_phase();
+    env_cwd_unset_phase();
     // Keep `fs_open_relative_phase` last: it installs a process-global
     // `current_dir_cap()` that persists across phases. Subsequent
     // phases that walk the same fs with high cap pressure (e.g.
@@ -2176,9 +2177,32 @@ fn fs_open_relative_phase()
     let pre_err = File::open("test.txt").expect_err("relative open without cwd must fail");
     assert_eq!(pre_err.kind(), std::io::ErrorKind::Unsupported);
 
-    // Install /srv as cwd. The walk goes through vfsd's synthetic root.
+    // Install /srv as cwd via the cap-native primitive. The walk goes
+    // through vfsd's synthetic root.
     std::os::seraph::set_current_dir("/srv").expect("set_current_dir(/srv) failed");
     assert_ne!(std::os::seraph::current_dir_cap(), 0);
+
+    // Cap-native `set_current_dir` also records the path string under
+    // the same Mutex as the cap, so `std::env::current_dir` sees `/srv`
+    // immediately afterwards. The two writers (cap-native and std-env)
+    // converge on the same backing store.
+    assert_eq!(
+        std::env::current_dir().expect("std::env::current_dir after cap-native set"),
+        std::path::PathBuf::from("/srv"),
+        "std::env::current_dir disagrees with cap-native set_current_dir",
+    );
+
+    // The std-portable `std::env::set_current_dir` path: same lockstep
+    // result, observable through both surfaces. Re-target /srv (same
+    // directory) so we can compare against the prior assertions
+    // without disturbing the cap-pressure expectations of subsequent
+    // assertions in this phase.
+    std::env::set_current_dir("/srv").expect("std::env::set_current_dir(/srv) failed");
+    assert_ne!(std::os::seraph::current_dir_cap(), 0);
+    assert_eq!(
+        std::env::current_dir().expect("std::env::current_dir after std-env set"),
+        std::path::PathBuf::from("/srv"),
+    );
 
     // Relative open now succeeds and reads the same bytes the absolute
     // path would yield.
@@ -2199,6 +2223,35 @@ fn fs_open_relative_phase()
     );
 
     std::os::seraph::log!("fs_open_relative phase passed");
+}
+
+/// `std::env::current_dir` returns `Unsupported` until something calls
+/// `set_current_dir` in this process. The startup cap installed from
+/// `ProcessInfo.current_dir_cap` does not carry a path string, and the
+/// namespace protocol forbids `..` / `.` as name components
+/// (`shared/namespace-protocol/src/name.rs`), so seraph has no
+/// FS-walking way to recover a string from a bare cap. The shape
+/// surfaces as `io::ErrorKind::Unsupported` rather than `NotFound`
+/// because the cwd directory *exists*; only its string label is
+/// absent.
+///
+/// MUST run before `fs_open_relative_phase`: that phase installs the
+/// path string permanently via `set_current_dir("/srv")`.
+fn env_cwd_unset_phase()
+{
+    assert_eq!(
+        std::os::seraph::current_dir_cap(),
+        0,
+        "env_cwd_unset_phase pre-condition: cwd cap should still be zero",
+    );
+    let err = std::env::current_dir()
+        .expect_err("std::env::current_dir() with no recorded path must fail");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::Unsupported,
+        "std::env::current_dir() pre-set should be Unsupported, got {err:?}",
+    );
+    std::os::seraph::log!("env_cwd_unset phase passed");
 }
 
 /// `Stdio::from(File)` is rejected at spawn on seraph rather than

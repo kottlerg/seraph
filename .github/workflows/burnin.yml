@@ -46,16 +46,7 @@ jobs:
         with:
           shared-key: burnin-${{ matrix.arch }}-${{ matrix.profile }}
 
-      - name: Swap boot.conf to init=ktest
-        run: |
-          sed -i \
-            -e 's|^init=init$|#init=init|' \
-            -e 's|^#init=ktest$|init=ktest|' \
-            -e 's|^cmdline=root=|#cmdline=root=|' \
-            -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
-            rootfs/esp/EFI/seraph/boot.conf
-
-      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }})
+      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }}) — usertest config
         run: |
           if [ "${{ matrix.profile }}" = "release" ]; then
             cargo xtask build --arch ${{ matrix.arch }} --release
@@ -63,16 +54,46 @@ jobs:
             cargo xtask build --arch ${{ matrix.arch }}
           fi
 
-      - name: ktest burn-in (4 × 40 iterations)
+      - name: usertest burn-in (4 × 20 iterations)
+        id: usertest-burnin
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
-            --parallel 4 --runs 40 --timeout 60
+            --parallel 4 --runs 20 --timeout 60
 
-      - name: Upload run-parallel logs on failure
-        if: failure()
+      - name: Upload usertest logs on failure
+        if: failure() && steps.usertest-burnin.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}
+          name: burnin-usertest-${{ matrix.arch }}-${{ matrix.profile }}
+          path: target/xtask/run-parallel/**/*.log
+          if-no-files-found: ignore
+
+      - name: Swap boot.conf to init=ktest and rebuild
+        run: |
+          sed -i \
+            -e 's|^init=init$|#init=init|' \
+            -e 's|^#init=ktest$|init=ktest|' \
+            -e 's|^cmdline=root=|#cmdline=root=|' \
+            -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
+            rootfs/esp/EFI/seraph/boot.conf
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo xtask build --arch ${{ matrix.arch }} --release
+          else
+            cargo xtask build --arch ${{ matrix.arch }}
+          fi
+
+      - name: ktest burn-in (4 × 20 iterations)
+        id: ktest-burnin
+        run: |
+          cargo xtask run-parallel \
+            --arch ${{ matrix.arch }} \
+            --parallel 4 --runs 20 --timeout 60
+
+      - name: Upload ktest logs on failure
+        if: failure() && steps.ktest-burnin.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: burnin-ktest-${{ matrix.arch }}-${{ matrix.profile }}
           path: target/xtask/run-parallel/**/*.log
           if-no-files-found: ignore

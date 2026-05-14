@@ -1,0 +1,108 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build-image:
+    # Guard workflow_dispatch from running against a branch ref — release
+    # artifacts must be anchored to a tagged commit so the asset filenames
+    # match the version they encode.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, riscv64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU, firmware, and zstd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-system-misc \
+            ovmf \
+            qemu-efi-riscv64 \
+            zstd
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-23
+          components: rust-src,rustfmt,clippy,llvm-tools
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.arch }}
+
+      - name: Build release (${{ matrix.arch }})
+        run: cargo xtask build --arch ${{ matrix.arch }} --release
+
+      - name: Compress and checksum disk image
+        run: |
+          TAG="${{ github.ref_name }}"
+          ARCH="${{ matrix.arch }}"
+          OUT="seraph-${TAG}-${ARCH}.img.zst"
+          zstd -19 -T0 disk.img -o "${OUT}"
+          sha256sum "${OUT}" > "${OUT}.sha256"
+
+      - name: Upload arch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: |
+            seraph-*.img.zst
+            seraph-*.img.zst.sha256
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS
+        run: |
+          cd artifacts
+          cat *.img.zst.sha256 | sort > SHA256SUMS
+          rm -f *.img.zst.sha256
+          ls -la
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          NOTES_FILE="docs/releases/${TAG}.md"
+          if [ ! -f "${NOTES_FILE}" ]; then
+            echo "::error::Release notes missing: ${NOTES_FILE}" >&2
+            echo "Create and commit ${NOTES_FILE} before tagging ${TAG}." >&2
+            exit 1
+          fi
+          gh release create "${TAG}" --draft \
+            --title "Seraph ${TAG}" \
+            --notes-file "${NOTES_FILE}" \
+            artifacts/seraph-*.img.zst \
+            artifacts/SHA256SUMS

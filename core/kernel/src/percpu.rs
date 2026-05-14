@@ -55,8 +55,8 @@ static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 /// sending IPIs to specific CPUs. Accepts a slice rather than a fixed-size
 /// array so the kernel's internal [`MAX_CPUS`] can diverge from the ABI's
 /// `BootInfo::cpu_ids` length; the ABI cap is larger today and only the
-/// leading [`MAX_CPUS`] entries are consumed. See the `TODO.md` entry
-/// "Kernel `MAX_CPUS` raise to match ABI".
+/// leading [`MAX_CPUS`] entries are consumed. Raising `MAX_CPUS` to match
+/// the ABI is tracked as issue #38.
 ///
 /// # Safety
 /// Single-threaded boot phase; must be called before SMP is active.

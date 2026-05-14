@@ -29,7 +29,7 @@ use namespace_protocol::{
 
 /// Maximum entries surfaced through `NS_LOOKUP` over a single fatfs
 /// session. Sized to the current test surface; an unbounded `NodeId`
-/// allocator is a follow-up (see [`TODO.md`](../../../../../TODO.md)).
+/// allocator is a follow-up (issue #27).
 pub const MAX_NODES: usize = 64;
 
 /// Per-NodeId metadata captured at lookup time.

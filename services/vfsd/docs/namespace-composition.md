@@ -184,10 +184,9 @@ Wire-label numbers for both surfaces live in [`ipc::vfsd_labels`] and
 A successful `install` retains the `synthetic_root_cap` (terminal
 nodes) and any walked `fallthrough_cap`s (synthetic intermediates)
 for the lifetime of the vfsd process. Unmount is not implemented;
-the mount-tree is permanent until vfsd exits. The deferred follow-
-ups in [`TODO.md`](../../../TODO.md) cover per-process
-`system_root_cap` distribution (different processes seeing different
-roots) and `cap_revoke`-driven unmount.
+the mount-tree is permanent until vfsd exits. Deferred follow-ups:
+per-process `system_root_cap` distribution (different processes
+seeing different roots) and `cap_revoke`-driven unmount.
 
 ---
 

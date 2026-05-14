@@ -32,7 +32,7 @@ use crate::mm::{PAGE_SIZE, paging::phys_to_virt};
 /// by arch code that wants bootloader-provided MMIO bases. Today the arch
 /// code still uses compiled-in constants; this cache makes the values
 /// available for the next round of work without forcing an immediate
-/// refactor (see `TODO.md`).
+/// refactor.
 ///
 /// # Safety
 /// Written exactly once, single-threaded, from Phase 6. Subsequent reads

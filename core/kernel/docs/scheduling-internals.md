@@ -320,7 +320,7 @@ Zero overhead when healthy.
 **Does NOT catch:** a single CPU spinning IRQ-disabled while peers make
 progress (no all-CPUs signal); BSP hardlockup (BSP timer stops, counter
 stops, detector can't fire). A future hardlockup detector (NMI / always-on
-S-mode timer) would close the latter gap; tracked in `TODO.md`.
+S-mode timer) would close the latter gap; tracked as issue #33.
 
 **Why kernel-side:** when every CPU is in kernel mode, no userspace monitor
 gets dispatched. The dump is also the only path that reads per-CPU

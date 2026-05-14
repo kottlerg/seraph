@@ -1,5 +1,11 @@
 # Seraph
 
+[![build-test](https://github.com/kottlerg/seraph/actions/workflows/build-test.yml/badge.svg?branch=master)](https://github.com/kottlerg/seraph/actions/workflows/build-test.yml?query=branch%3Amaster)
+[![license](https://img.shields.io/github/license/kottlerg/seraph)](LICENSE)
+[![language](https://img.shields.io/github/languages/top/kottlerg/seraph)](https://www.rust-lang.org/)
+[![targets](https://img.shields.io/badge/targets-x86__64%20%7C%20riscv64-blue)](docs/architecture.md)
+[![tag](https://img.shields.io/github/v/tag/kottlerg/seraph)](https://github.com/kottlerg/seraph/tags)
+
 Seraph is a microkernel operating system written in Rust, targeting x86-64 and RISC-V (RV64GC).
 
 ## Goals

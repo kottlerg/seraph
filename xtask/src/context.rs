@@ -13,8 +13,8 @@ pub struct Context
     /// Absolute path to the workspace root (parent of xtask/).
     pub root: PathBuf,
 
-    /// Sysroot staging area: used directly as a virtual FAT drive by QEMU.
-    /// Populated by `cargo xtask build`, cleared by `cargo xtask clean`.
+    /// Sysroot staging area: contents are packaged into `disk.img` (GPT
+    /// image) by `cargo xtask build` and cleared by `cargo xtask clean`.
     pub sysroot: PathBuf,
 
     /// Cargo's `target/` directory, shared by all workspace members.

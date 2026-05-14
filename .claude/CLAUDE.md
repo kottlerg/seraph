@@ -38,10 +38,25 @@ truth for "how work is tracked and shipped" on this project.
 
 ## Validation
 - Changes MUST be validated beyond successful compilation.
-- At minimum: the relevant build MUST succeed, and functional tests MUST
-  execute against the running OS on both `x86_64` and `riscv64` (`cargo xtask
-  run` booting ktest or userspace services under QEMU). Host-side compilation,
-  unit tests, and `cargo check` alone do not satisfy this requirement.
+- At minimum, on both `x86_64` and `riscv64`:
+  1. `cargo xtask build` MUST succeed.
+  2. `cargo xtask run` (a pure runner; it does not build) MUST then boot
+     ktest or userspace services under QEMU and the chosen mode's
+     terminal pass marker MUST appear.
+- Host-side compilation, unit tests, and `cargo check` alone do not
+  satisfy this requirement.
+
+## Completeness
+- Drift or defects discovered on the surface under audit MUST be fixed in
+  the same pass; they are the scope, surfaced incidentally.
+- "Out of scope", "follow-up", and similar deferrals MUST NOT be used to
+  avoid mechanically reachable work consistent with the task's intent.
+- Material scope expansions MUST be stated in one line and continued, not
+  paused for permission.
+- Genuine deferrals (different review surface, or expansion too large to
+  absorb) MUST be filed as GitHub Issues per
+  [docs/conventions.md](../docs/conventions.md), with user approval,
+  before the task closes.
 
 ## Conflicts
 - If any instruction, plan, or change conflicts with documented invariants or these constraints,

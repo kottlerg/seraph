@@ -24,39 +24,28 @@ Run `rustup show` in the repository root to confirm the toolchain is active.
 
 ## Workspace Structure
 
-The repository is a Cargo virtual workspace. Each component is a workspace member
-with its own `Cargo.toml`. Components targeting different compilation targets are
-separate crates; types shared between them are extracted into library crates.
+The repository is a Cargo virtual workspace. Top-level directories and their
+purposes are catalogued in the [root `README.md` Structure table](../README.md#structure);
+this section covers only the build-relevant consequences of the layout.
 
-```
-Cargo.toml                    # Virtual workspace root (default-members = ["xtask"])
-├── abi/
-│   ├── boot-protocol/        # BootInfo types (no_std lib) — boot ABI
-│   └── syscall/              # Syscall numbers, argument layout, return codes (no_std lib)
-├── kernel/                   # Microkernel (no_std; custom target)
-├── boot/                     # UEFI bootloader (no_std; UEFI target)
-├── init/                     # Bootstrap process (no_std; kernel target)
-├── shared/
-│   ├── elf/                  # ELF parser (no_std lib)
-│   └── syscall/              # Inline-asm syscall wrappers — userspace only (no_std lib)
-└── xtask/                    # Build task runner (std; host target)
-```
+Each component is a workspace member with its own `Cargo.toml`. Components
+targeting different compilation targets are separate crates; types shared
+between them are extracted into library crates under `abi/` (stable
+cross-boundary contracts) and `shared/` (utility crates without ABI-stability
+commitments).
 
-`abi/boot-protocol` is a `#![no_std]` library containing the `BootInfo` structure
-and associated types. Both the bootloader and kernel depend on it. This crate is the
-single source of truth for the boot protocol ABI; the types, layout, and
-version invariants live in the crate itself at
-[`abi/boot-protocol/`](../abi/boot-protocol/), and the kernel-entry
-contract the ABI supports is in
-[`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md).
+Setting `default-members = ["xtask"]` in the workspace root `Cargo.toml` means
+bare `cargo build` and `cargo run` operate only on the host-target xtask
+binary. Components targeting the kernel, bootloader, or std-userspace triples
+must be built via `cargo xtask build` so the correct custom target JSON and
+`-Zbuild-std` flags are passed.
 
-`abi/syscall` defines syscall numbers, argument layout, and return codes. It is
-the single source of truth for the syscall ABI; both the kernel and userspace
-import it. Inline assembly that invokes syscalls lives in `shared/syscall`.
-
-Setting `default-members = ["xtask"]` means bare `cargo build` and `cargo run`
-operate only on the host-target xtask binary. Components using custom embedded
-targets must be built via `cargo xtask build`.
+`abi/boot-protocol` is the source of truth for the boot protocol ABI; both
+the bootloader and kernel depend on it. The kernel-entry contract the ABI
+supports is in [`core/boot/docs/kernel-handoff.md`](../core/boot/docs/kernel-handoff.md).
+`abi/syscall` defines syscall numbers, argument layout, and return codes; both
+the kernel and userspace import it. Inline assembly that invokes syscalls
+lives in `shared/syscall`.
 
 ---
 
@@ -65,71 +54,109 @@ targets must be built via `cargo xtask build`.
 The kernel cannot be compiled with standard Rust targets because it requires
 specific hardware configuration: no red zone, no SSE/AVX before explicit
 initialisation, and the kernel code model for higher-half placement.
+Std-enabled userspace additionally needs a Seraph-OS target (`os: seraph`)
+so `-Zbuild-std` selects `std::sys::seraph` rather than `std::sys::unknown`.
 
-Custom target JSON specifications live in `targets/`:
+Custom target JSON specifications live under
+[`xtask/targets/`](../xtask/targets/) — see that directory's
+[`README.md`](../xtask/targets/README.md) for the file inventory and which
+triple each one defines.
 
-| File | Architecture | Key properties |
-|---|---|---|
-| `x86_64-seraph-none.json` | x86-64 | Red zone off, SSE/AVX/MMX off, soft-float, kernel code model |
-| `riscv64gc-seraph-none.json` | RISC-V | RV64GC features, medium code model, lp64d ABI |
+Key properties shared by the kernel-triple JSONs
+(`x86_64-seraph-none.json`, `riscv64gc-seraph-none.json`):
 
-Both targets set `panic-strategy: abort` and link with `rust-lld`.
+- x86-64: red zone off, SSE/AVX/MMX off, soft-float, kernel code model.
+- RISC-V: RV64GC feature set, medium code model, lp64d ABI.
+- Both: `panic-strategy: abort`, link with `rust-lld`.
 
-The bootloader uses built-in Rust targets (`x86_64-unknown-uefi` for x86-64),
-so no custom JSON is needed for it.
+The std-userspace triples (`x86_64-seraph.json`, `riscv64gc-seraph.json`)
+keep the same hardware floors as the kernel triples but switch `os` to
+`seraph` so the patched rust-src tree materialised by xtask is selected.
 
-Custom targets require `-Zbuild-std=core,alloc,compiler_builtins` to rebuild
-the standard library from source. This is passed explicitly by the build scripts
-rather than via `.cargo/config.toml`, to avoid interfering with `cargo test`
-(which builds for the host target and does not need `build-std`).
+The x86-64 bootloader uses the built-in `x86_64-unknown-uefi` target, so no
+custom JSON is needed. The RISC-V bootloader uses
+`riscv64gc-seraph-uefi.json` because no equivalent built-in target exists.
+
+Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
+kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace
+triples) to rebuild the standard library from source. This is passed
+explicitly by the build scripts rather than via `.cargo/config.toml`, to
+avoid interfering with `cargo test` (which builds for the host target and
+does not need `build-std`).
 
 ---
 
 ## Build Output: the Sysroot
 
-Build artifacts are staged in `sysroot/`, which is used directly as a virtual
-FAT drive by QEMU. The sysroot is built for one architecture at a time; the
-active architecture is recorded in `sysroot/.arch`. Switching architectures
-requires a clean rebuild.
+Build artifacts are staged in `sysroot/`, which is then packaged into the
+top-level `disk.img` GPT image consumed by QEMU. The sysroot is built for
+one architecture at a time; the active architecture is recorded in
+`sysroot/.arch`. Switching architectures requires a clean rebuild.
 
 ```
 sysroot/
-  .arch                  # "x86_64" or "riscv64"
-  efi/
-    BOOT/
-      BOOTX64.EFI        # UEFI fallback bootloader path (x86-64)
-    seraph/
-      seraph-kernel      # Kernel ELF binary
-  conf/                  # (future) System configuration
-  lib/                   # (future) Shared libraries
+  .arch                   # "x86_64" or "riscv64"
+  esp/                    # EFI System Partition contents
+    EFI/
+      BOOT/               # UEFI fallback boot path
+        BOOTX64.EFI       # x86-64
+        BOOTRISCV64.EFI   # RISC-V
+      seraph/             # Seraph vendor directory
+        boot.efi          # Bootloader (also copied to EFI/BOOT/<arch>.EFI)
+        boot.conf         # Boot config (from rootfs/) — selects init mode
+        kernel            # Microkernel
+        init              # First userspace process
+        ktest             # Kernel-validation harness
+        procmgr, memmgr, devmgr, vfsd, virtio-blk
+                          # Boot-loaded services (loaded directly by the
+                          # bootloader as boot modules)
+        fatfs             # Boot-loaded once to mount root; also lives
+                          # under /bin/fatfs for VFS-loaded re-spawns
+  bin/                    # Std-userspace binaries loaded by procmgr from
+                          # the root partition via VFS at runtime
+                          # (svcmgr, fatfs, usertest, hello, crasher,
+                          # stackoverflow, pipefault, stdiotest, …)
+  config/                 # System configuration (from rootfs/)
+  srv/                    # Service data files (from rootfs/)
+  usertest/               # Usertest data files (from rootfs/)
 ```
 
-The UEFI firmware (OVMF) discovers the bootloader at `EFI/BOOT/BOOTX64.EFI`
-(the UEFI specification's fallback boot path). The kernel lives alongside it
-under `EFI/seraph/`, the Seraph vendor directory within the EFI partition. This
-arrangement mirrors real deployments: when the system eventually has a separate
-EFI System Partition and additional mounted filesystems, both the bootloader and
-the kernel remain on the ESP where the firmware can reach them.
+The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
+(the UEFI specification's fallback boot path). The kernel and boot-loaded
+services live alongside it under `EFI/seraph/`, the Seraph vendor directory
+within the EFI partition.
 
-No temporary copies or image construction steps are needed — `cargo xtask run`
-passes the sysroot directory directly to QEMU's `fat:rw:` drive parameter.
+Non-ESP directories (`bin/`, `config/`, `srv/`, `usertest/`) populate the
+GPT image's root partition, which userspace services mount via vfsd /
+fatfs after boot. The split mirrors real deployments: anything the
+firmware must reach lives on the ESP; everything else lives on the root
+partition.
 
-Cargo's own `target/` directory contains intermediate compilation artifacts and
-is not part of the sysroot.
+The `esp/` and root-partition trees are populated from two sources:
+
+- Compiled binaries are installed by `cargo xtask build` to their
+  destinations (`esp/EFI/seraph/<name>` for boot modules,
+  `bin/<name>` for std-userspace services, both for `fatfs`).
+- Static files in [`rootfs/`](../rootfs/) are mirrored directly into
+  the sysroot — every file's path under `rootfs/` is its path under
+  `sysroot/` (see [`rootfs/README.md`](../rootfs/README.md)).
+
+The disk image is assembled by xtask after the sysroot is populated. Cargo's
+own `target/` directory contains intermediate compilation artifacts and is
+not part of the sysroot.
 
 ---
 
 ## Convenience Commands
 
-All build, run, clean, and test operations go through `cargo xtask`. See
-[`xtask/README.md`](../xtask/README.md) for the full command reference.
+All build, run, clean, and test operations go through `cargo xtask`. The
+authoritative command reference — every subcommand, every flag, expected
+behavior — lives in [`xtask/README.md`](../xtask/README.md).
 
-| Command | Purpose |
-|---|---|
-| `cargo xtask build` | Build components and populate the sysroot |
-| `cargo xtask clean` | Remove the sysroot (and optionally `target/`) |
-| `cargo xtask run` | Build (incremental) and launch under QEMU |
-| `cargo xtask test` | Run workspace unit tests on the host |
+The available subcommands are `build`, `run`, `run-parallel`, `clean`, and
+`test`. `build` and `run` are intentionally decoupled: `run` is a pure
+runner and does not build, so a typical workflow is `cargo xtask build`
+followed by `cargo xtask run` (or `cargo xtask run-parallel` for stress).
 
 ---
 
@@ -139,9 +166,9 @@ Seraph boots via its own UEFI bootloader on both architectures. This requires
 UEFI firmware in QEMU — SeaBIOS cannot load UEFI applications.
 
 **x86-64:** Requires OVMF from `edk2-ovmf`. `cargo xtask run` searches standard
-Fedora, Debian, and Arch install paths. The bootloader `.efi` is exposed to QEMU
-via a virtual FAT image (QEMU's `fat:rw:DIR` syntax), which OVMF reads like a
-real FAT partition.
+Fedora, Debian, and Arch install paths. The bootloader `.efi` reaches OVMF via
+the GPT image's ESP partition, attached to the guest as a virtio-blk-pci
+device.
 
 **RISC-V:** Requires `edk2-riscv64` firmware. `cargo xtask run` searches standard
 firmware paths and pads `RISCV_VIRT_CODE.fd` / `RISCV_VIRT_VARS.fd` to 32 MiB
@@ -177,8 +204,7 @@ For test naming conventions and requirements (what must be tested, what should n
 ## xtask
 
 `xtask/` is a Rust binary crate that runs on the host. It is the primary build
-interface — `build.sh`, `clean.sh`, `run.sh`, and `test.sh` have been replaced.
-Invoke it with `cargo xtask <command>`.
+interface; invoke it with `cargo xtask <command>`.
 
 See [`xtask/README.md`](../xtask/README.md) for the full command reference and
 [`xtask/src/main.rs`](../xtask/src/main.rs) for the dispatch entry point.

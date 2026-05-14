@@ -19,6 +19,11 @@ See [docs/coding-standards.md](../docs/coding-standards.md) — non-negotiable a
 ## Documentation invariants
 See [docs/documentation-standards.md](../docs/documentation-standards.md) — non-negotiable authority.
 
+## Project conventions
+See [docs/conventions.md](../docs/conventions.md) for versioning, backlog tracking (GitHub Issues),
+branch/PR workflow, CI gating, and release production. Treat its rules as the source of
+truth for "how work is tracked and shipped" on this project.
+
 ## Operating procedure
 - Documentation MUST be consumed by scope:
   1. System scope (`docs/`)

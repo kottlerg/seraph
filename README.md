@@ -80,6 +80,7 @@ Overall project design documents live in [`docs/`](docs/):
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands
 - [Coding Standards](docs/coding-standards.md) — Rust conventions, safety contracts, documentation rules
 - [Documentation Standards](docs/documentation-standards.md) — document hierarchy, authority, backlinks, required structure
+- [Conventions](docs/conventions.md) — versioning, backlog tracking via GitHub Issues, branch and PR workflow, CI gating, release production
 - [Release Notes](docs/releases/README.md) — per-tag notes catalogue, naming, source-of-truth discipline, workflow integration
 
 Each component contains a `README.md` that references the design docs relevant to that module.

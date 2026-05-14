@@ -383,6 +383,7 @@ pub extern "C" fn timer_isr()
 /// `Instant::now()` (which reads `elapsed_us` via `SYS_SYSTEM_INFO`) share
 /// a single counter.
 #[allow(dead_code)] // Required by arch interface: kernel/docs/arch-interface.md
+#[cfg(not(test))]
 pub fn current_tick() -> u64
 {
     let Some(us) = elapsed_us()
@@ -396,6 +397,13 @@ pub fn current_tick() -> u64
         return 0;
     }
     us.saturating_mul(tps) / 1_000_000
+}
+
+/// Test stub — host tests have no TSC calibration.
+#[cfg(test)]
+pub fn current_tick() -> u64
+{
+    0
 }
 
 /// Return the timer interrupt rate (interrupts per second, matching `current_tick()`).

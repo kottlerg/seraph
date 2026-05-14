@@ -315,11 +315,12 @@ impl CSpace
     ///
     /// Silently ignores an out-of-range, unmapped, or zero index.
     ///
-    /// Idempotent: a slot already on the free list (tag == Null) is left
-    /// alone. Pushing again would set `slot.next_free = slot` when the
-    /// caller passes the current `free_head` — a self-loop that turns the
-    /// next `allocate_slot` into an unbounded spin under IRQs-off
-    /// cspace.lock.
+    /// Rejects re-freeing the current `free_head`: pushing it again would
+    /// set `slot.next_free = slot`, a self-loop that turns the next
+    /// `allocate_slot` into an unbounded spin under IRQs-off cspace.lock.
+    /// A Null tag alone is not a "double-free" signal — `allocate_slot`
+    /// clears the slot on pop, so a freshly-allocated, not-yet-populated
+    /// slot is also Null-tagged but legitimately off the list.
     pub fn free_slot(&mut self, index: u32)
     {
         let Some(nz_index) = NonZeroU32::new(index)
@@ -327,18 +328,18 @@ impl CSpace
         {
             return;
         };
+        if self.free_head == Some(nz_index)
+        {
+            #[cfg(not(test))]
+            crate::kprintln!(
+                "free_slot: double-free index={} ignored (already free-list head)",
+                index
+            );
+            return;
+        }
         let old_head = self.free_head;
         if let Some(slot) = self.slot_mut(index)
         {
-            if slot.tag == super::slot::CapTag::Null
-            {
-                #[cfg(not(test))]
-                crate::kprintln!(
-                    "free_slot: double-free index={} ignored (slot already Null)",
-                    index
-                );
-                return;
-            }
             slot.set_next_free(old_head);
             self.free_head = Some(nz_index);
             self.free_count += 1;

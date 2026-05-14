@@ -2116,8 +2116,8 @@ mod tests
         // via NonZeroU32 niche) = 16 bytes, alignment 4.
         assert_eq!(size_of::<KernelObjectHeader>(), 16);
         // FrameObject: 16 header + 8 base + 8 size + 8 available_bytes +
-        // 1 owns_memory + 7 pad + 8 allocator pointer + 4 lock + 4 pad = 64 bytes.
-        assert_eq!(size_of::<FrameObject>(), 64);
+        // 1 owns_memory + 7 pad + 40 inline allocator + 4 lock + 4 pad = 96 bytes.
+        assert_eq!(size_of::<FrameObject>(), 96);
         // MmioRegionObject: 16 header + 8 base + 8 size + 4 flags + 4 pad = 40.
         assert_eq!(size_of::<MmioRegionObject>(), 40);
         // InterruptObject: 16 header + 4 start + 4 count = 24.

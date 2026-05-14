@@ -23,6 +23,8 @@
 
 use crate::cell::{Cell, UnsafeCell};
 use crate::mem::MaybeUninit;
+use crate::path::PathBuf;
+use crate::sync::Mutex;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sys::alloc::seraph as pal_alloc;
 use crate::sys::reserve as pal_reserve;
@@ -494,6 +496,17 @@ static ROOT_DIR_CAP: crate::sync::atomic::AtomicU32 =
 static CURRENT_DIR_CAP: crate::sync::atomic::AtomicU32 =
     crate::sync::atomic::AtomicU32::new(0);
 
+// String-form mirror of the cwd cap. Held under a Mutex so that
+// `set_current_dir` updates the cap and the path atomically (readers
+// of the pair never see a torn (new cap, old path) intermediate).
+//
+// `None` is the startup state: `_start` installs `CURRENT_DIR_CAP`
+// from `ProcessInfo.current_dir_cap`, but the cap does not carry a
+// path string — the spawner has no obligation to label it. Until a
+// process calls `set_current_dir`, `current_dir_path()` returns
+// `None` and `std::env::current_dir()` reports `Unsupported`.
+static CURRENT_DIR_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 /// Install the process-wide root-directory namespace cap. Called by
 /// `_start` from `ProcessInfo.system_root_cap`. Demoted to crate-internal
 /// visibility because the only legitimate writer is std's own startup
@@ -528,15 +541,35 @@ pub fn current_dir_cap() -> u32 {
     CURRENT_DIR_CAP.load(crate::sync::atomic::Ordering::Acquire)
 }
 
-/// Walk `path` from `root_dir_cap()` and install the resolved
-/// directory cap as the process-wide current-directory cap.
+/// Snapshot of the cwd path string recorded by the most recent
+/// successful `set_current_dir`. Returns `None` until `set_current_dir`
+/// has been called in this process — the startup cap installed from
+/// `ProcessInfo.current_dir_cap` carries no string label.
 ///
-/// The seraph-native cwd primitive: cwd is a held cap, not a string.
+/// Backs `std::env::current_dir()` on seraph through
+/// `crate::sys::env::seraph::getcwd`.
+pub(crate) fn current_dir_path() -> Option<PathBuf> {
+    CURRENT_DIR_PATH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Walk `path` from `root_dir_cap()` and install the resolved
+/// directory cap as the process-wide current-directory cap. Also
+/// records `path` as the string mirror returned by
+/// [`current_dir_path`]; the cap and the path are updated under one
+/// held lock so concurrent readers never observe a (new cap, old
+/// path) intermediate.
+///
+/// The seraph-native cwd primitive: cwd is a held cap, with a path
+/// string kept alongside only for `std::env::current_dir()` to echo.
 /// The existing cap (if any) is `cap_delete`'d and replaced.
 ///
-/// `std::env::set_current_dir` is `Unsupported` on seraph because the
-/// upstream API is path-as-string-only and cannot express the cap
-/// model directly; this function is the seraph-specific shape.
+/// `std::env::set_current_dir(impl AsRef<Path>)` delegates to this
+/// function on seraph via the env-imp dispatch overlay; this remains
+/// the direct entry point for cap-native callers who already hold a
+/// `&str` path.
 ///
 /// # Errors
 /// - `Unsupported` if `root_dir_cap()` is zero.
@@ -558,7 +591,10 @@ pub fn set_current_dir(path: &str) -> crate::io::Result<()> {
         ));
     }
     let walked = crate::sys::fs::walk_path_to_dir(root, path, ipc_buf)?;
+    let mut guard = CURRENT_DIR_PATH.lock().unwrap_or_else(|p| p.into_inner());
     let prev = CURRENT_DIR_CAP.swap(walked.dir_cap, crate::sync::atomic::Ordering::AcqRel);
+    *guard = Some(PathBuf::from(path));
+    drop(guard);
     if prev != 0 {
         let _ = syscall::cap_delete(prev);
     }

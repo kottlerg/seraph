@@ -224,7 +224,9 @@ pub fn register_with_memmgr(memmgr_ep: u32, ipc_buf: *mut u64) -> (u32, u64)
     {
         return (0, 0);
     }
-    let msg = IpcMessage::new(memmgr_labels::REGISTER_PROCESS);
+    let msg = IpcMessage::builder(memmgr_labels::REGISTER_PROCESS)
+        .word(0, u64::from(ipc::MEMMGR_LABELS_VERSION))
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let Ok(reply) = (unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) })
     else

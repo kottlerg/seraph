@@ -369,10 +369,23 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
         }
         else if label_id == GET_LOG_CAP
         {
-            handle_get_log_cap(log_ep, ipc_buf_raw);
-            // handle_get_log_cap performs its own ipc_reply (with the
-            // minted cap or an error code), so we do not double-reply
-            // here.
+            if recv.word(0) == u64::from(ipc::LOG_LABELS_VERSION)
+            {
+                handle_get_log_cap(log_ep, ipc_buf_raw);
+                // handle_get_log_cap performs its own ipc_reply (with the
+                // minted cap or an error code), so we do not double-reply
+                // here.
+            }
+            else
+            {
+                // Caller built against a different `shared/ipc` revision;
+                // reject before minting a token. Reply code 3 is local to
+                // GET_LOG_CAP's reply vocabulary (0=success, 1=token
+                // counter wrap, 2=cap_derive failure, 3=version mismatch).
+                // SAFETY: ipc_buf_raw is the log thread's registered IPC
+                // buffer page.
+                let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(3), ipc_buf_raw) };
+            }
         }
         else
         {

@@ -205,7 +205,9 @@ pub fn ingest_config_mounts(vfsd_ep: u32, ipc_buf: *mut u64) -> IngestOutcome
 /// walk-and-attenuate for sandboxed views).
 pub fn request_system_root(vfsd_ep: u32, ipc_buf: *mut u64) -> u32
 {
-    let msg = ipc::IpcMessage::new(vfsd_labels::GET_SYSTEM_ROOT_CAP);
+    let msg = ipc::IpcMessage::builder(vfsd_labels::GET_SYSTEM_ROOT_CAP)
+        .word(0, u64::from(ipc::VFSD_LABELS_VERSION))
+        .build();
     // SAFETY: ipc_buf is the caller's registered IPC buffer page.
     let Ok(reply) = (unsafe { ipc::ipc_call(vfsd_ep, &msg, ipc_buf) })
     else

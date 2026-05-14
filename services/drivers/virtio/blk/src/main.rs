@@ -704,13 +704,20 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
         return;
     }
 
-    if msg.word_count() < 2
+    if msg.word_count() < 3
     {
         reject(ipc_buf);
         return;
     }
-    let base_lba = msg.word(0);
-    let length_lba = msg.word(1);
+    if msg.word(0) != u64::from(ipc::BLK_LABELS_VERSION)
+    {
+        let reply = IpcMessage::new(ipc::blk_errors::LABEL_VERSION_MISMATCH);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+    let base_lba = msg.word(1);
+    let length_lba = msg.word(2);
 
     // Bound must fit inside device capacity.
     let end = base_lba.saturating_add(length_lba);

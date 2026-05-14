@@ -222,7 +222,11 @@ fn service_loop(
             {
                 fs_labels::FS_MOUNT =>
                 {
-                    if state.fat_size == 0
+                    if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
+                    {
+                        ipc::fs_errors::LABEL_VERSION_MISMATCH
+                    }
+                    else if state.fat_size == 0
                     {
                         validate_bpb(caps, state, cache, ipc_buf)
                     }

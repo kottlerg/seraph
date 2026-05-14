@@ -39,6 +39,12 @@ members = [
 # Components targeting custom/embedded targets are built via build.sh.
 default-members = ["xtask"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+
 [workspace.lints.clippy]
 all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

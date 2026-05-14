@@ -151,7 +151,9 @@ fn main() -> !
 
     // Query devmgr for the block device endpoint.
     std::os::seraph::log!("querying devmgr for block device");
-    let query_msg = IpcMessage::new(ipc::devmgr_labels::QUERY_BLOCK_DEVICE);
+    let query_msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_BLOCK_DEVICE)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(query_reply) = (unsafe { ipc::ipc_call(caps.registry_ep, &query_msg, ipc_buf) })
     else
@@ -383,6 +385,17 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
                         "GET_SYSTEM_ROOT_CAP rejected: token lacks SEED_AUTHORITY"
                     );
                     let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                }
+                else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
+                {
+                    std::os::seraph::log!(
+                        "GET_SYSTEM_ROOT_CAP rejected: caller VFSD_LABELS_VERSION={} expected {}",
+                        recv.word(0),
+                        ipc::VFSD_LABELS_VERSION
+                    );
+                    let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
                     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
                     let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
                 }
@@ -950,8 +963,9 @@ fn derive_and_register_partition(
 ) -> Option<u32>
 {
     let msg = IpcMessage::builder(blk_labels::REGISTER_PARTITION)
-        .word(0, base_lba)
-        .word(1, length_lba)
+        .word(0, u64::from(ipc::BLK_LABELS_VERSION))
+        .word(1, base_lba)
+        .word(2, length_lba)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let Ok(reply) = (unsafe { ipc::ipc_call(rt.blk_ep, &msg, ipc_buf) })

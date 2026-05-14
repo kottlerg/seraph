@@ -40,7 +40,7 @@ use core::prelude::rust_2024::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::{
-    IpcMessage,
+    IpcMessage, LOG_LABELS_VERSION,
     log_labels::GET_LOG_CAP,
     stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME},
 };
@@ -146,7 +146,9 @@ pub fn ensure_tokened_cap(ipc_buf: *mut u64) -> u32
 /// `ipc_buffer_set` on the current thread.
 pub fn acquire(discovery_cap: u32, ipc_buf: *mut u64) -> Result<u32, i64>
 {
-    let msg = IpcMessage::new(GET_LOG_CAP);
+    let msg = IpcMessage::builder(GET_LOG_CAP)
+        .word(0, u64::from(LOG_LABELS_VERSION))
+        .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer per the
     // function's documented invariant.
     let reply = unsafe { ipc::ipc_call(discovery_cap, &msg, ipc_buf) }?;

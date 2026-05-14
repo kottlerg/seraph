@@ -36,7 +36,39 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //
 // Per-service IPC operation labels. Namespaced by service because label
 // numbers are only meaningful relative to a specific endpoint.
+//
+// Each `*_LABELS_VERSION` constant declares the wire-protocol version of
+// its namespace. Bumped on any breaking change (label added, removed, or
+// repurposed; payload shape change). Three consumer-wiring categories:
+//
+//   Handshake-checked at first contact — producer prepends its compiled
+//   `*_LABELS_VERSION` as the first u32 of the handshake payload; receiver
+//   compares to its own and rejects on mismatch. Mismatched binaries are
+//   stopped before any per-IO traffic.
+//     FS_LABELS_VERSION     — fs_labels::FS_MOUNT             (vfsd ↔ fatfs)
+//     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd)
+//     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
+//     DEVMGR_LABELS_VERSION — devmgr_labels::QUERY_BLOCK_DEVICE (vfsd ↔ devmgr)
+//     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
+//     SVCMGR_LABELS_VERSION — svcmgr_labels::REGISTER_SERVICE   (init ↔ svcmgr)
+//     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP            (std process ↔ logd)
+//
+//   Implicitly covered by parent-channel handshake — the channel was opened
+//   against a cap-token first minted by a handshake-checked namespace; the
+//   token's presence is the version stamp, zero per-message cost.
+//     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
+//     STREAM_LABELS_VERSION — caps from log_labels handshake
+//
+//   Marker-only — no clean parent-channel handshake exists; per-message
+//   inlining would conflict with existing label-bit usage or cost wire bytes
+//   on every call. The constant exists for the bump discipline and for
+//   future tooling (CI label-stability scans, distributed-binary
+//   compatibility queries). PROCESS_ABI_VERSION at process startup
+//   provides coarse-grained coverage in lockstep with workspace-inherited
+//   versioning.
+//     PROCMGR_LABELS_VERSION
 
+pub const PROCMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -175,6 +207,7 @@ pub mod procmgr_labels
     pub const CONFIGURE_NAMESPACE: u64 = 12;
 }
 
+pub const MEMMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -268,6 +301,11 @@ pub mod memmgr_errors
     /// is at static cap. Procmgr handles this as a process-creation
     /// failure.
     pub const TOO_MANY_PROCESSES: u64 = 6;
+    /// Caller's compiled `MEMMGR_LABELS_VERSION` does not match the receiver's.
+    /// `REGISTER_PROCESS` is the handshake entry point and carries the
+    /// caller's version as `data[0]`; mismatch here means the caller was
+    /// built against a different revision of `shared/ipc`.
+    pub const LABEL_VERSION_MISMATCH: u64 = 7;
 }
 
 /// Process-state codes returned by `procmgr_labels::QUERY_PROCESS`.
@@ -293,6 +331,7 @@ pub mod procmgr_process_state
     pub const EXITED: u64 = 3;
 }
 
+pub const SVCMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -313,6 +352,7 @@ pub mod svcmgr_labels
     pub const QUERY_ENDPOINT: u64 = 4;
 }
 
+pub const VFSD_LABELS_VERSION: u32 = 1;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
 {
@@ -358,6 +398,7 @@ pub mod vfsd_labels
     pub const SEED_AUTHORITY: u64 = 1u64 << 62;
 }
 
+pub const NS_LABELS_VERSION: u32 = 1;
 /// IPC labels for the namespace protocol (cap-as-namespace surface).
 ///
 /// Numbered in a reserved range above the surviving [`fs_labels`] codes
@@ -406,6 +447,7 @@ pub mod ns_labels
     pub const NS_READDIR: u64 = 22;
 }
 
+pub const FS_LABELS_VERSION: u32 = 1;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
 {
@@ -455,6 +497,7 @@ pub mod fs_labels
     pub const FS_MOUNT: u64 = 10;
 }
 
+pub const DEVMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -478,6 +521,7 @@ pub mod devmgr_labels
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
 }
 
+pub const BLK_LABELS_VERSION: u32 = 1;
 /// IPC labels for block device drivers.
 pub mod blk_labels
 {
@@ -522,6 +566,7 @@ pub mod blk_labels
     pub const BLK_READ_INTO_FRAME: u64 = 3;
 }
 
+pub const STREAM_LABELS_VERSION: u32 = 1;
 /// IPC labels for byte-stream endpoints (stdin/stdout/stderr backing).
 ///
 /// One label, one direction, bytes inline. The producer issues
@@ -553,6 +598,7 @@ pub mod stream_labels
     pub const STREAM_REGISTER_NAME: u64 = 11;
 }
 
+pub const LOG_LABELS_VERSION: u32 = 1;
 /// IPC labels for the system log endpoint's discovery interface.
 ///
 /// Distinct from [`stream_labels`]: the latter carry payload (bytes,
@@ -668,6 +714,11 @@ pub mod vfsd_errors
     /// (e.g. `INGEST_AUTHORITY` for `INGEST_CONFIG_MOUNTS`,
     /// `SEED_AUTHORITY` for `GET_SYSTEM_ROOT_CAP`).
     pub const UNAUTHORIZED: u64 = 9;
+    /// Caller's compiled `VFSD_LABELS_VERSION` does not match the receiver's.
+    /// The handshake-checked entry point (`GET_SYSTEM_ROOT_CAP`) carries
+    /// the caller's version as `data[0]`; mismatch here means the caller
+    /// was built against a different revision of `shared/ipc`.
+    pub const LABEL_VERSION_MISMATCH: u64 = 10;
     /// Unknown opcode on vfsd endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -693,6 +744,11 @@ pub mod fs_errors
     /// Caller's node-cap token lacks a rights bit required by the
     /// requested operation (see `namespace-protocol::rights`).
     pub const PERMISSION_DENIED: u64 = 7;
+    /// Caller's compiled `FS_LABELS_VERSION` does not match the receiver's.
+    /// `FS_MOUNT` is the handshake entry point and carries the caller's
+    /// version as `data[0]`; mismatch here means the caller was built
+    /// against a different revision of `shared/ipc`.
+    pub const LABEL_VERSION_MISMATCH: u64 = 8;
     /// Unknown opcode on fs-driver endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -706,6 +762,11 @@ pub mod devmgr_errors
     /// Caller's token lacks the verb bit required by the handler
     /// (e.g. `REGISTRY_QUERY_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
     pub const UNAUTHORIZED: u64 = 2;
+    /// Caller's compiled `DEVMGR_LABELS_VERSION` does not match the receiver's.
+    /// `QUERY_BLOCK_DEVICE` is the handshake entry point and carries the
+    /// caller's version as `data[0]`; mismatch here means the caller was
+    /// built against a different revision of `shared/ipc`.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -726,6 +787,12 @@ pub mod svcmgr_errors
     pub const UNKNOWN_NAME: u64 = 5;
     /// Discovery registry publish: table full or duplicate name.
     pub const REGISTER_REJECTED: u64 = 6;
+    /// Caller's compiled `SVCMGR_LABELS_VERSION` does not match the receiver's.
+    /// `REGISTER_SERVICE` is the handshake entry point and carries the
+    /// caller's version as `data[0]` (with all other words shifted by +1);
+    /// mismatch here means the caller was built against a different
+    /// revision of `shared/ipc`.
+    pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Unknown opcode on svcmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }
@@ -745,6 +812,12 @@ pub mod blk_errors
     /// `BLK_READ_INTO_FRAME` target cap missing `MAP|WRITE` rights, sized
     /// other than one page, or absent.
     pub const INVALID_FRAME_CAP: u64 = 5;
+    /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
+    /// `REGISTER_PARTITION` is the handshake entry point and carries the
+    /// caller's version as `data[0]` (with `base_lba` shifted to `data[1]`
+    /// and `length_lba` to `data[2]`); mismatch here means the caller was
+    /// built against a different revision of `shared/ipc`.
+    pub const LABEL_VERSION_MISMATCH: u64 = 6;
     /// Unknown opcode on block endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

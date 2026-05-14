@@ -1011,9 +1011,10 @@ pub struct ServiceRegistration<'a>
 ///   bits [32..48] = `vfs_path_len` (0 = module-loaded, >0 = VFS-loaded)
 ///
 /// Data layout (in order):
-///   word 0:                        `restart_policy`
-///   word 1:                        `criticality`
-///   words 2..:                     name bytes (`name_words`)
+///   word 0:                        `SVCMGR_LABELS_VERSION` (handshake)
+///   word 1:                        `restart_policy`
+///   word 2:                        `criticality`
+///   words 3..:                     name bytes (`name_words`)
 ///   word `bundle_name_len_word`:   `bundle_name_len`
 ///   words ..:                      `bundle_name` bytes (`bundle_name_words`)
 ///   words ..:                      `vfs_path` bytes (`vfs_path_words`; only
@@ -1032,7 +1033,9 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
 
     // Bundle-name tail: [bundle_name_len, bundle_name_words...] packed after
     // the service name. Zero if no bundle cap is being sent.
-    let bundle_name_len_word = 2 + name_words;
+    // word 0 holds SVCMGR_LABELS_VERSION; restart_policy/criticality occupy
+    // words 1 and 2; the name starts at word 3.
+    let bundle_name_len_word = 3 + name_words;
     let has_restart_source = reg.module_cap != 0 || vfs_loaded;
     let include_bundle = has_restart_source
         && reg.bundle_cap != 0
@@ -1055,9 +1058,10 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
         | ((vfs_path_len as u64) << 32);
 
     let mut builder = IpcMessage::builder(label)
-        .word(0, u64::from(reg.restart_policy))
-        .word(1, u64::from(reg.criticality))
-        .bytes(2, reg.name)
+        .word(0, u64::from(ipc::SVCMGR_LABELS_VERSION))
+        .word(1, u64::from(reg.restart_policy))
+        .word(2, u64::from(reg.criticality))
+        .bytes(3, reg.name)
         .word(bundle_name_len_word, bundle_name_len as u64);
     if bundle_name_len > 0
     {

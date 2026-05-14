@@ -32,7 +32,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ipc::{IpcMessage, fs_labels, procmgr_labels};
+use ipc::{FS_LABELS_VERSION, IpcMessage, fs_labels, procmgr_labels};
 
 use crate::VfsdCaps;
 use crate::worker_pool::{BootstrapOrder, CreateFromFileOrder, WorkOrder, WorkerPool};
@@ -96,9 +96,12 @@ pub fn spawn_fatfs_driver(
         return None;
     }
 
-    // Probe the driver with an empty FS_MOUNT: fatfs validates the BPB in its
-    // handler and replies with fs_errors::SUCCESS or an error label.
-    let mount_msg = IpcMessage::new(fs_labels::FS_MOUNT);
+    // Probe the driver with FS_MOUNT: fatfs validates the FS_LABELS_VERSION
+    // handshake and the BPB in its handler and replies with
+    // fs_errors::SUCCESS or an error label.
+    let mount_msg = IpcMessage::builder(fs_labels::FS_MOUNT)
+        .word(0, u64::from(FS_LABELS_VERSION))
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let mount_reply = unsafe { ipc::ipc_call(driver_send, &mount_msg, ipc_buf) }.ok()?;
     if mount_reply.label != 0

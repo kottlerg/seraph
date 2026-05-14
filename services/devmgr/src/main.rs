@@ -170,6 +170,17 @@ fn main() -> !
                     // SAFETY: ipc_buf is the registered IPC buffer.
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 }
+                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    std::os::seraph::log!(
+                        "QUERY_BLOCK_DEVICE rejected: caller DEVMGR_LABELS_VERSION={} expected {}",
+                        msg.word(0),
+                        ipc::DEVMGR_LABELS_VERSION
+                    );
+                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
                 else if blk_driver_spawned && blk_ep != 0
                 {
                     // Mint a tokened SEND_GRANT cap with the

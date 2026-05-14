@@ -63,6 +63,10 @@ fn handle_register(
     let label = msg.label;
     let name_len = ((label >> 16) & 0xFFFF) as usize;
     let vfs_path_len = ((label >> 32) & 0xFFFF) as usize;
+    if msg.word(0) != u64::from(ipc::SVCMGR_LABELS_VERSION)
+    {
+        return ipc::svcmgr_errors::LABEL_VERSION_MISMATCH;
+    }
     if name_len == 0 || name_len > 32
     {
         return ipc::svcmgr_errors::INVALID_NAME;
@@ -76,14 +80,16 @@ fn handle_register(
         return ipc::svcmgr_errors::TABLE_FULL;
     }
 
-    let restart_policy = msg.word(0) as u8;
-    let criticality = msg.word(1) as u8;
+    let restart_policy = msg.word(1) as u8;
+    let criticality = msg.word(2) as u8;
 
     let name = read_name_from_msg(msg, name_len);
 
     // Optional bundle-cap name, tail-packed after the service name words.
+    // word 0 = SVCMGR_LABELS_VERSION; restart_policy/criticality at words
+    // 1 and 2; name starts at word 3.
     let name_words = name_len.div_ceil(8);
-    let bundle_name_len_word = 2 + name_words;
+    let bundle_name_len_word = 3 + name_words;
     let bundle_name_len = msg.word(bundle_name_len_word) as usize;
     let bundle_name_words = bundle_name_len.div_ceil(8);
 
@@ -226,7 +232,7 @@ fn read_name_from_msg(msg: &IpcMessage, name_len: usize) -> [u8; 32]
     let name_words = name_len.div_ceil(8);
     for w in 0..name_words
     {
-        let word = msg.word(2 + w);
+        let word = msg.word(3 + w);
         for b in 0..8
         {
             let idx = w * 8 + b;

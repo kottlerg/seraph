@@ -1,8 +1,8 @@
 [package]
 name = "shmem"
-version = "0.1.0"
-edition = "2024"
-publish = false
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
 
 # no_std: shared-memory helpers for cross-process byte transport. Wraps
 # procmgr frame allocation + cap transfer + mem_map on top of a Lamport-

@@ -763,6 +763,12 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
         return;
     }
 
+    if req.word(0) != u64::from(ipc::MEMMGR_LABELS_VERSION)
+    {
+        reply_label(ipc_buf, memmgr_errors::LABEL_VERSION_MISMATCH);
+        return;
+    }
+
     let table = table_mut();
     let new_token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
 

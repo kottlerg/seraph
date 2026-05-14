@@ -78,6 +78,27 @@ The full memmgr IPC specification is in
 
 ---
 
+## Sizing constants
+
+memmgr's bookkeeping is statically bounded (it cannot bootstrap a heap
+against itself). The pool-sizing constants below are picked for current
+early-boot workloads; they are documented here so the revisit triggers
+are easy to find when those workloads grow.
+
+| Constant | Value | Surface effect on overflow | Revisit when |
+|---|---|---|---|
+| `MAX_PROCESSES` | 64 | `REGISTER_PROCESS` returns `TooManyProcesses` | a workload approaches ~50 concurrent processes |
+| `MAX_PER_PROC` | 512 | `REQUEST_FRAMES` returns `Quota` | a single process needs > 2 MiB of pinned frames (current value bumped from 256; equivalent to ~2 MiB of pinned pages per process; covers std heap + thread stacks + a few zero-copy buffers for current workloads) |
+| `MAX_FREE_RUNS` | 512 | `pool.push` returns `Err` and the frame is leaked until a process-death `coalesce` recovers it | post-coalesce free-run count regularly approaches 512 |
+
+`MAX_PER_PROC` is not a security quota; it is a structural bound that
+keeps memmgr's per-process record statically sized.
+
+Coalesce on `PROCESS_DIED` is enabled, so the `MAX_FREE_RUNS` leak path
+is reachable only if fragmentation exceeds what coalescing can recover.
+
+---
+
 ## Bootstrap
 
 memmgr is created by init. At init's entry, the kernel has placed Frame
@@ -92,6 +113,27 @@ so procmgr's heap-bootstrap path reaches memmgr on its first IPC.
 
 Authoritative description of the boot order, capability flow, and
 ProcessInfo handover lives in [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md).
+
+### Bootstrap-IPC frame-count cap
+
+Init delivers RAM Frame caps to memmgr in a single bootstrap-IPC round,
+packed two page-counts per `u64` after a three-word prefix. The capacity
+of a single round is `MEMMGR_BOOTSTRAP_MAX_FRAMES = 122` frames. Init
+currently has ~90 RAM frames at boot, so this fits comfortably.
+
+If a future memory map (or an architecture with fragmented physical RAM)
+produces more than 122 RAM frame caps, memmgr will own only the first
+122 and the rest will sit unused in init's CSpace. Resolutions when
+needed:
+
+- **Multi-round bootstrap.** init does N `serve_round`s, each carrying
+  up to 122 page-counts; memmgr's `_start` does N `request_round`s.
+  Small change to memmgr's bootstrap parser and init's main.
+- **Frame-count discovery via a kernel syscall** that reads the size
+  from the cap itself. No such syscall exists today; would also enable
+  cleaner per-frame accounting throughout.
+
+Not pressing until init's frame count grows past 122.
 
 ---
 

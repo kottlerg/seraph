@@ -1184,6 +1184,10 @@ fn map_procmgr_error(code: u64) -> io::Error {
             io::Error::new(io::ErrorKind::NotFound, "FILE_NOT_FOUND")
         }
         procmgr_errors::IO_ERROR => io::Error::other("IO_ERROR"),
+        procmgr_errors::MAP_FAILED => io::Error::other("MAP_FAILED"),
+        procmgr_errors::INSUFFICIENT_RIGHTS => {
+            io::Error::new(io::ErrorKind::PermissionDenied, "INSUFFICIENT_RIGHTS")
+        }
         procmgr_errors::UNKNOWN_OPCODE => io::Error::other("UNKNOWN_OPCODE"),
         other => io::Error::other(format!("procmgr error {other}")),
     }

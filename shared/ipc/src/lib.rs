@@ -677,6 +677,11 @@ pub mod procmgr_errors
     /// I/O error reading file via the supplied file cap during
     /// `CREATE_FROM_FILE`.
     pub const IO_ERROR: u64 = 10;
+    /// `mem_map` or scratch mapping failed during ELF page load.
+    pub const MAP_FAILED: u64 = 11;
+    /// Cap rights derivation failed (e.g. `derive_frame_for_prot`)
+    /// during ELF page load.
+    pub const INSUFFICIENT_RIGHTS: u64 = 12;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

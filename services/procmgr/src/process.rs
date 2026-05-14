@@ -1500,12 +1500,15 @@ pub struct ElfLoadCtx
 }
 
 /// Load one ELF segment page by streaming file data from VFS.
+///
+/// On failure returns a `procmgr_errors::*` code distinguishing
+/// allocation, mapping, and rights-derivation failures.
 fn load_elf_page_streaming(
     page_vaddr: u64,
     seg: &elf::LoadSegment,
     prot: u64,
     ctx: &ElfLoadCtx,
-) -> Option<()>
+) -> Result<(), u64>
 {
     let Some(frame_cap) = crate::memmgr_alloc_page(ctx.child_memmgr_send, ctx.ipc_buf)
     else
@@ -1514,7 +1517,7 @@ fn load_elf_page_streaming(
             "procmgr: load_elf_page_streaming: alloc_page None vaddr=0x{:x}",
             page_vaddr
         );
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     };
 
     let Some(scratch) = ScratchMapping::map(ctx.self_aspace, frame_cap, 1, syscall::MAP_WRITABLE)
@@ -1525,7 +1528,7 @@ fn load_elf_page_streaming(
             page_vaddr
         );
         let _ = syscall::cap_delete(frame_cap);
-        return None;
+        return Err(procmgr_errors::MAP_FAILED);
     };
     let scratch_va = scratch.va();
     // SAFETY: scratch_va mapped writable, one page.
@@ -1544,7 +1547,7 @@ fn load_elf_page_streaming(
             prot
         );
         let _ = syscall::cap_delete(frame_cap);
-        return None;
+        return Err(procmgr_errors::INSUFFICIENT_RIGHTS);
     };
     if let Err(e) = syscall::mem_map(derived, ctx.child_aspace, page_vaddr, 0, 1, 0)
     {
@@ -1555,14 +1558,14 @@ fn load_elf_page_streaming(
         );
         let _ = syscall::cap_delete(derived);
         let _ = syscall::cap_delete(frame_cap);
-        return None;
+        return Err(procmgr_errors::MAP_FAILED);
     }
 
     // See `loader::load_elf_page` for the cap-refcount story.
     let _ = syscall::cap_delete(derived);
     let _ = syscall::cap_delete(frame_cap);
 
-    Some(())
+    Ok(())
 }
 
 /// Stream segment file data from VFS into the frame mapped at `scratch_va`.
@@ -1860,8 +1863,7 @@ pub fn create_process_from_file(
                 child_aspace: child_objs.aspace(),
                 child_memmgr_send: mms.cap(),
             };
-            load_elf_page_streaming(page_vaddr, &seg, prot, &load_ctx)
-                .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+            load_elf_page_streaming(page_vaddr, &seg, prot, &load_ctx)?;
         }
     }
 

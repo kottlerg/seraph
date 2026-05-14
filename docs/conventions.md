@@ -65,6 +65,13 @@ Each `Y` bump (`v0.1.0`, `v0.2.0`, …) has a GitHub milestone. Issues blocking 
 - Commit messages MAY reference Issues by `#N` where useful.
 - Once branch/PR workflow activates (below), PR descriptions MUST reference the Issue(s) they close via `Fixes #N` / `Closes #N` so merge auto-closes them.
 
+### Acceptance checklist discipline
+
+- Issue bodies SHOULD list acceptance criteria under `## Acceptance` as GitHub task-list checkboxes (`- [ ]`).
+- Before closing an Issue (or merging the PR that auto-closes it), every `- [ ]` under `## Acceptance` MUST be flipped to `- [x]`. An unticked box at close indicates either incomplete work or stale criteria; one of the two MUST be reconciled — finish the work, or edit the Issue to drop the obsolete criterion with a one-line rationale in the closing comment.
+- Updating the Issue body is `gh issue edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI. PRs that close Issues SHOULD include the tick-through edit in the same merge action — the closing comment on the Issue MAY also confirm "all acceptance criteria met".
+- This rule retro-applies: existing closed Issues with unticked boxes MAY be left alone, but no new Issue MAY close with unticked acceptance criteria.
+
 ## Commit Messages
 
 ### Title

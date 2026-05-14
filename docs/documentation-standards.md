@@ -103,6 +103,22 @@ Detailed comment conventions are in [coding-standards.md](coding-standards.md).
 
 ---
 
+## Incomplete Work Markers
+
+Permanent text refers to: Rust source comments, rustdoc, markdown documentation,
+error and log strings, and commit messages.
+
+- `TODO` is the vocabulary for incomplete-work markers in permanent text. A TODO
+  MUST name the missing thing concretely (e.g. `// TODO: handle non-contiguous
+  regions`).
+- Session-local planning labels MUST NOT appear in permanent text. Disallowed
+  forms include "step X", "phase Y", "tier N", "stage 7", and "the deferred
+  follow-up". These are pointers into a planning conversation that has no
+  permanence and rot the moment the plan moves on.
+- Commit messages name components and what changed, not planning labels.
+
+---
+
 ## Discoverability and Linking
 
 No document may be orphaned. Every document MUST be reachable by following links from the

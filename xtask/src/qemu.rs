@@ -108,11 +108,22 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec)
     // shape when KVM is unavailable.
     if Path::new("/dev/kvm").exists()
     {
+        // -cpu host inherits the development host's microarchitecture; the
+        // kernel asserts x86-64-v3 in early init, so the host must advertise
+        // AVX2/BMI2/FMA (Haswell+ / Excavator+).
         args.extend(["-enable-kvm".into(), "-cpu".into(), "host".into()]);
     }
     else
     {
-        args.extend(["-accel".into(), "tcg,thread=multi".into()]);
+        // TCG fallback: `-cpu max,migratable=no` advertises every feature
+        // QEMU can emulate (including x86-64-v3) so userspace SIMD codegen
+        // executes correctly under non-KVM runs (CI, KVM-less containers).
+        args.extend([
+            "-accel".into(),
+            "tcg,thread=multi".into(),
+            "-cpu".into(),
+            "max,migratable=no".into(),
+        ]);
     }
 
     args.extend([
@@ -136,6 +147,16 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
         .expect("riscv64 launch requires firmware_vars_path");
 
     args.extend(["-machine".into(), "virt".into()]);
+    // Pin the CPU model to a baseline that advertises the RVA23U64 features
+    // userspace targets: V (Vector) plus the Zba/Zbb/Zbs bitmanip set.
+    // RVA23 also mandates Zfa, Zfhmin, Zihintntl, Zicond, Zimop, Zcmop, Zcb,
+    // Zvfhmin, Zvbb, Zvkt, Zkt — those land as QEMU coverage broadens. A
+    // future bump should switch to `-cpu rva23s64` once the floor QEMU
+    // version on CI hosts is >= 9.1.
+    args.extend([
+        "-cpu".into(),
+        "rv64,v=true,zba=true,zbb=true,zbs=true".into(),
+    ]);
     // Explicit multi-threaded TCG: `-smp 4` without this falls back to the
     // per-arch default, which can be single-threaded round-robin. SMP
     // correctness under real parallel execution needs genuine

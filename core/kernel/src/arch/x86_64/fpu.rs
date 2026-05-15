@@ -81,8 +81,15 @@ pub unsafe fn cr0_clear_ts()
 
 // ── XSAVE / XCR0 ──────────────────────────────────────────────────────────────
 
-/// CR4.OSXSAVE bit. Setting this advertises XSAVE support to userspace via
-/// CPUID and unmasks the XSETBV/XGETBV instructions.
+/// CR4 bits set by [`enable_xsave`]:
+/// - `OSFXSR` (bit 9): the OS supports FXSAVE/FXRSTOR. Required before
+///   any SSE instruction can execute without raising `#UD`.
+/// - `OSXMMEXCPT` (bit 10): the OS handles `#XM` (SIMD floating-point
+///   exception). When clear, SSE FP exceptions degenerate into `#UD`.
+/// - `OSXSAVE` (bit 18): the OS supports XSAVE/XRSTOR and uses XCR0 to
+///   manage extended state. Unmasks XSETBV/XGETBV.
+const CR4_OSFXSR: u64 = 1 << 9;
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
 
 /// XCR0 component bits we enable for the x86-64-v3 userspace baseline.
@@ -152,11 +159,16 @@ pub unsafe fn enable_xsave()
         crate::fatal("XSAVE not supported by CPU — required for x86-64-v3 baseline");
     }
 
-    // Set CR4.OSXSAVE. This unmasks XSETBV/XGETBV.
+    // Set CR4.OSFXSR + OSXMMEXCPT + OSXSAVE. The first is required for any
+    // SSE instruction to execute at all (without it, SSE raises #UD); the
+    // second routes SIMD FP exceptions through the architected #XM vector
+    // instead of #UD; the third unmasks XSETBV/XGETBV for the XCR0 write
+    // below.
     let cr4 = super::cpu::read_cr4();
-    // SAFETY: CPUID confirmed XSAVE; setting OSXSAVE is the architected enable bit.
+    // SAFETY: CPUID confirmed XSAVE; OSFXSR is supported by every x86-64
+    // CPU; setting all three bits is the architected OS-enable sequence.
     unsafe {
-        super::cpu::write_cr4(cr4 | CR4_OSXSAVE);
+        super::cpu::write_cr4(cr4 | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE);
     }
 
     // Write XCR0 = x87 | SSE | AVX. Always-mandatory bit 0 (x87) included;
@@ -172,75 +184,6 @@ pub unsafe fn enable_xsave()
     let (_eax, _ebx, ecx, _edx) = super::cpu::cpuid(0xD);
     XSAVE_AREA_SIZE.store(ecx as usize, Ordering::Relaxed);
 }
-
-// ── Per-thread XSAVE area ─────────────────────────────────────────────────────
-
-/// Per-thread XSAVE area size: 4 KiB.
-///
-/// Comfortably above the area size for the x87|SSE|AVX component set we
-/// enable in XCR0 (typically 832 bytes). Leaves headroom for future
-/// AVX-512 promotion. SEED-backed allocations are page-aligned, which
-/// trivially satisfies XSAVE's 64-byte alignment requirement.
-pub const XSAVE_AREA_BYTES: usize = 4096;
-
-/// Allocate and zero-initialise a per-thread XSAVE area from the SEED
-/// retype pool. Returns a page-aligned `*mut u8` of size [`XSAVE_AREA_BYTES`].
-///
-/// A zeroed area is XRSTOR-valid: it is equivalent to FINIT + zeroed XMM/YMM
-/// per Intel SDM, so the first XRSTOR after a fresh allocation reaches the
-/// architected initial state with no special-casing.
-///
-/// Returns null if SEED is exhausted; the caller (TCB constructor) records
-/// the result in `ExtendedState::area`. A null area means lazy save/restore
-/// is disabled for the thread; the lazy-trap handler skips XRSTOR in that
-/// case and the user thread proceeds with whatever FPU state the hardware
-/// happens to have. Until userspace targets actually emit SIMD this is
-/// dormant; once they do, the allocator is the only failure mode and OOM
-/// here would in practice halt the kernel via the SEED carve panic.
-#[cfg(not(test))]
-pub fn alloc_area() -> *mut u8
-{
-    match crate::cap::retype::alloc_seed_scratch(XSAVE_AREA_BYTES as u64)
-    {
-        Ok(ptr) =>
-        {
-            // SAFETY: ptr points at XSAVE_AREA_BYTES of freshly-carved SEED
-            // scratch; zero-init makes the area XRSTOR-valid.
-            unsafe {
-                core::ptr::write_bytes(ptr, 0u8, XSAVE_AREA_BYTES);
-            }
-            ptr
-        }
-        Err(_) => core::ptr::null_mut(),
-    }
-}
-
-/// Test stub: TCB construction is exercised in host unit tests for the
-/// retype/dispatch arithmetic; never running asm there, so a null is fine.
-#[cfg(test)]
-pub fn alloc_area() -> *mut u8
-{
-    core::ptr::null_mut()
-}
-
-/// Reclaim a per-thread XSAVE area previously returned by [`alloc_area`].
-///
-/// # Safety
-/// `area` must have been returned by [`alloc_area`] on this kernel build
-/// and not previously freed. Null is allowed and is a no-op.
-#[cfg(not(test))]
-pub unsafe fn free_area(area: *mut u8)
-{
-    if area.is_null()
-    {
-        return;
-    }
-    crate::cap::retype::free_seed_scratch(area, XSAVE_AREA_BYTES as u64);
-}
-
-/// Test stub for [`free_area`].
-#[cfg(test)]
-pub unsafe fn free_area(_area: *mut u8) {}
 
 /// Save the live x87/SSE/AVX state of the executing CPU into `area`.
 ///

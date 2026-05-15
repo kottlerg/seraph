@@ -122,69 +122,6 @@ pub fn is_fp_or_v_opcode(insn: u64) -> bool
     matches!(major, 0x07 | 0x27 | 0x43 | 0x47 | 0x4B | 0x4F | 0x53 | 0x57)
 }
 
-// ── Per-thread F/D save area ──────────────────────────────────────────────────
-
-/// Per-thread F/D save area size: 4 KiB (matches the x86 XSAVE area
-/// allocation size for uniformity, even though the F/D state is only
-/// 32 × f64 + fcsr = 264 bytes). SEED scratch is allocated in 4 KiB units;
-/// using a full page also leaves headroom for the deferred V-register
-/// save layout without re-plumbing the allocator.
-pub const FP_AREA_BYTES: usize = 4096;
-
-/// Allocate and zero-initialise a per-thread F/D save area from the SEED
-/// retype pool. Returns a page-aligned `*mut u8`.
-///
-/// A zeroed area restores to f0..f31 = 0.0, fcsr = 0 — the RISC-V architected
-/// initial FP state.
-///
-/// Returns null on SEED exhaustion. A null area disables lazy save/restore
-/// for the thread; the lazy-trap handler still promotes `sstatus.FS` to
-/// Initial but skips the F/D restore, so the trapping instruction proceeds
-/// with whatever the live register file contains.
-#[cfg(not(test))]
-pub fn alloc_area() -> *mut u8
-{
-    match crate::cap::retype::alloc_seed_scratch(FP_AREA_BYTES as u64)
-    {
-        Ok(ptr) =>
-        {
-            // SAFETY: ptr points at FP_AREA_BYTES of freshly-carved SEED
-            // scratch; zero-init makes the area restore-valid.
-            unsafe {
-                core::ptr::write_bytes(ptr, 0u8, FP_AREA_BYTES);
-            }
-            ptr
-        }
-        Err(_) => core::ptr::null_mut(),
-    }
-}
-
-/// Test stub.
-#[cfg(test)]
-pub fn alloc_area() -> *mut u8
-{
-    core::ptr::null_mut()
-}
-
-/// Reclaim a per-thread F/D save area previously returned by [`alloc_area`].
-///
-/// # Safety
-/// `area` must have been returned by [`alloc_area`] on this kernel build
-/// and not previously freed. Null is allowed and is a no-op.
-#[cfg(not(test))]
-pub unsafe fn free_area(area: *mut u8)
-{
-    if area.is_null()
-    {
-        return;
-    }
-    crate::cap::retype::free_seed_scratch(area, FP_AREA_BYTES as u64);
-}
-
-/// Test stub.
-#[cfg(test)]
-pub unsafe fn free_area(_area: *mut u8) {}
-
 /// Save the live F/D register file to `area`.
 ///
 /// Precondition: `sstatus.FS` is not `Off`. Caller (`switch_out_save`)

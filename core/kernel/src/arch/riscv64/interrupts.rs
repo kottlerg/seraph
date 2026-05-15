@@ -483,11 +483,12 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
         && super::fpu::is_fp_or_v_opcode(frame.stval)
     {
         // U-mode illegal-instruction trap on an F/D/V opcode: lazy enable
-        // by promoting sstatus.FS / sstatus.VS from Off to Initial. If the
-        // current thread has no per-TCB F/D save area yet, allocate one on
-        // first touch. Then restore F/D from the area (V state restore is
-        // deferred to a follow-up commit). Returns without advancing sepc
-        // so the trapping instruction is re-executed.
+        // by promoting sstatus.FS / sstatus.VS from Off to Initial, then
+        // restore the F/D register file from the thread's per-TCB area
+        // (V state restore is deferred to a follow-up commit). Returns
+        // without advancing sepc so the trapping instruction is re-executed.
+        // The area is page N+1 of the Thread retype slot; user threads
+        // always have a non-null area, so no lazy allocation is required.
         // SAFETY: current_tcb returns this CPU's running thread; valid
         // here because we entered from a U-mode FP/V instruction.
         let area = unsafe {
@@ -498,20 +499,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             }
             else
             {
-                let existing = (*tcb).extended.area;
-                if existing.is_null()
-                {
-                    let new_area = super::fpu::alloc_area();
-                    if !new_area.is_null()
-                    {
-                        (*tcb).extended.area = new_area;
-                    }
-                    new_area.cast_const()
-                }
-                else
-                {
-                    existing.cast_const()
-                }
+                (*tcb).extended.area.cast_const()
             }
         };
         // SAFETY: ring-0 trap context; lazy_restore_fp_v handles the null

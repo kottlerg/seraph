@@ -667,18 +667,12 @@ unsafe extern "C" fn isr_nm()
 
 /// `#NM` handler body.
 ///
-/// Clears CR0.TS, lazily allocates the per-thread XSAVE area on first
-/// trap if it has not been allocated yet, and XRSTORs from it. The
-/// trapping x87/SSE/AVX instruction then proceeds on re-execution with
-/// the thread's saved register file restored. A zero-initialised area
-/// (the just-allocated case) restores to FINIT + zeroed XMM/YMM,
-/// matching the architected initial state.
-///
-/// If allocation fails (SEED exhausted) the handler clears TS and
-/// returns without XRSTOR; the trapping instruction proceeds with
-/// whatever the live register file contains. Lazy save/restore is then
-/// disabled for the thread (area stays null), and subsequent
-/// preemptions risk cross-thread FP state visibility.
+/// Clears CR0.TS and XRSTORs the current thread's saved register file
+/// from its per-TCB XSAVE area. The trapping x87/SSE/AVX instruction
+/// then proceeds on re-execution. The area is allocated as page N+1 of
+/// the Thread retype slot (see `sys_cap_create_thread` layout), so user
+/// threads always have a non-null area; the slot zero-init makes the
+/// first XRSTOR restore the architected initial state.
 #[cfg(not(test))]
 extern "C" fn nm_handler()
 {
@@ -699,30 +693,14 @@ extern "C" fn nm_handler()
         return;
     }
 
-    // SAFETY: tcb validated non-null. Lazy-allocate the XSAVE area on
-    // first #NM for this thread; the area outlives the thread (freed in
-    // dealloc_object's Thread arm).
+    // SAFETY: tcb validated non-null. extended.area is page-resident in
+    // the Thread retype slot and lives for the TCB's lifetime.
     let area = unsafe { (*tcb).extended.area };
-    let area = if area.is_null()
+    if area.is_null()
     {
-        let new_area = super::fpu::alloc_area();
-        if new_area.is_null()
-        {
-            return;
-        }
-        // SAFETY: tcb validated non-null.
-        unsafe {
-            (*tcb).extended.area = new_area;
-        }
-        new_area
+        return;
     }
-    else
-    {
-        area
-    };
-
-    // SAFETY: area is a valid XSAVE buffer just allocated or recorded
-    // on this thread's TCB; zero-initialised area is XRSTOR-valid.
+    // SAFETY: area is the per-thread XSAVE buffer carved at TCB construction.
     unsafe {
         super::fpu::restore_from(area);
     }

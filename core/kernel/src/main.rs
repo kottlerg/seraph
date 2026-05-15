@@ -557,12 +557,13 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         }
         .unwrap_or_else(|()| fatal("Phase 9: failed to map init stack"));
 
-        // Retype a 5-page slab from SEED_FRAME for init's Thread:
+        // Retype a 6-page slab from SEED_FRAME for init's Thread:
         //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)
         //   page 4   — ThreadObject (24 B) followed by ThreadControlBlock
+        //   page 5   — per-thread FPU/SIMD/V save area
         // Mirrors the layout established in `sys_cap_create_thread`.
         #[allow(clippy::items_after_statements)]
-        const INIT_THREAD_PAGES: u64 = (sched::KERNEL_STACK_PAGES + 1) as u64;
+        const INIT_THREAD_PAGES: u64 = (sched::KERNEL_STACK_PAGES + 2) as u64;
         let (init_thread_obj_nn, init_kstack_top, init_tcb) = {
             use cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
 
@@ -576,6 +577,14 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             let thread_obj_ptr = kstack_top as *mut ThreadObject;
             let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
             let tcb_ptr = (kstack_top + tcb_offset) as *mut sched::thread::ThreadControlBlock;
+            // Per-thread FPU/SIMD/V save area: one page directly after the
+            // wrapper page in the retyped slab.
+            let init_extended_area = (kstack_top + mm::PAGE_SIZE as u64) as *mut u8;
+            // SAFETY: init_extended_area lies on page 5 of the freshly-retyped
+            // slab, exclusively owned by this init bootstrap.
+            unsafe {
+                core::ptr::write_bytes(init_extended_area, 0u8, mm::PAGE_SIZE);
+            }
 
             // Prepare saved CPU state for init: user entry point + kernel stack.
             let init_saved = arch::current::context::new_state(
@@ -619,7 +628,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                         death_observer_count: 0,
                         exit_reason: 0,
                         sleep_deadline: 0,
-                        extended: sched::thread::ExtendedState::empty(),
+                        extended: sched::thread::ExtendedState::from_raw(init_extended_area),
                         magic: sched::thread::TCB_MAGIC,
                     },
                 );

@@ -24,7 +24,7 @@ rustflags = ["-Zunstable-options"]
 # RISC-V UEFI bootloader link flags.
 # The linker script path is relative to the workspace root.
 # jump-tables=no avoids generating jump tables that UEFI can't relocate.
-[target.riscv64gc-seraph-uefi]
+[target.riscv64imac-seraph-uefi]
 rustflags = [
     "-Zunstable-options",
     "-C", "link-arg=-Tcore/boot/linker/riscv64-uefi.ld",

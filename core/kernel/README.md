@@ -139,7 +139,7 @@ and is compiled with a custom target specification for each architecture:
 | Architecture | Target triple |
 |---|---|
 | x86-64 | `x86_64-seraph-none` |
-| RISC-V | `riscv64gc-seraph-none` |
+| RISC-V | `riscv64imac-seraph-none` |
 
 Custom target JSON files live in `targets/`. They specify the code model,
 relocation model, and disable features the kernel cannot use (SSE/AVX before explicit

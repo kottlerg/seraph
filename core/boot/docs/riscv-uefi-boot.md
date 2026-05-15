@@ -133,8 +133,8 @@ The key symbols exported by the linker script for use in `header.S`:
 ## Custom Target JSON
 
 The RISC-V bootloader uses a custom Cargo target specification,
-`targets/riscv64gc-seraph-uefi.json`. Key differences from the kernel target
-(`riscv64gc-seraph-none.json`):
+`targets/riscv64imac-seraph-uefi.json`. Key differences from the kernel target
+(`riscv64imac-seraph-none.json`):
 
 | Field | UEFI bootloader | Kernel |
 |---|---|---|
@@ -160,7 +160,7 @@ must be position-independent.
 The RISC-V UEFI image is produced by `cargo xtask build --arch riscv64`.
 Internally the pipeline runs in three steps:
 
-1. The bootloader crate is compiled against `riscv64gc-seraph-uefi`,
+1. The bootloader crate is compiled against `riscv64imac-seraph-uefi`,
    producing an ELF that contains the `.pecoff_header` section (assembled
    from `header.S`) at load address `0x0`, followed by `.text` at `0x1000`.
 2. `llvm-objcopy -O binary` strips all ELF structure and emits only the

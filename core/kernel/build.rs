@@ -18,7 +18,7 @@ fn main()
     // must not be linked with the kernel linker script.
     //
     // Our bare-metal triples end in "-none": x86_64-seraph-none,
-    // riscv64gc-seraph-none. The host triple does not.
+    // riscv64imac-seraph-none. The host triple does not.
     if !target.ends_with("-none") && !target.contains("-none-")
     {
         return;

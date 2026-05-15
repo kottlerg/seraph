@@ -619,6 +619,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                         death_observer_count: 0,
                         exit_reason: 0,
                         sleep_deadline: 0,
+                        extended: sched::thread::ExtendedState::empty(),
                         magic: sched::thread::TCB_MAGIC,
                     },
                 );

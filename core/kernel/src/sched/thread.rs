@@ -60,6 +60,45 @@ unsafe impl Send for DeathObserver {}
 // SAFETY: same rationale as `Send`.
 unsafe impl Sync for DeathObserver {}
 
+// ── ExtendedState ─────────────────────────────────────────────────────────────
+
+/// Per-thread extended-state metadata for the lazy FPU/SIMD/V save-restore
+/// discipline.
+///
+/// `area` points at a page-aligned, page-sized arch-specific save area
+/// (XSAVE layout on x86-64, F/D + V register file on RISC-V). Null when the
+/// area has not yet been allocated — kernel-only threads (idle, soft-float
+/// kernel-internal) never need one. The allocation and the live save/restore
+/// path are wired in a follow-up commit; until then `area` stays null and
+/// the field is data-only.
+///
+/// `dirty` is true if the live extended-state register file on the owning
+/// CPU contains thread-private data that must be saved before another
+/// thread can dirty the registers. Cleared on save.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct ExtendedState
+{
+    pub area: *mut u8,
+    pub dirty: bool,
+}
+
+impl ExtendedState
+{
+    pub const fn empty() -> Self
+    {
+        Self {
+            area: core::ptr::null_mut(),
+            dirty: false,
+        }
+    }
+}
+
+// SAFETY: `area` is only dereferenced under the scheduler lock or in the
+// owning thread's trap-handler context; raw pointer ownership is tracked
+// explicitly by the lazy save/restore code.
+unsafe impl Send for ExtendedState {}
+
 // ── IpcThreadState ────────────────────────────────────────────────────────────
 
 /// IPC blocking reason for a thread in the `Blocked` state.
@@ -292,6 +331,12 @@ pub struct ThreadControlBlock
     // === Sleep ===
     /// Tick deadline for `SYS_THREAD_SLEEP`. 0 = not sleeping.
     pub sleep_deadline: u64,
+
+    // === FPU / SIMD / Vector extended state ===
+    /// Per-thread XSAVE area pointer and dirty flag for lazy FPU/SIMD/V
+    /// save-restore. Null `area` until the save/restore path is wired in a
+    /// follow-up commit; field is data-only at this point.
+    pub extended: ExtendedState,
 
     // === Use-after-free detection ===
     /// Magic cookie for use-after-free detection. Must be `TCB_MAGIC` when valid.

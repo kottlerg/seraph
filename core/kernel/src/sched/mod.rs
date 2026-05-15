@@ -810,6 +810,7 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
                     death_observer_count: 0,
                     exit_reason: 0,
                     sleep_deadline: 0,
+                    extended: thread::ExtendedState::empty(),
                     magic: thread::TCB_MAGIC,
                 },
             );

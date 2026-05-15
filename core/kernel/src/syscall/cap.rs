@@ -859,6 +859,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 death_observer_count: 0,
                 exit_reason: 0,
                 sleep_deadline: 0,
+                extended: crate::sched::thread::ExtendedState::empty(),
                 magic: crate::sched::thread::TCB_MAGIC,
             },
         );

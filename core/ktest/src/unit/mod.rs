@@ -19,12 +19,14 @@
 //! - `wait_set.rs` — wait set add, remove, wait
 //! - `ipc.rs`      — IPC call, reply, recv, buffer set
 //! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity
+//! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption
 //! - `hw.rs`       — MMIO, IRQ, I/O ports
 //! - `sysinfo.rs`  — system info queries and debug log
 
 pub mod cap;
 pub mod cap_info;
 pub mod event;
+pub mod fpu;
 pub mod hw;
 pub mod ipc;
 pub mod mm;
@@ -370,6 +372,9 @@ pub fn run_all(ctx: &TestContext)
         "thread::default_affinity_bsp",
         thread::default_affinity_bsp(ctx)
     );
+
+    // ── Extended-state (FPU / SIMD / V) isolation ────────────────────────────
+    run_test!("fpu::preempt_isolation", fpu::preempt_isolation(ctx));
 
     // ── Hardware access syscalls ──────────────────────────────────────────────
     run_test!("hw::mmio_map", hw::mmio_map(ctx));

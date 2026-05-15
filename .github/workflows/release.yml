@@ -39,6 +39,11 @@ jobs:
             qemu-efi-riscv64 \
             zstd
 
+      - name: Log QEMU versions
+        run: |
+          qemu-system-x86_64 --version | head -n1
+          qemu-system-riscv64 --version | head -n1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:

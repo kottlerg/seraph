@@ -1486,6 +1486,21 @@ unsafe fn dealloc_object_one(
                     }
                 }
 
+                // Release the per-thread XSAVE / FP-save area allocated at
+                // TCB construction. Null on kernel-only TCBs (idle threads),
+                // which never reach the Thread arm of dealloc_object anyway.
+                // SAFETY: tcb validated non-null; extended.area is null or a
+                // pointer returned by arch::current::fpu::alloc_area.
+                let extended_area = unsafe { (*tcb).extended.area };
+                if !extended_area.is_null()
+                {
+                    // SAFETY: pointer came from fpu::alloc_area on this build.
+                    unsafe {
+                        crate::arch::current::fpu::free_area(extended_area);
+                        (*tcb).extended.area = core::ptr::null_mut();
+                    }
+                }
+
                 // Poison the TCB so any use-after-free reads garbage
                 // instead of plausible values.
                 // SAFETY: tcb is valid; we are about to free it.

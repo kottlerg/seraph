@@ -650,10 +650,10 @@ pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallE
 /// Unlike [`alloc_in_seed`], no `KernelObjectHeader` is written and the
 /// region does not enter any `CSpace`; the returned pointer is opaque.
 ///
-/// Gated `cfg(target_arch = "x86_64")` because the only consumer is the
-/// IOPB allocation in `sys_iopb_set`. RISC-V has no I/O port permission
-/// bitmap and never calls this.
-#[cfg(all(not(test), target_arch = "x86_64"))]
+/// Consumers: the IOPB allocation in `sys_iopb_set` (x86-64 only) and the
+/// per-thread XSAVE / FP save area allocated by `arch::current::fpu::alloc_area`
+/// (both arches).
+#[cfg(not(test))]
 pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 {
     let seed = crate::cap::seed_frame_ref();
@@ -669,7 +669,7 @@ pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 /// SEED is statically pinned (initial refcount 1 + Phase-7 `inc_ref` pin),
 /// so its refcount can never drop to zero in normal operation; the
 /// `dec_ref` here is bookkeeping for the scratch lease.
-#[cfg(all(not(test), target_arch = "x86_64"))]
+#[cfg(not(test))]
 pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
 {
     let seed = crate::cap::seed_frame_ref();

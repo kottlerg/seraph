@@ -242,9 +242,9 @@ pub unsafe fn restore_from(area: *const u8)
 }
 
 /// Context-switch hook called on switch-out of a user thread (the caller
-/// supplies the non-null area pointer): XSAVEOPT the live x87/SSE/AVX
-/// register file to the thread's per-TCB area and re-arm the `#NM` lazy
-/// trap by setting CR0.TS.
+/// supplies a TCB whose `extended.area` is non-null): XSAVEOPT the live
+/// x87/SSE/AVX register file to the thread's per-TCB area and re-arm the
+/// `#NM` lazy trap by setting CR0.TS.
 ///
 /// XSAVEOPT performs hardware-tracked dirty filtering via the XINUSE bits
 /// it maintains internally — components untouched since the last XRSTOR
@@ -255,12 +255,20 @@ pub unsafe fn restore_from(area: *const u8)
 ///
 /// # Safety
 /// Must execute at ring 0 with interrupts disabled, before the scheduler
-/// lock release that publishes this thread's state to other CPUs.
-/// `area` must satisfy the alignment and size requirements of [`save_to`].
+/// lock release that publishes this thread's state to other CPUs. `tcb`
+/// must be a valid TCB pointer; its `extended.area` must satisfy the
+/// alignment and size requirements of [`save_to`].
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn switch_out_save(area: *mut u8)
+pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
+    // SAFETY: caller guarantees tcb is valid; the area is allocated for the
+    // TCB's lifetime when non-null.
+    let area = unsafe { (*tcb).extended.area };
+    if area.is_null()
+    {
+        return;
+    }
     // SAFETY: caller's contract.
     unsafe {
         save_to(area);
@@ -270,4 +278,4 @@ pub unsafe fn switch_out_save(area: *mut u8)
 
 /// No-op test stub.
 #[cfg(test)]
-pub unsafe fn switch_out_save(_area: *mut u8) {}
+pub unsafe fn switch_out_save(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}

@@ -93,7 +93,7 @@ The bootloader is built as part of the Seraph workspace. Refer to
 | Architecture | Target triple | Output |
 |---|---|---|
 | x86-64 | `x86_64-unknown-uefi` | `.efi` (PE/COFF, direct from linker) |
-| RISC-V | `riscv64gc-seraph-uefi` | `.efi` (flat binary via `llvm-objcopy`) |
+| RISC-V | `riscv64imac-seraph-uefi` | `.efi` (flat binary via `llvm-objcopy`) |
 
 On x86-64, the Rust toolchain emits a PE/COFF `.efi` directly. On RISC-V, LLVM has
 no PE/COFF backend, so the output ELF is converted to a flat binary with a

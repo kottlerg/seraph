@@ -20,7 +20,7 @@ pub enum Arch
     #[value(name = "x86_64")]
     X86_64,
 
-    /// RISC-V 64-bit (RV64GC)
+    /// RISC-V 64-bit
     #[value(name = "riscv64")]
     Riscv64,
 }
@@ -37,7 +37,7 @@ impl Arch
         match self
         {
             Arch::X86_64 => "x86_64-seraph-none",
-            Arch::Riscv64 => "riscv64gc-seraph-none",
+            Arch::Riscv64 => "riscv64imac-seraph-none",
         }
     }
 
@@ -51,7 +51,7 @@ impl Arch
         match self
         {
             Arch::X86_64 => "x86_64-seraph",
-            Arch::Riscv64 => "riscv64gc-seraph",
+            Arch::Riscv64 => "riscv64a23-seraph",
         }
     }
 
@@ -61,7 +61,7 @@ impl Arch
         match self
         {
             Arch::X86_64 => "x86_64-unknown-uefi",
-            Arch::Riscv64 => "riscv64gc-seraph-uefi",
+            Arch::Riscv64 => "riscv64imac-seraph-uefi",
         }
     }
 

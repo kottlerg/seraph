@@ -484,11 +484,13 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
     {
         // U-mode illegal-instruction trap on an F/D/V opcode: lazy enable
         // by promoting sstatus.FS / sstatus.VS from Off to Initial, then
-        // restore the F/D register file from the thread's per-TCB area
-        // (V state restore is deferred to a follow-up commit). Returns
-        // without advancing sepc so the trapping instruction is re-executed.
-        // The area is page N+1 of the Thread retype slot; user threads
-        // always have a non-null area, so no lazy allocation is required.
+        // restore the F/D (and V) register file from the thread's per-TCB
+        // area. lazy_restore_fp_v mirrors the resulting live FS/VS bits
+        // into frame.sstatus so the trap_entry restore on sret keeps the
+        // promotion — without that, sret would put FS = VS = Off back
+        // into the live CSR and the trapping instruction would re-trap
+        // forever. Returns without advancing sepc so the trapping
+        // instruction is re-executed.
         // SAFETY: current_tcb returns this CPU's running thread; valid
         // here because we entered from a U-mode FP/V instruction.
         let area = unsafe {
@@ -505,7 +507,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
         // SAFETY: ring-0 trap context; lazy_restore_fp_v handles the null
         // area branch internally (no restore, just FS/VS promotion).
         unsafe {
-            super::fpu::lazy_restore_fp_v(area);
+            super::fpu::lazy_restore_fp_v(area, frame);
         }
     }
     else if cause_code == 8
@@ -790,10 +792,12 @@ pub unsafe fn init()
     // Force sstatus.FS = sstatus.VS = 00 (Off). Kernel is soft-float
     // (RV64IMAC); any F/D or V instruction in U-mode now raises an illegal-
     // instruction trap, which the lazy save/restore path will use to
-    // demand-restore extended state.
+    // demand-restore extended state. cache_vlenb is BSP-only because the
+    // RVA23 profile guarantees uniform VLEN across harts.
     // SAFETY: ring-0 boot; csrc sstatus is privileged S-mode.
     unsafe {
         super::fpu::enable_fpu_vector();
+        super::fpu::cache_vlenb();
     }
 
     // Enable SSIP (bit 1), STIP (bit 5), and SEIP (bit 9) in sie.

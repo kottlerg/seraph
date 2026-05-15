@@ -56,6 +56,15 @@ jobs:
             ovmf \
             qemu-efi-riscv64
 
+      - name: Log QEMU versions
+        # Seraph requires QEMU ≥ 8.0 (RISC-V V extension support). The
+        # explicit `-cpu rv64,v=true,...` invocation in `xtask/src/qemu.rs`
+        # works on every supported version; `-cpu rva23s64` becomes usable
+        # at QEMU ≥ 9.1 and is the preferred form once CI runners ship it.
+        run: |
+          qemu-system-x86_64 --version | head -n1
+          qemu-system-riscv64 --version | head -n1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:

@@ -4,8 +4,8 @@
  *
  * kernel/linker/riscv64.ld
  *
- * Linker script for the Seraph kernel (RISC-V RV64GC). Mirrors the x86-64
- * layout: kernel image at 0xFFFFFFFF80000000, physical direct map at
+ * Linker script for the Seraph kernel (RISC-V RV64IMAC, soft-float).
+ * Mirrors the x86-64 layout: kernel image at 0xFFFFFFFF80000000, physical direct map at
  * 0xFFFF800000000000 (established at runtime). Uses the medany code model.
  *
  * AT() clauses set p_paddr for each section to a low physical address

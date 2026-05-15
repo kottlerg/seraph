@@ -2,7 +2,9 @@
 
 Seraph uses Cargo as its build system. `cargo xtask` provides commands for
 cross-compilation, QEMU invocation, and artifact management for x86-64 and
-RISC-V RV64GC from a single source tree.
+RISC-V from a single source tree. Kernel is soft-float on both
+architectures (x86-64 baseline; RV64IMAC); userspace pins x86-64-v3 and
+the RVA23U64 subset respectively.
 
 ---
 
@@ -66,12 +68,26 @@ Key properties shared by the kernel-triple JSONs
 (`x86_64-seraph-none.json`, `riscv64imac-seraph-none.json`):
 
 - x86-64: red zone off, SSE/AVX/MMX off, soft-float, kernel code model.
-- RISC-V: RV64GC feature set, medium code model, lp64d ABI.
+- RISC-V: RV64IMAC feature set, soft-float, medium code model, lp64 ABI.
 - Both: `panic-strategy: abort`, link with `rust-lld`.
 
 The std-userspace triples (`x86_64-seraph.json`, `riscv64a23-seraph.json`)
-keep the same hardware floors as the kernel triples but switch `os` to
-`seraph` so the patched rust-src tree materialised by xtask is selected.
+relax the kernel-side soft-float discipline and pin a hard-microarchitecture
+floor for userspace SIMD / Vector codegen:
+
+- `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
+  SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, plus
+  XSAVE/XSAVEOPT for the lazy save/restore discipline.
+- `riscv64a23-seraph.json` — **RVA23U64** userspace profile (RVA23 v1.0,
+  ratified 2024-10-21): IMAFDCV plus the Zba/Zbb/Zbs bitmanip set,
+  hard-float LP64D ABI. Further RVA23 mandates (Zfa, Zfhmin, Zihintntl,
+  Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt) will land as LLVM
+  and QEMU coverage broadens.
+
+Userspace correctness under preemption is provided by lazy FP/SIMD/V
+save/restore in the kernel scheduler — switch-out save on dirty, switch-in
+lazy trap on first use. See `core/kernel/src/arch/{x86_64,riscv64}/fpu.rs`
+for the per-arch primitives.
 
 The x86-64 bootloader uses the built-in `x86_64-unknown-uefi` target, so no
 custom JSON is needed. The RISC-V bootloader uses
@@ -173,6 +189,13 @@ device.
 **RISC-V:** Requires `edk2-riscv64` firmware. `cargo xtask run` searches standard
 firmware paths and pads `RISCV_VIRT_CODE.fd` / `RISCV_VIRT_VARS.fd` to 32 MiB
 in temporary files if necessary (QEMU virt ≥9.0 requires exactly 32 MiB).
+
+**Minimum QEMU version:** QEMU ≥ 8.0 (V extension support) is required;
+`xtask/src/qemu.rs` passes `-cpu rv64,v=true,zba=true,zbb=true,zbs=true`
+for RISC-V and `-cpu max,migratable=no` on x86-64 TCG. The named
+`-cpu rva23s64` model arrived in QEMU 9.1 (2024-09) and is the preferred
+swap once the CI runner floor ships it; until then the explicit feature
+string is the source of truth.
 
 ---
 

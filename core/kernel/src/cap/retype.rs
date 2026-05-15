@@ -899,7 +899,8 @@ mod tests
     {
         let t = dispatch_for(ObjectType::Thread, 0).unwrap();
         assert!(t.split);
-        assert_eq!(t.raw_bytes, 5 * PAGE_SIZE as u64);
+        // KERNEL_STACK_PAGES (4) + 1 wrapper/TCB page + 1 FPU/SIMD/V save-area page.
+        assert_eq!(t.raw_bytes, 6 * PAGE_SIZE as u64);
     }
 
     #[test]

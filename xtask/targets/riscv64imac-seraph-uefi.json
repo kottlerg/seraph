@@ -10,10 +10,10 @@
     "linker-flavor": "ld.lld",
     "linker": "rust-lld",
     "panic-strategy": "abort",
-    "features": "+m,+a,+f,+d,+c,-v",
+    "features": "+m,+a,+c",
     "code-model": "medium",
     "relocation-model": "static",
-    "llvm-abiname": "lp64d",
+    "llvm-abiname": "lp64",
     "max-atomic-width": 64,
     "pre-link-args": {
         "ld.lld": ["--gc-sections"]

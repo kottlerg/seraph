@@ -757,6 +757,15 @@ pub unsafe fn init()
         );
     }
 
+    // Force sstatus.FS = sstatus.VS = 00 (Off). Kernel is soft-float
+    // (RV64IMAC); any F/D or V instruction in U-mode now raises an illegal-
+    // instruction trap, which the lazy save/restore path will use to
+    // demand-restore extended state.
+    // SAFETY: ring-0 boot; csrc sstatus is privileged S-mode.
+    unsafe {
+        super::fpu::enable_fpu_vector();
+    }
+
     // Enable SSIP (bit 1), STIP (bit 5), and SEIP (bit 9) in sie.
     // SSIP: supervisor software interrupts — used for wakeup IPIs and TLB
     //   shootdown IPIs (both delivered via SBI IPI extension).
@@ -833,6 +842,10 @@ pub unsafe fn init_ap()
 
         // Install stvec — per-hart CSR, must be written on every hart.
         install_trap_vector();
+
+        // Force sstatus.FS = sstatus.VS = 00 (Off) on this AP, mirroring
+        // the BSP invariant. Per-hart CSR; must be re-established here.
+        super::fpu::enable_fpu_vector();
 
         // Clear sscratch so trap_entry identifies S-mode traps correctly.
         core::arch::asm!("csrw sscratch, zero", options(nostack, nomem));

@@ -9,6 +9,7 @@ pub mod ap_trampoline;
 pub mod console;
 pub mod context;
 pub mod cpu;
+pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;

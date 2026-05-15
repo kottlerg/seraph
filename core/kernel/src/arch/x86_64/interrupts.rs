@@ -34,7 +34,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
 
 #[cfg(not(test))]
-use super::{cpu, gdt, idt};
+use super::{cpu, fpu, gdt, idt};
 #[cfg(not(test))]
 use crate::mm::paging::DIRECT_MAP_BASE;
 
@@ -114,6 +114,19 @@ pub unsafe fn init()
     // SAFETY: ring-0 single-threaded boot.
     unsafe {
         cpu::enable_smep_smap();
+    }
+
+    // 1a. Enable XSAVE (x87 | SSE | AVX in XCR0) and arm CR0.TS for lazy
+    //     FPU/SIMD save-restore. Kernel never touches FP/SIMD (soft-float)
+    //     so TS=1 is harmless until a user thread first uses XMM/YMM, at
+    //     which point a #NM trap runs the lazy-restore path.
+    // SAFETY: ring-0 boot; IDT is loaded a few steps below — until then a
+    // CR4/XCR0 fault would triple-fault the boot CPU. enable_xsave only
+    // executes architected register writes that succeed when CPUID
+    // advertises XSAVE; we fatal cleanly if the advertisement is absent.
+    unsafe {
+        fpu::enable_xsave();
+        fpu::cr0_set_ts();
     }
 
     // 2. Carve the BSP IST stacks out of [`BSP_IST_STACKS`] (BSS).
@@ -346,6 +359,18 @@ pub unsafe fn start_ap(target_apic_id: u32, trampoline_phys: u64)
 #[cfg(not(test))]
 pub unsafe fn init_ap()
 {
+    // Per-CPU CR4/CR0/XCR0 setup. The AP trampoline only sets CR4.PAE; SMEP,
+    // SMAP, OSXSAVE, and TS are per-CPU state that must be re-established on
+    // each hart. enable_smep_smap was not previously called on APs — this
+    // closes that gap alongside the XSAVE enablement.
+    // SAFETY: ring-0 AP boot; IDT loaded by caller (kernel_entry_ap); CPUID
+    // gates each enable so a missing feature halts cleanly.
+    unsafe {
+        cpu::enable_smep_smap();
+        fpu::enable_xsave();
+        fpu::cr0_set_ts();
+    }
+
     // SAFETY: AP has loaded GDT/IDT; Local APIC MMIO base is valid kernel mapping; SVR and LVT writes are architecture-defined.
     unsafe {
         apic_write(APIC_SVR, apic_read(APIC_SVR) | 0x100 | 0xFF);

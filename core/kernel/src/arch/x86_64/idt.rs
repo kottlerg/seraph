@@ -667,16 +667,64 @@ unsafe extern "C" fn isr_nm()
 
 /// `#NM` handler body.
 ///
-/// Clears CR0.TS so the trapping x87/SSE/AVX instruction can proceed on
-/// re-execution. Adding XRSTOR of the per-thread XSAVE area is deferred
-/// to the commit that introduces TCB extended state.
+/// Clears CR0.TS, lazily allocates the per-thread XSAVE area on first
+/// trap if it has not been allocated yet, and XRSTORs from it. The
+/// trapping x87/SSE/AVX instruction then proceeds on re-execution with
+/// the thread's saved register file restored. A zero-initialised area
+/// (the just-allocated case) restores to FINIT + zeroed XMM/YMM,
+/// matching the architected initial state.
+///
+/// If allocation fails (SEED exhausted) the handler clears TS and
+/// returns without XRSTOR; the trapping instruction proceeds with
+/// whatever the live register file contains. Lazy save/restore is then
+/// disabled for the thread (area stays null), and subsequent
+/// preemptions risk cross-thread FP state visibility.
 #[cfg(not(test))]
 extern "C" fn nm_handler()
 {
     // SAFETY: ring 0 exception context; clearing TS is the architected
-    // lazy-FPU enable. No memory accesses outside CR0.
+    // lazy-FPU enable. Must precede XRSTOR because XRSTOR itself executes
+    // an FP instruction.
     unsafe {
         super::fpu::cr0_clear_ts();
+    }
+
+    // SAFETY: current_tcb returns this CPU's running thread; valid in
+    // exception context because we entered from a user FP instruction
+    // (the trap fires only on x87/SSE/AVX in U-mode given the kernel is
+    // soft-float).
+    let tcb = unsafe { crate::syscall::current_tcb() };
+    if tcb.is_null()
+    {
+        return;
+    }
+
+    // SAFETY: tcb validated non-null. Lazy-allocate the XSAVE area on
+    // first #NM for this thread; the area outlives the thread (freed in
+    // dealloc_object's Thread arm).
+    let area = unsafe { (*tcb).extended.area };
+    let area = if area.is_null()
+    {
+        let new_area = super::fpu::alloc_area();
+        if new_area.is_null()
+        {
+            return;
+        }
+        // SAFETY: tcb validated non-null.
+        unsafe {
+            (*tcb).extended.area = new_area;
+        }
+        new_area
+    }
+    else
+    {
+        area
+    };
+
+    // SAFETY: area is a valid XSAVE buffer just allocated or recorded
+    // on this thread's TCB; zero-initialised area is XRSTOR-valid.
+    unsafe {
+        super::fpu::restore_from(area);
     }
 }
 

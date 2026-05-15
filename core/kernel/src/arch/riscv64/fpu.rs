@@ -6,10 +6,18 @@
 //! RISC-V extended-state (F / D / V) control primitives.
 //!
 //! Concentrates the unsafe surface for FP and Vector state management.
-//! Step 4: only establishes the boot invariant `sstatus.FS = sstatus.VS = 00
-//! (Off)`. With both fields Off, any F/D or V instruction in U-mode raises an
-//! illegal-instruction trap (`scause = 2`), which the lazy save/restore path
-//! installed in later commits will use to restore extended state.
+//! The boot invariant is `sstatus.FS = sstatus.VS = 00 (Off)`. Any F/D or V
+//! instruction in U-mode raises an illegal-instruction trap (`scause = 2`);
+//! the trap handler decodes the opcode (see [`is_fp_or_v_opcode`]) and
+//! lazy-restores via [`lazy_restore_fp_v`].
+//!
+//! The scheduler calls [`switch_out_save`] on switch-out of every user
+//! thread. It reads `sstatus.FS`: when `FS == 11 (Dirty)`, the live F/D
+//! register file is saved to the thread's per-TCB area; `sstatus.FS` is
+//! then forced back to `00 (Off)` to re-arm the lazy trap. The same
+//! pattern is intended for V state, but V-register save under preemption
+//! is deferred to a follow-up commit (see the head-of-branch design
+//! notes).
 
 /// `sstatus.FS` field — bits [14:13]. Two-bit FP unit state: 00=Off,
 /// 01=Initial, 10=Clean, 11=Dirty.
@@ -104,7 +112,6 @@ pub unsafe fn lazy_enable_fp_v_initial() {}
 /// Returns `false` if `insn == 0`, which some implementations write to
 /// `stval` instead of the trapping encoding — the caller must then treat
 /// the trap as a non-FP/V illegal instruction.
-#[allow(dead_code)] // Consumed by trap_dispatch in the same commit (build-order).
 pub fn is_fp_or_v_opcode(insn: u64) -> bool
 {
     if insn == 0
@@ -114,3 +121,266 @@ pub fn is_fp_or_v_opcode(insn: u64) -> bool
     let major = (insn & 0x7F) as u8;
     matches!(major, 0x07 | 0x27 | 0x43 | 0x47 | 0x4B | 0x4F | 0x53 | 0x57)
 }
+
+// ── Per-thread F/D save area ──────────────────────────────────────────────────
+
+/// Per-thread F/D save area size: 4 KiB (matches the x86 XSAVE area
+/// allocation size for uniformity, even though the F/D state is only
+/// 32 × f64 + fcsr = 264 bytes). SEED scratch is allocated in 4 KiB units;
+/// using a full page also leaves headroom for the deferred V-register
+/// save layout without re-plumbing the allocator.
+pub const FP_AREA_BYTES: usize = 4096;
+
+/// Allocate and zero-initialise a per-thread F/D save area from the SEED
+/// retype pool. Returns a page-aligned `*mut u8`.
+///
+/// A zeroed area restores to f0..f31 = 0.0, fcsr = 0 — the RISC-V architected
+/// initial FP state.
+///
+/// Returns null on SEED exhaustion. A null area disables lazy save/restore
+/// for the thread; the lazy-trap handler still promotes `sstatus.FS` to
+/// Initial but skips the F/D restore, so the trapping instruction proceeds
+/// with whatever the live register file contains.
+#[cfg(not(test))]
+pub fn alloc_area() -> *mut u8
+{
+    match crate::cap::retype::alloc_seed_scratch(FP_AREA_BYTES as u64)
+    {
+        Ok(ptr) =>
+        {
+            // SAFETY: ptr points at FP_AREA_BYTES of freshly-carved SEED
+            // scratch; zero-init makes the area restore-valid.
+            unsafe {
+                core::ptr::write_bytes(ptr, 0u8, FP_AREA_BYTES);
+            }
+            ptr
+        }
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Test stub.
+#[cfg(test)]
+pub fn alloc_area() -> *mut u8
+{
+    core::ptr::null_mut()
+}
+
+/// Reclaim a per-thread F/D save area previously returned by [`alloc_area`].
+///
+/// # Safety
+/// `area` must have been returned by [`alloc_area`] on this kernel build
+/// and not previously freed. Null is allowed and is a no-op.
+#[cfg(not(test))]
+pub unsafe fn free_area(area: *mut u8)
+{
+    if area.is_null()
+    {
+        return;
+    }
+    crate::cap::retype::free_seed_scratch(area, FP_AREA_BYTES as u64);
+}
+
+/// Test stub.
+#[cfg(test)]
+pub unsafe fn free_area(_area: *mut u8) {}
+
+/// Save the live F/D register file to `area`.
+///
+/// Precondition: `sstatus.FS` is not `Off`. Caller (`switch_out_save`)
+/// verifies this by checking the field is `Dirty`.
+///
+/// # Safety
+/// Must execute in supervisor mode. `area` must point at a per-thread
+/// F/D save area allocated by [`alloc_area`]. `sstatus.FS` must be non-Off.
+#[cfg(not(test))]
+#[inline]
+unsafe fn save_fp_to(area: *mut u8)
+{
+    // .option arch, +d locally enables the D extension for the assembler
+    // even though the kernel target is RV64IMAC. The CPU executes these
+    // instructions only when FS is non-Off, which the caller enforces.
+    // SAFETY: caller's contract.
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +d",
+            "fsd f0,    0({a})",
+            "fsd f1,    8({a})",
+            "fsd f2,   16({a})",
+            "fsd f3,   24({a})",
+            "fsd f4,   32({a})",
+            "fsd f5,   40({a})",
+            "fsd f6,   48({a})",
+            "fsd f7,   56({a})",
+            "fsd f8,   64({a})",
+            "fsd f9,   72({a})",
+            "fsd f10,  80({a})",
+            "fsd f11,  88({a})",
+            "fsd f12,  96({a})",
+            "fsd f13, 104({a})",
+            "fsd f14, 112({a})",
+            "fsd f15, 120({a})",
+            "fsd f16, 128({a})",
+            "fsd f17, 136({a})",
+            "fsd f18, 144({a})",
+            "fsd f19, 152({a})",
+            "fsd f20, 160({a})",
+            "fsd f21, 168({a})",
+            "fsd f22, 176({a})",
+            "fsd f23, 184({a})",
+            "fsd f24, 192({a})",
+            "fsd f25, 200({a})",
+            "fsd f26, 208({a})",
+            "fsd f27, 216({a})",
+            "fsd f28, 224({a})",
+            "fsd f29, 232({a})",
+            "fsd f30, 240({a})",
+            "fsd f31, 248({a})",
+            "csrr {tmp}, fcsr",
+            "sd {tmp}, 256({a})",
+            ".option pop",
+            a = in(reg) area,
+            tmp = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
+/// Restore the F/D register file from `area`.
+///
+/// Precondition: `sstatus.FS` is not `Off`. Caller (`lazy_restore_fp_v`)
+/// has just promoted FS to Initial.
+///
+/// # Safety
+/// Must execute in supervisor mode. `area` must point at a per-thread
+/// F/D save area previously written by [`save_fp_to`] or zero-initialised
+/// by [`alloc_area`] (the zeroed area restores to f0..f31 = 0.0 and
+/// fcsr = 0, matching the architected initial FP state).
+#[cfg(not(test))]
+#[inline]
+unsafe fn restore_fp_from(area: *const u8)
+{
+    // SAFETY: caller's contract.
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +d",
+            "fld f0,    0({a})",
+            "fld f1,    8({a})",
+            "fld f2,   16({a})",
+            "fld f3,   24({a})",
+            "fld f4,   32({a})",
+            "fld f5,   40({a})",
+            "fld f6,   48({a})",
+            "fld f7,   56({a})",
+            "fld f8,   64({a})",
+            "fld f9,   72({a})",
+            "fld f10,  80({a})",
+            "fld f11,  88({a})",
+            "fld f12,  96({a})",
+            "fld f13, 104({a})",
+            "fld f14, 112({a})",
+            "fld f15, 120({a})",
+            "fld f16, 128({a})",
+            "fld f17, 136({a})",
+            "fld f18, 144({a})",
+            "fld f19, 152({a})",
+            "fld f20, 160({a})",
+            "fld f21, 168({a})",
+            "fld f22, 176({a})",
+            "fld f23, 184({a})",
+            "fld f24, 192({a})",
+            "fld f25, 200({a})",
+            "fld f26, 208({a})",
+            "fld f27, 216({a})",
+            "fld f28, 224({a})",
+            "fld f29, 232({a})",
+            "fld f30, 240({a})",
+            "fld f31, 248({a})",
+            "ld {tmp}, 256({a})",
+            "csrw fcsr, {tmp}",
+            ".option pop",
+            a = in(reg) area,
+            tmp = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
+/// Context-switch hook: if `sstatus.FS == Dirty`, save the live F/D state
+/// to `area`. Always force `sstatus.FS = sstatus.VS = 00 (Off)` afterwards
+/// so the next user F/D or V instruction takes the lazy trap.
+///
+/// Calling this with `area == null` is incorrect — kernel-only threads
+/// (whose `extended.area` is null) never reach this hook because the
+/// scheduler guards on the area pointer.
+///
+/// # Safety
+/// Must execute in supervisor mode with interrupts disabled.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn switch_out_save(area: *mut u8)
+{
+    let sstatus: u64;
+    // SAFETY: csrr sstatus is a privileged S-mode read.
+    unsafe {
+        core::arch::asm!(
+            "csrr {0}, sstatus",
+            out(reg) sstatus,
+            options(nostack, nomem),
+        );
+    }
+    let fs = (sstatus >> 13) & 0x3;
+    if fs == 0x3
+    {
+        // SAFETY: FS = Dirty, so the FP register file is live and fsd
+        // executes without trapping.
+        unsafe {
+            save_fp_to(area);
+        }
+    }
+    // Force FS = VS = Off to re-arm the lazy trap.
+    // SAFETY: csrc sstatus is privileged S-mode; mask is architected.
+    unsafe {
+        core::arch::asm!(
+            "csrc sstatus, {mask}",
+            mask = in(reg) (SSTATUS_FS_MASK | SSTATUS_VS_MASK),
+            options(nostack, nomem),
+        );
+    }
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn switch_out_save(_area: *mut u8) {}
+
+/// Lazy-trap handler body: promote `sstatus.FS` and `sstatus.VS` from Off
+/// to Initial, then restore the F/D register file from `area` if non-null.
+/// V state is intentionally not restored — V-register save+restore is
+/// deferred to a follow-up commit.
+///
+/// # Safety
+/// Must execute in supervisor mode from the illegal-instruction trap path.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn lazy_restore_fp_v(area: *const u8)
+{
+    // SAFETY: csrs sstatus is privileged S-mode; this is the architected
+    // FS/VS promotion sequence.
+    unsafe {
+        lazy_enable_fp_v_initial();
+    }
+    if !area.is_null()
+    {
+        // SAFETY: area is a valid F/D save area pointer or zero-initialised
+        // (Box::new zeroes the [u64; 33]).
+        unsafe {
+            restore_fp_from(area);
+        }
+    }
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn lazy_restore_fp_v(_area: *const u8) {}

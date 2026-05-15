@@ -6,8 +6,9 @@
 //! x86-64 extended-state (x87 / SSE / AVX) control primitives.
 //!
 //! Concentrates the unsafe surface for FPU/SIMD state management:
-//! CR0 access (TS bit for lazy-trap discipline), XSETBV/XCR0 setup, and the
-//! per-CPU XSAVE enablement performed at boot.
+//! CR0 access (TS bit for lazy-trap discipline), XSETBV/XCR0 setup, the
+//! per-CPU XSAVE enablement performed at boot, and the per-thread XSAVE
+//! area allocation plus save/restore used by the lazy save/restore path.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -171,3 +172,159 @@ pub unsafe fn enable_xsave()
     let (_eax, _ebx, ecx, _edx) = super::cpu::cpuid(0xD);
     XSAVE_AREA_SIZE.store(ecx as usize, Ordering::Relaxed);
 }
+
+// ── Per-thread XSAVE area ─────────────────────────────────────────────────────
+
+/// Per-thread XSAVE area size: 4 KiB.
+///
+/// Comfortably above the area size for the x87|SSE|AVX component set we
+/// enable in XCR0 (typically 832 bytes). Leaves headroom for future
+/// AVX-512 promotion. SEED-backed allocations are page-aligned, which
+/// trivially satisfies XSAVE's 64-byte alignment requirement.
+pub const XSAVE_AREA_BYTES: usize = 4096;
+
+/// Allocate and zero-initialise a per-thread XSAVE area from the SEED
+/// retype pool. Returns a page-aligned `*mut u8` of size [`XSAVE_AREA_BYTES`].
+///
+/// A zeroed area is XRSTOR-valid: it is equivalent to FINIT + zeroed XMM/YMM
+/// per Intel SDM, so the first XRSTOR after a fresh allocation reaches the
+/// architected initial state with no special-casing.
+///
+/// Returns null if SEED is exhausted; the caller (TCB constructor) records
+/// the result in `ExtendedState::area`. A null area means lazy save/restore
+/// is disabled for the thread; the lazy-trap handler skips XRSTOR in that
+/// case and the user thread proceeds with whatever FPU state the hardware
+/// happens to have. Until userspace targets actually emit SIMD this is
+/// dormant; once they do, the allocator is the only failure mode and OOM
+/// here would in practice halt the kernel via the SEED carve panic.
+#[cfg(not(test))]
+pub fn alloc_area() -> *mut u8
+{
+    match crate::cap::retype::alloc_seed_scratch(XSAVE_AREA_BYTES as u64)
+    {
+        Ok(ptr) =>
+        {
+            // SAFETY: ptr points at XSAVE_AREA_BYTES of freshly-carved SEED
+            // scratch; zero-init makes the area XRSTOR-valid.
+            unsafe {
+                core::ptr::write_bytes(ptr, 0u8, XSAVE_AREA_BYTES);
+            }
+            ptr
+        }
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Test stub: TCB construction is exercised in host unit tests for the
+/// retype/dispatch arithmetic; never running asm there, so a null is fine.
+#[cfg(test)]
+pub fn alloc_area() -> *mut u8
+{
+    core::ptr::null_mut()
+}
+
+/// Reclaim a per-thread XSAVE area previously returned by [`alloc_area`].
+///
+/// # Safety
+/// `area` must have been returned by [`alloc_area`] on this kernel build
+/// and not previously freed. Null is allowed and is a no-op.
+#[cfg(not(test))]
+pub unsafe fn free_area(area: *mut u8)
+{
+    if area.is_null()
+    {
+        return;
+    }
+    crate::cap::retype::free_seed_scratch(area, XSAVE_AREA_BYTES as u64);
+}
+
+/// Test stub for [`free_area`].
+#[cfg(test)]
+pub unsafe fn free_area(_area: *mut u8) {}
+
+/// Save the live x87/SSE/AVX state of the executing CPU into `area`.
+///
+/// Uses XSAVEOPT to skip components untouched since the last save.
+/// `area` must be 64-byte aligned and point at a writable XSAVE buffer of
+/// at least [`xsave_area_size`] bytes. The component-mask passed in
+/// `EDX:EAX = 0xFFFF_FFFF_FFFF_FFFF` instructs XSAVEOPT to save every
+/// component that XCR0 currently enables.
+///
+/// # Safety
+/// Must execute at ring 0. `area` must satisfy the alignment and size
+/// requirements above. Called from the context-switch path with
+/// interrupts disabled and the scheduler lock held.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn save_to(area: *mut u8)
+{
+    // SAFETY: caller's contract; XSAVEOPT requires OSXSAVE which the boot
+    // path established. The component mask `0xFFFF_FFFF` (low 32 bits) is
+    // intersected with XCR0 by hardware, so it saves exactly the enabled set.
+    unsafe {
+        core::arch::asm!(
+            "xsaveopt [{area}]",
+            area = in(reg) area,
+            in("eax") 0xFFFF_FFFFu32,
+            in("edx") 0xFFFF_FFFFu32,
+            options(nostack),
+        );
+    }
+}
+
+/// Restore the x87/SSE/AVX state of the executing CPU from `area`.
+///
+/// The `XSTATE_BV` header in `area` selects which components actually get
+/// reloaded; the others reach the architected initial state. A zeroed
+/// area reaches FINIT + zeroed XMM/YMM.
+///
+/// # Safety
+/// Must execute at ring 0. `area` must point at an XSAVE buffer previously
+/// written by [`save_to`] (or zero-initialised). Called from the `#NM`
+/// trap handler with CR0.TS already cleared.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn restore_from(area: *const u8)
+{
+    // SAFETY: caller's contract; XRSTOR is gated on OSXSAVE which boot set.
+    unsafe {
+        core::arch::asm!(
+            "xrstor [{area}]",
+            area = in(reg) area,
+            in("eax") 0xFFFF_FFFFu32,
+            in("edx") 0xFFFF_FFFFu32,
+            options(nostack),
+        );
+    }
+}
+
+/// Context-switch hook called on switch-out of a user thread (the caller
+/// supplies the non-null area pointer): XSAVEOPT the live x87/SSE/AVX
+/// register file to the thread's per-TCB area and re-arm the `#NM` lazy
+/// trap by setting CR0.TS.
+///
+/// XSAVEOPT performs hardware-tracked dirty filtering via the XINUSE bits
+/// it maintains internally — components untouched since the last XRSTOR
+/// are not written. The cost on a thread that has not dirtied any FPU
+/// state since its last restore is ~50 cycles (instruction decode +
+/// XINUSE check, no memory traffic). This is the discipline Linux and
+/// most modern x86-64 kernels run.
+///
+/// # Safety
+/// Must execute at ring 0 with interrupts disabled, before the scheduler
+/// lock release that publishes this thread's state to other CPUs.
+/// `area` must satisfy the alignment and size requirements of [`save_to`].
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn switch_out_save(area: *mut u8)
+{
+    // SAFETY: caller's contract.
+    unsafe {
+        save_to(area);
+        cr0_set_ts();
+    }
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn switch_out_save(_area: *mut u8) {}

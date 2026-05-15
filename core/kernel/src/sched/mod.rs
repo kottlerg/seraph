@@ -1603,6 +1603,27 @@ pub unsafe fn schedule(requeue_current: bool)
         }
     }
 
+    // Save the current thread's extended FPU/SIMD/V state to its per-TCB
+    // area before any other CPU can observe this thread as no-longer-current.
+    // Skipped when the area is null (kernel-only / idle threads, which the
+    // soft-float-everywhere kernel discipline never dirties).
+    if !current.is_null()
+    {
+        // SAFETY: current is a valid TCB; extended.area is null or a valid
+        // arch-specific save area allocated by fpu::alloc_area.
+        let area = unsafe { (*current).extended.area };
+        if !area.is_null()
+        {
+            // SAFETY: ring-0 with interrupts disabled and the scheduler
+            // lock held; arch fpu::switch_out_save handles the per-arch
+            // save discipline (XSAVEOPT on x86-64, FS-dirty-check on
+            // RISC-V) and re-arms the lazy trap.
+            unsafe {
+                crate::arch::current::fpu::switch_out_save(area);
+            }
+        }
+    }
+
     // Capture saved-state pointers before releasing the lock.
     let current_state: *mut crate::arch::current::context::SavedState = if current.is_null()
     {

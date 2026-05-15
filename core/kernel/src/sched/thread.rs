@@ -62,25 +62,27 @@ unsafe impl Sync for DeathObserver {}
 
 // ── ExtendedState ─────────────────────────────────────────────────────────────
 
-/// Per-thread extended-state metadata for the lazy FPU/SIMD/V save-restore
-/// discipline.
+/// Per-thread extended-state save-area pointer for the lazy FPU/SIMD/V
+/// save-restore discipline.
 ///
-/// `area` points at a page-aligned, page-sized arch-specific save area
-/// (XSAVE layout on x86-64, F/D + V register file on RISC-V). Null when the
-/// area has not yet been allocated — kernel-only threads (idle, soft-float
-/// kernel-internal) never need one. The allocation and the live save/restore
-/// path are wired in a follow-up commit; until then `area` stays null and
-/// the field is data-only.
+/// `area` points at a page-aligned arch-specific save area (XSAVE layout
+/// on x86-64; F/D register file on RISC-V). Null on threads that never
+/// touch FP/SIMD/V (idle TCBs, soft-float kernel-only threads). For user
+/// threads, the area is allocated at TCB construction and freed at
+/// destruction.
 ///
-/// `dirty` is true if the live extended-state register file on the owning
-/// CPU contains thread-private data that must be saved before another
-/// thread can dirty the registers. Cleared on save.
+/// Save discipline: the context-switch path calls
+/// `arch::current::fpu::save_to(area)` unconditionally on switch-out
+/// whenever `area` is non-null (the area is XRSTOR-valid even before any
+/// user FP instruction has executed, because zeroed XSAVE state is
+/// equivalent to FINIT + zeroed XMM/YMM). The lazy-trap handler calls
+/// `arch::current::fpu::restore_from(area)` on each user FP/SIMD/V
+/// trap and clears CR0.TS / promotes sstatus.FS — see arch/*/fpu.rs.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ExtendedState
 {
     pub area: *mut u8,
-    pub dirty: bool,
 }
 
 impl ExtendedState
@@ -89,8 +91,14 @@ impl ExtendedState
     {
         Self {
             area: core::ptr::null_mut(),
-            dirty: false,
         }
+    }
+
+    /// Construct a populated `ExtendedState` from an area pointer returned
+    /// by `arch::current::fpu::alloc_area`.
+    pub const fn from_raw(area: *mut u8) -> Self
+    {
+        Self { area }
     }
 }
 

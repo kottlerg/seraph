@@ -1486,20 +1486,10 @@ unsafe fn dealloc_object_one(
                     }
                 }
 
-                // Release the per-thread XSAVE / FP-save area allocated at
-                // TCB construction. Null on kernel-only TCBs (idle threads),
-                // which never reach the Thread arm of dealloc_object anyway.
-                // SAFETY: tcb validated non-null; extended.area is null or a
-                // pointer returned by arch::current::fpu::alloc_area.
-                let extended_area = unsafe { (*tcb).extended.area };
-                if !extended_area.is_null()
-                {
-                    // SAFETY: pointer came from fpu::alloc_area on this build.
-                    unsafe {
-                        crate::arch::current::fpu::free_area(extended_area);
-                        (*tcb).extended.area = core::ptr::null_mut();
-                    }
-                }
+                // The per-thread XSAVE / FP-save area is page N+1 of the
+                // Thread retype slot (see sys_cap_create_thread layout); it
+                // is reclaimed wholesale by `retype_free` below as part of
+                // the same slot release, so no separate free is needed.
 
                 // Poison the TCB so any use-after-free reads garbage
                 // instead of plausible values.
@@ -1520,7 +1510,7 @@ unsafe fn dealloc_object_one(
             );
             use crate::cap::retype::{dispatch_for, retype_free};
             let raw_bytes = dispatch_for(ObjectType::Thread, 0).map_or(
-                (crate::sched::KERNEL_STACK_PAGES as u64 + 1) * crate::mm::PAGE_SIZE as u64,
+                (crate::sched::KERNEL_STACK_PAGES as u64 + 2) * crate::mm::PAGE_SIZE as u64,
                 |e| e.raw_bytes,
             );
             // SAFETY: ancestor_ptr non-null per 4b invariant.

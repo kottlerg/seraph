@@ -784,13 +784,14 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         cs_obj.cspace
     };
 
-    // Reserve the 5-page slot from the source Frame cap. Layout (a):
-    //   pages 0..4 (16 KiB) — kstack
+    // Reserve the 6-page slot from the source Frame cap. Layout:
+    //   pages 0..3 (16 KiB) — kstack
     //   page 4              — ThreadObject (24 B) followed by TCB
+    //   page 5              — per-thread FPU/SIMD/V save area
     let entry = dispatch_for(ObjectType::Thread, 0).ok_or(SyscallError::InvalidArgument)?;
     debug_assert_eq!(
         entry.raw_bytes,
-        (KERNEL_STACK_PAGES as u64 + 1) * PAGE_SIZE as u64
+        (KERNEL_STACK_PAGES as u64 + 2) * PAGE_SIZE as u64
     );
     let offset = retype_allocate(frame, entry.raw_bytes)?;
     let block_phys = frame.base + offset;
@@ -801,6 +802,17 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let thread_obj_ptr = kstack_top as *mut ThreadObject;
     let tcb_offset = core::mem::size_of::<ThreadObject>() as u64;
     let tcb_ptr = (kstack_top + tcb_offset) as *mut ThreadControlBlock;
+    // Per-thread FPU/SIMD/V save area: one page directly after the wrapper
+    // page. Zero-initialised so the first XRSTOR / F-D restore sees the
+    // architected initial state. The area's lifecycle is the Thread retype
+    // slot's; `retype_free` reclaims it wholesale, so no separate free
+    // path is needed.
+    let extended_area = (kstack_top + PAGE_SIZE as u64) as *mut u8;
+    // SAFETY: extended_area points at a freshly-retyped page exclusively
+    // owned by this TCB construction.
+    unsafe {
+        core::ptr::write_bytes(extended_area, 0u8, PAGE_SIZE);
+    }
 
     // Build the initial SavedState. The "entry point" is the user_thread_trampoline
     // so that when schedule() first switches to this thread, switch() jumps to
@@ -859,7 +871,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 death_observer_count: 0,
                 exit_reason: 0,
                 sleep_deadline: 0,
-                extended: crate::sched::thread::ExtendedState::empty(),
+                extended: crate::sched::thread::ExtendedState::from_raw(extended_area),
                 magic: crate::sched::thread::TCB_MAGIC,
             },
         );

@@ -650,10 +650,13 @@ pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallE
 /// Unlike [`alloc_in_seed`], no `KernelObjectHeader` is written and the
 /// region does not enter any `CSpace`; the returned pointer is opaque.
 ///
-/// Consumers: the IOPB allocation in `sys_iopb_set` (x86-64 only) and the
-/// per-thread XSAVE / FP save area allocated by `arch::current::fpu::alloc_area`
-/// (both arches).
-#[cfg(not(test))]
+/// Gated `cfg(target_arch = "x86_64")` because the only consumer is the
+/// IOPB allocation in `sys_iopb_set`. RISC-V has no I/O port permission
+/// bitmap and never calls this. The per-thread FPU/SIMD/V save area is
+/// not allocated through this path — it is carved as part of the Thread
+/// retype slot (an extra page beyond kstack + wrapper) so its memory
+/// comes from the user's Frame cap rather than the SEED bootstrap reserve.
+#[cfg(all(not(test), target_arch = "x86_64"))]
 pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 {
     let seed = crate::cap::seed_frame_ref();
@@ -669,7 +672,7 @@ pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 /// SEED is statically pinned (initial refcount 1 + Phase-7 `inc_ref` pin),
 /// so its refcount can never drop to zero in normal operation; the
 /// `dec_ref` here is bookkeeping for the scratch lease.
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
 {
     let seed = crate::cap::seed_frame_ref();
@@ -758,12 +761,14 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             })
         }
         // Thread: KERNEL_STACK_PAGES kstack pages + 1 page holding the
-        // ThreadObject wrapper and the TCB. Layout: pages 0..N are kstack
-        // (kstack_top = base + N*PAGE_SIZE); page N holds wrapper + TCB.
-        // The construction site `sys_cap_create_thread` asserts equality
-        // against this dispatch entry.
+        // ThreadObject wrapper and the TCB + 1 page for the per-thread
+        // FPU/SIMD/V save area. Layout: pages 0..N are kstack
+        // (kstack_top = base + N*PAGE_SIZE); page N holds wrapper + TCB;
+        // page N+1 is the XSAVE / F-D save area. The construction site
+        // `sys_cap_create_thread` asserts equality against this dispatch
+        // entry.
         ObjectType::Thread => Some(DispatchEntry {
-            raw_bytes: (crate::sched::KERNEL_STACK_PAGES as u64 + 1) * PAGE_SIZE as u64,
+            raw_bytes: (crate::sched::KERNEL_STACK_PAGES as u64 + 2) * PAGE_SIZE as u64,
             split: true,
         }),
         // AddressSpace and CSpace are both kernel-half growable objects.

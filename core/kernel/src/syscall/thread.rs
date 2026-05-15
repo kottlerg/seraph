@@ -45,7 +45,18 @@ pub fn sys_thread_configure(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let thread_idx = tf.arg(0) as u32;
     let entry = tf.arg(1);
-    let stack_ptr = tf.arg(2);
+    // Round the user stack pointer to match the entry point's `extern "C"`
+    // ABI expectations. On x86-64 SysV the convention is `rsp = 8 mod 16`
+    // at function entry (the 8 accounts for the return address a normal
+    // caller would have pushed); without this, the first 128-bit-aligned
+    // SSE/AVX memory operand in user code (e.g. a compiler-emitted
+    // `vmovaps (%rsp)` from a struct init) #GPs. On RISC-V LP64D the
+    // return address lives in `ra`, not on the stack, so function entry
+    // expects `sp = 0 mod 16`.
+    #[cfg(target_arch = "x86_64")]
+    let stack_ptr = (tf.arg(2) & !0xFu64).wrapping_sub(8);
+    #[cfg(target_arch = "riscv64")]
+    let stack_ptr = tf.arg(2) & !0xFu64;
     let arg = tf.arg(3);
     let tls_base = tf.arg(4);
 

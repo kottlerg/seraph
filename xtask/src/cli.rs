@@ -90,6 +90,7 @@ pub enum BuildComponent
     Crasher,
     Usertest,
     Svcmgr,
+    Pwrmgr,
     Hello,
     Pipefault,
     Stackoverflow,

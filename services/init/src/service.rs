@@ -528,6 +528,224 @@ pub fn create_devmgr_with_caps(
     }
 }
 
+// ── pwrmgr creation ─────────────────────────────────────────────────────────
+
+/// Walk `/bin/pwrmgr`, create the process, transfer platform shutdown
+/// caps via bootstrap rounds, and start it.
+///
+/// Returns the service-endpoint slot init owns (the RECV side stays with
+/// pwrmgr; init keeps the source for deriving tokened SENDs to
+/// authorized consumers). Returns `None` on any failure; partial state
+/// is torn down before returning.
+///
+/// Bootstrap layout (matches `services/pwrmgr/src/caps.rs`):
+/// * Round 1 (≤2 caps, 2 data words):
+///   - caps\[0\] = pwrmgr's service endpoint (derived copy).
+///   - caps\[1\] = arch authority cap (`IoPortRange` on x86-64,
+///     `SbiControl` on RISC-V). Omitted when absent.
+///   - data\[0\] = presence bitmap (bit 0 = arch cap present).
+///   - data\[1\] = `PWRMGR_LABELS_VERSION`.
+///   - `done` = true on RISC-V or when no ACPI regions follow.
+/// * Round 2..N (x86-64 only): ACPI region Frame caps, ≤4 per round.
+#[allow(clippy::too_many_lines)]
+pub fn create_and_start_pwrmgr(
+    info: &InitInfo,
+    procmgr_ep: u32,
+    bootstrap_ep: u32,
+    system_root_cap: u32,
+    init_self_cspace: u32,
+    ipc_buf: *mut u64,
+) -> Option<u32>
+{
+    let walked = walk::walk_to_file(system_root_cap, b"/bin/pwrmgr", ipc_buf)?;
+
+    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
+
+    let msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+        .word(0, walked.size)
+        .cap(walked.file_cap)
+        .cap(tokened_creator)
+        .build();
+
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
+    else
+    {
+        log("pwrmgr: CREATE_FROM_FILE ipc_call failed");
+        return None;
+    };
+    if reply.label != 0
+    {
+        log("pwrmgr: CREATE_FROM_FILE error");
+        return None;
+    }
+
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
+    {
+        log("pwrmgr: CREATE_FROM_FILE reply missing caps");
+        return None;
+    }
+    let process_handle = reply_caps[0];
+    // CREATE_FROM_FILE returns (process_handle, thread_cap). pwrmgr is
+    // not currently registered with svcmgr for death monitoring, so the
+    // thread cap is released here to avoid accumulating in init's
+    // CSpace.
+    if reply_caps.len() >= 2
+    {
+        let _ = syscall::cap_delete(reply_caps[1]);
+    }
+
+    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    {
+        return None;
+    }
+
+    // Service endpoint: init owns the RECV source; pwrmgr receives a
+    // derived RECV copy. Source stays in init's CSpace for deriving
+    // tokened SENDs (SHUTDOWN_AUTHORITY) to authorized consumers.
+    let Ok(pwrmgr_service_ep) = syscall::cap_create_endpoint(crate::endpoint_slab())
+    else
+    {
+        log("pwrmgr: cannot create service endpoint");
+        destroy_partial_child(process_handle, ipc_buf);
+        return None;
+    };
+    let Ok(service_copy) = syscall::cap_derive(pwrmgr_service_ep, syscall::RIGHTS_ALL)
+    else
+    {
+        log("pwrmgr: service endpoint derive failed");
+        let _ = syscall::cap_delete(pwrmgr_service_ep);
+        destroy_partial_child(process_handle, ipc_buf);
+        return None;
+    };
+
+    // Arch authority cap: IoPortRange on x86_64, SbiControl on
+    // RISC-V. Both are present in InitInfo's hw caps; on the absent arch
+    // the corresponding slot is zero.
+    let arch_cap_source: u32 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::find_cap_by_type(info, CapType::IoPortRange).unwrap_or(0)
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            info.sbi_control_cap
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            let _ = info;
+            0
+        }
+    };
+    let arch_cap_copy = if arch_cap_source != 0
+    {
+        syscall::cap_derive(arch_cap_source, syscall::RIGHTS_ALL).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+
+    if !start_process(
+        process_handle,
+        ipc_buf,
+        "phase 3: pwrmgr started; serving bootstrap",
+        "phase 3: pwrmgr START_PROCESS failed",
+    )
+    {
+        let _ = syscall::cap_delete(pwrmgr_service_ep);
+        return None;
+    }
+
+    // Round 1: service endpoint + (optionally) arch cap. The ACPI
+    // region rounds (x86_64 only) follow when present.
+    let acpi_present = info.acpi_region_frame_count > 0;
+    let mut r1_caps = [0u32; 2];
+    let mut r1_cap_count: usize = 1;
+    r1_caps[0] = service_copy;
+    let mut presence: u64 = 0;
+    if arch_cap_copy != 0
+    {
+        presence |= 1u64 << 0;
+        r1_caps[r1_cap_count] = arch_cap_copy;
+        r1_cap_count += 1;
+    }
+    let r1_done = !acpi_present;
+    if !serve(
+        bootstrap_ep,
+        child_token,
+        ipc_buf,
+        r1_done,
+        &r1_caps[..r1_cap_count],
+        &[presence, u64::from(ipc::PWRMGR_LABELS_VERSION)],
+        "pwrmgr: bootstrap round 1 failed",
+    )
+    {
+        let _ = syscall::cap_delete(pwrmgr_service_ep);
+        return None;
+    }
+
+    if acpi_present
+    {
+        let ar_start = info.acpi_region_frame_base;
+        let ar_end = ar_start + info.acpi_region_frame_count;
+        // Collect ACPI region metadata from descriptor array.
+        let mut regions: [(u32, u64, u64); MAX_ACPI_REGION_CAPS] =
+            [(0, 0, 0); MAX_ACPI_REGION_CAPS];
+        let mut region_count: usize = 0;
+        for d in crate::descriptors(info)
+        {
+            if d.cap_type == CapType::Frame
+                && d.slot >= ar_start
+                && d.slot < ar_end
+                && region_count < MAX_ACPI_REGION_CAPS
+            {
+                regions[region_count] = (d.slot, d.aux0, d.aux1);
+                region_count += 1;
+            }
+        }
+
+        let mut idx = 0;
+        while idx < region_count
+        {
+            let batch_end = (idx + 4).min(region_count);
+            let batch_count = batch_end - idx;
+            let mut caps = [0u32; 4];
+            let mut data = [0u64; 2 + 4 * 2];
+            data[0] = kind::ACPI_REGION;
+            data[1] = batch_count as u64;
+            for j in 0..batch_count
+            {
+                let (slot, base, size) = regions[idx + j];
+                if let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+                {
+                    caps[j] = c;
+                }
+                data[2 + j * 2] = base;
+                data[3 + j * 2] = size;
+            }
+            let is_last = batch_end == region_count;
+            if !serve(
+                bootstrap_ep,
+                child_token,
+                ipc_buf,
+                is_last,
+                &caps[..batch_count],
+                &data[..2 + batch_count * 2],
+                "pwrmgr: bootstrap ACPI region round failed",
+            )
+            {
+                let _ = syscall::cap_delete(pwrmgr_service_ep);
+                return None;
+            }
+            idx = batch_end;
+        }
+    }
+
+    Some(pwrmgr_service_ep)
+}
+
 // ── vfsd creation ────────────────────────────────────────────────────────────
 
 /// Endpoint set passed to vfsd via its bootstrap round.
@@ -816,20 +1034,35 @@ pub fn create_crasher_suspended_from_file(
 
 /// Load `/bin/usertest` via `CREATE_FROM_FILE`, install init's seed
 /// namespace cap on the child, start it, and serve a terminal bootstrap
-/// round carrying the fatfs root cap.
+/// round carrying the fatfs root cap and two SEND caps on pwrmgr's
+/// service endpoint.
 ///
 /// usertest exits cleanly on completion and is not registered with
 /// svcmgr. log + procmgr + system-root caps arrive via `ProcessInfo`;
-/// the bootstrap round carries only `caps[0]`: a tokened SEND on
-/// fatfs's namespace endpoint at `NodeId::ROOT` for the `ns_phase`
-/// direct-driver tests. Zero when vfsd was unable to mint one; the
-/// receiving phase logs and skips assertions in that case.
+/// the bootstrap round carries:
+/// * `caps[0]` — a tokened SEND on fatfs's namespace endpoint at
+///   `NodeId::ROOT` for the `ns_phase` direct-driver tests. Zero when
+///   vfsd was unable to mint one; the receiving phase logs and skips
+///   assertions in that case.
+/// * `caps[1]` — a `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's
+///   service endpoint. usertest invokes
+///   `pwrmgr_labels::SHUTDOWN` through this cap on the success path so
+///   QEMU exits cleanly. Zero when pwrmgr was not started; usertest's
+///   shutdown phase skips when zero.
+/// * `caps[2]` — a SEND on pwrmgr's service endpoint without the
+///   `SHUTDOWN_AUTHORITY` token bit. usertest's
+///   `pwrmgr_cap_deny_phase` calls `SHUTDOWN` through this cap and
+///   asserts the reply is `pwrmgr_errors::UNAUTHORIZED`. Zero when
+///   pwrmgr was not started; the phase skips when zero.
+#[allow(clippy::too_many_arguments)]
 pub fn create_and_run_usertest(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
     fatfs_root_cap: u32,
+    pwrmgr_auth_cap: u32,
+    pwrmgr_noauth_cap: u32,
     ipc_buf: *mut u64,
 )
 {
@@ -917,8 +1150,9 @@ pub fn create_and_run_usertest(
         return;
     }
 
-    // Slot convention: caps[0] = fatfs root. The system-root cap arrives
-    // through `ProcessInfo.system_root_cap` (set via
+    // Slot convention: caps[0] = fatfs root, caps[1] = pwrmgr
+    // authority, caps[2] = pwrmgr no-authority. The system-root cap
+    // arrives through `ProcessInfo.system_root_cap` (set via
     // `CONFIGURE_NAMESPACE` above); std exposes it via
     // `std::os::seraph::root_dir_cap()`.
     let _ = serve(
@@ -926,7 +1160,7 @@ pub fn create_and_run_usertest(
         child_token,
         ipc_buf,
         true,
-        &[fatfs_root_cap],
+        &[fatfs_root_cap, pwrmgr_auth_cap, pwrmgr_noauth_cap],
         &[],
         "phase 3: usertest bootstrap failed",
     );
@@ -1195,6 +1429,55 @@ pub fn phase3_svcmgr_handover(
         );
     }
 
+    // Spawn pwrmgr before usertest so we can hand usertest a tokened
+    // SEND on pwrmgr's service endpoint. usertest invokes
+    // `pwrmgr_labels::SHUTDOWN` through that cap on the success path so
+    // naked `xtask run` exits cleanly when the test suite finishes.
+    let pwrmgr_service_ep = create_and_start_pwrmgr(
+        info,
+        procmgr_ep,
+        bootstrap_ep,
+        system_root_cap,
+        init_self_cspace,
+        ipc_buf,
+    );
+    let (pwrmgr_auth_cap, pwrmgr_noauth_cap) = if let Some(ep) = pwrmgr_service_ep
+    {
+        let auth = if let Ok(c) = syscall::cap_derive_token(
+            ep,
+            syscall::RIGHTS_SEND,
+            ipc::pwrmgr_labels::SHUTDOWN_AUTHORITY,
+        )
+        {
+            c
+        }
+        else
+        {
+            log("phase 3: pwrmgr SHUTDOWN_AUTHORITY derive failed");
+            0
+        };
+        // No-authority twin used by usertest's `pwrmgr_cap_deny_phase`
+        // to verify the SHUTDOWN gate rejects un-tokened callers.
+        // `cap_derive_token` rejects token=0; use plain `cap_derive` so
+        // the derived cap inherits the source's token (which is zero on
+        // the untokened source endpoint init created).
+        let noauth = if let Ok(c) = syscall::cap_derive(ep, syscall::RIGHTS_SEND)
+        {
+            c
+        }
+        else
+        {
+            log("phase 3: pwrmgr no-auth derive failed");
+            0
+        };
+        (auth, noauth)
+    }
+    else
+    {
+        log("phase 3: pwrmgr not available; naked xtask run will not exit cleanly");
+        (0, 0)
+    };
+
     // Spawn usertest (run-once test driver; no svcmgr registration).
     create_and_run_usertest(
         procmgr_ep,
@@ -1202,6 +1485,8 @@ pub fn phase3_svcmgr_handover(
         system_root_cap,
         init_self_cspace,
         fatfs_root_cap,
+        pwrmgr_auth_cap,
+        pwrmgr_noauth_cap,
         ipc_buf,
     );
 

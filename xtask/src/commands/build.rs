@@ -129,6 +129,11 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::RootfsBin,
     },
     Spec {
+        name: "pwrmgr",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+    },
+    Spec {
         name: "hello",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
@@ -167,6 +172,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Crasher => "crasher",
         BuildComponent::Usertest => "usertest",
         BuildComponent::Svcmgr => "svcmgr",
+        BuildComponent::Pwrmgr => "pwrmgr",
         BuildComponent::Hello => "hello",
         BuildComponent::Stackoverflow => "stackoverflow",
         BuildComponent::Pipefault => "pipefault",

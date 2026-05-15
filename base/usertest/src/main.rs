@@ -67,12 +67,21 @@ fn main()
 
     // std::os::seraph::_start wires stdout cap + heap from ProcessInfo,
     // so `std::os::seraph::log!` and the System allocator are live on
-    // entry. init's terminal bootstrap round carries an optional
-    // tokened SEND on fatfs's namespace endpoint at NodeId::ROOT (zero
-    // when vfsd was unable to mint one). We consume the round so the
-    // creator does not hang on a pending REQUEST.
+    // entry. init's terminal bootstrap round carries:
+    //   caps[0]: tokened SEND on fatfs's namespace endpoint at
+    //            NodeId::ROOT (zero when vfsd was unable to mint one)
+    //   caps[1]: SHUTDOWN_AUTHORITY-tokened SEND on pwrmgr's service
+    //            endpoint (zero when pwrmgr was not started)
+    //   caps[2]: SEND on pwrmgr's service endpoint WITHOUT the
+    //            SHUTDOWN_AUTHORITY token bit (zero when pwrmgr was not
+    //            started). Used by pwrmgr_cap_deny_phase to verify the
+    //            authority gate rejects un-tokened callers.
+    // We consume the round so the creator does not hang on a pending
+    // REQUEST.
     let info = startup_info();
     let mut fatfs_root_cap: u32 = 0;
+    let mut pwrmgr_auth_cap: u32 = 0;
+    let mut pwrmgr_noauth_cap: u32 = 0;
     if info.creator_endpoint != 0
     {
         // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
@@ -81,9 +90,19 @@ fn main()
         // SAFETY: IPC buffer is registered by `_start` and page-aligned by
         // the boot protocol.
         if let Ok(round) = unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) }
-            && round.cap_count >= 1
         {
-            fatfs_root_cap = round.caps[0];
+            if round.cap_count >= 1
+            {
+                fatfs_root_cap = round.caps[0];
+            }
+            if round.cap_count >= 2
+            {
+                pwrmgr_auth_cap = round.caps[1];
+            }
+            if round.cap_count >= 3
+            {
+                pwrmgr_noauth_cap = round.caps[2];
+            }
         }
     }
 
@@ -126,8 +145,88 @@ fn main()
     // back-to-back `File::open` on the same path) can hit transient
     // cap-derivation pressure on TCG-emulated arches.
     fs_open_relative_phase();
+    pwrmgr_cap_deny_phase(pwrmgr_noauth_cap);
 
     std::os::seraph::log!("ALL TESTS PASSED");
+
+    pwrmgr_shutdown_phase(pwrmgr_auth_cap);
+}
+
+/// Verify pwrmgr's cap-gating rejects un-tokened callers.
+///
+/// Sends `pwrmgr_labels::SHUTDOWN` through a SEND cap on pwrmgr's
+/// service endpoint that lacks the `SHUTDOWN_AUTHORITY` token bit.
+/// pwrmgr's handler MUST reply `pwrmgr_errors::UNAUTHORIZED` rather
+/// than execute the platform shutdown sequence; a different reply (or
+/// no reply / actual shutdown) panics the phase.
+///
+/// `pwrmgr_noauth_cap == 0` indicates pwrmgr was not started (or init
+/// chose not to hand out a no-authority cap); the phase logs and
+/// returns.
+fn pwrmgr_cap_deny_phase(pwrmgr_noauth_cap: u32)
+{
+    if pwrmgr_noauth_cap == 0
+    {
+        std::os::seraph::log!("pwrmgr cap-deny phase skipped: no no-authority cap");
+        return;
+    }
+
+    let info = startup_info();
+    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(pwrmgr_noauth_cap, &msg, ipc_buf) }
+        .expect("pwrmgr SHUTDOWN ipc_call (no-auth) must return a reply");
+    assert_eq!(
+        reply.label,
+        ipc::pwrmgr_errors::UNAUTHORIZED,
+        "pwrmgr SHUTDOWN through no-authority cap must reply UNAUTHORIZED (got {:#x})",
+        reply.label
+    );
+    std::os::seraph::log!("pwrmgr cap-deny phase passed (UNAUTHORIZED reply)");
+}
+
+/// Terminal phase: invoke pwrmgr SHUTDOWN through the
+/// `SHUTDOWN_AUTHORITY`-tokened SEND cap delivered by init in the
+/// bootstrap round. On the success path the platform powers off and
+/// QEMU exits, ending naked `cargo xtask run` cleanly. A reply arrives
+/// only on the failure path (pwrmgr could not power off the platform
+/// or the cap is missing the authority token); in that case usertest
+/// logs and falls through to its normal `thread_exit`, leaving the
+/// system idle.
+///
+/// `pwrmgr_auth_cap == 0` indicates init did not start pwrmgr; the
+/// phase logs and returns so the usertest run still reports a clean
+/// pass marker on environments without a pwrmgr.
+fn pwrmgr_shutdown_phase(pwrmgr_auth_cap: u32)
+{
+    if pwrmgr_auth_cap == 0
+    {
+        std::os::seraph::log!("pwrmgr shutdown phase skipped: no authority cap");
+        return;
+    }
+
+    let info = startup_info();
+    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(pwrmgr_auth_cap, &msg, ipc_buf) };
+    // A reply means pwrmgr could not power off the platform (caller
+    // lacks authority, or the mechanism failed). Log and return.
+    match reply
+    {
+        Ok(r) => std::os::seraph::log!(
+            "pwrmgr SHUTDOWN returned unexpectedly (label={:#x})",
+            r.label
+        ),
+        Err(_) => std::os::seraph::log!("pwrmgr SHUTDOWN ipc_call failed"),
+    }
 }
 
 /// Re-entry path used by `ns_sandbox_phase` (parent). The child runs

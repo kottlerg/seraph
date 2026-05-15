@@ -352,6 +352,59 @@ pub mod svcmgr_labels
     pub const QUERY_ENDPOINT: u64 = 4;
 }
 
+pub const PWRMGR_LABELS_VERSION: u32 = 1;
+/// IPC labels for the power manager (`pwrmgr`).
+///
+/// pwrmgr owns the platform shutdown surface: ACPI S5 on x86-64 (via
+/// `AcpiReclaimable` Frame caps plus the `IoPortRange` cap) and SBI SRST
+/// on RISC-V (via the `SbiControl` cap). Init transfers those raw caps to
+/// pwrmgr during Phase 3 bootstrap; callers that may invoke shutdown
+/// receive a tokened SEND on pwrmgr's service endpoint with the
+/// [`pwrmgr_labels::SHUTDOWN_AUTHORITY`] verb bit set.
+///
+/// See `services/pwrmgr/README.md` for the authoritative description.
+pub mod pwrmgr_labels
+{
+    /// Power off the platform.
+    ///
+    /// Wire format: empty body. The handler verifies the caller's token
+    /// carries [`SHUTDOWN_AUTHORITY`] and replies
+    /// [`pwrmgr_errors::UNAUTHORIZED`] otherwise. On the success path the
+    /// platform powers off and no reply is delivered (QEMU exits the
+    /// process). A reply only ever arrives on a rejection or hardware
+    /// failure path.
+    pub const SHUTDOWN: u64 = 1;
+    /// Cold reboot the platform.
+    ///
+    /// Same authorization gate as [`SHUTDOWN`]. On the success path the
+    /// machine cold-boots back through the bootloader.
+    pub const REBOOT: u64 = 2;
+
+    /// Authority bit in the pwrmgr-service-endpoint token's high u64
+    /// bit. Set on caps minted for consumers permitted to call
+    /// [`SHUTDOWN`] and [`REBOOT`]. Without it the handler replies
+    /// [`pwrmgr_errors::UNAUTHORIZED`].
+    pub const SHUTDOWN_AUTHORITY: u64 = 1u64 << 63;
+}
+
+/// Error replies from pwrmgr.
+pub mod pwrmgr_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// Caller's token lacks the verb bit required by the handler
+    /// ([`pwrmgr_labels::SHUTDOWN_AUTHORITY`] for SHUTDOWN / REBOOT).
+    pub const UNAUTHORIZED: u64 = 1;
+    /// Malformed request (unknown opcode, label-version mismatch on a
+    /// future handshake, or platform handler failed in a way that
+    /// returned to userspace rather than powering off).
+    pub const INVALID_REQUEST: u64 = 2;
+    /// Reserved for a future per-message version handshake. Unused in
+    /// v0.1.0 — the bootstrap-round handshake gates the cap itself.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// Unknown opcode on pwrmgr endpoint.
+    pub const UNKNOWN_OPCODE: u64 = 0xFF;
+}
+
 pub const VFSD_LABELS_VERSION: u32 = 1;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels

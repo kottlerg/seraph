@@ -9,6 +9,7 @@ members = [
     "services/procmgr",
     "services/svcmgr",
     "services/devmgr",
+    "services/pwrmgr",
     "services/vfsd",
     "services/drivers/virtio/core",
     "services/drivers/virtio/blk",

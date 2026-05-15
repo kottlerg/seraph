@@ -104,6 +104,14 @@ Device manager. Receives platform resource capabilities from init, enumerates de
 spawns driver processes, and delegates per-device capabilities.
 See [device-management.md](device-management.md).
 
+**pwrmgr**
+Power manager. Sole holder of the raw platform shutdown caps (ACPI
+reclaimable Frame caps + `IoPortRange` on x86-64; `SbiControl` on
+RISC-V). Exposes `SHUTDOWN` / `REBOOT` over IPC, gated by a
+`SHUTDOWN_AUTHORITY` token bit. usertest invokes `SHUTDOWN` through a
+tokened cap on the success path so naked `cargo xtask run` exits
+cleanly. See [`services/pwrmgr/README.md`](../services/pwrmgr/README.md).
+
 **drivers**
 Isolated userspace processes. Access hardware only through capabilities granted by
 devmgr.

@@ -61,13 +61,24 @@ Init's responsibilities are strictly bounded:
    IPC. Init retains derived intermediary copies (for potential
    revocation), not the roots.
 
-6. **Spawn Phase 3 services from VFS** — svcmgr, crasher, usertest,
-   hello, stdiotest are loaded by walking init's seed system-root cap
-   to `/bin/<name>`, then issuing `procmgr_labels::CREATE_FROM_FILE`
-   with the resolved file cap. Each child receives a `cap_copy` of
-   init's root via `CONFIGURE_NAMESPACE` before start. See
+6. **Spawn Phase 3 services from VFS** — svcmgr, crasher, pwrmgr,
+   usertest, hello, stdiotest are loaded by walking init's seed
+   system-root cap to `/bin/<name>`, then issuing
+   `procmgr_labels::CREATE_FROM_FILE` with the resolved file cap.
+   Each child receives a `cap_copy` of init's root via
+   `CONFIGURE_NAMESPACE` before start. See
    [`docs/namespace-model.md`](../../docs/namespace-model.md) for the
    namespace-cap distribution invariants.
+
+   pwrmgr is spawned before usertest so init can derive two SEND
+   caps on pwrmgr's service endpoint — one with the
+   `SHUTDOWN_AUTHORITY` token, one without — and install both as
+   seed caps in usertest's bootstrap round. usertest invokes
+   `pwrmgr_labels::SHUTDOWN` through the authorised cap on the
+   success path so naked `cargo xtask run` exits cleanly. The
+   un-tokened twin drives `pwrmgr_cap_deny_phase`, which asserts the
+   gate rejects un-tokened callers. See
+   [`services/pwrmgr/README.md`](../pwrmgr/README.md).
 
 7. **Register services with svcmgr** — before exiting, init registers
    all started services with svcmgr along with their restart policies

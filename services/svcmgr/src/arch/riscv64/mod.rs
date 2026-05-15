@@ -3,7 +3,7 @@
 
 // svcmgr/src/arch/riscv64/mod.rs
 
-//! RISC-V (RV64GC) architecture primitives used by svcmgr.
+//! RISC-V architecture primitives used by svcmgr.
 
 /// Wait for an interrupt.
 ///

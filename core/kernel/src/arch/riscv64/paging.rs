@@ -3,7 +3,7 @@
 
 // kernel/src/arch/riscv64/paging.rs
 
-//! RISC-V RV64GC Sv48 four-level page table operations.
+//! RISC-V Sv48 four-level page table operations.
 //!
 //! Mirrors the x86-64 interface. All page table frames come from the
 //! BSS-resident pool supplied via [`PoolState`].

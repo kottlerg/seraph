@@ -35,7 +35,9 @@ bootloader does not provide a return address in any meaningful context.
 `extern "C"` on a Seraph kernel target resolves to:
 
 - **x86-64**: System V AMD64 ABI (first integer argument in `rdi`).
-- **RISC-V (RV64GC)**: LP64D (first integer argument in `a0`).
+- **RISC-V (RV64IMAC)**: LP64 (first integer argument in `a0`). The kernel
+  target is soft-float; the bootloader-to-kernel boundary carries no
+  FP/V state.
 
 These are the LLVM defaults for the respective `extern "C"` ABI on the
 Seraph custom targets; the bootloader places the `BootInfo` pointer in
@@ -66,7 +68,7 @@ rather than proceed with a mismatched structure.
 | GDT | Bootloader-provided; kernel replaces it during early initialisation |
 | IDT | Not loaded; interrupts must remain disabled until the kernel installs its own |
 
-### RISC-V (RV64GC)
+### RISC-V (RV64IMAC, soft-float)
 
 | Item | Guaranteed state |
 |---|---|

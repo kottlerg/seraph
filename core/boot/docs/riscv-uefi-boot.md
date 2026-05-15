@@ -143,7 +143,7 @@ The RISC-V bootloader uses a custom Cargo target specification,
 | `relocation-model` | `"pic"` | `"static"` |
 | `code-model` | `"medium"` | `"medium"` |
 | `disable-redzone` | `true` | `true` |
-| `features` | `"+m,+a,+f,+d,+c"` (RV64GC) | `"+m,+a,+f,+d,+c"` |
+| `features` | `"+m,+a,+c"` (RV64IMAC) | `"+m,+a,+c"` (RV64IMAC) |
 | `linker` | `"rust-lld"` | `"rust-lld"` |
 | `linker-flavor` | `"ld.lld"` | `"ld.lld"` |
 | `pre-link-args` | custom linker script | custom linker script |

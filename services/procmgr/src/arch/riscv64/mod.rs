@@ -3,7 +3,7 @@
 
 // procmgr/src/arch/riscv64/mod.rs
 
-//! RISC-V (RV64GC) architecture-specific constants.
+//! RISC-V architecture-specific constants.
 
 /// ELF machine type procmgr will accept when loading user binaries.
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_RISCV;

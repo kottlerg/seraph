@@ -227,11 +227,17 @@ Seraph targets 64‑bit architectures with modern MMU and privilege support.
 **x86‑64**
 Uses APIC and PCIDs. IOMMU hardware, when present, is discovered and
 programmed by devmgr in userspace; the kernel does not touch it. 32-bit
-and legacy x86 are not supported.
+and legacy x86 are not supported. The kernel is soft-float (no SSE/AVX/MMX);
+userspace targets the **x86-64-v3** psABI feature level (ratified 2020) —
+SSE2/3/SSSE3/SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT.
 
-**RISC‑V (RV64GC)**
-RV64GC base ISA (IMAFD + compressed). Embedded or non-standard configurations are
-not targeted.
+**RISC‑V**
+The kernel is **RV64IMAC** soft-float (LP64 ABI); userspace targets the
+**RVA23U64** profile (RVA23 v1.0, ratified 2024-10-21) — IMAFDCV plus the
+Zba/Zbb/Zbs bitmanip set, hard-float LP64D ABI. Embedded or non-standard
+configurations are not targeted. The kernel never touches F/D/V state
+itself; userspace FP/V state is preserved across preemption by a lazy
+save/restore discipline.
 
 See [coding-standards.md#c-architecture-invariants](coding-standards.md#c-architecture-invariants)
 for the architectural code isolation rules.

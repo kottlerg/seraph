@@ -27,7 +27,7 @@ unsafe extern "C" {
     static _handoff_trampoline_end: u8;
 }
 
-/// Transfer control to the kernel on RISC-V (RV64GC).
+/// Transfer control to the kernel on RISC-V (RV64IMAC, soft-float).
 ///
 /// Constructs the Sv48 SATP value from `page_table_root`, resolves the
 /// handoff trampoline address, and transfers control. The trampoline

@@ -43,12 +43,18 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`) |
 
-**x86-64** uses KVM acceleration. Requires OVMF firmware
+**x86-64** uses KVM acceleration when `/dev/kvm` is present, falling back
+to multi-threaded TCG with `-cpu max,migratable=no`. KVM hosts must
+advertise x86-64-v3 (AVX2/BMI2/FMA — Haswell+ / Excavator+) because the
+userspace target is pinned to that psABI level. Requires OVMF firmware
 (`dnf install edk2-ovmf` / `apt install ovmf`).
 
 **RISC-V** uses TCG emulation with edk2 UEFI firmware and OpenSBI (loaded
 automatically by QEMU's `virt` machine). Requires edk2 RISC-V firmware
-(`dnf install edk2-riscv64` / `apt install qemu-efi-riscv64`).
+(`dnf install edk2-riscv64` / `apt install qemu-efi-riscv64`) and
+QEMU ≥ 8.0 (V extension); QEMU ≥ 9.1 unlocks the named `-cpu rva23s64`
+model (currently the runner uses the explicit feature string until the
+CI floor catches up).
 
 ---
 

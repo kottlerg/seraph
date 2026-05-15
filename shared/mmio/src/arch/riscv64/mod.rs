@@ -3,7 +3,7 @@
 
 // shared/mmio/src/arch/riscv64.rs
 
-//! RISC-V (RV64GC) MMIO ordering barriers.
+//! RISC-V MMIO ordering barriers.
 //!
 //! All three primitives emit a single `fence` instruction with no operands
 //! beyond the predecessor/successor set. Inline assembly uses

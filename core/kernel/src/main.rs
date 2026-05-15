@@ -368,13 +368,24 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     SegmentFlags::ReadWrite => Rights::MAP | Rights::WRITE,
                     SegmentFlags::ReadExecute => Rights::MAP | Rights::EXECUTE,
                 };
+                // The bootloader encodes the ELF in-page offset into
+                // `phys_addr` so `map_segment` can preserve
+                // `phys & 0xFFF == virt & 0xFFF`. The Frame cap exposed
+                // to userspace describes whole pages, so mask the base
+                // down and ceil-round the size to PAGE_SIZE — upholds
+                // FrameObject's alignment invariant for downstream
+                // sys_mem_map / sys_frame_split.
+                let page_mask = mm::PAGE_SIZE as u64 - 1;
+                let phys_aligned = seg.phys_addr & !page_mask;
+                let in_page_off = seg.phys_addr & page_mask;
+                let size_aligned = (in_page_off + seg.size + page_mask) & !page_mask;
                 let fo_nn = cap::mint_phase7_body(FrameObject {
                     header: KernelObjectHeader::with_ancestor(
                         ObjectType::Frame,
                         cap::seed_header_nn(),
                     ),
-                    base: seg.phys_addr,
-                    size: seg.size,
+                    base: phys_aligned,
+                    size: size_aligned,
                     // Init ELF segment: not retypable; cap minted without RETYPE.
                     available_bytes: core::sync::atomic::AtomicU64::new(0),
                     // Init ELF segments are bootloader-loaded pages outside

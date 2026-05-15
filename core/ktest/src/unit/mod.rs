@@ -205,6 +205,10 @@ pub fn run_all(ctx: &TestContext)
         "mm::frame_split_at_end_err",
         mm::frame_split_at_end_err(ctx)
     );
+    run_test!(
+        "mm::init_segment_caps_aligned",
+        mm::init_segment_caps_aligned(ctx)
+    );
 
     // ── Signal syscalls ───────────────────────────────────────────────────────
     run_test!("signal::send", signal::send(ctx));

@@ -1033,12 +1033,15 @@ fn populate_cspace(
         {
             continue;
         }
+        // FrameObject invariant: page-aligned base, whole-page size.
+        let aligned_base = entry.physical_base & !0xFFF_u64;
+        let aligned_size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFF_u64;
         let obj = Box::new(FrameObject {
             header: KernelObjectHeader::new(ObjectType::Frame),
-            base: entry.physical_base,
-            size: entry.size,
+            base: aligned_base,
+            size: aligned_size,
             // RAM cap: full retypable budget mirrors the production path.
-            available_bytes: core::sync::atomic::AtomicU64::new(entry.size),
+            available_bytes: core::sync::atomic::AtomicU64::new(aligned_size),
             // Test stub: buddy not active; leaking on destruction is the
             // expected unit-test behaviour.
             owns_memory: core::sync::atomic::AtomicBool::new(false),
@@ -1063,8 +1066,8 @@ fn populate_cspace(
                 slot,
                 cap_type: CapType::Frame,
                 pad: [0; 3],
-                aux0: entry.physical_base,
-                aux1: entry.size,
+                aux0: aligned_base,
+                aux1: aligned_size,
             },
         );
         memory_frame_count += 1;
@@ -1224,14 +1227,17 @@ fn populate_cspace(
             );
             break;
         }
-        let size = (entry.size + 0xFFF) & !0xFFF;
+        // UEFI memory map entries are page-aligned per UEFI spec §7.2,
+        // but mask defensively to uphold FrameObject's alignment invariant.
+        let aligned_base = entry.physical_base & !0xFFF;
+        let size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFF;
         if size == 0
         {
             continue;
         }
         let ptr = mint_phase7_body(FrameObject {
             header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
-            base: entry.physical_base,
+            base: aligned_base,
             size,
             // Firmware table: not retypable; cap minted without RETYPE.
             available_bytes: core::sync::atomic::AtomicU64::new(0),
@@ -1257,7 +1263,7 @@ fn populate_cspace(
                 slot,
                 cap_type: CapType::Frame,
                 pad: [0; 3],
-                aux0: entry.physical_base,
+                aux0: aligned_base,
                 aux1: size,
             },
         );
@@ -1496,8 +1502,11 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
 
     for module in modules
     {
-        // Round size up to page boundary so mem_map can map whole pages.
-        let rounded_size = (module.size + 0xFFF) & !0xFFF;
+        // UEFI `AllocatePages` returns page-aligned bases, but mask
+        // defensively to uphold FrameObject's alignment invariant.
+        let aligned_base = module.physical_base & !0xFFF;
+        // Round size up so the cap covers every page that holds module bytes.
+        let rounded_size = (module.physical_base - aligned_base + module.size + 0xFFF) & !0xFFF;
 
         // Register the module's pages as managed-but-not-free so that if
         // the cap is ever destroyed, `dealloc_object`'s `buddy.free_range`
@@ -1509,13 +1518,13 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
         // (`mm/init.rs` excludes loaded regions); single-threaded boot.
         unsafe {
             crate::mm::with_frame_allocator(|alloc| {
-                alloc.register_owned_range(module.physical_base, rounded_size);
+                alloc.register_owned_range(aligned_base, rounded_size);
             });
         }
 
         let ptr = mint_phase7_body(FrameObject {
             header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
-            base: module.physical_base,
+            base: aligned_base,
             size: rounded_size,
             // Boot module pages are reclaimable: full byte ledger so the
             // pages can flow through `memmgr_labels::DONATE_FRAMES` into

@@ -10,11 +10,14 @@
 //!
 //! ## Design
 //!
-//! ktest starts with three large segment frame caps (TEXT, RODATA, BSS/DATA).
-//! Before any tests run, `init()` splits the BSS segment into single-page
-//! frames (up to `POOL_SIZE`) and stores the capability slots in `POOL_SLOTS`.
+//! ktest receives a set of buddy-backed RAM Frame caps from the kernel
+//! alongside its three segment caps (TEXT, RODATA, BSS/DATA). Before any
+//! tests run, `init()` splits the first RAM cap into single-page frames
+//! (up to `POOL_SIZE`) and stores the capability slots in `POOL_SLOTS`.
 //! Each slot is marked available in `POOL_AVAILABLE` (one bit per slot).
-//! TEXT and RODATA frames are intentionally left intact for direct use by tests.
+//! Segment caps are intentionally left intact: the pool never draws from
+//! the binary's own image, so non-zero initialised statics in ktest cannot
+//! be corrupted by test mappings.
 //!
 //! Tests call `alloc()` to reserve a frame cap from the pool. When done, they
 //! call `free()` to return it. The cap is never deleted, only marked available
@@ -46,11 +49,44 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use init_protocol::{CapDescriptor, CapType, InitInfo};
+
 /// Maximum frames in the pool.
 const POOL_SIZE: usize = 64;
 
 /// Size of one page.
 const PAGE_SIZE: u64 = 0x1000;
+
+/// Read the `CapDescriptor` array from the `InitInfo` page.
+fn descriptors(info: &InitInfo) -> &[CapDescriptor]
+{
+    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
+    // SAFETY: kernel populates `cap_descriptors_offset` and
+    // `cap_descriptor_count` to describe a valid array inside the same
+    // read-only InitInfo page. CapDescriptor is repr(C) starting with a u32,
+    // and the offset lands at the 4-byte-aligned end of InitInfo.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe {
+        let ptr = base
+            .add(info.cap_descriptors_offset as usize)
+            .cast::<CapDescriptor>();
+        core::slice::from_raw_parts(ptr, info.cap_descriptor_count as usize)
+    }
+}
+
+/// Return the byte size of the Frame cap occupying `slot`, or `None` if no
+/// Frame descriptor matches.
+fn find_frame_size(info: &InitInfo, slot: u32) -> Option<u64>
+{
+    for d in descriptors(info)
+    {
+        if d.slot == slot && d.cap_type == CapType::Frame
+        {
+            return Some(d.aux1);
+        }
+    }
+    None
+}
 
 /// Pool of available frame capability slots.
 ///
@@ -114,26 +150,76 @@ unsafe fn split_frame_recursive(frame_cap: u32, count: &mut usize)
     }
 }
 
-/// Initialize the frame pool by splitting segment frames.
+/// Initialize the frame pool by carving a tail off the first RAM cap.
 ///
-/// Called once from `main()` before any tests run. Recursively splits the
-/// BSS frame (largest segment) into single-page frames until the pool is full.
+/// Called once from `main()` before any tests run. Reads the size of the
+/// first RAM Frame cap from the `CapDescriptor` array, splits a
+/// `POOL_SIZE * PAGE_SIZE` tail off the end, then recursively splits that
+/// tail into single-page frames. The head of the RAM cap stays in
+/// `info.memory_frame_base` with full retype rights so tests can continue
+/// to create kernel objects from it.
 ///
 /// # Safety
 ///
 /// Must be called exactly once before any tests run, while no other threads exist.
 pub unsafe fn init(info: &init_protocol::InitInfo)
 {
-    // BSS is the third segment (index 2) after TEXT and RODATA.
-    let bss_frame = info.segment_frame_base + 2;
+    if info.memory_frame_count == 0
+    {
+        crate::log("frame pool: no RAM caps available; pool is empty");
+        POOL_AVAILABLE.store(0, Ordering::Release);
+        POOL_COUNT.store(0, Ordering::Release);
+        return;
+    }
+    let ram_frame = info.memory_frame_base;
+
+    // Locate the descriptor for the first RAM cap to learn its size.
+    let Some(ram_size) = find_frame_size(info, ram_frame)
+    else
+    {
+        crate::log("frame pool: RAM cap descriptor not found; pool is empty");
+        POOL_AVAILABLE.store(0, Ordering::Release);
+        POOL_COUNT.store(0, Ordering::Release);
+        return;
+    };
+
+    let pool_bytes = (POOL_SIZE as u64) * PAGE_SIZE;
+    // Leave at least one page in the head so retype callers keep a usable
+    // cap. If the cap is small, take whatever fits.
+    let pool_chunk = if ram_size > pool_bytes + PAGE_SIZE
+    {
+        pool_bytes
+    }
+    else if ram_size > 2 * PAGE_SIZE
+    {
+        ram_size - PAGE_SIZE
+    }
+    else
+    {
+        crate::log("frame pool: RAM cap too small to carve pool; pool is empty");
+        POOL_AVAILABLE.store(0, Ordering::Release);
+        POOL_COUNT.store(0, Ordering::Release);
+        return;
+    };
+    let split_at = ram_size - pool_chunk;
+
+    // SAFETY: ram_frame validated above; single-threaded boot.
+    let Ok(pool_tail) = syscall::frame_split(ram_frame, split_at)
+    else
+    {
+        crate::log("frame pool: frame_split on RAM cap failed; pool is empty");
+        POOL_AVAILABLE.store(0, Ordering::Release);
+        POOL_COUNT.store(0, Ordering::Release);
+        return;
+    };
 
     let mut count = 0usize;
 
-    // Recursively split the BSS frame into individual pages.
-    // Each split produces two child frames; we store both and continue splitting
-    // the larger child until we've filled the pool or run out of splittable frames.
+    // Recursively split the carved-out tail into individual pages.
+    // The original RAM cap's head remains at `info.memory_frame_base` for
+    // retype-based tests; only the pool's tail is consumed here.
     // SAFETY: called from init() which is documented as single-threaded boot-time only.
-    unsafe { split_frame_recursive(bss_frame, &mut count) };
+    unsafe { split_frame_recursive(pool_tail, &mut count) };
 
     // Mark all slots as available
     let mask = if count >= 64

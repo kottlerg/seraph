@@ -180,16 +180,26 @@ impl KernelObjectHeader
 // ── Concrete object types ─────────────────────────────────────────────────────
 
 /// Kernel object for a contiguous physical memory range (Frame capability).
+///
+/// Invariant: `base` MUST be 4 KiB-aligned and `size` MUST be a positive
+/// multiple of `PAGE_SIZE`. `sys_mem_map` (`syscall::mem`) feeds
+/// `base + offset` directly into `PageTableEntry::new_page`, which
+/// `debug_assert!`s page alignment. `sys_frame_split` preserves the invariant
+/// because `split_offset` is validated page-aligned before the tail's
+/// `base = parent.base + split_offset` is computed. Producers minting a cap
+/// from an external `physical_base` MUST mask down to a page boundary and
+/// ceiling-round `size` to whole pages.
 #[repr(C)]
 pub struct FrameObject
 {
     pub header: KernelObjectHeader,
-    /// Physical base address of the region.
+    /// Physical base address of the region. 4 KiB-aligned.
     pub base: u64,
-    /// Size of the region in bytes. Mutable: `sys_frame_split` shrinks it as
-    /// a tail child is carved off; `sys_frame_merge` grows it as a tail
-    /// child is absorbed back. Mutations require `lock` in write mode;
-    /// reads (`sys_mem_map`, `retype_allocate`) require `lock` in read mode.
+    /// Size of the region in bytes; multiple of `PAGE_SIZE`. Mutable:
+    /// `sys_frame_split` shrinks it as a tail child is carved off;
+    /// `sys_frame_merge` grows it as a tail child is absorbed back.
+    /// Mutations require `lock` in write mode; reads (`sys_mem_map`,
+    /// `retype_allocate`) require `lock` in read mode.
     pub size: u64,
     /// Bytes still available to retype into kernel objects, or to map.
     ///

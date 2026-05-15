@@ -38,16 +38,20 @@ const PATTERN_B: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 static mut STACK_A: ChildStack = ChildStack::ZERO;
 static mut STACK_B: ChildStack = ChildStack::ZERO;
 
-// All statics zero-initialise. ktest's frame pool draws backing pages from
-// the BSS segment, and any non-zero initialised static in this binary
-// forces LLD to emit a separate `.data` section, which the current
-// bootloader/kernel pipeline then surfaces as a sub-page-aligned segment
-// Frame cap — breaking the pool's frame_split path. Children write the
-// mismatch count after the spin completes and the parent reads it only
-// after the corresponding signal_send is observed, so the zero default is
-// never mistaken for a result.
+// Children write the mismatch count after the spin completes and the parent
+// reads it only after the corresponding signal_send is observed, so the zero
+// default is never mistaken for a result.
 static A_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static B_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+// Non-zero initialised static. Forces LLD to emit a `.data` section in the
+// ktest ELF, exercising the path where the kernel mints a Frame cap whose
+// underlying segment has a sub-page-aligned ELF VA. The cap must still
+// expose a page-aligned `base` and whole-page `size` to userspace — see
+// `mm::init_segment_caps_aligned`.
+#[used]
+#[unsafe(no_mangle)]
+pub static SUB_PAGE_SENTINEL: AtomicU64 = AtomicU64::new(0xDEAD_BEEF_CAFE_BABE);
 
 extern "C" fn child_a_entry(sig_slot: u64) -> !
 {

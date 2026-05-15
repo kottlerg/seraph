@@ -478,3 +478,51 @@ pub fn frame_split_at_end_err(_ctx: &TestContext) -> TestResult
     }
     Ok(())
 }
+
+// ── Init segment Frame cap alignment (issue #56) ─────────────────────────────
+
+/// Every init segment Frame cap exposes a page-aligned `base` and whole-page
+/// `size` to userspace, even when the underlying ELF segment has a sub-page
+/// `p_vaddr` (i.e. the ktest binary contains a non-empty `.data` section).
+///
+/// Maps each segment cap's first page read-only at `SEG_PROBE_VA` and queries
+/// the resulting physical address. The kernel `debug_assert!`s page alignment
+/// inside `PageTableEntry::new_page`, so a misaligned cap would panic before
+/// the query returns. `aspace_query` returning a page-aligned PA confirms the
+/// mapping landed cleanly.
+///
+/// Regression for issue #56: with the Phase 9 cap-mint masking off, the
+/// non-zero `fpu::SUB_PAGE_SENTINEL` static would push the RW segment's VA
+/// off a page boundary and trigger
+/// `core/kernel/src/arch/riscv64/paging.rs:80`'s
+/// `page PA not 4 KiB-aligned` panic during the first mapping below.
+pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
+{
+    const SEG_PROBE_VA: u64 = 0x4300_0000;
+    // Phase 9 mints exactly three segments per init binary: TEXT, RODATA,
+    // BSS/DATA. The cap slots sit contiguously starting at `aspace_cap + 1`.
+    const SEG_COUNT: u32 = 3;
+
+    for i in 0..SEG_COUNT
+    {
+        let seg_cap = ctx.aspace_cap + 1 + i;
+        // TEXT lacks the WRITE right; map every segment read-only.
+        mem_map(seg_cap, ctx.aspace_cap, SEG_PROBE_VA, 0, 1, MAP_READONLY)
+            .map_err(|_| "init_segment_caps_aligned: mem_map failed")?;
+
+        let phys = aspace_query(ctx.aspace_cap, SEG_PROBE_VA)
+            .map_err(|_| "init_segment_caps_aligned: aspace_query failed")?;
+        if phys == 0 || phys & 0xFFF != 0
+        {
+            mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1).ok();
+            return Err("init_segment_caps_aligned: segment cap mapped to non-page-aligned PA");
+        }
+
+        mem_unmap(ctx.aspace_cap, SEG_PROBE_VA, 1)
+            .map_err(|_| "init_segment_caps_aligned: mem_unmap failed")?;
+    }
+
+    // Touch the sentinel static so the optimiser keeps `.data` populated.
+    let _ = crate::unit::fpu::SUB_PAGE_SENTINEL.load(core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}

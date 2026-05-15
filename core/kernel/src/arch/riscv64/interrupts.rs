@@ -478,6 +478,24 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             }
         }
     }
+    else if cause_code == 2
+        && (frame.sstatus & (1 << 8)) == 0
+        && super::fpu::is_fp_or_v_opcode(frame.stval)
+    {
+        // U-mode illegal-instruction trap on an F/D/V opcode: lazy enable
+        // by promoting sstatus.FS / sstatus.VS from Off to Initial, then
+        // return without advancing sepc so the trapping instruction is
+        // re-executed.
+        //
+        // Until TCB extended state lands, no XRSTOR-equivalent restore is
+        // performed; the user thread sees zeroed register file on first
+        // touch. Today no userspace code emits F/D/V (kernel and user are
+        // both soft-float), so this branch is installed but dormant.
+        // SAFETY: ring-0 trap context; csrs sstatus is architected.
+        unsafe {
+            super::fpu::lazy_enable_fp_v_initial();
+        }
+    }
     else if cause_code == 8
     {
         // U-mode ecall: dispatch via the kernel syscall table.

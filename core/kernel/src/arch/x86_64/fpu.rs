@@ -70,7 +70,6 @@ pub unsafe fn cr0_set_ts()
 /// extended-state register file matches the thread that will run next.
 #[cfg(not(test))]
 #[inline]
-#[allow(dead_code)] // Consumed by the #NM lazy-trap handler in a follow-up commit.
 pub unsafe fn cr0_clear_ts()
 {
     // SAFETY: clearing TS is safe at ring 0; effect documented above.

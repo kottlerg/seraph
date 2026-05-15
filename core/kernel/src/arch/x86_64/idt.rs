@@ -466,7 +466,7 @@ isr_stub!(isr3, 3, has_error_code = false, ist = 0);
 isr_stub!(isr4, 4, has_error_code = false, ist = 0);
 isr_stub!(isr5, 5, has_error_code = false, ist = 0);
 isr_stub!(isr6, 6, has_error_code = false, ist = 0);
-isr_stub!(isr7, 7, has_error_code = false, ist = 0);
+// Vector 7 (#NM) has a dedicated handler — see `isr_nm` below.
 isr_stub!(isr8, 8, has_error_code = true, ist = 1); // Double Fault — IST1
 isr_stub!(isr9, 9, has_error_code = false, ist = 0);
 isr_stub!(isr10, 10, has_error_code = true, ist = 0);
@@ -624,6 +624,62 @@ unsafe extern "C" fn isr_spurious()
     core::arch::naked_asm!("iretq");
 }
 
+/// `#NM` (Device Not Available, vector 7) handler stub.
+///
+/// `#NM` fires when CR0.TS = 1 and a user thread executes an x87/SSE/AVX
+/// instruction — the kernel's lazy-trap signal that this thread is about
+/// to touch extended state. The handler clears CR0.TS and returns; the
+/// trapping instruction is re-executed by hardware and proceeds normally.
+///
+/// In a later commit this handler additionally XRSTORs the thread's saved
+/// XSAVE area when the TCB's dirty flag is set; for now the area does not
+/// exist yet, so the trapping thread sees zeroed/FINIT-equivalent state.
+/// Today no kernel or userspace code emits FP/SIMD, so the handler is
+/// installed but dormant.
+#[cfg(not(test))]
+#[unsafe(naked)]
+unsafe extern "C" fn isr_nm()
+{
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {handler}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym nm_handler,
+    );
+}
+
+/// `#NM` handler body.
+///
+/// Clears CR0.TS so the trapping x87/SSE/AVX instruction can proceed on
+/// re-execution. Adding XRSTOR of the per-thread XSAVE area is deferred
+/// to the commit that introduces TCB extended state.
+#[cfg(not(test))]
+extern "C" fn nm_handler()
+{
+    // SAFETY: ring 0 exception context; clearing TS is the architected
+    // lazy-FPU enable. No memory accesses outside CR0.
+    unsafe {
+        super::fpu::cr0_clear_ts();
+    }
+}
+
 /// TLB shootdown IPI handler stub (vector 250).
 ///
 /// Reads the shootdown request from `TLB_SHOOTDOWN`, flushes the TLB for the
@@ -779,7 +835,7 @@ pub unsafe fn init()
     set(4, isr4, 0);
     set(5, isr5, 0);
     set(6, isr6, 0);
-    set(7, isr7, 0);
+    set(7, isr_nm, 0); // #NM — lazy FPU enable, not fatal
     set(8, isr8, 1); // Double Fault — IST1
     set(9, isr9, 0);
     set(10, isr10, 0);

@@ -439,14 +439,27 @@ waitset_notify(wait_set, member_idx):
 
 ### Wait Set Add/Remove
 
-`SYS_WAIT_SET_ADD` acquires the wait set lock, appends a new `WaitSetMember`, and
-registers the wait set back-pointer on the source object. The source object must
-be modified atomically to avoid lost readiness notifications — if the source is
-already ready at add time, the wait set is immediately notified.
+`SYS_WAIT_SET_ADD` acquires the wait set lock, appends a new `WaitSetMember`,
+registers the wait set back-pointer on the source object, and `inc_ref`s the
+source's `KernelObjectHeader` — wait-set membership is a +1 cap-level
+reference on the source. The source object must be modified atomically to
+avoid lost readiness notifications — if the source is already ready at add
+time, the wait set is immediately notified.
 
 `SYS_WAIT_SET_REMOVE` acquires both the wait set lock and the source object lock,
-removes the member, and clears the back-pointer. This must be done under both locks
-to prevent a concurrent notification from referencing a removed member.
+removes the member, clears the back-pointer, and `dec_ref`s the source's
+`KernelObjectHeader` to release the +1 held by membership. The lock pairing
+prevents a concurrent notification from referencing a removed member. The
+caller still holds a cap to the source while issuing the syscall, so this
+`dec_ref` cannot drain the refcount to zero.
+
+When the wait set itself is dropped (last cap released), `wait_set_drop`
+clears every member's back-pointer and `dec_ref`s each source's header; any
+source whose refcount reaches zero at that point is reclaimed via the
+standard `dealloc_object` cascade. The source's dealloc arm therefore never
+runs while a wait-set member references it; the inline `waitset_remove`
+call that used to live in each source's dealloc arm has been replaced with
+a `debug_assert!(state.wait_set.is_null())` invariant check.
 
 ### Multiple Ready Sources
 

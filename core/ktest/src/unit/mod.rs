@@ -285,6 +285,18 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("wait_set::blocking_wait", wait_set::blocking_wait(ctx));
     run_test!("wait_set::remove", wait_set::remove(ctx));
+    run_test!(
+        "wait_set::source_signal_pinned_by_member",
+        wait_set::source_signal_pinned_by_member(ctx)
+    );
+    run_test!(
+        "wait_set::source_eventqueue_pinned_by_member",
+        wait_set::source_eventqueue_pinned_by_member(ctx)
+    );
+    run_test!(
+        "wait_set::source_endpoint_pinned_by_member",
+        wait_set::source_endpoint_pinned_by_member(ctx)
+    );
 
     // ── IPC syscalls ──────────────────────────────────────────────────────────
     run_test!("ipc::call_reply_recv", ipc::call_reply_recv(ctx));

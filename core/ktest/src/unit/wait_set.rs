@@ -13,9 +13,10 @@
 //! only the remaining member can wake the wait set after removal.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, event_post,
-    event_queue_create, event_recv, signal_send, signal_wait, thread_configure, thread_exit,
-    thread_start, wait_set_add, wait_set_create, wait_set_remove, wait_set_wait,
+    cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
+    cap_delete, event_post, event_queue_create, event_recv, signal_send, signal_wait,
+    thread_configure, thread_exit, thread_start, wait_set_add, wait_set_create, wait_set_remove,
+    wait_set_wait,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -175,6 +176,83 @@ pub fn remove(ctx: &TestContext) -> TestResult
     cap_delete(eq).map_err(|_| "cap_delete eq after remove test failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after remove test failed")?;
     cap_delete(ws).map_err(|_| "cap_delete ws after remove test failed")?;
+    Ok(())
+}
+
+// ── Source pin via wait-set membership (refcount invariant) ──────────────────
+
+/// Wait-set membership holds a +1 cap-level reference on the source. Dropping
+/// the only user-held cap to a signal that is already in a wait set must not
+/// reclaim the signal state — the wait set still references it. A subsequent
+/// `wait_set_wait` must observe the previously-sent bits and return the
+/// member's token. Dropping the wait-set cap then cascades the source's
+/// reclaim through `wait_set_drop`.
+pub fn source_signal_pinned_by_member(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
+    let sig = cap_create_signal(ctx.memory_frame_base).map_err(|_| "cap_create_signal failed")?;
+
+    wait_set_add(ws, sig, 31).map_err(|_| "wait_set_add(sig) failed")?;
+    signal_send(sig, 0xCAFE).map_err(|_| "signal_send before drop failed")?;
+
+    // Drop the only user-held cap to the signal while a wait-set member still
+    // references it. The +1 from membership must keep the SignalState alive.
+    cap_delete(sig).map_err(|_| "cap_delete(sig) while member-bound failed")?;
+
+    // The signal state should still be live: wait_set_wait observes the
+    // previously-stored bits via the level-state self-heal loop.
+    let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait after sig cap drop failed")?;
+    if tok != 31
+    {
+        return Err("wait_set_wait returned wrong token after sig cap drop");
+    }
+
+    // Cascade-reclaims the signal state through wait_set_drop's dec_ref.
+    cap_delete(ws).map_err(|_| "cap_delete(ws) cascade-drop failed")?;
+    Ok(())
+}
+
+/// Symmetric to `source_signal_pinned_by_member` for `EventQueue`. Posting an
+/// entry before dropping the cap ensures the queue is "ready" so the
+/// post-drop `wait_set_wait` can observe its live state.
+pub fn source_eventqueue_pinned_by_member(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
+    let eq =
+        event_queue_create(ctx.memory_frame_base, 4).map_err(|_| "event_queue_create failed")?;
+
+    wait_set_add(ws, eq, 73).map_err(|_| "wait_set_add(eq) failed")?;
+    event_post(eq, 0xABCD_EF01).map_err(|_| "event_post before drop failed")?;
+
+    cap_delete(eq).map_err(|_| "cap_delete(eq) while member-bound failed")?;
+
+    let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait after eq cap drop failed")?;
+    if tok != 73
+    {
+        return Err("wait_set_wait returned wrong token after eq cap drop");
+    }
+
+    cap_delete(ws).map_err(|_| "cap_delete(ws) cascade-drop failed")?;
+    Ok(())
+}
+
+/// Endpoint smoke variant. We can't easily make an endpoint "ready" without
+/// pre-queueing a sender, so this test only verifies that dropping the cap to
+/// a member-bound endpoint and then dropping the wait-set cap completes
+/// without UAF — the source is reclaimed via `wait_set_drop`'s cascade.
+pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
+{
+    let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
+    let ep =
+        cap_create_endpoint(ctx.memory_frame_base).map_err(|_| "cap_create_endpoint failed")?;
+
+    wait_set_add(ws, ep, 19).map_err(|_| "wait_set_add(ep) failed")?;
+
+    // +1 from membership keeps EndpointState alive across this cap drop.
+    cap_delete(ep).map_err(|_| "cap_delete(ep) while member-bound failed")?;
+
+    // Cascade-reclaims the endpoint state through wait_set_drop's dec_ref.
+    cap_delete(ws).map_err(|_| "cap_delete(ws) cascade-drop failed")?;
     Ok(())
 }
 

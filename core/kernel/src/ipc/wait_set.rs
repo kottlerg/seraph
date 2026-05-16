@@ -24,6 +24,17 @@
 //! A source can be in at most one wait set at a time. `sys_wait_set_add`
 //! returns `InvalidArgument` if the source's `wait_set` pointer is non-null.
 //!
+//! # Lifetime — wait-set membership refcount
+//! Each `WaitSetMember` holds a +1 cap-level reference on its source's
+//! `KernelObjectHeader` (Endpoint / Signal / `EventQueue`). The +1 is taken in
+//! `sys_wait_set_add` after the back-pointer is published, and released in
+//! `sys_wait_set_remove` and in `wait_set_drop`. Source state is therefore
+//! pinned alive for as long as any member references it; the dealloc arms
+//! in `cap::object::dealloc_object_one` only need to `debug_assert` that the
+//! `wait_set` back-pointer is null on entry (the invariant follows). See
+//! [`source_header`] for the helper that maps a member's `source_ptr` to the
+//! wrapper header that carries the refcount.
+//!
 //! # Thread safety
 //! All operations must be called with the scheduler lock held.
 //!
@@ -56,6 +67,45 @@ pub enum WaitSetSourceTag
     Endpoint = 0,
     Signal = 1,
     EventQueue = 2,
+}
+
+// ── Source wrapper layout ─────────────────────────────────────────────────────
+
+/// Byte distance from the start of an Endpoint/Signal/EventQueue retype slot
+/// (where the wrapper carrying `KernelObjectHeader` lives) to the embedded
+/// state body. Equals `size_of::<EndpointObject>() == size_of::<SignalObject>()
+/// == size_of::<EventQueueObject>() == 24` — see
+/// `cap::retype::EVENT_QUEUE_WRAPPER_BYTES` and the `dispatch_for` entries in
+/// `core/kernel/src/cap/retype.rs`. The wrapper structs themselves are defined
+/// in `core/kernel/src/cap/object.rs`.
+const SOURCE_WRAPPER_BYTES: usize = 24;
+
+/// Derive the `KernelObjectHeader` pointer from a registered source state
+/// pointer.
+///
+/// Wait-set membership holds a +1 reference on this header (see
+/// [`waitset_add`] / [`waitset_remove`] / [`wait_set_drop`]).
+///
+/// # Safety
+/// `state_ptr` must be the state pointer registered by `waitset_add` and must
+/// point into a retype-backed source slot (Endpoint/Signal/EventQueue). The
+/// production paths in `sys_cap_create_*` always retype-back these objects,
+/// and the dealloc arms in `cap::object::dealloc_object_one` assert
+/// `ancestor.is_some()`; the legacy heap-allocated paths are not exercised.
+unsafe fn source_header(state_ptr: *mut u8) -> *mut crate::cap::object::KernelObjectHeader
+{
+    // SAFETY: state_ptr is the inner-body pointer; the wrapper (with header at
+    // offset 0) precedes it by SOURCE_WRAPPER_BYTES inside the same retype slot.
+    // cast_ptr_alignment: the retype slot is allocated to the alignment of its
+    // wrapper (`EndpointObject` / `SignalObject` / `EventQueueObject`), each of
+    // which begins with a `KernelObjectHeader` (8-byte aligned); the state body
+    // is 24 bytes past that start so subtracting 24 lands on the wrapper start.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe {
+        state_ptr
+            .sub(SOURCE_WRAPPER_BYTES)
+            .cast::<crate::cap::object::KernelObjectHeader>()
+    }
 }
 
 // ── WaitSetMember ─────────────────────────────────────────────────────────────
@@ -127,6 +177,12 @@ pub struct WaitSetState
     /// `wait_set_drop` clears every source's back-pointer first (under
     /// each source's own lock) and only then takes its own lock, so no
     /// nesting reverses the order.
+    ///
+    /// Source liveness during member dispatch is now guaranteed by the
+    /// membership refcount (see module docs); the lock-order discipline
+    /// continues to govern back-pointer consistency and the side channels
+    /// between `signal_send`/`event_post`/`endpoint_call` and
+    /// `waitset_notify`.
     pub lock: crate::sync::Spinlock,
     /// Registered members. A slot with `source_ptr.is_null()` is vacant.
     pub members: [WaitSetMember; WAIT_SET_MAX_MEMBERS],
@@ -329,9 +385,10 @@ pub unsafe fn waitset_wait(
             continue;
         }
         let (source_ptr, source_tag, token) = (m.source_ptr, m.source_tag, m.token);
-        // SAFETY: source_ptr was registered via waitset_add and outlives
-        // the wait set (caller's CSpace still holds the cap). Read uses
-        // atomic loads where appropriate; no source-side lock required.
+        // SAFETY: source_ptr is pinned alive by the +1 cap-level ref this
+        // member holds on its source's `KernelObjectHeader` (see module
+        // docs). Reads use atomic loads where appropriate; no source-side
+        // lock required.
         if unsafe { source_is_ready(source_ptr, source_tag) }
         {
             // SAFETY: paired with lock_raw above.
@@ -496,7 +553,14 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
 /// Free all resources of `ws` and wake any blocked waiter.
 ///
 /// Clears back-pointers on all registered sources so they stop notifying,
-/// then wakes any blocked waiter.
+/// then `dec_ref`s the +1 cap-level reference that wait-set membership held
+/// on each source. Finally wakes any blocked waiter.
+///
+/// Returns the set of source headers whose `dec_ref` returned 0 (i.e. the
+/// member's +1 was the last cap-level reference). The caller — the `WaitSet`
+/// arm of `cap::object::dealloc_object_one` — pushes each of these onto
+/// the dealloc cascade worklist. Returned in the same slot ordering as
+/// `WaitSetState::members`; vacant entries are `None`.
 ///
 /// # Safety
 /// `ws` must be a valid pointer. After this call `ws` itself is NOT freed —
@@ -508,9 +572,15 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
 /// members under `ws.lock` while taking source locks would invert that
 /// order. By clearing back-pointers first we guarantee no future
 /// `waitset_notify` call references this ws; we then take `ws.lock` only
-/// to wake the blocked waiter (if any).
+/// to wake the blocked waiter (if any). The `dec_ref` calls happen after
+/// `clear_source_backpointer` returns, so they do not hold any source IPC
+/// lock — required because a `dec_ref` that drops the refcount to zero
+/// reports back to the cascade worklist (the actual reclaim happens
+/// outside this function, after `wait_set_drop` returns).
 #[cfg(not(test))]
-pub unsafe fn wait_set_drop(ws: *mut WaitSetState)
+pub unsafe fn wait_set_drop(
+    ws: *mut WaitSetState,
+) -> [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>; WAIT_SET_MAX_MEMBERS]
 {
     // SAFETY: ws valid for &mut access for the duration; the caller is
     // dealloc_object on a refcount==0 cap, no other syscall path can hold
@@ -531,12 +601,35 @@ pub unsafe fn wait_set_drop(ws: *mut WaitSetState)
             snap[i] = Some((slot.source_ptr, slot.source_tag));
         }
     }
-    for entry in snap.iter().flatten()
+
+    // Drop the +1 cap-level ref each membership held on its source. A
+    // source whose refcount reaches 0 here is returned to the caller for
+    // cascade-reclaim (the wait-set was the source's last referent).
+    let mut zeroed: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
+        WAIT_SET_MAX_MEMBERS] = [None; WAIT_SET_MAX_MEMBERS];
+    for (i, entry) in snap.iter().enumerate()
     {
-        let (source_ptr, source_tag) = *entry;
+        let Some((source_ptr, source_tag)) = *entry
+        else
+        {
+            continue;
+        };
         // SAFETY: source_ptr is a valid pointer to the source's state
         // struct; clear_source_backpointer takes the source's own lock.
         unsafe { clear_source_backpointer(source_ptr, source_tag) };
+
+        // SAFETY: source is retype-backed (production invariant — see
+        // source_header docstring); header sits at `source_ptr - 24`.
+        let header_ptr = unsafe { source_header(source_ptr) };
+        // SAFETY: header_ptr points to the wrapper's KernelObjectHeader,
+        // pinned alive by the +1 ref we are now releasing.
+        let new_rc = unsafe { (*header_ptr).dec_ref() };
+        if new_rc == 0
+        {
+            // SAFETY: header_ptr is non-null (computed from a non-null
+            // state_ptr); refcount reached 0 — caller cascades reclaim.
+            zeroed[i] = Some(unsafe { core::ptr::NonNull::new_unchecked(header_ptr) });
+        }
     }
 
     // Step 2: detach any blocked waiter under ws.lock; defer the wake
@@ -573,6 +666,8 @@ pub unsafe fn wait_set_drop(ws: *mut WaitSetState)
         // SAFETY: waiter remains valid.
         unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu, prio) };
     }
+
+    zeroed
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

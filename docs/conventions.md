@@ -63,7 +63,7 @@ Each `Y` bump (`v0.1.0`, `v0.2.0`, …) has a GitHub milestone. Issues blocking 
 ### Commit and PR cross-references
 
 - Commit messages MAY reference Issues by `#N` where useful.
-- Once branch/PR workflow activates (below), PR descriptions MUST reference the Issue(s) they close via `Fixes #N` / `Closes #N` so merge auto-closes them.
+- Any commit (or PR description, when merging via PR) that closes an Issue MUST reference it via `Fixes #N` / `Closes #N` in the message so the push (or merge) auto-closes the Issue. Manual `gh issue close` after the fact is a procedural miss, not a substitute.
 
 ### Acceptance checklist discipline
 
@@ -88,7 +88,7 @@ Each `Y` bump (`v0.1.0`, `v0.2.0`, …) has a GitHub milestone. Issues blocking 
 - Optional for trivial changes (typo fixes, single-line tweaks).
 - Expected for substantive changes: explain the why, not the what (the diff shows the what).
 - Wrap at ~72 columns.
-- Reference Issues via `Fixes #N` / `Closes #N` to trigger auto-close on merge once PR workflow activates.
+- A commit (or its enclosing PR description) that closes an Issue MUST include `Fixes #N` / `Closes #N` so the merge auto-closes the Issue. Closing manually after the fact is a procedural miss, not a substitute.
 
 ### Style
 
@@ -99,22 +99,23 @@ Each `Y` bump (`v0.1.0`, `v0.2.0`, …) has a GitHub milestone. Issues blocking 
 ### Operations
 
 - Commits MUST NOT skip pre-commit hooks (`--no-verify`). Hook failure indicates a real problem; fix the underlying issue and commit again.
-- Existing commits MUST NOT be amended once pushed. Land a new commit instead.
-- `master` MUST NOT receive force pushes.
+- Commits on `master` are immutable: no amend, no rewrite, no force push.
+- On feature branches before merge, amending and force-pushing your own branch is fine and often preferable to a "fix typo" commit. The merge into `master` is the linear-green commit that lands.
 
 ## Branch and PR Workflow
 
-### Before v0.1.0 tag
+All work — including single-line fixes and documentation changes — flows
+through a short-lived feature branch and a PR. Direct commits to `master`
+are forbidden; `master` MUST NOT receive force pushes.
 
-Direct commits to `master` are permitted. CI must stay green per commit.
-
-### From v0.1.0 tag forward
-
-- **Non-trivial work** MUST live on a feature branch and merge via PR. "Non-trivial" means: touches multiple components, or expects more than ~2 commits, or introduces a new subsystem.
-- Trivial single-file fixes MAY land on `master` directly.
-- PRs are self-reviewed; the file-by-file diff view, line comments, and CI status integration are the value.
-- `master` MUST stay linearly green: every commit on `master` MUST be a passing CI state. Branches MAY have intermediate failures; merge is the green gate.
-- PRs MUST reference the Issue(s) they close. CI MUST gate merge. Merge auto-closes the Issue(s).
+- PRs are self-reviewed; the file-by-file diff view, line comments, and CI
+  status integration are the value.
+- CI MUST gate merge. `master` MUST stay linearly green: every commit on
+  `master` is a passing CI state. Branches MAY have intermediate failures;
+  merge is the green gate.
+- PRs that close an Issue MUST carry `Fixes #N` / `Closes #N` in the PR
+  description so merge auto-closes the Issue. The acceptance-checklist
+  tick-through (see above) lands in the same merge action.
 
 ### Branch naming
 

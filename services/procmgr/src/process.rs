@@ -539,6 +539,16 @@ pub struct UniversalCaps
     /// `memmgr_labels::PROCESS_DIED` at child teardown so memmgr can
     /// reclaim the right ledger entry. Zero when memmgr is not wired.
     pub memmgr_token: u64,
+    /// Un-tokened SEND cap on svcmgr's service endpoint, sourced from
+    /// the slot procmgr received during init bootstrap. Used as the
+    /// `cap_derive_token` source for minting a per-child tokened SEND
+    /// (token = child's process token) attenuated to QUERY-only rights.
+    /// The minted cap is installed in `ProcessInfo.service_registry_cap`
+    /// and is how every child resolves service names via
+    /// `svcmgr_labels::QUERY_ENDPOINT`. Zero when svcmgr is not yet
+    /// reachable; children born in that case receive zero in
+    /// `pi.service_registry_cap` and `registry_client::lookup` no-ops.
+    pub registry_send_source: u32,
 }
 
 /// Program arguments delivered to a child process at spawn time.
@@ -710,6 +720,29 @@ fn populate_child_info(
         0
     };
 
+    // Mirror of the log_send derivation, for the system-wide service-discovery
+    // handle (svcmgr's QUERY_ENDPOINT). The token == child's process token
+    // serves as the unforgeable caller identity in svcmgr's per-process
+    // accounting; publish-authority gating on the same endpoint is a
+    // follow-up (see PR description) — until then, any holder of this cap
+    // can also call PUBLISH_ENDPOINT on svcmgr.
+    let registry_send_in_child = if universals.registry_send_source != 0
+    {
+        let proc_side = syscall::cap_derive_token(
+            universals.registry_send_source,
+            syscall::RIGHTS_SEND,
+            process_token,
+        )
+        .ok()?;
+        let child_side = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_SEND).ok()?;
+        let _ = syscall::cap_delete(proc_side);
+        child_side
+    }
+    else
+    {
+        0
+    };
+
     // Stdio pipe caps are not installed here — CONFIGURE_PIPE remaps
     // this same pi_frame writable and fills in one direction's triple
     // (frame + data signal + space signal) per call, before the child
@@ -766,6 +799,7 @@ fn populate_child_info(
     pi.system_root_cap = 0;
     pi.current_dir_cap = 0;
     pi.log_send_cap = log_send_in_child;
+    pi.service_registry_cap = registry_send_in_child;
     pi.stdin_data_signal_cap = 0;
     pi.stdin_space_signal_cap = 0;
     pi.stdout_data_signal_cap = 0;
@@ -2083,6 +2117,7 @@ pub fn create_process_from_file(
         log_send_source: ctx.log_ep,
         memmgr_endpoint: mms.cap(),
         memmgr_token: mms.token(),
+        registry_send_source: ctx.registry_ep,
     };
     let process_token = next_process_token();
     let pi_frame_cap = populate_child_info(

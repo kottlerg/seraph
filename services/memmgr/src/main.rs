@@ -55,6 +55,7 @@ pub extern "C" fn _start(_info_ptr: u64) -> !
         self_cspace: info.self_cspace_cap,
         procmgr_endpoint: info.procmgr_endpoint_cap,
         memmgr_endpoint: info.memmgr_endpoint_cap,
+        service_registry_cap: info.service_registry_cap,
         stdin_frame_cap: info.stdin_frame_cap,
         stdout_frame_cap: info.stdout_frame_cap,
         stderr_frame_cap: info.stderr_frame_cap,

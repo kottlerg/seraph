@@ -73,6 +73,14 @@ pub struct StartupInfo {
     /// chain). `_start` consumes this to bootstrap the heap.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub memmgr_endpoint: u32,
+    /// Cap slot of a tokened SEND cap on svcmgr (QUERY-only attenuation),
+    /// the system-wide service-discovery handle. `_start` consumes this
+    /// to install the registry cap into the registry-client cache, so
+    /// later `registry_client::lookup(name, ..)` calls resolve names to
+    /// service caps via `svcmgr_labels::QUERY_ENDPOINT`. Zero if svcmgr
+    /// is not reachable.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub service_registry_cap: u32,
     /// Shmem frame cap backing `std::io::stdin`. Zero when no input
     /// pipe is attached; reads return `Ok(0)` (EOF).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -328,6 +336,7 @@ pub extern "C" fn _start() -> ! {
         self_cspace: info.self_cspace_cap,
         procmgr_endpoint: info.procmgr_endpoint_cap,
         memmgr_endpoint: info.memmgr_endpoint_cap,
+        service_registry_cap: info.service_registry_cap,
         stdin_frame_cap: info.stdin_frame_cap,
         stdout_frame_cap: info.stdout_frame_cap,
         stderr_frame_cap: info.stderr_frame_cap,

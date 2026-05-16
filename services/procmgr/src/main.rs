@@ -128,6 +128,12 @@ fn main() -> !
         self_aspace,
         self_endpoint: boot.service_ep,
         log_ep: boot.log_ep,
+        // Task #7 (init/procmgr/devmgr/svcmgr wiring commit) extends the
+        // procmgr bootstrap-round payload to include the un-tokened SEND
+        // on svcmgr's endpoint. Until then, registry_ep is zero and
+        // children born in this window receive zero in
+        // ProcessInfo.service_registry_cap.
+        registry_ep: 0,
         memmgr_ep: startup.memmgr_endpoint,
         death_eq,
         ws_cap,
@@ -814,6 +820,7 @@ fn handle_create(
         log_send_source: ctx.log_ep,
         memmgr_endpoint: memmgr_send,
         memmgr_token,
+        registry_send_source: ctx.registry_ep,
     };
 
     let result = process::create_process(
@@ -883,6 +890,14 @@ pub struct ProcmgrCtx
     /// born in that window receive zero and silent-drop
     /// `std::os::seraph::log!`.
     pub log_ep: u32,
+    /// Un-tokened SEND cap on svcmgr's service endpoint, received from init
+    /// during procmgr's own bootstrap. Used as the `cap_derive_token` source
+    /// for minting a per-child tokened SEND (token = the child's process
+    /// token), installed in the child's `ProcessInfo.service_registry_cap`
+    /// so the child can issue `svcmgr_labels::QUERY_ENDPOINT` against svcmgr
+    /// for service-name lookups. Zero if init has not yet wired it; children
+    /// born in that window receive zero and `registry_client::lookup` no-ops.
+    pub registry_ep: u32,
     /// Tokened SEND cap on memmgr's service endpoint, identifying procmgr.
     /// Used to mint per-child memmgr SENDs via `REGISTER_PROCESS`, to
     /// notify `PROCESS_DIED`, and as the destination for procmgr's own

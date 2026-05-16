@@ -414,6 +414,74 @@ pub mod svcmgr_labels
     pub const QUERY_ENDPOINT: u64 = 4;
 }
 
+pub const RTC_LABELS_VERSION: u32 = 1;
+/// IPC labels for RTC chip drivers (`services/drivers/cmos`,
+/// `services/drivers/virtio/rtc`, and future per-board chip drivers).
+///
+/// Every RTC driver implements exactly one operation: return the current
+/// wall-clock time, as `u64` microseconds since the Unix epoch. The
+/// `timed` service queries the driver registered under
+/// `rtc.primary` in svcmgr once at startup, computes
+/// `offset = rtc_us - kernel_monotonic_us`, and serves
+/// [`timed_labels::GET_WALL_TIME`] thereafter without further driver IPC.
+///
+/// Adding a new RTC chip is a matter of writing a driver crate that
+/// answers this single label and registering it as `rtc.primary` from
+/// devmgr's per-board discovery path. `timed` itself never sees the
+/// chip-specific details.
+pub mod rtc_labels
+{
+    /// Request the current wall-clock time.
+    ///
+    /// Wire format: empty body (no data words, no caps). Reply:
+    /// `data[0]` is `u64` microseconds since the Unix epoch. Reply
+    /// label carries a status code in the lower 16 bits.
+    pub const RTC_GET_EPOCH_TIME: u64 = 1;
+}
+
+pub mod rtc_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// Driver could not read the underlying hardware (transient or
+    /// permanent device failure). Caller may retry; `timed` treats this
+    /// as "wall-clock unavailable" until a subsequent query succeeds.
+    pub const READ_FAILED: u64 = 1;
+    /// Driver received a label it does not implement.
+    pub const UNKNOWN_OPCODE: u64 = 2;
+}
+
+pub const TIMED_LABELS_VERSION: u32 = 1;
+/// IPC labels for the wall-clock service (`services/timed`).
+///
+/// `timed` is RTC-source-agnostic: it looks up `rtc.primary` once at
+/// startup, queries the driver via [`rtc_labels::RTC_GET_EPOCH_TIME`],
+/// computes a stable offset against the kernel's monotonic clock, and
+/// serves wall-clock queries from `offset + system_info(ElapsedUs)`. New
+/// RTC chip support never changes timed; only the `rtc.primary` driver
+/// changes per platform.
+pub mod timed_labels
+{
+    /// Request the current wall-clock time.
+    ///
+    /// Wire format: empty body. Reply: `data[0]` is `u64` microseconds
+    /// since the Unix epoch. Reply label carries a status code in the
+    /// lower 16 bits.
+    pub const GET_WALL_TIME: u64 = 1;
+}
+
+pub mod timed_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// No RTC driver was registered under `rtc.primary` at timed's
+    /// startup; the offset was never computed. Boards without an RTC
+    /// (some real RISC-V hardware) reach this state until an operator
+    /// or NTP path seeds the offset out-of-band. Out of scope for this
+    /// PR; documented to make the no-RTC path explicit at the wire
+    /// level rather than panicking.
+    pub const WALL_CLOCK_UNAVAILABLE: u64 = 1;
+    pub const UNKNOWN_OPCODE: u64 = 2;
+}
+
 pub const PWRMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the power manager (`pwrmgr`).
 ///

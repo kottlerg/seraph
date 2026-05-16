@@ -38,10 +38,17 @@ use std::os::seraph::startup_info;
 ///            Zero means no log endpoint is available yet; children
 ///            born in that window receive zero and silent-drop
 ///            `std::os::seraph::log!`.
+///   caps[2]: un-tokened SEND copy of svcmgr's service endpoint (the
+///            global service registry). Procmgr derives a tokened SEND
+///            per child for `ProcessInfo.service_registry_cap`; the
+///            child can `QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT`.
+///            Zero means no registry is available yet.
+#[allow(clippy::struct_field_names)]
 struct InitBootstrap
 {
     service_ep: u32,
     log_ep: u32,
+    registry_ep: u32,
 }
 
 fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstrap>
@@ -61,6 +68,14 @@ fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstr
         log_ep: if round.cap_count >= 2
         {
             round.caps[1]
+        }
+        else
+        {
+            0
+        },
+        registry_ep: if round.cap_count >= 3
+        {
+            round.caps[2]
         }
         else
         {
@@ -128,12 +143,7 @@ fn main() -> !
         self_aspace,
         self_endpoint: boot.service_ep,
         log_ep: boot.log_ep,
-        // Task #7 (init/procmgr/devmgr/svcmgr wiring commit) extends the
-        // procmgr bootstrap-round payload to include the un-tokened SEND
-        // on svcmgr's endpoint. Until then, registry_ep is zero and
-        // children born in this window receive zero in
-        // ProcessInfo.service_registry_cap.
-        registry_ep: 0,
+        registry_ep: boot.registry_ep,
         memmgr_ep: startup.memmgr_endpoint,
         death_eq,
         ws_cap,

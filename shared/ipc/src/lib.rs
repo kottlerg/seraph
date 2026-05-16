@@ -412,6 +412,17 @@ pub mod svcmgr_labels
     /// pattern); data words carry the name. Reply attaches the cap on
     /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
     pub const QUERY_ENDPOINT: u64 = 4;
+
+    /// Verb-bit set in the caller's token to authorise
+    /// [`PUBLISH_ENDPOINT`]. Init derives `PUBLISH_AUTHORITY`-tokened SEND
+    /// caps on svcmgr's service endpoint for the small set of holders
+    /// trusted to add names to the global registry (init itself, devmgr
+    /// for driver registrations, svcmgr for future post-init service
+    /// launches). The un-tokened SEND distributed to every process via
+    /// `ProcessInfo.service_registry_cap` lacks this bit and serves
+    /// `QUERY_ENDPOINT` only; svcmgr rejects publish attempts from
+    /// un-authorised callers with [`svcmgr_errors::UNAUTHORIZED`].
+    pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
 }
 
 pub const RTC_LABELS_VERSION: u32 = 1;
@@ -1036,6 +1047,9 @@ pub mod svcmgr_errors
     pub const UNKNOWN_NAME: u64 = 5;
     /// Discovery registry publish: table full or duplicate name.
     pub const REGISTER_REJECTED: u64 = 6;
+    /// Caller's token lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
+    /// `PUBLISH_ENDPOINT` request.
+    pub const UNAUTHORIZED: u64 = 8;
     /// Caller's compiled `SVCMGR_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_SERVICE` is the handshake entry point and carries the
     /// caller's version as `data[0]` (with all other words shifted by +1);

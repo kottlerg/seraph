@@ -751,6 +751,16 @@ pub struct ProcmgrBootstrap
     /// is available (very early boot); children born in that window
     /// receive zero and silent-drop `seraph::log!`.
     pub log_endpoint_slot: u32,
+    /// Slot in procmgr's `CSpace` holding an un-tokened SEND cap on
+    /// svcmgr's service endpoint (the global service registry).
+    /// Procmgr uses it as the *source* for `cap_derive_token` to mint
+    /// a tokened SEND cap per child (token = the child's process
+    /// token, no `PUBLISH_AUTHORITY` bit), which is placed in the
+    /// child's `ProcessInfo.service_registry_cap`. The child can
+    /// `QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT` — publish-authority
+    /// caps are minted separately and handed only to init / devmgr /
+    /// svcmgr.
+    pub registry_endpoint_slot: u32,
     /// Procmgr's main thread cap (in init's `CSpace`). Used by
     /// [`start_procmgr`] to launch procmgr after memmgr is live.
     pub thread: u32,
@@ -774,13 +784,22 @@ pub static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 =
 ///
 /// Returns the [`ProcmgrBootstrap`] record so the caller can issue bootstrap
 /// rounds and subsequent `CREATE_PROCESS` calls.
-#[allow(clippy::similar_names)]
+// too_many_lines: linear bootstrap workflow (CSpace setup, ELF load, TLS
+// prep, per-purpose cap derivation for log + registry + memmgr) reads
+// straight-through; extracting helpers would just shuffle state through
+// extra parameters.
+#[allow(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 pub fn bootstrap_procmgr(
     info: &InitInfo,
     alloc: &mut FrameAlloc,
     init_bootstrap_ep: u32,
     pm_service_ep: u32,
     log_ep: u32,
+    svcmgr_service_ep: u32,
     memmgr_send_cap: u32,
 ) -> Option<ProcmgrBootstrap>
 {
@@ -865,6 +884,23 @@ pub fn bootstrap_procmgr(
         syscall::cap_derive(log_ep, syscall::RIGHTS_SEND).ok()?
     };
 
+    // Derive an un-tokened SEND cap on svcmgr's service endpoint for
+    // procmgr. Kept in init's CSpace and sent to procmgr via the
+    // bootstrap round; procmgr uses it as the *source* for
+    // `cap_derive_token` to mint a tokened SEND cap per child it
+    // spawns, which becomes that child's
+    // `ProcessInfo.service_registry_cap`. Per-child tokens omit the
+    // `PUBLISH_AUTHORITY` bit so children can `QUERY_ENDPOINT` but
+    // not `PUBLISH_ENDPOINT`.
+    let pm_registry_send = if svcmgr_service_ep == 0
+    {
+        0
+    }
+    else
+    {
+        syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND).ok()?
+    };
+
     // Copy the tokened memmgr SEND cap into procmgr's CSpace. The slot it
     // lands at gets installed in procmgr's `ProcessInfo.memmgr_endpoint_cap`.
     let memmgr_endpoint_slot = if memmgr_send_cap == 0
@@ -933,6 +969,7 @@ pub fn bootstrap_procmgr(
         service_ep: service_ep_for_init,
         bootstrap_token: procmgr_token,
         log_endpoint_slot: pm_log_send,
+        registry_endpoint_slot: pm_registry_send,
         thread: pm_thread,
     })
 }

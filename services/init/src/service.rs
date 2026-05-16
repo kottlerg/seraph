@@ -1347,6 +1347,7 @@ pub fn phase3_svcmgr_handover(
     info: &InitInfo,
     procmgr_ep: u32,
     bootstrap_ep: u32,
+    svcmgr_service_ep: u32,
     system_root_cap: u32,
     fatfs_root_cap: u32,
     ipc_buf: *mut u64,
@@ -1356,12 +1357,11 @@ pub fn phase3_svcmgr_handover(
 {
     let init_self_cspace = info.cspace_cap;
 
-    let Ok(svcmgr_service_ep) = syscall::cap_create_endpoint(crate::endpoint_slab())
-    else
-    {
-        log("phase 3: cannot create svcmgr endpoint");
-        idle_loop();
-    };
+    // svcmgr's service endpoint is created in early init
+    // (before bootstrap_procmgr) so procmgr can receive an un-tokened
+    // SEND on it in its bootstrap round and distribute query caps via
+    // `ProcessInfo.service_registry_cap`. svcmgr's bootstrap endpoint
+    // is local to this phase and stays created here.
     let Ok(svcmgr_bootstrap_ep) = syscall::cap_create_endpoint(crate::endpoint_slab())
     else
     {

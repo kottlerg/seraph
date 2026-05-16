@@ -470,6 +470,10 @@ fn handle_publish_endpoint(
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
 ) -> u64
 {
+    if msg.token & svcmgr_labels::PUBLISH_AUTHORITY == 0
+    {
+        return ipc::svcmgr_errors::UNAUTHORIZED;
+    }
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
     if name_len == 0 || name_len > registry::NAME_MAX
     {

@@ -432,6 +432,20 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
+    // svcmgr's service endpoint backs the system-wide service registry
+    // (PUBLISH_ENDPOINT / QUERY_ENDPOINT). Created here, before
+    // bootstrap_procmgr, so procmgr can receive an un-tokened SEND on
+    // it in its bootstrap round. The RECV side is handed to svcmgr
+    // in phase 3 when init launches the binary; the same endpoint
+    // object backs both the early per-child query caps and svcmgr's
+    // future event loop.
+    let Ok(svcmgr_service_ep) = syscall::cap_create_endpoint(endpoint_slab())
+    else
+    {
+        logging::log("init: FATAL: cannot create svcmgr service endpoint");
+        syscall::thread_exit();
+    };
+
     // Create the log endpoint. Init holds the full-rights cap; procmgr
     // receives a SEND copy in its bootstrap round and `cap_copy`s it
     // and uses as the source for per-child `cap_derive_token` to seed
@@ -513,6 +527,7 @@ fn run(info_ptr: u64) -> !
         init_bootstrap_ep,
         procmgr_service_ep,
         log_ep,
+        svcmgr_service_ep,
         mm.procmgr_send_cap,
     )
     else
@@ -674,6 +689,9 @@ fn run(info_ptr: u64) -> !
     //   [1] un-tokened SEND on the log endpoint, slotted in procmgr's
     //       CSpace by `bootstrap_procmgr`. Procmgr re-derives tokened
     //       SEND caps from this for every child it spawns.
+    //   [2] un-tokened SEND on svcmgr's service endpoint, slotted in
+    //       procmgr's CSpace by `bootstrap_procmgr`. Procmgr derives a
+    //       tokened SEND per child for `ProcessInfo.service_registry_cap`.
     //
     // No data words: procmgr no longer maintains a frame pool; every
     // per-child allocation routes through memmgr.
@@ -690,7 +708,11 @@ fn run(info_ptr: u64) -> !
             pm.bootstrap_token,
             ipc_buf,
             true,
-            &[pm_service_cap_for_pm, pm.log_endpoint_slot],
+            &[
+                pm_service_cap_for_pm,
+                pm.log_endpoint_slot,
+                pm.registry_endpoint_slot,
+            ],
             &[],
         )
     }
@@ -878,6 +900,7 @@ fn run(info_ptr: u64) -> !
         info,
         endpoint_cap,
         init_bootstrap_ep,
+        svcmgr_service_ep,
         system_root_cap,
         root_mount.root_cap,
         ipc_buf,

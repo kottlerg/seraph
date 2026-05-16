@@ -469,13 +469,15 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                     // PCI BAR windows. Real hardware advertises these
                     // through the host bridge's `_CRS`, which the
                     // bootloader does not evaluate (no AML interpreter).
-                    // We seed conservatively: the 32-bit window is the
-                    // chipset-conventional band below 4 GiB; the 64-bit
-                    // window is `[4 GiB, 1 << MAXPHYADDR)` — wide enough
-                    // to cover any firmware/hypervisor placement on the
-                    // architecture without per-machine tuning. Apertures
-                    // are permission checks, not allocations, so a wide
-                    // upper bound is harmless.
+                    // We seed via an ECAM-base heuristic:
+                    //   ECAM < 2 GiB ⇒ QEMU virt (RISC-V): both windows
+                    //     at stable QEMU-defined offsets.
+                    //   ECAM ≥ 2 GiB ⇒ q35 (x86-64): 32-bit window
+                    //     below ECAM; 64-bit window `[4 GiB, 1<<MAXPHYADDR)`
+                    //     so it covers wherever firmware places it
+                    //     without per-CPU tuning. Apertures are
+                    //     permission checks, not allocations, so a wide
+                    //     upper bound is harmless.
                     let (lo_base, lo_size) = if base < 0x8000_0000
                     {
                         (0x4000_0000u64, 0x4000_0000u64)
@@ -485,17 +487,24 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                         (0x8000_0000u64, base - 0x8000_0000)
                     };
                     push!(lo_base, lo_size);
-                    let maxphyaddr = crate::arch::current::max_phys_addr_bits();
-                    let hi_top: u64 = if maxphyaddr >= 64
+                    let (hi_base, hi_size) = if base < 0x8000_0000
                     {
-                        u64::MAX
+                        (0x4_0000_0000u64, 0x4_0000_0000u64)
                     }
                     else
                     {
-                        1u64 << maxphyaddr
+                        let maxphyaddr = crate::arch::current::max_phys_addr_bits();
+                        let hi_top: u64 = if maxphyaddr >= 64
+                        {
+                            u64::MAX
+                        }
+                        else
+                        {
+                            1u64 << maxphyaddr
+                        };
+                        let hi_base: u64 = 1u64 << 32;
+                        (hi_base, hi_top.saturating_sub(hi_base))
                     };
-                    let hi_base: u64 = 1u64 << 32;
-                    let hi_size: u64 = hi_top.saturating_sub(hi_base);
                     push!(hi_base, hi_size);
                 }
                 off += MCFG_ENTRY_SIZE;

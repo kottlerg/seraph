@@ -500,11 +500,23 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut pro
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    // install_logd_death_eq stores the cap and binds it as a second
-    // observer on every existing thread. Future spawns pick it up
-    // inside finalize_creation by reading the same atomic.
-    let _ = process::install_logd_death_eq(table, logd_eq);
-    reply_empty(ipc_buf, procmgr_errors::SUCCESS);
+    // install_logd_death_eq is first-wins: it stores the cap and
+    // binds it as a second observer on every existing thread, or
+    // returns false if a previous registration already filled the
+    // slot. Future spawns pick it up inside finalize_creation by
+    // reading the same atomic.
+    if process::install_logd_death_eq(table, logd_eq)
+    {
+        reply_empty(ipc_buf, procmgr_errors::SUCCESS);
+    }
+    else
+    {
+        // Slot already filled (legitimate logd is registered).
+        // Drop the just-transferred cap so it doesn't leak in
+        // procmgr's CSpace; reject the caller.
+        let _ = syscall::cap_delete(logd_eq);
+        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+    }
 }
 
 /// Answer `QUERY_PROCESS` for the addressed entry.

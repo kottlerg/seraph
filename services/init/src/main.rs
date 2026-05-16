@@ -440,10 +440,13 @@ fn run(info_ptr: u64) -> !
     // log_ep) are satisfied so init's own subsequent log lines ride IPC
     // through the mediator instead of direct serial.
     //
-    // TODO: real `logd` — a late-boot service loaded from the real root
-    // (not the ESP) — will eventually own the receive side and the
-    // mediator role. At that point init hands over `log_ep` to logd and
-    // retires the in-init thread.
+    // Real `logd` (loaded from `/bin/logd` at the end of Phase 2,
+    // post-root-mount) takes over the receive side via the
+    // `log_labels::HANDOVER_PULL` exchange — see
+    // `service::create_and_start_logd` and
+    // `services/logd/docs/handover-protocol.md`. The same kernel
+    // endpoint object is reused, so every existing tokened SEND cap
+    // survives the handover unchanged.
     let Ok(log_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {

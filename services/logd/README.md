@@ -57,10 +57,6 @@ process.
 * Network-syslog sink.
 * svcmgr-late-launch migration (parallel to the usertest refactor;
   logd is launched by init for now).
-* GET_LOG_CAP cleanup. With every new spawn receiving a
-  pre-installed tokened SEND cap directly in `ProcessInfo`, the
-  legacy discovery path is dead code; a separate PR removes it
-  once every live writer has been migrated.
 
 ## Source layout
 

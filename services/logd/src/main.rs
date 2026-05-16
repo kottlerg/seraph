@@ -361,16 +361,21 @@ fn reply_ack(ipc_buf: *mut u64)
 /// Append `byte_len` bytes from the IPC payload onto the slot for
 /// `token`, flushing complete lines (`\n`-terminated) to the serial
 /// port AND recording them into the per-slot history ring.
+///
+/// Accepts up to `STREAM_CHUNK_SIZE = MSG_DATA_WORDS_MAX * 8` bytes
+/// per call (the maximum a single `STREAM_BYTES` IPC can carry); the
+/// per-line buffer is `LINE_BUF_SIZE` and force-flushes when full,
+/// so a chunk longer than `LINE_BUF_SIZE` produces multiple emitted
+/// lines rather than truncated output (matches init-logd's behaviour).
 fn consume_bytes(table: &mut SlotTable, token: u64, msg: &IpcMessage, byte_len: usize)
 {
+    const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
+
     let bytes = msg.data_bytes();
-    let n = byte_len.min(bytes.len());
-    // Bound the byte stream to the receiver's working buffer length
-    // (matches init-logd's per-call cap to one chunk-sized burst).
-    let n = n.min(LINE_BUF_SIZE);
+    let n = byte_len.min(bytes.len()).min(STREAM_CHUNK_SIZE);
     // Stage the bytes in a stack buffer so we can borrow the slot
     // mutably without aliasing the IPC buffer.
-    let mut staged = [0u8; LINE_BUF_SIZE];
+    let mut staged = [0u8; STREAM_CHUNK_SIZE];
     staged[..n].copy_from_slice(&bytes[..n]);
     let slot = table.get_or_create(token);
     for &b in &staged[..n]

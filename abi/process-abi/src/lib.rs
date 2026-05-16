@@ -361,15 +361,6 @@ pub struct ProcessInfo
     /// is installed (e.g. via `std::env::set_current_dir`).
     pub current_dir_cap: u32,
 
-    /// `CSpace` slot of an un-tokened SEND cap on the system log endpoint
-    /// (the *discovery* cap).
-    ///
-    /// Used by the `seraph::log!` macro path to lazy-acquire a tokened
-    /// SEND cap on first call, via the `log_labels::GET_LOG_CAP` IPC. The
-    /// discovery cap by itself grants no identity and no observability —
-    /// it merely lets the holder request a freshly-minted tokened cap.
-    /// Distributing it widely is therefore harmless.
-    ///
     /// `CSpace` slot of a tokened SEND cap on the system log endpoint
     /// suitable for direct `STREAM_BYTES` / `STREAM_REGISTER_NAME`
     /// use.
@@ -384,13 +375,6 @@ pub struct ProcessInfo
     /// Zero when no logger is reachable (init, memmgr, procmgr
     /// themselves; processes spawned before the log endpoint exists).
     /// `seraph::log!` silently drops in that case.
-    ///
-    /// History note (not part of the field's contract): pre-pivot
-    /// this slot held an *un-tokened* discovery cap; callers issued
-    /// `GET_LOG_CAP` to lazy-acquire a tokened cap on first log. The
-    /// discovery path still exists in init-logd and real-logd for
-    /// pre-handover live writers that already acquired their tokened
-    /// caps under it; new spawns skip it entirely.
     pub log_send_cap: u32,
 
     // ── Stdio pipe wakeup signals ──────────────────────────────────────

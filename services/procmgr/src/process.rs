@@ -40,9 +40,26 @@ static NEXT_TOKEN: std::sync::atomic::AtomicU64 =
 /// `pi.log_send_cap`'s tokened SEND derivation) AND `finalize_creation`
 /// (uses it as the table key, death-EQ correlator, and process-handle
 /// token).
+///
+/// Skips tokens whose lower 32 bits would collide with reserved
+/// death-EQ correlators (currently `INIT_REAP_CORRELATOR = u32::MAX`).
+/// The death-EQ binding API takes a `u32` correlator while process
+/// tokens are `u64`; without this guard the truncated correlator
+/// could match the reserved value at u32 wrap (~4.3B spawns) and
+/// the matching child's death would be silently absorbed by the
+/// init-reap branch in `dispatch_death`.
 fn next_process_token() -> u64
 {
-    NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    loop
+    {
+        let t = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if (t as u32) != ipc::procmgr_labels::INIT_REAP_CORRELATOR
+        {
+            return t;
+        }
+        // Skip the reserved correlator and try again. (Unreachable in
+        // v0.1.0 fleet sizes; cheap guard against a real-life wrap.)
+    }
 }
 
 /// Logd's death-notification `EventQueue` cap, registered via
@@ -60,16 +77,30 @@ pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 
 /// Install logd's death-notification EQ cap and retroactively bind it
 /// as a second observer on every thread currently in the process
-/// table. Called by `REGISTER_DEATH_EQ`'s handler. Idempotent on
-/// re-registration: replaces the previous slot, re-binds on
-/// everything.
+/// table. Called by `REGISTER_DEATH_EQ`'s handler.
+///
+/// First-wins semantics: returns `false` (and changes nothing) if a
+/// previous registration already filled the slot. This mitigates the
+/// pre-existing `sys_cap_derive_token` weakness in which any holder of
+/// a `SEND_GRANT` cap on procmgr's endpoint can mint
+/// `DEATH_EQ_AUTHORITY` and hijack logd's death stream — since logd
+/// registers at startup before any other user process is spawned, a
+/// later attacker's registration is always second and is rejected
+/// here. The caller (`handle_register_death_eq`) is responsible for
+/// `cap_delete`ing the just-transferred slot when this returns false.
 pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
 {
-    LOGD_DEATH_EQ.store(logd_eq, std::sync::atomic::Ordering::Release);
     if logd_eq == 0
     {
-        return true;
+        return false;
     }
+    // First-wins: refuse to overwrite. Real logd registers exactly
+    // once at startup, so the slot transitions 0 → logd_eq and stays.
+    if LOGD_DEATH_EQ.load(std::sync::atomic::Ordering::Acquire) != 0
+    {
+        return false;
+    }
+    LOGD_DEATH_EQ.store(logd_eq, std::sync::atomic::Ordering::Release);
     let mut ok = true;
     table.for_each(|entry| {
         let correlator = entry.token as u32;

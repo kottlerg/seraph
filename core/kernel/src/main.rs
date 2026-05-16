@@ -585,13 +585,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             for pg in 0..info_pages
             {
                 let phys = page_phys[pg];
-                // SAFETY: page was just buddy-allocated above and is not
-                // double-registered; single-threaded boot.
-                unsafe {
-                    crate::mm::with_frame_allocator(|alloc| {
-                        alloc.register_owned_range(phys, mm::PAGE_SIZE as u64);
-                    });
-                }
+                // No register_owned_range: these pages came from the
+                // buddy via `alloc.alloc(0)` above, so they are already
+                // in `total_pages`. `register_owned_range` would
+                // double-count.
                 let fo_nn = cap::mint_phase7_body(FrameObject {
                     header: KernelObjectHeader::with_ancestor(
                         ObjectType::Frame,
@@ -635,10 +632,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 info_pages,
             );
 
-            // Suppress unused-variable warnings: both values were already
-            // patched into InitInfo above; the block returns only the
-            // direct-map pointer that callers use for further patching.
-            let _ = (info_frame_base_slot, info_pages);
             info_base
         };
 
@@ -685,14 +678,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                         .unwrap_or_else(|()| fatal("Phase 9: failed to map init stack page"));
                 }
 
-                // Register and mint a reclaimable Frame cap covering this page.
-                // SAFETY: page just allocated from the buddy and not yet
-                // double-registered; single-threaded boot.
-                unsafe {
-                    crate::mm::with_frame_allocator(|alloc| {
-                        alloc.register_owned_range(phys, mm::PAGE_SIZE as u64);
-                    });
-                }
+                // Mint a reclaimable Frame cap covering this page.
+                // No register_owned_range: the page came from the
+                // buddy via `alloc.alloc(0)` above, so it is already
+                // in `total_pages`. `register_owned_range` would
+                // double-count.
                 let fo_nn = cap::mint_phase7_body(FrameObject {
                     header: KernelObjectHeader::with_ancestor(
                         ObjectType::Frame,

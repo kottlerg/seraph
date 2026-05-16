@@ -663,11 +663,11 @@ pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_page
 pub mod log {
     use super::current_ipc_buf;
 
-    /// Acquire (or fetch the cached) tokened SEND cap on the system log
-    /// endpoint. First call performs one `GET_LOG_CAP` round-trip;
-    /// subsequent calls return the same cap from the process-global
-    /// cache. Returns `0` when no discovery cap is reachable or the
-    /// IPC buffer is not yet registered.
+    /// Return the cached tokened SEND cap on the system log endpoint
+    /// (pre-installed at `_start` from `ProcessInfo.log_send_cap`).
+    /// Returns `0` when no log cap was seeded for this process (init,
+    /// memmgr, procmgr themselves, or processes spawned before logd
+    /// existed).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn acquire() -> u32 {
         ::log::ensure_tokened_cap(current_ipc_buf())

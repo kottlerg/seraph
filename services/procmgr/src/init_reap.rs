@@ -102,12 +102,24 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
         )
         .is_err()
         {
-            // Bind failed — drop the moved-in caps and refuse so init
-            // doesn't proceed to thread_exit thinking it'll be reaped.
-            let _ = syscall::cap_delete(aspace);
-            let _ = syscall::cap_delete(cspace);
-            let _ = syscall::cap_delete(main_thread);
-            let _ = syscall::cap_delete(logd_thread);
+            // Bind failed. We CANNOT cap_delete the moved-in
+            // AS/CSpace/Thread caps here: procmgr now holds the last
+            // reference, and init's threads are still actively
+            // running on the AS (we are mid-IPC). Dealloc would trip
+            // the `active_cpu_mask == 0` assert at
+            // `core/kernel/src/cap/object.rs` AddressSpace arm.
+            //
+            // Reply ERROR and leave the caps held in procmgr. Init
+            // observes the failure and aborts the handoff
+            // (`services/init/src/service.rs:handoff_to_procmgr_reap`),
+            // then `sys_thread_exit`s. The orphaned caps are a small
+            // one-shot leak on this failure-only path; the underlying
+            // bind error indicates a deeper problem (kernel out of
+            // observer slots) that warrants log + continue rather
+            // than recursive teardown.
+            std::os::seraph::log!(
+                "init-reap: thread_bind_notification failed; refusing handoff (caps leaked in procmgr)"
+            );
             reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
             return;
         }

@@ -116,6 +116,15 @@ pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
     0
 }
 
+/// No platform-default PCI apertures on x86-64.
+///
+/// q35 firmware always publishes MCFG, and BAR placement varies by
+/// machine and CPU MAXPHYADDR, so no single fixed seed makes sense.
+pub fn default_pci_apertures() -> &'static [(u64, u64)]
+{
+    &[]
+}
+
 /// Return the platform's maximum physical address width in bits.
 ///
 /// Read from CPUID extended leaf `0x80000008`, EAX[7:0]. When the

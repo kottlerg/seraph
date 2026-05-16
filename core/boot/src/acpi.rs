@@ -512,5 +512,19 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
         }
     }
 
+    // Per-arch platform-default PCI apertures.
+    //
+    // Some firmware builds publish ACPI without an MCFG table (e.g. the
+    // EDK2 shipped with Ubuntu's `qemu-efi-riscv64` package observed on
+    // `ubuntu-latest` GitHub runners). When MCFG is absent the loop above
+    // produces no PCI apertures, but devmgr still needs a frame covering
+    // ECAM. Append the arch-defined defaults unconditionally; any overlap
+    // with MCFG-derived entries is collapsed by
+    // `derive_mmio_apertures`'s merge pass.
+    for &(base, size) in crate::arch::current::default_pci_apertures()
+    {
+        push!(base, size);
+    }
+
     n
 }

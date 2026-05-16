@@ -161,6 +161,22 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
     unsafe { allocate_pages(bs, 1).ok() }
 }
 
+/// QEMU virt RISC-V PCI MMIO layout (ECAM, 32-bit window, 64-bit window).
+///
+/// Seeded unconditionally so devmgr can mint a Frame covering the ECAM
+/// region even on firmware builds that publish ACPI without MCFG and
+/// don't expose the DTB via the UEFI configuration table. Merged with any
+/// MCFG-derived entries in [`crate::memory_map::derive_mmio_apertures`].
+pub fn default_pci_apertures() -> &'static [(u64, u64)]
+{
+    const ENTRIES: &[(u64, u64)] = &[
+        (0x3000_0000, 0x1000_0000),
+        (0x4000_0000, 0x4000_0000),
+        (0x4_0000_0000, 0x4_0000_0000),
+    ];
+    ENTRIES
+}
+
 /// Return the platform's maximum physical address width in bits.
 ///
 /// On RISC-V the Privileged spec caps physical addresses at 56 bits

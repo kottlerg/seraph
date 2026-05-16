@@ -275,23 +275,56 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     {
         return;
     }
-    // CR0.TS is the architected dirty bit for the extended-state register
-    // file: cleared by the `#NM` handler when this thread loads its area,
-    // set again here on switch-out. If it is still set, the thread has
-    // not touched FP/SIMD since the last switch-in, so the live registers
-    // belong to whichever thread last cleared TS — saving them into this
-    // thread's area would clobber it with another thread's state. Skip.
-    if read_cr0() & CR0_TS != 0
+    // Eager save: the live extended-state register file always belongs to
+    // the outgoing thread because [`switch_in_restore`] reloaded it on
+    // switch-in. CR0.TS dirty-tracking is intentionally not used; the
+    // lazy-trap path varies in correctness across TCG versions
+    // (observed on QEMU 8.2 under `ubuntu-latest`).
+    // CR0.TS may already be clear (the matching switch_in_restore cleared
+    // it); ensure it is for XSAVE, which faults on TS=1.
+    // SAFETY: ring 0.
+    unsafe {
+        cr0_clear_ts();
+        save_to(area);
+    }
+}
+
+/// Context-switch hook called on switch-in of a user thread (the caller
+/// supplies a TCB whose `extended.area` is non-null): XRSTOR the saved
+/// register file into the live x87/SSE/AVX registers and clear CR0.TS so
+/// the thread resumes without an `#NM` trap.
+///
+/// Paired with [`switch_out_save`] to form an eager save/restore
+/// discipline that does not depend on `#NM`/CR0.TS lazy-trap semantics.
+///
+/// # Safety
+/// Must execute at ring 0 with interrupts disabled, after this thread's
+/// preceding `switch_out_save` has completed. `tcb` must be a valid TCB
+/// pointer; when its `extended.area` is non-null the area must satisfy
+/// the alignment and size requirements of [`restore_from`].
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn switch_in_restore(tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    // SAFETY: caller guarantees tcb is valid; the area is allocated for the
+    // TCB's lifetime when non-null.
+    let area = unsafe { (*tcb).extended.area };
+    if area.is_null()
     {
         return;
     }
-    // SAFETY: caller's contract.
+    // SAFETY: caller's contract; XRSTOR requires OSXSAVE which the boot
+    // path established.
     unsafe {
-        save_to(area);
-        cr0_set_ts();
+        cr0_clear_ts();
+        restore_from(area);
     }
 }
 
 /// No-op test stub.
 #[cfg(test)]
 pub unsafe fn switch_out_save(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}

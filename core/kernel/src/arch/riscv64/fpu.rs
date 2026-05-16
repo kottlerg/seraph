@@ -326,6 +326,23 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
 #[cfg(test)]
 pub unsafe fn switch_out_save(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
 
+/// No-op on RISC-V: the trap path's `lazy_restore_fp_v` already restores
+/// extended state on the first U-mode FP/V instruction after switch-in,
+/// and that path is correct under every TCG version currently exercised.
+/// The function exists for arch-dispatch symmetry with x86-64, where
+/// eager restore avoids variation in TCG lazy-FPU emulation.
+///
+/// # Safety
+/// Accepts the unified arch-dispatch signature; ring discipline is
+/// enforced by the caller.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
+
 /// Lazy-trap handler body: promote live `sstatus.FS` and `sstatus.VS` from
 /// Off to Initial, restore the F/D and V register files from `area` (when
 /// non-null), then mirror the resulting live FS/VS bits into `frame.sstatus`

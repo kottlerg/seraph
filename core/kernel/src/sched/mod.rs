@@ -1604,18 +1604,26 @@ pub unsafe fn schedule(requeue_current: bool)
     }
 
     // Save the current thread's extended FPU/SIMD/V state to its per-TCB
-    // area before any other CPU can observe this thread as no-longer-current.
-    // switch_out_save is a no-op when the TCB has no extended-state area
-    // (kernel-only / idle threads, which the soft-float-everywhere kernel
-    // discipline never dirties).
+    // area before any other CPU can observe this thread as no-longer-current,
+    // then load the incoming thread's state into the live registers. The
+    // x86-64 path is eager (unconditional XSAVE + XRSTOR here); the RISC-V
+    // path keeps lazy FS/VS trap restore so `switch_in_restore` is a no-op
+    // there. Both calls no-op for kernel-only / idle threads (extended.area
+    // is null on those TCBs).
     if !current.is_null()
     {
-        // SAFETY: ring-0 with interrupts disabled and the scheduler
-        // lock held; arch fpu::switch_out_save handles the per-arch
-        // save discipline (XSAVEOPT on x86-64, FS/VS-dirty checks plus
-        // trap-frame FS/VS clear on RISC-V) and re-arms the lazy trap.
+        // SAFETY: ring-0 with interrupts disabled and the scheduler lock
+        // held; arch fpu::switch_out_save handles the per-arch save.
         unsafe {
             crate::arch::current::fpu::switch_out_save(current);
+        }
+    }
+    if !next.is_null()
+    {
+        // SAFETY: ring-0 with interrupts disabled and the scheduler lock
+        // held; arch fpu::switch_in_restore handles the per-arch restore.
+        unsafe {
+            crate::arch::current::fpu::switch_in_restore(next);
         }
     }
 

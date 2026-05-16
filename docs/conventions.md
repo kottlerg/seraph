@@ -121,6 +121,34 @@ are forbidden; `master` MUST NOT receive force pushes.
 
 `feature/<slug>`, `fix/<slug>`, `cleanup/<slug>`, `audit/<slug>` — matching the Class labels above.
 
+### Merge method
+
+`master` accepts merge commits only; rebase and squash merge are disabled
+at the repo level. Merge via the GitHub web UI ("Create a merge commit")
+or `gh pr merge <N> --merge --delete-branch`. `git log --first-parent master`
+gives the PR-level linear view.
+
+### Branch protection
+
+`master` is protected by a GitHub branch protection rule enforcing:
+
+- Pull request required before merging.
+- Required status checks (strict, branch up-to-date): `host-tests`,
+  `validate (x86_64, debug)`, `validate (x86_64, release)`,
+  `validate (riscv64, debug)`, `validate (riscv64, release)`.
+- Required signed commits.
+- Force pushes blocked.
+- Branch deletion blocked.
+- Rules enforced for administrators.
+
+### PR-body checklist discipline
+
+- PRs are opened from `.github/pull_request_template.md`.
+- Before merge, every `- [ ]` in the PR body MUST be `- [x]` or removed
+  with a one-line rationale in the same edit. Same shape as the Issue
+  acceptance rule under "Backlog Tracking" above.
+- Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
+
 ## CI Workflows
 
 | Workflow file | Trigger | Purpose |

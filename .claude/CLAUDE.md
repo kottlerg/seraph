@@ -44,8 +44,16 @@ truth for "how work is tracked and shipped" on this project.
   `gh pr checks <N> --watch` (or `gh run watch <run-id>`) as a backgrounded
   `Bash` invocation (`run_in_background: true`). Do not poll, do not sleep —
   the harness notifies on completion.
-- On green: confirm the pass to the user in one line, then proceed (or
-  prompt for merge approval if not yet merged).
+- On green: confirm the pass in one line, then run the pre-merge audit
+  before prompting for merge:
+  1. `gh pr view <N> --json body`. Every `- [ ]` in the PR body MUST be
+     `- [x]` or removed with rationale. List any unticked items to the
+     user and resolve them (`gh pr edit`) before continuing.
+  2. For each `Closes #N` / `Fixes #N` in the PR body, `gh issue view <N>
+     --json body`. Every `- [ ]` under `## Acceptance` MUST be `- [x]` or
+     dropped with rationale. Resolve via `gh issue edit`.
+  3. Only after the audit clears, prompt the user for the merge decision.
+     Merge via `gh pr merge <N> --merge --delete-branch`.
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.
 - The assistant MUST NOT merge a PR while its CI run is pending or failing.

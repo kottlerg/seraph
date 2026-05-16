@@ -28,6 +28,7 @@ members = [
     "shared/registry",
     "shared/shmem",
     "base/crasher",
+    "base/fsbench",
     "base/hello",
     "base/pipefault",
     "base/stackoverflow",

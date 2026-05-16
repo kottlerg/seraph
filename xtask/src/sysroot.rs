@@ -92,6 +92,7 @@ pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
     }
 
     synthesise_usertest_large_bin(ctx)?;
+    synthesise_usertest_bench_bin(ctx)?;
 
     Ok(())
 }
@@ -132,6 +133,36 @@ fn synthesise_usertest_large_bin(ctx: &BuildContext) -> Result<()>
     buf.truncate(total);
     fs::write(&dst, &buf).with_context(|| format!("writing {}", dst.display()))?;
     step(&format!("Rootfs: {} (synthesised, 16 KiB)", dst.display()));
+    Ok(())
+}
+
+const USERTEST_BENCH_BIN_SIZE: usize = 65536;
+
+/// Emit `/usertest/bench.bin`, a 64 KiB deterministic fixture consumed by
+/// `fsbench` (the FS_READ vs FS_READ_FRAME crossover benchmark). Filled
+/// with a byte-position-derived pattern so any read-path corruption shows
+/// up as a content mismatch at the byte level. Gitignored and treated as
+/// a build artifact, same pattern as `large.bin`.
+fn synthesise_usertest_bench_bin(ctx: &BuildContext) -> Result<()>
+{
+    let dst = ctx.sysroot.join("usertest/bench.bin");
+    if dst.exists()
+    {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent()
+    {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut buf = Vec::with_capacity(USERTEST_BENCH_BIN_SIZE);
+    for i in 0..USERTEST_BENCH_BIN_SIZE
+    {
+        #[allow(clippy::cast_possible_truncation)]
+        let b = (i & 0xFF) as u8;
+        buf.push(b);
+    }
+    fs::write(&dst, &buf).with_context(|| format!("writing {}", dst.display()))?;
+    step(&format!("Rootfs: {} (synthesised, 64 KiB)", dst.display()));
     Ok(())
 }
 

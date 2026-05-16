@@ -18,10 +18,11 @@ use crate::util::step;
 
 const SECTOR_SIZE: u64 = 512;
 
-/// Both partitions are 128 MiB. Debug binaries have grown (usertest added
-/// alloc-crate codegen, bringing total ESP contents close to the old 64 MiB
-/// limit); release builds remain comfortable well under half of this.
-const PARTITION_SIZE: u64 = 128 * 1024 * 1024;
+/// Both partitions are 192 MiB. Debug binaries each weigh ~14 MiB; the root
+/// partition holds ~10 of them plus fixtures, so 128 MiB was insufficient
+/// once `fsbench` was added. Release builds remain comfortable well under
+/// half of this.
+const PARTITION_SIZE: u64 = 192 * 1024 * 1024;
 
 /// First partition starts at LBA 2048 (1 MiB alignment, standard GPT practice).
 const ESP_START_LBA: u64 = 2048;

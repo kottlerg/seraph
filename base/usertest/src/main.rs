@@ -130,6 +130,7 @@ fn main()
     ns_mount_boundary_phase();
     fs_open_phase();
     fs_release_on_close_phase();
+    fs_crossover_bench_phase();
     fs_rights_attenuation_phase();
     ns_multi_component_phase();
     ns_sandbox_phase();
@@ -728,6 +729,27 @@ fn fs_release_on_close_phase()
     }
 
     std::os::seraph::log!("fs_release_on_close phase passed (8 cycles)");
+}
+
+/// Spawn `/bin/fsbench` and surface its per-(size, path) cycle counts in
+/// the boot log. fsbench measures the cost of reading `/usertest/bench.bin`
+/// via the inline `FS_READ` path versus the zero-copy `FS_READ_FRAME` path
+/// across the size grid called out in issue #10. The numbers inform the
+/// `READ_INLINE_THRESHOLD` constant at
+/// `runtime/ruststd/src/sys/fs/seraph.rs`.
+///
+/// Asserts on child exit status only; the actual measurements appear in
+/// the serial log under the `[fsbench]` name.
+fn fs_crossover_bench_phase()
+{
+    use std::process::Command;
+
+    let mut child = Command::new("/bin/fsbench")
+        .spawn()
+        .expect("spawn /bin/fsbench failed");
+    let status = child.wait().expect("fsbench wait failed");
+    assert!(status.success(), "fsbench did not exit cleanly: {status}");
+    std::os::seraph::log!("fs_crossover_bench phase passed");
 }
 
 /// Verify F2: fatfs node-cap handlers enforce namespace rights bits.

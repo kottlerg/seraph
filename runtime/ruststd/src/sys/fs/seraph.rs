@@ -67,6 +67,20 @@ use release_handler::{FileEntry, OutstandingMapping};
 
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
+/// Per-call crossover threshold between the inline FS_READ path and the
+/// zero-copy FS_READ_FRAME path. A `read()` of at most this many bytes
+/// that also fits within the current page goes inline; anything larger
+/// or page-straddling takes the frame path.
+///
+/// 504 is the FS_READ IPC reply ceiling: 63 data words × 8 bytes minus
+/// the 8-byte length prefix in word 0 (`abi/syscall/MSG_DATA_WORDS_MAX`).
+/// At or below this size, a single FS_READ carries the bytes. The
+/// `fsbench` numbers in `services/fs/docs/fs-driver-protocol.md` show
+/// inline is roughly 2× cheaper per call on both x86_64 and riscv64,
+/// so 504 also happens to be the smallest size at which any larger
+/// would force ≥ 2 inline calls and lose to one frame call.
+const READ_INLINE_THRESHOLD: usize = 504;
+
 // ── Public type stubs ─────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -619,12 +633,15 @@ impl File
         let want = (buf.len() as u64).min(remaining) as usize;
 
         // Inline path: small reads or page-tail reads that don't cross a
-        // page boundary. The 504-byte inline ceiling matches what fs's
-        // FS_READ handler can fit in one IPC reply (63 data words ×
-        // 8 bytes = 504, minus the 8-byte length prefix in word 0).
+        // page boundary. Threshold equals the FS_READ IPC payload
+        // ceiling: 63 data words × 8 bytes = 504, minus the 8-byte
+        // length prefix in word 0. Above this a single inline reply
+        // cannot carry the bytes; below this the per-call cost is
+        // strictly cheaper than the frame path on both x86_64 and
+        // riscv64 (≈ 2× factor; see fsbench numbers recorded in
+        // `services/fs/docs/fs-driver-protocol.md`).
         let page_off = (pos % PAGE_SIZE) as usize;
-        const INLINE_MAX: usize = 504;
-        if want <= INLINE_MAX && page_off + want <= PAGE_SIZE_USIZE
+        if want <= READ_INLINE_THRESHOLD && page_off + want <= PAGE_SIZE_USIZE
         {
             return self.read_inline(buf, pos, want);
         }

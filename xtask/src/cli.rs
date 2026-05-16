@@ -93,6 +93,7 @@ pub enum BuildComponent
     Usertest,
     Svcmgr,
     Pwrmgr,
+    Timed,
     Hello,
     Fsbench,
     Pipefault,

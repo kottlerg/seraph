@@ -169,6 +169,12 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "timed",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::EfiSeraph,
+        arch_only: None,
+    },
+    Spec {
         name: "hello",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
@@ -220,6 +226,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Usertest => "usertest",
         BuildComponent::Svcmgr => "svcmgr",
         BuildComponent::Pwrmgr => "pwrmgr",
+        BuildComponent::Timed => "timed",
         BuildComponent::Hello => "hello",
         BuildComponent::Fsbench => "fsbench",
         BuildComponent::Stackoverflow => "stackoverflow",

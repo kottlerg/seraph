@@ -11,6 +11,7 @@ members = [
     "services/devmgr",
     "services/logd",
     "services/pwrmgr",
+    "services/timed",
     "services/vfsd",
     "services/drivers/cmos",
     "services/drivers/goldfish-rtc",

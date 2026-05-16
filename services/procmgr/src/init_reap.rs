@@ -79,15 +79,36 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
     let caps = req.caps();
     let is_first = req.word(0) != 0;
     let mut guard = STATE.lock().expect("init-reap state poisoned");
+
+    // Shared invariant for the error arms below: caps the kernel just
+    // moved into procmgr's CSpace cannot be `cap_delete`d here.
+    //   * AddressSpace caps would trip `dealloc_object`'s
+    //     `active_cpu_mask == 0` assert — init's threads are still
+    //     running on that AS while this IPC is in flight.
+    //   * Frame caps (donation rounds) would buddy-free pages that
+    //     init's still-live AS has mapped, recreating the very
+    //     aliasing window the reap ordering exists to prevent.
+    // Init is the sole legitimate caller, all reject arms are
+    // unreachable in well-formed traffic, and on the reject path init
+    // observes the error reply and aborts. The orphaned caps are a
+    // one-shot leak on a failure-only path.
+
     if is_first
     {
         if guard.is_some()
         {
+            std::os::seraph::log!(
+                "init-reap: duplicate first round; refusing (caps leaked in procmgr)"
+            );
             reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
             return;
         }
         if caps.len() != 4
         {
+            std::os::seraph::log!(
+                "init-reap: first round expected 4 caps, got {}; refusing (caps leaked in procmgr)",
+                caps.len(),
+            );
             reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
             return;
         }
@@ -102,21 +123,6 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
         )
         .is_err()
         {
-            // Bind failed. We CANNOT cap_delete the moved-in
-            // AS/CSpace/Thread caps here: procmgr now holds the last
-            // reference, and init's threads are still actively
-            // running on the AS (we are mid-IPC). Dealloc would trip
-            // the `active_cpu_mask == 0` assert at
-            // `core/kernel/src/cap/object.rs` AddressSpace arm.
-            //
-            // Reply ERROR and leave the caps held in procmgr. Init
-            // observes the failure and aborts the handoff
-            // (`services/init/src/service.rs:handoff_to_procmgr_reap`),
-            // then `sys_thread_exit`s. The orphaned caps are a small
-            // one-shot leak on this failure-only path; the underlying
-            // bind error indicates a deeper problem (kernel out of
-            // observer slots) that warrants log + continue rather
-            // than recursive teardown.
             std::os::seraph::log!(
                 "init-reap: thread_bind_notification failed; refusing handoff (caps leaked in procmgr)"
             );
@@ -138,6 +144,10 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
     let Some(state) = guard.as_mut()
     else
     {
+        std::os::seraph::log!(
+            "init-reap: donation round without prior first round; refusing ({} caps leaked in procmgr)",
+            caps.len(),
+        );
         reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
@@ -150,15 +160,26 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
 
 /// Handle `INIT_TEARDOWN_DONE`. Marks the state machine armed; the
 /// next death-EQ event with `INIT_REAP_CORRELATOR` triggers `run_reap`.
+///
+/// Rejects when state is `None` (no preceding first round) or when
+/// already armed (re-arm is meaningless and signals a malformed
+/// caller).
 pub fn handle_done(ipc_buf: *mut u64)
 {
     let mut guard = STATE.lock().expect("init-reap state poisoned");
     let Some(state) = guard.as_mut()
     else
     {
+        std::os::seraph::log!("init-reap: DONE without prior first round; refusing");
         reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    if state.armed
+    {
+        std::os::seraph::log!("init-reap: DONE called while already armed; refusing");
+        reply(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
     state.armed = true;
     reply(ipc_buf, procmgr_errors::SUCCESS);
 }

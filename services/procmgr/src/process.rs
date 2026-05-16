@@ -100,16 +100,29 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
     {
         return false;
     }
+    // Commit semantics: this function returns `true` whenever the cap
+    // becomes the registered logd death-EQ (atomic stored). The caller
+    // contract is "false ⇒ cap_delete on the just-transferred slot;
+    // true ⇒ slot is now owned by procmgr". A partial bind failure
+    // CANNOT roll back successful binds — the kernel has no
+    // thread-unbind syscall — so we commit unconditionally once
+    // first-wins passes. Any failed-bind entry is logged; logd will
+    // not receive a death event for it (procmgr's own observer still
+    // does, so memmgr accounting is unaffected). In practice
+    // `finalize_creation` registers logd-EQ at every spawn going
+    // forward; only the pre-existing table is subject to this.
     LOGD_DEATH_EQ.store(logd_eq, std::sync::atomic::Ordering::Release);
-    let mut ok = true;
     table.for_each(|entry| {
         let correlator = entry.token as u32;
         if syscall::thread_bind_notification(entry.thread_cap, logd_eq, correlator).is_err()
         {
-            ok = false;
+            std::os::seraph::log!(
+                "install_logd_death_eq: bind failed for entry token={} (logd will miss its death event; procmgr observer unaffected)",
+                entry.token,
+            );
         }
     });
-    ok
+    true
 }
 
 /// Maximum concurrent child processes procmgr tracks.
@@ -715,10 +728,23 @@ fn populate_child_info(
     pi.procmgr_endpoint_cap = procmgr_ep_in_child;
     pi.memmgr_endpoint_cap = if universals.memmgr_endpoint != 0
     {
-        // SEND_GRANT so the child can attach memmgr's tokened SEND to
-        // outgoing messages it makes on the same endpoint (no current
-        // protocol exercises that capability, but the rights mirror
-        // `procmgr_endpoint_cap`'s shape).
+        // Plain `cap_copy` here is structurally safe — and
+        // intentionally asymmetric with the
+        // `cap_derive_token(..., process_token)` shape used for
+        // `procmgr_endpoint_cap` just above. The reason:
+        // `universals.memmgr_endpoint` is the per-child tokened cap
+        // memmgr minted in its `REGISTER_PROCESS` handler at
+        // `services/memmgr/src/main.rs:781`
+        // (`cap_derive_token(service_ep, SEND_GRANT, new_token)`),
+        // returned via IPC in `register_with_memmgr`
+        // (`services/procmgr/src/main.rs:222-244`). The source is
+        // already kernel-tokened with a memmgr-private per-child
+        // value; `cap_copy` propagates the token to the child slot.
+        // Children therefore cannot `sys_cap_derive_token` to mint a
+        // privileged twin on memmgr's endpoint (the `src_token != 0`
+        // rejection applies). SEND_GRANT lets the child grant onward;
+        // no current protocol uses that, mirrored shape with
+        // `procmgr_endpoint_cap`.
         syscall::cap_copy(
             universals.memmgr_endpoint,
             child_cspace,

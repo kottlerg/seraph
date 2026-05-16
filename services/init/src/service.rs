@@ -1601,7 +1601,22 @@ fn handoff_to_procmgr_reap(
         }
         let msg = builder.build();
         // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
-        let _ = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) };
+        match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) }
+        {
+            Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
+            {}
+            Ok(reply) => log(
+                if reply.label == ipc::procmgr_errors::INVALID_ARGUMENT
+                {
+                    "reap-handoff: donation chunk refused INVALID_ARGUMENT"
+                }
+                else
+                {
+                    "reap-handoff: donation chunk refused (non-success reply)"
+                },
+            ),
+            Err(_) => log("reap-handoff: donation chunk IPC failed"),
+        }
         i = end;
     }
 
@@ -1611,7 +1626,12 @@ fn handoff_to_procmgr_reap(
     // already bound the EQ.)
     let done = IpcMessage::new(procmgr_labels::INIT_TEARDOWN_DONE);
     // SAFETY: ipc_buf is registered.
-    let _ = unsafe { ipc::ipc_call(procmgr_ep, &done, ipc_buf) };
+    match unsafe { ipc::ipc_call(procmgr_ep, &done, ipc_buf) }
+    {
+        Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
+        {}
+        _ => log("reap-handoff: INIT_TEARDOWN_DONE IPC failed (reap may not run)"),
+    }
 }
 
 // ── logd spawn ──────────────────────────────────────────────────────────────

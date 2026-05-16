@@ -12,6 +12,8 @@
 //! - `SYS_IOPORT_BIND` (35): bind an I/O port range to a thread (`x86_64` only).
 //! - `SYS_MMIO_SPLIT` (45): split an `MmioRegion` cap into two sub-regions.
 //! - `SYS_IRQ_SPLIT` (49): split an `Interrupt` range cap into two sub-ranges.
+//! - `SYS_IOPORT_SPLIT` (51): split an `IoPortRange` cap into two sub-ranges
+//!   (`x86_64` only).
 //!
 //! # Adding new hardware syscalls
 //! 1. Add a new `pub fn sys_hw_*` in this file.
@@ -835,6 +837,232 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 #[cfg(test)]
 pub fn sys_irq_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+// ── SYS_IOPORT_SPLIT ─────────────────────────────────────────────────────────
+
+/// `SYS_IOPORT_SPLIT` (51): split an `IoPortRange` cap into two non-overlapping children.
+///
+/// arg0 = `IoPortRange` cap index (must have USE right).
+/// arg1 = `split_at` port number. Must satisfy `base < split_at < base + size`
+///        (with `size == 0` interpreted as full 64K range). The lower child
+///        covers `[base, split_at)`; the upper child covers
+///        `[split_at, base + size)`.
+///
+/// Consumes the original cap and creates two new `IoPortRange` caps with the
+/// same rights, covering the two halves. Both children are reparented to the
+/// original's derivation parent.
+///
+/// On RISC-V: always returns `NotSupported` (no I/O port concept).
+///
+/// Returns `slot1 | (slot2 << 32)` on success.
+// needless_return: the cfg-gated early return is required to terminate the
+// riscv64 path; the x86_64 path follows in the same function body.
+// too_many_lines: mirrors sys_irq_split exactly; the shape is unavoidable.
+#[allow(clippy::needless_return, clippy::too_many_lines)]
+#[cfg(not(test))]
+pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    // RISC-V has no I/O port space.
+    #[cfg(target_arch = "riscv64")]
+    {
+        let _ = tf;
+        return Err(SyscallError::NotSupported);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
+        use crate::cap::object::{
+            IoPortRangeObject, KernelObjectHeader, ObjectType, dealloc_object,
+        };
+        use crate::cap::retype::alloc_in_seed;
+        use crate::cap::seed_header_nn;
+        use crate::cap::slot::{CapTag, Rights, SlotId};
+        use crate::syscall::current_tcb;
+
+        let port_idx = tf.arg(0) as u32;
+        let split_at_raw = tf.arg(1);
+        // arg2 reserved.
+
+        // split_at must be a representable port number in [1, 65535].
+        // 0 cannot be a valid split point (would yield an empty lower half).
+        // 65536+ is out of range entirely.
+        if split_at_raw == 0 || split_at_raw > 0xFFFF
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let split_at = split_at_raw as u32;
+
+        // ── Capability lookup ────────────────────────────────────────────────
+
+        // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+        let tcb = unsafe { current_tcb() };
+        if tcb.is_null()
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+        // SAFETY: tcb validated non-null; cspace set at thread creation.
+        let caller_cspace = unsafe { (*tcb).cspace };
+        if caller_cspace.is_null()
+        {
+            return Err(SyscallError::InvalidCapability);
+        }
+
+        let (base, size_u16, rights, cspace_id, orig_obj_ptr) = {
+            // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+            let slot = unsafe {
+                super::lookup_cap(caller_cspace, port_idx, CapTag::IoPortRange, Rights::USE)
+            }?;
+            let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
+            // SAFETY: tag confirmed IoPortRange; pointer is valid IoPortRangeObject.
+            #[allow(clippy::cast_ptr_alignment)]
+            let po = unsafe { &*(obj_ptr.as_ptr().cast::<IoPortRangeObject>()) };
+            // SAFETY: caller_cspace validated non-null; id() reads discriminator.
+            let cspace_id = unsafe { (*caller_cspace).id() };
+            (po.base, po.size, slot.rights, cspace_id, obj_ptr)
+        };
+
+        // ── Validation ───────────────────────────────────────────────────────
+
+        // size == 0 encodes the full 64K range; matches sys_ioport_bind's
+        // effective_size handling at the top of this file.
+        let effective_size: u32 = if size_u16 == 0
+        {
+            65536
+        }
+        else
+        {
+            u32::from(size_u16)
+        };
+        let base_u32 = u32::from(base);
+        let end = base_u32 + effective_size;
+
+        // split_at must lie strictly inside the cap's range.
+        if split_at <= base_u32 || split_at >= end
+        {
+            return Err(SyscallError::InvalidArgument);
+        }
+
+        // ── Create two child IoPortRangeObjects ─────────────────────────────
+        //
+        // Both halves are guaranteed u16-representable because:
+        //   lower_count = split_at - base_u32, where 1 <= split_at - base_u32 < 65536
+        //   upper_count = end - split_at,     where 1 <= end - split_at      <= 65535
+        // (Neither half can be the full 65536; the split is strict.)
+
+        let lower_count: u16 = (split_at - base_u32) as u16;
+        let upper_count: u16 = (end - split_at) as u16;
+        let split_at_u16: u16 = split_at as u16;
+
+        let child1_ptr = alloc_in_seed(IoPortRangeObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::IoPortRange, seed_header_nn()),
+            base,
+            size: lower_count,
+            _pad: 0,
+        })?;
+
+        let child2_ptr = match alloc_in_seed(IoPortRangeObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::IoPortRange, seed_header_nn()),
+            base: split_at_u16,
+            size: upper_count,
+            _pad: 0,
+        })
+        {
+            Ok(p) => p,
+            Err(e) =>
+            {
+                // SAFETY: child1_ptr is a freshly-allocated SEED-backed body
+                // with refcount 1 and not yet inserted into any CSpace.
+                unsafe { dealloc_object(child1_ptr) };
+                return Err(e);
+            }
+        };
+
+        // Insert both children into the caller's CSpace under cspace.lock.
+        // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
+        let slot1_nz = unsafe {
+            let saved = (*caller_cspace).lock.lock_raw();
+            let r = (*caller_cspace).insert_cap(CapTag::IoPortRange, rights, child1_ptr);
+            (*caller_cspace).lock.unlock_raw(saved);
+            r
+        }
+        .map_err(|_| SyscallError::OutOfMemory)?;
+        let slot1 = slot1_nz.get();
+        // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
+        let slot2_nz = unsafe {
+            let saved = (*caller_cspace).lock.lock_raw();
+            let r = (*caller_cspace).insert_cap(CapTag::IoPortRange, rights, child2_ptr);
+            (*caller_cspace).lock.unlock_raw(saved);
+            r
+        }
+        .map_err(|_| {
+            // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
+            unsafe {
+                let saved = (*caller_cspace).lock.lock_raw();
+                (*caller_cspace).free_slot(slot1);
+                (*caller_cspace).lock.unlock_raw(saved);
+            }
+            // SAFETY: child1_ptr just allocated above; ref count is 1.
+            unsafe { dealloc_object(child1_ptr) };
+            SyscallError::OutOfMemory
+        })?;
+        let slot2 = slot2_nz.get();
+
+        // ── Wire derivation tree ─────────────────────────────────────────────
+
+        let port_idx_nz =
+            core::num::NonZeroU32::new(port_idx).ok_or(SyscallError::InvalidCapability)?;
+
+        DERIVATION_LOCK.write_lock();
+
+        let orig_node = SlotId::new(cspace_id, port_idx_nz);
+        let child1_id = SlotId::new(cspace_id, slot1_nz);
+        let child2_id = SlotId::new(cspace_id, slot2_nz);
+
+        // SAFETY: caller_cspace validated; port_idx within CSpace bounds.
+        let orig_parent = unsafe { (*caller_cspace).slot(port_idx).and_then(|s| s.deriv_parent) };
+
+        // SAFETY: DERIVATION_LOCK held; orig_node/orig_parent valid.
+        unsafe { reparent_children(orig_node, orig_parent) };
+        // SAFETY: DERIVATION_LOCK held; orig_node valid.
+        unsafe { unlink_node(orig_node) };
+
+        if let Some(parent_id) = orig_parent
+        {
+            // SAFETY: DERIVATION_LOCK held; parent_id/child1_id/child2_id valid.
+            unsafe { link_child(parent_id, child1_id) };
+            // SAFETY: DERIVATION_LOCK held; parent_id/child2_id valid.
+            unsafe { link_child(parent_id, child2_id) };
+        }
+
+        DERIVATION_LOCK.write_unlock();
+
+        // ── Consume the original cap ─────────────────────────────────────────
+
+        // SAFETY: caller_cspace validated; port_idx within CSpace bounds.
+        unsafe {
+            let saved = (*caller_cspace).lock.lock_raw();
+            (*caller_cspace).free_slot(port_idx);
+            (*caller_cspace).lock.unlock_raw(saved);
+        }
+
+        // SAFETY: orig_obj_ptr from lookup_cap; object still valid (ref > 0 at lookup).
+        let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };
+        if remaining == 0
+        {
+            // SAFETY: ref count reached zero; no other references exist.
+            unsafe { dealloc_object(orig_obj_ptr) };
+        }
+
+        Ok(u64::from(slot1) | (u64::from(slot2) << 32))
+    }
+}
+
+#[cfg(test)]
+pub fn sys_ioport_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

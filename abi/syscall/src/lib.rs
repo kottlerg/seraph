@@ -297,6 +297,8 @@ pub const SYS_CAP_DERIVE_TOKEN: u64 = 48;
 pub const SYS_IRQ_SPLIT: u64 = 49;
 /// Merge two adjacent sibling Frame caps into one covering both ranges.
 pub const SYS_FRAME_MERGE: u64 = 50;
+/// Split an `IoPortRange` cap into two non-overlapping children (`x86_64` only).
+pub const SYS_IOPORT_SPLIT: u64 = 51;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 

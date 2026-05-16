@@ -44,13 +44,13 @@ use syscall_abi::{
     SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
     SYS_CAP_DERIVE_TOKEN, SYS_CAP_INFO, SYS_CAP_INSERT, SYS_CAP_MOVE, SYS_CAP_REVOKE,
     SYS_EVENT_POST, SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND,
-    SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER,
-    SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
-    SYS_SBI_CALL, SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT,
+    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
+    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP,
+    SYS_MMIO_SPLIT, SYS_SBI_CALL, SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO,
+    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS,
+    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
 };
 
 pub use syscall_abi::{
@@ -1107,6 +1107,45 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; kernel validates cap and split point.
     let ret = unsafe { syscall3(SYS_IRQ_SPLIT, u64::from(irq_cap), u64::from(split_at), 0) };
+    if ret < 0
+    {
+        Err(ret)
+    }
+    else
+    {
+        let v = ret as u64;
+        Ok(((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32))
+    }
+}
+
+/// Split an `IoPortRange` cap into two non-overlapping children.
+///
+/// `split_at` is the first port of the upper child (and the exclusive upper
+/// bound of the lower child); it must satisfy `base < split_at < base + size`
+/// on the cap being split, with `size == 0` interpreted as the full 64K
+/// range. The original cap is revoked on success; both children inherit the
+/// parent's rights. Returns packed `(lower_slot, upper_slot)`.
+///
+/// On RISC-V: always returns `NotSupported`.
+///
+/// # Errors
+/// Returns a negative `i64` error code if the cap is invalid, `split_at`
+/// falls outside the cap's range, or the syscall is not supported on this
+/// architecture.
+// cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[inline]
+pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
+{
+    // SAFETY: syscall3 issues raw syscall instruction; kernel validates cap and split point.
+    let ret = unsafe {
+        syscall3(
+            SYS_IOPORT_SPLIT,
+            u64::from(ioport_cap),
+            u64::from(split_at),
+            0,
+        )
+    };
     if ret < 0
     {
         Err(ret)

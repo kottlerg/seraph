@@ -1271,8 +1271,15 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Look up source cap — accept Endpoint, Signal, or EventQueue.
     // We must accept any of the three tags, so we read the slot directly
     // instead of calling lookup_cap (which checks a single expected tag).
+    //
+    // The third tuple element is the wrapper's `KernelObjectHeader` pointer
+    // (header sits at offset 0 of each `#[repr(C)]` source wrapper). Wait-set
+    // membership owns a +1 cap-level reference on this header; the inc_ref
+    // call below — and the matching dec_ref in `sys_wait_set_remove`,
+    // `wait_set_drop`, and the source-side dealloc invariant — keep the
+    // source alive while any member references it.
     // SAFETY: cspace_ptr validated above.
-    let (source_ptr, source_tag) = unsafe {
+    let (source_ptr, source_tag, source_header) = unsafe {
         let cs = &*cspace_ptr;
         let src_slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
         match src_slot.tag
@@ -1291,7 +1298,8 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep_obj = obj_ptr.cast::<crate::cap::object::EndpointObject>();
                 let ep_state = (*ep_obj).state.cast::<u8>();
-                (ep_state, WaitSetSourceTag::Endpoint)
+                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
+                (ep_state, WaitSetSourceTag::Endpoint, header)
             }
             CapTag::Signal =>
             {
@@ -1307,7 +1315,8 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig_obj = obj_ptr.cast::<crate::cap::object::SignalObject>();
                 let sig_state = (*sig_obj).state.cast::<u8>();
-                (sig_state, WaitSetSourceTag::Signal)
+                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
+                (sig_state, WaitSetSourceTag::Signal, header)
             }
             CapTag::EventQueue =>
             {
@@ -1323,7 +1332,8 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq_obj = obj_ptr.cast::<crate::cap::object::EventQueueObject>();
                 let eq_state = (*eq_obj).state.cast::<u8>();
-                (eq_state, WaitSetSourceTag::EventQueue)
+                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
+                (eq_state, WaitSetSourceTag::EventQueue, header)
             }
             _ => return Err(SyscallError::InvalidCapability),
         }
@@ -1331,12 +1341,12 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Hold source.lock outer for the entire registration sequence:
     // duplicate-registration check, waitset_add (which takes ws.lock
-    // INNER — see WaitSetState::lock for the ordering rationale), and
-    // the back-pointer write must all be atomic from the source's
-    // perspective. Otherwise signal_send / event_post / endpoint_call
-    // could read a partially-installed back-pointer and call into
-    // waitset_notify with an unregistered member, or skip the notify
-    // when the source is in fact ready.
+    // INNER — see WaitSetState::lock for the ordering rationale), the
+    // back-pointer write, and the +1 inc_ref on the source's header must
+    // all be atomic from the source's perspective. Otherwise signal_send
+    // / event_post / endpoint_call could read a partially-installed
+    // back-pointer and call into waitset_notify with an unregistered
+    // member, or skip the notify when the source is in fact ready.
     //
     // SAFETY: source_ptr extracted from validated cap; member_idx returned
     // from waitset_add. Lock acquired and released for each branch; the
@@ -1359,6 +1369,9 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                         {
                             (*ep).wait_set = ws_state.cast::<u8>();
                             (*ep).wait_set_member_idx = idx;
+                            // +1 cap-level ref pins this source for as long
+                            // as the wait set holds the member.
+                            (*source_header).inc_ref();
                             Ok(idx)
                         }
                         Err(()) => Err(SyscallError::InvalidArgument),
@@ -1388,6 +1401,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                             (*sig)
                                 .has_observer
                                 .store(1, core::sync::atomic::Ordering::Relaxed);
+                            (*source_header).inc_ref();
                             Ok(idx)
                         }
                         Err(()) => Err(SyscallError::InvalidArgument),
@@ -1414,6 +1428,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                         {
                             (*eq).wait_set = ws_state.cast::<u8>();
                             (*eq).wait_set_member_idx = idx;
+                            (*source_header).inc_ref();
                             Ok(idx)
                         }
                         Err(()) => Err(SyscallError::InvalidArgument),
@@ -1477,9 +1492,13 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*ws_obj).state
     };
 
-    // Look up source to get its raw state pointer.
+    // Look up source to get its raw state pointer and wrapper header.
+    // The header is needed for the `-1 dec_ref` that pairs with `sys_wait_set_add`'s
+    // `inc_ref`; it is performed under source.lock together with the back-pointer
+    // clear so a single critical section detaches the member from every wait-set
+    // observation path.
     // SAFETY: cspace_ptr validated above.
-    let (source_ptr, source_tag) = unsafe {
+    let (source_ptr, source_tag, source_header) = unsafe {
         let cs = &*cspace_ptr;
         let src_slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
         match src_slot.tag
@@ -1493,7 +1512,12 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
                 #[allow(clippy::cast_ptr_alignment)]
                 let ep_obj = obj_ptr.cast::<crate::cap::object::EndpointObject>();
-                ((*ep_obj).state.cast::<u8>(), WaitSetSourceTag::Endpoint)
+                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
+                (
+                    (*ep_obj).state.cast::<u8>(),
+                    WaitSetSourceTag::Endpoint,
+                    header,
+                )
             }
             CapTag::Signal =>
             {
@@ -1504,7 +1528,12 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
                 #[allow(clippy::cast_ptr_alignment)]
                 let sig_obj = obj_ptr.cast::<crate::cap::object::SignalObject>();
-                ((*sig_obj).state.cast::<u8>(), WaitSetSourceTag::Signal)
+                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
+                (
+                    (*sig_obj).state.cast::<u8>(),
+                    WaitSetSourceTag::Signal,
+                    header,
+                )
             }
             CapTag::EventQueue =>
             {
@@ -1515,15 +1544,22 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq_obj = obj_ptr.cast::<crate::cap::object::EventQueueObject>();
-                ((*eq_obj).state.cast::<u8>(), WaitSetSourceTag::EventQueue)
+                let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
+                (
+                    (*eq_obj).state.cast::<u8>(),
+                    WaitSetSourceTag::EventQueue,
+                    header,
+                )
             }
             _ => return Err(SyscallError::InvalidCapability),
         }
     };
 
-    // Hold source.lock outer for both waitset_remove (ws.lock INNER) and
-    // the back-pointer clear, mirroring the lock order in sys_wait_set_add
-    // and signal_send → waitset_notify.
+    // Hold source.lock outer for waitset_remove (ws.lock INNER), the
+    // back-pointer clear, and the dec_ref of the wait-set's +1 reference,
+    // mirroring the lock order in sys_wait_set_add. The caller still holds
+    // their own cap to the source, so dec_ref cannot drop the refcount to
+    // zero here — debug_assert verifies the invariant.
     //
     // SAFETY: source_ptr extracted from validated cap.
     let remove_result = unsafe {
@@ -1540,6 +1576,11 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 {
                     (*ep).wait_set = core::ptr::null_mut();
                     (*ep).wait_set_member_idx = 0;
+                    let remaining = (*source_header).dec_ref();
+                    debug_assert!(
+                        remaining > 0,
+                        "wait-set dec_ref drained source while caller still holds cap"
+                    );
                 }
                 (*ep).lock.unlock_raw(saved);
                 res
@@ -1560,6 +1601,11 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                         u8::from(!(*sig).waiter.is_null()),
                         core::sync::atomic::Ordering::Relaxed,
                     );
+                    let remaining = (*source_header).dec_ref();
+                    debug_assert!(
+                        remaining > 0,
+                        "wait-set dec_ref drained source while caller still holds cap"
+                    );
                 }
                 (*sig).lock.unlock_raw(saved);
                 res
@@ -1575,6 +1621,11 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 {
                     (*eq).wait_set = core::ptr::null_mut();
                     (*eq).wait_set_member_idx = 0;
+                    let remaining = (*source_header).dec_ref();
+                    debug_assert!(
+                        remaining > 0,
+                        "wait-set dec_ref drained source while caller still holds cap"
+                    );
                 }
                 (*eq).lock.unlock_raw(saved);
                 res

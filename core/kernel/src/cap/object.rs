@@ -925,8 +925,12 @@ pub unsafe fn dealloc_object(ptr: core::ptr::NonNull<KernelObjectHeader>)
 {
     /// Maximum nested-cascade depth handled. Real-world derivation chains
     /// (memmgr-frame → child-bootstrap split → kernel object) sit at depth
-    /// `<= 4`; sixteen is generous headroom that fits on the kernel stack.
-    const MAX_CASCADE: usize = 16;
+    /// `<= 4`; the `WaitSet` arm can additionally fan out to
+    /// `WAIT_SET_MAX_MEMBERS` (= 16) source headers in one pop when their
+    /// final +1 cap-level ref came from wait-set membership, so headroom is
+    /// sized to absorb the fan-out plus the wait-set's own ancestor frame.
+    /// Thirty-two entries fit comfortably on the kernel stack (256 B).
+    const MAX_CASCADE: usize = 32;
 
     let mut worklist: [Option<core::ptr::NonNull<KernelObjectHeader>>; MAX_CASCADE] =
         [None; MAX_CASCADE];
@@ -1747,21 +1751,18 @@ unsafe fn dealloc_object_one(
 
             if !state.is_null()
             {
-                // Unregister from wait set before freeing state.
+                // Wait-set membership holds a +1 cap-level ref on the source
+                // (see `sys_wait_set_add` / `wait_set_drop`); when an
+                // Endpoint reaches dealloc, its refcount is zero, which
+                // implies no wait-set member references it, which implies
+                // `wait_set` is null. The contract is verified here.
                 // SAFETY: state validated non-null; EndpointState allocated at creation.
-                unsafe {
-                    let ep = &mut *state;
-                    if !ep.wait_set.is_null()
-                    {
-                        // cast_ptr_alignment: ep.wait_set stores a type-erased *mut WaitSetState;
-                        // the original allocation guarantees the alignment.
-                        #[allow(clippy::cast_ptr_alignment)]
-                        let ws = ep.wait_set.cast::<crate::ipc::wait_set::WaitSetState>();
-                        let _ = crate::ipc::wait_set::waitset_remove(ws, state.cast::<u8>());
-                        ep.wait_set = core::ptr::null_mut();
-                        ep.wait_set_member_idx = 0;
-                    }
-                }
+                let wait_set_clear = unsafe { (*state).wait_set.is_null() };
+                debug_assert!(
+                    wait_set_clear,
+                    "Endpoint dealloc with live wait-set membership — \
+                     refcount invariant broken"
+                );
 
                 // Drain blocked senders and receivers with a zero return value.
                 // They will wake up and resume from sys_ipc_call / sys_ipc_recv,
@@ -1879,22 +1880,17 @@ unsafe fn dealloc_object_one(
                     crate::arch::current::cpu::restore_interrupts(saved);
                 }
 
-                // Unregister from wait set BEFORE freeing state. If registered
-                // with a wait set, the wait set's member array still holds a
-                // source_ptr to this SignalState; failing to remove it causes
-                // wait_set_drop to write to freed memory.
+                // Wait-set membership holds a +1 cap-level ref on the source
+                // (see `sys_wait_set_add` / `wait_set_drop`); reaching dealloc
+                // with `wait_set` still set means the refcount invariant is
+                // broken.
                 // SAFETY: state validated non-null; SignalState live.
-                unsafe {
-                    let sig = &mut *state;
-                    if !sig.wait_set.is_null()
-                    {
-                        #[allow(clippy::cast_ptr_alignment)]
-                        let ws = sig.wait_set.cast::<crate::ipc::wait_set::WaitSetState>();
-                        let _ = crate::ipc::wait_set::waitset_remove(ws, state.cast::<u8>());
-                        sig.wait_set = core::ptr::null_mut();
-                        sig.wait_set_member_idx = 0;
-                    }
-                }
+                let wait_set_clear = unsafe { (*state).wait_set.is_null() };
+                debug_assert!(
+                    wait_set_clear,
+                    "Signal dealloc with live wait-set membership — \
+                     refcount invariant broken"
+                );
 
                 // Wake a blocked waiter with wakeup_value = 0.
                 // TODO: return SyscallError::ObjectGone when a proper wakeup
@@ -1979,19 +1975,17 @@ unsafe fn dealloc_object_one(
 
             if !state.is_null()
             {
-                // Unregister from wait set before freeing state.
+                // Wait-set membership holds a +1 cap-level ref on the source
+                // (see `sys_wait_set_add` / `wait_set_drop`); reaching dealloc
+                // with `wait_set` still set means the refcount invariant is
+                // broken.
                 // SAFETY: state non-null; EventQueueState live.
-                unsafe {
-                    let eq = &mut *state;
-                    if !eq.wait_set.is_null()
-                    {
-                        #[allow(clippy::cast_ptr_alignment)]
-                        let ws = eq.wait_set.cast::<crate::ipc::wait_set::WaitSetState>();
-                        let _ = crate::ipc::wait_set::waitset_remove(ws, state.cast::<u8>());
-                        eq.wait_set = core::ptr::null_mut();
-                        eq.wait_set_member_idx = 0;
-                    }
-                }
+                let wait_set_clear = unsafe { (*state).wait_set.is_null() };
+                debug_assert!(
+                    wait_set_clear,
+                    "EventQueue dealloc with live wait-set membership — \
+                     refcount invariant broken"
+                );
 
                 // Wake any blocked waiter with `ObjectGone`. The inline
                 // ring is part of this slot and gets reclaimed below
@@ -2043,10 +2037,19 @@ unsafe fn dealloc_object_one(
 
             if !state.is_null()
             {
-                // wait_set_drop wakes any blocked waiter and clears every
-                // source back-pointer. It does NOT free the state Box itself.
+                // wait_set_drop wakes any blocked waiter, clears every source
+                // back-pointer, and drops the +1 cap-level ref each member
+                // held on its source. Any source whose ref drops to zero is
+                // returned for cascade-reclaim on this worklist — performed
+                // here rather than inside `wait_set_drop` so the source
+                // dealloc runs after every source/ws IPC lock has been
+                // released (see scheduling-internals.md § Lock Hierarchy).
                 // SAFETY: state non-null and live.
-                unsafe { crate::ipc::wait_set::wait_set_drop(state) };
+                let zeroed = unsafe { crate::ipc::wait_set::wait_set_drop(state) };
+                for entry in zeroed.iter().copied().flatten()
+                {
+                    push_ancestor(worklist, head, entry);
+                }
             }
 
             debug_assert!(

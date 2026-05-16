@@ -236,6 +236,14 @@ When a slot is cleared (deletion, revocation), the reference count is decremente
 When it reaches zero, the object is freed to its slab cache. This is the only
 mechanism by which kernel objects are freed — there is no explicit "destroy" syscall.
 
+The same refcount also tracks kernel-internal owners of an object. Wait-set
+membership is one such owner: `sys_wait_set_add` `inc_ref`s the source's
+header under the source's lock together with the back-pointer publication;
+`sys_wait_set_remove` and `wait_set_drop` perform the matching `dec_ref`. The
+source's state therefore outlives every wait-set member referencing it; the
+Endpoint/Signal/EventQueue dealloc arms only `debug_assert` that
+`state.wait_set` is null on entry (the invariant follows from the refcount).
+
 ---
 
 ## Derivation Tree (`cap/derivation.rs`)

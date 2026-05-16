@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 13;
+pub const PROCESS_ABI_VERSION: u32 = 14;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -370,10 +370,28 @@ pub struct ProcessInfo
     /// it merely lets the holder request a freshly-minted tokened cap.
     /// Distributing it widely is therefore harmless.
     ///
-    /// Zero when no logger is reachable (very early boot, processes
-    /// created before the log infrastructure is wired). Logger-using
-    /// callers must tolerate zero (writes silently drop).
-    pub log_discovery_cap: u32,
+    /// `CSpace` slot of a tokened SEND cap on the system log endpoint
+    /// suitable for direct `STREAM_BYTES` / `STREAM_REGISTER_NAME`
+    /// use.
+    ///
+    /// Procmgr derives this cap per spawn via `cap_derive_token` on
+    /// the log endpoint it holds, using the child's procmgr-assigned
+    /// token as the cap's token. Logd sees the same token on every
+    /// IPC the child makes, keys its per-sender slot map by it, and
+    /// matches it directly against the death-notification correlator
+    /// procmgr posts on child exit.
+    ///
+    /// Zero when no logger is reachable (init, memmgr, procmgr
+    /// themselves; processes spawned before the log endpoint exists).
+    /// `seraph::log!` silently drops in that case.
+    ///
+    /// History note (not part of the field's contract): pre-pivot
+    /// this slot held an *un-tokened* discovery cap; callers issued
+    /// `GET_LOG_CAP` to lazy-acquire a tokened cap on first log. The
+    /// discovery path still exists in init-logd and real-logd for
+    /// pre-handover live writers that already acquired their tokened
+    /// caps under it; new spawns skip it entirely.
+    pub log_send_cap: u32,
 
     // ── Stdio pipe wakeup signals ──────────────────────────────────────
     //

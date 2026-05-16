@@ -1498,6 +1498,210 @@ pub fn phase3_svcmgr_handover(
         _ => log("phase 3: handover failed"),
     }
 
-    log("main thread exiting, log thread continues");
+    // Init's main thread now exits cleanly. With init-logd already
+    // terminated (driven by real-logd's HANDOVER_PULL at end of
+    // Phase 2), no init thread remains; the kernel will reap init's
+    // address space and CSpace, returning every dynamically
+    // allocated (FrameAlloc-sourced) page to memmgr's buddy pool.
+    //
+    // NOTE: init's ELF segment Frame caps are minted by the kernel
+    // without `RETYPE` and with `owns_memory=false`
+    // (`core/kernel/src/main.rs:382-396`) — they are bootloader-
+    // loaded pages outside memmgr's buddy pool by design. They
+    // cannot be `DONATE_FRAMES`'d to memmgr (memmgr rejects them in
+    // `handle_donate_frames` per the `RETYPE` gate at
+    // `services/memmgr/src/main.rs:890`). Issue #5's "DONATE_FRAMES
+    // of init segments" therefore requires kernel changes (mint
+    // these caps with RETYPE + owns_memory, or add a separate
+    // memmgr ingestion path for non-pool pages). Not in scope here;
+    // surfaced as a follow-up. The init-logd termination and main-
+    // thread exit that this PR delivers are the real prerequisites.
+    log("main thread exiting; init process terminates");
     syscall::thread_exit();
+}
+
+// ── logd spawn ──────────────────────────────────────────────────────────────
+
+/// Spawn real-logd from `/bin/logd` at the end of Phase 2, immediately
+/// after the root mount completes. Init transfers:
+///
+/// * a RECV cap on the master log endpoint (so logd becomes the
+///   receive-side; init-logd terminates as part of the handover);
+/// * a SEND cap on the same endpoint (single-use, for the
+///   `HANDOVER_PULL` IPC to init-logd);
+/// * a tokened SEND cap on procmgr carrying
+///   `procmgr_labels::DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`);
+/// * an arch-specific serial-authority cap (`IoPortRange` on x86-64,
+///   `SbiControl` on RISC-V) so logd can write directly to the UART
+///   for its own diagnostics and the per-sender log lines it
+///   receives. Logd cannot route its diagnostics through
+///   `seraph::log!` because it IS the log receiver.
+///
+/// Returns `true` on successful spawn + bootstrap; `false` on any
+/// failure (logged at fault; init continues without real-logd, with
+/// init-logd running indefinitely until init's process is otherwise
+/// reaped).
+// too_many_lines: one transactional spawn path; splitting would push
+// most of the body into helpers and obscure the cap-flow sequencing.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn create_and_start_logd(
+    info: &InitInfo,
+    procmgr_ep: u32,
+    procmgr_service_ep_source: u32,
+    bootstrap_ep: u32,
+    log_ep: u32,
+    system_root_cap: u32,
+    init_self_cspace: u32,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let Some(walked) = walk::walk_to_file(system_root_cap, b"/bin/logd", ipc_buf)
+    else
+    {
+        log("logd: walk /bin/logd failed");
+        return false;
+    };
+
+    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
+    else
+    {
+        log("logd: tokened creator derive failed");
+        return false;
+    };
+
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+        .word(0, walked.size)
+        .cap(walked.file_cap)
+        .cap(tokened_creator)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
+    else
+    {
+        log("logd: CREATE_FROM_FILE ipc_call failed");
+        return false;
+    };
+    if reply.label != 0
+    {
+        log("logd: CREATE_FROM_FILE error");
+        return false;
+    }
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
+    {
+        log("logd: CREATE_FROM_FILE reply missing caps");
+        return false;
+    }
+    let process_handle = reply_caps[0];
+    // CREATE_FROM_FILE returns (process_handle, thread_cap); logd
+    // is svcmgr-registered for restart in a follow-up PR. Drop the
+    // thread cap for now.
+    if reply_caps.len() >= 2
+    {
+        let _ = syscall::cap_delete(reply_caps[1]);
+    }
+
+    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    {
+        return false;
+    }
+
+    // Derive the three bootstrap caps logd needs.
+    let Ok(log_recv) = syscall::cap_derive(log_ep, syscall::RIGHTS_ALL)
+    else
+    {
+        log("logd: log_ep RECV derive failed");
+        destroy_partial_child(process_handle, ipc_buf);
+        return false;
+    };
+    let Ok(log_handover_send) = syscall::cap_derive(log_ep, syscall::RIGHTS_SEND)
+    else
+    {
+        log("logd: log_ep SEND derive failed");
+        let _ = syscall::cap_delete(log_recv);
+        destroy_partial_child(process_handle, ipc_buf);
+        return false;
+    };
+    // RIGHTS_SEND_GRANT (not bare SEND): the IPC kernel requires the
+    // GRANT bit when the caller transfers any cap in the message, and
+    // logd's REGISTER_DEATH_EQ call hands over its `death_eq` cap.
+    let Ok(procmgr_death_auth) = syscall::cap_derive_token(
+        procmgr_service_ep_source,
+        syscall::RIGHTS_SEND_GRANT,
+        procmgr_labels::DEATH_EQ_AUTHORITY,
+    )
+    else
+    {
+        log("logd: procmgr DEATH_EQ_AUTHORITY derive failed");
+        let _ = syscall::cap_delete(log_recv);
+        let _ = syscall::cap_delete(log_handover_send);
+        destroy_partial_child(process_handle, ipc_buf);
+        return false;
+    };
+
+    // Arch-specific serial-authority cap. Both `cap_derive(RIGHTS_ALL)`
+    // mirror pwrmgr's pattern (`services/init/src/service.rs::
+    // create_and_start_pwrmgr`). On absent archs the source slot is
+    // zero; we pass zero through and logd silently disables its serial
+    // path (received log lines still buffer in memory).
+    let arch_cap_source: u32 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::find_cap_by_type(info, CapType::IoPortRange).unwrap_or(0)
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            info.sbi_control_cap
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            let _ = info;
+            0
+        }
+    };
+    let arch_cap_copy = if arch_cap_source != 0
+    {
+        syscall::cap_derive(arch_cap_source, syscall::RIGHTS_ALL).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+
+    if !start_process(
+        process_handle,
+        ipc_buf,
+        "phase 2: logd started; serving bootstrap",
+        "phase 2: logd START_PROCESS failed",
+    )
+    {
+        let _ = syscall::cap_delete(log_recv);
+        let _ = syscall::cap_delete(log_handover_send);
+        let _ = syscall::cap_delete(procmgr_death_auth);
+        if arch_cap_copy != 0
+        {
+            let _ = syscall::cap_delete(arch_cap_copy);
+        }
+        return false;
+    }
+
+    if !serve(
+        bootstrap_ep,
+        child_token,
+        ipc_buf,
+        true,
+        &[
+            log_recv,
+            log_handover_send,
+            procmgr_death_auth,
+            arch_cap_copy,
+        ],
+        &[],
+        "logd: bootstrap round failed",
+    )
+    {
+        return false;
+    }
+
+    true
 }

@@ -7,20 +7,20 @@
 //!
 //! Two halves:
 //!
-//! * **Wire-format helpers ([`acquire`], [`write_bytes`], [`write_args`],
-//!   [`register_name`]):** thin no-allocation wrappers over the IPC labels
-//!   defined in `ipc::{log_labels, stream_labels}`. Callers supply their
+//! * **Wire-format helpers ([`write_bytes`], [`write_args`],
+//!   [`register_name`]):** thin no-allocation wrappers over the IPC
+//!   labels defined in `ipc::stream_labels`. Callers supply their
 //!   tokened SEND cap and IPC buffer pointer explicitly.
-//! * **Process-global cache ([`set_discovery_cap`],
-//!   [`install_tokened_cap`], [`ensure_tokened_cap`]):** holds the
-//!   discovery cap installed at process startup and the lazily-acquired
-//!   tokened SEND cap. Init pre-populates the tokened slot via
-//!   [`install_tokened_cap`] (it derives its own token-1 cap directly
-//!   from the log endpoint it owns); std-built processes leave it zero
-//!   and let the first log call lazy-acquire from the discovery cap.
+//! * **Process-global cap cache ([`install_tokened_cap`],
+//!   [`ensure_tokened_cap`]):** holds the pre-installed tokened SEND
+//!   cap. Std's `_start` installs the cap procmgr seeded in
+//!   `ProcessInfo.log_send_cap`; init installs its own token-1 cap
+//!   derived directly from the log endpoint it owns. No discovery
+//!   roundtrip — the cap is live from the first user instruction.
 //!
-//! The user-facing macro lives in the std overlay (it needs thread-local
-//! IPC-buffer access). Inside no_std code (init), call [`emit`] directly.
+//! The user-facing macro lives in the std overlay (it needs thread-
+//! local IPC-buffer access). Inside no_std code (init), call [`emit`]
+//! directly.
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
@@ -40,8 +40,7 @@ use core::prelude::rust_2024::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use ipc::{
-    IpcMessage, LOG_LABELS_VERSION,
-    log_labels::GET_LOG_CAP,
+    IpcMessage,
     stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME},
 };
 use syscall_abi::MSG_DATA_WORDS_MAX;
@@ -58,107 +57,32 @@ const STACK_BUF_LEN: usize = CHUNK_SIZE;
 
 // ── Process-global cap cache ────────────────────────────────────────────────
 
-/// Un-tokened SEND cap on the system log endpoint, installed at process
-/// startup. Used to lazy-acquire the tokened cap on first log call. Zero
-/// in processes that received no discovery cap (init, processes spawned
-/// before the log infrastructure was wired).
-static DISCOVERY_CAP: AtomicU32 = AtomicU32::new(0);
-
-/// Tokened SEND cap on the log endpoint. Zero until either:
-/// * [`install_tokened_cap`] is called (init does this with its self-token cap), or
-/// * [`ensure_tokened_cap`] performs a successful `GET_LOG_CAP` round-trip
-///   against the discovery cap (the standard lazy path).
-///
-/// Once non-zero, never changes — Phase 1 acquires exactly one cap per
-/// process (singleton convention; not enforced receiver-side).
+/// Tokened SEND cap on the log endpoint, pre-installed at process
+/// startup via [`install_tokened_cap`]. Zero when no logger is
+/// reachable (init/memmgr/procmgr-self before its bootstrap completes,
+/// or any tier of the boot chain that runs before the log endpoint
+/// exists); [`emit`] silently drops in that case.
 static TOKENED_CAP: AtomicU32 = AtomicU32::new(0);
 
-/// Install the discovery cap. Called by std's `_start` from the
-/// `log_discovery_cap` field of `ProcessInfo`. Idempotent — last writer
-/// wins.
-pub fn set_discovery_cap(cap: u32)
-{
-    DISCOVERY_CAP.store(cap, Ordering::Release);
-}
-
-/// Pre-install a tokened SEND cap, bypassing the discovery path. Used by
-/// init, which derives its own token-1 cap directly from the log endpoint
-/// it owns and does not consume `GET_LOG_CAP`.
+/// Pre-install a tokened SEND cap on the log endpoint. Called by
+/// std's `_start` with the cap procmgr seeded in
+/// `ProcessInfo.log_send_cap`, and by init with its self-token-1 cap
+/// derived directly from the log endpoint it owns. Idempotent — last
+/// writer wins.
 pub fn install_tokened_cap(cap: u32)
 {
     TOKENED_CAP.store(cap, Ordering::Release);
 }
 
-/// Return the cached tokened cap, or attempt to acquire one from the
-/// discovery cap on first call. Returns 0 on failure (no discovery cap,
-/// no IPC buffer, IPC error, receiver out-of-resources). The first
-/// successful acquisition is persisted for all subsequent calls.
-///
-/// Safe to call from any thread once stdio init has run.
-pub fn ensure_tokened_cap(ipc_buf: *mut u64) -> u32
+/// Return the pre-installed tokened SEND cap, or zero. Caller is
+/// expected to have set it via [`install_tokened_cap`] before the
+/// first log call.
+pub fn ensure_tokened_cap(_ipc_buf: *mut u64) -> u32
 {
-    let existing = TOKENED_CAP.load(Ordering::Acquire);
-    if existing != 0
-    {
-        return existing;
-    }
-    let discovery = DISCOVERY_CAP.load(Ordering::Acquire);
-    if discovery == 0 || ipc_buf.is_null()
-    {
-        return 0;
-    }
-    let new_cap = match acquire(discovery, ipc_buf)
-    {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    if new_cap == 0
-    {
-        return 0;
-    }
-    // CAS — first writer wins. Concurrent acquirers race on first-log: the
-    // loser drops its extra cap slot via cap_delete. Singleton convention
-    // is preserved against all but the loser's transiently-held second
-    // slot.
-    match TOKENED_CAP.compare_exchange(0, new_cap, Ordering::AcqRel, Ordering::Acquire)
-    {
-        Ok(_) => new_cap,
-        Err(winner) =>
-        {
-            let _ = syscall::cap_delete(new_cap);
-            winner
-        }
-    }
+    TOKENED_CAP.load(Ordering::Acquire)
 }
 
 // ── Wire-format primitives ──────────────────────────────────────────────────
-
-/// Issue [`GET_LOG_CAP`] on `discovery_cap`. The reply transfers one cap
-/// (a tokened SEND on the log endpoint) into the caller's CSpace; this
-/// function returns the new slot index.
-///
-/// # Errors
-/// Returns a negative `i64` if the IPC call fails or the receiver replies
-/// without a cap.
-///
-/// # Safety
-/// The caller must have registered `ipc_buf` with the kernel via
-/// `ipc_buffer_set` on the current thread.
-pub fn acquire(discovery_cap: u32, ipc_buf: *mut u64) -> Result<u32, i64>
-{
-    let msg = IpcMessage::builder(GET_LOG_CAP)
-        .word(0, u64::from(LOG_LABELS_VERSION))
-        .build();
-    // SAFETY: ipc_buf is the calling thread's registered IPC buffer per the
-    // function's documented invariant.
-    let reply = unsafe { ipc::ipc_call(discovery_cap, &msg, ipc_buf) }?;
-    let caps = reply.caps();
-    if caps.is_empty()
-    {
-        return Err(0);
-    }
-    Ok(caps[0])
-}
 
 /// Send `bytes` as one or more `STREAM_BYTES` messages on `cap`. Splits
 /// across IPC calls when the payload exceeds [`CHUNK_SIZE`]; the receiver
@@ -254,23 +178,23 @@ pub fn write_args(cap: u32, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
     write_bytes(cap, ipc_buf, &buf.data[..buf.used]);
 }
 
-/// One-shot emit: ensure the tokened cap is acquired, then format `args`
-/// and send. Convenience entry point used by the std-overlay macro and by
-/// init's lazy-log path. Silently drops if no log cap can be acquired.
+/// One-shot emit: format `args` and send on the pre-installed tokened
+/// SEND cap. Silently drops when no cap is installed (the process has
+/// no log access — init/memmgr/procmgr-self before bootstrap, or any
+/// process spawned before the log endpoint existed).
 pub fn emit(ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
 {
     let cap = ensure_tokened_cap(ipc_buf);
     if cap == 0
     {
         // Reaching here means the binary linked `seraph::log!` but
-        // received neither a discovery cap at `_start` nor a pre-
-        // installed tokened cap. Tier-2 binaries that never call
-        // `log!` never reach this function (dead-code-eliminated).
-        // Loud in debug; silent drop in release for cap-oblivious
-        // tier-2 use.
+        // received no pre-installed tokened cap. Tier-2 binaries that
+        // never call `log!` never reach this function (dead-code-
+        // eliminated). Loud in debug; silent drop in release for
+        // cap-oblivious tier-2 use.
         debug_assert!(
             false,
-            "seraph::log! invoked but no log cap was wired at startup",
+            "seraph::log! invoked but no log cap was installed at startup",
         );
         return;
     }

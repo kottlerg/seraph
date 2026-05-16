@@ -208,6 +208,35 @@ procmgr retains the original caps for process lifecycle management.
 
 ---
 
+## REGISTER_DEATH_EQ — install logd's death observer
+
+Wire format:
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::REGISTER_DEATH_EQ` (14) |
+| caller's cap token | MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY` (`1 << 62`); init mints this tokened SEND cap and gives it exclusively to real-logd at bootstrap |
+| `caps[0]` | `EventQueue` cap with `POST` right; procmgr binds it as a second death observer on every supervised thread |
+
+Procmgr stores the cap in
+[`process::LOGD_DEATH_EQ`](../src/process.rs) and immediately
+walks its process table, calling
+`sys_thread_bind_notification(entry.thread_cap, logd_eq,
+entry.token as u32)` on every live entry. From that moment onward,
+[`finalize_creation`](../src/process.rs) also binds the same EQ on
+every newly spawned child (correlator = process token).
+
+Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
+caller lacks `DEATH_EQ_AUTHORITY`, `INVALID_ARGUMENT` if no cap was
+transferred. Re-registration replaces the previous cap.
+
+logd derives a `POST`-only copy from its `RECV+POST` event queue
+before sending — the kernel's cap-transfer moves the sent cap into
+procmgr's CSpace, so logd must retain `RECV` on its own copy to
+keep `wait_set_add` and `event_try_recv` working.
+
+---
+
 ## Relevant Design Documents
 
 | Document | Content |

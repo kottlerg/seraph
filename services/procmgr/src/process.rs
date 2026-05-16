@@ -26,8 +26,60 @@ const CHILD_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 
-/// Next token value (monotonically increasing, never zero).
-static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Next token value (monotonically increasing, never zero). Starts at
+/// `LOG_TOKEN_FIRST_CHILD` so per-child log tokens never collide with
+/// the reserved system-special tokens (init=1, procmgr=2, 3..15
+/// reserved). The same value is procmgr's process token, memmgr's
+/// per-process ledger key, the tokened SEND-cap token on the log
+/// endpoint, and procmgr's death-EQ correlator — one u64, four roles.
+static NEXT_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(ipc::log_tokens::LOG_TOKEN_FIRST_CHILD);
+
+/// Reserve the next process token. Single allocation point so the
+/// value can be threaded to `populate_child_info` (writes it into
+/// `pi.log_send_cap`'s tokened SEND derivation) AND `finalize_creation`
+/// (uses it as the table key, death-EQ correlator, and process-handle
+/// token).
+fn next_process_token() -> u64
+{
+    NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Logd's death-notification `EventQueue` cap, registered via
+/// `procmgr_labels::REGISTER_DEATH_EQ` once real-logd is up. Zero
+/// until then. Read in `finalize_creation` to bind logd as a second
+/// death observer on every newly spawned child; on registration,
+/// retroactively bound to every existing process table entry by
+/// `bind_logd_eq_to_existing` so logd does not miss prior children.
+///
+/// Single-writer (the `REGISTER_DEATH_EQ` handler runs under
+/// procmgr's single-threaded dispatch); readers race only with the
+/// writer, and the Acquire load pairs with the Release store on
+/// registration.
+pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Install logd's death-notification EQ cap and retroactively bind it
+/// as a second observer on every thread currently in the process
+/// table. Called by `REGISTER_DEATH_EQ`'s handler. Idempotent on
+/// re-registration: replaces the previous slot, re-binds on
+/// everything.
+pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
+{
+    LOGD_DEATH_EQ.store(logd_eq, std::sync::atomic::Ordering::Release);
+    if logd_eq == 0
+    {
+        return true;
+    }
+    let mut ok = true;
+    table.for_each(|entry| {
+        let correlator = entry.token as u32;
+        if syscall::thread_bind_notification(entry.thread_cap, logd_eq, correlator).is_err()
+        {
+            ok = false;
+        }
+    });
+    ok
+}
 
 /// Maximum concurrent child processes procmgr tracks.
 ///
@@ -207,6 +259,20 @@ impl ProcessTable
             }
         }
         None
+    }
+
+    /// Visit every live entry in insertion order. Used by
+    /// `install_logd_death_eq` to retroactively bind logd's EQ as a
+    /// second death observer on each child's main thread.
+    pub fn for_each<F: FnMut(&ProcessEntry)>(&self, mut f: F)
+    {
+        for slot in &self.entries
+        {
+            if let Some(entry) = slot.as_ref()
+            {
+                f(entry);
+            }
+        }
     }
 
     /// Lightweight status lookup for `QUERY_PROCESS`. Returns
@@ -390,14 +456,15 @@ pub struct CreateResult
 
 /// Universal bootstrap caps procmgr threads through into every child.
 ///
-/// Procmgr's own service endpoint plus the system log discovery cap.
+/// Procmgr's own service endpoint plus the log-cap derivation source.
 ///
 /// The child receives a tokened SEND copy of `procmgr_endpoint` so it
-/// can call `REQUEST_FRAMES` / `CREATE_PROCESS`, and
-/// an un-tokened SEND copy of `log_discovery` so it can `GET_LOG_CAP`
-/// against the system log endpoint on first `seraph::log!` call (the
-/// discovery cap by itself grants no log identity and no observability;
-/// it merely lets the holder request a freshly-minted tokened cap).
+/// can call `REQUEST_FRAMES` / `CREATE_PROCESS`, and a
+/// freshly-derived tokened SEND cap on the log endpoint (token = the
+/// child's process token) so `seraph::log!` writes go directly to logd
+/// with the kernel-attached identity. `log_send_source` is procmgr's
+/// un-tokened SEND cap on the log endpoint, used as the source for
+/// each per-child `cap_derive_token`.
 ///
 /// Stdio caps (stdin, stdout, stderr) are intentionally NOT part of this
 /// struct: they are not a universal property of processes, and each can
@@ -408,10 +475,14 @@ pub struct CreateResult
 pub struct UniversalCaps
 {
     pub procmgr_endpoint: u32,
-    /// Un-tokened SEND cap on the system log endpoint, sourced from the
-    /// `log_ep` slot procmgr received during init bootstrap. Zero when
-    /// procmgr has no log endpoint (e.g. a future no-log boot mode).
-    pub log_discovery: u32,
+    /// Un-tokened SEND cap on the system log endpoint, sourced from
+    /// the slot procmgr received during init bootstrap. Used as the
+    /// `cap_derive_token` source for minting a tokened SEND per child
+    /// (token = child's process token). Zero when procmgr has no log
+    /// endpoint (e.g. a future no-log boot mode); children born in
+    /// that case receive zero in `pi.log_send_cap` and silent-drop
+    /// `seraph::log!`.
+    pub log_send_source: u32,
     /// Tokened SEND cap on memmgr's service endpoint, freshly minted by
     /// `memmgr_labels::REGISTER_PROCESS` for this child. The cap lives in
     /// procmgr's `CSpace` on entry; `populate_child_info` copies it into
@@ -508,6 +579,7 @@ fn populate_child_info(
     env: &ChildEnv<'_>,
     ipc_buf: *mut u64,
     stack_pages: u32,
+    process_token: u64,
 ) -> Option<u32>
 {
     let pi_frame = crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)?;
@@ -556,14 +628,25 @@ fn populate_child_info(
         0
     };
 
-    // Discovery cap on the system log endpoint: SEND-only copy of the
-    // procmgr-held un-tokened log endpoint cap. Lets the child issue
-    // `GET_LOG_CAP` to lazy-acquire its tokened SEND cap on first
-    // `seraph::log!` call. Zero when procmgr has no log endpoint, in
-    // which case the macro silently drops.
-    let log_discovery_in_child = if universals.log_discovery != 0
+    // Tokened SEND cap on the system log endpoint: derived from the
+    // procmgr-held un-tokened source cap with token = child's process
+    // token. Child's std `_start` installs it via
+    // `::log::install_tokened_cap`; `seraph::log!` writes ride it
+    // directly with no discovery roundtrip. Logd attributes the
+    // writes by the kernel-delivered token, which equals procmgr's
+    // process token, which equals the death-EQ correlator —
+    // self-reconciliation across the three views.
+    let log_send_in_child = if universals.log_send_source != 0
     {
-        syscall::cap_copy(universals.log_discovery, child_cspace, syscall::RIGHTS_SEND).ok()?
+        let proc_side = syscall::cap_derive_token(
+            universals.log_send_source,
+            syscall::RIGHTS_SEND,
+            process_token,
+        )
+        .ok()?;
+        let child_side = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_SEND).ok()?;
+        let _ = syscall::cap_delete(proc_side);
+        child_side
     }
     else
     {
@@ -612,7 +695,7 @@ fn populate_child_info(
     // and there is no inter-CSpace cap_delete primitive to clean up.
     pi.system_root_cap = 0;
     pi.current_dir_cap = 0;
-    pi.log_discovery_cap = log_discovery_in_child;
+    pi.log_send_cap = log_send_in_child;
     pi.stdin_data_signal_cap = 0;
     pi.stdin_space_signal_cap = 0;
     pi.stdout_data_signal_cap = 0;
@@ -949,15 +1032,27 @@ fn finalize_creation(
     death_eq: u32,
     memmgr_send_cap: u32,
     memmgr_token: u64,
+    process_token: u64,
 ) -> Option<CreateResult>
 {
-    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let token = process_token;
 
     // Bind procmgr's shared death queue as an observer on the child's
     // main thread. Correlator = low 32 bits of the table token; on death,
     // dispatch_death recovers the entry via `take_by_correlator`.
     let correlator = token as u32;
     syscall::thread_bind_notification(child_thread, death_eq, correlator).ok()?;
+
+    // If logd has registered its own death EQ via REGISTER_DEATH_EQ,
+    // bind it as a second observer with the same correlator (logd's
+    // slot map is keyed by process_token, which equals this token).
+    // Children spawned before logd registers are bound retroactively
+    // by `install_logd_death_eq`.
+    let logd_eq = LOGD_DEATH_EQ.load(std::sync::atomic::Ordering::Acquire);
+    if logd_eq != 0
+    {
+        let _ = syscall::thread_bind_notification(child_thread, logd_eq, correlator);
+    }
 
     // Derive a tokened endpoint cap for the caller. The token identifies this
     // process on subsequent START_PROCESS / REQUEST_FRAMES calls.
@@ -1117,6 +1212,7 @@ fn create_process_from_bytes(
         MainTls::default()
     };
 
+    let process_token = next_process_token();
     let pi_frame_cap = populate_child_info(
         self_aspace,
         child_aspace,
@@ -1129,6 +1225,7 @@ fn create_process_from_bytes(
         env,
         ipc_buf,
         stack_pages,
+        process_token,
     )?;
     map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf, stack_pages)?;
 
@@ -1144,6 +1241,7 @@ fn create_process_from_bytes(
         death_eq,
         child_memmgr_send,
         universals.memmgr_token,
+        process_token,
     )
 }
 
@@ -1912,10 +2010,11 @@ pub fn create_process_from_file(
 
     let universals = UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
-        log_discovery: ctx.log_ep,
+        log_send_source: ctx.log_ep,
         memmgr_endpoint: mms.cap(),
         memmgr_token: mms.token(),
     };
+    let process_token = next_process_token();
     let pi_frame_cap = populate_child_info(
         self_aspace,
         child_objs.aspace(),
@@ -1928,6 +2027,7 @@ pub fn create_process_from_file(
         env,
         ipc_buf,
         stack_pages,
+        process_token,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let pi_frame_guard = CapGuard::new(pi_frame_cap);
@@ -1958,6 +2058,7 @@ pub fn create_process_from_file(
         death_eq,
         mms.cap(),
         mms.token(),
+        process_token,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY);
     if result.is_ok()

@@ -129,7 +129,15 @@ Network stack. Manages interfaces via driver IPC and exposes socket-like endpoin
 to applications.
 
 **logd**
-Receives structured log messages via IPC and routes them to configured sinks.
+Post-mount owner of the master log endpoint. Every userspace
+process holds a pre-installed tokened SEND cap on the same kernel
+endpoint (seeded by procmgr at spawn time into
+`ProcessInfo.log_send_cap`); logd drains the RECV side. Init runs an
+interim `init-logd` thread until logd is launched at the end of init's
+Phase 2, then hands over via `log_labels::HANDOVER_PULL` (the kernel
+endpoint object is unchanged across the handover, so existing tokened
+SEND caps survive without re-derivation). Subscribes to procmgr's
+death-notification cascade for per-sender slot reclamation.
 
 **base**
 Unprivileged applications (shell, terminal, editor, core tools).

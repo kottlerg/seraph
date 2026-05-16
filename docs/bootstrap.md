@@ -67,7 +67,18 @@ transferring the RAM frame pool to memmgr and minting procmgr's
 first call. Init then requests procmgr to start the remaining early services
 (devmgr, svcmgr, drivers, vfsd, optionally netd), delegates the appropriate
 subsets of its initial capability set to each service, registers services
-with svcmgr, and exits. The system-scope userspace boot order lives in
+with svcmgr, and exits.
+
+At the end of init's Phase 2 — after the root mount completes but before
+Phase 3 spawns any other service — init spawns real `logd` from
+`/bin/logd` and hands it the receive side of the master log endpoint
+via `log_labels::HANDOVER_PULL`. init-logd's receive loop terminates
+on the final handover reply. The kernel endpoint object is unchanged
+across the transition, so every pre-existing tokened SEND cap (held
+by memmgr, procmgr, every tier-1 service) continues to work without
+re-derivation; only the holder of the RECV cap changes. See
+[`services/logd/README.md`](../services/logd/README.md) and
+[`services/logd/docs/handover-protocol.md`](../services/logd/docs/handover-protocol.md). The system-scope userspace boot order lives in
 [`process-lifecycle.md`](process-lifecycle.md); role-level description is in
 [`services/init/README.md`](../services/init/README.md); authoritative stage
 enumeration lives in

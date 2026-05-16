@@ -61,7 +61,21 @@ Init's responsibilities are strictly bounded:
    IPC. Init retains derived intermediary copies (for potential
    revocation), not the roots.
 
-6. **Spawn Phase 3 services from VFS** — svcmgr, crasher, pwrmgr,
+6. **Launch real logd (Phase 2 epilogue)** — immediately after the
+   seed `system_root_cap` is acquired, init walks
+   `/bin/logd` and spawns real-logd via
+   `procmgr_labels::CREATE_FROM_FILE`. The bootstrap round
+   delivers (a) a RECV cap on the master log endpoint, (b) a
+   one-shot SEND cap on the same endpoint for `HANDOVER_PULL`,
+   (c) a tokened SEND on procmgr carrying
+   `procmgr_labels::DEATH_EQ_AUTHORITY`, and (d) the arch serial
+   authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V).
+   logd pulls init-logd's captured state via `HANDOVER_PULL`;
+   init-logd's receive loop self-terminates on the final reply.
+   See [`services/logd/README.md`](../logd/README.md) and
+   [`services/logd/docs/handover-protocol.md`](../logd/docs/handover-protocol.md).
+
+7. **Spawn Phase 3 services from VFS** — svcmgr, crasher, pwrmgr,
    usertest, hello, stdiotest are loaded by walking init's seed
    system-root cap to `/bin/<name>`, then issuing
    `procmgr_labels::CREATE_FROM_FILE` with the resolved file cap.
@@ -80,13 +94,21 @@ Init's responsibilities are strictly bounded:
    gate rejects un-tokened callers. See
    [`services/pwrmgr/README.md`](../pwrmgr/README.md).
 
-7. **Register services with svcmgr** — before exiting, init registers
+8. **Register services with svcmgr** — before exiting, init registers
    all started services with svcmgr along with their restart policies
    and capability sets.
 
-8. **Exit** — init calls `sys_thread_exit`. It holds no long-lived
-   state, no supervision capability, and no restart authority. svcmgr
-   takes over.
+9. **Exit** — init calls `sys_thread_exit`. By this point init-logd
+   has also terminated (driven by real-logd's `HANDOVER_PULL` at
+   end of Phase 2), so init holds no surviving threads. The kernel
+   tears down init's address space and CSpace; init's
+   `FrameAlloc`-sourced pages return to memmgr's buddy pool
+   automatically. (Init's bootloader-loaded ELF segment frames are
+   minted without `RETYPE` and without `owns_memory` — they stay
+   outside memmgr's pool until kernel-side work tracked separately
+   adds a non-RETYPE donation path.) Init holds no long-lived
+   state, no supervision capability, and no restart authority;
+   svcmgr takes over.
 
 memmgr and procmgr are the only two processes init creates via raw
 syscalls. Every later service is spawned via IPC to procmgr.

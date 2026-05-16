@@ -181,8 +181,13 @@ at creation time. Examples:
   identifying this process; minted by `REGISTER_PROCESS` per child.
 - `ProcessInfo.procmgr_endpoint_cap` — tokened SEND on procmgr's
   endpoint, for process-lifecycle queries.
-- `ProcessInfo.log_endpoint_cap` (or the log-discovery surface) —
-  established by procmgr per child.
+- `ProcessInfo.log_send_cap` — tokened SEND cap on the master log
+  endpoint, minted by procmgr per child via
+  `cap_derive_token(log_send_source, RIGHTS_SEND, process_token)`.
+  The cap's kernel-attached token equals procmgr's process token,
+  which also equals the death-EQ correlator procmgr posts to
+  logd. Identity is reconciled across the three views without
+  any auxiliary mapping.
 - `InitInfo.memory_frame_base`, `InitInfo.memory_frame_count` — chosen
   by the kernel per init invocation.
 

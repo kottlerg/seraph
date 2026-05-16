@@ -88,7 +88,7 @@ jobs:
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
-            --parallel 1 --runs 1 --timeout 60
+            --parallel 1 --runs 1 --timeout 180
 
       - name: Swap boot.conf to init=ktest and rebuild
         run: |
@@ -108,10 +108,10 @@ jobs:
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
-            --parallel 1 --runs 1 --timeout 60
+            --parallel 1 --runs 1 --timeout 180
 
-      - name: Upload run-parallel logs on failure
-        if: failure()
+      - name: Upload run-parallel logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}

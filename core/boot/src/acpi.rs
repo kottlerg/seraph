@@ -466,12 +466,18 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                     let num_buses = u64::from(end_bus).saturating_sub(u64::from(start_bus)) + 1;
                     let ecam_size = num_buses * 256 * 4096;
                     push!(base, ecam_size);
-                    // PCI BAR windows: QEMU-layout heuristic selected by
-                    // ECAM base. The 32-bit window sits below ECAM on q35
-                    // and at a fixed 0x4000_0000 on virt; the 64-bit
-                    // window is a fixed high range on each. Real hardware
-                    // advertises these through the host bridge's `_CRS`,
-                    // which the bootloader does not evaluate.
+                    // PCI BAR windows. Real hardware advertises these
+                    // through the host bridge's `_CRS`, which the
+                    // bootloader does not evaluate (no AML interpreter).
+                    // We seed via an ECAM-base heuristic:
+                    //   ECAM < 2 GiB ⇒ QEMU virt (RISC-V): both windows
+                    //     at stable QEMU-defined offsets.
+                    //   ECAM ≥ 2 GiB ⇒ q35 (x86-64): 32-bit window
+                    //     below ECAM; 64-bit window `[4 GiB, 1<<MAXPHYADDR)`
+                    //     so it covers wherever firmware places it
+                    //     without per-CPU tuning. Apertures are
+                    //     permission checks, not allocations, so a wide
+                    //     upper bound is harmless.
                     let (lo_base, lo_size) = if base < 0x8000_0000
                     {
                         (0x4000_0000u64, 0x4000_0000u64)
@@ -487,13 +493,37 @@ pub unsafe fn parse_aperture_seed(rsdp_addr: u64, out: &mut [MmioAperture]) -> u
                     }
                     else
                     {
-                        (0x3800_0000_0000u64, 0x1_0000_0000u64)
+                        let maxphyaddr = crate::arch::current::max_phys_addr_bits();
+                        let hi_top: u64 = if maxphyaddr >= 64
+                        {
+                            u64::MAX
+                        }
+                        else
+                        {
+                            1u64 << maxphyaddr
+                        };
+                        let hi_base: u64 = 1u64 << 32;
+                        (hi_base, hi_top.saturating_sub(hi_base))
                     };
                     push!(hi_base, hi_size);
                 }
                 off += MCFG_ENTRY_SIZE;
             }
         }
+    }
+
+    // Per-arch platform-default PCI apertures.
+    //
+    // Some firmware builds publish ACPI without an MCFG table (e.g. the
+    // EDK2 shipped with Ubuntu's `qemu-efi-riscv64` package observed on
+    // `ubuntu-latest` GitHub runners). When MCFG is absent the loop above
+    // produces no PCI apertures, but devmgr still needs a frame covering
+    // ECAM. Append the arch-defined defaults unconditionally; any overlap
+    // with MCFG-derived entries is collapsed by
+    // `derive_mmio_apertures`'s merge pass.
+    for &(base, size) in crate::arch::current::default_pci_apertures()
+    {
+        push!(base, size);
     }
 
     n

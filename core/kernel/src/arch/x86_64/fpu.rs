@@ -187,11 +187,17 @@ pub unsafe fn enable_xsave()
 
 /// Save the live x87/SSE/AVX state of the executing CPU into `area`.
 ///
-/// Uses XSAVEOPT to skip components untouched since the last save.
 /// `area` must be 64-byte aligned and point at a writable XSAVE buffer of
 /// at least [`xsave_area_size`] bytes. The component-mask passed in
-/// `EDX:EAX = 0xFFFF_FFFF_FFFF_FFFF` instructs XSAVEOPT to save every
-/// component that XCR0 currently enables.
+/// `EDX:EAX = 0xFFFF_FFFF_FFFF_FFFF` instructs XSAVE to write every
+/// component XCR0 currently enables; hardware intersects with XCR0, so
+/// the actual written set is exactly the OS-enabled components.
+///
+/// Plain XSAVE (not XSAVEOPT) is intentional: XSAVEOPT may skip writing
+/// components it tracks as "clean" since the last load, and the per-CPU
+/// tracking is only correct when both load and save paths use matching
+/// instructions consistently. XSAVE is unconditional and works the same
+/// on every implementation (hardware, KVM, TCG).
 ///
 /// # Safety
 /// Must execute at ring 0. `area` must satisfy the alignment and size
@@ -201,12 +207,12 @@ pub unsafe fn enable_xsave()
 #[inline]
 pub unsafe fn save_to(area: *mut u8)
 {
-    // SAFETY: caller's contract; XSAVEOPT requires OSXSAVE which the boot
+    // SAFETY: caller's contract; XSAVE requires OSXSAVE which the boot
     // path established. The component mask `0xFFFF_FFFF` (low 32 bits) is
     // intersected with XCR0 by hardware, so it saves exactly the enabled set.
     unsafe {
         core::arch::asm!(
-            "xsaveopt [{area}]",
+            "xsave [{area}]",
             area = in(reg) area,
             in("eax") 0xFFFF_FFFFu32,
             in("edx") 0xFFFF_FFFFu32,
@@ -269,13 +275,56 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     {
         return;
     }
-    // SAFETY: caller's contract.
+    // Eager save: the live extended-state register file always belongs to
+    // the outgoing thread because [`switch_in_restore`] reloaded it on
+    // switch-in. CR0.TS dirty-tracking is intentionally not used; the
+    // lazy-trap path varies in correctness across TCG versions
+    // (observed on QEMU 8.2 under `ubuntu-latest`).
+    // CR0.TS may already be clear (the matching switch_in_restore cleared
+    // it); ensure it is for XSAVE, which faults on TS=1.
+    // SAFETY: ring 0.
     unsafe {
+        cr0_clear_ts();
         save_to(area);
-        cr0_set_ts();
+    }
+}
+
+/// Context-switch hook called on switch-in of a user thread (the caller
+/// supplies a TCB whose `extended.area` is non-null): XRSTOR the saved
+/// register file into the live x87/SSE/AVX registers and clear CR0.TS so
+/// the thread resumes without an `#NM` trap.
+///
+/// Paired with [`switch_out_save`] to form an eager save/restore
+/// discipline that does not depend on `#NM`/CR0.TS lazy-trap semantics.
+///
+/// # Safety
+/// Must execute at ring 0 with interrupts disabled, after this thread's
+/// preceding `switch_out_save` has completed. `tcb` must be a valid TCB
+/// pointer; when its `extended.area` is non-null the area must satisfy
+/// the alignment and size requirements of [`restore_from`].
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn switch_in_restore(tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    // SAFETY: caller guarantees tcb is valid; the area is allocated for the
+    // TCB's lifetime when non-null.
+    let area = unsafe { (*tcb).extended.area };
+    if area.is_null()
+    {
+        return;
+    }
+    // SAFETY: caller's contract; XRSTOR requires OSXSAVE which the boot
+    // path established.
+    unsafe {
+        cr0_clear_ts();
+        restore_from(area);
     }
 }
 
 /// No-op test stub.
 #[cfg(test)]
 pub unsafe fn switch_out_save(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}

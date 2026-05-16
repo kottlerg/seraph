@@ -286,6 +286,42 @@ fn discover_ecam(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
     {
         return Some(loc);
     }
+    platform_default_ecam()
+}
+
+/// Platform-default ECAM when neither ACPI MCFG nor a DTB exposes one.
+///
+/// On RISC-V the QEMU `virt` machine has a stable, well-known PCI ECAM
+/// at `[0x3000_0000, 0x4000_0000)` for buses 0..=255. Some EDK2 builds
+/// shipped with distro packages (Ubuntu's `qemu-efi-riscv64`, observed
+/// on `ubuntu-latest` GitHub runners) publish ACPI but omit MCFG and do
+/// not re-expose the `OpenSBI` DTB through the UEFI configuration table,
+/// leaving both discovery paths empty. Falling back to the QEMU virt
+/// constants here keeps devmgr functional on those firmware builds.
+///
+/// On x86-64 no comparable single-target fallback exists; the function
+/// returns `None` so the boot halts and the missing firmware is
+/// surfaced explicitly. New RISC-V hardware that diverges from QEMU
+/// virt will need real `_CRS` parsing or a DTB published by its
+/// firmware — replace this stub at that point.
+// The `Option` return is the unified call-site shape; the riscv64
+// arm always succeeds, but `discover_ecam` chains it after two
+// fallible firmware probes that may also yield `Some(...)`.
+#[allow(clippy::unnecessary_wraps)]
+#[cfg(target_arch = "riscv64")]
+fn platform_default_ecam() -> Option<firmware::EcamLocation>
+{
+    Some(firmware::EcamLocation {
+        phys_base: 0x3000_0000,
+        size: 0x1000_0000,
+        start_bus: 0,
+        end_bus: 255,
+    })
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn platform_default_ecam() -> Option<firmware::EcamLocation>
+{
     None
 }
 

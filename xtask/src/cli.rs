@@ -92,6 +92,7 @@ pub enum BuildComponent
     Svcmgr,
     Pwrmgr,
     Hello,
+    Fsbench,
     Pipefault,
     Stackoverflow,
     Stdiotest,

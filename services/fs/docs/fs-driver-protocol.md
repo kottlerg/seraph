@@ -76,8 +76,11 @@ node's `(NodeId, NamespaceRights)` token to the driver via
 `ipc_recv.token`; the driver MUST verify the `READ` rights bit and
 reject with `NsError::PermissionDenied` otherwise.
 
-Used for short reads (`< PAGE_SIZE`); larger reads use
-[`FS_READ_FRAME`](#label-7-fs_read_frame).
+Used for short reads (≤ 504 bytes that fit within the current page);
+larger or page-straddling reads use
+[`FS_READ_FRAME`](#label-7-fs_read_frame). The threshold is
+client-side policy, not server-enforced; see
+[Inline-vs-frame crossover](#inline-vs-frame-crossover-client-policy).
 
 **Request**
 
@@ -151,6 +154,74 @@ falling back to the eviction worker's hard-revoke path.
 
 **Reply (error)**: `label = NsError::*` or
 `fs_errors::BAD_FRAME_OFFSET` (cookie zero).
+
+---
+
+## Inline-vs-frame crossover (client policy)
+
+The choice between [`FS_READ`](#label-2-fs_read) and
+[`FS_READ_FRAME`](#label-7-fs_read_frame) is **client-side policy**, not
+protocol. The server accepts whichever label arrives; the cost of the
+wrong pick falls entirely on the client.
+
+The reference policy lives in `runtime/ruststd/src/sys/fs/seraph.rs`:
+
+```text
+inline iff  want <= READ_INLINE_THRESHOLD
+       AND  (offset mod PAGE_SIZE) + want <= PAGE_SIZE
+frame  otherwise
+```
+
+`READ_INLINE_THRESHOLD = 504` bytes. This is the FS_READ IPC payload
+ceiling — 63 data words × 8 bytes minus the 8-byte length prefix in
+word 0 (`MSG_DATA_WORDS_MAX` in `abi/syscall`). Above this size a
+single inline reply cannot carry the bytes; below it the per-call cost
+is strictly cheaper than the frame path on both supported architectures.
+
+The page-alignment clause forces frame for any read that straddles a
+page tail even if its size fits inline, because the frame path's
+single-page granularity matches the on-disk page-cache layout, whereas
+an inline reply spanning two pages would force the server to assemble
+contiguous bytes across the boundary.
+
+### Measured per-call cost (`fsbench`, debug builds)
+
+Source: `base/fsbench/src/main.rs`. The bench loops 256 timed iterations
+of "seek to 0; read N bytes via the chosen path" against a 64 KiB
+fixture (`/usertest/bench.bin`). The inline path chunks into ≤ 504-byte
+non-straddling reads; the frame path always passes a full-page buffer
+so `want > 504` forces a frame call. `cycles_now()` uses `rdtsc` on
+x86_64 and `csrr cycle` on riscv64. Numbers below are `cycles_mean`.
+
+**x86_64 (KVM-accelerated, TSC = hardware cycles)**
+
+| Size (B) | Inline calls | Inline cycles | Frame calls | Frame cycles |
+|---------:|-------------:|--------------:|------------:|-------------:|
+| 16       | 1            | 61 426        | 1           | 123 139      |
+| 1 024    | 3            | 236 906       | 1           | 130 553      |
+| 4 096    | 9            | 938 019       | 1           | 244 221      |
+| 16 384   | 33           | 3 780 641     | 4           | 1 000 699    |
+| 65 536   | 130          | 15 347 991    | 16          | 3 987 730    |
+
+**riscv64 (TCG-emulated, `cycle` CSR via `scounteren.CY`)**
+
+| Size (B) | Inline calls | Inline cycles | Frame calls | Frame cycles |
+|---------:|-------------:|--------------:|------------:|-------------:|
+| 16       | 1            | 548 333       | 1           | 1 232 195    |
+| 1 024    | 3            | 2 131 616     | 1           | 1 383 683    |
+| 4 096    | 9            | 8 205 397     | 1           | 2 389 154    |
+| 16 384   | 33           | 33 249 701    | 4           | 9 735 094    |
+| 65 536   | 130          | 134 748 016   | 16          | 39 159 872   |
+
+**Reading the table:** the single-call inline cost is consistently
+≈ 0.5× the single-call frame cost on both architectures. Once the
+request exceeds 504 bytes the inline path must issue ≥ 2 calls and
+loses to the single frame call. Below 504 bytes inline always wins.
+The threshold is therefore set to the IPC payload ceiling: not by
+coincidence, but by measurement.
+
+Absolute riscv64 cycles run ≈ 10× x86_64 because riscv64 boots under
+TCG (no KVM); the *ratio* between paths is what informs the policy.
 
 ---
 

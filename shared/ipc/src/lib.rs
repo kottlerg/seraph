@@ -232,6 +232,41 @@ pub mod procmgr_labels
     /// hands it to real-logd at bootstrap; the un-tokened or
     /// differently-tokened twins are rejected.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
+
+    /// Hand init's kernel-object caps + reclaimable Frame caps to procmgr
+    /// for post-death reap. Init calls this in the post-Phase-3 exit
+    /// path, then `sys_thread_exit`s.
+    ///
+    /// First round (`is_first = data[0] != 0`):
+    ///   `caps[0]` = init's `AddressSpace` cap (MOVED out of init's `CSpace`).
+    ///   `caps[1]` = init's `CSpace` cap (MOVED).
+    ///   `caps[2]` = init's main `Thread` cap (MOVED).
+    ///   `caps[3]` = init-logd `Thread` cap (MOVED; may be the same slot
+    ///               as a previously-exited thread — its TCB is reclaimed
+    ///               on `cap_delete` regardless of state).
+    /// Subsequent rounds (`data[0] == 0`):
+    ///   `caps[0..N]` = reclaimable Frame caps (segments + stack +
+    ///                  `InitInfo` + IPC buffer + any other init-owned
+    ///                  donatable Frame). MOVED out of init's `CSpace`
+    ///                  via IPC cap-transfer; procmgr accumulates them
+    ///                  for the eventual `memmgr.DONATE_FRAMES` chunk.
+    ///
+    /// Procmgr binds the death-EQ on init's main thread with correlator
+    /// `INIT_REAP_CORRELATOR` as part of the first round. Each round
+    /// replies `procmgr_errors::SUCCESS`.
+    pub const REGISTER_INIT_TEARDOWN: u64 = 15;
+
+    /// Signal end of init's reap-handoff cap stream. After this call
+    /// init has no caps left to transfer; procmgr's state machine
+    /// transitions to "armed", awaiting the death-EQ event. Init
+    /// calls `sys_thread_exit` immediately after this IPC replies.
+    pub const INIT_TEARDOWN_DONE: u64 = 16;
+
+    /// Reserved death-notification correlator used by `REGISTER_INIT_TEARDOWN`.
+    /// Per-child correlators are `process_token as u32` starting at
+    /// `log_tokens::LOG_TOKEN_FIRST_CHILD = 16`; reserving the top of
+    /// the u32 range avoids collision.
+    pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
 
 pub const MEMMGR_LABELS_VERSION: u32 = 1;

@@ -451,9 +451,11 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // TODO: see above — log-thread ownership transfers to real logd.
+    // Log thread cap retained so init's reap-handoff
+    // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it, letting procmgr
+    // reclaim the init-logd TCB after init's main thread exits.
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
-    logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
+    let init_logd_thread_cap = logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
 
     // Tokened SEND on the log endpoint for init's own `log()` lines so
     // they appear under `[init]`. `LOG_TOKEN_INIT` (= 1) is reserved
@@ -876,6 +878,8 @@ fn run(info_ptr: u64) -> !
         system_root_cap,
         root_mount.root_cap,
         ipc_buf,
+        init_logd_thread_cap,
+        ipc_cap,
     );
 }
 

@@ -23,6 +23,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
+mod init_reap;
 mod loader;
 mod process;
 
@@ -451,6 +452,16 @@ fn dispatch_ipc(
             handle_register_death_eq(&req, ipc_buf, table);
         }
 
+        procmgr_labels::REGISTER_INIT_TEARDOWN =>
+        {
+            init_reap::handle_register(&req, ipc_buf, ctx.death_eq);
+        }
+
+        procmgr_labels::INIT_TEARDOWN_DONE =>
+        {
+            init_reap::handle_done(ipc_buf);
+        }
+
         _ =>
         {
             reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
@@ -564,6 +575,14 @@ fn dispatch_death(
         };
         let correlator = (payload >> 32) as u32;
         let exit_reason = payload & 0xFFFF_FFFF;
+        if correlator == procmgr_labels::INIT_REAP_CORRELATOR
+        {
+            // Init's main thread exited. Run the reap sequence that
+            // tears down init's AS/CSpace/Thread objects and donates
+            // its reclaimable Frame caps to memmgr's pool.
+            init_reap::run_reap(memmgr_ep, ipc_buf);
+            continue;
+        }
         if let Some(entry) = table.take_by_correlator(correlator)
         {
             let entry_token = entry.token();

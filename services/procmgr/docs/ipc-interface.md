@@ -237,6 +237,43 @@ keep `wait_set_add` and `event_try_recv` working.
 
 ---
 
+## REGISTER_INIT_TEARDOWN — init reap handoff
+
+Wire format:
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::REGISTER_INIT_TEARDOWN` (15) |
+| `data[0]` | `1` on the first round (carrying kernel-object caps); `0` on subsequent donation rounds |
+| `caps[0..]` | Round 1: 4 kernel-object caps (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) — MOVED out of init's CSpace via IPC cap-transfer. Subsequent rounds: 1-4 reclaimable Frame caps per round (segments, stack, `InitInfo` pages, IPC buffer). |
+
+On the first round procmgr stores the kernel-object caps and calls
+`syscall::thread_bind_notification(main_thread, death_eq,
+procmgr_labels::INIT_REAP_CORRELATOR)`. Subsequent rounds append to
+the donation Frame cap list. `INIT_TEARDOWN_DONE` (label 16, no
+caps, no data words) closes the stream and arms the state machine.
+
+Reply: `procmgr_errors::SUCCESS` on accept, `INVALID_ARGUMENT` on
+wrong round shape (wrong cap count on round 1, or `done` before any
+round 1).
+
+## INIT_TEARDOWN_DONE — end-of-stream signal
+
+Wire format:
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::INIT_TEARDOWN_DONE` (16) |
+| caps | none |
+
+Procmgr replies `SUCCESS` then arms the state machine. Init proceeds
+to `sys_thread_exit` immediately; the death-EQ event with
+`INIT_REAP_CORRELATOR` (reserved `u32::MAX`) triggers
+[`init_reap::run_reap`](../src/init_reap.rs) which executes the six-step
+teardown (Threads → AddressSpace → DONATE_FRAMES → CSpace → log).
+
+---
+
 ## Relevant Design Documents
 
 | Document | Content |

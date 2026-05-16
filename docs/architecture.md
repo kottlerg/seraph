@@ -79,9 +79,15 @@ under explicit capability grants.
 
 **init**
 First userspace process. Starts memmgr and procmgr, requests early services
-(devmgr, svcmgr, drivers, vfsd), delegates capabilities, and exits. See
-[`abi/boot-protocol/`](../abi/boot-protocol/) and
-[`process-lifecycle.md`](process-lifecycle.md) for the userspace boot order.
+(devmgr, svcmgr, drivers, vfsd), delegates capabilities, then hands its own
+`AddressSpace` / `CSpace` / `Thread` caps plus every reclaimable Frame cap
+(segments, stack, `InitInfo` pages, IPC buffer) to procmgr via
+`REGISTER_INIT_TEARDOWN` and exits. Procmgr's death-EQ observer fires on
+the exit and reclaims every init resource — kernel objects torn down,
+Frame caps donated to memmgr's pool. After reap, zero init residue
+remains in the system. See [`abi/boot-protocol/`](../abi/boot-protocol/),
+[`process-lifecycle.md`](process-lifecycle.md) §"Init reap", and
+`services/procmgr/src/init_reap.rs`.
 
 **memmgr**
 Owns the userspace RAM frame pool. Receives all RAM Frame caps from init at

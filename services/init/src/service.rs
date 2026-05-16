@@ -1350,6 +1350,8 @@ pub fn phase3_svcmgr_handover(
     system_root_cap: u32,
     fatfs_root_cap: u32,
     ipc_buf: *mut u64,
+    init_logd_thread_cap: u32,
+    init_ipc_buf_cap: u32,
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
@@ -1498,26 +1500,112 @@ pub fn phase3_svcmgr_handover(
         _ => log("phase 3: handover failed"),
     }
 
-    // Init's main thread now exits cleanly. With init-logd already
-    // terminated (driven by real-logd's HANDOVER_PULL at end of
-    // Phase 2), no init thread remains; the kernel will reap init's
-    // address space and CSpace, returning every dynamically
-    // allocated (FrameAlloc-sourced) page to memmgr's buddy pool.
-    //
-    // NOTE: init's ELF segment Frame caps are minted by the kernel
-    // without `RETYPE` and with `owns_memory=false`
-    // (`core/kernel/src/main.rs:382-396`) — they are bootloader-
-    // loaded pages outside memmgr's buddy pool by design. They
-    // cannot be `DONATE_FRAMES`'d to memmgr (memmgr rejects them in
-    // `handle_donate_frames` per the `RETYPE` gate at
-    // `services/memmgr/src/main.rs:890`). Issue #5's "DONATE_FRAMES
-    // of init segments" therefore requires kernel changes (mint
-    // these caps with RETYPE + owns_memory, or add a separate
-    // memmgr ingestion path for non-pool pages). Not in scope here;
-    // surfaced as a follow-up. The init-logd termination and main-
-    // thread exit that this PR delivers are the real prerequisites.
-    log("main thread exiting; init process terminates");
+    // Reap-handoff: move init's kernel-object caps + every reclaimable
+    // Frame cap to procmgr. Procmgr binds a death-EQ on init's main
+    // thread; when this function returns into `sys_thread_exit`
+    // immediately below, procmgr's reap path tears init's AS/CSpace
+    // /Threads down and donates the Frame caps to memmgr's pool.
+    handoff_to_procmgr_reap(
+        info,
+        procmgr_ep,
+        init_logd_thread_cap,
+        init_ipc_buf_cap,
+        ipc_buf,
+    );
+
+    log("main thread exiting; init handed off to procmgr for reap");
     syscall::thread_exit();
+}
+
+/// Move init's kernel-object caps + every reclaimable Frame cap to
+/// procmgr via `REGISTER_INIT_TEARDOWN`, then signal
+/// `INIT_TEARDOWN_DONE`. IPC cap-transfer MOVES caps, so after this
+/// returns init's `CSpace` no longer holds the transferred slots.
+///
+/// Failures here are logged but otherwise non-fatal — init still calls
+/// `sys_thread_exit` afterward, just leaving the un-transferred caps
+/// to cascade through `CSpace` teardown to the kernel buddy on eventual
+/// cap death.
+fn handoff_to_procmgr_reap(
+    info: &InitInfo,
+    procmgr_ep: u32,
+    init_logd_thread_cap: u32,
+    init_ipc_buf_cap: u32,
+    ipc_buf: *mut u64,
+)
+{
+    // Round 1: kernel-object caps. `data[0] = 1` distinguishes from
+    // subsequent donate-only rounds.
+    let round1 = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN)
+        .word(0, 1)
+        .cap(info.aspace_cap)
+        .cap(info.cspace_cap)
+        .cap(info.thread_cap)
+        .cap(init_logd_thread_cap)
+        .build();
+    // SAFETY: ipc_buf is init's registered IPC buffer; procmgr_ep carries SEND|GRANT.
+    if let Ok(reply) = unsafe { ipc::ipc_call(procmgr_ep, &round1, ipc_buf) }
+    {
+        if reply.label != ipc::procmgr_errors::SUCCESS
+        {
+            log("reap-handoff: procmgr refused kernel-object round; aborting handoff");
+            return;
+        }
+    }
+    else
+    {
+        log("reap-handoff: kernel-object round IPC failed; aborting handoff");
+        return;
+    }
+
+    // Donatable Frame caps: segments + stack + InitInfo region + IPC
+    // buffer. Other init-owned Frame caps (endpoint slab, leftover
+    // FrameAlloc tails) fall to the CSpace cascade — they end up in
+    // the kernel buddy rather than memmgr's pool.
+    let seg = info.segment_frame_base..info.segment_frame_base + info.segment_frame_count;
+    let stack =
+        info.init_stack_frame_base..info.init_stack_frame_base + info.init_stack_frame_count;
+    let inf = info.init_info_frame_base..info.init_info_frame_base + info.init_info_frame_count;
+
+    let mut donate: [u32; 32] = [0; 32];
+    let mut n = 0usize;
+    for slot in seg.chain(stack).chain(inf)
+    {
+        if n < donate.len()
+        {
+            donate[n] = slot;
+            n += 1;
+        }
+    }
+    if init_ipc_buf_cap != 0 && n < donate.len()
+    {
+        donate[n] = init_ipc_buf_cap;
+        n += 1;
+    }
+
+    let chunk_size = syscall_abi::MSG_CAP_SLOTS_MAX;
+    let mut i = 0usize;
+    while i < n
+    {
+        let end = (i + chunk_size).min(n);
+        let mut builder = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN).word(0, 0);
+        for &slot in &donate[i..end]
+        {
+            builder = builder.cap(slot);
+        }
+        let msg = builder.build();
+        // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
+        let _ = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) };
+        i = end;
+    }
+
+    // Signal the cap stream is closed. Procmgr arms the death-EQ
+    // observer; the next event with INIT_REAP_CORRELATOR triggers the
+    // reap. (Done by this point — REGISTER_INIT_TEARDOWN's first round
+    // already bound the EQ.)
+    let done = IpcMessage::new(procmgr_labels::INIT_TEARDOWN_DONE);
+    // SAFETY: ipc_buf is registered.
+    let _ = unsafe { ipc::ipc_call(procmgr_ep, &done, ipc_buf) };
 }
 
 // ── logd spawn ──────────────────────────────────────────────────────────────

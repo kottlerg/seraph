@@ -357,6 +357,15 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 .unwrap_or_else(|_| fatal("Phase 9: cannot insert init AddressSpace cap"));
 
             // Frame caps for each init segment (phys base + size + permissions).
+            // Minted reclaimable: full byte ledger + `owns_memory = true` +
+            // `register_owned_range` so init's reap-handoff donation
+            // (`procmgr.REGISTER_INIT_TEARDOWN` → `memmgr.DONATE_FRAMES`)
+            // can route these pages into memmgr's pool, and any cascade-
+            // delete via `dealloc_object` returns them to the buddy. The
+            // segments live in EFI LoaderData (not in the buddy free list
+            // at boot — see `mm/init.rs` exclusion list), so the buddy
+            // must register them as managed-but-not-free before a
+            // subsequent `free_range` can balance the page accounting.
             let seg_count = init_image.segment_count as usize;
             let mut seg_base: u32 = 0;
             for i in 0..seg_count
@@ -364,9 +373,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 let seg = &init_image.segments[i];
                 let rights = match seg.flags
                 {
-                    SegmentFlags::Read => Rights::MAP,
-                    SegmentFlags::ReadWrite => Rights::MAP | Rights::WRITE,
-                    SegmentFlags::ReadExecute => Rights::MAP | Rights::EXECUTE,
+                    SegmentFlags::Read => Rights::MAP | Rights::RETYPE,
+                    SegmentFlags::ReadWrite => Rights::MAP | Rights::WRITE | Rights::RETYPE,
+                    SegmentFlags::ReadExecute => Rights::MAP | Rights::EXECUTE | Rights::RETYPE,
                 };
                 // The bootloader encodes the ELF in-page offset into
                 // `phys_addr` so `map_segment` can preserve
@@ -379,6 +388,14 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 let phys_aligned = seg.phys_addr & !page_mask;
                 let in_page_off = seg.phys_addr & page_mask;
                 let size_aligned = (in_page_off + seg.size + page_mask) & !page_mask;
+                // SAFETY: segment phys range is disjoint from buddy
+                // free list (excluded in `mm/init.rs::collect_exclusions`)
+                // and from boot module ranges; single-threaded boot.
+                unsafe {
+                    crate::mm::with_frame_allocator(|alloc| {
+                        alloc.register_owned_range(phys_aligned, size_aligned);
+                    });
+                }
                 let fo_nn = cap::mint_phase7_body(FrameObject {
                     header: KernelObjectHeader::with_ancestor(
                         ObjectType::Frame,
@@ -386,11 +403,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     ),
                     base: phys_aligned,
                     size: size_aligned,
-                    // Init ELF segment: not retypable; cap minted without RETYPE.
-                    available_bytes: core::sync::atomic::AtomicU64::new(0),
-                    // Init ELF segments are bootloader-loaded pages outside
-                    // the buddy pool; never return them.
-                    owns_memory: core::sync::atomic::AtomicBool::new(false),
+                    available_bytes: core::sync::atomic::AtomicU64::new(size_aligned),
+                    owns_memory: core::sync::atomic::AtomicBool::new(true),
                     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
@@ -413,8 +427,13 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         // ── Populate InitInfo region ─────────────────────────────────────────
         // Allocate enough physical pages for InitInfo + CapDescriptor array +
         // command line, fill them via the direct map, then map read-only into
-        // init's address space starting at INIT_INFO_VADDR.
+        // init's address space starting at INIT_INFO_VADDR. Each backing page
+        // also gets a reclaimable Frame cap minted into init's CSpace so the
+        // pages flow into memmgr's pool through init's reap-handoff donate
+        // path (see `services/init/src/service.rs` end-of-phase-3).
         let info_page_virt = {
+            use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+            use cap::slot::{CapTag, Rights};
             use init_protocol::{INIT_INFO_VADDR, INIT_PROTOCOL_VERSION, InitInfo};
 
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
@@ -452,6 +471,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             }
             let mut page_ptrs: [*mut u8; init_protocol::INIT_INFO_MAX_PAGES] =
                 [core::ptr::null_mut(); init_protocol::INIT_INFO_MAX_PAGES];
+            let mut page_phys: [u64; init_protocol::INIT_INFO_MAX_PAGES] =
+                [0u64; init_protocol::INIT_INFO_MAX_PAGES];
 
             for pg in 0..info_pages
             {
@@ -466,6 +487,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 unsafe { (*init_as_ptr).map_page(map_va, phys, flags) }
                     .unwrap_or_else(|()| fatal("Phase 9: failed to map InitInfo page"));
                 page_ptrs[pg] = virt;
+                page_phys[pg] = phys;
             }
             let info_base = page_ptrs[0];
 
@@ -503,6 +525,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 acpi_region_frame_base: cspace_layout.acpi_region_frame_base,
                 acpi_region_frame_count: cspace_layout.acpi_region_frame_count,
                 dtb_frame_cap: cspace_layout.dtb_frame_slot,
+                init_stack_frame_base: 0,  // patched after stack mint
+                init_stack_frame_count: 0, // patched after stack mint
+                init_info_frame_base: 0,   // patched after self-mint below
+                init_info_frame_count: 0,  // patched after self-mint below
                 _pad_tail: 0,
             };
 
@@ -547,6 +573,61 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 }
             }
 
+            // Mint a reclaimable Frame cap per InitInfo page so init's
+            // reap-handoff donates the pages back to memmgr after AS
+            // teardown. Caps carry MAP|READ rights (matching the
+            // userspace mapping) and the standard reclaim flags
+            // (RETYPE + owns_memory=true + full ledger).
+            // SAFETY: ROOT_CSPACE initialised in Phase 7; single-threaded boot.
+            let cs = unsafe { cap::root_cspace_mut() }
+                .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing for InitInfo mint"));
+            let mut info_frame_base_slot: u32 = 0;
+            for pg in 0..info_pages
+            {
+                let phys = page_phys[pg];
+                // SAFETY: page was just buddy-allocated above and is not
+                // double-registered; single-threaded boot.
+                unsafe {
+                    crate::mm::with_frame_allocator(|alloc| {
+                        alloc.register_owned_range(phys, mm::PAGE_SIZE as u64);
+                    });
+                }
+                let fo_nn = cap::mint_phase7_body(FrameObject {
+                    header: KernelObjectHeader::with_ancestor(
+                        ObjectType::Frame,
+                        cap::seed_header_nn(),
+                    ),
+                    base: phys,
+                    size: mm::PAGE_SIZE as u64,
+                    available_bytes: core::sync::atomic::AtomicU64::new(mm::PAGE_SIZE as u64),
+                    owns_memory: core::sync::atomic::AtomicBool::new(true),
+                    allocator: crate::cap::retype::RetypeAllocator::new_inline(),
+                    lock: core::sync::atomic::AtomicU32::new(0),
+                });
+                let slot = cs
+                    .insert_cap(
+                        CapTag::Frame,
+                        Rights::MAP | Rights::READ | Rights::RETYPE,
+                        fo_nn,
+                    )
+                    .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Frame cap"));
+                if pg == 0
+                {
+                    info_frame_base_slot = slot.get();
+                }
+            }
+
+            // Patch the just-written InitInfo header with the self-
+            // referential cap slot range.
+            // SAFETY: info_base mapped writable through the direct map;
+            // header lives at offset 0; single-threaded boot.
+            #[allow(clippy::cast_ptr_alignment)]
+            unsafe {
+                let info_ptr = info_base.cast::<InitInfo>();
+                (*info_ptr).init_info_frame_base = info_frame_base_slot;
+                (*info_ptr).init_info_frame_count = info_pages as u32;
+            }
+
             kprintln!(
                 "init: info at {:#x} ({} cap descriptors, {} pages)",
                 INIT_INFO_VADDR,
@@ -554,19 +635,102 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 info_pages,
             );
 
+            // Suppress unused-variable warnings: both values were already
+            // patched into InitInfo above; the block returns only the
+            // direct-map pointer that callers use for further patching.
+            let _ = (info_frame_base_slot, info_pages);
             info_base
         };
 
-        // Map init's user stack (INIT_STACK_PAGES pages below INIT_STACK_TOP).
-        // SAFETY: init_as_ptr valid (allocated above); stack_top is page-aligned
-        // constant within user address range; frame allocator validated in Phase 2.
+        // Map init's user stack (INIT_STACK_PAGES pages below INIT_STACK_TOP)
+        // and mint a reclaimable Frame cap for each backing page. Inlined
+        // (rather than calling `map_stack`) so we capture each phys address
+        // for cap minting; `register_owned_range` accounts for the pages so
+        // dealloc-driven `free_range` keeps the buddy ledger balanced.
+        let (init_stack_frame_base, init_stack_frame_count) = {
+            use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+            use cap::slot::{CapTag, Rights};
+
+            const STACK_PAGES: usize = mm::address_space::INIT_STACK_PAGES;
+            let stack_top = mm::address_space::INIT_STACK_TOP;
+            let rw_flags = mm::paging::PageFlags {
+                readable: true,
+                writable: true,
+                executable: false,
+                uncacheable: false,
+            };
+
+            // SAFETY: ROOT_CSPACE initialised in Phase 7; single-threaded boot.
+            let cs = unsafe { cap::root_cspace_mut() }
+                .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing for stack mint"));
+
+            let mut base_slot: u32 = 0;
+            for i in 0..STACK_PAGES
+            {
+                let phys = crate::mm::with_frame_allocator(|alloc| alloc.alloc(0))
+                    .unwrap_or_else(|| fatal("Phase 9: cannot allocate init stack page"));
+
+                // Zero the page through the kernel direct map.
+                // SAFETY: phys_to_virt yields a valid kernel virtual address.
+                unsafe {
+                    let virt = mm::paging::phys_to_virt(phys);
+                    core::ptr::write_bytes(virt as *mut u8, 0, mm::PAGE_SIZE);
+                }
+
+                let virt = stack_top - ((i + 1) * mm::PAGE_SIZE) as u64;
+                // SAFETY: virt in user range; phys freshly allocated.
+                unsafe {
+                    (*init_as_ptr)
+                        .map_page(virt, phys, rw_flags)
+                        .unwrap_or_else(|()| fatal("Phase 9: failed to map init stack page"));
+                }
+
+                // Register and mint a reclaimable Frame cap covering this page.
+                // SAFETY: page just allocated from the buddy and not yet
+                // double-registered; single-threaded boot.
+                unsafe {
+                    crate::mm::with_frame_allocator(|alloc| {
+                        alloc.register_owned_range(phys, mm::PAGE_SIZE as u64);
+                    });
+                }
+                let fo_nn = cap::mint_phase7_body(FrameObject {
+                    header: KernelObjectHeader::with_ancestor(
+                        ObjectType::Frame,
+                        cap::seed_header_nn(),
+                    ),
+                    base: phys,
+                    size: mm::PAGE_SIZE as u64,
+                    available_bytes: core::sync::atomic::AtomicU64::new(mm::PAGE_SIZE as u64),
+                    owns_memory: core::sync::atomic::AtomicBool::new(true),
+                    allocator: crate::cap::retype::RetypeAllocator::new_inline(),
+                    lock: core::sync::atomic::AtomicU32::new(0),
+                });
+                let slot = cs
+                    .insert_cap(
+                        CapTag::Frame,
+                        Rights::MAP | Rights::READ | Rights::WRITE | Rights::RETYPE,
+                        fo_nn,
+                    )
+                    .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Frame cap"));
+                if i == 0
+                {
+                    base_slot = slot.get();
+                }
+            }
+            // The guard page (one page below the stack) is intentionally left
+            // unmapped: accessing it will fault, catching stack overflows.
+            (base_slot, STACK_PAGES as u32)
+        };
+
+        // Patch InitInfo with the just-minted stack cap slot range.
+        // SAFETY: info_page_virt mapped writable through the direct map;
+        // header at offset 0; single-threaded boot.
+        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
-            (*init_as_ptr).map_stack(
-                mm::address_space::INIT_STACK_TOP,
-                mm::address_space::INIT_STACK_PAGES,
-            )
+            let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
+            (*info_ptr).init_stack_frame_base = init_stack_frame_base;
+            (*info_ptr).init_stack_frame_count = init_stack_frame_count;
         }
-        .unwrap_or_else(|()| fatal("Phase 9: failed to map init stack"));
 
         // Retype a 6-page slab from SEED_FRAME for init's Thread:
         //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)

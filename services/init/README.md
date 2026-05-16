@@ -98,17 +98,35 @@ Init's responsibilities are strictly bounded:
    all started services with svcmgr along with their restart policies
    and capability sets.
 
-9. **Exit** — init calls `sys_thread_exit`. By this point init-logd
-   has also terminated (driven by real-logd's `HANDOVER_PULL` at
-   end of Phase 2), so init holds no surviving threads. The kernel
-   tears down init's address space and CSpace; init's
-   `FrameAlloc`-sourced pages return to memmgr's buddy pool
-   automatically. (Init's bootloader-loaded ELF segment frames are
-   minted without `RETYPE` and without `owns_memory` — they stay
-   outside memmgr's pool until kernel-side work tracked separately
-   adds a non-RETYPE donation path.) Init holds no long-lived
-   state, no supervision capability, and no restart authority;
-   svcmgr takes over.
+9. **Reap handoff and exit** — init hands its own `AddressSpace`,
+   `CSpace`, main `Thread`, and init-logd `Thread` caps plus every
+   reclaimable Frame cap (segments, stack, `InitInfo` region, IPC
+   buffer) to procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN`
+   (multi-round; IPC cap-transfer MOVES the caps out of init's
+   CSpace). After `INIT_TEARDOWN_DONE`, init calls
+   `sys_thread_exit`. The kernel mints all four resource classes at
+   Phase 9 with `RETYPE` + `owns_memory=true` + the full
+   `available_bytes` ledger + `register_owned_range`, so each cap is
+   eligible for `memmgr.DONATE_FRAMES` ingestion.
+
+   Procmgr's death-EQ observer (bound on init's main thread with
+   `INIT_REAP_CORRELATOR`) fires on the exit and runs
+   [`init_reap::run_reap`](../procmgr/src/init_reap.rs):
+
+   1. `cap_delete` both `Thread` caps → TCBs reclaimed.
+   2. `cap_revoke + cap_delete` init's `AddressSpace` → PT chunks
+      `retype_free`'d, every user-page mapping vanishes.
+   3. `DONATE_FRAMES` the accumulated Frame caps to memmgr → the
+      segment / stack / `InitInfo` / IPC-buffer pages enter
+      memmgr's pool, safely (no aliasing — the AS is already dead).
+   4. `cap_revoke + cap_delete` init's `CSpace` → cascade dec_refs
+      every cap init still held (endpoint SENDs, endpoint slab
+      Frame, leftover `FrameAlloc` tails). Those with
+      `owns_memory=true` return their pages to the kernel buddy via
+      `dealloc_object`'s `free_range` (kernel-internal, not
+      memmgr's pool).
+   5. Procmgr logs a summary line. No init-related kernel object
+      remains; svcmgr takes over as the resident supervisor.
 
 memmgr and procmgr are the only two processes init creates via raw
 syscalls. Every later service is spawned via IPC to procmgr.

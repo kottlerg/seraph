@@ -225,7 +225,18 @@ fn ipc_log(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 /// Spawn a dedicated log-receiving thread so the main thread can continue
 /// bootstrap orchestration (making IPC calls to vfsd etc.) without blocking
 /// service log output.
-pub fn spawn_log_thread(info: &InitInfo, alloc: &mut FrameAlloc, log_ep: u32, ioport_cap: u32)
+///
+/// Returns the init-logd Thread cap slot so the main thread can include it
+/// in the post-Phase-3 reap-handoff (`procmgr.REGISTER_INIT_TEARDOWN`).
+/// The cap survives init-logd's `sys_thread_exit` — the kernel marks the
+/// TCB Exited but does not reclaim it until `cap_delete` drops the cap's
+/// last reference.
+pub fn spawn_log_thread(
+    info: &InitInfo,
+    alloc: &mut FrameAlloc,
+    log_ep: u32,
+    ioport_cap: u32,
+) -> u32
 {
     // Allocate stack pages for the log thread.
     for i in 0..LOG_THREAD_STACK_PAGES
@@ -322,6 +333,7 @@ pub fn spawn_log_thread(info: &InitInfo, alloc: &mut FrameAlloc, log_ep: u32, io
         log("init: FATAL: cannot start log thread");
         syscall::thread_exit();
     }
+    thread_cap
 }
 
 /// Entry point for the log thread. Registers its own IPC buffer then enters

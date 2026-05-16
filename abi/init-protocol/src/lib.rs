@@ -36,7 +36,7 @@
 /// v4: Added `cspace_cap` slot for init's own `CSpace` cap.
 /// v3: Added `cmdline_offset`, `cmdline_len`, and `sbi_control_cap` for kernel
 ///     command line passthrough and RISC-V SBI forwarding.
-pub const INIT_PROTOCOL_VERSION: u32 = 5;
+pub const INIT_PROTOCOL_VERSION: u32 = 6;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -178,6 +178,32 @@ pub struct InitInfo
     /// Slot index of the read-only `Frame` cap covering the DTB blob,
     /// or zero if no DTB was supplied (pure-ACPI platforms).
     pub dtb_frame_cap: u32,
+
+    // ── Init self-reclaim cap surfaces (added in protocol v6) ───────────
+    /// First slot index of init's user stack `Frame` caps.
+    ///
+    /// Each cap covers one 4 KiB stack page; init holds
+    /// `init_stack_frame_count` consecutive caps starting at this slot.
+    /// Used by init's reap-handoff (`procmgr.REGISTER_INIT_TEARDOWN`) to
+    /// donate the stack pages back to memmgr's pool after init's
+    /// `AddressSpace` is torn down. Zero if the kernel did not mint stack
+    /// caps (legacy boot path).
+    pub init_stack_frame_base: u32,
+    /// Number of stack `Frame` caps (typically `INIT_STACK_PAGES = 4`).
+    pub init_stack_frame_count: u32,
+
+    /// First slot index of init's `InitInfo`-region `Frame` caps.
+    ///
+    /// Each cap covers one 4 KiB page of the kernel-allocated
+    /// `InitInfo` region (header + `CapDescriptor` array + command
+    /// line). Donated alongside the stack caps in init's reap-handoff.
+    /// The cap range includes the page that contains this `InitInfo`
+    /// struct itself — once init has read `InitInfo` at `_start`, the
+    /// pages can be reclaimed safely. Zero if the kernel did not mint
+    /// `InitInfo` caps (legacy boot path).
+    pub init_info_frame_base: u32,
+    /// Number of `InitInfo` `Frame` caps (1..=[`INIT_INFO_MAX_PAGES`]).
+    pub init_info_frame_count: u32,
 
     /// Explicit 4-byte tail pad so `size_of::<InitInfo>()` stays 8-byte
     /// aligned. Consumers of `cap_descriptors_offset` rely on this: the

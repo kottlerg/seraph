@@ -48,6 +48,26 @@ procmgr/
   notify memmgr.
 - **Process registry** — maintain a table of running processes; answer
   queries from svcmgr and other services.
+- **Per-child log cap seeding** — derive a tokened SEND cap on the
+  master log endpoint at every spawn (token = the child's process
+  token) and install the slot at `ProcessInfo.log_send_cap`. The
+  un-tokened source cap arrives in procmgr's bootstrap round from
+  init. Children call `seraph::log!` directly through the seeded
+  cap; no `GET_LOG_CAP` discovery roundtrip.
+- **Death-notification fan-out to logd** — accept
+  `REGISTER_DEATH_EQ` from real-logd (gated by the
+  `DEATH_EQ_AUTHORITY` token), store logd's `EventQueue` cap, bind
+  it retroactively on every existing thread, and bind it on every
+  new spawn alongside procmgr's own death observer (correlator =
+  process token, equal to logd's per-sender slot key).
+- **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff
+  at end-of-Phase-3 (init's own `AddressSpace` / `CSpace` / `Thread`
+  caps + every reclaimable Frame cap), bind a death-EQ observer on
+  init's main thread with `INIT_REAP_CORRELATOR`, then on the death
+  event (driven by init's `sys_thread_exit`) tear down init's
+  kernel objects in order (Threads → AddressSpace → donate Frame
+  caps to memmgr → CSpace), leaving zero init residue. See
+  [`src/init_reap.rs`](src/init_reap.rs).
 
 ---
 

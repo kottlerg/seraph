@@ -113,12 +113,13 @@ pub struct StartupInfo {
     pub stderr_data_signal_cap: u32,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stderr_space_signal_cap: u32,
-    /// Un-tokened SEND cap on the system log endpoint (the "discovery
-    /// cap"). Used by [`log!`] to lazy-acquire a tokened SEND cap on
-    /// first call via the `GET_LOG_CAP` IPC. Zero when no logger is
-    /// reachable; the macro silently drops.
+    /// Tokened SEND cap on the system log endpoint, pre-installed by
+    /// procmgr at spawn time. Used by [`log!`] directly — no
+    /// discovery roundtrip. Zero when no logger is reachable
+    /// (init/memmgr/procmgr themselves, or anything earlier in the
+    /// boot chain than the log endpoint); the macro silently drops.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub log_discovery_cap: u32,
+    pub log_send_cap: u32,
     /// Virtual address of the `PT_TLS` template in the loaded image, or 0
     /// when the binary has no TLS segment.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -338,7 +339,7 @@ pub extern "C" fn _start() -> ! {
         stdout_space_signal_cap: info.stdout_space_signal_cap,
         stderr_data_signal_cap: info.stderr_data_signal_cap,
         stderr_space_signal_cap: info.stderr_space_signal_cap,
-        log_discovery_cap: info.log_discovery_cap,
+        log_send_cap: info.log_send_cap,
         tls_template_vaddr: info.tls_template_vaddr,
         tls_template_filesz: info.tls_template_filesz,
         tls_template_memsz: info.tls_template_memsz,
@@ -373,10 +374,11 @@ pub extern "C" fn _start() -> ! {
         info.self_aspace_cap,
     );
 
-    // Install the log discovery cap so `seraph::log!` can lazy-acquire
-    // a tokened SEND cap on first call. Zero is tolerated (the macro
-    // silently drops in processes without a logger).
-    ::log::set_discovery_cap(info.log_discovery_cap);
+    // Install the pre-seeded tokened log SEND cap procmgr placed in
+    // ProcessInfo. `seraph::log!` uses it directly with no discovery
+    // roundtrip. Zero is tolerated (the macro silently drops in
+    // processes without a logger).
+    ::log::install_tokened_cap(info.log_send_cap);
 
     // Stash the system-root namespace cap so `std::fs` (or any other
     // namespace-walking surface) can reach it. Zero passes through
@@ -649,11 +651,11 @@ pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_page
 
 // ── System log macro surface ────────────────────────────────────────────────
 //
-// The discovery cap installed at process create-time (recorded in
-// `StartupInfo::log_discovery_cap` and forwarded to `::log::set_discovery_cap`
-// during `_start`) drives a lazy `GET_LOG_CAP` round on first
-// `seraph::log!` call; the tokened cap is then cached process-globally for
-// the lifetime of the process.
+// The tokened SEND cap procmgr seeds at process create-time (recorded in
+// `StartupInfo::log_send_cap` and installed via `::log::install_tokened_cap`
+// during `_start`) is the destination of every `seraph::log!` call. No
+// discovery roundtrip; the cap is live from the first instruction of
+// user code.
 
 /// System-log access surface. Re-exports the `shared/log` wire-format
 /// helpers wrapped against the calling thread's registered IPC buffer.
@@ -661,11 +663,11 @@ pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_page
 pub mod log {
     use super::current_ipc_buf;
 
-    /// Acquire (or fetch the cached) tokened SEND cap on the system log
-    /// endpoint. First call performs one `GET_LOG_CAP` round-trip;
-    /// subsequent calls return the same cap from the process-global
-    /// cache. Returns `0` when no discovery cap is reachable or the
-    /// IPC buffer is not yet registered.
+    /// Return the cached tokened SEND cap on the system log endpoint
+    /// (pre-installed at `_start` from `ProcessInfo.log_send_cap`).
+    /// Returns `0` when no log cap was seeded for this process (init,
+    /// memmgr, procmgr themselves, or processes spawned before logd
+    /// existed).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn acquire() -> u32 {
         ::log::ensure_tokened_cap(current_ipc_buf())

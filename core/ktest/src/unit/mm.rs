@@ -13,8 +13,14 @@
 //!   `aspace_cap + 2` — RODATA segment frame (MAP)
 //!   `aspace_cap + 3` — BSS/DATA segment frame (MAP | WRITE)
 //!
-//! `frame_split` consumes the RODATA frame (`aspace_cap + 2`). TEXT and BSS
-//! frames are left intact for the tests that use them directly.
+//! Segment Frame caps own their physical memory (the kernel mints them with
+//! `owns_memory=true` so the init-reap donation cascade can return them to
+//! memmgr). Tests therefore MUST NOT `cap_delete` or otherwise dec-ref a
+//! segment cap (or a tail derived from one) while the segment is still
+//! mapped in ktest's own address space — the dealloc would buddy-free phys
+//! pages still referenced by live PTEs and silently alias future allocations.
+//! Split/merge/delete exercises operate on pool-allocated frames; segments
+//! are read-only test surfaces for `mem_map` / `mem_protect`.
 
 use syscall::{MAP_READONLY, MAP_WRITABLE, aspace_query, mem_map, mem_unmap};
 
@@ -26,7 +32,7 @@ const TEST_VA: u64 = 0x4000_0000;
 
 // ── SYS_FRAME_SPLIT / SYS_FRAME_MERGE ─────────────────────────────────────────
 
-/// Split-merge round-trip on the RODATA frame (Option D semantics).
+/// Split-merge round-trip on the RODATA segment cap (Option D semantics).
 ///
 /// Validates the full inverse relationship between `frame_split` and
 /// `frame_merge`:
@@ -40,16 +46,18 @@ const TEST_VA: u64 = 0x4000_0000;
 /// 4. The merged cap can be re-split at the same offset, proving the
 ///    merge correctly restored the parent's size and base.
 ///
-/// Consumes a tail off RODATA (`aspace_cap + 2`); TEXT and BSS frames are
-/// left intact. The merged cap is not exercised through `mem_map` because
-/// RODATA's underlying physical base is sub-page-offset by ELF loading
-/// and is not usable as a leaf-page mapping target — a separate concern
-/// from frame merging.
+/// The test exclusively uses `frame_split` / `frame_merge` and never
+/// `cap_delete` on a segment-derived tail. Segment caps own their
+/// physical memory (kernel mint sets `owns_memory=true` for the
+/// init-reap donation cascade), so a `cap_delete` of a tail whose phys
+/// range is still mapped in ktest's own address space would buddy-free
+/// pages while live PTEs alias them. `frame_merge` clears `owns_memory`
+/// on the consumed tail before `dec_ref`, so the matching round-trip
+/// leaves no dangling deletes and preserves the original mapping.
 pub fn frame_split_merge(ctx: &TestContext) -> TestResult
 {
     const PAGE: u64 = 0x1000;
 
-    // ── Split ─────────────────────────────────────────────────────────────
     let rodata_cap = ctx.aspace_cap + 2;
     let tail =
         syscall::frame_split(rodata_cap, PAGE).map_err(|_| "frame_split on RODATA failed")?;
@@ -58,18 +66,13 @@ pub fn frame_split_merge(ctx: &TestContext) -> TestResult
         return Err("frame_split returned the parent's slot for the tail");
     }
 
-    // ── Wrong-order merge must fail ───────────────────────────────────────
     if syscall::frame_merge(tail, rodata_cap).is_ok()
     {
         return Err("frame_merge(tail, parent) should fail (contiguity reversed)");
     }
 
-    // ── Correct-order merge ──────────────────────────────────────────────
     syscall::frame_merge(rodata_cap, tail).map_err(|_| "frame_merge halves failed")?;
 
-    // ── Re-split must work on the merged cap ──────────────────────────────
-    // If the merge did not correctly restore parent.size, splitting at the
-    // same offset would fail.
     let tail2 =
         syscall::frame_split(rodata_cap, PAGE).map_err(|_| "re-split of merged cap failed")?;
     if tail2 == rodata_cap
@@ -77,7 +80,11 @@ pub fn frame_split_merge(ctx: &TestContext) -> TestResult
         return Err("re-split returned parent slot for tail");
     }
 
-    syscall::cap_delete(tail2).map_err(|_| "cap_delete re-split tail failed")?;
+    // Restore RODATA to its original size via merge. Using `cap_delete`
+    // here would dec-ref a Frame whose phys range is still mapped at
+    // RODATA's segment VA; the dealloc path would buddy-free pages live
+    // in ktest's own page tables.
+    syscall::frame_merge(rodata_cap, tail2).map_err(|_| "final frame_merge failed")?;
     Ok(())
 }
 

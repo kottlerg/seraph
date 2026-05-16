@@ -122,9 +122,57 @@ procmgr's `CREATE_PROCESS` endpoint. For each service, init delegates
 the appropriate capability subset (see
 [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution") and registers the service with svcmgr along with its
-restart policy. Init then exits.
+restart policy.
 
-After init exits, svcmgr is the resident supervisor. See
+### Init reap
+
+After Phase 3 (svcmgr handover complete, usertest spawned), init signs
+over its own kernel-object caps and every reclaimable Frame cap to
+procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN` and then
+`sys_thread_exit`s.
+
+Caps moved in the handoff:
+
+1. **Kernel-object caps** (first round):
+   - Init's own `AddressSpace`.
+   - Init's own `CSpace`.
+   - Init's main `Thread`.
+   - Init-logd's `Thread` (already in `Exited` state — TCB lingers
+     until cap death drives the dealloc).
+
+2. **Reclaimable Frame caps** (subsequent rounds, up to 4 caps per IPC):
+   - Init's ELF segment caps (kernel-minted at Phase 9 with
+     `RETYPE` + `owns_memory=true` + `available_bytes = size`).
+   - Init's user stack pages (one cap per page, same flags).
+   - Init's `InitInfo` region pages (one cap per page, same flags).
+   - Init's IPC buffer page (init-created via `FrameAlloc`).
+
+Procmgr binds a death-EQ observer on init's main thread with
+`procmgr_labels::INIT_REAP_CORRELATOR` (reserved `u32::MAX`); when
+init's `sys_thread_exit` posts the death notification, procmgr's
+`dispatch_death` routes to `init_reap::run_reap`:
+
+1. `cap_delete(init-logd thread)` — TCB reclaimed.
+2. `cap_delete(init main thread)` — TCB reclaimed.
+3. `cap_revoke + cap_delete(init AddressSpace)` — `dealloc_object`
+   walks PT chunks and `retype_free`s them; user-page mappings vanish
+   atomically.
+4. `DONATE_FRAMES(donate_caps) → memmgr` — pages enter memmgr's pool.
+   Safe: no aliasing, since init's mappings died at step 3.
+5. `cap_revoke + cap_delete(init CSpace)` — cascade dec_refs every
+   remaining cap (endpoint SENDs, endpoint slab Frame, leftover
+   `FrameAlloc` tails). `owns_memory = true` Frame caps return their
+   pages directly to the kernel buddy via `dealloc_object`'s
+   `buddy.free_range`.
+6. Log: `[procmgr] init reaped: donated N caps = M pages (M KiB) to
+   memmgr; pool reclaim total T pages`.
+
+After reap, no init-related kernel object exists; init's segment / stack
+/ `InitInfo` / IPC-buffer pages are in memmgr's pool; init's endpoint
+slab and any other `FrameAlloc` tails are back in the kernel buddy.
+Authoritative implementation: `services/procmgr/src/init_reap.rs`.
+
+After init's reap completes, svcmgr is the resident supervisor. See
 [`services/svcmgr/README.md`](../services/svcmgr/README.md).
 
 ---
@@ -181,8 +229,13 @@ at creation time. Examples:
   identifying this process; minted by `REGISTER_PROCESS` per child.
 - `ProcessInfo.procmgr_endpoint_cap` — tokened SEND on procmgr's
   endpoint, for process-lifecycle queries.
-- `ProcessInfo.log_endpoint_cap` (or the log-discovery surface) —
-  established by procmgr per child.
+- `ProcessInfo.log_send_cap` — tokened SEND cap on the master log
+  endpoint, minted by procmgr per child via
+  `cap_derive_token(log_send_source, RIGHTS_SEND, process_token)`.
+  The cap's kernel-attached token equals procmgr's process token,
+  which also equals the death-EQ correlator procmgr posts to
+  logd. Identity is reconciled across the three views without
+  any auxiliary mapping.
 - `InitInfo.memory_frame_base`, `InitInfo.memory_frame_count` — chosen
   by the kernel per init invocation.
 

@@ -16,7 +16,8 @@
 //   * stdin read returns Ok(0) (immediate EOF).
 //
 // Panic output continues to route through the system log endpoint
-// (lazy GET_LOG_CAP on first write); this file does NOT touch the log.
+// (pre-seeded tokened SEND cap in `ProcessInfo.log_send_cap`); this
+// file does NOT touch the log.
 
 use crate::cell::UnsafeCell;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
@@ -269,8 +270,8 @@ pub fn close_all() {
 
 /// Panic-output sink that emits through the system log endpoint.
 ///
-/// Lazy-acquires the process's tokened SEND cap on first write (one
-/// `GET_LOG_CAP` round-trip against the discovery cap), then sends each
+/// Uses the process's pre-seeded tokened SEND cap from
+/// `ProcessInfo.log_send_cap` (installed by `_start`) and sends each
 /// `write` as `STREAM_BYTES` chunks. Non-allocating — `log::write_bytes`
 /// stages bytes into the per-thread IPC buffer, so panics survive
 /// allocator failure. Silent-drops on a zero cap or any IPC error.

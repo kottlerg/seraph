@@ -1350,6 +1350,8 @@ pub fn phase3_svcmgr_handover(
     system_root_cap: u32,
     fatfs_root_cap: u32,
     ipc_buf: *mut u64,
+    init_logd_thread_cap: u32,
+    init_ipc_buf_cap: u32,
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
@@ -1457,11 +1459,17 @@ pub fn phase3_svcmgr_handover(
             0
         };
         // No-authority twin used by usertest's `pwrmgr_cap_deny_phase`
-        // to verify the SHUTDOWN gate rejects un-tokened callers.
-        // `cap_derive_token` rejects token=0; use plain `cap_derive` so
-        // the derived cap inherits the source's token (which is zero on
-        // the untokened source endpoint init created).
-        let noauth = if let Ok(c) = syscall::cap_derive(ep, syscall::RIGHTS_SEND)
+        // to verify the SHUTDOWN gate rejects callers without the
+        // `SHUTDOWN_AUTHORITY` token bit. Tokenized with a non-AUTHORITY
+        // sentinel (`1`) so the gate fails the
+        // `msg.token & SHUTDOWN_AUTHORITY != 0` check, AND so usertest
+        // cannot subsequently call `cap_derive_token` on this cap to
+        // mint a privileged twin — `sys_cap_derive_token` rejects
+        // sources with `src_token != 0`. Plain `cap_derive` would
+        // produce an un-tokened cap that usertest could re-tokenize
+        // with any value (including `SHUTDOWN_AUTHORITY`), defeating
+        // the very gate this test is supposed to exercise.
+        let noauth = if let Ok(c) = syscall::cap_derive_token(ep, syscall::RIGHTS_SEND, 1)
         {
             c
         }
@@ -1498,6 +1506,316 @@ pub fn phase3_svcmgr_handover(
         _ => log("phase 3: handover failed"),
     }
 
-    log("main thread exiting, log thread continues");
+    // Reap-handoff: move init's kernel-object caps + every reclaimable
+    // Frame cap to procmgr. Procmgr binds a death-EQ on init's main
+    // thread; when this function returns into `sys_thread_exit`
+    // immediately below, procmgr's reap path tears init's AS/CSpace
+    // /Threads down and donates the Frame caps to memmgr's pool.
+    handoff_to_procmgr_reap(
+        info,
+        procmgr_ep,
+        init_logd_thread_cap,
+        init_ipc_buf_cap,
+        ipc_buf,
+    );
+
+    log("main thread exiting; init handed off to procmgr for reap");
     syscall::thread_exit();
+}
+
+/// Move init's kernel-object caps + every reclaimable Frame cap to
+/// procmgr via `REGISTER_INIT_TEARDOWN`, then signal
+/// `INIT_TEARDOWN_DONE`. IPC cap-transfer MOVES caps, so after this
+/// returns init's `CSpace` no longer holds the transferred slots.
+///
+/// Failures here are logged but otherwise non-fatal — init still calls
+/// `sys_thread_exit` afterward, just leaving the un-transferred caps
+/// to cascade through `CSpace` teardown to the kernel buddy on eventual
+/// cap death.
+fn handoff_to_procmgr_reap(
+    info: &InitInfo,
+    procmgr_ep: u32,
+    init_logd_thread_cap: u32,
+    init_ipc_buf_cap: u32,
+    ipc_buf: *mut u64,
+)
+{
+    // Round 1: kernel-object caps. `data[0] = 1` distinguishes from
+    // subsequent donate-only rounds.
+    let round1 = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN)
+        .word(0, 1)
+        .cap(info.aspace_cap)
+        .cap(info.cspace_cap)
+        .cap(info.thread_cap)
+        .cap(init_logd_thread_cap)
+        .build();
+    // SAFETY: ipc_buf is init's registered IPC buffer; procmgr_ep carries SEND|GRANT.
+    if let Ok(reply) = unsafe { ipc::ipc_call(procmgr_ep, &round1, ipc_buf) }
+    {
+        if reply.label != ipc::procmgr_errors::SUCCESS
+        {
+            log("reap-handoff: procmgr refused kernel-object round; aborting handoff");
+            return;
+        }
+    }
+    else
+    {
+        log("reap-handoff: kernel-object round IPC failed; aborting handoff");
+        return;
+    }
+
+    // Donatable Frame caps: segments + stack + InitInfo region + IPC
+    // buffer. Other init-owned Frame caps (endpoint slab, leftover
+    // FrameAlloc tails) fall to the CSpace cascade — they end up in
+    // the kernel buddy rather than memmgr's pool.
+    let seg = info.segment_frame_base..info.segment_frame_base + info.segment_frame_count;
+    let stack =
+        info.init_stack_frame_base..info.init_stack_frame_base + info.init_stack_frame_count;
+    let inf = info.init_info_frame_base..info.init_info_frame_base + info.init_info_frame_count;
+
+    let mut donate: [u32; 32] = [0; 32];
+    let mut n = 0usize;
+    for slot in seg.chain(stack).chain(inf)
+    {
+        if n < donate.len()
+        {
+            donate[n] = slot;
+            n += 1;
+        }
+    }
+    if init_ipc_buf_cap != 0 && n < donate.len()
+    {
+        donate[n] = init_ipc_buf_cap;
+        n += 1;
+    }
+
+    let chunk_size = syscall_abi::MSG_CAP_SLOTS_MAX;
+    let mut i = 0usize;
+    while i < n
+    {
+        let end = (i + chunk_size).min(n);
+        let mut builder = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN).word(0, 0);
+        for &slot in &donate[i..end]
+        {
+            builder = builder.cap(slot);
+        }
+        let msg = builder.build();
+        // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
+        match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) }
+        {
+            Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
+            {}
+            Ok(reply) => log(
+                if reply.label == ipc::procmgr_errors::INVALID_ARGUMENT
+                {
+                    "reap-handoff: donation chunk refused INVALID_ARGUMENT"
+                }
+                else
+                {
+                    "reap-handoff: donation chunk refused (non-success reply)"
+                },
+            ),
+            Err(_) => log("reap-handoff: donation chunk IPC failed"),
+        }
+        i = end;
+    }
+
+    // Signal the cap stream is closed. Procmgr arms the death-EQ
+    // observer; the next event with INIT_REAP_CORRELATOR triggers the
+    // reap. (Done by this point — REGISTER_INIT_TEARDOWN's first round
+    // already bound the EQ.)
+    let done = IpcMessage::new(procmgr_labels::INIT_TEARDOWN_DONE);
+    // SAFETY: ipc_buf is registered.
+    match unsafe { ipc::ipc_call(procmgr_ep, &done, ipc_buf) }
+    {
+        Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
+        {}
+        _ => log("reap-handoff: INIT_TEARDOWN_DONE IPC failed (reap may not run)"),
+    }
+}
+
+// ── logd spawn ──────────────────────────────────────────────────────────────
+
+/// Spawn real-logd from `/bin/logd` at the end of Phase 2, immediately
+/// after the root mount completes. Init transfers:
+///
+/// * a RECV cap on the master log endpoint (so logd becomes the
+///   receive-side; init-logd terminates as part of the handover);
+/// * a SEND cap on the same endpoint (single-use, for the
+///   `HANDOVER_PULL` IPC to init-logd);
+/// * a tokened SEND cap on procmgr carrying
+///   `procmgr_labels::DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`);
+/// * an arch-specific serial-authority cap (`IoPortRange` on x86-64,
+///   `SbiControl` on RISC-V) so logd can write directly to the UART
+///   for its own diagnostics and the per-sender log lines it
+///   receives. Logd cannot route its diagnostics through
+///   `seraph::log!` because it IS the log receiver.
+///
+/// Returns `true` on successful spawn + bootstrap; `false` on any
+/// failure (logged at fault; init continues without real-logd, with
+/// init-logd running indefinitely until init's process is otherwise
+/// reaped).
+// too_many_lines: one transactional spawn path; splitting would push
+// most of the body into helpers and obscure the cap-flow sequencing.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn create_and_start_logd(
+    info: &InitInfo,
+    procmgr_ep: u32,
+    procmgr_service_ep_source: u32,
+    bootstrap_ep: u32,
+    log_ep: u32,
+    system_root_cap: u32,
+    init_self_cspace: u32,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let Some(walked) = walk::walk_to_file(system_root_cap, b"/bin/logd", ipc_buf)
+    else
+    {
+        log("logd: walk /bin/logd failed");
+        return false;
+    };
+
+    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
+    else
+    {
+        log("logd: tokened creator derive failed");
+        return false;
+    };
+
+    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+        .word(0, walked.size)
+        .cap(walked.file_cap)
+        .cap(tokened_creator)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
+    else
+    {
+        log("logd: CREATE_FROM_FILE ipc_call failed");
+        return false;
+    };
+    if reply.label != 0
+    {
+        log("logd: CREATE_FROM_FILE error");
+        return false;
+    }
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
+    {
+        log("logd: CREATE_FROM_FILE reply missing caps");
+        return false;
+    }
+    let process_handle = reply_caps[0];
+    // CREATE_FROM_FILE returns (process_handle, thread_cap); logd
+    // is svcmgr-registered for restart in a follow-up PR. Drop the
+    // thread cap for now.
+    if reply_caps.len() >= 2
+    {
+        let _ = syscall::cap_delete(reply_caps[1]);
+    }
+
+    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    {
+        return false;
+    }
+
+    // Derive the three bootstrap caps logd needs.
+    let Ok(log_recv) = syscall::cap_derive(log_ep, syscall::RIGHTS_ALL)
+    else
+    {
+        log("logd: log_ep RECV derive failed");
+        destroy_partial_child(process_handle, ipc_buf);
+        return false;
+    };
+    let Ok(log_handover_send) = syscall::cap_derive(log_ep, syscall::RIGHTS_SEND)
+    else
+    {
+        log("logd: log_ep SEND derive failed");
+        let _ = syscall::cap_delete(log_recv);
+        destroy_partial_child(process_handle, ipc_buf);
+        return false;
+    };
+    // RIGHTS_SEND_GRANT (not bare SEND): the IPC kernel requires the
+    // GRANT bit when the caller transfers any cap in the message, and
+    // logd's REGISTER_DEATH_EQ call hands over its `death_eq` cap.
+    let Ok(procmgr_death_auth) = syscall::cap_derive_token(
+        procmgr_service_ep_source,
+        syscall::RIGHTS_SEND_GRANT,
+        procmgr_labels::DEATH_EQ_AUTHORITY,
+    )
+    else
+    {
+        log("logd: procmgr DEATH_EQ_AUTHORITY derive failed");
+        let _ = syscall::cap_delete(log_recv);
+        let _ = syscall::cap_delete(log_handover_send);
+        destroy_partial_child(process_handle, ipc_buf);
+        return false;
+    };
+
+    // Arch-specific serial-authority cap. Both `cap_derive(RIGHTS_ALL)`
+    // mirror pwrmgr's pattern (`services/init/src/service.rs::
+    // create_and_start_pwrmgr`). On absent archs the source slot is
+    // zero; we pass zero through and logd silently disables its serial
+    // path (received log lines still buffer in memory).
+    let arch_cap_source: u32 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::find_cap_by_type(info, CapType::IoPortRange).unwrap_or(0)
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            info.sbi_control_cap
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            let _ = info;
+            0
+        }
+    };
+    let arch_cap_copy = if arch_cap_source != 0
+    {
+        syscall::cap_derive(arch_cap_source, syscall::RIGHTS_ALL).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+
+    if !start_process(
+        process_handle,
+        ipc_buf,
+        "phase 2: logd started; serving bootstrap",
+        "phase 2: logd START_PROCESS failed",
+    )
+    {
+        let _ = syscall::cap_delete(log_recv);
+        let _ = syscall::cap_delete(log_handover_send);
+        let _ = syscall::cap_delete(procmgr_death_auth);
+        if arch_cap_copy != 0
+        {
+            let _ = syscall::cap_delete(arch_cap_copy);
+        }
+        return false;
+    }
+
+    if !serve(
+        bootstrap_ep,
+        child_token,
+        ipc_buf,
+        true,
+        &[
+            log_recv,
+            log_handover_send,
+            procmgr_death_auth,
+            arch_cap_copy,
+        ],
+        &[],
+        "logd: bootstrap round failed",
+    )
+    {
+        return false;
+    }
+
+    true
 }

@@ -194,17 +194,77 @@ capability slots across all processes, enabling correct revocation.
 ## Tokens
 
 A capability may carry an immutable **token** — a `u64` value attached at derivation
-time via `SYS_CAP_DERIVE_TOKEN`. Tokens serve as unforgeable caller identifiers:
-when a tokened endpoint capability is used for IPC, the kernel delivers the token
-to the receiver alongside the message label.
+time via `SYS_CAP_DERIVE_TOKEN`. When a tokened endpoint capability is used for IPC,
+the kernel delivers the token to the receiver alongside the message label.
 
 Tokens are generic: any capability type may carry one. For endpoints, the kernel
 delivers the token on `ipc_recv`. For other types, the token is stored but not
 automatically delivered — userspace may use it for bookkeeping.
 
-A token is set once and cannot be changed. Deriving from a tokened capability
-inherits the token. Attempting to set a new token on an already-tokened capability
-returns an error.
+### Kernel guarantees
+
+`SYS_CAP_DERIVE_TOKEN` enforces two invariants:
+
+1. **Tokens are set-once.** A non-zero token may be attached only to a source
+   capability that does NOT already carry one (`src_token != 0` is rejected).
+   Deriving from an already-tokened cap propagates the parent's token unchanged;
+   the parent's token cannot be replaced or shadowed.
+2. **Tokens propagate through the derivation tree.** Every derived child inherits
+   the parent's token (when non-zero). Once a cap is tokened, every cap reachable
+   from it through `cap_derive` / `cap_copy` carries the same token.
+
+These guarantees give the **receiver** of an IPC message a kernel-delivered token
+field it can trust: the value cannot be lied about on the receive path, cannot be
+changed after the fact, and is locked to whichever derivation chain the cap belongs
+to.
+
+### What the kernel does NOT guarantee
+
+The kernel does NOT restrict which token *value* a caller chooses when attaching a
+token to an un-tokened source. Any holder of an un-tokened cap on an endpoint may
+mint a tokened child cap with any non-zero u64 value, including values that the
+endpoint's server uses as authority markers (e.g.,
+`procmgr_labels::DEATH_EQ_AUTHORITY`, `pwrmgr_labels::SHUTDOWN_AUTHORITY`).
+
+This is the correct kernel semantics — minting un-tokened sources is the
+mechanism by which servers distribute tokened identities. The implication for
+servers is structural, not cryptographic.
+
+### Server-side rule for authority-bearing endpoints
+
+**Never distribute an un-tokened SEND cap on an authority-bearing endpoint to a
+holder that should not be able to mint arbitrary identities on it.** The
+un-tokened cap is a blank cheque — it is, by design, the source from which any
+tokened child can be derived.
+
+In practice this means: the un-tokened source cap on a server's endpoint lives
+exclusively in the server's own CSpace (used internally to mint per-client
+tokened copies) and in the CSpaces of trusted bootstrap-time minters (today: init,
+which dies and is fully reclaimed at the end of Phase 3). Every other client
+receives a tokened cap whose token value is chosen by the trusted minter — the
+client cannot subsequently re-tokenize it because of the set-once rule above.
+
+Trying to harden a public authority-bearing token value by making it "hard to
+guess" (long random sentinel, etc.) is obscurity, not security: the same cap_derive
+chain that would produce the well-known constant can produce any other u64.
+Security comes from controlling *who holds an un-tokened cap*, not from secrecy
+of the token bits.
+
+### Examples in this codebase
+
+- **Memmgr** allocates a per-client tokened SEND on its own endpoint inside
+  `REGISTER_PROCESS` (`services/memmgr/src/main.rs:781`). The un-tokened source
+  cap on memmgr's endpoint never leaves memmgr's CSpace; clients see only the
+  set-once tokened copy minted for them.
+- **Procmgr** derives a tokened SEND_GRANT on its own endpoint per child during
+  `populate_child_info` (`services/procmgr/src/process.rs`). Children cannot
+  re-tokenize to mint `DEATH_EQ_AUTHORITY` or any other procmgr-side authority
+  bit. The un-tokened source stays in procmgr's own CSpace, and in init's CSpace
+  until init reaps.
+- **Pwrmgr** is similar: init mints both an authorised tokened cap
+  (`SHUTDOWN_AUTHORITY`) and a deliberately-non-authorised tokened cap
+  (sentinel `1`) for the negative-test path. Even the deny-test cap is tokened,
+  preventing the test recipient from re-deriving a privileged twin.
 
 ---
 

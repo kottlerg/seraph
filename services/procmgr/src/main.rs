@@ -23,6 +23,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
+mod init_reap;
 mod loader;
 mod process;
 
@@ -33,7 +34,7 @@ use std::os::seraph::startup_info;
 ///   caps[0]: service endpoint (procmgr receives requests on this)
 ///   caps[1]: un-tokened SEND copy of the system log endpoint. Procmgr
 ///            `cap_copy`s this into every child's
-///            `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time.
+///            `ProcessInfo.log_send_cap` at `CREATE_PROCESS` time.
 ///            Zero means no log endpoint is available yet; children
 ///            born in that window receive zero and silent-drop
 ///            `std::os::seraph::log!`.
@@ -446,10 +447,75 @@ fn dispatch_ipc(
             handle_configure_namespace(&req, ipc_buf, table);
         }
 
+        procmgr_labels::REGISTER_DEATH_EQ =>
+        {
+            handle_register_death_eq(&req, ipc_buf, table);
+        }
+
+        procmgr_labels::REGISTER_INIT_TEARDOWN =>
+        {
+            init_reap::handle_register(&req, ipc_buf, ctx.death_eq);
+        }
+
+        procmgr_labels::INIT_TEARDOWN_DONE =>
+        {
+            init_reap::handle_done(ipc_buf);
+        }
+
         _ =>
         {
             reply_empty(ipc_buf, procmgr_errors::UNKNOWN_OPCODE);
         }
+    }
+}
+
+/// Handle `REGISTER_DEATH_EQ` — store the caller's `EventQueue` cap
+/// as procmgr's logd-death observer, then retroactively bind it to
+/// every thread currently in the process table.
+///
+/// Wire format:
+/// * `caller token` MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY`
+///   (init derives the authorised tokened SEND cap and hands it
+///   exclusively to real-logd at bootstrap).
+/// * `caps[0]` = `EventQueue` cap with POST right.
+///
+/// Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
+/// caller lacks the authority token, `INVALID_ARGUMENT` if no cap
+/// arrives.
+fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+{
+    if req.token != procmgr_labels::DEATH_EQ_AUTHORITY
+    {
+        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        return;
+    }
+    let Some(&logd_eq) = req.caps().first()
+    else
+    {
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    if logd_eq == 0
+    {
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    // install_logd_death_eq is first-wins: it stores the cap and
+    // binds it as a second observer on every existing thread, or
+    // returns false if a previous registration already filled the
+    // slot. Future spawns pick it up inside finalize_creation by
+    // reading the same atomic.
+    if process::install_logd_death_eq(table, logd_eq)
+    {
+        reply_empty(ipc_buf, procmgr_errors::SUCCESS);
+    }
+    else
+    {
+        // Slot already filled (legitimate logd is registered).
+        // Drop the just-transferred cap so it doesn't leak in
+        // procmgr's CSpace; reject the caller.
+        let _ = syscall::cap_delete(logd_eq);
+        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
     }
 }
 
@@ -521,6 +587,14 @@ fn dispatch_death(
         };
         let correlator = (payload >> 32) as u32;
         let exit_reason = payload & 0xFFFF_FFFF;
+        if correlator == procmgr_labels::INIT_REAP_CORRELATOR
+        {
+            // Init's main thread exited. Run the reap sequence that
+            // tears down init's AS/CSpace/Thread objects and donates
+            // its reclaimable Frame caps to memmgr's pool.
+            init_reap::run_reap(memmgr_ep, ipc_buf);
+            continue;
+        }
         if let Some(entry) = table.take_by_correlator(correlator)
         {
             let entry_token = entry.token();
@@ -737,7 +811,7 @@ fn handle_create(
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
-        log_discovery: ctx.log_ep,
+        log_send_source: ctx.log_ep,
         memmgr_endpoint: memmgr_send,
         memmgr_token,
     };
@@ -800,11 +874,14 @@ pub struct ProcmgrCtx
 {
     pub self_aspace: u32,
     pub self_endpoint: u32,
-    /// Log endpoint (SEND) received from init during procmgr's own bootstrap.
-    /// Procmgr `cap_copy`s this into every child's
-    /// `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time. Zero if
-    /// init did not provide one (very early boot); children born in that
-    /// window receive zero and silent-drop `std::os::seraph::log!`.
+    /// Un-tokened SEND cap on the log endpoint received from init
+    /// during procmgr's own bootstrap. Procmgr uses it as the
+    /// `cap_derive_token` source for minting a tokened SEND cap per
+    /// child it spawns (token = the child's process token). The
+    /// minted cap is placed in the child's `ProcessInfo.log_send_cap`.
+    /// Zero if init did not provide one (very early boot); children
+    /// born in that window receive zero and silent-drop
+    /// `std::os::seraph::log!`.
     pub log_ep: u32,
     /// Tokened SEND cap on memmgr's service endpoint, identifying procmgr.
     /// Used to mint per-child memmgr SENDs via `REGISTER_PROCESS`, to

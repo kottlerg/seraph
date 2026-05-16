@@ -21,7 +21,7 @@ use core::panic::PanicInfo;
 /// Tiny `fmt::Write` adapter into a fixed byte slice. Truncates silently if
 /// the formatted output exceeds the slice. UTF-8 by construction (the
 /// formatter only emits valid UTF-8).
-struct SliceWriter<'a>
+pub(crate) struct SliceWriter<'a>
 {
     buf: &'a mut [u8],
     len: usize,
@@ -29,12 +29,12 @@ struct SliceWriter<'a>
 
 impl<'a> SliceWriter<'a>
 {
-    fn new(buf: &'a mut [u8]) -> Self
+    pub(crate) fn new(buf: &'a mut [u8]) -> Self
     {
         Self { buf, len: 0 }
     }
 
-    fn as_slice(&self) -> &[u8]
+    pub(crate) fn as_slice(&self) -> &[u8]
     {
         &self.buf[..self.len]
     }
@@ -434,15 +434,19 @@ fn run(info_ptr: u64) -> !
 
     // Create the log endpoint. Init holds the full-rights cap; procmgr
     // receives a SEND copy in its bootstrap round and `cap_copy`s it
-    // into every child's `ProcessInfo.log_discovery_cap`. Spawn the log
+    // and uses as the source for per-child `cap_derive_token` to seed
+    // `ProcessInfo.log_send_cap`. Spawn the log
     // thread as soon as its prerequisites (allocator, IPC buffer,
     // log_ep) are satisfied so init's own subsequent log lines ride IPC
     // through the mediator instead of direct serial.
     //
-    // TODO: real `logd` — a late-boot service loaded from the real root
-    // (not the ESP) — will eventually own the receive side and the
-    // mediator role. At that point init hands over `log_ep` to logd and
-    // retires the in-init thread.
+    // Real `logd` (loaded from `/bin/logd` at the end of Phase 2,
+    // post-root-mount) takes over the receive side via the
+    // `log_labels::HANDOVER_PULL` exchange — see
+    // `service::create_and_start_logd` and
+    // `services/logd/docs/handover-protocol.md`. The same kernel
+    // endpoint object is reused, so every existing tokened SEND cap
+    // survives the handover unchanged.
     let Ok(log_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
@@ -450,13 +454,20 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // TODO: see above — log-thread ownership transfers to real logd.
+    // Log thread cap retained so init's reap-handoff
+    // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it, letting procmgr
+    // reclaim the init-logd TCB after init's main thread exits.
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
-    logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
+    let init_logd_thread_cap = logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
 
     // Tokened SEND on the log endpoint for init's own `log()` lines so
-    // they appear under `[init]`. Token `1` is reserved for init.
-    let Ok(init_log_send) = syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, 1)
+    // they appear under `[init]`. `LOG_TOKEN_INIT` (= 1) is reserved
+    // for init in the log endpoint's token space.
+    let Ok(init_log_send) = syscall::cap_derive_token(
+        log_ep,
+        syscall::RIGHTS_SEND,
+        ipc::log_tokens::LOG_TOKEN_INIT,
+    )
     else
     {
         logging::log("init: FATAL: cannot derive tokened log SEND");
@@ -833,6 +844,31 @@ fn run(info_ptr: u64) -> !
 
     log_reclaim_total(memmgr_service_ep, ipc_buf, "phase 2");
 
+    // ── Phase 2 epilogue: launch real logd ──────────────────────────────────
+    //
+    // Spawned at the end of Phase 2 (after root mount, with
+    // system_root_cap in hand) so logd can be walked from
+    // `/bin/logd`. Hands over the master log endpoint via
+    // `HANDOVER_PULL` IPC inside logd's bootstrap; init-logd's
+    // receive loop self-terminates after replying the final chunk.
+    // From here on the same kernel endpoint object carries every
+    // sender's messages to real-logd's RECV — no live writer
+    // re-registers.
+    logging::log("phase 2: launching logd");
+    if !service::create_and_start_logd(
+        info,
+        endpoint_cap,
+        endpoint_cap,
+        init_bootstrap_ep,
+        log_ep,
+        system_root_cap,
+        info.cspace_cap,
+        ipc_buf,
+    )
+    {
+        logging::log("phase 2: logd launch failed; init-logd remains the receiver");
+    }
+
     logging::log("phase 2 bootstrap complete");
 
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
@@ -845,6 +881,8 @@ fn run(info_ptr: u64) -> !
         system_root_cap,
         root_mount.root_cap,
         ipc_buf,
+        init_logd_thread_cap,
+        ipc_cap,
     );
 }
 

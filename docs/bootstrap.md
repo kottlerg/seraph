@@ -67,7 +67,18 @@ transferring the RAM frame pool to memmgr and minting procmgr's
 first call. Init then requests procmgr to start the remaining early services
 (devmgr, svcmgr, drivers, vfsd, optionally netd), delegates the appropriate
 subsets of its initial capability set to each service, registers services
-with svcmgr, and exits. The system-scope userspace boot order lives in
+with svcmgr, and exits.
+
+At the end of init's Phase 2 — after the root mount completes but before
+Phase 3 spawns any other service — init spawns real `logd` from
+`/bin/logd` and hands it the receive side of the master log endpoint
+via `log_labels::HANDOVER_PULL`. init-logd's receive loop terminates
+on the final handover reply. The kernel endpoint object is unchanged
+across the transition, so every pre-existing tokened SEND cap (held
+by memmgr, procmgr, every tier-1 service) continues to work without
+re-derivation; only the holder of the RECV cap changes. See
+[`services/logd/README.md`](../services/logd/README.md) and
+[`services/logd/docs/handover-protocol.md`](../services/logd/docs/handover-protocol.md). The system-scope userspace boot order lives in
 [`process-lifecycle.md`](process-lifecycle.md); role-level description is in
 [`services/init/README.md`](../services/init/README.md); authoritative stage
 enumeration lives in
@@ -79,6 +90,20 @@ for specialized purposes and follow their own bootstrap shape.
 ---
 
 ## Handover to svcmgr
+
+At the end of Phase 3, init signs over its own kernel-object caps
+(`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and every
+reclaimable Frame cap (segments + stack + `InitInfo` pages + IPC buffer)
+to procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN`, then
+`sys_thread_exit`s. Procmgr binds a death-EQ observer on init's main
+thread with `procmgr_labels::INIT_REAP_CORRELATOR`; the event delivered
+by the exit triggers procmgr's reap path, which (1) reclaims both
+TCBs, (2) tears down init's `AddressSpace` (PT chunks freed, mappings
+gone), (3) donates the Frame caps to memmgr's pool with `DONATE_FRAMES`,
+and (4) tears down init's `CSpace` (cascade reclaims the remaining
+endpoint and slab caps). After reap, no init-related kernel object
+exists and the segment / stack / `InitInfo` / IPC-buffer pages are back
+in memmgr's pool. See `services/procmgr/src/init_reap.rs`.
 
 Once init exits, svcmgr is the resident supervisor: it monitors registered
 services, handles restarts, and holds the direct process-creation

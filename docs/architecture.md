@@ -79,9 +79,15 @@ under explicit capability grants.
 
 **init**
 First userspace process. Starts memmgr and procmgr, requests early services
-(devmgr, svcmgr, drivers, vfsd), delegates capabilities, and exits. See
-[`abi/boot-protocol/`](../abi/boot-protocol/) and
-[`process-lifecycle.md`](process-lifecycle.md) for the userspace boot order.
+(devmgr, svcmgr, drivers, vfsd), delegates capabilities, then hands its own
+`AddressSpace` / `CSpace` / `Thread` caps plus every reclaimable Frame cap
+(segments, stack, `InitInfo` pages, IPC buffer) to procmgr via
+`REGISTER_INIT_TEARDOWN` and exits. Procmgr's death-EQ observer fires on
+the exit and reclaims every init resource — kernel objects torn down,
+Frame caps donated to memmgr's pool. After reap, zero init residue
+remains in the system. See [`abi/boot-protocol/`](../abi/boot-protocol/),
+[`process-lifecycle.md`](process-lifecycle.md) §"Init reap", and
+`services/procmgr/src/init_reap.rs`.
 
 **memmgr**
 Owns the userspace RAM frame pool. Receives all RAM Frame caps from init at
@@ -129,7 +135,15 @@ Network stack. Manages interfaces via driver IPC and exposes socket-like endpoin
 to applications.
 
 **logd**
-Receives structured log messages via IPC and routes them to configured sinks.
+Post-mount owner of the master log endpoint. Every userspace
+process holds a pre-installed tokened SEND cap on the same kernel
+endpoint (seeded by procmgr at spawn time into
+`ProcessInfo.log_send_cap`); logd drains the RECV side. Init runs an
+interim `init-logd` thread until logd is launched at the end of init's
+Phase 2, then hands over via `log_labels::HANDOVER_PULL` (the kernel
+endpoint object is unchanged across the handover, so existing tokened
+SEND caps survive without re-derivation). Subscribes to procmgr's
+death-notification cascade for per-sender slot reclamation.
 
 **base**
 Unprivileged applications (shell, terminal, editor, core tools).

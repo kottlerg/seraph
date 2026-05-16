@@ -384,7 +384,7 @@ fn populate_memmgr_info(
     pi.stdin_frame_cap = 0;
     pi.stdout_frame_cap = 0;
     pi.stderr_frame_cap = 0;
-    pi.log_discovery_cap = 0;
+    pi.log_send_cap = 0;
     pi.stdin_data_signal_cap = 0;
     pi.stdin_space_signal_cap = 0;
     pi.stdout_data_signal_cap = 0;
@@ -623,12 +623,12 @@ struct ProcmgrCaps
     /// endpoint. Zero when memmgr is not yet wired (early-boot regression
     /// path; never expected after P5).
     memmgr_endpoint_slot: u32,
-    /// Slot in procmgr's `CSpace` holding an un-tokened SEND on the system
-    /// log endpoint (the "discovery" cap). Std reads it from
-    /// `pi.log_discovery_cap` at `_start` and uses it to lazy-acquire a
-    /// tokened SEND on first `seraph::log!` call. Zero when no log is
-    /// available.
-    log_discovery_slot: u32,
+    /// Slot in procmgr's `CSpace` holding a tokened SEND on the
+    /// system log endpoint with token `LOG_TOKEN_PROCMGR`. Std reads
+    /// it from `pi.log_send_cap` at `_start` and installs it via
+    /// `::log::install_tokened_cap` for procmgr's own `seraph::log!`
+    /// writes. Zero when no log endpoint is available.
+    log_send_slot: u32,
     /// `PT_TLS` template metadata, propagated into procmgr's `ProcessInfo`
     /// so spawned-thread allocations (via std) can populate matching
     /// blocks. Zero `memsz` means "no TLS".
@@ -637,10 +637,12 @@ struct ProcmgrCaps
 
 /// Populate procmgr's `ProcessInfo` page and map it read-only into procmgr.
 ///
-/// procmgr is `no_std` and doesn't drive `std::io::stdio`, so the three
-/// stdio cap slots are left zero. The log endpoint procmgr needs (as the
-/// source `cap_copy`'d into every child's `ProcessInfo.log_discovery_cap`)
-/// arrives via its bootstrap round, not via `ProcessInfo`.
+/// procmgr's stdio cap slots are left zero (procmgr is std-built post-
+/// P7 but does not drive interactive stdio). The un-tokened SEND on
+/// the log endpoint procmgr uses as the *source* for deriving tokened
+/// SEND caps per child arrives via procmgr's bootstrap round, not via
+/// `ProcessInfo`. The pre-installed tokened SEND cap procmgr uses for
+/// its OWN `seraph::log!` writes lives in `pi.log_send_cap`.
 #[allow(clippy::similar_names)]
 fn populate_procmgr_info(
     alloc: &mut FrameAlloc,
@@ -672,12 +674,13 @@ fn populate_procmgr_info(
     pi.stdin_frame_cap = 0;
     pi.stdout_frame_cap = 0;
     pi.stderr_frame_cap = 0;
-    // Procmgr holds the un-tokened SEND on the log endpoint and
-    // `cap_copy`s it into every child's `ProcessInfo.log_discovery_cap`
-    // at `CREATE_PROCESS` time. Post-P7 procmgr is std-using and has its
-    // own `seraph::log!` surface, so init also installs a discovery
-    // SEND here.
-    pi.log_discovery_cap = caps.log_discovery_slot;
+    // Procmgr's own `seraph::log!` surface. The slot holds a tokened
+    // SEND cap on the log endpoint with token `LOG_TOKEN_PROCMGR`,
+    // derived by init via `cap_derive_token`. Procmgr's std `_start`
+    // installs it via `::log::install_tokened_cap`. The un-tokened
+    // SEND procmgr uses to derive per-child tokened caps is separate
+    // (delivered via procmgr's bootstrap round).
+    pi.log_send_cap = caps.log_send_slot;
     pi.stdin_data_signal_cap = 0;
     pi.stdin_space_signal_cap = 0;
     pi.stdout_data_signal_cap = 0;
@@ -740,11 +743,13 @@ pub struct ProcmgrBootstrap
     pub service_ep: u32,
     /// Procmgr's bootstrap token on init's bootstrap endpoint.
     pub bootstrap_token: u64,
-    /// Slot in procmgr's `CSpace` holding an un-tokened SEND cap on the
-    /// system log endpoint. Procmgr `cap_copy`s this into every child's
-    /// `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time. Zero
-    /// when no log endpoint is available (very early boot); children
-    /// born in that window receive zero and silent-drop `seraph::log!`.
+    /// Slot in procmgr's `CSpace` holding an un-tokened SEND cap on
+    /// the system log endpoint, used by procmgr as the *source* for
+    /// `cap_derive_token` to mint a tokened SEND cap per child (token =
+    /// the child's process token). The minted cap is placed in the
+    /// child's `ProcessInfo.log_send_cap`. Zero when no log endpoint
+    /// is available (very early boot); children born in that window
+    /// receive zero and silent-drop `seraph::log!`.
     pub log_endpoint_slot: u32,
     /// Procmgr's main thread cap (in init's `CSpace`). Used by
     /// [`start_procmgr`] to launch procmgr after memmgr is live.
@@ -849,8 +854,8 @@ pub fn bootstrap_procmgr(
     // Derive an un-tokened SEND cap on the log endpoint for procmgr.
     // Kept in init's CSpace and sent to procmgr via the bootstrap round
     // (ipc transfer moves it into procmgr's CSpace at a fresh slot).
-    // Procmgr `cap_copy`s this into every child's
-    // `ProcessInfo.log_discovery_cap` at `CREATE_PROCESS` time.
+    // Procmgr uses it as the *source* for `cap_derive_token` to mint a
+    // tokened SEND cap per child it spawns.
     let pm_log_send = if log_ep == 0
     {
         0
@@ -871,19 +876,27 @@ pub fn bootstrap_procmgr(
         syscall::cap_copy(memmgr_send_cap, pm_cspace, syscall::RIGHTS_SEND_GRANT).ok()?
     };
 
-    // Copy a discovery SEND on the log endpoint into procmgr's CSpace so
-    // procmgr's own `seraph::log!` calls can `GET_LOG_CAP` on first use.
-    // Procmgr is std-using post-P7 and its diagnostics ride the same log
-    // surface as every other service; the discovery cap by itself grants
-    // no log identity — that comes from the tokened cap returned by
-    // `GET_LOG_CAP`.
-    let log_discovery_slot = if log_ep == 0
+    // Derive procmgr's pre-installed tokened SEND cap on the log
+    // endpoint. Token = `LOG_TOKEN_PROCMGR` (reserved). Procmgr's
+    // `seraph::log!` writes ride this cap; logd attributes them by the
+    // kernel-delivered token. Init derives in its own CSpace then
+    // copies into procmgr's, mirroring the rights of every other
+    // procmgr-CSpace seed.
+    let log_send_slot = if log_ep == 0
     {
         0
     }
     else
     {
-        syscall::cap_copy(log_ep, pm_cspace, syscall::RIGHTS_SEND).ok()?
+        let init_side = syscall::cap_derive_token(
+            log_ep,
+            syscall::RIGHTS_SEND,
+            ipc::log_tokens::LOG_TOKEN_PROCMGR,
+        )
+        .ok()?;
+        let pm_side = syscall::cap_copy(init_side, pm_cspace, syscall::RIGHTS_SEND).ok()?;
+        let _ = syscall::cap_delete(init_side);
+        pm_side
     };
 
     let pm_caps = ProcmgrCaps {
@@ -892,7 +905,7 @@ pub fn bootstrap_procmgr(
         thread: pm_thread,
         creator_endpoint_slot: pm_creator_slot,
         memmgr_endpoint_slot,
-        log_discovery_slot,
+        log_send_slot,
         tls: pm_tls_meta,
     };
     populate_procmgr_info(alloc, init_aspace, &pm_caps, stack_pages)?;

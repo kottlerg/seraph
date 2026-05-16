@@ -205,6 +205,68 @@ pub mod procmgr_labels
     /// Idempotent before start; later calls overwrite the previous
     /// caps (the prior caps are `cap_delete`'d procmgr-side).
     pub const CONFIGURE_NAMESPACE: u64 = 12;
+
+    /// Register a death-notification `EventQueue` cap with procmgr.
+    ///
+    /// Wire format:
+    /// * `caps[0]` = `EventQueue` cap (POST right) on which procmgr
+    ///   posts `(process_token as u32) << 32 | exit_reason` for every
+    ///   tracked process when it exits or faults.
+    ///
+    /// Procmgr stores the cap and, for every process already in its
+    /// table, calls `sys_thread_bind_notification` on the child's
+    /// main thread with this EQ as a second observer. From the
+    /// registration moment onward, every newly spawned child also
+    /// receives the binding inside `finalize_creation`. Single
+    /// observer slot — re-registration replaces the previous cap.
+    ///
+    /// Real-logd uses this to learn about sender deaths so it can
+    /// evict the corresponding slot in its hash-keyed token table.
+    /// Reply is `procmgr_errors::SUCCESS` on bind, `INVALID_ARGUMENT`
+    /// if the cap is missing or wrong type, `UNAUTHORIZED` if called
+    /// over a non-privileged path (gated by tokened SEND cap).
+    pub const REGISTER_DEATH_EQ: u64 = 14;
+
+    /// Token bit on procmgr service caps that authorises
+    /// `REGISTER_DEATH_EQ`. Init derives this tokened SEND cap and
+    /// hands it to real-logd at bootstrap; the un-tokened or
+    /// differently-tokened twins are rejected.
+    pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
+
+    /// Hand init's kernel-object caps + reclaimable Frame caps to procmgr
+    /// for post-death reap. Init calls this in the post-Phase-3 exit
+    /// path, then `sys_thread_exit`s.
+    ///
+    /// First round (`is_first = data[0] != 0`):
+    ///   `caps[0]` = init's `AddressSpace` cap (MOVED out of init's `CSpace`).
+    ///   `caps[1]` = init's `CSpace` cap (MOVED).
+    ///   `caps[2]` = init's main `Thread` cap (MOVED).
+    ///   `caps[3]` = init-logd `Thread` cap (MOVED; may be the same slot
+    ///               as a previously-exited thread — its TCB is reclaimed
+    ///               on `cap_delete` regardless of state).
+    /// Subsequent rounds (`data[0] == 0`):
+    ///   `caps[0..N]` = reclaimable Frame caps (segments + stack +
+    ///                  `InitInfo` + IPC buffer + any other init-owned
+    ///                  donatable Frame). MOVED out of init's `CSpace`
+    ///                  via IPC cap-transfer; procmgr accumulates them
+    ///                  for the eventual `memmgr.DONATE_FRAMES` chunk.
+    ///
+    /// Procmgr binds the death-EQ on init's main thread with correlator
+    /// `INIT_REAP_CORRELATOR` as part of the first round. Each round
+    /// replies `procmgr_errors::SUCCESS`.
+    pub const REGISTER_INIT_TEARDOWN: u64 = 15;
+
+    /// Signal end of init's reap-handoff cap stream. After this call
+    /// init has no caps left to transfer; procmgr's state machine
+    /// transitions to "armed", awaiting the death-EQ event. Init
+    /// calls `sys_thread_exit` immediately after this IPC replies.
+    pub const INIT_TEARDOWN_DONE: u64 = 16;
+
+    /// Reserved death-notification correlator used by `REGISTER_INIT_TEARDOWN`.
+    /// Per-child correlators are `process_token as u32` starting at
+    /// `log_tokens::LOG_TOKEN_FIRST_CHILD = 16`; reserving the top of
+    /// the u32 range avoids collision.
+    pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
 
 pub const MEMMGR_LABELS_VERSION: u32 = 1;
@@ -651,30 +713,88 @@ pub mod stream_labels
     pub const STREAM_REGISTER_NAME: u64 = 11;
 }
 
+/// Reserved log-endpoint tokens.
+///
+/// Every tokened SEND cap on the log endpoint carries a `u64` token
+/// (kernel-attached at `cap_derive_token` time, immutable thereafter).
+/// The cap's holder is identified to the receiver by that token. For
+/// procmgr-spawned children the token equals the child's procmgr-
+/// assigned process token; the kernel-side identity, the receiver's
+/// per-sender slot key, and procmgr's death-notification correlator
+/// thus all share one u64. To leave room for system-special senders
+/// whose identity is not a procmgr process token, procmgr's per-child
+/// token counter starts at [`LOG_TOKEN_FIRST_CHILD`].
+pub mod log_tokens
+{
+    /// init's self-identity. Init derives `cap_derive_token(log_ep,
+    /// SEND, LOG_TOKEN_INIT)` at boot and uses the cap for its own
+    /// `seraph::log!` writes.
+    pub const LOG_TOKEN_INIT: u64 = 1;
+    /// procmgr's self-identity. Init derives a tokened SEND cap with
+    /// this token at procmgr-bootstrap time and seeds it into
+    /// `ProcessInfo.log_send_cap` so procmgr's std `_start` can
+    /// install it. Procmgr's `seraph::log!` writes ride this cap.
+    pub const LOG_TOKEN_PROCMGR: u64 = 2;
+    /// First token value procmgr's per-child counter
+    /// (`NEXT_PROCESS_TOKEN`) hands out. Lower values are reserved
+    /// for the system specials above; raising this leaves room to
+    /// reserve more.
+    pub const LOG_TOKEN_FIRST_CHILD: u64 = 16;
+}
+
 pub const LOG_LABELS_VERSION: u32 = 1;
-/// IPC labels for the system log endpoint's discovery interface.
+/// IPC labels for the system log endpoint's legacy discovery interface
+/// and the one-shot init-logd → real-logd handover.
 ///
 /// Distinct from [`stream_labels`]: the latter carry payload (bytes,
 /// names) on tokened SEND caps that have already been minted; these
-/// labels are spoken on an un-tokened SEND cap (the "discovery cap"
-/// installed in every process at create time) and are how a process
-/// acquires its tokened cap in the first place.
+/// labels are spoken on caps that mediate cap acquisition or state
+/// transfer.
+///
+/// New std-built spawns post-pivot receive a pre-installed tokened
+/// SEND cap in `ProcessInfo.log_send_cap` and never call
+/// [`GET_LOG_CAP`]. The label remains for pre-pivot live writers that
+/// acquired their tokened caps under it; the receive handler stays in
+/// init-logd and real-logd until those callers are migrated.
 pub mod log_labels
 {
-    /// Request a freshly-minted tokened SEND cap on the log endpoint.
+    /// Legacy discovery: request a freshly-minted tokened SEND cap on
+    /// the log endpoint.
     ///
-    /// Request: empty (label only). Reply: one cap — a SEND cap on the
-    /// log endpoint whose token uniquely identifies this caller's log
-    /// stream — plus a single data word carrying a status code (zero on
-    /// success). Callers cache the returned cap process-globally and
-    /// reuse it for every subsequent `STREAM_BYTES` /
-    /// `STREAM_REGISTER_NAME` message.
+    /// Wire format: `word(0) = LOG_LABELS_VERSION` (mismatch → reply
+    /// code 3). Reply: one cap (a tokened SEND on the log endpoint
+    /// whose token uniquely identifies this caller) plus
+    /// `word(0) = status` (zero on success). Callers cache the
+    /// returned cap process-globally.
     ///
-    /// The receiver mints the token (callers cannot pick their own).
-    /// Tokens are unforgeable and serve as the immutable identity of a
-    /// log sender; display names registered later via
-    /// `STREAM_REGISTER_NAME` are mutable labels bound to that identity.
+    /// The receiver mints the token (counter-allocated by init-logd
+    /// or real-logd). Tokens are unforgeable identities; display
+    /// names registered later via `STREAM_REGISTER_NAME` are mutable
+    /// labels bound to that identity.
     pub const GET_LOG_CAP: u64 = 12;
+
+    /// One-shot handover: real-logd pulls init-logd's captured state.
+    ///
+    /// Sent by real-logd on a dedicated handover endpoint that init
+    /// hands it during bootstrap. Init-logd, on receipt, drains any
+    /// pending sends from the log endpoint's queue, then replies with
+    /// one or more chunks carrying:
+    ///
+    /// * The token table — for every active sender token init-logd
+    ///   has seen, the `(token, display_name)` pair.
+    /// * The captured-history ring — all complete lines init-logd has
+    ///   buffered since boot, attributed by token and timestamped at
+    ///   the original receipt instant.
+    /// * The next-token counter (init-logd's
+    ///   `INIT_DISCOVERY_NEXT_TOKEN` value at the moment of handover)
+    ///   so real-logd's `GET_LOG_CAP` handler can continue the same
+    ///   sequence for any further legacy callers.
+    ///
+    /// Wire encoding is documented in
+    /// `services/logd/docs/handover-protocol.md`. After the final
+    /// chunk is replied, init-logd breaks its receive loop and calls
+    /// `sys_thread_exit`.
+    pub const HANDOVER_PULL: u64 = 13;
 }
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────
@@ -735,6 +855,9 @@ pub mod procmgr_errors
     /// Cap rights derivation failed (e.g. `derive_frame_for_prot`)
     /// during ELF page load.
     pub const INSUFFICIENT_RIGHTS: u64 = 12;
+    /// Caller's cap lacks the required authority token for a gated
+    /// label (e.g. `REGISTER_DEATH_EQ` requires `DEATH_EQ_AUTHORITY`).
+    pub const UNAUTHORIZED: u64 = 13;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

@@ -134,6 +134,11 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::RootfsBin,
     },
     Spec {
+        name: "logd",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+    },
+    Spec {
         name: "hello",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,

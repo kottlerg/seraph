@@ -61,7 +61,21 @@ Init's responsibilities are strictly bounded:
    IPC. Init retains derived intermediary copies (for potential
    revocation), not the roots.
 
-6. **Spawn Phase 3 services from VFS** — svcmgr, crasher, pwrmgr,
+6. **Launch real logd (Phase 2 epilogue)** — immediately after the
+   seed `system_root_cap` is acquired, init walks
+   `/bin/logd` and spawns real-logd via
+   `procmgr_labels::CREATE_FROM_FILE`. The bootstrap round
+   delivers (a) a RECV cap on the master log endpoint, (b) a
+   one-shot SEND cap on the same endpoint for `HANDOVER_PULL`,
+   (c) a tokened SEND on procmgr carrying
+   `procmgr_labels::DEATH_EQ_AUTHORITY`, and (d) the arch serial
+   authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V).
+   logd pulls init-logd's captured state via `HANDOVER_PULL`;
+   init-logd's receive loop self-terminates on the final reply.
+   See [`services/logd/README.md`](../logd/README.md) and
+   [`services/logd/docs/handover-protocol.md`](../logd/docs/handover-protocol.md).
+
+7. **Spawn Phase 3 services from VFS** — svcmgr, crasher, pwrmgr,
    usertest, hello, stdiotest are loaded by walking init's seed
    system-root cap to `/bin/<name>`, then issuing
    `procmgr_labels::CREATE_FROM_FILE` with the resolved file cap.
@@ -80,13 +94,39 @@ Init's responsibilities are strictly bounded:
    gate rejects un-tokened callers. See
    [`services/pwrmgr/README.md`](../pwrmgr/README.md).
 
-7. **Register services with svcmgr** — before exiting, init registers
+8. **Register services with svcmgr** — before exiting, init registers
    all started services with svcmgr along with their restart policies
    and capability sets.
 
-8. **Exit** — init calls `sys_thread_exit`. It holds no long-lived
-   state, no supervision capability, and no restart authority. svcmgr
-   takes over.
+9. **Reap handoff and exit** — init hands its own `AddressSpace`,
+   `CSpace`, main `Thread`, and init-logd `Thread` caps plus every
+   reclaimable Frame cap (segments, stack, `InitInfo` region, IPC
+   buffer) to procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN`
+   (multi-round; IPC cap-transfer MOVES the caps out of init's
+   CSpace). After `INIT_TEARDOWN_DONE`, init calls
+   `sys_thread_exit`. The kernel mints all four resource classes at
+   Phase 9 with `RETYPE` + `owns_memory=true` + the full
+   `available_bytes` ledger + `register_owned_range`, so each cap is
+   eligible for `memmgr.DONATE_FRAMES` ingestion.
+
+   Procmgr's death-EQ observer (bound on init's main thread with
+   `INIT_REAP_CORRELATOR`) fires on the exit and runs
+   [`init_reap::run_reap`](../procmgr/src/init_reap.rs):
+
+   1. `cap_delete` both `Thread` caps → TCBs reclaimed.
+   2. `cap_revoke + cap_delete` init's `AddressSpace` → PT chunks
+      `retype_free`'d, every user-page mapping vanishes.
+   3. `DONATE_FRAMES` the accumulated Frame caps to memmgr → the
+      segment / stack / `InitInfo` / IPC-buffer pages enter
+      memmgr's pool, safely (no aliasing — the AS is already dead).
+   4. `cap_revoke + cap_delete` init's `CSpace` → cascade dec_refs
+      every cap init still held (endpoint SENDs, endpoint slab
+      Frame, leftover `FrameAlloc` tails). Those with
+      `owns_memory=true` return their pages to the kernel buddy via
+      `dealloc_object`'s `free_range` (kernel-internal, not
+      memmgr's pool).
+   5. Procmgr logs a summary line. No init-related kernel object
+      remains; svcmgr takes over as the resident supervisor.
 
 memmgr and procmgr are the only two processes init creates via raw
 syscalls. Every later service is spawned via IPC to procmgr.

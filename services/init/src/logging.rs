@@ -3,28 +3,41 @@
 
 // init/src/logging.rs
 
-//! Logging subsystem for init.
+//! Logging subsystem for init — the system's *interim* log mediator.
 //!
-//! Two halves:
+//! Init owns the master log endpoint at boot and runs a dedicated thread
+//! ("init-logd") that drains it until real-logd is launched at the end
+//! of Phase 2. The init-logd thread terminates immediately after the
+//! handover, leaving the same kernel endpoint object live (existing
+//! tokened SEND caps held by every early writer remain valid; only the
+//! RECV-holder changes).
+//!
+//! Three halves:
 //!
 //! * **Sender side (init's own log line emission):** early boot writes
 //!   directly to the serial port; once the log thread is up, init's main
 //!   thread switches to the same `STREAM_BYTES` IPC path that std-built
-//!   services use, with a tokened SEND cap carrying `b"init"` so the
-//!   receiver attributes init's lines correctly.
+//!   services use, with a tokened SEND cap carrying token
+//!   `LOG_TOKEN_INIT` so the receiver attributes init's lines correctly.
 //!
 //! * **Receiver side (`log_receive_loop`):** the dedicated log thread
-//!   loops on `ipc_recv` over the master log endpoint. Each message
-//!   carries a `STREAM_BYTES` label, the sender's token (delivered by the
-//!   kernel from the tokened SEND cap they hold), and a length-prefixed
-//!   payload. The thread maintains a small per-token line buffer; on
-//!   `\n` it emits `[name] <line>\r\n` to the serial port.
+//!   loops on `ipc_recv` over the master log endpoint. Each
+//!   `STREAM_BYTES` message carries a token (delivered by the kernel
+//!   from the tokened SEND cap they hold) and a length-prefixed payload.
+//!   The thread maintains a per-token line buffer; on `\n` it emits
+//!   `[name] <line>\r\n` to the serial port AND records the line in a
+//!   bounded history ring for handover to real-logd.
+//!
+//! * **Handover (`HANDOVER_PULL`):** real-logd, once up, calls
+//!   `log_labels::HANDOVER_PULL` on the same endpoint. Init-logd
+//!   serialises (token table + history ring) into one or more reply
+//!   chunks, then breaks its loop and `sys_thread_exit`s.
 
 use crate::arch;
 use crate::{FrameAlloc, PAGE_SIZE};
 use init_protocol::InitInfo;
 
-use ipc::log_labels::GET_LOG_CAP;
+use ipc::log_labels::HANDOVER_PULL;
 use ipc::stream_labels::STREAM_BYTES;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -58,6 +71,41 @@ const MAX_SENDERS: usize = 16;
 /// are truncated.
 const MAX_NAME_LEN: usize = 48;
 
+/// Number of completed log lines retained in the handover ring. Sized
+/// so the pre-mount window — every line emitted between boot and Phase
+/// 2's `phase 2: launching logd` — fits without wrapping in practice
+/// (today: ~50 lines). Lines beyond the ring eject the oldest entry
+/// (FIFO drop). Real-logd treats the ring as the captured history it
+/// inherits at handover.
+const HISTORY_RING_LEN: usize = 512;
+
+/// Per-line history entry. Stores the byte payload (no `\n`, no
+/// `[name]` prefix — real-logd re-renders if it wants), the sender's
+/// token (kernel-delivered identity), and the receipt timestamp in
+/// microseconds since boot. Names are looked up out of band on
+/// handover by walking the slot table.
+#[derive(Clone, Copy)]
+struct HistoryLine
+{
+    token: u64,
+    us: u64,
+    bytes: [u8; LINE_BUF_SIZE],
+    used: u16,
+}
+
+impl HistoryLine
+{
+    const fn empty() -> Self
+    {
+        Self {
+            token: 0,
+            us: 0,
+            bytes: [0u8; LINE_BUF_SIZE],
+            used: 0,
+        }
+    }
+}
+
 // ── Mutable state (sender side, main-thread bound) ──────────────────────────
 
 /// Tokened SEND cap on the log endpoint that init's own `log()` writes to.
@@ -67,14 +115,6 @@ static mut INIT_LOG_SEND: u32 = 0;
 
 /// IPC buffer pointer for the main thread (set after IPC buffer is mapped).
 static mut MAIN_IPC_BUF: *mut u64 = core::ptr::null_mut();
-
-/// Monotonic counter for tokens minted on the `GET_LOG_CAP` discovery
-/// path. Token 0 is reserved for the untokened sentinel; token 1 is
-/// reserved for init's self-identity cap, derived directly from the
-/// log endpoint init owns; every other process gets its token from
-/// this counter.
-static INIT_DISCOVERY_NEXT_TOKEN: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(2);
 
 // ── Public interface ─────────────────────────────────────────────────────────
 
@@ -185,7 +225,18 @@ fn ipc_log(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 /// Spawn a dedicated log-receiving thread so the main thread can continue
 /// bootstrap orchestration (making IPC calls to vfsd etc.) without blocking
 /// service log output.
-pub fn spawn_log_thread(info: &InitInfo, alloc: &mut FrameAlloc, log_ep: u32, ioport_cap: u32)
+///
+/// Returns the init-logd Thread cap slot so the main thread can include it
+/// in the post-Phase-3 reap-handoff (`procmgr.REGISTER_INIT_TEARDOWN`).
+/// The cap survives init-logd's `sys_thread_exit` — the kernel marks the
+/// TCB Exited but does not reclaim it until `cap_delete` drops the cap's
+/// last reference.
+pub fn spawn_log_thread(
+    info: &InitInfo,
+    alloc: &mut FrameAlloc,
+    log_ep: u32,
+    ioport_cap: u32,
+) -> u32
 {
     // Allocate stack pages for the log thread.
     for i in 0..LOG_THREAD_STACK_PAGES
@@ -282,6 +333,7 @@ pub fn spawn_log_thread(info: &InitInfo, alloc: &mut FrameAlloc, log_ep: u32, io
         log("init: FATAL: cannot start log thread");
         syscall::thread_exit();
     }
+    thread_cap
 }
 
 /// Entry point for the log thread. Registers its own IPC buffer then enters
@@ -335,17 +387,78 @@ impl SenderSlot
     }
 }
 
+/// Bounded ring of completed log lines, written on every `flush_line`
+/// for handover to real-logd. Wraps FIFO; oldest entry dropped on
+/// overflow. Lives on the log thread's stack? No — too large for the
+/// 16 KiB stack. Allocated as a `static mut` so it sits in init's BSS.
+/// The only mutator is the log thread; no synchronisation needed.
+static mut HISTORY: [HistoryLine; HISTORY_RING_LEN] = [HistoryLine::empty(); HISTORY_RING_LEN];
+
+/// Write cursor (next slot to overwrite, monotonically increasing modulo
+/// `HISTORY_RING_LEN`). Once `HISTORY_TOTAL >= HISTORY_RING_LEN` the
+/// ring has wrapped; oldest entry = `HISTORY[(HISTORY_TOTAL %
+/// HISTORY_RING_LEN)]`.
+static HISTORY_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Total lines ever pushed (monotonic, never reset). Lets the handover
+/// know whether the ring has wrapped (and thus how many entries to
+/// dump) without scanning for sentinel values.
+static HISTORY_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Set when `HANDOVER_PULL` has replied its final chunk. The receive
+/// loop checks this on the next iteration and exits cleanly via
+/// `sys_thread_exit`, terminating the init-logd thread.
+static HANDOVER_COMPLETE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Push a completed line into the history ring. Called from
+/// `flush_line` for every newline-terminated or buffer-full payload.
+fn history_push(slot: &SenderSlot)
+{
+    use core::sync::atomic::Ordering;
+
+    if slot.used == 0
+    {
+        return;
+    }
+    let head = HISTORY_HEAD.fetch_add(1, Ordering::Relaxed) % HISTORY_RING_LEN;
+    let us = syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64).unwrap_or(0);
+    // SAFETY: log thread is the only mutator of HISTORY; head is unique
+    // per call.
+    unsafe {
+        let entry = &mut HISTORY[head];
+        entry.token = slot.token;
+        entry.us = us;
+        let n = slot.used.min(LINE_BUF_SIZE);
+        entry.bytes[..n].copy_from_slice(&slot.buf[..n]);
+        entry.used = n as u16;
+    }
+    HISTORY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Receive byte-stream messages from services and write them to the serial
 /// port, prefixing each line with the sender's `[name]` (extracted from the
-/// per-message kernel-delivered token).
+/// per-message kernel-delivered token). Also services `HANDOVER_PULL`
+/// from real-logd; on the final chunk reply, sets `HANDOVER_COMPLETE`
+/// and the next loop iteration self-terminates the thread.
 fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
 {
     let mut slots: [SenderSlot; MAX_SENDERS] = [SenderSlot::empty(); MAX_SENDERS];
     // Round-robin pointer used to evict when all slots are in use.
     let mut next_evict: usize = 0;
+    // Cursor into HISTORY for staged HANDOVER_PULL replies.
+    let mut handover_cursor: u64 = 0;
+    // Cursor into the slot table for staged HANDOVER_PULL replies.
+    let mut handover_slot_idx: usize = 0;
 
     loop
     {
+        if HANDOVER_COMPLETE.load(core::sync::atomic::Ordering::Acquire)
+        {
+            flush_synthetic_logd_line(b"handover complete; init-logd thread exiting");
+            syscall::thread_exit();
+        }
+
         // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
         let Ok(recv) = (unsafe { ipc::ipc_recv(log_ep, ipc_buf_raw) })
         else
@@ -367,25 +480,14 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
-        else if label_id == GET_LOG_CAP
+        else if label_id == HANDOVER_PULL
         {
-            if recv.word(0) == u64::from(ipc::LOG_LABELS_VERSION)
-            {
-                handle_get_log_cap(log_ep, ipc_buf_raw);
-                // handle_get_log_cap performs its own ipc_reply (with the
-                // minted cap or an error code), so we do not double-reply
-                // here.
-            }
-            else
-            {
-                // Caller built against a different `shared/ipc` revision;
-                // reject before minting a token. Reply code 3 is local to
-                // GET_LOG_CAP's reply vocabulary (0=success, 1=token
-                // counter wrap, 2=cap_derive failure, 3=version mismatch).
-                // SAFETY: ipc_buf_raw is the log thread's registered IPC
-                // buffer page.
-                let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(3), ipc_buf_raw) };
-            }
+            handle_handover_pull(
+                &slots,
+                &mut handover_cursor,
+                &mut handover_slot_idx,
+                ipc_buf_raw,
+            );
         }
         else
         {
@@ -396,39 +498,134 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
     }
 }
 
-/// Handler for `log_labels::GET_LOG_CAP`. Mints a fresh tokened SEND cap
-/// on the system log endpoint (token=0 reserved as the untokened sentinel,
-/// token=1 reserved for init's self-identity), transfers it back to the
-/// caller in the reply, and frees our local slot when the kernel performs
-/// the transfer.
-fn handle_get_log_cap(log_ep: u32, ipc_buf: *mut u64)
+/// Reply codes for [`HANDOVER_PULL`].
+mod handover_reply
+{
+    /// More data follows; caller should make another `HANDOVER_PULL`
+    /// call.
+    pub const MORE: u64 = 0;
+    /// Final chunk; the caller has the complete state.
+    pub const DONE: u64 = 1;
+}
+
+/// Per-chunk payload kind in `word(0)` of `HANDOVER_PULL` replies.
+mod handover_kind
+{
+    /// `word(1)` = total history-entry count; `word(2)` = active slot
+    /// count. No further data words. Always the first chunk so the
+    /// caller can size its receiving buffers.
+    pub const HEADER: u64 = 1;
+    /// One slot entry. `word(1)` = token, `word(2)` = name length in
+    /// bytes; following bytes (starting `data[3*8]` via `.bytes(3,
+    /// ...)`) carry the name payload.
+    pub const SLOT: u64 = 2;
+    /// One history line. `word(1)` = token, `word(2)` = receipt
+    /// microseconds, `word(3)` = byte length, followed by inline name
+    /// bytes via `.bytes(4, ...)`.
+    pub const LINE: u64 = 3;
+}
+
+/// Stage one chunk of handover state into the reply. Cursor state
+/// (`hist_cursor`, `slot_idx`) advances across calls so each pull
+/// returns a fresh chunk. On the last entry, replies with `DONE` and
+/// sets `HANDOVER_COMPLETE`; the receive loop's next iteration exits
+/// the thread.
+fn handle_handover_pull(
+    slots: &[SenderSlot; MAX_SENDERS],
+    hist_cursor: &mut u64,
+    slot_idx: &mut usize,
+    ipc_buf: *mut u64,
+)
 {
     use core::sync::atomic::Ordering;
 
-    let token = INIT_DISCOVERY_NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    if token == 0
+    // First chunk: header.
+    if *hist_cursor == 0 && *slot_idx == 0
     {
-        // Counter wrapped — vanishingly unlikely (u64), but bail rather
-        // than mint a token that aliases the untokened sentinel.
-        flush_synthetic_logd_line(b"GET_LOG_CAP: token counter wrapped");
+        let total = HISTORY_TOTAL.load(Ordering::Acquire);
+        let active = slots.iter().filter(|s| s.token != 0).count() as u64;
+        let reply = ipc::IpcMessage::builder(handover_reply::MORE)
+            .word(0, handover_kind::HEADER)
+            .word(1, total)
+            .word(2, active)
+            .build();
         // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(1), ipc_buf) };
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        // Sentinel: bump cursor to mark "header sent". Real cursors
+        // start at 1.
+        *hist_cursor = 1;
         return;
     }
 
-    let Ok(cap) = syscall::cap_derive_token(log_ep, syscall::RIGHTS_SEND, token)
+    // Slot table.
+    while *slot_idx < MAX_SENDERS
+    {
+        let slot = &slots[*slot_idx];
+        *slot_idx += 1;
+        if slot.token == 0
+        {
+            continue;
+        }
+        let name_len = slot.name_used.min(MAX_NAME_LEN);
+        let label = handover_reply::MORE | ((name_len as u64 & 0xFFFF) << 16);
+        let reply = ipc::IpcMessage::builder(label)
+            .word(0, handover_kind::SLOT)
+            .word(1, slot.token)
+            .word(2, name_len as u64)
+            .bytes(3, &slot.name[..name_len])
+            .build();
+        // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+
+    // History ring.
+    let total = HISTORY_TOTAL.load(Ordering::Acquire);
+    let ring_full = total >= HISTORY_RING_LEN as u64;
+    let entries_to_send = if ring_full
+    {
+        HISTORY_RING_LEN as u64
+    }
     else
     {
-        // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
-        let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(2), ipc_buf) };
-        return;
+        total
     };
+    let cursor_zero_based = *hist_cursor - 1;
+    if cursor_zero_based < entries_to_send
+    {
+        let i = cursor_zero_based as usize;
+        let read_idx = if ring_full
+        {
+            (HISTORY_HEAD.load(Ordering::Acquire) + i) % HISTORY_RING_LEN
+        }
+        else
+        {
+            i
+        };
+        // SAFETY: log thread is the only mutator of HISTORY; read of
+        // a fully-initialised slot.
+        let entry = unsafe { &HISTORY[read_idx] };
+        let byte_len = entry.used as usize;
+        let label = handover_reply::MORE | ((byte_len as u64 & 0xFFFF) << 16);
+        let reply = ipc::IpcMessage::builder(label)
+            .word(0, handover_kind::LINE)
+            .word(1, entry.token)
+            .word(2, entry.us)
+            .word(3, byte_len as u64)
+            .bytes(4, &entry.bytes[..byte_len])
+            .build();
+        // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        *hist_cursor += 1;
+        return;
+    }
 
-    let reply = ipc::IpcMessage::builder(0).cap(cap).build();
-    // SAFETY: ipc_buf is the log thread's registered IPC buffer page;
-    // the kernel transfers the cap from init's CSpace to the caller's
-    // CSpace, so the local slot is released.
+    // Drained. Final reply marks DONE; the receive loop self-
+    // terminates on the next iteration.
+    let reply = ipc::IpcMessage::new(handover_reply::DONE);
+    // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    HANDOVER_COMPLETE.store(true, Ordering::Release);
 }
 
 /// Record a display name for the sender identified by `token`. Called
@@ -755,11 +952,13 @@ fn find_or_alloc_slot(
     victim
 }
 
-/// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port.
-/// `[name]` uses the display name registered via `STREAM_REGISTER_NAME`;
+/// Emit `[sec.usfrac] [name] <buffered bytes>\r\n` to the serial port,
+/// and record the line in the handover ring for real-logd. `[name]`
+/// uses the display name registered via `STREAM_REGISTER_NAME`;
 /// senders that have not registered yet render as `[?]`.
 fn flush_line(slot: &SenderSlot)
 {
+    history_push(slot);
     // ── Timestamp: [sec.usfrac:06] ─────────────────────────────────────
     //
     // Source: `SYS_SYSTEM_INFO(ElapsedUs)` — kernel handler returns

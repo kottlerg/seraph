@@ -1459,11 +1459,17 @@ pub fn phase3_svcmgr_handover(
             0
         };
         // No-authority twin used by usertest's `pwrmgr_cap_deny_phase`
-        // to verify the SHUTDOWN gate rejects un-tokened callers.
-        // `cap_derive_token` rejects token=0; use plain `cap_derive` so
-        // the derived cap inherits the source's token (which is zero on
-        // the untokened source endpoint init created).
-        let noauth = if let Ok(c) = syscall::cap_derive(ep, syscall::RIGHTS_SEND)
+        // to verify the SHUTDOWN gate rejects callers without the
+        // `SHUTDOWN_AUTHORITY` token bit. Tokenized with a non-AUTHORITY
+        // sentinel (`1`) so the gate fails the
+        // `msg.token & SHUTDOWN_AUTHORITY != 0` check, AND so usertest
+        // cannot subsequently call `cap_derive_token` on this cap to
+        // mint a privileged twin — `sys_cap_derive_token` rejects
+        // sources with `src_token != 0`. Plain `cap_derive` would
+        // produce an un-tokened cap that usertest could re-tokenize
+        // with any value (including `SHUTDOWN_AUTHORITY`), defeating
+        // the very gate this test is supposed to exercise.
+        let noauth = if let Ok(c) = syscall::cap_derive_token(ep, syscall::RIGHTS_SEND, 1)
         {
             c
         }

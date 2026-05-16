@@ -640,19 +640,32 @@ fn populate_child_info(
         0
     };
 
-    // procmgr's own service endpoint: install a SEND+GRANT copy so the child
-    // can use it for `REQUEST_FRAMES` (send-only) and `CREATE_PROCESS` (needs
-    // grant to transfer the module frame and creator endpoint in the same
-    // call). Zero when procmgr has no procmgr above it — e.g. procmgr itself,
-    // when init populates its `ProcessInfo`.
+    // procmgr's own service endpoint: install a SEND+GRANT copy
+    // tokened with the child's `process_token`. The token gives
+    // procmgr's handlers a kernel-delivered identity for every IPC
+    // the child makes (used today by no handler; available for
+    // future per-child authorisation), but more importantly it
+    // locks the child OUT of `cap_derive_token` on this cap —
+    // `sys_cap_derive_token` rejects sources with `src_token != 0`,
+    // so the child cannot mint a parallel cap with a privileged
+    // token value (`procmgr_labels::DEATH_EQ_AUTHORITY`, etc.). The
+    // un-tokened source cap stays exclusively in procmgr's own
+    // CSpace; init holds the only other un-tokened copy and reaps
+    // before any non-trusted process is spawned that could
+    // theoretically exploit it. Zero when procmgr has no procmgr
+    // above it — e.g. procmgr itself, when init populates its
+    // `ProcessInfo`.
     let procmgr_ep_in_child = if universals.procmgr_endpoint != 0
     {
-        syscall::cap_copy(
+        let tokened = syscall::cap_derive_token(
             universals.procmgr_endpoint,
-            child_cspace,
             syscall::RIGHTS_SEND_GRANT,
+            process_token,
         )
-        .ok()?
+        .ok()?;
+        let in_child = syscall::cap_copy(tokened, child_cspace, syscall::RIGHTS_SEND_GRANT).ok()?;
+        let _ = syscall::cap_delete(tokened);
+        in_child
     }
     else
     {

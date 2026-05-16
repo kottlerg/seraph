@@ -775,6 +775,7 @@ fn run(info_ptr: u64) -> !
             endpoint_cap,
             init_bootstrap_ep,
             devmgr_registry_ep,
+            svcmgr_service_ep,
             ipc_buf,
         );
     }

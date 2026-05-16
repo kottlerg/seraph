@@ -236,6 +236,7 @@ mod kind
     pub const MODULE: u64 = 1;
     pub const APERTURE: u64 = 2;
     pub const ACPI_REGION: u64 = 3;
+    pub const SVCMGR_BUNDLE: u64 = 4;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Tells devmgr which optional
@@ -264,12 +265,13 @@ mod present
 ///   - terminal round has `done = true`.
 ///
 /// The bootstrap layout mirrors `devmgr/src/caps.rs::bootstrap_caps`.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn create_devmgr_with_caps(
     info: &InitInfo,
     procmgr_ep: u32,
     bootstrap_ep: u32,
     registry_ep: u32,
+    svcmgr_service_ep: u32,
     ipc_buf: *mut u64,
 )
 {
@@ -492,6 +494,8 @@ pub fn create_devmgr_with_caps(
     }
 
     // ── Module round (virtio-blk = module 3) ────────────────────────────
+    let _ = remaining_apertures;
+    let _ = remaining_acpi;
     if has_module
     {
         let module_cap = info.module_frame_base + 3;
@@ -502,30 +506,65 @@ pub fn create_devmgr_with_caps(
             return;
         };
 
-        let _ = serve(
+        if !serve(
             bootstrap_ep,
             child_token,
             ipc_buf,
-            true,
+            false,
             &[module_copy],
             &[kind::MODULE, 1],
             "devmgr: bootstrap module round failed",
-        );
+        )
+        {
+            return;
+        }
     }
-    else if !remaining_apertures && !remaining_acpi
+
+    // ── Terminal SVCMGR_BUNDLE round ────────────────────────────────────
+    //
+    // caps: [svcmgr_publish_cap, ioport_root_cap (x86 only)]. The
+    // PUBLISH_AUTHORITY-tokened SEND lets devmgr register
+    // `rtc.primary` and `timed` in svcmgr's registry. The
+    // IoPortRange copy is non-zero only on x86-64 (RISC-V has no
+    // I/O ports); devmgr derives narrow per-driver IoPort caps from
+    // it for ISA peripherals like the CMOS RTC.
+    let svcmgr_publish = if svcmgr_service_ep != 0
     {
-        // All three kinds empty and R1 didn't mark done — close the
-        // stream with an empty terminal round so devmgr's loop exits.
-        let _ = serve(
-            bootstrap_ep,
-            child_token,
-            ipc_buf,
-            true,
-            &[],
-            &[kind::MODULE, 0],
-            "devmgr: bootstrap terminal round failed",
-        );
+        syscall::cap_derive_token(
+            svcmgr_service_ep,
+            syscall::RIGHTS_SEND,
+            ipc::svcmgr_labels::PUBLISH_AUTHORITY,
+        )
+        .unwrap_or(0)
     }
+    else
+    {
+        0
+    };
+
+    let ioport_root_cap = if cfg!(target_arch = "x86_64")
+    {
+        crate::find_cap_by_type(info, init_protocol::CapType::IoPortRange)
+            .and_then(|root| syscall::cap_derive(root, syscall::RIGHTS_ALL).ok())
+            .unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+
+    let bundle_caps: [u32; 2] = [svcmgr_publish, ioport_root_cap];
+    let bundle_cap_count = if ioport_root_cap != 0 { 2 } else { 1 };
+
+    let _ = serve(
+        bootstrap_ep,
+        child_token,
+        ipc_buf,
+        true,
+        &bundle_caps[..bundle_cap_count],
+        &[kind::SVCMGR_BUNDLE, bundle_cap_count as u64],
+        "devmgr: bootstrap SVCMGR_BUNDLE round failed",
+    );
 }
 
 // ── pwrmgr creation ─────────────────────────────────────────────────────────

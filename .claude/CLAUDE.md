@@ -36,6 +36,22 @@ truth for "how work is tracked and shipped" on this project.
 - Direct invocation of `cargo build`, `cargo run`, `cargo test`, or `cargo clippy` is forbidden.
 - When switching architectures or targets, `cargo xtask clean` MUST be run first.
 
+## PR workflow operations
+- All non-tag-driven work lands via a feature-branch PR per
+  [docs/conventions.md](../docs/conventions.md); the assistant MUST NOT push directly
+  to `master`.
+- After pushing a PR, the assistant MUST start watching its CI run via
+  `gh pr checks <N> --watch` (or `gh run watch <run-id>`) as a backgrounded
+  `Bash` invocation (`run_in_background: true`). Do not poll, do not sleep —
+  the harness notifies on completion.
+- On green: confirm the pass to the user in one line, then proceed (or
+  prompt for merge approval if not yet merged).
+- On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
+  or equivalent) so the user can see the actual error without asking.
+- The assistant MUST NOT merge a PR while its CI run is pending or failing.
+  Merge is the user's call; the assistant prepares the merge but does not
+  execute it without explicit instruction.
+
 ## Validation
 - Changes MUST be validated beyond successful compilation.
 - At minimum, on both `x86_64` and `riscv64`:

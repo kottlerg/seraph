@@ -86,6 +86,8 @@ pub enum BuildComponent
     Devmgr,
     Vfsd,
     VirtioBlk,
+    CmosRtc,
+    GoldfishRtc,
     Fatfs,
     Crasher,
     Usertest,

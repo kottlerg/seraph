@@ -12,6 +12,8 @@ members = [
     "services/logd",
     "services/pwrmgr",
     "services/vfsd",
+    "services/drivers/cmos",
+    "services/drivers/goldfish-rtc",
     "services/drivers/virtio/core",
     "services/drivers/virtio/blk",
     "services/fs/fat",

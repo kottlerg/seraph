@@ -66,8 +66,8 @@ jobs:
             --arch ${{ matrix.arch }} \
             --parallel 4 --runs 20 --timeout 60
 
-      - name: Upload usertest logs on failure
-        if: failure() && steps.usertest-burnin.outcome == 'failure'
+      - name: Upload usertest logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: burnin-usertest-${{ matrix.arch }}-${{ matrix.profile }}
@@ -95,8 +95,8 @@ jobs:
             --arch ${{ matrix.arch }} \
             --parallel 4 --runs 20 --timeout 60
 
-      - name: Upload ktest logs on failure
-        if: failure() && steps.ktest-burnin.outcome == 'failure'
+      - name: Upload ktest logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: burnin-ktest-${{ matrix.arch }}-${{ matrix.profile }}

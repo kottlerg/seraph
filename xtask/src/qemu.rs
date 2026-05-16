@@ -102,11 +102,12 @@ fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec)
 {
     args.extend(["-machine".into(), "q35".into()]);
 
-    // KVM acceleration when /dev/kvm is present (local dev); fall back to
-    // multi-threaded TCG otherwise (CI runners, KVM-less containers). The
-    // riscv64 path is always TCG; this mirrors its `-accel tcg,thread=multi`
-    // shape when KVM is unavailable.
-    if Path::new("/dev/kvm").exists()
+    // Existence is insufficient: GitHub `ubuntu-latest` x86 runners expose
+    // /dev/kvm for nested virt, but the runner user is not in the `kvm`
+    // group, so `open(O_RDWR)` returns EACCES and QEMU exits immediately.
+    // Probe the same way QEMU itself does, then fall through to TCG when
+    // the device cannot actually be used.
+    if kvm_usable()
     {
         // -cpu host inherits the development host's microarchitecture; the
         // kernel asserts x86-64-v3 in early init, so the host must advertise
@@ -192,6 +193,24 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
             ]);
         }
     }
+}
+
+/// Returns true if `/dev/kvm` can be opened for read+write by the current
+/// process. Existence alone is misleading on environments that expose the
+/// node without granting the calling user access (e.g. GitHub-hosted
+/// runners). Setting `SERAPH_NO_KVM=1` forces the TCG path regardless,
+/// for local reproduction of the no-KVM CI environment.
+fn kvm_usable() -> bool
+{
+    if std::env::var_os("SERAPH_NO_KVM").is_some()
+    {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
 }
 
 /// Locate the OVMF code image, returning the first installed path.

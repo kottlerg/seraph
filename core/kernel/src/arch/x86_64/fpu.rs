@@ -187,11 +187,17 @@ pub unsafe fn enable_xsave()
 
 /// Save the live x87/SSE/AVX state of the executing CPU into `area`.
 ///
-/// Uses XSAVEOPT to skip components untouched since the last save.
 /// `area` must be 64-byte aligned and point at a writable XSAVE buffer of
 /// at least [`xsave_area_size`] bytes. The component-mask passed in
-/// `EDX:EAX = 0xFFFF_FFFF_FFFF_FFFF` instructs XSAVEOPT to save every
-/// component that XCR0 currently enables.
+/// `EDX:EAX = 0xFFFF_FFFF_FFFF_FFFF` instructs XSAVE to write every
+/// component XCR0 currently enables; hardware intersects with XCR0, so
+/// the actual written set is exactly the OS-enabled components.
+///
+/// Plain XSAVE (not XSAVEOPT) is intentional: XSAVEOPT may skip writing
+/// components it tracks as "clean" since the last load, and the per-CPU
+/// tracking is only correct when both load and save paths use matching
+/// instructions consistently. XSAVE is unconditional and works the same
+/// on every implementation (hardware, KVM, TCG).
 ///
 /// # Safety
 /// Must execute at ring 0. `area` must satisfy the alignment and size
@@ -201,12 +207,12 @@ pub unsafe fn enable_xsave()
 #[inline]
 pub unsafe fn save_to(area: *mut u8)
 {
-    // SAFETY: caller's contract; XSAVEOPT requires OSXSAVE which the boot
+    // SAFETY: caller's contract; XSAVE requires OSXSAVE which the boot
     // path established. The component mask `0xFFFF_FFFF` (low 32 bits) is
     // intersected with XCR0 by hardware, so it saves exactly the enabled set.
     unsafe {
         core::arch::asm!(
-            "xsaveopt [{area}]",
+            "xsave [{area}]",
             area = in(reg) area,
             in("eax") 0xFFFF_FFFFu32,
             in("edx") 0xFFFF_FFFFu32,
@@ -266,6 +272,16 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     // TCB's lifetime when non-null.
     let area = unsafe { (*tcb).extended.area };
     if area.is_null()
+    {
+        return;
+    }
+    // CR0.TS is the architected dirty bit for the extended-state register
+    // file: cleared by the `#NM` handler when this thread loads its area,
+    // set again here on switch-out. If it is still set, the thread has
+    // not touched FP/SIMD since the last switch-in, so the live registers
+    // belong to whichever thread last cleared TS — saving them into this
+    // thread's area would clobber it with another thread's state. Skip.
+    if read_cr0() & CR0_TS != 0
     {
         return;
     }

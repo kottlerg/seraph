@@ -115,3 +115,55 @@ pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
 {
     0
 }
+
+/// Return the platform's maximum physical address width in bits.
+///
+/// Read from CPUID extended leaf `0x80000008`, EAX[7:0]. When the
+/// extended leaf is not advertised by the CPU (very old hardware), fall
+/// back to the IA-32e architectural minimum of 36 bits. The result
+/// determines where firmware and hypervisors place the 64-bit PCI MMIO
+/// window — see [`crate::acpi::parse_aperture_seed`].
+#[cfg(not(test))]
+pub fn max_phys_addr_bits() -> u8
+{
+    let max_ext: u32;
+    // SAFETY: CPUID leaf 0x80000000 is universally available on x86-64;
+    // rbx is callee-saved and reserved by LLVM in some codegen modes, so
+    // we save/restore it manually.
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 0x8000_0000u32 => max_ext,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, nomem),
+        );
+    }
+    if max_ext < 0x8000_0008
+    {
+        return 36;
+    }
+    let eax: u32;
+    // SAFETY: leaf 0x80000008 is advertised by the preceding check.
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 0x8000_0008u32 => eax,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, nomem),
+        );
+    }
+    let bits = (eax & 0xff) as u8;
+    if bits == 0 { 36 } else { bits }
+}
+
+#[cfg(test)]
+pub fn max_phys_addr_bits() -> u8
+{
+    48
+}

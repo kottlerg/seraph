@@ -239,8 +239,30 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
         dispatched += wave_size;
     }
 
-    print_summary(args, &workdir, &outcomes);
+    let summary = print_summary(args, &workdir, &outcomes);
+    print_failing_tails(&workdir, &outcomes);
+    if summary.pass != args.runs
+    {
+        bail!(
+            "run-parallel: {}/{} runs passed (ok={} fail={} hang={} err={})",
+            summary.pass,
+            args.runs,
+            summary.ok,
+            summary.fail,
+            summary.hang,
+            summary.err,
+        );
+    }
     Ok(())
+}
+
+struct Summary
+{
+    pass: u32,
+    ok: u32,
+    fail: u32,
+    hang: u32,
+    err: u32,
 }
 
 fn validate_args(args: &RunParallelArgs) -> Result<()>
@@ -440,23 +462,25 @@ fn format_outcome_line(outcome: &RunOutcome) -> String
     }
 }
 
-fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome])
+fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]) -> Summary
 {
-    let mut pass = 0u32;
-    let mut ok = 0u32;
-    let mut fail = 0u32;
-    let mut hang = 0u32;
-    let mut err = 0u32;
+    let mut summary = Summary {
+        pass: 0,
+        ok: 0,
+        fail: 0,
+        hang: 0,
+        err: 0,
+    };
     let mut non_hang_us: Vec<u128> = Vec::with_capacity(outcomes.len());
     for o in outcomes
     {
         match o.status
         {
-            Status::Pass => pass += 1,
-            Status::Ok => ok += 1,
-            Status::Fail => fail += 1,
-            Status::Hang => hang += 1,
-            Status::Err(_) => err += 1,
+            Status::Pass => summary.pass += 1,
+            Status::Ok => summary.ok += 1,
+            Status::Fail => summary.fail += 1,
+            Status::Hang => summary.hang += 1,
+            Status::Err(_) => summary.err += 1,
         }
         if !matches!(o.status, Status::Hang)
         {
@@ -472,7 +496,7 @@ fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]
     );
     println!(
         "pass={}  ok={}  fail={}  hang={}  err={}",
-        pass, ok, fail, hang, err
+        summary.pass, summary.ok, summary.fail, summary.hang, summary.err,
     );
     if let (Some(&min_us), Some(&max_us)) = (non_hang_us.first(), non_hang_us.last())
     {
@@ -485,6 +509,71 @@ fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]
         );
     }
     println!("logs preserved under {}", workdir.display());
+    summary
+}
+
+/// Per-run log tail: last `TAIL_LINES` lines, hard-capped at `TAIL_BYTES`.
+///
+/// Surfacing failing logs inline lets a CI step's own stdout convey the
+/// proximate failure without requiring an artifact download. The cap
+/// guards against multi-megabyte QEMU traces dominating job output.
+const TAIL_LINES: usize = 20;
+const TAIL_BYTES: usize = 4096;
+
+fn print_failing_tails(workdir: &Path, outcomes: &[RunOutcome])
+{
+    let failing: Vec<&RunOutcome> = outcomes
+        .iter()
+        .filter(|o| !matches!(o.status, Status::Pass | Status::Ok))
+        .collect();
+    if failing.is_empty()
+    {
+        return;
+    }
+    println!("===== failing-run tails =====");
+    for o in failing
+    {
+        let Some(prefix) = o.status.log_prefix()
+        else
+        {
+            continue;
+        };
+        let log_path = workdir.join(format!("{}-{}.log", prefix, o.run));
+        println!(
+            "--- run={} status={} log={}",
+            o.run,
+            o.status.label(),
+            log_path.display(),
+        );
+        let body = read_log(&log_path).unwrap_or_default();
+        let tail = tail_text(&body, TAIL_LINES, TAIL_BYTES);
+        if tail.is_empty()
+        {
+            println!("(no log content captured)");
+        }
+        else
+        {
+            println!("{}", tail);
+        }
+    }
+}
+
+fn tail_text(body: &str, max_lines: usize, max_bytes: usize) -> String
+{
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    let mut tail: String = lines[start..].join("\n");
+    if tail.len() > max_bytes
+    {
+        let drop = tail.len() - max_bytes;
+        let mut cut = drop;
+        while !tail.is_char_boundary(cut) && cut < tail.len()
+        {
+            cut += 1;
+        }
+        tail = tail.split_off(cut);
+    }
+    tail
 }
 
 fn us_to_s(us: u128) -> f64

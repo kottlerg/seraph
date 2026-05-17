@@ -24,6 +24,7 @@ mod disk;
 mod qemu;
 mod rust_src;
 mod sysroot;
+mod term;
 mod util;
 
 use cli::{Cli, CliCommand};

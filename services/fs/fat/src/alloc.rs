@@ -21,10 +21,6 @@
 //! Bad-cluster entries (`0xFFF7` / `0x0FFF_FFF7`) are *never* allocated
 //! and never freed by this module.
 
-// Allocator helpers other than load_fsinfo are wired into dispatch
-// handlers in a later commit.
-#![allow(dead_code)]
-
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
 use crate::fat::next_cluster;
@@ -311,6 +307,12 @@ pub fn allocate_cluster(
         state.free_count_hint -= 1;
     }
 
+    // Best-effort FSInfo write-back: keeps the on-disk hints aligned
+    // with in-memory state so a subsequent mount does not have to
+    // rescan the FAT to compute `free_count`. No-op on FAT16 / when
+    // the FAT32 image has no FSInfo sector.
+    flush_fsinfo(state, cache, block_dev, ipc_buf);
+
     Ok(found)
 }
 
@@ -372,6 +374,9 @@ pub fn free_cluster_chain(
             _ => break,
         }
     }
+    // Mirror allocate_cluster: persist the updated free-count and
+    // next-free hints so a remount sees the correct state.
+    flush_fsinfo(state, cache, block_dev, ipc_buf);
     Ok(freed)
 }
 

@@ -82,3 +82,9 @@ The other write-side phases (`fs_write_phase`, `fs_create_remove_phase`,
 golden-path round-trip tests; the windows above are not exercised
 by deliberate crash injection at v0.1.0. A two-boot QEMU harness for
 remount-survive testing is tracked as a follow-up.
+
+---
+
+## Summarized By
+
+[services/fs/fat/README.md](../README.md)

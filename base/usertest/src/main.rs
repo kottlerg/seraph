@@ -138,6 +138,7 @@ fn main()
     fs_rename_phase();
     fs_write_frame_phase();
     fs_write_cache_coherence_phase();
+    fs_write_invariants_phase();
     ns_multi_component_phase();
     ns_sandbox_phase();
     ns_fallthrough_attenuation_phase();
@@ -1438,6 +1439,197 @@ fn fs_write_cache_coherence_phase()
     fs_remove(usertest, name, ipc_buf).expect("cleanup coh");
     let _ = syscall::cap_delete(usertest);
     std::os::seraph::log!("fs_write_cache_coherence phase passed");
+}
+
+/// Regression coverage for three correctness bugs surfaced during the
+/// fs-fat write-support PR audit:
+///
+/// 1. `FS_CREATE` / `FS_MKDIR` MUST NOT promote rights on the returned
+///    child cap beyond the caller's parent rights. Creating from a
+///    `MUTATE_DIR`-only parent must yield a child cap that rejects
+///    `FS_WRITE` with `PERMISSION_DENIED`.
+/// 2. `NodeTable` MUST NOT alias distinct empty files to the same
+///    `NodeId`. Writing through one freshly-created empty-file cap
+///    must not affect a sibling empty-file cap created moments
+///    earlier.
+/// 3. Extending a file past its current EOC MUST NOT corrupt the
+///    existing FAT chain. Writing one byte at `offset = 2 *
+///    cluster_size` after a 2-cluster initial write must leave bytes
+///    `[cluster_size, 2 * cluster_size)` readable as originally
+///    written.
+#[allow(clippy::too_many_lines)]
+fn fs_write_invariants_phase()
+{
+    use namespace_protocol::rights;
+
+    /// Cluster size on the xtask-formatted test image: 8 sectors × 512 B.
+    const CLUSTER: usize = 4096;
+    /// `FS_WRITE` / `FS_READ` inline payloads cap at 504 B.
+    const INLINE_CHUNK: usize = 504;
+
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    // ── (1) rights attenuation on FS_CREATE child cap ──────────────
+    {
+        let usertest_full = usertest_dir_cap(ipc_buf);
+        let scratch_name: &[u8] = b"inv_rights.bin";
+        let _ = fs_remove(usertest_full, scratch_name, ipc_buf);
+
+        // Re-LOOKUP usertest with MUTATE_DIR | LOOKUP only — no READ,
+        // no WRITE. (LOOKUP is required to walk into the dir; STAT is
+        // omitted by design so we can prove the child cannot widen.)
+        let root = std::os::seraph::root_dir_cap();
+        let restricted_rights = u64::from(rights::LOOKUP | rights::MUTATE_DIR);
+        let (parent_attenuated, _, _) = ns_lookup(root, b"usertest", restricted_rights, ipc_buf)
+            .expect("ns_lookup usertest attenuated");
+
+        let (child_cap, _) = fs_create(parent_attenuated, scratch_name, ipc_buf)
+            .expect("FS_CREATE through attenuated parent should succeed");
+
+        // FS_WRITE on the returned cap must be rejected — child rights
+        // = parent ∩ kind_max = {LOOKUP, MUTATE_DIR} ∩ {STAT, READ,
+        // WRITE, EXEC} = {} (since LOOKUP is bit 0 and STAT/READ are
+        // disjoint). The write attempt hits the gate before fatfs
+        // touches the FAT.
+        let write_err = fs_write_inline(child_cap, 0, b"x", ipc_buf)
+            .expect_err("FS_WRITE on rights-attenuated child cap must reject");
+        assert_eq!(
+            write_err,
+            ipc::fs_errors::PERMISSION_DENIED,
+            "expected PERMISSION_DENIED; got {write_err}"
+        );
+
+        let _ = syscall::cap_delete(child_cap);
+        let _ = syscall::cap_delete(parent_attenuated);
+        let _ = fs_remove(usertest_full, scratch_name, ipc_buf);
+        let _ = syscall::cap_delete(usertest_full);
+        std::os::seraph::log!("fs_write_invariants: rights attenuation ok");
+    }
+
+    // ── (2) NodeTable dedupe must not alias distinct empty files ───
+    {
+        let usertest = usertest_dir_cap(ipc_buf);
+        let a: &[u8] = b"inv_aa.bin";
+        let b: &[u8] = b"inv_bb.bin";
+        let _ = fs_remove(usertest, a, ipc_buf);
+        let _ = fs_remove(usertest, b, ipc_buf);
+
+        let (cap_a, _) = fs_create(usertest, a, ipc_buf).expect("create inv_aa");
+        let (cap_b, _) = fs_create(usertest, b, ipc_buf).expect("create inv_bb");
+
+        // Write to A; B must remain empty.
+        fs_write_inline(cap_a, 0, b"AAAA", ipc_buf).expect("write to inv_aa");
+
+        // Re-LOOKUP B and read 8 bytes; with the old dedupe-on-(cluster,
+        // kind, size) bug B aliased A and would return "AAAA".
+        let _ = syscall::cap_delete(cap_b);
+        let (cap_b_fresh, _, b_size) =
+            ns_lookup(usertest, b, 0xFFFF, ipc_buf).expect("lookup inv_bb");
+        assert_eq!(b_size, 0, "inv_bb was aliased to inv_aa's storage");
+
+        // Tolerate either an empty read (size=0) or a short reply.
+        let r = fs_read_bytes(cap_b_fresh, 0, 8, ipc_buf).unwrap_or_default();
+        assert!(
+            r.is_empty() || r.iter().all(|&x| x == 0),
+            "inv_bb returned non-zero bytes after sibling write: {r:?}"
+        );
+
+        let _ = syscall::cap_delete(cap_a);
+        let _ = syscall::cap_delete(cap_b_fresh);
+        let _ = fs_remove(usertest, a, ipc_buf);
+        let _ = fs_remove(usertest, b, ipc_buf);
+        let _ = syscall::cap_delete(usertest);
+        std::os::seraph::log!("fs_write_invariants: empty-file dedupe ok");
+    }
+
+    // ── (3) FAT chain past EOC must not corrupt prior cluster ──────
+    //
+    // Cluster size on the test fixture is 8 sectors × 512 B = 4 KiB.
+    // Step a: write 8 KiB at offset 0 (occupies clusters X→Y, size
+    //         8 KiB).
+    // Step b: write 8 B at offset 16 KiB (target_cluster_idx = 4,
+    //         walks past EOC three times). The broken offset-walk
+    //         loop linked the first allocation behind X (overwriting
+    //         X→Y with X→Z) and orphaned Y.
+    // Step c: read 4 KiB from offset 4 KiB; with the bug this would
+    //         walk X→Z (the new cluster) and return the wrong bytes.
+    {
+        let usertest = usertest_dir_cap(ipc_buf);
+        let name: &[u8] = b"inv_chain.bin";
+        let _ = fs_remove(usertest, name, ipc_buf);
+
+        let (cap, _) = fs_create(usertest, name, ipc_buf).expect("create inv_chain");
+
+        // Inline FS_WRITE caps payload at 504 B; one cluster needs
+        // multiple inline calls. Each call uses the in-loop
+        // chain-advance path (known-good); only the cross-cluster
+        // calls exercise the EOC walk.
+        let pattern_a = vec![0xA5u8; CLUSTER];
+        let pattern_b = vec![0x5Au8; CLUSTER];
+        let write_pattern = |cap: u32, base: usize, src: &[u8]| {
+            let mut written = 0usize;
+            while written < src.len()
+            {
+                let n = (src.len() - written).min(INLINE_CHUNK);
+                fs_write_inline(
+                    cap,
+                    (base + written) as u64,
+                    &src[written..written + n],
+                    ipc_buf,
+                )
+                .expect("inline write chunk");
+                written += n;
+            }
+        };
+        write_pattern(cap, 0, &pattern_a);
+        write_pattern(cap, CLUSTER, &pattern_b);
+
+        // Re-LOOKUP so the cap reflects the post-write metadata.
+        let _ = syscall::cap_delete(cap);
+        let (cap, _, size) = ns_lookup(usertest, name, 0xFFFF, ipc_buf).expect("lookup inv_chain");
+        assert_eq!(size, 2 * CLUSTER as u64, "expected 8 KiB after AB writes");
+
+        // Step b: one-byte append past EOC. Exercises the
+        // offset-walk loop's allocate-on-EOC path.
+        fs_write_inline(cap, (4 * CLUSTER) as u64, b"Z", ipc_buf).expect("write Z past EOC");
+
+        // Re-LOOKUP again for consistency.
+        let _ = syscall::cap_delete(cap);
+        let (cap, _, _) = ns_lookup(usertest, name, 0xFFFF, ipc_buf).expect("lookup inv_chain 2");
+
+        // Step c: read back pattern B from offset 4 KiB. With the
+        // broken loop, the FAT chain X→Y was rewritten to X→Znew,
+        // and the read would return the fresh cluster's contents
+        // instead of pattern B. FS_READ inline tops out at 504 B,
+        // so we sample rather than asking for the whole cluster in
+        // one call.
+        let got_b = fs_read_bytes(cap, CLUSTER as u64, INLINE_CHUNK as u64, ipc_buf)
+            .expect("read pattern B");
+        assert_eq!(
+            got_b.len(),
+            INLINE_CHUNK,
+            "short read at offset {CLUSTER} (chain corruption?)"
+        );
+        assert!(
+            got_b.iter().all(|&b| b == 0x5A),
+            "pattern B corrupted at offset {CLUSTER} — FAT chain rewritten"
+        );
+
+        // Sample pattern A and the trailing byte.
+        let got_a = fs_read_bytes(cap, 0, INLINE_CHUNK as u64, ipc_buf).expect("read pattern A");
+        assert!(got_a.iter().all(|&b| b == 0xA5), "pattern A corrupted");
+        let got_z = fs_read_bytes(cap, (4 * CLUSTER) as u64, 1, ipc_buf).expect("read Z");
+        assert_eq!(got_z.first().copied(), Some(b'Z'));
+
+        let _ = syscall::cap_delete(cap);
+        let _ = fs_remove(usertest, name, ipc_buf);
+        let _ = syscall::cap_delete(usertest);
+        std::os::seraph::log!("fs_write_invariants: FAT chain past EOC ok");
+    }
+
+    std::os::seraph::log!("fs_write_invariants phase passed");
 }
 
 /// Exercise vfsd's tree-shaped synthetic root: a multi-component

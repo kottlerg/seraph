@@ -18,11 +18,6 @@
 //! that have no LFN entry still surface lower-case rather than as
 //! `BOOT    CON`.
 
-// The directory-mutation helpers added in the write-support work are
-// wired into dispatch handlers in a subsequent commit; suppress the
-// dead-code lint module-wide until that lands.
-#![allow(dead_code)]
-
 use crate::alloc::{FatError, allocate_cluster, free_cluster_chain};
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;
@@ -920,11 +915,6 @@ fn populate_lfn(entry: &mut DirEntry, lfn: &LfnAccum)
 }
 
 // ── Directory mutation ────────────────────────────────────────────────────
-//
-// The mutation API (insert_entry / remove_entry / update_entry_metadata
-// / write_dot_entries / directory_is_empty / free_entry_data) is wired
-// into dispatch handlers in a subsequent commit. Dead-code suppression
-// is module-wide via `#![allow(dead_code)]` at the top of dir.rs.
 
 /// Whether a new entry is a file or a directory. Drives the on-disk
 /// `attr` byte (`0x20` archive vs `0x10` directory) and the post-insert
@@ -974,8 +964,6 @@ pub struct DirEntryLocation
 pub struct RemovedEntry
 {
     pub start_cluster: u32,
-    pub size: u32,
-    pub is_dir: bool,
 }
 
 /// Insert a new 8.3 directory entry, prefixed by an LFN run when the
@@ -1050,7 +1038,7 @@ pub fn insert_entry(
             let is_last = i == 0;
             let slot_chars = lfn_chars_for_seq(&chars, name.len(), seq);
             let raw = pack_lfn_slot(seq, is_last, chksum, &slot_chars);
-            write_dir_slot(state, *slot, &raw, cache, block_dev, ipc_buf)?;
+            write_dir_slot(*slot, &raw, cache, block_dev, ipc_buf)?;
         }
     }
 
@@ -1060,14 +1048,7 @@ pub fn insert_entry(
         NewEntryKind::Dir => ATTR_DIRECTORY,
     };
     let raw_83 = pack_83_entry(&sfn, attr, start_cluster, size);
-    write_dir_slot(
-        state,
-        slots[total_slots - 1],
-        &raw_83,
-        cache,
-        block_dev,
-        ipc_buf,
-    )?;
+    write_dir_slot(slots[total_slots - 1], &raw_83, cache, block_dev, ipc_buf)?;
 
     Ok(slots[total_slots - 1])
 }
@@ -1094,7 +1075,7 @@ pub fn remove_entry(
     let (entry, ref slots) = positions;
     for slot in slots
     {
-        mark_slot_deleted(state, *slot, cache, block_dev, ipc_buf)?;
+        mark_slot_deleted(*slot, cache, block_dev, ipc_buf)?;
     }
     Ok(entry)
 }
@@ -1102,7 +1083,6 @@ pub fn remove_entry(
 /// Patch the 8.3 entry at `loc` with new `first_cluster` and `size`
 /// fields. Used after a write extends a file's cluster chain.
 pub fn update_entry_metadata(
-    state: &mut FatState,
     loc: DirEntryLocation,
     new_first_cluster: u32,
     new_size: u32,
@@ -1111,7 +1091,6 @@ pub fn update_entry_metadata(
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    let _ = state; // mirrors the read-side signature; reserved for future use
     let mut buf = Box::new([0u8; SECTOR_SIZE]);
     if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
@@ -1500,7 +1479,6 @@ fn zero_cluster(
 }
 
 fn write_dir_slot(
-    state: &mut FatState,
     loc: DirEntryLocation,
     raw: &[u8; 32],
     cache: &PageCache,
@@ -1508,7 +1486,6 @@ fn write_dir_slot(
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    let _ = state; // reserved for future use; mirrors the read-side signature
     let mut buf = Box::new([0u8; SECTOR_SIZE]);
     if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
@@ -1523,14 +1500,12 @@ fn write_dir_slot(
 }
 
 fn mark_slot_deleted(
-    state: &mut FatState,
     loc: DirEntryLocation,
     cache: &PageCache,
     block_dev: u32,
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    let _ = state;
     let mut buf = Box::new([0u8; SECTOR_SIZE]);
     if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
@@ -2038,8 +2013,6 @@ fn scan_sector_for_remove(
             return Ok(Some((
                 RemovedEntry {
                     start_cluster: u32::MAX,
-                    size: 0,
-                    is_dir: false,
                 },
                 *lfn_run,
                 *lfn_run_len,
@@ -2080,8 +2053,6 @@ fn scan_sector_for_remove(
                 return Ok(Some((
                     RemovedEntry {
                         start_cluster: entry.cluster,
-                        size: entry.size,
-                        is_dir: entry.attr & ATTR_DIRECTORY != 0,
                     },
                     run,
                     run_len,

@@ -198,7 +198,6 @@ impl PageCache
     ///
     /// Returns `false` on cache acquire failure, missing scratch frame
     /// (cache init never ran), or block-driver error.
-    #[allow(dead_code)] // wired in by alloc.rs / dispatch in subsequent commits
     pub fn write_sector(
         &self,
         lba: u64,

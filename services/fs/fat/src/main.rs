@@ -47,7 +47,7 @@ mod file;
 use std::os::seraph::{StartupInfo, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use alloc::{FatError, allocate_cluster, update_fat_entry};
+use alloc::{FatError, allocate_cluster};
 use backend::{FatfsBackend, NO_OPEN_SLOT, NodeTable};
 use bpb::{FatState, SECTOR_SIZE};
 use cache::PageCache;
@@ -283,10 +283,14 @@ fn service_loop(
         }
 
         // FS_* requests: gate on the rights table, replying with
-        // fs_errors codes.
-        let node_id = match gate(msg.label, msg.token)
+        // fs_errors codes. `parent_rights` is the caller's
+        // per-operation rights ceiling — the cap returned by
+        // FS_CREATE/FS_MKDIR must not exceed it, or a caller holding
+        // a `MUTATE_DIR`-only parent would silently gain `READ` /
+        // `WRITE` / `EXEC` on every child they create.
+        let (node_id, parent_rights) = match gate(msg.label, msg.token)
         {
-            Ok((node, _)) => node,
+            Ok(pair) => pair,
             Err(GateError::UnknownLabel) =>
             {
                 let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
@@ -334,7 +338,16 @@ fn service_loop(
             }
             fs_labels::FS_CREATE =>
             {
-                handle_create_node_cap(node_id, &msg, state, nodes, cache, caps, ipc_buf);
+                handle_create_node_cap(
+                    node_id,
+                    parent_rights,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps,
+                    ipc_buf,
+                );
                 continue;
             }
             fs_labels::FS_REMOVE =>
@@ -344,7 +357,16 @@ fn service_loop(
             }
             fs_labels::FS_MKDIR =>
             {
-                handle_mkdir_node_cap(node_id, &msg, state, nodes, cache, caps, ipc_buf);
+                handle_mkdir_node_cap(
+                    node_id,
+                    parent_rights,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps,
+                    ipc_buf,
+                );
                 continue;
             }
             fs_labels::FS_RENAME =>
@@ -878,23 +900,19 @@ fn write_file_bytes(
     let target_cluster_idx = offset / cluster_size;
 
     // Walk to the cluster containing the target offset, allocating
-    // along the way for sparse writes.
-    let mut prev = cluster;
+    // along the way for sparse writes. When we hit EOC, the current
+    // `cluster` is the terminal one — `allocate_cluster(Some(cluster))`
+    // links the new cluster after it. (A previous version threaded a
+    // separate `prev` that was updated after `cluster`, so on
+    // append-past-EOC it linked the new cluster behind the prior
+    // terminal, overwriting that terminal's existing forward link and
+    // orphaning the original tail.)
     for _ in 0..target_cluster_idx
     {
         cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
         {
-            Some(c) =>
-            {
-                prev = cluster;
-                c
-            }
-            None =>
-            {
-                let new = allocate_cluster(state, Some(prev), cache, block_dev, ipc_buf)?;
-                prev = cluster;
-                new
-            }
+            Some(c) => c,
+            None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
         };
     }
 
@@ -937,11 +955,10 @@ fn write_file_bytes(
         let new_cluster_offset = cur_offset % cluster_size;
         if new_cluster_offset == 0 && written < data.len()
         {
-            prev = cluster;
             cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
             {
                 Some(c) => c,
-                None => allocate_cluster(state, Some(prev), cache, block_dev, ipc_buf)?,
+                None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
             };
         }
     }
@@ -1008,15 +1025,8 @@ fn handle_write_node_cap(
 
     if (new_cluster != node.cluster || new_size != node.size) && node.loc.sector_lba != 0
     {
-        if let Err(e) = update_entry_metadata(
-            state,
-            node.loc,
-            new_cluster,
-            new_size,
-            cache,
-            block_dev,
-            ipc_buf,
-        )
+        if let Err(e) =
+            update_entry_metadata(node.loc, new_cluster, new_size, cache, block_dev, ipc_buf)
         {
             reply_err(fat_error_to_wire(e), ipc_buf);
             return;
@@ -1184,15 +1194,8 @@ fn handle_write_frame_node_cap(
 
     if (new_cluster != node.cluster || new_size != node.size) && node.loc.sector_lba != 0
     {
-        if let Err(e) = update_entry_metadata(
-            state,
-            node.loc,
-            new_cluster,
-            new_size,
-            cache,
-            block_dev,
-            ipc_buf,
-        )
+        if let Err(e) =
+            update_entry_metadata(node.loc, new_cluster, new_size, cache, block_dev, ipc_buf)
         {
             reply_with(fat_error_to_wire(e), ipc_buf);
             return;
@@ -1248,9 +1251,12 @@ fn self_aspace_cap() -> Option<u32>
 
 /// `FS_CREATE`: create a new file in a directory. Token = parent-dir
 /// cap (must carry `MUTATE_DIR`). `label[16..32]` = name length, name
-/// from word 0.
+/// from word 0. `parent_rights` is the caller's effective rights on
+/// the parent dir; the returned child cap is attenuated by it.
+#[allow(clippy::too_many_arguments)]
 fn handle_create_node_cap(
     node_id: NodeId,
+    parent_rights: NamespaceRights,
     msg: &IpcMessage,
     state: &mut FatState,
     nodes: &mut NodeTable,
@@ -1261,6 +1267,7 @@ fn handle_create_node_cap(
 {
     create_entry_common(
         node_id,
+        parent_rights,
         msg,
         NewEntryKind::File,
         state,
@@ -1272,8 +1279,10 @@ fn handle_create_node_cap(
 }
 
 /// `FS_MKDIR`: create a new directory in a directory.
+#[allow(clippy::too_many_arguments)]
 fn handle_mkdir_node_cap(
     node_id: NodeId,
+    parent_rights: NamespaceRights,
     msg: &IpcMessage,
     state: &mut FatState,
     nodes: &mut NodeTable,
@@ -1284,6 +1293,7 @@ fn handle_mkdir_node_cap(
 {
     create_entry_common(
         node_id,
+        parent_rights,
         msg,
         NewEntryKind::Dir,
         state,
@@ -1297,6 +1307,7 @@ fn handle_mkdir_node_cap(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn create_entry_common(
     node_id: NodeId,
+    parent_rights: NamespaceRights,
     msg: &IpcMessage,
     kind: NewEntryKind,
     state: &mut FatState,
@@ -1393,7 +1404,24 @@ fn create_entry_common(
         reply_err(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
         return;
     };
-    let token = pack_token(new_node_id, NamespaceRights::ALL);
+    // Cap-monotonic attenuation: the child cap can carry at most the
+    // intersection of the caller's parent rights and the kind-specific
+    // ceiling that `backend::lookup` would later apply on a re-walk.
+    // Files: STAT|READ|WRITE|EXEC. Dirs: ALL (intermediate-dir
+    // composition relies on dirs passing every bit through; per-op
+    // gating still enforces the leaf check).
+    let kind_max = match kind_for_node
+    {
+        NodeKind::Dir => NamespaceRights::ALL,
+        NodeKind::File => NamespaceRights::from_raw(
+            namespace_protocol::rights::STAT
+                | namespace_protocol::rights::READ
+                | namespace_protocol::rights::WRITE
+                | namespace_protocol::rights::EXEC,
+        ),
+    };
+    let child_rights = parent_rights.intersect(kind_max);
+    let token = pack_token(new_node_id, child_rights);
     let Ok(new_cap) = syscall::cap_derive_token(caps.service, syscall::RIGHTS_SEND_GRANT, token)
     else
     {
@@ -1436,7 +1464,7 @@ fn handle_remove_node_cap(
     }
     let name = &data_bytes[..name_len];
 
-    let Some((entry, _loc)) = dir::find_in_directory_with_location(
+    let Some((entry, removed_loc)) = dir::find_in_directory_with_location(
         parent_cluster,
         name,
         state,
@@ -1485,15 +1513,12 @@ fn handle_remove_node_cap(
         return;
     }
 
-    let kind = if removed.is_dir
-    {
-        NodeKind::Dir
-    }
-    else
-    {
-        NodeKind::File
-    };
-    nodes.invalidate_for_entry(removed.start_cluster, kind, removed.size);
+    // Slot-keyed invalidation: NodeTable now dedupes by
+    // `DirEntryLocation`, so a stale node for this slot must be
+    // dropped before a later FS_CREATE lands here and reuses the
+    // slot's bytes.
+    let _ = removed;
+    nodes.invalidate_for_loc(removed_loc);
 
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -1537,7 +1562,7 @@ fn handle_rename_node_cap(
         return;
     }
 
-    let Some((entry, _loc)) = dir::find_in_directory_with_location(
+    let Some((entry, src_loc)) = dir::find_in_directory_with_location(
         parent_cluster,
         src_name,
         state,
@@ -1583,7 +1608,11 @@ fn handle_rename_node_cap(
         return;
     }
 
-    let _ = update_fat_entry; // silence unused-import lint pending future use
+    // Drop any cached node referencing the now-deleted source slot.
+    // A later FS_WRITE through a held source cap would otherwise
+    // patch a `0xE5`-marked entry.
+    nodes.invalidate_for_loc(src_loc);
+
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

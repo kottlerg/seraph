@@ -60,7 +60,6 @@ pub struct FatNode
     /// chain. `sector_lba == 0` is the sentinel "no location known"
     /// (LBA 0 is the BPB, never a directory sector); the dispatch
     /// rejects mutation requests against such nodes.
-    #[allow(dead_code)] // consumed by dispatch handlers in a later commit
     pub loc: DirEntryLocation,
 }
 
@@ -115,19 +114,18 @@ impl NodeTable
 
     fn alloc(&mut self, node: FatNode) -> Option<NodeId>
     {
-        // Dedupe by (cluster, kind, size). Different on-disk entries
-        // never collide on starting cluster (FAT invariant for non-empty
-        // files; empty files at cluster 0 are content-indistinguishable
-        // and may safely share a NodeId). Saves the table from monotonic
-        // growth on repeated lookups of the same path — without this,
-        // 64 unique walks exhausts MAX_NODES, even for paths a caller
-        // re-walks every iteration.
+        // Dedupe by on-disk slot location. `(sector_lba,
+        // offset_in_sector)` uniquely identifies a 32-byte directory
+        // entry — two distinct files can never share one, and repeated
+        // walks of the same file always rediscover the same slot.
+        // Previous keys based on `(cluster, kind, size)` collapsed
+        // every empty file (cluster=0, size=0) to a single NodeId,
+        // silently aliasing FS_CREATEs of distinct empty files.
         for (i, slot) in self.entries[..self.len].iter().enumerate()
         {
             if let Some(existing) = slot
-                && existing.cluster == node.cluster
-                && existing.kind == node.kind
-                && existing.size == node.size
+                && existing.loc.sector_lba == node.loc.sector_lba
+                && existing.loc.offset_in_sector == node.loc.offset_in_sector
             {
                 return NodeId::new((i + 1) as u64);
             }
@@ -163,22 +161,21 @@ impl NodeTable
         }
     }
 
-    /// Invalidate any entries that match `(cluster, kind, size)`.
-    /// Called from `FS_REMOVE` so a follow-on `FS_CREATE` that lands at
-    /// the same disk location does not dedupe to a stale `NodeId`.
+    /// Invalidate any entry whose on-disk slot matches `loc`. Called
+    /// from `FS_REMOVE` / `FS_RENAME` so a follow-on `FS_CREATE` that
+    /// lands at the same disk slot does not dedupe to a stale
+    /// `NodeId`.
     ///
-    /// The append-only table cannot recycle slots (filed as Issue #27),
-    /// so the slot is left present but cleared to `None`; the dedupe
-    /// scan in `alloc()` only matches `Some` entries.
-    #[allow(dead_code)] // wired in by the FS_REMOVE handler in a later commit
-    pub fn invalidate_for_entry(&mut self, cluster: u32, kind: NodeKind, size: u32)
+    /// The append-only table cannot recycle slots (filed as Issue
+    /// #27), so the slot is left present but cleared to `None`; the
+    /// dedupe scan in `alloc()` only matches `Some` entries.
+    pub fn invalidate_for_loc(&mut self, loc: DirEntryLocation)
     {
         for slot in &mut self.entries[..self.len]
         {
             if let Some(existing) = slot
-                && existing.cluster == cluster
-                && existing.kind == kind
-                && existing.size == size
+                && existing.loc.sector_lba == loc.sector_lba
+                && existing.loc.offset_in_sector == loc.offset_in_sector
             {
                 *slot = None;
             }
@@ -187,7 +184,6 @@ impl NodeTable
 
     /// Update the cluster and size fields of a non-root node entry.
     /// Used by `FS_WRITE` after extending the file's cluster chain.
-    #[allow(dead_code)] // wired in by the FS_WRITE handler in this PR's next commit
     pub fn update_size_and_cluster(&mut self, id: NodeId, new_cluster: u32, new_size: u32)
     {
         let raw = id.raw();

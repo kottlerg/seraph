@@ -21,7 +21,10 @@
 
 use crate::bpb::{FatState, FatType};
 use crate::cache::PageCache;
-use crate::dir::{DirEntry, MAX_LFN_UTF8, read_dir_entry_at_index};
+use crate::dir::{
+    DirEntry, DirEntryLocation, MAX_LFN_UTF8, find_in_directory_with_location,
+    read_dir_entry_at_index,
+};
 use namespace_protocol::{
     EntryName, EntryTarget, EntryView, FrameReply, NamespaceBackend, NamespaceRights, NodeId,
     NodeKind, NodeStat, NsError, rights,
@@ -51,6 +54,13 @@ pub struct FatNode
     pub size: u32,
     pub kind: NodeKind,
     pub open_slot: u32,
+    /// On-disk position of this entry's 8.3 record. Populated by
+    /// `lookup()` so write / metadata-update handlers can patch
+    /// `first_cluster` and `size` in place after extending the cluster
+    /// chain. `sector_lba == 0` is the sentinel "no location known"
+    /// (LBA 0 is the BPB, never a directory sector); the dispatch
+    /// rejects mutation requests against such nodes.
+    pub loc: DirEntryLocation,
 }
 
 /// Sentinel for [`FatNode::open_slot`] meaning "no `OpenFile` slot
@@ -93,21 +103,29 @@ impl NodeTable
         self.entries.get(idx).copied().flatten()
     }
 
+    /// Public-to-the-crate wrapper around `alloc` so dispatch handlers
+    /// in `main.rs` can mint a new node entry directly for
+    /// freshly-created files / directories.
+    #[must_use]
+    pub fn alloc_for_dispatch(&mut self, node: FatNode) -> Option<NodeId>
+    {
+        self.alloc(node)
+    }
+
     fn alloc(&mut self, node: FatNode) -> Option<NodeId>
     {
-        // Dedupe by (cluster, kind, size). Different on-disk entries
-        // never collide on starting cluster (FAT invariant for non-empty
-        // files; empty files at cluster 0 are content-indistinguishable
-        // and may safely share a NodeId). Saves the table from monotonic
-        // growth on repeated lookups of the same path — without this,
-        // 64 unique walks exhausts MAX_NODES, even for paths a caller
-        // re-walks every iteration.
+        // Dedupe by on-disk slot location. `(sector_lba,
+        // offset_in_sector)` uniquely identifies a 32-byte directory
+        // entry — two distinct files can never share one, and repeated
+        // walks of the same file always rediscover the same slot.
+        // Previous keys based on `(cluster, kind, size)` collapsed
+        // every empty file (cluster=0, size=0) to a single NodeId,
+        // silently aliasing FS_CREATEs of distinct empty files.
         for (i, slot) in self.entries[..self.len].iter().enumerate()
         {
             if let Some(existing) = slot
-                && existing.cluster == node.cluster
-                && existing.kind == node.kind
-                && existing.size == node.size
+                && existing.loc.sector_lba == node.loc.sector_lba
+                && existing.loc.offset_in_sector == node.loc.offset_in_sector
             {
                 return NodeId::new((i + 1) as u64);
             }
@@ -140,6 +158,44 @@ impl NodeTable
         if let Some(Some(node)) = self.entries.get_mut(idx)
         {
             node.open_slot = slot;
+        }
+    }
+
+    /// Invalidate any entry whose on-disk slot matches `loc`. Called
+    /// from `FS_REMOVE` / `FS_RENAME` so a follow-on `FS_CREATE` that
+    /// lands at the same disk slot does not dedupe to a stale
+    /// `NodeId`.
+    ///
+    /// The append-only table cannot recycle slots (filed as Issue
+    /// #27), so the slot is left present but cleared to `None`; the
+    /// dedupe scan in `alloc()` only matches `Some` entries.
+    pub fn invalidate_for_loc(&mut self, loc: DirEntryLocation)
+    {
+        for slot in &mut self.entries[..self.len]
+        {
+            if let Some(existing) = slot
+                && existing.loc.sector_lba == loc.sector_lba
+                && existing.loc.offset_in_sector == loc.offset_in_sector
+            {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Update the cluster and size fields of a non-root node entry.
+    /// Used by `FS_WRITE` after extending the file's cluster chain.
+    pub fn update_size_and_cluster(&mut self, id: NodeId, new_cluster: u32, new_size: u32)
+    {
+        let raw = id.raw();
+        if raw == 0
+        {
+            return;
+        }
+        let idx = (raw - 1) as usize;
+        if let Some(Some(node)) = self.entries.get_mut(idx)
+        {
+            node.cluster = new_cluster;
+            node.size = new_size;
         }
     }
 }
@@ -221,13 +277,21 @@ impl NamespaceBackend for FatfsBackend<'_>
     {
         let dir_cluster = self.cluster_for(dir).ok_or(NsError::NotADirectory)?;
 
-        // Single-component scan against `dir_cluster`. Mirrors the
-        // logic in `dir.rs::find_in_directory`, inlined here because
-        // that helper is module-private to dir.rs and structured for
-        // the multi-component path walker rather than the per-call
-        // single-name dispatch the namespace protocol expects.
-        let entry = scan_dir_for_name(
-            dir_cluster,
+        // Resolves a single component against `dir_cluster` and also
+        // surfaces the on-disk `DirEntryLocation` so the write-side
+        // dispatch can patch metadata in place without re-scanning the
+        // parent directory.
+        let dir_cluster_resolved = if dir_cluster == 0
+            && matches!(self.state.fat_type, FatType::Fat32)
+        {
+            self.state.root_cluster
+        }
+        else
+        {
+            dir_cluster
+        };
+        let (entry, loc) = find_in_directory_with_location(
+            dir_cluster_resolved,
             name,
             self.state,
             self.cache,
@@ -244,19 +308,32 @@ impl NamespaceBackend for FatfsBackend<'_>
                 size: entry.size,
                 kind,
                 open_slot: NO_OPEN_SLOT,
+                loc,
             })
             .ok_or(NsError::OutOfResources)?;
 
+        // Rights composition (`parent ∩ entry.max ∩ requested`) means a
+        // dir's `max_rights` ceiling must include every bit a child
+        // file or subdir might legitimately inherit — otherwise the
+        // walk drops `READ` (or `WRITE`) on a leaf because an
+        // intermediate dir cleared it. Dirs therefore carry the full
+        // mask (the per-operation rights enforcement at the leaf still
+        // gates each request via `gate()`); files narrow to the
+        // file-only set.
+        let max = match kind
+        {
+            NodeKind::Dir => NamespaceRights::ALL,
+            NodeKind::File => NamespaceRights::from_raw(
+                rights::STAT | rights::READ | rights::WRITE | rights::EXEC,
+            ),
+        };
         Ok(EntryView {
             target: EntryTarget::Local(node_id),
             kind,
             size_hint: u64::from(entry.size),
-            // Read-only volume: hand out everything the namespace
-            // model defines as observable. Future write support
-            // narrows this on a per-entry basis.
-            max_rights: NamespaceRights::from_raw(
-                rights::LOOKUP | rights::READDIR | rights::STAT | rights::READ | rights::EXEC,
-            ),
+            // FAT directory `DIR_ATTR_READ_ONLY` is not honoured here;
+            // tracked as a follow-up Issue.
+            max_rights: max,
             visible_requires: NamespaceRights::NONE,
         })
     }
@@ -324,43 +401,4 @@ impl NamespaceBackend for FatfsBackend<'_>
     fn release_frame(&mut self, _file: NodeId, _cookie: u64) {}
 
     fn close(&mut self, _node: NodeId) {}
-}
-
-/// Single-component lookup against `dir_cluster`.
-///
-/// Bridges the gap left by `dir::find_in_directory` being private:
-/// Resolve a single name against `dir_cluster`, returning the matching
-/// directory entry (or `None` for absence).
-///
-/// Delegates to [`crate::dir::find_in_directory`] for both the FAT32
-/// cluster-chain walk and the FAT16 fixed-root case. That helper
-/// performs LFN-aware matching via `scan_sector_for_name`, so names
-/// whose 8.3 short form is generated (e.g. `boot.conf` → `BOOT~1.CON`)
-/// resolve correctly through their long-name entry. The
-/// FAT32-root-cluster path also lands on `find_in_directory` (no
-/// special-case dispatch) — `resolve_path` is only needed when the
-/// caller doesn't yet know the start cluster.
-fn scan_dir_for_name(
-    dir_cluster: u32,
-    name: &[u8],
-    state: &mut FatState,
-    cache: &PageCache,
-    block_dev: u32,
-    ipc_buf: *mut u64,
-) -> Option<DirEntry>
-{
-    if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat32)
-    {
-        // FAT32 with cluster 0 means "uninitialised" — fall back to
-        // resolving from the configured root cluster.
-        return crate::dir::find_in_directory(
-            state.root_cluster,
-            name,
-            state,
-            cache,
-            block_dev,
-            ipc_buf,
-        );
-    }
-    crate::dir::find_in_directory(dir_cluster, name, state, cache, block_dev, ipc_buf)
 }

@@ -5,20 +5,34 @@
 
 //! Block I/O request submission and completion for the `VirtIO` block driver.
 //!
-//! Provides the descriptor chain layout for `VirtIO` block read requests
-//! (`VirtIO` 1.2 section 5.2.6) and helpers for submitting sector reads.
+//! Provides the descriptor chain layout for `VirtIO` block read and write
+//! requests (`VirtIO` 1.2 section 5.2.6) and a single submit/wait helper
+//! parameterised over direction.
 //!
 //! `IoLayout` owns the driver's permanent 1-page DMA buffer. The request
 //! header (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live
 //! there permanently. The 512-byte data segment is supplied per-request by
-//! the caller as a Frame cap; `read_chain` parameterises the data-segment
-//! physical address. The driver's own page never holds bulk data.
+//! the caller as a Frame cap; [`IoLayout::read_chain`] /
+//! [`IoLayout::write_chain`] parameterise the data-segment physical
+//! address. The driver's own page never holds bulk data.
 
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::SplitVirtqueue;
 
 /// Block request type: read (`VirtIO` 1.2 section 5.2.6).
 const VIRTIO_BLK_T_IN: u32 = 0;
+/// Block request type: write (`VirtIO` 1.2 section 5.2.6).
+const VIRTIO_BLK_T_OUT: u32 = 1;
+
+/// Direction of a block I/O request.
+#[derive(Copy, Clone)]
+pub enum IoDirection
+{
+    /// Sector read: device DMAs data into the caller-supplied frame.
+    Read,
+    /// Sector write: device DMAs data out of the caller-supplied frame.
+    Write,
+}
 
 /// Block request header (`VirtIO` 1.2 section 5.2.6).
 #[repr(C)]
@@ -73,14 +87,38 @@ impl IoLayout
         ]
     }
 
-    /// Prepare a read request for the given sector.
+    /// Descriptor chain for a block write request whose data segment is
+    /// sourced from `data_phys` and is `data_len` bytes long (`data_len`
+    /// must be a non-zero multiple of 512).
+    ///
+    /// Mirror of [`Self::read_chain`] with the data segment's writable
+    /// flag flipped: the device reads from the caller-supplied frame and
+    /// writes only the completion status byte in the driver's page.
+    pub fn write_chain(&self, data_phys: u64, data_len: u32) -> [(u64, u32, bool); 3]
+    {
+        let header_phys = self.data_phys;
+        let status_phys = self.data_phys + 1024;
+
+        [
+            (header_phys, 16, false),     // request header
+            (data_phys, data_len, false), // data buffer (device reads)
+            (status_phys, 1, true),       // status byte (device writes)
+        ]
+    }
+
+    /// Prepare a read or write request for the given sector.
     ///
     /// Writes the block request header and resets the status byte.
-    pub fn prepare_read(&self, sector: u64)
+    pub fn prepare(&self, dir: IoDirection, sector: u64)
     {
+        let req_type = match dir
+        {
+            IoDirection::Read => VIRTIO_BLK_T_IN,
+            IoDirection::Write => VIRTIO_BLK_T_OUT,
+        };
         // SAFETY: header_va is within the mapped data page, properly aligned.
         unsafe {
-            (*self.header_va()).req_type = VIRTIO_BLK_T_IN;
+            (*self.header_va()).req_type = req_type;
             (*self.header_va()).reserved = 0;
             (*self.header_va()).sector = sector;
         }
@@ -101,27 +139,43 @@ impl IoLayout
     }
 }
 
-/// Maximum `signal_wait` iterations before treating the request as timed out.
+/// Maximum wait iterations before treating the request as timed out.
 const MAX_WAIT_ATTEMPTS: usize = 1000;
 
-/// Submit a read request and wait for completion via IRQ signal.
+/// Per-iteration timeout on the IRQ-signal wait, in milliseconds.
 ///
-/// `data_phys` is the physical address the device should DMA the data
-/// segment into — the caller-supplied frame's `phys_base` per the
-/// `BLK_READ_INTO_FRAME` contract (data lands at offset 0 of the frame).
-/// `data_len` is `count * 512` for `count` consecutive sectors starting
-/// at `sector`; the device fills the entire run in one transfer.
+/// Bounded so that a lost PLIC external interrupt on QEMU virt RISC-V (see
+/// the wait loop comment) cannot park this thread indefinitely: the next
+/// iteration's poll-burst will observe completion regardless of whether the
+/// IRQ ever fires. The actual completion time of a virtio-blk request on
+/// QEMU is sub-millisecond, so a 50 ms ceiling is two orders of magnitude
+/// over the expected wake and three orders under the outer-loop deadline
+/// (`MAX_WAIT_ATTEMPTS * IRQ_WAIT_TIMEOUT_MS` = 50 s upper bound).
+const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
+
+/// Submit a read or write request and wait for completion via IRQ signal.
 ///
-/// Blocks on `signal_wait` until the device raises an interrupt, reads the
-/// device ISR to deassert the level-triggered interrupt, then acknowledges
-/// at the controller for re-arming.
-// too_many_arguments: layout + sector + data_phys + data_len + four
-// hardware handles (virtqueue, transport, irq signal, irq cap) is the
-// minimal set this path needs; bundling for the lint would obscure the
-// per-call inputs (sector, data_phys, data_len) that vary per request.
+/// `data_phys` is the physical address of the caller-supplied frame's
+/// data segment (offset 0 of the frame per the `BLK_READ_INTO_FRAME` /
+/// `BLK_WRITE_FROM_FRAME` contract). `data_len` is `count * 512` for
+/// `count` consecutive sectors starting at `sector`; the device
+/// transfers the entire run in one descriptor chain.
+///
+/// Blocks on a bounded `signal_wait_timeout` per iteration until the device
+/// raises an interrupt or the per-iteration timeout elapses, then reads the
+/// device ISR to deassert the level-triggered interrupt, acknowledges at the
+/// controller for re-arming, and re-polls the used ring. The bounded wait
+/// ensures that a lost PLIC external interrupt on QEMU virt RISC-V cannot
+/// park this thread indefinitely — see the wait loop body for details.
+// too_many_arguments: layout + direction + sector + data_phys + data_len
+// + four hardware handles (virtqueue, transport, irq signal, irq cap) is
+// the minimal set this path needs; bundling for the lint would obscure
+// the per-call inputs (direction, sector, data_phys, data_len) that vary
+// per request.
 #[allow(clippy::too_many_arguments)]
 pub fn submit_and_wait(
     layout: &IoLayout,
+    dir: IoDirection,
     sector: u64,
     data_phys: u64,
     data_len: u32,
@@ -132,9 +186,13 @@ pub fn submit_and_wait(
     irq_cap: u32,
 ) -> bool
 {
-    layout.prepare_read(sector);
+    layout.prepare(dir, sector);
 
-    let chain = layout.read_chain(data_phys, data_len);
+    let chain = match dir
+    {
+        IoDirection::Read => layout.read_chain(data_phys, data_len),
+        IoDirection::Write => layout.write_chain(data_phys, data_len),
+    };
     let Some(_head) = vq.add_chain(&chain)
     else
     {
@@ -156,9 +214,11 @@ pub fn submit_and_wait(
     // PLIC) is occasionally not observed by any hart even though the device
     // processes the request — we have confirmed via instrumentation that
     // completion happens but the PLIC-delivered external interrupt never
-    // fires. To stay robust without pure polling, each wait iteration does
-    // a short poll burst first (catching device-faster-than-schedule cases
-    // and IRQ-lost cases both), and only blocks on the signal afterwards.
+    // fires. Two defenses against a lost IRQ: each iteration does a short
+    // poll burst, and the per-iteration signal wait carries a bounded
+    // timeout so a completion that lands between the poll burst and the
+    // kernel parking the thread is recovered on the next iteration's burst
+    // rather than wedging the driver forever.
     for _ in 0..MAX_WAIT_ATTEMPTS
     {
         // Poll burst before blocking. VirtIO devices typically complete in
@@ -179,8 +239,11 @@ pub fn submit_and_wait(
             core::hint::spin_loop();
         }
 
-        // No completion yet — block until the IRQ fires, then re-check.
-        let _ = syscall::signal_wait(irq_signal);
+        // No completion yet — block on the IRQ signal with a bounded timeout.
+        // Ok(0) means timeout (signal_send rejects zero-bit sends, so 0 is
+        // unambiguous); Ok(_) means a real wake; Err means the cap path
+        // failed and there's nothing useful to do but fall through and poll.
+        let _ = syscall::signal_wait_timeout(irq_signal, IRQ_WAIT_TIMEOUT_MS);
 
         // Read ISR to clear level-triggered interrupt at the device before
         // unmasking at the controller, preventing immediate re-delivery.

@@ -132,6 +132,13 @@ fn main()
     fs_release_on_close_phase();
     fs_crossover_bench_phase();
     fs_rights_attenuation_phase();
+    fs_write_phase();
+    fs_create_remove_phase();
+    fs_mkdir_phase();
+    fs_rename_phase();
+    fs_write_frame_phase();
+    fs_write_cache_coherence_phase();
+    fs_write_invariants_phase();
     ns_multi_component_phase();
     ns_sandbox_phase();
     ns_fallthrough_attenuation_phase();
@@ -1011,6 +1018,634 @@ fn fs_rights_attenuation_phase()
     let _ = syscall::cap_delete(full_cap);
     let _ = syscall::cap_delete(srv_cap);
     std::os::seraph::log!("fs_rights_attenuation phase passed");
+}
+
+// ── Write / mutation phases ────────────────────────────────────────────────
+//
+// All write-side phases exercise raw `FS_*` IPC against caps obtained
+// through `NS_LOOKUP`. Std::fs has no write surface yet — Issue #8
+// tracks the ruststd bridge separately. The scratch directory is
+// `/usertest/` (already populated by xtask's sysroot build, so it
+// exists on every boot); test files are uniquely-named per phase so
+// re-runs do not interfere when the disk image is reused.
+
+/// Walk `/usertest` and return a directory cap. The directory exists
+/// in the sysroot at build time; xtask populates fixture files into
+/// it (large.bin, bench.bin). We add scratch entries alongside.
+fn usertest_dir_cap(ipc_buf: *mut u64) -> u32
+{
+    let root = std::os::seraph::root_dir_cap();
+    let (cap, _kind, _) =
+        ns_lookup(root, b"usertest", 0xFFFF, ipc_buf).expect("ns_lookup /usertest failed");
+    cap
+}
+
+/// `FS_CREATE` returns `(node_cap, kind)` on success. Returns the wire
+/// error code on failure.
+fn fs_create(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32, u64), u64>
+{
+    let label = ipc::fs_labels::FS_CREATE | ((name.len() as u64) << 16);
+    let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(parent_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    let cap = *reply.caps().first().ok_or(0u64)?;
+    Ok((cap, reply.word(0)))
+}
+
+/// `FS_MKDIR`. Same shape as `FS_CREATE`.
+fn fs_mkdir(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32, u64), u64>
+{
+    let label = ipc::fs_labels::FS_MKDIR | ((name.len() as u64) << 16);
+    let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(parent_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    let cap = *reply.caps().first().ok_or(0u64)?;
+    Ok((cap, reply.word(0)))
+}
+
+/// `FS_REMOVE`. Returns `Ok(())` on success.
+fn fs_remove(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
+{
+    let label = ipc::fs_labels::FS_REMOVE | ((name.len() as u64) << 16);
+    let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(parent_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    Ok(())
+}
+
+/// `FS_RENAME` within a single directory. Returns `Ok(())` on success.
+fn fs_rename(dir_cap: u32, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
+{
+    let mut combined = Vec::with_capacity(src.len() + dst.len());
+    combined.extend_from_slice(src);
+    combined.extend_from_slice(dst);
+    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RENAME)
+        .word(0, src.len() as u64)
+        .word(1, dst.len() as u64)
+        .bytes(2, &combined)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(dir_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    Ok(())
+}
+
+/// `FS_WRITE` inline: returns `bytes_written`.
+#[allow(clippy::doc_markdown)]
+fn fs_write_inline(
+    file_cap: u32,
+    offset: u64,
+    payload: &[u8],
+    ipc_buf: *mut u64,
+) -> Result<u64, u64>
+{
+    let label = ipc::fs_labels::FS_WRITE | ((payload.len() as u64) << 16);
+    let msg = ipc::IpcMessage::builder(label)
+        .word(0, offset)
+        .bytes(1, payload)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    Ok(reply.word(0))
+}
+
+/// Round-trip `FS_READ`: returns the bytes the driver reports.
+fn fs_read_bytes(
+    file_cap: u32,
+    offset: u64,
+    max_len: u64,
+    ipc_buf: *mut u64,
+) -> Result<Vec<u8>, u64>
+{
+    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ)
+        .word(0, offset)
+        .word(1, max_len)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let n = reply.word(0) as usize;
+    Ok(reply.data_bytes()[8..8 + n].to_vec())
+}
+
+/// `FS_WRITE` round-trip on a fresh file. Creates, writes a small
+/// payload, re-looks-up the file, reads back, and confirms bytes
+/// match. Covers Issue #6's primary acceptance criterion ("Round-trip:
+/// write file from usertest → read back same bytes").
+fn fs_write_phase()
+{
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let usertest = usertest_dir_cap(ipc_buf);
+
+    let name: &[u8] = b"wrt.bin";
+    // Clean up any leftover from a previous (failed) run.
+    let _ = fs_remove(usertest, name, ipc_buf);
+
+    let (file_cap, kind) = fs_create(usertest, name, ipc_buf).expect("FS_CREATE wrt.bin failed");
+    assert_eq!(kind, namespace_protocol::NodeKind::File as u64);
+
+    let payload: &[u8] = b"hello write path\n";
+    let n = fs_write_inline(file_cap, 0, payload, ipc_buf).expect("FS_WRITE wrt.bin failed");
+    assert_eq!(n, payload.len() as u64, "FS_WRITE short");
+
+    // Re-lookup via NS_LOOKUP so the cap reflects the post-write
+    // metadata (size, first_cluster).
+    let _ = syscall::cap_delete(file_cap);
+    let (rd_cap, _kind, size_hint) =
+        ns_lookup(usertest, name, 0xFFFF, ipc_buf).expect("NS_LOOKUP wrt.bin failed");
+    assert_eq!(size_hint, payload.len() as u64, "post-write size hint");
+
+    let got =
+        fs_read_bytes(rd_cap, 0, payload.len() as u64, ipc_buf).expect("FS_READ wrt.bin failed");
+    assert_eq!(&got[..], payload, "round-trip bytes mismatch");
+
+    let _ = syscall::cap_delete(rd_cap);
+    let _ = fs_remove(usertest, name, ipc_buf);
+    let _ = syscall::cap_delete(usertest);
+    std::os::seraph::log!("fs_write phase passed");
+}
+
+/// `FS_CREATE` + `FS_REMOVE`: create a file, verify a duplicate
+/// `FS_CREATE` rejects, then `FS_REMOVE` and verify `NS_LOOKUP`
+/// returns `NotFound`.
+fn fs_create_remove_phase()
+{
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let usertest = usertest_dir_cap(ipc_buf);
+
+    let name: &[u8] = b"crt.bin";
+    let _ = fs_remove(usertest, name, ipc_buf);
+
+    let (cap, _) = fs_create(usertest, name, ipc_buf).expect("FS_CREATE first failed");
+    let _ = syscall::cap_delete(cap);
+
+    // Duplicate create must fail with NO_SPACE (our dispatch maps
+    // existing-name to fs_errors::NO_SPACE today; refining to EXISTS
+    // is a presentation tweak, the test asserts only "non-success").
+    let dup = fs_create(usertest, name, ipc_buf);
+    assert!(
+        dup.is_err(),
+        "duplicate FS_CREATE on existing name should fail"
+    );
+
+    fs_remove(usertest, name, ipc_buf).expect("FS_REMOVE crt.bin failed");
+
+    // Verify NS_LOOKUP now returns NotFound (NsError code 1).
+    let gone = ns_lookup(usertest, name, 0xFFFF, ipc_buf);
+    assert!(
+        gone.is_err(),
+        "NS_LOOKUP after FS_REMOVE should fail; got {gone:?}"
+    );
+
+    let _ = syscall::cap_delete(usertest);
+    std::os::seraph::log!("fs_create_remove phase passed");
+}
+
+/// `FS_MKDIR` + `NS_READDIR` + `FS_REMOVE` (empty directory).
+fn fs_mkdir_phase()
+{
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let usertest = usertest_dir_cap(ipc_buf);
+
+    let dname: &[u8] = b"mkd";
+    let _ = fs_remove(usertest, dname, ipc_buf);
+
+    let (dir_cap, kind) = fs_mkdir(usertest, dname, ipc_buf).expect("FS_MKDIR mkd failed");
+    assert_eq!(kind, namespace_protocol::NodeKind::Dir as u64);
+
+    // readdir on the new directory: expect "." and ".." entries plus
+    // end-of-directory.
+    let entry0 = ns_readdir(dir_cap, 0, ipc_buf).expect("NS_READDIR 0");
+    assert!(entry0.is_some(), "newly-mkdir'd directory must have ./..");
+
+    // Remove the empty directory.
+    let _ = syscall::cap_delete(dir_cap);
+    fs_remove(usertest, dname, ipc_buf).expect("FS_REMOVE mkd (empty) failed");
+
+    // mkdir then file-inside then attempt-remove must reject as NOT_EMPTY.
+    let (dir_cap2, _) = fs_mkdir(usertest, dname, ipc_buf).expect("FS_MKDIR mkd retry");
+    let (inner, _) = fs_create(dir_cap2, b"in.bin", ipc_buf).expect("FS_CREATE inside dir failed");
+    let _ = syscall::cap_delete(inner);
+    let err = fs_remove(usertest, dname, ipc_buf).expect_err("FS_REMOVE non-empty should fail");
+    assert_eq!(
+        err,
+        ipc::fs_errors::NOT_EMPTY,
+        "FS_REMOVE non-empty dir code"
+    );
+    fs_remove(dir_cap2, b"in.bin", ipc_buf).expect("cleanup file in mkd");
+    fs_remove(usertest, dname, ipc_buf).expect("FS_REMOVE mkd (now empty)");
+    let _ = syscall::cap_delete(dir_cap2);
+    let _ = syscall::cap_delete(usertest);
+    std::os::seraph::log!("fs_mkdir phase passed");
+}
+
+/// `FS_RENAME` within a directory.
+fn fs_rename_phase()
+{
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let usertest = usertest_dir_cap(ipc_buf);
+
+    let src: &[u8] = b"ren_a.bin";
+    let dst: &[u8] = b"ren_b.bin";
+    let _ = fs_remove(usertest, src, ipc_buf);
+    let _ = fs_remove(usertest, dst, ipc_buf);
+
+    let (cap, _) = fs_create(usertest, src, ipc_buf).expect("FS_CREATE ren_a failed");
+    let payload: &[u8] = b"renaming";
+    fs_write_inline(cap, 0, payload, ipc_buf).expect("FS_WRITE ren_a failed");
+    let _ = syscall::cap_delete(cap);
+
+    fs_rename(usertest, src, dst, ipc_buf).expect("FS_RENAME failed");
+
+    assert!(
+        ns_lookup(usertest, src, 0xFFFF, ipc_buf).is_err(),
+        "src must be gone after rename"
+    );
+    let (dst_cap, _kind, dst_size) =
+        ns_lookup(usertest, dst, 0xFFFF, ipc_buf).expect("NS_LOOKUP dst after rename");
+    assert_eq!(dst_size, payload.len() as u64);
+    let got = fs_read_bytes(dst_cap, 0, payload.len() as u64, ipc_buf).expect("read dst");
+    assert_eq!(&got[..], payload, "rename preserved contents");
+
+    let _ = syscall::cap_delete(dst_cap);
+    fs_remove(usertest, dst, ipc_buf).expect("cleanup dst");
+    let _ = syscall::cap_delete(usertest);
+    std::os::seraph::log!("fs_rename phase passed");
+}
+
+/// `FS_WRITE_FRAME` bulk-write round-trip via a caller-supplied
+/// memmgr Frame cap. Closes Issue #7's "Bulk write round-trip works
+/// under usertest" acceptance criterion.
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
+fn fs_write_frame_phase()
+{
+    use std::io::Read;
+
+    use syscall::MAP_WRITABLE;
+
+    const WRITE_LEN: usize = 2048;
+
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let usertest = usertest_dir_cap(ipc_buf);
+
+    let name: &[u8] = b"wrtf.bin";
+    let _ = fs_remove(usertest, name, ipc_buf);
+
+    let (file_cap, _) = fs_create(usertest, name, ipc_buf).expect("FS_CREATE wrtf failed");
+
+    // Acquire a single-page frame from memmgr.
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_FRAMES)
+        .word(0, 1)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &req, ipc_buf) }
+        .expect("memmgr REQUEST_FRAMES ipc_call failed");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "REQUEST_FRAMES status"
+    );
+    assert_eq!(reply.word(0), 1);
+    let frame_cap = *reply
+        .caps()
+        .first()
+        .expect("REQUEST_FRAMES returned no cap");
+
+    // Reserve a VA and map the frame writable.
+    let range = std::os::seraph::reserve_pages(1).expect("reserve_pages");
+    let va = range.va_start();
+    syscall::mem_map(frame_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE)
+        .expect("mem_map frame failed");
+
+    // Fill the page with a recognisable pattern; write a 2 KiB slice
+    // starting at frame offset 0 (well within bulk-write territory).
+    // SAFETY: va just mapped MAP_WRITABLE for one page; WRITE_LEN ≤ PAGE_SIZE.
+    unsafe {
+        for i in 0..WRITE_LEN
+        {
+            *((va + i as u64) as *mut u8) = u8::try_from(i & 0xFF).unwrap_or(0);
+        }
+    }
+
+    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_WRITE_FRAME)
+        .word(0, 0) // file offset
+        .word(1, WRITE_LEN as u64)
+        .word(2, 0) // frame_data_offset
+        .cap(frame_cap)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply =
+        unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.expect("FS_WRITE_FRAME ipc_call failed");
+    assert_eq!(
+        reply.label,
+        ipc::fs_errors::SUCCESS,
+        "FS_WRITE_FRAME status {} (expected SUCCESS={})",
+        reply.label,
+        ipc::fs_errors::SUCCESS
+    );
+    assert_eq!(reply.word(0), WRITE_LEN as u64);
+    // Frame cap returned in caps[0]; drop it.
+    let returned = *reply
+        .caps()
+        .first()
+        .expect("FS_WRITE_FRAME returned no cap");
+    let _ = syscall::cap_delete(returned);
+
+    let _ = syscall::mem_unmap(info.self_aspace, va, 1);
+    let _ = syscall::cap_delete(file_cap);
+
+    // Verify by reading back through std::fs::File::read — which
+    // takes the frame-cap read path for sizes >504 B.
+    let mut f = std::fs::File::open("/usertest/wrtf.bin").expect("open wrtf.bin");
+    let mut buf = vec![0u8; WRITE_LEN];
+    let mut total = 0;
+    while total < WRITE_LEN
+    {
+        let n = f.read(&mut buf[total..]).expect("read wrtf.bin");
+        assert!(n > 0, "short read at offset {total}");
+        total += n;
+    }
+    for (i, &b) in buf.iter().enumerate()
+    {
+        assert_eq!(b, u8::try_from(i & 0xFF).unwrap_or(0), "byte {i} mismatch");
+    }
+    drop(f);
+
+    fs_remove(usertest, name, ipc_buf).expect("cleanup wrtf");
+    let _ = syscall::cap_delete(usertest);
+    std::os::seraph::log!("fs_write_frame phase passed");
+}
+
+/// Cache coherence: a `FS_READ` after `FS_WRITE` to the same offset
+/// returns the new bytes. Issue #6 acceptance criterion.
+fn fs_write_cache_coherence_phase()
+{
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let usertest = usertest_dir_cap(ipc_buf);
+
+    let name: &[u8] = b"coh.bin";
+    let _ = fs_remove(usertest, name, ipc_buf);
+
+    let (cap, _) = fs_create(usertest, name, ipc_buf).expect("create coh");
+    // Initial write.
+    fs_write_inline(cap, 0, b"AAAAAAAA", ipc_buf).expect("write 1");
+    let r1 = fs_read_bytes(cap, 0, 8, ipc_buf).expect("read 1");
+    assert_eq!(&r1[..], b"AAAAAAAA");
+    // Overwrite same offset; cache page must update in place.
+    fs_write_inline(cap, 0, b"BBBBBBBB", ipc_buf).expect("write 2");
+    let r2 = fs_read_bytes(cap, 0, 8, ipc_buf).expect("read 2");
+    assert_eq!(
+        &r2[..],
+        b"BBBBBBBB",
+        "read after write returned stale bytes"
+    );
+
+    let _ = syscall::cap_delete(cap);
+    fs_remove(usertest, name, ipc_buf).expect("cleanup coh");
+    let _ = syscall::cap_delete(usertest);
+    std::os::seraph::log!("fs_write_cache_coherence phase passed");
+}
+
+/// Regression coverage for three correctness bugs surfaced during the
+/// fs-fat write-support PR audit:
+///
+/// 1. `FS_CREATE` / `FS_MKDIR` MUST NOT promote rights on the returned
+///    child cap beyond the caller's parent rights. Creating from a
+///    `MUTATE_DIR`-only parent must yield a child cap that rejects
+///    `FS_WRITE` with `PERMISSION_DENIED`.
+/// 2. `NodeTable` MUST NOT alias distinct empty files to the same
+///    `NodeId`. Writing through one freshly-created empty-file cap
+///    must not affect a sibling empty-file cap created moments
+///    earlier.
+/// 3. Extending a file past its current EOC MUST NOT corrupt the
+///    existing FAT chain. Writing one byte at `offset = 2 *
+///    cluster_size` after a 2-cluster initial write must leave bytes
+///    `[cluster_size, 2 * cluster_size)` readable as originally
+///    written.
+#[allow(clippy::too_many_lines)]
+fn fs_write_invariants_phase()
+{
+    use namespace_protocol::rights;
+
+    /// Cluster size on the xtask-formatted test image: 8 sectors × 512 B.
+    const CLUSTER: usize = 4096;
+    /// `FS_WRITE` / `FS_READ` inline payloads cap at 504 B.
+    const INLINE_CHUNK: usize = 504;
+
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    // ── (1) rights attenuation on FS_CREATE child cap ──────────────
+    {
+        let usertest_full = usertest_dir_cap(ipc_buf);
+        let scratch_name: &[u8] = b"inv_rights.bin";
+        let _ = fs_remove(usertest_full, scratch_name, ipc_buf);
+
+        // Re-LOOKUP usertest with MUTATE_DIR | LOOKUP only — no READ,
+        // no WRITE. (LOOKUP is required to walk into the dir; STAT is
+        // omitted by design so we can prove the child cannot widen.)
+        let root = std::os::seraph::root_dir_cap();
+        let restricted_rights = u64::from(rights::LOOKUP | rights::MUTATE_DIR);
+        let (parent_attenuated, _, _) = ns_lookup(root, b"usertest", restricted_rights, ipc_buf)
+            .expect("ns_lookup usertest attenuated");
+
+        let (child_cap, _) = fs_create(parent_attenuated, scratch_name, ipc_buf)
+            .expect("FS_CREATE through attenuated parent should succeed");
+
+        // FS_WRITE on the returned cap must be rejected — child rights
+        // = parent ∩ kind_max = {LOOKUP, MUTATE_DIR} ∩ {STAT, READ,
+        // WRITE, EXEC} = {} (since LOOKUP is bit 0 and STAT/READ are
+        // disjoint). The write attempt hits the gate before fatfs
+        // touches the FAT.
+        let write_err = fs_write_inline(child_cap, 0, b"x", ipc_buf)
+            .expect_err("FS_WRITE on rights-attenuated child cap must reject");
+        assert_eq!(
+            write_err,
+            ipc::fs_errors::PERMISSION_DENIED,
+            "expected PERMISSION_DENIED; got {write_err}"
+        );
+
+        let _ = syscall::cap_delete(child_cap);
+        let _ = syscall::cap_delete(parent_attenuated);
+        let _ = fs_remove(usertest_full, scratch_name, ipc_buf);
+        let _ = syscall::cap_delete(usertest_full);
+        std::os::seraph::log!("fs_write_invariants: rights attenuation ok");
+    }
+
+    // ── (2) NodeTable dedupe must not alias distinct empty files ───
+    {
+        let usertest = usertest_dir_cap(ipc_buf);
+        let a: &[u8] = b"inv_aa.bin";
+        let b: &[u8] = b"inv_bb.bin";
+        let _ = fs_remove(usertest, a, ipc_buf);
+        let _ = fs_remove(usertest, b, ipc_buf);
+
+        let (cap_a, _) = fs_create(usertest, a, ipc_buf).expect("create inv_aa");
+        let (cap_b, _) = fs_create(usertest, b, ipc_buf).expect("create inv_bb");
+
+        // Read through the original cap_b BEFORE any writes — under
+        // the old dedupe-on-(cluster, kind, size) bug both caps shared
+        // one NodeId, but the underlying FatNode still records the
+        // most recently inserted on-disk entry. Any subsequent FS_*
+        // call through either cap routes to the same NodeId. Writing
+        // through cap_a then reading through cap_b is the operational
+        // shape that would observe the aliasing.
+        fs_write_inline(cap_a, 0, b"AAAA", ipc_buf).expect("write to inv_aa");
+
+        // Read directly through the held cap_b (no re-LOOKUP that
+        // could refresh the dedupe state via a fresh insert). With
+        // the bug, cap_b's NodeId is the same as cap_a's after the
+        // most recent FS_CREATE, and FS_READ via that NodeId would
+        // walk inv_aa's cluster chain and surface "AAAA". With the
+        // fix, cap_b resolves to a distinct NodeId pointing at
+        // inv_bb's still-empty entry.
+        let r_b = fs_read_bytes(cap_b, 0, 8, ipc_buf).unwrap_or_default();
+        assert!(
+            r_b.is_empty() || r_b.iter().all(|&x| x == 0),
+            "inv_bb returned non-zero bytes through held cap after sibling write: {r_b:?}"
+        );
+
+        // Also verify via NS_LOOKUP that inv_bb's on-disk size hint
+        // is still zero — same-slot dedupe must not have updated
+        // inv_bb's `size` from inv_aa's growth.
+        let (cap_b_fresh, _, b_size) =
+            ns_lookup(usertest, b, 0xFFFF, ipc_buf).expect("lookup inv_bb");
+        assert_eq!(
+            b_size, 0,
+            "inv_bb on-disk size hint was perturbed by inv_aa write"
+        );
+
+        let _ = syscall::cap_delete(cap_a);
+        let _ = syscall::cap_delete(cap_b);
+        let _ = syscall::cap_delete(cap_b_fresh);
+        let _ = fs_remove(usertest, a, ipc_buf);
+        let _ = fs_remove(usertest, b, ipc_buf);
+        let _ = syscall::cap_delete(usertest);
+        std::os::seraph::log!("fs_write_invariants: empty-file dedupe ok");
+    }
+
+    // ── (3) FAT chain past EOC must not corrupt prior cluster ──────
+    //
+    // Cluster size on the test fixture is 8 sectors × 512 B = 4 KiB.
+    // Step a: write 8 KiB at offset 0 (occupies clusters X→Y, size
+    //         8 KiB).
+    // Step b: write 8 B at offset 16 KiB (target_cluster_idx = 4,
+    //         walks past EOC three times). The broken offset-walk
+    //         loop linked the first allocation behind X (overwriting
+    //         X→Y with X→Z) and orphaned Y.
+    // Step c: read 4 KiB from offset 4 KiB; with the bug this would
+    //         walk X→Z (the new cluster) and return the wrong bytes.
+    {
+        let usertest = usertest_dir_cap(ipc_buf);
+        let name: &[u8] = b"inv_chain.bin";
+        let _ = fs_remove(usertest, name, ipc_buf);
+
+        let (cap, _) = fs_create(usertest, name, ipc_buf).expect("create inv_chain");
+
+        // Inline FS_WRITE caps payload at 504 B; one cluster needs
+        // multiple inline calls. Each call uses the in-loop
+        // chain-advance path (known-good); only the cross-cluster
+        // calls exercise the EOC walk.
+        let pattern_a = vec![0xA5u8; CLUSTER];
+        let pattern_b = vec![0x5Au8; CLUSTER];
+        let write_pattern = |cap: u32, base: usize, src: &[u8]| {
+            let mut written = 0usize;
+            while written < src.len()
+            {
+                let n = (src.len() - written).min(INLINE_CHUNK);
+                fs_write_inline(
+                    cap,
+                    (base + written) as u64,
+                    &src[written..written + n],
+                    ipc_buf,
+                )
+                .expect("inline write chunk");
+                written += n;
+            }
+        };
+        write_pattern(cap, 0, &pattern_a);
+        write_pattern(cap, CLUSTER, &pattern_b);
+
+        // Re-LOOKUP so the cap reflects the post-write metadata.
+        let _ = syscall::cap_delete(cap);
+        let (cap, _, size) = ns_lookup(usertest, name, 0xFFFF, ipc_buf).expect("lookup inv_chain");
+        assert_eq!(size, 2 * CLUSTER as u64, "expected 8 KiB after AB writes");
+
+        // Step b: one-byte append past EOC. Exercises the
+        // offset-walk loop's allocate-on-EOC path.
+        fs_write_inline(cap, (4 * CLUSTER) as u64, b"Z", ipc_buf).expect("write Z past EOC");
+
+        // Re-LOOKUP again for consistency.
+        let _ = syscall::cap_delete(cap);
+        let (cap, _, _) = ns_lookup(usertest, name, 0xFFFF, ipc_buf).expect("lookup inv_chain 2");
+
+        // Step c: read back pattern B from offset 4 KiB. With the
+        // broken loop, the FAT chain X→Y was rewritten to X→Znew,
+        // and the read would return the fresh cluster's contents
+        // instead of pattern B. FS_READ inline tops out at 504 B,
+        // so we sample rather than asking for the whole cluster in
+        // one call.
+        let got_b = fs_read_bytes(cap, CLUSTER as u64, INLINE_CHUNK as u64, ipc_buf)
+            .expect("read pattern B");
+        assert_eq!(
+            got_b.len(),
+            INLINE_CHUNK,
+            "short read at offset {CLUSTER} (chain corruption?)"
+        );
+        assert!(
+            got_b.iter().all(|&b| b == 0x5A),
+            "pattern B corrupted at offset {CLUSTER} — FAT chain rewritten"
+        );
+
+        // Sample pattern A and the trailing byte.
+        let got_a = fs_read_bytes(cap, 0, INLINE_CHUNK as u64, ipc_buf).expect("read pattern A");
+        assert!(got_a.iter().all(|&b| b == 0xA5), "pattern A corrupted");
+        let got_z = fs_read_bytes(cap, (4 * CLUSTER) as u64, 1, ipc_buf).expect("read Z");
+        assert_eq!(got_z.first().copied(), Some(b'Z'));
+
+        let _ = syscall::cap_delete(cap);
+        let _ = fs_remove(usertest, name, ipc_buf);
+        let _ = syscall::cap_delete(usertest);
+        std::os::seraph::log!("fs_write_invariants: FAT chain past EOC ok");
+    }
+
+    std::os::seraph::log!("fs_write_invariants phase passed");
 }
 
 /// Exercise vfsd's tree-shaped synthetic root: a multi-component

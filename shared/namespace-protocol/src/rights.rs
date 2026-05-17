@@ -43,12 +43,12 @@ pub const READDIR: u32 = 1 << 1;
 pub const STAT: u32 = 1 << 2;
 /// `NS_READ` / `NS_READ_FRAME` on this file is permitted.
 pub const READ: u32 = 1 << 3;
-/// `NS_WRITE` on this file is permitted. Reserved; deferred to v2.
+/// `FS_WRITE` / `FS_WRITE_FRAME` on this file is permitted.
 pub const WRITE: u32 = 1 << 4;
 /// File is executable; consumed by ELF loaders to gate spawn.
 pub const EXEC: u32 = 1 << 5;
-/// `NS_CREATE` / `NS_UNLINK` in this directory are permitted.
-/// Reserved; deferred to v2.
+/// `FS_CREATE` / `FS_REMOVE` / `FS_MKDIR` / `FS_RENAME` in this
+/// directory are permitted.
 pub const MUTATE_DIR: u32 = 1 << 6;
 /// Visibility-gating bit: entries whose `visible_requires` includes
 /// `ADMIN` are hidden from callers without it (see the visibility

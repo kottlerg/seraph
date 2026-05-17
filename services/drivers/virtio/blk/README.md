@@ -111,18 +111,52 @@ that introduction.
 release protocol grows a block-layer analogue; today the cap is null and
 the slot is unused.
 
+### Label 4: `BLK_WRITE_FROM_FRAME`
+
+Mirror of `BLK_READ_INTO_FRAME` for the write direction. The driver
+reads `count * 512` bytes starting at offset 0 of the supplied page and
+writes them to disk. The frame contents past the requested run are not
+read.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 4 |
+| data[0] | Starting LBA (relative to the caller token's partition base) |
+| data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
+| caps[0] | Source Frame, `MAP \| READ`, at least `count * 512` bytes |
+| caps[1] | Reserved (null today; future per-request release handle) |
+| caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
+
+**Reply:**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) or one of the error codes below |
+| caps[0] | The source Frame, moved back to the caller |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
+| 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
+| 3 | `OutOfBounds` | LBA outside the caller token's partition range |
+| 5 | `InvalidFrameCap` | Source Frame missing `MAP\|READ`, sized smaller than `count * 512`, or absent |
+
 ---
 
 ## DMA Discipline
 
 The driver owns a single 1-page DMA buffer for the request header and
-status byte (offsets 0 and 1024). The data segment of every read is the
-caller-supplied Frame: the driver queries `phys_base` via `cap_info`
-without mapping the frame into its own address space (the device DMAs to
-the physical address; the driver never reads the data), then programs
-the descriptor chain to point at `phys_base`. The Frame cap is
-moved back to the caller in the reply on every outcome, so it never
-accumulates in the driver's `CSpace`.
+status byte (offsets 0 and 1024). The data segment of every read or
+write is the caller-supplied Frame: the driver queries `phys_base` via
+`cap_info` without mapping the frame into its own address space (the
+device DMAs to or from the physical address; the driver never touches
+the data), then programs the descriptor chain to point at `phys_base`.
+The Frame cap is moved back to the caller in the reply on every
+outcome, so it never accumulates in the driver's `CSpace`.
 
 The notify-after-avail-update memory-ordering pair (release fence on the
 producer, the device's implicit load-acquire on the doorbell MMIO)

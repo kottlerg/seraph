@@ -40,6 +40,25 @@ pub struct FatState
     pub cached_fat_sector: u32,
     /// Cached FAT sector data.
     pub cached_fat_data: [u8; SECTOR_SIZE],
+    /// Total cluster count (data-region size / cluster size). Used by
+    /// the cluster allocator to bound its FAT scan and by mount-time
+    /// validation. `cached_fat_sector` and the FAT array index range
+    /// `[2..2 + total_clusters)`.
+    pub total_clusters: u32,
+    /// `FSInfo` sector LBA (FAT32 only; `u32::MAX` sentinel otherwise).
+    /// Loaded from BPB offset 48 by `parse_bpb` when the detected type
+    /// is FAT32. The `FSInfo` content (free count, next-free hint) is
+    /// loaded separately by the allocator at mount, since `parse_bpb`
+    /// does not have block-device access.
+    pub fsinfo_sector: u32,
+    /// FAT32 advisory hint: next cluster the allocator should consider
+    /// for a free-cluster search. Microsoft spec §6 marks this field
+    /// advisory; the allocator revalidates by reading the FAT entry. A
+    /// `u32::MAX` sentinel forces a scan from cluster 2.
+    pub next_free_hint: u32,
+    /// FAT32 advisory free-cluster count. `u32::MAX` sentinel means
+    /// unknown. Maintained best-effort by the allocator.
+    pub free_count_hint: u32,
 }
 
 impl FatState
@@ -59,6 +78,10 @@ impl FatState
             data_start_sector: 0,
             cached_fat_sector: u32::MAX,
             cached_fat_data: [0; SECTOR_SIZE],
+            total_clusters: 0,
+            fsinfo_sector: u32::MAX,
+            next_free_hint: u32::MAX,
+            free_count_hint: u32::MAX,
         }
     }
 
@@ -171,6 +194,7 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
 
     let data_sectors = total_sectors.saturating_sub(state.data_start_sector);
     let total_clusters = data_sectors / u32::from(state.sectors_per_cluster);
+    state.total_clusters = total_clusters;
 
     // FAT type determination per Microsoft specification.
     if total_clusters < 65525
@@ -182,6 +206,15 @@ pub fn parse_bpb(sector_data: &[u8; SECTOR_SIZE], state: &mut FatState) -> bool
     {
         state.fat_type = FatType::Fat32;
         std::os::seraph::log!("detected FAT32");
+        // FAT32 extended BPB: `FSInfo` sector LBA at offset 48 (2 bytes).
+        // A value of 0 or 0xFFFF means "no `FSInfo` sector"; we hold the
+        // u32::MAX sentinel in those cases so the allocator skips load
+        // and falls back to a full FAT scan.
+        let fsinfo = u16::from_le_bytes([sector_data[48], sector_data[49]]);
+        if fsinfo != 0 && fsinfo != 0xFFFF
+        {
+            state.fsinfo_sector = u32::from(fsinfo);
+        }
     }
 
     std::os::seraph::log!(

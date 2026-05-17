@@ -34,9 +34,36 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;
+use std::sync::OnceLock;
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
 use crate::bpb::SECTOR_SIZE;
+
+/// Process-static scratch frame used for single-sector writeback in
+/// [`PageCache::write_sector`].
+///
+/// virtio-blk DMAs sector data starting at offset 0 of the supplied
+/// frame, so we cannot pass a cache page directly when only one of its
+/// eight sectors has been dirtied (the device would over-write the
+/// other seven on the disk side using whatever happened to be in the
+/// page). The scratch frame holds a single 512-byte sector copy per
+/// write and is reused across calls; allocated lazily on first write
+/// and held for the process lifetime.
+static SCRATCH_FRAME: OnceLock<ScratchFrame> = OnceLock::new();
+
+struct ScratchFrame
+{
+    cap: AtomicU32,
+    va: u64,
+}
+
+// SAFETY: ScratchFrame holds an AtomicU32 cap (Sync by construction) and
+// a raw VA value (u64) that is process-static. Concurrent callers
+// serialise their use of the frame via the cap_swap dance in
+// write_sector, not via Rust borrow checking.
+unsafe impl Send for ScratchFrame {}
+// SAFETY: see Send above — same justification.
+unsafe impl Sync for ScratchFrame {}
 
 /// Number of cache slots.
 pub const SLOT_COUNT: usize = 128;
@@ -138,7 +165,78 @@ impl PageCache
             slot.frame_cap.store(cap, Ordering::Release);
         }
 
+        // Allocate and map the single-page scratch frame used for
+        // single-sector writeback in `write_sector`. Lazy fallback would
+        // need to re-do the request/reserve/map dance under an Ordering
+        // discipline; doing it once at startup keeps `write_sector`
+        // synchronous and free of init-time error paths.
+        let scratch_va = reserve_pages(1).map_err(|_| InitError::Reserve)?.va_start();
+        let scratch_cap = request_one_page(memmgr_ep, ipc_buf).ok_or(InitError::Memmgr)?;
+        syscall::mem_map(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE)
+            .map_err(|_| InitError::Map)?;
+        SCRATCH_FRAME
+            .set(ScratchFrame {
+                cap: AtomicU32::new(scratch_cap),
+                va: scratch_va,
+            })
+            .ok();
+
         Ok(&*cache)
+    }
+
+    /// Write one 512-byte sector through the cache (write-through).
+    ///
+    /// Acquires the page covering `lba`, updates the affected sector in
+    /// place within the cached page (so any outstanding `FS_READ_FRAME`
+    /// cap aliasing that page observes the new bytes immediately), then
+    /// copies the same sector into a process-static scratch frame and
+    /// issues one `BLK_WRITE_FROM_FRAME` against the block device.
+    ///
+    /// Single-sector writeback only. Multi-sector cache pages cannot be
+    /// flushed as a unit because the unmodified neighbouring sectors
+    /// have no known-good source if the write fails mid-flight.
+    ///
+    /// Returns `false` on cache acquire failure, missing scratch frame
+    /// (cache init never ran), or block-driver error.
+    pub fn write_sector(
+        &self,
+        lba: u64,
+        block_dev: u32,
+        data: &[u8; SECTOR_SIZE],
+        ipc_buf: *mut u64,
+    ) -> bool
+    {
+        let Some(scratch) = SCRATCH_FRAME.get()
+        else
+        {
+            return false;
+        };
+        let page_base = page_base_of(lba);
+        let Some(idx) = self.acquire_page(page_base, block_dev, ipc_buf)
+        else
+        {
+            return false;
+        };
+        let slot = &self.slots[idx];
+        let sector_in_page = (lba - page_base) as usize;
+        let offset = sector_in_page * SECTOR_SIZE;
+
+        // SAFETY: refcount > 0 for the duration of these borrows. The
+        // cache page is single-process owned and mapped writable; the
+        // scratch frame VA is process-static and mapped writable. Both
+        // are 512-byte sector copies into pages this process owns.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (slot.va + offset as u64) as *mut u8,
+                SECTOR_SIZE,
+            );
+            core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.va as *mut u8, SECTOR_SIZE);
+        }
+
+        let ok = writeback_via_block_dev(scratch, lba, block_dev, ipc_buf);
+        self.release(idx);
+        ok
     }
 
     /// Read one 512-byte sector through the cache into `buf`. Single-call
@@ -334,6 +432,41 @@ fn fill_via_block_dev(
     };
     let returned = reply.caps().first().copied().unwrap_or(0);
     slot.frame_cap.store(returned, Ordering::Release);
+    reply.label == blk_errors::SUCCESS && returned != 0
+}
+
+/// Issue `BLK_WRITE_FROM_FRAME` with the scratch frame as the source.
+///
+/// Mirrors [`fill_via_block_dev`] for the write direction. The scratch
+/// frame's cap is moved out and back across the call; the returned cap
+/// (which may land at a different `CSpace` index) is restored in
+/// `scratch.cap`.
+fn writeback_via_block_dev(
+    scratch: &ScratchFrame,
+    lba: u64,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let cap = scratch.cap.load(Ordering::Acquire);
+    if cap == 0
+    {
+        return false;
+    }
+    let msg = IpcMessage::builder(blk_labels::BLK_WRITE_FROM_FRAME)
+        .word(0, lba)
+        .word(1, 1)
+        .cap(cap)
+        .build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) })
+    else
+    {
+        scratch.cap.store(0, Ordering::Release);
+        return false;
+    };
+    let returned = reply.caps().first().copied().unwrap_or(0);
+    scratch.cap.store(returned, Ordering::Release);
     reply.label == blk_errors::SUCCESS && returned != 0
 }
 

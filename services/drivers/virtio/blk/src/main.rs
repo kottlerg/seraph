@@ -468,6 +468,10 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
             {
                 handle_read_block_into_frame(&msg, ipc_buf, rt);
             }
+            blk_labels::BLK_WRITE_FROM_FRAME =>
+            {
+                handle_write_block_from_frame(&msg, ipc_buf, rt);
+            }
             blk_labels::REGISTER_PARTITION =>
             {
                 handle_register_partition(&msg, ipc_buf, rt);
@@ -610,6 +614,144 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     #[allow(clippy::cast_possible_truncation)]
     if !io::submit_and_wait(
         rt.layout,
+        io::IoDirection::Read,
+        absolute_sector,
+        phys_base,
+        data_len_bytes as u32,
+        rt.vq,
+        rt.transport,
+        rt.queue_notify_off,
+        rt.irq_signal,
+        rt.irq_cap,
+    )
+    {
+        let status = rt.layout.read_status();
+        reply_with(u64::from(status), ipc_buf);
+        return;
+    }
+
+    reply_with(ipc::blk_errors::SUCCESS, ipc_buf);
+}
+
+/// Handle a `BLK_WRITE_FROM_FRAME` request.
+///
+/// Mirror of [`handle_read_block_into_frame`] with the data direction
+/// inverted. Reads `caps[0]` (source Frame, `MAP|READ`) and DMAs
+/// `data[1]` consecutive sectors (default 1) starting at LBA `data[0]`
+/// out of the frame at offset 0, packed contiguously. The source Frame
+/// is moved back to the caller in `caps[0]` of the reply.
+// too_many_lines: matches the read sibling — the same validation gates
+// (cap presence, sector count, descriptor-length bound, three cap_info
+// lookups, two partition resolutions for start and end LBA) all apply
+// here, and the reply-with-cap pattern is unchanged.
+#[allow(clippy::too_many_lines)]
+fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+{
+    const SECTOR_SIZE: u64 = 512;
+
+    let source_cap = msg.caps().first().copied().unwrap_or(0);
+
+    let reply_with = |code: u64, ipc_buf: *mut u64| {
+        let mut builder = IpcMessage::builder(code);
+        if source_cap != 0
+        {
+            builder = builder.cap(source_cap);
+        }
+        let reply = builder.build();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    };
+
+    if source_cap == 0
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+
+    let sector_count = if msg.word_count() >= 2
+    {
+        msg.word(1)
+    }
+    else
+    {
+        1
+    };
+    if sector_count == 0
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+    let data_len_bytes = sector_count * SECTOR_SIZE;
+    if data_len_bytes > u64::from(u32::MAX)
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+
+    // Source frame must be a Frame cap with at least MAP+READ rights
+    // (device reads sector data out of it) and large enough to cover the
+    // requested run.
+    let Ok(tag_rights) = syscall::cap_info(source_cap, syscall::CAP_INFO_TAG_RIGHTS)
+    else
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    };
+    let tag = (tag_rights >> 32) as u8;
+    let rights = tag_rights & 0xFFFF_FFFF;
+    let required = syscall::RIGHTS_MAP_READ;
+    if u64::from(tag) != u64::from(syscall::CAP_TAG_FRAME) || (rights & required) != required
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+    let Ok(size) = syscall::cap_info(source_cap, syscall::CAP_INFO_FRAME_SIZE)
+    else
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    };
+    if size < data_len_bytes
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    }
+    let Ok(phys_base) = syscall::cap_info(source_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+    else
+    {
+        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        return;
+    };
+
+    let sector = if msg.word_count() >= 1
+    {
+        msg.word(0)
+    }
+    else
+    {
+        0
+    };
+    let absolute_sector = match resolve_sector(msg.token, sector, rt)
+    {
+        Ok(s) => s,
+        Err(code) =>
+        {
+            reply_with(code, ipc_buf);
+            return;
+        }
+    };
+    let last_relative = sector.saturating_add(sector_count - 1);
+    if resolve_sector(msg.token, last_relative, rt).is_err()
+    {
+        reply_with(ipc::blk_errors::OUT_OF_BOUNDS, ipc_buf);
+        return;
+    }
+
+    // cast_possible_truncation: data_len_bytes <= u32::MAX checked above.
+    #[allow(clippy::cast_possible_truncation)]
+    if !io::submit_and_wait(
+        rt.layout,
+        io::IoDirection::Write,
         absolute_sector,
         phys_base,
         data_len_bytes as u32,

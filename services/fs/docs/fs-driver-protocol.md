@@ -290,6 +290,140 @@ evicted the per-node slot under cache pressure; in that case
 
 ---
 
+## Label 4: `FS_WRITE`
+
+Inline write to a file. Token = file cap; the token must carry the
+`WRITE` namespace right.
+
+**Request**:
+
+| Field | Value |
+|---|---|
+| `label` | `FS_WRITE \| (byte_len << 16)` (bits 0-15 = label, bits 16-31 = payload bytes, ≤504) |
+| `data[0]` | File byte offset |
+| `bytes(1, &payload)` | Payload bytes (`byte_len` of them) starting at byte 8 |
+
+**Reply (success)**: `label = 0`, `data[0]` = bytes_written. May be
+short on `NO_SPACE`; callers iterate.
+
+**Errors**: `INVALID_TOKEN`, `IS_A_DIRECTORY`, `IO_ERROR`,
+`PERMISSION_DENIED`, `NO_SPACE`.
+
+---
+
+## Label 12: `FS_WRITE_FRAME`
+
+Bulk write from a caller-supplied source Frame cap. Mirror of
+`FS_READ_FRAME` for the write direction. Threshold for inline vs
+frame is the same 504-byte boundary that governs reads today; the
+crossover Issue tracks per-arch tuning.
+
+**Request**:
+
+| Field | Value |
+|---|---|
+| `label` | `FS_WRITE_FRAME` (12) |
+| `data[0]` | File byte offset |
+| `data[1]` | Bytes to write from the frame (`≤ PAGE_SIZE - frame_data_offset`) |
+| `data[2]` | Byte offset within the source frame where the data begins |
+| `caps[0]` | Source Frame cap (`MAP \| READ` rights; one page) |
+
+**Reply (success)**: `label = 0`, `data[0]` = bytes_written,
+`caps[0]` = the source Frame cap moved back to the caller.
+
+The driver mem-maps the source frame read-only into its own address
+space for the duration of the copy. The cap returns to the caller in
+every outcome (mirror of the read-frame ownership discipline).
+
+**Errors**: `INVALID_TOKEN`, `IS_A_DIRECTORY`, `IO_ERROR`,
+`PERMISSION_DENIED`, `NO_SPACE`, `BAD_FRAME_OFFSET`.
+
+---
+
+## Label 13: `FS_CREATE`
+
+Create a new file in a directory. Token = parent-directory cap; the
+token must carry the `MUTATE_DIR` namespace right.
+
+**Request**:
+
+| Field | Value |
+|---|---|
+| `label` | `FS_CREATE \| (name_len << 16)` |
+| `bytes(0, &name)` | Name bytes starting at byte 0 |
+
+**Reply (success)**: `label = 0`, `data[0]` = `NodeKind` (= File),
+`caps[0]` = node cap for the newly-created file. The new file starts
+empty (size 0, no allocated cluster).
+
+**Errors**: `INVALID_TOKEN`, `EXISTS` (the dispatch may currently
+surface `NO_SPACE` for duplicate names — to be tightened),
+`NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
+
+---
+
+## Label 14: `FS_REMOVE`
+
+Unlink a file or empty directory. Token = parent-directory cap with
+`MUTATE_DIR`.
+
+**Request**:
+
+| Field | Value |
+|---|---|
+| `label` | `FS_REMOVE \| (name_len << 16)` |
+| `bytes(0, &name)` | Name bytes |
+
+**Reply (success)**: `label = 0`, empty body.
+
+**Errors**: `NOT_FOUND`, `NOT_EMPTY` (directory has entries other
+than `.` and `..`), `IO_ERROR`, `PERMISSION_DENIED`.
+
+---
+
+## Label 15: `FS_MKDIR`
+
+Create a new (empty) directory. Same shape as `FS_CREATE`. Allocates
+one cluster, zero-fills it, and populates `.` / `..` entries before
+the directory entry is inserted in the parent.
+
+**Reply (success)**: `label = 0`, `data[0]` = `NodeKind` (= Dir),
+`caps[0]` = node cap for the new directory.
+
+**Errors**: as `FS_CREATE`.
+
+---
+
+## Label 16: `FS_RENAME`
+
+Rename a directory entry within a single directory. Token =
+directory cap with `MUTATE_DIR`.
+
+**Request**:
+
+| Field | Value |
+|---|---|
+| `label` | `FS_RENAME` (16) |
+| `data[0]` | Source name length |
+| `data[1]` | Destination name length |
+| `bytes(2, &concat(src, dst))` | Source bytes immediately followed by destination bytes (no padding) starting at byte 16 |
+
+**Reply (success)**: `label = 0`, empty body.
+
+Cross-directory rename is deferred: servers cannot introspect the
+token packed in a received cap, so a second-directory cap cannot
+resolve to a `NodeId`. A future Issue may add a wire shape that
+conveys the destination directory's `NodeId` explicitly.
+
+`FS_RENAME` is not atomic — see
+[`services/fs/fat/docs/crash-safety.md`](../fat/docs/crash-safety.md)
+for the post-crash visible states.
+
+**Errors**: `NOT_FOUND` (source missing), `EXISTS` (destination
+occupied), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
+
+---
+
 ## Label 6: `END_OF_DIR`
 
 End-of-directory marker reused as a reply label by `NS_READDIR`. See
@@ -338,4 +472,4 @@ bound on every `BLK_READ_INTO_FRAME`. See
 
 ## Summarized By
 
-[services/fs/README.md](../README.md)
+[services/fs/README.md](../README.md), [services/fs/fat/README.md](../fat/README.md)

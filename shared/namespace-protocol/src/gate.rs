@@ -157,6 +157,30 @@ const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
         RightsRequirement::AnyNonEmpty,
     ),
     (ipc::fs_labels::FS_CLOSE, RightsRequirement::AnyNonEmpty),
+    (
+        ipc::fs_labels::FS_WRITE,
+        RightsRequirement::Bits(nz(rights::WRITE)),
+    ),
+    (
+        ipc::fs_labels::FS_WRITE_FRAME,
+        RightsRequirement::Bits(nz(rights::WRITE)),
+    ),
+    (
+        ipc::fs_labels::FS_CREATE,
+        RightsRequirement::Bits(nz(rights::MUTATE_DIR)),
+    ),
+    (
+        ipc::fs_labels::FS_REMOVE,
+        RightsRequirement::Bits(nz(rights::MUTATE_DIR)),
+    ),
+    (
+        ipc::fs_labels::FS_MKDIR,
+        RightsRequirement::Bits(nz(rights::MUTATE_DIR)),
+    ),
+    (
+        ipc::fs_labels::FS_RENAME,
+        RightsRequirement::Bits(nz(rights::MUTATE_DIR)),
+    ),
 ];
 
 fn required_rights_for(opcode: u64) -> Option<RightsRequirement>
@@ -272,6 +296,43 @@ mod tests
             gate(ipc::fs_labels::FS_CLOSE, token_with(0)),
             Err(GateError::PermissionDenied)
         );
+    }
+
+    #[test]
+    fn fs_write_and_fs_write_frame_share_the_write_bit()
+    {
+        assert!(gate(ipc::fs_labels::FS_WRITE, token_with(rights::WRITE)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_WRITE_FRAME, token_with(rights::WRITE)).is_ok());
+        assert_eq!(
+            gate(ipc::fs_labels::FS_WRITE, token_with(rights::READ)),
+            Err(GateError::PermissionDenied)
+        );
+        assert_eq!(
+            gate(ipc::fs_labels::FS_WRITE_FRAME, token_with(rights::READ)),
+            Err(GateError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn fs_mutate_dir_labels_gate_on_mutate_dir_bit()
+    {
+        for label in [
+            ipc::fs_labels::FS_CREATE,
+            ipc::fs_labels::FS_REMOVE,
+            ipc::fs_labels::FS_MKDIR,
+            ipc::fs_labels::FS_RENAME,
+        ]
+        {
+            assert!(
+                gate(label, token_with(rights::MUTATE_DIR)).is_ok(),
+                "label {label:#x} should accept MUTATE_DIR"
+            );
+            assert_eq!(
+                gate(label, token_with(rights::LOOKUP | rights::READDIR)),
+                Err(GateError::PermissionDenied),
+                "label {label:#x} should reject without MUTATE_DIR"
+            );
+        }
     }
 
     #[test]

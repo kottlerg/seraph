@@ -5,19 +5,29 @@
 
 //! Seraph FAT filesystem driver.
 //!
-//! Implements read-only FAT16/FAT32 filesystem support. Serves the
+//! Implements read-write FAT16/FAT32 filesystem support. Serves the
 //! cap-native namespace protocol (`NS_LOOKUP` / `NS_STAT` /
-//! `NS_READDIR`) for directory walks and `FS_READ` / `FS_READ_FRAME` /
-//! `FS_RELEASE_FRAME` / `FS_CLOSE` against per-node tokened caps.
-//! `FS_MOUNT` is the one untokened service-level request, used by
-//! vfsd as a BPB-validation probe at mount time. All disk I/O is
-//! performed via the block device IPC endpoint received at creation
-//! time.
+//! `NS_READDIR`) for directory walks; per-node tokened caps carry
+//! the read side (`FS_READ`, `FS_READ_FRAME`, `FS_RELEASE_FRAME`,
+//! `FS_CLOSE`) and the write side (`FS_WRITE`, `FS_WRITE_FRAME`,
+//! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`). `FS_MOUNT` is
+//! the one untokened service-level request, used by vfsd as a
+//! BPB-validation probe at mount time. All disk I/O is performed via
+//! the block device IPC endpoint received at creation time.
 //!
 //! Per-node tokens are minted by `NS_LOOKUP` (token = `(NodeId,
-//! NamespaceRights)`); `FS_READ` / `FS_READ_FRAME` / `FS_RELEASE_FRAME`
-//! / `FS_CLOSE` look the node up in `NodeTable` and act on the
-//! lazily-allocated `OpenFile` slot.
+//! NamespaceRights)`); per-node ops look the node up in `NodeTable`
+//! and act on either the lazily-allocated `OpenFile` slot (read-side
+//! frame caps) or the cached `DirEntryLocation` (write-side metadata
+//! patching).
+//!
+//! Cache coherence: writes go through write-through
+//! ([`cache::PageCache::write_sector`]) so any outstanding
+//! `FS_READ_FRAME` cap aliasing the same page observes new bytes
+//! immediately. FAT-entry mutations invalidate the per-`FatState`
+//! private `cached_fat_sector` to prevent stale FAT chain walks.
+//! Crash window discussion lives in
+//! `services/fs/fat/docs/crash-safety.md`.
 
 // The `seraph` target is not in rustc's recognised-OS list, so `std` is
 // `restricted_std`-gated for downstream bins. Every std-built service on
@@ -25,6 +35,7 @@
 #![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
+mod alloc;
 mod backend;
 mod bpb;
 mod cache;
@@ -36,14 +47,19 @@ mod file;
 use std::os::seraph::{StartupInfo, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use alloc::{FatError, allocate_cluster};
 use backend::{FatfsBackend, NO_OPEN_SLOT, NodeTable};
 use bpb::{FatState, SECTOR_SIZE};
 use cache::PageCache;
+use dir::{
+    NewEntryKind, directory_is_empty, free_entry_data, insert_entry, remove_entry,
+    update_entry_metadata, write_dot_entries,
+};
 use eviction::{EvictReq, EvictionState};
 use fat::{next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
-use namespace_protocol::{GateError, NodeId, NodeKind, gate};
+use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_token};
 use syscall_abi::{PAGE_SIZE, RIGHTS_MAP_READ};
 
 /// Monotonic counter for token allocation. Starts at 1 (0 = untokened).
@@ -163,6 +179,11 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
 
 /// Validate the BPB by reading sector 0 through the block cap. Updates
 /// `state` in place; returns the IPC reply label to use.
+///
+/// On a successful FAT32 parse, also loads the `FSInfo` sector (advisory
+/// next-free / free-count hints) so the cluster allocator can seed its
+/// scan; FAT16 and FAT32 without `FSInfo` leave the hints at the
+/// `u32::MAX` sentinel and the allocator scans from cluster 2.
 fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf: *mut u64) -> u64
 {
     let mut sector_buf = [0u8; SECTOR_SIZE];
@@ -174,6 +195,7 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
     {
         return ipc::fs_errors::NOT_FOUND;
     }
+    alloc::load_fsinfo(state, cache, caps.block_dev, ipc_buf);
     ipc::fs_errors::SUCCESS
 }
 
@@ -194,6 +216,7 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
 /// the entire dispatch. The hot path is single-client and
 /// short-lived; lock contention with the worker is only material
 /// during cache-pressure releases.
+#[allow(clippy::too_many_lines)]
 fn service_loop(
     caps: &FatCaps,
     state: &mut FatState,
@@ -260,10 +283,14 @@ fn service_loop(
         }
 
         // FS_* requests: gate on the rights table, replying with
-        // fs_errors codes.
-        let node_id = match gate(msg.label, msg.token)
+        // fs_errors codes. `parent_rights` is the caller's
+        // per-operation rights ceiling — the cap returned by
+        // FS_CREATE/FS_MKDIR must not exceed it, or a caller holding
+        // a `MUTATE_DIR`-only parent would silently gain `READ` /
+        // `WRITE` / `EXEC` on every child they create.
+        let (node_id, parent_rights) = match gate(msg.label, msg.token)
         {
-            Ok((node, _)) => node,
+            Ok(pair) => pair,
             Err(GateError::UnknownLabel) =>
             {
                 let reply = IpcMessage::new(ipc::fs_errors::UNKNOWN_OPCODE);
@@ -284,6 +311,71 @@ fn service_loop(
         {
             handle_read_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
             continue;
+        }
+
+        // Mutation handlers do not need the OpenFile table lock; they
+        // operate on the NodeTable + cluster allocator + dir mutation
+        // + cache write-through.
+        match opcode
+        {
+            fs_labels::FS_WRITE =>
+            {
+                handle_write_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                continue;
+            }
+            fs_labels::FS_WRITE_FRAME =>
+            {
+                handle_write_frame_node_cap(
+                    node_id,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps.block_dev,
+                    ipc_buf,
+                );
+                continue;
+            }
+            fs_labels::FS_CREATE =>
+            {
+                handle_create_node_cap(
+                    node_id,
+                    parent_rights,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps,
+                    ipc_buf,
+                );
+                continue;
+            }
+            fs_labels::FS_REMOVE =>
+            {
+                handle_remove_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                continue;
+            }
+            fs_labels::FS_MKDIR =>
+            {
+                handle_mkdir_node_cap(
+                    node_id,
+                    parent_rights,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps,
+                    ipc_buf,
+                );
+                continue;
+            }
+            fs_labels::FS_RENAME =>
+            {
+                handle_rename_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
+                continue;
+            }
+            _ =>
+            {}
         }
 
         let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
@@ -721,6 +813,806 @@ fn handle_close_node_cap(
         files[idx] = OpenFile::empty();
         nodes.set_open_slot(node_id, NO_OPEN_SLOT);
     }
+    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+// ── Write / mutation handlers ──────────────────────────────────────────────
+
+/// Map a [`FatError`] to its wire-side `fs_errors` code.
+fn fat_error_to_wire(err: FatError) -> u64
+{
+    match err
+    {
+        // I/O and corrupt are both surfaced as IO_ERROR — clients
+        // don't distinguish, and "corrupt" without recovery state is
+        // an I/O-level failure from their point of view.
+        FatError::Io | FatError::Corrupt => ipc::fs_errors::IO_ERROR,
+        FatError::NoSpace => ipc::fs_errors::NO_SPACE,
+    }
+}
+
+fn reply_err(code: u64, ipc_buf: *mut u64)
+{
+    let reply = IpcMessage::new(code);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Resolve a parent-dir `NodeId` to the directory's cluster number.
+/// `NodeId(0)` is the root; FAT16 returns the sentinel cluster 0, FAT32
+/// returns `state.root_cluster`. Non-root ids must be present in the
+/// table and refer to a directory.
+fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> Option<u32>
+{
+    if node_id.raw() == 0
+    {
+        return Some(match state.fat_type
+        {
+            bpb::FatType::Fat32 => state.root_cluster,
+            bpb::FatType::Fat16 => 0,
+        });
+    }
+    let node = nodes.get(node_id)?;
+    if node.kind != NodeKind::Dir
+    {
+        return None;
+    }
+    Some(node.cluster)
+}
+
+/// Common cluster-walk-and-write engine used by `FS_WRITE` and
+/// `FS_WRITE_FRAME`. Walks the file's cluster chain from `offset`,
+/// allocating new clusters as needed, and writes `data` sector-by-
+/// sector through [`PageCache::write_sector`] (read-modify-write
+/// applies for partial-sector writes). Returns the number of bytes
+/// successfully written plus the (possibly-updated) file's first
+/// cluster.
+#[allow(clippy::too_many_arguments, clippy::single_match_else)]
+fn write_file_bytes(
+    start_cluster: u32,
+    file_size: u32,
+    offset: u64,
+    data: &[u8],
+    state: &mut FatState,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> Result<(u32, u32), FatError>
+{
+    let cluster_size = u64::from(state.cluster_size());
+    let bps = u64::from(state.bytes_per_sector);
+    if data.is_empty()
+    {
+        return Ok((start_cluster, file_size));
+    }
+
+    // Bootstrap: if the file currently holds no chain (size 0 / cluster
+    // 0), allocate the first cluster now.
+    let mut chain_head = start_cluster;
+    if chain_head < 2
+    {
+        chain_head = allocate_cluster(state, None, cache, block_dev, ipc_buf)?;
+    }
+
+    let mut cluster = chain_head;
+    let target_cluster_idx = offset / cluster_size;
+
+    // Walk to the cluster containing the target offset, allocating
+    // along the way for sparse writes. When we hit EOC, the current
+    // `cluster` is the terminal one — `allocate_cluster(Some(cluster))`
+    // links the new cluster after it. (A previous version threaded a
+    // separate `prev` that was updated after `cluster`, so on
+    // append-past-EOC it linked the new cluster behind the prior
+    // terminal, overwriting that terminal's existing forward link and
+    // orphaning the original tail.)
+    for _ in 0..target_cluster_idx
+    {
+        cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
+        {
+            Some(c) => c,
+            None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
+        };
+    }
+
+    let mut written = 0usize;
+    let mut cur_offset = offset;
+    while written < data.len()
+    {
+        let cluster_byte_offset = cur_offset % cluster_size;
+        let sector_in_cluster = (cluster_byte_offset / bps) as u32;
+        let byte_in_sector = (cluster_byte_offset % bps) as usize;
+        let sector_lba = state.cluster_to_sector(cluster) + sector_in_cluster;
+
+        let bytes_avail_in_sector = (bps as usize) - byte_in_sector;
+        let bytes_to_write = bytes_avail_in_sector.min(data.len() - written);
+
+        // Read-modify-write the sector unless we are writing the full
+        // sector from offset 0. Heap-allocated to keep the
+        // write-path frame within the default 32 KiB stack envelope
+        // when release LTO inlines the nested helpers
+        // (`insert_entry → write_dir_slot → ...`).
+        let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
+        let full_sector_overwrite = byte_in_sector == 0 && bytes_to_write == SECTOR_SIZE;
+        if !full_sector_overwrite
+            && !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)
+        {
+            return Err(FatError::Io);
+        }
+        sector_buf[byte_in_sector..byte_in_sector + bytes_to_write]
+            .copy_from_slice(&data[written..written + bytes_to_write]);
+        if !cache.write_sector(u64::from(sector_lba), block_dev, &sector_buf, ipc_buf)
+        {
+            return Err(FatError::Io);
+        }
+
+        written += bytes_to_write;
+        cur_offset += bytes_to_write as u64;
+
+        // Advance to next cluster if we still have data to write and
+        // this write touched the cluster tail.
+        let new_cluster_offset = cur_offset % cluster_size;
+        if new_cluster_offset == 0 && written < data.len()
+        {
+            cluster = match next_cluster(state, cluster, cache, block_dev, ipc_buf)
+            {
+                Some(c) => c,
+                None => allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?,
+            };
+        }
+    }
+
+    // cast_possible_truncation: cur_offset bounded by sector-level
+    // arithmetic; FAT file_size field is u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let new_size = file_size.max(cur_offset as u32);
+    Ok((chain_head, new_size))
+}
+
+/// `FS_WRITE` inline write. Token = file cap (must carry `WRITE`).
+/// `label[16..32]` = byte length (≤504), `data[0]` = offset, payload
+/// bytes packed from word 1 onward.
+fn handle_write_node_cap(
+    node_id: NodeId,
+    msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(node) = nodes.get(node_id)
+    else
+    {
+        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        return;
+    };
+    if node.kind != NodeKind::File
+    {
+        reply_err(ipc::fs_errors::IS_A_DIRECTORY, ipc_buf);
+        return;
+    }
+    let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
+    let offset = msg.word(0);
+    let data_bytes = msg.data_bytes();
+    if byte_len == 0 || data_bytes.len() < 8 + byte_len
+    {
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+    let payload = &data_bytes[8..8 + byte_len];
+
+    let (new_cluster, new_size) = match write_file_bytes(
+        node.cluster,
+        node.size,
+        offset,
+        payload,
+        state,
+        cache,
+        block_dev,
+        ipc_buf,
+    )
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            reply_err(fat_error_to_wire(e), ipc_buf);
+            return;
+        }
+    };
+
+    if (new_cluster != node.cluster || new_size != node.size) && node.loc.sector_lba != 0
+    {
+        if let Err(e) =
+            update_entry_metadata(node.loc, new_cluster, new_size, cache, block_dev, ipc_buf)
+        {
+            reply_err(fat_error_to_wire(e), ipc_buf);
+            return;
+        }
+        nodes.update_size_and_cluster(node_id, new_cluster, new_size);
+    }
+
+    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .word(0, byte_len as u64)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `FS_WRITE_FRAME`: caller supplies a source Frame cap; data lives
+/// at `frame_data_offset..frame_data_offset + byte_count` in the
+/// frame. The Frame is mapped into fatfs's address space at a
+/// process-static scratch VA, copied into a stack buffer, and the
+/// scratch VA unmapped before the actual writes. The Frame is moved
+/// back to the caller in the reply.
+#[allow(clippy::too_many_lines)]
+fn handle_write_frame_node_cap(
+    node_id: NodeId,
+    msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+)
+{
+    let src_cap = msg.caps().first().copied().unwrap_or(0);
+
+    let reply_with = |code: u64, ipc_buf: *mut u64| {
+        let mut builder = IpcMessage::builder(code);
+        if src_cap != 0
+        {
+            builder = builder.cap(src_cap);
+        }
+        let reply = builder.build();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    };
+
+    if src_cap == 0
+    {
+        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+    let Some(node) = nodes.get(node_id)
+    else
+    {
+        reply_with(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        return;
+    };
+    if node.kind != NodeKind::File
+    {
+        reply_with(ipc::fs_errors::IS_A_DIRECTORY, ipc_buf);
+        return;
+    }
+
+    let offset = msg.word(0);
+    let byte_count = msg.word(1) as usize;
+    let frame_data_offset = msg.word(2) as usize;
+    let page_size = PAGE_SIZE as usize;
+    if byte_count == 0
+        || frame_data_offset >= page_size
+        || byte_count > page_size - frame_data_offset
+    {
+        reply_with(ipc::fs_errors::BAD_FRAME_OFFSET, ipc_buf);
+        return;
+    }
+
+    // Validate the source frame: Frame cap with at least MAP|READ
+    // rights.
+    let Ok(tag_rights) = syscall::cap_info(src_cap, syscall::CAP_INFO_TAG_RIGHTS)
+    else
+    {
+        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    };
+    let tag = (tag_rights >> 32) as u8;
+    let cap_rights = tag_rights & 0xFFFF_FFFF;
+    if u64::from(tag) != u64::from(syscall::CAP_TAG_FRAME)
+        || (cap_rights & RIGHTS_MAP_READ) != RIGHTS_MAP_READ
+    {
+        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+
+    let va = write_frame_va();
+    if va == 0
+    {
+        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+    let Some(self_aspace) = self_aspace_cap()
+    else
+    {
+        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    };
+    // memmgr-issued frames carry RIGHTS_ALL (both WRITE and EXECUTE);
+    // mem_map with MAP_READONLY (= 0) on such a cap derives both w and
+    // x from the cap rights and trips the kernel's W^X check. Derive a
+    // sub-cap restricted to MAP_READ first; delete it after the unmap.
+    let Ok(restricted_cap) = syscall::cap_derive(src_cap, RIGHTS_MAP_READ)
+    else
+    {
+        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    };
+    if syscall::mem_map(
+        restricted_cap,
+        self_aspace,
+        va,
+        0,
+        1,
+        syscall_abi::MAP_READONLY,
+    )
+    .is_err()
+    {
+        let _ = syscall::cap_delete(restricted_cap);
+        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+
+    // Heap-allocated: a 4 KiB on-stack buffer would push the
+    // FS_WRITE_FRAME path past the default 32 KiB stack envelope
+    // once it cascades into `write_file_bytes → insert_entry → …`.
+    let mut buf = Box::new([0u8; PAGE_SIZE as usize]);
+    // SAFETY: va just mapped MAP_READONLY for one page; bounds checked
+    // above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (va + frame_data_offset as u64) as *const u8,
+            buf.as_mut_ptr(),
+            byte_count,
+        );
+    }
+    let _ = syscall::mem_unmap(self_aspace, va, 1);
+    // Drop the rights-restricted sub-cap we derived to satisfy W^X
+    // at mem_map. The original src_cap is unaffected and returns to
+    // the caller in the reply.
+    let _ = syscall::cap_delete(restricted_cap);
+
+    let (new_cluster, new_size) = match write_file_bytes(
+        node.cluster,
+        node.size,
+        offset,
+        &buf[..byte_count],
+        state,
+        cache,
+        block_dev,
+        ipc_buf,
+    )
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            reply_with(fat_error_to_wire(e), ipc_buf);
+            return;
+        }
+    };
+
+    if (new_cluster != node.cluster || new_size != node.size) && node.loc.sector_lba != 0
+    {
+        if let Err(e) =
+            update_entry_metadata(node.loc, new_cluster, new_size, cache, block_dev, ipc_buf)
+        {
+            reply_with(fat_error_to_wire(e), ipc_buf);
+            return;
+        }
+        nodes.update_size_and_cluster(node_id, new_cluster, new_size);
+    }
+
+    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .word(0, byte_count as u64)
+        .cap(src_cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Lazy process-local VA reservation for `FS_WRITE_FRAME` source-frame
+/// mapping. Returns the VA on success, `0` on reserve failure.
+fn write_frame_va() -> u64
+{
+    use std::sync::OnceLock;
+    static VA: OnceLock<u64> = OnceLock::new();
+    if let Some(v) = VA.get()
+    {
+        return *v;
+    }
+    let Ok(range) = std::os::seraph::reserve_pages(1)
+    else
+    {
+        return 0;
+    };
+    let va = range.va_start();
+    let _ = VA.set(va);
+    va
+}
+
+/// Locate the current process's `AddressSpace` cap, cached.
+fn self_aspace_cap() -> Option<u32>
+{
+    use std::sync::OnceLock;
+    static SELF_ASPACE: OnceLock<u32> = OnceLock::new();
+    if let Some(c) = SELF_ASPACE.get()
+    {
+        return Some(*c);
+    }
+    let info = startup_info();
+    let cap = info.self_aspace;
+    if cap != 0
+    {
+        let _ = SELF_ASPACE.set(cap);
+    }
+    Some(cap).filter(|&c| c != 0)
+}
+
+/// `FS_CREATE`: create a new file in a directory. Token = parent-dir
+/// cap (must carry `MUTATE_DIR`). `label[16..32]` = name length, name
+/// from word 0. `parent_rights` is the caller's effective rights on
+/// the parent dir; the returned child cap is attenuated by it.
+#[allow(clippy::too_many_arguments)]
+fn handle_create_node_cap(
+    node_id: NodeId,
+    parent_rights: NamespaceRights,
+    msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    cache: &PageCache,
+    caps: &FatCaps,
+    ipc_buf: *mut u64,
+)
+{
+    create_entry_common(
+        node_id,
+        parent_rights,
+        msg,
+        NewEntryKind::File,
+        state,
+        nodes,
+        cache,
+        caps,
+        ipc_buf,
+    );
+}
+
+/// `FS_MKDIR`: create a new directory in a directory.
+#[allow(clippy::too_many_arguments)]
+fn handle_mkdir_node_cap(
+    node_id: NodeId,
+    parent_rights: NamespaceRights,
+    msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    cache: &PageCache,
+    caps: &FatCaps,
+    ipc_buf: *mut u64,
+)
+{
+    create_entry_common(
+        node_id,
+        parent_rights,
+        msg,
+        NewEntryKind::Dir,
+        state,
+        nodes,
+        cache,
+        caps,
+        ipc_buf,
+    );
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn create_entry_common(
+    node_id: NodeId,
+    parent_rights: NamespaceRights,
+    msg: &IpcMessage,
+    kind: NewEntryKind,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    cache: &PageCache,
+    caps: &FatCaps,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
+    else
+    {
+        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        return;
+    };
+    let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
+    let data_bytes = msg.data_bytes();
+    if name_len == 0 || data_bytes.len() < name_len
+    {
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+    let name = &data_bytes[..name_len];
+    if namespace_protocol::validate_name(name).is_err()
+    {
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+
+    let (start_cluster, kind_for_node) = match kind
+    {
+        NewEntryKind::File => (0u32, NodeKind::File),
+        NewEntryKind::Dir =>
+        {
+            let new_cluster = match allocate_cluster(state, None, cache, caps.block_dev, ipc_buf)
+            {
+                Ok(c) => c,
+                Err(e) =>
+                {
+                    reply_err(fat_error_to_wire(e), ipc_buf);
+                    return;
+                }
+            };
+            if let Err(e) = write_dot_entries(
+                state,
+                new_cluster,
+                parent_cluster,
+                cache,
+                caps.block_dev,
+                ipc_buf,
+            )
+            {
+                reply_err(fat_error_to_wire(e), ipc_buf);
+                return;
+            }
+            (new_cluster, NodeKind::Dir)
+        }
+    };
+
+    let loc = match insert_entry(
+        state,
+        parent_cluster,
+        name,
+        kind,
+        start_cluster,
+        0,
+        cache,
+        caps.block_dev,
+        ipc_buf,
+    )
+    {
+        Ok(loc) => loc,
+        Err(e) =>
+        {
+            if matches!(kind, NewEntryKind::Dir)
+            {
+                let _ =
+                    alloc::free_cluster_chain(state, start_cluster, cache, caps.block_dev, ipc_buf);
+            }
+            reply_err(fat_error_to_wire(e), ipc_buf);
+            return;
+        }
+    };
+
+    let Some(new_node_id) = nodes.alloc_for_dispatch(backend::FatNode {
+        cluster: start_cluster,
+        size: 0,
+        kind: kind_for_node,
+        open_slot: backend::NO_OPEN_SLOT,
+        loc,
+    })
+    else
+    {
+        reply_err(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+        return;
+    };
+    // Cap-monotonic attenuation: the child cap can carry at most the
+    // intersection of the caller's parent rights and the kind-specific
+    // ceiling that `backend::lookup` would later apply on a re-walk.
+    // Files: STAT|READ|WRITE|EXEC. Dirs: ALL (intermediate-dir
+    // composition relies on dirs passing every bit through; per-op
+    // gating still enforces the leaf check).
+    let kind_max = match kind_for_node
+    {
+        NodeKind::Dir => NamespaceRights::ALL,
+        NodeKind::File => NamespaceRights::from_raw(
+            namespace_protocol::rights::STAT
+                | namespace_protocol::rights::READ
+                | namespace_protocol::rights::WRITE
+                | namespace_protocol::rights::EXEC,
+        ),
+    };
+    let child_rights = parent_rights.intersect(kind_max);
+    let token = pack_token(new_node_id, child_rights);
+    let Ok(new_cap) = syscall::cap_derive_token(caps.service, syscall::RIGHTS_SEND_GRANT, token)
+    else
+    {
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    };
+
+    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .word(0, kind_for_node as u64)
+        .cap(new_cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `FS_REMOVE`: unlink a file or empty directory. Token = parent-dir
+/// cap (must carry `MUTATE_DIR`). Name in label[16..32] + data bytes.
+fn handle_remove_node_cap(
+    node_id: NodeId,
+    msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
+    else
+    {
+        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        return;
+    };
+    let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
+    let data_bytes = msg.data_bytes();
+    if name_len == 0 || data_bytes.len() < name_len
+    {
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+    let name = &data_bytes[..name_len];
+
+    let Some((entry, removed_loc)) = dir::find_in_directory_with_location(
+        parent_cluster,
+        name,
+        state,
+        cache,
+        block_dev,
+        ipc_buf,
+    )
+    else
+    {
+        reply_err(ipc::fs_errors::NOT_FOUND, ipc_buf);
+        return;
+    };
+    let is_dir = entry.attr & 0x10 != 0;
+    if is_dir
+    {
+        match directory_is_empty(state, entry.cluster, cache, block_dev, ipc_buf)
+        {
+            Ok(true) =>
+            {}
+            Ok(false) =>
+            {
+                reply_err(ipc::fs_errors::NOT_EMPTY, ipc_buf);
+                return;
+            }
+            Err(e) =>
+            {
+                reply_err(fat_error_to_wire(e), ipc_buf);
+                return;
+            }
+        }
+    }
+
+    let removed = match remove_entry(state, parent_cluster, name, cache, block_dev, ipc_buf)
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            reply_err(fat_error_to_wire(e), ipc_buf);
+            return;
+        }
+    };
+
+    if let Err(e) = free_entry_data(state, &removed, cache, block_dev, ipc_buf)
+    {
+        reply_err(fat_error_to_wire(e), ipc_buf);
+        return;
+    }
+
+    // Slot-keyed invalidation: NodeTable now dedupes by
+    // `DirEntryLocation`, so a stale node for this slot must be
+    // dropped before a later FS_CREATE lands here and reuses the
+    // slot's bytes.
+    let _ = removed;
+    nodes.invalidate_for_loc(removed_loc);
+
+    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `FS_RENAME`: rename an entry within a single directory.
+#[allow(clippy::too_many_lines)]
+fn handle_rename_node_cap(
+    node_id: NodeId,
+    msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
+    else
+    {
+        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        return;
+    };
+    let src_len = msg.word(0) as usize;
+    let dst_len = msg.word(1) as usize;
+    let data_bytes = msg.data_bytes();
+    let name_off = 16; // words 0,1 = lengths (16 bytes), names from word 2
+    if src_len == 0 || dst_len == 0 || data_bytes.len() < name_off + src_len + dst_len
+    {
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+    let src_name = &data_bytes[name_off..name_off + src_len];
+    let dst_name = &data_bytes[name_off + src_len..name_off + src_len + dst_len];
+
+    if namespace_protocol::validate_name(src_name).is_err()
+        || namespace_protocol::validate_name(dst_name).is_err()
+    {
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+
+    let Some((entry, src_loc)) = dir::find_in_directory_with_location(
+        parent_cluster,
+        src_name,
+        state,
+        cache,
+        block_dev,
+        ipc_buf,
+    )
+    else
+    {
+        reply_err(ipc::fs_errors::NOT_FOUND, ipc_buf);
+        return;
+    };
+
+    let kind = if entry.attr & 0x10 != 0
+    {
+        NewEntryKind::Dir
+    }
+    else
+    {
+        NewEntryKind::File
+    };
+
+    // Non-atomic: insert destination first, then unlink source.
+    // Documented in services/fs/fat/docs/crash-safety.md.
+    if let Err(e) = insert_entry(
+        state,
+        parent_cluster,
+        dst_name,
+        kind,
+        entry.cluster,
+        entry.size,
+        cache,
+        block_dev,
+        ipc_buf,
+    )
+    {
+        reply_err(fat_error_to_wire(e), ipc_buf);
+        return;
+    }
+    if let Err(e) = remove_entry(state, parent_cluster, src_name, cache, block_dev, ipc_buf)
+    {
+        reply_err(fat_error_to_wire(e), ipc_buf);
+        return;
+    }
+
+    // Drop any cached node referencing the now-deleted source slot.
+    // A later FS_WRITE through a held source cap would otherwise
+    // patch a `0xE5`-marked entry.
+    nodes.invalidate_for_loc(src_loc);
+
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

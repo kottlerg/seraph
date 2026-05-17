@@ -21,7 +21,10 @@
 
 use crate::bpb::{FatState, FatType};
 use crate::cache::PageCache;
-use crate::dir::{DirEntry, MAX_LFN_UTF8, read_dir_entry_at_index};
+use crate::dir::{
+    DirEntry, DirEntryLocation, MAX_LFN_UTF8, find_in_directory_with_location,
+    read_dir_entry_at_index,
+};
 use namespace_protocol::{
     EntryName, EntryTarget, EntryView, FrameReply, NamespaceBackend, NamespaceRights, NodeId,
     NodeKind, NodeStat, NsError, rights,
@@ -51,6 +54,14 @@ pub struct FatNode
     pub size: u32,
     pub kind: NodeKind,
     pub open_slot: u32,
+    /// On-disk position of this entry's 8.3 record. Populated by
+    /// `lookup()` so write / metadata-update handlers can patch
+    /// `first_cluster` and `size` in place after extending the cluster
+    /// chain. `sector_lba == 0` is the sentinel "no location known"
+    /// (LBA 0 is the BPB, never a directory sector); the dispatch
+    /// rejects mutation requests against such nodes.
+    #[allow(dead_code)] // consumed by dispatch handlers in a later commit
+    pub loc: DirEntryLocation,
 }
 
 /// Sentinel for [`FatNode::open_slot`] meaning "no `OpenFile` slot
@@ -91,6 +102,15 @@ impl NodeTable
         }
         let idx = (raw - 1) as usize;
         self.entries.get(idx).copied().flatten()
+    }
+
+    /// Public-to-the-crate wrapper around `alloc` so dispatch handlers
+    /// in `main.rs` can mint a new node entry directly for
+    /// freshly-created files / directories.
+    #[must_use]
+    pub fn alloc_for_dispatch(&mut self, node: FatNode) -> Option<NodeId>
+    {
+        self.alloc(node)
     }
 
     fn alloc(&mut self, node: FatNode) -> Option<NodeId>
@@ -162,6 +182,24 @@ impl NodeTable
             {
                 *slot = None;
             }
+        }
+    }
+
+    /// Update the cluster and size fields of a non-root node entry.
+    /// Used by `FS_WRITE` after extending the file's cluster chain.
+    #[allow(dead_code)] // wired in by the FS_WRITE handler in this PR's next commit
+    pub fn update_size_and_cluster(&mut self, id: NodeId, new_cluster: u32, new_size: u32)
+    {
+        let raw = id.raw();
+        if raw == 0
+        {
+            return;
+        }
+        let idx = (raw - 1) as usize;
+        if let Some(Some(node)) = self.entries.get_mut(idx)
+        {
+            node.cluster = new_cluster;
+            node.size = new_size;
         }
     }
 }
@@ -243,13 +281,21 @@ impl NamespaceBackend for FatfsBackend<'_>
     {
         let dir_cluster = self.cluster_for(dir).ok_or(NsError::NotADirectory)?;
 
-        // Single-component scan against `dir_cluster`. Mirrors the
-        // logic in `dir.rs::find_in_directory`, inlined here because
-        // that helper is module-private to dir.rs and structured for
-        // the multi-component path walker rather than the per-call
-        // single-name dispatch the namespace protocol expects.
-        let entry = scan_dir_for_name(
-            dir_cluster,
+        // Resolves a single component against `dir_cluster` and also
+        // surfaces the on-disk `DirEntryLocation` so the write-side
+        // dispatch can patch metadata in place without re-scanning the
+        // parent directory.
+        let dir_cluster_resolved = if dir_cluster == 0
+            && matches!(self.state.fat_type, FatType::Fat32)
+        {
+            self.state.root_cluster
+        }
+        else
+        {
+            dir_cluster
+        };
+        let (entry, loc) = find_in_directory_with_location(
+            dir_cluster_resolved,
             name,
             self.state,
             self.cache,
@@ -266,6 +312,7 @@ impl NamespaceBackend for FatfsBackend<'_>
                 size: entry.size,
                 kind,
                 open_slot: NO_OPEN_SLOT,
+                loc,
             })
             .ok_or(NsError::OutOfResources)?;
 
@@ -358,43 +405,4 @@ impl NamespaceBackend for FatfsBackend<'_>
     fn release_frame(&mut self, _file: NodeId, _cookie: u64) {}
 
     fn close(&mut self, _node: NodeId) {}
-}
-
-/// Single-component lookup against `dir_cluster`.
-///
-/// Bridges the gap left by `dir::find_in_directory` being private:
-/// Resolve a single name against `dir_cluster`, returning the matching
-/// directory entry (or `None` for absence).
-///
-/// Delegates to [`crate::dir::find_in_directory`] for both the FAT32
-/// cluster-chain walk and the FAT16 fixed-root case. That helper
-/// performs LFN-aware matching via `scan_sector_for_name`, so names
-/// whose 8.3 short form is generated (e.g. `boot.conf` → `BOOT~1.CON`)
-/// resolve correctly through their long-name entry. The
-/// FAT32-root-cluster path also lands on `find_in_directory` (no
-/// special-case dispatch) — `resolve_path` is only needed when the
-/// caller doesn't yet know the start cluster.
-fn scan_dir_for_name(
-    dir_cluster: u32,
-    name: &[u8],
-    state: &mut FatState,
-    cache: &PageCache,
-    block_dev: u32,
-    ipc_buf: *mut u64,
-) -> Option<DirEntry>
-{
-    if dir_cluster == 0 && matches!(state.fat_type, FatType::Fat32)
-    {
-        // FAT32 with cluster 0 means "uninitialised" — fall back to
-        // resolving from the configured root cluster.
-        return crate::dir::find_in_directory(
-            state.root_cluster,
-            name,
-            state,
-            cache,
-            block_dev,
-            ipc_buf,
-        );
-    }
-    crate::dir::find_in_directory(dir_cluster, name, state, cache, block_dev, ipc_buf)
 }

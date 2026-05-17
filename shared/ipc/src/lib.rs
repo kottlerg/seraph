@@ -774,15 +774,19 @@ pub mod fs_labels
     ///
     /// Reply: identical shape to [`FS_CREATE`], `data[0]` = kind (Dir).
     pub const FS_MKDIR: u64 = 15;
-    /// Rename a directory entry, optionally across directories.
+    /// Rename a directory entry within a single directory.
     ///
-    /// Request: token = source-directory cap (must carry `MUTATE_DIR`),
+    /// Request: token = directory cap (must carry `MUTATE_DIR`),
     /// `data[0]` = source name length, `data[1]` = destination name
     /// length, name bytes packed contiguously from word 2 via
     /// `IpcMessageBuilder::bytes(2, &concat(src, dst))` — source bytes
     /// first, destination bytes immediately after with no padding.
-    /// `caps[0]` = destination-directory cap (must also carry
-    /// `MUTATE_DIR`). Source and destination may be the same cap.
+    ///
+    /// Cross-directory rename is deferred to a follow-up Issue: the
+    /// caller cannot supply a second directory cap because servers
+    /// cannot introspect the token packed inside a cap they receive
+    /// (`cap_info` does not expose token bits), so a cross-directory
+    /// destination cannot be resolved to a `NodeId` server-side.
     ///
     /// Not atomic: an interrupted rename can leave both names present
     /// or neither. See `services/fs/fat/docs/crash-safety.md`.

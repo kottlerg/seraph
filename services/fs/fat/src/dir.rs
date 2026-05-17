@@ -600,6 +600,118 @@ fn find_in_fat16_root(
     None
 }
 
+/// As [`find_in_directory`] but also returns the on-disk location of
+/// the matching 8.3 entry, used by callers that intend to patch the
+/// entry's metadata fields (`size`, `first_cluster`) later.
+pub fn find_in_directory_with_location(
+    dir_cluster: u32,
+    name: &[u8],
+    state: &mut FatState,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+) -> Option<(DirEntry, DirEntryLocation)>
+{
+    let mut sector_buf = [0u8; SECTOR_SIZE];
+    let mut lfn = LfnAccum::new();
+    let entries_per_sector = SECTOR_SIZE / 32;
+
+    if dir_cluster == 0
+    {
+        let root_start =
+            u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
+        let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
+        for s in 0..root_sectors
+        {
+            let sector_lba = root_start + s;
+            if !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)
+            {
+                return None;
+            }
+            if let Some((entry, off)) =
+                scan_sector_for_name_with_offset(&sector_buf, name, &mut lfn, entries_per_sector)
+            {
+                return Some((
+                    entry,
+                    DirEntryLocation {
+                        sector_lba,
+                        offset_in_sector: off,
+                    },
+                ));
+            }
+        }
+        return None;
+    }
+
+    let mut cluster = dir_cluster;
+    loop
+    {
+        let base_sector = state.cluster_to_sector(cluster);
+        for s in 0..u32::from(state.sectors_per_cluster)
+        {
+            let sector_lba = base_sector + s;
+            if !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)
+            {
+                return None;
+            }
+            if let Some((entry, off)) =
+                scan_sector_for_name_with_offset(&sector_buf, name, &mut lfn, entries_per_sector)
+            {
+                return Some((
+                    entry,
+                    DirEntryLocation {
+                        sector_lba,
+                        offset_in_sector: off,
+                    },
+                ));
+            }
+        }
+        cluster = next_cluster(state, cluster, cache, block_dev, ipc_buf)?;
+    }
+}
+
+fn scan_sector_for_name_with_offset(
+    sector: &[u8; SECTOR_SIZE],
+    name: &[u8],
+    lfn: &mut LfnAccum,
+    entries_per_sector: usize,
+) -> Option<(DirEntry, usize)>
+{
+    for i in 0..entries_per_sector
+    {
+        let offset = i * 32;
+        let raw = &sector[offset..offset + 32];
+        if raw[0] == 0x00
+        {
+            return None;
+        }
+        if raw[0] == 0xE5
+        {
+            lfn.reset();
+            continue;
+        }
+        if raw[11] == 0x0F
+        {
+            lfn.add_lfn_entry(raw);
+            continue;
+        }
+        if let Some(mut entry) = parse_dir_entry(raw)
+        {
+            let lfn_match = lfn.validate(&entry.name) && lfn.matches(name);
+            if lfn_match || name_matches(&entry.name, name)
+            {
+                if lfn.validate(&entry.name)
+                {
+                    populate_lfn(&mut entry, lfn);
+                }
+                return Some((entry, offset));
+            }
+        }
+        lfn.reset();
+    }
+    None
+}
+
 /// Scan a sector's 32-byte directory entries for a name match.
 ///
 /// Supports both 8.3 and LFN matching. The `lfn` accumulator carries

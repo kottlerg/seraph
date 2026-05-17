@@ -67,6 +67,9 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //   provides coarse-grained coverage in lockstep with workspace-inherited
 //   versioning.
 //     PROCMGR_LABELS_VERSION
+//     PWRMGR_LABELS_VERSION
+//     RTC_LABELS_VERSION
+//     TIMED_LABELS_VERSION
 
 pub const PROCMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the process manager (`procmgr`).
@@ -412,6 +415,108 @@ pub mod svcmgr_labels
     /// pattern); data words carry the name. Reply attaches the cap on
     /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
     pub const QUERY_ENDPOINT: u64 = 4;
+
+    /// Verb-bit carried by the caller's token to authorise
+    /// [`PUBLISH_ENDPOINT`]. Init mints SEND caps on svcmgr's service
+    /// endpoint whose token is exactly `PUBLISH_AUTHORITY` (no
+    /// per-publisher identity in the low bits today — server-side
+    /// auth is binary: have the bit, or don't). Holders trusted to
+    /// add names: init itself, devmgr for driver registrations,
+    /// svcmgr's own future post-init service launcher.
+    ///
+    /// The SEND distributed to every process via
+    /// `ProcessInfo.service_registry_cap` carries the child's
+    /// per-process token (no `PUBLISH_AUTHORITY` bit), so it is
+    /// accepted for `QUERY_ENDPOINT` only; svcmgr rejects publish
+    /// attempts whose token lacks the bit with
+    /// [`svcmgr_errors::UNAUTHORIZED`]. See
+    /// `docs/capability-model.md` "verb-bit authority pattern" for
+    /// the rationale and parallel use in
+    /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`.
+    ///
+    /// Per-publisher attenuation (e.g. name-prefix restrictions in
+    /// the low token bits, so a session daemon can publish only
+    /// `user.*`) is the future-work shape and the token namespace
+    /// reserves it — see GitHub issue #76.
+    pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
+}
+
+pub const RTC_LABELS_VERSION: u32 = 1;
+/// IPC labels for RTC chip drivers (`services/drivers/cmos`,
+/// `services/drivers/virtio/rtc`, and future per-board chip drivers).
+///
+/// Every RTC driver implements exactly one operation: return the current
+/// wall-clock time, as `u64` microseconds since the Unix epoch. The
+/// `timed` service queries the driver registered under
+/// `rtc.primary` in svcmgr once at startup, computes
+/// `offset = rtc_us - kernel_monotonic_us`, and serves
+/// [`timed_labels::GET_WALL_TIME`] thereafter without further driver IPC.
+///
+/// Adding a new RTC chip is a matter of writing a driver crate that
+/// answers this single label and registering it as `rtc.primary` from
+/// devmgr's per-board discovery path. `timed` itself never sees the
+/// chip-specific details.
+pub mod rtc_labels
+{
+    /// Request the current wall-clock time.
+    ///
+    /// Wire format: empty body (no data words, no caps). Reply:
+    /// `data[0]` is `u64` microseconds since the Unix epoch. Reply
+    /// label carries a status code in the lower 16 bits.
+    pub const RTC_GET_EPOCH_TIME: u64 = 1;
+}
+
+/// Error replies from RTC chip drivers.
+pub mod rtc_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// Driver could not read the underlying hardware (transient or
+    /// permanent device failure). Caller may retry; `timed` treats this
+    /// as "wall-clock unavailable" until a subsequent query succeeds.
+    pub const READ_FAILED: u64 = 1;
+    /// Driver received a label it does not implement.
+    pub const UNKNOWN_OPCODE: u64 = 2;
+    /// Reserved for a future per-message version handshake. Unused
+    /// today — `RTC_LABELS_VERSION` is marker-only and covered by
+    /// `PROCESS_ABI_VERSION` at process startup.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
+}
+
+pub const TIMED_LABELS_VERSION: u32 = 1;
+/// IPC labels for the wall-clock service (`services/timed`).
+///
+/// `timed` is RTC-source-agnostic: it looks up `rtc.primary` once at
+/// startup, queries the driver via [`rtc_labels::RTC_GET_EPOCH_TIME`],
+/// computes a stable offset against the kernel's monotonic clock, and
+/// serves wall-clock queries from `offset + system_info(ElapsedUs)`. New
+/// RTC chip support never changes timed; only the `rtc.primary` driver
+/// changes per platform.
+pub mod timed_labels
+{
+    /// Request the current wall-clock time.
+    ///
+    /// Wire format: empty body. Reply: `data[0]` is `u64` microseconds
+    /// since the Unix epoch. Reply label carries a status code in the
+    /// lower 16 bits.
+    pub const GET_WALL_TIME: u64 = 1;
+}
+
+/// Error replies from the wall-clock service.
+pub mod timed_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// No RTC driver was registered under `rtc.primary` at timed's
+    /// startup; the offset was never computed. Boards without an RTC
+    /// (some real RISC-V hardware) reach this state until an operator
+    /// or NTP path seeds the offset out-of-band. Out of scope for this
+    /// PR; documented to make the no-RTC path explicit at the wire
+    /// level rather than panicking.
+    pub const WALL_CLOCK_UNAVAILABLE: u64 = 1;
+    pub const UNKNOWN_OPCODE: u64 = 2;
+    /// Reserved for a future per-message version handshake. Unused
+    /// today — `TIMED_LABELS_VERSION` is marker-only and covered by
+    /// `PROCESS_ABI_VERSION` at process startup.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
 pub const PWRMGR_LABELS_VERSION: u32 = 1;
@@ -974,6 +1079,14 @@ pub mod svcmgr_errors
     /// mismatch here means the caller was built against a different
     /// revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
+    /// Caller's token lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
+    /// `PUBLISH_ENDPOINT` request.
+    pub const UNAUTHORIZED: u64 = 8;
+    /// Client-side: the underlying `ipc_call` returned `Err` (no reply
+    /// from svcmgr, transport-level failure). Never emitted by svcmgr
+    /// itself — synthesised by `registry-client` to give callers a
+    /// uniform status surface.
+    pub const IPC_FAILED: u64 = 9;
     /// Unknown opcode on svcmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

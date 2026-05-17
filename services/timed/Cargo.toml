@@ -1,0 +1,18 @@
+[package]
+name = "timed"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "timed"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+ipc = { path = "../../shared/ipc" }
+syscall = { path = "../../shared/syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+
+[lints]
+workspace = true

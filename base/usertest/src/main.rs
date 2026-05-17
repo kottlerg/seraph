@@ -147,6 +147,7 @@ fn main()
     // cap-derivation pressure on TCG-emulated arches.
     fs_open_relative_phase();
     pwrmgr_cap_deny_phase(pwrmgr_noauth_cap);
+    system_time_phase();
 
     std::os::seraph::log!("ALL TESTS PASSED");
 
@@ -188,6 +189,135 @@ fn pwrmgr_cap_deny_phase(pwrmgr_noauth_cap: u32)
         reply.label
     );
     std::os::seraph::log!("pwrmgr cap-deny phase passed (UNAUTHORIZED reply)");
+}
+
+/// `std::time::SystemTime::now()` end-to-end through the per-process
+/// `service_registry_cap` → svcmgr `QUERY_ENDPOINT` → timed
+/// `GET_WALL_TIME` → kernel monotonic clock + offset against
+/// `rtc.primary`. Closes issues #2 and #4 by asserting:
+///
+/// * the wall-clock returned is plausibly post-2024 and pre-2100 (rules
+///   out the `UNIX_EPOCH` degraded path and stuck clocks);
+/// * two `SystemTime::now()` reads bracketing a known `Instant::now()`
+///   delay agree on elapsed within 10 ms — `Instant` reads the kernel
+///   monotonic counter directly and `SystemTime` adds `offset`, so the
+///   deltas must match to within a few jiffies of IPC latency.
+///
+/// On boards where the wall-clock chain failed to come up (init logged
+/// a publish failure; `timed` is in `WALL_CLOCK_UNAVAILABLE` mode),
+/// `SystemTime::now()` returns `UNIX_EPOCH` and this phase logs +
+/// returns rather than panicking — `UNIX_EPOCH` is the documented
+/// degraded-mode contract.
+// 2024-01-01 00:00:00 UTC = 1 704 067 200 s.
+const SYSTEM_TIME_AFTER_2024_SECS: u64 = 1_704_067_200;
+// 2100-01-01 00:00:00 UTC = 4 102 444 800 s. Sanity ceiling.
+const SYSTEM_TIME_BEFORE_2100_SECS: u64 = 4_102_444_800;
+
+fn system_time_phase()
+{
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    // Sandwich-bracket the SystemTime read between two Instant reads
+    // so we can bound when the IPC for SystemTime actually sampled the
+    // monotonic clock. Without this the test flakes under heavy host
+    // load: a preemption stretching one bracket's IPC roundtrip more
+    // than the other's introduces an asymmetric bias that previously
+    // tripped a fixed 10 ms tolerance (observed ~17 ms divergence under
+    // 4-way parallel TCG).
+    fn sample() -> (Instant, SystemTime, Instant)
+    {
+        let i_pre = Instant::now();
+        let t = SystemTime::now();
+        let i_post = Instant::now();
+        (i_pre, t, i_post)
+    }
+
+    let (i_pre0, t0, i_post0) = sample();
+    let since_epoch = t0
+        .duration_since(UNIX_EPOCH)
+        .expect("SystemTime::now must be at or after UNIX_EPOCH");
+    if since_epoch == Duration::ZERO
+    {
+        std::os::seraph::log!("SystemTime phase skipped: timed unavailable (UNIX_EPOCH reply)");
+        return;
+    }
+
+    let secs = since_epoch.as_secs();
+    assert!(
+        secs >= SYSTEM_TIME_AFTER_2024_SECS,
+        "SystemTime returned {secs}s, before 2024-01-01 — \
+         timed offset miswired or RTC clock not running",
+    );
+    assert!(
+        secs < SYSTEM_TIME_BEFORE_2100_SECS,
+        "SystemTime returned {secs}s, after 2100-01-01 — overflow or junk read",
+    );
+
+    // Busy-loop on Instant; the loop duration is incidental — the
+    // structural assertion below uses Instant-bracketed bounds, not a
+    // fixed tolerance.
+    let target = Duration::from_millis(50);
+    while i_post0.elapsed() < target
+    {
+        core::hint::spin_loop();
+    }
+
+    let (i_pre1, t1, i_post1) = sample();
+    let sys_delta = t1
+        .duration_since(t0)
+        .expect("SystemTime monotonicity (wall clock did not run backwards)");
+
+    // t0 was sampled in monotonic time somewhere in [i_pre0, i_post0];
+    // t1 in [i_pre1, i_post1]. The true mono-time gap (t1 - t0) is
+    // therefore bounded:
+    //     min = i_pre1  - i_post0  (gap excluding the bracket reads)
+    //     max = i_post1 - i_pre0   (gap including the bracket reads)
+    // If sys_delta falls outside [min, max], SystemTime and Instant
+    // are not tracking each other — that's the structural failure the
+    // test is designed to catch (wrong offset, scale, or stuck clock).
+    let mono_min = i_pre1.duration_since(i_post0);
+    let mono_max = i_post1.duration_since(i_pre0);
+    assert!(
+        sys_delta >= mono_min && sys_delta <= mono_max,
+        "SystemTime delta {sys_delta:?} outside Instant-bracketed bounds \
+         [{mono_min:?}, {mono_max:?}] — clocks not tracking",
+    );
+
+    let (y, mo, dd, hh, mm, ss) = epoch_to_ymdhms(secs);
+    std::os::seraph::log!(
+        "SystemTime phase passed ({y:04}-{mo:02}-{dd:02}T{hh:02}:{mm:02}:{ss:02}Z, sys_delta={sys_delta:?}, mono_bounds=[{mono_min:?}, {mono_max:?}])"
+    );
+}
+
+/// Howard Hinnant's `civil_from_days` (inverse of `days_from_civil`)
+/// inlined for usertest's log line — keeps the dep surface zero. Maps
+/// `secs` since Unix epoch to `(year, month, day, hour, minute, second)`
+/// in UTC; matches `days_from_civil` in `services/drivers/cmos/src/main.rs`.
+///
+/// Operates entirely in unsigned arithmetic: post-2024 secs fit
+/// comfortably under `u32` for day counts and the Hinnant algorithm is
+/// branch-free for years ≥ 0.
+#[allow(clippy::cast_possible_truncation)]
+fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32)
+{
+    let days = secs / 86_400;
+    let sod = (secs % 86_400) as u32;
+    let hh = sod / 3_600;
+    let mm = (sod / 60) % 60;
+    let ss = sod % 60;
+
+    // z is days since 0000-03-01; valid for any post-epoch input.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + (era as u32) * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, d, hh, mm, ss)
 }
 
 /// Terminal phase: invoke pwrmgr SHUTDOWN through the

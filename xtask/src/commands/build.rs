@@ -63,6 +63,10 @@ struct Spec
     name: &'static str,
     profile: BuildProfile,
     dest: InstallDest,
+    /// If `Some`, only build/install this component when the active arch
+    /// matches. Used by per-arch HW drivers (CMOS on x86-64, goldfish RTC
+    /// on RISC-V) whose source is architecture-specific.
+    arch_only: Option<Arch>,
 }
 
 /// Every buildable component except `boot`. Order matters for `All` builds:
@@ -72,96 +76,133 @@ const SPECS: &[Spec] = &[
         name: "kernel",
         profile: BuildProfile::Kernel,
         dest: InstallDest::EfiSeraph,
+        arch_only: None,
     },
     Spec {
         name: "init",
         profile: BuildProfile::LowLevelUser,
         dest: InstallDest::EfiSeraph,
+        arch_only: None,
     },
     Spec {
         name: "ktest",
         profile: BuildProfile::LowLevelUser,
         dest: InstallDest::EfiSeraph,
+        arch_only: None,
     },
     Spec {
         name: "procmgr",
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiSeraph,
+        arch_only: None,
     },
     Spec {
         name: "memmgr",
         profile: BuildProfile::LowLevelUser,
         dest: InstallDest::EfiSeraph,
+        arch_only: None,
     },
     Spec {
         name: "devmgr",
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiSeraph,
+        arch_only: None,
     },
     Spec {
         name: "vfsd",
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiSeraph,
+        arch_only: None,
     },
     Spec {
         name: "virtio-blk",
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiSeraph,
+        arch_only: None,
+    },
+    Spec {
+        name: "cmos-rtc",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+        arch_only: Some(Arch::X86_64),
+    },
+    Spec {
+        name: "goldfish-rtc",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+        arch_only: Some(Arch::Riscv64),
     },
     Spec {
         name: "fatfs",
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiAndRootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "crasher",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "usertest",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "svcmgr",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "pwrmgr",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "logd",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
+    },
+    Spec {
+        name: "timed",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "hello",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "fsbench",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "stackoverflow",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "pipefault",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
     Spec {
         name: "stdiotest",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
     },
 ];
 
@@ -178,11 +219,14 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Devmgr => "devmgr",
         BuildComponent::Vfsd => "vfsd",
         BuildComponent::VirtioBlk => "virtio-blk",
+        BuildComponent::CmosRtc => "cmos-rtc",
+        BuildComponent::GoldfishRtc => "goldfish-rtc",
         BuildComponent::Fatfs => "fatfs",
         BuildComponent::Crasher => "crasher",
         BuildComponent::Usertest => "usertest",
         BuildComponent::Svcmgr => "svcmgr",
         BuildComponent::Pwrmgr => "pwrmgr",
+        BuildComponent::Timed => "timed",
         BuildComponent::Hello => "hello",
         BuildComponent::Fsbench => "fsbench",
         BuildComponent::Stackoverflow => "stackoverflow",
@@ -345,7 +389,11 @@ fn build_all_specs(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         BuildProfile::StdUser,
     ]
     {
-        let group: Vec<&Spec> = SPECS.iter().filter(|s| s.profile == profile).collect();
+        let group: Vec<&Spec> = SPECS
+            .iter()
+            .filter(|s| s.profile == profile)
+            .filter(|s| s.arch_only.is_none_or(|a| a == args.arch))
+            .collect();
         if group.is_empty()
         {
             continue;

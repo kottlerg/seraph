@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 14;
+pub const PROCESS_ABI_VERSION: u32 = 15;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -245,6 +245,29 @@ pub struct ProcessInfo
     /// before memmgr exists). Consumers must tolerate zero.
     pub memmgr_endpoint_cap: u32,
 
+    /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, used
+    /// as the system-wide service-discovery handle. The cap's token
+    /// carries only the child's per-process token — without the
+    /// `svcmgr_labels::PUBLISH_AUTHORITY` verb-bit — so svcmgr accepts
+    /// `QUERY_ENDPOINT` from it but rejects `PUBLISH_ENDPOINT` with
+    /// `svcmgr_errors::UNAUTHORIZED`. See `docs/capability-model.md`
+    /// "verb-bit authority pattern".
+    ///
+    /// Every process reads this slot and uses it (via the
+    /// `registry-client` crate) to resolve a service name to a SEND cap
+    /// on that service's endpoint. The publish-authority caps are held
+    /// by init, devmgr, and svcmgr itself — not by callers of this cap.
+    ///
+    /// This is the **only** service-discovery slot in `ProcessInfo`.
+    /// New services do not get their own dedicated slot; they are
+    /// resolved by name through this single handle. The deprecated
+    /// `log_send_cap` below predates this convention and will be
+    /// migrated to the same mechanism in a separate PR.
+    ///
+    /// Zero when no svcmgr is reachable (svcmgr itself, init, anything
+    /// before svcmgr exists). Consumers must tolerate zero.
+    pub service_registry_cap: u32,
+
     /// `CSpace` slot of the shmem frame cap backing `std::io::stdin`.
     ///
     /// One 4 KiB page laid out as `shmem::SpscHeader` followed by a
@@ -365,6 +388,12 @@ pub struct ProcessInfo
     /// suitable for direct `STREAM_BYTES` / `STREAM_REGISTER_NAME`
     /// use.
     ///
+    /// **Deprecated**: this slot predates the service registry and is
+    /// on a migration path to lookup via [`service_registry_cap`]. New
+    /// services MUST NOT add per-service fixed slots like this one;
+    /// the registry is the system-wide service-discovery channel from
+    /// this point forward. See follow-up issue tracking the migration.
+    ///
     /// Procmgr derives this cap per spawn via `cap_derive_token` on
     /// the log endpoint it holds, using the child's procmgr-assigned
     /// token as the cap's token. Logd sees the same token on every
@@ -453,6 +482,14 @@ pub struct StartupInfo
     /// Zero when unreachable (memmgr itself, init, or earlier in the boot
     /// chain).
     pub memmgr_endpoint: u32,
+
+    /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the
+    /// system-wide service-discovery handle. The cap's token lacks the
+    /// `svcmgr_labels::PUBLISH_AUTHORITY` verb-bit, so it answers
+    /// `QUERY_ENDPOINT` only. `registry-client::lookup(name)` issues
+    /// the QUERY against this cap. Zero when svcmgr is not reachable.
+    /// See `ProcessInfo::service_registry_cap` for the long form.
+    pub service_registry_cap: u32,
 
     /// `CSpace` slot of the stdin shmem frame cap. Zero when no input
     /// pipe is attached.

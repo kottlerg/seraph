@@ -161,15 +161,23 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
     unsafe { allocate_pages(bs, 1).ok() }
 }
 
-/// QEMU virt RISC-V PCI MMIO layout (ECAM, 32-bit window, 64-bit window).
+/// QEMU virt RISC-V default MMIO apertures: PCI ECAM + 32-bit + 64-bit
+/// PCI windows, plus the Goldfish RTC register page at `0x101000`.
 ///
-/// Seeded unconditionally so devmgr can mint a Frame covering the ECAM
-/// region even on firmware builds that publish ACPI without MCFG and
-/// don't expose the DTB via the UEFI configuration table. Merged with any
-/// MCFG-derived entries in [`crate::memory_map::derive_mmio_apertures`].
+/// Seeded unconditionally because EDK2 on the seraph boot path neither
+/// re-publishes the DTB via a UEFI configuration table nor emits ACPI
+/// entries for these regions, so neither
+/// [`crate::dtb::parse_aperture_seed`] nor MCFG / `_HID` walks can
+/// discover them at runtime. Merged with anything firmware does happen
+/// to publish in [`crate::memory_map::derive_mmio_apertures`].
+///
+/// The Goldfish RTC entry covers a single 4 KiB page; devmgr identifies
+/// it by base address (`0x101000` is part of the QEMU `virt` machine
+/// model contract) and spawns the `goldfish-rtc` driver on it.
 pub fn default_pci_apertures() -> &'static [(u64, u64)]
 {
     const ENTRIES: &[(u64, u64)] = &[
+        (0x10_1000, 0x1000),
         (0x3000_0000, 0x1000_0000),
         (0x4000_0000, 0x4000_0000),
         (0x4_0000_0000, 0x4_0000_0000),

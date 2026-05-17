@@ -73,6 +73,16 @@ pub struct StartupInfo {
     /// chain). `_start` consumes this to bootstrap the heap.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub memmgr_endpoint: u32,
+    /// Cap slot of a SEND cap on svcmgr's service endpoint, the
+    /// system-wide service-discovery handle. Carries only the per-process
+    /// token (no `PUBLISH_AUTHORITY` verb-bit) so it can answer
+    /// `svcmgr_labels::QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT`.
+    /// `_start` consumes this to install the cap into the
+    /// `registry-client` cache, so later `registry_client::lookup(name)`
+    /// calls resolve names to service caps. Zero if svcmgr is not
+    /// reachable.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub service_registry_cap: u32,
     /// Shmem frame cap backing `std::io::stdin`. Zero when no input
     /// pipe is attached; reads return `Ok(0)` (EOF).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -328,6 +338,7 @@ pub extern "C" fn _start() -> ! {
         self_cspace: info.self_cspace_cap,
         procmgr_endpoint: info.procmgr_endpoint_cap,
         memmgr_endpoint: info.memmgr_endpoint_cap,
+        service_registry_cap: info.service_registry_cap,
         stdin_frame_cap: info.stdin_frame_cap,
         stdout_frame_cap: info.stdout_frame_cap,
         stderr_frame_cap: info.stderr_frame_cap,
@@ -379,6 +390,12 @@ pub extern "C" fn _start() -> ! {
     // roundtrip. Zero is tolerated (the macro silently drops in
     // processes without a logger).
     ::log::install_tokened_cap(info.log_send_cap);
+
+    // Install the per-process svcmgr SEND cap into the registry-client
+    // cache. Zero is tolerated (processes spawned before svcmgr exists,
+    // or whose parent did not derive the cap, see lookups return
+    // `None`).
+    ::registry_client::install_registry_cap(info.service_registry_cap);
 
     // Stash the system-root namespace cap so `std::fs` (or any other
     // namespace-walking surface) can reach it. Zero passes through
@@ -694,6 +711,36 @@ pub mod log {
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn __emit(args: core::fmt::Arguments<'_>) {
         ::log::emit(current_ipc_buf(), args);
+    }
+}
+
+/// Service-registry client surface. Re-exports
+/// [`::registry_client::lookup`] against the std-built instance of
+/// registry-client — direct dependents would otherwise pull in their
+/// own compile of the crate and miss the `REGISTRY_CAP` static that
+/// `_start` installed.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod registry {
+    use super::current_ipc_buf;
+
+    /// Look up `name` in svcmgr's discovery registry. Returns
+    /// `Some(cap)` where the cap is a fresh SEND derived by svcmgr;
+    /// `None` on any failure.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn lookup(name: &[u8]) -> Option<u32> {
+        let buf = current_ipc_buf();
+        if buf.is_null() {
+            return None;
+        }
+        // SAFETY: current_ipc_buf returns the registered IPC buffer page.
+        unsafe { ::registry_client::lookup(name, buf) }
+    }
+
+    /// Return the installed registry cap, or zero if `_start` did not
+    /// seed one (e.g. process spawned before svcmgr existed).
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn registry_cap() -> u32 {
+        ::registry_client::registry_cap()
     }
 }
 

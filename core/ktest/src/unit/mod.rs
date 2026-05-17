@@ -396,6 +396,7 @@ pub fn run_all(ctx: &TestContext)
     run_test!("hw::mmio_map", hw::mmio_map(ctx));
     run_test!("hw::irq_register_ack", hw::irq_register_ack(ctx));
     run_test!("hw::ioport_bind", hw::ioport_bind(ctx));
+    run_test!("hw::ioport_split", hw::ioport_split(ctx));
 
     // ── System info syscalls ──────────────────────────────────────────────────
     run_test!("sysinfo::kernel_version", sysinfo::kernel_version(ctx));

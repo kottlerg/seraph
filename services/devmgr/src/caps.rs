@@ -69,6 +69,9 @@ pub mod kind
     pub const MODULE: u64 = 1;
     pub const APERTURE: u64 = 2;
     pub const ACPI_REGION: u64 = 3;
+    /// Round carrying svcmgr publish-authority cap + (x86) the root
+    /// `IoPortRange` cap copy. One-shot, always terminal.
+    pub const SVCMGR_BUNDLE: u64 = 4;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Mirrors
@@ -107,6 +110,16 @@ pub struct DevmgrCaps
     // Driver module caps.
     pub driver_module_slots: [u32; 8],
     pub driver_module_count: usize,
+
+    // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
+    // tokened on. devmgr uses this to publish driver service caps under
+    // well-known names (`rtc.primary`, `timed`) in the global registry.
+    pub svcmgr_publish_cap: u32,
+
+    // Copy of init's root `IoPortRange` cap (x86-64 only; zero on RISC-V).
+    // devmgr derives per-driver narrow copies for ISA peripherals
+    // (currently only the CMOS RTC at ports 0x70-0x71).
+    pub ioport_root_cap: u32,
 }
 
 impl DevmgrCaps
@@ -130,6 +143,8 @@ impl DevmgrCaps
             self_aspace: info.self_aspace,
             driver_module_slots: [0; 8],
             driver_module_count: 0,
+            svcmgr_publish_cap: 0,
+            ioport_root_cap: 0,
         }
     }
 }
@@ -205,6 +220,10 @@ fn absorb_aperture_round(
     let n = batch_count.min(round_cap_count).min(4);
     for (i, &slot) in round_caps.iter().take(n).enumerate()
     {
+        if slot == 0
+        {
+            continue;
+        }
         if caps.aperture_count >= caps.apertures.len()
         {
             break;
@@ -230,6 +249,10 @@ fn absorb_acpi_region_round(
     let n = batch_count.min(round_cap_count).min(4);
     for (i, &slot) in round_caps.iter().take(n).enumerate()
     {
+        if slot == 0
+        {
+            continue;
+        }
         if caps.acpi_region_count >= caps.acpi_regions.len()
         {
             break;
@@ -249,6 +272,10 @@ fn absorb_module_round(round_caps: &[u32], round_cap_count: usize, caps: &mut De
     let n = round_cap_count.min(4);
     for &slot in round_caps.iter().take(n)
     {
+        if slot == 0
+        {
+            continue;
+        }
         if caps.driver_module_count >= caps.driver_module_slots.len()
         {
             break;
@@ -277,6 +304,23 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
                 absorb_acpi_region_round(&round.caps, round.cap_count, &round.data, caps);
             }
             kind::MODULE => absorb_module_round(&round.caps, round.cap_count, caps),
+            kind::SVCMGR_BUNDLE =>
+            {
+                // caps[0] = svcmgr publish-authority cap (always present;
+                //           a zero slot indicates init's derive failed and
+                //           is treated as a bootstrap fatal).
+                // caps[1] = root IoPortRange copy (x86 only; absent on
+                //           RISC-V — sender simply omits the cap).
+                if round.cap_count < 1 || round.caps[0] == 0
+                {
+                    return None;
+                }
+                caps.svcmgr_publish_cap = round.caps[0];
+                if round.cap_count >= 2 && round.caps[1] != 0
+                {
+                    caps.ioport_root_cap = round.caps[1];
+                }
+            }
             _ =>
             {}
         }

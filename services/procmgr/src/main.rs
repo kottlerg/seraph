@@ -38,10 +38,17 @@ use std::os::seraph::startup_info;
 ///            Zero means no log endpoint is available yet; children
 ///            born in that window receive zero and silent-drop
 ///            `std::os::seraph::log!`.
+///   caps[2]: un-tokened SEND copy of svcmgr's service endpoint (the
+///            global service registry). Procmgr derives a tokened SEND
+///            per child for `ProcessInfo.service_registry_cap`; the
+///            child can `QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT`.
+///            Zero means no registry is available yet.
+#[allow(clippy::struct_field_names)]
 struct InitBootstrap
 {
     service_ep: u32,
     log_ep: u32,
+    registry_ep: u32,
 }
 
 fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstrap>
@@ -61,6 +68,14 @@ fn bootstrap_from_init(creator_ep: u32, ipc_buf: *mut u64) -> Option<InitBootstr
         log_ep: if round.cap_count >= 2
         {
             round.caps[1]
+        }
+        else
+        {
+            0
+        },
+        registry_ep: if round.cap_count >= 3
+        {
+            round.caps[2]
         }
         else
         {
@@ -128,6 +143,7 @@ fn main() -> !
         self_aspace,
         self_endpoint: boot.service_ep,
         log_ep: boot.log_ep,
+        registry_ep: boot.registry_ep,
         memmgr_ep: startup.memmgr_endpoint,
         death_eq,
         ws_cap,
@@ -814,6 +830,7 @@ fn handle_create(
         log_send_source: ctx.log_ep,
         memmgr_endpoint: memmgr_send,
         memmgr_token,
+        registry_send_source: ctx.registry_ep,
     };
 
     let result = process::create_process(
@@ -883,6 +900,14 @@ pub struct ProcmgrCtx
     /// born in that window receive zero and silent-drop
     /// `std::os::seraph::log!`.
     pub log_ep: u32,
+    /// Un-tokened SEND cap on svcmgr's service endpoint, received from init
+    /// during procmgr's own bootstrap. Used as the `cap_derive_token` source
+    /// for minting a per-child tokened SEND (token = the child's process
+    /// token), installed in the child's `ProcessInfo.service_registry_cap`
+    /// so the child can issue `svcmgr_labels::QUERY_ENDPOINT` against svcmgr
+    /// for service-name lookups. Zero if init has not yet wired it; children
+    /// born in that window receive zero and `registry_client::lookup` no-ops.
+    pub registry_ep: u32,
     /// Tokened SEND cap on memmgr's service endpoint, identifying procmgr.
     /// Used to mint per-child memmgr SENDs via `REGISTER_PROCESS`, to
     /// notify `PROCESS_DIED`, and as the destination for procmgr's own

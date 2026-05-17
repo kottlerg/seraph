@@ -599,7 +599,10 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         .join("shared/namespace-protocol")
         .canonicalize()
         .context("canonicalising shared/namespace-protocol")?;
-
+    let registry_client_path = project_root
+        .join("shared/registry-client")
+        .canonicalize()
+        .context("canonicalising shared/registry-client")?;
     let block = format!(
         "\n\
          # seraph-overlay: workspace ABI crates as std deps.\n\
@@ -614,7 +617,8 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
          log = {{ path = \"{log}\", features = [\"rustc-dep-of-std\"] }}\n\
          process-abi = {{ path = \"{proc}\", features = [\"rustc-dep-of-std\"] }}\n\
          shmem = {{ path = \"{shmem}\", features = [\"rustc-dep-of-std\"] }}\n\
-         namespace-protocol = {{ path = \"{ns}\", features = [\"rustc-dep-of-std\"] }}\n",
+         namespace-protocol = {{ path = \"{ns}\", features = [\"rustc-dep-of-std\"] }}\n\
+         registry-client = {{ path = \"{regcli}\", features = [\"rustc-dep-of-std\"] }}\n",
         abi = syscall_abi_path.display(),
         sys = syscall_path.display(),
         ipc = ipc_path.display(),
@@ -622,6 +626,7 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         proc = process_abi_path.display(),
         shmem = shmem_path.display(),
         ns = namespace_protocol_path.display(),
+        regcli = registry_client_path.display(),
     );
 
     let text = fs::read_to_string(&cargo_toml)
@@ -634,7 +639,12 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
     let has_log_dep = text.contains("log = { path");
     let has_shmem_dep = text.contains("shmem = { path");
     let has_namespace_protocol_dep = text.contains("namespace-protocol = { path");
-    if text.contains(marker) && has_log_dep && has_shmem_dep && has_namespace_protocol_dep
+    let has_registry_client_dep = text.contains("registry-client = { path");
+    if text.contains(marker)
+        && has_log_dep
+        && has_shmem_dep
+        && has_namespace_protocol_dep
+        && has_registry_client_dep
     {
         return Ok(());
     }

@@ -31,26 +31,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// What `link_or_copy` actually did, for logging / diagnostics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // kept for callers that want to log; not all do
-pub enum LinkKind
-{
-    /// Symbolic link from `dst` to `src`.
-    Symlink,
-    /// Hard link (shared inode) — file-only.
-    HardLink,
-    /// Independent physical copy. For dirs, recursive copy.
-    Copy,
-}
-
 /// Materialise `dst` to reference the same content as `src`. Tries
-/// symlink, then hard link (for files), then physical copy. Returns
-/// the kind that actually succeeded.
+/// symlink, then hard link (for files), then physical copy.
 ///
 /// `src` must exist; `dst` must not. The caller is responsible for
-/// removing any prior `dst`.
-pub fn link_or_copy(src: &Path, dst: &Path) -> Result<LinkKind>
+/// removing any prior `dst`. Failure of one fallback is silent; the
+/// only error surfaced is the final-fallback (`fs::copy` for files,
+/// recursive copy for dirs) failure, with the source path in
+/// context.
+pub fn link_or_copy(src: &Path, dst: &Path) -> Result<()>
 {
     let meta = fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
     if meta.file_type().is_dir()
@@ -64,31 +53,31 @@ pub fn link_or_copy(src: &Path, dst: &Path) -> Result<LinkKind>
 }
 
 /// File-level materialise: symlink → hard link → copy.
-fn link_or_copy_file(src: &Path, dst: &Path) -> Result<LinkKind>
+fn link_or_copy_file(src: &Path, dst: &Path) -> Result<()>
 {
     if try_symlink_file(src, dst).is_ok()
     {
-        return Ok(LinkKind::Symlink);
+        return Ok(());
     }
     if fs::hard_link(src, dst).is_ok()
     {
-        return Ok(LinkKind::HardLink);
+        return Ok(());
     }
     fs::copy(src, dst)
         .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
-    Ok(LinkKind::Copy)
+    Ok(())
 }
 
 /// Directory-level materialise: dir-symlink → recursive copy. There
 /// is no portable directory hard-link.
-fn link_or_copy_dir(src: &Path, dst: &Path) -> Result<LinkKind>
+fn link_or_copy_dir(src: &Path, dst: &Path) -> Result<()>
 {
     if try_symlink_dir(src, dst).is_ok()
     {
-        return Ok(LinkKind::Symlink);
+        return Ok(());
     }
     copy_dir_recursive(src, dst)?;
-    Ok(LinkKind::Copy)
+    Ok(())
 }
 
 /// Recursive directory copy. Used as the last-resort fallback for
@@ -205,11 +194,7 @@ mod tests
         let src = dir.join("src.txt");
         let dst = dir.join("dst.txt");
         fs::write(&src, b"hello world").unwrap();
-        let kind = link_or_copy(&src, &dst).unwrap();
-        assert!(matches!(
-            kind,
-            LinkKind::Symlink | LinkKind::HardLink | LinkKind::Copy
-        ));
+        link_or_copy(&src, &dst).unwrap();
         let bytes = fs::read(&dst).unwrap();
         assert_eq!(bytes, b"hello world");
         let _ = fs::remove_dir_all(&dir);
@@ -225,8 +210,7 @@ mod tests
         fs::write(src.join("a.txt"), b"one").unwrap();
         fs::create_dir(src.join("sub")).unwrap();
         fs::write(src.join("sub/b.txt"), b"two").unwrap();
-        let kind = link_or_copy(&src, &dst).unwrap();
-        assert!(matches!(kind, LinkKind::Symlink | LinkKind::Copy));
+        link_or_copy(&src, &dst).unwrap();
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"one");
         assert_eq!(fs::read(dst.join("sub/b.txt")).unwrap(), b"two");
         let _ = fs::remove_dir_all(&dir);

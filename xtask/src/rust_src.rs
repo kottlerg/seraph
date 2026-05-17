@@ -68,7 +68,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::context::Context as BuildContext;
 use crate::fs_compat::link_or_copy;
-use crate::util::{run_cmd, step};
+use crate::util::{require_tool, run_cmd, step};
 
 /// Substring placed in every patched source file for idempotency
 /// detection. Single marker per file suffices; atomic-per-file edits.
@@ -159,7 +159,7 @@ pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
             real_clippy.display()
         );
     }
-    install_wrappers(ctx, &real, &mirror).context("installing wrapper shim")?;
+    install_wrappers(ctx, &mirror).context("installing wrapper shim")?;
 
     let real_rustc = real
         .join("bin/rustc")
@@ -305,20 +305,28 @@ fn hard_link_tree(src: &Path, dst: &Path) -> Result<()>
         else if ft.is_symlink()
         {
             // Symlinks inside library/ are vanishingly rare in the
-            // shipped rust-src; if one appears, materialise it via
-            // `link_or_copy` (symlink on Unix, copy on Windows). The
-            // important invariant is that the file resolves to the
-            // same bytes — relative-target preservation isn't
-            // necessary for cargo's purposes.
+            // shipped rust-src today but are not formally forbidden.
+            // Files inside library/ MUST NOT appear as symlinks to
+            // upstream (cargo canonicalises source paths and would
+            // bypass the overlay) so we resolve and physically copy
+            // the linked content into the mirror — the same
+            // invariant the regular-file branch enforces. Hard-link
+            // is the natural choice but the symlink target may live
+            // on a different filesystem; fall through to copy if so.
             if dst_path.symlink_metadata().is_err()
             {
-                link_or_copy(&path, &dst_path).with_context(|| {
-                    format!(
-                        "materialising library/ symlink {} -> {}",
-                        dst_path.display(),
-                        path.display(),
-                    )
-                })?;
+                let target = fs::canonicalize(&path)
+                    .with_context(|| format!("resolving library/ symlink {}", path.display()))?;
+                if fs::hard_link(&target, &dst_path).is_err()
+                {
+                    fs::copy(&target, &dst_path).with_context(|| {
+                        format!(
+                            "copying library/ symlink target {} -> {}",
+                            target.display(),
+                            dst_path.display()
+                        )
+                    })?;
+                }
             }
         }
         else
@@ -492,10 +500,10 @@ const WRAPPER_NAMES: &[&str] = &["rustc", "ws-clippy"];
 /// works on every host with a native executable format. Wrapper
 /// behavior is parameterised via the `SERAPH_SHIM_*` env vars that
 /// `SeraphToolchain::apply_env` sets before invoking cargo.
-fn install_wrappers(ctx: &BuildContext, real: &Path, mirror: &Path) -> Result<()>
+fn install_wrappers(ctx: &BuildContext, mirror: &Path) -> Result<()>
 {
     let bin_dir = mirror.join("bin");
-    materialise_bin_dir(real, &bin_dir).context("materialising mirror bin/")?;
+    materialise_bin_dir(&bin_dir).context("materialising mirror bin/")?;
 
     let shim_binary = build_shim_binary(ctx)?;
     for &name in WRAPPER_NAMES
@@ -541,7 +549,8 @@ fn install_name_for(name: &str) -> String
 /// to the produced binary. cargo is a no-op when nothing changed.
 fn build_shim_binary(ctx: &BuildContext) -> Result<PathBuf>
 {
-    let mut cmd = Command::new("cargo");
+    let cargo = require_tool("cargo")?;
+    let mut cmd = Command::new(cargo);
     cmd.current_dir(&ctx.root)
         .arg("build")
         .arg("--release")
@@ -564,12 +573,12 @@ fn build_shim_binary(ctx: &BuildContext) -> Result<PathBuf>
     Ok(binary)
 }
 
-/// If `bin_dir` is currently a symlink to `real/bin/`, replace it
-/// with a real directory and populate it with mirror entries for
-/// every binary in `real/bin/` (so cargo's `rustc --print sysroot`
-/// path-resolution still finds the rest of the toolchain). If
-/// already a real directory, leave it alone.
-fn materialise_bin_dir(real: &Path, bin_dir: &Path) -> Result<()>
+/// If `bin_dir` is currently a symlink to the real toolchain's
+/// `bin/`, replace it with a real directory and populate it with
+/// mirror entries for every binary in the real `bin/` (so cargo's
+/// `rustc --print sysroot` path-resolution still finds the rest of
+/// the toolchain). If already a real directory, leave it alone.
+fn materialise_bin_dir(bin_dir: &Path) -> Result<()>
 {
     let is_symlink = bin_dir
         .symlink_metadata()
@@ -602,9 +611,6 @@ fn materialise_bin_dir(real: &Path, bin_dir: &Path) -> Result<()>
             )
         })?;
     }
-    // The real_bin path is needed only for the canonicalise+read_dir
-    // walk; nothing else references it after this function returns.
-    let _ = real;
     Ok(())
 }
 

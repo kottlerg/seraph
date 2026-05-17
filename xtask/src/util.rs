@@ -88,6 +88,10 @@ fn install_hint_for(name: &str) -> String
             macOS (Homebrew): brew install qemu\n  \
             FreeBSD:          pkg install qemu"
             .into(),
+        "cargo" => "Install rustup (https://rustup.rs/); xtask requires the toolchain pinned in \
+             rust-toolchain.toml. This usually means xtask itself was invoked outside a \
+             rustup-managed environment."
+            .into(),
         _ => format!("Install {name} via your distribution's package manager."),
     }
 }

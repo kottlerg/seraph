@@ -552,16 +552,16 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     cmd.arg("build").args(&flags_ref);
     if let Some(s) = seraph.as_ref()
     {
-        cmd.env("RUSTC", &s.rustc);
-        // StdUser bins sit on a custom target ("seraph") that rustc does not
-        // recognise in its built-in list, which makes the whole std surface
-        // `restricted_std`-gated. They also see `ProcessInfo`-derived
-        // helpers that feel "sysroot-private" when their backing crates
-        // (process-abi, syscall, ipc, shmem, log) get loaded as std deps.
-        // Setting RUSTC_BOOTSTRAP=1 for the build treats those gates as
-        // unlocked — matches how hermit and other tier-3 custom-std
-        // targets ship. Service code stays free of feature preambles.
-        cmd.env("RUSTC_BOOTSTRAP", "1");
+        // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
+        // sets the SERAPH_SHIM_* config (so the shim knows what to
+        // exec), and applies RUSTC_BOOTSTRAP=1. The latter unlocks
+        // `restricted_std`/`rustc_private` — StdUser bins target a
+        // custom triple ("seraph") that rustc doesn't recognise in
+        // its built-in list, and the std overlay loads workspace
+        // crates (process-abi, syscall, ipc, shmem, log) as std
+        // deps; matches how hermit and other tier-3 custom-std
+        // targets unlock the same gates.
+        s.apply_env(&mut cmd);
     }
     run_cmd(&mut cmd)?;
 

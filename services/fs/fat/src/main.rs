@@ -25,6 +25,7 @@
 #![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
+mod alloc;
 mod backend;
 mod bpb;
 mod cache;
@@ -163,6 +164,11 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
 
 /// Validate the BPB by reading sector 0 through the block cap. Updates
 /// `state` in place; returns the IPC reply label to use.
+///
+/// On a successful FAT32 parse, also loads the `FSInfo` sector (advisory
+/// next-free / free-count hints) so the cluster allocator can seed its
+/// scan; FAT16 and FAT32 without `FSInfo` leave the hints at the
+/// `u32::MAX` sentinel and the allocator scans from cluster 2.
 fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf: *mut u64) -> u64
 {
     let mut sector_buf = [0u8; SECTOR_SIZE];
@@ -174,6 +180,7 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
     {
         return ipc::fs_errors::NOT_FOUND;
     }
+    alloc::load_fsinfo(state, cache, caps.block_dev, ipc_buf);
     ipc::fs_errors::SUCCESS
 }
 

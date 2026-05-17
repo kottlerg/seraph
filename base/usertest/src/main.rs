@@ -1519,24 +1519,40 @@ fn fs_write_invariants_phase()
         let (cap_a, _) = fs_create(usertest, a, ipc_buf).expect("create inv_aa");
         let (cap_b, _) = fs_create(usertest, b, ipc_buf).expect("create inv_bb");
 
-        // Write to A; B must remain empty.
+        // Read through the original cap_b BEFORE any writes — under
+        // the old dedupe-on-(cluster, kind, size) bug both caps shared
+        // one NodeId, but the underlying FatNode still records the
+        // most recently inserted on-disk entry. Any subsequent FS_*
+        // call through either cap routes to the same NodeId. Writing
+        // through cap_a then reading through cap_b is the operational
+        // shape that would observe the aliasing.
         fs_write_inline(cap_a, 0, b"AAAA", ipc_buf).expect("write to inv_aa");
 
-        // Re-LOOKUP B and read 8 bytes; with the old dedupe-on-(cluster,
-        // kind, size) bug B aliased A and would return "AAAA".
-        let _ = syscall::cap_delete(cap_b);
+        // Read directly through the held cap_b (no re-LOOKUP that
+        // could refresh the dedupe state via a fresh insert). With
+        // the bug, cap_b's NodeId is the same as cap_a's after the
+        // most recent FS_CREATE, and FS_READ via that NodeId would
+        // walk inv_aa's cluster chain and surface "AAAA". With the
+        // fix, cap_b resolves to a distinct NodeId pointing at
+        // inv_bb's still-empty entry.
+        let r_b = fs_read_bytes(cap_b, 0, 8, ipc_buf).unwrap_or_default();
+        assert!(
+            r_b.is_empty() || r_b.iter().all(|&x| x == 0),
+            "inv_bb returned non-zero bytes through held cap after sibling write: {r_b:?}"
+        );
+
+        // Also verify via NS_LOOKUP that inv_bb's on-disk size hint
+        // is still zero — same-slot dedupe must not have updated
+        // inv_bb's `size` from inv_aa's growth.
         let (cap_b_fresh, _, b_size) =
             ns_lookup(usertest, b, 0xFFFF, ipc_buf).expect("lookup inv_bb");
-        assert_eq!(b_size, 0, "inv_bb was aliased to inv_aa's storage");
-
-        // Tolerate either an empty read (size=0) or a short reply.
-        let r = fs_read_bytes(cap_b_fresh, 0, 8, ipc_buf).unwrap_or_default();
-        assert!(
-            r.is_empty() || r.iter().all(|&x| x == 0),
-            "inv_bb returned non-zero bytes after sibling write: {r:?}"
+        assert_eq!(
+            b_size, 0,
+            "inv_bb on-disk size hint was perturbed by inv_aa write"
         );
 
         let _ = syscall::cap_delete(cap_a);
+        let _ = syscall::cap_delete(cap_b);
         let _ = syscall::cap_delete(cap_b_fresh);
         let _ = fs_remove(usertest, a, ipc_buf);
         let _ = fs_remove(usertest, b, ipc_buf);

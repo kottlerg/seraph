@@ -24,8 +24,9 @@ use crate::qemu::{
     validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
+use crate::term::guard::TerminalGuard;
 use crate::term::line_gate::LineGate;
-use crate::util::{TerminalGuard, step};
+use crate::util::step;
 
 /// Marker that opens the default-mode line gate. Emitted by the
 /// bootloader as the first line after firmware exits; everything

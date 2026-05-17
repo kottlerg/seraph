@@ -13,5 +13,6 @@
 //! makes the wiring contract obvious and unit-testable in isolation.
 
 pub mod filter;
+pub mod guard;
 pub mod line_gate;
 pub mod signal;

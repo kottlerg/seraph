@@ -22,6 +22,15 @@ regex = "1"
 # Portable SIGINT / Ctrl+C handler. Wraps signal(2) on Unix and
 # SetConsoleCtrlHandler on Windows behind a single set_handler call.
 ctrlc = "3"
+# Unix termios / ioctl bindings for TerminalGuard. Used unconditionally
+# because libc compiles cleanly on every platform xtask runs on, with
+# unused Unix-only items naturally elided on Windows builds.
+libc = "0.2"
+
+# Windows console-mode bindings for TerminalGuard. Only pulled in for
+# Windows builds; Linux/macOS/BSD builds skip this crate entirely.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 [lints]
 workspace = true

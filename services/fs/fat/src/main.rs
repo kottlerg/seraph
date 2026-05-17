@@ -1116,8 +1116,27 @@ fn handle_write_frame_node_cap(
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    if syscall::mem_map(src_cap, self_aspace, va, 0, 1, syscall_abi::MAP_READONLY).is_err()
+    // memmgr-issued frames carry RIGHTS_ALL (both WRITE and EXECUTE);
+    // mem_map with MAP_READONLY (= 0) on such a cap derives both w and
+    // x from the cap rights and trips the kernel's W^X check. Derive a
+    // sub-cap restricted to MAP_READ first; delete it after the unmap.
+    let Ok(restricted_cap) = syscall::cap_derive(src_cap, RIGHTS_MAP_READ)
+    else
     {
+        reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    };
+    if syscall::mem_map(
+        restricted_cap,
+        self_aspace,
+        va,
+        0,
+        1,
+        syscall_abi::MAP_READONLY,
+    )
+    .is_err()
+    {
+        let _ = syscall::cap_delete(restricted_cap);
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     }
@@ -1133,6 +1152,10 @@ fn handle_write_frame_node_cap(
         );
     }
     let _ = syscall::mem_unmap(self_aspace, va, 1);
+    // Drop the rights-restricted sub-cap we derived to satisfy W^X
+    // at mem_map. The original src_cap is unaffected and returns to
+    // the caller in the reply.
+    let _ = syscall::cap_delete(restricted_cap);
 
     let (new_cluster, new_size) = match write_file_bytes(
         node.cluster,

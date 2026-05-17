@@ -3,12 +3,14 @@
 
 //! qemu.rs
 //!
-//! Shared QEMU argv construction and firmware preparation.
+//! Shared QEMU argv construction and per-launch pflash cache for RISC-V.
 //!
 //! Both `run` and `run-parallel` produce QEMU command lines from the same
-//! source of truth (`build_qemu_argv`) and resolve firmware via the same
-//! helpers (`find_ovmf_code`, `prepare_riscv_firmware`). The interactive
-//! launch loop (stdout filtering, terminal restore) stays in
+//! source of truth (`build_qemu_argv`). Firmware discovery lives in
+//! `firmware::{find_ovmf_code, find_riscv_firmware}`; the padding +
+//! caching of RISC-V pflash images stays here in `prepare_riscv_firmware`.
+//! Acceleration-backend selection lives in `accel::detect_for_arch`. The
+//! interactive launch loop (stdout filtering, terminal restore) stays in
 //! `commands/run.rs`; `run-parallel` spawns QEMU directly against per-slot
 //! log files.
 
@@ -17,25 +19,11 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 
+use crate::accel::{self, Accel};
 use crate::arch::Arch;
 use crate::context::Context;
+use crate::firmware;
 use crate::sysroot;
-
-/// OVMF firmware search paths (Fedora, Debian/Ubuntu, Arch).
-const OVMF_CODE_PATHS: &[&str] = &[
-    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-    "/usr/share/OVMF/OVMF_CODE.fd",
-    "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
-    "/usr/share/ovmf/OVMF.fd",
-    "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
-];
-
-/// edk2 RISC-V firmware search directories.
-const EDK2_RISCV_DIRS: &[&str] = &[
-    "/usr/share/edk2/riscv",
-    "/usr/share/edk2-riscv",
-    "/usr/share/qemu-efi-riscv64",
-];
 
 /// QEMU virt machine requires pflash images to be exactly 32 MiB.
 const PFLASH_SIZE: u64 = 32 * 1024 * 1024;
@@ -89,42 +77,69 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Vec<String>
         args.extend(["-s".into(), "-S".into()]);
     }
 
+    let accel = accel::detect_for_arch(spec.arch);
     match spec.arch
     {
-        Arch::X86_64 => extend_x86(&mut args, spec),
+        Arch::X86_64 => extend_x86(&mut args, spec, accel),
         Arch::Riscv64 => extend_riscv(&mut args, spec),
     }
 
     args
 }
 
-fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec)
+fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
 {
     args.extend(["-machine".into(), "q35".into()]);
 
-    // Existence is insufficient: GitHub `ubuntu-latest` x86 runners expose
-    // /dev/kvm for nested virt, but the runner user is not in the `kvm`
-    // group, so `open(O_RDWR)` returns EACCES and QEMU exits immediately.
-    // Probe the same way QEMU itself does, then fall through to TCG when
-    // the device cannot actually be used.
-    if kvm_usable()
+    match accel
     {
-        // -cpu host inherits the development host's microarchitecture; the
-        // kernel asserts x86-64-v3 in early init, so the host must advertise
-        // AVX2/BMI2/FMA (Haswell+ / Excavator+).
-        args.extend(["-enable-kvm".into(), "-cpu".into(), "host".into()]);
-    }
-    else
-    {
-        // TCG fallback: `-cpu max,migratable=no` advertises every feature
-        // QEMU can emulate (including x86-64-v3) so userspace SIMD codegen
-        // executes correctly under non-KVM runs (CI, KVM-less containers).
-        args.extend([
-            "-accel".into(),
-            "tcg,thread=multi".into(),
-            "-cpu".into(),
-            "max,migratable=no".into(),
-        ]);
+        Accel::Kvm =>
+        {
+            // -cpu host inherits the development host's microarchitecture;
+            // the kernel asserts x86-64-v3 in early init, so the host must
+            // advertise AVX2/BMI2/FMA (Haswell+ / Excavator+).
+            args.extend(["-enable-kvm".into(), "-cpu".into(), "host".into()]);
+        }
+        Accel::Hvf =>
+        {
+            // macOS Hypervisor.framework. Same -cpu host rationale as KVM;
+            // HVF passes host features through to the guest natively.
+            args.extend(["-accel".into(), "hvf".into(), "-cpu".into(), "host".into()]);
+        }
+        Accel::Whpx =>
+        {
+            // Windows Hyper-V Platform. WHPX does not expose -cpu host the
+            // same way KVM/HVF do; -cpu max,migratable=no is the documented
+            // QEMU recipe and exposes the same x86-64-v3 baseline TCG does.
+            args.extend([
+                "-accel".into(),
+                "whpx".into(),
+                "-cpu".into(),
+                "max,migratable=no".into(),
+            ]);
+        }
+        Accel::Nvmm =>
+        {
+            args.extend([
+                "-accel".into(),
+                "nvmm".into(),
+                "-cpu".into(),
+                "max,migratable=no".into(),
+            ]);
+        }
+        Accel::Tcg =>
+        {
+            // TCG fallback: `-cpu max,migratable=no` advertises every
+            // feature QEMU can emulate (including x86-64-v3) so userspace
+            // SIMD codegen executes correctly under non-KVM runs (CI,
+            // KVM-less containers).
+            args.extend([
+                "-accel".into(),
+                "tcg,thread=multi".into(),
+                "-cpu".into(),
+                "max,migratable=no".into(),
+            ]);
+        }
     }
 
     args.extend([
@@ -195,41 +210,6 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
     }
 }
 
-/// Returns true if `/dev/kvm` can be opened for read+write by the current
-/// process. Existence alone is misleading on environments that expose the
-/// node without granting the calling user access (e.g. GitHub-hosted
-/// runners). Setting `SERAPH_NO_KVM=1` forces the TCG path regardless,
-/// for local reproduction of the no-KVM CI environment.
-fn kvm_usable() -> bool
-{
-    if std::env::var_os("SERAPH_NO_KVM").is_some()
-    {
-        return false;
-    }
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
-}
-
-/// Locate the OVMF code image, returning the first installed path.
-pub fn find_ovmf_code() -> Result<PathBuf>
-{
-    OVMF_CODE_PATHS
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "OVMF firmware not found\n\
-                 Install with: dnf install edk2-ovmf  (Fedora)\n\
-                 or:           apt install ovmf        (Debian/Ubuntu)\n\
-                 or:           pacman -S edk2-ovmf     (Arch Linux)"
-            )
-        })
-}
-
 /// Resolve and cache riscv64 firmware.
 ///
 /// Returns `(code_path, vars_template_path)`:
@@ -240,29 +220,14 @@ pub fn find_ovmf_code() -> Result<PathBuf>
 ///   on every call. `run` uses this path directly as the writable pflash;
 ///   `run-parallel` copies it to per-slot VARS.fd files so concurrent QEMUs
 ///   don't race on the same NVRAM image.
+///
+/// Source discovery is delegated to `firmware::find_riscv_firmware`,
+/// which is env-var-first and per-`cfg(target_os)` aware. This function
+/// owns only the padding/caching that QEMU's `virt` machine requires
+/// (exactly 32 MiB pflash images).
 pub fn prepare_riscv_firmware(ctx: &Context) -> Result<(PathBuf, PathBuf)>
 {
-    let firmware_dir = EDK2_RISCV_DIRS
-        .iter()
-        .find(|d| Path::new(d).join("RISCV_VIRT_CODE.fd").exists())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "edk2 RISC-V firmware not found\n\
-                 Install with: dnf install edk2-riscv64          (Fedora)\n\
-                 or:           apt install qemu-efi-riscv64       (Debian/Ubuntu)\n\
-                 or on Arch:   download the Fedora edk2-riscv64 RPM and extract\n\
-                               RISCV_VIRT_CODE.fd + RISCV_VIRT_VARS.fd into /usr/share/edk2/riscv/"
-            )
-        })?;
-
-    let base = Path::new(firmware_dir);
-    let src_code = base.join("RISCV_VIRT_CODE.fd");
-    let src_vars = base.join("RISCV_VIRT_VARS.fd");
-
-    if !src_vars.exists()
-    {
-        bail!("RISC-V NVRAM template not found: {}", src_vars.display());
-    }
+    let (src_code, src_vars) = firmware::find_riscv_firmware()?;
 
     let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
     std::fs::create_dir_all(&cache_dir)

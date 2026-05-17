@@ -720,12 +720,12 @@ fn populate_child_info(
         0
     };
 
-    // Mirror of the log_send derivation, for the system-wide service-discovery
-    // handle (svcmgr's QUERY_ENDPOINT). The token == child's process token
-    // serves as the unforgeable caller identity in svcmgr's per-process
-    // accounting; publish-authority gating on the same endpoint is a
-    // follow-up (see PR description) — until then, any holder of this cap
-    // can also call PUBLISH_ENDPOINT on svcmgr.
+    // Mirror of the log_send derivation, for the system-wide service-
+    // discovery handle. The token carries only the child's process token
+    // — without `svcmgr_labels::PUBLISH_AUTHORITY` — so the cap answers
+    // QUERY_ENDPOINT only; svcmgr rejects PUBLISH_ENDPOINT calls whose
+    // token lacks the verb-bit with `UNAUTHORIZED`. See
+    // `docs/capability-model.md` "verb-bit authority pattern".
     let registry_send_in_child = if universals.registry_send_source != 0
     {
         let proc_side = syscall::cap_derive_token(

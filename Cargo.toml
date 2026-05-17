@@ -30,6 +30,7 @@ members = [
     "shared/ipc",
     "shared/log",
     "shared/registry",
+    "shared/registry-client",
     "shared/shmem",
     "base/crasher",
     "base/fsbench",

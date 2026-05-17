@@ -402,10 +402,9 @@ pub fn create_devmgr_with_caps(
         return;
     }
 
-    // Helper: does any content remain after this point?
+    // SVCMGR_BUNDLE is unconditionally the terminal round; every prior
+    // round therefore sets `done=false` regardless of what follows.
     let has_module = info.module_frame_count > 3;
-    let remaining_apertures = hw.aperture_count > 0;
-    let remaining_acpi = hw.acpi_region_count > 0;
 
     // ── Aperture rounds ─────────────────────────────────────────────────
     let mut idx = 0;
@@ -428,22 +427,15 @@ pub fn create_devmgr_with_caps(
             data[3 + j * 2] = size;
         }
 
-        let is_last = batch_end == hw.aperture_count;
-        let done_here = is_last && !remaining_acpi && !has_module;
-
         if !serve(
             bootstrap_ep,
             child_token,
             ipc_buf,
-            done_here,
+            false,
             &caps[..batch_count],
             &data[..2 + batch_count * 2],
             "devmgr: bootstrap aperture round failed",
         )
-        {
-            return;
-        }
-        if done_here
         {
             return;
         }
@@ -471,14 +463,11 @@ pub fn create_devmgr_with_caps(
             data[3 + j * 2] = size;
         }
 
-        let is_last = batch_end == hw.acpi_region_count;
-        let done_here = is_last && !has_module;
-
         if !serve(
             bootstrap_ep,
             child_token,
             ipc_buf,
-            done_here,
+            false,
             &caps[..batch_count],
             &data[..2 + batch_count * 2],
             "devmgr: bootstrap ACPI region round failed",
@@ -486,16 +475,10 @@ pub fn create_devmgr_with_caps(
         {
             return;
         }
-        if done_here
-        {
-            return;
-        }
         idx = batch_end;
     }
 
     // ── Module round (virtio-blk = module 3) ────────────────────────────
-    let _ = remaining_apertures;
-    let _ = remaining_acpi;
     if has_module
     {
         let module_cap = info.module_frame_base + 3;
@@ -523,23 +506,26 @@ pub fn create_devmgr_with_caps(
     // ── Terminal SVCMGR_BUNDLE round ────────────────────────────────────
     //
     // caps: [svcmgr_publish_cap, ioport_root_cap (x86 only)]. The
-    // PUBLISH_AUTHORITY-tokened SEND lets devmgr register
-    // `rtc.primary` and `timed` in svcmgr's registry. The
-    // IoPortRange copy is non-zero only on x86-64 (RISC-V has no
-    // I/O ports); devmgr derives narrow per-driver IoPort caps from
-    // it for ISA peripherals like the CMOS RTC.
-    let svcmgr_publish = if svcmgr_service_ep != 0
+    // SEND-rights cap on svcmgr's service endpoint is stamped with the
+    // PUBLISH_AUTHORITY verb-bit in its token so devmgr can register
+    // `rtc.primary` and `timed` in svcmgr's registry. The IoPortRange
+    // copy is delivered only on x86-64 (RISC-V has no I/O ports);
+    // devmgr derives narrow per-driver IoPort caps from it for ISA
+    // peripherals like the CMOS RTC.
+    if svcmgr_service_ep == 0
     {
-        syscall::cap_derive_token(
-            svcmgr_service_ep,
-            syscall::RIGHTS_SEND,
-            ipc::svcmgr_labels::PUBLISH_AUTHORITY,
-        )
-        .unwrap_or(0)
+        log("devmgr: SVCMGR_BUNDLE skipped — no svcmgr service endpoint");
+        return;
     }
+    let Ok(svcmgr_publish) = syscall::cap_derive_token(
+        svcmgr_service_ep,
+        syscall::RIGHTS_SEND,
+        ipc::svcmgr_labels::PUBLISH_AUTHORITY,
+    )
     else
     {
-        0
+        log("devmgr: PUBLISH_AUTHORITY cap derive failed");
+        return;
     };
 
     let ioport_root_cap = if cfg!(target_arch = "x86_64")

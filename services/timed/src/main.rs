@@ -14,7 +14,7 @@
 #![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
-use ipc::{IpcMessage, rtc_errors, rtc_labels, svcmgr_labels, timed_errors, timed_labels};
+use ipc::{IpcMessage, rtc_errors, rtc_labels, timed_errors, timed_labels};
 use std::os::seraph::startup_info;
 use syscall_abi::SystemInfoType;
 
@@ -33,53 +33,6 @@ fn bootstrap_service_ep(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<u32>
         return None;
     }
     Some(round.caps[0])
-}
-
-// ── Service registry lookup ────────────────────────────────────────────────
-
-/// Maximum service-registry name length (must match svcmgr's `NAME_MAX`).
-/// Constant rather than imported to keep timed independent of svcmgr's
-/// internal crates; svcmgr enforces the bound on `PUBLISH_ENDPOINT` and
-/// rejects oversized lookup names with `INVALID_NAME`.
-const NAME_MAX: usize = 64;
-
-/// Pack a `name` into `out` as little-endian bytes within u64 words and
-/// return the number of words used. `name.len()` must be `<= NAME_MAX`.
-fn pack_name(name: &[u8], out: &mut [u64; NAME_MAX / 8]) -> usize
-{
-    for (i, &b) in name.iter().enumerate()
-    {
-        out[i / 8] |= u64::from(b) << ((i % 8) * 8);
-    }
-    name.len().div_ceil(8)
-}
-
-/// Look up `name` in svcmgr's registry. Returns a SEND cap on success.
-fn registry_lookup(registry_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Option<u32>
-{
-    if registry_cap == 0 || name.is_empty() || name.len() > NAME_MAX
-    {
-        return None;
-    }
-
-    let mut words = [0u64; NAME_MAX / 8];
-    let word_count = pack_name(name, &mut words);
-
-    let mut builder =
-        IpcMessage::builder(svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16));
-    for (i, &w) in words.iter().take(word_count).enumerate()
-    {
-        builder = builder.word(i, w);
-    }
-    let request = builder.build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(registry_cap, &request, ipc_buf) }.ok()?;
-    if reply.label != ipc::svcmgr_errors::SUCCESS
-    {
-        return None;
-    }
-    reply.caps().first().copied().filter(|&c| c != 0)
 }
 
 // ── RTC query ──────────────────────────────────────────────────────────────
@@ -153,9 +106,10 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, offset: Option<u64>) -> !
 /// Look up `rtc.primary` and compute the wall-clock offset. Returns
 /// `None` if any step fails (no registry, no RTC, RTC read error); the
 /// service then runs in `WALL_CLOCK_UNAVAILABLE` mode.
-fn compute_offset(registry_cap: u32, ipc_buf: *mut u64) -> Option<u64>
+fn compute_offset(ipc_buf: *mut u64) -> Option<u64>
 {
-    let rtc_cap = registry_lookup(registry_cap, b"rtc.primary", ipc_buf)?;
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let rtc_cap = unsafe { registry_client::lookup(b"rtc.primary", ipc_buf) }?;
     let rtc_us = query_rtc(rtc_cap, ipc_buf);
     let _ = syscall::cap_delete(rtc_cap);
     let rtc_us = rtc_us?;
@@ -178,7 +132,9 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    let offset = compute_offset(info.service_registry_cap, ipc_buf);
+    // std's `_start` already installed the per-process registry cap into
+    // registry-client; just query.
+    let offset = compute_offset(ipc_buf);
 
     service_loop(service_ep, ipc_buf, offset);
 }

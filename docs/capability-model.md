@@ -266,6 +266,36 @@ of the token bits.
   (sentinel `1`) for the negative-test path. Even the deny-test cap is tokened,
   preventing the test recipient from re-deriving a privileged twin.
 
+### Verb-bit authority pattern
+
+Some endpoints serve a mix of unprivileged read-style verbs (e.g.
+`QUERY_ENDPOINT`) and privileged mutate-style verbs (e.g.
+`PUBLISH_ENDPOINT`). Rather than splitting them across two endpoints
+(and two separate `service_*_cap` slots in `ProcessInfo`), Seraph uses
+a single endpoint and lets the server gate per-label on a **verb-bit**
+in the caller's token.
+
+Each privileged verb reserves one high bit of the u64 token namespace
+as its authority marker (`1u64 << 63` is the convention for the
+endpoint's first verb-bit). The set-once token rules above mean:
+
+- The server holds the un-tokened source cap. It is the only entity
+  that can mint a token with the verb-bit set.
+- Distribution of a "publish authority" cap and a "query-only" cap
+  differ only in whether the trusted distributor ORs the verb-bit into
+  the per-process token before calling `cap_derive_token`.
+- A holder of a query-only cap **cannot** re-derive an authority cap:
+  set-once rules forbid changing the token, and re-deriving from the
+  un-tokened source requires a source the caller doesn't have.
+- The server's dispatcher checks `msg.token & VERB_BIT != 0` before
+  servicing the privileged label and replies `UNAUTHORIZED` otherwise
+  (`svcmgr_labels::PUBLISH_AUTHORITY`, `pwrmgr_labels::SHUTDOWN_AUTHORITY`).
+
+This collapses what would otherwise be one `ProcessInfo` slot per
+server-verb pairing into one slot per server endpoint, and keeps the
+authority/distribution decisions local to the trusted minter (init at
+boot, devmgr/svcmgr post-handover) without adding new kernel surface.
+
 ---
 
 ## Capabilities as Namespaces

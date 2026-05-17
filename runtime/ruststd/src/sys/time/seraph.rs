@@ -3,18 +3,19 @@
 // `Instant` reads the kernel's microsecond-granularity elapsed counter via
 // `SYS_SYSTEM_INFO(SystemInfoType::ElapsedUs)` (see `abi/syscall/src/lib.rs`).
 // `SystemTime::now()` discovers the `timed` service via the per-process
-// `service_registry_cap` installed by procmgr at spawn, calls
-// `timed_labels::GET_WALL_TIME`, and returns the reply as a Duration since
-// the Unix epoch. The discovered cap is cached for the rest of the process
-// lifetime in a process-global atomic; subsequent calls skip the lookup.
-// On registry-miss (no `timed` registered) or any IPC failure, `now()`
-// returns `UNIX_EPOCH` — the documented degraded-mode behaviour matching
+// `service_registry_cap` (installed by `_start` from `ProcessInfo` into
+// `registry_client::REGISTRY_CAP`), calls `timed_labels::GET_WALL_TIME`,
+// and returns the reply as a Duration since the Unix epoch. The discovered
+// cap is cached for the rest of the process lifetime in a process-global
+// atomic; subsequent calls skip the lookup. On registry-miss (no `timed`
+// registered) or any IPC failure, `now()` returns `UNIX_EPOCH` — the
+// documented degraded-mode behaviour matching
 // `timed_errors::WALL_CLOCK_UNAVAILABLE`.
 
 use crate::time::Duration;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use ipc::{IpcMessage, svcmgr_labels, timed_errors, timed_labels};
+use ipc::{IpcMessage, timed_errors, timed_labels};
 use syscall_abi::SystemInfoType;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -26,51 +27,51 @@ pub struct SystemTime(Duration);
 pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
 
 /// Cached SEND cap on `timed`'s service endpoint. Zero means "not yet
-/// resolved"; any non-zero value is a valid slot in this process's CSpace
-/// for the rest of its lifetime.
+/// resolved or resolution failed"; any non-zero value is a valid slot in
+/// this process's CSpace for the rest of its lifetime.
 static TIMED_CAP: AtomicU32 = AtomicU32::new(0);
-/// Set once the first `now()` call has attempted resolution, regardless
-/// of success. Prevents repeated registry hits when `timed` is absent.
+
+/// Resolution state machine for `TIMED_CAP`:
+/// `0` = untried, `1` = resolving (some thread is doing the registry
+/// lookup), `2` = resolved (success or terminal failure; readers should
+/// load `TIMED_CAP` and accept it as final).
 static TIMED_RESOLVED: AtomicU32 = AtomicU32::new(0);
 
-/// Maximum service-registry name length (must match svcmgr's `NAME_MAX`).
-const REGISTRY_NAME_MAX: usize = 64;
-
-/// Pack `name` little-endian-by-byte into u64 words; returns word count.
-fn pack_name(name: &[u8], out: &mut [u64; REGISTRY_NAME_MAX / 8]) -> usize {
-    for (i, &b) in name.iter().enumerate() {
-        out[i / 8] |= u64::from(b) << ((i % 8) * 8);
+/// Resolve `timed` exactly once per process, even under concurrent
+/// `SystemTime::now()` calls. Returns zero on failure.
+fn timed_cap_once(ipc_buf: *mut u64) -> u32
+{
+    let c = TIMED_CAP.load(Ordering::Acquire);
+    if c != 0
+    {
+        return c;
     }
-    name.len().div_ceil(8)
-}
-
-/// Resolve `timed` via the per-process svcmgr cap. Returns zero on any
-/// failure (no registry cap, lookup miss, IPC error).
-fn lookup_timed(ipc_buf: *mut u64) -> u32 {
-    let registry_cap = crate::os::seraph::startup_info().service_registry_cap;
-    let name: &[u8] = b"timed";
-    if registry_cap == 0 || name.is_empty() || name.len() > REGISTRY_NAME_MAX {
-        return 0;
+    loop
+    {
+        match TIMED_RESOLVED.compare_exchange(
+            0,
+            1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        {
+            Ok(_) =>
+            {
+                // We claimed the resolution duty.
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let resolved = unsafe { registry_client::lookup(b"timed", ipc_buf) }.unwrap_or(0);
+                if resolved != 0
+                {
+                    TIMED_CAP.store(resolved, Ordering::Release);
+                }
+                TIMED_RESOLVED.store(2, Ordering::Release);
+                return resolved;
+            }
+            Err(2) => return TIMED_CAP.load(Ordering::Acquire),
+            // 1 means another thread is resolving; spin briefly.
+            Err(_) => core::hint::spin_loop(),
+        }
     }
-
-    let mut words = [0u64; REGISTRY_NAME_MAX / 8];
-    let word_count = pack_name(name, &mut words);
-
-    let mut builder =
-        IpcMessage::builder(svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16));
-    for (i, &w) in words.iter().take(word_count).enumerate() {
-        builder = builder.word(i, w);
-    }
-    let request = builder.build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer page for this thread.
-    let Ok(reply) = (unsafe { ipc::ipc_call(registry_cap, &request, ipc_buf) }) else {
-        return 0;
-    };
-    if reply.label != ipc::svcmgr_errors::SUCCESS {
-        return 0;
-    }
-    reply.caps().first().copied().filter(|&c| c != 0).unwrap_or(0)
 }
 
 impl Instant {
@@ -106,17 +107,7 @@ impl SystemTime {
             return UNIX_EPOCH;
         }
 
-        let cap = match TIMED_CAP.load(Ordering::Acquire) {
-            0 if TIMED_RESOLVED.load(Ordering::Acquire) == 0 => {
-                let resolved = lookup_timed(ipc_buf);
-                if resolved != 0 {
-                    TIMED_CAP.store(resolved, Ordering::Release);
-                }
-                TIMED_RESOLVED.store(1, Ordering::Release);
-                resolved
-            }
-            c => c,
-        };
+        let cap = timed_cap_once(ipc_buf);
         if cap == 0 {
             return UNIX_EPOCH;
         }

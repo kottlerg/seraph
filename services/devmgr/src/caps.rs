@@ -294,14 +294,17 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
             kind::MODULE => absorb_module_round(&round.caps, round.cap_count, caps),
             kind::SVCMGR_BUNDLE =>
             {
-                // caps[0] = svcmgr publish-authority cap (always present).
+                // caps[0] = svcmgr publish-authority cap (always present;
+                //           a zero slot indicates init's derive failed and
+                //           is treated as a bootstrap fatal).
                 // caps[1] = root IoPortRange copy (x86 only; absent on
                 //           RISC-V — sender simply omits the cap).
-                if round.cap_count >= 1
+                if round.cap_count < 1 || round.caps[0] == 0
                 {
-                    caps.svcmgr_publish_cap = round.caps[0];
+                    return None;
                 }
-                if round.cap_count >= 2
+                caps.svcmgr_publish_cap = round.caps[0];
+                if round.cap_count >= 2 && round.caps[1] != 0
                 {
                     caps.ioport_root_cap = round.caps[1];
                 }

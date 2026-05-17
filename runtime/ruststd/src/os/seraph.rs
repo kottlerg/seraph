@@ -73,12 +73,14 @@ pub struct StartupInfo {
     /// chain). `_start` consumes this to bootstrap the heap.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub memmgr_endpoint: u32,
-    /// Cap slot of a tokened SEND cap on svcmgr (QUERY-only attenuation),
-    /// the system-wide service-discovery handle. `_start` consumes this
-    /// to install the registry cap into the registry-client cache, so
-    /// later `registry_client::lookup(name, ..)` calls resolve names to
-    /// service caps via `svcmgr_labels::QUERY_ENDPOINT`. Zero if svcmgr
-    /// is not reachable.
+    /// Cap slot of a SEND cap on svcmgr's service endpoint, the
+    /// system-wide service-discovery handle. Carries only the per-process
+    /// token (no `PUBLISH_AUTHORITY` verb-bit) so it can answer
+    /// `svcmgr_labels::QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT`.
+    /// `_start` consumes this to install the cap into the
+    /// `registry-client` cache, so later `registry_client::lookup(name)`
+    /// calls resolve names to service caps. Zero if svcmgr is not
+    /// reachable.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub service_registry_cap: u32,
     /// Shmem frame cap backing `std::io::stdin`. Zero when no input
@@ -388,6 +390,12 @@ pub extern "C" fn _start() -> ! {
     // roundtrip. Zero is tolerated (the macro silently drops in
     // processes without a logger).
     ::log::install_tokened_cap(info.log_send_cap);
+
+    // Install the per-process svcmgr SEND cap into the registry-client
+    // cache. Zero is tolerated (processes spawned before svcmgr exists,
+    // or whose parent did not derive the cap, see lookups return
+    // `None`).
+    ::registry_client::install_registry_cap(info.service_registry_cap);
 
     // Stash the system-root namespace cap so `std::fs` (or any other
     // namespace-walking surface) can reach it. Zero passes through

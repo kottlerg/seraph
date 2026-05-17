@@ -413,15 +413,18 @@ pub mod svcmgr_labels
     /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
     pub const QUERY_ENDPOINT: u64 = 4;
 
-    /// Verb-bit set in the caller's token to authorise
-    /// [`PUBLISH_ENDPOINT`]. Init derives `PUBLISH_AUTHORITY`-tokened SEND
-    /// caps on svcmgr's service endpoint for the small set of holders
-    /// trusted to add names to the global registry (init itself, devmgr
-    /// for driver registrations, svcmgr for future post-init service
-    /// launches). The un-tokened SEND distributed to every process via
-    /// `ProcessInfo.service_registry_cap` lacks this bit and serves
+    /// Verb-bit `OR`-ed into the caller's token to authorise
+    /// [`PUBLISH_ENDPOINT`]. Init derives SEND caps on svcmgr's service
+    /// endpoint with this bit `OR`-ed into the per-process token for the
+    /// small set of holders trusted to add names to the global registry
+    /// (init itself, devmgr for driver registrations, svcmgr for future
+    /// post-init service launches). The SEND distributed to every
+    /// process via `ProcessInfo.service_registry_cap` carries only the
+    /// per-process token — without this verb-bit — and is accepted on
     /// `QUERY_ENDPOINT` only; svcmgr rejects publish attempts from
-    /// un-authorised callers with [`svcmgr_errors::UNAUTHORIZED`].
+    /// un-authorised callers with [`svcmgr_errors::UNAUTHORIZED`]. See
+    /// `docs/capability-model.md` "verb-bit authority pattern" for the
+    /// rationale and parallel use in `pwrmgr_labels::SHUTDOWN_AUTHORITY`.
     pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
 }
 
@@ -1047,15 +1050,20 @@ pub mod svcmgr_errors
     pub const UNKNOWN_NAME: u64 = 5;
     /// Discovery registry publish: table full or duplicate name.
     pub const REGISTER_REJECTED: u64 = 6;
-    /// Caller's token lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
-    /// `PUBLISH_ENDPOINT` request.
-    pub const UNAUTHORIZED: u64 = 8;
     /// Caller's compiled `SVCMGR_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_SERVICE` is the handshake entry point and carries the
     /// caller's version as `data[0]` (with all other words shifted by +1);
     /// mismatch here means the caller was built against a different
     /// revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
+    /// Caller's token lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
+    /// `PUBLISH_ENDPOINT` request.
+    pub const UNAUTHORIZED: u64 = 8;
+    /// Client-side: the underlying `ipc_call` returned `Err` (no reply
+    /// from svcmgr, transport-level failure). Never emitted by svcmgr
+    /// itself — synthesised by `registry-client` to give callers a
+    /// uniform status surface.
+    pub const IPC_FAILED: u64 = 9;
     /// Unknown opcode on svcmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

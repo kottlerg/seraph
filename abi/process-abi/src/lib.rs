@@ -245,16 +245,18 @@ pub struct ProcessInfo
     /// before memmgr exists). Consumers must tolerate zero.
     pub memmgr_endpoint_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on svcmgr's service endpoint,
-    /// attenuated to QUERY-only rights for use as the system-wide
-    /// service-discovery handle.
+    /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, used
+    /// as the system-wide service-discovery handle. The cap's token
+    /// carries only the child's per-process token — without the
+    /// `svcmgr_labels::PUBLISH_AUTHORITY` verb-bit — so svcmgr accepts
+    /// `QUERY_ENDPOINT` from it but rejects `PUBLISH_ENDPOINT` with
+    /// `svcmgr_errors::UNAUTHORIZED`. See `docs/capability-model.md`
+    /// "verb-bit authority pattern".
     ///
-    /// Every process reads this slot and uses it (via
-    /// `shared/registry-client::lookup`) to resolve a service name to a
-    /// SEND cap on that service's endpoint. svcmgr serves
-    /// `svcmgr_labels::QUERY_ENDPOINT` for the lookup; the
-    /// publish-authority side (`PUBLISH_ENDPOINT`) is held by init,
-    /// devmgr, and svcmgr itself — not by callers of this cap.
+    /// Every process reads this slot and uses it (via the
+    /// `registry-client` crate) to resolve a service name to a SEND cap
+    /// on that service's endpoint. The publish-authority caps are held
+    /// by init, devmgr, and svcmgr itself — not by callers of this cap.
     ///
     /// This is the **only** service-discovery slot in `ProcessInfo`.
     /// New services do not get their own dedicated slot; they are
@@ -475,11 +477,12 @@ pub struct StartupInfo
     /// chain).
     pub memmgr_endpoint: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on svcmgr's service endpoint
-    /// (QUERY-only attenuation). The system-wide service-discovery handle:
-    /// `shared/registry-client::lookup(name, ..)` issues
-    /// `svcmgr_labels::QUERY_ENDPOINT` against this cap. Zero when svcmgr
-    /// is not reachable. See `ProcessInfo::service_registry_cap`.
+    /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the
+    /// system-wide service-discovery handle. The cap's token lacks the
+    /// `svcmgr_labels::PUBLISH_AUTHORITY` verb-bit, so it answers
+    /// `QUERY_ENDPOINT` only. `registry-client::lookup(name)` issues
+    /// the QUERY against this cap. Zero when svcmgr is not reachable.
+    /// See `ProcessInfo::service_registry_cap` for the long form.
     pub service_registry_cap: u32,
 
     /// `CSpace` slot of the stdin shmem frame cap. Zero when no input

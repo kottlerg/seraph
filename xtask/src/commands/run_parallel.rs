@@ -13,8 +13,8 @@
 //! regexes (`--pass`, `--fail`); xtask only classifies outcomes by matching
 //! those patterns against per-run logs, plus exit-code and watchdog state.
 
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -32,6 +32,7 @@ use crate::qemu::{
     QemuLaunchSpec, build_qemu_argv, find_ovmf_code, prepare_riscv_firmware,
     validate_sysroot_for_launch,
 };
+use crate::term::filter::FilterWriter;
 use crate::util::step;
 
 /// How often the watchdog poll loop checks child exit status.
@@ -192,21 +193,42 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 };
                 let qemu_args = build_qemu_argv(&spec);
 
-                let log_file = File::create(&log_path)
+                // O_APPEND on the log fds so the kernel writes atomically
+                // at end-of-file. Both the per-slot stdout-forwarder thread
+                // and QEMU's stderr (via Stdio::from) write into the same
+                // file; with O_APPEND each write() syscall is its own
+                // boundary so output never overwrites itself even though
+                // two writers share the file.
+                let log_file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .append(true)
+                    .open(&log_path)
                     .with_context(|| format!("creating log file {}", log_path.display()))?;
-                let log_clone = log_file
+                let log_for_stderr = log_file
                     .try_clone()
                     .context("cloning log file fd for stderr")?;
+                // `log_file` is moved into the forwarder thread below.
 
                 let started = Instant::now();
                 let mut child = Command::new(arch.qemu_binary())
                     .args(&qemu_args)
-                    .stdout(Stdio::from(log_file))
-                    .stderr(Stdio::from(log_clone))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::from(log_for_stderr))
                     .spawn()
                     .with_context(|| format!("spawning {}", arch.qemu_binary()))?;
 
+                let qemu_stdout = child
+                    .stdout
+                    .take()
+                    .context("QEMU stdout was piped but unavailable")?;
+                let forwarder = spawn_stdout_forwarder(qemu_stdout, log_file);
+
                 let (exit_rc, hung) = wait_with_timeout(&mut child, timeout)?;
+                // Drain the forwarder before reading the log so classify()
+                // sees the complete byte stream even when the watchdog
+                // killed QEMU mid-write.
+                join_forwarder(forwarder, run_id);
                 let elapsed = started.elapsed();
 
                 let log_text = read_log(&log_path).unwrap_or_default();
@@ -327,6 +349,36 @@ fn purge_prior_logs(workdir: &Path) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// Spawn a thread that forwards `child_stdout` through `FilterWriter`
+/// into `log_sink`. The thread exits when the pipe reaches EOF (child
+/// closed its stdout, either by exiting or by being killed).
+fn spawn_stdout_forwarder(
+    mut child_stdout: std::process::ChildStdout,
+    log_sink: File,
+) -> JoinHandle<Result<()>>
+{
+    thread::spawn(move || -> Result<()> {
+        let mut sink = FilterWriter::new(log_sink);
+        std::io::copy(&mut child_stdout, &mut sink)
+            .context("forwarding QEMU stdout into per-slot log")?;
+        sink.flush().context("flushing per-slot log")?;
+        Ok(())
+    })
+}
+
+/// Join a stdout-forwarder thread. Logs but does not propagate forwarder
+/// errors so classification can still proceed on partial logs.
+fn join_forwarder(handle: JoinHandle<Result<()>>, run_id: u32)
+{
+    match handle.join()
+    {
+        Ok(Ok(())) =>
+        {}
+        Ok(Err(err)) => eprintln!("run {run_id}: stdout forwarder error: {err:#}"),
+        Err(_) => eprintln!("run {run_id}: stdout forwarder panicked"),
+    }
 }
 
 /// Block waiting for `child` to exit or `timeout` to elapse.

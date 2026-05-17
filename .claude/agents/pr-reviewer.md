@@ -78,7 +78,12 @@ rationale:
 - **Should fix.** Non-binding alignment — dead surface introduced;
   surrounding cleanup the diff touched but left stale; test-coverage gaps
   the surrounding component pattern would normally close.
-- **Nit.** Readability and naming. Cap at five; beyond that, summarize.
+- **Nit.** Readability and naming. List each distinct nit; when many
+  findings share the same root (e.g., one naming pattern recurring
+  across multiple sites), collapse them into a single entry citing the
+  pattern with one or two representative `file:line` examples. Do not
+  enforce a count cap — collapsing is for de-duplicating patterns, not
+  for hiding distinct findings.
 
 **Final line MUST be exactly one of:** `READY TO MERGE`, `BLOCKING ISSUES`,
 `NON-BLOCKING ISSUES ONLY`. Any Critical item forces `BLOCKING ISSUES`.

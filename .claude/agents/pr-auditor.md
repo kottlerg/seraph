@@ -37,10 +37,19 @@ claims.
    one of: `delivered` (cite `path:line` evidence), `dropped` (cite the
    rationale text), or `not delivered, no rationale` (FAIL).
 
-6. Silent-deferral scan: grep PR body and diff for `TODO`, `follow-up`,
-   `out of scope`, `defer`, `later`. Per the Completeness rule in
-   `.claude/CLAUDE.md`, mechanically reachable work cannot be deferred.
-   Surface every hit.
+6. Silent-deferral scan. The target signal is *intent to defer
+   mechanically-reachable work this PR should have covered*, not in-code
+   work markers — `docs/documentation-standards.md` endorses bare `TODO`
+   tokens as the canonical in-code annotation for independent future
+   work, and flagging them generates noise on any code-touching PR.
+   - PR body and commit messages: surface any of `out of scope`,
+     `follow-up`, `defer`, `deferred`, `later`, `TODO`.
+   - Diff: surface only multi-word deferral phrases — `out of scope`,
+     `follow-up`, `deferred to`, `for a future PR`, `for now`,
+     `will come later`. Do **not** flag bare `TODO` tokens in the diff.
+   Per the Completeness rule in `.claude/CLAUDE.md`, mechanically
+   reachable work cannot be deferred; surface every hit matching the
+   criteria above.
 
 7. Test-plan honesty: every `- [x]` under `## Test plan` in the PR body
    should have plausible basis (cited tool output, file presence, commit

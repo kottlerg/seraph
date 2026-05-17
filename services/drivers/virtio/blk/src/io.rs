@@ -139,8 +139,19 @@ impl IoLayout
     }
 }
 
-/// Maximum `signal_wait` iterations before treating the request as timed out.
+/// Maximum wait iterations before treating the request as timed out.
 const MAX_WAIT_ATTEMPTS: usize = 1000;
+
+/// Per-iteration timeout on the IRQ-signal wait, in milliseconds.
+///
+/// Bounded so that a lost PLIC external interrupt on QEMU virt RISC-V (see
+/// the wait loop comment) cannot park this thread indefinitely: the next
+/// iteration's poll-burst will observe completion regardless of whether the
+/// IRQ ever fires. The actual completion time of a virtio-blk request on
+/// QEMU is sub-millisecond, so a 50 ms ceiling is two orders of magnitude
+/// over the expected wake and three orders under the outer-loop deadline
+/// (`MAX_WAIT_ATTEMPTS * IRQ_WAIT_TIMEOUT_MS` = 50 s upper bound).
+const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 
 /// Submit a read or write request and wait for completion via IRQ signal.
 ///
@@ -200,9 +211,11 @@ pub fn submit_and_wait(
     // PLIC) is occasionally not observed by any hart even though the device
     // processes the request — we have confirmed via instrumentation that
     // completion happens but the PLIC-delivered external interrupt never
-    // fires. To stay robust without pure polling, each wait iteration does
-    // a short poll burst first (catching device-faster-than-schedule cases
-    // and IRQ-lost cases both), and only blocks on the signal afterwards.
+    // fires. Two defenses against a lost IRQ: each iteration does a short
+    // poll burst, and the per-iteration signal wait carries a bounded
+    // timeout so a completion that lands between the poll burst and the
+    // kernel parking the thread is recovered on the next iteration's burst
+    // rather than wedging the driver forever.
     for _ in 0..MAX_WAIT_ATTEMPTS
     {
         // Poll burst before blocking. VirtIO devices typically complete in
@@ -223,8 +236,11 @@ pub fn submit_and_wait(
             core::hint::spin_loop();
         }
 
-        // No completion yet — block until the IRQ fires, then re-check.
-        let _ = syscall::signal_wait(irq_signal);
+        // No completion yet — block on the IRQ signal with a bounded timeout.
+        // Ok(0) means timeout (signal_send rejects zero-bit sends, so 0 is
+        // unambiguous); Ok(_) means a real wake; Err means the cap path
+        // failed and there's nothing useful to do but fall through and poll.
+        let _ = syscall::signal_wait_timeout(irq_signal, IRQ_WAIT_TIMEOUT_MS);
 
         // Read ISR to clear level-triggered interrupt at the device before
         // unmasking at the controller, preventing immediate re-delivery.

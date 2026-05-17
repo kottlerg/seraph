@@ -737,10 +737,15 @@ pub struct CSpaceLayout
 /// - ~32 hardware caps (MMIO + IRQ + `IoPortRange`/`SbiControl` + `SchedControl`).
 /// - 8 ACPI region caps (`MAX_ACPI_REGIONS`), 1 ACPI RSDP, 1 DTB.
 /// - ~8 init segment caps + ~16 boot module caps.
+/// - [`boot_protocol::MAX_RECLAIM_RANGES`] reclaim Frame caps (worst case
+///   from `mint_reclaim_frame_caps`).
 ///
-/// `4096 + 64 = 4160` covers the worst case with headroom; BSS cost is
-/// 4160 × 24 B ≈ 100 KiB, comfortably small relative to total system RAM.
-pub const CSPACE_LAYOUT_MAX_DESCRIPTORS: usize = 4096 + 64;
+/// `4096 + 256 + 128 = 4480` covers the worst case with headroom; BSS
+/// cost is 4480 × 24 B ≈ 105 KiB, comfortably small relative to total
+/// system RAM. The `4096` term matches `MAX_DRAIN_BLOCKS` in the
+/// production-only branch; `256` is `boot_protocol::MAX_RECLAIM_RANGES`;
+/// the trailing `128` covers every other Phase-7 cap kind.
+pub const CSPACE_LAYOUT_MAX_DESCRIPTORS: usize = 4096 + boot_protocol::MAX_RECLAIM_RANGES + 128;
 
 /// Backing storage for [`CSpaceLayout::descriptor_count`]. `static mut`
 /// because [`populate_cspace`] writes entries during single-threaded
@@ -856,7 +861,9 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
     // 3. populate_cspace fills the root with Frame caps (from the drained
     //    blocks) plus all hardware-resource caps.
     // 4. mint_module_frame_caps appends boot-module Frame caps.
-    // 5. Stash the root CSpace pointer; Phase 9 hands it to init.
+    // 5. mint_reclaim_frame_caps appends reclaimable bootloader-scratch
+    //    Frame caps (BootInfo, descriptor arrays, transient PT frames).
+    // 6. Stash the root CSpace pointer; Phase 9 hands it to init.
     #[cfg(not(test))]
     {
         // SAFETY: single-threaded Phase 7; DRAIN_RAM_BLOCKS is exclusively
@@ -1627,7 +1634,6 @@ fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
     #[cfg(test)]
     let total_before: usize = 0;
 
-    let mut base_slot: u32 = 0;
     let mut count: u32 = 0;
     let mut pages_total: u64 = 0;
 
@@ -1679,10 +1685,6 @@ fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
             ptr,
             "Phase 7: cannot allocate Frame capability for reclaimed boot scratch",
         );
-        if count == 0
-        {
-            base_slot = slot;
-        }
         push_descriptor(
             &mut layout.descriptor_count,
             CapDescriptor {
@@ -1696,7 +1698,6 @@ fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         count += 1;
     }
 
-    let _ = base_slot;
     layout.total_populated = cspace.populated_count();
 
     #[cfg(not(test))]

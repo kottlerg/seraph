@@ -1,20 +1,34 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo xtask build *)",
-      "Bash(cargo xtask run *)",
-      "Bash(cargo xtask clean *)",
+      "Bash(cargo xtask *)",
 
       "Bash(readelf *)",
       "Bash(nm *)",
       "Bash(objdump *)",
-
       "Bash(riscv64-linux-gnu-objdump *)",
       "Bash(riscv64-unknown-elf-objdump *)",
 
-      "Bash(grep *)",
-      "Bash(echo *)"
+      "Bash(gh pr view *)",
+      "Bash(gh pr diff *)",
+      "Bash(gh pr checks *)",
+      "Bash(gh issue view *)",
+      "Bash(gh issue list *)",
+      "Bash(gh api *)",
+      "Bash(gh search *)",
+      "Bash(gh run *)",
+
+      "Bash(git checkout *)"
     ]
   },
-  "showThinkingSummaries": true
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "showThinkingSummaries": true,
+  "outputStyle": "Focused",
+  "autoMemoryEnabled": false,
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  }
 }

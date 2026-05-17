@@ -45,15 +45,26 @@ truth for "how work is tracked and shipped" on this project.
   `Bash` invocation (`run_in_background: true`). Do not poll, do not sleep —
   the harness notifies on completion.
 - On green: confirm the pass in one line, then run the pre-merge audit
-  before prompting for merge:
-  1. `gh pr view <N> --json body`. Every `- [ ]` in the PR body MUST be
-     `- [x]` or removed with rationale. List any unticked items to the
-     user and resolve them (`gh pr edit`) before continuing.
-  2. For each `Closes #N` / `Fixes #N` in the PR body, `gh issue view <N>
-     --json body`. Every `- [ ]` under `## Acceptance` MUST be `- [x]` or
-     dropped with rationale. Resolve via `gh issue edit`.
-  3. Only after the audit clears, prompt the user for the merge decision.
-     Merge via `gh pr merge <N> --merge --delete-branch`.
+  before prompting for merge. Invoke both audit agents in parallel (single
+  message, two `Agent` tool calls). The invocation prompt MUST supply the
+  PR number (or the feature-branch name when no PR exists yet) as the
+  per-PR scope; the agents discover binding authority from the repo
+  themselves.
+  1. `@pr-reviewer` — adversarial code review of the diff and its blast
+     radius.
+  2. `@pr-auditor` — PR-body checklist, linked-issue Acceptance closure,
+     silent-deferral, and test-plan honesty audit.
+
+  Surface both verdict lines to the user verbatim. If `pr-auditor` reports
+  `AUDIT FAIL`, resolve the named items (`gh pr edit`, `gh issue edit`, or
+  additional commits) before continuing. If `pr-reviewer` reports
+  `BLOCKING ISSUES`, address them in additional commits before continuing.
+  Non-blocking reviewer findings MAY be deferred only with a one-line
+  rationale to the user.
+
+  Only after both verdicts clear (or are explicitly waived by the user),
+  prompt for the merge decision. Merge via
+  `gh pr merge <N> --merge --delete-branch`.
 - On red: surface the failing job's tail (`gh run view <run-id> --log-failed`
   or equivalent) so the user can see the actual error without asking.
 - The assistant MUST NOT merge a PR while its CI run is pending or failing.

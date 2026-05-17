@@ -217,8 +217,22 @@ fn system_time_phase()
 {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    let t0 = SystemTime::now();
-    let i0 = Instant::now();
+    // Sandwich-bracket the SystemTime read between two Instant reads
+    // so we can bound when the IPC for SystemTime actually sampled the
+    // monotonic clock. Without this the test flakes under heavy host
+    // load: a preemption stretching one bracket's IPC roundtrip more
+    // than the other's introduces an asymmetric bias that previously
+    // tripped a fixed 10 ms tolerance (observed ~17 ms divergence under
+    // 4-way parallel TCG).
+    fn sample() -> (Instant, SystemTime, Instant)
+    {
+        let i_pre = Instant::now();
+        let t = SystemTime::now();
+        let i_post = Instant::now();
+        (i_pre, t, i_post)
+    }
+
+    let (i_pre0, t0, i_post0) = sample();
     let since_epoch = t0
         .duration_since(UNIX_EPOCH)
         .expect("SystemTime::now must be at or after UNIX_EPOCH");
@@ -239,30 +253,39 @@ fn system_time_phase()
         "SystemTime returned {secs}s, after 2100-01-01 — overflow or junk read",
     );
 
-    // Busy-loop on Instant to bracket a known elapsed against
-    // SystemTime. timed adds `offset + ElapsedUs`, so the two clocks
-    // must agree.
+    // Busy-loop on Instant; the loop duration is incidental — the
+    // structural assertion below uses Instant-bracketed bounds, not a
+    // fixed tolerance.
     let target = Duration::from_millis(50);
-    while i0.elapsed() < target
+    while i_post0.elapsed() < target
     {
         core::hint::spin_loop();
     }
 
-    let t1 = SystemTime::now();
-    let i1 = Instant::now();
+    let (i_pre1, t1, i_post1) = sample();
     let sys_delta = t1
         .duration_since(t0)
         .expect("SystemTime monotonicity (wall clock did not run backwards)");
-    let mono_delta = i1.duration_since(i0);
-    let diff = sys_delta.abs_diff(mono_delta);
+
+    // t0 was sampled in monotonic time somewhere in [i_pre0, i_post0];
+    // t1 in [i_pre1, i_post1]. The true mono-time gap (t1 - t0) is
+    // therefore bounded:
+    //     min = i_pre1  - i_post0  (gap excluding the bracket reads)
+    //     max = i_post1 - i_pre0   (gap including the bracket reads)
+    // If sys_delta falls outside [min, max], SystemTime and Instant
+    // are not tracking each other — that's the structural failure the
+    // test is designed to catch (wrong offset, scale, or stuck clock).
+    let mono_min = i_pre1.duration_since(i_post0);
+    let mono_max = i_post1.duration_since(i_pre0);
     assert!(
-        diff < Duration::from_millis(10),
-        "SystemTime/Instant delta divergence: sys={sys_delta:?} mono={mono_delta:?} diff={diff:?}",
+        sys_delta >= mono_min && sys_delta <= mono_max,
+        "SystemTime delta {sys_delta:?} outside Instant-bracketed bounds \
+         [{mono_min:?}, {mono_max:?}] — clocks not tracking",
     );
 
     let (y, mo, dd, hh, mm, ss) = epoch_to_ymdhms(secs);
     std::os::seraph::log!(
-        "SystemTime phase passed ({y:04}-{mo:02}-{dd:02}T{hh:02}:{mm:02}:{ss:02}Z, sys_delta={sys_delta:?}, mono_delta={mono_delta:?})"
+        "SystemTime phase passed ({y:04}-{mo:02}-{dd:02}T{hh:02}:{mm:02}:{ss:02}Z, sys_delta={sys_delta:?}, mono_bounds=[{mono_min:?}, {mono_max:?}])"
     );
 }
 

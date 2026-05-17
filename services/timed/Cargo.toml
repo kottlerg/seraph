@@ -13,7 +13,6 @@ test = false
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
-registry-client = { path = "../../shared/registry-client" }
 
 [lints]
 workspace = true

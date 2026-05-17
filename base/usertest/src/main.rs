@@ -147,6 +147,7 @@ fn main()
     // cap-derivation pressure on TCG-emulated arches.
     fs_open_relative_phase();
     pwrmgr_cap_deny_phase(pwrmgr_noauth_cap);
+    system_time_phase();
 
     std::os::seraph::log!("ALL TESTS PASSED");
 
@@ -188,6 +189,80 @@ fn pwrmgr_cap_deny_phase(pwrmgr_noauth_cap: u32)
         reply.label
     );
     std::os::seraph::log!("pwrmgr cap-deny phase passed (UNAUTHORIZED reply)");
+}
+
+/// `std::time::SystemTime::now()` end-to-end through the per-process
+/// `service_registry_cap` → svcmgr `QUERY_ENDPOINT` → timed
+/// `GET_WALL_TIME` → kernel monotonic clock + offset against
+/// `rtc.primary`. Closes issues #2 and #4 by asserting:
+///
+/// * the wall-clock returned is plausibly post-2024 and pre-2100 (rules
+///   out the `UNIX_EPOCH` degraded path and stuck clocks);
+/// * two `SystemTime::now()` reads bracketing a known `Instant::now()`
+///   delay agree on elapsed within 10 ms — `Instant` reads the kernel
+///   monotonic counter directly and `SystemTime` adds `offset`, so the
+///   deltas must match to within a few jiffies of IPC latency.
+///
+/// On boards where the wall-clock chain failed to come up (init logged
+/// a publish failure; `timed` is in `WALL_CLOCK_UNAVAILABLE` mode),
+/// `SystemTime::now()` returns `UNIX_EPOCH` and this phase logs +
+/// returns rather than panicking — `UNIX_EPOCH` is the documented
+/// degraded-mode contract.
+// 2024-01-01 00:00:00 UTC = 1 704 067 200 s.
+const SYSTEM_TIME_AFTER_2024_SECS: u64 = 1_704_067_200;
+// 2100-01-01 00:00:00 UTC = 4 102 444 800 s. Sanity ceiling.
+const SYSTEM_TIME_BEFORE_2100_SECS: u64 = 4_102_444_800;
+
+fn system_time_phase()
+{
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let t0 = SystemTime::now();
+    let i0 = Instant::now();
+    let since_epoch = t0
+        .duration_since(UNIX_EPOCH)
+        .expect("SystemTime::now must be at or after UNIX_EPOCH");
+    if since_epoch == Duration::ZERO
+    {
+        std::os::seraph::log!("SystemTime phase skipped: timed unavailable (UNIX_EPOCH reply)");
+        return;
+    }
+
+    let secs = since_epoch.as_secs();
+    assert!(
+        secs >= SYSTEM_TIME_AFTER_2024_SECS,
+        "SystemTime returned {secs}s, before 2024-01-01 — \
+         timed offset miswired or RTC clock not running",
+    );
+    assert!(
+        secs < SYSTEM_TIME_BEFORE_2100_SECS,
+        "SystemTime returned {secs}s, after 2100-01-01 — overflow or junk read",
+    );
+
+    // Busy-loop on Instant to bracket a known elapsed against
+    // SystemTime. timed adds `offset + ElapsedUs`, so the two clocks
+    // must agree.
+    let target = Duration::from_millis(50);
+    while i0.elapsed() < target
+    {
+        core::hint::spin_loop();
+    }
+
+    let t1 = SystemTime::now();
+    let i1 = Instant::now();
+    let sys_delta = t1
+        .duration_since(t0)
+        .expect("SystemTime monotonicity (wall clock did not run backwards)");
+    let mono_delta = i1.duration_since(i0);
+    let diff = sys_delta.abs_diff(mono_delta);
+    assert!(
+        diff < Duration::from_millis(10),
+        "SystemTime/Instant delta divergence: sys={sys_delta:?} mono={mono_delta:?} diff={diff:?}",
+    );
+
+    std::os::seraph::log!(
+        "SystemTime phase passed (epoch_s={secs}, sys_delta={sys_delta:?}, mono_delta={mono_delta:?})"
+    );
 }
 
 /// Terminal phase: invoke pwrmgr SHUTDOWN through the

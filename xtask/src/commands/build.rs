@@ -123,13 +123,13 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "cmos-rtc",
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::RootfsBin,
         arch_only: Some(Arch::X86_64),
     },
     Spec {
         name: "goldfish-rtc",
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::RootfsBin,
         arch_only: Some(Arch::Riscv64),
     },
     Spec {
@@ -171,7 +171,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "timed",
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {

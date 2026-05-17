@@ -714,6 +714,36 @@ pub mod log {
     }
 }
 
+/// Service-registry client surface. Re-exports
+/// [`::registry_client::lookup`] / `publish` against the std-built
+/// instance of registry-client — direct dependents would otherwise
+/// pull in their own compile of the crate and miss the
+/// `REGISTRY_CAP` static that `_start` installed.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod registry {
+    use super::current_ipc_buf;
+
+    /// Look up `name` in svcmgr's discovery registry. Returns
+    /// `Some(cap)` where the cap is a fresh SEND derived by svcmgr;
+    /// `None` on any failure.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn lookup(name: &[u8]) -> Option<u32> {
+        let buf = current_ipc_buf();
+        if buf.is_null() {
+            return None;
+        }
+        // SAFETY: current_ipc_buf returns the registered IPC buffer page.
+        unsafe { ::registry_client::lookup(name, buf) }
+    }
+
+    /// Return the installed registry cap, or zero if `_start` did not
+    /// seed one (e.g. process spawned before svcmgr existed).
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn registry_cap() -> u32 {
+        ::registry_client::registry_cap()
+    }
+}
+
 /// System-log macro. Formats and emits one log line on the process's
 /// tokened SEND cap, lazy-acquired from the discovery cap on first
 /// call. The receiver tags each line with the registered display name

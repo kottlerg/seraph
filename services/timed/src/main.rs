@@ -108,8 +108,7 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, offset: Option<u64>) -> !
 /// service then runs in `WALL_CLOCK_UNAVAILABLE` mode.
 fn compute_offset(ipc_buf: *mut u64) -> Option<u64>
 {
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let rtc_cap = unsafe { registry_client::lookup(b"rtc.primary", ipc_buf) }?;
+    let rtc_cap = std::os::seraph::registry::lookup(b"rtc.primary")?;
     let rtc_us = query_rtc(rtc_cap, ipc_buf);
     let _ = syscall::cap_delete(rtc_cap);
     let rtc_us = rtc_us?;
@@ -133,7 +132,10 @@ fn main() -> !
     };
 
     // std's `_start` already installed the per-process registry cap into
-    // registry-client; just query.
+    // the registry-client cache; just query via std's wrapper to avoid
+    // pulling in a second registry-client instance with its own static
+    // (cargo unifies features per workspace, not across the std mirror's
+    // workspace and ours).
     let offset = compute_offset(ipc_buf);
 
     service_loop(service_ep, ipc_buf, offset);

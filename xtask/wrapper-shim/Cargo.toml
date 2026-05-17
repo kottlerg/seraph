@@ -1,0 +1,20 @@
+[package]
+name = "seraph-wrapper-shim"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Host-target binary. Built once per toolchain mirror by xtask, then
+# installed into target/seraph-toolchain/bin/ as both `rustc` and
+# `ws-clippy`; dispatches on argv[0] basename.
+[[bin]]
+name = "seraph-wrapper-shim"
+path = "src/main.rs"
+test = false
+
+# Zero-dependency by design — the shim is on the hot path of every
+# rustc invocation during StdUser builds. Keep the working set tiny.
+[dependencies]
+
+[lints]
+workspace = true

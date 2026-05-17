@@ -20,15 +20,23 @@
 //!      src/sys/`), which is a physical copy.
 //!   2. Apply the seraph overlay to the physical-copy subtree — no
 //!      upstream rust-src is touched.
-//!   3. Install a `bin/rustc` wrapper script at
-//!      `target/seraph-toolchain/bin/rustc` that execs the real rustc
-//!      with `--sysroot=<our path>` prepended, so every rustc invocation
-//!      (including `rustc --print sysroot` which cargo uses internally)
-//!      reports and uses our sysroot.
-//!   4. Callers set `RUSTC=<wrapper path>` when invoking cargo — cargo
-//!      picks up the wrapper via standard RUSTC env-var handling. No
-//!      rustup-level state is modified; `target/seraph-toolchain/` is a
-//!      pure build artifact under `target/`.
+//!   3. Install the `seraph-wrapper-shim` native binary at
+//!      `target/seraph-toolchain/bin/rustc` (and the same binary again
+//!      as `bin/ws-clippy`). The shim dispatches on argv[0] basename,
+//!      reads its config from `SERAPH_SHIM_*` env vars set by the
+//!      caller, and execs the real rustc / clippy-driver with the
+//!      right flags so every rustc invocation (including `rustc
+//!      --print sysroot` which cargo uses internally) reports and
+//!      uses our sysroot. The shim replaces the previous `#!/bin/sh`
+//!      wrappers — a native binary works on every host without
+//!      shebang interpretation, POSIX shell, or chmod.
+//!   4. Callers route `cargo build` / `cargo clippy` through the
+//!      mirror by calling `SeraphToolchain::apply_env(&mut cmd)`,
+//!      which sets `RUSTC`, `RUSTC_WORKSPACE_WRAPPER`, the three
+//!      `SERAPH_SHIM_*` config vars, and `RUSTC_BOOTSTRAP=1` in one
+//!      go. No rustup-level state is modified;
+//!      `target/seraph-toolchain/` is a pure build artifact under
+//!      `target/`.
 //!
 //! # Invariants
 //!
@@ -53,14 +61,14 @@
 //! the shared inode with the real toolchain is never mutated.
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
 use crate::context::Context as BuildContext;
-use crate::util::step;
+use crate::fs_compat::link_or_copy;
+use crate::util::{run_cmd, step};
 
 /// Substring placed in every patched source file for idempotency
 /// detection. Single marker per file suffices; atomic-per-file edits.
@@ -75,22 +83,46 @@ const VERSION_STAMP: &str = ".seraph-toolchain-stamp";
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Wrapper paths callers set into cargo's environment for StdUser builds.
+/// Paths and shim config callers route their cargo invocations
+/// through for StdUser builds.
 ///
-/// Both live under `target/seraph-toolchain/bin/`. `rustc` is used by cargo
-/// build and cargo clippy alike (via `RUSTC=`) so `-Z build-std` reads the
-/// overlaid sysroot. `ws_clippy` is used only for cargo clippy (via
-/// `RUSTC_WORKSPACE_WRAPPER=`) to override clippy-driver's baked-in rustup
-/// toolchain — see the wrapper script for detail.
+/// `rustc` and `ws_clippy` point at the installed shim under
+/// `target/seraph-toolchain/bin/` (the same binary, installed under
+/// two names, dispatched by argv[0] basename). `real_rustc`,
+/// `real_clippy`, and `mirror_sysroot` are the absolute paths the
+/// shim needs to do its job — exposed here so `apply_env` can wire
+/// them into cargo's environment.
 pub struct SeraphToolchain
 {
     pub rustc: PathBuf,
     pub ws_clippy: PathBuf,
+    real_rustc: PathBuf,
+    real_clippy: PathBuf,
+    mirror_sysroot: PathBuf,
 }
 
-/// Ensure the seraph sysroot mirror exists under `target/` with overlays
-/// applied, and return the paths to the `bin/rustc` + `bin/ws-clippy`
-/// wrappers cargo should use for StdUser builds.
+impl SeraphToolchain
+{
+    /// Set every env var the shim and cargo need to route a StdUser
+    /// build through the seraph toolchain mirror: `RUSTC` and
+    /// `RUSTC_WORKSPACE_WRAPPER` (mirror entry points), the three
+    /// `SERAPH_SHIM_*` config vars (so the shim knows what to exec),
+    /// and `RUSTC_BOOTSTRAP=1` (so the StdUser builds can use
+    /// `restricted_std` and `rustc_private`).
+    pub fn apply_env(&self, cmd: &mut Command)
+    {
+        cmd.env("RUSTC", &self.rustc);
+        cmd.env("RUSTC_WORKSPACE_WRAPPER", &self.ws_clippy);
+        cmd.env("SERAPH_SHIM_REAL_RUSTC", &self.real_rustc);
+        cmd.env("SERAPH_SHIM_REAL_CLIPPY", &self.real_clippy);
+        cmd.env("SERAPH_SHIM_MIRROR_SYSROOT", &self.mirror_sysroot);
+        cmd.env("RUSTC_BOOTSTRAP", "1");
+    }
+}
+
+/// Ensure the seraph sysroot mirror exists under `target/` with
+/// overlays applied and the wrapper shim installed, and return the
+/// `SeraphToolchain` callers route their cargo invocations through.
 pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
 {
     let real = probe_real_sysroot().context("locating real rustc sysroot")?;
@@ -118,12 +150,34 @@ pub fn ensure_seraph_toolchain(ctx: &BuildContext) -> Result<SeraphToolchain>
     ensure_mirror(&real, &mirror, &overlay_root, &ctx.root)
         .context("assembling seraph-toolchain mirror")?;
     apply_all_overlays(&mirror, &overlay_root).context("applying seraph overlays")?;
-    install_rustc_wrapper(&real, &mirror).context("installing rustc wrapper")?;
-    install_ws_clippy_wrapper(&real, &mirror).context("installing ws-clippy wrapper")?;
+    let real_clippy = real.join("bin/clippy-driver");
+    if !real_clippy.exists()
+    {
+        bail!(
+            "clippy-driver not found at {}; add \"clippy\" to components \
+             in rust-toolchain.toml or run `rustup component add clippy`",
+            real_clippy.display()
+        );
+    }
+    install_wrappers(ctx, &real, &mirror).context("installing wrapper shim")?;
+
+    let real_rustc = real
+        .join("bin/rustc")
+        .canonicalize()
+        .context("canonicalising real rustc")?;
+    let real_clippy = real_clippy
+        .canonicalize()
+        .context("canonicalising real clippy-driver")?;
+    let mirror_sysroot = mirror
+        .canonicalize()
+        .context("canonicalising seraph mirror")?;
 
     Ok(SeraphToolchain {
         rustc: mirror.join("bin/rustc"),
         ws_clippy: mirror.join("bin/ws-clippy"),
+        real_rustc,
+        real_clippy,
+        mirror_sysroot,
     })
 }
 
@@ -201,8 +255,10 @@ fn ensure_mirror(real: &Path, mirror: &Path, overlay_root: &Path, project_root: 
 }
 
 /// For every direct-child entry in `real` whose name differs from
-/// `skip`, create a symlink in `mirror` pointing at the real entry.
-/// Idempotent: entries already present are left alone.
+/// `skip`, materialise it in `mirror` via the cheapest mechanism the
+/// host supports (symlink on Unix/macOS, falls back to hard-link or
+/// copy on Windows via `fs_compat::link_or_copy`). Idempotent:
+/// entries already present are left alone.
 fn symlink_siblings_except(real: &Path, mirror: &Path, skip: &str) -> Result<()>
 {
     for entry in fs::read_dir(real).with_context(|| format!("reading {}", real.display()))?
@@ -218,8 +274,12 @@ fn symlink_siblings_except(real: &Path, mirror: &Path, skip: &str) -> Result<()>
         {
             continue;
         }
-        symlink(entry.path(), &dst).with_context(|| {
-            format!("symlinking {} -> {}", dst.display(), entry.path().display())
+        link_or_copy(&entry.path(), &dst).with_context(|| {
+            format!(
+                "materialising {} -> {}",
+                dst.display(),
+                entry.path().display()
+            )
         })?;
     }
     Ok(())
@@ -244,36 +304,73 @@ fn hard_link_tree(src: &Path, dst: &Path) -> Result<()>
         }
         else if ft.is_symlink()
         {
+            // Symlinks inside library/ are vanishingly rare in the
+            // shipped rust-src; if one appears, materialise it via
+            // `link_or_copy` (symlink on Unix, copy on Windows). The
+            // important invariant is that the file resolves to the
+            // same bytes — relative-target preservation isn't
+            // necessary for cargo's purposes.
             if dst_path.symlink_metadata().is_err()
             {
-                let target = fs::read_link(&path)
-                    .with_context(|| format!("reading symlink {}", path.display()))?;
-                symlink(target, &dst_path)
-                    .with_context(|| format!("writing symlink {}", dst_path.display()))?;
+                link_or_copy(&path, &dst_path).with_context(|| {
+                    format!(
+                        "materialising library/ symlink {} -> {}",
+                        dst_path.display(),
+                        path.display(),
+                    )
+                })?;
             }
         }
         else
         {
-            // Hard link the file. If a destination already exists and
-            // shares our inode, skip; otherwise replace to refresh.
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(dst_meta) = dst_path.symlink_metadata()
+            // Hard link the file. If a destination already exists,
+            // see whether we can detect (on Unix) that it already
+            // shares our inode; otherwise replace to refresh. Cargo
+            // canonicalises source paths and bypasses overlays
+            // through symlinks, so files inside library/ MUST be
+            // hard-linked or physically copied — never symlinked.
+            if let Ok(_dst_meta) = dst_path.symlink_metadata()
             {
-                if let Ok(src_meta) = path.symlink_metadata()
-                    && dst_meta.ino() == src_meta.ino()
-                    && dst_meta.dev() == src_meta.dev()
+                if same_inode(&path, &dst_path)
                 {
                     continue;
                 }
                 fs::remove_file(&dst_path)
                     .with_context(|| format!("removing stale {}", dst_path.display()))?;
             }
-            fs::hard_link(&path, &dst_path).with_context(|| {
-                format!("hard linking {} -> {}", path.display(), dst_path.display())
-            })?;
+            // Hard link first (cheap, no copy). On Windows we may
+            // fall back to a physical copy via `link_or_copy` if the
+            // file systems don't support hard links across the
+            // mirror tree — semantically equivalent for cargo.
+            if fs::hard_link(&path, &dst_path).is_err()
+            {
+                fs::copy(&path, &dst_path).with_context(|| {
+                    format!("copying {} -> {}", path.display(), dst_path.display())
+                })?;
+            }
         }
     }
     Ok(())
+}
+
+/// Returns true when `a` and `b` are known to share a hard-link inode
+/// (only computable on Unix; conservatively returns false elsewhere
+/// so the caller does a refresh).
+#[cfg(unix)]
+fn same_inode(a: &Path, b: &Path) -> bool
+{
+    use std::os::unix::fs::MetadataExt;
+    match (a.symlink_metadata(), b.symlink_metadata())
+    {
+        (Ok(ma), Ok(mb)) => ma.ino() == mb.ino() && ma.dev() == mb.dev(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_inode(_a: &Path, _b: &Path) -> bool
+{
+    false
 }
 
 /// Identity string for the mirror. Combines the underlying rustc version
@@ -374,154 +471,140 @@ fn fnv_mix(state: &mut u64, byte: u8)
     *state = state.wrapping_mul(FNV_PRIME);
 }
 
-// ── rustc wrapper ─────────────────────────────────────────────────────────────
+// ── Wrapper-shim installation ────────────────────────────────────────────────
 
-/// Write `mirror/bin/rustc` as a shell wrapper that exec's the real
-/// rustc with `--sysroot=<mirror>` prepended. The wrapper only injects
-/// the flag if the caller didn't already pass `--sysroot` — so cargo's
-/// internal invocations (which don't) pick up our override, while any
-/// caller who manually specifies `--sysroot` retains that choice.
-fn install_rustc_wrapper(real: &Path, mirror: &Path) -> Result<()>
+/// Name of the shim crate inside the workspace. Built once per
+/// `ensure_seraph_toolchain` call; cargo will no-op when nothing
+/// changed.
+const SHIM_PACKAGE: &str = "seraph-wrapper-shim";
+
+/// Wrapper-binary names installed in `mirror/bin/`. The shim
+/// dispatches by argv[0] basename, so both names point at the same
+/// physical binary.
+const WRAPPER_NAMES: &[&str] = &["rustc", "ws-clippy"];
+
+/// Build the `seraph-wrapper-shim` crate once for the host triple
+/// (no-op when nothing changed), then install its binary into
+/// `mirror/bin/` under both wrapper names.
+///
+/// The previous implementation wrote `#!/bin/sh` heredoc scripts and
+/// `chmod +x`'d them — both Unix-only mechanisms. The shim binary
+/// works on every host with a native executable format. Wrapper
+/// behavior is parameterised via the `SERAPH_SHIM_*` env vars that
+/// `SeraphToolchain::apply_env` sets before invoking cargo.
+fn install_wrappers(ctx: &BuildContext, real: &Path, mirror: &Path) -> Result<()>
 {
-    let real_rustc = real.join("bin/rustc");
-    let real_rustc_abs = real_rustc
-        .canonicalize()
-        .with_context(|| format!("canonicalising {}", real_rustc.display()))?;
-    let mirror_abs = mirror
-        .canonicalize()
-        .with_context(|| format!("canonicalising {}", mirror.display()))?;
-
-    let script = format!(
-        "#!/bin/sh\n\
-         # Auto-generated by xtask — see xtask/src/rust_src.rs.\n\
-         # Exec the real rustc with --sysroot pointing at the seraph\n\
-         # toolchain mirror, unless the caller already passed --sysroot.\n\
-         for arg in \"$@\"; do\n\
-         \tcase \"$arg\" in\n\
-         \t\t--sysroot=*|--sysroot) exec \"{real}\" \"$@\" ;;\n\
-         \tesac\n\
-         done\n\
-         exec \"{real}\" --sysroot \"{ours}\" \"$@\"\n",
-        real = real_rustc_abs.display(),
-        ours = mirror_abs.display(),
-    );
-
-    // The mirror's bin/ may be a symlink to real/bin/; replace with a
-    // real directory so we can drop in the wrapper.
     let bin_dir = mirror.join("bin");
-    let is_symlink = bin_dir
-        .symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false);
-    if is_symlink
-    {
-        let real_bin = bin_dir
-            .canonicalize()
-            .with_context(|| format!("canonicalising {}", bin_dir.display()))?;
-        fs::remove_file(&bin_dir).with_context(|| format!("removing {}", bin_dir.display()))?;
-        fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
-        for entry in
-            fs::read_dir(&real_bin).with_context(|| format!("reading {}", real_bin.display()))?
-        {
-            let entry = entry?;
-            let dst = bin_dir.join(entry.file_name());
-            if dst.symlink_metadata().is_err()
-            {
-                symlink(entry.path(), &dst).with_context(|| {
-                    format!("symlinking {} -> {}", dst.display(), entry.path().display())
-                })?;
-            }
-        }
-    }
+    materialise_bin_dir(real, &bin_dir).context("materialising mirror bin/")?;
 
-    let wrapper = bin_dir.join("rustc");
-    if let Ok(current) = fs::read_to_string(&wrapper)
-        && current == script
+    let shim_binary = build_shim_binary(ctx)?;
+    for &name in WRAPPER_NAMES
     {
-        return Ok(());
+        let dst = bin_dir.join(install_name_for(name));
+        if dst.symlink_metadata().is_ok()
+        {
+            fs::remove_file(&dst).with_context(|| format!("removing {}", dst.display()))?;
+        }
+        // Copy outright — hard-linking would let the shim binary's
+        // mode bits / atime tracking diverge across the two install
+        // names, and dir-symlinking is not what we want here.
+        fs::copy(&shim_binary, &dst).with_context(|| {
+            format!(
+                "installing wrapper shim {} -> {}",
+                shim_binary.display(),
+                dst.display()
+            )
+        })?;
     }
-    if wrapper.symlink_metadata().is_ok()
-    {
-        fs::remove_file(&wrapper).with_context(|| format!("removing {}", wrapper.display()))?;
-    }
-    fs::write(&wrapper, &script).with_context(|| format!("writing {}", wrapper.display()))?;
-    let mut perms = fs::metadata(&wrapper)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&wrapper, perms)
-        .with_context(|| format!("chmod +x {}", wrapper.display()))?;
     step(&format!(
-        "seraph-toolchain: wrote rustc wrapper {}",
-        wrapper.display()
+        "seraph-toolchain: installed wrapper shim into {}",
+        bin_dir.display()
     ));
     Ok(())
 }
 
-/// Write `mirror/bin/ws-clippy` — a shell wrapper used by StdUser clippy
-/// invocations via `RUSTC_WORKSPACE_WRAPPER=<wrapper>`.
-///
-/// Cargo invokes a workspace wrapper as `<wrapper> <rustc_path> <args>`.
-/// The natural thing is to point it at the real `clippy-driver`, but that
-/// binary has its rustup toolchain baked in via `option_env!("RUSTUP_HOME")`
-/// and friends, so it reports the real sysroot regardless of `RUSTC`.
-/// Copying it into the mirror's `bin/` does not help — those env lookups
-/// are compile-time constants.
-///
-/// The wrapper fixes this by dropping the `<rustc_path>` arg cargo prepends
-/// and re-driving clippy-driver with both `SYSROOT=<mirror>` (env) and
-/// `--sysroot=<mirror>` (arg). clippy-driver checks args first, then env,
-/// then its baked-in values — both overrides are needed together.
-fn install_ws_clippy_wrapper(real: &Path, mirror: &Path) -> Result<()>
+/// Cargo builds shims into `target/release/<name><EXE>`. Encode the
+/// per-host exe suffix here so the path lookup is portable.
+fn install_name_for(name: &str) -> String
 {
-    let real_clippy = real.join("bin/clippy-driver");
-    if !real_clippy.exists()
+    if std::env::consts::EXE_SUFFIX.is_empty()
+    {
+        name.to_owned()
+    }
+    else
+    {
+        format!("{name}{}", std::env::consts::EXE_SUFFIX)
+    }
+}
+
+/// `cargo build --release -p seraph-wrapper-shim`. Returns the path
+/// to the produced binary. cargo is a no-op when nothing changed.
+fn build_shim_binary(ctx: &BuildContext) -> Result<PathBuf>
+{
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&ctx.root)
+        .arg("build")
+        .arg("--release")
+        .arg("-p")
+        .arg(SHIM_PACKAGE);
+    run_cmd(&mut cmd).context("building seraph-wrapper-shim")?;
+
+    let mut binary = ctx.target_dir.join("release");
+    binary.push(format!(
+        "{SHIM_PACKAGE}{suffix}",
+        suffix = std::env::consts::EXE_SUFFIX,
+    ));
+    if !binary.is_file()
     {
         bail!(
-            "clippy-driver not found at {}; add \"clippy\" to components \
-             in rust-toolchain.toml or run `rustup component add clippy`",
-            real_clippy.display()
+            "expected seraph-wrapper-shim binary at {} after build",
+            binary.display()
         );
     }
-    let real_clippy_abs = real_clippy
-        .canonicalize()
-        .with_context(|| format!("canonicalising {}", real_clippy.display()))?;
-    let mirror_abs = mirror
-        .canonicalize()
-        .with_context(|| format!("canonicalising {}", mirror.display()))?;
-    let mirror_rustc = mirror_abs.join("bin/rustc");
+    Ok(binary)
+}
 
-    let script = format!(
-        "#!/bin/sh\n\
-         # Auto-generated by xtask — see xtask/src/rust_src.rs.\n\
-         # cargo invokes RUSTC_WORKSPACE_WRAPPER as <wrapper> <rustc_path> <args...>.\n\
-         # clippy-driver bakes in rustup env vars at compile time, so it ignores RUSTC\n\
-         # and reports the real sysroot unless we force both --sysroot= (arg) and\n\
-         # SYSROOT (env). Drop the <rustc_path> arg cargo prepends and re-drive.\n\
-         shift\n\
-         SYSROOT=\"{mirror}\" exec \"{clippy}\" \"{rustc}\" --sysroot=\"{mirror}\" \"$@\"\n",
-        mirror = mirror_abs.display(),
-        clippy = real_clippy_abs.display(),
-        rustc = mirror_rustc.display(),
-    );
-
-    let wrapper = mirror.join("bin/ws-clippy");
-    if let Ok(current) = fs::read_to_string(&wrapper)
-        && current == script
+/// If `bin_dir` is currently a symlink to `real/bin/`, replace it
+/// with a real directory and populate it with mirror entries for
+/// every binary in `real/bin/` (so cargo's `rustc --print sysroot`
+/// path-resolution still finds the rest of the toolchain). If
+/// already a real directory, leave it alone.
+fn materialise_bin_dir(real: &Path, bin_dir: &Path) -> Result<()>
+{
+    let is_symlink = bin_dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink
     {
         return Ok(());
     }
-    if wrapper.symlink_metadata().is_ok()
+
+    let real_bin = bin_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalising {}", bin_dir.display()))?;
+    fs::remove_file(bin_dir).with_context(|| format!("removing {}", bin_dir.display()))?;
+    fs::create_dir_all(bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
+    for entry in
+        fs::read_dir(&real_bin).with_context(|| format!("reading {}", real_bin.display()))?
     {
-        fs::remove_file(&wrapper).with_context(|| format!("removing {}", wrapper.display()))?;
+        let entry = entry?;
+        let dst = bin_dir.join(entry.file_name());
+        if dst.symlink_metadata().is_ok()
+        {
+            continue;
+        }
+        link_or_copy(&entry.path(), &dst).with_context(|| {
+            format!(
+                "materialising {} -> {}",
+                dst.display(),
+                entry.path().display()
+            )
+        })?;
     }
-    fs::write(&wrapper, &script).with_context(|| format!("writing {}", wrapper.display()))?;
-    let mut perms = fs::metadata(&wrapper)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&wrapper, perms)
-        .with_context(|| format!("chmod +x {}", wrapper.display()))?;
-    step(&format!(
-        "seraph-toolchain: wrote ws-clippy wrapper {}",
-        wrapper.display()
-    ));
+    // The real_bin path is needed only for the canonicalise+read_dir
+    // walk; nothing else references it after this function returns.
+    let _ = real;
     Ok(())
 }
 

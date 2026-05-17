@@ -26,7 +26,7 @@ use crate::qemu::{
 use crate::term::filter::FilterWriter;
 use crate::term::guard::TerminalGuard;
 use crate::term::line_gate::LineGate;
-use crate::util::step;
+use crate::util::{require_tool, step};
 
 /// Marker that opens the default-mode line gate. Emitted by the
 /// bootloader as the first line after firmware exits; everything
@@ -105,7 +105,8 @@ fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Resu
     // (term::signal::install) means Ctrl+C terminates QEMU directly
     // via the tty without killing xtask. The TerminalGuard captured
     // in run() runs its drop on the way out, restoring termios.
-    let mut child = Command::new(binary)
+    let resolved = require_tool(binary)?;
+    let mut child = Command::new(&resolved)
         .args(args)
         .stdout(Stdio::piped())
         .spawn()

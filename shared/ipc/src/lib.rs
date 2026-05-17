@@ -667,7 +667,7 @@ pub mod ns_labels
     pub const NS_READDIR: u64 = 22;
 }
 
-pub const FS_LABELS_VERSION: u32 = 1;
+pub const FS_LABELS_VERSION: u32 = 2;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
 {
@@ -680,6 +680,19 @@ pub mod fs_labels
     /// pages, open-file slot, etc.). The caller still cap-deletes the
     /// node cap to drop the kernel-side reference.
     pub const FS_CLOSE: u64 = 3;
+    /// Inline write to a file node cap.
+    ///
+    /// Request: `label = FS_WRITE | (byte_len << 16)` (bits 0-15 = label
+    /// ID, bits 16-31 = payload byte length, ≤ 504), `data[0]` = file
+    /// byte offset, payload bytes packed from word 1 onward via
+    /// `IpcMessageBuilder::bytes(1, &payload)`. Token must carry the
+    /// `WRITE` namespace right (see `namespace-protocol::rights`).
+    ///
+    /// Reply (success label `fs_errors::SUCCESS`): `data[0]` =
+    /// `bytes_written` (may be short on `NO_SPACE` or on
+    /// partial-cluster failure; callers iterate). Error labels per
+    /// [`fs_errors`].
+    pub const FS_WRITE: u64 = 4;
     /// End-of-directory marker in `NS_READDIR` replies.
     pub const END_OF_DIR: u64 = 6;
     /// Read file content into a cached Frame cap returned in the reply.
@@ -715,6 +728,69 @@ pub mod fs_labels
     pub const FS_RELEASE_ACK: u64 = 9;
     /// Mount notification from vfsd.
     pub const FS_MOUNT: u64 = 10;
+    /// Write file content from a caller-supplied source Frame cap.
+    ///
+    /// Mirror of [`FS_READ_FRAME`] for the write direction. Caller maps,
+    /// fills, then transfers a Frame holding the bytes to write.
+    ///
+    /// Request: token identifies the file (per-file cap),
+    /// `data[0]` = file byte offset (no alignment requirement),
+    /// `data[1]` = bytes to write from the frame (`≤ PAGE_SIZE -
+    /// frame_data_offset`), `data[2]` = byte offset within the source
+    /// frame where the data begins. `caps[0]` = source Frame cap with
+    /// at least `MAP|READ` rights, sized one page. Token must carry the
+    /// `WRITE` namespace right.
+    ///
+    /// Reply (label `fs_errors::SUCCESS`): `data[0]` = `bytes_written`
+    /// (short on `NO_SPACE` or cluster-boundary truncation; callers
+    /// iterate). `caps[0]` = the source Frame cap moved back to the
+    /// caller. Errors per [`fs_errors`].
+    pub const FS_WRITE_FRAME: u64 = 12;
+    /// Create a new file in a directory.
+    ///
+    /// Request: token = parent-directory cap (must carry `MUTATE_DIR`),
+    /// `label = FS_CREATE | (name_len << 16)`, name bytes packed from
+    /// word 0 via `IpcMessageBuilder::bytes(0, name)`. Name validated
+    /// per `namespace-protocol::validate_name`.
+    ///
+    /// Reply (label `fs_errors::SUCCESS`): `data[0]` = entry kind (per
+    /// `namespace_protocol::NodeKind`), `caps[0]` = node cap for the
+    /// newly-created file. Errors include `EXISTS`, `NO_SPACE`,
+    /// `PERMISSION_DENIED`.
+    pub const FS_CREATE: u64 = 13;
+    /// Remove a file or empty directory from a directory.
+    ///
+    /// Request: token = parent-directory cap (must carry `MUTATE_DIR`),
+    /// `label = FS_REMOVE | (name_len << 16)`, name bytes from word 0.
+    ///
+    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
+    /// `NOT_FOUND`, `NOT_EMPTY` (directory has entries), `IO_ERROR`.
+    pub const FS_REMOVE: u64 = 14;
+    /// Create a new (empty) directory in a directory.
+    ///
+    /// Request: identical shape to [`FS_CREATE`]. Token must carry
+    /// `MUTATE_DIR`. Allocates one cluster zero-filled with `.` and
+    /// `..` entries.
+    ///
+    /// Reply: identical shape to [`FS_CREATE`], `data[0]` = kind (Dir).
+    pub const FS_MKDIR: u64 = 15;
+    /// Rename a directory entry, optionally across directories.
+    ///
+    /// Request: token = source-directory cap (must carry `MUTATE_DIR`),
+    /// `data[0]` = source name length, `data[1]` = destination name
+    /// length, name bytes packed contiguously from word 2 via
+    /// `IpcMessageBuilder::bytes(2, &concat(src, dst))` — source bytes
+    /// first, destination bytes immediately after with no padding.
+    /// `caps[0]` = destination-directory cap (must also carry
+    /// `MUTATE_DIR`). Source and destination may be the same cap.
+    ///
+    /// Not atomic: an interrupted rename can leave both names present
+    /// or neither. See `services/fs/fat/docs/crash-safety.md`.
+    ///
+    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
+    /// `NOT_FOUND` (source missing), `EXISTS` (destination occupied),
+    /// `NO_SPACE`, `IO_ERROR`.
+    pub const FS_RENAME: u64 = 16;
 }
 
 pub const DEVMGR_LABELS_VERSION: u32 = 1;
@@ -1035,6 +1111,19 @@ pub mod fs_errors
     /// version as `data[0]`; mismatch here means the caller was built
     /// against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 8;
+    /// Mutation refused: the target name already exists in the parent
+    /// directory (`FS_CREATE`, `FS_MKDIR`, `FS_RENAME` destination).
+    pub const EXISTS: u64 = 9;
+    /// Mutation refused: the volume has no free cluster, or the parent
+    /// directory has no room for a new entry (FAT16 fixed root full;
+    /// FAT32 cluster-chain extension failed).
+    pub const NO_SPACE: u64 = 10;
+    /// `FS_REMOVE` refused: the target directory is non-empty.
+    pub const NOT_EMPTY: u64 = 11;
+    /// Operation refused because the target is a directory (e.g.
+    /// `FS_WRITE` on a directory cap) or because the operation is
+    /// permitted only on files.
+    pub const IS_A_DIRECTORY: u64 = 12;
     /// Unknown opcode on fs-driver endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

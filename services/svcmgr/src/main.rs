@@ -529,7 +529,14 @@ fn handle_query_endpoint(
         .cap(derived)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    let send_result = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    if send_result.is_err()
+    {
+        // ipc_reply did not transfer the cap out of svcmgr's CSpace;
+        // delete the freshly-derived slot to avoid cumulative leakage
+        // over svcmgr's lifetime (one slot per failed reply).
+        let _ = syscall::cap_delete(derived);
+    }
 }
 
 /// Drain all pending death notifications from the shared queue. Each

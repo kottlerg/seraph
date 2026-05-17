@@ -413,18 +413,28 @@ pub mod svcmgr_labels
     /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
     pub const QUERY_ENDPOINT: u64 = 4;
 
-    /// Verb-bit `OR`-ed into the caller's token to authorise
-    /// [`PUBLISH_ENDPOINT`]. Init derives SEND caps on svcmgr's service
-    /// endpoint with this bit `OR`-ed into the per-process token for the
-    /// small set of holders trusted to add names to the global registry
-    /// (init itself, devmgr for driver registrations, svcmgr for future
-    /// post-init service launches). The SEND distributed to every
-    /// process via `ProcessInfo.service_registry_cap` carries only the
-    /// per-process token — without this verb-bit — and is accepted on
-    /// `QUERY_ENDPOINT` only; svcmgr rejects publish attempts from
-    /// un-authorised callers with [`svcmgr_errors::UNAUTHORIZED`]. See
-    /// `docs/capability-model.md` "verb-bit authority pattern" for the
-    /// rationale and parallel use in `pwrmgr_labels::SHUTDOWN_AUTHORITY`.
+    /// Verb-bit carried by the caller's token to authorise
+    /// [`PUBLISH_ENDPOINT`]. Init mints SEND caps on svcmgr's service
+    /// endpoint whose token is exactly `PUBLISH_AUTHORITY` (no
+    /// per-publisher identity in the low bits today — server-side
+    /// auth is binary: have the bit, or don't). Holders trusted to
+    /// add names: init itself, devmgr for driver registrations,
+    /// svcmgr's own future post-init service launcher.
+    ///
+    /// The SEND distributed to every process via
+    /// `ProcessInfo.service_registry_cap` carries the child's
+    /// per-process token (no `PUBLISH_AUTHORITY` bit), so it is
+    /// accepted for `QUERY_ENDPOINT` only; svcmgr rejects publish
+    /// attempts whose token lacks the bit with
+    /// [`svcmgr_errors::UNAUTHORIZED`]. See
+    /// `docs/capability-model.md` "verb-bit authority pattern" for
+    /// the rationale and parallel use in
+    /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`.
+    ///
+    /// Per-publisher attenuation (e.g. name-prefix restrictions in
+    /// the low token bits, so a session daemon can publish only
+    /// `user.*`) is the future-work shape and the token namespace
+    /// reserves it — see GitHub issue #76.
     pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
 }
 

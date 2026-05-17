@@ -512,21 +512,51 @@ pub fn create_devmgr_with_caps(
     // copy is delivered only on x86-64 (RISC-V has no I/O ports);
     // devmgr derives narrow per-driver IoPort caps from it for ISA
     // peripherals like the CMOS RTC.
-    if svcmgr_service_ep == 0
+    // SVCMGR_BUNDLE is unconditionally the terminal round. On any
+    // preparation failure init MUST still emit a `done=true` round so
+    // devmgr's bootstrap_rounds loop in `services/devmgr/src/caps.rs`
+    // unblocks; otherwise devmgr spins in `request_round` forever.
+    // Empty-caps terminal round signals "no bundle delivered"; devmgr's
+    // SVCMGR_BUNDLE absorber rejects a zero-cap message and returns
+    // None, which propagates to a clean failure rather than a hang.
+    let prep_failed = svcmgr_service_ep == 0;
+    let svcmgr_publish = if prep_failed
     {
-        log("devmgr: SVCMGR_BUNDLE skipped — no svcmgr service endpoint");
-        return;
+        0
     }
-    let Ok(svcmgr_publish) = syscall::cap_derive_token(
-        svcmgr_service_ep,
-        syscall::RIGHTS_SEND,
-        ipc::svcmgr_labels::PUBLISH_AUTHORITY,
-    )
     else
     {
-        log("devmgr: PUBLISH_AUTHORITY cap derive failed");
-        return;
+        syscall::cap_derive_token(
+            svcmgr_service_ep,
+            syscall::RIGHTS_SEND,
+            ipc::svcmgr_labels::PUBLISH_AUTHORITY,
+        )
+        .unwrap_or(0)
     };
+    if prep_failed
+    {
+        log("devmgr: SVCMGR_BUNDLE prep skipped — no svcmgr service endpoint");
+    }
+    else if svcmgr_publish == 0
+    {
+        log("devmgr: PUBLISH_AUTHORITY cap derive failed");
+    }
+    if svcmgr_publish == 0
+    {
+        // Emit a terminal SVCMGR_BUNDLE with zero caps; devmgr will
+        // notice cap_count == 0 in its absorber and refuse to bootstrap,
+        // but it WILL exit the round-receive loop.
+        let _ = serve(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            true,
+            &[],
+            &[kind::SVCMGR_BUNDLE, 0],
+            "devmgr: empty SVCMGR_BUNDLE failsafe round failed",
+        );
+        return;
+    }
 
     let ioport_root_cap = if cfg!(target_arch = "x86_64")
     {
@@ -2008,29 +2038,49 @@ pub fn create_and_start_rtc_driver(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
+    // Create the service-endpoint pair first so that a hw_cap allocation
+    // doesn't strand if the endpoint create fails — strict construction
+    // order is endpoint, then hw_cap, then walk+CREATE.
+    let (svc_source, svc_recv) = create_service_endpoint_pair()?;
+
     #[cfg(target_arch = "x86_64")]
     let (binary_path, hw_cap) = {
         let path: &[u8] = b"/bin/cmos-rtc";
-        let root = crate::find_cap_by_type(info, CapType::IoPortRange)?;
-        let narrow = ioport_carve(root, 0x70, 2)?;
+        let Some(root) = crate::find_cap_by_type(info, CapType::IoPortRange)
+        else
+        {
+            let _ = syscall::cap_delete(svc_recv);
+            let _ = syscall::cap_delete(svc_source);
+            return None;
+        };
+        let Some(narrow) = ioport_carve(root, 0x70, 2)
+        else
+        {
+            let _ = syscall::cap_delete(svc_recv);
+            let _ = syscall::cap_delete(svc_source);
+            return None;
+        };
         (path, narrow)
     };
     #[cfg(target_arch = "riscv64")]
     let (binary_path, hw_cap) = {
         let path: &[u8] = b"/bin/goldfish-rtc";
-        // QEMU virt platform fact: 0x101000 is the Goldfish RTC page.
-        let mmio = find_aperture_copy(info, 0x0010_1000)?;
+        let Some(mmio) = find_aperture_copy(info, 0x0010_1000)
+        else
+        {
+            let _ = syscall::cap_delete(svc_recv);
+            let _ = syscall::cap_delete(svc_source);
+            return None;
+        };
         (path, mmio)
     };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
     let (binary_path, hw_cap) = {
-        let _ = info;
+        let _ = (info, svc_recv, svc_source);
         return None;
     };
 
     let _ = info;
-
-    let (svc_source, svc_recv) = create_service_endpoint_pair()?;
 
     let Some((process_handle, child_token)) = walk_and_create_from_file(
         binary_path,
@@ -2059,6 +2109,7 @@ pub fn create_and_start_rtc_driver(
         let _ = syscall::cap_delete(hw_cap);
         let _ = syscall::cap_delete(svc_recv);
         let _ = syscall::cap_delete(svc_source);
+        destroy_partial_child(process_handle, ipc_buf);
         return None;
     }
 
@@ -2073,7 +2124,9 @@ pub fn create_and_start_rtc_driver(
     )
     {
         // serve_round MOVES the caps on success; on failure they may or
-        // may not have been consumed. Best-effort delete is safe.
+        // may not have been consumed. Best-effort delete is safe. The
+        // child has been started — we cannot destroy it safely from
+        // here; it will exit on the receive-side failure and be reaped.
         let _ = syscall::cap_delete(svc_source);
         return None;
     }
@@ -2119,6 +2172,7 @@ pub fn create_and_start_timed(
     {
         let _ = syscall::cap_delete(svc_recv);
         let _ = syscall::cap_delete(svc_source);
+        destroy_partial_child(process_handle, ipc_buf);
         return None;
     }
 
@@ -2132,6 +2186,8 @@ pub fn create_and_start_timed(
         "timed: bootstrap round failed",
     )
     {
+        // Child has been started; cannot destroy safely. It will exit
+        // on the receive-side failure and procmgr will reap.
         let _ = syscall::cap_delete(svc_source);
         return None;
     }

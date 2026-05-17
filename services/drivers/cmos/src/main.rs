@@ -256,9 +256,27 @@ fn days_from_civil(y: u32, m: u32, d: u32) -> u64
     era * 146_097 + doe - 719_468
 }
 
+/// Per-month max day count. Index 0 is unused; index 2 (February) is
+/// the non-leap value — leap years bump it before the check.
+const DAYS_IN_MONTH: [u8; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+fn is_leap(year: u32) -> bool
+{
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
 fn epoch_us(c: Calendar) -> Option<u64>
 {
-    if c.month == 0 || c.month > 12 || c.day == 0 || c.day > 31 || c.year < 1970
+    if c.month == 0 || c.month > 12 || c.day == 0 || c.year < 1970
+    {
+        return None;
+    }
+    let mut max_day = u32::from(DAYS_IN_MONTH[c.month as usize]);
+    if c.month == 2 && is_leap(c.year)
+    {
+        max_day = 29;
+    }
+    if c.day > max_day || c.hour >= 24 || c.min >= 60 || c.sec >= 60
     {
         return None;
     }

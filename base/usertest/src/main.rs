@@ -260,9 +260,41 @@ fn system_time_phase()
         "SystemTime/Instant delta divergence: sys={sys_delta:?} mono={mono_delta:?} diff={diff:?}",
     );
 
+    let (y, mo, dd, hh, mm, ss) = epoch_to_ymdhms(secs);
     std::os::seraph::log!(
-        "SystemTime phase passed (epoch_s={secs}, sys_delta={sys_delta:?}, mono_delta={mono_delta:?})"
+        "SystemTime phase passed ({y:04}-{mo:02}-{dd:02}T{hh:02}:{mm:02}:{ss:02}Z, sys_delta={sys_delta:?}, mono_delta={mono_delta:?})"
     );
+}
+
+/// Howard Hinnant's `civil_from_days` (inverse of `days_from_civil`)
+/// inlined for usertest's log line — keeps the dep surface zero. Maps
+/// `secs` since Unix epoch to `(year, month, day, hour, minute, second)`
+/// in UTC; matches `days_from_civil` in `services/drivers/cmos/src/main.rs`.
+///
+/// Operates entirely in unsigned arithmetic: post-2024 secs fit
+/// comfortably under `u32` for day counts and the Hinnant algorithm is
+/// branch-free for years ≥ 0.
+#[allow(clippy::cast_possible_truncation)]
+fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32)
+{
+    let days = secs / 86_400;
+    let sod = (secs % 86_400) as u32;
+    let hh = sod / 3_600;
+    let mm = (sod / 60) % 60;
+    let ss = sod % 60;
+
+    // z is days since 0000-03-01; valid for any post-epoch input.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + (era as u32) * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, d, hh, mm, ss)
 }
 
 /// Terminal phase: invoke pwrmgr SHUTDOWN through the

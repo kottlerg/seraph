@@ -39,13 +39,25 @@ static TIMED_RESOLVED: AtomicU32 = AtomicU32::new(0);
 
 /// Resolve `timed` exactly once per process, even under concurrent
 /// `SystemTime::now()` calls. Returns zero on failure.
+///
+/// Liveness: if the thread that claimed the resolution duty is killed
+/// or panics mid-lookup (no panic on this path today, but the gate
+/// must survive that possibility — a single hung `SystemTime::now()`
+/// must not propagate to the whole process), waiting threads bound
+/// their spin to `SPIN_BUDGET` `pause` iterations, then perform the
+/// lookup themselves rather than wait forever. The cap they obtain is
+/// **not** stored back into `TIMED_CAP` — the resolver-claim winner
+/// retains write ownership — so worst-case repeated stragglers
+/// re-lookup but never deadlock.
 fn timed_cap_once(ipc_buf: *mut u64) -> u32
 {
+    const SPIN_BUDGET: u32 = 1 << 20;
     let c = TIMED_CAP.load(Ordering::Acquire);
     if c != 0
     {
         return c;
     }
+    let mut spins: u32 = 0;
     loop
     {
         match TIMED_RESOLVED.compare_exchange(
@@ -68,8 +80,19 @@ fn timed_cap_once(ipc_buf: *mut u64) -> u32
                 return resolved;
             }
             Err(2) => return TIMED_CAP.load(Ordering::Acquire),
-            // 1 means another thread is resolving; spin briefly.
-            Err(_) => core::hint::spin_loop(),
+            // 1 means another thread is resolving. Spin briefly, then
+            // give up on the wait and do our own non-caching lookup so
+            // a panicked/cancelled resolver cannot wedge us forever.
+            Err(_) =>
+            {
+                spins += 1;
+                if spins > SPIN_BUDGET
+                {
+                    // SAFETY: ipc_buf is the registered IPC buffer page.
+                    return unsafe { registry_client::lookup(b"timed", ipc_buf) }.unwrap_or(0);
+                }
+                core::hint::spin_loop();
+            }
         }
     }
 }

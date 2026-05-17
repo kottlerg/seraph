@@ -3,12 +3,14 @@
 
 //! qemu.rs
 //!
-//! Shared QEMU argv construction and firmware preparation.
+//! Shared QEMU argv construction and per-launch pflash cache for RISC-V.
 //!
 //! Both `run` and `run-parallel` produce QEMU command lines from the same
-//! source of truth (`build_qemu_argv`) and resolve firmware via the same
-//! helpers (`find_ovmf_code`, `prepare_riscv_firmware`). The interactive
-//! launch loop (stdout filtering, terminal restore) stays in
+//! source of truth (`build_qemu_argv`). Firmware discovery lives in
+//! `firmware::{find_ovmf_code, find_riscv_firmware}`; the padding +
+//! caching of RISC-V pflash images stays here in `prepare_riscv_firmware`.
+//! Acceleration-backend selection lives in `accel::detect_for_arch`. The
+//! interactive launch loop (stdout filtering, terminal restore) stays in
 //! `commands/run.rs`; `run-parallel` spawns QEMU directly against per-slot
 //! log files.
 

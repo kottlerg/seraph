@@ -817,7 +817,7 @@ pub mod devmgr_labels
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
 }
 
-pub const BLK_LABELS_VERSION: u32 = 1;
+pub const BLK_LABELS_VERSION: u32 = 2;
 /// IPC labels for block device drivers.
 pub mod blk_labels
 {
@@ -860,6 +860,26 @@ pub mod blk_labels
     /// Reply: empty body, label is the success or error code; the target
     /// Frame is moved back to the caller in `caps[0]` of the reply.
     pub const BLK_READ_INTO_FRAME: u64 = 3;
+    /// Write one or more contiguous sectors from a caller-supplied Frame cap.
+    ///
+    /// Mirror of [`BLK_READ_INTO_FRAME`] for the write direction. The
+    /// caller fills the source frame, then issues the request; the
+    /// driver reads `count * 512` bytes starting at offset 0 and writes
+    /// them to disk.
+    ///
+    /// Request: `data[0]` = starting LBA, `data[1]` = sector count
+    /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
+    /// source Frame (`MAP|READ`; the driver reads `count * 512` bytes
+    /// starting at offset 0 of the frame, packed contiguously). The frame
+    /// must be at least `count * 512` bytes; the driver rejects with
+    /// `INVALID_FRAME_CAP` otherwise. `caps[1]` is reserved for a future
+    /// per-request release handle and is null today. `caps[2]` is a
+    /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
+    /// see [`BLK_READ_INTO_FRAME`] for the userspace-IOMMU framing.
+    /// Reply: empty body, label is the success or error code; the source
+    /// Frame is moved back to the caller in `caps[0]` of the reply (same
+    /// discipline as the read path).
+    pub const BLK_WRITE_FROM_FRAME: u64 = 4;
 }
 
 pub const STREAM_LABELS_VERSION: u32 = 1;
@@ -1192,8 +1212,9 @@ pub mod blk_errors
     pub const OUT_OF_BOUNDS: u64 = 3;
     /// Partition registration rejected (no authority, table full, or bad args).
     pub const REGISTER_REJECTED: u64 = 4;
-    /// `BLK_READ_INTO_FRAME` target cap missing `MAP|WRITE` rights, sized
-    /// other than one page, or absent.
+    /// Frame cap rejected: `BLK_READ_INTO_FRAME` target missing
+    /// `MAP|WRITE` rights, `BLK_WRITE_FROM_FRAME` source missing
+    /// `MAP|READ` rights, sized other than one page, or absent.
     pub const INVALID_FRAME_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the

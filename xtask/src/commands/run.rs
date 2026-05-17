@@ -25,7 +25,7 @@ use crate::qemu::{
 };
 use crate::term::filter::FilterWriter;
 use crate::term::line_gate::LineGate;
-use crate::util::{TerminalGuard, run_with_sigint_ignored, step};
+use crate::util::{TerminalGuard, step};
 
 /// Marker that opens the default-mode line gate. Emitted by the
 /// bootloader as the first line after firmware exits; everything
@@ -99,19 +99,22 @@ fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Resu
     // can screen every byte. stdin and stderr inherit. QEMU's stderr
     // is not part of the firmware-spam problem; passing it through
     // unfiltered preserves any meaningful QEMU diagnostics.
-    let status = run_with_sigint_ignored(|| -> Result<ExitStatus> {
-        let mut child = Command::new(binary)
-            .args(args)
-            .stdout(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to launch {binary}"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("QEMU stdout was piped but unavailable")?;
-        forward_qemu_stdout(stdout, verbose)?;
-        child.wait().context("waiting for QEMU to exit")
-    })?;
+    //
+    // SIGINT handling: the global no-op handler installed in main()
+    // (term::signal::install) means Ctrl+C terminates QEMU directly
+    // via the tty without killing xtask. The TerminalGuard captured
+    // in run() runs its drop on the way out, restoring termios.
+    let mut child = Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to launch {binary}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("QEMU stdout was piped but unavailable")?;
+    forward_qemu_stdout(stdout, verbose)?;
+    let status: ExitStatus = child.wait().context("waiting for QEMU to exit")?;
 
     if !status.success()
     {

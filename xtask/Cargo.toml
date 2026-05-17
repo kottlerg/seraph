@@ -19,6 +19,9 @@ fatfs = "0.3"
 uuid = "1"
 # Regex matching for run-parallel pass/fail classification.
 regex = "1"
+# Portable SIGINT / Ctrl+C handler. Wraps signal(2) on Unix and
+# SetConsoleCtrlHandler on Windows behind a single set_handler call.
+ctrlc = "3"
 
 [lints]
 workspace = true

@@ -12,36 +12,6 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-// ── SIGINT isolation ──────────────────────────────────────────────────────────
-
-/// Run `f` with SIGINT ignored in this process, then restore the previous
-/// signal disposition.
-///
-/// Ctrl+C sends SIGINT to the entire foreground process group (both xtask and
-/// the child process). By ignoring it here the child (QEMU) still receives and
-/// handles SIGINT normally while our process survives long enough to run cleanup
-/// (TerminalGuard restore, etc.).
-pub fn run_with_sigint_ignored<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    // POSIX guarantees: SIGINT = 2, SIG_DFL = 0, SIG_IGN = 1 on all targets
-    // we care about (Linux x86-64, Linux riscv64). xtask is host-only.
-    unsafe extern "C" {
-        fn signal(signum: i32, handler: usize) -> usize;
-    }
-    // SAFETY: signal() is async-signal-safe. We restore the previous disposition
-    // after `f` returns, so no permanent state change.
-    let prev = unsafe {
-        signal(2 /* SIGINT */, 1 /* SIG_IGN */)
-    };
-    let result = f();
-    unsafe {
-        signal(2 /* SIGINT */, prev)
-    };
-    result
-}
-
 // ── Step printing ─────────────────────────────────────────────────────────────
 
 /// Print a `==> msg` step header to stdout and flush immediately.

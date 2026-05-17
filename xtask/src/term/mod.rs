@@ -14,3 +14,4 @@
 
 pub mod filter;
 pub mod line_gate;
+pub mod signal;

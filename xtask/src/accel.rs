@@ -63,8 +63,15 @@ pub const ENV_ACCEL: &str = "SERAPH_ACCEL";
 /// or because the guest is cross-arch and only `Tcg` is possible.
 pub fn detect_for_arch(arch: Arch) -> Accel
 {
-    let env_value = std::env::var(ENV_ACCEL).ok();
-    let env_trimmed = env_value.as_deref().map(str::trim);
+    detect_for_arch_impl(arch, std::env::var(ENV_ACCEL).ok().as_deref())
+}
+
+/// Implementation core of `detect_for_arch`, parameterized on the
+/// env value so tests can exercise the env-override paths without
+/// mutating process-global env state.
+fn detect_for_arch_impl(arch: Arch, env_value: Option<&str>) -> Accel
+{
+    let env_trimmed = env_value.map(str::trim);
 
     if !is_same_arch(arch)
     {
@@ -194,101 +201,61 @@ mod tests
 {
     use super::*;
 
-    fn with_env<F: FnOnce()>(key: &str, value: Option<&str>, f: F)
+    fn native_arch() -> Arch
     {
-        let prev = std::env::var_os(key);
-        // SAFETY: env vars are process-global; tests touching the
-        // same var must not run concurrently. xtask's test surface is
-        // small enough that single-var ownership per test suffices.
-        unsafe {
-            match value
-            {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
+        if cfg!(target_arch = "x86_64")
+        {
+            Arch::X86_64
         }
-        f();
-        unsafe {
-            match prev
-            {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
+        else
+        {
+            Arch::Riscv64
+        }
+    }
+
+    fn cross_arch() -> Arch
+    {
+        if cfg!(target_arch = "x86_64")
+        {
+            Arch::Riscv64
+        }
+        else
+        {
+            Arch::X86_64
         }
     }
 
     #[test]
     fn cross_arch_guest_always_resolves_to_tcg()
     {
-        let cross = if cfg!(target_arch = "x86_64")
-        {
-            Arch::Riscv64
-        }
-        else
-        {
-            Arch::X86_64
-        };
-        with_env(ENV_ACCEL, Some("kvm"), || {
-            assert_eq!(detect_for_arch(cross), Accel::Tcg);
-        });
+        assert_eq!(detect_for_arch_impl(cross_arch(), Some("kvm")), Accel::Tcg);
     }
 
     #[test]
     fn explicit_env_var_tcg_forces_tcg()
     {
-        let native = if cfg!(target_arch = "x86_64")
-        {
-            Arch::X86_64
-        }
-        else
-        {
-            Arch::Riscv64
-        };
-        with_env(ENV_ACCEL, Some("tcg"), || {
-            assert_eq!(detect_for_arch(native), Accel::Tcg);
-        });
+        assert_eq!(detect_for_arch_impl(native_arch(), Some("tcg")), Accel::Tcg);
     }
 
     #[test]
     fn explicit_env_var_auto_falls_through_to_detection()
     {
-        // We can't fully test detection (depends on /dev/kvm), but
-        // we can confirm "auto" does not pin to any specific backend
-        // and is not rejected as invalid: the result must be the same
-        // as no env var set at all.
-        let native = if cfg!(target_arch = "x86_64")
-        {
-            Arch::X86_64
-        }
-        else
-        {
-            Arch::Riscv64
-        };
-        with_env(ENV_ACCEL, None, || {
-            let baseline = detect_for_arch(native);
-            with_env(ENV_ACCEL, Some("auto"), || {
-                assert_eq!(detect_for_arch(native), baseline);
-            });
-        });
+        // We can't fully test detection (depends on /dev/kvm), but we
+        // can confirm "auto" does not pin to a specific backend and
+        // is not rejected as invalid: the result matches the no-env
+        // baseline.
+        let baseline = detect_for_arch_impl(native_arch(), None);
+        assert_eq!(detect_for_arch_impl(native_arch(), Some("auto")), baseline);
     }
 
     #[test]
     fn unknown_env_value_falls_through_to_detection()
     {
-        let native = if cfg!(target_arch = "x86_64")
-        {
-            Arch::X86_64
-        }
-        else
-        {
-            Arch::Riscv64
-        };
-        with_env(ENV_ACCEL, None, || {
-            let baseline = detect_for_arch(native);
-            with_env(ENV_ACCEL, Some("notarealbackend"), || {
-                assert_eq!(detect_for_arch(native), baseline);
-            });
-        });
+        let baseline = detect_for_arch_impl(native_arch(), None);
+        assert_eq!(
+            detect_for_arch_impl(native_arch(), Some("notarealbackend")),
+            baseline,
+        );
     }
 
     #[test]

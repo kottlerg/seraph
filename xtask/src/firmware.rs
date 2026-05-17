@@ -24,6 +24,7 @@
 //! Padding and per-launch caching of the discovered images stays in
 //! `qemu.rs::prepare_riscv_firmware` — this module is pure discovery.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
@@ -121,12 +122,7 @@ pub const ENV_RISCV_VARS: &str = "SERAPH_RISCV_VARS";
 /// supported host.
 pub fn find_ovmf_code() -> Result<PathBuf>
 {
-    find_path(
-        ENV_OVMF_CODE,
-        OVMF_CODE_DEFAULTS,
-        "OVMF code firmware (x86-64)",
-        OVMF_INSTALL_HINTS,
-    )
+    find_ovmf_code_impl(std::env::var_os(ENV_OVMF_CODE).as_deref())
 }
 
 /// Locate the RISC-V EDK2 source images, returning `(code, vars)`.
@@ -140,8 +136,36 @@ pub fn find_ovmf_code() -> Result<PathBuf>
 /// directory containing both files is used.
 pub fn find_riscv_firmware() -> Result<(PathBuf, PathBuf)>
 {
-    let env_code = std::env::var_os(ENV_RISCV_CODE).map(PathBuf::from);
-    let env_vars = std::env::var_os(ENV_RISCV_VARS).map(PathBuf::from);
+    find_riscv_firmware_impl(
+        std::env::var_os(ENV_RISCV_CODE).as_deref(),
+        std::env::var_os(ENV_RISCV_VARS).as_deref(),
+    )
+}
+
+/// Implementation core of `find_ovmf_code`, parameterized on the env
+/// value so tests can exercise the env-override paths without
+/// mutating process-global env state.
+fn find_ovmf_code_impl(env_value: Option<&OsStr>) -> Result<PathBuf>
+{
+    find_path(
+        env_value,
+        ENV_OVMF_CODE,
+        OVMF_CODE_DEFAULTS,
+        "OVMF code firmware (x86-64)",
+        OVMF_INSTALL_HINTS,
+    )
+}
+
+/// Implementation core of `find_riscv_firmware`, parameterized on
+/// the env values so tests can exercise the env-override paths
+/// without mutating process-global env state.
+fn find_riscv_firmware_impl(
+    env_code: Option<&OsStr>,
+    env_vars: Option<&OsStr>,
+) -> Result<(PathBuf, PathBuf)>
+{
+    let env_code = env_code.map(PathBuf::from);
+    let env_vars = env_vars.map(PathBuf::from);
 
     match (env_code, env_vars)
     {
@@ -183,11 +207,19 @@ pub fn find_riscv_firmware() -> Result<(PathBuf, PathBuf)>
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// Resolve a single firmware file path: env var first, then default
-/// list, then structured error.
-fn find_path(env_var: &str, defaults: &[&str], label: &str, hints: &str) -> Result<PathBuf>
+/// Resolve a single firmware file path: env value first (taken as
+/// parameter rather than read from the process env, so callers in
+/// tests can supply mock values without mutating global state), then
+/// default list, then structured error.
+fn find_path(
+    env_value: Option<&OsStr>,
+    env_var: &str,
+    defaults: &[&str],
+    label: &str,
+    hints: &str,
+) -> Result<PathBuf>
 {
-    if let Some(value) = std::env::var_os(env_var)
+    if let Some(value) = env_value
     {
         let path = PathBuf::from(value);
         if path.is_file()
@@ -295,112 +327,74 @@ mod tests
 {
     use super::*;
 
-    /// Helper: run `f` with an env var set, then restore. Avoids
-    /// cross-test pollution because each test owns one env var
-    /// exclusively for the duration of the call.
-    fn with_env_var<F: FnOnce()>(key: &str, value: &str, f: F)
+    /// A known-existing file inside the workspace, used as a stand-in
+    /// for a real firmware image in env-override tests.
+    fn existing_workspace_file() -> PathBuf
     {
-        let prev = std::env::var_os(key);
-        // SAFETY: cargo runs tests serialized per process by default
-        // only for `--test-threads=1`; multi-threaded tests sharing
-        // env vars is racy. The two env-var tests here use distinct
-        // keys to minimize interaction, but a reader of these tests
-        // should know that the underlying env mutation is
-        // process-global. Acceptable for xtask's small test surface.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        f();
-        unsafe {
-            match prev
-            {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Cargo.toml")
     }
 
     #[test]
     fn env_var_override_pointing_at_missing_file_returns_error()
     {
-        with_env_var(ENV_OVMF_CODE, "/nonexistent/firmware/path.fd", || {
-            let err = find_ovmf_code().unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("SERAPH_OVMF_CODE"),
-                "error should name the env var: {msg}",
-            );
-            assert!(
-                msg.contains("/nonexistent/firmware/path.fd"),
-                "error should include the bad path: {msg}",
-            );
-        });
+        let bogus = OsStr::new("/nonexistent/firmware/path.fd");
+        let err = find_ovmf_code_impl(Some(bogus)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("SERAPH_OVMF_CODE"),
+            "error should name the env var: {msg}",
+        );
+        assert!(
+            msg.contains("/nonexistent/firmware/path.fd"),
+            "error should include the bad path: {msg}",
+        );
     }
 
     #[test]
     fn env_var_override_pointing_at_existing_file_succeeds()
     {
-        // Cargo.toml is a known-existing file in the workspace.
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Cargo.toml");
-        let workspace_str = workspace.to_str().unwrap();
-        with_env_var(ENV_OVMF_CODE, workspace_str, || {
-            let resolved = find_ovmf_code().unwrap();
-            assert_eq!(resolved, workspace);
-        });
+        let workspace = existing_workspace_file();
+        let resolved = find_ovmf_code_impl(Some(workspace.as_os_str())).unwrap();
+        assert_eq!(resolved, workspace);
     }
 
     #[test]
     fn riscv_firmware_with_both_env_vars_skips_directory_search()
     {
-        let workspace_cargo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Cargo.toml");
-        let path = workspace_cargo.to_str().unwrap();
-        with_env_var(ENV_RISCV_CODE, path, || {
-            with_env_var(ENV_RISCV_VARS, path, || {
-                let (code, vars) = find_riscv_firmware().unwrap();
-                assert_eq!(code, workspace_cargo);
-                assert_eq!(vars, workspace_cargo);
-            });
-        });
+        let workspace = existing_workspace_file();
+        let os = workspace.as_os_str();
+        let (code, vars) = find_riscv_firmware_impl(Some(os), Some(os)).unwrap();
+        assert_eq!(code, workspace);
+        assert_eq!(vars, workspace);
     }
 
     #[test]
-    fn riscv_firmware_with_only_one_env_var_set_is_rejected()
+    fn riscv_firmware_with_only_code_env_var_set_is_rejected()
     {
         // Setting only SERAPH_RISCV_CODE (without the matching VARS)
         // would silently pair a custom code image against the system
         // vars template — a real footgun. Require both or neither.
-        let workspace_cargo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("Cargo.toml");
-        let path = workspace_cargo.to_str().unwrap();
-        // Ensure the partner is unset for the duration of the test.
-        let prev_vars = std::env::var_os(ENV_RISCV_VARS);
-        // SAFETY: tests are single-threaded within this process for env
-        // mutation; we restore on the way out.
-        unsafe {
-            std::env::remove_var(ENV_RISCV_VARS);
-        }
-        with_env_var(ENV_RISCV_CODE, path, || {
-            let err = find_riscv_firmware().unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("must be set together"),
-                "expected pairing-error, got: {msg}",
-            );
-        });
-        unsafe {
-            match prev_vars
-            {
-                Some(v) => std::env::set_var(ENV_RISCV_VARS, v),
-                None => std::env::remove_var(ENV_RISCV_VARS),
-            }
-        }
+        let workspace = existing_workspace_file();
+        let err = find_riscv_firmware_impl(Some(workspace.as_os_str()), None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be set together"),
+            "expected pairing-error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn riscv_firmware_with_only_vars_env_var_set_is_rejected()
+    {
+        let workspace = existing_workspace_file();
+        let err = find_riscv_firmware_impl(None, Some(workspace.as_os_str())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be set together"),
+            "expected pairing-error, got: {msg}",
+        );
     }
 }

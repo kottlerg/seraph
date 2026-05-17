@@ -142,6 +142,28 @@ impl NodeTable
             node.open_slot = slot;
         }
     }
+
+    /// Invalidate any entries that match `(cluster, kind, size)`.
+    /// Called from `FS_REMOVE` so a follow-on `FS_CREATE` that lands at
+    /// the same disk location does not dedupe to a stale `NodeId`.
+    ///
+    /// The append-only table cannot recycle slots (filed as Issue #27),
+    /// so the slot is left present but cleared to `None`; the dedupe
+    /// scan in `alloc()` only matches `Some` entries.
+    #[allow(dead_code)] // wired in by the FS_REMOVE handler in a later commit
+    pub fn invalidate_for_entry(&mut self, cluster: u32, kind: NodeKind, size: u32)
+    {
+        for slot in &mut self.entries[..self.len]
+        {
+            if let Some(existing) = slot
+                && existing.cluster == cluster
+                && existing.kind == kind
+                && existing.size == size
+            {
+                *slot = None;
+            }
+        }
+    }
 }
 
 /// `NamespaceBackend` over a FAT volume.
@@ -247,16 +269,28 @@ impl NamespaceBackend for FatfsBackend<'_>
             })
             .ok_or(NsError::OutOfResources)?;
 
+        // Rights composition (`parent ∩ entry.max ∩ requested`) means a
+        // dir's `max_rights` ceiling must include every bit a child
+        // file or subdir might legitimately inherit — otherwise the
+        // walk drops `READ` (or `WRITE`) on a leaf because an
+        // intermediate dir cleared it. Dirs therefore carry the full
+        // mask (the per-operation rights enforcement at the leaf still
+        // gates each request via `gate()`); files narrow to the
+        // file-only set.
+        let max = match kind
+        {
+            NodeKind::Dir => NamespaceRights::ALL,
+            NodeKind::File => NamespaceRights::from_raw(
+                rights::STAT | rights::READ | rights::WRITE | rights::EXEC,
+            ),
+        };
         Ok(EntryView {
             target: EntryTarget::Local(node_id),
             kind,
             size_hint: u64::from(entry.size),
-            // Read-only volume: hand out everything the namespace
-            // model defines as observable. Future write support
-            // narrows this on a per-entry basis.
-            max_rights: NamespaceRights::from_raw(
-                rights::LOOKUP | rights::READDIR | rights::STAT | rights::READ | rights::EXEC,
-            ),
+            // FAT directory `DIR_ATTR_READ_ONLY` is not honoured here;
+            // tracked as a follow-up Issue.
+            max_rights: max,
             visible_requires: NamespaceRights::NONE,
         })
     }

@@ -451,7 +451,7 @@ fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, dea
         }
         svcmgr_labels::QUERY_ENDPOINT =>
         {
-            handle_query_endpoint(&msg, &state.registry, ipc_buf);
+            handle_query_endpoint(&msg, &mut state.registry, ipc_buf);
         }
         _ =>
         {
@@ -496,7 +496,7 @@ fn handle_publish_endpoint(
 /// reply with a derived SEND cap if found.
 fn handle_query_endpoint(
     msg: &IpcMessage,
-    registry: &registry::Registry<REGISTRY_CAPACITY>,
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
     ipc_buf: *mut u64,
 )
 {
@@ -520,6 +520,12 @@ fn handle_query_endpoint(
     let Ok(derived) = syscall::cap_derive(cap, syscall::RIGHTS_SEND)
     else
     {
+        // cap_derive failures on a stored entry are terminal — the
+        // publisher's endpoint object is gone (e.g. service died and
+        // procmgr reaped the source). Evict the dead entry so future
+        // queries get UNKNOWN_NAME instead of looping on INSUFFICIENT_CAPS.
+        let _ = registry.remove(&name[..name_len]);
+        let _ = syscall::cap_delete(cap);
         let reply = IpcMessage::new(ipc::svcmgr_errors::INSUFFICIENT_CAPS);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

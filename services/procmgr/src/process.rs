@@ -734,7 +734,12 @@ fn populate_child_info(
             process_token,
         )
         .ok()?;
-        let child_side = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_SEND).ok()?;
+        let Ok(child_side) = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_SEND)
+        else
+        {
+            let _ = syscall::cap_delete(proc_side);
+            return None;
+        };
         let _ = syscall::cap_delete(proc_side);
         child_side
     }

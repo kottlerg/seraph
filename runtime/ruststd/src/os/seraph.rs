@@ -715,10 +715,10 @@ pub mod log {
 }
 
 /// Service-registry client surface. Re-exports
-/// [`::registry_client::lookup`] / `publish` against the std-built
-/// instance of registry-client — direct dependents would otherwise
-/// pull in their own compile of the crate and miss the
-/// `REGISTRY_CAP` static that `_start` installed.
+/// [`::registry_client::lookup`] against the std-built instance of
+/// registry-client — direct dependents would otherwise pull in their
+/// own compile of the crate and miss the `REGISTRY_CAP` static that
+/// `_start` installed.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub mod registry {
     use super::current_ipc_buf;

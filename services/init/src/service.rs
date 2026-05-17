@@ -526,9 +526,12 @@ pub fn create_devmgr_with_caps(
     }
     else
     {
+        // RIGHTS_SEND_GRANT (not bare SEND): PUBLISH_ENDPOINT carries the
+        // service's SEND cap in the message, and the IPC kernel requires the
+        // GRANT bit on the caller's send-cap to transfer caps.
         syscall::cap_derive_token(
             svcmgr_service_ep,
-            syscall::RIGHTS_SEND,
+            syscall::RIGHTS_SEND_GRANT,
             ipc::svcmgr_labels::PUBLISH_AUTHORITY,
         )
         .unwrap_or(0)
@@ -1939,9 +1942,20 @@ fn svcmgr_publish(publish_cap: u32, name: &[u8], send_cap: u32, ipc_buf: *mut u6
 fn ioport_carve(root_cap: u32, base: u16, count: u16) -> Option<u32>
 {
     let working = syscall::cap_derive(root_cap, syscall::RIGHTS_ALL).ok()?;
-    let (lower_unused, upper) = syscall::ioport_split(working, base).ok()?;
+    let upper_split_at = base.checked_add(count)?;
+    let Ok((lower_unused, upper)) = syscall::ioport_split(working, base)
+    else
+    {
+        let _ = syscall::cap_delete(working);
+        return None;
+    };
     let _ = syscall::cap_delete(lower_unused);
-    let (narrow, upper_unused) = syscall::ioport_split(upper, base + count).ok()?;
+    let Ok((narrow, upper_unused)) = syscall::ioport_split(upper, upper_split_at)
+    else
+    {
+        let _ = syscall::cap_delete(upper);
+        return None;
+    };
     let _ = syscall::cap_delete(upper_unused);
     Some(narrow)
 }
@@ -2076,11 +2090,11 @@ pub fn create_and_start_rtc_driver(
     };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
     let (binary_path, hw_cap) = {
-        let _ = (info, svc_recv, svc_source);
+        let _ = info;
+        let _ = syscall::cap_delete(svc_recv);
+        let _ = syscall::cap_delete(svc_source);
         return None;
     };
-
-    let _ = info;
 
     let Some((process_handle, child_token)) = walk_and_create_from_file(
         binary_path,
@@ -2124,9 +2138,12 @@ pub fn create_and_start_rtc_driver(
     )
     {
         // serve_round MOVES the caps on success; on failure they may or
-        // may not have been consumed. Best-effort delete is safe. The
-        // child has been started — we cannot destroy it safely from
+        // may not have been consumed. Best-effort delete on every cap
+        // is safe (delete of an already-transferred slot is a no-op).
+        // The child has been started — we cannot destroy it safely from
         // here; it will exit on the receive-side failure and be reaped.
+        let _ = syscall::cap_delete(svc_recv);
+        let _ = syscall::cap_delete(hw_cap);
         let _ = syscall::cap_delete(svc_source);
         return None;
     }
@@ -2186,8 +2203,10 @@ pub fn create_and_start_timed(
         "timed: bootstrap round failed",
     )
     {
-        // Child has been started; cannot destroy safely. It will exit
-        // on the receive-side failure and procmgr will reap.
+        // Best-effort delete: serve_round may have transferred svc_recv
+        // before failing. Child has been started; cannot destroy safely.
+        // It will exit on the receive-side failure and procmgr will reap.
+        let _ = syscall::cap_delete(svc_recv);
         let _ = syscall::cap_delete(svc_source);
         return None;
     }
@@ -2250,6 +2269,7 @@ pub fn bring_up_wallclock(
     if !svcmgr_publish(publish_cap, b"rtc.primary", rtc_publish_send, ipc_buf)
     {
         log("phase 3: rtc.primary publish failed");
+        let _ = syscall::cap_delete(rtc_publish_send);
         let _ = syscall::cap_delete(publish_cap);
         return;
     }
@@ -2278,6 +2298,7 @@ pub fn bring_up_wallclock(
     if !svcmgr_publish(publish_cap, b"timed", timed_publish_send, ipc_buf)
     {
         log("phase 3: timed publish failed");
+        let _ = syscall::cap_delete(timed_publish_send);
         let _ = syscall::cap_delete(publish_cap);
         return;
     }

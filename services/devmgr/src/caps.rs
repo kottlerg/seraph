@@ -220,6 +220,10 @@ fn absorb_aperture_round(
     let n = batch_count.min(round_cap_count).min(4);
     for (i, &slot) in round_caps.iter().take(n).enumerate()
     {
+        if slot == 0
+        {
+            continue;
+        }
         if caps.aperture_count >= caps.apertures.len()
         {
             break;
@@ -245,6 +249,10 @@ fn absorb_acpi_region_round(
     let n = batch_count.min(round_cap_count).min(4);
     for (i, &slot) in round_caps.iter().take(n).enumerate()
     {
+        if slot == 0
+        {
+            continue;
+        }
         if caps.acpi_region_count >= caps.acpi_regions.len()
         {
             break;
@@ -264,6 +272,10 @@ fn absorb_module_round(round_caps: &[u32], round_cap_count: usize, caps: &mut De
     let n = round_cap_count.min(4);
     for &slot in round_caps.iter().take(n)
     {
+        if slot == 0
+        {
+            continue;
+        }
         if caps.driver_module_count >= caps.driver_module_slots.len()
         {
             break;

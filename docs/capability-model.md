@@ -279,14 +279,22 @@ Each privileged verb reserves one high bit of the u64 token namespace
 as its authority marker (`1u64 << 63` is the convention for the
 endpoint's first verb-bit). The set-once token rules above mean:
 
-- The server holds the un-tokened source cap. It is the only entity
-  that can mint a token with the verb-bit set.
-- Distribution of a "publish authority" cap and a "query-only" cap
-  differ only in whether the trusted distributor ORs the verb-bit into
-  the per-process token before calling `cap_derive_token`.
-- A holder of a query-only cap **cannot** re-derive an authority cap:
-  set-once rules forbid changing the token, and re-deriving from the
-  un-tokened source requires a source the caller doesn't have.
+- The server and its trusted bootstrap-time minters (init, and any
+  distributor init has delegated the un-tokened source to — devmgr
+  receives such a cap for `PUBLISH_AUTHORITY` in this codebase) are
+  the only entities that can mint a token with the verb-bit set. Every
+  other client holds only the tokened copies these distributors
+  chose to give them.
+- Distribution of an "authority" cap and an "unprivileged" cap differ
+  only in whether the trusted distributor sets the verb-bit in the
+  token passed to `cap_derive_token`. In this codebase the authority
+  cap's token is the verb-bit alone (no per-publisher identity in the
+  low bits); per-publisher attenuation (e.g. restricting registrations
+  to a name prefix) is the future-work shape and is tracked as a
+  follow-up issue.
+- A holder of an unprivileged cap **cannot** re-derive an authority
+  cap: set-once rules forbid changing the token, and re-deriving from
+  the un-tokened source requires a source the caller doesn't have.
 - The server's dispatcher checks `msg.token & VERB_BIT != 0` before
   servicing the privileged label and replies `UNAUTHORIZED` otherwise
   (`svcmgr_labels::PUBLISH_AUTHORITY`, `pwrmgr_labels::SHUTDOWN_AUTHORITY`).

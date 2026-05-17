@@ -67,6 +67,9 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //   provides coarse-grained coverage in lockstep with workspace-inherited
 //   versioning.
 //     PROCMGR_LABELS_VERSION
+//     PWRMGR_LABELS_VERSION
+//     RTC_LABELS_VERSION
+//     TIMED_LABELS_VERSION
 
 pub const PROCMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the process manager (`procmgr`).
@@ -463,6 +466,7 @@ pub mod rtc_labels
     pub const RTC_GET_EPOCH_TIME: u64 = 1;
 }
 
+/// Error replies from RTC chip drivers.
 pub mod rtc_errors
 {
     pub const SUCCESS: u64 = 0;
@@ -472,6 +476,10 @@ pub mod rtc_errors
     pub const READ_FAILED: u64 = 1;
     /// Driver received a label it does not implement.
     pub const UNKNOWN_OPCODE: u64 = 2;
+    /// Reserved for a future per-message version handshake. Unused
+    /// today — `RTC_LABELS_VERSION` is marker-only and covered by
+    /// `PROCESS_ABI_VERSION` at process startup.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
 pub const TIMED_LABELS_VERSION: u32 = 1;
@@ -493,6 +501,7 @@ pub mod timed_labels
     pub const GET_WALL_TIME: u64 = 1;
 }
 
+/// Error replies from the wall-clock service.
 pub mod timed_errors
 {
     pub const SUCCESS: u64 = 0;
@@ -504,6 +513,10 @@ pub mod timed_errors
     /// level rather than panicking.
     pub const WALL_CLOCK_UNAVAILABLE: u64 = 1;
     pub const UNKNOWN_OPCODE: u64 = 2;
+    /// Reserved for a future per-message version handshake. Unused
+    /// today — `TIMED_LABELS_VERSION` is marker-only and covered by
+    /// `PROCESS_ABI_VERSION` at process startup.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
 pub const PWRMGR_LABELS_VERSION: u32 = 1;

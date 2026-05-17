@@ -388,6 +388,12 @@ pub struct ProcessInfo
     /// suitable for direct `STREAM_BYTES` / `STREAM_REGISTER_NAME`
     /// use.
     ///
+    /// **Deprecated**: this slot predates the service registry and is
+    /// on a migration path to lookup via [`service_registry_cap`]. New
+    /// services MUST NOT add per-service fixed slots like this one;
+    /// the registry is the system-wide service-discovery channel from
+    /// this point forward. See follow-up issue tracking the migration.
+    ///
     /// Procmgr derives this cap per spawn via `cap_derive_token` on
     /// the log endpoint it holds, using the child's procmgr-assigned
     /// token as the cap's token. Logd sees the same token on every

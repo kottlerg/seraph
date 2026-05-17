@@ -106,14 +106,21 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, offset: Option<u64>) -> !
 /// Look up `rtc.primary` and compute the wall-clock offset. Returns
 /// `None` if any step fails (no registry, no RTC, RTC read error); the
 /// service then runs in `WALL_CLOCK_UNAVAILABLE` mode.
+///
+/// Brackets the RTC IPC with two `ElapsedUs` reads so the kernel-side
+/// moment of the RTC sample is approximated as the midpoint of the
+/// roundtrip; subtracting that midpoint from the RTC value removes
+/// most of the IPC-roundtrip bias from the resulting offset.
 fn compute_offset(ipc_buf: *mut u64) -> Option<u64>
 {
     let rtc_cap = std::os::seraph::registry::lookup(b"rtc.primary")?;
+    let kernel_pre = kernel_elapsed_us();
     let rtc_us = query_rtc(rtc_cap, ipc_buf);
+    let kernel_post = kernel_elapsed_us();
     let _ = syscall::cap_delete(rtc_cap);
     let rtc_us = rtc_us?;
-    let kernel_us = kernel_elapsed_us();
-    Some(rtc_us.wrapping_sub(kernel_us))
+    let kernel_mid = kernel_pre.wrapping_add(kernel_post.wrapping_sub(kernel_pre) / 2);
+    Some(rtc_us.wrapping_sub(kernel_mid))
 }
 
 fn main() -> !

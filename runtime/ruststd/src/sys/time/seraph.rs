@@ -40,15 +40,14 @@ static TIMED_RESOLVED: AtomicU32 = AtomicU32::new(0);
 /// Resolve `timed` exactly once per process, even under concurrent
 /// `SystemTime::now()` calls. Returns zero on failure.
 ///
-/// Liveness: if the thread that claimed the resolution duty is killed
-/// or panics mid-lookup (no panic on this path today, but the gate
-/// must survive that possibility — a single hung `SystemTime::now()`
-/// must not propagate to the whole process), waiting threads bound
-/// their spin to `SPIN_BUDGET` `pause` iterations, then perform the
-/// lookup themselves rather than wait forever. The cap they obtain is
-/// **not** stored back into `TIMED_CAP` — the resolver-claim winner
-/// retains write ownership — so worst-case repeated stragglers
-/// re-lookup but never deadlock.
+/// Liveness: the gate is designed to survive a resolver that panics
+/// or is killed mid-lookup — a single hung `SystemTime::now()` must
+/// not propagate to the whole process. Waiting threads bound their
+/// spin to `SPIN_BUDGET` `pause` iterations, then perform the lookup
+/// themselves. The straggler tries to install its result via a second
+/// compare-exchange; on collision (resolver finished first) it deletes
+/// its now-redundant cap and returns the resolver's. This bounds
+/// CSpace consumption to one slot per stuck-resolver event.
 fn timed_cap_once(ipc_buf: *mut u64) -> u32
 {
     const SPIN_BUDGET: u32 = 1 << 20;
@@ -81,15 +80,37 @@ fn timed_cap_once(ipc_buf: *mut u64) -> u32
             }
             Err(2) => return TIMED_CAP.load(Ordering::Acquire),
             // 1 means another thread is resolving. Spin briefly, then
-            // give up on the wait and do our own non-caching lookup so
-            // a panicked/cancelled resolver cannot wedge us forever.
+            // give up on the wait and do our own lookup so a panicked
+            // or cancelled resolver cannot wedge us forever.
             Err(_) =>
             {
                 spins += 1;
                 if spins > SPIN_BUDGET
                 {
                     // SAFETY: ipc_buf is the registered IPC buffer page.
-                    return unsafe { registry_client::lookup(b"timed", ipc_buf) }.unwrap_or(0);
+                    let fallback = unsafe { registry_client::lookup(b"timed", ipc_buf) }
+                        .unwrap_or(0);
+                    if fallback == 0
+                    {
+                        return 0;
+                    }
+                    // Try to install our result. If the resolver finished
+                    // first and stored its own cap, delete ours and use
+                    // theirs — keeps the per-process CSpace bounded.
+                    match TIMED_CAP.compare_exchange(
+                        0,
+                        fallback,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    {
+                        Ok(_) => return fallback,
+                        Err(installed) =>
+                        {
+                            let _ = syscall::cap_delete(fallback);
+                            return installed;
+                        }
+                    }
                 }
                 core::hint::spin_loop();
             }

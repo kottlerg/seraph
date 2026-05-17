@@ -1123,7 +1123,10 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
 /// `split_at` is the first port of the upper child (and the exclusive upper
 /// bound of the lower child); it must satisfy `base < split_at < base + size`
 /// on the cap being split, with `size == 0` interpreted as the full 64K
-/// range. The original cap is revoked on success; both children inherit the
+/// range. Additionally `split_at` must be non-zero (a zero split would
+/// yield an empty lower half) and lie in `1..=0xFFFF`; the kernel rejects
+/// values outside that range with `InvalidArgument` before loading the cap.
+/// The original cap is revoked on success; both children inherit the
 /// parent's rights. Returns packed `(lower_slot, upper_slot)`.
 ///
 /// On RISC-V: always returns `NotSupported`.

@@ -571,7 +571,15 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*caller_cspace).lock.unlock_raw(saved);
         r
     }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    .map_err(|_| {
+        // SAFETY: child1_ptr and child2_ptr just allocated above with
+        // refcount 1; neither has been inserted into any CSpace.
+        unsafe {
+            dealloc_object(child1_ptr);
+            dealloc_object(child2_ptr);
+        }
+        SyscallError::OutOfMemory
+    })?;
     let slot1 = slot1_nz.get();
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let slot2_nz = unsafe {
@@ -581,15 +589,21 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         r
     }
     .map_err(|_| {
-        // Undo slot1 insertion on failure.
+        // Undo slot1 insertion and release both objects: child1_ptr was
+        // inserted (held only via slot1, which we are about to free);
+        // child2_ptr was passed to the failing insert_cap and never
+        // stored, so the kernel object is unreachable unless dropped.
         // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
         unsafe {
             let saved = (*caller_cspace).lock.lock_raw();
             (*caller_cspace).free_slot(slot1);
             (*caller_cspace).lock.unlock_raw(saved);
         }
-        // SAFETY: child1_ptr just allocated above; ref count is 1.
-        unsafe { dealloc_object(child1_ptr) };
+        // SAFETY: both child pointers just allocated above with refcount 1.
+        unsafe {
+            dealloc_object(child1_ptr);
+            dealloc_object(child2_ptr);
+        }
         SyscallError::OutOfMemory
     })?;
     let slot2 = slot2_nz.get();
@@ -765,7 +779,15 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*caller_cspace).lock.unlock_raw(saved);
         r
     }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    .map_err(|_| {
+        // SAFETY: child1_ptr and child2_ptr just allocated above with
+        // refcount 1; neither has been inserted into any CSpace.
+        unsafe {
+            dealloc_object(child1_ptr);
+            dealloc_object(child2_ptr);
+        }
+        SyscallError::OutOfMemory
+    })?;
     let slot1 = slot1_nz.get();
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let slot2_nz = unsafe {
@@ -775,14 +797,21 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         r
     }
     .map_err(|_| {
+        // Undo slot1 insertion and release both objects: child1_ptr was
+        // inserted (held only via slot1, which we are about to free);
+        // child2_ptr was passed to the failing insert_cap and never
+        // stored.
         // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
         unsafe {
             let saved = (*caller_cspace).lock.lock_raw();
             (*caller_cspace).free_slot(slot1);
             (*caller_cspace).lock.unlock_raw(saved);
         }
-        // SAFETY: child1_ptr just allocated above; ref count is 1.
-        unsafe { dealloc_object(child1_ptr) };
+        // SAFETY: both child pointers just allocated above with refcount 1.
+        unsafe {
+            dealloc_object(child1_ptr);
+            dealloc_object(child2_ptr);
+        }
         SyscallError::OutOfMemory
     })?;
     let slot2 = slot2_nz.get();
@@ -989,7 +1018,15 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             (*caller_cspace).lock.unlock_raw(saved);
             r
         }
-        .map_err(|_| SyscallError::OutOfMemory)?;
+        .map_err(|_| {
+            // SAFETY: child1_ptr and child2_ptr just allocated above with
+            // refcount 1; neither has been inserted into any CSpace.
+            unsafe {
+                dealloc_object(child1_ptr);
+                dealloc_object(child2_ptr);
+            }
+            SyscallError::OutOfMemory
+        })?;
         let slot1 = slot1_nz.get();
         // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
         let slot2_nz = unsafe {
@@ -999,14 +1036,21 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             r
         }
         .map_err(|_| {
+            // Undo slot1 insertion and release both objects: child1_ptr was
+            // inserted (held only via slot1, which we are about to free);
+            // child2_ptr was passed to the failing insert_cap and never
+            // stored.
             // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
             unsafe {
                 let saved = (*caller_cspace).lock.lock_raw();
                 (*caller_cspace).free_slot(slot1);
                 (*caller_cspace).lock.unlock_raw(saved);
             }
-            // SAFETY: child1_ptr just allocated above; ref count is 1.
-            unsafe { dealloc_object(child1_ptr) };
+            // SAFETY: both child pointers just allocated above with refcount 1.
+            unsafe {
+                dealloc_object(child1_ptr);
+                dealloc_object(child2_ptr);
+            }
             SyscallError::OutOfMemory
         })?;
         let slot2 = slot2_nz.get();

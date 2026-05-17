@@ -49,9 +49,6 @@ pub struct LineGate<W: Write>
     opened: bool,
 }
 
-// LineGate is wired into the QEMU stdout pipeline in a separate commit
-// on this branch; until then it has no caller in the binary.
-#[allow(dead_code)]
 impl<W: Write> LineGate<W>
 {
     /// Wrap `inner` in a gate keyed on `marker`. Bytes are dropped
@@ -65,10 +62,7 @@ impl<W: Write> LineGate<W>
     /// builds.
     pub fn new(inner: W, marker: &[u8]) -> Self
     {
-        debug_assert!(
-            !marker.is_empty(),
-            "LineGate marker must be non-empty",
-        );
+        debug_assert!(!marker.is_empty(), "LineGate marker must be non-empty",);
         debug_assert!(
             marker.iter().all(|&b| b.is_ascii() && b != 0x1b),
             "LineGate marker must be plain ASCII with no ESC byte",
@@ -79,13 +73,6 @@ impl<W: Write> LineGate<W>
             line: Vec::new(),
             opened: false,
         }
-    }
-
-    /// Recover the inner writer. Any bytes still buffered in the
-    /// in-progress line are discarded.
-    pub fn into_inner(self) -> W
-    {
-        self.inner
     }
 }
 
@@ -155,19 +142,25 @@ mod tests
 
     fn run(input: &[u8]) -> Vec<u8>
     {
-        let mut g = LineGate::new(Vec::new(), MARKER);
-        g.write_all(input).unwrap();
-        g.into_inner()
+        let mut out = Vec::new();
+        {
+            let mut g = LineGate::new(&mut out, MARKER);
+            g.write_all(input).unwrap();
+        }
+        out
     }
 
     fn run_one_byte_at_a_time(input: &[u8]) -> Vec<u8>
     {
-        let mut g = LineGate::new(Vec::new(), MARKER);
-        for &b in input
+        let mut out = Vec::new();
         {
-            g.write_all(&[b]).unwrap();
+            let mut g = LineGate::new(&mut out, MARKER);
+            for &b in input
+            {
+                g.write_all(&[b]).unwrap();
+            }
         }
-        g.into_inner()
+        out
     }
 
     #[test]
@@ -188,10 +181,7 @@ mod tests
     fn passes_through_all_lines_after_marker()
     {
         let input = b"junk\n[--------] boot: hi\nafter1\nafter2\n";
-        assert_eq!(
-            run(input),
-            b"[--------] boot: hi\nafter1\nafter2\n",
-        );
+        assert_eq!(run(input), b"[--------] boot: hi\nafter1\nafter2\n",);
     }
 
     #[test]
@@ -215,10 +205,7 @@ mod tests
     fn marker_split_across_writes_is_detected()
     {
         let input = b"junk\n[--------] boot: split\n";
-        assert_eq!(
-            run_one_byte_at_a_time(input),
-            b"[--------] boot: split\n",
-        );
+        assert_eq!(run_one_byte_at_a_time(input), b"[--------] boot: split\n",);
     }
 
     #[test]
@@ -246,7 +233,8 @@ mod tests
     #[test]
     fn write_returns_full_input_length_before_marker()
     {
-        let mut g = LineGate::new(Vec::new(), MARKER);
+        let mut out = Vec::new();
+        let mut g = LineGate::new(&mut out, MARKER);
         let n = g.write(b"pre-marker garbage\n").unwrap();
         assert_eq!(n, 19);
     }
@@ -254,7 +242,8 @@ mod tests
     #[test]
     fn write_returns_full_input_length_after_marker()
     {
-        let mut g = LineGate::new(Vec::new(), MARKER);
+        let mut out = Vec::new();
+        let mut g = LineGate::new(&mut out, MARKER);
         g.write_all(b"[--------] boot: x\n").unwrap();
         let n = g.write(b"hello\n").unwrap();
         assert_eq!(n, 6);
@@ -265,10 +254,7 @@ mod tests
     {
         // Marker line and a subsequent line arrive in the same write.
         let input = b"[--------] boot: hi\nimmediate next line\n";
-        assert_eq!(
-            run(input),
-            b"[--------] boot: hi\nimmediate next line\n",
-        );
+        assert_eq!(run(input), b"[--------] boot: hi\nimmediate next line\n",);
     }
 
     #[test]
@@ -294,13 +280,15 @@ mod tests
     #[should_panic(expected = "LineGate marker must be non-empty")]
     fn empty_marker_panics_in_debug()
     {
-        let _ = LineGate::new(Vec::new(), b"");
+        let mut sink = Vec::new();
+        let _ = LineGate::new(&mut sink, b"");
     }
 
     #[test]
     #[should_panic(expected = "plain ASCII with no ESC byte")]
     fn marker_containing_esc_panics_in_debug()
     {
-        let _ = LineGate::new(Vec::new(), b"\x1b[boot");
+        let mut sink = Vec::new();
+        let _ = LineGate::new(&mut sink, b"\x1b[boot");
     }
 }

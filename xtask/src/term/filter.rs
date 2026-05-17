@@ -90,9 +90,6 @@ pub struct FilterWriter<W: Write>
     pending: Vec<u8>,
 }
 
-// FilterWriter is wired into the QEMU stdout pipeline in a separate
-// commit; until then it has no caller in the binary.
-#[allow(dead_code)]
 impl<W: Write> FilterWriter<W>
 {
     /// Wrap `inner` in a filter. Bytes written to the returned writer
@@ -105,13 +102,6 @@ impl<W: Write> FilterWriter<W>
             state: State::Ground,
             pending: Vec::new(),
         }
-    }
-
-    /// Recover the inner writer. Any bytes still buffered mid-sequence
-    /// are discarded.
-    pub fn into_inner(self) -> W
-    {
-        self.inner
     }
 
     /// Resolve a completed escape sequence: emit it to `inner` if
@@ -333,21 +323,27 @@ mod tests
     /// that reached the inner writer.
     fn run(input: &[u8]) -> Vec<u8>
     {
-        let mut w = FilterWriter::new(Vec::new());
-        w.write_all(input).unwrap();
-        w.into_inner()
+        let mut out = Vec::new();
+        {
+            let mut w = FilterWriter::new(&mut out);
+            w.write_all(input).unwrap();
+        }
+        out
     }
 
     /// Like `run`, but writes one byte at a time. Exercises mid-sequence
     /// state preservation across `write` boundaries.
     fn run_one_byte_at_a_time(input: &[u8]) -> Vec<u8>
     {
-        let mut w = FilterWriter::new(Vec::new());
-        for &b in input
+        let mut out = Vec::new();
         {
-            w.write_all(&[b]).unwrap();
+            let mut w = FilterWriter::new(&mut out);
+            for &b in input
+            {
+                w.write_all(&[b]).unwrap();
+            }
         }
-        w.into_inner()
+        out
     }
 
     #[test]
@@ -536,7 +532,8 @@ mod tests
     #[test]
     fn write_returns_full_input_length_on_drop()
     {
-        let mut w = FilterWriter::new(Vec::new());
+        let mut out = Vec::new();
+        let mut w = FilterWriter::new(&mut out);
         let n = w.write(b"\x1b[?1049h").unwrap();
         assert_eq!(n, 8);
     }
@@ -544,7 +541,8 @@ mod tests
     #[test]
     fn write_returns_full_input_length_on_passthrough()
     {
-        let mut w = FilterWriter::new(Vec::new());
+        let mut out = Vec::new();
+        let mut w = FilterWriter::new(&mut out);
         let n = w.write(b"hello").unwrap();
         assert_eq!(n, 5);
     }

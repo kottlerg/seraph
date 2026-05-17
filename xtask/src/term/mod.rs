@@ -13,3 +13,4 @@
 //! makes the wiring contract obvious and unit-testable in isolation.
 
 pub mod filter;
+pub mod line_gate;

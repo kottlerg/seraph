@@ -67,6 +67,15 @@ pub trait PageTableBuilder: Sized
     /// This value is written to CR3 on x86-64, or encoded into the `satp` PPN field
     /// on RISC-V.
     fn root_physical(&self) -> u64;
+
+    /// Physical addresses of every frame this builder allocated for its own page
+    /// tables (the root frame and every intermediate frame allocated during
+    /// [`map`][Self::map]).
+    ///
+    /// The bootloader records these in `BootInfo.reclaim_ranges` so the kernel
+    /// can mint reclaimable Frame caps over them once Phase 3 has installed the
+    /// kernel's own page tables and the bootloader's transient tables are dead.
+    fn allocated_frames(&self) -> &[u64];
 }
 
 /// Convert a [`MapError`] to a [`BootError`].

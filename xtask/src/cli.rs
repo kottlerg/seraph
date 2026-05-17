@@ -119,10 +119,15 @@ pub struct RunArgs
     #[arg(long)]
     pub headless: bool,
 
-    /// Show all serial output including pre-boot firmware noise (filtered by default).
+    /// Show all serial output including pre-boot firmware noise
+    /// (suppressed by default).
     ///
     /// By default, output is suppressed until the first line containing
-    /// '[--------] boot:', hiding UEFI/OpenSBI debug spam.
+    /// '[--------] boot:', hiding UEFI/OpenSBI debug spam. The
+    /// control-sequence filter (drops xterm window manipulation,
+    /// alternate-screen toggles, mouse tracking, etc.) is always on in
+    /// both modes — verbose only disables the marker gate, not the
+    /// filter.
     #[arg(long)]
     pub verbose: bool,
 

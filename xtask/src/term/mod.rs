@@ -6,11 +6,13 @@
 //! Host-terminal I/O adapters for the QEMU launch pipeline.
 //!
 //! This module owns the byte-stream and line-stream `Write` adapters
-//! that screen QEMU output before it reaches the user's tty, plus (in
-//! follow-on commits) the RAII terminal-state guard and SIGINT handler
-//! that surround the launch. Keeping these concerns together — rather
-//! than scattered across `util.rs` and inline in `commands/run.rs` —
-//! makes the wiring contract obvious and unit-testable in isolation.
+//! that screen QEMU output before it reaches the user's tty, the RAII
+//! terminal-state guard that snapshots and restores termios across
+//! the launch, and the global SIGINT handler that keeps Ctrl+C from
+//! killing xtask before its cleanup runs. Keeping these concerns
+//! together — rather than scattered across `util.rs` and inline in
+//! `commands/run.rs` — makes the wiring contract obvious and
+//! unit-testable in isolation.
 
 pub mod filter;
 pub mod guard;

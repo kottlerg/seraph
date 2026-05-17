@@ -34,6 +34,12 @@ use anyhow::{Context as _, Result};
 /// Must be called at most once per process; calling it again returns
 /// an error because `ctrlc::set_handler` rejects re-registration.
 /// Call from `main()` exactly once before any subprocess is spawned.
+///
+/// Future maintainers: this is intentionally global for xtask's whole
+/// lifetime. If a future sub-flow needs Ctrl+C to default-terminate
+/// xtask between subprocess invocations, `ctrlc` cannot be uninstalled
+/// — switch to per-call `signal(2)` / `sigaction` (Unix) and
+/// `SetConsoleCtrlHandler` (Windows) with manual scoping.
 pub fn install() -> Result<()>
 {
     ctrlc::set_handler(|| {

@@ -222,7 +222,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     .stdout
                     .take()
                     .context("QEMU stdout was piped but unavailable")?;
-                let forwarder = spawn_stdout_forwarder(qemu_stdout, log_file);
+                let forwarder = spawn_stdout_forwarder(qemu_stdout, log_file, slot)?;
 
                 let (exit_rc, hung) = wait_with_timeout(&mut child, timeout)?;
                 // Drain the forwarder before reading the log so classify()
@@ -353,19 +353,25 @@ fn purge_prior_logs(workdir: &Path) -> Result<()>
 
 /// Spawn a thread that forwards `child_stdout` through `FilterWriter`
 /// into `log_sink`. The thread exits when the pipe reaches EOF (child
-/// closed its stdout, either by exiting or by being killed).
+/// closed its stdout, either by exiting or by being killed). The
+/// thread is named `forwarder-<slot>` so panic backtraces and
+/// debugger views identify which slot owned the thread.
 fn spawn_stdout_forwarder(
     mut child_stdout: std::process::ChildStdout,
     log_sink: File,
-) -> JoinHandle<Result<()>>
+    slot: u32,
+) -> Result<JoinHandle<Result<()>>>
 {
-    thread::spawn(move || -> Result<()> {
-        let mut sink = FilterWriter::new(log_sink);
-        std::io::copy(&mut child_stdout, &mut sink)
-            .context("forwarding QEMU stdout into per-slot log")?;
-        sink.flush().context("flushing per-slot log")?;
-        Ok(())
-    })
+    thread::Builder::new()
+        .name(format!("forwarder-{slot}"))
+        .spawn(move || -> Result<()> {
+            let mut sink = FilterWriter::new(log_sink);
+            std::io::copy(&mut child_stdout, &mut sink)
+                .context("forwarding QEMU stdout into per-slot log")?;
+            sink.flush().context("flushing per-slot log")?;
+            Ok(())
+        })
+        .context("spawning stdout forwarder thread")
 }
 
 /// Join a stdout-forwarder thread. Logs but does not propagate forwarder

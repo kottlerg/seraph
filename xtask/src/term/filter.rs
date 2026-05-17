@@ -51,8 +51,33 @@
 //! scratch buffer that holds at most one in-flight sequence. It is
 //! unit-tested in isolation against the full CSI/OSC grammar and
 //! split-across-write boundaries.
+//!
+//! Scope limits:
+//!
+//! - **7-bit only.** Only the `ESC X` introducer is recognized; the
+//!   8-bit C1 forms (e.g. `0x9B` for CSI, `0x9D` for OSC) are passed
+//!   through unchanged. OVMF / EDK2 emit the 7-bit forms exclusively,
+//!   so this is not a real gap today; if Seraph itself ever emits C1
+//!   bytes the filter will not screen them.
+//! - **CSI private markers other than `?` pass through.** Sequences
+//!   like `CSI = 3 h` (legacy video-mode set) are not in the drop
+//!   list. If any such sequence ever leaves the tty in a bad state,
+//!   `TerminalGuard` (`term/guard.rs`) restores termios + winsize on
+//!   drop as a catch-all.
+//! - **Pending buffer is bounded** (`MAX_PENDING_BYTES`). A producer
+//!   that opens a sequence and never finishes it cannot make the
+//!   filter grow without limit; once the cap is exceeded the buffered
+//!   bytes are dropped and the parser resyncs to `Ground`.
 
 use std::io::{self, Write};
+
+/// Maximum bytes the parser will buffer for a single in-progress
+/// sequence. A well-formed CSI is ~10 bytes and a well-formed OSC
+/// title is ~100 bytes; 64 KiB is two orders of magnitude beyond any
+/// real producer. A sequence that exceeds the cap is dropped and the
+/// parser resyncs to `Ground` — preferable to unbounded growth on a
+/// malformed or hostile stream.
+const MAX_PENDING_BYTES: usize = 64 * 1024;
 
 /// CSI / OSC parser state. Bytes that arrive mid-sequence are buffered
 /// in `FilterWriter::pending` until the sequence completes; at that
@@ -104,6 +129,20 @@ impl<W: Write> FilterWriter<W>
         }
     }
 
+    /// Append `b` to `pending`, dropping the entire in-progress
+    /// sequence and resyncing to `Ground` if the cap is exceeded.
+    /// Protects against unbounded growth on malformed input.
+    fn push_pending(&mut self, b: u8)
+    {
+        if self.pending.len() >= MAX_PENDING_BYTES
+        {
+            self.pending.clear();
+            self.state = State::Ground;
+            return;
+        }
+        self.pending.push(b);
+    }
+
     /// Resolve a completed escape sequence: emit it to `inner` if
     /// permitted, or drop the buffered bytes otherwise. Always clears
     /// `pending`.
@@ -141,7 +180,7 @@ impl<W: Write> Write for FilterWriter<W>
                             self.inner.write_all(&buf[start..i])?;
                         }
                         self.state = State::Esc;
-                        self.pending.push(b);
+                        self.push_pending(b);
                     }
                     else
                     {
@@ -150,7 +189,7 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::Esc =>
                 {
-                    self.pending.push(b);
+                    self.push_pending(b);
                     match b
                     {
                         b'[' => self.state = State::Csi,
@@ -171,7 +210,7 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::Csi =>
                 {
-                    self.pending.push(b);
+                    self.push_pending(b);
                     // Final byte (0x40..=0x7e) ends the CSI sequence.
                     if (0x40..=0x7e).contains(&b)
                     {
@@ -181,7 +220,7 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::Osc =>
                 {
-                    self.pending.push(b);
+                    self.push_pending(b);
                     if b == 0x07
                     {
                         self.flush_pending()?;
@@ -194,7 +233,7 @@ impl<W: Write> Write for FilterWriter<W>
                 }
                 State::OscEsc =>
                 {
-                    self.pending.push(b);
+                    self.push_pending(b);
                     // Whether the next byte is `\` (proper ST) or anything
                     // else (malformed input — treat as end-of-sequence),
                     // we resolve `pending` and return to Ground.
@@ -553,6 +592,34 @@ mod tests
         // SGR + window-resize + plain text + alt-screen + SGR-reset.
         let input = b"\x1b[31mhi\x1b[8;1;1tworld\x1b[?1049h\x1b[0m";
         assert_eq!(run(input), b"\x1b[31mhiworld\x1b[0m");
+    }
+
+    #[test]
+    fn pending_buffer_is_bounded_against_runaway_sequence()
+    {
+        // Open an OSC and emit MAX_PENDING_BYTES+16 bytes without a
+        // terminator. The parser must drop the buffered bytes and
+        // resync to Ground rather than grow without limit. After the
+        // resync, a fresh well-formed blocklisted sequence is
+        // recognized and stripped, proving the state machine is
+        // functional again.
+        let mut input = Vec::with_capacity(MAX_PENDING_BYTES + 64);
+        input.extend_from_slice(b"\x1b]0;");
+        input.resize(MAX_PENDING_BYTES + 16, b'A');
+        input.extend_from_slice(b"\x1b[?1049h");
+        input.extend_from_slice(b"hello\n");
+
+        let out = run(&input);
+
+        assert!(
+            out.ends_with(b"hello\n"),
+            "expected trailing plaintext, got tail {:?}",
+            std::str::from_utf8(&out[out.len().saturating_sub(40)..]).unwrap_or("<non-utf8>"),
+        );
+        assert!(
+            !out.windows(5).any(|w| w == b"1049h"),
+            "post-resync alt-screen sequence leaked",
+        );
     }
 
     #[test]

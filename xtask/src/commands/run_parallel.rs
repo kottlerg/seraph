@@ -33,7 +33,7 @@ use crate::qemu::{
     QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
-use crate::util::step;
+use crate::util::{require_tool, step};
 
 /// How often the watchdog poll loop checks child exit status.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -107,6 +107,11 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 
     validate_sysroot_for_launch(ctx, args.arch)?;
 
+    // Resolve qemu binary once, up front: missing-tool errors should
+    // surface at run-parallel startup, not N times mid-wave inside
+    // worker threads.
+    let qemu_binary = require_tool(args.arch.qemu_binary())?;
+
     let firmware = resolve_firmware(ctx, args.arch)?;
 
     let workdir = ctx.target_dir.join("xtask").join("run-parallel");
@@ -152,6 +157,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let pass_re = pass_re.clone();
             let fail_re = fail_re.clone();
             let workdir = workdir.clone();
+            let qemu_binary = qemu_binary.clone();
 
             handles.push(thread::spawn(move || -> Result<RunOutcome> {
                 std::fs::create_dir_all(&slot_dir)
@@ -211,7 +217,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 // `log_file` is moved into the forwarder thread below.
 
                 let started = Instant::now();
-                let mut child = Command::new(arch.qemu_binary())
+                let mut child = Command::new(&qemu_binary)
                     .args(&qemu_args)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::from(log_for_stderr))

@@ -23,6 +23,7 @@ mod commands;
 mod context;
 mod disk;
 mod firmware;
+mod fs_compat;
 mod qemu;
 mod rust_src;
 mod sysroot;

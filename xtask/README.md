@@ -168,6 +168,14 @@ discarded.
 
 ---
 
+## Sub-crates
+
+| Sub-crate | Purpose |
+|---|---|
+| [wrapper-shim/](wrapper-shim/README.md) | Tiny native binary installed into the seraph toolchain mirror as both `rustc` and `ws-clippy`. Dispatches by argv[0] basename to exec the real rustc / clippy-driver with overlay-aware `--sysroot` flags. Built by `cargo xtask build` as part of StdUser builds; never invoked directly. |
+
+---
+
 ## Adding a new command
 
 1. Add a variant to `CliCommand` in `src/cli.rs` with a corresponding `Args` struct.

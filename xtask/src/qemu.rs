@@ -23,10 +23,6 @@ use crate::context::Context;
 use crate::firmware;
 use crate::sysroot;
 
-// Firmware discovery (OVMF, EDK2 RISC-V) lives in `firmware.rs`;
-// this module owns argv construction and the per-launch pflash cache.
-pub use crate::firmware::find_ovmf_code;
-
 /// QEMU virt machine requires pflash images to be exactly 32 MiB.
 const PFLASH_SIZE: u64 = 32 * 1024 * 1024;
 

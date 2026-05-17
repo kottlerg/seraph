@@ -22,8 +22,15 @@
 //! Env var:
 //!
 //! - `SERAPH_ACCEL = auto | tcg | kvm | hvf | whpx | nvmm` — override
-//!   automatic detection. Unknown values fall through to detection,
-//!   silently. `auto` is the documented "do detection" sentinel.
+//!   automatic detection. `auto` is the documented "do detection"
+//!   sentinel. Unknown values emit a stderr warning and fall through
+//!   to detection so a typo doesn't silently miss-accelerate.
+//!
+//! Cross-arch precedence: when the guest arch doesn't match the host
+//! arch (e.g. riscv64 guest on x86_64 host), native acceleration is
+//! impossible and the result is always `Tcg`. If the user also set
+//! `SERAPH_ACCEL` to something other than `tcg`/`auto`, a stderr
+//! warning is emitted so the silent downgrade is visible.
 
 use crate::arch::Arch;
 
@@ -50,19 +57,45 @@ pub const ENV_ACCEL: &str = "SERAPH_ACCEL";
 /// Select an acceleration backend for a guest of the given
 /// architecture. Cross-arch guests resolve to `Tcg`; same-arch
 /// guests honor `SERAPH_ACCEL` and per-`cfg(target_os)` detection.
+///
+/// Emits a stderr warning when an explicit `SERAPH_ACCEL` override
+/// is silently downgraded — either because the value is unrecognized
+/// or because the guest is cross-arch and only `Tcg` is possible.
 pub fn detect_for_arch(arch: Arch) -> Accel
 {
+    let env_value = std::env::var(ENV_ACCEL).ok();
+    let env_trimmed = env_value.as_deref().map(str::trim);
+
     if !is_same_arch(arch)
     {
+        if let Some(s) = env_trimmed
+            && !matches!(s.to_ascii_lowercase().as_str(), "" | "auto" | "tcg")
+        {
+            eprintln!(
+                "warning: {ENV_ACCEL}={s} ignored; cross-arch guest \
+                 (host != guest arch) only supports TCG",
+            );
+        }
         return Accel::Tcg;
     }
 
-    if let Some(value) = std::env::var_os(ENV_ACCEL)
+    if let Some(s) = env_trimmed
     {
-        let s = value.to_string_lossy();
-        if let Some(parsed) = parse_explicit(&s)
+        match parse_explicit(s)
         {
-            return parsed;
+            Some(explicit) => return explicit,
+            None if s.is_empty() || s.eq_ignore_ascii_case("auto") =>
+            {
+                // documented sentinel: fall through to detection
+            }
+            None =>
+            {
+                eprintln!(
+                    "warning: {ENV_ACCEL}={s} is not a recognized backend; \
+                     falling through to auto-detection \
+                     (valid: auto | tcg | kvm | hvf | whpx | nvmm)",
+                );
+            }
         }
     }
 
@@ -82,13 +115,13 @@ fn is_same_arch(arch: Arch) -> bool
 }
 
 /// Parse a user-provided env-var value into an `Accel`. Returns
-/// `None` for the documented `auto` sentinel and for unknown values
-/// (both trigger detection).
+/// `None` for the documented `auto` sentinel, the empty string, and
+/// for unknown values; the caller distinguishes "auto/empty"
+/// (silent fall-through) from "unknown" (warn-and-fall-through).
 fn parse_explicit(s: &str) -> Option<Accel>
 {
     match s.trim().to_ascii_lowercase().as_str()
     {
-        "auto" => None,
         "kvm" => Some(Accel::Kvm),
         "hvf" => Some(Accel::Hvf),
         "whpx" => Some(Accel::Whpx),
@@ -266,7 +299,10 @@ mod tests
         assert_eq!(parse_explicit("whpx"), Some(Accel::Whpx));
         assert_eq!(parse_explicit("nvmm"), Some(Accel::Nvmm));
         assert_eq!(parse_explicit("tcg"), Some(Accel::Tcg));
+        // Empty / sentinel / unknown all yield None; the caller
+        // distinguishes them.
         assert_eq!(parse_explicit("auto"), None);
+        assert_eq!(parse_explicit(""), None);
         assert_eq!(parse_explicit("garbage"), None);
     }
 

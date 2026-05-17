@@ -19,9 +19,9 @@ use anyhow::{Context as _, Result};
 use crate::arch::Arch;
 use crate::cli::RunArgs;
 use crate::context::Context as BuildContext;
+use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    QemuLaunchSpec, build_qemu_argv, find_ovmf_code, prepare_riscv_firmware,
-    validate_sysroot_for_launch,
+    QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
 use crate::term::guard::TerminalGuard;

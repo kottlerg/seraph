@@ -43,18 +43,43 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] [--cpus
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`) |
 
-**x86-64** uses KVM acceleration when `/dev/kvm` is present, falling back
-to multi-threaded TCG with `-cpu max,migratable=no`. KVM hosts must
-advertise x86-64-v3 (AVX2/BMI2/FMA — Haswell+ / Excavator+) because the
-userspace target is pinned to that psABI level. Requires OVMF firmware
-(`dnf install edk2-ovmf` / `apt install ovmf`).
+**x86-64** selects an acceleration backend per host: KVM on Linux,
+HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
+(see `SERAPH_ACCEL` below to override). KVM/HVF hosts must advertise
+x86-64-v3 (AVX2/BMI2/FMA — Haswell+ / Excavator+) because the userspace
+target is pinned to that psABI level; TCG mode uses
+`-cpu max,migratable=no` which emulates the same baseline. Requires
+OVMF firmware (`dnf install edk2-ovmf` / `apt install ovmf` /
+`pacman -S edk2-ovmf` / Homebrew `brew install qemu` /
+FreeBSD `pkg install edk2-qemu-x64`).
 
-**RISC-V** uses TCG emulation with edk2 UEFI firmware and OpenSBI (loaded
+**RISC-V** always uses TCG with edk2 UEFI firmware and OpenSBI (loaded
 automatically by QEMU's `virt` machine). Requires edk2 RISC-V firmware
 (`dnf install edk2-riscv64` / `apt install qemu-efi-riscv64`) and
 QEMU ≥ 8.0 (V extension); QEMU ≥ 9.1 unlocks the named `-cpu rva23s64`
 model (currently the runner uses the explicit feature string until the
 CI floor catches up).
+
+#### Environment variables
+
+These override `cargo xtask run`'s built-in firmware and accelerator
+selection. None are required when the host follows FHS conventions
+and the distro ships standard firmware packages.
+
+| Var | Effect |
+|---|---|
+| `SERAPH_OVMF_CODE` | Direct path to the OVMF code firmware. Skips the per-platform default search. |
+| `SERAPH_RISCV_CODE` | Direct path to `RISCV_VIRT_CODE.fd`. Must be set together with `SERAPH_RISCV_VARS` — partial overrides are rejected (a custom code image paired against the system vars template corrupts NVRAM state). |
+| `SERAPH_RISCV_VARS` | Direct path to `RISCV_VIRT_VARS.fd`. See pairing rule above. |
+| `SERAPH_ACCEL` | One of `auto` / `tcg` / `kvm` / `hvf` / `whpx` / `nvmm`. `auto` (the default) runs per-host detection. Cross-arch guests (e.g. riscv64 on x86) always resolve to `tcg`; an explicit non-`tcg`/`auto` override in that case emits a stderr warning. Unrecognized values also warn and fall through to detection. |
+
+Default firmware search paths per host:
+
+- **Linux** OVMF: `/usr/share/edk2/ovmf/OVMF_CODE.fd`, `/usr/share/OVMF/OVMF_CODE.fd`, `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd`, `/usr/share/ovmf/OVMF.fd`, `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
+- **Linux** RISC-V: `/usr/share/edk2/riscv`, `/usr/share/edk2-riscv`, `/usr/share/qemu-efi-riscv64`
+- **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`
+- **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`
+- **Windows / other**: no defaults; the relevant `SERAPH_*` env var is required.
 
 ---
 

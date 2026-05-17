@@ -181,14 +181,25 @@ followed by `cargo xtask run` (or `cargo xtask run-parallel` for stress).
 Seraph boots via its own UEFI bootloader on both architectures. This requires
 UEFI firmware in QEMU — SeaBIOS cannot load UEFI applications.
 
-**x86-64:** Requires OVMF from `edk2-ovmf`. `cargo xtask run` searches standard
-Fedora, Debian, and Arch install paths. The bootloader `.efi` reaches OVMF via
-the GPT image's ESP partition, attached to the guest as a virtio-blk-pci
-device.
+**x86-64:** Requires OVMF (`edk2-ovmf` / `ovmf` / `edk2-x86_64-code.fd`,
+distro-dependent). `cargo xtask run` searches per-platform default paths
+(Linux FHS, macOS Homebrew, BSD ports), or honours the `SERAPH_OVMF_CODE`
+env var for direct override on non-FHS or unsupported hosts. The bootloader
+`.efi` reaches OVMF via the GPT image's ESP partition, attached to the
+guest as a virtio-blk-pci device.
 
-**RISC-V:** Requires `edk2-riscv64` firmware. `cargo xtask run` searches standard
-firmware paths and pads `RISCV_VIRT_CODE.fd` / `RISCV_VIRT_VARS.fd` to 32 MiB
-in temporary files if necessary (QEMU virt ≥9.0 requires exactly 32 MiB).
+**RISC-V:** Requires `edk2-riscv64` firmware. `cargo xtask run` searches
+per-platform default paths and pads `RISCV_VIRT_CODE.fd` / `RISCV_VIRT_VARS.fd`
+to 32 MiB in temporary files if necessary (QEMU virt ≥ 9.0 requires exactly
+32 MiB). `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS` override discovery;
+they are an all-or-nothing pair (setting only one is rejected).
+
+**Acceleration:** controlled by `SERAPH_ACCEL` (`auto` / `tcg` / `kvm` /
+`hvf` / `whpx` / `nvmm`). Default `auto` runs per-host detection: KVM on
+Linux (`/dev/kvm` opened O_RDWR), HVF on macOS, WHPX on Windows, NVMM on
+NetBSD, or TCG elsewhere. Cross-arch guests (riscv64 on x86, etc.) always
+resolve to TCG. The user-facing command reference plus the full env-var
+table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 
 **Minimum QEMU version:** QEMU ≥ 8.0 (V extension support) is required;
 `xtask/src/qemu.rs` passes `-cpu rv64,v=true,zba=true,zbb=true,zbs=true`

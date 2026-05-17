@@ -131,35 +131,54 @@ pub fn find_ovmf_code() -> Result<PathBuf>
 
 /// Locate the RISC-V EDK2 source images, returning `(code, vars)`.
 ///
-/// Per-file env vars `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS`
-/// override the directory search; when both are set, no directory
-/// search runs. When neither is set, the first directory containing
-/// `RISCV_VIRT_CODE.fd` and `RISCV_VIRT_VARS.fd` is used as the
-/// source of both. When exactly one is set, the directory search
-/// resolves the unset one.
+/// Per-file env vars `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS` are
+/// all-or-nothing: setting only one is an error, because the code
+/// image and vars template must come from the same firmware build —
+/// pairing a custom code image with the system vars template (or
+/// vice versa) silently corrupts NVRAM state. When both are set,
+/// no directory search runs; when neither is set, the first
+/// directory containing both files is used.
 pub fn find_riscv_firmware() -> Result<(PathBuf, PathBuf)>
 {
     let env_code = std::env::var_os(ENV_RISCV_CODE).map(PathBuf::from);
     let env_vars = std::env::var_os(ENV_RISCV_VARS).map(PathBuf::from);
 
-    if let (Some(code), Some(vars)) = (env_code.as_ref(), env_vars.as_ref())
+    match (env_code, env_vars)
     {
-        return Ok((code.clone(), vars.clone()));
+        (Some(code), Some(vars)) =>
+        {
+            if !code.is_file()
+            {
+                return Err(missing_env_path_error(ENV_RISCV_CODE, &code));
+            }
+            if !vars.is_file()
+            {
+                return Err(missing_env_path_error(ENV_RISCV_VARS, &vars));
+            }
+            Ok((code, vars))
+        }
+        (Some(_), None) | (None, Some(_)) => Err(anyhow!(
+            "${ENV_RISCV_CODE} and ${ENV_RISCV_VARS} must be set \
+                 together (or both left unset). Pairing a custom code \
+                 image with a system vars template (or vice versa) \
+                 silently corrupts NVRAM state.",
+        )),
+        (None, None) =>
+        {
+            let dir = find_riscv_firmware_dir()?;
+            let code = dir.join("RISCV_VIRT_CODE.fd");
+            let vars = dir.join("RISCV_VIRT_VARS.fd");
+            if !code.is_file()
+            {
+                return Err(missing_file_error("RISC-V code firmware", &code));
+            }
+            if !vars.is_file()
+            {
+                return Err(missing_file_error("RISC-V vars template", &vars));
+            }
+            Ok((code, vars))
+        }
     }
-
-    let dir = find_riscv_firmware_dir()?;
-    let code = env_code.unwrap_or_else(|| dir.join("RISCV_VIRT_CODE.fd"));
-    let vars = env_vars.unwrap_or_else(|| dir.join("RISCV_VIRT_VARS.fd"));
-
-    if !code.is_file()
-    {
-        return Err(missing_file_error("RISC-V code firmware", &code));
-    }
-    if !vars.is_file()
-    {
-        return Err(missing_file_error("RISC-V vars template", &vars));
-    }
-    Ok((code, vars))
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -175,10 +194,7 @@ fn find_path(env_var: &str, defaults: &[&str], label: &str, hints: &str) -> Resu
         {
             return Ok(path);
         }
-        return Err(anyhow!(
-            "{label} not found: ${env_var}={path} does not exist",
-            path = path.display(),
-        ));
+        return Err(missing_env_path_error(env_var, &path));
     }
 
     for candidate in defaults
@@ -240,10 +256,20 @@ fn not_found_error(label: &str, env_var: &str, tried: &[&str], hints: &str) -> a
     anyhow!(msg)
 }
 
-/// Build the "env var set but file missing" error.
+/// Build the "discovered file missing" error.
 fn missing_file_error(label: &str, path: &std::path::Path) -> anyhow::Error
 {
     anyhow!("{label} not found at resolved path: {}", path.display(),)
+}
+
+/// Build the "env var set to a path that doesn't exist" error.
+/// Names the env var so the user can fix or unset it.
+fn missing_env_path_error(env_var: &str, path: &std::path::Path) -> anyhow::Error
+{
+    anyhow!(
+        "${env_var}={} does not exist; unset {env_var} to fall back to default search",
+        path.display(),
+    )
 }
 
 /// Per-platform install hints for OVMF.
@@ -341,5 +367,40 @@ mod tests
                 assert_eq!(vars, workspace_cargo);
             });
         });
+    }
+
+    #[test]
+    fn riscv_firmware_with_only_one_env_var_set_is_rejected()
+    {
+        // Setting only SERAPH_RISCV_CODE (without the matching VARS)
+        // would silently pair a custom code image against the system
+        // vars template — a real footgun. Require both or neither.
+        let workspace_cargo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("Cargo.toml");
+        let path = workspace_cargo.to_str().unwrap();
+        // Ensure the partner is unset for the duration of the test.
+        let prev_vars = std::env::var_os(ENV_RISCV_VARS);
+        // SAFETY: tests are single-threaded within this process for env
+        // mutation; we restore on the way out.
+        unsafe {
+            std::env::remove_var(ENV_RISCV_VARS);
+        }
+        with_env_var(ENV_RISCV_CODE, path, || {
+            let err = find_riscv_firmware().unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("must be set together"),
+                "expected pairing-error, got: {msg}",
+            );
+        });
+        unsafe {
+            match prev_vars
+            {
+                Some(v) => std::env::set_var(ENV_RISCV_VARS, v),
+                None => std::env::remove_var(ENV_RISCV_VARS),
+            }
+        }
     }
 }

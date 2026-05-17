@@ -911,8 +911,11 @@ fn write_file_bytes(
         let bytes_to_write = bytes_avail_in_sector.min(data.len() - written);
 
         // Read-modify-write the sector unless we are writing the full
-        // sector from offset 0.
-        let mut sector_buf = [0u8; SECTOR_SIZE];
+        // sector from offset 0. Heap-allocated to keep the
+        // write-path frame within the default 32 KiB stack envelope
+        // when release LTO inlines the nested helpers
+        // (`insert_entry → write_dir_slot → ...`).
+        let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
         let full_sector_overwrite = byte_in_sector == 0 && bytes_to_write == SECTOR_SIZE;
         if !full_sector_overwrite
             && !cache.read_sector(u64::from(sector_lba), block_dev, &mut sector_buf, ipc_buf)
@@ -1141,7 +1144,10 @@ fn handle_write_frame_node_cap(
         return;
     }
 
-    let mut buf = [0u8; PAGE_SIZE as usize];
+    // Heap-allocated: a 4 KiB on-stack buffer would push the
+    // FS_WRITE_FRAME path past the default 32 KiB stack envelope
+    // once it cascades into `write_file_bytes → insert_entry → …`.
+    let mut buf = Box::new([0u8; PAGE_SIZE as usize]);
     // SAFETY: va just mapped MAP_READONLY for one page; bounds checked
     // above.
     unsafe {

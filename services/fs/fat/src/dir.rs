@@ -533,7 +533,7 @@ pub fn find_in_directory(
     ipc_buf: *mut u64,
 ) -> Option<DirEntry>
 {
-    let mut sector_buf = [0u8; SECTOR_SIZE];
+    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
     let mut lfn = LfnAccum::new();
 
     if dir_cluster == 0
@@ -577,7 +577,7 @@ fn find_in_fat16_root(
 {
     let root_start = u32::from(state.reserved_sectors) + u32::from(state.num_fats) * state.fat_size;
     let root_sectors = (u32::from(state.root_entry_count) * 32).div_ceil(512);
-    let mut sector_buf = [0u8; SECTOR_SIZE];
+    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
     let mut lfn = LfnAccum::new();
 
     for s in 0..root_sectors
@@ -612,7 +612,7 @@ pub fn find_in_directory_with_location(
     ipc_buf: *mut u64,
 ) -> Option<(DirEntry, DirEntryLocation)>
 {
-    let mut sector_buf = [0u8; SECTOR_SIZE];
+    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
     let mut lfn = LfnAccum::new();
     let entries_per_sector = SECTOR_SIZE / 32;
 
@@ -783,7 +783,7 @@ pub fn read_dir_entry_at_index(
     ipc_buf: *mut u64,
 ) -> Option<DirEntry>
 {
-    let mut sector_buf = [0u8; SECTOR_SIZE];
+    let mut sector_buf = Box::new([0u8; SECTOR_SIZE]);
     let mut lfn = LfnAccum::new();
     let entries_per_sector = SECTOR_SIZE / 32;
     let mut current_idx: u64 = 0;
@@ -1112,7 +1112,7 @@ pub fn update_entry_metadata(
 ) -> Result<(), FatError>
 {
     let _ = state; // mirrors the read-side signature; reserved for future use
-    let mut buf = [0u8; SECTOR_SIZE];
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
     if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
         return Err(FatError::Io);
@@ -1141,7 +1141,7 @@ pub fn directory_is_empty(
     ipc_buf: *mut u64,
 ) -> Result<bool, FatError>
 {
-    let mut buf = [0u8; SECTOR_SIZE];
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
     let entries_per_sector = SECTOR_SIZE / 32;
 
     let mut cluster = dir_cluster;
@@ -1199,7 +1199,7 @@ pub fn write_dot_entries(
 ) -> Result<(), FatError>
 {
     let base_sector = state.cluster_to_sector(new_dir_cluster);
-    let mut buf = [0u8; SECTOR_SIZE];
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
     // First sector: "." and ".." entries packed at offsets 0 and 32;
     // remaining slots zeroed (== "end of directory" sentinel for every
     // following slot). Subsequent sectors of the cluster stay zero;
@@ -1224,7 +1224,7 @@ pub fn write_dot_entries(
     // Zero out the rest of the cluster so a stale neighbour sector
     // (allocate_cluster reuses freed clusters) does not surface as
     // ghost entries.
-    let zeros = [0u8; SECTOR_SIZE];
+    let zeros = Box::new([0u8; SECTOR_SIZE]);
     for s in 1..u32::from(state.sectors_per_cluster)
     {
         if !cache.write_sector(u64::from(base_sector + s), block_dev, &zeros, ipc_buf)
@@ -1257,7 +1257,7 @@ fn find_free_slot_run(
     let mut run_len = 0usize;
 
     let entries_per_sector = SECTOR_SIZE / 32;
-    let mut buf = [0u8; SECTOR_SIZE];
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
 
     // FAT16 fixed root.
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
@@ -1487,7 +1487,7 @@ fn zero_cluster(
     ipc_buf: *mut u64,
 ) -> Result<(), FatError>
 {
-    let zeros = [0u8; SECTOR_SIZE];
+    let zeros = Box::new([0u8; SECTOR_SIZE]);
     let base = state.cluster_to_sector(cluster);
     for s in 0..u32::from(state.sectors_per_cluster)
     {
@@ -1509,7 +1509,7 @@ fn write_dir_slot(
 ) -> Result<(), FatError>
 {
     let _ = state; // reserved for future use; mirrors the read-side signature
-    let mut buf = [0u8; SECTOR_SIZE];
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
     if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
         return Err(FatError::Io);
@@ -1531,7 +1531,7 @@ fn mark_slot_deleted(
 ) -> Result<(), FatError>
 {
     let _ = state;
-    let mut buf = [0u8; SECTOR_SIZE];
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
     if !cache.read_sector(u64::from(loc.sector_lba), block_dev, &mut buf, ipc_buf)
     {
         return Err(FatError::Io);
@@ -1794,7 +1794,7 @@ fn find_in_directory_by_sfn(
     ipc_buf: *mut u64,
 ) -> Option<()>
 {
-    let mut buf = [0u8; SECTOR_SIZE];
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
     let entries_per_sector = SECTOR_SIZE / 32;
 
     if parent_dir_cluster == 0 && matches!(state.fat_type, FatType::Fat16)
@@ -1906,7 +1906,7 @@ fn locate_entry_with_lfn_run(
 ) -> Result<(RemovedEntry, [DirEntryLocation; MAX_SLOT_RUN]), FatError>
 {
     let entries_per_sector = SECTOR_SIZE / 32;
-    let mut buf = [0u8; SECTOR_SIZE];
+    let mut buf = Box::new([0u8; SECTOR_SIZE]);
     let mut lfn = LfnAccum::new();
     let mut lfn_run: [Option<DirEntryLocation>; MAX_SLOT_RUN] = [None; MAX_SLOT_RUN];
     let mut lfn_run_len = 0usize;

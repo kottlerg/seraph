@@ -18,7 +18,10 @@
 //! - Phase 4: typed-memory cap surface (no `GlobalAlloc`; bodies sourced from caps).
 //! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall).
 //! - Phase 6: cache `kernel_mmio` and validate `mmio_apertures` slice before capability minting.
-//! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps.
+//! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps;
+//!   mint reclaimable Frame caps over bootloader scratch pages (`BootInfo`,
+//!   descriptor arrays, transient PT frames) so they flow to userspace via the
+//!   standard `CapDescriptor` path.
 //! - Phase 8: initialise per-CPU scheduler state and per-CPU idle threads for all online CPUs.
 //! - Phase 9: create init process address space + TCB; hand off root `CSpace`; enter user mode.
 
@@ -188,12 +191,12 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // Phase 7.
     //
     // Note on bootloader page table frame reclamation:
-    // Two categories of frames are NOT reclaimed:
-    //   1. BOOT_TABLE_POOL (BSS array): part of the kernel image; cannot be
-    //      freed to buddy. The unused portion (~750 KiB) is acceptable waste.
-    //   2. Bootloader's original page tables: BootInfo does not record their
-    //      physical addresses, so they cannot be identified. Future enhancement:
-    //      have the bootloader pass old CR3/satp in BootInfo.
+    // Bootloader transient page-table frames are now recorded in
+    // `BootInfo.reclaim_ranges` (boot protocol v7) and minted into init's
+    // CSpace by `cap::mint_reclaim_frame_caps`. The remaining un-reclaimed
+    // category is `BOOT_TABLE_POOL` (BSS array): part of the kernel image,
+    // cannot be freed to buddy; the unused portion (~750 KiB) is acceptable
+    // waste.
     kprintln!("Phase 4: Typed-Memory Cap Surface (no kernel heap)");
 
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read

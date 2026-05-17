@@ -153,6 +153,30 @@ are usable RAM, reserved, or used by firmware. The kernel parses this map during
 initialisation before the frame allocator is active. Memory used by the kernel image,
 boot modules, and reserved regions is marked unavailable.
 
+### Bootloader Scratch Reclamation
+
+Pages the bootloader allocated for its own scratch use — the `BootInfo`
+struct, the module descriptor array, the memory-map entry array, the
+MMIO aperture array, the reclaim-array page itself, and every transient
+page-table frame — are recorded in `BootInfo.reclaim_ranges` (boot
+protocol v7) and consumed by `cap::mint_reclaim_frame_caps` during
+Phase 7. The kernel mints one reclaimable Frame cap per range
+(`owns_memory = true`, full byte ledger) and inserts it into the root
+`CSpace` so the cap reaches init through the standard `CapDescriptor`
+walk. The buddy ledger records each range via `register_owned_range`
+so cap teardown returns the pages via the existing `dealloc_object` →
+`free_range` path with the `total / free` ratio well-defined. Whether
+init donates the cap onward to memmgr or lets it cascade back to the
+buddy on CSpace teardown is a userspace policy decision; the kernel
+does not impose a route.
+
+The cmdline page and the AP SIPI trampoline page are not reclaimed
+through this mechanism. Their last consumers run inside Phase 9, after
+`populate_cspace` has finalised `cspace_layout.descriptors`; reclaiming
+them through the standard `CapDescriptor` path requires either
+relocating their consumers into Phase 7 or moving SMP startup ahead of
+Phase 9.
+
 ### Buddy Allocator
 
 Physical frames are managed by a buddy allocator. Memory is divided into blocks whose

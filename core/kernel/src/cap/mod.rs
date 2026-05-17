@@ -737,10 +737,15 @@ pub struct CSpaceLayout
 /// - ~32 hardware caps (MMIO + IRQ + `IoPortRange`/`SbiControl` + `SchedControl`).
 /// - 8 ACPI region caps (`MAX_ACPI_REGIONS`), 1 ACPI RSDP, 1 DTB.
 /// - ~8 init segment caps + ~16 boot module caps.
+/// - [`boot_protocol::MAX_RECLAIM_RANGES`] reclaim Frame caps (worst case
+///   from `mint_reclaim_frame_caps`).
 ///
-/// `4096 + 64 = 4160` covers the worst case with headroom; BSS cost is
-/// 4160 × 24 B ≈ 100 KiB, comfortably small relative to total system RAM.
-pub const CSPACE_LAYOUT_MAX_DESCRIPTORS: usize = 4096 + 64;
+/// `4096 + 256 + 128 = 4480` covers the worst case with headroom; BSS
+/// cost is 4480 × 24 B ≈ 105 KiB, comfortably small relative to total
+/// system RAM. The `4096` term matches `MAX_DRAIN_BLOCKS` in the
+/// production-only branch; `256` is `boot_protocol::MAX_RECLAIM_RANGES`;
+/// the trailing `128` covers every other Phase-7 cap kind.
+pub const CSPACE_LAYOUT_MAX_DESCRIPTORS: usize = 4096 + boot_protocol::MAX_RECLAIM_RANGES + 128;
 
 /// Backing storage for [`CSpaceLayout::descriptor_count`]. `static mut`
 /// because [`populate_cspace`] writes entries during single-threaded
@@ -778,8 +783,9 @@ pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESC
 ///
 /// # Safety
 /// `layout.descriptor_count` must reflect the entries written by the
-/// `populate_cspace` / `mint_module_frame_caps` pass that produced
-/// `layout`. Single-threaded boot guarantees no concurrent writer.
+/// `populate_cspace`, `mint_module_frame_caps`, and
+/// `mint_reclaim_frame_caps` writers that produced `layout`.
+/// Single-threaded boot guarantees no concurrent writer.
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn descriptors(layout: &CSpaceLayout) -> &'static [CapDescriptor]
 {
@@ -855,7 +861,9 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
     // 3. populate_cspace fills the root with Frame caps (from the drained
     //    blocks) plus all hardware-resource caps.
     // 4. mint_module_frame_caps appends boot-module Frame caps.
-    // 5. Stash the root CSpace pointer; Phase 9 hands it to init.
+    // 5. mint_reclaim_frame_caps appends reclaimable bootloader-scratch
+    //    Frame caps (BootInfo, descriptor arrays, transient PT frames).
+    // 6. Stash the root CSpace pointer; Phase 9 hands it to init.
     #[cfg(not(test))]
     {
         // SAFETY: single-threaded Phase 7; DRAIN_RAM_BLOCKS is exclusively
@@ -883,6 +891,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         let cspace = unsafe { &mut *cs_ptr };
         let mut layout = populate_cspace(cspace, ram_blocks, mmap, mmio_apertures, info);
         mint_module_frame_caps(cspace, info, &mut layout);
+        mint_reclaim_frame_caps(cspace, info, &mut layout);
 
         // SAFETY: single-threaded boot; ROOT_CSPACE not yet observed.
         unsafe { ROOT_CSPACE = cs_ptr };
@@ -902,6 +911,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         let empty: [RamBlock; 0] = [];
         let mut layout = populate_cspace(&mut cspace, &empty, mmap, mmio_apertures, info);
         mint_module_frame_caps(&mut cspace, info, &mut layout);
+        mint_reclaim_frame_caps(&mut cspace, info, &mut layout);
         // Tests intentionally leak the box; isolated unit-test invariants
         // (every kernel object Boxed via `nonnull_from_box`) make explicit
         // teardown unnecessary.
@@ -1572,6 +1582,137 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
     layout.module_frame_base = base_slot;
     layout.module_frame_count = count;
     layout.total_populated = cspace.populated_count();
+}
+
+/// Mint reclaimable `Frame` capabilities over bootloader scratch ranges.
+///
+/// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
+/// descriptor array, memory-map entry array, MMIO aperture array, the
+/// reclaim-array page itself, and the bootloader's transient page-table
+/// frames — and mints one reclaimable `FrameObject` cap per range with
+/// `owns_memory = true` and the full byte ledger. Each cap is inserted
+/// into the root `CSpace` and a matching `CapDescriptor` entry pushed
+/// into `layout.descriptors`, so the cap reaches init through the
+/// standard descriptor-table walk in the same shape boot-module caps
+/// take. Pages return to the buddy on cap teardown via the existing
+/// `dealloc_object` → `free_range` path.
+///
+/// Symmetric to [`mint_module_frame_caps`]; runs immediately after it.
+/// The kernel MUST NOT dereference any address inside a recorded range
+/// after this function returns.
+///
+/// Appends one [`CapDescriptor`] entry per reclaimed range; init walks
+/// the descriptor table to discover the caps. There is no dedicated
+/// `reclaim_frame_base` / `reclaim_frame_count` pair on [`CSpaceLayout`]
+/// because reclaim caps carry no per-index meaning — unlike boot
+/// modules where slot N == module N, reclaim caps are a homogeneous
+/// pool and userspace inspects each `CapDescriptor.aux0`/`aux1` to
+/// learn the underlying physical range.
+fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
+{
+    use init_protocol::CapType;
+
+    let range_count = boot_info.reclaim_ranges.count as usize;
+    if range_count == 0 || boot_info.reclaim_ranges.entries.is_null()
+    {
+        return;
+    }
+    // The reclaim-array page is identity-mapped at boot and accessible via
+    // the direct physical map after Phase 3; reach it through the direct map.
+    // SAFETY: bootloader contract — `entries` points to a `count`-element
+    // ReclaimRange array; direct map active since Phase 3.
+    let ranges: &[boot_protocol::ReclaimRange] = unsafe {
+        core::slice::from_raw_parts(
+            phys_to_virt(boot_info.reclaim_ranges.entries as u64)
+                as *const boot_protocol::ReclaimRange,
+            range_count,
+        )
+    };
+
+    #[cfg(not(test))]
+    let total_before = crate::mm::with_frame_allocator(|alloc| alloc.total_page_count());
+    #[cfg(test)]
+    let total_before: usize = 0;
+
+    let mut count: u32 = 0;
+    let mut pages_total: u64 = 0;
+
+    for range in ranges
+    {
+        if range.page_count == 0
+        {
+            continue;
+        }
+        let phys_base = range.phys_base & !0xFFF;
+        let size_bytes = u64::from(range.page_count) * (crate::mm::PAGE_SIZE as u64);
+        pages_total += u64::from(range.page_count);
+
+        // Register the range as managed-but-not-free so that if the cap is
+        // ever destroyed, `dealloc_object`'s `free_range` keeps the buddy
+        // `free / total` ratio well-defined. These pages were never in
+        // `total_pages` — `mm::init::collect_usable_ranges` filters
+        // `Loaded`-typed regions out of the buddy at Phase 2 — so
+        // `register_owned_range` is the correct ledger entry (not
+        // `add_region`, which would also push them onto the free list).
+        #[cfg(not(test))]
+        // SAFETY: range pages were not added via `add_region`
+        // (bootloader-typed `Loaded`, filtered by
+        // `mm::init::collect_usable_ranges`); single-threaded Phase 7.
+        unsafe {
+            crate::mm::with_frame_allocator(|alloc| {
+                alloc.register_owned_range(phys_base, size_bytes);
+            });
+        }
+
+        let ptr = mint_phase7_body(FrameObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
+            base: phys_base,
+            size: size_bytes,
+            // Reclaim pages carry the full byte ledger and `owns_memory = true`
+            // so the buddy ledger is balanced when the cap is eventually
+            // destroyed — matching the boot-module precedent above. Routing
+            // beyond init's CSpace (donate-to-memmgr vs cascade-to-buddy) is
+            // a userspace policy decision; the kernel only delivers the cap.
+            available_bytes: core::sync::atomic::AtomicU64::new(size_bytes),
+            owns_memory: core::sync::atomic::AtomicBool::new(true),
+            allocator: crate::cap::retype::RetypeAllocator::new_inline(),
+            lock: core::sync::atomic::AtomicU32::new(0),
+        });
+        let slot = insert_or_fatal(
+            cspace,
+            CapTag::Frame,
+            Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
+            ptr,
+            "Phase 7: cannot allocate Frame capability for reclaimed boot scratch",
+        );
+        push_descriptor(
+            &mut layout.descriptor_count,
+            CapDescriptor {
+                slot,
+                cap_type: CapType::Frame,
+                pad: [0; 3],
+                aux0: phys_base,
+                aux1: size_bytes,
+            },
+        );
+        count += 1;
+    }
+
+    layout.total_populated = cspace.populated_count();
+
+    #[cfg(not(test))]
+    {
+        let total_after = crate::mm::with_frame_allocator(|alloc| alloc.total_page_count());
+        crate::kprintln!(
+            "reclaim: minted {} Frame caps over {} scratch pages (total accounted {} → {})",
+            count,
+            pages_total,
+            total_before,
+            total_after,
+        );
+    }
+    #[cfg(test)]
+    let _ = (total_before, pages_total);
 }
 
 /// Cast `Box<T>` to `NonNull<KernelObjectHeader>` by leaking the box.

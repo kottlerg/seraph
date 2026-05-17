@@ -21,6 +21,7 @@ mod cli;
 mod commands;
 mod context;
 mod disk;
+mod firmware;
 mod qemu;
 mod rust_src;
 mod sysroot;

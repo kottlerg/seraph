@@ -19,23 +19,12 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::context::Context;
+use crate::firmware;
 use crate::sysroot;
 
-/// OVMF firmware search paths (Fedora, Debian/Ubuntu, Arch).
-const OVMF_CODE_PATHS: &[&str] = &[
-    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-    "/usr/share/OVMF/OVMF_CODE.fd",
-    "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
-    "/usr/share/ovmf/OVMF.fd",
-    "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
-];
-
-/// edk2 RISC-V firmware search directories.
-const EDK2_RISCV_DIRS: &[&str] = &[
-    "/usr/share/edk2/riscv",
-    "/usr/share/edk2-riscv",
-    "/usr/share/qemu-efi-riscv64",
-];
+// Firmware discovery (OVMF, EDK2 RISC-V) lives in `firmware.rs`;
+// this module owns argv construction and the per-launch pflash cache.
+pub use crate::firmware::find_ovmf_code;
 
 /// QEMU virt machine requires pflash images to be exactly 32 MiB.
 const PFLASH_SIZE: u64 = 32 * 1024 * 1024;
@@ -213,23 +202,6 @@ fn kvm_usable() -> bool
         .is_ok()
 }
 
-/// Locate the OVMF code image, returning the first installed path.
-pub fn find_ovmf_code() -> Result<PathBuf>
-{
-    OVMF_CODE_PATHS
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "OVMF firmware not found\n\
-                 Install with: dnf install edk2-ovmf  (Fedora)\n\
-                 or:           apt install ovmf        (Debian/Ubuntu)\n\
-                 or:           pacman -S edk2-ovmf     (Arch Linux)"
-            )
-        })
-}
-
 /// Resolve and cache riscv64 firmware.
 ///
 /// Returns `(code_path, vars_template_path)`:
@@ -240,29 +212,14 @@ pub fn find_ovmf_code() -> Result<PathBuf>
 ///   on every call. `run` uses this path directly as the writable pflash;
 ///   `run-parallel` copies it to per-slot VARS.fd files so concurrent QEMUs
 ///   don't race on the same NVRAM image.
+///
+/// Source discovery is delegated to `firmware::find_riscv_firmware`,
+/// which is env-var-first and per-`cfg(target_os)` aware. This function
+/// owns only the padding/caching that QEMU's `virt` machine requires
+/// (exactly 32 MiB pflash images).
 pub fn prepare_riscv_firmware(ctx: &Context) -> Result<(PathBuf, PathBuf)>
 {
-    let firmware_dir = EDK2_RISCV_DIRS
-        .iter()
-        .find(|d| Path::new(d).join("RISCV_VIRT_CODE.fd").exists())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "edk2 RISC-V firmware not found\n\
-                 Install with: dnf install edk2-riscv64          (Fedora)\n\
-                 or:           apt install qemu-efi-riscv64       (Debian/Ubuntu)\n\
-                 or on Arch:   download the Fedora edk2-riscv64 RPM and extract\n\
-                               RISCV_VIRT_CODE.fd + RISCV_VIRT_VARS.fd into /usr/share/edk2/riscv/"
-            )
-        })?;
-
-    let base = Path::new(firmware_dir);
-    let src_code = base.join("RISCV_VIRT_CODE.fd");
-    let src_vars = base.join("RISCV_VIRT_VARS.fd");
-
-    if !src_vars.exists()
-    {
-        bail!("RISC-V NVRAM template not found: {}", src_vars.display());
-    }
+    let (src_code, src_vars) = firmware::find_riscv_firmware()?;
 
     let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
     std::fs::create_dir_all(&cache_dir)

@@ -48,7 +48,7 @@ re-install the new root cap.
 
 | Crate | Filesystem | Status |
 |---|---|---|
-| `fat/` | Read-only FAT16/FAT32 | Working |
+| `fat/` | Read/write FAT16/FAT32 (write-through, no fsync) | Working |
 
 ---
 

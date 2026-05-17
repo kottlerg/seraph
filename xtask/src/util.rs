@@ -88,9 +88,9 @@ fn install_hint_for(name: &str) -> String
             macOS (Homebrew): brew install qemu\n  \
             FreeBSD:          pkg install qemu"
             .into(),
-        "cargo" => "Install rustup (https://rustup.rs/); xtask requires the toolchain pinned in \
-             rust-toolchain.toml. This usually means xtask itself was invoked outside a \
-             rustup-managed environment."
+        "cargo" | "rustc" => "Install rustup (https://rustup.rs/); xtask requires the toolchain \
+             pinned in rust-toolchain.toml. This usually means xtask itself was invoked \
+             outside a rustup-managed environment."
             .into(),
         _ => format!("Install {name} via your distribution's package manager."),
     }
@@ -103,10 +103,11 @@ fn install_hint_for(name: &str) -> String
 /// Returns an error with install instructions if not found.
 pub fn find_llvm_objcopy() -> Result<PathBuf>
 {
-    let sysroot_out = run_cmd_capture(Command::new("rustc").args(["--print", "sysroot"]))?;
+    let rustc = require_tool("rustc")?;
+    let sysroot_out = run_cmd_capture(Command::new(&rustc).args(["--print", "sysroot"]))?;
     let sysroot = sysroot_out.trim();
 
-    let version_out = run_cmd_capture(Command::new("rustc").args(["-vV"]))?;
+    let version_out = run_cmd_capture(Command::new(&rustc).args(["-vV"]))?;
     let host_triple = version_out
         .lines()
         .find_map(|line| line.strip_prefix("host: "))

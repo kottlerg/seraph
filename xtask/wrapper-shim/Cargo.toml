@@ -12,9 +12,9 @@ name = "seraph-wrapper-shim"
 path = "src/main.rs"
 test = false
 
-# Zero-dependency by design — the shim is on the hot path of every
-# rustc invocation during StdUser builds. Keep the working set tiny.
-[dependencies]
+# Intentionally no [dependencies] — the shim is on the hot path of
+# every rustc invocation during StdUser builds. Keep the working set
+# tiny (std plus the few syscall sites the dispatch needs).
 
 [lints]
 workspace = true

@@ -347,9 +347,11 @@ fn hard_link_tree(src: &Path, dst: &Path) -> Result<()>
                     .with_context(|| format!("removing stale {}", dst_path.display()))?;
             }
             // Hard link first (cheap, no copy). On Windows we may
-            // fall back to a physical copy via `link_or_copy` if the
-            // file systems don't support hard links across the
-            // mirror tree — semantically equivalent for cargo.
+            // fall back to a physical `fs::copy` if the file systems
+            // don't support hard links across the mirror tree —
+            // semantically equivalent for cargo. Symlinks are
+            // forbidden here per the module's "Why hard-link-mirror
+            // the library/ tree" section.
             if fs::hard_link(&path, &dst_path).is_err()
             {
                 fs::copy(&path, &dst_path).with_context(|| {
@@ -1378,7 +1380,8 @@ fn write_if_changed(src: &Path, dst: &Path, short: &str) -> Result<()>
 
 fn probe_real_sysroot() -> Result<PathBuf>
 {
-    let out = Command::new("rustc")
+    let rustc = require_tool("rustc")?;
+    let out = Command::new(&rustc)
         .args(["--print", "sysroot"])
         .output()
         .context("invoking rustc --print sysroot")?;

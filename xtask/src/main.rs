@@ -16,6 +16,7 @@
 
 use clap::Parser;
 
+mod accel;
 mod arch;
 mod cli;
 mod commands;

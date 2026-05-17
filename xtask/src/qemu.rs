@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, bail};
 
+use crate::accel::{self, Accel};
 use crate::arch::Arch;
 use crate::context::Context;
 use crate::firmware;
@@ -78,42 +79,69 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Vec<String>
         args.extend(["-s".into(), "-S".into()]);
     }
 
+    let accel = accel::detect_for_arch(spec.arch);
     match spec.arch
     {
-        Arch::X86_64 => extend_x86(&mut args, spec),
+        Arch::X86_64 => extend_x86(&mut args, spec, accel),
         Arch::Riscv64 => extend_riscv(&mut args, spec),
     }
 
     args
 }
 
-fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec)
+fn extend_x86(args: &mut Vec<String>, spec: &QemuLaunchSpec, accel: Accel)
 {
     args.extend(["-machine".into(), "q35".into()]);
 
-    // Existence is insufficient: GitHub `ubuntu-latest` x86 runners expose
-    // /dev/kvm for nested virt, but the runner user is not in the `kvm`
-    // group, so `open(O_RDWR)` returns EACCES and QEMU exits immediately.
-    // Probe the same way QEMU itself does, then fall through to TCG when
-    // the device cannot actually be used.
-    if kvm_usable()
+    match accel
     {
-        // -cpu host inherits the development host's microarchitecture; the
-        // kernel asserts x86-64-v3 in early init, so the host must advertise
-        // AVX2/BMI2/FMA (Haswell+ / Excavator+).
-        args.extend(["-enable-kvm".into(), "-cpu".into(), "host".into()]);
-    }
-    else
-    {
-        // TCG fallback: `-cpu max,migratable=no` advertises every feature
-        // QEMU can emulate (including x86-64-v3) so userspace SIMD codegen
-        // executes correctly under non-KVM runs (CI, KVM-less containers).
-        args.extend([
-            "-accel".into(),
-            "tcg,thread=multi".into(),
-            "-cpu".into(),
-            "max,migratable=no".into(),
-        ]);
+        Accel::Kvm =>
+        {
+            // -cpu host inherits the development host's microarchitecture;
+            // the kernel asserts x86-64-v3 in early init, so the host must
+            // advertise AVX2/BMI2/FMA (Haswell+ / Excavator+).
+            args.extend(["-enable-kvm".into(), "-cpu".into(), "host".into()]);
+        }
+        Accel::Hvf =>
+        {
+            // macOS Hypervisor.framework. Same -cpu host rationale as KVM;
+            // HVF passes host features through to the guest natively.
+            args.extend(["-accel".into(), "hvf".into(), "-cpu".into(), "host".into()]);
+        }
+        Accel::Whpx =>
+        {
+            // Windows Hyper-V Platform. WHPX does not expose -cpu host the
+            // same way KVM/HVF do; -cpu max,migratable=no is the documented
+            // QEMU recipe and exposes the same x86-64-v3 baseline TCG does.
+            args.extend([
+                "-accel".into(),
+                "whpx".into(),
+                "-cpu".into(),
+                "max,migratable=no".into(),
+            ]);
+        }
+        Accel::Nvmm =>
+        {
+            args.extend([
+                "-accel".into(),
+                "nvmm".into(),
+                "-cpu".into(),
+                "max,migratable=no".into(),
+            ]);
+        }
+        Accel::Tcg =>
+        {
+            // TCG fallback: `-cpu max,migratable=no` advertises every
+            // feature QEMU can emulate (including x86-64-v3) so userspace
+            // SIMD codegen executes correctly under non-KVM runs (CI,
+            // KVM-less containers).
+            args.extend([
+                "-accel".into(),
+                "tcg,thread=multi".into(),
+                "-cpu".into(),
+                "max,migratable=no".into(),
+            ]);
+        }
     }
 
     args.extend([
@@ -182,24 +210,6 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
             ]);
         }
     }
-}
-
-/// Returns true if `/dev/kvm` can be opened for read+write by the current
-/// process. Existence alone is misleading on environments that expose the
-/// node without granting the calling user access (e.g. GitHub-hosted
-/// runners). Setting `SERAPH_NO_KVM=1` forces the TCG path regardless,
-/// for local reproduction of the no-KVM CI environment.
-fn kvm_usable() -> bool
-{
-    if std::env::var_os("SERAPH_NO_KVM").is_some()
-    {
-        return false;
-    }
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
 }
 
 /// Resolve and cache riscv64 firmware.

@@ -161,7 +161,7 @@ Detail: [uefi-environment.md](uefi-environment.md)
 
 `BootInfo` is populated in-place in a physical memory region allocated before step 8.
 All pointer and address fields hold physical addresses; no virtual addresses appear in
-`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `6`).
+`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `7`).
 Fields are populated as follows:
 
 | Field | Source |
@@ -183,6 +183,7 @@ Fields are populated as follows:
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed (SMP disabled). |
+| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface inside `populate_cspace`. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself) and `page_table.allocated_frames()` (the bootloader's transient page-table frames). Cmdline and AP trampoline are not included — their last consumers run inside Phase 9, after `populate_cspace` returns. |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
 memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel

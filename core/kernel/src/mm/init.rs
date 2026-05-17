@@ -361,6 +361,12 @@ fn collect_usable_ranges(info: &BootInfo) -> RangeList<MAX_RANGES>
 ///
 /// Exclusion boundaries are rounded outward (start down, end up) to page
 /// granularity so no live data sits on a partially-excluded page.
+///
+/// The `BootInfo` and AP-trampoline guards below are belt-and-suspenders
+/// against the `EfiBootServicesData → Usable` mis-typing risk noted at the
+/// trampoline guard's own comment. The authoritative reclamation mechanism
+/// for bootloader scratch pages is `BootInfo.reclaim_ranges`, consumed by
+/// `cap::mint_reclaim_frame_caps` during Phase 7.
 fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
 {
     let mut excl = RangeList::new();

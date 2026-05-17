@@ -39,8 +39,8 @@ use crate::uefi::{
 };
 use boot_protocol::{
     BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage, KernelMmio,
-    MAX_APERTURES, MAX_CPUS, MemoryMapEntry, MemoryMapSlice, MmioAperture, MmioApertureSlice,
-    ModuleSlice,
+    MAX_APERTURES, MAX_CPUS, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice, MmioAperture,
+    MmioApertureSlice, ModuleSlice, ReclaimRange, ReclaimSlice,
 };
 
 // ── Size constants ────────────────────────────────────────────────────────────
@@ -133,6 +133,11 @@ struct BootAllocations
     stack_top: u64,
     cmdline_phys: u64,
     ap_trampoline_phys: u64,
+    /// Physical address of the dedicated 4 KiB page that backs
+    /// `BootInfo.reclaim_ranges`. The bootloader allocates this page in
+    /// step 6, populates the `ReclaimRange` array in step 9, and records
+    /// the page itself as a reclaim entry so the kernel reclaims it last.
+    reclaim_array_phys: u64,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -223,6 +228,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
             &ctx.framebuffer,
             &allocs,
             &uefi_map,
+            &page_table,
         );
     }
     // SAFETY: page_table root frames are valid; kernel_info.entry_virtual is
@@ -655,6 +661,10 @@ unsafe fn step6_allocate_and_build_page_tables(
     // because MAX_CMDLINE_LEN (512) < 4096.
     unsafe { core::ptr::write((cmdline_phys + cfg.cmdline_len as u64) as *mut u8, 0u8) };
 
+    // Reclaim-array page: dedicated 4 KiB backing for BootInfo.reclaim_ranges.
+    // SAFETY: bs is valid.
+    let reclaim_array_phys = unsafe { allocate_pages(ctx.bs, 1)? };
+
     let allocs = BootAllocations {
         boot_info_phys,
         modules_phys,
@@ -664,6 +674,7 @@ unsafe fn step6_allocate_and_build_page_tables(
         stack_top,
         cmdline_phys,
         ap_trampoline_phys,
+        reclaim_array_phys,
     };
 
     let mut identity_regions: [(u64, u64); MAX_IDENTITY_REGIONS] =
@@ -757,6 +768,8 @@ fn collect_identity_regions(
     }
     // MMIO aperture array page.
     push(allocs.apertures_phys, 4096);
+    // Reclaim-array page: backs BootInfo.reclaim_ranges.
+    push(allocs.reclaim_array_phys, 4096);
     n
 }
 
@@ -845,8 +858,10 @@ unsafe fn step8_exit_boot_services(
 // BootInfo population is the fan-in point for every earlier step: config,
 // kernel, init, modules, firmware, cpu topology, framebuffer, boot
 // allocations, and the memory map all contribute distinct fields. Bundling
-// them would only rename the argument list into an ad-hoc struct.
-#[allow(clippy::too_many_arguments)]
+// them would only rename the argument list into an ad-hoc struct. The
+// too_many_lines allowance covers the inline reclaim-array build below,
+// which sits between aperture derivation and the BootInfo write.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 unsafe fn step9_populate_boot_info(
     cfg: &BootConfig,
     kernel: &KernelLoad,
@@ -857,6 +872,7 @@ unsafe fn step9_populate_boot_info(
     framebuffer: &FramebufferInfo,
     allocs: &BootAllocations,
     uefi_map: &uefi::MemoryMapResult,
+    page_table: &arch::current::BootPageTable,
 )
 {
     bprintln!("[--------] boot: step 9/10: populate BootInfo");
@@ -921,6 +937,63 @@ unsafe fn step9_populate_boot_info(
     }
     bprintln!(" derived");
 
+    // Build the reclaim-after-Phase-7 array in the dedicated 4 KiB page at
+    // `allocs.reclaim_array_phys`. Cmdline and AP trampoline are absent —
+    // their last consumers run inside Phase 9, after `populate_cspace`
+    // returns. The reclaim-array page is itself recorded as the final
+    // entry so the kernel reclaims it last.
+    // SAFETY: reclaim_array_phys is a valid 4 KiB allocation; we treat it as
+    // a fixed-size array of MAX_RECLAIM_RANGES entries (256 × 16 B = 4 KiB).
+    let reclaim_ranges: &mut [ReclaimRange; MAX_RECLAIM_RANGES] =
+        unsafe { &mut *(allocs.reclaim_array_phys as *mut [ReclaimRange; MAX_RECLAIM_RANGES]) };
+    *reclaim_ranges = [ReclaimRange {
+        phys_base: 0,
+        page_count: 0,
+        reserved: 0,
+    }; MAX_RECLAIM_RANGES];
+    let mut reclaim_len: usize = 0;
+    let mut push_reclaim = |phys_base: u64, page_count: u32| {
+        if reclaim_len >= MAX_RECLAIM_RANGES
+        {
+            bprintln!("[--------] boot: FATAL: reclaim_ranges overflow (bump MAX_RECLAIM_RANGES)");
+            // Post-exit, pre-handoff: BootInfo will be malformed; halt
+            // explicitly so the failure is obvious rather than silent.
+            loop
+            {
+                core::hint::spin_loop();
+            }
+        }
+        reclaim_ranges[reclaim_len] = ReclaimRange {
+            phys_base,
+            page_count,
+            reserved: 0,
+        };
+        reclaim_len += 1;
+    };
+    push_reclaim(allocs.boot_info_phys, 1);
+    push_reclaim(allocs.modules_phys, 1);
+    // MEM_MAP_ENTRY_PAGES and reclaim_len (bounded by MAX_RECLAIM_RANGES) are
+    // both small compile-time constants well within u32 range.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        push_reclaim(allocs.mem_entries_phys, MEM_MAP_ENTRY_PAGES as u32);
+    }
+    push_reclaim(allocs.apertures_phys, 1);
+    for &frame in page_table.allocated_frames()
+    {
+        push_reclaim(frame, 1);
+    }
+    // The reclaim-array page itself is reclaim-safe once the kernel has
+    // walked it — record it last so the kernel processes it in order.
+    push_reclaim(allocs.reclaim_array_phys, 1);
+    bprint!("[--------] boot: reclaim_ranges: ");
+    #[allow(clippy::cast_possible_truncation)]
+    // SAFETY: console initialized.
+    unsafe {
+        crate::console::console_write_dec32(reclaim_len as u32);
+    }
+    bprintln!(" entries recorded");
+
     // Write the populated BootInfo.
     // SAFETY: boot_info_phys is a valid 4 KiB allocation; BootInfo fits in one page.
     unsafe {
@@ -968,6 +1041,10 @@ unsafe fn step9_populate_boot_info(
                 bsp_id: cpus.bsp_id,
                 cpu_ids: cpus.cpu_ids,
                 ap_trampoline_page: allocs.ap_trampoline_phys,
+                reclaim_ranges: ReclaimSlice {
+                    entries: allocs.reclaim_array_phys as *const ReclaimRange,
+                    count: reclaim_len as u64,
+                },
             },
         );
     }

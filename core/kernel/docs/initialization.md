@@ -118,8 +118,12 @@ heap exists yet.
 6. Install the new page table:
    arch::current::Paging::activate(&new_table, pcid=0)
    (PCID/ASID 0 is reserved for kernel-only contexts)
-7. The bootloader page table is no longer referenced; its frames are not freed yet
-   (they remain allocated but will be reclaimed after Phase 4)
+7. The bootloader page table is no longer referenced; its frames are
+   recorded in `BootInfo.reclaim_ranges` (boot protocol v7) and minted
+   as reclaimable Frame caps into init's CSpace during Phase 7 by
+   `cap::mint_reclaim_frame_caps`, alongside the other bootloader
+   scratch pages (`BootInfo` page, descriptor arrays, MMIO aperture
+   array, reclaim-array page).
 8. Emit: "page tables established, physmap at 0xFFFF800000000000"
 ```
 
@@ -150,8 +154,7 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
    - PageTableNode (fixed size; one per level-below-root page table frame)
 3. Install the kernel allocator (implements the `GlobalAlloc` trait via the
    size-class path; used by any `alloc::*` usage in the kernel)
-4. Reclaim bootloader page table frames (no longer needed)
-5. Emit: "kernel heap active"
+4. Emit: "kernel heap active"
 ```
 
 After this phase, `Box`, `Vec`, and other heap types work in kernel code.

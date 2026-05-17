@@ -244,17 +244,16 @@ mapping that reaches the kernel is a security defect, not just a policy violatio
 
 ## Page Table Frame Tracking
 
-The bootloader does not free page table frames. All intermediate table frames
-allocated by `AllocatePages` appear in the UEFI memory map as `EfiLoaderData`
-regions, which translate to `MemoryType::Loaded` in `BootInfo`. The kernel sees
-these regions as in-use and does not reclaim them until it establishes its own page
-tables in Phase 3, after which it can safely free the bootloader's intermediate
-frames via its buddy allocator.
-
-The bootloader records the root page table's physical address but does not
-separately track intermediate frames. The kernel does not need to enumerate them
-— it simply replaces the entire page table structure during Phase 3 and the old
-frames become reclaimable as `EfiLoaderData` entries in the memory map are processed.
+Each arch-specific `BootPageTable` records the physical address of every
+frame it allocates from `AllocatePages` — the root table and every
+intermediate table allocated during `map` — in an inline `frame_log`.
+After step 8, step 9 reads this log via the trait method
+`PageTableBuilder::allocated_frames` and appends one
+`boot_protocol::ReclaimRange` per frame to `BootInfo.reclaim_ranges`.
+The kernel mints reclaimable Frame caps over the recorded frames during
+Phase 7 (`cap::mint_reclaim_frame_caps`), so they flow into userspace
+through the standard `CapDescriptor` path rather than being orphaned as
+`MemoryType::Loaded` pages outside the buddy.
 
 ---
 

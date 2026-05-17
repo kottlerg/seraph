@@ -25,6 +25,18 @@ const PAGE_SIZE: u64 = 4096;
 /// Number of entries in a single page table (all levels).
 const TABLE_ENTRIES: usize = 512;
 
+/// Capacity of the page-table frame log used for post-handoff reclamation.
+///
+/// Sized to cover the root PML4 plus every intermediate frame allocated
+/// during identity mapping of kernel, init, modules, framebuffer, and
+/// file-read buffers. Empirically a six-module seraph boot uses ~75
+/// frames; this cap provides ~50% headroom. The reclaim array's backing
+/// page in `BootInfo` holds up to `MAX_RECLAIM_RANGES` (256) entries, so
+/// this cap is the binding limit; `alloc_table` returns `None` once
+/// exhausted, propagating as `BootError::OutOfMemory` — diagnose by
+/// bumping this constant rather than silently truncating.
+const FRAME_LOG_CAP: usize = 128;
+
 /// x86-64 4-level page table builder.
 ///
 /// Holds the physical address of the PML4 root and the UEFI boot services
@@ -35,6 +47,13 @@ pub struct BootPageTable
     root_phys: u64,
     /// UEFI boot services pointer for frame allocation.
     bs: *mut crate::uefi::EfiBootServices,
+    /// Physical addresses of every frame allocated for this builder's tables
+    /// (root + every intermediate frame). Recorded in `BootInfo.reclaim_ranges`
+    /// so the kernel can reclaim them once Phase 3 has installed its own
+    /// page tables.
+    frame_log: [u64; FRAME_LOG_CAP],
+    /// Number of valid entries in [`Self::frame_log`].
+    frame_log_len: usize,
 }
 
 impl PageTableBuilder for BootPageTable
@@ -52,7 +71,14 @@ impl PageTableBuilder for BootPageTable
         unsafe {
             core::ptr::write_bytes(root_phys as *mut u8, 0, PAGE_SIZE as usize);
         }
-        Some(Self { root_phys, bs })
+        let mut frame_log = [0u64; FRAME_LOG_CAP];
+        frame_log[0] = root_phys;
+        Some(Self {
+            root_phys,
+            bs,
+            frame_log,
+            frame_log_len: 1,
+        })
     }
 
     fn map(&mut self, virt: u64, phys: u64, size: u64, flags: PageFlags) -> Result<(), MapError>
@@ -80,6 +106,11 @@ impl PageTableBuilder for BootPageTable
     fn root_physical(&self) -> u64
     {
         self.root_phys
+    }
+
+    fn allocated_frames(&self) -> &[u64]
+    {
+        &self.frame_log[..self.frame_log_len]
     }
 }
 
@@ -165,9 +196,14 @@ impl BootPageTable
 
     /// Allocate and zero one 4 KiB frame for use as an intermediate page table.
     ///
-    /// Returns the physical address of the frame, or `None` on allocation failure.
+    /// Returns the physical address of the frame, or `None` on allocation failure
+    /// (UEFI out-of-memory or [`FRAME_LOG_CAP`] exhausted).
     fn alloc_table(&mut self) -> Option<u64>
     {
+        if self.frame_log_len >= FRAME_LOG_CAP
+        {
+            return None;
+        }
         // SAFETY: self.bs is valid pre-ExitBootServices; allocate_pages returns a
         // physical address of a freshly allocated EfiLoaderData region.
         let frame = unsafe { crate::uefi::allocate_pages(self.bs, 1).ok()? };
@@ -178,6 +214,8 @@ impl BootPageTable
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
         }
+        self.frame_log[self.frame_log_len] = frame;
+        self.frame_log_len += 1;
         Some(frame)
     }
 }

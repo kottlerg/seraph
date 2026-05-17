@@ -37,7 +37,18 @@
 ///     descriptors: `kernel_mmio` (arch-specific struct carrying the small
 ///     MMIO bases the kernel itself consumes) and `mmio_apertures` (coarse
 ///     non-RAM physical ranges from which the kernel mints MMIO caps).
-pub const BOOT_PROTOCOL_VERSION: u32 = 6;
+/// v7: Added `reclaim_ranges: ReclaimSlice` so the bootloader can hand the
+///     kernel a list of scratch pages (`BootInfo` page, module descriptor
+///     array, memory-map entry array, MMIO aperture array, the
+///     reclaim-array page itself, and the bootloader's own transient
+///     page-table frames) that are safe to reclaim once the kernel's
+///     Phase-7 capability system has consumed them. The slice is backed
+///     by a dedicated 4 KiB scratch page; that page is itself the final
+///     entry in the array so the kernel reclaims it last. The kernel
+///     mints reclaimable Frame caps over each range inside
+///     `populate_cspace` so the pages reach userspace through the same
+///     `CapDescriptor` path as boot modules.
+pub const BOOT_PROTOCOL_VERSION: u32 = 7;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -442,6 +453,64 @@ unsafe impl Send for MmioApertureSlice {}
 // SAFETY: Same rationale as MemoryMapSlice.
 unsafe impl Sync for MmioApertureSlice {}
 
+// ── Reclaimable bootloader scratch ───────────────────────────────────────────
+
+/// A contiguous range of physical pages the bootloader allocated for its own
+/// scratch use and which becomes reclaim-safe once the kernel's Phase-7
+/// capability system has consumed it.
+///
+/// The kernel walks the [`ReclaimSlice`] in [`BootInfo`] inside
+/// `populate_cspace`, mints one reclaimable `FrameObject` cap per range, and
+/// inserts each into the root `CSpace` so the cap reaches userspace through
+/// the standard `CapDescriptor` path. Once `populate_cspace` returns, the
+/// kernel MUST NOT dereference any address inside a recorded range.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReclaimRange
+{
+    /// Page-aligned physical base address.
+    pub phys_base: u64,
+    /// Number of 4 KiB pages covered. Non-zero.
+    pub page_count: u32,
+    /// Reserved for future per-entry flags (e.g. arch-specific liveness
+    /// hints). Producers MUST write zero; consumers MUST ignore.
+    pub reserved: u32,
+}
+
+/// Maximum number of [`ReclaimRange`] entries one 4 KiB reclaim-array page
+/// can hold. The bootloader allocates a dedicated 4 KiB page for the array
+/// and indexes into it; 256 × 16 B = 4 KiB exactly.
+///
+/// A typical seraph boot produces between fifteen and fifty entries (one
+/// per fixed scratch allocation plus one per bootloader transient
+/// page-table frame). The bootloader diagnoses overflow as a sizing bug
+/// rather than truncating.
+pub const MAX_RECLAIM_RANGES: usize = 256;
+
+/// A slice of [`ReclaimRange`] values, passed by physical address.
+///
+/// Stored in `BootInfo` as a `(*const ReclaimRange, u64)` slice so the
+/// underlying array lives in its own dedicated 4 KiB scratch page,
+/// avoiding inline pressure on the `BootInfo` page-fit budget. The
+/// array's backing page is itself one of the recorded entries — the
+/// kernel reclaims it via `cap::mint_reclaim_frame_caps` once the
+/// scan completes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReclaimSlice
+{
+    /// Physical address of the first entry. Null if `count` is zero.
+    pub entries: *const ReclaimRange,
+    /// Number of entries.
+    pub count: u64,
+}
+
+// SAFETY: Same rationale as MemoryMapSlice — boot-time physical memory,
+// produced pre-ExitBootServices and read-only after handoff.
+unsafe impl Send for ReclaimSlice {}
+// SAFETY: Same rationale as MemoryMapSlice.
+unsafe impl Sync for ReclaimSlice {}
+
 // ── BootInfo ─────────────────────────────────────────────────────────────────
 
 /// Boot information structure populated by the bootloader and passed to the
@@ -564,6 +633,16 @@ pub struct BootInfo
     /// Zero if the bootloader could not reserve a trampoline page (SMP will
     /// then be unavailable; the kernel continues BSP-only).
     pub ap_trampoline_page: u64,
+
+    // ── Reclaimable scratch (added in protocol version 7) ─────────────────────
+    /// Bootloader scratch ranges the kernel reclaims into the cap surface
+    /// inside `populate_cspace`. The slice's backing array lives in its
+    /// own dedicated 4 KiB scratch page; that page is itself one of the
+    /// recorded entries, so the kernel reclaims it last. Reading or
+    /// writing any address in a recorded range after the Phase-7 cap
+    /// system has been initialised is undefined behaviour from the
+    /// kernel's perspective.
+    pub reclaim_ranges: ReclaimSlice,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -598,12 +677,18 @@ mod tests
         assert_eq!(FramebufferInfo::empty().pixel_format, PixelFormat::Rgbx8);
     }
 
-    /// BOOT_PROTOCOL_VERSION must be 6 after the PlatformResource → kernel_mmio
-    /// + mmio_apertures replacement.
+    /// BOOT_PROTOCOL_VERSION must be 7 after the `reclaim_ranges` addition.
     #[test]
-    fn protocol_version_is_6()
+    fn protocol_version_is_7()
     {
-        assert_eq!(BOOT_PROTOCOL_VERSION, 6);
+        assert_eq!(BOOT_PROTOCOL_VERSION, 7);
+    }
+
+    /// `ReclaimRange` is 16 bytes: u64 + u32 + u32, no padding.
+    #[test]
+    fn reclaim_range_size_is_16_bytes()
+    {
+        assert_eq!(core::mem::size_of::<ReclaimRange>(), 16);
     }
 
     /// `MmioApertureSlice` is layout-compatible across builds and trivially

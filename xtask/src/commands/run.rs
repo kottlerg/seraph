@@ -11,8 +11,8 @@
 //! rather than a silent rebuild, which keeps tight re-run loops from
 //! accidentally recompiling and changing what is being tested.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::io::{Read, Write, copy};
+use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::{Context as _, Result};
 
@@ -23,7 +23,15 @@ use crate::qemu::{
     QemuLaunchSpec, build_qemu_argv, find_ovmf_code, prepare_riscv_firmware,
     validate_sysroot_for_launch,
 };
-use crate::util::{TerminalGuard, run_with_sigint_ignored, step};
+use crate::term::filter::FilterWriter;
+use crate::term::guard::TerminalGuard;
+use crate::term::line_gate::LineGate;
+use crate::util::step;
+
+/// Marker that opens the default-mode line gate. Emitted by the
+/// bootloader as the first line after firmware exits; everything
+/// before it is firmware chatter that the user almost never wants.
+const BOOT_MARKER: &[u8] = b"[--------] boot:";
 
 /// Entry point for `cargo xtask run`.
 pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
@@ -76,73 +84,65 @@ pub fn run(ctx: &BuildContext, args: &RunArgs) -> Result<()>
 
 fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Result<()>
 {
-    if verbose
+    let banner = if verbose
     {
-        step(&format!("Starting QEMU ({})", desc));
-        // Ignore SIGINT in our process so Ctrl+C kills QEMU but lets us run
-        // cleanup (TerminalGuard restore) before exiting.
-        let status = run_with_sigint_ignored(|| {
-            Command::new(binary)
-                .args(args)
-                .status()
-                .with_context(|| format!("failed to launch {}", binary))
-        })?;
-        if !status.success()
-        {
-            eprintln!("QEMU exited with {} (normal for OS development)", status);
-        }
+        format!("Starting QEMU ({desc})")
     }
     else
     {
-        step(&format!(
-            "Starting QEMU ({}) [output filtered until '[--------] boot:'; --verbose to disable]",
-            desc
-        ));
-        let mut child = Command::new(binary)
-            .args(args)
-            .stdout(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to launch {}", binary))?;
+        format!(
+            "Starting QEMU ({desc}) [output filtered until '[--------] boot:'; --verbose to disable]",
+        )
+    };
+    step(&banner);
 
-        // Pipe stdout: suppress all output until '[--------] boot:' appears.
-        // This filters out UEFI DEBUG spam and OpenSBI banners on RISC-V.
-        // Note: piping stdout disables the QEMU monitor (Ctrl+A c).
-        //
-        // Use byte-level reading with `from_utf8_lossy` so non-UTF-8 bytes in
-        // kernel fault dumps (e.g. raw memory content) don't abort the reader.
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let mut reader = BufReader::new(stdout);
-        let mut show = false;
-        let mut buf: Vec<u8> = Vec::new();
+    // Pipe stdout unconditionally so the filter (and optional gate)
+    // can screen every byte. stdin and stderr inherit. QEMU's stderr
+    // is not part of the firmware-spam problem; passing it through
+    // unfiltered preserves any meaningful QEMU diagnostics.
+    //
+    // SIGINT handling: the global no-op handler installed in main()
+    // (term::signal::install) means Ctrl+C terminates QEMU directly
+    // via the tty without killing xtask. The TerminalGuard captured
+    // in run() runs its drop on the way out, restoring termios.
+    let mut child = Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to launch {binary}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("QEMU stdout was piped but unavailable")?;
+    forward_qemu_stdout(stdout, verbose)?;
+    let status: ExitStatus = child.wait().context("waiting for QEMU to exit")?;
 
-        loop
-        {
-            buf.clear();
-            let n = reader
-                .read_until(b'\n', &mut buf)
-                .context("reading QEMU stdout")?;
-            if n == 0
-            {
-                break;
-            }
-            let line = String::from_utf8_lossy(&buf);
-            let line = line.trim_end_matches(['\n', '\r']);
-            if !show && line.contains("[--------] boot:")
-            {
-                show = true;
-            }
-            if show
-            {
-                println!("{}", line);
-            }
-        }
-
-        let status = child.wait().context("waiting for QEMU to exit")?;
-        if !status.success()
-        {
-            eprintln!("QEMU exited with {} (normal for OS development)", status);
-        }
+    if !status.success()
+    {
+        eprintln!("QEMU exited with {status} (normal for OS development)");
     }
+    Ok(())
+}
 
+/// Read QEMU's stdout to EOF, forwarding it to the host stdout through
+/// the control-sequence filter and (in default mode) the marker gate.
+fn forward_qemu_stdout<R: Read>(mut from: R, verbose: bool) -> Result<()>
+{
+    let out = std::io::stdout();
+    let locked = out.lock();
+    let sink = FilterWriter::new(locked);
+
+    if verbose
+    {
+        let mut s = sink;
+        copy(&mut from, &mut s).context("forwarding QEMU stdout")?;
+        s.flush().context("flushing host stdout")?;
+    }
+    else
+    {
+        let mut gated = LineGate::new(sink, BOOT_MARKER);
+        copy(&mut from, &mut gated).context("forwarding QEMU stdout")?;
+        gated.flush().context("flushing host stdout")?;
+    }
     Ok(())
 }

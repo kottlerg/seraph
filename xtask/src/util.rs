@@ -3,44 +3,14 @@
 
 //! util.rs
 //!
-//! Shared utilities: step printing, command execution, tool discovery,
-//! and an RAII guard for terminal state.
+//! Shared utilities: step printing, command execution, and tool
+//! discovery. (The terminal-state RAII guard moved to `term::guard`.)
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-
-// ── SIGINT isolation ──────────────────────────────────────────────────────────
-
-/// Run `f` with SIGINT ignored in this process, then restore the previous
-/// signal disposition.
-///
-/// Ctrl+C sends SIGINT to the entire foreground process group (both xtask and
-/// the child process). By ignoring it here the child (QEMU) still receives and
-/// handles SIGINT normally while our process survives long enough to run cleanup
-/// (TerminalGuard restore, etc.).
-pub fn run_with_sigint_ignored<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    // POSIX guarantees: SIGINT = 2, SIG_DFL = 0, SIG_IGN = 1 on all targets
-    // we care about (Linux x86-64, Linux riscv64). xtask is host-only.
-    unsafe extern "C" {
-        fn signal(signum: i32, handler: usize) -> usize;
-    }
-    // SAFETY: signal() is async-signal-safe. We restore the previous disposition
-    // after `f` returns, so no permanent state change.
-    let prev = unsafe {
-        signal(2 /* SIGINT */, 1 /* SIG_IGN */)
-    };
-    let result = f();
-    unsafe {
-        signal(2 /* SIGINT */, prev)
-    };
-    result
-}
 
 // ── Step printing ─────────────────────────────────────────────────────────────
 
@@ -120,120 +90,4 @@ pub fn find_llvm_objcopy() -> Result<PathBuf>
             objcopy.display()
         )
     }
-}
-
-// ── Terminal guard ────────────────────────────────────────────────────────────
-
-/// RAII guard that saves terminal dimensions on creation and restores them on
-/// drop via `ioctl(TIOCSWINSZ)`.
-///
-/// OVMF emits `ESC[=3h` and `ESC[8;rows;colst` over serial during boot, which
-/// clobber TIOCSWINSZ. Capturing and restoring via ioctl directly (rather than
-/// a stty subprocess) is the reliable path.
-pub struct TerminalGuard
-{
-    rows: u16,
-    cols: u16,
-}
-
-impl TerminalGuard
-{
-    /// Capture the current terminal dimensions via `ioctl(TIOCGWINSZ)`.
-    ///
-    /// Falls back to 24×80 in non-interactive environments (CI, piped I/O).
-    pub fn capture() -> Self
-    {
-        let (rows, cols) = tiocgwinsz().unwrap_or((24, 80));
-        TerminalGuard { rows, cols }
-    }
-}
-
-impl Drop for TerminalGuard
-{
-    fn drop(&mut self)
-    {
-        restore_terminal(self.rows, self.cols);
-    }
-}
-
-fn restore_terminal(rows: u16, cols: u16)
-{
-    // stty sane: reset line discipline (echo, icanon, etc.). Best-effort.
-    let _ = Command::new("stty").arg("sane").status();
-
-    // Restore TIOCSWINSZ via direct ioctl rather than a stty subprocess.
-    if let Ok(tty) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-    {
-        use std::os::unix::io::AsRawFd;
-        tiocswinsz(tty.as_raw_fd(), rows, cols);
-        // ESC[8;rows;colst — hint to terminal emulator to resize its window.
-        // ESC[?25h         — ensure cursor is visible (QEMU may hide it).
-        let _ = write!(&tty, "\x1b[8;{};{}t\x1b[?25h", rows, cols);
-    }
-}
-
-// ── Terminal ioctl helpers ────────────────────────────────────────────────────
-//
-// TIOCGWINSZ = 0x5413, TIOCSWINSZ = 0x5414 on Linux x86-64 and riscv64.
-// These constants are stable across all Linux architectures xtask runs on.
-
-/// C `struct winsize` layout for TIOCGWINSZ / TIOCSWINSZ ioctls.
-#[repr(C)]
-struct Winsize
-{
-    ws_row: u16,
-    ws_col: u16,
-    ws_xpixel: u16,
-    ws_ypixel: u16,
-}
-
-unsafe extern "C" {
-    fn ioctl(fd: i32, request: u64, ...) -> i32;
-}
-
-/// Query terminal character dimensions via `ioctl(TIOCGWINSZ)` on `/dev/tty`.
-fn tiocgwinsz() -> Option<(u16, u16)>
-{
-    use std::os::unix::io::AsRawFd;
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok()?;
-    let mut ws = Winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: tty fd is valid; Winsize matches the kernel struct for TIOCGWINSZ.
-    let ret = unsafe {
-        ioctl(tty.as_raw_fd(), 0x5413 /* TIOCGWINSZ */, &mut ws)
-    };
-    if ret == 0 && ws.ws_row > 0 && ws.ws_col > 0
-    {
-        Some((ws.ws_row, ws.ws_col))
-    }
-    else
-    {
-        None
-    }
-}
-
-/// Set terminal character dimensions via `ioctl(TIOCSWINSZ)` on `fd`.
-fn tiocswinsz(fd: i32, rows: u16, cols: u16)
-{
-    let ws = Winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: fd is a valid terminal fd; Winsize matches the kernel struct for TIOCSWINSZ.
-    unsafe {
-        ioctl(fd, 0x5414 /* TIOCSWINSZ */, &ws)
-    };
 }

@@ -24,6 +24,7 @@ mod disk;
 mod qemu;
 mod rust_src;
 mod sysroot;
+mod term;
 mod util;
 
 use cli::{Cli, CliCommand};
@@ -33,6 +34,15 @@ fn main()
 {
     let cli = Cli::parse();
     let ctx = Context::from_manifest_dir();
+
+    // Install a no-op Ctrl+C handler so SIGINT terminates the inner
+    // subprocess (cargo, QEMU) without killing xtask itself. Allows
+    // TerminalGuard::drop and error propagation to run on Ctrl+C.
+    if let Err(err) = term::signal::install()
+    {
+        eprintln!("error: {err:#}");
+        std::process::exit(1);
+    }
 
     let result = match &cli.command
     {

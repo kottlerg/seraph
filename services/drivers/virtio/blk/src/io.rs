@@ -161,9 +161,12 @@ const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 /// `count` consecutive sectors starting at `sector`; the device
 /// transfers the entire run in one descriptor chain.
 ///
-/// Blocks on `signal_wait` until the device raises an interrupt, reads the
-/// device ISR to deassert the level-triggered interrupt, then acknowledges
-/// at the controller for re-arming.
+/// Blocks on a bounded `signal_wait_timeout` per iteration until the device
+/// raises an interrupt or the per-iteration timeout elapses, then reads the
+/// device ISR to deassert the level-triggered interrupt, acknowledges at the
+/// controller for re-arming, and re-polls the used ring. The bounded wait
+/// ensures that a lost PLIC external interrupt on QEMU virt RISC-V cannot
+/// park this thread indefinitely — see the wait loop body for details.
 // too_many_arguments: layout + direction + sector + data_phys + data_len
 // + four hardware handles (virtqueue, transport, irq signal, irq cap) is
 // the minimal set this path needs; bundling for the lint would obscure

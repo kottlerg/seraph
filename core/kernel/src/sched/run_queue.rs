@@ -316,22 +316,31 @@ impl PerCpuScheduler
 
     /// Remove `tcb` from its priority queue. No-op if not found.
     ///
-    /// Used by `dealloc_object(Thread)` to prevent use-after-free:
-    /// the TCB must be removed from the run queue before its memory
-    /// is freed.
+    /// Used by `dealloc_object(Thread)`, `change_priority`, and
+    /// `migrate_ready_thread` to relocate or destroy a queued thread.
+    ///
+    /// Decrements `CPU_LOAD[cpu_id]` iff the remove succeeded — the load
+    /// counter MUST match the actual queue contents. `change_priority` pairs
+    /// this with a follow-up `enqueue` so its net effect is zero.
     ///
     /// Caller must hold `self.lock`.
-    pub fn remove_from_queue(&mut self, tcb: *mut ThreadControlBlock, priority: u8)
+    pub fn remove_from_queue(&mut self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
     {
         let p = priority as usize;
         if p >= NUM_PRIORITY_LEVELS
         {
-            return;
+            return false;
         }
-        if self.queues[p].remove(tcb) && self.queues[p].is_empty()
+        let removed = self.queues[p].remove(tcb);
+        if removed
         {
-            self.non_empty.fetch_and(!(1 << p), Ordering::Release);
+            self.decrement_load();
+            if self.queues[p].is_empty()
+            {
+                self.non_empty.fetch_and(!(1 << p), Ordering::Release);
+            }
         }
+        removed
     }
 
     /// Move a `Ready` TCB from `old_prio` queue to `new_prio` queue.

@@ -57,6 +57,17 @@ static mut STACK_CONFIGURE_ERR: ChildStack = ChildStack::ZERO;
 static mut STACK_AFFINITY_CPU1: ChildStack = ChildStack::ZERO;
 static mut STACK_AFFINITY_RESPECTED: ChildStack = ChildStack::ZERO;
 static mut STACK_DEFAULT_AFFINITY: ChildStack = ChildStack::ZERO;
+static mut STACK_AFFINITY_MIGRATE_READY: ChildStack = ChildStack::ZERO;
+static mut STACK_AFFINITY_MIGRATE_RUNNING: ChildStack = ChildStack::ZERO;
+
+/// Latest CPU index observed by the spinner used in
+/// `affinity_migrate_running`. The spinner stores its current CPU id on
+/// every iteration; the parent reads this to detect migration.
+static MIGRATE_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Signals the migration spinner to exit cleanly once the parent has
+/// observed the migration.
+static MIGRATE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
 
 /// Signal cap slot passed to `phase2_entry` via a static rather than a
 /// register argument.
@@ -564,6 +575,161 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+// ── Active affinity migration (Issue #22) ─────────────────────────────────────
+
+/// `thread_set_affinity` actively migrates a Ready thread queued on another CPU.
+///
+/// Spawns child T pinned to CPU 0 at the same priority as the parent. Because
+/// the parent is already running on CPU 0 when T is started, T sits Ready in
+/// CPU 0's run queue. The parent then changes T's affinity to CPU 1: the
+/// active-migration path in `sys_thread_set_affinity` must dequeue T from
+/// CPU 0 and re-enqueue it on CPU 1 so that when the parent blocks in
+/// `signal_wait`, T runs on CPU 1.
+///
+/// T reports the CPU it actually ran on via `SystemInfoType::CurrentCpu`,
+/// encoded in the signal value. Without active migration, T would stay on
+/// CPU 0's run queue and report CPU 0 instead, failing the test.
+///
+/// Requires SMP; skips otherwise.
+pub fn affinity_migrate_ready_queued(ctx: &TestContext) -> TestResult
+{
+    let cpus =
+        system_info(SystemInfoType::CpuCount as u64).map_err(|_| "system_info(CpuCount) failed")?;
+    if cpus < 2
+    {
+        crate::log("ktest: thread::affinity_migrate_ready_queued SKIP (requires SMP)");
+        return Ok(());
+    }
+
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for affinity_migrate_ready_queued failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for affinity_migrate_ready_queued failed")?;
+    let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL)
+        .map_err(|_| "cap_copy for affinity_migrate_ready_queued failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        .map_err(|_| "cap_create_thread for affinity_migrate_ready_queued failed")?;
+
+    // Pin to CPU 0 initially so T's first enqueue lands on CPU 0's run queue.
+    thread_set_affinity(th, 0).map_err(|_| "initial thread_set_affinity(0) failed")?;
+
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_READY));
+    thread_configure(
+        th,
+        report_cpu_entry as *const () as u64,
+        stack_top,
+        u64::from(child_sig),
+    )
+    .map_err(|_| "thread_configure for affinity_migrate_ready_queued failed")?;
+    thread_start(th).map_err(|_| "thread_start for affinity_migrate_ready_queued failed")?;
+
+    // T is now Ready, queued on CPU 0. The parent is also Running on CPU 0
+    // (same priority, FIFO) so T has not yet been picked. Switch T's affinity
+    // to CPU 1 — the active-migration path must dequeue T from CPU 0 and
+    // re-enqueue it on CPU 1.
+    thread_set_affinity(th, 1).map_err(|_| "active migration thread_set_affinity(1) failed")?;
+
+    // Block on the signal: parent leaves CPU 0, CPU 1 runs T which reports
+    // its actual CPU id back through the signal bits.
+    let bits =
+        signal_wait(sig).map_err(|_| "signal_wait for affinity_migrate_ready_queued failed")?;
+    if bits != 1
+    {
+        return Err("Ready-thread migration did not land on CPU 1");
+    }
+
+    cap_delete(th).map_err(|_| "cap_delete th after affinity_migrate_ready_queued failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after affinity_migrate_ready_queued failed")?;
+    cap_delete(cs).map_err(|_| "cap_delete cs after affinity_migrate_ready_queued failed")?;
+    Ok(())
+}
+
+/// `thread_set_affinity` causes a Running thread on a different CPU to
+/// migrate within one tick.
+///
+/// Spawns T pinned to CPU 1 with a tight `CurrentCpu` read loop that publishes
+/// its observed CPU into `MIGRATE_OBSERVED_CPU`. The parent runs on CPU 0,
+/// waits until T is observed on CPU 1, then calls
+/// `thread_set_affinity(T, 0)`. The Running-elsewhere path in
+/// `sys_thread_set_affinity` sends a reschedule IPI to CPU 1; CPU 1's
+/// `schedule()` re-enqueue site sees `cpu_affinity != current_cpu` and
+/// routes T cross-CPU to CPU 0. The parent waits for `MIGRATE_OBSERVED_CPU`
+/// to flip to 0.
+///
+/// Requires SMP; skips otherwise.
+pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
+{
+    let cpus =
+        system_info(SystemInfoType::CpuCount as u64).map_err(|_| "system_info(CpuCount) failed")?;
+    if cpus < 2
+    {
+        crate::log("ktest: thread::affinity_migrate_running SKIP (requires SMP)");
+        return Ok(());
+    }
+
+    MIGRATE_OBSERVED_CPU.store(u32::MAX, Ordering::Relaxed);
+    MIGRATE_SHOULD_EXIT.store(0, Ordering::Relaxed);
+
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for affinity_migrate_running failed")?;
+    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        .map_err(|_| "create_cspace for affinity_migrate_running failed")?;
+    let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL)
+        .map_err(|_| "cap_copy for affinity_migrate_running failed")?;
+    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        .map_err(|_| "cap_create_thread for affinity_migrate_running failed")?;
+
+    thread_set_affinity(th, 1).map_err(|_| "thread_set_affinity(1) failed")?;
+
+    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_RUNNING));
+    thread_configure(
+        th,
+        migrate_spinner_entry as *const () as u64,
+        stack_top,
+        u64::from(child_sig),
+    )
+    .map_err(|_| "thread_configure for affinity_migrate_running failed")?;
+    thread_start(th).map_err(|_| "thread_start for affinity_migrate_running failed")?;
+
+    // Wait until T has been scheduled on CPU 1 and reported its CPU.
+    let mut spins: u32 = 0;
+    while MIGRATE_OBSERVED_CPU.load(Ordering::Relaxed) != 1
+    {
+        syscall::thread_yield().ok();
+        spins = spins.saturating_add(1);
+        if spins > 200_000
+        {
+            MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
+            return Err("T never observed on CPU 1 before migration");
+        }
+    }
+
+    // Trigger migration of a Running thread.
+    thread_set_affinity(th, 0).map_err(|_| "migration thread_set_affinity(0) failed")?;
+
+    // Wait up to a generous bound (≫ 1 timer tick) for the migration to land.
+    spins = 0;
+    while MIGRATE_OBSERVED_CPU.load(Ordering::Relaxed) != 0
+    {
+        syscall::thread_yield().ok();
+        spins = spins.saturating_add(1);
+        if spins > 200_000
+        {
+            MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
+            return Err("Running-thread migration did not land on CPU 0");
+        }
+    }
+
+    // Tell T to exit and wait for the exit signal.
+    MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
+    signal_wait(sig).map_err(|_| "signal_wait for migrate_spinner exit failed")?;
+
+    cap_delete(th).map_err(|_| "cap_delete th after affinity_migrate_running failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after affinity_migrate_running failed")?;
+    cap_delete(cs).map_err(|_| "cap_delete cs after affinity_migrate_running failed")?;
+    Ok(())
+}
+
 // ── Phase D scheduler correctness tests ───────────────────────────────────────
 
 /// Thread with explicit CPU affinity starts and executes successfully.
@@ -723,6 +889,46 @@ fn blocker_entry(arg: u64) -> !
     loop
     {
         core::hint::spin_loop();
+    }
+}
+
+/// Reports the current CPU id back through the signal value and exits.
+///
+/// Used by [`affinity_migrate_ready_queued`] — the child is queued on one
+/// CPU, then migrated by the parent via `thread_set_affinity`. The CPU id
+/// reported here MUST be the post-migration CPU.
+// cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
+#[allow(clippy::cast_possible_truncation)]
+fn report_cpu_entry(sig_slot: u64) -> !
+{
+    let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
+    signal_send(sig_slot as u32, cpu).ok();
+    thread_exit()
+}
+
+/// Tight `CurrentCpu` observation loop used by [`affinity_migrate_running`].
+///
+/// Publishes the latest observed CPU id into [`MIGRATE_OBSERVED_CPU`] on
+/// every iteration. Exits when [`MIGRATE_SHOULD_EXIT`] is set, signalling
+/// the parent first so it can complete `signal_wait`.
+// cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
+#[allow(clippy::cast_possible_truncation)]
+fn migrate_spinner_entry(sig_slot: u64) -> !
+{
+    loop
+    {
+        let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX) as u32;
+        MIGRATE_OBSERVED_CPU.store(cpu, Ordering::Relaxed);
+        if MIGRATE_SHOULD_EXIT.load(Ordering::Relaxed) != 0
+        {
+            signal_send(sig_slot as u32, 0xC0FE).ok();
+            thread_exit();
+        }
+        // Tiny back-off so the parent gets a chance to run between observations.
+        for _ in 0..32
+        {
+            core::hint::spin_loop();
+        }
     }
 }
 

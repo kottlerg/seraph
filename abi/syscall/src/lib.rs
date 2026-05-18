@@ -504,4 +504,8 @@ pub enum SystemInfoType
     /// Microseconds elapsed since kernel timer initialisation.
     /// Returns 0 if the timer has not been initialised yet.
     ElapsedUs = 6,
+    /// Index of the CPU on which the calling thread is currently executing.
+    /// Useful for diagnostics and for verifying affinity / migration
+    /// behaviour from userspace.
+    CurrentCpu = 7,
 }

@@ -130,6 +130,25 @@ pub fn elapsed_us(_ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// `system_info(CurrentCpu)` returns a CPU index < `CpuCount`.
+///
+/// The return value MUST be a valid CPU id. Used by affinity / migration
+/// tests to observe which CPU a thread runs on; this test exercises the
+/// query itself.
+pub fn current_cpu(_ctx: &TestContext) -> TestResult
+{
+    let cpus =
+        system_info(SystemInfoType::CpuCount as u64).map_err(|_| "system_info(CpuCount) failed")?;
+    let cpu = system_info(SystemInfoType::CurrentCpu as u64)
+        .map_err(|_| "system_info(CurrentCpu) failed")?;
+    if cpu >= cpus
+    {
+        return Err("system_info(CurrentCpu) returned an out-of-range CPU id");
+    }
+    crate::log_u64("ktest: CurrentCpu=", cpu);
+    Ok(())
+}
+
 /// `system_info(CpuCount)` returns ≥ 2 when the kernel was booted with SMP.
 ///
 /// Requires QEMU `-smp N` with N ≥ 2. Skips with a log message rather than

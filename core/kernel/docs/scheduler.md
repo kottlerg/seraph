@@ -451,13 +451,31 @@ to use a higher-priority server thread, not to add kernel priority inheritance.
 ### Hard Affinity
 
 `tcb.cpu_affinity != AFFINITY_ANY` specifies a single CPU the thread must run on.
-The thread is never migrated. Wakeups always enqueue the thread on the specified CPU's
-run queue. If the specified CPU is offline, `SYS_CAP_CREATE_THREAD` fails with
-`InvalidArgument`.
+Wakeups always enqueue the thread on the specified CPU's run queue. If the
+specified CPU is offline, `SYS_CAP_CREATE_THREAD` fails with `InvalidArgument`.
 
 Hard affinity is intended for:
 - Interrupt-handling threads that must run on specific CPUs (NUMA, IRQ affinity)
 - Real-time threads that must not suffer migration latency
+
+### Active migration on affinity change
+
+`SYS_THREAD_SET_AFFINITY` enforces the new affinity immediately rather than
+deferring to the next enqueue:
+
+- **Ready** thread queued on the old CPU: the syscall calls
+  `migrate_ready_thread` which dequeues the TCB from the source CPU's run
+  queue and re-enqueues it on the destination under both scheduler locks
+  (lower-numbered CPU first; see scheduling-internals.md § Lock Hierarchy
+  rule 4) and sends a wakeup IPI to the destination.
+- **Running** thread on a different CPU: the syscall sets the destination's
+  reschedule-pending flag and sends a wakeup IPI to the source CPU. When
+  the source CPU enters `schedule()`, the re-enqueue site checks
+  `cpu_affinity != current_cpu` and routes the requeue cross-CPU via
+  `enqueue_and_wake` instead of the local run queue. Latency is bounded
+  by one timer tick.
+- **Blocked / Stopped / Created**: the new affinity takes effect on the
+  next wake via `select_target_cpu`; no migration work is needed.
 
 ### Soft Affinity
 

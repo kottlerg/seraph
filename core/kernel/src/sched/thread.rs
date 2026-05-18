@@ -190,7 +190,9 @@ pub struct ThreadControlBlock
     pub slice_remaining: u32,
 
     /// Hard CPU affinity (`AFFINITY_ANY` = `0xFFFF_FFFF` means no hard affinity).
-    /// TODO: enforce during thread migration / load balancing.
+    /// Honoured by `select_target_cpu` on enqueue, by the `schedule()`
+    /// requeue site for an already-Running thread, and by
+    /// `sys_thread_set_affinity` which actively migrates a Ready thread.
     pub cpu_affinity: u32,
 
     /// Soft affinity: last CPU this thread ran on (hint for the load balancer).

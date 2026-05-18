@@ -610,11 +610,16 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = Thread cap index (must have CONTROL).
 /// arg1 = CPU ID, or `AFFINITY_ANY` (`u32::MAX`) to clear hard affinity.
 ///
-/// Takes effect on the thread's next enqueue (`select_target_cpu`
-/// consults `cpu_affinity`). A thread that is currently running on or
-/// queued on another CPU is not migrated.
-/// TODO(SMP): active migration so affinity changes apply to already-
-/// running or already-queued threads.
+/// Active migration semantics:
+/// - **Ready** elsewhere: dequeued from its current CPU's run queue and
+///   re-enqueued on the new target via `migrate_ready_thread`.
+/// - **Running** elsewhere: a reschedule-pending flag is set on the
+///   source CPU and a wakeup IPI is delivered there. The
+///   affinity-vs-current-CPU check in `schedule()` then routes the
+///   re-enqueue cross-CPU on the next dispatch (bounded by one IPI
+///   latency, < one tick).
+/// - **Blocked / Stopped / Created**: the new affinity takes effect on
+///   the next `enqueue_and_wake` via `select_target_cpu`.
 ///
 /// Returns 0 on success.
 #[cfg(not(test))]
@@ -623,6 +628,7 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::object::ThreadObject;
     use crate::cap::slot::{CapTag, Rights};
     use crate::sched::AFFINITY_ANY;
+    use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
     use core::sync::atomic::Ordering;
 
@@ -666,9 +672,57 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
 
-    // SAFETY: target_tcb validated non-null; cpu_affinity field assignment is valid.
+    // SAFETY: target_tcb validated non-null; field access is valid.
     unsafe {
+        let old_cpu = (*target_tcb).preferred_cpu as usize;
         (*target_tcb).cpu_affinity = cpu_id;
+
+        // No active migration when affinity is cleared (any-CPU): the load
+        // balancer or the next enqueue will place the thread.
+        if cpu_id == AFFINITY_ANY
+        {
+            return Ok(0);
+        }
+        let new_cpu = cpu_id as usize;
+        if new_cpu == old_cpu
+        {
+            return Ok(0);
+        }
+
+        // preferred_cpu is bounded by select_target_cpu (writes always come
+        // from enqueue_and_wake or schedule(); both clamp to CPU_COUNT). A
+        // higher value indicates a corrupted TCB, which we ignore here.
+        let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
+        if old_cpu >= cpu_count
+        {
+            return Ok(0);
+        }
+
+        // Unlocked read; revalidated under-lock by migrate_ready_thread or
+        // tolerated as a spurious IPI in the Running case. Mirrors the
+        // pattern in sys_thread_set_priority above.
+        match (*target_tcb).state
+        {
+            ThreadState::Ready =>
+            {
+                // Best-effort: migrate_ready_thread re-checks state and
+                // location under both scheduler locks and bails on race.
+                let _ = crate::sched::migrate_ready_thread(target_tcb, old_cpu, new_cpu);
+            }
+            ThreadState::Running =>
+            {
+                // The Running thread's CPU sees the affinity change at its
+                // next schedule() entry (see sched/mod.rs schedule() re-enqueue
+                // path). Nudging that CPU bounds the latency to one IPI.
+                crate::sched::set_reschedule_pending_for(old_cpu);
+                crate::sched::prod_remote_cpu(old_cpu);
+            }
+            _ =>
+            {
+                // Blocked / Stopped / Created / Exited: next enqueue routes
+                // via select_target_cpu which now sees the new affinity.
+            }
+        }
     }
 
     Ok(0)

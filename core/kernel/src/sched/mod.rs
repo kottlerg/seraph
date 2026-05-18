@@ -1142,6 +1142,130 @@ pub unsafe fn prod_remote_cpu(target_cpu: usize)
 #[allow(unused_variables)]
 pub unsafe fn prod_remote_cpu(_target_cpu: usize) {}
 
+/// Migrate a `Ready` thread from `src_cpu`'s run queue onto `dst_cpu`'s
+/// run queue.
+///
+/// Returns `true` if the migration committed. Returns `false` (no state
+/// change) when, under both scheduler locks, `tcb` is no longer `Ready`
+/// or no longer located on `src_cpu` — another CPU won the race.
+///
+/// Lock discipline: both scheduler locks are acquired in **ascending
+/// CPU-id order** (`docs/scheduling-internals.md` § Lock Hierarchy
+/// rule 4) to prevent ABBA deadlock against the load balancer or any
+/// other multi-lock holder. The destination's `set_reschedule_pending`
+/// is published before the unlocks; the wake IPI is sent after both
+/// locks are released.
+///
+/// Used by:
+/// - `sys_thread_set_affinity` (active migration of an already-queued
+///   thread).
+/// - The periodic cross-CPU load balancer.
+///
+/// # Safety
+/// - `tcb` must be a valid [`ThreadControlBlock`] pointer.
+/// - `src_cpu` and `dst_cpu` must be `< CPU_COUNT`.
+/// - Caller MUST NOT already hold either scheduler lock.
+#[cfg(not(test))]
+pub unsafe fn migrate_ready_thread(
+    tcb: *mut thread::ThreadControlBlock,
+    src_cpu: usize,
+    dst_cpu: usize,
+) -> bool
+{
+    use core::sync::atomic::Ordering;
+
+    if src_cpu == dst_cpu
+    {
+        return false;
+    }
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    if src_cpu >= cpu_count || dst_cpu >= cpu_count
+    {
+        return false;
+    }
+
+    let (lo, hi) = if src_cpu < dst_cpu
+    {
+        (src_cpu, dst_cpu)
+    }
+    else
+    {
+        (dst_cpu, src_cpu)
+    };
+
+    // SAFETY: lo, hi < cpu_count; scheduler slab initialised by init().
+    let lo_sched = unsafe { scheduler_for(lo) };
+    // SAFETY: as above.
+    let hi_sched = unsafe { scheduler_for(hi) };
+
+    // SAFETY: lock_raw/unlock_raw paired below in reverse order.
+    let saved_lo = unsafe { lo_sched.lock.lock_raw() };
+    // SAFETY: lo lock held; acquiring hi second satisfies ascending-CPU order.
+    let saved_hi = unsafe { hi_sched.lock.lock_raw() };
+
+    // Re-check under both locks: this is the only legal observation point
+    // for cross-CPU state. The state could have moved to Running, Blocked,
+    // Stopped, or Exited since the unlocked read in the caller. If a
+    // remove_from_queue lost the race (TCB no longer on src), bail.
+    // SAFETY: tcb valid by caller contract.
+    let (state, located_cpu, priority) =
+        unsafe { ((*tcb).state, (*tcb).preferred_cpu as usize, (*tcb).priority) };
+
+    if state != thread::ThreadState::Ready || located_cpu != src_cpu
+    {
+        // SAFETY: paired with lock_raw above; release hi first (reverse order).
+        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
+        // SAFETY: paired with lock_raw above.
+        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        return false;
+    }
+
+    // SAFETY: src and dst schedulers initialised; tcb is Ready on src; both
+    // locks held so neither queue's structure can change underneath us.
+    let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
+    if !removed
+    {
+        // Lost the race against another remove (dealloc, change_priority).
+        // SAFETY: paired with lock_raw above; release hi first.
+        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
+        // SAFETY: paired with lock_raw above.
+        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        return false;
+    }
+
+    // SAFETY: dst scheduler initialised; tcb is no longer on src's queue.
+    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
+    // SAFETY: tcb valid; both locks held.
+    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
+
+    // Publish reschedule-pending before the unlock so the dst CPU's idle
+    // loop / schedule() sees it via the Release on unlock.
+    set_reschedule_pending_for(dst_cpu);
+
+    // SAFETY: paired with lock_raw above; release hi first (reverse order).
+    unsafe { hi_sched.lock.unlock_raw(saved_hi) };
+    // SAFETY: paired with lock_raw above.
+    unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+
+    // Always-IPI per the wake-protocol invariant.
+    // SAFETY: dst_cpu validated < cpu_count above.
+    unsafe { wake_idle_cpu(dst_cpu) };
+
+    true
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub unsafe fn migrate_ready_thread(
+    _tcb: *mut thread::ThreadControlBlock,
+    _src_cpu: usize,
+    _dst_cpu: usize,
+) -> bool
+{
+    false
+}
+
 /// Enqueue a thread on a target CPU's run queue and wake the CPU if idle.
 ///
 /// This function acquires the target CPU's scheduler lock, enqueues the thread,
@@ -1382,7 +1506,7 @@ pub unsafe fn schedule(requeue_current: bool)
     // methods on `sched` while the lock is logically held.
     // SAFETY: lock_raw must be paired with unlock_raw before function return
     // (or before the context switch that may change the stack).
-    let saved_flags = unsafe { sched.lock.lock_raw() };
+    let mut saved_flags = unsafe { sched.lock.lock_raw() };
 
     let current = sched.current;
 
@@ -1393,7 +1517,7 @@ pub unsafe fn schedule(requeue_current: bool)
     if !current.is_null() && requeue_current
     {
         // SAFETY: current is a valid TCB set by enter() or a previous schedule();
-        // state, priority fields are always valid.
+        // state, priority, cpu_affinity fields are always valid.
         unsafe {
             debug_assert!(
                 (*current).magic == thread::TCB_MAGIC,
@@ -1408,13 +1532,48 @@ pub unsafe fn schedule(requeue_current: bool)
             let cur_state = (*current).state;
             if cur_state != ThreadState::Exited && cur_state != ThreadState::Stopped
             {
-                (*current).state = ThreadState::Ready;
                 let prio = (*current).priority;
                 debug_assert!(
                     (prio as usize) < NUM_PRIORITY_LEVELS,
                     "schedule: current priority {prio} out of range on cpu {cpu}"
                 );
-                sched.enqueue(current, prio);
+
+                // Affinity recheck: if a concurrent sys_thread_set_affinity
+                // (or any other affinity write) now forbids this CPU, route
+                // the requeue to the target CPU instead of the local one.
+                // The cross-CPU enqueue MUST happen outside this CPU's
+                // scheduler lock to respect ascending-CPU lock order
+                // (rule 4): otherwise a target CPU with a lower id would
+                // be locked second under our outer lock.
+                let aff = (*current).cpu_affinity;
+                let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+                let cross_cpu =
+                    aff != AFFINITY_ANY && (aff as usize) != cpu && (aff as usize) < cpu_count;
+
+                if cross_cpu
+                {
+                    // Clear context_saved BEFORE handing off so the
+                    // destination CPU spins until this CPU's switch()
+                    // commits the saved register state. Without this clear
+                    // the destination would observe context_saved == 1 from
+                    // the thread's previous switch and dispatch with stale
+                    // registers.
+                    (*current)
+                        .context_saved
+                        .store(0, core::sync::atomic::Ordering::Relaxed);
+                    (*current).state = ThreadState::Ready;
+
+                    // Release this CPU's sched lock so enqueue_and_wake can
+                    // acquire the target's lock without violating rule 4.
+                    sched.lock.unlock_raw(saved_flags);
+                    enqueue_and_wake(current, aff as usize, prio);
+                    saved_flags = sched.lock.lock_raw();
+                }
+                else
+                {
+                    (*current).state = ThreadState::Ready;
+                    sched.enqueue(current, prio);
+                }
             }
         }
     }

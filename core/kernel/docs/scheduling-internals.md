@@ -55,7 +55,7 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 
 3. **`SLEEP_LIST_LOCK` is leaf-only.** It MAY be acquired from inside any source IPC lock. It MUST NOT contain calls that re-enter IPC or scheduler code while held.
 
-4. **Cross-CPU scheduler-lock acquisition rule.** When a code path needs two CPU's `scheduler.lock`s simultaneously (load balancer, future cross-CPU migration), the lower-numbered CPU's lock MUST be acquired first. As of this document there is one such site (none in production code; the load-balancer claimed in `scheduler.md` does not yet exist).
+4. **Cross-CPU scheduler-lock acquisition rule.** When a code path needs two CPU's `scheduler.lock`s simultaneously, the lower-numbered CPU's lock MUST be acquired first. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer) and `dealloc_object(Thread)` (all-CPU walk in ascending order).
 
 5. **`enqueue_and_wake` MUST be invoked with no IPC source lock held.** A primitive that wakes a TCB (e.g. `signal_send`, `event_queue_post`, `waitset_notify`, `endpoint_call`'s server-wake branch, `endpoint_reply`) snapshots the wake parameters under its source lock, releases the source lock, then calls `enqueue_and_wake`. `enqueue_and_wake` acquires the *target CPU*'s scheduler.lock and dispatches an IPI; holding any source lock across that call would introduce a `source.lock → scheduler.lock` ordering that does not exist in the hierarchy. The same rule governs `dec_ref → dealloc_object` from a wait-set path: `wait_set_drop` releases its source/ws locks before reporting any zero-refcount source back to `dealloc_object_one`'s cascade worklist.
 
@@ -83,7 +83,8 @@ The transition table below pins every ThreadState write to a syscall/event, the 
 | `Created` | `Ready` | `sys_thread_start` (first start) | calling CPU | `set_state_under_all_locks(Ready)` then `enqueue_and_wake(target_cpu)` |
 | `Stopped` | `Ready` | `sys_thread_start` (resume from stop) | calling CPU | `set_state_under_all_locks(Ready)` then `enqueue_and_wake(target_cpu)` |
 | `Ready` | `Running` | `schedule()` selecting next | running CPU | running CPU's scheduler.lock |
-| `Running` | `Ready` | `schedule(requeue_current=true)` (yield, preempt) | running CPU | running CPU's scheduler.lock |
+| `Running` | `Ready` | `schedule(requeue_current=true)` (yield, preempt) | running CPU | running CPU's scheduler.lock; if `cpu_affinity` excludes the running CPU the requeue is routed cross-CPU via `enqueue_and_wake(target_cpu)` after dropping the local lock |
+| `Ready` (on CPU A) | `Ready` (on CPU B) | `sys_thread_set_affinity` (active migration) or periodic load balancer | calling CPU | `migrate_ready_thread(tcb, A, B)`; both scheduler.locks held in ascending-CPU order |
 | `Running` | `Blocked` | IPC blocking entry (`endpoint_call/recv`, `signal_wait`, `event_queue_recv`, `waitset_wait`) | running CPU | `commit_blocked_under_local_lock(tcb, ipc, blocked_on)`; on `false` the IPC primitive rolls back its waiter registration |
 | `Blocked` | `Ready` | IPC wake (`signal_send`, `event_queue_post`, `endpoint_reply`, `endpoint_call` server-wake, `waitset_notify`) | wake-issuing CPU | source IPC lock to snapshot wakeup payload, *released*, then `enqueue_and_wake(target_cpu)` |
 | `Blocked` | `Ready` | timeout from sleep list | timer-firing CPU | `SLEEP_LIST_LOCK` to drain expired entries (released first), then source IPC lock to arbitrate `(*src).waiter == tcb` and write the wake payload, then `enqueue_and_wake(target_cpu)` |

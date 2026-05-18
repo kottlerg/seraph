@@ -122,7 +122,13 @@ impl ServiceEntry
             active: false,
             bootstrap_token: 0,
             process_handle: 0,
-            ns_policy_kind: ipc::svcmgr_labels::NS_POLICY_UNIVERSAL,
+            // Fail-safe default: an empty slot has no installed
+            // policy yet, so `None` (no namespace cap delivered) is
+            // the correct shape if any code path were to inspect it
+            // before `handle_register` overwrites every field.
+            // Universal would silently grant the most permissive cap
+            // on a programmer error.
+            ns_policy_kind: ipc::svcmgr_labels::NS_POLICY_NONE,
             ns_subtree_path_len: 0,
             ns_subtree_path: [0; ipc::MAX_PATH_LEN],
             ns_subtree_rights: 0,

@@ -396,6 +396,14 @@ pub fn run_all(ctx: &TestContext)
         "thread::affinity_migrate_running",
         thread::affinity_migrate_running(ctx)
     );
+    run_test!(
+        "thread::load_balancer_redistributes_skewed",
+        thread::load_balancer_redistributes_skewed(ctx)
+    );
+    run_test!(
+        "thread::load_balancer_skips_pinned",
+        thread::load_balancer_skips_pinned(ctx)
+    );
 
     // ── Extended-state (FPU / SIMD / V) isolation ────────────────────────────
     run_test!("fpu::preempt_isolation", fpu::preempt_isolation(ctx));

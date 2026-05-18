@@ -289,31 +289,50 @@ The assignment is recorded in `tcb.preferred_cpu` and used for subsequent wakeup
 
 ### Load Balancing
 
-Load balancing runs periodically (at a configurable interval) and when a CPU becomes
-idle:
+A pull-based balancer runs on every CPU's `timer_tick` (see
+`sched::try_pull_balance`). It consumes the per-CPU `CPU_LOAD` counters
+maintained by `enqueue` / `dequeue_highest` / `remove_from_queue` and
+migrates at most one `Ready` thread per tick per CPU.
+
+Victim selection is mode-dependent:
+
+- **Loaded CPU (`my_load > 0`)** — pick a pseudo-random victim
+  (splitmix-style hash of the global `LOAD_BALANCE_TICK` counter and the
+  local CPU id). Skip if the victim is not significantly busier than us
+  (`their_load <= my_load + IMBALANCE_THRESHOLD`).
+- **Idle CPU (`my_load == 0`)** — scan all other CPUs and pull from the
+  heaviest. Scanning is cheap (one Relaxed atomic load per CPU) and
+  guarantees an idle CPU finds work on the first tick that sees an
+  imbalance. Pure random victim selection converges only
+  probabilistically and on small topologies sometimes wastes many ticks
+  before picking the busy CPU.
+
+Migration uses the shared `sched::migrate_ready_thread`-style helper
+`pull_unpinned_ready(src_cpu, dst_cpu)`:
 
 ```
-balance(cpu):
-    Find the most-loaded CPU: max_cpu
-    if max_cpu == cpu or load difference is below a configurable threshold:
-        return  // not worth migrating
-    // Acquire scheduler locks in CPU ID order to prevent deadlock.
-    Acquire both max_cpu.scheduler.lock and cpu.scheduler.lock
-    // Always acquire the lower CPU ID's lock first.
-    // Steal half the excess threads from max_cpu
-    // Prefer migrating lower-priority threads to preserve latency for high-priority
-    for thread in threads_to_migrate:
-        max_cpu.dequeue(thread)
-        thread.preferred_cpu = cpu
-        cpu.enqueue(thread)
-    Release both locks
+pull_unpinned_ready(src, dst):
+    lock(min(src, dst).scheduler.lock)        // ascending-CPU order
+    lock(max(src, dst).scheduler.lock)
+    tcb = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY)
+    if tcb is None: unlock both; return
+    src.remove_from_queue(tcb, tcb.priority)  // decrements CPU_LOAD[src]
+    dst.enqueue(tcb, tcb.priority)            // increments CPU_LOAD[dst]
+    tcb.preferred_cpu = dst
+    set_reschedule_pending_for(dst)
+    unlock both
+    wake_idle_cpu(dst)                        // always-IPI
 ```
 
-Threads with hard CPU affinity (`cpu_affinity != AFFINITY_ANY`) are never migrated.
+Lock order follows scheduling-internals.md § Lock Hierarchy rule 4
+(ascending CPU id). Pinned threads (`cpu_affinity != AFFINITY_ANY`) are
+invisible to the `find_runnable` predicate and are never migrated.
 
-Migration requires no IPI — the migrated thread is simply enqueued on the new CPU's
-run queue. The target CPU will pick it up on its next scheduler invocation (or
-immediately if an IPI is sent to wake an idle CPU).
+Hot-path cost per CPU per tick:
+- Idle CPU: one Relaxed load per remote CPU to find the heaviest victim.
+- Loaded CPU: one Relaxed increment + one Relaxed load for the victim.
+- Scheduler locks are taken only when an imbalance above
+  `IMBALANCE_THRESHOLD` is observed.
 
 ---
 

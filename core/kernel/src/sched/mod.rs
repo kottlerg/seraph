@@ -1266,6 +1266,202 @@ pub unsafe fn migrate_ready_thread(
     false
 }
 
+// ── Periodic cross-CPU load balancer ─────────────────────────────────────────
+
+/// Tick counter feeding the pseudo-random victim selection. Relaxed
+/// ordering: a stale value just biases victim selection slightly.
+static LOAD_BALANCE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Difference in `CPU_LOAD` above which the balancer will attempt a pull.
+/// Set high enough that two-CPU steady states (e.g. 1 thread + 2 threads)
+/// do not thrash; low enough that severe imbalances converge in a few
+/// ticks.
+const LOAD_BALANCE_IMBALANCE_THRESHOLD: u32 = 2;
+
+/// Per-tick load-balance step. Runs on every CPU's `timer_tick`.
+///
+/// Hot path cost: 1 Relaxed atomic load (own `CPU_LOAD`) plus either
+/// (idle CPU) one Relaxed load per remote CPU to find the heaviest, or
+/// (loaded CPU) 1 Relaxed atomic increment (tick counter) + 1 Relaxed
+/// load (random victim). Scheduler locks are acquired only when the
+/// observed imbalance exceeds `LOAD_BALANCE_IMBALANCE_THRESHOLD`.
+///
+/// Pull-based, victim-selection mode depends on local load:
+/// - **Loaded CPUs (`my_load > 0`)** sample a pseudo-random victim. This
+///   keeps the hot path cheap and avoids thundering-herd when many CPUs
+///   balance simultaneously.
+/// - **Idle CPUs (`my_load == 0`)** scan all other CPUs and pull from
+///   the heaviest. Scanning `cpu_count` Relaxed loads is cheap and
+///   guarantees an idle CPU finds work on the first tick that sees an
+///   imbalance — random sampling alone converges probabilistically and
+///   on small (`cpu_count ≤ 4`) topologies sometimes wastes many ticks
+///   before picking the busy CPU.
+///
+/// Pinned threads (`cpu_affinity != AFFINITY_ANY`) are invisible to the
+/// pull and remain on the pinned CPU.
+///
+/// # Safety
+/// Must be called with no scheduler lock held. Called from `timer_tick`
+/// after the local scheduler lock has been released.
+#[cfg(not(test))]
+unsafe fn try_pull_balance(this_cpu: usize)
+{
+    use core::sync::atomic::Ordering;
+
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    if cpu_count < 2 || this_cpu >= cpu_count
+    {
+        return;
+    }
+
+    // SAFETY: this_cpu bounded; scheduler slab initialised.
+    let my_load = unsafe { (*scheduler_ptr(this_cpu)).current_load() };
+
+    let victim = if my_load == 0
+    {
+        // Idle scan: pick the heaviest non-self CPU.
+        let mut max_load = 0u32;
+        let mut max_cpu = usize::MAX;
+        // needless_range_loop: scheduler_ptr requires raw indexing.
+        #[allow(clippy::needless_range_loop)]
+        for cpu in 0..cpu_count
+        {
+            if cpu == this_cpu
+            {
+                continue;
+            }
+            // SAFETY: cpu < cpu_count; slab initialised.
+            let load = unsafe { (*scheduler_ptr(cpu)).current_load() };
+            if load > max_load
+            {
+                max_load = load;
+                max_cpu = cpu;
+            }
+        }
+        if max_cpu == usize::MAX || max_load <= LOAD_BALANCE_IMBALANCE_THRESHOLD
+        {
+            return;
+        }
+        max_cpu
+    }
+    else
+    {
+        // Loaded path: pseudo-random victim, splitmix-style mix.
+        let tick = LOAD_BALANCE_TICK.fetch_add(1, Ordering::Relaxed);
+        let mix = tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (this_cpu as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let mut v = (mix as usize) % cpu_count;
+        if v == this_cpu
+        {
+            v = (v + 1) % cpu_count;
+        }
+        // SAFETY: v < cpu_count; slab initialised.
+        let their_load = unsafe { (*scheduler_ptr(v)).current_load() };
+        if their_load <= my_load.saturating_add(LOAD_BALANCE_IMBALANCE_THRESHOLD)
+        {
+            return;
+        }
+        v
+    };
+
+    // SAFETY: victim, this_cpu are valid and distinct.
+    unsafe { pull_unpinned_ready(victim, this_cpu) };
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+unsafe fn try_pull_balance(_this_cpu: usize) {}
+
+/// Locate the first unpinned Ready thread on `src_cpu`'s run queues and
+/// migrate it to `dst_cpu` under both scheduler locks (ascending order).
+///
+/// Pinned threads are invisible to this pull. Caller MUST NOT hold either
+/// scheduler lock.
+///
+/// # Safety
+/// Both CPU indices must be valid (`< CPU_COUNT`) and distinct.
+#[cfg(not(test))]
+unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
+{
+    use core::sync::atomic::Ordering;
+
+    if src_cpu == dst_cpu
+    {
+        return;
+    }
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    if src_cpu >= cpu_count || dst_cpu >= cpu_count
+    {
+        return;
+    }
+
+    let (lo, hi) = if src_cpu < dst_cpu
+    {
+        (src_cpu, dst_cpu)
+    }
+    else
+    {
+        (dst_cpu, src_cpu)
+    };
+
+    // SAFETY: lo, hi < cpu_count.
+    let lo_sched = unsafe { scheduler_for(lo) };
+    // SAFETY: as above.
+    let hi_sched = unsafe { scheduler_for(hi) };
+
+    // SAFETY: paired with unlock_raw below in reverse order.
+    let saved_lo = unsafe { lo_sched.lock.lock_raw() };
+    // SAFETY: ascending-CPU order satisfies lock-hierarchy rule 4.
+    let saved_hi = unsafe { hi_sched.lock.lock_raw() };
+
+    // SAFETY: src_cpu valid; lock held. Predicate is read-only.
+    let pick = unsafe {
+        (*scheduler_ptr(src_cpu)).find_runnable(|tcb| (*tcb).cpu_affinity == AFFINITY_ANY)
+    };
+
+    let Some((tcb, priority)) = pick
+    else
+    {
+        // SAFETY: paired with lock_raw above; release hi first.
+        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
+        // SAFETY: paired with lock_raw above.
+        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        return;
+    };
+
+    // SAFETY: tcb is currently linked in src_cpu's run queue at `priority`.
+    let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
+    if !removed
+    {
+        // SAFETY: paired with lock_raw above; release hi first.
+        unsafe { hi_sched.lock.unlock_raw(saved_hi) };
+        // SAFETY: paired with lock_raw above.
+        unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+        return;
+    }
+
+    // SAFETY: tcb is no longer on src; dst_cpu scheduler is valid.
+    unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
+    // SAFETY: tcb valid; both locks held.
+    unsafe { (*tcb).preferred_cpu = dst_cpu as u32 };
+
+    set_reschedule_pending_for(dst_cpu);
+
+    // SAFETY: paired with lock_raw above; release hi first.
+    unsafe { hi_sched.lock.unlock_raw(saved_hi) };
+    // SAFETY: paired with lock_raw above.
+    unsafe { lo_sched.lock.unlock_raw(saved_lo) };
+
+    // SAFETY: dst_cpu validated < cpu_count.
+    unsafe { wake_idle_cpu(dst_cpu) };
+}
+
+/// Test stub.
+#[cfg(test)]
+#[allow(unused_variables)]
+unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
+
 /// Enqueue a thread on a target CPU's run queue and wake the CPU if idle.
 ///
 /// This function acquires the target CPU's scheduler lock, enqueues the thread,
@@ -2019,8 +2215,12 @@ pub unsafe fn timer_tick()
     if remaining == 0
     {
         // Idle threads have slice_remaining = 0 and should not be preempted.
-        // SAFETY: Paired with lock_raw above
+        // Still run the load balancer so idle CPUs can pull work from busy
+        // ones (the whole point of pull-based balancing).
+        // SAFETY: Paired with lock_raw above.
         unsafe { sched.lock.unlock_raw(saved) };
+        // SAFETY: cpu validated against cpu_count above; no lock held.
+        unsafe { try_pull_balance(cpu) };
         return;
     }
 
@@ -2037,6 +2237,11 @@ pub unsafe fn timer_tick()
         // SAFETY: Unlock before calling schedule(), which will re-acquire
         unsafe { sched.lock.unlock_raw(saved) };
 
+        // Run the cross-CPU load balancer with no scheduler lock held.
+        // Cheap on the steady-state hot path (a few Relaxed atomic loads).
+        // SAFETY: cpu validated against cpu_count above; no lock held.
+        unsafe { try_pull_balance(cpu) };
+
         // If preemption is disabled (e.g., during TLB shootdown spin-wait
         // with interrupts temporarily enabled), skip the context switch.
         // The thread will be rescheduled normally on its next timer expiry.
@@ -2052,6 +2257,13 @@ pub unsafe fn timer_tick()
         // Still has time remaining - just unlock and return
         // SAFETY: Paired with lock_raw above
         unsafe { sched.lock.unlock_raw(saved) };
+
+        // Run the load balancer on every tick (cheap on the steady-state
+        // hot path). Pulling work into an underloaded CPU does not require
+        // the local thread to yield, so we run this even when the slice
+        // has not expired.
+        // SAFETY: cpu validated; no scheduler lock held.
+        unsafe { try_pull_balance(cpu) };
     }
 }
 

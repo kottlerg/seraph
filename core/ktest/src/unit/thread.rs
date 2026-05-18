@@ -59,6 +59,16 @@ static mut STACK_AFFINITY_RESPECTED: ChildStack = ChildStack::ZERO;
 static mut STACK_DEFAULT_AFFINITY: ChildStack = ChildStack::ZERO;
 static mut STACK_AFFINITY_MIGRATE_READY: ChildStack = ChildStack::ZERO;
 static mut STACK_AFFINITY_MIGRATE_RUNNING: ChildStack = ChildStack::ZERO;
+static mut STACK_BALANCE_SPINNERS: [ChildStack; BALANCE_MAX_SPINNERS] = [
+    ChildStack::ZERO,
+    ChildStack::ZERO,
+    ChildStack::ZERO,
+    ChildStack::ZERO,
+    ChildStack::ZERO,
+    ChildStack::ZERO,
+    ChildStack::ZERO,
+    ChildStack::ZERO,
+];
 
 /// Latest CPU index observed by the spinner used in
 /// `affinity_migrate_running`. The spinner stores its current CPU id on
@@ -68,6 +78,23 @@ static MIGRATE_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Signals the migration spinner to exit cleanly once the parent has
 /// observed the migration.
 static MIGRATE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
+
+/// Per-spinner observed CPU index. Indexed by spinner id (0..N). Used by
+/// the load-balancer tests. `u32::MAX` indicates "spinner has not run yet".
+const BALANCE_MAX_SPINNERS: usize = 8;
+static BALANCE_OBSERVED_CPU: [AtomicU32; BALANCE_MAX_SPINNERS] = [
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+];
+
+/// Set when the parent wants the balancer spinners to exit.
+static BALANCE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
 
 /// Signal cap slot passed to `phase2_entry` via a static rather than a
 /// register argument.
@@ -730,6 +757,191 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+// ── Periodic cross-CPU load balancer (Issue #23) ──────────────────────────────
+
+/// Helper: spawn `n` CPU-bound spinners, initially pinned to `initial_cpu`,
+/// then change each one's affinity to `final_affinity`. Returns the
+/// (thread, cspace, signal) cap triples for cleanup.
+///
+/// Each spinner publishes its current CPU into `BALANCE_OBSERVED_CPU[i]`
+/// on every loop iteration and exits when `BALANCE_SHOULD_EXIT` is set.
+#[allow(clippy::cast_possible_truncation)]
+fn balance_spawn_spinners(
+    ctx: &TestContext,
+    n: usize,
+    initial_cpu: u32,
+    final_affinity: u32,
+) -> Result<[(u32, u32, u32); BALANCE_MAX_SPINNERS], &'static str>
+{
+    let mut triples = [(0u32, 0u32, 0u32); BALANCE_MAX_SPINNERS];
+
+    for i in 0..n
+    {
+        BALANCE_OBSERVED_CPU[i].store(u32::MAX, Ordering::Relaxed);
+        let sig = cap_create_signal(ctx.memory_frame_base)
+            .map_err(|_| "balance: cap_create_signal failed")?;
+        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+            .map_err(|_| "balance: cap_create_cspace failed")?;
+        let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL).map_err(|_| "balance: cap_copy failed")?;
+        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+            .map_err(|_| "balance: cap_create_thread failed")?;
+
+        // Initial pinning forces enqueue onto `initial_cpu`.
+        thread_set_affinity(th, initial_cpu)
+            .map_err(|_| "balance: initial thread_set_affinity failed")?;
+
+        // SAFETY: per-spinner stack slot, no aliasing.
+        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
+        let arg = (i as u64) << 32 | u64::from(child_sig);
+        thread_configure(
+            th,
+            balance_spinner_entry as *const () as u64,
+            stack_top,
+            arg,
+        )
+        .map_err(|_| "balance: thread_configure failed")?;
+        thread_start(th).map_err(|_| "balance: thread_start failed")?;
+
+        triples[i] = (th, cs, sig);
+    }
+
+    // Once started, relax (or fully clear) the affinity. Active migration
+    // does NOT trigger here because `AFFINITY_ANY` is the no-migration path
+    // — the goal is exactly to leave the threads queued on `initial_cpu`
+    // for the periodic balancer to redistribute.
+    for (th, _, _) in triples.iter().take(n)
+    {
+        thread_set_affinity(*th, final_affinity)
+            .map_err(|_| "balance: relax thread_set_affinity failed")?;
+    }
+    Ok(triples)
+}
+
+/// Helper: tear down the spinners spawned by `balance_spawn_spinners`.
+/// Signals exit, drains each thread's `signal_send`, and deletes the caps.
+fn balance_teardown(triples: &[(u32, u32, u32); BALANCE_MAX_SPINNERS], n: usize) -> TestResult
+{
+    BALANCE_SHOULD_EXIT.store(1, Ordering::Relaxed);
+    for &(_, _, sig) in triples.iter().take(n)
+    {
+        // Each spinner sends 0xC0FE before exiting.
+        signal_wait(sig).map_err(|_| "balance: signal_wait teardown failed")?;
+    }
+    BALANCE_SHOULD_EXIT.store(0, Ordering::Relaxed);
+    for &(th, cs, sig) in triples.iter().take(n)
+    {
+        cap_delete(th).map_err(|_| "balance: cap_delete th failed")?;
+        cap_delete(sig).map_err(|_| "balance: cap_delete sig failed")?;
+        cap_delete(cs).map_err(|_| "balance: cap_delete cs failed")?;
+    }
+    Ok(())
+}
+
+/// A skewed workload (every thread initially queued on CPU 0) gets
+/// redistributed across all CPUs by the periodic load balancer.
+///
+/// Spawns N = `cpu_count` spinners with hard affinity to CPU 0 (forcing
+/// them onto CPU 0's run queue), then relaxes affinity to `AFFINITY_ANY`.
+/// After a few ticks the balancer pulls work into the under-loaded CPUs,
+/// so at least two distinct CPUs should be observed across the
+/// `BALANCE_OBSERVED_CPU` array.
+///
+/// Requires SMP; skips otherwise.
+pub fn load_balancer_redistributes_skewed(ctx: &TestContext) -> TestResult
+{
+    let cpus =
+        system_info(SystemInfoType::CpuCount as u64).map_err(|_| "system_info(CpuCount) failed")?;
+    if cpus < 2
+    {
+        crate::log("ktest: thread::load_balancer_redistributes_skewed SKIP (requires SMP)");
+        return Ok(());
+    }
+    let n = core::cmp::min(
+        usize::try_from(cpus).unwrap_or(BALANCE_MAX_SPINNERS),
+        BALANCE_MAX_SPINNERS,
+    );
+    // `u32::MAX` is the AFFINITY_ANY sentinel (see SYS_THREAD_SET_AFFINITY).
+    let triples = balance_spawn_spinners(ctx, n, 0, u32::MAX)?;
+
+    // Sleep in short increments so the parent is BLOCKED — that
+    // takes parent's CPU out of the spinner queue entirely and lets idle
+    // CPUs (which carry the pull-balancer in their timer_tick) do their
+    // job. Without this, parent's tight yield loop hogs CPU 0 long
+    // enough that on slow QEMU instances the balancer never gets a turn.
+    //
+    // 250 × 4 ms = 1 s total budget. Pull-balance is probabilistic
+    // (random victim selection); a one-second budget makes the chance
+    // of NOT seeing any migration vanishingly small while keeping the
+    // test fast in the common case (PASS fires on the first observed
+    // migration, which is usually < 50 ms).
+    let mut converged = false;
+    for _ in 0..250
+    {
+        let seen_other_cpu = BALANCE_OBSERVED_CPU.iter().take(n).any(|slot| {
+            let obs = slot.load(Ordering::Relaxed);
+            obs != u32::MAX && obs != 0
+        });
+        if seen_other_cpu
+        {
+            converged = true;
+            break;
+        }
+        // 4 ms blocking sleep: parent is OFF every run queue (Blocked),
+        // so spinners and idle CPUs both make progress unimpeded.
+        syscall::thread_sleep(4).ok();
+    }
+
+    balance_teardown(&triples, n)?;
+    if !converged
+    {
+        return Err("load balancer did not redistribute work off CPU 0");
+    }
+    Ok(())
+}
+
+/// Pinned threads (hard affinity) are NEVER migrated by the load balancer.
+///
+/// Spawns N pinned threads on CPU 0 and runs the test for a few ticks. The
+/// balancer's `find_runnable` predicate filters out `cpu_affinity != AFFINITY_ANY`,
+/// so every spinner MUST report CPU 0 throughout the test.
+///
+/// Requires SMP; skips otherwise.
+pub fn load_balancer_skips_pinned(ctx: &TestContext) -> TestResult
+{
+    let cpus =
+        system_info(SystemInfoType::CpuCount as u64).map_err(|_| "system_info(CpuCount) failed")?;
+    if cpus < 2
+    {
+        crate::log("ktest: thread::load_balancer_skips_pinned SKIP (requires SMP)");
+        return Ok(());
+    }
+    let n = 4usize.min(BALANCE_MAX_SPINNERS);
+
+    // Pin to CPU 0 AND keep the pin (final affinity == 0).
+    let triples = balance_spawn_spinners(ctx, n, 0, 0)?;
+
+    // Give the balancer plenty of wallclock time to misbehave. Sleeping
+    // blocks the parent, so the spinners and the idle CPUs both run
+    // freely while we wait.
+    for _ in 0..50
+    {
+        syscall::thread_sleep(2).ok();
+    }
+
+    // Every observation must be CPU 0.
+    let violated = BALANCE_OBSERVED_CPU.iter().take(n).any(|slot| {
+        let obs = slot.load(Ordering::Relaxed);
+        obs != u32::MAX && obs != 0
+    });
+
+    balance_teardown(&triples, n)?;
+    if violated
+    {
+        return Err("load balancer migrated a hard-pinned thread off its CPU");
+    }
+    Ok(())
+}
+
 // ── Phase D scheduler correctness tests ───────────────────────────────────────
 
 /// Thread with explicit CPU affinity starts and executes successfully.
@@ -904,6 +1116,37 @@ fn report_cpu_entry(sig_slot: u64) -> !
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
     signal_send(sig_slot as u32, cpu).ok();
     thread_exit()
+}
+
+/// Spinner used by the load-balancer tests.
+///
+/// `arg` packs `(spinner_index << 32) | exit_signal_cap`. On every iteration
+/// the spinner publishes the current CPU id into the per-index slot of
+/// [`BALANCE_OBSERVED_CPU`]. When [`BALANCE_SHOULD_EXIT`] is set, the
+/// spinner sends `0xC0FE` on its signal cap and exits.
+// cast_possible_truncation: spinner indices and cap slot indices fit in u32.
+#[allow(clippy::cast_possible_truncation)]
+fn balance_spinner_entry(arg: u64) -> !
+{
+    let idx = (arg >> 32) as usize;
+    let sig_slot = (arg & 0xFFFF_FFFF) as u32;
+    loop
+    {
+        let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX) as u32;
+        if idx < BALANCE_MAX_SPINNERS
+        {
+            BALANCE_OBSERVED_CPU[idx].store(cpu, Ordering::Relaxed);
+        }
+        if BALANCE_SHOULD_EXIT.load(Ordering::Relaxed) != 0
+        {
+            signal_send(sig_slot, 0xC0FE).ok();
+            thread_exit();
+        }
+        for _ in 0..64
+        {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Tight `CurrentCpu` observation loop used by [`affinity_migrate_running`].

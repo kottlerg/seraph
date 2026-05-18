@@ -13,6 +13,7 @@
 pub mod address_space;
 pub mod buddy;
 pub mod init;
+pub mod kernel_pt_pool;
 pub mod paging;
 #[cfg(not(test))]
 pub mod tlb_shootdown;

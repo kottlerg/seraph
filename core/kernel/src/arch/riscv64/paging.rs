@@ -376,15 +376,12 @@ pub unsafe fn read_root_phys() -> u64
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB Sv48
 /// root frame. `virt` must be in the lower (user) half. `phys` must be 4 KiB-aligned.
-// similar_names: frame_va and frame_pa are a VA/PA pair — the similarity is intentional.
 #[cfg(not(test))]
-#[allow(clippy::similar_names)]
 pub unsafe fn map_user_page(
     root_virt: u64,
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
-    allocator: &mut crate::mm::BuddyAllocator,
 ) -> Result<(), ()>
 {
     use crate::mm::paging::phys_to_virt;
@@ -394,15 +391,15 @@ pub unsafe fn map_user_page(
     // SAFETY: root_virt is direct-map VA of valid user Sv48 root PT; caller contract.
     let root = unsafe { table_at(root_virt) };
 
-    let l2_pa = rv_walk_or_alloc(&mut root[vpn3_index(virt)], allocator)?;
+    let l2_pa = rv_walk_or_alloc(&mut root[vpn3_index(virt)])?;
     // SAFETY: l2_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
     let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
 
-    let l1_pa = rv_walk_or_alloc(&mut l2[vpn2_index(virt)], allocator)?;
+    let l1_pa = rv_walk_or_alloc(&mut l2[vpn2_index(virt)])?;
     // SAFETY: l1_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
     let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
 
-    let l0_pa = rv_walk_or_alloc(&mut l1[vpn1_index(virt)], allocator)?;
+    let l0_pa = rv_walk_or_alloc(&mut l1[vpn1_index(virt)])?;
     // SAFETY: l0_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
     let l0 = unsafe { table_at(phys_to_virt(l0_pa)) };
     let mut pte = PageTableEntry::new_page(phys, flags);
@@ -412,31 +409,18 @@ pub unsafe fn map_user_page(
     Ok(())
 }
 
-/// Walk an existing Sv48 page table entry or allocate a new child frame.
-// similar_names: frame_va and frame_pa are a VA/PA pair — the similarity is intentional.
+/// Walk an existing Sv48 page table entry or allocate a new child frame
+/// from the kernel PT pool (`crate::mm::kernel_pt_pool`).
 #[cfg(not(test))]
-#[allow(clippy::similar_names)]
-fn rv_walk_or_alloc(
-    entry: &mut PageTableEntry,
-    allocator: &mut crate::mm::BuddyAllocator,
-) -> Result<u64, ()>
+fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 {
-    use crate::mm::PAGE_SIZE;
-    use crate::mm::paging::phys_to_virt;
-
     if entry.is_present()
     {
         return Ok(entry.phys_addr());
     }
 
-    let frame_pa = allocator.alloc(0).ok_or(())?;
-    let frame_va = phys_to_virt(frame_pa);
-
-    // SAFETY: frame_va is direct-map VA of freshly allocated buddy frame; exclusively
-    // owned; write_bytes zeroes exactly PAGE_SIZE (4 KiB).
-    unsafe {
-        core::ptr::write_bytes(frame_va as *mut u8, 0, PAGE_SIZE);
-    }
+    // Pool returns zero-filled pages; no further write_bytes needed.
+    let frame_pa = crate::mm::kernel_pt_pool::alloc_pt_page().ok_or(())?;
 
     *entry = PageTableEntry::new_table(frame_pa);
     Ok(frame_pa)
@@ -521,7 +505,7 @@ fn rv_walk_or_alloc_pooled(
 /// `active_cpu_mask() == 0` before invocation).
 #[cfg(not(test))]
 #[allow(dead_code)]
-pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::BuddyAllocator)
+pub unsafe fn free_user_page_tables(root_virt: u64)
 {
     use crate::mm::paging::phys_to_virt;
 
@@ -572,17 +556,14 @@ pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::B
                     continue;
                 }
                 let l0_pa = l1_e.phys_addr();
-                // SAFETY: l0_pa allocated by `rv_walk_or_alloc` from the
-                // buddy as order-0; no CPU references it (caller's contract).
-                unsafe { allocator.free(l0_pa, 0) };
+                // L0 frame originated from `kernel_pt_pool::alloc_pt_page`.
+                crate::mm::kernel_pt_pool::free_pt_page(l0_pa);
             }
-            // SAFETY: l1_pa allocated by `rv_walk_or_alloc` from the buddy
-            // as order-0; all descendant L0 frames just freed above.
-            unsafe { allocator.free(l1_pa, 0) };
+            // L1 frame likewise originated from the pool.
+            crate::mm::kernel_pt_pool::free_pt_page(l1_pa);
         }
-        // SAFETY: l2_pa allocated by `rv_walk_or_alloc` from the buddy as
-        // order-0; all descendant L1 frames just freed above.
-        unsafe { allocator.free(l2_pa, 0) };
+        // L2 frame likewise originated from the pool.
+        crate::mm::kernel_pt_pool::free_pt_page(l2_pa);
     }
 }
 

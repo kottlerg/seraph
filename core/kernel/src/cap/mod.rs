@@ -397,9 +397,17 @@ static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_D
 /// kernel-internal cap-identity storage. Returns the per-block
 /// (base, size) records ready for `populate_cspace` to mint Frame caps.
 ///
+/// After the drain completes, seeds [`crate::mm::kernel_pt_pool`] with
+/// most of the kernel reserve so the steady-state PT-growth path is
+/// cap-backed (sourced from a pool minted out of [`KERNEL_RESERVE_PAGES`])
+/// rather than drawing directly from the buddy. A small residue stays in
+/// the buddy for the `dealloc_object` → `free_range` reverse path's
+/// ledger arithmetic.
+///
 /// MUST run before any [`mint_phase7_body`] / [`boot_retype_aspace`] /
 /// [`boot_retype_cspace`] / `boot_retype_thread_slab` call against the
-/// seed.
+/// seed, and before any `map_user_page` consumer (the kernel PT pool
+/// must be live before Phase 9's init bootstrap maps run).
 ///
 /// # Safety
 /// Single-threaded Phase 7. Buddy active.
@@ -408,9 +416,15 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
 {
     use crate::mm::buddy::PAGE_SIZE as BUDDY_PAGE_SIZE;
 
-    /// Pages kept in the buddy for kernel-internal use (page tables, AP
-    /// kernel stacks, kernel heap residue). 16 MiB = 4096 pages.
-    const KERNEL_RESERVE_PAGES: usize = 4096;
+    /// Pages kept in the buddy for kernel-internal use after Phase 7.
+    /// PT growth now consumes from `mm::kernel_pt_pool` (seeded below
+    /// from `POOL_SEED_PAGES` of this reserve); the buddy keeps
+    /// `BUDDY_RESIDUE_PAGES` only for the `dealloc_object` →
+    /// `free_range` reverse-ledger path. 1024 + 64 = 1088 pages ≈
+    /// 4.25 MiB, down from PR #90's 4096 (16 MiB).
+    const POOL_SEED_PAGES: usize = 1024;
+    const BUDDY_RESIDUE_PAGES: usize = 64;
+    const KERNEL_RESERVE_PAGES: usize = POOL_SEED_PAGES + BUDDY_RESIDUE_PAGES;
 
     debug_assert!(out.len() >= MAX_DRAIN_BLOCKS);
 
@@ -469,6 +483,25 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         drained_pages,
         block_count,
         SEED_RESERVE_BYTES / 1024,
+    );
+
+    // Seed the kernel PT-frame pool from the residual buddy carve. This
+    // must run before any `map_user_page` consumer (the first is Phase
+    // 9's init bootstrap). The pool is the cap-backed source for
+    // intermediate page-table frames; the buddy keeps only
+    // `BUDDY_RESIDUE_PAGES` for `dealloc_object` → `free_range`
+    // ledger arithmetic.
+    // SAFETY: single-threaded Phase 7; drain has populated the buddy
+    // free list with up to KERNEL_RESERVE_PAGES; kernel_pt_pool::init
+    // takes its own LOCK internally.
+    unsafe {
+        crate::mm::kernel_pt_pool::init(POOL_SEED_PAGES);
+    }
+    let pool_remaining = crate::mm::kernel_pt_pool::remaining_pages();
+    crate::kprintln!(
+        "kernel_pt_pool: {} pages installed (buddy residue {})",
+        pool_remaining,
+        BUDDY_RESIDUE_PAGES,
     );
 
     block_count

@@ -396,14 +396,11 @@ pub unsafe fn read_root_phys() -> u64
 }
 
 /// Map a single 4 KiB user page `virt` → `phys` in the page table rooted at
-/// `root_virt`, allocating missing intermediate frames from `allocator`.
-///
-/// Unlike `map_page` (which uses a BSS pool), this function allocates
-/// intermediate page table frames dynamically from the buddy allocator.
-/// Used for building user address spaces after Phase 4 (heap active).
+/// `root_virt`, drawing missing intermediate frames from
+/// `crate::mm::kernel_pt_pool`.
 ///
 /// # Errors
-/// Returns `Err(())` if the buddy allocator is exhausted.
+/// Returns `Err(())` if the kernel PT pool is exhausted.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB PML4
@@ -414,7 +411,6 @@ pub unsafe fn map_user_page(
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
-    allocator: &mut crate::mm::BuddyAllocator,
 ) -> Result<(), ()>
 {
     use crate::mm::paging::phys_to_virt;
@@ -425,15 +421,15 @@ pub unsafe fn map_user_page(
     // SAFETY: root_virt is direct-map VA of valid user PML4; table entries validated before dereference.
     let pml4 = unsafe { table_at(root_virt) };
 
-    let pdpt_pa = user_walk_or_alloc(&mut pml4[pml4_index(virt)], allocator)?;
+    let pdpt_pa = user_walk_or_alloc(&mut pml4[pml4_index(virt)])?;
     // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
     let pdpt = unsafe { table_at(phys_to_virt(pdpt_pa)) };
 
-    let pd_pa = user_walk_or_alloc(&mut pdpt[pdpt_index(virt)], allocator)?;
+    let pd_pa = user_walk_or_alloc(&mut pdpt[pdpt_index(virt)])?;
     // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
     let pd = unsafe { table_at(phys_to_virt(pd_pa)) };
 
-    let pt_pa = user_walk_or_alloc(&mut pd[pd_index(virt)], allocator)?;
+    let pt_pa = user_walk_or_alloc(&mut pd[pd_index(virt)])?;
     // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
     let pt = unsafe { table_at(phys_to_virt(pt_pa)) };
 
@@ -445,18 +441,10 @@ pub unsafe fn map_user_page(
 }
 
 /// Walk an existing page table entry or allocate a new child frame from the
-/// buddy allocator.
-///
-/// Used by `map_user_page` in place of `walk_or_alloc` (which uses `PoolState`).
+/// kernel PT pool (`crate::mm::kernel_pt_pool`).
 #[cfg(not(test))]
-fn user_walk_or_alloc(
-    entry: &mut PageTableEntry,
-    allocator: &mut crate::mm::BuddyAllocator,
-) -> Result<u64, ()>
+fn user_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 {
-    use crate::mm::PAGE_SIZE;
-    use crate::mm::paging::phys_to_virt;
-
     // Set USER bit so lower-level tables are accessible from ring 3.
     const USER: u64 = 1 << 2;
 
@@ -465,13 +453,8 @@ fn user_walk_or_alloc(
         return Ok(entry.phys_addr());
     }
 
-    let frame_pa = allocator.alloc(0).ok_or(())?;
-    let frame_va = phys_to_virt(frame_pa);
-
-    // SAFETY: frame_va is exclusively-owned direct-map kernel address; write_bytes initializes valid memory.
-    unsafe {
-        core::ptr::write_bytes(frame_va as *mut u8, 0, PAGE_SIZE);
-    }
+    // Pool returns zero-filled pages; no further write_bytes needed.
+    let frame_pa = crate::mm::kernel_pt_pool::alloc_pt_page().ok_or(())?;
 
     let mut table_pte = PageTableEntry::new_table(frame_pa);
     table_pte.0 |= USER;
@@ -574,7 +557,7 @@ fn user_walk_or_alloc_pooled(
 /// `active_cpu_mask() == 0` before invocation).
 #[cfg(not(test))]
 #[allow(dead_code)]
-pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::BuddyAllocator)
+pub unsafe fn free_user_page_tables(root_virt: u64)
 {
     use crate::mm::paging::phys_to_virt;
 
@@ -621,17 +604,15 @@ pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::B
                     continue;
                 }
                 let pt_pa = pde.phys_addr();
-                // SAFETY: pt_pa allocated by `user_walk_or_alloc` from the
-                // buddy as order-0; caller guarantees no CPU still references it.
-                unsafe { allocator.free(pt_pa, 0) };
+                // PT frame originated from `kernel_pt_pool::alloc_pt_page`;
+                // return it there. Caller guarantees no CPU still references it.
+                crate::mm::kernel_pt_pool::free_pt_page(pt_pa);
             }
-            // SAFETY: pd_pa allocated by `user_walk_or_alloc` from the buddy
-            // as order-0; all descendant PT frames just freed above.
-            unsafe { allocator.free(pd_pa, 0) };
+            // PD frame likewise originated from the pool.
+            crate::mm::kernel_pt_pool::free_pt_page(pd_pa);
         }
-        // SAFETY: pdpt_pa allocated by `user_walk_or_alloc` from the buddy
-        // as order-0; all descendant PD frames just freed above.
-        unsafe { allocator.free(pdpt_pa, 0) };
+        // PDPT frame likewise originated from the pool.
+        crate::mm::kernel_pt_pool::free_pt_page(pdpt_pa);
     }
 }
 

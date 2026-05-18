@@ -277,15 +277,14 @@ impl AddressSpace
         crate::percpu::preempt_disable();
         self.pt_lock();
 
-        // Allocate intermediate page table frames as needed via the global
-        // frame allocator. FRAME_ALLOC_LOCK is acquired and released inside
-        // with_frame_allocator — not held across the shootdown.
-        // SAFETY: contract passed to caller.
-        let result = crate::mm::with_frame_allocator(|alloc| {
-            // SAFETY: contract passed to caller; root_virt is valid; virt is
-            // in user range; phys is a valid 4 KiB-aligned physical address.
-            unsafe { map_user_page(self.root_virt, virt, phys, flags, alloc) }
-        });
+        // Intermediate page table frames are drawn from
+        // `mm::kernel_pt_pool` (seeded once at Phase 7 from the residual
+        // `KERNEL_RESERVE_PAGES` buddy carve). No buddy lock is taken on
+        // this path; the shootdown below is the only inter-CPU
+        // synchronisation cost.
+        // SAFETY: contract passed to caller; root_virt is valid; virt is
+        // in user range; phys is a valid 4 KiB-aligned physical address.
+        let result = unsafe { map_user_page(self.root_virt, virt, phys, flags) };
 
         if result.is_err()
         {
@@ -443,51 +442,6 @@ impl AddressSpace
                 self.map_page(virt, phys, flags)?;
             }
         }
-        Ok(())
-    }
-
-    /// Allocate `pages` physical frames and map them as a user stack.
-    ///
-    /// The stack occupies virtual addresses `[stack_top - pages * PAGE_SIZE, stack_top)`.
-    /// One additional guard page (unmapped) sits below the stack to catch overflows.
-    ///
-    /// # Safety
-    /// `stack_top` must be page-aligned and within the user address range.
-    #[cfg(not(test))]
-    pub unsafe fn map_stack(&self, stack_top: u64, pages: usize) -> Result<(), ()>
-    {
-        let rw_flags = crate::mm::paging::PageFlags {
-            readable: true,
-            writable: true,
-            executable: false,
-            uncacheable: false,
-        };
-
-        for i in 0..pages
-        {
-            // Allocate one physical frame per page. The frame allocator lock
-            // is acquired and released here, independently of map_page's
-            // internal lock acquisition for intermediate page table frames.
-            let phys = crate::mm::with_frame_allocator(|alloc| alloc.alloc(0)).ok_or(())?;
-
-            // Zero the frame (stack pages should start clean).
-            // SAFETY: phys_to_virt gives a valid kernel virtual address.
-            unsafe {
-                let virt = phys_to_virt(phys);
-                core::ptr::write_bytes(virt as *mut u8, 0, PAGE_SIZE);
-            }
-
-            // Map at the correct virtual address (stack grows downward).
-            let virt = stack_top - ((i + 1) * PAGE_SIZE) as u64;
-            // SAFETY: phys is valid and virt is in user range.
-            unsafe {
-                self.map_page(virt, phys, rw_flags)?;
-            }
-        }
-
-        // The guard page (one page below the stack) is intentionally left
-        // unmapped: accessing it will fault, catching stack overflows.
-
         Ok(())
     }
 

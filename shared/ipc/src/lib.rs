@@ -708,7 +708,7 @@ pub mod ns_labels
     pub const NS_READDIR: u64 = 22;
 }
 
-pub const FS_LABELS_VERSION: u32 = 2;
+pub const FS_LABELS_VERSION: u32 = 3;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
 {
@@ -836,6 +836,22 @@ pub mod fs_labels
     /// `NOT_FOUND` (source missing), `EXISTS` (destination occupied),
     /// `NO_SPACE`, `IO_ERROR`.
     pub const FS_RENAME: u64 = 16;
+    /// Truncate a file to a new length.
+    ///
+    /// Request: token = file-node cap (must carry `WRITE`),
+    /// `label = FS_TRUNCATE`, `data[0]` = new length in bytes.
+    ///
+    /// v1 supports only `new_len == 0` (sufficient for
+    /// `OpenOptions::truncate(true)` and `File::set_len(0)`); non-zero
+    /// lengths reply `IO_ERROR`. The wire shape is forward-compatible
+    /// with later extend-with-zero-fill semantics. The corresponding
+    /// follow-up is tracked in the `ruststd::fs` completeness-gaps Issue.
+    ///
+    /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
+    /// `INVALID_TOKEN`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
+    /// `IO_ERROR` (chain walk / `FSInfo` flush failure, or non-zero
+    /// `new_len` until the v2 extend path lands).
+    pub const FS_TRUNCATE: u64 = 17;
 }
 
 pub const DEVMGR_LABELS_VERSION: u32 = 1;

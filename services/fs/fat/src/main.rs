@@ -374,6 +374,19 @@ fn service_loop(
                 handle_rename_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
                 continue;
             }
+            fs_labels::FS_TRUNCATE =>
+            {
+                handle_truncate_node_cap(
+                    node_id,
+                    &msg,
+                    state,
+                    nodes,
+                    cache,
+                    caps.block_dev,
+                    ipc_buf,
+                );
+                continue;
+            }
             _ =>
             {}
         }
@@ -1612,6 +1625,69 @@ fn handle_rename_node_cap(
     // A later FS_WRITE through a held source cap would otherwise
     // patch a `0xE5`-marked entry.
     nodes.invalidate_for_loc(src_loc);
+
+    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `FS_TRUNCATE`: shrink a file to a new length.
+///
+/// Token = file cap (must carry `WRITE`). `data[0]` = new length.
+/// v1 supports only `new_len == 0`; non-zero replies `IO_ERROR` so
+/// the wire shape is forward-compatible with later extend-with-
+/// zero-fill semantics tracked by the `ruststd::fs` completeness-gaps
+/// Issue.
+fn handle_truncate_node_cap(
+    node_id: NodeId,
+    msg: &IpcMessage,
+    state: &mut FatState,
+    nodes: &mut NodeTable,
+    cache: &PageCache,
+    block_dev: u32,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(node) = nodes.get(node_id)
+    else
+    {
+        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        return;
+    };
+    if node.kind != NodeKind::File
+    {
+        reply_err(ipc::fs_errors::IS_A_DIRECTORY, ipc_buf);
+        return;
+    }
+    let new_len = msg.word(0);
+    if new_len != 0
+    {
+        // v1: only size=0 is supported. Non-zero is the extend-with-
+        // zero-fill case which needs new allocator work.
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    }
+
+    // Capture the old chain head before clearing, then free it.
+    let old_cluster = node.cluster;
+    let entry_loc = node.loc;
+
+    if old_cluster >= 2
+        && let Err(e) = alloc::free_cluster_chain(state, old_cluster, cache, block_dev, ipc_buf)
+    {
+        reply_err(fat_error_to_wire(e), ipc_buf);
+        return;
+    }
+
+    // Patch the directory entry: first cluster = 0, size = 0.
+    if entry_loc.sector_lba != 0
+        && let Err(e) = update_entry_metadata(entry_loc, 0, 0, cache, block_dev, ipc_buf)
+    {
+        reply_err(fat_error_to_wire(e), ipc_buf);
+        return;
+    }
+
+    nodes.update_size_and_cluster(node_id, 0, 0);
 
     let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
     // SAFETY: ipc_buf is the registered IPC buffer page.

@@ -12,9 +12,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   burnin:
     runs-on: ubuntu-latest
@@ -24,7 +21,7 @@ jobs:
         arch: [x86_64, riscv64]
         profile: [debug, release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install QEMU and firmware
         run: |
@@ -68,7 +65,7 @@ jobs:
 
       - name: Upload usertest logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: burnin-usertest-${{ matrix.arch }}-${{ matrix.profile }}
           path: target/xtask/run-parallel/**/*.log
@@ -97,7 +94,7 @@ jobs:
 
       - name: Upload ktest logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: burnin-ktest-${{ matrix.arch }}-${{ matrix.profile }}
           path: target/xtask/run-parallel/**/*.log

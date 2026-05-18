@@ -469,6 +469,36 @@ pub fn init_kernel_page_tables(
     Ok(())
 }
 
+/// Tear down a 4 KiB identity mapping (VA == PA) in the kernel root page
+/// table, flush the local TLB, and broadcast a shootdown to all other
+/// online CPUs so the underlying physical page becomes reclaim-safe.
+///
+/// Used to retire the AP-trampoline identity mapping after SMP bringup
+/// completes. The walk only clears the leaf PTE; intermediate tables are
+/// left in place because they may host other low-VA identity mappings
+/// (e.g. future trampoline pages). A no-op on architectures that do not
+/// install a kernel identity mapping (RISC-V trampolines run pre-paging
+/// via SBI HSM `hart_start`).
+///
+/// # Safety
+/// `pa` must be 4 KiB-aligned. No thread (BSP or AP) may execute code on
+/// or reference data inside the page after this returns. Caller need not
+/// hold any lock; the routine handles preempt/shootdown discipline.
+#[cfg(not(test))]
+pub unsafe fn unmap_identity_page(pa: u64)
+{
+    // SAFETY: arch implementation handles the walk, local invalidate, and
+    // cross-CPU shootdown; caller's pa-aligned + no-live-reference contract
+    // is forwarded.
+    unsafe {
+        arch_paging::unmap_identity_page(pa);
+    }
+}
+
+/// Test stub.
+#[cfg(test)]
+pub unsafe fn unmap_identity_page(_pa: u64) {}
+
 /// Map kernel image sections with W^X permissions using 4 KiB pages.
 ///
 /// Physical addresses are derived from the kernel VA/PA offset in `info`.

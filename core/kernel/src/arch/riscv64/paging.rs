@@ -651,6 +651,15 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
     unsafe { flush_page(virt) };
 }
 
+/// RISC-V counterpart to [`crate::mm::paging::unmap_identity_page`].
+///
+/// No-op: the RISC-V AP trampoline runs pre-paging via SBI HSM
+/// `hart_start`, and the kernel never installs a low-VA identity mapping
+/// for the trampoline page. The trampoline page can be reclaimed
+/// directly once SMP bringup completes — no PTE teardown is required.
+#[cfg(not(test))]
+pub unsafe fn unmap_identity_page(_pa: u64) {}
+
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.
 ///
 /// Returns `Err(PagingError::NotMapped)` if any level is not present. On

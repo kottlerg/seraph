@@ -708,6 +708,83 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
     unsafe { flush_page(virt) };
 }
 
+/// x86-64 implementation of [`crate::mm::paging::unmap_identity_page`].
+///
+/// Walks the kernel PML4 from `phys_to_virt(kernel_pml4_pa())` down to the
+/// leaf PT covering `pa` and clears the leaf entry. Bails silently if any
+/// intermediate level is absent (the mapping was already torn down or
+/// never installed). Issues a local `invlpg`, then broadcasts a TLB
+/// shootdown to every other online CPU.
+///
+/// Intermediate tables are NOT freed — they may host other low-VA mappings
+/// (additional trampoline pages, future low-PA identity entries).
+#[cfg(not(test))]
+pub unsafe fn unmap_identity_page(pa: u64)
+{
+    use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
+
+    let root_pa = kernel_pml4_pa();
+    if root_pa == 0
+    {
+        return;
+    }
+    let root_va = phys_to_virt(root_pa);
+    let virt = pa; // identity: VA == PA
+
+    // SAFETY: root_va is the direct-map VA of the kernel PML4 installed in
+    // Phase 3; table walk is read-only until the leaf clear at the bottom.
+    let pml4 = unsafe { table_at(root_va) };
+    let e = pml4[pml4_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    let pdpt = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    let e = pdpt[pdpt_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    let pd = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    let e = pd[pd_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    let pt = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    pt[pt_index(virt)] = PageTableEntry(0);
+
+    // Local invalidate, then broadcast to every other online CPU. The
+    // shootdown routine requires preemption disabled and handles the
+    // interrupt window for mutual shootdown itself.
+    // SAFETY: invlpg is a per-CPU architectural primitive; shootdown
+    // contract met by acquiring preemption around the broadcast.
+    unsafe { flush_page(virt) };
+
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let online_mask: u64 = if cpu_count >= 64
+    {
+        u64::MAX
+    }
+    else
+    {
+        (1u64 << cpu_count) - 1
+    };
+    let current = crate::arch::current::cpu::current_cpu();
+    let remote = online_mask & !(1u64 << current);
+    if remote != 0
+    {
+        crate::percpu::preempt_disable();
+        // SAFETY: root_pa is the active kernel PML4; remote mask covers
+        // only online CPUs; preemption disabled around the shootdown.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, remote, virt) };
+        crate::percpu::preempt_enable();
+    }
+}
+
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.
 ///
 /// Walks PML4 → PDPT → PD → PT. Returns `Err(PagingError::NotMapped)` if

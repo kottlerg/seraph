@@ -299,9 +299,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 
     // ── Phase 7: capability system ─────────────────────────────────────────────
     // Initialises the root CSpace and mints initial capabilities for all
-    // boot-provided hardware resources.
+    // boot-provided hardware resources. `cspace_layout` is held `mut` so
+    // the post-SMP late-reclaim pass (after Phase 8) can append the AP
+    // trampoline cap to its descriptor table before Phase 9 consumes it.
     kprintln!("Phase 7: Capability System");
-    let cspace_layout = cap::init_capability_system(mmio_apertures, boot_info as u64);
+    let mut cspace_layout = cap::init_capability_system(mmio_apertures, boot_info as u64);
     kprintln!(
         "capability system initialised, {} slots populated",
         cspace_layout.total_populated
@@ -319,6 +321,113 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         cpu_count,
         if cpu_count == 1 { "" } else { "s" }
     );
+
+    // ── SMP: start Application Processors ────────────────────────────────────
+    // Reordered out of Phase 9 (relative to PR #90) so the AP trampoline
+    // page is reclaim-safe before init's CSpace descriptor table is
+    // consumed. APs only depend on Phase 5/8 state (interrupts, percpu,
+    // scheduler idle threads) — never on Phase 9 / init AS — so this
+    // ordering is sound; verified by inspecting `kernel_entry_ap`.
+    //
+    // Arch-neutral: each architecture implements `ap_trampoline::setup_trampoline`
+    // and `ap_trampoline::start_ap` behind the `arch::current` facade.
+    // APs enter their idle loops and increment APS_READY. The BSP waits
+    // for each AP before proceeding; the Acquire load on APS_READY also
+    // guarantees the AP has left the trampoline page (the trampoline
+    // increments APS_READY only after jumping to `kernel_entry_ap` at a
+    // kernel virtual address) — making the underlying physical page safe
+    // to retire from the identity map below.
+    #[cfg(not(test))]
+    {
+        let ap_count = (boot_cpu_count - 1) as usize;
+        if ap_count > 0
+        {
+            if trampoline_pa == 0
+            {
+                kprintln!("smp: no AP trampoline page — SMP disabled");
+            }
+            else
+            {
+                kprintln!("smp: starting {} AP(s)", ap_count);
+
+                // Copy/patch the trampoline code into the physical page.
+                // SAFETY: direct physical map active (Phase 3); trampoline_pa
+                // from BootInfo points to bootloader-allocated RWX page <1 MiB.
+                unsafe {
+                    arch::current::ap_trampoline::setup_trampoline(trampoline_pa);
+                }
+
+                let entry_fn = kernel_entry_ap as *const () as u64;
+
+                for cpu_idx in 1..=ap_count
+                {
+                    let hw_id = boot_cpu_ids[cpu_idx];
+                    // SAFETY: idle threads allocated in Phase 8 for all CPUs;
+                    // cpu_idx < boot_cpu_count validated by loop bound.
+                    let stack_top = unsafe { sched::idle_stack_top_for(cpu_idx) };
+
+                    // Arch-specific: write params + send SIPI / SBI hart_start.
+                    // SAFETY: trampoline setup complete above; all boot phases
+                    // (2-8) initialized; AP will use shared kernel state.
+                    let ok = unsafe {
+                        arch::current::ap_trampoline::start_ap(
+                            trampoline_pa,
+                            cpu_idx as u32,
+                            hw_id,
+                            entry_fn,
+                            stack_top,
+                        )
+                    };
+                    if !ok
+                    {
+                        kprintln!("smp: start_ap(cpu={}) failed", cpu_idx);
+                        continue;
+                    }
+
+                    while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
+                    {
+                        core::hint::spin_loop();
+                    }
+                }
+
+                kprintln!("smp: all {} AP(s) online", ap_count);
+            }
+        }
+    }
+
+    // ── Late reclaim: retire the AP trampoline identity mapping ──────────────
+    // With every AP now executing at kernel virtual addresses, the x86
+    // identity-RWX mapping at `trampoline_pa` (installed in Phase 3) is no
+    // longer reachable by any code path. Tear it down with a TLB shootdown
+    // across all online CPUs, then mint a reclaimable Frame cap over the
+    // page so it reaches init via the standard `CapDescriptor` walk.
+    // RISC-V's `unmap_identity_page` is a no-op (no kernel identity map
+    // for the trampoline); the late-reclaim mint still runs there.
+    #[cfg(not(test))]
+    if trampoline_pa != 0
+    {
+        // SAFETY: APS_READY-observed Acquire above guarantees no AP is
+        // still inside the trampoline page; preempt discipline is handled
+        // by `unmap_identity_page` internally.
+        unsafe {
+            mm::paging::unmap_identity_page(trampoline_pa);
+        }
+        // Re-resolve `BootInfo` through the direct physical map. The
+        // original `info` reference points to the bootloader's
+        // identity-mapped VA, which Phase 3 unmapped; reading through it
+        // here would page-fault. (Phase 7's `cap::init_capability_system`
+        // does the same translation when called with `boot_info as u64`.)
+        // SAFETY: direct map covers all RAM since Phase 3; boot_info
+        // physical address validated in Phase 0.
+        let info_dm = unsafe { &*(mm::paging::phys_to_virt(boot_info as u64) as *const BootInfo) };
+        // SAFETY: ROOT_CSPACE installed in Phase 7; trampoline page no
+        // longer mapped at its PA; single-threaded boot.
+        unsafe {
+            let cs = cap::root_cspace_mut()
+                .unwrap_or_else(|| fatal("late reclaim: ROOT_CSPACE missing"));
+            cap::mint_late_reclaim_frame_caps(cs, info_dm, &mut cspace_layout);
+        }
+    }
 
     // ── Phase 9: create and launch init ───────────────────────────────────────
     // Gated #[cfg(not(test))]: Phase 9 uses heap allocation and arch-specific
@@ -967,69 +1076,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE / 1024) as u64,
         );
 
-        // ── SMP: start Application Processors ────────────────────────────────
-        // Arch-neutral: each architecture implements `ap_trampoline::setup_trampoline`
-        // and `ap_trampoline::start_ap` behind the `arch::current` facade.
-        // APs enter their idle loops and increment APS_READY. The BSP waits
-        // for all APs before entering the scheduler.
-        {
-            let ap_count = (boot_cpu_count - 1) as usize;
-            if ap_count > 0
-            {
-                if trampoline_pa == 0
-                {
-                    kprintln!("smp: no AP trampoline page — SMP disabled");
-                }
-                else
-                {
-                    kprintln!("smp: starting {} AP(s)", ap_count);
-
-                    // Copy/patch the trampoline code into the physical page.
-                    // SAFETY: direct physical map active (Phase 3); trampoline_pa
-                    // from BootInfo points to bootloader-allocated RWX page <1 MiB.
-                    unsafe {
-                        arch::current::ap_trampoline::setup_trampoline(trampoline_pa);
-                    }
-
-                    let entry_fn = kernel_entry_ap as *const () as u64;
-
-                    for cpu_idx in 1..=ap_count
-                    {
-                        let hw_id = boot_cpu_ids[cpu_idx];
-                        // SAFETY: idle threads allocated in Phase 8 for all CPUs;
-                        // cpu_idx < boot_cpu_count validated by loop bound.
-                        let stack_top = unsafe { sched::idle_stack_top_for(cpu_idx) };
-
-                        // Arch-specific: write params + send SIPI / SBI hart_start.
-                        // SAFETY: trampoline setup complete above; all boot phases
-                        // (2-8) initialized; AP will use shared kernel state.
-                        let ok = unsafe {
-                            arch::current::ap_trampoline::start_ap(
-                                trampoline_pa,
-                                cpu_idx as u32,
-                                hw_id,
-                                entry_fn,
-                                stack_top,
-                            )
-                        };
-                        if !ok
-                        {
-                            kprintln!("smp: start_ap(cpu={}) failed", cpu_idx);
-                            continue;
-                        }
-
-                        while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
-                        {
-                            core::hint::spin_loop();
-                        }
-                    }
-
-                    kprintln!("smp: all {} AP(s) online", ap_count);
-                }
-            }
-        }
-
-        // Hand off to the scheduler. Never returns.
+        // Hand off to the scheduler. Never returns. (SMP startup ran
+        // between Phase 8 and Phase 9; APs are already idle.)
         sched::enter();
     }
 

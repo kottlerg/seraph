@@ -472,10 +472,17 @@ pub struct ReclaimRange
     pub phys_base: u64,
     /// Number of 4 KiB pages covered. Non-zero.
     pub page_count: u32,
-    /// Reserved for future per-entry flags (e.g. arch-specific liveness
-    /// hints). Producers MUST write zero; consumers MUST ignore.
-    pub reserved: u32,
+    /// Per-entry flags. See [`RECLAIM_FLAG_LATE`]. All other bits are
+    /// reserved; producers MUST write zero for them.
+    pub flags: u32,
 }
+
+/// `ReclaimRange.flags` bit: defer minting to a kernel-side "late reclaim"
+/// pass that runs after SMP bringup and any required identity-mapping
+/// teardown. Used today for the AP SIPI trampoline page (x86 holds a
+/// kernel-installed identity-RWX mapping that must be retired via TLB
+/// shootdown before reclaim).
+pub const RECLAIM_FLAG_LATE: u32 = 1;
 
 /// Maximum number of [`ReclaimRange`] entries one 4 KiB reclaim-array page
 /// can hold. The bootloader allocates a dedicated 4 KiB page for the array

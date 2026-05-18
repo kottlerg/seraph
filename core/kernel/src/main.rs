@@ -218,6 +218,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // Snapshot the cmdline from the bootloader-owned page into kernel BSS so
     // the page itself is reclaim-safe by Phase 7. The Phase-9 InitInfo copy
     // sources from `KERNEL_CMDLINE` rather than the bootloader page.
+    #[cfg(not(test))]
     {
         let n = cmdline_len.min(KERNEL_CMDLINE_MAX);
         if n > 0 && cmdline_phys != 0

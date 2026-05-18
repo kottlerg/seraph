@@ -150,6 +150,7 @@ fn main()
     std_bulk_write_phase();
     std_read_dir_phase();
     std_metadata_phase();
+    std_open_options_invalid_phase();
     ns_multi_component_phase();
     ns_sandbox_phase();
     ns_bin_subtree_phase();
@@ -1943,6 +1944,74 @@ fn std_metadata_phase()
 
     std::fs::remove_file(f).expect("cleanup");
     std::os::seraph::log!("std_metadata phase passed");
+}
+
+/// Cover the `OpenOptions` flag-combination reject legs added in the
+/// PAL. Every reject must surface `ErrorKind::InvalidInput` so callers
+/// can distinguish a bad open from a permission or I/O failure.
+///
+/// `clippy::suspicious_open_options` flags exactly the combinations we
+/// are deliberately exercising as reject legs; suppress the lint so the
+/// negative tests can compile.
+#[allow(
+    clippy::suspicious_open_options,
+    clippy::nonsensical_open_options,
+    clippy::ineffective_open_options,
+    clippy::needless_update
+)]
+fn std_open_options_invalid_phase()
+{
+    let path = "/usertest/__ooopt.bin";
+
+    let no_mode = std::fs::OpenOptions::new().open(path);
+    assert!(no_mode.is_err(), "open with no access mode must reject");
+    assert_eq!(
+        no_mode.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    let append_truncate = std::fs::OpenOptions::new()
+        .write(true)
+        .append(true)
+        .truncate(true)
+        .open(path);
+    assert!(append_truncate.is_err());
+    assert_eq!(
+        append_truncate.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    let truncate_no_write = std::fs::OpenOptions::new()
+        .read(true)
+        .truncate(true)
+        .open(path);
+    assert!(truncate_no_write.is_err());
+    assert_eq!(
+        truncate_no_write.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    let create_no_write = std::fs::OpenOptions::new()
+        .read(true)
+        .create(true)
+        .open(path);
+    assert!(create_no_write.is_err());
+    assert_eq!(
+        create_no_write.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    let create_new_no_write = std::fs::OpenOptions::new()
+        .read(true)
+        .create_new(true)
+        .open(path);
+    assert!(create_new_no_write.is_err());
+    assert_eq!(
+        create_new_no_write.unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    std::os::seraph::log!("std_open_options_invalid phase passed");
 }
 
 /// Exercise vfsd's tree-shaped synthetic root: a multi-component

@@ -1942,7 +1942,13 @@ pub fn remove_dir_all(path: &Path) -> io::Result<()>
 
     let result = drain_dir_recursive(walked.cap, ipc_buf);
     let _ = syscall::cap_delete(walked.cap);
-    result?;
+    if let Err(e) = result
+    {
+        // Release the (possibly-owned) parent cap before propagating;
+        // bare `?` would otherwise skip the release_split_parent leg.
+        release_split_parent(&split);
+        return Err(e);
+    }
 
     // Final FS_REMOVE for the now-empty target.
     let label = fs_labels::FS_REMOVE | ((split.leaf.len() as u64) << 16);

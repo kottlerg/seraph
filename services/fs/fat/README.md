@@ -42,6 +42,7 @@ fat/
 | `FS_REMOVE` | no | unlink a file or empty directory |
 | `FS_MKDIR` | no | new empty directory |
 | `FS_RENAME` | no | rename within a single directory |
+| `FS_TRUNCATE` | no | shrink a file to zero (v1: `new_len == 0` only) |
 
 `FS_RENAME` is single-directory only at v0.1.0 because servers cannot
 introspect the token packed in a received cap; cross-directory rename
@@ -49,8 +50,8 @@ needs either a kernel-level `cap_info` selector for tokens or a wire
 shape that conveys the destination `NodeId` out-of-band. Tracked as
 [Issue #89](https://github.com/kottlerg/seraph/issues/89).
 
-Per-label rights gating (`WRITE` for the write labels, `MUTATE_DIR`
-for the mutation labels) goes through
+Per-label rights gating (`WRITE` for the write / truncate labels,
+`MUTATE_DIR` for the directory-mutation labels) goes through
 [`namespace-protocol::gate`](../../../shared/namespace-protocol/src/gate.rs).
 The exact wire shapes are defined in
 [`shared/ipc/src/lib.rs`](../../../shared/ipc/src/lib.rs) and documented

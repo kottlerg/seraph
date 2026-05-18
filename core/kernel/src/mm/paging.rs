@@ -435,18 +435,21 @@ pub fn init_kernel_page_tables(
         }
     }
 
-    // ── AP trampoline identity mapping (x86-64 SMP) ──────────────────────────
+    // ── AP trampoline identity mapping (arch-neutral) ────────────────────────
     // Map the AP trampoline page at its physical address as a 4 KiB identity
-    // page (VA = PA). This allows APs to execute trampoline code immediately
-    // after enabling paging (CR3 = kernel PML4) in the PM32 → LM64 transition,
-    // before the first far jmp to the direct-map address.
+    // page (VA = PA). Both arches need this: on x86-64 the AP enables paging
+    // (writes CR3 = kernel PML4) during the PM32 → LM64 transition and must
+    // keep fetching trampoline instructions at their PA before the first far
+    // jmp to a kernel-VA target; on RISC-V the trampoline executes
+    // `csrw satp` and the next instructions (sfence.vma, mv sp, jr) likewise
+    // execute at the trampoline PA before the final `jr` lands at
+    // `kernel_entry_ap`'s kernel virtual address.
     //
-    // The trampoline page is physically < 1 MiB. The kernel's other mappings
-    // are at high virtual addresses (DIRECT_MAP_BASE, kernel image), so the
-    // low-VA identity mapping does not conflict.
-    //
-    // To add new low-VA trampoline pages: call map_page here with additional
-    // addresses. One 4 KiB page is sufficient for the SIPI startup sequence.
+    // The kernel's other mappings are at high virtual addresses
+    // (DIRECT_MAP_BASE, kernel image), so the low-VA identity mapping does
+    // not conflict. Once SMP bringup completes,
+    // `mm::paging::unmap_identity_page` (called in Phase 8) retires the
+    // mapping so the page can be reclaimed as a Frame cap.
     if info.ap_trampoline_page != 0
     {
         let tramp = info.ap_trampoline_page;
@@ -468,6 +471,35 @@ pub fn init_kernel_page_tables(
 
     Ok(())
 }
+
+/// Tear down a 4 KiB identity mapping (VA == PA) in the kernel root page
+/// table, flush the local TLB, and broadcast a shootdown to all other
+/// online CPUs so the underlying physical page becomes reclaim-safe.
+///
+/// Used to retire the AP-trampoline identity mapping after SMP bringup
+/// completes. The walk only clears the leaf PTE; intermediate tables are
+/// left in place because they host other live low-VA mappings — notably
+/// the boot-stack identity mapping installed by `init_kernel_page_tables`
+/// — and freeing them would corrupt unrelated live state.
+///
+/// # Safety
+/// `pa` must be 4 KiB-aligned. No thread (BSP or AP) may execute code on
+/// or reference data inside the page after this returns. Caller need not
+/// hold any lock; the routine handles preempt/shootdown discipline.
+#[cfg(not(test))]
+pub unsafe fn unmap_identity_page(pa: u64)
+{
+    // SAFETY: arch implementation handles the walk, local invalidate, and
+    // cross-CPU shootdown; caller's pa-aligned + no-live-reference contract
+    // is forwarded.
+    unsafe {
+        arch_paging::unmap_identity_page(pa);
+    }
+}
+
+/// Test stub.
+#[cfg(test)]
+pub unsafe fn unmap_identity_page(_pa: u64) {}
 
 /// Map kernel image sections with W^X permissions using 4 KiB pages.
 ///

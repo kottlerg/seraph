@@ -157,25 +157,36 @@ boot modules, and reserved regions is marked unavailable.
 
 Pages the bootloader allocated for its own scratch use — the `BootInfo`
 struct, the module descriptor array, the memory-map entry array, the
-MMIO aperture array, the reclaim-array page itself, and every transient
-page-table frame — are recorded in `BootInfo.reclaim_ranges` (boot
-protocol v7) and consumed by `cap::mint_reclaim_frame_caps` during
-Phase 7. The kernel mints one reclaimable Frame cap per range
-(`owns_memory = true`, full byte ledger) and inserts it into the root
-`CSpace` so the cap reaches init through the standard `CapDescriptor`
-walk. The buddy ledger records each range via `register_owned_range`
-so cap teardown returns the pages via the existing `dealloc_object` →
-`free_range` path with the `total / free` ratio well-defined. Whether
-init donates the cap onward to memmgr or lets it cascade back to the
-buddy on CSpace teardown is a userspace policy decision; the kernel
-does not impose a route.
+MMIO aperture array, the reclaim-array page itself, the cmdline page,
+the AP SIPI trampoline page, and every transient page-table frame —
+are recorded in `BootInfo.reclaim_ranges` (boot protocol v7) and
+consumed by `cap::mint_reclaim_frame_caps` during Phase 7. The kernel
+mints one reclaimable Frame cap per range (`owns_memory = true`, full
+byte ledger) and inserts it into the root `CSpace` so the cap reaches
+init through the standard `CapDescriptor` walk. The buddy ledger
+records each range via `register_owned_range` so cap teardown returns
+the pages via the existing `dealloc_object` → `free_range` path with
+the `total / free` ratio well-defined. Whether init donates the cap
+onward to memmgr or lets it cascade back to the buddy on CSpace
+teardown is a userspace policy decision; the kernel does not impose a
+route.
 
-The cmdline page and the AP SIPI trampoline page are not reclaimed
-through this mechanism. Their last consumers run inside Phase 9, after
-`populate_cspace` has finalised `cspace_layout.descriptors`; reclaiming
-them through the standard `CapDescriptor` path requires either
-relocating their consumers into Phase 7 or moving SMP startup ahead of
-Phase 9.
+Two entries reach the cap surface through indirect paths:
+
+- The cmdline page lands in `reclaim_ranges` like every other early
+  entry, but only after the kernel snapshots its contents into a small
+  BSS buffer during Phase 4. The Phase-9 `InitInfo` copy reads from the
+  snapshot, leaving the bootloader page reclaim-safe by Phase 7.
+- The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
+  `reclaim_ranges`. `cap::mint_reclaim_frame_caps` skips it during the
+  Phase-7 walk; `cap::mint_late_reclaim_frame_caps` mints it later in
+  Phase 8, after SMP bringup completes and
+  `mm::paging::unmap_identity_page` retires the low-VA identity-RWX
+  mapping. (Both arches install this identity mapping in Phase 3 — the
+  trampoline must remain executable at its PA while PC walks the
+  post-`csrw satp` / post-CR3-write instructions.) The late-mint
+  completes before Phase 9 consumes `cspace_layout`, so the descriptor
+  still flows through the standard CSpace handoff.
 
 ### Buddy Allocator
 

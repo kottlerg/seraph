@@ -376,15 +376,12 @@ pub unsafe fn read_root_phys() -> u64
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB Sv48
 /// root frame. `virt` must be in the lower (user) half. `phys` must be 4 KiB-aligned.
-// similar_names: frame_va and frame_pa are a VA/PA pair — the similarity is intentional.
 #[cfg(not(test))]
-#[allow(clippy::similar_names)]
 pub unsafe fn map_user_page(
     root_virt: u64,
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
-    allocator: &mut crate::mm::BuddyAllocator,
 ) -> Result<(), ()>
 {
     use crate::mm::paging::phys_to_virt;
@@ -394,15 +391,15 @@ pub unsafe fn map_user_page(
     // SAFETY: root_virt is direct-map VA of valid user Sv48 root PT; caller contract.
     let root = unsafe { table_at(root_virt) };
 
-    let l2_pa = rv_walk_or_alloc(&mut root[vpn3_index(virt)], allocator)?;
+    let l2_pa = rv_walk_or_alloc(&mut root[vpn3_index(virt)])?;
     // SAFETY: l2_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
     let l2 = unsafe { table_at(phys_to_virt(l2_pa)) };
 
-    let l1_pa = rv_walk_or_alloc(&mut l2[vpn2_index(virt)], allocator)?;
+    let l1_pa = rv_walk_or_alloc(&mut l2[vpn2_index(virt)])?;
     // SAFETY: l1_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
     let l1 = unsafe { table_at(phys_to_virt(l1_pa)) };
 
-    let l0_pa = rv_walk_or_alloc(&mut l1[vpn1_index(virt)], allocator)?;
+    let l0_pa = rv_walk_or_alloc(&mut l1[vpn1_index(virt)])?;
     // SAFETY: l0_pa from rv_walk_or_alloc is valid; phys_to_virt yields direct-map VA.
     let l0 = unsafe { table_at(phys_to_virt(l0_pa)) };
     let mut pte = PageTableEntry::new_page(phys, flags);
@@ -412,31 +409,18 @@ pub unsafe fn map_user_page(
     Ok(())
 }
 
-/// Walk an existing Sv48 page table entry or allocate a new child frame.
-// similar_names: frame_va and frame_pa are a VA/PA pair — the similarity is intentional.
+/// Walk an existing Sv48 page table entry or allocate a new child frame
+/// from the kernel PT pool (`crate::mm::kernel_pt_pool`).
 #[cfg(not(test))]
-#[allow(clippy::similar_names)]
-fn rv_walk_or_alloc(
-    entry: &mut PageTableEntry,
-    allocator: &mut crate::mm::BuddyAllocator,
-) -> Result<u64, ()>
+fn rv_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 {
-    use crate::mm::PAGE_SIZE;
-    use crate::mm::paging::phys_to_virt;
-
     if entry.is_present()
     {
         return Ok(entry.phys_addr());
     }
 
-    let frame_pa = allocator.alloc(0).ok_or(())?;
-    let frame_va = phys_to_virt(frame_pa);
-
-    // SAFETY: frame_va is direct-map VA of freshly allocated buddy frame; exclusively
-    // owned; write_bytes zeroes exactly PAGE_SIZE (4 KiB).
-    unsafe {
-        core::ptr::write_bytes(frame_va as *mut u8, 0, PAGE_SIZE);
-    }
+    // Pool returns zero-filled pages; no further write_bytes needed.
+    let frame_pa = crate::mm::kernel_pt_pool::alloc_pt_page().ok_or(())?;
 
     *entry = PageTableEntry::new_table(frame_pa);
     Ok(frame_pa)
@@ -521,7 +505,7 @@ fn rv_walk_or_alloc_pooled(
 /// `active_cpu_mask() == 0` before invocation).
 #[cfg(not(test))]
 #[allow(dead_code)]
-pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::BuddyAllocator)
+pub unsafe fn free_user_page_tables(root_virt: u64)
 {
     use crate::mm::paging::phys_to_virt;
 
@@ -572,17 +556,14 @@ pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::B
                     continue;
                 }
                 let l0_pa = l1_e.phys_addr();
-                // SAFETY: l0_pa allocated by `rv_walk_or_alloc` from the
-                // buddy as order-0; no CPU references it (caller's contract).
-                unsafe { allocator.free(l0_pa, 0) };
+                // L0 frame originated from `kernel_pt_pool::alloc_pt_page`.
+                crate::mm::kernel_pt_pool::free_pt_page(l0_pa);
             }
-            // SAFETY: l1_pa allocated by `rv_walk_or_alloc` from the buddy
-            // as order-0; all descendant L0 frames just freed above.
-            unsafe { allocator.free(l1_pa, 0) };
+            // L1 frame likewise originated from the pool.
+            crate::mm::kernel_pt_pool::free_pt_page(l1_pa);
         }
-        // SAFETY: l2_pa allocated by `rv_walk_or_alloc` from the buddy as
-        // order-0; all descendant L1 frames just freed above.
-        unsafe { allocator.free(l2_pa, 0) };
+        // L2 frame likewise originated from the pool.
+        crate::mm::kernel_pt_pool::free_pt_page(l2_pa);
     }
 }
 
@@ -649,6 +630,115 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
 
     // SAFETY: virt may now be unmapped; flush_page is safe for any VA.
     unsafe { flush_page(virt) };
+}
+
+/// RISC-V counterpart to [`crate::mm::paging::unmap_identity_page`].
+///
+/// Walks the kernel Sv48 root from `phys_to_virt(kernel_pml4_pa())` down
+/// to the VPN\[0\] leaf covering `pa` and clears the leaf entry. Bails
+/// silently if any intermediate level is absent. Issues a local
+/// `sfence.vma pa, x0`, then broadcasts a TLB shootdown to every other
+/// online hart.
+///
+/// The kernel installs this identity mapping in Phase 3 (arch-neutral
+/// `mm/paging.rs`) so the AP trampoline page can execute the four
+/// instructions after `csrw satp` (sfence.vma, mv sp, jr) while PC is
+/// still inside the trampoline at its physical address. Once the AP has
+/// reached its kernel-VA entry, the mapping is no longer needed.
+///
+/// Intermediate tables are NOT freed — they may host other low-VA
+/// mappings (notably the boot-stack identity mapping installed by
+/// `mm/paging.rs:572-599` and any future low-PA identity entries).
+// similar_names: root_va and root_pa are a VA/PA pair — the similarity is
+// intentional and follows the pattern used elsewhere in this file.
+#[cfg(not(test))]
+#[allow(clippy::similar_names)]
+pub unsafe fn unmap_identity_page(pa: u64)
+{
+    use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
+
+    // Sv48 leaf detection: any of R/W/X set on a present PTE.
+    const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
+    let is_leaf = |e: PageTableEntry| e.0 & LEAF_BITS != 0;
+
+    let root_pa = kernel_pml4_pa();
+    if root_pa == 0
+    {
+        return;
+    }
+    let root_va = phys_to_virt(root_pa);
+    let virt = pa; // identity: VA == PA
+
+    // SAFETY: root_va is the direct-map VA of the kernel Sv48 root
+    // installed in Phase 3; table walk is read-only until the leaf
+    // clear at the bottom.
+    let root = unsafe { table_at(root_va) };
+    let e = root[vpn3_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // Refuse to mis-clear inside a 512 GiB leaf at VPN[3]; the caller
+    // would corrupt unrelated memory if we treated it as a child table.
+    if is_leaf(e)
+    {
+        return;
+    }
+    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
+    let l2 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    let e = l2[vpn2_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // Same guard for a 1 GiB gigapage leaf at VPN[2].
+    if is_leaf(e)
+    {
+        return;
+    }
+    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
+    let l1 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    let e = l1[vpn1_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // Same guard for a 2 MiB megapage leaf at VPN[1].
+    if is_leaf(e)
+    {
+        return;
+    }
+    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
+    let l0 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    l0[vpn0_index(virt)] = PageTableEntry(0);
+
+    // Local invalidate, then broadcast to every other online hart. The
+    // shootdown routine requires preemption disabled and handles the
+    // interrupt window for mutual shootdown itself.
+    // SAFETY: sfence.vma is a per-hart architectural primitive; shootdown
+    // contract met by acquiring preemption around the broadcast.
+    unsafe { flush_page(virt) };
+
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let online_mask: u64 = if cpu_count >= 64
+    {
+        u64::MAX
+    }
+    else
+    {
+        (1u64 << cpu_count) - 1
+    };
+    let current = crate::arch::current::cpu::current_cpu();
+    let remote = online_mask & !(1u64 << current);
+    if remote != 0
+    {
+        crate::percpu::preempt_disable();
+        // SAFETY: root_pa is the active kernel Sv48 root; remote mask
+        // covers only online harts; preemption disabled around the
+        // shootdown.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, remote, virt) };
+        crate::percpu::preempt_enable();
+    }
 }
 
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.

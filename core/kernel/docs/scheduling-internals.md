@@ -222,7 +222,7 @@ The window during which the BSP is live but SMP state is not yet steady. Begins 
 
 4. `BOOT_TRANSIENT_ACTIVE: AtomicBool` is the gate `timer_tick` consults. Set true in `init_storage`, cleared in `sched::enter` immediately before `first_entry_to_user`. The implicit `slice_remaining == 0` short-circuit is retained as a backstop.
 
-5. APs do not enter the transient. They come up in Phase 9 via `kernel_entry_ap` after the BSP is past `sched::init`; by the time an AP arms its own timer, all SMP-related state is live.
+5. APs do not enter the transient. They come up in Phase 8 (after `sched::init` allocates idle TCBs and before Phase 9 begins) via `kernel_entry_ap`; by the time an AP arms its own timer, all SMP-related state is live.
 
 ---
 

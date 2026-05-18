@@ -40,7 +40,7 @@ use crate::uefi::{
 use boot_protocol::{
     BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage, KernelMmio,
     MAX_APERTURES, MAX_CPUS, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice, MmioAperture,
-    MmioApertureSlice, ModuleSlice, ReclaimRange, ReclaimSlice,
+    MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
 };
 
 // ── Size constants ────────────────────────────────────────────────────────────
@@ -938,10 +938,10 @@ unsafe fn step9_populate_boot_info(
     bprintln!(" derived");
 
     // Build the reclaim-after-Phase-7 array in the dedicated 4 KiB page at
-    // `allocs.reclaim_array_phys`. Cmdline and AP trampoline are absent —
-    // their last consumers run inside Phase 9, after `populate_cspace`
-    // returns. The reclaim-array page is itself recorded as the final
-    // entry so the kernel reclaims it last.
+    // `allocs.reclaim_array_phys`. AP trampoline is handled by kernel-side
+    // late reclaim after SMP bringup (see `mint_late_reclaim_frame_caps`);
+    // every other bootloader scratch page lands here. The reclaim-array page
+    // is itself recorded as the final entry so the kernel reclaims it last.
     // SAFETY: reclaim_array_phys is a valid 4 KiB allocation; we treat it as
     // a fixed-size array of MAX_RECLAIM_RANGES entries (256 × 16 B = 4 KiB).
     let reclaim_ranges: &mut [ReclaimRange; MAX_RECLAIM_RANGES] =
@@ -949,10 +949,10 @@ unsafe fn step9_populate_boot_info(
     *reclaim_ranges = [ReclaimRange {
         phys_base: 0,
         page_count: 0,
-        reserved: 0,
+        flags: 0,
     }; MAX_RECLAIM_RANGES];
     let mut reclaim_len: usize = 0;
-    let mut push_reclaim = |phys_base: u64, page_count: u32| {
+    let mut push_reclaim = |phys_base: u64, page_count: u32, flags: u32| {
         if reclaim_len >= MAX_RECLAIM_RANGES
         {
             bprintln!("[--------] boot: FATAL: reclaim_ranges overflow (bump MAX_RECLAIM_RANGES)");
@@ -966,26 +966,40 @@ unsafe fn step9_populate_boot_info(
         reclaim_ranges[reclaim_len] = ReclaimRange {
             phys_base,
             page_count,
-            reserved: 0,
+            flags,
         };
         reclaim_len += 1;
     };
-    push_reclaim(allocs.boot_info_phys, 1);
-    push_reclaim(allocs.modules_phys, 1);
+    push_reclaim(allocs.boot_info_phys, 1, 0);
+    push_reclaim(allocs.modules_phys, 1, 0);
     // MEM_MAP_ENTRY_PAGES and reclaim_len (bounded by MAX_RECLAIM_RANGES) are
     // both small compile-time constants well within u32 range.
     #[allow(clippy::cast_possible_truncation)]
     {
-        push_reclaim(allocs.mem_entries_phys, MEM_MAP_ENTRY_PAGES as u32);
+        push_reclaim(allocs.mem_entries_phys, MEM_MAP_ENTRY_PAGES as u32, 0);
     }
-    push_reclaim(allocs.apertures_phys, 1);
+    push_reclaim(allocs.apertures_phys, 1, 0);
     for &frame in page_table.allocated_frames()
     {
-        push_reclaim(frame, 1);
+        push_reclaim(frame, 1, 0);
+    }
+    // Cmdline page: contents are snapshotted by the kernel into BSS in
+    // Phase 4, so the bootloader page becomes reclaim-safe by Phase 7.
+    if allocs.cmdline_phys != 0
+    {
+        push_reclaim(allocs.cmdline_phys, 1, 0);
+    }
+    // AP SIPI trampoline page: kernel mints this through the late-reclaim
+    // pass once SMP bringup completes and `mm::paging::unmap_identity_page`
+    // has retired the low-VA identity mapping (installed on both arches by
+    // the arch-neutral kernel page-table builder).
+    if allocs.ap_trampoline_phys != 0
+    {
+        push_reclaim(allocs.ap_trampoline_phys, 1, RECLAIM_FLAG_LATE);
     }
     // The reclaim-array page itself is reclaim-safe once the kernel has
     // walked it — record it last so the kernel processes it in order.
-    push_reclaim(allocs.reclaim_array_phys, 1);
+    push_reclaim(allocs.reclaim_array_phys, 1, 0);
     bprint!("[--------] boot: reclaim_ranges: ");
     #[allow(clippy::cast_possible_truncation)]
     // SAFETY: console initialized.

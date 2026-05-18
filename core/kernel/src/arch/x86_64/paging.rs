@@ -396,14 +396,11 @@ pub unsafe fn read_root_phys() -> u64
 }
 
 /// Map a single 4 KiB user page `virt` → `phys` in the page table rooted at
-/// `root_virt`, allocating missing intermediate frames from `allocator`.
-///
-/// Unlike `map_page` (which uses a BSS pool), this function allocates
-/// intermediate page table frames dynamically from the buddy allocator.
-/// Used for building user address spaces after Phase 4 (heap active).
+/// `root_virt`, drawing missing intermediate frames from
+/// `crate::mm::kernel_pt_pool`.
 ///
 /// # Errors
-/// Returns `Err(())` if the buddy allocator is exhausted.
+/// Returns `Err(())` if the kernel PT pool is exhausted.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB PML4
@@ -414,7 +411,6 @@ pub unsafe fn map_user_page(
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
-    allocator: &mut crate::mm::BuddyAllocator,
 ) -> Result<(), ()>
 {
     use crate::mm::paging::phys_to_virt;
@@ -425,15 +421,15 @@ pub unsafe fn map_user_page(
     // SAFETY: root_virt is direct-map VA of valid user PML4; table entries validated before dereference.
     let pml4 = unsafe { table_at(root_virt) };
 
-    let pdpt_pa = user_walk_or_alloc(&mut pml4[pml4_index(virt)], allocator)?;
+    let pdpt_pa = user_walk_or_alloc(&mut pml4[pml4_index(virt)])?;
     // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
     let pdpt = unsafe { table_at(phys_to_virt(pdpt_pa)) };
 
-    let pd_pa = user_walk_or_alloc(&mut pdpt[pdpt_index(virt)], allocator)?;
+    let pd_pa = user_walk_or_alloc(&mut pdpt[pdpt_index(virt)])?;
     // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
     let pd = unsafe { table_at(phys_to_virt(pd_pa)) };
 
-    let pt_pa = user_walk_or_alloc(&mut pd[pd_index(virt)], allocator)?;
+    let pt_pa = user_walk_or_alloc(&mut pd[pd_index(virt)])?;
     // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
     let pt = unsafe { table_at(phys_to_virt(pt_pa)) };
 
@@ -445,18 +441,10 @@ pub unsafe fn map_user_page(
 }
 
 /// Walk an existing page table entry or allocate a new child frame from the
-/// buddy allocator.
-///
-/// Used by `map_user_page` in place of `walk_or_alloc` (which uses `PoolState`).
+/// kernel PT pool (`crate::mm::kernel_pt_pool`).
 #[cfg(not(test))]
-fn user_walk_or_alloc(
-    entry: &mut PageTableEntry,
-    allocator: &mut crate::mm::BuddyAllocator,
-) -> Result<u64, ()>
+fn user_walk_or_alloc(entry: &mut PageTableEntry) -> Result<u64, ()>
 {
-    use crate::mm::PAGE_SIZE;
-    use crate::mm::paging::phys_to_virt;
-
     // Set USER bit so lower-level tables are accessible from ring 3.
     const USER: u64 = 1 << 2;
 
@@ -465,13 +453,8 @@ fn user_walk_or_alloc(
         return Ok(entry.phys_addr());
     }
 
-    let frame_pa = allocator.alloc(0).ok_or(())?;
-    let frame_va = phys_to_virt(frame_pa);
-
-    // SAFETY: frame_va is exclusively-owned direct-map kernel address; write_bytes initializes valid memory.
-    unsafe {
-        core::ptr::write_bytes(frame_va as *mut u8, 0, PAGE_SIZE);
-    }
+    // Pool returns zero-filled pages; no further write_bytes needed.
+    let frame_pa = crate::mm::kernel_pt_pool::alloc_pt_page().ok_or(())?;
 
     let mut table_pte = PageTableEntry::new_table(frame_pa);
     table_pte.0 |= USER;
@@ -574,7 +557,7 @@ fn user_walk_or_alloc_pooled(
 /// `active_cpu_mask() == 0` before invocation).
 #[cfg(not(test))]
 #[allow(dead_code)]
-pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::BuddyAllocator)
+pub unsafe fn free_user_page_tables(root_virt: u64)
 {
     use crate::mm::paging::phys_to_virt;
 
@@ -621,17 +604,15 @@ pub unsafe fn free_user_page_tables(root_virt: u64, allocator: &mut crate::mm::B
                     continue;
                 }
                 let pt_pa = pde.phys_addr();
-                // SAFETY: pt_pa allocated by `user_walk_or_alloc` from the
-                // buddy as order-0; caller guarantees no CPU still references it.
-                unsafe { allocator.free(pt_pa, 0) };
+                // PT frame originated from `kernel_pt_pool::alloc_pt_page`;
+                // return it there. Caller guarantees no CPU still references it.
+                crate::mm::kernel_pt_pool::free_pt_page(pt_pa);
             }
-            // SAFETY: pd_pa allocated by `user_walk_or_alloc` from the buddy
-            // as order-0; all descendant PT frames just freed above.
-            unsafe { allocator.free(pd_pa, 0) };
+            // PD frame likewise originated from the pool.
+            crate::mm::kernel_pt_pool::free_pt_page(pd_pa);
         }
-        // SAFETY: pdpt_pa allocated by `user_walk_or_alloc` from the buddy
-        // as order-0; all descendant PD frames just freed above.
-        unsafe { allocator.free(pdpt_pa, 0) };
+        // PDPT frame likewise originated from the pool.
+        crate::mm::kernel_pt_pool::free_pt_page(pdpt_pa);
     }
 }
 
@@ -706,6 +687,98 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
 
     // SAFETY: invlpg flushes TLB entry for specified VA; architecture primitive.
     unsafe { flush_page(virt) };
+}
+
+/// x86-64 implementation of [`crate::mm::paging::unmap_identity_page`].
+///
+/// Walks the kernel PML4 from `phys_to_virt(kernel_pml4_pa())` down to the
+/// leaf PT covering `pa` and clears the leaf entry. Bails silently if any
+/// intermediate level is absent (the mapping was already torn down or
+/// never installed). Issues a local `invlpg`, then broadcasts a TLB
+/// shootdown to every other online CPU.
+///
+/// Intermediate tables are NOT freed — they may host other low-VA mappings
+/// (additional trampoline pages, future low-PA identity entries).
+#[cfg(not(test))]
+pub unsafe fn unmap_identity_page(pa: u64)
+{
+    use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
+
+    /// PS / large-page bit (bit 7 in PDPT / PD entries).
+    const LARGE_PAGE_BIT: u64 = 1 << 7;
+
+    let root_pa = kernel_pml4_pa();
+    if root_pa == 0
+    {
+        return;
+    }
+    let root_va = phys_to_virt(root_pa);
+    let virt = pa; // identity: VA == PA
+
+    // SAFETY: root_va is the direct-map VA of the kernel PML4 installed in
+    // Phase 3; table walk is read-only until the leaf clear at the bottom.
+    let pml4 = unsafe { table_at(root_va) };
+    let e = pml4[pml4_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    let pdpt = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    let e = pdpt[pdpt_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // A 1 GiB leaf at PDPT level means there is no PD/PT below; the caller
+    // is asking us to clear a 4 KiB region inside a huge mapping, which we
+    // refuse rather than corrupting the leaf's phys range.
+    if e.0 & LARGE_PAGE_BIT != 0
+    {
+        return;
+    }
+    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    let pd = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    let e = pd[pd_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // Same guard at PD level for 2 MiB leaves.
+    if e.0 & LARGE_PAGE_BIT != 0
+    {
+        return;
+    }
+    // SAFETY: direct map active; phys + DIRECT_MAP_BASE yields valid kernel VA.
+    let pt = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    pt[pt_index(virt)] = PageTableEntry(0);
+
+    // Local invalidate, then broadcast to every other online CPU. The
+    // shootdown routine requires preemption disabled and handles the
+    // interrupt window for mutual shootdown itself.
+    // SAFETY: invlpg is a per-CPU architectural primitive; shootdown
+    // contract met by acquiring preemption around the broadcast.
+    unsafe { flush_page(virt) };
+
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let online_mask: u64 = if cpu_count >= 64
+    {
+        u64::MAX
+    }
+    else
+    {
+        (1u64 << cpu_count) - 1
+    };
+    let current = crate::arch::current::cpu::current_cpu();
+    let remote = online_mask & !(1u64 << current);
+    if remote != 0
+    {
+        crate::percpu::preempt_disable();
+        // SAFETY: root_pa is the active kernel PML4; remote mask covers
+        // only online CPUs; preemption disabled around the shootdown.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, remote, virt) };
+        crate::percpu::preempt_enable();
+    }
 }
 
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.

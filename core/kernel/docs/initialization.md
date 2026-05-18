@@ -285,7 +285,7 @@ boot-provided hardware resources.
 
 ---
 
-## Phase 8: Scheduler
+## Phase 8: Scheduler and SMP Bringup
 
 ```
 1. Initialise per-CPU run queues:
@@ -300,13 +300,33 @@ boot-provided hardware resources.
         checking for pending work before each halt
    c. Set the per-CPU current_thread pointer to the idle TCB
 3. Emit: "scheduler initialised, N CPUs"
+4. For each AP listed in BootInfo.cpu_ids[1..cpu_count]:
+   a. Patch per-AP startup parameters into the trampoline page
+   b. Send SIPI (x86-64) / SBI HSM hart_start (RISC-V)
+   c. Wait for APS_READY.fetch_add(1) before launching the next AP
+      (the Acquire load doubles as the barrier guaranteeing the AP has
+      jumped from the trampoline page to its kernel-VA entry)
+5. Tear down the low-VA identity mapping at the trampoline PA via
+   mm::paging::unmap_identity_page (TLB shootdown to all other CPUs).
+6. Mint a late-reclaim Frame cap over the trampoline page via
+   cap::mint_late_reclaim_frame_caps; the descriptor lands in
+   cspace_layout so init sees the cap through the standard CSpace
+   handoff in Phase 9.
 ```
 
-**Failure mode:** Allocation failure for any idle stack or TCB halts with
-"fatal: cannot initialise scheduler".
+APs depend only on Phase 5/8 state (interrupts, percpu, scheduler
+idle threads); they never touch init's address space or any Phase-9
+state, so SMP bringup completes within Phase 8 and the trampoline page
+is reclaim-safe by the time Phase 9 consumes `cspace_layout`.
 
-**Completion criterion:** Per-CPU scheduler state and idle threads are initialised
-for all CPUs.
+**Failure mode:** Allocation failure for any idle stack or TCB halts with
+"fatal: cannot initialise scheduler". `start_ap` failure for an
+individual AP is logged and skipped (that CPU stays offline).
+
+**Completion criterion:** Per-CPU scheduler state and idle threads are
+initialised for all CPUs, every AP has incremented `APS_READY`, the
+trampoline identity mapping is torn down, and its Frame cap is in init's
+CSpace descriptor table.
 
 ---
 
@@ -334,11 +354,15 @@ calls `sched::enter()`.
         adds it to the physical frame address at translation time
       - Apply permissions from segment.flags (Read → RO, ReadWrite → RW,
         ReadExecute → RX); W^X is enforced (ReadWrite cannot also be executable)
-4. Allocate init's user stack (AddressSpace::map_stack):
+4. Allocate init's user stack (inlined in `kernel_entry`):
    a. Allocate INIT_STACK_PAGES (4) frames from the buddy allocator
+      one at a time so each phys address is captured for the reclaim
+      Frame cap minted alongside it
    b. Zero each frame
    c. Map below INIT_STACK_TOP (0x7FFF_FFFF_E000) with read/write permissions
-   d. Guard page (unmapped) sits immediately below the stack; stack overflows fault
+   d. Mint a reclaimable Frame cap per stack page into the root CSpace
+      so init can donate the pages to memmgr on reap
+   e. Guard page (unmapped) sits immediately below the stack; stack overflows fault
 5. Create init's TCB:
    a. Allocate a kernel stack for init (KERNEL_STACK_PAGES = 4 pages = 16 KiB)
    b. new_state(entry=init_image.entry_point, stack_top=kstack_top, arg=0, is_user=true)
@@ -411,7 +435,7 @@ that CPU only; the BSP and other CPUs continue.
 | 5 | CPU hardware (IDT/GDT/TSS/stvec) | Halt: missing required feature |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads | Halt: OOM |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim | Halt: OOM (idle stack/TCB); start_ap failure per CPU is logged and skipped |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

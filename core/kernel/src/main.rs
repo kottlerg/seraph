@@ -22,7 +22,8 @@
 //!   mint reclaimable Frame caps over bootloader scratch pages (`BootInfo`,
 //!   descriptor arrays, transient PT frames) so they flow to userspace via the
 //!   standard `CapDescriptor` path.
-//! - Phase 8: initialise per-CPU scheduler state and per-CPU idle threads for all online CPUs.
+//! - Phase 8: initialise per-CPU scheduler state and idle threads, start APs,
+//!   and retire the AP trampoline identity mapping into a reclaimable Frame cap.
 //! - Phase 9: create init process address space + TCB; hand off root `CSpace`; enter user mode.
 
 #![cfg_attr(not(test), no_std)]
@@ -31,7 +32,7 @@
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 #[cfg(not(test))]
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 // ── AP ready counter ──────────────────────────────────────────────────────────
 
@@ -42,6 +43,22 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// to come online before entering the scheduler.
 #[cfg(not(test))]
 static APS_READY: AtomicU32 = AtomicU32::new(0);
+
+// ── Kernel-resident cmdline snapshot ──────────────────────────────────────────
+
+/// Maximum cmdline bytes the kernel retains. Matches the bootloader cap
+/// (`MAX_CMDLINE_LEN`); see `core/boot/src/main.rs` cmdline allocation. The
+/// snapshot lives in BSS so the bootloader's cmdline page becomes reclaim-safe
+/// at Phase 7 (the only later reader is the Phase-9 `InitInfo` copy, which
+/// sources from this buffer rather than the bootloader page).
+#[cfg(not(test))]
+const KERNEL_CMDLINE_MAX: usize = 512;
+
+#[cfg(not(test))]
+static mut KERNEL_CMDLINE: [u8; KERNEL_CMDLINE_MAX] = [0; KERNEL_CMDLINE_MAX];
+
+#[cfg(not(test))]
+static KERNEL_CMDLINE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 use boot_protocol::BootInfo;
 
@@ -199,6 +216,25 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // waste.
     kprintln!("Phase 4: Typed-Memory Cap Surface (no kernel heap)");
 
+    // Snapshot the cmdline from the bootloader-owned page into kernel BSS so
+    // the page itself is reclaim-safe by Phase 7. The Phase-9 InitInfo copy
+    // sources from `KERNEL_CMDLINE` rather than the bootloader page.
+    #[cfg(not(test))]
+    {
+        let n = cmdline_len.min(KERNEL_CMDLINE_MAX);
+        if n > 0 && cmdline_phys != 0
+        {
+            // SAFETY: direct map active since Phase 3; single-threaded boot;
+            // `KERNEL_CMDLINE` is exclusively written here before any reader.
+            unsafe {
+                let src = mm::paging::phys_to_virt(cmdline_phys) as *const u8;
+                let dst = core::ptr::addr_of_mut!(KERNEL_CMDLINE).cast::<u8>();
+                core::ptr::copy_nonoverlapping(src, dst, n);
+            }
+            KERNEL_CMDLINE_LEN.store(n, Ordering::Release);
+        }
+    }
+
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read
     // bootloader-discovered MMIO bases instead of compile-time defaults. This
     // is heap-free and depends only on the direct physical map (Phase 3).
@@ -265,9 +301,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 
     // ── Phase 7: capability system ─────────────────────────────────────────────
     // Initialises the root CSpace and mints initial capabilities for all
-    // boot-provided hardware resources.
+    // boot-provided hardware resources. `cspace_layout` is held `mut` so
+    // the post-SMP late-reclaim pass (after Phase 8) can append the AP
+    // trampoline cap to its descriptor table before Phase 9 consumes it.
     kprintln!("Phase 7: Capability System");
-    let cspace_layout = cap::init_capability_system(mmio_apertures, boot_info as u64);
+    let mut cspace_layout = cap::init_capability_system(mmio_apertures, boot_info as u64);
     kprintln!(
         "capability system initialised, {} slots populated",
         cspace_layout.total_populated
@@ -278,13 +316,115 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // cpu_count from BootInfo (populated by bootloader from ACPI MADT / DTB).
     // APs are not yet started; sched::init allocates idle threads for all CPUs
     // so AP startup can call sched::ap_enter without re-allocating.
-    kprintln!("Phase 8: Scheduler");
+    kprintln!("Phase 8: Scheduler and SMP Bringup");
     let cpu_count = sched::init(boot_cpu_count, allocator);
     kprintln!(
         "scheduler initialised, {} CPU{}",
         cpu_count,
         if cpu_count == 1 { "" } else { "s" }
     );
+
+    // SMP startup brings every AP online using the per-CPU idle threads
+    // `sched::init` just allocated. APs depend only on Phase 5/8 state
+    // (interrupts, percpu, scheduler idle threads); they never touch
+    // init's AS or any Phase-9 state. Each architecture implements
+    // `ap_trampoline::setup_trampoline` and `ap_trampoline::start_ap`
+    // behind the `arch::current` facade. APs enter their idle loops
+    // and increment `APS_READY`; the BSP's Acquire load on `APS_READY`
+    // doubles as the barrier guaranteeing every AP has jumped from the
+    // trampoline page to its kernel-VA entry, making the physical page
+    // safe to retire from the identity map immediately below.
+    #[cfg(not(test))]
+    {
+        let ap_count = (boot_cpu_count - 1) as usize;
+        if ap_count > 0
+        {
+            if trampoline_pa == 0
+            {
+                kprintln!("smp: no AP trampoline page — SMP disabled");
+            }
+            else
+            {
+                kprintln!("smp: starting {} AP(s)", ap_count);
+
+                // Copy/patch the trampoline code into the physical page.
+                // SAFETY: direct physical map active (Phase 3); trampoline_pa
+                // from BootInfo points to bootloader-allocated RWX page <1 MiB.
+                unsafe {
+                    arch::current::ap_trampoline::setup_trampoline(trampoline_pa);
+                }
+
+                let entry_fn = kernel_entry_ap as *const () as u64;
+
+                for cpu_idx in 1..=ap_count
+                {
+                    let hw_id = boot_cpu_ids[cpu_idx];
+                    // SAFETY: idle threads allocated in Phase 8 for all CPUs;
+                    // cpu_idx < boot_cpu_count validated by loop bound.
+                    let stack_top = unsafe { sched::idle_stack_top_for(cpu_idx) };
+
+                    // Arch-specific: write params + send SIPI / SBI hart_start.
+                    // SAFETY: trampoline setup complete above; all boot phases
+                    // (2-8) initialized; AP will use shared kernel state.
+                    let ok = unsafe {
+                        arch::current::ap_trampoline::start_ap(
+                            trampoline_pa,
+                            cpu_idx as u32,
+                            hw_id,
+                            entry_fn,
+                            stack_top,
+                        )
+                    };
+                    if !ok
+                    {
+                        kprintln!("smp: start_ap(cpu={}) failed", cpu_idx);
+                        continue;
+                    }
+
+                    while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
+                    {
+                        core::hint::spin_loop();
+                    }
+                }
+
+                kprintln!("smp: all {} AP(s) online", ap_count);
+            }
+        }
+    }
+
+    // With every AP executing at kernel virtual addresses, the low-VA
+    // identity-RWX mapping at `trampoline_pa` (installed in Phase 3 on
+    // both arches; required for the post-`csrw satp` / post-CR3-write
+    // instructions inside the trampoline to fetch correctly) is no
+    // longer reachable by any code path. Tear it down with a TLB
+    // shootdown across all online CPUs, then mint a reclaimable Frame
+    // cap over the page so it reaches init via the standard
+    // `CapDescriptor` walk.
+    #[cfg(not(test))]
+    if trampoline_pa != 0
+    {
+        // SAFETY: APS_READY-observed Acquire above guarantees no AP is
+        // still inside the trampoline page; preempt discipline is handled
+        // by `unmap_identity_page` internally.
+        unsafe {
+            mm::paging::unmap_identity_page(trampoline_pa);
+        }
+        // Re-resolve `BootInfo` through the direct physical map. The
+        // original `info` reference points to the bootloader's
+        // identity-mapped VA, which Phase 3 unmapped; reading through it
+        // here would page-fault. (Phase 7's `cap::init_capability_system`
+        // does the same translation when called with `boot_info as u64`.)
+        // SAFETY: direct map covers all RAM since Phase 3; boot_info
+        // physical address validated in Phase 0.
+        let info_dm = unsafe { &*(mm::paging::phys_to_virt(boot_info as u64) as *const BootInfo) };
+        // SAFETY: ROOT_CSPACE installed in Phase 7; trampoline page no
+        // longer mapped at its PA; single-threaded boot.
+        unsafe {
+            let cs = cap::root_cspace_mut()
+                .unwrap_or_else(|| fatal("late reclaim: ROOT_CSPACE missing"));
+            cap::mint_late_reclaim_frame_caps(cs, info_dm, &mut cspace_layout);
+        }
+    }
 
     // ── Phase 9: create and launch init ───────────────────────────────────────
     // Gated #[cfg(not(test))]: Phase 9 uses heap allocation and arch-specific
@@ -445,7 +585,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             let desc_count = desc_slice.len();
             let desc_byte_len = core::mem::size_of_val(desc_slice);
             let cmdline_start = descriptors_offset as usize + desc_byte_len;
-            let total_bytes = cmdline_start + cmdline_len;
+            let cmdline_snapshot_len = KERNEL_CMDLINE_LEN.load(Ordering::Acquire);
+            let total_bytes = cmdline_start + cmdline_snapshot_len;
             let info_pages = total_bytes.div_ceil(mm::PAGE_SIZE).max(1);
 
             // Allocate and map each page.
@@ -494,7 +635,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             }
             let info_base = page_ptrs[0];
 
-            let cmdline_copy_len = cmdline_len;
+            let cmdline_copy_len = cmdline_snapshot_len;
             let cmdline_off = if cmdline_copy_len > 0
             {
                 cmdline_start as u32
@@ -557,17 +698,20 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 written += chunk;
             }
 
-            // Copy kernel command line after the CapDescriptor array.
-            if cmdline_copy_len > 0 && cmdline_phys != 0
+            // Copy kernel command line after the CapDescriptor array. Source
+            // is the Phase-4 BSS snapshot in `KERNEL_CMDLINE`; the bootloader
+            // cmdline page is already a reclaimable Frame cap by now.
+            if cmdline_copy_len > 0
             {
-                let cmdline_src = mm::paging::phys_to_virt(cmdline_phys) as *const u8;
+                let cmdline_src = core::ptr::addr_of!(KERNEL_CMDLINE).cast::<u8>();
                 let mut written = 0usize;
                 while written < cmdline_copy_len
                 {
                     let offset = cmdline_start + written;
                     let chunk =
                         (mm::PAGE_SIZE - offset % mm::PAGE_SIZE).min(cmdline_copy_len - written);
-                    // SAFETY: offset within mapped region; cmdline_src is valid.
+                    // SAFETY: offset within mapped region; cmdline_src points
+                    // into kernel BSS valid through `KERNEL_CMDLINE_MAX` bytes.
                     unsafe {
                         let dst = info_ptr(&page_ptrs, offset);
                         core::ptr::copy_nonoverlapping(cmdline_src.add(written), dst, chunk);
@@ -929,69 +1073,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE / 1024) as u64,
         );
 
-        // ── SMP: start Application Processors ────────────────────────────────
-        // Arch-neutral: each architecture implements `ap_trampoline::setup_trampoline`
-        // and `ap_trampoline::start_ap` behind the `arch::current` facade.
-        // APs enter their idle loops and increment APS_READY. The BSP waits
-        // for all APs before entering the scheduler.
-        {
-            let ap_count = (boot_cpu_count - 1) as usize;
-            if ap_count > 0
-            {
-                if trampoline_pa == 0
-                {
-                    kprintln!("smp: no AP trampoline page — SMP disabled");
-                }
-                else
-                {
-                    kprintln!("smp: starting {} AP(s)", ap_count);
-
-                    // Copy/patch the trampoline code into the physical page.
-                    // SAFETY: direct physical map active (Phase 3); trampoline_pa
-                    // from BootInfo points to bootloader-allocated RWX page <1 MiB.
-                    unsafe {
-                        arch::current::ap_trampoline::setup_trampoline(trampoline_pa);
-                    }
-
-                    let entry_fn = kernel_entry_ap as *const () as u64;
-
-                    for cpu_idx in 1..=ap_count
-                    {
-                        let hw_id = boot_cpu_ids[cpu_idx];
-                        // SAFETY: idle threads allocated in Phase 8 for all CPUs;
-                        // cpu_idx < boot_cpu_count validated by loop bound.
-                        let stack_top = unsafe { sched::idle_stack_top_for(cpu_idx) };
-
-                        // Arch-specific: write params + send SIPI / SBI hart_start.
-                        // SAFETY: trampoline setup complete above; all boot phases
-                        // (2-8) initialized; AP will use shared kernel state.
-                        let ok = unsafe {
-                            arch::current::ap_trampoline::start_ap(
-                                trampoline_pa,
-                                cpu_idx as u32,
-                                hw_id,
-                                entry_fn,
-                                stack_top,
-                            )
-                        };
-                        if !ok
-                        {
-                            kprintln!("smp: start_ap(cpu={}) failed", cpu_idx);
-                            continue;
-                        }
-
-                        while APS_READY.load(Ordering::Acquire) < cpu_idx as u32
-                        {
-                            core::hint::spin_loop();
-                        }
-                    }
-
-                    kprintln!("smp: all {} AP(s) online", ap_count);
-                }
-            }
-        }
-
-        // Hand off to the scheduler. Never returns.
+        // Hand off to the scheduler. Never returns. APs are already
+        // idle (Phase 8 brought them online).
         sched::enter();
     }
 

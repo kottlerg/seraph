@@ -40,14 +40,20 @@
 /// v7: Added `reclaim_ranges: ReclaimSlice` so the bootloader can hand the
 ///     kernel a list of scratch pages (`BootInfo` page, module descriptor
 ///     array, memory-map entry array, MMIO aperture array, the
-///     reclaim-array page itself, and the bootloader's own transient
-///     page-table frames) that are safe to reclaim once the kernel's
-///     Phase-7 capability system has consumed them. The slice is backed
-///     by a dedicated 4 KiB scratch page; that page is itself the final
-///     entry in the array so the kernel reclaims it last. The kernel
-///     mints reclaimable Frame caps over each range inside
-///     `populate_cspace` so the pages reach userspace through the same
-///     `CapDescriptor` path as boot modules.
+///     reclaim-array page itself, the cmdline page, and the bootloader's
+///     own transient page-table frames) that are safe to reclaim once
+///     the kernel's Phase-7 capability system has consumed them. The
+///     slice is backed by a dedicated 4 KiB scratch page; that page is
+///     itself the final entry in the array so the kernel reclaims it
+///     last. The kernel mints reclaimable Frame caps over each range
+///     inside `populate_cspace` so the pages reach userspace through
+///     the same `CapDescriptor` path as boot modules.
+///     Renamed `ReclaimRange.reserved` to `ReclaimRange.flags` (no
+///     on-wire layout change); bit 0 ([`RECLAIM_FLAG_LATE`]) marks an
+///     entry as deferred to the kernel's post-SMP-bringup late-reclaim
+///     pass (the AP SIPI trampoline page is the only such entry
+///     today). All other bits remain reserved (producers MUST write
+///     zero).
 pub const BOOT_PROTOCOL_VERSION: u32 = 7;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
@@ -472,10 +478,19 @@ pub struct ReclaimRange
     pub phys_base: u64,
     /// Number of 4 KiB pages covered. Non-zero.
     pub page_count: u32,
-    /// Reserved for future per-entry flags (e.g. arch-specific liveness
-    /// hints). Producers MUST write zero; consumers MUST ignore.
-    pub reserved: u32,
+    /// Per-entry flags. See [`RECLAIM_FLAG_LATE`]. All other bits are
+    /// reserved; producers MUST write zero for them.
+    pub flags: u32,
 }
+
+/// `ReclaimRange.flags` bit: defer minting to a kernel-side "late reclaim"
+/// pass that runs after SMP bringup and any required identity-mapping
+/// teardown. Used today for the AP SIPI trampoline page: both supported
+/// arches (x86-64 and RISC-V) install a low-VA identity-RWX mapping over
+/// the trampoline page so the AP can continue fetching instructions at
+/// its PA after enabling paging, and the kernel must retire that mapping
+/// via TLB shootdown before handing the page to userspace as a Frame cap.
+pub const RECLAIM_FLAG_LATE: u32 = 1;
 
 /// Maximum number of [`ReclaimRange`] entries one 4 KiB reclaim-array page
 /// can hold. The bootloader allocates a dedicated 4 KiB page for the array

@@ -397,9 +397,17 @@ static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_D
 /// kernel-internal cap-identity storage. Returns the per-block
 /// (base, size) records ready for `populate_cspace` to mint Frame caps.
 ///
+/// After the drain completes, seeds [`crate::mm::kernel_pt_pool`] with
+/// most of the kernel reserve so the steady-state PT-growth path is
+/// cap-backed (sourced from a pool minted out of [`KERNEL_RESERVE_PAGES`])
+/// rather than drawing directly from the buddy. A small residue stays in
+/// the buddy for the `dealloc_object` → `free_range` reverse path's
+/// ledger arithmetic.
+///
 /// MUST run before any [`mint_phase7_body`] / [`boot_retype_aspace`] /
 /// [`boot_retype_cspace`] / `boot_retype_thread_slab` call against the
-/// seed.
+/// seed, and before any `map_user_page` consumer (the kernel PT pool
+/// must be live before Phase 9's init bootstrap maps run).
 ///
 /// # Safety
 /// Single-threaded Phase 7. Buddy active.
@@ -408,9 +416,23 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
 {
     use crate::mm::buddy::PAGE_SIZE as BUDDY_PAGE_SIZE;
 
-    /// Pages kept in the buddy for kernel-internal use (page tables, AP
-    /// kernel stacks, kernel heap residue). 16 MiB = 4096 pages.
-    const KERNEL_RESERVE_PAGES: usize = 4096;
+    /// Pages kept in the buddy for kernel-internal use after Phase 7.
+    /// PT growth now consumes from `mm::kernel_pt_pool` (seeded below
+    /// from `POOL_SEED_PAGES` of this reserve); the buddy keeps
+    /// `BUDDY_RESIDUE_PAGES` for two purposes:
+    ///
+    /// 1. **Phase 8 idle-thread kernel stacks**: `sched::init` allocates
+    ///    `MAX_CPUS × KERNEL_STACK_PAGES = 64 × 4 = 256` pages worst
+    ///    case (one per CPU at order 2).
+    /// 2. **Phase 9 `InitInfo` / stack pages**: bounded; ~30 pages.
+    /// 3. **`dealloc_object` → `free_range` reverse-ledger path** that
+    ///    returns reclaimable Frame caps to the buddy on teardown.
+    ///
+    /// 384 covers (1) + (2) with ~100 pages of slack; PT growth does not
+    /// touch the buddy on this path. 1024 + 384 = 1408 pages ≈ 5.5 MiB.
+    const POOL_SEED_PAGES: usize = 1024;
+    const BUDDY_RESIDUE_PAGES: usize = 384;
+    const KERNEL_RESERVE_PAGES: usize = POOL_SEED_PAGES + BUDDY_RESIDUE_PAGES;
 
     debug_assert!(out.len() >= MAX_DRAIN_BLOCKS);
 
@@ -469,6 +491,25 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         drained_pages,
         block_count,
         SEED_RESERVE_BYTES / 1024,
+    );
+
+    // Seed the kernel PT-frame pool from the residual buddy carve. This
+    // must run before any `map_user_page` consumer (the first is Phase
+    // 9's init bootstrap). The pool is the cap-backed source for
+    // intermediate page-table frames; the buddy keeps only
+    // `BUDDY_RESIDUE_PAGES` for `dealloc_object` → `free_range`
+    // ledger arithmetic.
+    // SAFETY: single-threaded Phase 7; drain has populated the buddy
+    // free list with up to KERNEL_RESERVE_PAGES; kernel_pt_pool::init
+    // takes its own LOCK internally.
+    unsafe {
+        crate::mm::kernel_pt_pool::init(POOL_SEED_PAGES);
+    }
+    let pool_remaining = crate::mm::kernel_pt_pool::remaining_pages();
+    crate::kprintln!(
+        "kernel_pt_pool: {} pages installed (buddy residue {})",
+        pool_remaining,
+        BUDDY_RESIDUE_PAGES,
     );
 
     block_count
@@ -1588,18 +1629,23 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
 ///
 /// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
 /// descriptor array, memory-map entry array, MMIO aperture array, the
-/// reclaim-array page itself, and the bootloader's transient page-table
-/// frames — and mints one reclaimable `FrameObject` cap per range with
-/// `owns_memory = true` and the full byte ledger. Each cap is inserted
-/// into the root `CSpace` and a matching `CapDescriptor` entry pushed
-/// into `layout.descriptors`, so the cap reaches init through the
-/// standard descriptor-table walk in the same shape boot-module caps
-/// take. Pages return to the buddy on cap teardown via the existing
-/// `dealloc_object` → `free_range` path.
+/// reclaim-array page itself, the cmdline page, and the bootloader's
+/// transient page-table frames — and mints one reclaimable `FrameObject`
+/// cap per range with `owns_memory = true` and the full byte ledger.
+/// Each cap is inserted into the root `CSpace` and a matching
+/// `CapDescriptor` entry pushed into `layout.descriptors`, so the cap
+/// reaches init through the standard descriptor-table walk in the same
+/// shape boot-module caps take. Pages return to the buddy on cap teardown
+/// via the existing `dealloc_object` → `free_range` path.
+///
+/// Entries marked [`boot_protocol::RECLAIM_FLAG_LATE`] are skipped here
+/// and minted later by [`mint_late_reclaim_frame_caps`] after SMP
+/// bringup completes (the AP SIPI trampoline is the only such entry
+/// today).
 ///
 /// Symmetric to [`mint_module_frame_caps`]; runs immediately after it.
-/// The kernel MUST NOT dereference any address inside a recorded range
-/// after this function returns.
+/// The kernel MUST NOT dereference any address inside a recorded
+/// non-late range after this function returns.
 ///
 /// Appends one [`CapDescriptor`] entry per reclaimed range; init walks
 /// the descriptor table to discover the caps. There is no dedicated
@@ -1609,6 +1655,46 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
 /// pool and userspace inspects each `CapDescriptor.aux0`/`aux1` to
 /// learn the underlying physical range.
 fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
+{
+    mint_reclaim_pass(cspace, boot_info, layout, false, "reclaim");
+}
+
+/// Mint reclaimable `Frame` capabilities for entries flagged
+/// [`boot_protocol::RECLAIM_FLAG_LATE`] in `boot_info.reclaim_ranges`.
+///
+/// Caller MUST have already (a) completed SMP bringup so no AP is
+/// executing inside any late-flagged page, and (b) torn down any kernel
+/// identity mapping that aliases the page (see
+/// [`crate::mm::paging::unmap_identity_page`]). The mint itself is
+/// identical to [`mint_reclaim_frame_caps`] — same `FrameObject`
+/// shape, same `register_owned_range` ledger entry, same descriptor
+/// push — so init discovers the cap through the standard descriptor
+/// walk.
+///
+/// Must run before Phase 9 consumes [`descriptors`] so the new entry
+/// reaches init via the same `CSpace` handoff.
+#[cfg(not(test))]
+pub(crate) fn mint_late_reclaim_frame_caps(
+    cspace: &mut CSpace,
+    boot_info: &BootInfo,
+    layout: &mut CSpaceLayout,
+)
+{
+    mint_reclaim_pass(cspace, boot_info, layout, true, "late reclaim");
+}
+
+/// Shared implementation backing both reclaim passes. `late` selects
+/// which subset to process: `false` mints all entries with the LATE flag
+/// clear, `true` mints only entries with the LATE flag set. `label`
+/// prefixes the diagnostic line so the two passes are distinguishable
+/// in the boot log.
+fn mint_reclaim_pass(
+    cspace: &mut CSpace,
+    boot_info: &BootInfo,
+    layout: &mut CSpaceLayout,
+    late: bool,
+    label: &str,
+)
 {
     use init_protocol::CapType;
 
@@ -1640,6 +1726,11 @@ fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
     for range in ranges
     {
         if range.page_count == 0
+        {
+            continue;
+        }
+        let is_late = range.flags & boot_protocol::RECLAIM_FLAG_LATE != 0;
+        if is_late != late
         {
             continue;
         }
@@ -1704,7 +1795,8 @@ fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
     {
         let total_after = crate::mm::with_frame_allocator(|alloc| alloc.total_page_count());
         crate::kprintln!(
-            "reclaim: minted {} Frame caps over {} scratch pages (total accounted {} → {})",
+            "{}: minted {} Frame caps over {} scratch pages (total accounted {} → {})",
+            label,
             count,
             pages_total,
             total_before,
@@ -1712,7 +1804,7 @@ fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         );
     }
     #[cfg(test)]
-    let _ = (total_before, pages_total);
+    let _ = (total_before, pages_total, label);
 }
 
 /// Cast `Box<T>` to `NonNull<KernelObjectHeader>` by leaking the box.

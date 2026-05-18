@@ -424,6 +424,31 @@ occupied), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
 
 ---
 
+## Label 17: `FS_TRUNCATE`
+
+Set a file's length. Token = file cap with `WRITE`.
+
+**Request**:
+
+| Field | Value |
+|---|---|
+| `label` | `FS_TRUNCATE` (17) |
+| `data[0]` | New length in bytes |
+
+**Reply (success)**: `label = 0`, empty body.
+
+v1 supports only `new_len == 0`; non-zero replies `IO_ERROR`. The
+wire shape is forward-compatible with later extend-with-zero-fill
+semantics, tracked by the post-#8 `ruststd::fs` completeness-gaps
+Issue. The truncate-to-zero path frees the entire FAT cluster chain
+and patches the directory entry's first-cluster + size fields to 0.
+
+**Errors**: `INVALID_TOKEN`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
+`IO_ERROR` (chain walk / `FSInfo` flush failure, or non-zero
+`new_len` until the v2 extend path lands).
+
+---
+
 ## Label 6: `END_OF_DIR`
 
 End-of-directory marker reused as a reply label by `NS_READDIR`. See

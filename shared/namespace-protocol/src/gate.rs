@@ -181,6 +181,10 @@ const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
         ipc::fs_labels::FS_RENAME,
         RightsRequirement::Bits(nz(rights::MUTATE_DIR)),
     ),
+    (
+        ipc::fs_labels::FS_TRUNCATE,
+        RightsRequirement::Bits(nz(rights::WRITE)),
+    ),
 ];
 
 fn required_rights_for(opcode: u64) -> Option<RightsRequirement>
@@ -333,6 +337,20 @@ mod tests
                 "label {label:#x} should reject without MUTATE_DIR"
             );
         }
+    }
+
+    #[test]
+    fn fs_truncate_gates_on_write_bit()
+    {
+        assert!(gate(ipc::fs_labels::FS_TRUNCATE, token_with(rights::WRITE)).is_ok());
+        assert_eq!(
+            gate(ipc::fs_labels::FS_TRUNCATE, token_with(rights::READ)),
+            Err(GateError::PermissionDenied)
+        );
+        assert_eq!(
+            gate(ipc::fs_labels::FS_TRUNCATE, token_with(rights::MUTATE_DIR)),
+            Err(GateError::PermissionDenied)
+        );
     }
 
     #[test]

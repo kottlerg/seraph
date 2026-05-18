@@ -989,10 +989,10 @@ unsafe fn step9_populate_boot_info(
     {
         push_reclaim(allocs.cmdline_phys, 1, 0);
     }
-    // AP SIPI trampoline page: deferred to kernel-side late reclaim after
-    // SMP bringup completes and the identity mapping is torn down (x86 only;
-    // RISC-V has no kernel identity map). The kernel mints this via
-    // `mint_late_reclaim_frame_caps` after `mm::paging::unmap_identity_page`.
+    // AP SIPI trampoline page: kernel mints this through the late-reclaim
+    // pass once SMP bringup completes and `mm::paging::unmap_identity_page`
+    // has retired the low-VA identity mapping (installed on both arches by
+    // the arch-neutral kernel page-table builder).
     if allocs.ap_trampoline_phys != 0
     {
         push_reclaim(allocs.ap_trampoline_phys, 1, RECLAIM_FLAG_LATE);

@@ -435,18 +435,21 @@ pub fn init_kernel_page_tables(
         }
     }
 
-    // ── AP trampoline identity mapping (x86-64 SMP) ──────────────────────────
+    // ── AP trampoline identity mapping (arch-neutral) ────────────────────────
     // Map the AP trampoline page at its physical address as a 4 KiB identity
-    // page (VA = PA). This allows APs to execute trampoline code immediately
-    // after enabling paging (CR3 = kernel PML4) in the PM32 → LM64 transition,
-    // before the first far jmp to the direct-map address.
+    // page (VA = PA). Both arches need this: on x86-64 the AP enables paging
+    // (writes CR3 = kernel PML4) during the PM32 → LM64 transition and must
+    // keep fetching trampoline instructions at their PA before the first far
+    // jmp to a kernel-VA target; on RISC-V the trampoline executes
+    // `csrw satp` and the next instructions (sfence.vma, mv sp, jr) likewise
+    // execute at the trampoline PA before the final `jr` lands at
+    // `kernel_entry_ap`'s kernel virtual address.
     //
-    // The trampoline page is physically < 1 MiB. The kernel's other mappings
-    // are at high virtual addresses (DIRECT_MAP_BASE, kernel image), so the
-    // low-VA identity mapping does not conflict.
-    //
-    // To add new low-VA trampoline pages: call map_page here with additional
-    // addresses. One 4 KiB page is sufficient for the SIPI startup sequence.
+    // The kernel's other mappings are at high virtual addresses
+    // (DIRECT_MAP_BASE, kernel image), so the low-VA identity mapping does
+    // not conflict. Once SMP bringup completes,
+    // `mm::paging::unmap_identity_page` (called in Phase 8) retires the
+    // mapping so the page can be reclaimed as a Frame cap.
     if info.ap_trampoline_page != 0
     {
         let tramp = info.ap_trampoline_page;

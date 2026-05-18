@@ -649,11 +649,17 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
 /// Intermediate tables are NOT freed — they may host other low-VA
 /// mappings (notably the boot-stack identity mapping installed by
 /// `mm/paging.rs:572-599` and any future low-PA identity entries).
+// similar_names: root_va and root_pa are a VA/PA pair — the similarity is
+// intentional and follows the pattern used elsewhere in this file.
 #[cfg(not(test))]
 #[allow(clippy::similar_names)]
 pub unsafe fn unmap_identity_page(pa: u64)
 {
     use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
+
+    // Sv48 leaf detection: any of R/W/X set on a present PTE.
+    const LEAF_BITS: u64 = READ | WRITE | EXECUTE;
+    let is_leaf = |e: PageTableEntry| e.0 & LEAF_BITS != 0;
 
     let root_pa = kernel_pml4_pa();
     if root_pa == 0
@@ -672,6 +678,12 @@ pub unsafe fn unmap_identity_page(pa: u64)
     {
         return;
     }
+    // Refuse to mis-clear inside a 512 GiB leaf at VPN[3]; the caller
+    // would corrupt unrelated memory if we treated it as a child table.
+    if is_leaf(e)
+    {
+        return;
+    }
     // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
     let l2 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
     let e = l2[vpn2_index(virt)];
@@ -679,10 +691,20 @@ pub unsafe fn unmap_identity_page(pa: u64)
     {
         return;
     }
+    // Same guard for a 1 GiB gigapage leaf at VPN[2].
+    if is_leaf(e)
+    {
+        return;
+    }
     // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
     let l1 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
     let e = l1[vpn1_index(virt)];
     if !e.is_present()
+    {
+        return;
+    }
+    // Same guard for a 2 MiB megapage leaf at VPN[1].
+    if is_leaf(e)
     {
         return;
     }

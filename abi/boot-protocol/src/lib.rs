@@ -485,9 +485,11 @@ pub struct ReclaimRange
 
 /// `ReclaimRange.flags` bit: defer minting to a kernel-side "late reclaim"
 /// pass that runs after SMP bringup and any required identity-mapping
-/// teardown. Used today for the AP SIPI trampoline page (x86 holds a
-/// kernel-installed identity-RWX mapping that must be retired via TLB
-/// shootdown before reclaim).
+/// teardown. Used today for the AP SIPI trampoline page: both supported
+/// arches (x86-64 and RISC-V) install a low-VA identity-RWX mapping over
+/// the trampoline page so the AP can continue fetching instructions at
+/// its PA after enabling paging, and the kernel must retire that mapping
+/// via TLB shootdown before handing the page to userspace as a Frame cap.
 pub const RECLAIM_FLAG_LATE: u32 = 1;
 
 /// Maximum number of [`ReclaimRange`] entries one 4 KiB reclaim-array page

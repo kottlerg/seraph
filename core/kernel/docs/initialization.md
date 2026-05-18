@@ -435,7 +435,7 @@ that CPU only; the BSP and other CPUs continue.
 | 5 | CPU hardware (IDT/GDT/TSS/stvec) | Halt: missing required feature |
 | 6 | Platform resource validation | Halt if entries pointer is null with non-zero count; bad entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM |
-| 8 | Scheduler + idle threads | Halt: OOM |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim | Halt: OOM (idle stack/TCB); start_ap failure per CPU is logged and skipped |
 | 9 | Init creation + scheduler entry (user mode) | Halt: invalid InitImage or OOM |
 
 ---

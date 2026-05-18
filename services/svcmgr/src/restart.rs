@@ -200,11 +200,20 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx, correlator: u32) ->
     rebind_death_notification(svc, ctx.deaths_eq, new_thread_cap, correlator)
 }
 
+/// svcmgr's attenuated `root_dir_cap` addresses the `/bin` subtree
+/// (init installs this via `NsPolicy::Subtree { path: b"/bin", … }`),
+/// so any absolute path stored in `ServiceEntry.vfs_path` for an
+/// ELF restart MUST start with this prefix and is stripped before
+/// being walked.
+const VFS_BIN_PREFIX: &str = "/bin/";
+
 /// Spawn a fresh instance of `svc` via procmgr. Branches on the recorded
-/// restart source: VFS path → walk svcmgr's `root_dir_cap` to the binary
-/// then `CREATE_FROM_FILE`; module cap → `CREATE_PROCESS`. After create,
-/// installs a `cap_copy` of svcmgr's root cap on the child via
-/// `CONFIGURE_NAMESPACE`. Returns `(process_handle, thread, child_token)`.
+/// restart source: VFS path → walk svcmgr's `root_dir_cap` (stripping
+/// the `/bin/` prefix because svcmgr's root is attenuated to `/bin`)
+/// to the binary, then `CREATE_FROM_FILE`; module cap →
+/// `CREATE_PROCESS`. After create, applies the per-service namespace
+/// policy recorded at registration via `CONFIGURE_NAMESPACE`.
+/// Returns `(process_handle, thread, child_token)`.
 fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64)>
 {
     // Allocate a fresh bootstrap token for this child.
@@ -232,16 +241,26 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
             let _ = syscall::cap_delete(tokened_creator);
             return None;
         };
-        let (file_cap, file_size) = match std::os::seraph::namespace_lookup_file(root_cap, path_str)
+        // svcmgr's root cap addresses `/bin`; the registered absolute
+        // path must be re-rooted to that subtree before the walk.
+        let Some(path_relative) = path_str.strip_prefix(VFS_BIN_PREFIX)
+        else
         {
-            Ok(p) => p,
-            Err(e) =>
-            {
-                std::os::seraph::log!("restart: NS_LOOKUP {path_str:?} failed: {e}");
-                let _ = syscall::cap_delete(tokened_creator);
-                return None;
-            }
+            std::os::seraph::log!("restart: vfs_path {path_str:?} outside /bin");
+            let _ = syscall::cap_delete(tokened_creator);
+            return None;
         };
+        let (file_cap, file_size) =
+            match std::os::seraph::namespace_lookup_file(root_cap, path_relative)
+            {
+                Ok(p) => p,
+                Err(e) =>
+                {
+                    std::os::seraph::log!("restart: NS_LOOKUP {path_relative:?} failed: {e}");
+                    let _ = syscall::cap_delete(tokened_creator);
+                    return None;
+                }
+            };
         IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
             .word(0, file_size)
             .cap(file_cap)
@@ -275,52 +294,141 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
     let process_handle = reply_caps[0];
     let thread_cap = reply_caps[1];
 
-    // Install a `cap_copy` of svcmgr's own root cap on the child. The
-    // restart-created child needs its own namespace cap installed
-    // explicitly because procmgr no longer holds a broadcast root.
-    // A failure here means the restarted service would boot without
-    // namespace authority, presenting to the operator as "running but
-    // broken" — destroy the partial child instead so the supervision
-    // loop retries on the next death tick.
-    let info = std::os::seraph::try_startup_info()?;
-    let root_cap = std::os::seraph::root_dir_cap();
-    if root_cap != 0
+    if !apply_namespace_policy(svc, process_handle, thread_cap, ctx)
     {
-        let Ok(ns_cap) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_SEND)
-        else
-        {
-            std::os::seraph::log!("restart: cap_copy of root for child failed");
-            destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
-            return None;
-        };
-        let ns_msg = IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE)
-            .cap(ns_cap)
-            .build();
-        // SAFETY: ctx.ipc_buf is the registered IPC buffer.
-        let ns_reply = unsafe { ipc::ipc_call(process_handle, &ns_msg, ctx.ipc_buf) };
-        // The kernel transferred the cap on the IPC regardless of the
-        // reply label; release svcmgr's source slot unconditionally.
-        let _ = syscall::cap_delete(ns_cap);
-        match ns_reply
-        {
-            Ok(r) if r.label == 0 =>
-            {}
-            Ok(r) =>
-            {
-                std::os::seraph::log!("restart: CONFIGURE_NAMESPACE returned {:#x}", r.label);
-                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
-                return None;
-            }
-            Err(_) =>
-            {
-                std::os::seraph::log!("restart: CONFIGURE_NAMESPACE syscall failed");
-                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
-                return None;
-            }
-        }
+        return None;
     }
 
     Some((process_handle, thread_cap, child_token))
+}
+
+/// Re-apply the namespace policy recorded at registration to a
+/// freshly-created (suspended) restart child.
+///
+/// * `NS_POLICY_NONE` → skip `CONFIGURE_NAMESPACE`; the child's
+///   `system_root_cap` stays zero (matches first-spawn shape).
+/// * `NS_POLICY_UNIVERSAL` → `cap_copy` of svcmgr's own root. NOTE
+///   that under the current init policy svcmgr itself runs with an
+///   attenuated `/bin`-rooted cap, so this variant hands the child
+///   the same attenuated cap — not the full system root. Today no
+///   registered service uses it. If a future service legitimately
+///   needs the full root after restart, init must hand svcmgr the
+///   universal cap (or a dedicated mint cap) so this branch can
+///   actually deliver one.
+/// * `NS_POLICY_SUBTREE` → walk svcmgr's root for the stored
+///   subtree path with the stored rights mask, hand the resulting
+///   directory cap to the child.
+///
+/// On any failure the partial child is destroyed and `false` is
+/// returned (caller treats handle as no longer usable).
+fn apply_namespace_policy(
+    svc: &ServiceEntry,
+    process_handle: u32,
+    thread_cap: u32,
+    ctx: &RestartCtx,
+) -> bool
+{
+    if svc.ns_policy_kind == ipc::svcmgr_labels::NS_POLICY_NONE
+    {
+        return true;
+    }
+
+    let root_cap = std::os::seraph::root_dir_cap();
+    if root_cap == 0
+    {
+        std::os::seraph::log!("restart: no root_dir_cap for CONFIGURE_NAMESPACE");
+        destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+        return false;
+    }
+    let Some(info) = std::os::seraph::try_startup_info()
+    else
+    {
+        std::os::seraph::log!("restart: no startup info for cap_copy");
+        destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+        return false;
+    };
+
+    let ns_cap = match svc.ns_policy_kind
+    {
+        ipc::svcmgr_labels::NS_POLICY_UNIVERSAL =>
+        {
+            let Ok(c) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_SEND)
+            else
+            {
+                std::os::seraph::log!("restart: cap_copy of root for child failed");
+                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+                return false;
+            };
+            c
+        }
+        ipc::svcmgr_labels::NS_POLICY_SUBTREE =>
+        {
+            let path = &svc.ns_subtree_path[..svc.ns_subtree_path_len as usize];
+            let Ok(path_str) = core::str::from_utf8(path)
+            else
+            {
+                std::os::seraph::log!("restart: ns_subtree_path not UTF-8");
+                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+                return false;
+            };
+            // svcmgr's root is itself attenuated to `/bin`; the
+            // subtree path is therefore relative to that node, so the
+            // stored path must start with `/bin/` and is stripped
+            // here exactly as in the ELF-load branch.
+            let Some(path_relative) = path_str.strip_prefix(VFS_BIN_PREFIX)
+            else
+            {
+                std::os::seraph::log!("restart: ns_subtree_path {path_str:?} outside /bin");
+                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+                return false;
+            };
+            match std::os::seraph::namespace_lookup_dir(
+                root_cap,
+                path_relative,
+                u64::from(svc.ns_subtree_rights),
+            )
+            {
+                Ok(c) => c,
+                Err(e) =>
+                {
+                    std::os::seraph::log!("restart: subtree walk {path_relative:?} failed: {e}");
+                    destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+                    return false;
+                }
+            }
+        }
+        _ =>
+        {
+            std::os::seraph::log!("restart: unknown ns_policy_kind");
+            destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+            return false;
+        }
+    };
+
+    let ns_msg = IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE)
+        .cap(ns_cap)
+        .build();
+    // SAFETY: ctx.ipc_buf is the registered IPC buffer.
+    let ns_reply = unsafe { ipc::ipc_call(process_handle, &ns_msg, ctx.ipc_buf) };
+    // The kernel transferred the cap on the IPC regardless of the
+    // reply label; release svcmgr's source slot unconditionally.
+    let _ = syscall::cap_delete(ns_cap);
+    match ns_reply
+    {
+        Ok(r) if r.label == 0 => true,
+        Ok(r) =>
+        {
+            std::os::seraph::log!("restart: CONFIGURE_NAMESPACE returned {:#x}", r.label);
+            destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+            false
+        }
+        Err(_) =>
+        {
+            std::os::seraph::log!("restart: CONFIGURE_NAMESPACE syscall failed");
+            destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+            false
+        }
+    }
 }
 
 /// Tear down a partially-created child: send `DESTROY_PROCESS` over its

@@ -63,17 +63,34 @@ When a restart is permitted:
    - VFS-loaded service (`vfs_path_len > 0`): walk svcmgr's own
      `root_dir_cap` (delivered at svcmgr's bootstrap via
      `procmgr_labels::CONFIGURE_NAMESPACE`) to the stored path → file
-     cap, then send `CREATE_FROM_FILE` to procmgr. No file cap is
-     persisted across restarts; the walk re-runs on every restart so
-     the latest binary on disk is always loaded.
+     cap, then send `CREATE_FROM_FILE` to procmgr. svcmgr's root is
+     itself attenuated by init to the `/bin` subtree, so the stored
+     absolute path is stripped of its `/bin/` prefix before the walk
+     (e.g. registered path `/bin/crasher` walks as `crasher`); any
+     vfs path outside `/bin` fails closed. No file cap is persisted
+     across restarts; the walk re-runs on every restart so the latest
+     binary on disk is always loaded.
 
    The two are mutually exclusive at registration time and surfaced via the
    `vfs_path_len` field in the `REGISTER_SERVICE` label (bits [32..48]).
 
-   After the create reply, send `procmgr_labels::CONFIGURE_NAMESPACE`
-   to the new process handle with a `cap_copy` of svcmgr's own
-   `root_dir_cap` so the restarted child inherits svcmgr's namespace
-   view (parent-inherit default).
+   After the create reply, re-apply the per-service namespace policy
+   recorded at registration via `procmgr_labels::CONFIGURE_NAMESPACE`:
+
+   - `NS_POLICY_NONE` → skip the IPC entirely; the child's
+     `system_root_cap` stays zero (matches first-spawn shape).
+   - `NS_POLICY_UNIVERSAL` → `cap_copy` of svcmgr's own root and
+     deliver. Because svcmgr's own root is `/bin`-rooted under the
+     current init policy, this hands the child the same `/bin`
+     subtree; no registered service uses this variant today.
+   - `NS_POLICY_SUBTREE` → walk svcmgr's root for the stored
+     subtree path (also `/bin/`-prefix-stripped) with the stored
+     rights mask, deliver the resulting directory cap.
+
+   The descriptor lives on `ServiceEntry` and is bumped to the wire
+   by `REGISTER_SERVICE`; see [ipc-interface.md](ipc-interface.md)
+   and `shared/ipc/src/lib.rs::svcmgr_labels::REGISTER_SERVICE` for
+   the layout.
 
 3. **Inject capabilities.** Using the child CSpace cap returned by procmgr,
    inject the stored restart recipe caps (e.g., log endpoint) into the new
@@ -103,6 +120,9 @@ For the initial implementation, the recipe consists of:
   - VFS path bytes — svcmgr re-walks `root_dir_cap` to the path on
     every restart and uses `CREATE_FROM_FILE`.
 - Log endpoint Send capability (injected into child CSpace)
+- Namespace-policy descriptor (`ns_policy_kind` + optional
+  `ns_subtree_path` + `ns_subtree_rights`) — svcmgr re-applies this
+  on every restart so attenuation survives a crash-restart cycle.
 
 Future services may require additional caps (procmgr endpoint, device
 endpoints, etc.), which can be added to the recipe as needed. The IPC cap

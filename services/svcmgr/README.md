@@ -28,14 +28,43 @@ svcmgr/
 ## Responsibilities
 
 - **Service registration** — accept service registrations from init during
-  bootstrap; record the service name, capability set, and restart policy
+  bootstrap; record the service name, capability set, restart policy, and
+  namespace-policy descriptor (`ns_policy_kind` / `ns_subtree_path` /
+  `ns_subtree_rights`)
 - **Health monitoring** — hold thread lifecycle notification capabilities for
   monitored services; detect crashes via async notifications
 - **Restart management** — on detected crash, request a restart through procmgr
-  with the service's recorded initial capability set
+  with the service's recorded initial capability set; re-apply the stored
+  namespace policy on every restart so attenuation survives crash cycles
 - **procmgr fallback** — if procmgr crashes, use raw syscall capabilities to
   recreate procmgr from its boot module, then resume normal service monitoring
 - **Shutdown** — coordinate ordered service shutdown when requested
+
+---
+
+## Namespace authority
+
+Init spawns svcmgr with a namespace cap attenuated to the `/bin`
+subtree at `LOOKUP|STAT|READ` rights (the precise mask the ELF
+loader needs to walk and read child binaries). All svcmgr-side path
+operations therefore start from a `/bin`-rooted cap:
+
+- **Restart-time binary lookup** — when a registered VFS-loaded
+  service crashes, svcmgr strips the `/bin/` prefix from the
+  registered `vfs_path` (`b"/bin/crasher"` → `b"crasher"`) and walks
+  its attenuated root. A registered path outside `/bin/` is rejected
+  fail-closed; the partial child is torn down before the supervision
+  loop retries.
+- **Restart-time `NS_POLICY_SUBTREE` re-application** — the same
+  `/bin/` strip applies to the stored subtree path; the walk uses
+  the stored rights mask. The recovered directory cap is delivered
+  to the restarted child via `procmgr_labels::CONFIGURE_NAMESPACE`.
+
+The descriptor consumed by both paths arrives on the
+`REGISTER_SERVICE` wire — see
+[shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) for the layout
+and [docs/restart-protocol.md](docs/restart-protocol.md) for the
+restart sequencing.
 
 ---
 

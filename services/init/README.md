@@ -76,13 +76,33 @@ Init's responsibilities are strictly bounded:
    [`services/logd/docs/handover-protocol.md`](../logd/docs/handover-protocol.md).
 
 7. **Spawn Phase 3 services from VFS** — svcmgr, crasher, pwrmgr,
-   usertest, hello, stdiotest are loaded by walking init's seed
-   system-root cap to `/bin/<name>`, then issuing
-   `procmgr_labels::CREATE_FROM_FILE` with the resolved file cap.
-   Each child receives a `cap_copy` of init's root via
-   `CONFIGURE_NAMESPACE` before start. See
-   [`docs/namespace-model.md`](../../docs/namespace-model.md) for the
-   namespace-cap distribution invariants.
+   logd, the per-arch RTC driver, timed, and usertest are loaded by
+   walking init's seed system-root cap to `/bin/<name>` and issuing
+   `procmgr_labels::CREATE_FROM_FILE`. Each spawn site picks a
+   namespace policy that init installs via
+   `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`:
+
+   | Service | Policy | Notes |
+   |---|---|---|
+   | `svcmgr` | `Subtree { /bin, LOOKUP\|STAT\|READ }` | Needs to re-walk for crashed-service binaries. |
+   | `usertest` | `Universal` + `cwd = /srv` | Exercises the namespace tests; demonstrates cwd delivery. |
+   | `crasher` | `None` | Intentional fault test; touches no FS. |
+   | `pwrmgr` | `None` | Owns `IoPortRange` / `SbiControl` / ACPI frames; no FS. |
+   | `logd` | `None` | Owns the master log endpoint and arch serial authority; no FS. |
+   | `timed` | `None` | Queries the svcmgr registry for `rtc.primary`; no FS. |
+   | `cmos-rtc` / `goldfish-rtc` | `None` | Hardware-only driver; serves a single RTC read. |
+
+   The `NsPolicy` enum and the `configure_child_namespace` helper
+   live in [`src/service.rs`](src/service.rs); the per-service
+   policies are also re-applied by svcmgr on every restart via the
+   descriptor carried in `REGISTER_SERVICE` (see
+   [`services/svcmgr/docs/restart-protocol.md`](../svcmgr/docs/restart-protocol.md)).
+   `hello` and `stdiotest` exist in `/bin/` as reserved binaries but
+   are not currently spawned by init; whoever wires them up should
+   start from `NsPolicy::None` and widen only as the binary's actual
+   needs require. See
+   [`docs/namespace-model.md`](../../docs/namespace-model.md) for
+   the underlying namespace-cap distribution invariants.
 
    pwrmgr is spawned before usertest so init can derive two SEND
    caps on pwrmgr's service endpoint — one with the

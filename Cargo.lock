@@ -467,6 +467,7 @@ dependencies = [
  "elf",
  "init-protocol",
  "ipc",
+ "namespace-protocol",
  "process-abi",
  "syscall",
  "syscall-abi",

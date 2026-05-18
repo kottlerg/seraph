@@ -53,6 +53,7 @@ const REGISTRY_CAPACITY: usize = 8;
 /// label bits [32..48]:
 ///   - module-loaded (`vfs_path_len` == 0): caps = [thread, module, optional bundle]
 ///   - VFS-loaded    (`vfs_path_len`  > 0): caps = [thread, optional bundle]
+#[allow(clippy::too_many_lines)]
 fn handle_register(
     msg: &IpcMessage,
     services: &mut [ServiceEntry; MAX_SERVICES],
@@ -97,6 +98,36 @@ fn handle_register(
     let vfs_path_word = bundle_name_len_word + 1 + bundle_name_words;
     let vfs_loaded = vfs_path_len > 0;
 
+    // Namespace-policy descriptor: one packed word at the tail, plus
+    // optional subtree-path bytes when kind == NS_POLICY_SUBTREE.
+    let vfs_path_words = vfs_path_len.div_ceil(8);
+    let ns_policy_word = vfs_path_word + vfs_path_words;
+    let ns_packed = msg.word(ns_policy_word);
+    let ns_policy_kind = (ns_packed & 0xFF) as u8;
+    let ns_subtree_path_len = ((ns_packed >> 16) & 0xFFFF) as usize;
+    let ns_subtree_rights = (ns_packed >> 32) as u32;
+    if !matches!(
+        ns_policy_kind,
+        ipc::svcmgr_labels::NS_POLICY_UNIVERSAL
+            | ipc::svcmgr_labels::NS_POLICY_NONE
+            | ipc::svcmgr_labels::NS_POLICY_SUBTREE,
+    )
+    {
+        return ipc::svcmgr_errors::INVALID_NAME;
+    }
+    if ns_subtree_path_len > ipc::MAX_PATH_LEN
+    {
+        return ipc::svcmgr_errors::INVALID_NAME;
+    }
+    if ns_policy_kind != ipc::svcmgr_labels::NS_POLICY_SUBTREE && ns_subtree_path_len > 0
+    {
+        return ipc::svcmgr_errors::INVALID_NAME;
+    }
+    if ns_policy_kind == ipc::svcmgr_labels::NS_POLICY_SUBTREE && ns_subtree_path_len == 0
+    {
+        return ipc::svcmgr_errors::INVALID_NAME;
+    }
+
     let recv_caps = msg.caps();
     let cap_count = recv_caps.len();
 
@@ -136,6 +167,17 @@ fn handle_register(
         read_path_bytes(msg, vfs_path_word, vfs_path_len, &mut vfs_path_buf);
     }
 
+    let mut ns_subtree_path_buf = [0u8; ipc::MAX_PATH_LEN];
+    if ns_subtree_path_len > 0
+    {
+        read_path_bytes(
+            msg,
+            ns_policy_word + 1,
+            ns_subtree_path_len,
+            &mut ns_subtree_path_buf,
+        );
+    }
+
     services[idx] = ServiceEntry {
         name,
         name_len: name_len as u8,
@@ -155,6 +197,10 @@ fn handle_register(
         active: true,
         bootstrap_token: 0,
         process_handle: 0,
+        ns_policy_kind,
+        ns_subtree_path_len: ns_subtree_path_len as u8,
+        ns_subtree_path: ns_subtree_path_buf,
+        ns_subtree_rights,
     };
 
     // If a bundle cap was sent alongside, stash it in the first bundle slot.

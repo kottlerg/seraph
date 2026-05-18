@@ -1205,8 +1205,13 @@ pub unsafe fn migrate_ready_thread(
 
     // Re-check under both locks: this is the only legal observation point
     // for cross-CPU state. The state could have moved to Running, Blocked,
-    // Stopped, or Exited since the unlocked read in the caller. If a
-    // remove_from_queue lost the race (TCB no longer on src), bail.
+    // Stopped, or Exited since the unlocked read in the caller.
+    //
+    // The `preferred_cpu == src_cpu` check relies on the invariant that
+    // for a Ready thread, `preferred_cpu` names the CPU whose run queue
+    // currently links it. Every cross-CPU placement site writes
+    // `preferred_cpu = dst_cpu` under the destination's scheduler.lock —
+    // `enqueue_and_wake`, `pull_unpinned_ready`, and this function.
     // SAFETY: tcb valid by caller contract.
     let (state, located_cpu, priority) =
         unsafe { ((*tcb).state, (*tcb).preferred_cpu as usize, (*tcb).priority) };
@@ -1225,7 +1230,17 @@ pub unsafe fn migrate_ready_thread(
     let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
     if !removed
     {
-        // Lost the race against another remove (dealloc, change_priority).
+        // Defensive heal — not a race. Under both scheduler locks no
+        // concurrent removal is possible (dealloc takes all CPU locks in
+        // ascending order; change_priority takes only the per-CPU lock).
+        // A false return here indicates an internal bookkeeping
+        // inconsistency (state == Ready and preferred_cpu == src_cpu but
+        // the TCB is not linked at its priority on src). Bail without
+        // touching dst rather than panicking.
+        debug_assert!(
+            removed,
+            "migrate_ready_thread: Ready + preferred_cpu match but no queue entry"
+        );
         // SAFETY: paired with lock_raw above; release hi first.
         unsafe { hi_sched.lock.unlock_raw(saved_hi) };
         // SAFETY: paired with lock_raw above.
@@ -1748,22 +1763,39 @@ pub unsafe fn schedule(requeue_current: bool)
 
                 if cross_cpu
                 {
-                    // Clear context_saved BEFORE handing off so the
-                    // destination CPU spins until this CPU's switch()
-                    // commits the saved register state. Without this clear
-                    // the destination would observe context_saved == 1 from
-                    // the thread's previous switch and dispatch with stale
-                    // registers.
+                    // Publication-protocol requirement (see
+                    // docs/scheduling-internals.md § Cross-CPU TCB
+                    // Ownership): clear `context_saved` BEFORE the cross-CPU
+                    // enqueue so the destination's Acquire spin holds until
+                    // this CPU's `switch()` commits the saved register
+                    // state. Skipping the clear would let the destination
+                    // observe a stale `context_saved == 1` from the
+                    // thread's previous switch and dispatch with the wrong
+                    // register file.
                     (*current)
                         .context_saved
                         .store(0, core::sync::atomic::Ordering::Relaxed);
                     (*current).state = ThreadState::Ready;
 
-                    // Release this CPU's sched lock so enqueue_and_wake can
-                    // acquire the target's lock without violating rule 4.
+                    // Pin preemption across the unlock / enqueue_and_wake /
+                    // relock window. We must drop the local scheduler lock
+                    // so `enqueue_and_wake` can acquire the target's
+                    // scheduler lock without violating Lock Hierarchy rule
+                    // 4 (ascending-CPU order). But unlock_raw restores the
+                    // saved interrupt state, so a timer tick firing in that
+                    // window would re-enter `timer_tick` → `schedule(true)`
+                    // on this CPU, observe `(*current).state == Ready`,
+                    // take the cross-CPU branch a second time, and
+                    // double-enqueue `current` on `aff`'s run queue —
+                    // corrupting the intrusive `run_queue_next` chain.
+                    // `preempt_disable` short-circuits the
+                    // `timer_tick`-side preemption check
+                    // (`percpu::preemption_disabled()` in `timer_tick`).
+                    crate::percpu::preempt_disable();
                     sched.lock.unlock_raw(saved_flags);
                     enqueue_and_wake(current, aff as usize, prio);
                     saved_flags = sched.lock.lock_raw();
+                    crate::percpu::preempt_enable();
                 }
                 else
                 {

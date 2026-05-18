@@ -614,10 +614,13 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// - **Ready** elsewhere: dequeued from its current CPU's run queue and
 ///   re-enqueued on the new target via `migrate_ready_thread`.
 /// - **Running** elsewhere: a reschedule-pending flag is set on the
-///   source CPU and a wakeup IPI is delivered there. The
+///   source CPU and a wakeup IPI is delivered there. The wakeup IPI
+///   handler does not itself call `schedule()`; the running thread
+///   observes the new affinity at its next `schedule()` entry
+///   (slice-expiry preemption, voluntary yield, or IPC block). The
 ///   affinity-vs-current-CPU check in `schedule()` then routes the
-///   re-enqueue cross-CPU on the next dispatch (bounded by one IPI
-///   latency, < one tick).
+///   re-enqueue cross-CPU to the new target. Worst-case latency is
+///   one time slice.
 /// - **Blocked / Stopped / Created**: the new affinity takes effect on
 ///   the next `enqueue_and_wake` via `select_target_cpu`.
 ///

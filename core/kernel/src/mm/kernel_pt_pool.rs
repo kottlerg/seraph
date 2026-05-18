@@ -12,11 +12,13 @@
 //! `KERNEL_RESERVE_PAGES` buddy carve, threaded onto an intrusive
 //! single-linked free list, and consumed without further buddy traffic.
 //!
-//! This closes the architectural-invariant gap noted in
-//! `crate::kernel_entry`: every kernel-owned page now traces to a
-//! cap-managed surface (here, the seed of this pool, which is sourced
-//! from `KERNEL_RESERVE_PAGES`; PR #91 leaves a 64-page buddy residue
-//! for the `dealloc_object` → `free_range` reverse path only).
+//! Backs the architectural invariant from `crate::kernel_entry`: PT
+//! frames for the legacy `map_user_page` path trace to a single
+//! cap-managed surface (the seed of this pool, sourced from
+//! `KERNEL_RESERVE_PAGES` at Phase 7). A small buddy residue stays
+//! behind for non-PT consumers (idle-thread kernel stacks, the
+//! `dealloc_object` → `free_range` reverse path); see
+//! `crate::cap::drain_and_install_seed` for the sizing rationale.
 //!
 //! The free list is intrusive: each free page's first 8 bytes (accessed
 //! via the direct physical map) hold the next-PA pointer, or 0 for the

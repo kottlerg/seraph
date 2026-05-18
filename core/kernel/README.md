@@ -46,6 +46,7 @@ kernel/
 │   │   ├── slab.rs             # Slab allocator for fixed-size kernel objects
 │   │   ├── size_class.rs       # General size-class allocator (heap)
 │   │   ├── address_space.rs    # Virtual address space objects and lifecycle
+│   │   ├── kernel_pt_pool.rs   # Cap-backed pool for intermediate PT frames
 │   │   └── tlb.rs              # TLB management, PCID/ASID allocation
 │   ├── cap/                    # Capability subsystem
 │   │   ├── mod.rs
@@ -167,8 +168,8 @@ boot info validation
                                             └─► platform resource validation
                                                     └─► capability system (cap)
                                                     └─► scheduler (sched)
-                                                            └─► init thread (cap + mm + sched)
-                                                                    └─► SMP bringup (arch + sched)
+                                                            └─► SMP bringup (arch + sched)
+                                                                    └─► init thread (cap + mm + sched)
 ```
 
 The kernel creates init's AddressSpace, CSpace, and Thread directly from the

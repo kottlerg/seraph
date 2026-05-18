@@ -250,14 +250,14 @@ impl AddressSpace
 
     /// Map `virt` → `phys` as a 4 KiB page with the given permission flags.
     ///
-    /// Acquires `pt_lock`, allocates missing intermediate page table frames
-    /// from the global frame allocator, and sends TLB shootdown IPIs if this
-    /// address space is active on other CPUs.
+    /// Acquires `pt_lock`, draws missing intermediate page-table frames
+    /// from [`crate::mm::kernel_pt_pool`] (seeded at Phase 7), and sends
+    /// TLB shootdown IPIs if this address space is active on other CPUs.
     ///
     /// Used by:
-    /// - [`map_segment`](Self::map_segment), [`map_stack`](Self::map_stack),
-    ///   and direct kernel callers (Phase 9 init bootstrap, [`sys_mmio_map`]
-    ///   for legacy MMIO mappings) — PT pages come from the kernel buddy.
+    /// - [`map_segment`](Self::map_segment) and direct kernel callers
+    ///   (Phase 9 init bootstrap, `sys_mmio_map` for legacy MMIO mappings)
+    ///   — PT pages come from `kernel_pt_pool`.
     /// - For userspace `sys_mem_map` against a retype-backed AS, see
     ///   [`map_page_pooled`](Self::map_page_pooled).
     ///

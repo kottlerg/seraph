@@ -40,14 +40,20 @@
 /// v7: Added `reclaim_ranges: ReclaimSlice` so the bootloader can hand the
 ///     kernel a list of scratch pages (`BootInfo` page, module descriptor
 ///     array, memory-map entry array, MMIO aperture array, the
-///     reclaim-array page itself, and the bootloader's own transient
-///     page-table frames) that are safe to reclaim once the kernel's
-///     Phase-7 capability system has consumed them. The slice is backed
-///     by a dedicated 4 KiB scratch page; that page is itself the final
-///     entry in the array so the kernel reclaims it last. The kernel
-///     mints reclaimable Frame caps over each range inside
-///     `populate_cspace` so the pages reach userspace through the same
-///     `CapDescriptor` path as boot modules.
+///     reclaim-array page itself, the cmdline page, and the bootloader's
+///     own transient page-table frames) that are safe to reclaim once
+///     the kernel's Phase-7 capability system has consumed them. The
+///     slice is backed by a dedicated 4 KiB scratch page; that page is
+///     itself the final entry in the array so the kernel reclaims it
+///     last. The kernel mints reclaimable Frame caps over each range
+///     inside `populate_cspace` so the pages reach userspace through
+///     the same `CapDescriptor` path as boot modules.
+///     Renamed `ReclaimRange.reserved` to `ReclaimRange.flags` (no
+///     on-wire layout change); bit 0 ([`RECLAIM_FLAG_LATE`]) marks an
+///     entry as deferred to the kernel's post-SMP-bringup late-reclaim
+///     pass (the AP SIPI trampoline page is the only such entry
+///     today). All other bits remain reserved (producers MUST write
+///     zero).
 pub const BOOT_PROTOCOL_VERSION: u32 = 7;
 
 // ── Memory map ───────────────────────────────────────────────────────────────

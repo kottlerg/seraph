@@ -22,7 +22,8 @@
 //!   mint reclaimable Frame caps over bootloader scratch pages (`BootInfo`,
 //!   descriptor arrays, transient PT frames) so they flow to userspace via the
 //!   standard `CapDescriptor` path.
-//! - Phase 8: initialise per-CPU scheduler state and per-CPU idle threads for all online CPUs.
+//! - Phase 8: initialise per-CPU scheduler state and idle threads, start APs,
+//!   and retire the AP trampoline identity mapping into a reclaimable Frame cap.
 //! - Phase 9: create init process address space + TCB; hand off root `CSpace`; enter user mode.
 
 #![cfg_attr(not(test), no_std)]
@@ -315,7 +316,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // cpu_count from BootInfo (populated by bootloader from ACPI MADT / DTB).
     // APs are not yet started; sched::init allocates idle threads for all CPUs
     // so AP startup can call sched::ap_enter without re-allocating.
-    kprintln!("Phase 8: Scheduler");
+    kprintln!("Phase 8: Scheduler and SMP Bringup");
     let cpu_count = sched::init(boot_cpu_count, allocator);
     kprintln!(
         "scheduler initialised, {} CPU{}",
@@ -323,21 +324,16 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         if cpu_count == 1 { "" } else { "s" }
     );
 
-    // ── SMP: start Application Processors ────────────────────────────────────
-    // Reordered out of Phase 9 (relative to PR #90) so the AP trampoline
-    // page is reclaim-safe before init's CSpace descriptor table is
-    // consumed. APs only depend on Phase 5/8 state (interrupts, percpu,
-    // scheduler idle threads) — never on Phase 9 / init AS — so this
-    // ordering is sound; verified by inspecting `kernel_entry_ap`.
-    //
-    // Arch-neutral: each architecture implements `ap_trampoline::setup_trampoline`
-    // and `ap_trampoline::start_ap` behind the `arch::current` facade.
-    // APs enter their idle loops and increment APS_READY. The BSP waits
-    // for each AP before proceeding; the Acquire load on APS_READY also
-    // guarantees the AP has left the trampoline page (the trampoline
-    // increments APS_READY only after jumping to `kernel_entry_ap` at a
-    // kernel virtual address) — making the underlying physical page safe
-    // to retire from the identity map below.
+    // SMP startup brings every AP online using the per-CPU idle threads
+    // `sched::init` just allocated. APs depend only on Phase 5/8 state
+    // (interrupts, percpu, scheduler idle threads); they never touch
+    // init's AS or any Phase-9 state. Each architecture implements
+    // `ap_trampoline::setup_trampoline` and `ap_trampoline::start_ap`
+    // behind the `arch::current` facade. APs enter their idle loops
+    // and increment `APS_READY`; the BSP's Acquire load on `APS_READY`
+    // doubles as the barrier guaranteeing every AP has jumped from the
+    // trampoline page to its kernel-VA entry, making the physical page
+    // safe to retire from the identity map immediately below.
     #[cfg(not(test))]
     {
         let ap_count = (boot_cpu_count - 1) as usize;
@@ -396,14 +392,14 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         }
     }
 
-    // ── Late reclaim: retire the AP trampoline identity mapping ──────────────
-    // With every AP now executing at kernel virtual addresses, the x86
-    // identity-RWX mapping at `trampoline_pa` (installed in Phase 3) is no
-    // longer reachable by any code path. Tear it down with a TLB shootdown
-    // across all online CPUs, then mint a reclaimable Frame cap over the
-    // page so it reaches init via the standard `CapDescriptor` walk.
-    // RISC-V's `unmap_identity_page` is a no-op (no kernel identity map
-    // for the trampoline); the late-reclaim mint still runs there.
+    // With every AP executing at kernel virtual addresses, the low-VA
+    // identity-RWX mapping at `trampoline_pa` (installed in Phase 3 on
+    // both arches; required for the post-`csrw satp` / post-CR3-write
+    // instructions inside the trampoline to fetch correctly) is no
+    // longer reachable by any code path. Tear it down with a TLB
+    // shootdown across all online CPUs, then mint a reclaimable Frame
+    // cap over the page so it reaches init via the standard
+    // `CapDescriptor` walk.
     #[cfg(not(test))]
     if trampoline_pa != 0
     {
@@ -1077,8 +1073,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             (sched::KERNEL_STACK_PAGES * mm::PAGE_SIZE / 1024) as u64,
         );
 
-        // Hand off to the scheduler. Never returns. (SMP startup ran
-        // between Phase 8 and Phase 9; APs are already idle.)
+        // Hand off to the scheduler. Never returns. APs are already
+        // idle (Phase 8 brought them online).
         sched::enter();
     }
 

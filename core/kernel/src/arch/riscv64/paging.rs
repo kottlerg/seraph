@@ -634,12 +634,90 @@ pub unsafe fn unmap_user_page(root_virt: u64, virt: u64)
 
 /// RISC-V counterpart to [`crate::mm::paging::unmap_identity_page`].
 ///
-/// No-op: the RISC-V AP trampoline runs pre-paging via SBI HSM
-/// `hart_start`, and the kernel never installs a low-VA identity mapping
-/// for the trampoline page. The trampoline page can be reclaimed
-/// directly once SMP bringup completes — no PTE teardown is required.
+/// Walks the kernel Sv48 root from `phys_to_virt(kernel_pml4_pa())` down
+/// to the VPN\[0\] leaf covering `pa` and clears the leaf entry. Bails
+/// silently if any intermediate level is absent. Issues a local
+/// `sfence.vma pa, x0`, then broadcasts a TLB shootdown to every other
+/// online hart.
+///
+/// The kernel installs this identity mapping in Phase 3 (arch-neutral
+/// `mm/paging.rs`) so the AP trampoline page can execute the four
+/// instructions after `csrw satp` (sfence.vma, mv sp, jr) while PC is
+/// still inside the trampoline at its physical address. Once the AP has
+/// reached its kernel-VA entry, the mapping is no longer needed.
+///
+/// Intermediate tables are NOT freed — they may host other low-VA
+/// mappings (notably the boot-stack identity mapping installed by
+/// `mm/paging.rs:572-599` and any future low-PA identity entries).
 #[cfg(not(test))]
-pub unsafe fn unmap_identity_page(_pa: u64) {}
+#[allow(clippy::similar_names)]
+pub unsafe fn unmap_identity_page(pa: u64)
+{
+    use crate::mm::paging::{kernel_pml4_pa, phys_to_virt};
+
+    let root_pa = kernel_pml4_pa();
+    if root_pa == 0
+    {
+        return;
+    }
+    let root_va = phys_to_virt(root_pa);
+    let virt = pa; // identity: VA == PA
+
+    // SAFETY: root_va is the direct-map VA of the kernel Sv48 root
+    // installed in Phase 3; table walk is read-only until the leaf
+    // clear at the bottom.
+    let root = unsafe { table_at(root_va) };
+    let e = root[vpn3_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
+    let l2 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    let e = l2[vpn2_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
+    let l1 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    let e = l1[vpn1_index(virt)];
+    if !e.is_present()
+    {
+        return;
+    }
+    // SAFETY: e.phys_addr() extracted from present PTE; phys_to_virt yields direct-map VA.
+    let l0 = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+    l0[vpn0_index(virt)] = PageTableEntry(0);
+
+    // Local invalidate, then broadcast to every other online hart. The
+    // shootdown routine requires preemption disabled and handles the
+    // interrupt window for mutual shootdown itself.
+    // SAFETY: sfence.vma is a per-hart architectural primitive; shootdown
+    // contract met by acquiring preemption around the broadcast.
+    unsafe { flush_page(virt) };
+
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    let online_mask: u64 = if cpu_count >= 64
+    {
+        u64::MAX
+    }
+    else
+    {
+        (1u64 << cpu_count) - 1
+    };
+    let current = crate::arch::current::cpu::current_cpu();
+    let remote = online_mask & !(1u64 << current);
+    if remote != 0
+    {
+        crate::percpu::preempt_disable();
+        // SAFETY: root_pa is the active kernel Sv48 root; remote mask
+        // covers only online harts; preemption disabled around the
+        // shootdown.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, remote, virt) };
+        crate::percpu::preempt_enable();
+    }
+}
 
 /// Change the permission flags on an existing user-space leaf PTE at `virt`.
 ///

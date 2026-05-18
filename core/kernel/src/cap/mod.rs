@@ -419,11 +419,19 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     /// Pages kept in the buddy for kernel-internal use after Phase 7.
     /// PT growth now consumes from `mm::kernel_pt_pool` (seeded below
     /// from `POOL_SEED_PAGES` of this reserve); the buddy keeps
-    /// `BUDDY_RESIDUE_PAGES` only for the `dealloc_object` →
-    /// `free_range` reverse-ledger path. 1024 + 64 = 1088 pages ≈
-    /// 4.25 MiB, down from PR #90's 4096 (16 MiB).
+    /// `BUDDY_RESIDUE_PAGES` for two purposes:
+    ///
+    /// 1. **Phase 8 idle-thread kernel stacks**: `sched::init` allocates
+    ///    `MAX_CPUS × KERNEL_STACK_PAGES = 64 × 4 = 256` pages worst
+    ///    case (one per CPU at order 2).
+    /// 2. **Phase 9 `InitInfo` / stack pages**: bounded; ~30 pages.
+    /// 3. **`dealloc_object` → `free_range` reverse-ledger path** that
+    ///    returns reclaimable Frame caps to the buddy on teardown.
+    ///
+    /// 384 covers (1) + (2) with ~100 pages of slack; PT growth does not
+    /// touch the buddy on this path. 1024 + 384 = 1408 pages ≈ 5.5 MiB.
     const POOL_SEED_PAGES: usize = 1024;
-    const BUDDY_RESIDUE_PAGES: usize = 64;
+    const BUDDY_RESIDUE_PAGES: usize = 384;
     const KERNEL_RESERVE_PAGES: usize = POOL_SEED_PAGES + BUDDY_RESIDUE_PAGES;
 
     debug_assert!(out.len() >= MAX_DRAIN_BLOCKS);
@@ -1651,17 +1659,17 @@ fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
     mint_reclaim_pass(cspace, boot_info, layout, false, "reclaim");
 }
 
-/// Mint reclaimable `Frame` capabilities for ranges deferred from
-/// [`mint_reclaim_frame_caps`] because they were still in use at the end
-/// of Phase 7.
+/// Mint reclaimable `Frame` capabilities for entries flagged
+/// [`boot_protocol::RECLAIM_FLAG_LATE`] in `boot_info.reclaim_ranges`.
 ///
-/// Caller MUST have already (a) completed SMP bringup so no AP is still
-/// executing inside any late-flagged page and (b) torn down any kernel
+/// Caller MUST have already (a) completed SMP bringup so no AP is
+/// executing inside any late-flagged page, and (b) torn down any kernel
 /// identity mapping that aliases the page (see
 /// [`crate::mm::paging::unmap_identity_page`]). The mint itself is
-/// identical to the early pass — same `FrameObject` shape, same
-/// `register_owned_range` ledger entry, same descriptor push — so init
-/// discovers the cap through the standard descriptor walk.
+/// identical to [`mint_reclaim_frame_caps`] — same `FrameObject`
+/// shape, same `register_owned_range` ledger entry, same descriptor
+/// push — so init discovers the cap through the standard descriptor
+/// walk.
 ///
 /// Must run before Phase 9 consumes [`descriptors`] so the new entry
 /// reaches init via the same `CSpace` handoff.

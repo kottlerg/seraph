@@ -475,10 +475,9 @@ pub fn init_kernel_page_tables(
 ///
 /// Used to retire the AP-trampoline identity mapping after SMP bringup
 /// completes. The walk only clears the leaf PTE; intermediate tables are
-/// left in place because they may host other low-VA identity mappings
-/// (e.g. future trampoline pages). A no-op on architectures that do not
-/// install a kernel identity mapping (RISC-V trampolines run pre-paging
-/// via SBI HSM `hart_start`).
+/// left in place because they host other live low-VA mappings — notably
+/// the boot-stack identity mapping installed by `init_kernel_page_tables`
+/// — and freeing them would corrupt unrelated live state.
 ///
 /// # Safety
 /// `pa` must be 4 KiB-aligned. No thread (BSP or AP) may execute code on

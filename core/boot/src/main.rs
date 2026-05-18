@@ -938,10 +938,10 @@ unsafe fn step9_populate_boot_info(
     bprintln!(" derived");
 
     // Build the reclaim-after-Phase-7 array in the dedicated 4 KiB page at
-    // `allocs.reclaim_array_phys`. Cmdline and AP trampoline are absent —
-    // their last consumers run inside Phase 9, after `populate_cspace`
-    // returns. The reclaim-array page is itself recorded as the final
-    // entry so the kernel reclaims it last.
+    // `allocs.reclaim_array_phys`. AP trampoline is handled by kernel-side
+    // late reclaim after SMP bringup (see `mint_late_reclaim_frame_caps`);
+    // every other bootloader scratch page lands here. The reclaim-array page
+    // is itself recorded as the final entry so the kernel reclaims it last.
     // SAFETY: reclaim_array_phys is a valid 4 KiB allocation; we treat it as
     // a fixed-size array of MAX_RECLAIM_RANGES entries (256 × 16 B = 4 KiB).
     let reclaim_ranges: &mut [ReclaimRange; MAX_RECLAIM_RANGES] =
@@ -982,6 +982,12 @@ unsafe fn step9_populate_boot_info(
     for &frame in page_table.allocated_frames()
     {
         push_reclaim(frame, 1);
+    }
+    // Cmdline page: contents are snapshotted by the kernel into BSS in
+    // Phase 4, so the bootloader page becomes reclaim-safe by Phase 7.
+    if allocs.cmdline_phys != 0
+    {
+        push_reclaim(allocs.cmdline_phys, 1);
     }
     // The reclaim-array page itself is reclaim-safe once the kernel has
     // walked it — record it last so the kernel processes it in order.

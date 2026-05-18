@@ -14,14 +14,11 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   host-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -45,7 +42,7 @@ jobs:
         arch: [x86_64, riscv64]
         profile: [debug, release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install QEMU and firmware
         run: |
@@ -112,7 +109,7 @@ jobs:
 
       - name: Upload run-parallel logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}
           path: target/xtask/run-parallel/**/*.log

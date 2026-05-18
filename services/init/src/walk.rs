@@ -3,14 +3,24 @@
 
 // init/src/walk.rs
 
-//! No-std namespace walk helper for init.
+//! No-std namespace walk helpers for init.
 //!
 //! Init holds a tokened SEND on vfsd's namespace endpoint (the seed
 //! cap obtained from `vfsd_labels::GET_SYSTEM_ROOT_CAP`) and uses it to
-//! resolve binary paths into per-file caps before issuing
-//! `procmgr_labels::CREATE_FROM_FILE`. Mirrors the per-component
-//! `NS_LOOKUP` walk std performs in `runtime/ruststd/src/sys/fs/seraph.rs`,
-//! reduced to `no_std` primitives.
+//!
+//!   * resolve binary paths into per-file caps before issuing
+//!     `procmgr_labels::CREATE_FROM_FILE` ([`walk_to_file`]);
+//!   * derive attenuated subtree / cwd caps to install on children via
+//!     `procmgr_labels::CONFIGURE_NAMESPACE` ([`walk_to_dir`]).
+//!
+//! Both helpers mirror the per-component `NS_LOOKUP` walk std performs
+//! in `runtime/ruststd/src/sys/fs/seraph.rs`, reduced to `no_std`
+//! primitives. `requested_rights` is the rights mask sent on every
+//! intermediate hop; namespace-protocol intersects it against each
+//! entry's `max_rights`, so the returned cap carries at most
+//! `requested_rights` on every bit. Callers wanting "everything
+//! permitted" pass `0xFFFF` (the sentinel that selects each entry's
+//! full `max_rights`).
 
 use ipc::{IpcMessage, ns_labels};
 
@@ -24,21 +34,79 @@ pub struct WalkedFile
     pub size: u64,
 }
 
-/// Walk `path` from `root_cap` via per-component `NS_LOOKUP`. Each
-/// non-final hop must resolve to a directory; the final hop must
-/// resolve to a file.
+/// Walk `path` from `root_cap` requesting `requested_rights` per hop
+/// and return the resolved file cap.
+///
+/// Each non-final hop must resolve to a directory; the final hop must
+/// resolve to a file (kind 0).
 ///
 /// Returns `None` on any failure. On error, any partially-derived cap
 /// the helper owns is `cap_delete`d before returning.
-pub fn walk_to_file(root_cap: u32, path: &[u8], ipc_buf: *mut u64) -> Option<WalkedFile>
+pub fn walk_to_file(
+    root_cap: u32,
+    path: &[u8],
+    requested_rights: u64,
+    ipc_buf: *mut u64,
+) -> Option<WalkedFile>
+{
+    let WalkResult { cap, kind, size } = walk(root_cap, path, requested_rights, ipc_buf)?;
+    if kind != 0
+    {
+        let _ = syscall::cap_delete(cap);
+        return None;
+    }
+    Some(WalkedFile {
+        file_cap: cap,
+        size,
+    })
+}
+
+/// Walk `path` from `root_cap` requesting `requested_rights` per hop
+/// and return the resolved directory cap.
+///
+/// Every hop (including the final) must resolve to a directory
+/// (kind 1). Used to derive attenuated subtree / cwd caps for
+/// `CONFIGURE_NAMESPACE`.
+///
+/// Returns `None` on any failure. On error, any partially-derived cap
+/// the helper owns is `cap_delete`d before returning.
+pub fn walk_to_dir(
+    root_cap: u32,
+    path: &[u8],
+    requested_rights: u64,
+    ipc_buf: *mut u64,
+) -> Option<u32>
+{
+    let WalkResult { cap, kind, .. } = walk(root_cap, path, requested_rights, ipc_buf)?;
+    if kind != 1
+    {
+        let _ = syscall::cap_delete(cap);
+        return None;
+    }
+    Some(cap)
+}
+
+struct WalkResult
+{
+    cap: u32,
+    kind: u64,
+    size: u64,
+}
+
+/// Shared per-component walk used by [`walk_to_file`] and [`walk_to_dir`].
+/// Returns the cap, kind, and size hint reported by the final hop.
+/// Refuses empty paths (an empty walk would hand back the caller's
+/// own input cap, which the helper does not own).
+fn walk(root_cap: u32, path: &[u8], requested_rights: u64, ipc_buf: *mut u64)
+-> Option<WalkResult>
 {
     let mut current_cap = root_cap;
     let mut current_owns = false;
+    let mut last_kind: u64 = 0;
     let mut size_hint: u64 = 0;
+    let mut hop_count: usize = 0;
 
     let mut iter = PathComponents::new(path);
-    let mut last_kind: u64 = 0;
-    let mut hop_count: usize = 0;
     while let Some(name) = iter.next_component()
     {
         if name.is_empty() || name.len() > 255
@@ -61,7 +129,7 @@ pub fn walk_to_file(root_cap: u32, path: &[u8], ipc_buf: *mut u64) -> Option<Wal
 
         let label = ns_labels::NS_LOOKUP | ((name.len() as u64) << 16);
         let msg = IpcMessage::builder(label)
-            .word(0, 0xFFFF)
+            .word(0, requested_rights)
             .bytes(1, name)
             .build();
 
@@ -112,15 +180,9 @@ pub fn walk_to_file(root_cap: u32, path: &[u8], ipc_buf: *mut u64) -> Option<Wal
         return None;
     }
 
-    // Final hop must address a file (kind 0 per namespace-protocol).
-    if last_kind != 0
-    {
-        let _ = syscall::cap_delete(current_cap);
-        return None;
-    }
-
-    Some(WalkedFile {
-        file_cap: current_cap,
+    Some(WalkResult {
+        cap: current_cap,
+        kind: last_kind,
         size: size_hint,
     })
 }

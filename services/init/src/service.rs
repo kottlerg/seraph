@@ -18,6 +18,32 @@ use crate::walk;
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
+/// Per-spawn namespace-cap policy for [`configure_child_namespace`].
+///
+/// The variants encode the three shapes a child's `system_root_cap`
+/// can take: a `cap_copy` of the spawner's seed root, a walked-and-
+/// attenuated subtree, or nothing at all. The descriptor is also
+/// carried in `ServiceRegistration` so svcmgr can re-apply the same
+/// policy on restart (see `services/svcmgr/src/restart.rs`).
+#[derive(Clone, Copy)]
+pub enum NsPolicy<'a>
+{
+    /// Hand the child a `cap_copy` of `system_root_cap` at full
+    /// rights. Equivalent to the pre-attenuation default.
+    Universal,
+    /// Walk `path` from `system_root_cap` requesting `rights` per
+    /// hop, then hand the resulting directory cap to the child. The
+    /// path is bytes; `b"/bin"` etc.
+    Subtree
+    {
+        path: &'a [u8], rights: u64
+    },
+    /// Do not call `CONFIGURE_NAMESPACE` at all. The child's
+    /// `system_root_cap` stays zero; std-side absolute-path fs ops
+    /// return `Unsupported`.
+    None,
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn derive_tokened_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
@@ -28,33 +54,106 @@ fn derive_tokened_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
 }
 
 /// Issue `procmgr_labels::CONFIGURE_NAMESPACE` on a freshly-created
-/// (suspended) child, handing it a `cap_copy` of init's seed
-/// system-root cap. On any failure the partial child is destroyed
-/// (`DESTROY_PROCESS` on `process_handle`, then `cap_delete`) so a
-/// false return tells callers the handle is no longer usable. Callers
-/// holding additional caps from the same CREATE reply (e.g. a separate
-/// thread cap) remain responsible for releasing those.
+/// (suspended) child according to `policy` and the optional `cwd`.
+///
+/// * `policy` selects the shape of the child's `system_root_cap`:
+///   universal copy of `system_root_cap`, an attenuated subtree
+///   walked from it, or no cap at all.
+/// * `cwd`, when `Some`, walks `(path, rights)` from `system_root_cap`
+///   and delivers the resulting directory cap as `caps[1]` so the
+///   child's `current_dir_cap` is non-zero from the first instruction.
+///
+/// `NsPolicy::None` with `cwd = None` skips the IPC entirely
+/// (procmgr's default leaves both `ProcessInfo` slots at zero).
+/// `NsPolicy::None` with `cwd = Some(_)` is rejected by procmgr
+/// (`root_cap == 0` is `INVALID_ARGUMENT`); callers MUST pair a cwd
+/// with at least `Universal` or `Subtree`.
+///
+/// On any failure the partial child is destroyed (`DESTROY_PROCESS`
+/// on `process_handle`, then `cap_delete`) so a false return tells
+/// callers the handle is no longer usable. Callers holding additional
+/// caps from the same CREATE reply (e.g. a separate thread cap)
+/// remain responsible for releasing those.
 fn configure_child_namespace(
     process_handle: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
+    policy: NsPolicy<'_>,
+    cwd: Option<(&[u8], u64)>,
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let Ok(ns_cap) = syscall::cap_copy(system_root_cap, init_self_cspace, syscall::RIGHTS_SEND)
+    let ns_cap = match policy
+    {
+        NsPolicy::None =>
+        {
+            if cwd.is_some()
+            {
+                // cwd without root is unrepresentable on the wire
+                // (procmgr enforces root_cap != 0). Treat as a
+                // caller bug.
+                log("phase 3: NsPolicy::None with cwd is invalid");
+                destroy_partial_child(process_handle, ipc_buf);
+                return false;
+            }
+            return true;
+        }
+        NsPolicy::Universal =>
+        {
+            let Ok(c) = syscall::cap_copy(system_root_cap, init_self_cspace, syscall::RIGHTS_SEND)
+            else
+            {
+                log("phase 3: cap_copy of system root for child failed");
+                destroy_partial_child(process_handle, ipc_buf);
+                return false;
+            };
+            c
+        }
+        NsPolicy::Subtree { path, rights } =>
+        {
+            let Some(c) = walk::walk_to_dir(system_root_cap, path, rights, ipc_buf)
+            else
+            {
+                log("phase 3: subtree walk for child namespace failed");
+                destroy_partial_child(process_handle, ipc_buf);
+                return false;
+            };
+            c
+        }
+    };
+
+    let cwd_cap = if let Some((path, rights)) = cwd
+    {
+        let Some(c) = walk::walk_to_dir(system_root_cap, path, rights, ipc_buf)
+        else
+        {
+            log("phase 3: cwd walk for child failed");
+            let _ = syscall::cap_delete(ns_cap);
+            destroy_partial_child(process_handle, ipc_buf);
+            return false;
+        };
+        c
+    }
     else
     {
-        log("phase 3: cap_copy of system root for child failed");
-        destroy_partial_child(process_handle, ipc_buf);
-        return false;
+        0
     };
-    let ns_msg = IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE)
-        .cap(ns_cap)
-        .build();
+
+    let mut builder = IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE).cap(ns_cap);
+    if cwd_cap != 0
+    {
+        builder = builder.cap(cwd_cap);
+    }
+    let ns_msg = builder.build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(process_handle, &ns_msg, ipc_buf) };
-    // The kernel transferred the cap on the IPC; release init's source slot.
+    // The kernel transferred the caps on the IPC; release init's
+    // source slots unconditionally.
     let _ = syscall::cap_delete(ns_cap);
+    if cwd_cap != 0
+    {
+        let _ = syscall::cap_delete(cwd_cap);
+    }
     match reply
     {
         Ok(r) if r.label == 0 => true,
@@ -615,7 +714,7 @@ pub fn create_and_start_pwrmgr(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    let walked = walk::walk_to_file(system_root_cap, b"/bin/pwrmgr", ipc_buf)?;
+    let walked = walk::walk_to_file(system_root_cap, b"/bin/pwrmgr", 0xFFFF, ipc_buf)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -654,7 +753,17 @@ pub fn create_and_start_pwrmgr(
         let _ = syscall::cap_delete(reply_caps[1]);
     }
 
-    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    // pwrmgr's only surface is the gated SHUTDOWN/REBOOT IPC; it
+    // owns IoPortRange/SbiControl/ACPI frames directly and never
+    // touches the filesystem. Spawn with no namespace cap.
+    if !configure_child_namespace(
+        process_handle,
+        system_root_cap,
+        init_self_cspace,
+        NsPolicy::None,
+        None,
+        ipc_buf,
+    )
     {
         return None;
     }
@@ -936,7 +1045,7 @@ pub fn create_svcmgr_from_file(
     ipc_buf: *mut u64,
 ) -> Option<(u32, u64)>
 {
-    let walked = walk::walk_to_file(system_root_cap, b"/bin/svcmgr", ipc_buf)?;
+    let walked = walk::walk_to_file(system_root_cap, b"/bin/svcmgr", 0xFFFF, ipc_buf)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -974,7 +1083,31 @@ pub fn create_svcmgr_from_file(
         let _ = syscall::cap_delete(reply_caps[1]);
     }
 
-    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    // svcmgr only needs the filesystem to (re-)load registered child
+    // binaries from `/bin/<name>`. Attenuate to a `/bin`-rooted cap
+    // with the minimum rights needed: LOOKUP (to walk to the
+    // binary), STAT (the std fs surface stats before opening), READ
+    // (procmgr issues `FS_READ` / `FS_READ_FRAME` against the file
+    // cap during ELF load — see `services/procmgr/src/process.rs::
+    // create_process_from_file` and the gate enforcement at
+    // `shared/namespace-protocol/src/gate.rs:239`). READDIR/WRITE/
+    // EXEC/MUTATE_DIR/ADMIN are deliberately omitted.
+    let bin_rights = u64::from(
+        namespace_protocol::rights::LOOKUP
+            | namespace_protocol::rights::STAT
+            | namespace_protocol::rights::READ,
+    );
+    if !configure_child_namespace(
+        process_handle,
+        system_root_cap,
+        init_self_cspace,
+        NsPolicy::Subtree {
+            path: b"/bin",
+            rights: bin_rights,
+        },
+        None,
+        ipc_buf,
+    )
     {
         return None;
     }
@@ -1045,7 +1178,7 @@ pub fn create_crasher_suspended_from_file(
     ipc_buf: *mut u64,
 ) -> Option<(u32, u32, u64)>
 {
-    let walked = walk::walk_to_file(system_root_cap, b"/bin/crasher", ipc_buf)?;
+    let walked = walk::walk_to_file(system_root_cap, b"/bin/crasher", 0xFFFF, ipc_buf)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -1078,7 +1211,18 @@ pub fn create_crasher_suspended_from_file(
     let process_handle = reply_caps[0];
     let thread_cap = reply_caps[1];
 
-    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    // crasher is an intentional fault-test process — it touches no
+    // filesystem and never opens a file. Spawn with no namespace
+    // cap; svcmgr re-applies the same `NsPolicy::None` on every
+    // restart via the policy descriptor in `ServiceRegistration`.
+    if !configure_child_namespace(
+        process_handle,
+        system_root_cap,
+        init_self_cspace,
+        NsPolicy::None,
+        None,
+        ipc_buf,
+    )
     {
         // configure_child_namespace destroyed process_handle on failure;
         // release the thread cap that was extracted in the same scope.
@@ -1124,7 +1268,7 @@ pub fn create_and_run_usertest(
     ipc_buf: *mut u64,
 )
 {
-    let Some(walked) = walk::walk_to_file(system_root_cap, b"/bin/usertest", ipc_buf)
+    let Some(walked) = walk::walk_to_file(system_root_cap, b"/bin/usertest", 0xFFFF, ipc_buf)
     else
     {
         log("phase 3: usertest walk failed");
@@ -1193,7 +1337,28 @@ pub fn create_and_run_usertest(
         let _ = syscall::cap_delete(reply_caps[1]);
     }
 
-    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    // usertest exercises the namespace tests end-to-end and asserts
+    // on the cwd surface — hand it the universal root, plus a
+    // pre-walked cwd cap addressing `/srv` so `current_dir_cap()` is
+    // non-zero from the first instruction. `std::env::current_dir()`
+    // still returns `Unsupported` until a path string is registered
+    // (the cap and the path-string surface are independent — see
+    // `env_cwd_unset_phase`). The cwd rights mirror what a normal
+    // directory cap needs for `readdir` + per-entry stat + read.
+    let cwd_rights = u64::from(
+        namespace_protocol::rights::LOOKUP
+            | namespace_protocol::rights::READDIR
+            | namespace_protocol::rights::STAT
+            | namespace_protocol::rights::READ,
+    );
+    if !configure_child_namespace(
+        process_handle,
+        system_root_cap,
+        init_self_cspace,
+        NsPolicy::Universal,
+        Some((b"/srv", cwd_rights)),
+        ipc_buf,
+    )
     {
         return;
     }
@@ -1293,24 +1458,31 @@ pub struct ServiceRegistration<'a>
     /// services. Mutually exclusive with `module_cap` at the protocol level
     /// (presence is signalled by a non-zero `vfs_path_len` in the label).
     pub vfs_path: &'a [u8],
+    /// Namespace-policy kind svcmgr re-applies on every restart of
+    /// this service. One of
+    /// [`svcmgr_labels::NS_POLICY_UNIVERSAL`],
+    /// [`svcmgr_labels::NS_POLICY_NONE`],
+    /// [`svcmgr_labels::NS_POLICY_SUBTREE`]. The descriptor must
+    /// match what init installed via `configure_child_namespace` at
+    /// first spawn; otherwise the post-restart `system_root_cap`
+    /// differs from the initial one.
+    pub ns_policy_kind: u8,
+    /// Subtree path for [`svcmgr_labels::NS_POLICY_SUBTREE`]. Empty
+    /// for the other two kinds. Bounded by [`ipc::MAX_PATH_LEN`].
+    pub ns_subtree_path: &'a [u8],
+    /// Rights mask requested per hop when svcmgr walks
+    /// `ns_subtree_path` from its own root. Only the low 24 bits are
+    /// meaningful per `namespace-protocol`; the wire reserves the
+    /// upper 8 of the descriptor's 32 bits for future expansion.
+    pub ns_subtree_rights: u32,
 }
 
 /// Register a service with svcmgr via `REGISTER_SERVICE`.
 ///
-/// Label layout:
-///   bits [0..16]  = opcode
-///   bits [16..32] = `name_len`
-///   bits [32..48] = `vfs_path_len` (0 = module-loaded, >0 = VFS-loaded)
-///
-/// Data layout (in order):
-///   word 0:                        `SVCMGR_LABELS_VERSION` (handshake)
-///   word 1:                        `restart_policy`
-///   word 2:                        `criticality`
-///   words 3..:                     name bytes (`name_words`)
-///   word `bundle_name_len_word`:   `bundle_name_len`
-///   words ..:                      `bundle_name` bytes (`bundle_name_words`)
-///   words ..:                      `vfs_path` bytes (`vfs_path_words`; only
-///                                  when `vfs_path_len` > 0)
+/// See [`svcmgr_labels::REGISTER_SERVICE`] for the authoritative wire
+/// format. The descriptor at the tail (one packed word plus optional
+/// subtree-path bytes) is what svcmgr re-applies on every restart of
+/// this service, so attenuation survives crash cycles.
 ///
 /// Cap layout depends on the load mode:
 ///   module-loaded (`vfs_path_len` == 0): [thread, module, optional bundle]
@@ -1344,7 +1516,22 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
     let bundle_name_words = bundle_name_len.div_ceil(8);
     let vfs_path_word = bundle_name_len_word + 1 + bundle_name_words;
 
-    let data_count = vfs_path_word + vfs_path_words;
+    // Namespace-policy descriptor: one packed word + optional path bytes.
+    let ns_policy_word = vfs_path_word + vfs_path_words;
+    let ns_subtree_path_len = if reg.ns_policy_kind == svcmgr_labels::NS_POLICY_SUBTREE
+    {
+        reg.ns_subtree_path.len()
+    }
+    else
+    {
+        0
+    };
+    let ns_subtree_path_words = ns_subtree_path_len.div_ceil(8);
+    let ns_packed = u64::from(reg.ns_policy_kind)
+        | ((ns_subtree_path_len as u64) << 16)
+        | (u64::from(reg.ns_subtree_rights) << 32);
+
+    let data_count = ns_policy_word + 1 + ns_subtree_path_words;
     let label = svcmgr_labels::REGISTER_SERVICE
         | ((reg.name.len() as u64) << 16)
         | ((vfs_path_len as u64) << 32);
@@ -1365,6 +1552,14 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
     if vfs_path_len > 0
     {
         builder = builder.bytes(vfs_path_word, reg.vfs_path);
+    }
+    builder = builder.word(ns_policy_word, ns_packed);
+    if ns_subtree_path_len > 0
+    {
+        builder = builder.bytes(
+            ns_policy_word + 1,
+            &reg.ns_subtree_path[..ns_subtree_path_len],
+        );
     }
     builder = builder.word_count(data_count);
 
@@ -1491,6 +1686,11 @@ pub fn phase3_svcmgr_handover(
                 bundle_name: b"svcmgr",
                 bundle_cap: svcmgr_service_ep,
                 vfs_path: b"/bin/crasher",
+                // crasher was spawned with no namespace cap; svcmgr
+                // restarts it with the same `NsPolicy::None` shape.
+                ns_policy_kind: svcmgr_labels::NS_POLICY_NONE,
+                ns_subtree_path: b"",
+                ns_subtree_rights: 0,
             },
         );
 
@@ -1741,7 +1941,7 @@ pub fn create_and_start_logd(
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let Some(walked) = walk::walk_to_file(system_root_cap, b"/bin/logd", ipc_buf)
+    let Some(walked) = walk::walk_to_file(system_root_cap, b"/bin/logd", 0xFFFF, ipc_buf)
     else
     {
         log("logd: walk /bin/logd failed");
@@ -1787,7 +1987,17 @@ pub fn create_and_start_logd(
         let _ = syscall::cap_delete(reply_caps[1]);
     }
 
-    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    // logd owns the master log endpoint RECV plus arch serial
+    // authority (IoPortRange on x86-64, SbiControl on RISC-V); it
+    // does no filesystem I/O. Spawn with no namespace cap.
+    if !configure_child_namespace(
+        process_handle,
+        system_root_cap,
+        init_self_cspace,
+        NsPolicy::None,
+        None,
+        ipc_buf,
+    )
     {
         return false;
     }
@@ -1999,16 +2209,24 @@ fn create_service_endpoint_pair() -> Option<(u32, u32)>
 /// used by `create_and_start_logd` and `create_and_start_svcmgr`.
 /// Returns `(process_handle, child_token)`; caller is responsible for
 /// `destroy_partial_child` on any subsequent failure.
+///
+/// `policy` and `cwd` are forwarded to `configure_child_namespace`.
+/// The driver/service helpers that use this path (rtc driver, timed)
+/// pass `NsPolicy::None` because neither touches the filesystem after
+/// `_start`.
+#[allow(clippy::too_many_arguments)]
 fn walk_and_create_from_file(
     path: &[u8],
     procmgr_ep: u32,
     bootstrap_ep: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
+    policy: NsPolicy<'_>,
+    cwd: Option<(&[u8], u64)>,
     ipc_buf: *mut u64,
 ) -> Option<(u32, u64)>
 {
-    let walked = walk::walk_to_file(system_root_cap, path, ipc_buf)?;
+    let walked = walk::walk_to_file(system_root_cap, path, 0xFFFF, ipc_buf)?;
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
         .word(0, walked.size)
@@ -2032,7 +2250,14 @@ fn walk_and_create_from_file(
     {
         let _ = syscall::cap_delete(reply_caps[1]);
     }
-    if !configure_child_namespace(process_handle, system_root_cap, init_self_cspace, ipc_buf)
+    if !configure_child_namespace(
+        process_handle,
+        system_root_cap,
+        init_self_cspace,
+        policy,
+        cwd,
+        ipc_buf,
+    )
     {
         return None;
     }
@@ -2096,12 +2321,17 @@ pub fn create_and_start_rtc_driver(
         return None;
     };
 
+    // RTC driver owns its arch-specific hardware authority cap
+    // (IoPortRange on x86-64, MmioRegion on RISC-V) and serves a
+    // single read-only IPC. No filesystem access.
     let Some((process_handle, child_token)) = walk_and_create_from_file(
         binary_path,
         procmgr_ep,
         bootstrap_ep,
         system_root_cap,
         init_self_cspace,
+        NsPolicy::None,
+        None,
         ipc_buf,
     )
     else
@@ -2164,12 +2394,16 @@ pub fn create_and_start_timed(
 {
     let (svc_source, svc_recv) = create_service_endpoint_pair()?;
 
+    // timed queries the svcmgr registry for `rtc.primary` then
+    // serves GET_WALL_TIME. No filesystem access.
     let Some((process_handle, child_token)) = walk_and_create_from_file(
         b"/bin/timed",
         procmgr_ep,
         bootstrap_ep,
         system_root_cap,
         init_self_cspace,
+        NsPolicy::None,
+        None,
         ipc_buf,
     )
     else

@@ -278,7 +278,27 @@ pub(crate) fn walk_path_to_dir(
     ipc_buf: *mut u64,
 ) -> io::Result<WalkedDir>
 {
-    let walked = walk_components(root_cap, path_str, ipc_buf, ExpectKind::Dir)?;
+    walk_path_to_dir_with_rights(root_cap, path_str, 0xFFFF, ipc_buf)
+}
+
+/// Variant of [`walk_path_to_dir`] that requests `requested_rights`
+/// per hop instead of the `0xFFFF` "everything I'm allowed"
+/// sentinel. Used by spawners that walk-and-attenuate a subtree cap
+/// before installing it on a child via `CONFIGURE_NAMESPACE`.
+pub(crate) fn walk_path_to_dir_with_rights(
+    root_cap: u32,
+    path_str: &str,
+    requested_rights: u64,
+    ipc_buf: *mut u64,
+) -> io::Result<WalkedDir>
+{
+    let walked = walk_components(
+        root_cap,
+        path_str,
+        requested_rights,
+        ipc_buf,
+        ExpectKind::Dir,
+    )?;
     Ok(WalkedDir { dir_cap: walked.cap })
 }
 
@@ -298,7 +318,7 @@ pub(crate) fn walk_path_to_file(
     ipc_buf: *mut u64,
 ) -> io::Result<WalkedFile>
 {
-    let walked = walk_components(root_cap, path_str, ipc_buf, ExpectKind::File)?;
+    let walked = walk_components(root_cap, path_str, 0xFFFF, ipc_buf, ExpectKind::File)?;
     Ok(WalkedFile {
         file_cap: walked.cap,
         size: walked.size,
@@ -320,10 +340,15 @@ struct WalkedNode
 }
 
 /// Internal kind-parameterised walk shared by [`walk_path_to_file`] and
-/// [`walk_path_to_dir`].
+/// [`walk_path_to_dir`]. `requested_rights` is the mask sent on every
+/// hop; the namespace server intersects it against parent rights and
+/// per-entry `max_rights`. Callers wanting "everything I'm allowed"
+/// pass `0xFFFF`; callers walking-and-attenuating a subtree pass the
+/// target rights mask directly.
 fn walk_components(
     root_cap: u32,
     path_str: &str,
+    requested_rights: u64,
     ipc_buf: *mut u64,
     expect_kind: ExpectKind,
 ) -> io::Result<WalkedNode>
@@ -365,10 +390,10 @@ fn walk_components(
         let is_last = i == last_idx;
         // Cap-native rights model: server intersects
         // `parent_rights & entry.max_rights & caller_requested`.
-        // Asking for `0xFFFF` (everything I'm allowed) on every hop
-        // is the only shape that lets the final cap come back with
-        // READ when the chain's parents had READ available.
-        let requested_rights: u64 = 0xFFFF;
+        // `requested_rights` is the mask the caller wants on every
+        // hop; `0xFFFF` is the "everything I'm allowed" sentinel
+        // used by `File::open` and friends, and an explicit narrow
+        // mask is used by walk-and-attenuate spawners.
         let label = ns_labels::NS_LOOKUP | ((name.len() as u64) << 16);
         let msg = IpcMessage::builder(label)
             .word(0, requested_rights)

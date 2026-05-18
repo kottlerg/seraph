@@ -640,6 +640,32 @@ pub fn namespace_lookup_file(root_cap: u32, path: &str) -> crate::io::Result<(u3
     Ok((walked.file_cap, walked.size))
 }
 
+/// Walk `path` from the supplied namespace cap via `NS_LOOKUP`,
+/// requesting `requested_rights` per hop, and return the resolved
+/// directory's tokened SEND cap.
+///
+/// Every hop (including the final) must resolve to a directory. The
+/// returned cap carries at most `requested_rights` intersected with
+/// each parent's rights and each entry's `max_rights` — see
+/// `shared/namespace-protocol`. Used by spawners that walk-and-
+/// attenuate a subtree cap before installing it on a child via
+/// `CONFIGURE_NAMESPACE`. Callers wanting the full rights chain pass
+/// `0xFFFF`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn namespace_lookup_dir(
+    root_cap: u32,
+    path: &str,
+    requested_rights: u64,
+) -> crate::io::Result<u32> {
+    let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return Err(crate::io::Error::other("seraph: IPC buffer not registered"));
+    }
+    let walked =
+        crate::sys::fs::walk_path_to_dir_with_rights(root_cap, path, requested_rights, ipc_buf)?;
+    Ok(walked.dir_cap)
+}
+
 /// Return a Frame-cap slot suitable as the source for a `cap_create_*`
 /// retype, with at least `min_bytes` of `available_bytes`.
 ///

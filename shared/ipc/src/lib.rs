@@ -396,12 +396,53 @@ pub mod procmgr_process_state
     pub const EXITED: u64 = 3;
 }
 
-pub const SVCMGR_LABELS_VERSION: u32 = 1;
+pub const SVCMGR_LABELS_VERSION: u32 = 2;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
     /// Register a service for health monitoring.
+    ///
+    /// Wire format (data words, in order):
+    /// * word 0: `SVCMGR_LABELS_VERSION` handshake.
+    /// * word 1: `restart_policy` byte.
+    /// * word 2: `criticality` byte.
+    /// * words 3..: `name` bytes (length in label bits 16..32).
+    /// * one word: `bundle_name_len`.
+    /// * following words: `bundle_name` bytes when length > 0.
+    /// * following words: `vfs_path` bytes when length > 0 (length in
+    ///   label bits 32..48).
+    /// * one word: namespace-policy descriptor (`ns_policy_packed`):
+    ///     - bits  0..  8: kind (`NS_POLICY_UNIVERSAL` / `_NONE` /
+    ///       `_SUBTREE`).
+    ///     - bits 16.. 32: subtree-path length (0 for non-Subtree).
+    ///     - bits 32.. 64: subtree rights mask (u32; only the low 24
+    ///       bits are meaningful per `namespace-protocol`).
+    /// * following words: subtree-path bytes (only when kind ==
+    ///   `NS_POLICY_SUBTREE`).
+    ///
+    /// svcmgr stores the descriptor on the `ServiceEntry` and
+    /// re-applies it on every restart (walking its own
+    /// `root_dir_cap` for `Subtree`), so attenuation survives a
+    /// crash-restart cycle.
     pub const REGISTER_SERVICE: u64 = 1;
+
+    /// Namespace-policy descriptor: hand the child a `cap_copy` of
+    /// the spawner's seed root at full rights. The default for
+    /// services that legitimately need the whole namespace
+    /// (currently only `usertest`).
+    pub const NS_POLICY_UNIVERSAL: u8 = 0;
+    /// Namespace-policy descriptor: do not deliver any namespace
+    /// cap. The child's `ProcessInfo.system_root_cap` stays zero
+    /// (`Unsupported` on absolute-path fs ops in std). Suitable for
+    /// services that own only hardware / IPC authority and never
+    /// touch the filesystem.
+    pub const NS_POLICY_NONE: u8 = 1;
+    /// Namespace-policy descriptor: walk the spawner's seed root to
+    /// a per-service path with a per-service rights mask, and hand
+    /// the resulting directory cap. Path and rights live in the same
+    /// `REGISTER_SERVICE` body so svcmgr can reproduce the walk on
+    /// restart against its own root.
+    pub const NS_POLICY_SUBTREE: u8 = 2;
     /// Signal that init handover is complete.
     pub const HANDOVER_COMPLETE: u64 = 2;
     /// Publish a named endpoint into the discovery registry.

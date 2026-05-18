@@ -83,6 +83,19 @@ pub struct ServiceEntry
     /// Zero for the initial instance (which svcmgr never created — init
     /// did), so the first death cannot destroy; subsequent deaths can.
     pub process_handle: u32,
+    /// Namespace-policy kind init recorded at registration; one of
+    /// `ipc::svcmgr_labels::NS_POLICY_*`. svcmgr re-applies this
+    /// shape on every restart so attenuation survives a crash cycle.
+    pub ns_policy_kind: u8,
+    /// Length of `ns_subtree_path` in bytes (0 for non-`Subtree`).
+    pub ns_subtree_path_len: u8,
+    /// Subtree path svcmgr walks against its own root for
+    /// `NS_POLICY_SUBTREE`.
+    pub ns_subtree_path: [u8; ipc::MAX_PATH_LEN],
+    /// Rights mask svcmgr requests per hop when walking
+    /// `ns_subtree_path`. Only the low 24 bits are meaningful per
+    /// `namespace-protocol`.
+    pub ns_subtree_rights: u32,
 }
 
 impl ServiceEntry
@@ -109,6 +122,10 @@ impl ServiceEntry
             active: false,
             bootstrap_token: 0,
             process_handle: 0,
+            ns_policy_kind: ipc::svcmgr_labels::NS_POLICY_UNIVERSAL,
+            ns_subtree_path_len: 0,
+            ns_subtree_path: [0; ipc::MAX_PATH_LEN],
+            ns_subtree_rights: 0,
         }
     }
 

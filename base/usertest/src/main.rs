@@ -61,6 +61,7 @@ fn main()
     {
         Some("sandbox-child") => sandbox_child_main(),
         Some("cwd-child") => cwd_child_main(),
+        Some("bin-child") => bin_child_main(),
         _ =>
         {}
     }
@@ -141,6 +142,8 @@ fn main()
     fs_write_invariants_phase();
     ns_multi_component_phase();
     ns_sandbox_phase();
+    ns_bin_subtree_phase();
+    ns_startup_cwd_phase();
     ns_fallthrough_attenuation_phase();
     command_cwd_inherit_phase();
     command_cwd_missing_phase();
@@ -420,6 +423,51 @@ fn cwd_child_main() -> !
     {
         Ok(_) => std::process::exit(0),
         Err(_) => std::process::exit(5),
+    }
+}
+
+/// Re-entry path used by [`ns_bin_subtree_phase`] (parent). The
+/// parent walks `root → /bin` requesting `LOOKUP|STAT|READ` (the
+/// exact shape init installs on svcmgr) and spawns this binary with
+/// the attenuated cap as `system_root_cap`. From the child's
+/// perspective, that cap addresses `/bin`, so a path-component walk
+/// of `"/usertest"` resolves to `/bin/usertest` (the binary it was
+/// just spawned from) and `/srv/test.txt` fails before the first
+/// hop because the `/bin` directory has no `srv` entry.
+///
+/// Exit-reason convention (recovered by the parent via the death
+/// queue):
+/// * `0` — `/usertest` opened and `/srv/test.txt` rejected as
+///   expected.
+/// * `1` — `/usertest` open failed (subtree attenuation walked
+///   somewhere unexpected).
+/// * `2` — `/srv/test.txt` unexpectedly succeeded (the cap is not
+///   actually rooted at `/bin`).
+/// * `3` — `/srv/test.txt` failed with an unexpected error kind.
+/// * `4` — child has no `system_root_cap` at all.
+fn bin_child_main() -> !
+{
+    let root = std::os::seraph::root_dir_cap();
+    if root == 0
+    {
+        std::process::exit(4);
+    }
+    if std::fs::File::open("/usertest").is_err()
+    {
+        std::process::exit(1);
+    }
+    match std::fs::File::open("/srv/test.txt")
+    {
+        Ok(_) => std::process::exit(2),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied,
+            ) =>
+        {
+            std::process::exit(0)
+        }
+        Err(_) => std::process::exit(3),
     }
 }
 
@@ -1795,6 +1843,92 @@ fn ns_sandbox_phase()
     std::os::seraph::log!("ns_sandbox phase passed");
 }
 
+/// Exercise the production `NsPolicy::Subtree` shape that init
+/// installs on svcmgr: walk `root → /bin` requesting
+/// `LOOKUP|STAT|READ`, then spawn `/bin/usertest bin-child` with the
+/// attenuated cap delivered via `CommandExt::namespace_cap`. The
+/// child runs [`bin_child_main`], which verifies that (a) its
+/// `system_root_cap` reaches `/bin/usertest` and (b) any path
+/// outside `/bin` is unreachable from the cap.
+///
+/// Parent skips silently if no `root_dir_cap` is configured (no
+/// vfsd, no namespace authority) — same shape as `ns_sandbox_phase`.
+fn ns_bin_subtree_phase()
+{
+    use namespace_protocol::{NamespaceRights, rights};
+    use std::os::seraph::process::CommandExt;
+
+    let root = std::os::seraph::root_dir_cap();
+    if root == 0
+    {
+        std::os::seraph::log!("ns_bin_subtree phase skipped: no root_dir_cap");
+        return;
+    }
+
+    let bin_rights = NamespaceRights::from_raw(rights::LOOKUP | rights::STAT | rights::READ).raw();
+    let bin_cap = match std::os::seraph::namespace_lookup_dir(root, "/bin", u64::from(bin_rights))
+    {
+        Ok(c) => c,
+        Err(e) => panic!("ns_bin_subtree: walk-attenuate /bin failed: {e}"),
+    };
+
+    let mut cmd = std::process::Command::new("/bin/usertest");
+    cmd.arg("bin-child");
+    cmd.namespace_cap(bin_cap);
+    let status = cmd
+        .status()
+        .expect("ns_bin_subtree: spawn /bin/usertest bin-child failed");
+
+    assert!(
+        status.success(),
+        "ns_bin_subtree: child exit status {status:?}; expected 0. \
+         1 = /usertest open failed (cap not rooted at /bin), \
+         2 = /srv/test.txt unexpectedly opened (cap not attenuated), \
+         3 = /srv/test.txt failed with unexpected error kind, \
+         4 = no system_root_cap delivered to child"
+    );
+    std::os::seraph::log!("ns_bin_subtree phase passed");
+}
+
+/// Verify init's `configure_child_namespace` actually delivered a
+/// startup cwd cap addressing `/srv`. usertest is spawned by init
+/// with `cwd = Some((b"/srv", LOOKUP|READDIR|STAT|READ))`; the cap
+/// must arrive in `ProcessInfo.current_dir_cap` and the std startup
+/// path must install it as `current_dir_cap()`.
+///
+/// Asserts the cap is non-zero and that an `NS_LOOKUP` for
+/// `test.txt` succeeds (confirming the cap addresses `/srv` rather
+/// than some other directory). The looked-up cap is released
+/// immediately — this phase only proves wire delivery.
+///
+/// MUST run before `fs_open_relative_phase`, which installs the
+/// path string permanently via `set_current_dir("/srv")` and would
+/// otherwise mask any cap-delivery regression.
+fn ns_startup_cwd_phase()
+{
+    let cwd = std::os::seraph::current_dir_cap();
+    assert_ne!(
+        cwd, 0,
+        "ns_startup_cwd: init did not install a startup cwd cap via CONFIGURE_NAMESPACE",
+    );
+
+    let info = startup_info();
+    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB).
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    let (file_cap, kind, _size) = ns_lookup(cwd, b"test.txt", 0xFFFF, ipc_buf).expect(
+        "ns_startup_cwd: NS_LOOKUP test.txt from startup cwd cap failed — cwd cap \
+         does not address /srv",
+    );
+    assert_eq!(
+        kind, 0,
+        "ns_startup_cwd: test.txt should be a file (kind=0), got {kind}",
+    );
+    let _ = syscall::cap_delete(file_cap);
+    std::os::seraph::log!("ns_startup_cwd phase passed");
+}
+
 /// Verify F1: vfsd's fall-through forwarder repacks the request body
 /// to honour the caller's parent rights.
 ///
@@ -3044,27 +3178,34 @@ fn command_invalid_elf_loop_phase()
 
 /// Cap-native cwd surface: `set_current_dir` walks `root_dir_cap()` to
 /// a path and installs the resulting directory cap as
-/// `current_dir_cap()`. Subsequent `File::open` of a relative path
-/// anchors at that cap rather than the root. Asserts both the install
-/// and the relative open succeed.
+/// `current_dir_cap()`, replacing whatever cap (if any) the spawner
+/// installed via `procmgr_labels::CONFIGURE_NAMESPACE`. Subsequent
+/// `File::open` of a relative path anchors at that cap rather than
+/// the root. Asserts the install and the relative open succeed, and
+/// that `std::env::current_dir()` becomes `/srv` once a path string
+/// is recorded.
 fn fs_open_relative_phase()
 {
     use std::fs::File;
     use std::io::Read;
 
-    // Pre-condition: no cwd cap installed (children inherit zero by
-    // default unless the spawner set one). Relative open should fail
-    // with Unsupported.
-    assert_eq!(
+    // Pre-condition: init's `configure_child_namespace` installed a
+    // startup cwd cap addressing `/srv`, but the path-string surface
+    // was never populated (see `env_cwd_unset_phase`), so
+    // `std::env::current_dir()` still returns `Unsupported` and a
+    // relative open with no PathBuf in-hand is rejected before the
+    // walk by the std overlay's "no path recorded" check.
+    assert_ne!(
         std::os::seraph::current_dir_cap(),
         0,
-        "fs_open_relative_phase pre-condition: cwd cap should start zero",
+        "fs_open_relative_phase pre-condition: startup cwd cap should still be present",
     );
-    let pre_err = File::open("test.txt").expect_err("relative open without cwd must fail");
+    let pre_err =
+        std::env::current_dir().expect_err("std::env::current_dir() pre-set should still fail");
     assert_eq!(pre_err.kind(), std::io::ErrorKind::Unsupported);
 
     // Install /srv as cwd via the cap-native primitive. The walk goes
-    // through vfsd's synthetic root.
+    // through vfsd's synthetic root and replaces the startup cap.
     std::os::seraph::set_current_dir("/srv").expect("set_current_dir(/srv) failed");
     assert_ne!(std::os::seraph::current_dir_cap(), 0);
 
@@ -3121,14 +3262,20 @@ fn fs_open_relative_phase()
 /// because the cwd directory *exists*; only its string label is
 /// absent.
 ///
+/// init installs a startup cwd cap (`/srv`) for usertest via
+/// `configure_child_namespace`'s `cwd` argument, so
+/// `current_dir_cap()` is non-zero on entry — the cap surface and the
+/// path-string surface are deliberately independent.
+///
 /// MUST run before `fs_open_relative_phase`: that phase installs the
 /// path string permanently via `set_current_dir("/srv")`.
 fn env_cwd_unset_phase()
 {
-    assert_eq!(
+    assert_ne!(
         std::os::seraph::current_dir_cap(),
         0,
-        "env_cwd_unset_phase pre-condition: cwd cap should still be zero",
+        "env_cwd_unset_phase pre-condition: init's CONFIGURE_NAMESPACE \
+         must have installed a startup cwd cap",
     );
     let err = std::env::current_dir()
         .expect_err("std::env::current_dir() with no recorded path must fail");

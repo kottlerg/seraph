@@ -20,24 +20,17 @@ use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
 /// Per-spawn namespace-cap policy for [`configure_child_namespace`].
 ///
-/// The variants encode the three shapes a child's `system_root_cap`
-/// can take: a `cap_copy` of the spawner's seed root, a walked-and-
-/// attenuated subtree, or nothing at all. The descriptor is also
-/// carried in `ServiceRegistration` so svcmgr can re-apply the same
-/// policy on restart (see `services/svcmgr/src/restart.rs`).
+/// The variants encode the two shapes a child's `system_root_cap`
+/// can take when init still spawns the service directly: a `cap_copy`
+/// of the spawner's seed root, or nothing at all. Per-service subtree
+/// attenuation lives in svcmgr (parsed from `services.d/<name>.svc`'s
+/// `namespace = subtree:<path>:<rights>` line) post-#21.
 #[derive(Clone, Copy)]
-pub enum NsPolicy<'a>
+pub enum NsPolicy
 {
     /// Hand the child a `cap_copy` of `system_root_cap` at full
-    /// rights. Equivalent to the pre-attenuation default.
+    /// rights.
     Universal,
-    /// Walk `path` from `system_root_cap` requesting `rights` per
-    /// hop, then hand the resulting directory cap to the child. The
-    /// path is bytes; `b"/bin"` etc.
-    Subtree
-    {
-        path: &'a [u8], rights: u64
-    },
     /// Do not call `CONFIGURE_NAMESPACE` at all. The child's
     /// `system_root_cap` stays zero; std-side absolute-path fs ops
     /// return `Unsupported`.
@@ -78,7 +71,7 @@ fn configure_child_namespace(
     process_handle: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
-    policy: NsPolicy<'_>,
+    policy: NsPolicy,
     cwd: Option<(&[u8], u64)>,
     ipc_buf: *mut u64,
 ) -> bool
@@ -104,17 +97,6 @@ fn configure_child_namespace(
             else
             {
                 log("phase 3: cap_copy of system root for child failed");
-                destroy_partial_child(process_handle, ipc_buf);
-                return false;
-            };
-            c
-        }
-        NsPolicy::Subtree { path, rights } =>
-        {
-            let Some(c) = walk::walk_to_dir(system_root_cap, path, rights, ipc_buf)
-            else
-            {
-                log("phase 3: subtree walk for child namespace failed");
                 destroy_partial_child(process_handle, ipc_buf);
                 return false;
             };
@@ -687,21 +669,33 @@ pub fn create_devmgr_with_caps(
 
 // ── pwrmgr creation ─────────────────────────────────────────────────────────
 
+/// Pwrmgr-side result of [`create_and_start_pwrmgr`].
+///
+/// `service_ep` is the un-tokened source on pwrmgr's service endpoint
+/// (init keeps it to mint tokened SENDs); `thread_cap` is pwrmgr's
+/// main thread in init's `CSpace`, registered with svcmgr so the
+/// supervisor can bind death-notification.
+pub struct PwrmgrSpawn
+{
+    pub service_ep: u32,
+    pub thread_cap: u32,
+}
+
 /// Walk `/bin/pwrmgr`, create the process, transfer platform shutdown
 /// caps via bootstrap rounds, and start it.
 ///
 /// Returns the service-endpoint slot init owns (the RECV side stays with
 /// pwrmgr; init keeps the source for deriving tokened SENDs to
-/// authorized consumers). Returns `None` on any failure; partial state
-/// is torn down before returning.
+/// authorized consumers) plus pwrmgr's main thread cap. Returns `None`
+/// on any failure; partial state is torn down before returning.
 ///
 /// Bootstrap layout (matches `services/pwrmgr/src/caps.rs`):
 /// * Round 1 (≤2 caps, 2 data words):
-///   - caps\[0\] = pwrmgr's service endpoint (derived copy).
-///   - caps\[1\] = arch authority cap (`IoPortRange` on x86-64,
+///   - `caps[0]` = pwrmgr's service endpoint (derived copy).
+///   - `caps[1]` = arch authority cap (`IoPortRange` on x86-64,
 ///     `SbiControl` on RISC-V). Omitted when absent.
-///   - data\[0\] = presence bitmap (bit 0 = arch cap present).
-///   - data\[1\] = `PWRMGR_LABELS_VERSION`.
+///   - `data[0]` = presence bitmap (bit 0 = arch cap present).
+///   - `data[1]` = `PWRMGR_LABELS_VERSION`.
 ///   - `done` = true on RISC-V or when no ACPI regions follow.
 /// * Round 2..N (x86-64 only): ACPI region Frame caps, ≤4 per round.
 #[allow(clippy::too_many_lines)]
@@ -712,7 +706,7 @@ pub fn create_and_start_pwrmgr(
     system_root_cap: u32,
     init_self_cspace: u32,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Option<PwrmgrSpawn>
 {
     let walked = walk::walk_to_file(system_root_cap, b"/bin/pwrmgr", 0xFFFF, ipc_buf)?;
 
@@ -744,14 +738,17 @@ pub fn create_and_start_pwrmgr(
         return None;
     }
     let process_handle = reply_caps[0];
-    // CREATE_FROM_FILE returns (process_handle, thread_cap). pwrmgr is
-    // not currently registered with svcmgr for death monitoring, so the
-    // thread cap is released here to avoid accumulating in init's
-    // CSpace.
-    if reply_caps.len() >= 2
+    // CREATE_FROM_FILE returns (process_handle, thread_cap). Pwrmgr is
+    // svcmgr-registered for death monitoring (post-#21); the thread
+    // cap is preserved here and returned via [`PwrmgrSpawn`] for the
+    // Phase-3 v3 `REGISTER_SERVICE` call.
+    if reply_caps.len() < 2
     {
-        let _ = syscall::cap_delete(reply_caps[1]);
+        log("pwrmgr: CREATE_FROM_FILE reply missing thread cap");
+        destroy_partial_child(process_handle, ipc_buf);
+        return None;
     }
+    let thread_cap = reply_caps[1];
 
     // pwrmgr's only surface is the gated SHUTDOWN/REBOOT IPC; it
     // owns IoPortRange/SbiControl/ACPI frames directly and never
@@ -765,6 +762,7 @@ pub fn create_and_start_pwrmgr(
         ipc_buf,
     )
     {
+        let _ = syscall::cap_delete(thread_cap);
         return None;
     }
 
@@ -776,6 +774,7 @@ pub fn create_and_start_pwrmgr(
     {
         log("pwrmgr: cannot create service endpoint");
         destroy_partial_child(process_handle, ipc_buf);
+        let _ = syscall::cap_delete(thread_cap);
         return None;
     };
     let Ok(service_copy) = syscall::cap_derive(pwrmgr_service_ep, syscall::RIGHTS_ALL)
@@ -784,6 +783,7 @@ pub fn create_and_start_pwrmgr(
         log("pwrmgr: service endpoint derive failed");
         let _ = syscall::cap_delete(pwrmgr_service_ep);
         destroy_partial_child(process_handle, ipc_buf);
+        let _ = syscall::cap_delete(thread_cap);
         return None;
     };
 
@@ -822,6 +822,7 @@ pub fn create_and_start_pwrmgr(
     )
     {
         let _ = syscall::cap_delete(pwrmgr_service_ep);
+        let _ = syscall::cap_delete(thread_cap);
         return None;
     }
 
@@ -850,6 +851,7 @@ pub fn create_and_start_pwrmgr(
     )
     {
         let _ = syscall::cap_delete(pwrmgr_service_ep);
+        let _ = syscall::cap_delete(thread_cap);
         return None;
     }
 
@@ -904,13 +906,17 @@ pub fn create_and_start_pwrmgr(
             )
             {
                 let _ = syscall::cap_delete(pwrmgr_service_ep);
+                let _ = syscall::cap_delete(thread_cap);
                 return None;
             }
             idx = batch_end;
         }
     }
 
-    Some(pwrmgr_service_ep)
+    Some(PwrmgrSpawn {
+        service_ep: pwrmgr_service_ep,
+        thread_cap,
+    })
 }
 
 // ── vfsd creation ────────────────────────────────────────────────────────────
@@ -1083,28 +1089,17 @@ pub fn create_svcmgr_from_file(
         let _ = syscall::cap_delete(reply_caps[1]);
     }
 
-    // svcmgr only needs the filesystem to (re-)load registered child
-    // binaries from `/bin/<name>`. Attenuate to a `/bin`-rooted cap
-    // with the minimum rights needed: LOOKUP (to walk to the
-    // binary), STAT (the std fs surface stats before opening), READ
-    // (procmgr issues `FS_READ` / `FS_READ_FRAME` against the file
-    // cap during ELF load — see `services/procmgr/src/process.rs::
-    // create_process_from_file` and the gate enforcement at
-    // `shared/namespace-protocol/src/gate.rs:239`). READDIR/WRITE/
-    // EXEC/MUTATE_DIR/ADMIN are deliberately omitted.
-    let bin_rights = u64::from(
-        namespace_protocol::rights::LOOKUP
-            | namespace_protocol::rights::STAT
-            | namespace_protocol::rights::READ,
-    );
+    // Post-#21 svcmgr is the supervisor and holds the universal
+    // root: it reads `/etc/svcmgr/services.d/*.svc` at handover,
+    // walks `/bin/<name>` for first-launch of defined-but-unregistered
+    // services, and applies per-service namespace attenuation from
+    // each `.svc` recipe when configuring the child. Init no longer
+    // pre-attenuates svcmgr to `/bin`.
     if !configure_child_namespace(
         process_handle,
         system_root_cap,
         init_self_cspace,
-        NsPolicy::Subtree {
-            path: b"/bin",
-            rights: bin_rights,
-        },
+        NsPolicy::Universal,
         None,
         ipc_buf,
     )
@@ -1166,417 +1161,43 @@ pub fn setup_and_start_svcmgr(
     );
 }
 
-/// Load `/bin/crasher` via `CREATE_FROM_FILE` (suspended), install init's
-/// seed namespace cap on the child, and return `(process_handle,
-/// thread_cap, child_token)`. Svcmgr restarts via its own VFS-restart
-/// path using the namespace cap delivered through `ProcessInfo`.
-pub fn create_crasher_suspended_from_file(
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    ipc_buf: *mut u64,
-) -> Option<(u32, u32, u64)>
-{
-    let walked = walk::walk_to_file(system_root_cap, b"/bin/crasher", 0xFFFF, ipc_buf)?;
-
-    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
-
-    let msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, walked.size)
-        .cap(walked.file_cap)
-        .cap(tokened_creator)
-        .build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
-    else
-    {
-        log("phase 3: crasher CREATE_FROM_FILE failed");
-        return None;
-    };
-    if reply.label != 0
-    {
-        log("phase 3: crasher CREATE_FROM_FILE error");
-        return None;
-    }
-
-    let reply_caps = reply.caps();
-    if reply_caps.len() < 2
-    {
-        log("phase 3: crasher reply missing caps");
-        return None;
-    }
-
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
-
-    // crasher is an intentional fault-test process — it touches no
-    // filesystem and never opens a file. Spawn with no namespace
-    // cap; svcmgr re-applies the same `NsPolicy::None` on every
-    // restart via the policy descriptor in `ServiceRegistration`.
-    if !configure_child_namespace(
-        process_handle,
-        system_root_cap,
-        init_self_cspace,
-        NsPolicy::None,
-        None,
-        ipc_buf,
-    )
-    {
-        // configure_child_namespace destroyed process_handle on failure;
-        // release the thread cap that was extracted in the same scope.
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    }
-
-    log("phase 3: crasher created (suspended) from /bin/crasher");
-    Some((process_handle, thread_cap, child_token))
-}
-
-/// Load `/bin/usertest` via `CREATE_FROM_FILE`, install init's seed
-/// namespace cap on the child, start it, and serve a terminal bootstrap
-/// round carrying the fatfs root cap and two SEND caps on pwrmgr's
-/// service endpoint.
+/// Minimal v3 `REGISTER_SERVICE` payload: name + thread cap.
 ///
-/// usertest exits cleanly on completion and is not registered with
-/// svcmgr. log + procmgr + system-root caps arrive via `ProcessInfo`;
-/// the bootstrap round carries:
-/// * `caps[0]` — a tokened SEND on fatfs's namespace endpoint at
-///   `NodeId::ROOT` for the `ns_phase` direct-driver tests. Zero when
-///   vfsd was unable to mint one; the receiving phase logs and skips
-///   assertions in that case.
-/// * `caps[1]` — a `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's
-///   service endpoint. usertest invokes
-///   `pwrmgr_labels::SHUTDOWN` through this cap on the success path so
-///   QEMU exits cleanly. Zero when pwrmgr was not started; usertest's
-///   shutdown phase skips when zero.
-/// * `caps[2]` — a SEND on pwrmgr's service endpoint without the
-///   `SHUTDOWN_AUTHORITY` token bit. usertest's
-///   `pwrmgr_cap_deny_phase` calls `SHUTDOWN` through this cap and
-///   asserts the reply is `pwrmgr_errors::UNAUTHORIZED`. Zero when
-///   pwrmgr was not started; the phase skips when zero.
-#[allow(clippy::too_many_arguments)]
-pub fn create_and_run_usertest(
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    fatfs_root_cap: u32,
-    pwrmgr_auth_cap: u32,
-    pwrmgr_noauth_cap: u32,
-    ipc_buf: *mut u64,
-)
-{
-    let Some(walked) = walk::walk_to_file(system_root_cap, b"/bin/usertest", 0xFFFF, ipc_buf)
-    else
-    {
-        log("phase 3: usertest walk failed");
-        return;
-    };
-
-    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
-    else
-    {
-        let _ = syscall::cap_delete(walked.file_cap);
-        return;
-    };
-
-    // Hand usertest a minimal argv + env so its args/env assertions have
-    // real content to verify. argv: two NUL-terminated entries. env: two
-    // `KEY=VALUE` NUL-terminated entries.
-    let argv: &[u8] = b"usertest\0run\0";
-    let argv_count: u32 = 2;
-    let argv_bytes = argv.len();
-    let argv_words = argv_bytes.div_ceil(8);
-
-    let env_blob: &[u8] = b"SERAPH_TEST=1\0SERAPH_MODE=boot\0";
-    let env_count: u32 = 2;
-    let env_bytes = env_blob.len();
-    let env_words = env_bytes.div_ceil(8);
-
-    let label = procmgr_labels::CREATE_FROM_FILE
-        | ((argv_bytes as u64) << 32)
-        | ((u64::from(argv_count)) << 48)
-        | ((u64::from(env_count)) << 56);
-    let argv_word_offset: usize = 1;
-    let env_len_word_offset = argv_word_offset + argv_words;
-    let env_blob_word_offset = env_len_word_offset + 1;
-    let data_count = 1 + argv_words + 1 + env_words;
-    let msg = IpcMessage::builder(label)
-        .word(0, walked.size)
-        .bytes(argv_word_offset, argv)
-        .word(env_len_word_offset, env_bytes as u64)
-        .bytes(env_blob_word_offset, env_blob)
-        .word_count(data_count)
-        .cap(walked.file_cap)
-        .cap(tokened_creator)
-        .build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
-    else
-    {
-        log("phase 3: usertest CREATE_FROM_FILE failed");
-        return;
-    };
-    if reply.label != 0
-    {
-        log("phase 3: usertest CREATE_FROM_FILE error");
-        return;
-    }
-
-    let reply_caps = reply.caps();
-    if reply_caps.is_empty()
-    {
-        return;
-    }
-    let process_handle = reply_caps[0];
-    if reply_caps.len() >= 2
-    {
-        let _ = syscall::cap_delete(reply_caps[1]);
-    }
-
-    // usertest exercises the namespace tests end-to-end and asserts
-    // on the cwd surface — hand it the universal root, plus a
-    // pre-walked cwd cap addressing `/srv` so `current_dir_cap()` is
-    // non-zero from the first instruction. `std::env::current_dir()`
-    // still returns `Unsupported` until a path string is registered
-    // (the cap and the path-string surface are independent — see
-    // `env_cwd_unset_phase`). The cwd rights mirror what a normal
-    // directory cap needs for `readdir` + per-entry stat + read.
-    let cwd_rights = u64::from(
-        namespace_protocol::rights::LOOKUP
-            | namespace_protocol::rights::READDIR
-            | namespace_protocol::rights::STAT
-            | namespace_protocol::rights::READ,
-    );
-    if !configure_child_namespace(
-        process_handle,
-        system_root_cap,
-        init_self_cspace,
-        NsPolicy::Universal,
-        Some((b"/srv", cwd_rights)),
-        ipc_buf,
-    )
-    {
-        return;
-    }
-
-    if !start_process(
-        process_handle,
-        ipc_buf,
-        "phase 3: usertest started",
-        "phase 3: usertest START_PROCESS failed",
-    )
-    {
-        return;
-    }
-
-    // Slot convention: caps[0] = fatfs root, caps[1] = pwrmgr
-    // authority, caps[2] = pwrmgr no-authority. The system-root cap
-    // arrives through `ProcessInfo.system_root_cap` (set via
-    // `CONFIGURE_NAMESPACE` above); std exposes it via
-    // `std::os::seraph::root_dir_cap()`.
-    let _ = serve(
-        bootstrap_ep,
-        child_token,
-        ipc_buf,
-        true,
-        &[fatfs_root_cap, pwrmgr_auth_cap, pwrmgr_noauth_cap],
-        &[],
-        "phase 3: usertest bootstrap failed",
-    );
-}
-
-/// Start crasher and serve its bootstrap with `[svcmgr_ep]`.
-///
-/// `svcmgr_service_ep` is the same cap that svcmgr will re-inject from the
-/// restart bundle under the name `"svcmgr"`. Providing it on first boot as
-/// well keeps the cap layout identical across first-boot and restart paths.
-/// The log endpoint is delivered via `ProcessInfo`, not this round.
-pub fn start_and_bootstrap_crasher(
-    process_handle: u32,
-    child_token: u64,
-    bootstrap_ep: u32,
-    svcmgr_service_ep: u32,
-    ipc_buf: *mut u64,
-) -> bool
-{
-    if !start_process(
-        process_handle,
-        ipc_buf,
-        "phase 3: crasher started",
-        "phase 3: crasher START_PROCESS failed",
-    )
-    {
-        return false;
-    }
-
-    let svcmgr_copy = if svcmgr_service_ep != 0
-    {
-        syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND).unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
-
-    serve(
-        bootstrap_ep,
-        child_token,
-        ipc_buf,
-        true,
-        &[svcmgr_copy],
-        &[],
-        "phase 3: crasher bootstrap failed",
-    )
-}
-
-/// One service's registration data, passed to `register_service`.
-///
-/// Two restart sources are supported:
-///   - Module-loaded: pass `module_cap` (frame cap holding the ELF), leave
-///     `vfs_path` empty. svcmgr restarts via `CREATE_PROCESS`.
-///   - VFS-loaded: pass `vfs_path` (e.g. `b"/bin/crasher"`), leave
-///     `module_cap` zero. svcmgr re-walks its own `root_dir_cap` to
-///     the path on every restart and uses `CREATE_FROM_FILE`.
+/// Post-#21 the recipe (binary, argv, env, restart policy,
+/// criticality, namespace shape, seed names) lives on disk at
+/// `/etc/svcmgr/services.d/<name>.svc`. The wire conveys only what
+/// cannot be on disk: which named recipe this running process
+/// implements, and the thread cap svcmgr binds death-notification on.
 pub struct ServiceRegistration<'a>
 {
     pub name: &'a [u8],
-    pub restart_policy: u8,
-    pub criticality: u8,
     pub thread_cap: u32,
-    pub module_cap: u32,
-    /// Optional extra named cap for svcmgr's restart bundle. If both
-    /// `bundle_name` is non-empty and `bundle_cap != 0`, the cap will be
-    /// re-injected into every restart of this service under the given name.
-    pub bundle_name: &'a [u8],
-    pub bundle_cap: u32,
-    /// VFS path for restart via svcmgr-side walk + `CREATE_FROM_FILE`.
-    /// Empty for module-loaded
-    /// services. Mutually exclusive with `module_cap` at the protocol level
-    /// (presence is signalled by a non-zero `vfs_path_len` in the label).
-    pub vfs_path: &'a [u8],
-    /// Namespace-policy kind svcmgr re-applies on every restart of
-    /// this service. One of
-    /// [`svcmgr_labels::NS_POLICY_UNIVERSAL`],
-    /// [`svcmgr_labels::NS_POLICY_NONE`],
-    /// [`svcmgr_labels::NS_POLICY_SUBTREE`]. The descriptor must
-    /// match what init installed via `configure_child_namespace` at
-    /// first spawn; otherwise the post-restart `system_root_cap`
-    /// differs from the initial one.
-    pub ns_policy_kind: u8,
-    /// Subtree path for [`svcmgr_labels::NS_POLICY_SUBTREE`]. Empty
-    /// for the other two kinds. Bounded by [`ipc::MAX_PATH_LEN`].
-    pub ns_subtree_path: &'a [u8],
-    /// Rights mask requested per hop when svcmgr walks
-    /// `ns_subtree_path` from its own root. Only the low 24 bits are
-    /// meaningful per `namespace-protocol`; the wire reserves the
-    /// upper 8 of the descriptor's 32 bits for future expansion.
-    pub ns_subtree_rights: u32,
 }
 
-/// Register a service with svcmgr via `REGISTER_SERVICE`.
-///
-/// See [`svcmgr_labels::REGISTER_SERVICE`] for the authoritative wire
-/// format. The descriptor at the tail (one packed word plus optional
-/// subtree-path bytes) is what svcmgr re-applies on every restart of
-/// this service, so attenuation survives crash cycles.
-///
-/// Cap layout depends on the load mode:
-///   module-loaded (`vfs_path_len` == 0): [thread, module, optional bundle]
-///   VFS-loaded    (`vfs_path_len`  > 0): [thread, optional bundle]
+/// Register a currently-running service with svcmgr via the v3
+/// [`svcmgr_labels::REGISTER_SERVICE`] wire (`word 0` =
+/// `SVCMGR_LABELS_VERSION`, `word 1` = `name_len`, `words 2..` = name
+/// bytes, `caps[0]` = thread cap). svcmgr parks the entry and
+/// reconciles against `services.d/` on `HANDOVER_COMPLETE`.
 pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistration)
 {
-    let name_words = reg.name.len().div_ceil(8);
-
-    let vfs_loaded = !reg.vfs_path.is_empty();
-    let vfs_path_len = if vfs_loaded { reg.vfs_path.len() } else { 0 };
-    let vfs_path_words = vfs_path_len.div_ceil(8);
-
-    // Bundle-name tail: [bundle_name_len, bundle_name_words...] packed after
-    // the service name. Zero if no bundle cap is being sent.
-    // word 0 holds SVCMGR_LABELS_VERSION; restart_policy/criticality occupy
-    // words 1 and 2; the name starts at word 3.
-    let bundle_name_len_word = 3 + name_words;
-    let has_restart_source = reg.module_cap != 0 || vfs_loaded;
-    let include_bundle = has_restart_source
-        && reg.bundle_cap != 0
-        && !reg.bundle_name.is_empty()
-        && reg.bundle_name.len() <= 16;
-    let bundle_name_len = if include_bundle
+    let name_len = reg.name.len();
+    if name_len == 0 || name_len > 32 || reg.thread_cap == 0
     {
-        reg.bundle_name.len()
+        log("phase 3: REGISTER_SERVICE caller bug (empty name or zero thread cap)");
+        return;
     }
-    else
-    {
-        0
-    };
-    let bundle_name_words = bundle_name_len.div_ceil(8);
-    let vfs_path_word = bundle_name_len_word + 1 + bundle_name_words;
+    let name_words = name_len.div_ceil(8);
+    let data_count = 2 + name_words;
 
-    // Namespace-policy descriptor: one packed word + optional path bytes.
-    let ns_policy_word = vfs_path_word + vfs_path_words;
-    let ns_subtree_path_len = if reg.ns_policy_kind == svcmgr_labels::NS_POLICY_SUBTREE
-    {
-        reg.ns_subtree_path.len()
-    }
-    else
-    {
-        0
-    };
-    let ns_subtree_path_words = ns_subtree_path_len.div_ceil(8);
-    let ns_packed = u64::from(reg.ns_policy_kind)
-        | ((ns_subtree_path_len as u64) << 16)
-        | (u64::from(reg.ns_subtree_rights) << 32);
-
-    let data_count = ns_policy_word + 1 + ns_subtree_path_words;
-    let label = svcmgr_labels::REGISTER_SERVICE
-        | ((reg.name.len() as u64) << 16)
-        | ((vfs_path_len as u64) << 32);
-
-    let mut builder = IpcMessage::builder(label)
+    let msg = IpcMessage::builder(svcmgr_labels::REGISTER_SERVICE)
         .word(0, u64::from(ipc::SVCMGR_LABELS_VERSION))
-        .word(1, u64::from(reg.restart_policy))
-        .word(2, u64::from(reg.criticality))
-        .bytes(3, reg.name)
-        .word(bundle_name_len_word, bundle_name_len as u64);
-    if bundle_name_len > 0
-    {
-        builder = builder.bytes(
-            bundle_name_len_word + 1,
-            &reg.bundle_name[..bundle_name_len],
-        );
-    }
-    if vfs_path_len > 0
-    {
-        builder = builder.bytes(vfs_path_word, reg.vfs_path);
-    }
-    builder = builder.word(ns_policy_word, ns_packed);
-    if ns_subtree_path_len > 0
-    {
-        builder = builder.bytes(
-            ns_policy_word + 1,
-            &reg.ns_subtree_path[..ns_subtree_path_len],
-        );
-    }
-    builder = builder.word_count(data_count);
+        .word(1, name_len as u64)
+        .bytes(2, reg.name)
+        .word_count(data_count)
+        .cap(reg.thread_cap)
+        .build();
 
-    if reg.thread_cap != 0
-    {
-        builder = builder.cap(reg.thread_cap);
-    }
-    if !vfs_loaded && reg.module_cap != 0
-    {
-        builder = builder.cap(reg.module_cap);
-    }
-    if include_bundle && let Ok(derived) = syscall::cap_derive(reg.bundle_cap, syscall::RIGHTS_SEND)
-    {
-        builder = builder.cap(derived);
-    }
-
-    let msg = builder.build();
     // SAFETY: ipc_buf is the caller's registered IPC buffer.
     match unsafe { ipc::ipc_call(svcmgr_ep, &msg, ipc_buf) }
     {
@@ -1588,13 +1209,12 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
 
 // ── Phase 3 orchestration ───────────────────────────────────────────────────
 
-/// Phase 3: create svcmgr from VFS, register services, start crasher, handover.
-// clippy::too_many_lines: svcmgr handover is a single transaction that owns
-// the in-flight tokens for svcmgr and crasher processes; the partial-state
-// unwind on any failure (svcmgr creation fails, crasher creation fails,
-// registration fails, HANDOVER_COMPLETE fails) must see every token in
-// scope. Factoring into helpers requires threading every token through each,
-// which regresses readability.
+/// Phase 3: spawn svcmgr, bring up the wallclock chain, spawn pwrmgr,
+/// register pwrmgr with svcmgr (v3 wire), publish the named caps
+/// post-#21 consumers resolve from `services.d/<name>.svc` `seed = ...`
+/// lines, then signal `HANDOVER_COMPLETE` so svcmgr scans
+/// `services.d/` and launches the unregistered-but-defined services
+/// (crasher, usertest).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn phase3_svcmgr_handover(
     info: &InitInfo,
@@ -1602,13 +1222,14 @@ pub fn phase3_svcmgr_handover(
     bootstrap_ep: u32,
     svcmgr_service_ep: u32,
     system_root_cap: u32,
-    fatfs_root_cap: u32,
+    rootfs_root_cap: u32,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
     init_ipc_buf_cap: u32,
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
+    let _ = system_root_cap;
 
     // svcmgr's service endpoint is created in early init
     // (before bootstrap_procmgr) so procmgr can receive an un-tokened
@@ -1662,52 +1283,7 @@ pub fn phase3_svcmgr_handover(
         ipc_buf,
     );
 
-    let crasher = create_crasher_suspended_from_file(
-        procmgr_ep,
-        bootstrap_ep,
-        system_root_cap,
-        init_self_cspace,
-        ipc_buf,
-    );
-
-    log("phase 3: registering services with svcmgr");
-
-    if let Some((crasher_handle, crasher_thread, crasher_token)) = crasher
-    {
-        register_service(
-            svcmgr_service_ep,
-            ipc_buf,
-            &ServiceRegistration {
-                name: b"crasher",
-                restart_policy: 0, // POLICY_ALWAYS
-                criticality: 1,    // CRITICALITY_NORMAL
-                thread_cap: crasher_thread,
-                module_cap: 0,
-                bundle_name: b"svcmgr",
-                bundle_cap: svcmgr_service_ep,
-                vfs_path: b"/bin/crasher",
-                // crasher was spawned with no namespace cap; svcmgr
-                // restarts it with the same `NsPolicy::None` shape.
-                ns_policy_kind: svcmgr_labels::NS_POLICY_NONE,
-                ns_subtree_path: b"",
-                ns_subtree_rights: 0,
-            },
-        );
-
-        start_and_bootstrap_crasher(
-            crasher_handle,
-            crasher_token,
-            bootstrap_ep,
-            svcmgr_service_ep,
-            ipc_buf,
-        );
-    }
-
-    // Spawn pwrmgr before usertest so we can hand usertest a tokened
-    // SEND on pwrmgr's service endpoint. usertest invokes
-    // `pwrmgr_labels::SHUTDOWN` through that cap on the success path so
-    // naked `xtask run` exits cleanly when the test suite finishes.
-    let pwrmgr_service_ep = create_and_start_pwrmgr(
+    let pwrmgr_spawn = create_and_start_pwrmgr(
         info,
         procmgr_ep,
         bootstrap_ep,
@@ -1715,42 +1291,9 @@ pub fn phase3_svcmgr_handover(
         init_self_cspace,
         ipc_buf,
     );
-    let (pwrmgr_auth_cap, pwrmgr_noauth_cap) = if let Some(ep) = pwrmgr_service_ep
+    let (pwrmgr_service_ep, pwrmgr_thread_cap) = if let Some(s) = pwrmgr_spawn
     {
-        let auth = if let Ok(c) = syscall::cap_derive_token(
-            ep,
-            syscall::RIGHTS_SEND,
-            ipc::pwrmgr_labels::SHUTDOWN_AUTHORITY,
-        )
-        {
-            c
-        }
-        else
-        {
-            log("phase 3: pwrmgr SHUTDOWN_AUTHORITY derive failed");
-            0
-        };
-        // No-authority twin used by usertest's `pwrmgr_cap_deny_phase`
-        // to verify the SHUTDOWN gate rejects callers without the
-        // `SHUTDOWN_AUTHORITY` token bit. Tokenized with a non-AUTHORITY
-        // sentinel (`1`) so the gate fails the
-        // `msg.token & SHUTDOWN_AUTHORITY != 0` check, AND so usertest
-        // cannot subsequently call `cap_derive_token` on this cap to
-        // mint a privileged twin — `sys_cap_derive_token` rejects
-        // sources with `src_token != 0`. Plain `cap_derive` would
-        // produce an un-tokened cap that usertest could re-tokenize
-        // with any value (including `SHUTDOWN_AUTHORITY`), defeating
-        // the very gate this test is supposed to exercise.
-        let noauth = if let Ok(c) = syscall::cap_derive_token(ep, syscall::RIGHTS_SEND, 1)
-        {
-            c
-        }
-        else
-        {
-            log("phase 3: pwrmgr no-auth derive failed");
-            0
-        };
-        (auth, noauth)
+        (s.service_ep, s.thread_cap)
     }
     else
     {
@@ -1758,17 +1301,106 @@ pub fn phase3_svcmgr_handover(
         (0, 0)
     };
 
-    // Spawn usertest (run-once test driver; no svcmgr registration).
-    create_and_run_usertest(
-        procmgr_ep,
-        bootstrap_ep,
-        system_root_cap,
-        init_self_cspace,
-        fatfs_root_cap,
-        pwrmgr_auth_cap,
-        pwrmgr_noauth_cap,
-        ipc_buf,
-    );
+    // Derive a PUBLISH_AUTHORITY-tokened SEND on svcmgr's service ep
+    // so init can publish the named caps post-#21 consumers resolve
+    // through `services.d/<name>.svc` `seed = ...`. After the four
+    // publications init drops this cap; runtime consumers use the
+    // un-tokened SEND seeded into `ProcessInfo.service_registry_cap`.
+    let publish_cap = syscall::cap_derive_token(
+        svcmgr_service_ep,
+        syscall::RIGHTS_SEND,
+        svcmgr_labels::PUBLISH_AUTHORITY,
+    )
+    .ok();
+
+    // 1. rootfs.root — tokened SEND on the root filesystem's namespace
+    //    endpoint at its root directory. FS-driver-agnostic by design:
+    //    today fatfs, tomorrow any other FS driver, same name.
+    if let Some(cap) = publish_cap
+        && rootfs_root_cap != 0
+        && let Ok(derived) = syscall::cap_derive(rootfs_root_cap, syscall::RIGHTS_SEND)
+        && !svcmgr_publish(cap, ipc::published_names::ROOTFS_ROOT, derived, ipc_buf)
+    {
+        log("phase 3: publish rootfs.root failed");
+        let _ = syscall::cap_delete(derived);
+    }
+
+    // 2/3. pwrmgr.shutdown + pwrmgr.deny — derived from pwrmgr's
+    //      service endpoint with the SHUTDOWN_AUTHORITY token bit set
+    //      (or a non-AUTHORITY sentinel `1` for the negative-test
+    //      twin). Plain SEND would let consumers re-tokenize the cap
+    //      and defeat the gate; cap_derive_token rejects sources with
+    //      a non-zero token, so the AUTHORITY shape stays sealed.
+    if let Some(cap) = publish_cap
+        && pwrmgr_service_ep != 0
+    {
+        if let Ok(auth) = syscall::cap_derive_token(
+            pwrmgr_service_ep,
+            syscall::RIGHTS_SEND,
+            ipc::pwrmgr_labels::SHUTDOWN_AUTHORITY,
+        )
+        {
+            if !svcmgr_publish(cap, ipc::published_names::PWRMGR_SHUTDOWN, auth, ipc_buf)
+            {
+                log("phase 3: publish pwrmgr.shutdown failed");
+                let _ = syscall::cap_delete(auth);
+            }
+        }
+        else
+        {
+            log("phase 3: derive pwrmgr.shutdown cap failed");
+        }
+        if let Ok(deny) = syscall::cap_derive_token(pwrmgr_service_ep, syscall::RIGHTS_SEND, 1)
+        {
+            if !svcmgr_publish(cap, ipc::published_names::PWRMGR_DENY, deny, ipc_buf)
+            {
+                log("phase 3: publish pwrmgr.deny failed");
+                let _ = syscall::cap_delete(deny);
+            }
+        }
+        else
+        {
+            log("phase 3: derive pwrmgr.deny cap failed");
+        }
+    }
+
+    // 4. svcmgr — tokened SEND on svcmgr's own service endpoint. Used
+    //    by crasher.svc's `seed = svcmgr` line so the launched
+    //    crasher receives the same cap shape today's hard-coded
+    //    bundle gave it. Per-publisher attenuation (so children can
+    //    only QUERY, not PUBLISH) lives in the SEND-without-AUTHORITY
+    //    shape — same as `ProcessInfo.service_registry_cap`.
+    if let Some(cap) = publish_cap
+        && let Ok(svc_send) = syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND)
+        && !svcmgr_publish(cap, b"svcmgr", svc_send, ipc_buf)
+    {
+        log("phase 3: publish svcmgr failed");
+        let _ = syscall::cap_delete(svc_send);
+    }
+
+    if let Some(cap) = publish_cap
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+
+    // Register pwrmgr with svcmgr (v3 wire: name + thread cap).
+    // Other foundational services (vfsd, devmgr, procmgr, memmgr,
+    // logd, timed) are not registered in this PR — their thread caps
+    // are not threaded through the existing bootstrap paths; svcmgr
+    // launches the unregistered-and-defined set
+    // (`crasher.svc`, `usertest.svc`) and otherwise sees only pwrmgr
+    // as a `bind only`. Filed as a follow-up.
+    if pwrmgr_thread_cap != 0
+    {
+        register_service(
+            svcmgr_service_ep,
+            ipc_buf,
+            &ServiceRegistration {
+                name: b"pwrmgr",
+                thread_cap: pwrmgr_thread_cap,
+            },
+        );
+    }
 
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
     // SAFETY: ipc_buf is caller's registered IPC buffer.
@@ -2221,7 +1853,7 @@ fn walk_and_create_from_file(
     bootstrap_ep: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
-    policy: NsPolicy<'_>,
+    policy: NsPolicy,
     cwd: Option<(&[u8], u64)>,
     ipc_buf: *mut u64,
 ) -> Option<(u32, u64)>

@@ -11,11 +11,19 @@
 //!
 //! All ACPI parsing happens in userspace — the kernel and bootloader are not
 //! involved beyond providing Frame caps for the firmware table regions.
+//!
+//! I/O port permission for `PM1a_CNT_BLK` is obtained at shutdown time via
+//! `ioport::bind_port_range`, which carves a narrow `IoPortRange` cap
+//! covering exactly the `PM1a` control register from the residual wide
+//! cap left by earlier consumers.
 
 use init_protocol::{CapType, InitInfo};
 
 /// ACPI PM1 control register: `SLP_EN` bit (bit 13).
 const SLP_EN: u16 = 1 << 13;
+
+/// `PM1a_CNT_BLK` register width — 2 bytes per ACPI 6.x § 4.8.3.2.1.
+const PM1A_CNT_PORTS: u16 = 2;
 
 /// Virtual address base for mapping ACPI tables.
 const ACPI_MAP_BASE: u64 = 0x4000_0000;
@@ -51,13 +59,7 @@ pub fn shutdown(info: &InitInfo)
         return;
     };
 
-    let Some(ioport_slot) = find_cap_by_type(info, CapType::IoPortRange)
-    else
-    {
-        crate::log("ktest: shutdown failed (IoPortRange cap not found)");
-        return;
-    };
-    if syscall::ioport_bind(info.thread_cap, ioport_slot).is_err()
+    if !crate::ioport::bind_port_range(info.thread_cap, pm1a_cnt_blk, PM1A_CNT_PORTS)
     {
         crate::log("ktest: shutdown failed (ioport_bind)");
         return;
@@ -65,8 +67,9 @@ pub fn shutdown(info: &InitInfo)
 
     let value = (slp_typa << 10) | SLP_EN;
 
-    // SAFETY: `PM1a_CNT_BLK` is a valid I/O port from FADT; IOPB permits access
-    // after ioport_bind; writing `SLP_TYPa`|`SLP_EN` triggers ACPI S5.
+    // SAFETY: `PM1a_CNT_BLK` is a valid I/O port from FADT; the IOPB grant
+    // for [PM1a_CNT_BLK, +2) was established by the bind_port_range call
+    // above; writing `SLP_TYPa | SLP_EN` triggers ACPI S5.
     unsafe {
         core::arch::asm!(
             "out dx, ax",
@@ -334,19 +337,6 @@ fn descriptors(info: &InitInfo) -> &[init_protocol::CapDescriptor]
             info.cap_descriptor_count as usize,
         )
     }
-}
-
-/// Find the first cap matching `wanted_type`.
-fn find_cap_by_type(info: &InitInfo, wanted_type: CapType) -> Option<u32>
-{
-    for desc in descriptors(info)
-    {
-        if desc.cap_type == wanted_type
-        {
-            return Some(desc.slot);
-        }
-    }
-    None
 }
 
 /// Read a little-endian u32 at byte offset `off` from virtual address `vaddr`.

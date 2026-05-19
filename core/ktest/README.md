@@ -37,7 +37,7 @@ kernel's own source layout.
 | `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT` |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS` |
-| `hw.rs` | `SYS_MMIO_MAP`, `SYS_DMA_GRANT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IOPORT_BIND` |
+| `hw.rs` | `SYS_MMIO_MAP`, `SYS_DMA_GRANT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 
 Adding a new syscall means adding a section in the appropriate file here.
@@ -98,8 +98,11 @@ Defined in `src/main.rs`:
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,
   records PASS or FAIL (with reason), and never panics.
-- `TestContext` — thin struct carrying `aspace_cap` and the IPC buffer pointer,
-  passed by reference to every test function.
+- `TestContext` — thin struct carrying `aspace_cap`, `cspace_cap`, and the
+  IPC buffer pointer, passed by reference to every test function. `cspace_cap`
+  is queried via `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` by hardware tests
+  whose scans must cover slots populated after `aspace_cap` (e.g. narrow
+  `IoPortRange` caps carved by `ioport::bind_port_range` on `x86_64`).
 - `PASS_COUNT` / `FAIL_COUNT` — atomic counters updated by `run_test!`.
 - `log(msg)` / `log_u64(prefix, value)` — heap-free logging utilities.
 

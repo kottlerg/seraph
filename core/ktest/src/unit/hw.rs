@@ -23,6 +23,13 @@ use crate::{TestContext, TestResult};
 /// Test virtual address for MMIO mapping. 1.25 GiB — above ktest's load address.
 const MMIO_TEST_VA: u64 = 0x5000_0000;
 
+/// Kernel pin: every `CSpace` is clamped to at most `L1_SIZE * L2_SIZE`
+/// (256 * 64 = 16384) slots. Used as a fallback if `cap_info` ever
+/// returns a value larger than `u32::MAX`, which the kernel's own
+/// invariants forbid today.
+#[cfg(target_arch = "x86_64")]
+const ROOT_CSPACE_MAX_SLOTS: u32 = 16384;
+
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
 
 /// `mmio_map` maps a hardware MMIO region into the address space.
@@ -101,6 +108,11 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 /// On RISC-V this syscall is not supported and must return `NotSupported`.
 /// On `x86_64`, scans for the first `IoPortRange` cap and binds it to a test
 /// thread. If no `IoPortRange` cap is found, the test is skipped.
+///
+/// The scan bound is the cspace's `max_slots` (queried at runtime via
+/// `cap_info`) so the test stays robust against changes to cap mint
+/// order or post-init carve products landing at slot indices above
+/// `aspace_cap`.
 // needless_return: cfg-gated early return is required to terminate the riscv64
 // path; the x86_64 path follows in the same function body.
 #[allow(clippy::needless_return)]
@@ -126,7 +138,18 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
         let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
             .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
 
-        for slot in 1..ctx.aspace_cap
+        let max_slots = if let Ok(n) =
+            syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+        {
+            u32::try_from(n).unwrap_or(ROOT_CSPACE_MAX_SLOTS)
+        }
+        else
+        {
+            syscall::cap_delete(th).ok();
+            syscall::cap_delete(cs).ok();
+            return Err("cap_info(CAP_INFO_CSPACE_CAPACITY) failed");
+        };
+        for slot in 1u32..max_slots
         {
             match syscall::ioport_bind(th, slot)
             {
@@ -155,11 +178,13 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
 /// `ioport_split` divides an `IoPortRange` cap into two non-overlapping children.
 ///
 /// On RISC-V this syscall is not supported and must return `NotSupported`.
-/// On `x86_64`, scans for the first `IoPortRange` cap and splits it at port
-/// 0x80 (a well-known reserved port that lies inside any legacy port range).
-/// Validates: both child slots are non-zero and distinct; re-splitting the
-/// now-consumed parent slot fails; out-of-range splits fail with
-/// `InvalidArgument`. If no `IoPortRange` cap is found, the test is skipped.
+/// On `x86_64`, scans the cspace for the first `IoPortRange` cap whose
+/// range covers port 0x80 and splits it there. Slots whose cap is the
+/// wrong type or an `IoPortRange` not covering 0x80 are skipped
+/// non-destructively. Validates: both child slots are non-zero and
+/// distinct; re-splitting the now-consumed parent slot fails;
+/// out-of-range splits fail with `InvalidArgument`. If no such
+/// `IoPortRange` is found, the test is skipped.
 ///
 /// The original cap is consumed by the split; this is the documented
 /// semantics. No later test depends on the same slot.
@@ -180,20 +205,33 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    // x86_64: find an IoPortRange cap by probing with ioport_split.
-    // ioport_split returns InvalidCapability for wrong cap types and
-    // InvalidArgument for an IoPortRange whose range doesn't cover the
-    // split point. Either result lets us identify the slot's type
-    // non-destructively, since neither consumes the cap.
+    // x86_64: find an IoPortRange cap covering 0x80 by probing with
+    // `ioport_split`. `ioport_split` returns `InvalidCapability` for
+    // wrong cap types and `InvalidArgument` for an `IoPortRange` whose
+    // range doesn't cover the split point. Either result lets us
+    // identify the slot's type non-destructively, since neither
+    // consumes the cap.
+    //
+    // The scan bound is the cspace's `max_slots` (queried at runtime
+    // via `cap_info`) so post-init carve products from `ioport::init`
+    // — which land at slot indices above `aspace_cap` — are always
+    // reachable, regardless of how the cspace has grown.
     #[cfg(target_arch = "x86_64")]
     {
-        for slot in 1..ctx.aspace_cap
+        let max_slots =
+            match syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+            {
+                Ok(n) => u32::try_from(n).unwrap_or(ROOT_CSPACE_MAX_SLOTS),
+                Err(_) => return Err("cap_info(CAP_INFO_CSPACE_CAPACITY) failed"),
+            };
+        for slot in 1u32..max_slots
         {
             // Try splitting at 0x80. If the slot is not an IoPortRange we
             // get InvalidCapability and keep scanning. If it is an
-            // IoPortRange that doesn't cover 0x80 we get InvalidArgument
-            // (cap not consumed) and the test reports SKIP. If it
-            // succeeds we validate and clean up.
+            // IoPortRange that doesn't cover 0x80 (e.g. a narrow
+            // sub-range carved by `ioport::bind_port_range`) we also keep
+            // scanning — another slot may hold a wider IoPortRange that
+            // does cover the probe point.
             match syscall::ioport_split(slot, 0x80)
             {
                 Err(e) if e == SyscallError::InvalidCapability as i64 =>
@@ -202,15 +240,8 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
                 }
                 Err(e) if e == SyscallError::InvalidArgument as i64 =>
                 {
-                    // Slot is an IoPortRange but doesn't cover 0x80. Cap
-                    // is intact. Try a port that the test harness's
-                    // typical range definitely covers: any port in
-                    // [base, base+size) is valid. Without knowing the
-                    // range, skip cleanly.
-                    crate::log(
-                        "ktest: hw::ioport_split SKIP (IoPortRange found but doesn't cover 0x80)",
-                    );
-                    return Ok(());
+                    // IoPortRange whose range doesn't cover 0x80; cap is
+                    // intact. Keep scanning for another candidate.
                 }
                 Err(_) =>
                 {
@@ -228,10 +259,8 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
                         return Err("re-split of consumed parent succeeded");
                     }
                     // Out-of-range split on a child must fail with
-                    // InvalidArgument. 0xFFFF likely lies in the upper
-                    // child's range (which covers [0x80, end)); test
-                    // both children with split values guaranteed
-                    // out-of-bounds (0 is always invalid).
+                    // InvalidArgument. 0 is always invalid (would yield
+                    // an empty lower half).
                     let oob = syscall::ioport_split(slot1, 0);
                     if !matches!(oob, Err(e) if e == SyscallError::InvalidArgument as i64)
                     {
@@ -245,7 +274,9 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
             }
         }
 
-        crate::log("ktest: hw::ioport_split SKIP (no IoPortRange caps in initial cap set)");
+        crate::log(
+            "ktest: hw::ioport_split SKIP (no IoPortRange covering 0x80 in initial cap set)",
+        );
         Ok(())
     }
 }

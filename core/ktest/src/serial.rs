@@ -59,21 +59,6 @@ fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u
     None
 }
 
-/// Scan the `CapDescriptor` array for the first cap matching `wanted_type`.
-/// Returns the `CSpace` slot index if found.
-#[allow(dead_code)] // Used on x86-64 (IoPortRange lookup), not on RISC-V.
-fn find_cap_by_type(info: &InitInfo, wanted_type: CapType) -> Option<u32>
-{
-    for d in descriptors(info)
-    {
-        if d.cap_type == wanted_type
-        {
-            return Some(d.slot);
-        }
-    }
-    None
-}
-
 // ── x86-64: COM1 via I/O ports ───────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
@@ -82,27 +67,30 @@ mod arch
     /// COM1 base I/O port.
     const COM1: u16 = 0x3F8;
 
+    /// COM1 register width — 8 ports starting at [`COM1`].
+    const COM1_PORTS: u16 = 8;
+
     /// Initialise COM1 serial output.
     ///
-    /// Finds the `IoPortRange` cap covering COM1, binds it to the current
-    /// thread, then programs the UART to 115200 8N1.
+    /// Carves a narrow `IoPortRange` cap covering exactly COM1's 8 ports
+    /// from the root cap (via `ioport::bind_port_range`) and binds it to
+    /// the current thread, then programs the UART to 115200 8N1.
+    ///
+    /// `InitInfo` is consumed centrally by `ioport::init`; serial only
+    /// needs the narrow COM1 bind.
     ///
     /// # Safety
-    /// Must be called once, from the main thread, after `InitInfo` is mapped.
-    pub unsafe fn init(info: &super::InitInfo, thread_cap: u32)
+    /// Must be called once, from the main thread, after `InitInfo` is
+    /// mapped and `ioport::init` has run.
+    pub unsafe fn init(_info: &super::InitInfo, thread_cap: u32)
     {
-        let Some(slot) = super::find_cap_by_type(info, super::CapType::IoPortRange)
-        else
+        if !crate::ioport::bind_port_range(thread_cap, COM1, COM1_PORTS)
         {
-            return; // no IoPortRange cap — serial stays uninitialised
-        };
-
-        if syscall::ioport_bind(thread_cap, slot).is_err()
-        {
-            return;
+            return; // no IoPortRange cap, or carve/bind failed
         }
 
-        // SAFETY: ioport_bind succeeded; I/O port access is permitted.
+        // SAFETY: bind_port_range succeeded; I/O port access for [COM1,
+        // COM1+COM1_PORTS) is permitted on this thread.
         unsafe { serial_hw_init() };
 
         // SAFETY: single-threaded; serial hardware ready.

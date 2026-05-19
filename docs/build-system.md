@@ -80,9 +80,7 @@ floor for userspace SIMD / Vector codegen:
   XSAVE/XSAVEOPT for the lazy save/restore discipline.
 - `riscv64a23-seraph.json` — **RVA23U64** userspace profile (RVA23 v1.0,
   ratified 2024-10-21): IMAFDCV plus the Zba/Zbb/Zbs bitmanip set,
-  hard-float LP64D ABI. Further RVA23 mandates (Zfa, Zfhmin, Zihintntl,
-  Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt) will land as LLVM
-  and QEMU coverage broadens.
+  hard-float LP64D ABI.
 
 Userspace correctness under preemption is provided by lazy FP/SIMD/V
 save/restore in the kernel scheduler — switch-out save on dirty, switch-in
@@ -95,10 +93,8 @@ custom JSON is needed. The RISC-V bootloader uses
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace
-triples) to rebuild the standard library from source. This is passed
-explicitly by the build scripts rather than via `.cargo/config.toml`, to
-avoid interfering with `cargo test` (which builds for the host target and
-does not need `build-std`).
+triples) to rebuild the standard library from source. The build scripts
+pass the flag explicitly.
 
 ---
 
@@ -203,10 +199,10 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 
 **Minimum QEMU version:** QEMU ≥ 8.0 (V extension support) is required;
 `xtask/src/qemu.rs` passes `-cpu rv64,v=true,zba=true,zbb=true,zbs=true`
-for RISC-V and `-cpu max,migratable=no` on x86-64 TCG. The named
-`-cpu rva23s64` model arrived in QEMU 9.1 (2024-09) and is the preferred
-swap once the CI runner floor ships it; until then the explicit feature
-string is the source of truth.
+for RISC-V and `-cpu max,migratable=no` on x86-64 TCG. The explicit
+feature string is the source of truth. The named `-cpu rva23s64`
+single-flag equivalent (QEMU ≥ 9.1, 2024-09) is a documented
+configuration alternative when the CI runner floor supports it.
 
 ---
 
@@ -220,8 +216,8 @@ tree, scheduler run queues) keep hardware dependencies behind trait boundaries. 
 to run these modules on the host under the standard test harness.
 
 **QEMU integration tests** — Code requiring real hardware (page tables, interrupts, context
-switching) is tested under QEMU with a custom harness that runs tests sequentially and reports
-results over serial. This harness will be implemented when arch code is written.
+switching) is tested under QEMU by the [`core/ktest`](../core/ktest/README.md) harness, which
+runs tests sequentially and reports results over serial.
 
 ### Running Tests
 
@@ -231,7 +227,7 @@ cargo xtask test --component kernel     # single crate
 ```
 
 For test naming conventions and requirements (what must be tested, what should not), see
-[coding-standards.md](coding-standards.md#testing).
+[coding-standards.md](coding-standards.md#d-testing-invariants).
 
 ---
 
@@ -245,6 +241,27 @@ See [`xtask/README.md`](../xtask/README.md) for the full command reference and
 
 ---
 
+## Continuous Integration
+
+CI workflows live in `.github/workflows/`. Local equivalents are the
+`cargo xtask` commands documented above.
+
+| Workflow | Trigger | Purpose |
+|---|---|---|
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, runs one usertest iteration against the default `boot.conf`, then swaps `boot.conf` to `init=ktest` and runs one ktest iteration. |
+| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: per `arch × profile` cell, builds and runs `4 × 20` usertest iterations against the default `boot.conf`, then swaps to ktest and runs `4 × 20` ktest iterations. |
+| `release.yml` | tag push (`v*.*.*`), manual dispatch | Builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
+
+`build-test.yml` cancels stacked runs on the same ref
+(`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not
+cancel on the same ref — a tag-push run completes even if a later tag
+pushes.
+
+The merge-gating rule (CI must pass green before merge) lives in
+[conventions.md](conventions.md#branch-and-pr-workflow).
+
+---
+
 ## Summarized By
 
-[README.md](../README.md)
+[README.md](../README.md), [conventions.md](conventions.md)

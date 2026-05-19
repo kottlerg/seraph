@@ -149,17 +149,12 @@ gives the PR-level linear view.
   acceptance rule under "Backlog Tracking" above.
 - Edit via `gh pr edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI.
 
-## CI Workflows
+## CI Gating
 
-| Workflow file | Trigger | Purpose |
-|---|---|---|
-| `.github/workflows/build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, runs one usertest iteration against the default `boot.conf`, then swaps `boot.conf` to `init=ktest` and runs one ktest iteration. |
-| `.github/workflows/burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: per `arch × profile` cell, builds and runs `4 × 20` usertest iterations against the default `boot.conf`, then swaps to ktest and runs `4 × 20` ktest iterations. |
-| `.github/workflows/release.yml` | tag push (`v*.*.*`), manual dispatch | Builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
-
-`build-test.yml` cancels stacked runs on the same ref (`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not cancel on the same ref — a tag-push run completes even if a later tag pushes.
-
-Local equivalents of the CI runs are documented in [build-system.md](build-system.md) and the `xtask` command surface lives in [`xtask/README.md`](../xtask/README.md).
+CI status checks MUST pass before merge. The authoritative workflow
+inventory and per-workflow shape live in
+[build-system.md](build-system.md#continuous-integration); local
+equivalents are the `cargo xtask` commands documented there.
 
 ## Release Production
 

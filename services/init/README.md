@@ -201,4 +201,4 @@ Init derives and transfers these to services using the "derive twice" pattern
 
 ## Summarized By
 
-None
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Process Lifecycle](../../docs/process-lifecycle.md)

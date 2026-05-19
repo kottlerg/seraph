@@ -1,11 +1,16 @@
 # IPC Design
 
-All communication between processes goes through the kernel's IPC mechanism. Two
-processes that do not share an IPC capability cannot communicate.
+All communication between processes goes through the kernel's IPC mechanism.
+
+---
+
+## Overview
+
+Two processes that do not share an IPC capability cannot communicate.
 
 - **Synchronous calls** for structured request/reply between services.
-- **Asynchronous primitives** for event delivery: signals (coalescing bitmask) and
-  event queues (ordered ring).
+- **Asynchronous primitives** for event delivery: signals (coalescing
+  bitmask) and event queues (ordered ring).
 
 ---
 
@@ -149,4 +154,10 @@ The kernel does not provide:
 
 ## Summarized By
 
-[Architecture Overview](architecture.md)
+[README.md](../README.md),
+[Architecture Overview](architecture.md),
+[devmgr/README.md](../services/devmgr/README.md),
+[logd/README.md](../services/logd/README.md),
+[memmgr/README.md](../services/memmgr/README.md),
+[procmgr/README.md](../services/procmgr/README.md),
+[vfsd/README.md](../services/vfsd/README.md)

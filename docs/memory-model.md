@@ -1,5 +1,12 @@
 # Memory Model
 
+System-scope virtual address space layout, paging, and physical memory
+management for both supported architectures.
+
+---
+
+## Overview
+
 Seraph uses a conventional higher-half kernel layout on both supported architectures.
 The kernel occupies the upper portion of the virtual address space; userspace processes
 occupy the lower portion. Each process has its own isolated address space. The kernel
@@ -81,9 +88,6 @@ maps segments as directed by the binary format. The general convention is:
   0x0000000000400000 ┘  Program image (text, rodata, data, bss)
 ```
 
-Stack and heap placement will be randomised (ASLR) once the kernel's random number
-source is available. Exact base addresses are not fixed at this stage.
-
 Concrete VA management surfaces, the frame-allocation contract, and ownership
 boundaries between the kernel, memmgr, procmgr, and `std::sys::seraph` are
 documented in [userspace-memory-model.md](userspace-memory-model.md). The
@@ -155,38 +159,13 @@ boot modules, and reserved regions is marked unavailable.
 
 ### Bootloader Scratch Reclamation
 
-Pages the bootloader allocated for its own scratch use — the `BootInfo`
-struct, the module descriptor array, the memory-map entry array, the
-MMIO aperture array, the reclaim-array page itself, the cmdline page,
-the AP SIPI trampoline page, and every transient page-table frame —
-are recorded in `BootInfo.reclaim_ranges` (boot protocol v7) and
-consumed by `cap::mint_reclaim_frame_caps` during Phase 7. The kernel
-mints one reclaimable Frame cap per range (`owns_memory = true`, full
-byte ledger) and inserts it into the root `CSpace` so the cap reaches
-init through the standard `CapDescriptor` walk. The buddy ledger
-records each range via `register_owned_range` so cap teardown returns
-the pages via the existing `dealloc_object` → `free_range` path with
-the `total / free` ratio well-defined. Whether init donates the cap
-onward to memmgr or lets it cascade back to the buddy on CSpace
-teardown is a userspace policy decision; the kernel does not impose a
-route.
-
-Two entries reach the cap surface through indirect paths:
-
-- The cmdline page lands in `reclaim_ranges` like every other early
-  entry, but only after the kernel snapshots its contents into a small
-  BSS buffer during Phase 4. The Phase-9 `InitInfo` copy reads from the
-  snapshot, leaving the bootloader page reclaim-safe by Phase 7.
-- The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
-  `reclaim_ranges`. `cap::mint_reclaim_frame_caps` skips it during the
-  Phase-7 walk; `cap::mint_late_reclaim_frame_caps` mints it later in
-  Phase 8, after SMP bringup completes and
-  `mm::paging::unmap_identity_page` retires the low-VA identity-RWX
-  mapping. (Both arches install this identity mapping in Phase 3 — the
-  trampoline must remain executable at its PA while PC walks the
-  post-`csrw satp` / post-CR3-write instructions.) The late-mint
-  completes before Phase 9 consumes `cspace_layout`, so the descriptor
-  still flows through the standard CSpace handoff.
+Pages the bootloader allocated for its own scratch use are recorded in
+`BootInfo.reclaim_ranges` and minted as reclaimable Frame caps into
+init's CSpace by the kernel-initialisation reclaim-minting steps. See
+[`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md)
+Phase 7 (standard reclaim mint) and Phase 8 (`RECLAIM_FLAG_LATE`
+late-mint for the AP SIPI trampoline page) for the authoritative
+mechanism.
 
 ### Buddy Allocator
 
@@ -248,4 +227,4 @@ Kernel heap allocation MUST be handled as fallible at every call site.
 
 ## Summarized By
 
-[Architecture Overview](architecture.md)
+[README.md](../README.md), [Architecture Overview](architecture.md)

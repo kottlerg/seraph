@@ -17,9 +17,8 @@ Seraph is a microkernel operating system written in Rust, targeting x86-64 and R
 - Architecture-specific code isolated behind shared traits
 - Self-hosting as a long-term goal
 
-Summarized from the Project Goals and Philosophy sections of
-[docs/architecture.md](docs/architecture.md); see there for the authoritative
-statement and the reasoning behind each goal.
+Summarized from [docs/architecture.md](docs/architecture.md); see there
+for the authoritative statement.
 
 ## Structure
 
@@ -75,7 +74,6 @@ Overall project design documents live in [`docs/`](docs/):
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
 - [Namespace Model](docs/namespace-model.md) — node capabilities, per-entry rights and visibility, walking, sandboxing as cap-distribution
-- [Boot Protocol ABI crate](abi/boot-protocol/) — kernel-entry contract: `BootInfo` layout, `BOOT_PROTOCOL_VERSION`, and compliant-bootloader requirements
 - [System Bootstrap](docs/bootstrap.md) — end-to-end boot lifecycle summary (bootloader steps, kernel phases, init bootstrap)
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr, driver binding, DMA safety
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands

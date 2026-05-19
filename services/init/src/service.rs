@@ -1301,14 +1301,17 @@ pub fn phase3_svcmgr_handover(
         (0, 0)
     };
 
-    // Derive a PUBLISH_AUTHORITY-tokened SEND on svcmgr's service ep
-    // so init can publish the named caps post-#21 consumers resolve
-    // through `services.d/<name>.svc` `seed = ...`. After the four
+    // Derive a PUBLISH_AUTHORITY-tokened SEND_GRANT on svcmgr's
+    // service ep so init can publish the named caps post-#21 consumers
+    // resolve through `services.d/<name>.svc` `seed = ...`.
+    // `RIGHTS_SEND_GRANT` (not bare SEND): PUBLISH_ENDPOINT carries the
+    // value cap in the message, and the IPC kernel requires the GRANT
+    // bit on the caller's send-cap to transfer caps. After the four
     // publications init drops this cap; runtime consumers use the
     // un-tokened SEND seeded into `ProcessInfo.service_registry_cap`.
     let publish_cap = syscall::cap_derive_token(
         svcmgr_service_ep,
-        syscall::RIGHTS_SEND,
+        syscall::RIGHTS_SEND_GRANT,
         svcmgr_labels::PUBLISH_AUTHORITY,
     )
     .ok();

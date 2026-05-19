@@ -160,8 +160,12 @@ pub struct PerCpuData
     /// register file is currently believed live in this CPU's hardware
     /// XMM/YMM/x87 registers (null if none). Maintained by the `#NM`
     /// handler, the context-switch fast path, and the migration-side
-    /// flush IPI; defines the invariant `(CR0.TS=0) ⇔ (fpu_owner != null)`.
-    /// Unused on RISC-V (lazy via `sstatus.FS/VS`).
+    /// flush IPI. The invariant on each CPU is the one-way implication
+    /// `(CR0.TS=0) ⇒ (fpu_owner != null)`; equivalently, the forbidden
+    /// state is `(CR0.TS=0, fpu_owner=null)`. The states
+    /// `(TS=1, owner=null)`, `(TS=1, owner=T)`, and `(TS=0, owner=T)`
+    /// are all valid. See `arch/x86_64/fpu.rs` module docs for the
+    /// transition table. Unused on RISC-V (lazy via `sstatus.FS/VS`).
     pub fpu_owner: AtomicPtr<ThreadControlBlock>,
 }
 

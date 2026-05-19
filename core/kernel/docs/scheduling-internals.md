@@ -229,7 +229,7 @@ The window during which the BSP is live but SMP state is not yet steady. Begins 
 
 ## IPI Taxonomy
 
-The kernel sends two IPIs. Each has a defined purpose and correctness role.
+The kernel sends three IPIs. Each has a defined purpose and correctness role.
 
 ### x86_64
 
@@ -239,6 +239,7 @@ The kernel sends two IPIs. Each has a defined purpose and correctness role.
 |---|---|---|---|---|
 | 250 | `IPI_VECTOR_TLB_SHOOTDOWN` | TLB invalidation cascade | Flushes per-CPU TLB entries staged by the issuer. | Required: a writer that modifies a page-table entry MUST shoot down peer CPUs' TLBs before guaranteeing the change is observable. |
 | 251 | `IPI_VECTOR_WAKEUP` | Wake target CPU from `hlt` | EOI only (no work). | Required for the wake protocol's "always-IPI" invariant. The handler does no real work; the IPI's value is the trap entry itself, which exits `hlt` and re-enters the idle loop's check. |
+| 252 | `IPI_VECTOR_FPU_FLUSH` | Lazy-FPU owner flush on cross-CPU thread migration | Reads `FPU_FLUSH_PENDING[cpu]`, calls `fpu::flush_owner_if(target)` (CAS owner→null, XSAVE target's regs to its TCB area), clears the pending slot, EOI. | Required: the per-CPU `fpu_owner` cache marks which TCB owns the live extended-state registers. When a thread migrates to a new CPU, the destination's `#NM` handler XRSTORs from the TCB's XSAVE area; that area must be canonical, i.e. flushed from the source CPU's hardware registers before the migration commits. Issuer is the source-CPU side of `sched::flush_owner_remote` (called from `enqueue_and_wake` and `migrate_ready_thread` pre-lock). Sender spins for ack with interrupts ENABLED and preemption DISABLED, mirroring `mm::tlb_shootdown::shootdown` — required to avoid IF-versus-IPI circular deadlocks against another CPU initiating its own flush. |
 
 ### riscv64
 
@@ -248,9 +249,11 @@ The riscv64 build uses one SBI IPI extension (EID `0x735049`, FID `0`) for both 
 
 The same correctness rules apply: shootdown is required for TLB coherence; wakeup is required for the wake protocol.
 
+The lazy-FPU flush IPI is x86-64 only. RISC-V uses `sstatus.FS/VS` dirty tracking, which the trap path's `lazy_restore_fp_v` already keeps coherent across migration without a cross-hart IPI; `arch::riscv64::fpu::flush_owner_remote` is a no-op for arch-dispatch symmetry.
+
 ### Future IPIs (out of scope)
 
-Process-stop ("kill process across all CPUs"), TLB-shootdown-with-PCID variants, and scheduler-quiesce IPIs are not in the current kernel. If added, they MUST be documented in this section before landing.
+Process-stop ("kill process across all CPUs"), TLB-shootdown-with-PCID variants, scheduler-quiesce IPIs, and AVX-512 FPU-flush extensions are not in the current kernel. If added, they MUST be documented in this section before landing.
 
 ---
 

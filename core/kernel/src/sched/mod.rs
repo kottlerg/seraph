@@ -1442,17 +1442,19 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // SAFETY: ascending-CPU order satisfies lock-hierarchy rule 4.
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
-    // SAFETY: src_cpu valid; lock held. Predicate is read-only.
-    //
-    // Skip threads currently named as `src_cpu`'s lazy-FPU owner: those
-    // hold live extended-state on src_cpu's hardware registers; their
-    // per-thread XSAVE area is stale. A safe pull would require a flush
-    // IPI to src_cpu, but issuing a synchronous IPI while holding both
-    // scheduler locks risks circular-wait deadlock against another CPU
-    // doing the same. Skipping such threads from load-balance pulls
-    // costs at most one balance-tick of imbalance (the thread runs on
-    // src_cpu's next FP-using context and ceases being the owner via
-    // `#NM`), and is cheap and lock-free to detect.
+    // Skip-owner predicate: load-balance pulls cannot freshen a
+    // candidate's XSAVE area when the candidate is still named as
+    // `src_cpu`'s lazy-FPU owner. The only mechanism that would
+    // canonicalise the area is a synchronous flush IPI to `src_cpu`,
+    // but issuing an IPI while holding both `src_cpu` and `dst_cpu`
+    // scheduler locks would circular-wait against another CPU
+    // initiating its own migration (see Lock Hierarchy rule 4 and
+    // the `send_fpu_flush_ipi` deadlock-avoidance discipline in
+    // `arch/x86_64/interrupts.rs`). Skipping owner-named candidates
+    // is the deadlock-free alternative: the missed candidate stays
+    // Ready on `src_cpu` and gets picked by `src_cpu`'s next schedule
+    // tick. Detection is a single Acquire load of the per-CPU owner
+    // slot and a pointer-equality test inside the existing predicate.
     let fpu_owner_on_src =
         crate::percpu::fpu_owner_for(src_cpu).load(core::sync::atomic::Ordering::Acquire);
     // SAFETY: src_cpu valid; lock held; predicate is read-only.

@@ -356,14 +356,18 @@ pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBl
 /// clear the owner slot. Idempotent: a no-op when this CPU's owner has
 /// already been swapped to another value (e.g. by a concurrent `#NM`).
 ///
-/// Called from the IPI handler in idt.rs after the sender (a migration
-/// helper on another CPU) wrote `tcb` into this CPU's `FPU_FLUSH_PENDING`
-/// slot and delivered the IPI.
+/// Called from two contexts: (a) the IPI handler in idt.rs after the
+/// sender (a migration helper on another CPU) wrote `tcb` into this
+/// CPU's `FPU_FLUSH_PENDING` slot and delivered the IPI; (b) the local
+/// fast-path of `flush_owner_remote` when the caller's CPU is itself
+/// the source CPU (no IPI required).
 ///
 /// # Safety
-/// Must execute at ring 0 in IPI context. `tcb` must be a valid TCB
-/// pointer whose `extended.area` is allocated for the TCB's lifetime
-/// (or null, in which case this function does nothing).
+/// Must execute at ring 0 with interrupts disabled (the IPI-handler
+/// caller runs under an interrupt gate; the local-call path is invoked
+/// from syscall context with `IF=0`). `tcb` must be a valid TCB pointer
+/// whose `extended.area` is allocated for the TCB's lifetime, or null,
+/// in which case this function does nothing.
 #[cfg(not(test))]
 pub unsafe fn flush_owner_if(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {

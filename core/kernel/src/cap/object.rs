@@ -1286,23 +1286,6 @@ unsafe fn dealloc_object_one(
                         crate::sched::scheduler_for(cpu).remove_from_queue(tcb, prio);
                     }
 
-                    // Defensive: clear any per-CPU lazy-FPU ownership that
-                    // still names this TCB. By construction (migration-flush
-                    // IPI in sched/mod.rs) only the CPU on which this thread
-                    // last ran can legitimately still own it at death, but
-                    // sweeping all CPUs is bounded by `cpu_count` and locks
-                    // out a stale-pointer hazard if an invariant is violated.
-                    // No-op on RISC-V (the slot exists but is never written).
-                    for cpu in 0..cpu_count
-                    {
-                        let _ = crate::percpu::fpu_owner_for(cpu).compare_exchange(
-                            tcb,
-                            core::ptr::null_mut(),
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        );
-                    }
-
                     // Wake any reply-bound client with Interrupted; otherwise
                     // they would remain BlockedOnReply with a dangling
                     // blocked_on_object pointing at this freed server.
@@ -1389,6 +1372,27 @@ unsafe fn dealloc_object_one(
                         == 0
                     {
                         core::hint::spin_loop();
+                    }
+
+                    // x86-64 lazy-FPU: clear any per-CPU `fpu_owner` slot
+                    // still naming this TCB. Placed AFTER the `running_on`
+                    // and `context_saved` spins so the dying thread is
+                    // guaranteed to have switched out on every CPU and
+                    // taken no further `#NM` (which would have re-stored
+                    // its pointer into a CPU's owner slot). At this point
+                    // the only legitimate residue is the slot of the CPU
+                    // the thread last ran on; sweeping every CPU costs
+                    // O(MAX_CPUS) atomic CAS and locks out the stale-
+                    // pointer hazard before storage is reclaimed below.
+                    // No-op on RISC-V (the slot exists but is never written).
+                    for cpu in 0..cpu_count
+                    {
+                        let _ = crate::percpu::fpu_owner_for(cpu).compare_exchange(
+                            tcb,
+                            core::ptr::null_mut(),
+                            core::sync::atomic::Ordering::AcqRel,
+                            core::sync::atomic::Ordering::Acquire,
+                        );
                     }
                 }
 

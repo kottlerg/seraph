@@ -75,48 +75,59 @@ Init's responsibilities are strictly bounded:
    See [`services/logd/README.md`](../logd/README.md) and
    [`services/logd/docs/handover-protocol.md`](../logd/docs/handover-protocol.md).
 
-7. **Spawn Phase 3 services from VFS** — svcmgr, crasher, pwrmgr,
-   logd, the per-arch RTC driver, timed, and usertest are loaded by
-   walking init's seed system-root cap to `/bin/<name>` and issuing
+7. **Spawn Phase 3 services from VFS** — svcmgr, logd, the per-arch
+   RTC driver, timed, and pwrmgr are loaded by walking init's seed
+   system-root cap to `/bin/<name>` and issuing
    `procmgr_labels::CREATE_FROM_FILE`. Each spawn site picks a
    namespace policy that init installs via
    `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`:
 
    | Service | Policy | Notes |
    |---|---|---|
-   | `svcmgr` | `Subtree { /bin, LOOKUP\|STAT\|READ }` | Needs to re-walk for crashed-service binaries. |
-   | `usertest` | `Universal` + `cwd = /srv` | Exercises the namespace tests; demonstrates cwd delivery. |
-   | `crasher` | `None` | Intentional fault test; touches no FS. |
+   | `svcmgr` | `Universal` | Reads `/etc/svcmgr/services.d/`, walks `/bin/<name>` for launched services, re-applies per-service `.svc` attenuation on restart. |
    | `pwrmgr` | `None` | Owns `IoPortRange` / `SbiControl` / ACPI frames; no FS. |
    | `logd` | `None` | Owns the master log endpoint and arch serial authority; no FS. |
    | `timed` | `None` | Queries the svcmgr registry for `rtc.primary`; no FS. |
    | `cmos-rtc` / `goldfish-rtc` | `None` | Hardware-only driver; serves a single RTC read. |
 
    The `NsPolicy` enum and the `configure_child_namespace` helper
-   live in [`src/service.rs`](src/service.rs); the per-service
-   policies are also re-applied by svcmgr on every restart via the
-   descriptor carried in `REGISTER_SERVICE` (see
-   [`services/svcmgr/docs/restart-protocol.md`](../svcmgr/docs/restart-protocol.md)).
-   `hello` and `stdiotest` exist in `/bin/` as reserved binaries but
-   are not currently spawned by init; whoever wires them up should
-   start from `NsPolicy::None` and widen only as the binary's actual
-   needs require. See
+   live in [`src/service.rs`](src/service.rs). `crasher` and
+   `usertest` are no longer spawned by init — they are launched by
+   svcmgr after handover from their `.svc` recipes
+   (see [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)).
+   `hello`, `stdiotest`, and other `/bin/` binaries are spawned
+   on-demand by individual tests via `std::process::Command`. See
    [`docs/namespace-model.md`](../../docs/namespace-model.md) for
    the underlying namespace-cap distribution invariants.
 
-   pwrmgr is spawned before usertest so init can derive two SEND
-   caps on pwrmgr's service endpoint — one with the
-   `SHUTDOWN_AUTHORITY` token, one without — and install both as
-   seed caps in usertest's bootstrap round. usertest invokes
-   `pwrmgr_labels::SHUTDOWN` through the authorised cap on the
-   success path so naked `cargo xtask run` exits cleanly. The
-   un-tokened twin drives `pwrmgr_cap_deny_phase`, which asserts the
-   gate rejects un-tokened callers. See
-   [`services/pwrmgr/README.md`](../pwrmgr/README.md).
+8. **Publish well-known caps + register pwrmgr with svcmgr** —
+   before signalling handover, init publishes the named caps
+   post-#21 consumers resolve through `services.d/<name>.svc`
+   `seed = ...` lines, using
+   `svcmgr_labels::PUBLISH_ENDPOINT` with a
+   `PUBLISH_AUTHORITY`-tokened `RIGHTS_SEND_GRANT` cap on svcmgr's
+   service endpoint:
 
-8. **Register services with svcmgr** — before exiting, init registers
-   all started services with svcmgr along with their restart policies
-   and capability sets.
+   * `rootfs.root` — tokened SEND on the root filesystem's namespace
+     endpoint at its root directory (FS-driver-agnostic by design).
+   * `pwrmgr.shutdown` — `SHUTDOWN_AUTHORITY`-tokened SEND on
+     pwrmgr's service endpoint.
+   * `pwrmgr.deny` — no-authority SEND on pwrmgr's service endpoint
+     (negative-test twin).
+   * `svcmgr` — un-tokened SEND on svcmgr's own service endpoint.
+
+   Init also registers pwrmgr with svcmgr via the v3
+   `REGISTER_SERVICE` wire (name + thread cap; recipe lives in
+   `services.d/pwrmgr.svc`). vfsd, devmgr, procmgr, memmgr, logd,
+   and timed remain unregistered in this iteration — their thread
+   caps are not yet threaded through the existing bootstrap helpers;
+   registration is a follow-up.
+
+   Names are centralised in `ipc::published_names`. Recipes (binary,
+   argv, env, restart policy, criticality, namespace shape, seed
+   names) live on disk at `/etc/svcmgr/services.d/<name>.svc`, not
+   on the wire — see
+   [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md).
 
 9. **Reap handoff and exit** — init hands its own `AddressSpace`,
    `CSpace`, main `Thread`, and init-logd `Thread` caps plus every

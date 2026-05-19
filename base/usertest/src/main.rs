@@ -27,6 +27,13 @@
 // permits narrowly-justified blanket allows).
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod ipc_util;
+
+use ipc_util::fs::{
+    fs_create, fs_mkdir, fs_read_bytes, fs_remove, fs_rename, fs_write_inline, usertest_dir_cap,
+};
+use ipc_util::ns::{ns_lookup, ns_readdir, ns_stat};
+use ipc_util::time::epoch_to_ymdhms;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::os::seraph::startup_info;
@@ -308,37 +315,6 @@ fn system_time_phase()
     std::os::seraph::log!(
         "SystemTime phase passed ({y:04}-{mo:02}-{dd:02}T{hh:02}:{mm:02}:{ss:02}Z, sys_delta={sys_delta:?}, mono_bounds=[{mono_min:?}, {mono_max:?}])"
     );
-}
-
-/// Howard Hinnant's `civil_from_days` (inverse of `days_from_civil`)
-/// inlined for usertest's log line — keeps the dep surface zero. Maps
-/// `secs` since Unix epoch to `(year, month, day, hour, minute, second)`
-/// in UTC; matches `days_from_civil` in `services/drivers/cmos/src/main.rs`.
-///
-/// Operates entirely in unsigned arithmetic: post-2024 secs fit
-/// comfortably under `u32` for day counts and the Hinnant algorithm is
-/// branch-free for years ≥ 0.
-#[allow(clippy::cast_possible_truncation)]
-fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32)
-{
-    let days = secs / 86_400;
-    let sod = (secs % 86_400) as u32;
-    let hh = sod / 3_600;
-    let mm = (sod / 60) % 60;
-    let ss = sod % 60;
-
-    // z is days since 0000-03-01; valid for any post-epoch input.
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + (era as u32) * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    (year, month, d, hh, mm, ss)
 }
 
 /// Terminal phase: invoke pwrmgr SHUTDOWN through the
@@ -1087,128 +1063,6 @@ fn fs_rights_attenuation_phase()
 // `/usertest/` (already populated by xtask's sysroot build, so it
 // exists on every boot); test files are uniquely-named per phase so
 // re-runs do not interfere when the disk image is reused.
-
-/// Walk `/usertest` and return a directory cap. The directory exists
-/// in the sysroot at build time; xtask populates fixture files into
-/// it (large.bin, bench.bin). We add scratch entries alongside.
-fn usertest_dir_cap(ipc_buf: *mut u64) -> u32
-{
-    let root = std::os::seraph::root_dir_cap();
-    let (cap, _kind, _) =
-        ns_lookup(root, b"usertest", 0xFFFF, ipc_buf).expect("ns_lookup /usertest failed");
-    cap
-}
-
-/// `FS_CREATE` returns `(node_cap, kind)` on success. Returns the wire
-/// error code on failure.
-fn fs_create(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32, u64), u64>
-{
-    let label = ipc::fs_labels::FS_CREATE | ((name.len() as u64) << 16);
-    let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(parent_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
-    if reply.label != ipc::fs_errors::SUCCESS
-    {
-        return Err(reply.label);
-    }
-    let cap = *reply.caps().first().ok_or(0u64)?;
-    Ok((cap, reply.word(0)))
-}
-
-/// `FS_MKDIR`. Same shape as `FS_CREATE`.
-fn fs_mkdir(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(u32, u64), u64>
-{
-    let label = ipc::fs_labels::FS_MKDIR | ((name.len() as u64) << 16);
-    let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(parent_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
-    if reply.label != ipc::fs_errors::SUCCESS
-    {
-        return Err(reply.label);
-    }
-    let cap = *reply.caps().first().ok_or(0u64)?;
-    Ok((cap, reply.word(0)))
-}
-
-/// `FS_REMOVE`. Returns `Ok(())` on success.
-fn fs_remove(parent_cap: u32, name: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
-{
-    let label = ipc::fs_labels::FS_REMOVE | ((name.len() as u64) << 16);
-    let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(parent_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
-    if reply.label != ipc::fs_errors::SUCCESS
-    {
-        return Err(reply.label);
-    }
-    Ok(())
-}
-
-/// `FS_RENAME` within a single directory. Returns `Ok(())` on success.
-fn fs_rename(dir_cap: u32, src: &[u8], dst: &[u8], ipc_buf: *mut u64) -> Result<(), u64>
-{
-    let mut combined = Vec::with_capacity(src.len() + dst.len());
-    combined.extend_from_slice(src);
-    combined.extend_from_slice(dst);
-    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RENAME)
-        .word(0, src.len() as u64)
-        .word(1, dst.len() as u64)
-        .bytes(2, &combined)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(dir_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
-    if reply.label != ipc::fs_errors::SUCCESS
-    {
-        return Err(reply.label);
-    }
-    Ok(())
-}
-
-/// `FS_WRITE` inline: returns `bytes_written`.
-#[allow(clippy::doc_markdown)]
-fn fs_write_inline(
-    file_cap: u32,
-    offset: u64,
-    payload: &[u8],
-    ipc_buf: *mut u64,
-) -> Result<u64, u64>
-{
-    let label = ipc::fs_labels::FS_WRITE | ((payload.len() as u64) << 16);
-    let msg = ipc::IpcMessage::builder(label)
-        .word(0, offset)
-        .bytes(1, payload)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
-    if reply.label != ipc::fs_errors::SUCCESS
-    {
-        return Err(reply.label);
-    }
-    Ok(reply.word(0))
-}
-
-/// Round-trip `FS_READ`: returns the bytes the driver reports.
-fn fs_read_bytes(
-    file_cap: u32,
-    offset: u64,
-    max_len: u64,
-    ipc_buf: *mut u64,
-) -> Result<Vec<u8>, u64>
-{
-    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ)
-        .word(0, offset)
-        .word(1, max_len)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
-    if reply.label != ipc::fs_errors::SUCCESS
-    {
-        return Err(reply.label);
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    let n = reply.word(0) as usize;
-    Ok(reply.data_bytes()[8..8 + n].to_vec())
-}
 
 /// `FS_WRITE` round-trip on a fresh file. Creates, writes a small
 /// payload, re-looks-up the file, reads back, and confirms bytes
@@ -2319,80 +2173,6 @@ fn ns_fallthrough_attenuation_phase()
     let _ = syscall::cap_delete(file_cap);
     let _ = syscall::cap_delete(srv_cap);
     std::os::seraph::log!("ns_fallthrough_attenuation phase passed");
-}
-
-/// Issue a single `NS_LOOKUP` against `dir_cap` and decode the reply.
-///
-/// Returns `(child_cap, kind, size_hint)` on success or the wire
-/// `NsError` code on failure.
-fn ns_lookup(
-    dir_cap: u32,
-    name: &[u8],
-    requested_rights: u64,
-    ipc_buf: *mut u64,
-) -> Result<(u32, u64, u64), u64>
-{
-    let label = ipc::ns_labels::NS_LOOKUP | ((name.len() as u64) << 16);
-    let msg = ipc::IpcMessage::builder(label)
-        .word(0, requested_rights)
-        .bytes(1, name)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(dir_cap, &msg, ipc_buf) }
-        .map_err(|_| namespace_protocol::NsError::IoError.as_label())?;
-    if reply.label != 0
-    {
-        return Err(reply.label);
-    }
-    let kind = reply.word(0);
-    let size = reply.word(1);
-    let cap = *reply.caps().first().ok_or(0u64)?;
-    Ok((cap, kind, size))
-}
-
-/// Issue `NS_STAT` against `node_cap`.
-fn ns_stat(node_cap: u32, ipc_buf: *mut u64) -> Result<(u64, u64, u64), u64>
-{
-    let msg = ipc::IpcMessage::new(ipc::ns_labels::NS_STAT);
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }
-        .map_err(|_| namespace_protocol::NsError::IoError.as_label())?;
-    if reply.label != 0
-    {
-        return Err(reply.label);
-    }
-    Ok((reply.word(0), reply.word(1), reply.word(2)))
-}
-
-/// Issue `NS_READDIR(idx)` against `dir_cap`. Returns `Ok(None)` on
-/// `END_OF_DIR`, `Ok(Some((kind, name)))` for a populated entry, and
-/// `Err(code)` on protocol error.
-fn ns_readdir(dir_cap: u32, idx: u64, ipc_buf: *mut u64) -> Result<Option<(u64, Vec<u8>)>, u64>
-{
-    let msg = ipc::IpcMessage::builder(ipc::ns_labels::NS_READDIR)
-        .word(0, idx)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(dir_cap, &msg, ipc_buf) }
-        .map_err(|_| namespace_protocol::NsError::IoError.as_label())?;
-    if reply.label == ipc::fs_labels::END_OF_DIR
-    {
-        return Ok(None);
-    }
-    if reply.label != 0
-    {
-        return Err(reply.label);
-    }
-    let kind = reply.word(0);
-    // Name length is bounded by namespace_protocol::MAX_NAME_LEN (255);
-    // truncating to usize is safe on every supported target.
-    #[allow(clippy::cast_possible_truncation)]
-    let len = reply.word(1) as usize;
-    let bytes = reply.data_bytes();
-    // Name bytes start at byte 16 (after words 0 and 1).
-    let start = 16usize;
-    let end = start.saturating_add(len).min(bytes.len());
-    Ok(Some((kind, bytes[start..end].to_vec())))
 }
 
 /// Verify the main-thread stack guard page. Spawns `/bin/stackoverflow`

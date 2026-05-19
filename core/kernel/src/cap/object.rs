@@ -1286,29 +1286,6 @@ unsafe fn dealloc_object_one(
                         crate::sched::scheduler_for(cpu).remove_from_queue(tcb, prio);
                     }
 
-                    // x86-64 lazy-FPU: clear any per-CPU `fpu_owner` slot
-                    // still naming this TCB. Two-stage discipline:
-                    //   (a) here, inside the all-CPU-locks region — catches
-                    //       owners visible at the moment we commit
-                    //       state=Exited.
-                    //   (b) again after the running_on / context_saved
-                    //       spins — catches any re-installation by a still-
-                    //       running thread's `#NM` between all-locks release
-                    //       and the final switch-out, before storage is
-                    //       reclaimed.
-                    // No-op on RISC-V (the slot exists but is never written).
-                    // See `docs/thread-lifecycle-and-sleep.md` § Drain
-                    // Protocol step 10a and invariant 4a.
-                    for cpu in 0..cpu_count
-                    {
-                        let _ = crate::percpu::fpu_owner_for(cpu).compare_exchange(
-                            tcb,
-                            core::ptr::null_mut(),
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        );
-                    }
-
                     // Wake any reply-bound client with Interrupted; otherwise
                     // they would remain BlockedOnReply with a dangling
                     // blocked_on_object pointing at this freed server.
@@ -1376,6 +1353,22 @@ unsafe fn dealloc_object_one(
                     // running_on snapshot can race past schedule()'s
                     // pre-save lock release. See
                     // docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+                    //
+                    // The spin runs with interrupts ENABLED and preemption
+                    // DISABLED, mirroring `mm::tlb_shootdown::shootdown`. We
+                    // enter dealloc from a syscall with `IF=0`; spinning here
+                    // with `IF=0` blocks incoming IPIs (FPU flush, TLB
+                    // shootdown) targeted at this CPU and deadlocks them.
+                    // Enabling IF lets us service those, while
+                    // `preempt_disable` keeps the scheduler from migrating us
+                    // mid-dealloc (which would invalidate the `running_on`
+                    // snapshot we captured under the all-locks region).
+                    crate::percpu::preempt_disable();
+                    // SAFETY: ring 0; saved in matching restore below.
+                    let saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
+                    // SAFETY: ring 0; IDT loaded; preempt disabled.
+                    crate::arch::current::interrupts::enable();
+
                     if let Some(run_cpu) = running_on
                     {
                         let sched = crate::sched::scheduler_for(run_cpu);
@@ -1397,6 +1390,11 @@ unsafe fn dealloc_object_one(
                         core::hint::spin_loop();
                     }
 
+                    // Restore the caller's interrupt state and preemption.
+                    // SAFETY: saved_int from save_and_disable_interrupts above.
+                    crate::arch::current::cpu::restore_interrupts(saved_int);
+                    crate::percpu::preempt_enable();
+
                     // x86-64 lazy-FPU: clear any per-CPU `fpu_owner` slot
                     // still naming this TCB. Placed AFTER the `running_on`
                     // and `context_saved` spins so the dying thread is
@@ -1408,6 +1406,8 @@ unsafe fn dealloc_object_one(
                     // O(MAX_CPUS) atomic CAS and locks out the stale-
                     // pointer hazard before storage is reclaimed below.
                     // No-op on RISC-V (the slot exists but is never written).
+                    // See `docs/thread-lifecycle-and-sleep.md` § Drain
+                    // Protocol step 10a and invariant 4a.
                     for cpu in 0..cpu_count
                     {
                         let _ = crate::percpu::fpu_owner_for(cpu).compare_exchange(

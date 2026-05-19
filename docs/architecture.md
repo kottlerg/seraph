@@ -13,8 +13,11 @@ kernel mechanisms and userspace policy.
 - Architecture-specific code isolated behind shared traits
 - Self-hosting as a long-term goal
 
-Seraph does not provide binary compatibility with other operating systems.
-32-bit and legacy x86 are not targeted.
+Seraph defines its own native interfaces; POSIX API compatibility is not
+a goal. Filesystem formats and network protocols may be adopted as data
+formats, not as API commitments. Seraph does not provide binary
+compatibility with other operating systems. 32-bit and legacy x86 are
+not targeted.
 
 ---
 

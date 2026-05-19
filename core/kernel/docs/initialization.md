@@ -303,9 +303,9 @@ table frames).
 
 The cmdline page lands in `reclaim_ranges` like every other early entry,
 but only after the kernel snapshots its contents into a small BSS
-buffer during earlier kernel-phase processing. The Phase-9 `InitInfo`
-copy reads from the snapshot, leaving the bootloader page reclaim-safe
-by the time this phase mints its Frame cap.
+buffer during Phase 4. The Phase-9 `InitInfo` copy reads from the
+snapshot, leaving the bootloader page reclaim-safe by the time this
+phase mints its Frame cap.
 
 ---
 

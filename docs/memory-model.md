@@ -1,6 +1,7 @@
 # Memory Model
 
-System-scope virtual address space layout, paging, and physical memory management for both supported architectures.
+System-scope virtual address space layout, paging, and physical memory
+management for both supported architectures.
 
 ---
 

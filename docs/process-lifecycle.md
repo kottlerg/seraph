@@ -215,8 +215,7 @@ page.
 The `ProcessInfo` page also names the well-known CSpace slots that the
 parent populates (see
 [`abi/process-abi/README.md`](../abi/process-abi/README.md) §"Fixed
-CSpace slot conventions"). These are slot indices, not VAs, and are
-unaffected by ASLR.
+CSpace slot conventions"). These are slot indices, not VAs.
 
 ---
 
@@ -270,7 +269,7 @@ A process dies when:
 
 - It calls `sys_thread_exit` on its last thread.
 - Its `AddressSpace` capability is revoked (the "kill process" pattern;
-  see [`capability-model.md`](capability-model.md) §"Kill process pattern").
+  see [`capability-model.md`](capability-model.md) §`"Kill process" pattern`).
 - An unhandled fault terminates its threads.
 
 The death-notification flow:

@@ -98,4 +98,4 @@ MUST NOT be started independently of devmgr. See
 
 ## Summarized By
 
-None
+[docs/device-management.md](../../docs/device-management.md)

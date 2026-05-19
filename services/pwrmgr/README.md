@@ -4,7 +4,7 @@ Userspace power manager. Owns the platform shutdown and reboot path.
 
 ---
 
-## Source layout
+## Source Layout
 
 ```
 pwrmgr/
@@ -114,11 +114,16 @@ between the two trees.
 
 ---
 
-## Documentation hierarchy
+## Relevant Design Documents
 
-- [docs/architecture.md](../../docs/architecture.md) — system-wide
-  service inventory.
-- [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) — authoritative
-  IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`).
-- [services/init/README.md](../init/README.md) — bootstrap order and
-  cap-flow into pwrmgr.
+| Document | Content |
+|---|---|
+| [docs/architecture.md](../../docs/architecture.md) | System-wide service inventory; pwrmgr's role |
+| [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`) |
+| [services/init/README.md](../init/README.md) | Bootstrap order and cap-flow into pwrmgr |
+
+---
+
+## Summarized By
+
+[Architecture Overview](../../docs/architecture.md)

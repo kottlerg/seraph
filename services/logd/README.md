@@ -94,7 +94,7 @@ After `HANDOVER_PULL` completes, logd deletes cap[1] (no other use
 for a SEND cap on its own endpoint). The arch cap stays bound to
 logd's main thread for the lifetime of the process.
 
-## Relevant design documents
+## Relevant Design Documents
 
 | Document | Content |
 |---|---|
@@ -111,4 +111,4 @@ logd's main thread for the lifetime of the process.
 
 ## Summarized By
 
-None
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md)

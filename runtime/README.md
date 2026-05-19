@@ -7,7 +7,9 @@ Language runtime layers linked into userspace binaries. Seraph-specific; not sta
 | `libc/` | C standard library / POSIX compatibility layer |
 | `ruststd/` | Rust standard library platform layer (`std::sys::seraph`) |
 
-Neither has a top-level `Cargo.toml`. `xtask` materialises the `ruststd/` overlay into a patched toolchain mirror at build time.
+Neither has a top-level `Cargo.toml`. See
+[`docs/build-system.md`](../docs/build-system.md) for how `xtask`
+materialises the `ruststd/` overlay at build time.
 
 ---
 

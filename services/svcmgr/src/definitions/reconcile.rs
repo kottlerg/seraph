@@ -196,7 +196,10 @@ fn handle_definition(
     {
         slot.consumed = true;
         log!("svcmgr: bind only: {}", def.name);
-        bind_and_record(def, slot.thread_cap, services, service_count, deaths_eq);
+        // init-created service: svcmgr has no process_handle (init
+        // didn't share it). First death cannot DESTROY_PROCESS; this
+        // matches the pre-#21 shape — see `restart::restart_process`.
+        bind_and_record(def, slot.thread_cap, 0, services, service_count, deaths_eq);
         return;
     }
 
@@ -212,23 +215,33 @@ fn handle_definition(
     if matches!(def.restart, RestartPolicy::Never)
     {
         log!("svcmgr: launched ephemeral: {}", def.name);
-        // Drop the thread cap — no supervision binding to make.
+        // Drop the thread + process handles — no supervision binding
+        // to make; procmgr auto-reaps the one-shot on its own.
         let _ = syscall::cap_delete(launched.thread_cap);
-        // Keep the process handle around so a future death notification
-        // would be observable if we ever bind one; for `never` we
-        // intentionally don't.
+        let _ = syscall::cap_delete(launched.process_handle);
         return;
     }
 
-    bind_and_record(def, launched.thread_cap, services, service_count, deaths_eq);
+    bind_and_record(
+        def,
+        launched.thread_cap,
+        launched.process_handle,
+        services,
+        service_count,
+        deaths_eq,
+    );
 }
 
 /// Bind death-notification on `thread_cap` and record a `ServiceEntry`
 /// with the parsed recipe so the supervision loop can restart the
-/// service later.
+/// service later. `process_handle` is `0` for init-spawned services
+/// (init never shared its handle); for svcmgr-launched services it is
+/// the tokened procmgr handle so the restart path can issue
+/// `DESTROY_PROCESS` before respawning.
 fn bind_and_record(
     def: &Definition,
     thread_cap: u32,
+    process_handle: u32,
     services: &mut [ServiceEntry; MAX_SERVICES],
     service_count: &mut usize,
     deaths_eq: u32,
@@ -245,7 +258,7 @@ fn bind_and_record(
         log!("svcmgr: bind death-notification failed for {}", def.name);
         return;
     }
-    services[idx] = build_entry(def, thread_cap);
+    services[idx] = build_entry(def, thread_cap, process_handle);
     *service_count += 1;
 }
 
@@ -253,7 +266,7 @@ fn bind_and_record(
 /// Maps the `.svc` `restart`/`critical`/`namespace` values onto the
 /// in-memory `ServiceEntry` representation `restart::handle_death`
 /// reads.
-fn build_entry(def: &Definition, thread_cap: u32) -> ServiceEntry
+fn build_entry(def: &Definition, thread_cap: u32, process_handle: u32) -> ServiceEntry
 {
     let mut entry = ServiceEntry::empty();
 
@@ -264,6 +277,7 @@ fn build_entry(def: &Definition, thread_cap: u32) -> ServiceEntry
 
     entry.thread_cap = thread_cap;
     entry.module_cap = 0;
+    entry.process_handle = process_handle;
 
     let bin_bytes = def.binary.as_bytes();
     let bin_copy = bin_bytes.len().min(entry.vfs_path.len());

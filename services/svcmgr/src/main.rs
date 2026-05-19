@@ -29,10 +29,6 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
-// B5 wires definitions::reconcile_and_launch into HANDOVER_COMPLETE.
-// Suppress dead-code lints in the interim so each B-step ships
-// independently buildable.
-#[allow(dead_code)]
 mod definitions;
 mod restart;
 mod service;
@@ -300,7 +296,7 @@ fn event_loop(
 
         match token
         {
-            WS_TOKEN_SERVICE => dispatch_ipc(caps.service_ep, ipc_buf, state, deaths_eq),
+            WS_TOKEN_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx),
             WS_TOKEN_DEATHS => dispatch_deaths(deaths_eq, state, &restart_ctx),
             _ => std::os::seraph::log!("unexpected wait-set token"),
         }
@@ -308,10 +304,12 @@ fn event_loop(
 }
 
 /// Handle an IPC message on the service endpoint (registration, handover,
-/// or discovery-registry publish/query). `_deaths_eq` is plumbed through
-/// for B5's `HANDOVER_COMPLETE` → `reconcile_and_launch` path.
-fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, _deaths_eq: u32)
+/// or discovery-registry publish/query). `ctx` carries the procmgr /
+/// bootstrap / deaths-EQ state the `HANDOVER_COMPLETE` →
+/// `reconcile_and_launch` path needs to spawn `.svc`-defined services.
+fn dispatch_ipc(service_ep: u32, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
+    let ipc_buf = ctx.ipc_buf;
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(msg) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
     else
@@ -331,13 +329,27 @@ fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, _de
         }
         svcmgr_labels::HANDOVER_COMPLETE =>
         {
+            // Reply BEFORE reconciliation: init's call returns and it
+            // proceeds to teardown / thread_exit; svcmgr then runs the
+            // (potentially slow) scan + launch path without holding
+            // init blocked on the IPC reply path.
             state.handover_complete = true;
             let reply = IpcMessage::new(ipc::svcmgr_errors::SUCCESS);
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            std::os::seraph::log!("handover complete; scanning services.d/");
+            definitions::reconcile::reconcile_and_launch(
+                &mut state.pending,
+                state.pending_count,
+                &mut state.services,
+                &mut state.service_count,
+                ctx.deaths_eq,
+                ctx,
+                &mut state.registry,
+            );
             std::os::seraph::log!(
-                "handover complete, monitoring services: {:#018x}",
-                state.service_count as u64
+                "monitoring {} service(s) after reconciliation",
+                state.service_count
             );
         }
         svcmgr_labels::PUBLISH_ENDPOINT =>

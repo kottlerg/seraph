@@ -388,6 +388,22 @@ pub fn run_all(ctx: &TestContext)
         "thread::default_affinity_bsp",
         thread::default_affinity_bsp(ctx)
     );
+    run_test!(
+        "thread::affinity_migrate_ready_queued",
+        thread::affinity_migrate_ready_queued(ctx)
+    );
+    run_test!(
+        "thread::affinity_migrate_running",
+        thread::affinity_migrate_running(ctx)
+    );
+    run_test!(
+        "thread::load_balancer_redistributes_skewed",
+        thread::load_balancer_redistributes_skewed(ctx)
+    );
+    run_test!(
+        "thread::load_balancer_skips_pinned",
+        thread::load_balancer_skips_pinned(ctx)
+    );
 
     // ── Extended-state (FPU / SIMD / V) isolation ────────────────────────────
     run_test!("fpu::preempt_isolation", fpu::preempt_isolation(ctx));
@@ -409,5 +425,6 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("sysinfo::unknown_kind_err", sysinfo::unknown_kind_err(ctx));
     run_test!("sysinfo::elapsed_us", sysinfo::elapsed_us(ctx));
+    run_test!("sysinfo::current_cpu", sysinfo::current_cpu(ctx));
     run_test!("sysinfo::cpu_count_smp", sysinfo::cpu_count_smp(ctx));
 }

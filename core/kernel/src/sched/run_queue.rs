@@ -9,14 +9,16 @@
 //! non-empty queues for O(1) highest-priority selection, and pointers to the
 //! currently running and idle TCBs.
 //!
-//! # Phase 9 scope
-//! The `lock` field is a real `Spinlock<()>` (implemented in Phase 9). It
-//! disables interrupts while held, preventing timer-driven deadlock.
-//! Acquire before any `enqueue`, `dequeue_highest`, or `set_current` call.
+//! Locking. The `lock` field is a real `Spinlock<()>` that disables
+//! interrupts while held, preventing timer-driven deadlock. Acquire before
+//! any `enqueue`, `dequeue_highest`, `remove_from_queue`, `change_priority`,
+//! `find_runnable`, or `set_current` call.
 //!
-//! # TODO (SMP)
-//! - Implement `load_balance` across CPUs.
-//! - Add `preemption_pending: bool` flag per CPU.
+//! Cross-CPU migration goes through `sched::migrate_ready_thread` (used by
+//! `sys_thread_set_affinity` and the periodic load balancer); see
+//! `docs/scheduling-internals.md` § Lock Hierarchy rule 4 for the
+//! ascending-CPU-order rule that applies whenever two scheduler locks are
+//! held simultaneously.
 
 use super::NUM_PRIORITY_LEVELS;
 use super::thread::ThreadControlBlock;
@@ -97,6 +99,29 @@ impl RunQueue
     fn is_empty(&self) -> bool
     {
         self.head.is_none()
+    }
+
+    /// Find the first TCB in this queue satisfying `pred`. Returns the TCB
+    /// pointer without removing it; the caller decides whether to migrate
+    /// or skip. Read-only walk.
+    ///
+    /// O(n) in queue length. Caller MUST hold the owning
+    /// `PerCpuScheduler.lock`.
+    fn find_first_where<F>(&self, mut pred: F) -> Option<*mut ThreadControlBlock>
+    where
+        F: FnMut(*mut ThreadControlBlock) -> bool,
+    {
+        let mut cur = self.head;
+        while let Some(c) = cur
+        {
+            if pred(c)
+            {
+                return Some(c);
+            }
+            // SAFETY: c is a valid TCB; run_queue_next is always readable.
+            cur = unsafe { (*c).run_queue_next };
+        }
+        None
     }
 
     /// Remove a specific TCB from the queue. Returns `true` if found.
@@ -316,22 +341,55 @@ impl PerCpuScheduler
 
     /// Remove `tcb` from its priority queue. No-op if not found.
     ///
-    /// Used by `dealloc_object(Thread)` to prevent use-after-free:
-    /// the TCB must be removed from the run queue before its memory
-    /// is freed.
+    /// Used by `dealloc_object(Thread)`, `change_priority`, and
+    /// `migrate_ready_thread` to relocate or destroy a queued thread.
+    ///
+    /// Decrements `CPU_LOAD[cpu_id]` iff the remove succeeded — the load
+    /// counter MUST match the actual queue contents. `change_priority` pairs
+    /// this with a follow-up `enqueue` so its net effect is zero.
     ///
     /// Caller must hold `self.lock`.
-    pub fn remove_from_queue(&mut self, tcb: *mut ThreadControlBlock, priority: u8)
+    pub fn remove_from_queue(&mut self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
     {
         let p = priority as usize;
         if p >= NUM_PRIORITY_LEVELS
         {
-            return;
+            return false;
         }
-        if self.queues[p].remove(tcb) && self.queues[p].is_empty()
+        let removed = self.queues[p].remove(tcb);
+        if removed
         {
-            self.non_empty.fetch_and(!(1 << p), Ordering::Release);
+            self.decrement_load();
+            if self.queues[p].is_empty()
+            {
+                self.non_empty.fetch_and(!(1 << p), Ordering::Release);
+            }
         }
+        removed
+    }
+
+    /// Scan all priority queues from highest to lowest and return the first
+    /// queued TCB whose pointer satisfies `pred`, along with its priority.
+    ///
+    /// Used by the cross-CPU load balancer to pick a migratable (unpinned)
+    /// thread from a busier CPU's queue.
+    ///
+    /// Caller MUST hold `self.lock`.
+    pub fn find_runnable<F>(&self, mut pred: F) -> Option<(*mut ThreadControlBlock, u8)>
+    where
+        F: FnMut(*mut ThreadControlBlock) -> bool,
+    {
+        let mut ne = self.non_empty.load(Ordering::Relaxed);
+        while ne != 0
+        {
+            let priority = 31 - ne.leading_zeros() as usize;
+            if let Some(tcb) = self.queues[priority].find_first_where(&mut pred)
+            {
+                return Some((tcb, priority as u8));
+            }
+            ne &= !(1 << priority);
+        }
+        None
     }
 
     /// Move a `Ready` TCB from `old_prio` queue to `new_prio` queue.

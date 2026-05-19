@@ -289,31 +289,50 @@ The assignment is recorded in `tcb.preferred_cpu` and used for subsequent wakeup
 
 ### Load Balancing
 
-Load balancing runs periodically (at a configurable interval) and when a CPU becomes
-idle:
+A pull-based balancer runs on every CPU's `timer_tick` (see
+`sched::try_pull_balance`). It consumes the per-CPU `CPU_LOAD` counters
+maintained by `enqueue` / `dequeue_highest` / `remove_from_queue` and
+migrates at most one `Ready` thread per tick per CPU.
+
+Victim selection is mode-dependent:
+
+- **Loaded CPU (`my_load > 0`)** — pick a pseudo-random victim
+  (splitmix-style hash of the global `LOAD_BALANCE_TICK` counter and the
+  local CPU id). Skip if the victim is not significantly busier than us
+  (`their_load <= my_load + IMBALANCE_THRESHOLD`).
+- **Idle CPU (`my_load == 0`)** — scan all other CPUs and pull from the
+  heaviest. Scanning is cheap (one Relaxed atomic load per CPU) and
+  guarantees an idle CPU finds work on the first tick that sees an
+  imbalance. Pure random victim selection converges only
+  probabilistically and on small topologies sometimes wastes many ticks
+  before picking the busy CPU.
+
+Migration uses the shared `sched::migrate_ready_thread`-style helper
+`pull_unpinned_ready(src_cpu, dst_cpu)`:
 
 ```
-balance(cpu):
-    Find the most-loaded CPU: max_cpu
-    if max_cpu == cpu or load difference is below a configurable threshold:
-        return  // not worth migrating
-    // Acquire scheduler locks in CPU ID order to prevent deadlock.
-    Acquire both max_cpu.scheduler.lock and cpu.scheduler.lock
-    // Always acquire the lower CPU ID's lock first.
-    // Steal half the excess threads from max_cpu
-    // Prefer migrating lower-priority threads to preserve latency for high-priority
-    for thread in threads_to_migrate:
-        max_cpu.dequeue(thread)
-        thread.preferred_cpu = cpu
-        cpu.enqueue(thread)
-    Release both locks
+pull_unpinned_ready(src, dst):
+    lock(min(src, dst).scheduler.lock)        // ascending-CPU order
+    lock(max(src, dst).scheduler.lock)
+    tcb = src.find_runnable(|t| t.cpu_affinity == AFFINITY_ANY)
+    if tcb is None: unlock both; return
+    src.remove_from_queue(tcb, tcb.priority)  // decrements CPU_LOAD[src]
+    dst.enqueue(tcb, tcb.priority)            // increments CPU_LOAD[dst]
+    tcb.preferred_cpu = dst
+    set_reschedule_pending_for(dst)
+    unlock both
+    wake_idle_cpu(dst)                        // always-IPI
 ```
 
-Threads with hard CPU affinity (`cpu_affinity != AFFINITY_ANY`) are never migrated.
+Lock order follows scheduling-internals.md § Lock Hierarchy rule 4
+(ascending CPU id). Pinned threads (`cpu_affinity != AFFINITY_ANY`) are
+invisible to the `find_runnable` predicate and are never migrated.
 
-Migration requires no IPI — the migrated thread is simply enqueued on the new CPU's
-run queue. The target CPU will pick it up on its next scheduler invocation (or
-immediately if an IPI is sent to wake an idle CPU).
+Hot-path cost per CPU per tick:
+- Idle CPU: one Relaxed load per remote CPU to find the heaviest victim.
+- Loaded CPU: one Relaxed increment + one Relaxed load for the victim.
+- Scheduler locks are taken only when an imbalance above
+  `IMBALANCE_THRESHOLD` is observed.
 
 ---
 
@@ -451,13 +470,36 @@ to use a higher-priority server thread, not to add kernel priority inheritance.
 ### Hard Affinity
 
 `tcb.cpu_affinity != AFFINITY_ANY` specifies a single CPU the thread must run on.
-The thread is never migrated. Wakeups always enqueue the thread on the specified CPU's
-run queue. If the specified CPU is offline, `SYS_CAP_CREATE_THREAD` fails with
-`InvalidArgument`.
+Wakeups always enqueue the thread on the specified CPU's run queue. If the
+specified CPU is offline, `SYS_CAP_CREATE_THREAD` fails with `InvalidArgument`.
 
 Hard affinity is intended for:
 - Interrupt-handling threads that must run on specific CPUs (NUMA, IRQ affinity)
 - Real-time threads that must not suffer migration latency
+
+### Active migration on affinity change
+
+`SYS_THREAD_SET_AFFINITY` enforces the new affinity immediately rather than
+deferring to the next enqueue:
+
+- **Ready** thread queued on the old CPU: the syscall calls
+  `migrate_ready_thread` which dequeues the TCB from the source CPU's run
+  queue and re-enqueues it on the destination under both scheduler locks
+  (lower-numbered CPU first; see scheduling-internals.md § Lock Hierarchy
+  rule 4) and sends a wakeup IPI to the destination.
+- **Running** thread on a different CPU: the syscall sets the
+  **source** CPU's reschedule-pending flag and sends a wakeup IPI to the
+  **source** CPU (where the thread is currently running). The IPI itself
+  does not call `schedule()`; the running thread observes the new
+  affinity at its next entry to `schedule()` — preempt-on-slice-expiry,
+  voluntary yield, or IPC block. The re-enqueue site in `schedule()`
+  checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU
+  via `enqueue_and_wake` (which then sets the destination's
+  reschedule-pending flag and IPIs it) instead of doing a local enqueue.
+  Worst-case latency is therefore one time slice
+  (`TIME_SLICE_TICKS` × tick period), not one tick.
+- **Blocked / Stopped / Created**: the new affinity takes effect on the
+  next wake via `select_target_cpu`; no migration work is needed.
 
 ### Soft Affinity
 

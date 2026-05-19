@@ -839,8 +839,19 @@ Set or change a thread's CPU affinity.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-Setting a hard affinity prevents future migration by the load balancer. The thread
-is migrated to the target CPU at the next scheduler invocation if not already there.
+Setting a hard affinity prevents future migration by the load balancer and
+takes effect immediately:
+
+- A **Ready** thread queued on a different CPU is migrated to the new
+  target CPU's run queue (`sched::migrate_ready_thread`).
+- A **Running** thread on a different CPU is notified via a reschedule IPI
+  and routed cross-CPU on its next `schedule()` entry. The IPI does not
+  itself call `schedule()`; the running thread observes the new affinity
+  at its next slice-expiry, voluntary yield, or IPC block. Worst-case
+  latency is one time slice.
+- A **Blocked / Stopped / Created** thread observes the new affinity on
+  its next wake.
+
 If `cpu_id` names an offline CPU, the call fails with `InvalidArgument`.
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
@@ -1284,6 +1295,15 @@ pub enum SystemInfoType
     /// Boot protocol version used by the bootloader (see `abi/boot-protocol`).
     /// Userspace can use this to interpret fields in the boot info struct.
     BootProtocolVersion = 5,
+
+    /// Microseconds elapsed since kernel timer initialisation. Returns 0 if
+    /// the timer has not been initialised yet.
+    ElapsedUs           = 6,
+
+    /// Index of the CPU on which the calling thread is currently executing.
+    /// Useful for diagnostics and for verifying affinity / migration
+    /// behaviour from userspace.
+    CurrentCpu          = 7,
 }
 ```
 

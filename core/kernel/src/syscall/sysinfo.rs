@@ -65,6 +65,17 @@ pub fn sys_system_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         {
             Ok(crate::arch::current::timer::elapsed_us().unwrap_or(0))
         }
+        7 =>
+        // CurrentCpu — CPU index this syscall is running on.
+        //
+        // Safe to read without locking: `current_cpu()` reads a per-CPU
+        // register (gs/tp-based) that is fixed for the duration of a
+        // kernel entry, and userspace can be migrated by the scheduler
+        // only on a kernel/userspace boundary anyway.
+        {
+            let cpu = crate::arch::current::cpu::current_cpu();
+            Ok(u64::from(cpu))
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }

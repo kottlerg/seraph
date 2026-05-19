@@ -504,6 +504,54 @@ fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::Resta
             continue;
         }
 
-        restart::handle_death(&mut state.services[idx], exit_reason, ctx, correlator);
+        let outcome = restart::handle_death(&mut state.services[idx], exit_reason, ctx, correlator);
+        if matches!(outcome, restart::DeathOutcome::Unrecoverable)
+        {
+            initiate_graceful_shutdown(state, ctx, idx);
+        }
     }
+}
+
+/// Resolve `published_names::PWRMGR_SHUTDOWN` from the discovery
+/// registry and issue `pwrmgr_labels::SHUTDOWN` to power the system
+/// off cleanly. Called from [`dispatch_deaths`] when a service with
+/// `critical = high` dies unrecoverably.
+///
+/// Edge case: if the dying service IS pwrmgr, the shutdown source
+/// itself is gone; svcmgr logs the degraded state and returns.
+/// No fallback raw-shutdown path — same shape as today's lack of a
+/// recovery story for procmgr / memmgr death.
+fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx, dying_idx: usize)
+{
+    let name = state.services[dying_idx].name_str();
+    if name == "pwrmgr"
+    {
+        std::os::seraph::log!(
+            "critical service unrecoverable: pwrmgr; graceful shutdown impossible; \
+             system in degraded state"
+        );
+        return;
+    }
+
+    let shutdown_cap =
+        match registry_lookup_derived(&mut state.registry, ipc::published_names::PWRMGR_SHUTDOWN)
+        {
+            Ok(c) => c,
+            Err(code) =>
+            {
+                std::os::seraph::log!(
+                    "graceful shutdown: cannot resolve {} (code={code})",
+                    core::str::from_utf8(ipc::published_names::PWRMGR_SHUTDOWN).unwrap_or("?")
+                );
+                return;
+            }
+        };
+
+    let shutdown_msg = IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
+    // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(shutdown_cap, &shutdown_msg, ctx.ipc_buf) };
+    // On the success path pwrmgr powers off and this never returns.
+    // On a failure path we surface the cap leak rather than ignore it.
+    let _ = syscall::cap_delete(shutdown_cap);
+    std::os::seraph::log!("graceful shutdown: SHUTDOWN call returned (failure path)");
 }

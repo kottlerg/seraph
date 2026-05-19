@@ -13,12 +13,27 @@
 //! service's restart bundle. log and procmgr endpoints arrive via
 //! `ProcessInfo`, so they are not part of the restart cap set.
 
-use crate::halt_loop;
 use crate::service::{
-    CRITICALITY_FATAL, CRITICALITY_NORMAL, MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE,
-    ServiceEntry,
+    CRITICALITY_HIGH, CRITICALITY_LOW, CRITICALITY_NORMAL, MAX_RESTARTS, POLICY_ALWAYS,
+    POLICY_ON_FAILURE, ServiceEntry,
 };
 use ipc::{IpcMessage, procmgr_labels};
+
+/// Outcome of [`handle_death`], routed by the caller (`dispatch_deaths`
+/// in `main.rs`) to either continue, log degradation, or initiate a
+/// graceful system shutdown via pwrmgr.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeathOutcome
+{
+    /// Service was successfully restarted.
+    Restarted,
+    /// Service is marked inactive; system continues degraded.
+    Degraded,
+    /// Service was `critical = high` and svcmgr cannot recover it
+    /// (either `restart = never` or the restart budget is exhausted).
+    /// Caller must initiate `pwrmgr_labels::SHUTDOWN`.
+    Unrecoverable,
+}
 
 /// Monotonic counter for child bootstrap tokens. Shared between the
 /// restart path and the post-handover launch path: every child that
@@ -185,33 +200,44 @@ pub struct RestartCtx
 
 /// Handle a service death detected via event queue notification.
 ///
-/// Checks criticality and restart policy, then attempts to restart the service
-/// if appropriate. Marks the service inactive if restart is not attempted or
-/// fails. `correlator` is the death-payload tag used to route this entry —
-/// the restarted thread is rebound under the same value so subsequent
-/// crashes route back to the same `ServiceEntry`.
-pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx, correlator: u32)
+/// Checks criticality and restart policy, then attempts to restart
+/// the service if appropriate. Marks the service inactive if restart
+/// is not attempted or fails. `correlator` is the death-payload tag
+/// used to route this entry — the restarted thread is rebound under
+/// the same value so subsequent crashes route back to the same
+/// `ServiceEntry`.
+///
+/// Returns a [`DeathOutcome`] the caller routes:
+///
+/// * `Restarted` — service is back up; supervision loop continues.
+/// * `Degraded` — service is inactive; system continues without it.
+///   Used for `critical = low` deaths (informational) and for
+///   `critical = normal` deaths where restart is unavailable / the
+///   budget is exhausted.
+/// * `Unrecoverable` — `critical = high` death where restart cannot
+///   recover. Caller must initiate the graceful-shutdown path
+///   (`pwrmgr_labels::SHUTDOWN` via the `pwrmgr.shutdown` cap).
+pub fn handle_death(
+    svc: &mut ServiceEntry,
+    exit_reason: u64,
+    ctx: &RestartCtx,
+    correlator: u32,
+) -> DeathOutcome
 {
     std::os::seraph::log!("service died: {}", svc.name_str());
     std::os::seraph::log!("  exit_reason={exit_reason:#018x}");
 
-    if svc.criticality == CRITICALITY_FATAL
+    if svc.criticality == CRITICALITY_LOW
     {
-        std::os::seraph::log!("FATAL service crashed, halting");
-        halt_loop();
-    }
-
-    if svc.criticality != CRITICALITY_NORMAL
-    {
-        std::os::seraph::log!("unknown criticality, not restarting");
+        std::os::seraph::log!("low-criticality death; informational");
         svc.active = false;
-        return;
+        return DeathOutcome::Degraded;
     }
 
     if !should_restart(svc, exit_reason)
     {
         svc.active = false;
-        return;
+        return unrecoverable_or_degraded(svc);
     }
 
     std::os::seraph::log!(
@@ -222,11 +248,34 @@ pub fn handle_death(svc: &mut ServiceEntry, exit_reason: u64, ctx: &RestartCtx, 
     if !restart_process(svc, ctx, correlator)
     {
         svc.active = false;
-        return;
+        return unrecoverable_or_degraded(svc);
     }
 
     svc.restart_count += 1;
     std::os::seraph::log!("service restarted: {}", svc.name_str());
+    DeathOutcome::Restarted
+}
+
+/// Choose between `Unrecoverable` (critical = high) and `Degraded`
+/// (any other criticality) when restart is not attempted / failed.
+fn unrecoverable_or_degraded(svc: &ServiceEntry) -> DeathOutcome
+{
+    if svc.criticality == CRITICALITY_HIGH
+    {
+        std::os::seraph::log!(
+            "critical service unrecoverable: {}; initiating graceful shutdown",
+            svc.name_str()
+        );
+        DeathOutcome::Unrecoverable
+    }
+    else
+    {
+        if svc.criticality != CRITICALITY_NORMAL
+        {
+            std::os::seraph::log!("unknown criticality {}", svc.criticality);
+        }
+        DeathOutcome::Degraded
+    }
 }
 
 /// Determine whether a service should be restarted based on its policy and

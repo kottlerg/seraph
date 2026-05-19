@@ -29,8 +29,8 @@ use super::{Criticality, Definition, NamespaceShape, RestartPolicy, SERVICES_DIR
 use crate::REGISTRY_CAPACITY;
 use crate::restart::RestartCtx;
 use crate::service::{
-    CRITICALITY_FATAL, CRITICALITY_NORMAL, MAX_SERVICES, POLICY_ALWAYS, POLICY_ON_FAILURE,
-    ServiceEntry,
+    CRITICALITY_HIGH, CRITICALITY_LOW, CRITICALITY_NORMAL, MAX_SERVICES, POLICY_ALWAYS,
+    POLICY_NEVER, POLICY_ON_FAILURE, ServiceEntry,
 };
 
 /// Entry in init's pending-registration table populated by
@@ -286,20 +286,15 @@ fn build_entry(def: &Definition, thread_cap: u32, process_handle: u32) -> Servic
 
     entry.restart_policy = match def.restart
     {
-        // `Never` maps to a sentinel value `should_restart` does
-        // not match; the existing `_ => false` arm rejects restart.
-        RestartPolicy::Never => 0xFF,
+        RestartPolicy::Never => POLICY_NEVER,
         RestartPolicy::Always => POLICY_ALWAYS,
         RestartPolicy::OnFailure => POLICY_ON_FAILURE,
     };
     entry.criticality = match def.criticality
     {
-        // `Low` maps to a sentinel `restart::handle_death` reads as
-        // "informational"; restart's existing FATAL/NORMAL arms
-        // continue to drive the other two cases.
-        Criticality::Low => 0xFF,
+        Criticality::Low => CRITICALITY_LOW,
         Criticality::Normal => CRITICALITY_NORMAL,
-        Criticality::High => CRITICALITY_FATAL,
+        Criticality::High => CRITICALITY_HIGH,
     };
     entry.active = true;
 

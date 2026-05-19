@@ -138,6 +138,20 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 9. If running_on was recorded, spin (re-acquire that CPU's lock per iteration)
    until scheduler_for(run_cpu).current != tcb.
 10. Spin on tcb.context_saved.load(Acquire) == 1 (UNCONDITIONAL — see invariant 4).
+    Steps 9-10 run with `preempt_disable` and interrupts enabled
+    (`save_and_disable_interrupts` → `enable`); the local CPU MUST be
+    able to service incoming flush / TLB-shootdown IPIs during the
+    spin or it deadlocks against a peer CPU sending an IPI to it
+    (observed locally and on `ubuntu-latest` CI). Preemption is
+    disabled so a timer tick mid-spin cannot reschedule the dealloc
+    caller off this CPU (which would invalidate the `running_on`
+    snapshot captured at step 6).
+10a. (x86_64 only) Clear any per-CPU `fpu_owner` slot still naming
+    this TCB via `compare_exchange(tcb, null, AcqRel, Acquire)` for
+    every CPU. Placed AFTER steps 9-10 so the dying thread has
+    switched out on every CPU and taken no further `#NM`; closes the
+    dangling-pointer window before storage is reclaimed in step 16.
+    See invariant 4a.
 11. Acquire the source IPC lock for tcb's blocked_on_object (if any) and unlink
     tcb from the source's wait queue / waiter slot. Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.
@@ -164,6 +178,8 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 2. **Step 3 (state = Exited) commits under all locks.** No `schedule()` on any CPU can subsequently observe this TCB as `Ready` or `Running` for purposes of re-enqueue — the protection in `schedule()` reads `state` while holding its CPU's scheduler.lock and refuses to re-enqueue if `state ∈ {Exited, Stopped}`. `enqueue_and_wake` performs the same check before enqueueing (see [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 9).
 
 3. **Step 9's `running_on` spin is bounded.** The remote CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch switch on x86 due to `release_lock_only`), the spin exits.
+
+4a. **Step 10a's `fpu_owner` sweep closes the lazy-FPU dangling-pointer window.** The `#NM` handler writes `fpu_owner_for(cpu).store(current_tcb, Release)` on every trap, so as long as the dying thread can still take an `#NM`, its pointer can land in a per-CPU `fpu_owner` slot. Steps 9-10 guarantee the thread has switched out on every CPU and `context_saved == 1`, so no further `#NM` can name it. The compare_exchange sweep then drops the dangling pointer from every remaining slot before step 16 reclaims storage. The sweep MUST be placed AFTER step 10 — placing it before allows a still-running thread to re-install itself as `fpu_owner` via `#NM` after the sweep but before storage is freed, leaving a use-after-free for the next `#NM` consumer (the swap-out path reads `(*prev).extended.area` on a freed pointer). Steps 9-10's interrupt-enabled-while-spinning discipline is required to prevent the spin from deadlocking against a peer CPU's flush IPI; without it, the post-spin placement is the same correctness shape but the spin times out (observed on TCG).
 
 4. **Step 10's `context_saved` spin is the load-bearing UAF gate, and is unconditional.** On x86 (TSO), `schedule()` calls `set_current(next)` and `release_lock_only(sched.lock)` *before* `switch()` saves the dying thread's registers into `tcb.saved_state`. A peer CPU acquiring the same lock at any moment after the release can therefore observe `sched.current = idle` while `switch()` is still mid-save into `tcb.saved_state`. Freeing the TCB at that point lets the next allocation reuse the memory; `switch()` then corrupts the new allocation, producing hangs (`stress::thread_churn`, `bench thread_lifecycle`) or worse. Step 10 closes the window: `context_saved` is cleared by `schedule()` *before* the save and written `1` (Release) by `switch()` *after* the save; spinning on the Acquire load until it observes `1` guarantees the save has fully published. The spin is unconditional on the result of `running_on`, because the all-locks `running_on` snapshot can race past the lock release and miss the in-flight switch entirely. New TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
 

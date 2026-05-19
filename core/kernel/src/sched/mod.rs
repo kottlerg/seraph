@@ -1184,6 +1184,18 @@ pub unsafe fn migrate_ready_thread(
         return false;
     }
 
+    // Flush a stale lazy-FPU owner on src_cpu BEFORE acquiring scheduler
+    // locks. A synchronous flush IPI sent while holding the source/dest
+    // scheduler locks can circular-wait when the target CPU is acquiring
+    // those same locks for its own migration/wake (deadlock). The flush
+    // is harmless if src_cpu no longer owns the TCB (early-out in
+    // `flush_owner_remote`) — speculation cost is bounded. No-op on RISC-V.
+    // SAFETY: src_cpu validated < cpu_count above; tcb valid by caller; no
+    // scheduler locks held — IPI cannot circular-wait on lock acquisition.
+    unsafe {
+        crate::arch::current::fpu::flush_owner_remote(src_cpu, tcb);
+    }
+
     let (lo, hi) = if src_cpu < dst_cpu
     {
         (src_cpu, dst_cpu)
@@ -1430,9 +1442,26 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
     // SAFETY: ascending-CPU order satisfies lock-hierarchy rule 4.
     let saved_hi = unsafe { hi_sched.lock.lock_raw() };
 
-    // SAFETY: src_cpu valid; lock held. Predicate is read-only.
+    // Skip-owner predicate: load-balance pulls cannot freshen a
+    // candidate's XSAVE area when the candidate is still named as
+    // `src_cpu`'s lazy-FPU owner. The only mechanism that would
+    // canonicalise the area is a synchronous flush IPI to `src_cpu`,
+    // but issuing an IPI while holding both `src_cpu` and `dst_cpu`
+    // scheduler locks would circular-wait against another CPU
+    // initiating its own migration (see Lock Hierarchy rule 4 and
+    // the `send_fpu_flush_ipi` deadlock-avoidance discipline in
+    // `arch/x86_64/interrupts.rs`). Skipping owner-named candidates
+    // is the deadlock-free alternative: the missed candidate stays
+    // Ready on `src_cpu` and gets picked by `src_cpu`'s next schedule
+    // tick. Detection is a single Acquire load of the per-CPU owner
+    // slot and a pointer-equality test inside the existing predicate.
+    let fpu_owner_on_src =
+        crate::percpu::fpu_owner_for(src_cpu).load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: src_cpu valid; lock held; predicate is read-only.
     let pick = unsafe {
-        (*scheduler_ptr(src_cpu)).find_runnable(|tcb| (*tcb).cpu_affinity == AFFINITY_ANY)
+        (*scheduler_ptr(src_cpu)).find_runnable(|tcb| {
+            (*tcb).cpu_affinity == AFFINITY_ANY && !core::ptr::eq(tcb, fpu_owner_on_src)
+        })
     };
 
     let Some((tcb, priority)) = pick
@@ -1455,6 +1484,12 @@ unsafe fn pull_unpinned_ready(src_cpu: usize, dst_cpu: usize)
         unsafe { lo_sched.lock.unlock_raw(saved_lo) };
         return;
     }
+
+    // No flush IPI here: the `find_runnable` predicate skipped any
+    // candidate currently named as src_cpu's `fpu_owner`, so this tcb's
+    // XSAVE area is canonical. Issuing a synchronous IPI under both
+    // scheduler locks would risk circular-wait deadlock (see the
+    // `enqueue_and_wake` rationale).
 
     // SAFETY: tcb is no longer on src; dst_cpu scheduler is valid.
     unsafe { scheduler_for(dst_cpu).enqueue(tcb, priority) };
@@ -1499,6 +1534,32 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize, 
             "enqueue_and_wake: target_cpu={target_cpu} >= MAX_CPUS, tid={tid}, prio={priority}"
         );
     }
+
+    // Flush a stale lazy-FPU owner on the thread's previous CPU BEFORE
+    // acquiring any scheduler lock. A thread that was Blocked between
+    // #NM-time on `old_preferred` and this wake may still be `fpu_owner`
+    // over there with stale extended-state contents in its TCB area; the
+    // destination CPU's `#NM` would XRSTOR a stale area. The flush IPI
+    // must run outside the lock-held region: a synchronous IPI sent while
+    // holding a scheduler lock can circular-wait when the target CPU is
+    // also acquiring that same lock (deadlock). The thread is not Ready/
+    // Running (it is being woken from Blocked/Stopped/Created), so its
+    // `preferred_cpu` is stable for the duration of this call — an
+    // unlocked read is safe. No-op on RISC-V (lazy via `sstatus.FS/VS`).
+    let cpu_count_for_flush = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    // SAFETY: tcb valid by caller contract; preferred_cpu is a u32 field
+    // and aligned reads are atomic on x86-64.
+    let old_preferred =
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*tcb).preferred_cpu)) } as usize;
+    if old_preferred < cpu_count_for_flush && old_preferred != target_cpu
+    {
+        // SAFETY: old_preferred validated < CPU_COUNT; tcb valid; no
+        // scheduler locks held — IPI cannot circular-wait on lock acquisition.
+        unsafe {
+            crate::arch::current::fpu::flush_owner_remote(old_preferred, tcb);
+        }
+    }
+
     // SAFETY: caller guarantees tcb is valid and target_cpu is initialized.
     let sched = unsafe { scheduler_for(target_cpu) };
 
@@ -1990,17 +2051,21 @@ pub unsafe fn schedule(requeue_current: bool)
         }
     }
 
-    // Save the current thread's extended FPU/SIMD/V state to its per-TCB
-    // area before any other CPU can observe this thread as no-longer-current,
-    // then load the incoming thread's state into the live registers. The
-    // x86-64 path is eager (unconditional XSAVE + XRSTOR here); the RISC-V
-    // path keeps lazy FS/VS trap restore so `switch_in_restore` is a no-op
-    // there. Both calls no-op for kernel-only / idle threads (extended.area
-    // is null on those TCBs).
+    // Lazy-FPU context-switch hooks. Both arches use lazy save/restore:
+    // - x86-64: a per-CPU `fpu_owner` cache plus CR0.TS gating. switch_out_save
+    //   sets CR0.TS=1 (no XSAVE; the live regs stay for fast re-run or for
+    //   the migration flush IPI to extract). switch_in_restore clears TS
+    //   only when the incoming thread is already the owner — otherwise it
+    //   leaves TS=1 so the first FP op traps to `#NM`, which saves the
+    //   prior owner and XRSTORs the new thread's area.
+    // - RISC-V: lazy via `sstatus.FS/VS` dirty tracking. switch_out_save
+    //   reads FS/VS and saves to the area only on Dirty; switch_in_restore
+    //   is a no-op (the trap path's `lazy_restore_fp_v` reloads on first use).
+    // Both calls no-op for kernel-only / idle threads (extended.area is null).
     if !current.is_null()
     {
         // SAFETY: ring-0 with interrupts disabled and the scheduler lock
-        // held; arch fpu::switch_out_save handles the per-arch save.
+        // held; arch fpu::switch_out_save honours the per-arch lazy discipline.
         unsafe {
             crate::arch::current::fpu::switch_out_save(current);
         }
@@ -2008,7 +2073,7 @@ pub unsafe fn schedule(requeue_current: bool)
     if !next.is_null()
     {
         // SAFETY: ring-0 with interrupts disabled and the scheduler lock
-        // held; arch fpu::switch_in_restore handles the per-arch restore.
+        // held; arch fpu::switch_in_restore honours the per-arch lazy discipline.
         unsafe {
             crate::arch::current::fpu::switch_in_restore(next);
         }

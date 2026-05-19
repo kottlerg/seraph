@@ -29,13 +29,18 @@
 //! | `PERCPU_USER_RSP_OFFSET` | 16 | `user_rsp` |
 //! | `PERCPU_SCRATCH_OFFSET` | 24 | `scratch` |
 //! | `PERCPU_TSS_PTR_OFFSET` | 32 | `tss_ptr` |
+//! | `PERCPU_PREEMPT_COUNT_OFFSET` | 40 | `preempt_count` |
+//! | `PERCPU_FPU_OWNER_OFFSET` | 48 | `fpu_owner` |
 //!
 //! ## Adding new fields
 //! Append fields at the end of the struct. Update the constant table above,
 //! add a test in the `tests` module, and update any assembly that addresses
 //! the struct by offset.
 
+use core::sync::atomic::AtomicPtr;
+
 use crate::sched::MAX_CPUS;
+use crate::sched::thread::ThreadControlBlock;
 
 // ── APIC ID mapping ───────────────────────────────────────────────────────────
 
@@ -115,6 +120,10 @@ pub const PERCPU_TSS_PTR_OFFSET: usize = 32;
 // Not accessed from assembly; used by preempt_disable/preempt_enable.
 #[allow(dead_code)]
 pub const PERCPU_PREEMPT_COUNT_OFFSET: usize = 40;
+/// Byte offset of `PerCpuData::fpu_owner`. GS-relative: `gs:[48]`.
+// Not accessed from assembly; included for layout discipline.
+#[allow(dead_code)]
+pub const PERCPU_FPU_OWNER_OFFSET: usize = 48;
 
 // ── PerCpuData ────────────────────────────────────────────────────────────────
 
@@ -124,7 +133,6 @@ pub const PERCPU_PREEMPT_COUNT_OFFSET: usize = 40;
 /// no locks are required. The struct is `#[repr(C)]` to guarantee the
 /// byte layout expected by GS-relative assembly.
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct PerCpuData
 {
     /// Logical CPU index (0-based). x86-64: readable as `gs:[0]`.
@@ -148,6 +156,17 @@ pub struct PerCpuData
     /// sections such as TLB shootdown spin-waits.
     pub preempt_count: u32,
     _pad1: u32,
+    /// x86-64 lazy-FPU per-CPU owner cache: the TCB whose extended-state
+    /// register file is currently believed live in this CPU's hardware
+    /// XMM/YMM/x87 registers (null if none). Maintained by the `#NM`
+    /// handler, the context-switch fast path, and the migration-side
+    /// flush IPI. The invariant on each CPU is the one-way implication
+    /// `(CR0.TS=0) ⇒ (fpu_owner != null)`; equivalently, the forbidden
+    /// state is `(CR0.TS=0, fpu_owner=null)`. The states
+    /// `(TS=1, owner=null)`, `(TS=1, owner=T)`, and `(TS=0, owner=T)`
+    /// are all valid. See `arch/x86_64/fpu.rs` module docs for the
+    /// transition table. Unused on RISC-V (lazy via `sstatus.FS/VS`).
+    pub fpu_owner: AtomicPtr<ThreadControlBlock>,
 }
 
 impl PerCpuData
@@ -163,6 +182,7 @@ impl PerCpuData
             tss_ptr: 0,
             preempt_count: 0,
             _pad1: 0,
+            fpu_owner: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 }
@@ -180,10 +200,7 @@ impl PerCpuData
 /// access occurs after the entry is published (sequenced by the AP
 /// synchronization barrier in SMP startup).
 #[cfg(not(test))]
-pub static mut PER_CPU: [PerCpuData; MAX_CPUS] = {
-    const D: PerCpuData = PerCpuData::new();
-    [D; MAX_CPUS]
-};
+pub static mut PER_CPU: [PerCpuData; MAX_CPUS] = [const { PerCpuData::new() }; MAX_CPUS];
 
 // ── BSP initialisation ────────────────────────────────────────────────────────
 
@@ -285,6 +302,29 @@ pub fn preemption_disabled() -> bool
     unsafe { PER_CPU[cpu].preempt_count > 0 }
 }
 
+// ── Lazy-FPU owner cache (x86-64) ────────────────────────────────────────────
+
+/// Return a reference to CPU `cpu`'s lazy-FPU owner slot.
+///
+/// Used cross-CPU: the migration-side flush IPI sender atomically reads the
+/// target CPU's slot to decide whether to skip the IPI, and the IPI handler
+/// (on the target CPU) atomically CASes the slot from the migrating TCB to
+/// null. Local readers (the `#NM` handler, the context-switch fast path)
+/// resolve the slot for the current CPU index.
+///
+/// # Safety
+/// `cpu` must be < [`MAX_CPUS`]. The returned reference is `'static` because
+/// `PER_CPU` outlives any conceivable caller; concurrent access is safe via
+/// the [`AtomicPtr`] interior mutability.
+#[cfg(not(test))]
+pub fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
+{
+    debug_assert!(cpu < MAX_CPUS);
+    // SAFETY: cpu validated < MAX_CPUS; AtomicPtr permits concurrent access
+    // through a shared reference, and PER_CPU is alive for the program lifetime.
+    unsafe { &*core::ptr::addr_of!(PER_CPU[cpu].fpu_owner) }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -324,11 +364,11 @@ mod tests
     }
 
     #[test]
-    fn percpu_size_is_48_bytes()
+    fn percpu_size_is_56_bytes()
     {
         // cpu_id(4) + _pad0(4) + kernel_rsp(8) + user_rsp(8) + scratch(8) + tss_ptr(8)
-        // + preempt_count(4) + _pad1(4) = 48
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 48);
+        // + preempt_count(4) + _pad1(4) + fpu_owner(8) = 56
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 56);
     }
 
     #[test]
@@ -338,5 +378,11 @@ mod tests
             offset_of!(PerCpuData, preempt_count),
             PERCPU_PREEMPT_COUNT_OFFSET
         );
+    }
+
+    #[test]
+    fn percpu_fpu_owner_offset_matches_constant()
+    {
+        assert_eq!(offset_of!(PerCpuData, fpu_owner), PERCPU_FPU_OWNER_OFFSET);
     }
 }

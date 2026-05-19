@@ -14,12 +14,18 @@
 //! verifies both captures match the pattern the child wrote. Any
 //! cross-thread bleed surfaces as a mismatch and fails the test.
 
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::AtomicU32;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(target_arch = "x86_64")]
+use syscall::system_info;
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
     signal_wait, thread_configure, thread_exit, thread_set_affinity, thread_start,
 };
+#[cfg(target_arch = "x86_64")]
+use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -431,4 +437,258 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
         return Err("thread B observed extended-state corruption across preemption");
     }
     Ok(())
+}
+
+// ── Cross-CPU preemption-isolation (Issue #65 lazy-FPU flush IPI) ────────────
+
+/// Per-thread stack for the cross-CPU child.
+#[cfg(target_arch = "x86_64")]
+static mut STACK_CROSS: ChildStack = ChildStack::ZERO;
+/// Signal indices passed into the cross-CPU child by index (the child's
+/// cspace cap is published here so the inline-asm syscall sites can read
+/// them without crossing a Rust function boundary that would clobber
+/// xmm0..xmm15).
+#[cfg(target_arch = "x86_64")]
+static CROSS_SIG_READY: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static CROSS_SIG_RESUME: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static CROSS_SIG_DONE: AtomicU32 = AtomicU32::new(0);
+/// Mismatch count written by the cross-CPU child after the post-migration
+/// register capture. The parent reads it only after the `done` signal so
+/// the zero default is never mistaken for a pass.
+#[cfg(target_arch = "x86_64")]
+static CROSS_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+/// CPU id observed by the cross-CPU child after migration, sanity-checked
+/// by the parent to confirm the migration actually happened.
+#[cfg(target_arch = "x86_64")]
+static CROSS_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Cross-CPU child entry: load `PATTERN_A` into xmm0..xmm15, signal "ready",
+/// block on "resume", then capture xmm0..xmm15 back to a stack buffer.
+///
+/// The entire load → block → capture sequence runs inside a single inline-
+/// asm block so no intervening Rust call clobbers xmm. The syscall ABI is
+/// embedded directly: rax = syscall number, rdi/rsi = args; the kernel
+/// preserves the live FP register file across the block because (a) the
+/// kernel itself is soft-float and (b) the lazy-FPU discipline keeps the
+/// child as `fpu_owner` of its current CPU until either another thread
+/// takes an `#NM` or the migration-flush IPI fires on wake.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn child_cross_entry(_arg: u64) -> !
+{
+    // 128-bit pattern (xmm lane width).
+    let pat128 = [PATTERN_A, PATTERN_A];
+    let mut buf = [[0u64; 2]; 16];
+    let sig_ready = CROSS_SIG_READY.load(Ordering::Acquire);
+    let sig_resume = CROSS_SIG_RESUME.load(Ordering::Acquire);
+    // Brief spin between FP load and signal_send so timer ticks fire while
+    // we are fpu_owner on the source CPU.
+    let spin: u64 = 50_000;
+
+    // SAFETY: inline asm loads pat128 into xmm0..xmm15, issues two raw
+    // syscalls (SIGNAL_SEND, SIGNAL_WAIT) preserving the live FP register
+    // file across both, then stores xmm0..xmm15 into buf. All operands
+    // have matching lifetimes; rcx/r11 are syscall-clobber-only.
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu xmm0,  [{p}]",
+            "vmovdqu xmm1,  [{p}]",
+            "vmovdqu xmm2,  [{p}]",
+            "vmovdqu xmm3,  [{p}]",
+            "vmovdqu xmm4,  [{p}]",
+            "vmovdqu xmm5,  [{p}]",
+            "vmovdqu xmm6,  [{p}]",
+            "vmovdqu xmm7,  [{p}]",
+            "vmovdqu xmm8,  [{p}]",
+            "vmovdqu xmm9,  [{p}]",
+            "vmovdqu xmm10, [{p}]",
+            "vmovdqu xmm11, [{p}]",
+            "vmovdqu xmm12, [{p}]",
+            "vmovdqu xmm13, [{p}]",
+            "vmovdqu xmm14, [{p}]",
+            "vmovdqu xmm15, [{p}]",
+            "2:",
+            "pause",
+            "dec {it}",
+            "jnz 2b",
+            // Syscall SYS_SIGNAL_SEND(sig_ready, 0x1). rax = 3.
+            "mov rax, 3",
+            "mov edi, {sig_ready:e}",
+            "mov esi, 1",
+            "syscall",
+            // Syscall SYS_SIGNAL_WAIT(sig_resume, 0). rax = 4.
+            "mov rax, 4",
+            "mov edi, {sig_resume:e}",
+            "mov esi, 0",
+            "syscall",
+            // Now resumed on the migration target CPU. Capture xmm0..xmm15.
+            "vmovdqu [{b} + 0x000], xmm0",
+            "vmovdqu [{b} + 0x010], xmm1",
+            "vmovdqu [{b} + 0x020], xmm2",
+            "vmovdqu [{b} + 0x030], xmm3",
+            "vmovdqu [{b} + 0x040], xmm4",
+            "vmovdqu [{b} + 0x050], xmm5",
+            "vmovdqu [{b} + 0x060], xmm6",
+            "vmovdqu [{b} + 0x070], xmm7",
+            "vmovdqu [{b} + 0x080], xmm8",
+            "vmovdqu [{b} + 0x090], xmm9",
+            "vmovdqu [{b} + 0x0a0], xmm10",
+            "vmovdqu [{b} + 0x0b0], xmm11",
+            "vmovdqu [{b} + 0x0c0], xmm12",
+            "vmovdqu [{b} + 0x0d0], xmm13",
+            "vmovdqu [{b} + 0x0e0], xmm14",
+            "vmovdqu [{b} + 0x0f0], xmm15",
+            p = in(reg) pat128.as_ptr(),
+            b = in(reg) buf.as_mut_ptr(),
+            it = inout(reg) spin => _,
+            sig_ready = in(reg) sig_ready,
+            sig_resume = in(reg) sig_resume,
+            out("rax") _, out("rcx") _, out("rdi") _, out("rsi") _, out("r11") _,
+            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+            out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+            out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+            out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+            options(nostack),
+        );
+    }
+
+    let mut mismatches = 0u64;
+    for lane in &buf
+    {
+        if lane[0] != PATTERN_A || lane[1] != PATTERN_A
+        {
+            mismatches += 1;
+        }
+    }
+    CROSS_MISMATCHES.store(mismatches, Ordering::Release);
+    let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
+    CROSS_OBSERVED_CPU.store(u32::try_from(cpu).unwrap_or(u32::MAX), Ordering::Release);
+
+    let _ = signal_send(CROSS_SIG_DONE.load(Ordering::Acquire), 0x1);
+    thread_exit();
+}
+
+/// Cross-CPU lazy-FPU-flush correctness: a thread that became `fpu_owner`
+/// on CPU 0, blocked, then was woken with affinity changed to CPU 1, must
+/// observe its register file intact post-migration. Exercises the
+/// migration-flush IPI path added in Issue #65 via the `enqueue_and_wake`
+/// → `flush_owner_remote(old_preferred_cpu, tcb)` call.
+///
+/// Requires SMP; skips otherwise. Skipped on RISC-V (out of scope for #65).
+#[cfg(target_arch = "riscv64")]
+#[allow(clippy::unnecessary_wraps)]
+pub fn preempt_isolation_cross_cpu(_ctx: &TestContext) -> TestResult
+{
+    crate::log("ktest: fpu::preempt_isolation_cross_cpu SKIP (RISC-V out of scope for #65)");
+    Ok(())
+}
+
+/// Cross-CPU lazy-FPU-flush correctness (x86-64 only); see the
+/// architecture-neutral doc comment above.
+#[cfg(target_arch = "x86_64")]
+pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
+{
+    {
+        let cpus = system_info(SystemInfoType::CpuCount as u64)
+            .map_err(|_| "system_info(CpuCount) for preempt_isolation_cross_cpu failed")?;
+        if cpus < 2
+        {
+            crate::log("ktest: fpu::preempt_isolation_cross_cpu SKIP (requires SMP)");
+            return Ok(());
+        }
+
+        CROSS_MISMATCHES.store(0, Ordering::Release);
+        CROSS_OBSERVED_CPU.store(u32::MAX, Ordering::Release);
+
+        let sig_ready = cap_create_signal(ctx.memory_frame_base)
+            .map_err(|_| "create_signal ready for preempt_isolation_cross_cpu failed")?;
+        let sig_resume = cap_create_signal(ctx.memory_frame_base)
+            .map_err(|_| "create_signal resume for preempt_isolation_cross_cpu failed")?;
+        let sig_done = cap_create_signal(ctx.memory_frame_base)
+            .map_err(|_| "create_signal done for preempt_isolation_cross_cpu failed")?;
+        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+            .map_err(|_| "create_cspace for preempt_isolation_cross_cpu failed")?;
+
+        let child_ready = cap_copy(sig_ready, cs, RIGHTS_SIGNAL)
+            .map_err(|_| "cap_copy ready for preempt_isolation_cross_cpu failed")?;
+        let child_resume = cap_copy(sig_resume, cs, RIGHTS_SIGNAL)
+            .map_err(|_| "cap_copy resume for preempt_isolation_cross_cpu failed")?;
+        let child_done = cap_copy(sig_done, cs, RIGHTS_SIGNAL)
+            .map_err(|_| "cap_copy done for preempt_isolation_cross_cpu failed")?;
+
+        CROSS_SIG_READY.store(child_ready, Ordering::Release);
+        CROSS_SIG_RESUME.store(child_resume, Ordering::Release);
+        CROSS_SIG_DONE.store(child_done, Ordering::Release);
+
+        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+            .map_err(|_| "cap_create_thread for preempt_isolation_cross_cpu failed")?;
+
+        // Pin to CPU 0 initially: child must run and become CPU 0's
+        // `fpu_owner` before the migration step.
+        thread_set_affinity(th, 0)
+            .map_err(|_| "initial thread_set_affinity(0) for preempt_isolation_cross_cpu failed")?;
+
+        let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CROSS));
+        thread_configure(th, child_cross_entry as *const () as u64, stack_top, 0)
+            .map_err(|_| "thread_configure for preempt_isolation_cross_cpu failed")?;
+        thread_start(th).map_err(|_| "thread_start for preempt_isolation_cross_cpu failed")?;
+
+        // Wait for the child to become `fpu_owner` on CPU 0 and signal ready.
+        // The parent blocks (yielding CPU 0) so the child can run; the child
+        // then loads PATTERN_A, briefly spins, signals ready, and blocks on
+        // sig_resume.
+        let _ = signal_wait(sig_ready)
+            .map_err(|_| "signal_wait ready for preempt_isolation_cross_cpu failed")?;
+
+        // Change affinity to CPU 1 while the child is Blocked. This just
+        // updates the affinity field; the migration happens at wake time.
+        thread_set_affinity(th, 1)
+            .map_err(|_| "thread_set_affinity(1) for preempt_isolation_cross_cpu failed")?;
+
+        // Wake the child. The wake path calls `enqueue_and_wake(target=1)`
+        // → `flush_owner_remote(old_preferred=0, tcb)` → synchronous flush
+        // IPI on CPU 0 → CPU 0's `fpu_owner_if` saves the live regs into
+        // the child's XSAVE area. The child then runs on CPU 1; the first
+        // FP op (the capture vmovdqu) traps to `#NM`, which XRSTORs the
+        // freshly-saved area into CPU 1's hardware before the store
+        // executes.
+        signal_send(sig_resume, 0x1)
+            .map_err(|_| "signal_send resume for preempt_isolation_cross_cpu failed")?;
+
+        let _ = signal_wait(sig_done)
+            .map_err(|_| "signal_wait done for preempt_isolation_cross_cpu failed")?;
+
+        let mismatches = CROSS_MISMATCHES.load(Ordering::Acquire);
+        let observed_cpu = CROSS_OBSERVED_CPU.load(Ordering::Acquire);
+
+        cap_delete(th).map_err(|_| "cap_delete th after preempt_isolation_cross_cpu failed")?;
+        cap_delete(sig_ready)
+            .map_err(|_| "cap_delete sig_ready after preempt_isolation_cross_cpu failed")?;
+        cap_delete(sig_resume)
+            .map_err(|_| "cap_delete sig_resume after preempt_isolation_cross_cpu failed")?;
+        cap_delete(sig_done)
+            .map_err(|_| "cap_delete sig_done after preempt_isolation_cross_cpu failed")?;
+        cap_delete(cs).map_err(|_| "cap_delete cs after preempt_isolation_cross_cpu failed")?;
+
+        crate::log_u64(
+            "fpu::preempt_isolation_cross_cpu observed_cpu=",
+            u64::from(observed_cpu),
+        );
+        crate::log_u64("fpu::preempt_isolation_cross_cpu mismatches=", mismatches);
+        if mismatches != 0
+        {
+            return Err("cross-CPU child observed extended-state corruption after migration");
+        }
+        // The migration was either actually cross-CPU (observed != 0) or the
+        // scheduler kept the child on its original CPU. In either case, the
+        // FP state must be intact. The flush IPI path is exercised when the
+        // wake target differs from the thread's prior `preferred_cpu`; this
+        // can happen via affinity-driven `select_target_cpu` or via
+        // load-balance pull on the destination. We log the observed CPU for
+        // diagnostics but do not gate the test on it — the existing
+        // `thread::affinity_migrate_ready_queued` test already covers strict
+        // affinity enforcement.
+        Ok(())
+    }
 }

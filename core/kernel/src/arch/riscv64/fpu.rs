@@ -343,6 +343,33 @@ pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBl
 #[cfg(test)]
 pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
 
+/// No-op on RISC-V: there is no per-CPU lazy-FPU owner cache. The
+/// `switch_out_save` path eagerly persists F/D state to the per-TCB area
+/// on `sstatus.FS=Dirty`, so by the time a thread is moved between harts
+/// its saved area is already current. The function exists for arch-
+/// dispatch symmetry with x86-64.
+///
+/// # Safety
+/// Accepts the unified arch-dispatch signature; ring discipline is
+/// enforced by the caller.
+#[cfg(not(test))]
+#[inline]
+pub unsafe fn flush_owner_remote(
+    _src_cpu: usize,
+    _tcb: *mut crate::sched::thread::ThreadControlBlock,
+)
+{
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub unsafe fn flush_owner_remote(
+    _src_cpu: usize,
+    _tcb: *mut crate::sched::thread::ThreadControlBlock,
+)
+{
+}
+
 /// Lazy-trap handler body: promote live `sstatus.FS` and `sstatus.VS` from
 /// Off to Initial, restore the F/D and V register files from `area` (when
 /// non-null), then mirror the resulting live FS/VS bits into `frame.sstatus`

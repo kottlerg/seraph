@@ -1,11 +1,6 @@
 # Process Lifecycle
 
-System-wide model of userspace process creation, identity, and
-destruction. This document covers the userspace half of the boot
-sequence (init onward) and the steady-state process-creation and
--death flows that follow. The bootloader-and-kernel half lives in
-[`bootstrap.md`](bootstrap.md); this document picks up where init
-begins executing.
+System-wide model of userspace process creation, identity, and destruction from init onward.
 
 ---
 
@@ -127,50 +122,17 @@ restart policy.
 ### Init reap
 
 After Phase 3 (svcmgr handover complete, usertest spawned), init signs
-over its own kernel-object caps and every reclaimable Frame cap to
-procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN` and then
-`sys_thread_exit`s.
+over its own kernel-object caps (`AddressSpace`, `CSpace`, main
+`Thread`, init-logd `Thread`) and every reclaimable Frame cap (ELF
+segments, user stack pages, `InitInfo` pages, IPC buffer) to procmgr
+via `procmgr_labels::REGISTER_INIT_TEARDOWN`, then `sys_thread_exit`s.
 
-Caps moved in the handoff:
-
-1. **Kernel-object caps** (first round):
-   - Init's own `AddressSpace`.
-   - Init's own `CSpace`.
-   - Init's main `Thread`.
-   - Init-logd's `Thread` (already in `Exited` state — TCB lingers
-     until cap death drives the dealloc).
-
-2. **Reclaimable Frame caps** (subsequent rounds, up to 4 caps per IPC):
-   - Init's ELF segment caps (kernel-minted at Phase 9 with
-     `RETYPE` + `owns_memory=true` + `available_bytes = size`).
-   - Init's user stack pages (one cap per page, same flags).
-   - Init's `InitInfo` region pages (one cap per page, same flags).
-   - Init's IPC buffer page (init-created via `FrameAlloc`).
-
-Procmgr binds a death-EQ observer on init's main thread with
-`procmgr_labels::INIT_REAP_CORRELATOR` (reserved `u32::MAX`); when
-init's `sys_thread_exit` posts the death notification, procmgr's
-`dispatch_death` routes to `init_reap::run_reap`:
-
-1. `cap_delete(init-logd thread)` — TCB reclaimed.
-2. `cap_delete(init main thread)` — TCB reclaimed.
-3. `cap_revoke + cap_delete(init AddressSpace)` — `dealloc_object`
-   walks PT chunks and `retype_free`s them; user-page mappings vanish
-   atomically.
-4. `DONATE_FRAMES(donate_caps) → memmgr` — pages enter memmgr's pool.
-   Safe: no aliasing, since init's mappings died at step 3.
-5. `cap_revoke + cap_delete(init CSpace)` — cascade dec_refs every
-   remaining cap (endpoint SENDs, endpoint slab Frame, leftover
-   `FrameAlloc` tails). `owns_memory = true` Frame caps return their
-   pages directly to the kernel buddy via `dealloc_object`'s
-   `buddy.free_range`.
-6. Log: `[procmgr] init reaped: donated N caps = M pages (M KiB) to
-   memmgr; pool reclaim total T pages`.
-
-After reap, no init-related kernel object exists; init's segment / stack
-/ `InitInfo` / IPC-buffer pages are in memmgr's pool; init's endpoint
-slab and any other `FrameAlloc` tails are back in the kernel buddy.
-Authoritative implementation: `services/procmgr/src/init_reap.rs`.
+Procmgr binds a death-EQ observer on init's main thread; on the death
+event procmgr tears down init's kernel objects in order (Threads →
+AddressSpace → donate Frame caps to memmgr → CSpace cascade), leaving
+zero init residue. The implementation is in
+[`services/procmgr/README.md`](../services/procmgr/README.md) §"Init
+reap".
 
 After init's reap completes, svcmgr is the resident supervisor. See
 [`services/svcmgr/README.md`](../services/svcmgr/README.md).
@@ -239,24 +201,14 @@ at creation time. Examples:
 - `InitInfo.memory_frame_base`, `InitInfo.memory_frame_count` — chosen
   by the kernel per init invocation.
 
-### ABI constants today, runtime fields after ASLR
+### ABI constants
 
-Fields that are pinned at well-known virtual addresses today
+Fields that are pinned at well-known virtual addresses
 (`PROCESS_INFO_VADDR`, `PROCESS_STACK_TOP`, `PROCESS_MAIN_TLS_VADDR`,
 `INIT_INFO_VADDR`). Each is declared in its respective ABI crate
 (`abi/process-abi`, `abi/init-protocol`) and consumed by both the
 parent-side populator and the child-side `_start` to find its handover
 page.
-
-The ASLR work (tracked separately) promotes these to runtime fields:
-the parent draws each VA from the system RNG and writes it into a typed
-field on the handover page; the child reads the field to locate the
-page and its bootstrap regions. The mechanism is identical to today's
-runtime-field path; only the source of the value changes.
-
-This document declares the ASLR-transition shape so consumers reading
-the `ProcessInfo` / `InitInfo` ABI today understand which constants are
-expected to migrate.
 
 ### CSpace slot conventions
 
@@ -367,20 +319,17 @@ fault. svcmgr does not restart memmgr.
 
 ---
 
-## Non-Goals
+## Out of Scope
 
-- **`fork()` and copy-on-write.** Seraph does not implement either.
-  Process creation is always from-scratch via `CREATE_PROCESS`. Zero-
-  copy buffer handoff between processes uses Frame-cap moves over IPC,
-  not write-trap CoW.
-- **Kernel-side process abstraction.** The kernel has no Process
-  object. A process is a userspace convention: an `AddressSpace` plus
-  a `CSpace` plus one or more `Thread`s, grouped by procmgr.
-- **Pager protocols and userspace page-fault delivery.** No mechanism
-  delivers page faults to userspace; faulting threads terminate.
+Seraph does not implement `fork()` or copy-on-write. Process creation
+is always from-scratch via `CREATE_PROCESS`; zero-copy buffer handoff
+between processes uses Frame-cap moves over IPC.
+
+Page faults are not delivered to userspace; faulting threads terminate,
+which surfaces through the normal process-death notification flow above.
 
 ---
 
 ## Summarized By
 
-[Architecture Overview](architecture.md), [Bootstrap](bootstrap.md), [Userspace Memory Model](userspace-memory-model.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md), [init/README.md](../services/init/README.md)
+[README.md](../README.md), [Architecture Overview](architecture.md), [Bootstrap](bootstrap.md), [Userspace Memory Model](userspace-memory-model.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md), [init/README.md](../services/init/README.md)

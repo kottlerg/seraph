@@ -27,17 +27,12 @@ override.
 
 ## Node Capabilities
 
-A **node capability** is a tokened send capability on a namespace server's
-endpoint. The token encodes:
-
-| Field | Width | Meaning |
-|---|---:|---|
-| `node_id` | 40 bits | Server-private inode identifier |
-| `rights`  | 24 bits | Namespace rights (see below) |
-
-The kernel does not interpret token bits. Token semantics are owned by
-the namespace-protocol contract; servers decode the token on every
-request to identify the addressed node and the caller's rights.
+A **node capability** is a tokened send capability on a namespace
+server's endpoint. The token packs a 40-bit server-private node
+identifier and a 24-bit namespace rights mask (see
+[Namespace Rights](#namespace-rights)). See
+[capability-model.md](capability-model.md) §"Tokens" for the
+kernel-side derivation and set-once semantics that govern these caps.
 
 A node capability is one of two kinds, distinguished only by the rights
 the server permits and the operations the server accepts on the
@@ -56,13 +51,8 @@ distinctions are server-private and surface to clients via the
 
 Every node capability the system ever issues derives from a server's
 **namespace endpoint capability**: an un-tokened send capability the
-server holds in its own CSpace. All node caps a server issues share
-this single kernel-derivation parent.
-
-This is mandated by the kernel's `cap_derive_token` contract, which
-forbids deriving a tokened cap from an already-tokened source. The
-namespace tree therefore lives in server state, not in the kernel's
-derivation graph.
+server holds in its own CSpace. The namespace tree therefore lives in
+server state, not in the kernel's derivation graph.
 
 ### Revocation
 
@@ -96,9 +86,9 @@ rights are only inspected by the server.
 | 1 | `READDIR` | NS_READDIR enumeration of this directory is permitted |
 | 2 | `STAT` | NS_STAT on this node is permitted |
 | 3 | `READ` | NS_READ / NS_READ_FRAME on this file is permitted |
-| 4 | `WRITE` | NS_WRITE on this file is permitted (deferred; reserved) |
+| 4 | `WRITE` | NS_WRITE on this file is permitted |
 | 5 | `EXEC` | This file is executable (consumed by ELF loaders) |
-| 6 | `MUTATE_DIR` | NS_CREATE / NS_UNLINK in this directory are permitted (deferred; reserved) |
+| 6 | `MUTATE_DIR` | NS_CREATE / NS_UNLINK in this directory are permitted |
 | 7 | `ADMIN` | Reserved for visibility gating (see Per-Entry Visibility) |
 | 8..23 | — | Reserved; MUST be zero on derive, ignored on read |
 
@@ -118,20 +108,13 @@ in addition to the child's `node_id` and `kind`:
 - `visible_requires` — the rights the caller's directory capability
   MUST hold for this entry to be visible at lookup or readdir.
 
-`NS_LOOKUP` semantics, executed uniformly by the namespace-protocol
-crate (not by individual drivers):
-
-1. Decode the caller's token into `(parent_node, parent_rights)`.
-2. If `parent_rights & LOOKUP == 0`, reply `PERMISSION_DENIED`.
-3. Validate the requested name (see Naming).
-4. Resolve `(parent_node, name)` to an `EntryView` via the backend.
-5. If `(parent_rights & entry.visible_requires) != entry.visible_requires`,
-   reply `NOT_FOUND`. The caller MUST NOT be able to distinguish
-   "hidden" from "absent."
-6. Compute `returned_rights = parent_rights ∩ entry.max_rights ∩ caller_requested_rights`.
-7. Mint the child capability via `cap_derive_token` from the server's
-   namespace endpoint, with token `(entry.child_node, returned_rights)`.
-8. Reply with the child capability, its `kind`, and a size hint for files.
+On `NS_LOOKUP`, the returned child rights equal
+`parent_rights ∩ entry.max_rights ∩ caller_requested_rights`; entries
+failing the `visible_requires` check appear as `NOT_FOUND` (the caller
+MUST NOT be able to distinguish "hidden" from "absent"). The
+namespace-protocol crate executes this uniformly for every backend; see
+[`shared/namespace-protocol/README.md`](../shared/namespace-protocol/README.md)
+§`NS_LOOKUP` for the wire-level dispatch.
 
 `NS_READDIR` applies the same visibility filter: entries hidden from
 this caller are skipped. Hidden entries do not appear in enumeration.
@@ -275,18 +258,13 @@ There is no chroot syscall, no mount namespace, no per-process mount
 table, and no permission-check syscall. The capability delivered *is*
 the sandbox boundary.
 
-The wire mechanism is `procmgr_labels::CONFIGURE_NAMESPACE`, called
-on a tokened process handle between `CREATE_PROCESS` /
-`CREATE_FROM_FILE` and `START_PROCESS`. The supplied cap is the sole
-source of the child's `ProcessInfo.system_root_cap` — without this
-call the slot stays zero and the child runs with no namespace
-authority. Procmgr holds no namespace cap of its own; the spawner is
-the cap-distribution authority on every spawn. The cap is typically
-either a `cap_copy` of the spawner's own `root_dir_cap` (parent-
-inherit default for `Command::spawn`) or a walk-and-attenuated view
-the spawner constructed for sandboxing. From std, the seraph-
-specific `std::os::seraph::process::CommandExt::namespace_cap`
-extension overrides the parent-inherit default with an explicit cap.
+The spawner is the cap-distribution authority on every spawn: it
+delivers the child's root capability at process-creation time, and
+absent delivery the child has no namespace access. Procmgr holds no
+namespace cap of its own. For the wire mechanism see
+[`services/procmgr/README.md`](../services/procmgr/README.md); for the
+std bindings see
+[`runtime/ruststd/README.md`](../runtime/ruststd/README.md).
 
 ---
 
@@ -310,27 +288,8 @@ This makes the mechanism agnostic to:
   Per-user identity becomes the policy-layer mapping from authenticated
   identity to a particular root capability.
 
-The user/identity layer is deferred. When introduced, it operates
-above this mechanism by composing views and minting per-identity
-capabilities; the namespace surface itself does not change.
-
----
-
-## What This Model Does Not Do
-
-- **No path-based authority.** A path string carries no authority. The
-  authority for any operation is a held capability.
-- **No ambient lookup.** A process cannot ask "what files exist on this
-  system" except through capabilities it holds. Discovery beyond a
-  granted subtree is structurally impossible.
-- **No setuid-equivalent.** A program does not gain rights by being
-  marked or by its on-disk metadata. A program's rights are exactly
-  the capabilities its spawner delivers.
-- **No identity-based override.** No "root user" with implicit
-  override. Authority is held capabilities, nothing else.
-
 ---
 
 ## Summarized By
 
-[docs/capability-model.md](capability-model.md), [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md), [services/vfsd/docs/namespace-composition.md](../services/vfsd/docs/namespace-composition.md)
+[README.md](../README.md), [docs/capability-model.md](capability-model.md), [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md), [services/vfsd/docs/namespace-composition.md](../services/vfsd/docs/namespace-composition.md)

@@ -250,94 +250,28 @@ chain that would produce the well-known constant can produce any other u64.
 Security comes from controlling *who holds an un-tokened cap*, not from secrecy
 of the token bits.
 
-### Examples in this codebase
-
-- **Memmgr** allocates a per-client tokened SEND on its own endpoint inside
-  `REGISTER_PROCESS` (`services/memmgr/src/main.rs:781`). The un-tokened source
-  cap on memmgr's endpoint never leaves memmgr's CSpace; clients see only the
-  set-once tokened copy minted for them.
-- **Procmgr** derives a tokened SEND_GRANT on its own endpoint per child during
-  `populate_child_info` (`services/procmgr/src/process.rs`). Children cannot
-  re-tokenize to mint `DEATH_EQ_AUTHORITY` or any other procmgr-side authority
-  bit. The un-tokened source stays in procmgr's own CSpace, and in init's CSpace
-  until init reaps.
-- **Pwrmgr** is similar: init mints both an authorised tokened cap
-  (`SHUTDOWN_AUTHORITY`) and a deliberately-non-authorised tokened cap
-  (sentinel `1`) for the negative-test path. Even the deny-test cap is tokened,
-  preventing the test recipient from re-deriving a privileged twin.
-
 ### Verb-bit authority pattern
 
-Some endpoints serve a mix of unprivileged read-style verbs (e.g.
-`QUERY_ENDPOINT`) and privileged mutate-style verbs (e.g.
-`PUBLISH_ENDPOINT`). Rather than splitting them across two endpoints
-(and two separate `service_*_cap` slots in `ProcessInfo`), Seraph uses
-a single endpoint and lets the server gate per-label on a **verb-bit**
-in the caller's token.
-
-Each privileged verb reserves one high bit of the u64 token namespace
-as its authority marker (`1u64 << 63` is the convention for the
-endpoint's first verb-bit). The set-once token rules above mean:
-
-- The server and its trusted bootstrap-time minters (init, and any
-  distributor init has delegated the un-tokened source to — devmgr
-  receives such a cap for `PUBLISH_AUTHORITY` in this codebase) are
-  the only entities that can mint a token with the verb-bit set. Every
-  other client holds only the tokened copies these distributors
-  chose to give them.
-- Distribution of an "authority" cap and an "unprivileged" cap differ
-  only in whether the trusted distributor sets the verb-bit in the
-  token passed to `cap_derive_token`. In this codebase the authority
-  cap's token is the verb-bit alone (no per-publisher identity in the
-  low bits); per-publisher attenuation (e.g. restricting registrations
-  to a name prefix) is the future-work shape and is tracked as a
-  follow-up issue.
-- A holder of an unprivileged cap **cannot** re-derive an authority
-  cap: set-once rules forbid changing the token, and re-deriving from
-  the un-tokened source requires a source the caller doesn't have.
-- The server's dispatcher checks `msg.token & VERB_BIT != 0` before
-  servicing the privileged label and replies `UNAUTHORIZED` otherwise
-  (`svcmgr_labels::PUBLISH_AUTHORITY`, `pwrmgr_labels::SHUTDOWN_AUTHORITY`).
-
-This collapses what would otherwise be one `ProcessInfo` slot per
-server-verb pairing into one slot per server endpoint, and keeps the
-authority/distribution decisions local to the trusted minter (init at
-boot, devmgr/svcmgr post-handover) without adding new kernel surface.
+Endpoints that serve a mix of unprivileged and privileged labels gate
+the privileged labels on a verb-bit in the caller's token, rather than
+splitting across separate endpoints. By convention the high bit
+(`1u64 << 63`) is the first verb-bit. The set-once token rules above
+mean only the server and its trusted bootstrap-time minters can set
+the verb-bit; a holder of an unprivileged cap cannot re-derive an
+authority cap. The server's dispatcher checks
+`msg.token & VERB_BIT != 0` before servicing the privileged label and
+replies `UNAUTHORIZED` otherwise.
 
 ---
 
 ## Capabilities as Namespaces
 
-The capability mechanism above suffices to express filesystem
-namespaces, sandbox views, and per-process roots without any kernel
-support beyond what is already documented. A **node capability** in
-Seraph is a tokened SEND on an IPC endpoint owned by a server
-process; the token's bits encode a server-private node identifier
-plus a per-cap rights mask, decoded by the server on every request.
-
-This composition gives:
-
-- **The capability is the namespace.** Holding a directory cap is
-  the authority to walk that directory; no path string carries
-  authority.
-- **Sandboxing as cap distribution.** A child process whose initial
-  bootstrap cap is a different node cap (or no cap at all) sees a
-  different root, with no kernel mount table or chroot syscall
-  involved.
-- **Per-child distribution at spawn.** procmgr installs each child's
-  `ProcessInfo.system_root_cap` from either the universal default
-  (a tokened SEND on vfsd's namespace endpoint) or a spawner-supplied
-  override. Spawners override via the `CONFIGURE_NAMESPACE` IPC
-  between create and start, transferring an attenuated cap they
-  obtained by walk-and-attenuate from a cap they already hold.
-  procmgr never mints namespace caps itself.
-- **Attenuation through rights bits.** The rights field in the token
-  narrows on every walk under server enforcement, mirroring the
-  derivation-tree attenuation the kernel enforces on the cap itself.
-
-The system-scope authority for the namespace model is
+The capability and token primitives above compose into Seraph's
+filesystem namespace mechanism (node capabilities, attenuation through
+rights bits, sandboxing by cap distribution) without any kernel support
+beyond what this document specifies. The full model is in
 [`namespace-model.md`](namespace-model.md); the wire format and
-dispatch crate are
+dispatch crate are in
 [`shared/namespace-protocol/README.md`](../shared/namespace-protocol/README.md).
 
 ---
@@ -500,4 +434,4 @@ The kernel does not provide:
 
 ## Summarized By
 
-[Architecture Overview](architecture.md), [init](../services/init/README.md)
+[README.md](../README.md), [Architecture Overview](architecture.md), [init](../services/init/README.md), [namespace-model.md](namespace-model.md)

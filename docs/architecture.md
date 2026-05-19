@@ -18,19 +18,6 @@ Seraph does not provide binary compatibility with other operating systems.
 
 ---
 
-## Philosophy
-
-Seraph is a microkernel‑based operating system. The kernel is a minimal, trusted
-component that provides only core mechanisms: isolation, communication, scheduling,
-memory management, and capability enforcement.
-
-All policy and services live in userspace.
-
-Expanding kernel scope increases the TCB and MUST be treated as an architectural
-decision.
-
----
-
 ## Kernel Responsibilities
 
 The kernel provides only the core mechanisms required to support the system.
@@ -78,72 +65,56 @@ services and applications. All services communicate exclusively via IPC and oper
 under explicit capability grants.
 
 **init**
-First userspace process. Starts memmgr and procmgr, requests early services
-(devmgr, svcmgr, drivers, vfsd), delegates capabilities, then hands its own
-`AddressSpace` / `CSpace` / `Thread` caps plus every reclaimable Frame cap
-(segments, stack, `InitInfo` pages, IPC buffer) to procmgr via
-`REGISTER_INIT_TEARDOWN` and exits. Procmgr's death-EQ observer fires on
-the exit and reclaims every init resource — kernel objects torn down,
-Frame caps donated to memmgr's pool. After reap, zero init residue
-remains in the system. See [`abi/boot-protocol/`](../abi/boot-protocol/),
-[`process-lifecycle.md`](process-lifecycle.md) §"Init reap", and
-`services/procmgr/src/init_reap.rs`.
+First userspace process. Bootstraps tier-1 services (memmgr, procmgr),
+spawns the remaining early services, delegates per-service capabilities,
+then exits. See [`process-lifecycle.md`](process-lifecycle.md) and
+[`services/init/README.md`](../services/init/README.md).
 
 **memmgr**
-Owns the userspace RAM frame pool. Receives all RAM Frame caps from init at
-boot and serves frame allocation IPC to all std-built services. Tracks
-per-process frame ownership and reclaims on process death. `no_std`. See
-[`process-lifecycle.md`](process-lifecycle.md) and
-[`userspace-memory-model.md`](userspace-memory-model.md).
+Owns the userspace RAM frame pool and serves frame-allocation IPC to
+std-built services. `no_std`. See
+[`userspace-memory-model.md`](userspace-memory-model.md) and
+[`services/memmgr/README.md`](../services/memmgr/README.md).
 
 **procmgr**
-Process lifecycle manager. All post-boot process creation, ELF loading, and
-teardown go through procmgr. Procmgr is itself a memmgr client and
-bootstraps its heap by calling memmgr.
+Process lifecycle manager. All post-boot process creation, ELF loading,
+and teardown go through procmgr. See
+[`process-lifecycle.md`](process-lifecycle.md) and
+[`services/procmgr/README.md`](../services/procmgr/README.md).
 
 **svcmgr**
-Service health monitor. Detects crashes and requests restarts via procmgr; holds
-direct process-creation capabilities to restart procmgr itself.
+Service health monitor. Detects crashes and requests restarts via
+procmgr; holds the fallback capabilities needed to restart procmgr
+itself. See [`services/svcmgr/README.md`](../services/svcmgr/README.md).
 
 **devmgr**
-Device manager. Receives platform resource capabilities from init, enumerates devices,
-spawns driver processes, and delegates per-device capabilities.
-See [device-management.md](device-management.md).
+Device manager. Enumerates platform hardware, spawns driver processes,
+and delegates per-device capabilities. See
+[device-management.md](device-management.md).
 
 **pwrmgr**
-Power manager. Sole holder of the raw platform shutdown caps (ACPI
-reclaimable Frame caps + `IoPortRange` on x86-64; `SbiControl` on
-RISC-V). Exposes `SHUTDOWN` / `REBOOT` over IPC, gated by a
-`SHUTDOWN_AUTHORITY` token bit. usertest invokes `SHUTDOWN` through a
-tokened cap on the success path so naked `cargo xtask run` exits
-cleanly. See [`services/pwrmgr/README.md`](../services/pwrmgr/README.md).
+Power manager. Owns the platform shutdown surface and serves
+`SHUTDOWN` / `REBOOT` IPC. See
+[`services/pwrmgr/README.md`](../services/pwrmgr/README.md).
 
 **drivers**
-Isolated userspace processes. Access hardware only through capabilities granted by
-devmgr.
+Isolated userspace processes. Access hardware only through capabilities
+granted by devmgr.
 
 **vfsd**
-Unified filesystem namespace over separate fs driver processes. Delegates operations
-to the appropriate driver.
+Unified filesystem namespace over separate fs driver processes.
 
 **fs drivers**
-Separate binaries in `fs/` (FAT, ext4, tmpfs, etc.), launched by vfsd. Communicate
-with block drivers via IPC.
+Separate binaries in `fs/` (FAT, ext4, tmpfs, etc.), launched by vfsd.
 
 **netd**
-Network stack. Manages interfaces via driver IPC and exposes socket-like endpoints
-to applications.
+Network stack. Manages interfaces via driver IPC and exposes socket-
+like endpoints to applications.
 
 **logd**
-Post-mount owner of the master log endpoint. Every userspace
-process holds a pre-installed tokened SEND cap on the same kernel
-endpoint (seeded by procmgr at spawn time into
-`ProcessInfo.log_send_cap`); logd drains the RECV side. Init runs an
-interim `init-logd` thread until logd is launched at the end of init's
-Phase 2, then hands over via `log_labels::HANDOVER_PULL` (the kernel
-endpoint object is unchanged across the handover, so existing tokened
-SEND caps survive without re-derivation). Subscribes to procmgr's
-death-notification cascade for per-sender slot reclamation.
+Owner of the master log endpoint; drains log messages from every
+process holding a pre-installed log SEND cap. See
+[`services/logd/README.md`](../services/logd/README.md).
 
 **base**
 Unprivileged applications (shell, terminal, editor, core tools).
@@ -248,32 +219,16 @@ Seraph targets 64‑bit architectures with modern MMU and privilege support.
 
 **x86‑64**
 Uses APIC and PCIDs. IOMMU hardware, when present, is discovered and
-programmed by devmgr in userspace; the kernel does not touch it. 32-bit
-and legacy x86 are not supported. The kernel is soft-float (no SSE/AVX/MMX);
-userspace targets the **x86-64-v3** psABI feature level (ratified 2020) —
-SSE2/3/SSSE3/SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT.
+programmed by devmgr in userspace; the kernel does not touch it.
 
 **RISC‑V**
-The kernel is **RV64IMAC** soft-float (LP64 ABI); userspace targets the
-**RVA23U64** profile (RVA23 v1.0, ratified 2024-10-21) — IMAFDCV plus the
-Zba/Zbb/Zbs bitmanip set, hard-float LP64D ABI. Embedded or non-standard
-configurations are not targeted. The kernel never touches F/D/V state
-itself; userspace FP/V state is preserved across preemption by a lazy
-save/restore discipline.
+Embedded or non-standard configurations are not targeted.
 
-See [coding-standards.md#c-architecture-invariants](coding-standards.md#c-architecture-invariants)
-for the architectural code isolation rules.
-
----
-
-## Non-Goals
-
-**POSIX API compatibility.**
-Seraph defines its own native interfaces. Filesystem formats and network protocols
-may be adopted as data formats, not as API commitments.
-
-**Binary compatibility with other operating systems.**
-Seraph does not aim to run Linux or other OS binaries.
+Per-arch kernel and userspace target specifications (soft-float / FP
+profile, psABI feature floor, microarchitecture pins) are in
+[`build-system.md`](build-system.md#custom-targets). Architectural code
+isolation rules are in
+[coding-standards.md#c-architecture-invariants](coding-standards.md#c-architecture-invariants).
 
 ---
 

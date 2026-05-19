@@ -102,9 +102,7 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   for `mem_unmap` before `unreserve_pages`.
 - **Arena.** Each process carves a fixed-size arena out of its own
   address space at `_start` time. The arena base is a deterministic
-  constant for the first cut and is structured so a one-line change
-  switches to RNG-driven randomisation when the kernel RNG is
-  available.
+  constant.
 - **Concurrency.** Reservations are independent across threads; the
   allocator serialises on a spinlock as needed.
 
@@ -145,14 +143,11 @@ the child's `_start` will find them.
   `PROCESS_MAIN_TLS_VADDR` (today an ABI constant); spawned threads
   allocate their TLS blocks from the heap.
 
-Today, the page locations are split between **runtime fields**
+The page locations are split between **runtime fields**
 (`ipc_buffer_vaddr`) and **ABI constants** (`PROCESS_INFO_VADDR`,
-`PROCESS_STACK_TOP`, `PROCESS_MAIN_TLS_VADDR`, `INIT_INFO_VADDR`). The
-ASLR work (tracked separately) promotes the constants to runtime
-fields: the creator draws each VA from the system RNG and writes it
-into a typed field on the handover page, the child reads the field
-to locate the page. The mechanism is identical to today's
-`ipc_buffer_vaddr` path.
+`PROCESS_STACK_TOP`, `PROCESS_MAIN_TLS_VADDR`, `INIT_INFO_VADDR`).
+Each ABI constant is declared in its respective ABI crate
+(`abi/process-abi`, `abi/init-protocol`).
 
 See [`process-lifecycle.md`](process-lifecycle.md) for the full
 handover discipline.
@@ -184,65 +179,32 @@ Authoritative wire shape lives in
 
 ---
 
-## What the Kernel Refuses to Learn
+## Kernel-Side Non-Concerns
 
-- **Process** — not a kernel object. A "process" is an `AddressSpace`
-  plus a `CSpace` plus one or more `Thread`s, grouped by procmgr.
-- **Heap** — unknown to the kernel. The kernel only sees mappings of
-  Frame caps at user-supplied VAs.
+The kernel does not track per-process memory abstractions; userspace
+owns them.
+
+- **Heap** — the kernel only sees mappings of Frame caps at user-
+  supplied VAs.
 - **VA allocation policy** — the kernel enforces page alignment and
   the user-half bound; it does not track or allocate VAs.
-- **Frame ownership beyond the derivation tree** — the kernel does not
-  know which process "owns" a Frame; that information lives in
-  memmgr's per-process tracking.
+- **Frame ownership beyond the derivation tree** — the kernel does
+  not know which process "owns" a Frame.
 - **Process death implications for memory** — when a process's
   `AddressSpace` is revoked, the kernel tears down threads and page
   tables. memmgr's reclamation runs separately, driven by procmgr's
   death notification.
-- **Wall-clock time** — see [`memory-model.md`](memory-model.md) for
-  the broader kernel-scope statement; not a memory concern, but
-  related in spirit.
 
----
+The userspace process abstraction itself is owned by
+[`architecture.md`](architecture.md) §"Kernel Primitives vs.
+Userspace Abstractions".
 
-## ASLR Readiness
-
-The system is ASLR-ready by design and ASLR-pending by implementation:
-
-- The kernel never reads workspace VA constants; every mapping VA is
-  user-supplied at `mem_map` time.
-- memmgr never reads VA constants; it returns Frame caps that are VA-
-  agnostic.
-- `std::sys::seraph` chooses heap and page-reservation VAs at
-  process-startup time, structured so substituting an RNG-derived base
-  is a one-line change.
-- The creator chooses `ProcessInfo`-runtime-field VAs per child today.
-  ASLR promotes the remaining ABI-constant VAs to runtime fields
-  identically.
-
-The randomisation source is the kernel RNG. Until that exists, all
-VAs are deterministic, but no compile-time VA constant lives outside
-the ABI crates and per-component private modules.
-
----
-
-## Non-Goals
-
-These are rejected mechanisms, not deferred work.
-
-- **Copy-on-write.** No kernel write-trap, no refcount-on-write
-  frames, no frame-ownership ambiguity. Seraph does not implement
-  `fork()`. Zero-copy buffer handoff is via Frame-cap moves over IPC.
-- **POSIX file-backed `mmap()`.** No pager protocol, no page-fault
-  delivery to userspace, no page cache as a kernel concern. Zero-copy
-  file access is via fs-driver IPC returning Frame caps for file
-  pages, mapped by the client through the page-reservation
-  allocator.
-- **Wall-clock in the kernel.** The kernel exposes only monotonic
-  elapsed time. Wall-clock is a userspace `timed` service.
+File-backed access via `mmap()` does not exist. Zero-copy file access
+is via fs-driver IPC returning Frame caps for file pages, mapped by
+the client through the page-reservation allocator.
 
 ---
 
 ## Summarized By
 
-[Memory Model](memory-model.md), [Process Lifecycle](process-lifecycle.md), [Architecture Overview](architecture.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md), [ruststd/README.md](../runtime/ruststd/README.md)
+[README.md](../README.md), [Memory Model](memory-model.md), [Process Lifecycle](process-lifecycle.md), [Architecture Overview](architecture.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md), [ruststd/README.md](../runtime/ruststd/README.md)

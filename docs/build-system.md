@@ -80,9 +80,7 @@ floor for userspace SIMD / Vector codegen:
   XSAVE/XSAVEOPT for the lazy save/restore discipline.
 - `riscv64a23-seraph.json` — **RVA23U64** userspace profile (RVA23 v1.0,
   ratified 2024-10-21): IMAFDCV plus the Zba/Zbb/Zbs bitmanip set,
-  hard-float LP64D ABI. Further RVA23 mandates (Zfa, Zfhmin, Zihintntl,
-  Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt) will land as LLVM
-  and QEMU coverage broadens.
+  hard-float LP64D ABI.
 
 Userspace correctness under preemption is provided by lazy FP/SIMD/V
 save/restore in the kernel scheduler — switch-out save on dirty, switch-in
@@ -95,10 +93,8 @@ custom JSON is needed. The RISC-V bootloader uses
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace
-triples) to rebuild the standard library from source. This is passed
-explicitly by the build scripts rather than via `.cargo/config.toml`, to
-avoid interfering with `cargo test` (which builds for the host target and
-does not need `build-std`).
+triples) to rebuild the standard library from source. The build scripts
+pass the flag explicitly.
 
 ---
 
@@ -245,6 +241,27 @@ See [`xtask/README.md`](../xtask/README.md) for the full command reference and
 
 ---
 
+## Continuous Integration
+
+CI workflows live in `.github/workflows/`. Local equivalents are the
+`cargo xtask` commands documented above.
+
+| Workflow | Trigger | Purpose |
+|---|---|---|
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, runs one usertest iteration against the default `boot.conf`, then swaps `boot.conf` to `init=ktest` and runs one ktest iteration. |
+| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: per `arch × profile` cell, builds and runs `4 × 20` usertest iterations against the default `boot.conf`, then swaps to ktest and runs `4 × 20` ktest iterations. |
+| `release.yml` | tag push (`v*.*.*`), manual dispatch | Builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
+
+`build-test.yml` cancels stacked runs on the same ref
+(`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not
+cancel on the same ref — a tag-push run completes even if a later tag
+pushes.
+
+The merge-gating rule (CI must pass green before merge) lives in
+[conventions.md](conventions.md#branch-and-pr-workflow).
+
+---
+
 ## Summarized By
 
-[README.md](../README.md)
+[README.md](../README.md), [conventions.md](conventions.md)

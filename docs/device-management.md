@@ -41,22 +41,12 @@ binding in a running system.
 
 ### What devmgr receives from init
 
-At startup, devmgr receives from init (via `SYS_CAP_INSERT`):
-
-- **MMIO aperture capabilities** — one `MmioRegion` cap per
-  `BootInfo.mmio_apertures` entry, covering coarse non-RAM physical
-  regions. Init narrows these into device-sized sub-caps as needed and
-  delegates them to drivers.
-- **Interrupt capabilities** — produced on demand via the runtime
-  IRQ-registration syscall (`SYS_IRQ_REGISTER`) after init has walked
-  firmware tables and located the relevant GSI / PLIC source.
-- **Firmware-table access** — access to ACPI and DTB physical memory so
-  devmgr can resolve per-device descriptors that the bootloader no longer
-  enumerates.
-- **SchedControl capability** — for assigning elevated priorities to latency-sensitive
-  driver threads.
-
-Init retains derived copies to revoke devmgr's authority if devmgr crashes.
+devmgr receives from init a platform capability set sufficient for
+enumeration and per-driver delegation (MMIO apertures, firmware-table
+access, SchedControl, IRQ-registration authority). Init retains derived
+copies to revoke devmgr's authority if devmgr crashes. See
+[`services/devmgr/README.md`](../services/devmgr/README.md) for the
+authoritative cap-by-cap list.
 
 ### What devmgr does
 
@@ -102,31 +92,29 @@ possible. A driver may still be authorised by devmgr to DMA in this mode,
 but no hardware enforcement constrains the device; a compromised driver
 can reach any physical address the device can address.
 
-devmgr is responsible for detecting the platform IOMMU situation, deciding
-per-device policy, and programming the IOMMU itself when present. For
-devices that require DMA on a platform without IOMMU protection, devmgr may:
-- Refuse to bind the driver.
-- Bind the driver after warning the operator.
-- Bind the driver in a restricted mode that avoids DMA entirely.
+devmgr is responsible for detecting the platform IOMMU situation,
+deciding per-device policy, and programming the IOMMU itself when
+present. Policy on platforms without IOMMU protection is devmgr-
+defined; see [`services/devmgr/README.md`](../services/devmgr/README.md).
 
-This decision is entirely userspace policy. The kernel is agnostic to DMA
-mode: it does not read or write IOMMU registers, does not track per-device
-DMA state, and does not return a DMA-safety verdict.
+The kernel is agnostic to DMA mode: it does not read or write IOMMU
+registers, does not track per-device DMA state, and does not return a
+DMA-safety verdict.
 
 ---
 
 ## IOMMU Discovery and Programming
 
-IOMMU topology is a userspace concern. The bootloader does **not** emit a
-dedicated resource variant for IOMMU units; it passes ACPI and DTB tables
-through unchanged via `PlatformTable` entries, and `devmgr` performs the
-IOMMU-topology walk itself (DMAR on x86-64, `iommu` / `iommu-map` nodes on
-RISC-V).
+IOMMU topology is a userspace concern. The bootloader does **not** emit
+a dedicated resource variant for IOMMU units; it passes ACPI and DTB
+tables through unchanged via `PlatformTable` entries, and `devmgr`
+performs the IOMMU-topology walk itself. Discovery specifics live in
+[`services/devmgr/README.md`](../services/devmgr/README.md).
 
-For each IOMMU discovered, `devmgr` acquires an MMIO-region capability for
-that IOMMU's register range and programs the translation tables directly.
-The kernel does not read or write IOMMU registers and holds no per-IOMMU
-state.
+For each IOMMU discovered, `devmgr` acquires an MMIO-region capability
+for that IOMMU's register range and programs the translation tables
+directly. The kernel does not read or write IOMMU registers and holds
+no per-IOMMU state.
 
 When devmgr binds a DMA-capable driver, devmgr (a) programs the IOMMU
 translation tables for that driver's device, and (b) derives and transfers a
@@ -164,4 +152,4 @@ managed by init's bootstrap sequence (for early boot) and svcmgr (for restarts).
 
 ## Summarized By
 
-[Architecture Overview](architecture.md), [devmgr](../services/devmgr/README.md), [drivers](../services/drivers/README.md)
+[README.md](../README.md), [Architecture Overview](architecture.md), [devmgr](../services/devmgr/README.md), [drivers](../services/drivers/README.md)

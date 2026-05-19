@@ -273,15 +273,39 @@ Phase 7, and `KERNEL_MMIO` is populated.
    e. One SbiControl capability (RISC-V only; Call rights) for init to
       forward SBI calls.
    f. (Thread and process capabilities for init are added in Phase 9)
-4. Record the root CSpace pointer in a global for use in Phase 9
-5. Emit: "capability system initialised, N slots populated"
+4. Mint reclaimable Frame caps from `BootInfo.reclaim_ranges` via
+   `cap::mint_reclaim_frame_caps`:
+   - One cap per range with `owns_memory = true` and full byte ledger;
+     inserted into the root CSpace so the cap reaches init through the
+     standard `CapDescriptor` walk in Phase 9.
+   - The buddy ledger records each range via `register_owned_range`
+     so cap teardown returns the pages via `dealloc_object` →
+     `free_range` with the `total / free` ratio well-defined.
+   - Whether init donates each cap onward to memmgr or lets it cascade
+     back to the buddy on CSpace teardown is a userspace policy
+     decision; the kernel does not impose a route.
+   - Ranges flagged `RECLAIM_FLAG_LATE` are skipped here and minted in
+     Phase 8 (see Late-Reclaim below).
+5. Record the root CSpace pointer in a global for use in Phase 9
+6. Emit: "capability system initialised, N slots populated"
 ```
 
 **Failure mode:** Allocation failure during CSpace construction halts with
 "fatal: cannot initialise capability system".
 
 **Completion criterion:** Root CSpace exists and contains capabilities for all
-boot-provided hardware resources.
+boot-provided hardware resources, including the reclaimable Frame caps
+covering bootloader scratch pages (`BootInfo` page, descriptor arrays,
+MMIO aperture array, reclaim-array page, cmdline page, transient page-
+table frames).
+
+### Cmdline-page snapshot
+
+The cmdline page lands in `reclaim_ranges` like every other early entry,
+but only after the kernel snapshots its contents into a small BSS
+buffer during earlier kernel-phase processing. The Phase-9 `InitInfo`
+copy reads from the snapshot, leaving the bootloader page reclaim-safe
+by the time this phase mints its Frame cap.
 
 ---
 
@@ -313,6 +337,16 @@ boot-provided hardware resources.
    cspace_layout so init sees the cap through the standard CSpace
    handoff in Phase 9.
 ```
+
+The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
+`BootInfo.reclaim_ranges`. `cap::mint_reclaim_frame_caps` skips it in
+Phase 7; this phase mints it after SMP bringup completes and
+`mm::paging::unmap_identity_page` retires the low-VA identity-RWX
+mapping. (Both arches install this identity mapping in Phase 3 — the
+trampoline must remain executable at its PA while PC walks the
+post-`csrw satp` / post-CR3-write instructions.) The late-mint
+completes before Phase 9 consumes `cspace_layout`, so the descriptor
+still flows through the standard CSpace handoff.
 
 APs depend only on Phase 5/8 state (interrupts, percpu, scheduler
 idle threads); they never touch init's address space or any Phase-9

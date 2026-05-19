@@ -1,0 +1,18 @@
+# /bin/pwrmgr — power manager (platform shutdown / reboot).
+#
+# Init spawns pwrmgr in Phase 3 with the arch-specific shutdown
+# caps (IoPortRange / SbiControl / ACPI region frames) it cannot
+# obtain post-handover; svcmgr therefore binds-only on the running
+# instance rather than launching a fresh one. Once those platform
+# caps are reachable from svcmgr a `restart = on_failure` recipe
+# can replace this.
+#
+# critical = high: if pwrmgr dies and cannot recover, svcmgr
+# attempts a graceful shutdown via `pwrmgr.shutdown` — which is
+# unreachable because the source is gone. The death handler logs
+# the degraded state and continues; no fallback raw-shutdown path
+# exists in this architecture.
+binary    = /bin/pwrmgr
+restart   = never
+critical  = high
+namespace = none

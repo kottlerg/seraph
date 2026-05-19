@@ -23,6 +23,13 @@ use crate::{TestContext, TestResult};
 /// Test virtual address for MMIO mapping. 1.25 GiB — above ktest's load address.
 const MMIO_TEST_VA: u64 = 0x5000_0000;
 
+/// Kernel pin: every `CSpace` is clamped to at most `L1_SIZE * L2_SIZE`
+/// (256 * 64 = 16384) slots. Used as a fallback if `cap_info` ever
+/// returns a value larger than `u32::MAX`, which the kernel's own
+/// invariants forbid today.
+#[cfg(target_arch = "x86_64")]
+const ROOT_CSPACE_MAX_SLOTS: u32 = 16384;
+
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
 
 /// `mmio_map` maps a hardware MMIO region into the address space.
@@ -101,6 +108,11 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 /// On RISC-V this syscall is not supported and must return `NotSupported`.
 /// On `x86_64`, scans for the first `IoPortRange` cap and binds it to a test
 /// thread. If no `IoPortRange` cap is found, the test is skipped.
+///
+/// The scan bound is the cspace's `max_slots` (queried at runtime via
+/// `cap_info`) so the test stays robust against changes to cap mint
+/// order or post-init carve products landing at slot indices above
+/// `aspace_cap`.
 // needless_return: cfg-gated early return is required to terminate the riscv64
 // path; the x86_64 path follows in the same function body.
 #[allow(clippy::needless_return)]
@@ -126,7 +138,18 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
         let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
             .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
 
-        for slot in 1..ctx.aspace_cap
+        let max_slots = if let Ok(n) =
+            syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+        {
+            u32::try_from(n).unwrap_or(ROOT_CSPACE_MAX_SLOTS)
+        }
+        else
+        {
+            syscall::cap_delete(th).ok();
+            syscall::cap_delete(cs).ok();
+            return Err("cap_info(CAP_INFO_CSPACE_CAPACITY) failed");
+        };
+        for slot in 1u32..max_slots
         {
             match syscall::ioport_bind(th, slot)
             {
@@ -198,7 +221,7 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
         let max_slots =
             match syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
             {
-                Ok(n) => u32::try_from(n).unwrap_or(u32::MAX),
+                Ok(n) => u32::try_from(n).unwrap_or(ROOT_CSPACE_MAX_SLOTS),
                 Err(_) => return Err("cap_info(CAP_INFO_CSPACE_CAPACITY) failed"),
             };
         for slot in 1u32..max_slots

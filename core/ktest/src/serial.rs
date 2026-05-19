@@ -76,15 +76,14 @@ mod arch
     /// from the root cap (via `ioport::bind_port_range`) and binds it to
     /// the current thread, then programs the UART to 115200 8N1.
     ///
+    /// `InitInfo` is consumed centrally by `ioport::init`; serial only
+    /// needs the narrow COM1 bind.
+    ///
     /// # Safety
     /// Must be called once, from the main thread, after `InitInfo` is
     /// mapped and `ioport::init` has run.
-    pub unsafe fn init(info: &super::InitInfo, thread_cap: u32)
+    pub unsafe fn init(_info: &super::InitInfo, thread_cap: u32)
     {
-        // info is consumed via ioport::init() in main; serial only needs
-        // the narrow COM1 bind.
-        let _ = info;
-
         if !crate::ioport::bind_port_range(thread_cap, COM1, COM1_PORTS)
         {
             return; // no IoPortRange cap, or carve/bind failed

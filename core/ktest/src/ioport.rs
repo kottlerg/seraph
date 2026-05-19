@@ -41,9 +41,9 @@ static mut WIDE: WideCap = WideCap {
 
 /// Seed the wide cap from the root `IoPortRange` descriptor in `InitInfo`.
 ///
-/// Idempotent: a second call with the same `info` overwrites the prior
-/// state; intended to be called once from `main::run` before any
-/// `bind_port_range` consumer.
+/// Called once from `main::run` before any `bind_port_range` consumer.
+/// A second call would overwrite the residual-cap slot tracked here
+/// without recovering any carve products already produced.
 pub fn init(info: &InitInfo)
 {
     let Some((slot, base, end)) = find_root(info)
@@ -66,6 +66,10 @@ pub fn init(info: &InitInfo)
 /// cap fails.
 pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
 {
+    if count == 0
+    {
+        return false;
+    }
     let port_start = u32::from(port);
     let port_end = port_start + u32::from(count);
     // SAFETY: ktest is single-threaded.

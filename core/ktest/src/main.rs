@@ -133,8 +133,9 @@ pub struct TestContext
     /// Used by tests that need to discover the cspace's slot capacity at
     /// runtime via `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` so their scans
     /// cover every slot the kernel may have populated, including those
-    /// allocated after `aspace_cap` (e.g. carve-time `ioport::init`
-    /// products on `x86_64`).
+    /// allocated after `aspace_cap` (e.g. narrow `IoPortRange` caps minted
+    /// by `ioport::bind_port_range` callers such as `serial::init` on
+    /// `x86_64`).
     pub cspace_cap: u32,
 
     /// Pointer to the registered IPC buffer page (4 KiB, page-aligned).

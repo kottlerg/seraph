@@ -58,7 +58,7 @@ process.
 * svcmgr-late-launch migration (parallel to the usertest refactor;
   logd is launched by init for now).
 
-## Source layout
+## Source Layout
 
 ```
 logd/

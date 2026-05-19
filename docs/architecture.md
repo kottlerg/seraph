@@ -237,5 +237,12 @@ isolation rules are in
 
 ## Summarized By
 
-[README.md](../README.md), [init/README.md](../services/init/README.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md)
+[README.md](../README.md),
+[devmgr/README.md](../services/devmgr/README.md),
+[init/README.md](../services/init/README.md),
+[logd/README.md](../services/logd/README.md),
+[memmgr/README.md](../services/memmgr/README.md),
+[procmgr/README.md](../services/procmgr/README.md),
+[pwrmgr/README.md](../services/pwrmgr/README.md),
+[svcmgr/README.md](../services/svcmgr/README.md)
 

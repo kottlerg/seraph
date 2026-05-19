@@ -199,10 +199,10 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 
 **Minimum QEMU version:** QEMU ≥ 8.0 (V extension support) is required;
 `xtask/src/qemu.rs` passes `-cpu rv64,v=true,zba=true,zbb=true,zbs=true`
-for RISC-V and `-cpu max,migratable=no` on x86-64 TCG. The named
-`-cpu rva23s64` model arrived in QEMU 9.1 (2024-09) and is the preferred
-swap once the CI runner floor ships it; until then the explicit feature
-string is the source of truth.
+for RISC-V and `-cpu max,migratable=no` on x86-64 TCG. The explicit
+feature string is the source of truth. The named `-cpu rva23s64`
+single-flag equivalent (QEMU ≥ 9.1, 2024-09) is a documented
+configuration alternative when the CI runner floor supports it.
 
 ---
 
@@ -216,8 +216,8 @@ tree, scheduler run queues) keep hardware dependencies behind trait boundaries. 
 to run these modules on the host under the standard test harness.
 
 **QEMU integration tests** — Code requiring real hardware (page tables, interrupts, context
-switching) is tested under QEMU with a custom harness that runs tests sequentially and reports
-results over serial. This harness will be implemented when arch code is written.
+switching) is tested under QEMU by the [`core/ktest`](../core/ktest/README.md) harness, which
+runs tests sequentially and reports results over serial.
 
 ### Running Tests
 
@@ -227,7 +227,7 @@ cargo xtask test --component kernel     # single crate
 ```
 
 For test naming conventions and requirements (what must be tested, what should not), see
-[coding-standards.md](coding-standards.md#testing).
+[coding-standards.md](coding-standards.md#d-testing-invariants).
 
 ---
 

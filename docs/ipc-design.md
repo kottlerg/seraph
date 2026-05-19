@@ -154,4 +154,10 @@ The kernel does not provide:
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md)
+[README.md](../README.md),
+[Architecture Overview](architecture.md),
+[devmgr/README.md](../services/devmgr/README.md),
+[logd/README.md](../services/logd/README.md),
+[memmgr/README.md](../services/memmgr/README.md),
+[procmgr/README.md](../services/procmgr/README.md),
+[vfsd/README.md](../services/vfsd/README.md)

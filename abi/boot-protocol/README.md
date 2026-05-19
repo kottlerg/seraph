@@ -71,7 +71,7 @@ A compliant bootloader MUST NOT:
 
 ## Summarized By
 
-[README.md](../../README.md), [core/boot/README.md](../../core/boot/README.md),
+[core/boot/README.md](../../core/boot/README.md),
 [docs/bootstrap.md](../../docs/bootstrap.md),
 [docs/build-system.md](../../docs/build-system.md),
 [docs/architecture.md](../../docs/architecture.md),

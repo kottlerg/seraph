@@ -12,8 +12,7 @@ This document is authoritative for:
   (`init` → `memmgr` → `procmgr` → `svcmgr`).
 - The capability flow at each step — who hands what to whom.
 - The `ProcessInfo` / `InitInfo` handover discipline: which fields are
-  parent-chosen runtime values, which are ABI constants, and how the
-  ASLR transition will reshape the boundary.
+  parent-chosen runtime values and which are ABI constants.
 - The steady-state process-creation flow under procmgr.
 - The process-death notification flow that drives memmgr reclamation.
 - The procmgr-restart fallback when procmgr itself dies.
@@ -331,4 +330,12 @@ which surfaces through the normal process-death notification flow above.
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md), [Bootstrap](bootstrap.md), [Userspace Memory Model](userspace-memory-model.md), [memmgr/README.md](../services/memmgr/README.md), [procmgr/README.md](../services/procmgr/README.md), [init/README.md](../services/init/README.md)
+[README.md](../README.md),
+[Architecture Overview](architecture.md),
+[Bootstrap](bootstrap.md),
+[Userspace Memory Model](userspace-memory-model.md),
+[init/README.md](../services/init/README.md),
+[logd/README.md](../services/logd/README.md),
+[memmgr/README.md](../services/memmgr/README.md),
+[procmgr/README.md](../services/procmgr/README.md),
+[svcmgr/README.md](../services/svcmgr/README.md)

@@ -102,4 +102,8 @@ Once init exits, svcmgr is the resident supervisor. See
 
 ## Summarized By
 
-[README.md](../README.md)
+[README.md](../README.md),
+[abi/boot-protocol/README.md](../abi/boot-protocol/README.md),
+[init/README.md](../services/init/README.md),
+[logd/README.md](../services/logd/README.md),
+[svcmgr/README.md](../services/svcmgr/README.md)

@@ -45,6 +45,21 @@ pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
     Some((token, tokened))
 }
 
+/// Argv and env blobs seeded into a child at `CREATE_FROM_FILE` time.
+///
+/// Each blob is NUL-separated and NUL-terminated (the wire shape
+/// procmgr's stack-envelope writer expects); `count` is the number of
+/// entries in the blob. An empty blob with `count = 0` skips that
+/// surface entirely — the child inherits no argv / no env from svcmgr.
+#[derive(Default, Clone, Copy)]
+pub struct StartupBlobs<'a>
+{
+    pub argv: &'a [u8],
+    pub argv_count: u32,
+    pub env: &'a [u8],
+    pub env_count: u32,
+}
+
 /// Walk svcmgr's root for `path`, then call procmgr `CREATE_FROM_FILE`.
 /// Returns the freshly created (suspended) process. Caller is
 /// responsible for `CONFIGURE_NAMESPACE`, bootstrap delivery, and
@@ -53,8 +68,13 @@ pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
 /// `path` is interpreted relative to svcmgr's own `root_dir_cap`
 /// (universal post-#21 init handover), so callers pass paths exactly
 /// as they appear in `.svc` files — e.g. `"/bin/crasher"`.
+///
+/// `blobs` carries argv/env if the caller wants the child to see
+/// them; restart-path callers pass [`StartupBlobs::default`] to leave
+/// both surfaces empty (matching the pre-#21 restart shape).
 pub fn walk_and_create_from_file(
     path: &str,
+    blobs: StartupBlobs<'_>,
     procmgr_ep: u32,
     bootstrap_ep: u32,
     ipc_buf: *mut u64,
@@ -79,11 +99,41 @@ pub fn walk_and_create_from_file(
             return None;
         }
     };
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, file_size)
-        .cap(file_cap)
-        .cap(tokened_creator)
-        .build();
+
+    let argv_bytes = blobs.argv.len();
+    let argv_words = argv_bytes.div_ceil(8);
+    let env_bytes = blobs.env.len();
+    let env_words = env_bytes.div_ceil(8);
+
+    let label = procmgr_labels::CREATE_FROM_FILE
+        | ((argv_bytes as u64) << 32)
+        | (u64::from(blobs.argv_count) << 48)
+        | (u64::from(blobs.env_count) << 56);
+
+    // word layout matches init's `create_and_run_usertest`:
+    //   word 0:           file_size
+    //   words 1..1+argv_w: argv blob (NUL-separated, NUL-terminated)
+    //   word  1+argv_w:   env_bytes
+    //   words ...:        env blob
+    let argv_word_offset: usize = 1;
+    let env_len_word_offset = argv_word_offset + argv_words;
+    let env_blob_word_offset = env_len_word_offset + 1;
+    let data_count = 1 + argv_words + 1 + env_words;
+
+    let mut builder = IpcMessage::builder(label).word(0, file_size);
+    if argv_bytes > 0
+    {
+        builder = builder.bytes(argv_word_offset, blobs.argv);
+    }
+    builder = builder
+        .word(env_len_word_offset, env_bytes as u64)
+        .word_count(data_count);
+    if env_bytes > 0
+    {
+        builder = builder.bytes(env_blob_word_offset, blobs.env);
+    }
+    let create_msg = builder.cap(file_cap).cap(tokened_creator).build();
+
     // SAFETY: `ipc_buf` is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) }.ok()?;
     if reply.label != 0
@@ -306,7 +356,13 @@ fn create_process(svc: &ServiceEntry, ctx: &RestartCtx) -> Option<(u32, u32, u64
     {
         let path_bytes = &svc.vfs_path[..svc.vfs_path_len as usize];
         let path_str = core::str::from_utf8(path_bytes).ok()?;
-        walk_and_create_from_file(path_str, ctx.procmgr_ep, ctx.bootstrap_ep, ctx.ipc_buf)?
+        walk_and_create_from_file(
+            path_str,
+            StartupBlobs::default(),
+            ctx.procmgr_ep,
+            ctx.bootstrap_ep,
+            ctx.ipc_buf,
+        )?
     }
     else
     {
@@ -472,7 +528,7 @@ pub fn apply_namespace_policy(
 /// tokened handle and release procmgr-side cap slots. Called when a step
 /// between procmgr's CREATE and START fails and the partial child must
 /// be reaped before the supervision loop retries.
-fn destroy_partial_child(process_handle: u32, thread_cap: u32, ipc_buf: *mut u64)
+pub(crate) fn destroy_partial_child(process_handle: u32, thread_cap: u32, ipc_buf: *mut u64)
 {
     let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.

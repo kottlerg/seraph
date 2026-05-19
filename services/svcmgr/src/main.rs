@@ -29,6 +29,11 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
+// B5 wires definitions::reconcile_and_launch into HANDOVER_COMPLETE.
+// Suppress dead-code lints in the interim so each B-step ships
+// independently buildable.
+#[allow(dead_code)]
+mod definitions;
 mod restart;
 mod service;
 

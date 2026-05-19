@@ -1,0 +1,16 @@
+# memmgr — RAM frame allocator + per-process page-pool ledger.
+#
+# Bootstrapped by init via raw `cap_create_*` syscalls (no
+# CREATE_FROM_FILE; binary cannot be respawned by svcmgr today).
+# `restart = never` + `critical = high`: on unrecoverable death
+# svcmgr issues `pwrmgr_labels::SHUTDOWN` via `pwrmgr.shutdown` and
+# the system powers off.
+#
+# The `binary` line is required by the parser and points at the
+# bootloader-staged copy (the live process was loaded from a module
+# Frame cap, not a VFS walk). It is never consumed today because
+# the launch path is unreachable under `restart = never`.
+binary    = /esp/EFI/seraph/memmgr
+restart   = never
+critical  = high
+namespace = none

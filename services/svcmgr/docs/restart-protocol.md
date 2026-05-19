@@ -142,16 +142,25 @@ The set of services svcmgr currently supervises (per the shipped
 
 | Service | Source | Restart | Critical |
 |---|---|---|---|
-| usertest | svcmgr-launched | never | low |
-| crasher | svcmgr-launched | always | low |
-| pwrmgr | init-registered (bind only) | never | high |
+| `usertest` | svcmgr-launched | `never` | `low` |
+| `crasher` | svcmgr-launched | `always` | `low` |
+| `memmgr` | init-registered (bind only) | `never` | `high` |
+| `procmgr` | init-registered (bind only) | `never` | `high` |
+| `devmgr` | init-registered (bind only) | `never` | `high` |
+| `vfsd` | init-registered (bind only) | `never` | `high` |
+| `logd` | init-registered (bind only) | `never` | `high` |
+| `timed` | init-registered (bind only) | `never` | `normal` |
+| `pwrmgr` | init-registered (bind only) | `never` | `high` |
 
-vfsd, devmgr, procmgr, memmgr, logd, and timed remain unregistered
-in this PR (their thread caps are not yet threaded through init's
-bootstrap helpers); their `.svc` recipes are not shipped because
-shipping them without registrations would cause svcmgr to launch a
-second instance of each at handover. Registering them is the
-follow-up scope.
+Restart paths for the bind-only set are aspirational today: most of
+them were spawned with arch-/firmware-authority caps that init holds
+and svcmgr cannot re-mint (memmgr/procmgr via raw `cap_create_*`
+syscalls; devmgr/vfsd/logd with one-shot authority handover; pwrmgr
+with `IoPortRange` / `SbiControl` / ACPI frames). When their
+`.svc` `restart` value moves off `never` in the future, the spawn
+path needs to gain access to those caps — either via a new
+init→svcmgr handover round, or by relocating the spawn entirely
+into svcmgr.
 
 ---
 

@@ -116,12 +116,12 @@ Init's responsibilities are strictly bounded:
      (negative-test twin).
    * `svcmgr` — un-tokened SEND on svcmgr's own service endpoint.
 
-   Init also registers pwrmgr with svcmgr via the v3
-   `REGISTER_SERVICE` wire (name + thread cap; recipe lives in
-   `services.d/pwrmgr.svc`). vfsd, devmgr, procmgr, memmgr, logd,
-   and timed remain unregistered in this iteration — their thread
-   caps are not yet threaded through the existing bootstrap helpers;
-   registration is a follow-up.
+   Init also registers each foundational service it bootstrapped
+   with svcmgr via the v3 `REGISTER_SERVICE` wire (name + thread
+   cap; recipe lives in `services.d/<name>.svc`). The registration
+   set in this PR is `memmgr`, `procmgr`, `devmgr`, `vfsd`, `logd`,
+   `timed`, and `pwrmgr`. svcmgr reconciles each against its
+   matching `.svc` file and binds death-notification.
 
    Names are centralised in `ipc::published_names`. Recipes (binary,
    argv, env, restart policy, criticality, namespace shape, seed

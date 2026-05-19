@@ -1,0 +1,15 @@
+# logd — log endpoint + arch serial-authority writer.
+#
+# Init spawns logd at the end of Phase 2 from `/bin/logd`, hands
+# over the master log endpoint RECV, the SEND for HANDOVER_PULL,
+# the DEATH_EQ_AUTHORITY-tokened SEND on procmgr, and the
+# arch-specific serial-authority cap (IoPortRange on x86-64,
+# SbiControl on RISC-V). Those caps are unreachable from svcmgr
+# post-handover, so `restart = never`. `critical = high`: a dead
+# logd means no log destination — every subsequent log line
+# disappears, so the system is functionally blind. Graceful
+# shutdown is the right escape.
+binary    = /bin/logd
+restart   = never
+critical  = high
+namespace = none

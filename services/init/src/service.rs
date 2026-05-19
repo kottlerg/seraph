@@ -18,6 +18,27 @@ use crate::walk;
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
+/// Thread caps init collects across Phases 1-3 for v3
+/// `REGISTER_SERVICE` once svcmgr is up. Zero in a slot means init
+/// could not capture (or chose not to capture) that service's thread
+/// cap; the corresponding `register_service` call is then skipped.
+///
+/// Field order matches reconciliation order in the boot log, not
+/// spawn order. memmgr / procmgr come from
+/// [`crate::bootstrap::MemmgrBootstrap::mm_thread`] /
+/// [`crate::bootstrap::ProcmgrBootstrap::pm_thread`]; the rest come
+/// from the matching spawn-helper return values.
+#[derive(Default, Clone, Copy)]
+pub struct ServiceThreadCaps
+{
+    pub memmgr: u32,
+    pub procmgr: u32,
+    pub devmgr: u32,
+    pub vfsd: u32,
+    pub logd: u32,
+    pub timed: u32,
+}
+
 /// Per-spawn namespace-cap policy for [`configure_child_namespace`].
 ///
 /// The variants encode the two shapes a child's `system_root_cap`
@@ -354,16 +375,11 @@ pub fn create_devmgr_with_caps(
     registry_ep: u32,
     svcmgr_service_ep: u32,
     ipc_buf: *mut u64,
-)
+) -> Option<u32>
 {
     let devmgr_frame_cap = info.module_frame_base + 1;
 
-    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
-    else
-    {
-        log("devmgr: token derivation failed");
-        return;
-    };
+    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
     // caps: [module, creator]. No stdio pipes — devmgr reaches the
     // system log via the discovery cap procmgr installs in ProcessInfo.
@@ -376,21 +392,22 @@ pub fn create_devmgr_with_caps(
     else
     {
         log("devmgr: CREATE_PROCESS ipc_call failed");
-        return;
+        return None;
     };
     if reply.label != 0
     {
         log("devmgr: CREATE_PROCESS failed");
-        return;
+        return None;
     }
 
     let reply_caps = reply.caps();
-    if reply_caps.is_empty()
+    if reply_caps.len() < 2
     {
         log("devmgr: CREATE_PROCESS reply missing caps");
-        return;
+        return None;
     }
     let process_handle = reply_caps[0];
+    let thread_cap = reply_caps[1];
 
     let hw = collect_hw_caps(info);
 
@@ -401,7 +418,7 @@ pub fn create_devmgr_with_caps(
     else
     {
         log("devmgr: registry cap derive failed");
-        return;
+        return None;
     };
 
     // Derive sendable copies of the firmware-authority caps. Zero slots
@@ -442,7 +459,7 @@ pub fn create_devmgr_with_caps(
         "devmgr: START_PROCESS failed",
     )
     {
-        return;
+        return None;
     }
 
     // Round 1: [registry, ...present(irq,rsdp,dtb)].
@@ -480,7 +497,7 @@ pub fn create_devmgr_with_caps(
         "devmgr: bootstrap round 1 failed",
     )
     {
-        return;
+        return None;
     }
 
     // SVCMGR_BUNDLE is unconditionally the terminal round; every prior
@@ -518,7 +535,7 @@ pub fn create_devmgr_with_caps(
             "devmgr: bootstrap aperture round failed",
         )
         {
-            return;
+            return None;
         }
         idx = batch_end;
     }
@@ -554,7 +571,7 @@ pub fn create_devmgr_with_caps(
             "devmgr: bootstrap ACPI region round failed",
         )
         {
-            return;
+            return None;
         }
         idx = batch_end;
     }
@@ -567,7 +584,7 @@ pub fn create_devmgr_with_caps(
         else
         {
             log("devmgr: module cap derive failed");
-            return;
+            return None;
         };
 
         if !serve(
@@ -580,7 +597,7 @@ pub fn create_devmgr_with_caps(
             "devmgr: bootstrap module round failed",
         )
         {
-            return;
+            return None;
         }
     }
 
@@ -639,7 +656,7 @@ pub fn create_devmgr_with_caps(
             &[kind::SVCMGR_BUNDLE, 0],
             "devmgr: empty SVCMGR_BUNDLE failsafe round failed",
         );
-        return;
+        return None;
     }
 
     let ioport_root_cap = if cfg!(target_arch = "x86_64")
@@ -665,6 +682,7 @@ pub fn create_devmgr_with_caps(
         &[kind::SVCMGR_BUNDLE, bundle_cap_count as u64],
         "devmgr: bootstrap SVCMGR_BUNDLE round failed",
     );
+    Some(thread_cap)
 }
 
 // ── pwrmgr creation ─────────────────────────────────────────────────────────
@@ -936,16 +954,11 @@ pub fn create_vfsd_with_caps(
     bootstrap_ep: u32,
     spawn: &VfsdSpawnCaps,
     ipc_buf: *mut u64,
-)
+) -> Option<u32>
 {
     let vfsd_frame_cap = info.module_frame_base + 2;
 
-    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
-    else
-    {
-        log("vfsd: token derivation failed");
-        return;
-    };
+    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
         .cap(vfsd_frame_cap)
@@ -956,26 +969,27 @@ pub fn create_vfsd_with_caps(
     else
     {
         log("vfsd: CREATE_PROCESS ipc_call failed");
-        return;
+        return None;
     };
     if reply.label != 0
     {
         log("vfsd: CREATE_PROCESS failed");
-        return;
+        return None;
     }
 
     let reply_caps = reply.caps();
-    if reply_caps.is_empty()
+    if reply_caps.len() < 2
     {
         log("vfsd: CREATE_PROCESS reply missing caps");
-        return;
+        return None;
     }
     let process_handle = reply_caps[0];
+    let thread_cap = reply_caps[1];
 
     let Ok(service_copy) = syscall::cap_derive(spawn.vfsd_service_ep, syscall::RIGHTS_ALL)
     else
     {
-        return;
+        return None;
     };
     // vfsd is the sole devmgr `QUERY_BLOCK_DEVICE` consumer today;
     // tag its SEND with `REGISTRY_QUERY_AUTHORITY` so devmgr's
@@ -988,7 +1002,7 @@ pub fn create_vfsd_with_caps(
     )
     else
     {
-        return;
+        return None;
     };
 
     if !start_process(
@@ -998,7 +1012,7 @@ pub fn create_vfsd_with_caps(
         "vfsd: START_PROCESS failed",
     )
     {
-        return;
+        return None;
     }
 
     // Round 1: [service, registry]
@@ -1013,7 +1027,7 @@ pub fn create_vfsd_with_caps(
         "vfsd: bootstrap round 1 failed",
     )
     {
-        return;
+        return None;
     }
 
     // Round 2: fatfs module.
@@ -1035,6 +1049,8 @@ pub fn create_vfsd_with_caps(
         &[],
         "vfsd: bootstrap round 2 failed",
     );
+
+    Some(thread_cap)
 }
 
 // ── svcmgr / procmgr coordination ───────────────────────────────────────────
@@ -1223,6 +1239,7 @@ pub fn phase3_svcmgr_handover(
     svcmgr_service_ep: u32,
     system_root_cap: u32,
     rootfs_root_cap: u32,
+    mut thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
     init_ipc_buf_cap: u32,
@@ -1273,7 +1290,7 @@ pub fn phase3_svcmgr_handover(
     // svcmgr. Failures are logged but do not abort phase 3 — usertest
     // tolerates `SystemTime::now()` returning UNIX_EPOCH and exercises
     // the live path only when the chain came up.
-    bring_up_wallclock(
+    thread_caps.timed = bring_up_wallclock(
         info,
         procmgr_ep,
         bootstrap_ep,
@@ -1281,7 +1298,8 @@ pub fn phase3_svcmgr_handover(
         system_root_cap,
         init_self_cspace,
         ipc_buf,
-    );
+    )
+    .unwrap_or(0);
 
     let pwrmgr_spawn = create_and_start_pwrmgr(
         info,
@@ -1386,23 +1404,36 @@ pub fn phase3_svcmgr_handover(
         let _ = syscall::cap_delete(cap);
     }
 
-    // Register pwrmgr with svcmgr (v3 wire: name + thread cap).
-    // Other foundational services (vfsd, devmgr, procmgr, memmgr,
-    // logd, timed) are not registered in this PR — their thread caps
-    // are not threaded through the existing bootstrap paths; svcmgr
-    // launches the unregistered-and-defined set
-    // (`crasher.svc`, `usertest.svc`) and otherwise sees only pwrmgr
-    // as a `bind only`. Filed as a follow-up.
-    if pwrmgr_thread_cap != 0
+    // Register every foundational service init bootstrapped with
+    // svcmgr (v3 wire: name + thread cap). svcmgr's reconciliation
+    // path pairs each name with the matching `.svc` recipe on disk
+    // and binds death-notification. Zero in a slot means init could
+    // not capture the thread cap (e.g. the spawn failed or the
+    // helper had no cap to share); the register call is then
+    // skipped and the recipe ⇒ `registered without definition`
+    // entries are absent rather than surfacing as orphans.
+    let registrations: &[(&[u8], u32)] = &[
+        (b"memmgr", thread_caps.memmgr),
+        (b"procmgr", thread_caps.procmgr),
+        (b"devmgr", thread_caps.devmgr),
+        (b"vfsd", thread_caps.vfsd),
+        (b"logd", thread_caps.logd),
+        (b"timed", thread_caps.timed),
+        (b"pwrmgr", pwrmgr_thread_cap),
+    ];
+    for (name, thread_cap) in registrations
     {
-        register_service(
-            svcmgr_service_ep,
-            ipc_buf,
-            &ServiceRegistration {
-                name: b"pwrmgr",
-                thread_cap: pwrmgr_thread_cap,
-            },
-        );
+        if *thread_cap != 0
+        {
+            register_service(
+                svcmgr_service_ep,
+                ipc_buf,
+                &ServiceRegistration {
+                    name,
+                    thread_cap: *thread_cap,
+                },
+            );
+        }
     }
 
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
@@ -1574,21 +1605,11 @@ pub fn create_and_start_logd(
     system_root_cap: u32,
     init_self_cspace: u32,
     ipc_buf: *mut u64,
-) -> bool
+) -> Option<u32>
 {
-    let Some(walked) = walk::walk_to_file(system_root_cap, b"/bin/logd", 0xFFFF, ipc_buf)
-    else
-    {
-        log("logd: walk /bin/logd failed");
-        return false;
-    };
+    let walked = walk::walk_to_file(system_root_cap, b"/bin/logd", 0xFFFF, ipc_buf)?;
 
-    let Some((tokened_creator, child_token)) = derive_tokened_creator(bootstrap_ep)
-    else
-    {
-        log("logd: tokened creator derive failed");
-        return false;
-    };
+    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
         .word(0, walked.size)
@@ -1600,27 +1621,21 @@ pub fn create_and_start_logd(
     else
     {
         log("logd: CREATE_FROM_FILE ipc_call failed");
-        return false;
+        return None;
     };
     if reply.label != 0
     {
         log("logd: CREATE_FROM_FILE error");
-        return false;
+        return None;
     }
     let reply_caps = reply.caps();
-    if reply_caps.is_empty()
+    if reply_caps.len() < 2
     {
         log("logd: CREATE_FROM_FILE reply missing caps");
-        return false;
+        return None;
     }
     let process_handle = reply_caps[0];
-    // CREATE_FROM_FILE returns (process_handle, thread_cap); logd
-    // is svcmgr-registered for restart in a follow-up PR. Drop the
-    // thread cap for now.
-    if reply_caps.len() >= 2
-    {
-        let _ = syscall::cap_delete(reply_caps[1]);
-    }
+    let thread_cap = reply_caps[1];
 
     // logd owns the master log endpoint RECV plus arch serial
     // authority (IoPortRange on x86-64, SbiControl on RISC-V); it
@@ -1634,7 +1649,7 @@ pub fn create_and_start_logd(
         ipc_buf,
     )
     {
-        return false;
+        return None;
     }
 
     // Derive the three bootstrap caps logd needs.
@@ -1643,7 +1658,7 @@ pub fn create_and_start_logd(
     {
         log("logd: log_ep RECV derive failed");
         destroy_partial_child(process_handle, ipc_buf);
-        return false;
+        return None;
     };
     let Ok(log_handover_send) = syscall::cap_derive(log_ep, syscall::RIGHTS_SEND)
     else
@@ -1651,7 +1666,7 @@ pub fn create_and_start_logd(
         log("logd: log_ep SEND derive failed");
         let _ = syscall::cap_delete(log_recv);
         destroy_partial_child(process_handle, ipc_buf);
-        return false;
+        return None;
     };
     // RIGHTS_SEND_GRANT (not bare SEND): the IPC kernel requires the
     // GRANT bit when the caller transfers any cap in the message, and
@@ -1667,7 +1682,7 @@ pub fn create_and_start_logd(
         let _ = syscall::cap_delete(log_recv);
         let _ = syscall::cap_delete(log_handover_send);
         destroy_partial_child(process_handle, ipc_buf);
-        return false;
+        return None;
     };
 
     // Arch-specific serial-authority cap. Both `cap_derive(RIGHTS_ALL)`
@@ -1713,7 +1728,7 @@ pub fn create_and_start_logd(
         {
             let _ = syscall::cap_delete(arch_cap_copy);
         }
-        return false;
+        return None;
     }
 
     if !serve(
@@ -1731,10 +1746,10 @@ pub fn create_and_start_logd(
         "logd: bootstrap round failed",
     )
     {
-        return false;
+        return None;
     }
 
-    true
+    Some(thread_cap)
 }
 
 // ── RTC + timed spawn pipeline ──────────────────────────────────────────────
@@ -1840,9 +1855,9 @@ fn create_service_endpoint_pair() -> Option<(u32, u32)>
     Some((source, recv_cap))
 }
 
-/// Walk + `CREATE_FROM_FILE` for one binary path, mirroring the pattern
-/// used by `create_and_start_logd` and `create_and_start_svcmgr`.
-/// Returns `(process_handle, child_token)`; caller is responsible for
+/// Walk + `CREATE_FROM_FILE` for one binary path. Returns
+/// `(process_handle, thread_cap, child_token)`; caller owns the thread
+/// cap (e.g. for svcmgr `REGISTER_SERVICE`) and is responsible for
 /// `destroy_partial_child` on any subsequent failure.
 ///
 /// `policy` and `cwd` are forwarded to `configure_child_namespace`.
@@ -1859,7 +1874,7 @@ fn walk_and_create_from_file(
     policy: NsPolicy,
     cwd: Option<(&[u8], u64)>,
     ipc_buf: *mut u64,
-) -> Option<(u32, u64)>
+) -> Option<(u32, u32, u64)>
 {
     let walked = walk::walk_to_file(system_root_cap, path, 0xFFFF, ipc_buf)?;
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
@@ -1875,16 +1890,12 @@ fn walk_and_create_from_file(
         return None;
     }
     let reply_caps = reply.caps();
-    if reply_caps.is_empty()
+    if reply_caps.len() < 2
     {
         return None;
     }
     let process_handle = reply_caps[0];
-    // Drop the thread cap (restart support is a follow-up).
-    if reply_caps.len() >= 2
-    {
-        let _ = syscall::cap_delete(reply_caps[1]);
-    }
+    let thread_cap = reply_caps[1];
     if !configure_child_namespace(
         process_handle,
         system_root_cap,
@@ -1894,9 +1905,10 @@ fn walk_and_create_from_file(
         ipc_buf,
     )
     {
+        let _ = syscall::cap_delete(thread_cap);
         return None;
     }
-    Some((process_handle, child_token))
+    Some((process_handle, thread_cap, child_token))
 }
 
 /// Spawn the per-arch RTC chip driver from `/bin/<name>`. Returns the
@@ -1958,8 +1970,10 @@ pub fn create_and_start_rtc_driver(
 
     // RTC driver owns its arch-specific hardware authority cap
     // (IoPortRange on x86-64, MmioRegion on RISC-V) and serves a
-    // single read-only IPC. No filesystem access.
-    let Some((process_handle, child_token)) = walk_and_create_from_file(
+    // single read-only IPC. No filesystem access. devmgr supervises
+    // hardware drivers; the rtc driver's thread cap is not threaded
+    // to svcmgr — drop it here.
+    let Some((process_handle, thread_cap, child_token)) = walk_and_create_from_file(
         binary_path,
         procmgr_ep,
         bootstrap_ep,
@@ -1977,6 +1991,7 @@ pub fn create_and_start_rtc_driver(
         log("rtc: walk + CREATE_FROM_FILE failed");
         return None;
     };
+    let _ = syscall::cap_delete(thread_cap);
 
     if !start_process(
         process_handle,
@@ -2019,19 +2034,31 @@ pub fn create_and_start_rtc_driver(
 /// Spawn `/bin/timed` and serve its single bootstrap round. Returns
 /// the init-owned service-endpoint source cap; init derives a SEND
 /// from it for the `timed` publish.
+/// Timed-side result of [`create_and_start_timed`].
+///
+/// `service_ep` is the init-owned service-endpoint source cap (used
+/// to derive the SEND init publishes as `timed`). `thread_cap` is
+/// timed's main thread in init's `CSpace`, registered with svcmgr so
+/// the supervisor can bind death-notification.
+pub struct TimedSpawn
+{
+    pub service_ep: u32,
+    pub thread_cap: u32,
+}
+
 pub fn create_and_start_timed(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
     ipc_buf: *mut u64,
-) -> Option<u32>
+) -> Option<TimedSpawn>
 {
     let (svc_source, svc_recv) = create_service_endpoint_pair()?;
 
     // timed queries the svcmgr registry for `rtc.primary` then
     // serves GET_WALL_TIME. No filesystem access.
-    let Some((process_handle, child_token)) = walk_and_create_from_file(
+    let Some((process_handle, thread_cap, child_token)) = walk_and_create_from_file(
         b"/bin/timed",
         procmgr_ep,
         bootstrap_ep,
@@ -2058,6 +2085,7 @@ pub fn create_and_start_timed(
     {
         let _ = syscall::cap_delete(svc_recv);
         let _ = syscall::cap_delete(svc_source);
+        let _ = syscall::cap_delete(thread_cap);
         destroy_partial_child(process_handle, ipc_buf);
         return None;
     }
@@ -2077,10 +2105,14 @@ pub fn create_and_start_timed(
         // It will exit on the receive-side failure and procmgr will reap.
         let _ = syscall::cap_delete(svc_recv);
         let _ = syscall::cap_delete(svc_source);
+        let _ = syscall::cap_delete(thread_cap);
         return None;
     }
 
-    Some(svc_source)
+    Some(TimedSpawn {
+        service_ep: svc_source,
+        thread_cap,
+    })
 }
 
 /// Phase 3 sub-step: bring up the wall-clock chain. Spawns the per-arch
@@ -2098,7 +2130,7 @@ pub fn bring_up_wallclock(
     system_root_cap: u32,
     init_self_cspace: u32,
     ipc_buf: *mut u64,
-)
+) -> Option<u32>
 {
     // RIGHTS_SEND_GRANT (not bare SEND): PUBLISH_ENDPOINT carries the
     // service's SEND cap in the message, and the IPC kernel requires the
@@ -2111,7 +2143,7 @@ pub fn bring_up_wallclock(
     else
     {
         log("phase 3: wallclock PUBLISH_AUTHORITY derive failed");
-        return;
+        return None;
     };
 
     let Some(rtc_source) = create_and_start_rtc_driver(
@@ -2125,7 +2157,7 @@ pub fn bring_up_wallclock(
     else
     {
         let _ = syscall::cap_delete(publish_cap);
-        return;
+        return None;
     };
 
     let Ok(rtc_publish_send) = syscall::cap_derive(rtc_source, syscall::RIGHTS_SEND)
@@ -2133,18 +2165,18 @@ pub fn bring_up_wallclock(
     {
         log("phase 3: rtc publish SEND derive failed");
         let _ = syscall::cap_delete(publish_cap);
-        return;
+        return None;
     };
     if !svcmgr_publish(publish_cap, b"rtc.primary", rtc_publish_send, ipc_buf)
     {
         log("phase 3: rtc.primary publish failed");
         let _ = syscall::cap_delete(rtc_publish_send);
         let _ = syscall::cap_delete(publish_cap);
-        return;
+        return None;
     }
     log("phase 3: rtc.primary published");
 
-    let Some(timed_source) = create_and_start_timed(
+    let Some(timed_spawn) = create_and_start_timed(
         procmgr_ep,
         bootstrap_ep,
         system_root_cap,
@@ -2154,24 +2186,27 @@ pub fn bring_up_wallclock(
     else
     {
         let _ = syscall::cap_delete(publish_cap);
-        return;
+        return None;
     };
 
-    let Ok(timed_publish_send) = syscall::cap_derive(timed_source, syscall::RIGHTS_SEND)
+    let Ok(timed_publish_send) = syscall::cap_derive(timed_spawn.service_ep, syscall::RIGHTS_SEND)
     else
     {
         log("phase 3: timed publish SEND derive failed");
+        let _ = syscall::cap_delete(timed_spawn.thread_cap);
         let _ = syscall::cap_delete(publish_cap);
-        return;
+        return None;
     };
     if !svcmgr_publish(publish_cap, b"timed", timed_publish_send, ipc_buf)
     {
         log("phase 3: timed publish failed");
         let _ = syscall::cap_delete(timed_publish_send);
+        let _ = syscall::cap_delete(timed_spawn.thread_cap);
         let _ = syscall::cap_delete(publish_cap);
-        return;
+        return None;
     }
     log("phase 3: timed published");
 
     let _ = syscall::cap_delete(publish_cap);
+    Some(timed_spawn.thread_cap)
 }

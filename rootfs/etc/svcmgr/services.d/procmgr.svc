@@ -1,0 +1,12 @@
+# procmgr — process manager (CREATE_PROCESS / CREATE_FROM_FILE / etc).
+#
+# Bootstrapped by init via raw `cap_create_*` syscalls. Procmgr is
+# the chooser for every subsequent process creation; svcmgr has a
+# documented future raw-syscall fallback to reconstruct procmgr from
+# its boot module (not implemented today). `restart = never` +
+# `critical = high` matches the current shape: on unrecoverable
+# death svcmgr issues `pwrmgr_labels::SHUTDOWN`.
+binary    = /esp/EFI/seraph/procmgr
+restart   = never
+critical  = high
+namespace = none

@@ -34,6 +34,8 @@ mod unit;
 
 #[cfg(target_arch = "x86_64")]
 mod acpi_shutdown;
+#[cfg(target_arch = "x86_64")]
+mod ioport;
 #[cfg(target_arch = "riscv64")]
 mod sbi_shutdown;
 
@@ -126,6 +128,15 @@ pub struct TestContext
     /// bound to an address space), and hardware access tests.
     pub aspace_cap: u32,
 
+    /// ktest's own `CSpace` capability slot, provided by the kernel.
+    ///
+    /// Used by tests that need to discover the cspace's slot capacity at
+    /// runtime via `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` so their scans
+    /// cover every slot the kernel may have populated, including those
+    /// allocated after `aspace_cap` (e.g. carve-time `ioport::init`
+    /// products on `x86_64`).
+    pub cspace_cap: u32,
+
     /// Pointer to the registered IPC buffer page (4 KiB, page-aligned).
     ///
     /// Registered with `ipc_buffer_set` before any tests run. Passed into
@@ -213,6 +224,12 @@ fn run(info_ptr: u64) -> !
         halt();
     }
 
+    // Seed the I/O port subdivider with the root IoPortRange cap so
+    // `serial::init` and `acpi_shutdown::shutdown` can each carve only
+    // the ports they need instead of binding the full 64K range.
+    #[cfg(target_arch = "x86_64")]
+    ioport::init(info);
+
     // Initialise direct serial output before any logging.
     // SAFETY: called once, single-threaded, InitInfo is valid.
     unsafe { serial::init(info, info.aspace_cap, info.thread_cap) };
@@ -243,6 +260,7 @@ fn run(info_ptr: u64) -> !
 
     let ctx = TestContext {
         aspace_cap,
+        cspace_cap: info.cspace_cap,
         ipc_buf: ipc_buf_ptr,
         memory_frame_base: info.memory_frame_base,
     };

@@ -488,13 +488,15 @@ deferring to the next enqueue:
   (lower-numbered CPU first; see scheduling-internals.md § Lock Hierarchy
   rule 4) and sends a wakeup IPI to the destination.
 - **Running** thread on a different CPU: the syscall sets the
-  destination's reschedule-pending flag and sends a wakeup IPI to the
-  source CPU. The IPI itself does not call `schedule()`; the running
-  thread observes the new affinity at its next entry to `schedule()`
-  — preempt-on-slice-expiry, voluntary yield, or IPC block. The
-  re-enqueue site checks `cpu_affinity != current_cpu` and routes the
-  requeue cross-CPU via `enqueue_and_wake` instead of the local run
-  queue. Worst-case latency is therefore one time slice
+  **source** CPU's reschedule-pending flag and sends a wakeup IPI to the
+  **source** CPU (where the thread is currently running). The IPI itself
+  does not call `schedule()`; the running thread observes the new
+  affinity at its next entry to `schedule()` — preempt-on-slice-expiry,
+  voluntary yield, or IPC block. The re-enqueue site in `schedule()`
+  checks `cpu_affinity != current_cpu` and routes the requeue cross-CPU
+  via `enqueue_and_wake` (which then sets the destination's
+  reschedule-pending flag and IPIs it) instead of doing a local enqueue.
+  Worst-case latency is therefore one time slice
   (`TIME_SLICE_TICKS` × tick period), not one tick.
 - **Blocked / Stopped / Created**: the new affinity takes effect on the
   next wake via `select_target_cpu`; no migration work is needed.

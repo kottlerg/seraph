@@ -845,8 +845,10 @@ takes effect immediately:
 - A **Ready** thread queued on a different CPU is migrated to the new
   target CPU's run queue (`sched::migrate_ready_thread`).
 - A **Running** thread on a different CPU is notified via a reschedule IPI
-  and routed cross-CPU on its next `schedule()` entry (bounded by one
-  timer tick).
+  and routed cross-CPU on its next `schedule()` entry. The IPI does not
+  itself call `schedule()`; the running thread observes the new affinity
+  at its next slice-expiry, voluntary yield, or IPC block. Worst-case
+  latency is one time slice.
 - A **Blocked / Stopped / Created** thread observes the new affinity on
   its next wake.
 

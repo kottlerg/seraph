@@ -538,6 +538,36 @@ fn handle_publish_endpoint(
     ipc::svcmgr_errors::SUCCESS
 }
 
+/// Look up `name` in the discovery registry and derive a fresh
+/// `RIGHTS_SEND` cap on the published endpoint. Evicts the entry on
+/// `cap_derive` failure (publisher's endpoint is gone), so subsequent
+/// queries see `UNKNOWN_NAME` instead of looping on
+/// `INSUFFICIENT_CAPS`. Returns a `svcmgr_errors::*` code on miss or
+/// derivation failure.
+///
+/// Shared by `QUERY_ENDPOINT` (IPC) and the post-handover launch path
+/// (resolves each `.svc` `seed = ...` name into a cap to inject into
+/// the child's bootstrap round).
+pub(crate) fn registry_lookup_derived(
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    name: &[u8],
+) -> Result<u32, u64>
+{
+    let Some(cap) = registry.lookup(name)
+    else
+    {
+        return Err(ipc::svcmgr_errors::UNKNOWN_NAME);
+    };
+    let Ok(derived) = syscall::cap_derive(cap, syscall::RIGHTS_SEND)
+    else
+    {
+        let _ = registry.remove(name);
+        let _ = syscall::cap_delete(cap);
+        return Err(ipc::svcmgr_errors::INSUFFICIENT_CAPS);
+    };
+    Ok(derived)
+}
+
 /// Handle `QUERY_ENDPOINT`: look up a name in the discovery registry and
 /// reply with a derived SEND cap if found.
 fn handle_query_endpoint(
@@ -555,39 +585,29 @@ fn handle_query_endpoint(
         return;
     }
     let name = read_tail_name_from_msg(msg, 0, name_len);
-    let Some(cap) = registry.lookup(&name[..name_len])
-    else
+    match registry_lookup_derived(registry, &name[..name_len])
     {
-        let reply = IpcMessage::new(ipc::svcmgr_errors::UNKNOWN_NAME);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-    let Ok(derived) = syscall::cap_derive(cap, syscall::RIGHTS_SEND)
-    else
-    {
-        // cap_derive failures on a stored entry are terminal — the
-        // publisher's endpoint object is gone (e.g. service died and
-        // procmgr reaped the source). Evict the dead entry so future
-        // queries get UNKNOWN_NAME instead of looping on INSUFFICIENT_CAPS.
-        let _ = registry.remove(&name[..name_len]);
-        let _ = syscall::cap_delete(cap);
-        let reply = IpcMessage::new(ipc::svcmgr_errors::INSUFFICIENT_CAPS);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-    let reply = IpcMessage::builder(ipc::svcmgr_errors::SUCCESS)
-        .cap(derived)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let send_result = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-    if send_result.is_err()
-    {
-        // ipc_reply did not transfer the cap out of svcmgr's CSpace;
-        // delete the freshly-derived slot to avoid cumulative leakage
-        // over svcmgr's lifetime (one slot per failed reply).
-        let _ = syscall::cap_delete(derived);
+        Ok(derived) =>
+        {
+            let reply = IpcMessage::builder(ipc::svcmgr_errors::SUCCESS)
+                .cap(derived)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            let send_result = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            if send_result.is_err()
+            {
+                // ipc_reply did not transfer the cap out of svcmgr's
+                // CSpace; delete the freshly-derived slot to avoid
+                // cumulative leakage over svcmgr's lifetime.
+                let _ = syscall::cap_delete(derived);
+            }
+        }
+        Err(code) =>
+        {
+            let reply = IpcMessage::new(code);
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        }
     }
 }
 

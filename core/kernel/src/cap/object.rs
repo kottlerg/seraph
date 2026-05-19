@@ -1286,6 +1286,29 @@ unsafe fn dealloc_object_one(
                         crate::sched::scheduler_for(cpu).remove_from_queue(tcb, prio);
                     }
 
+                    // x86-64 lazy-FPU: clear any per-CPU `fpu_owner` slot
+                    // still naming this TCB. Two-stage discipline:
+                    //   (a) here, inside the all-CPU-locks region — catches
+                    //       owners visible at the moment we commit
+                    //       state=Exited.
+                    //   (b) again after the running_on / context_saved
+                    //       spins — catches any re-installation by a still-
+                    //       running thread's `#NM` between all-locks release
+                    //       and the final switch-out, before storage is
+                    //       reclaimed.
+                    // No-op on RISC-V (the slot exists but is never written).
+                    // See `docs/thread-lifecycle-and-sleep.md` § Drain
+                    // Protocol step 10a and invariant 4a.
+                    for cpu in 0..cpu_count
+                    {
+                        let _ = crate::percpu::fpu_owner_for(cpu).compare_exchange(
+                            tcb,
+                            core::ptr::null_mut(),
+                            core::sync::atomic::Ordering::AcqRel,
+                            core::sync::atomic::Ordering::Acquire,
+                        );
+                    }
+
                     // Wake any reply-bound client with Interrupted; otherwise
                     // they would remain BlockedOnReply with a dangling
                     // blocked_on_object pointing at this freed server.

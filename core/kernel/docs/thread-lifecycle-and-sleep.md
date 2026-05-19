@@ -138,11 +138,24 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 9. If running_on was recorded, spin (re-acquire that CPU's lock per iteration)
    until scheduler_for(run_cpu).current != tcb.
 10. Spin on tcb.context_saved.load(Acquire) == 1 (UNCONDITIONAL — see invariant 4).
-10a. (x86_64 only) Clear any per-CPU `fpu_owner` slot still naming this TCB
-    via compare_exchange(tcb, null, AcqRel, Acquire) for every CPU. Placed
-    AFTER steps 9-10 so the dying thread has switched out on every CPU and
-    taken no further `#NM`; closes the dangling-pointer window before
-    storage is reclaimed in step 16. See invariant 5a.
+10a. (x86_64 only) Two-stage clear of any per-CPU `fpu_owner` slot still
+    naming this TCB:
+      - Stage A: inside the all-CPU-locks region (between step 4 and
+        step 5), sweep `compare_exchange(tcb, null, AcqRel, Acquire)`
+        for every CPU. Captures any owner pointer that was settled at
+        the moment we committed `state = Exited`.
+      - Stage B: AFTER steps 9-10 and BEFORE storage reclaim (step 16),
+        repeat the sweep. Catches any re-installation that a still-
+        running thread's `#NM` performed between all-locks release and
+        the final switch-out, before storage is reclaimed.
+    Two stages are necessary in concert: stage A alone leaves a
+    re-installation window (invariant 4a); stage B alone destabilises
+    parallel-test boot under TCG, where the all-locks-region clear
+    happens to break a wake-IPI cycle the spin path otherwise
+    deadlocks under (the dealloc's `context_saved` spin runs with
+    `IF=0`, so any peer CPU sending a flush IPI to the deallocing CPU
+    stalls until the spin exits — observed locally and on
+    `ubuntu-latest` CI).
 11. Acquire the source IPC lock for tcb's blocked_on_object (if any) and unlink
     tcb from the source's wait queue / waiter slot. Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.
@@ -170,7 +183,9 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 
 3. **Step 9's `running_on` spin is bounded.** The remote CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch switch on x86 due to `release_lock_only`), the spin exits.
 
-4a. **Step 10a's `fpu_owner` sweep closes the lazy-FPU dangling-pointer window.** The `#NM` handler writes `fpu_owner_for(cpu).store(current_tcb, Release)` on every trap, so as long as the dying thread can still take an `#NM`, its pointer can land in a per-CPU `fpu_owner` slot. Steps 9-10 guarantee the thread has switched out on every CPU and `context_saved == 1`, so no further `#NM` can name it. The compare_exchange sweep then drops the dangling pointer from every remaining slot before step 16 reclaims storage. The sweep MUST be placed AFTER step 10 — placing it before allows a still-running thread to re-install itself as `fpu_owner` via `#NM` after the sweep but before storage is freed, leaving a use-after-free for the next `#NM` consumer (the swap-out path reads `(*prev).extended.area` on a freed pointer).
+4a. **Step 10a's two-stage `fpu_owner` sweep closes the lazy-FPU dangling-pointer window AND avoids a TCG IPI-spin deadlock.** Stage A (inside all-locks) clears every owner pointer visible at the `state = Exited` commit. Stage B (post-spin) drops any pointer re-installed by a still-running thread's `#NM` between the all-locks release and the final switch-out. Both stages are required:
+    - Stage B alone leaves stage A's window open: under TCG, a peer CPU initiating a flush IPI targeted at the dealloc'ing CPU during the `context_saved` spin will stall until the spin exits (the dealloc spins with `IF=0`); two peer CPUs deadlocked on each other's spins were observed locally and on `ubuntu-latest` CI.
+    - Stage A alone is invariant 4a's original concern: the `#NM` handler stores `fpu_owner_for(cpu) = current_tcb` on every trap, so a still-running dying thread can re-install its pointer after the all-locks release. Stage B catches that. Steps 9-10 guarantee no further `#NM` can name the thread, so the post-spin sweep is the final fence before storage reclaim in step 16.
 
 4. **Step 10's `context_saved` spin is the load-bearing UAF gate, and is unconditional.** On x86 (TSO), `schedule()` calls `set_current(next)` and `release_lock_only(sched.lock)` *before* `switch()` saves the dying thread's registers into `tcb.saved_state`. A peer CPU acquiring the same lock at any moment after the release can therefore observe `sched.current = idle` while `switch()` is still mid-save into `tcb.saved_state`. Freeing the TCB at that point lets the next allocation reuse the memory; `switch()` then corrupts the new allocation, producing hangs (`stress::thread_churn`, `bench thread_lifecycle`) or worse. Step 10 closes the window: `context_saved` is cleared by `schedule()` *before* the save and written `1` (Release) by `switch()` *after* the save; spinning on the Acquire load until it observes `1` guarantees the save has fully published. The spin is unconditional on the result of `running_on`, because the all-locks `running_on` snapshot can race past the lock release and miss the in-flight switch entirely. New TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
 

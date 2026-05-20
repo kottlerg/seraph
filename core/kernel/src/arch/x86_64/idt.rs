@@ -461,7 +461,8 @@ unsafe extern "C" fn common_exception_trampoline()
 
 isr_stub!(isr0, 0, has_error_code = false, ist = 0);
 isr_stub!(isr1, 1, has_error_code = false, ist = 0);
-isr_stub!(isr2, 2, has_error_code = false, ist = 2); // NMI — IST2
+// NMI (vector 2) uses ipi_nmi_backtrace_stub instead of the generic
+// isr_stub! — see the dedicated stub above.
 isr_stub!(isr3, 3, has_error_code = false, ist = 0);
 isr_stub!(isr4, 4, has_error_code = false, ist = 0);
 isr_stub!(isr5, 5, has_error_code = false, ist = 0);
@@ -665,7 +666,7 @@ unsafe extern "C" fn isr_nm()
     );
 }
 
-/// `#NM` handler body — lazy-FPU dispatch.
+/// `#NM` handler body — FPU lazy-restore dispatch.
 ///
 /// Saves the previous owner's live register file into its TCB XSAVE
 /// area (if any), clears CR0.TS, XRSTORs the trapping thread's area into
@@ -687,8 +688,12 @@ extern "C" fn nm_handler()
 
     let cpu = super::cpu::current_cpu() as usize;
     let owner_slot = crate::percpu::fpu_owner_for(cpu);
-    // Take ownership atomically so a concurrent flush IPI either races
-    // ahead (clears the slot first) or sees us holding the regs.
+    // Read the prior owner (if any) so we can save its live regs
+    // before XRSTOR'ing this thread's area. The atomic swap is
+    // simpler than load-then-store but is not load-bearing for
+    // concurrency: after #108 the only writer is this same handler
+    // (and `switch_out_save` on this CPU), and both run with
+    // preemption disabled — no cross-CPU race on this slot.
     let prev = owner_slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
 
     // SAFETY: current_tcb returns this CPU's running thread; valid in
@@ -745,8 +750,9 @@ extern "C" fn nm_handler()
         super::fpu::cr0_clear_ts();
         super::fpu::restore_from(area);
     }
-    // Publish new ownership. Release pairs with Acquire loads in
-    // switch_in_restore / flush_owner_remote / flush_owner_if.
+    // Publish new ownership. Release pairs with the Acquire load in
+    // switch_out_save (the only other reader of this slot after eager
+    // save eliminated the cross-CPU flush IPI).
     owner_slot.store(tcb, core::sync::atomic::Ordering::Release);
 
     crate::percpu::preempt_enable();
@@ -785,38 +791,130 @@ unsafe extern "C" fn ipi_tlb_shootdown_stub()
     );
 }
 
-/// FPU-flush IPI handler stub (vector 252).
+/// NMI backtrace stub (vector 2 with IST=2).
 ///
-/// Receives a cross-CPU request to extract this CPU's live x87/SSE/AVX
-/// register file into a migrating thread's XSAVE area. Reads the per-CPU
-/// `FPU_FLUSH_PENDING` slot, calls `fpu::flush_owner_if`, then clears the
-/// slot so the sender's ack-spin returns.
+/// Replaces the generic exception stub for NMI. Saves the same
+/// `ExceptionFrame` shape as `common_exception_trampoline`, calls the
+/// returning [`ipi_nmi_backtrace_handler`], then restores GPRs and
+/// `iretq`s. The handler decides at runtime whether the NMI is a
+/// watchdog backtrace request (returns normally → iretq fires) or a
+/// real hardware NMI (falls through to `common_exception_handler` which
+/// never returns — the iretq tail is unreachable in that case).
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn ipi_fpu_flush_stub()
+unsafe extern "C" fn ipi_nmi_backtrace_stub()
 {
     core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
+        "push 0",      // dummy error code (NMI has none)
+        "push 2",      // vector
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
         "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",
         "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
         "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "add rsp, 16",  // drop vector + error_code
         "iretq",
-        handler = sym ipi_fpu_flush_handler,
+        handler = sym ipi_nmi_backtrace_handler,
+    );
+}
+
+/// NMI body. Distinguishes a watchdog-requested backtrace from a real
+/// hardware NMI via [`NMI_BACKTRACE_REQUEST`]; on a watchdog ping it
+/// dumps the saved frame to serial and returns (the stub's iretq
+/// resumes the interrupted code). On a real NMI it tail-calls
+/// `common_exception_handler` which never returns — the iretq tail of
+/// the stub is dead code in that case.
+///
+/// NMI is not APIC-EOI'd, so no `acknowledge()` call.
+#[cfg(not(test))]
+extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
+{
+    let cpu = super::cpu::current_cpu() as usize;
+    let requested = if cpu < crate::sched::MAX_CPUS
+    {
+        super::interrupts::NMI_BACKTRACE_REQUEST[cpu]
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+    }
+    else
+    {
+        false
+    };
+    if !requested
+    {
+        // Real hardware NMI — defer to the standard fatal path.
+        // SAFETY: frame pointer constructed by ipi_nmi_backtrace_stub above.
+        unsafe {
+            common_exception_handler(frame);
+        }
+    }
+    // SAFETY: frame pointer constructed by ipi_nmi_backtrace_stub above.
+    let f = unsafe { &*frame };
+    // Use the NMI-safe console path: `CONSOLE_LOCK` is swap-and-
+    // restored rather than spin-acquired, so an NMI that interrupts
+    // the lock-holder does not deadlock the dump.
+    crate::kprintln_nmi!(
+        "NMI BACKTRACE: cpu={} rip={:#018x} rsp={:#018x} rbp={:#018x} cs={:#x} rflags={:#018x}",
+        cpu,
+        f.rip,
+        f.rsp,
+        f.rbp,
+        f.cs,
+        f.rflags
+    );
+    crate::kprintln_nmi!(
+        "  rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x}",
+        f.rax,
+        f.rbx,
+        f.rcx,
+        f.rdx
+    );
+    crate::kprintln_nmi!(
+        "  rsi={:#018x} rdi={:#018x} rbp={:#018x} rsp={:#018x}",
+        f.rsi,
+        f.rdi,
+        f.rbp,
+        f.rsp
+    );
+    crate::kprintln_nmi!(
+        "   r8={:#018x}  r9={:#018x} r10={:#018x} r11={:#018x}",
+        f.r8,
+        f.r9,
+        f.r10,
+        f.r11
+    );
+    crate::kprintln_nmi!(
+        "  r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x}",
+        f.r12,
+        f.r13,
+        f.r14,
+        f.r15
     );
 }
 
@@ -913,32 +1011,6 @@ extern "C" fn ipi_wakeup_handler()
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_WAKEUP));
 }
 
-/// FPU-flush IPI handler (vector 252).
-///
-/// Reads this CPU's pending flush target from `FPU_FLUSH_PENDING`,
-/// extracts the live x87/SSE/AVX register file into the target's XSAVE
-/// area if this CPU still owns it, clears the pending slot so the
-/// sender's ack-spin returns, and acknowledges via EOI.
-#[cfg(not(test))]
-extern "C" fn ipi_fpu_flush_handler()
-{
-    let cpu = super::cpu::current_cpu() as usize;
-    // Acquire pairs with the sender's Release in send_fpu_flush_ipi.
-    let target =
-        super::interrupts::FPU_FLUSH_PENDING[cpu].load(core::sync::atomic::Ordering::Acquire);
-    // SAFETY: target is either null (spurious / race) or a valid TCB
-    // pointer published by the sender, who guarantees the TCB outlives
-    // the ack-spin.
-    unsafe {
-        super::fpu::flush_owner_if(target);
-    }
-    // Release pairs with the sender's Acquire load when polling for ack.
-    super::interrupts::FPU_FLUSH_PENDING[cpu]
-        .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
-    // SAFETY: Vector 252 is the FPU-flush IPI vector.
-    super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_FPU_FLUSH));
-}
-
 // ── IDT population ────────────────────────────────────────────────────────────
 
 /// Populate the IDT and execute `lidt`.
@@ -963,7 +1035,9 @@ pub unsafe fn init()
     // Exception gates (vectors 0–31).
     set(0, isr0, 0);
     set(1, isr1, 0);
-    set(2, isr2, 2); // NMI — IST2
+    // NMI — IST2. Dedicated stub: distinguishes watchdog backtrace
+    // requests from real hardware NMIs (see ipi_nmi_backtrace_handler).
+    set(2, ipi_nmi_backtrace_stub, 2);
     set(3, isr3, 0);
     set(4, isr4, 0);
     set(5, isr5, 0);
@@ -1009,13 +1083,6 @@ pub unsafe fn init()
     set(
         usize::from(super::interrupts::IPI_VECTOR_WAKEUP),
         ipi_wakeup_stub,
-        0,
-    );
-
-    // FPU-flush IPI.
-    set(
-        usize::from(super::interrupts::IPI_VECTOR_FPU_FLUSH),
-        ipi_fpu_flush_stub,
         0,
     );
 

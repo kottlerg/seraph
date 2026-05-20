@@ -26,6 +26,12 @@ use boot_protocol::BootInfo;
 /// framebuffer cursor position. Uses a plain `AtomicBool` (test-and-set) rather
 /// than the ticket `Spinlock` to avoid disabling interrupts — callers may already
 /// be in an interrupt handler, and timer ISRs do not call `kprintln!`.
+///
+/// Two non-acquiring exceptions exist for crash and NMI paths where
+/// spin-waiting would deadlock against a halted or interrupted lock-
+/// holder: `panic_write_fmt` force-claims the lock and never releases
+/// it (caller halts), and `nmi_write_fmt` swap-and-restores the lock
+/// (caller resumes the interrupted code).
 static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// Static console state.
@@ -261,6 +267,65 @@ pub unsafe fn panic_write_fmt(args: core::fmt::Arguments)
     // Lock intentionally not released — caller halts immediately after.
 }
 
+/// Write a formatted string to the serial port from an NMI handler.
+///
+/// Unlike `serial_write_fmt`, this function does NOT spin-wait on
+/// `CONSOLE_LOCK` — an NMI can interrupt a CPU that already holds the
+/// lock, and spinning would deadlock. Instead it swaps the lock,
+/// writes, and restores the prior lock state so the interrupted
+/// critical section resumes cleanly.
+///
+/// Output may interleave with another CPU mid-write; the diagnostic
+/// content (RIP, RSP, GPRs from the saved frame) is intelligible
+/// line-by-line even when interleaved.
+///
+/// # Safety
+/// `console::init` must have been called before this function. Safe
+/// to call from inside an NMI handler regardless of whether
+/// `CONSOLE_LOCK` is held by the interrupted code.
+#[allow(dead_code)] // Only called by the x86-64 NMI handler; RISC-V has no S-mode NMI surface.
+#[cfg(not(test))]
+pub unsafe fn nmi_write_fmt(args: core::fmt::Arguments)
+{
+    use core::fmt::Write;
+
+    struct SerialWriter;
+    impl core::fmt::Write for SerialWriter
+    {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result
+        {
+            // SAFETY: serial was initialised by console::init before any kprint! use.
+            unsafe {
+                for byte in s.bytes()
+                {
+                    if byte == b'\n'
+                    {
+                        serial_write_byte(b'\r');
+                    }
+                    serial_write_byte(byte);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    // Atomic swap: take the lock (forcibly), remember the prior state.
+    let prior = CONSOLE_LOCK.swap(true, Ordering::Acquire);
+
+    let _ = SerialWriter.write_fmt(args);
+
+    // If the interrupted code was holding the lock, leave it held so
+    // its critical section resumes uninterrupted. Otherwise release.
+    if !prior
+    {
+        CONSOLE_LOCK.store(false, Ordering::Release);
+    }
+}
+
+/// No-op stub for test builds.
+#[cfg(test)]
+pub unsafe fn nmi_write_fmt(_args: core::fmt::Arguments) {}
+
 /// No-op stub for test builds.
 #[cfg(test)]
 pub unsafe fn panic_write_fmt(_args: core::fmt::Arguments) {}
@@ -457,5 +522,21 @@ macro_rules! kprintln {
     ($($arg:tt)*) => {{
         $crate::console::print_timestamp();
         $crate::kprint!("kernel: {}\n", format_args!($($arg)*))
+    }};
+}
+
+/// NMI-safe variant of [`kprintln_serial!`]: swap-and-restore on
+/// `CONSOLE_LOCK` instead of spin-waiting, so an NMI that interrupts
+/// the lock-holder does not deadlock. Output may interleave with
+/// another CPU mid-write; the diagnostic content is intelligible
+/// line-by-line.
+#[macro_export]
+macro_rules! kprintln_nmi {
+    ($($arg:tt)*) => {{
+        let _args = format_args!("kernel-nmi: {}\n", format_args!($($arg)*));
+        // SAFETY: console is initialised before any NMI dispatch.
+        unsafe {
+            $crate::console::nmi_write_fmt(_args);
+        }
     }};
 }

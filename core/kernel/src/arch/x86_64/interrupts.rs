@@ -207,22 +207,22 @@ const ICR_SIPI_BASE: u32 = 0x0000_4600;
 pub const IPI_VECTOR_TLB_SHOOTDOWN: u8 = 250;
 /// IPI vector for waking idle CPUs.
 pub const IPI_VECTOR_WAKEUP: u8 = 251;
-/// IPI vector for lazy-FPU owner flush on thread migration.
-pub const IPI_VECTOR_FPU_FLUSH: u8 = 252;
 
-/// Per-CPU "flush this TCB if you own it" slot, written by the sender
-/// (a migration helper on another CPU) immediately before raising
-/// [`IPI_VECTOR_FPU_FLUSH`] at the target CPU. The IPI handler reads the
-/// slot, calls `fpu::flush_owner_if`, then resets the slot to null,
-/// which the sender spins on to detect ack.
+/// Per-CPU "dump backtrace from your NMI handler" request flag, set by the
+/// synchronous-IPI watchdog before raising a vector-2 NMI at the stuck
+/// target CPU. The target's NMI handler reads it, dumps the saved
+/// `ExceptionFrame` to serial, and clears the flag. A hardware NMI with
+/// the flag clear falls through to the existing fatal path.
 ///
-/// One pending flush per CPU is sufficient because cross-CPU migrations
-/// involving a given source CPU serialize on its scheduler lock.
+/// Single-bit publication, no caller-side ordering beyond Release/Acquire
+/// (the NMI itself is a serialising event for the target).
 #[cfg(not(test))]
-pub static FPU_FLUSH_PENDING: [core::sync::atomic::AtomicPtr<
-    crate::sched::thread::ThreadControlBlock,
->; crate::sched::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; crate::sched::MAX_CPUS];
+pub static NMI_BACKTRACE_REQUEST: [core::sync::atomic::AtomicBool; crate::sched::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::sched::MAX_CPUS];
+
+/// ICR delivery-mode + level encoding for an NMI IPI (`delivery_mode`=4 = NMI,
+/// level=assert, trigger=edge, `dest_shorthand`=none, vector=0/ignored).
+const ICR_NMI: u32 = 0x0000_4400;
 
 /// Read this CPU's local APIC ID (bits [31:24] of the APIC ID register).
 #[allow(dead_code)] // Part of the arch interface; will be used by future SMP topology code.
@@ -240,9 +240,14 @@ pub fn lapic_id() -> u32
 }
 
 /// Spin until the ICR delivery status bit clears (IPI accepted by hardware).
-/// Returns false if it times out (bit still set after ~1M iterations).
+///
+/// The bit clears within microseconds on a healthy LAPIC; 1M iterations
+/// is far beyond any architectural timing. Exhaustion indicates a
+/// hardware-level fault (stuck APIC, emulator bug) rather than a
+/// schedulable race, so we fatal rather than return a status all four
+/// callers historically ignored.
 #[cfg(not(test))]
-unsafe fn wait_icr_idle() -> bool
+unsafe fn wait_icr_idle()
 {
     let mut n = 0u64;
     while apic_read(APIC_ICR_LOW) & ICR_PENDING != 0
@@ -251,10 +256,9 @@ unsafe fn wait_icr_idle() -> bool
         n += 1;
         if n >= 1_000_000
         {
-            return false;
+            crate::fatal("wait_icr_idle: APIC ICR delivery-status stuck after 1M iters");
         }
     }
-    true
 }
 
 /// Send an INIT IPI to the AP identified by `target_apic_id`.
@@ -340,88 +344,116 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
     }
 }
 
-/// Send a synchronous lazy-FPU owner-flush IPI to `target_cpu` and spin
-/// until the receiver acknowledges by clearing its `FPU_FLUSH_PENDING`
-/// slot. Invoked by sched migration helpers before enqueueing a migrated
-/// thread on its destination CPU; the receiver `XSAVE`s `tcb`'s live
-/// regs into `tcb.extended.area` if it still owns them.
-///
-/// Mirrors the `mm::tlb_shootdown::shootdown` interrupt-enable-while-
-/// spinning discipline: the spin-ack loop runs with interrupts enabled
-/// so a concurrent flush/shootdown IPI targeting this CPU can fire and
-/// service even though we entered the syscall with `IF=0`. Without this,
-/// two CPUs simultaneously initiating flush IPIs to each other deadlock
-/// (both spin with `IF=0`, neither processes the other's IPI). Preemption
-/// is disabled across the spin so a timer tick cannot reschedule the
-/// caller mid-IPI.
+/// Send an NMI (vector 2) to a target CPU. Used by the synchronous-IPI
+/// watchdog at Phase C to coax a backtrace dump from a CPU that has not
+/// acknowledged a sync IPI. The receiver's vector-2 handler consults
+/// [`NMI_BACKTRACE_REQUEST`] to distinguish a watchdog ping from a real
+/// hardware NMI.
 ///
 /// # Safety
-/// Must execute at ring 0. `target_cpu` must be < `MAX_CPUS` and != the
-/// current CPU (a local invalidation goes through `fpu::flush_owner_if`
-/// directly without raising an IPI). `tcb` must be a valid TCB pointer
-/// for the duration of the call. The caller's invariants (e.g. holding
-/// no scheduler lock) must permit this CPU to temporarily enable
-/// interrupts.
+/// `target_apic_id` must be a valid APIC ID of an online CPU.
 #[cfg(not(test))]
-pub unsafe fn send_fpu_flush_ipi(
-    target_cpu: usize,
-    tcb: *mut crate::sched::thread::ThreadControlBlock,
-)
+pub unsafe fn send_nmi_to(target_apic_id: u32)
 {
-    debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-    debug_assert!(target_cpu != cpu::current_cpu() as usize);
-    // SAFETY: cpu validated; CPU_APIC_IDS is read-only after init.
-    let target_apic_id = unsafe { crate::percpu::apic_id_for(target_cpu) };
-
-    // Publish the request before delivering the IPI. Release pairs with
-    // the Acquire load in ipi_fpu_flush_handler.
-    FPU_FLUSH_PENDING[target_cpu].store(tcb, core::sync::atomic::Ordering::Release);
-
-    // Disable preemption so the timer tick does not reschedule us while
-    // interrupts are temporarily enabled below.
-    crate::percpu::preempt_disable();
-    // Save current IF and unconditionally disable, then re-enable. This
-    // captures the caller's IF state for restoration even when we entered
-    // already with IF=0 (the common syscall case).
-    // SAFETY: ring 0.
-    let saved_int = unsafe { cpu::save_and_disable_interrupts() };
-    // SAFETY: IDT loaded; preempt-disabled; enabling IF here lets us
-    // service incoming flush / TLB-shootdown IPIs that would otherwise
-    // circular-wait against us.
-    unsafe { enable() };
-
-    // Wait for any in-flight ICR write, then send our IPI.
     // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
     unsafe { wait_icr_idle() };
-    // SAFETY: APIC MMIO; ICR_HIGH takes destination in bits [31:24].
+    // SAFETY: APIC MMIO region is valid; ICR_HIGH takes destination in bits [31:24].
     unsafe {
         apic_write(APIC_ICR_HIGH, target_apic_id << 24);
     }
-    // SAFETY: Fixed delivery, vector 252, level=0, trigger=edge.
+    // SAFETY: ICR_NMI encodes delivery_mode=NMI (4), level=assert, trigger=edge.
     unsafe {
-        apic_write(APIC_ICR_LOW, u32::from(IPI_VECTOR_FPU_FLUSH));
+        apic_write(APIC_ICR_LOW, ICR_NMI);
     }
+}
 
-    // Spin until the receiver clears the pending slot.
-    let mut n = 0u64;
-    while !FPU_FLUSH_PENDING[target_cpu]
-        .load(core::sync::atomic::Ordering::Acquire)
-        .is_null()
+// ── Synchronous-IPI watchdog ──────────────────────────────────────────────────
+
+/// Context passed to [`wait_for_ack`] by every synchronous IPI sender.
+///
+/// `op_name` and `target_cpu` are diagnostic-only (printed in the
+/// watchdog dump and panic message). `resend` is called once at Phase B
+/// to re-emit the IPI to whichever targets are still unacked; for a
+/// broadcast operation like TLB shootdown the closure should fan out to
+/// every CPU whose acknowledgement bit is still set, not the full
+/// original mask.
+pub struct IpiWaitCtx<'a>
+{
+    pub op_name: &'static str,
+    pub target_cpu: usize,
+    pub resend: &'a dyn Fn(),
+}
+
+/// TSC-bounded synchronous-IPI ack wait with re-send and NMI-backtrace
+/// escalation. Phases (wall-clock via `timer::elapsed_us`):
+/// - **A** (0 → ~250 ms): spin while `cond()` reports unacked.
+/// - **B** (250 ms → ~750 ms): at the boundary, call `ctx.resend()` once,
+///   then continue spinning. Recovers from a dropped IPI under
+///   emulators with non-deterministic LAPIC delivery.
+/// - **C** (750 ms → ~5 s): at the boundary, set
+///   [`NMI_BACKTRACE_REQUEST`] for `ctx.target_cpu` and send a vector-2
+///   NMI to that CPU. The receiver's handler dumps its
+///   `ExceptionFrame` to serial so a subsequent panic is diagnosable.
+/// - **D** (>5 s): print the context and fatal.
+///
+/// # Safety
+/// Must be called at ring 0 with preemption disabled and `IF=1` — the
+/// same envelope `mm::tlb_shootdown::shootdown` establishes. The caller
+/// is responsible for the surrounding interrupt-state save / restore.
+///
+/// `cond` MUST be free of side effects beyond the atomic loads needed
+/// to inspect the pending state; it is invoked many times per spin.
+#[cfg(not(test))]
+pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
+{
+    let start = super::timer::elapsed_us().unwrap_or(0);
+    let mut resent = false;
+    let mut nmi_sent = false;
+    loop
     {
-        core::hint::spin_loop();
-        n += 1;
-        if n >= 100_000_000
+        if cond()
         {
-            crate::fatal("send_fpu_flush_ipi: target CPU never acknowledged");
+            return;
+        }
+        core::hint::spin_loop();
+        let Some(now) = super::timer::elapsed_us()
+        else
+        {
+            continue;
+        };
+        let elapsed_ms = now.saturating_sub(start) / 1_000;
+        if elapsed_ms >= 5_000
+        {
+            crate::kprintln!(
+                "IPI WATCHDOG: target_cpu={} op={} elapsed_ms={} — never acked",
+                ctx.target_cpu,
+                ctx.op_name,
+                elapsed_ms
+            );
+            crate::fatal("ipi: target CPU never acked");
+        }
+        if !nmi_sent && elapsed_ms >= 750
+        {
+            if ctx.target_cpu < crate::sched::MAX_CPUS
+            {
+                NMI_BACKTRACE_REQUEST[ctx.target_cpu]
+                    .store(true, core::sync::atomic::Ordering::Release);
+                // SAFETY: target_cpu validated < MAX_CPUS; apic_id_for is
+                // read-only after init.
+                let apic_id = unsafe { crate::percpu::apic_id_for(ctx.target_cpu) };
+                // SAFETY: apic_id is a valid hardware LAPIC ID for an online CPU.
+                unsafe {
+                    send_nmi_to(apic_id);
+                }
+            }
+            nmi_sent = true;
+        }
+        if !resent && elapsed_ms >= 250
+        {
+            (ctx.resend)();
+            resent = true;
         }
     }
-
-    // Restore the caller's interrupt state and preemption.
-    // SAFETY: saved_int from save_and_disable_interrupts on this CPU.
-    unsafe {
-        cpu::restore_interrupts(saved_int);
-    }
-    crate::percpu::preempt_enable();
 }
 
 /// Start an AP using the INIT + 2×SIPI sequence (Intel SDM Vol. 3A §8.4.4.1).

@@ -439,7 +439,7 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── Cross-CPU preemption-isolation (Issue #65 lazy-FPU flush IPI) ────────────
+// ── Cross-CPU preemption-isolation (eager-save migration, per #108) ──────────
 
 /// Per-thread stack for the cross-CPU child.
 #[cfg(target_arch = "x86_64")]
@@ -471,9 +471,10 @@ static CROSS_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 /// asm block so no intervening Rust call clobbers xmm. The syscall ABI is
 /// embedded directly: rax = syscall number, rdi/rsi = args; the kernel
 /// preserves the live FP register file across the block because (a) the
-/// kernel itself is soft-float and (b) the lazy-FPU discipline keeps the
+/// kernel itself is soft-float and (b) the FPU discipline keeps the
 /// child as `fpu_owner` of its current CPU until either another thread
-/// takes an `#NM` or the migration-flush IPI fires on wake.
+/// takes an `#NM` or the child itself context-switches out (at which
+/// point `switch_out_save` XSAVEs the live regs into the TCB area).
 #[cfg(target_arch = "x86_64")]
 extern "C" fn child_cross_entry(_arg: u64) -> !
 {
@@ -569,13 +570,15 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     thread_exit();
 }
 
-/// Cross-CPU lazy-FPU-flush correctness: a thread that became `fpu_owner`
+/// Cross-CPU FPU-migration correctness: a thread that became `fpu_owner`
 /// on CPU 0, blocked, then was woken with affinity changed to CPU 1, must
-/// observe its register file intact post-migration. Exercises the
-/// migration-flush IPI path added in Issue #65 via the `enqueue_and_wake`
-/// → `flush_owner_remote(old_preferred_cpu, tcb)` call.
+/// observe its register file intact post-migration. After issue #108,
+/// this is guaranteed by eager XSAVE on switch-out (the source CPU's
+/// `switch_out_save` persists the live regs into the TCB area before the
+/// scheduler lock release that publishes the thread's Ready state).
 ///
-/// Requires SMP; skips otherwise. Skipped on RISC-V (out of scope for #65).
+/// Requires SMP; skips otherwise. Skipped on RISC-V (the equivalent
+/// `sstatus.FS/VS` dirty-tracking path is exercised by its own ktest).
 #[cfg(target_arch = "riscv64")]
 #[allow(clippy::unnecessary_wraps)]
 pub fn preempt_isolation_cross_cpu(_ctx: &TestContext) -> TestResult
@@ -584,7 +587,7 @@ pub fn preempt_isolation_cross_cpu(_ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Cross-CPU lazy-FPU-flush correctness (x86-64 only); see the
+/// Cross-CPU FPU-migration correctness (x86-64 only); see the
 /// architecture-neutral doc comment above.
 #[cfg(target_arch = "x86_64")]
 pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
@@ -646,13 +649,13 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         thread_set_affinity(th, 1)
             .map_err(|_| "thread_set_affinity(1) for preempt_isolation_cross_cpu failed")?;
 
-        // Wake the child. The wake path calls `enqueue_and_wake(target=1)`
-        // → `flush_owner_remote(old_preferred=0, tcb)` → synchronous flush
-        // IPI on CPU 0 → CPU 0's `fpu_owner_if` saves the live regs into
-        // the child's XSAVE area. The child then runs on CPU 1; the first
-        // FP op (the capture vmovdqu) traps to `#NM`, which XRSTORs the
-        // freshly-saved area into CPU 1's hardware before the store
-        // executes.
+        // Wake the child. The wake path calls `enqueue_and_wake(target=1)`,
+        // which simply enqueues the child on CPU 1's run queue: CPU 0's
+        // earlier `switch_out_save` (when the child blocked on sig_resume)
+        // already XSAVE'd the live regs into the child's TCB area. The
+        // child then runs on CPU 1; the first FP op (the capture vmovdqu)
+        // traps to `#NM`, which XRSTORs the area into CPU 1's hardware
+        // before the store executes.
         signal_send(sig_resume, 0x1)
             .map_err(|_| "signal_send resume for preempt_isolation_cross_cpu failed")?;
 

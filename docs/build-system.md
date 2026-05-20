@@ -77,15 +77,15 @@ floor for userspace SIMD / Vector codegen:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, plus
-  XSAVE/XSAVEOPT for the lazy save/restore discipline.
+  XSAVE for the eager-save / lazy-restore discipline.
 - `riscv64a23-seraph.json` — **RVA23U64** userspace profile (RVA23 v1.0,
   ratified 2024-10-21): IMAFDCV plus the Zba/Zbb/Zbs bitmanip set,
   hard-float LP64D ABI.
 
-Userspace correctness under preemption is provided by lazy FP/SIMD/V
-save/restore in the kernel scheduler — switch-out save on dirty, switch-in
-lazy trap on first use. See `core/kernel/src/arch/{x86_64,riscv64}/fpu.rs`
-for the per-arch primitives.
+Userspace correctness under preemption is provided by eager FP/SIMD/V save
+on switch-out and lazy restore on first FP/V use after switch-in (`#NM`
+trap on x86-64, illegal-instruction trap on RISC-V). See
+`core/kernel/src/arch/{x86_64,riscv64}/fpu.rs` for the per-arch primitives.
 
 The x86-64 bootloader uses the built-in `x86_64-unknown-uefi` target, so no
 custom JSON is needed. The RISC-V bootloader uses

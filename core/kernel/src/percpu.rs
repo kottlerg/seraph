@@ -156,16 +156,17 @@ pub struct PerCpuData
     /// sections such as TLB shootdown spin-waits.
     pub preempt_count: u32,
     _pad1: u32,
-    /// x86-64 lazy-FPU per-CPU owner cache: the TCB whose extended-state
-    /// register file is currently believed live in this CPU's hardware
-    /// XMM/YMM/x87 registers (null if none). Maintained by the `#NM`
-    /// handler, the context-switch fast path, and the migration-side
-    /// flush IPI. The invariant on each CPU is the one-way implication
-    /// `(CR0.TS=0) ⇒ (fpu_owner != null)`; equivalently, the forbidden
-    /// state is `(CR0.TS=0, fpu_owner=null)`. The states
-    /// `(TS=1, owner=null)`, `(TS=1, owner=T)`, and `(TS=0, owner=T)`
-    /// are all valid. See `arch/x86_64/fpu.rs` module docs for the
-    /// transition table. Unused on RISC-V (lazy via `sstatus.FS/VS`).
+    /// x86-64 per-CPU owner cache: the TCB whose extended-state register
+    /// file is currently live in this CPU's hardware XMM/YMM/x87
+    /// registers (null if none). Written by the `#NM` handler (installs
+    /// ownership on first FP use) and by `switch_out_save` (clears
+    /// ownership when this CPU's outgoing thread was the owner, after
+    /// eager XSAVE). The on-CPU invariant is the one-way implication
+    /// `(CR0.TS=0) ⇒ (fpu_owner != null)`; the forbidden state is
+    /// `(CR0.TS=0, fpu_owner=null)`. The states `(TS=1, owner=null)`
+    /// and `(TS=0, owner=T)` are the two at-rest states; see
+    /// `arch/x86_64/fpu.rs` module docs. Unused on RISC-V (lazy via
+    /// `sstatus.FS/VS`).
     pub fpu_owner: AtomicPtr<ThreadControlBlock>,
 }
 
@@ -302,21 +303,21 @@ pub fn preemption_disabled() -> bool
     unsafe { PER_CPU[cpu].preempt_count > 0 }
 }
 
-// ── Lazy-FPU owner cache (x86-64) ────────────────────────────────────────────
+// ── FPU owner cache (x86-64) ─────────────────────────────────────────────────
 
-/// Return a reference to CPU `cpu`'s lazy-FPU owner slot.
+/// Return a reference to CPU `cpu`'s FPU owner slot.
 ///
-/// Used cross-CPU: the migration-side flush IPI sender atomically reads the
-/// target CPU's slot to decide whether to skip the IPI, and the IPI handler
-/// (on the target CPU) atomically CASes the slot from the migrating TCB to
-/// null. Local readers (the `#NM` handler, the context-switch fast path)
-/// resolve the slot for the current CPU index.
+/// Called from the local `#NM` handler (`idt.rs::nm_handler`) and
+/// `switch_out_save`. After eager save-on-switch-out eliminated the
+/// migration-steal IPI and the dealloc-time sweep, every caller
+/// resolves `cpu == current_cpu()`; the slot reference form is kept
+/// for symmetry with the rest of the `PER_CPU` accessors.
 ///
 /// # Safety
 /// `cpu` must be < [`MAX_CPUS`]. The returned reference is `'static` because
 /// `PER_CPU` outlives any conceivable caller; concurrent access is safe via
 /// the [`AtomicPtr`] interior mutability.
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 pub fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
 {
     debug_assert!(cpu < MAX_CPUS);

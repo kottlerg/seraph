@@ -239,7 +239,6 @@ The kernel sends three IPIs. Each has a defined purpose and correctness role.
 |---|---|---|---|---|
 | 250 | `IPI_VECTOR_TLB_SHOOTDOWN` | TLB invalidation cascade | Flushes per-CPU TLB entries staged by the issuer. | Required: a writer that modifies a page-table entry MUST shoot down peer CPUs' TLBs before guaranteeing the change is observable. |
 | 251 | `IPI_VECTOR_WAKEUP` | Wake target CPU from `hlt` | EOI only (no work). | Required for the wake protocol's "always-IPI" invariant. The handler does no real work; the IPI's value is the trap entry itself, which exits `hlt` and re-enters the idle loop's check. |
-| 252 | `IPI_VECTOR_FPU_FLUSH` | Lazy-FPU owner flush on cross-CPU thread migration | Reads `FPU_FLUSH_PENDING[cpu]`, calls `fpu::flush_owner_if(target)` (CAS owner→null, XSAVE target's regs to its TCB area), clears the pending slot, EOI. | Required: the per-CPU `fpu_owner` cache marks which TCB owns the live extended-state registers. When a thread migrates to a new CPU, the destination's `#NM` handler XRSTORs from the TCB's XSAVE area; that area must be canonical, i.e. flushed from the source CPU's hardware registers before the migration commits. Issuer is the source-CPU side of `sched::flush_owner_remote` (called from `enqueue_and_wake` and `migrate_ready_thread` pre-lock). Sender spins for ack with interrupts ENABLED and preemption DISABLED, mirroring `mm::tlb_shootdown::shootdown` — required to avoid IF-versus-IPI circular deadlocks against another CPU initiating its own flush. |
 
 ### riscv64
 
@@ -249,11 +248,40 @@ The riscv64 build uses one SBI IPI extension (EID `0x735049`, FID `0`) for both 
 
 The same correctness rules apply: shootdown is required for TLB coherence; wakeup is required for the wake protocol.
 
-The lazy-FPU flush IPI is x86-64 only. RISC-V uses `sstatus.FS/VS` dirty tracking, which the trap path's `lazy_restore_fp_v` already keeps coherent across migration without a cross-hart IPI; `arch::riscv64::fpu::flush_owner_remote` is a no-op for arch-dispatch symmetry.
+There is no FPU flush IPI on either arch. x86-64 uses eager XSAVE on switch-out (`arch::x86_64::fpu::switch_out_save`), and RISC-V uses `sstatus.FS/VS` dirty tracking with the same switch-out save discipline. By the time a thread is observable as Ready on any CPU's run queue, the canonical extended-state contents are in its TCB area — no cross-CPU coordination is required.
 
 ### Future IPIs (out of scope)
 
-Process-stop ("kill process across all CPUs"), TLB-shootdown-with-PCID variants, scheduler-quiesce IPIs, and AVX-512 FPU-flush extensions are not in the current kernel. If added, they MUST be documented in this section before landing.
+Process-stop ("kill process across all CPUs"), TLB-shootdown-with-PCID variants, and scheduler-quiesce IPIs are not in the current kernel. If added, they MUST be documented in this section before landing.
+
+---
+
+## IPI Watchdog Ladder
+
+Every synchronous-IPI ack wait MUST route through `arch::current::interrupts::wait_for_ack` (file: `arch/x86_64/interrupts.rs`, mirrored in `arch/riscv64/interrupts.rs`). The helper bounds the wait against wall-clock time via TSC (`timer::elapsed_us`) and escalates through four phases keyed off the elapsed-microseconds delta from the start of the wait:
+
+| Phase | Window | Action |
+|---|---|---|
+| A | 0 – 250 ms | Spin with `core::hint::spin_loop()` while `cond()` reports unacked. |
+| B | 250 – 750 ms | Call `ctx.resend()` once at the boundary, then continue spinning. Recovers from a dropped IPI under emulators with non-deterministic LAPIC delivery. |
+| C | 750 ms – 5 s | x86-64: set `NMI_BACKTRACE_REQUEST[target_cpu]` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `ExceptionFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
+| D | > 5 s | Print `target_cpu`, `op_name`, `elapsed_ms` to serial, then `crate::fatal`. |
+
+`wait_for_ack` MUST be called with preemption disabled and `IF=1` / `sstatus.SIE=1` — the same envelope `mm::tlb_shootdown::shootdown` establishes. The `cond` closure MUST be side-effect-free beyond the atomic loads needed to inspect pending state (it runs many times per spin).
+
+For broadcast IPIs (TLB shootdown), `target_cpu` names the lowest-numbered CPU still pending at the start of the wait; this drives the diagnostic dump and panic message but does not constrain the ack predicate, which checks the full pending mask. The `resend` closure SHOULD re-fire only to CPUs whose bit is still set, not the full original mask.
+
+### `wait_icr_idle` discipline
+
+`wait_icr_idle` (x86-64 only; polls the LAPIC ICR delivery-status bit) is **not** a `wait_for_ack` consumer — it spins on a hardware register that clears within microseconds on a healthy LAPIC. A 1 M iteration cap is far beyond any architectural timing; exhaustion indicates a hardware-level fault (stuck APIC, emulator bug) and panics immediately. The four callers (`send_init_ipi`, `send_sipi`, `send_tlb_shootdown_ipi`, `send_wakeup_ipi`) call it for its side effect only; the return type is `()`.
+
+### `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`
+
+The x86-64 IDT registers a dedicated stub at vector 2 (IST=2 per the NMI ABI) that saves the standard `ExceptionFrame` shape, calls a returning handler, then restores GPRs and `iretq`s. The handler reads `NMI_BACKTRACE_REQUEST[cpu]`:
+- **Set** (watchdog-requested): dump the saved frame to serial and return; the stub's `iretq` resumes the interrupted code.
+- **Clear** (real hardware NMI): tail-call `common_exception_handler` which never returns — the stub's `iretq` tail is dead code in that case.
+
+NMI is not APIC-EOI'd; the handler does not call `acknowledge()`.
 
 ---
 

@@ -1393,7 +1393,7 @@ pub fn phase3_svcmgr_handover(
     //    shape — same as `ProcessInfo.service_registry_cap`.
     if let Some(cap) = publish_cap
         && let Ok(svc_send) = syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND)
-        && !svcmgr_publish(cap, b"svcmgr", svc_send, ipc_buf)
+        && !svcmgr_publish(cap, ipc::published_names::SVCMGR, svc_send, ipc_buf)
     {
         log("phase 3: publish svcmgr failed");
         let _ = syscall::cap_delete(svc_send);

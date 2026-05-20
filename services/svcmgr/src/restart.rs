@@ -339,6 +339,8 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx, correlator: u32) ->
 
     if !start_process(process_handle, ctx.ipc_buf)
     {
+        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
+        svc.process_handle = 0;
         return false;
     }
 
@@ -346,7 +348,8 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx, correlator: u32) ->
     // from the stored authoritative cap so the restarted child owns its own
     // copies. Bundle order is positional — children that registered with
     // bundle caps must expect them in the same order on restart as at first
-    // boot.
+    // boot. Mirrors the launch-side cleanup in `definitions::launch::launch`:
+    // on derive failure, release every cap derived so far before returning.
     let mut restart_caps: [u32; syscall_abi::MSG_CAP_SLOTS_MAX] =
         [0; syscall_abi::MSG_CAP_SLOTS_MAX];
     let mut cap_count = 0usize;
@@ -366,6 +369,11 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx, correlator: u32) ->
         else
         {
             std::os::seraph::log!("cannot derive bundle cap for restart");
+            for &derived in &restart_caps[..cap_count]
+            {
+                let _ = syscall::cap_delete(derived);
+            }
+            let _ = syscall::cap_delete(new_thread_cap);
             return false;
         };
         restart_caps[cap_count] = c;
@@ -386,6 +394,16 @@ fn restart_process(svc: &mut ServiceEntry, ctx: &RestartCtx, correlator: u32) ->
     .is_err()
     {
         std::os::seraph::log!("bootstrap serve failed");
+        // serve_round MOVES caps on success; on failure they may or
+        // may not have been consumed. Best-effort delete is safe
+        // (delete of an already-transferred slot is a no-op). Child
+        // is started; cannot destroy from here — it will exit on the
+        // receive-side failure and procmgr will reap.
+        for &derived in &restart_caps[..cap_count]
+        {
+            let _ = syscall::cap_delete(derived);
+        }
+        let _ = syscall::cap_delete(new_thread_cap);
         return false;
     }
 

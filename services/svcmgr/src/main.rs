@@ -42,9 +42,10 @@ use std::os::seraph::{StartupInfo, startup_info};
 /// endpoints (vfsd, logd, procmgr, …) plus slack.
 const REGISTRY_CAPACITY: usize = 8;
 
-/// Maximum services init may pre-register before [`handover_complete`]
-/// runs reconciliation. Sized to match [`MAX_SERVICES`] — svcmgr cannot
-/// supervise more entries than its `ServiceEntry` table can hold.
+/// Maximum services init may pre-register before
+/// [`svcmgr_labels::HANDOVER_COMPLETE`] runs reconciliation. Sized to
+/// match [`MAX_SERVICES`] — svcmgr cannot supervise more entries
+/// than its `ServiceEntry` table can hold.
 const MAX_PENDING_REGISTRATIONS: usize = MAX_SERVICES;
 
 // ── Registration handling ──────────────────────────────────────────────────
@@ -71,28 +72,42 @@ fn handle_register(
     pending_count: &mut usize,
 ) -> u64
 {
+    // IPC delivers caps into svcmgr's CSpace before dispatch — every
+    // reject path must release the delivered thread cap, otherwise a
+    // hostile or buggy registrar can leak a cap per request over
+    // svcmgr's lifetime.
+    let recv_caps = msg.caps();
+    let delivered_cap = recv_caps.first().copied().unwrap_or(0);
+    let reject = |code: u64| -> u64 {
+        if delivered_cap != 0
+        {
+            let _ = syscall::cap_delete(delivered_cap);
+        }
+        code
+    };
+
     if msg.word(0) != u64::from(ipc::SVCMGR_LABELS_VERSION)
     {
-        return ipc::svcmgr_errors::LABEL_VERSION_MISMATCH;
+        return reject(ipc::svcmgr_errors::LABEL_VERSION_MISMATCH);
     }
 
     let name_len = msg.word(1) as usize;
     if name_len == 0 || name_len > 32
     {
-        return ipc::svcmgr_errors::INVALID_NAME;
+        return reject(ipc::svcmgr_errors::INVALID_NAME);
     }
 
     if *pending_count >= MAX_PENDING_REGISTRATIONS
     {
-        return ipc::svcmgr_errors::TABLE_FULL;
+        return reject(ipc::svcmgr_errors::TABLE_FULL);
     }
 
-    let recv_caps = msg.caps();
-    if recv_caps.is_empty() || recv_caps[0] == 0
+    if delivered_cap == 0
     {
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
 
+    // delivered_cap transfers into PendingRegistration from here.
     let mut name = [0u8; 32];
     read_packed_bytes(msg, 2, name_len, &mut name);
 
@@ -100,7 +115,7 @@ fn handle_register(
     pending[idx] = PendingRegistration {
         name,
         name_len: name_len as u8,
-        thread_cap: recv_caps[0],
+        thread_cap: delivered_cap,
         consumed: false,
     };
     *pending_count += 1;
@@ -233,7 +248,6 @@ fn main() -> !
         service_count: 0,
         pending: [const { PendingRegistration::empty() }; MAX_PENDING_REGISTRATIONS],
         pending_count: 0,
-        handover_complete: false,
         registry: registry::Registry::new(),
     };
 
@@ -264,7 +278,6 @@ pub struct SvcmgrState
     pub service_count: usize,
     pub pending: [PendingRegistration; MAX_PENDING_REGISTRATIONS],
     pub pending_count: usize,
-    pub handover_complete: bool,
     pub registry: registry::Registry<REGISTRY_CAPACITY>,
 }
 
@@ -333,7 +346,6 @@ fn dispatch_ipc(service_ep: u32, state: &mut SvcmgrState, ctx: &restart::Restart
             // proceeds to teardown / thread_exit; svcmgr then runs the
             // (potentially slow) scan + launch path without holding
             // init blocked on the IPC reply path.
-            state.handover_complete = true;
             let reply = IpcMessage::new(ipc::svcmgr_errors::SUCCESS);
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -380,24 +392,36 @@ fn handle_publish_endpoint(
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
 ) -> u64
 {
+    // IPC delivers caps into svcmgr's CSpace before dispatch — every
+    // reject path must release the delivered value cap, otherwise a
+    // hostile or buggy publisher can leak a cap per call.
+    let recv_caps = msg.caps();
+    let delivered_cap = recv_caps.first().copied().unwrap_or(0);
+    let reject = |code: u64| -> u64 {
+        if delivered_cap != 0
+        {
+            let _ = syscall::cap_delete(delivered_cap);
+        }
+        code
+    };
+
     if msg.token & svcmgr_labels::PUBLISH_AUTHORITY == 0
     {
-        return ipc::svcmgr_errors::UNAUTHORIZED;
+        return reject(ipc::svcmgr_errors::UNAUTHORIZED);
     }
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
     if name_len == 0 || name_len > registry::NAME_MAX
     {
-        return ipc::svcmgr_errors::INVALID_NAME;
+        return reject(ipc::svcmgr_errors::INVALID_NAME);
     }
-    let recv_caps = msg.caps();
-    if recv_caps.is_empty() || recv_caps[0] == 0
+    if delivered_cap == 0
     {
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
     let name = read_tail_name_from_msg(msg, 0, name_len);
-    if registry.publish(&name[..name_len], recv_caps[0]).is_err()
+    if registry.publish(&name[..name_len], delivered_cap).is_err()
     {
-        return ipc::svcmgr_errors::REGISTER_REJECTED;
+        return reject(ipc::svcmgr_errors::REGISTER_REJECTED);
     }
     ipc::svcmgr_errors::SUCCESS
 }

@@ -122,12 +122,14 @@ post-handover.
 
 Init then publishes well-known caps into svcmgr's discovery
 registry (`ipc::published_names::ROOTFS_ROOT`,
-`PWRMGR_SHUTDOWN`, `PWRMGR_DENY`, plus an un-tokened SEND on svcmgr
-itself under `svcmgr`) via `svcmgr_labels::PUBLISH_ENDPOINT` with a
-`PUBLISH_AUTHORITY`-tokened cap, and registers pwrmgr with svcmgr
-via the v3 `REGISTER_SERVICE` wire (name + thread cap). Recipes for
-all svcmgr-supervised services live on disk at
-`/etc/svcmgr/services.d/<name>.svc`, not on the wire — see
+`PWRMGR_SHUTDOWN`, `PWRMGR_DENY`, `SVCMGR`) via
+`svcmgr_labels::PUBLISH_ENDPOINT` with a `PUBLISH_AUTHORITY`-tokened
+`RIGHTS_SEND_GRANT` cap, and registers every foundational service
+it bootstrapped with svcmgr via the v3 `REGISTER_SERVICE` wire
+(name + thread cap): `memmgr`, `procmgr`, `devmgr`, `vfsd`, `logd`,
+`timed`, `pwrmgr`. Recipes for all svcmgr-supervised services live
+on disk at `/etc/svcmgr/services.d/<name>.svc`, not on the wire —
+see
 [`services/svcmgr/docs/service-definitions.md`](../services/svcmgr/docs/service-definitions.md).
 
 ### Init reap

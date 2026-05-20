@@ -199,49 +199,75 @@ fn handle_definition(
         // init-created service: svcmgr has no process_handle (init
         // didn't share it). First death cannot DESTROY_PROCESS; this
         // matches the pre-#21 shape — see `restart::restart_process`.
-        bind_and_record(def, slot.thread_cap, 0, services, service_count, deaths_eq);
+        // Bind happens after the fact (the thread has been running
+        // since Phase 1/2/3 spawn) — a death in that window is lost.
+        // Closing that race is kernel-protocol work; tracked as a
+        // follow-up.
+        bind_only(def, slot.thread_cap, services, service_count, deaths_eq);
         return;
     }
 
     // Not registered by init → svcmgr launches it.
     log!("svcmgr: launching: {}", def.name);
-    let Some(launched) = launch::launch(def, ctx, registry)
+
+    if matches!(def.restart, RestartPolicy::Never)
+    {
+        // One-shot launch: no supervision binding, no `ServiceEntry`.
+        // procmgr auto-reaps on exit.
+        let Some(launched) = launch::launch(def, ctx, registry, None)
+        else
+        {
+            log!("svcmgr: launch failed: {}", def.name);
+            return;
+        };
+        log!("svcmgr: launched ephemeral: {}", def.name);
+        let _ = syscall::cap_delete(launched.thread_cap);
+        let _ = syscall::cap_delete(launched.process_handle);
+        return;
+    }
+
+    // Supervised launch: reserve the service-table slot BEFORE
+    // calling launch so the death-notification binding can land on a
+    // committed correlator. Bind happens inside launch.rs between
+    // CONFIGURE_NAMESPACE and START_PROCESS (thread still suspended)
+    // so any immediate post-start death is captured cleanly.
+    // On launch failure the slot is "burned" (stays at default,
+    // active=false); dispatch_deaths' `!active` guard skips it.
+    // Burning consumes one of MAX_SERVICES=16 slots in the failure
+    // case; healthy boots never burn.
+    if *service_count >= MAX_SERVICES
+    {
+        log!("svcmgr: service table full; dropping {}", def.name);
+        return;
+    }
+    let idx = *service_count;
+    *service_count += 1;
+    let correlator = idx as u32;
+
+    let Some(launched) = launch::launch(def, ctx, registry, Some((deaths_eq, correlator)))
     else
     {
         log!("svcmgr: launch failed: {}", def.name);
         return;
     };
 
-    if matches!(def.restart, RestartPolicy::Never)
-    {
-        log!("svcmgr: launched ephemeral: {}", def.name);
-        // Drop the thread + process handles — no supervision binding
-        // to make; procmgr auto-reaps the one-shot on its own.
-        let _ = syscall::cap_delete(launched.thread_cap);
-        let _ = syscall::cap_delete(launched.process_handle);
-        return;
-    }
-
-    bind_and_record(
-        def,
-        launched.thread_cap,
-        launched.process_handle,
-        services,
-        service_count,
-        deaths_eq,
-    );
+    services[idx] = build_entry(def, launched.thread_cap, launched.process_handle);
 }
 
-/// Bind death-notification on `thread_cap` and record a `ServiceEntry`
-/// with the parsed recipe so the supervision loop can restart the
-/// service later. `process_handle` is `0` for init-spawned services
-/// (init never shared its handle); for svcmgr-launched services it is
-/// the tokened procmgr handle so the restart path can issue
-/// `DESTROY_PROCESS` before respawning.
-fn bind_and_record(
+/// Bind-only path: bind death-notification on a thread init already
+/// started in Phase 1/2/3, record the `ServiceEntry`. `process_handle`
+/// is `0` for these services (init never shared its handle); first
+/// death cannot `DESTROY_PROCESS` — see `restart::restart_process`.
+///
+/// Race window: the thread has been running since init's spawn; a
+/// death between then and this bind is lost (the kernel walks an
+/// empty observer set on death). For long-running daemons the
+/// window is theoretical; closing it requires either a kernel-side
+/// death-queue or init binding onto its own EQ and forwarding at
+/// handover. Tracked as a follow-up.
+fn bind_only(
     def: &Definition,
     thread_cap: u32,
-    process_handle: u32,
     services: &mut [ServiceEntry; MAX_SERVICES],
     service_count: &mut usize,
     deaths_eq: u32,
@@ -256,9 +282,10 @@ fn bind_and_record(
     if syscall::thread_bind_notification(thread_cap, deaths_eq, idx as u32).is_err()
     {
         log!("svcmgr: bind death-notification failed for {}", def.name);
+        let _ = syscall::cap_delete(thread_cap);
         return;
     }
-    services[idx] = build_entry(def, thread_cap, process_handle);
+    services[idx] = build_entry(def, thread_cap, 0);
     *service_count += 1;
 }
 
@@ -323,9 +350,11 @@ fn build_entry(def: &Definition, thread_cap: u32, process_handle: u32) -> Servic
 }
 
 /// Log every entry in `pending` that was never matched by a `.svc`
-/// definition. Per the reconciliation contract these are hard errors
-/// but non-fatal — svcmgr keeps running for the services that did
-/// resolve cleanly.
+/// definition and release its thread cap. Per the reconciliation
+/// contract these are hard errors but non-fatal — svcmgr keeps
+/// running for the services that did resolve cleanly. Releasing the
+/// thread cap here avoids leaking a slot per orphaned registration
+/// over svcmgr's lifetime.
 fn report_orphans(pending: &[PendingRegistration], pending_count: usize)
 {
     for slot in pending.iter().take(pending_count)
@@ -336,6 +365,10 @@ fn report_orphans(pending: &[PendingRegistration], pending_count: usize)
                 "svcmgr: registered without definition: {} (refusing to bind)",
                 slot.name_str()
             );
+            if slot.thread_cap != 0
+            {
+                let _ = syscall::cap_delete(slot.thread_cap);
+            }
         }
     }
 }

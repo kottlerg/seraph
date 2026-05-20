@@ -521,6 +521,11 @@ pub mod published_names
     /// pointing at pwrmgr without the shutdown bit to verify the
     /// authority gate rejects it.
     pub const PWRMGR_DENY: &[u8] = b"pwrmgr.deny";
+
+    /// SEND on svcmgr's own service endpoint. Consumers resolve this
+    /// when they need to call into svcmgr beyond the per-process
+    /// `service_registry_cap` (today: crasher's `seed = svcmgr`).
+    pub const SVCMGR: &[u8] = b"svcmgr";
 }
 
 pub const RTC_LABELS_VERSION: u32 = 1;

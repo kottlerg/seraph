@@ -63,10 +63,19 @@ fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
 /// usertest's pwrmgr phases; consumers that don't tolerate a missing
 /// cap fail on first use, which is the right surface for a real
 /// misconfiguration.
+///
+/// `bind_target` carries the `(deaths_eq, correlator)` for supervised
+/// launches: when present, death-notification is bound BEFORE
+/// `START_PROCESS` so an immediate post-start death cannot be lost
+/// (the kernel walks the observer set at the moment of death; an
+/// empty observer set silently drops the event). For one-shot
+/// launches (`restart = never`, e.g. `usertest`) the caller passes
+/// `None` and forgoes supervision binding.
 pub fn launch(
     def: &Definition,
     ctx: &RestartCtx,
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    bind_target: Option<(u32, u32)>,
 ) -> Option<Launched>
 {
     let (argv_blob, argv_count) = build_blob(&def.argv);
@@ -88,6 +97,17 @@ pub fn launch(
 
     if !configure_namespace(def, &created, ctx)
     {
+        return None;
+    }
+
+    // Bind death-notification BEFORE start_process so any immediate
+    // post-start death is captured. Thread is suspended at this
+    // point — no userspace code has run yet.
+    if let Some((deaths_eq, correlator)) = bind_target
+        && syscall::thread_bind_notification(created.thread_cap, deaths_eq, correlator).is_err()
+    {
+        std::os::seraph::log!("launch {}: thread_bind_notification failed", def.name);
+        destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
         return None;
     }
 

@@ -767,17 +767,24 @@ fn run(info_ptr: u64) -> !
 
     // ── Request procmgr to create early services ──────────────────────────────
 
+    let mut thread_caps = service::ServiceThreadCaps {
+        memmgr: mm.mm_thread,
+        procmgr: pm.thread,
+        ..service::ServiceThreadCaps::default()
+    };
+
     if info.module_frame_count >= 2
     {
         logging::log("requesting procmgr to create devmgr (with hw caps)");
-        service::create_devmgr_with_caps(
+        thread_caps.devmgr = service::create_devmgr_with_caps(
             info,
             endpoint_cap,
             init_bootstrap_ep,
             devmgr_registry_ep,
             svcmgr_service_ep,
             ipc_buf,
-        );
+        )
+        .unwrap_or(0);
     }
     else
     {
@@ -787,7 +794,7 @@ fn run(info_ptr: u64) -> !
     if info.module_frame_count >= 3
     {
         logging::log("requesting procmgr to create vfsd (with caps)");
-        service::create_vfsd_with_caps(
+        thread_caps.vfsd = service::create_vfsd_with_caps(
             info,
             endpoint_cap,
             init_bootstrap_ep,
@@ -796,7 +803,8 @@ fn run(info_ptr: u64) -> !
                 vfsd_service_ep,
             },
             ipc_buf,
-        );
+        )
+        .unwrap_or(0);
     }
     else
     {
@@ -878,7 +886,7 @@ fn run(info_ptr: u64) -> !
     // sender's messages to real-logd's RECV — no live writer
     // re-registers.
     logging::log("phase 2: launching logd");
-    if !service::create_and_start_logd(
+    thread_caps.logd = service::create_and_start_logd(
         info,
         endpoint_cap,
         endpoint_cap,
@@ -888,9 +896,10 @@ fn run(info_ptr: u64) -> !
         info.cspace_cap,
         ipc_buf,
     )
-    {
+    .unwrap_or_else(|| {
         logging::log("phase 2: logd launch failed; init-logd remains the receiver");
-    }
+        0
+    });
 
     logging::log("phase 2 bootstrap complete");
 
@@ -904,6 +913,7 @@ fn run(info_ptr: u64) -> !
         svcmgr_service_ep,
         system_root_cap,
         root_mount.root_cap,
+        thread_caps,
         ipc_buf,
         init_logd_thread_cap,
         ipc_cap,

@@ -30,11 +30,26 @@ pub const POLICY_ALWAYS: u8 = 0;
 /// Restart policy: restart only on fault (nonzero exit reason).
 pub const POLICY_ON_FAILURE: u8 = 1;
 
-/// Criticality: crash of this service is fatal — halt the system.
-pub const CRITICALITY_FATAL: u8 = 0;
+/// Restart policy: never restart, even on fault. Used for one-shot
+/// integration-test fixtures whose exit is the success signal.
+pub const POLICY_NEVER: u8 = 2;
 
-/// Criticality: crash can be handled by restart policy.
+/// Criticality: death is informational. Logged; nothing else.
+pub const CRITICALITY_LOW: u8 = 0;
+
+/// Criticality: death is monitored within the restart-budget
+/// envelope. Once the budget is exhausted the service is marked
+/// inactive; the system continues degraded.
 pub const CRITICALITY_NORMAL: u8 = 1;
+
+/// Criticality: death the system cannot survive. On unrecoverable
+/// death (either `POLICY_NEVER` or restart budget exhausted under
+/// `POLICY_ON_FAILURE` / `POLICY_ALWAYS`) svcmgr resolves
+/// `published_names::PWRMGR_SHUTDOWN` from its discovery registry
+/// and issues `pwrmgr_labels::SHUTDOWN` to power the system off
+/// cleanly. Edge case: pwrmgr's own death cannot trigger this
+/// (the shutdown source itself is gone — see `restart.rs`).
+pub const CRITICALITY_HIGH: u8 = 2;
 
 // ── Service table ───────────────────────────────────────────────────────────
 
@@ -66,7 +81,8 @@ pub struct ServiceEntry
     pub bundle_count: u8,
     /// Restart policy (`POLICY_ALWAYS`, `POLICY_ON_FAILURE`, etc.).
     pub restart_policy: u8,
-    /// Criticality level (`CRITICALITY_FATAL`, `CRITICALITY_NORMAL`).
+    /// Criticality level (`CRITICALITY_LOW`, `CRITICALITY_NORMAL`,
+    /// `CRITICALITY_HIGH`).
     pub criticality: u8,
     /// Number of restart attempts so far.
     pub restart_count: u32,

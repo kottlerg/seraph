@@ -396,52 +396,60 @@ pub mod procmgr_process_state
     pub const EXITED: u64 = 3;
 }
 
-pub const SVCMGR_LABELS_VERSION: u32 = 2;
+pub const SVCMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
-    /// Register a service for health monitoring.
+    /// Register a currently-running service for supervision.
     ///
-    /// Wire format (data words, in order):
+    /// The recipe (binary, argv, env, restart policy, criticality,
+    /// namespace shape, seed names) lives on disk at
+    /// `/etc/svcmgr/services.d/<name>.svc`, not on the wire. This
+    /// message carries only what cannot be on disk: which named
+    /// recipe the running process implements, and the thread cap
+    /// svcmgr binds death-notification on.
+    ///
+    /// Wire format:
     /// * word 0: `SVCMGR_LABELS_VERSION` handshake.
-    /// * word 1: `restart_policy` byte.
-    /// * word 2: `criticality` byte.
-    /// * words 3..: `name` bytes (length in label bits 16..32).
-    /// * one word: `bundle_name_len`.
-    /// * following words: `bundle_name` bytes when length > 0.
-    /// * following words: `vfs_path` bytes when length > 0 (length in
-    ///   label bits 32..48).
-    /// * one word: namespace-policy descriptor (`ns_policy_packed`):
-    ///     - bits  0..  8: kind (`NS_POLICY_UNIVERSAL` / `_NONE` /
-    ///       `_SUBTREE`).
-    ///     - bits 16.. 32: subtree-path length (0 for non-Subtree).
-    ///     - bits 32.. 64: subtree rights mask (u32; only the low 24
-    ///       bits are meaningful per `namespace-protocol`).
-    /// * following words: subtree-path bytes (only when kind ==
-    ///   `NS_POLICY_SUBTREE`).
+    /// * word 1: `name_len` (byte length of the service name).
+    /// * words 2..: `name` bytes (the `.svc` filename without
+    ///   the `.svc` suffix).
+    /// * `caps[0]`: thread cap for death-notification binding.
     ///
-    /// svcmgr stores the descriptor on the `ServiceEntry` and
-    /// re-applies it on every restart (walking its own
-    /// `root_dir_cap` for `Subtree`), so attenuation survives a
-    /// crash-restart cycle.
+    /// On [`HANDOVER_COMPLETE`] svcmgr reconciles every registered
+    /// name against `services.d/`: a registered name with a
+    /// definition is bound and supervised using the on-disk recipe;
+    /// a defined name not registered is launched by svcmgr itself;
+    /// a registered name with no definition is a hard error (svcmgr
+    /// has no recipe to restart it). See
+    /// `services/svcmgr/docs/service-definitions.md` and
+    /// `services/svcmgr/docs/ipc-interface.md` for the
+    /// authoritative spec.
     pub const REGISTER_SERVICE: u64 = 1;
 
+    /// Internal namespace-policy descriptor stored on `ServiceEntry`
+    /// (one of the values below). Parsed by svcmgr from each
+    /// service's `namespace = ...` line in `services.d/<name>.svc`;
+    /// no longer carried on the [`REGISTER_SERVICE`] wire.
+    ///
     /// Namespace-policy descriptor: hand the child a `cap_copy` of
-    /// the spawner's seed root at full rights. The default for
-    /// services that legitimately need the whole namespace
-    /// (currently only `usertest`).
+    /// svcmgr's own root cap at full rights. Reserved for the small
+    /// allow-list of services that need genuine root authority (vfsd
+    /// as the namespace authority, devmgr for `/dev`, procmgr for
+    /// walking `/bin`, usertest as the namespace tester).
     pub const NS_POLICY_UNIVERSAL: u8 = 0;
     /// Namespace-policy descriptor: do not deliver any namespace
     /// cap. The child's `ProcessInfo.system_root_cap` stays zero
-    /// (`Unsupported` on absolute-path fs ops in std). Suitable for
+    /// (`Unsupported` on absolute-path fs ops in std). Default for
     /// services that own only hardware / IPC authority and never
     /// touch the filesystem.
     pub const NS_POLICY_NONE: u8 = 1;
-    /// Namespace-policy descriptor: walk the spawner's seed root to
-    /// a per-service path with a per-service rights mask, and hand
-    /// the resulting directory cap. Path and rights live in the same
-    /// `REGISTER_SERVICE` body so svcmgr can reproduce the walk on
-    /// restart against its own root.
+    /// Namespace-policy descriptor: walk svcmgr's root for a
+    /// per-service path with a per-service rights mask, and hand
+    /// the resulting directory cap as the child's namespace root.
+    /// Path and rights come from the `namespace = subtree:<path>:<rights>`
+    /// line in `services.d/<name>.svc` so attenuation survives a
+    /// crash-restart cycle.
     pub const NS_POLICY_SUBTREE: u8 = 2;
     /// Signal that init handover is complete.
     pub const HANDOVER_COMPLETE: u64 = 2;
@@ -480,6 +488,44 @@ pub mod svcmgr_labels
     /// `user.*`) is the future-work shape and the token namespace
     /// reserves it — see GitHub issue #76.
     pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
+}
+
+/// Well-known names published into svcmgr's discovery registry.
+///
+/// Centralised so publishers (today: `init` during Phase 3 handover)
+/// and consumers (today: `svcmgr` resolving each `.svc`'s `seed = ...`
+/// list during launch) share the exact spelling. A typo on either
+/// side leaks out as `svcmgr_errors::UNKNOWN_NAME` rather than
+/// `INSUFFICIENT_CAPS`.
+///
+/// Names are FS-driver- and platform-agnostic by design: swapping the
+/// root filesystem from fatfs to e.g. ext4, or replacing pwrmgr's
+/// platform shutdown source, changes only the publisher's local
+/// derivation, not the published name nor any consumer.
+pub mod published_names
+{
+    /// Tokened SEND on the root filesystem's namespace endpoint at
+    /// its root directory. The driver behind it (fatfs today, any
+    /// FS driver tomorrow) is opaque to consumers.
+    pub const ROOTFS_ROOT: &[u8] = b"rootfs.root";
+
+    /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's
+    /// service endpoint. Consumers needing power-off authority
+    /// resolve this name and call [`pwrmgr_labels::SHUTDOWN`] /
+    /// [`pwrmgr_labels::REBOOT`] through the returned cap.
+    pub const PWRMGR_SHUTDOWN: &[u8] = b"pwrmgr.shutdown";
+
+    /// No-authority SEND on pwrmgr's service endpoint, tokenised
+    /// with a non-`SHUTDOWN_AUTHORITY` sentinel. Used by negative
+    /// tests (e.g. usertest's `pwrmgr_cap_deny`) that need a cap
+    /// pointing at pwrmgr without the shutdown bit to verify the
+    /// authority gate rejects it.
+    pub const PWRMGR_DENY: &[u8] = b"pwrmgr.deny";
+
+    /// SEND on svcmgr's own service endpoint. Consumers resolve this
+    /// when they need to call into svcmgr beyond the per-process
+    /// `service_registry_cap` (today: crasher's `seed = svcmgr`).
+    pub const SVCMGR: &[u8] = b"svcmgr";
 }
 
 pub const RTC_LABELS_VERSION: u32 = 1;

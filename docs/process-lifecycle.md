@@ -111,20 +111,37 @@ mechanism — but procmgr is the chooser from that point forward (see
 ### Init → remaining services
 
 Init requests procmgr to start the remaining boot-time services in
-order — devmgr, svcmgr, drivers, vfsd, optionally netd — by IPC to
-procmgr's `CREATE_PROCESS` endpoint. For each service, init delegates
-the appropriate capability subset (see
+order — devmgr, vfsd, optionally netd, then svcmgr, the per-arch
+RTC driver, timed, and pwrmgr — by IPC to procmgr's
+`CREATE_FROM_FILE` / `CREATE_PROCESS` endpoints. For each service,
+init delegates the appropriate capability subset (see
 [`capability-model.md`](capability-model.md) §"Initial Capability
-Distribution") and registers the service with svcmgr along with its
-restart policy.
+Distribution"). svcmgr is configured with the universal
+`system_root_cap` so it can read `/etc/svcmgr/services.d/*.svc`
+post-handover.
+
+Init then publishes well-known caps into svcmgr's discovery
+registry (`ipc::published_names::ROOTFS_ROOT`,
+`PWRMGR_SHUTDOWN`, `PWRMGR_DENY`, `SVCMGR`) via
+`svcmgr_labels::PUBLISH_ENDPOINT` with a `PUBLISH_AUTHORITY`-tokened
+`RIGHTS_SEND_GRANT` cap, and registers every foundational service
+it bootstrapped with svcmgr via the v3 `REGISTER_SERVICE` wire
+(name + thread cap): `memmgr`, `procmgr`, `devmgr`, `vfsd`, `logd`,
+`timed`, `pwrmgr`. Recipes for all svcmgr-supervised services live
+on disk at `/etc/svcmgr/services.d/<name>.svc`, not on the wire —
+see
+[`services/svcmgr/docs/service-definitions.md`](../services/svcmgr/docs/service-definitions.md).
 
 ### Init reap
 
-After Phase 3 (svcmgr handover complete, usertest spawned), init signs
-over its own kernel-object caps (`AddressSpace`, `CSpace`, main
-`Thread`, init-logd `Thread`) and every reclaimable Frame cap (ELF
-segments, user stack pages, `InitInfo` pages, IPC buffer) to procmgr
-via `procmgr_labels::REGISTER_INIT_TEARDOWN`, then `sys_thread_exit`s.
+After Phase 3 signals `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
+replies immediately, then scans `services.d/` and launches the
+defined-but-unregistered services — today `crasher.svc` and
+`usertest.svc`), init signs over its own kernel-object caps
+(`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and
+every reclaimable Frame cap (ELF segments, user stack pages,
+`InitInfo` pages, IPC buffer) to procmgr via
+`procmgr_labels::REGISTER_INIT_TEARDOWN`, then `sys_thread_exit`s.
 
 Procmgr binds a death-EQ observer on init's main thread; on the death
 event procmgr tears down init's kernel objects in order (Threads →

@@ -873,6 +873,7 @@ name = "svcmgr"
 version = "0.1.0"
 dependencies = [
  "ipc",
+ "namespace-protocol",
  "registry",
  "syscall",
  "syscall-abi",

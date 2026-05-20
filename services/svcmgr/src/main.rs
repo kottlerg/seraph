@@ -29,201 +29,106 @@
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;
+mod definitions;
 mod restart;
 mod service;
 
+use definitions::reconcile::PendingRegistration;
 use ipc::{IpcMessage, svcmgr_labels};
-use service::{MAX_BUNDLE_CAPS, MAX_SERVICES, ServiceEntry, bootstrap_caps};
+use service::{MAX_SERVICES, ServiceEntry, bootstrap_caps};
 use std::os::seraph::{StartupInfo, startup_info};
 
 /// Global discovery registry size. Enough for a handful of top-level named
 /// endpoints (vfsd, logd, procmgr, …) plus slack.
 const REGISTRY_CAPACITY: usize = 8;
 
+/// Maximum services init may pre-register before
+/// [`svcmgr_labels::HANDOVER_COMPLETE`] runs reconciliation. Sized to
+/// match [`MAX_SERVICES`] — svcmgr cannot supervise more entries
+/// than its `ServiceEntry` table can hold.
+const MAX_PENDING_REGISTRATIONS: usize = MAX_SERVICES;
+
 // ── Registration handling ──────────────────────────────────────────────────
 
-/// Handle a `REGISTER_SERVICE` IPC message.
+/// Handle a `REGISTER_SERVICE` IPC message under the v3 wire (post-#21).
 ///
-/// Reads name, policy, criticality from data words. Reads `thread_cap`,
-/// `module_cap`, `log_ep` from transferred caps. Binds the thread's death
-/// notification onto the shared `deaths_eq` with the service's table
-/// index as the correlator.
+/// The recipe lives on disk at `/etc/svcmgr/services.d/<name>.svc`; the
+/// wire conveys only what cannot be on disk:
 ///
-/// Two restart sources are supported, distinguished by `vfs_path_len` in
-/// label bits [32..48]:
-///   - module-loaded (`vfs_path_len` == 0): caps = [thread, module, optional bundle]
-///   - VFS-loaded    (`vfs_path_len`  > 0): caps = [thread, optional bundle]
-#[allow(clippy::too_many_lines)]
+/// * `word 0`: `SVCMGR_LABELS_VERSION` handshake.
+/// * `word 1`: `name_len` (byte length of the service name).
+/// * `words 2..`: `name` bytes.
+/// * `caps[0]`: thread cap for death-notification binding.
+///
+/// The thread cap is parked in `pending`; binding to the deaths event
+/// queue is deferred to [`definitions::reconcile::reconcile_and_launch`]
+/// after handover, where each pending entry is paired with its `.svc`
+/// definition (or reported as a configuration error if no recipe
+/// exists). See [`ipc::svcmgr_labels::REGISTER_SERVICE`] for the
+/// authoritative spec.
 fn handle_register(
     msg: &IpcMessage,
-    services: &mut [ServiceEntry; MAX_SERVICES],
-    service_count: &mut usize,
-    deaths_eq: u32,
+    pending: &mut [PendingRegistration],
+    pending_count: &mut usize,
 ) -> u64
 {
-    let label = msg.label;
-    let name_len = ((label >> 16) & 0xFFFF) as usize;
-    let vfs_path_len = ((label >> 32) & 0xFFFF) as usize;
+    // IPC delivers caps into svcmgr's CSpace before dispatch — every
+    // reject path must release the delivered thread cap, otherwise a
+    // hostile or buggy registrar can leak a cap per request over
+    // svcmgr's lifetime. The v3 wire only carries one cap; release
+    // every trailing slot the caller may have delivered defensively.
+    let recv_caps = msg.caps();
+    let delivered_cap = recv_caps.first().copied().unwrap_or(0);
+    for &extra in recv_caps.iter().skip(1)
+    {
+        if extra != 0
+        {
+            let _ = syscall::cap_delete(extra);
+        }
+    }
+    let reject = |code: u64| -> u64 {
+        if delivered_cap != 0
+        {
+            let _ = syscall::cap_delete(delivered_cap);
+        }
+        code
+    };
+
     if msg.word(0) != u64::from(ipc::SVCMGR_LABELS_VERSION)
     {
-        return ipc::svcmgr_errors::LABEL_VERSION_MISMATCH;
+        return reject(ipc::svcmgr_errors::LABEL_VERSION_MISMATCH);
     }
+
+    let name_len = msg.word(1) as usize;
     if name_len == 0 || name_len > 32
     {
-        return ipc::svcmgr_errors::INVALID_NAME;
+        return reject(ipc::svcmgr_errors::INVALID_NAME);
     }
-    if vfs_path_len > ipc::MAX_PATH_LEN
+
+    if *pending_count >= MAX_PENDING_REGISTRATIONS
     {
-        return ipc::svcmgr_errors::INVALID_NAME;
-    }
-    if *service_count >= MAX_SERVICES
-    {
-        return ipc::svcmgr_errors::TABLE_FULL;
+        return reject(ipc::svcmgr_errors::TABLE_FULL);
     }
 
-    let restart_policy = msg.word(1) as u8;
-    let criticality = msg.word(2) as u8;
-
-    let name = read_name_from_msg(msg, name_len);
-
-    // Optional bundle-cap name, tail-packed after the service name words.
-    // word 0 = SVCMGR_LABELS_VERSION; restart_policy/criticality at words
-    // 1 and 2; name starts at word 3.
-    let name_words = name_len.div_ceil(8);
-    let bundle_name_len_word = 3 + name_words;
-    let bundle_name_len = msg.word(bundle_name_len_word) as usize;
-    let bundle_name_words = bundle_name_len.div_ceil(8);
-
-    // VFS path (when present) is tail-packed after the bundle-name tail.
-    let vfs_path_word = bundle_name_len_word + 1 + bundle_name_words;
-    let vfs_loaded = vfs_path_len > 0;
-
-    // Namespace-policy descriptor: one packed word at the tail, plus
-    // optional subtree-path bytes when kind == NS_POLICY_SUBTREE.
-    let vfs_path_words = vfs_path_len.div_ceil(8);
-    let ns_policy_word = vfs_path_word + vfs_path_words;
-    let ns_packed = msg.word(ns_policy_word);
-    let ns_policy_kind = (ns_packed & 0xFF) as u8;
-    let ns_subtree_path_len = ((ns_packed >> 16) & 0xFFFF) as usize;
-    let ns_subtree_rights = (ns_packed >> 32) as u32;
-    if !matches!(
-        ns_policy_kind,
-        ipc::svcmgr_labels::NS_POLICY_UNIVERSAL
-            | ipc::svcmgr_labels::NS_POLICY_NONE
-            | ipc::svcmgr_labels::NS_POLICY_SUBTREE,
-    )
-    {
-        return ipc::svcmgr_errors::INVALID_NAME;
-    }
-    if ns_subtree_path_len > ipc::MAX_PATH_LEN
-    {
-        return ipc::svcmgr_errors::INVALID_NAME;
-    }
-    if ns_policy_kind != ipc::svcmgr_labels::NS_POLICY_SUBTREE && ns_subtree_path_len > 0
-    {
-        return ipc::svcmgr_errors::INVALID_NAME;
-    }
-    if ns_policy_kind == ipc::svcmgr_labels::NS_POLICY_SUBTREE && ns_subtree_path_len == 0
-    {
-        return ipc::svcmgr_errors::INVALID_NAME;
-    }
-
-    let recv_caps = msg.caps();
-    let cap_count = recv_caps.len();
-
-    if cap_count < 1
+    if delivered_cap == 0
     {
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
 
-    let thread_cap = recv_caps[0];
-    if thread_cap == 0
-    {
-        return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
-    }
+    // delivered_cap transfers into PendingRegistration from here.
+    let mut name = [0u8; 32];
+    read_packed_bytes(msg, 2, name_len, &mut name);
 
-    let (module_cap, bundle_cap_idx) = if vfs_loaded
-    {
-        (0u32, 1usize)
-    }
-    else
-    {
-        if cap_count < 2 || recv_caps[1] == 0
-        {
-            return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
-        }
-        (recv_caps[1], 2usize)
-    };
-
-    let idx = *service_count;
-    if bind_thread_to_deaths_eq(thread_cap, deaths_eq, idx as u32).is_err()
-    {
-        return ipc::svcmgr_errors::EVENT_QUEUE_FAILED;
-    }
-
-    let mut vfs_path_buf = [0u8; ipc::MAX_PATH_LEN];
-    if vfs_loaded
-    {
-        read_path_bytes(msg, vfs_path_word, vfs_path_len, &mut vfs_path_buf);
-    }
-
-    let mut ns_subtree_path_buf = [0u8; ipc::MAX_PATH_LEN];
-    if ns_subtree_path_len > 0
-    {
-        read_path_bytes(
-            msg,
-            ns_policy_word + 1,
-            ns_subtree_path_len,
-            &mut ns_subtree_path_buf,
-        );
-    }
-
-    services[idx] = ServiceEntry {
+    let idx = *pending_count;
+    pending[idx] = PendingRegistration {
         name,
         name_len: name_len as u8,
-        thread_cap,
-        module_cap,
-        vfs_path: vfs_path_buf,
-        vfs_path_len: vfs_path_len as u8,
-        bundle: [registry::Entry {
-            name: [0; registry::NAME_MAX],
-            name_len: 0,
-            cap: 0,
-        }; MAX_BUNDLE_CAPS],
-        bundle_count: 0,
-        restart_policy,
-        criticality,
-        restart_count: 0,
-        active: true,
-        bootstrap_token: 0,
-        process_handle: 0,
-        ns_policy_kind,
-        ns_subtree_path_len: ns_subtree_path_len as u8,
-        ns_subtree_path: ns_subtree_path_buf,
-        ns_subtree_rights,
+        thread_cap: delivered_cap,
+        consumed: false,
     };
+    *pending_count += 1;
 
-    // If a bundle cap was sent alongside, stash it in the first bundle slot.
-    if cap_count > bundle_cap_idx
-        && recv_caps[bundle_cap_idx] != 0
-        && bundle_name_len > 0
-        && bundle_name_len <= registry::NAME_MAX
-    {
-        let bundle_name = read_tail_name_from_msg(msg, bundle_name_len_word + 1, bundle_name_len);
-        let entry = &mut services[idx].bundle[0];
-        entry.name[..bundle_name_len].copy_from_slice(&bundle_name[..bundle_name_len]);
-        entry.name_len = bundle_name_len as u8;
-        entry.cap = recv_caps[bundle_cap_idx];
-        services[idx].bundle_count = 1;
-    }
-
-    *service_count += 1;
-
-    std::os::seraph::log!(
-        "registered service: {} (bundle caps={})",
-        services[idx].name_str(),
-        u64::from(services[idx].bundle_count)
-    );
+    std::os::seraph::log!("registered: {}", pending[idx].name_str());
 
     ipc::svcmgr_errors::SUCCESS
 }
@@ -236,70 +141,27 @@ fn read_tail_name_from_msg(
 ) -> [u8; registry::NAME_MAX]
 {
     let mut out = [0u8; registry::NAME_MAX];
-    let words = name_len.div_ceil(8);
-    for w in 0..words
-    {
-        let word = msg.word(first_word + w);
-        for b in 0..8
-        {
-            let idx = w * 8 + b;
-            if idx < name_len && idx < registry::NAME_MAX
-            {
-                out[idx] = (word >> (b * 8)) as u8;
-            }
-        }
-    }
+    read_packed_bytes(msg, first_word, name_len, &mut out);
     out
 }
 
-/// Unpack `path_len` bytes from IPC data words starting at `first_word`
-/// into `out`. Caller must ensure `path_len <= out.len()`.
-fn read_path_bytes(msg: &IpcMessage, first_word: usize, path_len: usize, out: &mut [u8])
+/// Unpack `byte_len` bytes from IPC data words starting at `first_word`
+/// into `out`. Caller must ensure `byte_len <= out.len()`.
+fn read_packed_bytes(msg: &IpcMessage, first_word: usize, byte_len: usize, out: &mut [u8])
 {
-    let words = path_len.div_ceil(8);
+    let words = byte_len.div_ceil(8);
     for w in 0..words
     {
         let word = msg.word(first_word + w);
         for b in 0..8
         {
             let idx = w * 8 + b;
-            if idx < path_len && idx < out.len()
+            if idx < byte_len && idx < out.len()
             {
                 out[idx] = (word >> (b * 8)) as u8;
             }
         }
     }
-}
-
-/// Read a service name from message data words starting at offset 2.
-fn read_name_from_msg(msg: &IpcMessage, name_len: usize) -> [u8; 32]
-{
-    let mut name = [0u8; 32];
-    let name_words = name_len.div_ceil(8);
-    for w in 0..name_words
-    {
-        let word = msg.word(3 + w);
-        for b in 0..8
-        {
-            let idx = w * 8 + b;
-            if idx < name_len
-            {
-                name[idx] = (word >> (b * 8)) as u8;
-            }
-        }
-    }
-    name
-}
-
-/// Bind a service's main thread to the shared death-notification queue,
-/// using the service's table index as the correlator. The correlator is
-/// recovered from the high 32 bits of the death payload to route the
-/// event back to its `ServiceEntry`.
-fn bind_thread_to_deaths_eq(thread_cap: u32, deaths_eq: u32, correlator: u32) -> Result<(), ()>
-{
-    syscall::thread_bind_notification(thread_cap, deaths_eq, correlator).map_err(|_| {
-        std::os::seraph::log!("failed to bind death notification");
-    })
 }
 
 // ── Halt ───────────────────────────────────────────────────────────────────
@@ -392,7 +254,8 @@ fn main() -> !
     let mut state = SvcmgrState {
         services: [const { ServiceEntry::empty() }; MAX_SERVICES],
         service_count: 0,
-        handover_complete: false,
+        pending: [const { PendingRegistration::empty() }; MAX_PENDING_REGISTRATIONS],
+        pending_count: 0,
         registry: registry::Registry::new(),
     };
 
@@ -406,13 +269,23 @@ const WS_TOKEN_SERVICE: u64 = 0;
 /// `WaitSet` token for svcmgr's shared death event queue.
 const WS_TOKEN_DEATHS: u64 = 1;
 
-/// Monitored service table, global discovery registry, and handover flag.
-/// Held across the event loop for the lifetime of the process.
+/// Monitored service table, pending-registration table, discovery
+/// registry, and handover flag. Held across the event loop for the
+/// lifetime of the process.
+///
+/// `pending` is populated by [`handle_register`] as init announces
+/// each running service it spawned during Phase 3. On
+/// `HANDOVER_COMPLETE` [`definitions::reconcile::reconcile_and_launch`]
+/// pairs each entry with a `.svc` recipe, binds death-notification,
+/// and populates `services`. After reconciliation `pending` is
+/// effectively read-only — the unconsumed entries persist as logged
+/// configuration errors but are not re-used.
 pub struct SvcmgrState
 {
     pub services: [ServiceEntry; MAX_SERVICES],
     pub service_count: usize,
-    pub handover_complete: bool,
+    pub pending: [PendingRegistration; MAX_PENDING_REGISTRATIONS],
+    pub pending_count: usize,
     pub registry: registry::Registry<REGISTRY_CAPACITY>,
 }
 
@@ -444,7 +317,7 @@ fn event_loop(
 
         match token
         {
-            WS_TOKEN_SERVICE => dispatch_ipc(caps.service_ep, ipc_buf, state, deaths_eq),
+            WS_TOKEN_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx),
             WS_TOKEN_DEATHS => dispatch_deaths(deaths_eq, state, &restart_ctx),
             _ => std::os::seraph::log!("unexpected wait-set token"),
         }
@@ -452,9 +325,12 @@ fn event_loop(
 }
 
 /// Handle an IPC message on the service endpoint (registration, handover,
-/// or discovery-registry publish/query).
-fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, deaths_eq: u32)
+/// or discovery-registry publish/query). `ctx` carries the procmgr /
+/// bootstrap / deaths-EQ state the `HANDOVER_COMPLETE` →
+/// `reconcile_and_launch` path needs to spawn `.svc`-defined services.
+fn dispatch_ipc(service_ep: u32, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
+    let ipc_buf = ctx.ipc_buf;
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(msg) = (unsafe { ipc::ipc_recv(service_ep, ipc_buf) })
     else
@@ -467,25 +343,33 @@ fn dispatch_ipc(service_ep: u32, ipc_buf: *mut u64, state: &mut SvcmgrState, dea
     {
         svcmgr_labels::REGISTER_SERVICE =>
         {
-            let result = handle_register(
-                &msg,
-                &mut state.services,
-                &mut state.service_count,
-                deaths_eq,
-            );
+            let result = handle_register(&msg, &mut state.pending, &mut state.pending_count);
             let reply = IpcMessage::new(result);
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         }
         svcmgr_labels::HANDOVER_COMPLETE =>
         {
-            state.handover_complete = true;
+            // Reply BEFORE reconciliation: init's call returns and it
+            // proceeds to teardown / thread_exit; svcmgr then runs the
+            // (potentially slow) scan + launch path without holding
+            // init blocked on the IPC reply path.
             let reply = IpcMessage::new(ipc::svcmgr_errors::SUCCESS);
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            std::os::seraph::log!("handover complete; scanning services.d/");
+            definitions::reconcile::reconcile_and_launch(
+                &mut state.pending,
+                state.pending_count,
+                &mut state.services,
+                &mut state.service_count,
+                ctx.deaths_eq,
+                ctx,
+                &mut state.registry,
+            );
             std::os::seraph::log!(
-                "handover complete, monitoring services: {:#018x}",
-                state.service_count as u64
+                "monitoring {} service(s) after reconciliation",
+                state.service_count
             );
         }
         svcmgr_labels::PUBLISH_ENDPOINT =>
@@ -516,26 +400,77 @@ fn handle_publish_endpoint(
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
 ) -> u64
 {
+    // IPC delivers caps into svcmgr's CSpace before dispatch — every
+    // reject path must release the delivered value cap, otherwise a
+    // hostile or buggy publisher can leak a cap per call. The wire
+    // only carries one cap; release every trailing slot the caller
+    // may have delivered defensively.
+    let recv_caps = msg.caps();
+    let delivered_cap = recv_caps.first().copied().unwrap_or(0);
+    for &extra in recv_caps.iter().skip(1)
+    {
+        if extra != 0
+        {
+            let _ = syscall::cap_delete(extra);
+        }
+    }
+    let reject = |code: u64| -> u64 {
+        if delivered_cap != 0
+        {
+            let _ = syscall::cap_delete(delivered_cap);
+        }
+        code
+    };
+
     if msg.token & svcmgr_labels::PUBLISH_AUTHORITY == 0
     {
-        return ipc::svcmgr_errors::UNAUTHORIZED;
+        return reject(ipc::svcmgr_errors::UNAUTHORIZED);
     }
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
     if name_len == 0 || name_len > registry::NAME_MAX
     {
-        return ipc::svcmgr_errors::INVALID_NAME;
+        return reject(ipc::svcmgr_errors::INVALID_NAME);
     }
-    let recv_caps = msg.caps();
-    if recv_caps.is_empty() || recv_caps[0] == 0
+    if delivered_cap == 0
     {
         return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
     }
     let name = read_tail_name_from_msg(msg, 0, name_len);
-    if registry.publish(&name[..name_len], recv_caps[0]).is_err()
+    if registry.publish(&name[..name_len], delivered_cap).is_err()
     {
-        return ipc::svcmgr_errors::REGISTER_REJECTED;
+        return reject(ipc::svcmgr_errors::REGISTER_REJECTED);
     }
     ipc::svcmgr_errors::SUCCESS
+}
+
+/// Look up `name` in the discovery registry and derive a fresh
+/// `RIGHTS_SEND` cap on the published endpoint. Evicts the entry on
+/// `cap_derive` failure (publisher's endpoint is gone), so subsequent
+/// queries see `UNKNOWN_NAME` instead of looping on
+/// `INSUFFICIENT_CAPS`. Returns a `svcmgr_errors::*` code on miss or
+/// derivation failure.
+///
+/// Shared by `QUERY_ENDPOINT` (IPC) and the post-handover launch path
+/// (resolves each `.svc` `seed = ...` name into a cap to inject into
+/// the child's bootstrap round).
+pub(crate) fn registry_lookup_derived(
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    name: &[u8],
+) -> Result<u32, u64>
+{
+    let Some(cap) = registry.lookup(name)
+    else
+    {
+        return Err(ipc::svcmgr_errors::UNKNOWN_NAME);
+    };
+    let Ok(derived) = syscall::cap_derive(cap, syscall::RIGHTS_SEND)
+    else
+    {
+        let _ = registry.remove(name);
+        let _ = syscall::cap_delete(cap);
+        return Err(ipc::svcmgr_errors::INSUFFICIENT_CAPS);
+    };
+    Ok(derived)
 }
 
 /// Handle `QUERY_ENDPOINT`: look up a name in the discovery registry and
@@ -555,39 +490,29 @@ fn handle_query_endpoint(
         return;
     }
     let name = read_tail_name_from_msg(msg, 0, name_len);
-    let Some(cap) = registry.lookup(&name[..name_len])
-    else
+    match registry_lookup_derived(registry, &name[..name_len])
     {
-        let reply = IpcMessage::new(ipc::svcmgr_errors::UNKNOWN_NAME);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-    let Ok(derived) = syscall::cap_derive(cap, syscall::RIGHTS_SEND)
-    else
-    {
-        // cap_derive failures on a stored entry are terminal — the
-        // publisher's endpoint object is gone (e.g. service died and
-        // procmgr reaped the source). Evict the dead entry so future
-        // queries get UNKNOWN_NAME instead of looping on INSUFFICIENT_CAPS.
-        let _ = registry.remove(&name[..name_len]);
-        let _ = syscall::cap_delete(cap);
-        let reply = IpcMessage::new(ipc::svcmgr_errors::INSUFFICIENT_CAPS);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
-    };
-    let reply = IpcMessage::builder(ipc::svcmgr_errors::SUCCESS)
-        .cap(derived)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let send_result = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-    if send_result.is_err()
-    {
-        // ipc_reply did not transfer the cap out of svcmgr's CSpace;
-        // delete the freshly-derived slot to avoid cumulative leakage
-        // over svcmgr's lifetime (one slot per failed reply).
-        let _ = syscall::cap_delete(derived);
+        Ok(derived) =>
+        {
+            let reply = IpcMessage::builder(ipc::svcmgr_errors::SUCCESS)
+                .cap(derived)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            let send_result = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+            if send_result.is_err()
+            {
+                // ipc_reply did not transfer the cap out of svcmgr's
+                // CSpace; delete the freshly-derived slot to avoid
+                // cumulative leakage over svcmgr's lifetime.
+                let _ = syscall::cap_delete(derived);
+            }
+        }
+        Err(code) =>
+        {
+            let reply = IpcMessage::new(code);
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        }
     }
 }
 
@@ -620,6 +545,54 @@ fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::Resta
             continue;
         }
 
-        restart::handle_death(&mut state.services[idx], exit_reason, ctx, correlator);
+        let outcome = restart::handle_death(&mut state.services[idx], exit_reason, ctx, correlator);
+        if matches!(outcome, restart::DeathOutcome::Unrecoverable)
+        {
+            initiate_graceful_shutdown(state, ctx, idx);
+        }
     }
+}
+
+/// Resolve `published_names::PWRMGR_SHUTDOWN` from the discovery
+/// registry and issue `pwrmgr_labels::SHUTDOWN` to power the system
+/// off cleanly. Called from [`dispatch_deaths`] when a service with
+/// `critical = high` dies unrecoverably.
+///
+/// Edge case: if the dying service IS pwrmgr, the shutdown source
+/// itself is gone; svcmgr logs the degraded state and returns.
+/// No fallback raw-shutdown path — same shape as today's lack of a
+/// recovery story for procmgr / memmgr death.
+fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx, dying_idx: usize)
+{
+    let name = state.services[dying_idx].name_str();
+    if name == "pwrmgr"
+    {
+        std::os::seraph::log!(
+            "critical service unrecoverable: pwrmgr; graceful shutdown impossible; \
+             system in degraded state"
+        );
+        return;
+    }
+
+    let shutdown_cap =
+        match registry_lookup_derived(&mut state.registry, ipc::published_names::PWRMGR_SHUTDOWN)
+        {
+            Ok(c) => c,
+            Err(code) =>
+            {
+                std::os::seraph::log!(
+                    "graceful shutdown: cannot resolve {} (code={code})",
+                    core::str::from_utf8(ipc::published_names::PWRMGR_SHUTDOWN).unwrap_or("?")
+                );
+                return;
+            }
+        };
+
+    let shutdown_msg = IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
+    // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(shutdown_cap, &shutdown_msg, ctx.ipc_buf) };
+    // On the success path pwrmgr powers off and this never returns.
+    // On a failure path we surface the cap leak rather than ignore it.
+    let _ = syscall::cap_delete(shutdown_cap);
+    std::os::seraph::log!("graceful shutdown: SHUTDOWN call returned (failure path)");
 }

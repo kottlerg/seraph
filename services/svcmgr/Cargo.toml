@@ -14,6 +14,7 @@ ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
 registry = { path = "../../shared/registry" }
+namespace-protocol = { path = "../../shared/namespace-protocol" }
 
 [lints]
 workspace = true

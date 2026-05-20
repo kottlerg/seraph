@@ -1,137 +1,215 @@
 # svcmgr IPC Interface
 
-IPC interface specification for svcmgr: service registration, handover
-protocol, and status queries.
+IPC interface specification for svcmgr: service registration (v3 wire),
+handover-driven reconciliation, and the discovery-registry publish /
+query surface.
 
 ---
 
 ## Endpoint
 
-svcmgr listens on a single IPC endpoint (the svcmgr service endpoint). Init
-holds the Send-side capability and uses it to register services during
-bootstrap. svcmgr holds the Receive-side capability and multiplexes it with
-death notification EventQueues via a WaitSet.
+svcmgr listens on a single IPC endpoint (the svcmgr service endpoint).
+Init holds the Send-side capability and uses it to register currently-
+running services and publish well-known caps during bootstrap. svcmgr
+holds the Receive-side capability and multiplexes it with the shared
+death-notification EventQueue via a WaitSet.
+
+A SEND on the same endpoint (without the [`PUBLISH_AUTHORITY`](#publish-authority)
+verb bit) is delivered to every process via
+`ProcessInfo.service_registry_cap` so userspace consumers can
+`QUERY_ENDPOINT` for published names.
 
 ---
 
 ## Messages
 
-All requests use `SYS_IPC_CALL` (synchronous call/reply). The message label
-field identifies the operation.
+All requests use `SYS_IPC_CALL` (synchronous call/reply). The message
+label field identifies the operation.
 
-### Label 1: `REGISTER_SERVICE`
+### Label 1: `REGISTER_SERVICE` (v3)
 
-Register a service for health monitoring and (optionally) automatic restart.
-Init sends one `REGISTER_SERVICE` per top-level service during bootstrap.
+Register a currently-running service for supervision.
 
-Drivers spawned by devmgr and filesystem processes spawned by vfsd are NOT
-registered with svcmgr — their respective parents supervise them.
+Post-#21 the recipe (binary, argv, env, restart policy, criticality,
+namespace shape, seed names) lives on disk at
+`/etc/svcmgr/services.d/<name>.svc`. This message conveys only what
+cannot be on disk: which named recipe the running process implements,
+and the thread cap svcmgr binds death-notification on at
+reconciliation time.
 
 **Request:**
 
 | Field | Value |
 |---|---|
-| label | `1 \| (name_len << 16)` |
-| data[0] | Restart policy: 0 = Always, 1 = OnFailure, 2 = Never |
-| data[1] | Criticality: 0 = Fatal, 1 = Normal |
-| data[2..] | Service name bytes packed into u64 words (up to 32 bytes) |
-| cap[0] | Thread capability (Control right) for death notification binding |
-| cap[1] | Module Frame capability for restart (0 if VFS-loaded or no restart) |
-| cap[2] | Log endpoint Send capability (for restart cap injection) |
+| label | `1` |
+| word 0 | `SVCMGR_LABELS_VERSION` (currently `3`) handshake |
+| word 1 | `name_len` (byte length of the service name) |
+| words 2.. | service name bytes packed into `u64` words (up to 32 bytes) |
+| caps[0] | Thread capability (Control right) for death-notification binding |
 
-The Thread cap is used to bind a death notification EventQueue. The module
-cap and log endpoint are stored as the service's restart recipe — svcmgr
-replays them on restart.
+**Reply:**
 
-For Fatal-criticality services, cap[1] and cap[2] may be omitted (no restart
-recipe needed).
-
-**Reply (success):**
-
-| Field | Value |
+| label value | Meaning |
 |---|---|
-| label | 0 (success) |
+| `0` (`SUCCESS`) | Entry parked in svcmgr's pending-registration table |
+| `LABEL_VERSION_MISMATCH` | `word 0` does not equal svcmgr's `SVCMGR_LABELS_VERSION` |
+| `INVALID_NAME` | `name_len` is 0 or exceeds 32 |
+| `TABLE_FULL` | Pending table is full |
+| `INSUFFICIENT_CAPS` | `caps[0]` missing or zero |
 
-**Reply (error):**
-
-| Field | Value |
-|---|---|
-| label | Nonzero error code |
-
-**Error codes:**
-
-| Code | Name | Meaning |
-|---|---|---|
-| 1 | `TableFull` | Service table is full (max 16 entries) |
-| 2 | `InvalidName` | Name length is 0 or exceeds 32 bytes |
+At register time svcmgr does **not** bind death-notification — the
+matching `.svc` definition may not yet exist; reconciliation happens
+on [`HANDOVER_COMPLETE`](#label-2-handover_complete).
 
 ### Label 2: `HANDOVER_COMPLETE`
 
-Signals that init has finished registering all services and is about to exit.
-svcmgr transitions from registration phase to monitoring phase.
+Signals that init has finished registering services and publishing
+well-known caps. svcmgr replies `SUCCESS` immediately (so init can
+proceed to teardown), then runs
+[`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
+
+1. Scan `/etc/svcmgr/services.d/`, parse each `.svc` into a
+   [`Definition`](../src/definitions/mod.rs).
+2. Reconcile against the pending-registration table:
+   * **registered AND defined** — bind death-notification, record a
+     `ServiceEntry` with the parsed recipe.
+   * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
+   * **registered without definition** — log `registered without
+     definition: <name>; refusing to bind`.
+3. After reconciliation the supervision loop continues unchanged.
+
+See [service-definitions.md](service-definitions.md) for the
+authoritative reconciliation table.
 
 **Request:**
 
 | Field | Value |
 |---|---|
-| label | 2 |
+| label | `2` |
 
-**Reply (success):**
+**Reply:**
+
+| label value | Meaning |
+|---|---|
+| `0` (`SUCCESS`) | Always returned — reconciliation runs after the reply. |
+
+### Label 3: `PUBLISH_ENDPOINT`
+
+Insert a `name → cap` mapping into svcmgr's discovery registry.
+
+**Request:**
 
 | Field | Value |
 |---|---|
-| label | 0 (success) |
+| label | `3 \| (name_len << 16)` |
+| words 0.. | `name` bytes |
+| caps[0] | The endpoint the name resolves to (transferred to svcmgr). |
+| token | MUST carry [`PUBLISH_AUTHORITY`](#publish-authority); rejected with `UNAUTHORIZED` otherwise. |
 
-After this message, svcmgr enters its monitor loop and no longer accepts
-new registrations (future: dynamic registration may be added).
+**Reply:**
 
-### Label 3: `QUERY_STATUS`
+| label value | Meaning |
+|---|---|
+| `0` (`SUCCESS`) | Stored |
+| `UNAUTHORIZED` | Caller's token lacks `PUBLISH_AUTHORITY` |
+| `INVALID_NAME` | `name_len` is 0 or exceeds `registry::NAME_MAX` |
+| `INSUFFICIENT_CAPS` | `caps[0]` missing or zero |
+| `REGISTER_REJECTED` | Registry is full or name already registered |
 
-Deferred. Not implemented.
+### Label 4: `QUERY_ENDPOINT`
+
+Look up a name in the discovery registry; reply transfers a
+freshly-derived `RIGHTS_SEND` cap on the published endpoint.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | `4 \| (name_len << 16)` |
+| words 0.. | `name` bytes |
+
+**Reply:**
+
+| label value | Caps | Meaning |
+|---|---|---|
+| `0` (`SUCCESS`) | `[derived_send]` | Name resolved; cap transferred |
+| `UNKNOWN_NAME` | — | No mapping for `name` |
+| `INSUFFICIENT_CAPS` | — | Stored cap could not be derived (publisher gone); entry evicted |
+| `INVALID_NAME` | — | `name_len` is 0 or exceeds `registry::NAME_MAX` |
 
 ---
 
-## Death Notification
+## Publish authority
 
-For each registered service, svcmgr:
+`svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
+caller's cap token) gating `PUBLISH_ENDPOINT`. Init mints
+`PUBLISH_AUTHORITY`-tokened SENDs on svcmgr's service endpoint locally
+from the un-tokened source it owns; the SEND distributed to every
+process via `ProcessInfo.service_registry_cap` carries a per-process
+token *without* the bit, so it is accepted for `QUERY_ENDPOINT` only.
 
-1. Creates an EventQueue capability (`SYS_CAP_CREATE_EVENT_Q`, capacity 4).
-2. Binds the EventQueue to the service's thread via
-   `SYS_THREAD_BIND_NOTIFICATION(thread_cap, eventq_cap)`.
-3. Adds the EventQueue to a WaitSet with a token encoding the service index.
+Cap derivation for the publish cap MUST use `RIGHTS_SEND_GRANT`, not
+`RIGHTS_SEND`: `PUBLISH_ENDPOINT` carries the value cap in the
+message body, and the IPC kernel requires the GRANT bit on the
+caller's send-cap to transfer caps.
 
-When a thread exits (clean or fault), the kernel posts `exit_reason` to the
-bound EventQueue:
-
-- `0` = clean exit (`SYS_THREAD_EXIT`)
-- `1–255` = fault (exception vector + 1 on x86-64, scause + 1 on RISC-V)
-
-svcmgr's WaitSet wakes, identifies the service, and applies restart policy.
+See [`docs/capability-model.md`](../../../docs/capability-model.md)
+"verb-bit authority pattern" for the rationale and parallel use in
+`pwrmgr_labels::SHUTDOWN_AUTHORITY`.
 
 ---
 
-## Restart Policy
+## Death notification
 
-| Policy | Behavior |
-|--------|----------|
-| Always (0) | Restart unconditionally on any exit |
-| OnFailure (1) | Restart only if exit_reason is nonzero (fault) |
-| Never (2) | Do not restart; log only |
+svcmgr maintains one shared EventQueue (`deaths_eq`). At
+reconciliation time, every supervised service has its main thread
+bound to `deaths_eq` with `correlator = service_table_index`. The
+WaitSet has two members: the service endpoint (token 0) and the
+deaths queue (token 1).
 
-Restart attempts are counted per service. After 5 consecutive restarts, the
-service is marked **degraded** and not restarted automatically.
+When a thread exits (clean or fault), the kernel posts
+`(correlator << 32) | exit_reason` to `deaths_eq`. svcmgr drains the
+queue and routes each payload to its `ServiceEntry` via the
+correlator, then dispatches through
+[`restart::handle_death`](../src/restart.rs).
+
+Exit reason encoding:
+
+| Value | Meaning |
+|---|---|
+| `0` | clean exit (`SYS_THREAD_EXIT`) |
+| `EXIT_FAULT_BASE..` | fault (exception vector / scause + base) |
+
+---
+
+## Restart policy
+
+See [service-definitions.md](service-definitions.md#restart) for the
+`.svc` representation. svcmgr's in-memory shape:
+
+| Policy | Behaviour |
+|---|---|
+| `POLICY_NEVER` | Never restart |
+| `POLICY_ON_FAILURE` | Restart only when `exit_reason >= EXIT_FAULT_BASE` |
+| `POLICY_ALWAYS` | Restart on every exit |
+
+Restart attempts are counted per service. After `MAX_RESTARTS`
+consecutive restarts the service is marked degraded and not
+restarted automatically — see
+[restart-protocol.md](restart-protocol.md).
 
 ---
 
 ## Criticality
 
-| Level | Behavior on crash |
-|-------|------------------|
-| Fatal (0) | Log the crash, halt the system (graceful shutdown deferred) |
-| Normal (1) | Apply restart policy |
+See [service-definitions.md](service-definitions.md#critical) for the
+`.svc` representation. svcmgr's in-memory shape:
 
-Fatal services include procmgr, devmgr, and vfsd. Their crash indicates a
-system-level failure that cannot be recovered by simple restart.
+| Level | Behaviour on death |
+|---|---|
+| `CRITICALITY_LOW` | Logged; service marked inactive |
+| `CRITICALITY_NORMAL` | Apply restart policy; degrade on budget exhaustion |
+| `CRITICALITY_HIGH` | Apply restart policy; on unrecoverable death, initiate graceful shutdown via `published_names::PWRMGR_SHUTDOWN` |
 
 ---
 
@@ -140,8 +218,9 @@ system-level failure that cannot be recovered by simple restart.
 | Document | Content |
 |---|---|
 | [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, EventQueue semantics |
-| [docs/capability-model.md](../../../docs/capability-model.md) | Thread cap rights, EventQueue cap rights |
-| [restart-protocol.md](restart-protocol.md) | Restart sequencing and cap re-delegation |
+| [docs/capability-model.md](../../../docs/capability-model.md) | Verb-bit authority, cap rights |
+| [service-definitions.md](service-definitions.md) | `.svc` recipe format and reconciliation |
+| [restart-protocol.md](restart-protocol.md) | Restart sequencing, shared spawn primitives |
 
 ---
 

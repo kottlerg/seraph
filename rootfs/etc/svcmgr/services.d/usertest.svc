@@ -1,0 +1,14 @@
+# /bin/usertest — services-tier OS test harness.
+#
+# One-shot: exits cleanly on completion; svcmgr never restarts it.
+# Seeds resolve through svcmgr's discovery registry: rootfs.root is
+# the FS-driver-agnostic root-mount cap; pwrmgr.shutdown/pwrmgr.deny
+# are the SHUTDOWN_AUTHORITY-tokened SEND and its no-auth twin.
+binary    = /bin/usertest
+argv      = usertest run
+env       = SERAPH_TEST=1 SERAPH_MODE=boot
+restart   = never
+critical  = low
+namespace = universal
+cwd       = /srv
+seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny

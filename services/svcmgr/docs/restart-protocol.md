@@ -1,161 +1,176 @@
 # Restart Protocol
 
-Restart protocol details: crash detection via thread death notifications,
-restart sequencing, capability re-delegation, and criticality handling.
+Crash detection via thread death notifications, restart sequencing,
+shared spawn primitives, and criticality handling.
 
 ---
 
-## Death Detection
+## Death detection
 
-svcmgr uses the kernel's `SYS_THREAD_BIND_NOTIFICATION` syscall to bind an
-EventQueue to each monitored service's thread. When the thread exits — either
-cleanly via `SYS_THREAD_EXIT` or due to an unhandled fault (GPF, page fault,
-etc.) — the kernel posts the exit reason to the bound EventQueue.
+svcmgr binds every supervised service's main thread to one shared
+EventQueue (`deaths_eq`) via `SYS_THREAD_BIND_NOTIFICATION`, using the
+service's table index as the correlator. When a thread exits — either
+cleanly via `SYS_THREAD_EXIT` or due to an unhandled fault — the
+kernel posts `(correlator << 32) | exit_reason` to `deaths_eq`.
 
-svcmgr multiplexes all EventQueues (plus its own service endpoint for
-registration IPC) into a single WaitSet. The monitor loop blocks on
-`SYS_WAIT_SET_WAIT` and dispatches based on the returned token.
+The WaitSet has two members: the service endpoint (token 0) and the
+deaths queue (token 1). On wakeup svcmgr drains the queue and routes
+each payload to its `ServiceEntry` via the correlator, then dispatches
+through [`restart::handle_death`](../src/restart.rs).
 
 Exit reason encoding:
 
 | Value | Meaning |
-|-------|---------|
-| 0 | Clean exit (thread called `SYS_THREAD_EXIT`) |
-| 1–255 | Fault: exception vector + 1 (x86-64) or scause + 1 (RISC-V) |
+|---|---|
+| `0` | Clean exit (thread called `SYS_THREAD_EXIT`) |
+| `EXIT_FAULT_BASE..` | Fault (exception vector / scause + base) |
 
 ---
 
-## Criticality Check
+## Decision tree
 
-On detecting a service death, svcmgr first checks the service's criticality:
+[`restart::handle_death`](../src/restart.rs) returns a
+[`DeathOutcome`](../src/restart.rs) the dispatch loop routes:
 
-- **Fatal**: The service is essential and cannot be safely restarted. svcmgr
-  logs the crash with the service name and exit reason, then halts the system.
-  Graceful shutdown (notifying other services, flushing state) is deferred to
-  a future implementation.
+1. **`critical = low`** → log `low-criticality death; informational`,
+   mark service inactive, return `Degraded`.
+2. **`should_restart(svc, exit_reason)`** evaluates the restart
+   policy:
+   * `POLICY_NEVER` → no restart.
+   * `POLICY_ON_FAILURE` → restart iff `exit_reason >= EXIT_FAULT_BASE`.
+   * `POLICY_ALWAYS` → restart unconditionally.
+   * The restart-count budget (`MAX_RESTARTS`, currently `1`) is
+     enforced here; an exhausted budget reports "max restarts reached,
+     marking degraded" and returns false.
+   * A missing restart source (`module_cap == 0` AND
+     `vfs_path_len == 0`) reports "no restart source" and returns false.
+3. **Restart not permitted** → mark service inactive; route to
+   `unrecoverable_or_degraded`:
+   * `critical = high` → log `critical service unrecoverable:
+     <name>; initiating graceful shutdown`, return `Unrecoverable`.
+   * Otherwise → return `Degraded`.
+4. **Restart permitted** → call `restart_process`:
+   * If `process_handle != 0` (svcmgr-launched services), send
+     `procmgr_labels::DESTROY_PROCESS` to reclaim the previous
+     instance's kernel objects. Init-spawned services start with
+     `process_handle == 0`, so the first death cannot destroy;
+     subsequent deaths can.
+   * Spawn a fresh instance via the shared primitive
+     [`walk_and_create_from_file`](#shared-spawn-primitives) (VFS
+     path) or `CREATE_PROCESS` with a fresh module-cap derivation.
+   * Re-apply the per-service namespace policy via
+     [`apply_namespace_policy`](#shared-spawn-primitives).
+   * Serve the restart bootstrap round (empty caps today; future
+     work re-injects per-service seeds).
+   * Rebind death-notification on the new thread cap using the same
+     correlator so subsequent crashes route back to the same entry.
+   * On success: increment `restart_count`, return `Restarted`.
+   * On failure: route through `unrecoverable_or_degraded`.
 
-- **Normal**: The service can be restarted. svcmgr proceeds to the restart
-  policy check.
-
----
-
-## Restart Policy Check
-
-For Normal-criticality services, svcmgr checks the restart policy:
-
-- **Always**: Restart unconditionally.
-- **OnFailure**: Restart only if exit_reason != 0 (the thread faulted). If the
-  thread exited cleanly (exit_reason == 0), do not restart.
-- **Never**: Do not restart. Log the event and mark the service as inactive.
-
----
-
-## Restart Sequencing
-
-When a restart is permitted:
-
-1. **Check restart count.** If the service has been restarted 5 times (the
-   maximum), mark it as **degraded** and do not restart. Log a warning.
-
-2. **Create new process.** Branch on the recorded restart source:
-   - Module-loaded service (`module_cap != 0`): send `CREATE_PROCESS` to
-     procmgr with a fresh derivation of the stored module Frame capability.
-   - VFS-loaded service (`vfs_path_len > 0`): walk svcmgr's own
-     `root_dir_cap` (delivered at svcmgr's bootstrap via
-     `procmgr_labels::CONFIGURE_NAMESPACE`) to the stored path → file
-     cap, then send `CREATE_FROM_FILE` to procmgr. svcmgr's root is
-     itself attenuated by init to the `/bin` subtree, so the stored
-     absolute path is stripped of its `/bin/` prefix before the walk
-     (e.g. registered path `/bin/crasher` walks as `crasher`); any
-     vfs path outside `/bin` fails closed. No file cap is persisted
-     across restarts; the walk re-runs on every restart so the latest
-     binary on disk is always loaded.
-
-   The two are mutually exclusive at registration time and surfaced via the
-   `vfs_path_len` field in the `REGISTER_SERVICE` label (bits [32..48]).
-
-   After the create reply, re-apply the per-service namespace policy
-   recorded at registration via `procmgr_labels::CONFIGURE_NAMESPACE`:
-
-   - `NS_POLICY_NONE` → skip the IPC entirely; the child's
-     `system_root_cap` stays zero (matches first-spawn shape).
-   - `NS_POLICY_UNIVERSAL` → `cap_copy` of svcmgr's own root and
-     deliver. Because svcmgr's own root is `/bin`-rooted under the
-     current init policy, this hands the child the same `/bin`
-     subtree; no registered service uses this variant today.
-   - `NS_POLICY_SUBTREE` → walk svcmgr's root for the stored
-     subtree path (also `/bin/`-prefix-stripped) with the stored
-     rights mask, deliver the resulting directory cap.
-
-   The descriptor lives on `ServiceEntry` and is bumped to the wire
-   by `REGISTER_SERVICE`; see [ipc-interface.md](ipc-interface.md)
-   and `shared/ipc/src/lib.rs::svcmgr_labels::REGISTER_SERVICE` for
-   the layout.
-
-3. **Inject capabilities.** Using the child CSpace cap returned by procmgr,
-   inject the stored restart recipe caps (e.g., log endpoint) into the new
-   process's CSpace. Write corresponding CapDescriptors into the ProcessInfo
-   page.
-
-4. **Start process.** Send `START_PROCESS` to procmgr.
-
-5. **Rebind death notification.** Create a new EventQueue, bind it to the new
-   thread via `SYS_THREAD_BIND_NOTIFICATION`, and replace the old EventQueue
-   in the WaitSet.
-
-6. **Increment restart count.** Update the service entry.
+`dispatch_deaths` reacts to `Unrecoverable` by calling
+`initiate_graceful_shutdown`, which resolves
+`ipc::published_names::PWRMGR_SHUTDOWN` from svcmgr's discovery
+registry and issues `pwrmgr_labels::SHUTDOWN`. Edge case: a
+`critical = high` pwrmgr death cannot trigger graceful shutdown
+(the shutdown source is itself gone); svcmgr logs the degraded
+state and returns.
 
 ---
 
-## Restart Recipe
+## Shared spawn primitives
 
-Each registered service stores a restart recipe: the set of capabilities and
-metadata needed to recreate the service. Init transfers these during
-`REGISTER_SERVICE`.
+First-launch ([`definitions::launch`](../src/definitions/launch.rs))
+and restart ([`restart::create_process`](../src/restart.rs)) share
+the same procmgr-side primitives so a service's spawn shape is
+identical across both code paths:
 
-For the initial implementation, the recipe consists of:
+* [`mint_child_creator`](../src/restart.rs) — allocate a fresh
+  bootstrap token + tokened SEND on svcmgr's `bootstrap_ep`.
+* [`walk_and_create_from_file`](../src/restart.rs) — walk svcmgr's
+  universal `root_dir_cap` for the binary path, then call
+  `procmgr_labels::CREATE_FROM_FILE` with optional argv / env blobs.
+  Restart-path callers pass `StartupBlobs::default()`; launch-path
+  callers pass the argv / env blobs built from the `.svc` recipe.
+* [`apply_namespace_policy`](../src/restart.rs) — `CONFIGURE_NAMESPACE`
+  for `NS_POLICY_NONE` / `_UNIVERSAL` / `_SUBTREE` against svcmgr's
+  universal root. Launch-path extends this locally with the optional
+  `cwd` walk (cwd is launch-only; restart does not preserve cwd
+  today).
+* [`start_process`](../src/restart.rs) — `procmgr_labels::START_PROCESS`.
 
-- One of the following restart sources (mutually exclusive):
-  - Module Frame capability (for `CREATE_PROCESS`), or
-  - VFS path bytes — svcmgr re-walks `root_dir_cap` to the path on
-    every restart and uses `CREATE_FROM_FILE`.
-- Log endpoint Send capability (injected into child CSpace)
-- Namespace-policy descriptor (`ns_policy_kind` + optional
-  `ns_subtree_path` + `ns_subtree_rights`) — svcmgr re-applies this
-  on every restart so attenuation survives a crash-restart cycle.
-
-Future services may require additional caps (procmgr endpoint, device
-endpoints, etc.), which can be added to the recipe as needed. The IPC cap
-slot limit (4 per message) bounds the recipe size for a single registration
-message; multi-message registration can be added if needed.
+The launch path is documented in
+[service-definitions.md](service-definitions.md#reconciliation); the
+single-source-of-truth principle means both paths walk the same
+`.svc` recipe on every spawn, so a binary update on disk is picked
+up by the next restart without code changes.
 
 ---
 
-## Supervision Hierarchy
+## Recipe storage
 
-svcmgr only supervises top-level services registered by init:
+svcmgr's `ServiceEntry` stores the parsed `.svc` recipe at
+reconciliation time:
 
-| Service | Criticality | Restart Policy | Source |
-|---------|-------------|---------------|--------|
-| procmgr | Fatal | Never | Module |
-| devmgr | Fatal | Never | Module |
-| vfsd | Fatal | Never | Module |
-| crasher (test) | Normal | Always | VFS (`/bin/crasher`) |
+| Field | Source |
+|---|---|
+| `name` / `name_len` | `<name>.svc` filename |
+| `vfs_path` / `vfs_path_len` | `binary = ...` |
+| `restart_policy` | `restart = never \| on_failure \| always` |
+| `criticality` | `critical = low \| normal \| high` |
+| `ns_policy_kind` / `ns_subtree_path` / `ns_subtree_rights` | `namespace = ...` |
+| `thread_cap` | v3 `REGISTER_SERVICE` cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
+| `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
+| `module_cap` | `0` (no module-loaded services in the post-#21 model) |
 
-Device drivers (virtio-blk, etc.) are supervised by devmgr. Filesystem
-drivers (fatfs, etc.) are supervised by vfsd. All supervisors use the same
-kernel primitive (`SYS_THREAD_BIND_NOTIFICATION` + EventQueue).
+argv / env / cwd / seed are not preserved on `ServiceEntry` today;
+restart respawns with empty surfaces and the
+`namespace`-recorded policy. Re-running the launch path on restart
+(reading the `.svc` file from disk) is the natural follow-up when a
+service requires those surfaces across crashes.
+
+---
+
+## Supervision hierarchy
+
+svcmgr only supervises top-level services. Drivers (cmos / virtio-rtc
+/ future block / net) are supervised by devmgr. Filesystem drivers
+(fatfs / future ext / btrfs) are supervised by vfsd. None of those
+flow through `REGISTER_SERVICE`.
+
+The set of services svcmgr currently supervises (per the shipped
+`.svc` files):
+
+| Service | Source | Restart | Critical |
+|---|---|---|---|
+| `usertest` | svcmgr-launched | `never` | `low` |
+| `crasher` | svcmgr-launched | `always` | `low` |
+| `memmgr` | init-registered (bind only) | `never` | `high` |
+| `procmgr` | init-registered (bind only) | `never` | `high` |
+| `devmgr` | init-registered (bind only) | `never` | `high` |
+| `vfsd` | init-registered (bind only) | `never` | `high` |
+| `logd` | init-registered (bind only) | `never` | `high` |
+| `timed` | init-registered (bind only) | `never` | `normal` |
+| `pwrmgr` | init-registered (bind only) | `never` | `high` |
+
+Restart paths for the bind-only set are aspirational today: most of
+them were spawned with arch-/firmware-authority caps that init holds
+and svcmgr cannot re-mint (memmgr/procmgr via raw `cap_create_*`
+syscalls; devmgr/vfsd/logd with one-shot authority handover; pwrmgr
+with `IoPortRange` / `SbiControl` / ACPI frames). When their
+`.svc` `restart` value moves off `never` in the future, the spawn
+path needs to gain access to those caps — either via a new
+init→svcmgr handover round, or by relocating the spawn entirely
+into svcmgr.
 
 ---
 
 ## procmgr Fallback
 
 If procmgr itself crashes, svcmgr cannot use procmgr IPC to restart it.
-svcmgr holds raw kernel capabilities (AddressSpace, CSpace, Thread creation
-syscalls) as a fallback to reconstruct procmgr from its boot module.
-
-This fallback is deferred to a future implementation. For now, procmgr is
-registered as Fatal — its crash halts the system.
+svcmgr holds raw kernel capabilities (AddressSpace, CSpace, Thread
+creation syscalls) as a documented future fallback to reconstruct
+procmgr from its boot module. Not implemented today; procmgr's death
+falls into the `CRITICALITY_HIGH` graceful-shutdown path.
 
 ---
 

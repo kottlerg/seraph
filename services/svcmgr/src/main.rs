@@ -75,9 +75,17 @@ fn handle_register(
     // IPC delivers caps into svcmgr's CSpace before dispatch — every
     // reject path must release the delivered thread cap, otherwise a
     // hostile or buggy registrar can leak a cap per request over
-    // svcmgr's lifetime.
+    // svcmgr's lifetime. The v3 wire only carries one cap; release
+    // every trailing slot the caller may have delivered defensively.
     let recv_caps = msg.caps();
     let delivered_cap = recv_caps.first().copied().unwrap_or(0);
+    for &extra in recv_caps.iter().skip(1)
+    {
+        if extra != 0
+        {
+            let _ = syscall::cap_delete(extra);
+        }
+    }
     let reject = |code: u64| -> u64 {
         if delivered_cap != 0
         {
@@ -394,9 +402,18 @@ fn handle_publish_endpoint(
 {
     // IPC delivers caps into svcmgr's CSpace before dispatch — every
     // reject path must release the delivered value cap, otherwise a
-    // hostile or buggy publisher can leak a cap per call.
+    // hostile or buggy publisher can leak a cap per call. The wire
+    // only carries one cap; release every trailing slot the caller
+    // may have delivered defensively.
     let recv_caps = msg.caps();
     let delivered_cap = recv_caps.first().copied().unwrap_or(0);
+    for &extra in recv_caps.iter().skip(1)
+    {
+        if extra != 0
+        {
+            let _ = syscall::cap_delete(extra);
+        }
+    }
     let reject = |code: u64| -> u64 {
         if delivered_cap != 0
         {

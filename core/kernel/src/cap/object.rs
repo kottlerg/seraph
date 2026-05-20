@@ -1395,7 +1395,7 @@ unsafe fn dealloc_object_one(
                     crate::arch::current::cpu::restore_interrupts(saved_int);
                     crate::percpu::preempt_enable();
 
-                    // x86-64 lazy-FPU: clear any per-CPU `fpu_owner` slot
+                    // x86-64 FPU: clear any per-CPU `fpu_owner` slot
                     // still naming this TCB. Placed AFTER the `running_on`
                     // and `context_saved` spins so the dying thread is
                     // guaranteed to have switched out on every CPU and

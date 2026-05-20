@@ -665,7 +665,7 @@ unsafe extern "C" fn isr_nm()
     );
 }
 
-/// `#NM` handler body — lazy-FPU dispatch.
+/// `#NM` handler body — FPU lazy-restore dispatch.
 ///
 /// Saves the previous owner's live register file into its TCB XSAVE
 /// area (if any), clears CR0.TS, XRSTORs the trapping thread's area into
@@ -745,8 +745,9 @@ extern "C" fn nm_handler()
         super::fpu::cr0_clear_ts();
         super::fpu::restore_from(area);
     }
-    // Publish new ownership. Release pairs with Acquire loads in
-    // switch_in_restore / flush_owner_remote / flush_owner_if.
+    // Publish new ownership. Release pairs with the Acquire load in
+    // switch_out_save (the only other reader of this slot after eager
+    // save eliminated the cross-CPU flush IPI).
     owner_slot.store(tcb, core::sync::atomic::Ordering::Release);
 
     crate::percpu::preempt_enable();
@@ -782,41 +783,6 @@ unsafe extern "C" fn ipi_tlb_shootdown_stub()
         "pop rax",
         "iretq",
         handler = sym ipi_tlb_shootdown_handler,
-    );
-}
-
-/// FPU-flush IPI handler stub (vector 252).
-///
-/// Receives a cross-CPU request to extract this CPU's live x87/SSE/AVX
-/// register file into a migrating thread's XSAVE area. Reads the per-CPU
-/// `FPU_FLUSH_PENDING` slot, calls `fpu::flush_owner_if`, then clears the
-/// slot so the sender's ack-spin returns.
-#[cfg(not(test))]
-#[unsafe(naked)]
-unsafe extern "C" fn ipi_fpu_flush_stub()
-{
-    core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "iretq",
-        handler = sym ipi_fpu_flush_handler,
     );
 }
 
@@ -913,32 +879,6 @@ extern "C" fn ipi_wakeup_handler()
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_WAKEUP));
 }
 
-/// FPU-flush IPI handler (vector 252).
-///
-/// Reads this CPU's pending flush target from `FPU_FLUSH_PENDING`,
-/// extracts the live x87/SSE/AVX register file into the target's XSAVE
-/// area if this CPU still owns it, clears the pending slot so the
-/// sender's ack-spin returns, and acknowledges via EOI.
-#[cfg(not(test))]
-extern "C" fn ipi_fpu_flush_handler()
-{
-    let cpu = super::cpu::current_cpu() as usize;
-    // Acquire pairs with the sender's Release in send_fpu_flush_ipi.
-    let target =
-        super::interrupts::FPU_FLUSH_PENDING[cpu].load(core::sync::atomic::Ordering::Acquire);
-    // SAFETY: target is either null (spurious / race) or a valid TCB
-    // pointer published by the sender, who guarantees the TCB outlives
-    // the ack-spin.
-    unsafe {
-        super::fpu::flush_owner_if(target);
-    }
-    // Release pairs with the sender's Acquire load when polling for ack.
-    super::interrupts::FPU_FLUSH_PENDING[cpu]
-        .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
-    // SAFETY: Vector 252 is the FPU-flush IPI vector.
-    super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_FPU_FLUSH));
-}
-
 // ── IDT population ────────────────────────────────────────────────────────────
 
 /// Populate the IDT and execute `lidt`.
@@ -1009,13 +949,6 @@ pub unsafe fn init()
     set(
         usize::from(super::interrupts::IPI_VECTOR_WAKEUP),
         ipi_wakeup_stub,
-        0,
-    );
-
-    // FPU-flush IPI.
-    set(
-        usize::from(super::interrupts::IPI_VECTOR_FPU_FLUSH),
-        ipi_fpu_flush_stub,
         0,
     );
 

@@ -62,8 +62,8 @@ unsafe impl Sync for DeathObserver {}
 
 // ── ExtendedState ─────────────────────────────────────────────────────────────
 
-/// Per-thread extended-state save-area pointer for the lazy FPU/SIMD/V
-/// save-restore discipline.
+/// Per-thread extended-state save-area pointer for the FPU/SIMD/V
+/// eager-save / lazy-restore discipline.
 ///
 /// `area` points at a page-aligned arch-specific save area (XSAVE layout
 /// on x86-64; F/D register file on RISC-V). Null on threads that never
@@ -71,13 +71,14 @@ unsafe impl Sync for DeathObserver {}
 /// threads, the area is allocated at TCB construction and freed at
 /// destruction.
 ///
-/// Save discipline: the context-switch path calls
-/// `arch::current::fpu::save_to(area)` unconditionally on switch-out
-/// whenever `area` is non-null (the area is XRSTOR-valid even before any
-/// user FP instruction has executed, because zeroed XSAVE state is
-/// equivalent to FINIT + zeroed XMM/YMM). The lazy-trap handler calls
-/// `arch::current::fpu::restore_from(area)` on each user FP/SIMD/V
-/// trap and clears CR0.TS / promotes sstatus.FS — see arch/*/fpu.rs.
+/// Discipline: the context-switch path calls
+/// `arch::current::fpu::switch_out_save(tcb)` on every switch-out; on
+/// x86-64 it XSAVEs into `area` whenever this CPU is the live owner of
+/// `tcb`'s registers (`fpu_owner` matches), then clears `fpu_owner` and
+/// arms `CR0.TS=1`. On RISC-V it inspects `sstatus.FS/VS` and saves
+/// only on Dirty. After switch-in the first user FP/SIMD/V op traps
+/// (`#NM` on x86-64, illegal-instruction on RISC-V); the trap handler
+/// XRSTORs from `area` (or zeroes XMM/YMM if the area is fresh).
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ExtendedState
@@ -102,9 +103,10 @@ impl ExtendedState
     }
 }
 
-// SAFETY: `area` is only dereferenced under the scheduler lock or in the
-// owning thread's trap-handler context; raw pointer ownership is tracked
-// explicitly by the lazy save/restore code.
+// SAFETY: `area` is only dereferenced under the scheduler lock (eager
+// XSAVE in `switch_out_save`) or in the owning thread's trap-handler
+// context (`#NM` XRSTOR); raw pointer ownership is tracked explicitly
+// by the FPU save/restore code.
 unsafe impl Send for ExtendedState {}
 
 // ── IpcThreadState ────────────────────────────────────────────────────────────
@@ -343,9 +345,8 @@ pub struct ThreadControlBlock
     pub sleep_deadline: u64,
 
     // === FPU / SIMD / Vector extended state ===
-    /// Per-thread XSAVE area pointer and dirty flag for lazy FPU/SIMD/V
-    /// save-restore. Null `area` until the save/restore path is wired in a
-    /// follow-up commit; field is data-only at this point.
+    /// Per-thread XSAVE area pointer for the FPU/SIMD/V eager-save /
+    /// lazy-restore discipline (see [`ExtendedState`]).
     pub extended: ExtendedState,
 
     // === Use-after-free detection ===

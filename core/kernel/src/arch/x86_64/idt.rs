@@ -665,23 +665,31 @@ unsafe extern "C" fn isr_nm()
     );
 }
 
-/// `#NM` handler body.
+/// `#NM` handler body — lazy-FPU dispatch.
 ///
-/// Clears CR0.TS and XRSTORs the current thread's saved register file
-/// from its per-TCB XSAVE area. The trapping x87/SSE/AVX instruction
-/// then proceeds on re-execution. The area is allocated as page N+1 of
-/// the Thread retype slot (see `sys_cap_create_thread` layout), so user
-/// threads always have a non-null area; the slot zero-init makes the
-/// first XRSTOR restore the architected initial state.
+/// Saves the previous owner's live register file into its TCB XSAVE
+/// area (if any), clears CR0.TS, XRSTORs the trapping thread's area into
+/// the live registers, and installs the trapping thread as this CPU's
+/// new `fpu_owner`. The trapping x87/SSE/AVX instruction then proceeds
+/// on re-execution. The area is allocated as page N+1 of the Thread
+/// retype slot (see `sys_cap_create_thread` layout), so user threads
+/// always have a non-null area; the slot zero-init makes the first
+/// XRSTOR restore the architected initial state.
+///
+/// Preemption is disabled across the handler body so a timer tick mid-
+/// sequence cannot reschedule between the prev-owner save and the new-
+/// owner restore, which would leave the per-CPU `fpu_owner` invariant
+/// transiently violated.
 #[cfg(not(test))]
 extern "C" fn nm_handler()
 {
-    // SAFETY: ring 0 exception context; clearing TS is the architected
-    // lazy-FPU enable. Must precede XRSTOR because XRSTOR itself executes
-    // an FP instruction.
-    unsafe {
-        super::fpu::cr0_clear_ts();
-    }
+    crate::percpu::preempt_disable();
+
+    let cpu = super::cpu::current_cpu() as usize;
+    let owner_slot = crate::percpu::fpu_owner_for(cpu);
+    // Take ownership atomically so a concurrent flush IPI either races
+    // ahead (clears the slot first) or sees us holding the regs.
+    let prev = owner_slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
 
     // SAFETY: current_tcb returns this CPU's running thread; valid in
     // exception context because we entered from a user FP instruction
@@ -690,7 +698,30 @@ extern "C" fn nm_handler()
     let tcb = unsafe { crate::syscall::current_tcb() };
     if tcb.is_null()
     {
+        // No current thread — should not happen at #NM but be defensive.
+        // Re-establish the (TS=1, owner=null) state.
+        // SAFETY: ring 0.
+        unsafe {
+            super::fpu::cr0_set_ts();
+        }
+        crate::percpu::preempt_enable();
         return;
+    }
+
+    if !prev.is_null() && prev != tcb
+    {
+        // SAFETY: prev was the live owner; its extended.area is page-
+        // resident for the TCB's lifetime when non-null. XSAVE requires
+        // TS=0; clear it before the save instruction.
+        let prev_area = unsafe { (*prev).extended.area };
+        if !prev_area.is_null()
+        {
+            // SAFETY: ring 0; prev_area satisfies XSAVE alignment and size.
+            unsafe {
+                super::fpu::cr0_clear_ts();
+                super::fpu::save_to(prev_area);
+            }
+        }
     }
 
     // SAFETY: tcb validated non-null. extended.area is page-resident in
@@ -698,12 +729,27 @@ extern "C" fn nm_handler()
     let area = unsafe { (*tcb).extended.area };
     if area.is_null()
     {
+        // A user thread without a backing area cannot legitimately take
+        // an FP trap, but we observed one. Re-arm TS for safety and bail.
+        // SAFETY: ring 0.
+        unsafe {
+            super::fpu::cr0_set_ts();
+        }
+        crate::percpu::preempt_enable();
         return;
     }
-    // SAFETY: area is the per-thread XSAVE buffer carved at TCB construction.
+
+    // SAFETY: ring 0; area is a valid XSAVE buffer; we hold logical
+    // ownership of the live regs (prev was swapped out atomically).
     unsafe {
+        super::fpu::cr0_clear_ts();
         super::fpu::restore_from(area);
     }
+    // Publish new ownership. Release pairs with Acquire loads in
+    // switch_in_restore / flush_owner_remote / flush_owner_if.
+    owner_slot.store(tcb, core::sync::atomic::Ordering::Release);
+
+    crate::percpu::preempt_enable();
 }
 
 /// TLB shootdown IPI handler stub (vector 250).
@@ -736,6 +782,41 @@ unsafe extern "C" fn ipi_tlb_shootdown_stub()
         "pop rax",
         "iretq",
         handler = sym ipi_tlb_shootdown_handler,
+    );
+}
+
+/// FPU-flush IPI handler stub (vector 252).
+///
+/// Receives a cross-CPU request to extract this CPU's live x87/SSE/AVX
+/// register file into a migrating thread's XSAVE area. Reads the per-CPU
+/// `FPU_FLUSH_PENDING` slot, calls `fpu::flush_owner_if`, then clears the
+/// slot so the sender's ack-spin returns.
+#[cfg(not(test))]
+#[unsafe(naked)]
+unsafe extern "C" fn ipi_fpu_flush_stub()
+{
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "call {handler}",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym ipi_fpu_flush_handler,
     );
 }
 
@@ -832,6 +913,32 @@ extern "C" fn ipi_wakeup_handler()
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_WAKEUP));
 }
 
+/// FPU-flush IPI handler (vector 252).
+///
+/// Reads this CPU's pending flush target from `FPU_FLUSH_PENDING`,
+/// extracts the live x87/SSE/AVX register file into the target's XSAVE
+/// area if this CPU still owns it, clears the pending slot so the
+/// sender's ack-spin returns, and acknowledges via EOI.
+#[cfg(not(test))]
+extern "C" fn ipi_fpu_flush_handler()
+{
+    let cpu = super::cpu::current_cpu() as usize;
+    // Acquire pairs with the sender's Release in send_fpu_flush_ipi.
+    let target =
+        super::interrupts::FPU_FLUSH_PENDING[cpu].load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: target is either null (spurious / race) or a valid TCB
+    // pointer published by the sender, who guarantees the TCB outlives
+    // the ack-spin.
+    unsafe {
+        super::fpu::flush_owner_if(target);
+    }
+    // Release pairs with the sender's Acquire load when polling for ack.
+    super::interrupts::FPU_FLUSH_PENDING[cpu]
+        .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+    // SAFETY: Vector 252 is the FPU-flush IPI vector.
+    super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_FPU_FLUSH));
+}
+
 // ── IDT population ────────────────────────────────────────────────────────────
 
 /// Populate the IDT and execute `lidt`.
@@ -902,6 +1009,13 @@ pub unsafe fn init()
     set(
         usize::from(super::interrupts::IPI_VECTOR_WAKEUP),
         ipi_wakeup_stub,
+        0,
+    );
+
+    // FPU-flush IPI.
+    set(
+        usize::from(super::interrupts::IPI_VECTOR_FPU_FLUSH),
+        ipi_fpu_flush_stub,
         0,
     );
 

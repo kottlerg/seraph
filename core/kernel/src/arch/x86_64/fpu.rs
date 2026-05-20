@@ -6,9 +6,31 @@
 //! x86-64 extended-state (x87 / SSE / AVX) control primitives.
 //!
 //! Concentrates the unsafe surface for FPU/SIMD state management:
-//! CR0 access (TS bit for lazy-trap discipline), XSETBV/XCR0 setup, the
-//! per-CPU XSAVE enablement performed at boot, and the per-thread XSAVE
-//! area allocation plus save/restore used by the lazy save/restore path.
+//! CR0.TS (lazy-trap discipline gate), XSETBV/XCR0 setup, per-CPU XSAVE
+//! enablement performed at boot, the per-thread XSAVE area allocation,
+//! and the lazy save/restore primitives consumed by the `#NM` handler,
+//! the context-switch fast path, and the cross-CPU FPU-flush IPI handler.
+//!
+//! ## Lazy save/restore discipline
+//!
+//! On any CPU `C` at any time, exactly one of the following holds:
+//! - `(CR0.TS=1, fpu_owner=null)` — no live state worth saving; the next
+//!   user FP instruction raises `#NM`.
+//! - `(CR0.TS=1, fpu_owner=T)`    — T's data is still in the registers
+//!   but the next FP instruction (from any thread) raises `#NM`.
+//! - `(CR0.TS=0, fpu_owner=T)`    — T owns the live regs; FP runs trap-free.
+//!
+//! `(CR0.TS=0, fpu_owner=null)` is forbidden.
+//!
+//! [`switch_out_save`] sets TS=1 (no XSAVE — the regs stay live for the
+//! next thread to reuse or for the migration IPI to flush). [`switch_in_restore`]
+//! clears TS when the incoming thread is already the owner (fast re-run);
+//! otherwise it leaves TS=1 so the first FP op traps. The `#NM` handler
+//! (`idt.rs::nm_handler`) saves the previous owner's regs to its TCB area
+//! before `XRSTOR`ing the trapping thread's area. The migration helper
+//! (`sched/mod.rs`) flushes a stale remote owner via the FPU-flush IPI
+//! (`idt.rs::ipi_fpu_flush_handler` → [`flush_owner_if`]) before enqueuing
+//! a migrated thread on its destination CPU.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -247,55 +269,41 @@ pub unsafe fn restore_from(area: *const u8)
     }
 }
 
-/// Context-switch hook called on switch-out of a user thread (the caller
-/// supplies a TCB whose `extended.area` is non-null): XSAVEOPT the live
-/// x87/SSE/AVX register file to the thread's per-TCB area and re-arm the
-/// `#NM` lazy trap by setting CR0.TS.
+/// Context-switch hook called on switch-out of any thread.
 ///
-/// XSAVEOPT performs hardware-tracked dirty filtering via the XINUSE bits
-/// it maintains internally — components untouched since the last XRSTOR
-/// are not written. The cost on a thread that has not dirtied any FPU
-/// state since its last restore is ~50 cycles (instruction decode +
-/// XINUSE check, no memory traffic). This is the discipline Linux and
-/// most modern x86-64 kernels run.
+/// Re-arms the `#NM` lazy trap by setting CR0.TS. Performs **no XSAVE**:
+/// the live x87/SSE/AVX register file stays in the hardware registers and
+/// the per-CPU `fpu_owner` slot is left untouched. If the outgoing thread
+/// is rescheduled on this CPU before any other thread touches FP, the
+/// matching [`switch_in_restore`] clears TS and resumes trap-free. If a
+/// different thread tries to use FP first, the resulting `#NM` saves the
+/// previous owner's registers into its TCB area lazily. If the outgoing
+/// thread is migrated to another CPU, the migration-side flush IPI
+/// (sched/mod.rs → [`flush_owner_if`]) extracts the live regs into the
+/// thread's area before the destination CPU's `#NM` reloads them.
 ///
 /// # Safety
 /// Must execute at ring 0 with interrupts disabled, before the scheduler
-/// lock release that publishes this thread's state to other CPUs. `tcb`
-/// must be a valid TCB pointer; its `extended.area` must satisfy the
-/// alignment and size requirements of [`save_to`].
+/// lock release that publishes this thread's state to other CPUs. `_tcb`
+/// must be a valid TCB pointer.
 #[cfg(not(test))]
 #[inline]
-pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock)
+pub unsafe fn switch_out_save(_tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
-    // SAFETY: caller guarantees tcb is valid; the area is allocated for the
-    // TCB's lifetime when non-null.
-    let area = unsafe { (*tcb).extended.area };
-    if area.is_null()
-    {
-        return;
-    }
-    // Eager save: the live extended-state register file always belongs to
-    // the outgoing thread because [`switch_in_restore`] reloaded it on
-    // switch-in. CR0.TS dirty-tracking is intentionally not used; the
-    // lazy-trap path varies in correctness across TCG versions
-    // (observed on QEMU 8.2 under `ubuntu-latest`).
-    // CR0.TS may already be clear (the matching switch_in_restore cleared
-    // it); ensure it is for XSAVE, which faults on TS=1.
-    // SAFETY: ring 0.
+    // SAFETY: ring 0; CR0.TS=1 is the architected lazy-trap arm.
     unsafe {
-        cr0_clear_ts();
-        save_to(area);
+        cr0_set_ts();
     }
 }
 
-/// Context-switch hook called on switch-in of a user thread (the caller
-/// supplies a TCB whose `extended.area` is non-null): XRSTOR the saved
-/// register file into the live x87/SSE/AVX registers and clear CR0.TS so
-/// the thread resumes without an `#NM` trap.
+/// Context-switch hook called on switch-in of any thread.
 ///
-/// Paired with [`switch_out_save`] to form an eager save/restore
-/// discipline that does not depend on `#NM`/CR0.TS lazy-trap semantics.
+/// Fast path: if this CPU's lazy-FPU owner is already `tcb` (i.e. `tcb`
+/// re-runs on the same CPU it last ran on, and no other thread has used
+/// FP since), clear CR0.TS so the thread resumes trap-free without any
+/// XRSTOR. Otherwise leave/arm CR0.TS=1; the next FP instruction by
+/// `tcb` (or by any later thread on this CPU) traps to `#NM`, which
+/// saves the prior owner's regs and XRSTORs the trapping thread's area.
 ///
 /// # Safety
 /// Must execute at ring 0 with interrupts disabled, after this thread's
@@ -306,18 +314,30 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
 #[inline]
 pub unsafe fn switch_in_restore(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
+    let cpu = super::cpu::current_cpu() as usize;
+    let owner = crate::percpu::fpu_owner_for(cpu).load(core::sync::atomic::Ordering::Acquire);
     // SAFETY: caller guarantees tcb is valid; the area is allocated for the
     // TCB's lifetime when non-null.
-    let area = unsafe { (*tcb).extended.area };
-    if area.is_null()
+    let area_nonnull = !tcb.is_null() && !unsafe { (*tcb).extended.area }.is_null();
+    if owner == tcb && area_nonnull
     {
-        return;
+        // Fast re-run path: live regs already hold this thread's state.
+        // SAFETY: ring 0; invariant `(owner == tcb) ⇒ regs are tcb's` holds
+        // because the owner slot is only written by the `#NM` handler and
+        // by `flush_owner_if`, both of which keep the slot/regs coherent.
+        unsafe {
+            cr0_clear_ts();
+        }
     }
-    // SAFETY: caller's contract; XRSTOR requires OSXSAVE which the boot
-    // path established.
-    unsafe {
-        cr0_clear_ts();
-        restore_from(area);
+    else
+    {
+        // Trap-on-first-FP path: the live regs (if any) belong to some
+        // other thread; force `#NM` on the next FP op so the handler
+        // saves the prior owner and reloads this thread's area.
+        // SAFETY: ring 0.
+        unsafe {
+            cr0_set_ts();
+        }
     }
 }
 
@@ -328,3 +348,128 @@ pub unsafe fn switch_out_save(_tcb: *mut crate::sched::thread::ThreadControlBloc
 /// No-op test stub.
 #[cfg(test)]
 pub unsafe fn switch_in_restore(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
+
+// ── Cross-CPU FPU-flush IPI ───────────────────────────────────────────────────
+
+/// Local body of the FPU-flush IPI: if this CPU still owns `tcb`'s live
+/// extended-state register file, XSAVE it into `tcb.extended.area` and
+/// clear the owner slot. Idempotent: a no-op when this CPU's owner has
+/// already been swapped to another value (e.g. by a concurrent `#NM`).
+///
+/// Called from two contexts: (a) the IPI handler in idt.rs after the
+/// sender (a migration helper on another CPU) wrote `tcb` into this
+/// CPU's `FPU_FLUSH_PENDING` slot and delivered the IPI; (b) the local
+/// fast-path of `flush_owner_remote` when the caller's CPU is itself
+/// the source CPU (no IPI required).
+///
+/// # Safety
+/// Must execute at ring 0 with interrupts disabled (the IPI-handler
+/// caller runs under an interrupt gate; the local-call path is invoked
+/// from syscall context with `IF=0`). `tcb` must be a valid TCB pointer
+/// whose `extended.area` is allocated for the TCB's lifetime, or null,
+/// in which case this function does nothing.
+#[cfg(not(test))]
+pub unsafe fn flush_owner_if(tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    if tcb.is_null()
+    {
+        return;
+    }
+    let cpu = super::cpu::current_cpu() as usize;
+    let owner = crate::percpu::fpu_owner_for(cpu);
+    // Try to take ownership: if the slot still names `tcb`, claim it.
+    if owner
+        .compare_exchange(
+            tcb,
+            core::ptr::null_mut(),
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // Owner already differs (another `#NM` or flush displaced us).
+        // The live regs no longer belong to `tcb`; nothing to extract.
+        return;
+    }
+    // SAFETY: tcb is valid; we observed ownership; XSAVE requires the
+    // hardware regs to be accessible (CR0.TS=0 during the instruction).
+    let area = unsafe { (*tcb).extended.area };
+    if area.is_null()
+    {
+        // Defensive: if the area is missing the regs cannot be persisted;
+        // a thread that has ever been an owner must have had its area
+        // lazy-allocated in the `#NM` handler, so this branch is
+        // unreachable in normal operation. Re-arm TS for safety.
+        // SAFETY: ring 0.
+        unsafe {
+            cr0_set_ts();
+        }
+        return;
+    }
+    // SAFETY: ring 0; the area is valid for this TCB's lifetime, and we
+    // hold logical ownership of the live regs (no other CPU writes them).
+    unsafe {
+        cr0_clear_ts();
+        save_to(area);
+        cr0_set_ts();
+    }
+}
+
+/// Test stub for [`flush_owner_if`].
+#[cfg(test)]
+pub unsafe fn flush_owner_if(_tcb: *mut crate::sched::thread::ThreadControlBlock) {}
+
+/// Sender side of the cross-CPU FPU-flush IPI. Invoked from sched migration
+/// helpers (active migration, load-balancer pull) on the path that moves
+/// `tcb` from `src_cpu`'s run queue to a different CPU's run queue.
+///
+/// Early-outs if `src_cpu`'s owner slot does not currently name `tcb`
+/// (the common case — most threads are not the lazy-FPU owner of the CPU
+/// they're being migrated off of). Otherwise delegates to the arch-level
+/// synchronous IPI sender, which writes the per-CPU `FPU_FLUSH_PENDING`
+/// slot, fires the IPI vector, and spins for ack.
+///
+/// # Safety
+/// Must execute at ring 0. `src_cpu` must be < `MAX_CPUS`. `tcb` must be
+/// a valid TCB pointer that the caller is in the process of migrating
+/// off `src_cpu`.
+#[cfg(not(test))]
+pub unsafe fn flush_owner_remote(src_cpu: usize, tcb: *mut crate::sched::thread::ThreadControlBlock)
+{
+    if tcb.is_null()
+    {
+        return;
+    }
+    if src_cpu == super::cpu::current_cpu() as usize
+    {
+        // Local invalidation: do the work directly, no IPI.
+        // SAFETY: ring 0; same contract as the IPI handler.
+        unsafe {
+            flush_owner_if(tcb);
+        }
+        return;
+    }
+    let owner = crate::percpu::fpu_owner_for(src_cpu).load(core::sync::atomic::Ordering::Acquire);
+    if owner != tcb
+    {
+        // Common case: the source CPU does not currently own `tcb`'s
+        // live regs. Either `tcb` has never touched FP, or a later
+        // thread on the source CPU has displaced it via `#NM`. The
+        // canonical state in `tcb.extended.area` is already fresh.
+        return;
+    }
+    // SAFETY: src_cpu validated < MAX_CPUS by caller; tcb is the
+    // migration target.
+    unsafe {
+        super::interrupts::send_fpu_flush_ipi(src_cpu, tcb);
+    }
+}
+
+/// Test stub for [`flush_owner_remote`].
+#[cfg(test)]
+pub unsafe fn flush_owner_remote(
+    _src_cpu: usize,
+    _tcb: *mut crate::sched::thread::ThreadControlBlock,
+)
+{
+}

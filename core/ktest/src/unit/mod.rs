@@ -407,6 +407,10 @@ pub fn run_all(ctx: &TestContext)
 
     // ── Extended-state (FPU / SIMD / V) isolation ────────────────────────────
     run_test!("fpu::preempt_isolation", fpu::preempt_isolation(ctx));
+    run_test!(
+        "fpu::preempt_isolation_cross_cpu",
+        fpu::preempt_isolation_cross_cpu(ctx)
+    );
 
     // ── Hardware access syscalls ──────────────────────────────────────────────
     run_test!("hw::mmio_map", hw::mmio_map(ctx));

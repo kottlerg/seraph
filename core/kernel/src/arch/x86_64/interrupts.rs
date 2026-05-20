@@ -207,6 +207,22 @@ const ICR_SIPI_BASE: u32 = 0x0000_4600;
 pub const IPI_VECTOR_TLB_SHOOTDOWN: u8 = 250;
 /// IPI vector for waking idle CPUs.
 pub const IPI_VECTOR_WAKEUP: u8 = 251;
+/// IPI vector for lazy-FPU owner flush on thread migration.
+pub const IPI_VECTOR_FPU_FLUSH: u8 = 252;
+
+/// Per-CPU "flush this TCB if you own it" slot, written by the sender
+/// (a migration helper on another CPU) immediately before raising
+/// [`IPI_VECTOR_FPU_FLUSH`] at the target CPU. The IPI handler reads the
+/// slot, calls `fpu::flush_owner_if`, then resets the slot to null,
+/// which the sender spins on to detect ack.
+///
+/// One pending flush per CPU is sufficient because cross-CPU migrations
+/// involving a given source CPU serialize on its scheduler lock.
+#[cfg(not(test))]
+pub static FPU_FLUSH_PENDING: [core::sync::atomic::AtomicPtr<
+    crate::sched::thread::ThreadControlBlock,
+>; crate::sched::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; crate::sched::MAX_CPUS];
 
 /// Read this CPU's local APIC ID (bits [31:24] of the APIC ID register).
 #[allow(dead_code)] // Part of the arch interface; will be used by future SMP topology code.
@@ -322,6 +338,90 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
     unsafe {
         apic_write(APIC_ICR_LOW, u32::from(IPI_VECTOR_WAKEUP));
     }
+}
+
+/// Send a synchronous lazy-FPU owner-flush IPI to `target_cpu` and spin
+/// until the receiver acknowledges by clearing its `FPU_FLUSH_PENDING`
+/// slot. Invoked by sched migration helpers before enqueueing a migrated
+/// thread on its destination CPU; the receiver `XSAVE`s `tcb`'s live
+/// regs into `tcb.extended.area` if it still owns them.
+///
+/// Mirrors the `mm::tlb_shootdown::shootdown` interrupt-enable-while-
+/// spinning discipline: the spin-ack loop runs with interrupts enabled
+/// so a concurrent flush/shootdown IPI targeting this CPU can fire and
+/// service even though we entered the syscall with `IF=0`. Without this,
+/// two CPUs simultaneously initiating flush IPIs to each other deadlock
+/// (both spin with `IF=0`, neither processes the other's IPI). Preemption
+/// is disabled across the spin so a timer tick cannot reschedule the
+/// caller mid-IPI.
+///
+/// # Safety
+/// Must execute at ring 0. `target_cpu` must be < `MAX_CPUS` and != the
+/// current CPU (a local invalidation goes through `fpu::flush_owner_if`
+/// directly without raising an IPI). `tcb` must be a valid TCB pointer
+/// for the duration of the call. The caller's invariants (e.g. holding
+/// no scheduler lock) must permit this CPU to temporarily enable
+/// interrupts.
+#[cfg(not(test))]
+pub unsafe fn send_fpu_flush_ipi(
+    target_cpu: usize,
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+)
+{
+    debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+    debug_assert!(target_cpu != cpu::current_cpu() as usize);
+    // SAFETY: cpu validated; CPU_APIC_IDS is read-only after init.
+    let target_apic_id = unsafe { crate::percpu::apic_id_for(target_cpu) };
+
+    // Publish the request before delivering the IPI. Release pairs with
+    // the Acquire load in ipi_fpu_flush_handler.
+    FPU_FLUSH_PENDING[target_cpu].store(tcb, core::sync::atomic::Ordering::Release);
+
+    // Disable preemption so the timer tick does not reschedule us while
+    // interrupts are temporarily enabled below.
+    crate::percpu::preempt_disable();
+    // Save current IF and unconditionally disable, then re-enable. This
+    // captures the caller's IF state for restoration even when we entered
+    // already with IF=0 (the common syscall case).
+    // SAFETY: ring 0.
+    let saved_int = unsafe { cpu::save_and_disable_interrupts() };
+    // SAFETY: IDT loaded; preempt-disabled; enabling IF here lets us
+    // service incoming flush / TLB-shootdown IPIs that would otherwise
+    // circular-wait against us.
+    unsafe { enable() };
+
+    // Wait for any in-flight ICR write, then send our IPI.
+    // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
+    unsafe { wait_icr_idle() };
+    // SAFETY: APIC MMIO; ICR_HIGH takes destination in bits [31:24].
+    unsafe {
+        apic_write(APIC_ICR_HIGH, target_apic_id << 24);
+    }
+    // SAFETY: Fixed delivery, vector 252, level=0, trigger=edge.
+    unsafe {
+        apic_write(APIC_ICR_LOW, u32::from(IPI_VECTOR_FPU_FLUSH));
+    }
+
+    // Spin until the receiver clears the pending slot.
+    let mut n = 0u64;
+    while !FPU_FLUSH_PENDING[target_cpu]
+        .load(core::sync::atomic::Ordering::Acquire)
+        .is_null()
+    {
+        core::hint::spin_loop();
+        n += 1;
+        if n >= 100_000_000
+        {
+            crate::fatal("send_fpu_flush_ipi: target CPU never acknowledged");
+        }
+    }
+
+    // Restore the caller's interrupt state and preemption.
+    // SAFETY: saved_int from save_and_disable_interrupts on this CPU.
+    unsafe {
+        cpu::restore_interrupts(saved_int);
+    }
+    crate::percpu::preempt_enable();
 }
 
 /// Start an AP using the INIT + 2×SIPI sequence (Intel SDM Vol. 3A §8.4.4.1).

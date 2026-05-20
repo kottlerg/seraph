@@ -688,8 +688,12 @@ extern "C" fn nm_handler()
 
     let cpu = super::cpu::current_cpu() as usize;
     let owner_slot = crate::percpu::fpu_owner_for(cpu);
-    // Take ownership atomically so a concurrent flush IPI either races
-    // ahead (clears the slot first) or sees us holding the regs.
+    // Read the prior owner (if any) so we can save its live regs
+    // before XRSTOR'ing this thread's area. The atomic swap is
+    // simpler than load-then-store but is not load-bearing for
+    // concurrency: after #108 the only writer is this same handler
+    // (and `switch_out_save` on this CPU), and both run with
+    // preemption disabled — no cross-CPU race on this slot.
     let prev = owner_slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
 
     // SAFETY: current_tcb returns this CPU's running thread; valid in

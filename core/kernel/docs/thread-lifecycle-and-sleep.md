@@ -146,12 +146,6 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
     disabled so a timer tick mid-spin cannot reschedule the dealloc
     caller off this CPU (which would invalidate the `running_on`
     snapshot captured at step 6).
-10a. (x86_64 only) Clear any per-CPU `fpu_owner` slot still naming
-    this TCB via `compare_exchange(tcb, null, AcqRel, Acquire)` for
-    every CPU. Placed AFTER steps 9-10 so the dying thread has
-    switched out on every CPU and taken no further `#NM`; closes the
-    dangling-pointer window before storage is reclaimed in step 16.
-    See invariant 4a.
 11. Acquire the source IPC lock for tcb's blocked_on_object (if any) and unlink
     tcb from the source's wait queue / waiter slot. Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.

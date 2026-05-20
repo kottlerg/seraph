@@ -26,6 +26,12 @@ use boot_protocol::BootInfo;
 /// framebuffer cursor position. Uses a plain `AtomicBool` (test-and-set) rather
 /// than the ticket `Spinlock` to avoid disabling interrupts — callers may already
 /// be in an interrupt handler, and timer ISRs do not call `kprintln!`.
+///
+/// Two non-acquiring exceptions exist for crash and NMI paths where
+/// spin-waiting would deadlock against a halted or interrupted lock-
+/// holder: `panic_write_fmt` force-claims the lock and never releases
+/// it (caller halts), and `nmi_write_fmt` swap-and-restores the lock
+/// (caller resumes the interrupted code).
 static CONSOLE_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// Static console state.

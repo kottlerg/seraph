@@ -307,20 +307,17 @@ pub fn preemption_disabled() -> bool
 
 /// Return a reference to CPU `cpu`'s FPU owner slot.
 ///
-/// Resolved as a slot reference rather than a direct load so the same
-/// helper serves both the local `#NM` handler / `switch_out_save`
-/// (which CAS / swap / store on the slot) and the per-thread dealloc
-/// sweep in `sched::thread`, which clears any dangling pointer to a
-/// dying TCB from every CPU's slot. After the migration-steal IPI was
-/// removed in favour of eager save-on-switch-out, only the dealloc
-/// sweep accesses cross-CPU slots; the `#NM` handler and
-/// `switch_out_save` always resolve `cpu == current_cpu()`.
+/// Called from the local `#NM` handler (`idt.rs::nm_handler`) and
+/// `switch_out_save`. After eager save-on-switch-out eliminated the
+/// migration-steal IPI and the dealloc-time sweep, every caller
+/// resolves `cpu == current_cpu()`; the slot reference form is kept
+/// for symmetry with the rest of the `PER_CPU` accessors.
 ///
 /// # Safety
 /// `cpu` must be < [`MAX_CPUS`]. The returned reference is `'static` because
 /// `PER_CPU` outlives any conceivable caller; concurrent access is safe via
 /// the [`AtomicPtr`] interior mutability.
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 pub fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
 {
     debug_assert!(cpu < MAX_CPUS);

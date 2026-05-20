@@ -872,7 +872,10 @@ extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
     }
     // SAFETY: frame pointer constructed by ipi_nmi_backtrace_stub above.
     let f = unsafe { &*frame };
-    crate::kprintln!(
+    // Use the NMI-safe console path: `CONSOLE_LOCK` is swap-and-
+    // restored rather than spin-acquired, so an NMI that interrupts
+    // the lock-holder does not deadlock the dump.
+    crate::kprintln_nmi!(
         "NMI BACKTRACE: cpu={} rip={:#018x} rsp={:#018x} rbp={:#018x} cs={:#x} rflags={:#018x}",
         cpu,
         f.rip,
@@ -881,7 +884,34 @@ extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
         f.cs,
         f.rflags
     );
-    dump_x86_regs_console(f);
+    crate::kprintln_nmi!(
+        "  rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x}",
+        f.rax,
+        f.rbx,
+        f.rcx,
+        f.rdx
+    );
+    crate::kprintln_nmi!(
+        "  rsi={:#018x} rdi={:#018x} rbp={:#018x} rsp={:#018x}",
+        f.rsi,
+        f.rdi,
+        f.rbp,
+        f.rsp
+    );
+    crate::kprintln_nmi!(
+        "   r8={:#018x}  r9={:#018x} r10={:#018x} r11={:#018x}",
+        f.r8,
+        f.r9,
+        f.r10,
+        f.r11
+    );
+    crate::kprintln_nmi!(
+        "  r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x}",
+        f.r12,
+        f.r13,
+        f.r14,
+        f.r15
+    );
 }
 
 /// Wakeup IPI handler stub (vector 251).

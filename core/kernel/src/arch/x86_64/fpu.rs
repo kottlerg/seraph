@@ -20,11 +20,28 @@
 //! - `(CR0.TS=0, fpu_owner=T)`    — T owns the live regs; FP runs
 //!   trap-free.
 //!
-//! `(CR0.TS=0, fpu_owner=null)` is forbidden. `(CR0.TS=1, fpu_owner=T)`
-//! exists only transiently inside the `#NM` handler between the
-//! atomic `swap(null)` of the prior owner and the final `store(tcb,
-//! Release)` of the new owner — both ends of that window are at ring 0
-//! with preemption disabled, so no other code observes the transient.
+//! `(CR0.TS=0, fpu_owner=null)` is the forbidden at-rest state; it
+//! appears as a transient inside two code paths and is unobservable
+//! from outside each:
+//!
+//! - **Inside `nm_handler`** (`idt.rs::nm_handler`) between the
+//!   `cr0_clear_ts()` that arms the live registers for XSAVE / XRSTOR
+//!   and the final `fpu_owner.store(tcb, Release)`. Preemption is
+//!   disabled across the handler body, the CPU enters from a hardware
+//!   trap with `IF=0`, and the only architectural interrupt class that
+//!   can fire (NMI) does not touch FPU state — so no other code on this
+//!   CPU observes the transient. No other CPU writes this CPU's owner
+//!   slot.
+//! - **Inside `switch_out_save`** between the `cr0_clear_ts()` that
+//!   arms the live registers for XSAVE and the `cr0_set_ts()` that
+//!   re-arms the lazy trap. Called inside the scheduler-lock critical
+//!   section with `IF=0`; the Release on the subsequent lock unlock is
+//!   what publishes the area to peer CPUs.
+//!
+//! The state `(CR0.TS=1, fpu_owner=T)` never appears under this
+//! discipline: `nm_handler` clears CR0.TS *before* writing the owner
+//! slot, and `switch_out_save` clears the owner slot only after
+//! re-arming `CR0.TS=1`.
 //!
 //! [`switch_out_save`] eagerly XSAVEs the live regs into T's TCB area
 //! and clears `fpu_owner` whenever this CPU still owns the outgoing

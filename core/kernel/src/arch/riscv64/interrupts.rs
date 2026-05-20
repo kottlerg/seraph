@@ -1051,8 +1051,13 @@ pub unsafe fn send_nmi_to(_target_hart_id: u32)
 }
 
 /// Context passed to [`wait_for_ack`] by every synchronous IPI sender.
+///
 /// Identical shape to the x86-64 counterpart so shared call sites (e.g.
-/// `mm::tlb_shootdown::shootdown`) compile on both arches.
+/// `mm::tlb_shootdown::shootdown`) compile on both arches; see the
+/// x86-64 `IpiWaitCtx` rustdoc in `arch/x86_64/interrupts.rs` for the
+/// per-field semantics (`op_name` and `target_cpu` are diagnostic-only;
+/// `resend` is called once at Phase B to re-emit the IPI to whichever
+/// targets are still unacked).
 pub struct IpiWaitCtx<'a>
 {
     pub op_name: &'static str,

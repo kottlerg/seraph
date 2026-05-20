@@ -1395,28 +1395,12 @@ unsafe fn dealloc_object_one(
                     crate::arch::current::cpu::restore_interrupts(saved_int);
                     crate::percpu::preempt_enable();
 
-                    // x86-64 FPU: clear any per-CPU `fpu_owner` slot
-                    // still naming this TCB. Placed AFTER the `running_on`
-                    // and `context_saved` spins so the dying thread is
-                    // guaranteed to have switched out on every CPU and
-                    // taken no further `#NM` (which would have re-stored
-                    // its pointer into a CPU's owner slot). At this point
-                    // the only legitimate residue is the slot of the CPU
-                    // the thread last ran on; sweeping every CPU costs
-                    // O(MAX_CPUS) atomic CAS and locks out the stale-
-                    // pointer hazard before storage is reclaimed below.
-                    // No-op on RISC-V (the slot exists but is never written).
-                    // See `docs/thread-lifecycle-and-sleep.md` § Drain
-                    // Protocol step 10a and invariant 4a.
-                    for cpu in 0..cpu_count
-                    {
-                        let _ = crate::percpu::fpu_owner_for(cpu).compare_exchange(
-                            tcb,
-                            core::ptr::null_mut(),
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        );
-                    }
+                    // After eager FPU save (#108), no fpu_owner sweep is
+                    // needed: `nm_handler` only ever names the currently
+                    // Running thread on its CPU, and `switch_out_save`
+                    // clears the slot on switch-out — so by the time the
+                    // `running_on` and `context_saved` spins above have
+                    // completed, no CPU's owner slot can name this TCB.
                 }
 
                 // Wake the captured reply-bound client outside the all-locks

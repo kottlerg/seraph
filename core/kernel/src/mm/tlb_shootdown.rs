@@ -195,6 +195,10 @@ pub unsafe fn shootdown(root_phys: u64, cpu_mask: u64, virt: u64)
     // pending at the start of the wait; it drives the Phase-C NMI
     // backtrace and the Phase-D panic message.
     let target_cpu = cpu_mask.trailing_zeros() as usize;
+    // Relaxed: a stale read here only causes a redundant IPI to a CPU
+    // that has already acked, which is idempotent. The real
+    // synchronisation edge is the Acquire load inside the cond closure
+    // below.
     let resend = || send_ipis(TLB_SHOOTDOWN.pending_cpus.load(Ordering::Relaxed));
     // SAFETY: caller invariants (preempt-disabled, IF=1) are upheld by
     // the save_and_disable_interrupts + enable() sequence above.

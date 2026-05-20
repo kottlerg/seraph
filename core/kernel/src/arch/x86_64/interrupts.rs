@@ -208,6 +208,22 @@ pub const IPI_VECTOR_TLB_SHOOTDOWN: u8 = 250;
 /// IPI vector for waking idle CPUs.
 pub const IPI_VECTOR_WAKEUP: u8 = 251;
 
+/// Per-CPU "dump backtrace from your NMI handler" request flag, set by the
+/// synchronous-IPI watchdog before raising a vector-2 NMI at the stuck
+/// target CPU. The target's NMI handler reads it, dumps the saved
+/// `ExceptionFrame` to serial, and clears the flag. A hardware NMI with
+/// the flag clear falls through to the existing fatal path.
+///
+/// Single-bit publication, no caller-side ordering beyond Release/Acquire
+/// (the NMI itself is a serialising event for the target).
+#[cfg(not(test))]
+pub static NMI_BACKTRACE_REQUEST: [core::sync::atomic::AtomicBool; crate::sched::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::sched::MAX_CPUS];
+
+/// ICR delivery-mode + level encoding for an NMI IPI (`delivery_mode`=4 = NMI,
+/// level=assert, trigger=edge, `dest_shorthand`=none, vector=0/ignored).
+const ICR_NMI: u32 = 0x0000_4400;
+
 /// Read this CPU's local APIC ID (bits [31:24] of the APIC ID register).
 #[allow(dead_code)] // Part of the arch interface; will be used by future SMP topology code.
 #[cfg(not(test))]
@@ -224,9 +240,14 @@ pub fn lapic_id() -> u32
 }
 
 /// Spin until the ICR delivery status bit clears (IPI accepted by hardware).
-/// Returns false if it times out (bit still set after ~1M iterations).
+///
+/// The bit clears within microseconds on a healthy LAPIC; 1M iterations
+/// is far beyond any architectural timing. Exhaustion indicates a
+/// hardware-level fault (stuck APIC, emulator bug) rather than a
+/// schedulable race, so we fatal rather than return a status all four
+/// callers historically ignored.
 #[cfg(not(test))]
-unsafe fn wait_icr_idle() -> bool
+unsafe fn wait_icr_idle()
 {
     let mut n = 0u64;
     while apic_read(APIC_ICR_LOW) & ICR_PENDING != 0
@@ -235,10 +256,9 @@ unsafe fn wait_icr_idle() -> bool
         n += 1;
         if n >= 1_000_000
         {
-            return false;
+            crate::fatal("wait_icr_idle: APIC ICR delivery-status stuck after 1M iters");
         }
     }
-    true
 }
 
 /// Send an INIT IPI to the AP identified by `target_apic_id`.
@@ -321,6 +341,118 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
     // SAFETY: Fixed delivery mode (0), vector 251, level=0, trigger=edge.
     unsafe {
         apic_write(APIC_ICR_LOW, u32::from(IPI_VECTOR_WAKEUP));
+    }
+}
+
+/// Send an NMI (vector 2) to a target CPU. Used by the synchronous-IPI
+/// watchdog at Phase C to coax a backtrace dump from a CPU that has not
+/// acknowledged a sync IPI. The receiver's vector-2 handler consults
+/// [`NMI_BACKTRACE_REQUEST`] to distinguish a watchdog ping from a real
+/// hardware NMI.
+///
+/// # Safety
+/// `target_apic_id` must be a valid APIC ID of an online CPU.
+#[cfg(not(test))]
+pub unsafe fn send_nmi_to(target_apic_id: u32)
+{
+    // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
+    unsafe { wait_icr_idle() };
+    // SAFETY: APIC MMIO region is valid; ICR_HIGH takes destination in bits [31:24].
+    unsafe {
+        apic_write(APIC_ICR_HIGH, target_apic_id << 24);
+    }
+    // SAFETY: ICR_NMI encodes delivery_mode=NMI (4), level=assert, trigger=edge.
+    unsafe {
+        apic_write(APIC_ICR_LOW, ICR_NMI);
+    }
+}
+
+// ── Synchronous-IPI watchdog ──────────────────────────────────────────────────
+
+/// Context passed to [`wait_for_ack`] by every synchronous IPI sender.
+///
+/// `op_name` and `target_cpu` are diagnostic-only (printed in the
+/// watchdog dump and panic message). `resend` is called once at Phase B
+/// to re-emit the IPI to whichever targets are still unacked; for a
+/// broadcast operation like TLB shootdown the closure should fan out to
+/// every CPU whose acknowledgement bit is still set, not the full
+/// original mask.
+pub struct IpiWaitCtx<'a>
+{
+    pub op_name: &'static str,
+    pub target_cpu: usize,
+    pub resend: &'a dyn Fn(),
+}
+
+/// TSC-bounded synchronous-IPI ack wait with re-send and NMI-backtrace
+/// escalation. Phases (wall-clock via `timer::elapsed_us`):
+/// - **A** (0 → ~250 ms): spin while `cond()` reports unacked.
+/// - **B** (250 ms → ~750 ms): at the boundary, call `ctx.resend()` once,
+///   then continue spinning. Recovers from a dropped IPI under
+///   emulators with non-deterministic LAPIC delivery.
+/// - **C** (750 ms → ~5 s): at the boundary, set
+///   [`NMI_BACKTRACE_REQUEST`] for `ctx.target_cpu` and send a vector-2
+///   NMI to that CPU. The receiver's handler dumps its
+///   `ExceptionFrame` to serial so a subsequent panic is diagnosable.
+/// - **D** (>5 s): print the context and fatal.
+///
+/// # Safety
+/// Must be called at ring 0 with preemption disabled and `IF=1` — the
+/// same envelope `mm::tlb_shootdown::shootdown` establishes. The caller
+/// is responsible for the surrounding interrupt-state save / restore.
+///
+/// `cond` MUST be free of side effects beyond the atomic loads needed
+/// to inspect the pending state; it is invoked many times per spin.
+#[cfg(not(test))]
+pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
+{
+    let start = super::timer::elapsed_us().unwrap_or(0);
+    let mut resent = false;
+    let mut nmi_sent = false;
+    loop
+    {
+        if cond()
+        {
+            return;
+        }
+        core::hint::spin_loop();
+        let Some(now) = super::timer::elapsed_us()
+        else
+        {
+            continue;
+        };
+        let elapsed_ms = now.saturating_sub(start) / 1_000;
+        if elapsed_ms >= 5_000
+        {
+            crate::kprintln!(
+                "IPI WATCHDOG: target_cpu={} op={} elapsed_ms={} — never acked",
+                ctx.target_cpu,
+                ctx.op_name,
+                elapsed_ms
+            );
+            crate::fatal("ipi: target CPU never acked");
+        }
+        if !nmi_sent && elapsed_ms >= 750
+        {
+            if ctx.target_cpu < crate::sched::MAX_CPUS
+            {
+                NMI_BACKTRACE_REQUEST[ctx.target_cpu]
+                    .store(true, core::sync::atomic::Ordering::Release);
+                // SAFETY: target_cpu validated < MAX_CPUS; apic_id_for is
+                // read-only after init.
+                let apic_id = unsafe { crate::percpu::apic_id_for(ctx.target_cpu) };
+                // SAFETY: apic_id is a valid hardware LAPIC ID for an online CPU.
+                unsafe {
+                    send_nmi_to(apic_id);
+                }
+            }
+            nmi_sent = true;
+        }
+        if !resent && elapsed_ms >= 250
+        {
+            (ctx.resend)();
+            resent = true;
+        }
     }
 }
 

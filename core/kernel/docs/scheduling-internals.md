@@ -256,6 +256,35 @@ Process-stop ("kill process across all CPUs"), TLB-shootdown-with-PCID variants,
 
 ---
 
+## IPI Watchdog Ladder
+
+Every synchronous-IPI ack wait MUST route through `arch::current::interrupts::wait_for_ack` (file: `arch/x86_64/interrupts.rs`, mirrored in `arch/riscv64/interrupts.rs`). The helper bounds the wait against wall-clock time via TSC (`timer::elapsed_us`) and escalates through four phases keyed off the elapsed-microseconds delta from the start of the wait:
+
+| Phase | Window | Action |
+|---|---|---|
+| A | 0 – 250 ms | Spin with `core::hint::spin_loop()` while `cond()` reports unacked. |
+| B | 250 – 750 ms | Call `ctx.resend()` once at the boundary, then continue spinning. Recovers from a dropped IPI under emulators with non-deterministic LAPIC delivery. |
+| C | 750 ms – 5 s | x86-64: set `NMI_BACKTRACE_REQUEST[target_cpu]` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `ExceptionFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
+| D | > 5 s | Print `target_cpu`, `op_name`, `elapsed_ms` to serial, then `crate::fatal`. |
+
+`wait_for_ack` MUST be called with preemption disabled and `IF=1` / `sstatus.SIE=1` — the same envelope `mm::tlb_shootdown::shootdown` establishes. The `cond` closure MUST be side-effect-free beyond the atomic loads needed to inspect pending state (it runs many times per spin).
+
+For broadcast IPIs (TLB shootdown), `target_cpu` names the lowest-numbered CPU still pending at the start of the wait; this drives the diagnostic dump and panic message but does not constrain the ack predicate, which checks the full pending mask. The `resend` closure SHOULD re-fire only to CPUs whose bit is still set, not the full original mask.
+
+### `wait_icr_idle` discipline
+
+`wait_icr_idle` (x86-64 only; polls the LAPIC ICR delivery-status bit) is **not** a `wait_for_ack` consumer — it spins on a hardware register that clears within microseconds on a healthy LAPIC. A 1 M iteration cap is far beyond any architectural timing; exhaustion indicates a hardware-level fault (stuck APIC, emulator bug) and panics immediately. The four callers (`send_init_ipi`, `send_sipi`, `send_tlb_shootdown_ipi`, `send_wakeup_ipi`) call it for its side effect only; the return type is `()`.
+
+### `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`
+
+The x86-64 IDT registers a dedicated stub at vector 2 (IST=2 per the NMI ABI) that saves the standard `ExceptionFrame` shape, calls a returning handler, then restores GPRs and `iretq`s. The handler reads `NMI_BACKTRACE_REQUEST[cpu]`:
+- **Set** (watchdog-requested): dump the saved frame to serial and return; the stub's `iretq` resumes the interrupted code.
+- **Clear** (real hardware NMI): tail-call `common_exception_handler` which never returns — the stub's `iretq` tail is dead code in that case.
+
+NMI is not APIC-EOI'd; the handler does not call `acknowledge()`.
+
+---
+
 ## Atomic Ordering Invariants
 
 Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Load-bearing" means the ordering choice is required for correctness; relaxations would introduce a race.

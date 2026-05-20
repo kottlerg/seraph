@@ -1034,6 +1034,90 @@ pub unsafe fn send_wakeup_ipi(target_hart_id: u32)
     }
 }
 
+/// Send an NMI-equivalent to a target hart. RISC-V has no S-mode NMI
+/// surface and SBI offers no analogue; this is provided for arch-
+/// dispatch parity with x86-64's [`super::super::x86_64::interrupts::send_nmi_to`].
+/// Calling it panics: the watchdog escalation that would invoke it on
+/// x86-64 simply degrades to a logged warning before the eventual
+/// Phase-D panic on RISC-V (see [`wait_for_ack`]).
+///
+/// # Safety
+/// Arch-dispatch parity only; never invoked on RISC-V in practice.
+#[allow(dead_code)] // Arch-dispatch parity with x86_64; no caller on RISC-V.
+#[cfg(not(test))]
+pub unsafe fn send_nmi_to(_target_hart_id: u32)
+{
+    crate::fatal("send_nmi_to: RISC-V has no S-mode NMI surface");
+}
+
+/// Context passed to [`wait_for_ack`] by every synchronous IPI sender.
+/// Identical shape to the x86-64 counterpart so shared call sites (e.g.
+/// `mm::tlb_shootdown::shootdown`) compile on both arches.
+pub struct IpiWaitCtx<'a>
+{
+    pub op_name: &'static str,
+    pub target_cpu: usize,
+    pub resend: &'a dyn Fn(),
+}
+
+/// TSC-bounded synchronous-IPI ack wait. RISC-V has no S-mode NMI
+/// surface, so Phase C degrades to a single logged warning before
+/// Phase D panics. Phases:
+/// - **A** (0 → ~250 ms): spin while `cond()` reports unacked.
+/// - **B** (250 ms → ~750 ms): resend once.
+/// - **C** (750 ms → ~5 s): emit a single warning log (no NMI).
+/// - **D** (>5 s): panic.
+///
+/// # Safety
+/// Must run at S-mode with preemption disabled and `sstatus.SIE = 1`.
+/// `cond` MUST be side-effect-free beyond the atomic loads needed.
+#[cfg(not(test))]
+pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
+{
+    let start = super::timer::elapsed_us().unwrap_or(0);
+    let mut resent = false;
+    let mut warned = false;
+    loop
+    {
+        if cond()
+        {
+            return;
+        }
+        core::hint::spin_loop();
+        let Some(now) = super::timer::elapsed_us()
+        else
+        {
+            continue;
+        };
+        let elapsed_ms = now.saturating_sub(start) / 1_000;
+        if elapsed_ms >= 5_000
+        {
+            crate::kprintln!(
+                "IPI WATCHDOG: target_cpu={} op={} elapsed_ms={} — never acked",
+                ctx.target_cpu,
+                ctx.op_name,
+                elapsed_ms
+            );
+            crate::fatal("ipi: target CPU never acked");
+        }
+        if !warned && elapsed_ms >= 750
+        {
+            crate::kprintln!(
+                "IPI WATCHDOG: target_cpu={} op={} elapsed_ms={} — still unacked",
+                ctx.target_cpu,
+                ctx.op_name,
+                elapsed_ms
+            );
+            warned = true;
+        }
+        if !resent && elapsed_ms >= 250
+        {
+            (ctx.resend)();
+            resent = true;
+        }
+    }
+}
+
 /// Make SBI call with 2 arguments.
 ///
 /// # Safety

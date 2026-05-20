@@ -461,7 +461,8 @@ unsafe extern "C" fn common_exception_trampoline()
 
 isr_stub!(isr0, 0, has_error_code = false, ist = 0);
 isr_stub!(isr1, 1, has_error_code = false, ist = 0);
-isr_stub!(isr2, 2, has_error_code = false, ist = 2); // NMI — IST2
+// NMI (vector 2) uses ipi_nmi_backtrace_stub instead of the generic
+// isr_stub! — see the dedicated stub above.
 isr_stub!(isr3, 3, has_error_code = false, ist = 0);
 isr_stub!(isr4, 4, has_error_code = false, ist = 0);
 isr_stub!(isr5, 5, has_error_code = false, ist = 0);
@@ -786,6 +787,103 @@ unsafe extern "C" fn ipi_tlb_shootdown_stub()
     );
 }
 
+/// NMI backtrace stub (vector 2 with IST=2).
+///
+/// Replaces the generic exception stub for NMI. Saves the same
+/// `ExceptionFrame` shape as `common_exception_trampoline`, calls the
+/// returning [`ipi_nmi_backtrace_handler`], then restores GPRs and
+/// `iretq`s. The handler decides at runtime whether the NMI is a
+/// watchdog backtrace request (returns normally → iretq fires) or a
+/// real hardware NMI (falls through to `common_exception_handler` which
+/// never returns — the iretq tail is unreachable in that case).
+#[cfg(not(test))]
+#[unsafe(naked)]
+unsafe extern "C" fn ipi_nmi_backtrace_stub()
+{
+    core::arch::naked_asm!(
+        "push 0",      // dummy error code (NMI has none)
+        "push 2",      // vector
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",
+        "call {handler}",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "add rsp, 16",  // drop vector + error_code
+        "iretq",
+        handler = sym ipi_nmi_backtrace_handler,
+    );
+}
+
+/// NMI body. Distinguishes a watchdog-requested backtrace from a real
+/// hardware NMI via [`NMI_BACKTRACE_REQUEST`]; on a watchdog ping it
+/// dumps the saved frame to serial and returns (the stub's iretq
+/// resumes the interrupted code). On a real NMI it tail-calls
+/// `common_exception_handler` which never returns — the iretq tail of
+/// the stub is dead code in that case.
+///
+/// NMI is not APIC-EOI'd, so no `acknowledge()` call.
+#[cfg(not(test))]
+extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
+{
+    let cpu = super::cpu::current_cpu() as usize;
+    let requested = if cpu < crate::sched::MAX_CPUS
+    {
+        super::interrupts::NMI_BACKTRACE_REQUEST[cpu]
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+    }
+    else
+    {
+        false
+    };
+    if !requested
+    {
+        // Real hardware NMI — defer to the standard fatal path.
+        // SAFETY: frame pointer constructed by ipi_nmi_backtrace_stub above.
+        unsafe {
+            common_exception_handler(frame);
+        }
+    }
+    // SAFETY: frame pointer constructed by ipi_nmi_backtrace_stub above.
+    let f = unsafe { &*frame };
+    crate::kprintln!(
+        "NMI BACKTRACE: cpu={} rip={:#018x} rsp={:#018x} rbp={:#018x} cs={:#x} rflags={:#018x}",
+        cpu,
+        f.rip,
+        f.rsp,
+        f.rbp,
+        f.cs,
+        f.rflags
+    );
+    dump_x86_regs_console(f);
+}
+
 /// Wakeup IPI handler stub (vector 251).
 ///
 /// Breaks idle CPUs out of `hlt` when work is enqueued. The handler itself
@@ -903,7 +1001,9 @@ pub unsafe fn init()
     // Exception gates (vectors 0–31).
     set(0, isr0, 0);
     set(1, isr1, 0);
-    set(2, isr2, 2); // NMI — IST2
+    // NMI — IST2. Dedicated stub: distinguishes watchdog backtrace
+    // requests from real hardware NMIs (see ipi_nmi_backtrace_handler).
+    set(2, ipi_nmi_backtrace_stub, 2);
     set(3, isr3, 0);
     set(4, isr4, 0);
     set(5, isr5, 0);

@@ -186,14 +186,27 @@ pub unsafe fn shootdown(root_phys: u64, cpu_mask: u64, virt: u64)
     // Initial IPI volley.
     send_ipis(cpu_mask);
 
-    // Spin until all target CPUs acknowledge.
-    //
-    // Interrupts are enabled (set above), so we can receive and service
-    // incoming TLB shootdown IPIs from other CPUs while we wait. The IPI
-    // handler acquires no locks — only atomic operations and TLB flush.
-    while TLB_SHOOTDOWN.pending_cpus.load(Ordering::Acquire) != 0
-    {
-        core::hint::spin_loop();
+    // TSC-bounded ack wait with re-send + NMI-backtrace escalation. See
+    // arch::current::interrupts::wait_for_ack and the IPI Watchdog Ladder
+    // subsection in docs/scheduling-internals.md. The resend closure
+    // re-fires only to CPUs whose bit is still set at the boundary, so a
+    // dropped IPI from the initial volley recovers without retransmitting
+    // to acks-in-flight. target_cpu is the lowest-numbered CPU still
+    // pending at the start of the wait; it drives the Phase-C NMI
+    // backtrace and the Phase-D panic message.
+    let target_cpu = cpu_mask.trailing_zeros() as usize;
+    let resend = || send_ipis(TLB_SHOOTDOWN.pending_cpus.load(Ordering::Relaxed));
+    // SAFETY: caller invariants (preempt-disabled, IF=1) are upheld by
+    // the save_and_disable_interrupts + enable() sequence above.
+    unsafe {
+        crate::arch::current::interrupts::wait_for_ack(
+            || TLB_SHOOTDOWN.pending_cpus.load(Ordering::Acquire) == 0,
+            &crate::arch::current::interrupts::IpiWaitCtx {
+                op_name: "tlb-shootdown",
+                target_cpu,
+                resend: &resend,
+            },
+        );
     }
 
     shootdown_unlock();

@@ -140,12 +140,15 @@ pub unsafe fn event_queue_post(
         // (lock order: eq.lock → SLEEP_LIST_LOCK; the timer path takes
         // SLEEP_LIST_LOCK first, releases it, and only then reaches for
         // eq.lock — so no circular wait).
+        //
+        // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
+        // `sleep_deadline`. See `signal_send` for the race description.
         // SAFETY: waiter is the TCB we just dequeued from eq.waiter.
         unsafe {
             if (*waiter).sleep_deadline != 0
             {
-                (*waiter).sleep_deadline = 0;
                 crate::sched::sleep_list_remove(waiter);
+                (*waiter).sleep_deadline = 0;
             }
         }
         // SAFETY: paired with lock_raw above.

@@ -7,7 +7,7 @@
 
 pub mod build;
 pub mod clean;
-pub mod disk;
+pub mod mkdisk;
 pub mod run;
 pub mod run_parallel;
 pub mod test;

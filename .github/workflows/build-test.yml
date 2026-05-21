@@ -90,22 +90,22 @@ jobs:
       - name: Stage ${{ matrix.tester }} and repack disk
         # Recipe staging: svctest and usertest live in
         # `sysroot/etc/svcmgr/tests.d/` (svcmgr does not scan that
-        # directory); cp into services.d/ to enable. `cargo xtask disk`
+        # directory); cp into services.d/ to enable. `cargo xtask mkdisk`
         # re-mirrors rootfs and repacks the FAT image without invoking
         # cargo. ktest is bootloader-loaded, so it needs the `init=`
-        # swap in boot.conf and a `cargo xtask disk` to propagate the
+        # swap in boot.conf and a `cargo xtask mkdisk` to propagate the
         # edited boot.conf into the sysroot.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
               cp sysroot/etc/svcmgr/tests.d/svctest.svc \
                  sysroot/etc/svcmgr/services.d/
-              cargo xtask disk --arch ${{ matrix.arch }}
+              cargo xtask mkdisk --arch ${{ matrix.arch }}
               ;;
             usertest)
               cp sysroot/etc/svcmgr/tests.d/usertest.svc \
                  sysroot/etc/svcmgr/services.d/
-              cargo xtask disk --arch ${{ matrix.arch }}
+              cargo xtask mkdisk --arch ${{ matrix.arch }}
               ;;
             ktest)
               sed -i \
@@ -114,7 +114,7 @@ jobs:
                 -e 's|^cmdline=root=|#cmdline=root=|' \
                 -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
                 rootfs/esp/EFI/seraph/boot.conf
-              cargo xtask disk --arch ${{ matrix.arch }}
+              cargo xtask mkdisk --arch ${{ matrix.arch }}
               ;;
           esac
 

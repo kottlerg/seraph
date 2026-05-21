@@ -145,12 +145,6 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
-        name: "usertest",
-        profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
-        arch_only: None,
-    },
-    Spec {
         name: "svcmgr",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
@@ -170,6 +164,12 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "timed",
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsBin,
+        arch_only: None,
+    },
+    Spec {
+        name: "svctest",
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
@@ -223,8 +223,8 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::GoldfishRtc => "goldfish-rtc",
         BuildComponent::Fatfs => "fatfs",
         BuildComponent::Crasher => "crasher",
-        BuildComponent::Usertest => "usertest",
         BuildComponent::Svcmgr => "svcmgr",
+        BuildComponent::Svctest => "svctest",
         BuildComponent::Pwrmgr => "pwrmgr",
         BuildComponent::Timed => "timed",
         BuildComponent::Hello => "hello",

@@ -48,7 +48,7 @@ jobs:
         with:
           shared-key: burnin-${{ matrix.arch }}-${{ matrix.profile }}
 
-      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }}) — usertest config
+      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }}) — svctest config
         run: |
           if [ "${{ matrix.profile }}" = "release" ]; then
             cargo xtask build --arch ${{ matrix.arch }} --release
@@ -56,18 +56,18 @@ jobs:
             cargo xtask build --arch ${{ matrix.arch }}
           fi
 
-      - name: usertest burn-in (4 × 20 iterations)
-        id: usertest-burnin
+      - name: svctest burn-in (4 × 20 iterations)
+        id: svctest-burnin
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
             --parallel 4 --runs 20 --timeout 60
 
-      - name: Upload usertest logs
+      - name: Upload svctest logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: burnin-usertest-${{ matrix.arch }}-${{ matrix.profile }}
+          name: burnin-svctest-${{ matrix.arch }}-${{ matrix.profile }}
           path: target/xtask/run-parallel/**/*.log
           if-no-files-found: ignore
 

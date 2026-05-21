@@ -11,7 +11,7 @@
 //! (ACPI S5), and the `SbiControl` cap on RISC-V (SBI SRST). Init
 //! transfers those caps to pwrmgr during Phase 3 bootstrap and hands a
 //! `SHUTDOWN_AUTHORITY`-tokened SEND cap on pwrmgr's service endpoint to
-//! the consumers permitted to invoke shutdown (today: usertest, plus a
+//! the consumers permitted to invoke shutdown (today: svctest, plus a
 //! reserved copy held by svcmgr for future escalation policy).
 //!
 //! See `services/pwrmgr/README.md` for the design and future-scope

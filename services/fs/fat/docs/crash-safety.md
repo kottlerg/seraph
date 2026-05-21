@@ -71,7 +71,7 @@ but reconciles to FAT 0.
 
 ## Tested ordering invariants
 
-`usertest`'s `fs_write_cache_coherence_phase` confirms that
+`svctest`'s `fs_write_cache_coherence_phase` confirms that
 write-through means `FS_READ` after `FS_WRITE` observes the new bytes
 without any explicit flush — no scenario in v0.1.0 requires a flush
 between write and read for correctness within the lifetime of a

@@ -8,7 +8,7 @@
 //! pass/fail regexes. Intended for shaking out timing-dependent bugs that
 //! single-shot `cargo xtask run` cannot reliably expose.
 //!
-//! Mode-agnostic by design: xtask does not know about ktest, usertest, or
+//! Mode-agnostic by design: xtask does not know about ktest, svctest, or
 //! any other rootfs configuration. The caller supplies success and failure
 //! regexes (`--pass`, `--fail`); xtask only classifies outcomes by matching
 //! those patterns against per-run logs, plus exit-code and watchdog state.

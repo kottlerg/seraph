@@ -136,16 +136,16 @@ cargo xtask run-parallel \
 | `--runs` | (required) | Total runs, dispatched in waves of `--parallel` |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
 | `--cpus` | `4` | vCPUs per guest |
-| `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the unique terminal marker emitted by both ktest (`ktest: ALL TESTS PASSED`) and usertest (`[usertest] ALL TESTS PASSED`). On match the log is discarded and the run is classified `PASS` |
+| `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the unique terminal marker emitted by both ktest (`ktest: ALL TESTS PASSED`) and svctest (`[svctest] ALL TESTS PASSED`). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | (none) | Regex marking a failed run; the **first** match wins. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success |
 
-**Mode-agnostic**: xtask does not know about ktest, usertest, or any other
+**Mode-agnostic**: xtask does not know about ktest, svctest, or any other
 rootfs configuration. Pass/fail markers come from the invoker. The default
 `--pass` works for both modes because they emit the same terminal marker.
 Override for other configurations:
 
 ```sh
-# Default (works for ktest or usertest)
+# Default (works for ktest or svctest)
 cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100
 
 # Custom marker

@@ -142,7 +142,7 @@ The set of services svcmgr currently supervises (per the shipped
 
 | Service | Source | Restart | Critical |
 |---|---|---|---|
-| `usertest` | svcmgr-launched | `never` | `low` |
+| `svctest` | svcmgr-launched | `never` | `low` |
 | `crasher` | svcmgr-launched | `always` | `low` |
 | `memmgr` | init-registered (bind only) | `never` | `high` |
 | `procmgr` | init-registered (bind only) | `never` | `high` |

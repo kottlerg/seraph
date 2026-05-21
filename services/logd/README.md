@@ -55,7 +55,7 @@ process.
 
 * Log rotation, durable-disk persistence, query API.
 * Network-syslog sink.
-* svcmgr-late-launch migration (parallel to the usertest refactor;
+* svcmgr-late-launch migration (parallel to the svctest refactor;
   logd is launched by init for now).
 
 ## Source Layout

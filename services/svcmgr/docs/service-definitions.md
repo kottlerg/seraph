@@ -31,9 +31,9 @@ Unknown keys are **hard errors** — a typo cannot silently degrade a
 service.
 
 ```
-# /bin/usertest — services-tier OS test harness.
-binary    = /bin/usertest
-argv      = usertest run
+# /bin/svctest — services-tier OS test harness.
+binary    = /bin/svctest
+argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
 critical  = low
@@ -59,7 +59,7 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 
 | Value | Semantics |
 |---|---|
-| `never` | Service is one-shot; never restarted, even on fault. Used for integration-test fixtures (e.g. `usertest`) whose clean exit is the success signal. |
+| `never` | Service is one-shot; never restarted, even on fault. Used for integration-test fixtures (e.g. `svctest`) whose clean exit is the success signal. |
 | `on_failure` | Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`). Clean exits are treated as intentional. |
 | `always` | Restart on every exit, clean or faulty. Default for daemons that should never terminate during normal operation. |
 
@@ -91,7 +91,7 @@ The primary lever for confining a service to only what it needs.
 | Form | Effect |
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported`. Default tight choice for services with no filesystem dependency. |
-| `universal` | `cap_copy` of svcmgr's own root (post-#21: the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/bin`, usertest as the namespace tester). |
+| `universal` | `cap_copy` of svcmgr's own root (post-#21: the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/bin`, svctest as the namespace tester). |
 | `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<rights>` is a `+`-joined list of named tokens (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown tokens are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
@@ -110,7 +110,7 @@ parser error.
 
 `std::env::current_dir()` returns `Unsupported` until a path string
 is recorded via `std::env::set_current_dir`; the cap and the
-path-string surface are independent. See usertest's
+path-string surface are independent. See svctest's
 `env_cwd_unset_phase` for the assertion.
 
 ## `seed`
@@ -129,7 +129,7 @@ list is truncated to `MSG_CAP_SLOTS_MAX` (currently 4) entries; any
 truncation is logged.
 
 An unresolved name leaves slot `i` as `0`. Consumers that already
-tolerate `cap == 0 → skip` (e.g. usertest's pwrmgr phases) continue
+tolerate `cap == 0 → skip` (e.g. svctest's pwrmgr phases) continue
 to work; consumers that don't fail on first use, which is the right
 surface for a real misconfiguration.
 

@@ -54,9 +54,9 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (token bit
    service endpoint:
    - `pwrmgr_auth_cap` — `cap_derive_token(ep, SEND, SHUTDOWN_AUTHORITY)`.
    - `pwrmgr_noauth_cap` — `cap_derive_token(ep, SEND, 0)`. Used by
-     usertest's `pwrmgr_cap_deny_phase` to verify the gate.
-4. Init installs both caps in usertest's bootstrap-round payload.
-5. usertest, at the end of `main()` after `ALL TESTS PASSED`, sends
+     svctest's `pwrmgr_cap_deny_phase` to verify the gate.
+4. Init installs both caps in svctest's bootstrap-round payload.
+5. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends
    `pwrmgr_labels::SHUTDOWN` through the authorised cap. pwrmgr executes
    the platform shutdown sequence. QEMU exits cleanly, ending naked
    `cargo xtask run` without a wall-clock wait.
@@ -90,7 +90,7 @@ Out of scope for v0.1.0; deferred until concrete consumers exist:
 - **Battery and thermal monitoring** — ACPI `_BST` / `_TZ`, RISC-V
   platform sensors.
 - **Operator UX** — `shutdown` / `reboot` CLI wrappers calling pwrmgr.
-- **svcmgr-managed launch of usertest** — usertest is not
+- **svcmgr-managed launch of svctest** — svctest is not
   bootstrap-essential. Moving its spawn from init to svcmgr lets init
   fully exit earlier once a real logd lands.
 - **Cmdline-driven test-vs-shell mode** — naked `cargo xtask run` could

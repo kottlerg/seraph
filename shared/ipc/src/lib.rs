@@ -436,7 +436,7 @@ pub mod svcmgr_labels
     /// svcmgr's own root cap at full rights. Reserved for the small
     /// allow-list of services that need genuine root authority (vfsd
     /// as the namespace authority, devmgr for `/dev`, procmgr for
-    /// walking `/bin`, usertest as the namespace tester).
+    /// walking `/bin`, svctest as the namespace tester).
     pub const NS_POLICY_UNIVERSAL: u8 = 0;
     /// Namespace-policy descriptor: do not deliver any namespace
     /// cap. The child's `ProcessInfo.system_root_cap` stays zero
@@ -517,7 +517,7 @@ pub mod published_names
 
     /// No-authority SEND on pwrmgr's service endpoint, tokenised
     /// with a non-`SHUTDOWN_AUTHORITY` sentinel. Used by negative
-    /// tests (e.g. usertest's `pwrmgr_cap_deny`) that need a cap
+    /// tests (e.g. svctest's `pwrmgr_cap_deny`) that need a cap
     /// pointing at pwrmgr without the shutdown bit to verify the
     /// authority gate rejects it.
     pub const PWRMGR_DENY: &[u8] = b"pwrmgr.deny";

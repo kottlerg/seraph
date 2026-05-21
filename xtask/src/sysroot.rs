@@ -91,24 +91,24 @@ pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
         step(&format!("Rootfs: {}", dst.display()));
     }
 
-    synthesise_usertest_large_bin(ctx)?;
-    synthesise_usertest_bench_bin(ctx)?;
+    synthesise_svctest_large_bin(ctx)?;
+    synthesise_svctest_bench_bin(ctx)?;
 
     Ok(())
 }
 
-const USERTEST_LARGE_BIN_PAGES: usize = 4;
-const USERTEST_LARGE_BIN_PAGE_SIZE: usize = 4096;
+const SVCTEST_LARGE_BIN_PAGES: usize = 4;
+const SVCTEST_LARGE_BIN_PAGE_SIZE: usize = 4096;
 
-/// Emit `/usertest/large.bin`, a 16 KiB deterministic fixture consumed by
-/// `usertest`'s `fs_release_on_close_phase`. Each 4 KiB page is filled with
+/// Emit `/svctest/large.bin`, a 16 KiB deterministic fixture consumed by
+/// `svctest`'s `fs_release_on_close_phase`. Each 4 KiB page is filled with
 /// the ASCII tag `PAGE_NN_` repeated, where `NN` is the page index. The
 /// phase asserts the first 8 bytes equal `PAGE_00_` to confirm content
 /// integrity across the FS_READ_FRAME / mem_map / release sequence.
-/// Gitignored under `rootfs/usertest/` and treated as a build artifact.
-fn synthesise_usertest_large_bin(ctx: &BuildContext) -> Result<()>
+/// Gitignored under `rootfs/svctest/` and treated as a build artifact.
+fn synthesise_svctest_large_bin(ctx: &BuildContext) -> Result<()>
 {
-    let dst = ctx.sysroot.join("usertest/large.bin");
+    let dst = ctx.sysroot.join("svctest/large.bin");
     if dst.exists()
     {
         return Ok(());
@@ -117,14 +117,14 @@ fn synthesise_usertest_large_bin(ctx: &BuildContext) -> Result<()>
     {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let total = USERTEST_LARGE_BIN_PAGES * USERTEST_LARGE_BIN_PAGE_SIZE;
+    let total = SVCTEST_LARGE_BIN_PAGES * SVCTEST_LARGE_BIN_PAGE_SIZE;
     let mut buf = Vec::with_capacity(total);
-    for page in 0..USERTEST_LARGE_BIN_PAGES
+    for page in 0..SVCTEST_LARGE_BIN_PAGES
     {
         let tag = format!("PAGE_{page:02}_");
         let tag_bytes = tag.as_bytes();
         let mut written = 0usize;
-        while written < USERTEST_LARGE_BIN_PAGE_SIZE
+        while written < SVCTEST_LARGE_BIN_PAGE_SIZE
         {
             buf.extend_from_slice(tag_bytes);
             written += tag_bytes.len();
@@ -136,16 +136,16 @@ fn synthesise_usertest_large_bin(ctx: &BuildContext) -> Result<()>
     Ok(())
 }
 
-const USERTEST_BENCH_BIN_SIZE: usize = 65536;
+const SVCTEST_BENCH_BIN_SIZE: usize = 65536;
 
-/// Emit `/usertest/bench.bin`, a 64 KiB deterministic fixture consumed by
+/// Emit `/svctest/bench.bin`, a 64 KiB deterministic fixture consumed by
 /// `fsbench` (the FS_READ vs FS_READ_FRAME crossover benchmark). Filled
 /// with a byte-position-derived pattern so any read-path corruption shows
 /// up as a content mismatch at the byte level. Gitignored and treated as
 /// a build artifact, same pattern as `large.bin`.
-fn synthesise_usertest_bench_bin(ctx: &BuildContext) -> Result<()>
+fn synthesise_svctest_bench_bin(ctx: &BuildContext) -> Result<()>
 {
-    let dst = ctx.sysroot.join("usertest/bench.bin");
+    let dst = ctx.sysroot.join("svctest/bench.bin");
     if dst.exists()
     {
         return Ok(());
@@ -154,8 +154,8 @@ fn synthesise_usertest_bench_bin(ctx: &BuildContext) -> Result<()>
     {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut buf = Vec::with_capacity(USERTEST_BENCH_BIN_SIZE);
-    for i in 0..USERTEST_BENCH_BIN_SIZE
+    let mut buf = Vec::with_capacity(SVCTEST_BENCH_BIN_SIZE);
+    for i in 0..SVCTEST_BENCH_BIN_SIZE
     {
         #[allow(clippy::cast_possible_truncation)]
         let b = (i & 0xFF) as u8;

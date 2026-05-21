@@ -21,8 +21,8 @@ rootfs/
         boot.conf     # Bootloader config; selects init mode (init=ktest, …)
   srv/
     test.txt          # Sample service-data file
-  usertest/
-    large.bin         # Data file consumed by the usertest harness
+  svctest/
+    large.bin         # Data file consumed by the svctest harness
 ```
 
 To add a new static file, place it under the path it should occupy in the

@@ -38,7 +38,7 @@ pub enum RestartPolicy
 {
     /// Service is one-shot; never restart, even on fault. Used for
     /// integration-test fixtures whose exit is the success signal
-    /// (e.g. `usertest`).
+    /// (e.g. `svctest`).
     Never,
     /// Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`).
     /// Clean exits are treated as intentional.

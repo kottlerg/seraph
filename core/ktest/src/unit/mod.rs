@@ -5,10 +5,19 @@
 
 //! Tier 1 — per-syscall isolation tests.
 //!
-//! Each file in this module covers one logical group of related syscalls
-//! (mirroring the kernel's subsystem structure). Every kernel syscall must
-//! have at least one test here. Adding a new syscall means adding a section
-//! to the appropriate file.
+//! Rule (durable):
+//!
+//! > **One module per kernel subsystem under test. New subsystem ⇒ new
+//! > module.**
+//!
+//! Adding a new syscall means adding a section in the file for its
+//! kernel subsystem — not a new file. New file only when a new kernel
+//! subsystem is added. Files stay scoped; they don't grow unboundedly
+//! because each is one surface.
+//!
+//! Every kernel syscall must have at least one positive-path test here
+//! plus its most important negative paths (wrong rights, invalid
+//! arguments, wrong object state).
 //!
 //! Files:
 //! - `cap.rs`      — capability creation, copy, move, insert, derive, revoke, delete

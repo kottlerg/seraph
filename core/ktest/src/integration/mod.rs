@@ -5,11 +5,17 @@
 
 //! Tier 2 — cross-subsystem integration tests.
 //!
+//! Rule (durable):
+//!
+//! > **One file per cross-subsystem scenario. New scenario ⇒ new file.**
+//!
 //! Each file exercises a realistic multi-syscall scenario that spans more than
 //! one kernel subsystem. These tests catch emergent bugs that isolated syscall
 //! tests miss — for example, capability rights surviving an IPC transfer, thread
 //! register state being correct after stop+write+resume, or wait set ordering
-//! when multiple sources fire concurrently.
+//! when multiple sources fire concurrently. Don't extend an existing
+//! scenario file to bolt on a tangential second scenario; add a sibling
+//! file.
 //!
 //! Files:
 //! - `thread_lifecycle.rs`       — full thread lifecycle end-to-end

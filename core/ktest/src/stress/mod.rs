@@ -5,6 +5,11 @@
 
 //! Tier S — Stress and torture tests.
 //!
+//! Rule (durable):
+//!
+//! > **One file per race / resource invariant under stress. New race
+//! > class ⇒ new file.**
+//!
 //! These tests exercise race conditions, resource exhaustion, deep capability
 //! trees, and concurrent operations. They are **not** run by default; enable
 //! them with `ktest.filter=stress` in the kernel command line.

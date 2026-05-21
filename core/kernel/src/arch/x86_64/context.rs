@@ -152,24 +152,38 @@ pub unsafe extern "C" fn switch(
         "pushfq",
         "pop rax",
         "mov [rdi + 72], rax",
-        // ── Signal save complete + release lock ───────────────────────────
-        // On x86-64 TSO, stores are globally visible in program order and
-        // the lock was released by release_lock_only() before the call.
-        // Set the context_saved flag for cross-arch consistency. Do this
-        // BEFORE the rdmsr below, which clobbers rdx (the save_flag ptr).
-        "test rdx, rdx",
-        "jz 1f",
-        "mov dword ptr [rdx], 1", // *save_flag = 1 (TSO: implicitly ordered)
-        "1:",
+        // ── Save fs_base, then publish context_saved ──────────────────────
+        // saved_state.fs_base (offset 64) is the last field written during
+        // save. It must be globally visible before context_saved=1, because
+        // remote CPUs use the flag (Acquire) as the publication barrier
+        // for both cross-CPU dispatch (which then reads fs_base for the
+        // restore-side wrmsr) and dealloc UAF (which then frees the TCB
+        // body). See core/kernel/docs/scheduling-internals.md
+        // § Cross-CPU TCB Ownership.
+        //
+        // rdmsr clobbers rdx (which carries the save_flag pointer), so we
+        // stash it in r11 (caller-saved per System V AMD64; not part of
+        // SavedState). On x86-64 TSO, program-order stores are observed in
+        // program order by other CPUs, so the [rdi+64] store is visible
+        // before the [r11] store with no explicit fence; the scheduler-lock
+        // release at release_lock_only() happened in Rust before this asm
+        // and is independent of the publication barrier below.
+        "mov r11, rdx", // r11 = save_flag (rdx clobbered by rdmsr)
         // fs_base: read the currently-live user TLS base from IA32_FS_BASE
         // (MSR 0xc0000100). rdmsr returns high 32 bits in edx, low 32 in
-        // eax; combine into rax. Clobbers rcx/rdx/rax (all caller-saved,
-        // and rdx/save_flag is no longer needed at this point).
+        // eax; combine into rax.
         "mov ecx, 0xc0000100",
         "rdmsr",
         "shl rdx, 32",
         "or  rax, rdx",
-        "mov [rdi + 64], rax",
+        "mov [rdi + 64], rax", // saved_state.fs_base
+        // Publish context_saved = 1 only after every saved_state store is
+        // complete. The null check covers the boot path where save_flag is
+        // null (initial entry).
+        "test r11, r11",
+        "jz 1f",
+        "mov dword ptr [r11], 1", // *save_flag = 1
+        "1:",
         // ── Restore next thread ───────────────────────────────────────────
         // Restore rflags first so the restored flags take effect early.
         "mov rax, [rsi + 72]",

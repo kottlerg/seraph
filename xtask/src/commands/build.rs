@@ -42,25 +42,41 @@ enum BuildProfile
 #[derive(Clone, Copy, Debug)]
 enum InstallDest
 {
-    /// Installed under `sysroot/EFI/seraph/<name>` — boot modules loaded by
-    /// the bootloader.
+    /// Installed under `sysroot/EFI/seraph/<install_name>` — boot modules
+    /// loaded by the bootloader.
     EfiSeraph,
-    /// Installed under `sysroot/bin/<name>` — loaded by procmgr from the
-    /// root partition via VFS at runtime.
+    /// Installed under `sysroot/bin/<install_name>` — loaded by procmgr
+    /// from the root partition via VFS at runtime.
     RootfsBin,
-    /// Installed under both `sysroot/EFI/seraph/<name>` (bootloader-loaded
-    /// boot module) AND `sysroot/bin/<name>` (root partition). Used by
-    /// services that bootstrap the VFS itself (fatfs is needed once as a
-    /// boot module to mount root, then re-spawned from `/bin/<name>` for
-    /// every subsequent mount via the regular VFS path).
+    /// Installed under both `sysroot/EFI/seraph/<install_name>`
+    /// (bootloader-loaded boot module) AND `sysroot/bin/<install_name>`
+    /// (root partition). Used by services that bootstrap the VFS itself
+    /// (fatfs is needed once as a boot module to mount root, then
+    /// re-spawned from `/bin/<install_name>` for every subsequent mount
+    /// via the regular VFS path).
     EfiAndRootfsBin,
+    /// Installed under `sysroot/tests/<install_name>` — test-harness
+    /// binaries. svcmgr does not scan this path; harness recipes live
+    /// in `rootfs/etc/svcmgr/tests.d/`. See docs/testing.md.
+    RootfsTests,
+    /// Installed under `sysroot/tests/programs/<install_name>` —
+    /// per-program tester binaries discovered by the `usertest`
+    /// orchestrator. See docs/testing.md.
+    RootfsTestsPrograms,
 }
 
 /// Static description of a single buildable component (other than boot).
 struct Spec
 {
-    /// Cargo package/bin name (they match for every component today).
+    /// Cargo package/bin name. The cargo invocation uses this for both
+    /// `-p` and `--bin`; cargo writes the binary at `target/.../<name>`.
     name: &'static str,
+    /// Filename under [`InstallDest`]. When `None`, equals [`Spec::name`]
+    /// — the long-standing default for every production component. Set
+    /// to `Some(...)` only when the install filename differs from the
+    /// cargo crate name (per-program testers: crate `hello-tester` →
+    /// installs as `/tests/programs/hello`).
+    install_name: Option<&'static str>,
     profile: BuildProfile,
     dest: InstallDest,
     /// If `Some`, only build/install this component when the active arch
@@ -69,139 +85,191 @@ struct Spec
     arch_only: Option<Arch>,
 }
 
+impl Spec
+{
+    /// Filename of the installed binary under [`Spec::dest`].
+    fn install_name(&self) -> &'static str
+    {
+        self.install_name.unwrap_or(self.name)
+    }
+}
+
 /// Every buildable component except `boot`. Order matters for `All` builds:
 /// kernel → init → ktest → procmgr → dependent services → rootfs binaries.
 const SPECS: &[Spec] = &[
     Spec {
         name: "kernel",
+        install_name: None,
         profile: BuildProfile::Kernel,
         dest: InstallDest::EfiSeraph,
         arch_only: None,
     },
     Spec {
         name: "init",
+        install_name: None,
         profile: BuildProfile::LowLevelUser,
         dest: InstallDest::EfiSeraph,
         arch_only: None,
     },
     Spec {
         name: "ktest",
+        install_name: None,
         profile: BuildProfile::LowLevelUser,
         dest: InstallDest::EfiSeraph,
         arch_only: None,
     },
     Spec {
         name: "procmgr",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiSeraph,
         arch_only: None,
     },
     Spec {
         name: "memmgr",
+        install_name: None,
         profile: BuildProfile::LowLevelUser,
         dest: InstallDest::EfiSeraph,
         arch_only: None,
     },
     Spec {
         name: "devmgr",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiSeraph,
         arch_only: None,
     },
     Spec {
         name: "vfsd",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiSeraph,
         arch_only: None,
     },
     Spec {
         name: "virtio-blk",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiSeraph,
         arch_only: None,
     },
     Spec {
         name: "cmos-rtc",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: Some(Arch::X86_64),
     },
     Spec {
         name: "goldfish-rtc",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: Some(Arch::Riscv64),
     },
     Spec {
         name: "fatfs",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::EfiAndRootfsBin,
         arch_only: None,
     },
     Spec {
         name: "crasher",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
         name: "svcmgr",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
         name: "pwrmgr",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
         name: "logd",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
         name: "timed",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
         name: "svctest",
+        install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::RootfsTests,
+        arch_only: None,
+    },
+    Spec {
+        name: "usertest",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsTests,
         arch_only: None,
     },
     Spec {
         name: "hello",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
+        name: "hello-tester",
+        install_name: Some("hello"),
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsTestsPrograms,
+        arch_only: None,
+    },
+    Spec {
         name: "fsbench",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
         name: "stackoverflow",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
         name: "pipefault",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
         arch_only: None,
     },
     Spec {
         name: "stdiotest",
+        install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::RootfsBin,
+        arch_only: None,
+    },
+    Spec {
+        name: "stdiotest-tester",
+        install_name: Some("stdiotest"),
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::RootfsTestsPrograms,
         arch_only: None,
     },
 ];
@@ -225,13 +293,16 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Crasher => "crasher",
         BuildComponent::Svcmgr => "svcmgr",
         BuildComponent::Svctest => "svctest",
+        BuildComponent::Usertest => "usertest",
         BuildComponent::Pwrmgr => "pwrmgr",
         BuildComponent::Timed => "timed",
         BuildComponent::Hello => "hello",
+        BuildComponent::HelloTester => "hello-tester",
         BuildComponent::Fsbench => "fsbench",
         BuildComponent::Stackoverflow => "stackoverflow",
         BuildComponent::Pipefault => "pipefault",
         BuildComponent::Stdiotest => "stdiotest",
+        BuildComponent::StdiotestTester => "stdiotest-tester",
     };
     SPECS.iter().find(|s| s.name == name)
 }
@@ -609,14 +680,20 @@ fn profile_params(arch: Arch, profile: BuildProfile) -> (&'static str, &'static 
 
 fn install_paths(ctx: &BuildContext, spec: &Spec) -> Result<Vec<PathBuf>>
 {
+    let n = spec.install_name();
     Ok(match spec.dest
     {
-        InstallDest::EfiSeraph => vec![ctx.sysroot_efi_seraph().join(spec.name)],
-        InstallDest::RootfsBin => vec![ctx.sysroot.join("bin").join(spec.name)],
+        InstallDest::EfiSeraph => vec![ctx.sysroot_efi_seraph().join(n)],
+        InstallDest::RootfsBin => vec![ctx.sysroot.join("bin").join(n)],
         InstallDest::EfiAndRootfsBin => vec![
-            ctx.sysroot_efi_seraph().join(spec.name),
-            ctx.sysroot.join("bin").join(spec.name),
+            ctx.sysroot_efi_seraph().join(n),
+            ctx.sysroot.join("bin").join(n),
         ],
+        InstallDest::RootfsTests => vec![ctx.sysroot.join("tests").join(n)],
+        InstallDest::RootfsTestsPrograms =>
+        {
+            vec![ctx.sysroot.join("tests").join("programs").join(n)]
+        }
     })
 }
 

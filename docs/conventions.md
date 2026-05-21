@@ -75,15 +75,15 @@ Each `Y` bump (`v0.1.0`, `v0.2.0`, …) has a GitHub milestone. Issues blocking 
 ### Historical naming
 
 The identifier `usertest` formerly named the services-tier integration test
-harness, which lived at `base/usertest/`. As of the `base/`→`programs/` and
-`usertest`→`svctest` rename, the harness lives at `services/svctest/` and the
-log prefix is `[svctest]`. The `usertest` name is reserved for a planned
-tier-3 (under `programs/`) harness; documentation and code reaching back into
-that name therefore refer to the future tier-3 harness, not the historical
-services-tier one. References predating the rename in commit messages, PR
-descriptions, and closed Issues use the old name and are left as-is; open
-Issues were swept to use `svctest` where they meant the services-tier
-harness.
+harness, which lived at `base/usertest/`. The `base/`→`programs/` and
+`usertest`→`svctest` rename relocated that harness to `services/svctest/`
+(log prefix `[svctest]`), freeing the `usertest` name. The reclaimed name now
+identifies the programs-surface orchestrator at `services/usertest/` (log
+prefix `[usertest]`) — see [testing.md](testing.md) for the current
+tier taxonomy and conventions. References to `usertest` predating the rename
+(commit messages, PR descriptions, closed Issues) refer to the historical
+services-tier harness, not the current programs-surface one; open Issues
+were swept to use `svctest` where they meant the services-tier harness.
 
 ## Commit Messages
 

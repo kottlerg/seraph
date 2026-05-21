@@ -91,14 +91,17 @@ pub enum BuildComponent
     Fatfs,
     Crasher,
     Svctest,
+    Usertest,
     Svcmgr,
     Pwrmgr,
     Timed,
     Hello,
+    HelloTester,
     Fsbench,
     Pipefault,
     Stackoverflow,
     Stdiotest,
+    StdiotestTester,
     All,
 }
 
@@ -194,10 +197,10 @@ pub struct RunParallelArgs
     pub cpus: u32,
 
     /// Regex marking a successful run. On match the log is discarded and
-    /// the run is classified PASS. The default matches the unique terminal
-    /// marker emitted by both ktest (`ktest: ALL TESTS PASSED`) and
-    /// svctest (`[svctest] ALL TESTS PASSED`); override for other rootfs
-    /// configurations.
+    /// the run is classified PASS. The default matches the cross-harness
+    /// terminal marker `[<harness>] ALL TESTS PASSED` standardised in
+    /// [`docs/testing.md`](../../../docs/testing.md); override for other
+    /// rootfs configurations.
     #[arg(long, default_value = "ALL TESTS PASSED")]
     pub pass: String,
 

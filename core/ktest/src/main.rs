@@ -305,11 +305,11 @@ fn run(info_ptr: u64) -> !
     log_u64("ktest: failed=", failed as u64);
     if failed == 0
     {
-        log("ktest: ALL TESTS PASSED");
+        log("[ktest] ALL TESTS PASSED");
     }
     else
     {
-        log("ktest: SOME TESTS FAILED");
+        log("[ktest] SOME TESTS FAILED");
     }
 
     // ── Shutdown ─────────────────────────────────────────────────────────────

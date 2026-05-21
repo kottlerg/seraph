@@ -81,14 +81,35 @@ jobs:
             cargo xtask build --arch ${{ matrix.arch }}
           fi
 
-      - name: svctest single-shot (default boot.conf, init=init)
+      # Test-harness recipes ship under sysroot/etc/svcmgr/tests.d/ and
+      # are NOT loaded by svcmgr. Each step below stages exactly one
+      # recipe into services.d/ before booting, cleaning any leftover
+      # from the previous step. See docs/testing.md.
+
+      - name: Stage and run svctest
         run: |
+          rm -f sysroot/etc/svcmgr/services.d/svctest.svc \
+                sysroot/etc/svcmgr/services.d/usertest.svc
+          cp sysroot/etc/svcmgr/tests.d/svctest.svc \
+             sysroot/etc/svcmgr/services.d/
+          cargo xtask run-parallel \
+            --arch ${{ matrix.arch }} \
+            --parallel 1 --runs 1 --timeout 180
+
+      - name: Stage and run usertest
+        run: |
+          rm -f sysroot/etc/svcmgr/services.d/svctest.svc \
+                sysroot/etc/svcmgr/services.d/usertest.svc
+          cp sysroot/etc/svcmgr/tests.d/usertest.svc \
+             sysroot/etc/svcmgr/services.d/
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
             --parallel 1 --runs 1 --timeout 180
 
       - name: Swap boot.conf to init=ktest and rebuild
         run: |
+          rm -f sysroot/etc/svcmgr/services.d/svctest.svc \
+                sysroot/etc/svcmgr/services.d/usertest.svc
           sed -i \
             -e 's|^init=init$|#init=init|' \
             -e 's|^#init=ktest$|init=ktest|' \

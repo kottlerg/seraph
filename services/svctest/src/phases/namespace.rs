@@ -95,7 +95,7 @@ fn bin_child_main() -> !
     {
         std::process::exit(4);
     }
-    if std::fs::File::open("/svctest").is_err()
+    if std::fs::File::open("/hello").is_err()
     {
         std::process::exit(1);
     }
@@ -164,7 +164,7 @@ pub fn ns_phase(caps: &Caps)
         }
     }
     for expected in [
-        &b"svctest"[..],
+        &b"hello"[..],
         &b"pipefault"[..],
         &b"stackoverflow"[..],
         &b"stdiotest"[..],
@@ -183,18 +183,18 @@ pub fn ns_phase(caps: &Caps)
     }
     std::os::seraph::log!("ns: NS_READDIR /bin saw lowercase LFN-canonical names");
 
-    let svctest_cap = match ns_lookup(bin_cap, b"SVCTEST", 0xFFFF, ipc_buf)
+    let hello_cap = match ns_lookup(bin_cap, b"HELLO", 0xFFFF, ipc_buf)
     {
         Ok((cap, kind, _size)) =>
         {
-            assert_eq!(kind, 0, "expected /bin/SVCTEST to be a file (kind=0)");
+            assert_eq!(kind, 0, "expected /bin/HELLO to be a file (kind=0)");
             cap
         }
-        Err(code) => panic!("NS_LOOKUP(/bin, \"SVCTEST\") failed: code={code}"),
+        Err(code) => panic!("NS_LOOKUP(/bin, \"HELLO\") failed: code={code}"),
     };
-    let _ = ns_stat(svctest_cap, ipc_buf).expect("NS_STAT on SVCTEST must succeed");
-    let _ = syscall::cap_delete(svctest_cap);
-    std::os::seraph::log!("ns: NS_LOOKUP /bin/SVCTEST ok");
+    let _ = ns_stat(hello_cap, ipc_buf).expect("NS_STAT on HELLO must succeed");
+    let _ = syscall::cap_delete(hello_cap);
+    std::os::seraph::log!("ns: NS_LOOKUP /bin/HELLO ok");
 
     match ns_lookup(root_fs, b"nonexistent_xyz", 0xFFFF, ipc_buf)
     {
@@ -216,7 +216,7 @@ pub fn ns_phase(caps: &Caps)
         Ok((cap, _kind, _size)) => cap,
         Err(code) => panic!("NS_LOOKUP for limited /bin cap failed: code={code}"),
     };
-    match ns_lookup(limited_cap, b"SVCTEST", 0xFFFF, ipc_buf)
+    match ns_lookup(limited_cap, b"HELLO", 0xFFFF, ipc_buf)
     {
         Ok(_) => panic!("NS_LOOKUP through STAT-only cap unexpectedly succeeded"),
         Err(code) =>
@@ -407,12 +407,12 @@ pub fn ns_sandbox_phase(_: &Caps)
         Err(code) => panic!("ns_sandbox: walk-attenuate /srv failed: code={code}"),
     };
 
-    let mut cmd = std::process::Command::new("/bin/svctest");
+    let mut cmd = std::process::Command::new("/tests/svctest");
     cmd.arg("sandbox-child");
     cmd.namespace_cap(attenuated);
     let status = cmd
         .status()
-        .expect("ns_sandbox: spawn /bin/svctest sandbox-child failed");
+        .expect("ns_sandbox: spawn /tests/svctest sandbox-child failed");
 
     assert!(
         status.success(),
@@ -442,17 +442,17 @@ pub fn ns_bin_subtree_phase(_: &Caps)
         Err(e) => panic!("ns_bin_subtree: walk-attenuate /bin failed: {e}"),
     };
 
-    let mut cmd = std::process::Command::new("/bin/svctest");
+    let mut cmd = std::process::Command::new("/tests/svctest");
     cmd.arg("bin-child");
     cmd.namespace_cap(bin_cap);
     let status = cmd
         .status()
-        .expect("ns_bin_subtree: spawn /bin/svctest bin-child failed");
+        .expect("ns_bin_subtree: spawn /tests/svctest bin-child failed");
 
     assert!(
         status.success(),
         "ns_bin_subtree: child exit status {status:?}; expected 0. \
-         1 = /svctest open failed (cap not rooted at /bin), \
+         1 = /hello open failed (cap not rooted at /bin), \
          2 = /srv/test.txt unexpectedly opened (cap not attenuated), \
          3 = /srv/test.txt failed with unexpected error kind, \
          4 = no system_root_cap delivered to child"

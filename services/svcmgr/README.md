@@ -91,10 +91,16 @@ svcmgr/
 
 Init spawns svcmgr with the **universal** `system_root_cap` (post-#21).
 svcmgr reads `/etc/svcmgr/services.d/*.svc` directly via `std::fs`,
-walks `/bin/<name>` for first-launch, and applies per-service
+walks the recipe's `binary` path for first-launch, and applies per-service
 namespace attenuation from each `.svc` `namespace = ...` line via
 `procmgr_labels::CONFIGURE_NAMESPACE`. Restart-time attenuation reads
 the same `ServiceEntry`-stored policy that reconcile installed.
+
+svcmgr scans only `services.d/`. The sibling directory
+`/etc/svcmgr/tests.d/` holds opt-in test-harness recipes; svcmgr never
+reads it. The test gating contract — copy a `tests.d/<harness>.svc` into
+`services.d/` between build and run — is owned by
+[docs/testing.md](../../docs/testing.md).
 
 ---
 
@@ -105,7 +111,7 @@ The authoritative spec lives in
 minimal example:
 
 ```
-binary    = /bin/svctest
+binary    = /tests/svctest
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
@@ -178,4 +184,4 @@ marked degraded and not restarted automatically. See
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Process Lifecycle](../../docs/process-lifecycle.md)
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Process Lifecycle](../../docs/process-lifecycle.md), [Testing](../../docs/testing.md)

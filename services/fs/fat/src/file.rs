@@ -14,7 +14,7 @@
 //! caller-side child cap so per-cookie revocation is possible.
 
 /// Maximum number of simultaneously open files.
-pub const MAX_OPEN_FILES: usize = 8;
+pub const MAX_OPEN_FILES: usize = 16;
 
 /// Maximum outstanding `FS_READ_FRAME` pages per open file.
 ///

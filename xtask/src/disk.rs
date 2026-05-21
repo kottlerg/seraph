@@ -143,7 +143,7 @@ impl Seek for PartitionSlice
 
 /// Create a GPT disk image at `<project_root>/disk.img`.
 ///
-/// The image contains two 64 MiB FAT32 partitions:
+/// The image contains two FAT32 partitions sized [`PARTITION_SIZE`]:
 /// - Partition 1 (ESP): populated from `sysroot/esp/`
 /// - Partition 2 (ROOT): populated from `sysroot/` excluding `esp/`
 pub fn create_disk_image(ctx: &BuildContext) -> Result<()>

@@ -136,7 +136,7 @@ impl NodeTable
         }
         self.entries[self.len] = Some(node);
         self.len += 1;
-        // self.len fits in NodeId's u40 range trivially (MAX_NODES is 64).
+        // self.len fits in NodeId's u40 range trivially (MAX_NODES is small).
         NodeId::new(self.len as u64)
     }
 

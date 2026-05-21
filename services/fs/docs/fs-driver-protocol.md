@@ -186,9 +186,9 @@ contiguous bytes across the boundary.
 
 ### Measured per-call cost (`fsbench`, debug builds)
 
-Source: `base/fsbench/src/main.rs`. The bench loops 256 timed iterations
+Source: `programs/fsbench/src/main.rs`. The bench loops 256 timed iterations
 of "seek to 0; read N bytes via the chosen path" against a 64 KiB
-fixture (`/usertest/bench.bin`). The inline path chunks into ≤ 504-byte
+fixture (`/svctest/bench.bin`). The inline path chunks into ≤ 504-byte
 non-straddling reads; the frame path always passes a full-page buffer
 so `want > 504` forces a frame call. `cycles_now()` uses `rdtsc` on
 x86_64 and `csrr cycle` on riscv64. Numbers below are `cycles_mean`.

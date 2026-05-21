@@ -81,7 +81,7 @@ jobs:
             cargo xtask build --arch ${{ matrix.arch }}
           fi
 
-      - name: usertest single-shot (default boot.conf, init=init)
+      - name: svctest single-shot (default boot.conf, init=init)
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \

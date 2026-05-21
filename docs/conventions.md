@@ -72,6 +72,19 @@ Each `Y` bump (`v0.1.0`, `v0.2.0`, …) has a GitHub milestone. Issues blocking 
 - Updating the Issue body is `gh issue edit <N> --body "$(cat <<'EOF' …EOF)"` or the web UI. PRs that close Issues SHOULD include the tick-through edit in the same merge action — the closing comment on the Issue MAY also confirm "all acceptance criteria met".
 - This rule retro-applies: existing closed Issues with unticked boxes MAY be left alone, but no new Issue MAY close with unticked acceptance criteria.
 
+### Historical naming
+
+The identifier `usertest` formerly named the services-tier integration test
+harness, which lived at `base/usertest/`. As of the `base/`→`programs/` and
+`usertest`→`svctest` rename, the harness lives at `services/svctest/` and the
+log prefix is `[svctest]`. The `usertest` name is reserved for a planned
+tier-3 (under `programs/`) harness; documentation and code reaching back into
+that name therefore refer to the future tier-3 harness, not the historical
+services-tier one. References predating the rename in commit messages, PR
+descriptions, and closed Issues use the old name and are left as-is; open
+Issues were swept to use `svctest` where they meant the services-tier
+harness.
+
 ## Commit Messages
 
 ### Title

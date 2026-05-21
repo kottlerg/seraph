@@ -25,7 +25,7 @@ for the authoritative statement.
 | Directory | Purpose |
 |---|---|
 | `abi/` | Stable cross-boundary contracts |
-| `base/` | General-purpose userspace applications and utilities |
+| `programs/` | General-purpose userspace applications and utilities |
 | `core/` | Core OS: bootloader, kernel, and the kernel-validation harness (ktest) |
 | `docs/` | Architecture and design documentation |
 | `rootfs/` | System files installed into the sysroot during builds (config files, etc) |

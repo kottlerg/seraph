@@ -1230,7 +1230,7 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
 /// post-#21 consumers resolve from `services.d/<name>.svc` `seed = ...`
 /// lines, then signal `HANDOVER_COMPLETE` so svcmgr scans
 /// `services.d/` and launches the unregistered-but-defined services
-/// (crasher, usertest).
+/// (crasher, svctest).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn phase3_svcmgr_handover(
     info: &InitInfo,
@@ -1287,7 +1287,7 @@ pub fn phase3_svcmgr_handover(
     );
 
     // Wallclock chain: per-arch RTC driver + timed, both published in
-    // svcmgr. Failures are logged but do not abort phase 3 — usertest
+    // svcmgr. Failures are logged but do not abort phase 3 — svctest
     // tolerates `SystemTime::now()` returning UNIX_EPOCH and exercises
     // the live path only when the chain came up.
     thread_caps.timed = bring_up_wallclock(
@@ -2121,7 +2121,7 @@ pub fn create_and_start_timed(
 /// derived from `svcmgr_service_ep` (the un-tokened source init
 /// already owns). All failures are logged; the function never aborts
 /// phase 3 — a degraded wall-clock leaves `SystemTime::now()`
-/// returning `UNIX_EPOCH` but the rest of usertest still runs.
+/// returning `UNIX_EPOCH` but the rest of svctest still runs.
 pub fn bring_up_wallclock(
     info: &InitInfo,
     procmgr_ep: u32,

@@ -60,7 +60,7 @@ fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
 /// Seed caps that fail to resolve are passed through as slot `0`, so
 /// the child's bootstrap decoder sees a zero in that position. This
 /// matches the existing "absent dep ⇒ skip" pattern already used by
-/// usertest's pwrmgr phases; consumers that don't tolerate a missing
+/// svctest's pwrmgr phases; consumers that don't tolerate a missing
 /// cap fail on first use, which is the right surface for a real
 /// misconfiguration.
 ///
@@ -69,7 +69,7 @@ fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
 /// `START_PROCESS` so an immediate post-start death cannot be lost
 /// (the kernel walks the observer set at the moment of death; an
 /// empty observer set silently drops the event). For one-shot
-/// launches (`restart = never`, e.g. `usertest`) the caller passes
+/// launches (`restart = never`, e.g. `svctest`) the caller passes
 /// `None` and forgoes supervision binding.
 pub fn launch(
     def: &Definition,

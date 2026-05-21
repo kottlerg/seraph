@@ -105,8 +105,8 @@ The authoritative spec lives in
 minimal example:
 
 ```
-binary    = /bin/usertest
-argv      = usertest run
+binary    = /bin/svctest
+argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
 critical  = low

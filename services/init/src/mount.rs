@@ -110,7 +110,7 @@ fn parse_uuid_to_gpt_bytes(s: &[u8], out: &mut [u8; 16]) -> bool
 /// representing the mount root at full namespace rights. The system-
 /// root cap (delivered to every process via `ProcessInfo.system_root_cap`)
 /// is the authoritative cap for VFS access; this per-mount cap is
-/// retained only so the existing usertest direct-driver phase still
+/// retained only so the existing svctest direct-driver phase still
 /// has a fatfs root to exercise.
 pub struct MountOutcome
 {

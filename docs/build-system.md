@@ -126,11 +126,11 @@ sysroot/
                           # under /bin/fatfs for VFS-loaded re-spawns
   bin/                    # Std-userspace binaries loaded by procmgr from
                           # the root partition via VFS at runtime
-                          # (svcmgr, fatfs, usertest, hello, crasher,
+                          # (svcmgr, fatfs, svctest, hello, crasher,
                           # stackoverflow, pipefault, stdiotest, …)
   config/                 # System configuration (from rootfs/)
   srv/                    # Service data files (from rootfs/)
-  usertest/               # Usertest data files (from rootfs/)
+  svctest/                # Svctest data files (from rootfs/)
 ```
 
 The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
@@ -138,7 +138,7 @@ The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
 services live alongside it under `EFI/seraph/`, the Seraph vendor directory
 within the EFI partition.
 
-Non-ESP directories (`bin/`, `config/`, `srv/`, `usertest/`) populate the
+Non-ESP directories (`bin/`, `config/`, `srv/`, `svctest/`) populate the
 GPT image's root partition, which userspace services mount via vfsd /
 fatfs after boot. The split mirrors real deployments: anything the
 firmware must reach lives on the ESP; everything else lives on the root
@@ -248,8 +248,8 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, runs one usertest iteration against the default `boot.conf`, then swaps `boot.conf` to `init=ktest` and runs one ktest iteration. |
-| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: per `arch × profile` cell, builds and runs `4 × 20` usertest iterations against the default `boot.conf`, then swaps to ktest and runs `4 × 20` ktest iterations. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, runs one svctest iteration against the default `boot.conf`, then swaps `boot.conf` to `init=ktest` and runs one ktest iteration. |
+| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: per `arch × profile` cell, builds and runs `4 × 20` svctest iterations against the default `boot.conf`, then swaps to ktest and runs `4 × 20` ktest iterations. |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch | Builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 
 `build-test.yml` cancels stacked runs on the same ref

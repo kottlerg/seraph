@@ -92,7 +92,7 @@ Init's responsibilities are strictly bounded:
 
    The `NsPolicy` enum and the `configure_child_namespace` helper
    live in [`src/service.rs`](src/service.rs). `crasher` and
-   `usertest` are no longer spawned by init — they are launched by
+   `svctest` are no longer spawned by init — they are launched by
    svcmgr after handover from their `.svc` recipes
    (see [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)).
    `hello`, `stdiotest`, and other `/bin/` binaries are spawned

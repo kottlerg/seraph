@@ -137,7 +137,7 @@ see
 After Phase 3 signals `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
 replies immediately, then scans `services.d/` and launches the
 defined-but-unregistered services — today `crasher.svc` and
-`usertest.svc`), init signs over its own kernel-object caps
+`svctest.svc`), init signs over its own kernel-object caps
 (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and
 every reclaimable Frame cap (ELF segments, user stack pages,
 `InitInfo` pages, IPC buffer) to procmgr via

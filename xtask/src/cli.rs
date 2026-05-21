@@ -90,7 +90,7 @@ pub enum BuildComponent
     GoldfishRtc,
     Fatfs,
     Crasher,
-    Usertest,
+    Svctest,
     Svcmgr,
     Pwrmgr,
     Timed,
@@ -196,7 +196,7 @@ pub struct RunParallelArgs
     /// Regex marking a successful run. On match the log is discarded and
     /// the run is classified PASS. The default matches the unique terminal
     /// marker emitted by both ktest (`ktest: ALL TESTS PASSED`) and
-    /// usertest (`[usertest] ALL TESTS PASSED`); override for other rootfs
+    /// svctest (`[svctest] ALL TESTS PASSED`); override for other rootfs
     /// configurations.
     #[arg(long, default_value = "ALL TESTS PASSED")]
     pub pass: String,

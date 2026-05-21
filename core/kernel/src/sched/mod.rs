@@ -1003,6 +1003,16 @@ pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 /// spinlock acquires; for lifecycle syscalls only, not hot paths.
 /// See docs/scheduling-internals.md § Cross-CPU TCB Ownership.
 ///
+/// When `new_state` is `Stopped` or `Exited`, also scans every CPU's run
+/// queue at `tcb.priority` and removes any lingering entry. Closes the
+/// Ready→Stopped→Ready double-enqueue race (issue #117): a thread
+/// transitioning Ready→Stopped used to leave a stale entry on its source
+/// CPU's queue for the dispatch-side skip loop to drain. A subsequent
+/// Stopped→Ready + enqueue could race that drain and produce two list
+/// entries for the same TCB, corrupting the intrusive `run_queue_next`
+/// chain. Draining the entry here keeps the run-queue invariant
+/// "Ready iff linked into exactly one queue".
+///
 /// # Safety
 /// `tcb` must be a valid TCB pointer.
 #[cfg(not(test))]
@@ -1025,10 +1035,30 @@ pub unsafe fn set_state_under_all_locks(
         saved_flags[cpu] = unsafe { scheduler_for(cpu).lock.lock_raw() };
     }
 
-    // Write the state under all locks.
-    // SAFETY: tcb validated by caller; state field always valid.
-    unsafe {
+    // Write the state and snapshot priority under all locks so the queue
+    // drain below uses a value coherent with the state we just published.
+    // SAFETY: tcb validated by caller; state/priority fields always valid.
+    let priority = unsafe {
         (*tcb).state = new_state;
+        (*tcb).priority
+    };
+
+    // Drain stale run-queue entries on Stopped/Exited transitions. The
+    // remove is best-effort: if the TCB isn't linked, it's a no-op. See
+    // docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+    if matches!(
+        new_state,
+        thread::ThreadState::Stopped | thread::ThreadState::Exited
+    )
+    {
+        #[allow(clippy::needless_range_loop)]
+        for cpu in 0..cpu_count
+        {
+            // SAFETY: cpu < cpu_count; lock held; tcb valid.
+            unsafe {
+                scheduler_for(cpu).remove_from_queue(tcb, priority);
+            }
+        }
     }
 
     // Identify which CPU (if any) currently has tcb as `current`.

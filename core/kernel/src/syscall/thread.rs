@@ -488,13 +488,18 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
     // If the thread was parked with a timeout (signal-wait or event-recv
     // with `timeout_ms != 0`), it is also on the global sleep list. Drop
     // the entry now so a later timer tick does not dereference a freed TCB.
+    //
+    // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
+    // `sleep_deadline`. The timer path (`sleep_check_wakeups`) treats
+    // `sleep_deadline <= now` as expired; clearing the deadline first
+    // would let the timer claim a wake that this cancel path is delivering.
     // SAFETY: tcb is valid; sleep_list_remove is safe to call when the
     // thread is not registered (returns without effect).
     unsafe {
         if (*tcb).sleep_deadline != 0
         {
-            (*tcb).sleep_deadline = 0;
             crate::sched::sleep_list_remove(tcb);
+            (*tcb).sleep_deadline = 0;
         }
     }
 

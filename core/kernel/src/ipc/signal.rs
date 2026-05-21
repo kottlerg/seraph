@@ -159,12 +159,22 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
             // (lock order: sig.lock → SLEEP_LIST_LOCK; the timer path takes
             // SLEEP_LIST_LOCK first, releases it, and only then reaches for
             // sig.lock — so no circular wait).
+            //
+            // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
+            // `sleep_deadline`. The timer path (`sleep_check_wakeups`) walks
+            // `SLEEP_LIST` under `SLEEP_LIST_LOCK` and considers an entry
+            // expired when `(*tcb).sleep_deadline <= now`. Clearing the
+            // deadline first creates a window where the entry is still on
+            // the list with `deadline == 0 <= now`, making the timer claim a
+            // wake that this `signal_send` is concurrently delivering →
+            // double-`enqueue_and_wake` of the waiter and a corrupted run
+            // queue (intrusive-list self-cycle).
             // SAFETY: waiter is the TCB we just dequeued from sig.waiter.
             unsafe {
                 if (*waiter).sleep_deadline != 0
                 {
-                    (*waiter).sleep_deadline = 0;
                     crate::sched::sleep_list_remove(waiter);
+                    (*waiter).sleep_deadline = 0;
                 }
             }
             Some(waiter)

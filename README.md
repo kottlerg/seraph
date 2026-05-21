@@ -46,6 +46,7 @@ summarized here for quick reference:
 cargo xtask build                        # build all components (x86_64, debug)
 cargo xtask build --arch riscv64         # build for RISC-V
 cargo xtask build --component boot       # build a single component
+cargo xtask mkdisk                       # re-mirror sysroot + repack disk image (no cargo); refresh after rootfs/sysroot edits
 cargo xtask run                          # launch the existing sysroot under QEMU (pure runner; no build)
 cargo xtask run --gdb                    # pause at startup, GDB on localhost:1234
 cargo xtask run-parallel --parallel 4 --runs 100   # N parallel QEMU runs for stress / race-hunting
@@ -55,11 +56,12 @@ cargo xtask test                         # run all workspace tests on the host
 ```
 
 `cargo xtask test` runs host-side unit tests, for all algorithmic components.
-For kernel testing, set `init=ktest` in `rootfs/esp/EFI/seraph/boot.conf`, then run
-`cargo xtask run`. ktest exercises every syscall through real trap/return
-paths, runs cross-subsystem integration scenarios, and measures hardware
-cycle counts for key operations. See [core/ktest/README.md](core/ktest/README.md) for
-authoritative detail.
+In-tree QEMU-driven test harnesses cover three surfaces: `ktest` (kernel),
+`svctest` (services), and `usertest` (programs). The default boot is
+interactive — no harness runs. See [docs/testing.md](docs/testing.md) for
+the canonical tier taxonomy, the `[<harness>] ALL TESTS PASSED` marker, the
+per-program tester protocol, the sysroot layout under `/tests/`, and the
+recipe-dir gating mechanism that selects which harness runs in a given boot.
 
 ---
 
@@ -80,6 +82,7 @@ Overall project design documents live in [`docs/`](docs/):
 - [Coding Standards](docs/coding-standards.md) — Rust conventions, safety contracts, documentation rules
 - [Documentation Standards](docs/documentation-standards.md) — document hierarchy, authority, backlinks, required structure
 - [Conventions](docs/conventions.md) — versioning, backlog tracking via GitHub Issues, branch and PR workflow, CI gating, release production
+- [Testing](docs/testing.md) — tier taxonomy, marker format, per-program tester protocol, sysroot layout, gating
 - [Release Notes](docs/releases/README.md) — per-tag notes catalogue, naming, source-of-truth discipline, workflow integration
 
 Each component contains a `README.md` that references the design docs relevant to that module.

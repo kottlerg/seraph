@@ -31,8 +31,8 @@ Unknown keys are **hard errors** — a typo cannot silently degrade a
 service.
 
 ```
-# /bin/svctest — services-tier OS test harness.
-binary    = /bin/svctest
+# /tests/svctest — services-surface test harness.
+binary    = /tests/svctest
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never

@@ -1,10 +1,14 @@
-# /bin/svctest — services-tier OS test harness.
+# /tests/svctest — services-surface test harness.
 #
 # One-shot: exits cleanly on completion; svcmgr never restarts it.
 # Seeds resolve through svcmgr's discovery registry: rootfs.root is
 # the FS-driver-agnostic root-mount cap; pwrmgr.shutdown/pwrmgr.deny
 # are the SHUTDOWN_AUTHORITY-tokened SEND and its no-auth twin.
-binary    = /bin/svctest
+#
+# Recipe lives under tests.d/, which svcmgr does NOT scan. To enable
+# in a boot, copy this file into services.d/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+binary    = /tests/svctest
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never

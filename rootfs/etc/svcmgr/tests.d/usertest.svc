@@ -1,0 +1,16 @@
+# /tests/usertest — programs-surface test orchestrator.
+#
+# One-shot: exits cleanly on completion; svcmgr never restarts it. The
+# orchestrator walks /tests/programs/, spawns each per-program tester
+# sequentially, then powers off via the pwrmgr.shutdown seed.
+#
+# Recipe lives under tests.d/, which svcmgr does NOT scan. To enable in
+# a boot, copy this file into services.d/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+binary    = /tests/usertest
+argv      = usertest
+restart   = never
+critical  = low
+namespace = universal
+cwd       = /srv
+seed      = pwrmgr.shutdown pwrmgr.deny

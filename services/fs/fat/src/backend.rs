@@ -33,7 +33,7 @@ use namespace_protocol::{
 /// Maximum entries surfaced through `NS_LOOKUP` over a single fatfs
 /// session. Sized to the current test surface; an unbounded `NodeId`
 /// allocator is a follow-up (issue #27).
-pub const MAX_NODES: usize = 64;
+pub const MAX_NODES: usize = 128;
 
 /// Per-NodeId metadata captured at lookup time.
 ///
@@ -136,7 +136,7 @@ impl NodeTable
         }
         self.entries[self.len] = Some(node);
         self.len += 1;
-        // self.len fits in NodeId's u40 range trivially (MAX_NODES is 64).
+        // self.len fits in NodeId's u40 range trivially (MAX_NODES is small).
         NodeId::new(self.len as u64)
     }
 

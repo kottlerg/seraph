@@ -419,6 +419,10 @@ name = "hello"
 version = "0.1.0"
 
 [[package]]
+name = "hello-tester"
+version = "0.1.0"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -863,6 +867,10 @@ name = "stdiotest"
 version = "0.1.0"
 
 [[package]]
+name = "stdiotest-tester"
+version = "0.1.0"
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -935,6 +943,13 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "usertest"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+]
 
 [[package]]
 name = "utf8parse"

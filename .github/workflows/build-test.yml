@@ -41,6 +41,12 @@ jobs:
       matrix:
         arch: [x86_64, riscv64]
         profile: [debug, release]
+        # One harness per cell: each cell builds once, stages exactly one
+        # recipe (or swaps boot.conf for ktest), then runs once. Avoids
+        # back-to-back fatfs/sysroot state accumulation across harnesses
+        # and lets a failing tier surface as a single named cell. See
+        # docs/testing.md for the recipe-dir gating contract.
+        tester: [svctest, usertest, ktest]
     steps:
       - uses: actions/checkout@v6
 
@@ -81,27 +87,38 @@ jobs:
             cargo xtask build --arch ${{ matrix.arch }}
           fi
 
-      - name: svctest single-shot (default boot.conf, init=init)
+      - name: Stage ${{ matrix.tester }} and repack disk
+        # Recipe staging: svctest and usertest live in
+        # `sysroot/etc/svcmgr/tests.d/` (svcmgr does not scan that
+        # directory); cp into services.d/ to enable. `cargo xtask mkdisk`
+        # re-mirrors rootfs and repacks the FAT image without invoking
+        # cargo. ktest is bootloader-loaded, so it needs the `init=`
+        # swap in boot.conf and a `cargo xtask mkdisk` to propagate the
+        # edited boot.conf into the sysroot.
         run: |
-          cargo xtask run-parallel \
-            --arch ${{ matrix.arch }} \
-            --parallel 1 --runs 1 --timeout 180
+          case "${{ matrix.tester }}" in
+            svctest)
+              cp sysroot/etc/svcmgr/tests.d/svctest.svc \
+                 sysroot/etc/svcmgr/services.d/
+              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              ;;
+            usertest)
+              cp sysroot/etc/svcmgr/tests.d/usertest.svc \
+                 sysroot/etc/svcmgr/services.d/
+              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              ;;
+            ktest)
+              sed -i \
+                -e 's|^init=init$|#init=init|' \
+                -e 's|^#init=ktest$|init=ktest|' \
+                -e 's|^cmdline=root=|#cmdline=root=|' \
+                -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
+                rootfs/esp/EFI/seraph/boot.conf
+              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              ;;
+          esac
 
-      - name: Swap boot.conf to init=ktest and rebuild
-        run: |
-          sed -i \
-            -e 's|^init=init$|#init=init|' \
-            -e 's|^#init=ktest$|init=ktest|' \
-            -e 's|^cmdline=root=|#cmdline=root=|' \
-            -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
-            rootfs/esp/EFI/seraph/boot.conf
-          if [ "${{ matrix.profile }}" = "release" ]; then
-            cargo xtask build --arch ${{ matrix.arch }} --release
-          else
-            cargo xtask build --arch ${{ matrix.arch }}
-          fi
-
-      - name: ktest single-shot
+      - name: Run ${{ matrix.tester }}
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
@@ -111,6 +128,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}
+          name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
           path: target/xtask/run-parallel/**/*.log
           if-no-files-found: ignore

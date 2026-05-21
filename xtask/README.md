@@ -83,6 +83,38 @@ Default firmware search paths per host:
 
 ---
 
+### `cargo xtask mkdisk`
+
+Re-mirror `rootfs/` into `sysroot/`, re-synthesise test fixtures, and
+regenerate `disk.img` without invoking cargo. Use after editing
+`rootfs/` or the sysroot directly (e.g. staging a test recipe by
+copying it from `sysroot/etc/svcmgr/tests.d/` into
+`sysroot/etc/svcmgr/services.d/`) to refresh the boot image without
+paying for a full `cargo xtask build` (which would also run cargo
+fmt + clippy + check + binary install). Requires a populated,
+arch-tagged sysroot from a prior `cargo xtask build`.
+
+```
+cargo xtask mkdisk [--arch x86_64|riscv64]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
+
+Example — stage `svctest` and run it:
+
+```sh
+cp sysroot/etc/svcmgr/tests.d/svctest.svc sysroot/etc/svcmgr/services.d/
+cargo xtask mkdisk --arch x86_64
+cargo xtask run --arch x86_64
+```
+
+See [docs/testing.md](../docs/testing.md) for the test-harness gating
+contract.
+
+---
+
 ### `cargo xtask clean`
 
 Remove the sysroot (and optionally `target/`).
@@ -136,7 +168,7 @@ cargo xtask run-parallel \
 | `--runs` | (required) | Total runs, dispatched in waves of `--parallel` |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
 | `--cpus` | `4` | vCPUs per guest |
-| `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the unique terminal marker emitted by both ktest (`ktest: ALL TESTS PASSED`) and svctest (`[svctest] ALL TESTS PASSED`). On match the log is discarded and the run is classified `PASS` |
+| `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
 | `--fail` | (none) | Regex marking a failed run; the **first** match wins. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success |
 
 **Mode-agnostic**: xtask does not know about ktest, svctest, or any other

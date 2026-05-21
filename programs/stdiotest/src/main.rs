@@ -3,15 +3,14 @@
 
 // programs/stdiotest/src/main.rs
 
-//! Tier-2 stdin↔stdout proof. Reads a line from stdin, prints what it got
-//! plus an uppercase echo, then exits.
+//! Stdin↔stdout proof. Reads a line from stdin, prints what it got plus an
+//! uppercase echo, then exits.
 //!
 //! No Seraph cap awareness in this binary — only `std::io`. The spawner
-//! (init in the current setup) creates an endpoint pair, hands the RECV side
-//! to this child as `stdin`, keeps the SEND side, and writes a probe payload
-//! after this child has started. This child blocks on `stdin().read_line(..)`
-//! until those bytes arrive, processes them, and emits the result through
-//! `println!`.
+//! creates an endpoint pair, hands the RECV side to this child as `stdin`,
+//! keeps the SEND side, and writes a probe payload after this child has
+//! started. This child blocks on `stdin().read_line(..)` until those bytes
+//! arrive, processes them, and emits the result through `println!`.
 
 #![feature(restricted_std)]
 

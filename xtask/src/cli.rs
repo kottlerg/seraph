@@ -45,6 +45,13 @@ pub enum CliCommand
     /// classifying each run's outcome via user-supplied pass/fail regexes.
     /// Requires a populated sysroot — run `cargo xtask build` first.
     RunParallel(RunParallelArgs),
+
+    /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
+    /// and regenerate `disk.img` without invoking cargo. Used to refresh
+    /// the boot image after `rootfs/` or sysroot files were edited
+    /// outside the cargo flow (e.g. staging a test recipe). Requires an
+    /// arch-tagged sysroot from a prior `cargo xtask build`.
+    Mkdisk(MkdiskArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -91,14 +98,17 @@ pub enum BuildComponent
     Fatfs,
     Crasher,
     Svctest,
+    Usertest,
     Svcmgr,
     Pwrmgr,
     Timed,
     Hello,
+    HelloTester,
     Fsbench,
     Pipefault,
     Stackoverflow,
     Stdiotest,
+    StdiotestTester,
     All,
 }
 
@@ -134,6 +144,16 @@ pub struct RunArgs
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,
+}
+
+// ── Mkdisk ────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct MkdiskArgs
+{
+    /// Target architecture — must match the existing sysroot's arch tag.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
 }
 
 // ── Clean ─────────────────────────────────────────────────────────────────────
@@ -194,10 +214,10 @@ pub struct RunParallelArgs
     pub cpus: u32,
 
     /// Regex marking a successful run. On match the log is discarded and
-    /// the run is classified PASS. The default matches the unique terminal
-    /// marker emitted by both ktest (`ktest: ALL TESTS PASSED`) and
-    /// svctest (`[svctest] ALL TESTS PASSED`); override for other rootfs
-    /// configurations.
+    /// the run is classified PASS. The default matches the cross-harness
+    /// terminal marker `[<harness>] ALL TESTS PASSED` standardised in
+    /// [`docs/testing.md`](../../../docs/testing.md); override for other
+    /// rootfs configurations.
     #[arg(long, default_value = "ALL TESTS PASSED")]
     pub pass: String,
 

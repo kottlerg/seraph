@@ -164,7 +164,7 @@ pub fn command_cwd_inherit_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/bin/svctest")
+    let mut child = Command::new("/tests/svctest")
         .arg("cwd-child")
         .current_dir("/srv")
         .spawn()
@@ -183,7 +183,7 @@ pub fn command_cwd_missing_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let err = Command::new("/bin/svctest")
+    let err = Command::new("/tests/svctest")
         .arg("cwd-child")
         .current_dir("/this/does/not/exist")
         .spawn()

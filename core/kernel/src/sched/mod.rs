@@ -1036,7 +1036,12 @@ pub unsafe fn set_state_under_all_locks(
     }
 
     // Write the state and snapshot priority under all locks so the queue
-    // drain below uses a value coherent with the state we just published.
+    // drain below sees a value coherent with the state we just published.
+    // Priority itself is not protected against a concurrent
+    // `sys_thread_set_priority` (an unlocked write — see
+    // `core/kernel/src/cap/object.rs:1275` for the same caveat in dealloc);
+    // the new drain inherits that pre-existing limitation but does not
+    // worsen it.
     // SAFETY: tcb validated by caller; state/priority fields always valid.
     let priority = unsafe {
         (*tcb).state = new_state;
@@ -1045,7 +1050,7 @@ pub unsafe fn set_state_under_all_locks(
 
     // Drain stale run-queue entries on Stopped/Exited transitions. The
     // remove is best-effort: if the TCB isn't linked, it's a no-op. See
-    // docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+    // docs/scheduling-internals.md § Stopped/Exited drain.
     if matches!(
         new_state,
         thread::ThreadState::Stopped | thread::ThreadState::Exited

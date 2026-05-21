@@ -64,42 +64,30 @@ impl RunQueue
     /// A non-`None` `tcb.run_queue_next` on entry or `tail == Some(tcb)`
     /// indicates the caller is attempting a double-enqueue of a thread
     /// that is already linked — the intrusive list would become a
-    /// self-cycle (`tail.next = Some(tail)`). Both `debug_assert!`s are
-    /// tripwires for issue #117 family races; the original site
-    /// reproduced as `head=tail=tcb` (single-element queue, second
-    /// enqueue from a duplicate wake source).
+    /// self-cycle (`tail.next = Some(tail)`). The two debug-only
+    /// `debug_assert!`s below are tripwires for issue #117 family races;
+    /// the original site reproduced as `head=tail=tcb` (single-element
+    /// queue, second enqueue from a duplicate wake source).
+    /// `#[track_caller]` propagates the panic location to the kernel's
+    /// panic handler (`core/kernel/src/main.rs:1186-1198`), so the panic
+    /// banner names the call site (e.g. `sched/mod.rs:1607` for
+    /// `enqueue_and_wake`).
     #[track_caller]
     fn enqueue(&mut self, tcb: *mut ThreadControlBlock)
     {
-        // Debug-only tripwires; compiled out in release. Both fire on
-        // attempts to add `tcb` to a queue it is already linked into.
-        if cfg!(debug_assertions)
-        {
-            // SAFETY: tcb is a valid heap-allocated TCB pointer; caller
-            // holds the owning scheduler.lock so run_queue_next/thread_id
-            // are stable.
-            let (already_linked, tid) =
-                unsafe { ((*tcb).run_queue_next.is_some(), (*tcb).thread_id) };
-            if already_linked
-            {
-                let caller = core::panic::Location::caller();
-                panic!(
-                    "run_queue::enqueue from {}:{}: tcb {tcb:p} tid={tid} already linked (run_queue_next != None) — double-enqueue",
-                    caller.file(),
-                    caller.line(),
-                );
-            }
-            if self.tail == Some(tcb)
-            {
-                let caller = core::panic::Location::caller();
-                panic!(
-                    "run_queue::enqueue from {}:{}: tcb {tcb:p} tid={tid} is already this queue's tail (head={:?}) — double-enqueue or stale tail",
-                    caller.file(),
-                    caller.line(),
-                    self.head,
-                );
-            }
-        }
+        // SAFETY: tcb is a valid heap-allocated TCB pointer; caller holds
+        // the owning scheduler.lock so run_queue_next/thread_id are stable.
+        // Both reads are debug-only inputs to the assertions below.
+        let (already_linked, tid) = unsafe { ((*tcb).run_queue_next.is_some(), (*tcb).thread_id) };
+        debug_assert!(
+            !already_linked,
+            "run_queue::enqueue: tcb {tcb:p} tid={tid} already linked (run_queue_next != None) — double-enqueue",
+        );
+        debug_assert!(
+            self.tail != Some(tcb),
+            "run_queue::enqueue: tcb {tcb:p} tid={tid} is already this queue's tail (head={:?}) — double-enqueue or stale tail",
+            self.head,
+        );
         // SAFETY: tcb is a valid heap-allocated TCB pointer.
         unsafe { (*tcb).run_queue_next = None };
 

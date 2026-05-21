@@ -97,9 +97,29 @@ The transition table below pins every ThreadState write to a syscall/event, the 
 
 All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock`; all `Blocked→Ready` wakes MUST route through `enqueue_and_wake`. Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are forbidden; they race `set_state_under_all_locks(Stopped)` and silently clobber Stopped.
 
-**Sleep-list coordination (issue #117).** When a wake source (`signal_send`, `event_queue_post`, `cancel_ipc_block`) wakes a waiter that was registered with a timeout, the sleep-list entry MUST be dropped *before* `(*waiter).sleep_deadline` is cleared, not after. The timer path (`sleep_check_wakeups`) walks `SLEEP_LIST` under `SLEEP_LIST_LOCK` and treats `(*tcb).sleep_deadline <= now` as expired. Clearing the deadline before removing from the list creates a window where the entry is still on the list with `deadline == 0 <= now`, letting the timer claim a wake concurrently with the IPC source. Both then call `enqueue_and_wake`, producing a double-enqueue and an intrusive-list self-cycle (`tail.next = Some(tail)`).
+**Sleep-list coordination (issue #117).** When a wake source (`signal_send`,
+`event_queue_post`, `cancel_ipc_block`) wakes a waiter that was registered with
+a timeout, the sleep-list entry MUST be dropped *before* `(*waiter).sleep_deadline`
+is cleared, not after. The timer path (`sleep_check_wakeups`) walks `SLEEP_LIST`
+under `SLEEP_LIST_LOCK` and treats `(*tcb).sleep_deadline <= now` as expired.
+Clearing the deadline before removing from the list creates a window where the
+entry is still on the list with `deadline == 0 <= now`, letting the timer
+claim a wake concurrently with the IPC source. Both then call
+`enqueue_and_wake`, producing a double-enqueue and an intrusive-list self-cycle
+(`tail.next = Some(tail)`).
 
-**Stopped/Exited drain (issue #117).** `set_state_under_all_locks(Stopped|Exited)` MUST also walk every CPU's run queue and call `remove_from_queue(tcb, priority)` inside the all-locks region — leaving the stale `Ready` entry for the dispatch-side skip loop to drain (the previous design) is unsound: a subsequent Stopped→Ready transition followed by `enqueue_and_wake` could race the drain and produce two list entries for the same TCB. The skip loop at `sched/mod.rs:1942` remains as defence-in-depth and as the drain mechanism for legitimate paths that bypass `set_state_under_all_locks` (none currently).
+**Stopped/Exited drain (issue #117).** `set_state_under_all_locks(Stopped|Exited)`
+MUST also walk every CPU's run queue and call `remove_from_queue(tcb, priority)`
+inside the all-locks region — leaving the stale `Ready` entry for the
+dispatch-side skip loop to drain (the previous design) is unsound: a subsequent
+Stopped→Ready transition followed by `enqueue_and_wake` could race the drain
+and produce two list entries for the same TCB. The skip loop at
+`sched/mod.rs:1860` remains as defence-in-depth and as the drain mechanism for
+legitimate paths that bypass `set_state_under_all_locks` (none currently). The
+priority snapshot uses `(*tcb).priority` read under all-CPU locks; this is
+consistent with the existing `dealloc_object(Thread)` pattern but inherits the
+pre-existing `sys_thread_set_priority` unlocked-write race (see
+`core/kernel/src/cap/object.rs:1275`).
 
 ---
 

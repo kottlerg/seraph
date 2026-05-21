@@ -678,17 +678,43 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: target_tcb validated non-null; field access is valid.
     unsafe {
         let old_cpu = (*target_tcb).preferred_cpu as usize;
+
+        // Pin preemption across the `cpu_affinity` write and the matching
+        // state-read + action that follows. Defense-in-depth: the current
+        // syscall-entry discipline keeps IF=0 / SIE=0 throughout the
+        // handler body (no path inside re-enables interrupts — only
+        // spinlock save/restore — so a local timer tick cannot fire
+        // here), but if a future syscall path were to enable interrupts
+        // mid-handler, a timer-driven `schedule()` between the
+        // `cpu_affinity` store and the matching `migrate_ready_thread`
+        // call would dispatch the Ready target locally — `schedule()`'s
+        // skip loop checks state but not `cpu_affinity` on the incoming
+        // dispatched thread (see scheduling-internals.md § Cross-CPU TCB
+        // Ownership). Mirrors the load-bearing pattern in
+        // `core/kernel/src/sched/mod.rs:1815-1819` (cross-CPU re-enqueue
+        // branch of `schedule()`, where the inter-lock window IS visible
+        // to interrupts).
+        //
+        // (`sys_thread_set_priority` above does an analogous unlocked
+        // read but stays CPU-local — the priority-change does not move
+        // the thread between run queues — so it does not need a preempt
+        // bracket.)
+        //
+        // See issue #116.
+        crate::percpu::preempt_disable();
         (*target_tcb).cpu_affinity = cpu_id;
 
         // No active migration when affinity is cleared (any-CPU): the load
         // balancer or the next enqueue will place the thread.
         if cpu_id == AFFINITY_ANY
         {
+            crate::percpu::preempt_enable();
             return Ok(0);
         }
         let new_cpu = cpu_id as usize;
         if new_cpu == old_cpu
         {
+            crate::percpu::preempt_enable();
             return Ok(0);
         }
 
@@ -698,12 +724,12 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
         if old_cpu >= cpu_count
         {
+            crate::percpu::preempt_enable();
             return Ok(0);
         }
 
         // Unlocked read; revalidated under-lock by migrate_ready_thread or
-        // tolerated as a spurious IPI in the Running case. Mirrors the
-        // pattern in sys_thread_set_priority above.
+        // tolerated as a spurious IPI in the Running case.
         match (*target_tcb).state
         {
             ThreadState::Ready =>
@@ -726,6 +752,7 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 // via select_target_cpu which now sees the new affinity.
             }
         }
+        crate::percpu::preempt_enable();
     }
 
     Ok(0)

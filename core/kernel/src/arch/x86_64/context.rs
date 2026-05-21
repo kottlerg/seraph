@@ -120,21 +120,25 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, _is_user: bool) -> SavedS
 /// thread, `next.rip` is the return address of the previous `switch` call.
 ///
 /// # Safety
-/// Both pointers must be valid, aligned `SavedState` values. The caller must
-/// hold the scheduler lock and have interrupts disabled. `save_flag` and
-/// `lock_ptr` are used on RISC-V to release the lock between save/load;
-/// on x86-64 (TSO) the lock is released inline before the call and these
-/// parameters are ignored.
+/// Both pointers must be valid, aligned `SavedState` values. The caller
+/// must hold the scheduler lock and have interrupts disabled. `save_flag`
+/// is written to `1` after every store into `*current` completes — it is
+/// the cross-CPU publication barrier for both remote dispatch (which
+/// loads `next.saved_state` after observing the flag) and
+/// `dealloc_object(Thread)` (which spins on it before `retype_free`).
+/// See `core/kernel/docs/scheduling-internals.md`
+/// § Cross-CPU TCB Ownership. `lock_ptr` is unused on x86-64; on RISC-V
+/// it carries the scheduler lock released inline between save and load.
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(
     current: *mut SavedState,
     next: *const SavedState,
-    _save_flag: *const core::sync::atomic::AtomicU32,
+    save_flag: *const core::sync::atomic::AtomicU32,
     _lock_ptr: *const crate::sync::Spinlock,
 )
 {
-    // rdi = current, rsi = next, rdx = save_flag (unused), rcx = lock_ptr (unused)
+    // rdi = current, rsi = next, rdx = save_flag, rcx = lock_ptr (unused)
     core::arch::naked_asm!(
         // ── Save current thread ───────────────────────────────────────────
         // Pop return address into rax; the caller will "return" to it when this

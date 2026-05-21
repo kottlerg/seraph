@@ -125,7 +125,7 @@ pub fn walk_and_create_from_file(
         | (u64::from(blobs.argv_count) << 48)
         | (u64::from(blobs.env_count) << 56);
 
-    // word layout matches init's `CREATE_FROM_FILE` call site:
+    // word layout matches the procmgr `CREATE_FROM_FILE` wire layout:
     //   word 0:           file_size
     //   words 1..1+argv_w: argv blob (NUL-separated, NUL-terminated)
     //   word  1+argv_w:   env_bytes

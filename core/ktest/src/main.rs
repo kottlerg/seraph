@@ -10,7 +10,7 @@
 //!
 //! 1. **Tier 1** (`unit/`)        — exercises every kernel syscall in isolation.
 //! 2. **Tier 2** (`integration/`) — cross-subsystem scenario tests.
-//! 3. **Tier 3** (`bench/`)       — placeholder for future timing/profiling.
+//! 3. **Tier 3** (`bench/`)       — cycle-accurate benchmarks (`rdtsc` / `csrr cycle`).
 //!
 //! Results are printed directly to the serial console via hardware I/O.
 //! Each test prints `PASS` or `FAIL`. A summary follows. ktest then exits.

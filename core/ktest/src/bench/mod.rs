@@ -245,9 +245,13 @@ fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     }
 
     let reply = IpcMessage::new(0);
-    let t0 = cycles_now();
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    let mut total = 0u64;
+    let mut completed: u64 = 0;
     for _ in 0..n
     {
+        let t0 = cycles_now();
         // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
         if unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }.is_err()
         {
@@ -258,14 +262,29 @@ fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         {
             break;
         }
+        let t1 = cycles_now();
+        let delta = t1.saturating_sub(t0);
+        if delta < min
+        {
+            min = delta;
+        }
+        if delta > max
+        {
+            max = delta;
+        }
+        total = total.saturating_add(delta);
+        completed += 1;
     }
-    let t1 = cycles_now();
 
     signal_wait(done).ok();
 
-    let total = t1.saturating_sub(t0);
-    log_bench_header("ipc_round_trip_wrapped", iters);
-    crate::log_u64("ktest: bench  cycles_mean=", total / n);
+    log_bench_header("ipc_round_trip", iters);
+    if let Some(mean) = total.checked_div(completed)
+    {
+        crate::log_u64("ktest: bench  cycles_min=", min);
+        crate::log_u64("ktest: bench  cycles_mean=", mean);
+        crate::log_u64("ktest: bench  cycles_max=", max);
+    }
 
     cap_delete(th).ok();
     cap_delete(ep).ok();
@@ -361,9 +380,13 @@ fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
         return;
     }
 
-    let t0 = cycles_now();
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    let mut total = 0u64;
+    let mut completed: u64 = 0;
     for _ in 0..n
     {
+        let t0 = cycles_now();
         if signal_send(ping, 1).is_err()
         {
             break;
@@ -372,14 +395,28 @@ fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
         {
             break;
         }
+        let t1 = cycles_now();
+        let delta = t1.saturating_sub(t0);
+        if delta < min
+        {
+            min = delta;
+        }
+        if delta > max
+        {
+            max = delta;
+        }
+        total = total.saturating_add(delta);
+        completed += 1;
     }
-    let t1 = cycles_now();
-
-    let total = t1.saturating_sub(t0);
     signal_wait(done).ok();
 
     log_bench_header("signal_roundtrip", iters);
-    crate::log_u64("ktest: bench  cycles_mean=", total / n);
+    if let Some(mean) = total.checked_div(completed)
+    {
+        crate::log_u64("ktest: bench  cycles_min=", min);
+        crate::log_u64("ktest: bench  cycles_mean=", mean);
+        crate::log_u64("ktest: bench  cycles_max=", max);
+    }
 
     cap_delete(th).ok();
     cap_delete(ping).ok();

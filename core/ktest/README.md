@@ -12,7 +12,7 @@ On completion ktest emits the cross-harness marker
 
 ## Activating ktest
 
-Edit `rootfs/EFI/seraph/boot.conf` and change the `init` field:
+Edit `rootfs/esp/EFI/seraph/boot.conf` and change the `init` field:
 
 ```
 init=ktest
@@ -33,16 +33,19 @@ test and the most important negative paths (wrong rights, invalid arguments,
 wrong object state). Files are grouped by kernel subsystem, mirroring the
 kernel's own source layout.
 
-| File | Syscalls |
+| File | Syscalls / behaviour exercised |
 |---|---|
-| `cap.rs` | `SYS_CAP_CREATE_*`, `CAP_COPY`, `CAP_MOVE`, `CAP_INSERT`, `CAP_DERIVE`, `CAP_REVOKE`, `CAP_DELETE` |
+| `cap.rs` | `SYS_CAP_CREATE_*`, `CAP_COPY`, `CAP_MOVE`, `CAP_INSERT`, `CAP_DERIVE`, `CAP_DERIVE_TOKEN`, `CAP_REVOKE`, `CAP_DELETE` |
+| `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields) |
+| `retype.rs` | Retype primitive: CSpace/AddressSpace augmentation, page-table walk budget, kernel PT pool consumption |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_FRAME_SPLIT`, `SYS_ASPACE_QUERY` |
-| `signal.rs` | `SYS_SIGNAL_SEND`, `SYS_SIGNAL_WAIT` |
-| `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` |
+| `signal.rs` | `SYS_SIGNAL_SEND`, `SYS_SIGNAL_WAIT` (blocking and `signal_wait_timeout`) |
+| `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
 | `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT` |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
 | `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS` |
-| `hw.rs` | `SYS_MMIO_MAP`, `SYS_DMA_GRANT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT` |
+| `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
+| `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`, `SYS_SBI_CALL` |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
 
 Adding a new syscall means adding a section in the appropriate file here.
@@ -63,6 +66,7 @@ concurrent signal and queue events.
 | `multi_caller_ipc_fifo.rs` | Three concurrent IPC callers verify FIFO send-queue ordering |
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
 | `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown |
+| `retype_reclaim.rs` | Auto-reclaim invariant for every retypable kernel object |
 
 ### Tier S — `src/stress/`
 
@@ -70,15 +74,20 @@ Stress and torture tests that exercise race conditions, resource exhaustion, dee
 capability trees, and concurrent operations. **Not run by default**; enable with
 `ktest.filter=stress` (see [Command line options](#command-line-options)).
 
+Order matches `stress/mod.rs` dispatch order.
+
 | File | Scenario |
 |---|---|
 | `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation |
 | `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around) |
+| `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration |
 | `thread_churn.rs` | 20 rapid thread create/destroy cycles (TCB and CSpace cleanup) |
+| `cap_delete_running.rs` | Delete capabilities while child threads actively use them |
 | `concurrent_signal.rs` | 4 threads sending distinct bits to one signal simultaneously |
 | `concurrent_ipc.rs` | 4 callers racing on one endpoint, 10 cycles (send-queue safety) |
 | `cap_revoke_under_use.rs` | Revoke root while 4 threads actively send on derived caps |
 | `concurrent_map_unmap.rs` | 4 threads mapping/unmapping distinct VAs in the same address space |
+| `retype_concurrent.rs` | Concurrent retype operations sharing one Frame-backed allocator |
 
 ### Tier 3 — `src/bench/`
 

@@ -46,6 +46,7 @@ summarized here for quick reference:
 cargo xtask build                        # build all components (x86_64, debug)
 cargo xtask build --arch riscv64         # build for RISC-V
 cargo xtask build --component boot       # build a single component
+cargo xtask disk                         # repack sysroot + disk image (no cargo); refresh after rootfs/sysroot edits
 cargo xtask run                          # launch the existing sysroot under QEMU (pure runner; no build)
 cargo xtask run --gdb                    # pause at startup, GDB on localhost:1234
 cargo xtask run-parallel --parallel 4 --runs 100   # N parallel QEMU runs for stress / race-hunting

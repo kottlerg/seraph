@@ -147,8 +147,12 @@ gives the PR-level linear view.
 
 - Pull request required before merging.
 - Required status checks (strict, branch up-to-date): `host-tests`,
-  `validate (x86_64, debug)`, `validate (x86_64, release)`,
-  `validate (riscv64, debug)`, `validate (riscv64, release)`.
+  `validate (x86_64, debug, ktest)`, `validate (x86_64, debug, svctest)`,
+  `validate (x86_64, debug, usertest)`, `validate (x86_64, release, ktest)`,
+  `validate (x86_64, release, svctest)`, `validate (x86_64, release, usertest)`,
+  `validate (riscv64, debug, ktest)`, `validate (riscv64, debug, svctest)`,
+  `validate (riscv64, debug, usertest)`, `validate (riscv64, release, ktest)`,
+  `validate (riscv64, release, svctest)`, `validate (riscv64, release, usertest)`.
 - Required signed commits.
 - Force pushes blocked.
 - Branch deletion blocked.

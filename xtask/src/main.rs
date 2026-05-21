@@ -54,6 +54,7 @@ fn main()
         CliCommand::Clean(args) => commands::clean::run(&ctx, args),
         CliCommand::Test(args) => commands::test::run(&ctx, args),
         CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
+        CliCommand::Disk(args) => commands::disk::run(&ctx, args),
     };
 
     if let Err(err) = result

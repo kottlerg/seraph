@@ -129,14 +129,6 @@ fn main() -> !
         OpenFile::empty(),
         OpenFile::empty(),
         OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
-        OpenFile::empty(),
     ]));
 
     let eviction = Arc::new(EvictionState::new());

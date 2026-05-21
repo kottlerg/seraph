@@ -45,6 +45,14 @@ pub enum CliCommand
     /// classifying each run's outcome via user-supplied pass/fail regexes.
     /// Requires a populated sysroot — run `cargo xtask build` first.
     RunParallel(RunParallelArgs),
+
+    /// Repack the sysroot and disk image without invoking cargo. Mirrors
+    /// `rootfs/` into the sysroot, re-synthesises test fixtures, and
+    /// regenerates `disk.img`. Used to refresh the boot image after
+    /// `rootfs/` or sysroot files were edited outside the cargo flow
+    /// (e.g. staging a test recipe). Requires an arch-tagged sysroot
+    /// from a prior `cargo xtask build`.
+    Disk(DiskArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -137,6 +145,16 @@ pub struct RunArgs
     /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,
+}
+
+// ── Disk ──────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct DiskArgs
+{
+    /// Target architecture — must match the existing sysroot's arch tag.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
 }
 
 // ── Clean ─────────────────────────────────────────────────────────────────────

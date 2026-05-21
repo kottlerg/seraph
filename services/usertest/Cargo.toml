@@ -1,0 +1,16 @@
+[package]
+name = "usertest"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "usertest"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+ipc = { path = "../../shared/ipc" }
+
+[lints]
+workspace = true

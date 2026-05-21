@@ -18,11 +18,12 @@ use crate::util::step;
 
 const SECTOR_SIZE: u64 = 512;
 
-/// Both partitions are 192 MiB. Debug binaries each weigh ~14 MiB; the root
-/// partition holds ~10 of them plus fixtures, so 128 MiB was insufficient
-/// once `fsbench` was added. Release builds remain comfortable well under
-/// half of this.
-const PARTITION_SIZE: u64 = 192 * 1024 * 1024;
+/// Both partitions are 256 MiB. Debug binaries each weigh ~14 MiB; the root
+/// partition now holds ~13 of them (production services + test harnesses +
+/// per-program testers) plus fixtures, so 192 MiB was insufficient once the
+/// `usertest` orchestrator and per-program tester binaries landed. Release
+/// builds remain comfortable well under half of this.
+const PARTITION_SIZE: u64 = 256 * 1024 * 1024;
 
 /// First partition starts at LBA 2048 (1 MiB alignment, standard GPT practice).
 const ESP_START_LBA: u64 = 2048;
@@ -142,7 +143,7 @@ impl Seek for PartitionSlice
 
 /// Create a GPT disk image at `<project_root>/disk.img`.
 ///
-/// The image contains two 64 MiB FAT32 partitions:
+/// The image contains two FAT32 partitions sized [`PARTITION_SIZE`]:
 /// - Partition 1 (ESP): populated from `sysroot/esp/`
 /// - Partition 2 (ROOT): populated from `sysroot/` excluding `esp/`
 pub fn create_disk_image(ctx: &BuildContext) -> Result<()>

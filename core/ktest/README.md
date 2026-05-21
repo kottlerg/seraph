@@ -5,6 +5,11 @@ purpose of end-to-end kernel testing. It receives the same initial capability
 set that real init would, exercises every kernel syscall, and reports results
 to the serial console before exiting.
 
+On completion ktest emits the cross-harness marker
+`[ktest] ALL TESTS PASSED` (or `[ktest] SOME TESTS FAILED`) per
+[docs/testing.md](../../docs/testing.md). CI scrapes the substring
+`ALL TESTS PASSED` from the boot log.
+
 ## Activating ktest
 
 Edit `rootfs/EFI/seraph/boot.conf` and change the `init` field:
@@ -154,4 +159,4 @@ cmdline=ktest.filter=unit,integration,stress,bench ktest.shutdown=pass ktest.tim
 
 ## Summarized By
 
-None
+[docs/testing.md](../../docs/testing.md)

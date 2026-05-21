@@ -1,0 +1,13 @@
+[package]
+name = "hello-tester"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hello-tester"
+path = "src/main.rs"
+test = false
+
+[lints]
+workspace = true

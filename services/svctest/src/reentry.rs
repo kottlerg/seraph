@@ -3,7 +3,7 @@
 
 //! argv-driven child-mode dispatch.
 //!
-//! Several phases respawn `/bin/svctest` with a single argv token to
+//! Several phases respawn `/tests/svctest` with a single argv token to
 //! exercise child-side behaviour (namespace attenuation propagation,
 //! cwd-cap delivery, `/bin`-subtree attenuation). The child-mode
 //! function for each role lives in the phase module that spawns it;

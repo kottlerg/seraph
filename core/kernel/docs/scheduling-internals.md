@@ -116,6 +116,16 @@ The TCB is owned in pieces. Different field groups have different lock disciplin
 
 **Magic-cookie discipline.** `magic == TCB_MAGIC` MUST be read on every dereference of a TCB pointer that crossed a CPU boundary or came from an intrusive list (run queue, IPC wait queue, sleep list, death observer). `core/kernel/src/sched/run_queue.rs:223,272` already does this for run-queue ops; the same pattern applies anywhere a stale pointer might be observed.
 
+**`cpu_affinity` enforcement invariant.** A thread with `cpu_affinity = X` (X ≠ `AFFINITY_ANY`) MUST NOT be linked on CPU Y's run queue, nor dispatched out of `schedule()` on CPU Y, for any Y ≠ X. The enforcement points are:
+
+- `select_target_cpu` + `enqueue_and_wake` (`core/kernel/src/sched/mod.rs`) honour `cpu_affinity` on every placement.
+- `migrate_ready_thread` is the active-relocation primitive.
+- `schedule()`'s outgoing-thread re-enqueue branch (`core/kernel/src/sched/mod.rs:1773–1820`) routes the requeue cross-CPU when the *outgoing* thread's affinity no longer permits the current CPU.
+
+The dispatch-side skip loop in `schedule()` (`core/kernel/src/sched/mod.rs:1834–1843`) only filters `Stopped` / `Exited` — it does **NOT** consult `cpu_affinity` on the *incoming* dequeued thread. A `cpu_affinity` write that lands between an `enqueue_and_wake` and the matching `migrate_ready_thread` is therefore a window in which `schedule()` on the source CPU can still dispatch the target locally in violation of the new affinity. Syscalls that mutate `cpu_affinity` and then dispatch on an unlocked state read (`sys_thread_set_affinity`) MUST bracket the read-and-act sequence with `percpu::preempt_disable` / `preempt_enable` so a local timer-driven `schedule()` cannot dispatch the target on the source CPU during the in-flight migration. See issue #116.
+
+Userspace that pins a thread to one CPU then re-pins it to another (the `affinity_migrate_ready_queued` ktest pattern) has an analogous *inter-syscall* race window that no kernel guard closes: the target is legitimately Ready and on the source CPU's queue with a matching `cpu_affinity` for that CPU, so a timer-driven `schedule()` between the two syscalls correctly dispatches it locally. Tests that publish state derived from the running CPU MUST encode that state in a non-zero form (e.g. `1u64 << cpu` rather than `cpu`) so wake primitives never reject the wake on a stale-CPU run; otherwise a stale dispatch silently swallows the wake and the parent's wait parks indefinitely. See issue #116.
+
 **`context_saved` protocol (`core/kernel/src/sched/thread.rs`).** This is the load-bearing cross-CPU synchronisation for context-switch correctness on RVWMO *and* the publication barrier protecting TCB lifetime against `dealloc_object(Thread)`:
 
 ```

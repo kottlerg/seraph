@@ -23,8 +23,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, system_info, thread_configure, thread_exit, thread_read_regs, thread_set_affinity,
-    thread_set_priority, thread_start, thread_stop, thread_write_regs,
+    signal_wait, signal_wait_timeout, system_info, thread_configure, thread_exit, thread_read_regs,
+    thread_set_affinity, thread_set_priority, thread_start, thread_stop, thread_write_regs,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -657,10 +657,20 @@ pub fn affinity_migrate_ready_queued(ctx: &TestContext) -> TestResult
     thread_set_affinity(th, 1).map_err(|_| "active migration thread_set_affinity(1) failed")?;
 
     // Block on the signal: parent leaves CPU 0, CPU 1 runs T which reports
-    // its actual CPU id back through the signal bits.
-    let bits =
-        signal_wait(sig).map_err(|_| "signal_wait for affinity_migrate_ready_queued failed")?;
-    if bits != 1
+    // its actual CPU id back through the signal bits. `report_cpu_entry`
+    // encodes the CPU id as `1u64 << cpu` so the wake always lands even
+    // if a Ready→Running race on CPU 0 dispatches T before the migration
+    // (otherwise `signal_send(sig, 0)` would be rejected and the test
+    // would hang instead of failing — see issue #116). The 5 s timeout
+    // is a defensive backstop: any missed-wake from a different cause
+    // also degrades to a deterministic test FAIL rather than a HANG.
+    let bits = signal_wait_timeout(sig, 5_000)
+        .map_err(|_| "signal_wait for affinity_migrate_ready_queued failed")?;
+    if bits == 0
+    {
+        return Err("affinity_migrate_ready_queued timed out — child never signaled");
+    }
+    if bits != (1u64 << 1)
     {
         return Err("Ready-thread migration did not land on CPU 1");
     }
@@ -1109,12 +1119,26 @@ fn blocker_entry(arg: u64) -> !
 /// Used by [`affinity_migrate_ready_queued`] — the child is queued on one
 /// CPU, then migrated by the parent via `thread_set_affinity`. The CPU id
 /// reported here MUST be the post-migration CPU.
+///
+/// The CPU id is encoded as `1u64 << cpu` (one bit per CPU) rather than
+/// the raw integer. Raw encoding fails when `cpu == 0`: `signal_send`
+/// rejects zero-bit sends with `InvalidArgument` (see
+/// `core/kernel/src/syscall/ipc.rs:832–835`), the child silently exits,
+/// and the parent's `signal_wait` parks indefinitely — manifesting as the
+/// all-CPUs-idle stall in issue #116. The bit-per-CPU encoding is always
+/// non-zero for any valid CPU id, so the wake always lands; a stale-CPU
+/// run shows up as a deterministic test FAIL ("not landed on CPU 1")
+/// instead of a HANG.
 // cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
 #[allow(clippy::cast_possible_truncation)]
 fn report_cpu_entry(sig_slot: u64) -> !
 {
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
-    signal_send(sig_slot as u32, cpu).ok();
+    // `wrapping_shl` masks the shift count modulo the type width (64),
+    // keeping the result non-zero (and therefore acceptable to
+    // `signal_send`) even on the defensive `u64::MAX` fallback above —
+    // a plain `1u64 << cpu` would shift-overflow and panic in debug.
+    signal_send(sig_slot as u32, 1u64.wrapping_shl(cpu as u32)).ok();
     thread_exit()
 }
 

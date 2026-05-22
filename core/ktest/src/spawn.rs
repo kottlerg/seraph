@@ -38,9 +38,9 @@ pub struct SpawnedChild
 pub fn new_child(ctx: &TestContext) -> Result<SpawnedChild, &'static str>
 {
     // cap_create_cspace(frame, l1_idx=0, l1_depth=4, l2_size=16) — the
-    // 16-slot cspace is the default ceiling for tests that copy 1-3
-    // caps into the child plus headroom. Tests with wider cap layouts
-    // (e.g. integration/cap_transfer.rs uses a 32-slot cspace,
+    // 16-slot cspace covers tests that copy 1-3 caps into the child
+    // plus headroom. Tests with wider cap layouts (e.g.
+    // integration/cap_transfer.rs uses a 32-slot cspace,
     // stress/retype_concurrent.rs uses 64) bypass this helper and
     // call cap_create_cspace directly.
     let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)

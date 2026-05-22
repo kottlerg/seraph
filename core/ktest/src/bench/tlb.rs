@@ -37,9 +37,9 @@ use super::{cycles_now, log_bench_header};
 use crate::{ChildStack, spawn};
 
 /// Ceiling on the worker count. CPU 0 is ktest's own; pin children to
-/// 1..=`MAX_PINNED`. 7 covers an 8-vCPU QEMU configuration (the
-/// largest topology in the project's CI matrix today) and keeps
-/// `SHOOTDOWN_STACKS` BSS at 7 × 16 KiB = 112 KiB.
+/// 1..=`MAX_PINNED`. 7 covers up to an 8-vCPU host with headroom over
+/// the 4-vCPU QEMU configuration ktest currently boots under, and
+/// keeps `SHOOTDOWN_STACKS` BSS at 7 × 16 KiB = 112 KiB.
 const MAX_PINNED: usize = 7;
 static mut SHOOTDOWN_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; MAX_PINNED];
 

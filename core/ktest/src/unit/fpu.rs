@@ -14,17 +14,13 @@
 //! verifies both captures match the pattern the child wrote. Any
 //! cross-thread bleed surfaces as a mismatch and fails the test.
 
-#[cfg(target_arch = "x86_64")]
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-#[cfg(target_arch = "x86_64")]
 use syscall::system_info;
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
     signal_wait, thread_configure, thread_exit, thread_set_affinity, thread_start,
 };
-#[cfg(target_arch = "x86_64")]
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -442,39 +438,35 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
 // ── Cross-CPU preemption-isolation (eager-save migration, per #108) ──────────
 
 /// Per-thread stack for the cross-CPU child.
-#[cfg(target_arch = "x86_64")]
 static mut STACK_CROSS: ChildStack = ChildStack::ZERO;
 /// Signal indices passed into the cross-CPU child by index (the child's
 /// cspace cap is published here so the inline-asm syscall sites can read
-/// them without crossing a Rust function boundary that would clobber
-/// xmm0..xmm15).
-#[cfg(target_arch = "x86_64")]
+/// them without crossing a Rust function boundary that would clobber the
+/// FP register file).
 static CROSS_SIG_READY: AtomicU32 = AtomicU32::new(0);
-#[cfg(target_arch = "x86_64")]
 static CROSS_SIG_RESUME: AtomicU32 = AtomicU32::new(0);
-#[cfg(target_arch = "x86_64")]
 static CROSS_SIG_DONE: AtomicU32 = AtomicU32::new(0);
 /// Mismatch count written by the cross-CPU child after the post-migration
 /// register capture. The parent reads it only after the `done` signal so
 /// the zero default is never mistaken for a pass.
-#[cfg(target_arch = "x86_64")]
 static CROSS_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 /// CPU id observed by the cross-CPU child after migration, sanity-checked
 /// by the parent to confirm the migration actually happened.
-#[cfg(target_arch = "x86_64")]
 static CROSS_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Cross-CPU child entry: load `PATTERN_A` into xmm0..xmm15, signal "ready",
-/// block on "resume", then capture xmm0..xmm15 back to a stack buffer.
+/// Cross-CPU child entry: load `PATTERN_A` into the extended-state register
+/// file, signal "ready", block on "resume", then capture the registers
+/// back to a stack buffer.
 ///
 /// The entire load → block → capture sequence runs inside a single inline-
-/// asm block so no intervening Rust call clobbers xmm. The syscall ABI is
-/// embedded directly: rax = syscall number, rdi/rsi = args; the kernel
-/// preserves the live FP register file across the block because (a) the
-/// kernel itself is soft-float and (b) the FPU discipline keeps the
-/// child as `fpu_owner` of its current CPU until either another thread
-/// takes an `#NM` or the child itself context-switches out (at which
-/// point `switch_out_save` XSAVEs the live regs into the TCB area).
+/// asm block so no intervening Rust call clobbers FP state. The syscall ABI
+/// is embedded directly: the kernel preserves the live FP register file
+/// across the block because (a) the kernel itself is soft-float and (b) the
+/// FPU discipline keeps the child as `fpu_owner` of its current CPU until
+/// either another thread takes a lazy-restore trap or the child itself
+/// context-switches out (at which point `switch_out_save` saves the live
+/// regs into the TCB area before the publish that lets the destination CPU
+/// see the thread Ready).
 #[cfg(target_arch = "x86_64")]
 extern "C" fn child_cross_entry(_arg: u64) -> !
 {
@@ -570,6 +562,137 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     thread_exit();
 }
 
+/// RISC-V cross-CPU child entry: load `PATTERN_A` into f0..f31, signal
+/// "ready", block on "resume", then capture f0..f31 back to a stack buffer.
+///
+/// Same shape as the x86-64 sibling. ecall uses a7 as the syscall number
+/// and a0..a2 as args; the kernel is soft-float so the FP register file
+/// survives the syscall under the discipline described in the doc comment
+/// on `preempt_isolation_cross_cpu`.
+#[cfg(target_arch = "riscv64")]
+#[allow(clippy::too_many_lines)] // 32 FP loads + 32 FP stores dominate the body.
+extern "C" fn child_cross_entry(_arg: u64) -> !
+{
+    let pattern: u64 = PATTERN_A;
+    let mut buf = [0u64; 32];
+    let sig_ready = CROSS_SIG_READY.load(Ordering::Acquire);
+    let sig_resume = CROSS_SIG_RESUME.load(Ordering::Acquire);
+    let spin: u64 = 50_000;
+
+    // SAFETY: inline asm loads pattern into f0..f31, issues SIGNAL_SEND
+    // (a7=3) then SIGNAL_WAIT (a7=4) preserving the live FP register
+    // file across both, then stores f0..f31 into buf. The .option arch
+    // directive locally enables the D extension even though the kernel
+    // target is RV64IMAC; the trap-and-restore path will have made FS
+    // Dirty by the time these stores execute post-migration.
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +d",
+            "fmv.d.x f0,  {p}",
+            "fmv.d.x f1,  {p}",
+            "fmv.d.x f2,  {p}",
+            "fmv.d.x f3,  {p}",
+            "fmv.d.x f4,  {p}",
+            "fmv.d.x f5,  {p}",
+            "fmv.d.x f6,  {p}",
+            "fmv.d.x f7,  {p}",
+            "fmv.d.x f8,  {p}",
+            "fmv.d.x f9,  {p}",
+            "fmv.d.x f10, {p}",
+            "fmv.d.x f11, {p}",
+            "fmv.d.x f12, {p}",
+            "fmv.d.x f13, {p}",
+            "fmv.d.x f14, {p}",
+            "fmv.d.x f15, {p}",
+            "fmv.d.x f16, {p}",
+            "fmv.d.x f17, {p}",
+            "fmv.d.x f18, {p}",
+            "fmv.d.x f19, {p}",
+            "fmv.d.x f20, {p}",
+            "fmv.d.x f21, {p}",
+            "fmv.d.x f22, {p}",
+            "fmv.d.x f23, {p}",
+            "fmv.d.x f24, {p}",
+            "fmv.d.x f25, {p}",
+            "fmv.d.x f26, {p}",
+            "fmv.d.x f27, {p}",
+            "fmv.d.x f28, {p}",
+            "fmv.d.x f29, {p}",
+            "fmv.d.x f30, {p}",
+            "fmv.d.x f31, {p}",
+            "2:",
+            "addi {it}, {it}, -1",
+            "bnez {it}, 2b",
+            // SIGNAL_SEND(sig_ready, 0x1): a7=3, a0=sig_ready, a1=1.
+            "li a7, 3",
+            "mv a0, {sig_ready}",
+            "li a1, 1",
+            "ecall",
+            // SIGNAL_WAIT(sig_resume): a7=4, a0=sig_resume.
+            "li a7, 4",
+            "mv a0, {sig_resume}",
+            "ecall",
+            // Resumed on (potentially different) destination CPU.
+            "fsd f0,    0({b})",
+            "fsd f1,    8({b})",
+            "fsd f2,   16({b})",
+            "fsd f3,   24({b})",
+            "fsd f4,   32({b})",
+            "fsd f5,   40({b})",
+            "fsd f6,   48({b})",
+            "fsd f7,   56({b})",
+            "fsd f8,   64({b})",
+            "fsd f9,   72({b})",
+            "fsd f10,  80({b})",
+            "fsd f11,  88({b})",
+            "fsd f12,  96({b})",
+            "fsd f13, 104({b})",
+            "fsd f14, 112({b})",
+            "fsd f15, 120({b})",
+            "fsd f16, 128({b})",
+            "fsd f17, 136({b})",
+            "fsd f18, 144({b})",
+            "fsd f19, 152({b})",
+            "fsd f20, 160({b})",
+            "fsd f21, 168({b})",
+            "fsd f22, 176({b})",
+            "fsd f23, 184({b})",
+            "fsd f24, 192({b})",
+            "fsd f25, 200({b})",
+            "fsd f26, 208({b})",
+            "fsd f27, 216({b})",
+            "fsd f28, 224({b})",
+            "fsd f29, 232({b})",
+            "fsd f30, 240({b})",
+            "fsd f31, 248({b})",
+            ".option pop",
+            p = in(reg) pattern,
+            b = in(reg) buf.as_mut_ptr(),
+            it = inout(reg) spin => _,
+            sig_ready = in(reg) u64::from(sig_ready),
+            sig_resume = in(reg) u64::from(sig_resume),
+            out("a0") _, out("a1") _, out("a7") _,
+            options(nostack),
+        );
+    }
+
+    let mut mismatches = 0u64;
+    for &v in &buf
+    {
+        if v != PATTERN_A
+        {
+            mismatches += 1;
+        }
+    }
+    CROSS_MISMATCHES.store(mismatches, Ordering::Release);
+    let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
+    CROSS_OBSERVED_CPU.store(u32::try_from(cpu).unwrap_or(u32::MAX), Ordering::Release);
+
+    let _ = signal_send(CROSS_SIG_DONE.load(Ordering::Acquire), 0x1);
+    thread_exit();
+}
+
 /// Cross-CPU FPU-migration correctness: a thread that became `fpu_owner`
 /// on CPU 0, blocked, then was woken with affinity changed to CPU 1, must
 /// observe its register file intact post-migration. After issue #108,
@@ -577,19 +700,8 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
 /// `switch_out_save` persists the live regs into the TCB area before the
 /// scheduler lock release that publishes the thread's Ready state).
 ///
-/// Requires SMP; skips otherwise. Skipped on RISC-V (the equivalent
-/// `sstatus.FS/VS` dirty-tracking path is exercised by its own ktest).
-#[cfg(target_arch = "riscv64")]
-#[allow(clippy::unnecessary_wraps)]
-pub fn preempt_isolation_cross_cpu(_ctx: &TestContext) -> TestResult
-{
-    crate::log("ktest: fpu::preempt_isolation_cross_cpu SKIP (RISC-V out of scope for #65)");
-    Ok(())
-}
-
-/// Cross-CPU FPU-migration correctness (x86-64 only); see the
-/// architecture-neutral doc comment above.
-#[cfg(target_arch = "x86_64")]
+/// Requires SMP; skips on UP. Runs on both x86-64 (XSAVE/XRSTOR + `#NM`)
+/// and RISC-V (`sstatus.FS/VS` dirty-tracking + illegal-instruction trap).
 pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
 {
     {

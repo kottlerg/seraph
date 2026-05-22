@@ -154,6 +154,11 @@ pub struct TestContext
     /// `frame_pool` slots elsewhere are derived from a segment cap and
     /// therefore lack the RETYPE right.
     pub memory_frame_base: u32,
+
+    /// RISC-V SBI control cap (slot index), kernel-minted in init's
+    /// initial cap set. Zero on x86-64, where SBI is unavailable.
+    /// Tests of `SYS_SBI_CALL` use this cap.
+    pub sbi_control_cap: u32,
 }
 
 /// 16 KiB stack for a child thread, aligned per the System V ABI.
@@ -265,6 +270,7 @@ fn run(info_ptr: u64) -> !
         cspace_cap: info.cspace_cap,
         ipc_buf: ipc_buf_ptr,
         memory_frame_base: info.memory_frame_base,
+        sbi_control_cap: info.sbi_control_cap,
     };
 
     // Parse config early so we can gate tier execution and pass bench_iters.

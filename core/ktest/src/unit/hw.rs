@@ -5,15 +5,16 @@
 
 //! Tier 1 tests for hardware access syscalls.
 //!
-//! Covers: `SYS_MMIO_MAP`, `SYS_IRQ_REGISTER`, `SYS_IRQ_ACK`,
-//! `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`.
+//! Covers: `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER`,
+//! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`,
+//! `SYS_SBI_CALL`.
 //!
 //! Tests that require specific hardware capability types (`MmioRegion`, Interrupt,
 //! `IoPortRange`) scan the initial capability set for a matching cap. If none is
 //! found in the current boot configuration, the test is skipped and reports Ok.
 //! Skips are logged to serial so they are visible in the test run output.
 
-use syscall::{aspace_query, cap_create_signal, irq_ack, irq_register};
+use syscall::{aspace_query, cap_create_signal, irq_ack, irq_register, irq_split, mmio_split};
 #[cfg(target_arch = "x86_64")]
 use syscall::{cap_create_cspace, cap_create_thread};
 use syscall_abi::SyscallError;
@@ -279,4 +280,129 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
         );
         Ok(())
     }
+}
+
+// ── SYS_MMIO_SPLIT ────────────────────────────────────────────────────────────
+
+/// `mmio_split` on the first `MmioRegion` ≥ 8 KiB returns two valid children
+/// with disjoint base/size. Skipped if no suitable cap exists.
+pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
+{
+    let max_slots = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+        .map_or(ctx.aspace_cap, |n| u32::try_from(n).unwrap_or(u32::MAX));
+
+    for slot in 1u32..max_slots
+    {
+        // Probe: split at PAGE_SIZE. InvalidCapability ⇒ wrong tag.
+        // InvalidArgument ⇒ MmioRegion exists but too small.
+        match mmio_split(slot, 0x1000)
+        {
+            Err(e) if e == SyscallError::InvalidCapability as i64 =>
+            {}
+            Err(e) if e == SyscallError::InvalidArgument as i64 =>
+            {}
+            Err(_) => return Err("hw::mmio_split_carves: unexpected error from mmio_split"),
+            Ok((slot1, slot2)) =>
+            {
+                if slot1 == 0 || slot2 == 0 || slot1 == slot2
+                {
+                    return Err("hw::mmio_split_carves: split returned bad slot ids");
+                }
+                syscall::cap_delete(slot1).ok();
+                syscall::cap_delete(slot2).ok();
+                return Ok(());
+            }
+        }
+    }
+
+    crate::log("ktest: hw::mmio_split_carves SKIP (no MmioRegion caps in initial cap set)");
+    Ok(())
+}
+
+/// `mmio_split` on a Frame cap (wrong tag) must return `InvalidCapability`.
+pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
+{
+    let err = mmio_split(ctx.memory_frame_base, 0x1000);
+    if err != Err(SyscallError::InvalidCapability as i64)
+    {
+        return Err("hw::mmio_split_wrong_tag_err: did not return InvalidCapability");
+    }
+    Ok(())
+}
+
+// ── SYS_IRQ_SPLIT ─────────────────────────────────────────────────────────────
+
+/// `irq_split` on the first Interrupt-range cap with `count > 1` returns two
+/// disjoint children. Skipped if no suitable cap exists.
+pub fn irq_split_carves(ctx: &TestContext) -> TestResult
+{
+    let max_slots = syscall::cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+        .map_or(ctx.aspace_cap, |n| u32::try_from(n).unwrap_or(u32::MAX));
+
+    for slot in 1u32..max_slots
+    {
+        // Probe: split at base+1. Wrong-tag and unsplittable-range responses
+        // both leave the cap intact.
+        match irq_split(slot, 1)
+        {
+            Err(_) =>
+            {} // Wrong tag or non-splittable; keep scanning.
+            Ok((slot1, slot2)) =>
+            {
+                if slot1 == 0 || slot2 == 0 || slot1 == slot2
+                {
+                    return Err("hw::irq_split_carves: split returned bad slot ids");
+                }
+                syscall::cap_delete(slot1).ok();
+                syscall::cap_delete(slot2).ok();
+                return Ok(());
+            }
+        }
+    }
+
+    crate::log("ktest: hw::irq_split_carves SKIP (no Interrupt range caps with count>1)");
+    Ok(())
+}
+
+/// `irq_split` on a Frame cap (wrong tag) must return `InvalidCapability`.
+pub fn irq_split_wrong_tag_err(ctx: &TestContext) -> TestResult
+{
+    let err = irq_split(ctx.memory_frame_base, 0);
+    if err != Err(SyscallError::InvalidCapability as i64)
+    {
+        return Err("hw::irq_split_wrong_tag_err: did not return InvalidCapability");
+    }
+    Ok(())
+}
+
+// ── SYS_SBI_CALL ──────────────────────────────────────────────────────────────
+
+/// On RISC-V, `sbi_call(sbi_control_cap, EID=0x10, FID=0, …)` reads the SBI
+/// spec version. Verifies the call path: the kernel forwards to SBI and
+/// returns a plausible version (major in `0..=3`).
+#[cfg(target_arch = "riscv64")]
+pub fn sbi_call_get_spec_version(ctx: &TestContext) -> TestResult
+{
+    // EID_BASE = 0x10, FID_GET_SPEC_VERSION = 0 per the SBI base extension.
+    let version = syscall::sbi_call(ctx.sbi_control_cap, 0x10, 0, 0, 0, 0)
+        .map_err(|_| "hw::sbi_call_get_spec_version: sbi_call returned error")?;
+    let major = version >> 24;
+    if major > 3
+    {
+        return Err("hw::sbi_call_get_spec_version: implausible SBI major version");
+    }
+    Ok(())
+}
+
+/// On `x86_64`, `sbi_call` is unconditionally `NotSupported` regardless of
+/// arguments (the syscall is a RISC-V-only forwarder).
+#[cfg(target_arch = "x86_64")]
+pub fn sbi_call_not_supported_x86_64(_ctx: &TestContext) -> TestResult
+{
+    let err = syscall::sbi_call(0, 0, 0, 0, 0, 0);
+    if err != Err(SyscallError::NotSupported as i64)
+    {
+        return Err("hw::sbi_call_not_supported_x86_64: did not return NotSupported");
+    }
+    Ok(())
 }

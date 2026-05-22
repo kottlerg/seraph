@@ -22,9 +22,10 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, signal_wait_timeout, system_info, thread_configure, thread_exit, thread_read_regs,
-    thread_set_affinity, thread_set_priority, thread_start, thread_stop, thread_write_regs,
+    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete,
+    event_queue_create, event_recv, signal_send, signal_wait, signal_wait_timeout, system_info,
+    thread_bind_notification, thread_configure, thread_exit, thread_read_regs, thread_set_affinity,
+    thread_set_priority, thread_sleep, thread_start, thread_stop, thread_write_regs,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -1209,4 +1210,92 @@ fn phase2_entry() -> !
     let sig = PHASE2_SIG.load(Ordering::Acquire);
     signal_send(sig, 0x2).ok();
     thread_exit()
+}
+
+// ── SYS_THREAD_SLEEP ─────────────────────────────────────────────────────────
+
+/// `thread_sleep(50)` blocks the caller for at least ~40 ms wall clock
+/// (slack to absorb timer granularity on slow VMs).
+pub fn sleep_blocks_ms(_ctx: &TestContext) -> TestResult
+{
+    let t0 = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "thread::sleep_blocks_ms: system_info(ElapsedUs) before failed")?;
+    thread_sleep(50).map_err(|_| "thread::sleep_blocks_ms: thread_sleep(50) failed")?;
+    let t1 = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "thread::sleep_blocks_ms: system_info(ElapsedUs) after failed")?;
+    let elapsed_us = t1.wrapping_sub(t0);
+    if elapsed_us < 40_000
+    {
+        return Err("thread::sleep_blocks_ms: returned earlier than requested timeout");
+    }
+    Ok(())
+}
+
+/// `thread_sleep(0)` is a no-op — returns immediately with `Ok(())`.
+pub fn sleep_zero_is_noop(_ctx: &TestContext) -> TestResult
+{
+    thread_sleep(0).map_err(|_| "thread::sleep_zero_is_noop: thread_sleep(0) returned error")?;
+    Ok(())
+}
+
+// ── SYS_THREAD_BIND_NOTIFICATION ─────────────────────────────────────────────
+
+/// Stack for the `bind_notification` child.
+static mut BIND_NOTIF_STACK: crate::ChildStack = crate::ChildStack::ZERO;
+
+/// Child that exits immediately so its bound `EventQueue` receives the
+/// thread-death payload.
+fn bind_notif_exit_entry(_arg: u64) -> !
+{
+    thread_exit()
+}
+
+/// `thread_bind_notification(child, eq, correlator)` causes a payload
+/// carrying `correlator` to be posted to `eq` when the child thread exits.
+pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
+{
+    const CORRELATOR: u32 = 0xCAFEu32;
+
+    let eq = event_queue_create(ctx.memory_frame_base, 4)
+        .map_err(|_| "thread::bind_notification_fires_on_exit: event_queue_create failed")?;
+
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::bind_notification_fires_on_exit: spawn::new_child failed")?;
+
+    // Bind BEFORE the child starts so the observer is registered when the
+    // thread first becomes Exited.
+    thread_bind_notification(child.th, eq, CORRELATOR)
+        .map_err(|_| "thread::bind_notification_fires_on_exit: thread_bind_notification failed")?;
+
+    let stack_top = crate::ChildStack::top(core::ptr::addr_of!(BIND_NOTIF_STACK));
+    crate::spawn::configure_and_start(&child, bind_notif_exit_entry, stack_top, 0)
+        .map_err(|_| "thread::bind_notification_fires_on_exit: configure_and_start failed")?;
+
+    // Block until the death notification arrives.
+    let payload =
+        event_recv(eq).map_err(|_| "thread::bind_notification_fires_on_exit: event_recv failed")?;
+
+    // The kernel packs the correlator into the high 32 bits of the payload.
+    let observed = (payload >> 32) as u32;
+    if observed != CORRELATOR
+    {
+        return Err("thread::bind_notification_fires_on_exit: wrong correlator on death payload");
+    }
+
+    cap_delete(child.th).ok();
+    cap_delete(child.cs).ok();
+    cap_delete(eq).ok();
+    Ok(())
+}
+
+/// `thread_bind_notification` with a null thread cap must return
+/// `InvalidCapability`.
+pub fn bind_notification_invalid_cap_err(_ctx: &TestContext) -> TestResult
+{
+    let err = thread_bind_notification(0, 0, 0);
+    if err != Err(SyscallError::InvalidCapability as i64)
+    {
+        return Err("thread::bind_notification_invalid_cap_err: did not return InvalidCapability");
+    }
+    Ok(())
 }

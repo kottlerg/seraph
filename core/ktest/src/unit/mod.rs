@@ -5,22 +5,32 @@
 
 //! Tier 1 — per-syscall isolation tests.
 //!
-//! Each file in this module covers one logical group of related syscalls
-//! (mirroring the kernel's subsystem structure). Every kernel syscall must
-//! have at least one test here. Adding a new syscall means adding a section
-//! to the appropriate file.
+//! Rule (durable):
+//!
+//! > **One module per kernel subsystem under test. New subsystem ⇒ new
+//! > module.**
+//!
+//! Adding a new syscall means adding a section in the file for its
+//! kernel subsystem — not a new file. New file only when a new kernel
+//! subsystem is added. Files stay scoped; they don't grow unboundedly
+//! because each is one surface.
+//!
+//! Every kernel syscall must have at least one positive-path test here
+//! plus its most important negative paths (wrong rights, invalid
+//! arguments, wrong object state).
 //!
 //! Files:
 //! - `cap.rs`      — capability creation, copy, move, insert, derive, revoke, delete
 //! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
+//! - `retype.rs`   — retype primitive: aspace/cspace augment, PT budget, kernel PT pool
 //! - `mm.rs`       — memory map/unmap/protect, frame split, address space query
-//! - `signal.rs`   — signal send and wait
-//! - `event.rs`    — event queue post and receive
+//! - `signal.rs`   — signal send and wait (blocking and timeout)
+//! - `event.rs`    — event queue post and receive (blocking, try, timeout)
 //! - `wait_set.rs` — wait set add, remove, wait
 //! - `ipc.rs`      — IPC call, reply, recv, buffer set
-//! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity
-//! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption
-//! - `hw.rs`       — MMIO, IRQ, I/O ports
+//! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity, sleep, `bind_notification`
+//! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration
+//! - `hw.rs`       — MMIO, IRQ, I/O ports, SBI
 //! - `sysinfo.rs`  — system info queries and debug log
 
 pub mod cap;
@@ -236,6 +246,14 @@ pub fn run_all(ctx: &TestContext)
         "signal::send_insufficient_rights",
         signal::send_insufficient_rights(ctx)
     );
+    run_test!(
+        "signal::wait_timeout_fires",
+        signal::wait_timeout_fires(ctx)
+    );
+    run_test!(
+        "signal::wait_timeout_returns_bits_first",
+        signal::wait_timeout_returns_bits_first(ctx)
+    );
 
     // ── Event queue syscalls ──────────────────────────────────────────────────
     run_test!("event::create", event::create(ctx));
@@ -404,6 +422,19 @@ pub fn run_all(ctx: &TestContext)
         "thread::load_balancer_skips_pinned",
         thread::load_balancer_skips_pinned(ctx)
     );
+    run_test!("thread::sleep_blocks_ms", thread::sleep_blocks_ms(ctx));
+    run_test!(
+        "thread::sleep_zero_is_noop",
+        thread::sleep_zero_is_noop(ctx)
+    );
+    run_test!(
+        "thread::bind_notification_fires_on_exit",
+        thread::bind_notification_fires_on_exit(ctx)
+    );
+    run_test!(
+        "thread::bind_notification_invalid_cap_err",
+        thread::bind_notification_invalid_cap_err(ctx)
+    );
 
     // ── Extended-state (FPU / SIMD / V) isolation ────────────────────────────
     run_test!("fpu::preempt_isolation", fpu::preempt_isolation(ctx));
@@ -414,9 +445,29 @@ pub fn run_all(ctx: &TestContext)
 
     // ── Hardware access syscalls ──────────────────────────────────────────────
     run_test!("hw::mmio_map", hw::mmio_map(ctx));
+    run_test!("hw::mmio_split_carves", hw::mmio_split_carves(ctx));
+    run_test!(
+        "hw::mmio_split_wrong_tag_err",
+        hw::mmio_split_wrong_tag_err(ctx)
+    );
     run_test!("hw::irq_register_ack", hw::irq_register_ack(ctx));
+    run_test!("hw::irq_split_carves", hw::irq_split_carves(ctx));
+    run_test!(
+        "hw::irq_split_wrong_tag_err",
+        hw::irq_split_wrong_tag_err(ctx)
+    );
     run_test!("hw::ioport_bind", hw::ioport_bind(ctx));
     run_test!("hw::ioport_split", hw::ioport_split(ctx));
+    #[cfg(target_arch = "riscv64")]
+    run_test!(
+        "hw::sbi_call_get_spec_version",
+        hw::sbi_call_get_spec_version(ctx)
+    );
+    #[cfg(target_arch = "x86_64")]
+    run_test!(
+        "hw::sbi_call_not_supported_x86_64",
+        hw::sbi_call_not_supported_x86_64(ctx)
+    );
 
     // ── System info syscalls ──────────────────────────────────────────────────
     run_test!("sysinfo::kernel_version", sysinfo::kernel_version(ctx));

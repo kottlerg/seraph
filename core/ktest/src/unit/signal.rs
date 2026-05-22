@@ -8,10 +8,10 @@
 //! Covers: `SYS_SIGNAL_SEND`, `SYS_SIGNAL_WAIT`.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, cap_derive,
-    signal_send, signal_wait, thread_configure, thread_exit, thread_start,
+    cap_copy, cap_create_signal, cap_delete, cap_derive, signal_send, signal_wait,
+    signal_wait_timeout, system_info, thread_exit,
 };
-use syscall_abi::SyscallError;
+use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -45,24 +45,15 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
     let sig = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal for blocking-wait test failed")?;
 
-    // Create a child CSpace and copy the signal cap (SIGNAL right only).
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for blocking-wait test failed")?;
-    let child_sig =
-        cap_copy(sig, cs, RIGHTS_SIGNAL).map_err(|_| "cap_copy signal into child CSpace failed")?;
-
-    let child_th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for blocking-wait test failed")?;
+    // Create a child CSpace + thread, copy the signal cap (SIGNAL right only).
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "spawn::new_child for blocking-wait test failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
+        .map_err(|_| "cap_copy signal into child CSpace failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    thread_configure(
-        child_th,
-        sender_entry as *const () as u64,
-        stack_top,
-        u64::from(child_sig),
-    )
-    .map_err(|_| "thread_configure for blocking-wait test failed")?;
-    thread_start(child_th).map_err(|_| "thread_start for blocking-wait test failed")?;
+    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+        .map_err(|_| "configure_and_start for blocking-wait test failed")?;
 
     // Block until the child sends.
     let bits = signal_wait(sig).map_err(|_| "signal_wait (blocking) failed")?;
@@ -72,7 +63,7 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
     }
 
     cap_delete(sig).map_err(|_| "cap_delete sig after blocking-wait test failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after blocking-wait test failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after blocking-wait test failed")?;
     Ok(())
 }
 
@@ -197,6 +188,58 @@ pub fn send_insufficient_rights(ctx: &TestContext) -> TestResult
 
     cap_delete(wait_only).map_err(|_| "cap_delete wait_only failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after send_insufficient_rights failed")?;
+    Ok(())
+}
+
+// ── SYS_SIGNAL_WAIT (timeout) ─────────────────────────────────────────────────
+
+/// `signal_wait_timeout` on an un-signalled cap returns `Ok(0)` after the
+/// timeout elapses; the elapsed wall time must be at least the requested
+/// timeout less a small slack.
+pub fn wait_timeout_fires(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for wait_timeout_fires failed")?;
+
+    let t0 = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "system_info(ElapsedUs) before wait failed")?;
+    let bits = signal_wait_timeout(sig, 50).map_err(|_| "signal_wait_timeout (50ms) failed")?;
+    let t1 = system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "system_info(ElapsedUs) after wait failed")?;
+
+    if bits != 0
+    {
+        return Err("signal_wait_timeout on idle cap returned non-zero bits");
+    }
+    // Allow ~10 ms slack for timer granularity on slow VMs.
+    let elapsed_us = t1.wrapping_sub(t0);
+    if elapsed_us < 40_000
+    {
+        return Err("signal_wait_timeout returned earlier than the requested timeout");
+    }
+
+    cap_delete(sig).map_err(|_| "cap_delete sig after wait_timeout_fires failed")?;
+    Ok(())
+}
+
+/// Pre-signalled bits must be returned immediately, ahead of the timeout.
+pub fn wait_timeout_returns_bits_first(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for wait_timeout_returns_bits_first failed")?;
+
+    signal_send(sig, 0xABCD)
+        .map_err(|_| "signal_send before wait_timeout_returns_bits_first failed")?;
+
+    // Very large timeout — if we ever hit it, it's a real failure.
+    let bits = signal_wait_timeout(sig, 1_000_000)
+        .map_err(|_| "signal_wait_timeout with pending bits failed")?;
+    if bits != 0xABCD
+    {
+        return Err("signal_wait_timeout did not return pre-set bits");
+    }
+
+    cap_delete(sig).map_err(|_| "cap_delete sig after wait_timeout_returns_bits_first failed")?;
     Ok(())
 }
 

@@ -24,6 +24,9 @@ use syscall_abi::CAP_INFO_FRAME_AVAILABLE;
 
 use crate::{ChildStack, TestContext, TestResult};
 
+/// 8 — pre-ramp baseline. See `concurrent_signal.rs::NUM_SENDERS` for
+/// the kernel-side scaling pathologies that block ramping per-worker
+/// counts further in-tree. Iteration count was ramped (was 200).
 const NUM_WORKERS: usize = 8;
 const ITERS_PER_WORKER: u64 = 200;
 const ALL_BITS: u64 = 0xFF;

@@ -26,8 +26,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, thread_configure, thread_exit, thread_read_regs, thread_set_affinity,
-    thread_set_priority, thread_start, thread_stop, thread_write_regs,
+    signal_wait, thread_exit, thread_read_regs, thread_set_affinity, thread_set_priority,
+    thread_start, thread_stop, thread_write_regs,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -55,27 +55,19 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::thread_lifecycle: cap_create_signal (ready) failed")?;
     let block = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "integration::thread_lifecycle: cap_create_signal (block) failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "integration::thread_lifecycle: cap_create_cspace failed")?;
-    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "integration::thread_lifecycle: spawn::new_child failed")?;
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::thread_lifecycle: cap_copy (ready→child) failed")?;
-    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+    let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "integration::thread_lifecycle: cap_copy (block→child) failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "integration::thread_lifecycle: cap_create_thread failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    thread_configure(
-        th,
-        blocker_entry as *const () as u64,
-        stack_top,
-        blocker_arg,
-    )
-    .map_err(|_| "integration::thread_lifecycle: thread_configure failed")?;
 
     // ── Step 3: Start — child signals readiness. ──────────────────────────────
-    thread_start(th).map_err(|_| "integration::thread_lifecycle: thread_start failed")?;
+    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+        .map_err(|_| "integration::thread_lifecycle: configure_and_start failed")?;
     let ready_bits = signal_wait(ready)
         .map_err(|_| "integration::thread_lifecycle: signal_wait (readiness) failed")?;
     if ready_bits != 0x1
@@ -84,11 +76,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── Step 4: Stop while child is blocked. ──────────────────────────────────
-    thread_stop(th).map_err(|_| "integration::thread_lifecycle: thread_stop failed")?;
+    thread_stop(child.th).map_err(|_| "integration::thread_lifecycle: thread_stop failed")?;
 
     // ── Step 5: Read registers — verify IP is non-zero. ───────────────────────
     let mut reg_buf = [0u8; BUF];
-    thread_read_regs(th, reg_buf.as_mut_ptr(), BUF)
+    thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF)
         .map_err(|_| "integration::thread_lifecycle: thread_read_regs failed")?;
 
     let ip = u64::from_le_bytes(
@@ -107,11 +99,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     PHASE2_SIG.store(child_ready, Ordering::Release);
     let phase2_ptr = phase2_entry as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&phase2_ptr.to_le_bytes());
-    thread_write_regs(th, reg_buf.as_ptr(), BUF)
+    thread_write_regs(child.th, reg_buf.as_ptr(), BUF)
         .map_err(|_| "integration::thread_lifecycle: thread_write_regs failed")?;
 
     // ── Step 7: Resume — child lands in phase2_entry and sends 0x2. ──────────
-    thread_start(th).map_err(|_| "integration::thread_lifecycle: thread_start (resume) failed")?;
+    thread_start(child.th)
+        .map_err(|_| "integration::thread_lifecycle: thread_start (resume) failed")?;
     let phase2_bits = signal_wait(ready)
         .map_err(|_| "integration::thread_lifecycle: signal_wait (phase2) failed")?;
     if phase2_bits != 0x2
@@ -136,10 +129,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     cap_delete(th2).ok();
     cap_delete(cs2).ok();
-    cap_delete(th).ok();
+    cap_delete(child.th).ok();
     cap_delete(ready).ok();
     cap_delete(block).ok();
-    cap_delete(cs).ok();
+    cap_delete(child.cs).ok();
     Ok(())
 }
 

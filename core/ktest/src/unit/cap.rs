@@ -14,8 +14,8 @@
 
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_signal,
-    cap_create_thread, cap_delete, cap_derive, cap_derive_token, cap_insert, cap_move, cap_revoke,
-    event_queue_create, signal_send, signal_wait,
+    cap_delete, cap_derive, cap_derive_token, cap_insert, cap_move, cap_revoke, event_queue_create,
+    signal_send, signal_wait,
 };
 use syscall_abi::SyscallError;
 
@@ -85,12 +85,10 @@ pub fn create_aspace(ctx: &TestContext) -> TestResult
 pub fn create_thread(ctx: &TestContext) -> TestResult
 {
     // Thread needs both an address space and a cspace to be bound to.
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "cap_create_cspace for thread test failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread failed")?;
-    cap_delete(th).map_err(|_| "cap_delete thread failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cspace failed")?;
+    // `spawn::new_child` mints both via `cap_create_cspace` + `cap_create_thread`.
+    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete thread failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cspace failed")?;
     Ok(())
 }
 

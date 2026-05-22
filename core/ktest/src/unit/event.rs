@@ -11,9 +11,9 @@
 //! blocks only when the queue is empty. We pre-fill queues before receiving.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, event_post,
-    event_queue_create, event_recv, event_recv_timeout, event_try_recv, signal_send, signal_wait,
-    system_info, thread_configure, thread_exit, thread_sleep, thread_start, thread_yield,
+    cap_copy, cap_create_signal, cap_delete, event_post, event_queue_create, event_recv,
+    event_recv_timeout, event_try_recv, signal_send, signal_wait, system_info, thread_exit,
+    thread_sleep, thread_yield,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -108,24 +108,15 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     let sync = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "cap_create_signal for sync failed")?;
 
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "cap_create_cspace failed")?;
+    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
     // Pass all rights for the queue; SIGNAL right for the sync signal.
-    let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
-    let child_sync = cap_copy(sync, cs, 1 << 7).map_err(|_| "cap_copy sync failed")?;
+    let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
+    let child_sync = cap_copy(sync, child.cs, 1 << 7).map_err(|_| "cap_copy sync failed")?;
     let child_arg = u64::from(child_eq) | (u64::from(child_sync) << 16);
 
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
-    thread_configure(
-        th,
-        recv_and_report_entry as *const () as u64,
-        stack_top,
-        child_arg,
-    )
-    .map_err(|_| "thread_configure failed")?;
-    thread_start(th).map_err(|_| "thread_start failed")?;
+    crate::spawn::configure_and_start(&child, recv_and_report_entry, stack_top, child_arg)
+        .map_err(|_| "configure_and_start failed")?;
 
     // Yield to let the child run and block on event_recv (queue is empty).
     thread_yield().map_err(|_| "thread_yield failed")?;
@@ -140,10 +131,10 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
         return Err("child received wrong event payload (expected 0x42)");
     }
 
-    cap_delete(th).ok();
+    cap_delete(child.th).ok();
     cap_delete(eq).ok();
     cap_delete(sync).ok();
-    cap_delete(cs).ok();
+    cap_delete(child.cs).ok();
     Ok(())
 }
 
@@ -265,23 +256,14 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
 {
     let eq = event_queue_create(ctx.memory_frame_base, 4)
         .map_err(|_| "event_queue_create for zero-payload test failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "cap_create_cspace failed")?;
-    let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
+    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     // Encode the post payload as 0; the child will sleep ~10 ms, then post 0.
     let child_arg = u64::from(child_eq);
 
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_ZERO_PAYLOAD_STACK));
-    thread_configure(
-        th,
-        post_zero_after_sleep_entry as *const () as u64,
-        stack_top,
-        child_arg,
-    )
-    .map_err(|_| "thread_configure failed")?;
-    thread_start(th).map_err(|_| "thread_start failed")?;
+    crate::spawn::configure_and_start(&child, post_zero_after_sleep_entry, stack_top, child_arg)
+        .map_err(|_| "configure_and_start failed")?;
 
     // Wait up to 1 s for the child's post; 0 is the legitimate payload.
     let payload = event_recv_timeout(eq, 1000)
@@ -291,9 +273,9 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
         return Err("event_recv_timeout returned wrong payload (expected legitimate 0)");
     }
 
-    cap_delete(th).ok();
+    cap_delete(child.th).ok();
     cap_delete(eq).ok();
-    cap_delete(cs).ok();
+    cap_delete(child.cs).ok();
     Ok(())
 }
 
@@ -303,22 +285,13 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
 {
     let eq = event_queue_create(ctx.memory_frame_base, 4)
         .map_err(|_| "event_queue_create for nonzero-payload test failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "cap_create_cspace failed")?;
-    let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
+    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_arg = u64::from(child_eq);
 
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_NONZERO_PAYLOAD_STACK));
-    thread_configure(
-        th,
-        post_cafe_after_sleep_entry as *const () as u64,
-        stack_top,
-        child_arg,
-    )
-    .map_err(|_| "thread_configure failed")?;
-    thread_start(th).map_err(|_| "thread_start failed")?;
+    crate::spawn::configure_and_start(&child, post_cafe_after_sleep_entry, stack_top, child_arg)
+        .map_err(|_| "configure_and_start failed")?;
 
     let payload = event_recv_timeout(eq, 1000).map_err(|_| "event_recv_timeout failed")?;
     if payload != 0xCAFE
@@ -326,9 +299,9 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
         return Err("event_recv_timeout returned wrong payload (expected 0xCAFE)");
     }
 
-    cap_delete(th).ok();
+    cap_delete(child.th).ok();
     cap_delete(eq).ok();
-    cap_delete(cs).ok();
+    cap_delete(child.cs).ok();
     Ok(())
 }
 
@@ -338,22 +311,13 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
 {
     let eq = event_queue_create(ctx.memory_frame_base, 4)
         .map_err(|_| "event_queue_create for forever-block test failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "cap_create_cspace failed")?;
-    let child_eq = cap_copy(eq, cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
+    let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
+    let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_arg = u64::from(child_eq);
 
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread failed")?;
     let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_FOREVER_STACK));
-    thread_configure(
-        th,
-        post_beef_after_sleep_entry as *const () as u64,
-        stack_top,
-        child_arg,
-    )
-    .map_err(|_| "thread_configure failed")?;
-    thread_start(th).map_err(|_| "thread_start failed")?;
+    crate::spawn::configure_and_start(&child, post_beef_after_sleep_entry, stack_top, child_arg)
+        .map_err(|_| "configure_and_start failed")?;
 
     let payload = event_recv_timeout(eq, 0)
         .map_err(|_| "event_recv_timeout(eq, 0) returned error (forever-block sentinel broken)")?;
@@ -362,9 +326,9 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
         return Err("event_recv_timeout(eq, 0) returned wrong payload (expected 0xBEEF)");
     }
 
-    cap_delete(th).ok();
+    cap_delete(child.th).ok();
     cap_delete(eq).ok();
-    cap_delete(cs).ok();
+    cap_delete(child.cs).ok();
     Ok(())
 }
 

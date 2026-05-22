@@ -24,8 +24,7 @@
 //! Requires ≥ 2 CPUs. On UP configs, logs "SKIP" and passes trivially.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, system_info, thread_configure, thread_exit, thread_set_affinity, thread_start,
+    cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, system_info, thread_exit,
 };
 use syscall_abi::SystemInfoType;
 
@@ -93,32 +92,26 @@ pub fn run(ctx: &TestContext) -> TestResult
     let c2p = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "stress::idle_wake_race: cap_create_signal (c2p) failed")?;
 
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "stress::idle_wake_race: cap_create_cspace failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "stress::idle_wake_race: spawn::new_child failed")?;
 
-    let child_p2c = cap_copy(p2c, cs, RIGHTS_SIGNAL_WAIT)
+    let child_p2c = cap_copy(p2c, child.cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "stress::idle_wake_race: cap_copy (p2c) failed")?;
-    let child_c2p = cap_copy(c2p, cs, RIGHTS_SIGNAL_WAIT)
+    let child_c2p = cap_copy(c2p, child.cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "stress::idle_wake_race: cap_copy (c2p) failed")?;
 
     // SAFETY: single-threaded at this point; child not yet started.
     unsafe { CHILD_C2P_SLOT = child_c2p };
 
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "stress::idle_wake_race: cap_create_thread failed")?;
-
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    thread_configure(
-        th,
-        worker_entry as *const () as u64,
+    crate::spawn::configure_and_start_pinned(
+        &child,
+        worker_entry,
         stack_top,
         u64::from(child_p2c),
+        1,
     )
-    .map_err(|_| "stress::idle_wake_race: thread_configure failed")?;
-
-    thread_set_affinity(th, 1).map_err(|_| "stress::idle_wake_race: thread_set_affinity failed")?;
-
-    thread_start(th).map_err(|_| "stress::idle_wake_race: thread_start failed")?;
+    .map_err(|_| "stress::idle_wake_race: configure_and_start_pinned failed")?;
 
     // Wait for worker to reach its signal_wait loop.
     let ready =
@@ -198,8 +191,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         signal_wait(c2p).map_err(|_| "stress::idle_wake_race: signal_wait (final ack) failed")?;
 
     // Cleanup.
-    cap_delete(th).map_err(|_| "stress::idle_wake_race: cap_delete (thread) failed")?;
-    cap_delete(cs).map_err(|_| "stress::idle_wake_race: cap_delete (cspace) failed")?;
+    cap_delete(child.th).map_err(|_| "stress::idle_wake_race: cap_delete (thread) failed")?;
+    cap_delete(child.cs).map_err(|_| "stress::idle_wake_race: cap_delete (cspace) failed")?;
     cap_delete(p2c).map_err(|_| "stress::idle_wake_race: cap_delete (p2c) failed")?;
     cap_delete(c2p).map_err(|_| "stress::idle_wake_race: cap_delete (c2p) failed")?;
 

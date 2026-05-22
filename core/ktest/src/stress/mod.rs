@@ -5,6 +5,11 @@
 
 //! Tier S — Stress and torture tests.
 //!
+//! Rule (durable):
+//!
+//! > **One file per race / resource invariant under stress. New race
+//! > class ⇒ new file.**
+//!
 //! These tests exercise race conditions, resource exhaustion, deep capability
 //! trees, and concurrent operations. They are **not** run by default; enable
 //! them with `ktest.filter=stress` in the kernel command line.
@@ -15,10 +20,12 @@
 mod cap_delete_running;
 mod cap_revoke_under_use;
 mod cap_tree_deep;
+mod concurrent_event_producers;
 mod concurrent_ipc;
 mod concurrent_map_unmap;
 mod concurrent_signal;
 mod event_queue_fill_drain;
+mod fpu_migration_churn;
 mod idle_wake_race;
 mod retype_concurrent;
 mod thread_churn;
@@ -26,7 +33,14 @@ mod thread_churn;
 use crate::{ChildStack, TestContext, run_integration_test};
 
 /// Maximum concurrent child threads across all stress tests.
-const MAX_STRESS_THREADS: usize = 16;
+///
+/// 64 matches the width of the `u64` signal bitmask used by tests that
+/// allocate one bit per worker (`concurrent_signal`, `retype_concurrent`,
+/// `cap_revoke_under_use`). Bumping past 64 requires refactoring those
+/// tests to use an atomic-counter ledger instead of one bit per worker.
+/// 64 × 16 KiB `ChildStack` = 1 MiB BSS — fits comfortably in ktest's
+/// segment caps.
+const MAX_STRESS_THREADS: usize = 64;
 
 /// Shared child stacks for stress tests. Tests run sequentially so stacks
 /// are never aliased.
@@ -56,4 +70,9 @@ pub fn run_all(ctx: &TestContext)
         concurrent_map_unmap::run(ctx)
     );
     run_integration_test!("stress::retype_concurrent", retype_concurrent::run(ctx));
+    run_integration_test!("stress::fpu_migration_churn", fpu_migration_churn::run(ctx));
+    run_integration_test!(
+        "stress::concurrent_event_producers",
+        concurrent_event_producers::run(ctx)
+    );
 }

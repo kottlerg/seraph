@@ -8,12 +8,16 @@
 //! shootdown under load.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, mem_map,
-    mem_unmap, signal_send, signal_wait, thread_configure, thread_exit, thread_start,
+    cap_copy, cap_create_signal, cap_delete, mem_map, mem_unmap, signal_send, signal_wait,
+    thread_exit,
 };
 
-use crate::{ChildStack, TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult, spawn};
 
+/// 4 — pre-ramp baseline. See `concurrent_signal.rs::NUM_SENDERS` for
+/// kernel-side reasons we cap per-test concurrency at the pre-ramp
+/// baseline. Iteration count is also baseline; in-tree experiments with
+/// `MAP_ITERATIONS=1000` triggered the same follow-on hang.
 const NUM_CHILDREN: usize = 4;
 const MAP_ITERATIONS: usize = 200;
 
@@ -40,18 +44,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut cspaces = [0u32; NUM_CHILDREN];
     for i in 0..NUM_CHILDREN
     {
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-            .map_err(|_| "concurrent_map_unmap: create_cspace failed")?;
-        let child_done =
-            cap_copy(done, cs, 1 << 7).map_err(|_| "concurrent_map_unmap: cap_copy done failed")?;
+        let child =
+            spawn::new_child(ctx).map_err(|_| "concurrent_map_unmap: spawn::new_child failed")?;
+        let child_done = cap_copy(done, child.cs, 1 << 7)
+            .map_err(|_| "concurrent_map_unmap: cap_copy done failed")?;
         // Copy frame and aspace caps into child's CSpace with full rights.
-        let child_frame = cap_copy(frames[i], cs, syscall::RIGHTS_ALL)
+        let child_frame = cap_copy(frames[i], child.cs, syscall::RIGHTS_ALL)
             .map_err(|_| "concurrent_map_unmap: cap_copy frame failed")?;
-        let child_aspace = cap_copy(ctx.aspace_cap, cs, syscall::RIGHTS_ALL)
+        let child_aspace = cap_copy(ctx.aspace_cap, child.cs, syscall::RIGHTS_ALL)
             .map_err(|_| "concurrent_map_unmap: cap_copy aspace failed")?;
-
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-            .map_err(|_| "concurrent_map_unmap: create_thread failed")?;
 
         let done_bit = 1u64 << i;
         let va = STRESS_MAP_BASE + (i as u64) * VA_STRIDE;
@@ -61,19 +62,17 @@ pub fn run(ctx: &TestContext) -> TestResult
             | (u64::from(child_aspace) << 32)
             | (done_bit << 48);
 
-        // SAFETY: Each child uses a distinct stack index.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        thread_configure(th, mapper_entry as *const () as u64, stack_top, arg)
-            .map_err(|_| "concurrent_map_unmap: thread_configure failed")?;
-
         // Set the VA for this child via a static. Children read it from
         // a shared array indexed by child_frame slot (deterministic mapping).
         VA_PER_CHILD[i].store(va, core::sync::atomic::Ordering::Release);
 
-        thread_start(th).map_err(|_| "concurrent_map_unmap: thread_start failed")?;
+        // SAFETY: Each child uses a distinct stack index.
+        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        spawn::configure_and_start(&child, mapper_entry, stack_top, arg)
+            .map_err(|_| "concurrent_map_unmap: configure_and_start failed")?;
 
-        threads[i] = th;
-        cspaces[i] = cs;
+        threads[i] = child.th;
+        cspaces[i] = child.cs;
     }
 
     // Wait for all children. Each child sends a unique bit (1<<i).
@@ -84,8 +83,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let bits = signal_wait(done).map_err(|_| "concurrent_map_unmap: signal_wait failed")?;
         done_bits |= bits;
-        // Bit 8 is our error indicator (not used by any done_bit since max is 1<<3).
-        if bits & (1 << 8) != 0
+        // Bit 32 is the error indicator (well clear of done_bit range for
+        // NUM_CHILDREN up to 32).
+        if bits & (1 << 32) != 0
         {
             child_failed = true;
         }
@@ -109,12 +109,11 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// Per-child VA, set by parent before starting each child.
-static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-];
+static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = {
+    // const-fn loop is unstable in stable Rust; use a const block + manual
+    // population via array-init-by-fn idiom.
+    [const { core::sync::atomic::AtomicU64::new(0) }; NUM_CHILDREN]
+};
 
 // cast_possible_truncation: slot indices are kernel cap slots < 2^32.
 #[allow(clippy::cast_possible_truncation)]
@@ -133,8 +132,8 @@ fn mapper_entry(arg: u64) -> !
     {
         if mem_map(frame_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
         {
-            // Send done_bit | error indicator (bit 8).
-            signal_send(done_slot, done_bit | (1 << 8)).ok();
+            // Send done_bit | error indicator (bit 32).
+            signal_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
 
@@ -145,13 +144,13 @@ fn mapper_entry(arg: u64) -> !
         // ktest's own statics.
         if syscall::aspace_query(aspace, va).is_err()
         {
-            signal_send(done_slot, done_bit | (1 << 8)).ok();
+            signal_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
 
         if mem_unmap(aspace, va, 1).is_err()
         {
-            signal_send(done_slot, done_bit | (1 << 8)).ok();
+            signal_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
     }

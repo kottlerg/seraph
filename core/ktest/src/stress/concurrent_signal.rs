@@ -3,21 +3,34 @@
 
 //! Stress test: concurrent signal send/wait races.
 //!
-//! 4 child threads simultaneously send distinct bit patterns to the same signal.
-//! The parent waits for all children to finish, then verifies all bit patterns
-//! arrived in the accumulated signal state.
+//! `NUM_SENDERS` child threads simultaneously send distinct bit patterns
+//! to the same signal. The parent waits for all children to finish, then
+//! verifies every bit pattern arrived in the accumulated signal state.
 
-use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, thread_configure, thread_exit, thread_start,
-};
+use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
 
-use crate::{ChildStack, TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult, spawn};
 
+/// 16 — pre-ramp baseline. Two separate kernel-side issues block
+/// ramping this further in-tree:
+///
+/// 1. Bit 63 of `SYS_SIGNAL_WAIT`'s returned bitmask aliases with the
+///    dispatcher's `cast_signed()` Err encoding, so per-bit accounting
+///    tops out at 63 distinct workers.
+/// 2. Above ~16-32 concurrently runnable spinning syscall threads on
+///    4-CPU SMP, follow-on tests (notably `cap_revoke_under_use`)
+///    observe scheduler-fairness starvation. Until the kernel is
+///    fixed, we keep this constant at the pre-ramp baseline so
+///    downstream stress tests aren't compromised.
+///
+/// Iteration count is the pre-ramp baseline; in-tree experiments showed
+/// the ramped 5000-iter variant left follow-on tests in a degraded state
+/// (notably `cap_revoke_under_use` hangs even at its own NUM=16). Filed
+/// separately; revisit once the kernel-side fairness issue is resolved.
 const NUM_SENDERS: usize = 16;
 const SEND_ITERATIONS: u64 = 2000;
 
-/// Each sender ORs its unique bit once per iteration.
+/// Each sender ORs its unique bit (`1 << i`) once per iteration.
 const SENDER_BITS: [u64; NUM_SENDERS] = [
     0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000,
     0x8000,
@@ -37,28 +50,24 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for i in 0..NUM_SENDERS
     {
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-            .map_err(|_| "concurrent_signal: create_cspace failed")?;
+        let child =
+            spawn::new_child(ctx).map_err(|_| "concurrent_signal: spawn::new_child failed")?;
         // Child needs SIGNAL right on target and done.
-        let child_target = cap_copy(target, cs, 1 << 7)
+        let child_target = cap_copy(target, child.cs, 1 << 7)
             .map_err(|_| "concurrent_signal: cap_copy target failed")?;
-        let child_done =
-            cap_copy(done, cs, 1 << 7).map_err(|_| "concurrent_signal: cap_copy done failed")?;
-
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-            .map_err(|_| "concurrent_signal: create_thread failed")?;
+        let child_done = cap_copy(done, child.cs, 1 << 7)
+            .map_err(|_| "concurrent_signal: cap_copy done failed")?;
 
         // Pack: bits[15:0]=target_slot, bits[31:16]=done_slot, bits[47:32]=bit_index
         let arg = u64::from(child_target) | (u64::from(child_done) << 16) | ((i as u64) << 32);
 
         // SAFETY: Sequential setup; each child gets a unique stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        thread_configure(th, sender_entry as *const () as u64, stack_top, arg)
-            .map_err(|_| "concurrent_signal: thread_configure failed")?;
-        thread_start(th).map_err(|_| "concurrent_signal: thread_start failed")?;
+        spawn::configure_and_start(&child, sender_entry, stack_top, arg)
+            .map_err(|_| "concurrent_signal: configure_and_start failed")?;
 
-        threads[i] = th;
-        cspaces[i] = cs;
+        threads[i] = child.th;
+        cspaces[i] = child.cs;
     }
 
     // Wait for all senders to report done. Each child ORs a unique bit into

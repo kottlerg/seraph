@@ -20,8 +20,8 @@
 //! confirming the protocol operates correctly under concurrent access.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, mem_map,
-    mem_unmap, signal_send, signal_wait, system_info, thread_configure, thread_exit, thread_start,
+    cap_copy, cap_create_signal, cap_delete, mem_map, mem_unmap, signal_send, signal_wait,
+    system_info, thread_exit,
 };
 use syscall_abi::SystemInfoType;
 
@@ -60,37 +60,29 @@ pub fn run(ctx: &TestContext) -> TestResult
     let c2p = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "integration::tlb_coherency: cap_create_signal (c2p) failed")?;
 
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "integration::tlb_coherency: cap_create_cspace failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "integration::tlb_coherency: spawn::new_child failed")?;
 
     // Copy both signals into child's cspace.
-    let child_p2c = cap_copy(p2c, cs, RIGHTS_SIGNAL_WAIT)
+    let child_p2c = cap_copy(p2c, child.cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "integration::tlb_coherency: cap_copy (p2c) failed")?;
-    let child_c2p = cap_copy(c2p, cs, RIGHTS_SIGNAL_WAIT)
+    let child_c2p = cap_copy(c2p, child.cs, RIGHTS_SIGNAL_WAIT)
         .map_err(|_| "integration::tlb_coherency: cap_copy (c2p) failed")?;
 
     // Pass child's c2p slot via static (thread_configure only has one arg).
     // SAFETY: single-threaded at this point; child not started yet.
     unsafe { CHILD_C2P_SLOT = child_c2p };
 
-    // ── 3. Create a child thread pinned to CPU 1. ────────────────────────────
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "integration::tlb_coherency: cap_create_thread failed")?;
-
+    // ── 3. Configure + pin child to CPU 1, then start. ──────────────────────
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    thread_configure(
-        th,
-        tlb_worker_thread as *const () as u64,
+    crate::spawn::configure_and_start_pinned(
+        &child,
+        tlb_worker_thread,
         stack_top,
         u64::from(child_p2c), // arg = p2c slot; c2p slot read from static
+        1,
     )
-    .map_err(|_| "integration::tlb_coherency: thread_configure failed")?;
-
-    // Pin child to CPU 1 (parent runs on CPU 0 by default).
-    syscall::thread_set_affinity(th, 1)
-        .map_err(|_| "integration::tlb_coherency: thread_set_affinity failed")?;
-
-    thread_start(th).map_err(|_| "integration::tlb_coherency: thread_start failed")?;
+    .map_err(|_| "integration::tlb_coherency: configure_and_start_pinned failed")?;
 
     // Wait for child to signal readiness on c2p.
     let ready = signal_wait(c2p)
@@ -150,8 +142,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     signal_send(p2c, 0x80).map_err(|_| "integration::tlb_coherency: signal_send (exit) failed")?;
 
     // ── 6. Clean up. ─────────────────────────────────────────────────────────
-    cap_delete(th).map_err(|_| "integration::tlb_coherency: cap_delete (th) failed")?;
-    cap_delete(cs).map_err(|_| "integration::tlb_coherency: cap_delete (cs) failed")?;
+    cap_delete(child.th).map_err(|_| "integration::tlb_coherency: cap_delete (th) failed")?;
+    cap_delete(child.cs).map_err(|_| "integration::tlb_coherency: cap_delete (cs) failed")?;
     cap_delete(p2c).map_err(|_| "integration::tlb_coherency: cap_delete (p2c) failed")?;
     cap_delete(c2p).map_err(|_| "integration::tlb_coherency: cap_delete (c2p) failed")?;
 

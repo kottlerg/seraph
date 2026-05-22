@@ -38,6 +38,7 @@ mod mm;
 mod null;
 mod signal;
 mod thread;
+mod tlb;
 mod wait_set;
 
 // ── Cycle counter ─────────────────────────────────────────────────────────────
@@ -150,7 +151,10 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     signal::bench_signal_roundtrip(ctx, iters);
     cap::bench_cap_create_delete(ctx, iters);
     mm::bench_mem_map_unmap(ctx, iters);
+    mm::bench_mem_protect(ctx, iters);
     thread::bench_thread_lifecycle(ctx, iters);
+    thread::bench_context_switch(ctx, iters);
     event::bench_event_post_recv(ctx, iters);
     wait_set::bench_wait_set(ctx, iters);
+    tlb::bench_tlb_shootdown(ctx, iters);
 }

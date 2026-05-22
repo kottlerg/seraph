@@ -7,12 +7,9 @@
 //! The parent waits for all children to finish, then verifies all bit patterns
 //! arrived in the accumulated signal state.
 
-use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, thread_configure, thread_exit, thread_start,
-};
+use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
 
-use crate::{ChildStack, TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_SENDERS: usize = 16;
 const SEND_ITERATIONS: u64 = 2000;
@@ -37,28 +34,24 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for i in 0..NUM_SENDERS
     {
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-            .map_err(|_| "concurrent_signal: create_cspace failed")?;
+        let child =
+            spawn::new_child(ctx).map_err(|_| "concurrent_signal: spawn::new_child failed")?;
         // Child needs SIGNAL right on target and done.
-        let child_target = cap_copy(target, cs, 1 << 7)
+        let child_target = cap_copy(target, child.cs, 1 << 7)
             .map_err(|_| "concurrent_signal: cap_copy target failed")?;
-        let child_done =
-            cap_copy(done, cs, 1 << 7).map_err(|_| "concurrent_signal: cap_copy done failed")?;
-
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-            .map_err(|_| "concurrent_signal: create_thread failed")?;
+        let child_done = cap_copy(done, child.cs, 1 << 7)
+            .map_err(|_| "concurrent_signal: cap_copy done failed")?;
 
         // Pack: bits[15:0]=target_slot, bits[31:16]=done_slot, bits[47:32]=bit_index
         let arg = u64::from(child_target) | (u64::from(child_done) << 16) | ((i as u64) << 32);
 
         // SAFETY: Sequential setup; each child gets a unique stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        thread_configure(th, sender_entry as *const () as u64, stack_top, arg)
-            .map_err(|_| "concurrent_signal: thread_configure failed")?;
-        thread_start(th).map_err(|_| "concurrent_signal: thread_start failed")?;
+        spawn::configure_and_start(&child, sender_entry, stack_top, arg)
+            .map_err(|_| "concurrent_signal: configure_and_start failed")?;
 
-        threads[i] = th;
-        cspaces[i] = cs;
+        threads[i] = child.th;
+        cspaces[i] = child.cs;
     }
 
     // Wait for all senders to report done. Each child ORs a unique bit into

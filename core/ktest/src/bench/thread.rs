@@ -3,13 +3,10 @@
 
 //! Thread lifecycle benchmark: create → start → exit → cleanup.
 
-use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, thread_configure, thread_exit, thread_start,
-};
+use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
 
 use super::{cycles_now, log_bench_header};
-use crate::ChildStack;
+use crate::{ChildStack, spawn};
 
 static mut BENCH_LIFECYCLE_STACK: ChildStack = ChildStack::ZERO;
 
@@ -42,35 +39,24 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     {
         let t0 = cycles_now();
 
-        let Ok(cs) = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        let Ok(child) = spawn::new_child(ctx)
         else
         {
             break;
         };
-        let Ok(child_done) = cap_copy(done, cs, 1 << 7)
+        let Ok(child_done) = cap_copy(done, child.cs, 1 << 7)
         else
         {
             break;
         };
-        let Ok(th) = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        else
-        {
-            break;
-        };
-        if thread_configure(
-            th,
-            lifecycle_entry as *const () as u64,
-            stack_top,
-            u64::from(child_done),
-        )
-        .is_err()
-            || thread_start(th).is_err()
+        if spawn::configure_and_start(&child, lifecycle_entry, stack_top, u64::from(child_done))
+            .is_err()
         {
             break;
         }
         signal_wait(done).ok();
-        cap_delete(th).ok();
-        cap_delete(cs).ok();
+        cap_delete(child.th).ok();
+        cap_delete(child.cs).ok();
 
         let t1 = cycles_now();
         let delta = t1.saturating_sub(t0);

@@ -9,12 +9,12 @@
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, signal_send, signal_wait, thread_configure, thread_exit, thread_start,
+    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, signal_send, signal_wait,
+    thread_exit,
 };
 
 use super::{cycles_now, log_bench_header};
-use crate::ChildStack;
+use crate::{ChildStack, spawn};
 
 static mut BENCH_IPC_STACK: ChildStack = ChildStack::ZERO;
 
@@ -62,32 +62,26 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    let Ok(cs) = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let Ok(child) = spawn::new_child(ctx)
     else
     {
         return;
     };
-    let Ok(child_ep) = cap_copy(ep, cs, RIGHTS_SEND_GRANT)
+    let Ok(child_ep) = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
     else
     {
         return;
     };
-    let Ok(child_done) = cap_copy(done, cs, 1 << 7)
+    let Ok(child_done) = cap_copy(done, child.cs, 1 << 7)
     else
     {
         return;
     };
 
     let arg = u64::from(child_ep) | (u64::from(child_done) << 16) | (n << 32);
-    let Ok(th) = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-    else
-    {
-        return;
-    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_IPC_STACK));
 
-    if thread_configure(th, ipc_caller_entry as *const () as u64, stack_top, arg).is_err()
-        || thread_start(th).is_err()
+    if spawn::configure_and_start(&child, ipc_caller_entry, stack_top, arg).is_err()
     {
         return;
     }
@@ -134,8 +128,8 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         crate::log_u64("ktest: bench  cycles_max=", max);
     }
 
-    cap_delete(th).ok();
+    cap_delete(child.th).ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
-    cap_delete(cs).ok();
+    cap_delete(child.cs).ok();
 }

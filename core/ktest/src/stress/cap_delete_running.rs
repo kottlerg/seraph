@@ -17,11 +17,9 @@
 //! Without that handling the TCB would be freed while a CPU still held it
 //! in `sched.current`, causing a use-after-free on the next context switch.
 
-use syscall::{
-    cap_create_cspace, cap_create_thread, cap_delete, thread_configure, thread_start, thread_yield,
-};
+use syscall::{cap_delete, thread_yield};
 
-use crate::{ChildStack, TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 4;
 
@@ -32,20 +30,16 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for i in 0..NUM_CHILDREN
     {
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
-            .map_err(|_| "cap_delete_running: create_cspace failed")?;
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-            .map_err(|_| "cap_delete_running: create_thread failed")?;
-
+        let child =
+            spawn::new_child(ctx).map_err(|_| "cap_delete_running: spawn::new_child failed")?;
         // SAFETY: stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        thread_configure(th, spinner_entry as *const () as u64, stack_top, 0)
-            .map_err(|_| "cap_delete_running: thread_configure failed")?;
-        thread_start(th).map_err(|_| "cap_delete_running: thread_start failed")?;
+        spawn::configure_and_start(&child, spinner_entry, stack_top, 0)
+            .map_err(|_| "cap_delete_running: configure_and_start failed")?;
 
-        threads[i] = th;
-        cspaces[i] = cs;
+        threads[i] = child.th;
+        cspaces[i] = child.cs;
     }
 
     // Yield a few times so the children actually get on a CPU before we

@@ -8,11 +8,11 @@
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, signal_send, signal_wait, thread_configure, thread_exit, thread_start,
+    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, signal_send, signal_wait,
+    thread_exit,
 };
 
-use crate::{ChildStack, TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CALLERS: usize = 16;
 const CYCLES: usize = 50;
@@ -35,15 +35,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         // Start all callers simultaneously (no yields between starts).
         for i in 0..NUM_CALLERS
         {
-            let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-                .map_err(|_| "concurrent_ipc: create_cspace failed")?;
-            let child_ep = cap_copy(ep, cs, RIGHTS_SEND_GRANT)
+            let child =
+                spawn::new_child(ctx).map_err(|_| "concurrent_ipc: spawn::new_child failed")?;
+            let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
                 .map_err(|_| "concurrent_ipc: cap_copy ep failed")?;
-            let child_done =
-                cap_copy(done, cs, 1 << 7).map_err(|_| "concurrent_ipc: cap_copy done failed")?;
-
-            let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-                .map_err(|_| "concurrent_ipc: create_thread failed")?;
+            let child_done = cap_copy(done, child.cs, 1 << 7)
+                .map_err(|_| "concurrent_ipc: cap_copy done failed")?;
 
             // Pack: label = i+1 (1-based), done_bit = 1<<i (unique per child).
             let arg = u64::from(child_ep)
@@ -54,12 +51,11 @@ pub fn run(ctx: &TestContext) -> TestResult
             // SAFETY: Each caller uses a distinct stack index.
             let stack_top =
                 ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-            thread_configure(th, caller_entry as *const () as u64, stack_top, arg)
-                .map_err(|_| "concurrent_ipc: thread_configure failed")?;
-            thread_start(th).map_err(|_| "concurrent_ipc: thread_start failed")?;
+            spawn::configure_and_start(&child, caller_entry, stack_top, arg)
+                .map_err(|_| "concurrent_ipc: configure_and_start failed")?;
 
-            threads[i] = th;
-            cspaces[i] = cs;
+            threads[i] = child.th;
+            cspaces[i] = child.cs;
         }
 
         // Server: receive and reply to all callers.

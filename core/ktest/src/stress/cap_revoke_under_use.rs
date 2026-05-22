@@ -8,12 +8,11 @@
 //! kernel panic or use-after-free occurs.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, cap_derive,
-    cap_revoke, signal_send, signal_wait, thread_configure, thread_exit, thread_start,
-    thread_yield,
+    cap_copy, cap_create_signal, cap_delete, cap_derive, cap_revoke, signal_send, signal_wait,
+    thread_exit, thread_yield,
 };
 
-use crate::{ChildStack, TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 16;
 const RIGHTS_SIGNAL: u64 = 1 << 7;
@@ -38,26 +37,22 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut cspaces = [0u32; NUM_CHILDREN];
     for i in 0..NUM_CHILDREN
     {
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-            .map_err(|_| "cap_revoke_under_use: create_cspace failed")?;
-        let child_sig = cap_copy(derived[i], cs, RIGHTS_SIGNAL)
+        let child =
+            spawn::new_child(ctx).map_err(|_| "cap_revoke_under_use: spawn::new_child failed")?;
+        let child_sig = cap_copy(derived[i], child.cs, RIGHTS_SIGNAL)
             .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
-        let child_done =
-            cap_copy(done, cs, 1 << 7).map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
-
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-            .map_err(|_| "cap_revoke_under_use: create_thread failed")?;
+        let child_done = cap_copy(done, child.cs, 1 << 7)
+            .map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
 
         let done_bit = 1u64 << i;
         let arg = u64::from(child_sig) | (u64::from(child_done) << 16) | (done_bit << 32);
         // SAFETY: Each child uses a distinct stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
-        thread_configure(th, sender_loop_entry as *const () as u64, stack_top, arg)
-            .map_err(|_| "cap_revoke_under_use: thread_configure failed")?;
-        thread_start(th).map_err(|_| "cap_revoke_under_use: thread_start failed")?;
+        spawn::configure_and_start(&child, sender_loop_entry, stack_top, arg)
+            .map_err(|_| "cap_revoke_under_use: configure_and_start failed")?;
 
-        threads[i] = th;
-        cspaces[i] = cs;
+        threads[i] = child.th;
+        cspaces[i] = child.cs;
     }
 
     // Let children run for a while before revoking.

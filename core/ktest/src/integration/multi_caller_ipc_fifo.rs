@@ -20,12 +20,11 @@
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, signal_send, signal_wait, thread_configure, thread_exit, thread_set_affinity,
-    thread_start, thread_yield,
+    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, signal_send, signal_wait,
+    thread_exit, thread_yield,
 };
 
-use crate::{ChildStack, TestContext, TestResult};
+use crate::{ChildStack, TestContext, TestResult, spawn};
 
 // SEND | GRANT rights (bits 4 and 6).
 const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
@@ -45,59 +44,42 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "multi_caller_ipc_fifo: cap_create_signal failed")?;
 
     // ── Build and start caller A ──────────────────────────────────────────────
-    let cs_a = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "multi_caller_ipc_fifo: cs_a failed")?;
-    let ep_a =
-        cap_copy(ep, cs_a, RIGHTS_SEND_GRANT).map_err(|_| "multi_caller_ipc_fifo: ep_a failed")?;
+    let child_a = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child A failed")?;
+    let ep_a = cap_copy(ep, child_a.cs, RIGHTS_SEND_GRANT)
+        .map_err(|_| "multi_caller_ipc_fifo: ep_a failed")?;
     let done_a =
-        cap_copy(done, cs_a, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_a failed")?;
+        cap_copy(done, child_a.cs, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_a failed")?;
     // arg: ep_slot | (done_slot << 16) | (label << 32)
     let arg_a = u64::from(ep_a) | (u64::from(done_a) << 16) | (1u64 << 32);
-    let th_a = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_a)
-        .map_err(|_| "multi_caller_ipc_fifo: th_a failed")?;
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
-    thread_configure(th_a, caller_entry as *const () as u64, stack_a, arg_a)
-        .map_err(|_| "multi_caller_ipc_fifo: configure th_a failed")?;
     // Pin to CPU 0 so yield-based FIFO ordering is reliable under SMP.
-    thread_set_affinity(th_a, 0).map_err(|_| "multi_caller_ipc_fifo: set_affinity th_a failed")?;
-    thread_start(th_a).map_err(|_| "multi_caller_ipc_fifo: start th_a failed")?;
+    spawn::configure_and_start_pinned(&child_a, caller_entry, stack_a, arg_a, 0)
+        .map_err(|_| "multi_caller_ipc_fifo: start A failed")?;
     // Yield so A runs and blocks on ipc_call before B is started.
     thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after A failed")?;
 
     // ── Build and start caller B ──────────────────────────────────────────────
-    let cs_b = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "multi_caller_ipc_fifo: cs_b failed")?;
-    let ep_b =
-        cap_copy(ep, cs_b, RIGHTS_SEND_GRANT).map_err(|_| "multi_caller_ipc_fifo: ep_b failed")?;
+    let child_b = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child B failed")?;
+    let ep_b = cap_copy(ep, child_b.cs, RIGHTS_SEND_GRANT)
+        .map_err(|_| "multi_caller_ipc_fifo: ep_b failed")?;
     let done_b =
-        cap_copy(done, cs_b, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_b failed")?;
+        cap_copy(done, child_b.cs, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_b failed")?;
     let arg_b = u64::from(ep_b) | (u64::from(done_b) << 16) | (2u64 << 32);
-    let th_b = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_b)
-        .map_err(|_| "multi_caller_ipc_fifo: th_b failed")?;
     let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
-    thread_configure(th_b, caller_entry as *const () as u64, stack_b, arg_b)
-        .map_err(|_| "multi_caller_ipc_fifo: configure th_b failed")?;
-    // Pin to CPU 0 so yield-based FIFO ordering is reliable under SMP.
-    thread_set_affinity(th_b, 0).map_err(|_| "multi_caller_ipc_fifo: set_affinity th_b failed")?;
-    thread_start(th_b).map_err(|_| "multi_caller_ipc_fifo: start th_b failed")?;
+    spawn::configure_and_start_pinned(&child_b, caller_entry, stack_b, arg_b, 0)
+        .map_err(|_| "multi_caller_ipc_fifo: start B failed")?;
     thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after B failed")?;
 
     // ── Build and start caller C ──────────────────────────────────────────────
-    let cs_c = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "multi_caller_ipc_fifo: cs_c failed")?;
-    let ep_c =
-        cap_copy(ep, cs_c, RIGHTS_SEND_GRANT).map_err(|_| "multi_caller_ipc_fifo: ep_c failed")?;
+    let child_c = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child C failed")?;
+    let ep_c = cap_copy(ep, child_c.cs, RIGHTS_SEND_GRANT)
+        .map_err(|_| "multi_caller_ipc_fifo: ep_c failed")?;
     let done_c =
-        cap_copy(done, cs_c, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_c failed")?;
+        cap_copy(done, child_c.cs, 1 << 7).map_err(|_| "multi_caller_ipc_fifo: done_c failed")?;
     let arg_c = u64::from(ep_c) | (u64::from(done_c) << 16) | (3u64 << 32);
-    let th_c = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_c)
-        .map_err(|_| "multi_caller_ipc_fifo: th_c failed")?;
     let stack_c = ChildStack::top(core::ptr::addr_of!(STACK_C));
-    thread_configure(th_c, caller_entry as *const () as u64, stack_c, arg_c)
-        .map_err(|_| "multi_caller_ipc_fifo: configure th_c failed")?;
-    // Pin to CPU 0 so yield-based FIFO ordering is reliable under SMP.
-    thread_set_affinity(th_c, 0).map_err(|_| "multi_caller_ipc_fifo: set_affinity th_c failed")?;
-    thread_start(th_c).map_err(|_| "multi_caller_ipc_fifo: start th_c failed")?;
+    spawn::configure_and_start_pinned(&child_c, caller_entry, stack_c, arg_c, 0)
+        .map_err(|_| "multi_caller_ipc_fifo: start C failed")?;
     thread_yield().map_err(|_| "multi_caller_ipc_fifo: yield after C failed")?;
 
     // ── Drain send queue in FIFO order ────────────────────────────────────────
@@ -150,12 +132,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         all_done |= bits;
     }
 
-    cap_delete(th_a).ok();
-    cap_delete(cs_a).ok();
-    cap_delete(th_b).ok();
-    cap_delete(cs_b).ok();
-    cap_delete(th_c).ok();
-    cap_delete(cs_c).ok();
+    cap_delete(child_a.th).ok();
+    cap_delete(child_a.cs).ok();
+    cap_delete(child_b.th).ok();
+    cap_delete(child_b.cs).ok();
+    cap_delete(child_c.th).ok();
+    cap_delete(child_c.cs).ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
 

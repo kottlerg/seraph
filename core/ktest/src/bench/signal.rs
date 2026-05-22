@@ -6,13 +6,10 @@
 //! Parent and child ping-pong via two signals. Per-iteration bracketing
 //! on the parent side.
 
-use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, thread_configure, thread_exit, thread_start,
-};
+use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
 
 use super::{cycles_now, log_bench_header};
-use crate::ChildStack;
+use crate::{ChildStack, spawn};
 
 static mut BENCH_SIGNAL_STACK: ChildStack = ChildStack::ZERO;
 
@@ -62,22 +59,22 @@ pub(super) fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
         return;
     };
 
-    let Ok(cs) = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let Ok(child) = spawn::new_child(ctx)
     else
     {
         return;
     };
-    let Ok(child_ping) = cap_copy(ping, cs, RIGHTS_WAIT)
+    let Ok(child_ping) = cap_copy(ping, child.cs, RIGHTS_WAIT)
     else
     {
         return;
     };
-    let Ok(child_pong) = cap_copy(pong, cs, RIGHTS_SIGNAL)
+    let Ok(child_pong) = cap_copy(pong, child.cs, RIGHTS_SIGNAL)
     else
     {
         return;
     };
-    let Ok(child_done) = cap_copy(done, cs, RIGHTS_SIGNAL)
+    let Ok(child_done) = cap_copy(done, child.cs, RIGHTS_SIGNAL)
     else
     {
         return;
@@ -87,15 +84,9 @@ pub(super) fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
         | (u64::from(child_pong) << 16)
         | (u64::from(child_done) << 32)
         | (n << 48);
-    let Ok(th) = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-    else
-    {
-        return;
-    };
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_SIGNAL_STACK));
 
-    if thread_configure(th, signal_pong_entry as *const () as u64, stack_top, arg).is_err()
-        || thread_start(th).is_err()
+    if spawn::configure_and_start(&child, signal_pong_entry, stack_top, arg).is_err()
     {
         return;
     }
@@ -138,9 +129,9 @@ pub(super) fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
         crate::log_u64("ktest: bench  cycles_max=", max);
     }
 
-    cap_delete(th).ok();
+    cap_delete(child.th).ok();
     cap_delete(ping).ok();
     cap_delete(pong).ok();
     cap_delete(done).ok();
-    cap_delete(cs).ok();
+    cap_delete(child.cs).ok();
 }

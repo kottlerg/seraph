@@ -29,6 +29,7 @@ mod frame_pool;
 mod framebuffer;
 mod integration;
 mod serial;
+mod spawn;
 mod stress;
 mod unit;
 

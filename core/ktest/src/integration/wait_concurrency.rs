@@ -19,9 +19,9 @@
 //!   - `wait_set_remove` prevents the removed source from waking the set.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, event_post,
-    event_queue_create, event_recv, signal_send, signal_wait, thread_configure, thread_exit,
-    thread_start, wait_set_add, wait_set_create, wait_set_remove, wait_set_wait,
+    cap_copy, cap_create_signal, cap_delete, event_post, event_queue_create, event_recv,
+    signal_send, signal_wait, thread_exit, wait_set_add, wait_set_create, wait_set_remove,
+    wait_set_wait,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -60,22 +60,14 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::wait_concurrency: event_recv (drain part A) failed")?;
 
     // ── Part B: Child fires signal — blocking wake. ───────────────────────────
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "integration::wait_concurrency: cap_create_cspace failed")?;
-    let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL)
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "integration::wait_concurrency: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "integration::wait_concurrency: cap_copy sig failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "integration::wait_concurrency: cap_create_thread failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    thread_configure(
-        th,
-        sender_entry as *const () as u64,
-        stack_top,
-        u64::from(child_sig),
-    )
-    .map_err(|_| "integration::wait_concurrency: thread_configure failed")?;
-    thread_start(th).map_err(|_| "integration::wait_concurrency: thread_start failed")?;
+    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+        .map_err(|_| "integration::wait_concurrency: configure_and_start failed")?;
 
     // Block until the child fires the signal.
     let tok_b = wait_set_wait(ws)
@@ -116,7 +108,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(eq).ok();
     cap_delete(sig).ok();
     cap_delete(ws).ok();
-    cap_delete(cs).ok();
+    cap_delete(child.th).ok();
+    cap_delete(child.cs).ok();
     Ok(())
 }
 

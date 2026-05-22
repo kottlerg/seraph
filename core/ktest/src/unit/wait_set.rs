@@ -13,10 +13,9 @@
 //! only the remaining member can wake the wait set after removal.
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_signal, cap_create_thread,
-    cap_delete, event_post, event_queue_create, event_recv, signal_send, signal_wait,
-    thread_configure, thread_exit, thread_start, wait_set_add, wait_set_create, wait_set_remove,
-    wait_set_wait,
+    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, event_post, event_queue_create,
+    event_recv, signal_send, signal_wait, thread_exit, wait_set_add, wait_set_create,
+    wait_set_remove, wait_set_wait,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
@@ -103,22 +102,14 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
     wait_set_add(ws, sig, 7).map_err(|_| "wait_set_add for blocking test failed")?;
 
     // Set up a child thread that sends on the signal.
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "cap_create_cspace for blocking test failed")?;
+    let child =
+        crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for blocking test failed")?;
     let child_sig =
-        cap_copy(sig, cs, RIGHTS_SIGNAL).map_err(|_| "cap_copy for blocking test failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for blocking test failed")?;
+        cap_copy(sig, child.cs, RIGHTS_SIGNAL).map_err(|_| "cap_copy for blocking test failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    thread_configure(
-        th,
-        sender_entry as *const () as u64,
-        stack_top,
-        u64::from(child_sig),
-    )
-    .map_err(|_| "thread_configure for blocking test failed")?;
-    thread_start(th).map_err(|_| "thread_start for blocking test failed")?;
+    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+        .map_err(|_| "configure_and_start for blocking test failed")?;
 
     // Block until the child fires the signal.
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait (blocking) failed")?;
@@ -134,9 +125,9 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
         return Err("signal bits after blocking wait_set_wait are wrong (expected 0xBEEF)");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after blocking test failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after blocking test failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after blocking test failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after blocking test failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after blocking test failed")?;
     cap_delete(ws).map_err(|_| "cap_delete ws after blocking test failed")?;
     Ok(())
 }

@@ -23,8 +23,10 @@ Then rebuild (`cargo xtask build`) and run (`cargo xtask run`). Restore
 
 ## Test structure
 
-Tests are organised across three tiers. Each tier lives in its own source
-directory.
+Tests are organised across four tiers (three plus the opt-in stress
+tier). Each tier lives in its own source directory; each directory
+codifies a "one file per surface/scenario/race" rule at the top of its
+`mod.rs`.
 
 ### Tier 1 — `src/unit/`
 
@@ -43,7 +45,7 @@ kernel's own source layout.
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
 | `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT` |
 | `ipc.rs` | `SYS_IPC_CALL`, `SYS_IPC_REPLY`, `SYS_IPC_RECV`, `SYS_IPC_BUFFER_SET` |
-| `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS` |
+| `thread.rs` | `SYS_THREAD_START/STOP/YIELD/EXIT/CONFIGURE/SET_PRIORITY/SET_AFFINITY/READ_REGS/WRITE_REGS/SLEEP/BIND_NOTIFICATION` |
 | `fpu.rs` | FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration |
 | `hw.rs` | `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER/ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`, `SYS_SBI_CALL` |
 | `sysinfo.rs` | `SYS_SYSTEM_INFO` |
@@ -67,6 +69,9 @@ concurrent signal and queue events.
 | `cap_delegation_chain.rs` | Multi-level rights attenuation and cascaded revocation |
 | `tlb_coherency.rs` | Map/unmap cycles across CPUs to exercise TLB shootdown |
 | `retype_reclaim.rs` | Auto-reclaim invariant for every retypable kernel object |
+| `priority_preemption.rs` | Higher-priority runnable thread preempts a CPU-bound lower-priority spinner within a wall-clock budget |
+| `shared_frame_two_aspaces.rs` | One frame mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
+| `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
 
 ### Tier S — `src/stress/`
 
@@ -76,34 +81,47 @@ capability trees, and concurrent operations. **Not run by default**; enable with
 
 Order matches `stress/mod.rs` dispatch order.
 
+Concurrency knobs default to high values that exercise contention reliably on
+each boot (`MAX_STRESS_THREADS = 64`; tests with one bit per worker
+saturate the `u64` signal bitmask). See each test for its
+`NUM_*`/`CYCLES`/`ITERATIONS` constants.
+
 | File | Scenario |
 |---|---|
-| `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation |
-| `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around) |
-| `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration |
-| `thread_churn.rs` | 20 rapid thread create/destroy cycles (TCB and CSpace cleanup) |
-| `cap_delete_running.rs` | Delete capabilities while child threads actively use them |
-| `concurrent_signal.rs` | 4 threads sending distinct bits to one signal simultaneously |
-| `concurrent_ipc.rs` | 4 callers racing on one endpoint, 10 cycles (send-queue safety) |
-| `cap_revoke_under_use.rs` | Revoke root while 4 threads actively send on derived caps |
-| `concurrent_map_unmap.rs` | 4 threads mapping/unmapping distinct VAs in the same address space |
-| `retype_concurrent.rs` | Concurrent retype operations sharing one Frame-backed allocator |
+| `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation, 500 passes |
+| `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around), 2000 cycles |
+| `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration, 50000 iterations |
+| `thread_churn.rs` | 1000 rapid thread create/destroy cycles (TCB and CSpace cleanup) |
+| `cap_delete_running.rs` | Delete capabilities while child threads actively spin (`NUM_CHILDREN`) |
+| `concurrent_signal.rs` | 64 threads sending distinct bits to one signal simultaneously |
+| `concurrent_ipc.rs` | 64 callers racing on one endpoint, 200 cycles (send-queue safety) |
+| `cap_revoke_under_use.rs` | Revoke root while 64 threads actively send on derived caps |
+| `concurrent_map_unmap.rs` | 16 threads mapping/unmapping distinct VAs in the same address space, 1000 iters each |
+| `retype_concurrent.rs` | 64 workers retyping concurrently against one Frame-backed allocator, 1000 iters each |
+| `fpu_migration_churn.rs` | 100 cycles of FPU-owner thread migration across CPUs; validates eager save / lazy restore under churn |
+| `concurrent_event_producers.rs` | Multiple producers post concurrently to one event queue; consumer verifies every producer's full sequence |
 
 ### Tier 3 — `src/bench/`
 
 Cycle-accurate benchmarks using `rdtsc` (x86-64) or `csrr cycle` (RISC-V).
-Each benchmark logs min/mean/max cycle counts; no PASS/FAIL verdict.
+Each benchmark lives in its own file under `bench/`, mirroring
+`unit/`'s one-file-per-surface rule (`bench/{null,ipc,signal,cap,mm,
+thread,event,wait_set,tlb}.rs`). Each benchmark logs min/mean/max
+cycle counts; no PASS/FAIL verdict.
 
 | Benchmark | What it measures |
 |---|---|
 | `null_syscall_roundtrip` | Kernel entry/exit baseline (`SYS_SYSTEM_INFO`) |
-| `ipc_round_trip` | Synchronous IPC call + reply |
-| `signal_roundtrip` | Signal ping-pong between two threads |
+| `ipc_round_trip` | Synchronous IPC call + reply, per-iteration |
+| `signal_roundtrip` | Signal ping-pong between two threads, per-iteration |
 | `cap_create_delete` | `cap_create_signal` + `cap_delete` cycle |
 | `mem_map_unmap` | `mem_map` + `mem_unmap` cycle |
+| `mem_protect_pair` | `mem_protect(READONLY)` + `mem_protect(WRITABLE)` round trip |
 | `thread_lifecycle` | Full thread create → start → exit → cleanup |
+| `context_switch` | Parent/child `thread_yield` ping-pong on one CPU; reports cycles per switch |
 | `event_post_recv` | `event_post` + `event_recv` on a pre-created queue |
 | `wait_set_cycle` | Wait set create → add → wait → remove → delete |
+| `tlb_shootdown_unmap` | `mem_unmap` cost when ktest's aspace is `current` on every CPU (spinners pinned per CPU); logs `cpus=N` |
 
 ## Test infrastructure
 
@@ -112,13 +130,19 @@ Defined in `src/main.rs`:
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,
   records PASS or FAIL (with reason), and never panics.
-- `TestContext` — thin struct carrying `aspace_cap`, `cspace_cap`, and the
-  IPC buffer pointer, passed by reference to every test function. `cspace_cap`
-  is queried via `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` by hardware tests
-  whose scans must cover slots populated after `aspace_cap` (e.g. narrow
+- `TestContext` — thin struct carrying `aspace_cap`, `cspace_cap`, the
+  IPC buffer pointer, `memory_frame_base` (first RAM Frame cap), and
+  `sbi_control_cap` (zero on x86-64). Passed by reference to every
+  test function. `cspace_cap` is queried via
+  `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` by hardware tests whose
+  scans must cover slots populated after `aspace_cap` (e.g. narrow
   `IoPortRange` caps carved by `ioport::bind_port_range` on `x86_64`).
 - `PASS_COUNT` / `FAIL_COUNT` — atomic counters updated by `run_test!`.
 - `log(msg)` / `log_u64(prefix, value)` — heap-free logging utilities.
+- `spawn::new_child(ctx)` / `configure_and_start(child, …)` /
+  `configure_and_start_pinned(child, …)` — child-thread spawn helper
+  wrapping the cspace + thread + configure + start sequence that ~30
+  sites duplicated.
 
 ## Command line options
 

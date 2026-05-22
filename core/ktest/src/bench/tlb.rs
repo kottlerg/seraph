@@ -11,7 +11,7 @@
 //!
 //! Logs `cpus=N` alongside the result so SMP and UP runs aren't conflated.
 
-use syscall::{cap_create_signal, cap_delete, signal_send, signal_wait, system_info};
+use syscall::{cap_create_signal, cap_delete, signal_send, signal_wait, system_info, thread_yield};
 use syscall_abi::SystemInfoType;
 
 use super::{cycles_now, log_bench_header};
@@ -20,8 +20,24 @@ use crate::{ChildStack, spawn};
 const MAX_PINNED: usize = 7; // CPU 0 is ktest's own; pin children to 1..=7.
 static mut SHOOTDOWN_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; MAX_PINNED];
 
-/// Child entry: signal "ready" and spin until `cap_delete` of the thread
-/// cap tears it down. Pure userspace spin — no syscalls back.
+/// Child entry: signal "ready", then loop on `thread_yield` until
+/// `cap_delete` of the thread cap tears it down.
+///
+/// `thread_yield` is the preemption point: the kernel's
+/// thread-cap-delete path marks the thread Exited under the scheduler
+/// lock; on the next reschedule (which a yield triggers immediately)
+/// the kernel observes Exited and reaps the TCB without having to
+/// race the timer tick. A pure-userspace `spin_loop` body — the
+/// previous shape — has no kernel entry point, so a CPU pinned to a
+/// single yield-free spinner can only be preempted on a timer
+/// boundary, which under release-mode CI is too unreliable: the
+/// follow-on `cap_delete` in the bench teardown hangs the harness.
+///
+/// We still keep ktest's aspace `current` on the pinned CPU between
+/// yields (each yield returns to the same spinner because no other
+/// thread is ready on that CPU), so the bench's premise — the parent's
+/// `mem_unmap` issues a TLB-shootdown IPI to every CPU with the aspace
+/// live — still holds.
 // cast_possible_truncation: ready_slot is a kernel cap slot index < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn shootdown_spinner_entry(ready_slot: u64) -> !
@@ -29,7 +45,7 @@ fn shootdown_spinner_entry(ready_slot: u64) -> !
     signal_send(ready_slot as u32, 0x1).ok();
     loop
     {
-        core::hint::spin_loop();
+        let _ = thread_yield();
     }
 }
 

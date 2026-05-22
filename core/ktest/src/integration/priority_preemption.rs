@@ -17,8 +17,6 @@
 //! of wall time of being made runnable. Skipped if no `SchedControl` cap
 //! exists in the initial cap set (no elevation path).
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use syscall::{
     cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait_timeout, system_info,
     thread_exit, thread_set_priority, thread_yield,
@@ -40,10 +38,6 @@ const PREEMPT_BUDGET_US: u64 = 100_000;
 static mut HOG_STACK: ChildStack = ChildStack::ZERO;
 static mut ELEVATED_STACK: ChildStack = ChildStack::ZERO;
 
-/// Stored count of iterations the hog completed before being killed,
-/// for diagnostics on failure.
-static HOG_REMAINING: AtomicU64 = AtomicU64::new(0);
-
 /// Hog: spin `SPIN_ITERS` times and post `done_bit` (low 32 bits) on
 /// `done_slot` (high 32 bits).
 // cast_possible_truncation: slot indices are < 2^32.
@@ -56,9 +50,14 @@ fn hog_entry(arg: u64) -> !
     while n != 0
     {
         core::hint::spin_loop();
+        // black_box prevents LLVM from collapsing the spin to a single
+        // sub-and-branch loop or a noop in release mode; the test
+        // premise — "hog dominates a CPU long enough that we can
+        // observe whether preemption fires" — depends on the loop
+        // body actually consuming wall-clock time.
+        core::hint::black_box(n);
         n -= 1;
     }
-    HOG_REMAINING.store(n, Ordering::Release);
     signal_send(done_slot, done_bit).ok();
     thread_exit();
 }

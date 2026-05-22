@@ -22,14 +22,15 @@
 //! Files:
 //! - `cap.rs`      — capability creation, copy, move, insert, derive, revoke, delete
 //! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
+//! - `retype.rs`   — retype primitive: aspace/cspace augment, PT budget, kernel PT pool
 //! - `mm.rs`       — memory map/unmap/protect, frame split, address space query
-//! - `signal.rs`   — signal send and wait
-//! - `event.rs`    — event queue post and receive
+//! - `signal.rs`   — signal send and wait (blocking and timeout)
+//! - `event.rs`    — event queue post and receive (blocking, try, timeout)
 //! - `wait_set.rs` — wait set add, remove, wait
 //! - `ipc.rs`      — IPC call, reply, recv, buffer set
-//! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity
-//! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption
-//! - `hw.rs`       — MMIO, IRQ, I/O ports
+//! - `thread.rs`   — thread lifecycle, register read/write, priority, affinity, sleep, `bind_notification`
+//! - `fpu.rs`      — FPU / SIMD / V extended-state isolation across preemption and cross-CPU migration
+//! - `hw.rs`       — MMIO, IRQ, I/O ports, SBI
 //! - `sysinfo.rs`  — system info queries and debug log
 
 pub mod cap;

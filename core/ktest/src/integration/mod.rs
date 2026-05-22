@@ -24,7 +24,11 @@
 //! - `memory_lifecycle.rs`       — frame split → map → protect → unmap with state checks
 //! - `multi_caller_ipc_fifo.rs`  — endpoint send-queue FIFO ordering with three concurrent callers
 //! - `cap_delegation_chain.rs`   — multi-level rights attenuation and cascaded revocation
+//! - `tlb_coherency.rs`          — map/unmap cycles across CPUs exercising TLB shootdown
 //! - `retype_reclaim.rs`         — auto-reclaim invariant for every retypable kernel object
+//! - `priority_preemption.rs`    — higher-priority runnable thread preempts a busy lower-priority one
+//! - `shared_frame_two_aspaces.rs` — one frame mapped into two `AddressSpace` caps; phys round-trip
+//! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
 
 pub mod cap_delegation_chain;
 pub mod cap_move_into_fresh_cspace_then_ipc;

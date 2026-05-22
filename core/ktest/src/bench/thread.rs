@@ -34,6 +34,7 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     let mut min = u64::MAX;
     let mut max = 0u64;
     let mut total = 0u64;
+    let mut completed: u64 = 0;
 
     for _ in 0..n
     {
@@ -69,12 +70,15 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
             max = delta;
         }
         total = total.saturating_add(delta);
+        completed += 1;
     }
 
     cap_delete(done).ok();
 
     log_bench_header("thread_lifecycle", n);
-    if let Some(mean) = total.checked_div(n64)
+    // Guard against no successful iteration so we don't log u64::MAX min.
+    let _ = n64;
+    if let Some(mean) = total.checked_div(completed)
     {
         crate::log_u64("ktest: bench  cycles_min=", min);
         crate::log_u64("ktest: bench  cycles_mean=", mean);

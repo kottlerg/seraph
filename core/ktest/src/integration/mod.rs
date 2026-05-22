@@ -27,10 +27,13 @@
 //! - `retype_reclaim.rs`         — auto-reclaim invariant for every retypable kernel object
 
 pub mod cap_delegation_chain;
+pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
 pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
+pub mod priority_preemption;
 pub mod retype_reclaim;
+pub mod shared_frame_two_aspaces;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
 pub mod wait_concurrency;
@@ -58,4 +61,16 @@ pub fn run_all(ctx: &TestContext)
     );
     run_integration_test!("integration::tlb_coherency", tlb_coherency::run(ctx));
     run_integration_test!("integration::retype_reclaim", retype_reclaim::run(ctx));
+    run_integration_test!(
+        "integration::priority_preemption",
+        priority_preemption::run(ctx)
+    );
+    run_integration_test!(
+        "integration::shared_frame_two_aspaces",
+        shared_frame_two_aspaces::run(ctx)
+    );
+    run_integration_test!(
+        "integration::cap_move_into_fresh_cspace_then_ipc",
+        cap_move_into_fresh_cspace_then_ipc::run(ctx)
+    );
 }

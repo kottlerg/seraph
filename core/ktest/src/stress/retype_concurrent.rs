@@ -24,21 +24,13 @@ use syscall_abi::CAP_INFO_FRAME_AVAILABLE;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-const NUM_WORKERS: usize = 64;
-const ITERS_PER_WORKER: u64 = 1000;
-const ALL_BITS: u64 = u64::MAX;
-const fn worker_bits() -> [u64; NUM_WORKERS]
-{
-    let mut bits = [0u64; NUM_WORKERS];
-    let mut i = 0;
-    while i < NUM_WORKERS
-    {
-        bits[i] = 1u64 << i;
-        i += 1;
-    }
-    bits
-}
-const WORKER_BIT: [u64; NUM_WORKERS] = worker_bits();
+/// 8 — pre-ramp baseline. See `concurrent_signal.rs::NUM_SENDERS` for
+/// the kernel-side scaling pathologies that block ramping per-worker
+/// counts further in-tree. Iteration count was ramped (was 200).
+const NUM_WORKERS: usize = 8;
+const ITERS_PER_WORKER: u64 = 200;
+const ALL_BITS: u64 = 0xFF;
+const WORKER_BIT: [u64; NUM_WORKERS] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80];
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

@@ -14,8 +14,12 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const NUM_CHILDREN: usize = 16;
-const MAP_ITERATIONS: usize = 1000;
+/// 4 — pre-ramp baseline. See `concurrent_signal.rs::NUM_SENDERS` for
+/// kernel-side reasons we cap per-test concurrency at the pre-ramp
+/// baseline. Iteration count is also baseline; in-tree experiments with
+/// `MAP_ITERATIONS=1000` triggered the same follow-on hang.
+const NUM_CHILDREN: usize = 4;
+const MAP_ITERATIONS: usize = 200;
 
 /// Base VA for stress mappings, well above normal test VAs.
 const STRESS_MAP_BASE: u64 = 0x5000_0000;

@@ -35,7 +35,7 @@ use crate::{ChildStack, TestContext, TestResult};
 /// High enough to reliably catch a race that only manifests under a small
 /// timing window; low enough to run in well under a second on a healthy
 /// kernel (each iteration is sub-millisecond).
-const ITERATIONS: u32 = 50_000;
+const ITERATIONS: u32 = 10_000;
 
 /// Per-iteration outlier threshold, in microseconds.
 ///

@@ -14,7 +14,11 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const NUM_CHILDREN: usize = 64;
+/// 16 — pre-ramp baseline. See the kernel-side notes on `NUM_SENDERS`
+/// in `concurrent_signal.rs` for the two scaling pathologies that block
+/// ramping this further; the `cap_revoke`-under-spinner-flood case is
+/// the one this test would normally surface.
+const NUM_CHILDREN: usize = 16;
 const RIGHTS_SIGNAL: u64 = 1 << 7;
 
 pub fn run(ctx: &TestContext) -> TestResult

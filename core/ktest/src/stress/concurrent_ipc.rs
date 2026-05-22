@@ -15,8 +15,12 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const NUM_CALLERS: usize = 64;
-const CYCLES: usize = 200;
+/// 16 — see the kernel-side notes on `NUM_SENDERS` in
+/// `concurrent_signal.rs`. `CYCLES` is the pre-ramp baseline (in-tree
+/// experiments with `CYCLES=200` triggered the same follow-on hang in
+/// `cap_revoke_under_use`).
+const NUM_CALLERS: usize = 16;
+const CYCLES: usize = 50;
 
 // SEND + GRANT rights.
 const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);

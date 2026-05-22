@@ -14,7 +14,7 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const NUM_CHILDREN: usize = 16;
+const NUM_CHILDREN: usize = 64;
 const RIGHTS_SIGNAL: u64 = 1 << 7;
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -44,8 +44,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         let child_done = cap_copy(done, child.cs, 1 << 7)
             .map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
 
-        let done_bit = 1u64 << i;
-        let arg = u64::from(child_sig) | (u64::from(child_done) << 16) | (done_bit << 32);
+        // Pack: sig_slot[15:0], done_slot[31:16], bit_index[47:32]. Encode
+        // the bit index (not bit value) so it fits in 16 bits even for
+        // NUM_CHILDREN up to 64.
+        let arg = u64::from(child_sig) | (u64::from(child_done) << 16) | ((i as u64) << 32);
         // SAFETY: Each child uses a distinct stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         spawn::configure_and_start(&child, sender_loop_entry, stack_top, arg)
@@ -66,7 +68,15 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_revoke(root).map_err(|_| "cap_revoke_under_use: cap_revoke failed")?;
 
     // Wait for all children to report done. Each child sends a unique bit.
-    let all_done = (1u64 << NUM_CHILDREN) - 1;
+    // At NUM_CHILDREN=64 the bitmask saturates the u64.
+    let all_done: u64 = if NUM_CHILDREN >= 64
+    {
+        u64::MAX
+    }
+    else
+    {
+        (1u64 << NUM_CHILDREN) - 1
+    };
     let mut done_bits: u64 = 0;
     while done_bits != all_done
     {
@@ -94,7 +104,8 @@ fn sender_loop_entry(arg: u64) -> !
 {
     let sig_slot = (arg & 0xFFFF) as u32;
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
-    let done_bit = (arg >> 32) & 0xFFFF;
+    let bit_index = (arg >> 32) & 0xFFFF;
+    let done_bit = 1u64 << bit_index;
 
     // Send in a tight loop until the cap is revoked.
     loop

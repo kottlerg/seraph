@@ -3,23 +3,32 @@
 
 //! Stress test: concurrent signal send/wait races.
 //!
-//! 4 child threads simultaneously send distinct bit patterns to the same signal.
-//! The parent waits for all children to finish, then verifies all bit patterns
-//! arrived in the accumulated signal state.
+//! `NUM_SENDERS` child threads simultaneously send distinct bit patterns
+//! to the same signal. The parent waits for all children to finish, then
+//! verifies every bit pattern arrived in the accumulated signal state.
 
 use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const NUM_SENDERS: usize = 16;
-const SEND_ITERATIONS: u64 = 2000;
+const NUM_SENDERS: usize = 64;
+const SEND_ITERATIONS: u64 = 5000;
 
-/// Each sender ORs its unique bit once per iteration.
-const SENDER_BITS: [u64; NUM_SENDERS] = [
-    0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000,
-    0x8000,
-];
-const ALL_BITS: u64 = 0xFFFF;
+/// Each sender ORs its unique bit (`1 << i`) once per iteration. The
+/// signal's bit width is 64; one sender per bit saturates the bitmask.
+const fn sender_bits() -> [u64; NUM_SENDERS]
+{
+    let mut bits = [0u64; NUM_SENDERS];
+    let mut i = 0;
+    while i < NUM_SENDERS
+    {
+        bits[i] = 1u64 << i;
+        i += 1;
+    }
+    bits
+}
+const SENDER_BITS: [u64; NUM_SENDERS] = sender_bits();
+const ALL_BITS: u64 = u64::MAX;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

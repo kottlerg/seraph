@@ -33,7 +33,14 @@ mod thread_churn;
 use crate::{ChildStack, TestContext, run_integration_test};
 
 /// Maximum concurrent child threads across all stress tests.
-const MAX_STRESS_THREADS: usize = 16;
+///
+/// 64 matches the width of the `u64` signal bitmask used by tests that
+/// allocate one bit per worker (`concurrent_signal`, `retype_concurrent`,
+/// `cap_revoke_under_use`). Bumping past 64 requires refactoring those
+/// tests to use an atomic-counter ledger instead of one bit per worker.
+/// 64 × 16 KiB `ChildStack` = 1 MiB BSS — fits comfortably in ktest's
+/// segment caps.
+const MAX_STRESS_THREADS: usize = 64;
 
 /// Shared child stacks for stress tests. Tests run sequentially so stacks
 /// are never aliased.

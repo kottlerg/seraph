@@ -21,7 +21,7 @@ use syscall::{cap_delete, thread_yield};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const NUM_CHILDREN: usize = 4;
+const NUM_CHILDREN: usize = 16;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

@@ -14,8 +14,8 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const NUM_CHILDREN: usize = 4;
-const MAP_ITERATIONS: usize = 200;
+const NUM_CHILDREN: usize = 16;
+const MAP_ITERATIONS: usize = 1000;
 
 /// Base VA for stress mappings, well above normal test VAs.
 const STRESS_MAP_BASE: u64 = 0x5000_0000;
@@ -79,8 +79,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let bits = signal_wait(done).map_err(|_| "concurrent_map_unmap: signal_wait failed")?;
         done_bits |= bits;
-        // Bit 8 is our error indicator (not used by any done_bit since max is 1<<3).
-        if bits & (1 << 8) != 0
+        // Bit 32 is the error indicator (well clear of done_bit range for
+        // NUM_CHILDREN up to 32).
+        if bits & (1 << 32) != 0
         {
             child_failed = true;
         }
@@ -104,12 +105,11 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// Per-child VA, set by parent before starting each child.
-static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = [
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-    core::sync::atomic::AtomicU64::new(0),
-];
+static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = {
+    // const-fn loop is unstable in stable Rust; use a const block + manual
+    // population via array-init-by-fn idiom.
+    [const { core::sync::atomic::AtomicU64::new(0) }; NUM_CHILDREN]
+};
 
 // cast_possible_truncation: slot indices are kernel cap slots < 2^32.
 #[allow(clippy::cast_possible_truncation)]
@@ -128,8 +128,8 @@ fn mapper_entry(arg: u64) -> !
     {
         if mem_map(frame_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
         {
-            // Send done_bit | error indicator (bit 8).
-            signal_send(done_slot, done_bit | (1 << 8)).ok();
+            // Send done_bit | error indicator (bit 32).
+            signal_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
 
@@ -140,13 +140,13 @@ fn mapper_entry(arg: u64) -> !
         // ktest's own statics.
         if syscall::aspace_query(aspace, va).is_err()
         {
-            signal_send(done_slot, done_bit | (1 << 8)).ok();
+            signal_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
 
         if mem_unmap(aspace, va, 1).is_err()
         {
-            signal_send(done_slot, done_bit | (1 << 8)).ok();
+            signal_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
     }

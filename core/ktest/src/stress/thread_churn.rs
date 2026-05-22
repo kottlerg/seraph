@@ -10,7 +10,7 @@ use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait,
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-const ITERATIONS: usize = 100;
+const ITERATIONS: usize = 1000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

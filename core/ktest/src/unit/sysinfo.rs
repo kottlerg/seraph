@@ -87,14 +87,14 @@ pub fn page_size(_ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `system_info(BootProtocolVersion)` must return the current protocol version (7).
+/// `system_info(BootProtocolVersion)` must return the current protocol version (8).
 pub fn boot_protocol_version(_ctx: &TestContext) -> TestResult
 {
     let bpv = system_info(SystemInfoType::BootProtocolVersion as u64)
         .map_err(|_| "system_info(BootProtocolVersion) failed")?;
-    if bpv != 7
+    if bpv != 8
     {
-        return Err("system_info(BootProtocolVersion) did not return 7");
+        return Err("system_info(BootProtocolVersion) did not return 8");
     }
     Ok(())
 }

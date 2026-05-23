@@ -42,19 +42,27 @@ enum BuildProfile
 #[derive(Clone, Copy, Debug)]
 enum InstallDest
 {
-    /// Installed under `sysroot/EFI/seraph/<install_name>` — boot modules
-    /// loaded by the bootloader.
+    /// Installed under `sysroot/EFI/seraph/<install_name>` — only the
+    /// kernel ELF, which the bootloader loads loose from the ESP. Init,
+    /// ktest, and all userspace modules live under [`Self::Services`] and
+    /// reach the ESP via the bundle composer (see `xtask/src/bundle.rs`).
     EfiSeraph,
+    /// Installed under `sysroot/services/<install_name>` — canonical home
+    /// for bootloader-loaded userspace components (init, ktest, procmgr,
+    /// memmgr, devmgr, vfsd, virtio-blk, fatfs). The bundle composer
+    /// pulls from here; VFS-loaded respawns (notably fatfs after the
+    /// bundle has been reclaimed) look these up by `/services/<name>`.
+    Services,
+    /// Installed under both `sysroot/services/<install_name>` AND
+    /// `sysroot/bin/<install_name>`. Used today only for `fatfs`: the
+    /// `/services/` copy goes into the bundle, the `/bin/` copy is what
+    /// vfsd's hardcoded `CREATE_FROM_FILE` respawn path looks up
+    /// (`services/vfsd/src/driver.rs:205`). Collapses to plain
+    /// [`Self::Services`] once #125 renames vfsd's lookup path.
+    ServicesAndRootfsBin,
     /// Installed under `sysroot/bin/<install_name>` — loaded by procmgr
     /// from the root partition via VFS at runtime.
     RootfsBin,
-    /// Installed under both `sysroot/EFI/seraph/<install_name>`
-    /// (bootloader-loaded boot module) AND `sysroot/bin/<install_name>`
-    /// (root partition). Used by services that bootstrap the VFS itself
-    /// (fatfs is needed once as a boot module to mount root, then
-    /// re-spawned from `/bin/<install_name>` for every subsequent mount
-    /// via the regular VFS path).
-    EfiAndRootfsBin,
     /// Installed under `sysroot/tests/<install_name>` — test-harness
     /// binaries. svcmgr does not scan this path; harness recipes live
     /// in `rootfs/etc/svcmgr/tests.d/`. See docs/testing.md.
@@ -108,49 +116,49 @@ const SPECS: &[Spec] = &[
         name: "init",
         install_name: None,
         profile: BuildProfile::LowLevelUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "ktest",
         install_name: None,
         profile: BuildProfile::LowLevelUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "procmgr",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "memmgr",
         install_name: None,
         profile: BuildProfile::LowLevelUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "devmgr",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "vfsd",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "virtio-blk",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
@@ -171,7 +179,12 @@ const SPECS: &[Spec] = &[
         name: "fatfs",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::EfiAndRootfsBin,
+        // Dual-installed: `/services/fatfs` for the bundle composer (so
+        // the bootloader can mount root on the first boot), `/bin/fatfs`
+        // for vfsd's `CREATE_FROM_FILE` respawn path (the namespace path
+        // hardcoded at `services/vfsd/src/driver.rs:205`, scheduled for
+        // rename to `/services/fatfs` in #125's path migration).
+        dest: InstallDest::ServicesAndRootfsBin,
         arch_only: None,
     },
     Spec {
@@ -326,6 +339,10 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
             build_boot(ctx, args)?;
             build_all_specs(ctx, args)?;
             sysroot::install_rootfs(ctx)?;
+            // `build` is an authoring step: always (re)compose the default-
+            // init bundle. Operators who want ktest run
+            // `cargo xtask compose-bundle --harness ktest` after `build`.
+            crate::bundle::compose(ctx, crate::bundle::Harness::Init)?;
             crate::disk::create_disk_image(ctx, args.arch)?;
         }
         c =>
@@ -684,11 +701,12 @@ fn install_paths(ctx: &BuildContext, spec: &Spec) -> Result<Vec<PathBuf>>
     Ok(match spec.dest
     {
         InstallDest::EfiSeraph => vec![ctx.sysroot_efi_seraph().join(n)],
-        InstallDest::RootfsBin => vec![ctx.sysroot.join("bin").join(n)],
-        InstallDest::EfiAndRootfsBin => vec![
-            ctx.sysroot_efi_seraph().join(n),
+        InstallDest::Services => vec![ctx.sysroot_services().join(n)],
+        InstallDest::ServicesAndRootfsBin => vec![
+            ctx.sysroot_services().join(n),
             ctx.sysroot.join("bin").join(n),
         ],
+        InstallDest::RootfsBin => vec![ctx.sysroot.join("bin").join(n)],
         InstallDest::RootfsTests => vec![ctx.sysroot.join("tests").join(n)],
         InstallDest::RootfsTestsPrograms =>
         {

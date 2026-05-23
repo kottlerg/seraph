@@ -29,7 +29,6 @@
 //! via the `From` impl in `error.rs`.
 
 use crate::error::BootError;
-use boot_protocol::BootModule;
 
 // Both constants are re-exported here for arch-mod consumers; only one is
 // referenced per target arch build.
@@ -359,48 +358,8 @@ pub unsafe fn load_init(
     })
 }
 
-// ── Boot module loading ───────────────────────────────────────────────────────
-
-/// Load a flat binary boot module from `data` into physical memory.
-///
-/// Allocates pages at any available physical address via `AllocateAnyPages`,
-/// copies `data` into the region, and returns a [`BootModule`] descriptor for
-/// inclusion in [`boot_protocol::BootInfo`].
-///
-/// The allocated region is rounded up to a page boundary. `BootModule.size`
-/// records the exact file size (not the page-rounded allocation size) so the
-/// kernel knows the precise extent of valid data.
-///
-/// # Errors
-///
-/// Returns `BootError::OutOfMemory` if `AllocatePages` fails.
-///
-/// # Safety
-///
-/// `bs` must be a valid pointer to UEFI boot services and boot services must
-/// not yet have been exited.
-pub unsafe fn load_module(
-    bs: *mut crate::uefi::EfiBootServices,
-    data: &[u8],
-) -> Result<BootModule, BootError>
-{
-    let page_count = data.len().div_ceil(4096);
-
-    // SAFETY: `bs` is valid boot services per the caller's contract.
-    let phys_base = unsafe { crate::uefi::allocate_pages(bs, page_count)? };
-
-    let dst = phys_base as *mut u8;
-    // SAFETY: `dst` is the base of a freshly UEFI-allocated region of at least
-    // `page_count * 4096 >= data.len()` bytes, identity-mapped in the bootloader
-    // address space. `data` is a valid `&[u8]` of exactly `data.len()` bytes.
-    // The source (temporary file read buffer) and destination (new physical
-    // allocation) are disjoint regions; no overlap is possible.
-    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
-
-    // data.len() is a byte count that fits in u64 on any realistic system.
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(BootModule {
-        physical_base: phys_base,
-        size: data.len() as u64,
-    })
-}
+// Boot modules are no longer loaded as standalone allocations in the
+// bootloader. Bundle entries (excluding the `init` entry, which is ELF-
+// loaded via [`load_init`]) are exposed in place by referencing the
+// single bundle UEFI allocation in `BootModule.physical_base`. See
+// `main.rs::step4_parse_bundle`.

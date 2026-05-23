@@ -273,13 +273,17 @@ pub fn validate_sysroot_for_launch(ctx: &Context, arch: Arch) -> Result<()>
     let efi_name = arch.boot_efi_filename();
     let boot_efi = ctx.sysroot_efi_boot().join(efi_name);
     let kernel_bin = ctx.sysroot_efi_seraph().join("kernel");
-    let init_bin = ctx.sysroot_efi_seraph().join("init");
+    // Init (and modules) reach the ESP via the bootstrap bundle composed
+    // by `cargo xtask build` (default-init) or `cargo xtask compose-bundle
+    // --harness {init,ktest}`. Validate the bundle exists rather than any
+    // individual binary.
+    let bundle = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
     let disk_img = ctx.disk_image();
 
     let missing = [
         ("bootloader", boot_efi),
         ("kernel", kernel_bin),
-        ("init", init_bin),
+        ("bootstrap.bundle", bundle),
         ("disk image", disk_img),
     ];
     for (label, path) in missing

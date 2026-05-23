@@ -39,10 +39,11 @@ pub enum BootError
     /// `ExitBootServices` failed even after one retry with a refreshed map key.
     ExitBootServicesFailed,
 
-    /// The boot configuration file is missing, malformed, or contains invalid values.
+    /// The bootstrap.bundle file is missing, malformed, or violates an
+    /// internal invariant (no `init` entry, duplicate names, etc.).
     ///
-    /// The `&'static str` payload describes the specific configuration error.
-    InvalidConfig(&'static str),
+    /// The `&'static str` payload describes the specific bundle error.
+    InvalidBundle(&'static str),
 }
 
 impl From<elf::ElfError> for BootError
@@ -80,7 +81,7 @@ impl BootError
             BootError::ProtocolNotFound(s)
             | BootError::FileNotFound(s)
             | BootError::InvalidElf(s)
-            | BootError::InvalidConfig(s) => Some(s),
+            | BootError::InvalidBundle(s) => Some(s),
             _ => None,
         }
     }
@@ -100,7 +101,7 @@ impl BootError
             BootError::WxViolation => "ELF segment has writable+executable permissions (W^X)",
             BootError::OutOfMemory => "physical memory allocation failed",
             BootError::ExitBootServicesFailed => "ExitBootServices failed after retry",
-            BootError::InvalidConfig(_) => "boot configuration error",
+            BootError::InvalidBundle(_) => "bootstrap.bundle is malformed or missing",
         }
     }
 }
@@ -126,7 +127,7 @@ mod tests
             BootError::WxViolation,
             BootError::OutOfMemory,
             BootError::ExitBootServicesFailed,
-            BootError::InvalidConfig("c"),
+            BootError::InvalidBundle("b"),
         ];
         for v in variants
         {
@@ -161,11 +162,11 @@ mod tests
     }
 
     #[test]
-    fn invalid_config_detail_returns_payload()
+    fn invalid_bundle_detail_returns_payload()
     {
         assert_eq!(
-            BootError::InvalidConfig("missing key").detail(),
-            Some("missing key")
+            BootError::InvalidBundle("missing init").detail(),
+            Some("missing init")
         );
     }
 

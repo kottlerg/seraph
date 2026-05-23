@@ -11,6 +11,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::arch::Arch;
+use crate::bundle::Harness;
 
 /// Top-level CLI entry point.
 #[derive(Parser)]
@@ -52,6 +53,12 @@ pub enum CliCommand
     /// outside the cargo flow (e.g. staging a test recipe). Requires an
     /// arch-tagged sysroot from a prior `cargo xtask build`.
     Mkdisk(MkdiskArgs),
+
+    /// Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from
+    /// `sysroot/services/` and repack `disk.img`. Use `--harness ktest`
+    /// to run the kernel test harness; the default is `--harness init`.
+    /// Requires a populated sysroot from a prior `cargo xtask build`.
+    ComposeBundle(ComposeBundleArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -154,6 +161,20 @@ pub struct MkdiskArgs
     /// Target architecture — must match the existing sysroot's arch tag.
     #[arg(long, default_value = "x86_64")]
     pub arch: Arch,
+}
+
+// ── ComposeBundle ────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct ComposeBundleArgs
+{
+    /// Target architecture — must match the existing sysroot's arch tag.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// Which harness binary to use as the bundle's `init` entry.
+    #[arg(long, default_value = "init")]
+    pub harness: Harness,
 }
 
 // ── Clean ─────────────────────────────────────────────────────────────────────

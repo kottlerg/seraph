@@ -9,7 +9,16 @@
 //! received via the init protocol. Only tokens prefixed with `ktest.` are
 //! consumed; all others are silently ignored.
 //!
-//! Supported options:
+//! Boot protocol v8 removed the kernel command line; the init protocol still
+//! exposes [`crate::init_protocol::cmdline_bytes`] but in production boots
+//! that slice is always empty, so [`parse`] returns [`KtestConfig::DEFAULT`]
+//! verbatim. The defaults below were chosen for CI: tests run all tiers,
+//! the VM auto-shuts down on completion, and shutdown is immediate. To
+//! preserve QEMU for interactive inspection, edit [`KtestConfig::DEFAULT`]
+//! and `cargo xtask build -p ktest`.
+//!
+//! Supported options (parser retained for in-tree experiments that still
+//! pipe data through the init-protocol cmdline slice):
 //! - `ktest.shutdown=always|pass|never` — when to shut down after tests
 //! - `ktest.timeout=N` — seconds to wait before shutdown (decimal integer)
 //! - `ktest.filter=unit,integration,stress,bench` — comma-separated tier filter
@@ -42,12 +51,15 @@ pub struct KtestConfig
 
 impl KtestConfig
 {
-    const DEFAULT: KtestConfig = KtestConfig {
-        shutdown_policy: ShutdownPolicy::Never,
+    /// Compile-time configuration baked into every ktest build after the
+    /// boot-protocol v8 cmdline removal. CI-friendly: full coverage, exit
+    /// immediately on completion.
+    pub const DEFAULT: KtestConfig = KtestConfig {
+        shutdown_policy: ShutdownPolicy::Always,
         timeout_secs: 0,
         run_unit: true,
         run_integration: true,
-        run_stress: false,
+        run_stress: true,
         run_bench: true,
         bench_iters: 1000,
     };

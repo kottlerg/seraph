@@ -32,7 +32,7 @@
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 #[cfg(not(test))]
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // ── AP ready counter ──────────────────────────────────────────────────────────
 
@@ -43,22 +43,6 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 /// to come online before entering the scheduler.
 #[cfg(not(test))]
 static APS_READY: AtomicU32 = AtomicU32::new(0);
-
-// ── Kernel-resident cmdline snapshot ──────────────────────────────────────────
-
-/// Maximum cmdline bytes the kernel retains. Matches the bootloader cap
-/// (`MAX_CMDLINE_LEN`); see `core/boot/src/main.rs` cmdline allocation. The
-/// snapshot lives in BSS so the bootloader's cmdline page becomes reclaim-safe
-/// at Phase 7 (the only later reader is the Phase-9 `InitInfo` copy, which
-/// sources from this buffer rather than the bootloader page).
-#[cfg(not(test))]
-const KERNEL_CMDLINE_MAX: usize = 512;
-
-#[cfg(not(test))]
-static mut KERNEL_CMDLINE: [u8; KERNEL_CMDLINE_MAX] = [0; KERNEL_CMDLINE_MAX];
-
-#[cfg(not(test))]
-static KERNEL_CMDLINE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 use boot_protocol::BootInfo;
 
@@ -119,8 +103,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
-    let cmdline_phys = info.command_line as u64;
-    let cmdline_len = info.command_line_len as usize;
 
     // ── Phase 1: early console ──────────────────────────────────────────────
     // SAFETY: called exactly once, from the single kernel boot thread, after
@@ -215,25 +197,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // cannot be freed to buddy; the unused portion (~750 KiB) is acceptable
     // waste.
     kprintln!("Phase 4: Typed-Memory Cap Surface (no kernel heap)");
-
-    // Snapshot the cmdline from the bootloader-owned page into kernel BSS so
-    // the page itself is reclaim-safe by Phase 7. The Phase-9 InitInfo copy
-    // sources from `KERNEL_CMDLINE` rather than the bootloader page.
-    #[cfg(not(test))]
-    {
-        let n = cmdline_len.min(KERNEL_CMDLINE_MAX);
-        if n > 0 && cmdline_phys != 0
-        {
-            // SAFETY: direct map active since Phase 3; single-threaded boot;
-            // `KERNEL_CMDLINE` is exclusively written here before any reader.
-            unsafe {
-                let src = mm::paging::phys_to_virt(cmdline_phys) as *const u8;
-                let dst = core::ptr::addr_of_mut!(KERNEL_CMDLINE).cast::<u8>();
-                core::ptr::copy_nonoverlapping(src, dst, n);
-            }
-            KERNEL_CMDLINE_LEN.store(n, Ordering::Release);
-        }
-    }
 
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read
     // bootloader-discovered MMIO bases instead of compile-time defaults. This
@@ -584,9 +547,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
             let desc_count = desc_slice.len();
             let desc_byte_len = core::mem::size_of_val(desc_slice);
-            let cmdline_start = descriptors_offset as usize + desc_byte_len;
-            let cmdline_snapshot_len = KERNEL_CMDLINE_LEN.load(Ordering::Acquire);
-            let total_bytes = cmdline_start + cmdline_snapshot_len;
+            // Boot protocol v8 removed `BootInfo.command_line`; the kernel
+            // hands init an empty cmdline slice. The init-protocol
+            // `cmdline_offset` / `cmdline_len` fields remain (init-protocol
+            // v6) but are always zero in production boots.
+            let total_bytes = descriptors_offset as usize + desc_byte_len;
             let info_pages = total_bytes.div_ceil(mm::PAGE_SIZE).max(1);
 
             // Allocate and map each page.
@@ -635,16 +600,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             }
             let info_base = page_ptrs[0];
 
-            let cmdline_copy_len = cmdline_snapshot_len;
-            let cmdline_off = if cmdline_copy_len > 0
-            {
-                cmdline_start as u32
-            }
-            else
-            {
-                0
-            };
-
             let info = InitInfo {
                 version: INIT_PROTOCOL_VERSION,
                 cap_descriptor_count: desc_count as u32,
@@ -660,8 +615,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 hw_cap_count: cspace_layout.hw_cap_count,
                 cap_descriptors_offset: descriptors_offset,
                 thread_cap: 0, // patched below after Thread cap is minted
-                cmdline_offset: cmdline_off,
-                cmdline_len: cmdline_copy_len as u32,
+                cmdline_offset: 0,
+                cmdline_len: 0,
                 sbi_control_cap: cspace_layout.sbi_control_slot,
                 cspace_cap: 0, // patched below after CSpace cap is minted
                 irq_range_cap: cspace_layout.irq_range_slot,
@@ -696,28 +651,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     core::ptr::copy_nonoverlapping(desc_src.add(written), dst, chunk);
                 }
                 written += chunk;
-            }
-
-            // Copy kernel command line after the CapDescriptor array. Source
-            // is the Phase-4 BSS snapshot in `KERNEL_CMDLINE`; the bootloader
-            // cmdline page is already a reclaimable Frame cap by now.
-            if cmdline_copy_len > 0
-            {
-                let cmdline_src = core::ptr::addr_of!(KERNEL_CMDLINE).cast::<u8>();
-                let mut written = 0usize;
-                while written < cmdline_copy_len
-                {
-                    let offset = cmdline_start + written;
-                    let chunk =
-                        (mm::PAGE_SIZE - offset % mm::PAGE_SIZE).min(cmdline_copy_len - written);
-                    // SAFETY: offset within mapped region; cmdline_src points
-                    // into kernel BSS valid through `KERNEL_CMDLINE_MAX` bytes.
-                    unsafe {
-                        let dst = info_ptr(&page_ptrs, offset);
-                        core::ptr::copy_nonoverlapping(cmdline_src.add(written), dst, chunk);
-                    }
-                    written += chunk;
-                }
             }
 
             // Mint a reclaimable Frame cap per InitInfo page so init's

@@ -20,20 +20,25 @@ use crate::util::step;
 
 const SECTOR_SIZE: u64 = 512;
 
-/// Both partitions are 256 MiB. Debug binaries each weigh ~14 MiB; the root
-/// partition now holds ~13 of them (production services + test harnesses +
-/// per-program testers) plus fixtures, so 192 MiB was insufficient once the
-/// `usertest` orchestrator and per-program tester binaries landed. Release
-/// builds remain comfortable well under half of this.
-const PARTITION_SIZE: u64 = 256 * 1024 * 1024;
+/// ESP partition size. Debug binaries weigh ~14 MiB each; the ESP now holds
+/// just kernel + bundle + bootloader EFI (init and modules live inside the
+/// bundle), so 256 MiB leaves comfortable headroom for additional bundle
+/// modules.
+const ESP_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Root partition size. Bumped to 512 MiB to accommodate both the legacy
+/// `/bin/` set (~164 MiB of debug binaries) and the new `/services/`
+/// canonical home (~91 MiB) introduced for bootloader-loaded components.
+/// Release builds remain comfortable well under half of this.
+const ROOT_PARTITION_SIZE: u64 = 512 * 1024 * 1024;
 
 /// First partition starts at LBA 2048 (1 MiB alignment, standard GPT practice).
 const ESP_START_LBA: u64 = 2048;
-const ESP_SIZE_LBA: u64 = PARTITION_SIZE / SECTOR_SIZE;
+const ESP_SIZE_LBA: u64 = ESP_PARTITION_SIZE / SECTOR_SIZE;
 
 /// Second partition follows immediately after the first.
 const ROOT_START_LBA: u64 = ESP_START_LBA + ESP_SIZE_LBA;
-const ROOT_SIZE_LBA: u64 = PARTITION_SIZE / SECTOR_SIZE;
+const ROOT_SIZE_LBA: u64 = ROOT_PARTITION_SIZE / SECTOR_SIZE;
 
 /// Total image size: partitions + 1 MiB lead-in + 1 MiB trailing GPT backup.
 const IMAGE_SIZE: u64 = (ROOT_START_LBA + ROOT_SIZE_LBA + 2048) * SECTOR_SIZE;
@@ -145,9 +150,10 @@ impl Seek for PartitionSlice
 
 /// Create a GPT disk image at `<project_root>/disk.img`.
 ///
-/// The image contains two FAT32 partitions sized [`PARTITION_SIZE`]:
-/// - Partition 1 (ESP): populated from `sysroot/esp/`
-/// - Partition 2 (ROOT): populated from `sysroot/` excluding `esp/`
+/// The image contains two FAT32 partitions:
+/// - Partition 1 (ESP, [`ESP_PARTITION_SIZE`]): populated from `sysroot/esp/`
+/// - Partition 2 (ROOT, [`ROOT_PARTITION_SIZE`]): populated from `sysroot/`
+///   excluding `esp/`
 ///
 /// Partition 2's GPT type-GUID is the arch-specific Seraph root GUID
 /// (see [`boot_protocol::role_guids`]) so vfsd can identify the root by
@@ -156,6 +162,20 @@ pub fn create_disk_image(ctx: &BuildContext, arch: Arch) -> Result<()>
 {
     let image_path = ctx.disk_image();
     step(&format!("Creating disk image: {}", image_path.display()));
+
+    // `mkdisk` is the refresh-from-sysroot path — it never authors the
+    // bundle. `build` and `compose-bundle` are responsible for producing
+    // `bootstrap.bundle` before this point; fail loudly if it is absent
+    // rather than producing a disk image the bootloader will refuse.
+    let bundle_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
+    if !bundle_path.exists()
+    {
+        anyhow::bail!(
+            "mkdisk: {} missing — run `cargo xtask build` (default-init bundle) or \
+             `cargo xtask compose-bundle --harness {{init,ktest}}` first",
+            bundle_path.display()
+        );
+    }
 
     // Create zero-filled image file.
     {
@@ -168,10 +188,15 @@ pub fn create_disk_image(ctx: &BuildContext, arch: Arch) -> Result<()>
 
     // Format and populate the ESP from sysroot/esp/.
     let esp_source = ctx.sysroot_esp();
-    format_and_populate_partition(&image_path, ESP_START_LBA, &esp_source)?;
+    format_and_populate_partition(&image_path, ESP_START_LBA, ESP_PARTITION_SIZE, &esp_source)?;
 
     // Format and populate the root partition from sysroot/ (excluding esp/).
-    format_and_populate_partition(&image_path, ROOT_START_LBA, &ctx.sysroot)?;
+    format_and_populate_partition(
+        &image_path,
+        ROOT_START_LBA,
+        ROOT_PARTITION_SIZE,
+        &ctx.sysroot,
+    )?;
 
     step("Disk image complete");
     Ok(())
@@ -274,8 +299,12 @@ fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
 ///
 /// Skips `.arch`, `NvVars`, and the `esp` subdirectory (which is the ESP
 /// mount point, not root content) when populating.
-fn format_and_populate_partition(image_path: &Path, start_lba: u64, source_dir: &Path)
--> Result<()>
+fn format_and_populate_partition(
+    image_path: &Path,
+    start_lba: u64,
+    size: u64,
+    source_dir: &Path,
+) -> Result<()>
 {
     let offset = start_lba * SECTOR_SIZE;
 
@@ -286,7 +315,7 @@ fn format_and_populate_partition(image_path: &Path, start_lba: u64, source_dir: 
             .write(true)
             .open(image_path)
             .context("failed to open image for partition format")?;
-        let mut slice = PartitionSlice::new(file, offset, PARTITION_SIZE)?;
+        let mut slice = PartitionSlice::new(file, offset, size)?;
         // 4 KiB clusters align cluster boundaries with the page-granular
         // sector cache in fs/fat: each cluster holds exactly 8 sectors =
         // one PAGE_SIZE, so file data within a cluster is page-contiguous
@@ -306,7 +335,7 @@ fn format_and_populate_partition(image_path: &Path, start_lba: u64, source_dir: 
             .write(true)
             .open(image_path)
             .context("failed to open image for partition population")?;
-        let slice = PartitionSlice::new(file, offset, PARTITION_SIZE)?;
+        let slice = PartitionSlice::new(file, offset, size)?;
         let fat = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
             .context("failed to mount partition")?;
         let root = fat.root_dir();

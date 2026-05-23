@@ -31,11 +31,24 @@ use core::sync::atomic::{AtomicU32, Ordering};
 ///
 /// Interrupts are disabled on `lock_raw` and restored on `unlock_raw`,
 /// preventing deadlock from timer preemption.
+///
+/// `#[repr(C)]` pins field order: `arch::riscv64::context::switch` releases
+/// the scheduler lock inline by writing `now_serving` at a hardcoded offset
+/// of 4 bytes from the Spinlock base. The static assertion below enforces
+/// that the field layout matches the asm assumption at compile time.
+#[repr(C)]
 pub struct Spinlock
 {
     next_ticket: AtomicU32,
     now_serving: AtomicU32,
 }
+
+const _: () = {
+    assert!(
+        core::mem::offset_of!(Spinlock, now_serving) == 4,
+        "arch::riscv64::context::switch hardcodes now_serving at offset 4"
+    );
+};
 
 // SAFETY: The spinlock serialises access and disables interrupts while held,
 // so it can safely be sent across thread/CPU boundaries.

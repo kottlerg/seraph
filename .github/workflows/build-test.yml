@@ -113,22 +113,10 @@ jobs:
           esac
 
       - name: Run ${{ matrix.tester }}
-        # DIAGNOSTIC (PR #138): bump runs=10 for the historically
-        # flaky `riscv64 debug svctest` cell so a single workflow run
-        # gives 10 samples and we can compute a CI failure rate.
-        # Revert to runs=1 before merge.
         run: |
-          if [ "${{ matrix.arch }}" = "riscv64" ] \
-              && [ "${{ matrix.profile }}" = "debug" ] \
-              && [ "${{ matrix.tester }}" = "svctest" ]; then
-            cargo xtask run-parallel \
-              --arch ${{ matrix.arch }} \
-              --parallel 1 --runs 10 --timeout 180 || true
-          else
-            cargo xtask run-parallel \
-              --arch ${{ matrix.arch }} \
-              --parallel 1 --runs 1 --timeout 180
-          fi
+          cargo xtask run-parallel \
+            --arch ${{ matrix.arch }} \
+            --parallel 1 --runs 1 --timeout 180
 
       - name: Upload run-parallel logs
         if: always()

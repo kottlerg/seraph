@@ -138,9 +138,12 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, _is_user: bool) -> SavedS
 /// the scheduler lock. `save_flag` must be a valid `*const AtomicU32` (the
 /// current thread's `context_saved` field) or null (initial boot switch).
 ///
-/// The lock (`now_serving` at `lock_ptr + 4`) is released inside this function
-/// between the save and load phases, so that another CPU cannot load the
-/// current thread's `SavedState` until the save is globally visible.
+/// Both the `*save_flag = 1` publication and the `now_serving` lock release
+/// happen AFTER `ld sp, 0(a1)` (the sp swap to next's kstack). Publishing
+/// before the sp swap would let a peer hart observe `context_saved == 1`,
+/// dispatch the outgoing TCB, and execute its own sp restore onto the same
+/// outgoing kstack while this hart is still on it. See `core/kernel/docs/
+/// scheduling-internals.md` § Cross-CPU TCB Ownership (issue #117 / #133).
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(
@@ -175,6 +178,32 @@ pub unsafe extern "C" fn switch(
         "sd s9,    88(a0)",
         "sd s10,   96(a0)",
         "sd s11,  104(a0)",
+        // ── Restore next thread from *a1 ──────────────────────────────────
+        // #117 / #133 ordering invariant: both `*save_flag = 1` and the
+        // `now_serving` Release MUST happen AFTER `ld sp, 0(a1)` (the sp
+        // swap below). Publishing earlier lets a peer hart that observes
+        // `context_saved == 1` and dequeues `current` execute its own sp
+        // restore from `saved_state.sp` (still the OUTGOING sp) onto the
+        // same outgoing kstack while this hart is still pre-`ld sp` — two
+        // harts then push/pop on a shared kstack. Window (a) from the
+        // x86_64 fix does not apply on RISC-V because `switch()` does not
+        // restore `sstatus` and SIE stays masked across the swap, so no
+        // trap iretq frame is in flight; only window (b) is closed here.
+        "ld ra,     8(a1)", // return address (or entry function)
+        "ld sp,     0(a1)", // sp swap — now on next's kstack
+        "ld s0,    16(a1)",
+        "ld s1,    24(a1)",
+        "ld s2,    32(a1)",
+        "ld s3,    40(a1)",
+        "ld s4,    48(a1)",
+        "ld s5,    56(a1)",
+        "ld s6,    64(a1)",
+        "ld s7,    72(a1)",
+        "ld s8,    80(a1)",
+        "ld s9,    88(a1)",
+        "ld s10,   96(a1)",
+        "ld s11,  104(a1)",
+        "ld a0,   112(a1)", // argument for first-entry threads
         // ── Signal save complete (Release) ────────────────────────────────
         // Set context_saved = 1 so a remote CPU spinning in schedule() can
         // proceed to load this thread's SavedState. The Release fence
@@ -195,23 +224,7 @@ pub unsafe extern "C" fn switch(
         "lw   t0, 0(a3)", // t0 = now_serving
         "addi t0, t0, 1", // t0 += 1
         "sw   t0, 0(a3)", // now_serving = t0 + 1
-        // ── Restore next thread from *a1 ──────────────────────────────────
-        "ld ra,     8(a1)", // return address (or entry function)
-        "ld sp,     0(a1)",
-        "ld s0,    16(a1)",
-        "ld s1,    24(a1)",
-        "ld s2,    32(a1)",
-        "ld s3,    40(a1)",
-        "ld s4,    48(a1)",
-        "ld s5,    56(a1)",
-        "ld s6,    64(a1)",
-        "ld s7,    72(a1)",
-        "ld s8,    80(a1)",
-        "ld s9,    88(a1)",
-        "ld s10,   96(a1)",
-        "ld s11,  104(a1)",
-        "ld a0,   112(a1)", // argument for first-entry threads
-        "ret",              // jr ra → jumps to next thread's entry or resume point
+        "ret",            // jr ra → jumps to next thread's entry or resume point
     );
 }
 

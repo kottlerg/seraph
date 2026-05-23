@@ -11,11 +11,22 @@ the link.
 ## Power-on to kernel entry (bootloader)
 
 UEFI firmware loads the bootloader from the EFI System Partition; the
-bootloader reads `boot.conf`, loads the kernel and init ELFs plus any boot
-modules, queries the UEFI memory map, builds initial page tables, calls
-`ExitBootServices`, populates `BootInfo`, and jumps to the kernel entry point.
-The sequence is specified in ten bootloader steps in
+bootloader reads `\EFI\seraph\bootstrap.bundle` (a Seraph-defined container
+that packs init and every boot module into one file — see
+[`abi/boot-protocol::bundle`](../abi/boot-protocol/src/bundle.rs)), loads
+the kernel from `\EFI\seraph\kernel`, ELF-parses the bundle entry named
+`init` into `BootInfo.init_image`, exposes every other bundle entry as a
+named `BootModule`, queries the UEFI memory map, builds initial page
+tables, calls `ExitBootServices`, populates `BootInfo`, and jumps to the
+kernel entry point. The sequence is specified in ten bootloader steps in
 [`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).
+
+Boot-time configuration on disk consists of only the three ESP files
+named above plus the EFI fallback bootloader. `BootInfo` no longer
+carries a kernel command line (`boot-protocol` v8 removed
+`command_line`); root-partition identity moved to GPT type-GUID role
+discovery, performed by vfsd, and ktest options are baked into ktest's
+compile-time defaults.
 
 ---
 

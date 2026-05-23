@@ -80,23 +80,28 @@ pub fn fs_open_phase(_: &Caps)
 {
     use std::io::Read;
 
-    let mut file = match std::fs::File::open("/esp/EFI/seraph/boot.conf")
+    // `boot.conf` was removed in boot-protocol v8. Read the bootstrap
+    // bundle header (the first 16 bytes carry `SRPHBNDL` magic + u32
+    // version + u32 entry count) to exercise the same vfsd/fatfs std::fs
+    // path boot.conf did without pulling tens of MiB into a userspace
+    // Vec.
+    let mut file = match std::fs::File::open("/esp/EFI/seraph/bootstrap.bundle")
     {
         Ok(f) => f,
-        Err(e) => panic!("fs_open: open /esp/EFI/seraph/boot.conf failed: {e}"),
+        Err(e) => panic!("fs_open: open /esp/EFI/seraph/bootstrap.bundle failed: {e}"),
     };
-    let mut buf = Vec::new();
+    let mut header = [0u8; 16];
     let n = file
-        .read_to_end(&mut buf)
-        .expect("fs_open: read_to_end failed");
-    assert!(n > 0, "fs_open: read returned 0 bytes");
-
-    let body = String::from_utf8_lossy(&buf);
-    assert!(
-        body.contains("Seraph bootloader configuration"),
-        "fs_open: marker line missing from boot.conf body: {body:?}"
+        .read(&mut header)
+        .expect("fs_open: read(bundle header) failed");
+    assert_eq!(n, 16, "fs_open: short read on bundle header (got {n})");
+    assert_eq!(
+        &header[0..8],
+        b"SRPHBNDL",
+        "fs_open: bootstrap.bundle magic mismatch (got {:?})",
+        &header[0..8]
     );
-    std::os::seraph::log!("fs_open: read {n} bytes from /esp/EFI/seraph/boot.conf");
+    std::os::seraph::log!("fs_open: read bundle header magic+version+entry_count");
 
     match std::fs::File::open("/esp/no_such_directory/missing.txt")
     {

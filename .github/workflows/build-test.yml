@@ -92,9 +92,9 @@ jobs:
         # `sysroot/etc/svcmgr/tests.d/` (svcmgr does not scan that
         # directory); cp into services.d/ to enable. `cargo xtask mkdisk`
         # re-mirrors rootfs and repacks the FAT image without invoking
-        # cargo. ktest is bootloader-loaded, so it needs the `init=`
-        # swap in boot.conf and a `cargo xtask mkdisk` to propagate the
-        # edited boot.conf into the sysroot.
+        # cargo. ktest swaps the bundle's `init` entry via
+        # `cargo xtask compose-bundle --harness ktest`, which repacks
+        # the disk image as part of the compose step.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
@@ -108,13 +108,7 @@ jobs:
               cargo xtask mkdisk --arch ${{ matrix.arch }}
               ;;
             ktest)
-              sed -i \
-                -e 's|^init=init$|#init=init|' \
-                -e 's|^#init=ktest$|init=ktest|' \
-                -e 's|^cmdline=root=|#cmdline=root=|' \
-                -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
-                rootfs/esp/EFI/seraph/boot.conf
-              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
               ;;
           esac
 

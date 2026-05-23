@@ -115,15 +115,19 @@ sysroot/
         BOOTRISCV64.EFI   # RISC-V
       seraph/             # Seraph vendor directory
         boot.efi          # Bootloader (also copied to EFI/BOOT/<arch>.EFI)
-        boot.conf         # Boot config (from rootfs/) — selects init mode
         kernel            # Microkernel
-        init              # First userspace process
-        ktest             # Kernel-validation harness
-        procmgr, memmgr, devmgr, vfsd, virtio-blk
-                          # Boot-loaded services (loaded directly by the
-                          # bootloader as boot modules)
-        fatfs             # Boot-loaded once to mount root; also lives
-                          # under /bin/fatfs for VFS-loaded re-spawns
+        bootstrap.bundle  # Init + every boot module, packed by
+                          # `cargo xtask build` (or `compose-bundle`)
+                          # per `abi/boot-protocol::bundle`. Exactly
+                          # one of {init, ktest} appears as the
+                          # bundle's `init` entry; ktest is monolithic
+                          # so its bundle has zero module entries.
+  services/               # Canonical home for bootloader-loaded userspace
+                          # components (init, ktest, procmgr, memmgr,
+                          # devmgr, vfsd, virtio-blk, fatfs). The bundle
+                          # composer reads from here; fatfs is also
+                          # available at /bin/fatfs for VFS-loaded
+                          # respawn until #125's rename.
   bin/                    # Std-userspace binaries loaded by procmgr from
                           # the root partition via VFS at runtime
                           # (svcmgr, fatfs, svctest, hello, crasher,
@@ -248,8 +252,8 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, runs one svctest iteration against the default `boot.conf`, then swaps `boot.conf` to `init=ktest` and runs one ktest iteration. |
-| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: per `arch × profile` cell, builds and runs `4 × 20` svctest iterations against the default `boot.conf`, then swaps to ktest and runs `4 × 20` ktest iterations. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask test`; the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe + `mkdisk` (svctest, usertest) or re-composes the bundle via `compose-bundle --harness ktest`, and runs one iteration. |
+| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: per `arch × profile` cell, builds and runs `4 × 20` svctest iterations against the default bundle, then re-composes with `--harness ktest` and runs `4 × 20` ktest iterations. |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch | Builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 
 `build-test.yml` cancels stacked runs on the same ref

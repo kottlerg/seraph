@@ -94,6 +94,12 @@ paying for a full `cargo xtask build` (which would also run cargo
 fmt + clippy + check + binary install). Requires a populated,
 arch-tagged sysroot from a prior `cargo xtask build`.
 
+`mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
+fails if the bundle is missing. The bundle is composed by
+`cargo xtask build` (default-init) or by
+[`cargo xtask compose-bundle`](#cargo-xtask-compose-bundle) (any
+harness).
+
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64]
 ```
@@ -112,6 +118,51 @@ cargo xtask run --arch x86_64
 
 See [docs/testing.md](../docs/testing.md) for the test-harness gating
 contract.
+
+---
+
+### `cargo xtask compose-bundle`
+
+Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from canonical
+binaries under `sysroot/services/` and repack `disk.img`. Symmetric
+with `mkdisk`: both end with `create_disk_image`, the difference being
+which file they author. `compose-bundle` is the bundle authoring step;
+`mkdisk` never authors the bundle.
+
+```
+cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
+| `--harness` | `init` | Which binary becomes the bundle's `init` entry: `init` for the regular userspace init, `ktest` for the kernel-test harness |
+
+`--harness init` produces a 7-entry bundle (`init` + 6 boot modules in
+the order the bootloader expects). `--harness ktest` produces a
+single-entry bundle (`ktest` as the `init` entry, zero modules); ktest
+is monolithic and does not spawn userspace.
+
+Both `cargo xtask build` and `compose-bundle` are *authoring* steps —
+both deliberately overwrite the bundle. `mkdisk` is the
+refresh-from-sysroot path and never authors.
+
+Example — switch to ktest, run, then switch back to regular init:
+
+```sh
+cargo xtask compose-bundle --arch x86_64 --harness ktest
+cargo xtask run --arch x86_64 --headless
+
+# Reset to default-init for the next boot:
+cargo xtask compose-bundle --arch x86_64 --harness init
+cargo xtask run --arch x86_64
+```
+
+ktest's runtime options (`shutdown_policy`, `timeout_secs`, filter
+tiers, bench iteration count) bake in as compile-time defaults in
+`core/ktest/src/cmdline.rs::KtestConfig::DEFAULT` (CI-friendly:
+shutdown=Always, timeout=0, full filter, 1000 bench iters). To change
+them, edit the constant and `cargo xtask build --component ktest`.
 
 ---
 

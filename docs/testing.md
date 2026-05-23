@@ -12,7 +12,7 @@ Three harnesses exercise three surfaces:
 
 | Harness | Surface | Crate | Launch mechanism |
 |---|---|---|---|
-| `ktest` | Kernel | `core/ktest/` | Bootloader-loaded init replacement (`init=ktest` in `boot.conf`) |
+| `ktest` | Kernel | `core/ktest/` | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
 | `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `services.d/` recipe |
 | `usertest` | Programs | `services/usertest/` | `svcmgr` spawns from `services.d/` recipe; drives binaries under `programs/` through their real I/O surfaces |
 
@@ -134,10 +134,20 @@ cp sysroot/etc/svcmgr/tests.d/svctest.svc sysroot/etc/svcmgr/services.d/
 cargo xtask run
 ```
 
-`ktest` is gated separately: its launch mechanism is the bootloader's
-`init=` selector, not `svcmgr`. To run `ktest`, edit
-`sysroot/EFI/seraph/boot.conf` to set `init=ktest` and enable a
-`cmdline=ktest.…` line.
+`ktest` is gated separately: it lives in the bootloader-loaded bundle,
+not in `svcmgr`'s recipe set. To run `ktest`, swap which binary backs
+the bundle's `init` entry:
+
+```sh
+cargo xtask build
+cargo xtask compose-bundle --harness ktest
+cargo xtask run
+```
+
+Reset to the default-init bundle by re-running `cargo xtask build` or
+`compose-bundle --harness init`. ktest's runtime options bake in as
+compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
+(see [xtask/README.md](../xtask/README.md#cargo-xtask-compose-bundle)).
 
 ### One harness per boot
 

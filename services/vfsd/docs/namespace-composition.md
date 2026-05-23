@@ -42,11 +42,14 @@ when `MOUNT path="/"` succeeds. `MAX_TREE_NODES` is `32` and
 `MAX_ENTRY_NAME` is `64` bytes; both are file-local constants in
 [`services/vfsd/src/root_backend.rs`](../src/root_backend.rs).
 
-Multi-component mount paths (`/srv/data`) install through the tree
-by walking components, creating synthetic intermediates on demand,
-and setting `terminal_cap` on the final node. After install the
-caller (`do_mount`) walks the root mount component-by-component via
+Multi-component mount paths install through the tree by walking
+components, creating synthetic intermediates on demand, and setting
+`terminal_cap` on the final node. After install the caller
+(`do_mount`) walks the root mount component-by-component via
 `NS_LOOKUP` to populate each new intermediate's `fallthrough_cap`.
+The in-tree mount set after the GPT-type-GUID redesign is two
+single-component mounts (`/`, `/esp`); the multi-component install
+path remains supported but is currently unexercised in production.
 
 ---
 
@@ -89,13 +92,10 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    The fall-through preserves the namespace-model rule that root-fs
    entries remain reachable unless explicitly shadowed by a
    registered mount: paths like `/bin/svcmgr` reach the root fs
-   through the synthetic root's fall-through, and paths like
-   `/srv/test.txt` reach the root fs's `/srv/test.txt` through the
-   synthetic intermediate created for `/srv/data`'s mount.
-
-   Mount-point names take precedence so that a future `/bin` mount
-   (if installed) shadows the root-fs entry without changing the
-   root filesystem's on-disk contents.
+   through the synthetic root's fall-through. Mount-point names
+   take precedence so that a future `/bin` mount (if installed)
+   shadows the root-fs entry without changing the root filesystem's
+   on-disk contents.
 
 3. If neither stage matches, the dispatch loop falls through to the
    protocol crate, which replies `NotFound`.
@@ -113,8 +113,9 @@ A successful `MOUNT` mints **two** tokened SEND caps on the driver's
 namespace endpoint, both addressing the driver's root at full
 namespace rights:
 
-- `caller_root_cap` is returned to the `MOUNT` caller (or dropped if
-  the caller is `INGEST_CONFIG_MOUNTS` itself).
+- `caller_root_cap` is returned to the `MOUNT` caller (or dropped on
+  the internal `auto_mount_esp` path that handles the `/esp` mount
+  without a synchronous caller).
 - `synthetic_root_cap` is captured into [`VfsdRootBackend`] so the
   composition above can `cap_derive` from it on every `NS_LOOKUP`.
 
@@ -151,8 +152,9 @@ per-cap revocation.
 
 vfsd holds two un-tokened endpoints:
 
-- **Service endpoint** — `MOUNT`, `INGEST_CONFIG_MOUNTS`,
-  `GET_SYSTEM_ROOT_CAP`. Multi-threaded recv (4 handlers today) so
+- **Service endpoint** — `MOUNT` and `GET_SYSTEM_ROOT_CAP`
+  (`INGEST_CONFIG_MOUNTS` was retired alongside `mounts.conf`).
+  Multi-threaded recv (4 handlers today) so
   that a handler blocked on a worker pool order does not deadlock
   the system: `CREATE_FROM_FILE` for a fatfs respawn re-enters
   vfsd's namespace dispatcher (procmgr issues `FS_READ` against the
@@ -197,7 +199,7 @@ seeing different roots) and `cap_revoke`-driven unmount.
 | [shared/namespace-protocol/README.md](../../../shared/namespace-protocol/README.md) | NS_* wire surface and dispatch crate |
 | [docs/namespace-model.md](../../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing |
 | [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Filesystem-driver-specific labels (FS_READ, FS_READ_FRAME, …) |
-| [services/vfsd/docs/vfs-ipc-interface.md](vfs-ipc-interface.md) | vfsd service-endpoint surface (MOUNT, INGEST_CONFIG_MOUNTS) |
+| [services/vfsd/docs/vfs-ipc-interface.md](vfs-ipc-interface.md) | vfsd service-endpoint surface (MOUNT, GET_SYSTEM_ROOT_CAP) |
 
 ---
 

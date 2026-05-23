@@ -47,8 +47,10 @@ Init's responsibilities are strictly bounded:
    is zero, which is correct for kernel-adjacent services that have no
    business reading the filesystem.
 
-4. **Acquire the seed system-root cap** — after the cmdline-driven
-   root mount completes, init issues
+4. **Acquire the seed system-root cap** — after the role-driven
+   root mount completes (init sends `MOUNT(MountRole::Root, "/")`;
+   vfsd resolves the role to the arch-specific Seraph root GPT
+   type-GUID), init issues
    `vfsd_labels::GET_SYSTEM_ROOT_CAP` to vfsd. The returned tokened
    SEND on vfsd's namespace endpoint at `NodeId::ROOT` with full
    rights is init's seed: every later Phase 3 child receives a

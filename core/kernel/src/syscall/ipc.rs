@@ -980,8 +980,8 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // On resume, either `signal_send` stored delivered bits in wakeup_value,
-    // or the timer path left wakeup_value at 0 (timeout). Both paths clear
-    // `sleep_deadline` as part of claiming the wake.
+    // or the timer path cleared wakeup_value to 0 (timeout). Both paths
+    // clear `sleep_deadline` as part of claiming the wake.
     // SAFETY: tcb still valid after resume; wakeup_value set by the waker.
     let bits = unsafe { (*tcb).wakeup_value };
     // SAFETY: tcb validated above.

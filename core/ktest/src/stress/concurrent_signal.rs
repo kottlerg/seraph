@@ -38,7 +38,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "concurrent_signal: create done failed")?;
 
-    // Spawn 4 sender threads.
+    // Spawn `NUM_SENDERS` sender threads.
     let mut threads = [0u32; NUM_SENDERS];
     let mut cspaces = [0u32; NUM_SENDERS];
 
@@ -65,8 +65,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // Wait for all senders to report done. Each child ORs a unique bit into
-    // `done`, so we wait until all 4 bits are set (one blocking wait suffices
-    // since the last child to finish will set the final bit).
+    // `done`, so we wait until every `NUM_SENDERS` bit is set (one blocking
+    // wait suffices since the last child to finish will set the final bit).
     let mut done_bits: u64 = 0;
     while done_bits != ALL_BITS
     {

@@ -23,6 +23,9 @@ const RIGHTS_WAIT: u64 = 1 << 8;
 // Child stack for blocking-wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
+// Separate child stack for the parked-wakeup variant of the bit-63 test.
+static mut HIGH_BIT_CHILD_STACK: ChildStack = ChildStack::ZERO;
+
 // ── SYS_SIGNAL_SEND ───────────────────────────────────────────────────────────
 
 /// `signal_send` ORs bits into a signal object. Non-blocking.
@@ -253,6 +256,40 @@ pub fn wait_high_bit_roundtrip(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// Parked-wakeup variant: parent enters `signal_wait` first, then a child
+/// thread sends `1u64 << 63`. Exercises the post-resume return path
+/// (where `wakeup_value` is read after `schedule()`) — distinct from the
+/// immediate-bits fast path covered by `wait_high_bit_roundtrip`.
+pub fn wait_high_bit_parked_wakeup(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for wait_high_bit_parked_wakeup failed")?;
+
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "spawn::new_child for wait_high_bit_parked_wakeup failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
+        .map_err(|_| "cap_copy signal into child CSpace failed")?;
+
+    let stack_top = ChildStack::top(core::ptr::addr_of!(HIGH_BIT_CHILD_STACK));
+    crate::spawn::configure_and_start(
+        &child,
+        high_bit_sender_entry,
+        stack_top,
+        u64::from(child_sig),
+    )
+    .map_err(|_| "configure_and_start for wait_high_bit_parked_wakeup failed")?;
+
+    let bits = signal_wait(sig).map_err(|_| "signal_wait (parked) failed")?;
+    if bits != 1u64 << 63
+    {
+        return Err("parked-wakeup signal_wait did not deliver bit 63 (regression on #127)");
+    }
+
+    cap_delete(sig).map_err(|_| "cap_delete sig after wait_high_bit_parked_wakeup failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after wait_high_bit_parked_wakeup failed")?;
+    Ok(())
+}
+
 /// Pre-signalled bits must be returned immediately, ahead of the timeout.
 pub fn wait_timeout_returns_bits_first(ctx: &TestContext) -> TestResult
 {
@@ -282,5 +319,15 @@ pub fn wait_timeout_returns_bits_first(ctx: &TestContext) -> TestResult
 fn sender_entry(sig_slot: u64) -> !
 {
     signal_send(sig_slot as u32, 0xBEEF).ok();
+    thread_exit()
+}
+
+/// Child thread: sends `1u64 << 63` on `sig_slot` then exits. Used by
+/// `wait_high_bit_parked_wakeup` to drive the post-resume return path.
+// cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
+#[allow(clippy::cast_possible_truncation)]
+fn high_bit_sender_entry(sig_slot: u64) -> !
+{
+    signal_send(sig_slot as u32, 1u64 << 63).ok();
     thread_exit()
 }

@@ -17,6 +17,12 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 const NUM_CHILDREN: usize = 16;
 const MAP_ITERATIONS: usize = 1000;
 
+// done_bit is packed at bits 48..63 of the spawn arg (16-bit lane), so
+// `1u64 << i` must fit in 16 bits — bounding NUM_CHILDREN at 16. Raising
+// past 16 requires widening the lane or switching to bit-index packing
+// (see concurrent_signal.rs for the larger-lane idiom).
+const _: () = assert!(NUM_CHILDREN <= 16);
+
 /// Base VA for stress mappings, well above normal test VAs.
 const STRESS_MAP_BASE: u64 = 0x5000_0000;
 /// Spacing between each child's VA (16-page stride).
@@ -52,7 +58,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         let done_bit = 1u64 << i;
         let va = STRESS_MAP_BASE + (i as u64) * VA_STRIDE;
-        // Pack: done_slot[15:0], child_frame[31:16], child_aspace[47:32], done_bit[55:48]
+        // Pack: done_slot[15:0], child_frame[31:16], child_aspace[47:32], done_bit[63:48]
         let arg = u64::from(child_done)
             | (u64::from(child_frame) << 16)
             | (u64::from(child_aspace) << 32)

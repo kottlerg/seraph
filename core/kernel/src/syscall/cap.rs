@@ -649,12 +649,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
 
     // Register in the global registry so derivation lookups resolve.
-    // `register_cspace` now returns `Err` if `id >= MAX_CSPACES`
-    // (previously silently dropped, which made cross-CSpace derivation
-    // links unable to resolve into the new CSpace and was the actual
-    // root cause of #128 at the ramped stress concurrencies). Roll back
-    // the in-place wrapper/CSpace and the retype carve on registration
-    // failure so the source frame's accounting stays intact.
+    // Overflow → `SyscallError::OutOfMemory` with full rollback below.
     if crate::cap::register_cspace(id, cs_ptr).is_err()
     {
         // SAFETY: wrapper/cs not observed externally yet (registry

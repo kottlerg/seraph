@@ -217,10 +217,12 @@ selection policy is, in priority order: (1) hard affinity
 of the global `min_load`, and (4) the least-loaded CPU. The
 `LOAD_BALANCE_IMBALANCE_THRESHOLD` knob is shared with `try_pull_balance`
 so the wake-side stickiness and the pull-balancer's imbalance test
-agree on what counts as "real" load asymmetry. Issue #128 motivated the
-sticky-CPU rule: without it a thread blocked inside a busy multi-CPU
-runqueue can be re-placed on a different CPU at every wake and never
-land on a queue it can drain.
+agree on what counts as "real" load asymmetry. The sticky-CPU rule
+originated from the #128 investigation as an independent
+cache-warmth alignment with the documented soft-affinity intent in
+`scheduler.md` § Soft Affinity; #128's actual root cause turned out
+to be unrelated (`CSpaceId` namespace exhaustion, see commits on
+that issue).
 
 Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs:444+`):
 

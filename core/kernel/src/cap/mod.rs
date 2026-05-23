@@ -127,28 +127,19 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 
 /// Maximum number of `CSpaceId` slots ever allocated in a kernel lifetime.
 ///
-/// The registry size bounds the `CSpaceId` namespace because the allocator
-/// is currently monotonic ([`NEXT_CSPACE_ID`] `fetch_add`) — IDs are not
-/// recycled on `unregister_cspace`. Cumulative-ever count, not live count:
-/// every `cap_create_cspace` consumes a fresh ID, so cap-creation churn
-/// (e.g. ktest stress's repeated child-CSpace allocation) eventually
-/// exhausts the namespace.
-///
-/// 65536 entries × 8 bytes = 512 KiB BSS for [`CSPACE_REGISTRY`]. Sized to
-/// cover the ramped ktest stress sequence (~14k `CSpace`s cumulatively) plus
-/// 4× headroom; a future change to recycle IDs (proper free-list /
-/// generation counters in `SlotId`) would let this shrink again. Tracked
-/// as a follow-up to #128 — see PR #136 body.
+/// The allocator is monotonic ([`NEXT_CSPACE_ID`] `fetch_add`); freed IDs
+/// are not reused. This is a cumulative-ever bound, not a live-`CSpace`
+/// bound — every `cap_create_cspace` consumes a fresh ID. 65536 × 8 B =
+/// 512 KiB BSS for [`CSPACE_REGISTRY`], sized to cover the ramped ktest
+/// stress sequence (~14k `CSpace`s cumulatively) with 4× headroom. Issue
+/// #137 tracks switching to a recycling allocator (needs either
+/// generation counters in `SlotId` or a pre-unregister drain of external
+/// derivation back-links — both touch substantial code paths).
 const MAX_CSPACES: usize = 65536;
 
-/// Monotonically increasing `CSpace` ID allocator. Root gets ID 0.
-///
-/// Currently does not recycle: a freed `CSpaceId` is never re-issued.
-/// Recycling would require either generation counters in `SlotId` to make
-/// stale references fail-fast, or an explicit walk of every other
-/// `CSpace`'s derivation tree to clear cross-`CSpace` back-links to the
-/// freed `CSpace` before reuse. Both are tracked as a follow-up; until
-/// then [`MAX_CSPACES`] is sized to absorb cumulative churn.
+/// Monotonically increasing `CSpace` ID allocator. Root gets ID 0. See
+/// [`MAX_CSPACES`] for the namespace-bound rationale and #137 for the
+/// recycling follow-up.
 static NEXT_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Global registry mapping `CSpaceId` → raw *mut `CSpace.`
@@ -976,7 +967,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
     // branch iterate `mmap` directly — `ram_blocks` is empty.
     #[cfg(test)]
     {
-        let id = NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
+        let id = alloc_cspace_id();
         let mut cspace = Box::new(CSpace::new(id, ROOT_CSPACE_MAX_SLOTS));
         let empty: [RamBlock; 0] = [];
         let mut layout = populate_cspace(&mut cspace, &empty, mmap, mmio_apertures, info);

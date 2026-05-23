@@ -222,6 +222,37 @@ pub fn wait_timeout_fires(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+// ── SYS_SIGNAL_WAIT (high-bit payload) ────────────────────────────────────────
+
+/// Bitmasks with bit 63 set (and `u64::MAX`) must round-trip cleanly through
+/// `signal_send` / `signal_wait`. Regression test for the dispatcher's
+/// historical `cast_signed()` aliasing of `Ok(bits)` with negative-Err
+/// codes, which surfaced bit-63-set bitmasks to userspace as `Err(i64::MIN)`.
+pub fn wait_high_bit_roundtrip(ctx: &TestContext) -> TestResult
+{
+    let sig = cap_create_signal(ctx.memory_frame_base)
+        .map_err(|_| "create_signal for wait_high_bit_roundtrip failed")?;
+
+    // Bit 63 alone — the aliasing case.
+    signal_send(sig, 1u64 << 63).map_err(|_| "signal_send(1<<63) failed")?;
+    let bits = signal_wait(sig).map_err(|_| "signal_wait after send(1<<63) failed")?;
+    if bits != 1u64 << 63
+    {
+        return Err("signal_wait did not round-trip bit 63 (regression on #127)");
+    }
+
+    // All bits set — covers any bit-by-bit truncation in the new path.
+    signal_send(sig, u64::MAX).map_err(|_| "signal_send(u64::MAX) failed")?;
+    let bits = signal_wait(sig).map_err(|_| "signal_wait after send(u64::MAX) failed")?;
+    if bits != u64::MAX
+    {
+        return Err("signal_wait did not round-trip u64::MAX bitmask");
+    }
+
+    cap_delete(sig).map_err(|_| "cap_delete after wait_high_bit_roundtrip failed")?;
+    Ok(())
+}
+
 /// Pre-signalled bits must be returned immediately, ahead of the timeout.
 pub fn wait_timeout_returns_bits_first(ctx: &TestContext) -> TestResult
 {

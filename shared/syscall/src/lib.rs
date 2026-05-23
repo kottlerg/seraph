@@ -718,19 +718,22 @@ pub fn signal_send(sig: u32, bits: u64) -> Result<(), i64>
 
 /// Block until any bits are set on a signal cap. Returns the acquired bitmask.
 ///
+/// The primary return register holds status (`0` on success, negative
+/// `SyscallError` on failure); the bitmask is delivered in the secondary
+/// register (rdx / a1). Mirrors `event_recv`; the split avoids aliasing
+/// bit-63-set bitmasks with the dispatcher's negative-Err encoding.
+///
 /// # Errors
 /// Returns a negative `i64` error code if the signal cap is invalid or the
 /// wait is interrupted.
-// cast_sign_loss: ret is proven non-negative in the Ok branch; reinterpreting
-// as u64 preserves the bitmask bit-for-bit.
-#[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn signal_wait(sig: u32) -> Result<u64, i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; sig is cap index as u64;
-    // kernel validates cap, blocks until signal bits available, returns bitmask.
-    let ret = unsafe { syscall2(SYS_SIGNAL_WAIT, u64::from(sig), 0) };
-    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; sig is cap
+    // index as u64, arg1 = 0 selects indefinite blocking; kernel validates
+    // cap and writes the bitmask into the secondary return register.
+    let (ret, bits) = unsafe { syscall5_ret2(SYS_SIGNAL_WAIT, u64::from(sig), 0, 0, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
 /// Block until any bits are set on a signal cap, or until `timeout_ms`
@@ -740,17 +743,21 @@ pub fn signal_wait(sig: u32) -> Result<u64, i64>
 /// `timeout_ms == 0` is equivalent to [`signal_wait`] — block indefinitely.
 /// Callers that want a non-blocking poll should use `timeout_ms = 1`.
 ///
+/// Same register layout as [`signal_wait`]: status in the primary register,
+/// bitmask in the secondary. Timeout is signalled in-band as `bits == 0`
+/// (legitimate because `signal_send` rejects zero-bit sends).
+///
 /// # Errors
 /// Returns a negative `i64` error code if the signal cap is invalid or
 /// the wait is interrupted.
-#[allow(clippy::cast_sign_loss)]
 #[inline]
 pub fn signal_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 {
-    // SAFETY: same as `signal_wait`; arg1 carries the timeout (0 =
-    // infinite, matching the original single-arg behaviour).
-    let ret = unsafe { syscall2(SYS_SIGNAL_WAIT, u64::from(sig), timeout_ms) };
-    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+    // SAFETY: same as `signal_wait`; arg1 carries the timeout sentinel
+    // (0 = infinite, matching the single-arg behaviour).
+    let (ret, bits) =
+        unsafe { syscall5_ret2(SYS_SIGNAL_WAIT, u64::from(sig), timeout_ms, 0, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
 /// Retype a Frame cap into a new Endpoint. Returns the `CSpace` slot index.

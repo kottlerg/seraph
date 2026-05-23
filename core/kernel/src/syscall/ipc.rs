@@ -884,13 +884,18 @@ pub fn sys_signal_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_SIGNAL_WAIT` (4): block until a signal bit is set, then return the bits.
 ///
-/// arg0 = signal cap index.
-/// arg1 = `timeout_ms`. `0` blocks indefinitely (original behaviour). `> 0`
-///        blocks until bits are delivered *or* `timeout_ms` milliseconds
-///        have elapsed. On timeout the syscall returns `0` — unambiguous
-///        because `signal_send` rejects zero-bit sends.
+/// arg0 = signal cap index (WAIT right).
+/// arg1 = `timeout_ms`. `0` blocks indefinitely. `> 0` blocks until bits
+///        are delivered *or* `timeout_ms` milliseconds have elapsed.
 ///
-/// Returns the acquired bitmask in rax/a0 (0 = timeout).
+/// On success returns `0` in rax/a0 and the bitmask in the secondary return
+/// register (rdx/a1). On timeout returns `0` in both registers — unambiguous
+/// because `signal_send` rejects zero-bit sends, so a legitimate wake always
+/// carries non-zero bits. The split is required because the bitmask is an
+/// unrestricted `u64`: an in-band encoding via `cast_signed` would alias
+/// bit-63-set payloads with the dispatcher's negative-Err codes. Same
+/// register layout as `sys_event_recv`; see that handler for the broader
+/// pattern.
 #[cfg(not(test))]
 pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -924,8 +929,9 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     if let Ok(bits) = result
     {
-        // Bits were already set; return immediately.
-        return Ok(bits);
+        // Bits were already set; deliver bitmask in secondary register.
+        tf.set_ipc_return(0, bits);
+        return Ok(0);
     }
 
     // For a timed wait, arm the sleep list. Re-acquire sig.lock and check
@@ -974,15 +980,16 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // On resume, either `signal_send` stored delivered bits in wakeup_value,
-    // or the timer path cleared wakeup_value to 0 (timeout). Both paths
-    // clear `sleep_deadline` as part of claiming the wake.
+    // or the timer path left wakeup_value at 0 (timeout). Both paths clear
+    // `sleep_deadline` as part of claiming the wake.
     // SAFETY: tcb still valid after resume; wakeup_value set by the waker.
     let bits = unsafe { (*tcb).wakeup_value };
     // SAFETY: tcb validated above.
     unsafe {
         (*tcb).wakeup_value = 0;
     }
-    Ok(bits)
+    tf.set_ipc_return(0, bits);
+    Ok(0)
 }
 
 // ── Event Queue handlers ──────────────────────────────────────────────────────

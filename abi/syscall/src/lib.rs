@@ -69,9 +69,15 @@ pub const SYS_SIGNAL_SEND: u64 = 3;
 /// arg0 = signal cap index (WAIT right). arg1 = `timeout_ms`: `0` means
 /// block indefinitely (the only behaviour before the timeout extension);
 /// `> 0` means block until bits are delivered *or* `timeout_ms`
-/// milliseconds have elapsed, whichever comes first. On timeout the
-/// syscall returns `0` (unambiguous — `signal_send` rejects zero-bit
-/// sends, so a legitimate wake always carries non-zero bits).
+/// milliseconds have elapsed, whichever comes first.
+///
+/// On success returns `0` in the primary return register and the bitmask
+/// in the secondary register (rdx / a1); on timeout returns `0` in both
+/// (unambiguous because `signal_send` rejects zero-bit sends, so a
+/// legitimate wake always carries non-zero bits). The split avoids
+/// aliasing bit-63-set bitmasks with the dispatcher's negative-Err
+/// encoding — the full 64-bit bitmask range is usable. Same register
+/// layout as `SYS_EVENT_RECV`.
 pub const SYS_SIGNAL_WAIT: u64 = 4;
 /// `EventQueue`: post an entry.
 pub const SYS_EVENT_POST: u64 = 5;

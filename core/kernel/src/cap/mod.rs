@@ -125,11 +125,31 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
     }
 }
 
-/// Monotonically increasing `CSpace` ID allocator. Root gets ID 0.
-static NEXT_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
+/// Maximum number of `CSpaceId` slots ever allocated in a kernel lifetime.
+///
+/// The registry size bounds the `CSpaceId` namespace because the allocator
+/// is currently monotonic ([`NEXT_CSPACE_ID`] `fetch_add`) — IDs are not
+/// recycled on `unregister_cspace`. Cumulative-ever count, not live count:
+/// every `cap_create_cspace` consumes a fresh ID, so cap-creation churn
+/// (e.g. ktest stress's repeated child-CSpace allocation) eventually
+/// exhausts the namespace.
+///
+/// 65536 entries × 8 bytes = 512 KiB BSS for [`CSPACE_REGISTRY`]. Sized to
+/// cover the ramped ktest stress sequence (~14k `CSpace`s cumulatively) plus
+/// 4× headroom; a future change to recycle IDs (proper free-list /
+/// generation counters in `SlotId`) would let this shrink again. Tracked
+/// as a follow-up to #128 — see PR #136 body.
+const MAX_CSPACES: usize = 65536;
 
-/// Maximum number of live `CSpaces.` Sized for practical OS use.
-const MAX_CSPACES: usize = 4096;
+/// Monotonically increasing `CSpace` ID allocator. Root gets ID 0.
+///
+/// Currently does not recycle: a freed `CSpaceId` is never re-issued.
+/// Recycling would require either generation counters in `SlotId` to make
+/// stale references fail-fast, or an explicit walk of every other
+/// `CSpace`'s derivation tree to clear cross-`CSpace` back-links to the
+/// freed `CSpace` before reuse. Both are tracked as a follow-up; until
+/// then [`MAX_CSPACES`] is sized to absorb cumulative churn.
+static NEXT_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Global registry mapping `CSpaceId` → raw *mut `CSpace.`
 ///
@@ -156,13 +176,21 @@ static CSPACE_REGISTRY: [AtomicPtr<CSpace>; MAX_CSPACES] = {
 
 /// Register a `CSpace` pointer under its ID.
 ///
-/// Called immediately after a [`CSpace`] is heap-allocated. Panics (in debug)
-/// or silently drops (in release) if `id >= MAX_CSPACES`.
-pub fn register_cspace(id: CSpaceId, ptr: *mut CSpace)
+/// Called immediately after a [`CSpace`] is heap-allocated. Returns
+/// `Err(())` if `id >= MAX_CSPACES` so the caller can surface
+/// `SyscallError::OutOfMemory` and roll back, rather than silently leaving
+/// the derivation tree unable to resolve the new `CSpace` (the
+/// pre-#128-fix behaviour that masked the namespace-exhaustion bug).
+pub fn register_cspace(id: CSpaceId, ptr: *mut CSpace) -> Result<(), ()>
 {
     if (id as usize) < MAX_CSPACES
     {
         CSPACE_REGISTRY[id as usize].store(ptr, Ordering::Release);
+        Ok(())
+    }
+    else
+    {
+        Err(())
     }
 }
 
@@ -176,6 +204,16 @@ pub fn unregister_cspace(id: CSpaceId)
     {
         CSPACE_REGISTRY[id as usize].store(core::ptr::null_mut(), Ordering::Release);
     }
+}
+
+/// Allocate a unique `CSpace` ID.
+///
+/// Called by `SYS_CAP_CREATE_CSPACE` when creating new `CSpace` objects at
+/// runtime. The root `CSpace` is assigned ID 0 at init time via this same
+/// counter. See [`NEXT_CSPACE_ID`] for the recycling caveat.
+pub fn alloc_cspace_id() -> CSpaceId
+{
+    NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Resolve a `CSpaceId` to a raw pointer.
@@ -193,11 +231,6 @@ pub fn lookup_cspace(id: CSpaceId) -> Option<*mut CSpace>
     if ptr.is_null() { None } else { Some(ptr) }
 }
 
-/// Allocate a unique `CSpace` ID.
-///
-/// Called by `SYS_CAP_CREATE_CSPACE` when creating new `CSpace` objects at
-/// runtime. The root `CSpace` is assigned ID 0 at init time via this same
-/// counter.
 /// Sum [`FrameObject::available_bytes`] across every [`CapTag::Frame`] cap
 /// in `cspace`. Used by Phase 9 to print the boot-handover ledger so that
 /// "RAM granted to userspace as retypable bytes" can be reconciled against
@@ -223,11 +256,6 @@ pub fn sum_frame_available_bytes(cspace: &cspace::CSpace) -> u64
         }
     });
     sum
-}
-
-pub fn alloc_cspace_id() -> CSpaceId
-{
-    NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Maximum slots in the root `CSpace` (full two-level directory).
@@ -915,7 +943,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         let block_count = unsafe { drain_and_install_seed(ram_buf) };
         let ram_blocks: &[RamBlock] = &ram_buf[..block_count];
 
-        let id = NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
+        let id = alloc_cspace_id();
         // SAFETY: SEED installed above.
         let (_cs_kobj_nn, cs_ptr) = unsafe {
             boot_retype_cspace(
@@ -925,7 +953,8 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
                 id,
             )
         };
-        register_cspace(id, cs_ptr);
+        register_cspace(id, cs_ptr)
+            .unwrap_or_else(|()| crate::fatal("root CSpace register: id exceeds MAX_CSPACES"));
 
         // SAFETY: cs_ptr is freshly constructed and exclusively owned
         // (single-threaded Phase 7).

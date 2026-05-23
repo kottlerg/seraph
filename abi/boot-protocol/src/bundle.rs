@@ -123,7 +123,7 @@ pub enum BundleError
 ///
 /// Returns [`BundleError`] if the magic, version, length, alignment, or
 /// any entry's bounds fail validation.
-pub fn parse_header(bytes: &[u8]) -> Result<(BundleHeader, &[u8; 0]), BundleError>
+pub fn parse_header(bytes: &[u8]) -> Result<BundleHeader, BundleError>
 {
     let (header, entry_count) = parse_file_header(bytes)?;
 
@@ -157,11 +157,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(BundleHeader, &[u8; 0]), BundleErro
         }
     }
 
-    // The returned `&[u8; 0]` is a placeholder; callers iterate entry
-    // headers via [`entry_at`] indexed against the same input slice. This
-    // shape keeps the public API stable across no_std consumers that do
-    // not want to depend on a non-trivial typed slice.
-    Ok((header, &[]))
+    Ok(header)
 }
 
 /// Read the file header (magic + version + `entry_count`) without validating
@@ -276,7 +272,7 @@ mod tests
     fn parse_header_accepts_valid_bundle()
     {
         let buf = fixture();
-        let (hdr, _) = parse_header(&buf).expect("valid bundle");
+        let hdr = parse_header(&buf).expect("valid bundle");
         assert_eq!(hdr.magic, MAGIC);
         assert_eq!(hdr.version, VERSION);
         assert_eq!(hdr.entry_count, 1);

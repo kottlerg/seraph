@@ -184,12 +184,13 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     unsafe { core::slice::from_raw_parts(ptr, count) }
 }
 
-/// Locate a boot-module `Frame` capability by the bundle-entry name the
-/// bootloader stamped into [`CapDescriptor::name`] (init-protocol v7+).
+/// Locate a boot-module `Frame` capability by the bundle-entry name
+/// the kernel published in [`InitInfo::module_names`] (init-protocol
+/// v7+).
 ///
-/// Returns the descriptor's `CSpace` slot index, or `None` if no Frame
-/// descriptor carries the requested name. Replaces the historic
-/// ordinal-based lookups (`module_frame_base + N`).
+/// Returns the table entry's `CSpace` slot index, or `None` if no
+/// entry carries the requested name. This is init's only module-cap
+/// lookup; the v6 ordinal surface (`module_frame_base + N`) is gone.
 pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u32>
 {
     init_protocol::find_module_slot(info, name)

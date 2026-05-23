@@ -5,7 +5,10 @@
 
 //! ktest — Seraph kernel test binary.
 //!
-//! Loaded by the kernel in place of real init (set `init=ktest` in boot.conf).
+//! Loaded by the kernel in place of real init. Swap the harness by
+//! re-composing the bootloader bundle with `cargo xtask compose-bundle
+//! --harness ktest` (and revert via `--harness init`); the bundle's
+//! `init` entry decides which binary the bootloader hands off to.
 //! Receives the same initial capability set that init would, then:
 //!
 //! 1. **Tier 1** (`unit/`)        — exercises every kernel syscall in isolation.
@@ -273,9 +276,7 @@ fn run(info_ptr: u64) -> !
         sbi_control_cap: info.sbi_control_cap,
     };
 
-    // Parse config early so we can gate tier execution and pass bench_iters.
-    // SAFETY: info is valid for the lifetime of the process (kernel-mapped page).
-    let config = cmdline::parse(unsafe { init_protocol::cmdline_bytes(info) });
+    let config = cmdline::KtestConfig::DEFAULT;
 
     // ── Tier 1: per-syscall isolation ─────────────────────────────────────────
     if config.run_unit

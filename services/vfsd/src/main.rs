@@ -213,7 +213,7 @@ fn main() -> !
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
     // synthetic root. The service endpoint carries only `MOUNT` and
-    // `INGEST_CONFIG_MOUNTS`; the namespace endpoint is separated so
+    // `GET_SYSTEM_ROOT_CAP`; the namespace endpoint is separated so
     // a single dispatcher thread can serve every walk without
     // contending with mount-table mutations.
     let Some(namespace_slab) = std::os::seraph::object_slab_acquire(88)
@@ -324,9 +324,9 @@ pub struct VfsdRuntime
 /// re-entry via `FS_READ` while loading a driver from the now-mounted
 /// root) does not deadlock.
 ///
-/// Concurrency invariants. `MOUNT` and `INGEST_CONFIG_MOUNTS` both
-/// route into `do_mount`, which mutates shared runtime state under
-/// the `VfsdRuntime` mutexes:
+/// Concurrency invariants. `MOUNT` routes into `do_mount` (and
+/// `do_mount` calls itself recursively for the ESP auto-mount), which
+/// mutates shared runtime state under the `VfsdRuntime` mutexes:
 /// - `rt.boot_module_cap` — Mutex; swapped to zero on the first
 ///   successful mount.
 /// - `rt.root_backend` — Mutex; the synthetic-root tree's only

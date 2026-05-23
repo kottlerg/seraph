@@ -238,7 +238,7 @@ mod tests
         // Read back and parse.
         let mut buf = Vec::new();
         fs::File::open(&out).unwrap().read_to_end(&mut buf).unwrap();
-        let (hdr, _) = fmt::parse_header(&buf).expect("parse_header");
+        let hdr = fmt::parse_header(&buf).expect("parse_header");
         assert_eq!(hdr.magic, fmt::MAGIC);
         assert_eq!(hdr.version, fmt::VERSION);
         assert_eq!(hdr.entry_count, 2);

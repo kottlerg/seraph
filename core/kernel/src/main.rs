@@ -547,10 +547,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
             let desc_count = desc_slice.len();
             let desc_byte_len = core::mem::size_of_val(desc_slice);
-            // Boot protocol v8 removed `BootInfo.command_line`; the kernel
-            // hands init an empty cmdline slice. The init-protocol
-            // `cmdline_offset` / `cmdline_len` fields remain (init-protocol
-            // v6) but are always zero in production boots.
             let total_bytes = descriptors_offset as usize + desc_byte_len;
             let info_pages = total_bytes.div_ceil(mm::PAGE_SIZE).max(1);
 
@@ -635,14 +631,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 memory_frame_count: cspace_layout.memory_frame_count,
                 segment_frame_base,
                 segment_frame_count,
-                module_frame_base: cspace_layout.module_frame_base,
-                module_frame_count: cspace_layout.module_frame_count,
                 hw_cap_base: cspace_layout.hw_cap_base,
                 hw_cap_count: cspace_layout.hw_cap_count,
                 cap_descriptors_offset: descriptors_offset,
                 thread_cap: 0, // patched below after Thread cap is minted
-                cmdline_offset: 0,
-                cmdline_len: 0,
                 sbi_control_cap: cspace_layout.sbi_control_slot,
                 cspace_cap: 0, // patched below after CSpace cap is minted
                 irq_range_cap: cspace_layout.irq_range_slot,
@@ -655,9 +647,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 init_info_frame_base: 0,   // patched after self-mint below
                 init_info_frame_count: 0,  // patched after self-mint below
                 module_name_count: cspace_layout.module_name_count,
-                _pad_module_names: 0,
                 module_names: cspace_layout.module_names,
-                _pad_tail: 0,
             };
 
             // Write InitInfo header (always fits in first page).

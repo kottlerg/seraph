@@ -743,10 +743,6 @@ pub struct CSpaceLayout
     pub hw_cap_base: u32,
     /// Number of hardware resource capabilities.
     pub hw_cap_count: u32,
-    /// First slot index of boot module `Frame` capabilities.
-    pub module_frame_base: u32,
-    /// Number of boot module `Frame` capabilities.
-    pub module_frame_count: u32,
     /// Slot index of the `SchedControl` capability.
     pub sched_control_slot: u32,
     /// Slot index of the `SbiControl` capability (RISC-V only; 0 on x86-64).
@@ -1485,8 +1481,6 @@ fn populate_cspace(
         memory_frame_count,
         hw_cap_base,
         hw_cap_count,
-        module_frame_base: 0,
-        module_frame_count: 0,
         sched_control_slot,
         sbi_control_slot,
         irq_range_slot,
@@ -1539,8 +1533,11 @@ fn read_dtb_totalsize(phys: u64) -> Option<u64>
 /// [`CSpaceLayout::module_names`] so init can match modules by their
 /// bundle entry identifier instead of relying on ordinal position.
 ///
-/// Updates `layout.module_frame_base`, `layout.module_frame_count`, and
-/// appends [`CapDescriptor`] entries for each module.
+/// Updates `layout.module_names` / `layout.module_name_count` and
+/// appends [`CapDescriptor`] entries for each module. Init looks
+/// modules up by name via the published `module_names` table; the
+/// older `module_frame_base` / `module_frame_count` ordinal surface
+/// was retired with the init-protocol v6→v7 bump.
 fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
     use boot_protocol::BootModule;
@@ -1560,9 +1557,6 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             module_count,
         )
     };
-
-    let mut base_slot: u32 = 0;
-    let mut count: u32 = 0;
 
     for module in modules
     {
@@ -1616,10 +1610,6 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             ptr,
             "Phase 7: cannot allocate Frame capability for boot module",
         );
-        if count == 0
-        {
-            base_slot = slot;
-        }
         push_descriptor(
             &mut layout.descriptor_count,
             CapDescriptor {
@@ -1642,11 +1632,8 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             };
             layout.module_name_count += 1;
         }
-        count += 1;
     }
 
-    layout.module_frame_base = base_slot;
-    layout.module_frame_count = count;
     layout.total_populated = cspace.populated_count();
 }
 

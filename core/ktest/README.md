@@ -12,14 +12,18 @@ On completion ktest emits the cross-harness marker
 
 ## Activating ktest
 
-Edit `rootfs/esp/EFI/seraph/boot.conf` and change the `init` field:
+Re-compose the bootloader bundle with ktest as the `init` entry:
 
 ```
-init=ktest
+cargo xtask compose-bundle --harness ktest
+cargo xtask run
 ```
 
-Then rebuild (`cargo xtask build`) and run (`cargo xtask run`). Restore
-`init=init` when finished.
+Restore the default-init harness with `cargo xtask compose-bundle
+--harness init` (or any subsequent `cargo xtask build`, which always
+re-authors the default-init bundle). See
+[`xtask/README.md`](../../xtask/README.md) for the bundle-vs-mkdisk
+authoring discipline.
 
 ## Test structure
 
@@ -146,49 +150,42 @@ Defined in `src/main.rs`:
   wrapping the cspace + thread + configure + start sequence that ~30
   sites duplicated.
 
-## Command line options
+## Compile-time options
 
-ktest reads the kernel command line (passed via `boot.conf` `cmdline=`) for
-options prefixed with `ktest.`. All options are optional; defaults preserve the
-pre-shutdown behavior (halt in place, all tiers except stress).
+Boot-protocol v8 removed the kernel command line; ktest's runtime
+knobs now live in `KtestConfig::DEFAULT` in
+[`src/cmdline.rs`](src/cmdline.rs) and are baked in at compile time.
+Editing the constant and rebuilding ktest (`cargo xtask build -p
+ktest`) is the canonical way to flip them.
 
-| Option | Values | Default | Description |
+| Field | Values | Default | Description |
 |---|---|---|---|
-| `ktest.shutdown` | `always`, `pass`, `never` | `never` | When to shut down the system after tests complete |
-| `ktest.timeout` | decimal seconds | `0` | Seconds to wait before shutdown (allows reading output) |
-| `ktest.filter` | comma-separated tier names | `unit,integration,bench` | Which tiers to run (see below) |
-| `ktest.bench_iters` | decimal integer | `1000` | Number of iterations per benchmark |
+| `shutdown_policy` | `Always`, `Pass`, `Never` | `Always` | When to shut down the system after tests complete |
+| `timeout_secs` | `u64` | `0` | Seconds to wait before shutdown (allows reading output) |
+| `filter` | bitmask of `TIER_UNIT | TIER_INTEGRATION | TIER_STRESS | TIER_BENCH` | all four | Which tiers to run |
+| `bench_iters` | `u64` | `1000` | Number of iterations per benchmark |
+
+The defaults are picked for CI: every tier runs, the VM exits cleanly
+on completion, and no human-watch grace period is added. To keep QEMU
+open after a local interactive run, set `shutdown_policy:
+ShutdownPolicy::Never` and rebuild.
 
 ### Shutdown
 
-`ktest.shutdown=always` shuts down regardless of test outcome.
-`ktest.shutdown=pass` shuts down only if all tests passed; halts otherwise.
-`ktest.shutdown=never` halts in place after printing results.
+`ShutdownPolicy::Always` shuts down regardless of test outcome.
+`ShutdownPolicy::Pass` shuts down only if all tests passed; halts otherwise.
+`ShutdownPolicy::Never` halts in place after printing results.
 
 On x86-64 shutdown uses ACPI S5 (parsed from FADT/DSDT in userspace).
 On RISC-V shutdown uses SBI SRST via the `SYS_SBI_CALL` syscall.
 
 ### Tier filter
 
-`ktest.filter` accepts a comma-separated list of tier names: `unit`,
-`integration`, `stress`, `bench`. When present, only the listed tiers run.
-When absent, the default is `unit,integration,bench` (stress tests are excluded
-by default because they are slower).
-
-
-### Examples
-
-Default (unit + integration + benchmarks, no shutdown):
-
-```
-cmdline=ktest.shutdown=always ktest.timeout=3
-```
-
-Full run including stress tests:
-
-```
-cmdline=ktest.filter=unit,integration,stress,bench ktest.shutdown=pass ktest.timeout=3
-```
+The filter is a bitmask of `TIER_UNIT`, `TIER_INTEGRATION`,
+`TIER_STRESS`, `TIER_BENCH`. The default value
+(`TIER_UNIT | TIER_INTEGRATION | TIER_STRESS | TIER_BENCH`) runs
+every tier. Trimming the mask before recompiling is how a
+narrower-scope run is produced.
 
 ---
 

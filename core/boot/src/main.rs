@@ -470,9 +470,9 @@ unsafe fn step4_parse_bundle(
         core::slice::from_raw_parts(bundle_load.phys as *const u8, bundle_load.len as usize)
     };
 
-    let (header, _) = match bundle::parse_header(bytes)
+    let header = match bundle::parse_header(bytes)
     {
-        Ok(p) => p,
+        Ok(h) => h,
         Err(bundle::BundleError::TooSmall) =>
         {
             return Err(BootError::InvalidBundle("bundle truncated"));
@@ -708,9 +708,9 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 // ── Step 6: Allocate boot structures and build page tables ──────────────────
 
 /// Allocate the fixed pre-exit scratch pages (`BootInfo` page, modules
-/// descriptor page, memory-map page, aperture page, stack, command-line page),
-/// accumulate the identity-map region list, build initial page tables, and
-/// install the x86-64 handoff-trampoline mapping.
+/// descriptor page, memory-map page, aperture page, stack, reclaim-ranges
+/// page), accumulate the identity-map region list, build initial page
+/// tables, and install the x86-64 handoff-trampoline mapping.
 ///
 /// # Safety
 /// `ctx.bs` must be valid pre-exit; all addresses in `kernel`, `init`, and

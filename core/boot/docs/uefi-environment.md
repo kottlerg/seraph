@@ -39,60 +39,22 @@ The EFI System Partition is accessed as follows:
 1. image_handle → EFI_LOADED_IMAGE_PROTOCOL → DeviceHandle
 2. DeviceHandle → EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
 3. SimpleFileSystem->OpenVolume() → root EFI_FILE_PROTOCOL handle
-4. root->Open("\EFI\seraph\boot.conf") → parse BootConfig (kernel and init paths)
-5. root->Open(BootConfig.kernel_path) → kernel file handle
-6. root->Open(BootConfig.init_path) → init module file handle
+4. root->Open("\EFI\seraph\kernel") → kernel file handle (hardcoded path)
+5. root->Open("\EFI\seraph\bootstrap.bundle") → bundle file handle (hardcoded path)
 ```
 
 All files are opened as read-only. Sizes are determined via `EFI_FILE_INFO` before
 reading. Files are read into physical memory allocated by `AllocatePages`; see
 [elf-loading.md](elf-loading.md) for how segment placement works.
 
----
-
-## Boot Configuration File
-
-The bootloader reads `\EFI\seraph\boot.conf` from the ESP before opening any other
-files. This file specifies the paths to the kernel and init binaries, replacing any
-hardcoded path strings in the bootloader binary.
-
-### Format
-
-```
-# Comment lines begin with '#' and are ignored.
-# Blank lines are ignored.
-key=value
-```
-
-Leading and trailing whitespace (space, tab, `\r`) is stripped from both key and
-value. Keys and values are ASCII only; non-ASCII values are rejected.
-
-### Required Keys
-
-| Key | Description | Default in `boot.conf` |
-|---|---|---|
-| `kernel` | ESP-relative path to the kernel ELF | `\EFI\seraph\seraph-kernel` |
-| `init` | ESP-relative path to the init binary | `\sbin\init` |
-
-Both keys are required. A missing key is a fatal error (`InvalidConfig`). Unknown
-keys are silently ignored for forward compatibility.
-
-### Location and Size
-
-The file is always at `\EFI\seraph\boot.conf` on the ESP. The maximum file size is
-4096 bytes; a larger file is a fatal error. The file is read into a stack-allocated
-buffer — no heap allocation is needed.
-
-### Error Handling
-
-| Condition | Result |
-|---|---|
-| File not found | `FileNotFound("\EFI\seraph\boot.conf")` — fatal |
-| File exceeds 4096 bytes | `InvalidConfig("boot.conf exceeds maximum size")` — fatal |
-| Line missing `=` separator | `InvalidConfig("missing '=' in line")` — fatal |
-| Non-ASCII path value | `InvalidConfig("kernel path invalid")` / `"init path invalid"` — fatal |
-| Missing `kernel` key | `InvalidConfig("missing 'kernel' key")` — fatal |
-| Missing `init` key | `InvalidConfig("missing 'init' key")` — fatal |
+The bootloader carries only two ESP path constants —
+`\EFI\seraph\kernel` and `\EFI\seraph\bootstrap.bundle` — both
+hardcoded in [`boot/src/main.rs`](../src/main.rs). There is no on-disk
+boot configuration file (`boot.conf` was retired alongside the
+boot-protocol v7 → v8 bump); the bundle is the single composed artifact
+that carries init plus every userspace module the system needs. The
+bundle format itself is specified in
+[`abi/boot-protocol/src/bundle.rs`](../../../abi/boot-protocol/src/bundle.rs).
 
 ---
 
@@ -208,8 +170,8 @@ All fallible functions in the bootloader return `Result<T, BootError>`,
 defined in [`boot/src/error.rs`](../src/error.rs). The variant set covers
 protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
-failure after retry, and `boot.conf` parse failure; the source is the
-authority on the variant list and payloads.
+failure after retry, and bundle parse/validation failure (`InvalidBundle`);
+the source is the authority on the variant list and payloads.
 
 The top-level `efi_main` propagates errors to a single fatal handler that
 reports the error and halts. There is no recovery path and no retry beyond

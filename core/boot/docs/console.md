@@ -34,7 +34,7 @@ out to every backend that is live:
 - **Framebuffer** — available only when UEFI's Graphics Output Protocol
   (GOP) reported a linear pixel buffer in Step 1 of the boot sequence.
 
-Early messages (protocol lookup, `boot.conf` parse) occur before GOP is
+Early messages (protocol lookup, bundle load) occur before GOP is
 queried and land on serial only; this is the intended fallback on headless
 systems.
 

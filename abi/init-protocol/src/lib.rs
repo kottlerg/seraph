@@ -43,7 +43,11 @@
 ///     `BootModule.name`) to the kernel's `CSpace` slot index of each
 ///     module's `Frame` cap. The table lives in the `InitInfo` header so
 ///     it sits on the first `InitInfo` page; the [`CapDescriptor`] array
-///     layout is unchanged.
+///     layout is unchanged. Removed `module_frame_base` /
+///     `module_frame_count` (init now resolves modules by name via
+///     `module_names`, not ordinal arithmetic), `cmdline_offset` /
+///     `cmdline_len` (boot v8 removed the kernel command line surface
+///     entirely), and the corresponding `cmdline_bytes` helper.
 pub const INIT_PROTOCOL_VERSION: u32 = 7;
 
 /// Length of [`InitModuleName::name`], matching
@@ -122,15 +126,6 @@ pub struct InitInfo
     /// Number of segment `Frame` capabilities.
     pub segment_frame_count: u32,
 
-    /// First slot index of boot module `Frame` capabilities.
-    ///
-    /// Boot modules are ELF images for early services (procmgr, devmgr, etc.)
-    /// loaded by the bootloader. Currently not populated (count = 0) until the
-    /// boot protocol is extended with module metadata.
-    pub module_frame_base: u32,
-    /// Number of boot module `Frame` capabilities.
-    pub module_frame_count: u32,
-
     /// First slot index of hardware resource capabilities (MMIO, IRQ, I/O port).
     pub hw_cap_base: u32,
     /// Number of hardware resource capabilities.
@@ -148,22 +143,6 @@ pub struct InitInfo
     /// Allows init to bind I/O port ranges to itself (`ioport_bind`), set its
     /// own priority and affinity, and delegate thread authority to child services.
     pub thread_cap: u32,
-
-    // ── Command line (added in protocol version 3) ──────────────────────
-    // Boot protocol v8 removed `BootInfo.command_line`. The kernel always
-    // writes both fields below to zero, [`cmdline_bytes`] always returns
-    // an empty slice, and ktest's option parser is preserved as a no-op
-    // in-tree experiment surface. The fields are retained for
-    // init-protocol layout stability and may be retired at the next
-    // breaking init-protocol bump.
-    /// Byte offset from the start of this struct to the kernel command
-    /// line, or `0` if no command line was supplied (the production
-    /// boot path; see above).
-    pub cmdline_offset: u32,
-
-    /// Length of the command line in bytes, or `0` if absent (the
-    /// production boot path).
-    pub cmdline_len: u32,
 
     // ── RISC-V SBI forwarding (added in protocol version 3) ─────────────
     /// Slot index of the `SbiControl` capability (RISC-V only).
@@ -239,29 +218,33 @@ pub struct InitInfo
     /// [`INIT_MODULE_NAME_EMPTY`].
     pub module_name_count: u32,
 
-    /// Pads the prefix so this field plus [`_pad_tail`] together make
-    /// `size_of::<InitInfo>()` divisible by 8. `cap_descriptors_offset`
-    /// is set to `size_of::<InitInfo>()`; the `CapDescriptor` array it
-    /// points at contains `u64` fields and so must start on an 8-byte
-    /// boundary. The [`InitModuleName`] array itself only requires
-    /// 4-byte alignment, but the descriptor-offset rule fixes the size
-    /// modulo to 8 across the whole struct.
-    #[doc(hidden)]
-    pub _pad_module_names: u32,
-
     /// Bundle-entry-name → `CSpace`-slot mapping for boot-module Frame
     /// caps. Lives inside the `InitInfo` header so it sits entirely on
     /// the first `InitInfo` page (the [`CapDescriptor`] array that
     /// follows the header may span pages).
+    ///
+    /// Last field by intent: `cap_descriptors_offset =
+    /// size_of::<InitInfo>()` puts the `CapDescriptor` array
+    /// immediately after this table, and the current field count
+    /// keeps the total a multiple of 8 (the `u64` alignment the
+    /// descriptor array needs) without an explicit tail pad. The
+    /// compile-time assert below pins both invariants.
     pub module_names: [InitModuleName; INIT_MAX_NAMED_MODULES],
-
-    /// Explicit 4-byte tail pad so `size_of::<InitInfo>()` stays 8-byte
-    /// aligned. Consumers of `cap_descriptors_offset` rely on this: the
-    /// `CapDescriptor` array that immediately follows contains u64
-    /// fields and must start on an 8-byte boundary.
-    #[doc(hidden)]
-    pub _pad_tail: u32,
 }
+
+// Compile-time invariants for the `InitInfo` layout. The kernel writes
+// the `CapDescriptor` array at byte offset `cap_descriptors_offset =
+// size_of::<InitInfo>()` and the entries contain `u64` fields, so the
+// total size must be 8-byte aligned. The whole region must also fit
+// within `INIT_INFO_MAX_PAGES`.
+const _: () = assert!(
+    core::mem::size_of::<InitInfo>().is_multiple_of(8),
+    "InitInfo size must be 8-byte aligned so cap_descriptors_offset is 8-byte aligned",
+);
+const _: () = assert!(
+    core::mem::size_of::<InitInfo>() <= INIT_INFO_MAX_PAGES * 4096,
+    "InitInfo header must fit within INIT_INFO_MAX_PAGES",
+);
 
 // ── CapDescriptor / CapType ──────────────────────────────────────────────────
 
@@ -382,35 +365,4 @@ pub fn find_module_slot(info: &InitInfo, name: &[u8]) -> Option<u32>
         }
     }
     None
-}
-
-/// Return the kernel command line as a byte slice from the [`InitInfo`] page.
-///
-/// Vestigial under boot protocol v8: the kernel always writes
-/// [`InitInfo::cmdline_offset`] and [`InitInfo::cmdline_len`] to zero, so
-/// this helper always returns an empty slice in production boots. Kept
-/// callable so the ktest cmdline parser (and any future in-tree
-/// experiment that wants to thread bytes via the init-protocol page)
-/// still compiles unchanged.
-///
-/// # Safety
-/// `info` must point into the read-only [`InitInfo`] page mapped by the kernel
-/// at [`INIT_INFO_VADDR`]. The page must contain at least
-/// `info.cmdline_offset + info.cmdline_len` valid bytes.
-#[must_use]
-pub unsafe fn cmdline_bytes(info: &InitInfo) -> &[u8]
-{
-    if info.cmdline_len == 0 || info.cmdline_offset == 0
-    {
-        return &[];
-    }
-    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: caller guarantees the InitInfo page contains valid cmdline data
-    // at the specified offset and length, populated by the kernel in Phase 9.
-    unsafe {
-        core::slice::from_raw_parts(
-            base.add(info.cmdline_offset as usize),
-            info.cmdline_len as usize,
-        )
-    }
 }

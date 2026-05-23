@@ -3,9 +3,9 @@
 
 //! Stress test: concurrent memory map/unmap from multiple threads.
 //!
-//! 4 child threads each map and unmap a distinct VA range repeatedly, sharing
-//! the same address space. Exercises page table lock contention and TLB
-//! shootdown under load.
+//! `NUM_CHILDREN` threads each map and unmap a distinct VA range
+//! repeatedly, sharing the same address space. Exercises page table
+//! lock contention and TLB shootdown under load.
 
 use syscall::{
     cap_copy, cap_create_signal, cap_delete, mem_map, mem_unmap, signal_send, signal_wait,
@@ -14,12 +14,8 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// 4 — pre-ramp baseline. See `concurrent_signal.rs::NUM_SENDERS` for
-/// kernel-side reasons we cap per-test concurrency at the pre-ramp
-/// baseline. Iteration count is also baseline; in-tree experiments with
-/// `MAP_ITERATIONS=1000` triggered the same follow-on hang.
-const NUM_CHILDREN: usize = 4;
-const MAP_ITERATIONS: usize = 200;
+const NUM_CHILDREN: usize = 16;
+const MAP_ITERATIONS: usize = 1000;
 
 /// Base VA for stress mappings, well above normal test VAs.
 const STRESS_MAP_BASE: u64 = 0x5000_0000;
@@ -122,7 +118,9 @@ fn mapper_entry(arg: u64) -> !
     let done_slot = (arg & 0xFFFF) as u32;
     let frame_cap = ((arg >> 16) & 0xFFFF) as u32;
     let aspace = ((arg >> 32) & 0xFFFF) as u32;
-    let done_bit = (arg >> 48) & 0xFF;
+    // done_bit is `1u64 << i` for i in 0..NUM_CHILDREN; at NUM=16 it spans
+    // bits 0..15, so the mask is 16-bit not 8-bit.
+    let done_bit = (arg >> 48) & 0xFFFF;
 
     // Determine our child index from done_bit (1<<i → i).
     let child_idx = done_bit.trailing_zeros() as usize;

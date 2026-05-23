@@ -43,8 +43,8 @@ pub mod role_guids;
 /// v7: Added `reclaim_ranges: ReclaimSlice` so the bootloader can hand the
 ///     kernel a list of scratch pages (`BootInfo` page, module descriptor
 ///     array, memory-map entry array, MMIO aperture array, the
-///     reclaim-array page itself, the cmdline page, and the bootloader's
-///     own transient page-table frames) that are safe to reclaim once
+///     reclaim-array page itself, and the bootloader's own transient
+///     page-table frames) that are safe to reclaim once
 ///     the kernel's Phase-7 capability system has consumed them. The
 ///     slice is backed by a dedicated 4 KiB scratch page; that page is
 ///     itself the final entry in the array so the kernel reclaims it
@@ -591,7 +591,9 @@ pub struct BootInfo
 
     /// Additional boot modules (raw ELF images for early services).
     ///
-    /// The set of modules is configured via `boot.conf`.
+    /// The set of modules is sourced from the bootloader's
+    /// `bootstrap.bundle`; see the [`bundle`] module for the wire
+    /// format and the `init` entry name special-cased by the bootloader.
     pub modules: ModuleSlice,
 
     /// Framebuffer, if available. `physical_base == 0` means no framebuffer.

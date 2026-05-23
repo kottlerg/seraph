@@ -54,14 +54,12 @@ impl Harness
     }
 }
 
-/// Modules that ship in a default-init bundle, in the historic ordinal
-/// order today's init still depends on. After commit C swaps init to
-/// `find_module_by_name` the order will be free; until then, the
-/// `BootModule` array index must match each consumer's hardcoded offset
-/// (`module_frame_base + N` at `services/init/src/{main,service,bootstrap}.rs`).
-///
-/// Ordinals (the bundle parse strips the `init` entry first):
-/// `0=procmgr, 1=devmgr, 2=vfsd, 3=virtio-blk, 4=fatfs, 5=memmgr`.
+/// Modules that ship in a default-init bundle. init looks them up by
+/// the name strings here (via `InitInfo::module_names`, populated by
+/// the kernel), so the order is free for the producer's convenience.
+/// Kept in the historic ordinal order (`procmgr, devmgr, vfsd,
+/// virtio-blk, fatfs, memmgr`) only to keep the disk image byte-stable
+/// across builds.
 const MODULE_NAMES: &[&str] = &["procmgr", "devmgr", "vfsd", "virtio-blk", "fatfs", "memmgr"];
 
 /// Compose a bundle for the chosen harness and write it to

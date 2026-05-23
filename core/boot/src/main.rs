@@ -1054,20 +1054,23 @@ unsafe fn step9_populate_boot_info(
     {
         push_reclaim(frame, 1, 0);
     }
-    // Bundle blob: init ELF segments are copied into their own segment
-    // allocations by `load_init` (the kernel maps from those, not from the
-    // bundle), and module bodies become reclaimable Frame caps in
-    // `cap::mint_module_frame_caps` as the kernel walks `BootInfo.modules`.
-    // The whole bundle allocation is reclaim-safe once both passes have
-    // run; the kernel performs the bundle reclaim inside `populate_cspace`
-    // alongside the other reclaim entries.
-    if bundle.phys != 0 && bundle.pages > 0
-    {
-        // clippy::cast_possible_truncation: bundle.pages is bounded by the
-        // disk image size (a few hundred pages at most), comfortably within u32.
-        #[allow(clippy::cast_possible_truncation)]
-        push_reclaim(bundle.phys, bundle.pages as u32, 0);
-    }
+    // Bundle blob: NOT pushed as a single reclaim range. Module bodies
+    // are already covered by Frame caps minted in
+    // `cap::mint_module_frame_caps`, which call
+    // `register_owned_range` on each module's pages and create caps
+    // with `owns_memory = true`. Adding the whole bundle here would
+    // double-register those pages (inflating the buddy's `total_pages`)
+    // and produce two `owns_memory = true` caps over the same
+    // physical range, so any subsequent cap-destroy path that hits
+    // `dealloc_object → buddy.free_range` would double-free.
+    //
+    // The non-module portion of the bundle (header + entry table +
+    // init's ELF source bytes, which `load_init` has already copied
+    // out into separate segment allocations) is therefore leaked at
+    // boot — a small, bounded permanent waste. A future per-byte-range
+    // reclaim path can carve those ranges out of the bundle without
+    // overlapping the module Frame caps; tracked separately.
+    let _ = bundle;
     // AP SIPI trampoline page: kernel mints this through the late-reclaim
     // pass once SMP bringup completes and `mm::paging::unmap_identity_page`
     // has retired the low-VA identity mapping (installed on both arches by

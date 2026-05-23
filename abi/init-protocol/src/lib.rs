@@ -230,10 +230,13 @@ pub struct InitInfo
     /// [`INIT_MODULE_NAME_EMPTY`].
     pub module_name_count: u32,
 
-    /// Explicit 4-byte pad so [`module_names`] starts 8-byte aligned
-    /// (each entry leads with a u32 slot but contains a u32 pad to
-    /// realign for the [u8;32] name; the table-level alignment matters
-    /// for the optimiser when reading the array as a whole).
+    /// Pads the prefix so this field plus [`_pad_tail`] together make
+    /// `size_of::<InitInfo>()` divisible by 8. `cap_descriptors_offset`
+    /// is set to `size_of::<InitInfo>()`; the `CapDescriptor` array it
+    /// points at contains `u64` fields and so must start on an 8-byte
+    /// boundary. The [`InitModuleName`] array itself only requires
+    /// 4-byte alignment, but the descriptor-offset rule fixes the size
+    /// modulo to 8 across the whole struct.
     #[doc(hidden)]
     pub _pad_module_names: u32,
 

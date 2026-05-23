@@ -1535,8 +1535,9 @@ fn read_dtb_totalsize(phys: u64) -> Option<u64>
 /// Mint `Frame` capabilities for boot modules into the root `CSpace`.
 ///
 /// Each boot module (raw ELF image for an early service) gets a read-only
-/// Frame cap. Module order matches `boot.conf`'s `modules=` line, so init
-/// can identify modules by index (index 0 = procmgr, etc.).
+/// Frame cap. The kernel additionally publishes a name → slot mapping in
+/// [`CSpaceLayout::module_names`] so init can match modules by their
+/// bundle entry identifier instead of relying on ordinal position.
 ///
 /// Updates `layout.module_frame_base`, `layout.module_frame_count`, and
 /// appends [`CapDescriptor`] entries for each module.
@@ -1653,8 +1654,8 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
 ///
 /// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
 /// descriptor array, memory-map entry array, MMIO aperture array, the
-/// reclaim-array page itself, the cmdline page, and the bootloader's
-/// transient page-table frames — and mints one reclaimable `FrameObject`
+/// reclaim-array page itself, and the bootloader's transient page-table
+/// frames — and mints one reclaimable `FrameObject`
 /// cap per range with `owns_memory = true` and the full byte ledger.
 /// Each cap is inserted into the root `CSpace` and a matching
 /// `CapDescriptor` entry pushed into `layout.descriptors`, so the cap

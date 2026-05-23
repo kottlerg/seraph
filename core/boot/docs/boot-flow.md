@@ -154,7 +154,7 @@ Detail: [uefi-environment.md](uefi-environment.md)
 
 `BootInfo` is populated in-place in a physical memory region allocated before step 8.
 All pointer and address fields hold physical addresses; no virtual addresses appear in
-`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `7`).
+`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `8`).
 Fields are populated as follows:
 
 | Field | Source |

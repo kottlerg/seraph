@@ -81,27 +81,30 @@ capability trees, and concurrent operations. **Not run by default**; enable with
 
 Order matches `stress/mod.rs` dispatch order.
 
-Concurrency knobs are currently held at their pre-`v0.1.0` baselines.
-An earlier in-tree experiment ramped these knobs to NUM=64 (per-test
-worker counts) and 5-10× iteration counts; two kernel-side scaling
-issues block taking the ramp further at this time. Once those are
-fixed, the per-test `NUM_*`/`CYCLES`/`ITERATIONS` constants should be
-revisited.
+Concurrency knobs ramp every per-test worker count to the `u64` signal-
+bitmask ceiling (64 workers) and iteration counts 5-10× higher than a
+trivial smoke-test would need. The point is that one full
+`ktest.filter=stress` boot exercises enough contention to surface latent
+races, rather than needing tens of repeat runs to flake-mine. The
+`u64` width caps per-test workers at 64; lifting that would require
+re-encoding the per-worker bookkeeping from a bitmask to an atomic-
+counter ledger. The `MAX_STRESS_THREADS = 64` cap in `stress/mod.rs`
+mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 
-| File | Scenario |
-|---|---|
-| `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation |
-| `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around) |
-| `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration |
-| `thread_churn.rs` | Rapid thread create/destroy cycles (TCB and CSpace cleanup) |
-| `cap_delete_running.rs` | Delete capabilities while child threads actively spin |
-| `concurrent_signal.rs` | Multiple threads sending distinct bits to one signal simultaneously |
-| `concurrent_ipc.rs` | Multiple callers racing on one endpoint (send-queue safety) |
-| `cap_revoke_under_use.rs` | Revoke root while child threads actively send on derived caps |
-| `concurrent_map_unmap.rs` | Multiple threads mapping/unmapping distinct VAs in the same address space |
-| `retype_concurrent.rs` | Multiple workers retyping concurrently against one Frame-backed allocator |
-| `fpu_migration_churn.rs` | 100 cycles of FPU-owner thread migration across CPUs; validates eager save / lazy restore under churn |
-| `concurrent_event_producers.rs` | Multiple producers post concurrently to one event queue; consumer verifies every producer's full sequence |
+| File | Scenario | Knobs |
+|---|---|---|
+| `cap_tree_deep.rs` | 8-level derivation chain with cascading revocation | `CHAIN_DEPTH=8`, `PASSES=500` |
+| `event_queue_fill_drain.rs` | Fill/drain cycles on a capacity-8 queue (ring buffer wrap-around) | `CAPACITY=8`, `CYCLES=2000` |
+| `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration | `ITERATIONS=50_000` |
+| `thread_churn.rs` | Rapid thread create/destroy cycles (TCB and CSpace cleanup) | `ITERATIONS=1000` |
+| `cap_delete_running.rs` | Delete capabilities while child threads actively spin | `NUM_CHILDREN=16` |
+| `concurrent_signal.rs` | Multiple threads sending distinct bits to one signal simultaneously | `NUM_SENDERS=64`, `SEND_ITERATIONS=5000` |
+| `concurrent_ipc.rs` | Multiple callers racing on one endpoint (send-queue safety) | `NUM_CALLERS=64`, `CYCLES=200` |
+| `cap_revoke_under_use.rs` | Revoke root while child threads actively send on derived caps | `NUM_CHILDREN=64` |
+| `concurrent_map_unmap.rs` | Multiple threads mapping/unmapping distinct VAs in the same address space | `NUM_CHILDREN=16`, `MAP_ITERATIONS=1000` |
+| `retype_concurrent.rs` | Multiple workers retyping concurrently against one Frame-backed allocator | `NUM_WORKERS=64`, `ITERS_PER_WORKER=1000` |
+| `fpu_migration_churn.rs` | 100 cycles of FPU-owner thread migration across CPUs; validates eager save / lazy restore under churn | `CYCLES=100` |
+| `concurrent_event_producers.rs` | Multiple producers post concurrently to one event queue; consumer verifies every producer's full sequence | `NUM_PRODUCERS=4`, `MESSAGES_PER_PRODUCER=64` |
 
 ### Tier 3 — `src/bench/`
 

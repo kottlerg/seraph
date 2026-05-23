@@ -206,6 +206,24 @@ Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
 
 The producer-side `state`/`ipc_state`/`blocked_on_object` writes belong to `enqueue_and_wake` — wake primitives MUST NOT do them under the source IPC lock. See Lock Hierarchy rule 9.
 
+### Target CPU selection (`select_target_cpu`)
+
+`enqueue_and_wake` resolves `target_cpu` via `select_target_cpu`. The
+selection policy is, in priority order: (1) hard affinity
+(`cpu_affinity != AFFINITY_ANY`), (2) save-window pinning to
+`preferred_cpu` while `context_saved == 0` (closes the cross-CPU
+`schedule()` spin against the source CPU's in-flight save), (3) sticky
+`preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
+of the global `min_load`, and (4) the least-loaded CPU. The
+`LOAD_BALANCE_IMBALANCE_THRESHOLD` knob is shared with `try_pull_balance`
+so the wake-side stickiness and the pull-balancer's imbalance test
+agree on what counts as "real" load asymmetry. The sticky-CPU rule
+originated from the #128 investigation as an independent
+cache-warmth alignment with the documented soft-affinity intent in
+`scheduler.md` § Soft Affinity; #128's actual root cause turned out
+to be unrelated (`CSpaceId` namespace exhaustion, see commits on
+that issue).
+
 Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs:444+`):
 
 ```

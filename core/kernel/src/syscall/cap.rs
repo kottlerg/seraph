@@ -649,7 +649,18 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
 
     // Register in the global registry so derivation lookups resolve.
-    crate::cap::register_cspace(id, cs_ptr);
+    // Overflow → `SyscallError::OutOfMemory` with full rollback below.
+    if crate::cap::register_cspace(id, cs_ptr).is_err()
+    {
+        // SAFETY: wrapper/cs not observed externally yet (registry
+        // rejected the entry; no slot in any CSpace points at `cs_ptr`).
+        unsafe {
+            core::ptr::drop_in_place(cs_kobj_ptr);
+            core::ptr::drop_in_place(cs_ptr);
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        return Err(SyscallError::OutOfMemory);
+    }
 
     // Hold a reference on the source Frame cap.
     // SAFETY: frame_obj_nn is live.
@@ -681,7 +692,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let nonnull = unsafe { NonNull::new_unchecked(cs_kobj_ptr.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
-    let idx = unsafe {
+    let insert_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
         let r = (*cspace).insert_cap(
             CapTag::CSpace,
@@ -690,8 +701,30 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         );
         (*cspace).lock.unlock_raw(saved);
         r
-    }
-    .map_err(|_| SyscallError::OutOfMemory)?;
+    };
+    let Ok(idx) = insert_res
+    else
+    {
+        // Roll back the registry slot, the frame inc_ref, the in-place
+        // wrapper/CSpace constructions, and the retype carve. Without
+        // this rollback, a failed `insert_cap` would leak a live CSpace
+        // registry entry, leave `frame_obj_nn`'s refcount permanently
+        // incremented, and surrender the carved offset back to the
+        // retype allocator only when the source frame itself was
+        // dec_ref'd to zero.
+        crate::cap::unregister_cspace(id);
+        // SAFETY: wrapper/cs not observed externally (no slot in any
+        // CSpace points at `nonnull`, and we just removed the registry
+        // entry).
+        unsafe {
+            core::ptr::drop_in_place(cs_kobj_ptr);
+            core::ptr::drop_in_place(cs_ptr);
+        }
+        retype_free(frame, offset, entry.raw_bytes);
+        // SAFETY: matches the `frame_obj_nn.as_ref().inc_ref()` above.
+        unsafe { frame_obj_nn.as_ref().dec_ref() };
+        return Err(SyscallError::OutOfMemory);
+    };
 
     Ok(u64::from(idx.get()))
 }

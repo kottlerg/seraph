@@ -11,25 +11,24 @@ use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait,
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// 16 — pre-ramp baseline. Above ~16-32 concurrently runnable spinning
-/// syscall threads on 4-CPU SMP, follow-on tests (notably
-/// `cap_revoke_under_use`) observe scheduler-fairness starvation. Until
-/// the kernel-side fairness issue is fixed, we keep this constant at the
-/// pre-ramp baseline so downstream stress tests aren't compromised.
-///
-/// Iteration count is the pre-ramp baseline; in-tree experiments showed
-/// the ramped 5000-iter variant left follow-on tests in a degraded state
-/// (notably `cap_revoke_under_use` hangs even at its own NUM=16). Filed
-/// separately; revisit once the kernel-side fairness issue is resolved.
-const NUM_SENDERS: usize = 16;
-const SEND_ITERATIONS: u64 = 2000;
+const NUM_SENDERS: usize = 64;
+const SEND_ITERATIONS: u64 = 5000;
 
-/// Each sender ORs its unique bit (`1 << i`) once per iteration.
-const SENDER_BITS: [u64; NUM_SENDERS] = [
-    0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000,
-    0x8000,
-];
-const ALL_BITS: u64 = 0xFFFF;
+/// Each sender ORs its unique bit (`1 << i`) once per iteration. The
+/// signal's bit width is 64; one sender per bit saturates the bitmask.
+const fn sender_bits() -> [u64; NUM_SENDERS]
+{
+    let mut bits = [0u64; NUM_SENDERS];
+    let mut i = 0;
+    while i < NUM_SENDERS
+    {
+        bits[i] = 1u64 << i;
+        i += 1;
+    }
+    bits
+}
+const SENDER_BITS: [u64; NUM_SENDERS] = sender_bits();
+const ALL_BITS: u64 = u64::MAX;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

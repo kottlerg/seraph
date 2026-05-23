@@ -61,8 +61,9 @@ pub const INIT_MAX_NAMED_MODULES: usize = 8;
 
 /// Virtual address where the kernel maps the read-only [`InitInfo`] region.
 ///
-/// The region spans one or more contiguous pages (as many as needed for the
-/// header, [`CapDescriptor`] array, and command line). Placed below the stack.
+/// The region spans one or more contiguous pages — enough for the header
+/// (which now includes the boot-module name table) followed by the
+/// variable-length [`CapDescriptor`] array. Placed below the stack.
 pub const INIT_INFO_VADDR: u64 = 0x7FFF_FFFF_8000;
 
 /// Virtual address of the top of init's user stack.
@@ -75,7 +76,8 @@ pub const INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
 pub const INIT_STACK_PAGES: usize = 4;
 
 /// Maximum number of 4 KiB pages the kernel may allocate for the
-/// [`InitInfo`] region (header + [`CapDescriptor`] array + command line).
+/// [`InitInfo`] region (header — which now includes the boot-module
+/// name table — followed by the [`CapDescriptor`] array).
 ///
 /// The kernel enforces this ceiling when assembling the region; init uses it
 /// to bound descriptor-slice reads. Both sides must agree: changing this
@@ -148,13 +150,19 @@ pub struct InitInfo
     pub thread_cap: u32,
 
     // ── Command line (added in protocol version 3) ──────────────────────
-    /// Byte offset from the start of this struct to the kernel command line.
-    ///
-    /// The command line is placed after the [`CapDescriptor`] array within the
-    /// same 4 KiB page. Zero if no command line is present.
+    // Boot protocol v8 removed `BootInfo.command_line`. The kernel always
+    // writes both fields below to zero, [`cmdline_bytes`] always returns
+    // an empty slice, and ktest's option parser is preserved as a no-op
+    // in-tree experiment surface. The fields are retained for
+    // init-protocol layout stability and may be retired at the next
+    // breaking init-protocol bump.
+    /// Byte offset from the start of this struct to the kernel command
+    /// line, or `0` if no command line was supplied (the production
+    /// boot path; see above).
     pub cmdline_offset: u32,
 
-    /// Length of the command line in bytes (no null terminator). Zero if absent.
+    /// Length of the command line in bytes, or `0` if absent (the
+    /// production boot path).
     pub cmdline_len: u32,
 
     // ── RISC-V SBI forwarding (added in protocol version 3) ─────────────
@@ -214,8 +222,9 @@ pub struct InitInfo
     /// First slot index of init's `InitInfo`-region `Frame` caps.
     ///
     /// Each cap covers one 4 KiB page of the kernel-allocated
-    /// `InitInfo` region (header + `CapDescriptor` array + command
-    /// line). Donated alongside the stack caps in init's reap-handoff.
+    /// `InitInfo` region (header — which includes the boot-module name
+    /// table — followed by the `CapDescriptor` array). Donated
+    /// alongside the stack caps in init's reap-handoff.
     /// The cap range includes the page that contains this `InitInfo`
     /// struct itself — once init has read `InitInfo` at `_start`, the
     /// pages can be reclaimed safely. Zero if the kernel did not mint
@@ -376,6 +385,13 @@ pub fn find_module_slot(info: &InitInfo, name: &[u8]) -> Option<u32>
 }
 
 /// Return the kernel command line as a byte slice from the [`InitInfo`] page.
+///
+/// Vestigial under boot protocol v8: the kernel always writes
+/// [`InitInfo::cmdline_offset`] and [`InitInfo::cmdline_len`] to zero, so
+/// this helper always returns an empty slice in production boots. Kept
+/// callable so the ktest cmdline parser (and any future in-tree
+/// experiment that wants to thread bytes via the init-protocol page)
+/// still compiles unchanged.
 ///
 /// # Safety
 /// `info` must point into the read-only [`InitInfo`] page mapped by the kernel

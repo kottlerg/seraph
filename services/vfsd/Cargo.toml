@@ -10,6 +10,9 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# Seraph-minted GPT partition type GUIDs (per-arch root and EFI ESP);
+# vfsd compares GPT entries against these to identify the rootfs.
+boot-protocol = { path = "../../abi/boot-protocol" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 syscall = { path = "../../shared/syscall" }

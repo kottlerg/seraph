@@ -972,6 +972,7 @@ dependencies = [
 name = "vfsd"
 version = "0.1.0"
 dependencies = [
+ "boot-protocol",
  "ipc",
  "namespace-protocol",
  "syscall",

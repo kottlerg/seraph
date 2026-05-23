@@ -14,6 +14,9 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 # Ergonomic error propagation with .context().
 anyhow = "1"
+# Seraph-minted GPT partition type GUIDs are defined here so xtask
+# (producer) and vfsd (consumer) reference the same byte arrays.
+boot-protocol = { path = "../abi/boot-protocol" }
 gpt = "4"
 fatfs = "0.3"
 uuid = "1"

@@ -326,7 +326,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
             build_boot(ctx, args)?;
             build_all_specs(ctx, args)?;
             sysroot::install_rootfs(ctx)?;
-            crate::disk::create_disk_image(ctx)?;
+            crate::disk::create_disk_image(ctx, args.arch)?;
         }
         c =>
         {

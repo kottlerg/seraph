@@ -26,7 +26,7 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
 {
     sysroot::check_arch(ctx, args.arch)?;
     sysroot::install_rootfs(ctx)?;
-    disk::create_disk_image(ctx)?;
+    disk::create_disk_image(ctx, args.arch)?;
     step(&format!("mkdisk complete ({})", args.arch));
     Ok(())
 }

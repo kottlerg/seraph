@@ -12,7 +12,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use boot_protocol::role_guids;
 
+use crate::arch::Arch;
 use crate::context::Context as BuildContext;
 use crate::util::step;
 
@@ -146,7 +148,11 @@ impl Seek for PartitionSlice
 /// The image contains two FAT32 partitions sized [`PARTITION_SIZE`]:
 /// - Partition 1 (ESP): populated from `sysroot/esp/`
 /// - Partition 2 (ROOT): populated from `sysroot/` excluding `esp/`
-pub fn create_disk_image(ctx: &BuildContext) -> Result<()>
+///
+/// Partition 2's GPT type-GUID is the arch-specific Seraph root GUID
+/// (see [`boot_protocol::role_guids`]) so vfsd can identify the root by
+/// role without consulting a config file.
+pub fn create_disk_image(ctx: &BuildContext, arch: Arch) -> Result<()>
 {
     let image_path = ctx.disk_image();
     step(&format!("Creating disk image: {}", image_path.display()));
@@ -158,7 +164,7 @@ pub fn create_disk_image(ctx: &BuildContext) -> Result<()>
     }
 
     // Write GPT (protective MBR + headers + partition entries).
-    write_gpt(&image_path)?;
+    write_gpt(&image_path, arch)?;
 
     // Format and populate the ESP from sysroot/esp/.
     let esp_source = ctx.sysroot_esp();
@@ -171,15 +177,32 @@ pub fn create_disk_image(ctx: &BuildContext) -> Result<()>
     Ok(())
 }
 
-/// Deterministic partition UUIDs for development builds.
+/// Deterministic per-partition unique GUIDs for development builds.
 ///
-/// Real installations would use random UUIDs. Fixed values here give us
-/// stable `root=UUID=...` in boot.conf without build-time coordination.
-pub const ESP_PARTITION_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef0123456789";
-pub const ROOT_PARTITION_UUID: &str = "12345678-abcd-ef01-2345-6789abcdef01";
+/// Real installations would mint random per-partition GUIDs at format time.
+/// Fixed values here give reproducible disk images. Distinct from the GPT
+/// **type** GUIDs (`boot_protocol::role_guids::*`), which identify the
+/// partition's role; these identify the specific partition instance.
+pub const ESP_UNIQUE_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef0123456789";
+pub const ROOT_UNIQUE_UUID: &str = "12345678-abcd-ef01-2345-6789abcdef01";
+
+/// Return the Seraph root partition type-GUID for `arch`, wrapped as a
+/// `gpt::partition_types::Type` ready for `add_partition_at`.
+fn seraph_root_type(arch: Arch) -> gpt::partition_types::Type
+{
+    let bytes = match arch
+    {
+        Arch::X86_64 => role_guids::SERAPH_ROOT_X86_64,
+        Arch::Riscv64 => role_guids::SERAPH_ROOT_RISCV64,
+    };
+    gpt::partition_types::Type {
+        guid: uuid::Uuid::from_bytes_le(bytes),
+        os: gpt::partition_types::OperatingSystem::None,
+    }
+}
 
 /// Write a GPT partition table with two partitions and deterministic UUIDs.
-fn write_gpt(image_path: &Path) -> Result<()>
+fn write_gpt(image_path: &Path, arch: Arch) -> Result<()>
 {
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -213,24 +236,21 @@ fn write_gpt(image_path: &Path) -> Result<()>
     )
     .context("failed to add ESP partition")?;
 
-    // Partition 2: Root (Basic Data) immediately after ESP.
+    // Partition 2: Seraph root, arch-specific type-GUID per
+    // `boot_protocol::role_guids`.
     disk.add_partition_at(
         "ROOT",
         2,
         ROOT_START_LBA,
         ROOT_SIZE_LBA,
-        gpt::partition_types::BASIC,
+        seraph_root_type(arch),
         0,
     )
     .context("failed to add ROOT partition")?;
 
-    // Set deterministic partition UUIDs for reproducible builds.
-    let esp_uuid: uuid::Uuid = ESP_PARTITION_UUID
-        .parse()
-        .expect("invalid ESP_PARTITION_UUID");
-    let root_uuid: uuid::Uuid = ROOT_PARTITION_UUID
-        .parse()
-        .expect("invalid ROOT_PARTITION_UUID");
+    // Set deterministic per-partition unique GUIDs for reproducible builds.
+    let esp_uuid: uuid::Uuid = ESP_UNIQUE_UUID.parse().expect("invalid ESP_UNIQUE_UUID");
+    let root_uuid: uuid::Uuid = ROOT_UNIQUE_UUID.parse().expect("invalid ROOT_UNIQUE_UUID");
 
     let mut parts = disk.take_partitions();
     if let Some(p) = parts.get_mut(&1)

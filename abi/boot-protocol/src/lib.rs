@@ -19,6 +19,8 @@
 
 #![no_std]
 
+pub mod role_guids;
+
 /// Current boot protocol version. Increment when `BootInfo` layout or the
 /// CPU entry contract changes in a non-backwards-compatible way.
 ///

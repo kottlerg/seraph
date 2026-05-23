@@ -572,12 +572,35 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 unsafe { page_ptrs[page_idx].add(page_off) }
             }
 
-            // Track per-page direct-map pointers so we can write across
-            // page boundaries without requiring physically contiguous memory.
+            // Allocate the InitInfo region as one physically contiguous
+            // buddy extent so the descriptor array (which can span pages
+            // once CapDescriptor.name is included) lives in a single
+            // backing allocation. Per-page allocation works for the
+            // kernel-side `copy_nonoverlapping` writes, but init reads
+            // the descriptor slice as one cross-page Rust slice; on
+            // release builds LLVM exploits provenance assumptions about
+            // single-allocation slices to mis-load fields of descriptors
+            // that straddle page boundaries. A contiguous physical
+            // extent eliminates the discrepancy between virtual and
+            // physical contiguity, so the optimiser sees one allocation
+            // backing the slice.
             if info_pages > init_protocol::INIT_INFO_MAX_PAGES
             {
                 fatal("Phase 9: InitInfo region too large");
             }
+            // Round to next power of two for buddy allocation; for
+            // INIT_INFO_MAX_PAGES = 4 the upper bound is order 2 (4 pages).
+            let info_order = info_pages.next_power_of_two().trailing_zeros() as usize;
+            let block_pages = 1usize << info_order;
+            let block_phys = allocator
+                .alloc(info_order)
+                .unwrap_or_else(|| fatal("Phase 9: out of memory for InitInfo"));
+            let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
+            // SAFETY: just allocated; valid for block_pages * PAGE_SIZE bytes.
+            unsafe {
+                core::ptr::write_bytes(block_virt, 0, block_pages * mm::PAGE_SIZE);
+            }
+
             let mut page_ptrs: [*mut u8; init_protocol::INIT_INFO_MAX_PAGES] =
                 [core::ptr::null_mut(); init_protocol::INIT_INFO_MAX_PAGES];
             let mut page_phys: [u64; init_protocol::INIT_INFO_MAX_PAGES] =
@@ -585,19 +608,22 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 
             for pg in 0..info_pages
             {
-                let phys = allocator
-                    .alloc(0)
-                    .unwrap_or_else(|| fatal("Phase 9: out of memory for InitInfo"));
-                let virt = mm::paging::phys_to_virt(phys) as *mut u8;
-                // SAFETY: just allocated; valid for PAGE_SIZE bytes.
-                unsafe { core::ptr::write_bytes(virt, 0, mm::PAGE_SIZE) };
+                let phys = block_phys + (pg as u64) * mm::PAGE_SIZE as u64;
+                // SAFETY: pg < block_pages by construction (info_pages <= block_pages).
+                let virt = unsafe { block_virt.add(pg * mm::PAGE_SIZE) };
                 let map_va = INIT_INFO_VADDR + (pg as u64) * mm::PAGE_SIZE as u64;
-                // SAFETY: init_as_ptr valid; phys just allocated; map_va page-aligned.
+                // SAFETY: init_as_ptr valid; phys is part of the contiguous extent.
                 unsafe { (*init_as_ptr).map_page(map_va, phys, flags) }
                     .unwrap_or_else(|()| fatal("Phase 9: failed to map InitInfo page"));
                 page_ptrs[pg] = virt;
                 page_phys[pg] = phys;
             }
+            // The buddy has no per-page free path here; the unused tail
+            // of the contiguous extent (at most `block_pages - info_pages`
+            // pages, ≤ 2 pages with `INIT_INFO_MAX_PAGES = 4`) stays
+            // allocated to the kernel. Small but constant waste; reclaim
+            // via a future cap-mint path if it becomes material.
+            let _ = block_pages;
             let info_base = page_ptrs[0];
 
             let info = InitInfo {
@@ -628,6 +654,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 init_stack_frame_count: 0, // patched after stack mint
                 init_info_frame_base: 0,   // patched after self-mint below
                 init_info_frame_count: 0,  // patched after self-mint below
+                module_name_count: cspace_layout.module_name_count,
+                _pad_module_names: 0,
+                module_names: cspace_layout.module_names,
                 _pad_tail: 0,
             };
 

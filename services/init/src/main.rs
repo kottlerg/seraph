@@ -167,14 +167,21 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
         return &[];
     }
 
-    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: InitInfo page is valid; bounds checked above. cap_descriptors_offset
-    // is 8-byte aligned (set by kernel), satisfying CapDescriptor alignment.
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe {
-        let ptr = base.add(offset).cast::<CapDescriptor>();
-        core::slice::from_raw_parts(ptr, count)
-    }
+    // The kernel maps `INIT_INFO_MAX_PAGES` pages contiguously at
+    // `INIT_INFO_VADDR`; the InitInfo header lives at the start, and
+    // `cap_descriptors_offset` indexes into the same region. Construct
+    // the descriptor pointer from the integer address using
+    // `with_exposed_provenance` so the slice is not bounded by the
+    // narrower `&InitInfo` provenance — descriptors may span pages
+    // beyond the first one, and a pointer derived from `info`'s
+    // 112-byte allocation would let the optimiser assume out-of-bounds
+    // reads.
+    let base_addr = init_protocol::INIT_INFO_VADDR as usize + offset;
+    let ptr = core::ptr::with_exposed_provenance::<CapDescriptor>(base_addr);
+    // SAFETY: kernel has mapped `count * desc_size` valid CapDescriptor
+    // bytes starting at INIT_INFO_VADDR + offset. The exposed-provenance
+    // pointer carries provenance broad enough to cover that span.
+    unsafe { core::slice::from_raw_parts(ptr, count) }
 }
 
 /// Locate a boot-module `Frame` capability by the bundle-entry name the
@@ -185,20 +192,7 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 /// ordinal-based lookups (`module_frame_base + N`).
 pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u32>
 {
-    descriptors(info).iter().find_map(|d| {
-        if d.cap_type != CapType::Frame
-        {
-            return None;
-        }
-        if init_protocol::descriptor_name_str(&d.name) == name
-        {
-            Some(d.slot)
-        }
-        else
-        {
-            None
-        }
-    })
+    init_protocol::find_module_slot(info, name)
 }
 
 // dead_code: used by the x86_64 serial module but not riscv64.

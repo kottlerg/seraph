@@ -38,16 +38,24 @@
 ///     command line passthrough and RISC-V SBI forwarding.
 /// v6: Added `init_stack_frame_*` / `init_info_frame_*` slot ranges for
 ///     init self-reclaim.
-/// v7: Added `name: [u8; CAP_DESCRIPTOR_NAME_LEN]` to [`CapDescriptor`].
-///     Boot-module Frame caps (minted by the kernel from bundle entries)
-///     carry the bundle entry's identifier so init matches modules by
-///     name instead of ordinal position. Other descriptors carry NUL.
+/// v7: Added a fixed-size [`InitInfo::module_names`] table so init can
+///     map bundle-entry names (carried by the bootloader through
+///     `BootModule.name`) to the kernel's `CSpace` slot index of each
+///     module's `Frame` cap. The table lives in the `InitInfo` header so
+///     it sits on the first `InitInfo` page; the [`CapDescriptor`] array
+///     layout is unchanged.
 pub const INIT_PROTOCOL_VERSION: u32 = 7;
 
-/// Length of [`CapDescriptor::name`], matching
+/// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
 /// entry name straight through.
-pub const CAP_DESCRIPTOR_NAME_LEN: usize = 32;
+pub const INIT_MODULE_NAME_LEN: usize = 32;
+
+/// Maximum number of named boot-module entries the kernel can publish in
+/// [`InitInfo::module_names`]. Sized to comfortably cover the current
+/// `procmgr, devmgr, memmgr, vfsd, virtio-blk, fatfs` set plus future
+/// modules before the table fills.
+pub const INIT_MAX_NAMED_MODULES: usize = 8;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -216,6 +224,25 @@ pub struct InitInfo
     /// Number of `InitInfo` `Frame` caps (1..=[`INIT_INFO_MAX_PAGES`]).
     pub init_info_frame_count: u32,
 
+    // ── Boot-module name table (added in protocol version 7) ────────────
+    /// Number of valid [`InitModuleName`] entries in [`module_names`].
+    /// Indices `0..module_name_count` are populated; the rest are
+    /// [`INIT_MODULE_NAME_EMPTY`].
+    pub module_name_count: u32,
+
+    /// Explicit 4-byte pad so [`module_names`] starts 8-byte aligned
+    /// (each entry leads with a u32 slot but contains a u32 pad to
+    /// realign for the [u8;32] name; the table-level alignment matters
+    /// for the optimiser when reading the array as a whole).
+    #[doc(hidden)]
+    pub _pad_module_names: u32,
+
+    /// Bundle-entry-name → `CSpace`-slot mapping for boot-module Frame
+    /// caps. Lives inside the `InitInfo` header so it sits entirely on
+    /// the first `InitInfo` page (the [`CapDescriptor`] array that
+    /// follows the header may span pages).
+    pub module_names: [InitModuleName; INIT_MAX_NAMED_MODULES],
+
     /// Explicit 4-byte tail pad so `size_of::<InitInfo>()` stays 8-byte
     /// aligned. Consumers of `cap_descriptors_offset` rely on this: the
     /// `CapDescriptor` array that immediately follows contains u64
@@ -261,18 +288,36 @@ pub struct CapDescriptor
     /// - `IoPortRange`: port count
     /// - `SchedControl`: 0 (unused)
     pub aux1: u64,
-
-    /// Identifier for boot-module `Frame` caps, NUL-padded to
-    /// [`CAP_DESCRIPTOR_NAME_LEN`] bytes. Copied verbatim from the
-    /// originating bundle entry's [`boot_protocol::BootModule::name`].
-    /// All-zero for every other cap type.
-    pub name: [u8; CAP_DESCRIPTOR_NAME_LEN],
 }
 
-/// Empty / NUL-padded name for any [`CapDescriptor`] that is not a
-/// boot-module Frame cap. Producers (the kernel) MUST set
-/// [`CapDescriptor::name`] to this value for non-module descriptors.
-pub const CAP_DESCRIPTOR_EMPTY_NAME: [u8; CAP_DESCRIPTOR_NAME_LEN] = [0u8; CAP_DESCRIPTOR_NAME_LEN];
+/// Named boot-module entry published in [`InitInfo::module_names`].
+///
+/// Maps a bundle-entry name (carried through
+/// [`boot_protocol::BootModule::name`]) to the `CSpace` slot index of
+/// the module's `Frame` capability. The table sits in the `InitInfo`
+/// header so it always lives on the first `InitInfo` page and does not
+/// interact with the variable-length [`CapDescriptor`] array, which
+/// may span pages once `INIT_MAX_NAMED_MODULES` modules are minted.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InitModuleName
+{
+    /// `CSpace` slot index of the module's `Frame` cap.
+    pub slot: u32,
+    /// Explicit padding so `name` starts 8-byte aligned within the
+    /// surrounding `[InitModuleName; N]` array.
+    #[doc(hidden)]
+    pub _pad: u32,
+    /// Bundle entry name, NUL-padded to [`INIT_MODULE_NAME_LEN`] bytes.
+    pub name: [u8; INIT_MODULE_NAME_LEN],
+}
+
+/// Empty / NUL-padded slot for an unused [`InitModuleName`] entry.
+pub const INIT_MODULE_NAME_EMPTY: InitModuleName = InitModuleName {
+    slot: 0,
+    _pad: 0,
+    name: [0u8; INIT_MODULE_NAME_LEN],
+};
 
 /// Capability type discriminant for [`CapDescriptor`].
 ///
@@ -300,13 +345,31 @@ pub enum CapType
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Trim a NUL-padded descriptor name (or any [`CAP_DESCRIPTOR_NAME_LEN`]-byte
-/// name buffer) to its non-NUL prefix.
+/// Trim a NUL-padded module-name buffer to its non-NUL prefix.
 #[must_use]
-pub fn descriptor_name_str(name: &[u8; CAP_DESCRIPTOR_NAME_LEN]) -> &[u8]
+pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 {
     let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     &name[..end]
+}
+
+/// Locate a boot-module `Frame` cap by its bundle-entry name.
+///
+/// Returns the `CSpace` slot index from the first matching
+/// [`InitModuleName`] in [`InitInfo::module_names`], or `None` if no
+/// entry carries the requested name.
+#[must_use]
+pub fn find_module_slot(info: &InitInfo, name: &[u8]) -> Option<u32>
+{
+    let count = (info.module_name_count as usize).min(INIT_MAX_NAMED_MODULES);
+    for entry in &info.module_names[..count]
+    {
+        if module_name_str(&entry.name) == name
+        {
+            return Some(entry.slot);
+        }
+    }
+    None
 }
 
 /// Return the kernel command line as a byte slice from the [`InitInfo`] page.

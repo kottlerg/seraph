@@ -337,6 +337,18 @@ fn run(info_ptr: u64) -> !
         }
 
         log("ktest: shutdown");
+        // Brief unconditional wait so the terminal-marker lines (the
+        // `[ktest] ALL TESTS PASSED` / `SOME TESTS FAILED` line and
+        // the `ktest: shutdown` line above) have time to drain through
+        // QEMU's chardev backend before the shutdown port write tears
+        // the VM down. On slow TCG hosts (CI runners with QEMU stdio
+        // chardev) the chardev's last-buffer flush is not synchronous
+        // with the VM exit, and without this delay `run-parallel`'s
+        // pass-marker regex intermittently misses the terminal line.
+        // 100 ms is much more than the chardev's typical flush latency
+        // and is invisible against `KtestConfig::DEFAULT.timeout_secs`
+        // (which the operator controls separately).
+        wait_us(100_000);
         #[cfg(target_arch = "x86_64")]
         acpi_shutdown::shutdown(info);
         #[cfg(target_arch = "riscv64")]
@@ -539,7 +551,13 @@ pub fn log_version(prefix: &str, ver: u64)
 /// Yields the CPU between polls so the scheduler can run other threads.
 fn wait_seconds(secs: u32)
 {
-    let target_us = u64::from(secs) * 1_000_000;
+    wait_us(u64::from(secs) * 1_000_000);
+}
+
+/// Spin until `target_us` microseconds of `ElapsedUs` have passed since
+/// the call. Yields each iteration so other threads make progress.
+fn wait_us(target_us: u64)
+{
     let start = syscall::system_info(6).unwrap_or(0); // ElapsedUs = 6
     loop
     {

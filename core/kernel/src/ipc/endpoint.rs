@@ -372,14 +372,30 @@ pub unsafe fn endpoint_reply(
     {
         return None;
     }
-    // Plain Release store is safe under ep.lock — concurrent
-    // cancel_ipc_block uses compare_exchange and only clears if it matched
-    // its own client, which already lost to our load above.
+    // CAS-claim the reply slot: `cancel_ipc_block`, the
+    // `dealloc_object_one(Thread)` reply-bound waker, and the timer
+    // `BlockedOnReply` arm in `sleep_check_wakeups` all CAS this slot
+    // independently of `ep.lock`. A plain load+store would let one of
+    // them clear `reply_tcb` between our load and store while we still
+    // proceed to wake `caller` — yielding two `enqueue_and_wake` calls
+    // on the same client and a double-enqueue. See issue #117.
     // SAFETY: server validated.
-    unsafe {
+    if unsafe {
         (*server)
             .reply_tcb
-            .store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);
+            .compare_exchange(
+                caller,
+                core::ptr::null_mut(),
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+    }
+    {
+        // A concurrent canceller / dealloc / timer already cleared the
+        // slot; they own the wake (and the client may already be
+        // Stopped or Exited).
+        return None;
     }
 
     // SAFETY: caller stored by endpoint_call/recv. State transitions

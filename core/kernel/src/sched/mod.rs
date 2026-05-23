@@ -475,6 +475,11 @@ pub fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
 /// If we reach a signal-waiter tcb here, we must arbitrate against a
 /// concurrent `signal_send` by taking `sig.lock` and checking whether we
 /// are still registered as the waiter before claiming the wake.
+// too_many_lines: flat dispatch over every claimable `IpcThreadState`
+// (signal, event queue, reply, plain sleep); each arm is independent and
+// short, and splitting would require duplicating the SLEEP_LIST snapshot
+// plumbing.
+#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sleep_check_wakeups()
 {
@@ -598,6 +603,62 @@ pub fn sleep_check_wakeups()
                 }
                 // SAFETY: paired with lock_raw above.
                 unsafe { (*eq_state).lock.unlock_raw(saved_eq) };
+                we_win
+            }
+
+            crate::sched::thread::IpcThreadState::BlockedOnReply if !blocked_on.is_null() =>
+            {
+                // BlockedOnReply: `blocked_on` is the SERVER's TCB. The
+                // server's `reply_tcb` points to this tcb (the client) until
+                // `endpoint_reply`, `cancel_ipc_block`, or
+                // `dealloc_object_one(Thread)`'s reply-bound waker clears
+                // it.
+                //
+                // Defensive guard: no current code path adds a
+                // `BlockedOnReply` TCB to the sleep list (the IPC
+                // call/recv path does not accept a timeout — see
+                // `sys_ipc_call` and `sys_ipc_recv` in
+                // `core/kernel/src/syscall/ipc.rs`). If a future timeout
+                // surface is introduced, the `_` fall-through below
+                // would treat a `BlockedOnReply` waiter as a plain sleep
+                // and claim the wake unconditionally, racing with a
+                // concurrent `endpoint_reply` / cancel / dealloc and
+                // producing a double-`enqueue_and_wake`. This arm
+                // forecloses that by CAS-claiming the server's
+                // `reply_tcb` slot the same way every other reply-side
+                // writer does.
+                //
+                // CAS the server's `reply_tcb` from `tcb` (us) to null;
+                // success means we claim the wake, failure means the
+                // server/cancel/dealloc beat us. Lock order: SLEEP_LIST_LOCK
+                // was released above; this is a lock-free atomic.
+                // cast_ptr_alignment suppressed for the same reason as the
+                // signal arm above.
+                #[allow(clippy::cast_ptr_alignment)]
+                let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
+                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
+                let we_win = unsafe {
+                    (*server)
+                        .reply_tcb
+                        .compare_exchange(
+                            tcb,
+                            core::ptr::null_mut(),
+                            core::sync::atomic::Ordering::AcqRel,
+                            core::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                };
+                if we_win
+                {
+                    // SAFETY: tcb still valid; see above. State/ipc_state/
+                    // blocked_on_object are committed by enqueue_and_wake
+                    // under sched.lock.
+                    unsafe {
+                        (*tcb).wakeup_value = 0;
+                        (*tcb).timed_out = true;
+                        (*tcb).sleep_deadline = 0;
+                    }
+                }
                 we_win
             }
 

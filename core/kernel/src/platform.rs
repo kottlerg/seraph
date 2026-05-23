@@ -116,30 +116,12 @@ static mut VALIDATED_APERTURES: [MmioAperture; MAX_MMIO_APERTURES] = {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn validate_mmio_apertures(boot_info_phys: u64) -> &'static [MmioAperture]
 {
-    // DIAG (PR #138 release-ktest CI fault hunt): dump key pointers
-    // before the validator runs. Phase 6 release riscv64 ktest is
-    // crashing in CI with a kernel store fault at low-VA 0x9ddc0f58
-    // that local can't reproduce; this lets the failed-run log show
-    // exactly which pointer is computed incorrectly under CI's QEMU
-    // 8.2.2 (local repros with QEMU 11.0).
-    kprintln!("DIAG: boot_info_phys={:#x}", boot_info_phys);
-    let info_virt = phys_to_virt(boot_info_phys);
-    kprintln!("DIAG: phys_to_virt(boot_info_phys)={:#x}", info_virt);
     // SAFETY: boot_info_phys was validated in Phase 0; the direct physical map
     // is active since Phase 3.
-    let info: &BootInfo = unsafe { &*(info_virt as *const BootInfo) };
-    kprintln!(
-        "DIAG: info.mmio_apertures.entries={:p} count={}",
-        info.mmio_apertures.entries,
-        info.mmio_apertures.count
-    );
-    let buf_addr = core::ptr::addr_of_mut!(VALIDATED_APERTURES);
-    kprintln!("DIAG: &VALIDATED_APERTURES={:p}", buf_addr);
+    let info: &BootInfo = unsafe { &*(phys_to_virt(boot_info_phys) as *const BootInfo) };
     // SAFETY: single-threaded Phase 6; VALIDATED_APERTURES not yet aliased.
-    let buf = unsafe { &mut *buf_addr };
-    kprintln!("DIAG: entering validate_apertures_inner");
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(VALIDATED_APERTURES) };
     let count = validate_apertures_inner(info, buf);
-    kprintln!("DIAG: validate_apertures_inner returned count={}", count);
     // SAFETY: validate_apertures_inner wrote `count` entries; the rest are vacant.
     let p = core::ptr::addr_of!(VALIDATED_APERTURES);
     // SAFETY: `p` points at the valid 'static VALIDATED_APERTURES array;

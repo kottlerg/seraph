@@ -172,6 +172,11 @@ dealloc_object(Thread) (after the all-locks region releases):
 
 The Release in step 5 pairs with both the Acquire in step 6 (cross-CPU dequeue) and the Acquire in step 9 (TCB free). Without step 9, the lock release at step 3 lets `dealloc_object(Thread)` observe `sched.current = idle` (set at step 2) *while step 4 is still writing into `tcb.saved_state`* — freeing the TCB at that point lets the next allocation reuse the memory and `switch()` then corrupts the new allocation. The check is unconditional on the result of `running_on`, because the all-locks `running_on` snapshot can race step 2/3 and miss the in-flight switch. New TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
 
+**`context_saved = 1` and `popfq` ordering inside `Context::switch` (issue #117).** Step 5 above hides a finer-grained ordering invariant inside the `switch()` asm itself. Both the `context_saved = 1` publication AND the `popfq` that restores `next.saved_state.rflags` (which may set `IF = 1`) MUST happen AFTER `mov rsp, [rsi + 8]` (the rsp swap to the next thread's kstack), not before it. Doing either earlier opens this window:
+1. `popfq` before the rsp swap re-enables interrupts while this CPU is still executing on the OUTGOING thread's kstack. A trap taken in that window pushes its iretq frame onto the outgoing kstack.
+2. Publishing `current.context_saved = 1` before the rsp swap satisfies step 6's Acquire spin for any peer CPU that just dequeued `current`. That peer's own `switch()` then executes its own rsp swap onto the SAME outgoing kstack, and any push/pop the peer does collides with the iretq frame from (1).
+The collision overwrites the trap return address, so `iretq` on this CPU returns to a wild RIP (typically `0` because the corruption zeroes the slot). The `stress::concurrent_ipc` ktest surfaces this as a kernel `#PF` at `rip = 0, cr2 = 0, err = 0x10` at ~0.2 % per run on x86_64 TCG with the racy ordering. Keeping both the publication and `popfq` below the rsp swap closes the window.
+
 ---
 
 ## Wake Protocol Invariants

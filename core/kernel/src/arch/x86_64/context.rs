@@ -156,22 +156,14 @@ pub unsafe extern "C" fn switch(
         "pushfq",
         "pop rax",
         "mov [rdi + 72], rax",
-        // ── Save fs_base, then publish context_saved ──────────────────────
-        // saved_state.fs_base (offset 64) is the last field written during
-        // save. It must be globally visible before context_saved=1, because
-        // remote CPUs use the flag (Acquire) as the publication barrier
-        // for both cross-CPU dispatch (which then reads fs_base for the
-        // restore-side wrmsr) and dealloc UAF (which then frees the TCB
-        // body). See core/kernel/docs/scheduling-internals.md
-        // § Cross-CPU TCB Ownership.
-        //
-        // rdmsr clobbers rdx (which carries the save_flag pointer), so we
-        // stash it in r11 (caller-saved per System V AMD64; not part of
-        // SavedState). On x86-64 TSO, program-order stores are observed in
-        // program order by other CPUs, so the [rdi+64] store is visible
-        // before the [r11] store with no explicit fence; the scheduler-lock
-        // release at release_lock_only() happened in Rust before this asm
-        // and is independent of the publication barrier below.
+        // ── Save fs_base ──────────────────────────────────────────────────
+        // saved_state.fs_base (offset 64) is the last save-side field
+        // written. rdmsr clobbers rdx (which carries the save_flag
+        // pointer), so we stash it in r11 (caller-saved per System V
+        // AMD64; not part of SavedState). The `context_saved = 1`
+        // publication and the `popfq` that re-enables interrupts are
+        // both delayed until after the rsp swap (see #117 ordering note
+        // below in the restore phase).
         "mov r11, rdx", // r11 = save_flag (rdx clobbered by rdmsr)
         // fs_base: read the currently-live user TLS base from IA32_FS_BASE
         // (MSR 0xc0000100). rdmsr returns high 32 bits in edx, low 32 in
@@ -181,18 +173,25 @@ pub unsafe extern "C" fn switch(
         "shl rdx, 32",
         "or  rax, rdx",
         "mov [rdi + 64], rax", // saved_state.fs_base
-        // Publish context_saved = 1 only after every saved_state store is
-        // complete. The null check covers the boot path where save_flag is
-        // null (initial entry).
-        "test r11, r11",
-        "jz 1f",
-        "mov dword ptr [r11], 1", // *save_flag = 1
-        "1:",
         // ── Restore next thread ───────────────────────────────────────────
-        // Restore rflags first so the restored flags take effect early.
-        "mov rax, [rsi + 72]",
-        "push rax",
-        "popfq",
+        // #117 ordering invariant: `context_saved = 1` AND `popfq` (which
+        // restores `next.rflags`, re-enabling IF if the next thread had
+        // IF=1) must BOTH happen AFTER `mov rsp, [rsi + 8]`. Doing either
+        // earlier opens a fatal window:
+        //   (a) `popfq` before the rsp swap re-enables interrupts while
+        //       this CPU is still on the OUTGOING thread's kernel stack,
+        //       so any trap taken here pushes its iretq frame to the
+        //       outgoing kstack.
+        //   (b) Publishing `current.context_saved = 1` before the rsp
+        //       swap makes the outgoing TCB visible to peer CPUs as
+        //       "safe to dispatch" while this CPU is still using its
+        //       kstack. A peer that dispatches `current` will execute
+        //       its own `mov rsp, [rsi + 8]` onto the same outgoing
+        //       kstack — two CPUs sharing a kstack.
+        // Together (a) and (b) let a peer overwrite the iretq frame the
+        // trap in (a) pushed, so iretq on this CPU returns to a wild RIP
+        // — observed in stress::concurrent_ipc as a kernel #PF at RIP=0.
+        // Keep the publication and `popfq` below the rsp swap.
         // Restore fs_base into IA32_FS_BASE before any register the wrmsr
         // clobbers (rcx/rdx/rax) is finalised for the jump.
         "mov rax, [rsi + 64]",
@@ -206,7 +205,20 @@ pub unsafe extern "C" fn switch(
         "mov r12, [rsi + 32]",
         "mov rbp, [rsi + 24]",
         "mov rbx, [rsi + 16]",
-        "mov rsp, [rsi + 8]", // restore stack pointer
+        "mov rsp, [rsi + 8]", // restore stack pointer — now on next's kstack
+        // Publish context_saved = 1 only AFTER the rsp swap (see ordering
+        // note above). The null check covers the boot path where
+        // save_flag is null (initial entry).
+        "test r11, r11",
+        "jz 1f",
+        "mov dword ptr [r11], 1", // *save_flag = 1
+        "1:",
+        // Restore rflags (may re-enable IF). Doing this AFTER the rsp
+        // swap means an interrupt taken between popfq and `jmp rax`
+        // pushes its iretq frame to next's kstack, not the outgoing one.
+        "mov rax, [rsi + 72]",
+        "push rax",
+        "popfq",
         "mov rax, [rsi + 0]", // rip (jump target)
         "jmp rax",            // jump to next thread's rip
     );

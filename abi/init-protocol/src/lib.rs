@@ -36,7 +36,18 @@
 /// v4: Added `cspace_cap` slot for init's own `CSpace` cap.
 /// v3: Added `cmdline_offset`, `cmdline_len`, and `sbi_control_cap` for kernel
 ///     command line passthrough and RISC-V SBI forwarding.
-pub const INIT_PROTOCOL_VERSION: u32 = 6;
+/// v6: Added `init_stack_frame_*` / `init_info_frame_*` slot ranges for
+///     init self-reclaim.
+/// v7: Added `name: [u8; CAP_DESCRIPTOR_NAME_LEN]` to [`CapDescriptor`].
+///     Boot-module Frame caps (minted by the kernel from bundle entries)
+///     carry the bundle entry's identifier so init matches modules by
+///     name instead of ordinal position. Other descriptors carry NUL.
+pub const INIT_PROTOCOL_VERSION: u32 = 7;
+
+/// Length of [`CapDescriptor::name`], matching
+/// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
+/// entry name straight through.
+pub const CAP_DESCRIPTOR_NAME_LEN: usize = 32;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -250,7 +261,18 @@ pub struct CapDescriptor
     /// - `IoPortRange`: port count
     /// - `SchedControl`: 0 (unused)
     pub aux1: u64,
+
+    /// Identifier for boot-module `Frame` caps, NUL-padded to
+    /// [`CAP_DESCRIPTOR_NAME_LEN`] bytes. Copied verbatim from the
+    /// originating bundle entry's [`boot_protocol::BootModule::name`].
+    /// All-zero for every other cap type.
+    pub name: [u8; CAP_DESCRIPTOR_NAME_LEN],
 }
+
+/// Empty / NUL-padded name for any [`CapDescriptor`] that is not a
+/// boot-module Frame cap. Producers (the kernel) MUST set
+/// [`CapDescriptor::name`] to this value for non-module descriptors.
+pub const CAP_DESCRIPTOR_EMPTY_NAME: [u8; CAP_DESCRIPTOR_NAME_LEN] = [0u8; CAP_DESCRIPTOR_NAME_LEN];
 
 /// Capability type discriminant for [`CapDescriptor`].
 ///
@@ -277,6 +299,15 @@ pub enum CapType
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/// Trim a NUL-padded descriptor name (or any [`CAP_DESCRIPTOR_NAME_LEN`]-byte
+/// name buffer) to its non-NUL prefix.
+#[must_use]
+pub fn descriptor_name_str(name: &[u8; CAP_DESCRIPTOR_NAME_LEN]) -> &[u8]
+{
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    &name[..end]
+}
 
 /// Return the kernel command line as a byte slice from the [`InitInfo`] page.
 ///

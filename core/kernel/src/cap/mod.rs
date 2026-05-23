@@ -60,7 +60,7 @@ pub use slot::{CSpaceId, CapTag, CapabilitySlot, Rights, SlotId};
 use boot_protocol::{BootInfo, MemoryMapEntry, MemoryType, MmioAperture};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
-use init_protocol::CapDescriptor;
+use init_protocol::{CAP_DESCRIPTOR_EMPTY_NAME, CapDescriptor};
 
 use crate::mm::paging::phys_to_virt;
 
@@ -802,6 +802,7 @@ pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESC
         pad: [0; 3],
         aux0: 0,
         aux1: 0,
+        name: CAP_DESCRIPTOR_EMPTY_NAME,
     };
     [VACANT; CSPACE_LAYOUT_MAX_DESCRIPTORS]
 };
@@ -815,6 +816,7 @@ pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESC
         pad: [0; 3],
         aux0: 0,
         aux1: 0,
+        name: CAP_DESCRIPTOR_EMPTY_NAME,
     }; CSPACE_LAYOUT_MAX_DESCRIPTORS];
 
 /// Borrow the descriptor slice for the supplied [`CSpaceLayout`].
@@ -1062,6 +1064,7 @@ fn populate_cspace(
                     pad: [0; 3],
                     aux0: cap_base,
                     aux1: cap_size,
+                    name: CAP_DESCRIPTOR_EMPTY_NAME,
                 },
             );
             memory_frame_count += 1;
@@ -1119,6 +1122,7 @@ fn populate_cspace(
                 pad: [0; 3],
                 aux0: aligned_base,
                 aux1: aligned_size,
+                name: CAP_DESCRIPTOR_EMPTY_NAME,
             },
         );
         memory_frame_count += 1;
@@ -1168,6 +1172,7 @@ fn populate_cspace(
                 pad: [0; 3],
                 aux0: uart_base,
                 aux1: uart_size,
+                name: CAP_DESCRIPTOR_EMPTY_NAME,
             },
         );
     }
@@ -1200,6 +1205,7 @@ fn populate_cspace(
                 pad: [0; 3],
                 aux0: ap.phys_base,
                 aux1: ap.size,
+                name: CAP_DESCRIPTOR_EMPTY_NAME,
             },
         );
         hw_cap_count += 1;
@@ -1224,6 +1230,7 @@ fn populate_cspace(
             pad: [0; 3],
             aux0: 0,
             aux1: 0,
+            name: CAP_DESCRIPTOR_EMPTY_NAME,
         },
     );
 
@@ -1255,6 +1262,7 @@ fn populate_cspace(
             pad: [0; 3],
             aux0: 0,
             aux1: u64::from(ROOT_IRQ_COUNT),
+            name: CAP_DESCRIPTOR_EMPTY_NAME,
         },
     );
 
@@ -1316,6 +1324,7 @@ fn populate_cspace(
                 pad: [0; 3],
                 aux0: aligned_base,
                 aux1: size,
+                name: CAP_DESCRIPTOR_EMPTY_NAME,
             },
         );
         acpi_region_frame_count += 1;
@@ -1356,6 +1365,7 @@ fn populate_cspace(
                 pad: [0; 3],
                 aux0: info.acpi_rsdp,
                 aux1: 0x1000,
+                name: CAP_DESCRIPTOR_EMPTY_NAME,
             },
         );
         slot
@@ -1399,6 +1409,7 @@ fn populate_cspace(
                     pad: [0; 3],
                     aux0: info.device_tree & !0xFFF,
                     aux1: rounded,
+                    name: CAP_DESCRIPTOR_EMPTY_NAME,
                 },
             );
             slot
@@ -1439,6 +1450,7 @@ fn populate_cspace(
                 pad: [0; 3],
                 aux0: 0,
                 aux1: 0x10000, // full 64K range
+                name: CAP_DESCRIPTOR_EMPTY_NAME,
             },
         );
     }
@@ -1464,6 +1476,7 @@ fn populate_cspace(
                 pad: [0; 3],
                 aux0: 0,
                 aux1: 0,
+                name: CAP_DESCRIPTOR_EMPTY_NAME,
             },
         );
         slot
@@ -1615,6 +1628,7 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
                 pad: [0; 3],
                 aux0: module.physical_base,
                 aux1: module.size,
+                name: module.name,
             },
         );
         count += 1;
@@ -1784,6 +1798,7 @@ fn mint_reclaim_pass(
                 pad: [0; 3],
                 aux0: phys_base,
                 aux1: size_bytes,
+                name: CAP_DESCRIPTOR_EMPTY_NAME,
             },
         );
         count += 1;

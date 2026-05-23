@@ -418,8 +418,9 @@ fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
 /// tokened SEND from it and installs it as memmgr's
 /// `creator_endpoint_cap`.
 ///
-/// `memmgr_module_idx` is the index of memmgr's ELF in
-/// `InitInfo.module_frame_*`. Init uses it to find memmgr's image.
+/// The memmgr boot module is located in [`InitInfo`] by name via
+/// [`crate::find_module_by_name`] (init-protocol v7+); ordinal-based
+/// lookup is no longer used.
 ///
 /// `mm_service_ep` is the full-rights cap on memmgr's service endpoint
 /// (created in init's `CSpace`); init keeps a copy and minted SENDs from it
@@ -429,12 +430,11 @@ pub fn bootstrap_memmgr(
     info: &InitInfo,
     alloc: &mut FrameAlloc,
     init_bootstrap_ep: u32,
-    memmgr_module_idx: u32,
     mm_service_ep: u32,
 ) -> Option<MemmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;
-    let module_frame_cap = info.module_frame_base + memmgr_module_idx;
+    let module_frame_cap = crate::find_module_by_name(info, b"memmgr")?;
     let module_size = descriptor_for(info, module_frame_cap).map(|d| d.aux1)?;
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
@@ -805,7 +805,7 @@ pub fn bootstrap_procmgr(
 {
     let init_aspace = info.aspace_cap;
 
-    let module_frame_cap = info.module_frame_base; // Module 0 = procmgr
+    let module_frame_cap = crate::find_module_by_name(info, b"procmgr")?;
     let module_size = crate::descriptors(info)
         .iter()
         .find(|d| d.slot == module_frame_cap)

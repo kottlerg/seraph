@@ -177,6 +177,30 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     }
 }
 
+/// Locate a boot-module `Frame` capability by the bundle-entry name the
+/// bootloader stamped into [`CapDescriptor::name`] (init-protocol v7+).
+///
+/// Returns the descriptor's `CSpace` slot index, or `None` if no Frame
+/// descriptor carries the requested name. Replaces the historic
+/// ordinal-based lookups (`module_frame_base + N`).
+pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u32>
+{
+    descriptors(info).iter().find_map(|d| {
+        if d.cap_type != CapType::Frame
+        {
+            return None;
+        }
+        if init_protocol::descriptor_name_str(&d.name) == name
+        {
+            Some(d.slot)
+        }
+        else
+        {
+            None
+        }
+    })
+}
+
 // dead_code: used by the x86_64 serial module but not riscv64.
 #[allow(dead_code)]
 pub(crate) fn find_cap_by_type(info: &InitInfo, wanted: CapType) -> Option<u32>
@@ -495,24 +519,18 @@ fn run(info_ptr: u64) -> !
 
     // ── Bootstrap memmgr (raw ELF load; first half of remaining frames) ──────
 
-    if info.module_frame_count < 6
+    if find_module_by_name(info, b"memmgr").is_none()
     {
-        logging::log("FATAL: memmgr boot module missing (expect 6 modules)");
+        logging::log("FATAL: memmgr boot module missing from bundle");
         syscall::thread_exit();
     }
-    let memmgr_module_idx: u32 = 5;
 
     // Memmgr's setup phase: kernel objects, ELF load, PI page, stack/IPC
     // mappings, creator + procmgr SEND caps. Frame delegation and
     // thread_start are deferred to `finalize_memmgr` so procmgr's setup
     // can still draw from init's frame pool.
-    let Some(mm) = bootstrap::bootstrap_memmgr(
-        info,
-        &mut alloc,
-        init_bootstrap_ep,
-        memmgr_module_idx,
-        memmgr_service_ep,
-    )
+    let Some(mm) =
+        bootstrap::bootstrap_memmgr(info, &mut alloc, init_bootstrap_ep, memmgr_service_ep)
     else
     {
         logging::log("FATAL: failed to bootstrap memmgr");
@@ -640,8 +658,8 @@ fn run(info_ptr: u64) -> !
         use ipc::IpcMessage;
         use ipc::memmgr_labels;
 
-        let memmgr_module_cap = info.module_frame_base + memmgr_module_idx;
-        let procmgr_module_cap = info.module_frame_base; // module 0
+        let memmgr_module_cap = find_module_by_name(info, b"memmgr").unwrap_or(0);
+        let procmgr_module_cap = find_module_by_name(info, b"procmgr").unwrap_or(0);
         let Ok(donate_send) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_SEND_GRANT)
         else
         {
@@ -739,21 +757,11 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // Derive tokened call caps with the per-verb authority bits set.
-    // INGEST_CONFIG_MOUNTS and GET_SYSTEM_ROOT_CAP gate on these at
-    // vfsd's service-loop dispatcher; un-tokened sends are rejected
-    // with `UNAUTHORIZED`. MOUNT (un-gated) keeps using the root
-    // un-tokened cap.
-    let Ok(vfsd_ingest_cap) = syscall::cap_derive_token(
-        vfsd_service_ep,
-        syscall::RIGHTS_SEND,
-        ipc::vfsd_labels::INGEST_AUTHORITY,
-    )
-    else
-    {
-        logging::log("FATAL: cannot derive INGEST_AUTHORITY cap on vfsd service ep");
-        syscall::thread_exit();
-    };
+    // Derive a tokened call cap with the `SEED_AUTHORITY` bit set so vfsd's
+    // `GET_SYSTEM_ROOT_CAP` accepts the init request. `INGEST_AUTHORITY` is
+    // no longer needed (`INGEST_CONFIG_MOUNTS` was removed alongside
+    // `mounts.conf`); MOUNT is un-gated and keeps using the un-tokened
+    // service cap.
     let Ok(vfsd_seed_cap) = syscall::cap_derive_token(
         vfsd_service_ep,
         syscall::RIGHTS_SEND,
@@ -773,7 +781,7 @@ fn run(info_ptr: u64) -> !
         ..service::ServiceThreadCaps::default()
     };
 
-    if info.module_frame_count >= 2
+    if find_module_by_name(info, b"devmgr").is_some()
     {
         logging::log("requesting procmgr to create devmgr (with hw caps)");
         thread_caps.devmgr = service::create_devmgr_with_caps(
@@ -791,7 +799,7 @@ fn run(info_ptr: u64) -> !
         logging::log("no devmgr module available");
     }
 
-    if info.module_frame_count >= 3
+    if find_module_by_name(info, b"vfsd").is_some()
     {
         logging::log("requesting procmgr to create vfsd (with caps)");
         thread_caps.vfsd = service::create_vfsd_with_caps(
@@ -819,19 +827,12 @@ fn run(info_ptr: u64) -> !
 
     // ── Phase 2: mount root filesystem ──────────────────────────────────────
 
-    // SAFETY: InitInfo page is valid and contains cmdline data.
-    let cmdline = unsafe { init_protocol::cmdline_bytes(info) };
-    logging::log("phase 2: parsing cmdline");
-
-    let mut root_uuid = [0u8; 16];
-    if !mount::parse_root_uuid(cmdline, &mut root_uuid)
-    {
-        logging::log("FATAL: no root=UUID= in cmdline");
-        syscall::thread_exit();
-    }
-
+    // Boot protocol v8 removed the kernel command line; the root partition
+    // is identified by its GPT type-GUID (`role_guids::SERAPH_ROOT_<arch>`).
+    // vfsd resolves the role to a partition entry on its side; init just
+    // names the role.
     logging::log("phase 2: mounting root filesystem");
-    let root_mount = mount::send_mount(vfsd_service_ep, ipc_buf, &root_uuid, b"/");
+    let root_mount = mount::send_mount(vfsd_service_ep, ipc_buf, mount::MountRole::Root, b"/");
     if !root_mount.success
     {
         logging::log("FATAL: root mount failed");
@@ -839,28 +840,9 @@ fn run(info_ptr: u64) -> !
     }
     logging::log("phase 2: root mounted at /");
 
-    logging::log("phase 2: ingesting /config/mounts.conf via vfsd");
-    match mount::ingest_config_mounts(vfsd_ingest_cap, ipc_buf)
-    {
-        mount::IngestOutcome::Success =>
-        {}
-        mount::IngestOutcome::Partial(n) =>
-        {
-            let mut buf = [0u8; 96];
-            let mut w = SliceWriter::new(&mut buf);
-            let _ = core::fmt::write(
-                &mut w,
-                format_args!("phase 2: INGEST_CONFIG_MOUNTS partial: {n} mount line(s) failed"),
-            );
-            // SAFETY: SliceWriter only writes UTF-8 bytes from `core::fmt::write`.
-            let s = unsafe { core::str::from_utf8_unchecked(w.as_slice()) };
-            logging::log(s);
-        }
-        mount::IngestOutcome::Fail =>
-        {
-            logging::log("phase 2: INGEST_CONFIG_MOUNTS failed");
-        }
-    }
+    // `/config/mounts.conf` and `INGEST_CONFIG_MOUNTS` are gone. Additional
+    // partitions (e.g. the ESP, mounted at `/esp`) are discovered and mounted
+    // by vfsd directly via GPT type-GUID lookup.
 
     // Acquire init's seed system-root cap. Drives every Phase 3
     // walk-and-spawn — children receive a `cap_copy` of this cap via

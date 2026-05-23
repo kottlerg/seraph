@@ -503,9 +503,19 @@ deferring to the next enqueue:
 
 ### Soft Affinity
 
-`tcb.preferred_cpu` records the CPU the thread was last assigned to. The load
-balancer uses this as a hint to avoid unnecessary migration (cache warmth). A thread
-may be migrated away from its preferred CPU when load balancing requires it.
+`tcb.preferred_cpu` records the CPU the thread was last assigned to. The
+wake-side placement (`select_target_cpu`) honours it as a sticky cache-
+warmth hint: it scans all CPUs for `min_load`, and if `preferred_cpu`'s
+load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of `min_load`, the
+thread is re-placed on its preferred CPU. Beyond that threshold the
+thread is migrated to the least-loaded CPU. The threshold is the same
+hysteresis the pull balancer uses to decide an imbalance is real, so
+soft affinity, wake placement, and pull balancing share one knob.
+
+Hard affinity (`cpu_affinity != AFFINITY_ANY`) and save-window pinning
+(`context_saved == 0`) both short-circuit ahead of the soft-affinity
+check; see `select_target_cpu` in `core/kernel/src/sched/mod.rs` for
+the full policy.
 
 The scheduler does not expose soft affinity as a syscall parameter — it is an internal
 optimisation.

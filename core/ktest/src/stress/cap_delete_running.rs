@@ -21,12 +21,7 @@ use syscall::{cap_delete, thread_yield};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// 4 — pre-ramp baseline. See `concurrent_signal.rs::NUM_SENDERS` for
-/// the kernel-side scaling pathologies. The follow-on hang in
-/// `cap_revoke_under_use` was observed even after this test ran to PASS
-/// at NUM=16, so kernel state appears to accumulate; keeping per-test
-/// concurrency at the pre-ramp baseline avoids cross-test interference.
-const NUM_CHILDREN: usize = 4;
+const NUM_CHILDREN: usize = 16;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

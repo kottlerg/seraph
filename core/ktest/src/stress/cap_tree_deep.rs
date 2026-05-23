@@ -11,7 +11,7 @@ use syscall::{cap_create_signal, cap_delete, cap_derive, cap_revoke, signal_send
 use crate::{TestContext, TestResult};
 
 const CHAIN_DEPTH: usize = 8;
-const PASSES: usize = 50;
+const PASSES: usize = 500;
 const RIGHTS_SIGNAL: u64 = 1 << 7;
 
 pub fn run(ctx: &TestContext) -> TestResult

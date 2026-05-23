@@ -1673,10 +1673,25 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize, 
 #[allow(unused_variables)]
 pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize, _priority: u8) {}
 
-/// Select target CPU for enqueueing a thread based on affinity and load.
+/// Select target CPU for enqueueing a thread based on affinity, soft
+/// affinity (cache warmth), and load.
 ///
-/// If the thread has explicit CPU affinity, returns that CPU. Otherwise,
-/// selects the least-loaded CPU for load balancing.
+/// Policy, in priority order:
+/// 1. **Hard affinity** (`cpu_affinity != AFFINITY_ANY`): return that CPU.
+/// 2. **Save-window pinning** (`context_saved == 0`): pin to
+///    `preferred_cpu` to avoid the cross-CPU `schedule()` spin against
+///    the source CPU's still-in-flight context save.
+/// 3. **Sticky preferred CPU**: scan all CPUs for `min_load`; if
+///    `preferred_cpu`'s load is within
+///    [`LOAD_BALANCE_IMBALANCE_THRESHOLD`] of `min_load`, return
+///    `preferred_cpu`. Cache-warmth bias matching the documented soft-
+///    affinity intent (`core/kernel/docs/scheduler.md` § Soft Affinity)
+///    and the same hysteresis the pull balancer applies before deciding
+///    an imbalance is real (`try_pull_balance`,
+///    `LOAD_BALANCE_IMBALANCE_THRESHOLD` site). Closes the per-wake CPU-
+///    bouncing pathology that starves a thread inside a busy multi-CPU
+///    runqueue (issue #128: `cap_revoke` parent vs. spinner flood).
+/// 4. **Min load**: return the least-loaded CPU.
 ///
 /// # Safety
 /// `tcb` must be a valid pointer to an initialized [`ThreadControlBlock`].
@@ -1696,6 +1711,8 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
         return affinity as usize;
     }
 
+    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+
     // Save-window pinning: while `context_saved == 0` the source CPU is
     // mid-switch into `tcb.saved_state`. Migrating the wake to a different
     // CPU would force its `schedule()` to spin on the publication barrier;
@@ -1712,18 +1729,16 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
         // SAFETY: preferred_cpu is set by every prior enqueue_and_wake;
         // bounded by CPU_COUNT at the source.
         let pref = unsafe { (*tcb).preferred_cpu } as usize;
-        let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
         if pref < cpu_count
         {
             return pref;
         }
     }
 
-    // No preference: load balance across all CPUs.
-    let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    // Scan all CPUs for min load. Used both as the fallback selection and as
+    // the reference value for the sticky-preferred-CPU comparison below.
     let mut min_load = u32::MAX;
     let mut min_cpu = 0;
-
     // SAFETY: scheduler slab covers cpu_count slots, all initialised by sched::init.
     for cpu in 0..cpu_count
     {
@@ -1733,6 +1748,22 @@ pub unsafe fn select_target_cpu(tcb: *mut ThreadControlBlock) -> usize
         {
             min_load = load;
             min_cpu = cpu;
+        }
+    }
+
+    // Sticky preferred CPU: stay if within the pull-balancer's imbalance
+    // threshold of the global minimum. See doc comment above.
+    // SAFETY: preferred_cpu is set by every prior enqueue_and_wake; bounded
+    // by CPU_COUNT at the source. The `< cpu_count` guard makes a stale or
+    // never-initialised value fall through to the min-load path.
+    let pref = unsafe { (*tcb).preferred_cpu } as usize;
+    if pref < cpu_count
+    {
+        // SAFETY: pref < cpu_count; slab initialised.
+        let pref_load = unsafe { (*scheduler_ptr(pref)).current_load() };
+        if pref_load <= min_load.saturating_add(LOAD_BALANCE_IMBALANCE_THRESHOLD)
+        {
+            return pref;
         }
     }
 

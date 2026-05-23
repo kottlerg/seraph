@@ -3,9 +3,9 @@
 
 //! Stress test: revoke while derived capabilities are actively used.
 //!
-//! 4 child threads send on derived caps in a tight loop. The parent revokes
-//! the root cap mid-flight. Children detect errors and exit. Verifies no
-//! kernel panic or use-after-free occurs.
+//! `NUM_CHILDREN` threads send on derived caps in a tight loop. The parent
+//! revokes the root cap mid-flight. Children detect errors and exit.
+//! Verifies no kernel panic or use-after-free occurs.
 
 use syscall::{
     cap_copy, cap_create_signal, cap_delete, cap_derive, cap_revoke, signal_send, signal_wait,
@@ -14,11 +14,7 @@ use syscall::{
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// 16 — pre-ramp baseline. See the kernel-side notes on `NUM_SENDERS`
-/// in `concurrent_signal.rs` for the two scaling pathologies that block
-/// ramping this further; the `cap_revoke`-under-spinner-flood case is
-/// the one this test would normally surface.
-const NUM_CHILDREN: usize = 16;
+const NUM_CHILDREN: usize = 64;
 const RIGHTS_SIGNAL: u64 = 1 << 7;
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -28,7 +24,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "cap_revoke_under_use: create done failed")?;
 
-    // Derive 4 children from root.
+    // Derive NUM_CHILDREN children from root.
     let mut derived = [0u32; NUM_CHILDREN];
     for slot in &mut derived
     {
@@ -36,7 +32,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             cap_derive(root, RIGHTS_SIGNAL).map_err(|_| "cap_revoke_under_use: derive failed")?;
     }
 
-    // Spawn 4 threads, each sending on its derived cap.
+    // Spawn NUM_CHILDREN threads, each sending on its derived cap.
     let mut threads = [0u32; NUM_CHILDREN];
     let mut cspaces = [0u32; NUM_CHILDREN];
     for i in 0..NUM_CHILDREN

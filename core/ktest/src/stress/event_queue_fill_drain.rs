@@ -12,7 +12,7 @@ use syscall_abi::SyscallError;
 use crate::{TestContext, TestResult};
 
 const CAPACITY: u32 = 8;
-const CYCLES: usize = 200;
+const CYCLES: usize = 2000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {

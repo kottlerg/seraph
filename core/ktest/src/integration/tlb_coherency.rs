@@ -29,7 +29,7 @@ use crate::{ChildStack, TestContext, TestResult};
 
 const TEST_VA: u64 = 0x5000_0000; // 1.25 GiB — distinct from other integration tests.
 const RIGHTS_SIGNAL_WAIT: u64 = (1 << 7) | (1 << 8);
-const CYCLES: usize = 20;
+const CYCLES: usize = 100;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 

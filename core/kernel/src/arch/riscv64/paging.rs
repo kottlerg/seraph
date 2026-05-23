@@ -318,27 +318,36 @@ pub fn read_stack_pointer() -> u64
 
 /// Rebase the boot stack from identity-mapped to the direct physical map.
 ///
-/// Adds `direct_map_base` to `sp` and `s0` (frame pointer), switching from
-/// VA == PA to VA == `direct_map_base` + PA. Both mappings cover the same
-/// physical frames; this eliminates the 64 KiB identity-map limit.
+/// Adds `direct_map_base` to `sp`, switching from VA == PA to
+/// VA == `direct_map_base` + PA. Both mappings cover the same physical
+/// frames; this eliminates the 64 KiB identity-map limit.
 ///
 /// # Safety
 /// Must be called exactly once, immediately after `activate`, while the
 /// boot stack identity mapping is still valid. `direct_map_base` must be
 /// the base of a direct physical map that covers all of physical RAM.
+///
+/// # Codegen invariant — do not add `options(nostack)`
+/// This `asm!` block rewrites `sp` from the identity-mapped value to its
+/// direct-map alias. `options(nostack)` would tell LLVM "this asm leaves
+/// `sp` alone, sp-relative loads may be hoisted across it" — a direct
+/// lie about the body. Under release-LTO that license lets LLVM hoist a
+/// caller's `add reg, sp, imm` (local-variable address computation)
+/// across the rebase, producing a stale low-VA pointer the page tables
+/// do not cover. The kernel then page-faults the next time that pointer
+/// is dereferenced (PR #138 hit this in Phase 6's `kernel_entry` body).
+/// Leaving `options` off makes LLVM treat the asm as conservatively
+/// stack-modifying, which is the truth.
 #[cfg(not(test))]
 pub unsafe fn rebase_boot_stack(direct_map_base: u64)
 {
     // SAFETY: adding the direct-map offset to sp switches to the same
     // physical memory through the direct map virtual range. Both the
     // identity mapping (old) and direct map (new) are valid at this point.
-    // s0 is NOT rebased: in release mode it is a general-purpose register,
-    // not a frame pointer, and adding to it would corrupt live data.
     unsafe {
         core::arch::asm!(
             "add sp, sp, {base}",
             base = in(reg) direct_map_base,
-            options(nostack),
         );
     }
 }

@@ -323,9 +323,14 @@ entire bitmask.
 
 **Return:**
 
-- `rax`/`a0`: the bitmask that was set (positive, non-zero) on signal wake;
-  `0` on timeout (unambiguous: `signal_send` rejects zero-bit sends, so a
-  real wake always carries a non-zero mask). `SyscallError` on failure.
+- `rax`/`a0`: 0 on success; `SyscallError` on failure
+- `rdx`/`a1`: acquired bitmask on success (non-zero on signal wake; `0`
+  on timeout — unambiguous because `signal_send` rejects zero-bit sends,
+  so a real wake always carries a non-zero mask)
+
+Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
+bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
+full 64-bit bitmask range is usable.
 
 **Capability requirement:** `signal_cap` must have Wait rights.
 

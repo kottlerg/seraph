@@ -254,6 +254,14 @@ pub fn run_all(ctx: &TestContext)
         "signal::wait_timeout_returns_bits_first",
         signal::wait_timeout_returns_bits_first(ctx)
     );
+    run_test!(
+        "signal::wait_high_bit_roundtrip",
+        signal::wait_high_bit_roundtrip(ctx)
+    );
+    run_test!(
+        "signal::wait_high_bit_parked_wakeup",
+        signal::wait_high_bit_parked_wakeup(ctx)
+    );
 
     // ── Event queue syscalls ──────────────────────────────────────────────────
     run_test!("event::create", event::create(ctx));

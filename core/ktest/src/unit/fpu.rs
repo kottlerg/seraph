@@ -482,7 +482,9 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     // SAFETY: inline asm loads pat128 into xmm0..xmm15, issues two raw
     // syscalls (SIGNAL_SEND, SIGNAL_WAIT) preserving the live FP register
     // file across both, then stores xmm0..xmm15 into buf. All operands
-    // have matching lifetimes; rcx/r11 are syscall-clobber-only.
+    // have matching lifetimes; rcx/r11 are syscall-clobber-only. rdx is
+    // clobbered by SIGNAL_WAIT's secondary-return write (the kernel writes
+    // the acquired bitmask into rdx via `set_ipc_return`).
     unsafe {
         core::arch::asm!(
             "vmovdqu xmm0,  [{p}]",
@@ -537,7 +539,7 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
             it = inout(reg) spin => _,
             sig_ready = in(reg) sig_ready,
             sig_resume = in(reg) sig_resume,
-            out("rax") _, out("rcx") _, out("rdi") _, out("rsi") _, out("r11") _,
+            out("rax") _, out("rcx") _, out("rdx") _, out("rdi") _, out("rsi") _, out("r11") _,
             out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
             out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
             out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,

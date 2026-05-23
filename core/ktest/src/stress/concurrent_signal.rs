@@ -11,17 +11,11 @@ use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait,
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// 16 — pre-ramp baseline. Two separate kernel-side issues block
-/// ramping this further in-tree:
-///
-/// 1. Bit 63 of `SYS_SIGNAL_WAIT`'s returned bitmask aliases with the
-///    dispatcher's `cast_signed()` Err encoding, so per-bit accounting
-///    tops out at 63 distinct workers.
-/// 2. Above ~16-32 concurrently runnable spinning syscall threads on
-///    4-CPU SMP, follow-on tests (notably `cap_revoke_under_use`)
-///    observe scheduler-fairness starvation. Until the kernel is
-///    fixed, we keep this constant at the pre-ramp baseline so
-///    downstream stress tests aren't compromised.
+/// 16 — pre-ramp baseline. Above ~16-32 concurrently runnable spinning
+/// syscall threads on 4-CPU SMP, follow-on tests (notably
+/// `cap_revoke_under_use`) observe scheduler-fairness starvation. Until
+/// the kernel-side fairness issue is fixed, we keep this constant at the
+/// pre-ramp baseline so downstream stress tests aren't compromised.
 ///
 /// Iteration count is the pre-ramp baseline; in-tree experiments showed
 /// the ramped 5000-iter variant left follow-on tests in a degraded state
@@ -44,7 +38,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let done = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "concurrent_signal: create done failed")?;
 
-    // Spawn 4 sender threads.
+    // Spawn `NUM_SENDERS` sender threads.
     let mut threads = [0u32; NUM_SENDERS];
     let mut cspaces = [0u32; NUM_SENDERS];
 
@@ -71,8 +65,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // Wait for all senders to report done. Each child ORs a unique bit into
-    // `done`, so we wait until all 4 bits are set (one blocking wait suffices
-    // since the last child to finish will set the final bit).
+    // `done`, so we wait until every `NUM_SENDERS` bit is set (one blocking
+    // wait suffices since the last child to finish will set the final bit).
     let mut done_bits: u64 = 0;
     while done_bits != ALL_BITS
     {

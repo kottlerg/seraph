@@ -231,19 +231,26 @@ behaviour.
    // Atomically read and clear all bits
 2. if acquired != 0:
    // Bits were set; return immediately without blocking
-   return acquired
+   tf.set_ipc_return(primary = 0, secondary = acquired); return Ok(0)
 3. Acquire waiter_lock
 4. Re-check: acquired = bits.swap(0, Ordering::Acquire)
    // Must re-check after acquiring lock to prevent lost-wakeup race:
    // a sender may have set bits between step 1 and step 3
 5. if acquired != 0:
-   Release waiter_lock; return acquired
+   Release waiter_lock;
+   tf.set_ipc_return(primary = 0, secondary = acquired); return Ok(0)
 6. waiter = current_tcb
 7. Release waiter_lock
 8. Block current thread; return when woken
 9. On wakeup: the sender has already performed bits.swap(0) and stored the
-   result in current_tcb.wakeup_value; return that value
+   result in current_tcb.wakeup_value;
+   tf.set_ipc_return(primary = 0, secondary = wakeup_value); return Ok(0)
 ```
+
+The acquired bitmask is delivered in the secondary return register
+(rdx / a1), matching `SYS_EVENT_RECV`'s register layout. An in-band
+encoding via the dispatcher's `cast_signed()` of the primary would alias
+bit-63-set bitmasks with negative-Err codes.
 
 ---
 

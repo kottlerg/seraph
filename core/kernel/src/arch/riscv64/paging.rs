@@ -327,18 +327,25 @@ pub fn read_stack_pointer() -> u64
 /// boot stack identity mapping is still valid. `direct_map_base` must be
 /// the base of a direct physical map that covers all of physical RAM.
 ///
-/// # Codegen invariant — do not add `options(nostack)`
-/// This `asm!` block rewrites `sp` from the identity-mapped value to its
-/// direct-map alias. `options(nostack)` would tell LLVM "this asm leaves
-/// `sp` alone, sp-relative loads may be hoisted across it" — a direct
-/// lie about the body. Under release-LTO that license lets LLVM hoist a
-/// caller's `add reg, sp, imm` (local-variable address computation)
-/// across the rebase, producing a stale low-VA pointer the page tables
-/// do not cover. The kernel then page-faults the next time that pointer
-/// is dereferenced (PR #138 hit this in Phase 6's `kernel_entry` body).
-/// Leaving `options` off makes LLVM treat the asm as conservatively
-/// stack-modifying, which is the truth.
+/// # Codegen invariant — `#[inline(never)]` plus no `options(nostack)`
+/// This `asm!` block rewrites `sp` from the identity-mapped value to
+/// its direct-map alias. Rust inline asm cannot list `sp` as an output
+/// (it's a reserved register), so LLVM has no way to learn that this
+/// asm modifies `sp`. If LLVM inlines this function into the caller,
+/// it freely hoists any sp-relative local-address materialisation
+/// (`add reg, sp, imm`) to *before* the rebase, producing a stale
+/// low-VA pointer that page-faults on next dereference (PR #138 hit
+/// this in `kernel_entry`'s Phase 6 body — sepc=0xffffffff8000d972,
+/// stval=0x9ddc0f58 on CI's riscv64 release ktest).
+///
+/// `#[inline(never)]` is the fix: an opaque function call is an
+/// optimisation barrier the scheduler cannot move ops across, so every
+/// sp-derived expression in the caller materialises on the correct
+/// side of the rebase. Dropping `options(nostack)` is belt-and-braces
+/// in case a future revision re-inlines this — `nostack` would still
+/// be a factual lie about the body.
 #[cfg(not(test))]
+#[inline(never)]
 pub unsafe fn rebase_boot_stack(direct_map_base: u64)
 {
     // SAFETY: adding the direct-map offset to sp switches to the same

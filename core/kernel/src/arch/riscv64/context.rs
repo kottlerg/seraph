@@ -134,29 +134,31 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, _is_user: bool) -> SavedS
 /// thread, `next.ra` is the return address from its previous `switch` call.
 ///
 /// # Safety
-/// Both pointers must be valid, aligned `SavedState` values. Caller must hold
-/// the scheduler lock. `save_flag` must be a valid `*const AtomicU32` (the
-/// current thread's `context_saved` field) or null (initial boot switch).
+/// Both pointers must be valid, aligned `SavedState` values. Caller must have
+/// already released the scheduler lock (`schedule()` calls
+/// `sched.lock.release_lock_only()` before invoking `switch()`).
+/// `save_flag` must be a valid `*const AtomicU32` (the current thread's
+/// `context_saved` field) or null (initial boot switch).
 ///
-/// Both the `*save_flag = 1` publication and the `now_serving` lock release
-/// happen AFTER `ld sp, 0(a1)` (the sp swap to next's kstack). Publishing
-/// before the sp swap would let a peer hart observe `context_saved == 1`,
-/// dispatch the outgoing TCB, and execute its own sp restore onto the same
-/// outgoing kstack while this hart is still on it. See `core/kernel/docs/
-/// scheduling-internals.md` § Cross-CPU TCB Ownership (issue #117 / #133).
+/// The `*save_flag = 1` publication MUST happen AFTER `ld sp, 0(a1)` (the sp
+/// swap to next's kstack). Publishing before the sp swap would let a peer hart
+/// observe `context_saved == 1`, dispatch the outgoing TCB, and execute its
+/// own sp restore onto the same outgoing kstack while this hart is still on
+/// it. See `core/kernel/docs/scheduling-internals.md` § Cross-CPU TCB
+/// Ownership (issue #117 / #133).
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(
     current: *mut SavedState,
     next: *const SavedState,
     save_flag: *const core::sync::atomic::AtomicU32,
-    lock_ptr: *const crate::sync::Spinlock,
+    _lock_ptr: *const crate::sync::Spinlock,
 )
 {
     // a0 = current (*mut SavedState)
     // a1 = next (*const SavedState)
     // a2 = save_flag (*const AtomicU32) — context_saved flag on current TCB
-    // a3 = lock_ptr (*const Spinlock) — scheduler lock (now_serving at offset 4)
+    // a3 = _lock_ptr — vestigial; kept for cross-arch ABI consistency with x86.
     // SAFETY: switch_context preserves ABI; both pointers valid; stack/frame pointers valid.
     core::arch::naked_asm!(
         // ── Save current thread to *a0 ────────────────────────────────────
@@ -179,16 +181,16 @@ pub unsafe extern "C" fn switch(
         "sd s10,   96(a0)",
         "sd s11,  104(a0)",
         // ── Restore next thread from *a1 ──────────────────────────────────
-        // #117 / #133 ordering invariant: both `*save_flag = 1` and the
-        // `now_serving` Release MUST happen AFTER `ld sp, 0(a1)` (the sp
-        // swap below). Publishing earlier lets a peer hart that observes
-        // `context_saved == 1` and dequeues `current` execute its own sp
-        // restore from `saved_state.sp` (still the OUTGOING sp) onto the
-        // same outgoing kstack while this hart is still pre-`ld sp` — two
-        // harts then push/pop on a shared kstack. Window (a) from the
-        // x86_64 fix does not apply on RISC-V because `switch()` does not
-        // restore `sstatus` and SIE stays masked across the swap, so no
-        // trap iretq frame is in flight; only window (b) is closed here.
+        // #117 / #133 ordering invariant: `*save_flag = 1` MUST happen AFTER
+        // `ld sp, 0(a1)` (the sp swap below). Publishing earlier lets a peer
+        // hart that observes `context_saved == 1` and dequeues `current`
+        // execute its own sp restore from `saved_state.sp` (still the
+        // OUTGOING sp) onto the same outgoing kstack while this hart is
+        // still pre-`ld sp` — two harts then push/pop on a shared kstack.
+        // Window (a) from the x86_64 fix does not apply on RISC-V because
+        // `switch()` does not restore `sstatus` and SIE stays masked across
+        // the swap, so no trap iretq frame is in flight; only window (b) is
+        // closed here.
         "ld ra,     8(a1)", // return address (or entry function)
         "ld sp,     0(a1)", // sp swap — now on next's kstack
         "ld s0,    16(a1)",
@@ -214,17 +216,7 @@ pub unsafe extern "C" fn switch(
         "fence rw, w",    // Release fence: order saves before flag
         "sw   t0, 0(a2)", // *save_flag = 1
         "1:",
-        // ── Release scheduler lock ────────────────────────────────────────
-        // Advance now_serving (offset 4 in Spinlock) so other CPUs can
-        // acquire this CPU's scheduler lock. Uses fence + plain store
-        // since we only need Release ordering and the lock protocol
-        // guarantees single-writer (only the holder advances now_serving).
-        "fence rw, w",    // Release fence: order saves before unlock
-        "addi a3, a3, 4", // a3 = &now_serving
-        "lw   t0, 0(a3)", // t0 = now_serving
-        "addi t0, t0, 1", // t0 += 1
-        "sw   t0, 0(a3)", // now_serving = t0 + 1
-        "ret",            // jr ra → jumps to next thread's entry or resume point
+        "ret", // jr ra → jumps to next thread's entry or resume point
     );
 }
 

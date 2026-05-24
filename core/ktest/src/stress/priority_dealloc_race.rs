@@ -9,11 +9,10 @@
 //! syscalls under contention:
 //!
 //!   * **Phase 1** churns priority on every worker each cycle and, once
-//!     per 32-cycle window, also flips affinity — the load balancer /
-//!     active migration races the priority-change's locate-and-relocate.
-//!     The affinity-flip cadence is intentionally sparse to keep the
-//!     test from reliably triggering the pre-existing cross-CPU
-//!     `context_saved` publication hazard (see issue #144).
+//!     per 4-cycle window, also flips affinity — the load balancer /
+//!     active migration races the priority-change's locate-and-relocate
+//!     and exercises the cross-CPU outgoing re-enqueue branch under heavy
+//!     contention.
 //!   * **Phase 2** does two rapid priority writes followed by
 //!     `cap_delete(Thread)` — the dealloc all-locks walk races the
 //!     priority-change in flight.
@@ -64,12 +63,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Hazard 2 surface: an affinity-driven migration to a different CPU's
     // queue, racing the priority-change's locate-and-relocate sequence.
     //
-    // Affinity flips are sparse (one per 32-cycle window) to keep this
-    // test from reliably triggering the pre-existing cross-CPU
-    // `context_saved` publication hazard tracked by issue #144 — that
-    // hang is a separate review surface (cross-CPU dispatch publication,
-    // not the Scheduling-group locking that this fix addresses) and is
-    // exposed by any dense affinity-churn workload.
+    // Affinity flips run every 4 cycles — dense enough to exercise the
+    // cross-CPU `schedule()` outgoing-thread re-enqueue branch and the
+    // `context_saved` publication barrier closed by issue #144.
     for cycle in 0..CYCLES
     {
         // CYCLES and NUM_WORKERS are compile-time constants well below
@@ -80,7 +76,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             let prio: u8 = if (cycle + i) & 1 == 0 { 3 } else { 9 };
             let _ = thread_set_priority(th, prio, 0);
-            if cycle % 32 == 0
+            if cycle % 4 == 0
             {
                 let i_u32 = u32::try_from(i).unwrap_or(0);
                 let target_cpu = (i_u32 + cycle_u32) % cpu_mod;

@@ -243,7 +243,11 @@ pub struct RunParallelArgs
     pub pass: String,
 
     /// Regex marking a failed run. On match the log is preserved as
-    /// FAIL-<run>.log. Failure takes precedence over success.
-    #[arg(long)]
-    pub fail: Option<String>,
+    /// FAIL-<run>.log. Failure takes precedence over success. The default
+    /// matches the cross-harness terminal marker
+    /// `[<harness>] SOME TESTS FAILED` standardised in
+    /// [`docs/testing.md`](../../../docs/testing.md); override with a
+    /// never-matching pattern (e.g. `'$.^'`) to disable.
+    #[arg(long, default_value = "SOME TESTS FAILED")]
+    pub fail: String,
 }

@@ -105,11 +105,8 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     validate_args(args)?;
     let pass_re =
         Regex::new(&args.pass).with_context(|| format!("invalid --pass regex {:?}", args.pass))?;
-    let fail_re = match &args.fail
-    {
-        Some(s) => Some(Regex::new(s).with_context(|| format!("invalid --fail regex {:?}", s))?),
-        None => None,
-    };
+    let fail_re =
+        Regex::new(&args.fail).with_context(|| format!("invalid --fail regex {:?}", args.fail))?;
 
     validate_sysroot_for_launch(ctx, args.arch)?;
 
@@ -244,8 +241,7 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 let elapsed = started.elapsed();
 
                 let log_text = read_log(&log_path).unwrap_or_default();
-                let (status, matched) =
-                    classify(exit_rc, hung, &log_text, &pass_re, fail_re.as_ref());
+                let (status, matched) = classify(exit_rc, hung, &log_text, &pass_re, &fail_re);
 
                 let outcome = RunOutcome {
                     run: run_id,
@@ -439,17 +435,14 @@ fn classify(
     hung: bool,
     log: &str,
     pass_re: &Regex,
-    fail_re: Option<&Regex>,
+    fail_re: &Regex,
 ) -> (Status, Option<String>)
 {
     // Failure marker beats everything: a panic anywhere in the log invalidates
     // any PASS line. Use the first hit — earliest failure is the proximate cause.
-    if let Some(re) = fail_re
+    if let Some(m) = fail_re.find(log)
     {
-        if let Some(m) = re.find(log)
-        {
-            return (Status::Fail, Some(line_containing(log, m.start())));
-        }
+        return (Status::Fail, Some(line_containing(log, m.start())));
     }
     // Pass marker beats watchdog: a kernel that prints PASS and then idles
     // (no shutdown path) reaches the timeout but is functionally successful.

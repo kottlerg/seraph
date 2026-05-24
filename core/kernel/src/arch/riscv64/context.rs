@@ -159,6 +159,17 @@ pub unsafe extern "C" fn switch(
     // a2 = save_flag (*const AtomicU32) — context_saved flag on current TCB
     // SAFETY: switch_context preserves ABI; both pointers valid; stack/frame pointers valid.
     core::arch::naked_asm!(
+        // Drain prior memory ops on this hart before the SavedState
+        // save block. The outgoing thread's user-mode writes (and any
+        // kernel writes that happened during its syscall handling)
+        // must be ordered against the saves below so that, after a
+        // peer hart Acquires `context_saved == 1` and dispatches this
+        // TCB, every prior write the resuming thread will read — kernel
+        // and user — is globally visible. The Release `fence rw, w` at
+        // the end of this routine orders the saves themselves against
+        // the flag publication; this leading fence covers the writes
+        // that precede the save block.
+        "fence rw, rw",
         // ── Save current thread to *a0 ────────────────────────────────────
         // `ra` holds the return address from the `call switch` instruction;
         // saving it means the resumed thread will "return" to the call site.

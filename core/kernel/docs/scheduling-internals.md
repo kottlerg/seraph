@@ -125,17 +125,42 @@ under the same all-CPU-locks discipline.
 writes `(*tcb).priority` and, when the target is `Ready`, relocates its
 queue entry under every CPU's `scheduler.lock` acquired in ascending order.
 Identifying the home CPU is itself a read of the Scheduling field group, so
-the syscall scans each scheduler with `remove_from_queue(tcb, old_prio)` —
-exactly one CPU's queue links a Ready TCB (the "Ready ⇒ linked on exactly
-one queue" invariant) and reports `true`. The syscall then calls
-`PerCpuScheduler::enqueue(tcb, new_prio)` on the same scheduler so home-CPU
-placement is preserved. The all-locks region serialises this against
+the syscall scans each scheduler with `remove_from_queue(tcb, old_prio)`
+and re-enqueues on the same scheduler at the new priority via
+`PerCpuScheduler::enqueue`. The all-locks region serialises this against
 `migrate_ready_thread`, `dealloc_object(Thread)`, and
-`set_state_under_all_locks`, all of which share the same discipline for
-Scheduling-group writes. Calling `change_priority` here would be unsound:
-its enqueue half is unconditional, so calling it on the wrong scheduler
-when the load balancer had migrated the TCB would double-link it across
-two queues.
+`set_state_under_all_locks`.
+
+The "Ready ⇒ linked on exactly one queue" invariant has one transient
+exception: the cross-CPU outgoing branch of `schedule()` writes
+`state = Ready` under the local sched.lock, releases that lock, then
+calls `enqueue_and_wake` which acquires the destination scheduler's lock
+to commit the queue link. Between the local-lock release and the
+destination-lock acquisition the TCB is observably `Ready` with no queue
+link. A racing `sys_thread_set_priority` taking the all-CPU-locks region
+in this window sees no scheduler claim the TCB in its locate scan; it
+writes the new priority and falls through without relocating. The pending
+`enqueue_and_wake` then reads `(*tcb).priority` under the destination
+lock — the post-fix `enqueue_and_wake` no longer takes a caller-supplied
+priority — and links the TCB at whichever value was last committed under
+lock. No desync results.
+
+`PerCpuScheduler::enqueue` (not `change_priority`) is the correct primitive
+for the syscall's re-enqueue half: `change_priority`'s enqueue is
+unconditional, so calling it on a scheduler whose `remove_from_queue`
+returned `false` (the wrong-home race) would double-link the TCB; the
+function is therefore unused by the post-fix code.
+
+Note that the re-enqueue does not re-route via `select_target_cpu`, so a
+concurrent narrowing `sys_thread_set_affinity` that lands between this
+syscall and the next dispatch may leave the TCB transiently linked on a
+scheduler its `cpu_affinity` now forbids. `schedule()`'s outgoing
+cross-CPU branch and `migrate_ready_thread` heal this on the next
+dispatch tick (the dispatch-side skip loop at `sched/mod.rs` does not
+consult affinity, so the re-route happens via the outgoing branch's
+affinity recheck rather than at dispatch). This is the same eventual-
+consistency window as for any other `enqueue_and_wake` racing
+`sys_thread_set_affinity`; see issue #116.
 
 ---
 
@@ -369,7 +394,7 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 | Atomic | File:line | Set ordering | Read ordering | Pairing rationale |
 |---|---|---|---|---|
 | `RESCHEDULE_PENDING` | `sched/mod.rs:148` (decl), `:155–169` (ops) | Release on `set_reschedule_pending_for` (`fetch_or`) | AcqRel on `take_reschedule_pending` (`fetch_and`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
-| `non_empty` (per PerCpuScheduler) | `sched/run_queue.rs:159` (decl), `:239,281,327,352,358` (writes), `:308` (read) | Release on `enqueue.fetch_or`, `dequeue.fetch_and`, `remove_from_queue.fetch_and`, `change_priority.fetch_*` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
+| `non_empty` (per PerCpuScheduler) | `sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue`, `dequeue_highest`, `remove_from_queue`; read in `has_runnable`) | Release on `enqueue.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
 | `context_saved` (per TCB) | `sched/thread.rs:254` (decl) | Release after `Context::switch` returns on the outgoing CPU | Acquire on the remote-dequeue spin-loop | Closes the partial-`SavedState`-visibility race on RVWMO; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) for the full sequence. |
 | `bits` (Signal) | `ipc/signal.rs:39` (decl), `:109,130,237` (ops) | Relaxed `fetch_or` in `signal_send` (`:109`), Relaxed `swap` in `signal_wait` (`:237`) and `signal_send` slow path (`:130`) | (same — paired with the SeqCst fences below) | The Dekker fence pair below provides the cross-side ordering; the bits ops themselves are Relaxed because no other field needs to be synchronised relative to them. |
 | `has_observer` (Signal) + `bits` Dekker pair | `ipc/signal.rs:54` (decl) | Relaxed store on `:231` (signal_wait), Relaxed load on `:118` (signal_send) | (same) | Paired SeqCst fences in `signal_send` (`:115`, between `bits.fetch_or` and `has_observer.load`) and `signal_wait` (`:234`, between `has_observer.store` and `bits.swap`) form the Dekker pattern: either `signal_send` observes `has_observer == 1` and falls through to the slow path lock acquisition, or `signal_wait`'s swap observes the OR'd bits and returns without parking. The fences are the only ordering edge; weakening to plain `Acquire`/`Release` is **insufficient** because the read-and-write sites span two distinct atomics. |

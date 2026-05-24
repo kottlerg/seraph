@@ -325,18 +325,16 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
     };
 
     // SAFETY: waiter is a valid TCB placed by waitset_wait.
-    let (prio, target_cpu) = unsafe {
+    let target_cpu = unsafe {
         (*waiter).wakeup_value = token;
-        let prio = (*waiter).priority;
-        let target_cpu = crate::sched::select_target_cpu(waiter);
-        (prio, target_cpu)
+        crate::sched::select_target_cpu(waiter)
     };
 
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
 
     // SAFETY: waiter remains valid; enqueue_and_wake commits state under sched.lock.
-    unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu, prio) };
+    unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
 }
 
 /// Block `caller` until any member becomes ready, or return the next pending token.
@@ -476,7 +474,7 @@ pub unsafe fn waitset_add(
     // Check ready-at-add-time so notifications are not missed.
     // SAFETY: source_ptr is a valid pointer to the source's state struct; tag determines concrete type.
     let already_ready = unsafe { source_is_ready(source_ptr, source_tag) };
-    let mut deferred_wake: Option<(*mut ThreadControlBlock, u8, usize)> = None;
+    let mut deferred_wake: Option<(*mut ThreadControlBlock, usize)> = None;
     if already_ready
     {
         // cast_possible_truncation: WAIT_SET_MAX_MEMBERS = 16; idx fits in u8.
@@ -489,23 +487,21 @@ pub unsafe fn waitset_add(
             let waiter = ws.waiter;
             ws.waiter = core::ptr::null_mut();
             // SAFETY: waiter is a valid TCB.
-            let (prio, target_cpu) = unsafe {
+            let target_cpu = unsafe {
                 (*waiter).wakeup_value = token;
-                let prio = (*waiter).priority;
-                let target_cpu = crate::sched::select_target_cpu(waiter);
-                (prio, target_cpu)
+                crate::sched::select_target_cpu(waiter)
             };
-            deferred_wake = Some((waiter, prio, target_cpu));
+            deferred_wake = Some((waiter, target_cpu));
         }
     }
 
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
 
-    if let Some((waiter, prio, target_cpu)) = deferred_wake
+    if let Some((waiter, target_cpu)) = deferred_wake
     {
         // SAFETY: waiter remains valid.
-        unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu, prio) };
+        unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
     }
 
     // cast_possible_truncation: idx < WAIT_SET_MAX_MEMBERS = 16.
@@ -636,7 +632,7 @@ pub unsafe fn wait_set_drop(
     // until after unlock per § Lock Hierarchy rule 5.
     // SAFETY: lock owned by ws; matched unlock_raw below.
     let saved = unsafe { ws_ref.lock.lock_raw() };
-    let deferred_wake: Option<(*mut ThreadControlBlock, u8, usize)> = if ws_ref.waiter.is_null()
+    let deferred_wake: Option<(*mut ThreadControlBlock, usize)> = if ws_ref.waiter.is_null()
     {
         None
     }
@@ -645,13 +641,11 @@ pub unsafe fn wait_set_drop(
         let waiter = ws_ref.waiter;
         ws_ref.waiter = core::ptr::null_mut();
         // SAFETY: waiter is a valid TCB; wakeup_value=0 = drop semantics.
-        let (prio, target_cpu) = unsafe {
+        let target_cpu = unsafe {
             (*waiter).wakeup_value = 0;
-            let prio = (*waiter).priority;
-            let target_cpu = crate::sched::select_target_cpu(waiter);
-            (prio, target_cpu)
+            crate::sched::select_target_cpu(waiter)
         };
-        Some((waiter, prio, target_cpu))
+        Some((waiter, target_cpu))
     };
     for slot in &mut ws_ref.members
     {
@@ -661,10 +655,10 @@ pub unsafe fn wait_set_drop(
     // SAFETY: paired with lock_raw above.
     unsafe { ws_ref.lock.unlock_raw(saved) };
 
-    if let Some((waiter, prio, target_cpu)) = deferred_wake
+    if let Some((waiter, target_cpu)) = deferred_wake
     {
         // SAFETY: waiter remains valid.
-        unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu, prio) };
+        unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
     }
 
     zeroed

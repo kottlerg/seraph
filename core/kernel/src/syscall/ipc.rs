@@ -399,11 +399,9 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: woken_server returned by endpoint_call; is valid TCB.
         unsafe {
             debug_assert!((*woken_server).magic == crate::sched::thread::TCB_MAGIC);
-            let prio = (*woken_server).priority;
-            debug_assert!((prio as usize) < crate::sched::NUM_PRIORITY_LEVELS);
             let target_cpu = crate::sched::select_target_cpu(woken_server);
             debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-            crate::sched::enqueue_and_wake(woken_server, target_cpu, prio);
+            crate::sched::enqueue_and_wake(woken_server, target_cpu);
         }
     }
     // else: No server; caller is blocked on send queue. Yield to another thread.
@@ -647,9 +645,8 @@ unsafe fn fail_reply_and_wake_caller(
     }
     // SAFETY: caller is a valid parked TCB; enqueue_and_wake transitions to Ready.
     unsafe {
-        let prio = (*caller).priority;
         let target_cpu = crate::sched::select_target_cpu(caller);
-        crate::sched::enqueue_and_wake(caller, target_cpu, prio);
+        crate::sched::enqueue_and_wake(caller, target_cpu);
     }
     err
 }
@@ -806,11 +803,9 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: caller returned by endpoint_reply; is valid TCB.
             unsafe {
                 debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
-                let prio = (*caller).priority;
-                debug_assert!((prio as usize) < crate::sched::NUM_PRIORITY_LEVELS);
                 let target_cpu = crate::sched::select_target_cpu(caller);
                 debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-                crate::sched::enqueue_and_wake(caller, target_cpu, prio);
+                crate::sched::enqueue_and_wake(caller, target_cpu);
             }
             Ok(0)
         }
@@ -865,17 +860,12 @@ pub fn sys_signal_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 (*waiter).magic == crate::sched::thread::TCB_MAGIC,
                 "sys_signal_send: woken waiter magic corrupt"
             );
-            let prio = (*waiter).priority;
-            debug_assert!(
-                (prio as usize) < crate::sched::NUM_PRIORITY_LEVELS,
-                "sys_signal_send: waiter priority {prio} out of range"
-            );
             let target_cpu = crate::sched::select_target_cpu(waiter);
             debug_assert!(
                 target_cpu < crate::sched::MAX_CPUS,
                 "sys_signal_send: target_cpu {target_cpu} out of range"
             );
-            crate::sched::enqueue_and_wake(waiter, target_cpu, prio);
+            crate::sched::enqueue_and_wake(waiter, target_cpu);
         }
     }
 
@@ -1041,11 +1031,9 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             // SAFETY: woken returned by event_queue_post; is valid TCB.
             unsafe {
                 debug_assert!((*woken).magic == crate::sched::thread::TCB_MAGIC);
-                let prio = (*woken).priority;
-                debug_assert!((prio as usize) < crate::sched::NUM_PRIORITY_LEVELS);
                 let target_cpu = crate::sched::select_target_cpu(woken);
                 debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-                crate::sched::enqueue_and_wake(woken, target_cpu, prio);
+                crate::sched::enqueue_and_wake(woken, target_cpu);
             }
             Ok(0)
         }

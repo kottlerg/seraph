@@ -277,9 +277,8 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
         // SAFETY: waiter is a valid TCB.
         unsafe {
             (*waiter).wakeup_value = 0;
-            let prio = (*waiter).priority;
             let target_cpu = crate::sched::select_target_cpu(waiter);
-            crate::sched::enqueue_and_wake(waiter, target_cpu, prio);
+            crate::sched::enqueue_and_wake(waiter, target_cpu);
         }
     }
 }

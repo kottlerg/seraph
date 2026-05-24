@@ -194,10 +194,10 @@ pub fn sys_thread_start(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // All-CPU lock commit closes the cross-CPU dealloc race; see
         // docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
         crate::sched::set_state_under_all_locks(target_tcb, ThreadState::Ready);
-        let prio = (*target_tcb).priority;
-        // Route to correct CPU based on affinity.
+        // Route to correct CPU based on affinity. enqueue_and_wake reads
+        // priority from the TCB under the target scheduler's lock.
         let target_cpu = crate::sched::select_target_cpu(target_tcb);
-        crate::sched::enqueue_and_wake(target_tcb, target_cpu, prio);
+        crate::sched::enqueue_and_wake(target_tcb, target_cpu);
     }
 
     Ok(0)
@@ -621,12 +621,20 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         if state == ThreadState::Ready && old_prio != priority
         {
-            // A Ready TCB is linked on exactly one CPU's run queue at its
-            // current priority. Locate that scheduler by trying
-            // `remove_from_queue` on each one; the succeeding remove
-            // identifies the home, and we re-enqueue there at the new
-            // priority so home-CPU placement is preserved.
-            let mut relocated = false;
+            // A Ready TCB is normally linked on exactly one CPU's run queue.
+            // Locate that scheduler by trying `remove_from_queue` on each
+            // one; the succeeding remove identifies the home, and we
+            // re-enqueue there at the new priority. If no scheduler reports
+            // `true` the TCB is in the transient Ready-and-unlinked window
+            // of `schedule()`'s cross-CPU outgoing branch
+            // (`sched/mod.rs` cross_cpu re-enqueue): `state` was set to
+            // `Ready` under the local sched.lock, that lock was released,
+            // and the in-flight `enqueue_and_wake` on the destination
+            // scheduler has not yet acquired its target lock. That
+            // `enqueue_and_wake` re-reads `(*tcb).priority` under the
+            // target lock, so the write we just committed is picked up
+            // there and the queue link lands at the new priority. No
+            // action is needed in that case.
             #[allow(clippy::needless_range_loop)]
             for cpu in 0..cpu_count
             {
@@ -634,14 +642,9 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 if sched.remove_from_queue(target_tcb, old_prio)
                 {
                     sched.enqueue(target_tcb, priority);
-                    relocated = true;
                     break;
                 }
             }
-            debug_assert!(
-                relocated,
-                "Ready TCB {target_tcb:p} not linked at priority {old_prio} on any CPU",
-            );
         }
     }
 

@@ -152,13 +152,11 @@ pub unsafe extern "C" fn switch(
     current: *mut SavedState,
     next: *const SavedState,
     save_flag: *const core::sync::atomic::AtomicU32,
-    _lock_ptr: *const crate::sync::Spinlock,
 )
 {
     // a0 = current (*mut SavedState)
     // a1 = next (*const SavedState)
     // a2 = save_flag (*const AtomicU32) — context_saved flag on current TCB
-    // a3 = _lock_ptr — vestigial; kept for cross-arch ABI consistency with x86.
     // SAFETY: switch_context preserves ABI; both pointers valid; stack/frame pointers valid.
     core::arch::naked_asm!(
         // ── Save current thread to *a0 ────────────────────────────────────

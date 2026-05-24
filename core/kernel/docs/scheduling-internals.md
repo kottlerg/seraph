@@ -114,7 +114,7 @@ inside the all-locks region — leaving the stale `Ready` entry for the
 dispatch-side skip loop to drain (the previous design) is unsound: a subsequent
 Stopped→Ready transition followed by `enqueue_and_wake` could race the drain
 and produce two list entries for the same TCB. The skip loop at
-`sched/mod.rs:1860` remains as defence-in-depth and as the drain mechanism for
+`sched/mod.rs:1967-1976` remains as defence-in-depth and as the drain mechanism for
 legitimate paths that bypass `set_state_under_all_locks` (none currently). The
 priority snapshot uses `(*tcb).priority` read under all-CPU locks; this is
 consistent with the matching reads in `dealloc_object(Thread)` and

@@ -128,18 +128,16 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, _is_user: bool) -> SavedS
 /// barrier for both remote dispatch (which loads `next.saved_state` after
 /// observing the flag) and `dealloc_object(Thread)` (which spins on it
 /// before `retype_free`). See `core/kernel/docs/scheduling-internals.md`
-/// § Cross-CPU TCB Ownership. `_lock_ptr` is vestigial — kept for
-/// cross-arch ABI consistency with the RISC-V `switch` signature.
+/// § Cross-CPU TCB Ownership.
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch(
     current: *mut SavedState,
     next: *const SavedState,
     save_flag: *const core::sync::atomic::AtomicU32,
-    _lock_ptr: *const crate::sync::Spinlock,
 )
 {
-    // rdi = current, rsi = next, rdx = save_flag, rcx = _lock_ptr (vestigial)
+    // rdi = current, rsi = next, rdx = save_flag
     core::arch::naked_asm!(
         // ── Save current thread ───────────────────────────────────────────
         // Pop return address into rax; the caller will "return" to it when this

@@ -1844,8 +1844,11 @@ unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 ///
 /// # Safety
 /// Must be called from within a kernel context (interrupt handler or syscall
-/// handler) with a valid kernel stack. Interrupts are disabled by the
-/// scheduler lock; they are re-enabled as part of lock release.
+/// handler) with a valid kernel stack. Interrupts are disabled on entry by
+/// `sched.lock.lock_raw` (which saves and clears IF/SIE) and restored by
+/// `restore_interrupts_from(saved_flags)` after `switch()` returns;
+/// `release_lock_only` between them advances the lock ticket without
+/// touching interrupt state.
 // too_many_lines: schedule() is the core scheduler critical path; splitting would
 // introduce indirection that obscures the single logical context-switch sequence.
 #[allow(clippy::too_many_lines)]
@@ -2204,8 +2207,6 @@ pub unsafe fn schedule(requeue_current: bool)
         unsafe { (*save_flag).store(0, core::sync::atomic::Ordering::Relaxed) };
     }
 
-    let lock_ptr: *const crate::sync::Spinlock = core::ptr::addr_of!(sched.lock);
-
     // Release the local scheduler lock before the cross-CPU publication-barrier
     // spin and before `switch()` (both arches). The lock is not the synchroniser
     // for `next.saved_state` — `context_saved` Acquire/Release is. Holding the
@@ -2260,10 +2261,9 @@ pub unsafe fn schedule(requeue_current: bool)
     {
         // SAFETY: both current_state and next_state are valid SavedState pointers
         // on heap-allocated TCBs; kernel stacks are valid; interrupts are disabled;
-        // save_flag is valid or null; lock_ptr is now vestigial on both arches
-        // but kept for cross-arch ABI consistency.
+        // save_flag is valid or null.
         unsafe {
-            switch(current_state, next_state, save_flag, lock_ptr);
+            switch(current_state, next_state, save_flag);
         }
     }
 

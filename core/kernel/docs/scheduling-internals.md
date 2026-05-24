@@ -131,19 +131,34 @@ and re-enqueues on the same scheduler at the new priority via
 `migrate_ready_thread`, `dealloc_object(Thread)`, and
 `set_state_under_all_locks`.
 
-The "Ready ⇒ linked on exactly one queue" invariant has one transient
-exception: the cross-CPU outgoing branch of `schedule()` writes
-`state = Ready` under the local sched.lock, releases that lock, then
-calls `enqueue_and_wake` which acquires the destination scheduler's lock
-to commit the queue link. Between the local-lock release and the
-destination-lock acquisition the TCB is observably `Ready` with no queue
-link. A racing `sys_thread_set_priority` taking the all-CPU-locks region
-in this window sees no scheduler claim the TCB in its locate scan; it
-writes the new priority and falls through without relocating. The pending
+The "Ready ⇒ linked on exactly one queue" invariant has a transient
+exception during any window where a caller publishes `state = Ready` on
+a TCB but the matching `enqueue_and_wake` has not yet acquired the
+destination scheduler's lock. The known sites are:
+
+- `schedule()`'s cross-CPU outgoing branch
+  (`core/kernel/src/sched/mod.rs`), which writes `state = Ready` under
+  the local sched.lock, releases that lock, and only then calls
+  `enqueue_and_wake` on the destination CPU's lock.
+- `sys_thread_start` (`core/kernel/src/syscall/thread.rs`), which calls
+  `set_state_under_all_locks(target, Ready)` to commit the state
+  transition and then a separate `enqueue_and_wake(target_cpu)` to
+  commit the queue link.
+- `dealloc_object(Thread)`'s server-side reply wake
+  (`core/kernel/src/cap/object.rs`), which writes `state = Ready` on
+  the bound client under all-CPU locks and defers the matching
+  `enqueue_and_wake(bound)` until after the all-locks region releases
+  (the enqueue itself acquires a sched.lock, so it cannot run under
+  the outer all-locks region — see Lock Hierarchy rule 5).
+
+In each window the TCB is observably `Ready` with no queue link. A
+racing `sys_thread_set_priority` taking the all-CPU-locks region sees
+no scheduler claim the TCB in its locate scan; it writes the new
+priority and falls through without relocating. The pending
 `enqueue_and_wake` then reads `(*tcb).priority` under the destination
 lock — the post-fix `enqueue_and_wake` no longer takes a caller-supplied
-priority — and links the TCB at whichever value was last committed under
-lock. No desync results.
+priority — and links the TCB at whichever value was last committed
+under lock. No desync results.
 
 `PerCpuScheduler::enqueue` (not `change_priority`) is the correct primitive
 for the syscall's re-enqueue half: `change_priority`'s enqueue is

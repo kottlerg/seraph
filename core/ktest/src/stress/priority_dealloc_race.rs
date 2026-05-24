@@ -8,9 +8,12 @@
 //! TCB fields (`priority`, `state`, `run_queue_next`) from cross-CPU
 //! syscalls under contention:
 //!
-//!   * **Phase 1** churns priority on every worker each cycle and, every
-//!     fourth cycle, also flips affinity — the load balancer / active
-//!     migration races the priority-change's locate-and-relocate.
+//!   * **Phase 1** churns priority on every worker each cycle and, once
+//!     per 32-cycle window, also flips affinity — the load balancer /
+//!     active migration races the priority-change's locate-and-relocate.
+//!     The affinity-flip cadence is intentionally sparse to keep the
+//!     test from reliably triggering the pre-existing cross-CPU
+//!     `context_saved` publication hazard (see issue #144).
 //!   * **Phase 2** does two rapid priority writes followed by
 //!     `cap_delete(Thread)` — the dealloc all-locks walk races the
 //!     priority-change in flight.

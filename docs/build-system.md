@@ -122,13 +122,14 @@ sysroot/
                           # one of {init, ktest} appears as the
                           # bundle's `init` entry; ktest is monolithic
                           # so its bundle has zero module entries.
-  services/               # Long-running userspace services sourced from
-                          # services/ in the repo tree (init, ktest,
-                          # procmgr, memmgr, devmgr, vfsd, virtio-blk,
-                          # fatfs, svcmgr, logd, pwrmgr, timed,
-                          # cmos-rtc/goldfish-rtc). The bundle composer
-                          # reads from here; VFS-loaded respawns
-                          # (notably fatfs) walk these by /services/<name>.
+  services/               # Userspace components sourced from services/
+                          # in the repo tree (init, procmgr, memmgr,
+                          # devmgr, vfsd, virtio-blk, fatfs, svcmgr,
+                          # logd, pwrmgr, timed, cmos-rtc/goldfish-rtc),
+                          # plus ktest (sourced from core/ktest/). The
+                          # bundle composer reads from here; VFS-loaded
+                          # respawns (notably fatfs) walk these by
+                          # /services/<name>.
   programs/               # Userspace utilities and test programs sourced
                           # from programs/ in the repo tree (hello,
                           # crasher, fsbench, stackoverflow, pipefault,

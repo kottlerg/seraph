@@ -52,13 +52,16 @@ enum InstallDest
     /// ktest, and all userspace modules live under [`Self::Services`] and
     /// reach the ESP via the bundle composer (see `xtask/src/bundle.rs`).
     EfiSeraph,
-    /// Installed under `sysroot/services/<install_name>` — canonical home
-    /// for every long-running userspace component sourced from
-    /// `services/` (init, ktest, procmgr, memmgr, devmgr, vfsd,
-    /// virtio-blk, fatfs, svcmgr, logd, pwrmgr, timed, cmos-rtc,
-    /// goldfish-rtc). The bundle composer pulls from here; VFS-loaded
-    /// respawns (notably fatfs after the bundle has been reclaimed) look
-    /// these up by `/services/<name>`.
+    /// Installed under `sysroot/services/<install_name>`. Holds every
+    /// userspace component sourced from `services/<x>/` (init, procmgr,
+    /// memmgr, devmgr, vfsd, virtio-blk, fatfs, svcmgr, logd, pwrmgr,
+    /// timed, cmos-rtc, goldfish-rtc) plus `ktest` (sourced from
+    /// `core/ktest/`). `ktest` is a one-shot kernel-surface harness, not
+    /// a long-running service; it lands here because the bundle composer
+    /// reads from `sysroot/services/` and `ktest` is the init replacement
+    /// when `compose-bundle --harness ktest` runs. VFS-loaded respawns
+    /// (notably fatfs after the bundle has been reclaimed) walk these
+    /// by `/services/<name>`.
     Services,
     /// Installed under `sysroot/programs/<install_name>` — userspace
     /// utilities and test programs sourced from `programs/<x>/`. Loaded

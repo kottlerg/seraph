@@ -292,4 +292,4 @@ This makes the mechanism agnostic to:
 
 ## Summarized By
 
-[README.md](../README.md), [docs/capability-model.md](capability-model.md), [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md), [services/vfsd/docs/namespace-composition.md](../services/vfsd/docs/namespace-composition.md)
+[README.md](../README.md), [docs/capability-model.md](capability-model.md), [docs/storage.md](storage.md), [shared/namespace-protocol/README.md](../shared/namespace-protocol/README.md), [services/vfsd/docs/namespace-composition.md](../services/vfsd/docs/namespace-composition.md)

@@ -209,8 +209,8 @@ The supported failure-handling primitives are:
   the destroy-driver hammer. See
   [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)
   §"Revocation".
-- **Unmount is not implemented at v0.1.0.** The mount tree is
-  permanent for the lifetime of the vfsd process.
+- **Unmount is not implemented.** The mount tree is permanent for
+  the lifetime of the vfsd process.
 
 ---
 

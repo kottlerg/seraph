@@ -328,13 +328,16 @@ pub unsafe fn save_and_disable_interrupts() -> u64
 {
     let flags: u64;
     // SAFETY: pushfq/popfq are valid at ring 0; cli is safe here.
+    // `nostack` is intentionally absent: `pushfq` writes 8 bytes below RSP
+    // and the matching `pop` reads them. Net RSP delta is zero but the body
+    // is not red-zone-safe; only the kernel target's `disable-redzone: true`
+    // makes this latent today. Be honest about the body.
     unsafe {
         core::arch::asm!(
             "pushfq",
             "pop {flags}",
             "cli",
             flags = out(reg) flags,
-            options(nostack),
         );
     }
     flags
@@ -350,12 +353,12 @@ pub unsafe fn save_and_disable_interrupts() -> u64
 pub unsafe fn restore_interrupts(saved: u64)
 {
     // SAFETY: restoring a previously captured FLAGS value is safe.
+    // See save_and_disable_interrupts above for why `nostack` is absent.
     unsafe {
         core::arch::asm!(
             "push {flags}",
             "popfq",
             flags = in(reg) saved,
-            options(nostack),
         );
     }
 }

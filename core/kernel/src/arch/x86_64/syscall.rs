@@ -60,11 +60,15 @@ const STAR_VALUE: u64 = (0x0010u64 << 48) | (0x0008u64 << 32);
 pub unsafe fn set_kernel_rsp(rsp: u64)
 {
     // SAFETY: gs:[8] == PerCpuData::kernel_rsp; valid after percpu::init_bsp/ap.
+    // `nomem` is intentionally absent: the body is a memory store through the
+    // GS segment to PerCpuData::kernel_rsp. Claiming `nomem` would license
+    // LLVM to reorder unrelated memory ops across this asm, and any future
+    // Rust-level reader of kernel_rsp would observe stale state.
     unsafe {
         core::arch::asm!(
             "mov gs:[8], {}",
             in(reg) rsp,
-            options(nostack, nomem),
+            options(nostack),
         );
     }
 }

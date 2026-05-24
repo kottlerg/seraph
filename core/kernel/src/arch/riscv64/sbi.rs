@@ -33,6 +33,13 @@ pub fn sbi_call(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> Sbi
     let value: u64;
     // SAFETY: ecall is always available in RISC-V supervisor mode. The SBI
     // firmware handles unknown extensions gracefully (returns SBI_ERR_NOT_SUPPORTED).
+    // `nomem` is intentionally absent: this is a generic dispatcher that
+    // accepts any extension/function. Several SBI extensions inspect or
+    // write caller-pointed memory (RFENCE hart-mask pointer, HSM opaque
+    // arg, Debug Console Buffer write, …). Claiming `nomem` would license
+    // LLVM to reorder memory ops across the call and silently break any
+    // such caller. Today's only caller (`sys_sbi_call`) forwards scalar
+    // userspace registers, but the primitive must stay honest.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -41,7 +48,7 @@ pub fn sbi_call(extension: u64, function: u64, a0: u64, a1: u64, a2: u64) -> Sbi
             in("a2") a2,
             inout("a6") function => _,
             inout("a7") extension => _,
-            options(nostack, nomem),
+            options(nostack),
         );
     }
     SbiRet { error, value }

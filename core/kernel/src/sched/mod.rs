@@ -1330,18 +1330,17 @@ pub unsafe fn migrate_ready_thread(
     let removed = unsafe { scheduler_for(src_cpu).remove_from_queue(tcb, priority) };
     if !removed
     {
-        // Defensive heal — not a race. Under both scheduler locks no
-        // concurrent removal is possible (dealloc and
-        // sys_thread_set_priority both take every CPU's scheduler lock in
-        // ascending order; set_state_under_all_locks likewise). A false
-        // return here indicates an internal bookkeeping inconsistency
-        // (state == Ready and preferred_cpu == src_cpu but the TCB is not
-        // linked at its priority on src). Bail without touching dst rather
-        // than panicking.
-        debug_assert!(
-            removed,
-            "migrate_ready_thread: Ready + preferred_cpu match but no queue entry"
-        );
+        // Benign Ready-but-unlinked window. The Ready ⇒ linked-on-exactly-
+        // one-queue invariant has a transient exception while a caller has
+        // published `state = Ready` on `tcb` but the matching
+        // `enqueue_and_wake` has not yet acquired the destination scheduler's
+        // lock — most commonly `schedule()`'s cross-CPU outgoing branch
+        // (`sched/mod.rs:1918-1953`), which writes `state = Ready` and
+        // `preferred_cpu` is the stale source CPU until `enqueue_and_wake`
+        // overwrites it under the destination's lock. See
+        // `docs/scheduling-internals.md` § Cross-CPU TCB Ownership
+        // (Ready-priority-change paragraph). The pending `enqueue_and_wake`
+        // will place the tcb shortly; nothing to do on this side.
         // SAFETY: paired with lock_raw above; release hi first.
         unsafe { hi_sched.lock.unlock_raw(saved_hi) };
         // SAFETY: paired with lock_raw above.
@@ -1845,8 +1844,11 @@ unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 ///
 /// # Safety
 /// Must be called from within a kernel context (interrupt handler or syscall
-/// handler) with a valid kernel stack. Interrupts are disabled by the
-/// scheduler lock; they are re-enabled as part of lock release.
+/// handler) with a valid kernel stack. Interrupts are disabled on entry by
+/// `sched.lock.lock_raw` (which saves and clears IF/SIE) and restored by
+/// `restore_interrupts_from(saved_flags)` after `switch()` returns;
+/// `release_lock_only` between them advances the lock ticket without
+/// touching interrupt state.
 // too_many_lines: schedule() is the core scheduler critical path; splitting would
 // introduce indirection that obscures the single logical context-switch sequence.
 #[allow(clippy::too_many_lines)]
@@ -2205,9 +2207,26 @@ pub unsafe fn schedule(requeue_current: bool)
         unsafe { (*save_flag).store(0, core::sync::atomic::Ordering::Relaxed) };
     }
 
+    // Release the local scheduler lock before the cross-CPU publication-barrier
+    // spin and before `switch()` (both arches). The lock is not the synchroniser
+    // for `next.saved_state` — `context_saved` Acquire/Release is. Holding the
+    // lock across the spin re-introduces issue #144's cross-CPU deadlock: CPU A
+    // spinning on `next.context_saved` under A.lock while CPU B is blocked
+    // acquiring A.lock to deliver the cross-CPU enqueue that lets B reach
+    // `switch()` and publish. `release_lock_only` advances the ticket without
+    // restoring interrupts; `restore_interrupts_from(saved_flags)` runs after
+    // `switch()` returns. See `docs/scheduling-internals.md` § `context_saved`
+    // protocol.
+    // SAFETY: matched with the `lock_raw` at the top of `schedule()`;
+    // interrupts remain disabled until `restore_interrupts_from` below.
+    unsafe {
+        sched.lock.release_lock_only();
+    }
+
     // Wait for the next thread's SavedState to be fully committed by its
     // previous CPU's switch(). On RISC-V RVWMO, without this Acquire the
-    // loads in the restore phase could see stale register values.
+    // loads in the restore phase could see stale register values. The spin
+    // runs lockless (see #144).
     if !core::ptr::eq(next, sched.idle) && !next.is_null()
     {
         let mut spins: u64 = 0;
@@ -2238,41 +2257,13 @@ pub unsafe fn schedule(requeue_current: bool)
         }
     }
 
-    let lock_ptr: *const crate::sync::Spinlock = core::ptr::addr_of!(sched.lock);
-
-    // On x86-64 (TSO): release the lock before switch(). Stores are
-    // globally visible in program order, so the save is complete before
-    // any remote CPU can observe the lock release. The lock_ptr and
-    // save_flag parameters are still passed for cross-arch consistency
-    // but the lock is already released.
-    //
-    // On RISC-V (RVWMO): the lock is released INSIDE switch(), between
-    // the save and load phases. This ensures the save is globally visible
-    // (via Release fence) before another CPU can acquire the lock and
-    // load the saved state.
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: release_lock_only advances the ticket; saved_flags is preserved
-    // for restore_interrupts_from after switch.
-    unsafe {
-        sched.lock.release_lock_only();
-    }
-
-    if current_state.is_null()
-    {
-        // No current thread to save (boot path). Release the lock directly.
-        #[cfg(target_arch = "riscv64")]
-        // SAFETY: lock held; no save needed.
-        unsafe {
-            sched.lock.release_lock_only();
-        }
-    }
-    else
+    if !current_state.is_null()
     {
         // SAFETY: both current_state and next_state are valid SavedState pointers
         // on heap-allocated TCBs; kernel stacks are valid; interrupts are disabled;
-        // save_flag is valid or null; lock_ptr is valid.
+        // save_flag is valid or null.
         unsafe {
-            switch(current_state, next_state, save_flag, lock_ptr);
+            switch(current_state, next_state, save_flag);
         }
     }
 

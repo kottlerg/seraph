@@ -114,7 +114,7 @@ inside the all-locks region — leaving the stale `Ready` entry for the
 dispatch-side skip loop to drain (the previous design) is unsound: a subsequent
 Stopped→Ready transition followed by `enqueue_and_wake` could race the drain
 and produce two list entries for the same TCB. The skip loop at
-`sched/mod.rs:1860` remains as defence-in-depth and as the drain mechanism for
+`sched/mod.rs:1967-1976` remains as defence-in-depth and as the drain mechanism for
 legitimate paths that bypass `set_state_under_all_locks` (none currently). The
 priority snapshot uses `(*tcb).priority` read under all-CPU locks; this is
 consistent with the matching reads in `dealloc_object(Thread)` and
@@ -160,6 +160,19 @@ lock — the post-fix `enqueue_and_wake` no longer takes a caller-supplied
 priority — and links the TCB at whichever value was last committed
 under lock. No desync results.
 
+`migrate_ready_thread` (`core/kernel/src/sched/mod.rs`) is the other
+known consumer of this transient. Under both source and destination
+scheduler locks it re-reads `state` and `preferred_cpu` and proceeds
+only if `state == Ready && preferred_cpu == src_cpu`; the cross-CPU
+outgoing branch updates `preferred_cpu` inside the pending
+`enqueue_and_wake` (under the destination's lock), so during the
+transient the function still observes the stale `preferred_cpu`
+naming `src_cpu` and walks `src_cpu`'s priority queue. The walk finds
+nothing (the TCB is unlinked). `migrate_ready_thread` returns `false`
+and leaves the pending `enqueue_and_wake` to place the TCB; the next
+caller of `migrate_ready_thread` (or the load balancer) re-runs the
+migration if still warranted.
+
 `PerCpuScheduler::enqueue` (not `change_priority`) is the correct primitive
 for the syscall's re-enqueue half: `change_priority`'s enqueue is
 unconditional, so calling it on a scheduler whose `remove_from_queue`
@@ -200,9 +213,9 @@ The TCB is owned in pieces. Different field groups have different lock disciplin
 
 - `select_target_cpu` + `enqueue_and_wake` (`core/kernel/src/sched/mod.rs`) honour `cpu_affinity` on every placement.
 - `migrate_ready_thread` is the active-relocation primitive.
-- `schedule()`'s outgoing-thread re-enqueue branch (`core/kernel/src/sched/mod.rs:1773–1820`) routes the requeue cross-CPU when the *outgoing* thread's affinity no longer permits the current CPU.
+- `schedule()`'s outgoing-thread re-enqueue branch (`core/kernel/src/sched/mod.rs:1918-1953`) routes the requeue cross-CPU when the *outgoing* thread's affinity no longer permits the current CPU.
 
-The dispatch-side skip loop in `schedule()` (`core/kernel/src/sched/mod.rs:1834–1843`) only filters `Stopped` / `Exited` — it does **NOT** consult `cpu_affinity` on the *incoming* dequeued thread. A `cpu_affinity` write that lands between an `enqueue_and_wake` and the matching `migrate_ready_thread` is therefore a window in which `schedule()` on the source CPU can still dispatch the target locally in violation of the new affinity. Syscalls that mutate `cpu_affinity` and then dispatch on an unlocked state read (`sys_thread_set_affinity`) MUST bracket the read-and-act sequence with `percpu::preempt_disable` / `preempt_enable` so a local timer-driven `schedule()` cannot dispatch the target on the source CPU during the in-flight migration. See issue #116.
+The dispatch-side skip loop in `schedule()` (`core/kernel/src/sched/mod.rs:1967-1976`) only filters `Stopped` / `Exited` — it does **NOT** consult `cpu_affinity` on the *incoming* dequeued thread. A `cpu_affinity` write that lands between an `enqueue_and_wake` and the matching `migrate_ready_thread` is therefore a window in which `schedule()` on the source CPU can still dispatch the target locally in violation of the new affinity. Syscalls that mutate `cpu_affinity` and then dispatch on an unlocked state read (`sys_thread_set_affinity`) MUST bracket the read-and-act sequence with `percpu::preempt_disable` / `preempt_enable` so a local timer-driven `schedule()` cannot dispatch the target on the source CPU during the in-flight migration. See issue #116.
 
 Userspace that pins a thread to one CPU then re-pins it to another (the `affinity_migrate_ready_queued` ktest pattern) has an analogous *inter-syscall* race window that no kernel guard closes: the target is legitimately Ready and on the source CPU's queue with a matching `cpu_affinity` for that CPU, so a timer-driven `schedule()` between the two syscalls correctly dispatches it locally. Tests that publish state derived from the running CPU MUST encode that state in a non-zero form (e.g. `1u64 << cpu` rather than `cpu`) so wake primitives never reject the wake on a stale-CPU run; otherwise a stale dispatch silently swallows the wake and the parent's wait parks indefinitely. See issue #116.
 
@@ -213,6 +226,7 @@ Outgoing CPU (in schedule()):
   1. context_saved.store(0, Relaxed)               // before unlock
   2. sched.set_current(next)                       // sched.current = next
   3. sched.lock.release_lock_only()                // remote dequeue / dealloc can now observe
+  3.5. while next.context_saved.load(Acquire) == 0 { spin_loop() }   // LOCKLESS
   4. arch::Context::switch(&out.saved_state, &in.saved_state)
   5. context_saved.store(1, Release)               // after switch completes
 
@@ -226,16 +240,18 @@ dealloc_object(Thread) (after the all-locks region releases):
  10. // safe to free TCB body and kernel stack
 ```
 
-The Release in step 5 pairs with both the Acquire in step 6 (cross-CPU dequeue) and the Acquire in step 9 (TCB free). Without step 9, the lock release at step 3 lets `dealloc_object(Thread)` observe `sched.current = idle` (set at step 2) *while step 4 is still writing into `tcb.saved_state`* — freeing the TCB at that point lets the next allocation reuse the memory and `switch()` then corrupts the new allocation. The check is unconditional on the result of `running_on`, because the all-locks `running_on` snapshot can race step 2/3 and miss the in-flight switch. New TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
+Step 3.5 is the outgoing CPU's cross-CPU dispatch barrier: when this CPU is about to switch INTO `next`, it must observe `next.context_saved == 1` from the CPU that previously ran `next`. Step 3.5 MUST run with the local `sched.lock` already released (step 3). Holding the lock across the spin re-introduces issue #144's cross-CPU deadlock: a peer CPU's cross-CPU `enqueue_and_wake` (e.g. its own outgoing-branch re-enqueue) targets this CPU's lock; if this CPU is spinning on `next.context_saved` under the lock while waiting on the peer to publish, the peer cannot reach its own `switch()` and the cycle never breaks. Step 3.5 runs lockless on both arches.
+
+The Release in step 5 pairs with both the Acquire in step 6 (cross-CPU dequeue), the Acquire in step 3.5 (outgoing-CPU dispatch barrier), and the Acquire in step 9 (TCB free). Without step 9, the lock release at step 3 lets `dealloc_object(Thread)` observe `sched.current = idle` (set at step 2) *while step 4 is still writing into `tcb.saved_state`* — freeing the TCB at that point lets the next allocation reuse the memory and `switch()` then corrupts the new allocation. The check is unconditional on the result of `running_on`, because the all-locks `running_on` snapshot can race step 2/3 and miss the in-flight switch. New TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
 
 **`context_saved = 1` and `popfq` ordering inside `Context::switch` (issue #117).** Step 5 above hides a finer-grained ordering invariant inside the `switch()` asm itself. Both the `context_saved = 1` publication AND the `popfq` that restores `next.saved_state.rflags` (which may set `IF = 1`) MUST happen AFTER `mov rsp, [rsi + 8]` (the rsp swap to the next thread's kstack), not before it. Doing either earlier opens this window:
 1. `popfq` before the rsp swap re-enables interrupts while this CPU is still executing on the OUTGOING thread's kstack. A trap taken in that window pushes its iretq frame onto the outgoing kstack.
 2. Publishing `current.context_saved = 1` before the rsp swap satisfies step 6's Acquire spin for any peer CPU that just dequeued `current`. That peer's own `switch()` then executes its own rsp swap onto the SAME outgoing kstack, and any push/pop the peer does collides with the iretq frame from (1).
 The collision overwrites the trap return address, so `iretq` on this CPU returns to a wild RIP (typically `0` because the corruption zeroes the slot). The `stress::concurrent_ipc` ktest surfaces this as a kernel `#PF` at `rip = 0, cr2 = 0, err = 0x10` at ~0.2 % per run on x86_64 TCG with the racy ordering. Keeping both the publication and `popfq` below the rsp swap closes the window.
 
-**RISC-V analogue inside `arch::riscv64::context::switch` (issue #133).** The same invariant holds: both `*save_flag = 1` (the `context_saved` Release publication) AND the `now_serving` advance that releases this CPU's scheduler lock MUST happen AFTER `ld sp, 0(a1)` (the sp swap to next's kstack). Window (a) — interrupts re-enabled while still on the outgoing kstack — does NOT apply on RISC-V because `switch()` does not restore `sstatus` and `SIE` stays masked across the swap, so no trap iretq frame is in flight. Window (b) IS present and structurally identical to x86_64: a peer hart that observes `context_saved == 1` and dequeues `current` will pass step 6's Acquire spin, read `saved_state.sp` (still the OUTGOING sp because this hart has saved but not yet swapped), and execute its own sp restore onto the same outgoing kstack. Any push/pop the peer does then races this hart's continued use of the kstack until the `ld sp` retires. The symptom is less visible than the x86 iretq-frame case (no trap return address to corrupt) but the shared-kstack hazard is the same. Keeping both publication blocks below the sp swap closes the window.
+**RISC-V analogue inside `arch::riscv64::context::switch` (issue #133).** The same invariant holds: `*save_flag = 1` (the `context_saved` Release publication) MUST happen AFTER `ld sp, 0(a1)` (the sp swap to next's kstack). Window (a) — interrupts re-enabled while still on the outgoing kstack — does NOT apply on RISC-V because `switch()` does not restore `sstatus` and `SIE` stays masked across the swap, so no trap iretq frame is in flight. Window (b) IS present and structurally identical to x86_64: a peer hart that observes `context_saved == 1` and dequeues `current` will pass step 6's Acquire spin, read `saved_state.sp` (still the OUTGOING sp because this hart has saved but not yet swapped), and execute its own sp restore onto the same outgoing kstack. Any push/pop the peer does then races this hart's continued use of the kstack until the `ld sp` retires. The symptom is less visible than the x86 iretq-frame case (no trap return address to corrupt) but the shared-kstack hazard is the same. Keeping the publication below the sp swap closes the window.
 
-Per-arch step ordering: on x86_64, the textbook sequence above is literal — `sched.lock.release_lock_only()` (step 3) runs in Rust before `arch::Context::switch` (step 4), and `context_saved.store(1, Release)` (step 5) lives inside the asm at the tail of step 4. On RISC-V the scheduler lock is released INSIDE `switch()` by inlining the `now_serving` advance into the asm, and the publication-after-sp-swap reorder above moves it to the asm's tail; the effective sequence is 1 → 2 → 4-save → 4-load → 5 → 3. A peer that subsequently acquires this CPU's scheduler lock has therefore already observed `context_saved == 1` and the completed `saved_state` writes, so the hazard the prose at the start of this subsection ascribes to "step 3 before step 4 finishes writing into `tcb.saved_state`" is defeated by construction on RISC-V.
+Per-arch step ordering: both arches follow the textbook sequence above literally — `sched.lock.release_lock_only()` (step 3) runs in Rust before the lockless `next.context_saved` Acquire spin (step 3.5), which precedes `arch::Context::switch` (step 4); `context_saved.store(1, Release)` (step 5) lives inside the asm at the tail of step 4. Issue #144 collapsed an earlier RISC-V variant that inlined the `now_serving` lock-release advance into the asm tail (effective sequence 1 → 2 → 4-save → 4-load → 5 → 3): that ordering forced the step 3.5 spin to run under the local sched.lock and re-introduced the cross-CPU deadlock cycle described above. Releasing the lock in Rust on both arches keeps step 3.5 lockless and the deadlock geometry closed.
 
 ---
 

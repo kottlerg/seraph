@@ -89,7 +89,7 @@ directly without init involvement.
   namespace endpoint at the synthetic root with full namespace
   rights — every later child receives a `cap_copy` of it via
   `procmgr_labels::CONFIGURE_NAMESPACE`.
-- **Phase 2 epilogue** — walk `/bin/logd`, request procmgr to
+- **Phase 2 epilogue** — walk `/services/logd`, request procmgr to
   create real-logd via `CREATE_FROM_FILE`, and serve its bootstrap
   round (RECV cap on the master log endpoint, one-shot SEND for
   `HANDOVER_PULL`, `DEATH_EQ_AUTHORITY`-tokened SEND on procmgr,
@@ -111,7 +111,7 @@ publishes the well-known caps, registers init-bootstrapped
 services with svcmgr, and hands init's own kernel objects to
 procmgr for reaping.
 
-- Spawn svcmgr from `/bin/svcmgr` with the `Universal` namespace
+- Spawn svcmgr from `/services/svcmgr` with the `Universal` namespace
   policy and serve its bootstrap round
   (`../src/service.rs:1260` → `create_svcmgr_from_file` at
   `../src/service.rs:1058`; `setup_and_start_svcmgr` at
@@ -147,12 +147,12 @@ procmgr for reaping.
   `register_service` helper at `../src/service.rs:1194`).
   Registration set: `memmgr`, `procmgr`, `devmgr`, `vfsd`,
   `logd`, `timed`, `pwrmgr`. svcmgr reconciles each against the
-  matching `<name>.svc` recipe in `/etc/svcmgr/services.d/` and
+  matching `<name>.svc` recipe in `/config/svcmgr/services/` and
   binds death-notification — see
   [`../../svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md).
 - Signal `HANDOVER_COMPLETE` (`../src/service.rs:1435`). svcmgr
-  scans `services.d/` and launches any defined-but-unregistered
-  services from disk.
+  scans `/config/svcmgr/services/` and launches any
+  defined-but-unregistered services from disk.
 - Hand init's kernel-object caps (`AddressSpace`, `CSpace`, main
   `Thread`, init-logd `Thread`) and every reclaimable Frame cap
   (segments, stack, `InitInfo` region, IPC buffer) to procmgr via

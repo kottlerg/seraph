@@ -30,10 +30,10 @@ pub fn pipes_phase(_: &Caps)
 
     // ── (1) hello capture ─────────────────────────────────────────────
     {
-        let mut child = Command::new("/bin/hello")
+        let mut child = Command::new("/programs/hello")
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn /bin/hello (piped) failed");
+            .expect("spawn /programs/hello (piped) failed");
         let mut stdout_bytes = Vec::new();
         {
             let mut out = child
@@ -59,12 +59,12 @@ pub fn pipes_phase(_: &Caps)
 
     // ── (2) stdiotest round-trip ──────────────────────────────────────
     {
-        let mut child = Command::new("/bin/stdiotest")
+        let mut child = Command::new("/programs/stdiotest")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn /bin/stdiotest (piped) failed");
+            .expect("spawn /programs/stdiotest (piped) failed");
 
         {
             let mut stdin = child
@@ -125,7 +125,7 @@ pub fn pipes_phase(_: &Caps)
 
     // ── (3) Command::output() round-trip ──────────────────────────────
     {
-        let output = Command::new("/bin/hello")
+        let output = Command::new("/programs/hello")
             .output()
             .expect("Command::output on hello failed");
         assert!(
@@ -158,13 +158,13 @@ pub fn pipe_fault_eof_phase(_: &Caps)
     const EXIT_FAULT_BASE: u64 = 0x1000;
     const EXIT_KILLED: u64 = 0x2000;
 
-    let mut child = Command::new("/bin/pipefault")
+    let mut child = Command::new("/programs/pipefault")
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn /bin/pipefault failed");
+        .expect("spawn /programs/pipefault failed");
 
     let id = child.id();
-    std::os::seraph::log!("spawned /bin/pipefault handle={id:#x}");
+    std::os::seraph::log!("spawned /programs/pipefault handle={id:#x}");
 
     let mut stdout = child.stdout.take().expect("piped stdout missing");
     let mut bytes = Vec::new();

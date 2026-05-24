@@ -52,9 +52,9 @@ vfsd/
 - **Filesystem driver lifecycle** — vfsd is the dispatcher for fs
   driver processes. The first `MOUNT` (the role-driven root)
   spawns fatfs from a boot module cap; subsequent mounts walk
-  vfsd's own held system-root cap to `/bin/fatfs` and pass the
+  vfsd's own held system-root cap to `/services/fatfs` and pass the
   resulting file cap to procmgr via `CREATE_FROM_FILE`. The
-  first-mount path is permanent and structural — `/bin/fatfs` is
+  first-mount path is permanent and structural — `/services/fatfs` is
   unreachable until root mounts, so spawning the fatfs that brings
   the root online cannot be moved elsewhere. vfsd supplies each
   driver with a partition-scoped block device endpoint and the

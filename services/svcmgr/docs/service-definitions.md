@@ -1,6 +1,6 @@
 # `.svc` Service Definitions
 
-Authoritative spec for the `/etc/svcmgr/services.d/<name>.svc` files
+Authoritative spec for the `/config/svcmgr/services/<name>.svc` files
 svcmgr scans at `HANDOVER_COMPLETE` to reconcile init's pending
 `REGISTER_SERVICE` announcements with the on-disk service recipes.
 
@@ -13,15 +13,15 @@ recipe travels on the wire.
 
 ## Filesystem layout
 
-* Directory: `/etc/svcmgr/services.d/`
+* Directory: `/config/svcmgr/services/`
 * Filename: `<name>.svc`. The `<name>` portion is the key under which
   the service registers with svcmgr (the `name` field of the
   [v3 `REGISTER_SERVICE`](ipc-interface.md#label-1-register_service)
   wire). Filenames are ASCII; case-sensitive `.svc` suffix.
-* Files are shipped via `rootfs/etc/svcmgr/services.d/` and installed
+* Files are shipped via `rootfs/config/svcmgr/services/` and installed
   into the sysroot by xtask's recursive `install_rootfs` copy. No
   build-system change is required to add a new recipe — drop the
-  file in `rootfs/etc/svcmgr/services.d/` and rebuild.
+  file in `rootfs/config/svcmgr/services/` and rebuild.
 
 ## Grammar
 
@@ -38,7 +38,7 @@ env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
 critical  = low
 namespace = universal
-cwd       = /srv
+cwd       = /data
 seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 ```
 
@@ -91,13 +91,13 @@ The primary lever for confining a service to only what it needs.
 | Form | Effect |
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported`. Default tight choice for services with no filesystem dependency. |
-| `universal` | `cap_copy` of svcmgr's own root (post-#21: the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/bin`, svctest as the namespace tester). |
+| `universal` | `cap_copy` of svcmgr's own root (post-#21: the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
 | `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<rights>` is a `+`-joined list of named tokens (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown tokens are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
 
 ```
-namespace = subtree:/srv:LOOKUP+READDIR+STAT+READ+WRITE
+namespace = subtree:/data:LOOKUP+READDIR+STAT+READ+WRITE
 ```
 
 ## `cwd`
@@ -145,7 +145,7 @@ Well-known names are centralised in
 
 ## Reconciliation
 
-At `HANDOVER_COMPLETE` svcmgr scans `services.d/`, parses each
+At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 `<name>.svc`, and reconciles against init's pending-registration
 table:
 

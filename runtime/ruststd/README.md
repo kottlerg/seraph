@@ -82,7 +82,7 @@ let cwd:  u32 = std::os::seraph::current_dir_cap(); // 0 if no cwd attached
 // Walk the root cap to a path and install the resolved directory cap
 // as the process's cwd. The walk fails iff the path is unreachable
 // through the root.
-std::os::seraph::set_current_dir("/srv")?;
+std::os::seraph::set_current_dir("/data")?;
 ```
 
 `_start` reads `ProcessInfo.system_root_cap` and
@@ -102,7 +102,7 @@ cap-native machinery.
 `Command::spawn` defaults the child's root cap to a `cap_copy` of the
 spawner's `root_dir_cap()` (parent-inherit); explicit override via
 `std::os::seraph::process::CommandExt::namespace_cap` or
-`cwd_dir_cap`. `Command::cwd("/srv")` walks the spawner's root to the
+`cwd_dir_cap`. `Command::cwd("/data")` walks the spawner's root to the
 path and delivers the resulting cap as the child's initial
 `current_dir_cap`.
 

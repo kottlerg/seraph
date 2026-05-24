@@ -1,6 +1,6 @@
 # timed — wall-clock service (RTC-source-agnostic).
 #
-# Init spawns timed in Phase 3 from `/bin/timed`. timed needs only
+# Init spawns timed in Phase 3 from `/services/timed`. timed needs only
 # a service-endpoint RECV and queries `rtc.primary` through its
 # `ProcessInfo.service_registry_cap`; both surfaces are reachable
 # from a fresh launch, so a future restart is feasible. For now
@@ -8,7 +8,7 @@
 # preserves the registry handshake). `critical = normal`: a dead
 # timed leaves `SystemTime::now()` returning UNIX_EPOCH but does
 # not break the system; logged and left inactive.
-binary    = /bin/timed
+binary    = /services/timed
 restart   = never
 critical  = normal
 namespace = none

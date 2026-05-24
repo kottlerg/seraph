@@ -44,7 +44,7 @@ pub struct ServiceThreadCaps
 /// The variants encode the two shapes a child's `system_root_cap`
 /// can take when init still spawns the service directly: a `cap_copy`
 /// of the spawner's seed root, or nothing at all. Per-service subtree
-/// attenuation lives in svcmgr (parsed from `services.d/<name>.svc`'s
+/// attenuation lives in svcmgr (parsed from `/config/svcmgr/services/<name>.svc`'s
 /// `namespace = subtree:<path>:<rights>` line) post-#21.
 #[derive(Clone, Copy)]
 pub enum NsPolicy
@@ -698,7 +698,7 @@ pub struct PwrmgrSpawn
     pub thread_cap: u32,
 }
 
-/// Walk `/bin/pwrmgr`, create the process, transfer platform shutdown
+/// Walk `/services/pwrmgr`, create the process, transfer platform shutdown
 /// caps via bootstrap rounds, and start it.
 ///
 /// Returns the service-endpoint slot init owns (the RECV side stays with
@@ -725,7 +725,7 @@ pub fn create_and_start_pwrmgr(
     ipc_buf: *mut u64,
 ) -> Option<PwrmgrSpawn>
 {
-    let walked = walk::walk_to_file(system_root_cap, b"/bin/pwrmgr", 0xFFFF, ipc_buf)?;
+    let walked = walk::walk_to_file(system_root_cap, b"/services/pwrmgr", 0xFFFF, ipc_buf)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -1051,7 +1051,7 @@ pub fn create_vfsd_with_caps(
 
 // ── svcmgr / procmgr coordination ───────────────────────────────────────────
 
-/// Create svcmgr from `/bin/svcmgr` via `CREATE_FROM_FILE` and install
+/// Create svcmgr from `/services/svcmgr` via `CREATE_FROM_FILE` and install
 /// init's seed system-root cap on the child via `CONFIGURE_NAMESPACE`.
 ///
 /// Returns `(process_handle, child_token)` on success.
@@ -1063,7 +1063,7 @@ pub fn create_svcmgr_from_file(
     ipc_buf: *mut u64,
 ) -> Option<(u32, u64)>
 {
-    let walked = walk::walk_to_file(system_root_cap, b"/bin/svcmgr", 0xFFFF, ipc_buf)?;
+    let walked = walk::walk_to_file(system_root_cap, b"/services/svcmgr", 0xFFFF, ipc_buf)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -1102,8 +1102,10 @@ pub fn create_svcmgr_from_file(
     }
 
     // Post-#21 svcmgr is the supervisor and holds the universal
-    // root: it reads `/etc/svcmgr/services.d/*.svc` at handover,
-    // walks `/bin/<name>` for first-launch of defined-but-unregistered
+    // root: it reads `/config/svcmgr/services/*.svc` at handover,
+    // walks the recipe's `binary` path (typically
+    // `/services/<name>` or `/programs/<name>`) for first-launch of
+    // defined-but-unregistered
     // services, and applies per-service namespace attenuation from
     // each `.svc` recipe when configuring the child. Init no longer
     // pre-attenuates svcmgr to `/bin`.
@@ -1177,7 +1179,7 @@ pub fn setup_and_start_svcmgr(
 ///
 /// Post-#21 the recipe (binary, argv, env, restart policy,
 /// criticality, namespace shape, seed names) lives on disk at
-/// `/etc/svcmgr/services.d/<name>.svc`. The wire conveys only what
+/// `/config/svcmgr/services/<name>.svc`. The wire conveys only what
 /// cannot be on disk: which named recipe this running process
 /// implements, and the thread cap svcmgr binds death-notification on.
 pub struct ServiceRegistration<'a>
@@ -1190,7 +1192,7 @@ pub struct ServiceRegistration<'a>
 /// [`svcmgr_labels::REGISTER_SERVICE`] wire (`word 0` =
 /// `SVCMGR_LABELS_VERSION`, `word 1` = `name_len`, `words 2..` = name
 /// bytes, `caps[0]` = thread cap). svcmgr parks the entry and
-/// reconciles against `services.d/` on `HANDOVER_COMPLETE`.
+/// reconciles against `/config/svcmgr/services/` on `HANDOVER_COMPLETE`.
 pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistration)
 {
     let name_len = reg.name.len();
@@ -1223,9 +1225,9 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
 
 /// Phase 3: spawn svcmgr, bring up the wallclock chain, spawn pwrmgr,
 /// register pwrmgr with svcmgr (v3 wire), publish the named caps
-/// post-#21 consumers resolve from `services.d/<name>.svc` `seed = ...`
+/// post-#21 consumers resolve from `/config/svcmgr/services/<name>.svc` `seed = ...`
 /// lines, then signal `HANDOVER_COMPLETE` so svcmgr scans
-/// `services.d/` and launches the unregistered-but-defined services
+/// `/config/svcmgr/services/` and launches the unregistered-but-defined services
 /// (crasher, svctest).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn phase3_svcmgr_handover(
@@ -1256,7 +1258,7 @@ pub fn phase3_svcmgr_handover(
         idle_loop();
     };
 
-    log("phase 3: loading svcmgr from /bin/svcmgr");
+    log("phase 3: loading svcmgr from /services/svcmgr");
     let Some((svcmgr_handle, svcmgr_token)) = create_svcmgr_from_file(
         procmgr_ep,
         bootstrap_ep,
@@ -1317,7 +1319,7 @@ pub fn phase3_svcmgr_handover(
 
     // Derive a PUBLISH_AUTHORITY-tokened SEND_GRANT on svcmgr's
     // service ep so init can publish the named caps post-#21 consumers
-    // resolve through `services.d/<name>.svc` `seed = ...`.
+    // resolve through `/config/svcmgr/services/<name>.svc` `seed = ...`.
     // `RIGHTS_SEND_GRANT` (not bare SEND): PUBLISH_ENDPOINT carries the
     // value cap in the message, and the IPC kernel requires the GRANT
     // bit on the caller's send-cap to transfer caps. After the four
@@ -1570,7 +1572,7 @@ fn handoff_to_procmgr_reap(
 
 // ── logd spawn ──────────────────────────────────────────────────────────────
 
-/// Spawn real-logd from `/bin/logd` at the end of Phase 2, immediately
+/// Spawn real-logd from `/services/logd` at the end of Phase 2, immediately
 /// after the root mount completes. Init transfers:
 ///
 /// * a RECV cap on the master log endpoint (so logd becomes the
@@ -1603,7 +1605,7 @@ pub fn create_and_start_logd(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    let walked = walk::walk_to_file(system_root_cap, b"/bin/logd", 0xFFFF, ipc_buf)?;
+    let walked = walk::walk_to_file(system_root_cap, b"/services/logd", 0xFFFF, ipc_buf)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -1907,7 +1909,7 @@ fn walk_and_create_from_file(
     Some((process_handle, thread_cap, child_token))
 }
 
-/// Spawn the per-arch RTC chip driver from `/bin/<name>`. Returns the
+/// Spawn the per-arch RTC chip driver from `/services/<name>`. Returns the
 /// init-owned service-endpoint source cap on success — init derives a
 /// fresh SEND from it for the `rtc.primary` publish and the source
 /// stays in init's `CSpace` for the rest of phase 3.
@@ -1927,7 +1929,7 @@ pub fn create_and_start_rtc_driver(
 
     #[cfg(target_arch = "x86_64")]
     let (binary_path, hw_cap) = {
-        let path: &[u8] = b"/bin/cmos-rtc";
+        let path: &[u8] = b"/services/cmos-rtc";
         let Some(root) = crate::find_cap_by_type(info, CapType::IoPortRange)
         else
         {
@@ -1946,7 +1948,7 @@ pub fn create_and_start_rtc_driver(
     };
     #[cfg(target_arch = "riscv64")]
     let (binary_path, hw_cap) = {
-        let path: &[u8] = b"/bin/goldfish-rtc";
+        let path: &[u8] = b"/services/goldfish-rtc";
         let Some(mmio) = find_aperture_copy(info, 0x0010_1000)
         else
         {
@@ -2027,7 +2029,7 @@ pub fn create_and_start_rtc_driver(
     Some(svc_source)
 }
 
-/// Spawn `/bin/timed` and serve its single bootstrap round. Returns
+/// Spawn `/services/timed` and serve its single bootstrap round. Returns
 /// the init-owned service-endpoint source cap; init derives a SEND
 /// from it for the `timed` publish.
 /// Timed-side result of [`create_and_start_timed`].
@@ -2055,7 +2057,7 @@ pub fn create_and_start_timed(
     // timed queries the svcmgr registry for `rtc.primary` then
     // serves GET_WALL_TIME. No filesystem access.
     let Some((process_handle, thread_cap, child_token)) = walk_and_create_from_file(
-        b"/bin/timed",
+        b"/services/timed",
         procmgr_ep,
         bootstrap_ep,
         system_root_cap,

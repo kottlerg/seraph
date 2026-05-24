@@ -39,6 +39,11 @@ enum BuildProfile
 }
 
 /// Where the built binary is installed in the sysroot.
+///
+/// Mirrors the repo's source-tree shape: anything under `services/<x>/`
+/// installs under `/services/`, anything under `programs/<x>/` under
+/// `/programs/`. Test harnesses and per-program testers live under their
+/// own Seraph-native trees rather than borrowing FHS spelling.
 #[derive(Clone, Copy, Debug)]
 enum InstallDest
 {
@@ -48,29 +53,26 @@ enum InstallDest
     /// reach the ESP via the bundle composer (see `xtask/src/bundle.rs`).
     EfiSeraph,
     /// Installed under `sysroot/services/<install_name>` — canonical home
-    /// for bootloader-loaded userspace components (init, ktest, procmgr,
-    /// memmgr, devmgr, vfsd, virtio-blk, fatfs). The bundle composer
-    /// pulls from here; VFS-loaded respawns (notably fatfs after the
-    /// bundle has been reclaimed) look these up by `/services/<name>`.
+    /// for every long-running userspace component sourced from
+    /// `services/` (init, ktest, procmgr, memmgr, devmgr, vfsd,
+    /// virtio-blk, fatfs, svcmgr, logd, pwrmgr, timed, cmos-rtc,
+    /// goldfish-rtc). The bundle composer pulls from here; VFS-loaded
+    /// respawns (notably fatfs after the bundle has been reclaimed) look
+    /// these up by `/services/<name>`.
     Services,
-    /// Installed under both `sysroot/services/<install_name>` AND
-    /// `sysroot/bin/<install_name>`. Used today only for `fatfs`: the
-    /// `/services/` copy goes into the bundle, the `/bin/` copy is what
-    /// vfsd's hardcoded `CREATE_FROM_FILE` respawn path looks up
-    /// (`services/vfsd/src/driver.rs:205`). Collapses to plain
-    /// [`Self::Services`] once #125 renames vfsd's lookup path.
-    ServicesAndRootfsBin,
-    /// Installed under `sysroot/bin/<install_name>` — loaded by procmgr
-    /// from the root partition via VFS at runtime.
-    RootfsBin,
+    /// Installed under `sysroot/programs/<install_name>` — userspace
+    /// utilities and test programs sourced from `programs/<x>/`. Loaded
+    /// by procmgr from the root partition via VFS at runtime.
+    Programs,
     /// Installed under `sysroot/tests/<install_name>` — test-harness
-    /// binaries. svcmgr does not scan this path; harness recipes live
-    /// in `rootfs/etc/svcmgr/tests.d/`. See docs/testing.md.
-    RootfsTests,
-    /// Installed under `sysroot/tests/programs/<install_name>` —
+    /// binaries (svctest, usertest). svcmgr does not scan this path;
+    /// harness recipes live in `rootfs/config/svcmgr/tests/`. See
+    /// docs/testing.md.
+    Tests,
+    /// Installed under `sysroot/programs/tests/<install_name>` —
     /// per-program tester binaries discovered by the `usertest`
     /// orchestrator. See docs/testing.md.
-    RootfsTestsPrograms,
+    ProgramsTests,
 }
 
 /// Static description of a single buildable component (other than boot).
@@ -83,7 +85,7 @@ struct Spec
     /// — the long-standing default for every production component. Set
     /// to `Some(...)` only when the install filename differs from the
     /// cargo crate name (per-program testers: crate `hello-tester` →
-    /// installs as `/tests/programs/hello`).
+    /// installs as `/programs/tests/hello`).
     install_name: Option<&'static str>,
     profile: BuildProfile,
     dest: InstallDest,
@@ -165,124 +167,119 @@ const SPECS: &[Spec] = &[
         name: "cmos-rtc",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Services,
         arch_only: Some(Arch::X86_64),
     },
     Spec {
         name: "goldfish-rtc",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Services,
         arch_only: Some(Arch::Riscv64),
     },
     Spec {
         name: "fatfs",
         install_name: None,
         profile: BuildProfile::StdUser,
-        // Dual-installed: `/services/fatfs` for the bundle composer (so
-        // the bootloader can mount root on the first boot), `/bin/fatfs`
-        // for vfsd's `CREATE_FROM_FILE` respawn path (the namespace path
-        // hardcoded at `services/vfsd/src/driver.rs:205`, scheduled for
-        // rename to `/services/fatfs` in #125's path migration).
-        dest: InstallDest::ServicesAndRootfsBin,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "crasher",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Programs,
         arch_only: None,
     },
     Spec {
         name: "svcmgr",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "pwrmgr",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "logd",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "timed",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Services,
         arch_only: None,
     },
     Spec {
         name: "svctest",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsTests,
+        dest: InstallDest::Tests,
         arch_only: None,
     },
     Spec {
         name: "usertest",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsTests,
+        dest: InstallDest::Tests,
         arch_only: None,
     },
     Spec {
         name: "hello",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Programs,
         arch_only: None,
     },
     Spec {
         name: "hello-tester",
         install_name: Some("hello"),
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsTestsPrograms,
+        dest: InstallDest::ProgramsTests,
         arch_only: None,
     },
     Spec {
         name: "fsbench",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Programs,
         arch_only: None,
     },
     Spec {
         name: "stackoverflow",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Programs,
         arch_only: None,
     },
     Spec {
         name: "pipefault",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Programs,
         arch_only: None,
     },
     Spec {
         name: "stdiotest",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsBin,
+        dest: InstallDest::Programs,
         arch_only: None,
     },
     Spec {
         name: "stdiotest-tester",
         install_name: Some("stdiotest"),
         profile: BuildProfile::StdUser,
-        dest: InstallDest::RootfsTestsPrograms,
+        dest: InstallDest::ProgramsTests,
         arch_only: None,
     },
 ];
@@ -702,15 +699,11 @@ fn install_paths(ctx: &BuildContext, spec: &Spec) -> Result<Vec<PathBuf>>
     {
         InstallDest::EfiSeraph => vec![ctx.sysroot_efi_seraph().join(n)],
         InstallDest::Services => vec![ctx.sysroot_services().join(n)],
-        InstallDest::ServicesAndRootfsBin => vec![
-            ctx.sysroot_services().join(n),
-            ctx.sysroot.join("bin").join(n),
-        ],
-        InstallDest::RootfsBin => vec![ctx.sysroot.join("bin").join(n)],
-        InstallDest::RootfsTests => vec![ctx.sysroot.join("tests").join(n)],
-        InstallDest::RootfsTestsPrograms =>
+        InstallDest::Programs => vec![ctx.sysroot.join("programs").join(n)],
+        InstallDest::Tests => vec![ctx.sysroot.join("tests").join(n)],
+        InstallDest::ProgramsTests =>
         {
-            vec![ctx.sysroot.join("tests").join("programs").join(n)]
+            vec![ctx.sysroot.join("programs").join("tests").join(n)]
         }
     })
 }

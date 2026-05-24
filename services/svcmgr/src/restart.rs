@@ -82,7 +82,7 @@ pub struct StartupBlobs<'a>
 ///
 /// `path` is interpreted relative to svcmgr's own `root_dir_cap`
 /// (universal post-#21 init handover), so callers pass paths exactly
-/// as they appear in `.svc` files — e.g. `"/bin/crasher"`.
+/// as they appear in `.svc` files — e.g. `"/programs/crasher"`.
 ///
 /// `blobs` carries argv/env if the caller wants the child to see
 /// them; restart-path callers pass [`StartupBlobs::default`] to leave

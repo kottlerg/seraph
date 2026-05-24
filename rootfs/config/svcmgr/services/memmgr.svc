@@ -7,10 +7,11 @@
 # the system powers off.
 #
 # The `binary` line is required by the parser and points at the
-# bootloader-staged copy (the live process was loaded from a module
-# Frame cap, not a VFS walk). It is never consumed today because
-# the launch path is unreachable under `restart = never`.
-binary    = /esp/EFI/seraph/memmgr
+# canonical sysroot install location (the live process was loaded
+# from a module Frame cap, not a VFS walk). It is never consumed
+# today because the launch path is unreachable under
+# `restart = never`.
+binary    = /services/memmgr
 restart   = never
 critical  = high
 namespace = none

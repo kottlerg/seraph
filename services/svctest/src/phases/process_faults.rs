@@ -27,12 +27,12 @@ pub fn stack_overflow_phase(_: &Caps)
     const EXIT_FAULT_BASE: u64 = 0x1000;
     const EXIT_KILLED: u64 = 0x2000;
 
-    let mut child = Command::new("/bin/stackoverflow")
+    let mut child = Command::new("/programs/stackoverflow")
         .spawn()
-        .expect("spawn /bin/stackoverflow failed");
+        .expect("spawn /programs/stackoverflow failed");
 
     let id = child.id();
-    std::os::seraph::log!("spawned /bin/stackoverflow handle={id:#x}");
+    std::os::seraph::log!("spawned /programs/stackoverflow handle={id:#x}");
 
     let status = child.wait().expect("stackoverflow wait failed");
     std::os::seraph::log!("stackoverflow exited: {status}");

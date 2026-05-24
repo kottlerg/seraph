@@ -21,7 +21,7 @@ init/
     ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr, logd, RTC, timed, pwrmgr) and phase3_svcmgr_handover
     ├── mount.rs                # Root MOUNT exchange + GET_SYSTEM_ROOT_CAP pull
     ├── logging.rs              # init-logd thread (serves the log endpoint until real-logd takes over)
-    ├── walk.rs                 # /bin/<name> path walker over the seed system-root cap
+    ├── walk.rs                 # /services/<name> path walker over the seed system-root cap
     └── arch/                   # Per-arch serial init (x86-64, riscv64)
 ```
 
@@ -41,7 +41,7 @@ Init runs three stages between `_start` and `sys_thread_exit`:
 2. **Root mount** — issue `MOUNT(MountRole::Root, "/")` to vfsd (vfsd resolves
    the role to the arch-specific Seraph root GPT type-GUID), pull the seed
    `system_root_cap` via `GET_SYSTEM_ROOT_CAP`, then launch real-logd from
-   `/bin/logd` and hand off the master log endpoint via `HANDOVER_PULL`.
+   `/services/logd` and hand off the master log endpoint via `HANDOVER_PULL`.
 3. **Handover** — spawn svcmgr, RTC + timed, and pwrmgr; publish the
    well-known caps (`rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`,
    `svcmgr`); register every init-bootstrapped service with svcmgr via

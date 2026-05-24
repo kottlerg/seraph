@@ -13,12 +13,12 @@ Three harnesses exercise three surfaces:
 | Harness | Surface | Crate | Launch mechanism |
 |---|---|---|---|
 | `ktest` | Kernel | `core/ktest/` | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
-| `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `services.d/` recipe |
-| `usertest` | Programs | `services/usertest/` | `svcmgr` spawns from `services.d/` recipe; drives binaries under `programs/` through their real I/O surfaces |
+| `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
+| `usertest` | Programs | `services/usertest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
-tester binaries discovered under `/tests/programs/`.
+tester binaries discovered under `/programs/tests/`.
 
 ---
 
@@ -62,7 +62,7 @@ program opt in or skip; absence is the default.
 
 ### Install
 
-- The tester binary lands at `/tests/programs/<name>` in the sysroot,
+- The tester binary lands at `/programs/tests/<name>` in the sysroot,
   regardless of the tester crate's `[[bin]]` name.
 - The install path is controlled by `xtask`'s `SPECS` entry for the tester
   crate; the tester crate MUST NOT rely on its own binary name to land at
@@ -75,7 +75,7 @@ program opt in or skip; absence is the default.
 - The tester SHOULD emit a final stdout line `[<name>-tester] PASS` or
   `[<name>-tester] FAIL` for log readability. The orchestrator does not
   rely on this line for the verdict.
-- The tester drives `/bin/<name>` (the program under test) through its
+- The tester drives `/programs/<name>` (the program under test) through its
   real I/O surface — stdio (via `std::process::Command` with
   `Stdio::piped()`), argv, environment, filesystem — and asserts whatever
   invariant fits that program.
@@ -86,21 +86,25 @@ program opt in or skip; absence is the default.
 
 ```
 sysroot/
-├── EFI/seraph/ktest          # kernel-surface harness (bootloader-loaded)
-├── bin/                      # production and interactive binaries only
+├── services/                 # long-running userspace services
+│   └── …
+├── programs/                 # production and interactive program binaries
 │   ├── hello
 │   ├── stdiotest
-│   └── …
-└── tests/                    # opt-in test binaries
+│   ├── …
+│   └── tests/
+│       ├── hello             # per-program tester for /programs/hello
+│       ├── stdiotest         # per-program tester for /programs/stdiotest
+│       └── …
+└── tests/                    # opt-in test-harness binaries
     ├── svctest               # services-surface harness
-    ├── usertest              # programs-surface orchestrator
-    └── programs/
-        ├── hello             # per-program tester for /bin/hello
-        ├── stdiotest         # per-program tester for /bin/stdiotest
-        └── …
+    └── usertest              # programs-surface orchestrator
 ```
 
-`/bin/` MUST NOT contain test harnesses or per-program testers.
+`/programs/` MUST NOT contain test harnesses (the long-running orchestrators
+`svctest`/`usertest`). Per-program testers under `/programs/tests/` are the
+sole exception: they exercise their sibling `/programs/<name>` binary
+through the program's real I/O surface and exit on completion.
 
 ---
 
@@ -108,29 +112,29 @@ sysroot/
 
 The default boot is interactive: no harness runs.
 
-`svcmgr` walks `/etc/svcmgr/services.d/` and launches every `.svc` recipe
+`svcmgr` walks `/config/svcmgr/services/` and launches every `.svc` recipe
 it finds (see [services/svcmgr/README.md](../services/svcmgr/README.md)).
 Test-harness recipes are not shipped there by default. Instead they live
 in a sibling directory that `svcmgr` does not scan:
 
 ```
-rootfs/etc/svcmgr/
-├── services.d/               # always loaded by svcmgr
+rootfs/config/svcmgr/
+├── services/                 # always loaded by svcmgr
 │   ├── procmgr.svc
 │   ├── crasher.svc           # services-tier canary (always on)
 │   └── …
-└── tests.d/                  # NOT loaded by svcmgr
+└── tests/                    # NOT loaded by svcmgr
     ├── svctest.svc
     └── usertest.svc
 ```
 
 To enable a harness for a boot, copy its recipe from
-`sysroot/etc/svcmgr/tests.d/` into `sysroot/etc/svcmgr/services.d/`
+`sysroot/config/svcmgr/tests/` into `sysroot/config/svcmgr/services/`
 between `cargo xtask build` and `cargo xtask run`:
 
 ```sh
 cargo xtask build
-cp sysroot/etc/svcmgr/tests.d/svctest.svc sysroot/etc/svcmgr/services.d/
+cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
 cargo xtask run
 ```
 
@@ -154,7 +158,7 @@ compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
 `svctest` and `usertest` both invoke `pwrmgr` shutdown on completion. Two
 harnesses staged together race on shutdown — the slower one may not
 finish. Per boot, exactly one harness recipe MUST be staged in
-`services.d/`.
+`/config/svcmgr/services/`.
 
 CI matrix cells follow this rule: one harness per cell.
 

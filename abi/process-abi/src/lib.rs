@@ -378,7 +378,7 @@ pub struct ProcessInfo
     /// current working directory. Anchors relative-path resolution.
     ///
     /// Independent of [`Self::system_root_cap`] — typically a derivative
-    /// of it (e.g. `NS_LOOKUP("/srv")` against the root cap), but the
+    /// of it (e.g. `NS_LOOKUP("/data")` against the root cap), but the
     /// kernel imposes no relationship. Zero means "no cwd attached";
     /// std treats relative paths as `Unsupported` until a non-zero cap
     /// is installed (e.g. via `std::env::set_current_dir`).

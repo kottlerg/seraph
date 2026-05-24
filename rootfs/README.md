@@ -13,8 +13,14 @@ directly to their sysroot destinations, not via this tree.
 
 ```
 rootfs/
-  srv/
-    test.txt          # Sample service-data file
+  config/
+    svcmgr/
+      services/       # `.svc` recipes svcmgr scans at handover
+        *.svc
+      tests/          # Opt-in test-harness recipes; staged by hand
+        *.svc
+  data/
+    test.txt          # Marker fixture for svctest fs / namespace phases
   svctest/
     large.bin         # Data file consumed by the svctest harness
 ```

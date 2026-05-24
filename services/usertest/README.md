@@ -1,7 +1,7 @@
 # usertest
 
 Programs-surface test orchestrator. Discovers per-program tester binaries
-under `/tests/programs/`, spawns each, and reports a pass/fail verdict
+under `/programs/tests/`, spawns each, and reports a pass/fail verdict
 from the child's exit status.
 
 ---
@@ -18,7 +18,7 @@ services/usertest/
 
 `usertest` ships no per-program testers itself. Each program under
 `programs/<name>/` may ship a tester at `programs/<name>/tester/`; the
-tester binary lands at `/tests/programs/<name>` and is discovered at
+tester binary lands at `/programs/tests/<name>` and is discovered at
 runtime.
 
 ---

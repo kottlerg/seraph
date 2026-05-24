@@ -91,9 +91,9 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 
    The fall-through preserves the namespace-model rule that root-fs
    entries remain reachable unless explicitly shadowed by a
-   registered mount: paths like `/bin/svcmgr` reach the root fs
-   through the synthetic root's fall-through. Mount-point names
-   take precedence so that a future `/bin` mount (if installed)
+   registered mount: paths like `/services/svcmgr` reach the root
+   fs through the synthetic root's fall-through. Mount-point names
+   take precedence so that a future `/services` mount (if installed)
    shadows the root-fs entry without changing the root filesystem's
    on-disk contents.
 
@@ -172,7 +172,7 @@ vfsd holds two un-tokened endpoints:
 vfsd is also the owner of fs-process lifecycle: `MOUNT` spawns the
 fatfs driver via `worker_pool` (or, on the very first mount, from
 the boot module). The first-mount `CREATE_PROCESS` is permanent and
-structural — `/bin/fatfs` is unreachable until root mounts, so
+structural — `/services/fatfs` is unreachable until root mounts, so
 moving spawn responsibility elsewhere is a chicken-and-egg
 inversion.
 

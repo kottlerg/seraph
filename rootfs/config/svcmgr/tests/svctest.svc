@@ -5,14 +5,15 @@
 # the FS-driver-agnostic root-mount cap; pwrmgr.shutdown/pwrmgr.deny
 # are the SHUTDOWN_AUTHORITY-tokened SEND and its no-auth twin.
 #
-# Recipe lives under tests.d/, which svcmgr does NOT scan. To enable
-# in a boot, copy this file into services.d/ between
-# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
+# scan. To enable in a boot, copy this file into
+# /config/svcmgr/services/ between `cargo xtask build` and
+# `cargo xtask run`. See docs/testing.md.
 binary    = /tests/svctest
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
 critical  = low
 namespace = universal
-cwd       = /srv
+cwd       = /data
 seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny

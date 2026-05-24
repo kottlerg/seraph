@@ -5,9 +5,9 @@
 
 //! Programs-surface test orchestrator.
 //!
-//! Walks `/tests/programs/`, spawns each entry as a child process, and
+//! Walks `/programs/tests/`, spawns each entry as a child process, and
 //! reports a pass/fail verdict from the child's exit status. Each child
-//! (per-program tester) drives its target `/bin/<name>` through that
+//! (per-program tester) drives its target `/programs/<name>` through that
 //! program's real I/O surface; see [docs/testing.md](../../../docs/testing.md)
 //! for the protocol.
 
@@ -25,7 +25,7 @@ use std::os::seraph::startup_info;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const TESTERS_DIR: &str = "/tests/programs";
+const TESTERS_DIR: &str = "/programs/tests";
 
 fn main()
 {
@@ -80,7 +80,7 @@ fn main()
     shutdown(pwrmgr_auth);
 }
 
-/// Enumerate `/tests/programs/`. Stable sort by filename for deterministic
+/// Enumerate `/programs/tests/`. Stable sort by filename for deterministic
 /// output across boots. Empty list on any I/O error (the run then reports
 /// "no testers found"); that surfaces a sysroot-misconfiguration as a
 /// visible empty run rather than a hidden zero-test pass.

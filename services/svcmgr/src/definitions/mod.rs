@@ -6,7 +6,7 @@
 //! On-disk service definitions.
 //!
 //! Every userspace service supervised by svcmgr has a `.svc` file at
-//! `/etc/svcmgr/services.d/<name>.svc`. The file is the **single
+//! `/config/svcmgr/services/<name>.svc`. The file is the **single
 //! source of truth** for the service's recipe: binary path, argv,
 //! env, restart policy, criticality, namespace shape, optional cwd,
 //! and the named seed caps to inject into its bootstrap round. The
@@ -16,7 +16,7 @@
 //! At [`crate::svcmgr_labels::HANDOVER_COMPLETE`] svcmgr calls
 //! [`reconcile_and_launch`]:
 //!
-//! 1. Scan `services.d/` and parse every `.svc` into a [`Definition`].
+//! 1. Scan [`SERVICES_DIR`] and parse every `.svc` into a [`Definition`].
 //! 2. Reconcile against the pending-registration table init populated
 //!    via [`crate::svcmgr_labels::REGISTER_SERVICE`]:
 //!    - **Defined AND registered**: bind death-notification on the
@@ -121,4 +121,4 @@ pub struct Definition
 /// Directory svcmgr scans for service definitions. Absolute path
 /// against svcmgr's `system_root_cap`; post-#21 handover that cap is
 /// universal, so absolute lookups via `std::fs` resolve normally.
-pub const SERVICES_DIR: &str = "/etc/svcmgr/services.d";
+pub const SERVICES_DIR: &str = "/config/svcmgr/services";

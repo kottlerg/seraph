@@ -172,7 +172,7 @@ vfsd holds two un-tokened endpoints:
 vfsd is also the owner of fs-process lifecycle: `MOUNT` spawns the
 fatfs driver via `worker_pool` (or, on the very first mount, from
 the boot module). The first-mount `CREATE_PROCESS` is permanent and
-structural — `/services/fatfs` is unreachable until root mounts, so
+structural — `/services/fs/fatfs` is unreachable until root mounts, so
 moving spawn responsibility elsewhere is a chicken-and-egg
 inversion.
 

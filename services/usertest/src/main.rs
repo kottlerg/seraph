@@ -5,7 +5,7 @@
 
 //! Programs-surface test orchestrator.
 //!
-//! Walks `/programs/tests/`, spawns each entry as a child process, and
+//! Walks `/tests/programs/`, spawns each entry as a child process, and
 //! reports a pass/fail verdict from the child's exit status. Each child
 //! (per-program tester) drives its target `/programs/<name>` through that
 //! program's real I/O surface; see [docs/testing.md](../../../docs/testing.md)
@@ -25,7 +25,7 @@ use std::os::seraph::startup_info;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const TESTERS_DIR: &str = "/programs/tests";
+const TESTERS_DIR: &str = "/tests/programs";
 
 fn main()
 {

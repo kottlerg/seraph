@@ -11,10 +11,10 @@
 //!   the boot-module fatfs frame cap delivered to vfsd at bootstrap. This is
 //!   the only way to get fatfs running before any filesystem is mounted, so
 //!   the cap chain `init → vfsd → procmgr` is unavoidable for the root
-//!   mount. After the root MOUNT succeeds, `/services/fatfs` is reachable through
+//!   mount. After the root MOUNT succeeds, `/services/fs/fatfs` is reachable through
 //!   the just-mounted root filesystem and the boot module is dropped.
 //! * **VFS path** (every subsequent mount): vfsd walks its own held
-//!   system-root cap to `/services/fatfs` and asks procmgr to load that
+//!   system-root cap to `/services/fs/fatfs` and asks procmgr to load that
 //!   resolved file cap via `procmgr_labels::CREATE_FROM_FILE`.
 //!   Procmgr issues `FS_READ` against the file cap, which lands on a
 //!   vfs node; the active worker pool absorbs this round so vfsd's
@@ -42,7 +42,7 @@ static NEXT_BOOTSTRAP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Spawn a fatfs driver instance for a partition and return its `SEND_GRANT`
 /// service endpoint. `module_cap` is non-zero only for the root mount; pass
-/// zero to use the post-boot path that resolves `/services/fatfs` via vfsd's
+/// zero to use the post-boot path that resolves `/services/fs/fatfs` via vfsd's
 /// own held namespace cap (`system_root_cap`) and submits
 /// `CREATE_FROM_FILE` to procmgr.
 pub fn spawn_fatfs_driver(
@@ -116,7 +116,7 @@ pub fn spawn_fatfs_driver(
 
 /// Boot-module spawn path: register the bootstrap order, then issue
 /// `CREATE_PROCESS` directly from main and `START_PROCESS`. Used for the
-/// root mount only; `/services/fatfs` is not yet reachable when this runs.
+/// root mount only; `/services/fs/fatfs` is not yet reachable when this runs.
 fn spawn_via_module(
     caps: &VfsdCaps,
     pool: &WorkerPool,
@@ -186,7 +186,7 @@ fn spawn_via_module(
     true
 }
 
-/// Post-boot spawn path: resolve `/services/fatfs` via vfsd's held namespace
+/// Post-boot spawn path: resolve `/services/fs/fatfs` via vfsd's held namespace
 /// cap, then hand the resulting file cap plus size hint to an active
 /// worker that issues `CREATE_FROM_FILE` and `START_PROCESS` from
 /// outside main. The walk runs on the calling thread (cross-thread to
@@ -202,12 +202,12 @@ fn spawn_via_vfs(
 ) -> bool
 {
     let (file_cap, file_size) =
-        match std::os::seraph::namespace_lookup_file(system_root_cap, "/services/fatfs")
+        match std::os::seraph::namespace_lookup_file(system_root_cap, "/services/fs/fatfs")
         {
             Ok(p) => p,
             Err(e) =>
             {
-                std::os::seraph::log!("fatfs spawn: NS_LOOKUP /services/fatfs failed: {e}");
+                std::os::seraph::log!("fatfs spawn: NS_LOOKUP /services/fs/fatfs failed: {e}");
                 let _ = syscall::cap_delete(tokened_creator);
                 return false;
             }

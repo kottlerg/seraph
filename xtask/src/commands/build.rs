@@ -52,30 +52,41 @@ enum InstallDest
     /// ktest, and all userspace modules live under [`Self::Services`] and
     /// reach the ESP via the bundle composer (see `xtask/src/bundle.rs`).
     EfiSeraph,
-    /// Installed under `sysroot/services/<install_name>`. Holds every
-    /// userspace component sourced from `services/<x>/` (init, procmgr,
-    /// memmgr, devmgr, vfsd, virtio-blk, fatfs, svcmgr, logd, pwrmgr,
-    /// timed, cmos-rtc, goldfish-rtc) plus `ktest` (sourced from
-    /// `core/ktest/`). `ktest` is a one-shot kernel-surface harness, not
-    /// a long-running service; it lands here because the bundle composer
-    /// reads from `sysroot/services/` and `ktest` is the init replacement
-    /// when `compose-bundle --harness ktest` runs. VFS-loaded respawns
-    /// (notably fatfs after the bundle has been reclaimed) walk these
-    /// by `/services/<name>`.
+    /// Installed under `sysroot/services/<install_name>`. Holds the
+    /// non-driver, non-fs userspace components sourced from
+    /// `services/<x>/` (init, procmgr, memmgr, devmgr, vfsd, svcmgr,
+    /// logd, pwrmgr, timed).
     Services,
+    /// Installed under `sysroot/services/drivers/<install_name>`.
+    /// Holds device drivers sourced from `services/drivers/<x>/`
+    /// (cmos-rtc, goldfish-rtc, virtio-blk). Grouping anticipates
+    /// future per-component namespace attenuation: devmgr / init can
+    /// be confined to walking `/services/drivers/` rather than the
+    /// whole `/services/` tree.
+    ServicesDrivers,
+    /// Installed under `sysroot/services/fs/<install_name>`. Holds
+    /// filesystem drivers sourced from `services/fs/<x>/` (fatfs).
+    /// Grouped for the same future-attenuation reason as
+    /// [`Self::ServicesDrivers`] — vfsd is the sole spawner of fs
+    /// drivers and can be confined to `/services/fs/`.
+    ServicesFs,
     /// Installed under `sysroot/programs/<install_name>` — userspace
     /// utilities and test programs sourced from `programs/<x>/`. Loaded
     /// by procmgr from the root partition via VFS at runtime.
     Programs,
-    /// Installed under `sysroot/tests/<install_name>` — test-harness
-    /// binaries (svctest, usertest). svcmgr does not scan this path;
-    /// harness recipes live in `rootfs/config/svcmgr/tests/`. See
-    /// docs/testing.md.
+    /// Installed under `sysroot/tests/<install_name>` — every test
+    /// artifact (kernel-surface harness `ktest`, service-surface
+    /// `svctest`, programs-surface orchestrator `usertest`). svcmgr
+    /// does not scan this path; harness recipes live in
+    /// `rootfs/config/svcmgr/tests/`. The `/tests/` tree is the
+    /// single deletion criterion for stripping the system down to
+    /// a non-test distro shape. See docs/testing.md.
     Tests,
-    /// Installed under `sysroot/programs/tests/<install_name>` —
+    /// Installed under `sysroot/tests/programs/<install_name>` —
     /// per-program tester binaries discovered by the `usertest`
-    /// orchestrator. See docs/testing.md.
-    ProgramsTests,
+    /// orchestrator. Lives under `/tests/` so the deletion criterion
+    /// in [`Self::Tests`] removes them too. See docs/testing.md.
+    TestsPrograms,
 }
 
 /// Static description of a single buildable component (other than boot).
@@ -128,7 +139,7 @@ const SPECS: &[Spec] = &[
         name: "ktest",
         install_name: None,
         profile: BuildProfile::LowLevelUser,
-        dest: InstallDest::Services,
+        dest: InstallDest::Tests,
         arch_only: None,
     },
     Spec {
@@ -163,28 +174,28 @@ const SPECS: &[Spec] = &[
         name: "virtio-blk",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Services,
+        dest: InstallDest::ServicesDrivers,
         arch_only: None,
     },
     Spec {
         name: "cmos-rtc",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Services,
+        dest: InstallDest::ServicesDrivers,
         arch_only: Some(Arch::X86_64),
     },
     Spec {
         name: "goldfish-rtc",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Services,
+        dest: InstallDest::ServicesDrivers,
         arch_only: Some(Arch::Riscv64),
     },
     Spec {
         name: "fatfs",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Services,
+        dest: InstallDest::ServicesFs,
         arch_only: None,
     },
     Spec {
@@ -247,7 +258,7 @@ const SPECS: &[Spec] = &[
         name: "hello-tester",
         install_name: Some("hello"),
         profile: BuildProfile::StdUser,
-        dest: InstallDest::ProgramsTests,
+        dest: InstallDest::TestsPrograms,
         arch_only: None,
     },
     Spec {
@@ -282,7 +293,7 @@ const SPECS: &[Spec] = &[
         name: "stdiotest-tester",
         install_name: Some("stdiotest"),
         profile: BuildProfile::StdUser,
-        dest: InstallDest::ProgramsTests,
+        dest: InstallDest::TestsPrograms,
         arch_only: None,
     },
 ];
@@ -702,11 +713,16 @@ fn install_paths(ctx: &BuildContext, spec: &Spec) -> Result<Vec<PathBuf>>
     {
         InstallDest::EfiSeraph => vec![ctx.sysroot_efi_seraph().join(n)],
         InstallDest::Services => vec![ctx.sysroot_services().join(n)],
+        InstallDest::ServicesDrivers =>
+        {
+            vec![ctx.sysroot_services().join("drivers").join(n)]
+        }
+        InstallDest::ServicesFs => vec![ctx.sysroot_services().join("fs").join(n)],
         InstallDest::Programs => vec![ctx.sysroot.join("programs").join(n)],
         InstallDest::Tests => vec![ctx.sysroot.join("tests").join(n)],
-        InstallDest::ProgramsTests =>
+        InstallDest::TestsPrograms =>
         {
-            vec![ctx.sysroot.join("programs").join("tests").join(n)]
+            vec![ctx.sysroot.join("tests").join("programs").join(n)]
         }
     })
 }

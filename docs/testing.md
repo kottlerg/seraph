@@ -18,7 +18,7 @@ Three harnesses exercise three surfaces:
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
-tester binaries discovered under `/programs/tests/`.
+tester binaries discovered under `/tests/programs/`.
 
 ---
 
@@ -62,7 +62,7 @@ program opt in or skip; absence is the default.
 
 ### Install
 
-- The tester binary lands at `/programs/tests/<name>` in the sysroot,
+- The tester binary lands at `/tests/programs/<name>` in the sysroot,
   regardless of the tester crate's `[[bin]]` name.
 - The install path is controlled by `xtask`'s `SPECS` entry for the tester
   crate; the tester crate MUST NOT rely on its own binary name to land at
@@ -87,24 +87,28 @@ program opt in or skip; absence is the default.
 ```
 sysroot/
 ├── services/                 # long-running userspace services
-│   └── …
+│   ├── …
+│   ├── drivers/              # device drivers (cmos-rtc, goldfish-rtc,
+│   │                         # virtio-blk)
+│   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # production and interactive program binaries
 │   ├── hello
 │   ├── stdiotest
-│   ├── …
-│   └── tests/
-│       ├── hello             # per-program tester for /programs/hello
-│       ├── stdiotest         # per-program tester for /programs/stdiotest
-│       └── …
-└── tests/                    # opt-in test-harness binaries
+│   └── …
+└── tests/                    # every test artifact (deletion criterion
+    │                         # for a non-test distro shape)
+    ├── ktest                 # kernel-surface harness (bootloader-loaded)
     ├── svctest               # services-surface harness
-    └── usertest              # programs-surface orchestrator
+    ├── usertest              # programs-surface orchestrator
+    └── programs/
+        ├── hello             # per-program tester for /programs/hello
+        ├── stdiotest         # per-program tester for /programs/stdiotest
+        └── …
 ```
 
-`/programs/` MUST NOT contain test harnesses (the long-running orchestrators
-`svctest`/`usertest`). Per-program testers under `/programs/tests/` are the
-sole exception: they exercise their sibling `/programs/<name>` binary
-through the program's real I/O surface and exit on completion.
+`/services/`, `/programs/` MUST NOT contain test harnesses or per-program
+testers — all test artifacts live under `/tests/` so a non-test distro
+build amounts to dropping `/tests/`.
 
 ---
 

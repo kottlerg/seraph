@@ -1909,7 +1909,7 @@ fn walk_and_create_from_file(
     Some((process_handle, thread_cap, child_token))
 }
 
-/// Spawn the per-arch RTC chip driver from `/services/<name>`. Returns the
+/// Spawn the per-arch RTC chip driver from `/services/drivers/<name>`. Returns the
 /// init-owned service-endpoint source cap on success — init derives a
 /// fresh SEND from it for the `rtc.primary` publish and the source
 /// stays in init's `CSpace` for the rest of phase 3.
@@ -1929,7 +1929,7 @@ pub fn create_and_start_rtc_driver(
 
     #[cfg(target_arch = "x86_64")]
     let (binary_path, hw_cap) = {
-        let path: &[u8] = b"/services/cmos-rtc";
+        let path: &[u8] = b"/services/drivers/cmos-rtc";
         let Some(root) = crate::find_cap_by_type(info, CapType::IoPortRange)
         else
         {
@@ -1948,7 +1948,7 @@ pub fn create_and_start_rtc_driver(
     };
     #[cfg(target_arch = "riscv64")]
     let (binary_path, hw_cap) = {
-        let path: &[u8] = b"/services/goldfish-rtc";
+        let path: &[u8] = b"/services/drivers/goldfish-rtc";
         let Some(mmio) = find_aperture_copy(info, 0x0010_1000)
         else
         {

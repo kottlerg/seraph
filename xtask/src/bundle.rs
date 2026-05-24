@@ -4,19 +4,21 @@
 //! bundle.rs
 //!
 //! Compose the bootloader bundle (`sysroot/esp/EFI/seraph/bootstrap.bundle`)
-//! from canonical userspace binaries under `sysroot/services/`. The format
-//! is defined by [`boot_protocol::bundle`] and shared with the bootloader
+//! from canonical userspace binaries staged in the sysroot. The format is
+//! defined by [`boot_protocol::bundle`] and shared with the bootloader
 //! consumer side; this module is the only producer in the tree.
 //!
 //! Two flavours of bundle are produced, selected by [`Harness`]:
 //!
 //! - [`Harness::Init`] — default. Pulls `init`, `procmgr`, `memmgr`,
 //!   `devmgr`, `vfsd`, `virtio-blk`, `fatfs` into a 7-entry bundle. `init`
-//!   is named `"init"`; modules carry their service name.
-//! - [`Harness::Ktest`] — pulls `ktest` only, named `"init"`. Zero module
-//!   entries. The bootloader's `step4_parse_bundle` treats this as a
-//!   monolithic ktest boot per `boot_protocol::bundle::INIT_ENTRY_NAME`
-//!   semantics.
+//!   is named `"init"`; modules carry their service name. Sources span
+//!   `sysroot/services/`, `sysroot/services/drivers/`, and
+//!   `sysroot/services/fs/` per each component's install destination.
+//! - [`Harness::Ktest`] — pulls `ktest` only, named `"init"`, from
+//!   `sysroot/tests/ktest`. Zero module entries. The bootloader's
+//!   `step4_parse_bundle` treats this as a monolithic ktest boot per
+//!   `boot_protocol::bundle::INIT_ENTRY_NAME` semantics.
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -36,7 +38,7 @@ pub enum Harness
     /// every service module the system needs to bootstrap userspace.
     #[value(name = "init")]
     Init,
-    /// `sysroot/services/ktest` as the `"init"` entry. Bundle is a single
+    /// `sysroot/tests/ktest` as the `"init"` entry. Bundle is a single
     /// entry; ktest is monolithic and does not spawn userspace modules.
     #[value(name = "ktest")]
     Ktest,
@@ -44,12 +46,15 @@ pub enum Harness
 
 impl Harness
 {
-    fn binary_name(self) -> &'static str
+    /// Sysroot-relative source path of the harness binary that backs the
+    /// bundle's `"init"` entry. The bundle entry itself is always named
+    /// `"init"` regardless of source.
+    fn init_source(self) -> &'static str
     {
         match self
         {
-            Harness::Init => "init",
-            Harness::Ktest => "ktest",
+            Harness::Init => "services/init",
+            Harness::Ktest => "tests/ktest",
         }
     }
 }
@@ -57,23 +62,33 @@ impl Harness
 /// Modules that ship in a default-init bundle. init looks them up by
 /// the name strings here (via `InitInfo::module_names`, populated by
 /// the kernel), so the order is free for the producer's convenience.
-/// Kept in the historic ordinal order (`procmgr, devmgr, vfsd,
-/// virtio-blk, fatfs, memmgr`) only to keep the disk image byte-stable
-/// across builds.
-const MODULE_NAMES: &[&str] = &["procmgr", "devmgr", "vfsd", "virtio-blk", "fatfs", "memmgr"];
+/// Each entry is `(bundle_entry_name, sysroot_relative_source_path)`;
+/// the bundle-entry name is what init matches against, while the source
+/// path follows each binary's `InstallDest` (drivers under
+/// `services/drivers/`, fs drivers under `services/fs/`). Kept in the
+/// historic ordinal order to keep the disk image byte-stable across
+/// builds.
+const MODULES: &[(&str, &str)] = &[
+    ("procmgr", "services/procmgr"),
+    ("devmgr", "services/devmgr"),
+    ("vfsd", "services/vfsd"),
+    ("virtio-blk", "services/drivers/virtio-blk"),
+    ("fatfs", "services/fs/fatfs"),
+    ("memmgr", "services/memmgr"),
+];
 
 /// Compose a bundle for the chosen harness and write it to
 /// `sysroot/esp/EFI/seraph/bootstrap.bundle`, overwriting any existing
-/// file. Source binaries are read from `sysroot/services/<name>`.
+/// file. Source binaries are read from per-component sysroot paths
+/// driven by each component's [`crate::commands::build::InstallDest`].
 ///
-/// `Harness::Init` bundles `init` plus every entry in [`MODULE_NAMES`].
+/// `Harness::Init` bundles `init` plus every entry in [`MODULES`].
 /// `Harness::Ktest` bundles only `ktest` as the `init` entry.
 pub fn compose(ctx: &BuildContext, harness: Harness) -> Result<()>
 {
-    let services = ctx.sysroot_services();
     let out_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
 
-    let init_src = services.join(harness.binary_name());
+    let init_src = ctx.sysroot.join(harness.init_source());
     if !init_src.exists()
     {
         anyhow::bail!(
@@ -87,9 +102,9 @@ pub fn compose(ctx: &BuildContext, harness: Harness) -> Result<()>
     entries.push(("init".to_owned(), init_src));
     if harness == Harness::Init
     {
-        for name in MODULE_NAMES
+        for (name, source) in MODULES
         {
-            let p = services.join(name);
+            let p = ctx.sysroot.join(source);
             if !p.exists()
             {
                 anyhow::bail!(

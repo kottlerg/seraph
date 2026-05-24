@@ -21,9 +21,11 @@ rootfs/
         *.svc
   data/
     test.txt          # Marker fixture for svctest fs / namespace phases
-  svctest/
-    large.bin         # Data file consumed by the svctest harness
 ```
+
+xtask synthesises additional data fixtures at build time directly into
+the sysroot at `sysroot/data/svctest/{large.bin, bench.bin}`; they are
+not stored under `rootfs/` since they are deterministic build artifacts.
 
 The bootloader's `bootstrap.bundle` (which now carries every userspace
 binary the system needs to boot) is composed by `cargo xtask build`

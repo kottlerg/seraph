@@ -10,13 +10,16 @@
 
 use crate::ipc_util::ns::ns_lookup;
 
-/// Walk the per-test `/svctest` directory from the std-overlay
+/// Walk the per-test `/data/svctest` directory from the std-overlay
 /// root-dir cap and return the dir cap.
 pub fn svctest_dir_cap(ipc_buf: *mut u64) -> u32
 {
     let root = std::os::seraph::root_dir_cap();
+    let (data_cap, _kind, _) =
+        ns_lookup(root, b"data", 0xFFFF, ipc_buf).expect("ns_lookup /data failed");
     let (cap, _kind, _) =
-        ns_lookup(root, b"svctest", 0xFFFF, ipc_buf).expect("ns_lookup /svctest failed");
+        ns_lookup(data_cap, b"svctest", 0xFFFF, ipc_buf).expect("ns_lookup /data/svctest failed");
+    let _ = syscall::cap_delete(data_cap);
     cap
 }
 

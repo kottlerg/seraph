@@ -120,7 +120,7 @@ pub fn fs_release_on_close_phase(_: &Caps)
 {
     use std::io::Read;
 
-    let path = "/svctest/large.bin";
+    let path = "/data/svctest/large.bin";
 
     for iter in 0..8u32
     {
@@ -484,7 +484,7 @@ pub fn fs_write_frame_phase(_: &Caps)
     let _ = syscall::mem_unmap(info.self_aspace, va, 1);
     let _ = syscall::cap_delete(file_cap);
 
-    let mut f = std::fs::File::open("/svctest/wrtf.bin").expect("open wrtf.bin");
+    let mut f = std::fs::File::open("/data/svctest/wrtf.bin").expect("open wrtf.bin");
     let mut buf = vec![0u8; WRITE_LEN];
     let mut total = 0;
     while total < WRITE_LEN
@@ -552,8 +552,11 @@ pub fn fs_write_invariants_phase(_: &Caps)
 
         let root = std::os::seraph::root_dir_cap();
         let restricted_rights = u64::from(rights::LOOKUP | rights::MUTATE_DIR);
-        let (parent_attenuated, _, _) = ns_lookup(root, b"svctest", restricted_rights, ipc_buf)
-            .expect("ns_lookup svctest attenuated");
+        let (data_cap, _, _) =
+            ns_lookup(root, b"data", 0xFFFF, ipc_buf).expect("ns_lookup /data for attenuated walk");
+        let (parent_attenuated, _, _) = ns_lookup(data_cap, b"svctest", restricted_rights, ipc_buf)
+            .expect("ns_lookup /data/svctest attenuated");
+        let _ = syscall::cap_delete(data_cap);
 
         let (child_cap, _) = fs_create(parent_attenuated, scratch_name, ipc_buf)
             .expect("FS_CREATE through attenuated parent should succeed");

@@ -55,7 +55,7 @@ The following ordering MUST be observed everywhere in the kernel. Acquiring lock
 
 3. **`SLEEP_LIST_LOCK` is leaf-only.** It MAY be acquired from inside any source IPC lock. It MUST NOT contain calls that re-enter IPC or scheduler code while held.
 
-4. **Cross-CPU scheduler-lock acquisition rule.** When a code path needs two CPU's `scheduler.lock`s simultaneously, the lower-numbered CPU's lock MUST be acquired first. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer) and `dealloc_object(Thread)` (all-CPU walk in ascending order).
+4. **Cross-CPU scheduler-lock acquisition rule.** When a code path needs two CPU's `scheduler.lock`s simultaneously, the lower-numbered CPU's lock MUST be acquired first. Live production sites: `sched::migrate_ready_thread` (used by `sys_thread_set_affinity` active migration and the periodic load balancer), `dealloc_object(Thread)` (all-CPU walk in ascending order), `sched::set_state_under_all_locks` (lifecycle state writes), and `sys_thread_set_priority` (priority writes plus locate-and-relocate of the Ready TCB's queue entry — all-CPU walk in ascending order).
 
 5. **`enqueue_and_wake` MUST be invoked with no IPC source lock held.** A primitive that wakes a TCB (e.g. `signal_send`, `event_queue_post`, `waitset_notify`, `endpoint_call`'s server-wake branch, `endpoint_reply`) snapshots the wake parameters under its source lock, releases the source lock, then calls `enqueue_and_wake`. `enqueue_and_wake` acquires the *target CPU*'s scheduler.lock and dispatches an IPI; holding any source lock across that call would introduce a `source.lock → scheduler.lock` ordering that does not exist in the hierarchy. The same rule governs `dec_ref → dealloc_object` from a wait-set path: `wait_set_drop` releases its source/ws locks before reporting any zero-refcount source back to `dealloc_object_one`'s cascade worklist.
 
@@ -117,9 +117,25 @@ and produce two list entries for the same TCB. The skip loop at
 `sched/mod.rs:1860` remains as defence-in-depth and as the drain mechanism for
 legitimate paths that bypass `set_state_under_all_locks` (none currently). The
 priority snapshot uses `(*tcb).priority` read under all-CPU locks; this is
-consistent with the existing `dealloc_object(Thread)` pattern but inherits the
-pre-existing `sys_thread_set_priority` unlocked-write race (see
-`core/kernel/src/cap/object.rs:1275`).
+consistent with the matching reads in `dealloc_object(Thread)` and
+`sys_thread_set_priority`, which all read/write the Scheduling field group
+under the same all-CPU-locks discipline.
+
+**Priority change of a Ready TCB (issue #122).** `sys_thread_set_priority`
+writes `(*tcb).priority` and, when the target is `Ready`, relocates its
+queue entry under every CPU's `scheduler.lock` acquired in ascending order.
+Identifying the home CPU is itself a read of the Scheduling field group, so
+the syscall scans each scheduler with `remove_from_queue(tcb, old_prio)` —
+exactly one CPU's queue links a Ready TCB (the "Ready ⇒ linked on exactly
+one queue" invariant) and reports `true`. The syscall then calls
+`PerCpuScheduler::enqueue(tcb, new_prio)` on the same scheduler so home-CPU
+placement is preserved. The all-locks region serialises this against
+`migrate_ready_thread`, `dealloc_object(Thread)`, and
+`set_state_under_all_locks`, all of which share the same discipline for
+Scheduling-group writes. Calling `change_priority` here would be unsound:
+its enqueue half is unconditional, so calling it on the wrong scheduler
+when the load balancer had migrated the TCB would double-link it across
+two queues.
 
 ---
 

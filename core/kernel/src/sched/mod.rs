@@ -1098,11 +1098,9 @@ pub unsafe fn set_state_under_all_locks(
 
     // Write the state and snapshot priority under all locks so the queue
     // drain below sees a value coherent with the state we just published.
-    // Priority itself is not protected against a concurrent
-    // `sys_thread_set_priority` (an unlocked write — see
-    // `core/kernel/src/cap/object.rs:1275` for the same caveat in dealloc);
-    // the new drain inherits that pre-existing limitation but does not
-    // worsen it.
+    // `sys_thread_set_priority` observes the same all-CPU-locks discipline
+    // for Scheduling-group writes (`core/kernel/src/syscall/thread.rs`), so
+    // the priority read here is serialised against every other writer.
     // SAFETY: tcb validated by caller; state/priority fields always valid.
     let priority = unsafe {
         (*tcb).state = new_state;
@@ -1333,12 +1331,13 @@ pub unsafe fn migrate_ready_thread(
     if !removed
     {
         // Defensive heal — not a race. Under both scheduler locks no
-        // concurrent removal is possible (dealloc takes all CPU locks in
-        // ascending order; change_priority takes only the per-CPU lock).
-        // A false return here indicates an internal bookkeeping
-        // inconsistency (state == Ready and preferred_cpu == src_cpu but
-        // the TCB is not linked at its priority on src). Bail without
-        // touching dst rather than panicking.
+        // concurrent removal is possible (dealloc and
+        // sys_thread_set_priority both take every CPU's scheduler lock in
+        // ascending order; set_state_under_all_locks likewise). A false
+        // return here indicates an internal bookkeeping inconsistency
+        // (state == Ready and preferred_cpu == src_cpu but the TCB is not
+        // linked at its priority on src). Bail without touching dst rather
+        // than panicking.
         debug_assert!(
             removed,
             "migrate_ready_thread: Ready + preferred_cpu match but no queue entry"

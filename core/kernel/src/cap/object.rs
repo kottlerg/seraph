@@ -1272,8 +1272,10 @@ unsafe fn dealloc_object_one(
                         saved_flags[cpu] = crate::sched::scheduler_for(cpu).lock.lock_raw();
                     }
 
-                    // Read priority inside the all-locks region; a concurrent
-                    // sys_thread_set_priority would race outside.
+                    // Read priority inside the all-locks region.
+                    // `sys_thread_set_priority`, `set_state_under_all_locks`,
+                    // and this dealloc all observe the same all-CPU-locks
+                    // discipline for the Scheduling field group.
                     let prio = (*tcb).priority;
 
                     // Mark Exited under all locks — no schedule() on any CPU

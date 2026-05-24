@@ -102,6 +102,7 @@ mirrors that ceiling (64 × 16 KiB child-stack BSS = 1 MiB).
 | `idle_wake_race.rs` | Race wake of an idle CPU with concurrent ready-queue entry under affinity migration | `ITERATIONS=50_000` |
 | `thread_churn.rs` | Rapid thread create/destroy cycles (TCB and CSpace cleanup) | `ITERATIONS=1000` |
 | `cap_delete_running.rs` | Delete capabilities while child threads actively spin | `NUM_CHILDREN=16` |
+| `priority_dealloc_race.rs` | Race `sys_thread_set_priority` against `cap_delete(Thread)` and affinity-driven migration (covers Scheduling-group all-locks discipline) | `NUM_WORKERS=16`, `CYCLES=200` |
 | `concurrent_signal.rs` | Multiple threads sending distinct bits to one signal simultaneously | `NUM_SENDERS=64`, `SEND_ITERATIONS=5000` |
 | `concurrent_ipc.rs` | Multiple callers racing on one endpoint (send-queue safety) | `NUM_CALLERS=64`, `CYCLES=200` |
 | `cap_revoke_under_use.rs` | Revoke root while child threads actively send on derived caps | `NUM_CHILDREN=64` |

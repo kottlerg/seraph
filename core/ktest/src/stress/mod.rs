@@ -27,6 +27,7 @@ mod concurrent_signal;
 mod event_queue_fill_drain;
 mod fpu_migration_churn;
 mod idle_wake_race;
+mod priority_dealloc_race;
 mod retype_concurrent;
 mod thread_churn;
 
@@ -59,6 +60,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!("stress::idle_wake_race", idle_wake_race::run(ctx));
     run_integration_test!("stress::thread_churn", thread_churn::run(ctx));
     run_integration_test!("stress::cap_delete_running", cap_delete_running::run(ctx));
+    run_integration_test!(
+        "stress::priority_dealloc_race",
+        priority_dealloc_race::run(ctx)
+    );
     run_integration_test!("stress::concurrent_signal", concurrent_signal::run(ctx));
     run_integration_test!("stress::concurrent_ipc", concurrent_ipc::run(ctx));
     run_integration_test!(

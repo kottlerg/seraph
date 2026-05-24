@@ -593,17 +593,65 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // SAFETY: target_tcb validated non-null; priority/state fields always valid.
+    // `priority`, `state`, and `run_queue_next` are in the Scheduling field
+    // group (docs/scheduling-internals.md § Cross-CPU TCB Ownership);
+    // cross-CPU writers MUST hold the home CPU's scheduler.lock. Identifying
+    // the home CPU is itself a read of the same field group, so the
+    // locate-write-relocate sequence is serialised by acquiring every CPU's
+    // scheduler.lock in ascending order — the same shape used by
+    // `dealloc_object(Thread)` and `sched::set_state_under_all_locks`.
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let mut saved_flags: [u64; crate::sched::MAX_CPUS] = [0; crate::sched::MAX_CPUS];
+
+    // Ascending order matches the lock hierarchy rule.
+    #[allow(clippy::needless_range_loop)]
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by `sched::init`.
+        saved_flags[cpu] = unsafe { crate::sched::scheduler_for(cpu).lock.lock_raw() };
+    }
+
+    // SAFETY: target_tcb validated non-null; all-CPU scheduler.locks serialise
+    // every Scheduling-group writer (`dealloc_object(Thread)`,
+    // `migrate_ready_thread`, `set_state_under_all_locks`).
     unsafe {
         let old_prio = (*target_tcb).priority;
+        let state = (*target_tcb).state;
         (*target_tcb).priority = priority;
 
-        // If the thread is Ready, move it to the new priority queue immediately.
-        if (*target_tcb).state == ThreadState::Ready
+        if state == ThreadState::Ready && old_prio != priority
         {
-            // Use the thread's preferred CPU (where it last ran).
-            let target_cpu = (*target_tcb).preferred_cpu as usize;
-            crate::sched::scheduler_for(target_cpu).change_priority(target_tcb, old_prio, priority);
+            // A Ready TCB is linked on exactly one CPU's run queue at its
+            // current priority. Locate that scheduler by trying
+            // `remove_from_queue` on each one; the succeeding remove
+            // identifies the home, and we re-enqueue there at the new
+            // priority so home-CPU placement is preserved.
+            let mut relocated = false;
+            #[allow(clippy::needless_range_loop)]
+            for cpu in 0..cpu_count
+            {
+                let sched = crate::sched::scheduler_for(cpu);
+                if sched.remove_from_queue(target_tcb, old_prio)
+                {
+                    sched.enqueue(target_tcb, priority);
+                    relocated = true;
+                    break;
+                }
+            }
+            debug_assert!(
+                relocated,
+                "Ready TCB {target_tcb:p} not linked at priority {old_prio} on any CPU",
+            );
+        }
+    }
+
+    for cpu in (0..cpu_count).rev()
+    {
+        // SAFETY: `lock_raw` above paired with this unlock; same CPU index.
+        unsafe {
+            crate::sched::scheduler_for(cpu)
+                .lock
+                .unlock_raw(saved_flags[cpu]);
         }
     }
 
@@ -700,10 +748,10 @@ pub fn sys_thread_set_affinity(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // branch of `schedule()`, where the inter-lock window IS visible
         // to interrupts).
         //
-        // (`sys_thread_set_priority` above does an analogous unlocked
-        // read but stays CPU-local — the priority-change does not move
-        // the thread between run queues — so it does not need a preempt
-        // bracket.)
+        // `sys_thread_set_priority` above takes every CPU's scheduler.lock
+        // in ascending order around its Scheduling-group writes, so it
+        // serialises with `migrate_ready_thread` directly and does not need
+        // a preempt bracket.
         //
         // See issue #116.
         crate::percpu::preempt_disable();

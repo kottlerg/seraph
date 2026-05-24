@@ -155,13 +155,65 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // direct physical map (VA == DIRECT_MAP_BASE + PA). The identity mapping
     // covers only 64 KiB around SP and can be exhausted by later phases;
     // the direct map covers all physical RAM with no size limit.
+    //
+    // Tail-call into the bulk of `kernel_entry` through an
+    // `#[inline(never)]` boundary so LLVM cannot hoist sp-derived local-
+    // address materialisations from phases 4-9 to before the rebase. Rust
+    // inline asm cannot list sp as an output, so a per-call rebase would
+    // continue to mislead LLVM about sp's value across the call (the
+    // standard ABI promises sp is callee-saved; the rebase asm silently
+    // violates that, but only the optimisation barrier of an opaque
+    // function call boundary blocks the hoist that hosed PR #138's
+    // riscv64 release ktest cell in CI — sepc=0xffffffff8000d972,
+    // stval=0x9ddc0f58 from a stale `add s7, sp, 0x19E0`).
+    //
     // SAFETY: new page tables active with direct map covering all RAM.
     // Adding DIRECT_MAP_BASE to RSP/RBP switches to the same physical
     // frames through the direct map virtual range.
     unsafe {
         arch::current::paging::rebase_boot_stack(mm::paging::DIRECT_MAP_BASE);
+        kernel_entry_post_rebase(
+            boot_info as u64,
+            boot_cpu_count,
+            boot_cpu_ids,
+            trampoline_pa,
+            init_image,
+            fb_phys,
+            allocator,
+        )
     }
+}
 
+/// Continuation of [`kernel_entry`] after the boot-stack rebase.
+///
+/// `#[inline(never)]` is load-bearing: see the comment in `kernel_entry`
+/// at the rebase site. The body runs phase-3 console rebasing through
+/// phase-9 `init` launch and the scheduler hand-off.
+#[cfg(not(test))]
+#[inline(never)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::needless_range_loop,
+    clippy::similar_names,
+    // boot_cpu_ids ([u32; 512] = 2 KiB) and init_image (272 B) cross
+    // the by-value/by-reference threshold; passing by reference would
+    // re-expose the stale-sp-derived-pointer hazard the
+    // `#[inline(never)]` boundary exists to suppress. Pay the one-time
+    // boot-path memcpy.
+    clippy::large_types_passed_by_value
+)]
+unsafe fn kernel_entry_post_rebase(
+    boot_info_phys: u64,
+    boot_cpu_count: u32,
+    boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
+    trampoline_pa: u64,
+    init_image: boot_protocol::InitImage,
+    fb_phys: u64,
+    allocator: &'static mut mm::buddy::BuddyAllocator,
+) -> !
+{
     // Rebase MMIO-based console devices to the direct physical map.
     // On RISC-V the UART is MMIO and must be accessed via the direct map after
     // the page table switch; on x86-64 the UART is I/O-mapped (no-op).
@@ -202,7 +254,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // bootloader-discovered MMIO bases instead of compile-time defaults. This
     // is heap-free and depends only on the direct physical map (Phase 3).
     // SAFETY: single-threaded boot; called exactly once, after Phase 3.
-    unsafe { platform::capture_kernel_mmio(boot_info as u64) };
+    unsafe { platform::capture_kernel_mmio(boot_info_phys) };
 
     // Allocate per-CPU storage slabs (SCHEDULERS, IDLE_TCBS, AP TSS/GDT/IST
     // on x86) sized to boot_cpu_count. Must precede Phase 5: timer::init
@@ -260,7 +312,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // init can read it.)
     kprintln!("Phase 6: Platform Resource Validation");
     // SAFETY: single-threaded boot Phase 6; first and only call.
-    let mmio_apertures = unsafe { platform::validate_mmio_apertures(boot_info as u64) };
+    let mmio_apertures = unsafe { platform::validate_mmio_apertures(boot_info_phys) };
 
     // ── Phase 7: capability system ─────────────────────────────────────────────
     // Initialises the root CSpace and mints initial capabilities for all
@@ -268,7 +320,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // the post-SMP late-reclaim pass (after Phase 8) can append the AP
     // trampoline cap to its descriptor table before Phase 9 consumes it.
     kprintln!("Phase 7: Capability System");
-    let mut cspace_layout = cap::init_capability_system(mmio_apertures, boot_info as u64);
+    let mut cspace_layout = cap::init_capability_system(mmio_apertures, boot_info_phys);
     kprintln!(
         "capability system initialised, {} slots populated",
         cspace_layout.total_populated
@@ -376,10 +428,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         // original `info` reference points to the bootloader's
         // identity-mapped VA, which Phase 3 unmapped; reading through it
         // here would page-fault. (Phase 7's `cap::init_capability_system`
-        // does the same translation when called with `boot_info as u64`.)
+        // does the same translation when called with `boot_info_phys`.)
         // SAFETY: direct map covers all RAM since Phase 3; boot_info
         // physical address validated in Phase 0.
-        let info_dm = unsafe { &*(mm::paging::phys_to_virt(boot_info as u64) as *const BootInfo) };
+        let info_dm = unsafe { &*(mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo) };
         // SAFETY: ROOT_CSPACE installed in Phase 7; trampoline page no
         // longer mapped at its PA; single-threaded boot.
         unsafe {

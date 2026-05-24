@@ -105,7 +105,9 @@ Isolated userspace processes. Access hardware only through capabilities
 granted by devmgr.
 
 **vfsd**
-Unified filesystem namespace over separate fs driver processes.
+Unified filesystem namespace over separate fs driver processes. The
+system-scope composition (cap-delegation chain, GPT role-GUID
+discovery, mount lifecycle) is specified in [storage.md](storage.md).
 
 **fs drivers**
 Separate binaries in `fs/` (FAT, ext4, tmpfs, etc.), launched by vfsd.

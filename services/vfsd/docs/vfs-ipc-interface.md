@@ -101,4 +101,4 @@ via the root mount's transparent delegation.
 
 ## Summarized By
 
-[services/vfsd/README.md](../README.md)
+[services/vfsd/README.md](../README.md), [docs/storage.md](../../../docs/storage.md)

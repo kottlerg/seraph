@@ -1,7 +1,7 @@
 # /tests/usertest — programs-surface test orchestrator.
 #
 # One-shot: exits cleanly on completion; svcmgr never restarts it. The
-# orchestrator walks /programs/tests/, spawns each per-program tester
+# orchestrator walks /tests/programs/, spawns each per-program tester
 # sequentially, then powers off via the pwrmgr.shutdown seed.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.

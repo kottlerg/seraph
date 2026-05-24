@@ -80,7 +80,7 @@ fn main()
     shutdown(pwrmgr_auth);
 }
 
-/// Enumerate `/programs/tests/`. Stable sort by filename for deterministic
+/// Enumerate `/tests/programs/`. Stable sort by filename for deterministic
 /// output across boots. Empty list on any I/O error (the run then reports
 /// "no testers found"); that surfaces a sysroot-misconfiguration as a
 /// visible empty run rather than a hidden zero-test pass.

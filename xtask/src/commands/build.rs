@@ -99,7 +99,7 @@ struct Spec
     /// — the long-standing default for every production component. Set
     /// to `Some(...)` only when the install filename differs from the
     /// cargo crate name (per-program testers: crate `hello-tester` →
-    /// installs as `/programs/tests/hello`).
+    /// installs as `/tests/programs/hello`).
     install_name: Option<&'static str>,
     profile: BuildProfile,
     dest: InstallDest,

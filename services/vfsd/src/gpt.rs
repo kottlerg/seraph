@@ -204,7 +204,12 @@ fn read_and_validate_header(
     let part_entry_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap_or([0; 8]));
     let num_parts = u32::from_le_bytes(sector[80..84].try_into().unwrap_or([0; 4]));
     let entry_size = u32::from_le_bytes(sector[84..88].try_into().unwrap_or([0; 4]));
-    if entry_size == 0 || entry_size > 512
+    // GPT spec mandates `entry_size >= 128` (and a power-of-two multiple of
+    // 128). `iter_entries` reads up to 56 bytes per entry (type GUID,
+    // unique GUID, first/last LBA, attributes); a malformed `entry_size`
+    // below 56 would index past the per-sector buffer and panic the vfsd
+    // worker thread. Anchor on the spec minimum.
+    if !(128..=512).contains(&entry_size)
     {
         return Err(GptError::InvalidEntrySize);
     }

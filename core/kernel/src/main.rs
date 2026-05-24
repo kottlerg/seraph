@@ -156,9 +156,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // covers only 64 KiB around SP and can be exhausted by later phases;
     // the direct map covers all physical RAM with no size limit.
     //
-    // Tail-call into the bulk of `kernel_entry` through an
-    // `#[inline(never)]` boundary so LLVM cannot hoist sp-derived local-
-    // address materialisations from phases 4-9 to before the rebase. Rust
+    // Call into the bulk of `kernel_entry` through an `#[inline(never)]`
+    // boundary so LLVM cannot hoist sp-derived local-address
+    // materialisations from phases 4-9 to before the rebase. Rust
     // inline asm cannot list sp as an output, so a per-call rebase would
     // continue to mislead LLVM about sp's value across the call (the
     // standard ABI promises sp is callee-saved; the rebase asm silently
@@ -208,10 +208,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     clippy::needless_range_loop,
     clippy::similar_names,
     // boot_cpu_ids ([u32; 512] = 2 KiB) and init_image (272 B) cross
-    // the by-value/by-reference threshold; passing by reference would
-    // re-expose the stale-sp-derived-pointer hazard the
-    // `#[inline(never)]` boundary exists to suppress. Pay the one-time
-    // boot-path memcpy.
+    // the by-value/by-reference threshold. The `#[inline(never)]`
+    // boundary is what defeats the cross-rebase hoist; the by-value
+    // signature is incidental — the ABI passes both via hidden-pointer
+    // and emits an explicit memcpy into the callee's stack frame either
+    // way. Single boot-path copy; nothing on the hot path.
     clippy::large_types_passed_by_value
 )]
 unsafe fn kernel_entry_post_rebase(

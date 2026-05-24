@@ -29,13 +29,13 @@
 
 /// Init protocol version. Incremented on any breaking layout or semantic change.
 ///
+/// v3: Added `cmdline_offset`, `cmdline_len`, and `sbi_control_cap` for kernel
+///     command line passthrough and RISC-V SBI forwarding.
+/// v4: Added `cspace_cap` slot for init's own `CSpace` cap.
 /// v5: Range-cap semantics on `CapType::Interrupt` (`aux0 = start`,
 ///     `aux1 = count`). Dropped `CapType::PciEcam`. Added named
 ///     `InitInfo` slots for the root IRQ range cap and firmware-table
 ///     Frame caps (RSDP, ACPI reclaimable regions, DTB).
-/// v4: Added `cspace_cap` slot for init's own `CSpace` cap.
-/// v3: Added `cmdline_offset`, `cmdline_len`, and `sbi_control_cap` for kernel
-///     command line passthrough and RISC-V SBI forwarding.
 /// v6: Added `init_stack_frame_*` / `init_info_frame_*` slot ranges for
 ///     init self-reclaim.
 /// v7: Added a fixed-size [`InitInfo::module_names`] table so init can

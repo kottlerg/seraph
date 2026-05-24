@@ -17,9 +17,12 @@
 //!    bounds the worker's idle-wake latency from above.
 //!
 //! If the idle-wake primitive is broken (lost IPI / wfi sleeps past the
-//! wake), CPU 1 only wakes on the next timer tick (10 ms). Against a
-//! per-iteration threshold of a few ms, a single lost wake fails the
-//! test with the iteration index — a deterministic regression signal.
+//! wake), CPU 1 only wakes on the next timer tick (10 ms) and the next
+//! iteration takes 10+ ms. A genuinely broken wake path cascades —
+//! tens of thousands of iterations cross the 5 ms outlier threshold —
+//! and trips the aggregate [`MAX_OUTLIERS`] gate. No single sample can
+//! distinguish a lost wake from host preemption of a TCG vCPU thread,
+//! so the test gates solely on the aggregate count.
 //!
 //! Requires ≥ 2 CPUs. On UP configs, logs "SKIP" and passes trivially.
 

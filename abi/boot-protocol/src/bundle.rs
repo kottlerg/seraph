@@ -208,8 +208,8 @@ pub fn read_entry_header(bytes: &[u8]) -> BundleEntryHeader
 /// Read one entry header by index from a validated bundle slice.
 ///
 /// `index` MUST be less than the `entry_count` returned by
-/// [`parse_header`]; the caller is responsible for the bound (assertion in
-/// debug builds, undefined behaviour on overflow in release).
+/// [`parse_header`]; an out-of-bounds index panics deterministically via
+/// the inner slice bound (both debug and release).
 #[must_use]
 pub fn entry_at(bytes: &[u8], index: u32) -> BundleEntryHeader
 {

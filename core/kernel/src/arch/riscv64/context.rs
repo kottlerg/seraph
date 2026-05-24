@@ -267,6 +267,14 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
     //   s9=192, s10=200, s11=208, t3=216, t4=224, t5=232, t6=240,
     //   sepc=248, scause=256, stval=264, sstatus=272
     core::arch::naked_asm!(
+        // Drain prior memory ops on this hart before reading TrapFrame
+        // fields. On a first dispatch of a freshly-spawned thread the
+        // writer (procmgr populating ProcessInfo + sys_thread_configure
+        // populating this TrapFrame) ran on a different hart; without
+        // this fence a freshly-allocated TCB's u64 fields can be observed
+        // partially zero (lower-half stale from page-zero), leaving the
+        // new thread with a half-published pointer.
+        "fence rw, rw",
         // Set sepc = user entry point.
         "ld t0, 248(a0)",
         "csrw sepc, t0",

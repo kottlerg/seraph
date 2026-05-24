@@ -172,6 +172,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // frames through the direct map virtual range.
     unsafe {
         arch::current::paging::rebase_boot_stack(mm::paging::DIRECT_MAP_BASE);
+    }
+
+    #[cfg(not(test))]
+    // SAFETY: post-rebase phases consume validated boot state copied above.
+    unsafe {
         kernel_entry_post_rebase(
             boot_info as u64,
             boot_cpu_count,
@@ -182,6 +187,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             allocator,
         )
     }
+
+    // Test-mode divergence: kernel_entry is never called in host tests, but
+    // the function must type-check as returning `!`.
+    #[cfg(test)]
+    arch::current::cpu::halt_loop()
 }
 
 /// Continuation of [`kernel_entry`] after the boot-stack rebase.

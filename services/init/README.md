@@ -1,9 +1,9 @@
 # init
 
 Bootstrap service and first userspace process. The kernel starts init at the end
-of its initialization sequence. Init is a minimal bootstrapper — it starts early
-services, delegates all capabilities, and exits. It is not a long-lived service
-manager.
+of its initialization sequence. Init runs a three-stage bootstrap — raw memmgr /
+procmgr creation, root mount, then handover to svcmgr — and exits. It is not a
+long-lived service manager.
 
 ---
 
@@ -12,189 +12,60 @@ manager.
 ```
 init/
 ├── Cargo.toml                  # Workspace member; no_std binary
+├── README.md
+├── docs/
+│   └── bootstrap.md            # Authoritative stage enumeration + capability flow
 └── src/
-    └── main.rs                 # _start() entry point, bootstrap sequence
+    ├── main.rs                 # _start, run() orchestration across the three stages
+    ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup
+    ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr, logd, RTC, timed, pwrmgr) and phase3_svcmgr_handover
+    ├── mount.rs                # Root MOUNT exchange + GET_SYSTEM_ROOT_CAP pull
+    ├── logging.rs              # init-logd thread (serves the log endpoint until real-logd takes over)
+    ├── walk.rs                 # /bin/<name> path walker over the seed system-root cap
+    └── arch/                   # Per-arch serial init (x86-64, riscv64)
 ```
 
-Init depends on `shared/elf` for ELF parsing (to load procmgr from its boot
-module) and `shared/syscall` for raw syscall wrappers (to create procmgr's
-process without IPC).
+Init depends on `shared/elf` for ELF parsing (used to load memmgr and procmgr
+from their bundle entries) and `shared/syscall` for raw syscall wrappers (used
+to create memmgr and procmgr without IPC).
 
 ---
 
-## Role
+## Bootstrap
 
-Init's responsibilities are strictly bounded:
+Init runs three stages between `_start` and `sys_thread_exit`:
 
-1. **Start memmgr** — init contains a minimal ELF parser (from
-   `shared/elf`) and uses raw syscall wrappers (from `shared/syscall`)
-   to create memmgr's process directly, without IPC. Init transfers the
-   full RAM Frame cap pool from its own CSpace into memmgr's CSpace via
-   the derive-twice pattern, then serves a single bootstrap-IPC round
-   carrying the slot range so memmgr knows where its pool lives.
+1. **Raw bootstrap** — version-check `InitInfo`, set up the IPC buffer, mint
+   endpoints, spawn init-logd, bring up memmgr and procmgr via raw syscalls,
+   then drive procmgr IPC to create devmgr and vfsd.
+2. **Root mount** — issue `MOUNT(MountRole::Root, "/")` to vfsd (vfsd resolves
+   the role to the arch-specific Seraph root GPT type-GUID), pull the seed
+   `system_root_cap` via `GET_SYSTEM_ROOT_CAP`, then launch real-logd from
+   `/bin/logd` and hand off the master log endpoint via `HANDOVER_PULL`.
+3. **Handover** — spawn svcmgr, RTC + timed, and pwrmgr; publish the
+   well-known caps (`rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`,
+   `svcmgr`); register every init-bootstrapped service with svcmgr via
+   `REGISTER_SERVICE`; signal `HANDOVER_COMPLETE`; hand init's own
+   kernel objects + reclaimable Frame caps to procmgr via
+   `REGISTER_INIT_TEARDOWN`; call `sys_thread_exit`. Procmgr's death-EQ
+   observer then runs the reap path.
 
-2. **Start procmgr** — init creates procmgr the same way (raw syscalls,
-   no IPC). Before starting procmgr's thread, init calls
-   `memmgr.REGISTER_PROCESS` to mint procmgr's `memmgr_endpoint_cap`
-   and writes it into procmgr's `ProcessInfo` so procmgr's std heap
-   bootstrap reaches memmgr on its first call.
-
-3. **Request early service startup** — init requests procmgr to start
-   the remaining early services in order: devmgr, svcmgr, drivers, VFS,
-   and optionally net. Tier-1 services (devmgr, vfsd, drivers) are
-   spawned via boot-module `CREATE_PROCESS` *before* init has a
-   namespace cap, so they hold none — their `ProcessInfo.system_root_cap`
-   is zero, which is correct for kernel-adjacent services that have no
-   business reading the filesystem.
-
-4. **Acquire the seed system-root cap** — after the role-driven
-   root mount completes (init sends `MOUNT(MountRole::Root, "/")`;
-   vfsd resolves the role to the arch-specific Seraph root GPT
-   type-GUID), init issues
-   `vfsd_labels::GET_SYSTEM_ROOT_CAP` to vfsd. The returned tokened
-   SEND on vfsd's namespace endpoint at `NodeId::ROOT` with full
-   rights is init's seed: every later Phase 3 child receives a
-   `cap_copy` of it via `procmgr_labels::CONFIGURE_NAMESPACE`. Init
-   is the cap-distribution authority for tier-3 services; there is no
-   procmgr broadcast.
-
-5. **Delegate capabilities** — for each service, init derives and
-   transfers the appropriate subset of its initial capabilities via
-   IPC. Init retains derived intermediary copies (for potential
-   revocation), not the roots.
-
-6. **Launch real logd (Phase 2 epilogue)** — immediately after the
-   seed `system_root_cap` is acquired, init walks
-   `/bin/logd` and spawns real-logd via
-   `procmgr_labels::CREATE_FROM_FILE`. The bootstrap round
-   delivers (a) a RECV cap on the master log endpoint, (b) a
-   one-shot SEND cap on the same endpoint for `HANDOVER_PULL`,
-   (c) a tokened SEND on procmgr carrying
-   `procmgr_labels::DEATH_EQ_AUTHORITY`, and (d) the arch serial
-   authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V).
-   logd pulls init-logd's captured state via `HANDOVER_PULL`;
-   init-logd's receive loop self-terminates on the final reply.
-   See [`services/logd/README.md`](../logd/README.md) and
-   [`services/logd/docs/handover-protocol.md`](../logd/docs/handover-protocol.md).
-
-7. **Spawn Phase 3 services from VFS** — svcmgr, logd, the per-arch
-   RTC driver, timed, and pwrmgr are loaded by walking init's seed
-   system-root cap to `/bin/<name>` and issuing
-   `procmgr_labels::CREATE_FROM_FILE`. Each spawn site picks a
-   namespace policy that init installs via
-   `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`:
-
-   | Service | Policy | Notes |
-   |---|---|---|
-   | `svcmgr` | `Universal` | Reads `/etc/svcmgr/services.d/`, walks `/bin/<name>` for launched services, re-applies per-service `.svc` attenuation on restart. |
-   | `pwrmgr` | `None` | Owns `IoPortRange` / `SbiControl` / ACPI frames; no FS. |
-   | `logd` | `None` | Owns the master log endpoint and arch serial authority; no FS. |
-   | `timed` | `None` | Queries the svcmgr registry for `rtc.primary`; no FS. |
-   | `cmos-rtc` / `goldfish-rtc` | `None` | Hardware-only driver; serves a single RTC read. |
-
-   The `NsPolicy` enum and the `configure_child_namespace` helper
-   live in [`src/service.rs`](src/service.rs). `crasher` and
-   `svctest` are no longer spawned by init — they are launched by
-   svcmgr after handover from their `.svc` recipes
-   (see [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)).
-   `hello`, `stdiotest`, and other `/bin/` binaries are spawned
-   on-demand by individual tests via `std::process::Command`. See
-   [`docs/namespace-model.md`](../../docs/namespace-model.md) for
-   the underlying namespace-cap distribution invariants.
-
-8. **Publish well-known caps + register pwrmgr with svcmgr** —
-   before signalling handover, init publishes the named caps
-   post-#21 consumers resolve through `services.d/<name>.svc`
-   `seed = ...` lines, using
-   `svcmgr_labels::PUBLISH_ENDPOINT` with a
-   `PUBLISH_AUTHORITY`-tokened `RIGHTS_SEND_GRANT` cap on svcmgr's
-   service endpoint:
-
-   * `rootfs.root` — tokened SEND on the root filesystem's namespace
-     endpoint at its root directory (FS-driver-agnostic by design).
-   * `pwrmgr.shutdown` — `SHUTDOWN_AUTHORITY`-tokened SEND on
-     pwrmgr's service endpoint.
-   * `pwrmgr.deny` — no-authority SEND on pwrmgr's service endpoint
-     (negative-test twin).
-   * `svcmgr` — un-tokened SEND on svcmgr's own service endpoint.
-
-   Init also registers each foundational service it bootstrapped
-   with svcmgr via the v3 `REGISTER_SERVICE` wire (name + thread
-   cap; recipe lives in `services.d/<name>.svc`). The registration
-   set in this PR is `memmgr`, `procmgr`, `devmgr`, `vfsd`, `logd`,
-   `timed`, and `pwrmgr`. svcmgr reconciles each against its
-   matching `.svc` file and binds death-notification.
-
-   Names are centralised in `ipc::published_names`. Recipes (binary,
-   argv, env, restart policy, criticality, namespace shape, seed
-   names) live on disk at `/etc/svcmgr/services.d/<name>.svc`, not
-   on the wire — see
-   [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md).
-
-9. **Reap handoff and exit** — init hands its own `AddressSpace`,
-   `CSpace`, main `Thread`, and init-logd `Thread` caps plus every
-   reclaimable Frame cap (segments, stack, `InitInfo` region, IPC
-   buffer) to procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN`
-   (multi-round; IPC cap-transfer MOVES the caps out of init's
-   CSpace). After `INIT_TEARDOWN_DONE`, init calls
-   `sys_thread_exit`. The kernel mints all four resource classes at
-   Phase 9 with `RETYPE` + `owns_memory=true` + the full
-   `available_bytes` ledger + `register_owned_range`, so each cap is
-   eligible for `memmgr.DONATE_FRAMES` ingestion.
-
-   Procmgr's death-EQ observer (bound on init's main thread with
-   `INIT_REAP_CORRELATOR`) fires on the exit and runs
-   [`init_reap::run_reap`](../procmgr/src/init_reap.rs):
-
-   1. `cap_delete` both `Thread` caps → TCBs reclaimed.
-   2. `cap_revoke + cap_delete` init's `AddressSpace` → PT chunks
-      `retype_free`'d, every user-page mapping vanishes.
-   3. `DONATE_FRAMES` the accumulated Frame caps to memmgr → the
-      segment / stack / `InitInfo` / IPC-buffer pages enter
-      memmgr's pool, safely (no aliasing — the AS is already dead).
-   4. `cap_revoke + cap_delete` init's `CSpace` → cascade dec_refs
-      every cap init still held (endpoint SENDs, endpoint slab
-      Frame, leftover `FrameAlloc` tails). Those with
-      `owns_memory=true` return their pages to the kernel buddy via
-      `dealloc_object`'s `free_range` (kernel-internal, not
-      memmgr's pool).
-   5. Procmgr logs a summary line. No init-related kernel object
-      remains; svcmgr takes over as the resident supervisor.
-
-memmgr and procmgr are the only two processes init creates via raw
-syscalls. Every later service is spawned via IPC to procmgr.
-
-After the split, the only `no_std` userspace services in the running
-system are init and memmgr; everything else is std-built.
+See [docs/bootstrap.md](docs/bootstrap.md) for the authoritative
+stage-by-stage enumeration, source citations, and per-stage capability
+transfer table.
 
 ---
 
 ## What init does NOT do
 
-- Does not supervise services or restart them on crash (svcmgr's responsibility)
-- Does not hold raw process-creation fallback capabilities after delegating them
-  to svcmgr
-- Does not read a service dependency graph file at runtime (bootstrap order is
-  compiled in)
-- Does not remain resident after bootstrap completes
-
----
-
-## Capability flow
-
-At entry, init holds the full initial CSpace populated by the kernel:
-- Thread, AddressSpace, and CSpace caps for itself
-- Frame caps for all usable physical memory
-- One MmioRegion cap per coarse MMIO aperture
-- One root Interrupt range cap (narrowed per-device in userspace via `sys_irq_split`)
-- IoPortRange cap covering the full 64K port space (x86-64)
-- SbiControl cap (RISC-V)
-- Read-only Frame caps covering the ACPI RSDP page, each `AcpiReclaimable` region, and the DTB blob — devmgr parses firmware tables from these
-- SchedControl cap
-- Frame caps for boot module images (procmgr, devmgr, drivers, etc.)
-
-Init derives and transfers these to services using the "derive twice" pattern
-(see `docs/capability-model.md`) so it can revoke if needed before svcmgr takes over.
+- Does not supervise services or restart them on crash (svcmgr's
+  responsibility).
+- Does not hold raw process-creation fallback capabilities after delegating
+  them to svcmgr.
+- Does not read a service dependency graph file at runtime (bootstrap order
+  is compiled in).
+- Does not remain resident after bootstrap completes — procmgr reaps init's
+  address space, CSpace, and threads after `sys_thread_exit`.
 
 ---
 
@@ -203,15 +74,22 @@ Init derives and transfers these to services using the "derive twice" pattern
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, init/memmgr/procmgr/svcmgr roles |
+| [docs/bootstrap.md](../../docs/bootstrap.md) | System-scope end-to-end boot lifecycle |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, ProcessInfo/InitInfo handover, authority transfer |
-| [abi/boot-protocol/](../../abi/boot-protocol/) | InitImage, boot modules, initial CSpace |
-| [abi/init-protocol/](../../abi/init-protocol/) | Kernel-to-init handover (`InitInfo`) |
-| [docs/capability-model.md](../../docs/capability-model.md) | Initial capability distribution |
-| [services/memmgr/README.md](../memmgr/README.md) | First service init creates; receives the RAM frame pool |
+| [docs/capability-model.md](../../docs/capability-model.md) | Initial capability distribution, derive-twice pattern |
+| [docs/namespace-model.md](../../docs/namespace-model.md) | Namespace-cap distribution invariants |
+| [abi/boot-protocol/](../../abi/boot-protocol/) | `BootInfo`, `bootstrap.bundle`, initial CSpace |
+| [abi/init-protocol/](../../abi/init-protocol/) | Kernel-to-init handover (`InitInfo`, module-name table) |
+| [services/memmgr/README.md](../memmgr/README.md) | First service init creates; receives the RAM Frame pool |
+| [services/procmgr/README.md](../procmgr/README.md) | Owns process creation post-bootstrap; runs init's reap path |
+| [services/svcmgr/README.md](../svcmgr/README.md) | Takes over as resident supervisor after `HANDOVER_COMPLETE` |
+| [services/logd/README.md](../logd/README.md) | Master log endpoint owner post-Phase-2-epilogue |
+| [services/pwrmgr/README.md](../pwrmgr/README.md) | Receives arch authority + ACPI Frame caps during handover |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |
 
 ---
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Process Lifecycle](../../docs/process-lifecycle.md)
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Process Lifecycle](../../docs/process-lifecycle.md), [logd](../logd/README.md), [memmgr](../memmgr/README.md), [pwrmgr](../pwrmgr/README.md)

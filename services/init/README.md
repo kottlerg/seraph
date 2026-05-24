@@ -60,8 +60,10 @@ transfer table.
 
 - Does not supervise services or restart them on crash (svcmgr's
   responsibility).
-- Does not hold raw process-creation fallback capabilities after delegating
-  them to svcmgr.
+- Does not retain raw process-creation capabilities — the kernel-object
+  retypes (`cap_create_aspace` / `cap_create_cspace` / `cap_create_thread`)
+  used to bring up memmgr and procmgr happen only in init's Raw bootstrap
+  stage; after that, every process is created via procmgr IPC.
 - Does not read a service dependency graph file at runtime (bootstrap order
   is compiled in).
 - Does not remain resident after bootstrap completes — procmgr reaps init's

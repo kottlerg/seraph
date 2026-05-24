@@ -237,7 +237,7 @@ pub struct RunParallelArgs
     /// Regex marking a successful run. On match the log is discarded and
     /// the run is classified PASS. The default matches the cross-harness
     /// terminal marker `[<harness>] ALL TESTS PASSED` standardised in
-    /// [`docs/testing.md`](../../../docs/testing.md); override for other
+    /// [`docs/testing.md`](../../docs/testing.md); override for other
     /// rootfs configurations.
     #[arg(long, default_value = "ALL TESTS PASSED")]
     pub pass: String,
@@ -246,7 +246,7 @@ pub struct RunParallelArgs
     /// FAIL-<run>.log. Failure takes precedence over success. The default
     /// matches the cross-harness terminal marker
     /// `[<harness>] SOME TESTS FAILED` standardised in
-    /// [`docs/testing.md`](../../../docs/testing.md); override with a
+    /// [`docs/testing.md`](../../docs/testing.md); override with a
     /// never-matching pattern (e.g. `'$.^'`) to disable.
     #[arg(long, default_value = "SOME TESTS FAILED")]
     pub fail: String,

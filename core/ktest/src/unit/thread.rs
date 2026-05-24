@@ -617,11 +617,12 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
 ///    this, CPU 0 may be idle when `thread_start(T)` enqueues T, and the
 ///    wake-IPI lets CPU 0 dispatch T (the only Ready thread there) before
 ///    the active-migration call.
-/// 2. **T at priority 1 (below the parent's `PRIORITY_DEFAULT` of 10).**
-///    Even with parent on CPU 0, same-priority FIFO would let a timer-driven
-///    `schedule()` re-enqueue parent at the tail and dispatch T at the head.
-///    Strict-lower priority guarantees CPU 0's `dequeue_highest` always
-///    returns parent, leaving T queued.
+/// 2. **T at priority 1 (below the parent's `INIT_PRIORITY` of 15).**
+///    Both the harness and any thread minted via `cap_create_thread`
+///    default to `INIT_PRIORITY`. Without this step, same-priority FIFO
+///    would let a timer-driven `schedule()` re-enqueue parent at the tail
+///    and dispatch T at the head. Strict-lower priority guarantees CPU 0's
+///    `dequeue_highest` always returns parent, leaving T queued.
 ///
 /// Together these make `sys_thread_set_affinity` deterministically observe
 /// `state == Ready` for T on CPU 0, exercising `migrate_ready_thread`. When
@@ -654,11 +655,11 @@ pub fn affinity_migrate_ready_queued(ctx: &TestContext) -> TestResult
     let result = affinity_migrate_ready_queued_body(ctx);
 
     // Restore the harness's affinity regardless of test outcome so later
-    // tests start from the default any-CPU placement.
-    thread_set_affinity(ctx.thread_cap, u32::MAX)
-        .map_err(|_| "restoring parent affinity to AFFINITY_ANY failed")?;
-
-    result
+    // tests start from the default any-CPU placement. Preserve the body's
+    // error if both fail — the body's failure is the proximate cause.
+    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
+        .map_err(|_| "restoring parent affinity to AFFINITY_ANY failed");
+    result.and(restore)
 }
 
 fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
@@ -675,10 +676,11 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     // Pin to CPU 0 initially so T's first enqueue lands on CPU 0's run queue.
     thread_set_affinity(th, 0).map_err(|_| "initial thread_set_affinity(0) failed")?;
 
-    // Priority 1 (strict-lower than the parent's default of 10) so CPU 0's
-    // `dequeue_highest` always selects the parent over T while both are
-    // Ready/Running there. Priority 1 is below SCHED_ELEVATED_MIN so no
-    // SchedControl cap is required (sched_idx = 0).
+    // Priority 1 (strict-lower than the parent's INIT_PRIORITY of 15) so
+    // CPU 0's `dequeue_highest` always selects the parent over T while
+    // both are Ready/Running there. Priority 1 is below
+    // SCHED_ELEVATED_MIN so no SchedControl cap is required
+    // (sched_idx = 0).
     thread_set_priority(th, 1, 0)
         .map_err(|_| "thread_set_priority(1) for affinity_migrate_ready_queued failed")?;
 
@@ -693,20 +695,21 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     thread_start(th).map_err(|_| "thread_start for affinity_migrate_ready_queued failed")?;
 
     // T is Ready, queued on CPU 0 at priority 1; the parent is Running on
-    // CPU 0 at priority 10 (pinned by the outer wrapper), so no scheduling
-    // event can dispatch T here. Switch T's affinity to CPU 1 — the
-    // active-migration path must dequeue T from CPU 0 and re-enqueue it on
-    // CPU 1.
+    // CPU 0 at INIT_PRIORITY=15 (pinned by the outer wrapper), so no
+    // scheduling event can dispatch T here. Switch T's affinity to CPU 1
+    // — the active-migration path must dequeue T from CPU 0 and re-enqueue
+    // it on CPU 1.
     thread_set_affinity(th, 1).map_err(|_| "active migration thread_set_affinity(1) failed")?;
 
     // Block on the signal: parent leaves CPU 0, CPU 1 runs T which reports
     // its actual CPU id back through the signal bits. `report_cpu_entry`
-    // encodes the CPU id as `1u64 << cpu` (always non-zero) so any missed
-    // wake — including a `cpu == 0` report from an unexpected stale-CPU
-    // run — surfaces as a deterministic test FAIL instead of a HANG.
-    // `signal_send(sig, 0)` would be rejected and the parent would park
-    // indefinitely (see issue #116). The 5 s timeout is a defensive
-    // backstop against any other missed-wake mode.
+    // encodes the CPU id as `1u64.wrapping_shl(cpu)` (always non-zero by
+    // the modulo-64 shift semantics) so any missed wake — including a
+    // `cpu == 0` report from an unexpected stale-CPU run — surfaces as a
+    // deterministic test FAIL instead of a HANG. `signal_send(sig, 0)`
+    // would be rejected and the parent would park indefinitely (see
+    // issue #116). The 5 s timeout is a defensive backstop against any
+    // other missed-wake mode.
     let bits = signal_wait_timeout(sig, 5_000)
         .map_err(|_| "signal_wait for affinity_migrate_ready_queued failed")?;
     if bits == 0

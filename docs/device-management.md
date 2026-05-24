@@ -50,21 +50,11 @@ authoritative cap-by-cap list.
 
 ### What devmgr does
 
-1. **Parse firmware tables** — walks ACPI or Device Tree to resolve interrupt
-   routing, power domains, and the full PCI hierarchy.
-
-2. **Enumerate PCI** — maps the ECAM region and reads configuration space to
-   discover all devices, BARs, and interrupt assignments.
-
-3. **Bind drivers** — for each device, spawns a driver process, delegates
-   per-device capabilities (MMIO, interrupt, optionally DMA), and routes the
-   driver's endpoint to the consuming service.
-
-4. **Expose a device registry** — maintains an IPC service for querying device
-   capabilities.
-
-5. **Handle hotplug** — on supported platforms, receives hotplug notifications
-   and dynamically spawns or terminates driver processes.
+devmgr's per-responsibility specification — firmware-table parsing,
+PCI enumeration, driver binding, device-registry IPC, and hotplug —
+is in [`services/devmgr/README.md`](../services/devmgr/README.md) §
+Responsibilities. This document covers only the system-scope
+boundary devmgr sits inside.
 
 ### Security boundary
 
@@ -148,8 +138,12 @@ devmgr is not a dependency of vfsd or netd directly — those services receive d
 endpoints after devmgr has completed initial binding. The dependency ordering is
 managed by init's bootstrap sequence (for early boot) and svcmgr (for restarts).
 
+Storage-side cap delegation downstream of devmgr (whole-disk
+endpoint → vfsd → partition-scoped endpoint → fs driver) is
+specified in [`storage.md`](storage.md).
+
 ---
 
 ## Summarized By
 
-[README.md](../README.md), [Architecture Overview](architecture.md), [devmgr](../services/devmgr/README.md), [drivers](../services/drivers/README.md)
+[README.md](../README.md), [Architecture Overview](architecture.md), [storage.md](storage.md), [devmgr](../services/devmgr/README.md), [drivers](../services/drivers/README.md)

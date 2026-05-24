@@ -497,4 +497,4 @@ bound on every `BLK_READ_INTO_FRAME`. See
 
 ## Summarized By
 
-[services/fs/README.md](../README.md), [services/fs/fat/README.md](../fat/README.md)
+[services/fs/README.md](../README.md), [services/fs/fat/README.md](../fat/README.md), [docs/storage.md](../../../docs/storage.md)

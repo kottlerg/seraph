@@ -182,12 +182,10 @@ pub unsafe fn dispatch_device_irq(irq: u32)
     if let Some(tcb) = woken
     {
         // SAFETY: tcb is a valid ThreadControlBlock pointer returned by signal_send.
-        let prio = unsafe { (*tcb).priority };
-        // SAFETY: tcb is a valid ThreadControlBlock pointer returned by signal_send.
         let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
         // SAFETY: tcb and target_cpu are valid; enqueue_and_wake sends wakeup IPI if needed.
         unsafe {
-            crate::sched::enqueue_and_wake(tcb, target_cpu, prio);
+            crate::sched::enqueue_and_wake(tcb, target_cpu);
         }
     }
 }

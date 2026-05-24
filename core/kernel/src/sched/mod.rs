@@ -676,9 +676,9 @@ pub fn sleep_check_wakeups()
         if claimed
         {
             // SAFETY: tcb is valid; transitioned to Ready above.
-            let (cpu, priority) = unsafe { ((*tcb).preferred_cpu as usize, (*tcb).priority) };
+            let cpu = unsafe { (*tcb).preferred_cpu as usize };
             // SAFETY: tcb valid, Ready.
-            unsafe { enqueue_and_wake(tcb, cpu, priority) };
+            unsafe { enqueue_and_wake(tcb, cpu) };
         }
     }
 }
@@ -1098,11 +1098,9 @@ pub unsafe fn set_state_under_all_locks(
 
     // Write the state and snapshot priority under all locks so the queue
     // drain below sees a value coherent with the state we just published.
-    // Priority itself is not protected against a concurrent
-    // `sys_thread_set_priority` (an unlocked write — see
-    // `core/kernel/src/cap/object.rs:1275` for the same caveat in dealloc);
-    // the new drain inherits that pre-existing limitation but does not
-    // worsen it.
+    // `sys_thread_set_priority` observes the same all-CPU-locks discipline
+    // for Scheduling-group writes (`core/kernel/src/syscall/thread.rs`), so
+    // the priority read here is serialised against every other writer.
     // SAFETY: tcb validated by caller; state/priority fields always valid.
     let priority = unsafe {
         (*tcb).state = new_state;
@@ -1333,12 +1331,13 @@ pub unsafe fn migrate_ready_thread(
     if !removed
     {
         // Defensive heal — not a race. Under both scheduler locks no
-        // concurrent removal is possible (dealloc takes all CPU locks in
-        // ascending order; change_priority takes only the per-CPU lock).
-        // A false return here indicates an internal bookkeeping
-        // inconsistency (state == Ready and preferred_cpu == src_cpu but
-        // the TCB is not linked at its priority on src). Bail without
-        // touching dst rather than panicking.
+        // concurrent removal is possible (dealloc and
+        // sys_thread_set_priority both take every CPU's scheduler lock in
+        // ascending order; set_state_under_all_locks likewise). A false
+        // return here indicates an internal bookkeeping inconsistency
+        // (state == Ready and preferred_cpu == src_cpu but the TCB is not
+        // linked at its priority on src). Bail without touching dst rather
+        // than panicking.
         debug_assert!(
             removed,
             "migrate_ready_thread: Ready + preferred_cpu match but no queue entry"
@@ -1593,19 +1592,23 @@ unsafe fn pull_unpinned_ready(_src_cpu: usize, _dst_cpu: usize) {}
 /// This is the preferred way to enqueue a thread from cross-CPU contexts (IPC,
 /// IRQ handlers, etc.) as it handles both enqueuing and wakeup atomically.
 ///
+/// The enqueue priority is read from `(*tcb).priority` under the target
+/// scheduler's lock so a concurrent `sys_thread_set_priority` (which takes
+/// every CPU's scheduler.lock in ascending order) is serialised against the
+/// enqueue — the TCB is always linked at whichever priority value is observed
+/// last under lock.
+///
 /// # Safety
 /// - `tcb` must be a valid [`ThreadControlBlock`] pointer
 /// - `target_cpu` must be < [`MAX_CPUS`] and initialized by `sched::init`
 #[cfg(not(test))]
-pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize, priority: u8)
+pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
 {
     if target_cpu >= MAX_CPUS
     {
         // SAFETY: tcb may or may not be valid; thread_id is at a known offset.
         let tid = unsafe { (*tcb).thread_id };
-        crate::kprintln!(
-            "enqueue_and_wake: target_cpu={target_cpu} >= MAX_CPUS, tid={tid}, prio={priority}"
-        );
+        crate::kprintln!("enqueue_and_wake: target_cpu={target_cpu} >= MAX_CPUS, tid={tid}");
     }
 
     // No pre-lock FPU flush: a thread being woken from Blocked/Stopped/
@@ -1639,12 +1642,15 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize, 
         return;
     }
 
-    // SAFETY: tcb valid; lock held.
-    unsafe {
+    // SAFETY: tcb valid; lock held. Read priority under the lock so the
+    // enqueue links at whatever value sys_thread_set_priority's all-CPU-locks
+    // region last published.
+    let priority = unsafe {
         (*tcb).state = thread::ThreadState::Ready;
         (*tcb).ipc_state = thread::IpcThreadState::None;
         (*tcb).blocked_on_object = core::ptr::null_mut();
-    }
+        (*tcb).priority
+    };
 
     // Enqueue the thread while holding the lock.
     // SAFETY: lock is held; tcb is valid.
@@ -1671,7 +1677,7 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize, 
 /// Test stub for `enqueue_and_wake` (no-op in test mode).
 #[cfg(test)]
 #[allow(unused_variables)]
-pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize, _priority: u8) {}
+pub unsafe fn enqueue_and_wake(_tcb: *mut ThreadControlBlock, _target_cpu: usize) {}
 
 /// Select target CPU for enqueueing a thread based on affinity, soft
 /// affinity (cache warmth), and load.
@@ -1941,7 +1947,7 @@ pub unsafe fn schedule(requeue_current: bool)
                     // (`percpu::preemption_disabled()` in `timer_tick`).
                     crate::percpu::preempt_disable();
                     sched.lock.unlock_raw(saved_flags);
-                    enqueue_and_wake(current, aff as usize, prio);
+                    enqueue_and_wake(current, aff as usize);
                     saved_flags = sched.lock.lock_raw();
                     crate::percpu::preempt_enable();
                 }
@@ -2324,11 +2330,9 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
         let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
         if let Ok(Some(woken_tcb)) = result
         {
-            // SAFETY: woken_tcb is a valid TCB returned by event_queue_post.
-            let priority = unsafe { (*woken_tcb).priority };
             // SAFETY: cpu is valid; woken_tcb is valid and Ready.
             unsafe {
-                enqueue_and_wake(woken_tcb, cpu, priority);
+                enqueue_and_wake(woken_tcb, cpu);
             }
         }
     }

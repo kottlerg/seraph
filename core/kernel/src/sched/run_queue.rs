@@ -11,8 +11,8 @@
 //!
 //! Locking. The `lock` field is a real `Spinlock<()>` that disables
 //! interrupts while held, preventing timer-driven deadlock. Acquire before
-//! any `enqueue`, `dequeue_highest`, `remove_from_queue`, `change_priority`,
-//! `find_runnable`, or `set_current` call.
+//! any `enqueue`, `dequeue_highest`, `remove_from_queue`, `find_runnable`,
+//! or `set_current` call.
 //!
 //! Cross-CPU migration goes through `sched::migrate_ready_thread` (used by
 //! `sys_thread_set_affinity` and the periodic load balancer); see
@@ -152,7 +152,8 @@ impl RunQueue
 
     /// Remove a specific TCB from the queue. Returns `true` if found.
     ///
-    /// O(n) in queue length. Used by `change_priority` to relocate a thread.
+    /// O(n) in queue length. Used by `remove_from_queue` to drain or relocate
+    /// a queued thread.
     fn remove(&mut self, tcb: *mut ThreadControlBlock) -> bool
     {
         let mut prev: Option<*mut ThreadControlBlock> = None;
@@ -368,12 +369,16 @@ impl PerCpuScheduler
 
     /// Remove `tcb` from its priority queue. No-op if not found.
     ///
-    /// Used by `dealloc_object(Thread)`, `change_priority`, and
-    /// `migrate_ready_thread` to relocate or destroy a queued thread.
+    /// Used by `dealloc_object(Thread)`, `sys_thread_set_priority`, and
+    /// `migrate_ready_thread` to relocate or destroy a queued thread. The
+    /// boolean return identifies the home scheduler when called inside an
+    /// all-CPU-locks walk (e.g. `sys_thread_set_priority` re-enqueues at the
+    /// new priority on the same scheduler that reported `true`).
     ///
     /// Decrements `CPU_LOAD[cpu_id]` iff the remove succeeded — the load
-    /// counter MUST match the actual queue contents. `change_priority` pairs
-    /// this with a follow-up `enqueue` so its net effect is zero.
+    /// counter MUST match the actual queue contents. Callers that pair this
+    /// with a follow-up `enqueue` on the same scheduler net-zero the load
+    /// counter.
     ///
     /// Caller must hold `self.lock`.
     pub fn remove_from_queue(&mut self, tcb: *mut ThreadControlBlock, priority: u8) -> bool
@@ -417,36 +422,6 @@ impl PerCpuScheduler
             ne &= !(1 << priority);
         }
         None
-    }
-
-    /// Move a `Ready` TCB from `old_prio` queue to `new_prio` queue.
-    ///
-    /// Used by `SYS_THREAD_SET_PRIORITY` to immediately reflect a priority
-    /// change for a thread already in the run queue.
-    ///
-    /// If the TCB is not found in `old_prio` (possible if it was removed
-    /// between the state check and this call), it is enqueued at `new_prio`.
-    pub fn change_priority(&mut self, tcb: *mut ThreadControlBlock, old_prio: u8, new_prio: u8)
-    {
-        if old_prio == new_prio
-        {
-            return;
-        }
-
-        let old = old_prio as usize;
-        let new = new_prio as usize;
-        debug_assert!(old < NUM_PRIORITY_LEVELS && new < NUM_PRIORITY_LEVELS);
-
-        // Remove from old queue (best-effort; TCB may have been dequeued already).
-        if self.queues[old].remove(tcb) && self.queues[old].is_empty()
-        {
-            self.non_empty.fetch_and(!(1 << old), Ordering::Release);
-        }
-
-        // Enqueue at new priority. Release pairs with the idle loop's
-        // Acquire in `has_runnable`.
-        self.queues[new].enqueue(tcb);
-        self.non_empty.fetch_or(1 << new, Ordering::Release);
     }
 
     /// Increment the load counter when a thread becomes runnable.
@@ -678,37 +653,6 @@ mod tests
     }
 
     #[test]
-    fn change_priority_moves_thread()
-    {
-        let mut sched = PerCpuScheduler::new();
-        let mut a = make_tcb();
-        let pa = &mut *a as *mut _;
-
-        sched.enqueue(pa, 2);
-        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 2), 0);
-        sched.change_priority(pa, 2, 8);
-        // Old priority queue must be empty; new priority queue must be set.
-        assert_eq!(sched.non_empty.load(Ordering::Relaxed) & (1 << 2), 0);
-        assert_ne!(sched.non_empty.load(Ordering::Relaxed) & (1 << 8), 0);
-        sched.set_idle(pa);
-        assert_eq!(sched.dequeue_highest(), pa);
-    }
-
-    #[test]
-    fn change_priority_same_is_noop()
-    {
-        let mut sched = PerCpuScheduler::new();
-        let mut a = make_tcb();
-        let pa = &mut *a as *mut _;
-
-        sched.enqueue(pa, 4);
-        let before = sched.non_empty.load(Ordering::Relaxed);
-        sched.change_priority(pa, 4, 4);
-        // No state change when old == new.
-        assert_eq!(sched.non_empty.load(Ordering::Relaxed), before);
-    }
-
-    #[test]
     fn five_threads_same_priority_fifo_order()
     {
         // Enqueue 5 TCBs at the same priority and verify FIFO dequeue order.
@@ -758,35 +702,5 @@ mod tests
         // Then P=5 threads in original enqueue order.
         assert_eq!(sched.dequeue_highest(), pa);
         assert_eq!(sched.dequeue_highest(), pc);
-    }
-
-    #[test]
-    fn change_priority_while_multiple_queued()
-    {
-        // Three TCBs at P=3; raise the middle one to P=7.
-        // It must dequeue first (higher priority); A and C follow in original order.
-        let mut sched = PerCpuScheduler::new();
-        let mut a = make_tcb();
-        let mut b = make_tcb();
-        let mut c = make_tcb();
-        let pa = &mut *a as *mut _;
-        let pb = &mut *b as *mut _;
-        let pc = &mut *c as *mut _;
-
-        sched.enqueue(pa, 3);
-        sched.enqueue(pb, 3);
-        sched.enqueue(pc, 3);
-        sched.set_idle(pa);
-
-        // Raise middle thread.
-        sched.change_priority(pb, 3, 7);
-
-        assert_eq!(
-            sched.dequeue_highest(),
-            pb,
-            "raised thread must dequeue first"
-        );
-        assert_eq!(sched.dequeue_highest(), pa, "then A in original order");
-        assert_eq!(sched.dequeue_highest(), pc, "then C in original order");
     }
 }

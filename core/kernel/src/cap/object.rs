@@ -1249,7 +1249,6 @@ unsafe fn dealloc_object_one(
                 // client for wake outside the all-locks region.
                 let server_reply_wake: Option<(
                     *mut crate::sched::thread::ThreadControlBlock,
-                    u8,
                     usize,
                 )>;
                 // needless_range_loop: explicit indexing is clearer for scheduler_for(cpu)
@@ -1272,8 +1271,10 @@ unsafe fn dealloc_object_one(
                         saved_flags[cpu] = crate::sched::scheduler_for(cpu).lock.lock_raw();
                     }
 
-                    // Read priority inside the all-locks region; a concurrent
-                    // sys_thread_set_priority would race outside.
+                    // Read priority inside the all-locks region.
+                    // `sys_thread_set_priority`, `set_state_under_all_locks`,
+                    // and this dealloc all observe the same all-CPU-locks
+                    // discipline for the Scheduling field group.
                     let prio = (*tcb).priority;
 
                     // Mark Exited under all locks — no schedule() on any CPU
@@ -1316,9 +1317,8 @@ unsafe fn dealloc_object_one(
                             {
                                 (*trap_frame).set_return(syscall::SyscallError::Interrupted as i64);
                             }
-                            let bp = (*bound).priority;
                             let bcpu = crate::sched::select_target_cpu(bound);
-                            Some((bound, bp, bcpu))
+                            Some((bound, bcpu))
                         }
                         else
                         {
@@ -1405,10 +1405,10 @@ unsafe fn dealloc_object_one(
 
                 // Wake the captured reply-bound client outside the all-locks
                 // region (enqueue_and_wake takes a scheduler.lock).
-                if let Some((bound, bp, bcpu)) = server_reply_wake
+                if let Some((bound, bcpu)) = server_reply_wake
                 {
                     // SAFETY: bound prepared under all-CPU locks above.
-                    unsafe { crate::sched::enqueue_and_wake(bound, bcpu, bp) };
+                    unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
                 }
 
                 // Unlink this thread from any IPC object it's blocked on.
@@ -1808,9 +1808,8 @@ unsafe fn dealloc_object_one(
                     {
                         let next = (*tcb).ipc_wait_next;
                         (*tcb).ipc_wait_next = None;
-                        let prio = (*tcb).priority;
                         let target_cpu = crate::sched::select_target_cpu(tcb);
-                        crate::sched::enqueue_and_wake(tcb, target_cpu, prio);
+                        crate::sched::enqueue_and_wake(tcb, target_cpu);
                         tcb = next.unwrap_or(core::ptr::null_mut());
                     }
                     ep.send_head = core::ptr::null_mut();
@@ -1821,9 +1820,8 @@ unsafe fn dealloc_object_one(
                     {
                         let next = (*tcb).ipc_wait_next;
                         (*tcb).ipc_wait_next = None;
-                        let prio = (*tcb).priority;
                         let target_cpu = crate::sched::select_target_cpu(tcb);
-                        crate::sched::enqueue_and_wake(tcb, target_cpu, prio);
+                        crate::sched::enqueue_and_wake(tcb, target_cpu);
                         tcb = next.unwrap_or(core::ptr::null_mut());
                     }
                     ep.recv_head = core::ptr::null_mut();
@@ -1933,9 +1931,8 @@ unsafe fn dealloc_object_one(
                         // wakeup_value=0 = drop semantics; state transitions
                         // committed by enqueue_and_wake.
                         (*waiter).wakeup_value = 0;
-                        let prio = (*waiter).priority;
                         let target_cpu = crate::sched::select_target_cpu(waiter);
-                        crate::sched::enqueue_and_wake(waiter, target_cpu, prio);
+                        crate::sched::enqueue_and_wake(waiter, target_cpu);
                     }
                 }
             }

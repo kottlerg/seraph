@@ -347,7 +347,7 @@ pub fn read_stack_pointer() -> u64
 
 /// Rebase the boot stack from identity-mapped to the direct physical map.
 ///
-/// Adds `direct_map_base` to RSP and RBP, switching from VA == PA to
+/// Adds `direct_map_base` to RSP, switching from VA == PA to
 /// VA == `direct_map_base` + PA. Both mappings cover the same physical
 /// frames; this eliminates the 64 KiB identity-map limit.
 ///
@@ -355,19 +355,33 @@ pub fn read_stack_pointer() -> u64
 /// Must be called exactly once, immediately after `activate`, while the
 /// boot stack identity mapping is still valid. `direct_map_base` must be
 /// the base of a direct physical map that covers all of physical RAM.
+///
+/// # Codegen invariant — `#[inline(never)]` plus no `options(nostack)`
+/// Rust inline asm cannot list RSP as an output (it's a reserved
+/// register), so LLVM has no formal channel to learn that the
+/// `add rsp, {base}` body modifies RSP. If LLVM inlines this function
+/// into the caller (`kernel_entry`), it freely hoists any RSP-relative
+/// local-address materialisation (`lea reg, [rsp + imm]`) to *before*
+/// the rebase, producing a stale low-VA pointer the kernel page tables
+/// do not cover. The next dereference page-faults. The exact same
+/// hazard was hit on RISC-V in PR #138 (Phase 6 ktest fault); this
+/// arch had the same lying-options shape and is fixed pre-emptively.
+///
+/// `#[inline(never)]` is the fix: an opaque function call is an
+/// optimisation barrier the scheduler cannot move ops across, so every
+/// RSP-derived expression in the caller materialises on the correct
+/// side of the rebase. Dropping `options(nostack)` is belt-and-braces.
 #[cfg(not(test))]
+#[inline(never)]
 pub unsafe fn rebase_boot_stack(direct_map_base: u64)
 {
     // SAFETY: adding the direct-map offset to RSP switches to the same
     // physical memory through the direct map virtual range. Both the
     // identity mapping (old) and direct map (new) are valid at this point.
-    // RBP is NOT rebased: in release mode it is a general-purpose register,
-    // not a frame pointer, and adding to it would corrupt live data.
     unsafe {
         core::arch::asm!(
             "add rsp, {base}",
             base = in(reg) direct_map_base,
-            options(nostack),
         );
     }
 }

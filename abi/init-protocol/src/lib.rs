@@ -29,21 +29,45 @@
 
 /// Init protocol version. Incremented on any breaking layout or semantic change.
 ///
+/// v3: Added `cmdline_offset`, `cmdline_len`, and `sbi_control_cap` for kernel
+///     command line passthrough and RISC-V SBI forwarding.
+/// v4: Added `cspace_cap` slot for init's own `CSpace` cap.
 /// v5: Range-cap semantics on `CapType::Interrupt` (`aux0 = start`,
 ///     `aux1 = count`). Dropped `CapType::PciEcam`. Added named
 ///     `InitInfo` slots for the root IRQ range cap and firmware-table
 ///     Frame caps (RSDP, ACPI reclaimable regions, DTB).
-/// v4: Added `cspace_cap` slot for init's own `CSpace` cap.
-/// v3: Added `cmdline_offset`, `cmdline_len`, and `sbi_control_cap` for kernel
-///     command line passthrough and RISC-V SBI forwarding.
-pub const INIT_PROTOCOL_VERSION: u32 = 6;
+/// v6: Added `init_stack_frame_*` / `init_info_frame_*` slot ranges for
+///     init self-reclaim.
+/// v7: Added a fixed-size [`InitInfo::module_names`] table so init can
+///     map bundle-entry names (carried by the bootloader through
+///     `BootModule.name`) to the kernel's `CSpace` slot index of each
+///     module's `Frame` cap. The table lives in the `InitInfo` header so
+///     it sits on the first `InitInfo` page; the [`CapDescriptor`] array
+///     layout is unchanged. Removed `module_frame_base` /
+///     `module_frame_count` (init now resolves modules by name via
+///     `module_names`, not ordinal arithmetic), `cmdline_offset` /
+///     `cmdline_len` (boot v8 removed the kernel command line surface
+///     entirely), and the corresponding `cmdline_bytes` helper.
+pub const INIT_PROTOCOL_VERSION: u32 = 7;
+
+/// Length of [`InitModuleName::name`], matching
+/// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
+/// entry name straight through.
+pub const INIT_MODULE_NAME_LEN: usize = 32;
+
+/// Maximum number of named boot-module entries the kernel can publish in
+/// [`InitInfo::module_names`]. Sized to comfortably cover the current
+/// `procmgr, devmgr, memmgr, vfsd, virtio-blk, fatfs` set plus future
+/// modules before the table fills.
+pub const INIT_MAX_NAMED_MODULES: usize = 8;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
 /// Virtual address where the kernel maps the read-only [`InitInfo`] region.
 ///
-/// The region spans one or more contiguous pages (as many as needed for the
-/// header, [`CapDescriptor`] array, and command line). Placed below the stack.
+/// The region spans one or more contiguous pages — enough for the header
+/// (which now includes the boot-module name table) followed by the
+/// variable-length [`CapDescriptor`] array. Placed below the stack.
 pub const INIT_INFO_VADDR: u64 = 0x7FFF_FFFF_8000;
 
 /// Virtual address of the top of init's user stack.
@@ -56,7 +80,8 @@ pub const INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
 pub const INIT_STACK_PAGES: usize = 4;
 
 /// Maximum number of 4 KiB pages the kernel may allocate for the
-/// [`InitInfo`] region (header + [`CapDescriptor`] array + command line).
+/// [`InitInfo`] region (header — which now includes the boot-module
+/// name table — followed by the [`CapDescriptor`] array).
 ///
 /// The kernel enforces this ceiling when assembling the region; init uses it
 /// to bound descriptor-slice reads. Both sides must agree: changing this
@@ -101,15 +126,6 @@ pub struct InitInfo
     /// Number of segment `Frame` capabilities.
     pub segment_frame_count: u32,
 
-    /// First slot index of boot module `Frame` capabilities.
-    ///
-    /// Boot modules are ELF images for early services (procmgr, devmgr, etc.)
-    /// loaded by the bootloader. Currently not populated (count = 0) until the
-    /// boot protocol is extended with module metadata.
-    pub module_frame_base: u32,
-    /// Number of boot module `Frame` capabilities.
-    pub module_frame_count: u32,
-
     /// First slot index of hardware resource capabilities (MMIO, IRQ, I/O port).
     pub hw_cap_base: u32,
     /// Number of hardware resource capabilities.
@@ -127,16 +143,6 @@ pub struct InitInfo
     /// Allows init to bind I/O port ranges to itself (`ioport_bind`), set its
     /// own priority and affinity, and delegate thread authority to child services.
     pub thread_cap: u32,
-
-    // ── Command line (added in protocol version 3) ──────────────────────
-    /// Byte offset from the start of this struct to the kernel command line.
-    ///
-    /// The command line is placed after the [`CapDescriptor`] array within the
-    /// same 4 KiB page. Zero if no command line is present.
-    pub cmdline_offset: u32,
-
-    /// Length of the command line in bytes (no null terminator). Zero if absent.
-    pub cmdline_len: u32,
 
     // ── RISC-V SBI forwarding (added in protocol version 3) ─────────────
     /// Slot index of the `SbiControl` capability (RISC-V only).
@@ -195,8 +201,9 @@ pub struct InitInfo
     /// First slot index of init's `InitInfo`-region `Frame` caps.
     ///
     /// Each cap covers one 4 KiB page of the kernel-allocated
-    /// `InitInfo` region (header + `CapDescriptor` array + command
-    /// line). Donated alongside the stack caps in init's reap-handoff.
+    /// `InitInfo` region (header — which includes the boot-module name
+    /// table — followed by the `CapDescriptor` array). Donated
+    /// alongside the stack caps in init's reap-handoff.
     /// The cap range includes the page that contains this `InitInfo`
     /// struct itself — once init has read `InitInfo` at `_start`, the
     /// pages can be reclaimed safely. Zero if the kernel did not mint
@@ -205,13 +212,39 @@ pub struct InitInfo
     /// Number of `InitInfo` `Frame` caps (1..=[`INIT_INFO_MAX_PAGES`]).
     pub init_info_frame_count: u32,
 
-    /// Explicit 4-byte tail pad so `size_of::<InitInfo>()` stays 8-byte
-    /// aligned. Consumers of `cap_descriptors_offset` rely on this: the
-    /// `CapDescriptor` array that immediately follows contains u64
-    /// fields and must start on an 8-byte boundary.
-    #[doc(hidden)]
-    pub _pad_tail: u32,
+    // ── Boot-module name table (added in protocol version 7) ────────────
+    /// Number of valid [`InitModuleName`] entries in [`module_names`].
+    /// Indices `0..module_name_count` are populated; the rest are
+    /// [`INIT_MODULE_NAME_EMPTY`].
+    pub module_name_count: u32,
+
+    /// Bundle-entry-name → `CSpace`-slot mapping for boot-module Frame
+    /// caps. Lives inside the `InitInfo` header so it sits entirely on
+    /// the first `InitInfo` page (the [`CapDescriptor`] array that
+    /// follows the header may span pages).
+    ///
+    /// Last field by intent: `cap_descriptors_offset =
+    /// size_of::<InitInfo>()` puts the `CapDescriptor` array
+    /// immediately after this table, and the current field count
+    /// keeps the total a multiple of 8 (the `u64` alignment the
+    /// descriptor array needs) without an explicit tail pad. The
+    /// compile-time assert below pins both invariants.
+    pub module_names: [InitModuleName; INIT_MAX_NAMED_MODULES],
 }
+
+// Compile-time invariants for the `InitInfo` layout. The kernel writes
+// the `CapDescriptor` array at byte offset `cap_descriptors_offset =
+// size_of::<InitInfo>()` and the entries contain `u64` fields, so the
+// total size must be 8-byte aligned. The whole region must also fit
+// within `INIT_INFO_MAX_PAGES`.
+const _: () = assert!(
+    core::mem::size_of::<InitInfo>().is_multiple_of(8),
+    "InitInfo size must be 8-byte aligned so cap_descriptors_offset is 8-byte aligned",
+);
+const _: () = assert!(
+    core::mem::size_of::<InitInfo>() <= INIT_INFO_MAX_PAGES * 4096,
+    "InitInfo header must fit within INIT_INFO_MAX_PAGES",
+);
 
 // ── CapDescriptor / CapType ──────────────────────────────────────────────────
 
@@ -252,6 +285,35 @@ pub struct CapDescriptor
     pub aux1: u64,
 }
 
+/// Named boot-module entry published in [`InitInfo::module_names`].
+///
+/// Maps a bundle-entry name (carried through
+/// [`boot_protocol::BootModule::name`]) to the `CSpace` slot index of
+/// the module's `Frame` capability. The table sits in the `InitInfo`
+/// header so it always lives on the first `InitInfo` page and does not
+/// interact with the variable-length [`CapDescriptor`] array, which
+/// may span pages once `INIT_MAX_NAMED_MODULES` modules are minted.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InitModuleName
+{
+    /// `CSpace` slot index of the module's `Frame` cap.
+    pub slot: u32,
+    /// Explicit padding so `name` starts 8-byte aligned within the
+    /// surrounding `[InitModuleName; N]` array.
+    #[doc(hidden)]
+    pub _pad: u32,
+    /// Bundle entry name, NUL-padded to [`INIT_MODULE_NAME_LEN`] bytes.
+    pub name: [u8; INIT_MODULE_NAME_LEN],
+}
+
+/// Empty / NUL-padded slot for an unused [`InitModuleName`] entry.
+pub const INIT_MODULE_NAME_EMPTY: InitModuleName = InitModuleName {
+    slot: 0,
+    _pad: 0,
+    name: [0u8; INIT_MODULE_NAME_LEN],
+};
+
 /// Capability type discriminant for [`CapDescriptor`].
 ///
 /// Discriminant values match the kernel's `CapTag` enum for the types that
@@ -278,26 +340,29 @@ pub enum CapType
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Return the kernel command line as a byte slice from the [`InitInfo`] page.
-///
-/// # Safety
-/// `info` must point into the read-only [`InitInfo`] page mapped by the kernel
-/// at [`INIT_INFO_VADDR`]. The page must contain at least
-/// `info.cmdline_offset + info.cmdline_len` valid bytes.
+/// Trim a NUL-padded module-name buffer to its non-NUL prefix.
 #[must_use]
-pub unsafe fn cmdline_bytes(info: &InitInfo) -> &[u8]
+pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
 {
-    if info.cmdline_len == 0 || info.cmdline_offset == 0
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    &name[..end]
+}
+
+/// Locate a boot-module `Frame` cap by its bundle-entry name.
+///
+/// Returns the `CSpace` slot index from the first matching
+/// [`InitModuleName`] in [`InitInfo::module_names`], or `None` if no
+/// entry carries the requested name.
+#[must_use]
+pub fn find_module_slot(info: &InitInfo, name: &[u8]) -> Option<u32>
+{
+    let count = (info.module_name_count as usize).min(INIT_MAX_NAMED_MODULES);
+    for entry in &info.module_names[..count]
     {
-        return &[];
+        if module_name_str(&entry.name) == name
+        {
+            return Some(entry.slot);
+        }
     }
-    let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
-    // SAFETY: caller guarantees the InitInfo page contains valid cmdline data
-    // at the specified offset and length, populated by the kernel in Phase 9.
-    unsafe {
-        core::slice::from_raw_parts(
-            base.add(info.cmdline_offset as usize),
-            info.cmdline_len as usize,
-        )
-    }
+    None
 }

@@ -93,6 +93,12 @@ pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
     // SAFETY: CPUID is always available on x86-64; leaf 1 is required.
     // rbx is callee-saved and used by LLVM as the base register in some
     // codegen modes. We must save/restore it manually when using CPUID.
+    // `nostack` is intentionally absent: the body push/pop pair has net
+    // zero RSP delta but transiently writes [RSP-8]. Latent today because
+    // the bootloader target is `x86_64-unknown-uefi` (MS x64 ABI, no red
+    // zone) so no caller data lives there. Match the kernel-side
+    // `cpu::cpuid` discipline which already omits `nostack` for this
+    // reason.
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -103,7 +109,7 @@ pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
             ebx = out(reg) ebx,
             out("ecx") _,
             out("edx") _,
-            options(nostack, nomem),
+            options(nomem),
         );
     }
     // APIC ID is in EBX[31:24].
@@ -138,7 +144,8 @@ pub fn max_phys_addr_bits() -> u8
     let max_ext: u32;
     // SAFETY: CPUID leaf 0x80000000 is universally available on x86-64;
     // rbx is callee-saved and reserved by LLVM in some codegen modes, so
-    // we save/restore it manually.
+    // we save/restore it manually. See `bsp_hardware_id` above for why
+    // `nostack` is intentionally absent.
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -147,7 +154,7 @@ pub fn max_phys_addr_bits() -> u8
             inout("eax") 0x8000_0000u32 => max_ext,
             out("ecx") _,
             out("edx") _,
-            options(nostack, nomem),
+            options(nomem),
         );
     }
     if max_ext < 0x8000_0008
@@ -156,6 +163,7 @@ pub fn max_phys_addr_bits() -> u8
     }
     let eax: u32;
     // SAFETY: leaf 0x80000008 is advertised by the preceding check.
+    // See `bsp_hardware_id` above for why `nostack` is intentionally absent.
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -164,7 +172,7 @@ pub fn max_phys_addr_bits() -> u8
             inout("eax") 0x8000_0008u32 => eax,
             out("ecx") _,
             out("edx") _,
-            options(nostack, nomem),
+            options(nomem),
         );
     }
     let bits = (eax & 0xff) as u8;

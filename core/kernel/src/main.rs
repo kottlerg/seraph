@@ -32,7 +32,7 @@
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 #[cfg(not(test))]
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // ── AP ready counter ──────────────────────────────────────────────────────────
 
@@ -43,22 +43,6 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 /// to come online before entering the scheduler.
 #[cfg(not(test))]
 static APS_READY: AtomicU32 = AtomicU32::new(0);
-
-// ── Kernel-resident cmdline snapshot ──────────────────────────────────────────
-
-/// Maximum cmdline bytes the kernel retains. Matches the bootloader cap
-/// (`MAX_CMDLINE_LEN`); see `core/boot/src/main.rs` cmdline allocation. The
-/// snapshot lives in BSS so the bootloader's cmdline page becomes reclaim-safe
-/// at Phase 7 (the only later reader is the Phase-9 `InitInfo` copy, which
-/// sources from this buffer rather than the bootloader page).
-#[cfg(not(test))]
-const KERNEL_CMDLINE_MAX: usize = 512;
-
-#[cfg(not(test))]
-static mut KERNEL_CMDLINE: [u8; KERNEL_CMDLINE_MAX] = [0; KERNEL_CMDLINE_MAX];
-
-#[cfg(not(test))]
-static KERNEL_CMDLINE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 use boot_protocol::BootInfo;
 
@@ -119,8 +103,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     let boot_cpu_ids = info.cpu_ids;
     let trampoline_pa = info.ap_trampoline_page;
     let init_image = info.init_image; // InitImage is Copy
-    let cmdline_phys = info.command_line as u64;
-    let cmdline_len = info.command_line_len as usize;
 
     // ── Phase 1: early console ──────────────────────────────────────────────
     // SAFETY: called exactly once, from the single kernel boot thread, after
@@ -173,6 +155,18 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // direct physical map (VA == DIRECT_MAP_BASE + PA). The identity mapping
     // covers only 64 KiB around SP and can be exhausted by later phases;
     // the direct map covers all physical RAM with no size limit.
+    //
+    // Call into the bulk of `kernel_entry` through an `#[inline(never)]`
+    // boundary so LLVM cannot hoist sp-derived local-address
+    // materialisations from phases 4-9 to before the rebase. Rust
+    // inline asm cannot list sp as an output, so a per-call rebase would
+    // continue to mislead LLVM about sp's value across the call (the
+    // standard ABI promises sp is callee-saved; the rebase asm silently
+    // violates that, but only the optimisation barrier of an opaque
+    // function call boundary blocks the hoist that hosed PR #138's
+    // riscv64 release ktest cell in CI — sepc=0xffffffff8000d972,
+    // stval=0x9ddc0f58 from a stale `add s7, sp, 0x19E0`).
+    //
     // SAFETY: new page tables active with direct map covering all RAM.
     // Adding DIRECT_MAP_BASE to RSP/RBP switches to the same physical
     // frames through the direct map virtual range.
@@ -180,6 +174,57 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         arch::current::paging::rebase_boot_stack(mm::paging::DIRECT_MAP_BASE);
     }
 
+    #[cfg(not(test))]
+    // SAFETY: post-rebase phases consume validated boot state copied above.
+    unsafe {
+        kernel_entry_post_rebase(
+            boot_info as u64,
+            boot_cpu_count,
+            boot_cpu_ids,
+            trampoline_pa,
+            init_image,
+            fb_phys,
+            allocator,
+        )
+    }
+
+    // Test-mode divergence: kernel_entry is never called in host tests, but
+    // the function must type-check as returning `!`.
+    #[cfg(test)]
+    arch::current::cpu::halt_loop()
+}
+
+/// Continuation of [`kernel_entry`] after the boot-stack rebase.
+///
+/// `#[inline(never)]` is load-bearing: see the comment in `kernel_entry`
+/// at the rebase site. The body runs phase-3 console rebasing through
+/// phase-9 `init` launch and the scheduler hand-off.
+#[cfg(not(test))]
+#[inline(never)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::needless_range_loop,
+    clippy::similar_names,
+    // boot_cpu_ids ([u32; 512] = 2 KiB) and init_image (272 B) cross
+    // the by-value/by-reference threshold. The `#[inline(never)]`
+    // boundary is what defeats the cross-rebase hoist; the by-value
+    // signature is incidental — the ABI passes both via hidden-pointer
+    // and emits an explicit memcpy into the callee's stack frame either
+    // way. Single boot-path copy; nothing on the hot path.
+    clippy::large_types_passed_by_value
+)]
+unsafe fn kernel_entry_post_rebase(
+    boot_info_phys: u64,
+    boot_cpu_count: u32,
+    boot_cpu_ids: [u32; boot_protocol::MAX_CPUS],
+    trampoline_pa: u64,
+    init_image: boot_protocol::InitImage,
+    fb_phys: u64,
+    allocator: &'static mut mm::buddy::BuddyAllocator,
+) -> !
+{
     // Rebase MMIO-based console devices to the direct physical map.
     // On RISC-V the UART is MMIO and must be accessed via the direct map after
     // the page table switch; on x86-64 the UART is I/O-mapped (no-op).
@@ -216,30 +261,11 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // waste.
     kprintln!("Phase 4: Typed-Memory Cap Surface (no kernel heap)");
 
-    // Snapshot the cmdline from the bootloader-owned page into kernel BSS so
-    // the page itself is reclaim-safe by Phase 7. The Phase-9 InitInfo copy
-    // sources from `KERNEL_CMDLINE` rather than the bootloader page.
-    #[cfg(not(test))]
-    {
-        let n = cmdline_len.min(KERNEL_CMDLINE_MAX);
-        if n > 0 && cmdline_phys != 0
-        {
-            // SAFETY: direct map active since Phase 3; single-threaded boot;
-            // `KERNEL_CMDLINE` is exclusively written here before any reader.
-            unsafe {
-                let src = mm::paging::phys_to_virt(cmdline_phys) as *const u8;
-                let dst = core::ptr::addr_of_mut!(KERNEL_CMDLINE).cast::<u8>();
-                core::ptr::copy_nonoverlapping(src, dst, n);
-            }
-            KERNEL_CMDLINE_LEN.store(n, Ordering::Release);
-        }
-    }
-
     // Cache `BootInfo.kernel_mmio` so Phase 5 arch hardware init can read
     // bootloader-discovered MMIO bases instead of compile-time defaults. This
     // is heap-free and depends only on the direct physical map (Phase 3).
     // SAFETY: single-threaded boot; called exactly once, after Phase 3.
-    unsafe { platform::capture_kernel_mmio(boot_info as u64) };
+    unsafe { platform::capture_kernel_mmio(boot_info_phys) };
 
     // Allocate per-CPU storage slabs (SCHEDULERS, IDLE_TCBS, AP TSS/GDT/IST
     // on x86) sized to boot_cpu_count. Must precede Phase 5: timer::init
@@ -297,7 +323,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // init can read it.)
     kprintln!("Phase 6: Platform Resource Validation");
     // SAFETY: single-threaded boot Phase 6; first and only call.
-    let mmio_apertures = unsafe { platform::validate_mmio_apertures(boot_info as u64) };
+    let mmio_apertures = unsafe { platform::validate_mmio_apertures(boot_info_phys) };
 
     // ── Phase 7: capability system ─────────────────────────────────────────────
     // Initialises the root CSpace and mints initial capabilities for all
@@ -305,7 +331,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // the post-SMP late-reclaim pass (after Phase 8) can append the AP
     // trampoline cap to its descriptor table before Phase 9 consumes it.
     kprintln!("Phase 7: Capability System");
-    let mut cspace_layout = cap::init_capability_system(mmio_apertures, boot_info as u64);
+    let mut cspace_layout = cap::init_capability_system(mmio_apertures, boot_info_phys);
     kprintln!(
         "capability system initialised, {} slots populated",
         cspace_layout.total_populated
@@ -413,10 +439,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         // original `info` reference points to the bootloader's
         // identity-mapped VA, which Phase 3 unmapped; reading through it
         // here would page-fault. (Phase 7's `cap::init_capability_system`
-        // does the same translation when called with `boot_info as u64`.)
+        // does the same translation when called with `boot_info_phys`.)
         // SAFETY: direct map covers all RAM since Phase 3; boot_info
         // physical address validated in Phase 0.
-        let info_dm = unsafe { &*(mm::paging::phys_to_virt(boot_info as u64) as *const BootInfo) };
+        let info_dm = unsafe { &*(mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo) };
         // SAFETY: ROOT_CSPACE installed in Phase 7; trampoline page no
         // longer mapped at its PA; single-threaded boot.
         unsafe {
@@ -584,9 +610,7 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
             let desc_count = desc_slice.len();
             let desc_byte_len = core::mem::size_of_val(desc_slice);
-            let cmdline_start = descriptors_offset as usize + desc_byte_len;
-            let cmdline_snapshot_len = KERNEL_CMDLINE_LEN.load(Ordering::Acquire);
-            let total_bytes = cmdline_start + cmdline_snapshot_len;
+            let total_bytes = descriptors_offset as usize + desc_byte_len;
             let info_pages = total_bytes.div_ceil(mm::PAGE_SIZE).max(1);
 
             // Allocate and map each page.
@@ -607,12 +631,35 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 unsafe { page_ptrs[page_idx].add(page_off) }
             }
 
-            // Track per-page direct-map pointers so we can write across
-            // page boundaries without requiring physically contiguous memory.
+            // Allocate the InitInfo region as one physically contiguous
+            // buddy extent so the descriptor array (which can span pages
+            // once CapDescriptor.name is included) lives in a single
+            // backing allocation. Per-page allocation works for the
+            // kernel-side `copy_nonoverlapping` writes, but init reads
+            // the descriptor slice as one cross-page Rust slice; on
+            // release builds LLVM exploits provenance assumptions about
+            // single-allocation slices to mis-load fields of descriptors
+            // that straddle page boundaries. A contiguous physical
+            // extent eliminates the discrepancy between virtual and
+            // physical contiguity, so the optimiser sees one allocation
+            // backing the slice.
             if info_pages > init_protocol::INIT_INFO_MAX_PAGES
             {
                 fatal("Phase 9: InitInfo region too large");
             }
+            // Round to next power of two for buddy allocation; for
+            // INIT_INFO_MAX_PAGES = 4 the upper bound is order 2 (4 pages).
+            let info_order = info_pages.next_power_of_two().trailing_zeros() as usize;
+            let block_pages = 1usize << info_order;
+            let block_phys = allocator
+                .alloc(info_order)
+                .unwrap_or_else(|| fatal("Phase 9: out of memory for InitInfo"));
+            let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
+            // SAFETY: just allocated; valid for block_pages * PAGE_SIZE bytes.
+            unsafe {
+                core::ptr::write_bytes(block_virt, 0, block_pages * mm::PAGE_SIZE);
+            }
+
             let mut page_ptrs: [*mut u8; init_protocol::INIT_INFO_MAX_PAGES] =
                 [core::ptr::null_mut(); init_protocol::INIT_INFO_MAX_PAGES];
             let mut page_phys: [u64; init_protocol::INIT_INFO_MAX_PAGES] =
@@ -620,30 +667,23 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
 
             for pg in 0..info_pages
             {
-                let phys = allocator
-                    .alloc(0)
-                    .unwrap_or_else(|| fatal("Phase 9: out of memory for InitInfo"));
-                let virt = mm::paging::phys_to_virt(phys) as *mut u8;
-                // SAFETY: just allocated; valid for PAGE_SIZE bytes.
-                unsafe { core::ptr::write_bytes(virt, 0, mm::PAGE_SIZE) };
+                let phys = block_phys + (pg as u64) * mm::PAGE_SIZE as u64;
+                // SAFETY: pg < block_pages by construction (info_pages <= block_pages).
+                let virt = unsafe { block_virt.add(pg * mm::PAGE_SIZE) };
                 let map_va = INIT_INFO_VADDR + (pg as u64) * mm::PAGE_SIZE as u64;
-                // SAFETY: init_as_ptr valid; phys just allocated; map_va page-aligned.
+                // SAFETY: init_as_ptr valid; phys is part of the contiguous extent.
                 unsafe { (*init_as_ptr).map_page(map_va, phys, flags) }
                     .unwrap_or_else(|()| fatal("Phase 9: failed to map InitInfo page"));
                 page_ptrs[pg] = virt;
                 page_phys[pg] = phys;
             }
+            // The buddy has no per-page free path here; the unused tail
+            // of the contiguous extent (at most `block_pages - info_pages`
+            // pages, ≤ 2 pages with `INIT_INFO_MAX_PAGES = 4`) stays
+            // allocated to the kernel. Small but constant waste; reclaim
+            // via a future cap-mint path if it becomes material.
+            let _ = block_pages;
             let info_base = page_ptrs[0];
-
-            let cmdline_copy_len = cmdline_snapshot_len;
-            let cmdline_off = if cmdline_copy_len > 0
-            {
-                cmdline_start as u32
-            }
-            else
-            {
-                0
-            };
 
             let info = InitInfo {
                 version: INIT_PROTOCOL_VERSION,
@@ -654,14 +694,10 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 memory_frame_count: cspace_layout.memory_frame_count,
                 segment_frame_base,
                 segment_frame_count,
-                module_frame_base: cspace_layout.module_frame_base,
-                module_frame_count: cspace_layout.module_frame_count,
                 hw_cap_base: cspace_layout.hw_cap_base,
                 hw_cap_count: cspace_layout.hw_cap_count,
                 cap_descriptors_offset: descriptors_offset,
                 thread_cap: 0, // patched below after Thread cap is minted
-                cmdline_offset: cmdline_off,
-                cmdline_len: cmdline_copy_len as u32,
                 sbi_control_cap: cspace_layout.sbi_control_slot,
                 cspace_cap: 0, // patched below after CSpace cap is minted
                 irq_range_cap: cspace_layout.irq_range_slot,
@@ -673,7 +709,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                 init_stack_frame_count: 0, // patched after stack mint
                 init_info_frame_base: 0,   // patched after self-mint below
                 init_info_frame_count: 0,  // patched after self-mint below
-                _pad_tail: 0,
+                module_name_count: cspace_layout.module_name_count,
+                module_names: cspace_layout.module_names,
             };
 
             // Write InitInfo header (always fits in first page).
@@ -696,28 +733,6 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
                     core::ptr::copy_nonoverlapping(desc_src.add(written), dst, chunk);
                 }
                 written += chunk;
-            }
-
-            // Copy kernel command line after the CapDescriptor array. Source
-            // is the Phase-4 BSS snapshot in `KERNEL_CMDLINE`; the bootloader
-            // cmdline page is already a reclaimable Frame cap by now.
-            if cmdline_copy_len > 0
-            {
-                let cmdline_src = core::ptr::addr_of!(KERNEL_CMDLINE).cast::<u8>();
-                let mut written = 0usize;
-                while written < cmdline_copy_len
-                {
-                    let offset = cmdline_start + written;
-                    let chunk =
-                        (mm::PAGE_SIZE - offset % mm::PAGE_SIZE).min(cmdline_copy_len - written);
-                    // SAFETY: offset within mapped region; cmdline_src points
-                    // into kernel BSS valid through `KERNEL_CMDLINE_MAX` bytes.
-                    unsafe {
-                        let dst = info_ptr(&page_ptrs, offset);
-                        core::ptr::copy_nonoverlapping(cmdline_src.add(written), dst, chunk);
-                    }
-                    written += chunk;
-                }
             }
 
             // Mint a reclaimable Frame cap per InitInfo page so init's

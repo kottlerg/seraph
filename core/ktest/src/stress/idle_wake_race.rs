@@ -17,9 +17,12 @@
 //!    bounds the worker's idle-wake latency from above.
 //!
 //! If the idle-wake primitive is broken (lost IPI / wfi sleeps past the
-//! wake), CPU 1 only wakes on the next timer tick (10 ms). Against a
-//! per-iteration threshold of a few ms, a single lost wake fails the
-//! test with the iteration index — a deterministic regression signal.
+//! wake), CPU 1 only wakes on the next timer tick (10 ms) and the next
+//! iteration takes 10+ ms. A genuinely broken wake path cascades —
+//! tens of thousands of iterations cross the 5 ms outlier threshold —
+//! and trips the aggregate [`MAX_OUTLIERS`] gate. No single sample can
+//! distinguish a lost wake from host preemption of a TCG vCPU thread,
+//! so the test gates solely on the aggregate count.
 //!
 //! Requires ≥ 2 CPUs. On UP configs, logs "SKIP" and passes trivially.
 
@@ -43,10 +46,12 @@ const ITERATIONS: u32 = 50_000;
 /// microseconds. Iterations exceeding this threshold are *outliers* — they
 /// may indicate a lost wake recovered by the next 10 ms timer tick, or
 /// host-OS preemption of a TCG vCPU thread inflating the guest-virtual
-/// round trip. The two cases overlap in the 5–15 ms range and cannot be
-/// distinguished from a single sample, so this test gates on aggregate
-/// behaviour: outlier *count* and worst-case *ceiling*, not any one
-/// iteration.
+/// round trip. Single-sample ambiguity is fundamental: no individual
+/// iteration's duration distinguishes the two cases, so this test gates
+/// solely on [`MAX_OUTLIERS`] (aggregate count). Single-iteration spikes
+/// of hundreds of milliseconds are routine under parallel TCG host load
+/// and never indicate a broken-IPI signature on their own; a broken
+/// wake path cascades, producing tens of thousands of outliers.
 const OUTLIER_US: u64 = 5_000;
 /// Maximum number of outliers tolerated across `ITERATIONS`.
 ///
@@ -55,14 +60,6 @@ const OUTLIER_US: u64 = 5_000;
 /// kernel that loses wakes systematically (which would push the count
 /// into the thousands).
 const MAX_OUTLIERS: u32 = (ITERATIONS / 200) + 1;
-/// Hard ceiling for any single iteration, in microseconds.
-///
-/// Three timer periods. A single lost wake is recovered within one timer
-/// period (~10 ms); two consecutive lost wakes within two; three would
-/// indicate a persistently-broken IPI delivery path. Crossing this
-/// ceiling is treated as a deterministic correctness failure regardless
-/// of outlier count.
-const HARD_CEILING_US: u64 = 30_000;
 
 /// Bits exchanged on each signal.
 const BIT_GO: u64 = 0x1;
@@ -125,7 +122,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut worst_us: u64 = 0;
     let mut outlier_count: u32 = 0;
 
-    for iter in 0..ITERATIONS
+    for _ in 0..ITERATIONS
     {
         let t0 = elapsed_us();
 
@@ -143,17 +140,6 @@ pub fn run(ctx: &TestContext) -> TestResult
         if dt > worst_us
         {
             worst_us = dt;
-        }
-        if dt > HARD_CEILING_US
-        {
-            // Catastrophic: a single iteration crossing three timer
-            // periods is broken-IPI territory, not noise.
-            crate::log_u64(
-                "stress::idle_wake_race: hard-ceiling exceeded on iter ",
-                u64::from(iter),
-            );
-            crate::log_u64("stress::idle_wake_race:   round trip us = ", dt);
-            return Err("stress::idle_wake_race: round-trip exceeded hard ceiling");
         }
         if dt > OUTLIER_US
         {

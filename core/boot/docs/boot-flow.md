@@ -27,74 +27,67 @@ Protocol handles are resolved via `BootServices->HandleProtocol` and
 
 Detail: [uefi-environment.md](uefi-environment.md)
 
-### Step 2: Load Boot Configuration
+### Step 2: Load Bootstrap Bundle
 
-The bootloader opens `\EFI\seraph\boot.conf` on the ESP and reads it into a
-4096-byte stack buffer. The file is parsed line by line for `key=value` entries.
-`#` comments and blank lines are ignored; unknown keys are skipped for forward
-compatibility.
+The bootloader opens `\EFI\seraph\bootstrap.bundle` on the ESP and reads
+the entire file into one UEFI page allocation. The bundle wire format is
+defined by [`abi/boot-protocol::bundle`](../../../abi/boot-protocol/src/bundle.rs):
+a little-endian header (`SRPHBNDL` magic + version + entry count) followed
+by `entry_count` × `BundleEntryHeader { name, offset, size }` and per-
+entry bodies at 4096-byte aligned offsets. Header validation rejects bad
+magic / version / out-of-bounds offsets / misaligned bodies as
+`BootError::InvalidBundle`; a missing file (`EFI_NOT_FOUND`) is
+`BootError::BundleMissing` — the bundle is load-bearing for every boot
+because init lives inside it.
 
-**File format:**
-
-```
-# Seraph boot configuration
-path=\EFI\seraph
-kernel=kernel
-init=init
-modules=procmgr, devmgr, vfsd, fat
-cmdline=placeholder
-```
-
-- `path` — required. Base ESP directory. Prepended (with `\`) to kernel, init,
-  and all module names to form full ESP paths.
-- `kernel` — required. Kernel filename, resolved against `path`.
-- `init` — required. Init filename, resolved against `path`.
-- `modules` — optional. Comma-separated module filenames resolved against `path`.
-  Whitespace around names is trimmed; empty tokens are skipped. Absent or empty
-  means no additional modules.
-- `cmdline` — optional. Kernel command line passed verbatim via
-  `BootInfo.command_line`. Absent means empty string.
-
-Missing `path`, `kernel`, or `init` keys, or a malformed line (missing `=`), are
-fatal errors (`InvalidConfig`). The parsed paths are used in all subsequent
-file-open operations.
+The kernel ELF and the bootloader EFI binary itself remain loose files
+on the ESP. Only `\EFI\seraph\kernel`, `\EFI\seraph\bootstrap.bundle`,
+and the EFI fallback bootloader (`\EFI\BOOT\BOOTX64.EFI` or
+`BOOTRISCV64.EFI`) need to exist for a boot to succeed.
 
 Detail: [uefi-environment.md](uefi-environment.md)
 
 ### Step 3: Load Kernel ELF
 
-The kernel ELF is loaded from the path specified by the `kernel` key in
-`boot.conf` (default: `\EFI\seraph\seraph-kernel`). The ELF header is validated,
-LOAD segments are mapped into physical memory allocated via `AllocatePages`, and
-the kernel virtual addresses and entry point are recorded.
+The kernel ELF is loaded from the hardcoded path `\EFI\seraph\kernel`.
+The ELF header is validated, LOAD segments are mapped into physical
+memory allocated via `AllocatePages`, and the kernel virtual addresses
+and entry point are recorded.
 
-W^X is enforced during loading: any ELF segment requesting both writable and
-executable permissions is a fatal error.
+W^X is enforced during loading: any ELF segment requesting both writable
+and executable permissions is a fatal error.
 
 Detail: [elf-loading.md](elf-loading.md)
 
-### Step 4: Load Init ELF and Boot Modules
+### Step 4: Parse Bundle (Init ELF + Boot Modules)
 
-**Init** is loaded from the path resolved from the `init` key in `boot.conf`. It
-receives full ELF treatment: header validation, W^X check, and per-segment loading.
-Each `PT_LOAD` segment is allocated at any available physical address via
-`AllocateAnyPages` (not at `p_paddr`, which conflicts with UEFI low-memory use),
-file data is copied in, and the BSS tail is zeroed. The result is an `InitImage`
-containing the virtual entry point and one `InitSegment` per LOAD segment, each
-recording its physical allocation address, ELF virtual address, size, and
-permissions. This is stored in `BootInfo.init_image`.
+The bootloader walks the bundle header from step 2 and produces both
+[`InitImage`](../../../abi/boot-protocol/src/lib.rs) and the
+`BootModule[]` array in one pass.
 
-**Boot modules** are flat binary images listed in `boot.conf` under the `modules`
-key. Each module path is resolved as `path\<name>`. For each module: the file is
-read into a temporary UEFI-allocated buffer, `load_module()` copies the data into a
-persistent physical allocation, and a `BootModule` entry recording `physical_base`
-and `size` is stored in a local array. The descriptors are written into the
-pre-allocated modules page in step 9. The bootloader does not inspect or interpret
-module content; what the modules are and in what order they are started is entirely
-init's concern. Typical modules: procmgr, devmgr, block driver, FS driver, vfsd.
+**Init** is the bundle entry whose name (NUL-trimmed) equals
+`bundle::INIT_ENTRY_NAME` (`"init"`). Its body bytes — a slice of the
+bundle allocation — receive full ELF treatment: header validation, W^X
+check, and per-segment loading. Each `PT_LOAD` segment is allocated at
+any available physical address via `AllocateAnyPages`, file data copied
+in, BSS tail zeroed. The resulting `InitImage` is stored in
+`BootInfo.init_image`. Exactly one bundle entry MUST carry this name;
+zero or two is `BootError::InvalidBundle`.
 
-Both the module file read buffers and the loaded module physical regions are tracked
-for identity mapping so they remain accessible after page table switch.
+**Boot modules** are every *other* bundle entry. For each one the
+bootloader synthesises a
+`BootModule { name, physical_base: bundle_phys + entry.offset, size }`
+record directly — there is no per-module allocation or copy because the
+bundle bodies are already 4096-byte aligned within the bundle allocation.
+The bootloader does not inspect module content; what each module does
+and in what order init spawns them is init's concern, and after
+init-protocol v7 init identifies modules by `BootModule.name` rather
+than ordinal position. Typical modules: procmgr, memmgr, devmgr, vfsd,
+virtio-blk, fatfs.
+
+Only the whole bundle allocation is identity-mapped (one region in
+place of today's per-module pair of read-buffer + loaded-region
+mappings); see step 6.
 
 Detail: [elf-loading.md](elf-loading.md)
 
@@ -161,7 +154,7 @@ Detail: [uefi-environment.md](uefi-environment.md)
 
 `BootInfo` is populated in-place in a physical memory region allocated before step 8.
 All pointer and address fields hold physical addresses; no virtual addresses appear in
-`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `7`).
+`BootInfo`. The `version` field is set to `BOOT_PROTOCOL_VERSION` (currently `8`).
 Fields are populated as follows:
 
 | Field | Source |
@@ -178,12 +171,12 @@ Fields are populated as follows:
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
 | `kernel_mmio` | Arch-specific MMIO bases extracted from firmware tables in step 5 (see `firmware-parsing.md`). Fields the extractor cannot populate stay zero and the kernel falls back to its compiled-in defaults. |
 | `mmio_apertures` | Coarse `{phys_base, size}` array from step 8 (UEFI MMIO regions merged with firmware-table seeds). Empty if no MMIO regions were reported. |
-| `command_line` | Physical address of null-terminated ASCII string; may be empty |
+| ~~`command_line`~~ | Removed in boot-protocol v8 — kernel command line is no longer carried |
 | `cpu_count` | Enabled LAPIC count from MADT (x86-64) or enabled RINTC / DTB hart count (RISC-V); always ≥ 1 |
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Per-CPU hardware identifiers; `cpu_ids[0] == bsp_id`; entries beyond `cpu_count` are zero |
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed (SMP disabled). |
-| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the cmdline page, the AP trampoline page) and `page_table.allocated_frames()` (the bootloader's transient page-table frames). Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_frame_caps` inside `populate_cspace`. |
+| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the reclaim-array page itself, the whole bundle allocation, the AP trampoline page) and `page_table.allocated_frames()` (the bootloader's transient page-table frames). Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_frame_caps` inside `populate_cspace`. |
 
 All arrays pointed to by `BootInfo` fields reside in physical memory that the UEFI
 memory map marks as `Loaded` or `Usable`, ensuring they survive until the kernel

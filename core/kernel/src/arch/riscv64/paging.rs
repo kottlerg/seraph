@@ -318,27 +318,43 @@ pub fn read_stack_pointer() -> u64
 
 /// Rebase the boot stack from identity-mapped to the direct physical map.
 ///
-/// Adds `direct_map_base` to `sp` and `s0` (frame pointer), switching from
-/// VA == PA to VA == `direct_map_base` + PA. Both mappings cover the same
-/// physical frames; this eliminates the 64 KiB identity-map limit.
+/// Adds `direct_map_base` to `sp`, switching from VA == PA to
+/// VA == `direct_map_base` + PA. Both mappings cover the same physical
+/// frames; this eliminates the 64 KiB identity-map limit.
 ///
 /// # Safety
 /// Must be called exactly once, immediately after `activate`, while the
 /// boot stack identity mapping is still valid. `direct_map_base` must be
 /// the base of a direct physical map that covers all of physical RAM.
+///
+/// # Codegen invariant — `#[inline(never)]` plus no `options(nostack)`
+/// This `asm!` block rewrites `sp` from the identity-mapped value to
+/// its direct-map alias. Rust inline asm cannot list `sp` as an output
+/// (it's a reserved register), so LLVM has no way to learn that this
+/// asm modifies `sp`. If LLVM inlines this function into the caller,
+/// it freely hoists any sp-relative local-address materialisation
+/// (`add reg, sp, imm`) to *before* the rebase, producing a stale
+/// low-VA pointer that page-faults on next dereference (PR #138 hit
+/// this in `kernel_entry`'s Phase 6 body — sepc=0xffffffff8000d972,
+/// stval=0x9ddc0f58 on CI's riscv64 release ktest).
+///
+/// `#[inline(never)]` is the fix: an opaque function call is an
+/// optimisation barrier the scheduler cannot move ops across, so every
+/// sp-derived expression in the caller materialises on the correct
+/// side of the rebase. Dropping `options(nostack)` is belt-and-braces
+/// in case a future revision re-inlines this — `nostack` would still
+/// be a factual lie about the body.
 #[cfg(not(test))]
+#[inline(never)]
 pub unsafe fn rebase_boot_stack(direct_map_base: u64)
 {
     // SAFETY: adding the direct-map offset to sp switches to the same
     // physical memory through the direct map virtual range. Both the
     // identity mapping (old) and direct map (new) are valid at this point.
-    // s0 is NOT rebased: in release mode it is a general-purpose register,
-    // not a frame pointer, and adding to it would corrupt live data.
     unsafe {
         core::arch::asm!(
             "add sp, sp, {base}",
             base = in(reg) direct_map_base,
-            options(nostack),
         );
     }
 }

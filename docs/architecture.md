@@ -154,9 +154,12 @@ live in the component scope:
 - init's userspace bootstrap — [`services/init/README.md`](../services/init/README.md) and
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md).
 
-Boot modules (procmgr, devmgr, drivers, etc.) are configurable via `boot.conf`
-per [`abi/boot-protocol/`](../abi/boot-protocol/); the minimum set is procmgr, devmgr,
-one block driver, one FS driver, and vfsd.
+Boot modules (procmgr, memmgr, devmgr, vfsd, virtio-blk, fatfs) are packed into
+`\EFI\seraph\bootstrap.bundle` by `cargo xtask build` (see
+[`xtask/README.md`](../xtask/README.md) for the producer side and
+[`abi/boot-protocol/src/bundle.rs`](../abi/boot-protocol/src/bundle.rs) for the
+wire format); the bootloader exposes each entry as a named `BootModule` and
+init looks them up by `BootModule.name`.
 
 ---
 

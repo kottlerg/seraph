@@ -52,10 +52,6 @@ pub fn late() -> &'static [Phase]
             name: "ns_startup_cwd",
             run: ns_startup_cwd_phase,
         },
-        Phase {
-            name: "ns_fallthrough_attenuation",
-            run: ns_fallthrough_attenuation_phase,
-        },
     ]
 }
 
@@ -299,29 +295,46 @@ pub fn ns_mount_boundary_phase(_: &Caps)
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let (config_cap, kind, _size) = ns_lookup(system_root_cap, b"config", 0xFFFF, ipc_buf)
-        .expect("ns_mount_boundary: NS_LOOKUP(system_root, \"config\") failed");
+    // Transparent root-fs delegation: paths that are not shadowed by a
+    // mount on the synthetic root must resolve through the root fs.
+    // After the mounts.conf/INGEST_CONFIG_MOUNTS removal, /etc lives on
+    // the root partition and reaches `/etc/svcmgr/services.d/logd.svc`
+    // through delegation (the only mount on the synthetic root is /esp).
+    let (etc_cap, kind, _size) = ns_lookup(system_root_cap, b"etc", 0xFFFF, ipc_buf)
+        .expect("ns_mount_boundary: NS_LOOKUP(system_root, \"etc\") failed");
     assert_eq!(
         kind, 1,
-        "ns_mount_boundary: /config must be Dir (transparent root delegation regression?)"
+        "ns_mount_boundary: /etc must be Dir (transparent root delegation regression?)"
     );
-    std::os::seraph::log!("ns_mount_boundary: NS_LOOKUP /config (delegated) ok");
+    std::os::seraph::log!("ns_mount_boundary: NS_LOOKUP /etc (delegated) ok");
 
-    let (file_cap, kind, size_hint) = ns_lookup(config_cap, b"mounts.conf", 0xFFFF, ipc_buf)
-        .expect("ns_mount_boundary: NS_LOOKUP(config, \"mounts.conf\") failed");
+    let (svcmgr_cap, kind, _size) = ns_lookup(etc_cap, b"svcmgr", 0xFFFF, ipc_buf)
+        .expect("ns_mount_boundary: NS_LOOKUP(etc, \"svcmgr\") failed");
+    assert_eq!(kind, 1, "ns_mount_boundary: /etc/svcmgr must be Dir");
+    let (services_d_cap, kind, _size) = ns_lookup(svcmgr_cap, b"services.d", 0xFFFF, ipc_buf)
+        .expect("ns_mount_boundary: NS_LOOKUP(svcmgr, \"services.d\") failed");
+    assert_eq!(
+        kind, 1,
+        "ns_mount_boundary: /etc/svcmgr/services.d must be Dir"
+    );
+
+    let (file_cap, kind, size_hint) = ns_lookup(services_d_cap, b"logd.svc", 0xFFFF, ipc_buf)
+        .expect("ns_mount_boundary: NS_LOOKUP(services.d, \"logd.svc\") failed");
     assert_eq!(
         kind, 0,
-        "ns_mount_boundary: /config/mounts.conf must be File"
+        "ns_mount_boundary: /etc/svcmgr/services.d/logd.svc must be File"
     );
-    std::os::seraph::log!("ns_mount_boundary: NS_LOOKUP mounts.conf ok (size_hint={size_hint})");
+    std::os::seraph::log!("ns_mount_boundary: NS_LOOKUP logd.svc ok (size_hint={size_hint})");
 
     let (size, _mtime, kind) =
-        ns_stat(file_cap, ipc_buf).expect("ns_mount_boundary: NS_STAT mounts.conf failed");
+        ns_stat(file_cap, ipc_buf).expect("ns_mount_boundary: NS_STAT logd.svc failed");
     assert_eq!(kind, 0, "ns_mount_boundary: stat kind must be File");
-    assert!(size > 0, "ns_mount_boundary: mounts.conf size must be > 0");
+    assert!(size > 0, "ns_mount_boundary: logd.svc size must be > 0");
 
     let _ = syscall::cap_delete(file_cap);
-    let _ = syscall::cap_delete(config_cap);
+    let _ = syscall::cap_delete(services_d_cap);
+    let _ = syscall::cap_delete(svcmgr_cap);
+    let _ = syscall::cap_delete(etc_cap);
     std::os::seraph::log!("ns_mount_boundary phase passed");
 }
 
@@ -337,44 +350,29 @@ pub fn ns_multi_component_phase(_: &Caps)
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let (srv_cap, kind, _) = ns_lookup(system_root_cap, b"srv", 0xFFFF, ipc_buf)
-        .expect("ns_multi_component: NS_LOOKUP(/, srv) failed");
+    // `/esp` is a terminal mount on the EFI System Partition (vfsd
+    // auto-mounts it after root). The original `/srv/data` fixture (a
+    // root-partition self-mount via mounts.conf) is gone; this phase now
+    // exercises single-component terminal mount + walk-into-mount.
+    let (esp_cap, kind, _) = ns_lookup(system_root_cap, b"esp", 0xFFFF, ipc_buf)
+        .expect("ns_multi_component: NS_LOOKUP(/, esp) failed");
     assert_eq!(
         kind, 1,
-        "ns_multi_component: /srv must be Dir (synthetic intermediate)"
+        "ns_multi_component: /esp must be Dir (terminal mount)"
     );
-    std::os::seraph::log!("ns_multi_component: NS_LOOKUP /srv (synthetic) ok");
+    std::os::seraph::log!("ns_multi_component: NS_LOOKUP /esp (terminal mount) ok");
 
-    let (data_cap, kind, _) = ns_lookup(srv_cap, b"data", 0xFFFF, ipc_buf)
-        .expect("ns_multi_component: NS_LOOKUP(/srv, data) failed");
-    assert_eq!(
-        kind, 1,
-        "ns_multi_component: /srv/data must be Dir (mount terminal)"
-    );
-    let (cfg_cap, kind, _) = ns_lookup(data_cap, b"config", 0xFFFF, ipc_buf)
-        .expect("ns_multi_component: NS_LOOKUP(/srv/data, config) failed");
-    assert_eq!(kind, 1, "ns_multi_component: /srv/data/config must be Dir");
-    let _ = syscall::cap_delete(cfg_cap);
-    std::os::seraph::log!("ns_multi_component: NS_LOOKUP /srv/data (terminal) ok");
+    let (efi_cap, kind, _) = ns_lookup(esp_cap, b"EFI", 0xFFFF, ipc_buf)
+        .expect("ns_multi_component: NS_LOOKUP(/esp, EFI) failed");
+    assert_eq!(kind, 1, "ns_multi_component: /esp/EFI must be Dir");
+    let _ = syscall::cap_delete(efi_cap);
+    let _ = syscall::cap_delete(esp_cap);
+    std::os::seraph::log!("ns_multi_component: NS_LOOKUP /esp/EFI (terminal contents) ok");
 
-    let (txt_cap, kind, _) = ns_lookup(srv_cap, b"test.txt", 0xFFFF, ipc_buf)
-        .expect("ns_multi_component: NS_LOOKUP(/srv, test.txt) failed (fall-through regression?)");
-    assert_eq!(
-        kind, 0,
-        "ns_multi_component: /srv/test.txt must be File (root-fs fall-through)"
-    );
-    let (size, _mtime, kind) =
-        ns_stat(txt_cap, ipc_buf).expect("ns_multi_component: NS_STAT /srv/test.txt failed");
-    assert_eq!(kind, 0, "ns_multi_component: stat kind must be File");
-    assert!(
-        size > 0,
-        "ns_multi_component: /srv/test.txt size must be > 0"
-    );
-    let _ = syscall::cap_delete(txt_cap);
-    let _ = syscall::cap_delete(data_cap);
-    let _ = syscall::cap_delete(srv_cap);
-    std::os::seraph::log!("ns_multi_component: NS_LOOKUP /srv/test.txt (fall-through) ok");
-
+    // Root-fs fixture: `/srv/test.txt` is now a plain rootfs file (the
+    // mount that previously covered `/srv/data` is gone), so the cap
+    // walked from the system root resolves through the root-fs backend
+    // unchanged. Marker check verifies the byte content.
     let body = std::fs::read_to_string("/srv/test.txt")
         .expect("ns_multi_component: std::fs::read_to_string(/srv/test.txt) failed");
     assert!(
@@ -484,46 +482,10 @@ pub fn ns_startup_cwd_phase(_: &Caps)
     std::os::seraph::log!("ns_startup_cwd phase passed");
 }
 
-pub fn ns_fallthrough_attenuation_phase(_: &Caps)
-{
-    use namespace_protocol::{NamespaceRights, rights};
-
-    let root = std::os::seraph::root_dir_cap();
-    if root == 0
-    {
-        std::os::seraph::log!("ns_fallthrough_attenuation phase skipped: no root_dir_cap");
-        return;
-    }
-
-    let info = startup_info();
-    #[allow(clippy::cast_ptr_alignment)]
-    let ipc_buf = info.ipc_buffer.cast::<u64>();
-
-    let lookup_stat = NamespaceRights::from_raw(rights::LOOKUP | rights::STAT).raw();
-    let (srv_cap, _kind, _) = ns_lookup(root, b"srv", u64::from(lookup_stat), ipc_buf)
-        .expect("ns_fallthrough_attenuation: walk-attenuate /srv (LOOKUP|STAT) failed");
-
-    let (file_cap, _kind, _) = ns_lookup(srv_cap, b"test.txt", 0xFFFF, ipc_buf)
-        .expect("ns_fallthrough_attenuation: NS_LOOKUP /srv/test.txt across fall-through failed");
-
-    let read_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ)
-        .word(0, 0)
-        .word(1, 4)
-        .build();
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let read_reply = unsafe { ipc::ipc_call(file_cap, &read_msg, ipc_buf) }
-        .expect("ns_fallthrough_attenuation: FS_READ ipc_call failed");
-    assert_eq!(
-        read_reply.label,
-        ipc::fs_errors::PERMISSION_DENIED,
-        "ns_fallthrough_attenuation: FS_READ on cap walked under LOOKUP|STAT-only parent \
-         returned {} (expected PERMISSION_DENIED={}) — the fall-through forwarder is \
-         laundering authority through the synthetic intermediate's full-rights cap",
-        read_reply.label,
-        ipc::fs_errors::PERMISSION_DENIED,
-    );
-
-    let _ = syscall::cap_delete(file_cap);
-    let _ = syscall::cap_delete(srv_cap);
-    std::os::seraph::log!("ns_fallthrough_attenuation phase passed");
-}
+// ns_fallthrough_attenuation_phase was retired alongside the /srv/data
+// mount: it asserted that fall-through caps minted under a synthetic
+// intermediate (where /srv was synthetic only because /srv/data was a
+// mount within it) respect parent-cap attenuation. With /srv no longer
+// being a synthetic intermediate, the scenario it exercised no longer
+// exists. Re-introducing equivalent coverage requires a multi-component
+// mount fixture; track separately if and when one is added.

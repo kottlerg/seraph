@@ -71,19 +71,14 @@ jobs:
           path: target/xtask/run-parallel/**/*.log
           if-no-files-found: ignore
 
-      - name: Swap boot.conf to init=ktest and rebuild
+      - name: Compose the bundle for ktest
+        # `compose-bundle --harness ktest` overwrites
+        # sysroot/esp/EFI/seraph/bootstrap.bundle with the single-entry
+        # ktest bundle and repacks disk.img. No cargo rebuild is needed
+        # because the ktest binary was produced by the earlier
+        # `cargo xtask build` and lives at sysroot/services/ktest.
         run: |
-          sed -i \
-            -e 's|^init=init$|#init=init|' \
-            -e 's|^#init=ktest$|init=ktest|' \
-            -e 's|^cmdline=root=|#cmdline=root=|' \
-            -e 's|^#cmdline=ktest\.shutdown=always ktest\.timeout=3$|cmdline=ktest.shutdown=always ktest.timeout=3|' \
-            rootfs/esp/EFI/seraph/boot.conf
-          if [ "${{ matrix.profile }}" = "release" ]; then
-            cargo xtask build --arch ${{ matrix.arch }} --release
-          else
-            cargo xtask build --arch ${{ matrix.arch }}
-          fi
+          cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
 
       - name: ktest burn-in (4 × 20 iterations)
         id: ktest-burnin

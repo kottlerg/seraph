@@ -67,7 +67,13 @@ impl Status
     {
         match self
         {
-            Status::Pass | Status::Ok => None,
+            Status::Pass => None,
+            // Ok = QEMU exited cleanly but the pass-marker regex did
+            // not match. Preserve the log so the operator (and CI
+            // artifact upload) can see why — silent dropping of the
+            // log lost diagnostic context on a real CI flake debugging
+            // round (see commit message for PR #138).
+            Status::Ok => Some("OK"),
             Status::Fail => Some("FAIL"),
             Status::Hang => Some("HANG"),
             Status::Err(_) => Some("ERR"),

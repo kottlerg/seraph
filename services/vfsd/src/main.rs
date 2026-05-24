@@ -24,7 +24,7 @@
 
 mod driver;
 mod gpt;
-mod mount_conf;
+mod role_guids;
 mod root_backend;
 mod worker;
 mod worker_pool;
@@ -213,7 +213,7 @@ fn main() -> !
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
     // synthetic root. The service endpoint carries only `MOUNT` and
-    // `INGEST_CONFIG_MOUNTS`; the namespace endpoint is separated so
+    // `GET_SYSTEM_ROOT_CAP`; the namespace endpoint is separated so
     // a single dispatcher thread can serve every walk without
     // contending with mount-table mutations.
     let Some(namespace_slab) = std::os::seraph::object_slab_acquire(88)
@@ -324,9 +324,9 @@ pub struct VfsdRuntime
 /// re-entry via `FS_READ` while loading a driver from the now-mounted
 /// root) does not deadlock.
 ///
-/// Concurrency invariants. `MOUNT` and `INGEST_CONFIG_MOUNTS` both
-/// route into `do_mount`, which mutates shared runtime state under
-/// the `VfsdRuntime` mutexes:
+/// Concurrency invariants. `MOUNT` routes into `do_mount` (and
+/// `do_mount` calls itself recursively for the ESP auto-mount), which
+/// mutates shared runtime state under the `VfsdRuntime` mutexes:
 /// - `rt.boot_module_cap` — Mutex; swapped to zero on the first
 ///   successful mount.
 /// - `rt.root_backend` — Mutex; the synthetic-root tree's only
@@ -361,22 +361,6 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
         match opcode
         {
             ipc::vfsd_labels::MOUNT => handle_mount_request(&recv, ipc_buf, rt),
-            ipc::vfsd_labels::INGEST_CONFIG_MOUNTS =>
-            {
-                if token & ipc::vfsd_labels::INGEST_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(
-                        "INGEST_CONFIG_MOUNTS rejected: token lacks INGEST_AUTHORITY"
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else
-                {
-                    mount_conf::handle_ingest_config_mounts(ipc_buf, rt);
-                }
-            }
             ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
             {
                 if token & ipc::vfsd_labels::SEED_AUTHORITY == 0
@@ -607,24 +591,64 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
 
 // ── MOUNT handler ──────────────────────────────────────────────────────────
 
+/// Mount role decoded from the MOUNT IPC wire byte. The producer
+/// (init) declares which partition role it wants; vfsd resolves the
+/// role to a GPT type-GUID via [`role_for_type_guid`] and then to a
+/// partition entry via [`gpt::lookup_partition_by_type_guid`].
+#[derive(Clone, Copy, Debug)]
+enum MountRole
+{
+    /// Seraph rootfs (`role_guids::SERAPH_ROOT`).
+    Root,
+}
+
+impl MountRole
+{
+    fn from_wire(byte: u8) -> Option<Self>
+    {
+        match byte
+        {
+            0 => Some(MountRole::Root),
+            _ => None,
+        }
+    }
+
+    fn type_guid(self) -> &'static [u8; 16]
+    {
+        match self
+        {
+            MountRole::Root => &role_guids::SERAPH_ROOT,
+        }
+    }
+}
+
 /// Handle a MOUNT request from init (or any authorized client).
 ///
-/// IPC data layout:
-/// - `data[0..2]`: partition UUID (16 bytes, mixed-endian, as stored in GPT)
-/// - `data[2]`: mount path length
-/// - `data[3..]`: mount path bytes (packed into u64 words)
+/// IPC data layout (boot protocol v8+):
+/// - `data[0]` low byte: [`MountRole`] discriminant
+/// - `data[1]`: mount path length
+/// - `data[2..]`: mount path bytes (packed into u64 words)
 ///
 /// Decodes the wire payload and delegates to [`do_mount`] for the
-/// real work. `INGEST_CONFIG_MOUNTS` reuses `do_mount` directly.
+/// real work. When the requested role is [`MountRole::Root`], vfsd
+/// additionally auto-mounts the EFI System Partition at `/esp` so
+/// userspace (svctest namespace tests, future userspace) can read it
+/// without a separate IPC call.
+#[allow(clippy::cast_possible_truncation)]
 fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
-    let w0 = recv.word(0);
-    let w1 = recv.word(1);
-    let mut uuid = [0u8; 16];
-    uuid[..8].copy_from_slice(&w0.to_le_bytes());
-    uuid[8..].copy_from_slice(&w1.to_le_bytes());
+    let role_byte = recv.word(0) as u8;
+    let Some(role) = MountRole::from_wire(role_byte)
+    else
+    {
+        std::os::seraph::log!("MOUNT: unknown role byte {role_byte}");
+        let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+        return;
+    };
 
-    let path_len = recv.word(2) as usize;
+    let path_len = recv.word(1) as usize;
     if path_len == 0 || path_len > 64
     {
         std::os::seraph::log!("MOUNT: invalid path length");
@@ -636,8 +660,8 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 
     let mut path_buf = [0u8; 64];
     let path_bytes = recv.data_bytes();
-    // Path bytes start at word 3 (byte offset 24).
-    let path_src_start = 3 * 8;
+    // Path bytes start at word 2 (byte offset 16) under the new wire shape.
+    let path_src_start = 2 * 8;
     let path_src_end = (path_src_start + path_len).min(path_bytes.len());
     let copy_len = path_src_end.saturating_sub(path_src_start).min(path_len);
     if copy_len > 0
@@ -646,7 +670,7 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
             .copy_from_slice(&path_bytes[path_src_start..path_src_start + copy_len]);
     }
 
-    let reply = match do_mount(rt, ipc_buf, &uuid, &path_buf[..path_len])
+    let reply = match do_mount(rt, ipc_buf, role, &path_buf[..path_len])
     {
         Ok(0) => IpcMessage::new(ipc::vfsd_errors::SUCCESS),
         Ok(cap) => IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
@@ -654,8 +678,46 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
             .build(),
         Err(label) => IpcMessage::new(label),
     };
+
+    // Auto-mount the EFI System Partition at /esp once root is up so
+    // userspace can read kernel + bundle + bootloader without a separate
+    // MOUNT call (the historic role of `mounts.conf`). Best-effort —
+    // failure does not propagate into the root mount's reply.
+    if matches!(role, MountRole::Root) && reply.label == ipc::vfsd_errors::SUCCESS
+    {
+        auto_mount_esp(rt, ipc_buf);
+    }
+
     // SAFETY: ipc_buf is the registered IPC buffer.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// One-shot best-effort mount of the EFI System Partition at `/esp`. Logs
+/// a diagnostic on any failure. Idempotent if invoked twice — the
+/// install attempt against an already-terminal mount path is rejected by
+/// `root_backend::install_mount`.
+fn auto_mount_esp(rt: &VfsdRuntime, ipc_buf: *mut u64)
+{
+    let parts = &rt.gpt_parts;
+    let mut esp_found = false;
+    for p in parts
+    {
+        if p.active && p.type_guid == role_guids::EFI_SYSTEM_PARTITION
+        {
+            esp_found = true;
+            break;
+        }
+    }
+    if !esp_found
+    {
+        std::os::seraph::log!("MOUNT: no EFI System Partition found; skipping /esp auto-mount");
+        return;
+    }
+    match do_mount_internal(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, b"/esp")
+    {
+        Ok(_) => std::os::seraph::log!("MOUNT: /esp auto-mounted"),
+        Err(code) => std::os::seraph::log!("MOUNT: /esp auto-mount failed: code={code:#x}"),
+    }
 }
 
 /// Delete `slot` and log the kernel error code on failure. A no-op on
@@ -696,16 +758,42 @@ fn log_cap_delete(context: &str, slot: u32)
 pub(crate) fn do_mount(
     rt: &VfsdRuntime,
     ipc_buf: *mut u64,
-    uuid: &[u8; 16],
+    role: MountRole,
     path: &[u8],
 ) -> Result<u32, u64>
 {
-    let Some((partition_lba, partition_len)) = gpt::lookup_partition_by_uuid(uuid, &rt.gpt_parts)
-    else
-    {
-        std::os::seraph::log!("MOUNT: partition UUID not found");
-        return Err(ipc::vfsd_errors::NO_MOUNT);
-    };
+    do_mount_internal(rt, ipc_buf, role.type_guid(), path)
+}
+
+/// Shared implementation for both role-driven (`do_mount`) and
+/// internally-triggered (`auto_mount_esp`) mounts. Takes a type-GUID
+/// directly so callers without a [`MountRole`] (the ESP auto-mount)
+/// can reuse the transaction body.
+#[allow(clippy::too_many_lines)]
+fn do_mount_internal(
+    rt: &VfsdRuntime,
+    ipc_buf: *mut u64,
+    type_guid: &[u8; 16],
+    path: &[u8],
+) -> Result<u32, u64>
+{
+    let (partition_lba, partition_len) =
+        match gpt::lookup_partition_by_type_guid(type_guid, &rt.gpt_parts)
+        {
+            Ok(pair) => pair,
+            Err(gpt::GptLookupError::NotFound) =>
+            {
+                std::os::seraph::log!("MOUNT: partition role GUID not found");
+                return Err(ipc::vfsd_errors::NO_MOUNT);
+            }
+            Err(gpt::GptLookupError::DuplicateTie) =>
+            {
+                std::os::seraph::log!(
+                    "MOUNT: FATAL — multiple partitions share the role GUID with tied priority"
+                );
+                return Err(ipc::vfsd_errors::NO_MOUNT);
+            }
+        };
     std::os::seraph::log!(
         "MOUNT: partition LBA={partition_lba:#018x} length={partition_len:#018x}"
     );

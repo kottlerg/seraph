@@ -18,6 +18,7 @@ use clap::Parser;
 
 mod accel;
 mod arch;
+mod bundle;
 mod cli;
 mod commands;
 mod context;
@@ -55,6 +56,7 @@ fn main()
         CliCommand::Test(args) => commands::test::run(&ctx, args),
         CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
+        CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
     };
 
     if let Err(err) = result

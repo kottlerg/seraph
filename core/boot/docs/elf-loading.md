@@ -22,20 +22,24 @@ is a fatal error.
 
 ## File Paths
 
-Files are opened via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` on the ESP volume. Paths
-come from `\EFI\seraph\boot.conf`, parsed before any file loading occurs (see
+Files are opened via `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` on the ESP volume. The
+bootloader carries two hardcoded ESP path constants in
+[`boot/src/main.rs`](../src/main.rs) (see
 [uefi-environment.md](uefi-environment.md)):
 
-| File | Config key | Default path on ESP |
-|---|---|---|
-| Kernel | `kernel` | `\EFI\seraph\seraph-kernel` |
-| Init binary | `init` | `\EFI\seraph\init` |
-| Boot modules | future `boot.conf` keys | — |
+| File | Hardcoded ESP path |
+|---|---|
+| Kernel | `\EFI\seraph\kernel` |
+| Bootstrap bundle | `\EFI\seraph\bootstrap.bundle` |
 
-All paths use backslash separators as required by the UEFI file protocol. The kernel
-and init keys are required; their absence is a fatal error. Additional module paths
-are an extension point via new keys in `boot.conf`; the parser silently skips
-unknown keys, so old bootloader binaries are unaffected by additions.
+All paths use backslash separators as required by the UEFI file
+protocol. There is no per-file extension mechanism: the bundle is a
+single composed artifact carrying the userspace `init` entry plus every
+module init needs to bootstrap the system, parsed by the bundle module
+in [`abi/boot-protocol/src/bundle.rs`](../../../abi/boot-protocol/src/bundle.rs).
+Adding a new boot module is therefore a bundle-composer change in
+[`xtask/src/bundle.rs`](../../../xtask/src/bundle.rs), not a bootloader
+change.
 
 ---
 
@@ -134,33 +138,42 @@ the `phys_addr`/`virt_addr` pairs to build init's page tables without an ELF par
 
 ## Boot Module Loading
 
-Boot modules are flat binary images for early userspace services (e.g. procmgr,
-devmgr). The bootloader loads whatever files `boot.conf` specifies; it does not
-interpret their purpose.
+Boot modules are flat binary images for early userspace services (e.g.
+procmgr, devmgr). The bootloader does not open per-module files —
+every module body is already inside the bundle that step 2 loads. Per
+module, the bootloader's bundle walker:
 
 ```
-1. Open the module file and query its size via EFI_FILE_INFO.
-2. AllocatePages(AllocateAnyPages, EfiLoaderData, page_count, &phys_base).
-   page_count = ceil(file_size / PAGE_SIZE).
-3. Read the entire file into the allocated region.
-4. The allocated region may be larger than the file if the file size is not
-   page-aligned; the extra bytes at the end are unused (not explicitly zeroed).
-5. Record phys_base and file_size in a BootModule entry in BootInfo.modules.
+1. Iterate bundle entry headers from `boot_protocol::bundle::parse_header`.
+2. Skip the entry literally named "init" (that body becomes init's
+   ELF source, parsed separately).
+3. For every other entry, record a `BootModule { name, physical_base,
+   size }` where `physical_base = bundle_phys + entry.offset` and
+   `size = entry.size` (the file-byte size, not the body's rounded
+   allocation).
 ```
 
-`BootModule.size` records the exact file size (not the rounded allocation size).
-Init receives the module slice via its initial CSpace and is responsible for
-validating and starting each service.
+Bundle bodies are 4 KiB-aligned per `BODY_ALIGNMENT`, so
+`physical_base` is page-aligned and a downstream consumer that needs
+a page-rounded allocation (the kernel's `mint_module_frame_caps`,
+which rounds `size` up to the next page boundary for the Frame cap)
+does not need to copy or relocate bytes. Init receives the module
+slice via its initial `CSpace` and is responsible for validating and
+starting each service.
 
 ---
 
 ## Extensibility
 
-All file paths come from `\EFI\seraph\boot.conf`, not hard-coded in the bootloader
-binary. Adding boot modules requires only new keys in `boot.conf`; the parser
-silently skips unknown keys, so existing bootloader binaries are unaffected.
-`BootInfo.modules.count` accurately reflects however many modules were loaded; the
-kernel and init iterate it without assuming a fixed count or fixed ordering.
+The bundle replaces both the per-module file enumeration and the
+configuration file that used to point at it. Adding a new boot
+module is a bundle-composer change in
+[`xtask/src/bundle.rs`](../../../xtask/src/bundle.rs); the bootloader
+binary needs no change. `BootInfo.modules.count` accurately reflects
+the bundle's non-`init` entry count; the kernel and init iterate it
+without assuming a fixed count or fixed ordering, and init looks
+modules up by name via `InitInfo::module_names` rather than by
+ordinal.
 
 ---
 

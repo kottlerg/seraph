@@ -663,38 +663,22 @@ pub const VFSD_LABELS_VERSION: u32 = 1;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
 {
-    /// Mount a filesystem at a path.
+    /// Mount a filesystem at a path. The request body carries a
+    /// `MountRole` byte (see `services/vfsd/docs/vfs-ipc-interface.md`)
+    /// selecting which GPT type-GUID role to mount; vfsd looks the
+    /// partition up itself.
     pub const MOUNT: u64 = 10;
-    /// Trigger vfsd to read `/config/mounts.conf` from the
-    /// freshly-mounted root filesystem and issue the additional
-    /// MOUNTs it describes.
-    ///
-    /// Empty body. Reply: `SUCCESS` on success (including missing or
-    /// empty config — both are legitimate system states);
-    /// `PARTIAL_INGEST` with `data[0]` carrying the failed-line count
-    /// when one or more mount entries failed; `CONFIG_INGEST_ERROR`
-    /// when vfsd's own NS walk or read against the root mount failed.
-    /// `UNAUTHORIZED` when the caller's token lacks
-    /// [`INGEST_AUTHORITY`]. Synchronous — vfsd does not reply until
-    /// every described mount has been attempted.
-    pub const INGEST_CONFIG_MOUNTS: u64 = 12;
     /// Mint a fresh tokened SEND on vfsd's namespace endpoint addressing
     /// the synthetic system root at full namespace rights and return it
     /// to the caller.
     ///
     /// Empty request body. Reply: `SUCCESS` with `caps[0]` = the
     /// system-root cap; `UNAUTHORIZED` when the caller's token lacks
-    /// [`SEED_AUTHORITY`]. Init calls this once during bootstrap
-    /// (after the cmdline-driven root mount completes) to obtain the
-    /// seed cap from which all later namespace-cap distribution flows.
+    /// [`SEED_AUTHORITY`]. Init calls this once during bootstrap (after
+    /// the role-byte root mount completes) to obtain the seed cap from
+    /// which all later namespace-cap distribution flows.
     pub const GET_SYSTEM_ROOT_CAP: u64 = 13;
 
-    /// Authority bit in the vfsd-service-endpoint token's high u64
-    /// bit. Set on caps minted for consumers permitted to call
-    /// [`INGEST_CONFIG_MOUNTS`]. Without it, the handler replies
-    /// `UNAUTHORIZED`. Distinct from [`SEED_AUTHORITY`]: a consumer
-    /// may hold either, both, or neither.
-    pub const INGEST_AUTHORITY: u64 = 1u64 << 63;
     /// Authority bit in the vfsd-service-endpoint token. Set on caps
     /// minted for consumers permitted to call
     /// [`GET_SYSTEM_ROOT_CAP`]. Without it the handler replies
@@ -1186,22 +1170,8 @@ pub mod vfsd_errors
     pub const IO_ERROR: u64 = 5;
     /// Mount table full.
     pub const TABLE_FULL: u64 = 6;
-    /// `INGEST_CONFIG_MOUNTS` walked the namespace successfully but
-    /// reading `/config/mounts.conf` itself failed (lookup error other
-    /// than `NotFound`, or `FS_READ` failure). Distinguishes "config
-    /// not present (legitimate)" from "config present but unreadable
-    /// (operator-relevant)" at the wire.
-    pub const CONFIG_INGEST_ERROR: u64 = 7;
-    /// `INGEST_CONFIG_MOUNTS` parsed the config but one or more
-    /// described mounts failed (invalid UUID, partition not found,
-    /// fatfs spawn failure, etc.). `data[0]` carries the failed-line
-    /// count. Distinct from `CONFIG_INGEST_ERROR` (the config itself
-    /// could not be read) and `SUCCESS` (every described mount
-    /// landed).
-    pub const PARTIAL_INGEST: u64 = 8;
     /// Caller's token lacks the verb bit required by the handler
-    /// (e.g. `INGEST_AUTHORITY` for `INGEST_CONFIG_MOUNTS`,
-    /// `SEED_AUTHORITY` for `GET_SYSTEM_ROOT_CAP`).
+    /// (e.g. `SEED_AUTHORITY` for `GET_SYSTEM_ROOT_CAP`).
     pub const UNAUTHORIZED: u64 = 9;
     /// Caller's compiled `VFSD_LABELS_VERSION` does not match the receiver's.
     /// The handshake-checked entry point (`GET_SYSTEM_ROOT_CAP`) carries

@@ -326,6 +326,13 @@ pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
     // This flushes the CPU's segment cache for CS.
     // SAFETY: KERNEL_CS references a valid GDT entry just loaded; far return
     // executed at ring 0 with valid stack and return address.
+    //
+    // `nostack` is intentionally absent: the body pushes twice and the
+    // `retfq` pops twice (net RSP delta zero), but the asm transiently
+    // writes [RSP-8] and [RSP-16]. Claiming `nostack` would license LLVM
+    // to assume the red zone is untouched; only the kernel target's
+    // `disable-redzone: true` makes this latent today. Be honest about
+    // the body so a future target-spec change cannot break us silently.
     unsafe {
         core::arch::asm!(
             "push {cs}",
@@ -335,7 +342,6 @@ pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
             "2:",
             cs  = in(reg) KERNEL_CS as u64,
             tmp = lateout(reg) _,
-            options(nostack),
         );
     }
 
@@ -359,11 +365,18 @@ pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
     // Load the TSS selector.
     // SAFETY: ltr is a privileged x86 instruction; TSS_SEL references a valid
     // 128-bit TSS descriptor in the GDT just loaded; executed at ring 0.
+    //
+    // `nomem` is intentionally absent: `ltr` reads the 16-byte TSS
+    // descriptor from the GDT in memory AND writes the descriptor's busy
+    // bit back. Claiming `nomem` would license LLVM to reorder memory
+    // ops across this asm, including a hypothetical future write to the
+    // GDT itself; the latent hazard is real even though the GDT is
+    // post-init read-only in practice today.
     unsafe {
         core::arch::asm!(
             "ltr {0:x}",
             in(reg) TSS_SEL,
-            options(nostack, nomem),
+            options(nostack),
         );
     }
 }
@@ -511,6 +524,7 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     // Reload CS via a far return into the kernel code segment.
     // SAFETY: KERNEL_CS references a valid GDT entry just loaded; far return
     // executed at ring 0 with valid stack and return address.
+    // See bsp_install_gdt above for why `nostack` is intentionally absent.
     unsafe {
         core::arch::asm!(
             "push {cs}",
@@ -520,7 +534,6 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
             "2:",
             cs  = in(reg) KERNEL_CS as u64,
             tmp = lateout(reg) _,
-            options(nostack),
         );
     }
 
@@ -544,11 +557,12 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     // Load the TSS selector.
     // SAFETY: ltr is a privileged x86 instruction; TSS_SEL references a valid
     // 128-bit TSS descriptor in the GDT just loaded; executed at ring 0.
+    // See bsp_install_gdt above for why `nomem` is intentionally absent.
     unsafe {
         core::arch::asm!(
             "ltr {0:x}",
             in(reg) TSS_SEL,
-            options(nostack, nomem),
+            options(nostack),
         );
     }
 

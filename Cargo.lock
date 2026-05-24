@@ -972,6 +972,7 @@ dependencies = [
 name = "vfsd"
 version = "0.1.0"
 dependencies = [
+ "boot-protocol",
  "ipc",
  "namespace-protocol",
  "syscall",
@@ -1342,6 +1343,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boot-protocol",
  "clap",
  "ctrlc",
  "fatfs 0.3.6",

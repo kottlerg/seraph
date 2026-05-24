@@ -18,13 +18,13 @@ vfsd/
 │   ├── main.rs              # Entry, service + namespace loops, MOUNT handler
 │   ├── driver.rs            # Spawning fatfs driver instances
 │   ├── gpt.rs               # GPT partition table parsing
-│   ├── mount_conf.rs        # INGEST_CONFIG_MOUNTS reader
+│   ├── role_guids.rs        # Compile-time arch-conditional root + ESP GUIDs
 │   ├── root_backend.rs      # VfsdRootBackend (NamespaceBackend impl)
 │   ├── worker.rs            # Worker thread implementation
 │   └── worker_pool.rs       # Bootstrap-endpoint pool for spawned drivers
 └── docs/
     ├── namespace-composition.md   # Synthetic root, root-mount delegation
-    └── vfs-ipc-interface.md       # MOUNT / INGEST_CONFIG_MOUNTS
+    └── vfs-ipc-interface.md       # MOUNT wire shape
 ```
 
 ---
@@ -36,21 +36,21 @@ vfsd/
   entries on the synthetic system root, and forwards unmatched
   lookups to the root mount via transparent delegation. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md).
-- **Service endpoint** — handles `MOUNT`, `INGEST_CONFIG_MOUNTS`, and
-  `GET_SYSTEM_ROOT_CAP` on its un-tokened service endpoint, with
-  multi-threaded recv so a worker-driven `CREATE_FROM_FILE` re-entry
-  cannot deadlock an in-flight reply. See
+- **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
+  its un-tokened service endpoint, with multi-threaded recv so a
+  worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
+  flight reply. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md).
 - **System-root cap delivery** — vfsd does not push a system-root
   cap anywhere at boot. Init pulls one via
-  `vfsd_labels::GET_SYSTEM_ROOT_CAP` after the cmdline-driven root
-  mount completes; init then distributes per-child copies via
+  `vfsd_labels::GET_SYSTEM_ROOT_CAP` after issuing the role-driven
+  root `MOUNT`; init then distributes per-child copies via
   `procmgr_labels::CONFIGURE_NAMESPACE` on every spawn. Procmgr
   itself holds no namespace cap — children spawned without an
   explicit `CONFIGURE_NAMESPACE` cap see
   `ProcessInfo.system_root_cap == 0`.
 - **Filesystem driver lifecycle** — vfsd is the dispatcher for fs
-  driver processes. The first `MOUNT` (the cmdline-driven root)
+  driver processes. The first `MOUNT` (the role-driven root)
   spawns fatfs from a boot module cap; subsequent mounts walk
   vfsd's own held system-root cap to `/bin/fatfs` and pass the
   resulting file cap to procmgr via `CREATE_FROM_FILE`. The
@@ -59,9 +59,16 @@ vfsd/
   the root online cannot be moved elsewhere. vfsd supplies each
   driver with a partition-scoped block device endpoint and the
   receive side of its own service endpoint.
-- **GPT enumeration** — parses the GPT partition table from a single
-  scratch frame at startup and retains `(uuid → (lba, length))`
-  entries for `MOUNT` lookups.
+- **GPT enumeration + role-driven mount discovery** — parses the GPT
+  partition table from a single scratch frame at startup. The
+  `MOUNT` handler decodes a `MountRole` byte from the wire payload
+  and resolves it to a partition entry via
+  `gpt::lookup_partition_by_type_guid` against the arch-conditional
+  root GUID in `src/role_guids.rs`. The EFI System Partition (matched
+  by its standard type GUID) auto-mounts at `/esp` immediately after
+  the root mount completes; there is no `mounts.conf` and no
+  `INGEST_CONFIG_MOUNTS` IPC. See
+  [`docs/namespace-composition.md`](docs/namespace-composition.md).
 
 vfsd does not touch hardware directly. All storage I/O is mediated
 through partition-scoped block device IPC endpoints derived from

@@ -5,7 +5,10 @@
 
 //! ktest — Seraph kernel test binary.
 //!
-//! Loaded by the kernel in place of real init (set `init=ktest` in boot.conf).
+//! Loaded by the kernel in place of real init. Swap the harness by
+//! re-composing the bootloader bundle with `cargo xtask compose-bundle
+//! --harness ktest` (and revert via `--harness init`); the bundle's
+//! `init` entry decides which binary the bootloader hands off to.
 //! Receives the same initial capability set that init would, then:
 //!
 //! 1. **Tier 1** (`unit/`)        — exercises every kernel syscall in isolation.
@@ -273,9 +276,7 @@ fn run(info_ptr: u64) -> !
         sbi_control_cap: info.sbi_control_cap,
     };
 
-    // Parse config early so we can gate tier execution and pass bench_iters.
-    // SAFETY: info is valid for the lifetime of the process (kernel-mapped page).
-    let config = cmdline::parse(unsafe { init_protocol::cmdline_bytes(info) });
+    let config = cmdline::KtestConfig::DEFAULT;
 
     // ── Tier 1: per-syscall isolation ─────────────────────────────────────────
     if config.run_unit
@@ -337,6 +338,18 @@ fn run(info_ptr: u64) -> !
         }
 
         log("ktest: shutdown");
+        // Brief unconditional wait so the terminal-marker lines (the
+        // `[ktest] ALL TESTS PASSED` / `SOME TESTS FAILED` line and
+        // the `ktest: shutdown` line above) have time to drain through
+        // QEMU's chardev backend before the shutdown port write tears
+        // the VM down. On slow TCG hosts (CI runners with QEMU stdio
+        // chardev) the chardev's last-buffer flush is not synchronous
+        // with the VM exit, and without this delay `run-parallel`'s
+        // pass-marker regex intermittently misses the terminal line.
+        // 100 ms is much more than the chardev's typical flush latency
+        // and is invisible against `KtestConfig::DEFAULT.timeout_secs`
+        // (which the operator controls separately).
+        wait_us(100_000);
         #[cfg(target_arch = "x86_64")]
         acpi_shutdown::shutdown(info);
         #[cfg(target_arch = "riscv64")]
@@ -539,7 +552,13 @@ pub fn log_version(prefix: &str, ver: u64)
 /// Yields the CPU between polls so the scheduler can run other threads.
 fn wait_seconds(secs: u32)
 {
-    let target_us = u64::from(secs) * 1_000_000;
+    wait_us(u64::from(secs) * 1_000_000);
+}
+
+/// Spin until `target_us` microseconds of `ElapsedUs` have passed since
+/// the call. Yields each iteration so other threads make progress.
+fn wait_us(target_us: u64)
+{
     let start = syscall::system_info(6).unwrap_or(0); // ElapsedUs = 6
     loop
     {

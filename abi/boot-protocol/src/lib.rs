@@ -19,6 +19,9 @@
 
 #![no_std]
 
+pub mod bundle;
+pub mod role_guids;
+
 /// Current boot protocol version. Increment when `BootInfo` layout or the
 /// CPU entry contract changes in a non-backwards-compatible way.
 ///
@@ -40,8 +43,8 @@
 /// v7: Added `reclaim_ranges: ReclaimSlice` so the bootloader can hand the
 ///     kernel a list of scratch pages (`BootInfo` page, module descriptor
 ///     array, memory-map entry array, MMIO aperture array, the
-///     reclaim-array page itself, the cmdline page, and the bootloader's
-///     own transient page-table frames) that are safe to reclaim once
+///     reclaim-array page itself, and the bootloader's own transient
+///     page-table frames) that are safe to reclaim once
 ///     the kernel's Phase-7 capability system has consumed them. The
 ///     slice is backed by a dedicated 4 KiB scratch page; that page is
 ///     itself the final entry in the array so the kernel reclaims it
@@ -54,7 +57,18 @@
 ///     pass (the AP SIPI trampoline page is the only such entry
 ///     today). All other bits remain reserved (producers MUST write
 ///     zero).
-pub const BOOT_PROTOCOL_VERSION: u32 = 7;
+/// v8: Removed `command_line` / `command_line_len` from `BootInfo` —
+///     boot-time configuration moves to GPT type-GUID partition discovery
+///     (vfsd-side) and compile-time defaults (ktest options). Added a
+///     `name: [u8; 32]` field to [`BootModule`] (NUL-padded) so init can
+///     match boot modules by identity instead of ordinal. Introduced the
+///     [`bundle`] module: bootloader-loaded modules and init are now
+///     packed into a single `\EFI\seraph\bootstrap.bundle` file on the
+///     ESP, identified inside the bundle by the same name string carried
+///     in `BootModule.name`. The entry named `"init"` is special-cased by
+///     the bootloader and pre-parsed as an ELF into [`BootInfo::init_image`];
+///     every other entry is exposed verbatim through `BootInfo::modules`.
+pub const BOOT_PROTOCOL_VERSION: u32 = 8;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -137,14 +151,30 @@ unsafe impl Sync for MemoryMapSlice {}
 
 // ── Boot modules ─────────────────────────────────────────────────────────────
 
+/// Maximum length of a [`BootModule::name`] (NUL-padded; the NUL terminator
+/// is part of the array, so usable name length is up to 32 bytes with no
+/// terminator implied beyond the array bound).
+///
+/// Matches [`bundle::BundleEntryHeader::name`] so the bootloader can copy
+/// the bundle entry's name verbatim into `BootModule.name`.
+pub const BOOT_MODULE_NAME_LEN: usize = 32;
+
 /// A boot module loaded by the bootloader (raw ELF image for early services).
 ///
-/// The module set is configured via `boot.conf`. Each module is an ELF
-/// executable for an early userspace service (procmgr, devmgr, drivers, etc.).
+/// The module set is sourced from the `\EFI\seraph\bootstrap.bundle` file
+/// on the ESP (see [`bundle`]). Each module is an ELF executable for an
+/// early userspace service (procmgr, devmgr, drivers, etc.). `name`
+/// carries the bundle entry's identifier so init can match modules by
+/// identity instead of position in the array.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BootModule
 {
+    /// Identifier copied verbatim from the bundle entry header, NUL-padded
+    /// to [`BOOT_MODULE_NAME_LEN`] bytes. The bundle's entry named `"init"`
+    /// is consumed by the bootloader as the userspace init image and does
+    /// not appear here; every other entry is exposed as a `BootModule`.
+    pub name: [u8; BOOT_MODULE_NAME_LEN],
     /// Physical base address of the module data.
     pub physical_base: u64,
     /// Size of the module data in bytes (file size, not page-rounded size).
@@ -153,9 +183,9 @@ pub struct BootModule
 
 /// A slice of [`BootModule`] values, passed by physical address.
 ///
-/// Contains raw ELF images for early services. The module set is configurable
-/// via `boot.conf`; minimum: procmgr, devmgr, one block driver, one FS driver,
-/// VFS. Optionally: net stack and additional drivers.
+/// Contains raw ELF images for early services. The module set is determined
+/// by the contents of `\EFI\seraph\bootstrap.bundle` minus the special
+/// `"init"` entry the bootloader consumes for [`BootInfo::init_image`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleSlice
@@ -561,7 +591,9 @@ pub struct BootInfo
 
     /// Additional boot modules (raw ELF images for early services).
     ///
-    /// The set of modules is configured via `boot.conf`.
+    /// The set of modules is sourced from the bootloader's
+    /// `bootstrap.bundle`; see the [`bundle`] module for the wire
+    /// format and the `init` entry name special-cased by the bootloader.
     pub modules: ModuleSlice,
 
     /// Framebuffer, if available. `physical_base == 0` means no framebuffer.
@@ -594,13 +626,6 @@ pub struct BootInfo
     /// by userspace. Replaces the per-device `PlatformResource` array from
     /// protocol versions 4 and 5.
     pub mmio_apertures: MmioApertureSlice,
-
-    /// Physical address of a null-terminated kernel command line string.
-    ///
-    /// May point to a single null byte if no command line was specified.
-    pub command_line: *const u8,
-    /// Length of the command line string in bytes, excluding the null terminator.
-    pub command_line_len: u64,
 
     // ── SMP fields (added in protocol version 4) ──────────────────────────────
     /// Number of logical CPUs present and usable.
@@ -692,11 +717,26 @@ mod tests
         assert_eq!(FramebufferInfo::empty().pixel_format, PixelFormat::Rgbx8);
     }
 
-    /// BOOT_PROTOCOL_VERSION must be 7 after the `reclaim_ranges` addition.
+    /// BOOT_PROTOCOL_VERSION must be 8 after removing `command_line` and
+    /// adding `BootModule::name` for bundle-based identity matching.
     #[test]
-    fn protocol_version_is_7()
+    fn protocol_version_is_8()
     {
-        assert_eq!(BOOT_PROTOCOL_VERSION, 7);
+        assert_eq!(BOOT_PROTOCOL_VERSION, 8);
+    }
+
+    /// `BootModule::name` is exactly [`BOOT_MODULE_NAME_LEN`] bytes wide so
+    /// the bundle entry header copies straight into the field with no
+    /// length renegotiation.
+    #[test]
+    fn boot_module_name_len_matches_field()
+    {
+        let m = BootModule {
+            name: [0u8; BOOT_MODULE_NAME_LEN],
+            physical_base: 0,
+            size: 0,
+        };
+        assert_eq!(m.name.len(), BOOT_MODULE_NAME_LEN);
     }
 
     /// `ReclaimRange` is 16 bytes: u64 + u32 + u32, no padding.

@@ -16,7 +16,6 @@
 
 mod acpi;
 mod arch;
-mod config;
 mod console;
 mod dtb;
 mod elf;
@@ -27,8 +26,7 @@ mod memory_map;
 mod paging;
 mod uefi;
 
-use crate::config::{BootConfig, MAX_MODULES, load_boot_config};
-use crate::elf::{KernelInfo, load_init, load_kernel, load_module};
+use crate::elf::{KernelInfo, load_init, load_kernel};
 use crate::error::BootError;
 use crate::firmware::{FirmwareInfo, discover_firmware};
 use crate::paging::{PageTableBuilder, build_initial_tables};
@@ -38,10 +36,37 @@ use crate::uefi::{
     get_memory_map, open_esp_volume, open_file, query_gop,
 };
 use boot_protocol::{
-    BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage, KernelMmio,
-    MAX_APERTURES, MAX_CPUS, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice, MmioAperture,
-    MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
+    BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage,
+    KernelMmio, MAX_APERTURES, MAX_CPUS, MAX_RECLAIM_RANGES, MemoryMapEntry, MemoryMapSlice,
+    MmioAperture, MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
+    bundle,
 };
+
+/// Maximum boot modules carried in [`BootInfo::modules`]. Sized to comfortably
+/// cover the current `procmgr, memmgr, devmgr, vfsd, virtio-blk, fatfs` set
+/// plus future additions before the bundle entry count exceeds the array.
+const MAX_MODULES: usize = 16;
+
+/// `\EFI\seraph\kernel` as a NUL-terminated UTF-16 path for
+/// `EFI_FILE_PROTOCOL.Open()`.
+#[rustfmt::skip]
+static KERNEL_PATH: [u16; 19] = [
+    b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
+    b's' as u16, b'e' as u16, b'r' as u16, b'a' as u16, b'p' as u16,
+    b'h' as u16, b'\\' as u16, b'k' as u16, b'e' as u16, b'r' as u16,
+    b'n' as u16, b'e' as u16, b'l' as u16, 0u16,
+];
+
+/// `\EFI\seraph\bootstrap.bundle` as a NUL-terminated UTF-16 path.
+#[rustfmt::skip]
+static BUNDLE_PATH: [u16; 29] = [
+    b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
+    b's' as u16, b'e' as u16, b'r' as u16, b'a' as u16, b'p' as u16,
+    b'h' as u16, b'\\' as u16, b'b' as u16, b'o' as u16, b'o' as u16,
+    b't' as u16, b's' as u16, b't' as u16, b'r' as u16, b'a' as u16,
+    b'p' as u16, b'.' as u16, b'b' as u16, b'u' as u16, b'n' as u16,
+    b'd' as u16, b'l' as u16, b'e' as u16, 0u16,
+];
 
 // ── Size constants ────────────────────────────────────────────────────────────
 
@@ -89,23 +114,35 @@ struct KernelLoad
     buf_pages: usize,
 }
 
-/// Init ELF load result with its read-buffer allocation, same shape as
-/// [`KernelLoad`].
+/// Init ELF load result. Pre-parsed via [`load_init`]; segment bodies live
+/// in their own UEFI allocations (referenced by `image.segments[].phys_addr`).
+/// The source ELF bytes are part of the single bundle allocation tracked in
+/// [`BundleLoad`], so no per-init read buffer is recorded here.
 struct InitLoad
 {
     image: InitImage,
-    buf_phys: u64,
-    buf_pages: usize,
 }
 
 /// Boot-module load results: a fixed-capacity array of [`BootModule`]
-/// descriptors plus the per-module read-buffer allocations.
+/// descriptors. Module bodies are slices of the bundle allocation (see
+/// [`BundleLoad`]); there is no per-module read buffer.
 struct ModulesLoad
 {
     modules: [BootModule; MAX_MODULES],
     count: usize,
-    buf_phys: [u64; MAX_MODULES],
-    buf_pages: [usize; MAX_MODULES],
+}
+
+/// Bundle load result: a single UEFI allocation holding the whole
+/// `\EFI\seraph\bootstrap.bundle` file. The parsed entry headers (kept as
+/// raw bytes) drive [`step4_parse_bundle`].
+struct BundleLoad
+{
+    /// Physical base of the UEFI allocation holding the bundle.
+    phys: u64,
+    /// Page count of the UEFI allocation (covers `len` bytes rounded up).
+    pages: usize,
+    /// Exact bundle file size in bytes.
+    len: u64,
 }
 
 /// CPU topology derived from firmware tables (MADT / DTB /cpus).
@@ -131,7 +168,6 @@ struct BootAllocations
     apertures_phys: u64,
     stack_phys: u64,
     stack_top: u64,
-    cmdline_phys: u64,
     ap_trampoline_phys: u64,
     /// Physical address of the dedicated 4 KiB page that backs
     /// `BootInfo.reclaim_ranges`. The bootloader allocates this page in
@@ -191,13 +227,11 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // SAFETY: caller guarantees image and st are the UEFI-provided handles.
     let ctx = unsafe { step1_locate_uefi_protocols(image, st)? };
     // SAFETY: ctx.esp_root is a valid FAT directory handle.
-    let cfg = unsafe { step2_load_boot_config(&ctx)? };
+    let bundle_load = unsafe { step2_load_bundle(&ctx)? };
     // SAFETY: ctx.bs / esp_root are valid until ExitBootServices.
-    let kernel = unsafe { step3_load_kernel(&ctx, &cfg)? };
-    // SAFETY: same validity window as step 3.
-    let init = unsafe { step4a_load_init(&ctx, &cfg)? };
-    // SAFETY: same validity window.
-    let mods = unsafe { step4b_load_modules(&ctx, &cfg)? };
+    let kernel = unsafe { step3_load_kernel(&ctx)? };
+    // SAFETY: bundle_load.phys/len name a valid identity-mapped UEFI allocation.
+    let (init, mods) = unsafe { step4_parse_bundle(&ctx, &bundle_load)? };
     // SAFETY: ctx.st is a valid UEFI system table.
     let firm = unsafe { step5_discover_firmware(&ctx) };
     // SAFETY: ctx.st is valid; firmware addresses are identity-mapped by UEFI.
@@ -206,7 +240,14 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     let ap_trampoline_phys = unsafe { step5b_alloc_ap_trampoline(&ctx) };
     // SAFETY: all prior unsafe outputs remain valid; step 6 allocates via bs.
     let (allocs, mut page_table) = unsafe {
-        step6_allocate_and_build_page_tables(&ctx, &cfg, &kernel, &init, &mods, ap_trampoline_phys)?
+        step6_allocate_and_build_page_tables(
+            &ctx,
+            &bundle_load,
+            &kernel,
+            &init,
+            &mods,
+            ap_trampoline_phys,
+        )?
     };
     // SAFETY: ctx.bs valid; step 7 is the last pre-exit allocation.
     let mut uefi_map = unsafe { step7_query_memory_map(&ctx)? };
@@ -219,7 +260,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // and retained in `Loaded`-classified regions per step 7.
     unsafe {
         step9_populate_boot_info(
-            &cfg,
+            &bundle_load,
             &kernel,
             &init,
             &mods,
@@ -301,17 +342,55 @@ unsafe fn step1_locate_uefi_protocols(
     })
 }
 
-// ── Step 2: Load boot configuration ──────────────────────────────────────────
+// ── Step 2: Load bundle ──────────────────────────────────────────────────────
 
-/// Read and parse `\EFI\seraph\boot.conf` from the ESP.
+/// Open `\EFI\seraph\bootstrap.bundle`, allocate one contiguous UEFI
+/// region big enough to hold the whole file, and read it in. The header
+/// is validated at the start of [`step4_parse_bundle`].
 ///
 /// # Safety
-/// `ctx.esp_root` must be a valid open `EFI_FILE_PROTOCOL` directory handle.
-unsafe fn step2_load_boot_config(ctx: &UefiContext) -> Result<BootConfig, BootError>
+/// `ctx.bs` and `ctx.esp_root` must be valid UEFI services / directory
+/// handles, pre-`ExitBootServices`.
+unsafe fn step2_load_bundle(ctx: &UefiContext) -> Result<BundleLoad, BootError>
 {
-    bprintln!("[--------] boot: step 2/10: load boot configuration");
-    // SAFETY: esp_root is a valid EFI_FILE_PROTOCOL directory handle.
-    unsafe { load_boot_config(ctx.esp_root) }
+    bprintln!("[--------] boot: step 2/10: load bootstrap.bundle");
+    // SAFETY: esp_root is a valid directory handle; path is null-terminated UTF-16.
+    let file = unsafe {
+        open_file(
+            ctx.esp_root,
+            BUNDLE_PATH.as_ptr(),
+            "\\EFI\\seraph\\bootstrap.bundle",
+        )?
+    };
+    // SAFETY: file is a valid open file handle.
+    // cast_possible_truncation: usize is 64-bit on every UEFI target Seraph supports.
+    #[allow(clippy::cast_possible_truncation)]
+    let len = unsafe { file_size(file)? } as usize;
+    if len == 0
+    {
+        return Err(BootError::InvalidBundle("bootstrap.bundle is empty"));
+    }
+    let pages = len.div_ceil(4096);
+    // SAFETY: bs is valid.
+    let phys = unsafe { allocate_pages(ctx.bs, pages)? };
+    // SAFETY: phys is a freshly allocated region of `pages * 4096 >= len` bytes,
+    // identity-mapped by UEFI. The slice covers exactly the file extent.
+    let buf = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, len) };
+    // SAFETY: file is open at position 0; buf is the correct size.
+    unsafe { file_read(file, buf)? };
+
+    bprint!("[--------] boot: bundle size=");
+    // SAFETY: console initialized.
+    unsafe {
+        crate::console::console_write_hex64(len as u64);
+    }
+    bprintln!(" bytes");
+
+    Ok(BundleLoad {
+        phys,
+        pages,
+        len: len as u64,
+    })
 }
 
 // ── Step 3: Load kernel ELF ──────────────────────────────────────────────────
@@ -320,14 +399,13 @@ unsafe fn step2_load_boot_config(ctx: &UefiContext) -> Result<BootConfig, BootEr
 ///
 /// # Safety
 /// `ctx.bs` and `ctx.esp_root` must be valid UEFI services and directory
-/// handle respectively. `cfg.kernel_path` must be a null-terminated UTF-16
-/// file name.
-unsafe fn step3_load_kernel(ctx: &UefiContext, cfg: &BootConfig) -> Result<KernelLoad, BootError>
+/// handle respectively.
+unsafe fn step3_load_kernel(ctx: &UefiContext) -> Result<KernelLoad, BootError>
 {
     bprintln!("[--------] boot: step 3/10: load kernel ELF");
     // SAFETY: esp_root is a valid directory handle; path is null-terminated UTF-16.
     let kernel_file =
-        unsafe { open_file(ctx.esp_root, cfg.kernel_path.as_ptr(), "kernel (boot.conf)")? };
+        unsafe { open_file(ctx.esp_root, KERNEL_PATH.as_ptr(), "\\EFI\\seraph\\kernel")? };
     // SAFETY: kernel_file is a valid open file handle.
     // File size is a u64 from UEFI; usize is 64-bit on all supported targets so cast is exact.
     #[allow(clippy::cast_possible_truncation)]
@@ -367,105 +445,125 @@ unsafe fn step3_load_kernel(ctx: &UefiContext, cfg: &BootConfig) -> Result<Kerne
     })
 }
 
-// ── Step 4a: Load and pre-parse init ELF ─────────────────────────────────────
+// ── Step 4: Parse bundle, pre-parse init ELF, collect modules ────────────────
 
-/// Load init's ELF image, parse its segments, and produce an `InitImage`.
+/// Walk the bundle header, ELF-load the entry named [`bundle::INIT_ENTRY_NAME`]
+/// into a fresh set of segment pages, and expose every other entry as a
+/// [`BootModule`] referencing the bundle allocation in place.
 ///
 /// # Safety
-/// Same validity requirements as [`step3_load_kernel`].
-unsafe fn step4a_load_init(ctx: &UefiContext, cfg: &BootConfig) -> Result<InitLoad, BootError>
+/// `bundle_load.phys`/`len` must name the UEFI allocation produced by
+/// [`step2_load_bundle`]; the bytes must remain valid until `step9` runs.
+/// `ctx.bs` must be valid pre-`ExitBootServices`.
+unsafe fn step4_parse_bundle(
+    ctx: &UefiContext,
+    bundle_load: &BundleLoad,
+) -> Result<(InitLoad, ModulesLoad), BootError>
 {
-    bprintln!("[--------] boot: step 4/10: load init ELF and boot modules");
-    // SAFETY: esp_root is a valid directory handle; path is null-terminated UTF-16.
-    let init_file = unsafe { open_file(ctx.esp_root, cfg.init_path.as_ptr(), "init (boot.conf)")? };
-    // SAFETY: init_file is a valid open file handle.
+    bprintln!("[--------] boot: step 4/10: parse bundle (init + modules)");
+
+    // SAFETY: bundle_load.phys names a valid identity-mapped UEFI allocation
+    // of `pages * 4096 >= len` bytes; we read exactly `len` bytes. usize is
+    // 64-bit on every UEFI target Seraph supports, so the len cast is exact.
     #[allow(clippy::cast_possible_truncation)]
-    let init_file_sz = unsafe { file_size(init_file)? } as usize;
-    let buf_pages = init_file_sz.div_ceil(4096);
-    // SAFETY: bs is valid.
-    let buf_phys = unsafe { allocate_pages(ctx.bs, buf_pages)? };
-    // SAFETY: buf_phys is a freshly allocated region; slice is within the allocation.
-    let init_buf = unsafe { core::slice::from_raw_parts_mut(buf_phys as *mut u8, init_file_sz) };
-    // SAFETY: init_file is open at position 0; init_buf is the correct size.
-    unsafe { file_read(init_file, init_buf)? };
-    // load_init allocates at any available physical address (not p_paddr) because
-    // init is a userspace ELF whose p_paddr values conflict with UEFI low-memory
-    // use. The kernel receives phys_addr+virt_addr pairs to map init without an
-    // ELF parser.
-    // SAFETY: bs is valid; init_buf contains the complete ELF file.
-    let image = unsafe { load_init(ctx.bs, init_buf, arch::current::EXPECTED_ELF_MACHINE)? };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(bundle_load.phys as *const u8, bundle_load.len as usize)
+    };
 
-    bprint!("[--------] boot: init entry=");
-    // SAFETY: console initialized.
-    unsafe {
-        crate::console::console_write_hex64(image.entry_point);
-    }
-    bprint!("  size=");
-    // SAFETY: console initialized.
-    unsafe {
-        crate::console::console_write_hex64(init_file_sz as u64);
-    }
-    bprintln!(" bytes");
+    let header = match bundle::parse_header(bytes)
+    {
+        Ok(h) => h,
+        Err(bundle::BundleError::TooSmall) =>
+        {
+            return Err(BootError::InvalidBundle("bundle truncated"));
+        }
+        Err(bundle::BundleError::BadMagic) =>
+        {
+            return Err(BootError::InvalidBundle("bundle magic mismatch"));
+        }
+        Err(bundle::BundleError::BadVersion) =>
+        {
+            return Err(BootError::InvalidBundle("bundle version mismatch"));
+        }
+        Err(bundle::BundleError::EntryOutOfBounds) =>
+        {
+            return Err(BootError::InvalidBundle("bundle entry out of bounds"));
+        }
+        Err(bundle::BundleError::EntryMisaligned) =>
+        {
+            return Err(BootError::InvalidBundle("bundle entry misaligned"));
+        }
+    };
 
-    Ok(InitLoad {
-        image,
-        buf_phys,
-        buf_pages,
-    })
-}
-
-// ── Step 4b: Load additional boot modules ────────────────────────────────────
-
-/// Load each boot module listed in `cfg.modules` as a flat binary image.
-///
-/// # Safety
-/// Same validity requirements as [`step3_load_kernel`].
-unsafe fn step4b_load_modules(ctx: &UefiContext, cfg: &BootConfig)
--> Result<ModulesLoad, BootError>
-{
+    let mut init_image: Option<InitImage> = None;
     let mut modules = [BootModule {
+        name: [0u8; BOOT_MODULE_NAME_LEN],
         physical_base: 0,
         size: 0,
     }; MAX_MODULES];
-    let mut buf_phys = [0u64; MAX_MODULES];
-    let mut buf_pages = [0usize; MAX_MODULES];
     let mut count: usize = 0;
 
-    for i in 0..cfg.module_count
+    for i in 0..header.entry_count
     {
-        // SAFETY: esp_root is valid; module_paths[i] is a null-terminated UTF-16 path.
-        let mod_file = unsafe {
-            open_file(
-                ctx.esp_root,
-                cfg.module_paths[i].as_ptr(),
-                "module (boot.conf)",
-            )?
-        };
-        // SAFETY: mod_file is a valid open file handle.
+        let entry = bundle::entry_at(bytes, i);
+        let name = bundle::name_str(&entry.name);
+        // usize is 64-bit on every UEFI target Seraph supports; parse_header
+        // already bounds-checked offset+size against `bytes.len()`.
         #[allow(clippy::cast_possible_truncation)]
-        let file_sz = unsafe { file_size(mod_file)? } as usize;
-        let pages = file_sz.div_ceil(4096);
-        // SAFETY: bs is valid.
-        let phys = unsafe { allocate_pages(ctx.bs, pages)? };
-        // SAFETY: phys is a freshly allocated region of pages*4096 bytes.
-        let mod_buf = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, file_sz) };
-        // SAFETY: mod_file is open at position 0; mod_buf is the correct size.
-        unsafe { file_read(mod_file, mod_buf)? };
-        // SAFETY: bs is valid; mod_buf contains the complete module file.
-        let module = unsafe { load_module(ctx.bs, mod_buf)? };
+        let body_start = entry.offset as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let body_end = body_start + entry.size as usize;
+        if body_end > bytes.len()
+        {
+            return Err(BootError::InvalidBundle("bundle body past file end"));
+        }
+        let body = &bytes[body_start..body_end];
 
-        buf_phys[i] = phys;
-        buf_pages[i] = pages;
-        modules[count] = module;
-        count += 1;
+        if name == bundle::INIT_ENTRY_NAME
+        {
+            if init_image.is_some()
+            {
+                return Err(BootError::InvalidBundle(
+                    "bundle has multiple `init` entries",
+                ));
+            }
+            // SAFETY: bs is valid; body is the complete ELF file slice.
+            let image = unsafe { load_init(ctx.bs, body, arch::current::EXPECTED_ELF_MACHINE)? };
+            init_image = Some(image);
+            bprint!("[--------] boot: init entry=");
+            // SAFETY: console initialized.
+            unsafe {
+                crate::console::console_write_hex64(image.entry_point);
+            }
+            bprint!("  size=");
+            // SAFETY: console initialized.
+            unsafe {
+                crate::console::console_write_hex64(entry.size);
+            }
+            bprintln!(" bytes");
+        }
+        else
+        {
+            if count >= MAX_MODULES
+            {
+                return Err(BootError::InvalidBundle(
+                    "bundle exceeds MAX_MODULES entries",
+                ));
+            }
+            modules[count] = BootModule {
+                name: entry.name,
+                // Bundle bodies are page-aligned (per `bundle::BODY_ALIGNMENT`),
+                // so this physical base is a valid 4 KiB-aligned address inside
+                // the bundle UEFI allocation.
+                physical_base: bundle_load.phys + entry.offset,
+                size: entry.size,
+            };
+            count += 1;
+        }
     }
 
-    Ok(ModulesLoad {
-        modules,
-        count,
-        buf_phys,
-        buf_pages,
-    })
+    let image = init_image.ok_or(BootError::InvalidBundle("bundle missing `init` entry"))?;
+    Ok((InitLoad { image }, ModulesLoad { modules, count }))
 }
 
 // ── Step 5: Firmware discovery ───────────────────────────────────────────────
@@ -610,16 +708,16 @@ unsafe fn step5b_alloc_ap_trampoline(ctx: &UefiContext) -> u64
 // ── Step 6: Allocate boot structures and build page tables ──────────────────
 
 /// Allocate the fixed pre-exit scratch pages (`BootInfo` page, modules
-/// descriptor page, memory-map page, aperture page, stack, command-line page),
-/// accumulate the identity-map region list, build initial page tables, and
-/// install the x86-64 handoff-trampoline mapping.
+/// descriptor page, memory-map page, aperture page, stack, reclaim-ranges
+/// page), accumulate the identity-map region list, build initial page
+/// tables, and install the x86-64 handoff-trampoline mapping.
 ///
 /// # Safety
 /// `ctx.bs` must be valid pre-exit; all addresses in `kernel`, `init`, and
 /// `mods` must come from their respective `step3`/`step4*` outputs.
 unsafe fn step6_allocate_and_build_page_tables(
     ctx: &UefiContext,
-    cfg: &BootConfig,
+    bundle: &BundleLoad,
     kernel: &KernelLoad,
     init: &InitLoad,
     mods: &ModulesLoad,
@@ -642,25 +740,6 @@ unsafe fn step6_allocate_and_build_page_tables(
     // SAFETY: bs is valid.
     let stack_phys = unsafe { allocate_pages(ctx.bs, KERNEL_STACK_PAGES)? };
     let stack_top = stack_phys + (KERNEL_STACK_PAGES as u64) * 4096;
-    // Command line.
-    // SAFETY: bs is valid.
-    let cmdline_phys = unsafe { allocate_pages(ctx.bs, 1)? };
-    if cfg.cmdline_len > 0
-    {
-        // SAFETY: cmdline_phys is a valid allocation; config.cmdline[..cmdline_len]
-        // is valid ASCII. Regions are disjoint (config is stack data).
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                cfg.cmdline.as_ptr(),
-                cmdline_phys as *mut u8,
-                cfg.cmdline_len,
-            );
-        }
-    }
-    // SAFETY: cmdline_phys + cmdline_len is within the 4096-byte allocation
-    // because MAX_CMDLINE_LEN (512) < 4096.
-    unsafe { core::ptr::write((cmdline_phys + cfg.cmdline_len as u64) as *mut u8, 0u8) };
-
     // Reclaim-array page: dedicated 4 KiB backing for BootInfo.reclaim_ranges.
     // SAFETY: bs is valid.
     let reclaim_array_phys = unsafe { allocate_pages(ctx.bs, 1)? };
@@ -672,7 +751,6 @@ unsafe fn step6_allocate_and_build_page_tables(
         apertures_phys,
         stack_phys,
         stack_top,
-        cmdline_phys,
         ap_trampoline_phys,
         reclaim_array_phys,
     };
@@ -681,10 +759,10 @@ unsafe fn step6_allocate_and_build_page_tables(
         [(0u64, 0u64); MAX_IDENTITY_REGIONS];
     let region_count = collect_identity_regions(
         &allocs,
+        bundle,
         kernel,
         init,
         mods,
-        cfg,
         &ctx.framebuffer,
         arch::current::uart_mmio_region(),
         &mut identity_regions,
@@ -702,15 +780,15 @@ unsafe fn step6_allocate_and_build_page_tables(
 /// kernel can access them before establishing its own page tables. Returns
 /// the number of filled entries; silently caps at [`MAX_IDENTITY_REGIONS`].
 // Each parameter names a distinct origin of an identity-mapped region
-// (kernel, init, modules, config, framebuffer, UART, fixed allocations);
+// (kernel, init, modules, bundle, framebuffer, UART, fixed allocations);
 // bundling them further hides where a region came from.
 #[allow(clippy::too_many_arguments)]
 fn collect_identity_regions(
     allocs: &BootAllocations,
+    bundle: &BundleLoad,
     kernel: &KernelLoad,
     init: &InitLoad,
-    mods: &ModulesLoad,
-    cfg: &BootConfig,
+    _mods: &ModulesLoad,
     framebuffer: &FramebufferInfo,
     uart_base: u64,
     out: &mut [(u64, u64); MAX_IDENTITY_REGIONS],
@@ -736,25 +814,18 @@ fn collect_identity_regions(
     push(allocs.modules_phys, 4096);
     push(allocs.mem_entries_phys, (MEM_MAP_ENTRY_PAGES as u64) * 4096);
     push(allocs.stack_phys, (KERNEL_STACK_PAGES as u64) * 4096);
-    push(allocs.cmdline_phys, 4096);
-    // Init segments.
+    // Init segments — segment bodies live in their own UEFI allocations,
+    // produced by `load_init` against the bundle slice for the `init` entry.
     for i in 0..(init.image.segment_count as usize)
     {
         let seg = &init.image.segments[i];
         push(seg.phys_addr, (seg.size + 4095) & !4095);
     }
-    // File read buffers (UEFI retains these allocations until ExitBootServices).
-    push(init.buf_phys, (init.buf_pages as u64) * 4096);
+    // Kernel file read buffer (UEFI retains the allocation until ExitBootServices).
     push(kernel.buf_phys, (kernel.buf_pages as u64) * 4096);
-    // Boot modules: both the read buffer (UEFI-retained) and the loaded region.
-    for i in 0..cfg.module_count
-    {
-        push(mods.buf_phys[i], (mods.buf_pages[i] as u64) * 4096);
-        push(
-            mods.modules[i].physical_base,
-            (mods.modules[i].size + 4095) & !4095,
-        );
-    }
+    // Bundle blob: one allocation covers every module body and the init
+    // ELF source bytes. Map once.
+    push(bundle.phys, (bundle.pages as u64) * 4096);
     // Framebuffer (if present).
     if framebuffer.physical_base != 0
     {
@@ -863,7 +934,7 @@ unsafe fn step8_exit_boot_services(
 // which sits between aperture derivation and the BootInfo write.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 unsafe fn step9_populate_boot_info(
-    cfg: &BootConfig,
+    bundle: &BundleLoad,
     kernel: &KernelLoad,
     init: &InitLoad,
     mods: &ModulesLoad,
@@ -983,12 +1054,23 @@ unsafe fn step9_populate_boot_info(
     {
         push_reclaim(frame, 1, 0);
     }
-    // Cmdline page: contents are snapshotted by the kernel into BSS in
-    // Phase 4, so the bootloader page becomes reclaim-safe by Phase 7.
-    if allocs.cmdline_phys != 0
-    {
-        push_reclaim(allocs.cmdline_phys, 1, 0);
-    }
+    // Bundle blob: NOT pushed as a single reclaim range. Module bodies
+    // are already covered by Frame caps minted in
+    // `cap::mint_module_frame_caps`, which call
+    // `register_owned_range` on each module's pages and create caps
+    // with `owns_memory = true`. Adding the whole bundle here would
+    // double-register those pages (inflating the buddy's `total_pages`)
+    // and produce two `owns_memory = true` caps over the same
+    // physical range, so any subsequent cap-destroy path that hits
+    // `dealloc_object → buddy.free_range` would double-free.
+    //
+    // The non-module portion of the bundle (header + entry table +
+    // init's ELF source bytes, which `load_init` has already copied
+    // out into separate segment allocations) is therefore leaked at
+    // boot — a small, bounded permanent waste. A future per-byte-range
+    // reclaim path can carve those ranges out of the bundle without
+    // overlapping the module Frame caps; tracked separately.
+    let _ = bundle;
     // AP SIPI trampoline page: kernel mints this through the late-reclaim
     // pass once SMP bringup completes and `mm::paging::unmap_identity_page`
     // has retired the low-VA identity mapping (installed on both arches by
@@ -1049,8 +1131,6 @@ unsafe fn step9_populate_boot_info(
                     },
                     count: aperture_count as u64,
                 },
-                command_line: allocs.cmdline_phys as *const u8,
-                command_line_len: cfg.cmdline_len as u64,
                 cpu_count: cpus.count.max(1),
                 bsp_id: cpus.bsp_id,
                 cpu_ids: cpus.cpu_ids,

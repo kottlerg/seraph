@@ -29,12 +29,22 @@ const SECTOR_SIZE: usize = 512;
 /// 512-byte sector (per the wire contract).
 const SECTOR_OFFSET_IN_FRAME: u64 = 0;
 
-/// A discovered GPT partition (UUID + LBA range).
+/// A discovered GPT partition.
+///
+/// `type_guid` is the role-identifying partition type GUID (e.g.
+/// `role_guids::SERAPH_ROOT_*`, or `gpt::partition_types::EFI` for the
+/// standard ESP type). `uuid` is the unique per-partition GUID and is
+/// retained for diagnostics. `attributes` carries the GPT attribute
+/// flags; bits 48-63 are the DPS priority used by
+/// [`lookup_partition_by_type_guid`] to break ties between multiple
+/// partitions claiming the same role.
 pub struct GptEntry
 {
+    pub type_guid: [u8; 16],
     pub uuid: [u8; 16],
     pub first_lba: u64,
     pub length_lba: u64,
+    pub attributes: u64,
     pub active: bool,
 }
 
@@ -43,9 +53,11 @@ impl GptEntry
     pub const fn empty() -> Self
     {
         Self {
+            type_guid: [0; 16],
             uuid: [0; 16],
             first_lba: 0,
             length_lba: 0,
+            attributes: 0,
             active: false,
         }
     }
@@ -192,7 +204,12 @@ fn read_and_validate_header(
     let part_entry_lba = u64::from_le_bytes(sector[72..80].try_into().unwrap_or([0; 8]));
     let num_parts = u32::from_le_bytes(sector[80..84].try_into().unwrap_or([0; 4]));
     let entry_size = u32::from_le_bytes(sector[84..88].try_into().unwrap_or([0; 4]));
-    if entry_size == 0 || entry_size > 512
+    // GPT spec mandates `entry_size >= 128` (and a power-of-two multiple of
+    // 128). `iter_entries` reads up to 56 bytes per entry (type GUID,
+    // unique GUID, first/last LBA, attributes); a malformed `entry_size`
+    // below 56 would index past the per-sector buffer and panic the vfsd
+    // worker thread. Anchor on the spec minimum.
+    if !(128..=512).contains(&entry_size)
     {
         return Err(GptError::InvalidEntrySize);
     }
@@ -246,22 +263,35 @@ fn iter_entries(
                 break;
             }
             let off = (e * header.entry_size) as usize;
-            let first_lba =
-                u64::from_le_bytes(sector[off + 32..off + 40].try_into().unwrap_or([0; 8]));
-            let last_lba =
-                u64::from_le_bytes(sector[off + 40..off + 48].try_into().unwrap_or([0; 8]));
-            if first_lba == 0 || last_lba < first_lba
+            // GPT-spec unused-entry marker: type-GUID is all zeros. Safer
+            // than the legacy `first_lba == 0` heuristic.
+            let mut type_guid = [0u8; 16];
+            type_guid.copy_from_slice(&sector[off..off + 16]);
+            if type_guid.iter().all(|&b| b == 0)
             {
                 entries_checked += 1;
                 continue;
             }
             let mut uuid = [0u8; 16];
             uuid.copy_from_slice(&sector[off + 16..off + 32]);
+            let first_lba =
+                u64::from_le_bytes(sector[off + 32..off + 40].try_into().unwrap_or([0; 8]));
+            let last_lba =
+                u64::from_le_bytes(sector[off + 40..off + 48].try_into().unwrap_or([0; 8]));
+            let attributes =
+                u64::from_le_bytes(sector[off + 48..off + 56].try_into().unwrap_or([0; 8]));
+            if last_lba < first_lba
+            {
+                entries_checked += 1;
+                continue;
+            }
             let length_lba = last_lba - first_lba + 1;
             parts[found] = GptEntry {
+                type_guid,
                 uuid,
                 first_lba,
                 length_lba,
+                attributes,
                 active: true,
             };
             std::os::seraph::log!(
@@ -296,20 +326,62 @@ pub fn parse_gpt(
     Ok(found)
 }
 
-/// Look up a partition UUID in the GPT table.
-///
-/// Returns `Some((first_lba, length_lba))` for an active match, `None` otherwise.
-pub fn lookup_partition_by_uuid(
-    uuid: &[u8; 16],
-    parts: &[GptEntry; MAX_GPT_PARTS],
-) -> Option<(u64, u64)>
+/// Failure modes for [`lookup_partition_by_type_guid`].
+pub enum GptLookupError
 {
-    for p in parts
+    /// No active partition carries the requested type GUID.
+    NotFound,
+    /// Two or more active partitions claim the same type GUID with
+    /// equal DPS priority (attribute bits 48-63). Per the boot-shape
+    /// design (decision 6 in the implementation plan), the bootloader
+    /// halts the boot rather than picking an arbitrary winner.
+    DuplicateTie,
+}
+
+/// Look up a partition by GPT type GUID using DPS-style priority
+/// tie-breaking. Returns `Ok((first_lba, length_lba))` for the
+/// highest-priority active match, `Err(GptLookupError)` otherwise.
+///
+/// "Priority" is bits 48-63 of the partition attribute u64 (the upper
+/// 16 bits), per the Discoverable Partitions Specification convention.
+/// Higher priority wins; an exact tie between two or more partitions
+/// is a fatal configuration error.
+pub fn lookup_partition_by_type_guid(
+    type_guid: &[u8; 16],
+    parts: &[GptEntry; MAX_GPT_PARTS],
+) -> Result<(u64, u64), GptLookupError>
+{
+    let mut best: Option<(usize, u16)> = None;
+    let mut tied = false;
+    for (i, p) in parts.iter().enumerate()
     {
-        if p.active && p.uuid == *uuid
+        if !p.active || &p.type_guid != type_guid
         {
-            return Some((p.first_lba, p.length_lba));
+            continue;
+        }
+        // clippy::cast_possible_truncation: explicit shift+mask narrows to 16 bits.
+        #[allow(clippy::cast_possible_truncation)]
+        let priority = ((p.attributes >> 48) & 0xFFFF) as u16;
+        match best
+        {
+            None => best = Some((i, priority)),
+            Some((_, b)) if priority > b =>
+            {
+                best = Some((i, priority));
+                tied = false;
+            }
+            Some((_, b)) if priority == b =>
+            {
+                tied = true;
+            }
+            _ =>
+            {}
         }
     }
-    None
+    if tied
+    {
+        return Err(GptLookupError::DuplicateTie);
+    }
+    best.map(|(i, _)| (parts[i].first_lba, parts[i].length_lba))
+        .ok_or(GptLookupError::NotFound)
 }

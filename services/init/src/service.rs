@@ -377,7 +377,7 @@ pub fn create_devmgr_with_caps(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    let devmgr_frame_cap = info.module_frame_base + 1;
+    let devmgr_frame_cap = crate::find_module_by_name(info, b"devmgr")?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -502,7 +502,7 @@ pub fn create_devmgr_with_caps(
 
     // SVCMGR_BUNDLE is unconditionally the terminal round; every prior
     // round therefore sets `done=false` regardless of what follows.
-    let has_module = info.module_frame_count > 3;
+    let virtio_blk_module = crate::find_module_by_name(info, b"virtio-blk");
 
     // ── Aperture rounds ─────────────────────────────────────────────────
     let mut idx = 0;
@@ -576,10 +576,9 @@ pub fn create_devmgr_with_caps(
         idx = batch_end;
     }
 
-    // ── Module round (virtio-blk = module 3) ────────────────────────────
-    if has_module
+    // ── Module round (virtio-blk) ───────────────────────────────────────
+    if let Some(module_cap) = virtio_blk_module
     {
-        let module_cap = info.module_frame_base + 3;
         let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
         else
         {
@@ -956,7 +955,7 @@ pub fn create_vfsd_with_caps(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    let vfsd_frame_cap = info.module_frame_base + 2;
+    let vfsd_frame_cap = crate::find_module_by_name(info, b"vfsd")?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
@@ -1031,13 +1030,10 @@ pub fn create_vfsd_with_caps(
     }
 
     // Round 2: fatfs module.
-    let fatfs_cap = if info.module_frame_count > 4
+    let fatfs_cap = match crate::find_module_by_name(info, b"fatfs")
     {
-        syscall::cap_derive(info.module_frame_base + 4, syscall::RIGHTS_ALL).unwrap_or(0)
-    }
-    else
-    {
-        0
+        Some(slot) => syscall::cap_derive(slot, syscall::RIGHTS_ALL).unwrap_or(0),
+        None => 0,
     };
 
     let _ = serve(

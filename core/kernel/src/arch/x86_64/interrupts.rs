@@ -527,13 +527,14 @@ pub fn disable() -> bool
 {
     let rflags: u64;
     // SAFETY: pushfq/cli are always safe at ring 0; disables interrupts via x86 primitives.
+    // `nostack` is intentionally absent: `pushfq` writes 8 bytes below RSP.
+    // See `cpu::save_and_disable_interrupts` for the full rationale.
     unsafe {
         core::arch::asm!(
             "pushfq",
             "pop {0}",
             "cli",
             out(reg) rflags,
-            options(nostack),
         );
     }
     rflags & (1 << 9) != 0 // IF is bit 9
@@ -557,12 +558,13 @@ pub fn are_enabled() -> bool
 {
     let rflags: u64;
     // SAFETY: pushfq is always safe at ring 0; reads RFLAGS non-destructively.
+    // `nostack` is intentionally absent: `pushfq` writes 8 bytes below RSP.
+    // See `cpu::save_and_disable_interrupts` for the full rationale.
     unsafe {
         core::arch::asm!(
             "pushfq",
             "pop {0}",
             out(reg) rflags,
-            options(nostack),
         );
     }
     rflags & (1 << 9) != 0

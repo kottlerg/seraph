@@ -76,6 +76,7 @@ Overall project design documents live in [`docs/`](docs/):
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
 - [Namespace Model](docs/namespace-model.md) — node capabilities, per-entry rights and visibility, walking, sandboxing as cap-distribution
+- [Storage](docs/storage.md) — composition of vfsd, fs drivers, and block drivers; GPT role-GUID discovery; mount lifecycle
 - [System Bootstrap](docs/bootstrap.md) — end-to-end boot lifecycle summary (bootloader steps, kernel phases, init bootstrap)
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr, driver binding, DMA safety
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands

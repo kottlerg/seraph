@@ -205,4 +205,4 @@ seeing different roots) and `cap_revoke`-driven unmount.
 
 ## Summarized By
 
-[services/vfsd/README.md](../README.md)
+[services/vfsd/README.md](../README.md), [docs/storage.md](../../../docs/storage.md)

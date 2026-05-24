@@ -142,6 +142,12 @@ pub struct TestContext
     /// `x86_64`).
     pub cspace_cap: u32,
 
+    /// ktest's own `Thread` capability slot (CONTROL right), provided by
+    /// the kernel via `InitInfo::thread_cap`. Tests that need to pin the
+    /// harness thread to a specific CPU or adjust its priority for the
+    /// duration of a test use this cap.
+    pub thread_cap: u32,
+
     /// Pointer to the registered IPC buffer page (4 KiB, page-aligned).
     ///
     /// Registered with `ipc_buffer_set` before any tests run. Passed into
@@ -271,6 +277,7 @@ fn run(info_ptr: u64) -> !
     let ctx = TestContext {
         aspace_cap,
         cspace_cap: info.cspace_cap,
+        thread_cap: info.thread_cap,
         ipc_buf: ipc_buf_ptr,
         memory_frame_base: info.memory_frame_base,
         sbi_control_cap: info.sbi_control_cap,

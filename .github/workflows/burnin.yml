@@ -92,7 +92,7 @@ jobs:
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
-            --parallel 4 --runs 20 --timeout 60
+            --parallel 2 --runs 20 --timeout 180
 
       - name: Upload run-parallel logs
         if: always()

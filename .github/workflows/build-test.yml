@@ -89,8 +89,8 @@ jobs:
 
       - name: Stage ${{ matrix.tester }} and repack disk
         # Recipe staging: svctest and usertest live in
-        # `sysroot/etc/svcmgr/tests.d/` (svcmgr does not scan that
-        # directory); cp into services.d/ to enable. `cargo xtask mkdisk`
+        # `sysroot/config/svcmgr/tests/` (svcmgr does not scan that
+        # directory); cp into services/ to enable. `cargo xtask mkdisk`
         # re-mirrors rootfs and repacks the FAT image without invoking
         # cargo. ktest swaps the bundle's `init` entry via
         # `cargo xtask compose-bundle --harness ktest`, which repacks
@@ -98,13 +98,13 @@ jobs:
         run: |
           case "${{ matrix.tester }}" in
             svctest)
-              cp sysroot/etc/svcmgr/tests.d/svctest.svc \
-                 sysroot/etc/svcmgr/services.d/
+              cp sysroot/config/svcmgr/tests/svctest.svc \
+                 sysroot/config/svcmgr/services/
               cargo xtask mkdisk --arch ${{ matrix.arch }}
               ;;
             usertest)
-              cp sysroot/etc/svcmgr/tests.d/usertest.svc \
-                 sysroot/etc/svcmgr/services.d/
+              cp sysroot/config/svcmgr/tests/usertest.svc \
+                 sysroot/config/svcmgr/services/
               cargo xtask mkdisk --arch ${{ matrix.arch }}
               ;;
             ktest)

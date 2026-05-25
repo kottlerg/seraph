@@ -473,7 +473,7 @@ fn run(info_ptr: u64) -> !
     // log_ep) are satisfied so init's own subsequent log lines ride IPC
     // through the mediator instead of direct serial.
     //
-    // Real `logd` (loaded from `/bin/logd` at the end of Phase 2,
+    // Real `logd` (loaded from `/services/logd` at the end of Phase 2,
     // post-root-mount) takes over the receive side via the
     // `log_labels::HANDOVER_PULL` exchange — see
     // `service::create_and_start_logd` and
@@ -856,7 +856,7 @@ fn run(info_ptr: u64) -> !
     //
     // Spawned at the end of Phase 2 (after root mount, with
     // system_root_cap in hand) so logd can be walked from
-    // `/bin/logd`. Hands over the master log endpoint via
+    // `/services/logd`. Hands over the master log endpoint via
     // `HANDOVER_PULL` IPC inside logd's bootstrap; init-logd's
     // receive loop self-terminates after replying the final chunk.
     // From here on the same kernel endpoint object carries every

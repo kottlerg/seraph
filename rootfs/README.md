@@ -13,11 +13,19 @@ directly to their sysroot destinations, not via this tree.
 
 ```
 rootfs/
-  srv/
-    test.txt          # Sample service-data file
-  svctest/
-    large.bin         # Data file consumed by the svctest harness
+  config/
+    svcmgr/
+      services/       # `.svc` recipes svcmgr scans at handover
+        *.svc
+      tests/          # Opt-in test-harness recipes; staged by hand
+        *.svc
+  data/
+    test.txt          # Marker fixture for svctest fs / namespace phases
 ```
+
+xtask synthesises additional data fixtures at build time directly into
+the sysroot at `sysroot/data/svctest/{large.bin, bench.bin}`; they are
+not stored under `rootfs/` since they are deterministic build artifacts.
 
 The bootloader's `bootstrap.bundle` (which now carries every userspace
 binary the system needs to boot) is composed by `cargo xtask build`

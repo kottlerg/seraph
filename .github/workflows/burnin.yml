@@ -76,7 +76,7 @@ jobs:
         # sysroot/esp/EFI/seraph/bootstrap.bundle with the single-entry
         # ktest bundle and repacks disk.img. No cargo rebuild is needed
         # because the ktest binary was produced by the earlier
-        # `cargo xtask build` and lives at sysroot/services/ktest.
+        # `cargo xtask build` and lives at sysroot/tests/ktest.
         run: |
           cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
 

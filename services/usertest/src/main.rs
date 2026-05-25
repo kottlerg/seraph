@@ -7,7 +7,7 @@
 //!
 //! Walks `/tests/programs/`, spawns each entry as a child process, and
 //! reports a pass/fail verdict from the child's exit status. Each child
-//! (per-program tester) drives its target `/bin/<name>` through that
+//! (per-program tester) drives its target `/programs/<name>` through that
 //! program's real I/O surface; see [docs/testing.md](../../../docs/testing.md)
 //! for the protocol.
 

@@ -4,7 +4,7 @@ Service supervisor and discovery registry. Started by init before
 init exits; runs for the lifetime of the system. svcmgr is a
 self-driven process: it spawns into an already-running system (root
 mounted; vfsd, procmgr, devmgr, fs/block drivers up), reads service
-*definitions* from `/etc/svcmgr/services.d/`, and reconciles them
+*definitions* from `/config/svcmgr/services/`, and reconciles them
 against init's pending `REGISTER_SERVICE` announcements to either
 supervise the running instance or launch a fresh one.
 
@@ -62,7 +62,7 @@ svcmgr/
   criticality, namespace shape, seed names) live on disk, not on the
   wire — see [docs/service-definitions.md](docs/service-definitions.md).
 - **Reconciliation** — at `HANDOVER_COMPLETE` scan
-  `/etc/svcmgr/services.d/`, parse each `<name>.svc`, and pair it
+  `/config/svcmgr/services/`, parse each `<name>.svc`, and pair it
   with the pending-registration table. Three outcomes: `bind only`
   (registered AND defined), `launching` (defined only),
   `registered without definition` (registered AND no recipe → hard
@@ -90,16 +90,16 @@ svcmgr/
 ## Namespace authority
 
 Init spawns svcmgr with the **universal** `system_root_cap` (post-#21).
-svcmgr reads `/etc/svcmgr/services.d/*.svc` directly via `std::fs`,
+svcmgr reads `/config/svcmgr/services/*.svc` directly via `std::fs`,
 walks the recipe's `binary` path for first-launch, and applies per-service
 namespace attenuation from each `.svc` `namespace = ...` line via
 `procmgr_labels::CONFIGURE_NAMESPACE`. Restart-time attenuation reads
 the same `ServiceEntry`-stored policy that reconcile installed.
 
-svcmgr scans only `services.d/`. The sibling directory
-`/etc/svcmgr/tests.d/` holds opt-in test-harness recipes; svcmgr never
-reads it. The test gating contract — copy a `tests.d/<harness>.svc` into
-`services.d/` between build and run — is owned by
+svcmgr scans only `/config/svcmgr/services/`. The sibling directory
+`/config/svcmgr/tests/` holds opt-in test-harness recipes; svcmgr never
+reads it. The test gating contract — copy a `tests/<harness>.svc` into
+`services/` between build and run — is owned by
 [docs/testing.md](../../docs/testing.md).
 
 ---
@@ -117,7 +117,7 @@ env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
 critical  = low
 namespace = universal
-cwd       = /srv
+cwd       = /data
 seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 ```
 

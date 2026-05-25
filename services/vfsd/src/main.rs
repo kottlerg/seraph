@@ -230,7 +230,7 @@ fn main() -> !
     };
 
     // Vfsd-internal system-root cap. Used for vfsd's own walks (e.g.
-    // resolving `/bin/fatfs` before a worker spawns a fresh fatfs
+    // resolving `/services/fs/fatfs` before a worker spawns a fresh fatfs
     // instance via procmgr `CREATE_FROM_FILE`). Mirrors the cap shape
     // returned by `GET_SYSTEM_ROOT_CAP` to external callers.
     let token = namespace_protocol::pack(
@@ -305,7 +305,7 @@ pub struct VfsdRuntime
     /// Tokened SEND on `namespace_ep` addressing the synthetic root at
     /// full namespace rights. Vfsd's own copy of the system-root cap,
     /// minted at boot. Used by worker threads to walk the namespace
-    /// (e.g. resolving `/bin/fatfs`) before issuing
+    /// (e.g. resolving `/services/fs/fatfs`) before issuing
     /// `procmgr_labels::CREATE_FROM_FILE`.
     pub system_root_cap: u32,
     /// Synthetic system-root backend. Service handlers append entries
@@ -807,7 +807,7 @@ fn do_mount_internal(
     };
 
     // First MOUNT (root) consumes the boot module cap; later mounts pass 0
-    // and the spawn path walks vfsd's own system-root cap to /bin/fatfs
+    // and the spawn path walks vfsd's own system-root cap to /services/fs/fatfs
     // and uses procmgr `CREATE_FROM_FILE` via a worker. Hold the lock
     // only across the swap so other handlers can read it (and observe
     // 0) immediately.

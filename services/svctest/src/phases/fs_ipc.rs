@@ -120,7 +120,7 @@ pub fn fs_release_on_close_phase(_: &Caps)
 {
     use std::io::Read;
 
-    let path = "/svctest/large.bin";
+    let path = "/data/svctest/large.bin";
 
     for iter in 0..8u32
     {
@@ -154,9 +154,9 @@ pub fn fs_crossover_bench_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/bin/fsbench")
+    let mut child = Command::new("/programs/fsbench")
         .spawn()
-        .expect("spawn /bin/fsbench failed");
+        .expect("spawn /programs/fsbench failed");
     let status = child.wait().expect("fsbench wait failed");
     assert!(status.success(), "fsbench did not exit cleanly: {status}");
     std::os::seraph::log!("fs_crossover_bench phase passed");
@@ -176,12 +176,12 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let (srv_cap, _kind, _) = ns_lookup(system_root_cap, b"srv", 0xFFFF, ipc_buf)
-        .expect("fs_rights_attenuation: NS_LOOKUP /srv failed");
+    let (data_cap, _kind, _) = ns_lookup(system_root_cap, b"data", 0xFFFF, ipc_buf)
+        .expect("fs_rights_attenuation: NS_LOOKUP /data failed");
 
     let stat_only = u64::from(rights::STAT);
-    let (stat_cap, _kind, _) = ns_lookup(srv_cap, b"test.txt", stat_only, ipc_buf)
-        .expect("fs_rights_attenuation: NS_LOOKUP /srv/test.txt (STAT) failed");
+    let (stat_cap, _kind, _) = ns_lookup(data_cap, b"test.txt", stat_only, ipc_buf)
+        .expect("fs_rights_attenuation: NS_LOOKUP /data/test.txt (STAT) failed");
 
     let read_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ)
         .word(0, 0)
@@ -230,8 +230,8 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
 
     let _ = syscall::cap_delete(stat_cap);
 
-    let (empty_cap, _kind, _) = ns_lookup(srv_cap, b"test.txt", 0, ipc_buf)
-        .expect("fs_rights_attenuation: NS_LOOKUP /srv/test.txt (empty) failed");
+    let (empty_cap, _kind, _) = ns_lookup(data_cap, b"test.txt", 0, ipc_buf)
+        .expect("fs_rights_attenuation: NS_LOOKUP /data/test.txt (empty) failed");
     let release_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_FRAME)
         .word(0, 1)
         .build();
@@ -249,8 +249,8 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
     std::os::seraph::log!("fs_rights_attenuation: FS_RELEASE_FRAME rejected on empty-rights cap");
     let _ = syscall::cap_delete(empty_cap);
 
-    let (full_cap, _kind, _) = ns_lookup(srv_cap, b"test.txt", 0xFFFF, ipc_buf)
-        .expect("fs_rights_attenuation: NS_LOOKUP /srv/test.txt (full) failed");
+    let (full_cap, _kind, _) = ns_lookup(data_cap, b"test.txt", 0xFFFF, ipc_buf)
+        .expect("fs_rights_attenuation: NS_LOOKUP /data/test.txt (full) failed");
 
     let read_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ)
         .word(0, 0)
@@ -272,7 +272,7 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
     );
 
     let _ = syscall::cap_delete(full_cap);
-    let _ = syscall::cap_delete(srv_cap);
+    let _ = syscall::cap_delete(data_cap);
     std::os::seraph::log!("fs_rights_attenuation phase passed");
 }
 
@@ -484,7 +484,7 @@ pub fn fs_write_frame_phase(_: &Caps)
     let _ = syscall::mem_unmap(info.self_aspace, va, 1);
     let _ = syscall::cap_delete(file_cap);
 
-    let mut f = std::fs::File::open("/svctest/wrtf.bin").expect("open wrtf.bin");
+    let mut f = std::fs::File::open("/data/svctest/wrtf.bin").expect("open wrtf.bin");
     let mut buf = vec![0u8; WRITE_LEN];
     let mut total = 0;
     while total < WRITE_LEN
@@ -552,8 +552,11 @@ pub fn fs_write_invariants_phase(_: &Caps)
 
         let root = std::os::seraph::root_dir_cap();
         let restricted_rights = u64::from(rights::LOOKUP | rights::MUTATE_DIR);
-        let (parent_attenuated, _, _) = ns_lookup(root, b"svctest", restricted_rights, ipc_buf)
-            .expect("ns_lookup svctest attenuated");
+        let (data_cap, _, _) =
+            ns_lookup(root, b"data", 0xFFFF, ipc_buf).expect("ns_lookup /data for attenuated walk");
+        let (parent_attenuated, _, _) = ns_lookup(data_cap, b"svctest", restricted_rights, ipc_buf)
+            .expect("ns_lookup /data/svctest attenuated");
+        let _ = syscall::cap_delete(data_cap);
 
         let (child_cap, _) = fs_create(parent_attenuated, scratch_name, ipc_buf)
             .expect("FS_CREATE through attenuated parent should succeed");
@@ -685,20 +688,20 @@ pub fn fs_open_relative_phase(_: &Caps)
         std::env::current_dir().expect_err("std::env::current_dir() pre-set should still fail");
     assert_eq!(pre_err.kind(), std::io::ErrorKind::Unsupported);
 
-    std::os::seraph::set_current_dir("/srv").expect("set_current_dir(/srv) failed");
+    std::os::seraph::set_current_dir("/data").expect("set_current_dir(/data) failed");
     assert_ne!(std::os::seraph::current_dir_cap(), 0);
 
     assert_eq!(
         std::env::current_dir().expect("std::env::current_dir after cap-native set"),
-        std::path::PathBuf::from("/srv"),
+        std::path::PathBuf::from("/data"),
         "std::env::current_dir disagrees with cap-native set_current_dir",
     );
 
-    std::env::set_current_dir("/srv").expect("std::env::set_current_dir(/srv) failed");
+    std::env::set_current_dir("/data").expect("std::env::set_current_dir(/data) failed");
     assert_ne!(std::os::seraph::current_dir_cap(), 0);
     assert_eq!(
         std::env::current_dir().expect("std::env::current_dir after std-env set"),
-        std::path::PathBuf::from("/srv"),
+        std::path::PathBuf::from("/data"),
     );
 
     let mut f = File::open("test.txt").expect("relative open after set_current_dir failed");
@@ -706,7 +709,7 @@ pub fn fs_open_relative_phase(_: &Caps)
     f.read_to_string(&mut buf).expect("relative read failed");
     assert!(!buf.is_empty(), "relative open returned empty file");
 
-    let abs_meta = File::open("/srv/test.txt")
+    let abs_meta = File::open("/data/test.txt")
         .expect("absolute open after set_current_dir failed")
         .metadata()
         .expect("absolute metadata failed");

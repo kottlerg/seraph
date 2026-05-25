@@ -147,10 +147,10 @@ LBA.
 ### First-mount structural constraint
 
 The first fatfs process is spawned from the boot-module cap, not via
-the namespace. `/bin/fatfs` is unreachable until root mounts, so the
+the namespace. `/services/fs/fatfs` is unreachable until root mounts, so the
 fatfs that brings root online cannot be spawned from disk —
 chicken-and-egg. Subsequent fs-driver respawns walk vfsd's own
-held system-root cap to `/bin/fatfs` and pass the resulting file cap
+held system-root cap to `/services/fs/fatfs` and pass the resulting file cap
 to procmgr via `CREATE_FROM_FILE`. The first-mount path is permanent
 by structure.
 
@@ -194,7 +194,7 @@ The supported failure-handling primitives are:
   reinstall the new root cap. Other mounts are unaffected; the
   block driver is unaffected. The respawn path uses
   `CREATE_FROM_FILE` against vfsd's own held system-root cap walked
-  to `/bin/<driver>`.
+  to `/services/<driver>`.
 - **Mount-tree-wide revocation.** `cap_revoke` on an fs driver's
   namespace endpoint cascades through the kernel derivation graph
   and invalidates every cap ever derived from it: the synthetic-

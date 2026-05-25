@@ -122,19 +122,35 @@ sysroot/
                           # one of {init, ktest} appears as the
                           # bundle's `init` entry; ktest is monolithic
                           # so its bundle has zero module entries.
-  services/               # Canonical home for bootloader-loaded userspace
-                          # components (init, ktest, procmgr, memmgr,
-                          # devmgr, vfsd, virtio-blk, fatfs). The bundle
-                          # composer reads from here; fatfs is also
-                          # available at /bin/fatfs for VFS-loaded
-                          # respawn until #125's rename.
-  bin/                    # Std-userspace binaries loaded by procmgr from
-                          # the root partition via VFS at runtime
-                          # (svcmgr, fatfs, svctest, hello, crasher,
-                          # stackoverflow, pipefault, stdiotest, …)
+  services/               # Long-running userspace components sourced
+                          # from services/ in the repo tree (init,
+                          # procmgr, memmgr, devmgr, vfsd, svcmgr, logd,
+                          # pwrmgr, timed). The bundle composer reads
+                          # from this tree.
+  services/drivers/       # Device drivers sourced from
+                          # services/drivers/<x>/ (cmos-rtc on x86-64,
+                          # goldfish-rtc on RISC-V, virtio-blk).
+                          # Grouped to anticipate per-spawner namespace
+                          # attenuation.
+  services/fs/            # Filesystem drivers sourced from
+                          # services/fs/<x>/ (fatfs today). VFS-loaded
+                          # respawns walk /services/fs/<name>.
+  programs/               # Userspace utilities and test programs sourced
+                          # from programs/ in the repo tree (hello,
+                          # crasher, fsbench, stackoverflow, pipefault,
+                          # stdiotest). Loaded by procmgr from the root
+                          # partition via VFS at runtime.
+  tests/                  # All test artifacts: kernel-surface harness
+                          # (ktest), services-surface (svctest),
+                          # programs-surface orchestrator (usertest).
+                          # Deleting this tree strips the system to a
+                          # non-test distro shape.
+  tests/programs/         # Per-program tester binaries discovered by
+                          # the usertest orchestrator.
   config/                 # System configuration (from rootfs/)
-  srv/                    # Service data files (from rootfs/)
-  svctest/                # Svctest data files (from rootfs/)
+  data/                   # Data files used by fs / namespace tests
+                          # (from rootfs/), plus svctest scratch space
+                          # synthesised under data/svctest/.
 ```
 
 The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
@@ -142,17 +158,20 @@ The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
 services live alongside it under `EFI/seraph/`, the Seraph vendor directory
 within the EFI partition.
 
-Non-ESP directories (`bin/`, `config/`, `srv/`, `svctest/`) populate the
-GPT image's root partition, which userspace services mount via vfsd /
-fatfs after boot. The split mirrors real deployments: anything the
-firmware must reach lives on the ESP; everything else lives on the root
-partition.
+Non-ESP directories (`services/`, `programs/`, `tests/`, `config/`,
+`data/`) populate the GPT image's root partition, which userspace
+services mount via vfsd / fatfs after boot. The split mirrors real
+deployments: anything the firmware must reach lives on the ESP;
+everything else lives on the root partition.
 
 The `esp/` and root-partition trees are populated from two sources:
 
 - Compiled binaries are installed by `cargo xtask build` to their
   destinations (`esp/EFI/seraph/<name>` for boot modules,
-  `bin/<name>` for std-userspace services, both for `fatfs`).
+  `services/<name>`, `services/drivers/<name>`,
+  `services/fs/<name>`, or `programs/<name>` for std-userspace
+  binaries, `tests/<name>` or `tests/programs/<name>` for harness
+  binaries and per-program testers).
 - Static files in [`rootfs/`](../rootfs/) are mirrored directly into
   the sysroot — every file's path under `rootfs/` is its path under
   `sysroot/` (see [`rootfs/README.md`](../rootfs/README.md)).

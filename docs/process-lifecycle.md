@@ -117,7 +117,7 @@ RTC driver, timed, and pwrmgr — by IPC to procmgr's
 init delegates the appropriate capability subset (see
 [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution"). svcmgr is configured with the universal
-`system_root_cap` so it can read `/etc/svcmgr/services.d/*.svc`
+`system_root_cap` so it can read `/config/svcmgr/services/*.svc`
 post-handover.
 
 Init then publishes well-known caps into svcmgr's discovery
@@ -128,14 +128,14 @@ registry (`ipc::published_names::ROOTFS_ROOT`,
 it bootstrapped with svcmgr via the v3 `REGISTER_SERVICE` wire
 (name + thread cap): `memmgr`, `procmgr`, `devmgr`, `vfsd`, `logd`,
 `timed`, `pwrmgr`. Recipes for all svcmgr-supervised services live
-on disk at `/etc/svcmgr/services.d/<name>.svc`, not on the wire —
+on disk at `/config/svcmgr/services/<name>.svc`, not on the wire —
 see
 [`services/svcmgr/docs/service-definitions.md`](../services/svcmgr/docs/service-definitions.md).
 
 ### Init reap
 
 After Phase 3 signals `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
-replies immediately, then scans `services.d/` and launches the
+replies immediately, then scans `/config/svcmgr/services/` and launches the
 defined-but-unregistered services — today `crasher.svc` and
 `svctest.svc`), init signs over its own kernel-object caps
 (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and

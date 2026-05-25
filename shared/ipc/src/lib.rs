@@ -404,7 +404,7 @@ pub mod svcmgr_labels
     ///
     /// The recipe (binary, argv, env, restart policy, criticality,
     /// namespace shape, seed names) lives on disk at
-    /// `/etc/svcmgr/services.d/<name>.svc`, not on the wire. This
+    /// `/config/svcmgr/services/<name>.svc`, not on the wire. This
     /// message carries only what cannot be on disk: which named
     /// recipe the running process implements, and the thread cap
     /// svcmgr binds death-notification on.
@@ -417,7 +417,7 @@ pub mod svcmgr_labels
     /// * `caps[0]`: thread cap for death-notification binding.
     ///
     /// On [`HANDOVER_COMPLETE`] svcmgr reconciles every registered
-    /// name against `services.d/`: a registered name with a
+    /// name against `/config/svcmgr/services/`: a registered name with a
     /// definition is bound and supervised using the on-disk recipe;
     /// a defined name not registered is launched by svcmgr itself;
     /// a registered name with no definition is a hard error (svcmgr
@@ -429,7 +429,7 @@ pub mod svcmgr_labels
 
     /// Internal namespace-policy descriptor stored on `ServiceEntry`
     /// (one of the values below). Parsed by svcmgr from each
-    /// service's `namespace = ...` line in `services.d/<name>.svc`;
+    /// service's `namespace = ...` line in `/config/svcmgr/services/<name>.svc`;
     /// no longer carried on the [`REGISTER_SERVICE`] wire.
     ///
     /// Namespace-policy descriptor: hand the child a `cap_copy` of
@@ -448,7 +448,7 @@ pub mod svcmgr_labels
     /// per-service path with a per-service rights mask, and hand
     /// the resulting directory cap as the child's namespace root.
     /// Path and rights come from the `namespace = subtree:<path>:<rights>`
-    /// line in `services.d/<name>.svc` so attenuation survives a
+    /// line in `/config/svcmgr/services/<name>.svc` so attenuation survives a
     /// crash-restart cycle.
     pub const NS_POLICY_SUBTREE: u8 = 2;
     /// Signal that init handover is complete.

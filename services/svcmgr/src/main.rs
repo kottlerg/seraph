@@ -52,7 +52,7 @@ const MAX_PENDING_REGISTRATIONS: usize = MAX_SERVICES;
 
 /// Handle a `REGISTER_SERVICE` IPC message under the v3 wire (post-#21).
 ///
-/// The recipe lives on disk at `/etc/svcmgr/services.d/<name>.svc`; the
+/// The recipe lives on disk at `/config/svcmgr/services/<name>.svc`; the
 /// wire conveys only what cannot be on disk:
 ///
 /// * `word 0`: `SVCMGR_LABELS_VERSION` handshake.
@@ -357,7 +357,7 @@ fn dispatch_ipc(service_ep: u32, state: &mut SvcmgrState, ctx: &restart::Restart
             let reply = IpcMessage::new(ipc::svcmgr_errors::SUCCESS);
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-            std::os::seraph::log!("handover complete; scanning services.d/");
+            std::os::seraph::log!("handover complete; scanning /config/svcmgr/services/");
             definitions::reconcile::reconcile_and_launch(
                 &mut state.pending,
                 state.pending_count,

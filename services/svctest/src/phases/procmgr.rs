@@ -72,15 +72,15 @@ pub fn spawn_phase(_: &Caps)
 {
     use std::process::Command;
 
-    let mut child = Command::new("/bin/hello")
+    let mut child = Command::new("/programs/hello")
         .arg("one")
         .arg("two")
         .env("SPAWNED_BY", "svctest")
         .spawn()
-        .expect("spawn /bin/hello failed");
+        .expect("spawn /programs/hello failed");
 
     let id = child.id();
-    std::os::seraph::log!("spawned /bin/hello handle={id:#x}");
+    std::os::seraph::log!("spawned /programs/hello handle={id:#x}");
 
     {
         let info = startup_info();
@@ -120,7 +120,7 @@ pub fn spawn_phase(_: &Caps)
     std::os::seraph::log!("child exited: {status}");
     assert!(
         status.success(),
-        "child /bin/hello did not exit cleanly: {status}"
+        "child /programs/hello did not exit cleanly: {status}"
     );
 
     let again = child.try_wait().expect("try_wait after wait failed");
@@ -166,9 +166,9 @@ pub fn command_cwd_inherit_phase(_: &Caps)
 
     let mut child = Command::new("/tests/svctest")
         .arg("cwd-child")
-        .current_dir("/srv")
+        .current_dir("/data")
         .spawn()
-        .expect("Command::cwd(/srv) must spawn cleanly");
+        .expect("Command::cwd(/data) must spawn cleanly");
     let status = child.wait().expect("wait on cwd-inherit child failed");
     let code = status.code().unwrap_or(-1);
     assert_eq!(
@@ -202,14 +202,14 @@ pub fn command_invalid_elf_loop_phase(_: &Caps)
 
     for i in 0..16
     {
-        let err = Command::new("/srv/test.txt")
+        let err = Command::new("/data/test.txt")
             .spawn()
             .expect_err("spawning a non-ELF path must fail");
         let _ = i;
         let _ = err;
     }
 
-    let mut child = Command::new("/bin/hello")
+    let mut child = Command::new("/programs/hello")
         .spawn()
         .expect("legitimate spawn after invalid-ELF loop failed");
     let status = child.wait().expect("wait on hello after loop failed");
@@ -227,8 +227,8 @@ pub fn stdio_file_unsupported_phase(_: &Caps)
     use std::io::ErrorKind;
     use std::process::{Command, Stdio};
 
-    let file = File::open("/srv/test.txt").expect("open /srv/test.txt for stdio probe");
-    let err = Command::new("/bin/hello")
+    let file = File::open("/data/test.txt").expect("open /data/test.txt for stdio probe");
+    let err = Command::new("/programs/hello")
         .stdout(Stdio::from(file))
         .spawn()
         .expect_err("Stdio::from(File) must surface as Unsupported on seraph");

@@ -48,7 +48,7 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (token bit
    `InitInfo.sbi_control_cap`, plus the `IoPortRange` cap surfaced through
    the descriptor array).
 2. During Phase 3, init creates pwrmgr via `procmgr_labels::CREATE_FROM_FILE`
-   from `/bin/pwrmgr`, then transfers derived copies of the platform caps
+   from `/services/pwrmgr`, then transfers derived copies of the platform caps
    through the bootstrap-round protocol in `caps.rs`.
 3. After pwrmgr is ready, init derives two tokened SEND caps from pwrmgr's
    service endpoint:

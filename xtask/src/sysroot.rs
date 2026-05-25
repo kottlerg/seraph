@@ -100,15 +100,16 @@ pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
 const SVCTEST_LARGE_BIN_PAGES: usize = 4;
 const SVCTEST_LARGE_BIN_PAGE_SIZE: usize = 4096;
 
-/// Emit `/svctest/large.bin`, a 16 KiB deterministic fixture consumed by
-/// `svctest`'s `fs_release_on_close_phase`. Each 4 KiB page is filled with
-/// the ASCII tag `PAGE_NN_` repeated, where `NN` is the page index. The
-/// phase asserts the first 8 bytes equal `PAGE_00_` to confirm content
-/// integrity across the FS_READ_FRAME / mem_map / release sequence.
-/// Gitignored under `rootfs/svctest/` and treated as a build artifact.
+/// Emit `/data/svctest/large.bin`, a 16 KiB deterministic fixture
+/// consumed by `svctest`'s `fs_release_on_close_phase`. Each 4 KiB page
+/// is filled with the ASCII tag `PAGE_NN_` repeated, where `NN` is the
+/// page index. The phase asserts the first 8 bytes equal `PAGE_00_` to
+/// confirm content integrity across the FS_READ_FRAME / mem_map /
+/// release sequence. Treated as a build artifact (synthesised here, not
+/// shipped in `rootfs/`).
 fn synthesise_svctest_large_bin(ctx: &BuildContext) -> Result<()>
 {
-    let dst = ctx.sysroot.join("svctest/large.bin");
+    let dst = ctx.sysroot.join("data/svctest/large.bin");
     if dst.exists()
     {
         return Ok(());
@@ -138,14 +139,14 @@ fn synthesise_svctest_large_bin(ctx: &BuildContext) -> Result<()>
 
 const SVCTEST_BENCH_BIN_SIZE: usize = 65536;
 
-/// Emit `/svctest/bench.bin`, a 64 KiB deterministic fixture consumed by
-/// `fsbench` (the FS_READ vs FS_READ_FRAME crossover benchmark). Filled
-/// with a byte-position-derived pattern so any read-path corruption shows
-/// up as a content mismatch at the byte level. Gitignored and treated as
-/// a build artifact, same pattern as `large.bin`.
+/// Emit `/data/svctest/bench.bin`, a 64 KiB deterministic fixture
+/// consumed by `fsbench` (the FS_READ vs FS_READ_FRAME crossover
+/// benchmark). Filled with a byte-position-derived pattern so any
+/// read-path corruption shows up as a content mismatch at the byte
+/// level. Treated as a build artifact, same pattern as `large.bin`.
 fn synthesise_svctest_bench_bin(ctx: &BuildContext) -> Result<()>
 {
-    let dst = ctx.sysroot.join("svctest/bench.bin");
+    let dst = ctx.sysroot.join("data/svctest/bench.bin");
     if dst.exists()
     {
         return Ok(());

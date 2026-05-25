@@ -3,7 +3,7 @@
 
 // programs/stdiotest/tester/src/main.rs
 
-//! Per-program tester for `/bin/stdiotest`. Spawns it with piped stdin
+//! Per-program tester for `/programs/stdiotest`. Spawns it with piped stdin
 //! and stdout, writes a single line, then asserts the expected three-line
 //! reply (byte count, uppercase echo, `PASS`) appears and the child exits
 //! cleanly. See [docs/testing.md](../../../docs/testing.md).
@@ -18,11 +18,11 @@ const PROBE: &str = "hello-stdio\n";
 
 fn main()
 {
-    let mut child = Command::new("/bin/stdiotest")
+    let mut child = Command::new("/programs/stdiotest")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn /bin/stdiotest");
+        .expect("spawn /programs/stdiotest");
 
     {
         let mut stdin = child.stdin.take().expect("piped stdin");
@@ -33,9 +33,9 @@ fn main()
     let mut bytes = Vec::new();
     stdout
         .read_to_end(&mut bytes)
-        .expect("read /bin/stdiotest stdout");
+        .expect("read /programs/stdiotest stdout");
 
-    let status = child.wait().expect("wait /bin/stdiotest");
+    let status = child.wait().expect("wait /programs/stdiotest");
     let out = String::from_utf8_lossy(&bytes);
 
     let pass_present = out.lines().any(|l| l.trim() == "PASS");

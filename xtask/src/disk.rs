@@ -26,10 +26,10 @@ const SECTOR_SIZE: u64 = 512;
 /// modules.
 const ESP_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Root partition size. Bumped to 512 MiB to accommodate both the legacy
-/// `/bin/` set (~164 MiB of debug binaries) and the new `/services/`
-/// canonical home (~91 MiB) introduced for bootloader-loaded components.
-/// Release builds remain comfortable well under half of this.
+/// Root partition size. Sized at 512 MiB to comfortably hold every
+/// debug-build userspace binary under `/services/` and `/programs/`
+/// alongside the harness binaries under `/tests/`. Release builds remain
+/// comfortable well under half of this.
 const ROOT_PARTITION_SIZE: u64 = 512 * 1024 * 1024;
 
 /// First partition starts at LBA 2048 (1 MiB alignment, standard GPT practice).

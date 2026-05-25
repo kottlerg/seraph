@@ -6,7 +6,7 @@
 # post-handover, so `restart = never`. `critical = high`: a dead
 # devmgr means no hardware authority distribution and the system
 # cannot continue meaningfully — svcmgr issues a graceful shutdown.
-binary    = /esp/EFI/seraph/devmgr
+binary    = /services/devmgr
 restart   = never
 critical  = high
 namespace = none

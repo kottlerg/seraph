@@ -32,7 +32,7 @@ Register a currently-running service for supervision.
 
 Post-#21 the recipe (binary, argv, env, restart policy, criticality,
 namespace shape, seed names) lives on disk at
-`/etc/svcmgr/services.d/<name>.svc`. This message conveys only what
+`/config/svcmgr/services/<name>.svc`. This message conveys only what
 cannot be on disk: which named recipe the running process implements,
 and the thread cap svcmgr binds death-notification on at
 reconciliation time.
@@ -68,7 +68,7 @@ well-known caps. svcmgr replies `SUCCESS` immediately (so init can
 proceed to teardown), then runs
 [`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
 
-1. Scan `/etc/svcmgr/services.d/`, parse each `.svc` into a
+1. Scan `/config/svcmgr/services/`, parse each `.svc` into a
    [`Definition`](../src/definitions/mod.rs).
 2. Reconcile against the pending-registration table:
    * **registered AND defined** — bind death-notification, record a

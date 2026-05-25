@@ -3,7 +3,7 @@
 
 // programs/hello/tester/src/main.rs
 
-//! Per-program tester for `/bin/hello`. Spawns it with a piped stdout,
+//! Per-program tester for `/programs/hello`. Spawns it with a piped stdout,
 //! asserts the expected line appears, and asserts a clean exit. See
 //! [docs/testing.md](../../../docs/testing.md) for the protocol.
 
@@ -17,18 +17,18 @@ const EXPECTED_LINE: &str = "hello from seraph userspace";
 
 fn main()
 {
-    let mut child = Command::new("/bin/hello")
+    let mut child = Command::new("/programs/hello")
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn /bin/hello");
+        .expect("spawn /programs/hello");
 
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut bytes = Vec::new();
     stdout
         .read_to_end(&mut bytes)
-        .expect("read /bin/hello stdout");
+        .expect("read /programs/hello stdout");
 
-    let status = child.wait().expect("wait /bin/hello");
+    let status = child.wait().expect("wait /programs/hello");
     let out = String::from_utf8_lossy(&bytes);
 
     let line_present = out.lines().any(|l| l.contains(EXPECTED_LINE));

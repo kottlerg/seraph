@@ -7,8 +7,8 @@
 //! test fixtures, and regenerate `disk.img` without invoking cargo.
 //! Used to refresh the boot image after `rootfs/` or sysroot files
 //! were edited outside the cargo flow (notably: staging a test recipe
-//! by copying it from `sysroot/etc/svcmgr/tests.d/` into
-//! `sysroot/etc/svcmgr/services.d/`).
+//! by copying it from `sysroot/config/svcmgr/tests/` into
+//! `sysroot/config/svcmgr/services/`).
 
 use anyhow::Result;
 

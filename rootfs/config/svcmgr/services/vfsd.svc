@@ -6,7 +6,7 @@
 # cannot be re-minted by svcmgr today, so `restart = never`. vfsd
 # being dead means the namespace surface is gone (every absolute
 # `std::fs` op fails); `critical = high` triggers graceful shutdown.
-binary    = /esp/EFI/seraph/vfsd
+binary    = /services/vfsd
 restart   = never
 critical  = high
 namespace = none

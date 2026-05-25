@@ -88,8 +88,8 @@ Default firmware search paths per host:
 Re-mirror `rootfs/` into `sysroot/`, re-synthesise test fixtures, and
 regenerate `disk.img` without invoking cargo. Use after editing
 `rootfs/` or the sysroot directly (e.g. staging a test recipe by
-copying it from `sysroot/etc/svcmgr/tests.d/` into
-`sysroot/etc/svcmgr/services.d/`) to refresh the boot image without
+copying it from `sysroot/config/svcmgr/tests/` into
+`sysroot/config/svcmgr/services/`) to refresh the boot image without
 paying for a full `cargo xtask build` (which would also run cargo
 fmt + clippy + check + binary install). Requires a populated,
 arch-tagged sysroot from a prior `cargo xtask build`.
@@ -111,7 +111,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64]
 Example — stage `svctest` and run it:
 
 ```sh
-cp sysroot/etc/svcmgr/tests.d/svctest.svc sysroot/etc/svcmgr/services.d/
+cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
 cargo xtask mkdisk --arch x86_64
 cargo xtask run --arch x86_64
 ```

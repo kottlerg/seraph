@@ -41,7 +41,7 @@ const INLINE_CHUNK: u64 = 504;
 const SIZES: &[u64] = &[16, 1024, 4096, 16384, 65536];
 const WARMUP_ITERS: u32 = 8;
 const MEASURE_ITERS: u32 = 256;
-const FIXTURE_PATH: &str = "/svctest/bench.bin";
+const FIXTURE_PATH: &str = "/data/svctest/bench.bin";
 
 fn cycles_now() -> u64
 {

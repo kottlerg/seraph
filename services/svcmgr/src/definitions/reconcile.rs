@@ -4,7 +4,7 @@
 // svcmgr/src/definitions/reconcile.rs
 
 //! Post-handover reconciliation between init's `REGISTER_SERVICE`
-//! announcements and the on-disk `/etc/svcmgr/services.d/` recipe
+//! announcements and the on-disk `/config/svcmgr/services/` recipe
 //! set.
 //!
 //! Three outcomes per `.svc` file:
@@ -73,7 +73,7 @@ impl PendingRegistration
 
 /// Top-level entry called from `dispatch_ipc` on `HANDOVER_COMPLETE`.
 ///
-/// Walks `services.d/`, parses every `.svc` file, and routes each
+/// Walks `/config/svcmgr/services/`, parses every `.svc` file, and routes each
 /// definition through the right path. `pending` is consumed:
 /// entries that match a definition are marked `consumed`; entries
 /// left unconsumed after the scan are reported as a configuration
@@ -97,7 +97,7 @@ pub fn reconcile_and_launch(
         {
             log!("svcmgr: cannot open {SERVICES_DIR}: {e}");
             // Still report pending-without-def errors so a missing
-            // services.d/ does not silently swallow them.
+            // /config/svcmgr/services/ does not silently swallow them.
             report_orphans(pending, pending_count);
             return;
         }
@@ -129,7 +129,7 @@ pub fn reconcile_and_launch(
     }
     // Deterministic launch order — purely for grep-ability of the
     // boot log; svcmgr makes no policy claim about start sequencing
-    // across services.d/ (services that depend on each other use
+    // across /config/svcmgr/services/ (services that depend on each other use
     // discovery-registry lookups, not file-system ordering).
     entries.sort();
 

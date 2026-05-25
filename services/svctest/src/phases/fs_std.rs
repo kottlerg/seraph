@@ -60,7 +60,7 @@ pub fn phases() -> &'static [Phase]
 
 pub fn std_write_phase(_: &Caps)
 {
-    let path = "/svctest/std_w.bin";
+    let path = "/data/svctest/std_w.bin";
     let _ = std::fs::remove_file(path);
     std::fs::write(path, b"hello std::fs").expect("std::fs::write");
     let got = std::fs::read(path).expect("std::fs::read");
@@ -72,7 +72,7 @@ pub fn std_write_phase(_: &Caps)
 pub fn std_create_phase(_: &Caps)
 {
     use std::io::Write;
-    let path = "/svctest/std_c.bin";
+    let path = "/data/svctest/std_c.bin";
     let _ = std::fs::remove_file(path);
     {
         let mut f = std::fs::File::create(path).expect("File::create");
@@ -88,7 +88,7 @@ pub fn std_create_phase(_: &Caps)
 pub fn std_truncate_phase(_: &Caps)
 {
     use std::io::Write;
-    let path = "/svctest/std_t.bin";
+    let path = "/data/svctest/std_t.bin";
     let _ = std::fs::remove_file(path);
     std::fs::write(path, vec![0xAAu8; 1024]).expect("seed 1 KiB");
     {
@@ -109,7 +109,7 @@ pub fn std_truncate_phase(_: &Caps)
 pub fn std_append_phase(_: &Caps)
 {
     use std::io::Write;
-    let path = "/svctest/std_a.bin";
+    let path = "/data/svctest/std_a.bin";
     let _ = std::fs::remove_file(path);
     std::fs::write(path, b"head ").expect("seed");
     {
@@ -127,8 +127,8 @@ pub fn std_append_phase(_: &Caps)
 
 pub fn std_mkdir_remove_phase(_: &Caps)
 {
-    let d = "/svctest/std_d";
-    let f = "/svctest/std_d/inner.bin";
+    let d = "/data/svctest/std_d";
+    let f = "/data/svctest/std_d/inner.bin";
     let _ = std::fs::remove_file(f);
     let _ = std::fs::remove_dir(d);
 
@@ -143,8 +143,8 @@ pub fn std_mkdir_remove_phase(_: &Caps)
 
 pub fn std_rename_phase(_: &Caps)
 {
-    let a = "/svctest/std_r_a.bin";
-    let b = "/svctest/std_r_b.bin";
+    let a = "/data/svctest/std_r_a.bin";
+    let b = "/data/svctest/std_r_b.bin";
     let _ = std::fs::remove_file(a);
     let _ = std::fs::remove_file(b);
     std::fs::write(a, b"renameme").expect("seed");
@@ -161,10 +161,10 @@ pub fn std_rename_phase(_: &Caps)
 
 pub fn std_remove_dir_all_phase(_: &Caps)
 {
-    let top = "/svctest/std_tree";
-    let sub = "/svctest/std_tree/sub";
-    let f1 = "/svctest/std_tree/file.bin";
-    let f2 = "/svctest/std_tree/sub/leaf.bin";
+    let top = "/data/svctest/std_tree";
+    let sub = "/data/svctest/std_tree/sub";
+    let f1 = "/data/svctest/std_tree/file.bin";
+    let f2 = "/data/svctest/std_tree/sub/leaf.bin";
     let _ = std::fs::remove_dir_all(top);
 
     std::fs::create_dir(top).expect("create top");
@@ -188,7 +188,7 @@ pub fn std_remove_dir_all_phase(_: &Caps)
 pub fn std_bulk_write_phase(_: &Caps)
 {
     use std::io::{Read, Write};
-    let path = "/svctest/std_bulk.bin";
+    let path = "/data/svctest/std_bulk.bin";
     let _ = std::fs::remove_file(path);
     let mut buf = vec![0u8; STD_BULK_LEN];
     for (i, b) in buf.iter_mut().enumerate()
@@ -215,12 +215,12 @@ pub fn std_bulk_write_phase(_: &Caps)
 
 pub fn std_read_dir_phase(_: &Caps)
 {
-    let d = "/svctest/STD_RD";
+    let d = "/data/svctest/STD_RD";
     let _ = std::fs::remove_dir_all(d);
     std::fs::create_dir(d).expect("create_dir");
-    std::fs::write("/svctest/STD_RD/A.BIN", b"a").expect("A.BIN");
-    std::fs::write("/svctest/STD_RD/B.BIN", b"bb").expect("B.BIN");
-    std::fs::create_dir("/svctest/STD_RD/SUB").expect("create SUB");
+    std::fs::write("/data/svctest/STD_RD/A.BIN", b"a").expect("A.BIN");
+    std::fs::write("/data/svctest/STD_RD/B.BIN", b"bb").expect("B.BIN");
+    std::fs::create_dir("/data/svctest/STD_RD/SUB").expect("create SUB");
 
     let mut saw_a = false;
     let mut saw_b = false;
@@ -265,7 +265,7 @@ pub fn std_read_dir_phase(_: &Caps)
 
 pub fn std_metadata_phase(_: &Caps)
 {
-    let f = "/svctest/std_md.bin";
+    let f = "/data/svctest/std_md.bin";
     let _ = std::fs::remove_file(f);
     std::fs::write(f, b"meta").expect("seed");
     let md = std::fs::metadata(f).expect("metadata file");
@@ -273,13 +273,13 @@ pub fn std_metadata_phase(_: &Caps)
     assert!(!md.is_dir());
     assert_eq!(md.len(), 4);
 
-    let d = "/svctest";
+    let d = "/data/svctest";
     let md_d = std::fs::metadata(d).expect("metadata dir");
     assert!(md_d.is_dir());
     assert!(!md_d.is_file());
 
     assert!(std::fs::exists(f).expect("exists present"));
-    assert!(!std::fs::exists("/svctest/__definitely_not_here__").expect("exists missing"));
+    assert!(!std::fs::exists("/data/svctest/__definitely_not_here__").expect("exists missing"));
 
     std::fs::remove_file(f).expect("cleanup");
     std::os::seraph::log!("std_metadata phase passed");
@@ -293,7 +293,7 @@ pub fn std_metadata_phase(_: &Caps)
 )]
 pub fn std_open_options_invalid_phase(_: &Caps)
 {
-    let path = "/svctest/__ooopt.bin";
+    let path = "/data/svctest/__ooopt.bin";
 
     let no_mode = std::fs::OpenOptions::new().open(path);
     assert!(no_mode.is_err(), "open with no access mode must reject");

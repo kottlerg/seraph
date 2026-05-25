@@ -1,4 +1,4 @@
-# /bin/pwrmgr — power manager (platform shutdown / reboot).
+# /services/pwrmgr — power manager (platform shutdown / reboot).
 #
 # Init spawns pwrmgr in Phase 3 with the arch-specific shutdown
 # caps (IoPortRange / SbiControl / ACPI region frames) it cannot
@@ -12,7 +12,7 @@
 # unreachable because the source is gone. The death handler logs
 # the degraded state and continues; no fallback raw-shutdown path
 # exists in this architecture.
-binary    = /bin/pwrmgr
+binary    = /services/pwrmgr
 restart   = never
 critical  = high
 namespace = none

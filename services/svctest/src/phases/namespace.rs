@@ -4,8 +4,8 @@
 //! vfsd / namespace-protocol surface.
 //!
 //! Hosts the child-mode entries `sandbox_child_main` and
-//! `bin_child_main`, spawned by `ns_sandbox_phase` and
-//! `ns_bin_subtree_phase` respectively.
+//! `programs_child_main`, spawned by `ns_sandbox_phase` and
+//! `ns_programs_subtree_phase` respectively.
 
 use std::os::seraph::startup_info;
 
@@ -45,8 +45,8 @@ pub fn late() -> &'static [Phase]
             run: ns_sandbox_phase,
         },
         Phase {
-            name: "ns_bin_subtree",
-            run: ns_bin_subtree_phase,
+            name: "ns_programs_subtree",
+            run: ns_programs_subtree_phase,
         },
         Phase {
             name: "ns_startup_cwd",
@@ -63,7 +63,7 @@ pub fn reentry_main(role: &str)
     match role
     {
         "sandbox-child" => sandbox_child_main(),
-        "bin-child" => bin_child_main(),
+        "programs-child" => programs_child_main(),
         _ =>
         {}
     }
@@ -76,7 +76,7 @@ fn sandbox_child_main() -> !
     {
         std::process::exit(3);
     }
-    match std::fs::File::open("/srv/test.txt")
+    match std::fs::File::open("/data/test.txt")
     {
         Ok(_) => std::process::exit(1),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => std::process::exit(0),
@@ -84,7 +84,7 @@ fn sandbox_child_main() -> !
     }
 }
 
-fn bin_child_main() -> !
+fn programs_child_main() -> !
 {
     let root = std::os::seraph::root_dir_cap();
     if root == 0
@@ -95,7 +95,7 @@ fn bin_child_main() -> !
     {
         std::process::exit(1);
     }
-    match std::fs::File::open("/srv/test.txt")
+    match std::fs::File::open("/data/test.txt")
     {
         Ok(_) => std::process::exit(2),
         Err(e)
@@ -126,26 +126,27 @@ pub fn ns_phase(caps: &Caps)
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let bin_cap = match ns_lookup(root_fs, b"bin", 0xFFFF, ipc_buf)
+    let programs_cap = match ns_lookup(root_fs, b"programs", 0xFFFF, ipc_buf)
     {
         Ok((cap, kind, _size)) =>
         {
-            assert_eq!(kind, 1, "expected /bin to be a directory (kind=1)");
+            assert_eq!(kind, 1, "expected /programs to be a directory (kind=1)");
             cap
         }
-        Err(code) => panic!("NS_LOOKUP(root, \"bin\") failed: code={code}"),
+        Err(code) => panic!("NS_LOOKUP(root, \"programs\") failed: code={code}"),
     };
-    std::os::seraph::log!("ns: NS_LOOKUP /bin ok");
+    std::os::seraph::log!("ns: NS_LOOKUP /programs ok");
 
-    let (size, _mtime, kind) = ns_stat(bin_cap, ipc_buf).expect("NS_STAT on /bin must succeed");
-    assert_eq!(kind, 1, "/bin stat: kind must be Dir");
+    let (size, _mtime, kind) =
+        ns_stat(programs_cap, ipc_buf).expect("NS_STAT on /programs must succeed");
+    assert_eq!(kind, 1, "/programs stat: kind must be Dir");
     let _ = size;
-    std::os::seraph::log!("ns: NS_STAT /bin ok");
+    std::os::seraph::log!("ns: NS_STAT /programs ok");
 
     let mut readdir_names: Vec<Vec<u8>> = Vec::new();
     for idx in 0..32u64
     {
-        match ns_readdir(bin_cap, idx, ipc_buf)
+        match ns_readdir(programs_cap, idx, ipc_buf)
         {
             Ok(Some((entry_kind, name))) =>
             {
@@ -156,7 +157,7 @@ pub fn ns_phase(caps: &Caps)
                 readdir_names.push(name);
             }
             Ok(None) => break,
-            Err(code) => panic!("NS_READDIR(/bin, {idx}) failed: code={code}"),
+            Err(code) => panic!("NS_READDIR(/programs, {idx}) failed: code={code}"),
         }
     }
     for expected in [
@@ -168,7 +169,7 @@ pub fn ns_phase(caps: &Caps)
     {
         assert!(
             readdir_names.iter().any(|n| n.as_slice() == expected),
-            "NS_READDIR did not surface {:?} verbatim under /bin (LFN-canonical regression — \
+            "NS_READDIR did not surface {:?} verbatim under /programs (LFN-canonical regression — \
              saw {:?})",
             core::str::from_utf8(expected).unwrap(),
             readdir_names
@@ -177,20 +178,20 @@ pub fn ns_phase(caps: &Caps)
                 .collect::<Vec<_>>(),
         );
     }
-    std::os::seraph::log!("ns: NS_READDIR /bin saw lowercase LFN-canonical names");
+    std::os::seraph::log!("ns: NS_READDIR /programs saw lowercase LFN-canonical names");
 
-    let hello_cap = match ns_lookup(bin_cap, b"HELLO", 0xFFFF, ipc_buf)
+    let hello_cap = match ns_lookup(programs_cap, b"HELLO", 0xFFFF, ipc_buf)
     {
         Ok((cap, kind, _size)) =>
         {
-            assert_eq!(kind, 0, "expected /bin/HELLO to be a file (kind=0)");
+            assert_eq!(kind, 0, "expected /programs/HELLO to be a file (kind=0)");
             cap
         }
-        Err(code) => panic!("NS_LOOKUP(/bin, \"HELLO\") failed: code={code}"),
+        Err(code) => panic!("NS_LOOKUP(/programs, \"HELLO\") failed: code={code}"),
     };
     let _ = ns_stat(hello_cap, ipc_buf).expect("NS_STAT on HELLO must succeed");
     let _ = syscall::cap_delete(hello_cap);
-    std::os::seraph::log!("ns: NS_LOOKUP /bin/HELLO ok");
+    std::os::seraph::log!("ns: NS_LOOKUP /programs/HELLO ok");
 
     match ns_lookup(root_fs, b"nonexistent_xyz", 0xFFFF, ipc_buf)
     {
@@ -207,10 +208,10 @@ pub fn ns_phase(caps: &Caps)
     std::os::seraph::log!("ns: NS_LOOKUP nonexistent → NOT_FOUND");
 
     let stat_only = NamespaceRights::from_raw(rights::STAT).raw();
-    let limited_cap = match ns_lookup(root_fs, b"bin", u64::from(stat_only), ipc_buf)
+    let limited_cap = match ns_lookup(root_fs, b"programs", u64::from(stat_only), ipc_buf)
     {
         Ok((cap, _kind, _size)) => cap,
-        Err(code) => panic!("NS_LOOKUP for limited /bin cap failed: code={code}"),
+        Err(code) => panic!("NS_LOOKUP for limited /programs cap failed: code={code}"),
     };
     match ns_lookup(limited_cap, b"HELLO", 0xFFFF, ipc_buf)
     {
@@ -227,7 +228,7 @@ pub fn ns_phase(caps: &Caps)
     let _ = syscall::cap_delete(limited_cap);
     std::os::seraph::log!("ns: NS_LOOKUP without LOOKUP right → PERMISSION_DENIED");
 
-    let _ = syscall::cap_delete(bin_cap);
+    let _ = syscall::cap_delete(programs_cap);
 
     std::os::seraph::log!("ns phase passed");
 }
@@ -297,32 +298,32 @@ pub fn ns_mount_boundary_phase(_: &Caps)
 
     // Transparent root-fs delegation: paths that are not shadowed by a
     // mount on the synthetic root must resolve through the root fs.
-    // After the mounts.conf/INGEST_CONFIG_MOUNTS removal, /etc lives on
-    // the root partition and reaches `/etc/svcmgr/services.d/logd.svc`
+    // After the mounts.conf/INGEST_CONFIG_MOUNTS removal, /config lives on
+    // the root partition and reaches `/config/svcmgr/services/logd.svc`
     // through delegation (the only mount on the synthetic root is /esp).
-    let (etc_cap, kind, _size) = ns_lookup(system_root_cap, b"etc", 0xFFFF, ipc_buf)
-        .expect("ns_mount_boundary: NS_LOOKUP(system_root, \"etc\") failed");
+    let (config_cap, kind, _size) = ns_lookup(system_root_cap, b"config", 0xFFFF, ipc_buf)
+        .expect("ns_mount_boundary: NS_LOOKUP(system_root, \"config\") failed");
     assert_eq!(
         kind, 1,
-        "ns_mount_boundary: /etc must be Dir (transparent root delegation regression?)"
+        "ns_mount_boundary: /config must be Dir (transparent root delegation regression?)"
     );
-    std::os::seraph::log!("ns_mount_boundary: NS_LOOKUP /etc (delegated) ok");
+    std::os::seraph::log!("ns_mount_boundary: NS_LOOKUP /config (delegated) ok");
 
-    let (svcmgr_cap, kind, _size) = ns_lookup(etc_cap, b"svcmgr", 0xFFFF, ipc_buf)
-        .expect("ns_mount_boundary: NS_LOOKUP(etc, \"svcmgr\") failed");
-    assert_eq!(kind, 1, "ns_mount_boundary: /etc/svcmgr must be Dir");
-    let (services_d_cap, kind, _size) = ns_lookup(svcmgr_cap, b"services.d", 0xFFFF, ipc_buf)
-        .expect("ns_mount_boundary: NS_LOOKUP(svcmgr, \"services.d\") failed");
+    let (svcmgr_cap, kind, _size) = ns_lookup(config_cap, b"svcmgr", 0xFFFF, ipc_buf)
+        .expect("ns_mount_boundary: NS_LOOKUP(config, \"svcmgr\") failed");
+    assert_eq!(kind, 1, "ns_mount_boundary: /config/svcmgr must be Dir");
+    let (services_cap, kind, _size) = ns_lookup(svcmgr_cap, b"services", 0xFFFF, ipc_buf)
+        .expect("ns_mount_boundary: NS_LOOKUP(svcmgr, \"services\") failed");
     assert_eq!(
         kind, 1,
-        "ns_mount_boundary: /etc/svcmgr/services.d must be Dir"
+        "ns_mount_boundary: /config/svcmgr/services must be Dir"
     );
 
-    let (file_cap, kind, size_hint) = ns_lookup(services_d_cap, b"logd.svc", 0xFFFF, ipc_buf)
-        .expect("ns_mount_boundary: NS_LOOKUP(services.d, \"logd.svc\") failed");
+    let (file_cap, kind, size_hint) = ns_lookup(services_cap, b"logd.svc", 0xFFFF, ipc_buf)
+        .expect("ns_mount_boundary: NS_LOOKUP(services, \"logd.svc\") failed");
     assert_eq!(
         kind, 0,
-        "ns_mount_boundary: /etc/svcmgr/services.d/logd.svc must be File"
+        "ns_mount_boundary: /config/svcmgr/services/logd.svc must be File"
     );
     std::os::seraph::log!("ns_mount_boundary: NS_LOOKUP logd.svc ok (size_hint={size_hint})");
 
@@ -332,9 +333,9 @@ pub fn ns_mount_boundary_phase(_: &Caps)
     assert!(size > 0, "ns_mount_boundary: logd.svc size must be > 0");
 
     let _ = syscall::cap_delete(file_cap);
-    let _ = syscall::cap_delete(services_d_cap);
+    let _ = syscall::cap_delete(services_cap);
     let _ = syscall::cap_delete(svcmgr_cap);
-    let _ = syscall::cap_delete(etc_cap);
+    let _ = syscall::cap_delete(config_cap);
     std::os::seraph::log!("ns_mount_boundary phase passed");
 }
 
@@ -351,8 +352,8 @@ pub fn ns_multi_component_phase(_: &Caps)
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // `/esp` is a terminal mount on the EFI System Partition (vfsd
-    // auto-mounts it after root). The original `/srv/data` fixture (a
-    // root-partition self-mount via mounts.conf) is gone; this phase now
+    // auto-mounts it after root). The original multi-component root-
+    // partition self-mount (mounts.conf-driven) is gone; this phase now
     // exercises single-component terminal mount + walk-into-mount.
     let (esp_cap, kind, _) = ns_lookup(system_root_cap, b"esp", 0xFFFF, ipc_buf)
         .expect("ns_multi_component: NS_LOOKUP(/, esp) failed");
@@ -369,15 +370,15 @@ pub fn ns_multi_component_phase(_: &Caps)
     let _ = syscall::cap_delete(esp_cap);
     std::os::seraph::log!("ns_multi_component: NS_LOOKUP /esp/EFI (terminal contents) ok");
 
-    // Root-fs fixture: `/srv/test.txt` is now a plain rootfs file (the
-    // mount that previously covered `/srv/data` is gone), so the cap
-    // walked from the system root resolves through the root-fs backend
-    // unchanged. Marker check verifies the byte content.
-    let body = std::fs::read_to_string("/srv/test.txt")
-        .expect("ns_multi_component: std::fs::read_to_string(/srv/test.txt) failed");
+    // Root-fs fixture: `/data/test.txt` is a plain rootfs file (the
+    // mount that previously covered the storage path is gone), so the
+    // cap walked from the system root resolves through the root-fs
+    // backend unchanged. Marker check verifies the byte content.
+    let body = std::fs::read_to_string("/data/test.txt")
+        .expect("ns_multi_component: std::fs::read_to_string(/data/test.txt) failed");
     assert!(
         body.contains("srv-test-marker"),
-        "ns_multi_component: marker missing from /srv/test.txt body: {body:?}"
+        "ns_multi_component: marker missing from /data/test.txt body: {body:?}"
     );
     std::os::seraph::log!("ns_multi_component phase passed");
 }
@@ -399,10 +400,10 @@ pub fn ns_sandbox_phase(_: &Caps)
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let stat_only = NamespaceRights::from_raw(rights::STAT).raw();
-    let attenuated = match ns_lookup(root, b"srv", u64::from(stat_only), ipc_buf)
+    let attenuated = match ns_lookup(root, b"data", u64::from(stat_only), ipc_buf)
     {
         Ok((cap, _kind, _size)) => cap,
-        Err(code) => panic!("ns_sandbox: walk-attenuate /srv failed: code={code}"),
+        Err(code) => panic!("ns_sandbox: walk-attenuate /data failed: code={code}"),
     };
 
     let mut cmd = std::process::Command::new("/tests/svctest");
@@ -421,7 +422,7 @@ pub fn ns_sandbox_phase(_: &Caps)
     std::os::seraph::log!("ns_sandbox phase passed");
 }
 
-pub fn ns_bin_subtree_phase(_: &Caps)
+pub fn ns_programs_subtree_phase(_: &Caps)
 {
     use namespace_protocol::{NamespaceRights, rights};
     use std::os::seraph::process::CommandExt;
@@ -429,33 +430,35 @@ pub fn ns_bin_subtree_phase(_: &Caps)
     let root = std::os::seraph::root_dir_cap();
     if root == 0
     {
-        std::os::seraph::log!("ns_bin_subtree phase skipped: no root_dir_cap");
+        std::os::seraph::log!("ns_programs_subtree phase skipped: no root_dir_cap");
         return;
     }
 
-    let bin_rights = NamespaceRights::from_raw(rights::LOOKUP | rights::STAT | rights::READ).raw();
-    let bin_cap = match std::os::seraph::namespace_lookup_dir(root, "/bin", u64::from(bin_rights))
-    {
-        Ok(c) => c,
-        Err(e) => panic!("ns_bin_subtree: walk-attenuate /bin failed: {e}"),
-    };
+    let programs_rights =
+        NamespaceRights::from_raw(rights::LOOKUP | rights::STAT | rights::READ).raw();
+    let programs_cap =
+        match std::os::seraph::namespace_lookup_dir(root, "/programs", u64::from(programs_rights))
+        {
+            Ok(c) => c,
+            Err(e) => panic!("ns_programs_subtree: walk-attenuate /programs failed: {e}"),
+        };
 
     let mut cmd = std::process::Command::new("/tests/svctest");
-    cmd.arg("bin-child");
-    cmd.namespace_cap(bin_cap);
+    cmd.arg("programs-child");
+    cmd.namespace_cap(programs_cap);
     let status = cmd
         .status()
-        .expect("ns_bin_subtree: spawn /tests/svctest bin-child failed");
+        .expect("ns_programs_subtree: spawn /tests/svctest programs-child failed");
 
     assert!(
         status.success(),
-        "ns_bin_subtree: child exit status {status:?}; expected 0. \
-         1 = /hello open failed (cap not rooted at /bin), \
-         2 = /srv/test.txt unexpectedly opened (cap not attenuated), \
-         3 = /srv/test.txt failed with unexpected error kind, \
+        "ns_programs_subtree: child exit status {status:?}; expected 0. \
+         1 = /hello open failed (cap not rooted at /programs), \
+         2 = /data/test.txt unexpectedly opened (cap not attenuated), \
+         3 = /data/test.txt failed with unexpected error kind, \
          4 = no system_root_cap delivered to child"
     );
-    std::os::seraph::log!("ns_bin_subtree phase passed");
+    std::os::seraph::log!("ns_programs_subtree phase passed");
 }
 
 pub fn ns_startup_cwd_phase(_: &Caps)
@@ -472,7 +475,7 @@ pub fn ns_startup_cwd_phase(_: &Caps)
 
     let (file_cap, kind, _size) = ns_lookup(cwd, b"test.txt", 0xFFFF, ipc_buf).expect(
         "ns_startup_cwd: NS_LOOKUP test.txt from startup cwd cap failed — cwd cap \
-         does not address /srv",
+         does not address /data",
     );
     assert_eq!(
         kind, 0,
@@ -482,10 +485,10 @@ pub fn ns_startup_cwd_phase(_: &Caps)
     std::os::seraph::log!("ns_startup_cwd phase passed");
 }
 
-// ns_fallthrough_attenuation_phase was retired alongside the /srv/data
-// mount: it asserted that fall-through caps minted under a synthetic
-// intermediate (where /srv was synthetic only because /srv/data was a
-// mount within it) respect parent-cap attenuation. With /srv no longer
-// being a synthetic intermediate, the scenario it exercised no longer
-// exists. Re-introducing equivalent coverage requires a multi-component
-// mount fixture; track separately if and when one is added.
+// ns_fallthrough_attenuation_phase was retired alongside the historical
+// storage-mount fixture: it asserted that fall-through caps minted under
+// a synthetic intermediate (an outer dir that existed only because a
+// deeper mount fell within it) respect parent-cap attenuation. Without
+// a multi-component mount in the in-tree boot the scenario it exercised
+// no longer exists. Re-introducing equivalent coverage requires a
+// multi-component mount fixture; tracked as issue #139.

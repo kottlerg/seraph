@@ -6,7 +6,7 @@
 # its boot module (not implemented today). `restart = never` +
 # `critical = high` matches the current shape: on unrecoverable
 # death svcmgr issues `pwrmgr_labels::SHUTDOWN`.
-binary    = /esp/EFI/seraph/procmgr
+binary    = /services/procmgr
 restart   = never
 critical  = high
 namespace = none

@@ -88,7 +88,7 @@ jobs:
               ;;
           esac
 
-      - name: Burn in ${{ matrix.tester }} (4 × 20 iterations)
+      - name: Burn in ${{ matrix.tester }} (20 iterations, 2 parallel)
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \

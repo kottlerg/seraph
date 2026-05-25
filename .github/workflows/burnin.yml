@@ -20,6 +20,13 @@ jobs:
       matrix:
         arch: [x86_64, riscv64]
         profile: [debug, release]
+        # One harness per cell, matching build-test.yml: each cell builds
+        # once, stages exactly one recipe (or swaps boot.conf for ktest),
+        # then burns it in. Avoids back-to-back fatfs/sysroot state
+        # accumulation across harnesses and lets a failing tier surface as
+        # a single named cell. See docs/testing.md for the recipe-dir
+        # gating contract.
+        tester: [ktest, svctest, usertest]
     steps:
       - uses: actions/checkout@v6
 
@@ -48,7 +55,7 @@ jobs:
         with:
           shared-key: burnin-${{ matrix.arch }}-${{ matrix.profile }}
 
-      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }}) — svctest config
+      - name: Build (${{ matrix.arch }}, ${{ matrix.profile }})
         run: |
           if [ "${{ matrix.profile }}" = "release" ]; then
             cargo xtask build --arch ${{ matrix.arch }} --release
@@ -56,41 +63,41 @@ jobs:
             cargo xtask build --arch ${{ matrix.arch }}
           fi
 
-      - name: svctest burn-in (4 × 20 iterations)
-        id: svctest-burnin
+      - name: Stage ${{ matrix.tester }} and repack disk
+        # Recipe staging: svctest and usertest live in
+        # `sysroot/config/svcmgr/tests/` (svcmgr does not scan that
+        # directory); cp into services/ to enable. `cargo xtask mkdisk`
+        # re-mirrors rootfs and repacks the FAT image without invoking
+        # cargo. ktest swaps the bundle's `init` entry via
+        # `cargo xtask compose-bundle --harness ktest`, which repacks
+        # the disk image as part of the compose step.
+        run: |
+          case "${{ matrix.tester }}" in
+            svctest)
+              cp sysroot/config/svcmgr/tests/svctest.svc \
+                 sysroot/config/svcmgr/services/
+              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              ;;
+            usertest)
+              cp sysroot/config/svcmgr/tests/usertest.svc \
+                 sysroot/config/svcmgr/services/
+              cargo xtask mkdisk --arch ${{ matrix.arch }}
+              ;;
+            ktest)
+              cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
+              ;;
+          esac
+
+      - name: Burn in ${{ matrix.tester }} (4 × 20 iterations)
         run: |
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
             --parallel 4 --runs 20 --timeout 60
 
-      - name: Upload svctest logs
+      - name: Upload run-parallel logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: burnin-svctest-${{ matrix.arch }}-${{ matrix.profile }}
-          path: target/xtask/run-parallel/**/*.log
-          if-no-files-found: ignore
-
-      - name: Compose the bundle for ktest
-        # `compose-bundle --harness ktest` overwrites
-        # sysroot/esp/EFI/seraph/bootstrap.bundle with the single-entry
-        # ktest bundle and repacks disk.img. No cargo rebuild is needed
-        # because the ktest binary was produced by the earlier
-        # `cargo xtask build` and lives at sysroot/tests/ktest.
-        run: |
-          cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
-
-      - name: ktest burn-in (4 × 20 iterations)
-        id: ktest-burnin
-        run: |
-          cargo xtask run-parallel \
-            --arch ${{ matrix.arch }} \
-            --parallel 4 --runs 20 --timeout 60
-
-      - name: Upload ktest logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: burnin-ktest-${{ matrix.arch }}-${{ matrix.profile }}
+          name: burnin-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
           path: target/xtask/run-parallel/**/*.log
           if-no-files-found: ignore

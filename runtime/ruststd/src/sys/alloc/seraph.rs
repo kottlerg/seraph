@@ -50,9 +50,12 @@ const HEAP_MAX: u64 = 0x0000_0000_8000_0000;
 
 /// Initial heap size at `_start`, in 4 KiB pages. Sized to cover stdio's
 /// lazy line-buffer, two worker-thread stacks plus their per-thread IPC
-/// buffer pages, and typical collection workloads. Cost is one
-/// `REQUEST_FRAMES` round-trip at bootstrap, ≈ 512 KiB of physical RAM.
-const HEAP_INITIAL_PAGES: u64 = 128;
+/// buffer pages, typical collection workloads, AND the peak of a piped
+/// `Command::spawn` (parent-side `Pipe×3` + death-bridge thread stack +
+/// per-thread IPC buffer + Arc<Packet> for join-handle) without ever
+/// needing `grow`. Cost is one `REQUEST_FRAMES` round-trip at bootstrap,
+/// ≈ 2 MiB of physical RAM.
+const HEAP_INITIAL_PAGES: u64 = 512;
 
 /// Minimum grow increment in pages. Allocation-failure retries extend the
 /// heap by at least this many 4 KiB pages to amortise the memmgr IPC

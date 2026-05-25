@@ -93,6 +93,12 @@ impl From<crate::sys::pipe::Pipe> for Stdio {
     }
 }
 
+impl From<crate::boxed::Box<crate::sys::pipe::Pipe>> for Stdio {
+    fn from(pipe: crate::boxed::Box<crate::sys::pipe::Pipe>) -> Stdio {
+        (*pipe).diverge()
+    }
+}
+
 impl From<io::Stdout> for Stdio {
     fn from(_: io::Stdout) -> Stdio {
         Stdio::ParentStdout
@@ -418,9 +424,9 @@ impl Command {
         // which directions the caller piped. Errors tear the partial
         // child down before returning.
         let pipes_result = (|| -> io::Result<(
-            Option<crate::sys::pipe::seraph::Pipe>,
-            Option<crate::sys::pipe::seraph::Pipe>,
-            Option<crate::sys::pipe::seraph::Pipe>,
+            Option<ChildPipe>,
+            Option<ChildPipe>,
+            Option<ChildPipe>,
         )> {
             let stdin = if want_stdin_pipe {
                 Some(install_pipe(
@@ -720,9 +726,11 @@ fn install_pipe(
     ipc_ptr: *mut u64,
     direction: u64,
     parent_role: crate::sys::pipe::seraph::Role,
-) -> io::Result<crate::sys::pipe::seraph::Pipe> {
+) -> io::Result<ChildPipe> {
     use crate::sys::pipe::seraph::{Pipe, RING_CAPACITY};
     let (parent, caps) = Pipe::create_for_child(parent_role)?;
+    // Pin to heap before any further moves; see `ChildPipe` alias.
+    let parent = crate::boxed::Box::new(parent);
     let cap_msg = ipc::IpcMessage::builder(procmgr_labels::CONFIGURE_PIPE)
         .word(0, direction)
         .word(1, u64::from(RING_CAPACITY))
@@ -1112,7 +1120,13 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
 
 // ── ChildPipe ───────────────────────────────────────────────────────────────
 
-pub type ChildPipe = crate::sys::pipe::Pipe;
+// Heap-allocated so the `Pipe` itself never relocates after
+// construction. `ChildPipe` is moved repeatedly through `StdioPipes`,
+// `Child`, and into caller stacks; copying just the `Box` pointer
+// (single 8-byte atomic store) keeps the `Pipe` field block stable so
+// concurrent observers of a partial cross-CPU memcpy of those bytes
+// cannot see a half-populated layout.
+pub type ChildPipe = crate::boxed::Box<crate::sys::pipe::Pipe>;
 
 /// Drain `out` and `err` to their respective vectors. Sequential v1
 /// implementation: stdout first, then stderr. Children that fill the

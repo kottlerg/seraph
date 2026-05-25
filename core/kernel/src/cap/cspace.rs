@@ -291,7 +291,7 @@ impl CSpace
         let idx = index as usize;
         let page_idx = idx / L2_SIZE;
         let slot_idx = idx % L2_SIZE;
-        let page_nn = self.directory[page_idx]?;
+        let page_nn = (*self.directory.get(page_idx)?)?;
         // SAFETY: directory entries are never aliased while the CSpace lock
         // is held; CapabilitySlot is repr(C) and the page bytes are exclusively
         // owned by this CSpace.
@@ -305,7 +305,7 @@ impl CSpace
         let idx = index as usize;
         let page_idx = idx / L2_SIZE;
         let slot_idx = idx % L2_SIZE;
-        let mut page_nn = self.directory[page_idx]?;
+        let mut page_nn = (*self.directory.get(page_idx)?)?;
         // SAFETY: same as `slot`; `&mut self` excludes other readers.
         let page = unsafe { page_nn.as_mut() };
         Some(&mut page.slots[slot_idx])

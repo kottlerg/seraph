@@ -97,20 +97,28 @@ pub unsafe fn lazy_enable_fp_v_initial()
 #[cfg(test)]
 pub unsafe fn lazy_enable_fp_v_initial() {}
 
-/// Return `true` if `insn` (a 32-bit RISC-V instruction encoding from
-/// `stval` on an illegal-instruction trap) is an F, D, or V instruction —
-/// i.e. the trap was caused by FS=Off or VS=Off and is a candidate for
-/// lazy enable.
+/// Return `true` if `insn` (a RISC-V instruction encoding from `stval` on an
+/// illegal-instruction trap) is an F, D, or V instruction — i.e. the trap was
+/// caused by FS=Off or VS=Off and is a candidate for lazy enable.
 ///
-/// Decodes the major opcode (bits [6:0]):
-/// - `0x07` LOAD-FP    (FLW/FLD, vector loads)
-/// - `0x27` STORE-FP   (FSW/FSD, vector stores)
-/// - `0x43` MADD       (FMADD)
-/// - `0x47` MSUB       (FMSUB)
-/// - `0x4B` NMSUB      (FNMSUB)
-/// - `0x4F` NMADD      (FNMADD)
-/// - `0x53` OP-FP      (FP arithmetic)
-/// - `0x57` OP-V       (vector arithmetic, vsetvl[i])
+/// The lazy mechanism re-arms the trap on every switch-out, so the trapping
+/// instruction is the *first* F/D/V op a thread executes after switch-in. To
+/// avoid spuriously killing the thread, every encoding that can be that first
+/// op must be recognised here. That is three classes, not just FP/V
+/// arithmetic:
+///
+/// * 32-bit FP/V arith / load / store / fused-multiply (major opcodes below).
+/// * 32-bit FP/V **CSR** accesses (`csrr`/`csrw` of `fcsr`/`fflags`/`frm` or
+///   `vstart`/`vxsat`/`vxrm`/`vcsr`/`vl`/`vtype`/`vlenb`) — these are SYSTEM
+///   opcode `0x73` and also trap while FS/VS=Off (autovectorised `memcpy`
+///   reads `vlenb`, for example).
+/// * Compressed F/D load/store (`c.fld`/`c.fsd`/`c.fldsp`/`c.fsdsp`); RV64 has
+///   no `c.flw`/`c.fsw` and there are no compressed vector encodings.
+///
+/// 32-bit major opcodes (bits [6:0]):
+/// - `0x07` LOAD-FP, `0x27` STORE-FP (scalar + vector load/store)
+/// - `0x43`/`0x47`/`0x4B`/`0x4F` FMADD/FMSUB/FNMSUB/FNMADD
+/// - `0x53` OP-FP, `0x57` OP-V (incl. `vsetvl[i]`)
 ///
 /// Returns `false` if `insn == 0`, which some implementations write to
 /// `stval` instead of the trapping encoding — the caller must then treat
@@ -121,8 +129,34 @@ pub fn is_fp_or_v_opcode(insn: u64) -> bool
     {
         return false;
     }
-    let major = (insn & 0x7F) as u8;
-    matches!(major, 0x07 | 0x27 | 0x43 | 0x47 | 0x4B | 0x4F | 0x53 | 0x57)
+    // bits[1:0] == 0b11 marks a 32-bit instruction; anything else is a 16-bit
+    // compressed encoding.
+    if insn & 0x3 == 0x3
+    {
+        let major = (insn & 0x7F) as u8;
+        if matches!(major, 0x07 | 0x27 | 0x43 | 0x47 | 0x4B | 0x4F | 0x53 | 0x57)
+        {
+            return true;
+        }
+        // SYSTEM opcode with a non-zero funct3 is a CSR op (funct3 == 0 is
+        // ecall/ebreak/xret). Match the F/D and V CSR addresses (bits[31:20]).
+        if major == 0x73 && (insn >> 12) & 0x7 != 0
+        {
+            let csr = (insn >> 20) & 0xFFF;
+            return matches!(
+                csr,
+                0x001 | 0x002 | 0x003           // fflags, frm, fcsr
+                    | 0x008 | 0x009 | 0x00A     // vstart, vxsat, vxrm
+                    | 0x00F                     // vcsr
+                    | 0xC20 | 0xC21 | 0xC22 // vl, vtype, vlenb
+            );
+        }
+        return false;
+    }
+    // Compressed F/D load/store: quadrant C0 (`c.fld`/`c.fsd`) and C2
+    // (`c.fldsp`/`c.fsdsp`) both use funct3 (bits[15:13]) ∈ {0b001, 0b101},
+    // which are FP-only in those quadrants on RV64.
+    matches!(insn & 0x3, 0b00 | 0b10) && matches!((insn >> 13) & 0x7, 0b001 | 0b101)
 }
 
 /// Save the live F/D register file to `area`.
@@ -523,9 +557,19 @@ unsafe fn save_v_to(area: *mut u8)
 }
 
 /// Restore V state from `area`. Whole-register loads (`vl8re8.v`) ignore
-/// `vstart`. After the register loads, `vsetvl` resets `vl`/`vtype` from
-/// the saved values (clearing `vstart` as a side effect), then `vstart`
-/// and `vcsr` are explicitly written back from the saved values.
+/// `vl`/`vtype`/`vstart`, so the data registers are restored first. `vl`
+/// and `vtype` are then restored exactly via `vsetvl` (AVL = saved `vl`),
+/// after which `vcsr` and `vstart` are written back (`vsetvl` clears
+/// `vstart`).
+///
+/// Restoring `vl`/`vtype` is required for correctness, not optional: the
+/// kernel re-arms the lazy-trap on switch-out, so a thread that was
+/// preempted *between* its `vsetvli` and a dependent vector memory op
+/// (`vle*`/`vse*`) resumes — through this lazy-trap path — directly at that
+/// memory op, without re-executing the `vsetvli`. It must therefore observe
+/// the `vl`/`vtype` it had set, not whatever values another thread left in
+/// the live CSRs; otherwise the resumed `vle`/`vse` runs with the wrong
+/// element count and silently mis-sizes the transfer.
 ///
 /// # Safety
 /// Must execute in supervisor mode. `sstatus.VS` must be non-Off. `area`
@@ -534,14 +578,9 @@ unsafe fn save_v_to(area: *mut u8)
 #[inline]
 unsafe fn restore_v_from(area: *const u8)
 {
-    // SAFETY: caller's contract.
-    // Note: vl/vtype/vcsr restoration is intentionally minimal — `vsetvl`
-    // with a saved (vl=0, vtype=0) on the first lazy-trap can land
-    // hardware in a state user code doesn't tolerate. The user's own
-    // `vsetvli`/`vsetvl` immediately following the lazy-restored trap
-    // re-establishes the correct vtype/vl before any V op that depends
-    // on them. vstart is the one piece that matters across interrupted
-    // V ops, so it is restored.
+    // SAFETY: caller's contract. `vsetvl x0, vl, vtype` takes AVL from the
+    // saved `vl` register (rs1 != x0), reproducing vl = min(saved_vl, vlmax)
+    // = saved_vl for the saved vtype; rd = x0 discards the written length.
     unsafe {
         core::arch::asm!(
             ".option push",
@@ -556,14 +595,84 @@ unsafe fn restore_v_from(area: *const u8)
             "vl8re8.v v16, ({p})",
             "add {p}, {p}, {stride}",
             "vl8re8.v v24, ({p})",
+            // Restore vtype + vl exactly (AVL = saved vl).
+            "ld {vl}, 272({a})",
+            "ld {vtype}, 280({a})",
+            "vsetvl x0, {vl}, {vtype}",
+            // vsetvl clears vstart; restore vcsr then vstart from the area.
+            "ld {tmp}, 288({a})",
+            "csrw vcsr, {tmp}",
             "ld {tmp}, 264({a})",
             "csrw vstart, {tmp}",
             ".option pop",
             a = in(reg) area,
             tmp = out(reg) _,
+            vl = out(reg) _,
+            vtype = out(reg) _,
             p = out(reg) _,
             stride = out(reg) _,
             options(nostack),
         );
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests
+{
+    use super::is_fp_or_v_opcode;
+
+    #[test]
+    fn zero_stval_is_not_fp_v()
+    {
+        // Some implementations write 0 to stval instead of the encoding.
+        assert!(!is_fp_or_v_opcode(0));
+    }
+
+    #[test]
+    fn fp_v_arith_load_store_opcodes()
+    {
+        assert!(is_fp_or_v_opcode(0x0000_3007)); // fld f0, 0(x0)   (LOAD-FP)
+        assert!(is_fp_or_v_opcode(0x0000_30a7)); // fsd f0, 0(x1)   (STORE-FP)
+        assert!(is_fp_or_v_opcode(0x0000_70d7)); // OP-V (vsetvl[i]/arith)
+    }
+
+    #[test]
+    fn vector_csr_reads_are_fp_v()
+    {
+        // The exact encoding that killed vfsd (run 132): `csrr a1, vlenb`.
+        assert!(is_fp_or_v_opcode(0xc220_25f3));
+        // csrr x0, vl / vtype.
+        assert!(is_fp_or_v_opcode(0xc200_2073)); // vl    (0xC20)
+        assert!(is_fp_or_v_opcode(0xc210_2073)); // vtype (0xC21)
+        // FP CSR (fcsr) read also traps while FS=Off.
+        assert!(is_fp_or_v_opcode(0x0030_2073)); // csrr x0, fcsr (0x003)
+    }
+
+    #[test]
+    fn system_non_csr_and_integer_ops_are_not_fp_v()
+    {
+        assert!(!is_fp_or_v_opcode(0x0000_0073)); // ecall (funct3 == 0)
+        assert!(!is_fp_or_v_opcode(0x0010_0073)); // ebreak
+        assert!(!is_fp_or_v_opcode(0x0000_0013)); // addi x0, x0, 0
+        assert!(!is_fp_or_v_opcode(0xc000_2073)); // csrr x0, cycle (non-FP/V CSR)
+    }
+
+    #[test]
+    fn compressed_fp_load_store_is_fp_v()
+    {
+        assert!(is_fp_or_v_opcode(0x2000)); // C0 funct3=001 (c.fld)
+        assert!(is_fp_or_v_opcode(0xa000)); // C0 funct3=101 (c.fsd)
+        assert!(is_fp_or_v_opcode(0x2002)); // C2 funct3=001 (c.fldsp)
+        assert!(is_fp_or_v_opcode(0xa002)); // C2 funct3=101 (c.fsdsp)
+    }
+
+    #[test]
+    fn compressed_integer_ops_are_not_fp_v()
+    {
+        assert!(!is_fp_or_v_opcode(0x0001)); // c.nop / c.addi (C1)
+        assert!(!is_fp_or_v_opcode(0x4000)); // C0 funct3=010 (c.lw)
+        assert!(!is_fp_or_v_opcode(0x4002)); // C2 funct3=010 (c.lwsp)
     }
 }

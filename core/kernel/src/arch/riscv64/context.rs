@@ -159,6 +159,17 @@ pub unsafe extern "C" fn switch(
     // a2 = save_flag (*const AtomicU32) — context_saved flag on current TCB
     // SAFETY: switch_context preserves ABI; both pointers valid; stack/frame pointers valid.
     core::arch::naked_asm!(
+        // Drain prior memory ops on this hart before the SavedState
+        // save block. The outgoing thread's user-mode writes (and any
+        // kernel writes that happened during its syscall handling)
+        // must be ordered against the saves below so that, after a
+        // peer hart Acquires `context_saved == 1` and dispatches this
+        // TCB, every prior write the resuming thread will read — kernel
+        // and user — is globally visible. The Release `fence rw, w` at
+        // the end of this routine orders the saves themselves against
+        // the flag publication; this leading fence covers the writes
+        // that precede the save block.
+        "fence rw, rw",
         // ── Save current thread to *a0 ────────────────────────────────────
         // `ra` holds the return address from the `call switch` instruction;
         // saving it means the resumed thread will "return" to the call site.
@@ -267,6 +278,14 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
     //   s9=192, s10=200, s11=208, t3=216, t4=224, t5=232, t6=240,
     //   sepc=248, scause=256, stval=264, sstatus=272
     core::arch::naked_asm!(
+        // Drain prior memory ops on this hart before reading TrapFrame
+        // fields. On a first dispatch of a freshly-spawned thread the
+        // writer (procmgr populating ProcessInfo + sys_thread_configure
+        // populating this TrapFrame) ran on a different hart; without
+        // this fence a freshly-allocated TCB's u64 fields can be observed
+        // partially zero (lower-half stale from page-zero), leaving the
+        // new thread with a half-published pointer.
+        "fence rw, rw",
         // Set sepc = user entry point.
         "ld t0, 248(a0)",
         "csrw sepc, t0",

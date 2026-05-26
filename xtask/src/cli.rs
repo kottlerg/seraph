@@ -252,7 +252,7 @@ pub struct RunParallelArgs
     /// Regex marking a failed run. On match the log is preserved as
     /// FAIL-<run>.log. Failure takes precedence over success. The default
     /// matches the cross-harness terminal marker
-    /// `[<harness>] SOME TESTS FAILED` (`docs/testing.md`) plus the kernel's
+    /// `[<harness>] SOME TESTS FAILED` ([`docs/testing.md`](../../docs/testing.md)) plus the kernel's
     /// own death markers, so a crash classifies as FAIL rather than HANG: a
     /// hardware trap prints `KERNEL EXCEPTION` then `FATAL:`
     /// (`core/kernel/src/main.rs` `fatal()`), and a Rust `panic!` prints

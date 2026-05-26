@@ -220,7 +220,7 @@ cargo xtask run-parallel \
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
 | `--cpus` | `4` | vCPUs per guest |
 | `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
-| `--fail` | `SOME TESTS FAILED` | Regex marking a failed run; the **first** match wins. The default matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` standardised in [docs/testing.md](../docs/testing.md). On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
+| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )` | Regex marking a failed run; the **first** match wins. Matches the cross-harness terminal marker `[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the kernel's own death markers (`KERNEL EXCEPTION` + `FATAL:` for a hardware trap, `PANIC at`/`PANIC:` for a Rust `panic!`) so a crash classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these. On match the log is preserved as `FAIL-<run>.log`. Failure takes precedence over success. Override with a never-matching pattern (e.g. `'$.^'`) to disable |
 
 **Mode-agnostic**: xtask does not know about ktest, svctest, or any other
 rootfs configuration. Pass/fail markers come from the invoker. The default

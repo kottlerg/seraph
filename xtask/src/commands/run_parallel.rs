@@ -678,12 +678,17 @@ mod tests
     }
 
     #[test]
-    fn rust_panic_classifies_fail()
+    fn located_rust_panic_classifies_fail()
     {
-        let located = "\nPANIC at core/kernel/src/sched/mod.rs:42: assertion failed\n";
-        let bare = "\nPANIC: explicit halt\n";
-        assert!(matches!(classify_log(located), Status::Fail));
-        assert!(matches!(classify_log(bare), Status::Fail));
+        let log = "\nPANIC at core/kernel/src/sched/mod.rs:42: assertion failed\n";
+        assert!(matches!(classify_log(log), Status::Fail));
+    }
+
+    #[test]
+    fn bare_rust_panic_classifies_fail()
+    {
+        let log = "\nPANIC: explicit halt\n";
+        assert!(matches!(classify_log(log), Status::Fail));
     }
 
     #[test]

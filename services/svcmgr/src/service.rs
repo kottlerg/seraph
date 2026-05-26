@@ -34,23 +34,6 @@ pub const POLICY_ON_FAILURE: u8 = 1;
 /// integration-test fixtures whose exit is the success signal.
 pub const POLICY_NEVER: u8 = 2;
 
-/// Criticality: death is informational. Logged; nothing else.
-pub const CRITICALITY_LOW: u8 = 0;
-
-/// Criticality: death is monitored within the restart-budget
-/// envelope. Once the budget is exhausted the service is marked
-/// inactive; the system continues degraded.
-pub const CRITICALITY_NORMAL: u8 = 1;
-
-/// Criticality: death the system cannot survive. On unrecoverable
-/// death (either `POLICY_NEVER` or restart budget exhausted under
-/// `POLICY_ON_FAILURE` / `POLICY_ALWAYS`) svcmgr resolves
-/// `published_names::PWRMGR_SHUTDOWN` from its discovery registry
-/// and issues `pwrmgr_labels::SHUTDOWN` to power the system off
-/// cleanly. Edge case: pwrmgr's own death cannot trigger this
-/// (the shutdown source itself is gone — see `restart.rs`).
-pub const CRITICALITY_HIGH: u8 = 2;
-
 // ── Service table ───────────────────────────────────────────────────────────
 
 /// A monitored service entry in svcmgr's service table.
@@ -81,9 +64,11 @@ pub struct ServiceEntry
     pub bundle_count: u8,
     /// Restart policy (`POLICY_ALWAYS`, `POLICY_ON_FAILURE`, etc.).
     pub restart_policy: u8,
-    /// Criticality level (`CRITICALITY_LOW`, `CRITICALITY_NORMAL`,
-    /// `CRITICALITY_HIGH`).
-    pub criticality: u8,
+    /// Whether the system is viable without this service once it is
+    /// permanently down. `true` → svcmgr initiates graceful shutdown on
+    /// unrecoverable death; `false` → the system continues degraded.
+    /// Orthogonal to `restart_policy`, which alone decides respawn.
+    pub system_critical: bool,
     /// Number of restart attempts so far.
     pub restart_count: u32,
     /// Whether this service is currently active.
@@ -133,7 +118,7 @@ impl ServiceEntry
             }; MAX_BUNDLE_CAPS],
             bundle_count: 0,
             restart_policy: 0,
-            criticality: 0,
+            system_critical: false,
             restart_count: 0,
             active: false,
             bootstrap_token: 0,
@@ -156,6 +141,19 @@ impl ServiceEntry
     {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("???")
     }
+}
+
+/// Heap-backed launch surfaces that don't fit the fixed-size
+/// [`ServiceEntry`] record but must be replayed on every restart so a
+/// respawned child comes back with the same argv/env/cwd/seed it got on
+/// first launch. Held in a table on `SvcmgrState` index-aligned with
+/// `services[]` via the death correlator (which is the table index).
+pub struct RestartRecipe
+{
+    pub argv: Vec<String>,
+    pub env: Vec<String>,
+    pub cwd: Option<String>,
+    pub seed: Vec<String>,
 }
 
 // ── Bootstrap ───────────────────────────────────────────────────────────────

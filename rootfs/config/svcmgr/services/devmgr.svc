@@ -3,10 +3,10 @@
 # Init spawns devmgr in Phase 1 via procmgr CREATE_PROCESS with the
 # devmgr module + firmware-authority caps (IRQ range, RSDP, DTB,
 # apertures, ACPI regions). Those caps are unreachable from svcmgr
-# post-handover, so `restart = never`. `critical = high`: a dead
+# post-handover, so `restart = never`. `critical = yes`: a dead
 # devmgr means no hardware authority distribution and the system
 # cannot continue meaningfully — svcmgr issues a graceful shutdown.
 binary    = /services/devmgr
 restart   = never
-critical  = high
+critical  = yes
 namespace = none

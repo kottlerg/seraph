@@ -76,11 +76,11 @@ enum InstallDest
     Programs,
     /// Installed under `sysroot/tests/<install_name>` — every test
     /// artifact (kernel-surface harness `ktest`, service-surface
-    /// `svctest`, programs-surface orchestrator `usertest`). svcmgr
-    /// does not scan this path; harness recipes live in
-    /// `rootfs/config/svcmgr/tests/`. The `/tests/` tree is the
-    /// single deletion criterion for stripping the system down to
-    /// a non-test distro shape. See docs/testing.md.
+    /// `svctest`, programs-surface orchestrator `usertest`, and the
+    /// `crasher` restart-path fixture). svcmgr does not scan this path;
+    /// harness recipes live in `rootfs/config/svcmgr/tests/`. The
+    /// `/tests/` tree is the single deletion criterion for stripping the
+    /// system down to a non-test distro shape. See docs/testing.md.
     Tests,
     /// Installed under `sysroot/tests/programs/<install_name>` —
     /// per-program tester binaries discovered by the `usertest`
@@ -202,7 +202,7 @@ const SPECS: &[Spec] = &[
         name: "crasher",
         install_name: None,
         profile: BuildProfile::StdUser,
-        dest: InstallDest::Programs,
+        dest: InstallDest::Tests,
         arch_only: None,
     },
     Spec {

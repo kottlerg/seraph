@@ -5,8 +5,8 @@
 # a SEND on devmgr's registry for QUERY_BLOCK_DEVICE. Those caps
 # cannot be re-minted by svcmgr today, so `restart = never`. vfsd
 # being dead means the namespace surface is gone (every absolute
-# `std::fs` op fails); `critical = high` triggers graceful shutdown.
+# `std::fs` op fails); `critical = yes` triggers graceful shutdown.
 binary    = /services/vfsd
 restart   = never
-critical  = high
+critical  = yes
 namespace = none

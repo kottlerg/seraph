@@ -36,7 +36,7 @@ binary    = /tests/svctest
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
-critical  = low
+critical  = no
 namespace = universal
 cwd       = /data
 seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
@@ -50,7 +50,7 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `argv` | no | Space-separated tokens. Becomes NUL-separated, NUL-terminated bytes on the wire. |
 | `env` | no | Space-separated `KEY=VAL` tokens. Same NUL packing as `argv`. |
 | `restart` | yes | One of `never`, `on_failure`, `always`. |
-| `critical` | yes | One of `low`, `normal`, `high`. |
+| `critical` | yes | `yes` or `no`. Whether the system is viable without this service once it is permanently down. Orthogonal to `restart`. |
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
 | `cwd` | no | Path interpreted relative to svcmgr's universal root. Forbidden when `namespace = none`. |
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name). |
@@ -70,13 +70,23 @@ automatically — see [restart-protocol.md](restart-protocol.md).
 
 ## `critical`
 
-| Value | Behaviour on death |
-|---|---|
-| `low` | Logged; service marked inactive. No further action. |
-| `normal` | Existing restart-budget envelope applies. Once exhausted the service is left dead; system continues degraded. |
-| `high` | When `should_restart` says no (either `restart = never`, budget exhausted, or restart attempt failed), svcmgr logs `critical service unrecoverable: <name>; initiating graceful shutdown` and issues [`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/lib.rs) via the cap it resolves from [`published_names::PWRMGR_SHUTDOWN`](../../../shared/ipc/src/lib.rs). |
+`critical` answers one question — *can the system keep running without
+this service once it is permanently down?* — and nothing else. It is
+**orthogonal to `restart`**: `restart` (+ the budget) alone decides
+whether and when svcmgr respawns a dead service; `critical` is consulted
+only once a service is permanently down (restart not attempted, budget
+exhausted, or a restart attempt failed).
 
-**pwrmgr's own death** is the edge case. If a `critical = high`
+| Value | Behaviour once permanently down |
+|---|---|
+| `no` | Logged; service marked inactive. The system continues degraded. |
+| `yes` | svcmgr logs `critical service unrecoverable: <name>; initiating graceful shutdown` and issues [`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/lib.rs) via the cap it resolves from [`published_names::PWRMGR_SHUTDOWN`](../../../shared/ipc/src/lib.rs). |
+
+Because the two fields are independent, any combination is valid — e.g.
+`restart = always` + `critical = no` (the `crasher` fixture: respawned on
+every fault, but its eventual permanent death is non-fatal).
+
+**pwrmgr's own death** is the edge case. If a `critical = yes`
 service that *is* `pwrmgr` dies unrecoverably, the shutdown source is
 itself gone; svcmgr logs `critical service unrecoverable: pwrmgr;
 graceful shutdown impossible; system in degraded state` and takes no

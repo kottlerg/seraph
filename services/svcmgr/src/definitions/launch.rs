@@ -12,8 +12,6 @@
 //! the freshly spawned child's thread cap so the caller can bind
 //! death-notification on it.
 
-use ipc::{IpcMessage, procmgr_labels};
-
 use super::{Definition, NamespaceShape};
 use crate::REGISTRY_CAPACITY;
 use crate::registry_lookup_derived;
@@ -35,7 +33,7 @@ pub struct Launched
 /// stack-envelope writer expects from a list of tokens. Returns
 /// `(blob, count)`. Empty input yields an empty blob with `count = 0`,
 /// matching the "no argv / no env" wire shape.
-fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
+pub(crate) fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
 {
     if tokens.is_empty()
     {
@@ -114,7 +112,7 @@ pub fn launch(
     // Resolve seeds AFTER namespace setup so a seed-lookup miss does
     // not leave a configured-but-orphan partial child; if the seed
     // section fails, we still tear down here before launching.
-    let seed_caps = resolve_seeds(def, registry);
+    let seed_caps = resolve_seeds(&def.seed, &def.name, registry);
 
     if !start_process(created.process_handle, ctx.ipc_buf)
     {
@@ -164,46 +162,45 @@ pub fn launch(
 /// the published endpoint. Unresolved names become `0` in their slot
 /// so positional ordering is preserved. Truncated to
 /// `MSG_CAP_SLOTS_MAX` (the bootstrap round's cap limit).
-fn resolve_seeds(def: &Definition, registry: &mut registry::Registry<REGISTRY_CAPACITY>)
--> Vec<u32>
+///
+/// Shared by the launch path and the restart path (which passes the
+/// service's stored [`crate::service::RestartRecipe`] seeds), so a
+/// restarted child gets the same positional cap set it got on first
+/// launch. `svc_name` is for logging only.
+pub(crate) fn resolve_seeds(
+    seed: &[String],
+    svc_name: &str,
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+) -> Vec<u32>
 {
     let cap_max = syscall_abi::MSG_CAP_SLOTS_MAX;
-    let mut caps: Vec<u32> = Vec::with_capacity(def.seed.len().min(cap_max));
-    for name in def.seed.iter().take(cap_max)
+    let mut caps: Vec<u32> = Vec::with_capacity(seed.len().min(cap_max));
+    for name in seed.iter().take(cap_max)
     {
         match registry_lookup_derived(registry, name.as_bytes())
         {
             Ok(cap) => caps.push(cap),
             Err(code) =>
             {
-                std::os::seraph::log!(
-                    "launch {}: seed {:?} unresolved (code={code})",
-                    def.name,
-                    name
-                );
+                std::os::seraph::log!("launch {svc_name}: seed {name:?} unresolved (code={code})");
                 caps.push(0);
             }
         }
     }
-    if def.seed.len() > cap_max
+    if seed.len() > cap_max
     {
         std::os::seraph::log!(
-            "launch {}: seed list truncated to {} entries (had {})",
-            def.name,
-            cap_max,
-            def.seed.len()
+            "launch {svc_name}: seed list truncated to {cap_max} entries (had {})",
+            seed.len()
         );
     }
     caps
 }
 
-/// Apply `def.namespace` + `def.cwd` to a freshly created child via
-/// `CONFIGURE_NAMESPACE`. Local to the launch path because cwd
-/// handling is not present in the restart-side
-/// [`crate::restart::apply_namespace_policy`] (`ServiceEntry` does
-/// not preserve cwd today). On any failure the partial child is
-/// destroyed and `false` is returned.
-#[allow(clippy::too_many_lines)]
+/// Resolve `def.namespace` into the child's namespace cap, then hand it
+/// (plus `def.cwd`) to [`crate::restart::configure_namespace_caps`], the
+/// cwd-walk + `CONFIGURE_NAMESPACE` delivery shared with the restart path.
+/// On any failure the partial child is destroyed and `false` is returned.
 fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &RestartCtx) -> bool
 {
     let process_handle = created.process_handle;
@@ -268,68 +265,14 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
         }
     };
 
-    // cwd: walk against svcmgr's root with read+stat+readdir+lookup —
-    // the minimum a child needs for relative file ops in std::fs.
-    // (Tighter rights are a per-service concern handled at the
-    // namespace cap; cwd shares the same path-walk machinery.)
-    let cwd_cap = if let Some(cwd_path) = &def.cwd
-    {
-        let rights = u64::from(
-            namespace_protocol::rights::LOOKUP
-                | namespace_protocol::rights::READDIR
-                | namespace_protocol::rights::STAT
-                | namespace_protocol::rights::READ,
-        );
-        match std::os::seraph::namespace_lookup_dir(root_cap, cwd_path, rights)
-        {
-            Ok(c) => c,
-            Err(e) =>
-            {
-                std::os::seraph::log!("launch {}: cwd walk {:?} failed: {e}", def.name, cwd_path);
-                let _ = syscall::cap_delete(ns_cap);
-                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
-                return false;
-            }
-        }
-    }
-    else
-    {
-        0
-    };
-
-    let mut builder = IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE).cap(ns_cap);
-    if cwd_cap != 0
-    {
-        builder = builder.cap(cwd_cap);
-    }
-    let ns_msg = builder.build();
-
-    // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(process_handle, &ns_msg, ctx.ipc_buf) };
-    let _ = syscall::cap_delete(ns_cap);
-    if cwd_cap != 0
-    {
-        let _ = syscall::cap_delete(cwd_cap);
-    }
-
-    match reply
-    {
-        Ok(r) if r.label == 0 => true,
-        Ok(r) =>
-        {
-            std::os::seraph::log!(
-                "launch {}: CONFIGURE_NAMESPACE returned {:#x}",
-                def.name,
-                r.label
-            );
-            destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
-            false
-        }
-        Err(_) =>
-        {
-            std::os::seraph::log!("launch {}: CONFIGURE_NAMESPACE syscall failed", def.name);
-            destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
-            false
-        }
-    }
+    // cwd walk + CONFIGURE_NAMESPACE delivery + cap cleanup is shared
+    // with the restart path so both paths install cwd identically.
+    crate::restart::configure_namespace_caps(
+        ns_cap,
+        def.cwd.as_deref(),
+        root_cap,
+        process_handle,
+        thread_cap,
+        ctx,
+    )
 }

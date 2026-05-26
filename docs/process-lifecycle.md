@@ -135,9 +135,12 @@ see
 ### Init reap
 
 After Phase 3 signals `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
-replies immediately, then scans `/config/svcmgr/services/` and launches the
-defined-but-unregistered services — today `crasher.svc` and
-`svctest.svc`), init signs over its own kernel-object caps
+replies immediately, then scans `/config/svcmgr/services/` and launches any
+defined-but-unregistered service it finds — on a normal boot every default
+service is init-registered bind-only, so none launch here; the launch path
+fires only for staged test recipes such as `svctest.svc` / `usertest.svc`
+and the co-staged `crasher.svc` restart fixture), init signs over its own
+kernel-object caps
 (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and
 every reclaimable Frame cap (ELF segments, user stack pages,
 `InitInfo` pages, IPC buffer) to procmgr via

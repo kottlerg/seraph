@@ -30,15 +30,15 @@ svcmgr/
 ├── src/
 │   ├── main.rs                    # _start, IPC dispatch, dispatch_deaths,
 │   │                              # initiate_graceful_shutdown
-│   ├── service.rs                 # ServiceEntry, SvcmgrCaps, restart-policy
-│   │                              # and criticality constants
+│   ├── service.rs                 # ServiceEntry, RestartRecipe, SvcmgrCaps,
+│   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives
 │   │                              # (walk_and_create_from_file, mint_child_creator,
 │   │                              # start_process, apply_namespace_policy),
 │   │                              # death handling, DeathOutcome
 │   ├── definitions/
 │   │   ├── mod.rs                 # Definition struct + RestartPolicy /
-│   │   │                          # Criticality / NamespaceShape enums
+│   │   │                          # NamespaceShape enums
 │   │   ├── parse.rs               # `.svc` key=value parser
 │   │   ├── launch.rs              # First-launch path
 │   │   └── reconcile.rs           # PendingRegistration + reconcile_and_launch
@@ -76,14 +76,19 @@ svcmgr/
   service_index`. Detect crashes via async notifications.
 - **Restart management** — on detected crash, route through
   [`restart::handle_death`](src/restart.rs); shared spawn primitives
-  re-spawn the service from the on-disk recipe. The `.svc` file is
-  the single source of truth for both launch and restart.
+  re-spawn the service from the recorded recipe. The `.svc` file is the
+  single source of truth for both launch and restart — fixed fields on
+  `ServiceEntry`, the heap-backed argv/env/cwd/seed on a parallel
+  `RestartRecipe` — so a restart reproduces the first-launch surfaces.
+  Whether a service restarts is decided by its `restart` policy + budget
+  alone; `critical` is orthogonal (see graceful shutdown below).
 - **Discovery registry** — `PUBLISH_ENDPOINT` (init's
   `PUBLISH_AUTHORITY`-tokened SENDs) and `QUERY_ENDPOINT`
   (per-process SEND seeded into `ProcessInfo.service_registry_cap`).
-- **Graceful shutdown** — when a `critical = high` service dies
-  unrecoverably, resolve `ipc::published_names::PWRMGR_SHUTDOWN`
-  from the registry and issue `pwrmgr_labels::SHUTDOWN`.
+- **Graceful shutdown** — when a `critical = yes` service is permanently
+  down (restart not attempted or budget exhausted), resolve
+  `ipc::published_names::PWRMGR_SHUTDOWN` from the registry and issue
+  `pwrmgr_labels::SHUTDOWN`.
 
 ---
 
@@ -115,7 +120,7 @@ binary    = /tests/svctest
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
-critical  = low
+critical  = no
 namespace = universal
 cwd       = /data
 seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
@@ -124,7 +129,7 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
 `seed`. Unknown keys are hard errors. Restart values:
-`never | on_failure | always`. Criticality values: `low | normal | high`.
+`never | on_failure | always`. Critical values: `yes | no`.
 Namespace forms: `none | universal | subtree:<path>:<rights>`.
 
 ---
@@ -151,12 +156,15 @@ Centralised name constants live in `ipc::published_names`.
 
 ## Criticality
 
-`critical = high` services trigger a graceful shutdown via pwrmgr on
-unrecoverable death (either `restart = never` or restart budget
-exhausted). Edge case: pwrmgr itself cannot trigger shutdown on its
-own death (the shutdown source is gone); svcmgr logs the degraded
-state. See [docs/restart-protocol.md](docs/restart-protocol.md) for
-the decision tree.
+`critical` is binary (`yes` / `no`) and orthogonal to `restart`: it
+governs only what happens once a service is permanently down, not
+whether it restarts. A `critical = yes` service triggers a graceful
+shutdown via pwrmgr on permanent death (restart not attempted, or budget
+exhausted); a `critical = no` service is logged and the system continues
+degraded. Edge case: pwrmgr itself cannot trigger shutdown on its own
+death (the shutdown source is gone); svcmgr logs the degraded state. See
+[docs/restart-protocol.md](docs/restart-protocol.md) for the decision
+tree.
 
 ---
 

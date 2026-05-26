@@ -14,6 +14,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | `fs/` | Filesystem driver implementations (mounted by `vfsd`) |
 | `logd/` | Logging daemon |
 | `netd/` | Network stack daemon |
+| `crasher/` | Test-tier fixture: deliberate-crash canary for svcmgr's restart path (gated, opt-in) |
 
 Manager↔managed pairings are co-located: `devmgr` ↔ `drivers/`, `vfsd` ↔ `fs/`.
 

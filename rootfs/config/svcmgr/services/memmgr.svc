@@ -2,7 +2,7 @@
 #
 # Bootstrapped by init via raw `cap_create_*` syscalls (no
 # CREATE_FROM_FILE; binary cannot be respawned by svcmgr today).
-# `restart = never` + `critical = high`: on unrecoverable death
+# `restart = never` + `critical = yes`: on unrecoverable death
 # svcmgr issues `pwrmgr_labels::SHUTDOWN` via `pwrmgr.shutdown` and
 # the system powers off.
 #
@@ -13,5 +13,5 @@
 # `restart = never`.
 binary    = /services/memmgr
 restart   = never
-critical  = high
+critical  = yes
 namespace = none

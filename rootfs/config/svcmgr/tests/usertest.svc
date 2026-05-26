@@ -10,7 +10,7 @@
 binary    = /tests/usertest
 argv      = usertest
 restart   = never
-critical  = low
+critical  = no
 namespace = universal
 cwd       = /data
 seed      = pwrmgr.shutdown pwrmgr.deny

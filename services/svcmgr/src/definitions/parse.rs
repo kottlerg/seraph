@@ -15,7 +15,7 @@
 
 use namespace_protocol::rights as ns_rights;
 
-use super::{Criticality, Definition, NamespaceShape, RestartPolicy};
+use super::{Definition, NamespaceShape, RestartPolicy};
 
 /// Reasons a `.svc` file is rejected. Stringified into the boot log so
 /// an operator can find the bad line at a glance.
@@ -35,7 +35,7 @@ pub enum ParseError
     InvalidValue(usize, &'static str),
     /// `restart` was not one of `never | on_failure | always`.
     BadRestart(usize, String),
-    /// `critical` was not one of `low | normal | high`.
+    /// `critical` was not one of `yes | no`.
     BadCriticality(usize, String),
     /// `namespace` form was unrecognised. Expected `none`,
     /// `universal`, or `subtree:<path>:<rights>`.
@@ -55,7 +55,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut argv: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
     let mut restart: Option<RestartPolicy> = None;
-    let mut criticality: Option<Criticality> = None;
+    let mut system_critical: Option<bool> = None;
     let mut namespace: Option<NamespaceShape> = None;
     let mut cwd: Option<String> = None;
     let mut seed: Vec<String> = Vec::new();
@@ -138,15 +138,14 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
             }
             "critical" =>
             {
-                if criticality.is_some()
+                if system_critical.is_some()
                 {
                     return Err(ParseError::DuplicateKey(lineno, "critical"));
                 }
-                criticality = Some(match value
+                system_critical = Some(match value
                 {
-                    "low" => Criticality::Low,
-                    "normal" => Criticality::Normal,
-                    "high" => Criticality::High,
+                    "yes" => true,
+                    "no" => false,
                     other => return Err(ParseError::BadCriticality(lineno, other.to_owned())),
                 });
             }
@@ -186,7 +185,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 
     let binary = binary.ok_or(ParseError::MissingKey("binary"))?;
     let restart = restart.ok_or(ParseError::MissingKey("restart"))?;
-    let criticality = criticality.ok_or(ParseError::MissingKey("critical"))?;
+    let system_critical = system_critical.ok_or(ParseError::MissingKey("critical"))?;
     let namespace = namespace.ok_or(ParseError::MissingKey("namespace"))?;
 
     if matches!(namespace, NamespaceShape::None) && cwd.is_some()
@@ -203,7 +202,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         argv,
         env,
         restart,
-        criticality,
+        system_critical,
         namespace,
         cwd,
         seed,
@@ -289,10 +288,7 @@ impl core::fmt::Display for ParseError
             }
             Self::BadCriticality(l, v) =>
             {
-                write!(
-                    f,
-                    "line {l}: bad critical value `{v}` (want low|normal|high)"
-                )
+                write!(f, "line {l}: bad critical value `{v}` (want yes|no)")
             }
             Self::BadNamespace(l, v) =>
             {

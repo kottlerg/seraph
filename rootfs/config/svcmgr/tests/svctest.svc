@@ -13,7 +13,7 @@ binary    = /tests/svctest
 argv      = svctest run
 env       = SERAPH_TEST=1 SERAPH_MODE=boot
 restart   = never
-critical  = low
+critical  = no
 namespace = universal
 cwd       = /data
 seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny

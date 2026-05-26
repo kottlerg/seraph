@@ -210,6 +210,13 @@ pub enum TestComponent
 
 // ── RunParallel ───────────────────────────────────────────────────────────────
 
+/// Default `--fail` regex for `run-parallel`. Matches the cross-harness
+/// `SOME TESTS FAILED` marker plus the kernel's death markers so a crash is
+/// classified FAIL rather than HANG. `KERNEL EXCEPTION` + `FATAL:` cover the
+/// hardware-trap path; `PANIC( at |: )` covers the Rust `#[panic_handler]`.
+/// The benign `USERSPACE FAULT` path matches none of these.
+pub const DEFAULT_FAIL_REGEX: &str = r"SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )";
+
 #[derive(Parser)]
 pub struct RunParallelArgs
 {
@@ -245,9 +252,13 @@ pub struct RunParallelArgs
     /// Regex marking a failed run. On match the log is preserved as
     /// FAIL-<run>.log. Failure takes precedence over success. The default
     /// matches the cross-harness terminal marker
-    /// `[<harness>] SOME TESTS FAILED` standardised in
-    /// [`docs/testing.md`](../../docs/testing.md); override with a
-    /// never-matching pattern (e.g. `'$.^'`) to disable.
-    #[arg(long, default_value = "SOME TESTS FAILED")]
+    /// `[<harness>] SOME TESTS FAILED` (`docs/testing.md`) plus the kernel's
+    /// own death markers, so a crash classifies as FAIL rather than HANG: a
+    /// hardware trap prints `KERNEL EXCEPTION` then `FATAL:`
+    /// (`core/kernel/src/main.rs` `fatal()`), and a Rust `panic!` prints
+    /// `PANIC at`/`PANIC:` (the `#[panic_handler]`). The benign userspace
+    /// fault path prints `USERSPACE FAULT`, which none of these match.
+    /// Override with a never-matching pattern (e.g. `'$.^'`) to disable.
+    #[arg(long, default_value = DEFAULT_FAIL_REGEX)]
     pub fail: String,
 }

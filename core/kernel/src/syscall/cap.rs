@@ -899,6 +899,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 blocked_on_object: core::ptr::null_mut(),
                 thread_id: alloc_thread_id(),
                 context_saved: core::sync::atomic::AtomicU32::new(1),
+                wake_in_flight: core::sync::atomic::AtomicU32::new(0),
                 death_observers: [crate::sched::thread::DeathObserver::empty();
                     crate::sched::thread::MAX_DEATH_OBSERVERS],
                 death_observer_count: 0,

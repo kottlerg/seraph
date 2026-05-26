@@ -950,6 +950,7 @@ unsafe fn kernel_entry_post_rebase(
                         cspace: core::ptr::null_mut(),
                         thread_id: 1, // 0 = idle BSP, 1 = init
                         context_saved: core::sync::atomic::AtomicU32::new(1),
+                        wake_in_flight: core::sync::atomic::AtomicU32::new(0),
                         death_observers: [sched::thread::DeathObserver::empty();
                             sched::thread::MAX_DEATH_OBSERVERS],
                         death_observer_count: 0,

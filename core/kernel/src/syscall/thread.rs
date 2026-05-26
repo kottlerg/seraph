@@ -414,12 +414,26 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
                 // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
                 unsafe {
-                    let _ = (*server).reply_tcb.compare_exchange(
-                        tcb,
-                        core::ptr::null_mut(),
-                        core::sync::atomic::Ordering::AcqRel,
-                        core::sync::atomic::Ordering::Acquire,
-                    );
+                    let cancelled = (*server)
+                        .reply_tcb
+                        .compare_exchange(
+                            tcb,
+                            core::ptr::null_mut(),
+                            core::sync::atomic::Ordering::AcqRel,
+                            core::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok();
+                    // We cancelled the pending reply wake; release the
+                    // wake-in-flight claim endpoint_call/recv set when this
+                    // thread became BlockedOnReply, so a concurrent
+                    // dealloc_object(Thread) does not wait for a wake that will
+                    // never fire (#160).
+                    if cancelled
+                    {
+                        (*tcb)
+                            .wake_in_flight
+                            .store(0, core::sync::atomic::Ordering::Release);
+                    }
                 }
             }
         }

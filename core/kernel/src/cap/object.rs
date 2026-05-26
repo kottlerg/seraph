@@ -1494,12 +1494,28 @@ unsafe fn dealloc_object_one(
                                 use core::sync::atomic::Ordering;
                                 let server =
                                     blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
-                                let _ = (*server).reply_tcb.compare_exchange(
-                                    tcb,
-                                    core::ptr::null_mut(),
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                );
+                                // The Acquire-load of reply_tcb synchronises
+                                // with endpoint_call/recv's Release publication
+                                // of the binding, so the `wake_in_flight = 1`
+                                // they stored before it is visible here. If we
+                                // win the CAS we cancelled the reply wake — clear
+                                // the flag so the gate below does not wait for a
+                                // wake that will never fire. If we lose, a reply
+                                // is in flight and its enqueue_and_wake clears
+                                // the flag; the gate below waits for it (#160).
+                                let cancelled = (*server)
+                                    .reply_tcb
+                                    .compare_exchange(
+                                        tcb,
+                                        core::ptr::null_mut(),
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok();
+                                if cancelled
+                                {
+                                    (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                }
                             }
                             IpcThreadState::None =>
                             {}
@@ -1507,6 +1523,38 @@ unsafe fn dealloc_object_one(
                         (*tcb).blocked_on_object = core::ptr::null_mut();
                     }
                 }
+
+                // Wake-in-flight gate (#160): a waker that popped this thread
+                // from a wait object (signal/endpoint/event_queue/wait_set)
+                // under that object's lock sets `wake_in_flight = 1` before
+                // releasing the lock and clears it in `enqueue_and_wake`. The
+                // unlink above acquired the same wait-object lock after any
+                // such waker released it, so this load cannot miss the set.
+                // Spin until the in-flight wake commits, so `retype_free` below
+                // cannot free the TCB out from under the waker's pending
+                // `enqueue_and_wake` (the residual #117/#160 use-after-free).
+                // Interrupts enabled + preemption disabled, mirroring the
+                // `context_saved` gate above, so the spin does not block
+                // incoming IPIs (FPU flush / TLB shootdown).
+                crate::percpu::preempt_disable();
+                // SAFETY: ring 0; restored below.
+                let wake_saved_int =
+                    unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+                // SAFETY: ring 0; IDT loaded; preempt disabled.
+                unsafe { crate::arch::current::interrupts::enable() };
+                // SAFETY: tcb is valid (not yet freed); wake_in_flight is always
+                // valid on an initialized TCB.
+                while unsafe {
+                    (*tcb)
+                        .wake_in_flight
+                        .load(core::sync::atomic::Ordering::Acquire)
+                } != 0
+                {
+                    core::hint::spin_loop();
+                }
+                // SAFETY: wake_saved_int from save_and_disable_interrupts above.
+                unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
+                crate::percpu::preempt_enable();
 
                 // x86-64: release the per-thread IOPB to SEED if one was
                 // bound via `sys_iopb_set`. RISC-V threads never set this

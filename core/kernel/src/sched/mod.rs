@@ -867,6 +867,7 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
                     blocked_on_object: core::ptr::null_mut(),
                     thread_id: alloc_thread_id(),
                     context_saved: core::sync::atomic::AtomicU32::new(1),
+                    wake_in_flight: core::sync::atomic::AtomicU32::new(0),
                     death_observers: [thread::DeathObserver::empty(); thread::MAX_DEATH_OBSERVERS],
                     death_observer_count: 0,
                     exit_reason: 0,
@@ -1636,6 +1637,15 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         thread::ThreadState::Stopped | thread::ThreadState::Exited
     )
     {
+        // Wake aborted (a concurrent stop/dealloc won). Still clear the
+        // wake-in-flight gate the waker set at pop time so a waiting
+        // `dealloc_object(Thread)` can proceed to free this TCB.
+        // SAFETY: tcb valid; lock held.
+        unsafe {
+            (*tcb)
+                .wake_in_flight
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
         // SAFETY: paired with lock_raw above.
         unsafe { sched.lock.unlock_raw(saved) };
         return;
@@ -1665,6 +1675,18 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     // CPU observing the bit. Idle loop sees the flag (or the IPI hits its
     // halt boundary). See docs/scheduling-internals.md § Wake Protocol.
     set_reschedule_pending_for(target_cpu);
+
+    // Wake committed: the thread is Ready and enqueued under sched.lock. Clear
+    // the wake-in-flight gate so a waiting `dealloc_object(Thread)` may proceed
+    // (it will then observe the thread via the run queue / current and apply
+    // its existing removal + context_saved gate). Release pairs with the
+    // Acquire spin in dealloc.
+    // SAFETY: tcb valid; lock held.
+    unsafe {
+        (*tcb)
+            .wake_in_flight
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
 
     // SAFETY: saved was returned by the matching lock_raw above.
     unsafe { sched.lock.unlock_raw(saved) };

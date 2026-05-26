@@ -643,3 +643,78 @@ fn us_to_s(us: u128) -> f64
 {
     us as f64 / 1_000_000.0
 }
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+    use crate::cli::DEFAULT_FAIL_REGEX;
+
+    fn default_regexes() -> (Regex, Regex)
+    {
+        (
+            Regex::new("ALL TESTS PASSED").unwrap(),
+            Regex::new(DEFAULT_FAIL_REGEX).unwrap(),
+        )
+    }
+
+    fn classify_log(log: &str) -> Status
+    {
+        let (pass, fail) = default_regexes();
+        // exit_rc=0, hung=false: the kernel halts after a panic, so QEMU is
+        // SIGKILLed by the watchdog in practice; pass `hung=true` only where a
+        // test exercises the timeout path explicitly.
+        classify(0, false, log, &pass, &fail).0
+    }
+
+    #[test]
+    fn kernel_exception_classifies_fail()
+    {
+        let log = "[20.09] ktest: stress::concurrent_ipc starting\n\
+                   [22.86] kernel: KERNEL EXCEPTION: cpu=0 cause=#PF page fault (vec=14 err=0x10)\n\
+                   [22.86] kernel:   rip=0x0000000000000000  cr2=0x0000000000000000\n\
+                   [22.86] kernel: FATAL: unhandled kernel exception\n";
+        assert!(matches!(classify_log(log), Status::Fail));
+    }
+
+    #[test]
+    fn located_rust_panic_classifies_fail()
+    {
+        let log = "\nPANIC at core/kernel/src/sched/mod.rs:42: assertion failed\n";
+        assert!(matches!(classify_log(log), Status::Fail));
+    }
+
+    #[test]
+    fn bare_rust_panic_classifies_fail()
+    {
+        let log = "\nPANIC: explicit halt\n";
+        assert!(matches!(classify_log(log), Status::Fail));
+    }
+
+    #[test]
+    fn boot_phase_fatal_classifies_fail()
+    {
+        let log = "[0.10] kernel: FATAL: Phase 9: init image missing or has no entry point\n";
+        assert!(matches!(classify_log(log), Status::Fail));
+    }
+
+    #[test]
+    fn userspace_fault_with_pass_marker_classifies_pass()
+    {
+        // crasher's deliberate userspace fault must NOT trip the fail regex;
+        // a run that also prints the terminal marker is a PASS.
+        let log = "[2.16] kernel: USERSPACE FAULT: tid=27 cpu=1 cause=store/AMO page fault (scause=0xf)\n\
+                   [2.17] kernel:   rip=0x0000000000012bf8  fs_base=0x0000000000000000\n\
+                   [4.27] [usertest] ALL TESTS PASSED\n";
+        assert!(matches!(classify_log(log), Status::Pass));
+    }
+
+    #[test]
+    fn clean_exit_without_marker_classifies_ok()
+    {
+        assert!(matches!(
+            classify_log("[1.0] booting\n[2.0] idle\n"),
+            Status::Ok
+        ));
+    }
+}

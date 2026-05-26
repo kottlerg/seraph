@@ -1227,8 +1227,9 @@ pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistra
 /// register pwrmgr with svcmgr (v3 wire), publish the named caps
 /// post-#21 consumers resolve from `/config/svcmgr/services/<name>.svc` `seed = ...`
 /// lines, then signal `HANDOVER_COMPLETE` so svcmgr scans
-/// `/config/svcmgr/services/` and launches the unregistered-but-defined services
-/// (crasher, svctest).
+/// `/config/svcmgr/services/`. On a normal boot the defined services there are
+/// all init-registered (bind-only); svcmgr's launch path fires only for staged
+/// test recipes (svctest / usertest, and crasher co-staged with svctest).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn phase3_svcmgr_handover(
     info: &InitInfo,

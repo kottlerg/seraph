@@ -1,0 +1,23 @@
+# /tests/crasher — deliberate-crash fixture for svcmgr's restart path.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# Co-staged with svctest (services-surface harness) in CI and stageable
+# by hand: copy this file into /config/svcmgr/services/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+#
+# Exercises restart-surface preservation: on every spawn crasher asserts
+# its argv / env / cwd / seed match this recipe, logs `[crasher] … ok`,
+# then deliberately faults. `restart = always` drives svcmgr to respawn
+# it; with MAX_RESTARTS the budget bounds it to a fixed number of spawns,
+# then it is left degraded (`critical = no` — the system continues). A
+# surface that fails to survive restart makes crasher log `FATAL:`, which
+# fails the run. Confined to a read-only `/tests` subtree to model the
+# min-privilege shape future real services use.
+binary    = /tests/crasher
+argv      = crasher selftest
+env       = CRASHER_MARKER=107
+namespace = subtree:/tests:LOOKUP+READDIR+STAT+READ
+cwd       = /tests
+restart   = always
+critical  = no
+seed      = svcmgr pwrmgr.deny

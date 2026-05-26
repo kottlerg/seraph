@@ -4,9 +4,9 @@
 # the chooser for every subsequent process creation; svcmgr has a
 # documented future raw-syscall fallback to reconstruct procmgr from
 # its boot module (not implemented today). `restart = never` +
-# `critical = high` matches the current shape: on unrecoverable
+# `critical = yes` matches the current shape: on unrecoverable
 # death svcmgr issues `pwrmgr_labels::SHUTDOWN`.
 binary    = /services/procmgr
 restart   = never
-critical  = high
+critical  = yes
 namespace = none

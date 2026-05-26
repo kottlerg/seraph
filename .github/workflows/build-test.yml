@@ -95,10 +95,18 @@ jobs:
         # cargo. ktest swaps the bundle's `init` entry via
         # `cargo xtask compose-bundle --harness ktest`, which repacks
         # the disk image as part of the compose step.
+        #
+        # The svctest cell also co-stages crasher (the restart-path
+        # fixture): crasher is non-shutdown, so it shares the boot with
+        # svctest without racing pwrmgr shutdown; its bounded faults
+        # finish long before svctest's terminal marker. This is the only
+        # automated boot crasher runs in.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
               cp sysroot/config/svcmgr/tests/svctest.svc \
+                 sysroot/config/svcmgr/services/
+              cp sysroot/config/svcmgr/tests/crasher.svc \
                  sysroot/config/svcmgr/services/
               cargo xtask mkdisk --arch ${{ matrix.arch }}
               ;;

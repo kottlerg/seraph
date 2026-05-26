@@ -35,7 +35,7 @@ mod service;
 
 use definitions::reconcile::PendingRegistration;
 use ipc::{IpcMessage, svcmgr_labels};
-use service::{MAX_SERVICES, ServiceEntry, bootstrap_caps};
+use service::{MAX_SERVICES, RestartRecipe, ServiceEntry, bootstrap_caps};
 use std::os::seraph::{StartupInfo, startup_info};
 
 /// Global discovery registry size. Enough for a handful of top-level named
@@ -253,6 +253,7 @@ fn main() -> !
 
     let mut state = SvcmgrState {
         services: [const { ServiceEntry::empty() }; MAX_SERVICES],
+        recipes: [const { None }; MAX_SERVICES],
         service_count: 0,
         pending: [const { PendingRegistration::empty() }; MAX_PENDING_REGISTRATIONS],
         pending_count: 0,
@@ -283,6 +284,10 @@ const WS_TOKEN_DEATHS: u64 = 1;
 pub struct SvcmgrState
 {
     pub services: [ServiceEntry; MAX_SERVICES],
+    /// Heap-backed restart surfaces, index-aligned with `services` via
+    /// the death correlator. `None` for slots with no svcmgr-launched
+    /// recipe. See [`RestartRecipe`].
+    pub recipes: [Option<RestartRecipe>; MAX_SERVICES],
     pub service_count: usize,
     pub pending: [PendingRegistration; MAX_PENDING_REGISTRATIONS],
     pub pending_count: usize,
@@ -362,6 +367,7 @@ fn dispatch_ipc(service_ep: u32, state: &mut SvcmgrState, ctx: &restart::Restart
                 &mut state.pending,
                 state.pending_count,
                 &mut state.services,
+                &mut state.recipes,
                 &mut state.service_count,
                 ctx.deaths_eq,
                 ctx,
@@ -545,7 +551,22 @@ fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::Resta
             continue;
         }
 
-        let outcome = restart::handle_death(&mut state.services[idx], exit_reason, ctx, correlator);
+        // Split disjoint field borrows so handle_death gets the entry, its
+        // restart recipe, and the registry (for seed re-resolution) at once.
+        let SvcmgrState {
+            services,
+            recipes,
+            registry,
+            ..
+        } = state;
+        let outcome = restart::handle_death(
+            &mut services[idx],
+            exit_reason,
+            ctx,
+            correlator,
+            recipes[idx].as_ref(),
+            registry,
+        );
         if matches!(outcome, restart::DeathOutcome::Unrecoverable)
         {
             initiate_graceful_shutdown(state, ctx, idx);
@@ -555,8 +576,8 @@ fn dispatch_deaths(deaths_eq: u32, state: &mut SvcmgrState, ctx: &restart::Resta
 
 /// Resolve `published_names::PWRMGR_SHUTDOWN` from the discovery
 /// registry and issue `pwrmgr_labels::SHUTDOWN` to power the system
-/// off cleanly. Called from [`dispatch_deaths`] when a service with
-/// `critical = high` dies unrecoverably.
+/// off cleanly. Called from [`dispatch_deaths`] when a `system_critical`
+/// service dies unrecoverably.
 ///
 /// Edge case: if the dying service IS pwrmgr, the shutdown source
 /// itself is gone; svcmgr logs the degraded state and returns.

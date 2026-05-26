@@ -125,11 +125,11 @@ in a sibling directory that `svcmgr` does not scan:
 rootfs/config/svcmgr/
 ├── services/                 # always loaded by svcmgr
 │   ├── procmgr.svc
-│   ├── crasher.svc           # services-tier canary (always on)
 │   └── …
 └── tests/                    # NOT loaded by svcmgr
     ├── svctest.svc
-    └── usertest.svc
+    ├── usertest.svc
+    └── crasher.svc           # restart-path fixture; co-staged with svctest
 ```
 
 To enable a harness for a boot, copy its recipe from
@@ -157,14 +157,20 @@ Reset to the default-init bundle by re-running `cargo xtask build` or
 compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-compose-bundle)).
 
-### One harness per boot
+### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` both invoke `pwrmgr` shutdown on completion. Two
-harnesses staged together race on shutdown — the slower one may not
-finish. Per boot, exactly one harness recipe MUST be staged in
-`/config/svcmgr/services/`.
+such harnesses staged together race on shutdown — the slower one may not
+finish. Per boot, exactly one *shutdown-invoking* harness recipe MUST be
+staged in `/config/svcmgr/services/`.
 
-CI matrix cells follow this rule: one harness per cell.
+Non-shutdown fixtures may co-stage alongside one harness. `crasher`
+(`restart = always`, never shuts down) is co-staged with `svctest` in
+the services-surface CI cell so its restart loop is exercised there; its
+bounded faults complete long before `svctest`'s terminal marker, so the
+kernel fault dump never clobbers it.
+
+CI matrix cells follow this rule: one shutdown-invoking harness per cell.
 
 ---
 
@@ -177,8 +183,8 @@ CI matrix cells follow this rule: one harness per cell.
   `.svc` recipe.
 - **Restart policy.** A harness MUST set `restart = never` in its `.svc`
   recipe. Re-running on accidental exit corrupts CI semantics.
-- **Critical class.** A harness MUST set `critical = low`. Harness death
-  MUST NOT panic the supervisor.
+- **Critical class.** A harness MUST set `critical = no`. Harness death
+  MUST NOT bring down the supervisor or trip the graceful-shutdown path.
 - **Capability seeding.** A harness depends only on seeds declared in
   its `.svc` recipe. The harness MUST log its own seed-resolution state
   before running tests, so failures attributable to missing capabilities

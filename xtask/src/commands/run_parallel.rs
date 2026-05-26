@@ -701,11 +701,12 @@ mod tests
     #[test]
     fn userspace_fault_with_pass_marker_classifies_pass()
     {
-        // crasher's deliberate userspace fault must NOT trip the fail regex;
-        // a run that also prints the terminal marker is a PASS.
+        // crasher's deliberate userspace fault (co-staged with svctest) must
+        // NOT trip the fail regex; a run that also prints the terminal marker
+        // is a PASS.
         let log = "[2.16] kernel: USERSPACE FAULT: tid=27 cpu=1 cause=store/AMO page fault (scause=0xf)\n\
                    [2.17] kernel:   rip=0x0000000000012bf8  fs_base=0x0000000000000000\n\
-                   [4.27] [usertest] ALL TESTS PASSED\n";
+                   [4.27] [svctest] ALL TESTS PASSED\n";
         assert!(matches!(classify_log(log), Status::Pass));
     }
 

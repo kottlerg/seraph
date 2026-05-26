@@ -48,26 +48,6 @@ pub enum RestartPolicy
     Always,
 }
 
-/// System-impact level parsed from the `critical = ...` line.
-///
-/// Used by the death handler to decide what happens when a service
-/// dies and cannot be recovered (either `restart = never`, or the
-/// restart budget is exhausted under `on_failure` / `always`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Criticality
-{
-    /// Death is informational. Logged; nothing else.
-    Low,
-    /// Death is monitored against the restart budget. Once the
-    /// budget is exhausted the service is left dead; the system
-    /// continues degraded.
-    Normal,
-    /// Death the system cannot survive. On unrecoverable death
-    /// svcmgr logs and issues `pwrmgr_labels::SHUTDOWN` via the cap
-    /// it resolved from `published_names::PWRMGR_SHUTDOWN`.
-    High,
-}
-
 /// Namespace shape parsed from the `namespace = ...` line.
 ///
 /// One of:
@@ -106,7 +86,13 @@ pub struct Definition
     /// launch time as NUL-separated, NUL-terminated bytes.
     pub env: Vec<String>,
     pub restart: RestartPolicy,
-    pub criticality: Criticality,
+    /// Whether the system is viable without this service once it is
+    /// permanently down (restart not attempted, or budget exhausted).
+    /// `true` (`critical = yes`) → svcmgr issues `pwrmgr_labels::SHUTDOWN`
+    /// on unrecoverable death; `false` (`critical = no`) → the system
+    /// continues degraded. Orthogonal to [`Definition::restart`], which
+    /// alone decides whether/when to respawn.
+    pub system_critical: bool,
     pub namespace: NamespaceShape,
     /// Optional cwd path. Interpreted relative to the namespace root
     /// installed via [`NamespaceShape`], or absolute against svcmgr's

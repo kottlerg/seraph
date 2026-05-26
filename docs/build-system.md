@@ -137,12 +137,13 @@ sysroot/
                           # respawns walk /services/fs/<name>.
   programs/               # Userspace utilities and test programs sourced
                           # from programs/ in the repo tree (hello,
-                          # crasher, fsbench, stackoverflow, pipefault,
+                          # fsbench, stackoverflow, pipefault,
                           # stdiotest). Loaded by procmgr from the root
                           # partition via VFS at runtime.
   tests/                  # All test artifacts: kernel-surface harness
                           # (ktest), services-surface (svctest),
-                          # programs-surface orchestrator (usertest).
+                          # programs-surface orchestrator (usertest),
+                          # and the crasher restart-path fixture.
                           # Deleting this tree strips the system to a
                           # non-test distro shape.
   tests/programs/         # Per-program tester binaries discovered by

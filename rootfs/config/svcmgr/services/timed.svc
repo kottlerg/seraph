@@ -5,10 +5,10 @@
 # `ProcessInfo.service_registry_cap`; both surfaces are reachable
 # from a fresh launch, so a future restart is feasible. For now
 # `restart = never` matches the pre-#21 shape (no restart path
-# preserves the registry handshake). `critical = normal`: a dead
+# preserves the registry handshake). `critical = no`: a dead
 # timed leaves `SystemTime::now()` returning UNIX_EPOCH but does
 # not break the system; logged and left inactive.
 binary    = /services/timed
 restart   = never
-critical  = normal
+critical  = no
 namespace = none

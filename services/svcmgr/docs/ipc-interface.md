@@ -203,13 +203,15 @@ restarted automatically — see
 ## Criticality
 
 See [service-definitions.md](service-definitions.md#critical) for the
-`.svc` representation. svcmgr's in-memory shape:
+`.svc` representation. svcmgr's in-memory shape is a single
+`ServiceEntry.system_critical: bool`, consulted only once a service is
+permanently down (restart is decided independently by the restart
+policy + budget):
 
-| Level | Behaviour on death |
+| `system_critical` | Behaviour once permanently down |
 |---|---|
-| `CRITICALITY_LOW` | Logged; service marked inactive |
-| `CRITICALITY_NORMAL` | Apply restart policy; degrade on budget exhaustion |
-| `CRITICALITY_HIGH` | Apply restart policy; on unrecoverable death, initiate graceful shutdown via `published_names::PWRMGR_SHUTDOWN` |
+| `false` (`critical = no`) | Logged; service marked inactive; system continues degraded |
+| `true` (`critical = yes`) | Initiate graceful shutdown via `published_names::PWRMGR_SHUTDOWN` |
 
 ---
 

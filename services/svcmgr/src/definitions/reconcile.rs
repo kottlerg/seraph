@@ -25,12 +25,11 @@ use std::fs;
 use std::os::seraph::log;
 
 use super::parse::parse;
-use super::{Criticality, Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch};
+use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch};
 use crate::REGISTRY_CAPACITY;
 use crate::restart::RestartCtx;
 use crate::service::{
-    CRITICALITY_HIGH, CRITICALITY_LOW, CRITICALITY_NORMAL, MAX_SERVICES, POLICY_ALWAYS,
-    POLICY_NEVER, POLICY_ON_FAILURE, ServiceEntry,
+    MAX_SERVICES, POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry,
 };
 
 /// Entry in init's pending-registration table populated by
@@ -78,10 +77,12 @@ impl PendingRegistration
 /// entries that match a definition are marked `consumed`; entries
 /// left unconsumed after the scan are reported as a configuration
 /// error.
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile_and_launch(
     pending: &mut [PendingRegistration],
     pending_count: usize,
     services: &mut [ServiceEntry; MAX_SERVICES],
+    recipes: &mut [Option<RestartRecipe>; MAX_SERVICES],
     service_count: &mut usize,
     deaths_eq: u32,
     ctx: &RestartCtx,
@@ -164,6 +165,7 @@ pub fn reconcile_and_launch(
             pending,
             pending_count,
             services,
+            recipes,
             service_count,
             deaths_eq,
             ctx,
@@ -181,6 +183,7 @@ fn handle_definition(
     pending: &mut [PendingRegistration],
     pending_count: usize,
     services: &mut [ServiceEntry; MAX_SERVICES],
+    recipes: &mut [Option<RestartRecipe>; MAX_SERVICES],
     service_count: &mut usize,
     deaths_eq: u32,
     ctx: &RestartCtx,
@@ -203,7 +206,14 @@ fn handle_definition(
         // since Phase 1/2/3 spawn) — a death in that window is lost.
         // Closing that race is kernel-protocol work; tracked as a
         // follow-up.
-        bind_only(def, slot.thread_cap, services, service_count, deaths_eq);
+        bind_only(
+            def,
+            slot.thread_cap,
+            services,
+            recipes,
+            service_count,
+            deaths_eq,
+        );
         return;
     }
 
@@ -252,6 +262,7 @@ fn handle_definition(
     };
 
     services[idx] = build_entry(def, launched.thread_cap, launched.process_handle);
+    recipes[idx] = Some(recipe_from(def));
 }
 
 /// Bind-only path: bind death-notification on a thread init already
@@ -269,6 +280,7 @@ fn bind_only(
     def: &Definition,
     thread_cap: u32,
     services: &mut [ServiceEntry; MAX_SERVICES],
+    recipes: &mut [Option<RestartRecipe>; MAX_SERVICES],
     service_count: &mut usize,
     deaths_eq: u32,
 )
@@ -286,7 +298,22 @@ fn bind_only(
         return;
     }
     services[idx] = build_entry(def, thread_cap, 0);
+    recipes[idx] = Some(recipe_from(def));
     *service_count += 1;
+}
+
+/// Clone the heap-backed launch surfaces from a parsed definition so the
+/// restart path can replay argv/env/cwd/seed byte-for-byte. The fixed
+/// fields (name/binary/policy/namespace) live on the `ServiceEntry`; this
+/// carries only what the fixed record cannot hold.
+fn recipe_from(def: &Definition) -> RestartRecipe
+{
+    RestartRecipe {
+        argv: def.argv.clone(),
+        env: def.env.clone(),
+        cwd: def.cwd.clone(),
+        seed: def.seed.clone(),
+    }
 }
 
 /// Construct a fixed-size `ServiceEntry` from the parsed definition.
@@ -317,12 +344,7 @@ fn build_entry(def: &Definition, thread_cap: u32, process_handle: u32) -> Servic
         RestartPolicy::Always => POLICY_ALWAYS,
         RestartPolicy::OnFailure => POLICY_ON_FAILURE,
     };
-    entry.criticality = match def.criticality
-    {
-        Criticality::Low => CRITICALITY_LOW,
-        Criticality::Normal => CRITICALITY_NORMAL,
-        Criticality::High => CRITICALITY_HIGH,
-    };
+    entry.system_critical = def.system_critical;
     entry.active = true;
 
     match &def.namespace

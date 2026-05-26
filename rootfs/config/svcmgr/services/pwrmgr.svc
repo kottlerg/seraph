@@ -7,12 +7,12 @@
 # caps are reachable from svcmgr a `restart = on_failure` recipe
 # can replace this.
 #
-# critical = high: if pwrmgr dies and cannot recover, svcmgr
+# critical = yes: if pwrmgr dies and cannot recover, svcmgr
 # attempts a graceful shutdown via `pwrmgr.shutdown` — which is
 # unreachable because the source is gone. The death handler logs
 # the degraded state and continues; no fallback raw-shutdown path
 # exists in this architecture.
 binary    = /services/pwrmgr
 restart   = never
-critical  = high
+critical  = yes
 namespace = none

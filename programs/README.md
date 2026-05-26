@@ -11,7 +11,6 @@ the IPC interfaces exposed by vfs, net, and other services.
 
 | Crate | Purpose |
 |---|---|
-| `crasher` | Deliberate-crash fixture for svcmgr restart-path validation. |
 | `fsbench` | `FS_READ` vs `FS_READ_FRAME` crossover benchmark. |
 | `hello` | Tier-2 hello-world; std-only, no Seraph cap awareness. |
 | `pipefault` | Piped-stdio fault fixture for the pipe death-bridge regression test. |

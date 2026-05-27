@@ -490,6 +490,16 @@ progress (no all-CPUs signal); BSP hardlockup (BSP timer stops, counter
 stops, detector can't fire). A future hardlockup detector (NMI / always-on
 S-mode timer) would close the latter gap; tracked as issue #33.
 
+**Defers to an in-flight TLB shootdown:** a synchronous shootdown holds every
+participating CPU (initiator preempt-disabled in `wait_for_ack`; peers spinning
+in `pt_lock` or their own shootdown) until all remote CPUs ack. Under heavy
+oversubscription that round-trip can exceed the threshold while still making
+progress, so the detector skips firing while
+`tlb_shootdown::TLB_SHOOTDOWN.pending_cpus != 0`. The shootdown's own
+escalation ladder (NMI backtrace at 0.75 s, panic at 5 s in arch
+`wait_for_ack`) is the authoritative detector for a genuinely stuck IPI; a
+non-shootdown stall re-checks on the next tick once `pending_cpus` clears.
+
 **Why kernel-side:** when every CPU is in kernel mode, no userspace monitor
 gets dispatched. The dump is also the only path that reads per-CPU
 scheduler state without taking a lock that the stalled CPUs themselves hold.

@@ -99,14 +99,24 @@ pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64)
 /// `stack_top` — top of the thread's kernel stack (RSP starts here).
 /// `arg`       — first argument; stashed in `rbx` (delivered to entry by
 ///               the switch stub when the thread first runs).
-/// `is_user`   — unused at construction; user-mode entry uses `return_to_user`.
-pub fn new_state(entry: u64, stack_top: u64, arg: u64, _is_user: bool) -> SavedState
+/// `is_user`   — selects the initial RFLAGS (interrupt-enable) for the first
+///               dispatch; see below.
+pub fn new_state(entry: u64, stack_top: u64, arg: u64, is_user: bool) -> SavedState
 {
+    // A user thread's first dispatch runs `user_thread_trampoline` →
+    // `return_to_user` in ring 0; its `iretq` restores the user RFLAGS (IF=1,
+    // set by `init_user` = 0x202) from the TrapFrame. The kernel-side
+    // trampoline itself MUST run with IF=0: with IF=1 a timer can preempt the
+    // half-built trampoline frame deep on the kstack, and the convoluted
+    // resume path corrupts a return address → kernel `#PF` at RIP=0 (#160).
+    // RISC-V already runs this trampoline with SIE masked; this matches it.
+    // Kernel threads (idle) have no trampoline and need IF=1 to wake from `hlt`.
+    let rflags = if is_user { 0x002 } else { 0x200 };
     SavedState {
         rip: entry,
         rsp: stack_top,
-        rbx: arg,      // carried to entry via rbx; idle ignores it
-        rflags: 0x200, // IF=1 so timer can fire once thread starts
+        rbx: arg, // carried to entry via rbx; idle ignores it
+        rflags,
         ..SavedState::default()
     }
 }

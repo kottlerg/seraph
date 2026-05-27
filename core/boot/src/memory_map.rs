@@ -425,6 +425,7 @@ mod tests
         let stride = size_of::<EfiMemoryDescriptor>();
         let uefi_map = MemoryMapResult {
             buffer_phys: descs.as_ptr() as u64,
+            buffer_size: descs.len() * stride,
             map_size: descs.len() * stride,
             map_key: 0,
             descriptor_size: stride,
@@ -537,6 +538,7 @@ mod tests
         unsafe { core::ptr::write(buf.as_mut_ptr() as *mut EfiMemoryDescriptor, desc) };
         let uefi_map = MemoryMapResult {
             buffer_phys: buf.as_ptr() as u64,
+            buffer_size: stride,
             map_size: stride,
             map_key: 0,
             descriptor_size: stride,

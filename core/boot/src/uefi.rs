@@ -197,7 +197,12 @@ pub struct MemoryMapResult
 {
     /// Physical address of the memory map buffer (allocated by caller).
     pub buffer_phys: u64,
-    /// Total size of the map in the buffer, in bytes.
+    /// Allocated capacity of the buffer, in bytes. Distinct from `map_size`:
+    /// `GetMemoryMap` overwrites its size in-param with the (smaller) actual map
+    /// size on success, so a re-query must pass this capacity, not `map_size`.
+    pub buffer_size: usize,
+    /// Size of the map currently in the buffer, in bytes (the value `GetMemoryMap`
+    /// reported it wrote). This is what `translate_memory_map` iterates over.
     pub map_size: usize,
     /// Map key used by `ExitBootServices`.
     pub map_key: usize,
@@ -718,8 +723,10 @@ pub unsafe fn allocate_pages_max_addr(
 /// map key). Returns the buffer address, map size, map key, and descriptor size.
 /// The caller must use this as the final allocation before `ExitBootServices`.
 ///
-/// Adds 16 extra entries of slack to accommodate the allocation of the buffer
-/// itself, as required by the UEFI specification.
+/// Sizes the buffer with 16 entries of slack beyond the reported requirement.
+/// The buffer allocation itself adds at least one descriptor; the extra margin
+/// also absorbs further growth seen when `exit_boot_services` re-queries under
+/// contention (see [`exit_boot_services`]).
 ///
 /// # Safety
 /// `bs` must be valid boot services.
@@ -753,9 +760,10 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     let pages = map_size.div_ceil(4096);
     // SAFETY: bs is valid.
     let buffer_phys = unsafe { allocate_pages(bs, pages)? };
+    let buffer_size = pages * 4096;
 
     // Second call: fill the buffer. This call's map_key is the one to use.
-    map_size = pages * 4096;
+    map_size = buffer_size;
     // SAFETY: buffer_phys is a valid allocated region of map_size bytes.
     // cast_possible_truncation: buffer_phys is a UEFI physical address; on all supported
     // targets (x86_64, riscv64) usize is 64-bit, so the cast is exact.
@@ -776,18 +784,40 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
 
     Ok(MemoryMapResult {
         buffer_phys,
+        buffer_size,
         map_size,
         map_key,
         descriptor_size,
     })
 }
 
-/// Call `ExitBootServices`, retrying once on stale-key failure.
+/// Maximum number of `ExitBootServices` attempts before giving up.
+///
+/// UEFI may invalidate the map key between `GetMemoryMap` and `ExitBootServices`
+/// when a firmware event allocates memory in that window; the call then returns
+/// `EFI_INVALID_PARAMETER`. Under host CPU contention (parallel QEMU/OVMF) the
+/// vCPU can be descheduled in that window repeatedly, so the invalidation can
+/// recur across consecutive attempts. A bounded loop retries until a tight
+/// `GetMemoryMap`→`ExitBootServices` pair lands without an intervening
+/// allocation.
+///
+/// The observed two-attempt failure rate (≈0.2–1.7%) implies a per-attempt
+/// failure probability of roughly 0.045–0.13; 16 attempts drive the residual
+/// below ~1e-14 even at the high end, with wide margin for correlated
+/// contention bursts. Each extra attempt is one cheap firmware call pair into
+/// the existing buffer, so the bound is generous rather than tuned.
+const EXIT_BOOT_SERVICES_MAX_ATTEMPTS: u32 = 16;
+
+/// Call `ExitBootServices`, retrying on stale-key failure up to
+/// [`EXIT_BOOT_SERVICES_MAX_ATTEMPTS`] times.
 ///
 /// After a successful call, UEFI boot services are permanently unavailable.
 /// No UEFI calls may be made after this function returns `Ok(())`.
 ///
-/// On retry, re-queries the map using the existing buffer (no new allocation).
+/// Each retry re-queries the map into the existing buffer (no new allocation,
+/// which would invalidate the key again) to obtain a fresh key. The re-query
+/// passes the allocated buffer capacity, so it tolerates a map that grew since
+/// the previous query.
 ///
 /// # Safety
 /// `bs` must be valid boot services. `image` must be a valid image handle.
@@ -799,50 +829,53 @@ pub unsafe fn exit_boot_services(
     map: &mut MemoryMapResult,
 ) -> Result<(), BootError>
 {
-    // SAFETY: bs, image, and map_key are valid.
-    let status = unsafe { ((*bs).exit_boot_services)(image, map.map_key) };
-    if status == EFI_SUCCESS
+    let mut attempt: u32 = 0;
+    loop
     {
-        return Ok(());
-    }
-    if status != EFI_INVALID_PARAMETER
-    {
-        return Err(BootError::ExitBootServicesFailed);
-    }
+        // SAFETY: bs, image, and map_key are valid.
+        let status = unsafe { ((*bs).exit_boot_services)(image, map.map_key) };
+        if status == EFI_SUCCESS
+        {
+            return Ok(());
+        }
+        // EFI_INVALID_PARAMETER is the only status that means "stale key"; any
+        // other status is a genuine error that a retry cannot resolve.
+        if status != EFI_INVALID_PARAMETER
+        {
+            return Err(BootError::ExitBootServicesFailed);
+        }
+        attempt += 1;
+        if attempt >= EXIT_BOOT_SERVICES_MAX_ATTEMPTS
+        {
+            return Err(BootError::ExitBootServicesFailed);
+        }
 
-    // Stale key: re-query the map using the existing buffer (no new allocation).
-    let mut descriptor_size: usize = map.descriptor_size;
-    let mut descriptor_version: u32 = 0;
-    let mut map_size = map.map_size;
-    // SAFETY: buffer_phys is the existing allocated buffer.
-    // cast_possible_truncation: buffer_phys is a UEFI u64 address; usize is 64-bit on all
-    // supported targets, so the cast to *mut is exact.
-    #[allow(clippy::cast_possible_truncation)]
-    let status = unsafe {
-        ((*bs).get_memory_map)(
-            core::ptr::addr_of_mut!(map_size),
-            map.buffer_phys as *mut EfiMemoryDescriptor,
-            core::ptr::addr_of_mut!(map.map_key),
-            core::ptr::addr_of_mut!(descriptor_size),
-            core::ptr::addr_of_mut!(descriptor_version),
-        )
-    };
-    if status != EFI_SUCCESS
-    {
-        return Err(BootError::ExitBootServicesFailed);
-    }
-    map.map_size = map_size;
-
-    // Retry with the fresh key.
-    // SAFETY: map.map_key is fresh from the re-query above.
-    let status = unsafe { ((*bs).exit_boot_services)(image, map.map_key) };
-    if status == EFI_SUCCESS
-    {
-        Ok(())
-    }
-    else
-    {
-        Err(BootError::ExitBootServicesFailed)
+        // Stale key: re-query the map using the existing buffer (no new
+        // allocation). map_size is reset to the full buffer capacity each
+        // iteration because GetMemoryMap overwrites it with the smaller actual
+        // size on success; passing the prior actual size could fail with
+        // EFI_BUFFER_TOO_SMALL if the map grew under contention.
+        let mut descriptor_size: usize = map.descriptor_size;
+        let mut descriptor_version: u32 = 0;
+        let mut map_size = map.buffer_size;
+        // SAFETY: buffer_phys is the existing allocated buffer of buffer_size bytes.
+        // cast_possible_truncation: buffer_phys is a UEFI u64 address; usize is 64-bit on all
+        // supported targets, so the cast to *mut is exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let status = unsafe {
+            ((*bs).get_memory_map)(
+                core::ptr::addr_of_mut!(map_size),
+                map.buffer_phys as *mut EfiMemoryDescriptor,
+                core::ptr::addr_of_mut!(map.map_key),
+                core::ptr::addr_of_mut!(descriptor_size),
+                core::ptr::addr_of_mut!(descriptor_version),
+            )
+        };
+        if status != EFI_SUCCESS
+        {
+            return Err(BootError::ExitBootServicesFailed);
+        }
+        map.map_size = map_size;
     }
 }
 

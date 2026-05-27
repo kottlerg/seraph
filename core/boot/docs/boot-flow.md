@@ -145,8 +145,10 @@ Detail: [uefi-environment.md](uefi-environment.md)
 
 `ExitBootServices` is called with the map key from step 7. If the call fails due to
 a stale key (indicating that UEFI performed allocations between the query and the
-call), the memory map is re-queried and the call is retried once. After a successful
-exit, UEFI boot services are unavailable; no further UEFI calls are made.
+call), the memory map is re-queried into the existing buffer and the call is retried,
+in a bounded loop (up to `EXIT_BOOT_SERVICES_MAX_ATTEMPTS`). This tolerates a key
+that is invalidated repeatedly under host CPU contention. After a successful exit,
+UEFI boot services are unavailable; no further UEFI calls are made.
 
 Detail: [uefi-environment.md](uefi-environment.md)
 

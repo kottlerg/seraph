@@ -36,7 +36,8 @@ pub enum BootError
     /// A physical memory allocation failed.
     OutOfMemory,
 
-    /// `ExitBootServices` failed even after one retry with a refreshed map key.
+    /// `ExitBootServices` failed even after the bounded retry loop, each attempt
+    /// refreshing the map key from the existing buffer.
     ExitBootServicesFailed,
 
     /// The bootstrap.bundle file is missing, malformed, or violates an
@@ -100,7 +101,7 @@ impl BootError
             BootError::InvalidElf(_) => "kernel ELF validation failed",
             BootError::WxViolation => "ELF segment has writable+executable permissions (W^X)",
             BootError::OutOfMemory => "physical memory allocation failed",
-            BootError::ExitBootServicesFailed => "ExitBootServices failed after retry",
+            BootError::ExitBootServicesFailed => "ExitBootServices failed after retries",
             BootError::InvalidBundle(_) => "bootstrap.bundle is malformed or missing",
         }
     }

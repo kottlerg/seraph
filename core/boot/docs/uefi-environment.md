@@ -108,10 +108,10 @@ The acquisition sequence:
 5. Sort entries by physical_base ascending.
 ```
 
-The buffer allocation in step 2 increases the map size by one entry (the new
-`EfiLoaderData` region). The buffer allocated in step 2 must be sized to accommodate
-this extra entry; in practice, adding 16 extra entries of slack when sizing the buffer
-is sufficient.
+The buffer allocation in step 2 increases the map size by at least one entry (the new
+`EfiLoaderData` region). The buffer must be sized to accommodate this; the bootloader
+adds 16 entries of slack, a prudent margin that also absorbs the further growth seen
+when `ExitBootServices` re-queries the map under contention (see below).
 
 ### UEFI Memory Type Translation
 
@@ -130,17 +130,27 @@ The call sequence:
 1. Perform the final memory map acquisition (above).
 2. Call BootServices->ExitBootServices(image_handle, map_key).
 3. If the call returns EFI_INVALID_PARAMETER (stale map key):
-   a. Call GetMemoryMap again with the existing buffer (no new allocation).
+   a. Call GetMemoryMap again with the existing buffer (no new allocation),
+      passing the full allocated buffer capacity as the size in-param.
    b. Update map_key from the new call.
-   c. Retry ExitBootServices once.
-   d. If still failing: halt immediately — the environment is unrecoverable.
-4. On success: UEFI boot services are now permanently unavailable.
+   c. Retry ExitBootServices.
+   d. Repeat from step 3 up to EXIT_BOOT_SERVICES_MAX_ATTEMPTS times total.
+   e. If still failing after the bound: halt — the environment is unrecoverable.
+4. Any status other than EFI_SUCCESS or EFI_INVALID_PARAMETER: halt immediately
+   (not a stale-key condition, so retrying cannot help).
+5. On success: UEFI boot services are now permanently unavailable.
 ```
 
-The retry handles the rare case where UEFI performs an internal allocation between
-step 1 and step 2 — some firmware implementations do this for housekeeping. The
-retry uses the existing buffer rather than allocating a new one (which would
-invalidate the key again).
+The retry handles the case where UEFI performs an internal allocation between the
+final query and the exit call — some firmware does this for housekeeping, and under
+host CPU contention (e.g. parallel QEMU/OVMF instances sharing host cores) the vCPU
+can be descheduled in that window, letting a firmware event allocate and invalidate
+the key repeatedly across attempts. A *single* retry is therefore insufficient; the
+loop is bounded at `EXIT_BOOT_SERVICES_MAX_ATTEMPTS` (16) attempts. Each re-query
+reuses the existing buffer — allocating a new one would invalidate the key again —
+and passes the allocated buffer capacity, so it tolerates a map that grew since the
+previous query. No delay is inserted between the query and the exit call: that would
+only widen the invalidation window.
 
 ### Post-Exit Constraints
 
@@ -162,7 +172,8 @@ The bootloader performs no allocation-dependent operations after `ExitBootServic
 ## Error Handling Strategy
 
 All errors in the bootloader are fatal. There is no recovery path, no retry beyond
-the single `ExitBootServices` retry described above, and no fallback configuration.
+the bounded `ExitBootServices` retry loop described above, and no fallback
+configuration.
 
 ### BootError Type
 
@@ -170,19 +181,19 @@ All fallible functions in the bootloader return `Result<T, BootError>`,
 defined in [`boot/src/error.rs`](../src/error.rs). The variant set covers
 protocol-location failure, UEFI status-code propagation, ESP file-not-found,
 ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
-failure after retry, and bundle parse/validation failure (`InvalidBundle`);
-the source is the authority on the variant list and payloads.
+failure after the bounded retry loop, and bundle parse/validation failure
+(`InvalidBundle`); the source is the authority on the variant list and payloads.
 
 The top-level `efi_main` propagates errors to a single fatal handler that
 reports the error and halts. There is no recovery path and no retry beyond
-the single `ExitBootServices` retry described above.
+the bounded `ExitBootServices` retry loop described above.
 
 ### Error Reporting
 
-Before `ExitBootServices`, error messages are written to the UEFI console output
-(`SystemTable->ConOut`). After `ExitBootServices`, the UEFI console is no longer
-accessible; only a serial/framebuffer path would be available, but the current
-implementation has no post-exit output path.
+Error messages are written through the boot console (serial + framebuffer; see
+[console.md](console.md)), which does not depend on UEFI boot services and so
+remains available after `ExitBootServices`. A fatal `ExitBootServices` failure is
+therefore reported the same way as any earlier failure.
 
 Error reporting writes a short descriptive message and halts:
 
@@ -197,24 +208,23 @@ sufficient to identify which step failed and why.
 
 ## Console Output
 
-### Before ExitBootServices
+The boot console writes to two backends directly, bypassing `ConOut` entirely
+(the firmware text-output protocol is never used). Both backends are direct
+hardware access and so are independent of UEFI boot services:
 
-Two output paths are available:
+**Serial** — the platform UART (16550 COM1 on x86-64; a discovered ns16550a on
+RISC-V), driven by direct port/MMIO access.
 
-**UEFI console** — `SystemTable->ConOut->OutputString`. This is always available but
-the display quality depends on the firmware. It supports wide characters (`CHAR16`);
-the bootloader converts ASCII boot messages to wide character strings before output.
-
-**GOP framebuffer** — if `EFI_GRAPHICS_OUTPUT_PROTOCOL` is available and reports a
-pixel framebuffer, the bootloader maps a minimal bitmap font and writes directly to
-the framebuffer. This is more reliable on modern hardware where the UEFI console
-implementation may be slow or redirect to a serial port.
+**GOP framebuffer** — if `EFI_GRAPHICS_OUTPUT_PROTOCOL` reported a pixel
+framebuffer at step 1, the bootloader writes glyphs from a minimal bitmap font
+straight to the framebuffer MMIO.
 
 ### After ExitBootServices
 
-The UEFI console (`ConOut`) is unavailable. The current implementation has no
-output path after `ExitBootServices`. The normal path proceeds directly to `BootInfo`
-population and kernel handoff without any further output.
+Because neither backend depends on boot services, console output continues to
+work after `ExitBootServices`: the `step 9/10` and `step 10/10` progress lines,
+and any fatal message, are emitted over serial and framebuffer right up to kernel
+handoff.
 
 ---
 

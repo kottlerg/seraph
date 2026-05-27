@@ -208,23 +208,16 @@ sufficient to identify which step failed and why.
 
 ## Console Output
 
-The boot console writes to two backends directly, bypassing `ConOut` entirely
-(the firmware text-output protocol is never used). Both backends are direct
-hardware access and so are independent of UEFI boot services:
-
-**Serial** — the platform UART (16550 COM1 on x86-64; a discovered ns16550a on
-RISC-V), driven by direct port/MMIO access.
-
-**GOP framebuffer** — if `EFI_GRAPHICS_OUTPUT_PROTOCOL` reported a pixel
-framebuffer at step 1, the bootloader writes glyphs from a minimal bitmap font
-straight to the framebuffer MMIO.
+The boot console (serial + framebuffer; see [console.md](console.md) for the
+backends) reaches the hardware directly and never uses the firmware text-output
+protocol (`ConOut`). The property that matters here is that neither backend
+depends on UEFI boot services.
 
 ### After ExitBootServices
 
-Because neither backend depends on boot services, console output continues to
-work after `ExitBootServices`: the `step 9/10` and `step 10/10` progress lines,
-and any fatal message, are emitted over serial and framebuffer right up to kernel
-handoff.
+Because the console is boot-services-independent, output continues right up to
+kernel handoff: the `step 9/10` and `step 10/10` progress lines, and any fatal
+message, are emitted after the exit call.
 
 ---
 

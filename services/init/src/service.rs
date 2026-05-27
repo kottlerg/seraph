@@ -1617,11 +1617,13 @@ fn handoff_to_procmgr_reap(
 ///   `HANDOVER_PULL` IPC to init-logd);
 /// * a tokened SEND cap on procmgr carrying
 ///   `procmgr_labels::DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`);
-/// * an arch-specific serial-authority cap (`IoPortRange` on x86-64,
-///   `SbiControl` on RISC-V) so logd can write directly to the UART
-///   for its own diagnostics and the per-sender log lines it
-///   receives. Logd cannot route its diagnostics through
-///   `seraph::log!` because it IS the log receiver.
+/// * a SEND cap on devmgr's registry endpoint carrying
+///   `devmgr_labels::REGISTRY_QUERY_AUTHORITY`, with which logd resolves
+///   the serial driver (via `QUERY_SERIAL_DEVICE`) and routes its own
+///   diagnostics and the per-sender log lines it receives through the
+///   driver's `SERIAL_WRITE_BYTES`. Logd holds no UART hardware authority
+///   and cannot route diagnostics through `seraph::log!` because it IS the
+///   log receiver.
 ///
 /// Returns `true` on successful spawn + bootstrap; `false` on any
 /// failure (logged at fault; init continues without real-logd, with

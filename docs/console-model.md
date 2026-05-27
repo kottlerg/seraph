@@ -63,5 +63,7 @@ writer and the direct paths fire only in early boot and failure windows.
 
 ## Summarized By
 
+[README.md](../README.md),
+[services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/serial/README.md](../services/drivers/serial/README.md),
 [services/logd/README.md](../services/logd/README.md)

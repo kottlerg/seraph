@@ -222,6 +222,23 @@ fn watchdog_tick_and_check()
         }
     }
 
+    // A synchronous TLB shootdown legitimately holds every participating CPU
+    // (initiator preempt-disabled in the ack-wait; others spinning in pt_lock
+    // or their own shootdown) until all remote CPUs ack. Under heavy
+    // oversubscription that round-trip can exceed this 3 s threshold while
+    // still making progress. The shootdown owns its own bounded escalation
+    // (NMI backtrace at 0.75 s, panic at 5 s — see arch wait_for_ack) and is
+    // the authoritative detector for a genuinely stuck IPI, so defer to it
+    // rather than emit a misleading softlockup dump. A non-shootdown stall
+    // re-checks on the next tick once pending_cpus clears.
+    if crate::mm::tlb_shootdown::TLB_SHOOTDOWN
+        .pending_cpus
+        .load(core::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        return;
+    }
+
     if WATCHDOG_FIRED
         .compare_exchange(
             false,

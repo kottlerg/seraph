@@ -178,6 +178,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "serial",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: None,
+    },
+    Spec {
         name: "cmos-rtc",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -311,6 +318,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Devmgr => "devmgr",
         BuildComponent::Vfsd => "vfsd",
         BuildComponent::VirtioBlk => "virtio-blk",
+        BuildComponent::Serial => "serial",
         BuildComponent::CmosRtc => "cmos-rtc",
         BuildComponent::GoldfishRtc => "goldfish-rtc",
         BuildComponent::Fatfs => "fatfs",

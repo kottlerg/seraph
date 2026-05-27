@@ -70,6 +70,7 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     PWRMGR_LABELS_VERSION
 //     RTC_LABELS_VERSION
 //     TIMED_LABELS_VERSION
+//     SERIAL_LABELS_VERSION
 
 pub const PROCMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the process manager (`procmgr`).
@@ -884,7 +885,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 1;
+pub const DEVMGR_LABELS_VERSION: u32 = 2;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -898,6 +899,14 @@ pub mod devmgr_labels
     /// Query device configuration (`VirtIO` cap locations, etc.).
     /// The caller's token identifies the device.
     pub const QUERY_DEVICE_INFO: u64 = 2;
+    /// Query for the serial (UART) device endpoint.
+    ///
+    /// Mints a `serial_labels::WRITE_AUTHORITY`-tokened `SEND_GRANT`
+    /// cap on the serial driver's service endpoint to the caller.
+    /// Caller's token must have [`REGISTRY_QUERY_AUTHORITY`] set; the
+    /// handler replies `UNAUTHORIZED` otherwise. Mirrors
+    /// [`QUERY_BLOCK_DEVICE`].
+    pub const QUERY_SERIAL_DEVICE: u64 = 3;
 
     /// Authority bit in the devmgr-registry-endpoint token's high
     /// u64 bit. Set on caps minted for consumers permitted to call
@@ -971,6 +980,51 @@ pub mod blk_labels
     /// Frame is moved back to the caller in `caps[0]` of the reply (same
     /// discipline as the read path).
     pub const BLK_WRITE_FROM_FRAME: u64 = 4;
+}
+
+pub const SERIAL_LABELS_VERSION: u32 = 1;
+/// IPC labels for the serial (UART) device driver (`services/drivers/serial`).
+///
+/// The driver answers a single write operation today. It owns the platform
+/// UART hardware authority (an `IoPortRange` for COM1 on x86-64, an
+/// `MmioRegion` for the ACPI-SPCR-reported NS16550 on RISC-V) and is the
+/// sole driver-mediated sink for userspace serial bytes. devmgr spawns it
+/// and hands clients a [`serial_labels::WRITE_AUTHORITY`]-tokened SEND via
+/// [`devmgr_labels::QUERY_SERIAL_DEVICE`]. Read, line-control, flow-control,
+/// and RX-notify surfaces are planned but unimplemented (see the driver
+/// `README.md`); they are not on the wire.
+pub mod serial_labels
+{
+    /// Write bytes to the UART.
+    ///
+    /// Wire format mirrors [`stream_labels::STREAM_BYTES`]: the payload byte
+    /// length rides bits 16-31 of the label, the bytes are packed via
+    /// `.bytes(0, …)` into the data words, and the receiver reads
+    /// `byte_len.div_ceil(8)` words. Reply: empty body, status code in the
+    /// reply label.
+    ///
+    /// # Label encoding
+    /// - Bits 0-15: label ID (`SERIAL_WRITE_BYTES`)
+    /// - Bits 16-31: byte length of the payload in this call (0..=512).
+    pub const SERIAL_WRITE_BYTES: u64 = 1;
+
+    /// Authority bit in the serial-service-endpoint token's high u64 bit.
+    /// Set on caps devmgr mints in response to
+    /// [`devmgr_labels::QUERY_SERIAL_DEVICE`]; gates [`SERIAL_WRITE_BYTES`].
+    /// A verb ("may write"), not an identity.
+    pub const WRITE_AUTHORITY: u64 = 1u64 << 63;
+}
+
+/// Error replies from the serial device driver.
+pub mod serial_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// Driver received a label it does not implement.
+    pub const UNKNOWN_OPCODE: u64 = 2;
+    /// Reserved for a future per-message version handshake. Unused today —
+    /// `SERIAL_LABELS_VERSION` is marker-only and covered by
+    /// `PROCESS_ABI_VERSION` at process startup.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }
 
 pub const STREAM_LABELS_VERSION: u32 = 1;

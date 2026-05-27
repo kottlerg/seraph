@@ -79,6 +79,7 @@ Overall project design documents live in [`docs/`](docs/):
 - [Storage](docs/storage.md) — composition of vfsd, fs drivers, and block drivers; GPT role-GUID discovery; mount lifecycle
 - [System Bootstrap](docs/bootstrap.md) — end-to-end boot lifecycle summary (bootloader steps, kernel phases, init bootstrap)
 - [Device Management](docs/device-management.md) — platform enumeration, devmgr, driver binding, DMA safety
+- [Console Model](docs/console-model.md) — serial/console output ownership across boot; serial-driver-mediated userspace output
 - [Build System](docs/build-system.md) — toolchain, workspace layout, sysroot, xtask commands
 - [Coding Standards](docs/coding-standards.md) — Rust conventions, safety contracts, documentation rules
 - [Documentation Standards](docs/documentation-standards.md) — document hierarchy, authority, backlinks, required structure

@@ -11,9 +11,10 @@
 //! 1. Receives via bootstrap protocol a RECV cap on the master log
 //!    endpoint, a SEND cap on the same endpoint (single-use, for the
 //!    `HANDOVER_PULL` IPC to init-logd), a SEND cap on procmgr
-//!    carrying `DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`), and
-//!    an arch-specific serial-authority cap (`IoPortRange` on
-//!    x86-64, `SbiControl` on RISC-V) for direct UART output.
+//!    carrying `DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`), and a
+//!    SEND cap on devmgr's registry endpoint carrying
+//!    `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via
+//!    `QUERY_SERIAL_DEVICE`).
 //! 2. Drains init-logd's captured state via `HANDOVER_PULL` until
 //!    `DONE`. Init-logd self-terminates immediately after replying
 //!    `DONE`.
@@ -28,9 +29,12 @@
 //! Logd does NOT use `seraph::log!` for its own diagnostics — it IS
 //! the log receiver, so a `log!` call would self-IPC into the
 //! endpoint it serves and deadlock once init-logd has terminated.
-//! Diagnostics + received log lines are emitted directly to serial
-//! via `arch::current::serial_write_byte`, mirroring init-logd's
-//! `flush_synthetic_logd_line` pattern.
+//! Diagnostics + received log lines are emitted through the userspace
+//! serial driver (resolved once via devmgr's `QUERY_SERIAL_DEVICE`)
+//! using `serial_labels::SERIAL_WRITE_BYTES`. Until the driver is
+//! resolvable, serial output is dropped but received lines stay in the
+//! per-slot history ring; the pre-driver boot window is covered by
+//! init-logd's direct-UART fallback (see `docs/console-model.md`).
 //!
 //! The pre-existing tokened SEND caps held by memmgr, procmgr,
 //! tier-1 services, and every Phase-3 child remain valid across the
@@ -43,11 +47,11 @@
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 
-mod arch;
 mod handover;
 mod slot;
 
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ipc::stream_labels::{STREAM_BYTES, STREAM_REGISTER_NAME};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -74,12 +78,12 @@ struct BootCaps
     /// call `REGISTER_DEATH_EQ`. Kept across the lifetime of
     /// real-logd in case re-registration is ever needed.
     procmgr_death_auth_send: u32,
-    /// Arch-specific serial-authority cap. `IoPortRange` on x86-64
-    /// (bound to logd's main thread for COM1 access);
-    /// `SbiControl` on RISC-V (used for SBI legacy
-    /// `console_putchar`). Zero disables serial output (logd then
-    /// buffers received log lines in memory only).
-    arch_serial_cap: u32,
+    /// SEND cap on devmgr's registry endpoint carrying
+    /// `REGISTRY_QUERY_AUTHORITY`. logd resolves the serial driver's
+    /// write endpoint through it via `QUERY_SERIAL_DEVICE`. Zero
+    /// disables serial output (logd then buffers received log lines in
+    /// memory only).
+    devmgr_registry_ep: u32,
 }
 
 fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
@@ -98,7 +102,7 @@ fn bootstrap_caps(creator_endpoint: u32, ipc_buf: *mut u64) -> Option<BootCaps>
         log_ep_recv: round.caps[0],
         log_ep_handover_send: round.caps[1],
         procmgr_death_auth_send: round.caps[2],
-        arch_serial_cap: round.caps[3],
+        devmgr_registry_ep: round.caps[3],
     })
 }
 
@@ -116,11 +120,11 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    // Wire serial output BEFORE handover, so logd's own diagnostics
-    // are visible. On x86-64 this binds the IoPortRange cap to
-    // logd's main thread; on RISC-V it stashes the SbiControl cap
-    // for SBI calls.
-    arch::current::serial_init(startup.self_thread, caps.arch_serial_cap);
+    // Record the devmgr-registry cap + IPC buffer for the emit path. The
+    // serial driver is resolved lazily on first emit via
+    // `QUERY_SERIAL_DEVICE`; until then serial output is dropped (init-logd
+    // covered the pre-driver window) while history still accrues.
+    serial_init(caps.devmgr_registry_ep, ipc_buf);
 
     self_log("started; pulling init-logd handover state");
 
@@ -423,84 +427,247 @@ fn register_name(table: &mut SlotTable, token: u64, msg: &IpcMessage, byte_len: 
     slot.name.extend_from_slice(&bytes[..n]);
 }
 
-/// Emit `[sec.usfrac] [name] <bytes>\r\n` directly to the serial
-/// port. Mirrors init-logd's `flush_line` shape so the post-handover
-/// output stream looks identical to the pre-handover output.
+// ── Serial output (driver-mediated) ────────────────────────────────────────
+
+/// SEND cap on devmgr's registry endpoint (`REGISTRY_QUERY_AUTHORITY`).
+static DEVMGR_REGISTRY_EP: AtomicU32 = AtomicU32::new(0);
+/// Resolved SEND cap on the serial driver's service endpoint, cached after
+/// the first successful `QUERY_SERIAL_DEVICE`. Zero = unresolved.
+static SERIAL_CAP: AtomicU32 = AtomicU32::new(0);
+/// logd's registered IPC buffer pointer, stashed so the emit path can issue
+/// the serial `ipc_call` without threading it through every formatter.
+static IPC_BUF_PTR: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum payload bytes per `SERIAL_WRITE_BYTES` (one full IPC data area).
+const SERIAL_CHUNK: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
+
+/// Record the devmgr-registry cap and IPC buffer for the emit path.
+fn serial_init(devmgr_registry_ep: u32, ipc_buf: *mut u64)
+{
+    DEVMGR_REGISTRY_EP.store(devmgr_registry_ep, Ordering::Release);
+    IPC_BUF_PTR.store(ipc_buf as u64, Ordering::Release);
+}
+
+/// Resolve (and cache) the serial driver's SEND cap via devmgr's
+/// `QUERY_SERIAL_DEVICE`. Returns 0 while the driver is not yet resolvable
+/// (devmgr not reachable, or driver not spawned); the caller then drops the
+/// bytes.
+fn resolve_serial_cap(ipc_buf: *mut u64) -> u32
+{
+    let cached = SERIAL_CAP.load(Ordering::Acquire);
+    if cached != 0
+    {
+        return cached;
+    }
+    let registry = DEVMGR_REGISTRY_EP.load(Ordering::Acquire);
+    if registry == 0
+    {
+        return 0;
+    }
+    let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_SERIAL_DEVICE)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
+    else
+    {
+        return 0;
+    };
+    if reply.label != ipc::devmgr_errors::SUCCESS
+    {
+        return 0;
+    }
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
+    {
+        return 0;
+    }
+    let cap = reply_caps[0];
+    SERIAL_CAP.store(cap, Ordering::Release);
+    cap
+}
+
+/// Write a fully-formatted line to the serial driver via one or more
+/// `SERIAL_WRITE_BYTES` calls. Silently drops the bytes if the driver is
+/// not yet resolvable.
+fn serial_write(bytes: &[u8])
+{
+    let ipc_buf = IPC_BUF_PTR.load(Ordering::Acquire) as *mut u64;
+    if ipc_buf.is_null()
+    {
+        return;
+    }
+    let cap = resolve_serial_cap(ipc_buf);
+    if cap == 0
+    {
+        return;
+    }
+    let mut off = 0;
+    while off < bytes.len()
+    {
+        let end = (off + SERIAL_CHUNK).min(bytes.len());
+        let chunk = &bytes[off..end];
+        let label = ipc::serial_labels::SERIAL_WRITE_BYTES | ((chunk.len() as u64) << 16);
+        let msg = IpcMessage::builder(label).bytes(0, chunk).build();
+        // SAFETY: ipc_buf is the registered IPC buffer page. Nested IPC is
+        // safe here: a received `STREAM_BYTES` is already snapshotted into a
+        // stack `IpcMessage`, and the kernel preserves the pending reply to
+        // the log sender across this call (same pattern as vfsd → blk).
+        let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
+        off = end;
+    }
+}
+
+/// Fixed-capacity line builder. 512 bytes holds any logd line
+/// (`LINE_BUF_SIZE` content plus timestamp and name framing) in a single
+/// `SERIAL_WRITE_BYTES`; over-long lines truncate rather than allocate.
+struct LineBuf
+{
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl LineBuf
+{
+    fn new() -> Self
+    {
+        Self {
+            buf: [0u8; 512],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, b: u8)
+    {
+        if self.len < self.buf.len()
+        {
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+    }
+
+    /// Push a byte, expanding a bare `\n` to `\r\n` for terminal output.
+    fn push_escaped(&mut self, b: u8)
+    {
+        if b == b'\n'
+        {
+            self.push(b'\r');
+        }
+        self.push(b);
+    }
+
+    fn push_decimal(&mut self, value: u64)
+    {
+        let mut digits = [0u8; 20];
+        let mut n = value;
+        let mut idx = digits.len();
+        if n == 0
+        {
+            idx -= 1;
+            digits[idx] = b'0';
+        }
+        else
+        {
+            while n > 0
+            {
+                idx -= 1;
+                digits[idx] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+        }
+        for &d in &digits[idx..]
+        {
+            self.push(d);
+        }
+    }
+
+    fn push_decimal_padded(&mut self, value: u64, width: usize)
+    {
+        let mut digits = [b'0'; 20];
+        let mut n = value;
+        let mut idx = digits.len();
+        while n > 0 && idx > 0
+        {
+            idx -= 1;
+            digits[idx] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let start = digits.len().saturating_sub(width);
+        for &d in &digits[start..]
+        {
+            self.push(d);
+        }
+    }
+
+    /// Push `[sec.usfrac] ` from the current monotonic clock.
+    fn push_timestamp(&mut self)
+    {
+        let us = elapsed_us();
+        self.push(b'[');
+        self.push_decimal(us / 1_000_000);
+        self.push(b'.');
+        self.push_decimal_padded(us % 1_000_000, 6);
+        self.push(b']');
+        self.push(b' ');
+    }
+
+    fn flush(&self)
+    {
+        serial_write(&self.buf[..self.len]);
+    }
+}
+
+/// Emit `[sec.usfrac] [name] <bytes>\r\n` to the serial driver. Mirrors
+/// init-logd's `flush_line` shape so the post-handover output stream looks
+/// identical to the pre-handover output.
 fn emit_line(_token: u64, name: &[u8], line: &[u8])
 {
-    let us = elapsed_us();
-    let sec = us / 1_000_000;
-    let usfrac = (us % 1_000_000) as u32;
-
-    arch::current::serial_write_byte(b'[');
-    write_decimal(sec);
-    arch::current::serial_write_byte(b'.');
-    write_decimal_padded(u64::from(usfrac), 6);
-    arch::current::serial_write_byte(b']');
-    arch::current::serial_write_byte(b' ');
-
-    arch::current::serial_write_byte(b'[');
+    let mut out = LineBuf::new();
+    out.push_timestamp();
+    out.push(b'[');
     if name.is_empty()
     {
-        arch::current::serial_write_byte(b'?');
+        out.push(b'?');
     }
     else
     {
         for &b in name
         {
-            arch::current::serial_write_byte(b);
+            out.push(b);
         }
     }
-    arch::current::serial_write_byte(b']');
-    arch::current::serial_write_byte(b' ');
-
+    out.push(b']');
+    out.push(b' ');
     for &b in line
     {
-        if b == b'\n'
-        {
-            arch::current::serial_write_byte(b'\r');
-        }
-        arch::current::serial_write_byte(b);
+        out.push_escaped(b);
     }
-    arch::current::serial_write_byte(b'\r');
-    arch::current::serial_write_byte(b'\n');
+    out.push(b'\r');
+    out.push(b'\n');
+    out.flush();
 }
 
-/// Emit `[sec.usfrac] [logd] <payload>\r\n` directly to the serial
-/// port. Used for logd's own internal diagnostics, replacing every
-/// `seraph::log!` call (which would self-IPC into the log endpoint
-/// logd serves).
+/// Emit `[sec.usfrac] [logd] <payload>\r\n` to the serial driver. Used for
+/// logd's own diagnostics in place of `seraph::log!` (which would self-IPC
+/// into the endpoint logd serves).
 fn self_log(payload: &str)
 {
-    let us = elapsed_us();
-    let sec = us / 1_000_000;
-    let usfrac = (us % 1_000_000) as u32;
-
-    arch::current::serial_write_byte(b'[');
-    write_decimal(sec);
-    arch::current::serial_write_byte(b'.');
-    write_decimal_padded(u64::from(usfrac), 6);
-    arch::current::serial_write_byte(b']');
-    arch::current::serial_write_byte(b' ');
-
-    arch::current::serial_write_byte(b'[');
+    let mut out = LineBuf::new();
+    out.push_timestamp();
+    out.push(b'[');
     for &b in b"logd"
     {
-        arch::current::serial_write_byte(b);
+        out.push(b);
     }
-    arch::current::serial_write_byte(b']');
-    arch::current::serial_write_byte(b' ');
-
+    out.push(b']');
+    out.push(b' ');
     for b in payload.bytes()
     {
-        if b == b'\n'
-        {
-            arch::current::serial_write_byte(b'\r');
-        }
-        arch::current::serial_write_byte(b);
+        out.push_escaped(b);
     }
-    arch::current::serial_write_byte(b'\r');
-    arch::current::serial_write_byte(b'\n');
+    out.push(b'\r');
+    out.push(b'\n');
+    out.flush();
 }
 
 /// Stack-buffer `fmt::Write` adapter for one-shot formatted
@@ -541,49 +708,6 @@ impl Write for SerialFmt
         self.buf[self.used..self.used + n].copy_from_slice(&bytes[..n]);
         self.used += n;
         Ok(())
-    }
-}
-
-fn write_decimal(value: u64)
-{
-    let mut buf = [0u8; 20];
-    let mut n = value;
-    let mut idx = buf.len();
-    if n == 0
-    {
-        idx -= 1;
-        buf[idx] = b'0';
-    }
-    else
-    {
-        while n > 0
-        {
-            idx -= 1;
-            buf[idx] = b'0' + (n % 10) as u8;
-            n /= 10;
-        }
-    }
-    for &b in &buf[idx..]
-    {
-        arch::current::serial_write_byte(b);
-    }
-}
-
-fn write_decimal_padded(value: u64, width: usize)
-{
-    let mut buf = [b'0'; 20];
-    let mut n = value;
-    let mut idx = buf.len();
-    while n > 0 && idx > 0
-    {
-        idx -= 1;
-        buf[idx] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    let start = buf.len().saturating_sub(width);
-    for &b in &buf[start..]
-    {
-        arch::current::serial_write_byte(b);
     }
 }
 

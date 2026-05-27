@@ -18,6 +18,7 @@ members = [
     "services/vfsd",
     "services/drivers/cmos",
     "services/drivers/goldfish-rtc",
+    "services/drivers/serial",
     "services/drivers/virtio/core",
     "services/drivers/virtio/blk",
     "services/fs/fat",

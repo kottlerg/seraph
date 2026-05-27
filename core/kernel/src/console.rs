@@ -13,6 +13,10 @@
 //! Unlike the bootloader console, the kernel is a native ELF, so `core::fmt`
 //! trait objects and vtable dispatch work on all architectures. The macros
 //! accept full format arguments.
+//!
+//! This is the early/panic console and is retained permanently; steady-state
+//! userspace serial output is owned by the userspace serial driver. See
+//! `docs/console-model.md`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

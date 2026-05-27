@@ -10,6 +10,14 @@ capabilities delegated by devmgr.
 ```
 drivers/
 ├── README.md
+├── cmos/                           # x86-64 CMOS / MC146818 RTC driver (binary)
+├── goldfish-rtc/                   # RISC-V Goldfish RTC driver (binary)
+├── serial/                         # Serial (UART) device driver (binary)
+│   ├── Cargo.toml
+│   ├── README.md                   # Serial-driver IPC interface (SERIAL_WRITE_BYTES)
+│   └── src/
+│       ├── main.rs
+│       └── arch/                   # Per-arch UART access (x86_64 COM1, riscv64 NS16550)
 ├── virtio/
 │   ├── core/                       # Shared VirtIO transport and queue primitives (library)
 │   │   ├── Cargo.toml
@@ -60,6 +68,9 @@ holds ambient hardware authority. The full driver lifecycle is specified in
 |---|---|---|
 | `virtio/core/` | Library | Shared VirtIO transport primitives: device initialisation, virtqueue setup, descriptor chain management |
 | [`virtio/blk/`](virtio/blk/README.md) | Binary | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
+| [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
+| `cmos/` | Binary | x86-64 CMOS / MC146818 RTC driver — answers the one-label RTC contract |
+| `goldfish-rtc/` | Binary | RISC-V Goldfish RTC driver — answers the one-label RTC contract |
 
 ---
 
@@ -85,6 +96,7 @@ holds ambient hardware authority. The full driver lifecycle is specified in
 | [docs/device-management.md](../../docs/device-management.md) | Driver lifecycle, DMA safety, security boundary |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, delegation |
+| [docs/console-model.md](../../docs/console-model.md) | Console output ownership; the serial driver's place in it |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 
 ---

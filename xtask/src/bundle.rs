@@ -11,8 +11,9 @@
 //! Two flavours of bundle are produced, selected by [`Harness`]:
 //!
 //! - [`Harness::Init`] — default. Pulls `init`, `procmgr`, `memmgr`,
-//!   `devmgr`, `vfsd`, `virtio-blk`, `fatfs` into a 7-entry bundle. `init`
-//!   is named `"init"`; modules carry their service name. Sources span
+//!   `devmgr`, `vfsd`, `virtio-blk`, `serial`, `fatfs` into an 8-entry
+//!   bundle. `init` is named `"init"`; modules carry their service name.
+//!   Sources span
 //!   `sysroot/services/`, `sysroot/services/drivers/`, and
 //!   `sysroot/services/fs/` per each component's install destination.
 //! - [`Harness::Ktest`] — pulls `ktest` only, named `"init"`, from
@@ -73,6 +74,7 @@ const MODULES: &[(&str, &str)] = &[
     ("devmgr", "services/devmgr"),
     ("vfsd", "services/vfsd"),
     ("virtio-blk", "services/drivers/virtio-blk"),
+    ("serial", "services/drivers/serial"),
     ("fatfs", "services/fs/fatfs"),
     ("memmgr", "services/memmgr"),
 ];

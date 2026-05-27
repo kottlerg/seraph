@@ -173,10 +173,15 @@ pub unsafe fn allocate_ap_trampoline(bs: *mut EfiBootServices) -> Option<u64>
 ///
 /// The Goldfish RTC entry covers a single 4 KiB page; devmgr identifies
 /// it by base address (`0x101000` is part of the QEMU `virt` machine
-/// model contract) and spawns the `goldfish-rtc` driver on it.
+/// model contract) and spawns the `goldfish-rtc` driver on it. The
+/// NS16550 UART entry (`0x1000_0000`) is seeded on the same basis so
+/// devmgr can carve an `MmioRegion` for the userspace serial driver; the
+/// kernel retains its own direct mapping of the same UART for the panic
+/// console.
 pub fn default_pci_apertures() -> &'static [(u64, u64)]
 {
     const ENTRIES: &[(u64, u64)] = &[
+        (0x1000_0000, 0x1000),
         (0x10_1000, 0x1000),
         (0x3000_0000, 0x1000_0000),
         (0x4000_0000, 0x4000_0000),

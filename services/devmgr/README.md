@@ -38,13 +38,19 @@ responsibilities are:
 - **Bind drivers** — match discovered devices to driver binaries in
   [`drivers/`](../drivers/README.md), request procmgr to create driver
   processes, and delegate per-device capabilities (MMIO, interrupt, and
-  IoPortRange where applicable). Drivers that need physical-base
-  addresses for device DMA programming obtain them from memmgr's
-  `REQUEST_FRAMES` reply alongside the Frame caps; DMA isolation, when
-  established, is programmed by devmgr through IOMMU hardware it
-  acquires via the `MmioRegion` cap flow.
+  IoPortRange where applicable). PCI devices spawn through the
+  BAR/IRQ-shaped path; fixed-location platform devices (e.g. the serial
+  UART) spawn through a simpler path that delivers a service endpoint and
+  one arch authority cap (`IoPortRange` for COM1, `MmioRegion` for an
+  NS16550). Drivers that need physical-base addresses for device DMA
+  programming obtain them from memmgr's `REQUEST_FRAMES` reply alongside
+  the Frame caps; DMA isolation, when established, is programmed by devmgr
+  through IOMMU hardware it acquires via the `MmioRegion` cap flow.
 - **Expose device registry** — maintain an IPC service that other services
-  (vfsd, netd) query to discover device endpoints after drivers are bound.
+  query to discover device endpoints after drivers are bound: vfsd resolves
+  the block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
+  (`QUERY_SERIAL_DEVICE`), and netd in due course. devmgr owns each driver's
+  service endpoint and mints a tokened SEND on query.
 - **Handle hotplug** — on platforms that support it, receive hotplug
   notifications and dynamically spawn or terminate driver processes. See
   [`docs/hotplug.md`](docs/hotplug.md).

@@ -401,8 +401,15 @@ pub(crate) unsafe fn lookup_cap(
 #[cfg(not(test))]
 fn sys_ipc_buffer_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
+    // User half boundary: addresses at or above this are kernel/non-canonical.
+    const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
+
     let virt = tf.arg(0);
-    if virt != 0 && (virt & 0xFFF) != 0
+    // A non-zero buffer must be page-aligned AND in the user half. Without the
+    // user-half check a page-aligned kernel or non-canonical VA would be stored
+    // and later dereferenced by the IPC fast paths under user_access_begin/end,
+    // faulting in the kernel instead of failing the (mis)registration here.
+    if virt != 0 && ((virt & 0xFFF) != 0 || virt >= USER_HALF_TOP)
     {
         return Err(SyscallError::InvalidAddress);
     }

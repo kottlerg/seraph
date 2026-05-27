@@ -180,6 +180,18 @@ pub unsafe fn endpoint_call(
         // committed by enqueue_and_wake.
         unsafe {
             (*server).ipc_msg = *msg;
+            // Clear context_saved BEFORE the caller becomes wakeable. Every
+            // reply-wake claimant reaches the caller through `reply_tcb`
+            // (endpoint_reply, dealloc's BlockedOnReply detach,
+            // cancel_ipc_block, the sleep-list timer arm), Acquire-loading it.
+            // Ordering this Relaxed clear before the `reply_tcb` Release makes
+            // the Release carry it, so no claimant can observe the stale
+            // context_saved==1 left by the caller's previous switch-in and
+            // dispatch it onto a stack its switch() has not yet vacated.
+            // Mirrors signal_wait's clear-before-register ordering (signal.rs).
+            (*caller)
+                .context_saved
+                .store(0, core::sync::atomic::Ordering::Relaxed);
             // The caller is becoming BlockedOnReply: claim it for the eventual
             // reply wake BEFORE publishing reply_tcb. dealloc_object(Thread)'s
             // BlockedOnReply detach Acquire-loads reply_tcb, so this store is
@@ -200,14 +212,6 @@ pub unsafe fn endpoint_call(
             (*server)
                 .wake_in_flight
                 .store(1, core::sync::atomic::Ordering::Release);
-        }
-        // Clear context_saved before making the caller visible as blocked.
-        // See signal.rs signal_wait for the full rationale.
-        // SAFETY: caller validated by syscall layer; context_saved is AtomicU32.
-        unsafe {
-            (*caller)
-                .context_saved
-                .store(0, core::sync::atomic::Ordering::Relaxed);
         }
         // SAFETY: caller validated; held ep.lock excludes recv-queue writes.
         let committed = unsafe {

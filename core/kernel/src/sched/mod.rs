@@ -1912,14 +1912,17 @@ pub unsafe fn schedule(requeue_current: bool)
                 (*current).magic == thread::TCB_MAGIC,
                 "schedule: current TCB magic corrupt on cpu {cpu}"
             );
-            // Do not re-enqueue threads that dealloc_object has already marked
-            // Exited (or that are Stopped). Between dealloc's all-scheduler
-            // lock release and this timer-driven schedule(true), the Exited
-            // state was committed under all locks. Re-enqueuing would overwrite
-            // that state to Ready, creating a dangling run-queue entry that
-            // survives TCB deallocation — a use-after-free.
+            // Requeue ONLY a thread that is actually Running. `requeue_current`
+            // is set only by preemption and yield, both of which act on the
+            // running thread, so `Running` is the sole legitimate state here.
+            // An allowlist (rather than a `!= Exited && != Stopped` denylist)
+            // also refuses to requeue a `current` a concurrent path moved to
+            // Exited/Stopped (dealloc/stop committed under all locks —
+            // requeuing would resurrect a dangling run-queue entry over a freed
+            // TCB), and defensively never double-links a Blocked/Created/Ready
+            // current.
             let cur_state = (*current).state;
-            if cur_state != ThreadState::Exited && cur_state != ThreadState::Stopped
+            if cur_state == ThreadState::Running
             {
                 let prio = (*current).priority;
                 debug_assert!(

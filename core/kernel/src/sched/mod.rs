@@ -1912,17 +1912,20 @@ pub unsafe fn schedule(requeue_current: bool)
                 (*current).magic == thread::TCB_MAGIC,
                 "schedule: current TCB magic corrupt on cpu {cpu}"
             );
-            // Requeue ONLY a thread that is actually Running. `requeue_current`
-            // is set only by preemption and yield, both of which act on the
-            // running thread, so `Running` is the sole legitimate state here.
-            // An allowlist (rather than a `!= Exited && != Stopped` denylist)
-            // also refuses to requeue a `current` a concurrent path moved to
-            // Exited/Stopped (dealloc/stop committed under all locks —
-            // requeuing would resurrect a dangling run-queue entry over a freed
-            // TCB), and defensively never double-links a Blocked/Created/Ready
-            // current.
+            // Do not re-enqueue a thread that a concurrent path has already
+            // committed to Exited (dealloc) or Stopped under all-CPU scheduler
+            // locks: re-enqueuing would overwrite that state to Ready and leave
+            // a dangling run-queue entry over a TCB that retype_free may reclaim
+            // — a use-after-free. Every other state at a `requeue_current` call
+            // (Running in the common preemption/yield case) is requeue-legitimate.
+            //
+            // This MUST stay a denylist (`!= Exited && != Stopped`). A tighter
+            // `== Running` allowlist is logically equivalent on the audited
+            // callers but perturbs this hot path's instruction timing enough to
+            // widen the #116 all-CPUs-idle stall race dramatically under TCG SMP
+            // (measured ~0% → ~12% across run-parallel sweeps).
             let cur_state = (*current).state;
-            if cur_state == ThreadState::Running
+            if cur_state != ThreadState::Exited && cur_state != ThreadState::Stopped
             {
                 let prio = (*current).priority;
                 debug_assert!(

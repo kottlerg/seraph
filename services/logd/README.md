@@ -21,15 +21,17 @@ process.
   so every pre-existing tokened SEND cap continues to work without
   re-derivation or re-registration.
 
-* **Direct serial writer.** logd writes received log lines and its
-  own diagnostics straight to the UART via an arch-specific
-  authority cap (`IoPortRange` for COM1 on x86-64, `SbiControl` for
-  SBI legacy `console_putchar` on RISC-V). It cannot route its own
-  diagnostics through `seraph::log!` because it IS the log
-  receiver; the macro would self-IPC into the endpoint logd serves
-  and deadlock. A future PR will replace this direct path with a
-  proper userspace console driver under devmgr (see issue
-  [#66](https://github.com/kottlerg/seraph/issues/66)).
+* **Driver-mediated serial writer.** logd emits received log lines
+  and its own diagnostics through the userspace serial driver
+  (`services/drivers/serial/`), resolved once via devmgr's
+  `QUERY_SERIAL_DEVICE` and written with `SERIAL_WRITE_BYTES`. logd
+  holds no UART hardware authority. It cannot route its own
+  diagnostics through `seraph::log!` because it IS the log receiver;
+  the macro would self-IPC into the endpoint logd serves and
+  deadlock. Until the driver is resolvable, serial output is dropped
+  while history still accrues; early-boot output is covered by
+  init-logd's direct-UART fallback. See
+  [docs/console-model.md](../../docs/console-model.md).
 
 * **History buffer.** logd maintains a per-sender ring of completed
   log lines, populated by every `STREAM_BYTES`-derived flush and
@@ -69,14 +71,10 @@ logd/
 │   └── ipc-interface.md        # IPC labels logd handles
 └── src/
     ├── main.rs                 # entry, bootstrap, event loop,
-    │                           # serial emit, self_log
+    │                           # driver-mediated serial emit, self_log
     ├── handover.rs             # HANDOVER_PULL caller
-    ├── slot.rs                 # SlotTable: HashMap<token, Slot>
-    │                           # with per-sender history ring
-    └── arch/                   # arch-specific serial output
-        ├── mod.rs
-        ├── x86_64/mod.rs       # COM1 via IoPortRange
-        └── riscv64/mod.rs      # SBI legacy console_putchar
+    └── slot.rs                 # SlotTable: HashMap<token, Slot>
+                                # with per-sender history ring
 ```
 
 ## Bootstrap caps
@@ -88,11 +86,12 @@ Init's bootstrap round (one round, `done = true`) delivers four caps:
 | 0 | RECV on the master log endpoint |
 | 1 | SEND on the master log endpoint (single-use; HANDOVER_PULL only) |
 | 2 | Tokened SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
-| 3 | Arch serial authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V) |
+| 3 | Tokened SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE`) |
 
 After `HANDOVER_PULL` completes, logd deletes cap[1] (no other use
-for a SEND cap on its own endpoint). The arch cap stays bound to
-logd's main thread for the lifetime of the process.
+for a SEND cap on its own endpoint). The devmgr-registry cap is kept
+for the lifetime of the process; logd uses it once to resolve and
+cache the serial driver's write endpoint.
 
 ## Relevant Design Documents
 
@@ -102,6 +101,7 @@ logd's main thread for the lifetime of the process.
 | [docs/bootstrap.md](../../docs/bootstrap.md) | logd's spawn timing inside init's Phase 2 |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Death-notification cascade logd subscribes to |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | Endpoint identity, cap transfer semantics that make the init-logd handover possible |
+| [docs/console-model.md](../../docs/console-model.md) | Console output ownership; logd as the serial driver's primary client |
 | [services/init/README.md](../init/README.md) | init's Phase 2 epilogue (logd spawn) and init-logd's role + termination |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler + retroactive bind |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
@@ -111,4 +111,4 @@ logd's main thread for the lifetime of the process.
 
 ## Summarized By
 
-[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md)
+[Architecture Overview](../../docs/architecture.md), [System Bootstrap](../../docs/bootstrap.md), [Console Model](../../docs/console-model.md)

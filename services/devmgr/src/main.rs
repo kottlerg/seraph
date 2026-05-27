@@ -139,6 +139,15 @@ fn main() -> !
         &mut catalog,
     );
 
+    // Spawn the serial (UART) driver via the non-PCI simple-device path.
+    // devmgr owns `serial_ep` and mints client SEND caps on
+    // `QUERY_SERIAL_DEVICE`.
+    let (serial_spawned, serial_ep) = spawn_serial(&mut caps, ipc_buf);
+    if serial_spawned
+    {
+        std::os::seraph::log!("devmgr: serial driver spawned");
+    }
+
     if caps.registry_ep == 0
     {
         std::os::seraph::log!("no registry endpoint injected, halting");
@@ -193,6 +202,55 @@ fn main() -> !
                         blk_ep,
                         syscall::RIGHTS_SEND_GRANT,
                         ipc::blk_labels::MOUNT_AUTHORITY,
+                    )
+                    {
+                        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                            .cap(derived)
+                            .build();
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                    else
+                    {
+                        let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                }
+                else
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+            }
+            ipc::devmgr_labels::QUERY_SERIAL_DEVICE =>
+            {
+                // This handler must not `seraph::log!`: its caller is logd
+                // (the log sink), which blocks in this synchronous call
+                // outside its log-recv loop. A log here would deadlock
+                // (devmgr → log_ep → logd, which is waiting on this reply).
+                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if serial_spawned && serial_ep != 0
+                {
+                    // Mint a tokened SEND_GRANT cap carrying the
+                    // WRITE_AUTHORITY verb bit on the serial driver's
+                    // service endpoint, mirroring QUERY_BLOCK_DEVICE.
+                    if let Ok(derived) = syscall::cap_derive_token(
+                        serial_ep,
+                        syscall::RIGHTS_SEND_GRANT,
+                        ipc::serial_labels::WRITE_AUTHORITY,
                     )
                     {
                         let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
@@ -611,7 +669,7 @@ fn spawn_virtio_blk(
         let bar_info = find_virtio_bar_cap(pci_dev, caps);
         let irq_cap = acquire_single_irq_cap(pci_dev, irq_root);
 
-        let module_cap = caps.driver_module_slots[0];
+        let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
 
         let config = spawn::DriverSpawnConfig {
             procmgr_ep: caps.procmgr_ep,
@@ -717,6 +775,109 @@ fn find_virtio_bar_cap(
     }
 
     (bar_caps, bar_bases, count, bar_sizes)
+}
+
+// ── Serial (UART) driver spawn ──────────────────────────────────────────────
+
+/// Carve the platform UART arch authority cap and spawn the serial driver
+/// via the non-PCI simple-device path. Returns `(spawned, serial_ep)`;
+/// `serial_ep` is the devmgr-owned service endpoint used to mint client
+/// SEND caps on `QUERY_SERIAL_DEVICE`. devmgr does not retain UART-specific
+/// authority after a successful spawn — the carved cap is moved to the
+/// driver.
+fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
+{
+    let module_cap = caps.module_cap_for_kind(caps::module_kind::SERIAL);
+    if module_cap == 0
+    {
+        std::os::seraph::log!("serial: no serial driver module delivered");
+        return (false, 0);
+    }
+
+    // devmgr-owned service endpoint: the driver receives on a RIGHTS_ALL
+    // copy; devmgr keeps the original to mint client SEND caps on query.
+    let serial_ep = std::os::seraph::object_slab_acquire(88)
+        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
+        .unwrap_or(0);
+    if serial_ep == 0
+    {
+        std::os::seraph::log!("serial: failed to create service endpoint");
+        return (false, 0);
+    }
+
+    let Some(hw_cap) = carve_uart_authority(caps)
+    else
+    {
+        std::os::seraph::log!("serial: failed to carve UART authority cap");
+        return (false, serial_ep);
+    };
+
+    let spawned = spawn::spawn_simple_device(
+        caps.procmgr_ep,
+        caps.self_bootstrap_ep,
+        module_cap,
+        serial_ep,
+        hw_cap,
+        ipc_buf,
+    );
+    (spawned, serial_ep)
+}
+
+/// Carve the COM1 `IoPortRange` (`0x3F8`..=`0x3FF`) out of the root
+/// `IoPortRange` cap.
+#[cfg(target_arch = "x86_64")]
+fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
+{
+    ioport_carve(caps.ioport_root_cap, 0x3F8, 8)
+}
+
+/// Carve the NS16550 `MmioRegion` out of the aperture covering the UART
+/// MMIO window.
+///
+/// The window is the QEMU `virt` NS16550 at `[0x1000_0000, 0x1000_1000)` —
+/// a fixed part of the QEMU virt machine model, the same basis on which
+/// [`platform_default_ecam`] and the seeded goldfish-RTC aperture are
+/// identified. The bootloader independently discovers this base via ACPI
+/// SPCR for its early console; replacing this constant with forwarded
+/// SPCR/`_CRS` discovery is part of the data-driven device-binding follow-up.
+#[cfg(target_arch = "riscv64")]
+fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
+{
+    carve_subrange(
+        &mut caps.apertures[..caps.aperture_count],
+        0x1000_0000,
+        0x1000,
+    )
+}
+
+/// Carve a narrow `IoPortRange` of `count` ports starting at `base` out of
+/// the root `IoPortRange` cap via two `ioport_split` calls. Returns the
+/// narrow slot; the unused slabs are deleted. `cap_derive`-copies the root
+/// so it stays intact for further carves. Mirrors init's `ioport_carve`.
+#[cfg(target_arch = "x86_64")]
+fn ioport_carve(root_cap: u32, base: u16, count: u16) -> Option<u32>
+{
+    if root_cap == 0
+    {
+        return None;
+    }
+    let working = syscall::cap_derive(root_cap, syscall::RIGHTS_ALL).ok()?;
+    let upper_split_at = base.checked_add(count)?;
+    let Ok((lower_unused, upper)) = syscall::ioport_split(working, base)
+    else
+    {
+        let _ = syscall::cap_delete(working);
+        return None;
+    };
+    let _ = syscall::cap_delete(lower_unused);
+    let Ok((narrow, upper_unused)) = syscall::ioport_split(upper, upper_split_at)
+    else
+    {
+        let _ = syscall::cap_delete(upper);
+        return None;
+    };
+    let _ = syscall::cap_delete(upper_unused);
+    Some(narrow)
 }
 
 fn halt_loop() -> !

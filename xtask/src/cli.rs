@@ -100,6 +100,7 @@ pub enum BuildComponent
     Devmgr,
     Vfsd,
     VirtioBlk,
+    Serial,
     CmosRtc,
     GoldfishRtc,
     Fatfs,

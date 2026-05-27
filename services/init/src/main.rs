@@ -864,11 +864,11 @@ fn run(info_ptr: u64) -> !
     // re-registers.
     logging::log("phase 2: launching logd");
     thread_caps.logd = service::create_and_start_logd(
-        info,
         endpoint_cap,
         endpoint_cap,
         init_bootstrap_ep,
         log_ep,
+        devmgr_registry_ep,
         system_root_cap,
         info.cspace_cap,
         ipc_buf,

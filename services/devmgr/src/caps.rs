@@ -74,6 +74,15 @@ pub mod kind
     pub const SVCMGR_BUNDLE: u64 = 4;
 }
 
+/// Per-cap class tag carried alongside each `kind::MODULE` round cap, so
+/// devmgr resolves a driver module by class rather than by delivery
+/// position. Mirrors `init/src/service.rs::module_kind`.
+pub mod module_kind
+{
+    pub const VIRTIO_BLK: u64 = 1;
+    pub const SERIAL: u64 = 2;
+}
+
 /// Presence-bitmap bits on R1's `data[0]`. Mirrors
 /// `init/src/service.rs::present`.
 mod present
@@ -107,8 +116,10 @@ pub struct DevmgrCaps
     pub self_bootstrap_ep: u32,
     pub self_aspace: u32,
 
-    // Driver module caps.
+    // Driver module caps, with a parallel `module_kind::*` tag per slot so
+    // a module is resolved by class rather than by delivery position.
     pub driver_module_slots: [u32; 8],
+    pub driver_module_kinds: [u64; 8],
     pub driver_module_count: usize,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
@@ -142,10 +153,25 @@ impl DevmgrCaps
             self_bootstrap_ep: 0,
             self_aspace: info.self_aspace,
             driver_module_slots: [0; 8],
+            driver_module_kinds: [0; 8],
             driver_module_count: 0,
             svcmgr_publish_cap: 0,
             ioport_root_cap: 0,
         }
+    }
+
+    /// Resolve a delivered driver-module cap by its [`module_kind`] tag.
+    /// Returns `0` if no module of that class was delivered.
+    pub fn module_cap_for_kind(&self, kind: u64) -> u32
+    {
+        for i in 0..self.driver_module_count
+        {
+            if self.driver_module_kinds[i] == kind
+            {
+                return self.driver_module_slots[i];
+            }
+        }
+        0
     }
 }
 
@@ -266,11 +292,17 @@ fn absorb_acpi_region_round(
     }
 }
 
-/// Unpack one module-cap round.
-fn absorb_module_round(round_caps: &[u32], round_cap_count: usize, caps: &mut DevmgrCaps)
+/// Unpack one module-cap round. `data[2 + i]` carries the `module_kind`
+/// tag for `caps[i]`.
+fn absorb_module_round(
+    round_caps: &[u32],
+    round_cap_count: usize,
+    round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
+    caps: &mut DevmgrCaps,
+)
 {
     let n = round_cap_count.min(4);
-    for &slot in round_caps.iter().take(n)
+    for (i, &slot) in round_caps.iter().take(n).enumerate()
     {
         if slot == 0
         {
@@ -281,6 +313,7 @@ fn absorb_module_round(round_caps: &[u32], round_cap_count: usize, caps: &mut De
             break;
         }
         caps.driver_module_slots[caps.driver_module_count] = slot;
+        caps.driver_module_kinds[caps.driver_module_count] = round_data[2 + i];
         caps.driver_module_count += 1;
     }
 }
@@ -303,7 +336,10 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
             {
                 absorb_acpi_region_round(&round.caps, round.cap_count, &round.data, caps);
             }
-            kind::MODULE => absorb_module_round(&round.caps, round.cap_count, caps),
+            kind::MODULE =>
+            {
+                absorb_module_round(&round.caps, round.cap_count, &round.data, caps);
+            }
             kind::SVCMGR_BUNDLE =>
             {
                 // caps[0] = svcmgr publish-authority cap (always present;

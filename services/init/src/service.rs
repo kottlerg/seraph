@@ -341,6 +341,15 @@ mod kind
     pub const SVCMGR_BUNDLE: u64 = 4;
 }
 
+/// Per-cap class tag carried in a `kind::MODULE` round's data words so
+/// devmgr resolves a driver module by class rather than delivery position.
+/// Mirrors `devmgr/src/caps.rs::module_kind`.
+mod module_kind
+{
+    pub const VIRTIO_BLK: u64 = 1;
+    pub const SERIAL: u64 = 2;
+}
+
 /// Presence-bitmap bits on R1's `data[0]`. Tells devmgr which optional
 /// caps (in order after `registry_ep`) are present in the cap list.
 mod present
@@ -576,27 +585,53 @@ pub fn create_devmgr_with_caps(
         idx = batch_end;
     }
 
-    // ── Module round (virtio-blk) ───────────────────────────────────────
-    if let Some(module_cap) = virtio_blk_module
+    // ── Module round (driver binaries devmgr spawns) ────────────────────
+    //
+    // Each delivered cap is tagged with its `module_kind` in the data
+    // words so devmgr binds a module by class, not by delivery position.
+    let serial_module = crate::find_module_by_name(info, b"serial");
     {
-        let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
-        else
-        {
-            log("devmgr: module cap derive failed");
-            return None;
-        };
+        let mut module_caps = [0u32; 4];
+        let mut module_data = [0u64; 2 + 4];
+        module_data[0] = kind::MODULE;
+        let mut n = 0usize;
 
-        if !serve(
-            bootstrap_ep,
-            child_token,
-            ipc_buf,
-            false,
-            &[module_copy],
-            &[kind::MODULE, 1],
-            "devmgr: bootstrap module round failed",
-        )
+        for (source, tag) in [
+            (virtio_blk_module, module_kind::VIRTIO_BLK),
+            (serial_module, module_kind::SERIAL),
+        ]
         {
-            return None;
+            let Some(module_cap) = source
+            else
+            {
+                continue;
+            };
+            let Ok(module_copy) = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL)
+            else
+            {
+                log("devmgr: driver module cap derive failed");
+                return None;
+            };
+            module_caps[n] = module_copy;
+            module_data[2 + n] = tag;
+            n += 1;
+        }
+
+        if n > 0
+        {
+            module_data[1] = n as u64;
+            if !serve(
+                bootstrap_ep,
+                child_token,
+                ipc_buf,
+                false,
+                &module_caps[..n],
+                &module_data[..2 + n],
+                "devmgr: bootstrap module round failed",
+            )
+            {
+                return None;
+            }
         }
     }
 
@@ -1596,11 +1631,11 @@ fn handoff_to_procmgr_reap(
 // most of the body into helpers and obscure the cap-flow sequencing.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn create_and_start_logd(
-    info: &InitInfo,
     procmgr_ep: u32,
     procmgr_service_ep_source: u32,
     bootstrap_ep: u32,
     log_ep: u32,
+    devmgr_registry_ep: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
     ipc_buf: *mut u64,
@@ -1636,9 +1671,10 @@ pub fn create_and_start_logd(
     let process_handle = reply_caps[0];
     let thread_cap = reply_caps[1];
 
-    // logd owns the master log endpoint RECV plus arch serial
-    // authority (IoPortRange on x86-64, SbiControl on RISC-V); it
-    // does no filesystem I/O. Spawn with no namespace cap.
+    // logd owns the master log endpoint RECV plus a devmgr-registry query
+    // cap (to resolve the serial driver via QUERY_SERIAL_DEVICE); its
+    // serial output is driver-mediated, so it holds no UART hardware
+    // authority. It does no filesystem I/O. Spawn with no namespace cap.
     if !configure_child_namespace(
         process_handle,
         system_root_cap,
@@ -1684,29 +1720,20 @@ pub fn create_and_start_logd(
         return None;
     };
 
-    // Arch-specific serial-authority cap. Both `cap_derive(RIGHTS_ALL)`
-    // mirror pwrmgr's pattern (`services/init/src/service.rs::
-    // create_and_start_pwrmgr`). On absent archs the source slot is
-    // zero; we pass zero through and logd silently disables its serial
-    // path (received log lines still buffer in memory).
-    let arch_cap_source: u32 = {
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::find_cap_by_type(info, CapType::IoPortRange).unwrap_or(0)
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            info.sbi_control_cap
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
-        {
-            let _ = info;
-            0
-        }
-    };
-    let arch_cap_copy = if arch_cap_source != 0
+    // devmgr-registry query cap: a SEND on devmgr's registry endpoint
+    // tokened with REGISTRY_QUERY_AUTHORITY so logd can resolve the serial
+    // driver via `QUERY_SERIAL_DEVICE`. logd's serial output is mediated by
+    // that driver; it holds no UART hardware authority. A zero registry
+    // endpoint yields zero, and logd then buffers received log lines in
+    // memory until the driver becomes resolvable.
+    let devmgr_registry_query = if devmgr_registry_ep != 0
     {
-        syscall::cap_derive(arch_cap_source, syscall::RIGHTS_ALL).unwrap_or(0)
+        syscall::cap_derive_token(
+            devmgr_registry_ep,
+            syscall::RIGHTS_SEND,
+            ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+        )
+        .unwrap_or(0)
     }
     else
     {
@@ -1723,9 +1750,9 @@ pub fn create_and_start_logd(
         let _ = syscall::cap_delete(log_recv);
         let _ = syscall::cap_delete(log_handover_send);
         let _ = syscall::cap_delete(procmgr_death_auth);
-        if arch_cap_copy != 0
+        if devmgr_registry_query != 0
         {
-            let _ = syscall::cap_delete(arch_cap_copy);
+            let _ = syscall::cap_delete(devmgr_registry_query);
         }
         return None;
     }
@@ -1739,7 +1766,7 @@ pub fn create_and_start_logd(
             log_recv,
             log_handover_send,
             procmgr_death_auth,
-            arch_cap_copy,
+            devmgr_registry_query,
         ],
         &[],
         "logd: bootstrap round failed",

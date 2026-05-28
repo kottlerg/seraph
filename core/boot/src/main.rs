@@ -1097,12 +1097,12 @@ unsafe fn step9_populate_boot_info(
     let mut bundle_cursor = bundle.phys;
     for module in &mods.modules[..mods.count]
     {
+        // Bundle bodies are 4 KiB-aligned per `bundle::BODY_ALIGNMENT`,
+        // already enforced (release-mode) by `bundle::parse_header`'s
+        // `EntryMisaligned` check. Only the cursor-ordering invariant
+        // needs an explicit debug guard.
         let module_base = module.physical_base;
         let module_end = (module.physical_base + module.size + 0xFFF) & !0xFFF;
-        debug_assert!(
-            module_base.is_multiple_of(4096),
-            "bundle module body not 4 KiB-aligned",
-        );
         debug_assert!(
             bundle_cursor <= module_base,
             "bundle modules not in ascending offset order",

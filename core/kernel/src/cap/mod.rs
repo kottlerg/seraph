@@ -1999,6 +1999,29 @@ fn mint_reclaim_pass(
     let mut count: u32 = 0;
     let mut pages_total: u64 = 0;
 
+    // Module-range slice for the debug-only overlap check below. Hoisted
+    // out of the per-range loop because `boot_info.modules` is invariant
+    // across iterations.
+    #[cfg(debug_assertions)]
+    let modules: &[boot_protocol::BootModule] = if !boot_info.modules.entries.is_null()
+        && boot_info.modules.count > 0
+    {
+        // SAFETY: boot_info.modules was validated by the bootloader; the
+        // entries pointer is in the direct physical map (active since
+        // Phase 3) — same provenance as the slice in
+        // `mint_module_frame_caps`.
+        unsafe {
+            core::slice::from_raw_parts(
+                phys_to_virt(boot_info.modules.entries as u64) as *const boot_protocol::BootModule,
+                boot_info.modules.count as usize,
+            )
+        }
+    }
+    else
+    {
+        &[]
+    };
+
     for range in ranges
     {
         if range.page_count == 0
@@ -2014,36 +2037,23 @@ fn mint_reclaim_pass(
         let size_bytes = u64::from(range.page_count) * (crate::mm::PAGE_SIZE as u64);
         pages_total += u64::from(range.page_count);
 
-        // Catch double-coverage with module Frame caps: any overlap
-        // here would have `register_owned_range` double-bump
-        // `total_pages` and (on cap destroy) cause `free_range` to
-        // double-free into the buddy. The bootloader (`step9` bundle
-        // carve-out, scratch-page allocations) is responsible for
-        // disjointness; this asserts the contract at the consumer.
+        // Catch double-coverage with module Frame caps: any overlap here
+        // would have `register_owned_range` double-bump `total_pages` and
+        // (on cap destroy) cause `free_range` to double-free into the
+        // buddy. The bootloader (`step9` bundle carve-out, scratch-page
+        // allocations) is responsible for disjointness; this asserts the
+        // contract at the consumer.
         #[cfg(debug_assertions)]
         {
             let range_end = phys_base + size_bytes;
-            if !boot_info.modules.entries.is_null() && boot_info.modules.count > 0
+            for m in modules
             {
-                // SAFETY: same provenance as the slice in
-                // `mint_module_frame_caps` above; identity-mapped through
-                // Phase 7.
-                let modules = unsafe {
-                    core::slice::from_raw_parts(
-                        phys_to_virt(boot_info.modules.entries as u64)
-                            as *const boot_protocol::BootModule,
-                        boot_info.modules.count as usize,
-                    )
-                };
-                for m in modules
-                {
-                    let m_base = m.physical_base & !0xFFF;
-                    let m_end = (m.physical_base + m.size + 0xFFF) & !0xFFF;
-                    debug_assert!(
-                        range_end <= m_base || phys_base >= m_end,
-                        "reclaim range overlaps module Frame cap",
-                    );
-                }
+                let m_base = m.physical_base & !0xFFF;
+                let m_end = (m.physical_base + m.size + 0xFFF) & !0xFFF;
+                debug_assert!(
+                    range_end <= m_base || phys_base >= m_end,
+                    "reclaim range overlaps module Frame cap",
+                );
             }
         }
 

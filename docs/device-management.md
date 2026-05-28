@@ -139,6 +139,33 @@ devmgr is not a dependency of vfsd or netd directly — those services receive d
 endpoints after devmgr has completed initial binding. The dependency ordering is
 managed by init's bootstrap sequence (for early boot) and svcmgr (for restarts).
 
+### Driver binary sources
+
+devmgr loads driver binaries from one of two places:
+
+- **Boot bundle** — bootstrap-essentials (virtio-blk, serial,
+  framebuffer) ship in the bundle and arrive as Frame caps in devmgr's
+  MODULE bootstrap round. devmgr spawns them via
+  `procmgr_labels::CREATE_PROCESS` during initial enumeration.
+- **On-disk rootfs** — non-essentials (today: the per-arch RTC) live
+  at `/services/drivers/<chip>` and are loaded via
+  `procmgr_labels::CREATE_FROM_FILE`. After vfsd-mount, init walks
+  `system_root_cap` to `/services/drivers/` and hands devmgr that
+  subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by
+  `INIT_BIND_AUTHORITY`; sent at `LOOKUP | READ` rights only — devmgr
+  cannot reach outside the drivers subtree). Devmgr replies SUCCESS
+  before doing any spawn work so init never blocks on driver
+  bring-up; the actual walk + `CREATE_FROM_FILE` + bootstrap rounds
+  run after `ipc_reply` and before devmgr returns to its next
+  `ipc_recv`. The spawn is at-most-once per boot; on failure
+  (binary missing, ELF corrupt, hardware-carve failure, OOM, etc.)
+  devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
+  `QUERY_RTC_DEVICE` calls and clients (timed) degrade to their
+  no-device path. Growing the boot bundle with non-essentials would
+  waste permanently-leaked post-`ExitBootServices` UEFI allocation
+  (see `core/boot/src/main.rs`), so on-disk loading is preferred for
+  anything not on the read-the-disk-in-the-first-place critical path.
+
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is
 specified in [`storage.md`](storage.md).

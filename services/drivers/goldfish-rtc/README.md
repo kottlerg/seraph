@@ -9,9 +9,13 @@ fixed physical address `0x101000`. It returns wall-clock time as a
 64-bit nanosecond count since the Unix epoch in two 32-bit MMIO
 register reads.
 
-Spawned by devmgr on RISC-V QEMU virt via the non-PCI simple-device
-path. devmgr owns the driver's service endpoint and mints client SEND
-caps on `devmgr_labels::QUERY_RTC_DEVICE`, each tokened with
+Installed to `/services/drivers/goldfish-rtc` on the rootfs. Spawned
+by devmgr on RISC-V QEMU virt via the non-PCI simple-device path,
+`procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
+walks to from the `/services/drivers/` subtree cap init delivers
+post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`. devmgr owns the
+driver's service endpoint and mints client SEND caps on
+`devmgr_labels::QUERY_RTC_DEVICE`, each tokened with
 `rtc_labels::READ_AUTHORITY`. The `timed` service resolves the SEND
 once at startup to seed its wall-clock offset.
 

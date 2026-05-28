@@ -119,11 +119,24 @@ procmgr for reaping.
   (`../src/service.rs:1341` → `create_svcmgr_from_file` at
   `../src/service.rs:1135`; `setup_and_start_svcmgr` at
   `../src/service.rs:1213`).
+- Walk `system_root_cap` to `/services/drivers/` at `LOOKUP | READ`
+  rights and hand devmgr the resulting subtree cap via
+  `devmgr_labels::SET_DRIVERS_DIR`, on an
+  `INIT_BIND_AUTHORITY`-tokened copy of `devmgr_registry_ep`. Devmgr
+  replies SUCCESS *before* doing any spawn work, then walks the
+  per-arch RTC name from that subtree and spawns the driver between
+  its `ipc_reply` and next `ipc_recv` (procmgr `CREATE_FROM_FILE` —
+  the binary lives on the rootfs, not in the boot bundle).
+  Best-effort: the handshake is non-fatal, and any failure
+  (walk fails, devmgr replies non-SUCCESS) leaves the system without
+  a wallclock — timed degrades to `WALL_CLOCK_UNAVAILABLE`.
+  (`set_drivers_dir_on_devmgr` in `../src/service.rs`.)
 - Bring up the wallclock chain: spawn timed and resolve the per-arch
   RTC driver through devmgr. The RTC chip driver (cmos-rtc on x86-64,
-  goldfish-rtc on RISC-V) is devmgr-spawned during devmgr's
-  enumeration sweep, not by init; timed resolves the SEND at startup
-  via `devmgr_labels::QUERY_RTC_DEVICE` on the
+  goldfish-rtc on RISC-V) is spawned by devmgr from the on-disk
+  rootfs (`/services/drivers/<chip>`) after the
+  `SET_DRIVERS_DIR` handshake above, not by init; timed resolves the
+  SEND at startup via `devmgr_labels::QUERY_RTC_DEVICE` on the
   `REGISTRY_QUERY_AUTHORITY`-tokened copy of devmgr's registry
   endpoint delivered in its bootstrap round
   (`../src/service.rs:1372` → `bring_up_timed` at

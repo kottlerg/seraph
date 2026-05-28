@@ -12,6 +12,35 @@
 
 use ipc::{IpcMessage, procmgr_labels};
 
+/// Source the child's ELF binary is loaded from. Selected per spawn site:
+/// boot-bundle modules (the bootstrap-essential drivers virtio-blk,
+/// serial, framebuffer) carry a procmgr Frame cap and use
+/// [`CreateSource::Module`]; non-essential drivers loaded from the rootfs
+/// (today: the per-arch RTC, walked by devmgr through its
+/// `SET_DRIVERS_DIR` subtree cap) carry a vfsd file SEND cap plus a size
+/// hint and use [`CreateSource::File`]. The variant decides the procmgr
+/// request label and payload shape; the rest of [`spawn_simple_device`]
+/// — service-endpoint derivation, `START_PROCESS`, bootstrap rounds —
+/// is identical across both paths.
+#[derive(Clone, Copy)]
+pub enum CreateSource
+{
+    /// Frame cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
+    /// Caller retains the slot on failure to match the existing
+    /// `spawn_simple_device` contract; kernel transfers ownership on
+    /// successful `CREATE_PROCESS`.
+    Module(u32),
+    /// vfsd file SEND cap (`procmgr_labels::CREATE_FROM_FILE`). `size` is
+    /// the file size hint reported by the resolving `NS_LOOKUP`. On any
+    /// pre-`ipc_call` failure inside [`spawn_simple_device`], the function
+    /// deletes the file cap on the caller's behalf — the cap was just
+    /// derived by the namespace walk and has no retry value.
+    File
+    {
+        file_cap: u32, size: u64
+    },
+}
+
 /// Monotonic counter for driver-child bootstrap tokens.
 static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
@@ -233,21 +262,45 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
 pub fn spawn_simple_device(
     procmgr_ep: u32,
     bootstrap_ep: u32,
-    module_cap: u32,
+    source: CreateSource,
     service_ep: u32,
     hw_cap: u32,
     devmgr_query_ep: u32,
     ipc_buf: *mut u64,
 ) -> bool
 {
-    if module_cap == 0 || service_ep == 0 || hw_cap == 0
+    // Source-aware cleanup: on any failure before the procmgr ipc_call
+    // completes, `CreateSource::File`'s file_cap is deleted (the
+    // namespace walk just produced it; there is no retry value), while
+    // `CreateSource::Module`'s frame cap stays in the caller's slot
+    // (existing contract — module caps came from bootstrap and the
+    // caller may have other uses for them).
+    let source_cap_to_clean: u32 = match source
     {
-        std::os::seraph::log!("simple-device spawn: missing module/service/hw cap");
-        let _ = syscall::cap_delete(hw_cap);
-        if devmgr_query_ep != 0
+        CreateSource::Module(_) => 0,
+        CreateSource::File { file_cap, .. } => file_cap,
+    };
+    let source_cap_present: bool = match source
+    {
+        CreateSource::Module(m) => m != 0,
+        CreateSource::File { file_cap, .. } => file_cap != 0,
+    };
+    let cleanup_on_fail = |hw: u32, query: u32, srccap: u32| {
+        let _ = syscall::cap_delete(hw);
+        if query != 0
         {
-            let _ = syscall::cap_delete(devmgr_query_ep);
+            let _ = syscall::cap_delete(query);
         }
+        if srccap != 0
+        {
+            let _ = syscall::cap_delete(srccap);
+        }
+    };
+
+    if !source_cap_present || service_ep == 0 || hw_cap == 0
+    {
+        std::os::seraph::log!("simple-device spawn: missing source/service/hw cap");
+        cleanup_on_fail(hw_cap, devmgr_query_ep, source_cap_to_clean);
         return false;
     }
 
@@ -257,33 +310,41 @@ pub fn spawn_simple_device(
     else
     {
         std::os::seraph::log!("simple-device spawn: tokened creator derivation failed");
-        let _ = syscall::cap_delete(hw_cap);
-        if devmgr_query_ep != 0
-        {
-            let _ = syscall::cap_delete(devmgr_query_ep);
-        }
+        cleanup_on_fail(hw_cap, devmgr_query_ep, source_cap_to_clean);
         return false;
     };
 
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(module_cap)
-        .cap(tokened_creator)
-        .build();
+    let create_msg = match source
+    {
+        CreateSource::Module(module_cap) => IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+            .cap(module_cap)
+            .cap(tokened_creator)
+            .build(),
+        CreateSource::File { file_cap, size } =>
+        {
+            IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+                .word(0, size)
+                .cap(file_cap)
+                .cap(tokened_creator)
+                .build()
+        }
+    };
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        std::os::seraph::log!("simple-device CREATE_PROCESS ipc_call failed");
-        let _ = syscall::cap_delete(hw_cap);
-        if devmgr_query_ep != 0
-        {
-            let _ = syscall::cap_delete(devmgr_query_ep);
-        }
+        std::os::seraph::log!("simple-device CREATE_* ipc_call failed");
+        cleanup_on_fail(hw_cap, devmgr_query_ep, source_cap_to_clean);
         return false;
     };
     if reply.label != 0
     {
-        std::os::seraph::log!("simple-device CREATE_PROCESS failed");
+        std::os::seraph::log!("simple-device CREATE_* failed");
+        // ipc_call completed: kernel either transferred the source cap
+        // to procmgr (procmgr then deletes per its CREATE_FROM_FILE
+        // contract) or the transfer failed and the cap is back in our
+        // slot. Be conservative and skip our source cleanup; let
+        // any residual leak be handled by the broader procmgr error.
         let _ = syscall::cap_delete(hw_cap);
         if devmgr_query_ep != 0
         {

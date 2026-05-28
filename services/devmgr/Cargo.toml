@@ -12,6 +12,8 @@ test = false
 [dependencies]
 boot-protocol = { path = "../../abi/boot-protocol" }
 ipc = { path = "../../shared/ipc" }
+namespace-protocol = { path = "../../shared/namespace-protocol" }
+ns-client = { path = "../../shared/ns-client" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }
 virtio-core = { path = "../drivers/virtio/core" }

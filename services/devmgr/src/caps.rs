@@ -96,12 +96,18 @@ pub mod kind
 /// Per-cap class tag carried alongside each `kind::MODULE` round cap, so
 /// devmgr resolves a driver module by class rather than by delivery
 /// position. Mirrors `init/src/service.rs::module_kind`.
+///
+/// Only bootstrap-essential drivers ship as bundle modules — those
+/// needed to read anything off the disk in the first place (virtio-blk,
+/// fatfs) plus the pre-vfsd console pair (serial, framebuffer). The
+/// per-arch RTC driver lives on the rootfs disk and is loaded lazily by
+/// devmgr through its `SET_DRIVERS_DIR` subtree cap; no `RTC` module is
+/// delivered.
 pub mod module_kind
 {
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
     pub const FRAMEBUFFER: u64 = 3;
-    pub const RTC: u64 = 4;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Mirrors

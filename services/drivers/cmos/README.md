@@ -3,9 +3,13 @@
 x86-64 CMOS / MC146818-compatible RTC driver. Serves
 [`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).
 
-Spawned by devmgr on x86-64 platforms via the non-PCI simple-device
-path. devmgr owns the driver's service endpoint and mints client SEND
-caps on `devmgr_labels::QUERY_RTC_DEVICE`, each tokened with
+Installed to `/services/drivers/cmos-rtc` on the rootfs. Spawned by
+devmgr on x86-64 platforms via the non-PCI simple-device path,
+`procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
+walks to from the `/services/drivers/` subtree cap init delivers
+post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`. devmgr owns the
+driver's service endpoint and mints client SEND caps on
+`devmgr_labels::QUERY_RTC_DEVICE`, each tokened with
 `rtc_labels::READ_AUTHORITY`. The `timed` service resolves the SEND
 once at startup to seed its wall-clock offset.
 

@@ -1,0 +1,22 @@
+[package]
+name = "ns-client"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std: namespace-walk helpers for any service holding a tokened SEND on
+# a vfsd namespace endpoint. Resolve paths to per-file caps for
+# `procmgr_labels::CREATE_FROM_FILE`, or to attenuated subtree / cwd caps
+# for `procmgr_labels::CONFIGURE_NAMESPACE`. Originally lived in
+# `services/init/src/walk.rs`; consolidated here so devmgr (and any future
+# service that walks vfsd from a root cap) can share the implementation.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ipc = { path = "../ipc" }
+syscall = { path = "../syscall" }
+
+[lints]
+workspace = true

@@ -52,6 +52,23 @@ responsibilities are:
   programming obtain them from memmgr's `REQUEST_FRAMES` reply alongside
   the Frame caps; DMA isolation, when established, is programmed by devmgr
   through IOMMU hardware it acquires via the `MmioRegion` cap flow.
+
+  Driver binaries are sourced from one of two places:
+
+  - **Boot bundle** — bootstrap-essentials (virtio-blk, serial,
+    framebuffer) arrive as `procmgr_labels::CREATE_PROCESS`-ready Frame
+    caps in devmgr's MODULE bootstrap round. devmgr spawns these
+    during initial enumeration, before the registry loop opens.
+  - **On-disk rootfs** — non-essential drivers (today: the per-arch
+    RTC) live at `/services/drivers/<chip>` and are loaded via
+    `procmgr_labels::CREATE_FROM_FILE`. Init delivers a
+    `LOOKUP | READ`-attenuated `/services/drivers/` subtree cap via
+    `devmgr_labels::SET_DRIVERS_DIR` post-vfsd-mount; devmgr replies
+    SUCCESS immediately (so init never blocks on driver work), then
+    walks the per-arch driver name and spawns the driver between
+    `ipc_reply` and the next `ipc_recv`. At-most-once per boot; failure
+    is sticky and surfaced as `devmgr_errors::NO_DEVICE` on subsequent
+    queries.
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
   the block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver

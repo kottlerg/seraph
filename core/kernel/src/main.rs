@@ -603,7 +603,31 @@ unsafe fn kernel_entry_post_rebase(
         let info_page_virt = {
             use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
             use cap::slot::{CapTag, Rights};
-            use init_protocol::{INIT_INFO_VADDR, INIT_PROTOCOL_VERSION, InitInfo};
+            use init_protocol::{
+                INIT_INFO_VADDR, INIT_PROTOCOL_VERSION, InitFramebufferInfo, InitInfo,
+                InitPixelFormat,
+            };
+
+            // Re-read `BootInfo.framebuffer` via the direct physical map so
+            // init can forward the geometry to devmgr. The bootloader's
+            // captured GOP framebuffer identity dies at `ExitBootServices`;
+            // this is the only path from there to userspace.
+            // SAFETY: direct map covers all RAM since Phase 3; boot_info_phys
+            // validated in Phase 0; same pattern as `info_dm` above.
+            let boot_info_for_fb =
+                unsafe { &*(mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo) };
+            let fb_in = boot_info_for_fb.framebuffer;
+            let init_framebuffer = InitFramebufferInfo {
+                physical_base: fb_in.physical_base,
+                width: fb_in.width,
+                height: fb_in.height,
+                stride: fb_in.stride,
+                pixel_format: match fb_in.pixel_format
+                {
+                    boot_protocol::PixelFormat::Rgbx8 => InitPixelFormat::Rgbx8,
+                    boot_protocol::PixelFormat::Bgrx8 => InitPixelFormat::Bgrx8,
+                },
+            };
 
             let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
             // SAFETY: single-threaded boot; cspace_layout produced by Phase 7.
@@ -711,6 +735,7 @@ unsafe fn kernel_entry_post_rebase(
                 init_info_frame_count: 0,  // patched after self-mint below
                 module_name_count: cspace_layout.module_name_count,
                 module_names: cspace_layout.module_names,
+                framebuffer: init_framebuffer,
             };
 
             // Write InitInfo header (always fits in first page).

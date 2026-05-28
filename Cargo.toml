@@ -17,6 +17,7 @@ members = [
     "services/timed",
     "services/vfsd",
     "services/drivers/cmos",
+    "services/drivers/framebuffer",
     "services/drivers/goldfish-rtc",
     "services/drivers/serial",
     "services/drivers/virtio/core",

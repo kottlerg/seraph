@@ -321,7 +321,57 @@ impl FramebufferInfo
             pixel_format: PixelFormat::Rgbx8,
         }
     }
+
+    /// Size of the serialised form in bytes.
+    pub const SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Serialise into `buf`. Returns `None` if the buffer is shorter than
+    /// [`Self::SIZE`].
+    #[must_use]
+    pub fn to_bytes(&self, buf: &mut [u8]) -> Option<()>
+    {
+        if buf.len() < Self::SIZE
+        {
+            return None;
+        }
+        // SAFETY: buf has sufficient length; Self is repr(C) POD.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                core::ptr::from_ref(self).cast::<u8>(),
+                buf.as_mut_ptr(),
+                Self::SIZE,
+            );
+        }
+        Some(())
+    }
+
+    /// Deserialise from a byte slice. Returns `None` if `bytes` is shorter
+    /// than [`Self::SIZE`] or carries a `pixel_format` discriminant outside
+    /// the known set.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self>
+    {
+        if bytes.len() < Self::SIZE
+        {
+            return None;
+        }
+        // SAFETY: bytes has sufficient length. read_unaligned tolerates any
+        // alignment. PixelFormat is `repr(u32)` with two valid discriminants
+        // (0, 1); validate explicitly before trusting it.
+        let raw = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) };
+        let pf = raw.pixel_format as u32;
+        if pf > 1
+        {
+            return None;
+        }
+        Some(raw)
+    }
 }
+
+/// Schema version of the [`FramebufferInfo`] payload exchanged via
+/// devmgr's `QUERY_DEVICE_INFO`. Bump whenever the struct layout
+/// changes; callers verify this value before deserialising.
+pub const FRAMEBUFFER_INFO_VERSION: u32 = 1;
 
 // ── Kernel MMIO (arch-specific) ──────────────────────────────────────────────
 //

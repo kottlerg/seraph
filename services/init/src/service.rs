@@ -339,6 +339,7 @@ mod kind
     pub const APERTURE: u64 = 2;
     pub const ACPI_REGION: u64 = 3;
     pub const SVCMGR_BUNDLE: u64 = 4;
+    pub const FRAMEBUFFER_INFO: u64 = 5;
 }
 
 /// Per-cap class tag carried in a `kind::MODULE` round's data words so
@@ -348,6 +349,7 @@ mod module_kind
 {
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
+    pub const FRAMEBUFFER: u64 = 3;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Tells devmgr which optional
@@ -590,6 +592,7 @@ pub fn create_devmgr_with_caps(
     // Each delivered cap is tagged with its `module_kind` in the data
     // words so devmgr binds a module by class, not by delivery position.
     let serial_module = crate::find_module_by_name(info, b"serial");
+    let framebuffer_module = crate::find_module_by_name(info, b"framebuffer");
     {
         let mut module_caps = [0u32; 4];
         let mut module_data = [0u64; 2 + 4];
@@ -599,6 +602,7 @@ pub fn create_devmgr_with_caps(
         for (source, tag) in [
             (virtio_blk_module, module_kind::VIRTIO_BLK),
             (serial_module, module_kind::SERIAL),
+            (framebuffer_module, module_kind::FRAMEBUFFER),
         ]
         {
             let Some(module_cap) = source
@@ -632,6 +636,33 @@ pub fn create_devmgr_with_caps(
             {
                 return None;
             }
+        }
+    }
+
+    // ── Framebuffer-info round ──────────────────────────────────────────
+    //
+    // Always emitted; `physical_base == 0` tells devmgr to skip the
+    // framebuffer driver spawn (headless boot, e.g. QEMU with
+    // `-display none`). The geometry's authoritative source is GOP,
+    // which dies at `ExitBootServices`; the bootloader captured it into
+    // `BootInfo.framebuffer` and the kernel forwarded it through
+    // `InitInfo.framebuffer`.
+    {
+        let fb = info.framebuffer;
+        let wh = u64::from(fb.width) | (u64::from(fb.height) << 32);
+        let pf_disc = fb.pixel_format as u32;
+        let sf = u64::from(fb.stride) | (u64::from(pf_disc) << 32);
+        if !serve(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            false,
+            &[],
+            &[kind::FRAMEBUFFER_INFO, fb.physical_base, wh, sf],
+            "devmgr: bootstrap framebuffer-info round failed",
+        )
+        {
+            return None;
         }
     }
 
@@ -717,6 +748,68 @@ pub fn create_devmgr_with_caps(
         "devmgr: bootstrap SVCMGR_BUNDLE round failed",
     );
     Some(thread_cap)
+}
+
+// ── Framebuffer driver smoke print ──────────────────────────────────────────
+
+/// One-shot acceptance witness for the userspace framebuffer driver
+/// (issue #67). After devmgr is up, init derives a
+/// `REGISTRY_QUERY_AUTHORITY`-tokened SEND on `devmgr_registry_ep`,
+/// asks devmgr for the framebuffer driver's service cap via
+/// `QUERY_FRAMEBUFFER_DEVICE`, and issues one `FB_WRITE_BYTES` carrying
+/// a marker string. Best-effort: a missing framebuffer (headless boot)
+/// or a driver bring-up failure silently drops the print.
+///
+/// Throwaway: removable once a real terminal/shell consumer lands in
+/// a follow-up issue and routes through the framebuffer for its own
+/// reasons.
+pub fn smoke_print_framebuffer(devmgr_registry_ep: u32, ipc_buf: *mut u64)
+{
+    if devmgr_registry_ep == 0
+    {
+        return;
+    }
+
+    // Tokened SEND on devmgr's registry endpoint — the same shape
+    // logd/vfsd receive in their bootstraps.
+    let Ok(query_cap) = syscall::cap_derive_token(
+        devmgr_registry_ep,
+        syscall::RIGHTS_SEND,
+        ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+    )
+    else
+    {
+        return;
+    };
+
+    let query = IpcMessage::builder(ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(query_cap, &query, ipc_buf) };
+    let _ = syscall::cap_delete(query_cap);
+    let Ok(reply) = reply
+    else
+    {
+        return;
+    };
+    if reply.label != ipc::devmgr_errors::SUCCESS
+    {
+        return;
+    }
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
+    {
+        return;
+    }
+    let fb_write_cap = reply_caps[0];
+
+    let marker: &[u8] = b"seraph: userspace framebuffer driver up\n";
+    let label = ipc::fb_labels::FB_WRITE_BYTES | ((marker.len() as u64) << 16);
+    let write_msg = IpcMessage::builder(label).bytes(0, marker).build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(fb_write_cap, &write_msg, ipc_buf) };
+    let _ = syscall::cap_delete(fb_write_cap);
 }
 
 // ── pwrmgr creation ─────────────────────────────────────────────────────────

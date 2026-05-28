@@ -75,11 +75,7 @@ fn main() -> !
     );
 
     // Find the aperture covering ECAM and carve a narrow ECAM MmioRegion cap.
-    let Some(ecam_cap) = carve_subrange(
-        &mut caps.apertures[..caps.aperture_count],
-        ecam_loc.phys_base,
-        ecam_loc.size,
-    )
+    let Some(ecam_cap) = carve_subrange(&mut caps, ecam_loc.phys_base, ecam_loc.size)
     else
     {
         std::os::seraph::log!("no aperture covers the ECAM range, halting");
@@ -123,7 +119,12 @@ fn main() -> !
     // IRQ allocator state: consume the root range cap ascending.
     let mut irq_root = IrqRootAllocator::new(caps.irq_range_cap);
 
-    let mut device_info = [virtio_core::VirtioPciStartupInfo::default(); pci::MAX_DEVICES];
+    // Generic device-info catalog: each entry carries a kind discriminant +
+    // version + opaque payload bytes. virtio populates entries with kind
+    // VIRTIO_PCI; framebuffer (spawned later) uses kind FRAMEBUFFER.
+    // PCI bus devices share the catalog with non-PCI devices like the
+    // framebuffer, so size for both.
+    let mut device_info = [DeviceInfoEntry::empty(); pci::MAX_DEVICES + 4];
     let mut device_info_count: usize = 0;
 
     let mut catalog = DeviceCatalog {
@@ -146,6 +147,16 @@ fn main() -> !
     if serial_spawned
     {
         std::os::seraph::log!("devmgr: serial driver spawned");
+    }
+
+    // Spawn the framebuffer driver via the non-PCI simple-device path
+    // with a round-2 devmgr-query endpoint so the driver can fetch its
+    // FramebufferInfo via QUERY_DEVICE_INFO. devmgr owns `fb_ep` and
+    // mints client SEND caps on QUERY_FRAMEBUFFER_DEVICE.
+    let (fb_spawned, fb_ep) = spawn_framebuffer(&mut caps, &mut catalog, ipc_buf);
+    if fb_spawned
+    {
+        std::os::seraph::log!("devmgr: framebuffer driver spawned");
     }
 
     if caps.registry_ep == 0
@@ -273,14 +284,76 @@ fn main() -> !
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 }
             }
+            ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE =>
+            {
+                // Like QUERY_SERIAL_DEVICE: do not `seraph::log!` here.
+                // If logd ever fans framebuffer output here, a log call
+                // would deadlock (devmgr → log_ep → logd waiting on
+                // this reply).
+                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if fb_spawned && fb_ep != 0
+                {
+                    if let Ok(derived) = syscall::cap_derive_token(
+                        fb_ep,
+                        syscall::RIGHTS_SEND_GRANT,
+                        ipc::fb_labels::WRITE_AUTHORITY,
+                    )
+                    {
+                        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                            .cap(derived)
+                            .build();
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                    else
+                    {
+                        let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                }
+                else
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+            }
             ipc::devmgr_labels::QUERY_DEVICE_INFO =>
             {
                 let dev_idx = token.wrapping_sub(1) as usize;
                 if dev_idx < device_info_count
                 {
-                    let info_words = virtio_info_words(&device_info[dev_idx]);
+                    let entry = &device_info[dev_idx];
+                    // Reply schema: word[0] = kind, word[1] = version,
+                    // word[2] = byte_len, word[3..] = payload bytes
+                    // packed contiguously as u64. Devmgr does not
+                    // interpret the payload — driver-side deserialise.
+                    let byte_len = entry.byte_len as usize;
+                    let word_count = byte_len.div_ceil(8);
+                    let mut words = [0u64; 3 + MAX_DEVICE_INFO_PAYLOAD / 8];
+                    words[0] = u64::from(entry.kind);
+                    words[1] = u64::from(entry.version);
+                    words[2] = u64::from(entry.byte_len);
+                    for (i, chunk) in entry.payload[..byte_len].chunks(8).enumerate()
+                    {
+                        let mut buf = [0u8; 8];
+                        buf[..chunk.len()].copy_from_slice(chunk);
+                        words[3 + i] = u64::from_le_bytes(buf);
+                    }
                     let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-                        .words(0, &info_words)
+                        .words(0, &words[..3 + word_count])
                         .build();
                     // SAFETY: ipc_buf is the registered IPC buffer.
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -300,34 +373,6 @@ fn main() -> !
             }
         }
     }
-}
-
-/// Pack a [`virtio_core::VirtioPciStartupInfo`] into
-/// [`virtio_core::VirtioPciStartupInfo::IPC_WORD_COUNT`] data words, matching
-/// the layout that `write_to_ipc` writes directly into an IPC buffer.
-fn virtio_info_words(
-    info: &virtio_core::VirtioPciStartupInfo,
-) -> [u64; virtio_core::VirtioPciStartupInfo::IPC_WORD_COUNT]
-{
-    let mut out = [0u64; virtio_core::VirtioPciStartupInfo::IPC_WORD_COUNT];
-    let caps = [
-        &info.common_cfg,
-        &info.notify_cfg,
-        &info.isr_cfg,
-        &info.device_cfg,
-    ];
-    for (i, cap) in caps.iter().enumerate()
-    {
-        let lo = u64::from(cap.bar) | (u64::from(cap.offset) << 32);
-        out[i * 2] = lo;
-        if i < 3
-        {
-            out[i * 2 + 1] = u64::from(cap.length);
-        }
-    }
-    // Word 6: device_cfg.length | (notify_off_multiplier << 32).
-    out[6] = u64::from(info.device_cfg.length) | (u64::from(info.notify_off_multiplier) << 32);
-    out
 }
 
 // ── ECAM discovery ──────────────────────────────────────────────────────────
@@ -561,11 +606,23 @@ fn find_region_for(caps: &caps::DevmgrCaps, phys: u64) -> Option<(caps::AcpiRegi
 // ── Aperture splitting helper ───────────────────────────────────────────────
 
 /// Carve a narrow `MmioRegion` cap of `(phys, size)` out of whichever
-/// aperture in `apertures` covers it. Consumes and replaces the aperture
-/// entry with the remaining portion(s).
-fn carve_subrange(apertures: &mut [caps::Aperture], phys: u64, size: u64) -> Option<u32>
+/// aperture covers it. Consumes the entry and replaces it with up to
+/// two remainders: the **lower** portion `[ap_base, phys)` becomes a
+/// new aperture slot (if non-empty and a free slot exists), and the
+/// **upper** portion `[phys + size, ap_end)` updates the carved
+/// aperture in place via [`pci::split_bar_cap`].
+///
+/// The lower-portion preservation is the difference from raw
+/// [`pci::split_bar_cap`]: that helper drops the lower portion (its
+/// PCI-BAR caller doesn't need it — the gap is unused address space
+/// between BARs). For the framebuffer aperture we *do* care about
+/// preserving the surrounding range, since that range may host other
+/// useful MMIO (e.g. the framebuffer lives below the ECAM in the
+/// same parent aperture on x86-64 QEMU+OVMF).
+fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u32>
 {
-    for ap in apertures.iter_mut()
+    let mut found: Option<usize> = None;
+    for (i, ap) in caps.apertures[..caps.aperture_count].iter().enumerate()
     {
         if ap.size == 0
         {
@@ -573,10 +630,56 @@ fn carve_subrange(apertures: &mut [caps::Aperture], phys: u64, size: u64) -> Opt
         }
         if phys >= ap.base && phys + size <= ap.base + ap.size
         {
-            return pci::split_bar_cap(&mut ap.slot, &mut ap.base, &mut ap.size, phys, size);
+            found = Some(i);
+            break;
         }
     }
-    None
+    let i = found?;
+
+    let ap_base = caps.apertures[i].base;
+    let ap_size = caps.apertures[i].size;
+    let offset = phys - ap_base;
+
+    // Preserve the lower portion [ap_base, phys) as a new aperture slot
+    // when non-empty.
+    if offset > 0
+    {
+        let Ok((lower_cap, upper_cap)) = syscall::mmio_split(caps.apertures[i].slot, offset)
+        else
+        {
+            return None;
+        };
+        // This entry switches to the upper portion.
+        caps.apertures[i].slot = upper_cap;
+        caps.apertures[i].base = phys;
+        caps.apertures[i].size = ap_size - offset;
+        // Park the lower portion in a free aperture slot if one exists.
+        if caps.aperture_count < caps.apertures.len()
+        {
+            caps.apertures[caps.aperture_count] = caps::Aperture {
+                slot: lower_cap,
+                base: ap_base,
+                size: offset,
+            };
+            caps.aperture_count += 1;
+        }
+        else
+        {
+            let _ = syscall::cap_delete(lower_cap);
+        }
+    }
+
+    // The (possibly post-trim) entry now starts at `phys`. Carve the
+    // requested sub-range with `split_bar_cap`'s in-place upper-remainder
+    // path; with `offset_in_window == 0` it preserves any upper remainder
+    // back into the same slot.
+    pci::split_bar_cap(
+        &mut caps.apertures[i].slot,
+        &mut caps.apertures[i].base,
+        &mut caps.apertures[i].size,
+        phys,
+        size,
+    )
 }
 
 // ── Root Interrupt range allocator ──────────────────────────────────────────
@@ -621,11 +724,64 @@ impl IrqRootAllocator
     }
 }
 
+/// Maximum payload byte length stored per [`DeviceInfoEntry`]. Sized to
+/// fit the current driver-class payloads with headroom:
+/// `VirtioPciStartupInfo::SIZE = 56` and `FramebufferInfo::SIZE = 24`.
+pub const MAX_DEVICE_INFO_PAYLOAD: usize = 64;
+
+/// Opaque catalog entry: devmgr stores payload bytes against a kind
+/// discriminant and schema version, with no per-class interpretation.
+/// The driver class deserialises via its own `from_bytes` after
+/// verifying `kind` and `version`.
+#[derive(Clone, Copy)]
+pub struct DeviceInfoEntry
+{
+    pub kind: u32,
+    pub version: u32,
+    pub byte_len: u32,
+    pub payload: [u8; MAX_DEVICE_INFO_PAYLOAD],
+}
+
+impl DeviceInfoEntry
+{
+    #[must_use]
+    pub const fn empty() -> Self
+    {
+        Self {
+            kind: 0,
+            version: 0,
+            byte_len: 0,
+            payload: [0u8; MAX_DEVICE_INFO_PAYLOAD],
+        }
+    }
+
+    /// Insert a serialised payload of the given kind/version. Returns
+    /// `false` if the source bytes do not fit in [`MAX_DEVICE_INFO_PAYLOAD`].
+    pub fn fill(&mut self, kind: u32, version: u32, bytes: &[u8]) -> bool
+    {
+        if bytes.len() > MAX_DEVICE_INFO_PAYLOAD
+        {
+            return false;
+        }
+        self.kind = kind;
+        self.version = version;
+        self.byte_len = bytes.len() as u32;
+        self.payload[..bytes.len()].copy_from_slice(bytes);
+        for b in &mut self.payload[bytes.len()..]
+        {
+            *b = 0;
+        }
+        true
+    }
+}
+
 /// Growing registry of spawned-device startup-info entries, populated as
-/// drivers are spawned.
+/// drivers are spawned. Devmgr does not interpret payload bytes; the
+/// per-class shape lives in the driver crate (e.g.
+/// `virtio_core::VirtioPciStartupInfo::from_bytes`).
 pub struct DeviceCatalog<'a>
 {
-    pub entries: &'a mut [virtio_core::VirtioPciStartupInfo],
+    pub entries: &'a mut [DeviceInfoEntry],
     pub count: &'a mut usize,
 }
 
@@ -661,7 +817,25 @@ fn spawn_virtio_blk(
         let dev_idx = *catalog.count;
         if dev_idx < catalog.entries.len()
         {
-            catalog.entries[dev_idx] = pci_dev.virtio_info;
+            // Serialise the virtio startup info into the generic
+            // catalog entry. Devmgr stores the bytes opaquely; the
+            // driver's `from_bytes` (verified via kind/version)
+            // deserialises on the QUERY_DEVICE_INFO reply.
+            let mut buf = [0u8; virtio_core::VirtioPciStartupInfo::SIZE];
+            if pci_dev.virtio_info.to_bytes(&mut buf).is_none()
+            {
+                std::os::seraph::log!("virtio: to_bytes overflowed (catalog entry skipped)");
+                return false;
+            }
+            if !catalog.entries[dev_idx].fill(
+                ipc::device_info_kind::VIRTIO_PCI,
+                virtio_core::VIRTIO_PCI_INFO_VERSION,
+                &buf,
+            )
+            {
+                std::os::seraph::log!("virtio: catalog entry payload too large");
+                return false;
+            }
             *catalog.count += 1;
         }
         let device_token = (dev_idx as u64) + 1;
@@ -753,11 +927,7 @@ fn find_virtio_bar_cap(
             pci_dev.bar_size[b]
         );
 
-        if let Some(cap) = carve_subrange(
-            &mut caps.apertures[..caps.aperture_count],
-            pci_dev.bar_phys[b],
-            pci_dev.bar_size[b],
-        )
+        if let Some(cap) = carve_subrange(caps, pci_dev.bar_phys[b], pci_dev.bar_size[b])
         {
             bar_caps[0] = cap;
             bar_bases[0] = pci_dev.bar_phys[b];
@@ -818,9 +988,134 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
         module_cap,
         serial_ep,
         hw_cap,
+        0, // no devmgr_query_ep: serial driver needs no runtime platform metadata
         ipc_buf,
     );
     (spawned, serial_ep)
+}
+
+// ── Framebuffer driver spawn ────────────────────────────────────────────────
+
+/// Carve a narrow `MmioRegion` cap covering the linear framebuffer and
+/// spawn the framebuffer driver. Registers the geometry in `catalog`
+/// so the driver can fetch it via `QUERY_DEVICE_INFO` at runtime; mints
+/// a tokened devmgr-query endpoint for the driver's round-2 cap.
+/// Returns `(spawned, fb_ep)`; `fb_ep` is the devmgr-owned service
+/// endpoint used to mint client SEND caps on
+/// [`ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. devmgr does not
+/// retain framebuffer-MMIO authority after a successful spawn — the
+/// carved cap is moved to the driver.
+// too_many_lines: framebuffer spawn is one transaction — carve the MMIO
+// aperture cap, register the device-info catalog entry, mint a tokened
+// query endpoint, invoke spawn_simple_device. Each fallible step owns
+// slots that must be released cooperatively on partial failure;
+// extracting helpers requires threading the same parameters through.
+#[allow(clippy::too_many_lines)]
+fn spawn_framebuffer(
+    caps: &mut caps::DevmgrCaps,
+    catalog: &mut DeviceCatalog,
+    ipc_buf: *mut u64,
+) -> (bool, u32)
+{
+    let Some(fb) = caps.fb_info
+    else
+    {
+        // No framebuffer present (e.g. headless QEMU).
+        return (false, 0);
+    };
+
+    let module_cap = caps.module_cap_for_kind(caps::module_kind::FRAMEBUFFER);
+    if module_cap == 0
+    {
+        std::os::seraph::log!("framebuffer: no framebuffer driver module delivered");
+        return (false, 0);
+    }
+
+    // Page-aligned aperture range covering [physical_base, physical_base
+    // + stride*height) — same math the bootloader seeded into
+    // `mmio_apertures` so `carve_subrange` will find the covering window.
+    let base_aligned = fb.physical_base & !0xFFF;
+    let span = fb.physical_base + u64::from(fb.stride) * u64::from(fb.height);
+    let end_aligned = (span + 0xFFF) & !0xFFF;
+    let mmio_size = end_aligned - base_aligned;
+
+    let fb_ep = std::os::seraph::object_slab_acquire(88)
+        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
+        .unwrap_or(0);
+    if fb_ep == 0
+    {
+        std::os::seraph::log!("framebuffer: failed to create service endpoint");
+        return (false, 0);
+    }
+
+    let Some(hw_cap) = carve_subrange(caps, base_aligned, mmio_size)
+    else
+    {
+        std::os::seraph::log!("framebuffer: failed to carve MMIO cap");
+        return (false, fb_ep);
+    };
+
+    // Register a catalog entry so the driver can fetch its geometry via
+    // QUERY_DEVICE_INFO. Token == catalog-index + 1, mirroring virtio.
+    let dev_idx = *catalog.count;
+    if dev_idx >= catalog.entries.len()
+    {
+        std::os::seraph::log!("framebuffer: catalog full");
+        let _ = syscall::cap_delete(hw_cap);
+        return (false, fb_ep);
+    }
+    let fb_info_serial = boot_protocol::FramebufferInfo {
+        physical_base: fb.physical_base,
+        width: fb.width,
+        height: fb.height,
+        stride: fb.stride,
+        pixel_format: match fb.pixel_format
+        {
+            0 => boot_protocol::PixelFormat::Rgbx8,
+            _ => boot_protocol::PixelFormat::Bgrx8,
+        },
+    };
+    let mut buf = [0u8; boot_protocol::FramebufferInfo::SIZE];
+    if fb_info_serial.to_bytes(&mut buf).is_none()
+    {
+        std::os::seraph::log!("framebuffer: to_bytes overflow");
+        let _ = syscall::cap_delete(hw_cap);
+        return (false, fb_ep);
+    }
+    if !catalog.entries[dev_idx].fill(
+        ipc::device_info_kind::FRAMEBUFFER,
+        boot_protocol::FRAMEBUFFER_INFO_VERSION,
+        &buf,
+    )
+    {
+        std::os::seraph::log!("framebuffer: catalog entry too large");
+        let _ = syscall::cap_delete(hw_cap);
+        return (false, fb_ep);
+    }
+    *catalog.count += 1;
+    let device_token = (dev_idx as u64) + 1;
+
+    // Tokened devmgr-query endpoint so the driver can call
+    // QUERY_DEVICE_INFO and retrieve its FramebufferInfo.
+    let Ok(devmgr_query_ep) =
+        syscall::cap_derive_token(caps.registry_ep, syscall::RIGHTS_SEND, device_token)
+    else
+    {
+        std::os::seraph::log!("framebuffer: failed to derive tokened query ep");
+        let _ = syscall::cap_delete(hw_cap);
+        return (false, fb_ep);
+    };
+
+    let spawned = spawn::spawn_simple_device(
+        caps.procmgr_ep,
+        caps.self_bootstrap_ep,
+        module_cap,
+        fb_ep,
+        hw_cap,
+        devmgr_query_ep,
+        ipc_buf,
+    );
+    (spawned, fb_ep)
 }
 
 /// Carve the COM1 `IoPortRange` (`0x3F8`..=`0x3FF`) out of the root
@@ -843,11 +1138,7 @@ fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 #[cfg(target_arch = "riscv64")]
 fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 {
-    carve_subrange(
-        &mut caps.apertures[..caps.aperture_count],
-        0x1000_0000,
-        0x1000,
-    )
+    carve_subrange(caps, 0x1000_0000, 0x1000)
 }
 
 /// Carve a narrow `IoPortRange` of `count` ports starting at `base` out of

@@ -1,26 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/framebuffer.rs
+// drivers/framebuffer/src/render.rs
 
 //! Framebuffer text renderer.
 //!
-//! Renders glyphs from the embedded 9×20 bitmap font into a linear
-//! RGBX/BGRX framebuffer. Tracks cursor position, handles line wrap,
-//! and scrolls when the last row is filled.
-//!
-//! Userspace gains its own framebuffer driver at
-//! `services/drivers/framebuffer/`; this kernel renderer remains the
-//! early-boot / panic console fallback (see `docs/console-model.md`).
+//! Ported from `core/kernel/src/framebuffer.rs` (kept there as the
+//! early-boot / panic console fallback). Renders glyphs from the
+//! embedded 9×20 bitmap font into a linear RGBX/BGRX framebuffer.
+//! Tracks cursor position, handles line wrap, and scrolls when the
+//! last row is filled. The kernel renderer's `rebase` helper is
+//! omitted — the userspace driver maps once at bootstrap and never
+//! re-maps in flight.
 
 use boot_protocol::{FramebufferInfo, PixelFormat};
 use font::{FONT_9X20, GLYPH_HEIGHT, GLYPH_WIDTH};
 
 /// Framebuffer text renderer.
-///
-/// Constructed from a `FramebufferInfo` supplied by the bootloader. Clears the
-/// screen to black on construction. Tracks a character-cell cursor and renders
-/// glyphs from the embedded bitmap font.
 pub struct FramebufferWriter
 {
     base: *mut u8,
@@ -35,15 +31,15 @@ pub struct FramebufferWriter
 
 impl FramebufferWriter
 {
-    /// Construct a `FramebufferWriter` from a `FramebufferInfo`.
-    ///
-    /// Returns `None` if `fb.physical_base == 0` (no framebuffer available).
-    /// Clears the screen to black on success.
+    /// Construct a `FramebufferWriter` over the mapped framebuffer at
+    /// `base`. Returns `None` if `fb.physical_base == 0` (no framebuffer
+    /// present); the userspace driver is not spawned in that case so
+    /// this branch is defensive. Clears the screen to black on success.
     ///
     /// # Safety
-    /// `fb.physical_base` must be a valid, writable framebuffer region of at
-    /// least `fb.stride * fb.height` bytes, identity-mapped and accessible.
-    pub unsafe fn new(fb: &FramebufferInfo) -> Option<Self>
+    /// `base` must be a writable mapping of at least `fb.stride *
+    /// fb.height` bytes covering the framebuffer described by `fb`.
+    pub unsafe fn new(base: *mut u8, fb: &FramebufferInfo) -> Option<Self>
     {
         if fb.physical_base == 0
         {
@@ -54,7 +50,7 @@ impl FramebufferWriter
         let max_rows = fb.height / GLYPH_HEIGHT;
 
         let mut writer = FramebufferWriter {
-            base: fb.physical_base as *mut u8,
+            base,
             height: fb.height,
             stride: fb.stride,
             format: fb.pixel_format,
@@ -64,25 +60,11 @@ impl FramebufferWriter
             row: 0,
         };
 
-        // SAFETY: framebuffer pointer validated non-zero; region writable per caller contract.
+        // SAFETY: base mapping validated by caller; region writable per contract.
         unsafe {
             writer.clear();
         }
         Some(writer)
-    }
-
-    /// Update the framebuffer base pointer to a new virtual address.
-    ///
-    /// Called after the kernel's page tables are activated to repoint the
-    /// framebuffer from its bootloader identity-mapped address to the
-    /// corresponding virtual address in the direct physical map.
-    ///
-    /// # Safety
-    /// `new_base` must be a valid, writable virtual address for the same
-    /// physical framebuffer memory, accessible under the current page tables.
-    pub unsafe fn rebase(&mut self, new_base: *mut u8)
-    {
-        self.base = new_base;
     }
 
     /// Write one byte to the framebuffer, advancing the cursor.

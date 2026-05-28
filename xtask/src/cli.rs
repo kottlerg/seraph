@@ -101,6 +101,7 @@ pub enum BuildComponent
     Vfsd,
     VirtioBlk,
     Serial,
+    Framebuffer,
     CmosRtc,
     GoldfishRtc,
     Fatfs,

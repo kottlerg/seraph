@@ -11,6 +11,13 @@ capabilities delegated by devmgr.
 drivers/
 ├── README.md
 ├── cmos/                           # x86-64 CMOS / MC146818 RTC driver (binary)
+├── framebuffer/                    # Linear-framebuffer text driver (binary)
+│   ├── Cargo.toml
+│   ├── README.md                   # Framebuffer IPC interface (FB_WRITE_BYTES)
+│   └── src/
+│       ├── main.rs
+│       ├── render.rs               # 9×20 bitmap glyph blit + cursor + scroll
+│       └── arch/                   # Per-arch MMIO mapping (x86_64 / riscv64)
 ├── goldfish-rtc/                   # RISC-V Goldfish RTC driver (binary)
 ├── serial/                         # Serial (UART) device driver (binary)
 │   ├── Cargo.toml
@@ -69,6 +76,7 @@ holds ambient hardware authority. The full driver lifecycle is specified in
 | `virtio/core/` | Library | Shared VirtIO transport primitives: device initialisation, virtqueue setup, descriptor chain management |
 | [`virtio/blk/`](virtio/blk/README.md) | Binary | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
 | [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
+| [`framebuffer/`](framebuffer/README.md) | Binary | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
 | `cmos/` | Binary | x86-64 CMOS / MC146818 RTC driver — answers the one-label RTC contract |
 | `goldfish-rtc/` | Binary | RISC-V Goldfish RTC driver — answers the one-label RTC contract |
 

@@ -201,8 +201,21 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
 
 /// Spawn a non-PCI platform device driver with a minimal capability set: a
 /// RECV-rights copy of `service_ep` plus the device's arch authority cap
-/// (`hw_cap`). Unlike [`spawn_driver`] there is no BAR or IRQ, and the
-/// bootstrap is a single terminal round `[service, hw_cap]`.
+/// (`hw_cap`). Unlike [`spawn_driver`] there is no BAR or IRQ.
+///
+/// `devmgr_query_ep` is an optional tokened SEND on devmgr's
+/// registry-query endpoint, delivered as a round-2 cap so the driver can
+/// fetch runtime metadata via `QUERY_DEVICE_INFO`. Pass `0` to omit
+/// (single terminal round `[service, hw_cap]`, behaviour identical to
+/// the pre-extension shape used by drivers that need no runtime
+/// platform metadata). When non-zero a two-round protocol is served:
+///   Round 1 (non-terminal): `[service, hw_cap]`
+///   Round 2 (terminal):     `[devmgr_query_ep]`
+///
+/// The `devmgr_query_ep` is a generic mechanism — any future simple
+/// device needing runtime platform metadata uses it. The driver-class
+/// payload shape lives in the driver's crate; devmgr stores opaque
+/// bytes in its `DeviceCatalog`.
 ///
 /// devmgr retains `service_ep` to mint client SEND caps on query; the
 /// `hw_cap` is *moved* into the child (delivered directly, not copied), so
@@ -210,12 +223,20 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
 /// caller transfers ownership of `hw_cap` to this function — it is moved to
 /// the child on success and deleted on failure. Returns `false` on any
 /// spawn-path failure.
+// too_many_lines: simple-device spawn is one transaction — derive the
+// per-child caps, install them into the suspended child, and serve one or
+// two bootstrap rounds against the shared `ipc` buffer. Each fallible step
+// owns slots that must be released cooperatively on partial failure;
+// extracting helpers requires threading the same parameters through. The
+// linear presentation matches the bootstrap protocol one-to-one.
+#[allow(clippy::too_many_lines)]
 pub fn spawn_simple_device(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     module_cap: u32,
     service_ep: u32,
     hw_cap: u32,
+    devmgr_query_ep: u32,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -223,6 +244,10 @@ pub fn spawn_simple_device(
     {
         std::os::seraph::log!("simple-device spawn: missing module/service/hw cap");
         let _ = syscall::cap_delete(hw_cap);
+        if devmgr_query_ep != 0
+        {
+            let _ = syscall::cap_delete(devmgr_query_ep);
+        }
         return false;
     }
 
@@ -233,6 +258,10 @@ pub fn spawn_simple_device(
     {
         std::os::seraph::log!("simple-device spawn: tokened creator derivation failed");
         let _ = syscall::cap_delete(hw_cap);
+        if devmgr_query_ep != 0
+        {
+            let _ = syscall::cap_delete(devmgr_query_ep);
+        }
         return false;
     };
 
@@ -246,12 +275,20 @@ pub fn spawn_simple_device(
     {
         std::os::seraph::log!("simple-device CREATE_PROCESS ipc_call failed");
         let _ = syscall::cap_delete(hw_cap);
+        if devmgr_query_ep != 0
+        {
+            let _ = syscall::cap_delete(devmgr_query_ep);
+        }
         return false;
     };
     if reply.label != 0
     {
         std::os::seraph::log!("simple-device CREATE_PROCESS failed");
         let _ = syscall::cap_delete(hw_cap);
+        if devmgr_query_ep != 0
+        {
+            let _ = syscall::cap_delete(devmgr_query_ep);
+        }
         return false;
     }
     let reply_caps = reply.caps();
@@ -259,6 +296,10 @@ pub fn spawn_simple_device(
     {
         std::os::seraph::log!("simple-device CREATE_PROCESS reply missing caps");
         let _ = syscall::cap_delete(hw_cap);
+        if devmgr_query_ep != 0
+        {
+            let _ = syscall::cap_delete(devmgr_query_ep);
+        }
         return false;
     }
     let process_handle = reply_caps[0];
@@ -269,6 +310,10 @@ pub fn spawn_simple_device(
     else
     {
         let _ = syscall::cap_delete(hw_cap);
+        if devmgr_query_ep != 0
+        {
+            let _ = syscall::cap_delete(devmgr_query_ep);
+        }
         return false;
     };
 
@@ -284,30 +329,61 @@ pub fn spawn_simple_device(
         std::os::seraph::log!("simple-device START_PROCESS failed");
         let _ = syscall::cap_delete(service_copy);
         let _ = syscall::cap_delete(hw_cap);
+        if devmgr_query_ep != 0
+        {
+            let _ = syscall::cap_delete(devmgr_query_ep);
+        }
         return false;
     }
 
-    // Single terminal bootstrap round: [service, hw_cap]. serve_round MOVES
-    // the caps into the child on success.
+    // Bootstrap rounds. With no query endpoint, one terminal round
+    // [service, hw_cap]. With a query endpoint, two rounds: round 1
+    // non-terminal [service, hw_cap], round 2 terminal [query_ep].
+    let round1_done = devmgr_query_ep == 0;
     // SAFETY: ipc_buf is the registered IPC buffer.
     if unsafe {
         ipc::bootstrap::serve_round(
             bootstrap_ep,
             child_token,
             ipc_buf,
-            true,
+            round1_done,
             &[service_copy, hw_cap],
             &[],
         )
     }
     .is_err()
     {
-        std::os::seraph::log!("simple-device bootstrap round failed");
+        std::os::seraph::log!("simple-device bootstrap round 1 failed");
         // serve_round may or may not have consumed the caps; best-effort
         // delete is safe (deleting a transferred slot is a no-op).
         let _ = syscall::cap_delete(service_copy);
         let _ = syscall::cap_delete(hw_cap);
+        if devmgr_query_ep != 0
+        {
+            let _ = syscall::cap_delete(devmgr_query_ep);
+        }
         return false;
+    }
+
+    if devmgr_query_ep != 0
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        if unsafe {
+            ipc::bootstrap::serve_round(
+                bootstrap_ep,
+                child_token,
+                ipc_buf,
+                true,
+                &[devmgr_query_ep],
+                &[],
+            )
+        }
+        .is_err()
+        {
+            std::os::seraph::log!("simple-device bootstrap round 2 failed");
+            let _ = syscall::cap_delete(devmgr_query_ep);
+            return false;
+        }
     }
 
     std::os::seraph::log!("simple-device driver started");

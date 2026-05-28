@@ -135,7 +135,13 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 /// fast on epoch mismatch, so recycling cannot mis-target a recycled
 /// tenant. The pre-unregister derivation drain (`dealloc_object` for
 /// `CSpaceObj`) additionally scrubs the back-links in steady state.
-const MAX_CSPACES: usize = 65536;
+///
+/// Live-count peaks in ktest stress today sit in the low hundreds; 4096
+/// gives 10–40× headroom while reclaiming the ~480 KiB of BSS the
+/// pre-#137 65536-entry registry burned. A future workload that genuinely
+/// needs more live `CSpace`s only has to bump this constant — no layout,
+/// ABI, or algorithmic change is required.
+const MAX_CSPACES: usize = 4096;
 
 /// High-water mark for the bump-allocator side of `alloc_cspace_id` — only
 /// consulted when the free list is empty. Once `HIGH_WATER_CSPACE_ID` reaches

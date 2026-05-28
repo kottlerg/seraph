@@ -618,9 +618,9 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     DERIVATION_LOCK.write_lock();
 
-    let orig_node = SlotId::new(cspace_id, mmio_idx_nz);
-    let child1_id = SlotId::new(cspace_id, slot1_nz);
-    let child2_id = SlotId::new(cspace_id, slot2_nz);
+    let orig_node = SlotId::current(cspace_id, mmio_idx_nz);
+    let child1_id = SlotId::current(cspace_id, slot1_nz);
+    let child2_id = SlotId::current(cspace_id, slot2_nz);
 
     // Read the original's parent before we modify anything.
     // SAFETY: caller_cspace validated; mmio_idx within CSpace bounds.
@@ -822,9 +822,9 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     DERIVATION_LOCK.write_lock();
 
-    let orig_node = SlotId::new(cspace_id, irq_idx_nz);
-    let child1_id = SlotId::new(cspace_id, slot1_nz);
-    let child2_id = SlotId::new(cspace_id, slot2_nz);
+    let orig_node = SlotId::current(cspace_id, irq_idx_nz);
+    let child1_id = SlotId::current(cspace_id, slot1_nz);
+    let child2_id = SlotId::current(cspace_id, slot2_nz);
 
     // SAFETY: caller_cspace validated; irq_idx within CSpace bounds.
     let orig_parent = unsafe { (*caller_cspace).slot(irq_idx).and_then(|s| s.deriv_parent) };
@@ -1062,9 +1062,9 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         DERIVATION_LOCK.write_lock();
 
-        let orig_node = SlotId::new(cspace_id, port_idx_nz);
-        let child1_id = SlotId::new(cspace_id, slot1_nz);
-        let child2_id = SlotId::new(cspace_id, slot2_nz);
+        let orig_node = SlotId::current(cspace_id, port_idx_nz);
+        let child1_id = SlotId::current(cspace_id, slot1_nz);
+        let child2_id = SlotId::current(cspace_id, slot2_nz);
 
         // SAFETY: caller_cspace validated; port_idx within CSpace bounds.
         let orig_parent = unsafe { (*caller_cspace).slot(port_idx).and_then(|s| s.deriv_parent) };

@@ -96,6 +96,21 @@ impl SlotId
             index,
         }
     }
+
+    /// Construct a `SlotId` by snapshotting the registry's current epoch
+    /// for `cspace_id`.
+    ///
+    /// The natural form for derivation-tree write sites: the link is being
+    /// stamped now, so the current registry epoch is the correct value.
+    /// Callers must hold a proof that the cspace is currently live (e.g.
+    /// they just resolved a slot in it, or it is the caller's own cspace).
+    /// If the registry has already retired this id, `registry_epoch`
+    /// returns the bumped value and the `SlotId` stamps with that — but
+    /// the caller's proof-of-life should make that case impossible.
+    pub fn current(cspace_id: CSpaceId, index: NonZeroU32) -> Self
+    {
+        Self::with_epoch(cspace_id, crate::cap::registry_epoch(cspace_id), index)
+    }
 }
 
 // ── Capability tag ────────────────────────────────────────────────────────────

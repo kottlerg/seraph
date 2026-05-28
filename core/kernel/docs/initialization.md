@@ -123,7 +123,10 @@ heap exists yet.
    as reclaimable Frame caps into init's CSpace during Phase 7 by
    `cap::mint_reclaim_frame_caps`, alongside the other bootloader
    scratch pages (`BootInfo` page, descriptor arrays, MMIO aperture
-   array, reclaim-array page).
+   array, reclaim-array page) and the bundle's non-module pages
+   (header + entry table + 4 KiB pad, init ELF source body, and any
+   inter-module or trailing slack — module bodies are excluded because
+   `mint_module_frame_caps` already covers them).
 8. Emit: "page tables established, physmap at 0xFFFF800000000000"
 ```
 

@@ -385,7 +385,7 @@ layout via a well-known structure at the top of init's stack.
 | K+1..L | Read-only Frame capabilities (one per PlatformTable entry) |
 | L+1..P | IoPortRange capabilities (one per IoPortRange entry; x86-64 only) |
 | P+1..Q | Frame capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
-| Q+1..R | Reclaimable Frame capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) — one cap per `BootInfo.reclaim_ranges` entry |
+| Q+1..R | Reclaimable Frame capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Frame caps above) — one cap per `BootInfo.reclaim_ranges` entry |
 
 The exact slot numbers are passed to init in the `KernelHandoff` structure placed
 on init's user stack before it begins execution.

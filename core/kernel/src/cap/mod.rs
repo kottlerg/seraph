@@ -1901,8 +1901,11 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
 ///
 /// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
 /// descriptor array, memory-map entry array, MMIO aperture array, the
-/// reclaim-array page itself, and the bootloader's transient page-table
-/// frames — and mints one reclaimable `FrameObject`
+/// reclaim-array page itself, the bootloader's transient page-table
+/// frames, and the bundle's non-module pages (header + entry table +
+/// pad, init ELF source body, inter-module and trailing slack —
+/// module bodies are excluded because [`mint_module_frame_caps`]
+/// covers them) — and mints one reclaimable `FrameObject`
 /// cap per range with `owns_memory = true` and the full byte ledger.
 /// Each cap is inserted into the root `CSpace` and a matching
 /// `CapDescriptor` entry pushed into `layout.descriptors`, so the cap

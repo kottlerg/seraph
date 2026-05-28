@@ -312,6 +312,24 @@ impl CSpace
         Some(&mut page.slots[slot_idx])
     }
 
+    /// Return the raw page pointer for a directory entry, or `None` if the
+    /// entry is unmapped or `page_idx` is out of range.
+    ///
+    /// Used by the pre-unregister derivation drain in
+    /// `dealloc_object(CSpaceObj)` to determine which pages of the dying
+    /// `CSpace` are populated without holding a `&self` borrow across
+    /// per-slot calls into foreign `CSpace`s. The returned pointer is for
+    /// presence-testing only — callers MUST go through `slot`/`slot_mut`
+    /// for any actual read or write.
+    pub(crate) fn page_at(&self, page_idx: usize) -> Option<core::ptr::NonNull<u8>>
+    {
+        self.directory
+            .get(page_idx)
+            .copied()
+            .flatten()
+            .map(core::ptr::NonNull::cast::<u8>)
+    }
+
     /// Return a slot to the free list and clear its contents.
     ///
     /// Silently ignores an out-of-range, unmapped, or zero index.

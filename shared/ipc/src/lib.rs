@@ -571,8 +571,13 @@ pub mod rtc_labels
     /// Authority bit in the RTC-service-endpoint token's high u64 bit.
     /// Set on caps devmgr mints in response to
     /// [`devmgr_labels::QUERY_RTC_DEVICE`]; gates [`RTC_GET_EPOCH_TIME`].
-    /// A verb ("may read"), not an identity. Mirrors
-    /// [`serial_labels::WRITE_AUTHORITY`] / [`fb_labels::WRITE_AUTHORITY`].
+    /// A verb ("may read"), not an identity. Shares the same `1 << 63`
+    /// bit position as [`serial_labels::WRITE_AUTHORITY`] and
+    /// [`fb_labels::WRITE_AUTHORITY`]; unlike those two, the cmos /
+    /// goldfish-rtc drivers do enforce the bit at the service loop
+    /// (defence-in-depth alongside the upstream
+    /// [`REGISTRY_QUERY_AUTHORITY`](devmgr_labels::REGISTRY_QUERY_AUTHORITY)
+    /// gate at devmgr's `QUERY_RTC_DEVICE` handler).
     pub const READ_AUTHORITY: u64 = 1u64 << 63;
 }
 
@@ -590,7 +595,7 @@ pub mod rtc_errors
     /// today — `RTC_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
-    /// Caller's token lacked [`rtc_labels::READ_AUTHORITY`]. Mirrors
+    /// Caller's token lacked [`rtc_labels::READ_AUTHORITY`]. Backstops
     /// the upstream gate at [`devmgr_labels::QUERY_RTC_DEVICE`]: a
     /// well-behaved client only ever sees this if a SEND cap leaked
     /// without the verb bit (or a future verb-set partition refuses

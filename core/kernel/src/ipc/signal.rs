@@ -142,6 +142,16 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
         {
             let waiter = sig.waiter;
             sig.waiter = core::ptr::null_mut();
+            // Claim the waiter for wake before releasing sig.lock. A concurrent
+            // dealloc_object(Thread) takes sig.lock in its unlink path and then
+            // spins on this flag, so it cannot free `waiter` in the window
+            // between this pop and the caller's enqueue_and_wake. Cleared by
+            // enqueue_and_wake. See docs/scheduling-internals.md
+            // § Cross-CPU TCB Ownership.
+            // SAFETY: waiter is the valid TCB just dequeued from sig.waiter.
+            unsafe {
+                (*waiter).wake_in_flight.store(1, Ordering::Release);
+            }
             sig.has_observer
                 .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
             // SAFETY: waiter is a valid TCB pointer placed here by signal_wait.

@@ -132,6 +132,12 @@ pub unsafe fn event_queue_post(
         // SAFETY: waiter is a valid TCB placed by event_queue_recv.
         unsafe {
             (*waiter).wakeup_value = payload;
+            // Claim for wake under eq.lock; dealloc's BlockedOnEventQueue
+            // unlink takes eq.lock and spins on this flag (#160). Cleared by
+            // enqueue_and_wake.
+            (*waiter)
+                .wake_in_flight
+                .store(1, core::sync::atomic::Ordering::Release);
         }
         // If the waiter was registered with a `SYS_EVENT_RECV` timeout, it
         // is also on the global sleep list. Remove it here so the timer
@@ -277,6 +283,10 @@ pub unsafe fn event_queue_drop(eq: *mut EventQueueState)
         // SAFETY: waiter is a valid TCB.
         unsafe {
             (*waiter).wakeup_value = 0;
+            // Claim for wake under eq.lock (#160). Cleared by enqueue_and_wake.
+            (*waiter)
+                .wake_in_flight
+                .store(1, core::sync::atomic::Ordering::Release);
             let target_cpu = crate::sched::select_target_cpu(waiter);
             crate::sched::enqueue_and_wake(waiter, target_cpu);
         }

@@ -21,13 +21,24 @@
 //!
 //! ## Concurrency
 //!
-//! Page table modifications (`map_page`, `unmap_page`, `protect_page`) are
-//! serialized per address space by `pt_lock`. The lock ordering is:
+//! Page table modifications (`map_page`, `unmap_page`, `protect_page`) edit the
+//! leaf PTE under the per-address-space `pt_lock`, then RELEASE `pt_lock`
+//! before issuing the synchronous TLB shootdown ([`shootdown_remote`]). Holding
+//! `pt_lock` across the shootdown's cross-CPU IPI ack-wait would serialize every
+//! concurrent map/unmap on the address space behind that latency — a convoy /
+//! priority-inversion under load. The committed PTE plus the immutable
+//! `root_phys` are all the shootdown reads, so it runs without `pt_lock`.
 //!
-//!   `pt_lock` → `FRAME_ALLOC_LOCK` → `SHOOTDOWN_LOCK`
+//! `pt_lock` therefore does NOT nest with `SHOOTDOWN_LOCK`. The only lock the
+//! PTE edit nests under `pt_lock` is the PT-frame source
+//! (`pt_lock` → `FRAME_ALLOC_LOCK` on the heap-backed path).
 //!
-//! `pt_lock` does NOT disable interrupts; shootdown needs interrupts enabled.
-//! Preemption is disabled via `preempt_disable()` while the lock is held.
+//! `pt_lock` does NOT disable interrupts (shootdown needs them enabled).
+//! `preempt_disable()` is held across the whole edit-then-shootdown sequence:
+//! it satisfies the shootdown protocol's same-CPU invariant and ensures the
+//! mapping is fully TLB-coherent before the operation returns.
+//!
+//! [`shootdown_remote`]: AddressSpace::shootdown_remote
 
 // cast_possible_truncation: u64→usize page count arithmetic; bounded by address space size.
 #![allow(clippy::cast_possible_truncation)]
@@ -133,6 +144,38 @@ impl AddressSpace
     fn pt_unlock(&self)
     {
         self.pt_lock.store(false, Ordering::Release);
+    }
+
+    /// Shoot down the TLB entry for `virt` on every other CPU that currently
+    /// has this address space active.
+    ///
+    /// Run OUTSIDE `pt_lock` (the caller must have released it): the leaf PTE
+    /// is already committed, so holding `pt_lock` across the synchronous IPI
+    /// ack-wait would needlessly serialize every concurrent map/unmap on this
+    /// address space behind cross-CPU latency. The shootdown only reads the
+    /// immutable `root_phys` and the active-CPU mask, so it needs no PT lock.
+    ///
+    /// The current CPU is excluded from the mask; the caller performs the
+    /// local invalidation under `pt_lock`. The caller MUST still hold
+    /// `preempt_disable()` — the shootdown protocol requires it, and keeping
+    /// it held until the shootdown returns makes the mapping fully TLB-coherent
+    /// before the syscall returns.
+    #[cfg(not(test))]
+    #[inline]
+    fn shootdown_remote(&self, virt: u64)
+    {
+        let active = self.active_cpu_mask();
+        let current = crate::arch::current::cpu::current_cpu();
+        let remote_cpus = active & !(1u64 << current);
+        if remote_cpus != 0
+        {
+            // SAFETY: root_phys is a valid page table root; remote_cpus mask
+            // contains only bits for online CPUs (enforced by scheduler); the
+            // caller holds preempt_disable() and no longer holds pt_lock.
+            unsafe {
+                crate::mm::tlb_shootdown::shootdown(self.root_phys, remote_cpus, virt);
+            }
+        }
     }
 
     /// Allocate a new, empty user address space.
@@ -293,31 +336,19 @@ impl AddressSpace
             return Err(());
         }
 
-        // If this address space is active on other CPUs, they need TLB invalidation
-        // for the new mapping (some architectures cache negative lookups).
-        // The current CPU is excluded from the remote mask; it invalidates locally below.
-        let active = self.active_cpu_mask();
-        let current = crate::arch::current::cpu::current_cpu();
-        let remote_cpus = active & !(1u64 << current);
-
-        if remote_cpus != 0
-        {
-            // SAFETY: root_phys is a valid page table root; remote_cpus mask
-            // contains only bits for online CPUs (enforced by scheduler).
-            // preempt_disable() already called above.
-            unsafe {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, remote_cpus, virt);
-            }
-        }
-
-        // Local TLB invalidation for the mapped page. The current CPU does not
-        // send an IPI to itself; it performs the invalidation directly.
+        // Local TLB invalidation for the mapped page, under pt_lock. The
+        // current CPU does not IPI itself.
         // SAFETY: virt is a valid user virtual address.
         unsafe {
             flush_page(virt);
         }
 
+        // Drop pt_lock BEFORE the synchronous remote shootdown so concurrent
+        // map/unmap on this address space need not wait behind our IPI
+        // ack-wait. preempt stays disabled, so the shootdown completes (full
+        // TLB coherence) before this returns. See `shootdown_remote`.
         self.pt_unlock();
+        self.shootdown_remote(virt);
         crate::percpu::preempt_enable();
 
         Ok(())
@@ -356,25 +387,14 @@ impl AddressSpace
             return Err(());
         }
 
-        let active = self.active_cpu_mask();
-        let current = crate::arch::current::cpu::current_cpu();
-        let remote_cpus = active & !(1u64 << current);
-
-        if remote_cpus != 0
-        {
-            // SAFETY: root_phys is a valid PT root; remote_cpus mask is a
-            // subset of online CPUs.
-            unsafe {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, remote_cpus, virt);
-            }
-        }
-
+        // Local TLB invalidation under pt_lock; remote shootdown after unlock.
         // SAFETY: virt is a valid user virtual address.
         unsafe {
             flush_page(virt);
         }
 
         self.pt_unlock();
+        self.shootdown_remote(virt);
         crate::percpu::preempt_enable();
 
         Ok(())
@@ -466,30 +486,21 @@ impl AddressSpace
         // SAFETY: root_virt is valid; virt is in user range (caller's contract).
         unsafe { unmap_user_page(self.root_virt, virt) };
 
-        // Shootdown remote CPUs. The current CPU is excluded from the mask;
-        // it will invalidate locally below (no need to IPI ourselves).
-        let active = self.active_cpu_mask();
-        let current = crate::arch::current::cpu::current_cpu();
-        let remote_cpus = active & !(1u64 << current);
-
-        if remote_cpus != 0
-        {
-            // SAFETY: root_phys is a valid page table root; remote_cpus mask
-            // contains only bits for online CPUs (enforced by scheduler).
-            // preempt_disable() already called above.
-            unsafe {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, remote_cpus, virt);
-            }
-        }
-
-        // Local TLB invalidation for the unmapped page. The current CPU does
-        // not send an IPI to itself; it performs the invalidation directly.
+        // Local TLB invalidation for the unmapped page, under pt_lock. The
+        // current CPU does not IPI itself.
         // SAFETY: virt is a valid user virtual address.
         unsafe {
             flush_page(virt);
         }
 
+        // Drop pt_lock BEFORE the synchronous remote shootdown so concurrent
+        // map/unmap on this address space need not wait behind our IPI
+        // ack-wait. preempt stays disabled, so the unmap is fully TLB-coherent
+        // before this returns (the page's frame is owned by its Frame cap and
+        // is not reclaimed here, so no early-reuse hazard). See
+        // `shootdown_remote`.
         self.pt_unlock();
+        self.shootdown_remote(virt);
         crate::percpu::preempt_enable();
     }
 
@@ -524,30 +535,19 @@ impl AddressSpace
             return Err(e);
         }
 
-        // Shootdown remote CPUs. The current CPU is excluded from the mask;
-        // it will invalidate locally below (no need to IPI ourselves).
-        let active = self.active_cpu_mask();
-        let current = crate::arch::current::cpu::current_cpu();
-        let remote_cpus = active & !(1u64 << current);
-
-        if remote_cpus != 0
-        {
-            // SAFETY: root_phys is a valid page table root; remote_cpus mask
-            // contains only bits for online CPUs (enforced by scheduler).
-            // preempt_disable() already called above.
-            unsafe {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, remote_cpus, virt);
-            }
-        }
-
-        // Local TLB invalidation for the protected page. The current CPU does
-        // not send an IPI to itself; it performs the invalidation directly.
+        // Local TLB invalidation for the protected page, under pt_lock. The
+        // current CPU does not IPI itself.
         // SAFETY: virt is a valid user virtual address.
         unsafe {
             flush_page(virt);
         }
 
+        // Drop pt_lock BEFORE the synchronous remote shootdown so concurrent
+        // map/unmap on this address space need not wait behind our IPI
+        // ack-wait. preempt stays disabled, so the permission change is fully
+        // TLB-coherent before this returns. See `shootdown_remote`.
         self.pt_unlock();
+        self.shootdown_remote(virt);
         crate::percpu::preempt_enable();
 
         Ok(())

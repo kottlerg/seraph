@@ -306,6 +306,17 @@ pub struct ThreadControlBlock
     /// on RISC-V RVWMO.
     pub context_saved: core::sync::atomic::AtomicU32,
 
+    /// Set to 1 by a waker that has popped this thread from a wait object
+    /// (signal, endpoint, event queue, or wait set) under that object's lock
+    /// but has not yet called `enqueue_and_wake`; cleared to 0 by
+    /// `enqueue_and_wake`.
+    /// `dealloc_object(Thread)` spins on this (Acquire) after its wait-object
+    /// unlink and before `retype_free`, so a thread popped for wake cannot be
+    /// freed out from under the in-flight wake. This is the wake-side analogue
+    /// of `context_saved` (the switch-side gate). See
+    /// `docs/scheduling-internals.md` § Cross-CPU TCB Ownership.
+    pub wake_in_flight: core::sync::atomic::AtomicU32,
+
     // === Death notification ===
     /// Observers to notify when this thread exits or faults.
     ///

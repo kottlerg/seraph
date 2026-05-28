@@ -180,17 +180,38 @@ pub unsafe fn endpoint_call(
         // committed by enqueue_and_wake.
         unsafe {
             (*server).ipc_msg = *msg;
-            (*server)
-                .reply_tcb
-                .store(caller, core::sync::atomic::Ordering::Release);
-        }
-        // Clear context_saved before making the caller visible as blocked.
-        // See signal.rs signal_wait for the full rationale.
-        // SAFETY: caller validated by syscall layer; context_saved is AtomicU32.
-        unsafe {
+            // Clear context_saved BEFORE the caller becomes wakeable. Every
+            // reply-wake claimant reaches the caller through `reply_tcb`
+            // (endpoint_reply, dealloc's BlockedOnReply detach,
+            // cancel_ipc_block, the sleep-list timer arm), Acquire-loading it.
+            // Ordering this Relaxed clear before the `reply_tcb` Release makes
+            // the Release carry it, so no claimant can observe the stale
+            // context_saved==1 left by the caller's previous switch-in and
+            // dispatch it onto a stack its switch() has not yet vacated.
+            // Mirrors signal_wait's clear-before-register ordering (signal.rs).
             (*caller)
                 .context_saved
                 .store(0, core::sync::atomic::Ordering::Relaxed);
+            // The caller is becoming BlockedOnReply: claim it for the eventual
+            // reply wake BEFORE publishing reply_tcb. dealloc_object(Thread)'s
+            // BlockedOnReply detach Acquire-loads reply_tcb, so this store is
+            // visible to it (release/acquire via reply_tcb), and it spins on
+            // the flag before retype_free. On reply, enqueue_and_wake clears
+            // it; on dealloc cancel, the detach clears it (#160). See
+            // docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+            (*caller)
+                .wake_in_flight
+                .store(1, core::sync::atomic::Ordering::Release);
+            (*server)
+                .reply_tcb
+                .store(caller, core::sync::atomic::Ordering::Release);
+            // Claim the server for wake before releasing ep.lock. dealloc's
+            // BlockedOnRecv unlink takes ep.lock and then spins on this flag,
+            // so it cannot free the server in the window between this dequeue
+            // and the caller's enqueue_and_wake. Cleared by enqueue_and_wake.
+            (*server)
+                .wake_in_flight
+                .store(1, core::sync::atomic::Ordering::Release);
         }
         // SAFETY: caller validated; held ep.lock excludes recv-queue writes.
         let committed = unsafe {
@@ -205,12 +226,25 @@ pub unsafe fn endpoint_call(
             // Concurrent stop won; tear down the reply linkage.
             // SAFETY: caller / server validated.
             unsafe {
-                let _ = (*server).reply_tcb.compare_exchange(
-                    caller,
-                    core::ptr::null_mut(),
-                    core::sync::atomic::Ordering::AcqRel,
-                    core::sync::atomic::Ordering::Acquire,
-                );
+                let cleared = (*server)
+                    .reply_tcb
+                    .compare_exchange(
+                        caller,
+                        core::ptr::null_mut(),
+                        core::sync::atomic::Ordering::AcqRel,
+                        core::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok();
+                // If we tore down the reply binding, the reply wake will never
+                // fire, so release the wake-in-flight claim set above (#160).
+                // If the CAS failed, another claimant owns the wake and will
+                // clear it.
+                if cleared
+                {
+                    (*caller)
+                        .wake_in_flight
+                        .store(0, core::sync::atomic::Ordering::Release);
+                }
                 (*caller)
                     .context_saved
                     .store(1, core::sync::atomic::Ordering::Relaxed);
@@ -295,6 +329,13 @@ pub unsafe fn endpoint_recv(
         let msg = unsafe { (*caller).ipc_msg };
         // SAFETY: server validated by syscall layer.
         unsafe {
+            // Caller transitions BlockedOnSend → BlockedOnReply: claim it for
+            // the eventual reply wake BEFORE publishing reply_tcb, so dealloc's
+            // BlockedOnReply detach (which Acquire-loads reply_tcb) sees the
+            // flag and gates on it before retype_free (#160).
+            (*caller)
+                .wake_in_flight
+                .store(1, core::sync::atomic::Ordering::Release);
             (*server)
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);
@@ -399,7 +440,12 @@ pub unsafe fn endpoint_reply(
     }
 
     // SAFETY: caller stored by endpoint_call/recv. State transitions
-    // committed by enqueue_and_wake at the call site.
+    // committed by enqueue_and_wake at the call site. `caller.wake_in_flight`
+    // was set to 1 when the caller became BlockedOnReply (in endpoint_call /
+    // endpoint_recv, before publishing `reply_tcb`); enqueue_and_wake clears it
+    // once the wake commits. We won the reply_tcb CAS above, so no other
+    // claimant (dealloc / cancel) will touch the caller. See
+    // docs/scheduling-internals.md § Cross-CPU TCB Ownership.
     unsafe {
         (*caller).ipc_msg = *msg;
     }

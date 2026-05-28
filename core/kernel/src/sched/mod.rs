@@ -222,6 +222,23 @@ fn watchdog_tick_and_check()
         }
     }
 
+    // A synchronous TLB shootdown legitimately holds every participating CPU
+    // (initiator preempt-disabled in the ack-wait; others spinning in pt_lock
+    // or their own shootdown) until all remote CPUs ack. Under heavy
+    // oversubscription that round-trip can exceed this 3 s threshold while
+    // still making progress. The shootdown owns its own bounded escalation
+    // (NMI backtrace at 0.75 s, panic at 5 s — see arch wait_for_ack) and is
+    // the authoritative detector for a genuinely stuck IPI, so defer to it
+    // rather than emit a misleading softlockup dump. A non-shootdown stall
+    // re-checks on the next tick once pending_cpus clears.
+    if crate::mm::tlb_shootdown::TLB_SHOOTDOWN
+        .pending_cpus
+        .load(core::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        return;
+    }
+
     if WATCHDOG_FIRED
         .compare_exchange(
             false,
@@ -404,6 +421,21 @@ static mut SLEEP_LIST: [*mut ThreadControlBlock; MAX_SLEEPING] =
 #[cfg(not(test))]
 static mut SLEEP_COUNT: usize = 0;
 
+/// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
+/// dropping `SLEEP_LIST_LOCK` and waking them.
+///
+/// Kept off the stack deliberately: at `MAX_SLEEPING * 8 = 1 KiB` a
+/// stack-local snapshot inflated the frame of `timer_tick` (which inlines
+/// `sleep_check_wakeups`). `timer_tick` runs in the timer ISR (`isr_timer`,
+/// IST=0) on the kernel stack of whatever thread the tick interrupted; the
+/// oversized frame overran that stack's saved return-address chain, faulting
+/// with `rip=0` on the next `ret`. `sleep_check_wakeups` runs only on CPU0
+/// (see `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it
+/// is non-reentrant and this single buffer needs no lock of its own.
+#[cfg(not(test))]
+static mut EXPIRED_SCRATCH: [*mut ThreadControlBlock; MAX_SLEEPING] =
+    [core::ptr::null_mut(); MAX_SLEEPING];
+
 /// Add a thread to the sleep list. The TCB must already have
 /// `sleep_deadline` set and state = Blocked.
 ///
@@ -485,10 +517,14 @@ pub fn sleep_check_wakeups()
 {
     let now = crate::arch::current::timer::current_tick();
 
-    // Collect expired threads under the lock. Do not touch state yet — for
-    // signal-wait-timeout entries we need to take the signal's lock first.
-    let mut expired: [*mut ThreadControlBlock; MAX_SLEEPING] =
-        [core::ptr::null_mut(); MAX_SLEEPING];
+    // Collect expired threads under the lock into the CPU0-timer-private
+    // scratch buffer. Do not touch state yet — for signal-wait-timeout entries
+    // we need to take the signal's lock first.
+    // SAFETY: runs only on CPU0 behind an interrupt gate (non-reentrant), so
+    // this &mut borrow of EXPIRED_SCRATCH is exclusive for the call. Only
+    // entries [0, n) are written below and read back; stale tail entries are
+    // never observed.
+    let expired = unsafe { &mut *core::ptr::addr_of_mut!(EXPIRED_SCRATCH) };
     let mut n = 0usize;
 
     // SAFETY: lock serialises all sleep list access.
@@ -867,6 +903,7 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
                     blocked_on_object: core::ptr::null_mut(),
                     thread_id: alloc_thread_id(),
                     context_saved: core::sync::atomic::AtomicU32::new(1),
+                    wake_in_flight: core::sync::atomic::AtomicU32::new(0),
                     death_observers: [thread::DeathObserver::empty(); thread::MAX_DEATH_OBSERVERS],
                     death_observer_count: 0,
                     exit_reason: 0,
@@ -1636,6 +1673,15 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         thread::ThreadState::Stopped | thread::ThreadState::Exited
     )
     {
+        // Wake aborted (a concurrent stop/dealloc won). Still clear the
+        // wake-in-flight gate the waker set at pop time so a waiting
+        // `dealloc_object(Thread)` can proceed to free this TCB.
+        // SAFETY: tcb valid; lock held.
+        unsafe {
+            (*tcb)
+                .wake_in_flight
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
         // SAFETY: paired with lock_raw above.
         unsafe { sched.lock.unlock_raw(saved) };
         return;
@@ -1665,6 +1711,18 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
     // CPU observing the bit. Idle loop sees the flag (or the IPI hits its
     // halt boundary). See docs/scheduling-internals.md § Wake Protocol.
     set_reschedule_pending_for(target_cpu);
+
+    // Wake committed: the thread is Ready and enqueued under sched.lock. Clear
+    // the wake-in-flight gate so a waiting `dealloc_object(Thread)` may proceed
+    // (it will then observe the thread via the run queue / current and apply
+    // its existing removal + context_saved gate). Release pairs with the
+    // Acquire spin in dealloc.
+    // SAFETY: tcb valid; lock held.
+    unsafe {
+        (*tcb)
+            .wake_in_flight
+            .store(0, core::sync::atomic::Ordering::Release);
+    }
 
     // SAFETY: saved was returned by the matching lock_raw above.
     unsafe { sched.lock.unlock_raw(saved) };
@@ -1890,12 +1948,18 @@ pub unsafe fn schedule(requeue_current: bool)
                 (*current).magic == thread::TCB_MAGIC,
                 "schedule: current TCB magic corrupt on cpu {cpu}"
             );
-            // Do not re-enqueue threads that dealloc_object has already marked
-            // Exited (or that are Stopped). Between dealloc's all-scheduler
-            // lock release and this timer-driven schedule(true), the Exited
-            // state was committed under all locks. Re-enqueuing would overwrite
-            // that state to Ready, creating a dangling run-queue entry that
-            // survives TCB deallocation — a use-after-free.
+            // Do not re-enqueue a thread that a concurrent path has already
+            // committed to Exited (dealloc) or Stopped under all-CPU scheduler
+            // locks: re-enqueuing would overwrite that state to Ready and leave
+            // a dangling run-queue entry over a TCB that retype_free may reclaim
+            // — a use-after-free. Every other state at a `requeue_current` call
+            // (Running in the common preemption/yield case) is requeue-legitimate.
+            //
+            // This MUST stay a denylist (`!= Exited && != Stopped`). A tighter
+            // `== Running` allowlist is logically equivalent on the audited
+            // callers but perturbs this hot path's instruction timing enough to
+            // widen the #116 all-CPUs-idle stall race dramatically under TCG SMP
+            // (measured ~0% → ~12% across run-parallel sweeps).
             let cur_state = (*current).state;
             if cur_state != ThreadState::Exited && cur_state != ThreadState::Stopped
             {

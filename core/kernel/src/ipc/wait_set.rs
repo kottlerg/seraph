@@ -318,6 +318,15 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
     // docs/scheduling-internals.md § Lock Hierarchy rule 5.
     let waiter = ws.waiter;
     ws.waiter = core::ptr::null_mut();
+    // Claim the waiter for wake before releasing ws.lock; dealloc's
+    // BlockedOnWaitSet unlink takes ws.lock and spins on this flag (#160).
+    // Cleared by enqueue_and_wake.
+    // SAFETY: waiter is a valid TCB placed by waitset_wait.
+    unsafe {
+        (*waiter)
+            .wake_in_flight
+            .store(1, core::sync::atomic::Ordering::Release);
+    }
 
     let token = {
         let m = &ws.members[member_idx as usize];
@@ -486,9 +495,12 @@ pub unsafe fn waitset_add(
         {
             let waiter = ws.waiter;
             ws.waiter = core::ptr::null_mut();
-            // SAFETY: waiter is a valid TCB.
+            // SAFETY: waiter is a valid TCB. Claim for wake under ws.lock (#160).
             let target_cpu = unsafe {
                 (*waiter).wakeup_value = token;
+                (*waiter)
+                    .wake_in_flight
+                    .store(1, core::sync::atomic::Ordering::Release);
                 crate::sched::select_target_cpu(waiter)
             };
             deferred_wake = Some((waiter, target_cpu));
@@ -641,8 +653,12 @@ pub unsafe fn wait_set_drop(
         let waiter = ws_ref.waiter;
         ws_ref.waiter = core::ptr::null_mut();
         // SAFETY: waiter is a valid TCB; wakeup_value=0 = drop semantics.
+        // Claim for wake under ws.lock (#160).
         let target_cpu = unsafe {
             (*waiter).wakeup_value = 0;
+            (*waiter)
+                .wake_in_flight
+                .store(1, core::sync::atomic::Ordering::Release);
             crate::sched::select_target_cpu(waiter)
         };
         Some((waiter, target_cpu))

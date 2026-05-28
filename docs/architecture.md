@@ -17,7 +17,8 @@ Seraph defines its own native interfaces; POSIX API compatibility is not
 a goal. Filesystem formats and network protocols may be adopted as data
 formats, not as API commitments. Seraph does not provide binary
 compatibility with other operating systems. 32-bit and legacy x86 are
-not targeted.
+not targeted. Userspace targets these native interfaces through standard
+language runtimes (`ruststd`, `libc`), not through compatibility shims.
 
 ---
 

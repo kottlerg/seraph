@@ -489,7 +489,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///        empty pool that requires immediate augment-mode refill before any
 ///        cap can be inserted). Augment-mode accepts `init_pages >= 1`.
 /// arg3 = `max_slots` (create-mode only): hard cap on usable slots
-///        (clamped to `[1, 16384]`). Ignored in augment mode.
+///        (clamped to `[1, 14336]`). Ignored in augment mode.
 ///
 /// Create-mode slab layout:
 /// - page 0 — wrapper page: [`CSpaceKernelObject`] at offset 0, immediately
@@ -497,7 +497,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///   pointer indexes into this same page.
 /// - pages `1..init_pages` — slot-page pool, drawn on demand by
 ///   [`CSpace::grow`](crate::cap::cspace::CSpace::grow) when the directory
-///   needs another 64-slot leaf.
+///   needs another 56-slot leaf.
 ///
 /// Create-mode returns the new `CSpace` slot index. Augment-mode returns 0.
 #[cfg(not(test))]
@@ -516,7 +516,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use core::ptr::NonNull;
     use core::sync::atomic::AtomicU64;
 
-    const MAX_SLOTS: usize = 16384;
+    const MAX_SLOTS: usize = 14336;
 
     let frame_idx = tf.arg(0) as u32;
     let augment_idx = tf.arg(1) as u32;

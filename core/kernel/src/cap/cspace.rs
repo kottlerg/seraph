@@ -7,7 +7,7 @@
 //!
 //! A [`CSpace`] is a two-level directory of [`CapabilitySlot`]s. The directory
 //! has [`L1_SIZE`] entries; each points to a [`CSpacePage`] containing
-//! [`L2_SIZE`] slots. Maximum capacity: `L1_SIZE * L2_SIZE = 16384` slots.
+//! [`L2_SIZE`] slots. Maximum capacity: `L1_SIZE * L2_SIZE = 14336` slots.
 //!
 //! ## Free list
 //!
@@ -18,10 +18,10 @@
 //! ## Growth
 //!
 //! `CSpace` pages are allocated on demand by [`CSpace::grow`]. The first page
-//! skips slot 0 (always null); subsequent pages contribute all 64 slots to the
+//! skips slot 0 (always null); subsequent pages contribute all 56 slots to the
 //! free list.
 
-// cast_possible_truncation: usize→u32 slot index bounded by L1_SIZE * L2_SIZE (16384).
+// cast_possible_truncation: usize→u32 slot index bounded by L1_SIZE * L2_SIZE (14336).
 #![allow(clippy::cast_possible_truncation)]
 
 // `alloc` is needed by the host-test stubs (CSpace::grow heap fallback,
@@ -41,10 +41,11 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Slots per `CSpace` page (64 × 56 B = 3584 B, fits in a 4096-byte slab bin).
-pub const L2_SIZE: usize = 64;
+/// Slots per `CSpace` page (56 × 72 B = 4032 B, fits in a 4096-byte slab bin
+/// with 64 B of tail slack).
+pub const L2_SIZE: usize = 56;
 
-/// Directory entries per `CSpace` (max 256 × 64 = 16384 slots).
+/// Directory entries per `CSpace` (max 256 × 56 = 14336 slots).
 pub const L1_SIZE: usize = 256;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -685,9 +686,9 @@ mod tests
     #[test]
     fn max_slots_enforced()
     {
-        // max_slots = 63: exactly one page minus slot 0.
-        let mut cs = CSpace::new(0, 63);
-        for _ in 0..63
+        // max_slots = L2_SIZE - 1: exactly one page minus slot 0.
+        let mut cs = CSpace::new(0, L2_SIZE - 1);
+        for _ in 0..(L2_SIZE - 1)
         {
             cs.allocate_slot().unwrap();
         }

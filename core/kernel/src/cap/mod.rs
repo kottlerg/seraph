@@ -250,13 +250,13 @@ pub fn sum_frame_available_bytes(cspace: &cspace::CSpace) -> u64
 }
 
 /// Maximum slots in the root `CSpace` (full two-level directory).
-const ROOT_CSPACE_MAX_SLOTS: usize = 16384;
+const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
 
 /// Pages carved from `SEED_FRAME` for the root `CSpace` slab: page 0 is the
 /// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining
 /// pages seed the slot-page pool. `populate_cspace` plus
 /// [`mint_module_frame_caps`] mint ~150 caps into the root, occupying ~3
-/// slot pages (64 slots each); 16 pool pages = 1 KiB-cap headroom.
+/// slot pages (56 slots each); 16 pool pages = 1 KiB-cap headroom.
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_PAGES: u64 = 17;
 

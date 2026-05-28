@@ -126,11 +126,12 @@ physical address.
 ```
 init
  ├── devmgr  (platform caps + firmware table caps)
- │    ├── driver/ethernet  (MMIO cap, IRQ cap)
- │    ├── driver/nvme      (MMIO cap, IRQ cap)
- │    └── driver/usb-hcd   (MMIO cap, IRQ cap)
- ├── vfsd  (receives storage endpoint from devmgr)
- ├── netd  (receives network endpoint from devmgr)
+ │    ├── driver/virtio-blk        (MMIO + IRQ caps; QUERY_BLOCK_DEVICE)
+ │    ├── driver/serial            (UART hw cap; QUERY_SERIAL_DEVICE)
+ │    ├── driver/framebuffer       (MMIO cap; QUERY_FRAMEBUFFER_DEVICE)
+ │    └── driver/{cmos,goldfish-rtc} (RTC hw cap; QUERY_RTC_DEVICE)
+ ├── vfsd  (receives storage endpoint via QUERY_BLOCK_DEVICE)
+ ├── timed (receives RTC endpoint via QUERY_RTC_DEVICE)
  └── ...
 ```
 

@@ -1,8 +1,10 @@
 # timed
 
-Userspace wall-clock service. RTC-source agnostic: looks up
-`rtc.primary` in the service registry once at startup, computes a
-fixed offset against the kernel's monotonic clock, then serves
+Userspace wall-clock service. RTC-source agnostic: resolves the
+platform RTC via devmgr's
+[`devmgr_labels::QUERY_RTC_DEVICE`](../../shared/ipc/src/lib.rs) once
+at startup, computes a fixed offset against the kernel's monotonic
+clock, then serves
 [`timed_labels::GET_WALL_TIME`](../../shared/ipc/src/lib.rs) from
 `offset + kernel_elapsed_us()` on every request.
 
@@ -18,7 +20,7 @@ timed/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Service entry, registry lookup, event loop
+    └── main.rs            # Service entry, RTC resolve, event loop
 ```
 
 No `arch/` subdirectory — no hardware code. The same binary builds and
@@ -28,15 +30,15 @@ runs on every supported arch.
 
 ## Endpoint
 
-Bootstrap caps from devmgr (one round, one cap, `done=true`):
+Bootstrap caps from init (one round, two caps, `done=true`):
 
-| Slot      | Cap                                                  |
-|-----------|------------------------------------------------------|
-| `caps[0]` | Service-endpoint RECV (timed receives on this)       |
+| Slot      | Cap                                                          |
+|-----------|--------------------------------------------------------------|
+| `caps[0]` | Service-endpoint RECV (timed receives on this)               |
+| `caps[1]` | SEND on devmgr's registry endpoint, tokened with `REGISTRY_QUERY_AUTHORITY` |
 
-`ProcessInfo.service_registry_cap` (delivered to every spawned process
-by procmgr) provides the SEND cap on svcmgr's registry endpoint, used
-once for the `rtc.primary` lookup. No other caps are needed.
+No other caps are needed; the registry SEND is used once for the
+`QUERY_RTC_DEVICE` resolve and then discarded.
 
 ---
 
@@ -51,17 +53,18 @@ once for the `rtc.primary` lookup. No other caps are needed.
   at request time. `offset` is fixed at startup; future NTP discipline
   will update it in place without any client-side change.
 
-If `rtc.primary` lookup failed at startup (no RTC driver registered),
-timed enters a degraded state and replies
+If `QUERY_RTC_DEVICE` resolution failed at startup (no RTC reachable
+through devmgr), timed enters a degraded state and replies
 `timed_errors::WALL_CLOCK_UNAVAILABLE` to every `GET_WALL_TIME`.
 
 ---
 
 ## Startup Sequence
 
-1. Pull the service endpoint via the spawner's bootstrap round.
-2. `svcmgr.QUERY_ENDPOINT(b"rtc.primary")` → SEND cap on the RTC
-   chip driver registered by devmgr.
+1. Pull the service endpoint and devmgr-registry SEND via the
+   spawner's bootstrap round.
+2. `devmgr.QUERY_RTC_DEVICE` → `READ_AUTHORITY`-tokened SEND on the
+   per-board RTC driver bound by devmgr.
 3. `rtc_driver.RTC_GET_EPOCH_TIME` → `rtc_us` (Unix-epoch us).
 4. Snapshot `kernel_us = system_info(ElapsedUs)`.
 5. `offset = rtc_us.wrapping_sub(kernel_us)`.

@@ -159,6 +159,15 @@ fn main() -> !
         std::os::seraph::log!("devmgr: framebuffer driver spawned");
     }
 
+    // Spawn the platform RTC driver (CMOS on x86-64, goldfish-RTC on
+    // RISC-V) via the non-PCI simple-device path. devmgr owns `rtc_ep`
+    // and mints client SEND caps on QUERY_RTC_DEVICE.
+    let (rtc_spawned, rtc_ep) = spawn_rtc(&mut caps, ipc_buf);
+    if rtc_spawned
+    {
+        std::os::seraph::log!("devmgr: rtc driver spawned");
+    }
+
     if caps.registry_ep == 0
     {
         std::os::seraph::log!("no registry endpoint injected, halting");
@@ -308,6 +317,51 @@ fn main() -> !
                         fb_ep,
                         syscall::RIGHTS_SEND_GRANT,
                         ipc::fb_labels::WRITE_AUTHORITY,
+                    )
+                    {
+                        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                            .cap(derived)
+                            .build();
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                    else
+                    {
+                        let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                }
+                else
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+            }
+            ipc::devmgr_labels::QUERY_RTC_DEVICE =>
+            {
+                // Like QUERY_SERIAL_DEVICE: do not `seraph::log!` here.
+                // timed is the synchronous caller and a log inside this
+                // handler can deadlock if logd ever fans through devmgr.
+                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if rtc_spawned && rtc_ep != 0
+                {
+                    if let Ok(derived) = syscall::cap_derive_token(
+                        rtc_ep,
+                        syscall::RIGHTS_SEND_GRANT,
+                        ipc::rtc_labels::READ_AUTHORITY,
                     )
                     {
                         let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
@@ -1124,12 +1178,74 @@ fn spawn_framebuffer(
     (spawned, fb_ep)
 }
 
+/// Spawn the platform RTC driver — CMOS on x86-64, goldfish-RTC on
+/// RISC-V — via the non-PCI simple-device path. Returns
+/// `(spawned, rtc_ep)`; `rtc_ep` is the devmgr-owned service endpoint
+/// used to mint client SEND caps on `QUERY_RTC_DEVICE`. devmgr does
+/// not retain RTC-specific hardware authority after a successful
+/// spawn — the carved cap is moved to the driver.
+fn spawn_rtc(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
+{
+    let module_cap = caps.module_cap_for_kind(caps::module_kind::RTC);
+    if module_cap == 0
+    {
+        std::os::seraph::log!("rtc: no rtc driver module delivered");
+        return (false, 0);
+    }
+
+    let rtc_ep = std::os::seraph::object_slab_acquire(88)
+        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
+        .unwrap_or(0);
+    if rtc_ep == 0
+    {
+        std::os::seraph::log!("rtc: failed to create service endpoint");
+        return (false, 0);
+    }
+
+    let Some(hw_cap) = carve_rtc_authority(caps)
+    else
+    {
+        std::os::seraph::log!("rtc: failed to carve RTC authority cap");
+        return (false, rtc_ep);
+    };
+
+    let spawned = spawn::spawn_simple_device(
+        caps.procmgr_ep,
+        caps.self_bootstrap_ep,
+        module_cap,
+        rtc_ep,
+        hw_cap,
+        0, // no devmgr_query_ep: RTC driver needs no runtime platform metadata
+        ipc_buf,
+    );
+    (spawned, rtc_ep)
+}
+
 /// Carve the COM1 `IoPortRange` (`0x3F8`..=`0x3FF`) out of the root
 /// `IoPortRange` cap.
 #[cfg(target_arch = "x86_64")]
 fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 {
     ioport_carve(caps.ioport_root_cap, 0x3F8, 8)
+}
+
+/// Carve the platform RTC's hardware-authority cap out of devmgr's root
+/// authority pool. The bases below are platform-static (legacy MC146818
+/// at ISA `0x70` on x86-64; QEMU virt goldfish-RTC at `0x101000` on
+/// RISC-V) and hardcoded here pending #165, which replaces all such
+/// hardcoded per-driver knowledge with ACPI `_HID` (`PNP0B00`) and DTB
+/// `compatible = "google,goldfish-rtc"` driven discovery — same forward
+/// link as on `carve_uart_authority` below.
+#[cfg(target_arch = "x86_64")]
+fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
+{
+    ioport_carve(caps.ioport_root_cap, 0x70, 2)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
+{
+    carve_subrange(caps, 0x0010_1000, 0x1000)
 }
 
 /// Carve the NS16550 `MmioRegion` out of the aperture covering the UART

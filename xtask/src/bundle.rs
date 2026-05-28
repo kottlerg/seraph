@@ -63,21 +63,27 @@ impl Harness
 /// Modules that ship in a default-init bundle. init looks them up by
 /// the name strings here (via `InitInfo::module_names`, populated by
 /// the kernel), so the order is free for the producer's convenience.
-/// Each entry is `(bundle_entry_name, sysroot_relative_source_path)`;
-/// the bundle-entry name is what init matches against, while the source
-/// path follows each binary's `InstallDest` (drivers under
-/// `services/drivers/`, fs drivers under `services/fs/`). Kept in the
-/// historic ordinal order to keep the disk image byte-stable across
-/// builds.
-const MODULES: &[(&str, &str)] = &[
-    ("procmgr", "services/procmgr"),
-    ("devmgr", "services/devmgr"),
-    ("vfsd", "services/vfsd"),
-    ("virtio-blk", "services/drivers/virtio-blk"),
-    ("serial", "services/drivers/serial"),
-    ("framebuffer", "services/drivers/framebuffer"),
-    ("fatfs", "services/fs/fatfs"),
-    ("memmgr", "services/memmgr"),
+/// Each entry is `(bundle_entry_name, sysroot_relative_source_path,
+/// optional)`; the bundle-entry name is what init matches against, while
+/// the source path follows each binary's `InstallDest` (drivers under
+/// `services/drivers/`, fs drivers under `services/fs/`). `optional =
+/// true` entries are silently skipped when the source binary is absent
+/// from the sysroot — used for arch-gated build specs in
+/// `commands/build.rs` whose binary exists only on one architecture
+/// (the RTC chip drivers today). Mandatory entries hard-error when the
+/// binary is missing. Order is preserved across builds to keep the
+/// disk-image byte-stable.
+const MODULES: &[(&str, &str, bool)] = &[
+    ("procmgr", "services/procmgr", false),
+    ("devmgr", "services/devmgr", false),
+    ("vfsd", "services/vfsd", false),
+    ("virtio-blk", "services/drivers/virtio-blk", false),
+    ("serial", "services/drivers/serial", false),
+    ("framebuffer", "services/drivers/framebuffer", false),
+    ("cmos-rtc", "services/drivers/cmos-rtc", true),
+    ("goldfish-rtc", "services/drivers/goldfish-rtc", true),
+    ("fatfs", "services/fs/fatfs", false),
+    ("memmgr", "services/memmgr", false),
 ];
 
 /// Compose a bundle for the chosen harness and write it to
@@ -105,11 +111,15 @@ pub fn compose(ctx: &BuildContext, harness: Harness) -> Result<()>
     entries.push(("init".to_owned(), init_src));
     if harness == Harness::Init
     {
-        for (name, source) in MODULES
+        for (name, source, optional) in MODULES
         {
             let p = ctx.sysroot.join(source);
             if !p.exists()
             {
+                if *optional
+                {
+                    continue;
+                }
                 anyhow::bail!(
                     "compose-bundle: module binary missing at {} (run `cargo xtask build` first)",
                     p.display()

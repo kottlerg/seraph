@@ -541,27 +541,39 @@ pub mod published_names
 
 pub const RTC_LABELS_VERSION: u32 = 1;
 /// IPC labels for RTC chip drivers (`services/drivers/cmos`,
-/// `services/drivers/virtio/rtc`, and future per-board chip drivers).
+/// `services/drivers/goldfish-rtc`, and future per-board chip drivers).
 ///
 /// Every RTC driver implements exactly one operation: return the current
-/// wall-clock time, as `u64` microseconds since the Unix epoch. The
-/// `timed` service queries the driver registered under
-/// `rtc.primary` in svcmgr once at startup, computes
+/// wall-clock time, as `u64` microseconds since the Unix epoch. devmgr
+/// owns the per-board RTC and hands clients a
+/// [`READ_AUTHORITY`](rtc_labels::READ_AUTHORITY)-tokened SEND via
+/// [`devmgr_labels::QUERY_RTC_DEVICE`]. `timed` is the sole client
+/// today: it resolves the SEND once at startup, computes
 /// `offset = rtc_us - kernel_monotonic_us`, and serves
 /// [`timed_labels::GET_WALL_TIME`] thereafter without further driver IPC.
 ///
 /// Adding a new RTC chip is a matter of writing a driver crate that
-/// answers this single label and registering it as `rtc.primary` from
-/// devmgr's per-board discovery path. `timed` itself never sees the
-/// chip-specific details.
+/// answers this single label and binding it through devmgr's per-board
+/// discovery path; clients reach it via the same `QUERY_RTC_DEVICE`
+/// name. `timed` itself never sees the chip-specific details.
 pub mod rtc_labels
 {
     /// Request the current wall-clock time.
     ///
     /// Wire format: empty body (no data words, no caps). Reply:
     /// `data[0]` is `u64` microseconds since the Unix epoch. Reply
-    /// label carries a status code in the lower 16 bits.
+    /// label carries a status code in the lower 16 bits. Caller's
+    /// token must carry [`READ_AUTHORITY`] (devmgr stamps it on every
+    /// SEND it mints from `QUERY_RTC_DEVICE`); the driver replies
+    /// [`rtc_errors::UNAUTHORIZED`] otherwise.
     pub const RTC_GET_EPOCH_TIME: u64 = 1;
+
+    /// Authority bit in the RTC-service-endpoint token's high u64 bit.
+    /// Set on caps devmgr mints in response to
+    /// [`devmgr_labels::QUERY_RTC_DEVICE`]; gates [`RTC_GET_EPOCH_TIME`].
+    /// A verb ("may read"), not an identity. Mirrors
+    /// [`serial_labels::WRITE_AUTHORITY`] / [`fb_labels::WRITE_AUTHORITY`].
+    pub const READ_AUTHORITY: u64 = 1u64 << 63;
 }
 
 /// Error replies from RTC chip drivers.
@@ -578,17 +590,24 @@ pub mod rtc_errors
     /// today — `RTC_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// Caller's token lacked [`rtc_labels::READ_AUTHORITY`]. Mirrors
+    /// the upstream gate at [`devmgr_labels::QUERY_RTC_DEVICE`]: a
+    /// well-behaved client only ever sees this if a SEND cap leaked
+    /// without the verb bit (or a future verb-set partition refuses
+    /// reads with a more restrictive token).
+    pub const UNAUTHORIZED: u64 = 4;
 }
 
 pub const TIMED_LABELS_VERSION: u32 = 1;
 /// IPC labels for the wall-clock service (`services/timed`).
 ///
-/// `timed` is RTC-source-agnostic: it looks up `rtc.primary` once at
-/// startup, queries the driver via [`rtc_labels::RTC_GET_EPOCH_TIME`],
-/// computes a stable offset against the kernel's monotonic clock, and
-/// serves wall-clock queries from `offset + system_info(ElapsedUs)`. New
-/// RTC chip support never changes timed; only the `rtc.primary` driver
-/// changes per platform.
+/// `timed` is RTC-source-agnostic: it resolves the RTC SEND once at
+/// startup via [`devmgr_labels::QUERY_RTC_DEVICE`], queries the driver
+/// via [`rtc_labels::RTC_GET_EPOCH_TIME`], computes a stable offset
+/// against the kernel's monotonic clock, and serves wall-clock queries
+/// from `offset + system_info(ElapsedUs)`. New RTC chip support never
+/// changes timed; only the chip driver behind devmgr's lookup changes
+/// per platform.
 pub mod timed_labels
 {
     /// Request the current wall-clock time.
@@ -603,12 +622,12 @@ pub mod timed_labels
 pub mod timed_errors
 {
     pub const SUCCESS: u64 = 0;
-    /// No RTC driver was registered under `rtc.primary` at timed's
-    /// startup; the offset was never computed. Boards without an RTC
-    /// (some real RISC-V hardware) reach this state until an operator
-    /// or NTP path seeds the offset out-of-band. Out of scope for this
-    /// PR; documented to make the no-RTC path explicit at the wire
-    /// level rather than panicking.
+    /// No RTC was reachable through devmgr's [`devmgr_labels::QUERY_RTC_DEVICE`]
+    /// at timed's startup; the offset was never computed. Boards without
+    /// an RTC (some real RISC-V hardware) reach this state until an
+    /// operator or NTP path seeds the offset out-of-band. Out of scope
+    /// for this PR; documented to make the no-RTC path explicit at the
+    /// wire level rather than panicking.
     pub const WALL_CLOCK_UNAVAILABLE: u64 = 1;
     pub const UNKNOWN_OPCODE: u64 = 2;
     /// Reserved for a future per-message version handshake. Unused
@@ -895,7 +914,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 3;
+pub const DEVMGR_LABELS_VERSION: u32 = 4;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -937,6 +956,17 @@ pub mod devmgr_labels
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
     /// [`QUERY_SERIAL_DEVICE`].
     pub const QUERY_FRAMEBUFFER_DEVICE: u64 = 4;
+    /// Query for the platform real-time-clock device endpoint.
+    ///
+    /// Mints a `rtc_labels::READ_AUTHORITY`-tokened `SEND_GRANT` cap
+    /// on the RTC driver's service endpoint to the caller. Caller's
+    /// token must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
+    /// replies `UNAUTHORIZED` otherwise. Mirrors
+    /// [`QUERY_SERIAL_DEVICE`]. Today's sole consumer is `timed`,
+    /// which seeds its wall-clock offset from one
+    /// `RTC_GET_EPOCH_TIME` round-trip and serves `GET_WALL_TIME`
+    /// thereafter.
+    pub const QUERY_RTC_DEVICE: u64 = 5;
 
     /// Authority bit in the devmgr-registry-endpoint token's high
     /// u64 bit. Set on caps minted for consumers permitted to call

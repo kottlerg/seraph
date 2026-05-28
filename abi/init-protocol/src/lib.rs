@@ -53,7 +53,12 @@
 ///     for the framebuffer dies with UEFI `ExitBootServices`; the kernel
 ///     forwards what the bootloader captured so devmgr can spawn the
 ///     userspace framebuffer driver (`services/drivers/framebuffer/`).
-pub const INIT_PROTOCOL_VERSION: u32 = 8;
+/// v9: Raised [`INIT_MAX_NAMED_MODULES`] from 8 to 12 to accommodate
+///     the RTC chip drivers (`cmos-rtc` / `goldfish-rtc`) added to the
+///     bundle by #164 and headroom for near-roadmap modules. Pure
+///     constant bump; the [`InitInfo::module_names`] array grows in
+///     size but the field layout is otherwise unchanged.
+pub const INIT_PROTOCOL_VERSION: u32 = 9;
 
 /// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
@@ -62,9 +67,10 @@ pub const INIT_MODULE_NAME_LEN: usize = 32;
 
 /// Maximum number of named boot-module entries the kernel can publish in
 /// [`InitInfo::module_names`]. Sized to comfortably cover the current
-/// `procmgr, devmgr, memmgr, vfsd, virtio-blk, fatfs` set plus future
-/// modules before the table fills.
-pub const INIT_MAX_NAMED_MODULES: usize = 8;
+/// `procmgr, devmgr, memmgr, vfsd, virtio-blk, serial, framebuffer,
+/// cmos-rtc / goldfish-rtc, fatfs` set plus future modules before the
+/// table fills.
+pub const INIT_MAX_NAMED_MODULES: usize = 12;
 
 // ── Address space constants ──────────────────────────────────────────────────
 

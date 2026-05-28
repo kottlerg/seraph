@@ -291,11 +291,21 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64)
 {
     let reply = match msg.label
     {
-        rtc_labels::RTC_GET_EPOCH_TIME => match snapshot_cmos().and_then(epoch_us)
+        rtc_labels::RTC_GET_EPOCH_TIME =>
         {
-            Some(us) => IpcMessage::builder(rtc_errors::SUCCESS).word(0, us).build(),
-            None => IpcMessage::new(rtc_errors::READ_FAILED),
-        },
+            if msg.token & rtc_labels::READ_AUTHORITY == 0
+            {
+                IpcMessage::new(rtc_errors::UNAUTHORIZED)
+            }
+            else
+            {
+                match snapshot_cmos().and_then(epoch_us)
+                {
+                    Some(us) => IpcMessage::builder(rtc_errors::SUCCESS).word(0, us).build(),
+                    None => IpcMessage::new(rtc_errors::READ_FAILED),
+                }
+            }
+        }
         _ => IpcMessage::new(rtc_errors::UNKNOWN_OPCODE),
     };
     // SAFETY: ipc_buf is the registered IPC buffer page.

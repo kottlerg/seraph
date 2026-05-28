@@ -101,6 +101,7 @@ pub mod module_kind
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
     pub const FRAMEBUFFER: u64 = 3;
+    pub const RTC: u64 = 4;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Mirrors
@@ -143,13 +144,14 @@ pub struct DevmgrCaps
     pub driver_module_count: usize,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
-    // tokened on. devmgr uses this to publish driver service caps under
-    // well-known names (`rtc.primary`, `timed`) in the global registry.
+    // tokened on. Reserved for devmgr-initiated publications; the active
+    // svcmgr publications (`timed`, `rootfs.root`, `pwrmgr.*`, `svcmgr`,
+    // `devmgr.registry`) are init-issued.
     pub svcmgr_publish_cap: u32,
 
     // Copy of init's root `IoPortRange` cap (x86-64 only; zero on RISC-V).
     // devmgr derives per-driver narrow copies for ISA peripherals
-    // (currently only the CMOS RTC at ports 0x70-0x71).
+    // (CMOS RTC at ports 0x70-0x71; COM1 at 0x3F8-0x3FF for serial).
     pub ioport_root_cap: u32,
 
     /// Bootloader-discovered framebuffer geometry, or `None` when no

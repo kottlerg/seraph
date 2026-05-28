@@ -147,7 +147,6 @@ lines or via direct `QUERY_ENDPOINT` calls.
 | `pwrmgr.shutdown` | init Phase 3 | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | init Phase 3 | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
 | `svcmgr` | init Phase 3 | un-tokened SEND on svcmgr's own service endpoint |
-| `rtc.primary` | init bring-up | SEND on the per-board RTC driver's service endpoint |
 | `timed` | init bring-up | SEND on timed's service endpoint |
 
 Centralised name constants live in `ipc::published_names`.

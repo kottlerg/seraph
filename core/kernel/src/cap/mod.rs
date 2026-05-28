@@ -137,10 +137,12 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 /// `CSpaceObj`) additionally scrubs the back-links in steady state.
 ///
 /// Live-count peaks in ktest stress today sit in the low hundreds; 4096
-/// gives 10–40× headroom while reclaiming the ~480 KiB of BSS the
-/// pre-#137 65536-entry registry burned. A future workload that genuinely
-/// needs more live `CSpace`s only has to bump this constant — no layout,
-/// ABI, or algorithmic change is required.
+/// gives 10–40× headroom while reclaiming ~448 KiB of BSS the
+/// pre-#137 65536-entry registry burned (65536 × 8 B = 512 KiB old
+/// registry vs 4096 × 16 B = 64 KiB new registry + 4096 × 4 B = 16 KiB
+/// free list = 80 KiB total). A future workload that genuinely needs
+/// more live `CSpace`s only has to bump this constant — no layout, ABI,
+/// or algorithmic change is required.
 const MAX_CSPACES: usize = 4096;
 
 /// High-water mark for the bump-allocator side of `alloc_cspace_id` — only
@@ -219,7 +221,6 @@ static mut CSPACE_FREE_LIST_LEN: usize = 0;
 /// only push ids in `[0, MAX_CSPACES)` and `MAX_CSPACES` slots fit), the
 /// id leaks rather than panicking.
 #[cfg(not(test))]
-#[allow(dead_code)] // Wired into `dealloc_object(CSpaceObj)` by the next commit.
 fn push_free(id: CSpaceId)
 {
     // SAFETY: lock serialises all free-list mutations.
@@ -355,7 +356,6 @@ pub fn unregister_cspace(id: CSpaceId)
 /// lifetime; the `HDR_FLAG_IS_ROOT` clamp in `dec_ref` should already make
 /// it unreachable, but defense-in-depth catches misroutes here.
 #[cfg(not(test))]
-#[allow(dead_code)] // Wired into `dealloc_object(CSpaceObj)` by the next commit.
 pub fn free_cspace_id(id: CSpaceId)
 {
     assert!(id != 0, "free_cspace_id: root CSpace cannot be recycled");
@@ -461,7 +461,11 @@ const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
 /// the root; userspace init then mints, copies, and derives ~700 more
 /// caps during memmgr / procmgr bootstrap (kernel-object inserts +
 /// per-RAM-Frame derive/copy chains in `finalize_memmgr`). Sized at
-/// 1024 slots so the pre-memmgr-handover footprint fits with headroom.
+/// 1536 slots: roughly 1.8× the observed ~850-cap pre-memmgr-handover
+/// peak. The headroom absorbs realistic per-RAM-block-count growth
+/// (more drained blocks ⇒ more init-time Frame-cap derivations) and
+/// per-service growth (more boot modules ⇒ more module-frame caps)
+/// without revisiting this knob.
 ///
 /// MUST be kept in sync with the boot footprint: a target below the
 /// peak boot slot count means `pre_allocate`'s grow loop hits an
@@ -470,7 +474,7 @@ const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
 /// surfaces an unexpected `OutOfMemory`. After memmgr is alive, further
 /// growth is bounded only by `ROOT_CSPACE_MAX_SLOTS`.
 #[cfg(not(test))]
-const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1024;
+const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 
 /// Pages carved from `SEED_FRAME` for the root `CSpace` slab: page 0 is the
 /// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining

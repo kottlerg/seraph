@@ -177,14 +177,42 @@ impl KernelObjectHeader
     /// Returns 0 when the object has no remaining capability references; the
     /// caller is responsible for freeing the object at that point.
     ///
-    /// Headers carrying [`HDR_FLAG_IS_ROOT`] (the boot root `CSpace`) clamp at
-    /// 1: the dec is applied, but if the result would be 0 we restore the
-    /// `ref_count` to 1 and report 1 to the caller. The root `CSpace` lives
-    /// for kernel lifetime and never reaches `dealloc_object`, even if
-    /// upstream refcount accounting mismanages the ancillary slot/wrapper
-    /// pair.
+    /// Headers carrying [`HDR_FLAG_IS_ROOT`] (the boot root `CSpace`) clamp
+    /// at 1 via a CAS loop: when the current count is 1 the operation is a
+    /// no-op (returns 1); otherwise it decrements by one. The CAS form
+    /// avoids the fetch_sub-then-restore window in which a concurrent dec
+    /// would see 0 and underflow. The root `CSpace` lives for kernel
+    /// lifetime and never reaches `dealloc_object`, even if upstream
+    /// refcount accounting mismanages the ancillary slot/wrapper pair.
     pub fn dec_ref(&self) -> u32
     {
+        if (self.flags & HDR_FLAG_IS_ROOT) != 0
+        {
+            // Root path: CAS the floor in atomically so concurrent decs
+            // cannot observe a transient 0.
+            let mut cur = self.ref_count.load(Ordering::Relaxed);
+            loop
+            {
+                debug_assert!(
+                    cur != 0,
+                    "dec_ref underflow on IS_ROOT header: obj_type={:?} self={:p}",
+                    self.obj_type,
+                    self,
+                );
+                let new = if cur == 1 { 1 } else { cur - 1 };
+                match self.ref_count.compare_exchange_weak(
+                    cur,
+                    new,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                {
+                    Ok(_) => return new,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
         debug_assert!(
             prev != 0,
@@ -193,13 +221,7 @@ impl KernelObjectHeader
             self,
             self.ancestor.load(Ordering::Relaxed),
         );
-        let new = prev - 1;
-        if new == 0 && (self.flags & HDR_FLAG_IS_ROOT) != 0
-        {
-            self.ref_count.store(1, Ordering::Release);
-            return 1;
-        }
-        new
+        prev - 1
     }
 }
 

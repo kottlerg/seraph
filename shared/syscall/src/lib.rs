@@ -526,7 +526,7 @@ unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
 
 /// Pack up to `MSG_CAP_SLOTS_MAX` `CSpace` slot indices into a single `u64`.
 ///
-/// Each index occupies 16 bits (sufficient for max `CSpace` size of 16384 slots).
+/// Each index occupies 16 bits (sufficient for max `CSpace` size of 14336 slots).
 /// Indices beyond `MSG_CAP_SLOTS_MAX` are silently ignored.
 ///
 /// Pass the result as arg4 of `SYS_IPC_CALL` or arg3 of `SYS_IPC_REPLY`.
@@ -772,7 +772,7 @@ pub fn signal_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 /// `RIGHTS_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_endpoint(frame_cap: u32) -> Result<u32, i64>
@@ -794,7 +794,7 @@ pub fn cap_create_endpoint(frame_cap: u32) -> Result<u32, i64>
 /// `RIGHTS_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_signal(frame_cap: u32) -> Result<u32, i64>
@@ -848,7 +848,7 @@ pub fn cap_create_aspace(frame_cap: u32, augment_target: u32, init_pages: u64) -
 /// one). `init_pages` must be `>= 1`.
 ///
 /// `augment_target`:
-/// - `0` → create new with `max_slots` (clamped to `[1, 16384]`); returns
+/// - `0` → create new with `max_slots` (clamped to `[1, 14336]`); returns
 ///   the new cap slot index.
 /// - non-zero → augment that `CSpace`'s growth pool; returns `0`. The
 ///   `max_slots` argument is ignored in augment mode.
@@ -890,7 +890,7 @@ pub fn cap_create_cspace(
 /// cap lacks `RETYPE` or sufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_thread(frame_cap: u32, aspace_cap: u32, cspace_cap: u32) -> Result<u32, i64>
@@ -1246,7 +1246,7 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 /// Returns a negative `i64` error code if either cap is invalid, the caller
 /// lacks sufficient rights, or the destination `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result<u32, i64>
@@ -1275,7 +1275,7 @@ pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result
 /// Returns a negative `i64` error code if the source cap is invalid or the
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 {
@@ -1298,7 +1298,7 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
 /// Returns a negative `i64` error code if the source cap is invalid, the token
 /// is zero, the source already has a token, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_derive_token(src_slot: u32, rights_mask: u64, token: u64) -> Result<u32, i64>
 {
@@ -1355,7 +1355,7 @@ pub fn cap_revoke(slot: u32) -> Result<(), i64>
 /// Returns a negative `i64` error code if either cap is invalid, the
 /// destination `CSpace` is full, or `dest_index` is already occupied.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn cap_move(src_slot: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<u32, i64>
 {
@@ -1502,7 +1502,7 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 /// `RIGHTS_RETYPE`, has insufficient `available_bytes`, `capacity` is out
 /// of range, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn event_queue_create(frame_cap: u32, capacity: u32) -> Result<u32, i64>
@@ -1597,7 +1597,7 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 /// Returns a negative `i64` error code if `frame_cap` is invalid, lacks
 /// `RIGHTS_RETYPE`, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
-// guaranteed to fit in u32 (max CSpace size is 16384).
+// guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn wait_set_create(frame_cap: u32) -> Result<u32, i64>

@@ -200,7 +200,7 @@ pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::cspace_grow: cap_create_endpoint failed")?;
 
     // Copy enough times to spill past the first slot page. ~70 copies
-    // forces at least one grow on a typical 64-slot page.
+    // forces at least one grow on an `L2_SIZE`-slot page (currently 56).
     let copies = 70usize;
     for _ in 0..copies
     {

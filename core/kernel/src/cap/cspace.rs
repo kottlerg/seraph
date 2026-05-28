@@ -77,6 +77,16 @@ struct CSpacePage
     slots: [CapabilitySlot; L2_SIZE],
 }
 
+// CSpacePage MUST fit in a single 4 KiB page — `alloc_slot_page` returns
+// `PAGE_SIZE`-aligned bytes and the kernel casts that to `*mut CSpacePage`
+// expecting one struct per allocation. A regression that grows
+// `CapabilitySlot` beyond the headroom would overflow the slab silently;
+// the assertion makes that a build error.
+const _: () = assert!(
+    core::mem::size_of::<CSpacePage>() <= crate::mm::PAGE_SIZE,
+    "CSpacePage exceeds PAGE_SIZE — reduce L2_SIZE or shrink CapabilitySlot"
+);
+
 // ── CSpace ────────────────────────────────────────────────────────────────────
 
 /// A capability space: a growable indexed collection of capability slots.
@@ -97,7 +107,7 @@ struct CSpacePage
 pub struct CSpace
 {
     id: CSpaceId,
-    /// Two-level directory; each Some entry is a 64-slot page.
+    /// Two-level directory; each Some entry is an `L2_SIZE`-slot page.
     /// Pages are stored as raw `NonNull` pointers so the heap-backed and
     /// retype-pool-backed paths can coexist with different reclamation
     /// semantics. The `kobj` field discriminates: null = heap (Drop walks

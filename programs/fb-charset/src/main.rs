@@ -173,7 +173,7 @@ fn emit_sequence(fb_write: u32, ipc_buf: *mut u64)
         "fb-charset: userspace framebuffer driver up\n",
     );
 
-    // 2. 7-bit ASCII sweep.
+    // 2. 7-bit ASCII printable (0x20..=0x7E).
     let _ = write_str(fb_write, ipc_buf, "---- ascii ----\n");
     let _ = write_str(
         fb_write,
@@ -183,31 +183,46 @@ fn emit_sequence(fb_write: u32, ipc_buf: *mut u64)
          `abcdefghijklmnopqrstuvwxyz{|}~\n",
     );
 
-    // 3. CP437 high-half: math, Greek, accented Latin.
+    // 3. CP437 high-half (0x80..=0xFF) via Unicode codepoints — the
+    //    reverse table covers all 128 entries. Grouped for readability;
+    //    every codepoint here resolves to its CP437 byte index.
     let _ = write_str(fb_write, ipc_buf, "---- cp437 high-half ----\n");
     let _ = write_str(
         fb_write,
         ipc_buf,
-        "math: ± × ÷ ¼ ½ ° µ ² ∙ √ ∞ ∩ ≈ ≡ ≤ ≥\n\
-         greek: α Γ Θ Σ Φ Ω δ π σ τ φ ε\n\
-         latin: à á â ä ç é ê ë ï î ñ ó ö ú ü ÿ Ä Å Æ É Ñ Ö Ü ß\n\
-         punct: ¡ ¿ « » £ ¥ ¢ © ®\n",
+        "latin lower: à á â ä å ç è é ê ë ì í î ï ñ ò ó ô ö ù ú û ü ÿ\n\
+         latin upper: Ä Å Æ Ç É Ñ Ö Ü ß æ\n\
+         math/sym:    ± × ÷ ¼ ½ ° µ ² ∙ √ ∞ ∩ ≈ ≡ ≤ ≥ ƒ ⌐ ⌠ ⌡ ⁿ ·\n\
+         greek:       α Γ Θ Σ Φ Ω δ π σ τ φ ε\n\
+         punct/curr:  ¡ ¿ « » £ ¥ ¢ ₧ ª º ¬ ⌂\n",
     );
 
-    // 4. Box-drawing — joined rows depend on adjacent-cell pixels
-    //    lining up across the right margin (font is 9-px wide).
+    // 4. Box drawing — every CP437 box-drawing glyph in joined-grid
+    //    form so the single-↔-double junctions read correctly.
+    //    Single-line: 11 glyphs. Double-line: 11. Mixed (double horiz
+    //    × single vert): 9. Mixed (single horiz × double vert): 9.
     let _ = write_str(fb_write, ipc_buf, "---- box drawing ----\n");
     let _ = write_str(
         fb_write,
         ipc_buf,
-        "┌──┬──┐\n\
-         │  │  │\n\
-         ├──┼──┤\n\
-         │  │  │\n\
-         └──┴──┘\n",
+        "single        double        mixed (d-h)   mixed (d-v)\n\
+         ┌──┬──┐      ╔══╦══╗      ╒══╤══╕      ╓──╥──╖\n\
+         │  │  │      ║  ║  ║      │  │  │      ║  ║  ║\n\
+         ├──┼──┤      ╠══╬══╣      ╞══╪══╡      ╟──╫──╢\n\
+         │  │  │      ║  ║  ║      │  │  │      ║  ║  ║\n\
+         └──┴──┘      ╚══╩══╝      ╘══╧══╛      ╙──╨──╜\n",
     );
 
-    // 5. Font extension: every slot in FONT_9X20_EXT.
+    // 5. Block / shading elements (CP437 0xB0..=0xB2, 0xDB..=0xDF, 0xFE).
+    let _ = write_str(fb_write, ipc_buf, "---- blocks ----\n");
+    let _ = write_str(
+        fb_write,
+        ipc_buf,
+        "shading: ░ ▒ ▓   blocks: █ ▀ ▄ ▌ ▐   filled-sq: ■\n",
+    );
+
+    // 6. Font extension: every slot in FONT_9X20_EXT (slot 0 / U+FFFD
+    //    is exercised separately in step 8).
     let _ = write_str(fb_write, ipc_buf, "---- font extension ----\n");
     let _ = write_str(
         fb_write,
@@ -217,7 +232,8 @@ fn emit_sequence(fb_write: u32, ipc_buf: *mut u64)
          arrows ← ↑ → ↓ ↔\n",
     );
 
-    // 6. ASCII fallback: codepoints not in CP437 or extension.
+    // 7. ASCII fallback: codepoints not in CP437 or extension that
+    //    expand to multi-char substitutes via shared/text::fallback.
     let _ = write_str(fb_write, ipc_buf, "---- ascii fallback ----\n");
     let _ = write_str(
         fb_write,
@@ -226,13 +242,13 @@ fn emit_sequence(fb_write: u32, ipc_buf: *mut u64)
          single-quote ‘x’ double-quote “y” bullet • angle ‹z›\n",
     );
 
-    // 7. Invalid UTF-8: a bare 0xC3 (lead byte of a 2-byte sequence)
+    // 8. Invalid UTF-8: a bare 0xC3 (lead byte of a 2-byte sequence)
     //    followed by an ASCII byte that the decoder will treat as a
     //    bad continuation. The driver renders U+FFFD then continues
     //    with the trailing 'X'.
     let _ = write_str(fb_write, ipc_buf, "---- invalid utf-8 ----\n");
     let _ = write_bytes(fb_write, ipc_buf, b"lone-lead: \xC3X end\n");
 
-    // 8. End marker.
+    // 9. End marker.
     let _ = write_str(fb_write, ipc_buf, "---- done ----\n");
 }

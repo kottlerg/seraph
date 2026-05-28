@@ -455,13 +455,32 @@ pub fn sum_frame_available_bytes(cspace: &cspace::CSpace) -> u64
 /// Maximum slots in the root `CSpace` (full two-level directory).
 const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
 
+/// Target slot capacity for the root `CSpace`'s initial slot-page pool.
+///
+/// `populate_cspace` plus [`mint_module_frame_caps`] mint ~150 caps into
+/// the root; userspace init then mints, copies, and derives ~700 more
+/// caps during memmgr / procmgr bootstrap (kernel-object inserts +
+/// per-RAM-Frame derive/copy chains in `finalize_memmgr`). Sized at
+/// 1024 slots so the pre-memmgr-handover footprint fits with headroom.
+///
+/// MUST be kept in sync with the boot footprint: a target below the
+/// peak boot slot count means `pre_allocate`'s grow loop hits an
+/// exhausted pool, the syscall errors out, and the userspace caller
+/// either retries indefinitely (e.g. `request_round` in a child) or
+/// surfaces an unexpected `OutOfMemory`. After memmgr is alive, further
+/// growth is bounded only by `ROOT_CSPACE_MAX_SLOTS`.
+#[cfg(not(test))]
+const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1024;
+
 /// Pages carved from `SEED_FRAME` for the root `CSpace` slab: page 0 is the
 /// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining
-/// pages seed the slot-page pool. `populate_cspace` plus
-/// [`mint_module_frame_caps`] mint ~150 caps into the root, occupying ~3
-/// slot pages (56 slots each); 16 pool pages = 1 KiB-cap headroom.
+/// pages seed the slot-page pool. Sized so the pool holds at least
+/// [`ROOT_CSPACE_INIT_SLOT_CAPACITY`] slots regardless of `L2_SIZE`
+/// (slots-per-page). The slot-0 reservation on page 0 costs one slot
+/// and is absorbed by rounding up.
 #[cfg(not(test))]
-const ROOT_CSPACE_INIT_PAGES: u64 = 17;
+const ROOT_CSPACE_INIT_PAGES: u64 =
+    1 + ROOT_CSPACE_INIT_SLOT_CAPACITY.div_ceil(cspace::L2_SIZE as u64);
 
 // ── Phase-7 seed Frame cap ───────────────────────────────────────────────────
 

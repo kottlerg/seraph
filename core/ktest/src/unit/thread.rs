@@ -22,10 +22,10 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete,
-    event_queue_create, event_recv, signal_send, signal_wait, signal_wait_timeout, system_info,
-    thread_bind_notification, thread_configure, thread_exit, thread_read_regs, thread_set_affinity,
-    thread_set_priority, thread_sleep, thread_start, thread_stop, thread_write_regs,
+    cap_copy, cap_create_signal, cap_delete, event_queue_create, event_recv, signal_send,
+    signal_wait, signal_wait_timeout, system_info, thread_bind_notification, thread_configure,
+    thread_exit, thread_read_regs, thread_set_affinity, thread_set_priority, thread_sleep,
+    thread_start, thread_stop, thread_write_regs,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -117,22 +117,14 @@ pub fn configure_start(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal for configure_start failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for configure_start failed")?;
-    let child_sig = cap_copy(sig, cs, 1 << 7) // SIGNAL right only
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::configure_start: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy for configure_start failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for configure_start failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE));
-    thread_configure(
-        th,
-        sender_entry as *const () as u64,
-        stack_top,
-        u64::from(child_sig),
-    )
-    .map_err(|_| "thread_configure failed")?;
-    thread_start(th).map_err(|_| "thread_start failed")?;
+    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+        .map_err(|_| "thread::configure_start: configure_and_start failed")?;
 
     let bits = signal_wait(sig).map_err(|_| "signal_wait after thread_start failed")?;
     if bits != 0xBEEF
@@ -140,9 +132,9 @@ pub fn configure_start(ctx: &TestContext) -> TestResult
         return Err("thread did not send expected bits (expected 0xBEEF)");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after configure_start failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after configure_start failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after configure_start failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after configure_start failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after configure_start failed")?;
     Ok(())
 }
 
@@ -169,25 +161,17 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_signal (ready) for stop_read_regs failed")?;
     let block = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal (block) for stop_read_regs failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for stop_read_regs failed")?;
-    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::stop_read_regs: spawn::new_child failed")?;
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy (ready) for stop_read_regs failed")?;
-    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+    let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for stop_read_regs failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for stop_read_regs failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_STOP_REGS));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    thread_configure(
-        th,
-        blocker_entry as *const () as u64,
-        stack_top,
-        blocker_arg,
-    )
-    .map_err(|_| "thread_configure for stop_read_regs failed")?;
-    thread_start(th).map_err(|_| "thread_start for stop_read_regs failed")?;
+    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+        .map_err(|_| "thread::stop_read_regs: configure_and_start failed")?;
 
     // Wait for the child to signal readiness then enter its blocking signal_wait.
     let ready_bits = signal_wait(ready).map_err(|_| "signal_wait (readiness) failed")?;
@@ -197,11 +181,11 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
     }
 
     // Stop the child while it is blocked — this gives a stable, non-racy TrapFrame.
-    thread_stop(th).map_err(|_| "thread_stop failed")?;
+    thread_stop(child.th).map_err(|_| "thread_stop failed")?;
 
     // Read the register file.
     let mut reg_buf = [0u8; BUF_SIZE];
-    let bytes = thread_read_regs(th, reg_buf.as_mut_ptr(), BUF_SIZE)
+    let bytes = thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF_SIZE)
         .map_err(|_| "thread_read_regs failed")?;
 
     if bytes != TRAP_FRAME_BYTES
@@ -220,10 +204,10 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
         return Err("rip/sepc is zero after thread_stop — TrapFrame not valid");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after stop_read_regs failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after stop_read_regs failed")?;
     cap_delete(ready).map_err(|_| "cap_delete ready after stop_read_regs failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after stop_read_regs failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after stop_read_regs failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after stop_read_regs failed")?;
     Ok(())
 }
 
@@ -236,42 +220,34 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_signal (ready) for double-stop test failed")?;
     let block = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal (block) for double-stop test failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for double-stop test failed")?;
-    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::stop_again_invalid_state: spawn::new_child failed")?;
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy (ready) for double-stop test failed")?;
-    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+    let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for double-stop test failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for double-stop test failed")?;
 
     // Tests run sequentially; STACK_STOP_REGS contents are stale but the child
     // from the previous test is stopped. Using STACK_WRITE_REGS for safety.
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    thread_configure(
-        th,
-        blocker_entry as *const () as u64,
-        stack_top,
-        blocker_arg,
-    )
-    .map_err(|_| "thread_configure for double-stop test failed")?;
-    thread_start(th).map_err(|_| "thread_start for double-stop test failed")?;
+    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+        .map_err(|_| "thread::stop_again_invalid_state: configure_and_start failed")?;
 
     let _ = signal_wait(ready); // Wait for readiness signal.
-    thread_stop(th).map_err(|_| "first thread_stop failed")?;
+    thread_stop(child.th).map_err(|_| "first thread_stop failed")?;
 
     // Second stop on a Stopped thread must return InvalidState.
-    let err = thread_stop(th);
+    let err = thread_stop(child.th);
     if err != Err(SyscallError::InvalidState as i64)
     {
         return Err("double thread_stop did not return InvalidState");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after double-stop test failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after double-stop test failed")?;
     cap_delete(ready).map_err(|_| "cap_delete ready after double-stop test failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after double-stop test failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after double-stop test failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after double-stop test failed")?;
     Ok(())
 }
 
@@ -289,45 +265,39 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_signal (ready) for write_regs_resume failed")?;
     let block = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal (block) for write_regs_resume failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for write_regs_resume failed")?;
-    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::write_regs_resume: spawn::new_child failed")?;
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy (ready) for write_regs_resume failed")?;
-    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+    let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for write_regs_resume failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for write_regs_resume failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    thread_configure(
-        th,
-        blocker_entry as *const () as u64,
-        stack_top,
-        blocker_arg,
-    )
-    .map_err(|_| "thread_configure for write_regs_resume failed")?;
-    thread_start(th).map_err(|_| "thread_start for write_regs_resume failed")?;
+    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+        .map_err(|_| "thread::write_regs_resume: configure_and_start failed")?;
 
     // Wait for readiness then stop while the child is blocked.
     let _ = signal_wait(ready);
-    thread_stop(th).map_err(|_| "thread_stop for write_regs_resume failed")?;
+    thread_stop(child.th).map_err(|_| "thread_stop for write_regs_resume failed")?;
 
     // Publish the signal cap phase2_entry will send through.
     PHASE2_SIG.store(child_ready, Ordering::Release);
 
     let mut reg_buf = [0u8; BUF_SIZE];
-    thread_read_regs(th, reg_buf.as_mut_ptr(), BUF_SIZE)
+    thread_read_regs(child.th, reg_buf.as_mut_ptr(), BUF_SIZE)
         .map_err(|_| "thread_read_regs for write_regs_resume failed")?;
 
     // Overwrite instruction pointer to redirect child to phase2_entry.
     let phase2_ptr = phase2_entry as *const () as u64;
     reg_buf[IP_OFFSET..IP_OFFSET + 8].copy_from_slice(&phase2_ptr.to_le_bytes());
 
-    thread_write_regs(th, reg_buf.as_ptr(), BUF_SIZE).map_err(|_| "thread_write_regs failed")?;
+    thread_write_regs(child.th, reg_buf.as_ptr(), BUF_SIZE)
+        .map_err(|_| "thread_write_regs failed")?;
 
-    // Resume — child runs phase2_entry and sends 0x2.
-    thread_start(th).map_err(|_| "thread_start (resume) for write_regs_resume failed")?;
+    // Resume — child runs phase2_entry and sends 0x2. The helper is single-shot,
+    // so the resume calls `thread_start` directly.
+    thread_start(child.th).map_err(|_| "thread_start (resume) for write_regs_resume failed")?;
 
     let bits = signal_wait(ready).map_err(|_| "signal_wait for phase2 confirmation failed")?;
     if bits != 0x2
@@ -335,10 +305,10 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
         return Err("phase2_entry did not send expected value 0x2 after write_regs resume");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after write_regs_resume failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after write_regs_resume failed")?;
     cap_delete(ready).map_err(|_| "cap_delete ready after write_regs_resume failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after write_regs_resume failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after write_regs_resume failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after write_regs_resume failed")?;
     Ok(())
 }
 
@@ -348,16 +318,14 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 /// `SchedControl` capability.
 pub fn set_priority_normal(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
-        .map_err(|_| "create_cspace for set_priority_normal failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for set_priority_normal failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_priority_normal: spawn::new_child failed")?;
 
     // Priority 5 is in the normal range (1–20); sched_cap = 0 → not required.
-    thread_set_priority(th, 5, 0).map_err(|_| "thread_set_priority(5) failed")?;
+    thread_set_priority(child.th, 5, 0).map_err(|_| "thread_set_priority(5) failed")?;
 
-    cap_delete(th).map_err(|_| "cap_delete th after set_priority_normal failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after set_priority_normal failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_normal failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_normal failed")?;
     Ok(())
 }
 
@@ -365,20 +333,18 @@ pub fn set_priority_normal(ctx: &TestContext) -> TestResult
 /// no `SchedControl` capability is provided.
 pub fn set_priority_elevated_no_cap_err(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
-        .map_err(|_| "create_cspace for elevated_no_cap test failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for elevated_no_cap test failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_priority_elevated_no_cap_err: spawn::new_child failed")?;
 
     // Priority 25 requires a SchedControl cap; passing 0 must fail.
-    let err = thread_set_priority(th, 25, 0);
+    let err = thread_set_priority(child.th, 25, 0);
     if err.is_ok()
     {
         return Err("thread_set_priority(25, no_cap) should fail without SchedControl");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after elevated_no_cap test failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after elevated_no_cap test failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after elevated_no_cap test failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after elevated_no_cap test failed")?;
     Ok(())
 }
 
@@ -390,16 +356,14 @@ pub fn set_priority_elevated_no_cap_err(ctx: &TestContext) -> TestResult
 /// (reports Ok — the test was not applicable, not a failure).
 pub fn set_priority_elevated_with_cap(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
-        .map_err(|_| "create_cspace for elevated_with_cap test failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for elevated_with_cap test failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_priority_elevated_with_cap: spawn::new_child failed")?;
 
     // Scan for a SchedControl cap in the initial capability set.
     let mut found = false;
     for slot in 1..ctx.aspace_cap + 20
     {
-        if thread_set_priority(th, 25, slot).is_ok()
+        if thread_set_priority(child.th, 25, slot).is_ok()
         {
             found = true;
             break;
@@ -411,8 +375,8 @@ pub fn set_priority_elevated_with_cap(ctx: &TestContext) -> TestResult
         crate::log("ktest: thread::set_priority_elevated_with_cap SKIP (no SchedControl cap)");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after elevated_with_cap test failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after elevated_with_cap test failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after elevated_with_cap test failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after elevated_with_cap test failed")?;
     Ok(())
 }
 
@@ -421,36 +385,32 @@ pub fn set_priority_elevated_with_cap(ctx: &TestContext) -> TestResult
 /// `thread_set_affinity` with a valid CPU ID succeeds.
 pub fn set_affinity_valid(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
-        .map_err(|_| "create_cspace for set_affinity_valid failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for set_affinity_valid failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_affinity_valid: spawn::new_child failed")?;
 
     // CPU 0 is always valid on any boot configuration.
-    thread_set_affinity(th, 0).map_err(|_| "thread_set_affinity(0) failed")?;
+    thread_set_affinity(child.th, 0).map_err(|_| "thread_set_affinity(0) failed")?;
 
-    cap_delete(th).map_err(|_| "cap_delete th after set_affinity_valid failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after set_affinity_valid failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after set_affinity_valid failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_affinity_valid failed")?;
     Ok(())
 }
 
 /// `thread_set_affinity` with an out-of-range CPU ID returns `InvalidArgument`.
 pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
-        .map_err(|_| "create_cspace for set_affinity_invalid test failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for set_affinity_invalid test failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_affinity_invalid_err: spawn::new_child failed")?;
 
     // CPU 999 is beyond any reasonable CPU count.
-    let err = thread_set_affinity(th, 999);
+    let err = thread_set_affinity(child.th, 999);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("thread_set_affinity(999) did not return InvalidArgument");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after set_affinity_invalid test failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after set_affinity_invalid test failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after set_affinity_invalid test failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_affinity_invalid test failed")?;
     Ok(())
 }
 
@@ -466,38 +426,32 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
         .map_err(|_| "create_signal (ready) for configure_running_thread_err failed")?;
     let block = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal (block) for configure_running_thread_err failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for configure_running_thread_err failed")?;
-    let child_ready = cap_copy(ready, cs, RIGHTS_SIGNAL)
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::configure_running_thread_err: spawn::new_child failed")?;
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy (ready) for configure_running_thread_err failed")?;
-    let child_block = cap_copy(block, cs, RIGHTS_WAIT)
+    let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for configure_running_thread_err failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for configure_running_thread_err failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_ERR));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
-    thread_configure(
-        th,
-        blocker_entry as *const () as u64,
-        stack_top,
-        blocker_arg,
-    )
-    .map_err(|_| "first thread_configure failed")?;
-    thread_start(th).map_err(|_| "thread_start failed")?;
+    crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
+        .map_err(|_| "thread::configure_running_thread_err: configure_and_start failed")?;
 
     // Wait for the child to signal readiness (it is now Running or Blocked).
     signal_wait(ready).map_err(|_| "signal_wait for readiness failed")?;
 
-    // Attempting to configure a non-Created thread must fail.
-    let err = thread_configure(th, blocker_entry as *const () as u64, stack_top, 0);
+    // Attempting to configure a non-Created thread must fail. The helper is
+    // single-shot for the started-from-Created path; re-configuring uses the
+    // raw syscall on purpose to exercise the error case.
+    let err = thread_configure(child.th, blocker_entry as *const () as u64, stack_top, 0);
 
     // Stop the blocked child before cleanup.
-    thread_stop(th).ok();
-    cap_delete(th).map_err(|_| "cap_delete th after configure_running_thread_err failed")?;
+    thread_stop(child.th).ok();
+    cap_delete(child.th).map_err(|_| "cap_delete th after configure_running_thread_err failed")?;
     cap_delete(ready).map_err(|_| "cap_delete ready after configure_running_thread_err failed")?;
     cap_delete(block).map_err(|_| "cap_delete block after configure_running_thread_err failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after configure_running_thread_err failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after configure_running_thread_err failed")?;
 
     if err.is_ok()
     {
@@ -514,19 +468,17 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 /// a userspace thread.
 pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
-        .map_err(|_| "create_cspace for set_priority_zero_err failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for set_priority_zero_err failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_priority_zero_err: spawn::new_child failed")?;
 
-    let err = thread_set_priority(th, 0, 0);
+    let err = thread_set_priority(child.th, 0, 0);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("thread_set_priority(0) did not return InvalidArgument");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after set_priority_zero_err failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after set_priority_zero_err failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_zero_err failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_zero_err failed")?;
     Ok(())
 }
 
@@ -535,19 +487,17 @@ pub fn set_priority_zero_err(ctx: &TestContext) -> TestResult
 /// Priority 31 is reserved and may not be assigned to any thread.
 pub fn set_priority_31_err(ctx: &TestContext) -> TestResult
 {
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
-        .map_err(|_| "create_cspace for set_priority_31_err failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for set_priority_31_err failed")?;
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::set_priority_31_err: spawn::new_child failed")?;
 
-    let err = thread_set_priority(th, 31, 0);
+    let err = thread_set_priority(child.th, 31, 0);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("thread_set_priority(31) did not return InvalidArgument");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after set_priority_31_err failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after set_priority_31_err failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_31_err failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_31_err failed")?;
     Ok(())
 }
 
@@ -571,25 +521,21 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal for affinity_bind_cpu1 failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for affinity_bind_cpu1 failed")?;
-    let child_sig = cap_copy(sig, cs, 1 << 7) // SIGNAL right only
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::affinity_bind_cpu1: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy for affinity_bind_cpu1 failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for affinity_bind_cpu1 failed")?;
 
     // Bind to CPU 1 before starting.
-    thread_set_affinity(th, 1).map_err(|_| "thread_set_affinity(1) failed")?;
-
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_CPU1));
-    thread_configure(
-        th,
-        affinity_sender_entry as *const () as u64,
+    crate::spawn::configure_and_start_pinned(
+        &child,
+        affinity_sender_entry,
         stack_top,
         u64::from(child_sig),
+        1,
     )
-    .map_err(|_| "thread_configure for affinity_bind_cpu1 failed")?;
-    thread_start(th).map_err(|_| "thread_start for affinity_bind_cpu1 failed")?;
+    .map_err(|_| "thread::affinity_bind_cpu1: configure_and_start_pinned failed")?;
 
     let bits = signal_wait(sig).map_err(|_| "signal_wait for affinity_bind_cpu1 failed")?;
     if bits != 0xC1A1
@@ -597,9 +543,9 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
         return Err("affinity thread did not send expected bits (expected 0xC1A1)");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after affinity_bind_cpu1 failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after affinity_bind_cpu1 failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_bind_cpu1 failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after affinity_bind_cpu1 failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after affinity_bind_cpu1 failed")?;
     Ok(())
 }
 
@@ -666,40 +612,37 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal for affinity_migrate_ready_queued failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for affinity_migrate_ready_queued failed")?;
-    let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL)
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::affinity_migrate_ready_queued: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy for affinity_migrate_ready_queued failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for affinity_migrate_ready_queued failed")?;
-
-    // Pin to CPU 0 initially so T's first enqueue lands on CPU 0's run queue.
-    thread_set_affinity(th, 0).map_err(|_| "initial thread_set_affinity(0) failed")?;
 
     // Priority 1 (strict-lower than the parent's INIT_PRIORITY of 15) so
     // CPU 0's `dequeue_highest` always selects the parent over T while
     // both are Ready/Running there. Priority 1 is below
     // SCHED_ELEVATED_MIN so no SchedControl cap is required
-    // (sched_idx = 0).
-    thread_set_priority(th, 1, 0)
+    // (sched_idx = 0). Must be set before `thread_start`.
+    thread_set_priority(child.th, 1, 0)
         .map_err(|_| "thread_set_priority(1) for affinity_migrate_ready_queued failed")?;
 
+    // Pin to CPU 0 initially so T's first enqueue lands on CPU 0's run queue.
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_READY));
-    thread_configure(
-        th,
-        report_cpu_entry as *const () as u64,
+    crate::spawn::configure_and_start_pinned(
+        &child,
+        report_cpu_entry,
         stack_top,
         u64::from(child_sig),
+        0,
     )
-    .map_err(|_| "thread_configure for affinity_migrate_ready_queued failed")?;
-    thread_start(th).map_err(|_| "thread_start for affinity_migrate_ready_queued failed")?;
+    .map_err(|_| "thread::affinity_migrate_ready_queued: configure_and_start_pinned failed")?;
 
     // T is Ready, queued on CPU 0 at priority 1; the parent is Running on
     // CPU 0 at INIT_PRIORITY=15 (pinned by the outer wrapper), so no
     // scheduling event can dispatch T here. Switch T's affinity to CPU 1
     // — the active-migration path must dequeue T from CPU 0 and re-enqueue
     // it on CPU 1.
-    thread_set_affinity(th, 1).map_err(|_| "active migration thread_set_affinity(1) failed")?;
+    thread_set_affinity(child.th, 1)
+        .map_err(|_| "active migration thread_set_affinity(1) failed")?;
 
     // Block on the signal: parent leaves CPU 0, CPU 1 runs T which reports
     // its actual CPU id back through the signal bits. `report_cpu_entry`
@@ -721,9 +664,9 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
         return Err("Ready-thread migration did not land on CPU 1");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after affinity_migrate_ready_queued failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after affinity_migrate_ready_queued failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_migrate_ready_queued failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after affinity_migrate_ready_queued failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after affinity_migrate_ready_queued failed")?;
     Ok(())
 }
 
@@ -755,24 +698,20 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal for affinity_migrate_running failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for affinity_migrate_running failed")?;
-    let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL)
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::affinity_migrate_running: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy for affinity_migrate_running failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for affinity_migrate_running failed")?;
-
-    thread_set_affinity(th, 1).map_err(|_| "thread_set_affinity(1) failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_RUNNING));
-    thread_configure(
-        th,
-        migrate_spinner_entry as *const () as u64,
+    crate::spawn::configure_and_start_pinned(
+        &child,
+        migrate_spinner_entry,
         stack_top,
         u64::from(child_sig),
+        1,
     )
-    .map_err(|_| "thread_configure for affinity_migrate_running failed")?;
-    thread_start(th).map_err(|_| "thread_start for affinity_migrate_running failed")?;
+    .map_err(|_| "thread::affinity_migrate_running: configure_and_start_pinned failed")?;
 
     // Wait until T has been scheduled on CPU 1 and reported its CPU.
     let mut spins: u32 = 0;
@@ -788,7 +727,7 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     }
 
     // Trigger migration of a Running thread.
-    thread_set_affinity(th, 0).map_err(|_| "migration thread_set_affinity(0) failed")?;
+    thread_set_affinity(child.th, 0).map_err(|_| "migration thread_set_affinity(0) failed")?;
 
     // Wait up to a generous bound (≫ 1 timer tick) for the migration to land.
     spins = 0;
@@ -807,9 +746,9 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
     signal_wait(sig).map_err(|_| "signal_wait for migrate_spinner exit failed")?;
 
-    cap_delete(th).map_err(|_| "cap_delete th after affinity_migrate_running failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after affinity_migrate_running failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_migrate_running failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after affinity_migrate_running failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after affinity_migrate_running failed")?;
     Ok(())
 }
 
@@ -836,29 +775,24 @@ fn balance_spawn_spinners(
         BALANCE_OBSERVED_CPU[i].store(u32::MAX, Ordering::Relaxed);
         let sig = cap_create_signal(ctx.memory_frame_base)
             .map_err(|_| "balance: cap_create_signal failed")?;
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-            .map_err(|_| "balance: cap_create_cspace failed")?;
-        let child_sig = cap_copy(sig, cs, RIGHTS_SIGNAL).map_err(|_| "balance: cap_copy failed")?;
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-            .map_err(|_| "balance: cap_create_thread failed")?;
+        let child = crate::spawn::new_child(ctx).map_err(|_| "balance: spawn::new_child failed")?;
+        let child_sig =
+            cap_copy(sig, child.cs, RIGHTS_SIGNAL).map_err(|_| "balance: cap_copy failed")?;
 
-        // Initial pinning forces enqueue onto `initial_cpu`.
-        thread_set_affinity(th, initial_cpu)
-            .map_err(|_| "balance: initial thread_set_affinity failed")?;
-
+        // Initial pinning to `initial_cpu` forces the first enqueue there.
         // SAFETY: per-spinner stack slot, no aliasing.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
         let arg = (i as u64) << 32 | u64::from(child_sig);
-        thread_configure(
-            th,
-            balance_spinner_entry as *const () as u64,
+        crate::spawn::configure_and_start_pinned(
+            &child,
+            balance_spinner_entry,
             stack_top,
             arg,
+            initial_cpu,
         )
-        .map_err(|_| "balance: thread_configure failed")?;
-        thread_start(th).map_err(|_| "balance: thread_start failed")?;
+        .map_err(|_| "balance: configure_and_start_pinned failed")?;
 
-        triples[i] = (th, cs, sig);
+        triples[i] = (child.th, child.cs, sig);
     }
 
     // Once started, relax (or fully clear) the affinity. Active migration
@@ -1021,25 +955,21 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal for affinity_respected failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for affinity_respected failed")?;
-    let child_sig = cap_copy(sig, cs, 1 << 7) // SIGNAL right only
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::affinity_respected: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy for affinity_respected failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for affinity_respected failed")?;
 
     // Bind to CPU 1 before starting.
-    thread_set_affinity(th, 1).map_err(|_| "thread_set_affinity(1) failed")?;
-
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_RESPECTED));
-    thread_configure(
-        th,
-        affinity_sender_entry as *const () as u64,
+    crate::spawn::configure_and_start_pinned(
+        &child,
+        affinity_sender_entry,
         stack_top,
         u64::from(child_sig),
+        1,
     )
-    .map_err(|_| "thread_configure for affinity_respected failed")?;
-    thread_start(th).map_err(|_| "thread_start for affinity_respected failed")?;
+    .map_err(|_| "thread::affinity_respected: configure_and_start_pinned failed")?;
 
     // If the thread successfully signals back, affinity routing worked.
     let bits = signal_wait(sig).map_err(|_| "signal_wait for affinity_respected failed")?;
@@ -1048,9 +978,9 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
         return Err("affinity thread did not send expected bits (expected 0xC1A1)");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after affinity_respected failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after affinity_respected failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_respected failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after affinity_respected failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after affinity_respected failed")?;
     Ok(())
 }
 
@@ -1078,25 +1008,17 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
 
     let sig = cap_create_signal(ctx.memory_frame_base)
         .map_err(|_| "create_signal for default_affinity_bsp failed")?;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
-        .map_err(|_| "create_cspace for default_affinity_bsp failed")?;
-    let child_sig = cap_copy(sig, cs, 1 << 7) // SIGNAL right only
+    let child = crate::spawn::new_child(ctx)
+        .map_err(|_| "thread::default_affinity_bsp: spawn::new_child failed")?;
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
         .map_err(|_| "cap_copy for default_affinity_bsp failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
-        .map_err(|_| "cap_create_thread for default_affinity_bsp failed")?;
 
     // Do NOT set affinity — leave it at default (AFFINITY_ANY).
     // Phase D should route this to CPU 0.
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DEFAULT_AFFINITY));
-    thread_configure(
-        th,
-        sender_entry as *const () as u64,
-        stack_top,
-        u64::from(child_sig),
-    )
-    .map_err(|_| "thread_configure for default_affinity_bsp failed")?;
-    thread_start(th).map_err(|_| "thread_start for default_affinity_bsp failed")?;
+    crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
+        .map_err(|_| "thread::default_affinity_bsp: configure_and_start failed")?;
 
     // If the thread successfully signals back, default affinity routing worked.
     let bits = signal_wait(sig).map_err(|_| "signal_wait for default_affinity_bsp failed")?;
@@ -1105,9 +1027,9 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
         return Err("default affinity thread did not send expected bits (expected 0xBEEF)");
     }
 
-    cap_delete(th).map_err(|_| "cap_delete th after default_affinity_bsp failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after default_affinity_bsp failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after default_affinity_bsp failed")?;
-    cap_delete(cs).map_err(|_| "cap_delete cs after default_affinity_bsp failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after default_affinity_bsp failed")?;
     Ok(())
 }
 

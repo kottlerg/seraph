@@ -421,6 +421,21 @@ static mut SLEEP_LIST: [*mut ThreadControlBlock; MAX_SLEEPING] =
 #[cfg(not(test))]
 static mut SLEEP_COUNT: usize = 0;
 
+/// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
+/// dropping `SLEEP_LIST_LOCK` and waking them.
+///
+/// Kept off the stack deliberately: at `MAX_SLEEPING * 8 = 1 KiB` a
+/// stack-local snapshot inflated the frame of `timer_tick` (which inlines
+/// `sleep_check_wakeups`). `timer_tick` runs in the timer ISR (`isr_timer`,
+/// IST=0) on the kernel stack of whatever thread the tick interrupted; the
+/// oversized frame overran that stack's saved return-address chain, faulting
+/// with `rip=0` on the next `ret`. `sleep_check_wakeups` runs only on CPU0
+/// (see `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it
+/// is non-reentrant and this single buffer needs no lock of its own.
+#[cfg(not(test))]
+static mut EXPIRED_SCRATCH: [*mut ThreadControlBlock; MAX_SLEEPING] =
+    [core::ptr::null_mut(); MAX_SLEEPING];
+
 /// Add a thread to the sleep list. The TCB must already have
 /// `sleep_deadline` set and state = Blocked.
 ///
@@ -502,10 +517,14 @@ pub fn sleep_check_wakeups()
 {
     let now = crate::arch::current::timer::current_tick();
 
-    // Collect expired threads under the lock. Do not touch state yet — for
-    // signal-wait-timeout entries we need to take the signal's lock first.
-    let mut expired: [*mut ThreadControlBlock; MAX_SLEEPING] =
-        [core::ptr::null_mut(); MAX_SLEEPING];
+    // Collect expired threads under the lock into the CPU0-timer-private
+    // scratch buffer. Do not touch state yet — for signal-wait-timeout entries
+    // we need to take the signal's lock first.
+    // SAFETY: runs only on CPU0 behind an interrupt gate (non-reentrant), so
+    // this &mut borrow of EXPIRED_SCRATCH is exclusive for the call. Only
+    // entries [0, n) are written below and read back; stale tail entries are
+    // never observed.
+    let expired = unsafe { &mut *core::ptr::addr_of_mut!(EXPIRED_SCRATCH) };
     let mut n = 0usize;
 
     // SAFETY: lock serialises all sleep list access.

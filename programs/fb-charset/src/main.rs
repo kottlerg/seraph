@@ -189,7 +189,7 @@ fn emit_sequence(fb_write: u32, ipc_buf: *mut u64)
         fb_write,
         ipc_buf,
         "math: ± × ÷ ¼ ½ ° µ ² ∙ √ ∞ ∩ ≈ ≡ ≤ ≥\n\
-         greek: α β Γ Δ Θ Σ Φ Ω δ π σ τ φ ε\n\
+         greek: α Γ Θ Σ Φ Ω δ π σ τ φ ε\n\
          latin: à á â ä ç é ê ë ï î ñ ó ö ú ü ÿ Ä Å Æ É Ñ Ö Ü ß\n\
          punct: ¡ ¿ « » £ ¥ ¢ © ®\n",
     );
@@ -213,7 +213,8 @@ fn emit_sequence(fb_write: u32, ipc_buf: *mut u64)
         fb_write,
         ipc_buf,
         "em-dash — en-dash – nb-hyphen ‑ apos ’ ellipsis …\n\
-         times × minus − arrows ⇒ ⇔ neq ≠ ≪ ≫ in ∈ check ✓\n",
+         times × minus − dbl-arrows ⇒ ⇔ neq ≠ ≪ ≫ in ∈ check ✓\n\
+         arrows ← ↑ → ↓ ↔\n",
     );
 
     // 6. ASCII fallback: codepoints not in CP437 or extension.
@@ -221,7 +222,7 @@ fn emit_sequence(fb_write: u32, ipc_buf: *mut u64)
     let _ = write_str(
         fb_write,
         ipc_buf,
-        "(c)© (r)® (tm)™ left-right ↔ left ← up ↑ down ↓ right →\n\
+        "(c)© (r)® (tm)™\n\
          single-quote ‘x’ double-quote “y” bullet • angle ‹z›\n",
     );
 

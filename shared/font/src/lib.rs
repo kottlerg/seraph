@@ -548,7 +548,7 @@ pub static FONT_9X20: [u16; 5120] = [
 ];
 
 /// Number of extension glyphs in [`FONT_9X20_EXT`].
-pub const FONT_9X20_EXT_COUNT: usize = 15;
+pub const FONT_9X20_EXT_COUNT: usize = 20;
 
 /// Extension bitmap font for codepoints used by the codebase but not
 /// present in CP437. Same `[u16; 20]` encoding as [`FONT_9X20`]: each
@@ -605,10 +605,26 @@ pub static FONT_9X20_EXT: [u16; FONT_9X20_EXT_COUNT * 20] = [
     // slot 14 — U+2713 CHECK MARK (✓)
     0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0080, 0x0100, 0x8200, 0x4400, 0x2800,
     0x1000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    // slot 15 — U+2190 LEFTWARDS ARROW (←) tip-left, shaft right
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x2000, 0x4000,
+    0xFF80, 0x4000, 0x2000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    // slot 16 — U+2191 UPWARDS ARROW (↑) tip-top, shaft down
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0800, 0x1400, 0x2200, 0x0800, 0x0800, 0x0800,
+    0x0800, 0x0800, 0x0800, 0x0800, 0x0000, 0x0000, 0x0000, 0x0000,
+    // slot 17 — U+2192 RIGHTWARDS ARROW (→) tip-right, shaft left
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0200, 0x0100,
+    0xFF80, 0x0100, 0x0200, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    // slot 18 — U+2193 DOWNWARDS ARROW (↓) tip-bottom, shaft up
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0800, 0x0800, 0x0800, 0x0800, 0x0800, 0x0800,
+    0x0800, 0x2200, 0x1400, 0x0800, 0x0000, 0x0000, 0x0000, 0x0000,
+    // slot 19 — U+2194 LEFT RIGHT ARROW (↔) tips both ends
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x2200, 0x4100,
+    0xFF80, 0x4100, 0x2200, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
 ];
 
 /// Sorted Unicode → [`FONT_9X20_EXT`] slot mapping. Binary-searched by
-/// the `shared/text` crate's `ext_glyph_index`.
+/// the `shared/text` crate's `ext_glyph_index`; entries MUST stay in
+/// ascending codepoint order.
 pub static FONT_9X20_EXT_MAP: &[(u32, u32)] = &[
     (0x00D7, 6),  // × MULTIPLICATION SIGN
     (0x2011, 3),  // ‑ NON-BREAKING HYPHEN
@@ -616,10 +632,15 @@ pub static FONT_9X20_EXT_MAP: &[(u32, u32)] = &[
     (0x2014, 1),  // — EM DASH
     (0x2019, 4),  // ’ RIGHT SINGLE QUOTATION MARK
     (0x2026, 5),  // … HORIZONTAL ELLIPSIS
-    (0x2208, 13), // ∈ ELEMENT OF
-    (0x2212, 7),  // − MINUS SIGN
+    (0x2190, 15), // ← LEFTWARDS ARROW
+    (0x2191, 16), // ↑ UPWARDS ARROW
+    (0x2192, 17), // → RIGHTWARDS ARROW
+    (0x2193, 18), // ↓ DOWNWARDS ARROW
+    (0x2194, 19), // ↔ LEFT RIGHT ARROW
     (0x21D2, 8),  // ⇒ RIGHTWARDS DOUBLE ARROW
     (0x21D4, 9),  // ⇔ LEFT RIGHT DOUBLE ARROW
+    (0x2208, 13), // ∈ ELEMENT OF
+    (0x2212, 7),  // − MINUS SIGN
     (0x2260, 10), // ≠ NOT EQUAL TO
     (0x226A, 11), // ≪ MUCH LESS-THAN
     (0x226B, 12), // ≫ MUCH GREATER-THAN

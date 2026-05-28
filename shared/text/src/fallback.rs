@@ -9,7 +9,10 @@
 //! Returns a slice of ASCII bytes ( `0x00..=0x7F` ) that the caller is
 //! expected to feed back through the renderer one byte at a time, each
 //! resolving via the CP437 fast path. Lets multi-character substitutes
-//! ("(C)", "<->", "(TM)") expand naturally on the rendered surface.
+//! ("(C)", "(TM)") expand naturally on the rendered surface — useful
+//! for symbols whose ASCII transliteration is conventional and worth
+//! a multi-cell expansion (e.g. `©` → `(C)`) but not common enough to
+//! claim a font slot.
 
 /// Returns the ASCII fallback for `cp`, or `None` if no entry exists.
 #[must_use]
@@ -36,9 +39,4 @@ static TABLE: &[(u32, &[u8])] = &[
     (0x2039, b"<"),    // ‹
     (0x203A, b">"),    // ›
     (0x2122, b"(TM)"), // ™
-    (0x2190, b"<-"),   // ←
-    (0x2191, b"^"),    // ↑
-    (0x2192, b"->"),   // →
-    (0x2193, b"v"),    // ↓
-    (0x2194, b"<->"),  // ↔
 ];

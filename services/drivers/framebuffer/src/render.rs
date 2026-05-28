@@ -3,18 +3,21 @@
 
 // drivers/framebuffer/src/render.rs
 
-//! Framebuffer text renderer.
+//! Framebuffer text renderer (bitmap-input).
 //!
-//! Ported from `core/kernel/src/framebuffer.rs` (kept there as the
-//! early-boot / panic console fallback). Renders glyphs from the
-//! embedded 9×20 bitmap font into a linear RGBX/BGRX framebuffer.
-//! Tracks cursor position, handles line wrap, and scrolls when the
-//! last row is filled. The kernel renderer's `rebase` helper is
-//! omitted — the userspace driver maps once at bootstrap and never
-//! re-maps in flight.
+//! Blits caller-supplied 9×20 glyph bitmaps into a linear RGBX/BGRX
+//! framebuffer, tracks cursor position, wraps at the right margin, and
+//! scrolls when the last row is filled. Codepoint → bitmap resolution
+//! happens in `shared/text::render_codepoint`; this module is purely a
+//! pixel back-end.
+//!
+//! The kernel renderer (`core/kernel/src/framebuffer.rs`) remains
+//! byte-indexed against `font::FONT_9X20` for the early-boot / panic
+//! console; this renderer takes bitmaps so the UTF-8 + font-extension
+//! path can land without forcing the kernel onto the same stack.
 
 use boot_protocol::{FramebufferInfo, PixelFormat};
-use font::{FONT_9X20, GLYPH_HEIGHT, GLYPH_WIDTH};
+use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 
 /// Framebuffer text renderer.
 pub struct FramebufferWriter
@@ -67,90 +70,51 @@ impl FramebufferWriter
         Some(writer)
     }
 
-    /// Write one byte to the framebuffer, advancing the cursor.
-    ///
-    /// Handles `\n` (newline + carriage return), `\r` (carriage return),
-    /// and printable ASCII/Latin-1. Non-renderable bytes are silently ignored.
+    /// Advance the cursor to the start of the next line, scrolling if
+    /// the last row is filled.
     ///
     /// # Safety
     /// The framebuffer pointer must remain valid and writable.
-    pub unsafe fn write_byte(&mut self, byte: u8)
+    pub unsafe fn newline(&mut self)
     {
-        match byte
+        self.col = 0;
+        self.row += 1;
+        if self.row >= self.max_rows
         {
-            b'\n' =>
-            {
-                self.col = 0;
-                self.row += 1;
-                if self.row >= self.max_rows
-                {
-                    // SAFETY: framebuffer pointer is valid per struct invariant.
-                    unsafe {
-                        self.scroll();
-                    }
-                }
-            }
-            b'\r' =>
-            {
-                self.col = 0;
-            }
-            0x20..=0xFF =>
-            {
-                // SAFETY: framebuffer is valid; cursor is within bounds.
-                unsafe {
-                    self.draw_glyph(byte);
-                }
-                self.col += 1;
-                if self.col >= self.max_cols
-                {
-                    self.col = 0;
-                    self.row += 1;
-                    if self.row >= self.max_rows
-                    {
-                        // SAFETY: framebuffer pointer is valid.
-                        unsafe {
-                            self.scroll();
-                        }
-                    }
-                }
-            }
-            _ =>
-            {}
-        }
-    }
-
-    /// Clear the entire framebuffer to black.
-    ///
-    /// # Safety
-    /// Framebuffer pointer must be valid and writable.
-    unsafe fn clear(&mut self)
-    {
-        let total = (self.stride * self.height) as usize;
-        let mut p = self.base;
-        for _ in 0..total
-        {
-            // SAFETY: p is within the framebuffer allocation; stride * height bounds total bytes.
+            // SAFETY: framebuffer pointer is valid per struct invariant.
             unsafe {
-                core::ptr::write_volatile(p, 0);
+                self.scroll();
             }
-            // SAFETY: p remains within framebuffer bounds throughout loop.
-            p = unsafe { p.add(1) };
         }
     }
 
-    /// Draw glyph for `byte` at current cursor position.
+    /// Return the cursor to column 0 of the current row.
+    pub fn carriage_return(&mut self)
+    {
+        self.col = 0;
+    }
+
+    /// Blit a 9×20 glyph bitmap at the current cursor and advance one
+    /// column. The bitmap encoding matches `font::FONT_9X20`: 20 u16
+    /// scanlines, bits 15..=7 = the 9 pixels (MSB leftmost).
+    ///
+    /// # Panics
+    /// Panics if `bitmap.len() < 20`. Callers should pass a slice taken
+    /// from `font::FONT_9X20` or `font::FONT_9X20_EXT` of exactly 20
+    /// entries; the bound is checked here so the inner blit loop can
+    /// elide it.
     ///
     /// # Safety
-    /// Framebuffer pointer must be valid; cursor must be within bounds.
-    unsafe fn draw_glyph(&mut self, byte: u8)
+    /// The framebuffer pointer must remain valid and writable.
+    pub unsafe fn draw_glyph_bitmap(&mut self, bitmap: &[u16])
     {
-        let glyph_idx = byte as usize;
+        assert!(bitmap.len() >= GLYPH_HEIGHT as usize);
+
         let pixel_x = self.col * GLYPH_WIDTH;
         let pixel_y = self.row * GLYPH_HEIGHT;
 
-        for row_idx in 0..(GLYPH_HEIGHT as usize)
+        for (row_idx, &bits) in bitmap.iter().enumerate().take(GLYPH_HEIGHT as usize)
         {
-            let bits = FONT_9X20[glyph_idx * (GLYPH_HEIGHT as usize) + row_idx];
             let scan_y = pixel_y as usize + row_idx;
             let row_base = scan_y * self.stride as usize;
 
@@ -187,6 +151,34 @@ impl FramebufferWriter
                     }
                 }
             }
+        }
+
+        self.col += 1;
+        if self.col >= self.max_cols
+        {
+            // SAFETY: framebuffer pointer is valid per struct invariant.
+            unsafe {
+                self.newline();
+            }
+        }
+    }
+
+    /// Clear the entire framebuffer to black.
+    ///
+    /// # Safety
+    /// Framebuffer pointer must be valid and writable.
+    unsafe fn clear(&mut self)
+    {
+        let total = (self.stride * self.height) as usize;
+        let mut p = self.base;
+        for _ in 0..total
+        {
+            // SAFETY: p is within the framebuffer allocation; stride * height bounds total bytes.
+            unsafe {
+                core::ptr::write_volatile(p, 0);
+            }
+            // SAFETY: p remains within framebuffer bounds throughout loop.
+            p = unsafe { p.add(1) };
         }
     }
 

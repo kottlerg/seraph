@@ -113,6 +113,7 @@ pub enum BuildComponent
     Timed,
     Hello,
     HelloTester,
+    FbCharset,
     Fsbench,
     Pipefault,
     Stackoverflow,

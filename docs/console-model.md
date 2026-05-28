@@ -50,15 +50,17 @@ earlier ones, which remain as fallbacks.
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace
    framebuffer writers route bytes to it via `fb_labels::FB_WRITE_BYTES`.
-   v1 has one consumer: an inline acceptance smoke print from init
-   (`service::smoke_print_framebuffer`) that emits a single marker after
-   devmgr bring-up to verify the end-to-end path. Production consumers
-   (terminal, shell, compositor) arrive in follow-up issues; they will
-   resolve the driver's write endpoint through devmgr's
-   `devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`. v1 exposes one verb only —
-   `FB_WRITE_BYTES` — interpreting `\n`/`\r` and printable ASCII/Latin-1
-   only; graphical primitives are listed under the driver README's
-   "Planned future surface".
+   v1 has one consumer: `programs/fb-charset`, launched once per boot by
+   svcmgr via `/config/svcmgr/services/fb-charset.svc` (`seed =
+   devmgr.registry`). It resolves the framebuffer write cap via
+   `devmgr_labels::QUERY_FRAMEBUFFER_DEVICE` and submits a structured
+   UTF-8 sequence exercising every glyph class (ASCII, CP437 high half,
+   box-drawing, font-extension, ASCII fallback, invalid UTF-8 → U+FFFD),
+   then exits. Production consumers (terminal, shell, compositor) arrive
+   in follow-up issues and resolve the cap through the same name. v1
+   exposes one verb only — `FB_WRITE_BYTES` — interpreting payloads as
+   UTF-8 with `\n`/`\r` short-circuited; graphical primitives are listed
+   under the driver README's "Planned future surface".
 
 ## The serial driver as sole userspace UART owner
 

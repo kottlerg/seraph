@@ -750,68 +750,6 @@ pub fn create_devmgr_with_caps(
     Some(thread_cap)
 }
 
-// ── Framebuffer driver smoke print ──────────────────────────────────────────
-
-/// One-shot acceptance witness for the userspace framebuffer driver
-/// (issue #67). After devmgr is up, init derives a
-/// `REGISTRY_QUERY_AUTHORITY`-tokened SEND on `devmgr_registry_ep`,
-/// asks devmgr for the framebuffer driver's service cap via
-/// `QUERY_FRAMEBUFFER_DEVICE`, and issues one `FB_WRITE_BYTES` carrying
-/// a marker string. Best-effort: a missing framebuffer (headless boot)
-/// or a driver bring-up failure silently drops the print.
-///
-/// Throwaway: removable once a real terminal/shell consumer lands in
-/// a follow-up issue and routes through the framebuffer for its own
-/// reasons.
-pub fn smoke_print_framebuffer(devmgr_registry_ep: u32, ipc_buf: *mut u64)
-{
-    if devmgr_registry_ep == 0
-    {
-        return;
-    }
-
-    // Tokened SEND on devmgr's registry endpoint — the same shape
-    // logd/vfsd receive in their bootstraps.
-    let Ok(query_cap) = syscall::cap_derive_token(
-        devmgr_registry_ep,
-        syscall::RIGHTS_SEND,
-        ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-    )
-    else
-    {
-        return;
-    };
-
-    let query = IpcMessage::builder(ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(query_cap, &query, ipc_buf) };
-    let _ = syscall::cap_delete(query_cap);
-    let Ok(reply) = reply
-    else
-    {
-        return;
-    };
-    if reply.label != ipc::devmgr_errors::SUCCESS
-    {
-        return;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.is_empty()
-    {
-        return;
-    }
-    let fb_write_cap = reply_caps[0];
-
-    let marker: &[u8] = b"seraph: userspace framebuffer driver up\n";
-    let label = ipc::fb_labels::FB_WRITE_BYTES | ((marker.len() as u64) << 16);
-    let write_msg = IpcMessage::builder(label).bytes(0, marker).build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let _ = unsafe { ipc::ipc_call(fb_write_cap, &write_msg, ipc_buf) };
-    let _ = syscall::cap_delete(fb_write_cap);
-}
-
 // ── pwrmgr creation ─────────────────────────────────────────────────────────
 
 /// Pwrmgr-side result of [`create_and_start_pwrmgr`].
@@ -1364,6 +1302,7 @@ pub fn phase3_svcmgr_handover(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     svcmgr_service_ep: u32,
+    devmgr_registry_ep: u32,
     system_root_cap: u32,
     rootfs_root_cap: u32,
     mut thread_caps: ServiceThreadCaps,
@@ -1524,6 +1463,33 @@ pub fn phase3_svcmgr_handover(
     {
         log("phase 3: publish svcmgr failed");
         let _ = syscall::cap_delete(svc_send);
+    }
+
+    // 5. devmgr.registry — `REGISTRY_QUERY_AUTHORITY`-tokened SEND on
+    //    devmgr's registry endpoint. Today's consumer is
+    //    `programs/fb-charset` via `seed = devmgr.registry`; future
+    //    non-init consumers of devmgr's discovery surface use the same
+    //    name. The token bit survives svcmgr's plain `cap_derive` in
+    //    `registry_lookup_derived`.
+    if let Some(cap) = publish_cap
+        && devmgr_registry_ep != 0
+    {
+        match syscall::cap_derive_token(
+            devmgr_registry_ep,
+            syscall::RIGHTS_SEND,
+            ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+        )
+        {
+            Ok(derived) =>
+            {
+                if !svcmgr_publish(cap, ipc::published_names::DEVMGR_REGISTRY, derived, ipc_buf)
+                {
+                    log("phase 3: publish devmgr.registry failed");
+                    let _ = syscall::cap_delete(derived);
+                }
+            }
+            Err(_) => log("phase 3: derive devmgr.registry cap failed"),
+        }
     }
 
     if let Some(cap) = publish_cap

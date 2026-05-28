@@ -790,11 +790,6 @@ fn run(info_ptr: u64) -> !
             ipc_buf,
         )
         .unwrap_or(0);
-
-        // Acceptance witness for the userspace framebuffer driver
-        // (issue #67): on a graphical boot this puts a visible marker
-        // on the framebuffer. Best-effort; headless boots skip.
-        service::smoke_print_framebuffer(devmgr_registry_ep, ipc_buf);
     }
     else
     {
@@ -895,6 +890,7 @@ fn run(info_ptr: u64) -> !
         endpoint_cap,
         init_bootstrap_ep,
         svcmgr_service_ep,
+        devmgr_registry_ep,
         system_root_cap,
         root_mount.root_cap,
         thread_caps,

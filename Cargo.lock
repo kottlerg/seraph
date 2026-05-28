@@ -317,6 +317,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fb-charset"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,6 +350,7 @@ dependencies = [
  "ipc",
  "syscall",
  "syscall-abi",
+ "text",
 ]
 
 [[package]]
@@ -942,6 +952,13 @@ name = "syscall-abi"
 version = "0.1.0"
 dependencies = [
  "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "text"
+version = "0.1.0"
+dependencies = [
+ "font",
 ]
 
 [[package]]

@@ -1,10 +1,13 @@
 # framebuffer
 
 Userspace framebuffer device driver. Owns the bootloader-discovered GOP
-linear-framebuffer MMIO end-to-end and exposes a single byte-write IPC; bytes
-are rendered as text through the embedded 9×20 bitmap font (`shared/font`).
-The kernel framebuffer renderer (`core/kernel/src/framebuffer.rs`) remains
-the early-boot / panic console fallback — see
+linear-framebuffer MMIO end-to-end and exposes a single byte-write IPC.
+Payload bytes are interpreted as UTF-8: the driver carries a `text::Utf8Decoder`
+across calls (so a multi-byte sequence may straddle two payloads), then
+resolves each codepoint via CP437 reverse → font-extension → ASCII-fallback
+→ `U+FFFD`, blitting one or more 9×20 glyphs from `shared/font`. The kernel
+framebuffer renderer (`core/kernel/src/framebuffer.rs`) remains the early-
+boot / panic console fallback — see
 [docs/console-model.md](../../../docs/console-model.md).
 
 ---
@@ -57,25 +60,43 @@ error codes in `shared/ipc::fb_errors`.
 
 ### Label 1: `FB_WRITE_BYTES`
 
-Write a run of bytes to the framebuffer. The label carries the payload
-byte length in its high bits, mirroring `serial_labels::SERIAL_WRITE_BYTES`
-and `stream_labels::STREAM_BYTES`; the bytes are packed into the data
-words. The driver renders each printable byte as a 9×20 glyph at the
-cursor, handles `\n` / `\r`, and scrolls when the last row is filled, then
-replies empty.
+Write a run of UTF-8 bytes to the framebuffer. The label carries the
+payload byte length in its high bits, mirroring
+`serial_labels::SERIAL_WRITE_BYTES` and `stream_labels::STREAM_BYTES`;
+the bytes are packed into the data words.
+
+The driver feeds each byte to its `text::Utf8Decoder`:
+
+* `\n` advances to the start of the next line (scrolling if at the
+  bottom); `\r` returns the cursor to column 0. Both bypass the decoder.
+* Other bytes drive the decoder; on a completed codepoint the driver
+  calls `text::render_codepoint`, which dispatches in order:
+  CP437 reverse (`font::FONT_9X20`) → font-extension table
+  (`font::FONT_9X20_EXT`) → ASCII fallback (multi-byte substitutes such
+  as `©` → `(C)`) → `U+FFFD` replacement glyph (slot 0 of the extension
+  table).
+* Invalid UTF-8 emits one `U+FFFD` glyph and resets the decoder.
+
+A multi-byte sequence may straddle two `FB_WRITE_BYTES` calls; partial
+state is held in the driver's decoder until the sequence completes.
+There is one decoder per driver process, alongside the single cursor.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label | `1 \| (byte_len << 16)` — opcode in bits 0-15, payload byte length in bits 16-31 (`0..=512`) |
-| data[0..] | `byte_len` payload bytes, packed contiguously (`.bytes(0, …)`) |
+| data[0..] | `byte_len` payload bytes (UTF-8), packed contiguously (`.bytes(0, …)`) |
 
 **Reply:**
 
 | Field | Value |
 |---|---|
 | label | `0` (`SUCCESS`) or `2` (`UNKNOWN_OPCODE`) |
+
+The acceptance witness for this surface is `programs/fb-charset`,
+launched once per boot by svcmgr via
+`/config/svcmgr/services/fb-charset.svc` (`seed = devmgr.registry`).
 
 ---
 

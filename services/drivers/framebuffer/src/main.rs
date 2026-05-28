@@ -21,6 +21,13 @@
 //! stride, pixel format) and uses the `byte_len` in the reply to size
 //! the MMIO mapping (`stride * height` rounded up to pages).
 //!
+//! `FB_WRITE_BYTES` payloads are UTF-8. The service loop holds a single
+//! `text::Utf8Decoder`; partial multi-byte sequences are buffered across
+//! calls. Each assembled codepoint is resolved via the CP437 reverse →
+//! font-extension → ASCII-fallback → `U+FFFD` chain in
+//! `text::render_codepoint`, which feeds one or more 9×20 bitmaps to
+//! the `FramebufferWriter`. `\n` and `\r` short-circuit the decoder.
+//!
 //! Like the serial driver, this driver MUST NOT call
 //! `std::os::seraph::log!`: a future logd fanout that routes its own
 //! output here would deadlock (driver → log endpoint → logd → driver).
@@ -38,6 +45,9 @@ mod render;
 use boot_protocol::FramebufferInfo;
 use ipc::{IpcMessage, devmgr_labels, fb_errors, fb_labels};
 use std::os::seraph::startup_info;
+use text::{DecodeOutcome, Utf8Decoder};
+
+const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 
@@ -128,7 +138,12 @@ fn query_framebuffer_info(devmgr_ep: u32, ipc_buf: *mut u64) -> Option<Framebuff
 
 // ── Service loop ───────────────────────────────────────────────────────────
 
-fn handle_request(msg: &IpcMessage, writer: &mut render::FramebufferWriter, ipc_buf: *mut u64)
+fn handle_request(
+    msg: &IpcMessage,
+    writer: &mut render::FramebufferWriter,
+    decoder: &mut Utf8Decoder,
+    ipc_buf: *mut u64,
+)
 {
     // Label encoding mirrors `serial_labels::SERIAL_WRITE_BYTES` and
     // `stream_labels::STREAM_BYTES`: opcode in bits 0-15, payload byte
@@ -141,10 +156,21 @@ fn handle_request(msg: &IpcMessage, writer: &mut render::FramebufferWriter, ipc_
         for &b in &bytes[..n]
         {
             // SAFETY: writer.base is a valid MMIO mapping for the
-            // framebuffer's geometry; cursor stays within bounds by
-            // FramebufferWriter::write_byte's internal accounting.
+            // framebuffer's geometry; the FramebufferWriter advances
+            // its own cursor within its declared geometry.
             unsafe {
-                writer.write_byte(b);
+                match b
+                {
+                    b'\n' => writer.newline(),
+                    b'\r' => writer.carriage_return(),
+                    _ => match decoder.push(b)
+                    {
+                        DecodeOutcome::Codepoint(cp) => render_at(writer, cp),
+                        DecodeOutcome::Invalid => render_at(writer, REPLACEMENT_CODEPOINT),
+                        DecodeOutcome::NeedMore =>
+                        {}
+                    },
+                }
             }
         }
         IpcMessage::new(fb_errors::SUCCESS)
@@ -157,8 +183,24 @@ fn handle_request(msg: &IpcMessage, writer: &mut render::FramebufferWriter, ipc_
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Render one Unicode codepoint at the writer's cursor. Multi-glyph
+/// ASCII fallbacks (e.g. `©` → `(C)`) emit several blits.
+///
+/// # Safety
+/// `writer`'s framebuffer pointer must remain valid and writable.
+unsafe fn render_at(writer: &mut render::FramebufferWriter, cp: u32)
+{
+    text::render_codepoint(cp, &mut |bitmap| {
+        // SAFETY: hoisted from the caller's contract.
+        unsafe {
+            writer.draw_glyph_bitmap(bitmap);
+        }
+    });
+}
+
 fn service_loop(service_ep: u32, mut writer: render::FramebufferWriter, ipc_buf: *mut u64) -> !
 {
+    let mut decoder = Utf8Decoder::new();
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -167,7 +209,7 @@ fn service_loop(service_ep: u32, mut writer: render::FramebufferWriter, ipc_buf:
         {
             continue;
         };
-        handle_request(&msg, &mut writer, ipc_buf);
+        handle_request(&msg, &mut writer, &mut decoder, ipc_buf);
     }
 }
 

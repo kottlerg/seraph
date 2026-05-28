@@ -527,6 +527,16 @@ pub mod published_names
     /// when they need to call into svcmgr beyond the per-process
     /// `service_registry_cap` (today: crasher's `seed = svcmgr`).
     pub const SVCMGR: &[u8] = b"svcmgr";
+
+    /// `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry
+    /// endpoint. Consumers needing to resolve a device driver
+    /// themselves (today: `programs/fb-charset` →
+    /// `QUERY_FRAMEBUFFER_DEVICE`; future: any non-init caller of
+    /// devmgr's discovery surface) seed this name. Init publishes it
+    /// at Phase 3 handover; the `REGISTRY_QUERY_AUTHORITY` token bit
+    /// is preserved through svcmgr's plain `cap_derive` in
+    /// `registry_lookup_derived`.
+    pub const DEVMGR_REGISTRY: &[u8] = b"devmgr.registry";
 }
 
 pub const RTC_LABELS_VERSION: u32 = 1;

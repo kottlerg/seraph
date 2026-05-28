@@ -24,6 +24,7 @@ mod concurrent_event_producers;
 mod concurrent_ipc;
 mod concurrent_map_unmap;
 mod concurrent_signal;
+mod cspace_recycle;
 mod event_queue_fill_drain;
 mod fpu_migration_churn;
 mod idle_wake_race;
@@ -53,6 +54,7 @@ static mut STRESS_STACKS: [ChildStack; MAX_STRESS_THREADS] = [ChildStack::ZERO; 
 pub fn run_all(ctx: &TestContext)
 {
     run_integration_test!("stress::cap_tree_deep", cap_tree_deep::run(ctx));
+    run_integration_test!("stress::cspace_recycle", cspace_recycle::run(ctx));
     run_integration_test!(
         "stress::event_queue_fill_drain",
         event_queue_fill_drain::run(ctx)

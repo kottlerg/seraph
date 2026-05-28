@@ -103,15 +103,26 @@ pub struct KernelObjectHeader
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
+    /// Lifecycle flags. See `HDR_FLAG_*` constants. Currently only used to
+    /// mark the boot root `CSpace` as undestroyable.
+    pub flags: u8,
     // Padding to reach 8-byte alignment for the ancestor pointer below.
     #[allow(clippy::pub_underscore_fields)]
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 2],
     /// Pointer to the `FrameObject`'s header this object was retyped from,
     /// or null if allocated via the legacy heap path. Set once at creation,
     /// read at deallocation. `AtomicPtr` for the unforgeable null sentinel
     /// without imposing const-init constraints on construction.
     pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
+
+/// `flags` bit: this header belongs to the boot root `CSpace` and MUST NOT
+/// be deallocated. `dec_ref` intercepts the `→ 0` transition for these
+/// headers and returns 1, keeping the object alive regardless of upstream
+/// refcount mismanagement. Stamped in
+/// [`crate::cap::boot_retype_cspace`] for the root `CSpace`; never set
+/// elsewhere.
+pub const HDR_FLAG_IS_ROOT: u8 = 0x01;
 
 // SAFETY: ancestor is a back-pointer to a kernel object whose lifetime is
 // guaranteed by retype's refcount semantics. Send+Sync via the surrounding
@@ -132,7 +143,8 @@ impl KernelObjectHeader
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
-            _pad: [0; 3],
+            flags: 0,
+            _pad: [0; 2],
             ancestor: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -147,7 +159,8 @@ impl KernelObjectHeader
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
-            _pad: [0; 3],
+            flags: 0,
+            _pad: [0; 2],
             ancestor: AtomicPtr::new(ancestor.as_ptr()),
         }
     }
@@ -163,6 +176,13 @@ impl KernelObjectHeader
     ///
     /// Returns 0 when the object has no remaining capability references; the
     /// caller is responsible for freeing the object at that point.
+    ///
+    /// Headers carrying [`HDR_FLAG_IS_ROOT`] (the boot root `CSpace`) clamp at
+    /// 1: the dec is applied, but if the result would be 0 we restore the
+    /// `ref_count` to 1 and report 1 to the caller. The root `CSpace` lives
+    /// for kernel lifetime and never reaches `dealloc_object`, even if
+    /// upstream refcount accounting mismanages the ancillary slot/wrapper
+    /// pair.
     pub fn dec_ref(&self) -> u32
     {
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
@@ -173,7 +193,13 @@ impl KernelObjectHeader
             self,
             self.ancestor.load(Ordering::Relaxed),
         );
-        prev - 1
+        let new = prev - 1;
+        if new == 0 && (self.flags & HDR_FLAG_IS_ROOT) != 0
+        {
+            self.ref_count.store(1, Ordering::Release);
+            return 1;
+        }
+        new
     }
 }
 

@@ -314,7 +314,8 @@ static mut SEED_FRAME: object::FrameObject = object::FrameObject {
     header: object::KernelObjectHeader {
         ref_count: AtomicU32::new(1),
         obj_type: object::ObjectType::Frame,
-        _pad: [0; 3],
+        flags: 0,
+        _pad: [0; 2],
         ancestor: AtomicPtr::new(core::ptr::null_mut()),
     },
     base: 0,
@@ -703,6 +704,11 @@ pub(crate) unsafe fn boot_retype_cspace(
             },
         );
     }
+    // The root CSpace is pinned for kernel lifetime: marking it here makes
+    // `dec_ref` clamp at 1, so any upstream refcount mismanagement of the
+    // wrapper / self-cap pair cannot route it through `dealloc_object`.
+    // SAFETY: header just written, exclusively owned, single-threaded boot.
+    unsafe { (*cs_kobj_ptr).header.flags |= crate::cap::object::HDR_FLAG_IS_ROOT };
 
     // SAFETY: cs_ptr just constructed.
     unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };

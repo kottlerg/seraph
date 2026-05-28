@@ -1013,6 +1013,14 @@ unsafe fn kernel_entry_post_rebase(
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE wrapper not wired"));
             // SAFETY: cs_kobj_ptr is in-place inside the SEED slab; header at offset 0.
             let cs_nn = unsafe { NonNull::new_unchecked(cs_kobj_ptr.cast::<KernelObjectHeader>()) };
+            // The root CSpace wrapper now has two logical holders: init's TCB
+            // (`init_tcb.cspace`, set below) and the self-cap slot inserted
+            // here. `insert_cap` does not bump the refcount of the inserted
+            // object — it's the caller's responsibility — so we inc here.
+            // `HDR_FLAG_IS_ROOT` (stamped in `boot_retype_cspace`) is the
+            // belt-and-suspenders defense if this accounting ever drifts.
+            // SAFETY: header at offset 0 of cs_kobj_ptr; single-threaded boot.
+            unsafe { cs_nn.as_ref().inc_ref() };
             cs.insert_cap(
                 CapTag::CSpace,
                 Rights::INSERT | Rights::DELETE | Rights::DERIVE,

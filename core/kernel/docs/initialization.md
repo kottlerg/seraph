@@ -123,7 +123,10 @@ heap exists yet.
    as reclaimable Frame caps into init's CSpace during Phase 7 by
    `cap::mint_reclaim_frame_caps`, alongside the other bootloader
    scratch pages (`BootInfo` page, descriptor arrays, MMIO aperture
-   array, reclaim-array page).
+   array, reclaim-array page) and the bundle's non-module pages
+   (header + entry table + 4 KiB pad, init ELF source body, and any
+   inter-module or trailing slack — module bodies are excluded because
+   `mint_module_frame_caps` already covers them).
 8. Emit: "page tables established, physmap at 0xFFFF800000000000"
 ```
 
@@ -296,16 +299,10 @@ Phase 7, and `KERNEL_MMIO` is populated.
 **Completion criterion:** Root CSpace exists and contains capabilities for all
 boot-provided hardware resources, including the reclaimable Frame caps
 covering bootloader scratch pages (`BootInfo` page, descriptor arrays,
-MMIO aperture array, reclaim-array page, cmdline page, transient page-
-table frames).
-
-### Cmdline-page snapshot
-
-The cmdline page lands in `reclaim_ranges` like every other early entry,
-but only after the kernel snapshots its contents into a small BSS
-buffer during Phase 4. The Phase-9 `InitInfo` copy reads from the
-snapshot, leaving the bootloader page reclaim-safe by the time this
-phase mints its Frame cap.
+MMIO aperture array, reclaim-array page, transient page-table frames)
+and the bundle's non-module pages (header + entry table + 4 KiB pad,
+init ELF source body, inter-module and trailing slack — module bodies
+are excluded because `mint_module_frame_caps` already covers them).
 
 ---
 

@@ -1043,6 +1043,10 @@ unsafe fn step9_populate_boot_info(
     }; MAX_RECLAIM_RANGES];
     let mut reclaim_len: usize = 0;
     let mut push_reclaim = |phys_base: u64, page_count: u32, flags: u32| {
+        if page_count == 0
+        {
+            return;
+        }
         if reclaim_len >= MAX_RECLAIM_RANGES
         {
             bprintln!("[--------] boot: FATAL: reclaim_ranges overflow (bump MAX_RECLAIM_RANGES)");
@@ -1073,23 +1077,50 @@ unsafe fn step9_populate_boot_info(
     {
         push_reclaim(frame, 1, 0);
     }
-    // Bundle blob: NOT pushed as a single reclaim range. Module bodies
-    // are already covered by Frame caps minted in
-    // `cap::mint_module_frame_caps`, which call
-    // `register_owned_range` on each module's pages and create caps
-    // with `owns_memory = true`. Adding the whole bundle here would
-    // double-register those pages (inflating the buddy's `total_pages`)
-    // and produce two `owns_memory = true` caps over the same
-    // physical range, so any subsequent cap-destroy path that hits
-    // `dealloc_object → buddy.free_range` would double-free.
+    // Bundle blob: emit reclaim ranges over every bundle page NOT
+    // covered by a module Frame cap. Module bodies are 4 KiB-aligned
+    // per `bundle::BODY_ALIGNMENT` (enforced by `bundle::parse_header`),
+    // and `mods.modules[..mods.count]` arrives in ascending
+    // `physical_base` because `xtask/src/bundle.rs::write_bundle` lays
+    // bodies out at a monotonically-increasing aligned cursor and
+    // `step4_parse_bundle` preserves header-entry order while filtering
+    // `init` out. The gaps walked here cover the bundle header + entry
+    // table + leading pad, the init ELF source body (no longer needed —
+    // `load_init` copied segments out into separate allocations during
+    // step 4), and any inter-module or trailing slack pages.
     //
-    // The non-module portion of the bundle (header + entry table +
-    // init's ELF source bytes, which `load_init` has already copied
-    // out into separate segment allocations) is therefore leaked at
-    // boot — a small, bounded permanent waste. A future per-byte-range
-    // reclaim path can carve those ranges out of the bundle without
-    // overlapping the module Frame caps; tracked separately.
-    let _ = bundle;
+    // Module-covered pages are accounted exclusively by
+    // `cap::mint_module_frame_caps`; carving around them keeps the
+    // `register_owned_range` ledger entries disjoint and avoids the
+    // double-count / double-free trap that motivated PR #138 commit 6.
+    let bundle_end = bundle.phys + (bundle.pages as u64) * 4096;
+    let mut bundle_cursor = bundle.phys;
+    for module in &mods.modules[..mods.count]
+    {
+        let module_base = module.physical_base;
+        let module_end = (module.physical_base + module.size + 0xFFF) & !0xFFF;
+        debug_assert!(
+            module_base.is_multiple_of(4096),
+            "bundle module body not 4 KiB-aligned",
+        );
+        debug_assert!(
+            bundle_cursor <= module_base,
+            "bundle modules not in ascending offset order",
+        );
+        if bundle_cursor < module_base
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            let gap_pages = ((module_base - bundle_cursor) / 4096) as u32;
+            push_reclaim(bundle_cursor, gap_pages, 0);
+        }
+        bundle_cursor = module_end;
+    }
+    if bundle_cursor < bundle_end
+    {
+        #[allow(clippy::cast_possible_truncation)]
+        let tail_pages = ((bundle_end - bundle_cursor) / 4096) as u32;
+        push_reclaim(bundle_cursor, tail_pages, 0);
+    }
     // AP SIPI trampoline page: kernel mints this through the late-reclaim
     // pass once SMP bringup completes and `mm::paging::unmap_identity_page`
     // has retired the low-VA identity mapping (installed on both arches by

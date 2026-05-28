@@ -1960,6 +1960,10 @@ pub(crate) fn mint_late_reclaim_frame_caps(
 /// clear, `true` mints only entries with the LATE flag set. `label`
 /// prefixes the diagnostic line so the two passes are distinguishable
 /// in the boot log.
+// Linear Phase-7 sequence: per-range overlap check, owned-range
+// registration, FrameObject mint, descriptor push. The debug-only
+// overlap assertion adds ~25 lines without a natural extraction point.
+#[allow(clippy::too_many_lines)]
 fn mint_reclaim_pass(
     cspace: &mut CSpace,
     boot_info: &BootInfo,
@@ -2009,6 +2013,39 @@ fn mint_reclaim_pass(
         let phys_base = range.phys_base & !0xFFF;
         let size_bytes = u64::from(range.page_count) * (crate::mm::PAGE_SIZE as u64);
         pages_total += u64::from(range.page_count);
+
+        // Catch double-coverage with module Frame caps: any overlap
+        // here would have `register_owned_range` double-bump
+        // `total_pages` and (on cap destroy) cause `free_range` to
+        // double-free into the buddy. The bootloader (`step9` bundle
+        // carve-out, scratch-page allocations) is responsible for
+        // disjointness; this asserts the contract at the consumer.
+        #[cfg(debug_assertions)]
+        {
+            let range_end = phys_base + size_bytes;
+            if !boot_info.modules.entries.is_null() && boot_info.modules.count > 0
+            {
+                // SAFETY: same provenance as the slice in
+                // `mint_module_frame_caps` above; identity-mapped through
+                // Phase 7.
+                let modules = unsafe {
+                    core::slice::from_raw_parts(
+                        phys_to_virt(boot_info.modules.entries as u64)
+                            as *const boot_protocol::BootModule,
+                        boot_info.modules.count as usize,
+                    )
+                };
+                for m in modules
+                {
+                    let m_base = m.physical_base & !0xFFF;
+                    let m_end = (m.physical_base + m.size + 0xFFF) & !0xFFF;
+                    debug_assert!(
+                        range_end <= m_base || phys_base >= m_end,
+                        "reclaim range overlaps module Frame cap",
+                    );
+                }
+            }
+        }
 
         // Register the range as managed-but-not-free so that if the cap is
         // ever destroyed, `dealloc_object`'s `free_range` keeps the buddy

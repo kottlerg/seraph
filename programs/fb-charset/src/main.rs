@@ -9,9 +9,9 @@
 //! a representative sample of every glyph class the framebuffer driver
 //! can render: 7-bit ASCII, CP437 high half (math, Greek, accented
 //! Latin), CP437 box-drawing, the font-extension table (em-dash,
-//! ellipsis, ×, ⇒, ≠, ✓, …), the ASCII multi-byte substitute path
-//! (`©` → `(C)`, `↔` → `<->`, …), and one deliberately ill-formed UTF-8
-//! sequence so the `U+FFFD` glyph is reachable on screen. Useful for
+//! ellipsis, ×, ⇒, ≠, ✓, arrows, …), the ASCII multi-byte substitute
+//! path (`©` → `(C)`, `™` → `(TM)`, …), and one deliberately ill-formed
+//! UTF-8 sequence so the `U+FFFD` glyph is reachable on screen. Useful for
 //! eyeballing font output the same way `tput` / `showcfont` make the
 //! VT character set inspectable elsewhere.
 //!

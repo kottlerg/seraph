@@ -12,7 +12,11 @@ devmgr/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   └── main.rs                     # Entry point (stub)
+│   ├── main.rs                     # Bootstrap, registry service loop, QUERY_* handlers
+│   ├── caps.rs                     # Capability absorbers and device-info catalog
+│   ├── firmware/                   # ACPI / DTB parsing helpers
+│   ├── pci.rs                      # PCI ECAM enumeration + BAR splitting
+│   └── spawn.rs                    # Driver-process spawn helpers (simple-device, virtio-blk, ...)
 └── docs/
     ├── pci-enumeration.md          # PCI enumeration via ECAM MMIO
     └── hotplug.md                  # Hotplug event handling

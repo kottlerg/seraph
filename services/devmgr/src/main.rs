@@ -333,7 +333,13 @@ fn main() -> !
             ipc::devmgr_labels::QUERY_DEVICE_INFO =>
             {
                 let dev_idx = token.wrapping_sub(1) as usize;
-                if dev_idx < device_info_count
+                if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if dev_idx < device_info_count
                 {
                     let entry = &device_info[dev_idx];
                     // Reply schema: word[0] = kind, word[1] = version,

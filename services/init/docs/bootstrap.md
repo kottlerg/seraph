@@ -60,7 +60,10 @@ process creation to procmgr IPC.
   (`../src/main.rs:696`).
 - Request procmgr to create devmgr via boot-module
   `CREATE_PROCESS` and serve devmgr's multi-round bootstrap
-  (hardware caps: MMIO apertures, Interrupt range, ACPI Frame caps)
+  (hardware caps: MMIO apertures, Interrupt range, ACPI Frame caps,
+  DTB Frame cap on riscv64, and a `FRAMEBUFFER_INFO` round carrying
+  the bootloader-discovered `boot_protocol::FramebufferInfo` so devmgr
+  can spawn the userspace framebuffer driver)
   (`../src/main.rs:782` + `service::create_devmgr_with_caps` at
   `../src/service.rs:371`).
 - Request procmgr to create vfsd the same way and serve its

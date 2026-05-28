@@ -197,7 +197,9 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
 /// verifies kind/version before deserialising.
 fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 {
-    let request = IpcMessage::new(devmgr_labels::QUERY_DEVICE_INFO);
+    let request = IpcMessage::builder(devmgr_labels::QUERY_DEVICE_INFO)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(devmgr_ep, &request, ipc_buf) })
     else

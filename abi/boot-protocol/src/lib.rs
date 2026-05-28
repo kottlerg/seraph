@@ -836,4 +836,65 @@ mod tests
     {
         assert!(core::mem::size_of::<BootInfo>() <= 4096);
     }
+
+    /// `FramebufferInfo::SIZE` covers the full struct: u64 + 4×u32 = 24 B.
+    #[test]
+    fn framebuffer_info_size_is_24_bytes()
+    {
+        assert_eq!(FramebufferInfo::SIZE, 24);
+    }
+
+    /// Round-trip: a populated `FramebufferInfo` survives `to_bytes` then
+    /// `from_bytes` with every field intact.
+    #[test]
+    fn framebuffer_info_round_trip()
+    {
+        let fb = FramebufferInfo {
+            physical_base: 0xFD00_0000,
+            width: 1024,
+            height: 768,
+            stride: 4096,
+            pixel_format: PixelFormat::Bgrx8,
+        };
+        let mut buf = [0u8; FramebufferInfo::SIZE];
+        fb.to_bytes(&mut buf).expect("to_bytes");
+        let parsed = FramebufferInfo::from_bytes(&buf).expect("from_bytes");
+        assert_eq!(parsed.physical_base, fb.physical_base);
+        assert_eq!(parsed.width, fb.width);
+        assert_eq!(parsed.height, fb.height);
+        assert_eq!(parsed.stride, fb.stride);
+        assert_eq!(parsed.pixel_format, fb.pixel_format);
+    }
+
+    /// `from_bytes` rejects an invalid `PixelFormat` discriminant rather
+    /// than materialising an enum value outside its declared variants
+    /// (which is undefined behaviour in Rust).
+    #[test]
+    fn framebuffer_info_from_bytes_rejects_invalid_pixel_format()
+    {
+        let mut buf = [0u8; FramebufferInfo::SIZE];
+        // Discriminant 2 is outside {0, 1}.
+        buf[20..24].copy_from_slice(&2u32.to_le_bytes());
+        assert!(FramebufferInfo::from_bytes(&buf).is_none());
+        // 0xFFFFFFFF should also reject.
+        buf[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(FramebufferInfo::from_bytes(&buf).is_none());
+    }
+
+    /// `from_bytes` rejects a buffer shorter than `SIZE`.
+    #[test]
+    fn framebuffer_info_from_bytes_rejects_short_buffer()
+    {
+        let short = [0u8; FramebufferInfo::SIZE - 1];
+        assert!(FramebufferInfo::from_bytes(&short).is_none());
+    }
+
+    /// `to_bytes` rejects a buffer shorter than `SIZE`.
+    #[test]
+    fn framebuffer_info_to_bytes_rejects_short_buffer()
+    {
+        let fb = FramebufferInfo::empty();
+        let mut short = [0u8; FramebufferInfo::SIZE - 1];
+        assert!(fb.to_bytes(&mut short).is_none());
+    }
 }

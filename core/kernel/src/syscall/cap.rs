@@ -489,7 +489,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///        empty pool that requires immediate augment-mode refill before any
 ///        cap can be inserted). Augment-mode accepts `init_pages >= 1`.
 /// arg3 = `max_slots` (create-mode only): hard cap on usable slots
-///        (clamped to `[1, 16384]`). Ignored in augment mode.
+///        (clamped to `[1, 14336]`). Ignored in augment mode.
 ///
 /// Create-mode slab layout:
 /// - page 0 — wrapper page: [`CSpaceKernelObject`] at offset 0, immediately
@@ -497,7 +497,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///   pointer indexes into this same page.
 /// - pages `1..init_pages` — slot-page pool, drawn on demand by
 ///   [`CSpace::grow`](crate::cap::cspace::CSpace::grow) when the directory
-///   needs another 64-slot leaf.
+///   needs another 56-slot leaf.
 ///
 /// Create-mode returns the new `CSpace` slot index. Augment-mode returns 0.
 #[cfg(not(test))]
@@ -516,7 +516,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use core::ptr::NonNull;
     use core::sync::atomic::AtomicU64;
 
-    const MAX_SLOTS: usize = 16384;
+    const MAX_SLOTS: usize = 14336;
 
     let frame_idx = tf.arg(0) as u32;
     let augment_idx = tf.arg(1) as u32;
@@ -621,7 +621,15 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: wrapper_virt is page-aligned; cs_offset stays inside page 0.
     let cs_ptr = unsafe { wrapper_virt.add(cs_offset) }.cast::<CSpace>();
 
-    let id = alloc_cspace_id();
+    let Some(id) = alloc_cspace_id()
+    else
+    {
+        // Free list empty and high-water at MAX_CSPACES — namespace
+        // exhausted. Surface to userspace; the retype carve is undone below
+        // by `retype_free` after the error return.
+        retype_free(frame, offset, entry.raw_bytes);
+        return Err(SyscallError::OutOfMemory);
+    };
 
     // Construct CSpace in place.
     // SAFETY: cs_ptr lives inside the wrapper page, exclusively owned.
@@ -650,6 +658,9 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Register in the global registry so derivation lookups resolve.
     // Overflow → `SyscallError::OutOfMemory` with full rollback below.
+    // The returned epoch is the current registry value — `SlotId`s minted
+    // for this CSpace's slots during its lifetime stamp with it via
+    // `SlotId::current`.
     if crate::cap::register_cspace(id, cs_ptr).is_err()
     {
         // SAFETY: wrapper/cs not observed externally yet (registry
@@ -1080,8 +1091,8 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let new_idx = new_idx_nz.get();
 
     // Wire derivation tree: new slot is a child of the source slot.
-    let parent = crate::cap::slot::SlotId::new(caller_cspace_id, src_idx_nz);
-    let child = crate::cap::slot::SlotId::new(dest_cs_id, new_idx_nz);
+    let parent = crate::cap::slot::SlotId::current(caller_cspace_id, src_idx_nz);
+    let child = crate::cap::slot::SlotId::current(dest_cs_id, new_idx_nz);
     crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds just created.
     unsafe {
@@ -1182,8 +1193,8 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Wire derivation link.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
-    let parent = crate::cap::slot::SlotId::new(cspace_id, src_idx_nz);
-    let child = crate::cap::slot::SlotId::new(cspace_id, new_idx_nz);
+    let parent = crate::cap::slot::SlotId::current(cspace_id, src_idx_nz);
+    let child = crate::cap::slot::SlotId::current(cspace_id, new_idx_nz);
     crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds.
     unsafe {
@@ -1296,8 +1307,8 @@ pub fn sys_cap_derive_token(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Wire derivation link.
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
-    let parent = crate::cap::slot::SlotId::new(cspace_id, src_idx_nz);
-    let child = crate::cap::slot::SlotId::new(cspace_id, new_idx_nz);
+    let parent = crate::cap::slot::SlotId::current(cspace_id, src_idx_nz);
+    let child = crate::cap::slot::SlotId::current(cspace_id, new_idx_nz);
     crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds.
     unsafe {
@@ -1339,7 +1350,7 @@ pub fn sys_cap_delete(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let slot_idx_nz =
         core::num::NonZeroU32::new(slot_idx).ok_or(SyscallError::InvalidCapability)?;
-    let node = crate::cap::slot::SlotId::new(cspace_id, slot_idx_nz);
+    let node = crate::cap::slot::SlotId::current(cspace_id, slot_idx_nz);
 
     // Resolve the slot, unlink, and clear under DERIVATION_LOCK so a concurrent
     // revoke_subtree on a parent cap cannot race-clear this slot between the
@@ -1448,7 +1459,7 @@ pub fn sys_cap_revoke(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let slot_idx_nz =
         core::num::NonZeroU32::new(slot_idx).ok_or(SyscallError::InvalidCapability)?;
-    let root = crate::cap::slot::SlotId::new(cspace_id, slot_idx_nz);
+    let root = crate::cap::slot::SlotId::current(cspace_id, slot_idx_nz);
 
     // Revoke the subtree under the lock; snapshot the dealloc list to a
     // stack-local array so we can release the lock before calling
@@ -1694,8 +1705,8 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
-    let src_slot_id = SlotId::new(src_cspace_id, src_idx_nz);
-    let dst_slot_id = SlotId::new(dest_cspace_id, dest_idx_nz);
+    let src_slot_id = SlotId::current(src_cspace_id, src_idx_nz);
+    let dst_slot_id = SlotId::current(dest_cspace_id, dest_idx_nz);
 
     // Copy derivation links to destination.
     let (src_parent, src_first_child, src_prev, src_next) = {
@@ -1723,7 +1734,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Update parent's child pointer.
     if let Some(parent_id) = src_parent
-        && let Some(parent_cs) = crate::cap::lookup_cspace(parent_id.cspace_id)
+        && let Some(parent_cs) = crate::cap::lookup_cspace(parent_id.cspace_id, parent_id.epoch)
     {
         // SAFETY: parent_cs from registry; DERIVATION_LOCK held.
         if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(parent_id.index.get()) }
@@ -1735,7 +1746,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Update siblings' pointers.
     if let Some(prev_id) = src_prev
-        && let Some(prev_cs) = crate::cap::lookup_cspace(prev_id.cspace_id)
+        && let Some(prev_cs) = crate::cap::lookup_cspace(prev_id.cspace_id, prev_id.epoch)
     {
         // SAFETY: prev_cs from registry; DERIVATION_LOCK held.
         if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(prev_id.index.get()) }
@@ -1745,7 +1756,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     }
     if let Some(next_id) = src_next
-        && let Some(next_cs) = crate::cap::lookup_cspace(next_id.cspace_id)
+        && let Some(next_cs) = crate::cap::lookup_cspace(next_id.cspace_id, next_id.epoch)
     {
         // SAFETY: next_cs from registry; DERIVATION_LOCK held.
         if let Some(next_slot) = unsafe { (*next_cs).slot_mut(next_id.index.get()) }
@@ -1759,7 +1770,8 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let mut child_cur = src_first_child;
     while let Some(child_id) = child_cur
     {
-        child_cur = if let Some(child_cs) = crate::cap::lookup_cspace(child_id.cspace_id)
+        child_cur = if let Some(child_cs) =
+            crate::cap::lookup_cspace(child_id.cspace_id, child_id.epoch)
         {
             // SAFETY: child_cs from registry; DERIVATION_LOCK held.
             if let Some(child_slot) = unsafe { (*child_cs).slot_mut(child_id.index.get()) }
@@ -1933,8 +1945,8 @@ pub fn sys_cap_insert(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     })?;
 
     // Wire derivation link.
-    let parent = crate::cap::slot::SlotId::new(src_cspace_id, src_idx_nz);
-    let child = crate::cap::slot::SlotId::new(dest_cspace_id, dest_slot_idx_nz);
+    let parent = crate::cap::slot::SlotId::current(src_cspace_id, src_idx_nz);
+    let child = crate::cap::slot::SlotId::current(dest_cspace_id, dest_slot_idx_nz);
     crate::cap::DERIVATION_LOCK.write_lock();
     // SAFETY: DERIVATION_LOCK held; parent/child are valid SlotIds.
     unsafe {

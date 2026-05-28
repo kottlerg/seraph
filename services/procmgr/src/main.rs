@@ -215,10 +215,11 @@ pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
 
 /// Pages requested from memmgr for the child's `CSpace` retype slab.
-/// Each slot page holds 64 capability slots (3584 B); the +1 covers the
-/// per-Frame allocator metadata footprint. Larger `CSpace`s refill via
-/// augment-mode `cap_create_cspace`. Five pages → 4 slot pages → 256
-/// slots covers a small driver's lifetime.
+/// Each slot page holds `L2_SIZE` capability slots (currently 56 slots
+/// × 72 B = 4032 B/page); the +1 covers the per-Frame allocator
+/// metadata footprint. Larger `CSpace`s refill via augment-mode
+/// `cap_create_cspace`. Five pages → 4 slot pages → ~224 slots covers a
+/// small driver's lifetime.
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 5;
 
 /// Register a new child with memmgr. On success returns

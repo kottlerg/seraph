@@ -6,20 +6,24 @@
 //! Capability slot foundation types.
 //!
 //! [`CapabilitySlot`] is the fixed-size record stored in `CSpace` pages.
-//! The layout is `#[repr(C)]` and exactly 56 bytes.
+//! The layout is `#[repr(C)]` and exactly 72 bytes.
 //!
 //! ## Intrusive free list
 //!
 //! When a slot is free (`tag == Null`), the `deriv_parent` field is repurposed
 //! to store the next-free index. Call [`CapabilitySlot::set_next_free`] and
 //! [`CapabilitySlot::next_free`] to encode/decode; do not read `deriv_parent`
-//! directly on a free slot.
+//! directly on a free slot. The `epoch` field of the encoded `SlotId` is the
+//! free-list sentinel value `0` and MUST NOT appear in any live derivation
+//! link — derivation links carry the registry epoch that was current when
+//! they were stamped.
 //!
 //! ## Size derivation
 //!
-//! `Option<SlotId>` is 8 bytes because `SlotId.index` is [`NonZeroU32`], which
-//! provides a niche enabling the Option discriminant to be stored in the zero
-//! value — no extra bytes needed. This is verified by the size test below.
+//! `SlotId` is 12 bytes: `(cspace_id: u32, epoch: u32, index: NonZeroU32)`.
+//! `Option<SlotId>` is 12 bytes because `SlotId.index` is [`NonZeroU32`],
+//! which provides a niche enabling the Option discriminant to be stored in
+//! the zero value — no extra bytes needed. Verified by the size tests below.
 
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
@@ -31,23 +35,44 @@ use super::object::KernelObjectHeader;
 /// Unique identifier for a capability space.
 pub type CSpaceId = u32;
 
-/// A reference to a specific capability slot by `CSpace` ID and index.
+/// A reference to a specific capability slot by `CSpace` ID, generation
+/// epoch, and index.
 ///
-/// `index` is [`NonZeroU32`] because slot 0 is permanently null and is never a
-/// valid derivation target. This gives `Option<SlotId>` the same 8-byte size as
-/// `SlotId` itself via niche optimization.
+/// `index` is [`NonZeroU32`] because slot 0 is permanently null and is never
+/// a valid derivation target. This gives `Option<SlotId>` the same 12-byte
+/// size as `SlotId` itself via niche optimization.
+///
+/// `epoch` is the generation counter from the `CSpace` registry at the time
+/// this `SlotId` was stamped. Once `CSpaceId` recycling is enabled (see
+/// #137), `lookup_cspace` compares the stamped epoch to the registry's
+/// current epoch and fails fast on mismatch, so a stale `SlotId` referring
+/// to a freed `CSpace` cannot mis-target a recycled tenant. The reserved
+/// value `epoch == 0` is the free-list sentinel; it appears only in the
+/// intrusive next-free encoding stored in a `CapTag::Null` slot's
+/// `deriv_parent` and MUST NOT appear in any live derivation link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotId
 {
     /// The `CSpace` this slot belongs to.
     pub cspace_id: CSpaceId,
+    /// Registry generation counter stamped at construction. Compared on
+    /// `lookup_cspace` once recycling is enabled.
+    pub epoch: u32,
     /// Slot index within that `CSpace`. Never zero.
     pub index: NonZeroU32,
 }
 
 impl SlotId
 {
-    /// Construct a `SlotId` from a statically non-zero index.
+    /// Construct a `SlotId` with epoch `0`.
+    ///
+    /// Used by call sites that do not yet thread a real registry epoch
+    /// through. While `CSpaceId` recycling remains gated (no `free_cspace_id`
+    /// has run, so every live entry has epoch `1`+ when registered), every
+    /// site still works against a registry that ignores the supplied epoch
+    /// on `lookup_cspace`. Sites that need to stamp a `SlotId` with the
+    /// registry's current value should use [`Self::with_epoch`] together
+    /// with `cap::registry_epoch`.
     ///
     /// Callers holding a raw `u32` must first convert via [`NonZeroU32::new`]
     /// and route the `None` case through their subsystem's error channel
@@ -55,7 +80,36 @@ impl SlotId
     /// zero indices become graceful errors rather than kernel panics.
     pub fn new(cspace_id: CSpaceId, index: NonZeroU32) -> Self
     {
-        Self { cspace_id, index }
+        Self {
+            cspace_id,
+            epoch: 0,
+            index,
+        }
+    }
+
+    /// Construct a `SlotId` with an explicit epoch.
+    pub fn with_epoch(cspace_id: CSpaceId, epoch: u32, index: NonZeroU32) -> Self
+    {
+        Self {
+            cspace_id,
+            epoch,
+            index,
+        }
+    }
+
+    /// Construct a `SlotId` by snapshotting the registry's current epoch
+    /// for `cspace_id`.
+    ///
+    /// The natural form for derivation-tree write sites: the link is being
+    /// stamped now, so the current registry epoch is the correct value.
+    /// Callers must hold a proof that the cspace is currently live (e.g.
+    /// they just resolved a slot in it, or it is the caller's own cspace).
+    /// If the registry has already retired this id, `registry_epoch`
+    /// returns the bumped value and the `SlotId` stamps with that — but
+    /// the caller's proof-of-life should make that case impossible.
+    pub fn current(cspace_id: CSpaceId, index: NonZeroU32) -> Self
+    {
+        Self::with_epoch(cspace_id, crate::cap::registry_epoch(cspace_id), index)
     }
 }
 
@@ -240,11 +294,11 @@ pub fn violates_wx(rights: Rights) -> bool
 
 /// A single capability slot in a `CSpace` page.
 ///
-/// Fixed at 56 bytes (`#[repr(C)]`). Slot 0 in every `CSpace` is permanently
+/// Fixed at 72 bytes (`#[repr(C)]`). Slot 0 in every `CSpace` is permanently
 /// null. Non-null slots hold a typed reference to a kernel object and an
 /// associated rights bitmask.
 ///
-/// ## Layout (56 bytes)
+/// ## Layout (72 bytes)
 ///
 /// ```text
 ///  offset  size  field
@@ -253,16 +307,19 @@ pub fn violates_wx(rights: Rights) -> bool
 ///       4     4  rights
 ///       8     8  token  (caller-identifying label; 0 = untokened)
 ///      16     8  object (naturally 8-byte aligned at offset 16)
-///      24     8  deriv_parent   (next_free index when tag == Null)
-///      32     8  deriv_first_child
-///      40     8  deriv_next_sibling
-///      48     8  deriv_prev_sibling
-/// total: 56 bytes
+///      24    12  deriv_parent   (next_free index when tag == Null)
+///      36    12  deriv_first_child
+///      48    12  deriv_next_sibling
+///      60    12  deriv_prev_sibling
+/// total: 72 bytes
 /// ```
 ///
-/// Without explicit `pad`, `#[repr(C)]` would insert 2 bytes before `rights`
-/// (to satisfy 4-byte alignment) and 6 bytes before `token` (8-byte alignment),
-/// yielding 64 bytes. The 3-byte pad absorbs both gaps.
+/// Each `Option<SlotId>` derivation pointer is 12 bytes (3 × u32, niche on
+/// `index: NonZeroU32`). Without explicit `pad`, `#[repr(C)]` would insert 2
+/// bytes before `rights` (to satisfy 4-byte alignment) and 6 bytes before
+/// `token` (8-byte alignment); the 3-byte pad absorbs both gaps. The struct
+/// alignment is 8 (from `token` and `object`); 72 is already a multiple of 8
+/// so no trailing pad is required.
 #[repr(C)]
 pub struct CapabilitySlot
 {
@@ -337,6 +394,11 @@ impl CapabilitySlot
     ///
     /// The free list never contains slot 0 (it is permanently null), so the
     /// non-zero invariant is encoded in the argument type.
+    ///
+    /// `cspace_id` and `epoch` in the encoded `SlotId` are sentinel zeros —
+    /// the free-list reader only consults `index`. A live derivation link is
+    /// always stamped with the registry's non-zero epoch, so `epoch == 0`
+    /// unambiguously distinguishes the two encodings.
     pub fn set_next_free(&mut self, next: Option<NonZeroU32>)
     {
         self.tag = CapTag::Null;
@@ -349,6 +411,7 @@ impl CapabilitySlot
         self.deriv_prev_sibling = None;
         self.deriv_parent = next.map(|index| SlotId {
             cspace_id: 0,
+            epoch: 0,
             index,
         });
     }
@@ -375,16 +438,22 @@ mod tests
     use core::mem::size_of;
 
     #[test]
-    fn capability_slot_is_56_bytes()
+    fn capability_slot_is_72_bytes()
     {
-        assert_eq!(size_of::<CapabilitySlot>(), 56);
+        assert_eq!(size_of::<CapabilitySlot>(), 72);
     }
 
     #[test]
-    fn option_slot_id_is_8_bytes()
+    fn slot_id_is_12_bytes()
     {
-        // Verifies niche optimization via NonZeroU32.
-        assert_eq!(size_of::<Option<SlotId>>(), 8);
+        assert_eq!(size_of::<SlotId>(), 12);
+    }
+
+    #[test]
+    fn option_slot_id_is_12_bytes()
+    {
+        // Verifies niche optimization via NonZeroU32 survives the epoch widen.
+        assert_eq!(size_of::<Option<SlotId>>(), 12);
     }
 
     #[test]
@@ -480,7 +549,17 @@ mod tests
     {
         let id = SlotId::new(1, NonZeroU32::new(5).unwrap());
         assert_eq!(id.cspace_id, 1);
+        assert_eq!(id.epoch, 0);
         assert_eq!(id.index.get(), 5);
+    }
+
+    #[test]
+    fn slot_id_with_epoch()
+    {
+        let id = SlotId::with_epoch(7, 42, NonZeroU32::new(3).unwrap());
+        assert_eq!(id.cspace_id, 7);
+        assert_eq!(id.epoch, 42);
+        assert_eq!(id.index.get(), 3);
     }
 
     #[test]

@@ -549,7 +549,7 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     let frame_idx_nz =
         core::num::NonZeroU32::new(frame_idx).ok_or(SyscallError::InvalidCapability)?;
-    let parent_id = SlotId::new(cspace_id, frame_idx_nz);
+    let parent_id = SlotId::current(cspace_id, frame_idx_nz);
 
     // ── Acquire locks (DERIVATION outer, frame-write inner) ──────────────────
     DERIVATION_LOCK.write_lock();
@@ -649,7 +649,7 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::OutOfMemory);
     };
     let tail_slot = tail_slot_nz.get();
-    let tail_id = SlotId::new(cspace_id, tail_slot_nz);
+    let tail_id = SlotId::current(cspace_id, tail_slot_nz);
 
     // ── Wire derivation: tail becomes a sibling of parent under parent's parent ──
 
@@ -862,7 +862,7 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
     // SAFETY: caller_cspace validated non-null.
     let cspace_id = unsafe { (*caller_cspace).id() };
-    let tail_id = SlotId::new(cspace_id, tail_idx_nz);
+    let tail_id = SlotId::current(cspace_id, tail_idx_nz);
     let _ = parent_idx_nz; // parent slot not unlinked (it stays alive)
 
     // SAFETY: DERIVATION_LOCK held; indices within CSpace bounds.

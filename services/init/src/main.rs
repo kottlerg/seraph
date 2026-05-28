@@ -125,14 +125,16 @@ pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
 
 /// Pages init carves for memmgr/procmgr's `CSpace`. Each slot page holds
-/// 64 capability slots (3584 B); the +1 covers per-FrameObject allocator
-/// metadata. Mirrors procmgr's constant.
+/// `L2_SIZE` capability slots (currently 56 slots × 72 B = 4032 B/page);
+/// the +1 covers per-FrameObject allocator metadata. Mirrors procmgr's
+/// constant.
 ///
 /// Sized for the long-lived service's full lifetime: procmgr accumulates
 /// per-child caps (aspace, cspace, thread, frame slabs, derived rights
-/// caps) while children are alive. 33 pages → 32 slot pages → 2048 slots
-/// = ~32 children (aspace/cspace/thread/4 frame caps each) plus working
-/// caps. Larger workloads refill via augment-mode `cap_create_cspace`.
+/// caps) while children are alive. 33 pages → 32 slot pages → ~1792
+/// slots = ~28 children (aspace/cspace/thread/4 frame caps each) plus
+/// working caps. Larger workloads refill via augment-mode
+/// `cap_create_cspace`.
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 33;
 
 /// Base for init's scratch mappings (`ProcessInfo` frames, ELF pages).

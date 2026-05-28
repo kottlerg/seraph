@@ -7,7 +7,7 @@
 //!
 //! A [`CSpace`] is a two-level directory of [`CapabilitySlot`]s. The directory
 //! has [`L1_SIZE`] entries; each points to a [`CSpacePage`] containing
-//! [`L2_SIZE`] slots. Maximum capacity: `L1_SIZE * L2_SIZE = 16384` slots.
+//! [`L2_SIZE`] slots. Maximum capacity: `L1_SIZE * L2_SIZE = 14336` slots.
 //!
 //! ## Free list
 //!
@@ -18,10 +18,10 @@
 //! ## Growth
 //!
 //! `CSpace` pages are allocated on demand by [`CSpace::grow`]. The first page
-//! skips slot 0 (always null); subsequent pages contribute all 64 slots to the
+//! skips slot 0 (always null); subsequent pages contribute all 56 slots to the
 //! free list.
 
-// cast_possible_truncation: usize→u32 slot index bounded by L1_SIZE * L2_SIZE (16384).
+// cast_possible_truncation: usize→u32 slot index bounded by L1_SIZE * L2_SIZE (14336).
 #![allow(clippy::cast_possible_truncation)]
 
 // `alloc` is needed by the host-test stubs (CSpace::grow heap fallback,
@@ -41,10 +41,11 @@ use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Slots per `CSpace` page (64 × 56 B = 3584 B, fits in a 4096-byte slab bin).
-pub const L2_SIZE: usize = 64;
+/// Slots per `CSpace` page (56 × 72 B = 4032 B, fits in a 4096-byte slab bin
+/// with 64 B of tail slack).
+pub const L2_SIZE: usize = 56;
 
-/// Directory entries per `CSpace` (max 256 × 64 = 16384 slots).
+/// Directory entries per `CSpace` (max 256 × 56 = 14336 slots).
 pub const L1_SIZE: usize = 256;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -76,6 +77,16 @@ struct CSpacePage
     slots: [CapabilitySlot; L2_SIZE],
 }
 
+// CSpacePage MUST fit in a single 4 KiB page — `alloc_slot_page` returns
+// `PAGE_SIZE`-aligned bytes and the kernel casts that to `*mut CSpacePage`
+// expecting one struct per allocation. A regression that grows
+// `CapabilitySlot` beyond the headroom would overflow the slab silently;
+// the assertion makes that a build error.
+const _: () = assert!(
+    core::mem::size_of::<CSpacePage>() <= crate::mm::PAGE_SIZE,
+    "CSpacePage exceeds PAGE_SIZE — reduce L2_SIZE or shrink CapabilitySlot"
+);
+
 // ── CSpace ────────────────────────────────────────────────────────────────────
 
 /// A capability space: a growable indexed collection of capability slots.
@@ -96,7 +107,7 @@ struct CSpacePage
 pub struct CSpace
 {
     id: CSpaceId,
-    /// Two-level directory; each Some entry is a 64-slot page.
+    /// Two-level directory; each Some entry is an `L2_SIZE`-slot page.
     /// Pages are stored as raw `NonNull` pointers so the heap-backed and
     /// retype-pool-backed paths can coexist with different reclamation
     /// semantics. The `kobj` field discriminates: null = heap (Drop walks
@@ -309,6 +320,24 @@ impl CSpace
         // SAFETY: same as `slot`; `&mut self` excludes other readers.
         let page = unsafe { page_nn.as_mut() };
         Some(&mut page.slots[slot_idx])
+    }
+
+    /// Return the raw page pointer for a directory entry, or `None` if the
+    /// entry is unmapped or `page_idx` is out of range.
+    ///
+    /// Used by the pre-unregister derivation drain in
+    /// `dealloc_object(CSpaceObj)` to determine which pages of the dying
+    /// `CSpace` are populated without holding a `&self` borrow across
+    /// per-slot calls into foreign `CSpace`s. The returned pointer is for
+    /// presence-testing only — callers MUST go through `slot`/`slot_mut`
+    /// for any actual read or write.
+    pub(crate) fn page_at(&self, page_idx: usize) -> Option<core::ptr::NonNull<u8>>
+    {
+        self.directory
+            .get(page_idx)
+            .copied()
+            .flatten()
+            .map(core::ptr::NonNull::cast::<u8>)
     }
 
     /// Return a slot to the free list and clear its contents.
@@ -685,9 +714,9 @@ mod tests
     #[test]
     fn max_slots_enforced()
     {
-        // max_slots = 63: exactly one page minus slot 0.
-        let mut cs = CSpace::new(0, 63);
-        for _ in 0..63
+        // max_slots = L2_SIZE - 1: exactly one page minus slot 0.
+        let mut cs = CSpace::new(0, L2_SIZE - 1);
+        for _ in 0..(L2_SIZE - 1)
         {
             cs.allocate_slot().unwrap();
         }

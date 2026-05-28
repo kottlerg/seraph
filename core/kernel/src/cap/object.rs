@@ -103,15 +103,26 @@ pub struct KernelObjectHeader
     pub ref_count: AtomicU32,
     /// Concrete type, for use during deallocation.
     pub obj_type: ObjectType,
+    /// Lifecycle flags. See `HDR_FLAG_*` constants. Currently only used to
+    /// mark the boot root `CSpace` as undestroyable.
+    pub flags: u8,
     // Padding to reach 8-byte alignment for the ancestor pointer below.
     #[allow(clippy::pub_underscore_fields)]
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 2],
     /// Pointer to the `FrameObject`'s header this object was retyped from,
     /// or null if allocated via the legacy heap path. Set once at creation,
     /// read at deallocation. `AtomicPtr` for the unforgeable null sentinel
     /// without imposing const-init constraints on construction.
     pub ancestor: AtomicPtr<KernelObjectHeader>,
 }
+
+/// `flags` bit: this header belongs to the boot root `CSpace` and MUST NOT
+/// be deallocated. `dec_ref` intercepts the `→ 0` transition for these
+/// headers and returns 1, keeping the object alive regardless of upstream
+/// refcount mismanagement. Stamped in
+/// [`crate::cap::boot_retype_cspace`] for the root `CSpace`; never set
+/// elsewhere.
+pub const HDR_FLAG_IS_ROOT: u8 = 0x01;
 
 // SAFETY: ancestor is a back-pointer to a kernel object whose lifetime is
 // guaranteed by retype's refcount semantics. Send+Sync via the surrounding
@@ -132,7 +143,8 @@ impl KernelObjectHeader
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
-            _pad: [0; 3],
+            flags: 0,
+            _pad: [0; 2],
             ancestor: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -147,7 +159,8 @@ impl KernelObjectHeader
         Self {
             ref_count: AtomicU32::new(1),
             obj_type,
-            _pad: [0; 3],
+            flags: 0,
+            _pad: [0; 2],
             ancestor: AtomicPtr::new(ancestor.as_ptr()),
         }
     }
@@ -163,8 +176,43 @@ impl KernelObjectHeader
     ///
     /// Returns 0 when the object has no remaining capability references; the
     /// caller is responsible for freeing the object at that point.
+    ///
+    /// Headers carrying [`HDR_FLAG_IS_ROOT`] (the boot root `CSpace`) clamp
+    /// at 1 via a CAS loop: when the current count is 1 the operation is a
+    /// no-op (returns 1); otherwise it decrements by one. The CAS form
+    /// avoids the fetch_sub-then-restore window in which a concurrent dec
+    /// would see 0 and underflow. The root `CSpace` lives for kernel
+    /// lifetime and never reaches `dealloc_object`, even if upstream
+    /// refcount accounting mismanages the ancillary slot/wrapper pair.
     pub fn dec_ref(&self) -> u32
     {
+        if (self.flags & HDR_FLAG_IS_ROOT) != 0
+        {
+            // Root path: CAS the floor in atomically so concurrent decs
+            // cannot observe a transient 0.
+            let mut cur = self.ref_count.load(Ordering::Relaxed);
+            loop
+            {
+                debug_assert!(
+                    cur != 0,
+                    "dec_ref underflow on IS_ROOT header: obj_type={:?} self={:p}",
+                    self.obj_type,
+                    self,
+                );
+                let new = if cur == 1 { 1 } else { cur - 1 };
+                match self.ref_count.compare_exchange_weak(
+                    cur,
+                    new,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                {
+                    Ok(_) => return new,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
         debug_assert!(
             prev != 0,
@@ -1731,6 +1779,14 @@ unsafe fn dealloc_object_one(
         // least one chunk slot covering the wrapper plus the slot-page pool.
         // Reclamation walks the chunk slots and `retype_free`s each one
         // wholesale, then `dec_ref`s the ancestor.
+        //
+        // Before `unregister_cspace` and the dec_ref cascade run, the
+        // derivation tree's external back-links into this dying `CSpace`
+        // are scrubbed by [`drain_dying_cspace`]. Combined with the
+        // [`SlotId`] epoch check in `lookup_cspace`, this is the
+        // defense-in-depth that lets `free_cspace_id` recycle the id
+        // safely: foreign slots cannot retain a back-link, and any that
+        // somehow slip through fail-fast on epoch mismatch.
         ObjectType::CSpaceObj =>
         {
             // SAFETY: ptr points at an in-place CSpaceKernelObject; header at offset 0.
@@ -1742,13 +1798,47 @@ unsafe fn dealloc_object_one(
                 "dealloc CSpaceObj: heap-backed CSpace reached typed-memory dealloc path"
             );
 
+            // Captured for the final `free_cspace_id` after the lock release;
+            // 0 means "no dying id" (cs_ptr was null), which short-circuits
+            // the free-list push below.
+            let mut dying_id: crate::cap::slot::CSpaceId = 0;
+            let mut needs_free_id = false;
+
             if !cs_ptr.is_null()
             {
                 // SAFETY: cs_ptr non-null; allocated at creation.
                 let id = unsafe { (*cs_ptr).id() };
-                crate::cap::unregister_cspace(id);
+                dying_id = id;
+                let dying_epoch = crate::cap::registry_epoch(id);
 
-                // Dec-ref all objects referenced by non-null slots.
+                // ── Pre-unregister derivation drain ──
+                // Hold DERIVATION_LOCK exclusively for the drain + unregister
+                // pair only. The drain walks each populated slot, snapshots
+                // its outgoing derivation pointers under a brief per-slot
+                // &mut, clears them, then splices the corresponding back-
+                // links in foreign slots. `unregister_cspace` runs inside
+                // the same critical section so any concurrent foreign reader
+                // sees a consistent "drained, then absent" transition.
+                //
+                // The lock MUST be released BEFORE the `for_each_object`
+                // dec_ref cascade below: a slot in the dying CSpace may hold
+                // a CSpace cap whose dec_ref drives a nested
+                // `dealloc_object(CSpaceObj)` call, which would re-enter
+                // this same non-recursive lock and deadlock. The drain
+                // already removed every foreign back-link before this
+                // point, so the dec_ref cascade has no derivation-tree
+                // work to do — releasing is safe.
+                crate::cap::derivation::DERIVATION_LOCK.write_lock();
+                // SAFETY: DERIVATION_LOCK held; cs_ptr uniquely owned at
+                // refcount=0; registry entry still live (unregister below).
+                unsafe { drain_dying_cspace(cs_ptr, id, dying_epoch) };
+                crate::cap::unregister_cspace(id);
+                crate::cap::derivation::DERIVATION_LOCK.write_unlock();
+
+                // Dec-ref all objects referenced by non-null slots. Runs
+                // without DERIVATION_LOCK so nested CSpaceObj deallocs (a
+                // dying CSpace whose slots hold caps to other CSpaces) can
+                // acquire it themselves without re-entry.
                 // SAFETY: cs_ptr non-null; for_each_object handles iteration.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {
@@ -1769,6 +1859,11 @@ unsafe fn dealloc_object_one(
                 unsafe {
                     core::ptr::drop_in_place(cs_ptr);
                 }
+
+                // Don't recycle id 0 (root CSpace's id). The root is also
+                // pinned by HDR_FLAG_IS_ROOT so this branch is unreachable
+                // for the root in practice; the guard is defense-in-depth.
+                needs_free_id = id != 0;
             }
 
             // Snapshot every chunk slot before freeing — `retype_free`
@@ -1806,6 +1901,15 @@ unsafe fn dealloc_object_one(
                     let anc_nn = unsafe { NonNull::new_unchecked(anc_ptr) };
                     push_ancestor(worklist, head, anc_nn);
                 }
+            }
+
+            // Recycle the id last, after all of the dying CSpace's storage
+            // is reclaimed and DERIVATION_LOCK is released. Bumping the
+            // epoch now invalidates any surviving SlotId stamped with the
+            // pre-recycle value — subsequent `lookup_cspace` returns None.
+            if needs_free_id
+            {
+                crate::cap::free_cspace_id(dying_id);
             }
 
             // No separate `Box::from_raw(obj)` — the wrapper lives inside
@@ -2157,6 +2261,228 @@ unsafe fn dealloc_object_one(
                 push_ancestor(worklist, head, ancestor_nn);
             }
         }
+    }
+}
+
+// ── CSpace teardown helpers ──────────────────────────────────────────────────
+
+/// Pre-unregister derivation drain for a dying `CSpace`.
+///
+/// Iterates each populated slot in `cs_ptr` and splices the slot out of its
+/// foreign back-link chains so that, after `unregister_cspace` runs, no
+/// foreign slot in any other `CSpace` retains a derivation pointer into the
+/// dying one. Combined with the per-id epoch check in
+/// `crate::cap::lookup_cspace`, this lets `free_cspace_id` recycle the id
+/// safely.
+///
+/// ## Aliasing avoidance
+///
+/// PR #136's first recycling attempt hit a release-mode aliasing UB: an
+/// outer iteration holding `&CSpacePage` while an inner closure took
+/// `&mut CapabilitySlot` to a slot inside the same page. This drain
+/// avoids the hazard structurally — no borrow into `cs_ptr` is held
+/// across foreign-slot accesses. The per-slot scope is:
+///
+/// 1. A brief `unsafe { (*cs_ptr).slot_mut(idx) }` produces a
+///    `&mut CapabilitySlot` purely to snapshot the four `deriv_*` fields
+///    into stack locals and clear them in place. The borrow ends at the
+///    block boundary.
+/// 2. The foreign-write step calls into [`drain_foreign_back_links`],
+///    which only accesses foreign `CSpace`s via fresh
+///    `lookup_cspace`/`slot_mut` calls. Intra-cspace siblings/children
+///    are short-circuited and never re-borrowed from inside this scope.
+///
+/// # Safety
+///
+/// Caller MUST hold `DERIVATION_LOCK` write lock. `cs_ptr` MUST be a valid
+/// `CSpace` pointer whose refcount has reached zero (i.e. exclusive
+/// ownership). The registry entry for `dying_id` MUST still be live
+/// (i.e. `unregister_cspace` has not yet run); the deferred unregister
+/// allows the drain itself to splice through `lookup_cspace`.
+#[cfg(not(test))]
+unsafe fn drain_dying_cspace(
+    cs_ptr: *mut crate::cap::cspace::CSpace,
+    dying_id: crate::cap::slot::CSpaceId,
+    dying_epoch: u32,
+)
+{
+    use crate::cap::cspace::{L1_SIZE, L2_SIZE};
+    use crate::cap::slot::{CapTag, SlotId};
+    use core::num::NonZeroU32;
+
+    for page_idx in 0..L1_SIZE
+    {
+        // Presence-test the page without holding a `&CSpace` borrow into
+        // the per-slot scope below.
+        // SAFETY: cs_ptr is uniquely owned; `page_at` takes `&self` briefly
+        // and returns before the borrow can be observed elsewhere.
+        if unsafe { (*cs_ptr).page_at(page_idx) }.is_none()
+        {
+            continue;
+        }
+        let start = usize::from(page_idx == 0);
+        for slot_idx_in_page in start..L2_SIZE
+        {
+            let global_idx = (page_idx * L2_SIZE + slot_idx_in_page) as u32;
+            let Some(global_idx_nz) = NonZeroU32::new(global_idx)
+            else
+            {
+                continue;
+            };
+
+            // Step A — local read + clear under a brief per-slot &mut.
+            // The borrow ends at the block boundary; the four snapshots
+            // are `Copy` and outlive it.
+            // SAFETY: cs_ptr is uniquely owned (refcount=0); the &mut
+            // produced by slot_mut is the only borrow into this slot for
+            // the duration of the block and is dropped before any foreign
+            // access.
+            let (parent, fc, prev, next, populated) = unsafe {
+                if let Some(slot) = (*cs_ptr).slot_mut(global_idx)
+                {
+                    if slot.tag == CapTag::Null
+                    {
+                        (None, None, None, None, false)
+                    }
+                    else
+                    {
+                        let p = slot.deriv_parent;
+                        let c = slot.deriv_first_child;
+                        let pr = slot.deriv_prev_sibling;
+                        let nx = slot.deriv_next_sibling;
+                        slot.deriv_parent = None;
+                        slot.deriv_first_child = None;
+                        slot.deriv_prev_sibling = None;
+                        slot.deriv_next_sibling = None;
+                        (p, c, pr, nx, true)
+                    }
+                }
+                else
+                {
+                    (None, None, None, None, false)
+                }
+            };
+            if !populated
+            {
+                continue;
+            }
+
+            let self_id = SlotId::with_epoch(dying_id, dying_epoch, global_idx_nz);
+
+            // Step B — foreign splice. No borrow into `cs_ptr` is held.
+            // SAFETY: DERIVATION_LOCK held; foreign cspaces resolved via
+            // registry lookup with epoch validation.
+            unsafe {
+                drain_foreign_back_links(self_id, dying_id, parent, fc, prev, next);
+            }
+        }
+    }
+}
+
+/// Splice `self_id`'s back-references out of foreign `CSpace` slots.
+///
+/// Intra-cspace back-links (where the back-reference lives in the dying
+/// `CSpace` itself) are skipped — those slots are either already cleared
+/// by an earlier iteration of [`drain_dying_cspace`] or will be cleared
+/// shortly. Their derivation pointers don't matter because the entire
+/// dying `CSpace`'s storage is about to be reclaimed.
+///
+/// For the children walk: a foreign child has its `deriv_parent` nulled
+/// (orphaned). Intra-cspace children are skipped for the same reason
+/// above. `next_sibling` advancement reads through `slot()` (immutable),
+/// which is safe because we never re-enter Step A's `&mut` for the dying
+/// `CSpace` inside this function's scope.
+///
+/// # Safety
+///
+/// Caller MUST hold `DERIVATION_LOCK` write lock. `dying_id`'s registry
+/// entry MUST still be live so `lookup_cspace(dying_id, dying_epoch)`
+/// resolves for the intra-cspace child-chain walk.
+#[cfg(not(test))]
+unsafe fn drain_foreign_back_links(
+    self_id: crate::cap::slot::SlotId,
+    dying_id: crate::cap::slot::CSpaceId,
+    parent: Option<crate::cap::slot::SlotId>,
+    first_child: Option<crate::cap::slot::SlotId>,
+    prev: Option<crate::cap::slot::SlotId>,
+    next: Option<crate::cap::slot::SlotId>,
+)
+{
+    // Parent: if first_child pointed at self_id, redirect to next sibling.
+    // (We don't attempt to find a different non-dying child; the next
+    // sibling may itself be in dying — that's fine, epoch defense will
+    // reject it on the next lookup after `free_cspace_id`.)
+    if let Some(p) = parent
+        && p.cspace_id != dying_id
+        && let Some(parent_cs) = crate::cap::lookup_cspace(p.cspace_id, p.epoch)
+    {
+        // SAFETY: parent_cs from registry; DERIVATION_LOCK held.
+        if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(p.index.get()) }
+            && parent_slot.deriv_first_child == Some(self_id)
+        {
+            parent_slot.deriv_first_child = next;
+        }
+    }
+
+    // Prev sibling: splice self_id out of the chain (its next becomes our next).
+    if let Some(pr) = prev
+        && pr.cspace_id != dying_id
+        && let Some(prev_cs) = crate::cap::lookup_cspace(pr.cspace_id, pr.epoch)
+    {
+        // SAFETY: prev_cs from registry; DERIVATION_LOCK held.
+        if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(pr.index.get()) }
+            && prev_slot.deriv_next_sibling == Some(self_id)
+        {
+            prev_slot.deriv_next_sibling = next;
+        }
+    }
+
+    // Next sibling: splice self_id out of the chain (its prev becomes our prev).
+    if let Some(nx) = next
+        && nx.cspace_id != dying_id
+        && let Some(next_cs) = crate::cap::lookup_cspace(nx.cspace_id, nx.epoch)
+    {
+        // SAFETY: next_cs from registry; DERIVATION_LOCK held.
+        if let Some(next_slot) = unsafe { (*next_cs).slot_mut(nx.index.get()) }
+            && next_slot.deriv_prev_sibling == Some(self_id)
+        {
+            next_slot.deriv_prev_sibling = prev;
+        }
+    }
+
+    // Children chain: orphan each foreign child by nulling its
+    // deriv_parent. Walk via next_sibling. Intra-cspace children are
+    // visited only to read next_sibling and continue the walk.
+    let mut cur = first_child;
+    while let Some(c) = cur
+    {
+        let next_in_chain = if c.cspace_id == dying_id
+        {
+            // Intra-cspace: don't touch (it's being iterated independently).
+            // Read next_sibling via immutable `slot()` to advance the walk.
+            // SAFETY: lookup returns the dying CSpace's ptr; immutable `&`
+            // borrow is exclusive with respect to drain_dying_cspace's
+            // per-slot `&mut` because Step A's scope already ended.
+            crate::cap::lookup_cspace(c.cspace_id, c.epoch)
+                .and_then(|cs| unsafe { (*cs).slot(c.index.get()) })
+                .and_then(|s| s.deriv_next_sibling)
+        }
+        else
+        {
+            // Foreign: resolve, snapshot next_sibling, null deriv_parent.
+            // SAFETY: foreign cspace lookup; DERIVATION_LOCK held.
+            crate::cap::lookup_cspace(c.cspace_id, c.epoch).and_then(|cs| unsafe {
+                (*cs).slot_mut(c.index.get()).and_then(|slot| {
+                    let n = slot.deriv_next_sibling;
+                    if slot.deriv_parent == Some(self_id)
+                    {
+                        slot.deriv_parent = None;
+                    }
+                    n
+                })
+            })
+        };
+        cur = next_in_chain;
     }
 }
 

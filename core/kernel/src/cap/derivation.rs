@@ -133,7 +133,7 @@ impl DerivationLock
 /// is valid only while the lock is held and the `CSpace` is live.
 unsafe fn resolve_slot_mut(id: SlotId) -> Option<&'static mut super::slot::CapabilitySlot>
 {
-    let cs_ptr = crate::cap::lookup_cspace(id.cspace_id)?;
+    let cs_ptr = crate::cap::lookup_cspace(id.cspace_id, id.epoch)?;
     // SAFETY: cspace registry lookup validated; CSpace pointer lives as long as the registry entry.
     let cs = unsafe { &mut *cs_ptr };
     cs.slot_mut(id.index.get())
@@ -429,7 +429,7 @@ pub unsafe fn revoke_subtree(root: SlotId) -> &'static [Option<NonNull<KernelObj
             continue;
         };
 
-        let Some(cs_ptr) = crate::cap::lookup_cspace(node_id.cspace_id)
+        let Some(cs_ptr) = crate::cap::lookup_cspace(node_id.cspace_id, node_id.epoch)
         else
         {
             continue;

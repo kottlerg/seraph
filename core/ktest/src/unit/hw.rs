@@ -25,11 +25,11 @@ use crate::{TestContext, TestResult};
 const MMIO_TEST_VA: u64 = 0x5000_0000;
 
 /// Kernel pin: every `CSpace` is clamped to at most `L1_SIZE * L2_SIZE`
-/// (256 * 64 = 16384) slots. Used as a fallback if `cap_info` ever
+/// (256 * 56 = 14336) slots. Used as a fallback if `cap_info` ever
 /// returns a value larger than `u32::MAX`, which the kernel's own
 /// invariants forbid today.
 #[cfg(target_arch = "x86_64")]
-const ROOT_CSPACE_MAX_SLOTS: u32 = 16384;
+const ROOT_CSPACE_MAX_SLOTS: u32 = 14336;
 
 // ── SYS_MMIO_MAP ──────────────────────────────────────────────────────────────
 

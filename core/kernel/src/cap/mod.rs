@@ -125,101 +125,304 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
     }
 }
 
-/// Maximum number of `CSpaceId` slots ever allocated in a kernel lifetime.
+/// Maximum number of `CSpace`s that can be live in the registry at one time.
 ///
-/// The allocator is monotonic ([`NEXT_CSPACE_ID`] `fetch_add`); freed IDs
-/// are not reused. This is a cumulative-ever bound, not a live-`CSpace`
-/// bound — every `cap_create_cspace` consumes a fresh ID. 65536 × 8 B =
-/// 512 KiB BSS for [`CSPACE_REGISTRY`], sized to cover the ramped ktest
-/// stress sequence (~14k `CSpace`s cumulatively) with 4× headroom. Issue
-/// #137 tracks switching to a recycling allocator (needs either
-/// generation counters in `SlotId` or a pre-unregister drain of external
-/// derivation back-links — both touch substantial code paths).
-const MAX_CSPACES: usize = 65536;
-
-/// Monotonically increasing `CSpace` ID allocator. Root gets ID 0. See
-/// [`MAX_CSPACES`] for the namespace-bound rationale and #137 for the
-/// recycling follow-up.
-static NEXT_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
-
-/// Global registry mapping `CSpaceId` → raw *mut `CSpace.`
+/// IDs are recycled via the [`CSPACE_FREE_LIST`] free list once
+/// [`free_cspace_id`] runs at the end of a `CSpace`'s `dealloc_object` pass,
+/// so this is a live-count bound — not the cumulative-ever bound it used to
+/// be under the pre-#137 monotonic allocator. Per-id generation counters in
+/// [`CSPACE_REGISTRY`] make any pre-existing stale `SlotId` resolution fail
+/// fast on epoch mismatch, so recycling cannot mis-target a recycled
+/// tenant. The pre-unregister derivation drain (`dealloc_object` for
+/// `CSpaceObj`) additionally scrubs the back-links in steady state.
 ///
-/// Populated by [`register_cspace`] when a `CSpace` is created, cleared by
-/// [`unregister_cspace`] when the backing object is freed. Required for
-/// derivation tree traversal: `SlotId` stores a `CSpaceId`, and we need
-/// O(1) resolution to the actual `CSpace` to read/write derivation pointers.
+/// Live-count peaks in ktest stress today sit in the low hundreds; 4096
+/// gives 10–40× headroom while reclaiming ~432 KiB of BSS the
+/// pre-#137 65536-entry registry burned (65536 × 8 B = 512 KiB old
+/// registry vs 4096 × 16 B = 64 KiB new registry + 4096 × 4 B = 16 KiB
+/// free list = 80 KiB total; 512 − 80 = 432 KiB net). A future workload
+/// that genuinely needs more live `CSpace`s only has to bump this
+/// constant — no layout, ABI, or algorithmic change is required.
+const MAX_CSPACES: usize = 4096;
+
+/// High-water mark for the bump-allocator side of `alloc_cspace_id` — only
+/// consulted when the free list is empty. Once `HIGH_WATER_CSPACE_ID` reaches
+/// `MAX_CSPACES`, no new id can be minted until a prior id is recycled.
+static HIGH_WATER_CSPACE_ID: AtomicU32 = AtomicU32::new(0);
+
+/// One slot of the global `CSpace` registry.
+///
+/// `ptr` is the live `CSpace` pointer or null when the slot is vacant.
+/// `epoch` is a generation counter incremented each time an id is freed
+/// (see [`free_cspace_id`]); a `SlotId` stamped with a stale epoch fails
+/// resolution at [`lookup_cspace`] so a recycled id cannot alias a foreign
+/// derivation link into the new tenant.
+///
+/// `align(16)` colocates `ptr` and `epoch` on the same cache line and leaves
+/// room for a future 16-byte CAS if contention warrants it.
+#[repr(C, align(16))]
+struct CSpaceRegistryEntry
+{
+    ptr: AtomicPtr<CSpace>,
+    epoch: AtomicU32,
+    _pad: [u8; 4],
+}
+
+impl CSpaceRegistryEntry
+{
+    const fn empty() -> Self
+    {
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+            // Epoch starts at 1 so the sentinel value `0` (used by the
+            // free-list intrusive encoding in `CapabilitySlot::set_next_free`)
+            // never matches any live entry — a stale lookup of a free-listed
+            // slot resolves to `None` rather than the root `CSpace`.
+            epoch: AtomicU32::new(1),
+            _pad: [0; 4],
+        }
+    }
+}
+
+/// Global registry mapping `CSpaceId` → (`*mut CSpace`, epoch).
+///
+/// Populated by [`register_cspace`] when a `CSpace` is created. Cleared by
+/// [`unregister_cspace`] when the backing object is freed. The epoch is
+/// bumped by [`free_cspace_id`] at the end of `dealloc_object` so any
+/// stale `SlotId` carrying the old epoch fails fast on subsequent
+/// resolution.
 ///
 /// # Safety invariant
-/// A non-null entry is valid as long as the corresponding `CSpaceKernelObject`
+/// A non-null `ptr` is valid as long as the corresponding `CSpaceKernelObject`
 /// refcount is > 0. After `dec_ref` reaches 0 and `dealloc_object` runs,
-/// `unregister_cspace` clears the entry before the memory is freed.
-// SAFETY: AtomicPtr<CSpace> is Send+Sync; array-of-atomics is always valid
-// for static initialisation.
-static CSPACE_REGISTRY: [AtomicPtr<CSpace>; MAX_CSPACES] = {
-    // SAFETY: AtomicPtr<T> is repr(transparent) over *mut T; zero-initialized usize array
-    // is valid array of null AtomicPtr values.
+/// `unregister_cspace` clears `ptr` before the memory is freed, and
+/// `free_cspace_id` bumps `epoch` before the id returns to the free list.
+static CSPACE_REGISTRY: [CSpaceRegistryEntry; MAX_CSPACES] =
+    [const { CSpaceRegistryEntry::empty() }; MAX_CSPACES];
+
+/// Free list of returned `CSpaceId`s, popped LIFO before
+/// [`HIGH_WATER_CSPACE_ID`] is bumped.
+///
+/// Protected by [`CSPACE_FREE_LIST_LOCK`]. The stack stores released ids;
+/// `len` is the number of valid entries. Single global spinlock is fine —
+/// cap-create/destroy is rare relative to IPC/map fast paths, and the
+/// critical sections are O(1) push/pop.
+#[cfg(not(test))]
+static CSPACE_FREE_LIST_LOCK: crate::sync::Spinlock = crate::sync::Spinlock::new();
+#[cfg(not(test))]
+static mut CSPACE_FREE_LIST: [CSpaceId; MAX_CSPACES] = [0; MAX_CSPACES];
+#[cfg(not(test))]
+static mut CSPACE_FREE_LIST_LEN: usize = 0;
+
+/// Push a recycled id onto the free list.
+///
+/// Called from [`free_cspace_id`] after the epoch bump. Saturating: if the
+/// free list is already at capacity (impossible by construction since we
+/// only push ids in `[0, MAX_CSPACES)` and `MAX_CSPACES` slots fit), the
+/// id leaks rather than panicking.
+#[cfg(not(test))]
+fn push_free(id: CSpaceId)
+{
+    // SAFETY: lock serialises all free-list mutations.
+    let saved = unsafe { CSPACE_FREE_LIST_LOCK.lock_raw() };
+    // SAFETY: single-writer access under lock.
     unsafe {
-        core::mem::transmute::<[usize; MAX_CSPACES], [AtomicPtr<CSpace>; MAX_CSPACES]>(
-            [0usize; MAX_CSPACES],
-        )
+        if CSPACE_FREE_LIST_LEN < MAX_CSPACES
+        {
+            CSPACE_FREE_LIST[CSPACE_FREE_LIST_LEN] = id;
+            CSPACE_FREE_LIST_LEN += 1;
+        }
     }
-};
+    // SAFETY: paired with lock_raw above.
+    unsafe { CSPACE_FREE_LIST_LOCK.unlock_raw(saved) };
+}
+
+/// Pop a recycled id from the free list, or `None` if empty.
+#[cfg(not(test))]
+fn pop_free() -> Option<CSpaceId>
+{
+    // SAFETY: lock serialises all free-list mutations.
+    let saved = unsafe { CSPACE_FREE_LIST_LOCK.lock_raw() };
+    // SAFETY: single-writer access under lock.
+    let id = unsafe {
+        if CSPACE_FREE_LIST_LEN > 0
+        {
+            CSPACE_FREE_LIST_LEN -= 1;
+            Some(CSPACE_FREE_LIST[CSPACE_FREE_LIST_LEN])
+        }
+        else
+        {
+            None
+        }
+    };
+    // SAFETY: paired with lock_raw above.
+    unsafe { CSPACE_FREE_LIST_LOCK.unlock_raw(saved) };
+    id
+}
+
+/// Allocate a unique `CSpace` ID.
+///
+/// Pops a recycled id off the free list first; otherwise bumps the
+/// high-water counter. Returns `None` once `MAX_CSPACES` are simultaneously
+/// live (callers must surface `SyscallError::OutOfMemory`).
+///
+/// The root `CSpace` receives id `0` at init time via the high-water path
+/// — Phase 7 runs before any `free_cspace_id` could populate the free list,
+/// so the root deterministically gets id 0 (and is hard-rejected from
+/// returning to the free list by [`free_cspace_id`]).
+#[cfg(not(test))]
+pub fn alloc_cspace_id() -> Option<CSpaceId>
+{
+    if let Some(id) = pop_free()
+    {
+        return Some(id);
+    }
+    let next = HIGH_WATER_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
+    if (next as usize) >= MAX_CSPACES
+    {
+        // Clamp so the counter doesn't wrap u32 under sustained pressure.
+        HIGH_WATER_CSPACE_ID.store(MAX_CSPACES as u32, Ordering::Relaxed);
+        return None;
+    }
+    Some(next)
+}
+
+/// Test-only stub: monotonic allocation, no recycling.
+///
+/// The host-side test path doesn't exercise the lock primitive or the BSS
+/// free list (no SMP, no interrupts), and tests only ever create the single
+/// root CSpace before tearing down. The simple monotonic allocator matches
+/// the pre-#137 behavior exactly.
+#[cfg(test)]
+pub fn alloc_cspace_id() -> Option<CSpaceId>
+{
+    let next = HIGH_WATER_CSPACE_ID.fetch_add(1, Ordering::Relaxed);
+    if (next as usize) >= MAX_CSPACES
+    {
+        return None;
+    }
+    Some(next)
+}
 
 /// Register a `CSpace` pointer under its ID.
 ///
-/// Called immediately after a [`CSpace`] is heap-allocated. Returns
-/// `Err(())` if `id >= MAX_CSPACES` so the caller can surface
-/// `SyscallError::OutOfMemory` and roll back, rather than silently leaving
-/// the derivation tree unable to resolve the new `CSpace` (the
-/// pre-#128-fix behaviour that masked the namespace-exhaustion bug).
-pub fn register_cspace(id: CSpaceId, ptr: *mut CSpace) -> Result<(), ()>
+/// Called immediately after a [`CSpace`] is allocated. Returns the registry
+/// entry's current epoch so the caller can stamp `SlotId`s minted in this
+/// `CSpace`'s lifetime. Returns `Err(())` if `id >= MAX_CSPACES`.
+pub fn register_cspace(id: CSpaceId, ptr: *mut CSpace) -> Result<u32, ()>
 {
-    if (id as usize) < MAX_CSPACES
+    if (id as usize) >= MAX_CSPACES
     {
-        CSPACE_REGISTRY[id as usize].store(ptr, Ordering::Release);
-        Ok(())
+        return Err(());
     }
-    else
-    {
-        Err(())
-    }
+    let entry = &CSPACE_REGISTRY[id as usize];
+    debug_assert!(
+        entry.ptr.load(Ordering::Acquire).is_null(),
+        "register_cspace: id {id} already registered"
+    );
+    entry.ptr.store(ptr, Ordering::Release);
+    Ok(entry.epoch.load(Ordering::Acquire))
 }
 
 /// Clear a `CSpace` registration.
 ///
 /// Called from `dealloc_object` for `ObjectType::CSpaceObj` *before* freeing
-/// the backing allocation, so no dangling pointer is observable.
+/// the backing allocation, so no dangling pointer is observable. The
+/// generation bump that retires this id is deferred to [`free_cspace_id`]
+/// so the pre-unregister derivation drain can still resolve foreign
+/// back-links into this `CSpace`'s live (now-quiescent) registry entry.
 pub fn unregister_cspace(id: CSpaceId)
 {
     if (id as usize) < MAX_CSPACES
     {
-        CSPACE_REGISTRY[id as usize].store(core::ptr::null_mut(), Ordering::Release);
+        CSPACE_REGISTRY[id as usize]
+            .ptr
+            .store(core::ptr::null_mut(), Ordering::Release);
     }
 }
 
-/// Allocate a unique `CSpace` ID.
+/// Bump the registry epoch for `id` and return it to the free list.
 ///
-/// Called by `SYS_CAP_CREATE_CSPACE` when creating new `CSpace` objects at
-/// runtime. The root `CSpace` is assigned ID 0 at init time via this same
-/// counter. See [`NEXT_CSPACE_ID`] for the recycling caveat.
-pub fn alloc_cspace_id() -> CSpaceId
+/// Pre-condition: `unregister_cspace(id)` has run (registry `ptr` is null).
+/// Bumping the epoch invalidates any surviving `SlotId` stamped with the
+/// old value — subsequent `lookup_cspace(id, old_epoch)` returns `None`.
+///
+/// If the epoch would overflow `u32`, the id is permanently retired: not
+/// pushed back to the free list. The eventually-leaked-id rate is bounded
+/// by `u32::MAX` recycles per id, which is unreachable in any realistic
+/// system lifetime (≥13 years at 10k recycles/sec/id).
+///
+/// Asserts `id != 0`: the root `CSpace`'s id is reserved for kernel
+/// lifetime; the `HDR_FLAG_IS_ROOT` clamp in `dec_ref` should already make
+/// it unreachable, but defense-in-depth catches misroutes here.
+#[cfg(not(test))]
+pub fn free_cspace_id(id: CSpaceId)
 {
-    NEXT_CSPACE_ID.fetch_add(1, Ordering::Relaxed)
+    assert!(id != 0, "free_cspace_id: root CSpace cannot be recycled");
+    debug_assert!((id as usize) < MAX_CSPACES);
+    let entry = &CSPACE_REGISTRY[id as usize];
+    debug_assert!(
+        entry.ptr.load(Ordering::Acquire).is_null(),
+        "free_cspace_id called before unregister_cspace for id {id}"
+    );
+    let prev = entry.epoch.fetch_add(1, Ordering::AcqRel);
+    if prev == u32::MAX
+    {
+        // Retired: the next fetch_add would wrap to 0, which the registry
+        // initialiser treats as "no entry"/free-list sentinel. Leak the id
+        // rather than risk aliasing.
+        crate::kprintln!("cspace: id {id} retired (epoch wraparound)");
+        return;
+    }
+    push_free(id);
 }
 
-/// Resolve a `CSpaceId` to a raw pointer.
+/// Read the current epoch for a registry entry. Returns 0 if `id` is out
+/// of range (a stale `SlotId` carrying an out-of-range `cspace_id` is
+/// always rejected by `lookup_cspace` regardless).
+pub fn registry_epoch(id: CSpaceId) -> u32
+{
+    if (id as usize) >= MAX_CSPACES
+    {
+        return 0;
+    }
+    CSPACE_REGISTRY[id as usize].epoch.load(Ordering::Acquire)
+}
+
+/// Resolve a `CSpaceId` and expected epoch to a raw pointer.
 ///
-/// Returns `None` if `id` is out of range or not yet registered. The returned
-/// pointer is valid only while the corresponding `CSpaceKernelObject` has a
-/// positive refcount and `DERIVATION_LOCK` is held by the caller.
-pub fn lookup_cspace(id: CSpaceId) -> Option<*mut CSpace>
+/// Returns `None` if `id` is out of range, the slot is vacant, or the
+/// stamped epoch doesn't match the registry's current value. The double
+/// epoch load brackets the ptr load so a concurrent `unregister →
+/// free_cspace_id → reuse → register` sequence cannot present a
+/// newly-registered ptr alongside an old expected epoch.
+///
+/// The returned pointer is valid only while the corresponding
+/// `CSpaceKernelObject` has a positive refcount and (for derivation-tree
+/// reads) `DERIVATION_LOCK` is held.
+pub fn lookup_cspace(id: CSpaceId, expected_epoch: u32) -> Option<*mut CSpace>
 {
     if (id as usize) >= MAX_CSPACES
     {
         return None;
     }
-    let ptr = CSPACE_REGISTRY[id as usize].load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    let entry = &CSPACE_REGISTRY[id as usize];
+    let e1 = entry.epoch.load(Ordering::Acquire);
+    if e1 != expected_epoch
+    {
+        return None;
+    }
+    let ptr = entry.ptr.load(Ordering::Acquire);
+    if ptr.is_null()
+    {
+        return None;
+    }
+    let e2 = entry.epoch.load(Ordering::Acquire);
+    if e2 != expected_epoch
+    {
+        return None;
+    }
+    Some(ptr)
 }
 
 /// Sum [`FrameObject::available_bytes`] across every [`CapTag::Frame`] cap
@@ -250,15 +453,38 @@ pub fn sum_frame_available_bytes(cspace: &cspace::CSpace) -> u64
 }
 
 /// Maximum slots in the root `CSpace` (full two-level directory).
-const ROOT_CSPACE_MAX_SLOTS: usize = 16384;
+const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
+
+/// Target slot capacity for the root `CSpace`'s initial slot-page pool.
+///
+/// `populate_cspace` plus [`mint_module_frame_caps`] mint ~150 caps into
+/// the root; userspace init then mints, copies, and derives ~700 more
+/// caps during memmgr / procmgr bootstrap (kernel-object inserts +
+/// per-RAM-Frame derive/copy chains in `finalize_memmgr`). Sized at
+/// 1536 slots: roughly 1.8× the observed ~850-cap pre-memmgr-handover
+/// peak. The headroom absorbs realistic per-RAM-block-count growth
+/// (more drained blocks ⇒ more init-time Frame-cap derivations) and
+/// per-service growth (more boot modules ⇒ more module-frame caps)
+/// without revisiting this knob.
+///
+/// MUST be kept in sync with the boot footprint: a target below the
+/// peak boot slot count means `pre_allocate`'s grow loop hits an
+/// exhausted pool, the syscall errors out, and the userspace caller
+/// either retries indefinitely (e.g. `request_round` in a child) or
+/// surfaces an unexpected `OutOfMemory`. After memmgr is alive, further
+/// growth is bounded only by `ROOT_CSPACE_MAX_SLOTS`.
+#[cfg(not(test))]
+const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 
 /// Pages carved from `SEED_FRAME` for the root `CSpace` slab: page 0 is the
 /// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining
-/// pages seed the slot-page pool. `populate_cspace` plus
-/// [`mint_module_frame_caps`] mint ~150 caps into the root, occupying ~3
-/// slot pages (64 slots each); 16 pool pages = 1 KiB-cap headroom.
+/// pages seed the slot-page pool. Sized so the pool holds at least
+/// [`ROOT_CSPACE_INIT_SLOT_CAPACITY`] slots regardless of `L2_SIZE`
+/// (slots-per-page). The slot-0 reservation on page 0 costs one slot
+/// and is absorbed by rounding up.
 #[cfg(not(test))]
-const ROOT_CSPACE_INIT_PAGES: u64 = 17;
+const ROOT_CSPACE_INIT_PAGES: u64 =
+    1 + ROOT_CSPACE_INIT_SLOT_CAPACITY.div_ceil(cspace::L2_SIZE as u64);
 
 // ── Phase-7 seed Frame cap ───────────────────────────────────────────────────
 
@@ -314,7 +540,8 @@ static mut SEED_FRAME: object::FrameObject = object::FrameObject {
     header: object::KernelObjectHeader {
         ref_count: AtomicU32::new(1),
         obj_type: object::ObjectType::Frame,
-        _pad: [0; 3],
+        flags: 0,
+        _pad: [0; 2],
         ancestor: AtomicPtr::new(core::ptr::null_mut()),
     },
     base: 0,
@@ -703,6 +930,11 @@ pub(crate) unsafe fn boot_retype_cspace(
             },
         );
     }
+    // The root CSpace is pinned for kernel lifetime: marking it here makes
+    // `dec_ref` clamp at 1, so any upstream refcount mismanagement of the
+    // wrapper / self-cap pair cannot route it through `dealloc_object`.
+    // SAFETY: header just written, exclusively owned, single-threaded boot.
+    unsafe { (*cs_kobj_ptr).header.flags |= crate::cap::object::HDR_FLAG_IS_ROOT };
 
     // SAFETY: cs_ptr just constructed.
     unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
@@ -939,7 +1171,12 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         let block_count = unsafe { drain_and_install_seed(ram_buf) };
         let ram_blocks: &[RamBlock] = &ram_buf[..block_count];
 
-        let id = alloc_cspace_id();
+        let id = alloc_cspace_id()
+            .unwrap_or_else(|| crate::fatal("root CSpace: alloc_cspace_id exhausted at boot"));
+        debug_assert_eq!(
+            id, 0,
+            "root CSpace must receive id 0 (free list empty at boot)"
+        );
         // SAFETY: SEED installed above.
         let (_cs_kobj_nn, cs_ptr) = unsafe {
             boot_retype_cspace(
@@ -949,7 +1186,10 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
                 id,
             )
         };
-        register_cspace(id, cs_ptr)
+        // The root CSpace's epoch is fixed at 1 (initial registry value) and
+        // never bumps — it's never recycled (asserted in `free_cspace_id`),
+        // so we discard the returned value.
+        let _root_epoch = register_cspace(id, cs_ptr)
             .unwrap_or_else(|()| crate::fatal("root CSpace register: id exceeds MAX_CSPACES"));
 
         // SAFETY: cs_ptr is freshly constructed and exclusively owned
@@ -972,7 +1212,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
     // branch iterate `mmap` directly — `ram_blocks` is empty.
     #[cfg(test)]
     {
-        let id = alloc_cspace_id();
+        let id = alloc_cspace_id().expect("root CSpace: alloc_cspace_id exhausted at boot");
         let mut cspace = Box::new(CSpace::new(id, ROOT_CSPACE_MAX_SLOTS));
         let empty: [RamBlock; 0] = [];
         let mut layout = populate_cspace(&mut cspace, &empty, mmap, mmio_apertures, info);
@@ -1921,8 +2161,8 @@ pub unsafe fn move_cap_between_cspaces(
     let new_idx = new_idx_nz.get();
 
     let src_idx_nz = core::num::NonZeroU32::new(src_idx).ok_or(SyscallError::InvalidCapability)?;
-    let src_slot_id = SlotId::new(src_cspace_id, src_idx_nz);
-    let dst_slot_id = SlotId::new(dst_cspace_id, new_idx_nz);
+    let src_slot_id = SlotId::current(src_cspace_id, src_idx_nz);
+    let dst_slot_id = SlotId::current(dst_cspace_id, new_idx_nz);
 
     // Read derivation links from the source slot.
     let (src_parent, src_first_child, src_prev, src_next) = {
@@ -1952,7 +2192,7 @@ pub unsafe fn move_cap_between_cspaces(
 
     // Update parent's first_child if it pointed to source.
     if let Some(parent_id) = src_parent
-        && let Some(parent_cs) = lookup_cspace(parent_id.cspace_id)
+        && let Some(parent_cs) = lookup_cspace(parent_id.cspace_id, parent_id.epoch)
     {
         // SAFETY: parent_cs returned by lookup_cspace is valid; parent_id.index from derivation link is within bounds.
         if let Some(parent_slot) = unsafe { (*parent_cs).slot_mut(parent_id.index.get()) }
@@ -1964,7 +2204,7 @@ pub unsafe fn move_cap_between_cspaces(
 
     // Update prev sibling's next pointer.
     if let Some(prev_id) = src_prev
-        && let Some(prev_cs) = lookup_cspace(prev_id.cspace_id)
+        && let Some(prev_cs) = lookup_cspace(prev_id.cspace_id, prev_id.epoch)
     {
         // SAFETY: prev_cs returned by lookup_cspace is valid; prev_id.index from derivation link is within bounds.
         if let Some(prev_slot) = unsafe { (*prev_cs).slot_mut(prev_id.index.get()) }
@@ -1976,7 +2216,7 @@ pub unsafe fn move_cap_between_cspaces(
 
     // Update next sibling's prev pointer.
     if let Some(next_id) = src_next
-        && let Some(next_cs) = lookup_cspace(next_id.cspace_id)
+        && let Some(next_cs) = lookup_cspace(next_id.cspace_id, next_id.epoch)
     {
         // SAFETY: next_cs returned by lookup_cspace is valid; next_id.index from derivation link is within bounds.
         if let Some(next_slot) = unsafe { (*next_cs).slot_mut(next_id.index.get()) }
@@ -1991,7 +2231,7 @@ pub unsafe fn move_cap_between_cspaces(
     let mut child_cur = src_first_child;
     while let Some(child_id) = child_cur
     {
-        child_cur = if let Some(child_cs) = lookup_cspace(child_id.cspace_id)
+        child_cur = if let Some(child_cs) = lookup_cspace(child_id.cspace_id, child_id.epoch)
         {
             // SAFETY: child_cs returned by lookup_cspace is valid; child_id.index from derivation link is within bounds.
             if let Some(child_slot) = unsafe { (*child_cs).slot_mut(child_id.index.get()) }

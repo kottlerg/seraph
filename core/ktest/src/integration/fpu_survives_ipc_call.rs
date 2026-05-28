@@ -63,9 +63,12 @@ static OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 #[cfg(target_arch = "x86_64")]
 fn child_entry(_arg: u64) -> !
 {
-    // Empty messages do not touch the IPC buffer, but the kernel rejects
-    // any IPC syscall from a thread without a registered buffer. Register
-    // before the FP-preserving block so any clobber here is irrelevant.
+    // Register this thread's IPC buffer. For the empty round-trip used
+    // here (`data_count=0`, `cap_count=0`) the kernel never reads or
+    // writes the buffer, but registering keeps the test correct if it
+    // later grows data words and matches the buffer-registered ktest
+    // invariant. Done before the FP-preserving block so any FP clobber
+    // here is irrelevant.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if ipc_buffer_set(buf_addr).is_err()
     {
@@ -113,9 +116,10 @@ fn child_entry(_arg: u64) -> !
             "xor r10, r10",
             "xor r8, r8",
             "syscall",
-            // Resumed (possibly on CPU 1). The first FP op triggers #NM;
-            // the handler XRSTORs the saved area into CPU 1's live regs
-            // before the store retires.
+            // Resumed (possibly on CPU 1). The first FP op (the capture
+            // `vmovdqu`) traps to `#NM` because `switch_in_restore` set
+            // `CR0.TS=1`; the handler XRSTORs the saved area into CPU 1's
+            // hardware before the store executes.
             "vmovdqu [{b} + 0x000], xmm0",
             "vmovdqu [{b} + 0x010], xmm1",
             "vmovdqu [{b} + 0x020], xmm2",
@@ -167,6 +171,7 @@ fn child_entry(_arg: u64) -> !
 #[allow(clippy::too_many_lines)] // 32 FP loads + ecall + 32 FP stores dominate the body.
 fn child_entry(_arg: u64) -> !
 {
+    // Register this thread's IPC buffer. See x86_64 sibling for rationale.
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if ipc_buffer_set(buf_addr).is_err()
     {

@@ -1790,23 +1790,33 @@ unsafe fn dealloc_object_one(
                 let dying_epoch = crate::cap::registry_epoch(id);
 
                 // ── Pre-unregister derivation drain ──
-                // Hold DERIVATION_LOCK exclusively across the drain and the
-                // subsequent for_each_object dec_ref pass. The drain walks
-                // each populated slot, snapshots its outgoing derivation
-                // pointers under a brief per-slot &mut, clears them, then
-                // splices the corresponding back-links in foreign slots
-                // with no borrow into the dying CSpace held.
+                // Hold DERIVATION_LOCK exclusively for the drain + unregister
+                // pair only. The drain walks each populated slot, snapshots
+                // its outgoing derivation pointers under a brief per-slot
+                // &mut, clears them, then splices the corresponding back-
+                // links in foreign slots. `unregister_cspace` runs inside
+                // the same critical section so any concurrent foreign reader
+                // sees a consistent "drained, then absent" transition.
+                //
+                // The lock MUST be released BEFORE the `for_each_object`
+                // dec_ref cascade below: a slot in the dying CSpace may hold
+                // a CSpace cap whose dec_ref drives a nested
+                // `dealloc_object(CSpaceObj)` call, which would re-enter
+                // this same non-recursive lock and deadlock. The drain
+                // already removed every foreign back-link before this
+                // point, so the dec_ref cascade has no derivation-tree
+                // work to do — releasing is safe.
                 crate::cap::derivation::DERIVATION_LOCK.write_lock();
                 // SAFETY: DERIVATION_LOCK held; cs_ptr uniquely owned at
                 // refcount=0; registry entry still live (unregister below).
                 unsafe { drain_dying_cspace(cs_ptr, id, dying_epoch) };
-
-                // After the drain, no foreign slot back-links into this
-                // CSpace remain. Now clear the registry pointer so any
-                // subsequent lookup of the dying id resolves to None.
                 crate::cap::unregister_cspace(id);
+                crate::cap::derivation::DERIVATION_LOCK.write_unlock();
 
-                // Dec-ref all objects referenced by non-null slots.
+                // Dec-ref all objects referenced by non-null slots. Runs
+                // without DERIVATION_LOCK so nested CSpaceObj deallocs (a
+                // dying CSpace whose slots hold caps to other CSpaces) can
+                // acquire it themselves without re-entry.
                 // SAFETY: cs_ptr non-null; for_each_object handles iteration.
                 unsafe {
                     (*cs_ptr).for_each_object(|obj_ptr| {
@@ -1828,7 +1838,6 @@ unsafe fn dealloc_object_one(
                     core::ptr::drop_in_place(cs_ptr);
                 }
 
-                crate::cap::derivation::DERIVATION_LOCK.write_unlock();
                 // Don't recycle id 0 (root CSpace's id). The root is also
                 // pinned by HDR_FLAG_IS_ROOT so this branch is unreachable
                 // for the root in practice; the guard is defense-in-depth.

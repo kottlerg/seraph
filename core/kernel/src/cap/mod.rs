@@ -137,12 +137,12 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 /// `CSpaceObj`) additionally scrubs the back-links in steady state.
 ///
 /// Live-count peaks in ktest stress today sit in the low hundreds; 4096
-/// gives 10–40× headroom while reclaiming ~448 KiB of BSS the
+/// gives 10–40× headroom while reclaiming ~432 KiB of BSS the
 /// pre-#137 65536-entry registry burned (65536 × 8 B = 512 KiB old
 /// registry vs 4096 × 16 B = 64 KiB new registry + 4096 × 4 B = 16 KiB
-/// free list = 80 KiB total). A future workload that genuinely needs
-/// more live `CSpace`s only has to bump this constant — no layout, ABI,
-/// or algorithmic change is required.
+/// free list = 80 KiB total; 512 − 80 = 432 KiB net). A future workload
+/// that genuinely needs more live `CSpace`s only has to bump this
+/// constant — no layout, ABI, or algorithmic change is required.
 const MAX_CSPACES: usize = 4096;
 
 /// High-water mark for the bump-allocator side of `alloc_cspace_id` — only

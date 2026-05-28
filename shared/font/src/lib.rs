@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only AND OFL-1.1
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 //
-// Bitmap data adapted from Terminus 10×20 (terminus-font.sourceforge.net,
-// OFL-1.1). The rightmost pixel column of each 10×20 source glyph is
-// dropped to produce the 9×20 cells used here; that column is
-// structurally blank for ASCII/Latin-1 (and verified blank for each
-// codepoint in `FONT_9X20_EXT`). Code: GPL-2.0-only. Font data: OFL-1.1.
+// Code: GPL-2.0-only. Bitmap data: OFL-1.1, adapted from Terminus 10×20
+// (terminus-font.sourceforge.net). The rightmost pixel column of each
+// 10×20 source glyph is dropped to produce the 9×20 cells used here;
+// that column is structurally blank for ASCII/Latin-1 (and verified
+// blank for each codepoint in `FONT_9X20_EXT`).
 
 // shared/font/src/lib.rs
 

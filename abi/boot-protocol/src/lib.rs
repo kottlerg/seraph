@@ -355,16 +355,27 @@ impl FramebufferInfo
         {
             return None;
         }
-        // SAFETY: bytes has sufficient length. read_unaligned tolerates any
-        // alignment. PixelFormat is `repr(u32)` with two valid discriminants
-        // (0, 1); validate explicitly before trusting it.
-        let raw = unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<Self>()) };
-        let pf = raw.pixel_format as u32;
-        if pf > 1
+        // Parse field-by-field. Constructing a `PixelFormat` whose
+        // discriminant is outside its declared variants is UB; validate
+        // before materialising the enum.
+        let physical_base = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let width = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        let height = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+        let stride = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+        let pf_raw = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
+        let pixel_format = match pf_raw
         {
-            return None;
-        }
-        Some(raw)
+            0 => PixelFormat::Rgbx8,
+            1 => PixelFormat::Bgrx8,
+            _ => return None,
+        };
+        Some(Self {
+            physical_base,
+            width,
+            height,
+            stride,
+            pixel_format,
+        })
     }
 }
 

@@ -129,7 +129,7 @@ procmgr for reaping.
   `create_and_start_pwrmgr` at `../src/service.rs:719`).
 - Derive a `PUBLISH_AUTHORITY`-tokened `RIGHTS_SEND_GRANT` cap on
   svcmgr's service endpoint (`../src/service.rs:1326`) and
-  publish four well-known names via `PUBLISH_ENDPOINT`:
+  publish five well-known names via `PUBLISH_ENDPOINT`:
   - `rootfs.root` — tokened SEND on the root filesystem's
     namespace endpoint at its root directory (FS-driver-agnostic
     by design) (`../src/service.rs:1336`).
@@ -139,6 +139,13 @@ procmgr for reaping.
     endpoint (negative-test twin) (`../src/service.rs:1370`).
   - `svcmgr` — un-tokened SEND on svcmgr's own service endpoint
     (`../src/service.rs:1390`).
+  - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-tokened SEND
+    on devmgr's registry endpoint. Consumers needing to resolve a
+    device driver themselves (today: `programs/fb-charset` →
+    `QUERY_FRAMEBUFFER_DEVICE`; future: any non-init caller of
+    devmgr's discovery surface) seed this name. The token bit
+    survives svcmgr's plain `cap_derive` in
+    `registry_lookup_derived`.
 
   Name constants are centralised in `ipc::published_names`.
 - Register each init-bootstrapped service with svcmgr via the v3
@@ -217,7 +224,7 @@ svcmgr if needed.
 | Root mount | logd | RECV on the master log endpoint, one-shot SEND for `HANDOVER_PULL`, `DEATH_EQ_AUTHORITY`-tokened SEND on procmgr, arch serial authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V) |
 | Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; in the bootstrap round, full-rights SEND on its own service endpoint and on the local svcmgr-bootstrap endpoint |
 | Handover | pwrmgr | Remaining arch authority (`IoPortRange` / `SbiControl`) + ACPI region Frame caps |
-| Handover (publish) | svcmgr registry | `rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`, `svcmgr` named caps |
+| Handover (publish) | svcmgr registry | `rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`, `svcmgr`, `devmgr.registry` named caps |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Frame cap (segments, stack, `InitInfo` region, IPC buffer) |
 
 ---

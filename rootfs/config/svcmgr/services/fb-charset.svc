@@ -1,15 +1,16 @@
-# /programs/fb-charset — userspace framebuffer character-coverage witness.
+# /programs/fb-charset — framebuffer character-set demo.
 #
-# Acceptance test for the framebuffer driver, font extension, UTF-8
-# decoder, CP437 reverse table, and best-fit fallback. Runs once per
-# boot via the seed mechanism; if it dies before exit, the system
-# continues (critical = no).
+# Small one-shot program (a step above "hello world") that prints a
+# representative sample of every glyph class the framebuffer driver
+# can render, then exits. No assertions, no PASS/FAIL — analogous to
+# `tput`/`showcfont` on conventional systems for eyeballing the
+# character set the console can produce.
 #
 # seed = devmgr.registry → REGISTRY_QUERY_AUTHORITY-tokened SEND on
 # devmgr's registry endpoint, published by init at Phase 3 handover.
 # fb-charset uses it to QUERY_FRAMEBUFFER_DEVICE for a write cap on
 # the framebuffer driver's service endpoint, then submits a structured
-# sequence of FB_WRITE_BYTES exercising every glyph class.
+# sequence of FB_WRITE_BYTES.
 binary    = /programs/fb-charset
 restart   = never
 critical  = no

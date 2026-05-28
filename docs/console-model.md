@@ -50,17 +50,19 @@ earlier ones, which remain as fallbacks.
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace
    framebuffer writers route bytes to it via `fb_labels::FB_WRITE_BYTES`.
-   v1 has one consumer: `programs/fb-charset`, launched once per boot by
+   v1 has one consumer: `programs/fb-charset`, a small demo program
+   (a step above "hello world") launched once per default boot by
    svcmgr via `/config/svcmgr/services/fb-charset.svc` (`seed =
    devmgr.registry`). It resolves the framebuffer write cap via
-   `devmgr_labels::QUERY_FRAMEBUFFER_DEVICE` and submits a structured
-   UTF-8 sequence exercising every glyph class (ASCII, CP437 high half,
-   box-drawing, font-extension, ASCII fallback, invalid UTF-8 → U+FFFD),
-   then exits. Production consumers (terminal, shell, compositor) arrive
-   in follow-up issues and resolve the cap through the same name. v1
+   `devmgr_labels::QUERY_FRAMEBUFFER_DEVICE` and emits a structured
+   UTF-8 sequence covering every glyph class (ASCII, CP437 high half,
+   box-drawing, font-extension, ASCII fallback, and one ill-formed
+   sequence so the U+FFFD glyph is reachable on screen), then exits.
+   Production consumers (terminal, shell, compositor) arrive in
+   follow-up issues and resolve the cap through the same name. v1
    exposes one verb only — `FB_WRITE_BYTES` — interpreting payloads as
-   UTF-8 with `\n`/`\r` short-circuited; graphical primitives are listed
-   under the driver README's "Planned future surface".
+   UTF-8 with `\n`/`\r` short-circuited; graphical primitives are
+   listed under the driver README's "Planned future surface".
 
 ## The serial driver as sole userspace UART owner
 

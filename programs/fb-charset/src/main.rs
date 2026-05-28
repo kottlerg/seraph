@@ -3,32 +3,31 @@
 
 // programs/fb-charset/src/main.rs
 
-//! Userspace framebuffer character-coverage witness.
+//! Framebuffer character-set demo program.
 //!
-//! One-shot test program launched by svcmgr from
-//! `/config/svcmgr/services/fb-charset.svc`. Exercises every glyph
-//! class served by the framebuffer driver:
+//! A small one-shot program — a step above "hello world" — that prints
+//! a representative sample of every glyph class the framebuffer driver
+//! can render: 7-bit ASCII, CP437 high half (math, Greek, accented
+//! Latin), CP437 box-drawing, the font-extension table (em-dash,
+//! ellipsis, ×, ⇒, ≠, ✓, …), the ASCII multi-byte substitute path
+//! (`©` → `(C)`, `↔` → `<->`, …), and one deliberately ill-formed UTF-8
+//! sequence so the `U+FFFD` glyph is reachable on screen. Useful for
+//! eyeballing font output the same way `tput` / `showcfont` make the
+//! VT character set inspectable elsewhere.
 //!
-//! * 7-bit ASCII (CP437 fast path).
-//! * CP437 high half (math, Greek, accented Latin).
-//! * CP437 box-drawing.
-//! * Font-extension table (em-dash, ellipsis, ×, ⇒, ≠, ✓, …).
-//! * ASCII multi-byte fallback (`©` → `(C)`, `↔` → `<->`, …).
-//! * Invalid UTF-8 → `U+FFFD` checkerboard.
+//! Launched by svcmgr from `/config/svcmgr/services/fb-charset.svc` on
+//! every default boot; the recipe declares `seed = devmgr.registry`,
+//! so the bootstrap round delivers one cap on devmgr's registry. The
+//! program calls `QUERY_FRAMEBUFFER_DEVICE` for a write cap on the
+//! framebuffer driver's service endpoint, then submits the structured
+//! sequence as `FB_WRITE_BYTES` chunks and exits.
 //!
-//! Bootstrap: a single round delivers `caps[0]` = `devmgr.registry`
-//! (`REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry
-//! endpoint), per the recipe's `seed = devmgr.registry`. fb-charset
-//! issues `QUERY_FRAMEBUFFER_DEVICE` against it to receive a write cap
-//! on the framebuffer driver's service endpoint, then submits a
-//! structured sequence of `FB_WRITE_BYTES` payloads.
-//!
-//! Headless boots write through the full pipeline as on graphical
-//! boots; the IPC `SUCCESS` reply per chunk is the indirect oracle
-//! that the driver dispatched each payload through its UTF-8 decoder,
-//! glyph resolver, and MMIO write loop. The `no framebuffer` boot
-//! (rare; `physical_base == 0`) skips silently — `restart = never`,
-//! `critical = no`, so svcmgr does not flag the missing run.
+//! No assertions, no PASS/FAIL output — when fb-charset returns
+//! `fb-charset: done`, the driver received every chunk and replied
+//! `fb_errors::SUCCESS`. Headless boots run the same path; the pixels
+//! land in MMIO but are not displayed. The rare no-framebuffer boot
+//! (`physical_base == 0`) exits silently. `restart = never`,
+//! `critical = no`.
 
 #![feature(restricted_std)]
 
@@ -121,7 +120,7 @@ fn query_framebuffer(devmgr_registry: u32, ipc_buf: *mut u64) -> Option<u32>
 /// Emit one `FB_WRITE_BYTES`, chunking to `FB_PAYLOAD_MAX` if needed.
 /// Returns `false` if the driver did not reply `fb_errors::SUCCESS`
 /// on any chunk; the caller logs and continues so a single bad chunk
-/// does not silence the rest of the witness.
+/// does not silence the rest of the demo.
 fn write_str(fb_write: u32, ipc_buf: *mut u64, s: &str) -> bool
 {
     let mut bytes = s.as_bytes();

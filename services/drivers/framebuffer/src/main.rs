@@ -161,8 +161,20 @@ fn handle_request(
             unsafe {
                 match b
                 {
-                    b'\n' => writer.newline(),
-                    b'\r' => writer.carriage_return(),
+                    // `\n` and `\r` short-circuit the decoder, but drop
+                    // any in-flight UTF-8 sequence first — a half-
+                    // assembled lead byte stranded by a newline would
+                    // otherwise eat the next codepoint.
+                    b'\n' =>
+                    {
+                        decoder.reset();
+                        writer.newline();
+                    }
+                    b'\r' =>
+                    {
+                        decoder.reset();
+                        writer.carriage_return();
+                    }
                     _ => match decoder.push(b)
                     {
                         DecodeOutcome::Codepoint(cp) => render_at(writer, cp),

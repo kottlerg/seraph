@@ -94,9 +94,10 @@ There is one decoder per driver process, alongside the single cursor.
 |---|---|
 | label | `0` (`SUCCESS`) or `2` (`UNKNOWN_OPCODE`) |
 
-The acceptance witness for this surface is `programs/fb-charset`,
-launched once per boot by svcmgr via
+The driver's UTF-8 / font output is exercised by `programs/fb-charset`,
+a small demo program launched once per default boot by svcmgr via
 `/config/svcmgr/services/fb-charset.svc` (`seed = devmgr.registry`).
+It prints a representative sample of every glyph class and exits.
 
 ---
 

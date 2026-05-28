@@ -527,6 +527,16 @@ pub mod published_names
     /// when they need to call into svcmgr beyond the per-process
     /// `service_registry_cap` (today: crasher's `seed = svcmgr`).
     pub const SVCMGR: &[u8] = b"svcmgr";
+
+    /// `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry
+    /// endpoint. Consumers needing to resolve a device driver
+    /// themselves (today: `programs/fb-charset` →
+    /// `QUERY_FRAMEBUFFER_DEVICE`; future: any non-init caller of
+    /// devmgr's discovery surface) seed this name. Init publishes it
+    /// at Phase 3 handover; the `REGISTRY_QUERY_AUTHORITY` token bit
+    /// is preserved through svcmgr's plain `cap_derive` in
+    /// `registry_lookup_derived`.
+    pub const DEVMGR_REGISTRY: &[u8] = b"devmgr.registry";
 }
 
 pub const RTC_LABELS_VERSION: u32 = 1;
@@ -885,7 +895,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 2;
+pub const DEVMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -896,8 +906,20 @@ pub mod devmgr_labels
     /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
     /// `UNAUTHORIZED` otherwise.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
-    /// Query device configuration (`VirtIO` cap locations, etc.).
-    /// The caller's token identifies the device.
+    /// Query a device's startup-info payload from devmgr's catalog.
+    ///
+    /// The caller's token identifies the device by indexing devmgr's
+    /// [`DeviceCatalog`] (token == entry index + 1). Devmgr stores the
+    /// payload bytes opaquely; the per-class shape lives in the driver
+    /// crate. Reply schema (generic for every kind):
+    /// - `word[0]` = `kind` discriminant ([`super::device_info_kind`])
+    /// - `word[1]` = `version` (per-kind payload schema version)
+    /// - `word[2]` = `byte_len` (valid bytes in the payload)
+    /// - `word[3..3 + byte_len.div_ceil(8)]` = payload bytes packed as
+    ///   `u64` words (`repr(C)` of the kind's struct).
+    ///
+    /// The driver verifies `kind` and `version` before deserialising
+    /// the payload. Devmgr does not interpret payload bytes.
     pub const QUERY_DEVICE_INFO: u64 = 2;
     /// Query for the serial (UART) device endpoint.
     ///
@@ -907,6 +929,14 @@ pub mod devmgr_labels
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
     /// [`QUERY_BLOCK_DEVICE`].
     pub const QUERY_SERIAL_DEVICE: u64 = 3;
+    /// Query for the framebuffer device endpoint.
+    ///
+    /// Mints a `fb_labels::WRITE_AUTHORITY`-tokened `SEND_GRANT` cap
+    /// on the framebuffer driver's service endpoint to the caller.
+    /// Caller's token must have [`REGISTRY_QUERY_AUTHORITY`] set; the
+    /// handler replies `UNAUTHORIZED` otherwise. Mirrors
+    /// [`QUERY_SERIAL_DEVICE`].
+    pub const QUERY_FRAMEBUFFER_DEVICE: u64 = 4;
 
     /// Authority bit in the devmgr-registry-endpoint token's high
     /// u64 bit. Set on caps minted for consumers permitted to call
@@ -915,6 +945,20 @@ pub mod devmgr_labels
     /// virtio-blk closes the minter-side surface: `MOUNT_AUTHORITY`
     /// caps are never issued to consumers devmgr did not authorise.
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
+}
+
+/// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
+/// replies. Each driver class owns a fixed value; devmgr stores payload
+/// bytes against this discriminant in its [`DeviceCatalog`] and replies
+/// with the discriminant as `word[0]` so callers can verify the type
+/// before deserialising.
+pub mod device_info_kind
+{
+    /// `VirtIO` PCI device startup info
+    /// (`virtio_core::VirtioPciStartupInfo`).
+    pub const VIRTIO_PCI: u32 = 1;
+    /// Linear framebuffer geometry (`boot_protocol::FramebufferInfo`).
+    pub const FRAMEBUFFER: u32 = 2;
 }
 
 pub const BLK_LABELS_VERSION: u32 = 2;
@@ -1023,6 +1067,54 @@ pub mod serial_errors
     pub const UNKNOWN_OPCODE: u64 = 2;
     /// Reserved for a future per-message version handshake. Unused today —
     /// `SERIAL_LABELS_VERSION` is marker-only and covered by
+    /// `PROCESS_ABI_VERSION` at process startup.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
+}
+
+pub const FB_LABELS_VERSION: u32 = 1;
+/// IPC labels for the framebuffer device driver
+/// (`services/drivers/framebuffer`).
+///
+/// The driver answers a single write operation today. It owns the
+/// bootloader-handed GOP linear-framebuffer MMIO end-to-end and is the
+/// sole driver-mediated sink for userspace framebuffer bytes. devmgr
+/// spawns it and hands clients a [`fb_labels::WRITE_AUTHORITY`]-tokened
+/// SEND via [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. Graphical
+/// primitives, cursor control, mode set, and multi-head dispatch are
+/// planned but unimplemented (see the driver `README.md`); they are not
+/// on the wire.
+pub mod fb_labels
+{
+    /// Write bytes to the framebuffer (text rendered through the
+    /// embedded 9×20 bitmap font).
+    ///
+    /// Wire format mirrors [`serial_labels::SERIAL_WRITE_BYTES`] and
+    /// [`stream_labels::STREAM_BYTES`]: the payload byte length rides
+    /// bits 16-31 of the label, the bytes are packed via
+    /// `.bytes(0, …)` into the data words, and the receiver reads
+    /// `byte_len.div_ceil(8)` words. Reply: empty body, status code in
+    /// the reply label.
+    ///
+    /// # Label encoding
+    /// - Bits 0-15: label ID (`FB_WRITE_BYTES`)
+    /// - Bits 16-31: byte length of the payload in this call (0..=512).
+    pub const FB_WRITE_BYTES: u64 = 1;
+
+    /// Authority bit in the framebuffer-service-endpoint token's high
+    /// u64 bit. Set on caps devmgr mints in response to
+    /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]; gates
+    /// [`FB_WRITE_BYTES`]. A verb ("may write"), not an identity.
+    pub const WRITE_AUTHORITY: u64 = 1u64 << 63;
+}
+
+/// Error replies from the framebuffer device driver.
+pub mod fb_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// Driver received a label it does not implement.
+    pub const UNKNOWN_OPCODE: u64 = 2;
+    /// Reserved for a future per-message version handshake. Unused
+    /// today — `FB_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
 }

@@ -17,6 +17,7 @@ members = [
     "services/timed",
     "services/vfsd",
     "services/drivers/cmos",
+    "services/drivers/framebuffer",
     "services/drivers/goldfish-rtc",
     "services/drivers/serial",
     "services/drivers/virtio/core",
@@ -36,6 +37,8 @@ members = [
     "shared/registry",
     "shared/registry-client",
     "shared/shmem",
+    "shared/text",
+    "programs/fb-charset",
     "programs/fsbench",
     "programs/hello",
     "programs/hello/tester",
@@ -73,6 +76,7 @@ init-protocol = { path = "abi/init-protocol" }
 process-abi = { path = "abi/process-abi" }
 font = { path = "shared/font" }
 mmio = { path = "shared/mmio" }
+text = { path = "shared/text" }
 syscall = { path = "abi/syscall", package = "syscall-abi" }
 syscall-abi = { path = "abi/syscall" }
 virtio-core = { path = "services/drivers/virtio/core" }

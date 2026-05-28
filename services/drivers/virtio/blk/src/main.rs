@@ -190,10 +190,16 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
 
 /// Query devmgr for `VirtIO` PCI capability locations via IPC.
 ///
-/// The driver's devmgr endpoint is tokened — the token identifies the device.
+/// The driver's devmgr endpoint is tokened — the token identifies the
+/// device. Devmgr replies in the generic `QUERY_DEVICE_INFO` schema:
+/// `word[0]` = kind, `word[1]` = version, `word[2]` = `byte_len`,
+/// payload bytes packed into the subsequent data words. The driver
+/// verifies kind/version before deserialising.
 fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
 {
-    let request = IpcMessage::new(devmgr_labels::QUERY_DEVICE_INFO);
+    let request = IpcMessage::builder(devmgr_labels::QUERY_DEVICE_INFO)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(devmgr_ep, &request, ipc_buf) })
     else
@@ -206,7 +212,45 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
         std::os::seraph::log!("QUERY_DEVICE_INFO returned error");
         syscall::thread_exit();
     }
-    VirtioPciStartupInfo::from_words(reply.words())
+    let words = reply.words();
+    if words.len() < 3
+    {
+        std::os::seraph::log!("QUERY_DEVICE_INFO reply truncated (header)");
+        syscall::thread_exit();
+    }
+    let kind = words[0] as u32;
+    let version = words[1] as u32;
+    let byte_len = words[2] as usize;
+    if kind != ipc::device_info_kind::VIRTIO_PCI || version != virtio_core::VIRTIO_PCI_INFO_VERSION
+    {
+        std::os::seraph::log!("QUERY_DEVICE_INFO reply kind/version mismatch");
+        syscall::thread_exit();
+    }
+    if byte_len != VirtioPciStartupInfo::SIZE
+    {
+        std::os::seraph::log!("QUERY_DEVICE_INFO reply byte_len mismatch");
+        syscall::thread_exit();
+    }
+    // Unpack payload words into a byte buffer, then deserialise.
+    let mut buf = [0u8; VirtioPciStartupInfo::SIZE];
+    let payload_words = byte_len.div_ceil(8);
+    if words.len() < 3 + payload_words
+    {
+        std::os::seraph::log!("QUERY_DEVICE_INFO reply truncated (payload)");
+        syscall::thread_exit();
+    }
+    for (i, chunk) in buf.chunks_mut(8).enumerate()
+    {
+        let bytes = words[3 + i].to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    let Some(info) = VirtioPciStartupInfo::from_bytes(&buf)
+    else
+    {
+        std::os::seraph::log!("QUERY_DEVICE_INFO from_bytes failed");
+        syscall::thread_exit();
+    };
+    info
 }
 
 // ── Frame allocation via memmgr IPC ────────────────────────────────────────

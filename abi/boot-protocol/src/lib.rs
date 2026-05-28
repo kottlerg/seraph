@@ -321,7 +321,68 @@ impl FramebufferInfo
             pixel_format: PixelFormat::Rgbx8,
         }
     }
+
+    /// Size of the serialised form in bytes.
+    pub const SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Serialise into `buf`. Returns `None` if the buffer is shorter than
+    /// [`Self::SIZE`].
+    #[must_use]
+    pub fn to_bytes(&self, buf: &mut [u8]) -> Option<()>
+    {
+        if buf.len() < Self::SIZE
+        {
+            return None;
+        }
+        // SAFETY: buf has sufficient length; Self is repr(C) POD.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                core::ptr::from_ref(self).cast::<u8>(),
+                buf.as_mut_ptr(),
+                Self::SIZE,
+            );
+        }
+        Some(())
+    }
+
+    /// Deserialise from a byte slice. Returns `None` if `bytes` is shorter
+    /// than [`Self::SIZE`] or carries a `pixel_format` discriminant outside
+    /// the known set.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self>
+    {
+        if bytes.len() < Self::SIZE
+        {
+            return None;
+        }
+        // Parse field-by-field. Constructing a `PixelFormat` whose
+        // discriminant is outside its declared variants is UB; validate
+        // before materialising the enum.
+        let physical_base = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let width = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        let height = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+        let stride = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+        let pf_raw = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
+        let pixel_format = match pf_raw
+        {
+            0 => PixelFormat::Rgbx8,
+            1 => PixelFormat::Bgrx8,
+            _ => return None,
+        };
+        Some(Self {
+            physical_base,
+            width,
+            height,
+            stride,
+            pixel_format,
+        })
+    }
 }
+
+/// Schema version of the [`FramebufferInfo`] payload exchanged via
+/// devmgr's `QUERY_DEVICE_INFO`. Bump whenever the struct layout
+/// changes; callers verify this value before deserialising.
+pub const FRAMEBUFFER_INFO_VERSION: u32 = 1;
 
 // ── Kernel MMIO (arch-specific) ──────────────────────────────────────────────
 //
@@ -774,5 +835,66 @@ mod tests
     fn boot_info_fits_4kib_page()
     {
         assert!(core::mem::size_of::<BootInfo>() <= 4096);
+    }
+
+    /// `FramebufferInfo::SIZE` covers the full struct: u64 + 4×u32 = 24 B.
+    #[test]
+    fn framebuffer_info_size_is_24_bytes()
+    {
+        assert_eq!(FramebufferInfo::SIZE, 24);
+    }
+
+    /// Round-trip: a populated `FramebufferInfo` survives `to_bytes` then
+    /// `from_bytes` with every field intact.
+    #[test]
+    fn framebuffer_info_round_trip()
+    {
+        let fb = FramebufferInfo {
+            physical_base: 0xFD00_0000,
+            width: 1024,
+            height: 768,
+            stride: 4096,
+            pixel_format: PixelFormat::Bgrx8,
+        };
+        let mut buf = [0u8; FramebufferInfo::SIZE];
+        fb.to_bytes(&mut buf).expect("to_bytes");
+        let parsed = FramebufferInfo::from_bytes(&buf).expect("from_bytes");
+        assert_eq!(parsed.physical_base, fb.physical_base);
+        assert_eq!(parsed.width, fb.width);
+        assert_eq!(parsed.height, fb.height);
+        assert_eq!(parsed.stride, fb.stride);
+        assert_eq!(parsed.pixel_format, fb.pixel_format);
+    }
+
+    /// `from_bytes` rejects an invalid `PixelFormat` discriminant rather
+    /// than materialising an enum value outside its declared variants
+    /// (which is undefined behaviour in Rust).
+    #[test]
+    fn framebuffer_info_from_bytes_rejects_invalid_pixel_format()
+    {
+        let mut buf = [0u8; FramebufferInfo::SIZE];
+        // Discriminant 2 is outside {0, 1}.
+        buf[20..24].copy_from_slice(&2u32.to_le_bytes());
+        assert!(FramebufferInfo::from_bytes(&buf).is_none());
+        // 0xFFFFFFFF should also reject.
+        buf[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(FramebufferInfo::from_bytes(&buf).is_none());
+    }
+
+    /// `from_bytes` rejects a buffer shorter than `SIZE`.
+    #[test]
+    fn framebuffer_info_from_bytes_rejects_short_buffer()
+    {
+        let short = [0u8; FramebufferInfo::SIZE - 1];
+        assert!(FramebufferInfo::from_bytes(&short).is_none());
+    }
+
+    /// `to_bytes` rejects a buffer shorter than `SIZE`.
+    #[test]
+    fn framebuffer_info_to_bytes_rejects_short_buffer()
+    {
+        let fb = FramebufferInfo::empty();
+        let mut short = [0u8; FramebufferInfo::SIZE - 1];
+        assert!(fb.to_bytes(&mut short).is_none());
     }
 }

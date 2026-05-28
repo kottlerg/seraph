@@ -66,6 +66,13 @@ pub struct VirtioPciStartupInfo
     pub pad: u32,
 }
 
+/// Schema version of the [`VirtioPciStartupInfo`] payload exchanged via
+/// [`devmgr_labels::QUERY_DEVICE_INFO`]. Bump whenever the struct layout
+/// changes; callers verify this value before deserialising.
+///
+/// [`devmgr_labels::QUERY_DEVICE_INFO`]: ../../../shared/ipc/index.html
+pub const VIRTIO_PCI_INFO_VERSION: u32 = 1;
+
 impl VirtioPciStartupInfo
 {
     /// Size of the serialised startup message in bytes.

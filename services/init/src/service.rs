@@ -339,6 +339,7 @@ mod kind
     pub const APERTURE: u64 = 2;
     pub const ACPI_REGION: u64 = 3;
     pub const SVCMGR_BUNDLE: u64 = 4;
+    pub const FRAMEBUFFER_INFO: u64 = 5;
 }
 
 /// Per-cap class tag carried in a `kind::MODULE` round's data words so
@@ -348,6 +349,7 @@ mod module_kind
 {
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
+    pub const FRAMEBUFFER: u64 = 3;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Tells devmgr which optional
@@ -590,6 +592,7 @@ pub fn create_devmgr_with_caps(
     // Each delivered cap is tagged with its `module_kind` in the data
     // words so devmgr binds a module by class, not by delivery position.
     let serial_module = crate::find_module_by_name(info, b"serial");
+    let framebuffer_module = crate::find_module_by_name(info, b"framebuffer");
     {
         let mut module_caps = [0u32; 4];
         let mut module_data = [0u64; 2 + 4];
@@ -599,6 +602,7 @@ pub fn create_devmgr_with_caps(
         for (source, tag) in [
             (virtio_blk_module, module_kind::VIRTIO_BLK),
             (serial_module, module_kind::SERIAL),
+            (framebuffer_module, module_kind::FRAMEBUFFER),
         ]
         {
             let Some(module_cap) = source
@@ -632,6 +636,33 @@ pub fn create_devmgr_with_caps(
             {
                 return None;
             }
+        }
+    }
+
+    // ── Framebuffer-info round ──────────────────────────────────────────
+    //
+    // Always emitted; `physical_base == 0` tells devmgr to skip the
+    // framebuffer driver spawn (headless boot, e.g. QEMU with
+    // `-display none`). The geometry's authoritative source is GOP,
+    // which dies at `ExitBootServices`; the bootloader captured it into
+    // `BootInfo.framebuffer` and the kernel forwarded it through
+    // `InitInfo.framebuffer`.
+    {
+        let fb = info.framebuffer;
+        let wh = u64::from(fb.width) | (u64::from(fb.height) << 32);
+        let pf_disc = fb.pixel_format as u32;
+        let sf = u64::from(fb.stride) | (u64::from(pf_disc) << 32);
+        if !serve(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            false,
+            &[],
+            &[kind::FRAMEBUFFER_INFO, fb.physical_base, wh, sf],
+            "devmgr: bootstrap framebuffer-info round failed",
+        )
+        {
+            return None;
         }
     }
 
@@ -1271,6 +1302,7 @@ pub fn phase3_svcmgr_handover(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     svcmgr_service_ep: u32,
+    devmgr_registry_ep: u32,
     system_root_cap: u32,
     rootfs_root_cap: u32,
     mut thread_caps: ServiceThreadCaps,
@@ -1431,6 +1463,33 @@ pub fn phase3_svcmgr_handover(
     {
         log("phase 3: publish svcmgr failed");
         let _ = syscall::cap_delete(svc_send);
+    }
+
+    // 5. devmgr.registry — `REGISTRY_QUERY_AUTHORITY`-tokened SEND on
+    //    devmgr's registry endpoint. Today's consumer is
+    //    `programs/fb-charset` via `seed = devmgr.registry`; future
+    //    non-init consumers of devmgr's discovery surface use the same
+    //    name. The token bit survives svcmgr's plain `cap_derive` in
+    //    `registry_lookup_derived`.
+    if let Some(cap) = publish_cap
+        && devmgr_registry_ep != 0
+    {
+        match syscall::cap_derive_token(
+            devmgr_registry_ep,
+            syscall::RIGHTS_SEND,
+            ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+        )
+        {
+            Ok(derived) =>
+            {
+                if !svcmgr_publish(cap, ipc::published_names::DEVMGR_REGISTRY, derived, ipc_buf)
+                {
+                    log("phase 3: publish devmgr.registry failed");
+                    let _ = syscall::cap_delete(derived);
+                }
+            }
+            Err(_) => log("phase 3: derive devmgr.registry cap failed"),
+        }
     }
 
     if let Some(cap) = publish_cap

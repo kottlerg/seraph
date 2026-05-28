@@ -8,6 +8,10 @@
 //! Renders glyphs from the embedded 9×20 bitmap font into a linear
 //! RGBX/BGRX framebuffer. Tracks cursor position, handles line wrap,
 //! and scrolls when the last row is filled.
+//!
+//! Userspace gains its own framebuffer driver at
+//! `services/drivers/framebuffer/`; this kernel renderer remains the
+//! early-boot / panic console fallback (see `docs/console-model.md`).
 
 use boot_protocol::{FramebufferInfo, PixelFormat};
 use font::{FONT_9X20, GLYPH_HEIGHT, GLYPH_WIDTH};

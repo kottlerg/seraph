@@ -62,6 +62,19 @@ impl AcpiRegion
     }
 }
 
+/// Framebuffer geometry forwarded by init (originally from the
+/// bootloader's GOP query). Stored unboxed; `physical_base == 0` is the
+/// "no framebuffer" sentinel.
+#[derive(Clone, Copy)]
+pub struct FbInfoRaw
+{
+    pub physical_base: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub pixel_format: u8,
+}
+
 /// Round kind discriminator on post-R1 bootstrap rounds. Mirrors
 /// `init/src/service.rs::kind`.
 pub mod kind
@@ -72,6 +85,12 @@ pub mod kind
     /// Round carrying svcmgr publish-authority cap + (x86) the root
     /// `IoPortRange` cap copy. One-shot, always terminal.
     pub const SVCMGR_BUNDLE: u64 = 4;
+    /// Round carrying bootloader-discovered framebuffer geometry
+    /// (`physical_base`, `width`, `height`, `stride`, `pixel_format`).
+    /// Zero caps; data words `[kind, physical_base, w|h<<32,
+    /// stride|format<<32]`. Skipped (and devmgr's `fb_info` stays
+    /// `None`) when no framebuffer is present.
+    pub const FRAMEBUFFER_INFO: u64 = 5;
 }
 
 /// Per-cap class tag carried alongside each `kind::MODULE` round cap, so
@@ -81,6 +100,7 @@ pub mod module_kind
 {
     pub const VIRTIO_BLK: u64 = 1;
     pub const SERIAL: u64 = 2;
+    pub const FRAMEBUFFER: u64 = 3;
 }
 
 /// Presence-bitmap bits on R1's `data[0]`. Mirrors
@@ -131,6 +151,11 @@ pub struct DevmgrCaps
     // devmgr derives per-driver narrow copies for ISA peripherals
     // (currently only the CMOS RTC at ports 0x70-0x71).
     pub ioport_root_cap: u32,
+
+    /// Bootloader-discovered framebuffer geometry, or `None` when no
+    /// framebuffer is present. Populated from init's
+    /// [`kind::FRAMEBUFFER_INFO`] bootstrap round.
+    pub fb_info: Option<FbInfoRaw>,
 }
 
 impl DevmgrCaps
@@ -157,6 +182,7 @@ impl DevmgrCaps
             driver_module_count: 0,
             svcmgr_publish_cap: 0,
             ioport_root_cap: 0,
+            fb_info: None,
         }
     }
 
@@ -318,6 +344,30 @@ fn absorb_module_round(
     }
 }
 
+/// Unpack one framebuffer-info round. Zero caps; data words carry the
+/// geometry. A `physical_base == 0` leaves `caps.fb_info = None`.
+fn absorb_framebuffer_info_round(
+    round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
+    caps: &mut DevmgrCaps,
+)
+{
+    let physical_base = round_data[1];
+    if physical_base == 0
+    {
+        caps.fb_info = None;
+        return;
+    }
+    let wh = round_data[2];
+    let sf = round_data[3];
+    caps.fb_info = Some(FbInfoRaw {
+        physical_base,
+        width: wh as u32,
+        height: (wh >> 32) as u32,
+        stride: sf as u32,
+        pixel_format: (sf >> 32) as u8,
+    });
+}
+
 /// Drive the post-R1 bootstrap rounds until init marks the stream done.
 fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> Option<()>
 {
@@ -339,6 +389,10 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
             kind::MODULE =>
             {
                 absorb_module_round(&round.caps, round.cap_count, &round.data, caps);
+            }
+            kind::FRAMEBUFFER_INFO =>
+            {
+                absorb_framebuffer_info_round(&round.data, caps);
             }
             kind::SVCMGR_BUNDLE =>
             {

@@ -1,0 +1,21 @@
+[package]
+name = "framebuffer"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "framebuffer"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+boot-protocol = { path = "../../../abi/boot-protocol" }
+font = { path = "../../../shared/font" }
+ipc = { path = "../../../shared/ipc" }
+syscall = { path = "../../../shared/syscall" }
+syscall-abi = { path = "../../../abi/syscall" }
+text = { path = "../../../shared/text" }
+
+[lints]
+workspace = true

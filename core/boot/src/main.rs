@@ -986,6 +986,25 @@ unsafe fn step9_populate_boot_info(
     // SAFETY: device_tree is zero or identity-mapped; parse_aperture_seed validates.
     seed_count +=
         unsafe { dtb::parse_aperture_seed(firm.device_tree, &mut aperture_seed[seed_count..]) };
+    // GOP linear framebuffer: UEFI typically reports it as
+    // `EfiReservedMemoryType` rather than `EfiMemoryMappedIO`, so
+    // `derive_mmio_apertures` cannot recover it from the UEFI map alone.
+    // Seed it explicitly when present. The framebuffer's identity dies
+    // at `ExitBootServices` (only GOP knows it pre-exit), so the
+    // bootloader is the only entity that can carry this aperture
+    // through to userspace.
+    if framebuffer.physical_base != 0 && seed_count < MAX_APERTURE_SEEDS
+    {
+        let base_aligned = framebuffer.physical_base & !0xFFF;
+        let span = framebuffer.physical_base
+            + u64::from(framebuffer.stride) * u64::from(framebuffer.height);
+        let end_aligned = (span + 0xFFF) & !0xFFF;
+        aperture_seed[seed_count] = MmioAperture {
+            phys_base: base_aligned,
+            size: end_aligned - base_aligned,
+        };
+        seed_count += 1;
+    }
 
     let apertures_out = allocs.apertures_phys as *mut MmioAperture;
     // SAFETY: apertures_phys is a valid 4 KiB allocation with room for

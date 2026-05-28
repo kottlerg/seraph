@@ -48,7 +48,12 @@
 ///     `module_names`, not ordinal arithmetic), `cmdline_offset` /
 ///     `cmdline_len` (boot v8 removed the kernel command line surface
 ///     entirely), and the corresponding `cmdline_bytes` helper.
-pub const INIT_PROTOCOL_VERSION: u32 = 7;
+/// v8: Added [`InitInfo::framebuffer`] carrying the bootloader-discovered
+///     GOP linear-framebuffer geometry. Authoritative runtime metadata
+///     for the framebuffer dies with UEFI `ExitBootServices`; the kernel
+///     forwards what the bootloader captured so devmgr can spawn the
+///     userspace framebuffer driver (`services/drivers/framebuffer/`).
+pub const INIT_PROTOCOL_VERSION: u32 = 8;
 
 /// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
@@ -222,14 +227,20 @@ pub struct InitInfo
     /// caps. Lives inside the `InitInfo` header so it sits entirely on
     /// the first `InitInfo` page (the [`CapDescriptor`] array that
     /// follows the header may span pages).
+    pub module_names: [InitModuleName; INIT_MAX_NAMED_MODULES],
+
+    // ── Framebuffer geometry (added in protocol version 8) ─────────────
+    /// Bootloader-discovered framebuffer geometry. `physical_base == 0`
+    /// indicates no framebuffer is present and devmgr skips the
+    /// framebuffer-driver spawn.
     ///
     /// Last field by intent: `cap_descriptors_offset =
     /// size_of::<InitInfo>()` puts the `CapDescriptor` array
-    /// immediately after this table, and the current field count
-    /// keeps the total a multiple of 8 (the `u64` alignment the
-    /// descriptor array needs) without an explicit tail pad. The
-    /// compile-time assert below pins both invariants.
-    pub module_names: [InitModuleName; INIT_MAX_NAMED_MODULES],
+    /// immediately after this field, and [`InitFramebufferInfo`] is
+    /// `u64 + 4×u32 = 24 B` so the total stays 8-byte aligned (the
+    /// `u64` alignment the descriptor array needs). The compile-time
+    /// assert below pins both invariants.
+    pub framebuffer: InitFramebufferInfo,
 }
 
 // Compile-time invariants for the `InitInfo` layout. The kernel writes
@@ -313,6 +324,56 @@ pub const INIT_MODULE_NAME_EMPTY: InitModuleName = InitModuleName {
     _pad: 0,
     name: [0u8; INIT_MODULE_NAME_LEN],
 };
+
+/// Pixel layout for a linear framebuffer. Discriminants are stable across
+/// the kernel-to-init boundary; values match `boot_protocol::PixelFormat`.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitPixelFormat
+{
+    /// Red–Green–Blue–Padding, 8 bits per channel.
+    Rgbx8 = 0,
+    /// Blue–Green–Red–Padding, 8 bits per channel.
+    Bgrx8 = 1,
+}
+
+/// Framebuffer geometry forwarded to init.
+///
+/// Mirrors `boot_protocol::FramebufferInfo` but is redefined locally so
+/// `init-protocol` retains its zero-dependency invariant. The kernel
+/// converts between the two at the boundary. When `physical_base == 0`
+/// no framebuffer is present.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct InitFramebufferInfo
+{
+    /// Physical base address of the framebuffer. Zero if absent.
+    pub physical_base: u64,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Bytes per row (may exceed `width × bytes_per_pixel`).
+    pub stride: u32,
+    /// Pixel format.
+    pub pixel_format: InitPixelFormat,
+}
+
+impl InitFramebufferInfo
+{
+    /// Return a zeroed `InitFramebufferInfo` indicating no framebuffer.
+    #[must_use]
+    pub const fn empty() -> Self
+    {
+        Self {
+            physical_base: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            pixel_format: InitPixelFormat::Rgbx8,
+        }
+    }
+}
 
 /// Capability type discriminant for [`CapDescriptor`].
 ///

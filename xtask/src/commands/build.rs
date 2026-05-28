@@ -185,6 +185,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "framebuffer",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: None,
+    },
+    Spec {
         name: "cmos-rtc",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -269,6 +276,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "fb-charset",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
         name: "fsbench",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -319,6 +333,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Vfsd => "vfsd",
         BuildComponent::VirtioBlk => "virtio-blk",
         BuildComponent::Serial => "serial",
+        BuildComponent::Framebuffer => "framebuffer",
         BuildComponent::CmosRtc => "cmos-rtc",
         BuildComponent::GoldfishRtc => "goldfish-rtc",
         BuildComponent::Fatfs => "fatfs",
@@ -330,6 +345,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Timed => "timed",
         BuildComponent::Hello => "hello",
         BuildComponent::HelloTester => "hello-tester",
+        BuildComponent::FbCharset => "fb-charset",
         BuildComponent::Fsbench => "fsbench",
         BuildComponent::Stackoverflow => "stackoverflow",
         BuildComponent::Pipefault => "pipefault",

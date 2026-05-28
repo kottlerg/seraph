@@ -12,7 +12,11 @@ devmgr/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   └── main.rs                     # Entry point (stub)
+│   ├── main.rs                     # Bootstrap, registry service loop, QUERY_* handlers
+│   ├── caps.rs                     # Capability absorbers and device-info catalog
+│   ├── firmware/                   # ACPI / DTB parsing helpers
+│   ├── pci.rs                      # PCI ECAM enumeration + BAR splitting
+│   └── spawn.rs                    # Driver-process spawn helpers (simple-device, virtio-blk, ...)
 └── docs/
     ├── pci-enumeration.md          # PCI enumeration via ECAM MMIO
     └── hotplug.md                  # Hotplug event handling
@@ -49,8 +53,9 @@ responsibilities are:
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
   the block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
-  (`QUERY_SERIAL_DEVICE`), and netd in due course. devmgr owns each driver's
-  service endpoint and mints a tokened SEND on query.
+  (`QUERY_SERIAL_DEVICE`), `programs/fb-charset` resolves the framebuffer
+  driver (`QUERY_FRAMEBUFFER_DEVICE`), and netd in due course. devmgr owns
+  each driver's service endpoint and mints a tokened SEND on query.
 - **Handle hotplug** — on platforms that support it, receive hotplug
   notifications and dynamically spawn or terminate driver processes. See
   [`docs/hotplug.md`](docs/hotplug.md).

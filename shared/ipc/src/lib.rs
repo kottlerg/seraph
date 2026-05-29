@@ -273,7 +273,7 @@ pub mod procmgr_labels
     pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
 
-pub const MEMMGR_LABELS_VERSION: u32 = 1;
+pub const MEMMGR_LABELS_VERSION: u32 = 2;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -334,6 +334,23 @@ pub mod memmgr_labels
     /// cap is missing RETYPE or the pool is full (cap is dropped on
     /// reject).
     pub const DONATE_FRAMES: u64 = 5;
+    /// Read-only query of the all-RAM-accounted identity. Callable from any
+    /// tokened cap; returns aggregate counts only — no caps, no state change.
+    ///
+    /// Wire format: request carries no words. Reply (`SUCCESS`):
+    ///
+    /// * `data[0]` — `system_ram_bytes`: total installed RAM the kernel
+    ///   computed at boot (delivered to memmgr via the bootstrap facts).
+    /// * `data[1]` — `kernel_reserved_bytes`: the fixed kernel reserve
+    ///   (`system_ram_bytes` minus every `owns_memory` page minted to init).
+    /// * `data[2]` — `pool_total_bytes`: every page memmgr owns, across free
+    ///   runs, in-use bootstrap arenas, and reap donations.
+    ///
+    /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
+    /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
+    /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
+    /// "dark" memory.
+    pub const QUERY_POOL_STATUS: u64 = 6;
 
     /// `REQUEST_FRAMES` flag: reply MUST contain exactly one Frame cap
     /// covering all `want_pages`, or fail with

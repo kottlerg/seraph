@@ -435,6 +435,8 @@ struct InitBootstrap
     phys_bases: [u64; BOOTSTRAP_MAX_FRAMES],
     in_use: [BootInUse; ipc::memmgr_bootstrap::MAX_IN_USE],
     in_use_count: usize,
+    system_ram_bytes: u64,
+    kernel_reserved_bytes: u64,
 }
 
 fn bootstrap_from_init(
@@ -522,6 +524,19 @@ fn bootstrap_from_init(
         };
     }
 
+    // The kernel's immutable RAM-accounting facts, written by init at fixed
+    // phys-table indices. They form the left side of the all-RAM-accounted
+    // identity (`system_ram == kernel_reserved + pool_total`) surfaced via
+    // `QUERY_POOL_STATUS`.
+    // SAFETY: both indices are within the mapped 4 KiB page and past the
+    // phys-base table.
+    let (system_ram_bytes, kernel_reserved_bytes) = unsafe {
+        (
+            core::ptr::read_volatile(phys_ptr.add(mb::FACTS_SYSTEM_RAM_IDX)),
+            core::ptr::read_volatile(phys_ptr.add(mb::FACTS_KERNEL_RESERVED_IDX)),
+        )
+    };
+
     let _ = syscall::mem_unmap(self_aspace, PHYS_TABLE_TEMP_VA, 1);
     let _ = syscall::cap_delete(phys_table_cap);
 
@@ -534,6 +549,8 @@ fn bootstrap_from_init(
         phys_bases,
         in_use,
         in_use_count,
+        system_ram_bytes,
+        kernel_reserved_bytes,
     })
 }
 
@@ -981,6 +998,22 @@ fn handle_donate_frames(req: &IpcMessage, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Reply with the all-RAM-accounted identity terms (all in bytes):
+/// `system_ram`, `kernel_reserved`, `pool_total`. Read-only; the caller asserts
+/// `system_ram == kernel_reserved + pool_total`. `pool_total` is the page
+/// counter scaled to bytes; the facts arrive verbatim from the kernel.
+fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
+{
+    let pool_total_bytes = pool_total_pages().saturating_mul(PAGE_SIZE);
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, boot.system_ram_bytes)
+        .word(1, boot.kernel_reserved_bytes)
+        .word(2, pool_total_bytes)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
 /// Total pages of RAM memmgr owns: every page it has taken ownership of since
 /// boot, across all dispositions — bootstrap free runs, in-use bootstrap
 /// arenas, and reap donations. memmgr never returns RAM to the kernel, and
@@ -1118,6 +1151,10 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         memmgr_labels::DONATE_FRAMES =>
         {
             handle_donate_frames(req, ipc_buf);
+        }
+        memmgr_labels::QUERY_POOL_STATUS =>
+        {
+            handle_query_pool_status(ipc_buf, boot);
         }
         _ =>
         {

@@ -1321,6 +1321,7 @@ pub fn phase3_svcmgr_handover(
     mut thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
+    mem_frame_reap_floor: u32,
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
@@ -1563,7 +1564,13 @@ pub fn phase3_svcmgr_handover(
     // thread; when this function returns into `sys_thread_exit`
     // immediately below, procmgr's reap path tears init's AS/CSpace
     // /Threads down and donates the Frame caps to memmgr's pool.
-    handoff_to_procmgr_reap(info, procmgr_ep, init_logd_thread_cap, ipc_buf);
+    handoff_to_procmgr_reap(
+        info,
+        procmgr_ep,
+        init_logd_thread_cap,
+        ipc_buf,
+        mem_frame_reap_floor,
+    );
 
     log("main thread exiting; init handed off to procmgr for reap");
     syscall::thread_exit();
@@ -1622,6 +1629,7 @@ fn handoff_to_procmgr_reap(
     procmgr_ep: u32,
     init_logd_thread_cap: u32,
     ipc_buf: *mut u64,
+    mem_frame_reap_floor: u32,
 )
 {
     // Round 1: kernel-object caps. `data[0] = 1` distinguishes from
@@ -1658,20 +1666,20 @@ fn handoff_to_procmgr_reap(
     //    bootloader and bundle reclaim ranges plus the AP-trampoline late
     //    cap — which carry no named InitInfo slot.
     // The walk skips caps init does not solely own or that are not RAM: the
-    // usable-RAM range (memmgr owns it, forwarded at bootstrap) and the
-    // firmware read-only caps (RSDP/ACPI/DTB; owns_memory=false). Boot-module
-    // Frame caps are included: init is their sole owner once every loader has
-    // copied the ELF and dropped its borrowed read-only derivation, so they
-    // donate to memmgr here like any other reclaimable frame.
+    // consumed/forwarded usable-RAM prefix (below `mem_frame_reap_floor` —
+    // `FrameAlloc` arenas and the frames `finalize_memmgr` already forwarded;
+    // memmgr keeps them alive) and the firmware read-only caps (RSDP/ACPI/DTB;
+    // owns_memory=false). The usable-RAM *tail* at or above the floor — free
+    // frames that did not fit the single bootstrap round — IS donated here, so
+    // every page of RAM reaches memmgr's pool. Boot-module Frame caps are also
+    // included: init is their sole owner once every loader has copied the ELF
+    // and dropped its borrowed read-only derivation.
     let seg = info.segment_frame_base..info.segment_frame_base + info.segment_frame_count;
     let stack =
         info.init_stack_frame_base..info.init_stack_frame_base + info.init_stack_frame_count;
     let inf = info.init_info_frame_base..info.init_info_frame_base + info.init_info_frame_count;
 
     let mem_lo = info.memory_frame_base;
-    let mem_hi = info
-        .memory_frame_base
-        .saturating_add(info.memory_frame_count);
     let acpi_lo = info.acpi_region_frame_base;
     let acpi_hi = info
         .acpi_region_frame_base
@@ -1702,7 +1710,7 @@ fn handoff_to_procmgr_reap(
                 continue;
             }
             let s = desc.slot;
-            if s >= mem_lo && s < mem_hi
+            if s >= mem_lo && s < mem_frame_reap_floor
             {
                 continue;
             }

@@ -639,9 +639,19 @@ static mut DRAIN_ORDER_BUF: [(u64, usize); MAX_DRAIN_BLOCKS] = [(0u64, 0usize); 
 static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_DRAIN_BLOCKS];
 
 /// Pages of the kernel reserve seeded into [`crate::mm::kernel_pt_pool`] at
-/// Phase 7. PT growth consumes from that pool, not the buddy.
+/// Phase 7. The pool backs only the kernel-side Phase-9 bootstrap maps that
+/// build init's (or ktest's) boot address space — ELF segments, stack, and
+/// `InitInfo` — via [`crate::mm::address_space::AddressSpace::map_page`].
+/// Userspace-driven PT growth (drivers' MMIO, services' scratch) funds its
+/// own retype-backed growth pool and never draws here; see
+/// [`crate::mm::kernel_pt_pool`].
+///
+/// Measured Phase-9 consumption is 6 pages (init) / 7 pages (ktest) on both
+/// arches; 64 leaves ~9× slack for init-binary growth and VA-layout
+/// fragmentation. Undersizing is not silent — the pool returning `None`
+/// fatals at the first failed bootstrap map.
 #[cfg(not(test))]
-pub(crate) const POOL_SEED_PAGES: usize = 1024;
+pub(crate) const POOL_SEED_PAGES: usize = 64;
 /// Pages kept in the buddy for kernel-internal use after Phase 7:
 ///
 /// 1. **Phase 8 idle-thread kernel stacks**: `sched::init` allocates
@@ -657,8 +667,11 @@ pub(crate) const POOL_SEED_PAGES: usize = 1024;
 /// asserts.
 #[cfg(not(test))]
 pub(crate) const BUDDY_RESIDUE_PAGES: usize = 384;
-/// Total fixed reserve carved from the buddy at Phase 7. `1024 + 384 = 1408`
-/// pages ≈ 5.5 MiB.
+/// Total fixed reserve carved from the buddy at Phase 7. `64 + 384 = 448`
+/// pages ≈ 1.75 MiB. Pages not carved here are minted as userspace RAM Frame
+/// caps and route to memmgr's pool, so shrinking this only moves pages from
+/// reserve into pool; the all-RAM-accounted identity is unaffected
+/// (`kernel_reserved` is computed as the complement at Phase 9).
 #[cfg(not(test))]
 pub(crate) const KERNEL_RESERVE_PAGES: usize = POOL_SEED_PAGES + BUDDY_RESIDUE_PAGES;
 

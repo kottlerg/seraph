@@ -849,6 +849,11 @@ fn run(info_ptr: u64) -> !
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
 
     let _ = vfsd_service_ep;
+    // The free-RAM frames `finalize_memmgr` could not fit in memmgr's single
+    // bootstrap round remain solely init's, at slots at or above this floor.
+    // The reap walk donates them to memmgr's pool; below the floor are the
+    // frames FrameAlloc consumed or finalize already forwarded.
+    let mem_frame_reap_floor = info.memory_frame_base + alloc.next_idx;
     service::phase3_svcmgr_handover(
         info,
         endpoint_cap,
@@ -860,6 +865,7 @@ fn run(info_ptr: u64) -> !
         thread_caps,
         ipc_buf,
         init_logd_thread_cap,
+        mem_frame_reap_floor,
     );
 }
 

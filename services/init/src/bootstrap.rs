@@ -724,11 +724,18 @@ pub fn finalize_memmgr(
     phys_table_frame: u32,
 ) -> Option<MemmgrFinalize>
 {
-    // The bootstrap-IPC payload to memmgr packs 2 page_counts per word
-    // after a 3-word prefix; up to `ipc::memmgr_bootstrap::MAX_FRAMES`
-    // entries fit. With memmgr owning all of system RAM, this should
-    // comfortably cover any plausible init frame count; raise the bound (or
-    // move to multi-round bootstrap) if a target ever exceeds it.
+    // The bootstrap-IPC payload to memmgr packs 2 page_counts per word after
+    // a 3-word prefix; `ipc::memmgr_bootstrap::MAX_FRAMES` entries fit, of
+    // which the loop below claims at most `MAX_FRAMES - 2` for regular memory
+    // frames and leaves two for the FrameAlloc tail and the phys-table page.
+    // That is enough to seed memmgr's pool for procmgr's first allocations;
+    // any regular frames beyond the cap (the buddy can drain into more blocks
+    // than fit when the memory map is fragmented) are delivered later via the
+    // reap-donation route (`handoff_to_procmgr_reap` → procmgr →
+    // `DONATE_FRAMES`), which streams without a per-round cap. So this bound is
+    // a round-size limit, not a ceiling on total RAM forwarded — the reap floor
+    // below picks up the rest. (The tail and phys-table page have no InitInfo
+    // descriptor, so the reap walk cannot reach them; they must ride here.)
     let mut page_counts = [0u32; ipc::memmgr_bootstrap::MAX_FRAMES];
     let mut phys_bases = [0u64; ipc::memmgr_bootstrap::MAX_FRAMES];
     let mut mm_frame_base: u32 = 0;
@@ -736,7 +743,12 @@ pub fn finalize_memmgr(
     let total_remaining = info.memory_frame_count.saturating_sub(alloc.next_idx);
     for i in 0..total_remaining
     {
-        if mm_frame_count as usize >= ipc::memmgr_bootstrap::MAX_FRAMES
+        // Reserve two payload slots for the FrameAlloc tail and the phys-table
+        // page forwarded below. Both are `frame_split` products with no
+        // InitInfo descriptor, so the reap walk cannot reach them — they MUST
+        // ride this bootstrap round. Regular frames that no longer fit are
+        // delivered to memmgr's pool via reap instead.
+        if mm_frame_count as usize >= ipc::memmgr_bootstrap::MAX_FRAMES - 2
         {
             break;
         }
@@ -744,7 +756,9 @@ pub fn finalize_memmgr(
         let Some(desc) = descriptor_for(info, src_slot)
         else
         {
-            continue;
+            // Keep the forwarded set a contiguous prefix: stop here and let
+            // the reap route donate this frame and everything after it.
+            break;
         };
         let bytes = desc.aux1;
         let phys_base = desc.aux0;
@@ -770,12 +784,12 @@ pub fn finalize_memmgr(
         let Ok(intermediary) = syscall::cap_derive(src_slot, syscall::RIGHTS_ALL)
         else
         {
-            continue;
+            break;
         };
         let Ok(dst_slot) = syscall::cap_copy(intermediary, mm.mm_cspace, syscall::RIGHTS_ALL)
         else
         {
-            continue;
+            break;
         };
         if mm_frame_count == 0
         {
@@ -785,7 +799,13 @@ pub fn finalize_memmgr(
         phys_bases[mm_frame_count as usize] = phys_base;
         mm_frame_count += 1;
     }
-    alloc.next_idx += total_remaining;
+    // Advance only past the frames actually forwarded this round (a
+    // contiguous prefix — the loop breaks on the first frame it cannot
+    // forward). `memory_frame_base + alloc.next_idx` is now the reap floor:
+    // every memory-frame cap at or above it is still solely init's, never
+    // handed out by `FrameAlloc` nor forwarded here, and is donated to
+    // memmgr's pool via the reap route, which has no per-round frame cap.
+    alloc.next_idx += mm_frame_count;
 
     // Forward the partial tail left in `alloc.current`: the unallocated
     // remainder of the last frame `FrameAlloc` split from. It is a

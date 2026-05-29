@@ -5,24 +5,30 @@
 
 //! Kernel-internal intermediate page-table frame pool.
 //!
-//! Backs the legacy `map_user_page` PT-growth path for the only address
-//! space that has no retype-backed PT pool of its own: the chunk-less
-//! kernel-created boot AS (init's own AS, itself part of the fixed
-//! reserve). Both `sys_mmio_map` and `sys_mem_map` dispatch on chunk
-//! presence and reach `AddressSpace::map_page` (and thus this pool) only
-//! for that AS; every retype-backed AS funds its own intermediate PT
-//! pages from its growth pool. Phase-9 init bootstrap mappings also draw
-//! here. Pages are seeded once at the end of Phase 7 from the residual
+//! Backs the unconditional `map_user_page` PT-growth path
+//! ([`crate::mm::address_space::AddressSpace::map_page`]). The sole
+//! consumer in a real boot is the kernel-side Phase-9 bootstrap that
+//! builds init's (or ktest's) boot address space — ELF segments, stack,
+//! and `InitInfo` — which calls `map_page` directly, before any userspace
+//! runs. `sys_mmio_map` / `sys_mem_map` also fall back here, but only for
+//! an address space with no retype-backed PT chunk; every address space
+//! the boot actually creates is seeded with a chunk (`boot_retype_aspace`
+//! for the boot AS, `sys_cap_create_aspace` for services), so those
+//! syscalls take the pooled path and fund their own intermediate PT pages
+//! from the AS's own growth pool. The fallback is the safety net for the
+//! chunk-less case, not a routine path.
+//!
+//! Pages are seeded once at the end of Phase 7 from the residual
 //! `KERNEL_RESERVE_PAGES` buddy carve, threaded onto an intrusive
 //! single-linked free list, and consumed without further buddy traffic.
 //!
 //! Backs the architectural invariant from `crate::kernel_entry`: PT
-//! frames for the legacy `map_user_page` path trace to a single
-//! cap-managed surface (the seed of this pool, sourced from
-//! `KERNEL_RESERVE_PAGES` at Phase 7). A small buddy residue stays
-//! behind for non-PT consumers (idle-thread kernel stacks, the
-//! `dealloc_object` → `free_range` reverse path); see
-//! `crate::cap::drain_and_install_seed` for the sizing rationale.
+//! frames for the `map_user_page` path trace to a single cap-managed
+//! surface (the seed of this pool, sourced from `KERNEL_RESERVE_PAGES` at
+//! Phase 7). A small buddy residue stays behind for non-PT consumers
+//! (idle-thread kernel stacks, the `dealloc_object` → `free_range`
+//! reverse path); see `crate::cap::drain_and_install_seed` for the sizing
+//! rationale.
 //!
 //! The free list is intrusive: each free page's first 8 bytes (accessed
 //! via the direct physical map) hold the next-PA pointer, or 0 for the

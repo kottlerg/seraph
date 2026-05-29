@@ -1574,6 +1574,43 @@ pub fn phase3_svcmgr_handover(
     syscall::thread_exit();
 }
 
+/// Send one `REGISTER_INIT_TEARDOWN` donate-only round (word 0 = 0)
+/// carrying `slots` as caps. Non-fatal on failure: init exits regardless,
+/// and any un-sent cap falls to the `CSpace` cascade.
+///
+/// # Safety
+/// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
+/// SEND|GRANT.
+unsafe fn send_teardown_round(procmgr_ep: u32, slots: &[u32], ipc_buf: *mut u64)
+{
+    if slots.is_empty()
+    {
+        return;
+    }
+    let mut builder = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN).word(0, 0);
+    for &slot in slots
+    {
+        builder = builder.cap(slot);
+    }
+    let msg = builder.build();
+    // SAFETY: forwarded from the caller's contract above.
+    match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
+        {}
+        Ok(_) => log("reap-handoff: donation round refused"),
+        Err(_) => log("reap-handoff: donation round IPC failed"),
+    }
+}
+
+/// True if `slot` is one of the boot-module Frame caps published in
+/// [`InitInfo::module_names`].
+fn is_module_slot(info: &InitInfo, slot: u32) -> bool
+{
+    let count = (info.module_name_count as usize).min(init_protocol::INIT_MAX_NAMED_MODULES);
+    info.module_names[..count].iter().any(|m| m.slot == slot)
+}
+
 /// Move init's kernel-object caps + every reclaimable Frame cap to
 /// procmgr via `REGISTER_INIT_TEARDOWN`, then signal
 /// `INIT_TEARDOWN_DONE`. IPC cap-transfer MOVES caps, so after this
@@ -1615,60 +1652,81 @@ fn handoff_to_procmgr_reap(
         return;
     }
 
-    // Donatable Frame caps: segments + stack + InitInfo region + IPC
-    // buffer. Other init-owned Frame caps (endpoint slab, leftover
-    // FrameAlloc tails) fall to the CSpace cascade — they end up in
-    // the kernel buddy rather than memmgr's pool.
+    // Donate every owns_memory Frame cap init solely holds, streamed in
+    // MSG_CAP_SLOTS_MAX-sized rounds. Two disjoint sources:
+    //  - explicit InitInfo ranges (not in the descriptor array): init's ELF
+    //    segments, user stack, the InitInfo region, and the IPC buffer page.
+    //  - a descriptor walk for the unnamed reclaimable Frame caps — the
+    //    bootloader and bundle reclaim ranges plus the AP-trampoline late
+    //    cap — which carry no named InitInfo slot.
+    // The walk skips caps init does not solely own or that are not RAM: the
+    // usable-RAM range (memmgr owns it, forwarded at bootstrap), firmware
+    // read-only caps (RSDP/ACPI/DTB; owns_memory=false), and boot-module
+    // frames (returned to memmgr via the module-source path).
     let seg = info.segment_frame_base..info.segment_frame_base + info.segment_frame_count;
     let stack =
         info.init_stack_frame_base..info.init_stack_frame_base + info.init_stack_frame_count;
     let inf = info.init_info_frame_base..info.init_info_frame_base + info.init_info_frame_count;
 
-    let mut donate: [u32; 32] = [0; 32];
-    let mut n = 0usize;
-    for slot in seg.chain(stack).chain(inf)
-    {
-        if n < donate.len()
-        {
-            donate[n] = slot;
-            n += 1;
-        }
-    }
-    if init_ipc_buf_cap != 0 && n < donate.len()
-    {
-        donate[n] = init_ipc_buf_cap;
-        n += 1;
-    }
+    let mem_lo = info.memory_frame_base;
+    let mem_hi = info
+        .memory_frame_base
+        .saturating_add(info.memory_frame_count);
+    let acpi_lo = info.acpi_region_frame_base;
+    let acpi_hi = info
+        .acpi_region_frame_base
+        .saturating_add(info.acpi_region_frame_count);
 
-    let chunk_size = syscall_abi::MSG_CAP_SLOTS_MAX;
-    let mut i = 0usize;
-    while i < n
+    let mut chunk = [0u32; syscall_abi::MSG_CAP_SLOTS_MAX];
+    let mut cn = 0usize;
     {
-        let end = (i + chunk_size).min(n);
-        let mut builder = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN).word(0, 0);
-        for &slot in &donate[i..end]
+        let mut push = |slot: u32| {
+            chunk[cn] = slot;
+            cn += 1;
+            if cn == chunk.len()
+            {
+                // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
+                unsafe { send_teardown_round(procmgr_ep, &chunk, ipc_buf) };
+                cn = 0;
+            }
+        };
+
+        for slot in seg.chain(stack).chain(inf)
         {
-            builder = builder.cap(slot);
+            push(slot);
         }
-        let msg = builder.build();
+        if init_ipc_buf_cap != 0
+        {
+            push(init_ipc_buf_cap);
+        }
+        for desc in crate::descriptors(info)
+        {
+            if desc.cap_type != CapType::Frame
+            {
+                continue;
+            }
+            let s = desc.slot;
+            if s >= mem_lo && s < mem_hi
+            {
+                continue;
+            }
+            if (info.acpi_rsdp_frame_cap != 0 && s == info.acpi_rsdp_frame_cap)
+                || (info.dtb_frame_cap != 0 && s == info.dtb_frame_cap)
+                || (info.acpi_region_frame_count != 0 && s >= acpi_lo && s < acpi_hi)
+            {
+                continue;
+            }
+            if is_module_slot(info, s)
+            {
+                continue;
+            }
+            push(s);
+        }
+    }
+    if cn > 0
+    {
         // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
-        match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) }
-        {
-            Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
-            {}
-            Ok(reply) => log(
-                if reply.label == ipc::procmgr_errors::INVALID_ARGUMENT
-                {
-                    "reap-handoff: donation chunk refused INVALID_ARGUMENT"
-                }
-                else
-                {
-                    "reap-handoff: donation chunk refused (non-success reply)"
-                },
-            ),
-            Err(_) => log("reap-handoff: donation chunk IPC failed"),
-        }
-        i = end;
+        unsafe { send_teardown_round(procmgr_ep, &chunk[..cn], ipc_buf) };
     }
 
     // Signal the cap stream is closed. Procmgr arms the death-EQ

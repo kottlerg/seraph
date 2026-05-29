@@ -394,13 +394,14 @@ pub fn create_devmgr_with_caps(
 ) -> Option<u32>
 {
     let devmgr_frame_cap = crate::find_module_by_name(info, b"devmgr")?;
+    let devmgr_module_copy = module_spawn_copy(devmgr_frame_cap)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
     // caps: [module, creator]. No stdio pipes — devmgr reaches the
     // system log via the discovery cap procmgr installs in ProcessInfo.
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(devmgr_frame_cap)
+        .cap(devmgr_module_copy)
         .cap(tokened_creator)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -1033,11 +1034,12 @@ pub fn create_vfsd_with_caps(
 ) -> Option<u32>
 {
     let vfsd_frame_cap = crate::find_module_by_name(info, b"vfsd")?;
+    let vfsd_module_copy = module_spawn_copy(vfsd_frame_cap)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(vfsd_frame_cap)
+        .cap(vfsd_module_copy)
         .cap(tokened_creator)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -1603,12 +1605,14 @@ unsafe fn send_teardown_round(procmgr_ep: u32, slots: &[u32], ipc_buf: *mut u64)
     }
 }
 
-/// True if `slot` is one of the boot-module Frame caps published in
-/// [`InitInfo::module_names`].
-fn is_module_slot(info: &InitInfo, slot: u32) -> bool
+/// Derive a transient full-rights copy of a boot-module Frame cap for a
+/// `CREATE_PROCESS` spawn. Init retains the original — it is the sole owner
+/// of the module-source `FrameObject` and donates it to memmgr at reap. The
+/// loader borrows this copy (deriving a read-only child for the load-time
+/// mapping) and deletes it once the ELF is loaded.
+fn module_spawn_copy(module_frame_cap: u32) -> Option<u32>
 {
-    let count = (info.module_name_count as usize).min(init_protocol::INIT_MAX_NAMED_MODULES);
-    info.module_names[..count].iter().any(|m| m.slot == slot)
+    syscall::cap_derive(module_frame_cap, syscall::RIGHTS_ALL).ok()
 }
 
 /// Move init's kernel-object caps + every reclaimable Frame cap to
@@ -1660,9 +1664,11 @@ fn handoff_to_procmgr_reap(
     //    bootloader and bundle reclaim ranges plus the AP-trampoline late
     //    cap — which carry no named InitInfo slot.
     // The walk skips caps init does not solely own or that are not RAM: the
-    // usable-RAM range (memmgr owns it, forwarded at bootstrap), firmware
-    // read-only caps (RSDP/ACPI/DTB; owns_memory=false), and boot-module
-    // frames (returned to memmgr via the module-source path).
+    // usable-RAM range (memmgr owns it, forwarded at bootstrap) and the
+    // firmware read-only caps (RSDP/ACPI/DTB; owns_memory=false). Boot-module
+    // Frame caps are included: init is their sole owner once every loader has
+    // copied the ELF and dropped its borrowed read-only derivation, so they
+    // donate to memmgr here like any other reclaimable frame.
     let seg = info.segment_frame_base..info.segment_frame_base + info.segment_frame_count;
     let stack =
         info.init_stack_frame_base..info.init_stack_frame_base + info.init_stack_frame_count;
@@ -1713,10 +1719,6 @@ fn handoff_to_procmgr_reap(
             if (info.acpi_rsdp_frame_cap != 0 && s == info.acpi_rsdp_frame_cap)
                 || (info.dtb_frame_cap != 0 && s == info.dtb_frame_cap)
                 || (info.acpi_region_frame_count != 0 && s >= acpi_lo && s < acpi_hi)
-            {
-                continue;
-            }
-            if is_module_slot(info, s)
             {
                 continue;
             }

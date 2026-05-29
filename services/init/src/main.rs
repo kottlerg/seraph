@@ -654,54 +654,10 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     }
 
-    // Donate the two self-loaded boot-module Frame caps (memmgr's and
-    // procmgr's ELFs) to memmgr's pool. Init has already finished
-    // ELF-loading both, so the source pages can flow back to userspace.
-    // memmgr is in its dispatch loop (its bootstrap completed above);
-    // any IPC sent now is queued and handled before procmgr's later
-    // REGISTER_PROCESS arrives.
-    {
-        use ipc::IpcMessage;
-        use ipc::memmgr_labels;
-
-        let memmgr_module_cap = find_module_by_name(info, b"memmgr").unwrap_or(0);
-        let procmgr_module_cap = find_module_by_name(info, b"procmgr").unwrap_or(0);
-        let Ok(donate_send) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_SEND_GRANT)
-        else
-        {
-            logging::log("FATAL: cannot derive donate-SEND cap on memmgr endpoint");
-            syscall::thread_exit();
-        };
-        let mut pages_donated: u64 = 0;
-        let mut last_total: u64 = 0;
-        for module_cap in [memmgr_module_cap, procmgr_module_cap]
-        {
-            let msg = IpcMessage::builder(memmgr_labels::DONATE_FRAMES)
-                .cap(module_cap)
-                .build();
-            // SAFETY: ipc_buf is the registered IPC buffer page; donate_send
-            // is a SEND_GRANT cap on memmgr's endpoint.
-            if let Ok(reply) = unsafe { ipc::ipc_call(donate_send, &msg, ipc_buf) }
-            {
-                pages_donated = pages_donated.saturating_add(reply.word(1));
-                last_total = reply.word(2);
-            }
-        }
-        let _ = syscall::cap_delete(donate_send);
-        let mut buf = [0u8; 96];
-        let mut w = SliceWriter::new(&mut buf);
-        let _ = core::fmt::write(
-            &mut w,
-            format_args!(
-                "donated boot modules: {pages_donated} pages = {} KiB (memmgr pool reclaim \
-                 total: {last_total} pages)",
-                pages_donated * 4,
-            ),
-        );
-        // SAFETY: SliceWriter only writes UTF-8 bytes from `core::fmt::write`.
-        let s = unsafe { core::str::from_utf8_unchecked(w.as_slice()) };
-        logging::log(s);
-    }
+    // Init retains every boot-module source Frame cap (its own self-loaded
+    // memmgr/procmgr ELFs plus the devmgr/vfsd/driver modules) as the sole
+    // owner of each `FrameObject`; all of them donate to memmgr's pool on the
+    // single reap-handoff route once every loader has copied the ELF.
 
     // Memmgr is now ingesting; start procmgr.
     bootstrap::start_procmgr(&pm);

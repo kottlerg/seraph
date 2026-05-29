@@ -438,10 +438,10 @@ pub fn bootstrap_memmgr(
     let module_size = descriptor_for(info, module_frame_cap).map(|d| d.aux1)?;
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
-    // Module Frame caps now carry full rights (R+W+X+RETYPE) so they can
-    // flow through the donation chain into memmgr's pool with rights its
-    // consumers need. Derive a read-only child cap for the load-time
-    // mapping so `mem_map`'s derive-from-cap path produces a strictly
+    // The module Frame cap carries full rights (R+W+X+RETYPE): init retains
+    // it as the module-source owner and donates it to memmgr's pool at reap,
+    // where RETYPE lets memmgr re-derive. Derive a read-only child cap for the
+    // load-time mapping so `mem_map`'s derive-from-cap path produces a strictly
     // read-only page (otherwise W+X cap rights trip W^X).
     let module_ro = syscall::cap_derive(module_frame_cap, syscall::RIGHTS_MAP_READ).ok()?;
     syscall::mem_map(

@@ -260,32 +260,6 @@ pub fn register_with_memmgr(memmgr_ep: u32, ipc_buf: *mut u64) -> (u32, u64)
     (cap, token)
 }
 
-/// Permanently transfer a boot-module Frame cap into memmgr's pool via
-/// `DONATE_FRAMES`. Returns true on success (cap left procmgr's `CSpace`),
-/// false on any failure (caller should `cap_delete` to drop the slot).
-///
-/// Used after `CREATE_PROCESS` completes its ELF load: the source pages
-/// are no longer referenced by procmgr, and routing them through memmgr
-/// (rather than dropping the cap) returns the bytes to userspace.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-fn donate_module_cap(memmgr_ep: u32, module_cap: u32, ipc_buf: *mut u64) -> bool
-{
-    if memmgr_ep == 0
-    {
-        return false;
-    }
-    let msg = IpcMessage::builder(memmgr_labels::DONATE_FRAMES)
-        .cap(module_cap)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) })
-    else
-    {
-        return false;
-    };
-    reply.label == memmgr_errors::SUCCESS && reply.word(0) >= 1
-}
-
 /// Allocate exactly one page from memmgr. Returns the cap slot of the
 /// (single-page) Frame in procmgr's `CSpace`, or zero on any failure
 /// (memmgr not wired, OOM, derive failure). Caller is responsible for
@@ -859,17 +833,14 @@ fn handle_create(
         let _ = syscall::cap_delete(memmgr_send);
     }
 
-    // Module cap disposition: donate the source frame to memmgr's pool. The
-    // loader has copied the ELF contents into the child's AddressSpace and
-    // procmgr has no further use for the source pages, so routing them
-    // through memmgr returns the bytes to userspace.
+    // Module cap disposition: the module cap is a borrowed derivation of the
+    // caller's module-source frame. The loader has copied the ELF contents
+    // into the child's AddressSpace and has no further use for the source, so
+    // delete it. The owner (init) retains the source frame and donates it to
+    // memmgr's pool at reap.
     if module_cap != 0
     {
-        let donated = donate_module_cap(ctx.memmgr_ep, module_cap, ipc_buf);
-        if !donated
-        {
-            let _ = syscall::cap_delete(module_cap);
-        }
+        let _ = syscall::cap_delete(module_cap);
     }
     if creator_ep != 0
     {

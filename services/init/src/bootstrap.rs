@@ -34,61 +34,131 @@ const ELF_PAGE_TEMP_VA: u64 = TEMP_MAP_BASE + 0x1000_0000;
 /// procmgr's IPC buffer VA as seen from init while bootstrapping procmgr.
 const PROCMGR_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 
-// ── ELF loading ──────────────────────────────────────────────────────────────
+// ── Bootstrap arena ────────────────────────────────────────────────────────────
+//
+// Each tier-1 service (memmgr, procmgr) is backed by one contiguous arena
+// Frame cap carved from init's pool. Its front `[0, RETYPE_RESERVE_PAGES)`
+// is consumed by the service's `AddressSpace` / `CSpace` / `Thread` retypes
+// (a monotonic page-aligned front bump in the cap's `RetypeAllocator`); the
+// remainder is offset-mapped page-by-page as the service's loaded backing
+// (ELF segments, TLS, `ProcessInfo`, stack, IPC buffer). The retypes each
+// hold an ancestor reference on the arena's `FrameObject` for the immortal
+// service's life, so init's eventual cap-drop at reap never brings the
+// refcount to zero: the offset-mapped backing never dangles and the arena
+// never frees into the post-handoff buddy.
 
-/// Derive a frame cap with the given protection rights for mapping.
-fn derive_frame_for_prot(frame_cap: u32, prot: u64) -> Option<u32>
+/// Front region of every arena reserved for the three kernel-object retypes.
+/// `AddressSpace` and `CSpace` each consume `*_RETYPE_PAGES - 1` pages (the
+/// value passed as their growth budget); `Thread` consumes
+/// `THREAD_RETYPE_PAGES`. The retype bump is page-aligned and monotonic, so
+/// backing offsets at or above this bound never collide with a retype slab.
+const RETYPE_RESERVE_PAGES: u64 = (crate::ASPACE_RETYPE_PAGES - 1)
+    + (crate::CSPACE_RETYPE_PAGES - 1)
+    + crate::THREAD_RETYPE_PAGES;
+
+/// A service's contiguous backing arena: one Frame cap plus a page cursor
+/// into its offset-mapped backing region.
+struct BootArena
 {
-    if prot == syscall::MAP_READONLY
+    /// Arena Frame cap in init's `CSpace`. Full rights (R+W+X+RETYPE):
+    /// retyped from its front, offset-mapped past the retype bump.
+    cap: u32,
+    /// init's own `AddressSpace` cap; transient per-page scratch maps land
+    /// here at [`ELF_PAGE_TEMP_VA`].
+    init_aspace: u32,
+    /// Next free backing-page offset, in pages. Starts at
+    /// [`RETYPE_RESERVE_PAGES`]; advances one page per [`Self::place_page`].
+    cursor: u64,
+}
+
+impl BootArena
+{
+    /// Carve a `RETYPE_RESERVE_PAGES + backing_pages` contiguous arena off
+    /// `alloc` with the cursor positioned past the retype reserve. The
+    /// caller performs the three retypes against [`Self::cap`] before
+    /// placing any backing page.
+    fn carve(alloc: &mut FrameAlloc, init_aspace: u32, backing_pages: u64) -> Option<Self>
     {
-        syscall::cap_derive(frame_cap, syscall::RIGHTS_MAP_READ).ok()
+        let cap = alloc.alloc_pages(RETYPE_RESERVE_PAGES + backing_pages)?;
+        Some(Self {
+            cap,
+            init_aspace,
+            cursor: RETYPE_RESERVE_PAGES,
+        })
     }
-    else if prot == syscall::MAP_EXECUTABLE
+
+    /// Map the arena's current backing page writable into init at
+    /// [`ELF_PAGE_TEMP_VA`], zero it, run `populate` to fill it, unmap it
+    /// from init, then map it into `target_aspace` at `target_va` with
+    /// `prot`. Advances the cursor. `prot` is an explicit mapping mode
+    /// (`MAP_READ` / `MAP_WRITABLE` / `MAP_EXECUTABLE`) applied directly to
+    /// the full-rights arena cap — no per-page derived child, so no live
+    /// derivation blocks a later `frame_split` of the arena.
+    fn place_page(
+        &mut self,
+        target_aspace: u32,
+        target_va: u64,
+        prot: u64,
+        populate: impl FnOnce(u64),
+    ) -> Option<()>
     {
-        syscall::cap_derive(frame_cap, syscall::RIGHTS_MAP_RX).ok()
-    }
-    else
-    {
-        syscall::cap_derive(frame_cap, syscall::RIGHTS_MAP_RW).ok()
+        let offset = self.cursor;
+        syscall::mem_map(
+            self.cap,
+            self.init_aspace,
+            ELF_PAGE_TEMP_VA,
+            offset,
+            1,
+            syscall::MAP_WRITABLE,
+        )
+        .ok()?;
+        // SAFETY: ELF_PAGE_TEMP_VA is mapped writable, one page.
+        unsafe { core::ptr::write_bytes(ELF_PAGE_TEMP_VA as *mut u8, 0, PAGE_SIZE as usize) };
+        populate(ELF_PAGE_TEMP_VA);
+        let _ = syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, 1);
+        syscall::mem_map(self.cap, target_aspace, target_va, offset, 1, prot).ok()?;
+        self.cursor += 1;
+        Some(())
     }
 }
 
-/// Copy one ELF segment page from `file_data` into a freshly allocated frame,
-/// then map it into the target address space.
-fn load_elf_page(
-    page_vaddr: u64,
-    seg_vaddr: u64,
-    file_data: &[u8],
-    prot: u64,
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
-    target_aspace: u32,
-) -> Option<()>
+/// Sum of `PT_LOAD` page spans for `ehdr` — the backing pages an arena must
+/// reserve for ELF segments. Mirrors the per-segment page math in
+/// [`load_elf_into_arena`]; the two MUST agree or the arena is mis-sized.
+fn elf_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> Option<u64>
 {
-    let Some(frame_cap) = alloc.alloc_page()
-    else
+    let mut total = 0u64;
+    for seg_result in elf::load_segments(ehdr, module_bytes)
     {
-        log("ELF load: frame alloc failed");
-        return None;
-    };
-
-    if syscall::mem_map(
-        frame_cap,
-        init_aspace,
-        ELF_PAGE_TEMP_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
-    .is_err()
-    {
-        log("ELF load: temp map failed");
-        return None;
+        let seg = seg_result.ok()?;
+        if seg.memsz == 0
+        {
+            continue;
+        }
+        let first_page = seg.vaddr & !0xFFF;
+        let last_page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+        total += (last_page_end - first_page) / PAGE_SIZE;
     }
+    Some(total)
+}
 
-    // SAFETY: ELF_PAGE_TEMP_VA is mapped writable, covers one page.
-    unsafe { core::ptr::write_bytes(ELF_PAGE_TEMP_VA as *mut u8, 0, PAGE_SIZE as usize) };
+/// One backing page for the main TLS block when `ehdr` declares a non-empty
+/// `PT_TLS`, else zero. Mirrors the presence check in [`place_main_tls`].
+fn tls_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> u64
+{
+    match elf::tls_segment(ehdr, module_bytes)
+    {
+        Ok(Some(seg)) if seg.memsz > 0 => 1,
+        _ => 0,
+    }
+}
 
+/// Copy one ELF segment page's file data into the page mapped at
+/// `scratch_va` (already zeroed). Handles the partial first/last page via
+/// `seg_vaddr` alignment so the loaded image matches the segment's byte
+/// layout; the bytes beyond `filesz` stay zero (BSS).
+fn copy_segment_into(scratch_va: u64, page_vaddr: u64, seg_vaddr: u64, file_data: &[u8])
+{
     let dest_offset = if page_vaddr < seg_vaddr
     {
         (seg_vaddr - page_vaddr) as usize
@@ -103,33 +173,21 @@ fn load_elf_page(
     if copy_len > 0
     {
         let src = &file_data[seg_offset..seg_offset + copy_len];
-        // SAFETY: temp_va is mapped and writable; copy within one page.
+        // SAFETY: scratch_va is mapped writable; the copy stays within one page.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr(),
-                (ELF_PAGE_TEMP_VA as *mut u8).add(dest_offset),
+                (scratch_va as *mut u8).add(dest_offset),
                 src.len(),
             );
         }
     }
-
-    let _ = syscall::mem_unmap(init_aspace, ELF_PAGE_TEMP_VA, 1);
-
-    let derived_cap = derive_frame_for_prot(frame_cap, prot)?;
-    syscall::mem_map(derived_cap, target_aspace, page_vaddr, 0, 1, 0).ok()?;
-
-    Some(())
 }
 
-/// Allocate one frame for the main thread's TLS block, populate it from
-/// the in-memory `.tdata` template, install the TCB self-pointer, and
-/// map it read-write into `target_aspace` at `PROCESS_MAIN_TLS_VADDR`.
-///
-/// Returns `(tls_base_va, tls_template_metadata)` where the metadata is
-/// what gets written into the child's `ProcessInfo.tls_template_*`
-/// fields. When the binary has no `PT_TLS` segment, returns
-/// `(0, ChildTlsMeta::default())` and the caller passes
-/// `tls_base_va = 0` to `thread_configure_with_tls`.
+/// `PT_TLS` template metadata, written into the child's
+/// `ProcessInfo.tls_template_*` fields. When the binary has no `PT_TLS`
+/// segment, [`place_main_tls`] returns `(0, ChildTlsMeta::default())` and
+/// the caller passes `tls_base_va = 0` to `thread_configure_with_tls`.
 #[derive(Clone, Copy, Default)]
 pub struct ChildTlsMeta
 {
@@ -139,17 +197,22 @@ pub struct ChildTlsMeta
     pub align: u64,
 }
 
+/// Place the main thread's TLS block in `arena`: populate it from the
+/// in-memory `.tdata` template, install the TCB self-pointer, and map it
+/// read-write into `target_aspace` at `PROCESS_MAIN_TLS_VADDR`.
+///
+/// Returns `(tls_base_va, metadata)`. When the binary has no `PT_TLS`
+/// segment (or it is empty), returns `(0, ChildTlsMeta::default())` without
+/// consuming a backing page — matching [`tls_backing_pages`].
 #[allow(clippy::similar_names)]
-fn prepare_main_tls(
+fn place_main_tls(
+    arena: &mut BootArena,
+    ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
     target_aspace: u32,
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
 ) -> Option<(u64, ChildTlsMeta)>
 {
-    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
-    let tls_seg = elf::tls_segment(ehdr, module_bytes).ok()?;
-    let Some(seg) = tls_seg
+    let Some(seg) = elf::tls_segment(ehdr, module_bytes).ok()?
     else
     {
         return Some((0, ChildTlsMeta::default()));
@@ -175,71 +238,49 @@ fn prepare_main_tls(
         return None;
     }
 
-    let tls_frame = alloc.alloc_zero_page(init_aspace, crate::TEMP_MAP_BASE)?;
-
-    // SAFETY: TEMP_MAP_BASE mapped writable, one page, zeroed.
     let tdata_start = seg.offset as usize;
     let tdata_end = tdata_start + seg.filesz as usize;
     if tdata_end > module_bytes.len()
     {
-        let _ = syscall::mem_unmap(init_aspace, crate::TEMP_MAP_BASE, 1);
         return None;
-    }
-    // SAFETY: TEMP_MAP_BASE mapped writable, length bounded by tls_block_layout.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            module_bytes[tdata_start..tdata_end].as_ptr(),
-            crate::TEMP_MAP_BASE as *mut u8,
-            seg.filesz as usize,
-        );
     }
 
     let tls_base_va = process_abi::PROCESS_MAIN_TLS_VADDR + tls_base_offset;
-    // SAFETY: TEMP_MAP_BASE mapped writable; the block fits.
-    unsafe {
-        process_abi::tls_install_tcb(
-            crate::TEMP_MAP_BASE as *mut u8,
-            tls_base_offset,
-            tls_base_va,
-        );
-    }
-
-    let _ = syscall::mem_unmap(init_aspace, crate::TEMP_MAP_BASE, 1);
-
-    let tls_rw = syscall::cap_derive(tls_frame, syscall::RIGHTS_MAP_RW).ok()?;
-    syscall::mem_map(
-        tls_rw,
+    arena.place_page(
         target_aspace,
         process_abi::PROCESS_MAIN_TLS_VADDR,
-        0,
-        1,
-        0,
-    )
-    .ok()?;
+        syscall::MAP_WRITABLE,
+        |scratch_va| {
+            // SAFETY: scratch_va is mapped writable and zeroed; the copy
+            // length is bounded by the tls_block_layout fit check above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    module_bytes[tdata_start..tdata_end].as_ptr(),
+                    scratch_va as *mut u8,
+                    seg.filesz as usize,
+                );
+            }
+            // SAFETY: scratch_va is mapped writable; the block fits one page.
+            unsafe {
+                process_abi::tls_install_tcb(scratch_va as *mut u8, tls_base_offset, tls_base_va);
+            }
+        },
+    )?;
 
     Some((tls_base_va, meta))
 }
 
-/// Load an ELF image into a target address space.
-///
-/// Returns `(entry_point_vaddr, stack_pages)` — `stack_pages` reflects
-/// the binary's `.note.seraph.stack` declaration when present, falling
-/// back to [`DEFAULT_PROCESS_STACK_PAGES`] otherwise. The caller passes
-/// `stack_pages` into [`map_stack_and_ipc`] and the matching
-/// `populate_*_info` so the child sees a consistent envelope.
-fn load_elf(
+/// Load an ELF image's `PT_LOAD` segments into `arena`, offset-mapped into
+/// `target_aspace` at each segment's virtual address with explicit W^X
+/// protection (executable → RX, writable → RW, else RO). Consumes exactly
+/// [`elf_backing_pages`] backing pages.
+fn load_elf_into_arena(
+    arena: &mut BootArena,
+    ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
     target_aspace: u32,
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
-) -> Option<(u64, u32)>
+) -> Option<()>
 {
-    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
-    let entry = elf::entry_point(ehdr);
-    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
-        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
-        .clamp(1, MAX_PROCESS_STACK_PAGES);
-
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
         let seg = seg_result.ok()?;
@@ -258,31 +299,25 @@ fn load_elf(
         }
         else
         {
-            syscall::MAP_READONLY
+            syscall::MAP_READ
         };
 
         let first_page = seg.vaddr & !0xFFF;
         let last_page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        let num_pages = ((last_page_end - first_page) / PAGE_SIZE) as usize;
+        let num_pages = (last_page_end - first_page) / PAGE_SIZE;
 
         let file_data = &module_bytes[seg.offset as usize..(seg.offset + seg.filesz) as usize];
 
         for page_idx in 0..num_pages
         {
-            let page_vaddr = first_page + (page_idx as u64) * PAGE_SIZE;
-            load_elf_page(
-                page_vaddr,
-                seg.vaddr,
-                file_data,
-                prot,
-                alloc,
-                init_aspace,
-                target_aspace,
-            )?;
+            let page_vaddr = first_page + page_idx * PAGE_SIZE;
+            arena.place_page(target_aspace, page_vaddr, prot, |scratch_va| {
+                copy_segment_into(scratch_va, page_vaddr, seg.vaddr, file_data);
+            })?;
         }
     }
 
-    Some((entry, stack_pages))
+    Some(())
 }
 
 // ── Memmgr bootstrap ────────────────────────────────────────────────────────
@@ -354,52 +389,53 @@ struct MemmgrCaps
     creator_endpoint_slot: u32,
 }
 
-/// Populate memmgr's `ProcessInfo` page and map it read-only into memmgr.
+/// Populate memmgr's `ProcessInfo` page from `arena` and map it read-only
+/// into `target_aspace`.
 #[allow(clippy::similar_names)]
 fn populate_memmgr_info(
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
+    arena: &mut BootArena,
+    target_aspace: u32,
     caps: &MemmgrCaps,
     stack_pages: u32,
-) -> Option<u32>
+) -> Option<()>
 {
-    let pi_frame = alloc.alloc_zero_page(init_aspace, TEMP_MAP_BASE)?;
-    // SAFETY: TEMP_MAP_BASE is mapped writable and zeroed, one page.
-    let pi = unsafe { process_abi::process_info_mut(TEMP_MAP_BASE) };
-
     let mm_thread_in_mm =
         syscall::cap_copy(caps.thread, caps.cspace, syscall::RIGHTS_THREAD).ok()?;
     let mm_aspace_in_mm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
     let mm_cspace_in_mm =
         syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CSPACE).ok()?;
 
-    pi.version = PROCESS_ABI_VERSION;
-    pi.self_thread_cap = mm_thread_in_mm;
-    pi.self_aspace_cap = mm_aspace_in_mm;
-    pi.self_cspace_cap = mm_cspace_in_mm;
-    pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
-    pi.creator_endpoint_cap = caps.creator_endpoint_slot;
-    pi.procmgr_endpoint_cap = 0;
-    pi.memmgr_endpoint_cap = 0;
-    pi.stdin_frame_cap = 0;
-    pi.stdout_frame_cap = 0;
-    pi.stderr_frame_cap = 0;
-    pi.log_send_cap = 0;
-    pi.stdin_data_signal_cap = 0;
-    pi.stdin_space_signal_cap = 0;
-    pi.stdout_data_signal_cap = 0;
-    pi.stdout_space_signal_cap = 0;
-    pi.stderr_data_signal_cap = 0;
-    pi.stderr_space_signal_cap = 0;
-    pi.stack_top_vaddr = PROCESS_STACK_TOP;
-    pi.stack_pages = stack_pages;
+    arena.place_page(
+        target_aspace,
+        PROCESS_INFO_VADDR,
+        syscall::MAP_READ,
+        |scratch_va| {
+            // SAFETY: scratch_va is mapped writable and zeroed, one page.
+            let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+            pi.version = PROCESS_ABI_VERSION;
+            pi.self_thread_cap = mm_thread_in_mm;
+            pi.self_aspace_cap = mm_aspace_in_mm;
+            pi.self_cspace_cap = mm_cspace_in_mm;
+            pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
+            pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+            pi.procmgr_endpoint_cap = 0;
+            pi.memmgr_endpoint_cap = 0;
+            pi.stdin_frame_cap = 0;
+            pi.stdout_frame_cap = 0;
+            pi.stderr_frame_cap = 0;
+            pi.log_send_cap = 0;
+            pi.stdin_data_signal_cap = 0;
+            pi.stdin_space_signal_cap = 0;
+            pi.stdout_data_signal_cap = 0;
+            pi.stdout_space_signal_cap = 0;
+            pi.stderr_data_signal_cap = 0;
+            pi.stderr_space_signal_cap = 0;
+            pi.stack_top_vaddr = PROCESS_STACK_TOP;
+            pi.stack_pages = stack_pages;
+        },
+    )?;
 
-    let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
-
-    let pi_ro_cap = syscall::cap_derive(pi_frame, syscall::RIGHTS_MAP_READ).ok()?;
-    syscall::mem_map(pi_ro_cap, caps.aspace, PROCESS_INFO_VADDR, 0, 1, 0).ok()?;
-
-    Some(pi_frame)
+    Some(())
 }
 
 /// Locate a `CapDescriptor` by slot index.
@@ -457,19 +493,27 @@ pub fn bootstrap_memmgr(
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
-    let mm_aspace_slab = alloc.alloc_pages(crate::ASPACE_RETYPE_PAGES)?;
+    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
+    let entry = elf::entry_point(ehdr);
+    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
+        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
+        .clamp(1, MAX_PROCESS_STACK_PAGES);
+
+    // memmgr's bespoke `_start` configures no TLS, so its arena reserves
+    // only ELF segments + `ProcessInfo` + stack + IPC buffer.
+    let backing_pages = elf_backing_pages(ehdr, module_bytes)? + 1 + u64::from(stack_pages) + 1;
+    let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
+
     let mm_aspace =
-        syscall::cap_create_aspace(mm_aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
-    let mm_cspace_slab = alloc.alloc_pages(crate::CSPACE_RETYPE_PAGES)?;
+        syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let mm_cspace =
-        syscall::cap_create_cspace(mm_cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
-    let mm_thread_slab = alloc.alloc_pages(crate::THREAD_RETYPE_PAGES)?;
-    let mm_thread = syscall::cap_create_thread(mm_thread_slab, mm_aspace, mm_cspace).ok()?;
+        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
+    let mm_thread = syscall::cap_create_thread(arena.cap, mm_aspace, mm_cspace).ok()?;
 
     log("created memmgr kernel objects");
     log("loading memmgr ELF segments");
 
-    let (entry, stack_pages) = load_elf(module_bytes, mm_aspace, alloc, init_aspace)?;
+    load_elf_into_arena(&mut arena, ehdr, module_bytes, mm_aspace)?;
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
     let _ = syscall::cap_delete(module_ro);
     log("loaded memmgr ELF");
@@ -489,8 +533,8 @@ pub fn bootstrap_memmgr(
         thread: mm_thread,
         creator_endpoint_slot: mm_creator_slot,
     };
-    populate_memmgr_info(alloc, init_aspace, &mm_caps, stack_pages)?;
-    map_stack_and_ipc(alloc, mm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
+    populate_memmgr_info(&mut arena, mm_aspace, &mm_caps, stack_pages)?;
+    place_stack_and_ipc(&mut arena, mm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
 
     // Mint procmgr's tokened SEND cap on memmgr's endpoint. Memmgr will
     // recognise calls bearing this token as authorised for the
@@ -669,66 +713,67 @@ struct ProcmgrCaps
 /// its OWN `seraph::log!` writes lives in `pi.log_send_cap`.
 #[allow(clippy::similar_names)]
 fn populate_procmgr_info(
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
+    arena: &mut BootArena,
+    target_aspace: u32,
     caps: &ProcmgrCaps,
     stack_pages: u32,
-) -> Option<u32>
+) -> Option<()>
 {
-    let pi_frame = alloc.alloc_zero_page(init_aspace, TEMP_MAP_BASE)?;
-
-    // SAFETY: TEMP_MAP_BASE is mapped writable and zeroed, one page.
-    let pi = unsafe { process_abi::process_info_mut(TEMP_MAP_BASE) };
-
     let pm_thread_in_pm =
         syscall::cap_copy(caps.thread, caps.cspace, syscall::RIGHTS_THREAD).ok()?;
     let pm_aspace_in_pm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
     let pm_cspace_in_pm =
         syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CSPACE).ok()?;
 
-    pi.version = PROCESS_ABI_VERSION;
-    pi.self_thread_cap = pm_thread_in_pm;
-    pi.self_aspace_cap = pm_aspace_in_pm;
-    pi.self_cspace_cap = pm_cspace_in_pm;
-    pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
-    pi.creator_endpoint_cap = caps.creator_endpoint_slot;
-    // procmgr has no procmgr above it; leave zero.
-    pi.procmgr_endpoint_cap = 0;
-    pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
-    pi.stdin_frame_cap = 0;
-    pi.stdout_frame_cap = 0;
-    pi.stderr_frame_cap = 0;
-    // Procmgr's own `seraph::log!` surface. The slot holds a tokened
-    // SEND cap on the log endpoint with token `LOG_TOKEN_PROCMGR`,
-    // derived by init via `cap_derive_token`. Procmgr's std `_start`
-    // installs it via `::log::install_tokened_cap`. The un-tokened
-    // SEND procmgr uses to derive per-child tokened caps is separate
-    // (delivered via procmgr's bootstrap round).
-    pi.log_send_cap = caps.log_send_slot;
-    pi.stdin_data_signal_cap = 0;
-    pi.stdin_space_signal_cap = 0;
-    pi.stdout_data_signal_cap = 0;
-    pi.stdout_space_signal_cap = 0;
-    pi.stderr_data_signal_cap = 0;
-    pi.stderr_space_signal_cap = 0;
-    pi.tls_template_vaddr = caps.tls.vaddr;
-    pi.tls_template_filesz = caps.tls.filesz;
-    pi.tls_template_memsz = caps.tls.memsz;
-    pi.tls_template_align = caps.tls.align;
-    pi.stack_top_vaddr = PROCESS_STACK_TOP;
-    pi.stack_pages = stack_pages;
+    arena.place_page(
+        target_aspace,
+        PROCESS_INFO_VADDR,
+        syscall::MAP_READ,
+        |scratch_va| {
+            // SAFETY: scratch_va is mapped writable and zeroed, one page.
+            let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+            pi.version = PROCESS_ABI_VERSION;
+            pi.self_thread_cap = pm_thread_in_pm;
+            pi.self_aspace_cap = pm_aspace_in_pm;
+            pi.self_cspace_cap = pm_cspace_in_pm;
+            pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
+            pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+            // procmgr has no procmgr above it; leave zero.
+            pi.procmgr_endpoint_cap = 0;
+            pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
+            pi.stdin_frame_cap = 0;
+            pi.stdout_frame_cap = 0;
+            pi.stderr_frame_cap = 0;
+            // Procmgr's own `seraph::log!` surface. The slot holds a tokened
+            // SEND cap on the log endpoint with token `LOG_TOKEN_PROCMGR`,
+            // derived by init via `cap_derive_token`. Procmgr's std `_start`
+            // installs it via `::log::install_tokened_cap`. The un-tokened
+            // SEND procmgr uses to derive per-child tokened caps is separate
+            // (delivered via procmgr's bootstrap round).
+            pi.log_send_cap = caps.log_send_slot;
+            pi.stdin_data_signal_cap = 0;
+            pi.stdin_space_signal_cap = 0;
+            pi.stdout_data_signal_cap = 0;
+            pi.stdout_space_signal_cap = 0;
+            pi.stderr_data_signal_cap = 0;
+            pi.stderr_space_signal_cap = 0;
+            pi.tls_template_vaddr = caps.tls.vaddr;
+            pi.tls_template_filesz = caps.tls.filesz;
+            pi.tls_template_memsz = caps.tls.memsz;
+            pi.tls_template_align = caps.tls.align;
+            pi.stack_top_vaddr = PROCESS_STACK_TOP;
+            pi.stack_pages = stack_pages;
+        },
+    )?;
 
-    let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
-
-    let pi_ro_cap = syscall::cap_derive(pi_frame, syscall::RIGHTS_MAP_READ).ok()?;
-    syscall::mem_map(pi_ro_cap, caps.aspace, PROCESS_INFO_VADDR, 0, 1, 0).ok()?;
-
-    Some(pi_frame)
+    Some(())
 }
 
-/// Map stack and IPC buffer pages into the target address space.
-fn map_stack_and_ipc(
-    alloc: &mut FrameAlloc,
+/// Place the stack and IPC buffer pages in `arena`, zeroed and mapped
+/// read-write into `target_aspace`. Consumes `stack_pages + 1` backing
+/// pages.
+fn place_stack_and_ipc(
+    arena: &mut BootArena,
     target_aspace: u32,
     ipc_buf_va: u64,
     stack_pages: u32,
@@ -737,23 +782,14 @@ fn map_stack_and_ipc(
     let stack_base = PROCESS_STACK_TOP - u64::from(stack_pages) * PAGE_SIZE;
     for i in 0..stack_pages
     {
-        let frame = alloc.alloc_page()?;
-        let rw_cap = syscall::cap_derive(frame, syscall::RIGHTS_MAP_RW).ok()?;
-        syscall::mem_map(
-            rw_cap,
+        arena.place_page(
             target_aspace,
             stack_base + u64::from(i) * PAGE_SIZE,
-            0,
-            1,
-            0,
-        )
-        .ok()?;
+            syscall::MAP_WRITABLE,
+            |_| {},
+        )?;
     }
-
-    let ipc_frame = alloc.alloc_page()?;
-    let ipc_rw_cap = syscall::cap_derive(ipc_frame, syscall::RIGHTS_MAP_RW).ok()?;
-    syscall::mem_map(ipc_rw_cap, target_aspace, ipc_buf_va, 0, 1, 0).ok()?;
-
+    arena.place_page(target_aspace, ipc_buf_va, syscall::MAP_WRITABLE, |_| {})?;
     Some(())
 }
 
@@ -853,28 +889,38 @@ pub fn bootstrap_procmgr(
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
-    let pm_aspace_slab = alloc.alloc_pages(crate::ASPACE_RETYPE_PAGES)?;
+    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
+    let entry = elf::entry_point(ehdr);
+    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
+        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
+        .clamp(1, MAX_PROCESS_STACK_PAGES);
+
+    // procmgr is std-using: its arena reserves ELF segments + the main TLS
+    // block + `ProcessInfo` + stack + IPC buffer.
+    let backing_pages = elf_backing_pages(ehdr, module_bytes)?
+        + tls_backing_pages(ehdr, module_bytes)
+        + 1
+        + u64::from(stack_pages)
+        + 1;
+    let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
+
     let pm_aspace =
-        syscall::cap_create_aspace(pm_aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
-    let pm_cspace_slab = alloc.alloc_pages(crate::CSPACE_RETYPE_PAGES)?;
+        syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let pm_cspace =
-        syscall::cap_create_cspace(pm_cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
-    let pm_thread_slab = alloc.alloc_pages(crate::THREAD_RETYPE_PAGES)?;
-    let pm_thread = syscall::cap_create_thread(pm_thread_slab, pm_aspace, pm_cspace).ok()?;
+        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
+    let pm_thread = syscall::cap_create_thread(arena.cap, pm_aspace, pm_cspace).ok()?;
 
     log("created procmgr kernel objects");
     log("loading procmgr ELF segments");
 
-    let (entry, stack_pages) = load_elf(module_bytes, pm_aspace, alloc, init_aspace)?;
+    load_elf_into_arena(&mut arena, ehdr, module_bytes, pm_aspace)?;
 
-    // Allocate, populate, and map the main thread's TLS block while the
-    // module is still mapped — `prepare_main_tls` re-validates the ELF
-    // headers to locate the `PT_TLS` segment. Procmgr is std-using so the
-    // std runtime's `_start` accesses thread-local statics (e.g.
-    // `IPC_BUF_TLS`) before user `main` runs; without a configured TLS
+    // Place the main thread's TLS block while the module is still mapped —
+    // `place_main_tls` reads the `PT_TLS` template from it. Procmgr is
+    // std-using so the std runtime's `_start` accesses thread-local statics
+    // (e.g. `IPC_BUF_TLS`) before user `main` runs; without a configured TLS
     // block, the first such access page-faults at NULL.
-    let (pm_tls_base_va, pm_tls_meta) =
-        prepare_main_tls(module_bytes, pm_aspace, alloc, init_aspace)?;
+    let (pm_tls_base_va, pm_tls_meta) = place_main_tls(&mut arena, ehdr, module_bytes, pm_aspace)?;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
     let _ = syscall::cap_delete(module_ro);
@@ -968,9 +1014,9 @@ pub fn bootstrap_procmgr(
         log_send_slot,
         tls: pm_tls_meta,
     };
-    populate_procmgr_info(alloc, init_aspace, &pm_caps, stack_pages)?;
+    populate_procmgr_info(&mut arena, pm_aspace, &pm_caps, stack_pages)?;
 
-    map_stack_and_ipc(alloc, pm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
+    place_stack_and_ipc(&mut arena, pm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
 
     syscall::thread_configure_with_tls(
         pm_thread,

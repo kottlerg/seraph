@@ -2164,16 +2164,18 @@ fn set_drivers_dir_on_devmgr(devmgr_registry_ep: u32, system_root_cap: u32, ipc_
 }
 
 /// Phase 3 sub-step: spawn timed and publish it as `timed`. The RTC
-/// driver itself is loaded lazily by devmgr from the on-disk rootfs;
-/// timed resolves the running driver via
-/// [`ipc::devmgr_labels::QUERY_RTC_DEVICE`] against the
+/// driver itself is loaded by devmgr from the on-disk rootfs inside
+/// the [`set_drivers_dir_on_devmgr`] handshake (above), between
+/// devmgr's `ipc_reply` and its next `ipc_recv`; by the time `timed`
+/// queries [`ipc::devmgr_labels::QUERY_RTC_DEVICE`] against the
 /// `REGISTRY_QUERY_AUTHORITY`-tokened copy of `devmgr_registry_ep`
-/// delivered in its bootstrap round (the first such call triggers
-/// devmgr's lazy spawn). Init's PUBLISH_AUTHORITY-tokened cap is
-/// derived from `svcmgr_service_ep` (the un-tokened source init
-/// already owns). All failures are logged; the function never aborts
-/// phase 3 — a degraded wall-clock leaves `SystemTime::now()`
-/// returning `UNIX_EPOCH` but the rest of svctest still runs.
+/// delivered in its bootstrap round, devmgr already holds `rtc_ep`
+/// (or the sticky-failure state and replies `NO_DEVICE`). Init's
+/// PUBLISH_AUTHORITY-tokened cap is derived from `svcmgr_service_ep`
+/// (the un-tokened source init already owns). All failures are
+/// logged; the function never aborts phase 3 — a degraded wall-clock
+/// leaves `SystemTime::now()` returning `UNIX_EPOCH` but the rest of
+/// svctest still runs.
 pub fn bring_up_timed(
     procmgr_ep: u32,
     bootstrap_ep: u32,

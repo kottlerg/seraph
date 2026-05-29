@@ -1274,11 +1274,13 @@ fn spawn_framebuffer(
 }
 
 /// Spawn the platform RTC driver — CMOS on x86-64, goldfish-RTC on
-/// RISC-V — from the on-disk rootfs. Called lazily on the first
-/// `QUERY_RTC_DEVICE` after `SET_DRIVERS_DIR` has delivered a
-/// `LOOKUP | READ`-attenuated `/services/drivers/` subtree cap
-/// (namespace-protocol rights, not kernel cap rights).
-/// Walks `drivers_dir_cap` to the per-arch chip name, carves the per-arch
+/// RISC-V — from the on-disk rootfs. Called from inside the
+/// `SET_DRIVERS_DIR` registry-loop arm, after the handler's
+/// `ipc_reply` to init and before devmgr's next `ipc_recv`. The
+/// `drivers_dir_cap` argument is the `LOOKUP | READ`-attenuated
+/// `/services/drivers/` subtree cap init delivered in the handshake
+/// (namespace-protocol rights, not kernel cap rights). Walks
+/// `drivers_dir_cap` to the per-arch chip name, carves the per-arch
 /// hardware authority, and goes through the file-cap branch of
 /// [`spawn::spawn_simple_device`]. Returns the freshly-allocated
 /// service endpoint on success; the caller stores it for subsequent

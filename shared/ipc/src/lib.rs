@@ -553,17 +553,20 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// [`timed_labels::GET_WALL_TIME`] thereafter without further driver IPC.
 ///
 /// **Acquisition path**: the RTC driver binary lives on the rootfs disk
-/// at `/services/drivers/<chip>` and is loaded lazily by devmgr.
+/// at `/services/drivers/<chip>` and is loaded by devmgr from there.
 /// Init walks vfsd to `/services/drivers/` and hands devmgr a
 /// `LOOKUP | READ`-attenuated subtree cap via
-/// [`devmgr_labels::SET_DRIVERS_DIR`]. On the first
-/// [`devmgr_labels::QUERY_RTC_DEVICE`] after that handshake, devmgr
-/// walks the per-arch driver name (`cmos-rtc` on x86-64, `goldfish-rtc`
-/// on RISC-V) from the subtree cap, calls
-/// [`procmgr_labels::CREATE_FROM_FILE`], and delivers the per-arch
-/// hardware authority cap (ISA `IoPortRange` for CMOS; MMIO aperture
-/// for goldfish-rtc) through the bootstrap protocol. Spawn is
-/// at-most-once per boot; failure is sticky and clients see
+/// [`devmgr_labels::SET_DRIVERS_DIR`]. Devmgr replies SUCCESS to that
+/// handshake *before* doing any spawn work (so init never blocks on
+/// driver bring-up); it then walks the per-arch driver name
+/// (`cmos-rtc` on x86-64, `goldfish-rtc` on RISC-V) from the subtree
+/// cap, calls [`procmgr_labels::CREATE_FROM_FILE`], and delivers the
+/// per-arch hardware authority cap (ISA `IoPortRange` for CMOS; MMIO
+/// aperture for goldfish-rtc) through the bootstrap protocol — all
+/// between the `SET_DRIVERS_DIR` handler's `ipc_reply` and the next
+/// `ipc_recv`. See [`devmgr_labels::SET_DRIVERS_DIR`] for the nested-IPC
+/// constraint that forces this ordering. Spawn is at-most-once per
+/// boot; failure is sticky and clients see
 /// [`devmgr_errors::NO_DEVICE`] permanently. RTC drivers are
 /// **not** carried in the boot bundle.
 ///

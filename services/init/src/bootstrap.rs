@@ -592,6 +592,30 @@ pub fn finalize_memmgr(
     }
     alloc.next_idx += total_remaining;
 
+    // Forward the partial tail left in `alloc.current`: the unallocated
+    // remainder of the last frame `FrameAlloc` split from. It is a
+    // `frame_split` product, so it carries no named `InitInfo` descriptor and
+    // is excluded from the reap donation walk; without this it would free into
+    // the post-handoff buddy (which nothing allocates from) and be lost. It is
+    // free RAM, so it joins memmgr's pool as a run like any forwarded frame.
+    if alloc.remaining >= PAGE_SIZE && (mm_frame_count as usize) < page_counts.len()
+    {
+        let tail_pages = (alloc.remaining / PAGE_SIZE) as u32;
+        if let Ok(phys_base) = syscall::cap_info(alloc.current, syscall::CAP_INFO_FRAME_PHYS_BASE)
+            && let Ok(intermediary) = syscall::cap_derive(alloc.current, syscall::RIGHTS_ALL)
+            && let Ok(dst_slot) = syscall::cap_copy(intermediary, mm.mm_cspace, syscall::RIGHTS_ALL)
+        {
+            if mm_frame_count == 0
+            {
+                mm_frame_base = dst_slot;
+            }
+            page_counts[mm_frame_count as usize] = tail_pages;
+            phys_bases[mm_frame_count as usize] = phys_base;
+            mm_frame_count += 1;
+        }
+        alloc.remaining = 0;
+    }
+
     syscall::thread_configure(
         mm.mm_thread,
         mm.entry,

@@ -580,6 +580,7 @@ unsafe fn kernel_entry_post_rebase(
                 let slot = cs
                     .insert_cap(CapTag::Frame, rights, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Frame cap"));
+                cap::note_owns_memory_minted(size_aligned);
                 if i == 0
                 {
                     seg_base = slot.get();
@@ -735,6 +736,8 @@ unsafe fn kernel_entry_post_rebase(
                 init_info_frame_count: 0,  // patched after self-mint below
                 module_name_count: cspace_layout.module_name_count,
                 module_names: cspace_layout.module_names,
+                system_ram_bytes: 0, // patched below after all owns_memory mints
+                kernel_reserved_bytes: 0, // patched below after all owns_memory mints
                 framebuffer: init_framebuffer,
             };
 
@@ -795,6 +798,7 @@ unsafe fn kernel_entry_post_rebase(
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Frame cap"));
+                cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
                 if pg == 0
                 {
                     info_frame_base_slot = slot.get();
@@ -889,6 +893,7 @@ unsafe fn kernel_entry_post_rebase(
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Frame cap"));
+                cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
                 if i == 0
                 {
                     base_slot = slot.get();
@@ -908,6 +913,27 @@ unsafe fn kernel_entry_post_rebase(
             (*info_ptr).init_stack_frame_base = init_stack_frame_base;
             (*info_ptr).init_stack_frame_count = init_stack_frame_count;
         }
+
+        // Patch the immutable memory-accounting facts. All owns_memory Frame
+        // caps minted to init (Phase-7 drain/module/reclaim + the segment,
+        // InitInfo, and stack caps above) are now in the ledger, so the
+        // reserved total is the complement against installed RAM.
+        let system_ram = mm::init::system_ram_bytes();
+        let kernel_reserved = system_ram.saturating_sub(cap::owns_memory_minted_bytes());
+        // SAFETY: info_page_virt mapped writable through the direct map;
+        // header at offset 0; single-threaded boot.
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
+            (*info_ptr).system_ram_bytes = system_ram;
+            (*info_ptr).kernel_reserved_bytes = kernel_reserved;
+        }
+        kprintln!(
+            "init: system_ram={} KiB, kernel_reserved={} KiB, pool={} KiB",
+            system_ram / 1024,
+            kernel_reserved / 1024,
+            cap::owns_memory_minted_bytes() / 1024,
+        );
 
         // Retype a 6-page slab from SEED_FRAME for init's Thread:
         //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)

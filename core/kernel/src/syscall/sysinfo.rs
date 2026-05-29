@@ -38,18 +38,8 @@ pub fn sys_system_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let n = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
             Ok(u64::from(n))
         }
-        2 =>
-        // FreeFrames
-        {
-            let free = crate::mm::with_frame_allocator(|a| a.free_page_count());
-            Ok(free as u64)
-        }
-        3 =>
-        // TotalFrames
-        {
-            let total = crate::mm::with_frame_allocator(|a| a.total_page_count());
-            Ok(total as u64)
-        }
+        // Discriminants 2 and 3 are reserved (see `SystemInfoType`) and fall
+        // through to the unknown-discriminant arm below.
         4 =>
         // PageSize
         {

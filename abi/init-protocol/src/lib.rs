@@ -61,7 +61,13 @@
 ///     keyboard driver. Pure constant bump; the
 ///     [`InitInfo::module_names`] array grows in size but the field
 ///     layout is otherwise unchanged.
-pub const INIT_PROTOCOL_VERSION: u32 = 9;
+/// v10: Added [`InitInfo::system_ram_bytes`] and
+///     [`InitInfo::kernel_reserved_bytes`] — immutable post-boot
+///     memory-accounting facts (total usable RAM and the fixed kernel
+///     reserve) that let the dynamic memory pool be reconciled against
+///     the all-RAM-accounted identity. Both `u64`, placed before
+///     `framebuffer` so that field remains last.
+pub const INIT_PROTOCOL_VERSION: u32 = 10;
 
 /// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
@@ -238,6 +244,22 @@ pub struct InitInfo
     /// the first `InitInfo` page (the [`CapDescriptor`] array that
     /// follows the header may span pages).
     pub module_names: [InitModuleName; INIT_MAX_NAMED_MODULES],
+
+    // ── Memory-accounting facts (added in protocol version 10) ─────────
+    /// Total installed usable system RAM, in bytes. Immutable after boot.
+    ///
+    /// The full physical span the all-RAM-accounted identity covers:
+    /// `system_ram_bytes == kernel_reserved_bytes + dynamic_pool_total`.
+    pub system_ram_bytes: u64,
+
+    /// RAM permanently held by the fixed kernel reserve, in bytes.
+    /// Immutable after boot.
+    ///
+    /// The complement of all reclaimable RAM: kernel image, direct-map
+    /// metadata, SEED reserve, kernel page tables, per-CPU/idle structures,
+    /// retype metadata, and buddy residue. A reported quantity for
+    /// accounting, never itself a capability.
+    pub kernel_reserved_bytes: u64,
 
     // ── Framebuffer geometry (added in protocol version 8) ─────────────
     /// Bootloader-discovered framebuffer geometry. `physical_base == 0`

@@ -583,6 +583,15 @@ fn run(info_ptr: u64) -> !
         // SAFETY: i < mm_frame_count <= 122; bounded above.
         unsafe { core::ptr::write_volatile(phys_dst.add(i), mm_final.phys_bases[i]) };
     }
+    // Append the immutable memory-accounting facts past the phys-base table
+    // (byte 1024 = u64 index 128; the table tops out at 122 × 8 = 976 B, so
+    // 128/129 never collide with it and stay within the 512-slot page).
+    let facts_idx = 1024usize / 8;
+    // SAFETY: indices 128 and 129 lie within the one mapped 4 KiB page.
+    unsafe {
+        core::ptr::write_volatile(phys_dst.add(facts_idx), info.system_ram_bytes);
+        core::ptr::write_volatile(phys_dst.add(facts_idx + 1), info.kernel_reserved_bytes);
+    }
     let _ = syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1);
     let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_frame, syscall::RIGHTS_MAP_READ)
     else

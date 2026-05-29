@@ -497,11 +497,8 @@ pub enum SystemInfoType
     KernelVersion = 0,
     /// Number of logical CPUs initialised at boot.
     CpuCount = 1,
-    /// Number of free 4 KiB physical frames at the time of the call.
-    FreeFrames = 2,
-    /// Total number of 4 KiB physical frames detected at boot.
-    /// `FreeFrames / TotalFrames` gives current memory pressure.
-    TotalFrames = 3,
+    // Discriminants 2 and 3 are reserved and MUST NOT be reused; these values
+    // are a stable wire contract.
     /// Size of a physical page in bytes (always 4096 on supported platforms).
     PageSize = 4,
     /// Boot protocol version used by the bootloader.

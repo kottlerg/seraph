@@ -1098,6 +1098,27 @@ pub unsafe fn descriptors(layout: &CSpaceLayout) -> &'static [CapDescriptor]
     &arr_ref[..layout.descriptor_count]
 }
 
+/// Running total of `owns_memory = true` `Frame` cap bytes minted into
+/// init's root `CSpace`. These pages are the reclaimable complement of the
+/// fixed kernel reserve; `kernel_reserved_bytes = system_ram - this`.
+/// Single-threaded boot, so a relaxed atomic suffices.
+static OWNS_MEMORY_MINTED_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Record `bytes` of a newly-minted `owns_memory` `Frame` cap toward the
+/// minted-to-init ledger. Called at every Phase-7/Phase-9 mint site.
+pub(crate) fn note_owns_memory_minted(bytes: u64)
+{
+    OWNS_MEMORY_MINTED_BYTES.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total `owns_memory` `Frame` cap bytes minted to init.
+#[must_use]
+pub(crate) fn owns_memory_minted_bytes() -> u64
+{
+    OWNS_MEMORY_MINTED_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Append a `CapDescriptor` to the global buffer and bump `descriptor_count`.
 /// Calls [`crate::fatal`] if the buffer is full.
 fn push_descriptor(count: &mut usize, desc: CapDescriptor)
@@ -1329,6 +1350,7 @@ fn populate_cspace(
                     aux1: cap_size,
                 },
             );
+            note_owns_memory_minted(cap_size);
             memory_frame_count += 1;
         }
 
@@ -1870,6 +1892,7 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             ptr,
             "Phase 7: cannot allocate Frame capability for boot module",
         );
+        note_owns_memory_minted(rounded_size);
         push_descriptor(
             &mut layout.descriptor_count,
             CapDescriptor {
@@ -2110,6 +2133,8 @@ fn mint_reclaim_pass(
         );
         count += 1;
     }
+
+    note_owns_memory_minted(pages_total * crate::mm::PAGE_SIZE as u64);
 
     layout.total_populated = cspace.populated_count();
 

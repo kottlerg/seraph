@@ -480,7 +480,6 @@ pub fn run_all(ctx: &TestContext)
     // ── System info syscalls ──────────────────────────────────────────────────
     run_test!("sysinfo::kernel_version", sysinfo::kernel_version(ctx));
     run_test!("sysinfo::cpu_count", sysinfo::cpu_count(ctx));
-    run_test!("sysinfo::frame_counts", sysinfo::frame_counts(ctx));
     run_test!("sysinfo::page_size", sysinfo::page_size(ctx));
     run_test!(
         "sysinfo::boot_protocol_version",

@@ -90,6 +90,11 @@ fn main() -> !
         halt_loop();
     };
     let ecam_va = ecam_range.va_start();
+    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, ecam_pages)
+    {
+        std::os::seraph::log!("failed to fund PT budget for ECAM region");
+        halt_loop();
+    }
     if syscall::mmio_map(caps.self_aspace, ecam_cap, ecam_va, 0).is_err()
     {
         std::os::seraph::log!("failed to map ECAM region");

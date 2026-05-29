@@ -477,11 +477,13 @@ unsafe fn kernel_entry_post_rebase(
         // pages 2..init_pages = PT growth pool). The wrapper header is the
         // cap object inserted into init's CSpace below.
         // 18 pages = 1 wrapper + 1 root PT + 16 PT pool. Phase 9 mappings
-        // (ELF segments, InitInfo, stack) go through the legacy buddy path
-        // via `map_page` (kernel-direct call); the wrapper's pool serves
-        // only init's userspace `sys_mem_map` calls (TEMP_MAP_BASE +
-        // ELF_PAGE_TEMP_VA scratch regions). 16 pool pages comfortably
-        // covers the bootstrap loop's PT footprint.
+        // (ELF segments, InitInfo, stack) go through `map_page`, a
+        // kernel-direct call whose intermediate PT pages come from
+        // `kernel_pt_pool`, not this wrapper's pool. The wrapper's pool
+        // serves init's userspace pooled paths: `sys_mem_map`
+        // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and, post-Gap-B,
+        // `sys_mmio_map` for init's own MMIO (the riscv64 serial UART, one
+        // page). 16 pool pages cover that footprint with margin.
         #[allow(clippy::items_after_statements)]
         const INIT_ASPACE_PAGES: u64 = 18;
         // SAFETY: SEED installed in Phase 7; single-threaded Phase 9.
@@ -489,10 +491,10 @@ unsafe fn kernel_entry_post_rebase(
             unsafe { cap::boot_retype_aspace(cap::seed_frame_ref(), INIT_ASPACE_PAGES) };
         let _ = allocator; // legacy buddy path no longer used for init's AS
 
-        // Map each ELF LOAD segment into the init address space. `map_page`
-        // self-dispatches via the wrapper back-pointer wired by
-        // `boot_retype_aspace`, so every intermediate PT page comes from
-        // the wrapper's growth pool.
+        // Map each ELF LOAD segment into the init address space via
+        // `map_page`, whose intermediate PT pages come from `kernel_pt_pool`
+        // (the kernel-direct legacy path). The wrapper's growth pool is
+        // reserved for init's later userspace pooled maps.
         for i in 0..init_image.segment_count as usize
         {
             let seg = &init_image.segments[i];

@@ -696,6 +696,41 @@ pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
     }
 }
 
+/// Fund `self_aspace`'s page-table growth budget to cover mapping a
+/// `region_pages`-page foreign-frame region (MMIO, DMA) into a
+/// retype-backed `AddressSpace`.
+///
+/// Requests a Frame cap from memmgr (via the object slab) and retypes it
+/// onto the AS's PT pool with `cap_create_aspace` in augment mode, so the
+/// kernel draws the region's intermediate page tables from this
+/// caller-funded, memmgr-accounted budget rather than the fixed kernel PT
+/// reserve. Call once before `mmio_map`/`mem_map` of a region whose PT
+/// cost may exceed the AS's spare budget.
+///
+/// `region_pages == 0` is a no-op success. Returns `false` if memmgr is
+/// unreachable or the request/augment fails; the subsequent map then
+/// fails with `OutOfMemory` rather than silently drawing on the reserve.
+pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
+    if region_pages == 0 {
+        return true;
+    }
+    // Worst-case fresh intermediate PT pages for a contiguous VA run of
+    // `region_pages`: one last-level table per 512 pages plus a boundary
+    // span, and the upper levels (PD/PDPT/root) with their spans (+4).
+    let pt_pages = region_pages.div_ceil(512) + 4;
+    let Some(frame) = object_slab_acquire(pt_pages * PAGE_SIZE) else {
+        return false;
+    };
+    if syscall::cap_create_aspace(frame, self_aspace, pt_pages).is_err() {
+        let _ = syscall::cap_delete(frame);
+        return false;
+    }
+    // The augment retypes the budget out of `frame`; the AS chunk holds its
+    // own reference, so the cap is not deleted (mirrors the heap augment
+    // path). The sub-page tail is reclaimed when the process dies.
+    true
+}
+
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-
 /// failure and panic terminator until P3c wires a proper abort path.
 pub fn abort_thread() -> ! {

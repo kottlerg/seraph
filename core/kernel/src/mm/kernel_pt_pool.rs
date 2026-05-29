@@ -5,10 +5,14 @@
 
 //! Kernel-internal intermediate page-table frame pool.
 //!
-//! Backs the steady-state PT-growth path for the legacy `map_user_page`
-//! API (and its callers: `AddressSpace::map_page`, `sys_mmio_map`, the
-//! `sys_mem_map` fallback, and Phase-9 init bootstrap mappings). Pages
-//! are seeded once at the end of Phase 7 from the residual
+//! Backs the legacy `map_user_page` PT-growth path for the only address
+//! space that has no retype-backed PT pool of its own: the chunk-less
+//! kernel-created boot AS (init's own AS, itself part of the fixed
+//! reserve). Both `sys_mmio_map` and `sys_mem_map` dispatch on chunk
+//! presence and reach `AddressSpace::map_page` (and thus this pool) only
+//! for that AS; every retype-backed AS funds its own intermediate PT
+//! pages from its growth pool. Phase-9 init bootstrap mappings also draw
+//! here. Pages are seeded once at the end of Phase 7 from the residual
 //! `KERNEL_RESERVE_PAGES` buddy carve, threaded onto an intrusive
 //! single-linked free list, and consumed without further buddy traffic.
 //!

@@ -935,6 +935,25 @@ unsafe fn kernel_entry_post_rebase(
             cap::owns_memory_minted_bytes() / 1024,
         );
 
+        // By here every buddy draw of the boot has run (Phase 8 idle stacks,
+        // Phase 9 init stack/InitInfo) and the reap-time reverse path has not,
+        // so the free count can only have shrunk from the Phase-7 carve.
+        // Exceeding BUDDY_RESIDUE_PAGES means the fixed-reserve split
+        // misprovisioned the buddy — a Phase-B/E regression. debug_assert, not
+        // assert: a misprovisioned residue wastes RAM but keeps the
+        // all-RAM-accounted identity sound (kernel_reserved is its complement),
+        // so it must not brick a release boot; CI's debug matrix enforces it.
+        let buddy_free = crate::mm::with_frame_allocator(|alloc| alloc.free_page_count());
+        kprintln!(
+            "init: buddy_residue={} pages (cap {})",
+            buddy_free,
+            cap::BUDDY_RESIDUE_PAGES,
+        );
+        debug_assert!(
+            buddy_free <= cap::BUDDY_RESIDUE_PAGES,
+            "post-handoff buddy free count exceeds BUDDY_RESIDUE_PAGES — fixed reserve misprovisioned",
+        );
+
         // Retype a 6-page slab from SEED_FRAME for init's Thread:
         //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)
         //   page 4   — ThreadObject (24 B) followed by ThreadControlBlock

@@ -638,6 +638,30 @@ static mut DRAIN_ORDER_BUF: [(u64, usize); MAX_DRAIN_BLOCKS] = [(0u64, 0usize); 
 #[cfg(not(test))]
 static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_DRAIN_BLOCKS];
 
+/// Pages of the kernel reserve seeded into [`crate::mm::kernel_pt_pool`] at
+/// Phase 7. PT growth consumes from that pool, not the buddy.
+#[cfg(not(test))]
+pub(crate) const POOL_SEED_PAGES: usize = 1024;
+/// Pages kept in the buddy for kernel-internal use after Phase 7:
+///
+/// 1. **Phase 8 idle-thread kernel stacks**: `sched::init` allocates
+///    `MAX_CPUS × KERNEL_STACK_PAGES = 64 × 4 = 256` pages worst case (one
+///    per CPU at order 2).
+/// 2. **Phase 9 `InitInfo` / stack pages**: bounded; ~30 pages.
+/// 3. **`dealloc_object` → `free_range` reverse-ledger path** that returns
+///    reclaimable Frame caps to the buddy on teardown.
+///
+/// 384 covers (1) + (2) with ~100 pages of slack; PT growth does not touch
+/// the buddy on this path. The post-handoff buddy free count never exceeds
+/// this (Phases 8–9 only draw pages out of it), which the Phase-9 boot guard
+/// asserts.
+#[cfg(not(test))]
+pub(crate) const BUDDY_RESIDUE_PAGES: usize = 384;
+/// Total fixed reserve carved from the buddy at Phase 7. `1024 + 384 = 1408`
+/// pages ≈ 5.5 MiB.
+#[cfg(not(test))]
+pub(crate) const KERNEL_RESERVE_PAGES: usize = POOL_SEED_PAGES + BUDDY_RESIDUE_PAGES;
+
 /// Drain user-cap RAM from the buddy and install [`SEED_FRAME`] over the
 /// largest drained block, reserving its first [`SEED_RESERVE_BYTES`] for
 /// kernel-internal cap-identity storage. Returns the per-block
@@ -661,24 +685,6 @@ static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_D
 pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
 {
     use crate::mm::buddy::PAGE_SIZE as BUDDY_PAGE_SIZE;
-
-    /// Pages kept in the buddy for kernel-internal use after Phase 7.
-    /// PT growth now consumes from `mm::kernel_pt_pool` (seeded below
-    /// from `POOL_SEED_PAGES` of this reserve); the buddy keeps
-    /// `BUDDY_RESIDUE_PAGES` for two purposes:
-    ///
-    /// 1. **Phase 8 idle-thread kernel stacks**: `sched::init` allocates
-    ///    `MAX_CPUS × KERNEL_STACK_PAGES = 64 × 4 = 256` pages worst
-    ///    case (one per CPU at order 2).
-    /// 2. **Phase 9 `InitInfo` / stack pages**: bounded; ~30 pages.
-    /// 3. **`dealloc_object` → `free_range` reverse-ledger path** that
-    ///    returns reclaimable Frame caps to the buddy on teardown.
-    ///
-    /// 384 covers (1) + (2) with ~100 pages of slack; PT growth does not
-    /// touch the buddy on this path. 1024 + 384 = 1408 pages ≈ 5.5 MiB.
-    const POOL_SEED_PAGES: usize = 1024;
-    const BUDDY_RESIDUE_PAGES: usize = 384;
-    const KERNEL_RESERVE_PAGES: usize = POOL_SEED_PAGES + BUDDY_RESIDUE_PAGES;
 
     debug_assert!(out.len() >= MAX_DRAIN_BLOCKS);
 

@@ -387,10 +387,10 @@ fn table_mut() -> &'static mut ProcessTable
 // The init → memmgr bootstrap payload layout (round caps + data words and the
 // auxiliary phys-table page) is defined in `ipc::memmgr_bootstrap`. memmgr
 // reads the free-run prefix from the data words and, from the phys-table page,
-// the per-frame physical bases plus the in-use bootstrap arenas (memmgr's and
-// procmgr's own backing). The arenas are recorded against per-owner process
-// records so `pool_total` spans every page of RAM memmgr owns, not only the
-// free runs and reap donations.
+// the per-frame physical bases plus the in-use bootstrap arenas (memmgr's,
+// procmgr's, and init's own backing). The arenas are recorded against per-owner
+// process records so `pool_total` spans every page of RAM memmgr owns, not only
+// the free runs and reap donations.
 
 /// Maximum free RAM frames init delivers in one bootstrap round; see
 /// `ipc::memmgr_bootstrap::MAX_FRAMES`.
@@ -400,6 +400,12 @@ const BOOTSTRAP_MAX_FRAMES: usize = ipc::memmgr_bootstrap::MAX_FRAMES;
 /// Out of range of every minted token (memmgr's `NEXT_TOKEN` and init's
 /// bootstrap tokens both start at 1), so no real caller can match it.
 const MEMMGR_SELF_TOKEN: u64 = u64::MAX;
+
+/// Reserved process-table token for init's orphaned bootstrap-backing record.
+/// init exits at reap, so no live process owns its arena; its pages stay
+/// parked and accounted here. Like `MEMMGR_SELF_TOKEN`, far out of minted-token
+/// range, so no real caller can match it.
+const INIT_SELF_TOKEN: u64 = u64::MAX - 1;
 
 /// Scratch VA in memmgr's address space for mapping the bootstrap
 /// phys-table frame. One page; mapped RO during `bootstrap_from_init`,
@@ -1072,6 +1078,7 @@ fn ingest_in_use(boot: &InitBootstrap)
         {
             ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR => MEMMGR_SELF_TOKEN,
             ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR => boot.procmgr_token,
+            ipc::memmgr_bootstrap::IN_USE_KIND_INIT => INIT_SELF_TOKEN,
             _ => continue,
         };
         if let Some(record) = table_mut().find_mut(token)
@@ -1145,11 +1152,14 @@ fn main(startup: &StartupInfo) -> !
     // and `PROCESS_DIED`; both code paths still check `req.token` against
     // `boot.procmgr_token` independently of the table entry.
     //
-    // Register a memmgr-self record too: `ingest_in_use` files memmgr's own
-    // bootstrap arena against it so the arena's pages join `pool_total`.
-    // Neither service ever dies, so neither record is ever reclaimed.
+    // Register memmgr-self and init-self records too: `ingest_in_use` files
+    // memmgr's, procmgr's, and init's bootstrap arenas against them so every
+    // arena's pages join `pool_total`. procmgr and memmgr never die; init exits
+    // at reap but its arena stays parked, so none of these records is ever
+    // reclaimed.
     if table_mut().insert(boot.procmgr_token).is_none()
         || table_mut().insert(MEMMGR_SELF_TOKEN).is_none()
+        || table_mut().insert(INIT_SELF_TOKEN).is_none()
     {
         // Process table full at boot — fatal; refuse to enter dispatch.
         syscall::thread_exit();

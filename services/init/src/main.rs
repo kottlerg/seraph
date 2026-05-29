@@ -112,12 +112,10 @@ pub(crate) use syscall_abi::PAGE_SIZE;
 /// init main-thread IPC buffer.
 pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 
-/// Pages requested per spawned thread when carving a Thread-retype slab
-/// off `FrameAlloc`. The kernel consumes `KERNEL_STACK_PAGES + 1 = 5`
-/// pages (4 kstack + 1 wrapper/TCB) plus a small one-time per-`FrameObject`
-/// allocator metadata footprint; one extra page is included so a fresh
-/// slab always has headroom and the retype lookup does not fail
-/// `available_bytes >= raw_bytes` after the metadata debit.
+/// Page span a single Thread retype consumes from its source Frame cap's
+/// front bump: `KERNEL_STACK_PAGES` (4) kernel-stack pages + one TCB/wrapper
+/// page + one extended FPU/SIMD save page = 6, page-aligned. Used to size the
+/// retype reserve of init's and the tier-1 services' bootstrap arenas.
 pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 
 /// Pages init carves for memmgr/procmgr's `AddressSpace`. Page 0 becomes
@@ -141,11 +139,13 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 33;
 /// Base for init's scratch mappings (`ProcessInfo` frames, ELF pages).
 pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;
 
-/// Frame cap that backs init's kernel-object retypes (currently endpoints).
+/// Frame cap that backs init's kernel-object retypes (endpoints; the log
+/// thread also retypes from it directly).
 ///
-/// Set once early in `run()` from `FrameAlloc::alloc_page`; carries
-/// `Rights::RETYPE` and ≈ 4 KiB of `available_bytes`. Read by every
-/// `cap_create_endpoint` callsite — main.rs, service.rs.
+/// Set once early in `run()` to init's bootstrap arena cap; carries full
+/// rights (incl. `Rights::RETYPE`). Read by every `cap_create_endpoint`
+/// callsite — main.rs, service.rs. The arena's front reserve bounds the total
+/// retype bump; see `bootstrap::INIT_RETYPE_RESERVE_PAGES`.
 pub(crate) static ENDPOINT_SLAB: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -393,40 +393,43 @@ fn run(info_ptr: u64) -> !
 
     let mut alloc = FrameAlloc::new(info);
 
-    // Reserve a Frame cap to back all of init's kernel-object retypes
-    // (currently endpoints; later: signals, threads, etc.). One page is
-    // enough for ~30 endpoints at 128 B each — init creates 8.
-    let Some(slab_cap) = alloc.alloc_page()
-    else
-    {
-        logging::log("init: FATAL: cannot allocate endpoint slab frame");
-        syscall::thread_exit();
-    };
-    ENDPOINT_SLAB.store(slab_cap, core::sync::atomic::Ordering::Relaxed);
-
-    // Map a fresh page for init's IPC buffer.
-    let Some(ipc_cap) = alloc.alloc_page()
-    else
-    {
-        logging::log("init: FATAL: cannot allocate IPC buffer frame");
-        syscall::thread_exit();
-    };
-    if syscall::mem_map(
-        ipc_cap,
+    // Carve init's own bootstrap arena: one contiguous Frame cap backing every
+    // page init allocates for itself. Its front reserve absorbs init's
+    // endpoint and log-thread retypes; its backing region is offset-mapped as
+    // init's IPC buffer, the log-thread stack, and the log-thread IPC buffer.
+    // The whole arena is forwarded to memmgr as an in-use run at
+    // `finalize_memmgr`, so init's own backing is accounted in memmgr's pool
+    // and — pinned by memmgr's copy — never frees into the post-handoff buddy
+    // when init reaps. Mirrors the memmgr/procmgr arenas.
+    let backing_pages = 1 + logging::LOG_THREAD_STACK_PAGES + 1;
+    let Some(mut init_arena) = bootstrap::BootArena::carve_reserve(
+        &mut alloc,
         info.aspace_cap,
-        INIT_IPC_BUF_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
+        bootstrap::INIT_RETYPE_RESERVE_PAGES,
+        backing_pages,
     )
-    .is_err()
+    else
     {
-        logging::log("init: FATAL: cannot map IPC buffer page");
+        logging::log("init: FATAL: cannot carve init bootstrap arena");
+        syscall::thread_exit();
+    };
+    // Every `cap_create_endpoint` retypes from the arena front.
+    ENDPOINT_SLAB.store(init_arena.cap, core::sync::atomic::Ordering::Relaxed);
+
+    // Offset-map init's IPC buffer from the arena (zeroed by `place_page`) and
+    // register it.
+    if init_arena
+        .place_page(
+            info.aspace_cap,
+            INIT_IPC_BUF_VA,
+            syscall::MAP_WRITABLE,
+            |_| {},
+        )
+        .is_none()
+    {
+        logging::log("init: FATAL: cannot place IPC buffer page");
         syscall::thread_exit();
     }
-    // Zero the IPC buffer page.
-    // SAFETY: INIT_IPC_BUF_VA is mapped writable, one page.
-    unsafe { core::ptr::write_bytes(INIT_IPC_BUF_VA as *mut u8, 0, PAGE_SIZE as usize) };
     if syscall::ipc_buffer_set(INIT_IPC_BUF_VA).is_err()
     {
         logging::log("init: FATAL: ipc_buffer_set failed");
@@ -494,7 +497,7 @@ fn run(info_ptr: u64) -> !
     // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it, letting procmgr
     // reclaim the init-logd TCB after init's main thread exits.
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
-    let init_logd_thread_cap = logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
+    let init_logd_thread_cap = logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap);
 
     // Tokened SEND on the log endpoint for init's own `log()` lines so
     // they appear under `[init]`. `LOG_TOKEN_INIT` (= 1) is reserved
@@ -565,7 +568,14 @@ fn run(info_ptr: u64) -> !
         logging::log("FATAL: phys-table page alloc failed");
         syscall::thread_exit();
     };
-    let Some(mm_final) = bootstrap::finalize_memmgr(info, &mut alloc, &mm, pm.arena_cap)
+    let Some(mm_final) = bootstrap::finalize_memmgr(
+        info,
+        &mut alloc,
+        &mm,
+        pm.arena_cap,
+        init_arena.cap,
+        phys_table_frame,
+    )
     else
     {
         logging::log("FATAL: finalize_memmgr failed");
@@ -850,7 +860,6 @@ fn run(info_ptr: u64) -> !
         thread_caps,
         ipc_buf,
         init_logd_thread_cap,
-        ipc_cap,
     );
 }
 

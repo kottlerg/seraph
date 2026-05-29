@@ -1321,7 +1321,6 @@ pub fn phase3_svcmgr_handover(
     mut thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
-    init_ipc_buf_cap: u32,
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
@@ -1564,13 +1563,7 @@ pub fn phase3_svcmgr_handover(
     // thread; when this function returns into `sys_thread_exit`
     // immediately below, procmgr's reap path tears init's AS/CSpace
     // /Threads down and donates the Frame caps to memmgr's pool.
-    handoff_to_procmgr_reap(
-        info,
-        procmgr_ep,
-        init_logd_thread_cap,
-        init_ipc_buf_cap,
-        ipc_buf,
-    );
+    handoff_to_procmgr_reap(info, procmgr_ep, init_logd_thread_cap, ipc_buf);
 
     log("main thread exiting; init handed off to procmgr for reap");
     syscall::thread_exit();
@@ -1628,7 +1621,6 @@ fn handoff_to_procmgr_reap(
     info: &InitInfo,
     procmgr_ep: u32,
     init_logd_thread_cap: u32,
-    init_ipc_buf_cap: u32,
     ipc_buf: *mut u64,
 )
 {
@@ -1659,7 +1651,9 @@ fn handoff_to_procmgr_reap(
     // Donate every owns_memory Frame cap init solely holds, streamed in
     // MSG_CAP_SLOTS_MAX-sized rounds. Two disjoint sources:
     //  - explicit InitInfo ranges (not in the descriptor array): init's ELF
-    //    segments, user stack, the InitInfo region, and the IPC buffer page.
+    //    segments, user stack, and the InitInfo region. (init's IPC buffer is
+    //    not here: it lives in init's bootstrap arena, forwarded to memmgr at
+    //    `finalize_memmgr` as an in-use run, not donated at reap.)
     //  - a descriptor walk for the unnamed reclaimable Frame caps — the
     //    bootloader and bundle reclaim ranges plus the AP-trampoline late
     //    cap — which carry no named InitInfo slot.
@@ -1700,10 +1694,6 @@ fn handoff_to_procmgr_reap(
         for slot in seg.chain(stack).chain(inf)
         {
             push(slot);
-        }
-        if init_ipc_buf_cap != 0
-        {
-            push(init_ipc_buf_cap);
         }
         for desc in crate::descriptors(info)
         {

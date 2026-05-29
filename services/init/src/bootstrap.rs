@@ -47,27 +47,46 @@ const PROCMGR_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 // refcount to zero: the offset-mapped backing never dangles and the arena
 // never frees into the post-handoff buddy.
 
-/// Front region of every arena reserved for the three kernel-object retypes.
-/// `AddressSpace` and `CSpace` each consume `*_RETYPE_PAGES - 1` pages (the
-/// value passed as their growth budget); `Thread` consumes
+/// Front region of a tier-1 service arena reserved for the three kernel-object
+/// retypes. `AddressSpace` and `CSpace` each consume `*_RETYPE_PAGES - 1` pages
+/// (the value passed as their growth budget); `Thread` consumes
 /// `THREAD_RETYPE_PAGES`. The retype bump is page-aligned and monotonic, so
 /// backing offsets at or above this bound never collide with a retype slab.
 const RETYPE_RESERVE_PAGES: u64 = (crate::ASPACE_RETYPE_PAGES - 1)
     + (crate::CSPACE_RETYPE_PAGES - 1)
     + crate::THREAD_RETYPE_PAGES;
 
+/// Front region of init's own arena reserved for its kernel-object retypes.
+///
+/// Unlike a tier-1 service, init retypes only endpoints (byte-granular) and
+/// one log thread from this arena; it reuses the kernel-supplied
+/// `AddressSpace`/`CSpace` rather than creating its own. The reserve is:
+///
+/// * 1 page for endpoints created before the log-thread retype (the retype
+///   allocator packs ~32 endpoints per page; init creates well under that),
+/// * `THREAD_RETYPE_PAGES` (6) for the log thread, which page-aligns the bump
+///   upward — splitting endpoint packing across a page boundary, and
+/// * 1 page for endpoints created after the log-thread retype, so they never
+///   bump into the offset-mapped backing region even without relying on the
+///   allocator reusing the first page's recovered slack.
+///
+/// Sound for up to ~32 endpoints on each side of the log-thread retype; init
+/// creates roughly a dozen total. [`finalize_memmgr`] asserts the front bump
+/// never crossed this bound before forwarding the arena.
+pub(crate) const INIT_RETYPE_RESERVE_PAGES: u64 = 1 + crate::THREAD_RETYPE_PAGES + 1;
+
 /// A service's contiguous backing arena: one Frame cap plus a page cursor
 /// into its offset-mapped backing region.
-struct BootArena
+pub(crate) struct BootArena
 {
     /// Arena Frame cap in init's `CSpace`. Full rights (R+W+X+RETYPE):
     /// retyped from its front, offset-mapped past the retype bump.
-    cap: u32,
-    /// init's own `AddressSpace` cap; transient per-page scratch maps land
-    /// here at [`ELF_PAGE_TEMP_VA`].
+    pub(crate) cap: u32,
+    /// `AddressSpace` cap the transient per-page scratch maps land in at
+    /// [`ELF_PAGE_TEMP_VA`] — always init's own `AddressSpace`.
     init_aspace: u32,
-    /// Next free backing-page offset, in pages. Starts at
-    /// [`RETYPE_RESERVE_PAGES`]; advances one page per [`Self::place_page`].
+    /// Next free backing-page offset, in pages. Starts at the front reserve;
+    /// advances one page per [`Self::place_page`].
     cursor: u64,
 }
 
@@ -79,11 +98,25 @@ impl BootArena
     /// placing any backing page.
     fn carve(alloc: &mut FrameAlloc, init_aspace: u32, backing_pages: u64) -> Option<Self>
     {
-        let cap = alloc.alloc_pages(RETYPE_RESERVE_PAGES + backing_pages)?;
+        Self::carve_reserve(alloc, init_aspace, RETYPE_RESERVE_PAGES, backing_pages)
+    }
+
+    /// Carve a `reserve_pages + backing_pages` contiguous arena off `alloc`
+    /// with the cursor positioned past `reserve_pages`. The caller performs
+    /// every retype against [`Self::cap`] within the `reserve_pages` front
+    /// bound before placing backing pages at or above it.
+    pub(crate) fn carve_reserve(
+        alloc: &mut FrameAlloc,
+        init_aspace: u32,
+        reserve_pages: u64,
+        backing_pages: u64,
+    ) -> Option<Self>
+    {
+        let cap = alloc.alloc_pages(reserve_pages + backing_pages)?;
         Some(Self {
             cap,
             init_aspace,
-            cursor: RETYPE_RESERVE_PAGES,
+            cursor: reserve_pages,
         })
     }
 
@@ -94,7 +127,7 @@ impl BootArena
     /// (`MAP_READ` / `MAP_WRITABLE` / `MAP_EXECUTABLE`) applied directly to
     /// the full-rights arena cap — no per-page derived child, so no live
     /// derivation blocks a later `frame_split` of the arena.
-    fn place_page(
+    pub(crate) fn place_page(
         &mut self,
         target_aspace: u32,
         target_va: u64,
@@ -394,8 +427,8 @@ pub struct MemmgrFinalize
     /// Sourced from `CapDescriptor.aux0` of the underlying RAM Frame
     /// caps minted by the kernel at boot.
     pub phys_bases: [u64; ipc::memmgr_bootstrap::MAX_FRAMES],
-    /// In-use bootstrap arenas (memmgr's and procmgr's own backing)
-    /// copied into memmgr's `CSpace`. Init writes these into the
+    /// In-use bootstrap arenas (memmgr's, procmgr's, and init's own
+    /// backing) copied into memmgr's `CSpace`. Init writes these into the
     /// phys-table page's in-use section; memmgr records them against
     /// per-owner process records.
     pub in_use: [InUseArena; ipc::memmgr_bootstrap::MAX_IN_USE],
@@ -603,9 +636,67 @@ fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena
     })
 }
 
+/// Forward a single Frame cap covering `pages` free pages into memmgr's
+/// `CSpace` as a free run: derive a full-rights intermediary, copy it into
+/// `mm_cspace`, and append the run to the parallel `page_counts`/`phys_bases`
+/// tables (advancing `count`, recording `base` on the first run). Used for the
+/// `FrameAlloc` tail and the transient phys-table page — both `frame_split`
+/// products with no `InitInfo` descriptor that would otherwise free into the
+/// sealed post-handoff buddy.
+#[allow(clippy::too_many_arguments)]
+fn push_free_run(
+    src_cap: u32,
+    pages: u32,
+    mm_cspace: u32,
+    page_counts: &mut [u32],
+    phys_bases: &mut [u64],
+    base: &mut u32,
+    count: &mut u32,
+)
+{
+    if pages == 0 || (*count as usize) >= page_counts.len()
+    {
+        return;
+    }
+    if let Ok(phys_base) = syscall::cap_info(src_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+        && let Ok(intermediary) = syscall::cap_derive(src_cap, syscall::RIGHTS_ALL)
+        && let Ok(dst_slot) = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL)
+    {
+        if *count == 0
+        {
+            *base = dst_slot;
+        }
+        page_counts[*count as usize] = pages;
+        phys_bases[*count as usize] = phys_base;
+        *count += 1;
+    }
+}
+
+/// Assert init's arena retype front never crossed its reserve into the
+/// offset-mapped backing region. init's endpoint and log-thread retypes bump a
+/// monotonic cursor through the front; the backing was offset-mapped at
+/// `INIT_RETYPE_RESERVE_PAGES`. `available` is the arena's un-retyped byte
+/// count, so a front bump past the reserve shows up as a consumed span larger
+/// than the reserve. Endpoints created after `finalize_memmgr` (devmgr/vfsd
+/// registries, phase 3) stay within the reserve's documented headroom.
+fn assert_init_arena_front_bounded(init_arena_cap: u32)
+{
+    if let (Ok(size), Ok(available)) = (
+        syscall::cap_info(init_arena_cap, syscall::CAP_INFO_FRAME_SIZE),
+        syscall::cap_info(init_arena_cap, syscall::CAP_INFO_FRAME_AVAILABLE),
+    )
+    {
+        let front_bump = size.saturating_sub(available);
+        assert!(
+            front_bump <= INIT_RETYPE_RESERVE_PAGES * PAGE_SIZE,
+            "init: arena retype front overran its reserve into backing",
+        );
+    }
+}
+
 /// Delegate every remaining RAM Frame cap from init's pool into memmgr's
-/// `CSpace`, forward the in-use bootstrap arenas (memmgr's and procmgr's own
-/// backing), then `thread_configure` + `thread_start` memmgr.
+/// `CSpace`, forward the in-use bootstrap arenas (memmgr's, procmgr's, and
+/// init's own backing), then `thread_configure` + `thread_start` memmgr.
 ///
 /// Call after every `alloc.alloc_page()` consumer (memmgr's own setup,
 /// procmgr's setup) has run — at that point everything left in init's
@@ -613,15 +704,24 @@ fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena
 /// no more frames; subsequent allocations route through memmgr like any
 /// other process.
 ///
-/// `pm_arena_cap` is procmgr's backing arena (from [`ProcmgrBootstrap`]); it
-/// is forwarded alongside memmgr's own arena (`mm.arena_cap`) so memmgr's
-/// `pool_total` spans the bootstrap-consumed RAM, not only the free runs.
-#[allow(clippy::similar_names)]
+/// `pm_arena_cap` is procmgr's backing arena and `init_arena_cap` is init's own
+/// (from [`ProcmgrBootstrap`] and [`crate::run`]); both are forwarded alongside
+/// memmgr's own arena (`mm.arena_cap`) so memmgr's `pool_total` spans every page
+/// of bootstrap-consumed RAM, not only the free runs.
+///
+/// `phys_table_frame` is the auxiliary phys-table page (written after this
+/// call). It is a transient bootstrap artifact, so it is forwarded as a free
+/// run — its keep-alive moves to memmgr's pool copy, and after memmgr reads it
+/// through the read-only `caps[1]` derivation the page becomes allocatable like
+/// any other.
+#[allow(clippy::similar_names, clippy::too_many_lines)]
 pub fn finalize_memmgr(
     info: &InitInfo,
     alloc: &mut FrameAlloc,
     mm: &MemmgrBootstrap,
     pm_arena_cap: u32,
+    init_arena_cap: u32,
+    phys_table_frame: u32,
 ) -> Option<MemmgrFinalize>
 {
     // The bootstrap-IPC payload to memmgr packs 2 page_counts per word
@@ -693,34 +793,50 @@ pub fn finalize_memmgr(
     // is excluded from the reap donation walk; without this it would free into
     // the post-handoff buddy (which nothing allocates from) and be lost. It is
     // free RAM, so it joins memmgr's pool as a run like any forwarded frame.
-    if alloc.remaining >= PAGE_SIZE && (mm_frame_count as usize) < page_counts.len()
+    if alloc.remaining >= PAGE_SIZE
     {
         let tail_pages = (alloc.remaining / PAGE_SIZE) as u32;
-        if let Ok(phys_base) = syscall::cap_info(alloc.current, syscall::CAP_INFO_FRAME_PHYS_BASE)
-            && let Ok(intermediary) = syscall::cap_derive(alloc.current, syscall::RIGHTS_ALL)
-            && let Ok(dst_slot) = syscall::cap_copy(intermediary, mm.mm_cspace, syscall::RIGHTS_ALL)
-        {
-            if mm_frame_count == 0
-            {
-                mm_frame_base = dst_slot;
-            }
-            page_counts[mm_frame_count as usize] = tail_pages;
-            phys_bases[mm_frame_count as usize] = phys_base;
-            mm_frame_count += 1;
-        }
+        push_free_run(
+            alloc.current,
+            tail_pages,
+            mm.mm_cspace,
+            &mut page_counts,
+            &mut phys_bases,
+            &mut mm_frame_base,
+            &mut mm_frame_count,
+        );
         alloc.remaining = 0;
     }
 
+    // Forward the transient phys-table page as a free run too (same rationale
+    // as the tail: a descriptor-less `frame_split` product). Its content is
+    // written after this call and read once by memmgr through the read-only
+    // `caps[1]` derivation; the free-run copy is the page's keep-alive, and
+    // after the read the page is allocatable like any other.
+    push_free_run(
+        phys_table_frame,
+        1,
+        mm.mm_cspace,
+        &mut page_counts,
+        &mut phys_bases,
+        &mut mm_frame_base,
+        &mut mm_frame_count,
+    );
+
     // Forward the in-use bootstrap arenas. These are the RAM init carved to
-    // back memmgr and procmgr (retype slabs + offset-mapped ELF/stack/IPC/PI);
-    // they are retype-pinned and never freed, but their pages belong in
-    // memmgr's `pool_total` so the all-RAM-accounted identity closes. memmgr
-    // records each against the owning service's process record.
+    // back memmgr, procmgr, and itself (retype slabs + offset-mapped
+    // ELF/stack/IPC/PI); they are retype-pinned and never freed, but their
+    // pages belong in memmgr's `pool_total` so the all-RAM-accounted identity
+    // closes. memmgr records each against the owning service's process record.
+    // init's arena is forwarded here even though init exits at reap: memmgr's
+    // copy becomes the arena's permanent keep-alive and the pages stay parked
+    // and accounted.
     let mut in_use = [InUseArena::default(); ipc::memmgr_bootstrap::MAX_IN_USE];
     let mut in_use_count = 0usize;
     for (cap, kind) in [
         (mm.arena_cap, ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR),
         (pm_arena_cap, ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR),
+        (init_arena_cap, ipc::memmgr_bootstrap::IN_USE_KIND_INIT),
     ]
     {
         if let Some(arena) = forward_arena(cap, mm.mm_cspace, kind)
@@ -729,6 +845,8 @@ pub fn finalize_memmgr(
             in_use_count += 1;
         }
     }
+
+    assert_init_arena_front_bounded(init_arena_cap);
 
     syscall::thread_configure(
         mm.mm_thread,

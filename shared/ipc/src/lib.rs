@@ -397,9 +397,9 @@ pub mod memmgr_errors
 /// * `[0, frame_count)` — `phys_base` per free frame, parallel to the
 ///   `page_count` words above.
 /// * `FACTS_*` — the kernel's immutable RAM-accounting facts.
-/// * `IN_USE_*` — the in-use bootstrap arenas (memmgr's and procmgr's own
-///   backing), forwarded so memmgr's `pool_total` spans every page of RAM it
-///   owns, not only the free runs and reap donations.
+/// * `IN_USE_*` — the in-use bootstrap arenas (memmgr's, procmgr's, and init's
+///   own backing), forwarded so memmgr's `pool_total` spans every page of RAM
+///   it owns, not only the free runs and reap donations.
 pub mod memmgr_bootstrap
 {
     use syscall_abi::MSG_DATA_WORDS_MAX;
@@ -425,7 +425,7 @@ pub mod memmgr_bootstrap
     /// * word 1 — `phys_base`.
     /// * word 2 — `kind` (see `IN_USE_KIND_*`).
     pub const IN_USE_WORDS: usize = 3;
-    /// Maximum in-use arenas init forwards (memmgr-self, procmgr, slack).
+    /// Maximum in-use arenas init forwards (memmgr-self, procmgr, init, slack).
     /// `IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS` must stay within the
     /// 512-slot page.
     pub const MAX_IN_USE: usize = 4;
@@ -434,6 +434,11 @@ pub mod memmgr_bootstrap
     pub const IN_USE_KIND_MEMMGR: u64 = 0;
     /// In-use arena owner kind: procmgr's bootstrap backing.
     pub const IN_USE_KIND_PROCMGR: u64 = 1;
+    /// In-use arena owner kind: init's own bootstrap backing (endpoint and
+    /// log-thread retype slabs plus the offset-mapped IPC buffer and
+    /// log-thread stack/IPC). init exits at reap; the arena's pages stay
+    /// parked and are accounted against a dedicated memmgr-side record.
+    pub const IN_USE_KIND_INIT: u64 = 2;
 }
 
 /// Process-state codes returned by `procmgr_labels::QUERY_PROCESS`.

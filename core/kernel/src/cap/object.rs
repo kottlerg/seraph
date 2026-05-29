@@ -1299,8 +1299,8 @@ unsafe fn dealloc_object_one(
                     *mut crate::sched::thread::ThreadControlBlock,
                     usize,
                 )>;
-                // needless_range_loop: explicit indexing is clearer for scheduler_for(cpu)
-                // and saved_flags[cpu] parallel access.
+                // needless_range_loop: explicit indexing reads clearer for the
+                // parallel scheduler_for(cpu) accesses across all CPUs.
                 #[allow(clippy::needless_range_loop)]
                 // SAFETY: tcb validated non-null; all scheduler locks are acquired in
                 // ascending order to prevent deadlock; lock_raw paired with unlock_raw.
@@ -1311,12 +1311,12 @@ unsafe fn dealloc_object_one(
                         as usize;
 
                     // Acquire all scheduler locks in ascending CPU order to
-                    // prevent ABBA deadlock.
-                    let mut saved_flags: [u64; crate::sched::MAX_CPUS] =
-                        [0; crate::sched::MAX_CPUS];
+                    // prevent ABBA deadlock. Each CPU's saved interrupt-flag
+                    // word is stashed in its own scheduler (under that lock).
                     for cpu in 0..cpu_count
                     {
-                        saved_flags[cpu] = crate::sched::scheduler_for(cpu).lock.lock_raw();
+                        let s = crate::sched::scheduler_for(cpu);
+                        s.saved_lock_flags = s.lock.lock_raw();
                     }
 
                     // Read priority inside the all-locks region.
@@ -1390,9 +1390,8 @@ unsafe fn dealloc_object_one(
                     // Release all locks.
                     for cpu in (0..cpu_count).rev()
                     {
-                        crate::sched::scheduler_for(cpu)
-                            .lock
-                            .unlock_raw(saved_flags[cpu]);
+                        let s = crate::sched::scheduler_for(cpu);
+                        s.lock.unlock_raw(s.saved_lock_flags);
                     }
 
                     // UAF gate: wait for the in-flight switch (if any) to
@@ -1698,8 +1697,8 @@ unsafe fn dealloc_object_one(
                 // No CPU should still have this address space loaded in
                 // satp/CR3 when we free its root page table.
                 debug_assert!(
-                    // SAFETY: as_ptr non-null; active_cpu_mask is an Acquire load.
-                    unsafe { (*as_ptr).active_cpu_mask() } == 0,
+                    // SAFETY: as_ptr non-null; active_cpu_mask is an Acquire snapshot.
+                    unsafe { (*as_ptr).active_cpu_mask() }.is_empty(),
                     "dealloc AddressSpace: freeing root while active_cpus != 0"
                 );
 

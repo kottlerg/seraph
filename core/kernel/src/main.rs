@@ -49,6 +49,7 @@ use boot_protocol::BootInfo;
 mod arch;
 mod cap;
 mod console;
+mod cpu_mask;
 mod framebuffer;
 mod ipc;
 pub mod irq;

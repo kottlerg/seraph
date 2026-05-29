@@ -615,14 +615,16 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // scheduler.lock in ascending order — the same shape used by
     // `dealloc_object(Thread)` and `sched::set_state_under_all_locks`.
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let mut saved_flags: [u64; crate::sched::MAX_CPUS] = [0; crate::sched::MAX_CPUS];
 
-    // Ascending order matches the lock hierarchy rule.
-    #[allow(clippy::needless_range_loop)]
+    // Ascending order matches the lock hierarchy rule. Each CPU's saved
+    // interrupt-flag word is stashed in its own scheduler (under that lock).
     for cpu in 0..cpu_count
     {
         // SAFETY: cpu < cpu_count; scheduler slab initialised by `sched::init`.
-        saved_flags[cpu] = unsafe { crate::sched::scheduler_for(cpu).lock.lock_raw() };
+        unsafe {
+            let s = crate::sched::scheduler_for(cpu);
+            s.saved_lock_flags = s.lock.lock_raw();
+        }
     }
 
     // SAFETY: target_tcb validated non-null; all-CPU scheduler.locks serialise
@@ -666,9 +668,8 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         // SAFETY: `lock_raw` above paired with this unlock; same CPU index.
         unsafe {
-            crate::sched::scheduler_for(cpu)
-                .lock
-                .unlock_raw(saved_flags[cpu]);
+            let s = crate::sched::scheduler_for(cpu);
+            s.lock.unlock_raw(s.saved_lock_flags);
         }
     }
 

@@ -227,6 +227,14 @@ pub struct PerCpuScheduler
     /// Used to index into the `CPU_LOAD` array for load tracking.
     /// Set during `sched::init` before the scheduler is used.
     pub cpu_id: usize,
+
+    /// Interrupt-flag word saved by `lock_raw` while this CPU's lock is held
+    /// as part of an all-CPU-locks operation (`set_state_under_all_locks`,
+    /// `sys_thread_set_priority`, `dealloc_object(Thread)`); read back at the
+    /// matching `unlock_raw`. Written only under this scheduler's own lock, so
+    /// it needs no atomicity. Lives here rather than in a `MAX_CPUS`-wide stack
+    /// array that would scale with the CPU ceiling.
+    pub saved_lock_flags: u64,
 }
 
 // SAFETY: scheduler is protected by `lock` (Phase 9+) and only accessed
@@ -259,6 +267,7 @@ impl PerCpuScheduler
             idle: core::ptr::null_mut(),
             lock: crate::sync::Spinlock::new(),
             cpu_id: 0,
+            saved_lock_flags: 0,
         }
     }
 

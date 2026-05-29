@@ -47,9 +47,11 @@ pub const TIME_SLICE_TICKS: u32 = 10;
 /// Number of 4 KiB pages in each idle thread's kernel stack (16 KiB total).
 pub const KERNEL_STACK_PAGES: usize = 4;
 
-/// Maximum number of CPUs. Matches the `u64` TLB-shootdown cpu-mask width.
-/// TODO: enforce if `cpu_count` exceeds this.
-pub const MAX_CPUS: usize = 64;
+/// Maximum number of CPUs the kernel supports, matching the boot protocol's
+/// ceiling ([`boot_protocol::MAX_CPUS`]). Per-CPU sets ([`crate::cpu_mask`])
+/// size their word counts from this, and the boot path drops any CPUs the
+/// firmware enumerates beyond it.
+pub const MAX_CPUS: usize = boot_protocol::MAX_CPUS;
 
 /// Hard affinity sentinel: no hard CPU affinity.
 pub const AFFINITY_ANY: u32 = 0xFFFF_FFFF;
@@ -146,9 +148,7 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 ///
 /// Arch-uniform. On RISC-V the IPI handler does **not** set this flag; the
 /// producer does. On x86-64 the same contract holds.
-const RESCHEDULE_WORDS: usize = MAX_CPUS.div_ceil(64);
-static RESCHEDULE_PENDING: [core::sync::atomic::AtomicU64; RESCHEDULE_WORDS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; RESCHEDULE_WORDS];
+static RESCHEDULE_PENDING: crate::cpu_mask::AtomicCpuMask = crate::cpu_mask::AtomicCpuMask::new();
 
 /// Set the reschedule-pending bit for `cpu` (producer side).
 ///
@@ -157,9 +157,7 @@ static RESCHEDULE_PENDING: [core::sync::atomic::AtomicU64; RESCHEDULE_WORDS] =
 /// `take_reschedule_pending`.
 pub fn set_reschedule_pending_for(cpu: usize)
 {
-    let word = cpu / 64;
-    let bit = 1u64 << (cpu % 64);
-    RESCHEDULE_PENDING[word].fetch_or(bit, core::sync::atomic::Ordering::Release);
+    RESCHEDULE_PENDING.set_cpu(cpu, core::sync::atomic::Ordering::Release);
 }
 
 /// Check and clear the reschedule-pending flag for a CPU.
@@ -168,9 +166,7 @@ pub fn set_reschedule_pending_for(cpu: usize)
 /// `AcqRel`: Acquire side pairs with Release in `set_reschedule_pending_for`.
 pub fn take_reschedule_pending(cpu: usize) -> bool
 {
-    let word = cpu / 64;
-    let bit = 1u64 << (cpu % 64);
-    RESCHEDULE_PENDING[word].fetch_and(!bit, core::sync::atomic::Ordering::AcqRel) & bit != 0
+    RESCHEDULE_PENDING.take_cpu(cpu, core::sync::atomic::Ordering::AcqRel)
 }
 
 // ── Softlockup watchdog ──────────────────────────────────────────────────────
@@ -231,10 +227,9 @@ fn watchdog_tick_and_check()
     // the authoritative detector for a genuinely stuck IPI, so defer to it
     // rather than emit a misleading softlockup dump. A non-shootdown stall
     // re-checks on the next tick once pending_cpus clears.
-    if crate::mm::tlb_shootdown::TLB_SHOOTDOWN
+    if !crate::mm::tlb_shootdown::TLB_SHOOTDOWN
         .pending_cpus
-        .load(core::sync::atomic::Ordering::Acquire)
-        != 0
+        .is_empty(core::sync::atomic::Ordering::Acquire)
     {
         return;
     }
@@ -1120,17 +1115,17 @@ pub unsafe fn set_state_under_all_locks(
 ) -> Option<usize>
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let mut saved_flags: [u64; MAX_CPUS] = [0; MAX_CPUS];
 
     // Acquire all scheduler locks in ascending CPU order to prevent ABBA.
-    // needless_range_loop: explicit indexing keeps saved_flags[cpu] /
-    // scheduler_for(cpu) parallel and clear; iter_mut().enumerate() would
-    // obscure the all-CPU pattern.
-    #[allow(clippy::needless_range_loop)]
+    // Each CPU's saved interrupt-flag word is stashed in its own scheduler
+    // (written under that lock), so no MAX_CPUS-wide stack scratch is needed.
     for cpu in 0..cpu_count
     {
         // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-        saved_flags[cpu] = unsafe { scheduler_for(cpu).lock.lock_raw() };
+        unsafe {
+            let s = scheduler_for(cpu);
+            s.saved_lock_flags = s.lock.lock_raw();
+        }
     }
 
     // Write the state and snapshot priority under all locks so the queue
@@ -1178,7 +1173,10 @@ pub unsafe fn set_state_under_all_locks(
     for cpu in (0..cpu_count).rev()
     {
         // SAFETY: lock_raw above paired with this unlock.
-        unsafe { scheduler_for(cpu).lock.unlock_raw(saved_flags[cpu]) };
+        unsafe {
+            let s = scheduler_for(cpu);
+            s.lock.unlock_raw(s.saved_lock_flags);
+        }
     }
 
     running_on

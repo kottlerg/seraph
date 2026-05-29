@@ -58,10 +58,9 @@ static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 ///
 /// Must be called once during boot before any SMP operations that require
 /// sending IPIs to specific CPUs. Accepts a slice rather than a fixed-size
-/// array so the kernel's internal [`MAX_CPUS`] can diverge from the ABI's
-/// `BootInfo::cpu_ids` length; the ABI cap is larger today and only the
-/// leading [`MAX_CPUS`] entries are consumed. Raising `MAX_CPUS` to match
-/// the ABI is tracked as issue #38.
+/// array; [`MAX_CPUS`] now matches the boot protocol's `BootInfo::cpu_ids`
+/// length, so the `min` below is a defensive bound that drops nothing in
+/// practice.
 ///
 /// # Safety
 /// Single-threaded boot phase; must be called before SMP is active.

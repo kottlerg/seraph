@@ -40,6 +40,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::cpu_mask::{AtomicCpuMask, CpuMask};
+
 /// TLB shootdown request state.
 ///
 /// The initiating CPU stores the target address space root, the virtual address
@@ -53,9 +55,9 @@ pub struct TlbShootdownRequest
     /// Virtual address to invalidate. `u64::MAX` means full flush.
     pub flush_va: AtomicU64,
 
-    /// Bitmask of CPUs that must acknowledge before initiator proceeds.
-    /// Bit N set = CPU N must execute invlpg/sfence.vma and clear its bit.
-    pub pending_cpus: AtomicU64,
+    /// Set of CPUs that must acknowledge before the initiator proceeds.
+    /// CPU N present = CPU N must execute invlpg/sfence.vma and clear its bit.
+    pub pending_cpus: AtomicCpuMask,
 }
 
 /// Global TLB shootdown request state.
@@ -65,7 +67,7 @@ pub struct TlbShootdownRequest
 pub static TLB_SHOOTDOWN: TlbShootdownRequest = TlbShootdownRequest {
     root_phys: AtomicU64::new(0),
     flush_va: AtomicU64::new(u64::MAX),
-    pending_cpus: AtomicU64::new(0),
+    pending_cpus: AtomicCpuMask::new(),
 };
 
 /// Serialization lock for TLB shootdown initiation.
@@ -111,15 +113,15 @@ fn shootdown_unlock()
 /// # Contract
 /// - Caller must have called `preempt_disable()` before this function.
 /// - `root_phys` must be a valid page table root physical address or 0 for full flush.
-/// - `cpu_mask` bits must correspond to online CPUs only.
+/// - `cpus` must contain only online CPU indices.
 ///
 /// # Safety
-/// Caller must ensure `root_phys` and `cpu_mask` are valid as described above.
+/// Caller must ensure `root_phys` and `cpus` are valid as described above.
 // Used by AddressSpace::map_page, unmap_page, protect_page.
 #[allow(dead_code)]
-pub unsafe fn shootdown(root_phys: u64, cpu_mask: u64, virt: u64)
+pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64)
 {
-    if cpu_mask == 0
+    if cpus.is_empty()
     {
         return; // No remote CPUs active
     }
@@ -151,9 +153,7 @@ pub unsafe fn shootdown(root_phys: u64, cpu_mask: u64, virt: u64)
     // are visible to remote CPUs before the IPI arrives.
     TLB_SHOOTDOWN.root_phys.store(root_phys, Ordering::Release);
     TLB_SHOOTDOWN.flush_va.store(virt, Ordering::Release);
-    TLB_SHOOTDOWN
-        .pending_cpus
-        .store(cpu_mask, Ordering::Release);
+    TLB_SHOOTDOWN.pending_cpus.store(cpus, Ordering::Release);
 
     // Fence: ensure pending_cpus is globally visible before sending IPIs.
     // On RISC-V (RVWMO), the Release store orders it after prior stores on
@@ -164,27 +164,23 @@ pub unsafe fn shootdown(root_phys: u64, cpu_mask: u64, virt: u64)
     // (TSO) this is a no-op.
     core::sync::atomic::fence(Ordering::SeqCst);
 
-    // Helper: send IPIs to all CPUs with bits set in `mask`.
-    let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed);
-    let send_ipis = |mask: u64| {
-        for cpu in 0..cpu_count
+    // Helper: send IPIs to every CPU in `mask`.
+    let send_ipis = |mask: &CpuMask| {
+        for cpu in mask.iter()
         {
-            if (mask & (1u64 << cpu)) != 0
-            {
-                // Translate logical CPU → hardware ID (APIC ID / hart ID).
-                // SAFETY: cpu is in [0, cpu_count), all online CPUs;
-                // apic_id_for returns the hardware ID for the logical CPU.
-                let hw_id = unsafe { crate::percpu::apic_id_for(cpu as usize) };
-                // SAFETY: hw_id is a valid hardware ID for an online CPU.
-                unsafe {
-                    crate::arch::current::interrupts::send_tlb_shootdown_ipi(hw_id);
-                }
+            // Translate logical CPU → hardware ID (APIC ID / hart ID).
+            // SAFETY: cpu is an online CPU index from the caller's mask;
+            // apic_id_for returns the hardware ID for the logical CPU.
+            let hw_id = unsafe { crate::percpu::apic_id_for(cpu) };
+            // SAFETY: hw_id is a valid hardware ID for an online CPU.
+            unsafe {
+                crate::arch::current::interrupts::send_tlb_shootdown_ipi(hw_id);
             }
         }
     };
 
     // Initial IPI volley.
-    send_ipis(cpu_mask);
+    send_ipis(cpus);
 
     // TSC-bounded ack wait with re-send + NMI-backtrace escalation. See
     // arch::current::interrupts::wait_for_ack and the IPI Watchdog Ladder
@@ -194,17 +190,17 @@ pub unsafe fn shootdown(root_phys: u64, cpu_mask: u64, virt: u64)
     // to acks-in-flight. target_cpu is the lowest-numbered CPU still
     // pending at the start of the wait; it drives the Phase-C NMI
     // backtrace and the Phase-D panic message.
-    let target_cpu = cpu_mask.trailing_zeros() as usize;
+    let target_cpu = cpus.first().unwrap_or(0);
     // Relaxed: a stale read here only causes a redundant IPI to a CPU
     // that has already acked, which is idempotent. The real
     // synchronisation edge is the Acquire load inside the cond closure
     // below.
-    let resend = || send_ipis(TLB_SHOOTDOWN.pending_cpus.load(Ordering::Relaxed));
+    let resend = || send_ipis(&TLB_SHOOTDOWN.pending_cpus.snapshot(Ordering::Relaxed));
     // SAFETY: caller invariants (preempt-disabled, IF=1) are upheld by
     // the save_and_disable_interrupts + enable() sequence above.
     unsafe {
         crate::arch::current::interrupts::wait_for_ack(
-            || TLB_SHOOTDOWN.pending_cpus.load(Ordering::Acquire) == 0,
+            || TLB_SHOOTDOWN.pending_cpus.is_empty(Ordering::Acquire),
             &crate::arch::current::interrupts::IpiWaitCtx {
                 op_name: "tlb-shootdown",
                 target_cpu,

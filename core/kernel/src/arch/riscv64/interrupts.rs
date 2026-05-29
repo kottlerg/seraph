@@ -355,14 +355,11 @@ fn handle_software_interrupt()
         clear_sip_ssip();
     }
 
-    let hart_id = super::cpu::current_cpu();
-    let my_bit = 1u64 << hart_id;
+    let hart_id = super::cpu::current_cpu() as usize;
 
-    let pending = crate::mm::tlb_shootdown::TLB_SHOOTDOWN
+    if crate::mm::tlb_shootdown::TLB_SHOOTDOWN
         .pending_cpus
-        .load(core::sync::atomic::Ordering::Acquire);
-
-    if pending & my_bit != 0
+        .test_cpu(hart_id, core::sync::atomic::Ordering::Acquire)
     {
         // TLB shootdown request: flush the requested VA and acknowledge.
         // Per-VA sfence.vma preserves global kernel-text iTLB entries that
@@ -396,7 +393,7 @@ fn handle_software_interrupt()
         // SAFETY: Release ordering ensures TLB flush is visible before bit clear.
         crate::mm::tlb_shootdown::TLB_SHOOTDOWN
             .pending_cpus
-            .fetch_and(!my_bit, core::sync::atomic::Ordering::Release);
+            .clear_cpu(hart_id, core::sync::atomic::Ordering::Release);
     }
 
     // Wakeup IPIs carry no handler work beyond the hardware-mandated SSIP

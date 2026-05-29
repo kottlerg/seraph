@@ -518,7 +518,7 @@ fn rv_walk_or_alloc_pooled(
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB Sv48 root frame.
 /// No CPU may still be using this address space (the caller verifies
-/// `active_cpu_mask() == 0` before invocation).
+/// `active_cpu_mask().is_empty()` before invocation).
 #[cfg(not(test))]
 #[allow(dead_code)]
 pub unsafe fn free_user_page_tables(root_virt: u64)
@@ -735,24 +735,16 @@ pub unsafe fn unmap_identity_page(pa: u64)
     // contract met by acquiring preemption around the broadcast.
     unsafe { flush_page(virt) };
 
-    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-    let online_mask: u64 = if cpu_count >= 64
-    {
-        u64::MAX
-    }
-    else
-    {
-        (1u64 << cpu_count) - 1
-    };
-    let current = crate::arch::current::cpu::current_cpu();
-    let remote = online_mask & !(1u64 << current);
-    if remote != 0
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let current = crate::arch::current::cpu::current_cpu() as usize;
+    let mut remote = crate::cpu_mask::CpuMask::range(cpu_count);
+    remote.clear(current);
+    if !remote.is_empty()
     {
         crate::percpu::preempt_disable();
-        // SAFETY: root_pa is the active kernel Sv48 root; remote mask
-        // covers only online harts; preemption disabled around the
-        // shootdown.
-        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, remote, virt) };
+        // SAFETY: root_pa is the active kernel Sv48 root; remote covers
+        // only online harts; preemption disabled around the shootdown.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt) };
         crate::percpu::preempt_enable();
     }
 }

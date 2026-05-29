@@ -3,8 +3,14 @@
 x86-64 CMOS / MC146818-compatible RTC driver. Serves
 [`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).
 
-Spawned by devmgr on x86-64 platforms. Registered with svcmgr under the
-well-known name `rtc.primary`; the `timed` service queries this driver
+Installed to `/services/drivers/cmos-rtc` on the rootfs. Spawned by
+devmgr on x86-64 platforms via the non-PCI simple-device path,
+`procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
+walks to from the `/services/drivers/` subtree cap init delivers
+post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`. devmgr owns the
+driver's service endpoint and mints client SEND caps on
+`devmgr_labels::QUERY_RTC_DEVICE`, each tokened with
+`rtc_labels::READ_AUTHORITY`. The `timed` service resolves the SEND
 once at startup to seed its wall-clock offset.
 
 ---
@@ -39,10 +45,12 @@ protocol.
 ## IPC Interface
 
 * **`rtc_labels::RTC_GET_EPOCH_TIME`** — no payload. The driver
-  re-reads the CMOS hardware on every request (no caching). Reply:
-  reply label is a [`rtc_errors`](../../../shared/ipc/src/lib.rs)
-  status code; on `SUCCESS`, `data[0]` is `u64` microseconds since
-  the Unix epoch.
+  re-reads the CMOS hardware on every request (no caching). Caller's
+  token must carry `rtc_labels::READ_AUTHORITY` (devmgr stamps it on
+  every SEND minted from `QUERY_RTC_DEVICE`); the driver replies
+  `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a
+  [`rtc_errors`](../../../shared/ipc/src/lib.rs) status code; on
+  `SUCCESS`, `data[0]` is `u64` microseconds since the Unix epoch.
 
 The driver does not maintain a wall-clock offset or compute drift;
 that is `timed`'s responsibility.

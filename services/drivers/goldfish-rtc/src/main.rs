@@ -75,10 +75,17 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, base_va: u64)
     {
         rtc_labels::RTC_GET_EPOCH_TIME =>
         {
-            let ns = read_epoch_ns(base_va);
-            IpcMessage::builder(rtc_errors::SUCCESS)
-                .word(0, ns / 1000)
-                .build()
+            if msg.token & rtc_labels::READ_AUTHORITY == 0
+            {
+                IpcMessage::new(rtc_errors::UNAUTHORIZED)
+            }
+            else
+            {
+                let ns = read_epoch_ns(base_va);
+                IpcMessage::builder(rtc_errors::SUCCESS)
+                    .word(0, ns / 1000)
+                    .build()
+            }
         }
         _ => IpcMessage::new(rtc_errors::UNKNOWN_OPCODE),
     };

@@ -541,27 +541,62 @@ pub mod published_names
 
 pub const RTC_LABELS_VERSION: u32 = 1;
 /// IPC labels for RTC chip drivers (`services/drivers/cmos`,
-/// `services/drivers/virtio/rtc`, and future per-board chip drivers).
+/// `services/drivers/goldfish-rtc`, and future per-board chip drivers).
 ///
 /// Every RTC driver implements exactly one operation: return the current
-/// wall-clock time, as `u64` microseconds since the Unix epoch. The
-/// `timed` service queries the driver registered under
-/// `rtc.primary` in svcmgr once at startup, computes
+/// wall-clock time, as `u64` microseconds since the Unix epoch. devmgr
+/// owns the per-board RTC and hands clients a
+/// [`READ_AUTHORITY`](rtc_labels::READ_AUTHORITY)-tokened SEND via
+/// [`devmgr_labels::QUERY_RTC_DEVICE`]. `timed` is the sole client
+/// today: it resolves the SEND once at startup, computes
 /// `offset = rtc_us - kernel_monotonic_us`, and serves
 /// [`timed_labels::GET_WALL_TIME`] thereafter without further driver IPC.
 ///
+/// **Acquisition path**: the RTC driver binary lives on the rootfs disk
+/// at `/services/drivers/<chip>` and is loaded by devmgr from there.
+/// Init walks vfsd to `/services/drivers/` and hands devmgr a
+/// `LOOKUP | READ`-attenuated subtree cap via
+/// [`devmgr_labels::SET_DRIVERS_DIR`]. Devmgr replies SUCCESS to that
+/// handshake *before* doing any spawn work (so init never blocks on
+/// driver bring-up); it then walks the per-arch driver name
+/// (`cmos-rtc` on x86-64, `goldfish-rtc` on RISC-V) from the subtree
+/// cap, calls [`procmgr_labels::CREATE_FROM_FILE`], and delivers the
+/// per-arch hardware authority cap (ISA `IoPortRange` for CMOS; MMIO
+/// aperture for goldfish-rtc) through the bootstrap protocol — all
+/// between the `SET_DRIVERS_DIR` handler's `ipc_reply` and the next
+/// `ipc_recv`. See [`devmgr_labels::SET_DRIVERS_DIR`] for the nested-IPC
+/// constraint that forces this ordering. Spawn is at-most-once per
+/// boot; failure is sticky and clients see
+/// [`devmgr_errors::NO_DEVICE`] permanently. RTC drivers are
+/// **not** carried in the boot bundle.
+///
 /// Adding a new RTC chip is a matter of writing a driver crate that
-/// answers this single label and registering it as `rtc.primary` from
-/// devmgr's per-board discovery path. `timed` itself never sees the
-/// chip-specific details.
+/// answers this single label and binding it through devmgr's per-board
+/// discovery path; clients reach it via the same `QUERY_RTC_DEVICE`
+/// name. `timed` itself never sees the chip-specific details.
 pub mod rtc_labels
 {
     /// Request the current wall-clock time.
     ///
     /// Wire format: empty body (no data words, no caps). Reply:
     /// `data[0]` is `u64` microseconds since the Unix epoch. Reply
-    /// label carries a status code in the lower 16 bits.
+    /// label carries a status code in the lower 16 bits. Caller's
+    /// token must carry [`READ_AUTHORITY`] (devmgr stamps it on every
+    /// SEND it mints from `QUERY_RTC_DEVICE`); the driver replies
+    /// [`rtc_errors::UNAUTHORIZED`] otherwise.
     pub const RTC_GET_EPOCH_TIME: u64 = 1;
+
+    /// Authority bit in the RTC-service-endpoint token's high u64 bit.
+    /// Set on caps devmgr mints in response to
+    /// [`devmgr_labels::QUERY_RTC_DEVICE`]; gates [`RTC_GET_EPOCH_TIME`].
+    /// A verb ("may read"), not an identity. Shares the same `1 << 63`
+    /// bit position as [`serial_labels::WRITE_AUTHORITY`] and
+    /// [`fb_labels::WRITE_AUTHORITY`]; unlike those two, the cmos /
+    /// goldfish-rtc drivers do enforce the bit at the service loop
+    /// (defence-in-depth alongside the upstream
+    /// [`REGISTRY_QUERY_AUTHORITY`](devmgr_labels::REGISTRY_QUERY_AUTHORITY)
+    /// gate at devmgr's `QUERY_RTC_DEVICE` handler).
+    pub const READ_AUTHORITY: u64 = 1u64 << 63;
 }
 
 /// Error replies from RTC chip drivers.
@@ -578,17 +613,24 @@ pub mod rtc_errors
     /// today — `RTC_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// Caller's token lacked [`rtc_labels::READ_AUTHORITY`]. Backstops
+    /// the upstream gate at [`devmgr_labels::QUERY_RTC_DEVICE`]: a
+    /// well-behaved client only ever sees this if a SEND cap leaked
+    /// without the verb bit (or a future verb-set partition refuses
+    /// reads with a more restrictive token).
+    pub const UNAUTHORIZED: u64 = 4;
 }
 
 pub const TIMED_LABELS_VERSION: u32 = 1;
 /// IPC labels for the wall-clock service (`services/timed`).
 ///
-/// `timed` is RTC-source-agnostic: it looks up `rtc.primary` once at
-/// startup, queries the driver via [`rtc_labels::RTC_GET_EPOCH_TIME`],
-/// computes a stable offset against the kernel's monotonic clock, and
-/// serves wall-clock queries from `offset + system_info(ElapsedUs)`. New
-/// RTC chip support never changes timed; only the `rtc.primary` driver
-/// changes per platform.
+/// `timed` is RTC-source-agnostic: it resolves the RTC SEND once at
+/// startup via [`devmgr_labels::QUERY_RTC_DEVICE`], queries the driver
+/// via [`rtc_labels::RTC_GET_EPOCH_TIME`], computes a stable offset
+/// against the kernel's monotonic clock, and serves wall-clock queries
+/// from `offset + system_info(ElapsedUs)`. New RTC chip support never
+/// changes timed; only the chip driver behind devmgr's lookup changes
+/// per platform.
 pub mod timed_labels
 {
     /// Request the current wall-clock time.
@@ -603,12 +645,12 @@ pub mod timed_labels
 pub mod timed_errors
 {
     pub const SUCCESS: u64 = 0;
-    /// No RTC driver was registered under `rtc.primary` at timed's
-    /// startup; the offset was never computed. Boards without an RTC
-    /// (some real RISC-V hardware) reach this state until an operator
-    /// or NTP path seeds the offset out-of-band. Out of scope for this
-    /// PR; documented to make the no-RTC path explicit at the wire
-    /// level rather than panicking.
+    /// No RTC was reachable through devmgr's [`devmgr_labels::QUERY_RTC_DEVICE`]
+    /// at timed's startup; the offset was never computed. Boards without
+    /// an RTC (some real RISC-V hardware) reach this state until an
+    /// operator or NTP path seeds the offset out-of-band. Out of scope
+    /// for this PR; documented to make the no-RTC path explicit at the
+    /// wire level rather than panicking.
     pub const WALL_CLOCK_UNAVAILABLE: u64 = 1;
     pub const UNKNOWN_OPCODE: u64 = 2;
     /// Reserved for a future per-message version handshake. Unused
@@ -895,7 +937,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 3;
+pub const DEVMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -937,6 +979,51 @@ pub mod devmgr_labels
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
     /// [`QUERY_SERIAL_DEVICE`].
     pub const QUERY_FRAMEBUFFER_DEVICE: u64 = 4;
+    /// Query for the platform real-time-clock device endpoint.
+    ///
+    /// Mints a `rtc_labels::READ_AUTHORITY`-tokened `SEND_GRANT` cap
+    /// on the RTC driver's service endpoint to the caller. Caller's
+    /// token must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
+    /// replies `UNAUTHORIZED` otherwise. Mirrors
+    /// [`QUERY_SERIAL_DEVICE`]. Today's sole consumer is `timed`,
+    /// which seeds its wall-clock offset from one
+    /// `RTC_GET_EPOCH_TIME` round-trip and serves `GET_WALL_TIME`
+    /// thereafter.
+    pub const QUERY_RTC_DEVICE: u64 = 5;
+    /// Init-only handshake: install the
+    /// `LOOKUP | READ`-attenuated `/services/drivers/` namespace cap from
+    /// which devmgr walks its on-disk driver binaries.
+    ///
+    /// Request: `data[0]` = caller's compiled
+    /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = tokened SEND on a
+    /// vfsd directory node rooted at the system's `/services/drivers/`
+    /// path, derived by init via
+    /// `ns_client::walk_to_dir(system_root_cap, …, LOOKUP | READ)`.
+    /// Caller's token MUST carry [`INIT_BIND_AUTHORITY`]; the handler
+    /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// Devmgr stashes the cap and replies
+    /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
+    /// work, so init never blocks on driver bring-up. The actual walk,
+    /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
+    /// bootstrap-round delivery for any on-disk driver (today: the
+    /// per-arch RTC; #165 will generalize) runs after the reply but
+    /// before devmgr returns to its next `ipc_recv`. The nested IPC
+    /// chain the spawn requires (procmgr → vfsd → block driver) cannot
+    /// run inside a request-handler frame without clobbering the
+    /// implicit reply context, so it must happen between `ipc_reply`
+    /// and the next `ipc_recv`. Clients querying `QUERY_RTC_DEVICE`
+    /// before the spawn completes block in the kernel's send queue
+    /// until devmgr returns to `ipc_recv`; once devmgr returns, those
+    /// queries see `rtc_ep != 0` (or the sticky-failure state) and
+    /// reply normally.
+    ///
+    /// The spawn is attempted at most once per boot. On failure
+    /// (missing binary, ELF corrupt, carve failure, OOM, etc.),
+    /// devmgr marks the driver permanently unavailable for this boot
+    /// and replies [`super::devmgr_errors::NO_DEVICE`] on subsequent
+    /// queries; clients MUST NOT retry-loop.
+    pub const SET_DRIVERS_DIR: u64 = 6;
 
     /// Authority bit in the devmgr-registry-endpoint token's high
     /// u64 bit. Set on caps minted for consumers permitted to call
@@ -945,6 +1032,13 @@ pub mod devmgr_labels
     /// virtio-blk closes the minter-side surface: `MOUNT_AUTHORITY`
     /// caps are never issued to consumers devmgr did not authorise.
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
+    /// Authority bit gating [`SET_DRIVERS_DIR`]. Set only on the cap
+    /// init derives for its own use from `devmgr_registry_ep`; the
+    /// `REGISTRY_QUERY_AUTHORITY`-only copy init publishes to svcmgr
+    /// (which other services then look up) lacks this bit, so no
+    /// service other than init can call `SET_DRIVERS_DIR`. Disjoint
+    /// position from [`REGISTRY_QUERY_AUTHORITY`].
+    pub const INIT_BIND_AUTHORITY: u64 = 1u64 << 62;
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
@@ -1385,6 +1479,16 @@ pub mod devmgr_errors
     /// caller's version as `data[0]`; mismatch here means the caller was
     /// built against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// Requested device class is permanently unavailable on this boot.
+    /// Returned by `QUERY_RTC_DEVICE` when devmgr either (a) has not
+    /// received [`super::devmgr_labels::SET_DRIVERS_DIR`] yet, or
+    /// (b) attempted the lazy disk-walked spawn and failed (missing
+    /// binary, ELF corrupt, hardware carve failed, OOM, etc.). The
+    /// answer is sticky for the boot: a single attempt is made and
+    /// further queries get the same `NO_DEVICE` reply. Clients (timed)
+    /// MUST treat this as terminal and fall through to their no-device
+    /// path; they MUST NOT retry-loop.
+    pub const NO_DEVICE: u64 = 4;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

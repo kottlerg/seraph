@@ -345,6 +345,11 @@ mod kind
 /// Per-cap class tag carried in a `kind::MODULE` round's data words so
 /// devmgr resolves a driver module by class rather than delivery position.
 /// Mirrors `devmgr/src/caps.rs::module_kind`.
+///
+/// Only bootstrap-essential drivers ship as bundle modules. The per-arch
+/// RTC binary lives on the rootfs disk and is loaded lazily by devmgr
+/// after init delivers a `/services/drivers/` subtree cap via
+/// `devmgr_labels::SET_DRIVERS_DIR`; no RTC `module_kind` is delivered.
 mod module_kind
 {
     pub const VIRTIO_BLK: u64 = 1;
@@ -591,11 +596,14 @@ pub fn create_devmgr_with_caps(
     //
     // Each delivered cap is tagged with its `module_kind` in the data
     // words so devmgr binds a module by class, not by delivery position.
+    // Only bootstrap-essential drivers are delivered; the per-arch RTC
+    // lives on the rootfs and is loaded by devmgr lazily after the
+    // `SET_DRIVERS_DIR` handshake (Phase 3, below).
     let serial_module = crate::find_module_by_name(info, b"serial");
     let framebuffer_module = crate::find_module_by_name(info, b"framebuffer");
     {
-        let mut module_caps = [0u32; 4];
-        let mut module_data = [0u64; 2 + 4];
+        let mut module_caps = [0u32; 3];
+        let mut module_data = [0u64; 2 + 3];
         module_data[0] = kind::MODULE;
         let mut n = 0usize;
 
@@ -671,9 +679,12 @@ pub fn create_devmgr_with_caps(
     // caps: [svcmgr_publish_cap, ioport_root_cap (x86 only)]. The
     // SEND-rights cap on svcmgr's service endpoint is stamped with the
     // PUBLISH_AUTHORITY verb-bit in its token so devmgr can register
-    // `rtc.primary` and `timed` in svcmgr's registry. The IoPortRange
-    // copy is delivered only on x86-64 (RISC-V has no I/O ports);
-    // devmgr derives narrow per-driver IoPort caps from it for ISA
+    // service caps in svcmgr's registry on init's behalf (today's only
+    // use is reserved for future devmgr publications; the active
+    // publications — `timed`, `rootfs.root`, `pwrmgr.*`, `svcmgr`,
+    // `devmgr.registry` — are init-issued). The IoPortRange copy is
+    // delivered only on x86-64 (RISC-V has no I/O ports); devmgr
+    // derives narrow per-driver IoPort caps from it for ISA
     // peripherals like the CMOS RTC.
     // SVCMGR_BUNDLE is unconditionally the terminal round. On any
     // preparation failure init MUST still emit a `done=true` round so
@@ -1312,7 +1323,6 @@ pub fn phase3_svcmgr_handover(
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
-    let _ = system_root_cap;
 
     // svcmgr's service endpoint is created in early init
     // (before bootstrap_procmgr) so procmgr can receive an un-tokened
@@ -1352,15 +1362,25 @@ pub fn phase3_svcmgr_handover(
         ipc_buf,
     );
 
-    // Wallclock chain: per-arch RTC driver + timed, both published in
-    // svcmgr. Failures are logged but do not abort phase 3 — svctest
-    // tolerates `SystemTime::now()` returning UNIX_EPOCH and exercises
-    // the live path only when the chain came up.
-    thread_caps.timed = bring_up_wallclock(
-        info,
+    // Hand devmgr a least-privilege `/services/drivers/` subtree cap so
+    // it can lazily walk + spawn its on-disk driver binaries (today: the
+    // per-arch RTC). Ack-only handshake; init does not block on driver
+    // work. Best-effort: a failure here means timed will see NO_DEVICE
+    // on its first QUERY_RTC_DEVICE and degrade to its no-RTC path; the
+    // rest of Phase 3 proceeds normally.
+    set_drivers_dir_on_devmgr(devmgr_registry_ep, system_root_cap, ipc_buf);
+
+    // Wallclock chain: timed (init-spawned, svcmgr-published) consumes
+    // devmgr's QUERY_RTC_DEVICE for the per-arch RTC driver, which devmgr
+    // loads lazily from disk after the SET_DRIVERS_DIR handshake above.
+    // Failures are logged but do not abort phase 3 — svctest tolerates
+    // `SystemTime::now()` returning UNIX_EPOCH and exercises the live
+    // path only when the chain came up.
+    thread_caps.timed = bring_up_timed(
         procmgr_ep,
         bootstrap_ep,
         svcmgr_service_ep,
+        devmgr_registry_ep,
         system_root_cap,
         init_self_cspace,
         ipc_buf,
@@ -1879,57 +1899,9 @@ fn svcmgr_publish(publish_cap: u32, name: &[u8], send_cap: u32, ipc_buf: *mut u6
     matches!(reply, Ok(r) if r.label == ipc::svcmgr_errors::SUCCESS)
 }
 
-/// Carve a narrow `IoPortRange` cap covering `[base, base + count)` from
-/// init's root `IoPortRange` via two `ioport_split` calls. Returns the
-/// narrow slot; the unused upper/lower slabs are deleted.
-///
-/// `cap_derive`-copies the root so the original stays intact; subsequent
-/// callers (devmgr's bundle, logd's serial-port carve) keep working.
-#[cfg(target_arch = "x86_64")]
-fn ioport_carve(root_cap: u32, base: u16, count: u16) -> Option<u32>
-{
-    let working = syscall::cap_derive(root_cap, syscall::RIGHTS_ALL).ok()?;
-    let upper_split_at = base.checked_add(count)?;
-    let Ok((lower_unused, upper)) = syscall::ioport_split(working, base)
-    else
-    {
-        let _ = syscall::cap_delete(working);
-        return None;
-    };
-    let _ = syscall::cap_delete(lower_unused);
-    let Ok((narrow, upper_unused)) = syscall::ioport_split(upper, upper_split_at)
-    else
-    {
-        let _ = syscall::cap_delete(upper);
-        return None;
-    };
-    let _ = syscall::cap_delete(upper_unused);
-    Some(narrow)
-}
-
-/// Find the `MmioRegion` aperture whose `[base, base+size)` range
-/// contains `target_base`, returning a freshly-derived copy of its cap.
-/// Used on RISC-V to hand the Goldfish RTC driver an `MmioRegion` cap
-/// for the QEMU `virt` page at 0x101000 (seeded as an aperture by
-/// `core/boot/src/arch/riscv64/mod.rs::default_pci_apertures`).
-#[cfg(target_arch = "riscv64")]
-fn find_aperture_copy(info: &InitInfo, target_base: u64) -> Option<u32>
-{
-    for d in crate::descriptors(info)
-    {
-        if d.cap_type == CapType::MmioRegion
-            && d.aux0 <= target_base
-            && target_base < d.aux0.saturating_add(d.aux1)
-        {
-            return syscall::cap_derive(d.slot, syscall::RIGHTS_ALL).ok();
-        }
-    }
-    None
-}
-
-/// Common service-endpoint + RECV-derivation setup for an RTC/timed
-/// spawn. Init keeps the source slot to mint per-publish SENDs; the
-/// child receives a RECV-rights derivation.
+/// Common service-endpoint + RECV-derivation setup for a timed spawn.
+/// Init keeps the source slot to mint per-publish SENDs; the child
+/// receives a RECV-rights derivation.
 fn create_service_endpoint_pair() -> Option<(u32, u32)>
 {
     let source = syscall::cap_create_endpoint(crate::endpoint_slab()).ok()?;
@@ -1948,9 +1920,8 @@ fn create_service_endpoint_pair() -> Option<(u32, u32)>
 /// `destroy_partial_child` on any subsequent failure.
 ///
 /// `policy` and `cwd` are forwarded to `configure_child_namespace`.
-/// The driver/service helpers that use this path (rtc driver, timed)
-/// pass `NsPolicy::None` because neither touches the filesystem after
-/// `_start`.
+/// Service helpers that use this path (e.g. timed) pass `NsPolicy::None`
+/// because they do not touch the filesystem after `_start`.
 #[allow(clippy::too_many_arguments)]
 fn walk_and_create_from_file(
     path: &[u8],
@@ -1998,126 +1969,6 @@ fn walk_and_create_from_file(
     Some((process_handle, thread_cap, child_token))
 }
 
-/// Spawn the per-arch RTC chip driver from `/services/drivers/<name>`. Returns the
-/// init-owned service-endpoint source cap on success — init derives a
-/// fresh SEND from it for the `rtc.primary` publish and the source
-/// stays in init's `CSpace` for the rest of phase 3.
-pub fn create_and_start_rtc_driver(
-    info: &InitInfo,
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    ipc_buf: *mut u64,
-) -> Option<u32>
-{
-    // Create the service-endpoint pair first so that a hw_cap allocation
-    // doesn't strand if the endpoint create fails — strict construction
-    // order is endpoint, then hw_cap, then walk+CREATE.
-    let (svc_source, svc_recv) = create_service_endpoint_pair()?;
-
-    #[cfg(target_arch = "x86_64")]
-    let (binary_path, hw_cap) = {
-        let path: &[u8] = b"/services/drivers/cmos-rtc";
-        let Some(root) = crate::find_cap_by_type(info, CapType::IoPortRange)
-        else
-        {
-            let _ = syscall::cap_delete(svc_recv);
-            let _ = syscall::cap_delete(svc_source);
-            return None;
-        };
-        let Some(narrow) = ioport_carve(root, 0x70, 2)
-        else
-        {
-            let _ = syscall::cap_delete(svc_recv);
-            let _ = syscall::cap_delete(svc_source);
-            return None;
-        };
-        (path, narrow)
-    };
-    #[cfg(target_arch = "riscv64")]
-    let (binary_path, hw_cap) = {
-        let path: &[u8] = b"/services/drivers/goldfish-rtc";
-        let Some(mmio) = find_aperture_copy(info, 0x0010_1000)
-        else
-        {
-            let _ = syscall::cap_delete(svc_recv);
-            let _ = syscall::cap_delete(svc_source);
-            return None;
-        };
-        (path, mmio)
-    };
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
-    let (binary_path, hw_cap) = {
-        let _ = info;
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        return None;
-    };
-
-    // RTC driver owns its arch-specific hardware authority cap
-    // (IoPortRange on x86-64, MmioRegion on RISC-V) and serves a
-    // single read-only IPC. No filesystem access. devmgr supervises
-    // hardware drivers; the rtc driver's thread cap is not threaded
-    // to svcmgr — drop it here.
-    let Some((process_handle, thread_cap, child_token)) = walk_and_create_from_file(
-        binary_path,
-        procmgr_ep,
-        bootstrap_ep,
-        system_root_cap,
-        init_self_cspace,
-        NsPolicy::None,
-        None,
-        ipc_buf,
-    )
-    else
-    {
-        let _ = syscall::cap_delete(hw_cap);
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        log("rtc: walk + CREATE_FROM_FILE failed");
-        return None;
-    };
-    let _ = syscall::cap_delete(thread_cap);
-
-    if !start_process(
-        process_handle,
-        ipc_buf,
-        "phase 3: rtc driver started; serving bootstrap",
-        "phase 3: rtc driver START_PROCESS failed",
-    )
-    {
-        let _ = syscall::cap_delete(hw_cap);
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        destroy_partial_child(process_handle, ipc_buf);
-        return None;
-    }
-
-    if !serve(
-        bootstrap_ep,
-        child_token,
-        ipc_buf,
-        true,
-        &[svc_recv, hw_cap],
-        &[],
-        "rtc: bootstrap round failed",
-    )
-    {
-        // serve_round MOVES the caps on success; on failure they may or
-        // may not have been consumed. Best-effort delete on every cap
-        // is safe (delete of an already-transferred slot is a no-op).
-        // The child has been started — we cannot destroy it safely from
-        // here; it will exit on the receive-side failure and be reaped.
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(hw_cap);
-        let _ = syscall::cap_delete(svc_source);
-        return None;
-    }
-
-    Some(svc_source)
-}
-
 /// Spawn `/services/timed` and serve its single bootstrap round. Returns
 /// the init-owned service-endpoint source cap; init derives a SEND
 /// from it for the `timed` publish.
@@ -2136,6 +1987,7 @@ pub struct TimedSpawn
 pub fn create_and_start_timed(
     procmgr_ep: u32,
     bootstrap_ep: u32,
+    devmgr_registry_ep: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
     ipc_buf: *mut u64,
@@ -2143,8 +1995,22 @@ pub fn create_and_start_timed(
 {
     let (svc_source, svc_recv) = create_service_endpoint_pair()?;
 
-    // timed queries the svcmgr registry for `rtc.primary` then
-    // serves GET_WALL_TIME. No filesystem access.
+    // timed resolves the RTC via devmgr's QUERY_RTC_DEVICE on a
+    // REGISTRY_QUERY_AUTHORITY-tokened SEND copy of devmgr's registry
+    // endpoint, then serves GET_WALL_TIME. No filesystem access.
+    let Ok(devmgr_registry_copy) = syscall::cap_derive_token(
+        devmgr_registry_ep,
+        syscall::RIGHTS_SEND,
+        ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+    )
+    else
+    {
+        let _ = syscall::cap_delete(svc_recv);
+        let _ = syscall::cap_delete(svc_source);
+        log("timed: devmgr registry token derive failed");
+        return None;
+    };
+
     let Some((process_handle, thread_cap, child_token)) = walk_and_create_from_file(
         b"/services/timed",
         procmgr_ep,
@@ -2157,6 +2023,7 @@ pub fn create_and_start_timed(
     )
     else
     {
+        let _ = syscall::cap_delete(devmgr_registry_copy);
         let _ = syscall::cap_delete(svc_recv);
         let _ = syscall::cap_delete(svc_source);
         log("timed: walk + CREATE_FROM_FILE failed");
@@ -2170,6 +2037,7 @@ pub fn create_and_start_timed(
         "phase 3: timed START_PROCESS failed",
     )
     {
+        let _ = syscall::cap_delete(devmgr_registry_copy);
         let _ = syscall::cap_delete(svc_recv);
         let _ = syscall::cap_delete(svc_source);
         let _ = syscall::cap_delete(thread_cap);
@@ -2182,15 +2050,16 @@ pub fn create_and_start_timed(
         child_token,
         ipc_buf,
         true,
-        &[svc_recv],
+        &[svc_recv, devmgr_registry_copy],
         &[],
         "timed: bootstrap round failed",
     )
     {
-        // Best-effort delete: serve_round may have transferred svc_recv
-        // before failing. Child has been started; cannot destroy safely.
-        // It will exit on the receive-side failure and procmgr will reap.
+        // Best-effort delete: serve_round may have transferred caps before
+        // failing. Child has been started; cannot destroy safely. It will
+        // exit on the receive-side failure and procmgr will reap.
         let _ = syscall::cap_delete(svc_recv);
+        let _ = syscall::cap_delete(devmgr_registry_copy);
         let _ = syscall::cap_delete(svc_source);
         let _ = syscall::cap_delete(thread_cap);
         return None;
@@ -2202,18 +2071,116 @@ pub fn create_and_start_timed(
     })
 }
 
-/// Phase 3 sub-step: bring up the wall-clock chain. Spawns the per-arch
-/// RTC chip driver, publishes it as `rtc.primary`, spawns timed,
-/// publishes it as `timed`. Init's PUBLISH_AUTHORITY-tokened cap is
-/// derived from `svcmgr_service_ep` (the un-tokened source init
-/// already owns). All failures are logged; the function never aborts
-/// phase 3 — a degraded wall-clock leaves `SystemTime::now()`
-/// returning `UNIX_EPOCH` but the rest of svctest still runs.
-pub fn bring_up_wallclock(
-    info: &InitInfo,
+/// Phase 3 sub-step: hand devmgr a least-privilege
+/// `/services/drivers/` subtree cap so it can lazily walk + spawn
+/// on-disk driver binaries (today: the per-arch RTC).
+///
+/// Walks `system_root_cap` to `/services/drivers/` at `LOOKUP | READ`
+/// rights, then sends `devmgr_labels::SET_DRIVERS_DIR` on a fresh
+/// `INIT_BIND_AUTHORITY`-tokened copy of `devmgr_registry_ep` (only
+/// init holds this verb bit; the `REGISTRY_QUERY_AUTHORITY`-only copy
+/// published to svcmgr cannot send this label).
+///
+/// devmgr's handler is ack-only: it stashes the cap and replies
+/// SUCCESS immediately. No driver walk or spawn happens in the
+/// handshake's blocking window — those fire lazily on the first
+/// `QUERY_RTC_DEVICE`. Init is not in the critical path of any
+/// driver spawn.
+///
+/// Best-effort: any failure (walk fails, devmgr replies a non-SUCCESS
+/// code, transport error) is logged and Phase 3 continues. The
+/// system boots without a wallclock; timed sees `NO_DEVICE` and
+/// degrades to its no-RTC path.
+fn set_drivers_dir_on_devmgr(devmgr_registry_ep: u32, system_root_cap: u32, ipc_buf: *mut u64)
+{
+    if devmgr_registry_ep == 0 || system_root_cap == 0
+    {
+        log("phase 3: SET_DRIVERS_DIR skipped (no devmgr or no system root)");
+        return;
+    }
+
+    // Attenuated rights: only what devmgr needs to walk into a
+    // subdirectory and read file contents. Visibility-gating bits are
+    // intentionally omitted; the namespace server intersects per hop.
+    let rights = u64::from(namespace_protocol::rights::LOOKUP | namespace_protocol::rights::READ);
+    let Some(drivers_dir) =
+        walk::walk_to_dir(system_root_cap, b"/services/drivers", rights, ipc_buf)
+    else
+    {
+        log("phase 3: SET_DRIVERS_DIR walk to /services/drivers failed; RTC unavailable");
+        return;
+    };
+
+    // `ipc::ipc_call` requires SEND+GRANT on the endpoint cap when the
+    // message carries caps (`drivers_dir` here); use
+    // `RIGHTS_SEND_GRANT`. The `devmgr.registry` cap init publishes for
+    // other services to look up deliberately omits the GRANT bit so
+    // client callers cannot transfer caps in queries; init's own
+    // privileged copy includes it for this single transfer.
+    let Ok(init_bind_ep) = syscall::cap_derive_token(
+        devmgr_registry_ep,
+        syscall::RIGHTS_SEND_GRANT,
+        ipc::devmgr_labels::INIT_BIND_AUTHORITY,
+    )
+    else
+    {
+        log("phase 3: SET_DRIVERS_DIR INIT_BIND_AUTHORITY derive failed; RTC unavailable");
+        let _ = syscall::cap_delete(drivers_dir);
+        return;
+    };
+
+    let msg = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .cap(drivers_dir)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let result = unsafe { ipc::ipc_call(init_bind_ep, &msg, ipc_buf) };
+    let _ = syscall::cap_delete(init_bind_ep);
+
+    match result
+    {
+        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS =>
+        {
+            // Kernel transferred `drivers_dir` to devmgr; nothing
+            // for init to clean up.
+            log("phase 3: SET_DRIVERS_DIR handshake ok");
+        }
+        Ok(_reply) =>
+        {
+            // Devmgr replied an error after the kernel transferred
+            // the cap. Per the SET_DRIVERS_DIR contract, devmgr's
+            // error paths release the delivered cap themselves.
+            log("phase 3: SET_DRIVERS_DIR rejected; RTC unavailable");
+        }
+        Err(_) =>
+        {
+            // ipc_call returned before the kernel committed the
+            // transfer; the source slot still owns `drivers_dir`
+            // and must be released.
+            let _ = syscall::cap_delete(drivers_dir);
+            log("phase 3: SET_DRIVERS_DIR ipc_call error; RTC unavailable");
+        }
+    }
+}
+
+/// Phase 3 sub-step: spawn timed and publish it as `timed`. The RTC
+/// driver itself is loaded by devmgr from the on-disk rootfs inside
+/// the [`set_drivers_dir_on_devmgr`] handshake (above), between
+/// devmgr's `ipc_reply` and its next `ipc_recv`; by the time `timed`
+/// queries [`ipc::devmgr_labels::QUERY_RTC_DEVICE`] against the
+/// `REGISTRY_QUERY_AUTHORITY`-tokened copy of `devmgr_registry_ep`
+/// delivered in its bootstrap round, devmgr already holds `rtc_ep`
+/// (or the sticky-failure state and replies `NO_DEVICE`). Init's
+/// PUBLISH_AUTHORITY-tokened cap is derived from `svcmgr_service_ep`
+/// (the un-tokened source init already owns). All failures are
+/// logged; the function never aborts phase 3 — a degraded wall-clock
+/// leaves `SystemTime::now()` returning `UNIX_EPOCH` but the rest of
+/// svctest still runs.
+pub fn bring_up_timed(
     procmgr_ep: u32,
     bootstrap_ep: u32,
     svcmgr_service_ep: u32,
+    devmgr_registry_ep: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
     ipc_buf: *mut u64,
@@ -2229,43 +2196,14 @@ pub fn bring_up_wallclock(
     )
     else
     {
-        log("phase 3: wallclock PUBLISH_AUTHORITY derive failed");
+        log("phase 3: timed PUBLISH_AUTHORITY derive failed");
         return None;
     };
-
-    let Some(rtc_source) = create_and_start_rtc_driver(
-        info,
-        procmgr_ep,
-        bootstrap_ep,
-        system_root_cap,
-        init_self_cspace,
-        ipc_buf,
-    )
-    else
-    {
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    };
-
-    let Ok(rtc_publish_send) = syscall::cap_derive(rtc_source, syscall::RIGHTS_SEND)
-    else
-    {
-        log("phase 3: rtc publish SEND derive failed");
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    };
-    if !svcmgr_publish(publish_cap, b"rtc.primary", rtc_publish_send, ipc_buf)
-    {
-        log("phase 3: rtc.primary publish failed");
-        let _ = syscall::cap_delete(rtc_publish_send);
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    }
-    log("phase 3: rtc.primary published");
 
     let Some(timed_spawn) = create_and_start_timed(
         procmgr_ep,
         bootstrap_ep,
+        devmgr_registry_ep,
         system_root_cap,
         init_self_cspace,
         ipc_buf,

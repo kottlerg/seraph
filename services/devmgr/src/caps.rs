@@ -96,6 +96,13 @@ pub mod kind
 /// Per-cap class tag carried alongside each `kind::MODULE` round cap, so
 /// devmgr resolves a driver module by class rather than by delivery
 /// position. Mirrors `init/src/service.rs::module_kind`.
+///
+/// Only bootstrap-essential drivers ship as bundle modules — those
+/// needed to read anything off the disk in the first place (virtio-blk,
+/// fatfs) plus the pre-vfsd console pair (serial, framebuffer). The
+/// per-arch RTC driver lives on the rootfs disk and is loaded lazily by
+/// devmgr through its `SET_DRIVERS_DIR` subtree cap; no `RTC` module is
+/// delivered.
 pub mod module_kind
 {
     pub const VIRTIO_BLK: u64 = 1;
@@ -143,13 +150,14 @@ pub struct DevmgrCaps
     pub driver_module_count: usize,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
-    // tokened on. devmgr uses this to publish driver service caps under
-    // well-known names (`rtc.primary`, `timed`) in the global registry.
+    // tokened on. Reserved for devmgr-initiated publications; the active
+    // svcmgr publications (`timed`, `rootfs.root`, `pwrmgr.*`, `svcmgr`,
+    // `devmgr.registry`) are init-issued.
     pub svcmgr_publish_cap: u32,
 
     // Copy of init's root `IoPortRange` cap (x86-64 only; zero on RISC-V).
     // devmgr derives per-driver narrow copies for ISA peripherals
-    // (currently only the CMOS RTC at ports 0x70-0x71).
+    // (CMOS RTC at ports 0x70-0x71; COM1 at 0x3F8-0x3FF for serial).
     pub ioport_root_cap: u32,
 
     /// Bootloader-discovered framebuffer geometry, or `None` when no

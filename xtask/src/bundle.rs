@@ -66,9 +66,22 @@ impl Harness
 /// Each entry is `(bundle_entry_name, sysroot_relative_source_path)`;
 /// the bundle-entry name is what init matches against, while the source
 /// path follows each binary's `InstallDest` (drivers under
-/// `services/drivers/`, fs drivers under `services/fs/`). Kept in the
-/// historic ordinal order to keep the disk image byte-stable across
-/// builds.
+/// `services/drivers/`, fs drivers under `services/fs/`).
+///
+/// Only **bootstrap-essential** binaries belong here — things needed to
+/// read anything off the disk in the first place (`vfsd`, the block
+/// driver, the fs driver) and things needed before vfsd is up
+/// (`serial` + `framebuffer` for pre-vfsd console output, `memmgr` /
+/// `procmgr` / `devmgr` to even bring up userspace). Non-essential
+/// drivers live on the rootfs and are loaded by their managing service
+/// after vfsd-mount — the per-arch RTC, for example, is loaded by
+/// devmgr through its `SET_DRIVERS_DIR` subtree cap; growing the bundle
+/// with non-essentials directly wastes permanently-leaked
+/// post-`ExitBootServices` UEFI allocation
+/// (see `core/boot/src/main.rs:1076-1091`).
+///
+/// All entries are mandatory; a missing source binary hard-errors.
+/// Order is preserved across builds to keep the disk-image byte-stable.
 const MODULES: &[(&str, &str)] = &[
     ("procmgr", "services/procmgr"),
     ("devmgr", "services/devmgr"),

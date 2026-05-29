@@ -18,7 +18,7 @@ init/
 └── src/
     ├── main.rs                 # _start, run() orchestration across the three stages
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup
-    ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr, logd, RTC, timed, pwrmgr) and phase3_svcmgr_handover
+    ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr, logd, timed, pwrmgr) and phase3_svcmgr_handover
     ├── mount.rs                # Root MOUNT exchange + GET_SYSTEM_ROOT_CAP pull
     ├── logging.rs              # init-logd thread (serves the log endpoint until real-logd takes over)
     ├── walk.rs                 # /services/<name> path walker over the seed system-root cap
@@ -42,9 +42,11 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    the role to the arch-specific Seraph root GPT type-GUID), pull the seed
    `system_root_cap` via `GET_SYSTEM_ROOT_CAP`, then launch real-logd from
    `/services/logd` and hand off the master log endpoint via `HANDOVER_PULL`.
-3. **Handover** — spawn svcmgr, RTC + timed, and pwrmgr; publish the
+3. **Handover** — spawn svcmgr, timed, and pwrmgr (the per-arch RTC
+   chip driver is devmgr-spawned during devmgr's enumeration sweep
+   and resolved by timed via `QUERY_RTC_DEVICE`); publish the
    well-known caps (`rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`,
-   `svcmgr`); register every init-bootstrapped service with svcmgr via
+   `svcmgr`, `timed`); register every init-bootstrapped service with svcmgr via
    `REGISTER_SERVICE`; signal `HANDOVER_COMPLETE`; hand init's own
    kernel objects + reclaimable Frame caps to procmgr via
    `REGISTER_INIT_TEARDOWN`; call `sys_thread_exit`. Procmgr's death-EQ

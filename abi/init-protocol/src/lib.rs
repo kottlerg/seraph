@@ -53,7 +53,15 @@
 ///     for the framebuffer dies with UEFI `ExitBootServices`; the kernel
 ///     forwards what the bootloader captured so devmgr can spawn the
 ///     userspace framebuffer driver (`services/drivers/framebuffer/`).
-pub const INIT_PROTOCOL_VERSION: u32 = 8;
+/// v9: Raised [`INIT_MAX_NAMED_MODULES`] from 8 to 12 — pure headroom for
+///     near-roadmap bundle modules without further re-bumps. The current
+///     bootstrap-essential set fits in 8 (#164 deliberately keeps the
+///     per-arch RTC drivers off the bundle and on the rootfs); the
+///     headroom accommodates upcoming non-RTC additions such as the
+///     keyboard driver. Pure constant bump; the
+///     [`InitInfo::module_names`] array grows in size but the field
+///     layout is otherwise unchanged.
+pub const INIT_PROTOCOL_VERSION: u32 = 9;
 
 /// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
@@ -62,9 +70,11 @@ pub const INIT_MODULE_NAME_LEN: usize = 32;
 
 /// Maximum number of named boot-module entries the kernel can publish in
 /// [`InitInfo::module_names`]. Sized to comfortably cover the current
-/// `procmgr, devmgr, memmgr, vfsd, virtio-blk, fatfs` set plus future
-/// modules before the table fills.
-pub const INIT_MAX_NAMED_MODULES: usize = 8;
+/// `procmgr, devmgr, memmgr, vfsd, virtio-blk, serial, framebuffer,
+/// fatfs` bootstrap-essential set plus future modules (e.g. keyboard)
+/// before the table fills. Non-bootstrap drivers (the per-arch RTC)
+/// live on the rootfs and do not consume slots here.
+pub const INIT_MAX_NAMED_MODULES: usize = 12;
 
 // ── Address space constants ──────────────────────────────────────────────────
 

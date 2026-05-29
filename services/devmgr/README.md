@@ -43,19 +43,39 @@ responsibilities are:
   [`drivers/`](../drivers/README.md), request procmgr to create driver
   processes, and delegate per-device capabilities (MMIO, interrupt, and
   IoPortRange where applicable). PCI devices spawn through the
-  BAR/IRQ-shaped path; fixed-location platform devices (e.g. the serial
-  UART) spawn through a simpler path that delivers a service endpoint and
-  one arch authority cap (`IoPortRange` for COM1, `MmioRegion` for an
-  NS16550). Drivers that need physical-base addresses for device DMA
+  BAR/IRQ-shaped path; fixed-location platform devices (the serial
+  UART, the platform RTC chip — `cmos-rtc` on x86-64, `goldfish-rtc`
+  on RISC-V) spawn through a simpler path that delivers a service
+  endpoint and one arch authority cap (`IoPortRange` for COM1 and
+  CMOS, `MmioRegion` for an NS16550 or the goldfish RTC at `0x101000`).
+  Drivers that need physical-base addresses for device DMA
   programming obtain them from memmgr's `REQUEST_FRAMES` reply alongside
   the Frame caps; DMA isolation, when established, is programmed by devmgr
   through IOMMU hardware it acquires via the `MmioRegion` cap flow.
+
+  Driver binaries are sourced from one of two places:
+
+  - **Boot bundle** — bootstrap-essentials (virtio-blk, serial,
+    framebuffer) arrive as `procmgr_labels::CREATE_PROCESS`-ready Frame
+    caps in devmgr's MODULE bootstrap round. devmgr spawns these
+    during initial enumeration, before the registry loop opens.
+  - **On-disk rootfs** — non-essential drivers (today: the per-arch
+    RTC) live at `/services/drivers/<chip>` and are loaded via
+    `procmgr_labels::CREATE_FROM_FILE`. Init delivers a
+    `LOOKUP | READ`-attenuated `/services/drivers/` subtree cap via
+    `devmgr_labels::SET_DRIVERS_DIR` post-vfsd-mount; devmgr replies
+    SUCCESS immediately (so init never blocks on driver work), then
+    walks the per-arch driver name and spawns the driver between
+    `ipc_reply` and the next `ipc_recv`. At-most-once per boot; failure
+    is sticky and surfaced as `devmgr_errors::NO_DEVICE` on subsequent
+    queries.
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
   the block device (`QUERY_BLOCK_DEVICE`), logd resolves the serial driver
   (`QUERY_SERIAL_DEVICE`), `programs/fb-charset` resolves the framebuffer
-  driver (`QUERY_FRAMEBUFFER_DEVICE`), and netd in due course. devmgr owns
-  each driver's service endpoint and mints a tokened SEND on query.
+  driver (`QUERY_FRAMEBUFFER_DEVICE`), timed resolves the platform RTC
+  (`QUERY_RTC_DEVICE`), and netd in due course. devmgr owns each driver's
+  service endpoint and mints a tokened SEND on query.
 - **Handle hotplug** — on platforms that support it, receive hotplug
   notifications and dynamically spawn or terminate driver processes. See
   [`docs/hotplug.md`](docs/hotplug.md).

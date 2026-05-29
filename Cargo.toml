@@ -34,6 +34,7 @@ members = [
     "shared/syscall",
     "shared/ipc",
     "shared/log",
+    "shared/ns-client",
     "shared/registry",
     "shared/registry-client",
     "shared/shmem",

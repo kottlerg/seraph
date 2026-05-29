@@ -264,6 +264,8 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "ipc",
+ "namespace-protocol",
+ "ns-client",
  "syscall",
  "syscall-abi",
  "virtio-core",
@@ -494,6 +496,7 @@ dependencies = [
  "init-protocol",
  "ipc",
  "namespace-protocol",
+ "ns-client",
  "process-abi",
  "syscall",
  "syscall-abi",
@@ -635,6 +638,14 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "ns-client"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "syscall",
 ]
 
 [[package]]

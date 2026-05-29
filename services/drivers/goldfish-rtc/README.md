@@ -9,9 +9,15 @@ fixed physical address `0x101000`. It returns wall-clock time as a
 64-bit nanosecond count since the Unix epoch in two 32-bit MMIO
 register reads.
 
-Spawned by devmgr on RISC-V QEMU virt; registered with svcmgr under
-the well-known name `rtc.primary`. The `timed` service queries this
-driver once at startup to seed its wall-clock offset.
+Installed to `/services/drivers/goldfish-rtc` on the rootfs. Spawned
+by devmgr on RISC-V QEMU virt via the non-PCI simple-device path,
+`procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
+walks to from the `/services/drivers/` subtree cap init delivers
+post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`. devmgr owns the
+driver's service endpoint and mints client SEND caps on
+`devmgr_labels::QUERY_RTC_DEVICE`, each tokened with
+`rtc_labels::READ_AUTHORITY`. The `timed` service resolves the SEND
+once at startup to seed its wall-clock offset.
 
 ---
 
@@ -44,7 +50,10 @@ The driver reserves one page of VA via `reserve_pages` and maps the
 ## IPC Interface
 
 * **`rtc_labels::RTC_GET_EPOCH_TIME`** — no payload. The driver
-  re-reads the device on every request. Reply: reply label is a
+  re-reads the device on every request. Caller's token must carry
+  `rtc_labels::READ_AUTHORITY` (devmgr stamps it on every SEND minted
+  from `QUERY_RTC_DEVICE`); the driver replies
+  `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a
   [`rtc_errors`](../../../shared/ipc/src/lib.rs) status code; on
   `SUCCESS`, `data[0]` is `u64` microseconds since the Unix epoch.
 

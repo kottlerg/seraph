@@ -111,9 +111,11 @@ mechanism — but procmgr is the chooser from that point forward (see
 ### Init → remaining services
 
 Init requests procmgr to start the remaining boot-time services in
-order — devmgr, vfsd, optionally netd, then svcmgr, the per-arch
-RTC driver, timed, and pwrmgr — by IPC to procmgr's
-`CREATE_FROM_FILE` / `CREATE_PROCESS` endpoints. For each service,
+order — devmgr, vfsd, optionally netd, then svcmgr, timed, and
+pwrmgr — by IPC to procmgr's `CREATE_FROM_FILE` / `CREATE_PROCESS`
+endpoints. The per-arch RTC chip driver is not in this list: devmgr
+spawns it during its enumeration sweep, and timed resolves it via
+`devmgr_labels::QUERY_RTC_DEVICE` at startup. For each service,
 init delegates the appropriate capability subset (see
 [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution"). svcmgr is configured with the universal

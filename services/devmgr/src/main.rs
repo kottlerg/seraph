@@ -159,6 +159,22 @@ fn main() -> !
         std::os::seraph::log!("devmgr: framebuffer driver spawned");
     }
 
+    // On-disk driver state. The RTC binary lives on the rootfs at
+    // `/services/drivers/<chip>`, not in the boot bundle — RTC is not
+    // bootstrap-essential. Init delivers a `LOOKUP | READ`-attenuated
+    // `/services/drivers/` subtree cap via `SET_DRIVERS_DIR` post-vfsd;
+    // the walk + `CREATE_FROM_FILE` + bootstrap rounds run inside the
+    // `SET_DRIVERS_DIR` handler, after its `ipc_reply` and before the
+    // next `ipc_recv` (a nested ipc_call inside a request-handler
+    // frame would clobber the implicit reply context, so the spawn
+    // must happen between reply and recv). `rtc_spawn_attempted` is
+    // sticky: a single attempt per boot, with `NO_DEVICE` returned
+    // thereafter on failure so timed degrades gracefully to its
+    // no-RTC path.
+    let mut drivers_dir_cap: u32 = 0;
+    let mut rtc_ep: u32 = 0;
+    let mut rtc_spawn_attempted: bool = false;
+
     if caps.registry_ep == 0
     {
         std::os::seraph::log!("no registry endpoint injected, halting");
@@ -326,6 +342,139 @@ fn main() -> !
                 else
                 {
                     let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+            }
+            ipc::devmgr_labels::SET_DRIVERS_DIR =>
+            {
+                // Init-only handshake. Reply SUCCESS *first* so init
+                // unblocks immediately and is never in the critical
+                // path of driver work. THEN do the walk + spawn between
+                // ipc_reply and the next ipc_recv: a nested ipc_call
+                // (CREATE_FROM_FILE → procmgr → vfsd → virtio-blk → fs)
+                // inside a request handler would clobber the implicit
+                // reply context that ipc_reply needs, so all such work
+                // must happen after the reply has been sent.
+                let mut should_attempt_spawn = false;
+                // Capability hygiene: every gate-fail arm below must
+                // release any cap the kernel transferred into devmgr's
+                // CSpace before replying. Even though today only init
+                // can plausibly send this label, leaving an authority
+                // cap dangling in a server's slot is a category of bug
+                // the rest of the codebase consistently avoids.
+                let delivered_cap = msg.caps().first().copied();
+                if token & ipc::devmgr_labels::INIT_BIND_AUTHORITY == 0
+                {
+                    std::os::seraph::log!(
+                        "SET_DRIVERS_DIR rejected: token lacks INIT_BIND_AUTHORITY"
+                    );
+                    if let Some(c) = delivered_cap
+                    {
+                        let _ = syscall::cap_delete(c);
+                    }
+                    let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    if let Some(c) = delivered_cap
+                    {
+                        let _ = syscall::cap_delete(c);
+                    }
+                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if let Some(&new_cap) = msg.caps().first()
+                {
+                    if drivers_dir_cap != 0
+                    {
+                        // Idempotent re-send: keep the original, drop the new.
+                        let _ = syscall::cap_delete(new_cap);
+                    }
+                    else
+                    {
+                        drivers_dir_cap = new_cap;
+                        std::os::seraph::log!("devmgr: SET_DRIVERS_DIR cap installed");
+                        should_attempt_spawn = !rtc_spawn_attempted;
+                    }
+                    let reply = IpcMessage::new(ipc::devmgr_errors::SUCCESS);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+
+                // After reply: do the at-most-once spawn. Failure is
+                // sticky (`rtc_spawn_attempted`) so subsequent
+                // SET_DRIVERS_DIR re-sends (idempotent path above) do
+                // not retry. Subsequent QUERY_RTC_DEVICE arms just
+                // mint from `rtc_ep` (or reply NO_DEVICE).
+                if should_attempt_spawn
+                {
+                    rtc_spawn_attempted = true;
+                    if let Some(new_ep) = spawn_rtc_from_disk(&mut caps, drivers_dir_cap, ipc_buf)
+                    {
+                        rtc_ep = new_ep;
+                    }
+                }
+            }
+            ipc::devmgr_labels::QUERY_RTC_DEVICE =>
+            {
+                // Like QUERY_SERIAL_DEVICE: do not `seraph::log!` here.
+                // timed is the synchronous caller and a log inside this
+                // handler can deadlock if logd ever fans through devmgr.
+                //
+                // No nested IPC, no spawn: the RTC was spawned by the
+                // SET_DRIVERS_DIR handler. If `rtc_ep == 0` here, the
+                // spawn either has not happened yet (handshake not
+                // received) or failed permanently for this boot —
+                // reply NO_DEVICE either way and the client (timed)
+                // degrades to its no-RTC path.
+                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+                {
+                    let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the registered IPC buffer.
+                    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                }
+                else if rtc_ep != 0
+                {
+                    if let Ok(derived) = syscall::cap_derive_token(
+                        rtc_ep,
+                        syscall::RIGHTS_SEND_GRANT,
+                        ipc::rtc_labels::READ_AUTHORITY,
+                    )
+                    {
+                        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                            .cap(derived)
+                            .build();
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                    else
+                    {
+                        let reply = IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+                        // SAFETY: ipc_buf is the registered IPC buffer.
+                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                    }
+                }
+                else
+                {
+                    // Terminal for the boot — see SET_DRIVERS_DIR arm
+                    // for the at-most-once spawn contract.
+                    let reply = IpcMessage::new(ipc::devmgr_errors::NO_DEVICE);
                     // SAFETY: ipc_buf is the registered IPC buffer.
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 }
@@ -991,7 +1140,7 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
     let spawned = spawn::spawn_simple_device(
         caps.procmgr_ep,
         caps.self_bootstrap_ep,
-        module_cap,
+        spawn::CreateSource::Module(module_cap),
         serial_ep,
         hw_cap,
         0, // no devmgr_query_ep: serial driver needs no runtime platform metadata
@@ -1115,7 +1264,7 @@ fn spawn_framebuffer(
     let spawned = spawn::spawn_simple_device(
         caps.procmgr_ep,
         caps.self_bootstrap_ep,
-        module_cap,
+        spawn::CreateSource::Module(module_cap),
         fb_ep,
         hw_cap,
         devmgr_query_ep,
@@ -1124,12 +1273,118 @@ fn spawn_framebuffer(
     (spawned, fb_ep)
 }
 
+/// Spawn the platform RTC driver — CMOS on x86-64, goldfish-RTC on
+/// RISC-V — from the on-disk rootfs. Called from inside the
+/// `SET_DRIVERS_DIR` registry-loop arm, after the handler's
+/// `ipc_reply` to init and before devmgr's next `ipc_recv`. The
+/// `drivers_dir_cap` argument is the `LOOKUP | READ`-attenuated
+/// `/services/drivers/` subtree cap init delivered in the handshake
+/// (namespace-protocol rights, not kernel cap rights). Walks
+/// `drivers_dir_cap` to the per-arch chip name, carves the per-arch
+/// hardware authority, and goes through the file-cap branch of
+/// [`spawn::spawn_simple_device`]. Returns the freshly-allocated
+/// service endpoint on success; the caller stores it for subsequent
+/// queries and records `rtc_spawn_attempted = true` regardless of
+/// outcome so failure is sticky for the boot.
+///
+/// devmgr does not retain RTC-specific hardware authority after a
+/// successful spawn — the carved cap is moved to the driver. The
+/// walked file cap is owned by procmgr after a successful
+/// `CREATE_FROM_FILE` and closed by procmgr after the ELF load.
+fn spawn_rtc_from_disk(
+    caps: &mut caps::DevmgrCaps,
+    drivers_dir_cap: u32,
+    ipc_buf: *mut u64,
+) -> Option<u32>
+{
+    // Per-arch driver name, relative to the subtree cap. Hardcoded
+    // pending #165 (manifest-driven discovery).
+    #[cfg(target_arch = "x86_64")]
+    const RTC_NAME: &[u8] = b"cmos-rtc";
+    #[cfg(target_arch = "riscv64")]
+    const RTC_NAME: &[u8] = b"goldfish-rtc";
+
+    // Request READ rights on the resolved file node. The cap init handed
+    // us in SET_DRIVERS_DIR is already attenuated to LOOKUP|READ at the
+    // /services/drivers/ subtree, so the namespace server will only ever
+    // mint a file cap with at most those bits set.
+    let requested_rights = u64::from(namespace_protocol::rights::READ);
+    let Some(walked) =
+        ns_client::walk_to_file(drivers_dir_cap, RTC_NAME, requested_rights, ipc_buf)
+    else
+    {
+        std::os::seraph::log!("rtc: walk_to_file failed (binary missing on rootfs)");
+        return None;
+    };
+
+    let rtc_ep = std::os::seraph::object_slab_acquire(88)
+        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
+        .unwrap_or(0);
+    if rtc_ep == 0
+    {
+        std::os::seraph::log!("rtc: failed to create service endpoint");
+        let _ = syscall::cap_delete(walked.file_cap);
+        return None;
+    }
+
+    let Some(hw_cap) = carve_rtc_authority(caps)
+    else
+    {
+        std::os::seraph::log!("rtc: failed to carve RTC authority cap");
+        let _ = syscall::cap_delete(walked.file_cap);
+        let _ = syscall::cap_delete(rtc_ep);
+        return None;
+    };
+
+    let spawned = spawn::spawn_simple_device(
+        caps.procmgr_ep,
+        caps.self_bootstrap_ep,
+        spawn::CreateSource::File {
+            file_cap: walked.file_cap,
+            size: walked.size,
+        },
+        rtc_ep,
+        hw_cap,
+        0, // no devmgr_query_ep: RTC driver needs no runtime platform metadata
+        ipc_buf,
+    );
+    if spawned
+    {
+        std::os::seraph::log!("devmgr: rtc driver spawned from disk");
+        Some(rtc_ep)
+    }
+    else
+    {
+        let _ = syscall::cap_delete(rtc_ep);
+        None
+    }
+}
+
 /// Carve the COM1 `IoPortRange` (`0x3F8`..=`0x3FF`) out of the root
 /// `IoPortRange` cap.
 #[cfg(target_arch = "x86_64")]
 fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 {
     ioport_carve(caps.ioport_root_cap, 0x3F8, 8)
+}
+
+/// Carve the platform RTC's hardware-authority cap out of devmgr's root
+/// authority pool. The bases below are platform-static (legacy MC146818
+/// at ISA `0x70` on x86-64; QEMU virt goldfish-RTC at `0x101000` on
+/// RISC-V) and hardcoded here pending #165, which replaces all such
+/// hardcoded per-driver knowledge with ACPI `_HID` (`PNP0B00`) and DTB
+/// `compatible = "google,goldfish-rtc"` driven discovery — same forward
+/// link as on `carve_uart_authority` below.
+#[cfg(target_arch = "x86_64")]
+fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
+{
+    ioport_carve(caps.ioport_root_cap, 0x70, 2)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
+{
+    carve_subrange(caps, 0x0010_1000, 0x1000)
 }
 
 /// Carve the NS16550 `MmioRegion` out of the aperture covering the UART

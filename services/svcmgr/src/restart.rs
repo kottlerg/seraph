@@ -469,6 +469,16 @@ fn create_process(
     }
     else
     {
+        // TODO(#78): this module-cap restart branch is unreachable today —
+        // `ServiceEntry::module_cap` is never populated (REGISTER_SERVICE
+        // delivers only a thread cap; the restart source is set from
+        // `vfs_path` by the reconcile pass), so `create_process` always takes
+        // the `vfs_path` arm above. Deferred to #78, which decides whether
+        // svcmgr must restart boot-substrate services from an in-memory ELF
+        // before the filesystem is reachable. If so, init endows svcmgr with
+        // those module source caps (excluding them from its reap donation)
+        // and this branch goes live; otherwise drop `module_cap` and this
+        // branch and restart everything from `vfs_path`.
         let (child_token, tokened_creator) = mint_child_creator(ctx.bootstrap_ep)?;
         let Ok(module_copy) = syscall::cap_derive(svc.module_cap, syscall::RIGHTS_ALL)
         else

@@ -45,14 +45,15 @@ pub struct ServiceEntry
     pub name_len: u8,
     /// Capability slot for the service's thread.
     pub thread_cap: u32,
-    /// Capability slot for the service's boot module. Zero for VFS-loaded
-    /// services (`vfs_path_len > 0`); the restart path then walks
-    /// svcmgr's own `root_dir_cap` to `vfs_path` and uses
-    /// `CREATE_FROM_FILE` instead of `CREATE_PROCESS`.
+    /// Capability slot for an in-memory boot-module source, used to respawn
+    /// via `CREATE_PROCESS`. Always zero today: no registration path
+    /// populates it, so every restart uses `vfs_path` + `CREATE_FROM_FILE`.
+    /// Reserved for the #78 init→svcmgr substrate endowment — see the dead
+    /// branch in [`crate::restart`]'s `create_process`.
     pub module_cap: u32,
     /// VFS path used to respawn this service via svcmgr-side walk +
-    /// `CREATE_FROM_FILE`. Mutually exclusive with `module_cap` at
-    /// registration time.
+    /// `CREATE_FROM_FILE`. The sole restart source today; `module_cap` is its
+    /// reserved alternative.
     pub vfs_path: [u8; ipc::MAX_PATH_LEN],
     /// Length of `vfs_path` in bytes (0 = module-loaded).
     pub vfs_path_len: u8,

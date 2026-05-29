@@ -402,6 +402,16 @@ pub const MAP_EXECUTABLE: u64 = 0x4;
 /// Passed as `prot_bits` to `SYS_MEM_MAP`; equivalent to 0 but more explicit.
 pub const MAP_READONLY: u64 = 0;
 
+/// Mapping protection: explicit read-only. Bit 0, matching the kernel
+/// `Rights::READ` layout.
+///
+/// Unlike `MAP_READONLY` (= 0, which derives permissions from the Frame
+/// cap's rights), this nonzero value forces a read-only mapping regardless
+/// of the cap's WRITE/EXECUTE rights, so a full-rights cap can be mapped
+/// read-only without first deriving a narrowed child cap. W^X holds
+/// trivially (neither WRITE nor EXECUTE set).
+pub const MAP_READ: u64 = 0x1;
+
 // ── Capability rights masks ─────────────────────────────────────────────────
 //
 // `u64` masks for `cap_derive` / `cap_copy` / `cap_insert` rights parameters.

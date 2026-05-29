@@ -25,9 +25,11 @@ use syscall::SyscallError;
 /// arg2 = virtual address of the first page to map (must be page-aligned, user range).
 /// arg3 = offset into the frame in pages (0 = start of frame).
 /// arg4 = number of pages to map.
-/// arg5 = protection bits (bit 1 = WRITE, bit 2 = EXECUTE). If zero, permissions
-///         are derived from the Frame cap's rights. If nonzero, must be a subset
-///         of the cap's rights. W^X is enforced: WRITE and EXECUTE may not both
+/// arg5 = protection bits (bit 1 = WRITE, bit 2 = EXECUTE; bit 0 = READ, no
+///         effect on permissions but makes a read-only request nonzero and
+///         thus explicit). If zero, permissions are derived from the Frame
+///         cap's rights. If nonzero, WRITE/EXECUTE must each be a subset of
+///         the cap's rights. W^X is enforced: WRITE and EXECUTE may not both
 ///         be set.
 ///
 /// Returns 0 on success.

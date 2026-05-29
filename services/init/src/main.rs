@@ -53,12 +53,13 @@ impl core::fmt::Write for SliceWriter<'_>
     }
 }
 
-/// Issue a no-cap `DONATE_FRAMES` to memmgr to read back the cumulative
-/// page-reclaim total (memmgr returns it in `word(2)` of every reply),
-/// then log a single line tagged with `phase`. Silent on any failure
-/// (memmgr unreachable, derive failure) — this is a diagnostic, not a
-/// correctness path.
-fn log_reclaim_total(memmgr_service_ep: u32, ipc_buf: *mut u64, phase: &str)
+/// Issue a no-cap `DONATE_FRAMES` to memmgr to read back the running
+/// `pool_total` — the total RAM memmgr accounts (free runs + in-use
+/// bootstrap arenas + reap donations), returned in `word(2)` of every reply —
+/// then log a single line tagged with `phase`. Silent on any failure (memmgr
+/// unreachable, derive failure) — this is a diagnostic, not a correctness
+/// path.
+fn log_pool_total(memmgr_service_ep: u32, ipc_buf: *mut u64, phase: &str)
 {
     use ipc::IpcMessage;
     use ipc::memmgr_labels;
@@ -78,7 +79,7 @@ fn log_reclaim_total(memmgr_service_ep: u32, ipc_buf: *mut u64, phase: &str)
         let _ = core::fmt::write(
             &mut w,
             format_args!(
-                "{phase} reclaim total: {total_pages} pages = {} KiB",
+                "{phase} pool total: {total_pages} pages = {} KiB",
                 total_pages * 4,
             ),
         );
@@ -564,34 +565,22 @@ fn run(info_ptr: u64) -> !
         logging::log("FATAL: phys-table page alloc failed");
         syscall::thread_exit();
     };
-    let Some(mm_final) = bootstrap::finalize_memmgr(info, &mut alloc, &mm)
+    let Some(mm_final) = bootstrap::finalize_memmgr(info, &mut alloc, &mm, pm.arena_cap)
     else
     {
         logging::log("FATAL: finalize_memmgr failed");
         syscall::thread_exit();
     };
 
-    // Populate the phys-table page with the parallel `[u64; mm_frame_count]`
-    // array of physical bases for every Frame cap delegated to memmgr.
-    // SAFETY: TEMP_MAP_BASE is mapped writable, one page; the table fits
-    // (max 122 entries × 8 B = 976 B << 4 KiB). The pointer is page-aligned
-    // (4 KiB), satisfying u64 alignment.
+    // Populate the phys-table page: free-run physical bases, the kernel's
+    // immutable RAM-accounting facts, and the in-use bootstrap arenas. The
+    // page is mapped writable at TEMP_MAP_BASE; memmgr reads it back via the
+    // RO cap derived below. See `bootstrap::write_memmgr_aux_frame`.
+    // SAFETY: TEMP_MAP_BASE is mapped writable, one page, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_dst = TEMP_MAP_BASE as *mut u64;
-    for i in 0..(mm_final.mm_frame_count as usize)
-    {
-        // SAFETY: i < mm_frame_count <= 122; bounded above.
-        unsafe { core::ptr::write_volatile(phys_dst.add(i), mm_final.phys_bases[i]) };
-    }
-    // Append the immutable memory-accounting facts past the phys-base table
-    // (byte 1024 = u64 index 128; the table tops out at 122 × 8 = 976 B, so
-    // 128/129 never collide with it and stay within the 512-slot page).
-    let facts_idx = 1024usize / 8;
-    // SAFETY: indices 128 and 129 lie within the one mapped 4 KiB page.
-    unsafe {
-        core::ptr::write_volatile(phys_dst.add(facts_idx), info.system_ram_bytes);
-        core::ptr::write_volatile(phys_dst.add(facts_idx + 1), info.kernel_reserved_bytes);
-    }
+    // SAFETY: phys_dst points at the one mapped 4 KiB page.
+    unsafe { bootstrap::write_memmgr_aux_frame(phys_dst, info, &mm_final) };
     let _ = syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1);
     let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_frame, syscall::RIGHTS_MAP_READ)
     else
@@ -781,9 +770,9 @@ fn run(info_ptr: u64) -> !
         logging::log("no vfsd module available");
     }
 
-    // Re-probe memmgr's running donation counter so procmgr's per-spawn
+    // Re-probe memmgr's running pool total so procmgr's per-spawn
     // donations (devmgr, vfsd modules) become visible.
-    log_reclaim_total(memmgr_service_ep, ipc_buf, "phase 1");
+    log_pool_total(memmgr_service_ep, ipc_buf, "phase 1");
 
     logging::log("phase 1 bootstrap complete");
 
@@ -817,7 +806,7 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     }
 
-    log_reclaim_total(memmgr_service_ep, ipc_buf, "phase 2");
+    log_pool_total(memmgr_service_ep, ipc_buf, "phase 2");
 
     // ── Phase 2 epilogue: launch real logd ──────────────────────────────────
     //

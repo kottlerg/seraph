@@ -374,6 +374,68 @@ pub mod memmgr_errors
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
 }
 
+/// Init → memmgr bootstrap payload layout.
+///
+/// memmgr is created directly by init (no procmgr exists yet), so its startup
+/// pool bounds arrive over a single bootstrap round on memmgr's creator
+/// endpoint plus one auxiliary read-only Frame cap (`caps[1]` of that round) —
+/// the "phys-table" page. This module is the single source of truth for the
+/// payload layout; init writes it and memmgr reads it.
+///
+/// Round (`ipc::bootstrap` caps + data words):
+/// * `caps[0]` — memmgr's own service endpoint (full rights; its RECV side).
+/// * `caps[1]` — read-only Frame cap covering the phys-table page (below).
+/// * `data[0]` — `frame_base`: first `CSpace` slot of the free RAM Frame caps
+///   init copied into memmgr's `CSpace`.
+/// * `data[1]` — `frame_count`: number of consecutive free RAM frames.
+/// * `data[2]` — `procmgr_token`: token init burned into procmgr's tokened
+///   SEND on memmgr's endpoint; gates the procmgr-only labels.
+/// * `data[3..3 + frame_count.div_ceil(2)]` — `page_count` per free frame,
+///   packed two per word (low 32 bits = even index, high 32 = odd index).
+///
+/// Phys-table page (`u64`-indexed; one 4 KiB page = 512 slots):
+/// * `[0, frame_count)` — `phys_base` per free frame, parallel to the
+///   `page_count` words above.
+/// * `FACTS_*` — the kernel's immutable RAM-accounting facts.
+/// * `IN_USE_*` — the in-use bootstrap arenas (memmgr's and procmgr's own
+///   backing), forwarded so memmgr's `pool_total` spans every page of RAM it
+///   owns, not only the free runs and reap donations.
+pub mod memmgr_bootstrap
+{
+    use syscall_abi::MSG_DATA_WORDS_MAX;
+
+    /// Maximum free RAM frames init delivers in the round's data words:
+    /// `MSG_DATA_WORDS_MAX` minus the 3-word prefix, two `page_count`s per
+    /// remaining word.
+    pub const MAX_FRAMES: usize = (MSG_DATA_WORDS_MAX - 3) * 2;
+
+    /// Phys-table `u64` index of the first immutable fact
+    /// (`system_ram_bytes`). Sits past the `MAX_FRAMES`-entry `phys_base`
+    /// table (`MAX_FRAMES * 8 = 976 B`) so the two regions never overlap.
+    pub const FACTS_SYSTEM_RAM_IDX: usize = 128;
+    /// Phys-table `u64` index of `kernel_reserved_bytes`.
+    pub const FACTS_KERNEL_RESERVED_IDX: usize = 129;
+
+    /// Phys-table `u64` index of the in-use arena count.
+    pub const IN_USE_COUNT_IDX: usize = 130;
+    /// Phys-table `u64` index of the first in-use arena descriptor.
+    pub const IN_USE_BASE_IDX: usize = 131;
+    /// `u64` words per in-use arena descriptor:
+    /// * word 0 — `cap_slot` (low 32 bits) | `page_count` (high 32 bits).
+    /// * word 1 — `phys_base`.
+    /// * word 2 — `kind` (see `IN_USE_KIND_*`).
+    pub const IN_USE_WORDS: usize = 3;
+    /// Maximum in-use arenas init forwards (memmgr-self, procmgr, slack).
+    /// `IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS` must stay within the
+    /// 512-slot page.
+    pub const MAX_IN_USE: usize = 4;
+
+    /// In-use arena owner kind: memmgr's own bootstrap backing.
+    pub const IN_USE_KIND_MEMMGR: u64 = 0;
+    /// In-use arena owner kind: procmgr's bootstrap backing.
+    pub const IN_USE_KIND_PROCMGR: u64 = 1;
+}
+
 /// Process-state codes returned by `procmgr_labels::QUERY_PROCESS`.
 ///
 /// Populated in data word 0 of the reply. Word 1 carries an accompanying

@@ -344,8 +344,31 @@ pub struct MemmgrBootstrap
     /// Memmgr's main `Thread` cap (in init's `CSpace`). Init invokes
     /// `thread_configure` + `thread_start` at [`finalize_memmgr`] time.
     pub mm_thread: u32,
+    /// Memmgr's contiguous backing arena Frame cap (in init's `CSpace`).
+    /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
+    /// as an in-use arena so its pages are accounted in memmgr's pool.
+    pub arena_cap: u32,
     /// Memmgr's ELF entry point.
     pub entry: u64,
+}
+
+/// One in-use bootstrap arena forwarded to memmgr for accounting. Its whole
+/// Frame cap is copied into memmgr's `CSpace`; memmgr records it as an
+/// `OwnedFrame` against the owning service's record so the arena's pages count
+/// toward `pool_total` without ever becoming allocatable. The arena is
+/// retype-pinned and offset-mapped for the immortal service's life, so this is
+/// pure accounting — memmgr never frees it.
+#[derive(Clone, Copy, Default)]
+pub struct InUseArena
+{
+    /// Slot in memmgr's `CSpace` of the copied arena cap.
+    pub cap_slot: u32,
+    /// Arena size in pages (`RETYPE_RESERVE_PAGES` + backing).
+    pub page_count: u32,
+    /// Arena physical base.
+    pub phys_base: u64,
+    /// Owner kind (`ipc::memmgr_bootstrap::IN_USE_KIND_*`).
+    pub kind: u64,
 }
 
 /// Result of [`finalize_memmgr`] — bootstrap-IPC payload init sends
@@ -353,11 +376,11 @@ pub struct MemmgrBootstrap
 ///
 /// Page counts are packed two per `u64` (low 32 bits = even index,
 /// high 32 bits = odd index) so the 64-word IPC data field can carry
-/// up to 122 entries after the 3-word prefix. Physical bases travel
-/// out-of-band via a read-only Frame cap (`caps[1]` in the bootstrap
-/// reply); init writes `phys_bases` into the page before deriving the
-/// RO cap. Memmgr maps the page, copies the values into its `FreeRun`
-/// records, and drops the cap.
+/// up to `ipc::memmgr_bootstrap::MAX_FRAMES` entries after the 3-word
+/// prefix. Physical bases travel out-of-band via a read-only Frame cap
+/// (`caps[1]` in the bootstrap reply); init writes `phys_bases` into the
+/// page before deriving the RO cap. Memmgr maps the page, copies the
+/// values into its `FreeRun` records, and drops the cap.
 pub struct MemmgrFinalize
 {
     /// First slot of the RAM Frame caps init copied into memmgr's
@@ -366,19 +389,19 @@ pub struct MemmgrFinalize
     /// Number of RAM frames delegated to memmgr.
     pub mm_frame_count: u32,
     /// Page count for each delegated frame, in slot order.
-    pub page_counts: [u32; 122],
+    pub page_counts: [u32; ipc::memmgr_bootstrap::MAX_FRAMES],
     /// Physical base address for each delegated frame, in slot order.
     /// Sourced from `CapDescriptor.aux0` of the underlying RAM Frame
     /// caps minted by the kernel at boot.
-    pub phys_bases: [u64; 122],
+    pub phys_bases: [u64; ipc::memmgr_bootstrap::MAX_FRAMES],
+    /// In-use bootstrap arenas (memmgr's and procmgr's own backing)
+    /// copied into memmgr's `CSpace`. Init writes these into the
+    /// phys-table page's in-use section; memmgr records them against
+    /// per-owner process records.
+    pub in_use: [InUseArena; ipc::memmgr_bootstrap::MAX_IN_USE],
+    /// Number of valid entries in `in_use`.
+    pub in_use_count: usize,
 }
-
-/// Maximum number of frames init can delegate to memmgr in one
-/// bootstrap-IPC round. Bounded by the IPC data-word count
-/// (`MSG_DATA_WORDS_MAX = 64`) minus the 3-word prefix
-/// (`frame_base`, `frame_count`, `procmgr_token`), times 2 for the
-/// 2-page-counts-per-word packing.
-pub const MEMMGR_BOOTSTRAP_MAX_FRAMES: u32 = 122;
 
 /// Memmgr kernel object caps needed to populate `ProcessInfo`.
 struct MemmgrCaps
@@ -554,38 +577,66 @@ pub fn bootstrap_memmgr(
         procmgr_send_cap,
         mm_cspace,
         mm_thread,
+        arena_cap: arena.cap,
         entry,
     })
 }
 
+/// Copy one in-use bootstrap arena cap into memmgr's `CSpace` and build its
+/// [`InUseArena`] descriptor. Mirrors the free-run forward: derive a
+/// full-rights intermediary, copy it into `mm_cspace`, and read the arena's
+/// physical base + size from the cap. The arena is exact-sized (no free
+/// tail), so it is never `frame_split`; the copy gives memmgr the accounting
+/// anchor while the original cap and the retypes keep the `FrameObject`
+/// pinned for the immortal service's life.
+fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena>
+{
+    let phys_base = syscall::cap_info(arena_cap, syscall::CAP_INFO_FRAME_PHYS_BASE).ok()?;
+    let size_bytes = syscall::cap_info(arena_cap, syscall::CAP_INFO_FRAME_SIZE).ok()?;
+    let intermediary = syscall::cap_derive(arena_cap, syscall::RIGHTS_ALL).ok()?;
+    let cap_slot = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL).ok()?;
+    Some(InUseArena {
+        cap_slot,
+        page_count: (size_bytes / PAGE_SIZE) as u32,
+        phys_base,
+        kind,
+    })
+}
+
 /// Delegate every remaining RAM Frame cap from init's pool into memmgr's
-/// `CSpace`, then `thread_configure` + `thread_start` memmgr.
+/// `CSpace`, forward the in-use bootstrap arenas (memmgr's and procmgr's own
+/// backing), then `thread_configure` + `thread_start` memmgr.
 ///
 /// Call after every `alloc.alloc_page()` consumer (memmgr's own setup,
 /// procmgr's setup) has run — at that point everything left in init's
 /// frame pool is RAM that memmgr should own. After this call, init has
 /// no more frames; subsequent allocations route through memmgr like any
 /// other process.
+///
+/// `pm_arena_cap` is procmgr's backing arena (from [`ProcmgrBootstrap`]); it
+/// is forwarded alongside memmgr's own arena (`mm.arena_cap`) so memmgr's
+/// `pool_total` spans the bootstrap-consumed RAM, not only the free runs.
 #[allow(clippy::similar_names)]
 pub fn finalize_memmgr(
     info: &InitInfo,
     alloc: &mut FrameAlloc,
     mm: &MemmgrBootstrap,
+    pm_arena_cap: u32,
 ) -> Option<MemmgrFinalize>
 {
     // The bootstrap-IPC payload to memmgr packs 2 page_counts per word
-    // after a 3-word prefix; up to `MEMMGR_BOOTSTRAP_MAX_FRAMES` entries
-    // fit. With memmgr owning all of system RAM, this should comfortably
-    // cover any plausible init frame count; raise the bound (or move to
-    // multi-round bootstrap) if a target ever exceeds it.
-    let mut page_counts = [0u32; MEMMGR_BOOTSTRAP_MAX_FRAMES as usize];
-    let mut phys_bases = [0u64; MEMMGR_BOOTSTRAP_MAX_FRAMES as usize];
+    // after a 3-word prefix; up to `ipc::memmgr_bootstrap::MAX_FRAMES`
+    // entries fit. With memmgr owning all of system RAM, this should
+    // comfortably cover any plausible init frame count; raise the bound (or
+    // move to multi-round bootstrap) if a target ever exceeds it.
+    let mut page_counts = [0u32; ipc::memmgr_bootstrap::MAX_FRAMES];
+    let mut phys_bases = [0u64; ipc::memmgr_bootstrap::MAX_FRAMES];
     let mut mm_frame_base: u32 = 0;
     let mut mm_frame_count: u32 = 0;
     let total_remaining = info.memory_frame_count.saturating_sub(alloc.next_idx);
     for i in 0..total_remaining
     {
-        if mm_frame_count >= MEMMGR_BOOTSTRAP_MAX_FRAMES
+        if mm_frame_count as usize >= ipc::memmgr_bootstrap::MAX_FRAMES
         {
             break;
         }
@@ -660,6 +711,25 @@ pub fn finalize_memmgr(
         alloc.remaining = 0;
     }
 
+    // Forward the in-use bootstrap arenas. These are the RAM init carved to
+    // back memmgr and procmgr (retype slabs + offset-mapped ELF/stack/IPC/PI);
+    // they are retype-pinned and never freed, but their pages belong in
+    // memmgr's `pool_total` so the all-RAM-accounted identity closes. memmgr
+    // records each against the owning service's process record.
+    let mut in_use = [InUseArena::default(); ipc::memmgr_bootstrap::MAX_IN_USE];
+    let mut in_use_count = 0usize;
+    for (cap, kind) in [
+        (mm.arena_cap, ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR),
+        (pm_arena_cap, ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR),
+    ]
+    {
+        if let Some(arena) = forward_arena(cap, mm.mm_cspace, kind)
+        {
+            in_use[in_use_count] = arena;
+            in_use_count += 1;
+        }
+    }
+
     syscall::thread_configure(
         mm.mm_thread,
         mm.entry,
@@ -675,7 +745,58 @@ pub fn finalize_memmgr(
         mm_frame_count,
         page_counts,
         phys_bases,
+        in_use,
+        in_use_count,
     })
+}
+
+/// Write memmgr's bootstrap aux (phys-table) page from `mm_final`: the
+/// per-free-run physical bases, the kernel's immutable RAM-accounting facts
+/// (from `info`), and the in-use bootstrap arena descriptors. The layout is
+/// defined in `ipc::memmgr_bootstrap`; memmgr's `bootstrap_from_init` reads it
+/// back through the read-only cap init derives from the same page.
+///
+/// # Safety
+/// `phys_dst` must point at init's writable mapping of the one-page phys-table
+/// frame (at least 4 KiB, `u64`-aligned).
+pub unsafe fn write_memmgr_aux_frame(phys_dst: *mut u64, info: &InitInfo, mm_final: &MemmgrFinalize)
+{
+    use ipc::memmgr_bootstrap as mb;
+
+    for i in 0..(mm_final.mm_frame_count as usize)
+    {
+        // SAFETY: i < mm_frame_count <= MAX_FRAMES; within the mapped page.
+        unsafe { core::ptr::write_volatile(phys_dst.add(i), mm_final.phys_bases[i]) };
+    }
+    // SAFETY: the facts and in-use-count indices lie within the mapped page.
+    unsafe {
+        core::ptr::write_volatile(
+            phys_dst.add(mb::FACTS_SYSTEM_RAM_IDX),
+            info.system_ram_bytes,
+        );
+        core::ptr::write_volatile(
+            phys_dst.add(mb::FACTS_KERNEL_RESERVED_IDX),
+            info.kernel_reserved_bytes,
+        );
+        core::ptr::write_volatile(
+            phys_dst.add(mb::IN_USE_COUNT_IDX),
+            mm_final.in_use_count as u64,
+        );
+    }
+    for i in 0..mm_final.in_use_count
+    {
+        let arena = mm_final.in_use[i];
+        let base = mb::IN_USE_BASE_IDX + i * mb::IN_USE_WORDS;
+        // SAFETY: base + 2 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the page.
+        unsafe {
+            core::ptr::write_volatile(
+                phys_dst.add(base),
+                u64::from(arena.cap_slot) | (u64::from(arena.page_count) << 32),
+            );
+            core::ptr::write_volatile(phys_dst.add(base + 1), arena.phys_base);
+            core::ptr::write_volatile(phys_dst.add(base + 2), arena.kind);
+        }
+    }
 }
 
 // ── Procmgr bootstrap ───────────────────────────────────────────────────────
@@ -824,6 +945,10 @@ pub struct ProcmgrBootstrap
     /// Procmgr's main thread cap (in init's `CSpace`). Used by
     /// [`start_procmgr`] to launch procmgr after memmgr is live.
     pub thread: u32,
+    /// Procmgr's contiguous backing arena Frame cap (in init's `CSpace`).
+    /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
+    /// as an in-use arena so its pages are accounted in memmgr's pool.
+    pub arena_cap: u32,
 }
 
 /// Monotonic counter for init-side bootstrap tokens.
@@ -1041,6 +1166,7 @@ pub fn bootstrap_procmgr(
         log_endpoint_slot: pm_log_send,
         registry_endpoint_slot: pm_registry_send,
         thread: pm_thread,
+        arena_cap: arena.cap,
     })
 }
 

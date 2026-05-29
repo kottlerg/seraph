@@ -19,12 +19,12 @@
 //! chunk-less case, not a routine path.
 //!
 //! Pages are seeded once at the end of Phase 7 from the residual
-//! `KERNEL_RESERVE_PAGES` buddy carve, threaded onto an intrusive
+//! `kernel_reserve_pages()` buddy carve, threaded onto an intrusive
 //! single-linked free list, and consumed without further buddy traffic.
 //!
 //! Backs the architectural invariant from `crate::kernel_entry`: PT
 //! frames for the `map_user_page` path trace to a single cap-managed
-//! surface (the seed of this pool, sourced from `KERNEL_RESERVE_PAGES` at
+//! surface (the seed of this pool, sourced from `kernel_reserve_pages()` at
 //! Phase 7). A small buddy residue stays behind for non-PT consumers
 //! (idle-thread kernel stacks, the `dealloc_object` → `free_range`
 //! reverse path); see `crate::cap::drain_and_install_seed` for the sizing
@@ -71,7 +71,7 @@ fn release()
 /// Seed the pool with `seed_pages` 4 KiB frames pulled from the buddy.
 ///
 /// MUST run during Phase 7, after `drain_and_install_seed` finishes
-/// reserving `KERNEL_RESERVE_PAGES` and before any `map_user_page`
+/// reserving `kernel_reserve_pages()` and before any `map_user_page`
 /// consumer fires (the first such consumer is Phase 9's init segment
 /// mapping). Fewer pages than requested may be installed if the buddy
 /// is genuinely exhausted; the caller diagnoses via `remaining_pages()`.

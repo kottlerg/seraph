@@ -652,28 +652,57 @@ static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_D
 /// fatals at the first failed bootstrap map.
 #[cfg(not(test))]
 pub(crate) const POOL_SEED_PAGES: usize = 64;
-/// Pages kept in the buddy for kernel-internal use after Phase 7:
+/// Buddy-residue headroom held above the per-CPU idle-stack demand.
 ///
-/// 1. **Phase 8 idle-thread kernel stacks**: `sched::init` allocates
-///    `MAX_CPUS × KERNEL_STACK_PAGES = 64 × 4 = 256` pages worst case (one
-///    per CPU at order 2).
-/// 2. **Phase 9 `InitInfo` / stack pages**: bounded; ~30 pages.
-/// 3. **`dealloc_object` → `free_range` reverse-ledger path** that returns
-///    reclaimable Frame caps to the buddy on teardown.
+/// `drain_for_usercaps` keeps the smallest `reserve_pages` of the buddy as
+/// the residue, so the residue always begins with the memory map's order-0/1
+/// rounding fragments — pages that cannot back an order-2 (`KERNEL_STACK_PAGES`
+/// = 4-page) idle-stack allocation. This constant is the floor that absorbs
+/// those fragments (observed ~150 pages across the usable regions on both
+/// arches) plus the Phase-9 `InitInfo`/init-stack draw and the
+/// `dealloc_object` → `free_range` reverse-ledger arithmetic, so the
+/// per-CPU term in [`buddy_residue_pages`] is what actually extends the
+/// residue into the order-2-and-larger blocks `sched::init` splits for idle
+/// stacks. 384 is the value the pre-`cpu_count` fixed reserve used and is
+/// validated to leave the residue order-2-capable; it has comfortable margin
+/// over the observed fragment total.
+#[cfg(not(test))]
+const BOOT_RESIDUE_SLACK_PAGES: usize = 384;
+
+/// Pages kept in the buddy after Phase 7, sized to the live boot CPU count:
 ///
-/// 384 covers (1) + (2) with ~100 pages of slack; PT growth does not touch
-/// the buddy on this path. The post-handoff buddy free count never exceeds
-/// this (Phases 8–9 only draw pages out of it), which the Phase-9 boot guard
-/// asserts.
+/// 1. **Phase 8 idle-thread kernel stacks**: `sched::init` allocates one
+///    `KERNEL_STACK_PAGES`-page stack per online CPU — `cpu_count ×
+///    KERNEL_STACK_PAGES` pages, each an order-2 block split out of the
+///    residue.
+/// 2. **`BOOT_RESIDUE_SLACK_PAGES`**: the fragment floor + Phase-9 + reverse
+///    path (see that constant).
+///
+/// `sched::CPU_COUNT` is published in Phase 4 (`sched::init_storage`), before
+/// both the Phase-7 drain and the Phase-9 guard that call this. Sizing to the
+/// live count rather than `MAX_CPUS` removes the `MAX_CPUS × KERNEL_STACK_PAGES`
+/// (= 2048) worst case: the residue tracks the actual CPU count, so a 512-CPU
+/// boot keeps ~2.4 K pages of order-2-capable blocks for its idle stacks while
+/// a 4-CPU boot keeps ~400. PT growth does not touch the buddy on this path.
+/// The post-handoff buddy free count never exceeds this (Phases 8–9 only draw
+/// pages out of it), which the Phase-9 boot guard asserts.
 #[cfg(not(test))]
-pub(crate) const BUDDY_RESIDUE_PAGES: usize = 384;
-/// Total fixed reserve carved from the buddy at Phase 7. `64 + 384 = 448`
-/// pages ≈ 1.75 MiB. Pages not carved here are minted as userspace RAM Frame
-/// caps and route to memmgr's pool, so shrinking this only moves pages from
-/// reserve into pool; the all-RAM-accounted identity is unaffected
-/// (`kernel_reserved` is computed as the complement at Phase 9).
+pub(crate) fn buddy_residue_pages() -> usize
+{
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    cpu_count * crate::sched::KERNEL_STACK_PAGES + BOOT_RESIDUE_SLACK_PAGES
+}
+
+/// Total fixed reserve carved from the buddy at Phase 7:
+/// `POOL_SEED_PAGES + buddy_residue_pages()`. Pages not carved here are minted
+/// as userspace RAM Frame caps and route to memmgr's pool, so the size only
+/// moves pages between reserve and pool; the all-RAM-accounted identity is
+/// unaffected (`kernel_reserved` is computed as the complement at Phase 9).
 #[cfg(not(test))]
-pub(crate) const KERNEL_RESERVE_PAGES: usize = POOL_SEED_PAGES + BUDDY_RESIDUE_PAGES;
+pub(crate) fn kernel_reserve_pages() -> usize
+{
+    POOL_SEED_PAGES + buddy_residue_pages()
+}
 
 /// Drain user-cap RAM from the buddy and install [`SEED_FRAME`] over the
 /// largest drained block, reserving its first [`SEED_RESERVE_BYTES`] for
@@ -682,7 +711,7 @@ pub(crate) const KERNEL_RESERVE_PAGES: usize = POOL_SEED_PAGES + BUDDY_RESIDUE_P
 ///
 /// After the drain completes, seeds [`crate::mm::kernel_pt_pool`] with
 /// most of the kernel reserve so the steady-state PT-growth path is
-/// cap-backed (sourced from a pool minted out of [`KERNEL_RESERVE_PAGES`])
+/// cap-backed (sourced from a pool minted out of [`kernel_reserve_pages`])
 /// rather than drawing directly from the buddy. A small residue stays in
 /// the buddy for the `dealloc_object` → `free_range` reverse path's
 /// ledger arithmetic.
@@ -705,9 +734,20 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     // used by this call.
     let order_buf: &mut [(u64, usize); MAX_DRAIN_BLOCKS] =
         unsafe { &mut *core::ptr::addr_of_mut!(DRAIN_ORDER_BUF) };
-    let block_count = crate::mm::with_frame_allocator(|alloc| {
-        alloc.drain_for_usercaps(KERNEL_RESERVE_PAGES, order_buf)
-    });
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let reserve_pages = kernel_reserve_pages();
+    crate::kprintln!(
+        "Phase 7: kernel reserve {} pages = pool {} + residue {} \
+         (idle {}×{} + slack {})",
+        reserve_pages,
+        POOL_SEED_PAGES,
+        buddy_residue_pages(),
+        cpu_count,
+        crate::sched::KERNEL_STACK_PAGES,
+        BOOT_RESIDUE_SLACK_PAGES,
+    );
+    let block_count =
+        crate::mm::with_frame_allocator(|alloc| alloc.drain_for_usercaps(reserve_pages, order_buf));
 
     if block_count == 0
     {
@@ -762,10 +802,10 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     // must run before any `map_user_page` consumer (the first is Phase
     // 9's init bootstrap). The pool is the cap-backed source for
     // intermediate page-table frames; the buddy keeps only
-    // `BUDDY_RESIDUE_PAGES` for `dealloc_object` → `free_range`
-    // ledger arithmetic.
+    // `buddy_residue_pages()` for the idle stacks and the
+    // `dealloc_object` → `free_range` ledger arithmetic.
     // SAFETY: single-threaded Phase 7; drain has populated the buddy
-    // free list with up to KERNEL_RESERVE_PAGES; kernel_pt_pool::init
+    // free list with up to `kernel_reserve_pages()`; kernel_pt_pool::init
     // takes its own LOCK internally.
     unsafe {
         crate::mm::kernel_pt_pool::init(POOL_SEED_PAGES);
@@ -774,7 +814,7 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     crate::kprintln!(
         "kernel_pt_pool: {} pages installed (buddy residue {})",
         pool_remaining,
-        BUDDY_RESIDUE_PAGES,
+        buddy_residue_pages(),
     );
 
     block_count

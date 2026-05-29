@@ -323,7 +323,7 @@ impl AddressSpace
 
         // Intermediate page table frames are drawn from
         // `mm::kernel_pt_pool` (seeded once at Phase 7 from the residual
-        // `KERNEL_RESERVE_PAGES` buddy carve). No buddy lock is taken on
+        // `kernel_reserve_pages()` buddy carve). No buddy lock is taken on
         // this path; the shootdown below is the only inter-CPU
         // synchronisation cost.
         // SAFETY: contract passed to caller; root_virt is valid; virt is

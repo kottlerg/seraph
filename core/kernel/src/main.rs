@@ -941,20 +941,22 @@ unsafe fn kernel_entry_post_rebase(
         // By here every buddy draw of the boot has run (Phase 8 idle stacks,
         // Phase 9 init stack/InitInfo) and the reap-time reverse path has not,
         // so the free count can only have shrunk from the Phase-7 carve.
-        // Exceeding BUDDY_RESIDUE_PAGES means the fixed-reserve split
-        // misprovisioned the buddy — a Phase-B/E regression. debug_assert, not
-        // assert: a misprovisioned residue wastes RAM but keeps the
-        // all-RAM-accounted identity sound (kernel_reserved is its complement),
-        // so it must not brick a release boot; CI's debug matrix enforces it.
+        // Exceeding the residue means the fixed-reserve split misprovisioned
+        // the buddy — a Phase-B/E regression. The cap tracks the live CPU
+        // count (idle stacks dominate it), so it stays tight as MAX_CPUS
+        // grows. debug_assert, not assert: a misprovisioned residue wastes RAM
+        // but keeps the all-RAM-accounted identity sound (kernel_reserved is
+        // its complement), so it must not brick a release boot; CI's debug
+        // matrix enforces it.
         let buddy_free = crate::mm::with_frame_allocator(|alloc| alloc.free_page_count());
         kprintln!(
             "init: buddy_residue={} pages (cap {})",
             buddy_free,
-            cap::BUDDY_RESIDUE_PAGES,
+            cap::buddy_residue_pages(),
         );
         debug_assert!(
-            buddy_free <= cap::BUDDY_RESIDUE_PAGES,
-            "post-handoff buddy free count exceeds BUDDY_RESIDUE_PAGES — fixed reserve misprovisioned",
+            buddy_free <= cap::buddy_residue_pages(),
+            "post-handoff buddy free count exceeds buddy_residue_pages() — fixed reserve misprovisioned",
         );
 
         // Retype a 6-page slab from SEED_FRAME for init's Thread:

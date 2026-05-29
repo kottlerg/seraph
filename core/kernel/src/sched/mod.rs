@@ -177,8 +177,24 @@ pub fn take_reschedule_pending(cpu: usize) -> bool
 
 const WATCHDOG_THRESHOLD_TICKS: u64 = 3_000; // ~3 s at the observed ~1 ms BSP tick.
 
-static LAST_NON_IDLE_TICK: [core::sync::atomic::AtomicU64; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+/// Base pointer for the `[AtomicU64; cpu_count]` per-CPU last-non-idle-tick
+/// array allocated in [`init_per_cpu_storage`]. Slot `cpu` records the global
+/// tick at which CPU `cpu` last dispatched a non-idle thread. Sized to
+/// `cpu_count` rather than `MAX_CPUS` so it scales with the CPU count.
+static LAST_NON_IDLE_TICK_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU64> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Return CPU `cpu`'s last-non-idle-tick slot. Caller guarantees
+/// `cpu < CPU_COUNT` and that [`init_per_cpu_storage`] has run.
+#[inline]
+fn last_non_idle_tick(cpu: usize) -> &'static core::sync::atomic::AtomicU64
+{
+    let base = LAST_NON_IDLE_TICK_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(!base.is_null(), "last_non_idle_tick: not initialised");
+    // SAFETY: cpu < CPU_COUNT by caller contract; the slab covers CPU_COUNT
+    // AtomicU64 slots, each zero-initialised (a valid AtomicU64).
+    unsafe { &*base.add(cpu) }
+}
 
 static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -188,7 +204,7 @@ static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 pub fn watchdog_mark_non_idle(cpu: usize)
 {
     let now = WATCHDOG_TICK_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
-    LAST_NON_IDLE_TICK[cpu].store(now, core::sync::atomic::Ordering::Relaxed);
+    last_non_idle_tick(cpu).store(now, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// BSP-only: tick the global counter; if every CPU's last non-idle
@@ -211,7 +227,7 @@ fn watchdog_tick_and_check()
     #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
-        let last = LAST_NON_IDLE_TICK[cpu].load(core::sync::atomic::Ordering::Relaxed);
+        let last = last_non_idle_tick(cpu).load(core::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last) < WATCHDOG_THRESHOLD_TICKS
         {
             return;
@@ -256,7 +272,7 @@ fn watchdog_tick_and_check()
         let (cur_is_null, tid, state, ipc, blocked_on, prio, pref, last_tick, mask) = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
-            let lt = LAST_NON_IDLE_TICK[cpu].load(core::sync::atomic::Ordering::Relaxed);
+            let lt = last_non_idle_tick(cpu).load(core::sync::atomic::Ordering::Relaxed);
             if cur.is_null()
             {
                 (
@@ -914,8 +930,6 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
         // exclusively owned during init.
         unsafe {
             let s = &mut *scheduler_ptr(cpu);
-            // Set CPU ID so the scheduler can index into the global CPU_LOAD array.
-            s.cpu_id = cpu;
             s.set_idle(tcb);
             s.set_current(tcb);
         }
@@ -977,11 +991,21 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         alloc_zeroed_slab::<MaybeUninit<ThreadControlBlock>>(tcb_bytes, allocator, "IDLE_TCBS");
     IDLE_TCBS_PTR.store(tcb_ptr, core::sync::atomic::Ordering::Release);
 
+    // Per-CPU watchdog last-non-idle-tick slab (zeroed AtomicU64 per CPU).
+    let tick_bytes = n * core::mem::size_of::<core::sync::atomic::AtomicU64>();
+    let tick_ptr = alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(
+        tick_bytes,
+        allocator,
+        "LAST_NON_IDLE_TICK",
+    );
+    LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
+
     // Arch-specific per-CPU tables. x86_64 only.
     #[cfg(target_arch = "x86_64")]
     {
         crate::arch::current::gdt::init_ap_storage(n, allocator);
         crate::arch::current::ap_trampoline::init_ap_ist_storage(n, allocator);
+        crate::arch::current::interrupts::init_nmi_backtrace_storage(n, allocator);
     }
 }
 

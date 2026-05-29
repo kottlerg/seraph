@@ -846,7 +846,7 @@ unsafe extern "C" fn ipi_nmi_backtrace_stub()
 }
 
 /// NMI body. Distinguishes a watchdog-requested backtrace from a real
-/// hardware NMI via [`NMI_BACKTRACE_REQUEST`]; on a watchdog ping it
+/// hardware NMI via the per-CPU `nmi_backtrace_request` flag; on a watchdog ping it
 /// dumps the saved frame to serial and returns (the stub's iretq
 /// resumes the interrupted code). On a real NMI it tail-calls
 /// `common_exception_handler` which never returns — the iretq tail of
@@ -857,15 +857,8 @@ unsafe extern "C" fn ipi_nmi_backtrace_stub()
 extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
 {
     let cpu = super::cpu::current_cpu() as usize;
-    let requested = if cpu < crate::sched::MAX_CPUS
-    {
-        super::interrupts::NMI_BACKTRACE_REQUEST[cpu]
-            .swap(false, core::sync::atomic::Ordering::AcqRel)
-    }
-    else
-    {
-        false
-    };
+    let requested = super::interrupts::nmi_backtrace_request(cpu)
+        .is_some_and(|flag| flag.swap(false, core::sync::atomic::Ordering::AcqRel));
     if !requested
     {
         // Real hardware NMI — defer to the standard fatal path.

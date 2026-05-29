@@ -216,9 +216,47 @@ pub const IPI_VECTOR_WAKEUP: u8 = 251;
 ///
 /// Single-bit publication, no caller-side ordering beyond Release/Acquire
 /// (the NMI itself is a serialising event for the target).
+/// Base pointer for the per-CPU `[AtomicBool; cpu_count]` request slab,
+/// allocated by [`init_nmi_backtrace_storage`] before AP bringup. Sized to
+/// `cpu_count` rather than `MAX_CPUS` so it scales with the CPU count.
 #[cfg(not(test))]
-pub static NMI_BACKTRACE_REQUEST: [core::sync::atomic::AtomicBool; crate::sched::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; crate::sched::MAX_CPUS];
+static NMI_BACKTRACE_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicBool> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Allocate the per-CPU NMI-backtrace request slab sized to `cpu_count`,
+/// zero-filled (each `AtomicBool` starts `false`). Called from
+/// `sched::init_per_cpu_storage` before AP bringup.
+#[cfg(not(test))]
+pub fn init_nmi_backtrace_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+{
+    let bytes = cpu_count * core::mem::size_of::<core::sync::atomic::AtomicBool>();
+    let ptr = crate::sched::alloc_zeroed_slab::<core::sync::atomic::AtomicBool>(
+        bytes,
+        allocator,
+        "NMI_BACKTRACE",
+    );
+    NMI_BACKTRACE_PTR.store(ptr, core::sync::atomic::Ordering::Release);
+}
+
+/// Return CPU `cpu`'s NMI-backtrace request flag, or `None` if `cpu` is out of
+/// range or the slab is not yet allocated.
+#[cfg(not(test))]
+pub fn nmi_backtrace_request(cpu: usize) -> Option<&'static core::sync::atomic::AtomicBool>
+{
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    if cpu >= cpu_count
+    {
+        return None;
+    }
+    let base = NMI_BACKTRACE_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if base.is_null()
+    {
+        return None;
+    }
+    // SAFETY: cpu < cpu_count; the slab covers cpu_count zero-initialised
+    // AtomicBool slots.
+    Some(unsafe { &*base.add(cpu) })
+}
 
 /// ICR delivery-mode + level encoding for an NMI IPI (`delivery_mode`=4 = NMI,
 /// level=assert, trigger=edge, `dest_shorthand`=none, vector=0/ignored).
@@ -347,8 +385,8 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
 /// Send an NMI (vector 2) to a target CPU. Used by the synchronous-IPI
 /// watchdog at Phase C to coax a backtrace dump from a CPU that has not
 /// acknowledged a sync IPI. The receiver's vector-2 handler consults
-/// [`NMI_BACKTRACE_REQUEST`] to distinguish a watchdog ping from a real
-/// hardware NMI.
+/// the per-CPU `nmi_backtrace_request` flag to distinguish a watchdog ping
+/// from a real hardware NMI.
 ///
 /// # Safety
 /// `target_apic_id` must be a valid APIC ID of an online CPU.
@@ -391,7 +429,7 @@ pub struct IpiWaitCtx<'a>
 ///   then continue spinning. Recovers from a dropped IPI under
 ///   emulators with non-deterministic LAPIC delivery.
 /// - **C** (750 ms → ~5 s): at the boundary, set
-///   [`NMI_BACKTRACE_REQUEST`] for `ctx.target_cpu` and send a vector-2
+///   the `nmi_backtrace_request` flag for `ctx.target_cpu` and send a vector-2
 ///   NMI to that CPU. The receiver's handler dumps its
 ///   `ExceptionFrame` to serial so a subsequent panic is diagnosable.
 /// - **D** (>5 s): print the context and fatal.
@@ -434,11 +472,10 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
         }
         if !nmi_sent && elapsed_ms >= 750
         {
-            if ctx.target_cpu < crate::sched::MAX_CPUS
+            if let Some(flag) = nmi_backtrace_request(ctx.target_cpu)
             {
-                NMI_BACKTRACE_REQUEST[ctx.target_cpu]
-                    .store(true, core::sync::atomic::Ordering::Release);
-                // SAFETY: target_cpu validated < MAX_CPUS; apic_id_for is
+                flag.store(true, core::sync::atomic::Ordering::Release);
+                // SAFETY: target_cpu is an online CPU index; apic_id_for is
                 // read-only after init.
                 let apic_id = unsafe { crate::percpu::apic_id_for(ctx.target_cpu) };
                 // SAFETY: apic_id is a valid hardware LAPIC ID for an online CPU.

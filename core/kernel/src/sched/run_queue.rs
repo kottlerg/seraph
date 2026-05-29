@@ -24,22 +24,6 @@ use super::NUM_PRIORITY_LEVELS;
 use super::thread::ThreadControlBlock;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use super::MAX_CPUS;
-
-// ── Per-CPU load tracking ─────────────────────────────────────────────────────
-
-/// Per-CPU load counters (number of Ready + Running threads).
-///
-/// Separate global array to avoid issues with `AtomicU32` in const-initialized
-/// `PerCpuScheduler` structs. Each entry is independently updated with Relaxed
-/// ordering; approximate load values are sufficient for load balancing.
-#[cfg(not(test))]
-static CPU_LOAD: [AtomicU32; MAX_CPUS] = {
-    // SAFETY: `AtomicU32` is `repr(transparent)` over `UnsafeCell<u32>`.
-    // Zero-initialized u32 array transmutes to valid array of `AtomicU32::new(0)`.
-    unsafe { core::mem::transmute::<[u32; MAX_CPUS], [AtomicU32; MAX_CPUS]>([0u32; MAX_CPUS]) }
-};
-
 // ── RunQueue ──────────────────────────────────────────────────────────────────
 
 /// Intrusive FIFO queue of ready TCBs at a single priority level.
@@ -222,11 +206,11 @@ pub struct PerCpuScheduler
     /// The lock disables interrupts while held, preventing timer-driven deadlock.
     pub lock: crate::sync::Spinlock,
 
-    /// Logical CPU ID for this scheduler (0-based).
-    ///
-    /// Used to index into the `CPU_LOAD` array for load tracking.
-    /// Set during `sched::init` before the scheduler is used.
-    pub cpu_id: usize,
+    /// Approximate load counter (number of Ready + Running threads on this
+    /// CPU). Relaxed-updated; advisory for load balancing. Lives in the
+    /// scheduler rather than a `MAX_CPUS`-wide global so it scales with the
+    /// CPU count.
+    load: AtomicU32,
 
     /// Interrupt-flag word saved by `lock_raw` while this CPU's lock is held
     /// as part of an all-CPU-locks operation (`set_state_under_all_locks`,
@@ -266,7 +250,7 @@ impl PerCpuScheduler
             current: core::ptr::null_mut(),
             idle: core::ptr::null_mut(),
             lock: crate::sync::Spinlock::new(),
-            cpu_id: 0,
+            load: AtomicU32::new(0),
             saved_lock_flags: 0,
         }
     }
@@ -384,7 +368,7 @@ impl PerCpuScheduler
     /// all-CPU-locks walk (e.g. `sys_thread_set_priority` re-enqueues at the
     /// new priority on the same scheduler that reported `true`).
     ///
-    /// Decrements `CPU_LOAD[cpu_id]` iff the remove succeeded — the load
+    /// Decrements the load counter iff the remove succeeded — the load
     /// counter MUST match the actual queue contents. Callers that pair this
     /// with a follow-up `enqueue` on the same scheduler net-zero the load
     /// counter.
@@ -441,7 +425,7 @@ impl PerCpuScheduler
     #[cfg(not(test))]
     pub fn increment_load(&self)
     {
-        CPU_LOAD[self.cpu_id].fetch_add(1, Ordering::Relaxed);
+        self.load.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement the load counter when a thread leaves runnable state.
@@ -452,7 +436,7 @@ impl PerCpuScheduler
     #[cfg(not(test))]
     pub fn decrement_load(&self)
     {
-        CPU_LOAD[self.cpu_id].fetch_sub(1, Ordering::Relaxed);
+        self.load.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Get current load (number of runnable threads).
@@ -461,7 +445,7 @@ impl PerCpuScheduler
     #[cfg(not(test))]
     pub fn current_load(&self) -> u32
     {
-        CPU_LOAD[self.cpu_id].load(Ordering::Relaxed)
+        self.load.load(Ordering::Relaxed)
     }
 
     // Test stubs for host-side unit tests

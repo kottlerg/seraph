@@ -1000,6 +1000,9 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     );
     LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
 
+    // Per-CPU arch data (PerCpuData) and APIC-ID slabs.
+    crate::percpu::init_storage(n, allocator);
+
     // Arch-specific per-CPU tables. x86_64 only.
     #[cfg(target_arch = "x86_64")]
     {

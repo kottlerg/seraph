@@ -37,7 +37,7 @@
 //! add a test in the `tests` module, and update any assembly that addresses
 //! the struct by offset.
 
-use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::sched::MAX_CPUS;
 use crate::sched::thread::ThreadControlBlock;
@@ -52,7 +52,7 @@ use crate::sched::thread::ThreadControlBlock;
 /// # Safety
 /// Written once during single-threaded boot, then read-only during SMP.
 #[cfg(not(test))]
-static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
+static CPU_APIC_IDS_PTR: AtomicPtr<u32> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize the CPU-to-APIC-ID mapping from `BootInfo::cpu_ids`.
 ///
@@ -67,15 +67,17 @@ static mut CPU_APIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 #[cfg(not(test))]
 pub unsafe fn init_apic_ids(cpu_ids: &[u32])
 {
-    let take = core::cmp::min(cpu_ids.len(), MAX_CPUS);
-    // SAFETY: single-threaded boot; CPU_APIC_IDS is not accessed concurrently.
-    // Use raw pointer to avoid static-mut-refs lint.
-    let dst = core::ptr::addr_of_mut!(CPU_APIC_IDS);
-    // SAFETY: dst points to a valid [u32; MAX_CPUS] array; `take` is bounded
-    // above by both source and destination length; no aliasing during
-    // single-threaded boot.
+    let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
+    let take = core::cmp::min(cpu_ids.len(), cpu_count);
+    let dst = CPU_APIC_IDS_PTR.load(Ordering::Relaxed);
+    debug_assert!(
+        !dst.is_null(),
+        "init_apic_ids: CPU_APIC_IDS slab not allocated"
+    );
+    // SAFETY: single-threaded boot; the slab holds `cpu_count` u32 slots and
+    // `take <= cpu_count`; no aliasing during single-threaded boot.
     unsafe {
-        core::ptr::copy_nonoverlapping(cpu_ids.as_ptr(), (*dst).as_mut_ptr(), take);
+        core::ptr::copy_nonoverlapping(cpu_ids.as_ptr(), dst, take);
     }
 }
 
@@ -88,9 +90,14 @@ pub unsafe fn init_apic_ids(cpu_ids: &[u32])
 #[cfg(not(test))]
 pub unsafe fn apic_id_for(cpu: usize) -> u32
 {
-    debug_assert!(cpu < MAX_CPUS);
-    // SAFETY: cpu is validated in bounds; CPU_APIC_IDS is read-only after init_apic_ids.
-    unsafe { CPU_APIC_IDS[cpu] }
+    let base = CPU_APIC_IDS_PTR.load(Ordering::Relaxed);
+    debug_assert!(
+        !base.is_null(),
+        "apic_id_for: CPU_APIC_IDS slab not allocated"
+    );
+    // SAFETY: cpu < CPU_COUNT by caller contract; the slab holds CPU_COUNT
+    // u32 slots, read-only after init_apic_ids.
+    unsafe { *base.add(cpu) }
 }
 
 // ── Field offsets (must match #[repr(C)] layout) ──────────────────────────────
@@ -200,7 +207,55 @@ impl PerCpuData
 /// access occurs after the entry is published (sequenced by the AP
 /// synchronization barrier in SMP startup).
 #[cfg(not(test))]
-pub static mut PER_CPU: [PerCpuData; MAX_CPUS] = [const { PerCpuData::new() }; MAX_CPUS];
+static PER_CPU_PTR: AtomicPtr<PerCpuData> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Allocate the per-CPU [`PerCpuData`] and APIC-ID slabs, each sized to
+/// `cpu_count`, and publish their base pointers. Called from
+/// `sched::init_per_cpu_storage` (Phase 4), before [`init_bsp`] /
+/// [`init_apic_ids`] and before any SMP startup. The `PerCpuData` slab is
+/// zero-filled, which equals [`PerCpuData::new`] for every field.
+///
+/// # Panics
+/// Halts via `crate::fatal` on buddy exhaustion.
+#[cfg(not(test))]
+pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
+{
+    debug_assert!(
+        cpu_count <= MAX_CPUS,
+        "init_storage: cpu_count exceeds MAX_CPUS"
+    );
+
+    let pc_bytes = cpu_count * core::mem::size_of::<PerCpuData>();
+    let pc_ptr = crate::sched::alloc_zeroed_slab::<PerCpuData>(pc_bytes, allocator, "PER_CPU");
+    // SAFETY: the slab covers cpu_count PerCpuData entries; initialise each in
+    // place. PerCpuData::new() is all-zero (matching the slab's zero-fill); the
+    // explicit write documents the contract and mirrors the scheduler slab.
+    unsafe {
+        for cpu in 0..cpu_count
+        {
+            core::ptr::write(pc_ptr.add(cpu), PerCpuData::new());
+        }
+    }
+    PER_CPU_PTR.store(pc_ptr, Ordering::Release);
+
+    let id_bytes = cpu_count * core::mem::size_of::<u32>();
+    let id_ptr = crate::sched::alloc_zeroed_slab::<u32>(id_bytes, allocator, "CPU_APIC_IDS");
+    CPU_APIC_IDS_PTR.store(id_ptr, Ordering::Release);
+}
+
+/// Pointer to CPU `cpu`'s [`PerCpuData`]. Caller guarantees `cpu < CPU_COUNT`
+/// and that [`init_storage`] has run. Used internally and by AP GDT setup,
+/// which must write `tss_ptr` before GS-base is reinstalled.
+#[cfg(not(test))]
+#[inline]
+pub fn per_cpu_ptr(cpu: usize) -> *mut PerCpuData
+{
+    let base = PER_CPU_PTR.load(Ordering::Relaxed);
+    debug_assert!(!base.is_null(), "per_cpu_ptr: PER_CPU slab not allocated");
+    // SAFETY: cpu < CPU_COUNT by caller contract; the slab covers CPU_COUNT
+    // PerCpuData entries.
+    unsafe { base.add(cpu) }
+}
 
 // ── BSP initialisation ────────────────────────────────────────────────────────
 
@@ -216,8 +271,7 @@ pub static mut PER_CPU: [PerCpuData; MAX_CPUS] = [const { PerCpuData::new() }; M
 #[cfg(not(test))]
 pub unsafe fn init_bsp()
 {
-    // SAFETY: single-threaded Phase 5 boot; PER_CPU[0] is not accessed elsewhere.
-    let ptr = unsafe { core::ptr::addr_of_mut!(PER_CPU[0]) };
+    let ptr = per_cpu_ptr(0);
     // SAFETY: single-threaded boot phase; no concurrent access to PER_CPU[0].
     unsafe {
         (*ptr).cpu_id = 0;
@@ -242,9 +296,7 @@ pub unsafe fn init_bsp()
 #[cfg(not(test))]
 pub unsafe fn init_ap(cpu_id: u32)
 {
-    debug_assert!((cpu_id as usize) < MAX_CPUS);
-    // SAFETY: cpu_id validated < MAX_CPUS; PER_CPU[cpu_id] not yet in use.
-    let ptr = unsafe { core::ptr::addr_of_mut!(PER_CPU[cpu_id as usize]) };
+    let ptr = per_cpu_ptr(cpu_id as usize);
     // SAFETY: AP init; no concurrent access to PER_CPU[cpu_id] during AP startup.
     unsafe {
         (*ptr).cpu_id = cpu_id;
@@ -268,10 +320,10 @@ pub unsafe fn init_ap(cpu_id: u32)
 pub fn preempt_disable()
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: cpu < MAX_CPUS; preempt_count is exclusively owned by this CPU
-    // after init. No concurrent access from other CPUs.
+    // SAFETY: preempt_count is exclusively owned by this CPU after init; no
+    // concurrent access from other CPUs.
     unsafe {
-        let ptr = core::ptr::addr_of_mut!(PER_CPU[cpu].preempt_count);
+        let ptr = core::ptr::addr_of_mut!((*per_cpu_ptr(cpu)).preempt_count);
         *ptr = (*ptr).wrapping_add(1);
     }
 }
@@ -286,7 +338,7 @@ pub fn preempt_enable()
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     // SAFETY: same as preempt_disable — per-CPU exclusive access.
     unsafe {
-        let ptr = core::ptr::addr_of_mut!(PER_CPU[cpu].preempt_count);
+        let ptr = core::ptr::addr_of_mut!((*per_cpu_ptr(cpu)).preempt_count);
         debug_assert!(*ptr > 0, "preempt_enable: underflow on cpu {cpu}");
         *ptr = (*ptr).wrapping_sub(1);
     }
@@ -298,8 +350,8 @@ pub fn preempt_enable()
 pub fn preemption_disabled() -> bool
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
-    // SAFETY: cpu < MAX_CPUS; preempt_count is per-CPU, read-only here.
-    unsafe { PER_CPU[cpu].preempt_count > 0 }
+    // SAFETY: preempt_count is per-CPU, read-only here.
+    unsafe { (*per_cpu_ptr(cpu)).preempt_count > 0 }
 }
 
 // ── FPU owner cache (x86-64) ─────────────────────────────────────────────────
@@ -319,10 +371,10 @@ pub fn preemption_disabled() -> bool
 #[cfg(all(not(test), target_arch = "x86_64"))]
 pub fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
 {
-    debug_assert!(cpu < MAX_CPUS);
-    // SAFETY: cpu validated < MAX_CPUS; AtomicPtr permits concurrent access
-    // through a shared reference, and PER_CPU is alive for the program lifetime.
-    unsafe { &*core::ptr::addr_of!(PER_CPU[cpu].fpu_owner) }
+    // SAFETY: cpu < CPU_COUNT by caller contract; AtomicPtr permits concurrent
+    // access through a shared reference, and the PER_CPU slab is alive for the
+    // program lifetime.
+    unsafe { &*core::ptr::addr_of!((*per_cpu_ptr(cpu)).fpu_owner) }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

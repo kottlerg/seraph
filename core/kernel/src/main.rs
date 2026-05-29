@@ -1215,8 +1215,9 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // 2. Install per-CPU GS-base (IA32_GS_BASE → &PER_CPU[cpu_id]).
     //    After gdt::init_ap reloaded GS with selector 0, the GS shadow-register
     //    base is 0. Write the MSR here to restore GS-relative addressing.
-    // SAFETY: PER_CPU[cpu_id] allocated during Phase 8 (BSP); not yet accessed
-    // by this AP or any other CPU; called once per AP during startup.
+    // SAFETY: the PerCpuData slab was allocated in Phase 4 (sched::init_storage);
+    // this AP's entry is not yet accessed by any other CPU; called once per AP
+    // during startup.
     unsafe {
         percpu::init_ap(cpu_id);
     }

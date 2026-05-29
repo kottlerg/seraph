@@ -555,7 +555,7 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// **Acquisition path**: the RTC driver binary lives on the rootfs disk
 /// at `/services/drivers/<chip>` and is loaded lazily by devmgr.
 /// Init walks vfsd to `/services/drivers/` and hands devmgr a
-/// `RIGHTS_READ`-attenuated subtree cap via
+/// `LOOKUP | READ`-attenuated subtree cap via
 /// [`devmgr_labels::SET_DRIVERS_DIR`]. On the first
 /// [`devmgr_labels::QUERY_RTC_DEVICE`] after that handshake, devmgr
 /// walks the per-arch driver name (`cmos-rtc` on x86-64, `goldfish-rtc`
@@ -988,7 +988,7 @@ pub mod devmgr_labels
     /// thereafter.
     pub const QUERY_RTC_DEVICE: u64 = 5;
     /// Init-only handshake: install the
-    /// `RIGHTS_READ`-attenuated `/services/drivers/` namespace cap from
+    /// `LOOKUP | READ`-attenuated `/services/drivers/` namespace cap from
     /// which devmgr walks its on-disk driver binaries.
     ///
     /// Request: `data[0]` = caller's compiled

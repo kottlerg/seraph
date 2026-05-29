@@ -9,6 +9,9 @@
 //! crate so devmgr can use the same walker against the attenuated
 //! `/services/drivers/` subtree cap init delivers via
 //! `devmgr_labels::SET_DRIVERS_DIR`. Init's call sites continue to import
-//! through this module to avoid churn.
+//! the two walk fns through this module to avoid churn; callers that
+//! need [`ns_client::WalkedFile`] by name go through `ns_client` directly
+//! (no init call site does today, so re-exporting it here would be an
+//! unused import).
 
 pub use ns_client::{walk_to_dir, walk_to_file};

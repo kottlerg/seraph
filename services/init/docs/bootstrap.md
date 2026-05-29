@@ -107,16 +107,15 @@ directly without init involvement.
 
 ### Handover
 
-`service::phase3_svcmgr_handover` (`../src/service.rs:1231`, called
-from `../src/main.rs:886`) brings up the remaining bootstrap
-services, transfers the system-wide service registry to svcmgr,
-publishes the well-known caps, registers init-bootstrapped
-services with svcmgr, and hands init's own kernel objects to
-procmgr for reaping.
+`service::phase3_svcmgr_handover` (`../src/service.rs:1311`, called
+from `../src/main.rs`) brings up the remaining bootstrap services,
+transfers the system-wide service registry to svcmgr, publishes the
+well-known caps, registers init-bootstrapped services with svcmgr,
+and hands init's own kernel objects to procmgr for reaping.
 
 - Spawn svcmgr from `/services/svcmgr` with the `Universal` namespace
   policy and serve its bootstrap round
-  (`../src/service.rs:1341` → `create_svcmgr_from_file` at
+  (`../src/service.rs:1340` → `create_svcmgr_from_file` at
   `../src/service.rs:1135`; `setup_and_start_svcmgr` at
   `../src/service.rs:1213`).
 - Walk `system_root_cap` to `/services/drivers/` at `LOOKUP | READ`
@@ -139,54 +138,54 @@ procmgr for reaping.
   SEND at startup via `devmgr_labels::QUERY_RTC_DEVICE` on the
   `REGISTRY_QUERY_AUTHORITY`-tokened copy of devmgr's registry
   endpoint delivered in its bootstrap round
-  (`../src/service.rs:1372` → `bring_up_timed` at
-  `../src/service.rs:2077`, with `create_and_start_timed` at
-  `../src/service.rs:1980`).
+  (`../src/service.rs:1379` → `bring_up_timed` at
+  `../src/service.rs:2177`, with `create_and_start_timed` at
+  `../src/service.rs:1987`).
 - Spawn pwrmgr with the arch authority cap
   (`IoPortRange` on x86-64, `SbiControl` on RISC-V) and the
   ACPI Frame caps; capture pwrmgr's service endpoint and main
-  thread cap (`../src/service.rs:1383` →
+  thread cap (`../src/service.rs:1390` →
   `create_and_start_pwrmgr` at `../src/service.rs:796`).
 - Derive a `PUBLISH_AUTHORITY`-tokened `RIGHTS_SEND_GRANT` cap on
-  svcmgr's service endpoint (`../src/service.rs:1409`) and
+  svcmgr's service endpoint (`../src/service.rs:1419`) and
   publish five well-known names via `PUBLISH_ENDPOINT`:
   - `rootfs.root` — tokened SEND on the root filesystem's
     namespace endpoint at its root directory (FS-driver-agnostic
-    by design) (`../src/service.rs:1422`).
+    by design) (`../src/service.rs:1429`).
   - `pwrmgr.shutdown` — `SHUTDOWN_AUTHORITY`-tokened SEND on
-    pwrmgr's service endpoint (`../src/service.rs:1443`).
+    pwrmgr's service endpoint (`../src/service.rs:1450`).
   - `pwrmgr.deny` — non-AUTHORITY SEND on pwrmgr's service
-    endpoint (negative-test twin) (`../src/service.rs:1455`).
+    endpoint (negative-test twin) (`../src/service.rs:1462`).
   - `svcmgr` — un-tokened SEND on svcmgr's own service endpoint
-    (`../src/service.rs:1475`).
+    (`../src/service.rs:1482`).
   - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-tokened SEND
-    on devmgr's registry endpoint. Consumers needing to resolve a
-    device driver themselves (today: `programs/fb-charset` →
-    `QUERY_FRAMEBUFFER_DEVICE`; future: any non-init caller of
-    devmgr's discovery surface) seed this name. The token bit
-    survives svcmgr's plain `cap_derive` in
-    `registry_lookup_derived`.
+    on devmgr's registry endpoint (`../src/service.rs:1505`).
+    Consumers needing to resolve a device driver themselves
+    (today: `programs/fb-charset` → `QUERY_FRAMEBUFFER_DEVICE`;
+    future: any non-init caller of devmgr's discovery surface)
+    seed this name. The token bit survives svcmgr's plain
+    `cap_derive` in `registry_lookup_derived`.
 
   Name constants are centralised in `ipc::published_names`.
 - Register each init-bootstrapped service with svcmgr via the v3
   `REGISTER_SERVICE` wire (name + thread cap)
-  (`../src/service.rs:1521`–`../src/service.rs:1543`;
+  (`../src/service.rs:1528`–`../src/service.rs:1550`;
   `register_service` helper at `../src/service.rs:1273`).
   Registration set: `memmgr`, `procmgr`, `devmgr`, `vfsd`,
   `logd`, `timed`, `pwrmgr`. svcmgr reconciles each against the
   matching `<name>.svc` recipe in `/config/svcmgr/services/` and
   binds death-notification — see
   [`../../svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md).
-- Signal `HANDOVER_COMPLETE` (`../src/service.rs:1545`). svcmgr
+- Signal `HANDOVER_COMPLETE` (`../src/service.rs:1552`). svcmgr
   scans `/config/svcmgr/services/` and launches any
   defined-but-unregistered services from disk.
 - Hand init's kernel-object caps (`AddressSpace`, `CSpace`, main
   `Thread`, init-logd `Thread`) and every reclaimable Frame cap
   (segments, stack, `InitInfo` region, IPC buffer) to procmgr via
-  `REGISTER_INIT_TEARDOWN` (`../src/service.rs:1558` →
-  `handoff_to_procmgr_reap` at `../src/service.rs:1579`). IPC
+  `REGISTER_INIT_TEARDOWN` (`../src/service.rs:1565` →
+  `handoff_to_procmgr_reap` at `../src/service.rs:1586`). IPC
   cap-transfer MOVES the caps, so they leave init's CSpace.
-- Call `sys_thread_exit` (`../src/service.rs:1567`). Procmgr's
+- Call `sys_thread_exit` (`../src/service.rs:1574`). Procmgr's
   death-EQ observer (bound on init's main thread with
   `INIT_REAP_CORRELATOR`) fires and runs
   [`init_reap::run_reap`](../../procmgr/src/init_reap.rs): both

@@ -2141,15 +2141,23 @@ fn set_drivers_dir_on_devmgr(devmgr_registry_ep: u32, system_root_cap: u32, ipc_
     {
         Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS =>
         {
+            // Kernel transferred `drivers_dir` to devmgr; nothing
+            // for init to clean up.
             log("phase 3: SET_DRIVERS_DIR handshake ok");
         }
-        Ok(reply) =>
+        Ok(_reply) =>
         {
+            // Devmgr replied an error after the kernel transferred
+            // the cap. Per the SET_DRIVERS_DIR contract, devmgr's
+            // error paths release the delivered cap themselves.
             log("phase 3: SET_DRIVERS_DIR rejected; RTC unavailable");
-            let _ = reply;
         }
         Err(_) =>
         {
+            // ipc_call returned before the kernel committed the
+            // transfer; the source slot still owns `drivers_dir`
+            // and must be released.
+            let _ = syscall::cap_delete(drivers_dir);
             log("phase 3: SET_DRIVERS_DIR ipc_call error; RTC unavailable");
         }
     }

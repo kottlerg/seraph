@@ -53,11 +53,14 @@
 ///     for the framebuffer dies with UEFI `ExitBootServices`; the kernel
 ///     forwards what the bootloader captured so devmgr can spawn the
 ///     userspace framebuffer driver (`services/drivers/framebuffer/`).
-/// v9: Raised [`INIT_MAX_NAMED_MODULES`] from 8 to 12 to accommodate
-///     the RTC chip drivers (`cmos-rtc` / `goldfish-rtc`) added to the
-///     bundle by #164 and headroom for near-roadmap modules. Pure
-///     constant bump; the [`InitInfo::module_names`] array grows in
-///     size but the field layout is otherwise unchanged.
+/// v9: Raised [`INIT_MAX_NAMED_MODULES`] from 8 to 12 — pure headroom for
+///     near-roadmap bundle modules without further re-bumps. The current
+///     bootstrap-essential set fits in 8 (#164 deliberately keeps the
+///     per-arch RTC drivers off the bundle and on the rootfs); the
+///     headroom accommodates upcoming non-RTC additions such as the
+///     keyboard driver. Pure constant bump; the
+///     [`InitInfo::module_names`] array grows in size but the field
+///     layout is otherwise unchanged.
 pub const INIT_PROTOCOL_VERSION: u32 = 9;
 
 /// Length of [`InitModuleName::name`], matching
@@ -68,8 +71,9 @@ pub const INIT_MODULE_NAME_LEN: usize = 32;
 /// Maximum number of named boot-module entries the kernel can publish in
 /// [`InitInfo::module_names`]. Sized to comfortably cover the current
 /// `procmgr, devmgr, memmgr, vfsd, virtio-blk, serial, framebuffer,
-/// cmos-rtc / goldfish-rtc, fatfs` set plus future modules before the
-/// table fills.
+/// fatfs` bootstrap-essential set plus future modules (e.g. keyboard)
+/// before the table fills. Non-bootstrap drivers (the per-arch RTC)
+/// live on the rootfs and do not consume slots here.
 pub const INIT_MAX_NAMED_MODULES: usize = 12;
 
 // ── Address space constants ──────────────────────────────────────────────────

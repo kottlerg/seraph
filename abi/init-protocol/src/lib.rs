@@ -88,13 +88,20 @@ pub const INIT_MAX_NAMED_MODULES: usize = 12;
 ///
 /// The region spans one or more contiguous pages — enough for the header
 /// (which now includes the boot-module name table) followed by the
-/// variable-length [`CapDescriptor`] array. Placed below the stack.
-pub const INIT_INFO_VADDR: u64 = 0x7FFF_FFFF_8000;
+/// variable-length [`CapDescriptor`] array. Sized so the full
+/// [`INIT_INFO_MAX_PAGES`] fit between this address and the init stack's guard
+/// page (`INIT_STACK_TOP - INIT_STACK_PAGES - 1` = `0x7FFF_FFFF_9000`): the
+/// region occupies `[0x7FFF_FFFF_5000, 0x7FFF_FFFF_9000)`, the guard sits at
+/// `0x7FFF_FFFF_9000`, and the stack runs `[0x7FFF_FFFF_A000, INIT_STACK_TOP)`.
+/// A larger array (3+ pages) must not collide with the stack — that silently
+/// remaps descriptor pages onto stack frames and drops the trailing caps.
+pub const INIT_INFO_VADDR: u64 = 0x7FFF_FFFF_5000;
 
 /// Virtual address of the top of init's user stack.
 ///
 /// `INIT_STACK_PAGES` pages are mapped immediately below this address.
-/// One additional guard page (unmapped) sits below the stack.
+/// One additional guard page (unmapped) sits below the stack, and the
+/// [`InitInfo`] region (up to [`INIT_INFO_MAX_PAGES`]) sits below that.
 pub const INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
 
 /// Number of 4 KiB pages in init's user stack (16 KiB total).

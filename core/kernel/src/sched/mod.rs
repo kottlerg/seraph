@@ -85,6 +85,16 @@ static SCHEDULERS_PTR: core::sync::atomic::AtomicPtr<PerCpuScheduler> =
 static IDLE_TCBS_PTR: core::sync::atomic::AtomicPtr<MaybeUninit<ThreadControlBlock>> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
+/// Base pointer for the `[u64; cpu_count]` array of idle-thread kernel-stack
+/// tops, allocated in [`init_per_cpu_storage`]. The stacks themselves are
+/// drawn from the pristine buddy at Phase 4 — before the Phase-7 user-cap
+/// drain — so each is a contiguous order-2 block rather than an order-2
+/// block scraped from the fragmented post-drain residue. [`init`] reads
+/// slot `cpu` here and copies it into the idle TCB's `kernel_stack_top`.
+#[cfg(not(test))]
+static IDLE_STACK_TOPS_PTR: core::sync::atomic::AtomicPtr<u64> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
 /// Return the `PerCpuScheduler` pointer for `cpu`. Caller must guarantee
 /// `cpu < CPU_COUNT` and that [`init_per_cpu_storage`] has run.
 #[cfg(not(test))]
@@ -113,6 +123,34 @@ unsafe fn idle_tcb_ptr(cpu: usize) -> *mut MaybeUninit<ThreadControlBlock>
     );
     // SAFETY: cpu < cpu_count by caller contract; allocation covers cpu_count slots.
     unsafe { base.add(cpu) }
+}
+
+/// Return the idle-stack-top slot pointer for `cpu`. Same contract as
+/// [`idle_tcb_ptr`].
+#[cfg(not(test))]
+#[inline]
+unsafe fn idle_stack_top_slot(cpu: usize) -> *mut u64
+{
+    let base = IDLE_STACK_TOPS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(
+        !base.is_null(),
+        "idle_stack_top_slot: IDLE_STACK_TOPS_PTR not initialised"
+    );
+    // SAFETY: cpu < cpu_count by caller contract; allocation covers cpu_count slots.
+    unsafe { base.add(cpu) }
+}
+
+/// Order of a single idle-thread kernel stack: smallest `2^order >=
+/// KERNEL_STACK_PAGES`. With `KERNEL_STACK_PAGES = 4` this is order 2.
+#[cfg(not(test))]
+const fn idle_stack_order() -> usize
+{
+    let mut o = 0;
+    while (1usize << o) < KERNEL_STACK_PAGES
+    {
+        o += 1;
+    }
+    o
 }
 
 // ── Thread ID counter ─────────────────────────────────────────────────────────
@@ -822,24 +860,20 @@ fn idle_thread_entry(_cpu_id: u64) -> !
 
 /// Initialise per-CPU scheduler state and idle threads for `cpu_count` CPUs.
 ///
-/// For each CPU:
-/// 1. Allocates `KERNEL_STACK_PAGES` physical frames from the buddy allocator.
-/// 2. Converts the physical base to a virtual address via the direct map.
-/// 3. Creates an idle [`ThreadControlBlock`] with initial context pointing at
+/// The idle kernel stacks are allocated earlier, in [`init_per_cpu_storage`]
+/// (Phase 4), so they come from the pristine buddy; this function only reads
+/// each stack top back and, for each CPU:
+/// 1. Creates an idle [`ThreadControlBlock`] with initial context pointing at
 ///    [`idle_thread_entry`].
-/// 4. Registers the TCB as both `idle` and `current` in the CPU's scheduler.
+/// 2. Registers the TCB as both `idle` and `current` in the CPU's scheduler.
 ///
 /// Returns `cpu_count` (for use in the Phase 8 startup log message).
 ///
-/// # Panics
-/// Halts with `fatal()` if the buddy allocator cannot satisfy a stack
-/// allocation request.
-///
 /// # Safety
 /// Must be called exactly once, from the single boot thread, after Phase 3
-/// (page tables active) and Phase 4 (heap active).
+/// (page tables active) and Phase 4 (heap + idle stacks active).
 #[cfg(not(test))]
-pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
+pub fn init(cpu_count: u32) -> u32
 {
     debug_assert_eq!(
         CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed),
@@ -847,31 +881,13 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
         "sched::init: storage was not pre-initialised for this cpu_count"
     );
 
-    // Order for KERNEL_STACK_PAGES (4 pages = order 2).
-    // 2^order pages >= KERNEL_STACK_PAGES.
-    let stack_order = {
-        let mut o = 0;
-        while (1usize << o) < KERNEL_STACK_PAGES
-        {
-            o += 1;
-        }
-        o
-    };
-
     for cpu in 0..cpu_count as usize
     {
-        // 1. Allocate stack frames.
-        let stack_phys = allocator
-            .alloc(stack_order)
-            .unwrap_or_else(|| crate::fatal("sched::init: out of memory for idle stack"));
+        // Idle stack top pre-allocated in Phase 4.
+        // SAFETY: cpu < cpu_count; slab populated by init_per_cpu_storage.
+        let stack_top = unsafe { *idle_stack_top_slot(cpu) };
 
-        // 2. Convert physical address to virtual (direct map).
-        let stack_virt = phys_to_virt(stack_phys);
-
-        // Stack grows downward; top = base + size.
-        let stack_top = stack_virt + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
-
-        // 3. Build idle TCB.
+        // Build idle TCB.
         let saved = new_state(
             idle_thread_entry as *const () as u64,
             stack_top,
@@ -991,6 +1007,27 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         alloc_zeroed_slab::<MaybeUninit<ThreadControlBlock>>(tcb_bytes, allocator, "IDLE_TCBS");
     IDLE_TCBS_PTR.store(tcb_ptr, core::sync::atomic::Ordering::Release);
 
+    // Idle-stack-top slab, then one idle kernel stack per CPU drawn from the
+    // pristine buddy. Done here, in Phase 4, rather than in `init` (Phase 8):
+    // before the Phase-7 user-cap drain the buddy still holds large contiguous
+    // blocks, so each order-2 stack is a clean split. After the drain the only
+    // free blocks are the memory map's order-0/1 fragments, which cannot back
+    // an order-2 stack. `init` reads the tops back from this slab.
+    let tops_bytes = n * core::mem::size_of::<u64>();
+    let tops_ptr = alloc_zeroed_slab::<u64>(tops_bytes, allocator, "IDLE_STACK_TOPS");
+    let stack_order = idle_stack_order();
+    for cpu in 0..n
+    {
+        let stack_phys = allocator
+            .alloc(stack_order)
+            .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: out of memory for idle stack"));
+        // Stack grows downward; top = base + size (direct map).
+        let stack_top = phys_to_virt(stack_phys) + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+        // SAFETY: tops_ptr covers n slots; cpu < n.
+        unsafe { core::ptr::write(tops_ptr.add(cpu), stack_top) };
+    }
+    IDLE_STACK_TOPS_PTR.store(tops_ptr, core::sync::atomic::Ordering::Release);
+
     // Per-CPU watchdog last-non-idle-tick slab (zeroed AtomicU64 per CPU).
     let tick_bytes = n * core::mem::size_of::<core::sync::atomic::AtomicU64>();
     let tick_ptr = alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(
@@ -1050,7 +1087,7 @@ pub(crate) fn alloc_zeroed_slab<T>(
 /// arch-specific or heap types that are unavailable on the host.
 #[cfg(test)]
 #[allow(unused_variables)]
-pub fn init(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) -> u32
+pub fn init(_cpu_count: u32) -> u32
 {
     0
 }

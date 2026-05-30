@@ -344,7 +344,7 @@ unsafe fn kernel_entry_post_rebase(
     // APs are not yet started; sched::init allocates idle threads for all CPUs
     // so AP startup can call sched::ap_enter without re-allocating.
     kprintln!("Phase 8: Scheduler and SMP Bringup");
-    let cpu_count = sched::init(boot_cpu_count, allocator);
+    let cpu_count = sched::init(boot_cpu_count);
     kprintln!(
         "scheduler initialised, {} CPU{}",
         cpu_count,

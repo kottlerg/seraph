@@ -3,7 +3,8 @@
 
 // kernel/src/arch/x86_64/interrupts.rs
 
-//! x86-64 interrupt controller (xAPIC) and Phase 5 interrupt initialisation.
+//! x86-64 interrupt controller (xAPIC / x2APIC) and Phase 5 interrupt
+//! initialisation.
 //!
 //! Orchestrates GDT, IDT, SMEP/SMAP, and the local APIC in the correct order:
 //!
@@ -17,17 +18,22 @@
 //! Interrupts are **not** enabled here; `timer::init()` enables them after the
 //! APIC timer is calibrated and configured.
 //!
-//! # xAPIC layout
-//! The local APIC base physical address is supplied by the bootloader through
-//! `BootInfo.kernel_mmio.lapic_base` (see [`super::platform::lapic_base`]),
-//! and accessed via the kernel's direct physical map at
-//! `DIRECT_MAP_BASE + lapic_base()`.
+//! # Local APIC access
+//! Two access modes share a single accessor pair ([`apic_read`] /
+//! [`apic_write`]), gated on [`X2APIC_ENABLED`]:
+//! - **xAPIC** (MMIO): registers live at `DIRECT_MAP_BASE + lapic_base() +
+//!   offset`, where `lapic_base` comes from the bootloader through
+//!   `BootInfo.kernel_mmio.lapic_base` (see [`super::platform::lapic_base`]).
+//! - **x2APIC** (MSR): the CPU advertises x2APIC via CPUID.01H:ECX[21]; Phase
+//!   5 sets `IA32_APIC_BASE.EXTD` and each register maps to MSR
+//!   `0x800 + (offset >> 4)`. The ICR collapses to one 64-bit MSR write (see
+//!   [`apic_send_icr`]). Enabling x2APIC disables the xAPIC MMIO window, so
+//!   every local-APIC access must route through the accessor — the I/O APIC
+//!   (separate hardware) is unaffected and stays MMIO.
 //!
 //! # Modification notes
 //! - To handle a new device IRQ: call `register_handler(vec, handler)` and
 //!   call `unmask(vec)`. Full routing is deferred to a later phase.
-//! - To migrate to x2APIC: replace `apic_read`/`apic_write` with MSR accesses
-//!   (`IA32_X2APIC_`*) and update the SVR/LVT offsets.
 
 // cast_possible_truncation: u64→usize/u8 APIC address arithmetic; bounded by APIC layout.
 // cast_lossless: u8→u32 vector casts are always widening.
@@ -72,16 +78,83 @@ const IST_STACK_SIZE: usize = 8192;
 #[cfg(not(test))]
 static mut BSP_IST_STACKS: [u8; IST_STACK_SIZE * 2] = [0u8; IST_STACK_SIZE * 2];
 
+// ── x2APIC mode ───────────────────────────────────────────────────────────────
+
+/// `IA32_APIC_BASE` MSR: bit 10 (EXTD) selects x2APIC mode, bit 11 (EN) is the
+/// global APIC enable.
+const IA32_APIC_BASE: u32 = 0x1B;
+const APIC_BASE_GLOBAL_ENABLE: u64 = 1 << 11;
+const APIC_BASE_X2APIC_ENABLE: u64 = 1 << 10;
+
+/// `IA32_X2APIC_ICR` MSR. In x2APIC mode the ICR is a single 64-bit register:
+/// destination in bits [63:32], command word in bits [31:0].
+const IA32_X2APIC_ICR: u32 = 0x830;
+
+/// CPUID.01H:ECX bit 21 — x2APIC supported.
+const CPUID_ECX_X2APIC: u32 = 1 << 21;
+
+/// True once the local APIC is driven through x2APIC MSRs rather than the
+/// xAPIC MMIO window. Decided once on the BSP at Phase 5 from CPUID.01H:ECX[21];
+/// each AP mirrors the mode by setting `IA32_APIC_BASE.EXTD` in [`init_ap`]
+/// (EXTD is per-CPU MSR state). x2APIC support is uniform across a package, so a
+/// single global flag is correct. The write happens before any AP exists, so
+/// `Relaxed` ordering suffices.
+#[cfg(not(test))]
+static X2APIC_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether this CPU drives the APIC through x2APIC MSRs.
+#[cfg(not(test))]
+#[inline]
+fn x2apic_enabled() -> bool
+{
+    X2APIC_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns true when the CPU advertises x2APIC (CPUID.01H:ECX[21]).
+#[cfg(not(test))]
+fn x2apic_supported() -> bool
+{
+    let (_eax, _ebx, ecx, _edx) = cpu::cpuid(1);
+    ecx & CPUID_ECX_X2APIC != 0
+}
+
+/// Switch the executing CPU into x2APIC mode by setting `IA32_APIC_BASE.EXTD`
+/// (preserving the global-enable bit firmware already set).
+///
+/// # Safety
+/// Ring 0. The CPU must advertise x2APIC (caller checks [`x2apic_supported`]).
+#[cfg(not(test))]
+unsafe fn enable_x2apic_this_cpu()
+{
+    // SAFETY: IA32_APIC_BASE exists on every x86-64 local APIC; ring 0.
+    unsafe {
+        let base = cpu::read_msr(IA32_APIC_BASE);
+        cpu::write_msr(
+            IA32_APIC_BASE,
+            base | APIC_BASE_GLOBAL_ENABLE | APIC_BASE_X2APIC_ENABLE,
+        );
+    }
+}
+
 // ── APIC register access ──────────────────────────────────────────────────────
 
-/// Write `val` to APIC register at `offset` bytes from the APIC base.
+/// Write `val` to the local-APIC register at `offset` bytes from the xAPIC
+/// base (an x2APIC MSR index of `0x800 + (offset >> 4)` in x2APIC mode).
+///
+/// The ICR is sent via [`apic_send_icr`] and must not pass through here.
 ///
 /// # Safety
 /// Must only be called after Phase 3 (direct map active) and with a valid
-/// APIC register offset.
+/// 16-byte-aligned APIC register offset.
 #[cfg(not(test))]
-unsafe fn apic_write(offset: usize, val: u32)
+pub(super) unsafe fn apic_write(offset: usize, val: u32)
 {
+    if x2apic_enabled()
+    {
+        // SAFETY: offset names a valid 16-byte-aligned APIC register; ring 0.
+        unsafe { cpu::write_msr(0x800 + (offset >> 4) as u32, u64::from(val)) };
+        return;
+    }
     let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
     // SAFETY: vaddr is within the direct-mapped APIC MMIO region.
     unsafe {
@@ -89,10 +162,16 @@ unsafe fn apic_write(offset: usize, val: u32)
     }
 }
 
-/// Read an APIC register at `offset` bytes from the APIC base.
+/// Read the local-APIC register at `offset` bytes from the xAPIC base (an
+/// x2APIC MSR index of `0x800 + (offset >> 4)` in x2APIC mode).
 #[cfg(not(test))]
-fn apic_read(offset: usize) -> u32
+pub(super) fn apic_read(offset: usize) -> u32
 {
+    if x2apic_enabled()
+    {
+        // SAFETY: offset names a valid 16-byte-aligned APIC register; ring 0.
+        return unsafe { cpu::read_msr(0x800 + (offset >> 4) as u32) as u32 };
+    }
     let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
     // SAFETY: vaddr is within the direct-mapped APIC MMIO region.
     unsafe { core::ptr::read_volatile(vaddr as *const u32) }
@@ -154,9 +233,25 @@ pub unsafe fn init()
         idt::init();
     }
 
+    // 4a. Switch into x2APIC mode when the CPU advertises it, before any APIC
+    //     register access below: once EXTD is set the xAPIC MMIO window is
+    //     gone, so the SVR/LVT writes must route through the x2APIC MSRs.
+    // SAFETY: ring-0 boot; the MSR write is gated on CPUID advertisement.
+    unsafe {
+        if x2apic_supported()
+        {
+            enable_x2apic_this_cpu();
+            X2APIC_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    crate::kprintln!(
+        "interrupts: local APIC mode = {}",
+        if x2apic_enabled() { "x2APIC" } else { "xAPIC" }
+    );
+
     // 5. Software-enable the local APIC.
     // Set SVR bit 8 (APIC Software Enable) and program spurious vector 255.
-    // SAFETY: direct map is active; APIC MMIO base is valid kernel mapping; SVR write is architecture-defined.
+    // SAFETY: direct map / x2APIC MSRs active; SVR write is architecture-defined.
     unsafe {
         apic_write(APIC_SVR, apic_read(APIC_SVR) | 0x100 | 0xFF);
     }
@@ -262,12 +357,16 @@ pub fn nmi_backtrace_request(cpu: usize) -> Option<&'static core::sync::atomic::
 /// level=assert, trigger=edge, `dest_shorthand`=none, vector=0/ignored).
 const ICR_NMI: u32 = 0x0000_4400;
 
-/// Read this CPU's local APIC ID (bits [31:24] of the APIC ID register).
+/// Read this CPU's local APIC ID.
+///
+/// xAPIC packs the 8-bit ID in bits [31:24] of the APIC ID register; x2APIC
+/// exposes the full 32-bit ID with no shift.
 #[allow(dead_code)] // Part of the arch interface; will be used by future SMP topology code.
 #[cfg(not(test))]
 pub fn lapic_id() -> u32
 {
-    apic_read(APIC_ID) >> 24
+    let raw = apic_read(APIC_ID);
+    if x2apic_enabled() { raw } else { raw >> 24 }
 }
 
 /// No-op test stub.
@@ -277,16 +376,46 @@ pub fn lapic_id() -> u32
     0
 }
 
+/// Issue one ICR command targeting hardware APIC ID `dest`.
+///
+/// xAPIC mode writes `ICR_HIGH` (destination) then `ICR_LOW` (command); x2APIC
+/// mode writes the single 64-bit `IA32_X2APIC_ICR` MSR with the full 32-bit
+/// destination in the high dword. Callers serialise with [`wait_icr_idle`]
+/// (a no-op in x2APIC, which has no delivery-status bit).
+///
+/// # Safety
+/// Ring 0; `dest` must be a valid APIC ID and `cmd` a valid ICR command word.
+#[cfg(not(test))]
+unsafe fn apic_send_icr(dest: u32, cmd: u32)
+{
+    if x2apic_enabled()
+    {
+        // SAFETY: IA32_X2APIC_ICR is writable in x2APIC mode; ring 0.
+        unsafe { cpu::write_msr(IA32_X2APIC_ICR, (u64::from(dest) << 32) | u64::from(cmd)) };
+        return;
+    }
+    // SAFETY: APIC MMIO is valid; ICR_HIGH takes the destination in bits [31:24].
+    unsafe {
+        apic_write(APIC_ICR_HIGH, dest << 24);
+        apic_write(APIC_ICR_LOW, cmd);
+    }
+}
+
 /// Spin until the ICR delivery status bit clears (IPI accepted by hardware).
 ///
 /// The bit clears within microseconds on a healthy LAPIC; 1M iterations
 /// is far beyond any architectural timing. Exhaustion indicates a
 /// hardware-level fault (stuck APIC, emulator bug) rather than a
 /// schedulable race, so we fatal rather than return a status all four
-/// callers historically ignored.
+/// callers historically ignored. x2APIC has no delivery-status bit (the ICR
+/// MSR write is not pipelined), so the wait is skipped in that mode.
 #[cfg(not(test))]
 unsafe fn wait_icr_idle()
 {
+    if x2apic_enabled()
+    {
+        return;
+    }
     let mut n = 0u64;
     while apic_read(APIC_ICR_LOW) & ICR_PENDING != 0
     {
@@ -306,13 +435,11 @@ unsafe fn wait_icr_idle()
 #[cfg(not(test))]
 unsafe fn send_init_ipi(target_apic_id: u32)
 {
-    // SAFETY: Local APIC MMIO base is valid kernel mapping; ICR writes follow Intel SDM INIT sequence.
+    // SAFETY: ICR writes follow the Intel SDM INIT assert/de-assert sequence.
     unsafe {
-        apic_write(APIC_ICR_HIGH, target_apic_id << 24);
-        apic_write(APIC_ICR_LOW, ICR_INIT_ASSERT);
+        apic_send_icr(target_apic_id, ICR_INIT_ASSERT);
         wait_icr_idle();
-        apic_write(APIC_ICR_HIGH, target_apic_id << 24);
-        apic_write(APIC_ICR_LOW, ICR_INIT_DEASSERT);
+        apic_send_icr(target_apic_id, ICR_INIT_DEASSERT);
         wait_icr_idle();
     }
 }
@@ -324,10 +451,9 @@ unsafe fn send_init_ipi(target_apic_id: u32)
 #[cfg(not(test))]
 unsafe fn send_sipi(target_apic_id: u32, vector: u8)
 {
-    // SAFETY: Local APIC MMIO base is valid kernel mapping; ICR SIPI write follows Intel SDM STARTUP sequence.
+    // SAFETY: ICR SIPI write follows the Intel SDM STARTUP sequence.
     unsafe {
-        apic_write(APIC_ICR_HIGH, target_apic_id << 24);
-        apic_write(APIC_ICR_LOW, ICR_SIPI_BASE | vector as u32);
+        apic_send_icr(target_apic_id, ICR_SIPI_BASE | vector as u32);
         wait_icr_idle();
     }
 }
@@ -346,14 +472,9 @@ pub unsafe fn send_tlb_shootdown_ipi(target_apic_id: u32)
     // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
     unsafe { wait_icr_idle() };
 
-    // SAFETY: APIC MMIO region is valid; ICR_HIGH takes destination in bits [31:24].
+    // SAFETY: fixed delivery mode (0), vector 250, level=0, trigger=edge.
     unsafe {
-        apic_write(APIC_ICR_HIGH, target_apic_id << 24);
-    }
-
-    // SAFETY: Delivery mode 0 (fixed), vector 250, level=0, trigger=edge.
-    unsafe {
-        apic_write(APIC_ICR_LOW, u32::from(IPI_VECTOR_TLB_SHOOTDOWN));
+        apic_send_icr(target_apic_id, u32::from(IPI_VECTOR_TLB_SHOOTDOWN));
     }
 }
 
@@ -371,14 +492,9 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
     // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
     unsafe { wait_icr_idle() };
 
-    // SAFETY: APIC MMIO region is valid; ICR_HIGH takes destination in bits [31:24].
+    // SAFETY: fixed delivery mode (0), vector 251, level=0, trigger=edge.
     unsafe {
-        apic_write(APIC_ICR_HIGH, target_apic_id << 24);
-    }
-
-    // SAFETY: Fixed delivery mode (0), vector 251, level=0, trigger=edge.
-    unsafe {
-        apic_write(APIC_ICR_LOW, u32::from(IPI_VECTOR_WAKEUP));
+        apic_send_icr(target_apic_id, u32::from(IPI_VECTOR_WAKEUP));
     }
 }
 
@@ -395,13 +511,9 @@ pub unsafe fn send_nmi_to(target_apic_id: u32)
 {
     // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
     unsafe { wait_icr_idle() };
-    // SAFETY: APIC MMIO region is valid; ICR_HIGH takes destination in bits [31:24].
-    unsafe {
-        apic_write(APIC_ICR_HIGH, target_apic_id << 24);
-    }
     // SAFETY: ICR_NMI encodes delivery_mode=NMI (4), level=assert, trigger=edge.
     unsafe {
-        apic_write(APIC_ICR_LOW, ICR_NMI);
+        apic_send_icr(target_apic_id, ICR_NMI);
     }
 }
 
@@ -540,7 +652,18 @@ pub unsafe fn init_ap()
         fpu::cr0_set_ts();
     }
 
-    // SAFETY: AP has loaded GDT/IDT; Local APIC MMIO base is valid kernel mapping; SVR and LVT writes are architecture-defined.
+    // Mirror the BSP's APIC mode: EXTD is per-CPU MSR state that must be set on
+    // each hart before any APIC register access. The mode was decided once on
+    // the BSP in `init`.
+    // SAFETY: ring-0 AP boot; only writes EXTD when the BSP chose x2APIC.
+    unsafe {
+        if x2apic_enabled()
+        {
+            enable_x2apic_this_cpu();
+        }
+    }
+
+    // SAFETY: AP has loaded GDT/IDT; direct map / x2APIC MSRs active; SVR and LVT writes are architecture-defined.
     unsafe {
         apic_write(APIC_SVR, apic_read(APIC_SVR) | 0x100 | 0xFF);
         apic_write(APIC_LVT_TIMER, LVT_MASK);
@@ -610,7 +733,7 @@ pub fn are_enabled() -> bool
 /// Send the end-of-interrupt signal to the local APIC.
 ///
 /// Must be called from within an interrupt handler before returning.
-/// `_irq` is ignored for xAPIC (EOI register is level-independent).
+/// `_irq` is ignored (the local-APIC EOI register is level-independent).
 #[cfg(not(test))]
 pub fn acknowledge(_irq: u32)
 {

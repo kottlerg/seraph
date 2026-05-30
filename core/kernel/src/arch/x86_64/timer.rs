@@ -42,15 +42,16 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(test))]
 use super::interrupts;
 #[cfg(not(test))]
-use crate::mm::paging::DIRECT_MAP_BASE;
+use super::interrupts::{apic_read, apic_write};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Vector number assigned to the APIC timer interrupt.
 pub const TIMER_VECTOR: u8 = 32;
 
-/// APIC register offsets (relative to the APIC base reported by
-/// [`super::platform::lapic_base`]).
+/// APIC timer register offsets, passed to the shared
+/// [`super::interrupts::apic_write`] accessor (which translates them to the
+/// xAPIC MMIO window or the x2APIC MSRs depending on the active mode).
 const APIC_LVT_TIMER: usize = 0x320;
 const APIC_TIMER_INITIAL: usize = 0x380;
 const APIC_TIMER_CURRENT: usize = 0x390;
@@ -113,28 +114,6 @@ fn read_tsc() -> u64
         );
     }
     (hi as u64) << 32 | lo as u64
-}
-
-// ── APIC register helpers ─────────────────────────────────────────────────────
-
-#[cfg(not(test))]
-unsafe fn apic_write(offset: usize, val: u32)
-{
-    let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
-    // SAFETY: APIC base mapped via direct map (Phase 3); vaddr points to a
-    // valid APIC MMIO register within the 4 KiB APIC page.
-    unsafe {
-        core::ptr::write_volatile(vaddr as *mut u32, val);
-    }
-}
-
-#[cfg(not(test))]
-fn apic_read(offset: usize) -> u32
-{
-    let vaddr = (DIRECT_MAP_BASE + super::platform::lapic_base()) as usize + offset;
-    // SAFETY: APIC base mapped via direct map (Phase 3); vaddr points to a
-    // valid APIC MMIO register within the 4 KiB APIC page.
-    unsafe { core::ptr::read_volatile(vaddr as *const u32) }
 }
 
 // ── Port I/O helpers ──────────────────────────────────────────────────────────

@@ -110,7 +110,7 @@ This table is the authoritative per-transition rule set for the lifecycle syscal
 
 `preferred_cpu` is updated by `enqueue_and_wake` under the target CPU's scheduler.lock. Between a reader of `preferred_cpu` and the lock acquisition, a concurrent `enqueue_and_wake` on another CPU can move the TCB. Locking only `preferred_cpu`'s scheduler then walking that one queue is racy: the TCB may have been re-enqueued elsewhere. The current implementation locks every CPU's scheduler.lock in ascending order (preventing ABBA per [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 4), writes `Exited` once, then iterates `remove_from_queue` over every CPU. After the all-locks release, the TCB cannot be in any run queue (the `Exited` state under each lock prevented re-enqueue, and the explicit removal cleared any prior link).
 
-Cost on MAX_CPUS = 64 is up to 64 spinlock acquisitions per Thread dealloc, each leaf-leveled. This is acceptable for a teardown path that runs at most O(num-threads-created) times in the system's lifetime.
+Cost on MAX_CPUS = 512 is up to 512 spinlock acquisitions per Thread dealloc, each leaf-leveled. This is acceptable for a teardown path that runs at most O(num-threads-created) times in the system's lifetime.
 
 ---
 

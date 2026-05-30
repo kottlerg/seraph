@@ -494,7 +494,7 @@ unsafe fn kernel_entry_post_rebase(
 
         // Map each ELF LOAD segment into the init address space via
         // `map_page`, whose intermediate PT pages come from `kernel_pt_pool`
-        // (the kernel-direct legacy path). The wrapper's growth pool is
+        // (the kernel-direct path). The wrapper's growth pool is
         // reserved for init's later userspace pooled maps.
         for i in 0..init_image.segment_count as usize
         {

@@ -36,8 +36,10 @@ responsibilities are:
 - **Parse firmware tables** — read ACPI tables (x86-64) or Device Tree blob
   (RISC-V) from read-only frame capabilities to resolve interrupt routing,
   power domains, and the PCI hierarchy.
-- **Enumerate PCI devices** — map the ECAM MMIO region, read configuration
-  space, discover devices and BARs, resolve interrupt assignments. See
+- **Enumerate PCI devices** — reserve VA, fund the AS's page-table growth
+  budget via `fund_aspace_pt_budget`, then map the ECAM MMIO region via
+  `mmio_map`, read configuration space, discover devices and BARs, resolve
+  interrupt assignments. See
   [`docs/pci-enumeration.md`](docs/pci-enumeration.md).
 - **Bind drivers** — match discovered devices to driver binaries in
   [`drivers/`](../drivers/README.md), request procmgr to create driver

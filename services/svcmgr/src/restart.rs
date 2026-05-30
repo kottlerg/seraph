@@ -324,8 +324,8 @@ fn restart_process(
     // Reclaim the previous instance's kernel objects (thread/aspace/cspace/
     // ProcessInfo frame) before spawning a fresh one. CSpace teardown
     // cascades: frames handed to the dead process via `REQUEST_FRAMES`
-    // (which procmgr no longer holds caps on) get dec-ref'd and recycled
-    // back to the kernel buddy allocator. The initial instance was created
+    // (which procmgr no longer holds caps on) get dec-ref'd and reclaimed
+    // into memmgr's pool. The initial instance was created
     // by init, not svcmgr, so svcmgr has no handle for it — `process_handle
     // == 0` on first death, and we skip; subsequent deaths reclaim.
     if svc.process_handle != 0

@@ -273,7 +273,7 @@ Producer side (`enqueue_and_wake`, `core/kernel/src/sched/mod.rs`):
 5. Update tcb.preferred_cpu = target_cpu (so dealloc_object targets the
    correct scheduler).
 6. set_reschedule_pending_for(target_cpu).
-   (RESCHEDULE_PENDING.fetch_or(1 << target_cpu, Release).)
+   (RESCHEDULE_PENDING.set_cpu(target_cpu, Release).)
 7. Release target scheduler.lock.
 8. wake_idle_cpu(target_cpu)  →  sends IPI (always; see below).
 ```
@@ -302,7 +302,7 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs:444+`):
 
 ```
 1. Mask interrupts.
-2. pending = take_reschedule_pending(cpu)          // RESCHEDULE_PENDING.fetch_and(!bit, AcqRel)
+2. pending = take_reschedule_pending(cpu)          // RESCHEDULE_PENDING.take_cpu(cpu, AcqRel)
 3. has_work = scheduler_ptr(cpu).has_runnable()    // non_empty.load(Acquire)
 4. if pending || has_work {
        enable interrupts;
@@ -322,11 +322,11 @@ Consumer side (`idle_thread_entry`, `core/kernel/src/sched/mod.rs:444+`):
 
 4. **Always-IPI MUST be the policy in `wake_idle_cpu`.** Predicating IPI delivery on a per-CPU "is idle" hint is a missed-wakeup race: the producer can observe `running` while the target CPU has just halted in `hlt`/`wfi`, and the producer's enqueue + `RESCHEDULE_PENDING` set sit unobserved until the next interrupt. The IPI MUST be sent for every cross-CPU wake (skipping only self-wakes). Spurious IPIs to running targets cost only a trap entry; the cost is negligible against the missed-wakeup risk.
 
-5. **`take_reschedule_pending` MUST use AcqRel** (the Acquire half pairs with the producer's Release `fetch_or`; the Release half is conservative but avoids a separate-fence requirement).
+5. **`take_reschedule_pending` MUST use AcqRel** (the Acquire half pairs with the producer's Release `set_cpu`; the Release half is conservative but avoids a separate-fence requirement).
 
 **Why two signals.** `non_empty` (per-CPU `AtomicU32`, "Ready thread at some
 priority") is updated by enqueue/dequeue and is the dispatcher's signal.
-`RESCHEDULE_PENDING` (global `AtomicU64`, one bit per CPU) is set by
+`RESCHEDULE_PENDING` (global `AtomicCpuMask`, one bit per CPU) is set by
 `enqueue_and_wake` and is consumed by both the idle loop and `schedule()` on
 every entry to decide whether to skip optimisations. Collapsing the two would
 require restructuring `schedule()`.
@@ -426,7 +426,7 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 
 | Atomic | File:line | Set ordering | Read ordering | Pairing rationale |
 |---|---|---|---|---|
-| `RESCHEDULE_PENDING` | `sched/mod.rs:148` (decl), `:155–169` (ops) | Release on `set_reschedule_pending_for` (`fetch_or`) | AcqRel on `take_reschedule_pending` (`fetch_and`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
+| `RESCHEDULE_PENDING` (`AtomicCpuMask`) | `sched/mod.rs:189` (decl), `:196–207` (ops) | Release on `set_reschedule_pending_for` (`set_cpu`) | AcqRel on `take_reschedule_pending` (`take_cpu`) | Release publishes the producer's prior enqueue; AcqRel ensures the consumer sees the enqueue and synchronises both directions of the bit clear. |
 | `non_empty` (per PerCpuScheduler) | `sched/run_queue.rs` (decl in `PerCpuScheduler`; writes in `enqueue`, `dequeue_highest`, `remove_from_queue`; read in `has_runnable`) | Release on `enqueue.fetch_or`, `dequeue_highest.fetch_and`, `remove_from_queue.fetch_and` | Acquire on `has_runnable.load` | Release publishes the queue-mutation stores; the lockless idle-loop Acquire is the only synchronisation edge with cross-CPU enqueues on RVWMO. |
 | `context_saved` (per TCB) | `sched/thread.rs:254` (decl) | Release after `Context::switch` returns on the outgoing CPU | Acquire on the remote-dequeue spin-loop | Closes the partial-`SavedState`-visibility race on RVWMO; see [Cross-CPU TCB Ownership](#cross-cpu-tcb-ownership) for the full sequence. |
 | `bits` (Signal) | `ipc/signal.rs:39` (decl), `:109,130,237` (ops) | Relaxed `fetch_or` in `signal_send` (`:109`), Relaxed `swap` in `signal_wait` (`:237`) and `signal_send` slow path (`:130`) | (same — paired with the SeqCst fences below) | The Dekker fence pair below provides the cross-side ordering; the bits ops themselves are Relaxed because no other field needs to be synchronised relative to them. |

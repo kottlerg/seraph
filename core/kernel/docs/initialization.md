@@ -281,12 +281,11 @@ Phase 7, and `KERNEL_MMIO` is populated.
    - One cap per range with `owns_memory = true` and full byte ledger;
      inserted into the root CSpace so the cap reaches init through the
      standard `CapDescriptor` walk in Phase 9.
-   - The buddy ledger records each range via `register_owned_range`
-     so cap teardown returns the pages via `dealloc_object` →
-     `free_range` with the `total / free` ratio well-defined.
-   - Whether init donates each cap onward to memmgr or lets it cascade
-     back to the buddy on CSpace teardown is a userspace policy
-     decision; the kernel does not impose a route.
+   - The buddy ledger records each range's pages in `total_pages` via
+     `register_owned_range`; the range is never placed on the free
+     list. Init donates every reclaim cap to memmgr's pool at reap,
+     and the buddy is sealed after handoff, so no reclaim page returns
+     to it.
    - Ranges flagged `RECLAIM_FLAG_LATE` are skipped here and minted in
      Phase 8 (see Late-Reclaim below).
 5. Record the root CSpace pointer in a global for use in Phase 9
@@ -313,7 +312,8 @@ are excluded because `mint_module_frame_caps` already covers them).
    - NUM_PRIORITY_LEVELS priority queues per CPU (e.g. 32 levels)
    - Each queue is an intrusive doubly-linked list of TCBs
 2. For each CPU (including the BSP):
-   a. Allocate a kernel stack (KERNEL_STACK_SIZE pages from buddy allocator)
+   a. Use the idle kernel stack pre-allocated at per-CPU storage init
+      (Phase 4); read its top from the IDLE_STACK_TOPS slab
    b. Allocate and initialise an idle TCB:
       - Priority: IDLE_PRIORITY (lowest, reserved; never preempted)
       - Entry: arch::current::Context::new_state(idle_entry, stack_top, cpu_id, false)

@@ -46,7 +46,7 @@ The XSDT pointer at RSDP offset 24 is the authoritative table root; the
 
 | Table | Signature | Extracted into |
 |---|---|---|
-| MADT | `"APIC"` | `BootInfo.cpu_count` / `cpu_ids` via LAPIC (type 0) and RINTC (type 0x18). On x86-64: `BootInfo.kernel_mmio` LAPIC base (MADT header + type-5 override) and IOAPIC entries (type 1). On RISC-V: `BootInfo.kernel_mmio.plic_base` / `plic_size` from the first PLIC entry (type 0x1B). Aperture seeds for LAPIC, IOAPIC, and RISC-V PLIC. |
+| MADT | `"APIC"` | `BootInfo.cpu_count` / `cpu_ids` via LAPIC (type 0), Local x2APIC (type 9, 32-bit IDs), and RINTC (type 0x18). On x86-64: `BootInfo.kernel_mmio` LAPIC base (MADT header + type-5 override) and IOAPIC entries (type 1). On RISC-V: `BootInfo.kernel_mmio.plic_base` / `plic_size` from the first PLIC entry (type 0x1B). Aperture seeds for LAPIC, IOAPIC, and RISC-V PLIC. |
 | MCFG | `"MCFG"` | Aperture seeds for each ECAM window and the derived 32-bit / 64-bit PCI BAR windows (QEMU-layout heuristic; see `firmware-parsing.md` for the real-hardware `_CRS` note). |
 | SPCR | `"SPCR"` | RISC-V only: `BootInfo.kernel_mmio.uart_base` (from the Generic Address Structure when the address-space identifier is MMIO). `uart_size` is set to the ns16550a conventional 0x100 (SPCR does not carry a region size; if DTB also advertises the UART, DTB's explicit `reg` size overrides). The pre-Step-1 serial-init path uses the same walk to pick up a UART base for early diagnostics. |
 

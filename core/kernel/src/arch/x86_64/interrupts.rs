@@ -653,7 +653,7 @@ pub unsafe fn init_ap()
     }
 
     // Mirror the BSP's APIC mode: EXTD is per-CPU MSR state that must be set on
-    // each hart before any APIC register access. The mode was decided once on
+    // each CPU before any APIC register access. The mode is decided once on
     // the BSP in `init`.
     // SAFETY: ring-0 AP boot; only writes EXTD when the BSP chose x2APIC.
     unsafe {

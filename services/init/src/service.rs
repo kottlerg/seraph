@@ -1322,6 +1322,7 @@ pub fn phase3_svcmgr_handover(
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
     mem_frame_reap_floor: u32,
+    orphan_frames: &[u32],
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
@@ -1570,6 +1571,7 @@ pub fn phase3_svcmgr_handover(
         init_logd_thread_cap,
         ipc_buf,
         mem_frame_reap_floor,
+        orphan_frames,
     );
 
     log("main thread exiting; init handed off to procmgr for reap");
@@ -1630,6 +1632,7 @@ fn handoff_to_procmgr_reap(
     init_logd_thread_cap: u32,
     ipc_buf: *mut u64,
     mem_frame_reap_floor: u32,
+    orphan_frames: &[u32],
 )
 {
     // Round 1: kernel-object caps. `data[0] = 1` distinguishes from
@@ -1657,7 +1660,7 @@ fn handoff_to_procmgr_reap(
     }
 
     // Donate every owns_memory Frame cap init solely holds, streamed in
-    // MSG_CAP_SLOTS_MAX-sized rounds. Two disjoint sources:
+    // MSG_CAP_SLOTS_MAX-sized rounds. Three disjoint sources:
     //  - explicit InitInfo ranges (not in the descriptor array): init's ELF
     //    segments, user stack, and the InitInfo region. (init's IPC buffer is
     //    not here: it lives in init's bootstrap arena, forwarded to memmgr at
@@ -1665,6 +1668,8 @@ fn handoff_to_procmgr_reap(
     //  - a descriptor walk for the unnamed reclaimable Frame caps — the
     //    bootloader and bundle reclaim ranges plus the AP-trampoline late
     //    cap — which carry no named InitInfo slot.
+    //  - FrameAlloc's orphans: free remainders abandoned while carving the
+    //    bootstrap arenas, below the floor with no descriptor.
     // The walk skips caps init does not solely own or that are not RAM: the
     // consumed/forwarded usable-RAM prefix (below `mem_frame_reap_floor` —
     // `FrameAlloc` arenas and the frames `finalize_memmgr` already forwarded;
@@ -1721,6 +1726,15 @@ fn handoff_to_procmgr_reap(
                 continue;
             }
             push(s);
+        }
+        // The free Frame caps FrameAlloc abandoned while carving bootstrap
+        // arenas: frame_split remainders below the floor with no descriptor.
+        // Without this they would cascade into the sealed buddy at CSpace
+        // teardown and leak. They carry RETYPE + owns_memory like any RAM
+        // frame, so memmgr ingests them into its pool.
+        for &slot in orphan_frames
+        {
+            push(slot);
         }
     }
     if cn > 0

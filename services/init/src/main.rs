@@ -221,6 +221,13 @@ pub(crate) fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) 
 
 // ── Simple frame allocator ──────────────────────────────────────────────────
 
+/// Upper bound on Frame caps `advance_cap` can abandon with pages still free.
+/// One orphan is recorded per frame `FrameAlloc` moves off while it still has
+/// a usable remainder; with the drain's high→low ordering init carves its
+/// arenas from the largest frames and abandons only a handful of leftovers.
+/// Overflowing this is a hard error (it would silently leak), not a drop.
+const MAX_ORPHAN_FRAMES: usize = 64;
+
 /// Bump allocator over init's memory pool frame caps.
 ///
 /// Splits page-sized frames from the first available memory pool frame cap
@@ -236,6 +243,13 @@ pub(crate) struct FrameAlloc
     /// [`InitInfo`] fields copied out for reference.
     frame_base: u32,
     frame_count: u32,
+    /// Free Frame caps `advance_cap` moved off while they still held pages —
+    /// `frame_split` remainders (no `InitInfo` descriptor) and whole frames
+    /// too small for a pending multi-page request, both below the reap floor.
+    /// Nothing else can reach them, so they are streamed to memmgr's pool at
+    /// reap via [`orphan_frames`].
+    orphan_slots: [u32; MAX_ORPHAN_FRAMES],
+    orphan_count: usize,
 }
 
 impl FrameAlloc
@@ -248,7 +262,29 @@ impl FrameAlloc
             next_idx: 0,
             frame_base: info.memory_frame_base,
             frame_count: info.memory_frame_count,
+            orphan_slots: [0; MAX_ORPHAN_FRAMES],
+            orphan_count: 0,
         }
+    }
+
+    /// Free Frame caps abandoned during allocation, to be donated to memmgr at
+    /// reap so every page of RAM reaches the pool.
+    pub(crate) fn orphan_frames(&self) -> &[u32]
+    {
+        &self.orphan_slots[..self.orphan_count]
+    }
+
+    /// Record a Frame cap `advance_cap` is moving off while it still holds at
+    /// least one free page. Halts if the fixed orphan table overflows: silently
+    /// dropping would leak the cap into the sealed post-handoff buddy.
+    fn record_orphan(&mut self, slot: u32)
+    {
+        assert!(
+            self.orphan_count < MAX_ORPHAN_FRAMES,
+            "init: FrameAlloc orphan table overflow — raise MAX_ORPHAN_FRAMES"
+        );
+        self.orphan_slots[self.orphan_count] = slot;
+        self.orphan_count += 1;
     }
 
     /// Advance `self.current` to the next memory-pool Frame cap and read its
@@ -258,6 +294,14 @@ impl FrameAlloc
         if self.next_idx >= self.frame_count
         {
             return false;
+        }
+        // The frame we are leaving still holds `remaining` free bytes (it was
+        // too small for the pending multi-page request, or skipped whole).
+        // It is a free Frame cap below the reap floor that nothing else
+        // donates — record it so reap forwards it to memmgr's pool.
+        if self.remaining >= PAGE_SIZE
+        {
+            self.record_orphan(self.current);
         }
         self.current = self.frame_base + self.next_idx;
         self.next_idx += 1;
@@ -327,9 +371,9 @@ impl FrameAlloc
         let need = pages * PAGE_SIZE;
         // Bootstrap is single-threaded; the simplest correct behaviour is
         // to scan forward to the first cap large enough for the request.
-        // Caps that get skipped here are not "lost" — earlier `alloc_page`
-        // calls already carved their first pages; whatever fragments
-        // remain cannot satisfy a multi-page contiguous request anyway.
+        // Frames skipped here (the current leftover, or whole frames too
+        // small) are recorded as orphans by `advance_cap` and donated to
+        // memmgr's pool at reap, so no free RAM is lost.
         while self.remaining < need
         {
             if !self.advance_cap()
@@ -866,6 +910,7 @@ fn run(info_ptr: u64) -> !
         ipc_buf,
         init_logd_thread_cap,
         mem_frame_reap_floor,
+        alloc.orphan_frames(),
     );
 }
 

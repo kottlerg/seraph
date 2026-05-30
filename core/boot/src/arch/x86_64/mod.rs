@@ -77,42 +77,61 @@ pub unsafe fn discover_boot_hart_id(_st: *mut EfiSystemTable) -> u64
     0
 }
 
-/// Return the hardware identifier of the bootstrap processor.
+/// Execute `CPUID(leaf, subleaf)`, returning `(eax, ebx, ecx, edx)`.
 ///
-/// On x86-64 the BSP identifier is the APIC ID read from CPUID leaf 01H
-/// (EBX[31:24]). `_boot_hart_id` is unused on this arch — it exists so
-/// the arch-dispatch surface is identical between architectures.
-///
-/// Only the 8-bit xAPIC ID is read; platforms whose BSP has an APIC ID
-/// ≥ 256 require x2APIC (CPUID leaf 0x0B), which this reader does not
-/// return. Every board currently targeted by Seraph fits in xAPIC.
+/// `rbx` is callee-saved and reserved by LLVM as a base register in some
+/// codegen modes, so it is preserved with a push/pop pair. `nostack` is
+/// intentionally absent: the push/pop has net-zero RSP delta but
+/// transiently writes [RSP-8], latent only because the bootloader target
+/// is `x86_64-unknown-uefi` (MS x64 ABI, no red zone). Mirrors the
+/// kernel-side `cpu::cpuid` discipline.
 #[cfg(not(test))]
-pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
+fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32)
 {
+    let eax: u32;
     let ebx: u32;
-    // SAFETY: CPUID is always available on x86-64; leaf 1 is required.
-    // rbx is callee-saved and used by LLVM as the base register in some
-    // codegen modes. We must save/restore it manually when using CPUID.
-    // `nostack` is intentionally absent: the body push/pop pair has net
-    // zero RSP delta but transiently writes [RSP-8]. Latent today because
-    // the bootloader target is `x86_64-unknown-uefi` (MS x64 ABI, no red
-    // zone) so no caller data lives there. Match the kernel-side
-    // `cpu::cpuid` discipline which already omits `nostack` for this
-    // reason.
+    let ecx: u32;
+    let edx: u32;
+    // SAFETY: CPUID is universally available on x86-64; rbx preserved.
     unsafe {
         core::arch::asm!(
             "push rbx",
             "cpuid",
             "mov {ebx:e}, ebx",
             "pop rbx",
-            inout("eax") 1u32 => _,
+            inout("eax") leaf => eax,
             ebx = out(reg) ebx,
-            out("ecx") _,
-            out("edx") _,
+            inout("ecx") subleaf => ecx,
+            out("edx") edx,
             options(nomem),
         );
     }
-    // APIC ID is in EBX[31:24].
+    (eax, ebx, ecx, edx)
+}
+
+/// Return the hardware identifier of the bootstrap processor.
+///
+/// On x86-64 the BSP identifier is its local APIC ID. When CPUID leaf
+/// `0x0B` (Extended Topology Enumeration) is present its EDX carries the
+/// full 32-bit x2APIC ID; otherwise the 8-bit xAPIC ID from CPUID leaf
+/// 01H (EBX[31:24]) is used. `_boot_hart_id` is unused on this arch — it
+/// exists so the arch-dispatch surface is identical between architectures.
+#[cfg(not(test))]
+pub fn bsp_hardware_id(_boot_hart_id: u64) -> u32
+{
+    let (max_leaf, ..) = cpuid(0, 0);
+    if max_leaf >= 0x0B
+    {
+        let (_, ebx, _, edx) = cpuid(0x0B, 0);
+        // Leaf 0x0B is valid only when its level field (EBX[15:0]) is
+        // non-zero; EDX then holds the full 32-bit x2APIC ID.
+        if ebx & 0xFFFF != 0
+        {
+            return edx;
+        }
+    }
+    let (_, ebx, ..) = cpuid(1, 0);
+    // 8-bit xAPIC ID is in EBX[31:24].
     (ebx >> 24) & 0xFF
 }
 
@@ -141,40 +160,12 @@ pub fn default_pci_apertures() -> &'static [(u64, u64)]
 #[cfg(not(test))]
 pub fn max_phys_addr_bits() -> u8
 {
-    let max_ext: u32;
-    // SAFETY: CPUID leaf 0x80000000 is universally available on x86-64;
-    // rbx is callee-saved and reserved by LLVM in some codegen modes, so
-    // we save/restore it manually. See `bsp_hardware_id` above for why
-    // `nostack` is intentionally absent.
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "pop rbx",
-            inout("eax") 0x8000_0000u32 => max_ext,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem),
-        );
-    }
+    let (max_ext, ..) = cpuid(0x8000_0000, 0);
     if max_ext < 0x8000_0008
     {
         return 36;
     }
-    let eax: u32;
-    // SAFETY: leaf 0x80000008 is advertised by the preceding check.
-    // See `bsp_hardware_id` above for why `nostack` is intentionally absent.
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "cpuid",
-            "pop rbx",
-            inout("eax") 0x8000_0008u32 => eax,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem),
-        );
-    }
+    let (eax, ..) = cpuid(0x8000_0008, 0);
     let bits = (eax & 0xff) as u8;
     if bits == 0 { 36 } else { bits }
 }

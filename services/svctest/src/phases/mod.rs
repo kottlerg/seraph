@@ -25,6 +25,10 @@
 //! 4. `pwrmgr_shutdown_phase` is NOT in the registry — `main.rs`
 //!    calls it explicitly after [`run_all`](crate::runner::run_all)
 //!    returns and after the `ALL TESTS PASSED` marker is emitted.
+//! 5. [`memmgr::identity`] last: the all-RAM-accounted identity only
+//!    closes once init's reap donations reach memmgr, which races
+//!    svctest startup. Running it last maximises the chance the
+//!    donations have landed; the phase polls to close the residual race.
 
 use crate::runner::Phase;
 
@@ -62,5 +66,6 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_ipc::relative_only());
     out.extend_from_slice(pwrmgr::deny_only());
     out.extend_from_slice(timed::phases());
+    out.extend_from_slice(memmgr::identity());
     out
 }

@@ -14,7 +14,9 @@
 //! found in the current boot configuration, the test is skipped and reports Ok.
 //! Skips are logged to serial so they are visible in the test run output.
 
-use syscall::{aspace_query, cap_create_signal, irq_ack, irq_register, irq_split, mmio_split};
+use syscall::{
+    aspace_query, cap_create_signal, irq_ack, irq_register, irq_split, mem_unmap, mmio_split,
+};
 #[cfg(target_arch = "x86_64")]
 use syscall::{cap_create_cspace, cap_create_thread};
 use syscall_abi::SyscallError;
@@ -35,35 +37,46 @@ const ROOT_CSPACE_MAX_SLOTS: u32 = 14336;
 
 /// `mmio_map` maps a hardware MMIO region into the address space.
 ///
-/// Scans the initial capability set for the first `MmioRegion` cap. On a
-/// successful map, verifies the VA is now mapped via `aspace_query`. If no
-/// `MmioRegion` cap exists in this boot configuration, the test is skipped.
+/// Maps only a single carved page, not the whole aperture: post-Gap-B,
+/// `sys_mmio_map` draws intermediate PT pages from the *target* AS's own pool,
+/// and the first `MmioRegion` in the boot config can span hundreds of MiB
+/// (hundreds of PT pages) — mapping it whole would drain `ctx.aspace_cap`'s
+/// pool, which the `mem_map` integration and bench tests share. One page
+/// suffices to exercise the map + `aspace_query` path. The region is split so
+/// its large remainder stays a valid `MmioRegion` for [`mmio_split_carves`].
+/// Skipped if no `MmioRegion` of at least two pages exists in this boot config.
 pub fn mmio_map(ctx: &TestContext) -> TestResult
 {
-    // Hardware caps live in slots 1..aspace_cap. Scan for the first MmioRegion.
-    // A non-MmioRegion slot returns InvalidCapability; an MmioRegion succeeds.
+    // Probe each slot with a one-page split. `InvalidCapability` ⇒ wrong tag;
+    // `InvalidArgument` ⇒ an `MmioRegion` smaller than two pages. Both leave
+    // the cap intact, so the scan is non-destructive until a split succeeds.
     for slot in 1..ctx.aspace_cap
     {
-        match syscall::mmio_map(ctx.aspace_cap, slot, MMIO_TEST_VA, 0)
+        let Ok((lo, _hi)) = mmio_split(slot, 0x1000)
+        else
         {
-            Err(e) if e == SyscallError::InvalidCapability as i64 =>
-            {}
-            Err(_) =>
-            {} // Wrong type or other error — keep scanning.
-            Ok(()) =>
+            continue;
+        };
+        // `lo` covers one page; map and verify it. The remainder child (`_hi`)
+        // stays in the CSpace as a valid `MmioRegion` for the split test that
+        // runs next.
+        let result = (|| -> TestResult {
+            syscall::mmio_map(ctx.aspace_cap, lo, MMIO_TEST_VA, 0)
+                .map_err(|_| "mmio_map of carved page failed")?;
+            let phys = aspace_query(ctx.aspace_cap, MMIO_TEST_VA)
+                .map_err(|_| "aspace_query after mmio_map failed")?;
+            if phys == 0 || phys & 0xFFF != 0
             {
-                let phys = aspace_query(ctx.aspace_cap, MMIO_TEST_VA)
-                    .map_err(|_| "aspace_query after mmio_map failed")?;
-                if phys == 0 || phys & 0xFFF != 0
-                {
-                    return Err("aspace_query returned invalid phys after mmio_map");
-                }
-                return Ok(());
+                return Err("aspace_query returned invalid phys after mmio_map");
             }
-        }
+            Ok(())
+        })();
+        let _ = mem_unmap(ctx.aspace_cap, MMIO_TEST_VA, 1);
+        syscall::cap_delete(lo).ok();
+        return result;
     }
 
-    crate::log("ktest: hw::mmio_map SKIP (no MmioRegion caps in initial cap set)");
+    crate::log("ktest: hw::mmio_map SKIP (no MmioRegion >= 2 pages in initial cap set)");
     Ok(())
 }
 

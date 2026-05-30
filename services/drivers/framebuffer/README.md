@@ -23,8 +23,8 @@ framebuffer/
     ├── render.rs                # FramebufferWriter (cursor + glyph blit + scroll)
     └── arch/
         ├── mod.rs               # #[cfg(target_arch)] dispatch
-        ├── x86_64/mod.rs        # reserve VA + mmio_map the linear framebuffer
-        └── riscv64/mod.rs       # reserve VA + mmio_map the linear framebuffer
+        ├── x86_64/mod.rs        # reserve VA + fund PT budget + mmio_map the linear framebuffer
+        └── riscv64/mod.rs       # reserve VA + fund PT budget + mmio_map the linear framebuffer
 ```
 
 ---

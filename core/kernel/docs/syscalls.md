@@ -601,12 +601,14 @@ Map pages from a physical frame capability into an address space.
 | 2 | `virt` | Virtual address to map at (page-aligned, user range) |
 | 3 | `offset_pages` | Page offset into the frame |
 | 4 | `page_count` | Number of pages to map (nonzero) |
-| 5 | `prot_bits` | Protection bits: bit 1 = WRITE, bit 2 = EXECUTE. If zero, derived from frame cap rights |
+| 5 | `prot_bits` | Protection bits: bit 0 = READ, bit 1 = WRITE, bit 2 = EXECUTE. If zero, derived from frame cap rights |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 If `prot_bits` is nonzero, the requested permissions must be a subset of the frame
-cap's rights. W^X is enforced: WRITE and EXECUTE may not both be set.
+cap's rights. W^X is enforced: WRITE and EXECUTE may not both be set. Bit 0 (READ)
+carries no permission of its own; it makes an otherwise-empty read-only request
+nonzero so the explicit path is taken instead of deriving from the cap's rights.
 
 If `prot_bits` is zero, permissions are derived from the frame cap's rights directly.
 This fails with `WxViolation` if the frame cap has both WRITE and EXECUTE rights.
@@ -1287,12 +1289,8 @@ pub enum SystemInfoType
     /// Number of logical CPUs initialised at boot.
     CpuCount            = 1,
 
-    /// Number of free 4 KiB physical frames at the time of the call.
-    FreeFrames          = 2,
-
-    /// Total number of 4 KiB physical frames detected at boot (fixed after boot).
-    /// `FreeFrames / TotalFrames` gives current memory pressure.
-    TotalFrames         = 3,
+    // Discriminants 2 and 3 are reserved and MUST NOT be reused; these values
+    // are a stable wire contract.
 
     /// Size of a physical page in bytes (always 4096 on supported platforms).
     PageSize            = 4,

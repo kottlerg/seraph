@@ -13,7 +13,7 @@
 //! that state persists, so no re-initialization is required here.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::os::seraph::reserve_pages;
+use std::os::seraph::{fund_aspace_pt_budget, reserve_pages};
 
 /// NS16550 register offsets (byte-addressed).
 const UART_TX: u64 = 0; // transmit holding register
@@ -33,6 +33,10 @@ pub fn serial_init(_self_thread: u32, self_aspace: u32, mmio_cap: u32) -> bool
         return false;
     };
     let base_va = range.va_start();
+    if !fund_aspace_pt_budget(self_aspace, 1)
+    {
+        return false;
+    }
     if syscall::mmio_map(self_aspace, mmio_cap, base_va, 0).is_err()
     {
         return false;

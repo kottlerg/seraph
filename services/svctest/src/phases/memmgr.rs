@@ -4,6 +4,7 @@
 //! Memmgr / heap allocator surface.
 
 use std::collections::BTreeMap;
+use std::os::seraph::startup_info;
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -24,6 +25,17 @@ pub fn phases() -> &'static [Phase]
             run: alloc_grow_phase,
         },
     ]
+}
+
+/// All-RAM-accounted identity check. Registered last (see [`super::all`]) so
+/// init's reap donations have almost always landed; the poll closes the
+/// residual race in any case.
+pub fn identity() -> &'static [Phase]
+{
+    &[Phase {
+        name: "ram_accounted_identity",
+        run: ram_accounted_identity_phase,
+    }]
 }
 
 pub fn alloc_phase(_: &Caps)
@@ -148,4 +160,55 @@ pub fn alloc_grow_phase(_: &Caps)
     assert_eq!(post.last().copied(), Some(4095));
 
     std::os::seraph::log!("alloc_grow phase passed ({BIG} bytes + 8 KiB interleaved)");
+}
+
+/// Assert the all-RAM-accounted identity `system_ram == kernel_reserved +
+/// pool_total` holds with zero residual. memmgr reports the three terms (bytes)
+/// via `QUERY_POOL_STATUS`.
+///
+/// init's reap donations arrive at memmgr asynchronously after init's main
+/// thread exits, racing svctest's startup, so a query issued too early sees a
+/// transient positive residual (donations still in flight). The residual only
+/// shrinks — `kernel_reserved` is fixed and `pool_total` only grows as
+/// donations land — so polling converges to zero on a clean system. A real
+/// leak (a minted page that never reaches the pool) holds the residual above
+/// zero and the poll times out.
+pub fn ram_accounted_identity_phase(_: &Caps)
+{
+    const MAX_POLL: u32 = 4096;
+
+    let info = startup_info();
+    #[allow(clippy::cast_ptr_alignment)]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+
+    let mut terms = (0u64, 0u64, 0u64);
+    for _ in 0..MAX_POLL
+    {
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &req, ipc_buf) }
+            .expect("memmgr QUERY_POOL_STATUS ipc_call failed");
+        assert_eq!(
+            reply.label,
+            ipc::memmgr_errors::SUCCESS,
+            "QUERY_POOL_STATUS status"
+        );
+        let (system_ram, kernel_reserved, pool_total) =
+            (reply.word(0), reply.word(1), reply.word(2));
+        terms = (system_ram, kernel_reserved, pool_total);
+        if system_ram == kernel_reserved.saturating_add(pool_total)
+        {
+            std::os::seraph::log!(
+                "ram_accounted_identity passed: system_ram={system_ram} == kernel_reserved={kernel_reserved} + pool_total={pool_total} (residual=0)"
+            );
+            return;
+        }
+        let _ = syscall::thread_yield();
+    }
+
+    let (system_ram, kernel_reserved, pool_total) = terms;
+    let residual = system_ram.abs_diff(kernel_reserved.saturating_add(pool_total));
+    panic!(
+        "ram_accounted_identity FAILED: system_ram={system_ram} != kernel_reserved={kernel_reserved} + pool_total={pool_total} (residual={residual} bytes; leaked or double-counted)"
+    );
 }

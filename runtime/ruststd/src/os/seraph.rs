@@ -681,6 +681,25 @@ pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
     pal_alloc::object_slab_acquire(min_bytes)
 }
 
+/// Fund `self_aspace`'s page-table growth budget to cover mapping a
+/// `region_pages`-page foreign-frame region (MMIO, DMA) into a
+/// retype-backed `AddressSpace`.
+///
+/// Requests Frame backing from memmgr and retypes it onto the AS's PT pool
+/// via `cap_create_aspace` augment-mode, so `mmio_map`/`mem_map` of the
+/// region draws its intermediate page tables from this caller-funded,
+/// memmgr-accounted budget rather than the fixed kernel PT reserve. Call
+/// once before mapping a region whose PT cost may exceed the AS's spare
+/// budget (every driver mapping discovered MMIO).
+///
+/// `region_pages == 0` is a no-op success. Returns `false` if memmgr is
+/// unreachable or the request/augment fails; the subsequent map then fails
+/// with `OutOfMemory` rather than silently drawing on the reserve.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
+    pal_alloc::fund_aspace_pt_budget(self_aspace, region_pages)
+}
+
 // ── Page-reservation allocator ──────────────────────────────────────────────
 //
 // Re-exports from `crate::sys::reserve`. See that module for the per-process

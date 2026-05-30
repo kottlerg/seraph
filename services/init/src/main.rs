@@ -18,77 +18,6 @@
 
 use core::panic::PanicInfo;
 
-/// Tiny `fmt::Write` adapter into a fixed byte slice. Truncates silently if
-/// the formatted output exceeds the slice. UTF-8 by construction (the
-/// formatter only emits valid UTF-8).
-pub(crate) struct SliceWriter<'a>
-{
-    buf: &'a mut [u8],
-    len: usize,
-}
-
-impl<'a> SliceWriter<'a>
-{
-    pub(crate) fn new(buf: &'a mut [u8]) -> Self
-    {
-        Self { buf, len: 0 }
-    }
-
-    pub(crate) fn as_slice(&self) -> &[u8]
-    {
-        &self.buf[..self.len]
-    }
-}
-
-impl core::fmt::Write for SliceWriter<'_>
-{
-    fn write_str(&mut self, s: &str) -> core::fmt::Result
-    {
-        let bytes = s.as_bytes();
-        let cap = self.buf.len() - self.len;
-        let n = bytes.len().min(cap);
-        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
-        self.len += n;
-        Ok(())
-    }
-}
-
-/// Issue a no-cap `DONATE_FRAMES` to memmgr to read back the cumulative
-/// page-reclaim total (memmgr returns it in `word(2)` of every reply),
-/// then log a single line tagged with `phase`. Silent on any failure
-/// (memmgr unreachable, derive failure) — this is a diagnostic, not a
-/// correctness path.
-fn log_reclaim_total(memmgr_service_ep: u32, ipc_buf: *mut u64, phase: &str)
-{
-    use ipc::IpcMessage;
-    use ipc::memmgr_labels;
-
-    let Ok(probe_send) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        return;
-    };
-    let msg = IpcMessage::new(memmgr_labels::DONATE_FRAMES);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if let Ok(reply) = unsafe { ipc::ipc_call(probe_send, &msg, ipc_buf) }
-    {
-        let total_pages = reply.word(2);
-        let mut buf = [0u8; 96];
-        let mut w = SliceWriter::new(&mut buf);
-        let _ = core::fmt::write(
-            &mut w,
-            format_args!(
-                "{phase} reclaim total: {total_pages} pages = {} KiB",
-                total_pages * 4,
-            ),
-        );
-        // SAFETY: SliceWriter only writes UTF-8 bytes from `core::fmt::write`.
-        let s = unsafe { core::str::from_utf8_unchecked(w.as_slice()) };
-        logging::log(s);
-    }
-    let _ = syscall::cap_delete(probe_send);
-}
-
 use init_protocol::{CapDescriptor, CapType, INIT_INFO_MAX_PAGES, INIT_PROTOCOL_VERSION, InitInfo};
 
 mod arch;
@@ -111,12 +40,10 @@ pub(crate) use syscall_abi::PAGE_SIZE;
 /// init main-thread IPC buffer.
 pub(crate) const INIT_IPC_BUF_VA: u64 = 0x0000_0000_C000_0000;
 
-/// Pages requested per spawned thread when carving a Thread-retype slab
-/// off `FrameAlloc`. The kernel consumes `KERNEL_STACK_PAGES + 1 = 5`
-/// pages (4 kstack + 1 wrapper/TCB) plus a small one-time per-`FrameObject`
-/// allocator metadata footprint; one extra page is included so a fresh
-/// slab always has headroom and the retype lookup does not fail
-/// `available_bytes >= raw_bytes` after the metadata debit.
+/// Page span a single Thread retype consumes from its source Frame cap's
+/// front bump: `KERNEL_STACK_PAGES` (4) kernel-stack pages + one TCB/wrapper
+/// page + one extended FPU/SIMD save page = 6, page-aligned. Used to size the
+/// retype reserve of init's and the tier-1 services' bootstrap arenas.
 pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 
 /// Pages init carves for memmgr/procmgr's `AddressSpace`. Page 0 becomes
@@ -140,11 +67,13 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 33;
 /// Base for init's scratch mappings (`ProcessInfo` frames, ELF pages).
 pub(crate) const TEMP_MAP_BASE: u64 = 0x0000_0001_0000_0000;
 
-/// Frame cap that backs init's kernel-object retypes (currently endpoints).
+/// Frame cap that backs init's kernel-object retypes (endpoints; the log
+/// thread also retypes from it directly).
 ///
-/// Set once early in `run()` from `FrameAlloc::alloc_page`; carries
-/// `Rights::RETYPE` and ≈ 4 KiB of `available_bytes`. Read by every
-/// `cap_create_endpoint` callsite — main.rs, service.rs.
+/// Set once early in `run()` to init's bootstrap arena cap; carries full
+/// rights (incl. `Rights::RETYPE`). Read by every `cap_create_endpoint`
+/// callsite — main.rs, service.rs. The arena's front reserve bounds the total
+/// retype bump; see `bootstrap::INIT_RETYPE_RESERVE_PAGES`.
 pub(crate) static ENDPOINT_SLAB: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -220,6 +149,13 @@ pub(crate) fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) 
 
 // ── Simple frame allocator ──────────────────────────────────────────────────
 
+/// Upper bound on Frame caps `advance_cap` can abandon with pages still free.
+/// One orphan is recorded per frame `FrameAlloc` moves off while it still has
+/// a usable remainder; with the drain's high→low ordering init carves its
+/// arenas from the largest frames and abandons only a handful of leftovers.
+/// Overflowing this is a hard error (it would silently leak), not a drop.
+const MAX_ORPHAN_FRAMES: usize = 64;
+
 /// Bump allocator over init's memory pool frame caps.
 ///
 /// Splits page-sized frames from the first available memory pool frame cap
@@ -235,6 +171,13 @@ pub(crate) struct FrameAlloc
     /// [`InitInfo`] fields copied out for reference.
     frame_base: u32,
     frame_count: u32,
+    /// Free Frame caps `advance_cap` moved off while they still held pages —
+    /// `frame_split` remainders (no `InitInfo` descriptor) and whole frames
+    /// too small for a pending multi-page request, both below the reap floor.
+    /// Nothing else can reach them, so they are streamed to memmgr's pool at
+    /// reap via [`orphan_frames`].
+    orphan_slots: [u32; MAX_ORPHAN_FRAMES],
+    orphan_count: usize,
 }
 
 impl FrameAlloc
@@ -247,7 +190,29 @@ impl FrameAlloc
             next_idx: 0,
             frame_base: info.memory_frame_base,
             frame_count: info.memory_frame_count,
+            orphan_slots: [0; MAX_ORPHAN_FRAMES],
+            orphan_count: 0,
         }
+    }
+
+    /// Free Frame caps abandoned during allocation, to be donated to memmgr at
+    /// reap so every page of RAM reaches the pool.
+    pub(crate) fn orphan_frames(&self) -> &[u32]
+    {
+        &self.orphan_slots[..self.orphan_count]
+    }
+
+    /// Record a Frame cap `advance_cap` is moving off while it still holds at
+    /// least one free page. Halts if the fixed orphan table overflows: silently
+    /// dropping would leak the cap into the sealed post-handoff buddy.
+    fn record_orphan(&mut self, slot: u32)
+    {
+        assert!(
+            self.orphan_count < MAX_ORPHAN_FRAMES,
+            "init: FrameAlloc orphan table overflow — raise MAX_ORPHAN_FRAMES"
+        );
+        self.orphan_slots[self.orphan_count] = slot;
+        self.orphan_count += 1;
     }
 
     /// Advance `self.current` to the next memory-pool Frame cap and read its
@@ -257,6 +222,14 @@ impl FrameAlloc
         if self.next_idx >= self.frame_count
         {
             return false;
+        }
+        // The frame we are leaving still holds `remaining` free bytes (it was
+        // too small for the pending multi-page request, or skipped whole).
+        // It is a free Frame cap below the reap floor that nothing else
+        // donates — record it so reap forwards it to memmgr's pool.
+        if self.remaining >= PAGE_SIZE
+        {
+            self.record_orphan(self.current);
         }
         self.current = self.frame_base + self.next_idx;
         self.next_idx += 1;
@@ -326,9 +299,9 @@ impl FrameAlloc
         let need = pages * PAGE_SIZE;
         // Bootstrap is single-threaded; the simplest correct behaviour is
         // to scan forward to the first cap large enough for the request.
-        // Caps that get skipped here are not "lost" — earlier `alloc_page`
-        // calls already carved their first pages; whatever fragments
-        // remain cannot satisfy a multi-page contiguous request anyway.
+        // Frames skipped here (the current leftover, or whole frames too
+        // small) are recorded as orphans by `advance_cap` and donated to
+        // memmgr's pool at reap, so no free RAM is lost.
         while self.remaining < need
         {
             if !self.advance_cap()
@@ -392,40 +365,43 @@ fn run(info_ptr: u64) -> !
 
     let mut alloc = FrameAlloc::new(info);
 
-    // Reserve a Frame cap to back all of init's kernel-object retypes
-    // (currently endpoints; later: signals, threads, etc.). One page is
-    // enough for ~30 endpoints at 128 B each — init creates 8.
-    let Some(slab_cap) = alloc.alloc_page()
-    else
-    {
-        logging::log("init: FATAL: cannot allocate endpoint slab frame");
-        syscall::thread_exit();
-    };
-    ENDPOINT_SLAB.store(slab_cap, core::sync::atomic::Ordering::Relaxed);
-
-    // Map a fresh page for init's IPC buffer.
-    let Some(ipc_cap) = alloc.alloc_page()
-    else
-    {
-        logging::log("init: FATAL: cannot allocate IPC buffer frame");
-        syscall::thread_exit();
-    };
-    if syscall::mem_map(
-        ipc_cap,
+    // Carve init's own bootstrap arena: one contiguous Frame cap backing every
+    // page init allocates for itself. Its front reserve absorbs init's
+    // endpoint and log-thread retypes; its backing region is offset-mapped as
+    // init's IPC buffer, the log-thread stack, and the log-thread IPC buffer.
+    // The whole arena is forwarded to memmgr as an in-use run at
+    // `finalize_memmgr`, so init's own backing is accounted in memmgr's pool
+    // and — pinned by memmgr's copy — never frees into the post-handoff buddy
+    // when init reaps. Mirrors the memmgr/procmgr arenas.
+    let backing_pages = 1 + logging::LOG_THREAD_STACK_PAGES + 1;
+    let Some(mut init_arena) = bootstrap::BootArena::carve_reserve(
+        &mut alloc,
         info.aspace_cap,
-        INIT_IPC_BUF_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
+        bootstrap::INIT_RETYPE_RESERVE_PAGES,
+        backing_pages,
     )
-    .is_err()
+    else
     {
-        logging::log("init: FATAL: cannot map IPC buffer page");
+        logging::log("init: FATAL: cannot carve init bootstrap arena");
+        syscall::thread_exit();
+    };
+    // Every `cap_create_endpoint` retypes from the arena front.
+    ENDPOINT_SLAB.store(init_arena.cap, core::sync::atomic::Ordering::Relaxed);
+
+    // Offset-map init's IPC buffer from the arena (zeroed by `place_page`) and
+    // register it.
+    if init_arena
+        .place_page(
+            info.aspace_cap,
+            INIT_IPC_BUF_VA,
+            syscall::MAP_WRITABLE,
+            |_| {},
+        )
+        .is_none()
+    {
+        logging::log("init: FATAL: cannot place IPC buffer page");
         syscall::thread_exit();
     }
-    // Zero the IPC buffer page.
-    // SAFETY: INIT_IPC_BUF_VA is mapped writable, one page.
-    unsafe { core::ptr::write_bytes(INIT_IPC_BUF_VA as *mut u8, 0, PAGE_SIZE as usize) };
     if syscall::ipc_buffer_set(INIT_IPC_BUF_VA).is_err()
     {
         logging::log("init: FATAL: ipc_buffer_set failed");
@@ -493,7 +469,7 @@ fn run(info_ptr: u64) -> !
     // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it, letting procmgr
     // reclaim the init-logd TCB after init's main thread exits.
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
-    let init_logd_thread_cap = logging::spawn_log_thread(info, &mut alloc, log_ep, ioport_cap);
+    let init_logd_thread_cap = logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap);
 
     // Tokened SEND on the log endpoint for init's own `log()` lines so
     // they appear under `[init]`. `LOG_TOKEN_INIT` (= 1) is reserved
@@ -564,25 +540,29 @@ fn run(info_ptr: u64) -> !
         logging::log("FATAL: phys-table page alloc failed");
         syscall::thread_exit();
     };
-    let Some(mm_final) = bootstrap::finalize_memmgr(info, &mut alloc, &mm)
+    let Some(mm_final) = bootstrap::finalize_memmgr(
+        info,
+        &mut alloc,
+        &mm,
+        pm.arena_cap,
+        init_arena.cap,
+        phys_table_frame,
+    )
     else
     {
         logging::log("FATAL: finalize_memmgr failed");
         syscall::thread_exit();
     };
 
-    // Populate the phys-table page with the parallel `[u64; mm_frame_count]`
-    // array of physical bases for every Frame cap delegated to memmgr.
-    // SAFETY: TEMP_MAP_BASE is mapped writable, one page; the table fits
-    // (max 122 entries × 8 B = 976 B << 4 KiB). The pointer is page-aligned
-    // (4 KiB), satisfying u64 alignment.
+    // Populate the phys-table page: free-run physical bases, the kernel's
+    // immutable RAM-accounting facts, and the in-use bootstrap arenas. The
+    // page is mapped writable at TEMP_MAP_BASE; memmgr reads it back via the
+    // RO cap derived below. See `bootstrap::write_memmgr_aux_frame`.
+    // SAFETY: TEMP_MAP_BASE is mapped writable, one page, page-aligned.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_dst = TEMP_MAP_BASE as *mut u64;
-    for i in 0..(mm_final.mm_frame_count as usize)
-    {
-        // SAFETY: i < mm_frame_count <= 122; bounded above.
-        unsafe { core::ptr::write_volatile(phys_dst.add(i), mm_final.phys_bases[i]) };
-    }
+    // SAFETY: phys_dst points at the one mapped 4 KiB page.
+    unsafe { bootstrap::write_memmgr_aux_frame(phys_dst, info, &mm_final) };
     let _ = syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, 1);
     let Ok(phys_table_ro_cap) = syscall::cap_derive(phys_table_frame, syscall::RIGHTS_MAP_READ)
     else
@@ -645,54 +625,10 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     }
 
-    // Donate the two self-loaded boot-module Frame caps (memmgr's and
-    // procmgr's ELFs) to memmgr's pool. Init has already finished
-    // ELF-loading both, so the source pages can flow back to userspace.
-    // memmgr is in its dispatch loop (its bootstrap completed above);
-    // any IPC sent now is queued and handled before procmgr's later
-    // REGISTER_PROCESS arrives.
-    {
-        use ipc::IpcMessage;
-        use ipc::memmgr_labels;
-
-        let memmgr_module_cap = find_module_by_name(info, b"memmgr").unwrap_or(0);
-        let procmgr_module_cap = find_module_by_name(info, b"procmgr").unwrap_or(0);
-        let Ok(donate_send) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_SEND_GRANT)
-        else
-        {
-            logging::log("FATAL: cannot derive donate-SEND cap on memmgr endpoint");
-            syscall::thread_exit();
-        };
-        let mut pages_donated: u64 = 0;
-        let mut last_total: u64 = 0;
-        for module_cap in [memmgr_module_cap, procmgr_module_cap]
-        {
-            let msg = IpcMessage::builder(memmgr_labels::DONATE_FRAMES)
-                .cap(module_cap)
-                .build();
-            // SAFETY: ipc_buf is the registered IPC buffer page; donate_send
-            // is a SEND_GRANT cap on memmgr's endpoint.
-            if let Ok(reply) = unsafe { ipc::ipc_call(donate_send, &msg, ipc_buf) }
-            {
-                pages_donated = pages_donated.saturating_add(reply.word(1));
-                last_total = reply.word(2);
-            }
-        }
-        let _ = syscall::cap_delete(donate_send);
-        let mut buf = [0u8; 96];
-        let mut w = SliceWriter::new(&mut buf);
-        let _ = core::fmt::write(
-            &mut w,
-            format_args!(
-                "donated boot modules: {pages_donated} pages = {} KiB (memmgr pool reclaim \
-                 total: {last_total} pages)",
-                pages_donated * 4,
-            ),
-        );
-        // SAFETY: SliceWriter only writes UTF-8 bytes from `core::fmt::write`.
-        let s = unsafe { core::str::from_utf8_unchecked(w.as_slice()) };
-        logging::log(s);
-    }
+    // Init retains every boot-module source Frame cap (its own self-loaded
+    // memmgr/procmgr ELFs plus the devmgr/vfsd/driver modules) as the sole
+    // owner of each `FrameObject`; all of them donate to memmgr's pool on the
+    // single reap-handoff route once every loader has copied the ELF.
 
     // Memmgr is now ingesting; start procmgr.
     bootstrap::start_procmgr(&pm);
@@ -816,10 +752,6 @@ fn run(info_ptr: u64) -> !
         logging::log("no vfsd module available");
     }
 
-    // Re-probe memmgr's running donation counter so procmgr's per-spawn
-    // donations (devmgr, vfsd modules) become visible.
-    log_reclaim_total(memmgr_service_ep, ipc_buf, "phase 1");
-
     logging::log("phase 1 bootstrap complete");
 
     // ── Phase 2: mount root filesystem ──────────────────────────────────────
@@ -852,8 +784,6 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     }
 
-    log_reclaim_total(memmgr_service_ep, ipc_buf, "phase 2");
-
     // ── Phase 2 epilogue: launch real logd ──────────────────────────────────
     //
     // Spawned at the end of Phase 2 (after root mount, with
@@ -885,6 +815,11 @@ fn run(info_ptr: u64) -> !
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
 
     let _ = vfsd_service_ep;
+    // The free-RAM frames `finalize_memmgr` could not fit in memmgr's single
+    // bootstrap round remain solely init's, at slots at or above this floor.
+    // The reap walk donates them to memmgr's pool; below the floor are the
+    // frames FrameAlloc consumed or finalize already forwarded.
+    let mem_frame_reap_floor = info.memory_frame_base + alloc.next_idx;
     service::phase3_svcmgr_handover(
         info,
         endpoint_cap,
@@ -896,7 +831,8 @@ fn run(info_ptr: u64) -> !
         thread_caps,
         ipc_buf,
         init_logd_thread_cap,
-        ipc_cap,
+        mem_frame_reap_floor,
+        alloc.orphan_frames(),
     );
 }
 

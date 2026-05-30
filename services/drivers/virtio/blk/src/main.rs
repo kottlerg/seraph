@@ -1008,6 +1008,11 @@ fn main() -> !
         syscall::thread_exit();
     };
     let bar_va = bar_range.va_start();
+    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, bar_pages)
+    {
+        std::os::seraph::log!("BAR PT-budget funding failed");
+        syscall::thread_exit();
+    }
     if syscall::mmio_map(caps.self_aspace, caps.bar_mmio_slot, bar_va, 0).is_err()
     {
         std::os::seraph::log!("BAR mmio_map failed");

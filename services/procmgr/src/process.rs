@@ -2219,10 +2219,11 @@ pub fn reap_by_correlator(
 ///
 /// Once revoked, `cap_delete` on procmgr's remaining root cap drops the
 /// final reference. The kernel's `dealloc_object` path then tears down the
-/// `CSpace` (dec-refing every slot it contains), walks the `AddressSpace`'s
-/// user page tables to return intermediate frames to the buddy, and — via
-/// `FrameObject::owns_memory` — releases heap / stack / IPC / `ProcessInfo`
-/// pages to the buddy as their refcounts hit zero.
+/// `CSpace` (dec-refing every slot it contains) and the `AddressSpace`'s
+/// page tables. The child's heap / stack / IPC / `ProcessInfo` pages are
+/// `owns_memory = false` derivations of memmgr's pool, so dropping them
+/// frees nothing to the sealed buddy; memmgr reclaims those pages into its
+/// pool via the process-death notification.
 ///
 /// Idempotent: returns silently if the token is unknown (already destroyed).
 pub fn destroy_process(token: u64, memmgr_ep: u32, ipc_buf: *mut u64, table: &mut ProcessTable)

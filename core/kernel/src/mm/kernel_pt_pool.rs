@@ -5,20 +5,28 @@
 
 //! Kernel-internal intermediate page-table frame pool.
 //!
-//! Backs the steady-state PT-growth path for the legacy `map_user_page`
-//! API (and its callers: `AddressSpace::map_page`, `sys_mmio_map`, the
-//! `sys_mem_map` fallback, and Phase-9 init bootstrap mappings). Pages
-//! are seeded once at the end of Phase 7 from the residual
-//! `KERNEL_RESERVE_PAGES` buddy carve, threaded onto an intrusive
+//! Backs the unconditional `map_user_page` PT-growth path
+//! ([`crate::mm::address_space::AddressSpace::map_page`]). The sole
+//! consumer in a real boot is the kernel-side Phase-9 bootstrap that
+//! builds init's (or ktest's) boot address space — ELF segments, stack,
+//! and `InitInfo` — which calls `map_page` directly, before any userspace
+//! runs. `sys_mmio_map` / `sys_mem_map` also fall back here, but only for
+//! an address space with no retype-backed PT chunk; every address space
+//! the boot actually creates is seeded with a chunk (`boot_retype_aspace`
+//! for the boot AS, `sys_cap_create_aspace` for services), so those
+//! syscalls take the pooled path and fund their own intermediate PT pages
+//! from the AS's own growth pool. The fallback is the safety net for the
+//! chunk-less case, not a routine path.
+//!
+//! Pages are seeded once during Phase 7 — `POOL_SEED_PAGES` allocated from the
+//! pristine buddy before the user-cap drain — threaded onto an intrusive
 //! single-linked free list, and consumed without further buddy traffic.
 //!
 //! Backs the architectural invariant from `crate::kernel_entry`: PT
-//! frames for the legacy `map_user_page` path trace to a single
-//! cap-managed surface (the seed of this pool, sourced from
-//! `KERNEL_RESERVE_PAGES` at Phase 7). A small buddy residue stays
-//! behind for non-PT consumers (idle-thread kernel stacks, the
-//! `dealloc_object` → `free_range` reverse path); see
-//! `crate::cap::drain_and_install_seed` for the sizing rationale.
+//! frames for the `map_user_page` path trace to a single cap-managed
+//! surface (the seed of this pool). It is one of the kernel's named fixed
+//! reserves (see `crate::cap::kernel_reserve_pages`); every other page of RAM
+//! is drained for userspace, so the post-handoff buddy is left empty.
 //!
 //! The free list is intrusive: each free page's first 8 bytes (accessed
 //! via the direct physical map) hold the next-PA pointer, or 0 for the
@@ -60,9 +68,9 @@ fn release()
 
 /// Seed the pool with `seed_pages` 4 KiB frames pulled from the buddy.
 ///
-/// MUST run during Phase 7, after `drain_and_install_seed` finishes
-/// reserving `KERNEL_RESERVE_PAGES` and before any `map_user_page`
-/// consumer fires (the first such consumer is Phase 9's init segment
+/// MUST run during Phase 7, from `drain_and_install_seed` before the user-cap
+/// drain (so the frames come from the pristine buddy) and before any
+/// `map_user_page` consumer fires (the first is Phase 9's init segment
 /// mapping). Fewer pages than requested may be installed if the buddy
 /// is genuinely exhausted; the caller diagnoses via `remaining_pages()`.
 ///

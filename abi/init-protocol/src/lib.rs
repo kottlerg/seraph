@@ -61,7 +61,13 @@
 ///     keyboard driver. Pure constant bump; the
 ///     [`InitInfo::module_names`] array grows in size but the field
 ///     layout is otherwise unchanged.
-pub const INIT_PROTOCOL_VERSION: u32 = 9;
+/// v10: Added [`InitInfo::system_ram_bytes`] and
+///     [`InitInfo::kernel_reserved_bytes`] — immutable post-boot
+///     memory-accounting facts (total usable RAM and the fixed kernel
+///     reserve) that let the dynamic memory pool be reconciled against
+///     the all-RAM-accounted identity. Both `u64`, placed before
+///     `framebuffer` so that field remains last.
+pub const INIT_PROTOCOL_VERSION: u32 = 10;
 
 /// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
@@ -82,13 +88,20 @@ pub const INIT_MAX_NAMED_MODULES: usize = 12;
 ///
 /// The region spans one or more contiguous pages — enough for the header
 /// (which now includes the boot-module name table) followed by the
-/// variable-length [`CapDescriptor`] array. Placed below the stack.
-pub const INIT_INFO_VADDR: u64 = 0x7FFF_FFFF_8000;
+/// variable-length [`CapDescriptor`] array. Sized so the full
+/// [`INIT_INFO_MAX_PAGES`] fit between this address and the init stack's guard
+/// page (`0x7FFF_FFFF_9000`): the
+/// region occupies `[0x7FFF_FFFF_5000, 0x7FFF_FFFF_9000)`, the guard sits at
+/// `0x7FFF_FFFF_9000`, and the stack runs `[0x7FFF_FFFF_A000, INIT_STACK_TOP)`.
+/// A larger array (3+ pages) must not collide with the stack — that silently
+/// remaps descriptor pages onto stack frames and drops the trailing caps.
+pub const INIT_INFO_VADDR: u64 = 0x7FFF_FFFF_5000;
 
 /// Virtual address of the top of init's user stack.
 ///
 /// `INIT_STACK_PAGES` pages are mapped immediately below this address.
-/// One additional guard page (unmapped) sits below the stack.
+/// One additional guard page (unmapped) sits below the stack, and the
+/// [`InitInfo`] region (up to [`INIT_INFO_MAX_PAGES`]) sits below that.
 pub const INIT_STACK_TOP: u64 = 0x7FFF_FFFF_E000;
 
 /// Number of 4 KiB pages in init's user stack (16 KiB total).
@@ -238,6 +251,22 @@ pub struct InitInfo
     /// the first `InitInfo` page (the [`CapDescriptor`] array that
     /// follows the header may span pages).
     pub module_names: [InitModuleName; INIT_MAX_NAMED_MODULES],
+
+    // ── Memory-accounting facts (added in protocol version 10) ─────────
+    /// Total installed usable system RAM, in bytes. Immutable after boot.
+    ///
+    /// The full physical span the all-RAM-accounted identity covers:
+    /// `system_ram_bytes == kernel_reserved_bytes + dynamic_pool_total`.
+    pub system_ram_bytes: u64,
+
+    /// RAM permanently held by the fixed kernel reserve, in bytes.
+    /// Immutable after boot.
+    ///
+    /// The complement of all reclaimable RAM: kernel image, direct-map
+    /// metadata, SEED reserve, kernel page tables, per-CPU/idle structures,
+    /// retype metadata, and buddy residue. A reported quantity for
+    /// accounting, never itself a capability.
+    pub kernel_reserved_bytes: u64,
 
     // ── Framebuffer geometry (added in protocol version 8) ─────────────
     /// Bootloader-discovered framebuffer geometry. `physical_base == 0`

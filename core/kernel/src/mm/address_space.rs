@@ -43,10 +43,11 @@
 // cast_possible_truncation: u64→usize page count arithmetic; bounded by address space size.
 #![allow(clippy::cast_possible_truncation)]
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use boot_protocol::{InitSegment, SegmentFlags};
 
+use crate::cpu_mask::{AtomicCpuMask, CpuMask};
 use crate::mm::paging::phys_to_virt;
 use crate::mm::{BuddyAllocator, PAGE_SIZE};
 
@@ -66,12 +67,12 @@ pub struct AddressSpace
     pub root_phys: u64,
     /// Virtual address of the root frame (via the direct physical map).
     pub root_virt: u64,
-    /// Bitmask of CPUs currently running threads in this address space.
+    /// Set of CPUs currently running threads in this address space.
     ///
-    /// Bit N set = CPU N has this AS active, TLB may contain cached entries.
+    /// CPU N present = CPU N has this AS active, TLB may contain cached entries.
     /// Updated on every context switch by the scheduler; queried by TLB
     /// shootdown to determine which CPUs need IPIs.
-    active_cpus: AtomicU64,
+    active_cpus: AtomicCpuMask,
     /// Lock serializing page table modifications (map/unmap/protect).
     ///
     /// Simple CAS spin lock — does NOT disable interrupts (shootdown needs
@@ -164,16 +165,16 @@ impl AddressSpace
     #[inline]
     fn shootdown_remote(&self, virt: u64)
     {
-        let active = self.active_cpu_mask();
-        let current = crate::arch::current::cpu::current_cpu();
-        let remote_cpus = active & !(1u64 << current);
-        if remote_cpus != 0
+        let mut remote_cpus = self.active_cpu_mask();
+        let current = crate::arch::current::cpu::current_cpu() as usize;
+        remote_cpus.clear(current);
+        if !remote_cpus.is_empty()
         {
-            // SAFETY: root_phys is a valid page table root; remote_cpus mask
-            // contains only bits for online CPUs (enforced by scheduler); the
-            // caller holds preempt_disable() and no longer holds pt_lock.
+            // SAFETY: root_phys is a valid page table root; remote_cpus
+            // contains only online CPUs (enforced by scheduler); the caller
+            // holds preempt_disable() and no longer holds pt_lock.
             unsafe {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, remote_cpus, virt);
+                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote_cpus, virt);
             }
         }
     }
@@ -222,7 +223,7 @@ impl AddressSpace
         Self {
             root_phys,
             root_virt,
-            active_cpus: AtomicU64::new(0),
+            active_cpus: AtomicCpuMask::new(),
             pt_lock: AtomicBool::new(false),
         }
     }
@@ -260,7 +261,7 @@ impl AddressSpace
         Self {
             root_phys,
             root_virt,
-            active_cpus: AtomicU64::new(0),
+            active_cpus: AtomicCpuMask::new(),
             pt_lock: AtomicBool::new(false),
         }
     }
@@ -321,10 +322,9 @@ impl AddressSpace
         self.pt_lock();
 
         // Intermediate page table frames are drawn from
-        // `mm::kernel_pt_pool` (seeded once at Phase 7 from the residual
-        // `KERNEL_RESERVE_PAGES` buddy carve). No buddy lock is taken on
-        // this path; the shootdown below is the only inter-CPU
-        // synchronisation cost.
+        // `mm::kernel_pt_pool` (seeded once at Phase 7 with `POOL_SEED_PAGES`
+        // from the pristine buddy). No buddy lock is taken on this path; the
+        // shootdown below is the only inter-CPU synchronisation cost.
         // SAFETY: contract passed to caller; root_virt is valid; virt is
         // in user range; phys is a valid 4 KiB-aligned physical address.
         let result = unsafe { map_user_page(self.root_virt, virt, phys, flags) };
@@ -601,8 +601,8 @@ impl AddressSpace
     {
         // SAFETY: Release ordering ensures prior address space setup (page
         // table modifications) is visible before we mark it active for TLB
-        // shootdown purposes. The fetch_or is atomic; no data race on the mask.
-        self.active_cpus.fetch_or(1u64 << cpu, Ordering::Release);
+        // shootdown purposes. The set_cpu is atomic; no data race on the mask.
+        self.active_cpus.set_cpu(cpu as usize, Ordering::Release);
     }
 
     /// Mark this address space as inactive on a CPU.
@@ -618,9 +618,8 @@ impl AddressSpace
     {
         // SAFETY: Release ordering ensures all TLB-dependent operations
         // complete before we mark inactive, so TLB shootdowns see the correct
-        // mask. The fetch_and is atomic; no data race on the mask.
-        self.active_cpus
-            .fetch_and(!(1u64 << cpu), Ordering::Release);
+        // mask. The clear_cpu is atomic; no data race on the mask.
+        self.active_cpus.clear_cpu(cpu as usize, Ordering::Release);
     }
 
     /// Get the bitmask of CPUs with this address space active.
@@ -632,10 +631,10 @@ impl AddressSpace
     /// Uses Acquire ordering: ensures we observe all prior `mark_active_on_cpu`
     /// calls from other CPUs, giving an accurate snapshot of which CPUs have
     /// cached TLB entries for this address space.
-    pub(crate) fn active_cpu_mask(&self) -> u64
+    pub(crate) fn active_cpu_mask(&self) -> CpuMask
     {
         // SAFETY: Acquire ordering ensures we see all mark_active calls from
-        // other CPUs. The load is atomic; no data race on the mask.
-        self.active_cpus.load(Ordering::Acquire)
+        // other CPUs. The snapshot is per-word atomic; no data race on the mask.
+        self.active_cpus.snapshot(Ordering::Acquire)
     }
 }

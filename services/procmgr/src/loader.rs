@@ -92,12 +92,11 @@ impl Drop for ScratchMapping
 /// returned [`ScratchMapping`] owns the reservation; dropping it unmaps
 /// and releases the VA.
 ///
-/// Module Frame caps now carry full rights so they can flow through the
-/// donation chain into memmgr's pool. We derive a read-only child cap for
-/// the load-time mapping; otherwise `mem_map`'s derive-from-cap path
-/// produces a writable+executable mapping that violates W^X. The derived
-/// cap is owned by the returned [`ScratchMapping`] and dropped alongside
-/// the unmap.
+/// `module_frame_cap` is a borrowed derivation of the caller's full-rights
+/// module-source frame. We derive a read-only child cap for the load-time
+/// mapping; otherwise `mem_map`'s derive-from-cap path produces a
+/// writable+executable mapping that violates W^X. The derived cap is owned by
+/// the returned [`ScratchMapping`] and dropped alongside the unmap.
 pub fn map_module(module_frame_cap: u32, self_aspace: u32) -> Option<(ScratchMapping, u64)>
 {
     let module_ro = syscall::cap_derive(module_frame_cap, syscall::RIGHTS_MAP_READ).ok()?;

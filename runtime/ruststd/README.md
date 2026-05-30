@@ -41,11 +41,18 @@ procmgr), `std::sys::seraph` exposes a page-granular reservation allocator:
 
 ```rust
 let range = std::os::seraph::reserve_pages(n)?;     // unmapped VA range
+std::os::seraph::fund_aspace_pt_budget(self_aspace, n); // fund PT growth
 syscall::mem_map(frame_cap, self_aspace, range.va, 0, n, prot)?;
 // ... use the mapping ...
 syscall::mem_unmap(self_aspace, range.va, n)?;
 std::os::seraph::unreserve_pages(range);
 ```
+
+Mapping a foreign Frame cap into a retype-backed `AddressSpace` first funds
+that AS's page-table growth budget: `fund_aspace_pt_budget(self_aspace, n)`
+acquires a memmgr-backed RETYPE frame and augments the AS's PT pool via
+`cap_create_aspace`. It MUST be called after reserving VA and before
+`mem_map`/`mmio_map`, or the map fails with `OutOfMemory`.
 
 The arena is carved out of the process's address space at `_start` time at
 a deterministic constant base; the implementation is structured so a

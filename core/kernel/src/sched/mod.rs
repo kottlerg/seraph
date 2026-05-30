@@ -47,9 +47,11 @@ pub const TIME_SLICE_TICKS: u32 = 10;
 /// Number of 4 KiB pages in each idle thread's kernel stack (16 KiB total).
 pub const KERNEL_STACK_PAGES: usize = 4;
 
-/// Maximum number of CPUs. Matches the `u64` TLB-shootdown cpu-mask width.
-/// TODO: enforce if `cpu_count` exceeds this.
-pub const MAX_CPUS: usize = 64;
+/// Maximum number of CPUs the kernel supports, matching the boot protocol's
+/// ceiling ([`boot_protocol::MAX_CPUS`]). Per-CPU sets ([`crate::cpu_mask`])
+/// size their word counts from this, and the boot path drops any CPUs the
+/// firmware enumerates beyond it.
+pub const MAX_CPUS: usize = boot_protocol::MAX_CPUS;
 
 /// Hard affinity sentinel: no hard CPU affinity.
 pub const AFFINITY_ANY: u32 = 0xFFFF_FFFF;
@@ -83,6 +85,16 @@ static SCHEDULERS_PTR: core::sync::atomic::AtomicPtr<PerCpuScheduler> =
 static IDLE_TCBS_PTR: core::sync::atomic::AtomicPtr<MaybeUninit<ThreadControlBlock>> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
+/// Base pointer for the `[u64; cpu_count]` array of idle-thread kernel-stack
+/// tops, allocated in [`init_per_cpu_storage`]. The stacks themselves are
+/// drawn from the pristine buddy at Phase 4 — before the Phase-7 user-cap
+/// drain — so each is a contiguous order-2 block rather than an order-2
+/// block scraped from the fragmented post-drain residue. [`init`] reads
+/// slot `cpu` here and copies it into the idle TCB's `kernel_stack_top`.
+#[cfg(not(test))]
+static IDLE_STACK_TOPS_PTR: core::sync::atomic::AtomicPtr<u64> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
 /// Return the `PerCpuScheduler` pointer for `cpu`. Caller must guarantee
 /// `cpu < CPU_COUNT` and that [`init_per_cpu_storage`] has run.
 #[cfg(not(test))]
@@ -111,6 +123,34 @@ unsafe fn idle_tcb_ptr(cpu: usize) -> *mut MaybeUninit<ThreadControlBlock>
     );
     // SAFETY: cpu < cpu_count by caller contract; allocation covers cpu_count slots.
     unsafe { base.add(cpu) }
+}
+
+/// Return the idle-stack-top slot pointer for `cpu`. Same contract as
+/// [`idle_tcb_ptr`].
+#[cfg(not(test))]
+#[inline]
+unsafe fn idle_stack_top_slot(cpu: usize) -> *mut u64
+{
+    let base = IDLE_STACK_TOPS_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(
+        !base.is_null(),
+        "idle_stack_top_slot: IDLE_STACK_TOPS_PTR not initialised"
+    );
+    // SAFETY: cpu < cpu_count by caller contract; allocation covers cpu_count slots.
+    unsafe { base.add(cpu) }
+}
+
+/// Order of a single idle-thread kernel stack: smallest `2^order >=
+/// KERNEL_STACK_PAGES`. With `KERNEL_STACK_PAGES = 4` this is order 2.
+#[cfg(not(test))]
+const fn idle_stack_order() -> usize
+{
+    let mut o = 0;
+    while (1usize << o) < KERNEL_STACK_PAGES
+    {
+        o += 1;
+    }
+    o
 }
 
 // ── Thread ID counter ─────────────────────────────────────────────────────────
@@ -146,9 +186,7 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 ///
 /// Arch-uniform. On RISC-V the IPI handler does **not** set this flag; the
 /// producer does. On x86-64 the same contract holds.
-const RESCHEDULE_WORDS: usize = MAX_CPUS.div_ceil(64);
-static RESCHEDULE_PENDING: [core::sync::atomic::AtomicU64; RESCHEDULE_WORDS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; RESCHEDULE_WORDS];
+static RESCHEDULE_PENDING: crate::cpu_mask::AtomicCpuMask = crate::cpu_mask::AtomicCpuMask::new();
 
 /// Set the reschedule-pending bit for `cpu` (producer side).
 ///
@@ -157,9 +195,7 @@ static RESCHEDULE_PENDING: [core::sync::atomic::AtomicU64; RESCHEDULE_WORDS] =
 /// `take_reschedule_pending`.
 pub fn set_reschedule_pending_for(cpu: usize)
 {
-    let word = cpu / 64;
-    let bit = 1u64 << (cpu % 64);
-    RESCHEDULE_PENDING[word].fetch_or(bit, core::sync::atomic::Ordering::Release);
+    RESCHEDULE_PENDING.set_cpu(cpu, core::sync::atomic::Ordering::Release);
 }
 
 /// Check and clear the reschedule-pending flag for a CPU.
@@ -168,9 +204,7 @@ pub fn set_reschedule_pending_for(cpu: usize)
 /// `AcqRel`: Acquire side pairs with Release in `set_reschedule_pending_for`.
 pub fn take_reschedule_pending(cpu: usize) -> bool
 {
-    let word = cpu / 64;
-    let bit = 1u64 << (cpu % 64);
-    RESCHEDULE_PENDING[word].fetch_and(!bit, core::sync::atomic::Ordering::AcqRel) & bit != 0
+    RESCHEDULE_PENDING.take_cpu(cpu, core::sync::atomic::Ordering::AcqRel)
 }
 
 // ── Softlockup watchdog ──────────────────────────────────────────────────────
@@ -181,8 +215,24 @@ pub fn take_reschedule_pending(cpu: usize) -> bool
 
 const WATCHDOG_THRESHOLD_TICKS: u64 = 3_000; // ~3 s at the observed ~1 ms BSP tick.
 
-static LAST_NON_IDLE_TICK: [core::sync::atomic::AtomicU64; MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+/// Base pointer for the `[AtomicU64; cpu_count]` per-CPU last-non-idle-tick
+/// array allocated in [`init_per_cpu_storage`]. Slot `cpu` records the global
+/// tick at which CPU `cpu` last dispatched a non-idle thread. Sized to
+/// `cpu_count` rather than `MAX_CPUS` so it scales with the CPU count.
+static LAST_NON_IDLE_TICK_PTR: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU64> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Return CPU `cpu`'s last-non-idle-tick slot. Caller guarantees
+/// `cpu < CPU_COUNT` and that [`init_per_cpu_storage`] has run.
+#[inline]
+fn last_non_idle_tick(cpu: usize) -> &'static core::sync::atomic::AtomicU64
+{
+    let base = LAST_NON_IDLE_TICK_PTR.load(core::sync::atomic::Ordering::Acquire);
+    debug_assert!(!base.is_null(), "last_non_idle_tick: not initialised");
+    // SAFETY: cpu < CPU_COUNT by caller contract; the slab covers CPU_COUNT
+    // AtomicU64 slots, each zero-initialised (a valid AtomicU64).
+    unsafe { &*base.add(cpu) }
+}
 
 static WATCHDOG_TICK_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -192,7 +242,7 @@ static WATCHDOG_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 pub fn watchdog_mark_non_idle(cpu: usize)
 {
     let now = WATCHDOG_TICK_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
-    LAST_NON_IDLE_TICK[cpu].store(now, core::sync::atomic::Ordering::Relaxed);
+    last_non_idle_tick(cpu).store(now, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// BSP-only: tick the global counter; if every CPU's last non-idle
@@ -215,7 +265,7 @@ fn watchdog_tick_and_check()
     #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
-        let last = LAST_NON_IDLE_TICK[cpu].load(core::sync::atomic::Ordering::Relaxed);
+        let last = last_non_idle_tick(cpu).load(core::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last) < WATCHDOG_THRESHOLD_TICKS
         {
             return;
@@ -231,10 +281,9 @@ fn watchdog_tick_and_check()
     // the authoritative detector for a genuinely stuck IPI, so defer to it
     // rather than emit a misleading softlockup dump. A non-shootdown stall
     // re-checks on the next tick once pending_cpus clears.
-    if crate::mm::tlb_shootdown::TLB_SHOOTDOWN
+    if !crate::mm::tlb_shootdown::TLB_SHOOTDOWN
         .pending_cpus
-        .load(core::sync::atomic::Ordering::Acquire)
-        != 0
+        .is_empty(core::sync::atomic::Ordering::Acquire)
     {
         return;
     }
@@ -261,7 +310,7 @@ fn watchdog_tick_and_check()
         let (cur_is_null, tid, state, ipc, blocked_on, prio, pref, last_tick, mask) = unsafe {
             let s = scheduler_for(cpu);
             let cur = s.current;
-            let lt = LAST_NON_IDLE_TICK[cpu].load(core::sync::atomic::Ordering::Relaxed);
+            let lt = last_non_idle_tick(cpu).load(core::sync::atomic::Ordering::Relaxed);
             if cur.is_null()
             {
                 (
@@ -811,24 +860,20 @@ fn idle_thread_entry(_cpu_id: u64) -> !
 
 /// Initialise per-CPU scheduler state and idle threads for `cpu_count` CPUs.
 ///
-/// For each CPU:
-/// 1. Allocates `KERNEL_STACK_PAGES` physical frames from the buddy allocator.
-/// 2. Converts the physical base to a virtual address via the direct map.
-/// 3. Creates an idle [`ThreadControlBlock`] with initial context pointing at
+/// The idle kernel stacks are allocated earlier, in [`init_per_cpu_storage`]
+/// (Phase 4), so they come from the pristine buddy; this function only reads
+/// each stack top back and, for each CPU:
+/// 1. Creates an idle [`ThreadControlBlock`] with initial context pointing at
 ///    [`idle_thread_entry`].
-/// 4. Registers the TCB as both `idle` and `current` in the CPU's scheduler.
+/// 2. Registers the TCB as both `idle` and `current` in the CPU's scheduler.
 ///
 /// Returns `cpu_count` (for use in the Phase 8 startup log message).
 ///
-/// # Panics
-/// Halts with `fatal()` if the buddy allocator cannot satisfy a stack
-/// allocation request.
-///
 /// # Safety
 /// Must be called exactly once, from the single boot thread, after Phase 3
-/// (page tables active) and Phase 4 (heap active).
+/// (page tables active) and Phase 4 (heap + idle stacks active).
 #[cfg(not(test))]
-pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
+pub fn init(cpu_count: u32) -> u32
 {
     debug_assert_eq!(
         CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed),
@@ -836,31 +881,13 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
         "sched::init: storage was not pre-initialised for this cpu_count"
     );
 
-    // Order for KERNEL_STACK_PAGES (4 pages = order 2).
-    // 2^order pages >= KERNEL_STACK_PAGES.
-    let stack_order = {
-        let mut o = 0;
-        while (1usize << o) < KERNEL_STACK_PAGES
-        {
-            o += 1;
-        }
-        o
-    };
-
     for cpu in 0..cpu_count as usize
     {
-        // 1. Allocate stack frames.
-        let stack_phys = allocator
-            .alloc(stack_order)
-            .unwrap_or_else(|| crate::fatal("sched::init: out of memory for idle stack"));
+        // Idle stack top pre-allocated in Phase 4.
+        // SAFETY: cpu < cpu_count; slab populated by init_per_cpu_storage.
+        let stack_top = unsafe { *idle_stack_top_slot(cpu) };
 
-        // 2. Convert physical address to virtual (direct map).
-        let stack_virt = phys_to_virt(stack_phys);
-
-        // Stack grows downward; top = base + size.
-        let stack_top = stack_virt + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
-
-        // 3. Build idle TCB.
+        // Build idle TCB.
         let saved = new_state(
             idle_thread_entry as *const () as u64,
             stack_top,
@@ -919,8 +946,6 @@ pub fn init(cpu_count: u32, allocator: &mut BuddyAllocator) -> u32
         // exclusively owned during init.
         unsafe {
             let s = &mut *scheduler_ptr(cpu);
-            // Set CPU ID so the scheduler can index into the global CPU_LOAD array.
-            s.cpu_id = cpu;
             s.set_idle(tcb);
             s.set_current(tcb);
         }
@@ -982,11 +1007,45 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
         alloc_zeroed_slab::<MaybeUninit<ThreadControlBlock>>(tcb_bytes, allocator, "IDLE_TCBS");
     IDLE_TCBS_PTR.store(tcb_ptr, core::sync::atomic::Ordering::Release);
 
+    // Idle-stack-top slab, then one idle kernel stack per CPU drawn from the
+    // pristine buddy. Done here, in Phase 4, rather than in `init` (Phase 8):
+    // before the Phase-7 user-cap drain the buddy still holds large contiguous
+    // blocks, so each order-2 stack is a clean split. After the drain the only
+    // free blocks are the memory map's order-0/1 fragments, which cannot back
+    // an order-2 stack. `init` reads the tops back from this slab.
+    let tops_bytes = n * core::mem::size_of::<u64>();
+    let tops_ptr = alloc_zeroed_slab::<u64>(tops_bytes, allocator, "IDLE_STACK_TOPS");
+    let stack_order = idle_stack_order();
+    for cpu in 0..n
+    {
+        let stack_phys = allocator
+            .alloc(stack_order)
+            .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: out of memory for idle stack"));
+        // Stack grows downward; top = base + size (direct map).
+        let stack_top = phys_to_virt(stack_phys) + (KERNEL_STACK_PAGES * PAGE_SIZE) as u64;
+        // SAFETY: tops_ptr covers n slots; cpu < n.
+        unsafe { core::ptr::write(tops_ptr.add(cpu), stack_top) };
+    }
+    IDLE_STACK_TOPS_PTR.store(tops_ptr, core::sync::atomic::Ordering::Release);
+
+    // Per-CPU watchdog last-non-idle-tick slab (zeroed AtomicU64 per CPU).
+    let tick_bytes = n * core::mem::size_of::<core::sync::atomic::AtomicU64>();
+    let tick_ptr = alloc_zeroed_slab::<core::sync::atomic::AtomicU64>(
+        tick_bytes,
+        allocator,
+        "LAST_NON_IDLE_TICK",
+    );
+    LAST_NON_IDLE_TICK_PTR.store(tick_ptr, core::sync::atomic::Ordering::Release);
+
+    // Per-CPU arch data (PerCpuData) and APIC-ID slabs.
+    crate::percpu::init_storage(n, allocator);
+
     // Arch-specific per-CPU tables. x86_64 only.
     #[cfg(target_arch = "x86_64")]
     {
         crate::arch::current::gdt::init_ap_storage(n, allocator);
         crate::arch::current::ap_trampoline::init_ap_ist_storage(n, allocator);
+        crate::arch::current::interrupts::init_nmi_backtrace_storage(n, allocator);
     }
 }
 
@@ -1028,7 +1087,7 @@ pub(crate) fn alloc_zeroed_slab<T>(
 /// arch-specific or heap types that are unavailable on the host.
 #[cfg(test)]
 #[allow(unused_variables)]
-pub fn init(_cpu_count: u32, _allocator: &mut crate::mm::BuddyAllocator) -> u32
+pub fn init(_cpu_count: u32) -> u32
 {
     0
 }
@@ -1120,17 +1179,17 @@ pub unsafe fn set_state_under_all_locks(
 ) -> Option<usize>
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    let mut saved_flags: [u64; MAX_CPUS] = [0; MAX_CPUS];
 
     // Acquire all scheduler locks in ascending CPU order to prevent ABBA.
-    // needless_range_loop: explicit indexing keeps saved_flags[cpu] /
-    // scheduler_for(cpu) parallel and clear; iter_mut().enumerate() would
-    // obscure the all-CPU pattern.
-    #[allow(clippy::needless_range_loop)]
+    // Each CPU's saved interrupt-flag word is stashed in its own scheduler
+    // (written under that lock), so no MAX_CPUS-wide stack scratch is needed.
     for cpu in 0..cpu_count
     {
         // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-        saved_flags[cpu] = unsafe { scheduler_for(cpu).lock.lock_raw() };
+        unsafe {
+            let s = scheduler_for(cpu);
+            s.saved_lock_flags = s.lock.lock_raw();
+        }
     }
 
     // Write the state and snapshot priority under all locks so the queue
@@ -1178,7 +1237,10 @@ pub unsafe fn set_state_under_all_locks(
     for cpu in (0..cpu_count).rev()
     {
         // SAFETY: lock_raw above paired with this unlock.
-        unsafe { scheduler_for(cpu).lock.unlock_raw(saved_flags[cpu]) };
+        unsafe {
+            let s = scheduler_for(cpu);
+            s.lock.unlock_raw(s.saved_lock_flags);
+        }
     }
 
     running_on
@@ -1424,7 +1486,7 @@ pub unsafe fn migrate_ready_thread(
 /// ordering: a stale value just biases victim selection slightly.
 static LOAD_BALANCE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Difference in `CPU_LOAD` above which the balancer will attempt a pull.
+/// Difference in per-CPU `current_load` above which the balancer will attempt a pull.
 /// Set high enough that two-CPU steady states (e.g. 1 thread + 2 threads)
 /// do not thrash; low enough that severe imbalances converge in a few
 /// ticks.
@@ -1432,7 +1494,7 @@ const LOAD_BALANCE_IMBALANCE_THRESHOLD: u32 = 2;
 
 /// Per-tick load-balance step. Runs on every CPU's `timer_tick`.
 ///
-/// Hot path cost: 1 Relaxed atomic load (own `CPU_LOAD`) plus either
+/// Hot path cost: 1 Relaxed atomic load (own `current_load`) plus either
 /// (idle CPU) one Relaxed load per remote CPU to find the heaviest, or
 /// (loaded CPU) 1 Relaxed atomic increment (tick counter) + 1 Relaxed
 /// load (random victim). Scheduler locks are acquired only when the

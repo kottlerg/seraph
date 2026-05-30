@@ -42,8 +42,9 @@ Bootstrap caps from devmgr (one round, two caps, `done=true`):
 | `caps[0]` | Service-endpoint RECV (driver receives on this)      |
 | `caps[1]` | `MmioRegion` covering one page at `0x101000`         |
 
-The driver reserves one page of VA via `reserve_pages` and maps the
-`MmioRegion` cap into it via `syscall::mmio_map`.
+The driver reserves one page of VA via `reserve_pages`, funds the AS's
+page-table growth budget for that page via `fund_aspace_pt_budget`, and maps
+the `MmioRegion` cap into it via `syscall::mmio_map`.
 
 ---
 

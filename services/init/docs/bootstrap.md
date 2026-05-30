@@ -180,11 +180,16 @@ and hands init's own kernel objects to procmgr for reaping.
   scans `/config/svcmgr/services/` and launches any
   defined-but-unregistered services from disk.
 - Hand init's kernel-object caps (`AddressSpace`, `CSpace`, main
-  `Thread`, init-logd `Thread`) and every reclaimable Frame cap
-  (segments, stack, `InitInfo` region, IPC buffer) to procmgr via
+  `Thread`, init-logd `Thread`) and every reclaimable Frame cap it
+  solely owns (ELF segments, user stack pages, `InitInfo` pages, the
+  bootloader/bundle reclaim ranges, the AP-trampoline frame, and the
+  boot-module ELF sources) to procmgr via
   `REGISTER_INIT_TEARDOWN` (`../src/service.rs:1565` →
   `handoff_to_procmgr_reap` at `../src/service.rs:1586`). IPC
-  cap-transfer MOVES the caps, so they leave init's CSpace.
+  cap-transfer MOVES the caps, so they leave init's CSpace. The
+  usable-RAM range (already memmgr's), the firmware read-only caps,
+  and init's own bootstrap backing (arena-forwarded to memmgr at
+  `finalize_memmgr`) are excluded.
 - Call `sys_thread_exit` (`../src/service.rs:1574`). Procmgr's
   death-EQ observer (bound on init's main thread with
   `INIT_REAP_CORRELATOR`) fires and runs
@@ -193,9 +198,11 @@ and hands init's own kernel objects to procmgr for reaping.
   deleted (PT chunks `retype_free`'d, user-page mappings
   vanish), the accumulated Frame caps are `DONATE_FRAMES`'d to
   memmgr's pool, init's `CSpace` is revoked + deleted (cascading
-  dec_ref through every remaining cap; `owns_memory=true` caps
-  return their pages to the kernel buddy via `dealloc_object`),
-  and procmgr logs a summary line. No init-related kernel object
+  dec_ref through init's remaining caps — endpoint SENDs and the
+  retype-pinned endpoint-slab arena already forwarded to memmgr).
+  Every reclaimable Frame was donated, so no `owns_memory` cap
+  reaches its last reference and nothing frees to the sealed buddy.
+  Procmgr logs a summary line; no init-related kernel object
   remains; svcmgr is the resident supervisor from this point on.
 
 memmgr and procmgr are the only two processes init creates via
@@ -244,7 +251,7 @@ svcmgr if needed.
 | Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; in the bootstrap round, full-rights SEND on its own service endpoint and on the local svcmgr-bootstrap endpoint |
 | Handover | pwrmgr | Remaining arch authority (`IoPortRange` / `SbiControl`) + ACPI region Frame caps |
 | Handover (publish) | svcmgr registry | `rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`, `svcmgr`, `devmgr.registry` named caps |
-| Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Frame cap (segments, stack, `InitInfo` region, IPC buffer) |
+| Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Frame cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline frame, boot-module ELF sources) |
 
 ---
 

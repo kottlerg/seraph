@@ -33,8 +33,9 @@
 //!   serialises (token table + history ring) into one or more reply
 //!   chunks, then breaks its loop and `sys_thread_exit`s.
 
+use crate::PAGE_SIZE;
 use crate::arch;
-use crate::{FrameAlloc, PAGE_SIZE};
+use crate::bootstrap::BootArena;
 use init_protocol::InitInfo;
 
 use ipc::log_labels::HANDOVER_PULL;
@@ -54,7 +55,7 @@ const LOG_THREAD_IPC_BUF_VA: u64 = crate::INIT_IPC_BUF_VA + crate::PAGE_SIZE;
 const LOG_THREAD_STACK_VA: u64 = 0x0000_0000_D000_0000;
 
 /// Number of stack pages for the log thread (16 KiB).
-const LOG_THREAD_STACK_PAGES: u64 = 4;
+pub(crate) const LOG_THREAD_STACK_PAGES: u64 = 4;
 
 /// Max bytes per IPC chunk. Must match `MSG_DATA_WORDS_MAX * 8` from `syscall_abi`.
 const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
@@ -236,74 +237,47 @@ fn ipc_log(cap: u32, ipc_buf: *mut u64, bytes: &[u8])
 /// The cap survives init-logd's `sys_thread_exit` — the kernel marks the
 /// TCB Exited but does not reclaim it until `cap_delete` drops the cap's
 /// last reference.
-pub fn spawn_log_thread(
-    info: &InitInfo,
-    alloc: &mut FrameAlloc,
-    log_ep: u32,
-    ioport_cap: u32,
-) -> u32
+pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, ioport_cap: u32)
+-> u32
 {
-    // Allocate stack pages for the log thread.
+    // Offset-map the log thread's stack pages from init's arena into init's
+    // address space, writable (W^X: not executable). `place_page` maps the
+    // full-rights arena cap directly with explicit protection, so no per-page
+    // derived child cap is needed.
     for i in 0..LOG_THREAD_STACK_PAGES
     {
-        let Some(frame) = alloc.alloc_page()
-        else
+        if arena
+            .place_page(
+                info.aspace_cap,
+                LOG_THREAD_STACK_VA + i * PAGE_SIZE,
+                syscall::MAP_WRITABLE,
+                |_| {},
+            )
+            .is_none()
         {
-            log("init: FATAL: cannot allocate log thread stack");
-            syscall::thread_exit();
-        };
-        let Ok(rw_cap) = syscall::cap_derive(frame, syscall::RIGHTS_MAP_RW)
-        else
-        {
-            log("init: FATAL: cannot derive log thread stack cap");
-            syscall::thread_exit();
-        };
-        if syscall::mem_map(
-            rw_cap,
-            info.aspace_cap,
-            LOG_THREAD_STACK_VA + i * PAGE_SIZE,
-            0,
-            1,
-            0,
-        )
-        .is_err()
-        {
-            log("init: FATAL: cannot map log thread stack");
+            log("init: FATAL: cannot place log thread stack");
             syscall::thread_exit();
         }
     }
 
-    // Allocate IPC buffer page for the log thread.
-    let Some(ipc_frame) = alloc.alloc_page()
-    else
+    // Offset-map the log thread's IPC buffer (zeroed by `place_page`).
+    if arena
+        .place_page(
+            info.aspace_cap,
+            LOG_THREAD_IPC_BUF_VA,
+            syscall::MAP_WRITABLE,
+            |_| {},
+        )
+        .is_none()
     {
-        log("init: FATAL: cannot allocate log thread IPC buffer");
-        syscall::thread_exit();
-    };
-    let Ok(ipc_rw_cap) = syscall::cap_derive(ipc_frame, syscall::RIGHTS_MAP_RW)
-    else
-    {
-        log("init: FATAL: cannot derive log thread IPC cap");
-        syscall::thread_exit();
-    };
-    if syscall::mem_map(ipc_rw_cap, info.aspace_cap, LOG_THREAD_IPC_BUF_VA, 0, 1, 0).is_err()
-    {
-        log("init: FATAL: cannot map log thread IPC buffer");
+        log("init: FATAL: cannot place log thread IPC buffer");
         syscall::thread_exit();
     }
-    // Zero the IPC buffer.
-    // SAFETY: LOG_THREAD_IPC_BUF_VA is mapped writable and covers one page.
-    unsafe { core::ptr::write_bytes(LOG_THREAD_IPC_BUF_VA as *mut u8, 0, PAGE_SIZE as usize) };
 
-    // Reserve a Thread-retype slab and create the log thread bound to
-    // init's address space and CSpace.
-    let Some(thread_slab) = alloc.alloc_pages(crate::THREAD_RETYPE_PAGES)
-    else
-    {
-        log("init: FATAL: cannot allocate log thread frame slab");
-        syscall::thread_exit();
-    };
-    let Ok(thread_cap) = syscall::cap_create_thread(thread_slab, info.aspace_cap, info.cspace_cap)
+    // Create the log thread by retyping from the arena front, bound to init's
+    // own address space and CSpace. The retype holds an ancestor reference on
+    // the arena's FrameObject, pinning it for the thread's life.
+    let Ok(thread_cap) = syscall::cap_create_thread(arena.cap, info.aspace_cap, info.cspace_cap)
     else
     {
         log("init: FATAL: cannot create log thread");

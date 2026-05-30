@@ -85,15 +85,32 @@ fn print_memory_line(idx: usize, start: u64, end: u64, ty: MemoryType)
     );
 }
 
+/// Total installed DRAM in bytes, captured by [`print_memory_map`].
+/// Read once at Phase 9 to populate `InitInfo::system_ram_bytes`.
+static SYSTEM_RAM_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Total installed DRAM in bytes (the sum of every DRAM-typed memory-map
+/// region). Zero until [`print_memory_map`] runs at early boot.
+#[must_use]
+pub fn system_ram_bytes() -> u64
+{
+    SYSTEM_RAM_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Print the physical memory map from the bootloader to the serial console.
 ///
 /// Iterates all entries in `info.memory_map`, printing address range, size in
 /// KiB, and memory type for each entry. Prints a summary line with usable and
-/// total RAM in MiB at the end.
+/// total RAM in MiB at the end. Records the DRAM total for
+/// [`system_ram_bytes`].
 ///
 /// Must be called before Phase 3 activates the kernel page tables; the
 /// `memory_map.entries` pointer is a physical address covered by the
 /// bootloader's identity map, which is replaced in Phase 3.
+// too_many_lines: a flat, sequential memory-map dump; the per-type tallying,
+// run-merging, and summary print read as one unit and gain nothing from
+// being split across helpers.
+#[allow(clippy::too_many_lines)]
 pub fn print_memory_map(info: &BootInfo)
 {
     kprintln!("Memory map:");
@@ -185,6 +202,7 @@ pub fn print_memory_map(info: &BootInfo)
     // `mmio` here so the DRAM sum is accurate.
     let dram_total_bytes =
         usable_bytes + loaded_bytes + reserved_bytes + acpi_bytes + persistent_bytes;
+    SYSTEM_RAM_BYTES.store(dram_total_bytes, core::sync::atomic::Ordering::Relaxed);
     let (dram_v, dram_u) = scaled_unit(dram_total_bytes);
     let (use_v, use_u) = scaled_unit(usable_bytes);
     let (lod_v, lod_u) = scaled_unit(loaded_bytes);

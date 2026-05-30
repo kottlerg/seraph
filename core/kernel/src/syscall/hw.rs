@@ -204,6 +204,13 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// All pages are mapped with `uncacheable = true` (PCD|PWT on `x86_64`,
 /// no-op on RISC-V under the current MMU mode — see [`PageFlags`] comment).
 ///
+/// Intermediate page-table pages are drawn from the target AS's own
+/// retype-backed PT growth pool when it has one (every userspace driver's
+/// AS); the chunk-less kernel-created boot AS falls back to the fixed
+/// kernel PT pool. Callers mapping a region larger than the AS's spare PT
+/// budget must augment it first via `cap_create_aspace` augment-mode, else
+/// the map fails with `OutOfMemory` rather than drawing on the reserve.
+///
 /// Returns 0 on success.
 #[cfg(not(test))]
 pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
@@ -267,13 +274,14 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let as_slot =
         unsafe { super::lookup_cap(cspace, aspace_idx, CapTag::AddressSpace, Rights::MAP) }?;
-    let as_ptr = {
+    let (as_ptr, aso_raw) = {
         let obj = as_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed AddressSpace; object was allocated as Box<AddressSpaceObject>.
+        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
         #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            (*obj.as_ptr().cast::<AddressSpaceObject>()).address_space
-        }
+        let aso = obj.as_ptr().cast::<AddressSpaceObject>();
+        // SAFETY: tag confirmed AddressSpace; aso is a valid AddressSpaceObject.
+        let as_inner = unsafe { (*aso).address_space };
+        (as_inner, aso)
     };
 
     // MMIO mappings are never executable.
@@ -288,6 +296,18 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         uncacheable: true,
     };
 
+    // Choose the PT-page source, mirroring sys_mem_map. A retype-backed AS
+    // (any chunk slot occupied) pulls intermediate PT pages from its own
+    // caller-funded growth pool; the chunk-less kernel-created boot AS (init's
+    // own AS, part of the fixed reserve) falls back to the kernel PT pool.
+    // SAFETY: aso_raw is non-null and valid for the lifetime of the cap.
+    let pooled = !unsafe {
+        (*aso_raw).pt_chunks[0]
+            .ancestor
+            .load(core::sync::atomic::Ordering::Acquire)
+            .is_null()
+    };
+
     // Map each page.
     for i in 0..page_count
     {
@@ -295,10 +315,20 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let phys = mmio_phys + (i * PAGE_SIZE) as u64;
 
         // SAFETY: virt in user range (validated above); phys from a
-        // kernel-provisioned MmioRegion boot object. map_page acquires
-        // pt_lock and FRAME_ALLOC_LOCK internally.
-        unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
-            .map_err(|()| SyscallError::OutOfMemory)?;
+        // kernel-provisioned MmioRegion boot object. Pooled vs heap-backed
+        // dispatch is chosen once above from the AS's typed-memory state.
+        let result = if pooled
+        {
+            // SAFETY: aso_raw is valid; it wraps as_ptr.
+            unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, &*aso_raw) }
+        }
+        else
+        {
+            // SAFETY: heap-backed boot AS; map_page acquires pt_lock and
+            // FRAME_ALLOC_LOCK internally.
+            unsafe { (*as_ptr).map_page(virt, phys, page_flags) }
+        };
+        result.map_err(|()| SyscallError::OutOfMemory)?;
     }
 
     Ok(0)

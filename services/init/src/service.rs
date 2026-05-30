@@ -394,13 +394,14 @@ pub fn create_devmgr_with_caps(
 ) -> Option<u32>
 {
     let devmgr_frame_cap = crate::find_module_by_name(info, b"devmgr")?;
+    let devmgr_module_copy = module_spawn_copy(devmgr_frame_cap)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
     // caps: [module, creator]. No stdio pipes — devmgr reaches the
     // system log via the discovery cap procmgr installs in ProcessInfo.
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(devmgr_frame_cap)
+        .cap(devmgr_module_copy)
         .cap(tokened_creator)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -1033,11 +1034,12 @@ pub fn create_vfsd_with_caps(
 ) -> Option<u32>
 {
     let vfsd_frame_cap = crate::find_module_by_name(info, b"vfsd")?;
+    let vfsd_module_copy = module_spawn_copy(vfsd_frame_cap)?;
 
     let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
 
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(vfsd_frame_cap)
+        .cap(vfsd_module_copy)
         .cap(tokened_creator)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -1319,7 +1321,8 @@ pub fn phase3_svcmgr_handover(
     mut thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
-    init_ipc_buf_cap: u32,
+    mem_frame_reap_floor: u32,
+    orphan_frames: &[u32],
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
@@ -1566,12 +1569,52 @@ pub fn phase3_svcmgr_handover(
         info,
         procmgr_ep,
         init_logd_thread_cap,
-        init_ipc_buf_cap,
         ipc_buf,
+        mem_frame_reap_floor,
+        orphan_frames,
     );
 
     log("main thread exiting; init handed off to procmgr for reap");
     syscall::thread_exit();
+}
+
+/// Send one `REGISTER_INIT_TEARDOWN` donate-only round (word 0 = 0)
+/// carrying `slots` as caps. Non-fatal on failure: init exits regardless,
+/// and any un-sent cap falls to the `CSpace` cascade.
+///
+/// # Safety
+/// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
+/// SEND|GRANT.
+unsafe fn send_teardown_round(procmgr_ep: u32, slots: &[u32], ipc_buf: *mut u64)
+{
+    if slots.is_empty()
+    {
+        return;
+    }
+    let mut builder = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN).word(0, 0);
+    for &slot in slots
+    {
+        builder = builder.cap(slot);
+    }
+    let msg = builder.build();
+    // SAFETY: forwarded from the caller's contract above.
+    match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
+        {}
+        Ok(_) => log("reap-handoff: donation round refused"),
+        Err(_) => log("reap-handoff: donation round IPC failed"),
+    }
+}
+
+/// Derive a transient full-rights copy of a boot-module Frame cap for a
+/// `CREATE_PROCESS` spawn. Init retains the original — it is the sole owner
+/// of the module-source `FrameObject` and donates it to memmgr at reap. The
+/// loader borrows this copy (deriving a read-only child for the load-time
+/// mapping) and deletes it once the ELF is loaded.
+fn module_spawn_copy(module_frame_cap: u32) -> Option<u32>
+{
+    syscall::cap_derive(module_frame_cap, syscall::RIGHTS_ALL).ok()
 }
 
 /// Move init's kernel-object caps + every reclaimable Frame cap to
@@ -1587,8 +1630,9 @@ fn handoff_to_procmgr_reap(
     info: &InitInfo,
     procmgr_ep: u32,
     init_logd_thread_cap: u32,
-    init_ipc_buf_cap: u32,
     ipc_buf: *mut u64,
+    mem_frame_reap_floor: u32,
+    orphan_frames: &[u32],
 )
 {
     // Round 1: kernel-object caps. `data[0] = 1` distinguishes from
@@ -1615,60 +1659,88 @@ fn handoff_to_procmgr_reap(
         return;
     }
 
-    // Donatable Frame caps: segments + stack + InitInfo region + IPC
-    // buffer. Other init-owned Frame caps (endpoint slab, leftover
-    // FrameAlloc tails) fall to the CSpace cascade — they end up in
-    // the kernel buddy rather than memmgr's pool.
+    // Donate every owns_memory Frame cap init solely holds, streamed in
+    // MSG_CAP_SLOTS_MAX-sized rounds. Three disjoint sources:
+    //  - explicit InitInfo ranges (not in the descriptor array): init's ELF
+    //    segments, user stack, and the InitInfo region. (init's IPC buffer is
+    //    not here: it lives in init's bootstrap arena, forwarded to memmgr at
+    //    `finalize_memmgr` as an in-use run, not donated at reap.)
+    //  - a descriptor walk for the unnamed reclaimable Frame caps — the
+    //    bootloader and bundle reclaim ranges plus the AP-trampoline late
+    //    cap — which carry no named InitInfo slot.
+    //  - FrameAlloc's orphans: free remainders abandoned while carving the
+    //    bootstrap arenas, below the floor with no descriptor.
+    // The walk skips caps init does not solely own or that are not RAM: the
+    // consumed/forwarded usable-RAM prefix (below `mem_frame_reap_floor` —
+    // `FrameAlloc` arenas and the frames `finalize_memmgr` already forwarded;
+    // memmgr keeps them alive) and the firmware read-only caps (RSDP/ACPI/DTB;
+    // owns_memory=false). The usable-RAM *tail* at or above the floor — free
+    // frames that did not fit the single bootstrap round — IS donated here, so
+    // every page of RAM reaches memmgr's pool. Boot-module Frame caps are also
+    // included: init is their sole owner once every loader has copied the ELF
+    // and dropped its borrowed read-only derivation.
     let seg = info.segment_frame_base..info.segment_frame_base + info.segment_frame_count;
     let stack =
         info.init_stack_frame_base..info.init_stack_frame_base + info.init_stack_frame_count;
     let inf = info.init_info_frame_base..info.init_info_frame_base + info.init_info_frame_count;
 
-    let mut donate: [u32; 32] = [0; 32];
-    let mut n = 0usize;
-    for slot in seg.chain(stack).chain(inf)
-    {
-        if n < donate.len()
-        {
-            donate[n] = slot;
-            n += 1;
-        }
-    }
-    if init_ipc_buf_cap != 0 && n < donate.len()
-    {
-        donate[n] = init_ipc_buf_cap;
-        n += 1;
-    }
+    let mem_lo = info.memory_frame_base;
+    let acpi_lo = info.acpi_region_frame_base;
+    let acpi_hi = info
+        .acpi_region_frame_base
+        .saturating_add(info.acpi_region_frame_count);
 
-    let chunk_size = syscall_abi::MSG_CAP_SLOTS_MAX;
-    let mut i = 0usize;
-    while i < n
+    let mut chunk = [0u32; syscall_abi::MSG_CAP_SLOTS_MAX];
+    let mut cn = 0usize;
     {
-        let end = (i + chunk_size).min(n);
-        let mut builder = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN).word(0, 0);
-        for &slot in &donate[i..end]
+        let mut push = |slot: u32| {
+            chunk[cn] = slot;
+            cn += 1;
+            if cn == chunk.len()
+            {
+                // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
+                unsafe { send_teardown_round(procmgr_ep, &chunk, ipc_buf) };
+                cn = 0;
+            }
+        };
+
+        for slot in seg.chain(stack).chain(inf)
         {
-            builder = builder.cap(slot);
+            push(slot);
         }
-        let msg = builder.build();
+        for desc in crate::descriptors(info)
+        {
+            if desc.cap_type != CapType::Frame
+            {
+                continue;
+            }
+            let s = desc.slot;
+            if s >= mem_lo && s < mem_frame_reap_floor
+            {
+                continue;
+            }
+            if (info.acpi_rsdp_frame_cap != 0 && s == info.acpi_rsdp_frame_cap)
+                || (info.dtb_frame_cap != 0 && s == info.dtb_frame_cap)
+                || (info.acpi_region_frame_count != 0 && s >= acpi_lo && s < acpi_hi)
+            {
+                continue;
+            }
+            push(s);
+        }
+        // The free Frame caps FrameAlloc abandoned while carving bootstrap
+        // arenas: frame_split remainders below the floor with no descriptor.
+        // Without this they would cascade into the sealed buddy at CSpace
+        // teardown and leak. They carry RETYPE + owns_memory like any RAM
+        // frame, so memmgr ingests them into its pool.
+        for &slot in orphan_frames
+        {
+            push(slot);
+        }
+    }
+    if cn > 0
+    {
         // SAFETY: ipc_buf is registered; procmgr_ep carries SEND|GRANT.
-        match unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) }
-        {
-            Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS =>
-            {}
-            Ok(reply) => log(
-                if reply.label == ipc::procmgr_errors::INVALID_ARGUMENT
-                {
-                    "reap-handoff: donation chunk refused INVALID_ARGUMENT"
-                }
-                else
-                {
-                    "reap-handoff: donation chunk refused (non-success reply)"
-                },
-            ),
-            Err(_) => log("reap-handoff: donation chunk IPC failed"),
-        }
-        i = end;
+        unsafe { send_teardown_round(procmgr_ep, &chunk[..cn], ipc_buf) };
     }
 
     // Signal the cap stream is closed. Procmgr arms the death-EQ

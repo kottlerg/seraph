@@ -226,6 +226,56 @@ pub extern "C" fn _start(info_ptr: u64) -> !
     run(info_ptr)
 }
 
+/// Fund extra page-table growth budget on ktest's own (boot) `AddressSpace`
+/// via the real userspace mechanism — `cap_create_aspace` augment-mode off an
+/// inherited RAM Frame cap. Drivers fund this way after obtaining a frame from
+/// memmgr; ktest has no memmgr, so it draws on the kernel-minted RAM caps it
+/// inherits as init.
+///
+/// Post-Gap-B, `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot
+/// AS draw intermediate PT pages from that AS's own pool, not the fixed kernel
+/// reserve. The seeded `INIT_ASPACE_PAGES` pool sizes init's own bootstrap
+/// footprint; ktest additionally maps the framebuffer and serial MMIO and runs
+/// the `mem_map` suite against this AS, so it needs a modest top-up. Source the
+/// slabs from spare RAM caps — every inherited RAM cap except `memory_frame_base`,
+/// which `frame_pool` and the retype-heavy tests draw from. The drain leaves one
+/// large cap plus many smaller fragments, so accumulate across several augments.
+/// Best-effort: a partial top-up still helps; failures surface in the tests.
+fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
+{
+    const TARGET_BYTES: u64 = 64 * 4096;
+    const PER_AUGMENT_MAX: u64 = 64;
+    const MIN_SPARE_PAGES: u64 = 16;
+    const MAX_AUGMENTS: u32 = 8; // stay within MAX_PT_CHUNKS headroom
+    if info.memory_frame_count < 2
+    {
+        return;
+    }
+    let mut augments = 0u32;
+    for slot in (info.memory_frame_base + 1)..(info.memory_frame_base + info.memory_frame_count)
+    {
+        if augments >= MAX_AUGMENTS
+            || syscall::cap_info(info.aspace_cap, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET)
+                .is_ok_and(|b| b >= TARGET_BYTES)
+        {
+            break;
+        }
+        let avail_pages =
+            syscall::cap_info(slot, syscall_abi::CAP_INFO_FRAME_AVAILABLE).map_or(0, |a| a / 4096);
+        if avail_pages < MIN_SPARE_PAGES
+        {
+            continue;
+        }
+        // Leave one page for the retype metadata header the kernel carves on a
+        // frame's first retype; cap each augment to bound the per-chunk size.
+        let want = (avail_pages - 1).min(PER_AUGMENT_MAX);
+        if syscall::cap_create_aspace(slot, info.aspace_cap, want).is_ok()
+        {
+            augments += 1;
+        }
+    }
+}
+
 fn run(info_ptr: u64) -> !
 {
     // Read InitInfo from the kernel-mapped page.
@@ -239,6 +289,11 @@ fn run(info_ptr: u64) -> !
         // Cannot log (serial not initialised yet). Halt immediately.
         halt();
     }
+
+    // Fund extra PT growth budget on ktest's own (boot) AddressSpace before
+    // anything maps MMIO into it (serial/framebuffer below, the hw::mmio_map
+    // aperture later). Must precede `serial::init`/`framebuffer::init`.
+    fund_boot_aspace_pt(info);
 
     // Seed the I/O port subdivider with the root IoPortRange cap so
     // `serial::init` and `acpi_shutdown::shutdown` can each carve only

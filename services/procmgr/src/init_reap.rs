@@ -28,9 +28,10 @@
 //!   2. cap_delete(main_thread)
 //!   3. cap_revoke + cap_delete(aspace)        — mappings gone
 //!   4. DONATE_FRAMES(caps[..]) → memmgr       — safe; no aliasing
-//!   5. cap_revoke + cap_delete(cspace)        — cascade clears
-//!                                                undonated caps to
-//!                                                kernel buddy
+//!   5. cap_revoke + cap_delete(cspace)        — cascade drops
+//!                                                init's last caps;
+//!                                                none free to the
+//!                                                sealed buddy
 //!   6. log summary
 //! ```
 
@@ -50,8 +51,9 @@ use syscall_abi::MSG_CAP_SLOTS_MAX;
 ///
 /// `aspace`/`cspace`/`main_thread`/`logd_thread` are the procmgr-side
 /// slots holding the moved-in caps; `donate_caps` is the list of
-/// reclaimable Frame caps (segments + stack + `InitInfo` + IPC buffer +
-/// any other init-owned Frame the reap-handoff covers).
+/// reclaimable Frame caps (ELF segments, user stack pages, `InitInfo`
+/// pages, bootloader/bundle reclaim ranges, the AP-trampoline frame,
+/// and boot-module ELF sources).
 pub struct InitReapState
 {
     aspace: u32,
@@ -228,11 +230,11 @@ pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
         donate_to_memmgr(memmgr_ep, &state.donate_caps, ipc_buf);
 
     // 5. Destroy init's CSpace last. The cascade in `dealloc_object`
-    //    deref's every cap init still held (endpoint SENDs, endpoint
-    //    slab Frame, leftover memory frames not donated above). Pages
-    //    backed by `owns_memory=true` Frame caps return to the kernel
-    //    buddy via `free_range` — they don't enter memmgr's pool, but
-    //    they are no longer leaked.
+    //    drops every cap init still held — endpoint SENDs and the
+    //    endpoint-slab arena Frame. That arena is retype-pinned and
+    //    already forwarded to memmgr's pool, and every reclaimable
+    //    Frame was donated in step 4, so no `owns_memory` cap reaches
+    //    its last reference here: nothing frees to the sealed buddy.
     let _ = syscall::cap_revoke(state.cspace);
     let _ = syscall::cap_delete(state.cspace);
 

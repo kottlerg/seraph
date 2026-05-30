@@ -225,69 +225,76 @@ impl FreePool
         best
     }
 
-    /// Coalesce free runs by repeatedly trying `frame_merge` between every
-    /// pair. Bounded: each successful merge reduces the run count by one.
+    /// Coalesce free runs into larger physically-contiguous chunks.
+    ///
+    /// `frame_merge` only joins runs adjacent in physical memory, so sorting
+    /// the populated runs by `phys_base` places every mergeable pair
+    /// consecutively. A single linear pass then folds each run into its
+    /// lower-addressed neighbour with one `frame_merge` per pair: O(P)
+    /// syscalls over P populated runs, versus the O(P²) of blind all-pairs
+    /// probing. The distinction is load-bearing once the pool spans the whole
+    /// machine and every process death coalesces — a syscall per ordered pair
+    /// dominates teardown latency.
+    // cast_possible_truncation: slot indices are bounded by MAX_FREE_RUNS
+    // (512), so `i as u16` cannot truncate.
+    #[allow(clippy::cast_possible_truncation)]
     fn coalesce(&mut self)
     {
-        loop
+        // Collect populated slot indices (slot < MAX_FREE_RUNS fits u16).
+        let mut order = [0u16; MAX_FREE_RUNS];
+        let mut n = 0usize;
+        for (i, slot) in self.runs.iter().enumerate()
         {
-            let mut merged_any = false;
-            'outer: for i in 0..MAX_FREE_RUNS
+            if slot.is_some()
             {
-                let Some(run_a) = self.runs[i]
+                order[n] = i as u16;
+                n += 1;
+            }
+        }
+        // Insertion sort by phys_base: P is small in practice and this needs
+        // no allocator. None never appears in `order`, so map_or's default is
+        // unreachable.
+        for a in 1..n
+        {
+            let key = order[a];
+            let key_phys = self.runs[key as usize].map_or(0, |r| r.phys_base);
+            let mut b = a;
+            while b > 0 && self.runs[order[b - 1] as usize].map_or(0, |r| r.phys_base) > key_phys
+            {
+                order[b] = order[b - 1];
+                b -= 1;
+            }
+            order[b] = key;
+        }
+        // Fold each run into the current survivor while `frame_merge` accepts
+        // the pair. The survivor is the lower-addressed run, so it is always
+        // the merge parent; a rejection (non-adjacent or foreign parent) ends
+        // this survivor's run and promotes the rejecting run to survivor.
+        let mut s = 0usize;
+        while s < n
+        {
+            let surv = order[s] as usize;
+            let mut t = s + 1;
+            while t < n
+            {
+                let (Some(parent), Some(tail)) = (self.runs[surv], self.runs[order[t] as usize])
                 else
                 {
-                    continue;
+                    break;
                 };
-                for j in 0..MAX_FREE_RUNS
+                if syscall::frame_merge(parent.cap_slot, tail.cap_slot).is_err()
                 {
-                    if i == j
-                    {
-                        continue;
-                    }
-                    let Some(run_b) = self.runs[j]
-                    else
-                    {
-                        continue;
-                    };
-                    // Try merging in both orders. Option-D frame_merge
-                    // requires physical contiguity (parent first, tail
-                    // second) and identical rights/parents; it rejects every
-                    // non-adjacent pair, so blind probing is correct (just
-                    // O(N²)). On success the parent's slot stays valid and
-                    // the tail's slot is freed; the merged run's cap_slot
-                    // is therefore the parent (lower-address) cap.
-                    if syscall::frame_merge(run_a.cap_slot, run_b.cap_slot).is_ok()
-                    {
-                        // run_a was parent (lower base); its slot survives
-                        // and now covers run_a.size + run_b.size.
-                        self.runs[i] = Some(FreeRun {
-                            cap_slot: run_a.cap_slot,
-                            page_count: run_a.page_count + run_b.page_count,
-                            phys_base: run_a.phys_base,
-                        });
-                        self.runs[j] = None;
-                        merged_any = true;
-                        break 'outer;
-                    }
-                    if syscall::frame_merge(run_b.cap_slot, run_a.cap_slot).is_ok()
-                    {
-                        // run_b was parent; its slot survives.
-                        self.runs[i] = Some(FreeRun {
-                            cap_slot: run_b.cap_slot,
-                            page_count: run_a.page_count + run_b.page_count,
-                            phys_base: run_b.phys_base,
-                        });
-                        self.runs[j] = None;
-                        merged_any = true;
-                        break 'outer;
-                    }
+                    break;
                 }
+                self.runs[surv] = Some(FreeRun {
+                    cap_slot: parent.cap_slot,
+                    page_count: parent.page_count + tail.page_count,
+                    phys_base: parent.phys_base,
+                });
+                self.runs[order[t] as usize] = None;
+                t += 1;
             }
-            if !merged_any
-            {
-                break;
-            }
+            s = t;
         }
     }
 }
@@ -384,36 +391,46 @@ fn table_mut() -> &'static mut ProcessTable
 
 // ── Bootstrap protocol ───────────────────────────────────────────────────────
 //
-// Init → memmgr bootstrap (one round on memmgr's creator endpoint):
-//   caps[0]: memmgr's service endpoint (full rights; memmgr's RECV side).
-//   caps[1]: read-only Frame cap (one page) carrying `[u64; frame_count]`
-//            of physical-base addresses, parallel to `page_counts`. memmgr
-//            maps it RO at `PHYS_TABLE_TEMP_VA`, copies the values into
-//            its `FreeRun` records, then unmaps + cap-deletes.
-//   data[0]: frame_base — first slot index of the RAM Frame caps already
-//            copied into memmgr's `CSpace`.
-//   data[1]: frame_count — number of consecutive RAM frames.
-//   data[2]: procmgr_token — the token init burned into procmgr's tokened
-//            SEND on memmgr's endpoint. memmgr stores this and gates the
-//            procmgr-only labels (REGISTER_PROCESS, PROCESS_DIED) on it.
-//   data[3..3+ceil(frame_count/2)]: page_count per frame, packed two per
-//            word (low 32 bits = even index, high 32 bits = odd index).
-//
-// MSG_DATA_WORDS_MAX = 64; this layout supports up to 122 RAM frames per
-// bootstrap round (same as before phys_base was plumbed: phys travels via
-// the auxiliary frame in caps[1] rather than competing for data-field
-// budget).
+// The init → memmgr bootstrap payload layout (round caps + data words and the
+// auxiliary phys-table page) is defined in `ipc::memmgr_bootstrap`. memmgr
+// reads the free-run prefix from the data words and, from the phys-table page,
+// the per-frame physical bases plus the in-use bootstrap arenas (memmgr's,
+// procmgr's, and init's own backing). The arenas are recorded against per-owner
+// process records so `pool_total` spans every page of RAM memmgr owns, not only
+// the free runs and reap donations.
 
-/// Maximum number of frames init can deliver in one bootstrap round.
-/// Mirrors `MEMMGR_BOOTSTRAP_MAX_FRAMES` in init's `bootstrap.rs`:
-/// 64-word data field minus 3-word prefix, two `page_counts` packed
-/// per word.
-const BOOTSTRAP_MAX_FRAMES: usize = 122;
+/// Maximum free RAM frames init delivers in one bootstrap round; see
+/// `ipc::memmgr_bootstrap::MAX_FRAMES`.
+const BOOTSTRAP_MAX_FRAMES: usize = ipc::memmgr_bootstrap::MAX_FRAMES;
+
+/// Reserved process-table token for memmgr's own bootstrap-backing record.
+/// Out of range of every minted token (memmgr's `NEXT_TOKEN` and init's
+/// bootstrap tokens both start at 1), so no real caller can match it.
+const MEMMGR_SELF_TOKEN: u64 = u64::MAX;
+
+/// Reserved process-table token for init's orphaned bootstrap-backing record.
+/// init exits at reap, so no live process owns its arena; its pages stay
+/// parked and accounted here. Like `MEMMGR_SELF_TOKEN`, far out of minted-token
+/// range, so no real caller can match it.
+const INIT_SELF_TOKEN: u64 = u64::MAX - 1;
 
 /// Scratch VA in memmgr's address space for mapping the bootstrap
 /// phys-table frame. One page; mapped RO during `bootstrap_from_init`,
 /// unmapped before the dispatch loop entry.
 const PHYS_TABLE_TEMP_VA: u64 = 0x0000_5000_0000_0000;
+
+/// One in-use bootstrap arena delivered by init: a Frame cap covering a
+/// tier-1 service's whole backing (retype slabs + offset-mapped pages),
+/// recorded as an `OwnedFrame` against the owning service's record so its
+/// pages count toward `pool_total`.
+#[derive(Clone, Copy, Default)]
+struct BootInUse
+{
+    cap_slot: u32,
+    page_count: u32,
+    phys_base: u64,
+    kind: u64,
+}
 
 struct InitBootstrap
 {
@@ -423,6 +440,10 @@ struct InitBootstrap
     frame_count: u32,
     page_counts: [u32; BOOTSTRAP_MAX_FRAMES],
     phys_bases: [u64; BOOTSTRAP_MAX_FRAMES],
+    in_use: [BootInUse; ipc::memmgr_bootstrap::MAX_IN_USE],
+    in_use_count: usize,
+    system_ram_bytes: u64,
+    kernel_reserved_bytes: u64,
 }
 
 fn bootstrap_from_init(
@@ -431,6 +452,8 @@ fn bootstrap_from_init(
     ipc_buf: *mut u64,
 ) -> Option<InitBootstrap>
 {
+    use ipc::memmgr_bootstrap as mb;
+
     if creator_ep == 0
     {
         return None;
@@ -481,6 +504,46 @@ fn bootstrap_from_init(
         // 976 B fits in one 4 KiB page.
         *slot = unsafe { core::ptr::read_volatile(phys_ptr.add(i)) };
     }
+
+    // Read the in-use bootstrap arenas from the phys-table page's in-use
+    // section (above the phys-base table and the immutable facts).
+    // SAFETY: IN_USE_COUNT_IDX is within the mapped 4 KiB page.
+    let in_use_count = (unsafe { core::ptr::read_volatile(phys_ptr.add(mb::IN_USE_COUNT_IDX)) }
+        as usize)
+        .min(mb::MAX_IN_USE);
+    let mut in_use = [BootInUse::default(); mb::MAX_IN_USE];
+    for (i, entry) in in_use.iter_mut().enumerate().take(in_use_count)
+    {
+        let base = mb::IN_USE_BASE_IDX + i * mb::IN_USE_WORDS;
+        // SAFETY: base + 2 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the mapped page.
+        let (w0, phys_base, kind) = unsafe {
+            (
+                core::ptr::read_volatile(phys_ptr.add(base)),
+                core::ptr::read_volatile(phys_ptr.add(base + 1)),
+                core::ptr::read_volatile(phys_ptr.add(base + 2)),
+            )
+        };
+        *entry = BootInUse {
+            cap_slot: w0 as u32,
+            page_count: (w0 >> 32) as u32,
+            phys_base,
+            kind,
+        };
+    }
+
+    // The kernel's immutable RAM-accounting facts, written by init at fixed
+    // phys-table indices. They form the left side of the all-RAM-accounted
+    // identity (`system_ram == kernel_reserved + pool_total`) surfaced via
+    // `QUERY_POOL_STATUS`.
+    // SAFETY: both indices are within the mapped 4 KiB page and past the
+    // phys-base table.
+    let (system_ram_bytes, kernel_reserved_bytes) = unsafe {
+        (
+            core::ptr::read_volatile(phys_ptr.add(mb::FACTS_SYSTEM_RAM_IDX)),
+            core::ptr::read_volatile(phys_ptr.add(mb::FACTS_KERNEL_RESERVED_IDX)),
+        )
+    };
+
     let _ = syscall::mem_unmap(self_aspace, PHYS_TABLE_TEMP_VA, 1);
     let _ = syscall::cap_delete(phys_table_cap);
 
@@ -491,6 +554,10 @@ fn bootstrap_from_init(
         frame_count,
         page_counts,
         phys_bases,
+        in_use,
+        in_use_count,
+        system_ram_bytes,
+        kernel_reserved_bytes,
     })
 }
 
@@ -923,7 +990,7 @@ fn handle_donate_frames(req: &IpcMessage, ipc_buf: *mut u64)
         }
         accepted_caps += 1;
         accepted_pages += u64::from(page_count);
-        donated_pages_total_add(u64::from(page_count));
+        pool_total_add(u64::from(page_count));
     }
     if accepted_caps > 0
     {
@@ -932,29 +999,51 @@ fn handle_donate_frames(req: &IpcMessage, ipc_buf: *mut u64)
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, u64::from(accepted_caps))
         .word(1, accepted_pages)
-        .word(2, donated_pages_total())
+        .word(2, pool_total_pages())
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Cumulative count of pages reclaimed via `DONATE_FRAMES` since boot.
-/// Surfaced in the `DONATE_FRAMES` reply (`word(2)`) so callers can log
-/// running totals without separate IPC. Single-threaded memmgr — plain
-/// static suffices.
-static mut DONATED_PAGES_TOTAL: u64 = 0;
-
-fn donated_pages_total() -> u64
+/// Reply with the all-RAM-accounted identity terms (all in bytes):
+/// `system_ram`, `kernel_reserved`, `pool_total`. Read-only; the caller asserts
+/// `system_ram == kernel_reserved + pool_total`. `pool_total` is the page
+/// counter scaled to bytes; the facts arrive verbatim from the kernel.
+fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 {
-    // SAFETY: memmgr is single-threaded; no concurrent access.
-    unsafe { DONATED_PAGES_TOTAL }
+    let pool_total_bytes = pool_total_pages().saturating_mul(PAGE_SIZE);
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, boot.system_ram_bytes)
+        .word(1, boot.kernel_reserved_bytes)
+        .word(2, pool_total_bytes)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-fn donated_pages_total_add(pages: u64)
+/// Total pages of RAM memmgr owns: every page it has taken ownership of since
+/// boot, across all dispositions — bootstrap free runs, in-use bootstrap
+/// arenas, and reap donations. memmgr never returns RAM to the kernel, and
+/// `frame_split`/`frame_merge` preserve total page count, so this monotonic
+/// counter equals the live owned set exactly.
+///
+/// This is the `pool_total` of the all-RAM-accounted identity
+/// (`system_ram == kernel_reserved + pool_total`). Surfaced in the
+/// `DONATE_FRAMES` reply (`word(2)`) so callers can read it without a separate
+/// IPC. Single-threaded memmgr — plain static suffices.
+static mut POOL_TOTAL_PAGES: u64 = 0;
+
+fn pool_total_pages() -> u64
+{
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    unsafe { POOL_TOTAL_PAGES }
+}
+
+fn pool_total_add(pages: u64)
 {
     // SAFETY: memmgr is single-threaded; no concurrent access.
     unsafe {
-        DONATED_PAGES_TOTAL = DONATED_PAGES_TOTAL.saturating_add(pages);
+        POOL_TOTAL_PAGES = POOL_TOTAL_PAGES.saturating_add(pages);
     }
 }
 
@@ -1003,11 +1092,46 @@ fn ingest_pool(boot: &InitBootstrap)
                 "memmgr: ingested RAM Frame cap missing RIGHTS_RETYPE",
             );
         }
-        let _ = pool.push(FreeRun {
-            cap_slot,
-            page_count: boot.page_counts[i],
-            phys_base: boot.phys_bases[i],
-        });
+        if pool
+            .push(FreeRun {
+                cap_slot,
+                page_count: boot.page_counts[i],
+                phys_base: boot.phys_bases[i],
+            })
+            .is_ok()
+        {
+            pool_total_add(u64::from(boot.page_counts[i]));
+        }
+    }
+}
+
+/// Record each in-use bootstrap arena as an `OwnedFrame` against the owning
+/// service's process record so the arena's pages count toward `pool_total`.
+/// The arenas are retype-pinned and offset-mapped for the immortal service's
+/// life — memmgr never allocates from or frees them; this is pure accounting.
+/// Both owner records (procmgr, memmgr-self) must already exist.
+fn ingest_in_use(boot: &InitBootstrap)
+{
+    for entry in boot.in_use.iter().take(boot.in_use_count)
+    {
+        let token = match entry.kind
+        {
+            ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR => MEMMGR_SELF_TOKEN,
+            ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR => boot.procmgr_token,
+            ipc::memmgr_bootstrap::IN_USE_KIND_INIT => INIT_SELF_TOKEN,
+            _ => continue,
+        };
+        if let Some(record) = table_mut().find_mut(token)
+            && record
+                .push(OwnedFrame {
+                    cap_slot: entry.cap_slot,
+                    page_count: entry.page_count,
+                    phys_base: entry.phys_base,
+                })
+                .is_ok()
+        {
+            pool_total_add(u64::from(entry.page_count));
+        }
     }
 }
 
@@ -1034,6 +1158,10 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         memmgr_labels::DONATE_FRAMES =>
         {
             handle_donate_frames(req, ipc_buf);
+        }
+        memmgr_labels::QUERY_POOL_STATUS =>
+        {
+            handle_query_pool_status(ipc_buf, boot);
         }
         _ =>
         {
@@ -1067,11 +1195,20 @@ fn main(startup: &StartupInfo) -> !
     // procmgr_token cap doubles as the auth gate for `REGISTER_PROCESS`
     // and `PROCESS_DIED`; both code paths still check `req.token` against
     // `boot.procmgr_token` independently of the table entry.
+    //
+    // Register memmgr-self and init-self records too: `ingest_in_use` files
+    // memmgr's, procmgr's, and init's bootstrap arenas against them so every
+    // arena's pages join `pool_total`. procmgr and memmgr never die; init exits
+    // at reap but its arena stays parked, so none of these records is ever
+    // reclaimed.
     if table_mut().insert(boot.procmgr_token).is_none()
+        || table_mut().insert(MEMMGR_SELF_TOKEN).is_none()
+        || table_mut().insert(INIT_SELF_TOKEN).is_none()
     {
         // Process table full at boot — fatal; refuse to enter dispatch.
         syscall::thread_exit();
     }
+    ingest_in_use(&boot);
 
     loop
     {

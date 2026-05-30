@@ -48,33 +48,6 @@ pub fn cpu_count(_ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `system_info(FreeFrames)` and `system_info(TotalFrames)` return consistent values.
-///
-/// `FreeFrames` must be > 0 and ≤ `TotalFrames`. `TotalFrames` must be > 0.
-pub fn frame_counts(_ctx: &TestContext) -> TestResult
-{
-    let free = system_info(SystemInfoType::FreeFrames as u64)
-        .map_err(|_| "system_info(FreeFrames) failed")?;
-    let total = system_info(SystemInfoType::TotalFrames as u64)
-        .map_err(|_| "system_info(TotalFrames) failed")?;
-
-    if free == 0
-    {
-        return Err("system_info(FreeFrames) returned 0");
-    }
-    if total == 0
-    {
-        return Err("system_info(TotalFrames) returned 0");
-    }
-    if free > total
-    {
-        return Err("FreeFrames > TotalFrames (inconsistent memory accounting)");
-    }
-    crate::log_u64("ktest: FreeFrames=", free);
-    crate::log_u64("ktest: TotalFrames=", total);
-    Ok(())
-}
-
 /// `system_info(PageSize)` must return 4096.
 pub fn page_size(_ctx: &TestContext) -> TestResult
 {

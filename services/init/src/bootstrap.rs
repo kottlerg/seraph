@@ -34,61 +34,164 @@ const ELF_PAGE_TEMP_VA: u64 = TEMP_MAP_BASE + 0x1000_0000;
 /// procmgr's IPC buffer VA as seen from init while bootstrapping procmgr.
 const PROCMGR_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 
-// ── ELF loading ──────────────────────────────────────────────────────────────
+// ── Bootstrap arena ────────────────────────────────────────────────────────────
+//
+// Each tier-1 service (memmgr, procmgr) is backed by one contiguous arena
+// Frame cap carved from init's pool. Its front `[0, RETYPE_RESERVE_PAGES)`
+// is consumed by the service's `AddressSpace` / `CSpace` / `Thread` retypes
+// (a monotonic page-aligned front bump in the cap's `RetypeAllocator`); the
+// remainder is offset-mapped page-by-page as the service's loaded backing
+// (ELF segments, TLS, `ProcessInfo`, stack, IPC buffer). The retypes each
+// hold an ancestor reference on the arena's `FrameObject` for the immortal
+// service's life, so init's eventual cap-drop at reap never brings the
+// refcount to zero: the offset-mapped backing never dangles and the arena
+// never frees into the post-handoff buddy.
 
-/// Derive a frame cap with the given protection rights for mapping.
-fn derive_frame_for_prot(frame_cap: u32, prot: u64) -> Option<u32>
+/// Front region of a tier-1 service arena reserved for the three kernel-object
+/// retypes. `AddressSpace` and `CSpace` each consume `*_RETYPE_PAGES - 1` pages
+/// (the value passed as their growth budget); `Thread` consumes
+/// `THREAD_RETYPE_PAGES`. The retype bump is page-aligned and monotonic, so
+/// backing offsets at or above this bound never collide with a retype slab.
+const RETYPE_RESERVE_PAGES: u64 = (crate::ASPACE_RETYPE_PAGES - 1)
+    + (crate::CSPACE_RETYPE_PAGES - 1)
+    + crate::THREAD_RETYPE_PAGES;
+
+/// Front region of init's own arena reserved for its kernel-object retypes.
+///
+/// Unlike a tier-1 service, init retypes only endpoints (byte-granular) and
+/// one log thread from this arena; it reuses the kernel-supplied
+/// `AddressSpace`/`CSpace` rather than creating its own. The reserve is:
+///
+/// * 1 page for endpoints created before the log-thread retype (the retype
+///   allocator packs ~32 endpoints per page; init creates well under that),
+/// * `THREAD_RETYPE_PAGES` (6) for the log thread, which page-aligns the bump
+///   upward — splitting endpoint packing across a page boundary, and
+/// * 1 page for endpoints created after the log-thread retype, so they never
+///   bump into the offset-mapped backing region even without relying on the
+///   allocator reusing the first page's recovered slack.
+///
+/// Sound for up to ~32 endpoints on each side of the log-thread retype; init
+/// creates roughly a dozen total. [`finalize_memmgr`] asserts the front bump
+/// never crossed this bound before forwarding the arena.
+pub(crate) const INIT_RETYPE_RESERVE_PAGES: u64 = 1 + crate::THREAD_RETYPE_PAGES + 1;
+
+/// A service's contiguous backing arena: one Frame cap plus a page cursor
+/// into its offset-mapped backing region.
+pub(crate) struct BootArena
 {
-    if prot == syscall::MAP_READONLY
+    /// Arena Frame cap in init's `CSpace`. Full rights (R+W+X+RETYPE):
+    /// retyped from its front, offset-mapped past the retype bump.
+    pub(crate) cap: u32,
+    /// `AddressSpace` cap the transient per-page scratch maps land in at
+    /// [`ELF_PAGE_TEMP_VA`] — always init's own `AddressSpace`.
+    init_aspace: u32,
+    /// Next free backing-page offset, in pages. Starts at the front reserve;
+    /// advances one page per [`Self::place_page`].
+    cursor: u64,
+}
+
+impl BootArena
+{
+    /// Carve a `RETYPE_RESERVE_PAGES + backing_pages` contiguous arena off
+    /// `alloc` with the cursor positioned past the retype reserve. The
+    /// caller performs the three retypes against [`Self::cap`] before
+    /// placing any backing page.
+    fn carve(alloc: &mut FrameAlloc, init_aspace: u32, backing_pages: u64) -> Option<Self>
     {
-        syscall::cap_derive(frame_cap, syscall::RIGHTS_MAP_READ).ok()
+        Self::carve_reserve(alloc, init_aspace, RETYPE_RESERVE_PAGES, backing_pages)
     }
-    else if prot == syscall::MAP_EXECUTABLE
+
+    /// Carve a `reserve_pages + backing_pages` contiguous arena off `alloc`
+    /// with the cursor positioned past `reserve_pages`. The caller performs
+    /// every retype against [`Self::cap`] within the `reserve_pages` front
+    /// bound before placing backing pages at or above it.
+    pub(crate) fn carve_reserve(
+        alloc: &mut FrameAlloc,
+        init_aspace: u32,
+        reserve_pages: u64,
+        backing_pages: u64,
+    ) -> Option<Self>
     {
-        syscall::cap_derive(frame_cap, syscall::RIGHTS_MAP_RX).ok()
+        let cap = alloc.alloc_pages(reserve_pages + backing_pages)?;
+        Some(Self {
+            cap,
+            init_aspace,
+            cursor: reserve_pages,
+        })
     }
-    else
+
+    /// Map the arena's current backing page writable into init at
+    /// [`ELF_PAGE_TEMP_VA`], zero it, run `populate` to fill it, unmap it
+    /// from init, then map it into `target_aspace` at `target_va` with
+    /// `prot`. Advances the cursor. `prot` is an explicit mapping mode
+    /// (`MAP_READ` / `MAP_WRITABLE` / `MAP_EXECUTABLE`) applied directly to
+    /// the full-rights arena cap — no per-page derived child, so no live
+    /// derivation blocks a later `frame_split` of the arena.
+    pub(crate) fn place_page(
+        &mut self,
+        target_aspace: u32,
+        target_va: u64,
+        prot: u64,
+        populate: impl FnOnce(u64),
+    ) -> Option<()>
     {
-        syscall::cap_derive(frame_cap, syscall::RIGHTS_MAP_RW).ok()
+        let offset = self.cursor;
+        syscall::mem_map(
+            self.cap,
+            self.init_aspace,
+            ELF_PAGE_TEMP_VA,
+            offset,
+            1,
+            syscall::MAP_WRITABLE,
+        )
+        .ok()?;
+        // SAFETY: ELF_PAGE_TEMP_VA is mapped writable, one page.
+        unsafe { core::ptr::write_bytes(ELF_PAGE_TEMP_VA as *mut u8, 0, PAGE_SIZE as usize) };
+        populate(ELF_PAGE_TEMP_VA);
+        let _ = syscall::mem_unmap(self.init_aspace, ELF_PAGE_TEMP_VA, 1);
+        syscall::mem_map(self.cap, target_aspace, target_va, offset, 1, prot).ok()?;
+        self.cursor += 1;
+        Some(())
     }
 }
 
-/// Copy one ELF segment page from `file_data` into a freshly allocated frame,
-/// then map it into the target address space.
-fn load_elf_page(
-    page_vaddr: u64,
-    seg_vaddr: u64,
-    file_data: &[u8],
-    prot: u64,
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
-    target_aspace: u32,
-) -> Option<()>
+/// Sum of `PT_LOAD` page spans for `ehdr` — the backing pages an arena must
+/// reserve for ELF segments. Mirrors the per-segment page math in
+/// [`load_elf_into_arena`]; the two MUST agree or the arena is mis-sized.
+fn elf_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> Option<u64>
 {
-    let Some(frame_cap) = alloc.alloc_page()
-    else
+    let mut total = 0u64;
+    for seg_result in elf::load_segments(ehdr, module_bytes)
     {
-        log("ELF load: frame alloc failed");
-        return None;
-    };
-
-    if syscall::mem_map(
-        frame_cap,
-        init_aspace,
-        ELF_PAGE_TEMP_VA,
-        0,
-        1,
-        syscall::MAP_WRITABLE,
-    )
-    .is_err()
-    {
-        log("ELF load: temp map failed");
-        return None;
+        let seg = seg_result.ok()?;
+        if seg.memsz == 0
+        {
+            continue;
+        }
+        let first_page = seg.vaddr & !0xFFF;
+        let last_page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
+        total += (last_page_end - first_page) / PAGE_SIZE;
     }
+    Some(total)
+}
 
-    // SAFETY: ELF_PAGE_TEMP_VA is mapped writable, covers one page.
-    unsafe { core::ptr::write_bytes(ELF_PAGE_TEMP_VA as *mut u8, 0, PAGE_SIZE as usize) };
+/// One backing page for the main TLS block when `ehdr` declares a non-empty
+/// `PT_TLS`, else zero. Mirrors the presence check in [`place_main_tls`].
+fn tls_backing_pages(ehdr: &elf::Elf64Ehdr, module_bytes: &[u8]) -> u64
+{
+    match elf::tls_segment(ehdr, module_bytes)
+    {
+        Ok(Some(seg)) if seg.memsz > 0 => 1,
+        _ => 0,
+    }
+}
 
+/// Copy one ELF segment page's file data into the page mapped at
+/// `scratch_va` (already zeroed). Handles the partial first/last page via
+/// `seg_vaddr` alignment so the loaded image matches the segment's byte
+/// layout; the bytes beyond `filesz` stay zero (BSS).
+fn copy_segment_into(scratch_va: u64, page_vaddr: u64, seg_vaddr: u64, file_data: &[u8])
+{
     let dest_offset = if page_vaddr < seg_vaddr
     {
         (seg_vaddr - page_vaddr) as usize
@@ -103,33 +206,21 @@ fn load_elf_page(
     if copy_len > 0
     {
         let src = &file_data[seg_offset..seg_offset + copy_len];
-        // SAFETY: temp_va is mapped and writable; copy within one page.
+        // SAFETY: scratch_va is mapped writable; the copy stays within one page.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr(),
-                (ELF_PAGE_TEMP_VA as *mut u8).add(dest_offset),
+                (scratch_va as *mut u8).add(dest_offset),
                 src.len(),
             );
         }
     }
-
-    let _ = syscall::mem_unmap(init_aspace, ELF_PAGE_TEMP_VA, 1);
-
-    let derived_cap = derive_frame_for_prot(frame_cap, prot)?;
-    syscall::mem_map(derived_cap, target_aspace, page_vaddr, 0, 1, 0).ok()?;
-
-    Some(())
 }
 
-/// Allocate one frame for the main thread's TLS block, populate it from
-/// the in-memory `.tdata` template, install the TCB self-pointer, and
-/// map it read-write into `target_aspace` at `PROCESS_MAIN_TLS_VADDR`.
-///
-/// Returns `(tls_base_va, tls_template_metadata)` where the metadata is
-/// what gets written into the child's `ProcessInfo.tls_template_*`
-/// fields. When the binary has no `PT_TLS` segment, returns
-/// `(0, ChildTlsMeta::default())` and the caller passes
-/// `tls_base_va = 0` to `thread_configure_with_tls`.
+/// `PT_TLS` template metadata, written into the child's
+/// `ProcessInfo.tls_template_*` fields. When the binary has no `PT_TLS`
+/// segment, [`place_main_tls`] returns `(0, ChildTlsMeta::default())` and
+/// the caller passes `tls_base_va = 0` to `thread_configure_with_tls`.
 #[derive(Clone, Copy, Default)]
 pub struct ChildTlsMeta
 {
@@ -139,17 +230,22 @@ pub struct ChildTlsMeta
     pub align: u64,
 }
 
+/// Place the main thread's TLS block in `arena`: populate it from the
+/// in-memory `.tdata` template, install the TCB self-pointer, and map it
+/// read-write into `target_aspace` at `PROCESS_MAIN_TLS_VADDR`.
+///
+/// Returns `(tls_base_va, metadata)`. When the binary has no `PT_TLS`
+/// segment (or it is empty), returns `(0, ChildTlsMeta::default())` without
+/// consuming a backing page — matching [`tls_backing_pages`].
 #[allow(clippy::similar_names)]
-fn prepare_main_tls(
+fn place_main_tls(
+    arena: &mut BootArena,
+    ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
     target_aspace: u32,
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
 ) -> Option<(u64, ChildTlsMeta)>
 {
-    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
-    let tls_seg = elf::tls_segment(ehdr, module_bytes).ok()?;
-    let Some(seg) = tls_seg
+    let Some(seg) = elf::tls_segment(ehdr, module_bytes).ok()?
     else
     {
         return Some((0, ChildTlsMeta::default()));
@@ -175,71 +271,49 @@ fn prepare_main_tls(
         return None;
     }
 
-    let tls_frame = alloc.alloc_zero_page(init_aspace, crate::TEMP_MAP_BASE)?;
-
-    // SAFETY: TEMP_MAP_BASE mapped writable, one page, zeroed.
     let tdata_start = seg.offset as usize;
     let tdata_end = tdata_start + seg.filesz as usize;
     if tdata_end > module_bytes.len()
     {
-        let _ = syscall::mem_unmap(init_aspace, crate::TEMP_MAP_BASE, 1);
         return None;
-    }
-    // SAFETY: TEMP_MAP_BASE mapped writable, length bounded by tls_block_layout.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            module_bytes[tdata_start..tdata_end].as_ptr(),
-            crate::TEMP_MAP_BASE as *mut u8,
-            seg.filesz as usize,
-        );
     }
 
     let tls_base_va = process_abi::PROCESS_MAIN_TLS_VADDR + tls_base_offset;
-    // SAFETY: TEMP_MAP_BASE mapped writable; the block fits.
-    unsafe {
-        process_abi::tls_install_tcb(
-            crate::TEMP_MAP_BASE as *mut u8,
-            tls_base_offset,
-            tls_base_va,
-        );
-    }
-
-    let _ = syscall::mem_unmap(init_aspace, crate::TEMP_MAP_BASE, 1);
-
-    let tls_rw = syscall::cap_derive(tls_frame, syscall::RIGHTS_MAP_RW).ok()?;
-    syscall::mem_map(
-        tls_rw,
+    arena.place_page(
         target_aspace,
         process_abi::PROCESS_MAIN_TLS_VADDR,
-        0,
-        1,
-        0,
-    )
-    .ok()?;
+        syscall::MAP_WRITABLE,
+        |scratch_va| {
+            // SAFETY: scratch_va is mapped writable and zeroed; the copy
+            // length is bounded by the tls_block_layout fit check above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    module_bytes[tdata_start..tdata_end].as_ptr(),
+                    scratch_va as *mut u8,
+                    seg.filesz as usize,
+                );
+            }
+            // SAFETY: scratch_va is mapped writable; the block fits one page.
+            unsafe {
+                process_abi::tls_install_tcb(scratch_va as *mut u8, tls_base_offset, tls_base_va);
+            }
+        },
+    )?;
 
     Some((tls_base_va, meta))
 }
 
-/// Load an ELF image into a target address space.
-///
-/// Returns `(entry_point_vaddr, stack_pages)` — `stack_pages` reflects
-/// the binary's `.note.seraph.stack` declaration when present, falling
-/// back to [`DEFAULT_PROCESS_STACK_PAGES`] otherwise. The caller passes
-/// `stack_pages` into [`map_stack_and_ipc`] and the matching
-/// `populate_*_info` so the child sees a consistent envelope.
-fn load_elf(
+/// Load an ELF image's `PT_LOAD` segments into `arena`, offset-mapped into
+/// `target_aspace` at each segment's virtual address with explicit W^X
+/// protection (executable → RX, writable → RW, else RO). Consumes exactly
+/// [`elf_backing_pages`] backing pages.
+fn load_elf_into_arena(
+    arena: &mut BootArena,
+    ehdr: &elf::Elf64Ehdr,
     module_bytes: &[u8],
     target_aspace: u32,
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
-) -> Option<(u64, u32)>
+) -> Option<()>
 {
-    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
-    let entry = elf::entry_point(ehdr);
-    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
-        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
-        .clamp(1, MAX_PROCESS_STACK_PAGES);
-
     for seg_result in elf::load_segments(ehdr, module_bytes)
     {
         let seg = seg_result.ok()?;
@@ -258,31 +332,25 @@ fn load_elf(
         }
         else
         {
-            syscall::MAP_READONLY
+            syscall::MAP_READ
         };
 
         let first_page = seg.vaddr & !0xFFF;
         let last_page_end = (seg.vaddr + seg.memsz + 0xFFF) & !0xFFF;
-        let num_pages = ((last_page_end - first_page) / PAGE_SIZE) as usize;
+        let num_pages = (last_page_end - first_page) / PAGE_SIZE;
 
         let file_data = &module_bytes[seg.offset as usize..(seg.offset + seg.filesz) as usize];
 
         for page_idx in 0..num_pages
         {
-            let page_vaddr = first_page + (page_idx as u64) * PAGE_SIZE;
-            load_elf_page(
-                page_vaddr,
-                seg.vaddr,
-                file_data,
-                prot,
-                alloc,
-                init_aspace,
-                target_aspace,
-            )?;
+            let page_vaddr = first_page + page_idx * PAGE_SIZE;
+            arena.place_page(target_aspace, page_vaddr, prot, |scratch_va| {
+                copy_segment_into(scratch_va, page_vaddr, seg.vaddr, file_data);
+            })?;
         }
     }
 
-    Some((entry, stack_pages))
+    Some(())
 }
 
 // ── Memmgr bootstrap ────────────────────────────────────────────────────────
@@ -309,8 +377,31 @@ pub struct MemmgrBootstrap
     /// Memmgr's main `Thread` cap (in init's `CSpace`). Init invokes
     /// `thread_configure` + `thread_start` at [`finalize_memmgr`] time.
     pub mm_thread: u32,
+    /// Memmgr's contiguous backing arena Frame cap (in init's `CSpace`).
+    /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
+    /// as an in-use arena so its pages are accounted in memmgr's pool.
+    pub arena_cap: u32,
     /// Memmgr's ELF entry point.
     pub entry: u64,
+}
+
+/// One in-use bootstrap arena forwarded to memmgr for accounting. Its whole
+/// Frame cap is copied into memmgr's `CSpace`; memmgr records it as an
+/// `OwnedFrame` against the owning service's record so the arena's pages count
+/// toward `pool_total` without ever becoming allocatable. The arena is
+/// retype-pinned and offset-mapped for the immortal service's life, so this is
+/// pure accounting — memmgr never frees it.
+#[derive(Clone, Copy, Default)]
+pub struct InUseArena
+{
+    /// Slot in memmgr's `CSpace` of the copied arena cap.
+    pub cap_slot: u32,
+    /// Arena size in pages (`RETYPE_RESERVE_PAGES` + backing).
+    pub page_count: u32,
+    /// Arena physical base.
+    pub phys_base: u64,
+    /// Owner kind (`ipc::memmgr_bootstrap::IN_USE_KIND_*`).
+    pub kind: u64,
 }
 
 /// Result of [`finalize_memmgr`] — bootstrap-IPC payload init sends
@@ -318,11 +409,11 @@ pub struct MemmgrBootstrap
 ///
 /// Page counts are packed two per `u64` (low 32 bits = even index,
 /// high 32 bits = odd index) so the 64-word IPC data field can carry
-/// up to 122 entries after the 3-word prefix. Physical bases travel
-/// out-of-band via a read-only Frame cap (`caps[1]` in the bootstrap
-/// reply); init writes `phys_bases` into the page before deriving the
-/// RO cap. Memmgr maps the page, copies the values into its `FreeRun`
-/// records, and drops the cap.
+/// up to `ipc::memmgr_bootstrap::MAX_FRAMES` entries after the 3-word
+/// prefix. Physical bases travel out-of-band via a read-only Frame cap
+/// (`caps[1]` in the bootstrap reply); init writes `phys_bases` into the
+/// page before deriving the RO cap. Memmgr maps the page, copies the
+/// values into its `FreeRun` records, and drops the cap.
 pub struct MemmgrFinalize
 {
     /// First slot of the RAM Frame caps init copied into memmgr's
@@ -331,19 +422,19 @@ pub struct MemmgrFinalize
     /// Number of RAM frames delegated to memmgr.
     pub mm_frame_count: u32,
     /// Page count for each delegated frame, in slot order.
-    pub page_counts: [u32; 122],
+    pub page_counts: [u32; ipc::memmgr_bootstrap::MAX_FRAMES],
     /// Physical base address for each delegated frame, in slot order.
     /// Sourced from `CapDescriptor.aux0` of the underlying RAM Frame
     /// caps minted by the kernel at boot.
-    pub phys_bases: [u64; 122],
+    pub phys_bases: [u64; ipc::memmgr_bootstrap::MAX_FRAMES],
+    /// In-use bootstrap arenas (memmgr's, procmgr's, and init's own
+    /// backing) copied into memmgr's `CSpace`. Init writes these into the
+    /// phys-table page's in-use section; memmgr records them against
+    /// per-owner process records.
+    pub in_use: [InUseArena; ipc::memmgr_bootstrap::MAX_IN_USE],
+    /// Number of valid entries in `in_use`.
+    pub in_use_count: usize,
 }
-
-/// Maximum number of frames init can delegate to memmgr in one
-/// bootstrap-IPC round. Bounded by the IPC data-word count
-/// (`MSG_DATA_WORDS_MAX = 64`) minus the 3-word prefix
-/// (`frame_base`, `frame_count`, `procmgr_token`), times 2 for the
-/// 2-page-counts-per-word packing.
-pub const MEMMGR_BOOTSTRAP_MAX_FRAMES: u32 = 122;
 
 /// Memmgr kernel object caps needed to populate `ProcessInfo`.
 struct MemmgrCaps
@@ -354,52 +445,53 @@ struct MemmgrCaps
     creator_endpoint_slot: u32,
 }
 
-/// Populate memmgr's `ProcessInfo` page and map it read-only into memmgr.
+/// Populate memmgr's `ProcessInfo` page from `arena` and map it read-only
+/// into `target_aspace`.
 #[allow(clippy::similar_names)]
 fn populate_memmgr_info(
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
+    arena: &mut BootArena,
+    target_aspace: u32,
     caps: &MemmgrCaps,
     stack_pages: u32,
-) -> Option<u32>
+) -> Option<()>
 {
-    let pi_frame = alloc.alloc_zero_page(init_aspace, TEMP_MAP_BASE)?;
-    // SAFETY: TEMP_MAP_BASE is mapped writable and zeroed, one page.
-    let pi = unsafe { process_abi::process_info_mut(TEMP_MAP_BASE) };
-
     let mm_thread_in_mm =
         syscall::cap_copy(caps.thread, caps.cspace, syscall::RIGHTS_THREAD).ok()?;
     let mm_aspace_in_mm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
     let mm_cspace_in_mm =
         syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CSPACE).ok()?;
 
-    pi.version = PROCESS_ABI_VERSION;
-    pi.self_thread_cap = mm_thread_in_mm;
-    pi.self_aspace_cap = mm_aspace_in_mm;
-    pi.self_cspace_cap = mm_cspace_in_mm;
-    pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
-    pi.creator_endpoint_cap = caps.creator_endpoint_slot;
-    pi.procmgr_endpoint_cap = 0;
-    pi.memmgr_endpoint_cap = 0;
-    pi.stdin_frame_cap = 0;
-    pi.stdout_frame_cap = 0;
-    pi.stderr_frame_cap = 0;
-    pi.log_send_cap = 0;
-    pi.stdin_data_signal_cap = 0;
-    pi.stdin_space_signal_cap = 0;
-    pi.stdout_data_signal_cap = 0;
-    pi.stdout_space_signal_cap = 0;
-    pi.stderr_data_signal_cap = 0;
-    pi.stderr_space_signal_cap = 0;
-    pi.stack_top_vaddr = PROCESS_STACK_TOP;
-    pi.stack_pages = stack_pages;
+    arena.place_page(
+        target_aspace,
+        PROCESS_INFO_VADDR,
+        syscall::MAP_READ,
+        |scratch_va| {
+            // SAFETY: scratch_va is mapped writable and zeroed, one page.
+            let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+            pi.version = PROCESS_ABI_VERSION;
+            pi.self_thread_cap = mm_thread_in_mm;
+            pi.self_aspace_cap = mm_aspace_in_mm;
+            pi.self_cspace_cap = mm_cspace_in_mm;
+            pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
+            pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+            pi.procmgr_endpoint_cap = 0;
+            pi.memmgr_endpoint_cap = 0;
+            pi.stdin_frame_cap = 0;
+            pi.stdout_frame_cap = 0;
+            pi.stderr_frame_cap = 0;
+            pi.log_send_cap = 0;
+            pi.stdin_data_signal_cap = 0;
+            pi.stdin_space_signal_cap = 0;
+            pi.stdout_data_signal_cap = 0;
+            pi.stdout_space_signal_cap = 0;
+            pi.stderr_data_signal_cap = 0;
+            pi.stderr_space_signal_cap = 0;
+            pi.stack_top_vaddr = PROCESS_STACK_TOP;
+            pi.stack_pages = stack_pages;
+        },
+    )?;
 
-    let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
-
-    let pi_ro_cap = syscall::cap_derive(pi_frame, syscall::RIGHTS_MAP_READ).ok()?;
-    syscall::mem_map(pi_ro_cap, caps.aspace, PROCESS_INFO_VADDR, 0, 1, 0).ok()?;
-
-    Some(pi_frame)
+    Some(())
 }
 
 /// Locate a `CapDescriptor` by slot index.
@@ -438,10 +530,10 @@ pub fn bootstrap_memmgr(
     let module_size = descriptor_for(info, module_frame_cap).map(|d| d.aux1)?;
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
-    // Module Frame caps now carry full rights (R+W+X+RETYPE) so they can
-    // flow through the donation chain into memmgr's pool with rights its
-    // consumers need. Derive a read-only child cap for the load-time
-    // mapping so `mem_map`'s derive-from-cap path produces a strictly
+    // The module Frame cap carries full rights (R+W+X+RETYPE): init retains
+    // it as the module-source owner and donates it to memmgr's pool at reap,
+    // where RETYPE lets memmgr re-derive. Derive a read-only child cap for the
+    // load-time mapping so `mem_map`'s derive-from-cap path produces a strictly
     // read-only page (otherwise W+X cap rights trip W^X).
     let module_ro = syscall::cap_derive(module_frame_cap, syscall::RIGHTS_MAP_READ).ok()?;
     syscall::mem_map(
@@ -457,19 +549,27 @@ pub fn bootstrap_memmgr(
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
-    let mm_aspace_slab = alloc.alloc_pages(crate::ASPACE_RETYPE_PAGES)?;
+    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
+    let entry = elf::entry_point(ehdr);
+    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
+        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
+        .clamp(1, MAX_PROCESS_STACK_PAGES);
+
+    // memmgr's bespoke `_start` configures no TLS, so its arena reserves
+    // only ELF segments + `ProcessInfo` + stack + IPC buffer.
+    let backing_pages = elf_backing_pages(ehdr, module_bytes)? + 1 + u64::from(stack_pages) + 1;
+    let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
+
     let mm_aspace =
-        syscall::cap_create_aspace(mm_aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
-    let mm_cspace_slab = alloc.alloc_pages(crate::CSPACE_RETYPE_PAGES)?;
+        syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let mm_cspace =
-        syscall::cap_create_cspace(mm_cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
-    let mm_thread_slab = alloc.alloc_pages(crate::THREAD_RETYPE_PAGES)?;
-    let mm_thread = syscall::cap_create_thread(mm_thread_slab, mm_aspace, mm_cspace).ok()?;
+        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
+    let mm_thread = syscall::cap_create_thread(arena.cap, mm_aspace, mm_cspace).ok()?;
 
     log("created memmgr kernel objects");
     log("loading memmgr ELF segments");
 
-    let (entry, stack_pages) = load_elf(module_bytes, mm_aspace, alloc, init_aspace)?;
+    load_elf_into_arena(&mut arena, ehdr, module_bytes, mm_aspace)?;
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
     let _ = syscall::cap_delete(module_ro);
     log("loaded memmgr ELF");
@@ -489,8 +589,8 @@ pub fn bootstrap_memmgr(
         thread: mm_thread,
         creator_endpoint_slot: mm_creator_slot,
     };
-    populate_memmgr_info(alloc, init_aspace, &mm_caps, stack_pages)?;
-    map_stack_and_ipc(alloc, mm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
+    populate_memmgr_info(&mut arena, mm_aspace, &mm_caps, stack_pages)?;
+    place_stack_and_ipc(&mut arena, mm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
 
     // Mint procmgr's tokened SEND cap on memmgr's endpoint. Memmgr will
     // recognise calls bearing this token as authorised for the
@@ -510,38 +610,145 @@ pub fn bootstrap_memmgr(
         procmgr_send_cap,
         mm_cspace,
         mm_thread,
+        arena_cap: arena.cap,
         entry,
     })
 }
 
+/// Copy one in-use bootstrap arena cap into memmgr's `CSpace` and build its
+/// [`InUseArena`] descriptor. Mirrors the free-run forward: derive a
+/// full-rights intermediary, copy it into `mm_cspace`, and read the arena's
+/// physical base + size from the cap. The arena is exact-sized (no free
+/// tail), so it is never `frame_split`; the copy gives memmgr the accounting
+/// anchor while the original cap and the retypes keep the `FrameObject`
+/// pinned for the immortal service's life.
+fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena>
+{
+    let phys_base = syscall::cap_info(arena_cap, syscall::CAP_INFO_FRAME_PHYS_BASE).ok()?;
+    let size_bytes = syscall::cap_info(arena_cap, syscall::CAP_INFO_FRAME_SIZE).ok()?;
+    let intermediary = syscall::cap_derive(arena_cap, syscall::RIGHTS_ALL).ok()?;
+    let cap_slot = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL).ok()?;
+    Some(InUseArena {
+        cap_slot,
+        page_count: (size_bytes / PAGE_SIZE) as u32,
+        phys_base,
+        kind,
+    })
+}
+
+/// Forward a single Frame cap covering `pages` free pages into memmgr's
+/// `CSpace` as a free run: derive a full-rights intermediary, copy it into
+/// `mm_cspace`, and append the run to the parallel `page_counts`/`phys_bases`
+/// tables (advancing `count`, recording `base` on the first run). Used for the
+/// `FrameAlloc` tail and the transient phys-table page — both `frame_split`
+/// products with no `InitInfo` descriptor that would otherwise free into the
+/// sealed post-handoff buddy.
+#[allow(clippy::too_many_arguments)]
+fn push_free_run(
+    src_cap: u32,
+    pages: u32,
+    mm_cspace: u32,
+    page_counts: &mut [u32],
+    phys_bases: &mut [u64],
+    base: &mut u32,
+    count: &mut u32,
+)
+{
+    if pages == 0 || (*count as usize) >= page_counts.len()
+    {
+        return;
+    }
+    if let Ok(phys_base) = syscall::cap_info(src_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+        && let Ok(intermediary) = syscall::cap_derive(src_cap, syscall::RIGHTS_ALL)
+        && let Ok(dst_slot) = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL)
+    {
+        if *count == 0
+        {
+            *base = dst_slot;
+        }
+        page_counts[*count as usize] = pages;
+        phys_bases[*count as usize] = phys_base;
+        *count += 1;
+    }
+}
+
+/// Assert init's arena retype front never crossed its reserve into the
+/// offset-mapped backing region. init's endpoint and log-thread retypes bump a
+/// monotonic cursor through the front; the backing was offset-mapped at
+/// `INIT_RETYPE_RESERVE_PAGES`. `available` is the arena's un-retyped byte
+/// count, so a front bump past the reserve shows up as a consumed span larger
+/// than the reserve. Endpoints created after `finalize_memmgr` (devmgr/vfsd
+/// registries, phase 3) stay within the reserve's documented headroom.
+fn assert_init_arena_front_bounded(init_arena_cap: u32)
+{
+    if let (Ok(size), Ok(available)) = (
+        syscall::cap_info(init_arena_cap, syscall::CAP_INFO_FRAME_SIZE),
+        syscall::cap_info(init_arena_cap, syscall::CAP_INFO_FRAME_AVAILABLE),
+    )
+    {
+        let front_bump = size.saturating_sub(available);
+        assert!(
+            front_bump <= INIT_RETYPE_RESERVE_PAGES * PAGE_SIZE,
+            "init: arena retype front overran its reserve into backing",
+        );
+    }
+}
+
 /// Delegate every remaining RAM Frame cap from init's pool into memmgr's
-/// `CSpace`, then `thread_configure` + `thread_start` memmgr.
+/// `CSpace`, forward the in-use bootstrap arenas (memmgr's, procmgr's, and
+/// init's own backing), then `thread_configure` + `thread_start` memmgr.
 ///
 /// Call after every `alloc.alloc_page()` consumer (memmgr's own setup,
 /// procmgr's setup) has run — at that point everything left in init's
 /// frame pool is RAM that memmgr should own. After this call, init has
 /// no more frames; subsequent allocations route through memmgr like any
 /// other process.
-#[allow(clippy::similar_names)]
+///
+/// `pm_arena_cap` is procmgr's backing arena and `init_arena_cap` is init's own
+/// (from [`ProcmgrBootstrap`] and [`crate::run`]); both are forwarded alongside
+/// memmgr's own arena (`mm.arena_cap`) so memmgr's `pool_total` spans every page
+/// of bootstrap-consumed RAM, not only the free runs.
+///
+/// `phys_table_frame` is the auxiliary phys-table page (written after this
+/// call). It is a transient bootstrap artifact, so it is forwarded as a free
+/// run — its keep-alive moves to memmgr's pool copy, and after memmgr reads it
+/// through the read-only `caps[1]` derivation the page becomes allocatable like
+/// any other.
+#[allow(clippy::similar_names, clippy::too_many_lines)]
 pub fn finalize_memmgr(
     info: &InitInfo,
     alloc: &mut FrameAlloc,
     mm: &MemmgrBootstrap,
+    pm_arena_cap: u32,
+    init_arena_cap: u32,
+    phys_table_frame: u32,
 ) -> Option<MemmgrFinalize>
 {
-    // The bootstrap-IPC payload to memmgr packs 2 page_counts per word
-    // after a 3-word prefix; up to `MEMMGR_BOOTSTRAP_MAX_FRAMES` entries
-    // fit. With memmgr owning all of system RAM, this should comfortably
-    // cover any plausible init frame count; raise the bound (or move to
-    // multi-round bootstrap) if a target ever exceeds it.
-    let mut page_counts = [0u32; MEMMGR_BOOTSTRAP_MAX_FRAMES as usize];
-    let mut phys_bases = [0u64; MEMMGR_BOOTSTRAP_MAX_FRAMES as usize];
+    // The bootstrap-IPC payload to memmgr packs 2 page_counts per word after
+    // a 3-word prefix; `ipc::memmgr_bootstrap::MAX_FRAMES` entries fit, of
+    // which the loop below claims at most `MAX_FRAMES - 2` for regular memory
+    // frames and leaves two for the FrameAlloc tail and the phys-table page.
+    // That is enough to seed memmgr's pool for procmgr's first allocations;
+    // any regular frames beyond the cap (the buddy can drain into more blocks
+    // than fit when the memory map is fragmented) are delivered later via the
+    // reap-donation route (`handoff_to_procmgr_reap` → procmgr →
+    // `DONATE_FRAMES`), which streams without a per-round cap. So this bound is
+    // a round-size limit, not a ceiling on total RAM forwarded — the reap floor
+    // below picks up the rest. (The tail and phys-table page have no InitInfo
+    // descriptor, so the reap walk cannot reach them; they must ride here.)
+    let mut page_counts = [0u32; ipc::memmgr_bootstrap::MAX_FRAMES];
+    let mut phys_bases = [0u64; ipc::memmgr_bootstrap::MAX_FRAMES];
     let mut mm_frame_base: u32 = 0;
     let mut mm_frame_count: u32 = 0;
     let total_remaining = info.memory_frame_count.saturating_sub(alloc.next_idx);
     for i in 0..total_remaining
     {
-        if mm_frame_count >= MEMMGR_BOOTSTRAP_MAX_FRAMES
+        // Reserve two payload slots for the FrameAlloc tail and the phys-table
+        // page forwarded below. Both are `frame_split` products with no
+        // InitInfo descriptor, so the reap walk cannot reach them — they MUST
+        // ride this bootstrap round. Regular frames that no longer fit are
+        // delivered to memmgr's pool via reap instead.
+        if mm_frame_count as usize >= ipc::memmgr_bootstrap::MAX_FRAMES - 2
         {
             break;
         }
@@ -549,7 +756,9 @@ pub fn finalize_memmgr(
         let Some(desc) = descriptor_for(info, src_slot)
         else
         {
-            continue;
+            // Keep the forwarded set a contiguous prefix: stop here and let
+            // the reap route donate this frame and everything after it.
+            break;
         };
         let bytes = desc.aux1;
         let phys_base = desc.aux0;
@@ -575,12 +784,12 @@ pub fn finalize_memmgr(
         let Ok(intermediary) = syscall::cap_derive(src_slot, syscall::RIGHTS_ALL)
         else
         {
-            continue;
+            break;
         };
         let Ok(dst_slot) = syscall::cap_copy(intermediary, mm.mm_cspace, syscall::RIGHTS_ALL)
         else
         {
-            continue;
+            break;
         };
         if mm_frame_count == 0
         {
@@ -590,7 +799,74 @@ pub fn finalize_memmgr(
         phys_bases[mm_frame_count as usize] = phys_base;
         mm_frame_count += 1;
     }
-    alloc.next_idx += total_remaining;
+    // Advance only past the frames actually forwarded this round (a
+    // contiguous prefix — the loop breaks on the first frame it cannot
+    // forward). `memory_frame_base + alloc.next_idx` is now the reap floor:
+    // every memory-frame cap at or above it is still solely init's, never
+    // handed out by `FrameAlloc` nor forwarded here, and is donated to
+    // memmgr's pool via the reap route, which has no per-round frame cap.
+    alloc.next_idx += mm_frame_count;
+
+    // Forward the partial tail left in `alloc.current`: the unallocated
+    // remainder of the last frame `FrameAlloc` split from. It is a
+    // `frame_split` product, so it carries no named `InitInfo` descriptor and
+    // is excluded from the reap donation walk; without this it would free into
+    // the post-handoff buddy (which nothing allocates from) and be lost. It is
+    // free RAM, so it joins memmgr's pool as a run like any forwarded frame.
+    if alloc.remaining >= PAGE_SIZE
+    {
+        let tail_pages = (alloc.remaining / PAGE_SIZE) as u32;
+        push_free_run(
+            alloc.current,
+            tail_pages,
+            mm.mm_cspace,
+            &mut page_counts,
+            &mut phys_bases,
+            &mut mm_frame_base,
+            &mut mm_frame_count,
+        );
+        alloc.remaining = 0;
+    }
+
+    // Forward the transient phys-table page as a free run too (same rationale
+    // as the tail: a descriptor-less `frame_split` product). Its content is
+    // written after this call and read once by memmgr through the read-only
+    // `caps[1]` derivation; the free-run copy is the page's keep-alive, and
+    // after the read the page is allocatable like any other.
+    push_free_run(
+        phys_table_frame,
+        1,
+        mm.mm_cspace,
+        &mut page_counts,
+        &mut phys_bases,
+        &mut mm_frame_base,
+        &mut mm_frame_count,
+    );
+
+    // Forward the in-use bootstrap arenas. These are the RAM init carved to
+    // back memmgr, procmgr, and itself (retype slabs + offset-mapped
+    // ELF/stack/IPC/PI); they are retype-pinned and never freed, but their
+    // pages belong in memmgr's `pool_total` so the all-RAM-accounted identity
+    // closes. memmgr records each against the owning service's process record.
+    // init's arena is forwarded here even though init exits at reap: memmgr's
+    // copy becomes the arena's permanent keep-alive and the pages stay parked
+    // and accounted.
+    let mut in_use = [InUseArena::default(); ipc::memmgr_bootstrap::MAX_IN_USE];
+    let mut in_use_count = 0usize;
+    for (cap, kind) in [
+        (mm.arena_cap, ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR),
+        (pm_arena_cap, ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR),
+        (init_arena_cap, ipc::memmgr_bootstrap::IN_USE_KIND_INIT),
+    ]
+    {
+        if let Some(arena) = forward_arena(cap, mm.mm_cspace, kind)
+        {
+            in_use[in_use_count] = arena;
+            in_use_count += 1;
+        }
+    }
+
+    assert_init_arena_front_bounded(init_arena_cap);
 
     syscall::thread_configure(
         mm.mm_thread,
@@ -607,7 +883,58 @@ pub fn finalize_memmgr(
         mm_frame_count,
         page_counts,
         phys_bases,
+        in_use,
+        in_use_count,
     })
+}
+
+/// Write memmgr's bootstrap aux (phys-table) page from `mm_final`: the
+/// per-free-run physical bases, the kernel's immutable RAM-accounting facts
+/// (from `info`), and the in-use bootstrap arena descriptors. The layout is
+/// defined in `ipc::memmgr_bootstrap`; memmgr's `bootstrap_from_init` reads it
+/// back through the read-only cap init derives from the same page.
+///
+/// # Safety
+/// `phys_dst` must point at init's writable mapping of the one-page phys-table
+/// frame (at least 4 KiB, `u64`-aligned).
+pub unsafe fn write_memmgr_aux_frame(phys_dst: *mut u64, info: &InitInfo, mm_final: &MemmgrFinalize)
+{
+    use ipc::memmgr_bootstrap as mb;
+
+    for i in 0..(mm_final.mm_frame_count as usize)
+    {
+        // SAFETY: i < mm_frame_count <= MAX_FRAMES; within the mapped page.
+        unsafe { core::ptr::write_volatile(phys_dst.add(i), mm_final.phys_bases[i]) };
+    }
+    // SAFETY: the facts and in-use-count indices lie within the mapped page.
+    unsafe {
+        core::ptr::write_volatile(
+            phys_dst.add(mb::FACTS_SYSTEM_RAM_IDX),
+            info.system_ram_bytes,
+        );
+        core::ptr::write_volatile(
+            phys_dst.add(mb::FACTS_KERNEL_RESERVED_IDX),
+            info.kernel_reserved_bytes,
+        );
+        core::ptr::write_volatile(
+            phys_dst.add(mb::IN_USE_COUNT_IDX),
+            mm_final.in_use_count as u64,
+        );
+    }
+    for i in 0..mm_final.in_use_count
+    {
+        let arena = mm_final.in_use[i];
+        let base = mb::IN_USE_BASE_IDX + i * mb::IN_USE_WORDS;
+        // SAFETY: base + 2 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the page.
+        unsafe {
+            core::ptr::write_volatile(
+                phys_dst.add(base),
+                u64::from(arena.cap_slot) | (u64::from(arena.page_count) << 32),
+            );
+            core::ptr::write_volatile(phys_dst.add(base + 1), arena.phys_base);
+            core::ptr::write_volatile(phys_dst.add(base + 2), arena.kind);
+        }
+    }
 }
 
 // ── Procmgr bootstrap ───────────────────────────────────────────────────────
@@ -645,66 +972,67 @@ struct ProcmgrCaps
 /// its OWN `seraph::log!` writes lives in `pi.log_send_cap`.
 #[allow(clippy::similar_names)]
 fn populate_procmgr_info(
-    alloc: &mut FrameAlloc,
-    init_aspace: u32,
+    arena: &mut BootArena,
+    target_aspace: u32,
     caps: &ProcmgrCaps,
     stack_pages: u32,
-) -> Option<u32>
+) -> Option<()>
 {
-    let pi_frame = alloc.alloc_zero_page(init_aspace, TEMP_MAP_BASE)?;
-
-    // SAFETY: TEMP_MAP_BASE is mapped writable and zeroed, one page.
-    let pi = unsafe { process_abi::process_info_mut(TEMP_MAP_BASE) };
-
     let pm_thread_in_pm =
         syscall::cap_copy(caps.thread, caps.cspace, syscall::RIGHTS_THREAD).ok()?;
     let pm_aspace_in_pm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
     let pm_cspace_in_pm =
         syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CSPACE).ok()?;
 
-    pi.version = PROCESS_ABI_VERSION;
-    pi.self_thread_cap = pm_thread_in_pm;
-    pi.self_aspace_cap = pm_aspace_in_pm;
-    pi.self_cspace_cap = pm_cspace_in_pm;
-    pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
-    pi.creator_endpoint_cap = caps.creator_endpoint_slot;
-    // procmgr has no procmgr above it; leave zero.
-    pi.procmgr_endpoint_cap = 0;
-    pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
-    pi.stdin_frame_cap = 0;
-    pi.stdout_frame_cap = 0;
-    pi.stderr_frame_cap = 0;
-    // Procmgr's own `seraph::log!` surface. The slot holds a tokened
-    // SEND cap on the log endpoint with token `LOG_TOKEN_PROCMGR`,
-    // derived by init via `cap_derive_token`. Procmgr's std `_start`
-    // installs it via `::log::install_tokened_cap`. The un-tokened
-    // SEND procmgr uses to derive per-child tokened caps is separate
-    // (delivered via procmgr's bootstrap round).
-    pi.log_send_cap = caps.log_send_slot;
-    pi.stdin_data_signal_cap = 0;
-    pi.stdin_space_signal_cap = 0;
-    pi.stdout_data_signal_cap = 0;
-    pi.stdout_space_signal_cap = 0;
-    pi.stderr_data_signal_cap = 0;
-    pi.stderr_space_signal_cap = 0;
-    pi.tls_template_vaddr = caps.tls.vaddr;
-    pi.tls_template_filesz = caps.tls.filesz;
-    pi.tls_template_memsz = caps.tls.memsz;
-    pi.tls_template_align = caps.tls.align;
-    pi.stack_top_vaddr = PROCESS_STACK_TOP;
-    pi.stack_pages = stack_pages;
+    arena.place_page(
+        target_aspace,
+        PROCESS_INFO_VADDR,
+        syscall::MAP_READ,
+        |scratch_va| {
+            // SAFETY: scratch_va is mapped writable and zeroed, one page.
+            let pi = unsafe { process_abi::process_info_mut(scratch_va) };
+            pi.version = PROCESS_ABI_VERSION;
+            pi.self_thread_cap = pm_thread_in_pm;
+            pi.self_aspace_cap = pm_aspace_in_pm;
+            pi.self_cspace_cap = pm_cspace_in_pm;
+            pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
+            pi.creator_endpoint_cap = caps.creator_endpoint_slot;
+            // procmgr has no procmgr above it; leave zero.
+            pi.procmgr_endpoint_cap = 0;
+            pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
+            pi.stdin_frame_cap = 0;
+            pi.stdout_frame_cap = 0;
+            pi.stderr_frame_cap = 0;
+            // Procmgr's own `seraph::log!` surface. The slot holds a tokened
+            // SEND cap on the log endpoint with token `LOG_TOKEN_PROCMGR`,
+            // derived by init via `cap_derive_token`. Procmgr's std `_start`
+            // installs it via `::log::install_tokened_cap`. The un-tokened
+            // SEND procmgr uses to derive per-child tokened caps is separate
+            // (delivered via procmgr's bootstrap round).
+            pi.log_send_cap = caps.log_send_slot;
+            pi.stdin_data_signal_cap = 0;
+            pi.stdin_space_signal_cap = 0;
+            pi.stdout_data_signal_cap = 0;
+            pi.stdout_space_signal_cap = 0;
+            pi.stderr_data_signal_cap = 0;
+            pi.stderr_space_signal_cap = 0;
+            pi.tls_template_vaddr = caps.tls.vaddr;
+            pi.tls_template_filesz = caps.tls.filesz;
+            pi.tls_template_memsz = caps.tls.memsz;
+            pi.tls_template_align = caps.tls.align;
+            pi.stack_top_vaddr = PROCESS_STACK_TOP;
+            pi.stack_pages = stack_pages;
+        },
+    )?;
 
-    let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, 1);
-
-    let pi_ro_cap = syscall::cap_derive(pi_frame, syscall::RIGHTS_MAP_READ).ok()?;
-    syscall::mem_map(pi_ro_cap, caps.aspace, PROCESS_INFO_VADDR, 0, 1, 0).ok()?;
-
-    Some(pi_frame)
+    Some(())
 }
 
-/// Map stack and IPC buffer pages into the target address space.
-fn map_stack_and_ipc(
-    alloc: &mut FrameAlloc,
+/// Place the stack and IPC buffer pages in `arena`, zeroed and mapped
+/// read-write into `target_aspace`. Consumes `stack_pages + 1` backing
+/// pages.
+fn place_stack_and_ipc(
+    arena: &mut BootArena,
     target_aspace: u32,
     ipc_buf_va: u64,
     stack_pages: u32,
@@ -713,23 +1041,14 @@ fn map_stack_and_ipc(
     let stack_base = PROCESS_STACK_TOP - u64::from(stack_pages) * PAGE_SIZE;
     for i in 0..stack_pages
     {
-        let frame = alloc.alloc_page()?;
-        let rw_cap = syscall::cap_derive(frame, syscall::RIGHTS_MAP_RW).ok()?;
-        syscall::mem_map(
-            rw_cap,
+        arena.place_page(
             target_aspace,
             stack_base + u64::from(i) * PAGE_SIZE,
-            0,
-            1,
-            0,
-        )
-        .ok()?;
+            syscall::MAP_WRITABLE,
+            |_| {},
+        )?;
     }
-
-    let ipc_frame = alloc.alloc_page()?;
-    let ipc_rw_cap = syscall::cap_derive(ipc_frame, syscall::RIGHTS_MAP_RW).ok()?;
-    syscall::mem_map(ipc_rw_cap, target_aspace, ipc_buf_va, 0, 1, 0).ok()?;
-
+    arena.place_page(target_aspace, ipc_buf_va, syscall::MAP_WRITABLE, |_| {})?;
     Some(())
 }
 
@@ -764,6 +1083,10 @@ pub struct ProcmgrBootstrap
     /// Procmgr's main thread cap (in init's `CSpace`). Used by
     /// [`start_procmgr`] to launch procmgr after memmgr is live.
     pub thread: u32,
+    /// Procmgr's contiguous backing arena Frame cap (in init's `CSpace`).
+    /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
+    /// as an in-use arena so its pages are accounted in memmgr's pool.
+    pub arena_cap: u32,
 }
 
 /// Monotonic counter for init-side bootstrap tokens.
@@ -829,28 +1152,38 @@ pub fn bootstrap_procmgr(
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
-    let pm_aspace_slab = alloc.alloc_pages(crate::ASPACE_RETYPE_PAGES)?;
+    let ehdr = elf::validate(module_bytes, arch::current::EXPECTED_ELF_MACHINE).ok()?;
+    let entry = elf::entry_point(ehdr);
+    let stack_pages = elf::parse_stack_note(ehdr, module_bytes)
+        .unwrap_or(DEFAULT_PROCESS_STACK_PAGES)
+        .clamp(1, MAX_PROCESS_STACK_PAGES);
+
+    // procmgr is std-using: its arena reserves ELF segments + the main TLS
+    // block + `ProcessInfo` + stack + IPC buffer.
+    let backing_pages = elf_backing_pages(ehdr, module_bytes)?
+        + tls_backing_pages(ehdr, module_bytes)
+        + 1
+        + u64::from(stack_pages)
+        + 1;
+    let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
+
     let pm_aspace =
-        syscall::cap_create_aspace(pm_aspace_slab, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
-    let pm_cspace_slab = alloc.alloc_pages(crate::CSPACE_RETYPE_PAGES)?;
+        syscall::cap_create_aspace(arena.cap, 0, crate::ASPACE_RETYPE_PAGES - 1).ok()?;
     let pm_cspace =
-        syscall::cap_create_cspace(pm_cspace_slab, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
-    let pm_thread_slab = alloc.alloc_pages(crate::THREAD_RETYPE_PAGES)?;
-    let pm_thread = syscall::cap_create_thread(pm_thread_slab, pm_aspace, pm_cspace).ok()?;
+        syscall::cap_create_cspace(arena.cap, 0, crate::CSPACE_RETYPE_PAGES - 1, 8192).ok()?;
+    let pm_thread = syscall::cap_create_thread(arena.cap, pm_aspace, pm_cspace).ok()?;
 
     log("created procmgr kernel objects");
     log("loading procmgr ELF segments");
 
-    let (entry, stack_pages) = load_elf(module_bytes, pm_aspace, alloc, init_aspace)?;
+    load_elf_into_arena(&mut arena, ehdr, module_bytes, pm_aspace)?;
 
-    // Allocate, populate, and map the main thread's TLS block while the
-    // module is still mapped — `prepare_main_tls` re-validates the ELF
-    // headers to locate the `PT_TLS` segment. Procmgr is std-using so the
-    // std runtime's `_start` accesses thread-local statics (e.g.
-    // `IPC_BUF_TLS`) before user `main` runs; without a configured TLS
+    // Place the main thread's TLS block while the module is still mapped —
+    // `place_main_tls` reads the `PT_TLS` template from it. Procmgr is
+    // std-using so the std runtime's `_start` accesses thread-local statics
+    // (e.g. `IPC_BUF_TLS`) before user `main` runs; without a configured TLS
     // block, the first such access page-faults at NULL.
-    let (pm_tls_base_va, pm_tls_meta) =
-        prepare_main_tls(module_bytes, pm_aspace, alloc, init_aspace)?;
+    let (pm_tls_base_va, pm_tls_meta) = place_main_tls(&mut arena, ehdr, module_bytes, pm_aspace)?;
 
     let _ = syscall::mem_unmap(init_aspace, TEMP_MAP_BASE, module_pages);
     let _ = syscall::cap_delete(module_ro);
@@ -944,9 +1277,9 @@ pub fn bootstrap_procmgr(
         log_send_slot,
         tls: pm_tls_meta,
     };
-    populate_procmgr_info(alloc, init_aspace, &pm_caps, stack_pages)?;
+    populate_procmgr_info(&mut arena, pm_aspace, &pm_caps, stack_pages)?;
 
-    map_stack_and_ipc(alloc, pm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
+    place_stack_and_ipc(&mut arena, pm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
 
     syscall::thread_configure_with_tls(
         pm_thread,
@@ -971,6 +1304,7 @@ pub fn bootstrap_procmgr(
         log_endpoint_slot: pm_log_send,
         registry_endpoint_slot: pm_registry_send,
         thread: pm_thread,
+        arena_cap: arena.cap,
     })
 }
 

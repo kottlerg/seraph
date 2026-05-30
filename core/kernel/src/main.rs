@@ -49,6 +49,7 @@ use boot_protocol::BootInfo;
 mod arch;
 mod cap;
 mod console;
+mod cpu_mask;
 mod framebuffer;
 mod ipc;
 pub mod irq;
@@ -343,7 +344,7 @@ unsafe fn kernel_entry_post_rebase(
     // APs are not yet started; sched::init allocates idle threads for all CPUs
     // so AP startup can call sched::ap_enter without re-allocating.
     kprintln!("Phase 8: Scheduler and SMP Bringup");
-    let cpu_count = sched::init(boot_cpu_count, allocator);
+    let cpu_count = sched::init(boot_cpu_count);
     kprintln!(
         "scheduler initialised, {} CPU{}",
         cpu_count,
@@ -477,11 +478,13 @@ unsafe fn kernel_entry_post_rebase(
         // pages 2..init_pages = PT growth pool). The wrapper header is the
         // cap object inserted into init's CSpace below.
         // 18 pages = 1 wrapper + 1 root PT + 16 PT pool. Phase 9 mappings
-        // (ELF segments, InitInfo, stack) go through the legacy buddy path
-        // via `map_page` (kernel-direct call); the wrapper's pool serves
-        // only init's userspace `sys_mem_map` calls (TEMP_MAP_BASE +
-        // ELF_PAGE_TEMP_VA scratch regions). 16 pool pages comfortably
-        // covers the bootstrap loop's PT footprint.
+        // (ELF segments, InitInfo, stack) go through `map_page`, a
+        // kernel-direct call whose intermediate PT pages come from
+        // `kernel_pt_pool`, not this wrapper's pool. The wrapper's pool
+        // serves init's userspace pooled paths: `sys_mem_map`
+        // (TEMP_MAP_BASE + ELF_PAGE_TEMP_VA scratch) and, post-Gap-B,
+        // `sys_mmio_map` for init's own MMIO (the riscv64 serial UART, one
+        // page). 16 pool pages cover that footprint with margin.
         #[allow(clippy::items_after_statements)]
         const INIT_ASPACE_PAGES: u64 = 18;
         // SAFETY: SEED installed in Phase 7; single-threaded Phase 9.
@@ -489,10 +492,10 @@ unsafe fn kernel_entry_post_rebase(
             unsafe { cap::boot_retype_aspace(cap::seed_frame_ref(), INIT_ASPACE_PAGES) };
         let _ = allocator; // legacy buddy path no longer used for init's AS
 
-        // Map each ELF LOAD segment into the init address space. `map_page`
-        // self-dispatches via the wrapper back-pointer wired by
-        // `boot_retype_aspace`, so every intermediate PT page comes from
-        // the wrapper's growth pool.
+        // Map each ELF LOAD segment into the init address space via
+        // `map_page`, whose intermediate PT pages come from `kernel_pt_pool`
+        // (the kernel-direct path). The wrapper's growth pool is
+        // reserved for init's later userspace pooled maps.
         for i in 0..init_image.segment_count as usize
         {
             let seg = &init_image.segments[i];
@@ -529,12 +532,12 @@ unsafe fn kernel_entry_post_rebase(
             // Minted reclaimable: full byte ledger + `owns_memory = true` +
             // `register_owned_range` so init's reap-handoff donation
             // (`procmgr.REGISTER_INIT_TEARDOWN` → `memmgr.DONATE_FRAMES`)
-            // can route these pages into memmgr's pool, and any cascade-
-            // delete via `dealloc_object` returns them to the buddy. The
-            // segments live in EFI LoaderData (not in the buddy free list
-            // at boot — see `mm/init.rs` exclusion list), so the buddy
-            // must register them as managed-but-not-free before a
-            // subsequent `free_range` can balance the page accounting.
+            // routes these pages into memmgr's pool. The segments live in EFI
+            // LoaderData (not in the buddy free list at boot — see `mm/init.rs`
+            // exclusion list), so `register_owned_range` accounts for them in
+            // the buddy's `total_pages` ledger. memmgr holds the cap from then
+            // on; the post-handoff buddy is sealed, so the `dealloc_object` →
+            // `free_range` path is a tripwire, not an expected reclaim.
             let seg_count = init_image.segment_count as usize;
             let mut seg_base: u32 = 0;
             for i in 0..seg_count
@@ -580,6 +583,7 @@ unsafe fn kernel_entry_post_rebase(
                 let slot = cs
                     .insert_cap(CapTag::Frame, rights, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Frame cap"));
+                cap::note_owns_memory_minted(size_aligned);
                 if i == 0
                 {
                     seg_base = slot.get();
@@ -675,9 +679,11 @@ unsafe fn kernel_entry_post_rebase(
             // INIT_INFO_MAX_PAGES = 4 the upper bound is order 2 (4 pages).
             let info_order = info_pages.next_power_of_two().trailing_zeros() as usize;
             let block_pages = 1usize << info_order;
-            let block_phys = allocator
-                .alloc(info_order)
-                .unwrap_or_else(|| fatal("Phase 9: out of memory for InitInfo"));
+            // The block was reserved from the pristine buddy at Phase 7
+            // (worst-case INIT_INFO_MAX_PAGES, one contiguous extent); the
+            // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES is
+            // enforced above, so it fits within the reserved extent.
+            let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
             // SAFETY: just allocated; valid for block_pages * PAGE_SIZE bytes.
             unsafe {
@@ -701,11 +707,10 @@ unsafe fn kernel_entry_post_rebase(
                 page_ptrs[pg] = virt;
                 page_phys[pg] = phys;
             }
-            // The buddy has no per-page free path here; the unused tail
-            // of the contiguous extent (at most `block_pages - info_pages`
-            // pages, ≤ 2 pages with `INIT_INFO_MAX_PAGES = 4`) stays
-            // allocated to the kernel. Small but constant waste; reclaim
-            // via a future cap-mint path if it becomes material.
+            // The block was reserved at the worst-case INIT_INFO_MAX_PAGES;
+            // the unused tail (INIT_INFO_MAX_PAGES - info_pages pages, ≤ 3)
+            // stays kernel-held — neither mapped nor minted below. Small but
+            // constant waste, bounded and accounted as kernel_reserved.
             let _ = block_pages;
             let info_base = page_ptrs[0];
 
@@ -735,6 +740,8 @@ unsafe fn kernel_entry_post_rebase(
                 init_info_frame_count: 0,  // patched after self-mint below
                 module_name_count: cspace_layout.module_name_count,
                 module_names: cspace_layout.module_names,
+                system_ram_bytes: 0, // patched below after all owns_memory mints
+                kernel_reserved_bytes: 0, // patched below after all owns_memory mints
                 framebuffer: init_framebuffer,
             };
 
@@ -772,10 +779,9 @@ unsafe fn kernel_entry_post_rebase(
             for pg in 0..info_pages
             {
                 let phys = page_phys[pg];
-                // No register_owned_range: these pages came from the
-                // buddy via `alloc.alloc(0)` above, so they are already
-                // in `total_pages`. `register_owned_range` would
-                // double-count.
+                // No register_owned_range: these pages came from the buddy
+                // (reserved at Phase 7), so they are already in `total_pages`.
+                // `register_owned_range` would double-count.
                 let fo_nn = cap::mint_phase7_body(FrameObject {
                     header: KernelObjectHeader::with_ancestor(
                         ObjectType::Frame,
@@ -795,6 +801,7 @@ unsafe fn kernel_entry_post_rebase(
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Frame cap"));
+                cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
                 if pg == 0
                 {
                     info_frame_base_slot = slot.get();
@@ -825,8 +832,10 @@ unsafe fn kernel_entry_post_rebase(
         // Map init's user stack (INIT_STACK_PAGES pages below INIT_STACK_TOP)
         // and mint a reclaimable Frame cap for each backing page. Inlined
         // (rather than calling `map_stack`) so we capture each phys address
-        // for cap minting; `register_owned_range` accounts for the pages so
-        // dealloc-driven `free_range` keeps the buddy ledger balanced.
+        // for cap minting; `register_owned_range` accounts for the pages in
+        // the buddy's `total_pages` ledger. The caps route to memmgr via reap;
+        // post-handoff the buddy is sealed, so the dealloc `free_range` path
+        // is a tripwire, not an expected reclaim.
         let (init_stack_frame_base, init_stack_frame_count) = {
             use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
             use cap::slot::{CapTag, Rights};
@@ -847,8 +856,9 @@ unsafe fn kernel_entry_post_rebase(
             let mut base_slot: u32 = 0;
             for i in 0..STACK_PAGES
             {
-                let phys = crate::mm::with_frame_allocator(|alloc| alloc.alloc(0))
-                    .unwrap_or_else(|| fatal("Phase 9: cannot allocate init stack page"));
+                // Page reserved from the pristine buddy at Phase 7; the
+                // post-drain buddy is empty.
+                let phys = cap::init_stack_phys(i);
 
                 // Zero the page through the kernel direct map.
                 // SAFETY: phys_to_virt yields a valid kernel virtual address.
@@ -866,10 +876,9 @@ unsafe fn kernel_entry_post_rebase(
                 }
 
                 // Mint a reclaimable Frame cap covering this page.
-                // No register_owned_range: the page came from the
-                // buddy via `alloc.alloc(0)` above, so it is already
-                // in `total_pages`. `register_owned_range` would
-                // double-count.
+                // No register_owned_range: the page came from the buddy
+                // (reserved at Phase 7), so it is already in `total_pages`.
+                // `register_owned_range` would double-count.
                 let fo_nn = cap::mint_phase7_body(FrameObject {
                     header: KernelObjectHeader::with_ancestor(
                         ObjectType::Frame,
@@ -889,6 +898,7 @@ unsafe fn kernel_entry_post_rebase(
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Frame cap"));
+                cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
                 if i == 0
                 {
                     base_slot = slot.get();
@@ -908,6 +918,43 @@ unsafe fn kernel_entry_post_rebase(
             (*info_ptr).init_stack_frame_base = init_stack_frame_base;
             (*info_ptr).init_stack_frame_count = init_stack_frame_count;
         }
+
+        // Patch the immutable memory-accounting facts. All owns_memory Frame
+        // caps minted to init (Phase-7 drain/module/reclaim + the segment,
+        // InitInfo, and stack caps above) are now in the ledger, so the
+        // reserved total is the complement against installed RAM.
+        let system_ram = mm::init::system_ram_bytes();
+        let kernel_reserved = system_ram.saturating_sub(cap::owns_memory_minted_bytes());
+        // SAFETY: info_page_virt mapped writable through the direct map;
+        // header at offset 0; single-threaded boot.
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
+            (*info_ptr).system_ram_bytes = system_ram;
+            (*info_ptr).kernel_reserved_bytes = kernel_reserved;
+        }
+        kprintln!(
+            "init: system_ram={} KiB, kernel_reserved={} KiB, pool={} KiB",
+            system_ram / 1024,
+            kernel_reserved / 1024,
+            cap::owns_memory_minted_bytes() / 1024,
+        );
+
+        // Every page Phase 8/9 consumes was pre-reserved before the Phase-7
+        // drain, which then took 100% of the remainder, so the post-handoff
+        // buddy is empty: every page of RAM is either a named kernel
+        // reservation or minted to userspace. The reap-time reverse path has
+        // not run yet, so any nonzero free count here is a Phase-7 reservation
+        // or drain bug. debug_assert, not assert: a stray free page wastes RAM
+        // but keeps the all-RAM-accounted identity sound (kernel_reserved is
+        // its complement), so it must not brick a release boot; CI's debug
+        // matrix enforces it.
+        let buddy_free = crate::mm::with_frame_allocator(|alloc| alloc.free_page_count());
+        kprintln!("init: post-handoff buddy free={buddy_free} pages");
+        debug_assert!(
+            buddy_free == 0,
+            "post-handoff buddy is not empty — a Phase-7 reservation or drain leak",
+        );
 
         // Retype a 6-page slab from SEED_FRAME for init's Thread:
         //   pages 0..3 — kernel stack (KERNEL_STACK_PAGES = 4 = 16 KiB)
@@ -1167,8 +1214,9 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // 2. Install per-CPU GS-base (IA32_GS_BASE → &PER_CPU[cpu_id]).
     //    After gdt::init_ap reloaded GS with selector 0, the GS shadow-register
     //    base is 0. Write the MSR here to restore GS-relative addressing.
-    // SAFETY: PER_CPU[cpu_id] allocated during Phase 8 (BSP); not yet accessed
-    // by this AP or any other CPU; called once per AP during startup.
+    // SAFETY: the PerCpuData slab was allocated in Phase 4 (sched::init_storage);
+    // this AP's entry is not yet accessed by any other CPU; called once per AP
+    // during startup.
     unsafe {
         percpu::init_ap(cpu_id);
     }

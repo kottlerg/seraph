@@ -569,10 +569,10 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     // Store TSS pointer directly in per-CPU data. GS-relative addressing is not
     // available here because the segment reload above (`mov gs, 0`) reset the
     // GS shadow-register base to 0; percpu::init_ap() reinstalls it afterward.
-    // SAFETY: cpu_id < MAX_CPUS (caller guarantee); PER_CPU[cpu_id] is not yet
-    // in use by any other CPU; single-CPU access during AP bringup.
+    // SAFETY: cpu_id < CPU_COUNT (caller guarantee); the PerCpuData slab entry
+    // is not yet in use by any other CPU; single-CPU access during AP bringup.
     unsafe {
-        let ptr = core::ptr::addr_of_mut!(crate::percpu::PER_CPU[cpu_id as usize]);
+        let ptr = crate::percpu::per_cpu_ptr(cpu_id as usize);
         (*ptr).tss_ptr = tss_addr;
     }
 }

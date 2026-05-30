@@ -144,9 +144,17 @@ fires only for staged test recipes such as `svctest.svc` / `usertest.svc`
 and the co-staged `crasher.svc` restart fixture), init signs over its own
 kernel-object caps
 (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and
-every reclaimable Frame cap (ELF segments, user stack pages,
-`InitInfo` pages, IPC buffer) to procmgr via
-`procmgr_labels::REGISTER_INIT_TEARDOWN`, then `sys_thread_exit`s.
+every reclaimable Frame cap it solely owns (ELF segments, user stack
+pages, `InitInfo` pages, the bootloader/bundle reclaim ranges, the
+AP-trampoline frame, and the boot-module ELF sources) to
+procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN`, then
+`sys_thread_exit`s. The usable-RAM range (already memmgr's) and the
+firmware read-only caps (RSDP/ACPI/DTB) are excluded. init's own
+bootstrap backing — its endpoint and log-thread retype slabs plus the
+offset-mapped IPC buffer and log-thread stack/IPC — is not in this set:
+it lives in a single contiguous arena Frame cap that init forwards to
+memmgr as an in-use run at bootstrap (`finalize_memmgr`), so those pages
+are already accounted in memmgr's pool and never reach the reap route.
 
 Procmgr binds a death-EQ observer on init's main thread; on the death
 event procmgr tears down init's kernel objects in order (Threads →

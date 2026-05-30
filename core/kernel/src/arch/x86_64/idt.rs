@@ -846,7 +846,7 @@ unsafe extern "C" fn ipi_nmi_backtrace_stub()
 }
 
 /// NMI body. Distinguishes a watchdog-requested backtrace from a real
-/// hardware NMI via [`NMI_BACKTRACE_REQUEST`]; on a watchdog ping it
+/// hardware NMI via the per-CPU `nmi_backtrace_request` flag; on a watchdog ping it
 /// dumps the saved frame to serial and returns (the stub's iretq
 /// resumes the interrupted code). On a real NMI it tail-calls
 /// `common_exception_handler` which never returns — the iretq tail of
@@ -857,15 +857,8 @@ unsafe extern "C" fn ipi_nmi_backtrace_stub()
 extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
 {
     let cpu = super::cpu::current_cpu() as usize;
-    let requested = if cpu < crate::sched::MAX_CPUS
-    {
-        super::interrupts::NMI_BACKTRACE_REQUEST[cpu]
-            .swap(false, core::sync::atomic::Ordering::AcqRel)
-    }
-    else
-    {
-        false
-    };
+    let requested = super::interrupts::nmi_backtrace_request(cpu)
+        .is_some_and(|flag| flag.swap(false, core::sync::atomic::Ordering::AcqRel));
     if !requested
     {
         // Real hardware NMI — defer to the standard fatal path.
@@ -985,13 +978,12 @@ extern "C" fn ipi_tlb_shootdown_handler()
     }
 
     // Acknowledge by clearing our bit in pending_cpus
-    let cpu_id = super::cpu::current_cpu();
-    let mask = !(1u64 << cpu_id);
+    let cpu_id = super::cpu::current_cpu() as usize;
 
     // SAFETY: Release ordering ensures TLB flush completes before bit clear is visible
     crate::mm::tlb_shootdown::TLB_SHOOTDOWN
         .pending_cpus
-        .fetch_and(mask, core::sync::atomic::Ordering::Release);
+        .clear_cpu(cpu_id, core::sync::atomic::Ordering::Release);
 
     // Send EOI to local APIC
     // SAFETY: Vector 250 is the TLB shootdown vector

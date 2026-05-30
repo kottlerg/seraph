@@ -807,8 +807,14 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         INIT_STACK_PAGES,
         SEED_RESERVE_BYTES / 1024,
     );
-    let block_count =
-        crate::mm::with_frame_allocator(|alloc| alloc.drain_for_usercaps(0, order_buf));
+    let block_count = crate::mm::with_frame_allocator(|alloc| {
+        let count = alloc.drain_for_usercaps(0, order_buf);
+        // The drain emptied the buddy; seal it. memmgr owns all dynamic RAM
+        // from here. A later free into the buddy (a destroyed `owns_memory`
+        // cap) is an accounting violation that the seal trips.
+        alloc.seal();
+        count
+    });
 
     if block_count == 0
     {
@@ -1952,11 +1958,14 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
         // Round size up so the cap covers every page that holds module bytes.
         let rounded_size = (module.physical_base - aligned_base + module.size + 0xFFF) & !0xFFF;
 
-        // Register the module's pages as managed-but-not-free so that if
-        // the cap is ever destroyed, `dealloc_object`'s `buddy.free_range`
-        // path keeps `free / total` well-defined. Idempotent at boot
-        // since module page ranges are disjoint. Production-only:
-        // `with_frame_allocator` is `cfg(not(test))`.
+        // Register the module's pages as managed-but-not-free so the buddy's
+        // `total_pages` ledger accounts for them (they are excluded from the
+        // free list — `mm/init.rs` filters loaded regions). These caps route
+        // to memmgr via reap and are not destroyed in the kernel; the
+        // post-handoff buddy is sealed, so the dealloc `free_range` path is a
+        // tripwire, not a routine reclaim. Idempotent at boot since module
+        // page ranges are disjoint. Production-only: `with_frame_allocator` is
+        // `cfg(not(test))`.
         #[cfg(not(test))]
         // SAFETY: module pages were not added via `add_region`
         // (`mm/init.rs` excludes loaded regions); single-threaded boot.
@@ -2037,8 +2046,9 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
 /// Each cap is inserted into the root `CSpace` and a matching
 /// `CapDescriptor` entry pushed into `layout.descriptors`, so the cap
 /// reaches init through the standard descriptor-table walk in the same
-/// shape boot-module caps take. Pages return to the buddy on cap teardown
-/// via the existing `dealloc_object` → `free_range` path.
+/// shape boot-module caps take. init routes each cap to memmgr via reap;
+/// the post-handoff buddy is sealed, so the `dealloc_object` → `free_range`
+/// path is a tripwire for a leaked cap, not a routine reclaim.
 ///
 /// Entries marked [`boot_protocol::RECLAIM_FLAG_LATE`] are skipped here
 /// and minted later by [`mint_late_reclaim_frame_caps`] after SMP
@@ -2187,13 +2197,15 @@ fn mint_reclaim_pass(
             }
         }
 
-        // Register the range as managed-but-not-free so that if the cap is
-        // ever destroyed, `dealloc_object`'s `free_range` keeps the buddy
-        // `free / total` ratio well-defined. These pages were never in
+        // Register the range as managed-but-not-free so the buddy's
+        // `total_pages` ledger accounts for it. These pages were never in
         // `total_pages` — `mm::init::collect_usable_ranges` filters
         // `Loaded`-typed regions out of the buddy at Phase 2 — so
         // `register_owned_range` is the correct ledger entry (not
-        // `add_region`, which would also push them onto the free list).
+        // `add_region`, which would also push them onto the free list). The
+        // cap routes to memmgr via reap and is not destroyed in the kernel;
+        // post-handoff the buddy is sealed, so a `free_range` here is a
+        // tripwire, not a routine reclaim.
         #[cfg(not(test))]
         // SAFETY: range pages were not added via `add_region`
         // (bootloader-typed `Loaded`, filtered by

@@ -36,6 +36,22 @@ transfers them to memmgr (derive-twice). From that point on, memmgr is
 the sole userspace authority over RAM frame allocation; the kernel does
 not delegate further to anyone.
 
+The handoff is total. At Phase 7 the kernel reserves its fixed
+contributors (PT-pool seed, idle-thread stacks, the `InitInfo` block,
+init's user stack, the SEED arena) from the pristine buddy, then drains
+**every** remaining page into userspace Frame caps and *seals* the buddy.
+After the seal the buddy is an inert boot artifact: it holds no free
+pages, allocates nothing, and must receive no frees. Every page of RAM is
+therefore either a bounded fixed kernel reserve or owned by memmgr's pool
+— nothing is invisible. memmgr holds its `owns_memory` Frame caps
+permanently (consumers receive `owns_memory=false` derivations that return
+to the pool on death), so no cap ever cascades back to the kernel
+allocator. A free into the sealed buddy means an `owns_memory` cap was
+destroyed post-handoff — RAM leaked into an allocator nothing draws from —
+and trips a kernel `debug_assert`; the same fault surfaces in the
+closing identity `system_ram == kernel_reserved + pool_total` checked by
+svctest.
+
 No process manipulates another process's address space. Sharing is
 explicit and capability-mediated: a Frame cap is sent over IPC and the
 receiver maps it into its own address space at a VA the receiver chose.

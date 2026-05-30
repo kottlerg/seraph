@@ -532,12 +532,12 @@ unsafe fn kernel_entry_post_rebase(
             // Minted reclaimable: full byte ledger + `owns_memory = true` +
             // `register_owned_range` so init's reap-handoff donation
             // (`procmgr.REGISTER_INIT_TEARDOWN` → `memmgr.DONATE_FRAMES`)
-            // can route these pages into memmgr's pool, and any cascade-
-            // delete via `dealloc_object` returns them to the buddy. The
-            // segments live in EFI LoaderData (not in the buddy free list
-            // at boot — see `mm/init.rs` exclusion list), so the buddy
-            // must register them as managed-but-not-free before a
-            // subsequent `free_range` can balance the page accounting.
+            // routes these pages into memmgr's pool. The segments live in EFI
+            // LoaderData (not in the buddy free list at boot — see `mm/init.rs`
+            // exclusion list), so `register_owned_range` accounts for them in
+            // the buddy's `total_pages` ledger. memmgr holds the cap from then
+            // on; the post-handoff buddy is sealed, so the `dealloc_object` →
+            // `free_range` path is a tripwire, not an expected reclaim.
             let seg_count = init_image.segment_count as usize;
             let mut seg_base: u32 = 0;
             for i in 0..seg_count
@@ -832,8 +832,10 @@ unsafe fn kernel_entry_post_rebase(
         // Map init's user stack (INIT_STACK_PAGES pages below INIT_STACK_TOP)
         // and mint a reclaimable Frame cap for each backing page. Inlined
         // (rather than calling `map_stack`) so we capture each phys address
-        // for cap minting; `register_owned_range` accounts for the pages so
-        // dealloc-driven `free_range` keeps the buddy ledger balanced.
+        // for cap minting; `register_owned_range` accounts for the pages in
+        // the buddy's `total_pages` ledger. The caps route to memmgr via reap;
+        // post-handoff the buddy is sealed, so the dealloc `free_range` path
+        // is a tripwire, not an expected reclaim.
         let (init_stack_frame_base, init_stack_frame_count) = {
             use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
             use cap::slot::{CapTag, Rights};

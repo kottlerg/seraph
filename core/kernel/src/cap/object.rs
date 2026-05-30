@@ -1055,7 +1055,10 @@ unsafe fn dealloc_object_one(
             // object. `owns_memory` is false for MMIO / firmware / boot
             // module / init-segment caps (the physical memory is not part
             // of the buddy pool at all) and for split originals (ownership
-            // was atomically transferred to the children).
+            // was atomically transferred to the children). This is the buddy's
+            // only reverse path; post-handoff the buddy is sealed (every
+            // `owns_memory` cap lives permanently in memmgr's pool), so a live
+            // free here trips the seal — see `buddy::free_range`.
             // SAFETY: ptr points to a live FrameObject; single-owner access
             // since refcount reached zero at the call site.
             let (base, size, owned) = unsafe {

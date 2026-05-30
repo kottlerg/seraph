@@ -30,6 +30,16 @@
 //! across all orders. The current value handles ~16 GiB of RAM. Increase it
 //! (or transition to in-page node storage after Phase 3 establishes page
 //! tables) for larger systems.
+//!
+//! # Post-handoff sealing
+//!
+//! The buddy is a boot-time allocator only. Phase 7 ([`crate::cap`]) drains
+//! every page into userspace Frame caps (`drain_for_usercaps(0, …)`), then
+//! [`seal`][BuddyAllocator::seal]s the allocator. memmgr is the sole dynamic
+//! memory authority thereafter; the buddy neither allocates (its free list is
+//! empty) nor should receive frees. A post-seal [`free_range`][BuddyAllocator::free_range]
+//! means an `owns_memory` Frame cap was destroyed after handoff — RAM leaked
+//! into an allocator nothing draws from — and trips a `debug_assert`.
 
 // cast_possible_truncation: u64→usize and usize→u16 casts bounded by physical address ranges.
 // large_stack_arrays: BuddyAllocator is placed in .bss as a static; the large arrays are
@@ -75,6 +85,16 @@ pub struct BuddyAllocator
     free_pages: usize,
     /// Total number of 4 KiB pages ever added via `add_region`. Fixed at boot.
     total_pages: usize,
+    /// Set once the Phase-7 drain has handed all RAM to userspace
+    /// ([`seal`][Self::seal]). After this the buddy is a sealed boot
+    /// artifact: nothing allocates from it and nothing should free into it.
+    /// [`free_range`][Self::free_range] trips on a post-seal free.
+    ///
+    /// Read only by the `free_range` `debug_assert`, so it is write-only in a
+    /// release build (the tripwire is debug-only by design — a misaccounted
+    /// page must not brick a release boot; CI's debug matrix enforces it).
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    sealed: bool,
 }
 
 impl BuddyAllocator
@@ -93,6 +113,7 @@ impl BuddyAllocator
             pool_init: false,
             free_pages: 0,
             total_pages: 0,
+            sealed: false,
         }
     }
 
@@ -212,6 +233,20 @@ impl BuddyAllocator
         self.free_pages
     }
 
+    /// Seal the allocator after the Phase-7 drain.
+    ///
+    /// Records that all RAM has been handed to userspace and the buddy is now
+    /// a sealed boot artifact. Subsequent [`free_range`][Self::free_range]
+    /// calls trip a `debug_assert`: post-handoff the only owner of buddy-backed
+    /// RAM is memmgr, which holds its `owns_memory` Frame caps permanently, so
+    /// a free here is an accounting violation. Called once, at the end of the
+    /// drain, while the free list is empty.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn seal(&mut self)
+    {
+        self.sealed = true;
+    }
+
     /// Register `size_bytes / PAGE_SIZE` pages as managed but not currently
     /// free.
     ///
@@ -242,7 +277,9 @@ impl BuddyAllocator
     ///
     /// Used by [`FrameObject`](crate::cap::object::FrameObject) teardown to
     /// return an entire cap-backed region (which need not be a single
-    /// power-of-two block after `frame_split`) in one call.
+    /// power-of-two block after `frame_split`) in one call. Before the
+    /// Phase-7 [`seal`][Self::seal] this balances the boot-time ledger; after
+    /// it, see the post-seal `debug_assert` below.
     ///
     /// # Safety
     ///
@@ -254,6 +291,17 @@ impl BuddyAllocator
     {
         debug_assert!(base.is_multiple_of(PAGE_SIZE as u64));
         debug_assert!(size_bytes.is_multiple_of(PAGE_SIZE as u64));
+        // The sole runtime caller is `dealloc_object`'s Frame arm, reached
+        // only for an `owns_memory` cap at its last reference. Every such cap
+        // is minted at or after the Phase-7 drain and routes to memmgr, which
+        // never destroys it — so post-seal this path is unreachable on a
+        // correct system. A trip here is a leak into the sealed buddy; the
+        // identity check (svctest) catches the same fault later via the drop
+        // in memmgr's `pool_total`.
+        debug_assert!(
+            !self.sealed,
+            "post-handoff buddy free — owns_memory cap destroyed after handoff (accounting violation)"
+        );
 
         let page_size = PAGE_SIZE as u64;
         let mut addr = base;

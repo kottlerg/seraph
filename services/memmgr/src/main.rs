@@ -225,69 +225,76 @@ impl FreePool
         best
     }
 
-    /// Coalesce free runs by repeatedly trying `frame_merge` between every
-    /// pair. Bounded: each successful merge reduces the run count by one.
+    /// Coalesce free runs into larger physically-contiguous chunks.
+    ///
+    /// `frame_merge` only joins runs adjacent in physical memory, so sorting
+    /// the populated runs by `phys_base` places every mergeable pair
+    /// consecutively. A single linear pass then folds each run into its
+    /// lower-addressed neighbour with one `frame_merge` per pair: O(P)
+    /// syscalls over P populated runs, versus the O(P²) of blind all-pairs
+    /// probing. The distinction is load-bearing once the pool spans the whole
+    /// machine and every process death coalesces — a syscall per ordered pair
+    /// dominates teardown latency.
+    // cast_possible_truncation: slot indices are bounded by MAX_FREE_RUNS
+    // (512), so `i as u16` cannot truncate.
+    #[allow(clippy::cast_possible_truncation)]
     fn coalesce(&mut self)
     {
-        loop
+        // Collect populated slot indices (slot < MAX_FREE_RUNS fits u16).
+        let mut order = [0u16; MAX_FREE_RUNS];
+        let mut n = 0usize;
+        for (i, slot) in self.runs.iter().enumerate()
         {
-            let mut merged_any = false;
-            'outer: for i in 0..MAX_FREE_RUNS
+            if slot.is_some()
             {
-                let Some(run_a) = self.runs[i]
+                order[n] = i as u16;
+                n += 1;
+            }
+        }
+        // Insertion sort by phys_base: P is small in practice and this needs
+        // no allocator. None never appears in `order`, so map_or's default is
+        // unreachable.
+        for a in 1..n
+        {
+            let key = order[a];
+            let key_phys = self.runs[key as usize].map_or(0, |r| r.phys_base);
+            let mut b = a;
+            while b > 0 && self.runs[order[b - 1] as usize].map_or(0, |r| r.phys_base) > key_phys
+            {
+                order[b] = order[b - 1];
+                b -= 1;
+            }
+            order[b] = key;
+        }
+        // Fold each run into the current survivor while `frame_merge` accepts
+        // the pair. The survivor is the lower-addressed run, so it is always
+        // the merge parent; a rejection (non-adjacent or foreign parent) ends
+        // this survivor's run and promotes the rejecting run to survivor.
+        let mut s = 0usize;
+        while s < n
+        {
+            let surv = order[s] as usize;
+            let mut t = s + 1;
+            while t < n
+            {
+                let (Some(parent), Some(tail)) = (self.runs[surv], self.runs[order[t] as usize])
                 else
                 {
-                    continue;
+                    break;
                 };
-                for j in 0..MAX_FREE_RUNS
+                if syscall::frame_merge(parent.cap_slot, tail.cap_slot).is_err()
                 {
-                    if i == j
-                    {
-                        continue;
-                    }
-                    let Some(run_b) = self.runs[j]
-                    else
-                    {
-                        continue;
-                    };
-                    // Try merging in both orders. Option-D frame_merge
-                    // requires physical contiguity (parent first, tail
-                    // second) and identical rights/parents; it rejects every
-                    // non-adjacent pair, so blind probing is correct (just
-                    // O(N²)). On success the parent's slot stays valid and
-                    // the tail's slot is freed; the merged run's cap_slot
-                    // is therefore the parent (lower-address) cap.
-                    if syscall::frame_merge(run_a.cap_slot, run_b.cap_slot).is_ok()
-                    {
-                        // run_a was parent (lower base); its slot survives
-                        // and now covers run_a.size + run_b.size.
-                        self.runs[i] = Some(FreeRun {
-                            cap_slot: run_a.cap_slot,
-                            page_count: run_a.page_count + run_b.page_count,
-                            phys_base: run_a.phys_base,
-                        });
-                        self.runs[j] = None;
-                        merged_any = true;
-                        break 'outer;
-                    }
-                    if syscall::frame_merge(run_b.cap_slot, run_a.cap_slot).is_ok()
-                    {
-                        // run_b was parent; its slot survives.
-                        self.runs[i] = Some(FreeRun {
-                            cap_slot: run_b.cap_slot,
-                            page_count: run_a.page_count + run_b.page_count,
-                            phys_base: run_b.phys_base,
-                        });
-                        self.runs[j] = None;
-                        merged_any = true;
-                        break 'outer;
-                    }
+                    break;
                 }
+                self.runs[surv] = Some(FreeRun {
+                    cap_slot: parent.cap_slot,
+                    page_count: parent.page_count + tail.page_count,
+                    phys_base: parent.phys_base,
+                });
+                self.runs[order[t] as usize] = None;
+                t += 1;
             }
-            if !merged_any
-            {
-                break;
-            }
+            s = t;
         }
     }
 }

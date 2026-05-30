@@ -90,7 +90,7 @@ pub unsafe fn init_apic_ids(cpu_ids: &[u32])
 #[cfg(not(test))]
 pub unsafe fn apic_id_for(cpu: usize) -> u32
 {
-    let base = CPU_APIC_IDS_PTR.load(Ordering::Relaxed);
+    let base = CPU_APIC_IDS_PTR.load(Ordering::Acquire);
     debug_assert!(
         !base.is_null(),
         "apic_id_for: CPU_APIC_IDS slab not allocated"
@@ -250,7 +250,7 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 #[inline]
 pub fn per_cpu_ptr(cpu: usize) -> *mut PerCpuData
 {
-    let base = PER_CPU_PTR.load(Ordering::Relaxed);
+    let base = PER_CPU_PTR.load(Ordering::Acquire);
     debug_assert!(!base.is_null(), "per_cpu_ptr: PER_CPU slab not allocated");
     // SAFETY: cpu < CPU_COUNT by caller contract; the slab covers CPU_COUNT
     // PerCpuData entries.

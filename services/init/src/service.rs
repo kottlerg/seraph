@@ -18,10 +18,10 @@ use crate::walk;
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
-/// Thread caps init collects across Phases 1-3 for v3
-/// `REGISTER_SERVICE` once svcmgr is up. Zero in a slot means init
-/// could not capture (or chose not to capture) that service's thread
-/// cap; the corresponding `register_service` call is then skipped.
+/// Thread caps init collects across Phases 1-3 to hand svcmgr in the
+/// handover endowment (one `SUBSTRATE` round each). Zero in a slot means
+/// init could not capture (or chose not to capture) that service's thread
+/// cap; the corresponding endowment round is then skipped.
 ///
 /// Field order matches reconciliation order in the boot log, not
 /// spawn order. memmgr / procmgr come from
@@ -958,112 +958,166 @@ pub fn create_svcmgr_from_file(
     Some((process_handle, child_token))
 }
 
-/// Endpoint set handed to svcmgr in its bootstrap round.
+/// Round kinds for the svcmgr handover endowment, tagged in `data[0]`.
+/// Mirrors the receive side in `services/svcmgr/src/service.rs::endow_kind`.
+mod endow_kind
+{
+    /// Round 1: svcmgr's own endpoints + publish-role source caps.
+    pub const CAPS: u64 = 1;
+    /// One substrate `(name, thread_cap)` registration.
+    pub const SUBSTRATE: u64 = 2;
+}
+
+/// Source + endpoint caps init endows svcmgr with at handover. The two
+/// source caps are init's own (full-rights) handles on the root filesystem
+/// namespace endpoint and devmgr's registry endpoint; svcmgr derives the
+/// shapes it publishes / sends from them.
 #[allow(clippy::struct_field_names)]
-pub struct SvcmgrHandoverCaps
+pub struct SvcmgrEndowment
 {
     pub svcmgr_service_ep: u32,
     pub svcmgr_bootstrap_ep: u32,
+    pub rootfs_root_cap: u32,
+    pub devmgr_registry_ep: u32,
 }
 
-/// Start svcmgr, then serve its bootstrap.
-pub fn setup_and_start_svcmgr(
+/// Start svcmgr, then serve the handover endowment over the bootstrap
+/// protocol.
+///
+/// Round 1 (`CAPS`, not done) delivers svcmgr's service + bootstrap
+/// endpoints (full rights) and the publish-role source caps: a `SEND` on
+/// the root filesystem namespace endpoint (svcmgr publishes it as
+/// `rootfs.root`) and a token-0 `SEND|GRANT` source on devmgr's registry
+/// endpoint (svcmgr mints the `REGISTRY_QUERY_AUTHORITY` `devmgr.registry`
+/// publish cap and the `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from
+/// it). An absent source cap rides as a zero slot, which svcmgr tolerates.
+///
+/// Each subsequent `SUBSTRATE` round delivers one init-bootstrapped
+/// service's thread cap plus its name; the final substrate round is
+/// terminal. svcmgr parks the pairs for reconciliation. Best-effort: a
+/// failed round logs and aborts the endowment; svcmgr then runs with
+/// whatever it received (the system is already non-viable if a substrate
+/// thread cap cannot be delivered).
+fn endow_svcmgr(
     bootstrap_ep: u32,
     process_handle: u32,
     child_token: u64,
-    handover: &SvcmgrHandoverCaps,
+    endow: &SvcmgrEndowment,
+    thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
 )
 {
     if !start_process(
         process_handle,
         ipc_buf,
-        "phase 3: svcmgr started; serving bootstrap",
+        "phase 3: svcmgr started; serving endowment",
         "phase 3: svcmgr START_PROCESS failed",
     )
     {
         return;
     }
 
-    let Ok(service_copy) = syscall::cap_derive(handover.svcmgr_service_ep, syscall::RIGHTS_ALL)
+    let Ok(service_copy) = syscall::cap_derive(endow.svcmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
+        log("phase 3: svcmgr service-ep derive failed");
         return;
     };
-    let Ok(boot_copy) = syscall::cap_derive(handover.svcmgr_bootstrap_ep, syscall::RIGHTS_ALL)
+    let Ok(boot_copy) = syscall::cap_derive(endow.svcmgr_bootstrap_ep, syscall::RIGHTS_ALL)
     else
     {
+        log("phase 3: svcmgr bootstrap-ep derive failed");
         return;
+    };
+    // rootfs.root SEND — token inherited from the root fs namespace cap.
+    let rootfs_send = if endow.rootfs_root_cap != 0
+    {
+        syscall::cap_derive(endow.rootfs_root_cap, syscall::RIGHTS_SEND).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    // devmgr-registry source: token-0 SEND|GRANT so svcmgr can mint the
+    // tokened query + drivers-dir caps. SEND|GRANT (not RIGHTS_ALL) is the
+    // minimum — it withholds the RECV right on devmgr's registry endpoint.
+    let devmgr_registry_src = if endow.devmgr_registry_ep != 0
+    {
+        syscall::cap_derive(endow.devmgr_registry_ep, syscall::RIGHTS_SEND_GRANT).unwrap_or(0)
+    }
+    else
+    {
+        0
     };
 
-    // One round: [service, bootstrap_ep].
-    // (log + procmgr auto-delivered via ProcessInfo.)
-    let _ = serve(
+    // Substrate set; init skips a service whose thread cap it could not
+    // capture, so a missing recipe match is bind-only-absent rather than a
+    // `registered without definition` orphan in svcmgr.
+    let registrations: &[(&[u8], u32)] = &[
+        (b"memmgr", thread_caps.memmgr),
+        (b"procmgr", thread_caps.procmgr),
+        (b"devmgr", thread_caps.devmgr),
+        (b"vfsd", thread_caps.vfsd),
+        (b"logd", thread_caps.logd),
+    ];
+    let last = registrations.iter().rposition(|&(_, tc)| tc != 0);
+
+    // Round 1 (CAPS), positional: [service, bootstrap, rootfs, devmgr_reg].
+    // Terminal only in the (unreachable) all-zero-substrate case.
+    if !serve(
         bootstrap_ep,
         child_token,
         ipc_buf,
-        true,
-        &[service_copy, boot_copy],
-        &[],
-        "phase 3: svcmgr bootstrap failed",
-    );
-}
-
-/// Minimal v3 `REGISTER_SERVICE` payload: name + thread cap.
-///
-/// Post-#21 the recipe (binary, argv, env, restart policy,
-/// criticality, namespace shape, seed names) lives on disk at
-/// `/config/svcmgr/services/<name>.svc`. The wire conveys only what
-/// cannot be on disk: which named recipe this running process
-/// implements, and the thread cap svcmgr binds death-notification on.
-pub struct ServiceRegistration<'a>
-{
-    pub name: &'a [u8],
-    pub thread_cap: u32,
-}
-
-/// Register a currently-running service with svcmgr via the v3
-/// [`svcmgr_labels::REGISTER_SERVICE`] wire (`word 0` =
-/// `SVCMGR_LABELS_VERSION`, `word 1` = `name_len`, `words 2..` = name
-/// bytes, `caps[0]` = thread cap). svcmgr parks the entry and
-/// reconciles against `/config/svcmgr/services/` on `HANDOVER_COMPLETE`.
-pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistration)
-{
-    let name_len = reg.name.len();
-    if name_len == 0 || name_len > 32 || reg.thread_cap == 0
+        last.is_none(),
+        &[service_copy, boot_copy, rootfs_send, devmgr_registry_src],
+        &[endow_kind::CAPS, u64::from(ipc::SVCMGR_LABELS_VERSION)],
+        "phase 3: svcmgr endowment CAPS round failed",
+    )
     {
-        log("phase 3: REGISTER_SERVICE caller bug (empty name or zero thread cap)");
         return;
     }
-    let name_words = name_len.div_ceil(8);
-    let data_count = 2 + name_words;
 
-    let msg = IpcMessage::builder(svcmgr_labels::REGISTER_SERVICE)
-        .word(0, u64::from(ipc::SVCMGR_LABELS_VERSION))
-        .word(1, name_len as u64)
-        .bytes(2, reg.name)
-        .word_count(data_count)
-        .cap(reg.thread_cap)
-        .build();
-
-    // SAFETY: ipc_buf is the caller's registered IPC buffer.
-    match unsafe { ipc::ipc_call(svcmgr_ep, &msg, ipc_buf) }
+    // Substrate rounds: one (name, thread_cap) each; last is terminal.
+    for (i, &(name, thread_cap)) in registrations.iter().enumerate()
     {
-        Ok(reply) if reply.label == 0 =>
-        {}
-        _ => log("phase 3: REGISTER_SERVICE failed"),
+        if thread_cap == 0
+        {
+            continue;
+        }
+        let mut name_words = [0u64; 2];
+        let nw = pack_svc_name(name, &mut name_words);
+        let mut data = [0u64; 2 + 2];
+        data[0] = endow_kind::SUBSTRATE;
+        data[1] = name.len() as u64;
+        data[2..2 + nw].copy_from_slice(&name_words[..nw]);
+        if !serve(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            Some(i) == last,
+            &[thread_cap],
+            &data[..2 + nw],
+            "phase 3: svcmgr endowment SUBSTRATE round failed",
+        )
+        {
+            return;
+        }
     }
 }
 
 // ── Phase 3 orchestration ───────────────────────────────────────────────────
 
-/// Phase 3: spawn svcmgr, bring up the wallclock chain, spawn pwrmgr,
-/// register pwrmgr with svcmgr (v3 wire), publish the named caps
-/// post-#21 consumers resolve from `/config/svcmgr/services/<name>.svc` `seed = ...`
-/// lines, then signal `HANDOVER_COMPLETE` so svcmgr scans
-/// `/config/svcmgr/services/`. On a normal boot the defined services there are
-/// all init-registered (bind-only); svcmgr's launch path fires only for staged
-/// test recipes (svctest / usertest, and crasher co-staged with svctest).
+/// Phase 3: load svcmgr, serve it the handover endowment (its own
+/// endpoints + publish-role source caps + one `(name, thread_cap)` round
+/// per init-bootstrapped substrate service), then signal
+/// `HANDOVER_COMPLETE` so svcmgr scans `/config/svcmgr/services/`. svcmgr
+/// publishes the well-known names it now owns and installs devmgr's
+/// drivers dir from the endowment; init no longer publishes caps,
+/// registers services, or talks to devmgr. On a normal boot the defined
+/// services are the bind-only substrate plus the svcmgr-launched providers
+/// (`timed`, `pwrmgr`); svcmgr's pure-consumer launch path fires only for
+/// staged test recipes (svctest / usertest, and crasher co-staged with
+/// svctest).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn phase3_svcmgr_handover(
     info: &InitInfo,
@@ -1108,137 +1162,33 @@ pub fn phase3_svcmgr_handover(
         idle_loop();
     };
 
-    let handover = SvcmgrHandoverCaps {
+    // Serve svcmgr its handover endowment: round 1 carries svcmgr's own
+    // endpoints plus the publish-role source caps (rootfs root, devmgr
+    // registry), then one round per init-bootstrapped substrate service
+    // carries that service's (name, thread_cap) for death-supervision
+    // binding. svcmgr drains it all in `bootstrap_caps`, publishes the
+    // well-known names it now owns (`rootfs.root` / `svcmgr` /
+    // `devmgr.registry`) and installs devmgr's drivers dir itself, then
+    // reconciles the substrate against `/config/svcmgr/services/` on
+    // HANDOVER_COMPLETE.
+    //
+    // pwrmgr/timed are svcmgr-launched providers (`*.svc`) that acquire
+    // their caps from devmgr and publish their own names; init neither
+    // spawns nor publishes for them.
+    let endowment = SvcmgrEndowment {
         svcmgr_service_ep,
         svcmgr_bootstrap_ep,
+        rootfs_root_cap,
+        devmgr_registry_ep,
     };
-    setup_and_start_svcmgr(
+    endow_svcmgr(
         bootstrap_ep,
         svcmgr_handle,
         svcmgr_token,
-        &handover,
+        &endowment,
+        thread_caps,
         ipc_buf,
     );
-
-    // Hand devmgr a least-privilege `/services/drivers/` subtree cap so
-    // it can lazily walk + spawn its on-disk driver binaries (today: the
-    // per-arch RTC). Ack-only handshake; init does not block on driver
-    // work. Best-effort: a failure here means timed will see NO_DEVICE
-    // on its first QUERY_RTC_DEVICE and degrade to its no-RTC path; the
-    // rest of Phase 3 proceeds normally.
-    set_drivers_dir_on_devmgr(devmgr_registry_ep, system_root_cap, ipc_buf);
-
-    // pwrmgr is now a svcmgr-launched provider (`pwrmgr.svc`): it acquires
-    // its shutdown caps from devmgr (QUERY_SHUTDOWN_DEVICE) and publishes
-    // `pwrmgr.shutdown`/`pwrmgr.deny` itself via svcmgr's provider path.
-    // init no longer spawns it, holds its endpoint, or publishes its caps.
-
-    // Derive a PUBLISH_AUTHORITY-tokened SEND_GRANT on svcmgr's
-    // service ep so init can publish the named caps post-#21 consumers
-    // resolve through `/config/svcmgr/services/<name>.svc` `seed = ...`.
-    // `RIGHTS_SEND_GRANT` (not bare SEND): PUBLISH_ENDPOINT carries the
-    // value cap in the message, and the IPC kernel requires the GRANT
-    // bit on the caller's send-cap to transfer caps. After the four
-    // publications init drops this cap; runtime consumers use the
-    // un-tokened SEND seeded into `ProcessInfo.service_registry_cap`.
-    let publish_cap = syscall::cap_derive_token(
-        svcmgr_service_ep,
-        syscall::RIGHTS_SEND_GRANT,
-        svcmgr_labels::PUBLISH_AUTHORITY,
-    )
-    .ok();
-
-    // 1. rootfs.root — tokened SEND on the root filesystem's namespace
-    //    endpoint at its root directory. FS-driver-agnostic by design:
-    //    today fatfs, tomorrow any other FS driver, same name.
-    if let Some(cap) = publish_cap
-        && rootfs_root_cap != 0
-        && let Ok(derived) = syscall::cap_derive(rootfs_root_cap, syscall::RIGHTS_SEND)
-        && !svcmgr_publish(cap, ipc::published_names::ROOTFS_ROOT, derived, ipc_buf)
-    {
-        log("phase 3: publish rootfs.root failed");
-        let _ = syscall::cap_delete(derived);
-    }
-
-    // pwrmgr.shutdown / pwrmgr.deny are published by svcmgr's provider
-    // path now (`pwrmgr.svc` `provides = pwrmgr.shutdown:auth
-    // pwrmgr.deny:deny`), not by init.
-
-    // 4. svcmgr — tokened SEND on svcmgr's own service endpoint. Used
-    //    by crasher.svc's `seed = svcmgr` line so the launched
-    //    crasher receives the same cap shape today's hard-coded
-    //    bundle gave it. Per-publisher attenuation (so children can
-    //    only QUERY, not PUBLISH) lives in the SEND-without-AUTHORITY
-    //    shape — same as `ProcessInfo.service_registry_cap`.
-    if let Some(cap) = publish_cap
-        && let Ok(svc_send) = syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND)
-        && !svcmgr_publish(cap, ipc::published_names::SVCMGR, svc_send, ipc_buf)
-    {
-        log("phase 3: publish svcmgr failed");
-        let _ = syscall::cap_delete(svc_send);
-    }
-
-    // 5. devmgr.registry — `REGISTRY_QUERY_AUTHORITY`-tokened SEND on
-    //    devmgr's registry endpoint. Today's consumer is
-    //    `programs/fb-charset` via `seed = devmgr.registry`; future
-    //    non-init consumers of devmgr's discovery surface use the same
-    //    name. The token bit survives svcmgr's plain `cap_derive` in
-    //    `registry_lookup_derived`.
-    if let Some(cap) = publish_cap
-        && devmgr_registry_ep != 0
-    {
-        match syscall::cap_derive_token(
-            devmgr_registry_ep,
-            syscall::RIGHTS_SEND,
-            ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-        )
-        {
-            Ok(derived) =>
-            {
-                if !svcmgr_publish(cap, ipc::published_names::DEVMGR_REGISTRY, derived, ipc_buf)
-                {
-                    log("phase 3: publish devmgr.registry failed");
-                    let _ = syscall::cap_delete(derived);
-                }
-            }
-            Err(_) => log("phase 3: derive devmgr.registry cap failed"),
-        }
-    }
-
-    if let Some(cap) = publish_cap
-    {
-        let _ = syscall::cap_delete(cap);
-    }
-
-    // Register every foundational service init bootstrapped with
-    // svcmgr (v3 wire: name + thread cap). svcmgr's reconciliation
-    // path pairs each name with the matching `.svc` recipe on disk
-    // and binds death-notification. Zero in a slot means init could
-    // not capture the thread cap (e.g. the spawn failed or the
-    // helper had no cap to share); the register call is then
-    // skipped and the recipe ⇒ `registered without definition`
-    // entries are absent rather than surfacing as orphans.
-    let registrations: &[(&[u8], u32)] = &[
-        (b"memmgr", thread_caps.memmgr),
-        (b"procmgr", thread_caps.procmgr),
-        (b"devmgr", thread_caps.devmgr),
-        (b"vfsd", thread_caps.vfsd),
-        (b"logd", thread_caps.logd),
-    ];
-    for (name, thread_cap) in registrations
-    {
-        if *thread_cap != 0
-        {
-            register_service(
-                svcmgr_service_ep,
-                ipc_buf,
-                &ServiceRegistration {
-                    name,
-                    thread_cap: *thread_cap,
-                },
-            );
-        }
-    }
 
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
     // SAFETY: ipc_buf is caller's registered IPC buffer.
@@ -1619,10 +1569,11 @@ pub fn create_and_start_logd(
     Some(thread_cap)
 }
 
-// ── svcmgr publish + drivers-dir handshake ──────────────────────────────────
+// ── svcmgr endowment name packing ───────────────────────────────────────────
 
-/// Pack a short ASCII name into IPC data words (`pack_name` shape matches
-/// `svcmgr::read_tail_name_from_msg`). Returns the word count used.
+/// Pack a short ASCII name into IPC data words, little-endian within each
+/// word. Matches svcmgr's unpack in `service::ingest_substrate` /
+/// `read_tail_name_from_msg`. Returns the word count used.
 fn pack_svc_name(name: &[u8], out: &mut [u64; 2]) -> usize
 {
     for (i, &b) in name.iter().enumerate()
@@ -1630,123 +1581,4 @@ fn pack_svc_name(name: &[u8], out: &mut [u64; 2]) -> usize
         out[i / 8] |= u64::from(b) << ((i % 8) * 8);
     }
     name.len().div_ceil(8)
-}
-
-/// Publish `(name, send_cap)` to svcmgr via `PUBLISH_ENDPOINT`. `publish_cap`
-/// MUST carry `svcmgr_labels::PUBLISH_AUTHORITY` in its token (init mints
-/// such caps locally from the un-tokened source it owns on svcmgr's service
-/// endpoint). Returns `true` on `svcmgr_errors::SUCCESS`.
-fn svcmgr_publish(publish_cap: u32, name: &[u8], send_cap: u32, ipc_buf: *mut u64) -> bool
-{
-    if publish_cap == 0 || send_cap == 0 || name.is_empty() || name.len() > 16
-    {
-        return false;
-    }
-    let mut words = [0u64; 2];
-    let word_count = pack_svc_name(name, &mut words);
-
-    let mut builder =
-        IpcMessage::builder(svcmgr_labels::PUBLISH_ENDPOINT | ((name.len() as u64) << 16))
-            .cap(send_cap);
-    for (i, &w) in words.iter().take(word_count).enumerate()
-    {
-        builder = builder.word(i, w);
-    }
-    let request = builder.build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(publish_cap, &request, ipc_buf) };
-    matches!(reply, Ok(r) if r.label == ipc::svcmgr_errors::SUCCESS)
-}
-
-/// Phase 3 sub-step: hand devmgr a least-privilege
-/// `/services/drivers/` subtree cap so it can lazily walk + spawn
-/// on-disk driver binaries (today: the per-arch RTC).
-///
-/// Walks `system_root_cap` to `/services/drivers/` at `LOOKUP | READ`
-/// rights, then sends `devmgr_labels::SET_DRIVERS_DIR` on a fresh
-/// `INIT_BIND_AUTHORITY`-tokened copy of `devmgr_registry_ep` (only
-/// init holds this verb bit; the `REGISTRY_QUERY_AUTHORITY`-only copy
-/// published to svcmgr cannot send this label).
-///
-/// devmgr's handler is ack-only: it stashes the cap and replies
-/// SUCCESS immediately. No driver walk or spawn happens in the
-/// handshake's blocking window — those fire lazily on the first
-/// `QUERY_RTC_DEVICE`. Init is not in the critical path of any
-/// driver spawn.
-///
-/// Best-effort: any failure (walk fails, devmgr replies a non-SUCCESS
-/// code, transport error) is logged and Phase 3 continues. The
-/// system boots without a wallclock; timed sees `NO_DEVICE` and
-/// degrades to its no-RTC path.
-fn set_drivers_dir_on_devmgr(devmgr_registry_ep: u32, system_root_cap: u32, ipc_buf: *mut u64)
-{
-    if devmgr_registry_ep == 0 || system_root_cap == 0
-    {
-        log("phase 3: SET_DRIVERS_DIR skipped (no devmgr or no system root)");
-        return;
-    }
-
-    // Attenuated rights: only what devmgr needs to walk into a
-    // subdirectory and read file contents. Visibility-gating bits are
-    // intentionally omitted; the namespace server intersects per hop.
-    let rights = u64::from(namespace_protocol::rights::LOOKUP | namespace_protocol::rights::READ);
-    let Some(drivers_dir) =
-        walk::walk_to_dir(system_root_cap, b"/services/drivers", rights, ipc_buf)
-    else
-    {
-        log("phase 3: SET_DRIVERS_DIR walk to /services/drivers failed; RTC unavailable");
-        return;
-    };
-
-    // `ipc::ipc_call` requires SEND+GRANT on the endpoint cap when the
-    // message carries caps (`drivers_dir` here); use
-    // `RIGHTS_SEND_GRANT`. The `devmgr.registry` cap init publishes for
-    // other services to look up deliberately omits the GRANT bit so
-    // client callers cannot transfer caps in queries; init's own
-    // privileged copy includes it for this single transfer.
-    let Ok(init_bind_ep) = syscall::cap_derive_token(
-        devmgr_registry_ep,
-        syscall::RIGHTS_SEND_GRANT,
-        ipc::devmgr_labels::INIT_BIND_AUTHORITY,
-    )
-    else
-    {
-        log("phase 3: SET_DRIVERS_DIR INIT_BIND_AUTHORITY derive failed; RTC unavailable");
-        let _ = syscall::cap_delete(drivers_dir);
-        return;
-    };
-
-    let msg = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .cap(drivers_dir)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let result = unsafe { ipc::ipc_call(init_bind_ep, &msg, ipc_buf) };
-    let _ = syscall::cap_delete(init_bind_ep);
-
-    match result
-    {
-        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS =>
-        {
-            // Kernel transferred `drivers_dir` to devmgr; nothing
-            // for init to clean up.
-            log("phase 3: SET_DRIVERS_DIR handshake ok");
-        }
-        Ok(_reply) =>
-        {
-            // Devmgr replied an error after the kernel transferred
-            // the cap. Per the SET_DRIVERS_DIR contract, devmgr's
-            // error paths release the delivered cap themselves.
-            log("phase 3: SET_DRIVERS_DIR rejected; RTC unavailable");
-        }
-        Err(_) =>
-        {
-            // ipc_call returned before the kernel committed the
-            // transfer; the source slot still owns `drivers_dir`
-            // and must be released.
-            let _ = syscall::cap_delete(drivers_dir);
-            log("phase 3: SET_DRIVERS_DIR ipc_call error; RTC unavailable");
-        }
-    }
 }

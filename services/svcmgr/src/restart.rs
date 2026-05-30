@@ -359,11 +359,11 @@ fn restart_process(
     // declares `seed = ...` gets those seeds re-resolved from the registry
     // by name, in declaration order — byte-for-byte the positional set
     // first launch delivered (see `definitions::launch::launch`). Otherwise
-    // fall back to the registration-time bundle caps (init-bootstrapped
-    // services that registered caps over `REGISTER_SERVICE`). The two
-    // sources are disjoint in practice: recipe-launched services carry
-    // seeds and no bundle; init-registered services carry a bundle and no
-    // seeds. Each cap is freshly derived so the child owns its own copy.
+    // fall back to the stored bundle caps. In practice the fallback is
+    // empty: recipe-launched services carry seeds and no bundle, and the
+    // init-endowed substrate is delivered with only a thread cap (no
+    // bundle) — so this arm yields nothing for them. Each cap is freshly
+    // derived so the child owns its own copy.
     let restart_caps: Vec<u32> = match recipe
     {
         Some(r) if !r.seed.is_empty() => resolve_seeds(&r.seed, svc.name_str(), registry),

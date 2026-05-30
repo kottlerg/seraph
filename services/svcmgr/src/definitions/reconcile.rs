@@ -3,9 +3,9 @@
 
 // svcmgr/src/definitions/reconcile.rs
 
-//! Post-handover reconciliation between init's `REGISTER_SERVICE`
-//! announcements and the on-disk `/config/svcmgr/services/` recipe
-//! set.
+//! Post-handover reconciliation between the substrate registrations init
+//! delivers in the handover endowment and the on-disk
+//! `/config/svcmgr/services/` recipe set.
 //!
 //! Three outcomes per `.svc` file:
 //!
@@ -32,10 +32,10 @@ use crate::service::{
     MAX_SERVICES, POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry,
 };
 
-/// Entry in init's pending-registration table populated by
-/// `REGISTER_SERVICE`. Each entry pairs a service name with the
-/// thread cap svcmgr will bind death-notification on once the
-/// matching `.svc` definition is found.
+/// Entry in svcmgr's pending-registration table populated from init's
+/// handover endowment (one substrate `SUBSTRATE` round each). Each entry
+/// pairs a service name with the thread cap svcmgr will bind
+/// death-notification on once the matching `.svc` definition is found.
 pub struct PendingRegistration
 {
     pub name: [u8; 32],
@@ -196,8 +196,8 @@ fn handle_definition(
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
 )
 {
-    // Match against pending registrations from init's
-    // REGISTER_SERVICE pass.
+    // Match against pending registrations parked from init's
+    // handover endowment.
     if let Some(slot) = pending
         .iter_mut()
         .take(pending_count)

@@ -42,17 +42,20 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    the role to the arch-specific Seraph root GPT type-GUID), pull the seed
    `system_root_cap` via `GET_SYSTEM_ROOT_CAP`, then launch real-logd from
    `/services/logd` and hand off the master log endpoint via `HANDOVER_PULL`.
-3. **Handover** — spawn svcmgr and endow it; publish the well-known caps
-   init still owns the sources for (`rootfs.root`, `svcmgr`,
-   `devmgr.registry`); register every init-bootstrapped substrate service
-   with svcmgr via `REGISTER_SERVICE`; signal `HANDOVER_COMPLETE`; hand
-   init's own kernel objects + reclaimable Frame caps to procmgr via
-   `REGISTER_INIT_TEARDOWN`; call `sys_thread_exit`. Procmgr's death-EQ
-   observer then runs the reap path. The non-bootstrap services svcmgr
-   then launches itself — `timed` and `pwrmgr` (providers), the staged
-   test harnesses — and publishes their names; the per-arch RTC chip
-   driver is devmgr-spawned during enumeration and resolved by timed via
-   `QUERY_RTC_DEVICE`.
+3. **Handover** — load svcmgr and serve it the handover endowment over
+   the bootstrap-round protocol: its own endpoints, the publish-role
+   source caps (`rootfs.root` SEND, devmgr-registry `SEND|GRANT` source),
+   and one `(name, thread_cap)` round per init-bootstrapped substrate
+   service. Signal `HANDOVER_COMPLETE`; hand init's own kernel objects +
+   reclaimable Frame caps to procmgr via `REGISTER_INIT_TEARDOWN`; call
+   `sys_thread_exit`. Procmgr's death-EQ observer then runs the reap path.
+   svcmgr publishes the well-known names it now owns (`rootfs.root`,
+   `svcmgr`, `devmgr.registry`) and installs devmgr's `/services/drivers/`
+   cap via `SET_DRIVERS_DIR` from the endowment; it then launches the
+   non-bootstrap services itself — `timed` and `pwrmgr` (providers), the
+   staged test harnesses — and publishes their names. The per-arch RTC
+   chip driver is devmgr-spawned lazily after `SET_DRIVERS_DIR` and
+   resolved by timed via `QUERY_RTC_DEVICE`.
 
 See [docs/bootstrap.md](docs/bootstrap.md) for the authoritative
 stage-by-stage enumeration, source citations, and per-stage capability

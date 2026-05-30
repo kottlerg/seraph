@@ -149,12 +149,13 @@ devmgr loads driver binaries from one of two places:
   `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (today: the per-arch RTC) live
   at `/services/drivers/<chip>` and are loaded via
-  `procmgr_labels::CREATE_FROM_FILE`. After vfsd-mount, init walks
-  `system_root_cap` to `/services/drivers/` and hands devmgr that
+  `procmgr_labels::CREATE_FROM_FILE`. Post-handover, svcmgr walks its
+  universal root to `/services/drivers/` and hands devmgr that
   subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by
-  `INIT_BIND_AUTHORITY`; sent at `LOOKUP | READ` rights only — devmgr
+  `DRIVERS_DIR_AUTHORITY`, minted from the devmgr-registry source init
+  endows svcmgr with; sent at `LOOKUP | READ` rights only — devmgr
   cannot reach outside the drivers subtree). Devmgr replies SUCCESS
-  before doing any spawn work so init never blocks on driver
+  before doing any spawn work so svcmgr never blocks on driver
   bring-up; the actual walk + `CREATE_FROM_FILE` + bootstrap rounds
   run after `ipc_reply` and before devmgr returns to its next
   `ipc_recv`. The spawn is at-most-once per boot; on failure

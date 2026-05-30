@@ -17,14 +17,15 @@
 //! [`reconcile_and_launch`]:
 //!
 //! 1. Scan [`SERVICES_DIR`] and parse every `.svc` into a [`Definition`].
-//! 2. Reconcile against the pending-registration table init populated
-//!    via [`crate::svcmgr_labels::REGISTER_SERVICE`]:
-//!    - **Defined AND registered**: bind death-notification on the
-//!      registered thread cap and store the parsed `Definition` on
-//!      the `ServiceEntry` for restart use.
+//! 2. Reconcile against the pending-registration table
+//!    [`crate::service::bootstrap_caps`] populated from init's handover
+//!    endowment (one substrate `(name, thread_cap)` round each):
+//!    - **Defined AND parked**: bind death-notification on the endowed
+//!      thread cap and store the parsed `Definition` on the
+//!      `ServiceEntry` for restart use.
 //!    - **Defined only**: launch the service via [`launch::launch`].
-//!    - **Registered without definition**: log a hard error and
-//!      refuse to bind — svcmgr has no recipe to restart it.
+//!    - **Parked without definition**: log a hard error and refuse to
+//!      bind — svcmgr has no recipe to restart it.
 //!
 //! After reconciliation the supervision loop proceeds as today.
 

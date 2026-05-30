@@ -166,8 +166,8 @@ fn main() -> !
 
     // On-disk driver state. The RTC binary lives on the rootfs at
     // `/services/drivers/<chip>`, not in the boot bundle — RTC is not
-    // bootstrap-essential. Init delivers a `LOOKUP | READ`-attenuated
-    // `/services/drivers/` subtree cap via `SET_DRIVERS_DIR` post-vfsd;
+    // bootstrap-essential. svcmgr delivers a `LOOKUP | READ`-attenuated
+    // `/services/drivers/` subtree cap via `SET_DRIVERS_DIR` at handover;
     // the walk + `CREATE_FROM_FILE` + bootstrap rounds run inside the
     // `SET_DRIVERS_DIR` handler, after its `ipc_reply` and before the
     // next `ipc_recv` (a nested ipc_call inside a request-handler
@@ -353,7 +353,7 @@ fn main() -> !
             }
             ipc::devmgr_labels::SET_DRIVERS_DIR =>
             {
-                // Init-only handshake. Reply SUCCESS *first* so init
+                // svcmgr-only handshake. Reply SUCCESS *first* so svcmgr
                 // unblocks immediately and is never in the critical
                 // path of driver work. THEN do the walk + spawn between
                 // ipc_reply and the next ipc_recv: a nested ipc_call
@@ -364,15 +364,15 @@ fn main() -> !
                 let mut should_attempt_spawn = false;
                 // Capability hygiene: every gate-fail arm below must
                 // release any cap the kernel transferred into devmgr's
-                // CSpace before replying. Even though today only init
+                // CSpace before replying. Even though today only svcmgr
                 // can plausibly send this label, leaving an authority
                 // cap dangling in a server's slot is a category of bug
                 // the rest of the codebase consistently avoids.
                 let delivered_cap = msg.caps().first().copied();
-                if token & ipc::devmgr_labels::INIT_BIND_AUTHORITY == 0
+                if token & ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY == 0
                 {
                     std::os::seraph::log!(
-                        "SET_DRIVERS_DIR rejected: token lacks INIT_BIND_AUTHORITY"
+                        "SET_DRIVERS_DIR rejected: token lacks DRIVERS_DIR_AUTHORITY"
                     );
                     if let Some(c) = delivered_cap
                     {
@@ -1505,9 +1505,9 @@ fn spawn_framebuffer(
 /// Spawn the platform RTC driver — CMOS on x86-64, goldfish-RTC on
 /// RISC-V — from the on-disk rootfs. Called from inside the
 /// `SET_DRIVERS_DIR` registry-loop arm, after the handler's
-/// `ipc_reply` to init and before devmgr's next `ipc_recv`. The
+/// `ipc_reply` to svcmgr and before devmgr's next `ipc_recv`. The
 /// `drivers_dir_cap` argument is the `LOOKUP | READ`-attenuated
-/// `/services/drivers/` subtree cap init delivered in the handshake
+/// `/services/drivers/` subtree cap svcmgr delivered in the handshake
 /// (namespace-protocol rights, not kernel cap rights). Walks
 /// `drivers_dir_cap` to the per-arch chip name, carves the per-arch
 /// hardware authority, and goes through the file-cap branch of
@@ -1533,7 +1533,7 @@ fn spawn_rtc_from_disk(
     #[cfg(target_arch = "riscv64")]
     const RTC_NAME: &[u8] = b"goldfish-rtc";
 
-    // Request READ rights on the resolved file node. The cap init handed
+    // Request READ rights on the resolved file node. The cap svcmgr handed
     // us in SET_DRIVERS_DIR is already attenuated to LOOKUP|READ at the
     // /services/drivers/ subtree, so the namespace server will only ever
     // mint a file cap with at most those bits set.

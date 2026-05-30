@@ -5,13 +5,16 @@ init exits; runs for the lifetime of the system. svcmgr is a
 self-driven process: it spawns into an already-running system (root
 mounted; vfsd, procmgr, devmgr, fs/block drivers up), reads service
 *definitions* from `/config/svcmgr/services/`, and reconciles them
-against init's pending `REGISTER_SERVICE` announcements to either
-supervise the running instance or launch a fresh one.
+against the substrate registrations init delivers in the handover
+endowment to either supervise the running instance or launch a fresh
+one.
 
-svcmgr also owns the system-wide discovery registry: well-known names
-(`rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`, `svcmgr`, …) are
-published into it by init at Phase 3, and consumers resolve them via
-`QUERY_ENDPOINT` (or transparently through their `.svc` `seed = ...`
+svcmgr also owns the system-wide discovery registry: it publishes the
+well-known names it owns (`rootfs.root`, `svcmgr`, `devmgr.registry`,
+and each provider's `provides` names like `pwrmgr.shutdown` / `timed`)
+into the registry itself — from the source caps init endows it with at
+handover, and from each provider's launch — and consumers resolve them
+via `QUERY_ENDPOINT` (or transparently through their `.svc` `seed = ...`
 line at launch time).
 
 svcmgr also holds raw process-creation syscall capabilities as a
@@ -44,7 +47,7 @@ svcmgr/
 │   │   └── reconcile.rs           # PendingRegistration + reconcile_and_launch
 │   └── arch/                      # Per-arch halt() entry
 └── docs/
-    ├── ipc-interface.md           # v3 REGISTER_SERVICE, HANDOVER_COMPLETE,
+    ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
     │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT
     ├── restart-protocol.md        # Death detection, restart sequencing,
     │                              # shared spawn primitives, criticality
@@ -56,17 +59,20 @@ svcmgr/
 
 ## Responsibilities
 
-- **Service registration** — accept the v3 `REGISTER_SERVICE` wire
-  (name + thread_cap) from init for services init bootstrapped
-  before svcmgr existed. Recipes (binary, argv, env, restart policy,
-  criticality, namespace shape, seed names) live on disk, not on the
-  wire — see [docs/service-definitions.md](docs/service-definitions.md).
+- **Handover endowment** — drain init's bootstrap-round endowment in
+  [`service::bootstrap_caps`](src/service.rs): svcmgr's own endpoints,
+  the publish-role source caps (`rootfs.root` SEND, devmgr-registry
+  `SEND|GRANT` source), and one `(name, thread_cap)` round per substrate
+  service init bootstrapped before svcmgr existed. Recipes (binary,
+  argv, env, restart policy, criticality, namespace shape, seed names)
+  live on disk, not on the wire — see
+  [docs/service-definitions.md](docs/service-definitions.md).
 - **Reconciliation** — at `HANDOVER_COMPLETE` scan
   `/config/svcmgr/services/`, parse each `<name>.svc`, and pair it
-  with the pending-registration table. Three outcomes: `bind only`
-  (registered AND defined), `launching` (defined only),
-  `registered without definition` (registered AND no recipe → hard
-  error).
+  with the pending-registration table (substrate pairs parked from the
+  endowment). Three outcomes: `bind only` (parked AND defined),
+  `launching` (defined only), `registered without definition`
+  (parked AND no recipe → hard error).
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)
   (`walk_and_create_from_file`, `apply_namespace_policy`,
@@ -82,9 +88,11 @@ svcmgr/
   `RestartRecipe` — so a restart reproduces the first-launch surfaces.
   Whether a service restarts is decided by its `restart` policy + budget
   alone; `critical` is orthogonal (see graceful shutdown below).
-- **Discovery registry** — `PUBLISH_ENDPOINT` (init's
-  `PUBLISH_AUTHORITY`-tokened SENDs) and `QUERY_ENDPOINT`
-  (per-process SEND seeded into `ProcessInfo.service_registry_cap`).
+- **Discovery registry** — svcmgr publishes the names it owns directly
+  (internal `registry.publish`); `PUBLISH_ENDPOINT` is the external
+  write-API (reserved for a future devmgr publisher) and `QUERY_ENDPOINT`
+  the lookup, served on the per-process SEND seeded into
+  `ProcessInfo.service_registry_cap`.
 - **Graceful shutdown** — when a `critical = yes` service is permanently
   down (restart not attempted or budget exhausted), resolve
   `ipc::published_names::PWRMGR_SHUTDOWN` from the registry and issue
@@ -136,16 +144,19 @@ Namespace forms: `none | universal | subtree:<path>:<rights>`.
 
 ## Cap publication
 
-Init publishes the following well-known names into svcmgr's registry
-during Phase 3 (post-#21). Names are FS-driver- and platform-agnostic
-by design; consumers resolve them through their `.svc` `seed = ...`
-lines or via direct `QUERY_ENDPOINT` calls.
+svcmgr publishes every well-known name into its own registry — there is
+no init-side `PUBLISH_ENDPOINT` traffic. The first three are published in
+`main()` right after the endowment is drained, from the source caps init
+endows svcmgr with at handover; the provider names are published on each
+provider's launch path. Names are FS-driver- and platform-agnostic by
+design; consumers resolve them through their `.svc` `seed = ...` lines or
+via direct `QUERY_ENDPOINT` calls.
 
 | Name | Source | Cap shape |
 |---|---|---|
-| `rootfs.root` | init Phase 3 | tokened SEND on the root filesystem's namespace endpoint at its root directory |
-| `svcmgr` | init Phase 3 | un-tokened SEND on svcmgr's own service endpoint |
-| `devmgr.registry` | init Phase 3 | `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry endpoint |
+| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | tokened SEND on the root filesystem's namespace endpoint at its root directory |
+| `svcmgr` | svcmgr (its own service ep) | un-tokened SEND on svcmgr's own service endpoint |
+| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry endpoint |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
 | `timed` | svcmgr (`timed.svc` provider) | SEND on timed's service endpoint |

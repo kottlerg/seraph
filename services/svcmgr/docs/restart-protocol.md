@@ -68,8 +68,8 @@ permanent loss*.
      [`apply_namespace_policy`](#shared-spawn-primitives).
    * Serve the restart bootstrap round, re-resolving the recipe's
      `seed` names from the discovery registry in declaration order (or,
-     for init-registered services with no seeds, re-deriving the
-     registration bundle caps).
+     for init-endowed services with no seeds, re-deriving the stored
+     bundle caps).
    * Rebind death-notification on the new thread cap using the same
      correlator so subsequent crashes route back to the same entry.
    * On success: increment `restart_count`, return `Restarted`.
@@ -129,7 +129,7 @@ at reconciliation time. The fixed-size fields live on `ServiceEntry`:
 | `restart_policy` | `restart = never \| on_failure \| always` |
 | `system_critical` | `critical = yes \| no` |
 | `ns_policy_kind` / `ns_subtree_path` / `ns_subtree_rights` | `namespace = ...` |
-| `thread_cap` | v3 `REGISTER_SERVICE` cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
+| `thread_cap` | endowment thread cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
 | `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
 | `module_cap` | `0` (no module-loaded services in the post-#21 model) |
 
@@ -157,7 +157,7 @@ back with the same surfaces first launch gave it.
 svcmgr only supervises top-level services. Drivers (cmos / virtio-rtc
 / future block / net) are supervised by devmgr. Filesystem drivers
 (fatfs / future ext / btrfs) are supervised by vfsd. None of those
-flow through `REGISTER_SERVICE`.
+flow through the handover endowment.
 
 The set of services svcmgr currently supervises (per the shipped
 `.svc` files):
@@ -172,15 +172,15 @@ every boot.
 |---|---|---|---|
 | `svctest` | svcmgr-launched (test-tier, staged) | `never` | `no` |
 | `crasher` | svcmgr-launched (test-tier, staged) | `always` | `no` |
-| `memmgr` | init-registered (bind only) | `never` | `yes` |
-| `procmgr` | init-registered (bind only) | `never` | `yes` |
-| `devmgr` | init-registered (bind only) | `never` | `yes` |
-| `vfsd` | init-registered (bind only) | `never` | `yes` |
-| `logd` | init-registered (bind only) | `never` | `yes` |
+| `memmgr` | init-endowed (bind only) | `never` | `yes` |
+| `procmgr` | init-endowed (bind only) | `never` | `yes` |
+| `devmgr` | init-endowed (bind only) | `never` | `yes` |
+| `vfsd` | init-endowed (bind only) | `never` | `yes` |
+| `logd` | init-endowed (bind only) | `never` | `yes` |
 | `timed` | svcmgr-launched (provider) | `on_failure` | `no` |
 | `pwrmgr` | svcmgr-launched (provider) | `on_failure` | `no` |
 
-Restart paths for the init-registered (bind-only) substrate set are
+Restart paths for the init-endowed (bind-only) substrate set are
 aspirational today: each was spawned with arch-/firmware-authority caps
 that init holds and svcmgr cannot re-mint (memmgr/procmgr via raw
 `cap_create_*` syscalls; devmgr/vfsd/logd with one-shot authority

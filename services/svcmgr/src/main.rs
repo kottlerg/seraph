@@ -48,91 +48,6 @@ const REGISTRY_CAPACITY: usize = 8;
 /// than its `ServiceEntry` table can hold.
 const MAX_PENDING_REGISTRATIONS: usize = MAX_SERVICES;
 
-// ── Registration handling ──────────────────────────────────────────────────
-
-/// Handle a `REGISTER_SERVICE` IPC message under the v3 wire (post-#21).
-///
-/// The recipe lives on disk at `/config/svcmgr/services/<name>.svc`; the
-/// wire conveys only what cannot be on disk:
-///
-/// * `word 0`: `SVCMGR_LABELS_VERSION` handshake.
-/// * `word 1`: `name_len` (byte length of the service name).
-/// * `words 2..`: `name` bytes.
-/// * `caps[0]`: thread cap for death-notification binding.
-///
-/// The thread cap is parked in `pending`; binding to the deaths event
-/// queue is deferred to [`definitions::reconcile::reconcile_and_launch`]
-/// after handover, where each pending entry is paired with its `.svc`
-/// definition (or reported as a configuration error if no recipe
-/// exists). See [`ipc::svcmgr_labels::REGISTER_SERVICE`] for the
-/// authoritative spec.
-fn handle_register(
-    msg: &IpcMessage,
-    pending: &mut [PendingRegistration],
-    pending_count: &mut usize,
-) -> u64
-{
-    // IPC delivers caps into svcmgr's CSpace before dispatch — every
-    // reject path must release the delivered thread cap, otherwise a
-    // hostile or buggy registrar can leak a cap per request over
-    // svcmgr's lifetime. The v3 wire only carries one cap; release
-    // every trailing slot the caller may have delivered defensively.
-    let recv_caps = msg.caps();
-    let delivered_cap = recv_caps.first().copied().unwrap_or(0);
-    for &extra in recv_caps.iter().skip(1)
-    {
-        if extra != 0
-        {
-            let _ = syscall::cap_delete(extra);
-        }
-    }
-    let reject = |code: u64| -> u64 {
-        if delivered_cap != 0
-        {
-            let _ = syscall::cap_delete(delivered_cap);
-        }
-        code
-    };
-
-    if msg.word(0) != u64::from(ipc::SVCMGR_LABELS_VERSION)
-    {
-        return reject(ipc::svcmgr_errors::LABEL_VERSION_MISMATCH);
-    }
-
-    let name_len = msg.word(1) as usize;
-    if name_len == 0 || name_len > 32
-    {
-        return reject(ipc::svcmgr_errors::INVALID_NAME);
-    }
-
-    if *pending_count >= MAX_PENDING_REGISTRATIONS
-    {
-        return reject(ipc::svcmgr_errors::TABLE_FULL);
-    }
-
-    if delivered_cap == 0
-    {
-        return ipc::svcmgr_errors::INSUFFICIENT_CAPS;
-    }
-
-    // delivered_cap transfers into PendingRegistration from here.
-    let mut name = [0u8; 32];
-    read_packed_bytes(msg, 2, name_len, &mut name);
-
-    let idx = *pending_count;
-    pending[idx] = PendingRegistration {
-        name,
-        name_len: name_len as u8,
-        thread_cap: delivered_cap,
-        consumed: false,
-    };
-    *pending_count += 1;
-
-    std::os::seraph::log!("registered: {}", pending[idx].name_str());
-
-    ipc::svcmgr_errors::SUCCESS
-}
-
 /// Read a short name packed into IPC data words starting at `first_word`.
 fn read_tail_name_from_msg(
     msg: &IpcMessage,
@@ -189,7 +104,19 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(caps) = bootstrap_caps(info, ipc_buf)
+    // State is created before the endowment is drained so `bootstrap_caps`
+    // can park the substrate `(name, thread_cap)` pairs directly in
+    // `state.pending`; `HANDOVER_COMPLETE` reconciles them later.
+    let mut state = SvcmgrState {
+        services: [const { ServiceEntry::empty() }; MAX_SERVICES],
+        recipes: [const { None }; MAX_SERVICES],
+        service_count: 0,
+        pending: [const { PendingRegistration::empty() }; MAX_PENDING_REGISTRATIONS],
+        pending_count: 0,
+        registry: registry::Registry::new(),
+    };
+
+    let Some(caps) = bootstrap_caps(info, ipc_buf, &mut state.pending, &mut state.pending_count)
     else
     {
         syscall::thread_exit();
@@ -261,16 +188,14 @@ fn main() -> !
         halt_loop();
     }
 
-    let mut state = SvcmgrState {
-        services: [const { ServiceEntry::empty() }; MAX_SERVICES],
-        recipes: [const { None }; MAX_SERVICES],
-        service_count: 0,
-        pending: [const { PendingRegistration::empty() }; MAX_PENDING_REGISTRATIONS],
-        pending_count: 0,
-        registry: registry::Registry::new(),
-    };
+    // Publish the well-known names svcmgr owns and hand devmgr its
+    // drivers dir — both from the handover endowment caps — before the
+    // event loop, so they are in place before `HANDOVER_COMPLETE` drives
+    // reconciliation and any launched consumer resolves them.
+    publish_well_known(&mut state.registry, &caps);
+    install_drivers_dir(&caps, ipc_buf);
 
-    std::os::seraph::log!("waiting for registrations");
+    std::os::seraph::log!("endowed; waiting for handover");
 
     event_loop(
         info,
@@ -283,6 +208,157 @@ fn main() -> !
     );
 }
 
+/// Publish the well-known names svcmgr owns into its own discovery
+/// registry, from the caps init endowed at handover. These are internal
+/// `registry.publish` calls (no `PUBLISH_AUTHORITY` token — svcmgr owns
+/// the registry). Each provider's own `provides` names are published
+/// separately on the launch path ([`definitions::launch`]).
+fn publish_well_known(
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    caps: &service::SvcmgrCaps,
+)
+{
+    // rootfs.root — SEND on the root filesystem's namespace endpoint,
+    // endowed pre-derived by init. Published as-is; `registry_lookup_derived`
+    // re-derives a SEND per consumer and the token survives.
+    if caps.rootfs_root != 0
+    {
+        if registry
+            .publish(ipc::published_names::ROOTFS_ROOT, caps.rootfs_root)
+            .is_err()
+        {
+            std::os::seraph::log!("publish rootfs.root failed");
+            let _ = syscall::cap_delete(caps.rootfs_root);
+        }
+    }
+    else
+    {
+        std::os::seraph::log!("no rootfs.root source cap; not published");
+    }
+
+    // svcmgr — SEND on svcmgr's own service endpoint (crasher seeds it).
+    match syscall::cap_derive(caps.service_ep, syscall::RIGHTS_SEND)
+    {
+        Ok(send) =>
+        {
+            if registry
+                .publish(ipc::published_names::SVCMGR, send)
+                .is_err()
+            {
+                std::os::seraph::log!("publish svcmgr failed");
+                let _ = syscall::cap_delete(send);
+            }
+        }
+        Err(_) => std::os::seraph::log!("derive svcmgr SEND failed"),
+    }
+
+    // devmgr.registry — `REGISTRY_QUERY_AUTHORITY`-tokened SEND minted from
+    // the endowed token-0 `SEND|GRANT` source. The token bit rides through
+    // `registry_lookup_derived`'s plain `cap_derive` to consumers.
+    if caps.devmgr_registry != 0
+    {
+        match syscall::cap_derive_token(
+            caps.devmgr_registry,
+            syscall::RIGHTS_SEND,
+            ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+        )
+        {
+            Ok(send) =>
+            {
+                if registry
+                    .publish(ipc::published_names::DEVMGR_REGISTRY, send)
+                    .is_err()
+                {
+                    std::os::seraph::log!("publish devmgr.registry failed");
+                    let _ = syscall::cap_delete(send);
+                }
+            }
+            Err(_) => std::os::seraph::log!("derive devmgr.registry cap failed"),
+        }
+    }
+    else
+    {
+        std::os::seraph::log!("no devmgr.registry source cap; not published");
+    }
+}
+
+/// Hand devmgr a `LOOKUP | READ`-attenuated `/services/drivers/` subtree
+/// cap via `SET_DRIVERS_DIR`, so devmgr can lazily walk + spawn its on-disk
+/// driver binaries (today: the per-arch RTC). svcmgr walks its universal
+/// root for the dir and mints a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from
+/// the endowed devmgr-registry source.
+///
+/// Best-effort: any failure leaves devmgr without a drivers dir, so timed
+/// sees `NO_DEVICE` on its first `QUERY_RTC_DEVICE` and degrades to its
+/// no-RTC path; the rest of startup proceeds.
+fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
+{
+    if caps.devmgr_registry == 0
+    {
+        std::os::seraph::log!("SET_DRIVERS_DIR skipped: no devmgr registry source");
+        return;
+    }
+    let root_cap = std::os::seraph::root_dir_cap();
+    if root_cap == 0
+    {
+        std::os::seraph::log!("SET_DRIVERS_DIR skipped: no root_dir_cap");
+        return;
+    }
+
+    // Attenuated rights: only what devmgr needs to walk into the subtree
+    // and read driver-binary contents; the namespace server intersects
+    // per hop.
+    let rights = u64::from(namespace_protocol::rights::LOOKUP | namespace_protocol::rights::READ);
+    let drivers_dir =
+        match std::os::seraph::namespace_lookup_dir(root_cap, "/services/drivers", rights)
+        {
+            Ok(c) => c,
+            Err(e) =>
+            {
+                std::os::seraph::log!("SET_DRIVERS_DIR: walk /services/drivers failed: {e}");
+                return;
+            }
+        };
+
+    // `RIGHTS_SEND_GRANT` (not bare SEND): SET_DRIVERS_DIR transfers the
+    // dir cap, and the IPC kernel requires the GRANT bit to move caps.
+    let Ok(bind_ep) = syscall::cap_derive_token(
+        caps.devmgr_registry,
+        syscall::RIGHTS_SEND_GRANT,
+        ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY,
+    )
+    else
+    {
+        std::os::seraph::log!("SET_DRIVERS_DIR: DRIVERS_DIR_AUTHORITY derive failed");
+        let _ = syscall::cap_delete(drivers_dir);
+        return;
+    };
+
+    let msg = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .cap(drivers_dir)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let result = unsafe { ipc::ipc_call(bind_ep, &msg, ipc_buf) };
+    let _ = syscall::cap_delete(bind_ep);
+
+    match result
+    {
+        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS =>
+        {
+            std::os::seraph::log!("SET_DRIVERS_DIR ok");
+        }
+        Ok(_) => std::os::seraph::log!("SET_DRIVERS_DIR rejected; RTC unavailable"),
+        Err(_) =>
+        {
+            // Transport error before the kernel committed the transfer;
+            // the source slot still owns `drivers_dir`.
+            let _ = syscall::cap_delete(drivers_dir);
+            std::os::seraph::log!("SET_DRIVERS_DIR ipc error; RTC unavailable");
+        }
+    }
+}
+
 /// `WaitSet` token for svcmgr's service endpoint.
 const WS_TOKEN_SERVICE: u64 = 0;
 /// `WaitSet` token for svcmgr's shared death event queue.
@@ -292,13 +368,14 @@ const WS_TOKEN_DEATHS: u64 = 1;
 /// registry, and handover flag. Held across the event loop for the
 /// lifetime of the process.
 ///
-/// `pending` is populated by [`handle_register`] as init announces
-/// each running service it spawned during Phase 3. On
-/// `HANDOVER_COMPLETE` [`definitions::reconcile::reconcile_and_launch`]
-/// pairs each entry with a `.svc` recipe, binds death-notification,
-/// and populates `services`. After reconciliation `pending` is
-/// effectively read-only — the unconsumed entries persist as logged
-/// configuration errors but are not re-used.
+/// `pending` is populated by [`service::bootstrap_caps`] as it drains
+/// init's handover endowment (one substrate `(name, thread_cap)` round
+/// each). On `HANDOVER_COMPLETE`
+/// [`definitions::reconcile::reconcile_and_launch`] pairs each entry with
+/// a `.svc` recipe, binds death-notification, and populates `services`.
+/// After reconciliation `pending` is effectively read-only — the
+/// unconsumed entries persist as logged configuration errors but are not
+/// re-used.
 pub struct SvcmgrState
 {
     pub services: [ServiceEntry; MAX_SERVICES],
@@ -366,13 +443,6 @@ fn dispatch_ipc(service_ep: u32, state: &mut SvcmgrState, ctx: &restart::Restart
     let opcode = msg.label & 0xFFFF;
     match opcode
     {
-        svcmgr_labels::REGISTER_SERVICE =>
-        {
-            let result = handle_register(&msg, &mut state.pending, &mut state.pending_count);
-            let reply = IpcMessage::new(result);
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        }
         svcmgr_labels::HANDOVER_COMPLETE =>
         {
             // Reply BEFORE reconciliation: init's call returns and it

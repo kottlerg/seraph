@@ -42,7 +42,8 @@ init                  no_std; receives the full initial CSpace
    │
    ├── delegates per-service capability subsets via IPC
    │
-   ├── registers all started services with svcmgr
+   ├── endows svcmgr (its endpoints + publish-source caps + substrate
+   │     thread caps) over the bootstrap-round handover endowment
    │
    └── exits
        │
@@ -124,27 +125,30 @@ Distribution"). svcmgr is configured with the universal
 `system_root_cap` so it can read `/config/svcmgr/services/*.svc`
 post-handover.
 
-Init then publishes the well-known caps it still owns the sources for
-into svcmgr's discovery registry (`ipc::published_names::ROOTFS_ROOT`,
-`SVCMGR`, `DEVMGR_REGISTRY`) via `svcmgr_labels::PUBLISH_ENDPOINT` with
-a `PUBLISH_AUTHORITY`-tokened `RIGHTS_SEND_GRANT` cap, and registers
-every foundational substrate service it bootstrapped with svcmgr via the
-v3 `REGISTER_SERVICE` wire (name + thread cap): `memmgr`, `procmgr`,
-`devmgr`, `vfsd`, `logd`. The names of svcmgr-launched providers
-(`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are published by svcmgr's
-own provider path, not by init. Recipes for all svcmgr-supervised
-services live on disk at `/config/svcmgr/services/<name>.svc`, not on
-the wire — see
+Init then serves svcmgr the **handover endowment** over the
+bootstrap-round protocol: round 1 carries svcmgr's own endpoints plus the
+publish-role source caps (a `SEND` on the root filesystem namespace
+endpoint and a token-0 `SEND|GRANT` source on devmgr's registry
+endpoint); each subsequent round carries one `(name, thread_cap)` pair for
+a substrate service init bootstrapped (`memmgr`, `procmgr`, `devmgr`,
+`vfsd`, `logd`). svcmgr — not init — then publishes the well-known names
+it owns into its own registry (`ipc::published_names::ROOTFS_ROOT`,
+`SVCMGR`, `DEVMGR_REGISTRY`, minted from the endowed sources) and installs
+devmgr's `/services/drivers/` cap via `devmgr_labels::SET_DRIVERS_DIR`.
+The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are
+published by svcmgr's provider path on each provider's launch. Recipes for
+all svcmgr-supervised services live on disk at
+`/config/svcmgr/services/<name>.svc`, not on the wire — see
 [`services/svcmgr/docs/service-definitions.md`](../services/svcmgr/docs/service-definitions.md).
 
 ### Init reap
 
 After Phase 3 signals `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
-replies immediately, then scans `/config/svcmgr/services/` and launches any
-defined-but-unregistered service it finds — on a normal boot every default
-service is init-registered bind-only, so none launch here; the launch path
-fires only for staged test recipes such as `svctest.svc` / `usertest.svc`
-and the co-staged `crasher.svc` restart fixture), init signs over its own
+replies immediately, then scans `/config/svcmgr/services/`, binds the
+endowed substrate bind-only, and launches every defined-but-unparked
+service — the `timed` and `pwrmgr` providers on a normal boot, plus any
+staged test recipes such as `svctest.svc` / `usertest.svc` and the
+co-staged `crasher.svc` restart fixture), init signs over its own
 kernel-object caps
 (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and
 every reclaimable Frame cap it solely owns (ELF segments, user stack

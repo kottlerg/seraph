@@ -100,86 +100,85 @@ directly without init involvement.
   state via `HANDOVER_PULL`; init-logd self-terminates on the
   final reply. See
   [`../../logd/docs/handover-protocol.md`](../../logd/docs/handover-protocol.md)
-  (`../src/main.rs:866` → `service::create_and_start_logd` at
-  `../src/service.rs:1595`).
+  (`../src/main.rs:866` → `service::create_and_start_logd` in
+  `../src/service.rs`).
 - Closing marker: `"phase 2 bootstrap complete"`
   (`../src/main.rs:881`).
 
 ### Handover
 
-`service::phase3_svcmgr_handover` (`../src/service.rs:1311`, called
-from `../src/main.rs`) brings up the remaining bootstrap services,
-transfers the system-wide service registry to svcmgr, publishes the
-well-known caps, registers init-bootstrapped services with svcmgr,
-and hands init's own kernel objects to procmgr for reaping.
+`service::phase3_svcmgr_handover` (in `../src/service.rs`, called
+from `../src/main.rs`) loads svcmgr, serves it the handover endowment,
+signals handover, and hands init's own kernel objects to procmgr for
+reaping. init no longer publishes well-known caps, registers services,
+or talks to devmgr — svcmgr does all of that from the endowment.
 
 - Spawn svcmgr from `/services/svcmgr` with the `Universal` namespace
-  policy and serve its bootstrap round
-  (`../src/service.rs:1340` → `create_svcmgr_from_file` at
-  `../src/service.rs:1135`; `setup_and_start_svcmgr` at
-  `../src/service.rs:1213`).
-- Walk `system_root_cap` to `/services/drivers/` at `LOOKUP | READ`
-  rights and hand devmgr the resulting subtree cap via
-  `devmgr_labels::SET_DRIVERS_DIR`, on an
-  `INIT_BIND_AUTHORITY`-tokened copy of `devmgr_registry_ep`. Devmgr
-  replies SUCCESS *before* doing any spawn work, then walks the
-  per-arch RTC name from that subtree and spawns the driver between
-  its `ipc_reply` and next `ipc_recv` (procmgr `CREATE_FROM_FILE` —
-  the binary lives on the rootfs, not in the boot bundle).
-  Best-effort: the handshake is non-fatal, and any failure
-  (walk fails, devmgr replies non-SUCCESS) leaves the system without
-  a wallclock — timed degrades to `WALL_CLOCK_UNAVAILABLE`.
-  (`set_drivers_dir_on_devmgr` in `../src/service.rs`.)
+  policy (`create_svcmgr_from_file`), then serve it the handover
+  endowment over the bootstrap-round protocol (`endow_svcmgr`):
+  - **Round 1 (`CAPS`)** — svcmgr's service + bootstrap endpoints
+    (full rights), plus the publish-role source caps: a `SEND` on the
+    root filesystem's namespace endpoint (svcmgr publishes it as
+    `rootfs.root`) and a token-0 `SEND|GRANT` source on
+    `devmgr_registry_ep` (svcmgr mints the `REGISTRY_QUERY_AUTHORITY`
+    `devmgr.registry` publish cap and the `DRIVERS_DIR_AUTHORITY`
+    `SET_DRIVERS_DIR` cap from it). `data[1]` carries
+    `SVCMGR_LABELS_VERSION`. An absent source rides as a zero slot.
+  - **Rounds 2..N (`SUBSTRATE`)** — one `(name, thread_cap)` per
+    init-bootstrapped substrate service: `memmgr`, `procmgr`, `devmgr`,
+    `vfsd`, `logd`. svcmgr parks them and binds death-notification on
+    each at reconciliation, pairing against the matching `<name>.svc`
+    recipe in `/config/svcmgr/services/` — see
+    [`../../svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md).
+- After draining the endowment, **svcmgr** (not init) publishes the
+  well-known names it owns into its own registry and installs devmgr's
+  drivers dir:
+  - `rootfs.root` — the endowed `SEND` on the root filesystem's
+    namespace endpoint (FS-driver-agnostic by design).
+  - `svcmgr` — un-tokened SEND on svcmgr's own service endpoint.
+  - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-tokened SEND minted
+    from the endowed devmgr-registry source. Consumers needing to
+    resolve a device driver themselves (`programs/fb-charset` →
+    `QUERY_FRAMEBUFFER_DEVICE`; timed and pwrmgr → their devmgr queries;
+    future: any non-init caller of devmgr's discovery surface) seed this
+    name. The token bit survives svcmgr's plain `cap_derive` in
+    `registry_lookup_derived`.
+  - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
+    `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
+    cap on a `DRIVERS_DIR_AUTHORITY`-tokened copy of the
+    devmgr-registry source. Devmgr replies SUCCESS *before* any spawn
+    work, then walks the per-arch RTC name and spawns the driver between
+    its `ipc_reply` and next `ipc_recv` (procmgr `CREATE_FROM_FILE` —
+    the binary lives on the rootfs, not in the boot bundle). Best-effort:
+    a failure leaves the system without a wallclock — timed degrades to
+    `WALL_CLOCK_UNAVAILABLE`.
+
+  `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by
+  svcmgr's provider path on each provider's launch. Name constants are
+  centralised in `ipc::published_names`.
 - The wallclock chain and pwrmgr are **not** spawned by init. `timed`
   and `pwrmgr` are svcmgr-launched providers (`timed.svc` / `pwrmgr.svc`),
   brought up post-handover; each resolves its authority from devmgr at
   startup (`QUERY_RTC_DEVICE` for timed; `QUERY_ACPI_TABLE` +
   `QUERY_SHUTDOWN_DEVICE` for pwrmgr). The RTC chip driver (cmos-rtc on
   x86-64, goldfish-rtc on RISC-V) is spawned by devmgr from
-  `/services/drivers/<chip>` after the `SET_DRIVERS_DIR` handshake above,
-  also not by init.
-- Derive a `PUBLISH_AUTHORITY`-tokened `RIGHTS_SEND_GRANT` cap on
-  svcmgr's service endpoint and publish the three well-known names init
-  still owns the sources for, via `PUBLISH_ENDPOINT`
-  (`phase3_svcmgr_handover` in `../src/service.rs`):
-  - `rootfs.root` — tokened SEND on the root filesystem's
-    namespace endpoint at its root directory (FS-driver-agnostic
-    by design).
-  - `svcmgr` — un-tokened SEND on svcmgr's own service endpoint.
-  - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-tokened SEND
-    on devmgr's registry endpoint. Consumers needing to resolve a
-    device driver themselves (`programs/fb-charset` →
-    `QUERY_FRAMEBUFFER_DEVICE`; timed and pwrmgr → their devmgr
-    queries; future: any non-init caller of devmgr's discovery surface)
-    seed this name. The token bit survives svcmgr's plain `cap_derive`
-    in `registry_lookup_derived`.
-
-  `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by
-  svcmgr's provider path, not by init. Name constants are centralised in
-  `ipc::published_names`.
-- Register each init-bootstrapped substrate service with svcmgr via the
-  v3 `REGISTER_SERVICE` wire (name + thread cap; `register_service`
-  helper in `../src/service.rs`). Registration set: `memmgr`, `procmgr`,
-  `devmgr`, `vfsd`, `logd`. svcmgr reconciles each against the matching
-  `<name>.svc` recipe in `/config/svcmgr/services/` and binds
-  death-notification; the non-bootstrap services (`timed`, `pwrmgr`,
-  staged harnesses) it launches itself from their recipes — see
-  [`../../svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md).
-- Signal `HANDOVER_COMPLETE` (`../src/service.rs:1552`). svcmgr
-  scans `/config/svcmgr/services/` and launches any
-  defined-but-unregistered services from disk.
+  `/services/drivers/<chip>` after svcmgr's `SET_DRIVERS_DIR` handshake.
+- Signal `HANDOVER_COMPLETE`. svcmgr scans `/config/svcmgr/services/`,
+  reconciles the parked substrate against the recipes, and launches any
+  defined-but-unparked services (`timed`, `pwrmgr`, staged harnesses)
+  from disk.
 - Hand init's kernel-object caps (`AddressSpace`, `CSpace`, main
   `Thread`, init-logd `Thread`) and every reclaimable Frame cap it
   solely owns (ELF segments, user stack pages, `InitInfo` pages, the
   bootloader/bundle reclaim ranges, the AP-trampoline frame, and the
   boot-module ELF sources) to procmgr via
-  `REGISTER_INIT_TEARDOWN` (`../src/service.rs:1565` →
-  `handoff_to_procmgr_reap` at `../src/service.rs:1586`). IPC
+  `REGISTER_INIT_TEARDOWN` (`handoff_to_procmgr_reap` in
+  `../src/service.rs`). IPC
   cap-transfer MOVES the caps, so they leave init's CSpace. The
   usable-RAM range (already memmgr's), the firmware read-only caps,
   and init's own bootstrap backing (arena-forwarded to memmgr at
   `finalize_memmgr`) are excluded.
-- Call `sys_thread_exit` (`../src/service.rs:1574`). Procmgr's
+- Call `sys_thread_exit`. Procmgr's
   death-EQ observer (bound on init's main thread with
   `INIT_REAP_CORRELATOR`) fires and runs
   [`init_reap::run_reap`](../../procmgr/src/init_reap.rs): both
@@ -237,8 +236,7 @@ svcmgr if needed.
 | Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Frame caps; root `IoPortRange` (x86-64) / `SbiControl` (RISC-V) via the terminal `SVCMGR_BUNDLE` round — the hardware + shutdown authority devmgr brokers to drivers and to pwrmgr |
 | Raw bootstrap | vfsd | `SEED_AUTHORITY`-tokened SEND on vfsd's own service endpoint (gates `GET_SYSTEM_ROOT_CAP`); the un-tokened service-endpoint SEND init holds is used for the un-gated MOUNT call. Init keeps no FS access of its own. |
 | Root mount | logd | RECV on the master log endpoint, one-shot SEND for `HANDOVER_PULL`, `DEATH_EQ_AUTHORITY`-tokened SEND on procmgr, arch serial authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V) |
-| Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; in the bootstrap round, full-rights SEND on its own service endpoint and on the local svcmgr-bootstrap endpoint |
-| Handover (publish) | svcmgr registry | `rootfs.root`, `svcmgr`, `devmgr.registry` named caps (init no longer publishes `pwrmgr.*` / `timed` — svcmgr's provider path does) |
+| Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — round 1 (`CAPS`): full-rights SEND on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a token-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry` publish cap and the `SET_DRIVERS_DIR` cap); rounds 2..N (`SUBSTRATE`): one `(name, thread_cap)` per substrate service for death-supervision binding. svcmgr publishes all well-known names itself and sends `SET_DRIVERS_DIR` from these sources; init no longer publishes or talks to devmgr. |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Frame cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline frame, boot-module ELF sources) |
 
 ---

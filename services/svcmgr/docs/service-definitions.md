@@ -1,8 +1,9 @@
 # `.svc` Service Definitions
 
 Authoritative spec for the `/config/svcmgr/services/<name>.svc` files
-svcmgr scans at `HANDOVER_COMPLETE` to reconcile init's pending
-`REGISTER_SERVICE` announcements with the on-disk service recipes.
+svcmgr scans at `HANDOVER_COMPLETE` to reconcile the substrate
+registrations init delivers in the handover endowment with the on-disk
+service recipes.
 
 ## Authority
 
@@ -15,9 +16,10 @@ recipe travels on the wire.
 
 * Directory: `/config/svcmgr/services/`
 * Filename: `<name>.svc`. The `<name>` portion is the key under which
-  the service registers with svcmgr (the `name` field of the
-  [v3 `REGISTER_SERVICE`](ipc-interface.md#label-1-register_service)
-  wire). Filenames are ASCII; case-sensitive `.svc` suffix.
+  the service is reconciled with svcmgr — for a substrate service, the
+  `name` carried in its
+  [handover-endowment `SUBSTRATE` round](ipc-interface.md#handover-endowment-bootstrap-rounds).
+  Filenames are ASCII; case-sensitive `.svc` suffix.
 * Files are shipped via `rootfs/config/svcmgr/services/` and installed
   into the sysroot by xtask's recursive `install_rootfs` copy. No
   build-system change is required to add a new recipe — drop the
@@ -185,21 +187,21 @@ provides = pwrmgr.shutdown:auth pwrmgr.deny:deny
 ## Reconciliation
 
 At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
-`<name>.svc`, and reconciles against init's pending-registration
-table:
+`<name>.svc`, and reconciles against the pending-registration table
+(substrate pairs parked from the handover endowment):
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind death-notification on the registered thread cap; record a `ServiceEntry` with the parsed recipe for restart use. |
+| present | present | **bind only** — bind death-notification on the endowed thread cap; record a `ServiceEntry` with the parsed recipe for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, `START_PROCESS`, serve the seed bootstrap round. If `restart != never`, bind death-notification and record a `ServiceEntry`. |
-| absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; a registration without a matching `.svc` is a configuration error. |
+| absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 ## Relevant Design Documents
 
 | Document | Content |
 |---|---|
 | [README.md](../README.md) | Component scope, responsibilities, restart policy |
-| [ipc-interface.md](ipc-interface.md) | v3 `REGISTER_SERVICE` wire, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` |
+| [ipc-interface.md](ipc-interface.md) | handover endowment, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` |
 | [restart-protocol.md](restart-protocol.md) | Restart sequencing, shared spawn primitives, criticality semantics |
 | [shared/ipc/src/lib.rs](../../../shared/ipc/src/lib.rs) | `published_names` constants, `svcmgr_labels::*`, `svcmgr_errors::*` |
 

@@ -679,9 +679,11 @@ unsafe fn kernel_entry_post_rebase(
             // INIT_INFO_MAX_PAGES = 4 the upper bound is order 2 (4 pages).
             let info_order = info_pages.next_power_of_two().trailing_zeros() as usize;
             let block_pages = 1usize << info_order;
-            let block_phys = allocator
-                .alloc(info_order)
-                .unwrap_or_else(|| fatal("Phase 9: out of memory for InitInfo"));
+            // The block was reserved from the pristine buddy at Phase 7
+            // (worst-case INIT_INFO_MAX_PAGES, one contiguous extent); the
+            // post-drain buddy is empty. info_pages <= INIT_INFO_MAX_PAGES is
+            // enforced above, so it fits within the reserved extent.
+            let block_phys = cap::take_init_info_block_phys();
             let block_virt = mm::paging::phys_to_virt(block_phys) as *mut u8;
             // SAFETY: just allocated; valid for block_pages * PAGE_SIZE bytes.
             unsafe {
@@ -705,11 +707,10 @@ unsafe fn kernel_entry_post_rebase(
                 page_ptrs[pg] = virt;
                 page_phys[pg] = phys;
             }
-            // The buddy has no per-page free path here; the unused tail
-            // of the contiguous extent (at most `block_pages - info_pages`
-            // pages, ≤ 2 pages with `INIT_INFO_MAX_PAGES = 4`) stays
-            // allocated to the kernel. Small but constant waste; reclaim
-            // via a future cap-mint path if it becomes material.
+            // The block was reserved at the worst-case INIT_INFO_MAX_PAGES;
+            // the unused tail (INIT_INFO_MAX_PAGES - info_pages pages, ≤ 3)
+            // stays kernel-held — neither mapped nor minted below. Small but
+            // constant waste, bounded and accounted as kernel_reserved.
             let _ = block_pages;
             let info_base = page_ptrs[0];
 
@@ -778,10 +779,9 @@ unsafe fn kernel_entry_post_rebase(
             for pg in 0..info_pages
             {
                 let phys = page_phys[pg];
-                // No register_owned_range: these pages came from the
-                // buddy via `alloc.alloc(0)` above, so they are already
-                // in `total_pages`. `register_owned_range` would
-                // double-count.
+                // No register_owned_range: these pages came from the buddy
+                // (reserved at Phase 7), so they are already in `total_pages`.
+                // `register_owned_range` would double-count.
                 let fo_nn = cap::mint_phase7_body(FrameObject {
                     header: KernelObjectHeader::with_ancestor(
                         ObjectType::Frame,
@@ -854,8 +854,9 @@ unsafe fn kernel_entry_post_rebase(
             let mut base_slot: u32 = 0;
             for i in 0..STACK_PAGES
             {
-                let phys = crate::mm::with_frame_allocator(|alloc| alloc.alloc(0))
-                    .unwrap_or_else(|| fatal("Phase 9: cannot allocate init stack page"));
+                // Page reserved from the pristine buddy at Phase 7; the
+                // post-drain buddy is empty.
+                let phys = cap::init_stack_phys(i);
 
                 // Zero the page through the kernel direct map.
                 // SAFETY: phys_to_virt yields a valid kernel virtual address.
@@ -873,10 +874,9 @@ unsafe fn kernel_entry_post_rebase(
                 }
 
                 // Mint a reclaimable Frame cap covering this page.
-                // No register_owned_range: the page came from the
-                // buddy via `alloc.alloc(0)` above, so it is already
-                // in `total_pages`. `register_owned_range` would
-                // double-count.
+                // No register_owned_range: the page came from the buddy
+                // (reserved at Phase 7), so it is already in `total_pages`.
+                // `register_owned_range` would double-count.
                 let fo_nn = cap::mint_phase7_body(FrameObject {
                     header: KernelObjectHeader::with_ancestor(
                         ObjectType::Frame,

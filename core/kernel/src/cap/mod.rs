@@ -704,17 +704,92 @@ pub(crate) fn kernel_reserve_pages() -> usize
     POOL_SEED_PAGES + buddy_residue_pages()
 }
 
+/// Number of init user-stack pages reserved ahead of the drain.
+#[cfg(not(test))]
+const INIT_STACK_PAGES: usize = crate::mm::address_space::INIT_STACK_PAGES;
+
+/// Order of the pre-reserved `InitInfo` block: the smallest `2^order` that
+/// covers [`init_protocol::INIT_INFO_MAX_PAGES`] pages. The descriptor array's
+/// true page count is unknown until the drain has run (it scales with the
+/// drained-block count), so the bounded maximum is reserved as one contiguous
+/// extent — preserving the single-allocation backing the cross-page descriptor
+/// slice relies on.
+#[cfg(not(test))]
+const INIT_INFO_RESERVE_ORDER: usize = {
+    let mut o = 0;
+    while (1usize << o) < init_protocol::INIT_INFO_MAX_PAGES
+    {
+        o += 1;
+    }
+    o
+};
+
+/// Physical base of the `InitInfo` block reserved from the pristine buddy in
+/// [`drain_and_install_seed`], consumed once at Phase 9 via
+/// [`take_init_info_block_phys`].
+#[cfg(not(test))]
+static INIT_INFO_BLOCK_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Physical bases of init's user-stack pages ([`INIT_STACK_PAGES`] order-0
+/// frames) reserved from the pristine buddy in [`drain_and_install_seed`],
+/// consumed once each at Phase 9 via [`init_stack_phys`].
+#[cfg(not(test))]
+static INIT_STACK_PHYS: [core::sync::atomic::AtomicU64; INIT_STACK_PAGES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; INIT_STACK_PAGES];
+
+/// Reserve, from the pristine buddy, every page Phase 9 consumes after the
+/// Phase-7 drain: the `InitInfo` block (one contiguous
+/// `2^INIT_INFO_RESERVE_ORDER`-page extent) and init's user-stack pages. Done
+/// before the drain so the drain can take 100% of the remainder, driving the
+/// post-handoff buddy free count to 0.
+#[cfg(not(test))]
+fn reserve_init_backing()
+{
+    crate::mm::with_frame_allocator(|alloc| {
+        let info = alloc
+            .alloc(INIT_INFO_RESERVE_ORDER)
+            .unwrap_or_else(|| crate::fatal("Phase 7: out of memory reserving InitInfo block"));
+        INIT_INFO_BLOCK_PHYS.store(info, core::sync::atomic::Ordering::Relaxed);
+        for slot in &INIT_STACK_PHYS
+        {
+            let page = alloc
+                .alloc(0)
+                .unwrap_or_else(|| crate::fatal("Phase 7: out of memory reserving init stack"));
+            slot.store(page, core::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// Physical base of the pre-reserved `InitInfo` block. Single consumption:
+/// returns the base and clears the slot.
+#[cfg(not(test))]
+pub(crate) fn take_init_info_block_phys() -> u64
+{
+    let phys = INIT_INFO_BLOCK_PHYS.swap(0, core::sync::atomic::Ordering::Relaxed);
+    debug_assert!(phys != 0, "InitInfo block consumed before it was reserved");
+    phys
+}
+
+/// Physical base of init's pre-reserved user-stack page `i` (`i <
+/// INIT_STACK_PAGES`). Single consumption per page.
+#[cfg(not(test))]
+pub(crate) fn init_stack_phys(i: usize) -> u64
+{
+    let phys = INIT_STACK_PHYS[i].swap(0, core::sync::atomic::Ordering::Relaxed);
+    debug_assert!(phys != 0, "init stack page consumed before it was reserved");
+    phys
+}
+
 /// Drain user-cap RAM from the buddy and install [`SEED_FRAME`] over the
 /// largest drained block, reserving its first [`SEED_RESERVE_BYTES`] for
 /// kernel-internal cap-identity storage. Returns the per-block
 /// (base, size) records ready for `populate_cspace` to mint Frame caps.
 ///
-/// After the drain completes, seeds [`crate::mm::kernel_pt_pool`] with
-/// most of the kernel reserve so the steady-state PT-growth path is
-/// cap-backed (sourced from a pool minted out of [`kernel_reserve_pages`])
-/// rather than drawing directly from the buddy. A small residue stays in
-/// the buddy for the `dealloc_object` → `free_range` reverse path's
-/// ledger arithmetic.
+/// Before draining, reserves init's Phase-9 backing (the `InitInfo` block and
+/// user stack) and seeds [`crate::mm::kernel_pt_pool`] from the pristine buddy,
+/// so the drain takes 100% of the remaining RAM and the post-handoff buddy is
+/// empty. The pool is the cap-backed source for intermediate page-table frames
+/// on the kernel-side Phase-9 bootstrap maps.
 ///
 /// MUST run before any [`mint_phase7_body`] / [`boot_retype_aspace`] /
 /// [`boot_retype_cspace`] / `boot_retype_thread_slab` call against the
@@ -736,9 +811,21 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         unsafe { &mut *core::ptr::addr_of_mut!(DRAIN_ORDER_BUF) };
     let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     let reserve_pages = kernel_reserve_pages();
+
+    // Reserve every page Phase 9 consumes after the drain — init's InitInfo
+    // block and user stack — plus the kernel PT-frame pool, from the pristine
+    // buddy first. With those out of the way the drain takes 100% of the
+    // remainder, so the post-handoff buddy free count reaches 0. The PT pool
+    // must also be live before Phase 9's first bootstrap map, which holds.
+    reserve_init_backing();
+    // SAFETY: single-threaded Phase 7; kernel_pt_pool::init locks internally.
+    unsafe {
+        crate::mm::kernel_pt_pool::init(POOL_SEED_PAGES);
+    }
+
     crate::kprintln!(
         "Phase 7: kernel reserve {} pages = pool {} + residue {} \
-         (idle {}×{} + slack {})",
+         (idle {}×{} + slack {}); draining all remaining RAM to userspace",
         reserve_pages,
         POOL_SEED_PAGES,
         buddy_residue_pages(),
@@ -747,7 +834,7 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         BOOT_RESIDUE_SLACK_PAGES,
     );
     let block_count =
-        crate::mm::with_frame_allocator(|alloc| alloc.drain_for_usercaps(reserve_pages, order_buf));
+        crate::mm::with_frame_allocator(|alloc| alloc.drain_for_usercaps(0, order_buf));
 
     if block_count == 0
     {
@@ -798,24 +885,8 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         SEED_RESERVE_BYTES / 1024,
     );
 
-    // Seed the kernel PT-frame pool from the residual buddy carve. This
-    // must run before any `map_user_page` consumer (the first is Phase
-    // 9's init bootstrap). The pool is the cap-backed source for
-    // intermediate page-table frames; the buddy keeps only
-    // `buddy_residue_pages()` for the idle stacks and the
-    // `dealloc_object` → `free_range` ledger arithmetic.
-    // SAFETY: single-threaded Phase 7; drain has populated the buddy
-    // free list with up to `kernel_reserve_pages()`; kernel_pt_pool::init
-    // takes its own LOCK internally.
-    unsafe {
-        crate::mm::kernel_pt_pool::init(POOL_SEED_PAGES);
-    }
     let pool_remaining = crate::mm::kernel_pt_pool::remaining_pages();
-    crate::kprintln!(
-        "kernel_pt_pool: {} pages installed (buddy residue {})",
-        pool_remaining,
-        buddy_residue_pages(),
-    );
+    crate::kprintln!("kernel_pt_pool: {pool_remaining} pages installed");
 
     block_count
 }

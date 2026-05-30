@@ -207,8 +207,8 @@ pub fn ram_accounted_identity_phase(_: &Caps)
     }
 
     let (system_ram, kernel_reserved, pool_total) = terms;
-    let residual = system_ram.saturating_sub(kernel_reserved.saturating_add(pool_total));
+    let residual = system_ram.abs_diff(kernel_reserved.saturating_add(pool_total));
     panic!(
-        "ram_accounted_identity FAILED: system_ram={system_ram} != kernel_reserved={kernel_reserved} + pool_total={pool_total} (residual={residual} bytes of leaked dark memory)"
+        "ram_accounted_identity FAILED: system_ram={system_ram} != kernel_reserved={kernel_reserved} + pool_total={pool_total} (residual={residual} bytes; leaked or double-counted)"
     );
 }

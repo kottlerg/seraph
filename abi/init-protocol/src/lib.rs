@@ -90,7 +90,7 @@ pub const INIT_MAX_NAMED_MODULES: usize = 12;
 /// (which now includes the boot-module name table) followed by the
 /// variable-length [`CapDescriptor`] array. Sized so the full
 /// [`INIT_INFO_MAX_PAGES`] fit between this address and the init stack's guard
-/// page (`INIT_STACK_TOP - INIT_STACK_PAGES - 1` = `0x7FFF_FFFF_9000`): the
+/// page (`0x7FFF_FFFF_9000`): the
 /// region occupies `[0x7FFF_FFFF_5000, 0x7FFF_FFFF_9000)`, the guard sits at
 /// `0x7FFF_FFFF_9000`, and the stack runs `[0x7FFF_FFFF_A000, INIT_STACK_TOP)`.
 /// A larger array (3+ pages) must not collide with the stack — that silently

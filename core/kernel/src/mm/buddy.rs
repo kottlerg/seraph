@@ -140,7 +140,7 @@ impl BuddyAllocator
             return;
         }
 
-        // Count pages being added so TotalFrames can be reported later.
+        // Track the running total of installed pages this allocator manages.
         self.total_pages += ((end - start) / PAGE_SIZE as u64) as usize;
 
         let mut cursor = start;

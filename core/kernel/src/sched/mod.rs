@@ -1486,7 +1486,7 @@ pub unsafe fn migrate_ready_thread(
 /// ordering: a stale value just biases victim selection slightly.
 static LOAD_BALANCE_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Difference in `CPU_LOAD` above which the balancer will attempt a pull.
+/// Difference in per-CPU `current_load` above which the balancer will attempt a pull.
 /// Set high enough that two-CPU steady states (e.g. 1 thread + 2 threads)
 /// do not thrash; low enough that severe imbalances converge in a few
 /// ticks.
@@ -1494,7 +1494,7 @@ const LOAD_BALANCE_IMBALANCE_THRESHOLD: u32 = 2;
 
 /// Per-tick load-balance step. Runs on every CPU's `timer_tick`.
 ///
-/// Hot path cost: 1 Relaxed atomic load (own `CPU_LOAD`) plus either
+/// Hot path cost: 1 Relaxed atomic load (own `current_load`) plus either
 /// (idle CPU) one Relaxed load per remote CPU to find the heaviest, or
 /// (loaded CPU) 1 Relaxed atomic increment (tick counter) + 1 Relaxed
 /// load (random victim). Scheduler locks are acquired only when the

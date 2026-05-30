@@ -322,10 +322,9 @@ impl AddressSpace
         self.pt_lock();
 
         // Intermediate page table frames are drawn from
-        // `mm::kernel_pt_pool` (seeded once at Phase 7 from the residual
-        // `kernel_reserve_pages()` buddy carve). No buddy lock is taken on
-        // this path; the shootdown below is the only inter-CPU
-        // synchronisation cost.
+        // `mm::kernel_pt_pool` (seeded once at Phase 7 with `POOL_SEED_PAGES`
+        // from the pristine buddy). No buddy lock is taken on this path; the
+        // shootdown below is the only inter-CPU synchronisation cost.
         // SAFETY: contract passed to caller; root_virt is valid; virt is
         // in user range; phys is a valid 4 KiB-aligned physical address.
         let result = unsafe { map_user_page(self.root_virt, virt, phys, flags) };

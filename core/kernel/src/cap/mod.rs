@@ -652,56 +652,29 @@ static mut DRAIN_RAM_BLOCKS: [RamBlock; MAX_DRAIN_BLOCKS] = [(0u64, 0u64); MAX_D
 /// fatals at the first failed bootstrap map.
 #[cfg(not(test))]
 pub(crate) const POOL_SEED_PAGES: usize = 64;
-/// Buddy-residue headroom held above the per-CPU idle-stack demand.
-///
-/// `drain_for_usercaps` keeps the smallest `reserve_pages` of the buddy as
-/// the residue, so the residue always begins with the memory map's order-0/1
-/// rounding fragments — pages that cannot back an order-2 (`KERNEL_STACK_PAGES`
-/// = 4-page) idle-stack allocation. This constant is the floor that absorbs
-/// those fragments (observed ~150 pages across the usable regions on both
-/// arches) plus the Phase-9 `InitInfo`/init-stack draw and the
-/// `dealloc_object` → `free_range` reverse-ledger arithmetic, so the
-/// per-CPU term in [`buddy_residue_pages`] is what actually extends the
-/// residue into the order-2-and-larger blocks `sched::init` splits for idle
-/// stacks. 384 is the value the pre-`cpu_count` fixed reserve used and is
-/// validated to leave the residue order-2-capable; it has comfortable margin
-/// over the observed fragment total.
-#[cfg(not(test))]
-const BOOT_RESIDUE_SLACK_PAGES: usize = 384;
 
-/// Pages kept in the buddy after Phase 7, sized to the live boot CPU count:
+/// Pages the kernel permanently reserves from RAM at Phase 7, as the sum of its
+/// named contributors:
 ///
-/// 1. **Phase 8 idle-thread kernel stacks**: `sched::init` allocates one
-///    `KERNEL_STACK_PAGES`-page stack per online CPU — `cpu_count ×
-///    KERNEL_STACK_PAGES` pages, each an order-2 block split out of the
-///    residue.
-/// 2. **`BOOT_RESIDUE_SLACK_PAGES`**: the fragment floor + Phase-9 + reverse
-///    path (see that constant).
+/// 1. `POOL_SEED_PAGES` — the kernel PT-frame pool seed.
+/// 2. Idle-thread kernel stacks — `cpu_count × KERNEL_STACK_PAGES`, one stack
+///    per online CPU (pre-allocated in Phase 4 from the pristine buddy).
+/// 3. The `InitInfo` block — worst-case `INIT_INFO_MAX_PAGES`.
+/// 4. Init's user stack — `INIT_STACK_PAGES`.
+/// 5. The SEED arena — `SEED_RESERVE_BYTES`.
 ///
-/// `sched::CPU_COUNT` is published in Phase 4 (`sched::init_storage`), before
-/// both the Phase-7 drain and the Phase-9 guard that call this. Sizing to the
-/// live count rather than `MAX_CPUS` removes the `MAX_CPUS × KERNEL_STACK_PAGES`
-/// (= 2048) worst case: the residue tracks the actual CPU count, so a 512-CPU
-/// boot keeps ~2.4 K pages of order-2-capable blocks for its idle stacks while
-/// a 4-CPU boot keeps ~400. PT growth does not touch the buddy on this path.
-/// The post-handoff buddy free count never exceeds this (Phases 8–9 only draw
-/// pages out of it), which the Phase-9 boot guard asserts.
-#[cfg(not(test))]
-pub(crate) fn buddy_residue_pages() -> usize
-{
-    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    cpu_count * crate::sched::KERNEL_STACK_PAGES + BOOT_RESIDUE_SLACK_PAGES
-}
-
-/// Total fixed reserve carved from the buddy at Phase 7:
-/// `POOL_SEED_PAGES + buddy_residue_pages()`. Pages not carved here are minted
-/// as userspace RAM Frame caps and route to memmgr's pool, so the size only
-/// moves pages between reserve and pool; the all-RAM-accounted identity is
-/// unaffected (`kernel_reserved` is computed as the complement at Phase 9).
+/// Every other page of RAM is drained for userspace and routes to memmgr's
+/// pool, leaving the post-handoff buddy fully empty. This value is a Phase-7
+/// diagnostic; the authoritative `kernel_reserved` is the complement of the
+/// `owns_memory` ledger computed at Phase 9 (`main.rs`).
 #[cfg(not(test))]
 pub(crate) fn kernel_reserve_pages() -> usize
 {
-    POOL_SEED_PAGES + buddy_residue_pages()
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let idle_stacks = cpu_count * crate::sched::KERNEL_STACK_PAGES;
+    let init_info = 1usize << INIT_INFO_RESERVE_ORDER;
+    let seed = (SEED_RESERVE_BYTES / crate::mm::PAGE_SIZE as u64) as usize;
+    POOL_SEED_PAGES + idle_stacks + init_info + INIT_STACK_PAGES + seed
 }
 
 /// Number of init user-stack pages reserved ahead of the drain.
@@ -824,14 +797,15 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     }
 
     crate::kprintln!(
-        "Phase 7: kernel reserve {} pages = pool {} + residue {} \
-         (idle {}×{} + slack {}); draining all remaining RAM to userspace",
+        "Phase 7: kernel reserve {} pages = pool {} + idle {}×{} + initinfo {} + \
+         initstack {} + seed {} KiB; draining all remaining RAM to userspace",
         reserve_pages,
         POOL_SEED_PAGES,
-        buddy_residue_pages(),
         cpu_count,
         crate::sched::KERNEL_STACK_PAGES,
-        BOOT_RESIDUE_SLACK_PAGES,
+        1usize << INIT_INFO_RESERVE_ORDER,
+        INIT_STACK_PAGES,
+        SEED_RESERVE_BYTES / 1024,
     );
     let block_count =
         crate::mm::with_frame_allocator(|alloc| alloc.drain_for_usercaps(0, order_buf));

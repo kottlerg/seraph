@@ -18,17 +18,15 @@
 //! from the AS's own growth pool. The fallback is the safety net for the
 //! chunk-less case, not a routine path.
 //!
-//! Pages are seeded once at the end of Phase 7 from the residual
-//! `kernel_reserve_pages()` buddy carve, threaded onto an intrusive
+//! Pages are seeded once during Phase 7 — `POOL_SEED_PAGES` allocated from the
+//! pristine buddy before the user-cap drain — threaded onto an intrusive
 //! single-linked free list, and consumed without further buddy traffic.
 //!
 //! Backs the architectural invariant from `crate::kernel_entry`: PT
 //! frames for the `map_user_page` path trace to a single cap-managed
-//! surface (the seed of this pool, sourced from `kernel_reserve_pages()` at
-//! Phase 7). A small buddy residue stays behind for non-PT consumers
-//! (idle-thread kernel stacks, the `dealloc_object` → `free_range`
-//! reverse path); see `crate::cap::drain_and_install_seed` for the sizing
-//! rationale.
+//! surface (the seed of this pool). It is one of the kernel's named fixed
+//! reserves (see `crate::cap::kernel_reserve_pages`); every other page of RAM
+//! is drained for userspace, so the post-handoff buddy is left empty.
 //!
 //! The free list is intrusive: each free page's first 8 bytes (accessed
 //! via the direct physical map) hold the next-PA pointer, or 0 for the
@@ -70,9 +68,9 @@ fn release()
 
 /// Seed the pool with `seed_pages` 4 KiB frames pulled from the buddy.
 ///
-/// MUST run during Phase 7, after `drain_and_install_seed` finishes
-/// reserving `kernel_reserve_pages()` and before any `map_user_page`
-/// consumer fires (the first such consumer is Phase 9's init segment
+/// MUST run during Phase 7, from `drain_and_install_seed` before the user-cap
+/// drain (so the frames come from the pristine buddy) and before any
+/// `map_user_page` consumer fires (the first is Phase 9's init segment
 /// mapping). Fewer pages than requested may be installed if the buddy
 /// is genuinely exhausted; the caller diagnoses via `remaining_pages()`.
 ///

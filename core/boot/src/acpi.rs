@@ -53,6 +53,7 @@ pub(crate) const MADT_ENTRIES_OFF: usize = 44;
 // MADT entry types:
 const MADT_TYPE_LAPIC: u8 = 0; // x86-64: Processor Local APIC, length 8
 pub(crate) const MADT_TYPE_IOAPIC: u8 = 1;
+const MADT_TYPE_LOCAL_X2APIC: u8 = 9; // x86-64: Processor Local x2APIC, length 16
 const MADT_TYPE_RINTC: u8 = 0x18; // RISC-V INTC (MADT type 24), length 36
 pub(crate) const MADT_TYPE_PLIC: u8 = 0x1B; // RISC-V PLIC (MADT type 27)
 
@@ -197,7 +198,7 @@ pub unsafe fn parse_cpu_topology(rsdp_addr: u64, bsp_id: u32) -> (u32, u32, [u32
     (1, bsp_id, cpu_ids)
 }
 
-/// Walk MADT entries to collect CPU hardware IDs (LAPIC or RINTC).
+/// Walk MADT entries to collect CPU hardware IDs (LAPIC, x2APIC, or RINTC).
 ///
 /// Returns `(cpu_count, bsp_id, cpu_ids)`. The BSP is placed at index 0,
 /// APs fill indices `1..cpu_count` in MADT order. Entries beyond
@@ -232,6 +233,28 @@ fn parse_madt_topology(
                 //   off+4: flags(u32)  bit0=enabled  bit1=online-capable
                 let apic_id = u32::from(read_u8(table, off + 3));
                 let flags = read_u32(table, off + 4);
+                if (flags & 0x1 != 0) || (flags & 0x2 != 0)
+                {
+                    if all_count < MAX_CPUS
+                    {
+                        all_ids[all_count] = apic_id;
+                        all_count += 1;
+                    }
+                    else
+                    {
+                        truncated = true;
+                    }
+                }
+            }
+            MADT_TYPE_LOCAL_X2APIC if entry_len >= 16 =>
+            {
+                // Type 9 (Processor Local x2APIC), length 16:
+                //   off+0: type  off+1: length  off+2: reserved(2)
+                //   off+4: x2apic_id(u32)
+                //   off+8: flags(u32)  bit0=enabled  bit1=online-capable
+                //   off+12: acpi_proc_uid(u32)
+                let apic_id = read_u32(table, off + 4);
+                let flags = read_u32(table, off + 8);
                 if (flags & 0x1 != 0) || (flags & 0x2 != 0)
                 {
                     if all_count < MAX_CPUS

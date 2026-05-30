@@ -36,7 +36,6 @@ pub struct ServiceThreadCaps
     pub devmgr: u32,
     pub vfsd: u32,
     pub logd: u32,
-    pub timed: u32,
 }
 
 /// Per-spawn namespace-cap policy for [`configure_child_namespace`].
@@ -1318,7 +1317,7 @@ pub fn phase3_svcmgr_handover(
     devmgr_registry_ep: u32,
     system_root_cap: u32,
     rootfs_root_cap: u32,
-    mut thread_caps: ServiceThreadCaps,
+    thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
     mem_frame_reap_floor: u32,
@@ -1372,23 +1371,6 @@ pub fn phase3_svcmgr_handover(
     // on its first QUERY_RTC_DEVICE and degrade to its no-RTC path; the
     // rest of Phase 3 proceeds normally.
     set_drivers_dir_on_devmgr(devmgr_registry_ep, system_root_cap, ipc_buf);
-
-    // Wallclock chain: timed (init-spawned, svcmgr-published) consumes
-    // devmgr's QUERY_RTC_DEVICE for the per-arch RTC driver, which devmgr
-    // loads lazily from disk after the SET_DRIVERS_DIR handshake above.
-    // Failures are logged but do not abort phase 3 — svctest tolerates
-    // `SystemTime::now()` returning UNIX_EPOCH and exercises the live
-    // path only when the chain came up.
-    thread_caps.timed = bring_up_timed(
-        procmgr_ep,
-        bootstrap_ep,
-        svcmgr_service_ep,
-        devmgr_registry_ep,
-        system_root_cap,
-        init_self_cspace,
-        ipc_buf,
-    )
-    .unwrap_or(0);
 
     let pwrmgr_spawn = create_and_start_pwrmgr(
         info,
@@ -1534,7 +1516,6 @@ pub fn phase3_svcmgr_handover(
         (b"devmgr", thread_caps.devmgr),
         (b"vfsd", thread_caps.vfsd),
         (b"logd", thread_caps.logd),
-        (b"timed", thread_caps.timed),
         (b"pwrmgr", pwrmgr_thread_cap),
     ];
     for (name, thread_cap) in registrations
@@ -1931,7 +1912,7 @@ pub fn create_and_start_logd(
     Some(thread_cap)
 }
 
-// ── RTC + timed spawn pipeline ──────────────────────────────────────────────
+// ── svcmgr publish + drivers-dir handshake ──────────────────────────────────
 
 /// Pack a short ASCII name into IPC data words (`pack_name` shape matches
 /// `svcmgr::read_tail_name_from_msg`). Returns the word count used.
@@ -1969,178 +1950,6 @@ fn svcmgr_publish(publish_cap: u32, name: &[u8], send_cap: u32, ipc_buf: *mut u6
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(publish_cap, &request, ipc_buf) };
     matches!(reply, Ok(r) if r.label == ipc::svcmgr_errors::SUCCESS)
-}
-
-/// Common service-endpoint + RECV-derivation setup for a timed spawn.
-/// Init keeps the source slot to mint per-publish SENDs; the child
-/// receives a RECV-rights derivation.
-fn create_service_endpoint_pair() -> Option<(u32, u32)>
-{
-    let source = syscall::cap_create_endpoint(crate::endpoint_slab()).ok()?;
-    let Ok(recv_cap) = syscall::cap_derive(source, syscall::RIGHTS_RECEIVE)
-    else
-    {
-        let _ = syscall::cap_delete(source);
-        return None;
-    };
-    Some((source, recv_cap))
-}
-
-/// Walk + `CREATE_FROM_FILE` for one binary path. Returns
-/// `(process_handle, thread_cap, child_token)`; caller owns the thread
-/// cap (e.g. for svcmgr `REGISTER_SERVICE`) and is responsible for
-/// `destroy_partial_child` on any subsequent failure.
-///
-/// `policy` and `cwd` are forwarded to `configure_child_namespace`.
-/// Service helpers that use this path (e.g. timed) pass `NsPolicy::None`
-/// because they do not touch the filesystem after `_start`.
-#[allow(clippy::too_many_arguments)]
-fn walk_and_create_from_file(
-    path: &[u8],
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    policy: NsPolicy,
-    cwd: Option<(&[u8], u64)>,
-    ipc_buf: *mut u64,
-) -> Option<(u32, u32, u64)>
-{
-    let walked = walk::walk_to_file(system_root_cap, path, 0xFFFF, ipc_buf)?;
-    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, walked.size)
-        .cap(walked.file_cap)
-        .cap(tokened_creator)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) }.ok()?;
-    if reply.label != 0
-    {
-        return None;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.len() < 2
-    {
-        return None;
-    }
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
-    if !configure_child_namespace(
-        process_handle,
-        system_root_cap,
-        init_self_cspace,
-        policy,
-        cwd,
-        ipc_buf,
-    )
-    {
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    }
-    Some((process_handle, thread_cap, child_token))
-}
-
-/// Spawn `/services/timed` and serve its single bootstrap round. Returns
-/// the init-owned service-endpoint source cap; init derives a SEND
-/// from it for the `timed` publish.
-/// Timed-side result of [`create_and_start_timed`].
-///
-/// `service_ep` is the init-owned service-endpoint source cap (used
-/// to derive the SEND init publishes as `timed`). `thread_cap` is
-/// timed's main thread in init's `CSpace`, registered with svcmgr so
-/// the supervisor can bind death-notification.
-pub struct TimedSpawn
-{
-    pub service_ep: u32,
-    pub thread_cap: u32,
-}
-
-pub fn create_and_start_timed(
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    devmgr_registry_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    ipc_buf: *mut u64,
-) -> Option<TimedSpawn>
-{
-    let (svc_source, svc_recv) = create_service_endpoint_pair()?;
-
-    // timed resolves the RTC via devmgr's QUERY_RTC_DEVICE on a
-    // REGISTRY_QUERY_AUTHORITY-tokened SEND copy of devmgr's registry
-    // endpoint, then serves GET_WALL_TIME. No filesystem access.
-    let Ok(devmgr_registry_copy) = syscall::cap_derive_token(
-        devmgr_registry_ep,
-        syscall::RIGHTS_SEND,
-        ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-    )
-    else
-    {
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        log("timed: devmgr registry token derive failed");
-        return None;
-    };
-
-    let Some((process_handle, thread_cap, child_token)) = walk_and_create_from_file(
-        b"/services/timed",
-        procmgr_ep,
-        bootstrap_ep,
-        system_root_cap,
-        init_self_cspace,
-        NsPolicy::None,
-        None,
-        ipc_buf,
-    )
-    else
-    {
-        let _ = syscall::cap_delete(devmgr_registry_copy);
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        log("timed: walk + CREATE_FROM_FILE failed");
-        return None;
-    };
-
-    if !start_process(
-        process_handle,
-        ipc_buf,
-        "phase 3: timed started; serving bootstrap",
-        "phase 3: timed START_PROCESS failed",
-    )
-    {
-        let _ = syscall::cap_delete(devmgr_registry_copy);
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        let _ = syscall::cap_delete(thread_cap);
-        destroy_partial_child(process_handle, ipc_buf);
-        return None;
-    }
-
-    if !serve(
-        bootstrap_ep,
-        child_token,
-        ipc_buf,
-        true,
-        &[svc_recv, devmgr_registry_copy],
-        &[],
-        "timed: bootstrap round failed",
-    )
-    {
-        // Best-effort delete: serve_round may have transferred caps before
-        // failing. Child has been started; cannot destroy safely. It will
-        // exit on the receive-side failure and procmgr will reap.
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(devmgr_registry_copy);
-        let _ = syscall::cap_delete(svc_source);
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    }
-
-    Some(TimedSpawn {
-        service_ep: svc_source,
-        thread_cap,
-    })
 }
 
 /// Phase 3 sub-step: hand devmgr a least-privilege
@@ -2233,77 +2042,4 @@ fn set_drivers_dir_on_devmgr(devmgr_registry_ep: u32, system_root_cap: u32, ipc_
             log("phase 3: SET_DRIVERS_DIR ipc_call error; RTC unavailable");
         }
     }
-}
-
-/// Phase 3 sub-step: spawn timed and publish it as `timed`. The RTC
-/// driver itself is loaded by devmgr from the on-disk rootfs inside
-/// the [`set_drivers_dir_on_devmgr`] handshake (above), between
-/// devmgr's `ipc_reply` and its next `ipc_recv`; by the time `timed`
-/// queries [`ipc::devmgr_labels::QUERY_RTC_DEVICE`] against the
-/// `REGISTRY_QUERY_AUTHORITY`-tokened copy of `devmgr_registry_ep`
-/// delivered in its bootstrap round, devmgr already holds `rtc_ep`
-/// (or the sticky-failure state and replies `NO_DEVICE`). Init's
-/// PUBLISH_AUTHORITY-tokened cap is derived from `svcmgr_service_ep`
-/// (the un-tokened source init already owns). All failures are
-/// logged; the function never aborts phase 3 — a degraded wall-clock
-/// leaves `SystemTime::now()` returning `UNIX_EPOCH` but the rest of
-/// svctest still runs.
-pub fn bring_up_timed(
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    svcmgr_service_ep: u32,
-    devmgr_registry_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    ipc_buf: *mut u64,
-) -> Option<u32>
-{
-    // RIGHTS_SEND_GRANT (not bare SEND): PUBLISH_ENDPOINT carries the
-    // service's SEND cap in the message, and the IPC kernel requires the
-    // GRANT bit on the caller's send-cap to transfer caps.
-    let Ok(publish_cap) = syscall::cap_derive_token(
-        svcmgr_service_ep,
-        syscall::RIGHTS_SEND_GRANT,
-        svcmgr_labels::PUBLISH_AUTHORITY,
-    )
-    else
-    {
-        log("phase 3: timed PUBLISH_AUTHORITY derive failed");
-        return None;
-    };
-
-    let Some(timed_spawn) = create_and_start_timed(
-        procmgr_ep,
-        bootstrap_ep,
-        devmgr_registry_ep,
-        system_root_cap,
-        init_self_cspace,
-        ipc_buf,
-    )
-    else
-    {
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    };
-
-    let Ok(timed_publish_send) = syscall::cap_derive(timed_spawn.service_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        log("phase 3: timed publish SEND derive failed");
-        let _ = syscall::cap_delete(timed_spawn.thread_cap);
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    };
-    if !svcmgr_publish(publish_cap, b"timed", timed_publish_send, ipc_buf)
-    {
-        log("phase 3: timed publish failed");
-        let _ = syscall::cap_delete(timed_publish_send);
-        let _ = syscall::cap_delete(timed_spawn.thread_cap);
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    }
-    log("phase 3: timed published");
-
-    let _ = syscall::cap_delete(publish_cap);
-    Some(timed_spawn.thread_cap)
 }

@@ -27,6 +27,10 @@ pub struct Launched
 {
     pub thread_cap: u32,
     pub process_handle: u32,
+    /// Persistent service-endpoint source for a `provides = ...` service,
+    /// stored on the `ServiceEntry` so restarts re-serve a fresh RECV on
+    /// the same object. Zero for pure-consumer services.
+    pub provided_endpoint: u32,
 }
 
 /// Build the NUL-separated, NUL-terminated wire blob procmgr's
@@ -46,6 +50,81 @@ pub(crate) fn build_blob(tokens: &[String]) -> (Vec<u8>, u32)
         blob.push(0);
     }
     (blob, tokens.len() as u32)
+}
+
+/// Delete a set of cap slots, skipping the zero sentinel. Used on the
+/// launch/restart cleanup paths where a partially-assembled cap set must
+/// be released; deleting an already-transferred slot is a kernel no-op.
+pub(crate) fn delete_caps(caps: &[u32])
+{
+    for &c in caps
+    {
+        if c != 0
+        {
+            let _ = syscall::cap_delete(c);
+        }
+    }
+}
+
+/// Assemble a child's bootstrap cap set: the provider service-endpoint
+/// RECV (`provided_recv`, cap[0]) ahead of the positional `seeds`, capped
+/// at `MSG_CAP_SLOTS_MAX`. A `provided_recv` of `0` (pure consumer) is
+/// skipped. Overflow seeds beyond the cap are deleted so they don't leak.
+/// Consumes `seeds`.
+pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32>
+{
+    let mut caps: Vec<u32> = Vec::with_capacity(syscall_abi::MSG_CAP_SLOTS_MAX);
+    if provided_recv != 0
+    {
+        caps.push(provided_recv);
+    }
+    for c in seeds
+    {
+        if caps.len() < syscall_abi::MSG_CAP_SLOTS_MAX
+        {
+            caps.push(c);
+        }
+        else if c != 0
+        {
+            let _ = syscall::cap_delete(c);
+        }
+    }
+    caps
+}
+
+/// Publish a `provides` service's endpoint under its registry name once
+/// the endpoint exists, so consumers launched after it resolve the name.
+/// The endpoint persists on the `ServiceEntry`, so the SEND stays valid
+/// across restarts. No-op for a pure consumer (`provided_endpoint == 0`)
+/// or a service with no `provides` name.
+fn publish_provided(
+    provided_endpoint: u32,
+    provides: Option<&str>,
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+    svc_name: &str,
+)
+{
+    let Some(name) = provides
+    else
+    {
+        return;
+    };
+    if provided_endpoint == 0
+    {
+        return;
+    }
+    if let Ok(send) = syscall::cap_derive(provided_endpoint, syscall::RIGHTS_SEND)
+    {
+        if registry.publish(name.as_bytes(), send).is_err()
+        {
+            std::os::seraph::log!("launch {svc_name}: publish {name:?} failed");
+            let _ = syscall::cap_delete(send);
+        }
+    }
+    else
+    {
+        std::os::seraph::log!("launch {svc_name}: provider SEND derive failed");
+    }
 }
 
 /// Spawn a service from its parsed `.svc` definition.
@@ -109,19 +188,61 @@ pub fn launch(
         return None;
     }
 
+    // A `provides` service serves its own service endpoint on bootstrap
+    // cap[0]. Create it now (after namespace + death bind, before seeds)
+    // so svcmgr owns the persistent source: the child receives a RECV
+    // derivation, consumers a published SEND, and a restart re-serves a
+    // fresh RECV on the same object. Created before START_PROCESS so a
+    // failure still lands on the destroyable partial child.
+    let provided_endpoint = if def.provides.is_some()
+    {
+        let Ok(ep) = syscall::cap_create_endpoint(ctx.endpoint_slab)
+        else
+        {
+            std::os::seraph::log!("launch {}: provider endpoint create failed", def.name);
+            destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
+            return None;
+        };
+        ep
+    }
+    else
+    {
+        0
+    };
+
     // Resolve seeds AFTER namespace setup so a seed-lookup miss does
     // not leave a configured-but-orphan partial child; if the seed
     // section fails, we still tear down here before launching.
     let seed_caps = resolve_seeds(&def.seed, &def.name, registry);
 
+    // Bootstrap cap set: a provider's own service-endpoint RECV is cap[0],
+    // ahead of the positional seeds. Derive it before assembly so a derive
+    // failure tears the partial child down cleanly.
+    let provided_recv = if provided_endpoint != 0
+    {
+        let Ok(recv) = syscall::cap_derive(provided_endpoint, syscall::RIGHTS_RECEIVE)
+        else
+        {
+            std::os::seraph::log!("launch {}: provider RECV derive failed", def.name);
+            delete_caps(&seed_caps);
+            let _ = syscall::cap_delete(provided_endpoint);
+            destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
+            return None;
+        };
+        recv
+    }
+    else
+    {
+        0
+    };
+    let boot_caps = assemble_boot_caps(provided_recv, seed_caps);
+
     if !start_process(created.process_handle, ctx.ipc_buf)
     {
-        for &c in &seed_caps
+        delete_caps(&boot_caps);
+        if provided_endpoint != 0
         {
-            if c != 0
-            {
-                let _ = syscall::cap_delete(c);
-            }
+            let _ = syscall::cap_delete(provided_endpoint);
         }
         destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
         return None;
@@ -134,7 +255,7 @@ pub fn launch(
             created.child_token,
             ctx.ipc_buf,
             true,
-            &seed_caps,
+            &boot_caps,
             &[],
         )
     };
@@ -143,18 +264,22 @@ pub fn launch(
         std::os::seraph::log!("launch {}: bootstrap serve failed", def.name);
         // Process is already started; can't unspawn. The child will
         // observe an empty bootstrap and degrade per its own logic.
-        for &c in &seed_caps
-        {
-            if c != 0
-            {
-                let _ = syscall::cap_delete(c);
-            }
-        }
+        delete_caps(&boot_caps);
     }
+
+    // Publish the provided name now that the endpoint exists, so consumers
+    // launched after this provider resolve it.
+    publish_provided(
+        provided_endpoint,
+        def.provides.as_deref(),
+        registry,
+        &def.name,
+    );
 
     Some(Launched {
         thread_cap: created.thread_cap,
         process_handle: created.process_handle,
+        provided_endpoint,
     })
 }
 

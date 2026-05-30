@@ -59,6 +59,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut namespace: Option<NamespaceShape> = None;
     let mut cwd: Option<String> = None;
     let mut seed: Vec<String> = Vec::new();
+    let mut provides: Option<String> = None;
 
     let mut seen_argv = false;
     let mut seen_env = false;
@@ -179,6 +180,21 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 seen_seed = true;
                 seed = value.split_whitespace().map(str::to_owned).collect();
             }
+            "provides" =>
+            {
+                if provides.is_some()
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "provides"));
+                }
+                if value.is_empty() || value.len() > registry::NAME_MAX
+                {
+                    return Err(ParseError::InvalidValue(
+                        lineno,
+                        "provides must be a non-empty name <= NAME_MAX bytes",
+                    ));
+                }
+                provides = Some(value.to_owned());
+            }
             other => return Err(ParseError::UnknownKey(lineno, other.to_owned())),
         }
     }
@@ -206,6 +222,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         namespace,
         cwd,
         seed,
+        provides,
     })
 }
 

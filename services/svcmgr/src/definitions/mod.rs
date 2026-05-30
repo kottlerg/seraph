@@ -102,6 +102,16 @@ pub struct Definition
     /// Published-registry names svcmgr resolves at launch time and
     /// injects positionally into the child's bootstrap round.
     pub seed: Vec<String>,
+    /// Registry name this service's own service endpoint is published
+    /// under. When set, svcmgr's launch path creates a service endpoint,
+    /// serves its RECV half as bootstrap cap[0] (ahead of the `seed`
+    /// caps), and publishes a SEND half under this name. The endpoint
+    /// persists across restarts (svcmgr holds the source), so a cached
+    /// client cap survives a crash-restart cycle. `None` for pure-consumer
+    /// services that only receive `seed` caps. A `provides` service also
+    /// launches ahead of pure consumers during reconciliation so its name
+    /// resolves before any consumer queries it.
+    pub provides: Option<String>,
 }
 
 /// Directory svcmgr scans for service definitions. Absolute path

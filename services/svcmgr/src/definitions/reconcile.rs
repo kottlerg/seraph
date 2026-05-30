@@ -134,6 +134,12 @@ pub fn reconcile_and_launch(
     // discovery-registry lookups, not file-system ordering).
     entries.sort();
 
+    // Parse every recipe first, then order providers (services that
+    // publish their own endpoint via `provides = ...`) ahead of pure
+    // consumers, so a provided name is in the discovery registry before
+    // any consumer launched here resolves it. `sort_by_key` is stable, so
+    // alphabetical order is preserved within each group.
+    let mut defs: Vec<Definition> = Vec::with_capacity(entries.len());
     for filename in &entries
     {
         let service_name = filename.trim_end_matches(".svc");
@@ -150,18 +156,18 @@ pub fn reconcile_and_launch(
                 continue;
             }
         };
-        let def = match parse(service_name, &contents)
+        match parse(service_name, &contents)
         {
-            Ok(d) => d,
-            Err(e) =>
-            {
-                log!("svcmgr: parse {path}: {e}");
-                continue;
-            }
-        };
+            Ok(d) => defs.push(d),
+            Err(e) => log!("svcmgr: parse {path}: {e}"),
+        }
+    }
+    defs.sort_by_key(|d| d.provides.is_none());
 
+    for def in &defs
+    {
         handle_definition(
-            &def,
+            def,
             pending,
             pending_count,
             services,
@@ -233,6 +239,10 @@ fn handle_definition(
         log!("svcmgr: launched ephemeral: {}", def.name);
         let _ = syscall::cap_delete(launched.thread_cap);
         let _ = syscall::cap_delete(launched.process_handle);
+        if launched.provided_endpoint != 0
+        {
+            let _ = syscall::cap_delete(launched.provided_endpoint);
+        }
         return;
     }
 
@@ -261,7 +271,12 @@ fn handle_definition(
         return;
     };
 
-    services[idx] = build_entry(def, launched.thread_cap, launched.process_handle);
+    services[idx] = build_entry(
+        def,
+        launched.thread_cap,
+        launched.process_handle,
+        launched.provided_endpoint,
+    );
     recipes[idx] = Some(recipe_from(def));
 }
 
@@ -297,7 +312,7 @@ fn bind_only(
         let _ = syscall::cap_delete(thread_cap);
         return;
     }
-    services[idx] = build_entry(def, thread_cap, 0);
+    services[idx] = build_entry(def, thread_cap, 0, 0);
     recipes[idx] = Some(recipe_from(def));
     *service_count += 1;
 }
@@ -320,7 +335,12 @@ fn recipe_from(def: &Definition) -> RestartRecipe
 /// Maps the `.svc` `restart`/`critical`/`namespace` values onto the
 /// in-memory `ServiceEntry` representation `restart::handle_death`
 /// reads.
-fn build_entry(def: &Definition, thread_cap: u32, process_handle: u32) -> ServiceEntry
+fn build_entry(
+    def: &Definition,
+    thread_cap: u32,
+    process_handle: u32,
+    provided_endpoint: u32,
+) -> ServiceEntry
 {
     let mut entry = ServiceEntry::empty();
 
@@ -330,7 +350,7 @@ fn build_entry(def: &Definition, thread_cap: u32, process_handle: u32) -> Servic
     entry.name_len = copy_len as u8;
 
     entry.thread_cap = thread_cap;
-    entry.module_cap = 0;
+    entry.provided_endpoint = provided_endpoint;
     entry.process_handle = process_handle;
 
     let bin_bytes = def.binary.as_bytes();

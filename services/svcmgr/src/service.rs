@@ -45,15 +45,16 @@ pub struct ServiceEntry
     pub name_len: u8,
     /// Capability slot for the service's thread.
     pub thread_cap: u32,
-    /// Capability slot for an in-memory boot-module source, used to respawn
-    /// via `CREATE_PROCESS`. Always zero today: no registration path
-    /// populates it, so every restart uses `vfs_path` + `CREATE_FROM_FILE`.
-    /// Reserved for the #78 init→svcmgr substrate endowment — see the dead
-    /// branch in [`crate::restart`]'s `create_process`.
-    pub module_cap: u32,
+    /// Persistent service endpoint svcmgr created for a `provides = ...`
+    /// service: the source half (the child holds a RECV derivation,
+    /// consumers a published SEND). Zero for pure-consumer services. The
+    /// endpoint outlives any single instance — on restart svcmgr derives a
+    /// fresh RECV from this slot and re-serves it, so the published SEND
+    /// stays valid across the crash and cached client caps keep resolving.
+    pub provided_endpoint: u32,
     /// VFS path used to respawn this service via svcmgr-side walk +
-    /// `CREATE_FROM_FILE`. The sole restart source today; `module_cap` is its
-    /// reserved alternative.
+    /// `CREATE_FROM_FILE`. The sole restart source: every restartable
+    /// service is reloaded from the filesystem.
     pub vfs_path: [u8; ipc::MAX_PATH_LEN],
     /// Length of `vfs_path` in bytes (0 = module-loaded).
     pub vfs_path_len: u8,
@@ -109,7 +110,7 @@ impl ServiceEntry
             name: [0; 32],
             name_len: 0,
             thread_cap: 0,
-            module_cap: 0,
+            provided_endpoint: 0,
             vfs_path: [0; ipc::MAX_PATH_LEN],
             vfs_path_len: 0,
             bundle: [registry::Entry {

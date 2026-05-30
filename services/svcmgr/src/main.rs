@@ -240,6 +240,16 @@ fn main() -> !
         halt_loop();
     };
 
+    // Frame slab svcmgr retypes provider service endpoints from. One page
+    // backs every `provides = ...` service (each `cap_create_endpoint`
+    // carves an endpoint object from it); the provider set is small.
+    let Some(endpoint_slab) = std::os::seraph::object_slab_acquire(syscall_abi::PAGE_SIZE)
+    else
+    {
+        std::os::seraph::log!("failed to acquire frame for provider endpoint slab");
+        halt_loop();
+    };
+
     if syscall::wait_set_add(ws_cap, caps.service_ep, WS_TOKEN_SERVICE).is_err()
     {
         std::os::seraph::log!("failed to add service endpoint to wait set");
@@ -262,7 +272,15 @@ fn main() -> !
 
     std::os::seraph::log!("waiting for registrations");
 
-    event_loop(info, &caps, ws_cap, deaths_eq, ipc_buf, &mut state);
+    event_loop(
+        info,
+        &caps,
+        ws_cap,
+        deaths_eq,
+        endpoint_slab,
+        ipc_buf,
+        &mut state,
+    );
 }
 
 /// `WaitSet` token for svcmgr's service endpoint.
@@ -300,6 +318,7 @@ fn event_loop(
     caps: &service::SvcmgrCaps,
     ws_cap: u32,
     deaths_eq: u32,
+    endpoint_slab: u32,
     ipc_buf: *mut u64,
     state: &mut SvcmgrState,
 ) -> !
@@ -309,6 +328,7 @@ fn event_loop(
         bootstrap_ep: caps.bootstrap_ep,
         ipc_buf,
         deaths_eq,
+        endpoint_slab,
     };
 
     loop

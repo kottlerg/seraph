@@ -12,7 +12,7 @@
 //! the freshly spawned child's thread cap so the caller can bind
 //! death-notification on it.
 
-use super::{Definition, NamespaceShape};
+use super::{Definition, NamespaceShape, ProvidedName};
 use crate::REGISTRY_CAPACITY;
 use crate::registry_lookup_derived;
 use crate::restart::{
@@ -92,38 +92,49 @@ pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32
     caps
 }
 
-/// Publish a `provides` service's endpoint under its registry name once
-/// the endpoint exists, so consumers launched after it resolve the name.
-/// The endpoint persists on the `ServiceEntry`, so the SEND stays valid
-/// across restarts. No-op for a pure consumer (`provided_endpoint == 0`)
-/// or a service with no `provides` name.
+/// Publish each name in a provider's `provides` list under the discovery
+/// registry once the endpoint exists, so consumers launched after it
+/// resolve them. Each name's SEND is stamped with its
+/// [`ProvidedName::token`] (`cap_derive_token` when non-zero, plain
+/// `cap_derive` for a bare entry); the token rides through to a
+/// consumer's `QUERY_ENDPOINT` lookup unchanged. The endpoint persists on
+/// the `ServiceEntry`, so the SENDs stay valid across restarts. No-op for
+/// a pure consumer (`provided_endpoint == 0`) or an empty list.
 fn publish_provided(
     provided_endpoint: u32,
-    provides: Option<&str>,
+    provides: &[ProvidedName],
     registry: &mut registry::Registry<REGISTRY_CAPACITY>,
     svc_name: &str,
 )
 {
-    let Some(name) = provides
-    else
-    {
-        return;
-    };
     if provided_endpoint == 0
     {
         return;
     }
-    if let Ok(send) = syscall::cap_derive(provided_endpoint, syscall::RIGHTS_SEND)
+    for p in provides
     {
-        if registry.publish(name.as_bytes(), send).is_err()
+        let derived = if p.token == 0
         {
-            std::os::seraph::log!("launch {svc_name}: publish {name:?} failed");
+            syscall::cap_derive(provided_endpoint, syscall::RIGHTS_SEND)
+        }
+        else
+        {
+            syscall::cap_derive_token(provided_endpoint, syscall::RIGHTS_SEND, p.token)
+        };
+        let Ok(send) = derived
+        else
+        {
+            std::os::seraph::log!(
+                "launch {svc_name}: provider SEND derive for {:?} failed",
+                p.name
+            );
+            continue;
+        };
+        if registry.publish(p.name.as_bytes(), send).is_err()
+        {
+            std::os::seraph::log!("launch {svc_name}: publish {:?} failed", p.name);
             let _ = syscall::cap_delete(send);
         }
-    }
-    else
-    {
-        std::os::seraph::log!("launch {svc_name}: provider SEND derive failed");
     }
 }
 
@@ -194,7 +205,11 @@ pub fn launch(
     // derivation, consumers a published SEND, and a restart re-serves a
     // fresh RECV on the same object. Created before START_PROCESS so a
     // failure still lands on the destroyable partial child.
-    let provided_endpoint = if def.provides.is_some()
+    let provided_endpoint = if def.provides.is_empty()
+    {
+        0
+    }
+    else
     {
         let Ok(ep) = syscall::cap_create_endpoint(ctx.endpoint_slab)
         else
@@ -204,10 +219,6 @@ pub fn launch(
             return None;
         };
         ep
-    }
-    else
-    {
-        0
     };
 
     // Resolve seeds AFTER namespace setup so a seed-lookup miss does
@@ -269,12 +280,7 @@ pub fn launch(
 
     // Publish the provided name now that the endpoint exists, so consumers
     // launched after this provider resolve it.
-    publish_provided(
-        provided_endpoint,
-        def.provides.as_deref(),
-        registry,
-        &def.name,
-    );
+    publish_provided(provided_endpoint, &def.provides, registry, &def.name);
 
     Some(Launched {
         thread_cap: created.thread_cap,

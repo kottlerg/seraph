@@ -54,6 +54,7 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
 | `cwd` | no | Path interpreted relative to svcmgr's universal root. Forbidden when `namespace = none`. |
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name). |
+| `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one tokened SEND per entry into the discovery registry. See [`provides`](#provides). |
 
 ## `restart`
 
@@ -86,13 +87,15 @@ Because the two fields are independent, any combination is valid — e.g.
 `restart = always` + `critical = no` (the `crasher` fixture: respawned on
 every fault, but its eventual permanent death is non-fatal).
 
-**pwrmgr's own death** is the edge case. If a `critical = yes`
-service that *is* `pwrmgr` dies unrecoverably, the shutdown source is
-itself gone; svcmgr logs `critical service unrecoverable: pwrmgr;
-graceful shutdown impossible; system in degraded state` and takes no
-further action. No fallback raw-shutdown path is provided — the
-same shape as today's lack of a recovery story for procmgr / memmgr
-death.
+**pwrmgr's own death** is the edge case. pwrmgr is `restart = on_failure`
++ `critical = no`: a crashed pwrmgr is recoverable (svcmgr re-creates it
+and it re-acquires its actuator caps from devmgr — see
+[services/pwrmgr/README.md](../../pwrmgr/README.md)), and its *permanent*
+death is deliberately non-fatal. It is `critical = no` precisely because
+the graceful-shutdown escalation routes through `pwrmgr.shutdown` — if
+pwrmgr is the dead service, that source is gone, so escalation would be
+circular. The honest terminal state is logged-and-continue. Setting
+`critical = yes` on pwrmgr would be self-defeating for this reason.
 
 ## `namespace`
 
@@ -149,9 +152,35 @@ Well-known names are centralised in
 | Name | Publisher (today) | Cap shape |
 |---|---|---|
 | `rootfs.root` | init Phase 3 | tokened SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
-| `pwrmgr.shutdown` | init Phase 3 | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
-| `pwrmgr.deny` | init Phase 3 | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
+| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
+| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
+| `timed` | svcmgr (`timed.svc` provider) | un-tokened SEND on timed's service endpoint (wall-clock) |
 | `svcmgr` | init Phase 3 | un-tokened SEND on svcmgr's own service endpoint |
+| `devmgr.registry` | init Phase 3 | `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry endpoint |
+
+## `provides`
+
+Declares the registry names a service's own endpoint is published under.
+svcmgr creates a service endpoint, serves its RECV as bootstrap `cap[0]`
+(ahead of the `seed` caps), and publishes one SEND per entry. Providers
+launch ahead of pure consumers during reconciliation, so a provided name
+is resolvable before any consumer queries it. The endpoint persists across
+restarts (svcmgr holds the source), so a cached client cap survives a
+crash-restart and no re-publish is needed.
+
+Each space-separated entry is `name[:auth|:deny]`; the suffix selects the
+token svcmgr stamps on that name's SEND (the token rides through a
+consumer's `QUERY_ENDPOINT` lookup unchanged):
+
+| Suffix | Token | Use |
+|---|---|---|
+| *(none)* | `0` (untokened) | Plain SEND. e.g. `timed`. |
+| `:auth` | `1 << 63` | The universal verb-authority bit shared by every `*_AUTHORITY` constant — the server's `token & (1 << 63)` gate passes. e.g. `pwrmgr.shutdown:auth`. |
+| `:deny` | `1` | Present so the cap resolves, but the authority gate fails. The negative-test twin. e.g. `pwrmgr.deny:deny`. |
+
+```
+provides = pwrmgr.shutdown:auth pwrmgr.deny:deny
+```
 
 ## Reconciliation
 

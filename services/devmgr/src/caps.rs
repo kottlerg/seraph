@@ -157,8 +157,17 @@ pub struct DevmgrCaps
 
     // Copy of init's root `IoPortRange` cap (x86-64 only; zero on RISC-V).
     // devmgr derives per-driver narrow copies for ISA peripherals
-    // (CMOS RTC at ports 0x70-0x71; COM1 at 0x3F8-0x3FF for serial).
+    // (CMOS RTC at ports 0x70-0x71; COM1 at 0x3F8-0x3FF for serial) and,
+    // on `QUERY_SHUTDOWN_DEVICE`, the PM1a + 8042-reset ports for pwrmgr.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub ioport_root_cap: u32,
+
+    // Copy of init's `SbiControl` cap (RISC-V only; zero on x86-64). The
+    // SBI SRST shutdown/reboot authority; devmgr serves a `cap_derive`
+    // copy to pwrmgr on `QUERY_SHUTDOWN_DEVICE`. devmgr itself never
+    // forwards an SBI call — it only brokers the cap.
+    #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+    pub sbi_control_cap: u32,
 
     /// Bootloader-discovered framebuffer geometry, or `None` when no
     /// framebuffer is present. Populated from init's
@@ -190,6 +199,7 @@ impl DevmgrCaps
             driver_module_count: 0,
             svcmgr_publish_cap: 0,
             ioport_root_cap: 0,
+            sbi_control_cap: 0,
             fb_info: None,
         }
     }
@@ -407,8 +417,9 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
                 // caps[0] = svcmgr publish-authority cap (always present;
                 //           a zero slot indicates init's derive failed and
                 //           is treated as a bootstrap fatal).
-                // caps[1] = root IoPortRange copy (x86 only; absent on
-                //           RISC-V — sender simply omits the cap).
+                // caps[1] = arch shutdown-authority cap: root IoPortRange
+                //           on x86-64, SbiControl on RISC-V. Same slot
+                //           either way; the receiver routes it by arch.
                 if round.cap_count < 1 || round.caps[0] == 0
                 {
                     return None;
@@ -416,7 +427,14 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
                 caps.svcmgr_publish_cap = round.caps[0];
                 if round.cap_count >= 2 && round.caps[1] != 0
                 {
-                    caps.ioport_root_cap = round.caps[1];
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        caps.ioport_root_cap = round.caps[1];
+                    }
+                    #[cfg(target_arch = "riscv64")]
+                    {
+                        caps.sbi_control_cap = round.caps[1];
+                    }
                 }
             }
             _ =>

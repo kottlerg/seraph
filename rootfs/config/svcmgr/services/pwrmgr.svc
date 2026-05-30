@@ -1,18 +1,28 @@
 # /services/pwrmgr — power manager (platform shutdown / reboot).
 #
-# Init spawns pwrmgr in Phase 3 with the arch-specific shutdown
-# caps (IoPortRange / SbiControl / ACPI region frames) it cannot
-# obtain post-handover; svcmgr therefore binds-only on the running
-# instance rather than launching a fresh one. Once those platform
-# caps are reachable from svcmgr a `restart = on_failure` recipe
-# can replace this.
+# svcmgr launches pwrmgr post-handover as a provider. `provides` makes
+# svcmgr create pwrmgr's service endpoint, serve its RECV as bootstrap
+# cap[0], and publish two SENDs on it:
+#   * pwrmgr.shutdown:auth — SHUTDOWN_AUTHORITY-tokened (1 << 63), for
+#     consumers permitted to power the platform off.
+#   * pwrmgr.deny:deny    — a no-authority twin (sentinel token 1) that the
+#     SHUTDOWN/REBOOT gate rejects; svctest uses it to assert the deny path.
+# `seed = devmgr.registry` delivers the REGISTRY_QUERY_AUTHORITY-tokened
+# SEND on devmgr's registry that pwrmgr uses to acquire its shutdown
+# actuator caps (QUERY_ACPI_TABLE for the FADT/DSDT it parses, and
+# QUERY_SHUTDOWN_DEVICE for the carved PM1a + 8042 ports / SbiControl).
+# pwrmgr owns no hardware caps directly — devmgr is the hardware authority.
 #
-# critical = yes: if pwrmgr dies and cannot recover, svcmgr
-# attempts a graceful shutdown via `pwrmgr.shutdown` — which is
-# unreachable because the source is gone. The death handler logs
-# the degraded state and continues; no fallback raw-shutdown path
-# exists in this architecture.
+# `restart = on_failure`: svcmgr re-creates pwrmgr from /services/pwrmgr and
+# re-serves a fresh RECV on the persistent endpoint, so a SHUTDOWN_AUTHORITY
+# cap cached against `pwrmgr.shutdown` survives a crash-restart. pwrmgr
+# re-acquires its actuator caps from devmgr on each (re)start.
+# `critical = no`: a permanently-dead pwrmgr cannot self-shutdown, so the
+# graceful-shutdown-via-pwrmgr path would be circular; the honest terminal
+# state is logged-and-continue, matching timed.
 binary    = /services/pwrmgr
-restart   = never
-critical  = yes
+restart   = on_failure
+critical  = no
 namespace = none
+provides  = pwrmgr.shutdown:auth pwrmgr.deny:deny
+seed      = devmgr.registry

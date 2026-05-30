@@ -18,7 +18,7 @@ init/
 └── src/
     ├── main.rs                 # _start, run() orchestration across the three stages
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup
-    ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr, logd, timed, pwrmgr) and phase3_svcmgr_handover
+    ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr, logd) and phase3_svcmgr_handover
     ├── mount.rs                # Root MOUNT exchange + GET_SYSTEM_ROOT_CAP pull
     ├── logging.rs              # init-logd thread (serves the log endpoint until real-logd takes over)
     ├── walk.rs                 # /services/<name> path walker over the seed system-root cap
@@ -42,15 +42,17 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    the role to the arch-specific Seraph root GPT type-GUID), pull the seed
    `system_root_cap` via `GET_SYSTEM_ROOT_CAP`, then launch real-logd from
    `/services/logd` and hand off the master log endpoint via `HANDOVER_PULL`.
-3. **Handover** — spawn svcmgr, timed, and pwrmgr (the per-arch RTC
-   chip driver is devmgr-spawned during devmgr's enumeration sweep
-   and resolved by timed via `QUERY_RTC_DEVICE`); publish the
-   well-known caps (`rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`,
-   `svcmgr`, `timed`); register every init-bootstrapped service with svcmgr via
-   `REGISTER_SERVICE`; signal `HANDOVER_COMPLETE`; hand init's own
-   kernel objects + reclaimable Frame caps to procmgr via
+3. **Handover** — spawn svcmgr and endow it; publish the well-known caps
+   init still owns the sources for (`rootfs.root`, `svcmgr`,
+   `devmgr.registry`); register every init-bootstrapped substrate service
+   with svcmgr via `REGISTER_SERVICE`; signal `HANDOVER_COMPLETE`; hand
+   init's own kernel objects + reclaimable Frame caps to procmgr via
    `REGISTER_INIT_TEARDOWN`; call `sys_thread_exit`. Procmgr's death-EQ
-   observer then runs the reap path.
+   observer then runs the reap path. The non-bootstrap services svcmgr
+   then launches itself — `timed` and `pwrmgr` (providers), the staged
+   test harnesses — and publishes their names; the per-arch RTC chip
+   driver is devmgr-spawned during enumeration and resolved by timed via
+   `QUERY_RTC_DEVICE`.
 
 See [docs/bootstrap.md](docs/bootstrap.md) for the authoritative
 stage-by-stage enumeration, source citations, and per-stage capability
@@ -88,7 +90,7 @@ transfer table.
 | [services/procmgr/README.md](../procmgr/README.md) | Owns process creation post-bootstrap; runs init's reap path |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Takes over as resident supervisor after `HANDOVER_COMPLETE` |
 | [services/logd/README.md](../logd/README.md) | Master log endpoint owner post-Phase-2-epilogue |
-| [services/pwrmgr/README.md](../pwrmgr/README.md) | Receives arch authority + ACPI Frame caps during handover |
+| [services/pwrmgr/README.md](../pwrmgr/README.md) | svcmgr-launched post-handover; acquires its shutdown caps from devmgr, not from init |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 | [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |
 

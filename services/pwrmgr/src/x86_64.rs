@@ -5,23 +5,28 @@
 
 //! x86-64 platform shutdown and reboot.
 //!
-//! Shutdown follows ACPI S5 (soft-off):
-//! 1. Scan each `AcpiReclaimable` Frame cap for the FADT (`FACP` signature).
-//! 2. Extract `PM1a_CNT_BLK` and the `DSDT` physical address from FADT.
-//! 3. Locate the DSDT in one of the same regions and parse the `\_S5_`
-//!    AML object for `SLP_TYPa`.
-//! 4. Bind the `IoPortRange` cap, write `(SLP_TYPa << 10) | SLP_EN` to
-//!    `PM1a_CNT_BLK`.
+//! pwrmgr owns the shutdown *interpretation* and *actuation*; devmgr owns
+//! the ACPI data and the raw hardware authority. At startup pwrmgr asks
+//! devmgr for the tables it needs and the ports it computed:
 //!
-//! Reboot uses the 8042 keyboard-controller reset (port `0x64`, value
-//! `0xFE`). It is the simplest reset path that does not require parsing
-//! the ACPI `RESET_REG` and works under QEMU q35 + OVMF. A future
-//! revision can promote this to ACPI reset.
+//! 1. [`devmgr_labels::QUERY_ACPI_TABLE`] (`FACP`) → map the FADT
+//!    read-only, extract `PM1a_CNT_BLK` and the DSDT physical address.
+//! 2. [`devmgr_labels::QUERY_ACPI_TABLE`] (DSDT phys) → map the DSDT
+//!    read-only, parse the `\_S5_` AML object for `SLP_TYPa`.
+//! 3. [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`] (`PM1a` port) → devmgr carves
+//!    `[PM1a, PM1a+2)` + the 8042 reset port `[0x64, 0x65)` and serves the
+//!    two `IoPortRange` caps.
 //!
-//! On any unrecoverable failure the routine falls through and the caller
-//! (`main::handle_shutdown`) replies `pwrmgr_errors::INVALID_REQUEST`.
+//! Shutdown (ACPI S5 soft-off) binds the `PM1a` cap and writes
+//! `(SLP_TYPa << 10) | SLP_EN` to `PM1a_CNT_BLK`. Reboot binds the 8042
+//! cap and pulses the keyboard-controller reset (port `0x64`, value
+//! `0xFE`) — the simplest reset path that works under QEMU q35 + OVMF.
+//!
+//! On any unrecoverable failure a routine falls through and the caller
+//! (`main`) replies `pwrmgr_errors::INVALID_REQUEST`.
 
-use crate::caps::PwrmgrCaps;
+use crate::caps::devmgr_call;
+use ipc::devmgr_labels;
 use std::os::seraph::{reserve_pages, unreserve_pages};
 use syscall_abi::MAP_READONLY;
 
@@ -33,86 +38,101 @@ const FADT_OFF_DSDT: usize = 40;
 const FADT_OFF_PM1A_CNT_BLK: usize = 64;
 const FADT_OFF_X_DSDT: usize = 140;
 
-/// 8042 keyboard-controller command port, used for the legacy CPU reset
-/// path on PC-compatible platforms.
-const KBC_COMMAND_PORT: u16 = 0x64;
-/// 8042 reset pulse (asserts INIT# to the CPU).
-const KBC_RESET_VALUE: u8 = 0xFE;
-
-/// Attempt ACPI S5 shutdown. Logs progress and does not return on
-/// success. On failure (missing caps, unparseable tables) logs a warning
-/// and returns so the caller can reply with an error.
-pub fn shutdown(self_thread: u32, caps: &PwrmgrCaps)
+/// Resolved shutdown actuation state. Acquired once at startup from
+/// devmgr; held for pwrmgr's lifetime. The two `IoPortRange` caps are
+/// narrow (the `PM1a` control pair and the single 8042 reset port).
+pub struct Actuator
 {
-    let Some((pm1a_cnt_blk, dsdt_phys)) = locate_fadt_fields(caps)
-    else
-    {
-        std::os::seraph::log!("shutdown failed (FADT not found)");
-        return;
-    };
-    if pm1a_cnt_blk == 0
-    {
-        std::os::seraph::log!("shutdown failed (PM1a_CNT_BLK is zero)");
-        return;
-    }
-    let Some(slp_typa) = locate_and_parse_dsdt(caps, dsdt_phys)
-    else
-    {
-        std::os::seraph::log!("shutdown failed (DSDT not found or \\_S5_ missing)");
-        return;
-    };
+    pm1a_port: u16,
+    slp_typa: u16,
+    pm1a_ioport_cap: u32,
+    kbc_ioport_cap: u32,
+}
 
-    if caps.arch_cap == 0
+/// Resolve the shutdown actuation state from devmgr. Returns `None` if any
+/// query or parse fails; the caller then serves SHUTDOWN/REBOOT with no
+/// actuator and replies an error to any request.
+pub fn resolve(devmgr_registry: u32, self_aspace: u32, ipc_buf: *mut u64) -> Option<Actuator>
+{
+    let facp_sig = u64::from(u32::from_le_bytes(*b"FACP"));
+    let fadt = query_acpi_table(devmgr_registry, facp_sig, 0, ipc_buf)?;
+    let (pm1a_port, dsdt_phys) = with_table_mapped(self_aspace, &fadt, |table_vaddr| {
+        Some(read_fadt_fields(table_vaddr))
+    })?;
+    if pm1a_port == 0
     {
-        std::os::seraph::log!("shutdown failed (no IoPortRange cap)");
-        return;
-    }
-    if syscall::ioport_bind(self_thread, caps.arch_cap).is_err()
-    {
-        std::os::seraph::log!("shutdown failed (ioport_bind)");
-        return;
+        std::os::seraph::log!("resolve failed (PM1a_CNT_BLK is zero)");
+        return None;
     }
 
-    let value = (slp_typa << 10) | SLP_EN;
-    // SAFETY: `PM1a_CNT_BLK` is a valid I/O port from FADT; IOPB permits
+    let dsdt = query_acpi_table(devmgr_registry, 0, dsdt_phys, ipc_buf)?;
+    let slp_typa = with_table_mapped(self_aspace, &dsdt, |dsdt_vaddr| {
+        // SAFETY: DSDT mapped read-only; offset 4 is the SDT length field.
+        let dsdt_len = unsafe { read_u32_at(dsdt_vaddr, 4) } as usize;
+        scan_dsdt_for_s5(dsdt_vaddr, dsdt_len)
+    })?;
+
+    let reply = devmgr_call(
+        devmgr_registry,
+        devmgr_labels::QUERY_SHUTDOWN_DEVICE,
+        u64::from(pm1a_port),
+        0,
+        ipc_buf,
+    )?;
+    let caps = reply.caps();
+    if caps.len() < 2
+    {
+        std::os::seraph::log!("resolve failed (QUERY_SHUTDOWN_DEVICE missing caps)");
+        return None;
+    }
+
+    Some(Actuator {
+        pm1a_port,
+        slp_typa,
+        pm1a_ioport_cap: caps[0],
+        kbc_ioport_cap: caps[1],
+    })
+}
+
+/// Attempt ACPI S5 shutdown. Logs and does not return on success; on
+/// failure logs and returns so the caller can reply with an error.
+pub fn shutdown(self_thread: u32, act: &Actuator)
+{
+    if syscall::ioport_bind(self_thread, act.pm1a_ioport_cap).is_err()
+    {
+        std::os::seraph::log!("shutdown failed (ioport_bind PM1a)");
+        return;
+    }
+    let value = (act.slp_typa << 10) | SLP_EN;
+    // SAFETY: `pm1a_port` is the FADT PM1a control port; IOPB permits
     // access after `ioport_bind`; writing `SLP_TYPa | SLP_EN` triggers
     // ACPI S5.
     unsafe {
         core::arch::asm!(
             "out dx, ax",
-            in("dx") pm1a_cnt_blk,
+            in("dx") act.pm1a_port,
             in("ax") value,
             options(nomem, nostack),
         );
     }
-    // The hardware may take a moment to power off. Halt to prevent
-    // any further output from racing the shutdown.
-    loop
-    {
-        // SAFETY: privileged HLT is rewritten by the kernel-emulation
-        // path; userspace falls back to a busy wait.
-        unsafe {
-            core::arch::asm!("pause", options(nomem, nostack));
-        }
-    }
+    halt();
 }
 
 /// Best-effort reboot via the 8042 KBC reset pulse.
-pub fn reboot(self_thread: u32, caps: &PwrmgrCaps)
+pub fn reboot(self_thread: u32, act: &Actuator)
 {
-    if caps.arch_cap == 0
+    /// 8042 keyboard-controller command port (legacy CPU reset path).
+    const KBC_COMMAND_PORT: u16 = 0x64;
+    /// 8042 reset pulse (asserts INIT# to the CPU).
+    const KBC_RESET_VALUE: u8 = 0xFE;
+
+    if syscall::ioport_bind(self_thread, act.kbc_ioport_cap).is_err()
     {
-        std::os::seraph::log!("reboot failed (no IoPortRange cap)");
+        std::os::seraph::log!("reboot failed (ioport_bind KBC)");
         return;
     }
-    if syscall::ioport_bind(self_thread, caps.arch_cap).is_err()
-    {
-        std::os::seraph::log!("reboot failed (ioport_bind)");
-        return;
-    }
-    // SAFETY: port 0x64 is the 8042 command register; writing 0xFE
-    // pulses the KBC reset line. IOPB permits access after
-    // `ioport_bind`.
+    // SAFETY: port 0x64 is the 8042 command register; writing 0xFE pulses
+    // the KBC reset line. IOPB permits access after `ioport_bind`.
     unsafe {
         core::arch::asm!(
             "out dx, al",
@@ -121,62 +141,96 @@ pub fn reboot(self_thread: u32, caps: &PwrmgrCaps)
             options(nomem, nostack),
         );
     }
+    halt();
+}
+
+/// Halt after issuing a reset/poweroff write so no further output races
+/// the platform powering off.
+fn halt() -> !
+{
     loop
     {
-        // SAFETY: same as in `shutdown`.
+        // SAFETY: `pause` is non-privileged.
         unsafe {
             core::arch::asm!("pause", options(nomem, nostack));
         }
     }
 }
 
-// ── ACPI table discovery ────────────────────────────────────────────────────
+// ── devmgr ACPI-table acquisition ───────────────────────────────────────────
 
-/// Map one ACPI region read-only, hand the (`region_vaddr`,
-/// `region_size`) pair to `f`, then unmap. Returns `f`'s output
-/// unchanged.
-fn with_region_mapped<F, R>(self_aspace: u32, region: &crate::caps::AcpiRegion, f: F) -> Option<R>
-where
-    F: FnOnce(u64, u64) -> Option<R>,
+/// A read-only ACPI table view served by devmgr's `QUERY_ACPI_TABLE`: a
+/// Frame cap on the containing region plus the geometry needed to map it
+/// and index to the table.
+struct TableView
 {
-    let pages = pages_for(region.phys_base, region.size);
+    frame_cap: u32,
+    region_base: u64,
+    region_size: u64,
+    table_phys: u64,
+}
+
+/// Query devmgr for an ACPI table by signature (`phys == 0`) or by
+/// physical address (`sig == 0`). Returns the served Frame cap + geometry.
+fn query_acpi_table(registry: u32, sig: u64, phys: u64, ipc_buf: *mut u64) -> Option<TableView>
+{
+    let reply = devmgr_call(
+        registry,
+        devmgr_labels::QUERY_ACPI_TABLE,
+        sig,
+        phys,
+        ipc_buf,
+    )?;
+    let frame_cap = *reply.caps().first()?;
+    Some(TableView {
+        frame_cap,
+        region_base: reply.word(0),
+        region_size: reply.word(1),
+        table_phys: reply.word(2),
+    })
+}
+
+/// Map the region behind a [`TableView`] read-only, hand the table's
+/// virtual address to `f`, then unmap, unreserve, and release the Frame
+/// cap. The cap is devmgr's to own; pwrmgr drops its copy after reading.
+fn with_table_mapped<F, R>(self_aspace: u32, view: &TableView, f: F) -> Option<R>
+where
+    F: FnOnce(u64) -> Option<R>,
+{
+    let pages = pages_for(view.region_base, view.region_size);
     let range = reserve_pages(pages).ok()?;
     let map_vaddr = range.va_start();
-    if syscall::mem_map(region.slot, self_aspace, map_vaddr, 0, pages, MAP_READONLY).is_err()
+    let mapped = syscall::mem_map(
+        view.frame_cap,
+        self_aspace,
+        map_vaddr,
+        0,
+        pages,
+        MAP_READONLY,
+    );
+    let out = if mapped.is_ok()
     {
-        unreserve_pages(range);
-        return None;
+        // The frame maps from the page containing `region_base`; the table
+        // sits at `table_phys` within it.
+        let table_vaddr = map_vaddr + (view.table_phys - (view.region_base & !0xFFF));
+        let r = f(table_vaddr);
+        let _ = syscall::mem_unmap(self_aspace, map_vaddr, pages);
+        r
     }
-    let region_vaddr = map_vaddr + (region.phys_base & 0xFFF);
-    let out = f(region_vaddr, region.size);
-    let _ = syscall::mem_unmap(self_aspace, map_vaddr, pages);
+    else
+    {
+        None
+    };
     unreserve_pages(range);
+    let _ = syscall::cap_delete(view.frame_cap);
     out
 }
 
-/// Scan every ACPI region for the FADT (`FACP`) signature. Returns
-/// `(pm1a_cnt_blk, dsdt_phys)` on success.
-fn locate_fadt_fields(caps: &PwrmgrCaps) -> Option<(u16, u64)>
-{
-    for region in &caps.acpi_regions[..caps.acpi_region_count]
-    {
-        let found = with_region_mapped(caps.self_aspace, region, |vaddr, size| {
-            scan_for_signature(vaddr, size, *b"FACP")
-                .map(|off| read_fadt_fields(vaddr + off as u64))
-        });
-        if let Some(pair) = found
-        {
-            return Some(pair);
-        }
-    }
-    None
-}
-
+/// Read `(PM1a_CNT_BLK, dsdt_phys)` from a mapped FADT.
 fn read_fadt_fields(table_vaddr: u64) -> (u16, u64)
 {
-    // SAFETY: `table_vaddr` is in a region just mapped read-only and
-    // sized to hold a full ACPI table header (FADT minimum size is 244
-    // bytes in ACPI 6.x).
+    // SAFETY: `table_vaddr` is in a region mapped read-only and sized to
+    // hold a full ACPI table header (FADT minimum is 244 bytes).
     let pm1a = unsafe { read_u32_at(table_vaddr, FADT_OFF_PM1A_CNT_BLK) } as u16;
     // SAFETY: same mapping.
     let dsdt32 = unsafe { read_u32_at(table_vaddr, FADT_OFF_DSDT) };
@@ -193,53 +247,9 @@ fn read_fadt_fields(table_vaddr: u64) -> (u16, u64)
     (pm1a, dsdt_phys)
 }
 
-/// Locate the DSDT by physical address and parse `\_S5_` for `SLP_TYPa`.
-fn locate_and_parse_dsdt(caps: &PwrmgrCaps, dsdt_phys: u64) -> Option<u16>
-{
-    for region in &caps.acpi_regions[..caps.acpi_region_count]
-    {
-        if dsdt_phys < region.phys_base || dsdt_phys >= region.phys_base + region.size
-        {
-            continue;
-        }
-        return with_region_mapped(caps.self_aspace, region, |region_vaddr, _size| {
-            let table_off = dsdt_phys - region.phys_base;
-            let dsdt_vaddr = region_vaddr + table_off;
-            // SAFETY: just mapped; offset 4 is the SDT length field.
-            let dsdt_len = unsafe { read_u32_at(dsdt_vaddr, 4) } as usize;
-            scan_dsdt_for_s5(dsdt_vaddr, dsdt_len)
-        });
-    }
-    None
-}
-
 fn pages_for(phys: u64, size: u64) -> u64
 {
-    ((phys & 0xFFF) + size).div_ceil(0x1000)
-}
-
-/// Scan `len` bytes starting at `vaddr` for a 4-byte ACPI signature on a
-/// 16-byte aligned offset (ACPI table header alignment per spec).
-fn scan_for_signature(vaddr: u64, len: u64, sig: [u8; 4]) -> Option<usize>
-{
-    let len = usize::try_from(len).ok()?;
-    if len < 4
-    {
-        return None;
-    }
-    // SAFETY: caller-mapped region of `len` bytes at `vaddr`.
-    let bytes = unsafe { core::slice::from_raw_parts(vaddr as *const u8, len) };
-    let last = len.saturating_sub(4);
-    let mut off = 0;
-    while off <= last
-    {
-        if bytes[off..off + 4] == sig
-        {
-            return Some(off);
-        }
-        off += 16;
-    }
-    None
+    ((phys & 0xFFF) + size).div_ceil(0x1000).max(1)
 }
 
 // ── DSDT scanning ───────────────────────────────────────────────────────────

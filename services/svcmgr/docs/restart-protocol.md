@@ -177,18 +177,24 @@ every boot.
 | `devmgr` | init-registered (bind only) | `never` | `yes` |
 | `vfsd` | init-registered (bind only) | `never` | `yes` |
 | `logd` | init-registered (bind only) | `never` | `yes` |
-| `timed` | init-registered (bind only) | `never` | `no` |
-| `pwrmgr` | init-registered (bind only) | `never` | `yes` |
+| `timed` | svcmgr-launched (provider) | `on_failure` | `no` |
+| `pwrmgr` | svcmgr-launched (provider) | `on_failure` | `no` |
 
-Restart paths for the bind-only set are aspirational today: most of
-them were spawned with arch-/firmware-authority caps that init holds
-and svcmgr cannot re-mint (memmgr/procmgr via raw `cap_create_*`
-syscalls; devmgr/vfsd/logd with one-shot authority handover; pwrmgr
-with `IoPortRange` / `SbiControl` / ACPI frames). When their
-`.svc` `restart` value moves off `never` in the future, the spawn
-path needs to gain access to those caps — either via a new
-init→svcmgr handover round, or by relocating the spawn entirely
-into svcmgr.
+Restart paths for the init-registered (bind-only) substrate set are
+aspirational today: each was spawned with arch-/firmware-authority caps
+that init holds and svcmgr cannot re-mint (memmgr/procmgr via raw
+`cap_create_*` syscalls; devmgr/vfsd/logd with one-shot authority
+handover). When their `.svc` `restart` value moves off `never` in the
+future, the spawn path needs to gain access to those caps — either via a
+new init→svcmgr handover round, or by relocating the spawn entirely into
+svcmgr.
+
+`timed` and `pwrmgr` are *not* in that set: they are svcmgr-launched
+providers and genuinely restartable. Neither holds a unique source cap —
+each re-acquires its authority on (re)start by querying devmgr
+(`QUERY_RTC_DEVICE` for timed; `QUERY_ACPI_TABLE` + `QUERY_SHUTDOWN_DEVICE`
+for pwrmgr), and svcmgr re-serves a fresh RECV on the persistent service
+endpoint so cached client caps survive the restart.
 
 ---
 

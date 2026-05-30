@@ -144,10 +144,11 @@ lines or via direct `QUERY_ENDPOINT` calls.
 | Name | Source | Cap shape |
 |---|---|---|
 | `rootfs.root` | init Phase 3 | tokened SEND on the root filesystem's namespace endpoint at its root directory |
-| `pwrmgr.shutdown` | init Phase 3 | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
-| `pwrmgr.deny` | init Phase 3 | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
 | `svcmgr` | init Phase 3 | un-tokened SEND on svcmgr's own service endpoint |
-| `timed` | init bring-up | SEND on timed's service endpoint |
+| `devmgr.registry` | init Phase 3 | `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry endpoint |
+| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
+| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
+| `timed` | svcmgr (`timed.svc` provider) | SEND on timed's service endpoint |
 
 Centralised name constants live in `ipc::published_names`.
 

@@ -130,51 +130,40 @@ and hands init's own kernel objects to procmgr for reaping.
   (walk fails, devmgr replies non-SUCCESS) leaves the system without
   a wallclock — timed degrades to `WALL_CLOCK_UNAVAILABLE`.
   (`set_drivers_dir_on_devmgr` in `../src/service.rs`.)
-- Bring up the wallclock chain: spawn timed and resolve the per-arch
-  RTC driver through devmgr. The RTC chip driver (cmos-rtc on x86-64,
-  goldfish-rtc on RISC-V) is spawned by devmgr from the on-disk
-  rootfs (`/services/drivers/<chip>`) after the
-  `SET_DRIVERS_DIR` handshake above, not by init; timed resolves the
-  SEND at startup via `devmgr_labels::QUERY_RTC_DEVICE` on the
-  `REGISTRY_QUERY_AUTHORITY`-tokened copy of devmgr's registry
-  endpoint delivered in its bootstrap round
-  (`../src/service.rs:1379` → `bring_up_timed` at
-  `../src/service.rs:2177`, with `create_and_start_timed` at
-  `../src/service.rs:1987`).
-- Spawn pwrmgr with the arch authority cap
-  (`IoPortRange` on x86-64, `SbiControl` on RISC-V) and the
-  ACPI Frame caps; capture pwrmgr's service endpoint and main
-  thread cap (`../src/service.rs:1390` →
-  `create_and_start_pwrmgr` at `../src/service.rs:796`).
+- The wallclock chain and pwrmgr are **not** spawned by init. `timed`
+  and `pwrmgr` are svcmgr-launched providers (`timed.svc` / `pwrmgr.svc`),
+  brought up post-handover; each resolves its authority from devmgr at
+  startup (`QUERY_RTC_DEVICE` for timed; `QUERY_ACPI_TABLE` +
+  `QUERY_SHUTDOWN_DEVICE` for pwrmgr). The RTC chip driver (cmos-rtc on
+  x86-64, goldfish-rtc on RISC-V) is spawned by devmgr from
+  `/services/drivers/<chip>` after the `SET_DRIVERS_DIR` handshake above,
+  also not by init.
 - Derive a `PUBLISH_AUTHORITY`-tokened `RIGHTS_SEND_GRANT` cap on
-  svcmgr's service endpoint (`../src/service.rs:1419`) and
-  publish five well-known names via `PUBLISH_ENDPOINT`:
+  svcmgr's service endpoint and publish the three well-known names init
+  still owns the sources for, via `PUBLISH_ENDPOINT`
+  (`phase3_svcmgr_handover` in `../src/service.rs`):
   - `rootfs.root` — tokened SEND on the root filesystem's
     namespace endpoint at its root directory (FS-driver-agnostic
-    by design) (`../src/service.rs:1429`).
-  - `pwrmgr.shutdown` — `SHUTDOWN_AUTHORITY`-tokened SEND on
-    pwrmgr's service endpoint (`../src/service.rs:1450`).
-  - `pwrmgr.deny` — non-AUTHORITY SEND on pwrmgr's service
-    endpoint (negative-test twin) (`../src/service.rs:1462`).
-  - `svcmgr` — un-tokened SEND on svcmgr's own service endpoint
-    (`../src/service.rs:1482`).
+    by design).
+  - `svcmgr` — un-tokened SEND on svcmgr's own service endpoint.
   - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-tokened SEND
-    on devmgr's registry endpoint (`../src/service.rs:1505`).
-    Consumers needing to resolve a device driver themselves
-    (today: `programs/fb-charset` → `QUERY_FRAMEBUFFER_DEVICE`;
-    future: any non-init caller of devmgr's discovery surface)
-    seed this name. The token bit survives svcmgr's plain
-    `cap_derive` in `registry_lookup_derived`.
+    on devmgr's registry endpoint. Consumers needing to resolve a
+    device driver themselves (`programs/fb-charset` →
+    `QUERY_FRAMEBUFFER_DEVICE`; timed and pwrmgr → their devmgr
+    queries; future: any non-init caller of devmgr's discovery surface)
+    seed this name. The token bit survives svcmgr's plain `cap_derive`
+    in `registry_lookup_derived`.
 
-  Name constants are centralised in `ipc::published_names`.
-- Register each init-bootstrapped service with svcmgr via the v3
-  `REGISTER_SERVICE` wire (name + thread cap)
-  (`../src/service.rs:1528`–`../src/service.rs:1550`;
-  `register_service` helper at `../src/service.rs:1273`).
-  Registration set: `memmgr`, `procmgr`, `devmgr`, `vfsd`,
-  `logd`, `timed`, `pwrmgr`. svcmgr reconciles each against the
-  matching `<name>.svc` recipe in `/config/svcmgr/services/` and
-  binds death-notification — see
+  `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by
+  svcmgr's provider path, not by init. Name constants are centralised in
+  `ipc::published_names`.
+- Register each init-bootstrapped substrate service with svcmgr via the
+  v3 `REGISTER_SERVICE` wire (name + thread cap; `register_service`
+  helper in `../src/service.rs`). Registration set: `memmgr`, `procmgr`,
+  `devmgr`, `vfsd`, `logd`. svcmgr reconciles each against the matching
+  `<name>.svc` recipe in `/config/svcmgr/services/` and binds
+  death-notification; the non-bootstrap services (`timed`, `pwrmgr`,
+  staged harnesses) it launches itself from their recipes — see
   [`../../svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md).
 - Signal `HANDOVER_COMPLETE` (`../src/service.rs:1552`). svcmgr
   scans `/config/svcmgr/services/` and launches any
@@ -245,12 +234,11 @@ svcmgr if needed.
 |---|---|---|
 | Raw bootstrap | memmgr | RAM `Frame` pool (every Frame cap not consumed by init/procmgr setup) |
 | Raw bootstrap | procmgr | memmgr SEND cap, log endpoint SEND, svcmgr service endpoint SEND, boot-module `Frame` caps for downstream `CREATE_PROCESS` |
-| Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Frame caps |
+| Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Frame caps; root `IoPortRange` (x86-64) / `SbiControl` (RISC-V) via the terminal `SVCMGR_BUNDLE` round — the hardware + shutdown authority devmgr brokers to drivers and to pwrmgr |
 | Raw bootstrap | vfsd | `SEED_AUTHORITY`-tokened SEND on vfsd's own service endpoint (gates `GET_SYSTEM_ROOT_CAP`); the un-tokened service-endpoint SEND init holds is used for the un-gated MOUNT call. Init keeps no FS access of its own. |
 | Root mount | logd | RECV on the master log endpoint, one-shot SEND for `HANDOVER_PULL`, `DEATH_EQ_AUTHORITY`-tokened SEND on procmgr, arch serial authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V) |
 | Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; in the bootstrap round, full-rights SEND on its own service endpoint and on the local svcmgr-bootstrap endpoint |
-| Handover | pwrmgr | Remaining arch authority (`IoPortRange` / `SbiControl`) + ACPI region Frame caps |
-| Handover (publish) | svcmgr registry | `rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`, `svcmgr`, `devmgr.registry` named caps |
+| Handover (publish) | svcmgr registry | `rootfs.root`, `svcmgr`, `devmgr.registry` named caps (init no longer publishes `pwrmgr.*` / `timed` — svcmgr's provider path does) |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Frame cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline frame, boot-module ELF sources) |
 
 ---

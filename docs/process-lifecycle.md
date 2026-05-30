@@ -110,28 +110,31 @@ mechanism — but procmgr is the chooser from that point forward (see
 
 ### Init → remaining services
 
-Init requests procmgr to start the remaining boot-time services in
-order — devmgr, vfsd, optionally netd, then svcmgr, timed, and
-pwrmgr — by IPC to procmgr's `CREATE_FROM_FILE` / `CREATE_PROCESS`
-endpoints. The per-arch RTC chip driver is not in this list: devmgr
-spawns it during its enumeration sweep, and timed resolves it via
-`devmgr_labels::QUERY_RTC_DEVICE` at startup. For each service,
-init delegates the appropriate capability subset (see
+Init requests procmgr to start only the bootstrap-essential services
+— devmgr, vfsd, optionally netd, real-logd, then svcmgr — by IPC to
+procmgr's `CREATE_FROM_FILE` / `CREATE_PROCESS` endpoints. The
+non-bootstrap services (`timed`, `pwrmgr`, the staged test harnesses)
+are not in this list: svcmgr launches them itself post-handover from
+their `/config/svcmgr/services/*.svc` recipes. Nor is the per-arch RTC
+chip driver: devmgr spawns it during its enumeration sweep, and timed
+resolves it via `devmgr_labels::QUERY_RTC_DEVICE` at startup. For each
+service init starts, it delegates the appropriate capability subset (see
 [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution"). svcmgr is configured with the universal
 `system_root_cap` so it can read `/config/svcmgr/services/*.svc`
 post-handover.
 
-Init then publishes well-known caps into svcmgr's discovery
-registry (`ipc::published_names::ROOTFS_ROOT`,
-`PWRMGR_SHUTDOWN`, `PWRMGR_DENY`, `SVCMGR`) via
-`svcmgr_labels::PUBLISH_ENDPOINT` with a `PUBLISH_AUTHORITY`-tokened
-`RIGHTS_SEND_GRANT` cap, and registers every foundational service
-it bootstrapped with svcmgr via the v3 `REGISTER_SERVICE` wire
-(name + thread cap): `memmgr`, `procmgr`, `devmgr`, `vfsd`, `logd`,
-`timed`, `pwrmgr`. Recipes for all svcmgr-supervised services live
-on disk at `/config/svcmgr/services/<name>.svc`, not on the wire —
-see
+Init then publishes the well-known caps it still owns the sources for
+into svcmgr's discovery registry (`ipc::published_names::ROOTFS_ROOT`,
+`SVCMGR`, `DEVMGR_REGISTRY`) via `svcmgr_labels::PUBLISH_ENDPOINT` with
+a `PUBLISH_AUTHORITY`-tokened `RIGHTS_SEND_GRANT` cap, and registers
+every foundational substrate service it bootstrapped with svcmgr via the
+v3 `REGISTER_SERVICE` wire (name + thread cap): `memmgr`, `procmgr`,
+`devmgr`, `vfsd`, `logd`. The names of svcmgr-launched providers
+(`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are published by svcmgr's
+own provider path, not by init. Recipes for all svcmgr-supervised
+services live on disk at `/config/svcmgr/services/<name>.svc`, not on
+the wire — see
 [`services/svcmgr/docs/service-definitions.md`](../services/svcmgr/docs/service-definitions.md).
 
 ### Init reap

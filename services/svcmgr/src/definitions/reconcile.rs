@@ -162,7 +162,7 @@ pub fn reconcile_and_launch(
             Err(e) => log!("svcmgr: parse {path}: {e}"),
         }
     }
-    defs.sort_by_key(|d| d.provides.is_none());
+    defs.sort_by_key(|d| d.provides.is_empty());
 
     for def in &defs
     {

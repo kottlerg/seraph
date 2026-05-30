@@ -1021,7 +1021,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 5;
+pub const DEVMGR_LABELS_VERSION: u32 = 6;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -1108,6 +1108,58 @@ pub mod devmgr_labels
     /// and replies [`super::devmgr_errors::NO_DEVICE`] on subsequent
     /// queries; clients MUST NOT retry-loop.
     pub const SET_DRIVERS_DIR: u64 = 6;
+
+    /// Locate an ACPI table and serve a read-only view of it.
+    ///
+    /// devmgr is the sole owner of ACPI data and the only service that
+    /// navigates the table tree (RSDP → XSDT). Callers that need a table
+    /// (today: `pwrmgr`, for the FADT + DSDT it interprets for S5
+    /// shutdown) request it here rather than holding ACPI frames of
+    /// their own.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = 4-byte table signature packed little-endian (e.g.
+    /// `FACP`), or `0` to look up by physical address; `data[2]` =
+    /// table physical address (used when `data[1] == 0`, e.g. the DSDT,
+    /// whose address the caller reads from the FADT). Caller's token MUST
+    /// carry [`REGISTRY_QUERY_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a derived
+    /// **read-only-intended** Frame cap on the ACPI region containing the
+    /// table (the caller maps it `MAP_READONLY`); `data[0]` = region
+    /// physical base, `data[1]` = region size in bytes, `data[2]` = the
+    /// table's physical address. The caller maps the region and reads the
+    /// table at `table_phys - region_base`. devmgr reads only the
+    /// directory (RSDP/XSDT) and table headers (signatures) to locate the
+    /// table — never a table body. Replies
+    /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found.
+    pub const QUERY_ACPI_TABLE: u64 = 7;
+
+    /// Carve and serve the platform shutdown-actuator hardware caps.
+    ///
+    /// devmgr is the hardware authority; it carves the exact ports the
+    /// power manager asks for and performs no shutdown logic. The caller
+    /// (`pwrmgr`) has already parsed the ACPI tables (served via
+    /// [`QUERY_ACPI_TABLE`]) and computed the `PM1a` control port it needs.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the `PM1a` control port (x86-64; ignored on RISC-V).
+    /// Caller's token MUST carry [`REGISTRY_QUERY_AUTHORITY`]; the handler
+    /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]):
+    /// - x86-64: `caps[0]` = a narrow `IoPortRange` over `[pm1a, pm1a+2)`
+    ///   carved from devmgr's root `IoPortRange`; `caps[1]` = a narrow
+    ///   `IoPortRange` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
+    ///   Both are re-derived from the root on every call, so a pwrmgr
+    ///   restart re-acquires them cleanly.
+    /// - RISC-V: `caps[0]` = a `cap_derive` copy of devmgr's `SbiControl`
+    ///   cap (SBI SRST authority).
+    ///
+    /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
+    /// the platform authority cap is absent.
+    pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
     /// Authority bit in the devmgr-registry-endpoint token's high
     /// u64 bit. Set on caps minted for consumers permitted to call

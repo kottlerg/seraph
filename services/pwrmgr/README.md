@@ -12,7 +12,7 @@ pwrmgr/
 ├── README.md
 └── src/
     ├── main.rs       # Entry, bootstrap, IPC dispatch loop, cap-gating
-    ├── caps.rs       # init → pwrmgr bootstrap protocol
+    ├── caps.rs       # svcmgr bootstrap + devmgr-query acquisition
     ├── x86_64.rs     # ACPI S5 walk + PM1a write; 8042 KBC reboot
     └── riscv64.rs    # SBI SRST shutdown + cold reboot
 ```
@@ -21,12 +21,20 @@ pwrmgr/
 
 ## Responsibilities
 
-pwrmgr is the sole holder, after Phase 3 of init's bootstrap, of the raw
-capabilities required to power off or reset the platform:
+pwrmgr owns the shutdown *interpretation* and *actuation* but holds no
+hardware caps of its own. devmgr is the hardware and ACPI authority;
+pwrmgr acquires only what it needs from devmgr at startup, "as if it were
+a device driver":
 
-- **x86-64** — the `IoPortRange` cap, plus the `AcpiReclaimable` Frame caps
-  that cover the firmware tables containing FADT and DSDT.
-- **RISC-V** — the `SbiControl` cap that authorises forwarding `system_reset`
+- **x86-64** — the FADT and DSDT it parses are served read-only by devmgr
+  via `devmgr_labels::QUERY_ACPI_TABLE` (devmgr is the sole owner of the
+  `AcpiReclaimable` Frame caps and the only service that walks the ACPI
+  table tree). pwrmgr extracts `PM1a_CNT_BLK` from the FADT and the `\_S5_`
+  sleep type from the DSDT, then requests a narrow `IoPortRange` over the
+  PM1a control port and the 8042 reset port via
+  `devmgr_labels::QUERY_SHUTDOWN_DEVICE`.
+- **RISC-V** — `QUERY_SHUTDOWN_DEVICE` serves a `cap_derive` copy of
+  devmgr's `SbiControl` cap, which authorises forwarding `system_reset`
   through the kernel to M-mode firmware.
 
 It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
@@ -44,37 +52,42 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (token bit
 
 ## Cap flow
 
-1. Init holds the platform caps at boot (`InitInfo.acpi_region_frame_*`,
-   `InitInfo.sbi_control_cap`, plus the `IoPortRange` cap surfaced through
-   the descriptor array).
-2. During Phase 3, init creates pwrmgr via `procmgr_labels::CREATE_FROM_FILE`
-   from `/services/pwrmgr`, then transfers derived copies of the platform caps
-   through the bootstrap-round protocol in `caps.rs`.
-3. After pwrmgr is ready, init derives two tokened SEND caps from pwrmgr's
-   service endpoint:
-   - `pwrmgr_auth_cap` — `cap_derive_token(ep, SEND, SHUTDOWN_AUTHORITY)`.
-   - `pwrmgr_noauth_cap` — `cap_derive_token(ep, SEND, 0)`. Used by
-     svctest's `pwrmgr_cap_deny_phase` to verify the gate.
-4. Init installs both caps in svctest's bootstrap-round payload.
-5. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends
+1. svcmgr launches pwrmgr post-handover from its `pwrmgr.svc` recipe. The
+   `provides = pwrmgr.shutdown:auth pwrmgr.deny:deny` directive makes svcmgr
+   create pwrmgr's service endpoint, serve its RECV as bootstrap `cap[0]`,
+   and publish two SENDs into the discovery registry: `pwrmgr.shutdown`
+   (`SHUTDOWN_AUTHORITY`-tokened) and `pwrmgr.deny` (a no-authority twin).
+   The endpoint persists across restarts.
+2. `seed = devmgr.registry` delivers a `REGISTRY_QUERY_AUTHORITY`-tokened
+   SEND on devmgr's registry as bootstrap `cap[1]`. pwrmgr uses it to
+   resolve its actuation state from devmgr (see Responsibilities). pwrmgr
+   never holds a platform cap longer than it needs — the served ACPI Frame
+   caps are mapped read-only and dropped after parsing.
+3. Consumers permitted to power the platform off seed `pwrmgr.shutdown`
+   (e.g. svctest, and svcmgr's own critical-service-death escalation); the
+   token rides through the registry lookup unchanged. svctest also seeds
+   `pwrmgr.deny` to assert the gate rejects an unauthorised cap.
+4. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends
    `pwrmgr_labels::SHUTDOWN` through the authorised cap. pwrmgr executes
-   the platform shutdown sequence. QEMU exits cleanly, ending naked
+   the platform shutdown sequence. QEMU exits cleanly, ending the staged
    `cargo xtask run` without a wall-clock wait.
 
 ---
 
 ## Restart semantics
 
-pwrmgr is not registered with svcmgr. The platform caps it owns are
-unique resources; after a hypothetical crash there is no way to restart
-pwrmgr with the same authority because init has released its copies. The
-system idles in that case (the same behaviour as today's userspace when
-no caller can reach the platform reset).
+pwrmgr is a `restart = on_failure` svcmgr service. Because it holds no
+unique source caps, a crashed pwrmgr is recoverable: svcmgr re-creates it
+from `/services/pwrmgr` and re-serves a fresh RECV on the persistent
+service endpoint, so a `pwrmgr.shutdown` cap cached against the published
+name survives the restart. The restarted instance re-acquires its actuator
+caps from devmgr on startup — `QUERY_SHUTDOWN_DEVICE` re-carves the I/O
+ports from devmgr's root cap on every call, so nothing is consumed.
 
-A future revision can have init retain the source caps and re-deliver
-them to a restarted pwrmgr on svcmgr's policy; the wiring is
-straightforward but adds bootstrap state to init that is not exercised in
-v0.1.0.
+`critical = no`: a permanently-dead pwrmgr (restart budget exhausted)
+cannot power the platform off, so the graceful-shutdown-via-`pwrmgr.shutdown`
+escalation would be circular. The honest terminal state is logged and the
+system continues degraded, matching `timed`.
 
 ---
 
@@ -90,9 +103,6 @@ Out of scope for v0.1.0; deferred until concrete consumers exist:
 - **Battery and thermal monitoring** — ACPI `_BST` / `_TZ`, RISC-V
   platform sensors.
 - **Operator UX** — `shutdown` / `reboot` CLI wrappers calling pwrmgr.
-- **svcmgr-managed launch of svctest** — svctest is not
-  bootstrap-essential. Moving its spawn from init to svcmgr lets init
-  fully exit earlier once a real logd lands.
 - **Cmdline-driven test-vs-shell mode** — naked `cargo xtask run` could
   drop into an interactive userspace shell instead of running
   tests-then-shutdown.
@@ -119,8 +129,9 @@ between the two trees.
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System-wide service inventory; pwrmgr's role |
-| [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`) |
-| [services/init/README.md](../init/README.md) | Bootstrap order and cap-flow into pwrmgr |
+| [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`, `devmgr_labels`) |
+| [services/devmgr/README.md](../devmgr/README.md) | Hardware + ACPI authority; the `QUERY_ACPI_TABLE` / `QUERY_SHUTDOWN_DEVICE` brokers pwrmgr acquires its caps through |
+| [services/svcmgr/README.md](../svcmgr/README.md) | Launcher + supervisor; the provider path that publishes `pwrmgr.shutdown` / `pwrmgr.deny` |
 
 ---
 

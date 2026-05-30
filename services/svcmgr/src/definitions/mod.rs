@@ -102,16 +102,37 @@ pub struct Definition
     /// Published-registry names svcmgr resolves at launch time and
     /// injects positionally into the child's bootstrap round.
     pub seed: Vec<String>,
-    /// Registry name this service's own service endpoint is published
-    /// under. When set, svcmgr's launch path creates a service endpoint,
-    /// serves its RECV half as bootstrap cap[0] (ahead of the `seed`
-    /// caps), and publishes a SEND half under this name. The endpoint
-    /// persists across restarts (svcmgr holds the source), so a cached
-    /// client cap survives a crash-restart cycle. `None` for pure-consumer
-    /// services that only receive `seed` caps. A `provides` service also
-    /// launches ahead of pure consumers during reconciliation so its name
-    /// resolves before any consumer queries it.
-    pub provides: Option<String>,
+    /// Registry names this service's own service endpoint is published
+    /// under. When non-empty, svcmgr's launch path creates a service
+    /// endpoint, serves its RECV half as bootstrap cap[0] (ahead of the
+    /// `seed` caps), and publishes one SEND half per entry — each stamped
+    /// with that entry's [`ProvidedName::token`] — into the discovery
+    /// registry. The endpoint persists across restarts (svcmgr holds the
+    /// source), so cached client caps survive a crash-restart cycle and no
+    /// re-publish is needed. Empty for pure-consumer services that only
+    /// receive `seed` caps. A provider also launches ahead of pure
+    /// consumers during reconciliation so its names resolve before any
+    /// consumer queries them.
+    pub provides: Vec<ProvidedName>,
+}
+
+/// One published name in a service's `provides = ...` list, with the
+/// token svcmgr stamps on the SEND it publishes.
+///
+/// The token rides through publish → registry → `QUERY_ENDPOINT` lookup
+/// unchanged (`cap_derive` inherits a source cap's token), so a consumer
+/// that resolves the name receives a SEND already carrying it. The verb
+/// the server gates on is `token & (1 << 63)`, the universal
+/// verb-authority bit shared by every `*_AUTHORITY` constant.
+#[derive(Clone, Debug)]
+pub struct ProvidedName
+{
+    pub name: String,
+    /// `1 << 63` for an `:auth` entry (carries the verb-authority bit),
+    /// `1` for a `:deny` entry (present but gate-failing), `0` for a bare
+    /// entry (untokened — published via `cap_derive`, not
+    /// `cap_derive_token`).
+    pub token: u64,
 }
 
 /// Directory svcmgr scans for service definitions. Absolute path

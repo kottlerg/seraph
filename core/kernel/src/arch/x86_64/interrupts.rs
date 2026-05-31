@@ -406,8 +406,8 @@ unsafe fn apic_send_icr(dest: u32, cmd: u32)
 /// The bit clears within microseconds on a healthy LAPIC; 1M iterations
 /// is far beyond any architectural timing. Exhaustion indicates a
 /// hardware-level fault (stuck APIC, emulator bug) rather than a
-/// schedulable race, so we fatal rather than return a status all four
-/// callers historically ignored. x2APIC has no delivery-status bit (the ICR
+/// schedulable race, so we fatal rather than return a status no caller
+/// could act on. x2APIC has no delivery-status bit (the ICR
 /// MSR write is not pipelined), so the wait is skipped in that mode.
 #[cfg(not(test))]
 unsafe fn wait_icr_idle()
@@ -642,8 +642,7 @@ pub unsafe fn init_ap()
 {
     // Per-CPU CR4/CR0/XCR0 setup. The AP trampoline only sets CR4.PAE; SMEP,
     // SMAP, OSXSAVE, and TS are per-CPU state that must be re-established on
-    // each hart. enable_smep_smap was not previously called on APs — this
-    // closes that gap alongside the XSAVE enablement.
+    // each hart.
     // SAFETY: ring-0 AP boot; IDT loaded by caller (kernel_entry_ap); CPUID
     // gates each enable so a missing feature halts cleanly.
     unsafe {

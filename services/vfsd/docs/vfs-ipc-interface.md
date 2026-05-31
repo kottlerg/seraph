@@ -21,12 +21,10 @@ distribution; children of init receive a `cap_copy` of it via
 `std::os::seraph::root_dir_cap()`. Vfsd holds no namespace cap on
 procmgr's behalf — there is no boot-time push.
 
-The historic `INGEST_CONFIG_MOUNTS` IPC and the `/config/mounts.conf`
-file it consumed were retired with the GPT-type-GUID redesign (boot
-protocol v8). vfsd self-mounts the Seraph root partition at `/` and the
-EFI System Partition at `/esp` at startup; additional partitions are
-discovered by their type GUID, not by a config file. The label number
-(`12`) is reserved and MUST NOT be reused for an unrelated request.
+vfsd self-mounts the Seraph root partition at `/` and the EFI System
+Partition at `/esp` at startup; additional partitions are discovered by
+their type GUID, not by a config file. Label `12` on the service endpoint
+is reserved and MUST NOT be reused for an unrelated request.
 
 ---
 

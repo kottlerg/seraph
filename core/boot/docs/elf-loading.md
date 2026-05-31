@@ -165,8 +165,7 @@ starting each service.
 
 ## Extensibility
 
-The bundle replaces both the per-module file enumeration and the
-configuration file that used to point at it. Adding a new boot
+The bundle is the single boot-module container. Adding a new boot
 module is a bundle-composer change in
 [`xtask/src/bundle.rs`](../../../xtask/src/bundle.rs); the bootloader
 binary needs no change. `BootInfo.modules.count` accurately reflects

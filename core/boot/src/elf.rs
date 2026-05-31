@@ -358,8 +358,6 @@ pub unsafe fn load_init(
     })
 }
 
-// Boot modules are no longer loaded as standalone allocations in the
-// bootloader. Bundle entries (excluding the `init` entry, which is ELF-
-// loaded via [`load_init`]) are exposed in place by referencing the
-// single bundle UEFI allocation in `BootModule.physical_base`. See
-// `main.rs::step4_parse_bundle`.
+// Boot modules are exposed in place by referencing the single bundle UEFI
+// allocation in `BootModule.physical_base`; only the `init` entry is ELF-
+// loaded (via [`load_init`]). See `main.rs::step4_parse_bundle`.

@@ -282,7 +282,7 @@ teardown (Threads → AddressSpace → DONATE_FRAMES → CSpace → log).
 | [docs/process-lifecycle.md](../../../docs/process-lifecycle.md) | System-scope creation order; procmgr's role and authority boundary with memmgr |
 | [abi/process-abi](../../../abi/process-abi/README.md) | ProcessInfo handover struct |
 | [abi/syscall](../../../abi/syscall/README.md) | Syscall numbers and register conventions |
-| [services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) | Frame allocation IPC (formerly procmgr's `REQUEST_FRAMES`) |
+| [services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) | Frame allocation IPC |
 
 ---
 

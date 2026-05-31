@@ -464,9 +464,8 @@ When the wait set itself is dropped (last cap released), `wait_set_drop`
 clears every member's back-pointer and `dec_ref`s each source's header; any
 source whose refcount reaches zero at that point is reclaimed via the
 standard `dealloc_object` cascade. The source's dealloc arm therefore never
-runs while a wait-set member references it; the inline `waitset_remove`
-call that used to live in each source's dealloc arm has been replaced with
-a `debug_assert!(state.wait_set.is_null())` invariant check.
+runs while a wait-set member references it; each source's dealloc arm
+carries a `debug_assert!(state.wait_set.is_null())` invariant check.
 
 ### Multiple Ready Sources
 

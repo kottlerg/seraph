@@ -171,7 +171,7 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 
 2. **Step 3 (state = Exited) commits under all locks.** No `schedule()` on any CPU can subsequently observe this TCB as `Ready` or `Running` for purposes of re-enqueue — the protection in `schedule()` reads `state` while holding its CPU's scheduler.lock and refuses to re-enqueue if `state ∈ {Exited, Stopped}`. `enqueue_and_wake` performs the same check before enqueueing (see [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 9).
 
-3. **Step 9's `running_on` spin is bounded.** The remote CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch switch on both arches — `release_lock_only` runs in Rust before `switch()` on x86_64 and on RISC-V post-#144), the spin exits.
+3. **Step 9's `running_on` spin is bounded.** The remote CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch switch on both arches — `release_lock_only` runs in Rust before `switch()`), the spin exits.
 
 4a. **No `fpu_owner` sweep is needed after eager save (#108).** The `#NM` handler only ever installs the currently Running thread on its CPU as `fpu_owner`. `switch_out_save` clears the slot on switch-out before the thread re-enters the Ready / Blocked / Stopped / Exited states. By the time steps 9 and 10 above have completed — the thread has switched out on every CPU and `context_saved == 1` — no CPU's owner slot can name this TCB. Steps 9-10's interrupt-enabled-while-spinning discipline is still required to prevent the spin from deadlocking against a peer CPU's TLB-shootdown IPI; without it, two CPUs in mutual TLB shootdown would deadlock.
 

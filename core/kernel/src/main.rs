@@ -490,7 +490,9 @@ unsafe fn kernel_entry_post_rebase(
         // SAFETY: SEED installed in Phase 7; single-threaded Phase 9.
         let (init_as_obj_nn, init_as_ptr) =
             unsafe { cap::boot_retype_aspace(cap::seed_frame_ref(), INIT_ASPACE_PAGES) };
-        let _ = allocator; // legacy buddy path no longer used for init's AS
+        // init's AS is built from typed memory (boot_retype_aspace), so the
+        // buddy allocator is unused here.
+        let _ = allocator;
 
         // Map each ELF LOAD segment into the init address space via
         // `map_page`, whose intermediate PT pages come from `kernel_pt_pool`

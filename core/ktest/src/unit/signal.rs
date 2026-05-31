@@ -228,9 +228,9 @@ pub fn wait_timeout_fires(ctx: &TestContext) -> TestResult
 // ── SYS_SIGNAL_WAIT (high-bit payload) ────────────────────────────────────────
 
 /// Bitmasks with bit 63 set (and `u64::MAX`) must round-trip cleanly through
-/// `signal_send` / `signal_wait`. Regression test for the dispatcher's
-/// historical `cast_signed()` aliasing of `Ok(bits)` with negative-Err
-/// codes, which surfaced bit-63-set bitmasks to userspace as `Err(i64::MIN)`.
+/// `signal_send` / `signal_wait`. Regression test for `cast_signed()`
+/// aliasing of `Ok(bits)` with negative-Err codes, which would surface
+/// bit-63-set bitmasks to userspace as `Err(i64::MIN)`.
 pub fn wait_high_bit_roundtrip(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_signal(ctx.memory_frame_base)

@@ -161,9 +161,8 @@ static AP_GDT_PTR: core::sync::atomic::AtomicPtr<[u64; 7]> =
 /// from `sched::init`, before any AP startup. Each slab is page-aligned and
 /// zero-filled; `init_ap` overwrites the relevant fields per AP.
 ///
-/// The IOPB region of every TSS is then filled with `0xFF` (deny-all) to
-/// match the historic BSS-init behaviour; `init_ap` re-applies on each AP
-/// for paranoia.
+/// The IOPB region of every TSS is then filled with `0xFF` so all I/O-port
+/// access is denied; `init_ap` re-applies on each AP for paranoia.
 #[cfg(not(test))]
 pub fn init_ap_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
 {

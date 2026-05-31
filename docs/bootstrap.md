@@ -22,11 +22,10 @@ kernel entry point. The sequence is specified in ten bootloader steps in
 [`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).
 
 Boot-time configuration on disk consists of only the three ESP files
-named above plus the EFI fallback bootloader. `BootInfo` no longer
-carries a kernel command line (`boot-protocol` v8 removed
-`command_line`); root-partition identity moved to GPT type-GUID role
-discovery, performed by vfsd, and ktest options are baked into ktest's
-compile-time defaults.
+named above plus the EFI fallback bootloader. `BootInfo` carries no
+kernel command line; root-partition identity comes from GPT type-GUID
+role discovery, performed by vfsd, and ktest options are baked into
+ktest's compile-time defaults.
 
 ---
 

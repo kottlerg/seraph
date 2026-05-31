@@ -49,8 +49,7 @@ use syscall::{
 // ── TrapFrame accessor shims ──────────────────────────────────────────────────
 // `TrapFrame::syscall_nr`, `::set_return`, and `::arg` are defined as methods
 // on `TrapFrame` in each arch's `trap_frame.rs`. Callers (ipc.rs etc.) use
-// `tf.arg(n)` directly; this comment marks where the free functions used to
-// live so the removal is easy to trace.
+// `tf.arg(n)` directly.
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
 

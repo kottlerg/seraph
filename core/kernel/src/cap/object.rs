@@ -273,8 +273,8 @@ pub struct FrameObject
     /// Per-Frame-cap retype allocator. Stored inline in kernel-owned memory
     /// so userspace `sys_mem_map` writes against the cap's region cannot
     /// corrupt the metadata. Zero-initialised: `bump_offset = 0` and every
-    /// free-list head = `FREE_LIST_END` give the same "fresh cap, all
-    /// bytes available" state the lazy install used to produce.
+    /// free-list head = `FREE_LIST_END` give a fresh cap with all bytes
+    /// available.
     pub allocator: crate::cap::retype::RetypeAllocator,
     /// Per-cap reader/writer lock guarding mutations of `size` (and the
     /// implicit `[base, base+size)` region they describe).

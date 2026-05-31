@@ -156,8 +156,8 @@ Defined in `src/main.rs`:
 
 ## Compile-time options
 
-Boot-protocol v8 removed the kernel command line; ktest's runtime
-knobs now live in `KtestConfig::DEFAULT` in
+The boot protocol carries no kernel command line; ktest's runtime
+knobs live in `KtestConfig::DEFAULT` in
 [`src/cmdline.rs`](src/cmdline.rs) and are baked in at compile time.
 Editing the constant and rebuilding ktest (`cargo xtask build -p
 ktest`) is the canonical way to flip them.

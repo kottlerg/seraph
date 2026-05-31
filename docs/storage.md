@@ -93,11 +93,11 @@ or on-disk UUID. The model is:
   [`SERAPH_ROOT_RISCV64`](../abi/boot-protocol/src/role_guids.rs),
   and the arch-neutral [`SERAPH_DATA`](../abi/boot-protocol/src/role_guids.rs)
   in [`abi/boot-protocol/src/role_guids.rs`](../abi/boot-protocol/src/role_guids.rs).
-- **The EFI System Partition is auto-mounted at `/esp`** after the
-  root mount completes, using the standard ESP type GUID
+- **The EFI System Partition is auto-mounted at `/esp`** immediately
+  after the root self-mount, using the standard ESP type GUID
   `c12a7328-f81f-11d2-ba4b-00a0c93ec93b`. No caller issues a
-  `MOUNT` for `/esp`; vfsd does so internally as part of root-mount
-  handling. ESP mount is best-effort and failure is non-fatal.
+  `MOUNT` for `/esp`; vfsd does so internally at startup. ESP mount
+  is best-effort and failure is non-fatal.
 - **DPS-style priority tie-break.** Where multiple partitions match
   a role GUID, GPT attribute bits 48–63 are compared as an unsigned
   priority; the highest wins. Tied non-zero priorities are a fatal
@@ -119,23 +119,26 @@ is owned by [`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vf
 
 Three actors cooperate to bring a filesystem online:
 
-**init** holds two storage-relevant caps after vfsd is spawned: an
-untokened SEND on vfsd's service endpoint (for the un-gated `MOUNT`
-call), and a `SEED_AUTHORITY`-tokened SEND on the same endpoint
-(required by the `GET_SYSTEM_ROOT_CAP` gate). Init issues exactly
-one `MOUNT` request — the root — over the untokened SEND, then pulls
-the system root via `GET_SYSTEM_ROOT_CAP`, then distributes per-child
-copies on every spawn via `procmgr_labels::CONFIGURE_NAMESPACE`.
-Init retains no further filesystem access of its own.
+**init** holds one storage-relevant cap after vfsd is spawned: a
+`SEED_AUTHORITY`-tokened SEND on vfsd's service endpoint (required by
+the `GET_SYSTEM_ROOT_CAP` gate). Init issues no `MOUNT` — vfsd
+self-mounts root. Init pulls the system root via
+`GET_SYSTEM_ROOT_CAP` (which vfsd serves only once root is mounted, so
+the call blocks until the root filesystem is up), then distributes
+per-child copies on every spawn via
+`procmgr_labels::CONFIGURE_NAMESPACE`. Init retains no further
+filesystem access of its own.
 
-**vfsd** parses the GPT once at startup, resolves the role byte to a
-type GUID, looks the partition up in its parsed table, registers the
-partition bound with virtio-blk, spawns the fs driver, sends
-`FS_MOUNT` to validate the BPB, and captures the driver's root cap
-into the synthetic root (see
+**vfsd** parses the GPT once at startup, then self-mounts the root
+partition: it resolves the arch root GUID, looks the partition up in
+its parsed table, registers the partition bound with virtio-blk,
+spawns the fs driver, sends `FS_MOUNT` to validate the BPB, and
+captures the driver's root cap into the synthetic root (see
 [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)).
-When the requested role is the rootfs, vfsd additionally auto-mounts
-the ESP at `/esp` inside the same handler before replying.
+It then auto-mounts the ESP at `/esp`. Both run before any service
+thread serves a request, so `GET_SYSTEM_ROOT_CAP` never observes an
+unmounted root. The runtime `MOUNT` label is retained for explicit /
+foreign-GUID mounts and shares this resolution path.
 
 **fs driver** runs as a separate process. After `FS_MOUNT` succeeds,
 it serves the cap-native `NS_*` protocol plus the surviving

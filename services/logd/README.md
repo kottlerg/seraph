@@ -1,14 +1,18 @@
 # logd
 
-Post-mount owner of the master system log endpoint.
+Owner of the master system log endpoint.
 
-logd is spawned by init at the end of Phase 2, immediately after the
-root filesystem is mounted and before any Phase 3 service is launched.
-It assumes the receive side of the kernel endpoint that init-logd had
+svcmgr launches and supervises logd post-handover, minting its bootstrap
+round from the reserved log-sink sources init endows (see
+[`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)).
+logd assumes the receive side of the kernel endpoint that init-logd has
 been draining since boot, ingests init-logd's captured history,
-subscribes to procmgr's death-notification cascade, and from then on
-is the single owner of every log line emitted by every userspace
-process.
+subscribes to procmgr's death-notification cascade, and from then on is
+the single owner of every log line emitted by every userspace process.
+It is restartable (`restart = on_failure`): svcmgr holds the master-log
+endpoint source for the system's life, so a restarted logd re-attaches a
+fresh RECV to the same endpoint object every sender already targets; only
+the one-time init-logd history pull is skipped on restart.
 
 ## Role
 
@@ -44,8 +48,8 @@ process.
 
 * **Per-sender slot reclamation.** logd creates an `EventQueue` and
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
-  (authorised by the `DEATH_EQ_AUTHORITY` tokened SEND cap init
-  hands to logd at bootstrap). Procmgr binds that EQ as an
+  (authorised by the `DEATH_EQ_AUTHORITY` tokened SEND cap svcmgr mints
+  into logd's bootstrap round). Procmgr binds that EQ as an
   additional death observer on every existing thread and on every
   future spawn. When a process exits, logd's EQ receives
   `(process_token << 32) | exit_reason`; logd evicts the matching
@@ -57,8 +61,6 @@ process.
 
 * Log rotation, durable-disk persistence, query API.
 * Network-syslog sink.
-* svcmgr-late-launch migration (parallel to the svctest refactor;
-  logd is launched by init for now).
 
 ## Source Layout
 
@@ -79,30 +81,35 @@ logd/
 
 ## Bootstrap caps
 
-Init's bootstrap round (one round, `done = true`) delivers four caps:
+svcmgr's bootstrap round (one round, `done = true`) delivers four caps,
+minted from the reserved log-sink sources svcmgr holds (master-log
+endpoint, procmgr `SEND|GRANT`, devmgr registry):
 
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; HANDOVER_PULL only) |
+| 1 | SEND on the master log endpoint (single-use; HANDOVER_PULL only). `0` on a restart — there is no init-logd left to pull from, so logd skips the history pull |
 | 2 | Tokened SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | Tokened SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE`) |
 
-After `HANDOVER_PULL` completes, logd deletes cap[1] (no other use
-for a SEND cap on its own endpoint). The devmgr-registry cap is kept
-for the lifetime of the process; logd uses it once to resolve and
-cache the serial driver's write endpoint.
+logd registers its death-EQ with procmgr before the handover pull (while
+init-logd still drains the endpoint and procmgr is not yet reaping init),
+then pulls cap[1] and deletes it (no other use for a SEND cap on its own
+endpoint). The devmgr-registry cap is kept for the lifetime of the
+process; logd uses it once to resolve and cache the serial driver's write
+endpoint.
 
 ## Relevant Design Documents
 
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | logd's role in the userspace component map |
-| [docs/bootstrap.md](../../docs/bootstrap.md) | logd's spawn timing inside init's Phase 2 |
+| [docs/bootstrap.md](../../docs/bootstrap.md) | init-logd's boot role and the init → svcmgr handover that precedes logd's launch |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Death-notification cascade logd subscribes to |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | Endpoint identity, cap transfer semantics that make the init-logd handover possible |
 | [docs/console-model.md](../../docs/console-model.md) | Console output ownership; logd as the serial driver's primary client |
-| [services/init/README.md](../init/README.md) | init's Phase 2 epilogue (logd spawn) and init-logd's role + termination |
+| [services/init/README.md](../init/README.md) | init-logd's role + termination, and the reserved log-sink sources init endows svcmgr |
+| [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler + retroactive bind |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts |

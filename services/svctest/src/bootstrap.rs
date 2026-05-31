@@ -4,10 +4,12 @@
 //! Decode the creator-endpoint bootstrap round into a typed [`Caps`].
 //!
 //! Slot layout (set by whichever launcher minted the round):
-//!   * `caps[0]`: tokened SEND on the **root-filesystem's** namespace
-//!     endpoint at its root directory (zero when the launcher could
-//!     not mint one). The driver behind this cap (fatfs today, any
-//!     FS driver tomorrow) is opaque to svctest.
+//!   * `caps[0]`: tokened SEND on the unified **root-filesystem**
+//!     namespace at its root directory (`rootfs.root`; zero when the
+//!     launcher could not mint one). This is vfsd's synthetic system
+//!     root — `NS_LOOKUP` walks it, and vfsd transparently delegates
+//!     to the underlying fs driver (fatfs today), which stays opaque
+//!     to svctest.
 //!   * `caps[1]`: `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's
 //!     service endpoint (zero when pwrmgr is absent)
 //!   * `caps[2]`: SEND on pwrmgr's service endpoint without the
@@ -23,8 +25,9 @@ use std::os::seraph::startup_info;
 #[derive(Default)]
 pub struct Caps
 {
-    /// Tokened SEND on the root filesystem's namespace endpoint at
-    /// its root directory. FS driver behind it is opaque.
+    /// Tokened SEND on the unified root-filesystem namespace at its
+    /// root directory (vfsd's synthetic root). The fs driver behind
+    /// vfsd's delegation is opaque.
     pub root_fs: u32,
     pub pwrmgr_auth: u32,
     pub pwrmgr_noauth: u32,

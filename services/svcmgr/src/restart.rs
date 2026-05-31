@@ -18,7 +18,9 @@
 //! restart cap set.
 
 use crate::REGISTRY_CAPACITY;
-use crate::definitions::launch::{build_blob, resolve_seeds};
+use crate::definitions::launch::{
+    assemble_boot_caps, build_blob, delete_caps, mint_logd_boot_caps, resolve_seeds,
+};
 use crate::service::{MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::{IpcMessage, procmgr_labels};
 
@@ -84,7 +86,7 @@ pub struct StartupBlobs<'a>
 /// `START_PROCESS`.
 ///
 /// `path` is interpreted relative to svcmgr's own `root_dir_cap`
-/// (universal post-#21 init handover), so callers pass paths exactly
+/// (universal), so callers pass paths exactly
 /// as they appear in `.svc` files — e.g. `"/services/logd"`.
 ///
 /// `blobs` carries argv/env for the child. Both paths build them from
@@ -200,6 +202,19 @@ pub struct RestartCtx
     /// the routing in `dispatch_deaths` continues to land on the
     /// correct `ServiceEntry`.
     pub deaths_eq: u32,
+    /// Frame slab svcmgr retypes provider service endpoints from
+    /// (`cap_create_endpoint`). One slab backs every `provides = ...`
+    /// service's endpoint; sized for the handful of provider services.
+    pub endpoint_slab: u32,
+    /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
+    /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
+    pub master_log_source: u32,
+    /// Token-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
+    /// real-logd's `DEATH_EQ_AUTHORITY` SEND from it.
+    pub procmgr_death_auth_source: u32,
+    /// Token-0 `SEND|GRANT` source on devmgr's registry endpoint. svcmgr mints
+    /// real-logd's `REGISTRY_QUERY_AUTHORITY` query cap from it.
+    pub devmgr_registry: u32,
 }
 
 /// Handle a service death detected via event queue notification.
@@ -302,9 +317,9 @@ fn should_restart(svc: &ServiceEntry, exit_reason: u64) -> bool
         return false;
     }
 
-    if svc.module_cap == 0 && svc.vfs_path_len == 0
+    if svc.vfs_path_len == 0
     {
-        std::os::seraph::log!("no restart source (module or vfs_path), cannot restart");
+        std::os::seraph::log!("no restart source (vfs_path), cannot restart");
         return false;
     }
 
@@ -351,50 +366,81 @@ fn restart_process(
         return false;
     }
 
-    // Assemble the restart bootstrap cap set. A service whose recipe
-    // declares `seed = ...` gets those seeds re-resolved from the registry
-    // by name, in declaration order — byte-for-byte the positional set
-    // first launch delivered (see `definitions::launch::launch`). Otherwise
-    // fall back to the registration-time bundle caps (init-bootstrapped
-    // services that registered caps over `REGISTER_SERVICE`). The two
-    // sources are disjoint in practice: recipe-launched services carry
-    // seeds and no bundle; init-registered services carry a bundle and no
-    // seeds. Each cap is freshly derived so the child owns its own copy.
-    let restart_caps: Vec<u32> = match recipe
+    // Assemble the restart bootstrap cap set. The log-sink service (real-logd)
+    // gets a freshly-minted round from the reserved log-sink sources, with no
+    // `HANDOVER_PULL` SEND — init-logd is long gone by any restart, so the
+    // restarted logd skips the history pull and takes over the log endpoint
+    // directly. Senders are unaffected: their SENDs target the endpoint
+    // object, and svcmgr's reserved source kept it alive across the crash.
+    //
+    // Otherwise: a recipe declaring `seed = ...` re-resolves those seeds from
+    // the registry by name, in declaration order — byte-for-byte the
+    // positional set first launch delivered. The fallback to stored bundle
+    // caps is empty in practice (recipe-launched services carry seeds and no
+    // bundle; the init-endowed substrate carries only a thread cap). A
+    // `provides` service's own service-endpoint RECV leads as cap[0]; the
+    // endpoint persists on the entry, so a fresh RECV reattaches the restarted
+    // instance to the same object consumers already hold a SEND on.
+    let boot_caps: Vec<u32> = if matches!(recipe, Some(r) if r.log_sink)
     {
-        Some(r) if !r.seed.is_empty() => resolve_seeds(&r.seed, svc.name_str(), registry),
-        _ =>
+        mint_logd_boot_caps(ctx, false)
+    }
+    else
+    {
+        let restart_caps: Vec<u32> = match recipe
         {
-            let mut caps: Vec<u32> = Vec::new();
-            for i in 0..(svc.bundle_count as usize)
+            Some(r) if !r.seed.is_empty() => resolve_seeds(&r.seed, svc.name_str(), registry),
+            _ =>
             {
-                if caps.len() >= syscall_abi::MSG_CAP_SLOTS_MAX
+                let mut caps: Vec<u32> = Vec::new();
+                for i in 0..(svc.bundle_count as usize)
                 {
-                    break;
-                }
-                let entry = &svc.bundle[i];
-                if entry.cap == 0
-                {
-                    continue;
-                }
-                let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_SEND)
-                else
-                {
-                    std::os::seraph::log!("cannot derive bundle cap for restart");
-                    for &derived in &caps
+                    if caps.len() >= syscall_abi::MSG_CAP_SLOTS_MAX
                     {
-                        if derived != 0
-                        {
-                            let _ = syscall::cap_delete(derived);
-                        }
+                        break;
                     }
-                    let _ = syscall::cap_delete(new_thread_cap);
-                    return false;
-                };
-                caps.push(c);
+                    let entry = &svc.bundle[i];
+                    if entry.cap == 0
+                    {
+                        continue;
+                    }
+                    let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_SEND)
+                    else
+                    {
+                        std::os::seraph::log!("cannot derive bundle cap for restart");
+                        for &derived in &caps
+                        {
+                            if derived != 0
+                            {
+                                let _ = syscall::cap_delete(derived);
+                            }
+                        }
+                        let _ = syscall::cap_delete(new_thread_cap);
+                        return false;
+                    };
+                    caps.push(c);
+                }
+                caps
             }
-            caps
+        };
+
+        let provided_recv = if svc.provided_endpoint != 0
+        {
+            if let Ok(recv) = syscall::cap_derive(svc.provided_endpoint, syscall::RIGHTS_RECEIVE)
+            {
+                recv
+            }
+            else
+            {
+                std::os::seraph::log!("restart: provider RECV derive failed");
+                0
+            }
         }
+        else
+        {
+            0
+        };
+        assemble_boot_caps(provided_recv, restart_caps)
     };
 
     // SAFETY: ctx.ipc_buf is the registered IPC buffer.
@@ -404,7 +450,7 @@ fn restart_process(
             child_token,
             ctx.ipc_buf,
             true,
-            &restart_caps,
+            &boot_caps,
             &[],
         )
     }
@@ -416,13 +462,7 @@ fn restart_process(
         // (delete of an already-transferred slot is a no-op). Child
         // is started; cannot destroy from here — it will exit on the
         // receive-side failure and procmgr will reap.
-        for &derived in &restart_caps
-        {
-            if derived != 0
-            {
-                let _ = syscall::cap_delete(derived);
-            }
-        }
+        delete_caps(&boot_caps);
         let _ = syscall::cap_delete(new_thread_cap);
         return false;
     }
@@ -432,10 +472,9 @@ fn restart_process(
     rebind_death_notification(svc, ctx.deaths_eq, new_thread_cap, correlator)
 }
 
-/// Spawn a fresh instance of `svc` via procmgr. Branches on the recorded
-/// restart source: VFS path → [`walk_and_create_from_file`]; module
-/// cap → `CREATE_PROCESS`. After create, applies the per-service
-/// namespace policy recorded at registration via
+/// Spawn a fresh instance of `svc` via procmgr from its recorded
+/// `vfs_path` ([`walk_and_create_from_file`]). After create, applies the
+/// per-service namespace policy recorded at registration via
 /// `CONFIGURE_NAMESPACE`. Returns `(process_handle, thread, child_token)`.
 fn create_process(
     svc: &ServiceEntry,
@@ -443,72 +482,31 @@ fn create_process(
     ctx: &RestartCtx,
 ) -> Option<(u32, u32, u64)>
 {
-    let created = if svc.vfs_path_len > 0
+    if svc.vfs_path_len == 0
     {
-        let path_bytes = &svc.vfs_path[..svc.vfs_path_len as usize];
-        let path_str = core::str::from_utf8(path_bytes).ok()?;
-        // Replay argv/env from the stored recipe so the respawned child
-        // gets the same startup surfaces first launch built. The blobs
-        // must outlive the create call — `StartupBlobs` borrows them.
-        let (argv_blob, argv_count) =
-            recipe.map_or_else(|| (Vec::new(), 0), |r| build_blob(&r.argv));
-        let (env_blob, env_count) = recipe.map_or_else(|| (Vec::new(), 0), |r| build_blob(&r.env));
-        let blobs = StartupBlobs {
-            argv: &argv_blob,
-            argv_count,
-            env: &env_blob,
-            env_count,
-        };
-        walk_and_create_from_file(
-            path_str,
-            blobs,
-            ctx.procmgr_ep,
-            ctx.bootstrap_ep,
-            ctx.ipc_buf,
-        )?
+        std::os::seraph::log!("restart: no vfs_path source for {}", svc.name_str());
+        return None;
     }
-    else
-    {
-        // TODO(#78): this module-cap restart branch is unreachable today —
-        // `ServiceEntry::module_cap` is never populated (REGISTER_SERVICE
-        // delivers only a thread cap; the restart source is set from
-        // `vfs_path` by the reconcile pass), so `create_process` always takes
-        // the `vfs_path` arm above. Deferred to #78, which decides whether
-        // svcmgr must restart boot-substrate services from an in-memory ELF
-        // before the filesystem is reachable. If so, init endows svcmgr with
-        // those module source caps (excluding them from its reap donation)
-        // and this branch goes live; otherwise drop `module_cap` and this
-        // branch and restart everything from `vfs_path`.
-        let (child_token, tokened_creator) = mint_child_creator(ctx.bootstrap_ep)?;
-        let Ok(module_copy) = syscall::cap_derive(svc.module_cap, syscall::RIGHTS_ALL)
-        else
-        {
-            let _ = syscall::cap_delete(tokened_creator);
-            return None;
-        };
-        let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-            .cap(module_copy)
-            .cap(tokened_creator)
-            .build();
-        // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
-        let reply = unsafe { ipc::ipc_call(ctx.procmgr_ep, &create_msg, ctx.ipc_buf) }.ok()?;
-        if reply.label != 0
-        {
-            std::os::seraph::log!("restart create failed");
-            return None;
-        }
-        let reply_caps = reply.caps();
-        if reply_caps.len() < 2
-        {
-            std::os::seraph::log!("restart reply missing caps");
-            return None;
-        }
-        CreatedProcess {
-            process_handle: reply_caps[0],
-            thread_cap: reply_caps[1],
-            child_token,
-        }
+    let path_bytes = &svc.vfs_path[..svc.vfs_path_len as usize];
+    let path_str = core::str::from_utf8(path_bytes).ok()?;
+    // Replay argv/env from the stored recipe so the respawned child gets the
+    // same startup surfaces first launch built. The blobs must outlive the
+    // create call — `StartupBlobs` borrows them.
+    let (argv_blob, argv_count) = recipe.map_or_else(|| (Vec::new(), 0), |r| build_blob(&r.argv));
+    let (env_blob, env_count) = recipe.map_or_else(|| (Vec::new(), 0), |r| build_blob(&r.env));
+    let blobs = StartupBlobs {
+        argv: &argv_blob,
+        argv_count,
+        env: &env_blob,
+        env_count,
     };
+    let created = walk_and_create_from_file(
+        path_str,
+        blobs,
+        ctx.procmgr_ep,
+        ctx.bootstrap_ep,
+        ctx.ipc_buf,
+    )?;
 
     let cwd = recipe.and_then(|r| r.cwd.as_deref());
     if !apply_namespace_policy(svc, cwd, created.process_handle, created.thread_cap, ctx)

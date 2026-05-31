@@ -2,8 +2,8 @@
 
 Bootstrap service and first userspace process. The kernel starts init at the end
 of its initialization sequence. Init runs a three-stage bootstrap — raw memmgr /
-procmgr creation, root mount, then handover to svcmgr — and exits. It is not a
-long-lived service manager.
+procmgr creation, root acquisition, then handover to svcmgr — and exits. It is
+not a long-lived service manager.
 
 ---
 
@@ -18,8 +18,8 @@ init/
 └── src/
     ├── main.rs                 # _start, run() orchestration across the three stages
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup
-    ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr, logd, timed, pwrmgr) and phase3_svcmgr_handover
-    ├── mount.rs                # Root MOUNT exchange + GET_SYSTEM_ROOT_CAP pull
+    ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr) and phase3_svcmgr_handover
+    ├── mount.rs                # GET_SYSTEM_ROOT_CAP pull (vfsd self-mounts root)
     ├── logging.rs              # init-logd thread (serves the log endpoint until real-logd takes over)
     ├── walk.rs                 # /services/<name> path walker over the seed system-root cap
     └── arch/                   # Per-arch serial init (x86-64, riscv64)
@@ -38,19 +38,30 @@ Init runs three stages between `_start` and `sys_thread_exit`:
 1. **Raw bootstrap** — version-check `InitInfo`, set up the IPC buffer, mint
    endpoints, spawn init-logd, bring up memmgr and procmgr via raw syscalls,
    then drive procmgr IPC to create devmgr and vfsd.
-2. **Root mount** — issue `MOUNT(MountRole::Root, "/")` to vfsd (vfsd resolves
-   the role to the arch-specific Seraph root GPT type-GUID), pull the seed
-   `system_root_cap` via `GET_SYSTEM_ROOT_CAP`, then launch real-logd from
-   `/services/logd` and hand off the master log endpoint via `HANDOVER_PULL`.
-3. **Handover** — spawn svcmgr, timed, and pwrmgr (the per-arch RTC
-   chip driver is devmgr-spawned during devmgr's enumeration sweep
-   and resolved by timed via `QUERY_RTC_DEVICE`); publish the
-   well-known caps (`rootfs.root`, `pwrmgr.shutdown`, `pwrmgr.deny`,
-   `svcmgr`, `timed`); register every init-bootstrapped service with svcmgr via
-   `REGISTER_SERVICE`; signal `HANDOVER_COMPLETE`; hand init's own
-   kernel objects + reclaimable Frame caps to procmgr via
-   `REGISTER_INIT_TEARDOWN`; call `sys_thread_exit`. Procmgr's death-EQ
-   observer then runs the reap path.
+2. **Root acquisition** — vfsd self-mounts the Seraph root partition at `/`
+   on its own startup; init issues no `MOUNT`. Pull the seed
+   `system_root_cap` via `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once
+   root is mounted, so the call blocks until root is up). The init-logd
+   thread keeps serving the master log endpoint and writing serial directly;
+   the svcmgr-launched real-logd takes over the endpoint and pulls init-logd's
+   captured history via `HANDOVER_PULL` post-handover.
+3. **Handover** — load svcmgr and serve it the handover endowment over
+   the bootstrap-round protocol: its own endpoints, the publish-role
+   source caps (`rootfs.root` SEND, devmgr-registry `SEND|GRANT` source),
+   one `(name, thread_cap)` round per init-bootstrapped substrate
+   service, and a terminal round carrying the reserved log-sink sources
+   (master-log endpoint + procmgr `SEND|GRANT`) svcmgr keeps to launch and
+   supervise real-logd. Signal `HANDOVER_COMPLETE`; hand init's own kernel
+   objects + reclaimable Frame caps to procmgr via `REGISTER_INIT_TEARDOWN`;
+   call `sys_thread_exit`. Procmgr binds a death-EQ on both init threads
+   (main + init-logd) and runs the reap path once both have exited.
+   svcmgr publishes the well-known names it now owns (`rootfs.root`,
+   `svcmgr`, `devmgr.registry`) and installs devmgr's `/services/drivers/`
+   cap via `SET_DRIVERS_DIR` from the endowment; it then launches the
+   non-bootstrap services itself — `timed` and `pwrmgr` (providers), the
+   staged test harnesses — and publishes their names. The per-arch RTC
+   chip driver is devmgr-spawned lazily after `SET_DRIVERS_DIR` and
+   resolved by timed via `QUERY_RTC_DEVICE`.
 
 See [docs/bootstrap.md](docs/bootstrap.md) for the authoritative
 stage-by-stage enumeration, source citations, and per-stage capability
@@ -87,8 +98,8 @@ transfer table.
 | [services/memmgr/README.md](../memmgr/README.md) | First service init creates; receives the RAM Frame pool |
 | [services/procmgr/README.md](../procmgr/README.md) | Owns process creation post-bootstrap; runs init's reap path |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Takes over as resident supervisor after `HANDOVER_COMPLETE` |
-| [services/logd/README.md](../logd/README.md) | Master log endpoint owner post-Phase-2-epilogue |
-| [services/pwrmgr/README.md](../pwrmgr/README.md) | Receives arch authority + ACPI Frame caps during handover |
+| [services/logd/README.md](../logd/README.md) | Master log endpoint owner; svcmgr-launched, pulls init-logd's history at handover |
+| [services/pwrmgr/README.md](../pwrmgr/README.md) | svcmgr-launched post-handover; acquires its shutdown caps from devmgr, not from init |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 | [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |
 

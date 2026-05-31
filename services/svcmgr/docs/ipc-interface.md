@@ -1,6 +1,6 @@
 # svcmgr IPC Interface
 
-IPC interface specification for svcmgr: service registration (v3 wire),
+IPC interface specification for svcmgr: the init handover endowment,
 handover-driven reconciliation, and the discovery-registry publish /
 query surface.
 
@@ -9,10 +9,9 @@ query surface.
 ## Endpoint
 
 svcmgr listens on a single IPC endpoint (the svcmgr service endpoint).
-Init holds the Send-side capability and uses it to register currently-
-running services and publish well-known caps during bootstrap. svcmgr
-holds the Receive-side capability and multiplexes it with the shared
-death-notification EventQueue via a WaitSet.
+svcmgr holds the Receive-side capability (delivered in the handover
+endowment) and multiplexes it with the shared death-notification
+EventQueue via a WaitSet.
 
 A SEND on the same endpoint (without the [`PUBLISH_AUTHORITY`](#publish-authority)
 verb bit) is delivered to every process via
@@ -21,60 +20,72 @@ verb bit) is delivered to every process via
 
 ---
 
+## Handover endowment (bootstrap rounds)
+
+svcmgr's entire startup state arrives over init's bootstrap-round
+protocol (the same mechanism that delivers every service's startup caps),
+not a dedicated registration label. init serves the rounds on its
+bootstrap endpoint; svcmgr drains them in
+[`service::bootstrap_caps`](../src/service.rs). Each round is tagged by
+kind in `data[0]`:
+
+**Round 1 — `CAPS` (`data[0] = 1`, not terminal):**
+
+| Field | Value |
+|---|---|
+| caps[0] | svcmgr's service endpoint (RECV) |
+| caps[1] | svcmgr's own bootstrap endpoint (RECV — serves launched/restarted children) |
+| caps[2] | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; `0` if init could not derive it) |
+| caps[3] | `SEND\|GRANT`, token-0 source on devmgr's registry endpoint (`0` if absent) |
+| data[0] | `1` (`CAPS`) |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `4`) handshake |
+
+svcmgr mints the `devmgr.registry` publish cap
+(`REGISTRY_QUERY_AUTHORITY`) and the `SET_DRIVERS_DIR` cap
+(`DRIVERS_DIR_AUTHORITY`) from caps[3]. A version mismatch in `data[1]`
+aborts bootstrap (svcmgr exits).
+
+**Rounds 2..N — `SUBSTRATE` (`data[0] = 2`; the final round is terminal):**
+one per init-bootstrapped substrate service (memmgr, procmgr, devmgr,
+vfsd, logd).
+
+| Field | Value |
+|---|---|
+| caps[0] | the service's main thread cap (Control right) for death-notification binding |
+| data[0] | `2` (`SUBSTRATE`) |
+| data[1] | `name_len` (byte length of the service name) |
+| data[2..] | service name bytes packed LE into `u64` words (≤ 32 bytes) |
+
+svcmgr parks each pair in its pending-registration table. It does **not**
+bind death-notification at endowment time — the matching `.svc`
+definition is paired at reconciliation, on
+[`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
+endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
+`svcmgr`, `devmgr.registry`) into its own registry and installs devmgr's
+`/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event
+loop.
+
+---
+
 ## Messages
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). The message
 label field identifies the operation.
 
-### Label 1: `REGISTER_SERVICE` (v3)
-
-Register a currently-running service for supervision.
-
-Post-#21 the recipe (binary, argv, env, restart policy, criticality,
-namespace shape, seed names) lives on disk at
-`/config/svcmgr/services/<name>.svc`. This message conveys only what
-cannot be on disk: which named recipe the running process implements,
-and the thread cap svcmgr binds death-notification on at
-reconciliation time.
-
-**Request:**
-
-| Field | Value |
-|---|---|
-| label | `1` |
-| word 0 | `SVCMGR_LABELS_VERSION` (currently `3`) handshake |
-| word 1 | `name_len` (byte length of the service name) |
-| words 2.. | service name bytes packed into `u64` words (up to 32 bytes) |
-| caps[0] | Thread capability (Control right) for death-notification binding |
-
-**Reply:**
-
-| label value | Meaning |
-|---|---|
-| `0` (`SUCCESS`) | Entry parked in svcmgr's pending-registration table |
-| `LABEL_VERSION_MISMATCH` | `word 0` does not equal svcmgr's `SVCMGR_LABELS_VERSION` |
-| `INVALID_NAME` | `name_len` is 0 or exceeds 32 |
-| `TABLE_FULL` | Pending table is full |
-| `INSUFFICIENT_CAPS` | `caps[0]` missing or zero |
-
-At register time svcmgr does **not** bind death-notification — the
-matching `.svc` definition may not yet exist; reconciliation happens
-on [`HANDOVER_COMPLETE`](#label-2-handover_complete).
-
 ### Label 2: `HANDOVER_COMPLETE`
 
-Signals that init has finished registering services and publishing
-well-known caps. svcmgr replies `SUCCESS` immediately (so init can
-proceed to teardown), then runs
+Signals that init has finished serving the handover endowment. svcmgr
+replies `SUCCESS` immediately (so init can proceed to teardown), then runs
 [`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
 
 1. Scan `/config/svcmgr/services/`, parse each `.svc` into a
    [`Definition`](../src/definitions/mod.rs).
-2. Reconcile against the pending-registration table:
-   * **registered AND defined** — bind death-notification, record a
+2. Reconcile against the pending-registration table (the substrate pairs
+   parked from the endowment):
+   * **parked AND defined** — bind death-notification, record a
      `ServiceEntry` with the parsed recipe.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
-   * **registered without definition** — log `registered without
+   * **parked without definition** — log `registered without
      definition: <name>; refusing to bind`.
 3. After reconciliation the supervision loop continues unchanged.
 
@@ -142,14 +153,18 @@ freshly-derived `RIGHTS_SEND` cap on the published endpoint.
 ## Publish authority
 
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
-caller's cap token) gating `PUBLISH_ENDPOINT`. Init mints
-`PUBLISH_AUTHORITY`-tokened SENDs on svcmgr's service endpoint locally
-from the un-tokened source it owns; the SEND distributed to every
-process via `ProcessInfo.service_registry_cap` carries a per-process
-token *without* the bit, so it is accepted for `QUERY_ENDPOINT` only.
+caller's cap token) gating `PUBLISH_ENDPOINT` for *external* publishers.
+svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
+`devmgr.registry`, and each provider's `provides` names) directly into
+its own registry, so those need no token. The gate exists for a future
+external publisher — devmgr holds a `PUBLISH_AUTHORITY`-tokened SEND from
+its bootstrap bundle, reserved for driver registrations. The SEND
+distributed to every process via `ProcessInfo.service_registry_cap`
+carries a per-process token *without* the bit, so it is accepted for
+`QUERY_ENDPOINT` only.
 
-Cap derivation for the publish cap MUST use `RIGHTS_SEND_GRANT`, not
-`RIGHTS_SEND`: `PUBLISH_ENDPOINT` carries the value cap in the
+Cap derivation for an external publish cap MUST use `RIGHTS_SEND_GRANT`,
+not `RIGHTS_SEND`: `PUBLISH_ENDPOINT` carries the value cap in the
 message body, and the IPC kernel requires the GRANT bit on the
 caller's send-cap to transfer caps.
 

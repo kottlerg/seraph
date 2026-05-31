@@ -162,7 +162,7 @@ impl VfsdRootBackend
     /// Walks `path`'s components, creating synthetic intermediates on
     /// demand, and sets `terminal_cap` on the final node. The empty
     /// path (`/`) installs `cap` as the synthetic root's
-    /// `fallthrough_cap`.
+    /// `fallthrough_cap` (the root mount).
     ///
     /// Returns `Some(InstallResult)` listing newly-created
     /// intermediate indices on success; the caller is expected to
@@ -170,13 +170,19 @@ impl VfsdRootBackend
     /// [`Self::set_fallthrough_cap`].
     ///
     /// Returns `None` on tree exhaustion, oversize component
-    /// (`> MAX_ENTRY_NAME`), or attempting to mount on top of an
-    /// already-terminal node.
+    /// (`> MAX_ENTRY_NAME`), attempting to mount on top of an
+    /// already-terminal node, or re-installing the root mount.
     pub fn install(&mut self, path: &[u8], cap: u32) -> Option<InstallResult>
     {
         let stripped = path.strip_prefix(b"/").unwrap_or(path);
         if stripped.is_empty()
         {
+            if self.nodes[0].fallthrough_cap != 0
+            {
+                // Root is already mounted; reject rather than overwrite
+                // the cap and leak the running root fs driver.
+                return None;
+            }
             self.nodes[0].fallthrough_cap = cap;
             return Some(InstallResult::empty());
         }
@@ -199,6 +205,10 @@ impl VfsdRootBackend
         if total == 0
         {
             // Path was something like `///` — treat as root.
+            if self.nodes[0].fallthrough_cap != 0
+            {
+                return None;
+            }
             self.nodes[0].fallthrough_cap = cap;
             return Some(InstallResult::empty());
         }

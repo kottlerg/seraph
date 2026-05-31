@@ -580,9 +580,10 @@ fn dispatch_death(
         let exit_reason = payload & 0xFFFF_FFFF;
         if correlator == procmgr_labels::INIT_REAP_CORRELATOR
         {
-            // Init's main thread exited. Run the reap sequence that
-            // tears down init's AS/CSpace/Thread objects and donates
-            // its reclaimable Frame caps to memmgr's pool.
+            // An init thread exited. `run_reap` counts down the two init
+            // threads and, on the last exit, tears down init's
+            // AS/CSpace/Thread objects and donates its reclaimable Frame
+            // caps to memmgr's pool.
             init_reap::run_reap(memmgr_ep, ipc_buf);
             continue;
         }

@@ -78,6 +78,17 @@ responsibilities are:
   driver (`QUERY_FRAMEBUFFER_DEVICE`), timed resolves the platform RTC
   (`QUERY_RTC_DEVICE`), and netd in due course. devmgr owns each driver's
   service endpoint and mints a tokened SEND on query.
+- **Broker ACPI and shutdown hardware to pwrmgr** — devmgr is the sole
+  owner of the ACPI Frame caps and the only service that walks the ACPI
+  table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by
+  signature or physical address and serves a read-only view of it (devmgr
+  reads only the directory and table headers, never a table body).
+  `QUERY_SHUTDOWN_DEVICE` carves the shutdown-actuator caps pwrmgr asks
+  for — a narrow `IoPortRange` over the PM1a control and 8042 reset ports
+  on x86-64 (the port pwrmgr computed from the FADT), or a `cap_derive`
+  copy of `SbiControl` on RISC-V. devmgr runs no shutdown logic; it brokers
+  the hardware, pwrmgr interprets and actuates. Both are gated on
+  `REGISTRY_QUERY_AUTHORITY`.
 - **Handle hotplug** — on platforms that support it, receive hotplug
   notifications and dynamically spawn or terminate driver processes. See
   [`docs/hotplug.md`](docs/hotplug.md).
@@ -95,8 +106,9 @@ how devmgr uses them.
 |---|---|---|
 | MMIO Region (per platform resource) | Map | Map device register regions into driver address spaces |
 | Interrupt (per IRQ line) | — | Delegate to drivers for hardware interrupt delivery |
-| IoPortRange (x86-64, per range) | Use | Delegate to drivers requiring port I/O |
-| Frame (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob, including full IOMMU topology (DMAR on x86-64, `iommu` / `iommu-map` on RISC-V) |
+| IoPortRange (x86-64, root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
+| SbiControl (RISC-V, root) | Delegate | Broker a copy to pwrmgr for SBI SRST shutdown / reboot |
+| Frame (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob (incl. IOMMU topology: DMAR on x86-64, `iommu` / `iommu-map` on RISC-V); broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE` |
 | SchedControl | Elevate | Assign elevated priorities to latency-sensitive drivers |
 
 IOMMU register regions are not pre-minted as distinct capabilities.

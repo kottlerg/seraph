@@ -121,7 +121,7 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 ///
 /// Returns the table entry's `CSpace` slot index, or `None` if no
 /// entry carries the requested name. This is init's only module-cap
-/// lookup; the v6 ordinal surface (`module_frame_base + N`) is gone.
+/// lookup; modules are addressed by name through the table.
 pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u32>
 {
     init_protocol::find_module_slot(info, name)
@@ -451,13 +451,12 @@ fn run(info_ptr: u64) -> !
     // log_ep) are satisfied so init's own subsequent log lines ride IPC
     // through the mediator instead of direct serial.
     //
-    // Real `logd` (loaded from `/services/logd` at the end of Phase 2,
-    // post-root-mount) takes over the receive side via the
+    // Real `logd` (svcmgr-launched post-handover from the reserved log-sink
+    // sources init endows) takes over the receive side via the
     // `log_labels::HANDOVER_PULL` exchange — see
-    // `service::create_and_start_logd` and
-    // `services/logd/docs/handover-protocol.md`. The same kernel
-    // endpoint object is reused, so every existing tokened SEND cap
-    // survives the handover unchanged.
+    // `services/logd/docs/handover-protocol.md`. The same kernel endpoint
+    // object is reused, so every existing tokened SEND cap survives the
+    // handover unchanged.
     let Ok(log_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
@@ -466,8 +465,9 @@ fn run(info_ptr: u64) -> !
     };
 
     // Log thread cap retained so init's reap-handoff
-    // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it, letting procmgr
-    // reclaim the init-logd TCB after init's main thread exits.
+    // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it: procmgr binds a
+    // death-EQ on both init threads and reclaims the init-logd TCB once init
+    // is threadless (init-logd outlives main until real-logd's handover).
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
     let init_logd_thread_cap = logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap);
 
@@ -644,8 +644,7 @@ fn run(info_ptr: u64) -> !
     //       procmgr's CSpace by `bootstrap_procmgr`. Procmgr derives a
     //       tokened SEND per child for `ProcessInfo.service_registry_cap`.
     //
-    // No data words: procmgr no longer maintains a frame pool; every
-    // per-child allocation routes through memmgr.
+    // No data words: every per-child allocation routes through memmgr.
     let Ok(pm_service_cap_for_pm) = syscall::cap_derive(procmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
@@ -691,10 +690,8 @@ fn run(info_ptr: u64) -> !
     };
 
     // Derive a tokened call cap with the `SEED_AUTHORITY` bit set so vfsd's
-    // `GET_SYSTEM_ROOT_CAP` accepts the init request. `INGEST_AUTHORITY` is
-    // no longer needed (`INGEST_CONFIG_MOUNTS` was removed alongside
-    // `mounts.conf`); MOUNT is un-gated and keeps using the un-tokened
-    // service cap.
+    // `GET_SYSTEM_ROOT_CAP` accepts the init request. MOUNT is un-gated and
+    // uses the un-tokened service cap.
     let Ok(vfsd_seed_cap) = syscall::cap_derive_token(
         vfsd_service_ep,
         syscall::RIGHTS_SEND,
@@ -754,62 +751,32 @@ fn run(info_ptr: u64) -> !
 
     logging::log("phase 1 bootstrap complete");
 
-    // ── Phase 2: mount root filesystem ──────────────────────────────────────
+    // ── Phase 2: acquire the system-root cap ─────────────────────────────────
 
-    // Boot protocol v8 removed the kernel command line; the root partition
-    // is identified by its GPT type-GUID (`role_guids::SERAPH_ROOT_<arch>`).
-    // vfsd resolves the role to a partition entry on its side; init just
-    // names the role.
-    logging::log("phase 2: mounting root filesystem");
-    let root_mount = mount::send_mount(vfsd_service_ep, ipc_buf, mount::MountRole::Root, b"/");
-    if !root_mount.success
-    {
-        logging::log("FATAL: root mount failed");
-        syscall::thread_exit();
-    }
-    logging::log("phase 2: root mounted at /");
-
-    // `/config/mounts.conf` and `INGEST_CONFIG_MOUNTS` are gone. Additional
-    // partitions (e.g. the ESP, mounted at `/esp`) are discovered and mounted
-    // by vfsd directly via GPT type-GUID lookup.
-
-    // Acquire init's seed system-root cap. Drives every Phase 3
-    // walk-and-spawn — children receive a `cap_copy` of this cap via
-    // `procmgr_labels::CONFIGURE_NAMESPACE`. The `SEED_AUTHORITY`
-    // tokened cap is required by vfsd's `GET_SYSTEM_ROOT_CAP` gate.
+    // vfsd self-mounts the root partition at `/` (and the ESP at `/esp`) on
+    // its own startup, identifying partitions by GPT type-GUID; init issues
+    // no MOUNT and reads no mount-config file.
+    //
+    // Acquire init's seed system-root cap. vfsd serves this only once root
+    // is mounted, so the call blocks until the root filesystem is up. The
+    // cap drives every Phase 3 walk-and-spawn — children receive a
+    // `cap_copy` via `procmgr_labels::CONFIGURE_NAMESPACE`. The
+    // `SEED_AUTHORITY` tokened cap is required by vfsd's gate.
+    logging::log("phase 2: acquiring system-root cap (vfsd self-mounts root)");
     let system_root_cap = mount::request_system_root(vfsd_seed_cap, ipc_buf);
     if system_root_cap == 0
     {
         logging::log("FATAL: GET_SYSTEM_ROOT_CAP from vfsd failed");
         syscall::thread_exit();
     }
+    logging::log("phase 2: root available");
 
-    // ── Phase 2 epilogue: launch real logd ──────────────────────────────────
-    //
-    // Spawned at the end of Phase 2 (after root mount, with
-    // system_root_cap in hand) so logd can be walked from
-    // `/services/logd`. Hands over the master log endpoint via
-    // `HANDOVER_PULL` IPC inside logd's bootstrap; init-logd's
-    // receive loop self-terminates after replying the final chunk.
-    // From here on the same kernel endpoint object carries every
-    // sender's messages to real-logd's RECV — no live writer
-    // re-registers.
-    logging::log("phase 2: launching logd");
-    thread_caps.logd = service::create_and_start_logd(
-        endpoint_cap,
-        endpoint_cap,
-        init_bootstrap_ep,
-        log_ep,
-        devmgr_registry_ep,
-        system_root_cap,
-        info.cspace_cap,
-        ipc_buf,
-    )
-    .unwrap_or_else(|| {
-        logging::log("phase 2: logd launch failed; init-logd remains the receiver");
-        0
-    });
-
+    // init-logd (the serial-writer thread) serves the master log endpoint
+    // and writes serial directly until the svcmgr-launched real-logd pulls
+    // `HANDOVER_PULL`; it outlives init's main thread, so procmgr reaps init
+    // only once both init threads have exited (reap-on-threadless). svcmgr
+    // launches real-logd post-handover from the reserved log-sink sources
+    // endowed in Phase 3.
     logging::log("phase 2 bootstrap complete");
 
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
@@ -827,7 +794,7 @@ fn run(info_ptr: u64) -> !
         svcmgr_service_ep,
         devmgr_registry_ep,
         system_root_cap,
-        root_mount.root_cap,
+        log_ep,
         thread_caps,
         ipc_buf,
         init_logd_thread_cap,

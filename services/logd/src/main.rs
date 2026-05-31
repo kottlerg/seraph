@@ -6,7 +6,7 @@
 //! Seraph system log daemon — post-mount owner of the master log
 //! endpoint.
 //!
-//! Spawned by init at the end of Phase 2, real-logd:
+//! Launched and supervised by svcmgr, real-logd:
 //!
 //! 1. Receives via bootstrap protocol a RECV cap on the master log
 //!    endpoint, a SEND cap on the same endpoint (single-use, for the
@@ -126,18 +126,40 @@ fn main() -> !
     // covered the pre-driver window) while history still accrues.
     serial_init(caps.devmgr_registry_ep, ipc_buf);
 
-    self_log("started; pulling init-logd handover state");
-
     let mut table = SlotTable::default();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    unsafe { handover::pull_all(caps.log_ep_handover_send, ipc_buf, &mut table) };
 
-    // Handover send cap is single-use; drop it now so we don't carry a
-    // SEND cap to the log endpoint around (the only legitimate path
-    // for that cap was the handover IPC).
-    let _ = syscall::cap_delete(caps.log_ep_handover_send);
-
+    // Set up the death-notification queue + wait set and register with procmgr
+    // BEFORE pulling the handover. The pull causes init-logd to exit, which
+    // triggers procmgr's init-reap; that reap logs, and until logd reaches its
+    // draining loop there is no other reader on the log endpoint. Registering
+    // here — while init's main has already exited but init-logd is still
+    // serving, so procmgr is not yet reaping init — keeps logd from blocking on
+    // procmgr in that window, which would deadlock against procmgr blocking on
+    // the unmanned log endpoint. After the pull, logd reaches `event_loop` with
+    // no further procmgr dependency, so it drains the reap's log line itself.
+    let Some(death_eq) = create_death_eq()
+    else
     {
+        self_log("FATAL: death-EQ create failed; halting");
+        syscall::thread_exit();
+    };
+    register_with_procmgr(caps.procmgr_death_auth_send, death_eq, ipc_buf);
+    let Some(ws_cap) = create_wait_set(caps.log_ep_recv, death_eq)
+    else
+    {
+        self_log("FATAL: wait_set create failed; halting");
+        syscall::thread_exit();
+    };
+
+    if caps.log_ep_handover_send != 0
+    {
+        // First launch: pull init-logd's accrued boot history, then drop the
+        // single-use SEND so logd carries no SEND cap to its own log endpoint.
+        self_log("started; pulling init-logd handover state");
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { handover::pull_all(caps.log_ep_handover_send, ipc_buf, &mut table) };
+        let _ = syscall::cap_delete(caps.log_ep_handover_send);
+
         let mut buf = SerialFmt::new();
         let _ = write!(
             buf,
@@ -147,22 +169,13 @@ fn main() -> !
         );
         buf.flush_self_log();
     }
-
-    let Some(death_eq) = create_death_eq()
     else
     {
-        self_log("FATAL: death-EQ create failed; halting");
-        syscall::thread_exit();
-    };
-
-    register_with_procmgr(caps.procmgr_death_auth_send, death_eq, ipc_buf);
-
-    let Some(ws_cap) = create_wait_set(caps.log_ep_recv, death_eq)
-    else
-    {
-        self_log("FATAL: wait_set create failed; halting");
-        syscall::thread_exit();
-    };
+        // A svcmgr restart: there is no handover source (init-logd exited
+        // after the first launch). Serve a fresh table; in-flight history
+        // from the prior instance is not recoverable.
+        self_log("started (restart); no handover source, serving fresh");
+    }
 
     event_loop(ws_cap, death_eq, caps.log_ep_recv, ipc_buf, &mut table);
 }

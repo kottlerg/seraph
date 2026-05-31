@@ -15,7 +15,17 @@
 
 use namespace_protocol::rights as ns_rights;
 
-use super::{Definition, NamespaceShape, RestartPolicy};
+use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy};
+
+/// Token stamped on an `:auth` provider SEND — the universal
+/// verb-authority bit (`1 << 63`), shared by every `*_AUTHORITY`
+/// constant the various services gate on.
+const PROVIDES_AUTH_TOKEN: u64 = 1 << 63;
+/// Token stamped on a `:deny` provider SEND — present so the cap
+/// resolves, but lacking the authority bit, so the server's
+/// `token & (1 << 63)` gate fails. Distinct from a bare (untokened)
+/// entry only in intent; both are rejected by an authority gate.
+const PROVIDES_DENY_TOKEN: u64 = 1;
 
 /// Reasons a `.svc` file is rejected. Stringified into the boot log so
 /// an operator can find the bad line at a glance.
@@ -59,11 +69,14 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut namespace: Option<NamespaceShape> = None;
     let mut cwd: Option<String> = None;
     let mut seed: Vec<String> = Vec::new();
+    let mut provides: Vec<ProvidedName> = Vec::new();
+    let mut log_sink: Option<bool> = None;
 
     let mut seen_argv = false;
     let mut seen_env = false;
     let mut seen_cwd = false;
     let mut seen_seed = false;
+    let mut seen_provides = false;
 
     for (idx, raw) in contents.lines().enumerate()
     {
@@ -179,6 +192,67 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 seen_seed = true;
                 seed = value.split_whitespace().map(str::to_owned).collect();
             }
+            "provides" =>
+            {
+                if seen_provides
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "provides"));
+                }
+                seen_provides = true;
+                for tok in value.split_whitespace()
+                {
+                    let (name, token) = match tok.split_once(':')
+                    {
+                        Some((n, "auth")) => (n, PROVIDES_AUTH_TOKEN),
+                        Some((n, "deny")) => (n, PROVIDES_DENY_TOKEN),
+                        Some((_, _)) =>
+                        {
+                            return Err(ParseError::InvalidValue(
+                                lineno,
+                                "provides suffix must be :auth or :deny",
+                            ));
+                        }
+                        None => (tok, 0),
+                    };
+                    if name.is_empty() || name.len() > registry::NAME_MAX
+                    {
+                        return Err(ParseError::InvalidValue(
+                            lineno,
+                            "provides name must be non-empty and <= NAME_MAX bytes",
+                        ));
+                    }
+                    provides.push(ProvidedName {
+                        name: name.to_owned(),
+                        token,
+                    });
+                }
+                if provides.is_empty()
+                {
+                    return Err(ParseError::InvalidValue(
+                        lineno,
+                        "provides must list at least one name",
+                    ));
+                }
+            }
+            "log_sink" =>
+            {
+                if log_sink.is_some()
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "log_sink"));
+                }
+                log_sink = Some(match value
+                {
+                    "yes" => true,
+                    "no" => false,
+                    _ =>
+                    {
+                        return Err(ParseError::InvalidValue(
+                            lineno,
+                            "log_sink must be yes or no",
+                        ));
+                    }
+                });
+            }
             other => return Err(ParseError::UnknownKey(lineno, other.to_owned())),
         }
     }
@@ -196,6 +270,18 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
+    let log_sink = log_sink.unwrap_or(false);
+    if log_sink && (!seed.is_empty() || !provides.is_empty())
+    {
+        // A log-sink service's bootstrap caps are minted by svcmgr from the
+        // reserved log-sink sources, so registry-resolved seeds / provided
+        // endpoints have no slot in its round.
+        return Err(ParseError::InvalidValue(
+            0,
+            "log_sink is exclusive of seed and provides",
+        ));
+    }
+
     Ok(Definition {
         name: name.to_owned(),
         binary,
@@ -206,6 +292,8 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         namespace,
         cwd,
         seed,
+        provides,
+        log_sink,
     })
 }
 

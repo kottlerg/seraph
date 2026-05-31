@@ -1,8 +1,9 @@
 # `.svc` Service Definitions
 
 Authoritative spec for the `/config/svcmgr/services/<name>.svc` files
-svcmgr scans at `HANDOVER_COMPLETE` to reconcile init's pending
-`REGISTER_SERVICE` announcements with the on-disk service recipes.
+svcmgr scans at `HANDOVER_COMPLETE` to reconcile the substrate
+registrations init delivers in the handover endowment with the on-disk
+service recipes.
 
 ## Authority
 
@@ -15,9 +16,10 @@ recipe travels on the wire.
 
 * Directory: `/config/svcmgr/services/`
 * Filename: `<name>.svc`. The `<name>` portion is the key under which
-  the service registers with svcmgr (the `name` field of the
-  [v3 `REGISTER_SERVICE`](ipc-interface.md#label-1-register_service)
-  wire). Filenames are ASCII; case-sensitive `.svc` suffix.
+  the service is reconciled with svcmgr — for a substrate service, the
+  `name` carried in its
+  [handover-endowment `SUBSTRATE` round](ipc-interface.md#handover-endowment-bootstrap-rounds).
+  Filenames are ASCII; case-sensitive `.svc` suffix.
 * Files are shipped via `rootfs/config/svcmgr/services/` and installed
   into the sysroot by xtask's recursive `install_rootfs` copy. No
   build-system change is required to add a new recipe — drop the
@@ -54,6 +56,8 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
 | `cwd` | no | Path interpreted relative to svcmgr's universal root. Forbidden when `namespace = none`. |
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name). |
+| `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one tokened SEND per entry into the discovery registry. See [`provides`](#provides). |
+| `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 
 ## `restart`
 
@@ -86,13 +90,15 @@ Because the two fields are independent, any combination is valid — e.g.
 `restart = always` + `critical = no` (the `crasher` fixture: respawned on
 every fault, but its eventual permanent death is non-fatal).
 
-**pwrmgr's own death** is the edge case. If a `critical = yes`
-service that *is* `pwrmgr` dies unrecoverably, the shutdown source is
-itself gone; svcmgr logs `critical service unrecoverable: pwrmgr;
-graceful shutdown impossible; system in degraded state` and takes no
-further action. No fallback raw-shutdown path is provided — the
-same shape as today's lack of a recovery story for procmgr / memmgr
-death.
+**pwrmgr's own death** is the edge case. pwrmgr is `restart = on_failure`
++ `critical = no`: a crashed pwrmgr is recoverable (svcmgr re-creates it
+and it re-acquires its actuator caps from devmgr — see
+[services/pwrmgr/README.md](../../pwrmgr/README.md)), and its *permanent*
+death is deliberately non-fatal. It is `critical = no` precisely because
+the graceful-shutdown escalation routes through `pwrmgr.shutdown` — if
+pwrmgr is the dead service, that source is gone, so escalation would be
+circular. The honest terminal state is logged-and-continue. Setting
+`critical = yes` on pwrmgr would be self-defeating for this reason.
 
 ## `namespace`
 
@@ -101,7 +107,7 @@ The primary lever for confining a service to only what it needs.
 | Form | Effect |
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported`. Default tight choice for services with no filesystem dependency. |
-| `universal` | `cap_copy` of svcmgr's own root (post-#21: the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
+| `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
 | `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<rights>` is a `+`-joined list of named tokens (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown tokens are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
@@ -149,28 +155,91 @@ Well-known names are centralised in
 | Name | Publisher (today) | Cap shape |
 |---|---|---|
 | `rootfs.root` | init Phase 3 | tokened SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
-| `pwrmgr.shutdown` | init Phase 3 | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
-| `pwrmgr.deny` | init Phase 3 | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
+| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
+| `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
+| `timed` | svcmgr (`timed.svc` provider) | un-tokened SEND on timed's service endpoint (wall-clock) |
 | `svcmgr` | init Phase 3 | un-tokened SEND on svcmgr's own service endpoint |
+| `devmgr.registry` | init Phase 3 | `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry endpoint |
+
+## `provides`
+
+Declares the registry names a service's own endpoint is published under.
+svcmgr creates a service endpoint, serves its RECV as bootstrap `cap[0]`
+(ahead of the `seed` caps), and publishes one SEND per entry. Providers
+launch ahead of pure consumers during reconciliation, so a provided name
+is resolvable before any consumer queries it. The endpoint persists across
+restarts (svcmgr holds the source), so a cached client cap survives a
+crash-restart and no re-publish is needed.
+
+Each space-separated entry is `name[:auth|:deny]`; the suffix selects the
+token svcmgr stamps on that name's SEND (the token rides through a
+consumer's `QUERY_ENDPOINT` lookup unchanged):
+
+| Suffix | Token | Use |
+|---|---|---|
+| *(none)* | `0` (untokened) | Plain SEND. e.g. `timed`. |
+| `:auth` | `1 << 63` | The universal verb-authority bit shared by every `*_AUTHORITY` constant — the server's `token & (1 << 63)` gate passes. e.g. `pwrmgr.shutdown:auth`. |
+| `:deny` | `1` | Present so the cap resolves, but the authority gate fails. The negative-test twin. e.g. `pwrmgr.deny:deny`. |
+
+```
+provides = pwrmgr.shutdown:auth pwrmgr.deny:deny
+```
+
+## `log_sink`
+
+`yes` marks the service as the system's master log sink — real-logd, the
+receive-side owner of the master log endpoint. Exactly one recipe carries
+`log_sink = yes`.
+
+A log-sink service's bootstrap round is **not** assembled from `seed` or
+`provides`. svcmgr mints it from the reserved log-sink sources init endows
+at handover (the master-log endpoint source and the procmgr `SEND|GRANT`
+death-auth source — see
+[`process-lifecycle.md`](../../../docs/process-lifecycle.md)) plus the
+`devmgr.registry` source. The round is four positional caps:
+
+| Index | Cap |
+|---|---|
+| 0 | `RECV` on the master log endpoint |
+| 1 | `SEND` on the master log endpoint (single-use; `HANDOVER_PULL` only). `0` on a restart — no init-logd remains to pull from |
+| 2 | tokened `SEND` on procmgr carrying `DEATH_EQ_AUTHORITY` (logd registers per-sender death-notifications for slot reclaim) |
+| 3 | tokened `SEND` on devmgr's registry carrying `REGISTRY_QUERY_AUTHORITY` (logd resolves the serial driver via `QUERY_SERIAL_DEVICE`) |
+
+Because these slots are svcmgr-minted, `seed` and `provides` have no
+position in the round; declaring either alongside `log_sink = yes` is a
+parser error. The same svcmgr-minted round drives both the first launch
+(`cap[1]` present, history pulled from init-logd) and every restart
+(`cap[1] = 0`, history pull skipped) — svcmgr holds the master-log source
+for the system's life, so each (re)launched logd re-attaches a fresh RECV
+to the same endpoint object every sender already targets. `restart` and
+`critical` behave exactly as for any other service.
+
+```
+binary    = /services/logd
+restart   = on_failure
+critical  = yes
+namespace = none
+log_sink  = yes
+```
 
 ## Reconciliation
 
 At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
-`<name>.svc`, and reconciles against init's pending-registration
-table:
+`<name>.svc`, and reconciles against the pending-registration table
+(substrate pairs parked from the handover endowment):
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind death-notification on the registered thread cap; record a `ServiceEntry` with the parsed recipe for restart use. |
+| present | present | **bind only** — bind death-notification on the endowed thread cap; record a `ServiceEntry` with the parsed recipe for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, `START_PROCESS`, serve the seed bootstrap round. If `restart != never`, bind death-notification and record a `ServiceEntry`. |
-| absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; a registration without a matching `.svc` is a configuration error. |
+| absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 ## Relevant Design Documents
 
 | Document | Content |
 |---|---|
 | [README.md](../README.md) | Component scope, responsibilities, restart policy |
-| [ipc-interface.md](ipc-interface.md) | v3 `REGISTER_SERVICE` wire, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` |
+| [ipc-interface.md](ipc-interface.md) | handover endowment, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` |
 | [restart-protocol.md](restart-protocol.md) | Restart sequencing, shared spawn primitives, criticality semantics |
 | [shared/ipc/src/lib.rs](../../../shared/ipc/src/lib.rs) | `published_names` constants, `svcmgr_labels::*`, `svcmgr_errors::*` |
 

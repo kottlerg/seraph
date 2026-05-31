@@ -9,22 +9,26 @@
 //! `/config/svcmgr/services/<name>.svc`. The file is the **single
 //! source of truth** for the service's recipe: binary path, argv,
 //! env, restart policy, criticality, namespace shape, optional cwd,
-//! and the named seed caps to inject into its bootstrap round. The
-//! same definition drives both first-launch (when init didn't
-//! bootstrap the service) and restart (when init did).
+//! and the named seed caps to inject into its bootstrap round. A
+//! `log_sink = yes` recipe (the master log sink, real-logd) instead
+//! takes a svcmgr-minted bootstrap round from the reserved log-sink
+//! sources and declares neither `seed` nor `provides`. The same
+//! definition drives both first-launch (when init didn't bootstrap
+//! the service) and restart (when init did).
 //!
 //! At [`crate::svcmgr_labels::HANDOVER_COMPLETE`] svcmgr calls
 //! [`reconcile_and_launch`]:
 //!
 //! 1. Scan [`SERVICES_DIR`] and parse every `.svc` into a [`Definition`].
-//! 2. Reconcile against the pending-registration table init populated
-//!    via [`crate::svcmgr_labels::REGISTER_SERVICE`]:
-//!    - **Defined AND registered**: bind death-notification on the
-//!      registered thread cap and store the parsed `Definition` on
-//!      the `ServiceEntry` for restart use.
+//! 2. Reconcile against the pending-registration table
+//!    [`crate::service::bootstrap_caps`] populated from init's handover
+//!    endowment (one substrate `(name, thread_cap)` round each):
+//!    - **Defined AND parked**: bind death-notification on the endowed
+//!      thread cap and store the parsed `Definition` on the
+//!      `ServiceEntry` for restart use.
 //!    - **Defined only**: launch the service via [`launch::launch`].
-//!    - **Registered without definition**: log a hard error and
-//!      refuse to bind — svcmgr has no recipe to restart it.
+//!    - **Parked without definition**: log a hard error and refuse to
+//!      bind — svcmgr has no recipe to restart it.
 //!
 //! After reconciliation the supervision loop proceeds as today.
 
@@ -102,9 +106,49 @@ pub struct Definition
     /// Published-registry names svcmgr resolves at launch time and
     /// injects positionally into the child's bootstrap round.
     pub seed: Vec<String>,
+    /// Registry names this service's own service endpoint is published
+    /// under. When non-empty, svcmgr's launch path creates a service
+    /// endpoint, serves its RECV half as bootstrap cap[0] (ahead of the
+    /// `seed` caps), and publishes one SEND half per entry — each stamped
+    /// with that entry's [`ProvidedName::token`] — into the discovery
+    /// registry. The endpoint persists across restarts (svcmgr holds the
+    /// source), so cached client caps survive a crash-restart cycle and no
+    /// re-publish is needed. Empty for pure-consumer services that only
+    /// receive `seed` caps. A provider also launches ahead of pure
+    /// consumers during reconciliation so its names resolve before any
+    /// consumer queries them.
+    pub provides: Vec<ProvidedName>,
+    /// `log_sink = yes` marks the service as the system log sink (real-logd).
+    /// svcmgr mints its bootstrap round — master-log RECV, the first-launch
+    /// `HANDOVER_PULL` SEND, a `DEATH_EQ_AUTHORITY` SEND, and a
+    /// `devmgr.registry` query cap — from the reserved log-sink sources and
+    /// the `devmgr.registry` source it holds, rather than from `seed` /
+    /// `provides` (which the parser rejects in combination). Exactly one
+    /// recipe carries this; supervision/restart otherwise follow the normal
+    /// `restart`/`critical` fields.
+    pub log_sink: bool,
+}
+
+/// One published name in a service's `provides = ...` list, with the
+/// token svcmgr stamps on the SEND it publishes.
+///
+/// The token rides through publish → registry → `QUERY_ENDPOINT` lookup
+/// unchanged (`cap_derive` inherits a source cap's token), so a consumer
+/// that resolves the name receives a SEND already carrying it. The verb
+/// the server gates on is `token & (1 << 63)`, the universal
+/// verb-authority bit shared by every `*_AUTHORITY` constant.
+#[derive(Clone, Debug)]
+pub struct ProvidedName
+{
+    pub name: String,
+    /// `1 << 63` for an `:auth` entry (carries the verb-authority bit),
+    /// `1` for a `:deny` entry (present but gate-failing), `0` for a bare
+    /// entry (untokened — published via `cap_derive`, not
+    /// `cap_derive_token`).
+    pub token: u64,
 }
 
 /// Directory svcmgr scans for service definitions. Absolute path
-/// against svcmgr's `system_root_cap`; post-#21 handover that cap is
-/// universal, so absolute lookups via `std::fs` resolve normally.
+/// against svcmgr's `system_root_cap`. That cap is universal, so
+/// absolute lookups via `std::fs` resolve normally.
 pub const SERVICES_DIR: &str = "/config/svcmgr/services";

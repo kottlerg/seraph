@@ -18,10 +18,10 @@ use crate::walk;
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
-/// Thread caps init collects across Phases 1-3 for v3
-/// `REGISTER_SERVICE` once svcmgr is up. Zero in a slot means init
-/// could not capture (or chose not to capture) that service's thread
-/// cap; the corresponding `register_service` call is then skipped.
+/// Thread caps init collects across Phases 1-3 to hand svcmgr in the
+/// handover endowment (one `SUBSTRATE` round each). Zero in a slot means
+/// init could not capture (or chose not to capture) that service's thread
+/// cap; the corresponding endowment round is then skipped.
 ///
 /// Field order matches reconciliation order in the boot log, not
 /// spawn order. memmgr / procmgr come from
@@ -35,27 +35,6 @@ pub struct ServiceThreadCaps
     pub procmgr: u32,
     pub devmgr: u32,
     pub vfsd: u32,
-    pub logd: u32,
-    pub timed: u32,
-}
-
-/// Per-spawn namespace-cap policy for [`configure_child_namespace`].
-///
-/// The variants encode the two shapes a child's `system_root_cap`
-/// can take when init still spawns the service directly: a `cap_copy`
-/// of the spawner's seed root, or nothing at all. Per-service subtree
-/// attenuation lives in svcmgr (parsed from `/config/svcmgr/services/<name>.svc`'s
-/// `namespace = subtree:<path>:<rights>` line) post-#21.
-#[derive(Clone, Copy)]
-pub enum NsPolicy
-{
-    /// Hand the child a `cap_copy` of `system_root_cap` at full
-    /// rights.
-    Universal,
-    /// Do not call `CONFIGURE_NAMESPACE` at all. The child's
-    /// `system_root_cap` stays zero; std-side absolute-path fs ops
-    /// return `Unsupported`.
-    None,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -68,20 +47,16 @@ fn derive_tokened_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
 }
 
 /// Issue `procmgr_labels::CONFIGURE_NAMESPACE` on a freshly-created
-/// (suspended) child according to `policy` and the optional `cwd`.
+/// (suspended) child, handing it a universal `cap_copy` of
+/// `system_root_cap` at full rights plus the optional `cwd`.
 ///
-/// * `policy` selects the shape of the child's `system_root_cap`:
-///   universal copy of `system_root_cap`, an attenuated subtree
-///   walked from it, or no cap at all.
-/// * `cwd`, when `Some`, walks `(path, rights)` from `system_root_cap`
-///   and delivers the resulting directory cap as `caps[1]` so the
-///   child's `current_dir_cap` is non-zero from the first instruction.
+/// `cwd`, when `Some`, walks `(path, rights)` from `system_root_cap`
+/// and delivers the resulting directory cap as `caps[1]` so the
+/// child's `current_dir_cap` is non-zero from the first instruction.
 ///
-/// `NsPolicy::None` with `cwd = None` skips the IPC entirely
-/// (procmgr's default leaves both `ProcessInfo` slots at zero).
-/// `NsPolicy::None` with `cwd = Some(_)` is rejected by procmgr
-/// (`root_cap == 0` is `INVALID_ARGUMENT`); callers MUST pair a cwd
-/// with at least `Universal` or `Subtree`.
+/// Per-service subtree attenuation lives in svcmgr (parsed from each
+/// `/config/svcmgr/services/<name>.svc`'s `namespace =` line); init
+/// hands its sole namespace consumer — svcmgr — the universal root.
 ///
 /// On any failure the partial child is destroyed (`DESTROY_PROCESS`
 /// on `process_handle`, then `cap_delete`) so a false return tells
@@ -92,37 +67,16 @@ fn configure_child_namespace(
     process_handle: u32,
     system_root_cap: u32,
     init_self_cspace: u32,
-    policy: NsPolicy,
     cwd: Option<(&[u8], u64)>,
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let ns_cap = match policy
+    let Ok(ns_cap) = syscall::cap_copy(system_root_cap, init_self_cspace, syscall::RIGHTS_SEND)
+    else
     {
-        NsPolicy::None =>
-        {
-            if cwd.is_some()
-            {
-                // cwd without root is unrepresentable on the wire
-                // (procmgr enforces root_cap != 0). Treat as a
-                // caller bug.
-                log("phase 3: NsPolicy::None with cwd is invalid");
-                destroy_partial_child(process_handle, ipc_buf);
-                return false;
-            }
-            return true;
-        }
-        NsPolicy::Universal =>
-        {
-            let Ok(c) = syscall::cap_copy(system_root_cap, init_self_cspace, syscall::RIGHTS_SEND)
-            else
-            {
-                log("phase 3: cap_copy of system root for child failed");
-                destroy_partial_child(process_handle, ipc_buf);
-                return false;
-            };
-            c
-        }
+        log("phase 3: cap_copy of system root for child failed");
+        destroy_partial_child(process_handle, ipc_buf);
+        return false;
     };
 
     let cwd_cap = if let Some((path, rights)) = cwd
@@ -677,16 +631,18 @@ pub fn create_devmgr_with_caps(
 
     // ── Terminal SVCMGR_BUNDLE round ────────────────────────────────────
     //
-    // caps: [svcmgr_publish_cap, ioport_root_cap (x86 only)]. The
-    // SEND-rights cap on svcmgr's service endpoint is stamped with the
-    // PUBLISH_AUTHORITY verb-bit in its token so devmgr can register
-    // service caps in svcmgr's registry on init's behalf (today's only
-    // use is reserved for future devmgr publications; the active
-    // publications — `timed`, `rootfs.root`, `pwrmgr.*`, `svcmgr`,
-    // `devmgr.registry` — are init-issued). The IoPortRange copy is
-    // delivered only on x86-64 (RISC-V has no I/O ports); devmgr
-    // derives narrow per-driver IoPort caps from it for ISA
-    // peripherals like the CMOS RTC.
+    // caps: [svcmgr_publish_cap, arch_shutdown_cap]. The SEND-rights cap
+    // on svcmgr's service endpoint is stamped with the PUBLISH_AUTHORITY
+    // verb-bit in its token so devmgr can register service caps in
+    // svcmgr's registry on init's behalf (today's only use is reserved
+    // for future devmgr publications; the active publications — `timed`,
+    // `rootfs.root`, `svcmgr`, `devmgr.registry` — are init-issued).
+    // The arch shutdown-authority cap is the root `IoPortRange` on x86-64
+    // (devmgr derives narrow per-driver IoPort caps from it for ISA
+    // peripherals like the CMOS RTC, and carves the PM1a + 8042 ports for
+    // pwrmgr) and `SbiControl` on RISC-V (devmgr serves a copy to pwrmgr
+    // for SBI SRST). devmgr is the hardware authority; pwrmgr acquires its
+    // shutdown caps from devmgr, not from init.
     // SVCMGR_BUNDLE is unconditionally the terminal round. On any
     // preparation failure init MUST still emit a `done=true` round so
     // devmgr's bootstrap_rounds loop in `services/devmgr/src/caps.rs`
@@ -736,19 +692,25 @@ pub fn create_devmgr_with_caps(
         return None;
     }
 
-    let ioport_root_cap = if cfg!(target_arch = "x86_64")
+    let arch_shutdown_cap = if cfg!(target_arch = "x86_64")
     {
         crate::find_cap_by_type(info, init_protocol::CapType::IoPortRange)
             .and_then(|root| syscall::cap_derive(root, syscall::RIGHTS_ALL).ok())
             .unwrap_or(0)
+    }
+    else if info.sbi_control_cap != 0
+    {
+        // RISC-V: SbiControl is the platform shutdown authority. devmgr
+        // serves a copy to pwrmgr on QUERY_SHUTDOWN_DEVICE for SBI SRST.
+        syscall::cap_derive(info.sbi_control_cap, syscall::RIGHTS_ALL).unwrap_or(0)
     }
     else
     {
         0
     };
 
-    let bundle_caps: [u32; 2] = [svcmgr_publish, ioport_root_cap];
-    let bundle_cap_count = if ioport_root_cap != 0 { 2 } else { 1 };
+    let bundle_caps: [u32; 2] = [svcmgr_publish, arch_shutdown_cap];
+    let bundle_cap_count = if arch_shutdown_cap != 0 { 2 } else { 1 };
 
     let _ = serve(
         bootstrap_ep,
@@ -760,258 +722,6 @@ pub fn create_devmgr_with_caps(
         "devmgr: bootstrap SVCMGR_BUNDLE round failed",
     );
     Some(thread_cap)
-}
-
-// ── pwrmgr creation ─────────────────────────────────────────────────────────
-
-/// Pwrmgr-side result of [`create_and_start_pwrmgr`].
-///
-/// `service_ep` is the un-tokened source on pwrmgr's service endpoint
-/// (init keeps it to mint tokened SENDs); `thread_cap` is pwrmgr's
-/// main thread in init's `CSpace`, registered with svcmgr so the
-/// supervisor can bind death-notification.
-pub struct PwrmgrSpawn
-{
-    pub service_ep: u32,
-    pub thread_cap: u32,
-}
-
-/// Walk `/services/pwrmgr`, create the process, transfer platform shutdown
-/// caps via bootstrap rounds, and start it.
-///
-/// Returns the service-endpoint slot init owns (the RECV side stays with
-/// pwrmgr; init keeps the source for deriving tokened SENDs to
-/// authorized consumers) plus pwrmgr's main thread cap. Returns `None`
-/// on any failure; partial state is torn down before returning.
-///
-/// Bootstrap layout (matches `services/pwrmgr/src/caps.rs`):
-/// * Round 1 (≤2 caps, 2 data words):
-///   - `caps[0]` = pwrmgr's service endpoint (derived copy).
-///   - `caps[1]` = arch authority cap (`IoPortRange` on x86-64,
-///     `SbiControl` on RISC-V). Omitted when absent.
-///   - `data[0]` = presence bitmap (bit 0 = arch cap present).
-///   - `data[1]` = `PWRMGR_LABELS_VERSION`.
-///   - `done` = true on RISC-V or when no ACPI regions follow.
-/// * Round 2..N (x86-64 only): ACPI region Frame caps, ≤4 per round.
-#[allow(clippy::too_many_lines)]
-pub fn create_and_start_pwrmgr(
-    info: &InitInfo,
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    ipc_buf: *mut u64,
-) -> Option<PwrmgrSpawn>
-{
-    let walked = walk::walk_to_file(system_root_cap, b"/services/pwrmgr", 0xFFFF, ipc_buf)?;
-
-    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
-
-    let msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, walked.size)
-        .cap(walked.file_cap)
-        .cap(tokened_creator)
-        .build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
-    else
-    {
-        log("pwrmgr: CREATE_FROM_FILE ipc_call failed");
-        return None;
-    };
-    if reply.label != 0
-    {
-        log("pwrmgr: CREATE_FROM_FILE error");
-        return None;
-    }
-
-    let reply_caps = reply.caps();
-    if reply_caps.is_empty()
-    {
-        log("pwrmgr: CREATE_FROM_FILE reply missing caps");
-        return None;
-    }
-    let process_handle = reply_caps[0];
-    // CREATE_FROM_FILE returns (process_handle, thread_cap). Pwrmgr is
-    // svcmgr-registered for death monitoring (post-#21); the thread
-    // cap is preserved here and returned via [`PwrmgrSpawn`] for the
-    // Phase-3 v3 `REGISTER_SERVICE` call.
-    if reply_caps.len() < 2
-    {
-        log("pwrmgr: CREATE_FROM_FILE reply missing thread cap");
-        destroy_partial_child(process_handle, ipc_buf);
-        return None;
-    }
-    let thread_cap = reply_caps[1];
-
-    // pwrmgr's only surface is the gated SHUTDOWN/REBOOT IPC; it
-    // owns IoPortRange/SbiControl/ACPI frames directly and never
-    // touches the filesystem. Spawn with no namespace cap.
-    if !configure_child_namespace(
-        process_handle,
-        system_root_cap,
-        init_self_cspace,
-        NsPolicy::None,
-        None,
-        ipc_buf,
-    )
-    {
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    }
-
-    // Service endpoint: init owns the RECV source; pwrmgr receives a
-    // derived RECV copy. Source stays in init's CSpace for deriving
-    // tokened SENDs (SHUTDOWN_AUTHORITY) to authorized consumers.
-    let Ok(pwrmgr_service_ep) = syscall::cap_create_endpoint(crate::endpoint_slab())
-    else
-    {
-        log("pwrmgr: cannot create service endpoint");
-        destroy_partial_child(process_handle, ipc_buf);
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    };
-    let Ok(service_copy) = syscall::cap_derive(pwrmgr_service_ep, syscall::RIGHTS_ALL)
-    else
-    {
-        log("pwrmgr: service endpoint derive failed");
-        let _ = syscall::cap_delete(pwrmgr_service_ep);
-        destroy_partial_child(process_handle, ipc_buf);
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    };
-
-    // Arch authority cap: IoPortRange on x86_64, SbiControl on
-    // RISC-V. Both are present in InitInfo's hw caps; on the absent arch
-    // the corresponding slot is zero.
-    let arch_cap_source: u32 = {
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::find_cap_by_type(info, CapType::IoPortRange).unwrap_or(0)
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            info.sbi_control_cap
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
-        {
-            let _ = info;
-            0
-        }
-    };
-    let arch_cap_copy = if arch_cap_source != 0
-    {
-        syscall::cap_derive(arch_cap_source, syscall::RIGHTS_ALL).unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
-
-    if !start_process(
-        process_handle,
-        ipc_buf,
-        "phase 3: pwrmgr started; serving bootstrap",
-        "phase 3: pwrmgr START_PROCESS failed",
-    )
-    {
-        let _ = syscall::cap_delete(pwrmgr_service_ep);
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    }
-
-    // Round 1: service endpoint + (optionally) arch cap. The ACPI
-    // region rounds (x86_64 only) follow when present.
-    let acpi_present = info.acpi_region_frame_count > 0;
-    let mut r1_caps = [0u32; 2];
-    let mut r1_cap_count: usize = 1;
-    r1_caps[0] = service_copy;
-    let mut presence: u64 = 0;
-    if arch_cap_copy != 0
-    {
-        presence |= 1u64 << 0;
-        r1_caps[r1_cap_count] = arch_cap_copy;
-        r1_cap_count += 1;
-    }
-    let r1_done = !acpi_present;
-    if !serve(
-        bootstrap_ep,
-        child_token,
-        ipc_buf,
-        r1_done,
-        &r1_caps[..r1_cap_count],
-        &[presence, u64::from(ipc::PWRMGR_LABELS_VERSION)],
-        "pwrmgr: bootstrap round 1 failed",
-    )
-    {
-        let _ = syscall::cap_delete(pwrmgr_service_ep);
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    }
-
-    if acpi_present
-    {
-        let ar_start = info.acpi_region_frame_base;
-        let ar_end = ar_start + info.acpi_region_frame_count;
-        // Collect ACPI region metadata from descriptor array.
-        let mut regions: [(u32, u64, u64); MAX_ACPI_REGION_CAPS] =
-            [(0, 0, 0); MAX_ACPI_REGION_CAPS];
-        let mut region_count: usize = 0;
-        for d in crate::descriptors(info)
-        {
-            if d.cap_type == CapType::Frame
-                && d.slot >= ar_start
-                && d.slot < ar_end
-                && region_count < MAX_ACPI_REGION_CAPS
-            {
-                regions[region_count] = (d.slot, d.aux0, d.aux1);
-                region_count += 1;
-            }
-        }
-
-        let mut idx = 0;
-        while idx < region_count
-        {
-            let batch_end = (idx + 4).min(region_count);
-            let batch_count = batch_end - idx;
-            let mut caps = [0u32; 4];
-            let mut data = [0u64; 2 + 4 * 2];
-            data[0] = kind::ACPI_REGION;
-            data[1] = batch_count as u64;
-            for j in 0..batch_count
-            {
-                let (slot, base, size) = regions[idx + j];
-                if let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
-                {
-                    caps[j] = c;
-                }
-                data[2 + j * 2] = base;
-                data[3 + j * 2] = size;
-            }
-            let is_last = batch_end == region_count;
-            if !serve(
-                bootstrap_ep,
-                child_token,
-                ipc_buf,
-                is_last,
-                &caps[..batch_count],
-                &data[..2 + batch_count * 2],
-                "pwrmgr: bootstrap ACPI region round failed",
-            )
-            {
-                let _ = syscall::cap_delete(pwrmgr_service_ep);
-                let _ = syscall::cap_delete(thread_cap);
-                return None;
-            }
-            idx = batch_end;
-        }
-    }
-
-    Some(PwrmgrSpawn {
-        service_ep: pwrmgr_service_ep,
-        thread_cap,
-    })
 }
 
 // ── vfsd creation ────────────────────────────────────────────────────────────
@@ -1180,19 +890,17 @@ pub fn create_svcmgr_from_file(
         let _ = syscall::cap_delete(reply_caps[1]);
     }
 
-    // Post-#21 svcmgr is the supervisor and holds the universal
-    // root: it reads `/config/svcmgr/services/*.svc` at handover,
+    // svcmgr is the supervisor and holds the universal root: it
+    // reads `/config/svcmgr/services/*.svc` at handover,
     // walks the recipe's `binary` path (typically
     // `/services/<name>` or `/programs/<name>`) for first-launch of
-    // defined-but-unregistered
-    // services, and applies per-service namespace attenuation from
-    // each `.svc` recipe when configuring the child. Init no longer
-    // pre-attenuates svcmgr to `/bin`.
+    // defined-but-unregistered services, and applies per-service
+    // namespace attenuation from each `.svc` recipe when configuring
+    // the child. svcmgr therefore holds the universal root.
     if !configure_child_namespace(
         process_handle,
         system_root_cap,
         init_self_cspace,
-        NsPolicy::Universal,
         None,
         ipc_buf,
     )
@@ -1203,112 +911,200 @@ pub fn create_svcmgr_from_file(
     Some((process_handle, child_token))
 }
 
-/// Endpoint set handed to svcmgr in its bootstrap round.
+/// Round kinds for the svcmgr handover endowment, tagged in `data[0]`.
+/// Mirrors the receive side in `services/svcmgr/src/service.rs::endow_kind`.
+mod endow_kind
+{
+    /// Round 1: svcmgr's own endpoints + publish-role source caps.
+    pub const CAPS: u64 = 1;
+    /// One substrate `(name, thread_cap)` registration.
+    pub const SUBSTRATE: u64 = 2;
+    /// Terminal round: the reserved source caps svcmgr keeps to launch +
+    /// supervise + restart real-logd (master-log endpoint, procmgr death-auth).
+    pub const LOGD_SOURCES: u64 = 3;
+}
+
+/// Source + endpoint caps init endows svcmgr with at handover. svcmgr
+/// derives the shapes it publishes / sends / launches with from these
+/// reserved sources; it keeps the log-sink sources for the system's life
+/// so it can (re)launch real-logd any number of times.
 #[allow(clippy::struct_field_names)]
-pub struct SvcmgrHandoverCaps
+pub struct SvcmgrEndowment
 {
     pub svcmgr_service_ep: u32,
     pub svcmgr_bootstrap_ep: u32,
+    /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). svcmgr
+    /// derives the published `rootfs.root` SEND from it.
+    pub rootfs_root_cap: u32,
+    pub devmgr_registry_ep: u32,
+    /// Reserved master-log endpoint source (`cap_derive(log_ep, RIGHTS_ALL)`).
+    /// svcmgr mints real-logd's master-log RECV from it on every (re)launch,
+    /// plus the one-shot `HANDOVER_PULL` SEND on the first launch. Holding it
+    /// keeps the endpoint object alive across a logd crash so log senders are
+    /// agnostic to which process holds the RECV.
+    pub master_log_source: u32,
+    /// Reserved token-0 `SEND|GRANT` source on procmgr's service endpoint.
+    /// svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch
+    /// (used by logd to register sender death-notifications for slot reclaim).
+    pub procmgr_death_auth_source: u32,
 }
 
-/// Start svcmgr, then serve its bootstrap.
-pub fn setup_and_start_svcmgr(
+/// Start svcmgr, then serve the handover endowment over the bootstrap
+/// protocol.
+///
+/// Round 1 (`CAPS`) delivers svcmgr's service + bootstrap endpoints (full
+/// rights) and the publish-role source caps: a `SEND` on the root
+/// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
+/// a token-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
+/// the `REGISTRY_QUERY_AUTHORITY` `devmgr.registry` publish cap and the
+/// `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it). An absent source
+/// cap rides as a zero slot, which svcmgr tolerates.
+///
+/// Each `SUBSTRATE` round then delivers one init-bootstrapped service's
+/// thread cap plus its name (memmgr/procmgr/devmgr/vfsd); svcmgr parks the
+/// pairs for death-supervision binding at reconciliation.
+///
+/// The terminal `LOGD_SOURCES` round delivers the two reserved caps svcmgr
+/// keeps to launch + supervise + restart real-logd: the master-log endpoint
+/// source and a token-0 procmgr `SEND|GRANT` source (see [`SvcmgrEndowment`]).
+///
+/// Best-effort: a failed round logs and aborts the endowment; svcmgr then
+/// runs with whatever it received (the system is already non-viable if a
+/// substrate thread cap cannot be delivered).
+fn endow_svcmgr(
     bootstrap_ep: u32,
     process_handle: u32,
     child_token: u64,
-    handover: &SvcmgrHandoverCaps,
+    endow: &SvcmgrEndowment,
+    thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
 )
 {
     if !start_process(
         process_handle,
         ipc_buf,
-        "phase 3: svcmgr started; serving bootstrap",
+        "phase 3: svcmgr started; serving endowment",
         "phase 3: svcmgr START_PROCESS failed",
     )
     {
         return;
     }
 
-    let Ok(service_copy) = syscall::cap_derive(handover.svcmgr_service_ep, syscall::RIGHTS_ALL)
+    let Ok(service_copy) = syscall::cap_derive(endow.svcmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
+        log("phase 3: svcmgr service-ep derive failed");
         return;
     };
-    let Ok(boot_copy) = syscall::cap_derive(handover.svcmgr_bootstrap_ep, syscall::RIGHTS_ALL)
+    let Ok(boot_copy) = syscall::cap_derive(endow.svcmgr_bootstrap_ep, syscall::RIGHTS_ALL)
     else
     {
+        log("phase 3: svcmgr bootstrap-ep derive failed");
         return;
+    };
+    // rootfs.root SEND — token inherited from the root fs namespace cap.
+    let rootfs_send = if endow.rootfs_root_cap != 0
+    {
+        syscall::cap_derive(endow.rootfs_root_cap, syscall::RIGHTS_SEND).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    // devmgr-registry source: token-0 SEND|GRANT so svcmgr can mint the
+    // tokened query + drivers-dir caps. SEND|GRANT (not RIGHTS_ALL) is the
+    // minimum — it withholds the RECV right on devmgr's registry endpoint.
+    let devmgr_registry_src = if endow.devmgr_registry_ep != 0
+    {
+        syscall::cap_derive(endow.devmgr_registry_ep, syscall::RIGHTS_SEND_GRANT).unwrap_or(0)
+    }
+    else
+    {
+        0
     };
 
-    // One round: [service, bootstrap_ep].
-    // (log + procmgr auto-delivered via ProcessInfo.)
+    // Substrate set; init skips a service whose thread cap it could not
+    // capture, so a missing recipe match is bind-only-absent rather than a
+    // `registered without definition` orphan in svcmgr. logd is absent — it
+    // is a svcmgr-launched service (LOGD_SOURCES round), not a parked
+    // substrate.
+    let registrations: &[(&[u8], u32)] = &[
+        (b"memmgr", thread_caps.memmgr),
+        (b"procmgr", thread_caps.procmgr),
+        (b"devmgr", thread_caps.devmgr),
+        (b"vfsd", thread_caps.vfsd),
+    ];
+
+    // Round 1 (CAPS), positional: [service, bootstrap, rootfs, devmgr_reg].
+    // The LOGD_SOURCES round is always terminal, so no earlier round is.
+    if !serve(
+        bootstrap_ep,
+        child_token,
+        ipc_buf,
+        false,
+        &[service_copy, boot_copy, rootfs_send, devmgr_registry_src],
+        &[endow_kind::CAPS, u64::from(ipc::SVCMGR_LABELS_VERSION)],
+        "phase 3: svcmgr endowment CAPS round failed",
+    )
+    {
+        return;
+    }
+
+    // Substrate rounds: one (name, thread_cap) each.
+    for &(name, thread_cap) in registrations
+    {
+        if thread_cap == 0
+        {
+            continue;
+        }
+        let mut name_words = [0u64; 2];
+        let nw = pack_svc_name(name, &mut name_words);
+        let mut data = [0u64; 2 + 2];
+        data[0] = endow_kind::SUBSTRATE;
+        data[1] = name.len() as u64;
+        data[2..2 + nw].copy_from_slice(&name_words[..nw]);
+        if !serve(
+            bootstrap_ep,
+            child_token,
+            ipc_buf,
+            false,
+            &[thread_cap],
+            &data[..2 + nw],
+            "phase 3: svcmgr endowment SUBSTRATE round failed",
+        )
+        {
+            return;
+        }
+    }
+
+    // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
+    // and the token-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
+    // bootstrap caps from these on every (re)launch. A zero slot rides if a
+    // source derive failed; svcmgr degrades (logd unlaunchable) but survives.
     let _ = serve(
         bootstrap_ep,
         child_token,
         ipc_buf,
         true,
-        &[service_copy, boot_copy],
-        &[],
-        "phase 3: svcmgr bootstrap failed",
+        &[endow.master_log_source, endow.procmgr_death_auth_source],
+        &[endow_kind::LOGD_SOURCES],
+        "phase 3: svcmgr endowment LOGD_SOURCES round failed",
     );
-}
-
-/// Minimal v3 `REGISTER_SERVICE` payload: name + thread cap.
-///
-/// Post-#21 the recipe (binary, argv, env, restart policy,
-/// criticality, namespace shape, seed names) lives on disk at
-/// `/config/svcmgr/services/<name>.svc`. The wire conveys only what
-/// cannot be on disk: which named recipe this running process
-/// implements, and the thread cap svcmgr binds death-notification on.
-pub struct ServiceRegistration<'a>
-{
-    pub name: &'a [u8],
-    pub thread_cap: u32,
-}
-
-/// Register a currently-running service with svcmgr via the v3
-/// [`svcmgr_labels::REGISTER_SERVICE`] wire (`word 0` =
-/// `SVCMGR_LABELS_VERSION`, `word 1` = `name_len`, `words 2..` = name
-/// bytes, `caps[0]` = thread cap). svcmgr parks the entry and
-/// reconciles against `/config/svcmgr/services/` on `HANDOVER_COMPLETE`.
-pub fn register_service(svcmgr_ep: u32, ipc_buf: *mut u64, reg: &ServiceRegistration)
-{
-    let name_len = reg.name.len();
-    if name_len == 0 || name_len > 32 || reg.thread_cap == 0
-    {
-        log("phase 3: REGISTER_SERVICE caller bug (empty name or zero thread cap)");
-        return;
-    }
-    let name_words = name_len.div_ceil(8);
-    let data_count = 2 + name_words;
-
-    let msg = IpcMessage::builder(svcmgr_labels::REGISTER_SERVICE)
-        .word(0, u64::from(ipc::SVCMGR_LABELS_VERSION))
-        .word(1, name_len as u64)
-        .bytes(2, reg.name)
-        .word_count(data_count)
-        .cap(reg.thread_cap)
-        .build();
-
-    // SAFETY: ipc_buf is the caller's registered IPC buffer.
-    match unsafe { ipc::ipc_call(svcmgr_ep, &msg, ipc_buf) }
-    {
-        Ok(reply) if reply.label == 0 =>
-        {}
-        _ => log("phase 3: REGISTER_SERVICE failed"),
-    }
 }
 
 // ── Phase 3 orchestration ───────────────────────────────────────────────────
 
-/// Phase 3: spawn svcmgr, bring up the wallclock chain, spawn pwrmgr,
-/// register pwrmgr with svcmgr (v3 wire), publish the named caps
-/// post-#21 consumers resolve from `/config/svcmgr/services/<name>.svc` `seed = ...`
-/// lines, then signal `HANDOVER_COMPLETE` so svcmgr scans
-/// `/config/svcmgr/services/`. On a normal boot the defined services there are
-/// all init-registered (bind-only); svcmgr's launch path fires only for staged
-/// test recipes (svctest / usertest, and crasher co-staged with svctest).
+/// Phase 3: load svcmgr, serve it the handover endowment (its own
+/// endpoints + publish-role source caps + one `(name, thread_cap)` round
+/// per init-bootstrapped substrate service + the reserved log-sink
+/// sources), then signal `HANDOVER_COMPLETE` so svcmgr scans
+/// `/config/svcmgr/services/`. svcmgr owns all post-handover work from the
+/// endowment: it publishes the well-known names, installs devmgr's drivers
+/// dir, and launches + supervises the non-bootstrap services. On a normal
+/// boot the defined services are the bind-only substrate plus the
+/// svcmgr-launched services (`logd`, `timed`, `pwrmgr`); svcmgr's
+/// pure-consumer launch path fires only for staged test recipes (svctest /
+/// usertest, and crasher co-staged with svctest).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn phase3_svcmgr_handover(
     info: &InitInfo,
@@ -1317,8 +1113,8 @@ pub fn phase3_svcmgr_handover(
     svcmgr_service_ep: u32,
     devmgr_registry_ep: u32,
     system_root_cap: u32,
-    rootfs_root_cap: u32,
-    mut thread_caps: ServiceThreadCaps,
+    log_ep: u32,
+    thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
     mem_frame_reap_floor: u32,
@@ -1353,204 +1149,42 @@ pub fn phase3_svcmgr_handover(
         idle_loop();
     };
 
-    let handover = SvcmgrHandoverCaps {
+    // Serve svcmgr its handover endowment: round 1 carries svcmgr's own
+    // endpoints plus the publish-role source caps (rootfs root, devmgr
+    // registry), then one round per init-bootstrapped substrate service
+    // carries that service's (name, thread_cap) for death-supervision
+    // binding, and the terminal round carries the reserved log-sink sources.
+    // svcmgr drains it all in `bootstrap_caps`, publishes the well-known
+    // names it owns (`rootfs.root` / `svcmgr` / `devmgr.registry`), installs
+    // devmgr's drivers dir, and reconciles `/config/svcmgr/services/` on
+    // HANDOVER_COMPLETE — launching logd/timed/pwrmgr and acquiring their
+    // caps for them.
+    //
+    // The publish source for `rootfs.root` is the seed system-root cap
+    // (vfsd's synthetic root): vfsd self-mounts root, so there is no
+    // per-mount fatfs cap to publish.
+    let master_log_source = syscall::cap_derive(log_ep, syscall::RIGHTS_ALL).unwrap_or(0);
+    // Token-0 `SEND|GRANT` source on procmgr's service endpoint; svcmgr mints
+    // logd's `DEATH_EQ_AUTHORITY` SEND from it. `GRANT` because logd's
+    // death-EQ registration transfers a cap, which the IPC kernel gates on it.
+    let procmgr_death_auth_source =
+        syscall::cap_derive(procmgr_ep, syscall::RIGHTS_SEND_GRANT).unwrap_or(0);
+    let endowment = SvcmgrEndowment {
         svcmgr_service_ep,
         svcmgr_bootstrap_ep,
+        rootfs_root_cap: system_root_cap,
+        devmgr_registry_ep,
+        master_log_source,
+        procmgr_death_auth_source,
     };
-    setup_and_start_svcmgr(
+    endow_svcmgr(
         bootstrap_ep,
         svcmgr_handle,
         svcmgr_token,
-        &handover,
+        &endowment,
+        thread_caps,
         ipc_buf,
     );
-
-    // Hand devmgr a least-privilege `/services/drivers/` subtree cap so
-    // it can lazily walk + spawn its on-disk driver binaries (today: the
-    // per-arch RTC). Ack-only handshake; init does not block on driver
-    // work. Best-effort: a failure here means timed will see NO_DEVICE
-    // on its first QUERY_RTC_DEVICE and degrade to its no-RTC path; the
-    // rest of Phase 3 proceeds normally.
-    set_drivers_dir_on_devmgr(devmgr_registry_ep, system_root_cap, ipc_buf);
-
-    // Wallclock chain: timed (init-spawned, svcmgr-published) consumes
-    // devmgr's QUERY_RTC_DEVICE for the per-arch RTC driver, which devmgr
-    // loads lazily from disk after the SET_DRIVERS_DIR handshake above.
-    // Failures are logged but do not abort phase 3 — svctest tolerates
-    // `SystemTime::now()` returning UNIX_EPOCH and exercises the live
-    // path only when the chain came up.
-    thread_caps.timed = bring_up_timed(
-        procmgr_ep,
-        bootstrap_ep,
-        svcmgr_service_ep,
-        devmgr_registry_ep,
-        system_root_cap,
-        init_self_cspace,
-        ipc_buf,
-    )
-    .unwrap_or(0);
-
-    let pwrmgr_spawn = create_and_start_pwrmgr(
-        info,
-        procmgr_ep,
-        bootstrap_ep,
-        system_root_cap,
-        init_self_cspace,
-        ipc_buf,
-    );
-    let (pwrmgr_service_ep, pwrmgr_thread_cap) = if let Some(s) = pwrmgr_spawn
-    {
-        (s.service_ep, s.thread_cap)
-    }
-    else
-    {
-        log("phase 3: pwrmgr not available; naked xtask run will not exit cleanly");
-        (0, 0)
-    };
-
-    // Derive a PUBLISH_AUTHORITY-tokened SEND_GRANT on svcmgr's
-    // service ep so init can publish the named caps post-#21 consumers
-    // resolve through `/config/svcmgr/services/<name>.svc` `seed = ...`.
-    // `RIGHTS_SEND_GRANT` (not bare SEND): PUBLISH_ENDPOINT carries the
-    // value cap in the message, and the IPC kernel requires the GRANT
-    // bit on the caller's send-cap to transfer caps. After the four
-    // publications init drops this cap; runtime consumers use the
-    // un-tokened SEND seeded into `ProcessInfo.service_registry_cap`.
-    let publish_cap = syscall::cap_derive_token(
-        svcmgr_service_ep,
-        syscall::RIGHTS_SEND_GRANT,
-        svcmgr_labels::PUBLISH_AUTHORITY,
-    )
-    .ok();
-
-    // 1. rootfs.root — tokened SEND on the root filesystem's namespace
-    //    endpoint at its root directory. FS-driver-agnostic by design:
-    //    today fatfs, tomorrow any other FS driver, same name.
-    if let Some(cap) = publish_cap
-        && rootfs_root_cap != 0
-        && let Ok(derived) = syscall::cap_derive(rootfs_root_cap, syscall::RIGHTS_SEND)
-        && !svcmgr_publish(cap, ipc::published_names::ROOTFS_ROOT, derived, ipc_buf)
-    {
-        log("phase 3: publish rootfs.root failed");
-        let _ = syscall::cap_delete(derived);
-    }
-
-    // 2/3. pwrmgr.shutdown + pwrmgr.deny — derived from pwrmgr's
-    //      service endpoint with the SHUTDOWN_AUTHORITY token bit set
-    //      (or a non-AUTHORITY sentinel `1` for the negative-test
-    //      twin). Plain SEND would let consumers re-tokenize the cap
-    //      and defeat the gate; cap_derive_token rejects sources with
-    //      a non-zero token, so the AUTHORITY shape stays sealed.
-    if let Some(cap) = publish_cap
-        && pwrmgr_service_ep != 0
-    {
-        if let Ok(auth) = syscall::cap_derive_token(
-            pwrmgr_service_ep,
-            syscall::RIGHTS_SEND,
-            ipc::pwrmgr_labels::SHUTDOWN_AUTHORITY,
-        )
-        {
-            if !svcmgr_publish(cap, ipc::published_names::PWRMGR_SHUTDOWN, auth, ipc_buf)
-            {
-                log("phase 3: publish pwrmgr.shutdown failed");
-                let _ = syscall::cap_delete(auth);
-            }
-        }
-        else
-        {
-            log("phase 3: derive pwrmgr.shutdown cap failed");
-        }
-        if let Ok(deny) = syscall::cap_derive_token(pwrmgr_service_ep, syscall::RIGHTS_SEND, 1)
-        {
-            if !svcmgr_publish(cap, ipc::published_names::PWRMGR_DENY, deny, ipc_buf)
-            {
-                log("phase 3: publish pwrmgr.deny failed");
-                let _ = syscall::cap_delete(deny);
-            }
-        }
-        else
-        {
-            log("phase 3: derive pwrmgr.deny cap failed");
-        }
-    }
-
-    // 4. svcmgr — tokened SEND on svcmgr's own service endpoint. Used
-    //    by crasher.svc's `seed = svcmgr` line so the launched
-    //    crasher receives the same cap shape today's hard-coded
-    //    bundle gave it. Per-publisher attenuation (so children can
-    //    only QUERY, not PUBLISH) lives in the SEND-without-AUTHORITY
-    //    shape — same as `ProcessInfo.service_registry_cap`.
-    if let Some(cap) = publish_cap
-        && let Ok(svc_send) = syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND)
-        && !svcmgr_publish(cap, ipc::published_names::SVCMGR, svc_send, ipc_buf)
-    {
-        log("phase 3: publish svcmgr failed");
-        let _ = syscall::cap_delete(svc_send);
-    }
-
-    // 5. devmgr.registry — `REGISTRY_QUERY_AUTHORITY`-tokened SEND on
-    //    devmgr's registry endpoint. Today's consumer is
-    //    `programs/fb-charset` via `seed = devmgr.registry`; future
-    //    non-init consumers of devmgr's discovery surface use the same
-    //    name. The token bit survives svcmgr's plain `cap_derive` in
-    //    `registry_lookup_derived`.
-    if let Some(cap) = publish_cap
-        && devmgr_registry_ep != 0
-    {
-        match syscall::cap_derive_token(
-            devmgr_registry_ep,
-            syscall::RIGHTS_SEND,
-            ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-        )
-        {
-            Ok(derived) =>
-            {
-                if !svcmgr_publish(cap, ipc::published_names::DEVMGR_REGISTRY, derived, ipc_buf)
-                {
-                    log("phase 3: publish devmgr.registry failed");
-                    let _ = syscall::cap_delete(derived);
-                }
-            }
-            Err(_) => log("phase 3: derive devmgr.registry cap failed"),
-        }
-    }
-
-    if let Some(cap) = publish_cap
-    {
-        let _ = syscall::cap_delete(cap);
-    }
-
-    // Register every foundational service init bootstrapped with
-    // svcmgr (v3 wire: name + thread cap). svcmgr's reconciliation
-    // path pairs each name with the matching `.svc` recipe on disk
-    // and binds death-notification. Zero in a slot means init could
-    // not capture the thread cap (e.g. the spawn failed or the
-    // helper had no cap to share); the register call is then
-    // skipped and the recipe ⇒ `registered without definition`
-    // entries are absent rather than surfacing as orphans.
-    let registrations: &[(&[u8], u32)] = &[
-        (b"memmgr", thread_caps.memmgr),
-        (b"procmgr", thread_caps.procmgr),
-        (b"devmgr", thread_caps.devmgr),
-        (b"vfsd", thread_caps.vfsd),
-        (b"logd", thread_caps.logd),
-        (b"timed", thread_caps.timed),
-        (b"pwrmgr", pwrmgr_thread_cap),
-    ];
-    for (name, thread_cap) in registrations
-    {
-        if *thread_cap != 0
-        {
-            register_service(
-                svcmgr_service_ep,
-                ipc_buf,
-                &ServiceRegistration {
-                    name,
-                    thread_cap: *thread_cap,
-                },
-            );
-        }
-    }
 
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
     // SAFETY: ipc_buf is caller's registered IPC buffer.
@@ -1561,10 +1195,11 @@ pub fn phase3_svcmgr_handover(
     }
 
     // Reap-handoff: move init's kernel-object caps + every reclaimable
-    // Frame cap to procmgr. Procmgr binds a death-EQ on init's main
-    // thread; when this function returns into `sys_thread_exit`
-    // immediately below, procmgr's reap path tears init's AS/CSpace
-    // /Threads down and donates the Frame caps to memmgr's pool.
+    // Frame cap to procmgr. Procmgr binds a death-EQ on both of init's
+    // threads (main + init-logd) and reaps once both have exited — init-logd
+    // outlives this main thread until the svcmgr-launched real-logd pulls
+    // `HANDOVER_PULL`. The reap tears init's AS/CSpace/Threads down and
+    // donates the Frame caps to memmgr's pool.
     handoff_to_procmgr_reap(
         info,
         procmgr_ep,
@@ -1757,184 +1392,11 @@ fn handoff_to_procmgr_reap(
     }
 }
 
-// ── logd spawn ──────────────────────────────────────────────────────────────
+// ── svcmgr endowment name packing ───────────────────────────────────────────
 
-/// Spawn real-logd from `/services/logd` at the end of Phase 2, immediately
-/// after the root mount completes. Init transfers:
-///
-/// * a RECV cap on the master log endpoint (so logd becomes the
-///   receive-side; init-logd terminates as part of the handover);
-/// * a SEND cap on the same endpoint (single-use, for the
-///   `HANDOVER_PULL` IPC to init-logd);
-/// * a tokened SEND cap on procmgr carrying
-///   `procmgr_labels::DEATH_EQ_AUTHORITY` (for `REGISTER_DEATH_EQ`);
-/// * a SEND cap on devmgr's registry endpoint carrying
-///   `devmgr_labels::REGISTRY_QUERY_AUTHORITY`, with which logd resolves
-///   the serial driver (via `QUERY_SERIAL_DEVICE`) and routes its own
-///   diagnostics and the per-sender log lines it receives through the
-///   driver's `SERIAL_WRITE_BYTES`. Logd holds no UART hardware authority
-///   and cannot route diagnostics through `seraph::log!` because it IS the
-///   log receiver.
-///
-/// Returns `true` on successful spawn + bootstrap; `false` on any
-/// failure (logged at fault; init continues without real-logd, with
-/// init-logd running indefinitely until init's process is otherwise
-/// reaped).
-// too_many_lines: one transactional spawn path; splitting would push
-// most of the body into helpers and obscure the cap-flow sequencing.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub fn create_and_start_logd(
-    procmgr_ep: u32,
-    procmgr_service_ep_source: u32,
-    bootstrap_ep: u32,
-    log_ep: u32,
-    devmgr_registry_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    ipc_buf: *mut u64,
-) -> Option<u32>
-{
-    let walked = walk::walk_to_file(system_root_cap, b"/services/logd", 0xFFFF, ipc_buf)?;
-
-    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
-
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, walked.size)
-        .cap(walked.file_cap)
-        .cap(tokened_creator)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
-    else
-    {
-        log("logd: CREATE_FROM_FILE ipc_call failed");
-        return None;
-    };
-    if reply.label != 0
-    {
-        log("logd: CREATE_FROM_FILE error");
-        return None;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.len() < 2
-    {
-        log("logd: CREATE_FROM_FILE reply missing caps");
-        return None;
-    }
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
-
-    // logd owns the master log endpoint RECV plus a devmgr-registry query
-    // cap (to resolve the serial driver via QUERY_SERIAL_DEVICE); its
-    // serial output is driver-mediated, so it holds no UART hardware
-    // authority. It does no filesystem I/O. Spawn with no namespace cap.
-    if !configure_child_namespace(
-        process_handle,
-        system_root_cap,
-        init_self_cspace,
-        NsPolicy::None,
-        None,
-        ipc_buf,
-    )
-    {
-        return None;
-    }
-
-    // Derive the three bootstrap caps logd needs.
-    let Ok(log_recv) = syscall::cap_derive(log_ep, syscall::RIGHTS_ALL)
-    else
-    {
-        log("logd: log_ep RECV derive failed");
-        destroy_partial_child(process_handle, ipc_buf);
-        return None;
-    };
-    let Ok(log_handover_send) = syscall::cap_derive(log_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        log("logd: log_ep SEND derive failed");
-        let _ = syscall::cap_delete(log_recv);
-        destroy_partial_child(process_handle, ipc_buf);
-        return None;
-    };
-    // RIGHTS_SEND_GRANT (not bare SEND): the IPC kernel requires the
-    // GRANT bit when the caller transfers any cap in the message, and
-    // logd's REGISTER_DEATH_EQ call hands over its `death_eq` cap.
-    let Ok(procmgr_death_auth) = syscall::cap_derive_token(
-        procmgr_service_ep_source,
-        syscall::RIGHTS_SEND_GRANT,
-        procmgr_labels::DEATH_EQ_AUTHORITY,
-    )
-    else
-    {
-        log("logd: procmgr DEATH_EQ_AUTHORITY derive failed");
-        let _ = syscall::cap_delete(log_recv);
-        let _ = syscall::cap_delete(log_handover_send);
-        destroy_partial_child(process_handle, ipc_buf);
-        return None;
-    };
-
-    // devmgr-registry query cap: a SEND on devmgr's registry endpoint
-    // tokened with REGISTRY_QUERY_AUTHORITY so logd can resolve the serial
-    // driver via `QUERY_SERIAL_DEVICE`. logd's serial output is mediated by
-    // that driver; it holds no UART hardware authority. A zero registry
-    // endpoint yields zero, and logd then buffers received log lines in
-    // memory until the driver becomes resolvable.
-    let devmgr_registry_query = if devmgr_registry_ep != 0
-    {
-        syscall::cap_derive_token(
-            devmgr_registry_ep,
-            syscall::RIGHTS_SEND,
-            ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-        )
-        .unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
-
-    if !start_process(
-        process_handle,
-        ipc_buf,
-        "phase 2: logd started; serving bootstrap",
-        "phase 2: logd START_PROCESS failed",
-    )
-    {
-        let _ = syscall::cap_delete(log_recv);
-        let _ = syscall::cap_delete(log_handover_send);
-        let _ = syscall::cap_delete(procmgr_death_auth);
-        if devmgr_registry_query != 0
-        {
-            let _ = syscall::cap_delete(devmgr_registry_query);
-        }
-        return None;
-    }
-
-    if !serve(
-        bootstrap_ep,
-        child_token,
-        ipc_buf,
-        true,
-        &[
-            log_recv,
-            log_handover_send,
-            procmgr_death_auth,
-            devmgr_registry_query,
-        ],
-        &[],
-        "logd: bootstrap round failed",
-    )
-    {
-        return None;
-    }
-
-    Some(thread_cap)
-}
-
-// ── RTC + timed spawn pipeline ──────────────────────────────────────────────
-
-/// Pack a short ASCII name into IPC data words (`pack_name` shape matches
-/// `svcmgr::read_tail_name_from_msg`). Returns the word count used.
+/// Pack a short ASCII name into IPC data words, little-endian within each
+/// word. Matches svcmgr's unpack in `service::ingest_substrate` /
+/// `read_tail_name_from_msg`. Returns the word count used.
 fn pack_svc_name(name: &[u8], out: &mut [u64; 2]) -> usize
 {
     for (i, &b) in name.iter().enumerate()
@@ -1942,368 +1404,4 @@ fn pack_svc_name(name: &[u8], out: &mut [u64; 2]) -> usize
         out[i / 8] |= u64::from(b) << ((i % 8) * 8);
     }
     name.len().div_ceil(8)
-}
-
-/// Publish `(name, send_cap)` to svcmgr via `PUBLISH_ENDPOINT`. `publish_cap`
-/// MUST carry `svcmgr_labels::PUBLISH_AUTHORITY` in its token (init mints
-/// such caps locally from the un-tokened source it owns on svcmgr's service
-/// endpoint). Returns `true` on `svcmgr_errors::SUCCESS`.
-fn svcmgr_publish(publish_cap: u32, name: &[u8], send_cap: u32, ipc_buf: *mut u64) -> bool
-{
-    if publish_cap == 0 || send_cap == 0 || name.is_empty() || name.len() > 16
-    {
-        return false;
-    }
-    let mut words = [0u64; 2];
-    let word_count = pack_svc_name(name, &mut words);
-
-    let mut builder =
-        IpcMessage::builder(svcmgr_labels::PUBLISH_ENDPOINT | ((name.len() as u64) << 16))
-            .cap(send_cap);
-    for (i, &w) in words.iter().take(word_count).enumerate()
-    {
-        builder = builder.word(i, w);
-    }
-    let request = builder.build();
-
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(publish_cap, &request, ipc_buf) };
-    matches!(reply, Ok(r) if r.label == ipc::svcmgr_errors::SUCCESS)
-}
-
-/// Common service-endpoint + RECV-derivation setup for a timed spawn.
-/// Init keeps the source slot to mint per-publish SENDs; the child
-/// receives a RECV-rights derivation.
-fn create_service_endpoint_pair() -> Option<(u32, u32)>
-{
-    let source = syscall::cap_create_endpoint(crate::endpoint_slab()).ok()?;
-    let Ok(recv_cap) = syscall::cap_derive(source, syscall::RIGHTS_RECEIVE)
-    else
-    {
-        let _ = syscall::cap_delete(source);
-        return None;
-    };
-    Some((source, recv_cap))
-}
-
-/// Walk + `CREATE_FROM_FILE` for one binary path. Returns
-/// `(process_handle, thread_cap, child_token)`; caller owns the thread
-/// cap (e.g. for svcmgr `REGISTER_SERVICE`) and is responsible for
-/// `destroy_partial_child` on any subsequent failure.
-///
-/// `policy` and `cwd` are forwarded to `configure_child_namespace`.
-/// Service helpers that use this path (e.g. timed) pass `NsPolicy::None`
-/// because they do not touch the filesystem after `_start`.
-#[allow(clippy::too_many_arguments)]
-fn walk_and_create_from_file(
-    path: &[u8],
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    policy: NsPolicy,
-    cwd: Option<(&[u8], u64)>,
-    ipc_buf: *mut u64,
-) -> Option<(u32, u32, u64)>
-{
-    let walked = walk::walk_to_file(system_root_cap, path, 0xFFFF, ipc_buf)?;
-    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, walked.size)
-        .cap(walked.file_cap)
-        .cap(tokened_creator)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) }.ok()?;
-    if reply.label != 0
-    {
-        return None;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.len() < 2
-    {
-        return None;
-    }
-    let process_handle = reply_caps[0];
-    let thread_cap = reply_caps[1];
-    if !configure_child_namespace(
-        process_handle,
-        system_root_cap,
-        init_self_cspace,
-        policy,
-        cwd,
-        ipc_buf,
-    )
-    {
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    }
-    Some((process_handle, thread_cap, child_token))
-}
-
-/// Spawn `/services/timed` and serve its single bootstrap round. Returns
-/// the init-owned service-endpoint source cap; init derives a SEND
-/// from it for the `timed` publish.
-/// Timed-side result of [`create_and_start_timed`].
-///
-/// `service_ep` is the init-owned service-endpoint source cap (used
-/// to derive the SEND init publishes as `timed`). `thread_cap` is
-/// timed's main thread in init's `CSpace`, registered with svcmgr so
-/// the supervisor can bind death-notification.
-pub struct TimedSpawn
-{
-    pub service_ep: u32,
-    pub thread_cap: u32,
-}
-
-pub fn create_and_start_timed(
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    devmgr_registry_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    ipc_buf: *mut u64,
-) -> Option<TimedSpawn>
-{
-    let (svc_source, svc_recv) = create_service_endpoint_pair()?;
-
-    // timed resolves the RTC via devmgr's QUERY_RTC_DEVICE on a
-    // REGISTRY_QUERY_AUTHORITY-tokened SEND copy of devmgr's registry
-    // endpoint, then serves GET_WALL_TIME. No filesystem access.
-    let Ok(devmgr_registry_copy) = syscall::cap_derive_token(
-        devmgr_registry_ep,
-        syscall::RIGHTS_SEND,
-        ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
-    )
-    else
-    {
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        log("timed: devmgr registry token derive failed");
-        return None;
-    };
-
-    let Some((process_handle, thread_cap, child_token)) = walk_and_create_from_file(
-        b"/services/timed",
-        procmgr_ep,
-        bootstrap_ep,
-        system_root_cap,
-        init_self_cspace,
-        NsPolicy::None,
-        None,
-        ipc_buf,
-    )
-    else
-    {
-        let _ = syscall::cap_delete(devmgr_registry_copy);
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        log("timed: walk + CREATE_FROM_FILE failed");
-        return None;
-    };
-
-    if !start_process(
-        process_handle,
-        ipc_buf,
-        "phase 3: timed started; serving bootstrap",
-        "phase 3: timed START_PROCESS failed",
-    )
-    {
-        let _ = syscall::cap_delete(devmgr_registry_copy);
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(svc_source);
-        let _ = syscall::cap_delete(thread_cap);
-        destroy_partial_child(process_handle, ipc_buf);
-        return None;
-    }
-
-    if !serve(
-        bootstrap_ep,
-        child_token,
-        ipc_buf,
-        true,
-        &[svc_recv, devmgr_registry_copy],
-        &[],
-        "timed: bootstrap round failed",
-    )
-    {
-        // Best-effort delete: serve_round may have transferred caps before
-        // failing. Child has been started; cannot destroy safely. It will
-        // exit on the receive-side failure and procmgr will reap.
-        let _ = syscall::cap_delete(svc_recv);
-        let _ = syscall::cap_delete(devmgr_registry_copy);
-        let _ = syscall::cap_delete(svc_source);
-        let _ = syscall::cap_delete(thread_cap);
-        return None;
-    }
-
-    Some(TimedSpawn {
-        service_ep: svc_source,
-        thread_cap,
-    })
-}
-
-/// Phase 3 sub-step: hand devmgr a least-privilege
-/// `/services/drivers/` subtree cap so it can lazily walk + spawn
-/// on-disk driver binaries (today: the per-arch RTC).
-///
-/// Walks `system_root_cap` to `/services/drivers/` at `LOOKUP | READ`
-/// rights, then sends `devmgr_labels::SET_DRIVERS_DIR` on a fresh
-/// `INIT_BIND_AUTHORITY`-tokened copy of `devmgr_registry_ep` (only
-/// init holds this verb bit; the `REGISTRY_QUERY_AUTHORITY`-only copy
-/// published to svcmgr cannot send this label).
-///
-/// devmgr's handler is ack-only: it stashes the cap and replies
-/// SUCCESS immediately. No driver walk or spawn happens in the
-/// handshake's blocking window — those fire lazily on the first
-/// `QUERY_RTC_DEVICE`. Init is not in the critical path of any
-/// driver spawn.
-///
-/// Best-effort: any failure (walk fails, devmgr replies a non-SUCCESS
-/// code, transport error) is logged and Phase 3 continues. The
-/// system boots without a wallclock; timed sees `NO_DEVICE` and
-/// degrades to its no-RTC path.
-fn set_drivers_dir_on_devmgr(devmgr_registry_ep: u32, system_root_cap: u32, ipc_buf: *mut u64)
-{
-    if devmgr_registry_ep == 0 || system_root_cap == 0
-    {
-        log("phase 3: SET_DRIVERS_DIR skipped (no devmgr or no system root)");
-        return;
-    }
-
-    // Attenuated rights: only what devmgr needs to walk into a
-    // subdirectory and read file contents. Visibility-gating bits are
-    // intentionally omitted; the namespace server intersects per hop.
-    let rights = u64::from(namespace_protocol::rights::LOOKUP | namespace_protocol::rights::READ);
-    let Some(drivers_dir) =
-        walk::walk_to_dir(system_root_cap, b"/services/drivers", rights, ipc_buf)
-    else
-    {
-        log("phase 3: SET_DRIVERS_DIR walk to /services/drivers failed; RTC unavailable");
-        return;
-    };
-
-    // `ipc::ipc_call` requires SEND+GRANT on the endpoint cap when the
-    // message carries caps (`drivers_dir` here); use
-    // `RIGHTS_SEND_GRANT`. The `devmgr.registry` cap init publishes for
-    // other services to look up deliberately omits the GRANT bit so
-    // client callers cannot transfer caps in queries; init's own
-    // privileged copy includes it for this single transfer.
-    let Ok(init_bind_ep) = syscall::cap_derive_token(
-        devmgr_registry_ep,
-        syscall::RIGHTS_SEND_GRANT,
-        ipc::devmgr_labels::INIT_BIND_AUTHORITY,
-    )
-    else
-    {
-        log("phase 3: SET_DRIVERS_DIR INIT_BIND_AUTHORITY derive failed; RTC unavailable");
-        let _ = syscall::cap_delete(drivers_dir);
-        return;
-    };
-
-    let msg = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .cap(drivers_dir)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let result = unsafe { ipc::ipc_call(init_bind_ep, &msg, ipc_buf) };
-    let _ = syscall::cap_delete(init_bind_ep);
-
-    match result
-    {
-        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS =>
-        {
-            // Kernel transferred `drivers_dir` to devmgr; nothing
-            // for init to clean up.
-            log("phase 3: SET_DRIVERS_DIR handshake ok");
-        }
-        Ok(_reply) =>
-        {
-            // Devmgr replied an error after the kernel transferred
-            // the cap. Per the SET_DRIVERS_DIR contract, devmgr's
-            // error paths release the delivered cap themselves.
-            log("phase 3: SET_DRIVERS_DIR rejected; RTC unavailable");
-        }
-        Err(_) =>
-        {
-            // ipc_call returned before the kernel committed the
-            // transfer; the source slot still owns `drivers_dir`
-            // and must be released.
-            let _ = syscall::cap_delete(drivers_dir);
-            log("phase 3: SET_DRIVERS_DIR ipc_call error; RTC unavailable");
-        }
-    }
-}
-
-/// Phase 3 sub-step: spawn timed and publish it as `timed`. The RTC
-/// driver itself is loaded by devmgr from the on-disk rootfs inside
-/// the [`set_drivers_dir_on_devmgr`] handshake (above), between
-/// devmgr's `ipc_reply` and its next `ipc_recv`; by the time `timed`
-/// queries [`ipc::devmgr_labels::QUERY_RTC_DEVICE`] against the
-/// `REGISTRY_QUERY_AUTHORITY`-tokened copy of `devmgr_registry_ep`
-/// delivered in its bootstrap round, devmgr already holds `rtc_ep`
-/// (or the sticky-failure state and replies `NO_DEVICE`). Init's
-/// PUBLISH_AUTHORITY-tokened cap is derived from `svcmgr_service_ep`
-/// (the un-tokened source init already owns). All failures are
-/// logged; the function never aborts phase 3 — a degraded wall-clock
-/// leaves `SystemTime::now()` returning `UNIX_EPOCH` but the rest of
-/// svctest still runs.
-pub fn bring_up_timed(
-    procmgr_ep: u32,
-    bootstrap_ep: u32,
-    svcmgr_service_ep: u32,
-    devmgr_registry_ep: u32,
-    system_root_cap: u32,
-    init_self_cspace: u32,
-    ipc_buf: *mut u64,
-) -> Option<u32>
-{
-    // RIGHTS_SEND_GRANT (not bare SEND): PUBLISH_ENDPOINT carries the
-    // service's SEND cap in the message, and the IPC kernel requires the
-    // GRANT bit on the caller's send-cap to transfer caps.
-    let Ok(publish_cap) = syscall::cap_derive_token(
-        svcmgr_service_ep,
-        syscall::RIGHTS_SEND_GRANT,
-        svcmgr_labels::PUBLISH_AUTHORITY,
-    )
-    else
-    {
-        log("phase 3: timed PUBLISH_AUTHORITY derive failed");
-        return None;
-    };
-
-    let Some(timed_spawn) = create_and_start_timed(
-        procmgr_ep,
-        bootstrap_ep,
-        devmgr_registry_ep,
-        system_root_cap,
-        init_self_cspace,
-        ipc_buf,
-    )
-    else
-    {
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    };
-
-    let Ok(timed_publish_send) = syscall::cap_derive(timed_spawn.service_ep, syscall::RIGHTS_SEND)
-    else
-    {
-        log("phase 3: timed publish SEND derive failed");
-        let _ = syscall::cap_delete(timed_spawn.thread_cap);
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    };
-    if !svcmgr_publish(publish_cap, b"timed", timed_publish_send, ipc_buf)
-    {
-        log("phase 3: timed publish failed");
-        let _ = syscall::cap_delete(timed_publish_send);
-        let _ = syscall::cap_delete(timed_spawn.thread_cap);
-        let _ = syscall::cap_delete(publish_cap);
-        return None;
-    }
-    log("phase 3: timed published");
-
-    let _ = syscall::cap_delete(publish_cap);
-    Some(timed_spawn.thread_cap)
 }

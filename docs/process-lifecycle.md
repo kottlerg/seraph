@@ -42,7 +42,8 @@ init                  no_std; receives the full initial CSpace
    │
    ├── delegates per-service capability subsets via IPC
    │
-   ├── registers all started services with svcmgr
+   ├── endows svcmgr (its endpoints + publish-source caps + substrate
+   │     thread caps) over the bootstrap-round handover endowment
    │
    └── exits
        │
@@ -110,38 +111,45 @@ mechanism — but procmgr is the chooser from that point forward (see
 
 ### Init → remaining services
 
-Init requests procmgr to start the remaining boot-time services in
-order — devmgr, vfsd, optionally netd, then svcmgr, timed, and
-pwrmgr — by IPC to procmgr's `CREATE_FROM_FILE` / `CREATE_PROCESS`
-endpoints. The per-arch RTC chip driver is not in this list: devmgr
-spawns it during its enumeration sweep, and timed resolves it via
-`devmgr_labels::QUERY_RTC_DEVICE` at startup. For each service,
-init delegates the appropriate capability subset (see
+Init requests procmgr to start only the bootstrap-essential services
+— devmgr, vfsd, optionally netd, then svcmgr — by IPC to
+procmgr's `CREATE_FROM_FILE` / `CREATE_PROCESS` endpoints. The
+non-bootstrap services (`logd`, `timed`, `pwrmgr`, the staged test
+harnesses) are not in this list: svcmgr launches them itself
+post-handover from
+their `/config/svcmgr/services/*.svc` recipes. Nor is the per-arch RTC
+chip driver: devmgr spawns it during its enumeration sweep, and timed
+resolves it via `devmgr_labels::QUERY_RTC_DEVICE` at startup. For each
+service init starts, it delegates the appropriate capability subset (see
 [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution"). svcmgr is configured with the universal
 `system_root_cap` so it can read `/config/svcmgr/services/*.svc`
 post-handover.
 
-Init then publishes well-known caps into svcmgr's discovery
-registry (`ipc::published_names::ROOTFS_ROOT`,
-`PWRMGR_SHUTDOWN`, `PWRMGR_DENY`, `SVCMGR`) via
-`svcmgr_labels::PUBLISH_ENDPOINT` with a `PUBLISH_AUTHORITY`-tokened
-`RIGHTS_SEND_GRANT` cap, and registers every foundational service
-it bootstrapped with svcmgr via the v3 `REGISTER_SERVICE` wire
-(name + thread cap): `memmgr`, `procmgr`, `devmgr`, `vfsd`, `logd`,
-`timed`, `pwrmgr`. Recipes for all svcmgr-supervised services live
-on disk at `/config/svcmgr/services/<name>.svc`, not on the wire —
-see
+Init then serves svcmgr the **handover endowment** over the
+bootstrap-round protocol: round 1 carries svcmgr's own endpoints plus the
+publish-role source caps (a `SEND` on the root filesystem namespace
+endpoint and a token-0 `SEND|GRANT` source on devmgr's registry
+endpoint); each subsequent round carries one `(name, thread_cap)` pair for
+a substrate service init bootstrapped (`memmgr`, `procmgr`, `devmgr`,
+`vfsd`, `logd`). svcmgr — not init — then publishes the well-known names
+it owns into its own registry (`ipc::published_names::ROOTFS_ROOT`,
+`SVCMGR`, `DEVMGR_REGISTRY`, minted from the endowed sources) and installs
+devmgr's `/services/drivers/` cap via `devmgr_labels::SET_DRIVERS_DIR`.
+The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are
+published by svcmgr's provider path on each provider's launch. Recipes for
+all svcmgr-supervised services live on disk at
+`/config/svcmgr/services/<name>.svc`, not on the wire — see
 [`services/svcmgr/docs/service-definitions.md`](../services/svcmgr/docs/service-definitions.md).
 
 ### Init reap
 
 After Phase 3 signals `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
-replies immediately, then scans `/config/svcmgr/services/` and launches any
-defined-but-unregistered service it finds — on a normal boot every default
-service is init-registered bind-only, so none launch here; the launch path
-fires only for staged test recipes such as `svctest.svc` / `usertest.svc`
-and the co-staged `crasher.svc` restart fixture), init signs over its own
+replies immediately, then scans `/config/svcmgr/services/`, binds the
+endowed substrate bind-only, and launches every defined-but-unparked
+service — `logd`, the `timed` and `pwrmgr` providers on a normal boot,
+plus any staged test recipes such as `svctest.svc` / `usertest.svc` and
+the co-staged `crasher.svc` restart fixture), init signs over its own
 kernel-object caps
 (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and
 every reclaimable Frame cap it solely owns (ELF segments, user stack
@@ -156,10 +164,15 @@ it lives in a single contiguous arena Frame cap that init forwards to
 memmgr as an in-use run at bootstrap (`finalize_memmgr`), so those pages
 are already accounted in memmgr's pool and never reach the reap route.
 
-Procmgr binds a death-EQ observer on init's main thread; on the death
-event procmgr tears down init's kernel objects in order (Threads →
-AddressSpace → donate Frame caps to memmgr → CSpace cascade), leaving
-zero init residue. The implementation is in
+Procmgr binds a death-EQ observer on **both** init threads (main +
+init-logd) and reaps only once both have exited — init is threadless. The
+main thread exits at the end of Phase 3, but init-logd keeps serving the
+master log endpoint until the svcmgr-launched real-logd pulls its
+handover, so it outlives main; reclaiming init's address space while a
+thread still runs in it would fault that thread. On the last death procmgr
+tears down init's kernel objects in order (Threads → AddressSpace → donate
+Frame caps to memmgr → CSpace cascade), leaving zero init residue. The
+implementation is in
 [`services/procmgr/README.md`](../services/procmgr/README.md) §"Init
 reap".
 

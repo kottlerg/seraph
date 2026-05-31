@@ -50,7 +50,7 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
 //     DEVMGR_LABELS_VERSION — devmgr_labels::QUERY_BLOCK_DEVICE (vfsd ↔ devmgr)
 //     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
-//     SVCMGR_LABELS_VERSION — svcmgr_labels::REGISTER_SERVICE   (init ↔ svcmgr)
+//     SVCMGR_LABELS_VERSION — svcmgr handover endowment round 1   (init ↔ svcmgr)
 //     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP            (std process ↔ logd)
 //
 //   Implicitly covered by parent-channel handshake — the channel was opened
@@ -255,9 +255,10 @@ pub mod procmgr_labels
     ///                  via IPC cap-transfer; procmgr accumulates them
     ///                  for the eventual `memmgr.DONATE_FRAMES` chunk.
     ///
-    /// Procmgr binds the death-EQ on init's main thread with correlator
-    /// `INIT_REAP_CORRELATOR` as part of the first round. Each round
-    /// replies `procmgr_errors::SUCCESS`.
+    /// Procmgr binds the death-EQ on both init threads (main and
+    /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
+    /// first round, and reaps once both have exited. Each round replies
+    /// `procmgr_errors::SUCCESS`.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
     /// Signal end of init's reap-handoff cap stream. After this call
@@ -481,41 +482,30 @@ pub mod procmgr_process_state
     pub const EXITED: u64 = 3;
 }
 
-pub const SVCMGR_LABELS_VERSION: u32 = 3;
+pub const SVCMGR_LABELS_VERSION: u32 = 4;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
-    /// Register a currently-running service for supervision.
-    ///
-    /// The recipe (binary, argv, env, restart policy, criticality,
-    /// namespace shape, seed names) lives on disk at
-    /// `/config/svcmgr/services/<name>.svc`, not on the wire. This
-    /// message carries only what cannot be on disk: which named
-    /// recipe the running process implements, and the thread cap
-    /// svcmgr binds death-notification on.
-    ///
-    /// Wire format:
-    /// * word 0: `SVCMGR_LABELS_VERSION` handshake.
-    /// * word 1: `name_len` (byte length of the service name).
-    /// * words 2..: `name` bytes (the `.svc` filename without
-    ///   the `.svc` suffix).
-    /// * `caps[0]`: thread cap for death-notification binding.
-    ///
-    /// On [`HANDOVER_COMPLETE`] svcmgr reconciles every registered
-    /// name against `/config/svcmgr/services/`: a registered name with a
-    /// definition is bound and supervised using the on-disk recipe;
-    /// a defined name not registered is launched by svcmgr itself;
-    /// a registered name with no definition is a hard error (svcmgr
-    /// has no recipe to restart it). See
-    /// `services/svcmgr/docs/service-definitions.md` and
-    /// `services/svcmgr/docs/ipc-interface.md` for the
-    /// authoritative spec.
-    pub const REGISTER_SERVICE: u64 = 1;
+    // The substrate services init bootstrapped before svcmgr existed
+    // (memmgr, procmgr, devmgr, vfsd, logd) are handed to svcmgr over
+    // init's bootstrap-round endowment, not a dedicated label: round 1
+    // carries svcmgr's own endpoints plus the source caps it needs for
+    // its publish role (`rootfs.root` SEND, devmgr-registry `SEND|GRANT`
+    // source) and `SVCMGR_LABELS_VERSION` in `data[1]`; each subsequent
+    // round carries one `(name, thread_cap)` pair svcmgr parks in its
+    // pending-registration table. On `HANDOVER_COMPLETE` svcmgr
+    // reconciles every parked name against `/config/svcmgr/services/`:
+    // a parked name with a definition is bound and supervised using the
+    // on-disk recipe; a defined name not parked is launched by svcmgr
+    // itself; a parked name with no definition is a hard error (svcmgr
+    // has no recipe to restart it). The endowment layout lives in
+    // `services/init/src/service.rs` and `services/svcmgr/src/service.rs`;
+    // see `services/svcmgr/docs/ipc-interface.md` and
+    // `services/svcmgr/docs/service-definitions.md` for the spec.
 
     /// Internal namespace-policy descriptor stored on `ServiceEntry`
     /// (one of the values below). Parsed by svcmgr from each
-    /// service's `namespace = ...` line in `/config/svcmgr/services/<name>.svc`;
-    /// no longer carried on the [`REGISTER_SERVICE`] wire.
+    /// service's `namespace = ...` line in `/config/svcmgr/services/<name>.svc`.
     ///
     /// Namespace-policy descriptor: hand the child a `cap_copy` of
     /// svcmgr's own root cap at full rights. Reserved for the small
@@ -551,12 +541,14 @@ pub mod svcmgr_labels
     pub const QUERY_ENDPOINT: u64 = 4;
 
     /// Verb-bit carried by the caller's token to authorise
-    /// [`PUBLISH_ENDPOINT`]. Init mints SEND caps on svcmgr's service
-    /// endpoint whose token is exactly `PUBLISH_AUTHORITY` (no
-    /// per-publisher identity in the low bits today — server-side
-    /// auth is binary: have the bit, or don't). Holders trusted to
-    /// add names: init itself, devmgr for driver registrations,
-    /// svcmgr's own future post-init service launcher.
+    /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
+    /// identity in the low bits today — server-side auth is binary: have
+    /// the bit, or don't). svcmgr publishes the well-known names it owns
+    /// (`rootfs.root`, `svcmgr`, `devmgr.registry`, and each provider's
+    /// `provides` names) directly into its own registry, so those need no
+    /// token. The gate exists for a future external publisher — devmgr
+    /// holds a `PUBLISH_AUTHORITY`-tokened SEND from its bootstrap bundle,
+    /// reserved for driver registrations.
     ///
     /// The SEND distributed to every process via
     /// `ProcessInfo.service_registry_cap` carries the child's
@@ -577,10 +569,12 @@ pub mod svcmgr_labels
 
 /// Well-known names published into svcmgr's discovery registry.
 ///
-/// Centralised so publishers (today: `init` during Phase 3 handover)
-/// and consumers (today: `svcmgr` resolving each `.svc`'s `seed = ...`
-/// list during launch) share the exact spelling. A typo on either
-/// side leaks out as `svcmgr_errors::UNKNOWN_NAME` rather than
+/// Centralised so the publisher (`svcmgr`, post-handover — from source
+/// caps init endows it in the handover endowment, plus each provider's
+/// `provides` names) and consumers (`svcmgr` resolving each `.svc`'s
+/// `seed = ...` list during launch, and any process via
+/// `QUERY_ENDPOINT`) share the exact spelling. A typo on either side
+/// leaks out as `svcmgr_errors::UNKNOWN_NAME` rather than
 /// `INSUFFICIENT_CAPS`.
 ///
 /// Names are FS-driver- and platform-agnostic by design: swapping the
@@ -616,10 +610,10 @@ pub mod published_names
     /// endpoint. Consumers needing to resolve a device driver
     /// themselves (today: `programs/fb-charset` →
     /// `QUERY_FRAMEBUFFER_DEVICE`; future: any non-init caller of
-    /// devmgr's discovery surface) seed this name. Init publishes it
-    /// at Phase 3 handover; the `REGISTRY_QUERY_AUTHORITY` token bit
-    /// is preserved through svcmgr's plain `cap_derive` in
-    /// `registry_lookup_derived`.
+    /// devmgr's discovery surface) seed this name. svcmgr publishes it
+    /// post-handover from the devmgr-registry source cap init endows it
+    /// with; the `REGISTRY_QUERY_AUTHORITY` token bit is preserved
+    /// through svcmgr's plain `cap_derive` in `registry_lookup_derived`.
     pub const DEVMGR_REGISTRY: &[u8] = b"devmgr.registry";
 }
 
@@ -746,12 +740,14 @@ pub mod timed_errors
 pub const PWRMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the power manager (`pwrmgr`).
 ///
-/// pwrmgr owns the platform shutdown surface: ACPI S5 on x86-64 (via
-/// `AcpiReclaimable` Frame caps plus the `IoPortRange` cap) and SBI SRST
-/// on RISC-V (via the `SbiControl` cap). Init transfers those raw caps to
-/// pwrmgr during Phase 3 bootstrap; callers that may invoke shutdown
-/// receive a tokened SEND on pwrmgr's service endpoint with the
-/// [`pwrmgr_labels::SHUTDOWN_AUTHORITY`] verb bit set.
+/// pwrmgr owns the platform shutdown surface: ACPI S5 on x86-64 (the
+/// `PM1a` `IoPortRange` carved from the FADT/DSDT it interprets) and SBI
+/// SRST on RISC-V (the `SbiControl` cap). It acquires those caps from
+/// devmgr — the hardware/ACPI authority — at startup via
+/// [`devmgr_labels::QUERY_ACPI_TABLE`] and
+/// [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`], not from init. Callers that
+/// may invoke shutdown receive a tokened SEND on pwrmgr's service
+/// endpoint with the [`pwrmgr_labels::SHUTDOWN_AUTHORITY`] verb bit set.
 ///
 /// See `services/pwrmgr/README.md` for the authoritative description.
 pub mod pwrmgr_labels
@@ -1021,7 +1017,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 5;
+pub const DEVMGR_LABELS_VERSION: u32 = 6;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -1074,21 +1070,21 @@ pub mod devmgr_labels
     /// `RTC_GET_EPOCH_TIME` round-trip and serves `GET_WALL_TIME`
     /// thereafter.
     pub const QUERY_RTC_DEVICE: u64 = 5;
-    /// Init-only handshake: install the
+    /// svcmgr-only handshake: install the
     /// `LOOKUP | READ`-attenuated `/services/drivers/` namespace cap from
     /// which devmgr walks its on-disk driver binaries.
     ///
     /// Request: `data[0]` = caller's compiled
     /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = tokened SEND on a
     /// vfsd directory node rooted at the system's `/services/drivers/`
-    /// path, derived by init via
-    /// `ns_client::walk_to_dir(system_root_cap, …, LOOKUP | READ)`.
-    /// Caller's token MUST carry [`INIT_BIND_AUTHORITY`]; the handler
+    /// path, derived by svcmgr via
+    /// `namespace_lookup_dir(root_dir_cap, …, LOOKUP | READ)`.
+    /// Caller's token MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Devmgr stashes the cap and replies
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
-    /// work, so init never blocks on driver bring-up. The actual walk,
+    /// work, so svcmgr never blocks on driver bring-up. The actual walk,
     /// the [`super::procmgr_labels::CREATE_FROM_FILE`] call, and the
     /// bootstrap-round delivery for any on-disk driver (today: the
     /// per-arch RTC; #165 will generalize) runs after the reply but
@@ -1109,6 +1105,58 @@ pub mod devmgr_labels
     /// queries; clients MUST NOT retry-loop.
     pub const SET_DRIVERS_DIR: u64 = 6;
 
+    /// Locate an ACPI table and serve a read-only view of it.
+    ///
+    /// devmgr is the sole owner of ACPI data and the only service that
+    /// navigates the table tree (RSDP → XSDT). Callers that need a table
+    /// (today: `pwrmgr`, for the FADT + DSDT it interprets for S5
+    /// shutdown) request it here rather than holding ACPI frames of
+    /// their own.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = 4-byte table signature packed little-endian (e.g.
+    /// `FACP`), or `0` to look up by physical address; `data[2]` =
+    /// table physical address (used when `data[1] == 0`, e.g. the DSDT,
+    /// whose address the caller reads from the FADT). Caller's token MUST
+    /// carry [`REGISTRY_QUERY_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a derived
+    /// **read-only-intended** Frame cap on the ACPI region containing the
+    /// table (the caller maps it `MAP_READONLY`); `data[0]` = region
+    /// physical base, `data[1]` = region size in bytes, `data[2]` = the
+    /// table's physical address. The caller maps the region and reads the
+    /// table at `table_phys - region_base`. devmgr reads only the
+    /// directory (RSDP/XSDT) and table headers (signatures) to locate the
+    /// table — never a table body. Replies
+    /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found.
+    pub const QUERY_ACPI_TABLE: u64 = 7;
+
+    /// Carve and serve the platform shutdown-actuator hardware caps.
+    ///
+    /// devmgr is the hardware authority; it carves the exact ports the
+    /// power manager asks for and performs no shutdown logic. The caller
+    /// (`pwrmgr`) has already parsed the ACPI tables (served via
+    /// [`QUERY_ACPI_TABLE`]) and computed the `PM1a` control port it needs.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the `PM1a` control port (x86-64; ignored on RISC-V).
+    /// Caller's token MUST carry [`REGISTRY_QUERY_AUTHORITY`]; the handler
+    /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]):
+    /// - x86-64: `caps[0]` = a narrow `IoPortRange` over `[pm1a, pm1a+2)`
+    ///   carved from devmgr's root `IoPortRange`; `caps[1]` = a narrow
+    ///   `IoPortRange` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
+    ///   Both are re-derived from the root on every call, so a pwrmgr
+    ///   restart re-acquires them cleanly.
+    /// - RISC-V: `caps[0]` = a `cap_derive` copy of devmgr's `SbiControl`
+    ///   cap (SBI SRST authority).
+    ///
+    /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
+    /// the platform authority cap is absent.
+    pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
+
     /// Authority bit in the devmgr-registry-endpoint token's high
     /// u64 bit. Set on caps minted for consumers permitted to call
     /// [`QUERY_BLOCK_DEVICE`] (today: vfsd). Without it the handler
@@ -1116,13 +1164,14 @@ pub mod devmgr_labels
     /// virtio-blk closes the minter-side surface: `MOUNT_AUTHORITY`
     /// caps are never issued to consumers devmgr did not authorise.
     pub const REGISTRY_QUERY_AUTHORITY: u64 = 1u64 << 63;
-    /// Authority bit gating [`SET_DRIVERS_DIR`]. Set only on the cap
-    /// init derives for its own use from `devmgr_registry_ep`; the
-    /// `REGISTRY_QUERY_AUTHORITY`-only copy init publishes to svcmgr
-    /// (which other services then look up) lacks this bit, so no
-    /// service other than init can call `SET_DRIVERS_DIR`. Disjoint
-    /// position from [`REGISTRY_QUERY_AUTHORITY`].
-    pub const INIT_BIND_AUTHORITY: u64 = 1u64 << 62;
+    /// Authority bit gating [`SET_DRIVERS_DIR`]. svcmgr mints a SEND
+    /// cap carrying this bit from the devmgr-registry source cap init
+    /// endows it with at handover; the `REGISTRY_QUERY_AUTHORITY`-only
+    /// copy svcmgr publishes as `devmgr.registry` (which other services
+    /// then look up) lacks this bit, so no looked-up consumer can call
+    /// `SET_DRIVERS_DIR`. Disjoint position from
+    /// [`REGISTRY_QUERY_AUTHORITY`].
+    pub const DRIVERS_DIR_AUTHORITY: u64 = 1u64 << 62;
 }
 
 /// Device-info kind discriminants for [`devmgr_labels::QUERY_DEVICE_INFO`]
@@ -1594,8 +1643,8 @@ pub mod svcmgr_errors
     /// Discovery registry publish: table full or duplicate name.
     pub const REGISTER_REJECTED: u64 = 6;
     /// Caller's compiled `SVCMGR_LABELS_VERSION` does not match the receiver's.
-    /// `REGISTER_SERVICE` is the handshake entry point and carries the
-    /// caller's version as `data[0]` (with all other words shifted by +1);
+    /// The handover-endowment `CAPS` round carries the caller's version
+    /// in `data[1]` (after the `endow_kind` discriminant in `data[0]`);
     /// mismatch here means the caller was built against a different
     /// revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;

@@ -6,13 +6,14 @@
 //! Seraph power manager — userspace authority for platform shutdown and
 //! reboot.
 //!
-//! pwrmgr owns the raw platform caps that drive a clean power-off:
-//! `AcpiReclaimable` Frame caps plus the `IoPortRange` cap on x86-64
-//! (ACPI S5), and the `SbiControl` cap on RISC-V (SBI SRST). Init
-//! transfers those caps to pwrmgr during Phase 3 bootstrap and hands a
-//! `SHUTDOWN_AUTHORITY`-tokened SEND cap on pwrmgr's service endpoint to
-//! the consumers permitted to invoke shutdown (today: svctest, plus a
-//! reserved copy held by svcmgr for future escalation policy).
+//! pwrmgr is a svcmgr-launched provider. It owns the shutdown
+//! *interpretation* and *actuation* but holds no hardware caps of its own:
+//! it acquires the ACPI tables it parses and the carved I/O-port /
+//! `SbiControl` caps it drives from devmgr (the hardware + ACPI authority)
+//! at startup, "as if it were a device driver". svcmgr publishes a
+//! `SHUTDOWN_AUTHORITY`-tokened SEND (`pwrmgr.shutdown`) and its no-auth
+//! twin (`pwrmgr.deny`) on pwrmgr's service endpoint to the consumers it
+//! seeds (today: svctest).
 //!
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
@@ -47,31 +48,38 @@ fn main() -> !
     #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(caps) = caps::bootstrap_caps(info, ipc_buf)
+    let Some(bootstrap) = caps::request_bootstrap(info, ipc_buf)
     else
     {
         std::os::seraph::log!("bootstrap failed, exiting");
         syscall::thread_exit();
     };
 
-    if caps.service_ep == 0
+    if bootstrap.service_ep == 0
     {
         std::os::seraph::log!("no service endpoint, exiting");
         syscall::thread_exit();
     }
 
-    std::os::seraph::log!(
-        "ready (arch_cap={:#x}, acpi_regions={})",
-        u64::from(caps.arch_cap),
-        caps.acpi_region_count as u64
-    );
+    // Acquire the actuation state from devmgr. `None` means the platform
+    // caps could not be resolved; pwrmgr still serves so callers get a
+    // clean error rather than a hung ipc_call.
+    let actuator = arch::resolve(bootstrap.devmgr_registry, info.self_aspace, ipc_buf);
+    if actuator.is_some()
+    {
+        std::os::seraph::log!("ready");
+    }
+    else
+    {
+        std::os::seraph::log!("ready (degraded: no shutdown actuator)");
+    }
 
     let self_thread = info.self_thread;
 
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let Ok(msg) = (unsafe { ipc::ipc_recv(caps.service_ep, ipc_buf) })
+        let Ok(msg) = (unsafe { ipc::ipc_recv(bootstrap.service_ep, ipc_buf) })
         else
         {
             continue;
@@ -88,9 +96,12 @@ fn main() -> !
                     continue;
                 }
                 std::os::seraph::log!("SHUTDOWN requested");
-                arch::shutdown(self_thread, &caps);
-                // Returned → shutdown failed. Reply so the caller does
-                // not hang on its ipc_call.
+                if let Some(act) = &actuator
+                {
+                    arch::shutdown(self_thread, act);
+                }
+                // Reached here → no actuator or shutdown failed. Reply so
+                // the caller does not hang on its ipc_call.
                 reject(pwrmgr_errors::INVALID_REQUEST, ipc_buf);
             }
             pwrmgr_labels::REBOOT =>
@@ -101,7 +112,10 @@ fn main() -> !
                     continue;
                 }
                 std::os::seraph::log!("REBOOT requested");
-                arch::reboot(self_thread, &caps);
+                if let Some(act) = &actuator
+                {
+                    arch::reboot(self_thread, act);
+                }
                 reject(pwrmgr_errors::INVALID_REQUEST, ipc_buf);
             }
             _ => reject(pwrmgr_errors::UNKNOWN_OPCODE, ipc_buf),

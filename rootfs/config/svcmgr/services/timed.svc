@@ -1,14 +1,25 @@
 # timed — wall-clock service (RTC-source-agnostic).
 #
-# Init spawns timed in Phase 3 from `/services/timed`. timed needs a
-# service-endpoint RECV plus a REGISTRY_QUERY_AUTHORITY-tokened SEND on
-# devmgr's registry endpoint (delivered together in the bootstrap
-# round) and resolves the RTC via `QUERY_RTC_DEVICE`. `restart = never`
-# matches the pre-#21 shape (no restart path preserves the bootstrap
-# handshake). `critical = no`: a dead timed leaves `SystemTime::now()`
-# returning UNIX_EPOCH but does not break the system; logged and left
-# inactive.
+# svcmgr launches timed post-handover and owns its service endpoint.
+# `provides = timed` makes svcmgr create the endpoint, serve its RECV as
+# bootstrap cap[0], and publish a SEND under the name `timed` so consumers
+# resolve `SystemTime::now()` through the discovery registry.
+# `seed = devmgr.registry` delivers the REGISTRY_QUERY_AUTHORITY-tokened
+# SEND on devmgr's registry that timed uses for `QUERY_RTC_DEVICE`. The two
+# together are timed's bootstrap round (caps[0] = own service endpoint,
+# caps[1] = devmgr registry). As a provider, timed launches ahead of pure
+# consumers during reconciliation so its name is published before any
+# consumer resolves it.
+#
+# `restart = on_failure`: svcmgr re-creates timed from `/services/timed`
+# and re-serves a fresh RECV on the persistent endpoint, so a client cap
+# cached against the published `timed` name survives a crash-restart.
+# `critical = no`: a dead timed leaves `SystemTime::now()` returning
+# UNIX_EPOCH but does not break the system; logged and left inactive once
+# the restart budget is spent.
 binary    = /services/timed
-restart   = never
+restart   = on_failure
 critical  = no
 namespace = none
+provides  = timed
+seed      = devmgr.registry

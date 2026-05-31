@@ -166,8 +166,8 @@ fn main() -> !
 
     // On-disk driver state. The RTC binary lives on the rootfs at
     // `/services/drivers/<chip>`, not in the boot bundle — RTC is not
-    // bootstrap-essential. Init delivers a `LOOKUP | READ`-attenuated
-    // `/services/drivers/` subtree cap via `SET_DRIVERS_DIR` post-vfsd;
+    // bootstrap-essential. svcmgr delivers a `LOOKUP | READ`-attenuated
+    // `/services/drivers/` subtree cap via `SET_DRIVERS_DIR` at handover;
     // the walk + `CREATE_FROM_FILE` + bootstrap rounds run inside the
     // `SET_DRIVERS_DIR` handler, after its `ipc_reply` and before the
     // next `ipc_recv` (a nested ipc_call inside a request-handler
@@ -353,7 +353,7 @@ fn main() -> !
             }
             ipc::devmgr_labels::SET_DRIVERS_DIR =>
             {
-                // Init-only handshake. Reply SUCCESS *first* so init
+                // svcmgr-only handshake. Reply SUCCESS *first* so svcmgr
                 // unblocks immediately and is never in the critical
                 // path of driver work. THEN do the walk + spawn between
                 // ipc_reply and the next ipc_recv: a nested ipc_call
@@ -364,15 +364,15 @@ fn main() -> !
                 let mut should_attempt_spawn = false;
                 // Capability hygiene: every gate-fail arm below must
                 // release any cap the kernel transferred into devmgr's
-                // CSpace before replying. Even though today only init
+                // CSpace before replying. Even though today only svcmgr
                 // can plausibly send this label, leaving an authority
                 // cap dangling in a server's slot is a category of bug
                 // the rest of the codebase consistently avoids.
                 let delivered_cap = msg.caps().first().copied();
-                if token & ipc::devmgr_labels::INIT_BIND_AUTHORITY == 0
+                if token & ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY == 0
                 {
                     std::os::seraph::log!(
-                        "SET_DRIVERS_DIR rejected: token lacks INIT_BIND_AUTHORITY"
+                        "SET_DRIVERS_DIR rejected: token lacks DRIVERS_DIR_AUTHORITY"
                     );
                     if let Some(c) = delivered_cap
                     {
@@ -484,6 +484,14 @@ fn main() -> !
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 }
             }
+            ipc::devmgr_labels::QUERY_ACPI_TABLE =>
+            {
+                handle_query_acpi_table(&caps, &msg, token, ipc_buf);
+            }
+            ipc::devmgr_labels::QUERY_SHUTDOWN_DEVICE =>
+            {
+                handle_query_shutdown_device(&caps, &msg, token, ipc_buf);
+            }
             ipc::devmgr_labels::QUERY_DEVICE_INFO =>
             {
                 let dev_idx = token.wrapping_sub(1) as usize;
@@ -590,10 +598,37 @@ fn platform_default_ecam() -> Option<firmware::EcamLocation>
 
 fn discover_ecam_acpi(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
 {
+    let xsdt_phys = read_xsdt_phys(caps)?;
+
+    // Copy XSDT entry pointers into a heap vec so we can release the XSDT
+    // mapping and remap per-table — MCFG may live in a different ACPI
+    // region than the XSDT (e.g. EDK2 on RISC-V virt: many tiny regions).
+    let entries = read_xsdt_entries(caps, xsdt_phys)?;
+
+    for tbl_phys in entries
+    {
+        if let Some(loc) = read_mcfg_at(caps, tbl_phys)
+        {
+            return Some(loc);
+        }
+    }
+    None
+}
+
+/// Map the RSDP page and read the XSDT physical address out of it.
+///
+/// Shared by ECAM discovery and the [`devmgr_labels::QUERY_ACPI_TABLE`]
+/// broker so the RSDP → XSDT step exists exactly once. Returns `None` when
+/// no RSDP was delivered or the table is pre-ACPI-2.0.
+fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
+{
+    if caps.rsdp_frame_cap == 0
+    {
+        return None;
+    }
     // `rsdp_page_base` carries the exact RSDP physical address (see
     // init-protocol v5 docs); the backing Frame cap covers the page.
-    let rsdp_phys = caps.rsdp_page_base;
-    let rsdp_page_offset = (rsdp_phys & 0xFFF) as usize;
+    let rsdp_page_offset = (caps.rsdp_page_base & 0xFFF) as usize;
     let range = reserve_pages(1).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
@@ -615,21 +650,7 @@ fn discover_ecam_acpi(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
     let xsdt_phys = firmware::acpi::rsdp_xsdt_phys(rsdp_bytes);
     let _ = syscall::mem_unmap(caps.self_aspace, va, 1);
     unreserve_pages(range);
-    let xsdt_phys = xsdt_phys?;
-
-    // Copy XSDT entry pointers into a heap vec so we can release the XSDT
-    // mapping and remap per-table — MCFG may live in a different ACPI
-    // region than the XSDT (e.g. EDK2 on RISC-V virt: many tiny regions).
-    let entries = read_xsdt_entries(caps, xsdt_phys)?;
-
-    for tbl_phys in entries
-    {
-        if let Some(loc) = read_mcfg_at(caps, tbl_phys)
-        {
-            return Some(loc);
-        }
-    }
-    None
+    xsdt_phys
 }
 
 /// Map the ACPI region containing `xsdt_phys`, copy the entry pointer
@@ -761,6 +782,209 @@ fn find_region_for(caps: &caps::DevmgrCaps, phys: u64) -> Option<(caps::AcpiRegi
         }
     }
     None
+}
+
+/// Read the 4-byte signature of the ACPI table at physical address
+/// `tbl_phys` by mapping the region that contains it. Returns `None` if no
+/// region covers the address or the header is unreadable. devmgr reads
+/// only the header signature here — never a table body.
+fn read_table_sig(caps: &caps::DevmgrCaps, tbl_phys: u64) -> Option<[u8; 4]>
+{
+    let (region, off) = find_region_for(caps, tbl_phys)?;
+    let region_pages = region.size.div_ceil(PAGE_SIZE);
+    let map_pages = region_pages.min(FIRMWARE_MAP_MAX_PAGES);
+    let range = reserve_pages(map_pages).ok()?;
+    let va = range.va_start();
+    if syscall::mem_map(
+        region.slot,
+        caps.self_aspace,
+        va,
+        0,
+        map_pages,
+        syscall_abi::MAP_READONLY,
+    )
+    .is_err()
+    {
+        unreserve_pages(range);
+        return None;
+    }
+    let span = (map_pages * PAGE_SIZE) as usize;
+    let sig = if off + 4 <= span
+    {
+        // SAFETY: `span` bytes mapped read-only from `va`.
+        let bytes = unsafe { core::slice::from_raw_parts(va as *const u8, span) };
+        Some(firmware::acpi::sdt_signature(&bytes[off..]))
+    }
+    else
+    {
+        None
+    };
+    let _ = syscall::mem_unmap(caps.self_aspace, va, map_pages);
+    unreserve_pages(range);
+    sig
+}
+
+/// Locate an ACPI table by 4-byte `sig` via an XSDT walk. Returns the
+/// table's physical address. Reuses the same RSDP/XSDT directory read as
+/// ECAM discovery, so there is one XSDT walk in the whole system.
+fn locate_table_by_sig(caps: &caps::DevmgrCaps, sig: [u8; 4]) -> Option<u64>
+{
+    let xsdt_phys = read_xsdt_phys(caps)?;
+    let entries = read_xsdt_entries(caps, xsdt_phys)?;
+    entries
+        .into_iter()
+        .find(|&tbl_phys| read_table_sig(caps, tbl_phys) == Some(sig))
+}
+
+/// Resolve an ACPI-table request to `(region, table_phys)`. A non-zero
+/// `phys` is looked up directly (e.g. the DSDT, whose address the caller
+/// read from the FADT); otherwise `sig_word`'s low 32 bits are the table
+/// signature to find via the XSDT.
+fn locate_acpi_table(
+    caps: &caps::DevmgrCaps,
+    sig_word: u64,
+    phys: u64,
+) -> Option<(caps::AcpiRegion, u64)>
+{
+    let table_phys = if phys != 0
+    {
+        phys
+    }
+    else
+    {
+        locate_table_by_sig(caps, (sig_word as u32).to_le_bytes())?
+    };
+    let (region, _off) = find_region_for(caps, table_phys)?;
+    Some((region, table_phys))
+}
+
+/// Send a bodyless status reply (no caps) on the current request.
+fn reply_status(code: u64, ipc_buf: *mut u64)
+{
+    let reply = IpcMessage::new(code);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `QUERY_ACPI_TABLE` handler: locate the requested ACPI table and reply
+/// with a read-only Frame cap on its region plus the `(region_base,
+/// region_size, table_phys)` the caller needs to map and read it. devmgr
+/// is the sole ACPI owner; consumers hold no ACPI frames of their own.
+fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, token: u64, ipc_buf: *mut u64)
+{
+    if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+    {
+        reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+        return;
+    }
+    if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+    {
+        reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+        return;
+    }
+    let Some((region, table_phys)) = locate_acpi_table(caps, msg.word(1), msg.word(2))
+    else
+    {
+        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+        return;
+    };
+    let Ok(frame) = syscall::cap_derive(region.slot, syscall::RIGHTS_ALL)
+    else
+    {
+        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+        return;
+    };
+    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+        .word(0, region.base)
+        .word(1, region.size)
+        .word(2, table_phys)
+        .cap(frame)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(frame);
+    }
+}
+
+/// `QUERY_SHUTDOWN_DEVICE` handler: serve pwrmgr the platform shutdown
+/// actuator caps. devmgr carves exactly what is asked for and runs no
+/// shutdown logic. x86-64: a narrow `IoPortRange` over the caller-supplied
+/// `PM1a` control port plus the 8042 reset port. RISC-V: a `cap_derive` copy
+/// of `SbiControl`. The caps are re-derived from the root on every call,
+/// so a pwrmgr restart re-acquires them cleanly.
+fn handle_query_shutdown_device(
+    caps: &caps::DevmgrCaps,
+    msg: &IpcMessage,
+    token: u64,
+    ipc_buf: *mut u64,
+)
+{
+    if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+    {
+        reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+        return;
+    }
+    if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+    {
+        reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // 8042 KBC command port — the 1-byte reset register pwrmgr pulses
+        // for reboot. The PM1a control port is FADT-derived, so pwrmgr
+        // computes it and passes it here; devmgr only carves.
+        const KBC_COMMAND_PORT: u16 = 0x64;
+        let pm1a = msg.word(1) as u16;
+        let Some(pm1a_cap) = ioport_carve(caps.ioport_root_cap, pm1a, 2)
+        else
+        {
+            reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+            return;
+        };
+        let Some(kbc_cap) = ioport_carve(caps.ioport_root_cap, KBC_COMMAND_PORT, 1)
+        else
+        {
+            let _ = syscall::cap_delete(pm1a_cap);
+            reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+            return;
+        };
+        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+            .cap(pm1a_cap)
+            .cap(kbc_cap)
+            .build();
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+        {
+            let _ = syscall::cap_delete(pm1a_cap);
+            let _ = syscall::cap_delete(kbc_cap);
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        if caps.sbi_control_cap == 0
+        {
+            reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
+            return;
+        }
+        let Ok(sbi) = syscall::cap_derive(caps.sbi_control_cap, syscall::RIGHTS_ALL)
+        else
+        {
+            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            return;
+        };
+        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+            .cap(sbi)
+            .build();
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+        {
+            let _ = syscall::cap_delete(sbi);
+        }
+    }
 }
 
 // ── Aperture splitting helper ───────────────────────────────────────────────
@@ -1281,9 +1505,9 @@ fn spawn_framebuffer(
 /// Spawn the platform RTC driver — CMOS on x86-64, goldfish-RTC on
 /// RISC-V — from the on-disk rootfs. Called from inside the
 /// `SET_DRIVERS_DIR` registry-loop arm, after the handler's
-/// `ipc_reply` to init and before devmgr's next `ipc_recv`. The
+/// `ipc_reply` to svcmgr and before devmgr's next `ipc_recv`. The
 /// `drivers_dir_cap` argument is the `LOOKUP | READ`-attenuated
-/// `/services/drivers/` subtree cap init delivered in the handshake
+/// `/services/drivers/` subtree cap svcmgr delivered in the handshake
 /// (namespace-protocol rights, not kernel cap rights). Walks
 /// `drivers_dir_cap` to the per-arch chip name, carves the per-arch
 /// hardware authority, and goes through the file-cap branch of
@@ -1309,7 +1533,7 @@ fn spawn_rtc_from_disk(
     #[cfg(target_arch = "riscv64")]
     const RTC_NAME: &[u8] = b"goldfish-rtc";
 
-    // Request READ rights on the resolved file node. The cap init handed
+    // Request READ rights on the resolved file node. The cap svcmgr handed
     // us in SET_DRIVERS_DIR is already attenuated to LOOKUP|READ at the
     // /services/drivers/ subtree, so the namespace server will only ever
     // mint a file cap with at most those bits set.

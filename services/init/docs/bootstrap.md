@@ -2,9 +2,9 @@
 
 Authoritative enumeration of the work init performs between kernel
 handoff (`_start`) and `sys_thread_exit`, organised into three
-stages: **Raw bootstrap**, **Root mount**, **Handover**. The names
-used in source `log()` strings — `"phase 1 bootstrap complete"`,
-`"phase 2: mounting root filesystem"`, `"phase 2 epilogue"`,
+stages: **Raw bootstrap**, **Root acquisition**, **Handover**. The
+names used in source `log()` strings — `"phase 1 bootstrap complete"`,
+`"phase 2: acquiring system-root cap"`, `"phase 2 epilogue"`,
 `"phase 3: ..."` — are the searchable equivalents and remain stable.
 
 ---
@@ -72,26 +72,22 @@ process creation to procmgr IPC.
 - Closing marker: `"phase 1 bootstrap complete"`
   (`../src/main.rs:821`).
 
-### Root mount
+### Root acquisition
 
-vfsd identifies the root partition by GPT type-GUID
-(`boot_protocol::role_guids::SERAPH_ROOT_<arch>`), so init names
-only the *role* and vfsd performs the partition lookup. Init's
-contribution is the MOUNT exchange and the seed-cap pull; the ESP
-and any further partitions are discovered and mounted by vfsd
-directly without init involvement.
+vfsd self-mounts the root partition at `/` (and the ESP at `/esp`) on
+its own startup, identifying partitions by GPT type-GUID
+(`boot_protocol::role_guids::SERAPH_ROOT_<arch>`). Init issues no
+`MOUNT`; its only contribution is the seed-cap pull, which doubles as
+init's wait-for-root barrier.
 
-- Send `MOUNT(MountRole::Root, "/")` to vfsd
-  (`../src/main.rs:830` → `mount::send_mount` at
-  `../src/mount.rs:63`). The wire payload is the `MountRole`
-  discriminant byte (`../src/mount.rs:30`, currently a single
-  variant `Root = 0`) plus the mount-point path.
 - Pull the seed system-root cap via `GET_SYSTEM_ROOT_CAP`
-  (`../src/main.rs:846` → `mount::request_system_root` at
-  `../src/mount.rs:100`). The reply is a tokened SEND on vfsd's
-  namespace endpoint at the synthetic root with full namespace
-  rights — every later child receives a `cap_copy` of it via
-  `procmgr_labels::CONFIGURE_NAMESPACE`.
+  (`mount::request_system_root`). vfsd replies `NO_MOUNT` until it has
+  mounted root, so the call blocks until the root filesystem is up; a
+  zero return is FATAL. The success reply is a tokened SEND on vfsd's
+  namespace endpoint at the synthetic root with full namespace rights
+  — every later child receives a `cap_copy` of it via
+  `procmgr_labels::CONFIGURE_NAMESPACE`, and svcmgr derives the
+  published `rootfs.root` SEND from it.
 - **Phase 2 epilogue** — walk `/services/logd`, request procmgr to
   create real-logd via `CREATE_FROM_FILE`, and serve its bootstrap
   round (RECV cap on the master log endpoint, one-shot SEND for
@@ -234,8 +230,8 @@ svcmgr if needed.
 | Raw bootstrap | memmgr | RAM `Frame` pool (every Frame cap not consumed by init/procmgr setup) |
 | Raw bootstrap | procmgr | memmgr SEND cap, log endpoint SEND, svcmgr service endpoint SEND, boot-module `Frame` caps for downstream `CREATE_PROCESS` |
 | Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Frame caps; root `IoPortRange` (x86-64) / `SbiControl` (RISC-V) via the terminal `SVCMGR_BUNDLE` round — the hardware + shutdown authority devmgr brokers to drivers and to pwrmgr |
-| Raw bootstrap | vfsd | `SEED_AUTHORITY`-tokened SEND on vfsd's own service endpoint (gates `GET_SYSTEM_ROOT_CAP`); the un-tokened service-endpoint SEND init holds is used for the un-gated MOUNT call. Init keeps no FS access of its own. |
-| Root mount | logd | RECV on the master log endpoint, one-shot SEND for `HANDOVER_PULL`, `DEATH_EQ_AUTHORITY`-tokened SEND on procmgr, arch serial authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V) |
+| Raw bootstrap | vfsd | `SEED_AUTHORITY`-tokened SEND on vfsd's own service endpoint (gates `GET_SYSTEM_ROOT_CAP`). vfsd self-mounts root, so init issues no `MOUNT` and keeps no FS access of its own. |
+| Root acquisition | logd | RECV on the master log endpoint, one-shot SEND for `HANDOVER_PULL`, `DEATH_EQ_AUTHORITY`-tokened SEND on procmgr, arch serial authority (`IoPortRange` on x86-64, `SbiControl` on RISC-V) |
 | Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — round 1 (`CAPS`): full-rights SEND on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a token-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry` publish cap and the `SET_DRIVERS_DIR` cap); rounds 2..N (`SUBSTRATE`): one `(name, thread_cap)` per substrate service for death-supervision binding. svcmgr publishes all well-known names itself and sends `SET_DRIVERS_DIR` from these sources; init no longer publishes or talks to devmgr. |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Frame cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline frame, boot-module ELF sources) |
 

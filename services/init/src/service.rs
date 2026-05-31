@@ -969,14 +969,16 @@ mod endow_kind
 }
 
 /// Source + endpoint caps init endows svcmgr with at handover. The two
-/// source caps are init's own (full-rights) handles on the root filesystem
-/// namespace endpoint and devmgr's registry endpoint; svcmgr derives the
-/// shapes it publishes / sends from them.
+/// source caps are init's seed system-root cap (a SEND on vfsd's
+/// namespace endpoint) and init's full-rights handle on devmgr's registry
+/// endpoint; svcmgr derives the shapes it publishes / sends from them.
 #[allow(clippy::struct_field_names)]
 pub struct SvcmgrEndowment
 {
     pub svcmgr_service_ep: u32,
     pub svcmgr_bootstrap_ep: u32,
+    /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). svcmgr
+    /// derives the published `rootfs.root` SEND from it.
     pub rootfs_root_cap: u32,
     pub devmgr_registry_ep: u32,
 }
@@ -1126,7 +1128,6 @@ pub fn phase3_svcmgr_handover(
     svcmgr_service_ep: u32,
     devmgr_registry_ep: u32,
     system_root_cap: u32,
-    rootfs_root_cap: u32,
     thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
@@ -1178,7 +1179,10 @@ pub fn phase3_svcmgr_handover(
     let endowment = SvcmgrEndowment {
         svcmgr_service_ep,
         svcmgr_bootstrap_ep,
-        rootfs_root_cap,
+        // vfsd self-mounts root, so init no longer holds a per-mount fatfs
+        // cap; the seed system-root cap (vfsd's synthetic root) is the
+        // publish source for `rootfs.root`.
+        rootfs_root_cap: system_root_cap,
         devmgr_registry_ep,
     };
     endow_svcmgr(

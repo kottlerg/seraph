@@ -754,35 +754,25 @@ fn run(info_ptr: u64) -> !
 
     logging::log("phase 1 bootstrap complete");
 
-    // ── Phase 2: mount root filesystem ──────────────────────────────────────
+    // ── Phase 2: acquire the system-root cap ─────────────────────────────────
 
-    // Boot protocol v8 removed the kernel command line; the root partition
-    // is identified by its GPT type-GUID (`role_guids::SERAPH_ROOT_<arch>`).
-    // vfsd resolves the role to a partition entry on its side; init just
-    // names the role.
-    logging::log("phase 2: mounting root filesystem");
-    let root_mount = mount::send_mount(vfsd_service_ep, ipc_buf, mount::MountRole::Root, b"/");
-    if !root_mount.success
-    {
-        logging::log("FATAL: root mount failed");
-        syscall::thread_exit();
-    }
-    logging::log("phase 2: root mounted at /");
-
-    // `/config/mounts.conf` and `INGEST_CONFIG_MOUNTS` are gone. Additional
-    // partitions (e.g. the ESP, mounted at `/esp`) are discovered and mounted
-    // by vfsd directly via GPT type-GUID lookup.
-
-    // Acquire init's seed system-root cap. Drives every Phase 3
-    // walk-and-spawn — children receive a `cap_copy` of this cap via
-    // `procmgr_labels::CONFIGURE_NAMESPACE`. The `SEED_AUTHORITY`
-    // tokened cap is required by vfsd's `GET_SYSTEM_ROOT_CAP` gate.
+    // vfsd self-mounts the root partition at `/` (and the ESP at `/esp`) on
+    // its own startup, identifying partitions by GPT type-GUID; init issues
+    // no MOUNT. `/config/mounts.conf` and `INGEST_CONFIG_MOUNTS` are gone.
+    //
+    // Acquire init's seed system-root cap. vfsd serves this only once root
+    // is mounted, so the call blocks until the root filesystem is up. The
+    // cap drives every Phase 3 walk-and-spawn — children receive a
+    // `cap_copy` via `procmgr_labels::CONFIGURE_NAMESPACE`. The
+    // `SEED_AUTHORITY` tokened cap is required by vfsd's gate.
+    logging::log("phase 2: acquiring system-root cap (vfsd self-mounts root)");
     let system_root_cap = mount::request_system_root(vfsd_seed_cap, ipc_buf);
     if system_root_cap == 0
     {
         logging::log("FATAL: GET_SYSTEM_ROOT_CAP from vfsd failed");
         syscall::thread_exit();
     }
+    logging::log("phase 2: root available");
 
     // ── Phase 2 epilogue: launch real logd ──────────────────────────────────
     //
@@ -827,7 +817,6 @@ fn run(info_ptr: u64) -> !
         svcmgr_service_ep,
         devmgr_registry_ep,
         system_root_cap,
-        root_mount.root_cap,
         thread_caps,
         ipc_buf,
         init_logd_thread_cap,

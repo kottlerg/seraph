@@ -2,8 +2,8 @@
 
 Bootstrap service and first userspace process. The kernel starts init at the end
 of its initialization sequence. Init runs a three-stage bootstrap — raw memmgr /
-procmgr creation, root mount, then handover to svcmgr — and exits. It is not a
-long-lived service manager.
+procmgr creation, root acquisition, then handover to svcmgr — and exits. It is
+not a long-lived service manager.
 
 ---
 
@@ -19,7 +19,7 @@ init/
     ├── main.rs                 # _start, run() orchestration across the three stages
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup
     ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr, logd) and phase3_svcmgr_handover
-    ├── mount.rs                # Root MOUNT exchange + GET_SYSTEM_ROOT_CAP pull
+    ├── mount.rs                # GET_SYSTEM_ROOT_CAP pull (vfsd self-mounts root)
     ├── logging.rs              # init-logd thread (serves the log endpoint until real-logd takes over)
     ├── walk.rs                 # /services/<name> path walker over the seed system-root cap
     └── arch/                   # Per-arch serial init (x86-64, riscv64)
@@ -38,10 +38,12 @@ Init runs three stages between `_start` and `sys_thread_exit`:
 1. **Raw bootstrap** — version-check `InitInfo`, set up the IPC buffer, mint
    endpoints, spawn init-logd, bring up memmgr and procmgr via raw syscalls,
    then drive procmgr IPC to create devmgr and vfsd.
-2. **Root mount** — issue `MOUNT(MountRole::Root, "/")` to vfsd (vfsd resolves
-   the role to the arch-specific Seraph root GPT type-GUID), pull the seed
-   `system_root_cap` via `GET_SYSTEM_ROOT_CAP`, then launch real-logd from
-   `/services/logd` and hand off the master log endpoint via `HANDOVER_PULL`.
+2. **Root acquisition** — vfsd self-mounts the Seraph root partition at `/`
+   on its own startup; init issues no `MOUNT`. Pull the seed
+   `system_root_cap` via `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once
+   root is mounted, so the call blocks until root is up), then launch
+   real-logd from `/services/logd` and hand off the master log endpoint via
+   `HANDOVER_PULL`.
 3. **Handover** — load svcmgr and serve it the handover endowment over
    the bootstrap-round protocol: its own endpoints, the publish-role
    source caps (`rootfs.root` SEND, devmgr-registry `SEND|GRANT` source),

@@ -6,12 +6,16 @@
 //! Seraph virtual filesystem daemon.
 //!
 //! vfsd presents a unified virtual filesystem namespace to all other
-//! processes via a synthetic system-root cap. Each MOUNT installs a
+//! processes via a synthetic system-root cap. A mount installs a
 //! tokened SEND on the underlying driver's namespace endpoint into
 //! `VfsdRootBackend`; clients walk that root via `NS_LOOKUP` and reach
 //! per-file node caps directly on the driver. After the walk vfsd is
 //! out of the path: file reads, frame requests, and closes go straight
 //! from client to driver.
+//!
+//! vfsd self-mounts the Seraph root partition at `/` (and the ESP at
+//! `/esp`) during startup, before serving any request; the runtime
+//! `MOUNT` IPC remains for explicit/foreign-GUID mounts.
 //!
 //! See `vfsd/README.md` for the design and `fs/docs/fs-driver-protocol.md`
 //! for the driver-side protocol.
@@ -256,7 +260,9 @@ fn main() -> !
         root_backend: Mutex::new(VfsdRootBackend::new()),
     }));
 
-    // Spawn the namespace dispatcher.
+    // Spawn the namespace dispatcher first: the `/esp` self-mount below
+    // takes the VFS spawn path, which re-enters vfsd's namespace endpoint
+    // to resolve `/services/fs/fatfs`.
     if std::thread::Builder::new()
         .name("vfsd-namespace".into())
         .spawn(move || namespace_loop(runtime))
@@ -264,6 +270,16 @@ fn main() -> !
     {
         std::os::seraph::log!("FATAL: namespace thread spawn failed");
         idle_loop();
+    }
+
+    // Self-mount the root filesystem (and the ESP) before any service
+    // thread can serve `GET_SYSTEM_ROOT_CAP`, so the seed system-root cap
+    // is never handed out against an unmounted root. On failure vfsd still
+    // serves: `GET_SYSTEM_ROOT_CAP` replies `NO_MOUNT` so init FATALs
+    // promptly rather than blocking forever.
+    if !self_mount(runtime, ipc_buf)
+    {
+        std::os::seraph::log!("root unavailable; system-root requests will fail");
     }
 
     // Spawn N-1 helper service threads; main becomes the Nth handler. Each
@@ -567,8 +583,28 @@ fn try_forward_lookup_fallthrough(
 /// service-endpoint token: holding the bit is equivalent to holding
 /// the system-root cap, so only consumers explicitly entrusted with
 /// seed authority reach this handler.
+///
+/// Replies [`vfsd_errors::NO_MOUNT`] when the root filesystem is not
+/// mounted. vfsd self-mounts root before any service thread starts, so
+/// this fires only when the self-mount failed (no `SERAPH_ROOT`
+/// partition, or fatfs bring-up failed); init then FATALs instead of
+/// receiving a system-root cap that resolves against an empty root.
 fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
+    if rt
+        .root_backend
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .root_mount_cap()
+        == 0
+    {
+        std::os::seraph::log!("GET_SYSTEM_ROOT_CAP rejected: root not mounted");
+        let err = IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
+        // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+        return;
+    }
+
     let token = namespace_protocol::pack(
         namespace_protocol::NodeId::ROOT,
         namespace_protocol::NamespaceRights::ALL,
@@ -622,7 +658,43 @@ impl MountRole
     }
 }
 
-/// Handle a MOUNT request from init (or any authorized client).
+/// Mount the Seraph root partition at `/`, then auto-mount the ESP at
+/// `/esp`, during vfsd startup.
+///
+/// Runs on the main thread before any service handler exists, so a
+/// `GET_SYSTEM_ROOT_CAP` request can never observe an unmounted root.
+/// The namespace dispatcher must already be running: the `/esp` mount
+/// takes the VFS spawn path, which re-enters vfsd's namespace endpoint
+/// to resolve `/services/fs/fatfs`. Returns whether the root mount
+/// succeeded; `/esp` is best-effort and never gates the return value.
+fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
+{
+    match do_mount_internal(rt, ipc_buf, &role_guids::SERAPH_ROOT, b"/")
+    {
+        Ok(caller_root_cap) =>
+        {
+            // The per-mount caller cap rides back to an IPC caller; the
+            // self-mount has none, and vfsd reaches root through the
+            // synthetic backend, so drop it.
+            log_cap_delete("self-mount caller_root_cap", caller_root_cap);
+            std::os::seraph::log!("root self-mounted at /");
+        }
+        Err(code) =>
+        {
+            std::os::seraph::log!("FATAL: root self-mount failed: code={code:#x}");
+            return false;
+        }
+    }
+
+    auto_mount_esp(rt, ipc_buf);
+    true
+}
+
+/// Handle a runtime MOUNT request from an authorized client.
+///
+/// vfsd self-mounts root and `/esp` at startup ([`self_mount`]), so no
+/// in-tree caller currently issues MOUNT; it remains the explicit /
+/// runtime-mount surface (foreign-GUID disks, user-invoked mounts).
 ///
 /// IPC data layout (boot protocol v8+):
 /// - `data[0]` low byte: [`MountRole`] discriminant
@@ -631,9 +703,7 @@ impl MountRole
 ///
 /// Decodes the wire payload and delegates to [`do_mount`] for the
 /// real work. When the requested role is [`MountRole::Root`], vfsd
-/// additionally auto-mounts the EFI System Partition at `/esp` so
-/// userspace (svctest namespace tests, future userspace) can read it
-/// without a separate IPC call.
+/// additionally auto-mounts the EFI System Partition at `/esp`.
 #[allow(clippy::cast_possible_truncation)]
 fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {

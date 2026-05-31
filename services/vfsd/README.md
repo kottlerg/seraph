@@ -4,7 +4,8 @@ Virtual filesystem daemon. vfsd is a namespace server with no on-disk
 storage: it composes a synthetic system root from per-mount tokened
 SEND caps on filesystem drivers, mints the root cap that every
 process receives in `ProcessInfo.system_root_cap`, and stays out of
-the I/O path after the walk.
+the I/O path after the walk. vfsd self-mounts the Seraph root partition
+(and the ESP) at startup; init issues no `MOUNT`.
 
 ---
 
@@ -15,7 +16,7 @@ vfsd/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   ├── main.rs              # Entry, service + namespace loops, MOUNT handler
+│   ├── main.rs              # Entry, root self-mount, service + namespace loops, MOUNT handler
 │   ├── driver.rs            # Spawning fatfs driver instances
 │   ├── gpt.rs               # GPT partition table parsing
 │   ├── role_guids.rs        # Compile-time arch-conditional root + ESP GUIDs
@@ -36,38 +37,47 @@ vfsd/
   entries on the synthetic system root, and forwards unmatched
   lookups to the root mount via transparent delegation. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md).
+- **Root self-mount** — at startup, after parsing the GPT, vfsd mounts
+  the Seraph root partition at `/` and the ESP at `/esp` on its own
+  initiative, before any service thread begins serving. The namespace
+  dispatcher is spawned first because the `/esp` mount re-enters vfsd's
+  namespace endpoint to resolve `/services/fs/fatfs`; service threads
+  are spawned only after the mount, so `GET_SYSTEM_ROOT_CAP` is never
+  served against an unmounted root.
 - **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
   its un-tokened service endpoint, with multi-threaded recv so a
   worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
-  flight reply. See
+  flight reply. `MOUNT` is the runtime explicit-mount surface
+  (foreign-GUID disks, user-invoked mounts); no in-tree caller issues
+  it, since root and `/esp` are self-mounted. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md).
 - **System-root cap delivery** — vfsd does not push a system-root
   cap anywhere at boot. Init pulls one via
-  `vfsd_labels::GET_SYSTEM_ROOT_CAP` after issuing the role-driven
-  root `MOUNT`; init then distributes per-child copies via
+  `vfsd_labels::GET_SYSTEM_ROOT_CAP`; vfsd replies `NO_MOUNT` until
+  root is mounted, so the pull blocks until the root filesystem is up.
+  Init then distributes per-child copies via
   `procmgr_labels::CONFIGURE_NAMESPACE` on every spawn. Procmgr
   itself holds no namespace cap — children spawned without an
   explicit `CONFIGURE_NAMESPACE` cap see
   `ProcessInfo.system_root_cap == 0`.
 - **Filesystem driver lifecycle** — vfsd is the dispatcher for fs
-  driver processes. The first `MOUNT` (the role-driven root)
-  spawns fatfs from a boot module cap; subsequent mounts walk
-  vfsd's own held system-root cap to `/services/fs/fatfs` and pass the
-  resulting file cap to procmgr via `CREATE_FROM_FILE`. The
-  first-mount path is permanent and structural — `/services/fs/fatfs` is
-  unreachable until root mounts, so spawning the fatfs that brings
-  the root online cannot be moved elsewhere. vfsd supplies each
-  driver with a partition-scoped block device endpoint and the
-  receive side of its own service endpoint.
-- **GPT enumeration + role-driven mount discovery** — parses the GPT
-  partition table from a single scratch frame at startup. The
-  `MOUNT` handler decodes a `MountRole` byte from the wire payload
-  and resolves it to a partition entry via
-  `gpt::lookup_partition_by_type_guid` against the arch-conditional
-  root GUID in `src/role_guids.rs`. The EFI System Partition (matched
-  by its standard type GUID) auto-mounts at `/esp` immediately after
-  the root mount completes; there is no `mounts.conf` and no
-  `INGEST_CONFIG_MOUNTS` IPC. See
+  driver processes. The root self-mount spawns fatfs from a boot
+  module cap; subsequent mounts walk vfsd's own held system-root cap
+  to `/services/fs/fatfs` and pass the resulting file cap to procmgr
+  via `CREATE_FROM_FILE`. The boot-module path is permanent and
+  structural — `/services/fs/fatfs` is unreachable until root mounts,
+  so spawning the fatfs that brings the root online cannot be moved
+  elsewhere. vfsd supplies each driver with a partition-scoped block
+  device endpoint and the receive side of its own service endpoint.
+- **GPT enumeration + mount discovery** — parses the GPT partition
+  table from a single scratch frame at startup, then resolves the
+  arch-conditional root GUID in `src/role_guids.rs` via
+  `gpt::lookup_partition_by_type_guid` for the self-mount. The EFI
+  System Partition (matched by its standard type GUID) auto-mounts at
+  `/esp` immediately after root; there is no `mounts.conf` and no
+  `INGEST_CONFIG_MOUNTS` IPC. The runtime `MOUNT` handler decodes a
+  `MountRole` byte from the wire payload and reuses the same
+  resolution path. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md).
 
 vfsd does not touch hardware directly. All storage I/O is mediated

@@ -328,27 +328,28 @@ unsafe extern "C" fn trap_entry()
 /// Dispatch a trap to the appropriate handler.
 ///
 /// `scause` bit 63 set = interrupt; clear = exception.
-/// TLB shootdown IPI handler.
+/// TLB shootdown / wakeup IPI handler.
 ///
-/// Reads the shootdown request from `TLB_SHOOTDOWN`, flushes the TLB for the
-/// target address space, and acknowledges by clearing this hart's bit in the
-/// pending mask.
+/// Services any per-CPU shootdown request that names this hart (flush + ack),
+/// then returns. Wakeup IPIs carry no extra work beyond the SSIP clear.
 #[cfg(not(test))]
 fn handle_software_interrupt()
 {
     // On RISC-V, both TLB shootdown and wakeup IPIs arrive as supervisor
-    // software interrupts (scause=1). Distinguish by checking if our bit
-    // is set in the shootdown pending mask.
+    // software interrupts (scause=1); a wakeup-only IPI simply finds no
+    // request naming this hart below.
 
-    // Clear SSIP *before* checking pending_cpus. This is critical for
-    // correctness: if a new IPI arrives between our check and sret, the
+    // Clear SSIP *before* servicing requests. This is critical for
+    // correctness: if a new IPI arrives between our scan and sret, the
     // 0→1 transition on SSIP generates a fresh interrupt after sret.
     //
-    // Clearing SSIP *after* the check is racy: a wakeup IPI sets SSIP,
-    // we enter the handler and check pending_cpus (0 — shootdown store
-    // hasn't happened yet), then the shootdown IPI arrives (SSIP already
-    // 1, no new edge), and clear_sip_ssip wipes both signals. The
-    // shootdown is never processed.
+    // Clearing SSIP *after* the scan is racy: a wakeup IPI sets SSIP, we
+    // enter and find no request (the shootdown store hasn't happened yet),
+    // then the shootdown IPI arrives (SSIP already 1, no new edge), and
+    // clear_sip_ssip wipes both signals — the shootdown is never processed.
+    // The initiator's SeqCst fence orders its slot store before the IPI, so
+    // any IPI whose SSIP-set precedes our clear has a slot store visible to
+    // the scan; any later IPI re-triggers via a fresh SSIP edge.
     //
     // SAFETY: sip.SSIP write clears supervisor software interrupt pending.
     unsafe {
@@ -356,54 +357,18 @@ fn handle_software_interrupt()
     }
 
     let hart_id = super::cpu::current_cpu() as usize;
-
-    if crate::mm::tlb_shootdown::TLB_SHOOTDOWN
-        .pending_cpus
-        .test_cpu(hart_id, core::sync::atomic::Ordering::Acquire)
-    {
-        // TLB shootdown request: flush the requested VA and acknowledge.
-        // Per-VA sfence.vma preserves global kernel-text iTLB entries that
-        // a full sfence.vma x0, x0 would otherwise discard.
-        let va = crate::mm::tlb_shootdown::TLB_SHOOTDOWN
-            .flush_va
-            .load(core::sync::atomic::Ordering::Acquire);
-        if va == u64::MAX
-        {
-            // Full flush requested.
-            // SAFETY: sfence.vma x0, x0 flushes all TLB entries.
-            unsafe {
-                super::paging::flush_tlb_all();
-            }
-        }
-        else
-        {
-            // SAFETY: sfence.vma with a specific VA flushes only that
-            // translation. The VA is a user-range address from the
-            // shootdown initiator.
-            unsafe {
-                core::arch::asm!(
-                    "sfence.vma {}, zero",
-                    in(reg) va,
-                    options(nostack, preserves_flags),
-                );
-            }
-        }
-
-        // Clear our bit to acknowledge completion.
-        // SAFETY: Release ordering ensures TLB flush is visible before bit clear.
-        crate::mm::tlb_shootdown::TLB_SHOOTDOWN
-            .pending_cpus
-            .clear_cpu(hart_id, core::sync::atomic::Ordering::Release);
+    // SAFETY: IPI-handler context on hart_id in S-mode; issuing sfence.vma here
+    // is valid.
+    unsafe {
+        crate::mm::tlb_shootdown::service_shootdowns(hart_id);
     }
 
     // Wakeup IPIs carry no handler work beyond the hardware-mandated SSIP
-    // acknowledgement (performed by the caller via `clear_sip_ssip`). The
-    // reschedule-pending flag is set producer-side in `enqueue_and_wake`,
-    // so the handler does not need to touch it here.
-    //
-    // The IPI's purpose is purely to break the target hart out of `wfi`;
-    // correctness of the wake is provided by the producer-side flag plus
-    // the atomic check-and-halt in the idle loop. See
+    // acknowledgement (performed above via `clear_sip_ssip`). The
+    // reschedule-pending flag is set producer-side in `enqueue_and_wake`, so
+    // the handler does not need to touch it here. The IPI's purpose is purely
+    // to break the target hart out of `wfi`; correctness of the wake is the
+    // producer-side flag plus the atomic check-and-halt in the idle loop. See
     // `kernel/src/sched/mod.rs` `RESCHEDULE_PENDING` doc.
 }
 
@@ -982,9 +947,9 @@ pub fn acknowledge(irq: u32)
 /// Send a TLB shootdown IPI to a target hart via SBI IPI.
 ///
 /// Sends a supervisor software interrupt to the target hart. The
-/// `handle_tlb_shootdown_ipi` handler (scause=1) on the target reads
-/// the shootdown request, executes sfence.vma, clears its pending bit,
-/// and clears SSIP.
+/// The software-interrupt handler (scause=1) on the target services any
+/// shootdown request naming it: executes sfence.vma, clears its pending
+/// bit, and clears SSIP.
 ///
 /// Note: this uses SBI IPI (not RFENCE) because RFENCE is a blocking
 /// firmware call that performs the flush internally without generating a

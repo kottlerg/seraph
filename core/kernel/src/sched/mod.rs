@@ -280,10 +280,8 @@ fn watchdog_tick_and_check()
     // (NMI backtrace at 0.75 s, panic at 5 s — see arch wait_for_ack) and is
     // the authoritative detector for a genuinely stuck IPI, so defer to it
     // rather than emit a misleading softlockup dump. A non-shootdown stall
-    // re-checks on the next tick once pending_cpus clears.
-    if !crate::mm::tlb_shootdown::TLB_SHOOTDOWN
-        .pending_cpus
-        .is_empty(core::sync::atomic::Ordering::Acquire)
+    // re-checks on the next tick once the shootdown drains.
+    if crate::mm::tlb_shootdown::any_pending()
     {
         return;
     }

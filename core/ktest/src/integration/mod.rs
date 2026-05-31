@@ -31,6 +31,7 @@
 //! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
 //! - `fpu_survives_ipc_call.rs` — FP register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration
 //! - `fault_kills_thread.rs`     — a genuine userspace page fault terminates the thread with the right exit reason
+//! - `tlb_widen_retry.rs`        — a permission-widen elides its shootdown; a remote stale-TLB write still completes via spurious-fault retry
 
 pub mod cap_delegation_chain;
 pub mod cap_move_into_fresh_cspace_then_ipc;
@@ -44,6 +45,7 @@ pub mod retype_reclaim;
 pub mod shared_frame_two_aspaces;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
+pub mod tlb_widen_retry;
 pub mod wait_concurrency;
 
 use crate::TestContext;
@@ -89,4 +91,5 @@ pub fn run_all(ctx: &TestContext)
         "integration::fault_kills_thread",
         fault_kills_thread::run(ctx)
     );
+    run_integration_test!("integration::tlb_widen_retry", tlb_widen_retry::run(ctx));
 }

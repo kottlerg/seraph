@@ -413,6 +413,9 @@ pub unsafe fn read_root_phys() -> u64
 /// `root_virt`, drawing missing intermediate frames from
 /// `crate::mm::kernel_pt_pool`.
 ///
+/// Returns the [`MapOutcome`](crate::mm::paging::MapOutcome) classifying the
+/// rewrite so the caller can decide whether a remote shootdown is required.
+///
 /// # Errors
 /// Returns `Err(())` if the kernel PT pool is exhausted.
 ///
@@ -425,7 +428,7 @@ pub unsafe fn map_user_page(
     virt: u64,
     phys: u64,
     flags: crate::mm::paging::PageFlags,
-) -> Result<(), ()>
+) -> Result<crate::mm::paging::MapOutcome, ()>
 {
     use crate::mm::paging::phys_to_virt;
 
@@ -449,9 +452,10 @@ pub unsafe fn map_user_page(
 
     let mut pte = PageTableEntry::new_page(phys, flags);
     pte.0 |= USER;
+    let prior = pt[pt_index(virt)].0;
     pt[pt_index(virt)] = pte;
 
-    Ok(())
+    Ok(classify_user_map(prior, pte.0))
 }
 
 /// Walk an existing page table entry or allocate a new child frame from the
@@ -495,7 +499,7 @@ pub unsafe fn map_user_page_pooled(
     phys: u64,
     flags: crate::mm::paging::PageFlags,
     aso: &crate::cap::object::AddressSpaceObject,
-) -> Result<(), ()>
+) -> Result<crate::mm::paging::MapOutcome, ()>
 {
     use crate::mm::paging::phys_to_virt;
     const USER: u64 = 1 << 2;
@@ -517,9 +521,10 @@ pub unsafe fn map_user_page_pooled(
 
     let mut pte = PageTableEntry::new_page(phys, flags);
     pte.0 |= USER;
+    let prior = pt[pt_index(virt)].0;
     pt[pt_index(virt)] = pte;
 
-    Ok(())
+    Ok(classify_user_map(prior, pte.0))
 }
 
 /// Pooled equivalent of [`user_walk_or_alloc`]: pulls a freshly-zeroed PT
@@ -792,8 +797,9 @@ pub unsafe fn unmap_identity_page(pa: u64)
 ///
 /// Walks PML4 → PDPT → PD → PT. Returns `Err(PagingError::NotMapped)` if
 /// the page is not present at any level. On success, rewrites the leaf PTE
-/// with the new `flags` (preserving the physical address and USER bit) and
-/// calls `flush_page`.
+/// with the new `flags` (preserving the physical address and USER bit), calls
+/// `flush_page`, and returns the [`MapOutcome`](crate::mm::paging::MapOutcome)
+/// classifying the rights change (a same-frame rewrite, so never `Fresh`).
 ///
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB PML4
@@ -803,7 +809,7 @@ pub unsafe fn protect_user_page(
     root_virt: u64,
     virt: u64,
     flags: crate::mm::paging::PageFlags,
-) -> Result<(), crate::mm::paging::PagingError>
+) -> Result<crate::mm::paging::MapOutcome, crate::mm::paging::PagingError>
 {
     use crate::mm::paging::{PagingError, phys_to_virt};
 
@@ -842,6 +848,7 @@ pub unsafe fn protect_user_page(
         return Err(PagingError::NotMapped);
     }
 
+    let prior = leaf.0;
     let phys = leaf.phys_addr();
     let mut new_pte = PageTableEntry::new_page(phys, flags);
     new_pte.0 |= USER;
@@ -849,7 +856,7 @@ pub unsafe fn protect_user_page(
 
     // SAFETY: invlpg flushes TLB entry for specified VA; architecture primitive.
     unsafe { flush_page(virt) };
-    Ok(())
+    Ok(classify_user_map(prior, new_pte.0))
 }
 
 /// Translate a user virtual address to its mapped physical address and raw PTE.
@@ -905,6 +912,48 @@ pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64
     }
 
     Some((leaf.phys_addr(), leaf.0))
+}
+
+// ── Shootdown-elision classification ──────────────────────────────────────────
+
+/// Classify a leaf-PTE rewrite (`prior` → `new`) into a
+/// [`MapOutcome`](crate::mm::paging::MapOutcome) for shootdown elision.
+///
+/// `prior`/`new` are raw x86-64 leaf PTE bits (`new` is presumed present). A
+/// not-present `prior` is a fresh map; a same-frame rights *widening* needs only
+/// the spurious-fault retry; any frame change or rights *narrowing* strands a
+/// dangerous stale entry and must shoot down. See [`MapOutcome`] for the full
+/// argument.
+fn classify_user_map(prior: u64, new: u64) -> crate::mm::paging::MapOutcome
+{
+    use crate::mm::paging::MapOutcome;
+
+    if prior & PRESENT == 0
+    {
+        return MapOutcome::Fresh;
+    }
+    if PageTableEntry(prior).phys_addr() == PageTableEntry(new).phys_addr()
+        && map_rights_superset(new, prior)
+    {
+        MapOutcome::Widen
+    }
+    else
+    {
+        MapOutcome::Replace
+    }
+}
+
+/// Whether `new` grants every user access `prior` granted (x86-64 leaf bits).
+///
+/// On x86-64 every present user page is readable, so only W (WRITABLE) and X
+/// (NX clear) can narrow.
+fn map_rights_superset(new: u64, prior: u64) -> bool
+{
+    // W: if prior was writable, new must be writable.
+    let w_ok = prior & WRITABLE == 0 || new & WRITABLE != 0;
+    // X: if prior was executable (NX clear), new must be executable (NX clear).
+    let x_ok = prior & NO_EXECUTE != 0 || new & NO_EXECUTE == 0;
+    w_ok && x_ok
 }
 
 // ── Spurious-fault classification ─────────────────────────────────────────────
@@ -1172,5 +1221,84 @@ mod tests
         // Not present: genuine fault regardless of other bits.
         let absent = USER_BIT | WRITABLE;
         assert!(!pte_permits_user_access(absent, false, false));
+    }
+
+    // ── Shootdown-elision classification ───────────────────────────────────────
+
+    use crate::mm::paging::MapOutcome;
+
+    const FRAME_A: u64 = 0x10_000;
+    const FRAME_B: u64 = 0x20_000;
+
+    /// Raw leaf PTE bits: present user page on `frame` with the given rights.
+    fn leaf(frame: u64, writable: bool, executable: bool) -> u64
+    {
+        let mut pte = PRESENT | USER_BIT | (frame & PHYS_MASK);
+        if writable
+        {
+            pte |= WRITABLE;
+        }
+        if !executable
+        {
+            pte |= NO_EXECUTE;
+        }
+        pte
+    }
+
+    #[test]
+    fn classify_fresh_when_prior_absent()
+    {
+        assert_eq!(
+            classify_user_map(0, leaf(FRAME_A, true, false)),
+            MapOutcome::Fresh
+        );
+    }
+
+    #[test]
+    fn classify_widen_when_adding_write_same_frame()
+    {
+        let prior = leaf(FRAME_A, false, false); // R--
+        let new = leaf(FRAME_A, true, false); // RW-
+        assert_eq!(classify_user_map(prior, new), MapOutcome::Widen);
+    }
+
+    #[test]
+    fn classify_widen_when_adding_exec_same_frame()
+    {
+        let prior = leaf(FRAME_A, false, false); // R-- (NX)
+        let new = leaf(FRAME_A, false, true); // R-X
+        assert_eq!(classify_user_map(prior, new), MapOutcome::Widen);
+    }
+
+    #[test]
+    fn classify_widen_when_identical()
+    {
+        let pte = leaf(FRAME_A, true, false);
+        assert_eq!(classify_user_map(pte, pte), MapOutcome::Widen);
+    }
+
+    #[test]
+    fn classify_replace_when_narrowing_write()
+    {
+        let prior = leaf(FRAME_A, true, false); // RW-
+        let new = leaf(FRAME_A, false, false); // R--
+        assert_eq!(classify_user_map(prior, new), MapOutcome::Replace);
+    }
+
+    #[test]
+    fn classify_replace_when_narrowing_exec()
+    {
+        let prior = leaf(FRAME_A, false, true); // R-X
+        let new = leaf(FRAME_A, false, false); // R-- (NX)
+        assert_eq!(classify_user_map(prior, new), MapOutcome::Replace);
+    }
+
+    #[test]
+    fn classify_replace_when_frame_changes()
+    {
+        // Same rights but a different frame is a dangerous stale entry.
+        let prior = leaf(FRAME_A, true, false);
+        let new = leaf(FRAME_B, true, false);
+        assert_eq!(classify_user_map(prior, new), MapOutcome::Replace);
     }
 }

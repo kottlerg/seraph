@@ -144,6 +144,51 @@ pub struct PageFlags
     pub uncacheable: bool,
 }
 
+/// How a leaf-PTE rewrite changed an existing mapping, used to decide whether a
+/// cross-CPU TLB shootdown is required once the new PTE is committed.
+///
+/// A remote CPU may hold a cached translation for the affected VA. Whether that
+/// stale entry can cause a *correctness* violation — versus at worst a
+/// re-walkable spurious fault the page-fault handler resolves against the live
+/// PTE — decides whether the synchronous shootdown can be elided. The arch
+/// mapping primitives classify the rewrite; `mm::address_space` acts on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapOutcome
+{
+    /// No prior mapping existed at this VA (the leaf was not-present).
+    ///
+    /// x86-64 does not cache not-present translations (Intel SDM 4.10.2.3), so
+    /// no remote CPU holds a stale entry. RISC-V may cache an invalid PTE, but
+    /// an access through it is a spurious fault the handler resolves against the
+    /// now-present live PTE. Either way, no remote shootdown is required.
+    Fresh,
+    /// A prior mapping existed; the rewrite keeps the same frame and only
+    /// *widens* permissions (new rights ⊇ prior).
+    ///
+    /// A remote CPU's stale, narrower entry can at worst raise a spurious fault
+    /// on the newly-granted access; the handler re-walks the live PTE, sees the
+    /// access is now permitted, and retries. No remote shootdown is required;
+    /// the local flush still runs so the initiating CPU sees the new rights.
+    Widen,
+    /// A prior mapping existed and the rewrite can leave a *dangerous* stale
+    /// entry on a remote CPU — a different frame (use-after-free / stale data)
+    /// or a permission *narrowing* (stale, over-broad rights). Requires a
+    /// synchronous remote shootdown before the operation returns.
+    Replace,
+}
+
+impl MapOutcome
+{
+    /// Whether committing this rewrite requires a synchronous cross-CPU TLB
+    /// shootdown. Only [`MapOutcome::Replace`] can strand a dangerous stale
+    /// entry; `Fresh` and `Widen` rely on the spurious-fault retry path.
+    #[must_use]
+    pub fn needs_remote_shootdown(self) -> bool
+    {
+        matches!(self, MapOutcome::Replace)
+    }
+}
+
 // ── Static boot table pool ────────────────────────────────────────────────────
 
 /// Number of 4 KiB frames in the static boot table pool.

@@ -34,6 +34,23 @@
 //! nests under `pt_lock` is the PT-frame source
 //! (`pt_lock` → `FRAME_ALLOC_LOCK` on the heap-backed path).
 //!
+//! ## Operation-class shootdown elision
+//!
+//! The remote shootdown is issued only when the leaf-PTE rewrite can strand a
+//! *dangerous* stale entry on another CPU. The arch mapping primitives classify
+//! each rewrite as a [`MapOutcome`](crate::mm::paging::MapOutcome):
+//!
+//! - **Fresh map** (no prior mapping) and **permission widen** (same frame, new
+//!   rights ⊇ prior) skip the remote shootdown. No remote CPU can hold a stale
+//!   entry that grants more than the live PTE, so the worst case is a spurious
+//!   fault the page-fault handler resolves against the live PTE and retries.
+//! - **Replace** (different frame, or a permission *narrow*) keeps the
+//!   synchronous shootdown: a stale entry would alias a freed/reused frame or
+//!   cache over-broad rights — a correctness violation the retry cannot mask.
+//!
+//! `unmap_page` is always a Replace-equivalent and stays synchronous. The local
+//! flush runs unconditionally regardless of class.
+//!
 //! `pt_lock` does NOT disable interrupts (shootdown needs them enabled).
 //! `preempt_disable()` is held across the whole edit-then-shootdown sequence:
 //! it satisfies the shootdown protocol's same-CPU invariant and ensures the
@@ -296,8 +313,10 @@ impl AddressSpace
     /// Map `virt` → `phys` as a 4 KiB page with the given permission flags.
     ///
     /// Acquires `pt_lock`, draws missing intermediate page-table frames
-    /// from [`crate::mm::kernel_pt_pool`] (seeded at Phase 7), and sends
-    /// TLB shootdown IPIs if this address space is active on other CPUs.
+    /// from [`crate::mm::kernel_pt_pool`] (seeded at Phase 7), flushes the local
+    /// TLB, and sends remote TLB shootdown IPIs only when the rewrite can strand
+    /// a dangerous stale entry (see the module's elision note). A fresh map into
+    /// a previously-unmapped VA skips the remote shootdown.
     ///
     /// Used by:
     /// - [`map_segment`](Self::map_segment) and direct kernel callers
@@ -328,14 +347,13 @@ impl AddressSpace
         // shootdown below is the only inter-CPU synchronisation cost.
         // SAFETY: contract passed to caller; root_virt is valid; virt is
         // in user range; phys is a valid 4 KiB-aligned physical address.
-        let result = unsafe { map_user_page(self.root_virt, virt, phys, flags) };
-
-        if result.is_err()
+        let Ok(outcome) = (unsafe { map_user_page(self.root_virt, virt, phys, flags) })
+        else
         {
             self.pt_unlock();
             crate::percpu::preempt_enable();
             return Err(());
-        }
+        };
 
         // Local TLB invalidation for the mapped page, under pt_lock. The
         // current CPU does not IPI itself.
@@ -344,12 +362,18 @@ impl AddressSpace
             flush_page(virt);
         }
 
-        // Drop pt_lock BEFORE the synchronous remote shootdown so concurrent
-        // map/unmap on this address space need not wait behind our IPI
-        // ack-wait. preempt stays disabled, so the shootdown completes (full
-        // TLB coherence) before this returns. See `shootdown_remote`.
+        // Drop pt_lock BEFORE the (conditional) synchronous remote shootdown so
+        // concurrent map/unmap on this address space need not wait behind our
+        // IPI ack-wait. preempt stays disabled, so any shootdown completes (full
+        // TLB coherence) before this returns. A fresh map or a permission widen
+        // strands no dangerous stale entry, so it skips the remote shootdown and
+        // relies on the spurious-fault retry path. See `shootdown_remote` and
+        // [`MapOutcome`](crate::mm::paging::MapOutcome).
         self.pt_unlock();
-        self.shootdown_remote(virt);
+        if outcome.needs_remote_shootdown()
+        {
+            self.shootdown_remote(virt);
+        }
         crate::percpu::preempt_enable();
 
         Ok(())
@@ -379,23 +403,26 @@ impl AddressSpace
         self.pt_lock();
 
         // SAFETY: caller's contract; aso pairs with this AS.
-        let result = unsafe { map_user_page_pooled(self.root_virt, virt, phys, flags, aso) };
-
-        if result.is_err()
+        let Ok(outcome) = (unsafe { map_user_page_pooled(self.root_virt, virt, phys, flags, aso) })
+        else
         {
             self.pt_unlock();
             crate::percpu::preempt_enable();
             return Err(());
-        }
+        };
 
-        // Local TLB invalidation under pt_lock; remote shootdown after unlock.
+        // Local TLB invalidation under pt_lock; conditional remote shootdown
+        // after unlock (fresh map / widen elide it — see `map_page`).
         // SAFETY: virt is a valid user virtual address.
         unsafe {
             flush_page(virt);
         }
 
         self.pt_unlock();
-        self.shootdown_remote(virt);
+        if outcome.needs_remote_shootdown()
+        {
+            self.shootdown_remote(virt);
+        }
         crate::percpu::preempt_enable();
 
         Ok(())
@@ -527,14 +554,16 @@ impl AddressSpace
 
         // Change protection bits via arch-specific page table walk.
         // SAFETY: root_virt is valid; virt is in user range (caller's contract).
-        let result = unsafe { protect_user_page(self.root_virt, virt, flags) };
-
-        if let Err(e) = result
+        let outcome = match unsafe { protect_user_page(self.root_virt, virt, flags) }
         {
-            self.pt_unlock();
-            crate::percpu::preempt_enable();
-            return Err(e);
-        }
+            Ok(outcome) => outcome,
+            Err(e) =>
+            {
+                self.pt_unlock();
+                crate::percpu::preempt_enable();
+                return Err(e);
+            }
+        };
 
         // Local TLB invalidation for the protected page, under pt_lock. The
         // current CPU does not IPI itself.
@@ -543,12 +572,18 @@ impl AddressSpace
             flush_page(virt);
         }
 
-        // Drop pt_lock BEFORE the synchronous remote shootdown so concurrent
-        // map/unmap on this address space need not wait behind our IPI
-        // ack-wait. preempt stays disabled, so the permission change is fully
-        // TLB-coherent before this returns. See `shootdown_remote`.
+        // Drop pt_lock BEFORE the (conditional) synchronous remote shootdown so
+        // concurrent map/unmap on this address space need not wait behind our
+        // IPI ack-wait. preempt stays disabled, so any shootdown is fully
+        // TLB-coherent before this returns. A permission *widen* strands only a
+        // re-walkable stale entry and skips the remote shootdown; a *narrow*
+        // leaves over-broad rights cached and stays synchronous. See
+        // `shootdown_remote` and [`MapOutcome`](crate::mm::paging::MapOutcome).
         self.pt_unlock();
-        self.shootdown_remote(virt);
+        if outcome.needs_remote_shootdown()
+        {
+            self.shootdown_remote(virt);
+        }
         crate::percpu::preempt_enable();
 
         Ok(())

@@ -760,8 +760,9 @@ extern "C" fn nm_handler()
 
 /// TLB shootdown IPI handler stub (vector 250).
 ///
-/// Reads the shootdown request from `TLB_SHOOTDOWN`, flushes the TLB for the
-/// target address space, and acknowledges by clearing this CPU's bit.
+/// Saves caller-clobbered registers, calls the Rust handler — which services
+/// any shootdown request naming this CPU and clears its acknowledgement bit —
+/// then restores and `iretq`s.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn ipi_tlb_shootdown_stub()
@@ -946,47 +947,22 @@ unsafe extern "C" fn ipi_wakeup_stub()
 
 /// TLB shootdown IPI handler.
 ///
-/// Reads the shootdown request, flushes the TLB for the target address space,
-/// and acknowledges by clearing this CPU's bit in the pending mask.
+/// Services every per-CPU shootdown request that names this CPU (flush the
+/// requested VA, clear this CPU's acknowledgement bit), then sends EOI. The
+/// dedicated vector means every delivery is a shootdown; a re-sent or stale IPI
+/// that finds no request naming this CPU simply does no flush.
 #[cfg(not(test))]
 extern "C" fn ipi_tlb_shootdown_handler()
 {
-    // SAFETY: Acquire ordering ensures we see the root_phys stored by initiator
-    let root_phys = crate::mm::tlb_shootdown::TLB_SHOOTDOWN
-        .root_phys
-        .load(core::sync::atomic::Ordering::Acquire);
-
-    // Flush TLB for the target page.
-    let va = crate::mm::tlb_shootdown::TLB_SHOOTDOWN
-        .flush_va
-        .load(core::sync::atomic::Ordering::Acquire);
-    if va == u64::MAX || root_phys == 0
-    {
-        // Full TLB flush.
-        // SAFETY: CR3 write invalidates all non-global TLB entries.
-        unsafe {
-            super::paging::flush_tlb_all();
-        }
-    }
-    else
-    {
-        // Per-VA flush via invlpg.
-        // SAFETY: va is a valid virtual address from the shootdown initiator.
-        unsafe {
-            super::paging::flush_page(va);
-        }
-    }
-
-    // Acknowledge by clearing our bit in pending_cpus
     let cpu_id = super::cpu::current_cpu() as usize;
+    // SAFETY: IPI-handler context on cpu_id at ring 0; issuing TLB flushes here
+    // is valid.
+    unsafe {
+        crate::mm::tlb_shootdown::service_shootdowns(cpu_id);
+    }
 
-    // SAFETY: Release ordering ensures TLB flush completes before bit clear is visible
-    crate::mm::tlb_shootdown::TLB_SHOOTDOWN
-        .pending_cpus
-        .clear_cpu(cpu_id, core::sync::atomic::Ordering::Release);
-
-    // Send EOI to local APIC
-    // SAFETY: Vector 250 is the TLB shootdown vector
+    // Send EOI to local APIC.
+    // SAFETY: Vector 250 is the TLB shootdown vector.
     super::interrupts::acknowledge(u32::from(super::interrupts::IPI_VECTOR_TLB_SHOOTDOWN));
 }
 

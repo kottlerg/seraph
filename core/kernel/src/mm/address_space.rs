@@ -29,8 +29,9 @@
 //! priority-inversion under load. The committed PTE plus the immutable
 //! `root_phys` are all the shootdown reads, so it runs without `pt_lock`.
 //!
-//! `pt_lock` therefore does NOT nest with `SHOOTDOWN_LOCK`. The only lock the
-//! PTE edit nests under `pt_lock` is the PT-frame source
+//! The shootdown itself is lock-free — each CPU publishes into its own request
+//! slot — so `pt_lock` nests with no shootdown lock. The only lock the PTE edit
+//! nests under `pt_lock` is the PT-frame source
 //! (`pt_lock` → `FRAME_ALLOC_LOCK` on the heap-backed path).
 //!
 //! `pt_lock` does NOT disable interrupts (shootdown needs them enabled).

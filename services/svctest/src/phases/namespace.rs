@@ -298,9 +298,9 @@ pub fn ns_mount_boundary_phase(_: &Caps)
 
     // Transparent root-fs delegation: paths that are not shadowed by a
     // mount on the synthetic root must resolve through the root fs.
-    // After the mounts.conf/INGEST_CONFIG_MOUNTS removal, /config lives on
-    // the root partition and reaches `/config/svcmgr/services/logd.svc`
-    // through delegation (the only mount on the synthetic root is /esp).
+    // /config lives on the root partition and reaches
+    // `/config/svcmgr/services/logd.svc` through delegation (the only mount
+    // on the synthetic root is /esp).
     let (config_cap, kind, _size) = ns_lookup(system_root_cap, b"config", 0xFFFF, ipc_buf)
         .expect("ns_mount_boundary: NS_LOOKUP(system_root, \"config\") failed");
     assert_eq!(
@@ -485,10 +485,9 @@ pub fn ns_startup_cwd_phase(_: &Caps)
     std::os::seraph::log!("ns_startup_cwd phase passed");
 }
 
-// ns_fallthrough_attenuation_phase was retired alongside the historical
-// storage-mount fixture: it asserted that fall-through caps minted under
-// a synthetic intermediate (an outer dir that existed only because a
-// deeper mount fell within it) respect parent-cap attenuation. Without
-// a multi-component mount in the in-tree boot the scenario it exercised
-// no longer exists. Re-introducing equivalent coverage requires a
+// There is no ns_fallthrough_attenuation_phase here: the in-tree boot has
+// no multi-component mount, so the scenario it would exercise — fall-through
+// caps minted under a synthetic intermediate (an outer dir present only
+// because a deeper mount falls within it) respecting parent-cap attenuation
+// — is not reachable. Re-introducing this coverage requires a
 // multi-component mount fixture; tracked as issue #139.

@@ -80,11 +80,10 @@ pub fn fs_open_phase(_: &Caps)
 {
     use std::io::Read;
 
-    // `boot.conf` was removed in boot-protocol v8. Read the bootstrap
-    // bundle header (the first 16 bytes carry `SRPHBNDL` magic + u32
-    // version + u32 entry count) to exercise the same vfsd/fatfs std::fs
-    // path boot.conf did without pulling tens of MiB into a userspace
-    // Vec.
+    // Read the bootstrap bundle header (the first 16 bytes carry
+    // `SRPHBNDL` magic + u32 version + u32 entry count) to exercise the
+    // vfsd/fatfs std::fs path on a small read without pulling tens of MiB
+    // into a userspace Vec.
     let mut file = match std::fs::File::open("/esp/EFI/seraph/bootstrap.bundle")
     {
         Ok(f) => f,

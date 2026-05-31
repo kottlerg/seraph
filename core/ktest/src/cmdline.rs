@@ -5,7 +5,7 @@
 
 //! Compile-time ktest configuration.
 //!
-//! Boot protocol v8 removed the kernel command line, so every ktest run
+//! The boot protocol carries no kernel command line, so every ktest run
 //! uses the same [`KtestConfig::DEFAULT`] baked in at build time. The
 //! defaults are picked for CI: every tier runs, the VM auto-shuts down
 //! on completion, and shutdown is immediate. To preserve QEMU for
@@ -28,8 +28,7 @@ pub enum ShutdownPolicy
     Never,
 }
 
-/// ktest configuration. Baked in at compile time after the boot-
-/// protocol v8 cmdline removal.
+/// ktest configuration. Baked in at compile time.
 #[allow(clippy::struct_excessive_bools)]
 pub struct KtestConfig
 {
@@ -44,9 +43,8 @@ pub struct KtestConfig
 
 impl KtestConfig
 {
-    /// Compile-time configuration baked into every ktest build after
-    /// the boot-protocol v8 cmdline removal. CI-friendly: full
-    /// coverage, exit immediately on completion.
+    /// Compile-time configuration baked into every ktest build.
+    /// CI-friendly: full coverage, exit immediately on completion.
     pub const DEFAULT: KtestConfig = KtestConfig {
         shutdown_policy: ShutdownPolicy::Always,
         timeout_secs: 0,

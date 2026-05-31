@@ -751,8 +751,8 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 
     // Auto-mount the EFI System Partition at /esp once root is up so
     // userspace can read kernel + bundle + bootloader without a separate
-    // MOUNT call (the historic role of `mounts.conf`). Best-effort —
-    // failure does not propagate into the root mount's reply.
+    // MOUNT call. Best-effort — failure does not propagate into the root
+    // mount's reply.
     if matches!(role, MountRole::Root) && reply.label == ipc::vfsd_errors::SUCCESS
     {
         auto_mount_esp(rt, ipc_buf);

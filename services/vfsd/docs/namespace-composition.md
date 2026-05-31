@@ -47,9 +47,9 @@ components, creating synthetic intermediates on demand, and setting
 `terminal_cap` on the final node. After install the caller
 (`do_mount`) walks the root mount component-by-component via
 `NS_LOOKUP` to populate each new intermediate's `fallthrough_cap`.
-The in-tree mount set after the GPT-type-GUID redesign is two
-single-component mounts (`/`, `/esp`); the multi-component install
-path remains supported but is currently unexercised in production.
+The in-tree mount set is two single-component mounts (`/`, `/esp`);
+the multi-component install path remains supported but is currently
+unexercised in production.
 
 ---
 
@@ -152,8 +152,7 @@ per-cap revocation.
 
 vfsd holds two un-tokened endpoints:
 
-- **Service endpoint** — `MOUNT` and `GET_SYSTEM_ROOT_CAP`
-  (`INGEST_CONFIG_MOUNTS` was retired alongside `mounts.conf`).
+- **Service endpoint** — `MOUNT` and `GET_SYSTEM_ROOT_CAP`.
   Multi-threaded recv (4 handlers today) so
   that a handler blocked on a worker pool order does not deadlock
   the system: `CREATE_FROM_FILE` for a fatfs respawn re-enters

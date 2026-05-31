@@ -182,7 +182,7 @@ memmgr serves frame requests over IPC. The contract:
   to `want_pages`. The reply carries each returned cap's page count
   alongside it. memmgr prefers fewer caps over many.
 - **No fixed cap-count ceiling.** Replies may use the full IPC
-  reply-side cap-slot capacity; there is no historical 4-cap limit.
+  reply-side cap-slot capacity; there is no 4-cap limit.
 - **Caller maps.** Every returned Frame cap is mapped at a caller-
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).

@@ -37,7 +37,7 @@
 //! `OpenOptions::truncate(true)` on an existing file and
 //! `File::set_len(0)` ride the new `FS_TRUNCATE` label. v1 supports
 //! `new_len == 0` only; the corresponding extend-with-zero-fill case
-//! is tracked in the post-#8 completeness-gaps Issue.
+//! is tracked in the `ruststd::fs` completeness-gaps issue.
 //!
 //! ## Metadata
 //! `std::fs::metadata` / `symlink_metadata` / `exists` walk the path
@@ -1239,7 +1239,7 @@ impl File
         if new_len != 0
         {
             // v1: only shrink-to-zero is implemented. Extend-with-
-            // zero-fill is in the post-#8 completeness-gaps Issue.
+            // zero-fill is tracked in the `ruststd::fs` completeness-gaps issue.
             return Err(io::const_error!(
                 io::ErrorKind::Unsupported,
                 "seraph fs: File::set_len(non-zero) not supported in v1",

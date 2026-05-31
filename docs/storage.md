@@ -107,9 +107,7 @@ or on-disk UUID. The model is:
   filesystem label or UUID consulted by vfsd. The GUID is the
   binding.
 
-The boot-protocol v8 retirement of `BootInfo.command_line` and the
-prior `mounts.conf` file completed this transition; the role-GUID
-model is the present and only mount-discovery mechanism. The wire
+The role-GUID model is the only mount-discovery mechanism. The wire
 shape vfsd uses internally (a `MountRole` byte mapped to a type GUID)
 is owned by [`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md).
 
@@ -234,8 +232,7 @@ To prevent inference of behavior that does not exist:
   etc.) are not consulted by vfsd.
 - **No boot-time mount configuration file.** Discovery is GPT-driven
   and arch-conditional; there is no `mounts.conf`, no `/etc/fstab`,
-  and no kernel command line carrying mount config (boot-protocol
-  v8 retired `command_line` entirely).
+  and no kernel command line carrying mount config.
 - **No process-global filesystem authority.** A process delivered no
   namespace cap has no filesystem access; `std::fs` returns
   `Unsupported`. There is no fallback to a system identity.

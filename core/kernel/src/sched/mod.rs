@@ -816,10 +816,10 @@ fn idle_thread_entry(_cpu_id: u64) -> !
                 crate::arch::current::cpu::disable_interrupts();
             }
 
-            // Step 2: atomic check of flag + run queue. (The previous
-            // `CPU_IDLE_MASK` advisory was removed alongside the always-IPI
-            // refactor; idle-state is no longer published — the wake protocol
-            // does not consult it. See docs/scheduling-internals.md.)
+            // Step 2: atomic check of flag + run queue. Idle state is not
+            // published; the wake protocol always sends a reschedule IPI
+            // rather than consulting a per-CPU idle mask.
+            // See docs/scheduling-internals.md.
             let pending = take_reschedule_pending(cpu);
             // SAFETY: scheduler slot is initialised for this CPU.
             let has_work = unsafe { (*scheduler_ptr(cpu)).has_runnable() };
@@ -1161,8 +1161,8 @@ pub unsafe fn scheduler_for(id: usize) -> &'static mut PerCpuScheduler
 /// When `new_state` is `Stopped` or `Exited`, also scans every CPU's run
 /// queue at `tcb.priority` and removes any lingering entry. Closes the
 /// Ready→Stopped→Ready double-enqueue race (issue #117): a thread
-/// transitioning Ready→Stopped used to leave a stale entry on its source
-/// CPU's queue for the dispatch-side skip loop to drain. A subsequent
+/// transitioning Ready→Stopped would otherwise leave a stale entry on its
+/// source CPU's queue for the dispatch-side skip loop to drain. A subsequent
 /// Stopped→Ready + enqueue could race that drain and produce two list
 /// entries for the same TCB, corrupting the intrusive `run_queue_next`
 /// chain. Draining the entry here keeps the run-queue invariant

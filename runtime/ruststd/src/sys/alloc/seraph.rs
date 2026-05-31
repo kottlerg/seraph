@@ -65,8 +65,7 @@ const GROW_MIN_PAGES: u64 = 16;
 /// Upper bound on a single `grow` call's page count. memmgr's reply is
 /// bounded by `MSG_CAP_SLOTS_MAX = 4` Frame caps per round; with
 /// best-effort allocation each cap may cover many pages, so this cap is
-/// no longer driven by per-page CSpace consumption (as it was under
-/// procmgr's one-cap-per-page ABI). Kept large enough that typical
+/// not driven by per-page CSpace consumption. It is sized so typical
 /// large `Vec` reallocations stay within a single round.
 const GROW_MAX_PAGES: u64 = 256;
 
@@ -732,7 +731,7 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
 }
 
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-
-/// failure and panic terminator until P3c wires a proper abort path.
+/// failure and panic terminator.
 pub fn abort_thread() -> ! {
     syscall::thread_exit()
 }

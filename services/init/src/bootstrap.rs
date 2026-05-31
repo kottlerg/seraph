@@ -511,8 +511,7 @@ fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
 /// `creator_endpoint_cap`.
 ///
 /// The memmgr boot module is located in [`InitInfo`] by name via
-/// [`crate::find_module_by_name`] (init-protocol v7+); ordinal-based
-/// lookup is no longer used.
+/// [`crate::find_module_by_name`] (init-protocol v7+).
 ///
 /// `mm_service_ep` is the full-rights cap on memmgr's service endpoint
 /// (created in init's `CSpace`); init keeps a copy and minted SENDs from it
@@ -947,8 +946,8 @@ struct ProcmgrCaps
     thread: u32,
     creator_endpoint_slot: u32,
     /// Slot index in procmgr's `CSpace` of the tokened SEND cap on memmgr's
-    /// endpoint. Zero when memmgr is not yet wired (early-boot regression
-    /// path; never expected after P5).
+    /// endpoint. Zero when memmgr is not yet wired — an early-boot-only
+    /// condition.
     memmgr_endpoint_slot: u32,
     /// Slot in procmgr's `CSpace` holding a tokened SEND on the
     /// system log endpoint with token `LOG_TOKEN_PROCMGR`. Std reads
@@ -964,8 +963,8 @@ struct ProcmgrCaps
 
 /// Populate procmgr's `ProcessInfo` page and map it read-only into procmgr.
 ///
-/// procmgr's stdio cap slots are left zero (procmgr is std-built post-
-/// P7 but does not drive interactive stdio). The un-tokened SEND on
+/// procmgr's stdio cap slots are left zero (procmgr is std-built but
+/// does not drive interactive stdio). The un-tokened SEND on
 /// the log endpoint procmgr uses as the *source* for deriving tokened
 /// SEND caps per child arrives via procmgr's bootstrap round, not via
 /// `ProcessInfo`. The pre-installed tokened SEND cap procmgr uses for
@@ -1197,10 +1196,10 @@ pub fn bootstrap_procmgr(
     let pm_creator_slot =
         syscall::cap_copy(tokened_creator, pm_cspace, syscall::RIGHTS_SEND).ok()?;
 
-    // Procmgr no longer maintains its own frame pool (P7 routes every
-    // per-child allocation through memmgr). All remaining RAM frames
-    // get delegated to memmgr in `finalize_memmgr` after every setup
-    // path has finished consuming init's pool.
+    // Procmgr maintains no frame pool of its own; every per-child
+    // allocation routes through memmgr. All remaining RAM frames get
+    // delegated to memmgr in `finalize_memmgr` after every setup path
+    // has finished consuming init's pool.
     let _ = pm_creator_slot;
 
     // Derive an un-tokened SEND cap on the log endpoint for procmgr.

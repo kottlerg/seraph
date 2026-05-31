@@ -616,13 +616,14 @@ fn token_caller_entry(arg: u64) -> !
 /// logging helper, or any other IPC issued before the caller consumes the
 /// received data) cannot clobber it.
 ///
-/// Historically the IPC buffer was caller-visible state across the
-/// post-recv / pre-read window; a `println!` between recv and the word
-/// read would scribble `STREAM_BYTES` over the received payload. The
-/// snapshot wrapper eliminates that window at the type level. This test
-/// locks the invariant in: receive a message with known words, scribble
-/// garbage directly over the IPC buffer (the worst case of any nested IPC
-/// activity), then verify the message's view is unchanged.
+/// Without the snapshot wrapper, the IPC buffer would be caller-visible
+/// state across the post-recv / pre-read window: a `println!` between recv
+/// and the word read would scribble `STREAM_BYTES` over the received
+/// payload. The snapshot wrapper eliminates that window at the type
+/// level. This test locks the invariant in: receive a message with known
+/// words, scribble garbage directly over the IPC buffer (the worst case
+/// of any nested IPC activity), then verify the message's view is
+/// unchanged.
 pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_frame_base)

@@ -157,4 +157,5 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     event::bench_event_post_recv(ctx, iters);
     wait_set::bench_wait_set(ctx, iters);
     tlb::bench_tlb_shootdown(ctx, iters);
+    tlb::bench_tlb_shootdown_concurrent(ctx, iters);
 }

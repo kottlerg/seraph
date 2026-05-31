@@ -1371,8 +1371,13 @@ all its descendants (including C2) but leaves C and any other children of C inta
   in other processes completes before `SYS_CAP_REVOKE` returns.
 
 - **Memory mapping operations are atomic with respect to the address space.** After
-  `SYS_MEM_MAP` or `SYS_MEM_UNMAP` returns, all CPUs see the updated mapping (TLB
-  shootdowns complete before return).
+  `SYS_MEM_MAP` or `SYS_MEM_UNMAP` returns, every CPU observes the updated mapping on
+  its next access. Rewrites that could leave a dangerous stale entry (unmap,
+  permission narrowing, frame replacement) complete a synchronous cross-CPU TLB
+  shootdown before returning; fresh maps and permission widenings instead rely on the
+  page-fault handler's spurious-fault retry, which re-walks the live page table on
+  first remote access. Either way the end state is coherent before the access
+  completes.
 
 - **Syscalls may be preempted.** Long-running operations (revocation traversal, SMP
   TLB shootdowns) may be interrupted by a higher-priority runnable thread. The kernel

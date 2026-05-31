@@ -6,9 +6,9 @@
 //! Integration: a permission-widen that elides its TLB shootdown still lets a
 //! remote CPU's stale-TLB write complete via the spurious-fault retry path.
 //!
-//! Phase 4 elides the cross-CPU shootdown when a `mem_protect` only *widens*
-//! permissions — a stale, narrower remote TLB entry can at worst raise a
-//! re-walkable spurious fault. This test drives exactly that window:
+//! Operation-class elision skips the cross-CPU shootdown when a `mem_protect`
+//! only *widens* permissions — a stale, narrower remote TLB entry can at worst
+//! raise a re-walkable spurious fault. This test drives exactly that window:
 //!
 //!   1. Parent maps a page read-only at `WIDEN_VA`.
 //!   2. A child pinned to CPU 1 reads the page, caching a read-only TLB entry,

@@ -51,6 +51,10 @@
 //! `unmap_page` is always a Replace-equivalent and stays synchronous. The local
 //! flush runs unconditionally regardless of class.
 //!
+//! Fresh/Widen safety rests on the spurious-fault retry (Widen) and on x86-64 not
+//! caching not-present entries (Fresh) — not on the context-switch TLB flush — so
+//! it is unaffected by a future PCID/ASID-tagged regime.
+//!
 //! `pt_lock` does NOT disable interrupts (shootdown needs them enabled).
 //! `preempt_disable()` is held across the whole edit-then-shootdown sequence:
 //! it satisfies the shootdown protocol's same-CPU invariant and ensures the

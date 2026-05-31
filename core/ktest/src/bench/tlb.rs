@@ -263,8 +263,9 @@ fn teardown(
 // `N` passive holders — the per-shootdown *hold* cost (IPI send + ack wait),
 // which scales with target count. This variant instead makes *every* pinned
 // worker an initiator: each loops map/unmap on its own VA and times both its
-// own `mem_map` (a fresh map, whose remote shootdown Phase 4 elides) and its
-// own `mem_unmap` (synchronous shootdown). With `W` concurrent initiators each publishing into its own
+// own `mem_map` (a fresh map, whose remote shootdown the operation-class
+// elision skips) and its own `mem_unmap` (synchronous shootdown). With `W`
+// concurrent initiators each publishing into its own
 // per-CPU request slot, the only residual cross-initiator cost is the
 // same-address-space `pt_lock` and the ack tail, so the concurrent mean tracks
 // the single-initiator mean. This bench is the regression guard for that parity:
@@ -306,9 +307,9 @@ static CONC_LAT_SUM: AtomicU64 = AtomicU64::new(0);
 static CONC_LAT_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// Shared per-map latency accumulators (cycles). Each loop map is a *fresh* map
-/// (the VA was just unmapped), which Phase 4 elides the remote shootdown for —
-/// so this mean drops to ~bare-syscall cost while the unmap mean above still
-/// carries the synchronous shootdown. The gap is the elision win.
+/// (the VA was just unmapped), whose remote shootdown the operation-class
+/// elision skips — so this mean drops to ~bare-syscall cost while the unmap mean
+/// above still carries the synchronous shootdown. The gap is the elision win.
 static CONC_MAP_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
 static CONC_MAP_MAX: AtomicU64 = AtomicU64::new(0);
 static CONC_MAP_SUM: AtomicU64 = AtomicU64::new(0);
@@ -366,8 +367,8 @@ fn conc_worker_entry(arg: u64) -> !
 
     for _ in 0..iters
     {
-        // Time the map — a fresh map (the VA is unmapped at loop top), the path
-        // Phase 4 elides the remote shootdown for.
+        // Time the map — a fresh map (the VA is unmapped at loop top), whose
+        // remote shootdown the operation-class elision skips.
         let m0 = cycles_now();
         let mr = syscall::mem_map(frame, aspace, va, 0, 1, syscall::MAP_WRITABLE);
         let m1 = cycles_now();
@@ -550,8 +551,8 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     let map_cnt = CONC_MAP_CNT.load(Ordering::Acquire);
     if let Some(map_mean) = CONC_MAP_SUM.load(Ordering::Acquire).checked_div(map_cnt)
     {
-        // Fresh-map latency: with Phase 4 elision this is ~bare syscall, well
-        // below the unmap (shootdown) mean below.
+        // Fresh-map latency: with the shootdown elided this is ~bare syscall,
+        // well below the unmap (shootdown) mean below.
         crate::log_u64(
             "ktest: bench  conc_map_cycles_min=",
             CONC_MAP_MIN.load(Ordering::Acquire),

@@ -379,7 +379,7 @@ The kernel sends three IPIs. Each has a defined purpose and correctness role.
 
 `core/kernel/src/arch/riscv64/interrupts.rs`:
 
-The riscv64 build uses one SBI IPI extension (EID `0x735049`, FID `0`) for both TLB shootdown and wakeup. The supervisor-mode trap handler distinguishes the two by side-channel state — the shootdown path consults a per-CPU pending-shootdown bitmap; the wakeup path falls through with no work, exactly mirroring the x86_64 wakeup-vector handler.
+The riscv64 build uses one SBI IPI extension (EID `0x735049`, FID `0`) for both TLB shootdown and wakeup. The supervisor-mode trap handler distinguishes the two by side-channel state — the shootdown path scans the per-CPU TLB shootdown request slots and services any whose pending mask names this hart; a wakeup-only IPI finds no slot naming it and falls through with no work, exactly mirroring the x86_64 wakeup-vector handler.
 
 The same correctness rules apply: shootdown is required for TLB coherence; wakeup is required for the wake protocol.
 
@@ -494,11 +494,11 @@ S-mode timer) would close the latter gap; tracked as issue #33.
 participating CPU (initiator preempt-disabled in `wait_for_ack`; peers spinning
 in `pt_lock` or their own shootdown) until all remote CPUs ack. Under heavy
 oversubscription that round-trip can exceed the threshold while still making
-progress, so the detector skips firing while
-`tlb_shootdown::TLB_SHOOTDOWN.pending_cpus != 0`. The shootdown's own
+progress, so the detector skips firing while `tlb_shootdown::any_pending()`
+reports any per-CPU request slot with CPUs still to ack. The shootdown's own
 escalation ladder (NMI backtrace at 0.75 s, panic at 5 s in arch
 `wait_for_ack`) is the authoritative detector for a genuinely stuck IPI; a
-non-shootdown stall re-checks on the next tick once `pending_cpus` clears.
+non-shootdown stall re-checks on the next tick once the pending slots drain.
 
 **Why kernel-side:** when every CPU is in kernel mode, no userspace monitor
 gets dispatched. The dump is also the only path that reads per-CPU

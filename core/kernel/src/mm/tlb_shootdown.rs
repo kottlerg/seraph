@@ -139,6 +139,8 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
         }
         let va = req.flush_va.load(Ordering::Acquire);
         let root = req.root_phys.load(Ordering::Acquire);
+        // Both `flush_va == u64::MAX` and `root_phys == 0` are full-flush
+        // sentinels per shootdown()'s contract; either alone selects flush_tlb_all.
         // SAFETY: caller guarantees IPI-handler context; flush_page /
         // flush_tlb_all are valid TLB primitives at ring 0 / S-mode. A per-VA
         // flush preserves global kernel entries that a full flush would discard.

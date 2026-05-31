@@ -184,10 +184,6 @@ impl AtomicCpuMask
     }
 
     /// Whether `cpu` is in the set.
-    // Used only by the riscv64 IPI handler, which multiplexes shootdown and
-    // wakeup on one software interrupt; the x86 handler has a dedicated
-    // shootdown vector and clears unconditionally.
-    #[allow(dead_code)]
     #[inline]
     pub fn test_cpu(&self, cpu: usize, order: Ordering) -> bool
     {

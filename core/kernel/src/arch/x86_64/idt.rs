@@ -474,7 +474,8 @@ isr_stub!(isr10, 10, has_error_code = true, ist = 0);
 isr_stub!(isr11, 11, has_error_code = true, ist = 0);
 isr_stub!(isr12, 12, has_error_code = true, ist = 0);
 isr_stub!(isr13, 13, has_error_code = true, ist = 0);
-isr_stub!(isr14, 14, has_error_code = true, ist = 0);
+// Vector 14 (#PF) has a dedicated stub — see `isr_page_fault` below — so a
+// spurious stale-TLB fault can be resolved and retried instead of killing.
 isr_stub!(isr15, 15, has_error_code = false, ist = 0);
 isr_stub!(isr16, 16, has_error_code = false, ist = 0);
 isr_stub!(isr17, 17, has_error_code = true, ist = 0);
@@ -758,6 +759,111 @@ extern "C" fn nm_handler()
     crate::percpu::preempt_enable();
 }
 
+/// Page-fault (`#PF`, vector 14) stub.
+///
+/// Saves the full [`ExceptionFrame`] (the hardware already pushed the error
+/// code; this stub pushes the vector), calls [`page_fault_handler`], then —
+/// reached only when the fault was a resolved spurious stale-TLB fault —
+/// restores the unmodified user register state and `iretq`s, re-executing the
+/// faulting instruction. For every genuine fault the handler diverges
+/// (`common_exception_handler` never returns) and the restore tail is dead.
+#[cfg(not(test))]
+#[unsafe(naked)]
+unsafe extern "C" fn isr_page_fault()
+{
+    core::arch::naked_asm!(
+        "push 14", // vector (hardware already pushed the error code)
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",
+        "call {handler}",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "add rsp, 16", // drop vector + error_code
+        "iretq",
+        handler = sym page_fault_handler,
+    );
+}
+
+/// Page-fault (`#PF`, vector 14) handler body.
+///
+/// Classifies the fault before the diverging common handler runs: a userspace
+/// fault whose faulting address (CR2) is mapped with permissions covering the
+/// access is a stale-TLB *spurious* fault — the live page tables already
+/// satisfy it (e.g. after a remote map/widen whose shootdown was elided). Such
+/// faults are resolved by a local `invlpg` and a return-to-retry; the stub's
+/// `iretq` re-executes the faulting instruction. Every other fault (genuine
+/// userspace fault, or any kernel fault) is handed to
+/// [`common_exception_handler`], which never returns.
+#[cfg(not(test))]
+extern "C" fn page_fault_handler(frame: *const ExceptionFrame)
+{
+    /// `#PF` error-code bits (Intel SDM Vol 3 §4.7).
+    const ERR_WRITE: u64 = 1 << 1;
+    const ERR_RSVD: u64 = 1 << 3;
+    const ERR_INSTR: u64 = 1 << 4;
+
+    // SAFETY: frame is constructed by isr_page_fault on this stack.
+    let f = unsafe { &*frame };
+    let from_user = (f.cs & 3) != 0;
+    // A reserved-bit violation is never a stale-TLB fault; only well-formed
+    // present/permission faults from userspace are retry candidates.
+    if from_user && f.error_code & ERR_RSVD == 0
+    {
+        let cr2: u64;
+        // SAFETY: CR2 holds the faulting linear address for a #PF; read-only at
+        // ring 0.
+        unsafe {
+            core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
+        }
+        let write = f.error_code & ERR_WRITE != 0;
+        let instr = f.error_code & ERR_INSTR != 0;
+        // SAFETY: ring 0; the faulting thread's CR3 is still active (no context
+        // switch since entry — the interrupt gate left IF=0).
+        if unsafe { super::paging::user_fault_is_spurious(cr2, write, instr) }
+        {
+            // SAFETY: ring 0; drops the stale TLB entry so the retried
+            // instruction re-walks the now-satisfying mapping.
+            unsafe {
+                super::paging::flush_page(cr2);
+            }
+            return;
+        }
+    }
+
+    // Not a recoverable spurious fault — kill (userspace) or fatal (kernel).
+    // SAFETY: frame is valid; common_exception_handler never returns.
+    unsafe {
+        common_exception_handler(frame);
+    }
+}
+
 /// TLB shootdown IPI handler stub (vector 250).
 ///
 /// Saves caller-clobbered registers, calls the Rust handler — which services
@@ -1017,7 +1123,7 @@ pub unsafe fn init()
     set(11, isr11, 0);
     set(12, isr12, 0);
     set(13, isr13, 0);
-    set(14, isr14, 0);
+    set(14, isr_page_fault, 0); // #PF — spurious stale-TLB faults retry
     set(15, isr15, 0);
     set(16, isr16, 0);
     set(17, isr17, 0);

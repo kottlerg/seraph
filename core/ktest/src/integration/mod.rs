@@ -30,10 +30,12 @@
 //! - `shared_frame_two_aspaces.rs` — one frame mapped into two `AddressSpace` caps; phys round-trip
 //! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
 //! - `fpu_survives_ipc_call.rs` — FP register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration
+//! - `fault_kills_thread.rs`     — a genuine userspace page fault terminates the thread with the right exit reason
 
 pub mod cap_delegation_chain;
 pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
+pub mod fault_kills_thread;
 pub mod fpu_survives_ipc_call;
 pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
@@ -82,5 +84,9 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fpu_survives_ipc_call",
         fpu_survives_ipc_call::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_kills_thread",
+        fault_kills_thread::run(ctx)
     );
 }

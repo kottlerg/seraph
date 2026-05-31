@@ -112,10 +112,11 @@ mechanism — but procmgr is the chooser from that point forward (see
 ### Init → remaining services
 
 Init requests procmgr to start only the bootstrap-essential services
-— devmgr, vfsd, optionally netd, real-logd, then svcmgr — by IPC to
+— devmgr, vfsd, optionally netd, then svcmgr — by IPC to
 procmgr's `CREATE_FROM_FILE` / `CREATE_PROCESS` endpoints. The
-non-bootstrap services (`timed`, `pwrmgr`, the staged test harnesses)
-are not in this list: svcmgr launches them itself post-handover from
+non-bootstrap services (`logd`, `timed`, `pwrmgr`, the staged test
+harnesses) are not in this list: svcmgr launches them itself
+post-handover from
 their `/config/svcmgr/services/*.svc` recipes. Nor is the per-arch RTC
 chip driver: devmgr spawns it during its enumeration sweep, and timed
 resolves it via `devmgr_labels::QUERY_RTC_DEVICE` at startup. For each
@@ -146,9 +147,9 @@ all svcmgr-supervised services live on disk at
 After Phase 3 signals `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
 replies immediately, then scans `/config/svcmgr/services/`, binds the
 endowed substrate bind-only, and launches every defined-but-unparked
-service — the `timed` and `pwrmgr` providers on a normal boot, plus any
-staged test recipes such as `svctest.svc` / `usertest.svc` and the
-co-staged `crasher.svc` restart fixture), init signs over its own
+service — `logd`, the `timed` and `pwrmgr` providers on a normal boot,
+plus any staged test recipes such as `svctest.svc` / `usertest.svc` and
+the co-staged `crasher.svc` restart fixture), init signs over its own
 kernel-object caps
 (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and
 every reclaimable Frame cap it solely owns (ELF segments, user stack
@@ -163,10 +164,15 @@ it lives in a single contiguous arena Frame cap that init forwards to
 memmgr as an in-use run at bootstrap (`finalize_memmgr`), so those pages
 are already accounted in memmgr's pool and never reach the reap route.
 
-Procmgr binds a death-EQ observer on init's main thread; on the death
-event procmgr tears down init's kernel objects in order (Threads →
-AddressSpace → donate Frame caps to memmgr → CSpace cascade), leaving
-zero init residue. The implementation is in
+Procmgr binds a death-EQ observer on **both** init threads (main +
+init-logd) and reaps only once both have exited — init is threadless. The
+main thread exits at the end of Phase 3, but init-logd keeps serving the
+master log endpoint until the svcmgr-launched real-logd pulls its
+handover, so it outlives main; reclaiming init's address space while a
+thread still runs in it would fault that thread. On the last death procmgr
+tears down init's kernel objects in order (Threads → AddressSpace → donate
+Frame caps to memmgr → CSpace cascade), leaving zero init residue. The
+implementation is in
 [`services/procmgr/README.md`](../services/procmgr/README.md) §"Init
 reap".
 

@@ -161,6 +161,10 @@ pub struct RestartRecipe
     pub env: Vec<String>,
     pub cwd: Option<String>,
     pub seed: Vec<String>,
+    /// The log-sink service: its restart bootstrap round is minted from the
+    /// reserved log-sink sources (with no `HANDOVER_PULL` SEND), not from
+    /// `seed`/provider caps. See `definitions::launch::mint_logd_boot_caps`.
+    pub log_sink: bool,
 }
 
 // ── Bootstrap (init → svcmgr handover endowment) ────────────────────────────
@@ -183,10 +187,17 @@ pub struct RestartRecipe
 //              `DRIVERS_DIR_AUTHORITY` SET_DRIVERS_DIR cap (0 if absent)
 //     data[1]: `SVCMGR_LABELS_VERSION` handshake
 //
-//   SUBSTRATE (one per init-bootstrapped service; last round is done):
+//   SUBSTRATE (one per init-bootstrapped service):
 //     caps[0]: the service's main thread cap (svcmgr binds death-
 //              notification on it at reconciliation)
 //     data[1]: name_len; data[2..]: name bytes (LE-packed)
+//
+//   LOGD_SOURCES (terminal round, done):
+//     caps[0]: reserved master-log endpoint source (svcmgr mints real-logd's
+//              RECV from it per launch, and the first-launch HANDOVER_PULL
+//              SEND); held for the system's life so it can relaunch logd
+//     caps[1]: token-0 `SEND|GRANT` source on procmgr's service endpoint
+//              (svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it)
 //
 // The substrate pairs land in `pending`; `HANDOVER_COMPLETE` later
 // reconciles them against `/config/svcmgr/services/`. log and procmgr
@@ -199,6 +210,9 @@ mod endow_kind
     pub const CAPS: u64 = 1;
     /// One substrate `(name, thread_cap)` registration.
     pub const SUBSTRATE: u64 = 2;
+    /// Terminal round: the reserved log-sink sources svcmgr mints real-logd's
+    /// bootstrap caps from on every (re)launch.
+    pub const LOGD_SOURCES: u64 = 3;
 }
 
 /// Well-known capability slots acquired from the handover endowment.
@@ -218,6 +232,14 @@ pub struct SvcmgrCaps
     /// and the `SET_DRIVERS_DIR` cap (`DRIVERS_DIR_AUTHORITY`) from it.
     /// Zero if absent.
     pub devmgr_registry: u32,
+    /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
+    /// real-logd's master-log RECV from it on every (re)launch, and the
+    /// one-shot `HANDOVER_PULL` SEND on the first launch. Holding it keeps the
+    /// log endpoint object alive across a logd crash. Zero if absent.
+    pub master_log_source: u32,
+    /// Token-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
+    /// real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch. Zero if absent.
+    pub procmgr_death_auth_source: u32,
 }
 
 /// Acquire svcmgr's initial cap set and substrate registrations from its
@@ -275,9 +297,28 @@ pub fn bootstrap_caps(
                     {
                         0
                     },
+                    master_log_source: 0,
+                    procmgr_death_auth_source: 0,
                 });
             }
             endow_kind::SUBSTRATE => ingest_substrate(&round, pending, pending_count),
+            endow_kind::LOGD_SOURCES =>
+            {
+                // Terminal round (arrives after CAPS). Record the reserved
+                // log-sink sources on the already-built cap set.
+                if let Some(c) = caps.as_mut()
+                {
+                    c.master_log_source = round.caps[0];
+                    c.procmgr_death_auth_source = if round.cap_count > 1
+                    {
+                        round.caps[1]
+                    }
+                    else
+                    {
+                        0
+                    };
+                }
+            }
             other => std::os::seraph::log!("bootstrap: unknown endowment kind {other}"),
         }
         if round.done

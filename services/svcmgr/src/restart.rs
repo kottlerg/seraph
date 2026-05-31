@@ -18,7 +18,9 @@
 //! restart cap set.
 
 use crate::REGISTRY_CAPACITY;
-use crate::definitions::launch::{assemble_boot_caps, build_blob, delete_caps, resolve_seeds};
+use crate::definitions::launch::{
+    assemble_boot_caps, build_blob, delete_caps, mint_logd_boot_caps, resolve_seeds,
+};
 use crate::service::{MAX_RESTARTS, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::{IpcMessage, procmgr_labels};
 
@@ -204,6 +206,15 @@ pub struct RestartCtx
     /// (`cap_create_endpoint`). One slab backs every `provides = ...`
     /// service's endpoint; sized for the handful of provider services.
     pub endpoint_slab: u32,
+    /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
+    /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
+    pub master_log_source: u32,
+    /// Token-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
+    /// real-logd's `DEATH_EQ_AUTHORITY` SEND from it.
+    pub procmgr_death_auth_source: u32,
+    /// Token-0 `SEND|GRANT` source on devmgr's registry endpoint. svcmgr mints
+    /// real-logd's `REGISTRY_QUERY_AUTHORITY` query cap from it.
+    pub devmgr_registry: u32,
 }
 
 /// Handle a service death detected via event queue notification.
@@ -355,74 +366,82 @@ fn restart_process(
         return false;
     }
 
-    // Assemble the restart bootstrap cap set. A service whose recipe
-    // declares `seed = ...` gets those seeds re-resolved from the registry
-    // by name, in declaration order — byte-for-byte the positional set
-    // first launch delivered (see `definitions::launch::launch`). Otherwise
-    // fall back to the stored bundle caps. In practice the fallback is
-    // empty: recipe-launched services carry seeds and no bundle, and the
-    // init-endowed substrate is delivered with only a thread cap (no
-    // bundle) — so this arm yields nothing for them. Each cap is freshly
-    // derived so the child owns its own copy.
-    let restart_caps: Vec<u32> = match recipe
+    // Assemble the restart bootstrap cap set. The log-sink service (real-logd)
+    // gets a freshly-minted round from the reserved log-sink sources, with no
+    // `HANDOVER_PULL` SEND — init-logd is long gone by any restart, so the
+    // restarted logd skips the history pull and takes over the log endpoint
+    // directly. Senders are unaffected: their SENDs target the endpoint
+    // object, and svcmgr's reserved source kept it alive across the crash.
+    //
+    // Otherwise: a recipe declaring `seed = ...` re-resolves those seeds from
+    // the registry by name, in declaration order — byte-for-byte the
+    // positional set first launch delivered. The fallback to stored bundle
+    // caps is empty in practice (recipe-launched services carry seeds and no
+    // bundle; the init-endowed substrate carries only a thread cap). A
+    // `provides` service's own service-endpoint RECV leads as cap[0]; the
+    // endpoint persists on the entry, so a fresh RECV reattaches the restarted
+    // instance to the same object consumers already hold a SEND on.
+    let boot_caps: Vec<u32> = if matches!(recipe, Some(r) if r.log_sink)
     {
-        Some(r) if !r.seed.is_empty() => resolve_seeds(&r.seed, svc.name_str(), registry),
-        _ =>
-        {
-            let mut caps: Vec<u32> = Vec::new();
-            for i in 0..(svc.bundle_count as usize)
-            {
-                if caps.len() >= syscall_abi::MSG_CAP_SLOTS_MAX
-                {
-                    break;
-                }
-                let entry = &svc.bundle[i];
-                if entry.cap == 0
-                {
-                    continue;
-                }
-                let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_SEND)
-                else
-                {
-                    std::os::seraph::log!("cannot derive bundle cap for restart");
-                    for &derived in &caps
-                    {
-                        if derived != 0
-                        {
-                            let _ = syscall::cap_delete(derived);
-                        }
-                    }
-                    let _ = syscall::cap_delete(new_thread_cap);
-                    return false;
-                };
-                caps.push(c);
-            }
-            caps
-        }
-    };
-
-    // A `provides` service's own service endpoint is bootstrap cap[0],
-    // ahead of its seeds — the same positional shape `launch::launch`
-    // delivers on first launch. The endpoint persists on the entry, so a
-    // fresh RECV derivation re-attaches the restarted instance to the same
-    // object consumers already hold a SEND on.
-    let provided_recv = if svc.provided_endpoint != 0
-    {
-        if let Ok(recv) = syscall::cap_derive(svc.provided_endpoint, syscall::RIGHTS_RECEIVE)
-        {
-            recv
-        }
-        else
-        {
-            std::os::seraph::log!("restart: provider RECV derive failed");
-            0
-        }
+        mint_logd_boot_caps(ctx, false)
     }
     else
     {
-        0
+        let restart_caps: Vec<u32> = match recipe
+        {
+            Some(r) if !r.seed.is_empty() => resolve_seeds(&r.seed, svc.name_str(), registry),
+            _ =>
+            {
+                let mut caps: Vec<u32> = Vec::new();
+                for i in 0..(svc.bundle_count as usize)
+                {
+                    if caps.len() >= syscall_abi::MSG_CAP_SLOTS_MAX
+                    {
+                        break;
+                    }
+                    let entry = &svc.bundle[i];
+                    if entry.cap == 0
+                    {
+                        continue;
+                    }
+                    let Ok(c) = syscall::cap_derive(entry.cap, syscall::RIGHTS_SEND)
+                    else
+                    {
+                        std::os::seraph::log!("cannot derive bundle cap for restart");
+                        for &derived in &caps
+                        {
+                            if derived != 0
+                            {
+                                let _ = syscall::cap_delete(derived);
+                            }
+                        }
+                        let _ = syscall::cap_delete(new_thread_cap);
+                        return false;
+                    };
+                    caps.push(c);
+                }
+                caps
+            }
+        };
+
+        let provided_recv = if svc.provided_endpoint != 0
+        {
+            if let Ok(recv) = syscall::cap_derive(svc.provided_endpoint, syscall::RIGHTS_RECEIVE)
+            {
+                recv
+            }
+            else
+            {
+                std::os::seraph::log!("restart: provider RECV derive failed");
+                0
+            }
+        }
+        else
+        {
+            0
+        };
+        assemble_boot_caps(provided_recv, restart_caps)
     };
-    let boot_caps = assemble_boot_caps(provided_recv, restart_caps);
 
     // SAFETY: ctx.ipc_buf is the registered IPC buffer.
     if unsafe {

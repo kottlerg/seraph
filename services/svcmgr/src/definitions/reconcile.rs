@@ -328,6 +328,7 @@ fn recipe_from(def: &Definition) -> RestartRecipe
         env: def.env.clone(),
         cwd: def.cwd.clone(),
         seed: def.seed.clone(),
+        log_sink: def.log_sink,
     }
 }
 

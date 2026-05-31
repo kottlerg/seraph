@@ -1,15 +1,22 @@
-# logd — log endpoint + arch serial-authority writer.
+# logd — the system log sink (real-logd).
 #
-# Init spawns logd at the end of Phase 2 from `/services/logd`, hands
-# over the master log endpoint RECV, the SEND for HANDOVER_PULL,
-# the DEATH_EQ_AUTHORITY-tokened SEND on procmgr, and the
-# arch-specific serial-authority cap (IoPortRange on x86-64,
-# SbiControl on RISC-V). Those caps are unreachable from svcmgr
-# post-handover, so `restart = never`. `critical = yes`: a dead
-# logd means no log destination — every subsequent log line
-# disappears, so the system is functionally blind. Graceful
-# shutdown is the right escape.
+# svcmgr launches and supervises logd post-handover, minting its bootstrap
+# round from the reserved log-sink sources init endows: the master log
+# endpoint RECV, a first-launch SEND for the HANDOVER_PULL of init-logd's
+# boot history, a DEATH_EQ_AUTHORITY SEND on procmgr (for sender slot
+# reclaim), and a devmgr.registry query cap (logd resolves the serial driver
+# via QUERY_SERIAL_DEVICE and routes output through it — it holds no UART
+# hardware). `log_sink = yes` selects this svcmgr-minted round in place of
+# seed / provides.
+#
+# `restart = on_failure`: svcmgr holds the master-log source for the system's
+# life, so a fresh logd re-attaches to the same endpoint object every log
+# sender already targets; a restart skips the one-shot history pull (no
+# init-logd remains) and serves a fresh table. `critical = yes`: a
+# permanently-down logd leaves the system blind, so graceful shutdown is the
+# right terminal escape once the restart budget is spent.
 binary    = /services/logd
-restart   = never
+restart   = on_failure
 critical  = yes
 namespace = none
+log_sink  = yes

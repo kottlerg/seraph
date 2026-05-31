@@ -406,6 +406,9 @@ fn event_loop(
         ipc_buf,
         deaths_eq,
         endpoint_slab,
+        master_log_source: caps.master_log_source,
+        procmgr_death_auth_source: caps.procmgr_death_auth_source,
+        devmgr_registry: caps.devmgr_registry,
     };
 
     loop

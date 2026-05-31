@@ -70,6 +70,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut cwd: Option<String> = None;
     let mut seed: Vec<String> = Vec::new();
     let mut provides: Vec<ProvidedName> = Vec::new();
+    let mut log_sink: Option<bool> = None;
 
     let mut seen_argv = false;
     let mut seen_env = false;
@@ -233,6 +234,25 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     ));
                 }
             }
+            "log_sink" =>
+            {
+                if log_sink.is_some()
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "log_sink"));
+                }
+                log_sink = Some(match value
+                {
+                    "yes" => true,
+                    "no" => false,
+                    _ =>
+                    {
+                        return Err(ParseError::InvalidValue(
+                            lineno,
+                            "log_sink must be yes or no",
+                        ));
+                    }
+                });
+            }
             other => return Err(ParseError::UnknownKey(lineno, other.to_owned())),
         }
     }
@@ -250,6 +270,18 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
+    let log_sink = log_sink.unwrap_or(false);
+    if log_sink && (!seed.is_empty() || !provides.is_empty())
+    {
+        // A log-sink service's bootstrap caps are minted by svcmgr from the
+        // reserved log-sink sources, so registry-resolved seeds / provided
+        // endpoints have no slot in its round.
+        return Err(ParseError::InvalidValue(
+            0,
+            "log_sink is exclusive of seed and provides",
+        ));
+    }
+
     Ok(Definition {
         name: name.to_owned(),
         binary,
@@ -261,6 +293,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         cwd,
         seed,
         provides,
+        log_sink,
     })
 }
 

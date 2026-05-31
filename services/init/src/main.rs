@@ -451,13 +451,12 @@ fn run(info_ptr: u64) -> !
     // log_ep) are satisfied so init's own subsequent log lines ride IPC
     // through the mediator instead of direct serial.
     //
-    // Real `logd` (loaded from `/services/logd` at the end of Phase 2,
-    // post-root-mount) takes over the receive side via the
+    // Real `logd` (svcmgr-launched post-handover from the reserved log-sink
+    // sources init endows) takes over the receive side via the
     // `log_labels::HANDOVER_PULL` exchange — see
-    // `service::create_and_start_logd` and
-    // `services/logd/docs/handover-protocol.md`. The same kernel
-    // endpoint object is reused, so every existing tokened SEND cap
-    // survives the handover unchanged.
+    // `services/logd/docs/handover-protocol.md`. The same kernel endpoint
+    // object is reused, so every existing tokened SEND cap survives the
+    // handover unchanged.
     let Ok(log_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
     {
@@ -466,8 +465,9 @@ fn run(info_ptr: u64) -> !
     };
 
     // Log thread cap retained so init's reap-handoff
-    // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it, letting procmgr
-    // reclaim the init-logd TCB after init's main thread exits.
+    // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it: procmgr binds a
+    // death-EQ on both init threads and reclaims the init-logd TCB once init
+    // is threadless (init-logd outlives main until real-logd's handover).
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
     let init_logd_thread_cap = logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap);
 
@@ -758,7 +758,7 @@ fn run(info_ptr: u64) -> !
 
     // vfsd self-mounts the root partition at `/` (and the ESP at `/esp`) on
     // its own startup, identifying partitions by GPT type-GUID; init issues
-    // no MOUNT. `/config/mounts.conf` and `INGEST_CONFIG_MOUNTS` are gone.
+    // no MOUNT and reads no mount-config file.
     //
     // Acquire init's seed system-root cap. vfsd serves this only once root
     // is mounted, so the call blocks until the root filesystem is up. The
@@ -774,32 +774,12 @@ fn run(info_ptr: u64) -> !
     }
     logging::log("phase 2: root available");
 
-    // ── Phase 2 epilogue: launch real logd ──────────────────────────────────
-    //
-    // Spawned at the end of Phase 2 (after root mount, with
-    // system_root_cap in hand) so logd can be walked from
-    // `/services/logd`. Hands over the master log endpoint via
-    // `HANDOVER_PULL` IPC inside logd's bootstrap; init-logd's
-    // receive loop self-terminates after replying the final chunk.
-    // From here on the same kernel endpoint object carries every
-    // sender's messages to real-logd's RECV — no live writer
-    // re-registers.
-    logging::log("phase 2: launching logd");
-    thread_caps.logd = service::create_and_start_logd(
-        endpoint_cap,
-        endpoint_cap,
-        init_bootstrap_ep,
-        log_ep,
-        devmgr_registry_ep,
-        system_root_cap,
-        info.cspace_cap,
-        ipc_buf,
-    )
-    .unwrap_or_else(|| {
-        logging::log("phase 2: logd launch failed; init-logd remains the receiver");
-        0
-    });
-
+    // init-logd (the serial-writer thread) serves the master log endpoint
+    // and writes serial directly until the svcmgr-launched real-logd pulls
+    // `HANDOVER_PULL`; it outlives init's main thread, so procmgr reaps init
+    // only once both init threads have exited (reap-on-threadless). svcmgr
+    // launches real-logd post-handover from the reserved log-sink sources
+    // endowed in Phase 3.
     logging::log("phase 2 bootstrap complete");
 
     // ── Phase 3: svcmgr, service registration, handover ────────────────────
@@ -817,6 +797,7 @@ fn run(info_ptr: u64) -> !
         svcmgr_service_ep,
         devmgr_registry_ep,
         system_root_cap,
+        log_ep,
         thread_caps,
         ipc_buf,
         init_logd_thread_cap,

@@ -8,9 +8,7 @@
 //! vfsd self-mounts the Seraph root partition at `/` (and the ESP at
 //! `/esp`) on its own startup, identifying partitions by GPT type-GUID
 //! (per-arch root via `boot_protocol::role_guids`, plus the standard
-//! EFI System Partition type). Init no longer issues a MOUNT request;
-//! the historic `INGEST_CONFIG_MOUNTS` IPC and `mounts.conf` ingest are
-//! likewise gone.
+//! EFI System Partition type). Init issues no MOUNT request.
 //!
 //! Init pulls a seed system-root cap from vfsd via `GET_SYSTEM_ROOT_CAP`
 //! (see [`request_system_root`]) and uses it both to walk binary paths

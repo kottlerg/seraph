@@ -12,6 +12,8 @@
 //! the freshly spawned child's thread cap so the caller can bind
 //! death-notification on it.
 
+use ipc::{devmgr_labels, procmgr_labels};
+
 use super::{Definition, NamespaceShape, ProvidedName};
 use crate::REGISTRY_CAPACITY;
 use crate::registry_lookup_derived;
@@ -92,6 +94,70 @@ pub(crate) fn assemble_boot_caps(provided_recv: u32, seeds: Vec<u32>) -> Vec<u32
     caps
 }
 
+/// Mint the four bootstrap caps real-logd expects, from the reserved
+/// log-sink sources svcmgr holds for the system's life:
+///   * `[0]` master-log endpoint RECV (svcmgr's source stays valid, so a
+///     fresh RECV reattaches each (re)launched logd to the same object that
+///     every sender's `log_send_cap` targets);
+///   * `[1]` a SEND on the same endpoint for the one-shot `HANDOVER_PULL`,
+///     present only on the first launch — a restart has no init-logd to pull
+///     from, so this is `0` and logd skips the history pull;
+///   * `[2]` a `DEATH_EQ_AUTHORITY` SEND on procmgr (logd registers sender
+///     death-notifications for slot reclaim) — `SEND|GRANT` because that
+///     registration transfers a cap;
+///   * `[3]` a `REGISTRY_QUERY_AUTHORITY` SEND on devmgr's registry (logd
+///     resolves the serial driver via `QUERY_SERIAL_DEVICE`).
+///
+/// A source absent from the endowment yields `0` in its slot; logd then
+/// degrades on first use of that cap. The four slots are positional, so
+/// zeros are preserved (the round still carries `MSG_CAP_SLOTS_MAX` caps).
+pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u32>
+{
+    let recv = if ctx.master_log_source != 0
+    {
+        syscall::cap_derive(ctx.master_log_source, syscall::RIGHTS_RECEIVE).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    let handover_send = if first_launch && ctx.master_log_source != 0
+    {
+        syscall::cap_derive(ctx.master_log_source, syscall::RIGHTS_SEND).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    let death_auth = if ctx.procmgr_death_auth_source != 0
+    {
+        syscall::cap_derive_token(
+            ctx.procmgr_death_auth_source,
+            syscall::RIGHTS_SEND_GRANT,
+            procmgr_labels::DEATH_EQ_AUTHORITY,
+        )
+        .unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    let registry_query = if ctx.devmgr_registry != 0
+    {
+        syscall::cap_derive_token(
+            ctx.devmgr_registry,
+            syscall::RIGHTS_SEND,
+            devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+        )
+        .unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    std::vec![recv, handover_send, death_auth, registry_query]
+}
+
 /// Publish each name in a provider's `provides` list under the discovery
 /// registry once the endpoint exists, so consumers launched after it
 /// resolve them. Each name's SEND is stamped with its
@@ -136,6 +202,66 @@ fn publish_provided(
             let _ = syscall::cap_delete(send);
         }
     }
+}
+
+/// Assemble the non-log-sink bootstrap cap set: create the persistent
+/// provider service endpoint (when `provides` is non-empty) so svcmgr owns the
+/// restart-stable source, resolve the `seed` caps, and lead with the provider
+/// RECV as cap[0] ahead of the positional seeds. Returns
+/// `(provided_endpoint, boot_caps)`; `provided_endpoint` is `0` for a pure
+/// consumer. Runs after namespace + death bind and before `START_PROCESS`, so
+/// any failure destroys the partial child and returns `None`.
+fn assemble_provided_boot_caps(
+    def: &Definition,
+    created: &CreatedProcess,
+    ctx: &RestartCtx,
+    registry: &mut registry::Registry<REGISTRY_CAPACITY>,
+) -> Option<(u32, Vec<u32>)>
+{
+    let provided_endpoint = if def.provides.is_empty()
+    {
+        0
+    }
+    else
+    {
+        let Ok(ep) = syscall::cap_create_endpoint(ctx.endpoint_slab)
+        else
+        {
+            std::os::seraph::log!("launch {}: provider endpoint create failed", def.name);
+            destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
+            return None;
+        };
+        ep
+    };
+
+    // Resolve seeds AFTER namespace setup so a seed-lookup miss does not leave a
+    // configured-but-orphan partial child; on failure we still tear down here.
+    let seed_caps = resolve_seeds(&def.seed, &def.name, registry);
+
+    // A provider's own service-endpoint RECV is cap[0], ahead of the positional
+    // seeds. Derive it before assembly so a derive failure tears the partial
+    // child down cleanly.
+    let provided_recv = if provided_endpoint != 0
+    {
+        let Ok(recv) = syscall::cap_derive(provided_endpoint, syscall::RIGHTS_RECEIVE)
+        else
+        {
+            std::os::seraph::log!("launch {}: provider RECV derive failed", def.name);
+            delete_caps(&seed_caps);
+            let _ = syscall::cap_delete(provided_endpoint);
+            destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
+            return None;
+        };
+        recv
+    }
+    else
+    {
+        0
+    };
+    Some((
+        provided_endpoint,
+        assemble_boot_caps(provided_recv, seed_caps),
+    ))
 }
 
 /// Spawn a service from its parsed `.svc` definition.
@@ -199,54 +325,18 @@ pub fn launch(
         return None;
     }
 
-    // A `provides` service serves its own service endpoint on bootstrap
-    // cap[0]. Create it now (after namespace + death bind, before seeds)
-    // so svcmgr owns the persistent source: the child receives a RECV
-    // derivation, consumers a published SEND, and a restart re-serves a
-    // fresh RECV on the same object. Created before START_PROCESS so a
-    // failure still lands on the destroyable partial child.
-    let provided_endpoint = if def.provides.is_empty()
+    // Bootstrap cap set + (for providers) the persistent service endpoint.
+    // The log-sink service (real-logd) gets a svcmgr-minted round from the
+    // reserved log-sink sources; the parser guarantees it declares neither
+    // `provides` nor `seed`, so it never enters the provider/seed path.
+    let (provided_endpoint, boot_caps) = if def.log_sink
     {
-        0
+        (0, mint_logd_boot_caps(ctx, true))
     }
     else
     {
-        let Ok(ep) = syscall::cap_create_endpoint(ctx.endpoint_slab)
-        else
-        {
-            std::os::seraph::log!("launch {}: provider endpoint create failed", def.name);
-            destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
-            return None;
-        };
-        ep
+        assemble_provided_boot_caps(def, &created, ctx, registry)?
     };
-
-    // Resolve seeds AFTER namespace setup so a seed-lookup miss does
-    // not leave a configured-but-orphan partial child; if the seed
-    // section fails, we still tear down here before launching.
-    let seed_caps = resolve_seeds(&def.seed, &def.name, registry);
-
-    // Bootstrap cap set: a provider's own service-endpoint RECV is cap[0],
-    // ahead of the positional seeds. Derive it before assembly so a derive
-    // failure tears the partial child down cleanly.
-    let provided_recv = if provided_endpoint != 0
-    {
-        let Ok(recv) = syscall::cap_derive(provided_endpoint, syscall::RIGHTS_RECEIVE)
-        else
-        {
-            std::os::seraph::log!("launch {}: provider RECV derive failed", def.name);
-            delete_caps(&seed_caps);
-            let _ = syscall::cap_delete(provided_endpoint);
-            destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
-            return None;
-        };
-        recv
-    }
-    else
-    {
-        0
-    };
-    let boot_caps = assemble_boot_caps(provided_recv, seed_caps);
 
     if !start_process(created.process_handle, ctx.ipc_buf)
     {

@@ -817,6 +817,12 @@ pub unsafe fn protect_user_page(
 /// TLB. Returns `Some((phys_addr, raw_pte_bits))` if the page is present at
 /// every level, or `None` if any level is not present.
 ///
+/// Assumes 4 KiB user leaves: it descends to the L0 level and does not treat a
+/// present R/W/X entry at an intermediate level as a mega/gigapage leaf. The
+/// user mapping path never installs a large leaf, so this holds for every user
+/// VA — the spurious-fault classifier relies on it. A caller that introduces
+/// user large pages must add a large-leaf branch here.
+///
 /// # Safety
 /// `root_virt` must be the direct-map virtual address of a valid 4 KiB L3
 /// page table frame.

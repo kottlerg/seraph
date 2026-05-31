@@ -262,8 +262,10 @@ fn teardown(
 // `bench_tlb_shootdown` above measures a single initiator (CPU 0) shooting down
 // `N` passive holders — the per-shootdown *hold* cost (IPI send + ack wait),
 // which scales with target count. This variant instead makes *every* pinned
-// worker an initiator: each loops map/unmap on its own VA and times its own
-// `mem_unmap`. With `W` concurrent initiators each publishing into its own
+// worker an initiator: each loops map/unmap on its own VA and times both its
+// own `mem_map` (a fresh map, whose remote shootdown the operation-class
+// elision skips) and its own `mem_unmap` (synchronous shootdown). With `W`
+// concurrent initiators each publishing into its own
 // per-CPU request slot, the only residual cross-initiator cost is the
 // same-address-space `pt_lock` and the ack tail, so the concurrent mean tracks
 // the single-initiator mean. This bench is the regression guard for that parity:
@@ -304,7 +306,16 @@ static CONC_LAT_MAX: AtomicU64 = AtomicU64::new(0);
 static CONC_LAT_SUM: AtomicU64 = AtomicU64::new(0);
 static CONC_LAT_CNT: AtomicU64 = AtomicU64::new(0);
 
-/// Fold one latency sample into the shared min/max/sum/count accumulators.
+/// Shared per-map latency accumulators (cycles). Each loop map is a *fresh* map
+/// (the VA was just unmapped), whose remote shootdown the operation-class
+/// elision skips — so this mean drops to ~bare-syscall cost while the unmap mean
+/// above still carries the synchronous shootdown. The gap is the elision win.
+static CONC_MAP_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
+static CONC_MAP_MAX: AtomicU64 = AtomicU64::new(0);
+static CONC_MAP_SUM: AtomicU64 = AtomicU64::new(0);
+static CONC_MAP_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Fold one unmap-latency sample into the shared min/max/sum/count accumulators.
 ///
 /// Relaxed is sufficient: the parent reads these only after every worker's
 /// `done`-bit handshake, and the `signal_send`/`signal_wait` round-trip
@@ -315,6 +326,15 @@ fn conc_fold(d: u64)
     CONC_LAT_CNT.fetch_add(1, Ordering::Relaxed);
     CONC_LAT_MIN.fetch_min(d, Ordering::Relaxed);
     CONC_LAT_MAX.fetch_max(d, Ordering::Relaxed);
+}
+
+/// Fold one map-latency sample; see [`conc_fold`] for the ordering rationale.
+fn conc_map_fold(d: u64)
+{
+    CONC_MAP_SUM.fetch_add(d, Ordering::Relaxed);
+    CONC_MAP_CNT.fetch_add(1, Ordering::Relaxed);
+    CONC_MAP_MIN.fetch_min(d, Ordering::Relaxed);
+    CONC_MAP_MAX.fetch_max(d, Ordering::Relaxed);
 }
 
 /// Concurrent-initiator worker. `arg` packs
@@ -347,11 +367,17 @@ fn conc_worker_entry(arg: u64) -> !
 
     for _ in 0..iters
     {
-        if syscall::mem_map(frame, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
+        // Time the map — a fresh map (the VA is unmapped at loop top), whose
+        // remote shootdown the operation-class elision skips.
+        let m0 = cycles_now();
+        let mr = syscall::mem_map(frame, aspace, va, 0, 1, syscall::MAP_WRITABLE);
+        let m1 = cycles_now();
+        if mr.is_err()
         {
             signal_send(done_slot, bit).ok();
             thread_exit();
         }
+        conc_map_fold(m1.saturating_sub(m0));
         // Time the unmap — the path that issues the shootdown IPI volley.
         let t0 = cycles_now();
         let r = syscall::mem_unmap(aspace, va, 1);
@@ -392,6 +418,10 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     CONC_LAT_MAX.store(0, Ordering::Release);
     CONC_LAT_SUM.store(0, Ordering::Release);
     CONC_LAT_CNT.store(0, Ordering::Release);
+    CONC_MAP_MIN.store(u64::MAX, Ordering::Release);
+    CONC_MAP_MAX.store(0, Ordering::Release);
+    CONC_MAP_SUM.store(0, Ordering::Release);
+    CONC_MAP_CNT.store(0, Ordering::Release);
 
     let Ok(ready) = cap_create_signal(ctx.memory_frame_base)
     else
@@ -516,6 +546,22 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         let _ = syscall::mem_unmap(ctx.aspace_cap, va, 1);
         // SAFETY: frame is from the pool and now unmapped (above).
         unsafe { crate::frame_pool::free(*fr) };
+    }
+
+    let map_cnt = CONC_MAP_CNT.load(Ordering::Acquire);
+    if let Some(map_mean) = CONC_MAP_SUM.load(Ordering::Acquire).checked_div(map_cnt)
+    {
+        // Fresh-map latency: with the shootdown elided this is ~bare syscall,
+        // well below the unmap (shootdown) mean below.
+        crate::log_u64(
+            "ktest: bench  conc_map_cycles_min=",
+            CONC_MAP_MIN.load(Ordering::Acquire),
+        );
+        crate::log_u64("ktest: bench  conc_map_cycles_mean=", map_mean);
+        crate::log_u64(
+            "ktest: bench  conc_map_cycles_max=",
+            CONC_MAP_MAX.load(Ordering::Acquire),
+        );
     }
 
     let cnt = CONC_LAT_CNT.load(Ordering::Acquire);

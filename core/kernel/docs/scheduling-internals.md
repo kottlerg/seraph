@@ -372,7 +372,7 @@ The kernel sends three IPIs. Each has a defined purpose and correctness role.
 
 | Vector | Constant | Purpose | Handler | Correctness role |
 |---|---|---|---|---|
-| 250 | `IPI_VECTOR_TLB_SHOOTDOWN` | TLB invalidation cascade | Flushes per-CPU TLB entries staged by the issuer. | Required: a writer that modifies a page-table entry MUST shoot down peer CPUs' TLBs before guaranteeing the change is observable. |
+| 250 | `IPI_VECTOR_TLB_SHOOTDOWN` | TLB invalidation cascade | Flushes per-CPU TLB entries staged by the issuer. | Required for rewrites that could strand a dangerous stale entry — unmap, permission narrowing, or frame replacement — where the stale entry would alias a freed/reused frame or grant revoked rights. Fresh maps and permission widenings skip the IPI and rely instead on the page-fault handler's spurious-fault retry (the live PTE already permits the access). |
 | 251 | `IPI_VECTOR_WAKEUP` | Wake target CPU from `hlt` | EOI only (no work). | Required for the wake protocol's "always-IPI" invariant. The handler does no real work; the IPI's value is the trap entry itself, which exits `hlt` and re-enters the idle loop's check. |
 
 ### riscv64

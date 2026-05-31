@@ -353,29 +353,40 @@ Threads in the same address space switching on the same CPU require no TLB opera
 ### SMP TLB Shootdown
 
 When a mapping is modified in an address space that has active threads on other CPUs,
-TLB entries on those CPUs must be invalidated. The protocol:
+stale TLB entries on those CPUs may need invalidation. The leaf PTE is edited under
+the per-address-space `pt_lock`, which is then **released before** any cross-CPU
+work: holding it across the IPI ack-wait would serialize every concurrent map/unmap
+on the address space behind cross-CPU latency.
+
+The shootdown itself is lock-free — there is no global shootdown lock and no IPI
+payload. Each CPU owns a request slot. The initiator publishes `(root, virt)` into
+its own slot, sets the pending bit of each target CPU, then sends the IPI:
 
 ```
-1. Acquire table_lock on the address space
-2. Modify the page table (map/unmap/protect)
-3. Read active_cpu_mask to determine which remote CPUs are affected
-4. For each affected remote CPU: send an IPI (Inter-Processor Interrupt)
-   with the address space pointer and virtual address to invalidate
-5. Wait for all targeted CPUs to acknowledge (spin on a per-CPU counter)
-6. Release table_lock
+1. Edit the leaf PTE under pt_lock; release pt_lock.
+2. Read active_cpu_mask; exclude the current CPU.
+3. Publish (root, virt) into this CPU's request slot and set each target's
+   pending bit (the bit doubles as the per-target liveness/ack token).
+4. Send the shootdown IPI to the targets and wait for every pending bit to clear.
 ```
 
-The IPI handler on each remote CPU:
+A target services the slot only once it observes its own pending bit set, so it never
+reads a half-published request; it flushes the named VA and clears its bit. Preemption
+stays disabled across the whole edit-then-shootdown sequence.
 
-```
-1. Receive the (address_space, virt_addr) from the IPI payload
-2. If the current address space matches: call Paging::flush_page(virt_addr)
-3. Increment the acknowledgement counter
-```
+The shootdown is **not** issued unconditionally. Each rewrite is classified as it
+commits (`MapOutcome`):
 
-If a CPU switches away from the affected address space between step 3 and step 5, its
-TLB entries for that space are irrelevant (a context switch performs the appropriate
-flush). The kernel checks for this case and skips the IPI for CPUs that have switched.
+- **Fresh** (no prior mapping) and **Widen** (same frame, strictly broader rights)
+  skip the remote shootdown. No remote CPU can hold an entry granting more than the
+  live PTE, so the worst case is a spurious fault the page-fault handler resolves by
+  re-walking the live PTE and retrying.
+- **Replace** (different frame, or a permission narrowing) issues the synchronous
+  shootdown above: a stale entry would alias a freed/reused frame or cache revoked
+  rights, which no retry can recover. `unmap` is always synchronous.
+
+A CPU that switches away from the address space before acking is harmless: a context
+switch reloads the page-table root and flushes that space's user entries.
 
 ### Direct Physical Map Access
 

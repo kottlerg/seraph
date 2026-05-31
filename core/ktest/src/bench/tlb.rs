@@ -263,11 +263,13 @@ fn teardown(
 // `N` passive holders — the per-shootdown *hold* cost (IPI send + ack wait),
 // which scales with target count. This variant instead makes *every* pinned
 // worker an initiator: each loops map/unmap on its own VA and times its own
-// `mem_unmap`. With `W` concurrent initiators, the global `SHOOTDOWN_LOCK`
-// serializes them, so each unmap's latency also includes the *lock-wait*. The
-// difference between this bench and `bench_tlb_shootdown` at the same CPU count
-// is the global-serialization penalty — the quantity issue #188 is about, and
-// the quantity a per-CPU-mailbox shootdown redesign would drive to zero.
+// `mem_unmap`. With `W` concurrent initiators each publishing into its own
+// per-CPU request slot, the only residual cross-initiator cost is the
+// same-address-space `pt_lock` and the ack tail, so the concurrent mean tracks
+// the single-initiator mean. This bench is the regression guard for that parity:
+// a change that reintroduced system-wide shootdown serialization (the issue #188
+// bottleneck) would show up as the concurrent mean diverging above
+// `bench_tlb_shootdown` at the same CPU count.
 //
 // Workers are pinned (CPUs `1..=W`, matching `bench_tlb_shootdown`) so each
 // `cycles_now()` bracket starts and ends on the same CPU — an unpinned worker

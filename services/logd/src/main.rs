@@ -6,7 +6,7 @@
 //! Seraph system log daemon — post-mount owner of the master log
 //! endpoint.
 //!
-//! Spawned by init at the end of Phase 2, real-logd:
+//! Launched and supervised by svcmgr, real-logd:
 //!
 //! 1. Receives via bootstrap protocol a RECV cap on the master log
 //!    endpoint, a SEND cap on the same endpoint (single-use, for the

@@ -78,13 +78,16 @@ transferring the RAM frame pool to memmgr and minting procmgr's
 `memmgr_endpoint_cap` so procmgr's std heap bootstrap finds memmgr on its
 first call. Init then requests procmgr to start the remaining early services
 (devmgr, svcmgr, drivers, vfsd, optionally netd), delegates the appropriate
-subsets of its initial capability set to each service, registers services
-with svcmgr, and exits.
+subsets of its initial capability set to each service, endows svcmgr with the
+handover endowment, and exits.
 
-At the end of init's Phase 2, init spawns real `logd` and hands it
-the receive side of the master log endpoint. The kernel endpoint
-object is unchanged across the transition, so existing tokened SEND
-caps continue to work without re-derivation. See
+Init runs a second thread, init-logd, that drains the master log endpoint and
+writes lines to serial directly from early boot onward. svcmgr launches and
+supervises the real `logd` post-handover, minting its bootstrap caps from the
+reserved log-sink sources init endows; the real `logd` then takes the receive
+side of the master log endpoint and pulls init-logd's captured history. The
+kernel endpoint object is unchanged across the transition, so existing tokened
+SEND caps continue to work without re-derivation. See
 [`services/logd/docs/handover-protocol.md`](../services/logd/docs/handover-protocol.md).
 
 The system-scope userspace boot order lives in

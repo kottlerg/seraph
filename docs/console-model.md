@@ -29,23 +29,38 @@ earlier ones, which remain as fallbacks.
    as the panic console. The kernel never becomes a client of the userspace
    serial or framebuffer driver.
 
-3. **init-logd direct-UART fallback** — during early userspace boot, before a
-   log daemon exists, init drains the master log endpoint and writes lines to
-   the UART directly (`services/init/src/logging.rs`). This path is
-   **permanent**, not transitional: it is the only writer before the serial
-   driver is up, and the fallback if the driver fails to come up. There is
-   no parallel init-logd direct-framebuffer path today; pre-driver
-   framebuffer writes are deferred to a future surface (see "Planned future
-   surface" in the framebuffer driver README).
+3. **init-logd direct-UART fallback** — during early userspace boot, the
+   init-logd thread (a second thread of the init process,
+   `services/init/src/logging.rs`) drains the master log endpoint and writes
+   lines to the UART directly. It owns console output from the moment init
+   spawns it through the entire init → svcmgr handover and svcmgr's reconcile,
+   until the svcmgr-launched real-logd assumes the endpoint's RECV and pulls
+   init-logd's captured history via `log_labels::HANDOVER_PULL` — at which
+   point init-logd self-terminates. This direct path is **permanent**, not
+   transitional: it is the only writer before the serial driver is up, and the
+   fallback if the driver fails to come up. There is no parallel init-logd
+   direct-framebuffer path today; pre-driver framebuffer writes are deferred
+   to a future surface (see "Planned future surface" in the framebuffer driver
+   README).
 
 4. **Serial-driver-mediated path** — once devmgr has spawned the serial driver
    (`services/drivers/serial/`), every userspace UART writer routes bytes to it
    via `serial_labels::SERIAL_WRITE_BYTES`. real-logd
-   (`services/logd/src/main.rs`) is the primary client: it resolves the
-   driver's write endpoint through devmgr's
-   `devmgr_labels::QUERY_SERIAL_DEVICE` and emits both received log lines and
-   its own diagnostics through it. No userspace process other than the serial
-   driver and init-logd holds UART hardware authority.
+   (`services/logd/src/main.rs`) is the primary client: svcmgr launches and
+   supervises it, it resolves the driver's write endpoint through devmgr's
+   `devmgr_labels::QUERY_SERIAL_DEVICE`, and it emits both received log lines
+   and its own diagnostics through it. No userspace process other than the
+   serial driver and init-logd holds UART hardware authority.
+
+   real-logd is restartable (`restart = on_failure`). svcmgr holds the
+   master-log endpoint source for the system's life, so a restarted logd
+   re-attaches a fresh RECV to the same endpoint object every sender already
+   targets; the log senders are uninterrupted across the restart and need no
+   re-derivation of their `log_send_cap`. A restarted logd re-resolves the
+   serial driver via `QUERY_SERIAL_DEVICE` and resumes serial-mediated output.
+   While logd is down, a sender's `STREAM_BYTES` queues at the kernel endpoint
+   until the restarted logd drains it; the kernel panic console remains the
+   guaranteed output path for any fault in that window.
 
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace

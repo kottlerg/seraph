@@ -86,7 +86,7 @@ pub struct StartupBlobs<'a>
 /// `START_PROCESS`.
 ///
 /// `path` is interpreted relative to svcmgr's own `root_dir_cap`
-/// (universal post-#21 init handover), so callers pass paths exactly
+/// (universal), so callers pass paths exactly
 /// as they appear in `.svc` files — e.g. `"/services/logd"`.
 ///
 /// `blobs` carries argv/env for the child. Both paths build them from

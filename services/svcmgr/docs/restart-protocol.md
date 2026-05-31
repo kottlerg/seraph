@@ -44,8 +44,8 @@ permanent loss*.
    * The restart-count budget (`MAX_RESTARTS`, currently `1`) is
      enforced here; an exhausted budget reports "max restarts reached,
      marking degraded" and returns false.
-   * A missing restart source (`module_cap == 0` AND
-     `vfs_path_len == 0`) reports "no restart source" and returns false.
+   * A missing restart source (`vfs_path_len == 0`) reports
+     "no restart source" and returns false.
 2. **Restart not permitted** → mark service inactive; route to
    `permanent_death_outcome`:
    * `system_critical` (`critical = yes`) → log `critical service
@@ -131,7 +131,7 @@ at reconciliation time. The fixed-size fields live on `ServiceEntry`:
 | `ns_policy_kind` / `ns_subtree_path` / `ns_subtree_rights` | `namespace = ...` |
 | `thread_cap` | endowment thread cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
 | `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
-| `module_cap` | `0` (no module-loaded services in the post-#21 model) |
+| `module_cap` | `0` (services restart from their `vfs_path`; no module caps are held) |
 
 The heap-backed launch surfaces that don't fit the fixed record are held
 in a parallel [`RestartRecipe`](../src/service.rs) table

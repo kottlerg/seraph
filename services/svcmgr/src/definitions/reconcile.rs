@@ -206,10 +206,10 @@ fn handle_definition(
         slot.consumed = true;
         log!("svcmgr: bind only: {}", def.name);
         // init-created service: svcmgr has no process_handle (init
-        // didn't share it). First death cannot DESTROY_PROCESS; this
-        // matches the pre-#21 shape — see `restart::restart_process`.
-        // Bind happens after the fact (the thread has been running
-        // since Phase 1/2/3 spawn) — a death in that window is lost.
+        // didn't share it). First death cannot DESTROY_PROCESS — see
+        // `restart::restart_process`. Bind happens after the fact (the
+        // thread has been running since its bootstrap spawn) — a death
+        // in that window is lost.
         // Closing that race is kernel-protocol work; tracked as a
         // follow-up.
         bind_only(

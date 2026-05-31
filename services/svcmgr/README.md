@@ -102,7 +102,7 @@ svcmgr/
 
 ## Namespace authority
 
-Init spawns svcmgr with the **universal** `system_root_cap` (post-#21).
+Init spawns svcmgr with the **universal** `system_root_cap`.
 svcmgr reads `/config/svcmgr/services/*.svc` directly via `std::fs`,
 walks the recipe's `binary` path for first-launch, and applies per-service
 namespace attenuation from each `.svc` `namespace = ...` line via

@@ -2,13 +2,25 @@
 
 Wire format for the one-shot init-logd → real-logd state transfer.
 
-Real-logd, on bootstrap, calls `log_labels::HANDOVER_PULL` repeatedly
-on its single-use SEND cap to the master log endpoint. Init-logd's
-receive loop, on seeing the label, replies one chunk at a time until
-its captured state is drained, then breaks its loop and calls
-`sys_thread_exit`. Real-logd's existing tokened SEND caps held by
-every other sender remain valid because the kernel endpoint object
-is unchanged across the transition.
+svcmgr launches and supervises real-logd, minting its bootstrap caps
+from the reserved log-sink sources init endows (see
+[`services/svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)).
+On its **first launch**, real-logd holds a single-use SEND cap on the
+master log endpoint (bootstrap `cap[1]`) and calls
+`log_labels::HANDOVER_PULL` repeatedly on it. Init-logd's receive loop,
+on seeing the label, replies one chunk at a time until its captured
+state is drained, then breaks its loop and calls `sys_thread_exit`.
+Real-logd's existing tokened SEND caps held by every other sender remain
+valid because the kernel endpoint object is unchanged across the
+transition.
+
+On a **restart**, svcmgr mints `cap[1] = 0`: init-logd exited after the
+first launch, so there is no handover source. The restarted logd skips
+the pull entirely (guarded on a non-zero `cap[1]`) and serves a fresh
+table on the same endpoint object — svcmgr holds the master-log source
+for the system's life, so the restarted logd's RECV re-attaches to the
+object every sender already targets. In-flight history from the prior
+instance is not recoverable.
 
 ## Call shape
 

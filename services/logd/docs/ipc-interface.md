@@ -11,13 +11,34 @@ logd additionally calls procmgr's
 [`procmgr_labels::REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md)
 once during its own startup; see that document for the wire format.
 
+## Bootstrap caps
+
+svcmgr launches and supervises real-logd, minting its bootstrap round —
+one round, `done = true`, four positional caps — from the reserved
+log-sink sources init endows it (see
+[`services/svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)).
+The shape mirrors the README's "Bootstrap caps" table:
+
+| Index | Cap |
+|---|---|
+| 0 | `RECV` on the master log endpoint |
+| 1 | `SEND` on the master log endpoint (single-use; `HANDOVER_PULL` only). `0` on a restart — no init-logd remains to pull from, so logd skips the history pull |
+| 2 | tokened `SEND` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
+| 3 | tokened `SEND` on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (resolves the serial driver via `QUERY_SERIAL_DEVICE`) |
+
+Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log
+source, so a restarted logd re-attaches its RECV to the same endpoint
+object every sender already targets. Only `cap[1]` differs across the two
+paths: present on the first launch (one-shot history pull from init-logd),
+`0` on a restart (history pull skipped, fresh table served).
+
 ## Endpoint
 
 | Cap holder | Right | Purpose |
 |---|---|---|
 | logd's main thread | `RECV` | drains the endpoint via `ipc_recv` inside the wait-set loop |
 | every userspace sender | `SEND` (tokened) | `STREAM_BYTES`, `STREAM_REGISTER_NAME` |
-| real-logd at bootstrap | `SEND` (un-tokened) | single-use `HANDOVER_PULL` to init-logd; deleted immediately after `DONE` |
+| real-logd on its first launch | `SEND` (un-tokened) | single-use `HANDOVER_PULL` to init-logd; deleted immediately after `DONE`. Absent (`cap[1] = 0`) on a restart |
 
 ## Labels accepted
 

@@ -890,8 +890,8 @@ pub fn create_svcmgr_from_file(
         let _ = syscall::cap_delete(reply_caps[1]);
     }
 
-    // Post-#21 svcmgr is the supervisor and holds the universal
-    // root: it reads `/config/svcmgr/services/*.svc` at handover,
+    // svcmgr is the supervisor and holds the universal root: it
+    // reads `/config/svcmgr/services/*.svc` at handover,
     // walks the recipe's `binary` path (typically
     // `/services/<name>` or `/programs/<name>`) for first-launch of
     // defined-but-unregistered services, and applies per-service

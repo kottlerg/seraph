@@ -121,7 +121,7 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 ///
 /// Returns the table entry's `CSpace` slot index, or `None` if no
 /// entry carries the requested name. This is init's only module-cap
-/// lookup; the v6 ordinal surface (`module_frame_base + N`) is gone.
+/// lookup; modules are addressed by name through the table.
 pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u32>
 {
     init_protocol::find_module_slot(info, name)
@@ -644,8 +644,7 @@ fn run(info_ptr: u64) -> !
     //       procmgr's CSpace by `bootstrap_procmgr`. Procmgr derives a
     //       tokened SEND per child for `ProcessInfo.service_registry_cap`.
     //
-    // No data words: procmgr no longer maintains a frame pool; every
-    // per-child allocation routes through memmgr.
+    // No data words: every per-child allocation routes through memmgr.
     let Ok(pm_service_cap_for_pm) = syscall::cap_derive(procmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
@@ -691,10 +690,8 @@ fn run(info_ptr: u64) -> !
     };
 
     // Derive a tokened call cap with the `SEED_AUTHORITY` bit set so vfsd's
-    // `GET_SYSTEM_ROOT_CAP` accepts the init request. `INGEST_AUTHORITY` is
-    // no longer needed (`INGEST_CONFIG_MOUNTS` was removed alongside
-    // `mounts.conf`); MOUNT is un-gated and keeps using the un-tokened
-    // service cap.
+    // `GET_SYSTEM_ROOT_CAP` accepts the init request. MOUNT is un-gated and
+    // uses the un-tokened service cap.
     let Ok(vfsd_seed_cap) = syscall::cap_derive_token(
         vfsd_service_ep,
         syscall::RIGHTS_SEND,

@@ -9,9 +9,12 @@
 //! `/config/svcmgr/services/<name>.svc`. The file is the **single
 //! source of truth** for the service's recipe: binary path, argv,
 //! env, restart policy, criticality, namespace shape, optional cwd,
-//! and the named seed caps to inject into its bootstrap round. The
-//! same definition drives both first-launch (when init didn't
-//! bootstrap the service) and restart (when init did).
+//! and the named seed caps to inject into its bootstrap round. A
+//! `log_sink = yes` recipe (the master log sink, real-logd) instead
+//! takes a svcmgr-minted bootstrap round from the reserved log-sink
+//! sources and declares neither `seed` nor `provides`. The same
+//! definition drives both first-launch (when init didn't bootstrap
+//! the service) and restart (when init did).
 //!
 //! At [`crate::svcmgr_labels::HANDOVER_COMPLETE`] svcmgr calls
 //! [`reconcile_and_launch`]:
@@ -146,6 +149,6 @@ pub struct ProvidedName
 }
 
 /// Directory svcmgr scans for service definitions. Absolute path
-/// against svcmgr's `system_root_cap`; post-#21 handover that cap is
-/// universal, so absolute lookups via `std::fs` resolve normally.
+/// against svcmgr's `system_root_cap`. That cap is universal, so
+/// absolute lookups via `std::fs` resolve normally.
 pub const SERVICES_DIR: &str = "/config/svcmgr/services";

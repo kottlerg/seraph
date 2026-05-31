@@ -255,9 +255,10 @@ pub mod procmgr_labels
     ///                  via IPC cap-transfer; procmgr accumulates them
     ///                  for the eventual `memmgr.DONATE_FRAMES` chunk.
     ///
-    /// Procmgr binds the death-EQ on init's main thread with correlator
-    /// `INIT_REAP_CORRELATOR` as part of the first round. Each round
-    /// replies `procmgr_errors::SUCCESS`.
+    /// Procmgr binds the death-EQ on both init threads (main and
+    /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
+    /// first round, and reaps once both have exited. Each round replies
+    /// `procmgr_errors::SUCCESS`.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
     /// Signal end of init's reap-handoff cap stream. After this call
@@ -1642,8 +1643,8 @@ pub mod svcmgr_errors
     /// Discovery registry publish: table full or duplicate name.
     pub const REGISTER_REJECTED: u64 = 6;
     /// Caller's compiled `SVCMGR_LABELS_VERSION` does not match the receiver's.
-    /// `REGISTER_SERVICE` is the handshake entry point and carries the
-    /// caller's version as `data[0]` (with all other words shifted by +1);
+    /// The handover-endowment `CAPS` round carries the caller's version
+    /// in `data[1]` (after the `endow_kind` discriminant in `data[0]`);
     /// mismatch here means the caller was built against a different
     /// revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;

@@ -57,6 +57,7 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `cwd` | no | Path interpreted relative to svcmgr's universal root. Forbidden when `namespace = none`. |
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name). |
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one tokened SEND per entry into the discovery registry. See [`provides`](#provides). |
+| `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 
 ## `restart`
 
@@ -106,7 +107,7 @@ The primary lever for confining a service to only what it needs.
 | Form | Effect |
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported`. Default tight choice for services with no filesystem dependency. |
-| `universal` | `cap_copy` of svcmgr's own root (post-#21: the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
+| `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
 | `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<rights>` is a `+`-joined list of named tokens (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown tokens are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
@@ -182,6 +183,43 @@ consumer's `QUERY_ENDPOINT` lookup unchanged):
 
 ```
 provides = pwrmgr.shutdown:auth pwrmgr.deny:deny
+```
+
+## `log_sink`
+
+`yes` marks the service as the system's master log sink — real-logd, the
+receive-side owner of the master log endpoint. Exactly one recipe carries
+`log_sink = yes`.
+
+A log-sink service's bootstrap round is **not** assembled from `seed` or
+`provides`. svcmgr mints it from the reserved log-sink sources init endows
+at handover (the master-log endpoint source and the procmgr `SEND|GRANT`
+death-auth source — see
+[`process-lifecycle.md`](../../../docs/process-lifecycle.md)) plus the
+`devmgr.registry` source. The round is four positional caps:
+
+| Index | Cap |
+|---|---|
+| 0 | `RECV` on the master log endpoint |
+| 1 | `SEND` on the master log endpoint (single-use; `HANDOVER_PULL` only). `0` on a restart — no init-logd remains to pull from |
+| 2 | tokened `SEND` on procmgr carrying `DEATH_EQ_AUTHORITY` (logd registers per-sender death-notifications for slot reclaim) |
+| 3 | tokened `SEND` on devmgr's registry carrying `REGISTRY_QUERY_AUTHORITY` (logd resolves the serial driver via `QUERY_SERIAL_DEVICE`) |
+
+Because these slots are svcmgr-minted, `seed` and `provides` have no
+position in the round; declaring either alongside `log_sink = yes` is a
+parser error. The same svcmgr-minted round drives both the first launch
+(`cap[1]` present, history pulled from init-logd) and every restart
+(`cap[1] = 0`, history pull skipped) — svcmgr holds the master-log source
+for the system's life, so each (re)launched logd re-attaches a fresh RECV
+to the same endpoint object every sender already targets. `restart` and
+`critical` behave exactly as for any other service.
+
+```
+binary    = /services/logd
+restart   = on_failure
+critical  = yes
+namespace = none
+log_sink  = yes
 ```
 
 ## Reconciliation

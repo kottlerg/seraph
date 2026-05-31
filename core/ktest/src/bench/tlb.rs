@@ -26,7 +26,7 @@
 //! yields and call `thread_exit` themselves. By the time the parent
 //! calls `cap_delete`, every worker is already Exited.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     cap_create_signal, cap_delete, signal_send, signal_wait, system_info, thread_exit, thread_yield,
@@ -255,4 +255,278 @@ fn teardown(
     }
     cap_delete(ready).ok();
     cap_delete(done).ok();
+}
+
+// ── Concurrent-initiator variant ───────────────────────────────────────────────
+//
+// `bench_tlb_shootdown` above measures a single initiator (CPU 0) shooting down
+// `N` passive holders — the per-shootdown *hold* cost (IPI send + ack wait),
+// which scales with target count. This variant instead makes *every* pinned
+// worker an initiator: each loops map/unmap on its own VA and times its own
+// `mem_unmap`. With `W` concurrent initiators, the global `SHOOTDOWN_LOCK`
+// serializes them, so each unmap's latency also includes the *lock-wait*. The
+// difference between this bench and `bench_tlb_shootdown` at the same CPU count
+// is the global-serialization penalty — the quantity issue #188 is about, and
+// the quantity a per-CPU-mailbox shootdown redesign would drive to zero.
+//
+// Workers are pinned (CPUs `1..=W`, matching `bench_tlb_shootdown`) so each
+// `cycles_now()` bracket starts and ends on the same CPU — an unpinned worker
+// could migrate mid-unmap and read two unsynchronized cycle counters.
+
+/// Distinct VA base for the concurrent bench (clear of `BENCH_VA`).
+const CONC_VA_BASE: u64 = 0x6400_0000;
+/// Per-worker VA stride (16-page spacing; matches the stress test).
+const CONC_VA_STRIDE: u64 = 0x1_0000;
+
+// Worker ceiling reuses `MAX_PINNED` so the thread/cspace arrays share the
+// `teardown` helper's fixed-size signature.
+static mut CONC_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; MAX_PINNED];
+
+/// Child-cspace slot of each worker's frame cap, indexed by worker bit-index.
+/// Set by the parent before starting each worker; read by the worker. (Arg
+/// packing has no room for both frame and aspace slots alongside the signal
+/// slots, so these go through statics.)
+static CONC_FRAME_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
+/// Child-cspace slot of each worker's aspace cap, indexed by worker bit-index.
+static CONC_ASPACE_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
+
+/// Release barrier: workers spin here after signalling ready so every worker
+/// starts its measured loop at the same instant (maximising overlap, which is
+/// the contention the bench measures).
+static CONC_GO: AtomicBool = AtomicBool::new(false);
+
+/// Shared per-unmap latency accumulators (cycles); workers fold via atomic
+/// add / min / max.
+static CONC_LAT_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
+static CONC_LAT_MAX: AtomicU64 = AtomicU64::new(0);
+static CONC_LAT_SUM: AtomicU64 = AtomicU64::new(0);
+static CONC_LAT_CNT: AtomicU64 = AtomicU64::new(0);
+
+/// Fold one latency sample into the shared min/max/sum/count accumulators.
+///
+/// Relaxed is sufficient: the parent reads these only after every worker's
+/// `done`-bit handshake, and the `signal_send`/`signal_wait` round-trip
+/// establishes the happens-before that publishes the folds.
+fn conc_fold(d: u64)
+{
+    CONC_LAT_SUM.fetch_add(d, Ordering::Relaxed);
+    CONC_LAT_CNT.fetch_add(1, Ordering::Relaxed);
+    CONC_LAT_MIN.fetch_min(d, Ordering::Relaxed);
+    CONC_LAT_MAX.fetch_max(d, Ordering::Relaxed);
+}
+
+/// Concurrent-initiator worker. `arg` packs
+/// `ready[15:0] | done[31:16] | bit_index[39:32] | iters[63:40]` — the
+/// iteration count is capped at the 24-bit lane (far above any bench `iters`).
+///
+/// Each worker sends its unique `1 << bit_index` on both `ready` and `done`;
+/// the kernel signal cap OR-accumulates, so identical bits from concurrent
+/// workers would collapse to one wakeup and hang the parent's wait loop.
+// cast_possible_truncation: packed fields fit their lanes by construction.
+#[allow(clippy::cast_possible_truncation)]
+fn conc_worker_entry(arg: u64) -> !
+{
+    let ready_slot = (arg & 0xFFFF) as u32;
+    let done_slot = ((arg >> 16) & 0xFFFF) as u32;
+    let bit_index = ((arg >> 32) & 0xFF) as usize;
+    let iters = (arg >> 40) & 0xFF_FFFF;
+    let bit = 1u64 << bit_index;
+
+    let frame = CONC_FRAME_SLOT[bit_index].load(Ordering::Acquire);
+    let aspace = CONC_ASPACE_SLOT[bit_index].load(Ordering::Acquire);
+    let va = CONC_VA_BASE + (bit_index as u64) * CONC_VA_STRIDE;
+
+    // Ready, then wait for the common GO so all initiators contend together.
+    signal_send(ready_slot, bit).ok();
+    while !CONC_GO.load(Ordering::Acquire)
+    {
+        let _ = thread_yield();
+    }
+
+    for _ in 0..iters
+    {
+        if syscall::mem_map(frame, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
+        {
+            signal_send(done_slot, bit).ok();
+            thread_exit();
+        }
+        // Time the unmap — the path that issues the shootdown IPI volley.
+        let t0 = cycles_now();
+        let r = syscall::mem_unmap(aspace, va, 1);
+        let t1 = cycles_now();
+        if r.is_err()
+        {
+            signal_send(done_slot, bit).ok();
+            thread_exit();
+        }
+        conc_fold(t1.saturating_sub(t0));
+    }
+
+    signal_send(done_slot, bit).ok();
+    thread_exit()
+}
+
+/// Concurrent-initiator TLB-shootdown latency bench (see module note above).
+#[allow(clippy::too_many_lines)] // setup + ready/go barrier + cooperative teardown.
+pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u32)
+{
+    log_bench_header("tlb_shootdown_concurrent", iters);
+
+    let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
+    crate::log_u64("ktest: bench  cpus=", cpus);
+    // cast_possible_truncation: cpus < 256 on every supported platform.
+    #[allow(clippy::cast_possible_truncation)]
+    let want = (cpus.saturating_sub(1) as usize).min(MAX_PINNED);
+    if want == 0
+    {
+        // UP guest: no remote CPU to shoot down, nothing to contend on.
+        crate::log_u64("ktest: bench  conc_workers=", 0);
+        return;
+    }
+
+    // Reset shared state so a re-run starts clean.
+    CONC_GO.store(false, Ordering::Release);
+    CONC_LAT_MIN.store(u64::MAX, Ordering::Release);
+    CONC_LAT_MAX.store(0, Ordering::Release);
+    CONC_LAT_SUM.store(0, Ordering::Release);
+    CONC_LAT_CNT.store(0, Ordering::Release);
+
+    let Ok(ready) = cap_create_signal(ctx.memory_frame_base)
+    else
+    {
+        return;
+    };
+    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
+    else
+    {
+        cap_delete(ready).ok();
+        return;
+    };
+
+    // One pool frame per worker.
+    let mut frames = [0u32; MAX_PINNED];
+    let mut allocated = 0usize;
+    for f in frames.iter_mut().take(want)
+    {
+        match crate::frame_pool::alloc()
+        {
+            Some(fr) =>
+            {
+                *f = fr;
+                allocated += 1;
+            }
+            None => break,
+        }
+    }
+
+    let mut threads = [0u32; MAX_PINNED];
+    let mut cspaces = [0u32; MAX_PINNED];
+    let mut spawned = 0usize;
+    for i in 0..allocated
+    {
+        let Ok(child) = spawn::new_child(ctx)
+        else
+        {
+            break;
+        };
+        let Ok(child_ready) = syscall::cap_copy(ready, child.cs, 1 << 7)
+        else
+        {
+            cap_delete(child.th).ok();
+            cap_delete(child.cs).ok();
+            break;
+        };
+        let Ok(child_done) = syscall::cap_copy(done, child.cs, 1 << 7)
+        else
+        {
+            cap_delete(child.th).ok();
+            cap_delete(child.cs).ok();
+            break;
+        };
+        let Ok(child_frame) = syscall::cap_copy(frames[i], child.cs, syscall::RIGHTS_ALL)
+        else
+        {
+            cap_delete(child.th).ok();
+            cap_delete(child.cs).ok();
+            break;
+        };
+        let Ok(child_aspace) = syscall::cap_copy(ctx.aspace_cap, child.cs, syscall::RIGHTS_ALL)
+        else
+        {
+            cap_delete(child.th).ok();
+            cap_delete(child.cs).ok();
+            break;
+        };
+
+        CONC_FRAME_SLOT[i].store(child_frame, Ordering::Release);
+        CONC_ASPACE_SLOT[i].store(child_aspace, Ordering::Release);
+
+        // SAFETY: bench tier runs sequentially; this is the only use of
+        // CONC_STACKS[i].
+        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(CONC_STACKS[i]) });
+        // i < allocated ≤ want ≤ cpus-1, so CPU index i+1 is online.
+        #[allow(clippy::cast_possible_truncation)]
+        let cpu = (i + 1) as u32;
+        let arg = u64::from(child_ready)
+            | (u64::from(child_done) << 16)
+            | ((i as u64) << 32)
+            | (u64::from(iters & 0xFF_FFFF) << 40);
+        if spawn::configure_and_start_pinned(&child, conc_worker_entry, stack_top, arg, cpu)
+            .is_err()
+        {
+            cap_delete(child.th).ok();
+            cap_delete(child.cs).ok();
+            break;
+        }
+        threads[i] = child.th;
+        cspaces[i] = child.cs;
+        spawned += 1;
+    }
+
+    crate::log_u64("ktest: bench  conc_workers=", spawned as u64);
+
+    // Wait for every worker's unique ready bit, then release them together.
+    if spawned > 0
+    {
+        let all_ready = (1u64 << spawned) - 1;
+        let mut ready_bits: u64 = 0;
+        while ready_bits & all_ready != all_ready
+        {
+            ready_bits |= signal_wait(ready).unwrap_or(0);
+        }
+    }
+    CONC_GO.store(true, Ordering::Release);
+
+    // Cooperative teardown: wait every worker's done bit (each is about to
+    // thread_exit), then delete caps — no cap_delete races a running worker.
+    teardown(&threads, &cspaces, spawned, ready, done);
+
+    for (i, fr) in frames.iter().enumerate().take(allocated)
+    {
+        // Defensively unmap each worker's VA before returning the frame to the
+        // pool: a worker that hit an (unexpected) mem_unmap error exits with its
+        // VA still mapped, and frame_pool::free requires the frame unmapped.
+        // mem_unmap is idempotent, so this is a no-op for the normal path and
+        // for frames whose worker never spawned.
+        // cast_possible_truncation: i < allocated ≤ MAX_PINNED.
+        #[allow(clippy::cast_possible_truncation)]
+        let va = CONC_VA_BASE + (i as u64) * CONC_VA_STRIDE;
+        let _ = syscall::mem_unmap(ctx.aspace_cap, va, 1);
+        // SAFETY: frame is from the pool and now unmapped (above).
+        unsafe { crate::frame_pool::free(*fr) };
+    }
+
+    let cnt = CONC_LAT_CNT.load(Ordering::Acquire);
+    if let Some(mean) = CONC_LAT_SUM.load(Ordering::Acquire).checked_div(cnt)
+    {
+        crate::log_u64(
+            "ktest: bench  conc_cycles_min=",
+            CONC_LAT_MIN.load(Ordering::Acquire),
+        );
+        crate::log_u64("ktest: bench  conc_cycles_mean=", mean);
+        crate::log_u64(
+            "ktest: bench  conc_cycles_max=",
+            CONC_LAT_MAX.load(Ordering::Acquire),
+        );
+    }
 }

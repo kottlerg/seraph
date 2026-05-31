@@ -156,9 +156,9 @@ racing `sys_thread_set_priority` taking the all-CPU-locks region sees
 no scheduler claim the TCB in its locate scan; it writes the new
 priority and falls through without relocating. The pending
 `enqueue_and_wake` then reads `(*tcb).priority` under the destination
-lock — the post-fix `enqueue_and_wake` no longer takes a caller-supplied
-priority — and links the TCB at whichever value was last committed
-under lock. No desync results.
+lock — `enqueue_and_wake` takes no caller-supplied priority — and links
+the TCB at whichever value was last committed under lock. No desync
+results.
 
 `migrate_ready_thread` (`core/kernel/src/sched/mod.rs`) is the other
 known consumer of this transient. Under both source and destination
@@ -433,7 +433,7 @@ Pairing table for every load-bearing atomic in the scheduling and IPC paths. "Lo
 | `has_observer` (Signal) + `bits` Dekker pair | `ipc/signal.rs:54` (decl) | Relaxed store on `:231` (signal_wait), Relaxed load on `:118` (signal_send) | (same) | Paired SeqCst fences in `signal_send` (`:115`, between `bits.fetch_or` and `has_observer.load`) and `signal_wait` (`:234`, between `has_observer.store` and `bits.swap`) form the Dekker pattern: either `signal_send` observes `has_observer == 1` and falls through to the slow path lock acquisition, or `signal_wait`'s swap observes the OR'd bits and returns without parking. The fences are the only ordering edge; weakening to plain `Acquire`/`Release` is **insufficient** because the read-and-write sites span two distinct atomics. |
 | `RESCHEDULE_PENDING` bit (per CPU) | (same as first row) | (same) | (same) | (single entry, listed once.) |
 | `BOOT_TRANSIENT_ACTIVE` | `sched/mod.rs` (decl) | Release on `init_storage` (set true) and `sched::enter` (set false) | Acquire on every `timer_tick` entry | Single-writer (BSP). The Release/Acquire pair gates `timer_tick` against firing during Phase 4–9 when the run queue and scheduler state have not yet stabilised. |
-| `CPU_LOAD[cpu]` | `sched/run_queue.rs:35` (decl) | Relaxed on `increment_load`, `decrement_load` | Relaxed on `current_load` | Advisory: `select_target_cpu` and the periodic load balancer consult this; transient inconsistency does not violate correctness. The counter MUST track queue occupancy: every `enqueue` increments, every `dequeue_highest` / `remove_from_queue` decrements (the latter was historically a no-op — fixed in #22/#23). |
+| `CPU_LOAD[cpu]` | `sched/run_queue.rs:35` (decl) | Relaxed on `increment_load`, `decrement_load` | Relaxed on `current_load` | Advisory: `select_target_cpu` and the periodic load balancer consult this; transient inconsistency does not violate correctness. The counter MUST track queue occupancy: every `enqueue` increments, every `dequeue_highest` / `remove_from_queue` decrements. |
 | `LOAD_BALANCE_TICK` | `sched/mod.rs` (decl, balancer) | Relaxed on `fetch_add` (sole writer is the loaded-path victim selection in `try_pull_balance`) | Relaxed on the same `fetch_add` (consumes the previous value) | Advisory random-victim seed; correctness does not depend on ordering — a stale value just biases victim selection slightly. |
 | `NEXT_THREAD_ID` | `sched/mod.rs` (counter) | Relaxed on `fetch_add` | n/a | Monotonic counter; no synchronisation needed. |
 | `CPU_COUNT` | `sched/mod.rs:124` | Relaxed on store (`init_storage`) | Relaxed on every read | Single-writer at boot; the SCHEDULERS_PTR Release publishes the storage; readers establish happens-before via the pointer load, not via CPU_COUNT itself. |

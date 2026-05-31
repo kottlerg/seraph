@@ -1759,8 +1759,8 @@ impl IpcMessage
     /// (`idx >= MSG_DATA_WORDS_MAX`). Reading past the sender's declared
     /// `word_count()` returns zero — the unused array slots are zero-init
     /// and the kernel does not write them past the declared range. This
-    /// matches the old `IpcBuf::read_word` contract so protocols that
-    /// carry optional trailing words at fixed offsets keep working.
+    /// is a deliberate contract so protocols that carry optional trailing
+    /// words at fixed offsets keep working.
     #[must_use]
     pub fn word(&self, idx: usize) -> u64
     {

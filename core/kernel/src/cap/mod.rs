@@ -129,20 +129,17 @@ pub unsafe fn root_cspace_mut() -> Option<&'static mut CSpace>
 ///
 /// IDs are recycled via the [`CSPACE_FREE_LIST`] free list once
 /// [`free_cspace_id`] runs at the end of a `CSpace`'s `dealloc_object` pass,
-/// so this is a live-count bound — not the cumulative-ever bound it used to
-/// be under the pre-#137 monotonic allocator. Per-id generation counters in
-/// [`CSPACE_REGISTRY`] make any pre-existing stale `SlotId` resolution fail
-/// fast on epoch mismatch, so recycling cannot mis-target a recycled
-/// tenant. The pre-unregister derivation drain (`dealloc_object` for
-/// `CSpaceObj`) additionally scrubs the back-links in steady state.
+/// so this is a live-count bound, not a cumulative-ever bound. Per-id
+/// generation counters in [`CSPACE_REGISTRY`] make any stale `SlotId`
+/// resolution fail fast on epoch mismatch, so recycling cannot mis-target a
+/// recycled tenant. The pre-unregister derivation drain (`dealloc_object`
+/// for `CSpaceObj`) additionally scrubs the back-links in steady state.
 ///
-/// Live-count peaks in ktest stress today sit in the low hundreds; 4096
-/// gives 10–40× headroom while reclaiming ~432 KiB of BSS the
-/// pre-#137 65536-entry registry burned (65536 × 8 B = 512 KiB old
-/// registry vs 4096 × 16 B = 64 KiB new registry + 4096 × 4 B = 16 KiB
-/// free list = 80 KiB total; 512 − 80 = 432 KiB net). A future workload
-/// that genuinely needs more live `CSpace`s only has to bump this
-/// constant — no layout, ABI, or algorithmic change is required.
+/// Live-count peaks in ktest stress sit in the low hundreds; 4096 gives
+/// 10–40× headroom. The registry (4096 × 16 B = 64 KiB) plus the free list
+/// (4096 × 4 B = 16 KiB) cost 80 KiB of BSS. A future workload that needs
+/// more live `CSpace`s only has to bump this constant — no layout, ABI, or
+/// algorithmic change is required.
 const MAX_CSPACES: usize = 4096;
 
 /// High-water mark for the bump-allocator side of `alloc_cspace_id` — only
@@ -291,8 +288,7 @@ pub fn alloc_cspace_id() -> Option<CSpaceId>
 ///
 /// The host-side test path doesn't exercise the lock primitive or the BSS
 /// free list (no SMP, no interrupts), and tests only ever create the single
-/// root CSpace before tearing down. The simple monotonic allocator matches
-/// the pre-#137 behavior exactly.
+/// root CSpace before tearing down. A simple monotonic allocator suffices.
 #[cfg(test)]
 pub fn alloc_cspace_id() -> Option<CSpaceId>
 {
@@ -1927,9 +1923,7 @@ fn read_dtb_totalsize(phys: u64) -> Option<u64>
 ///
 /// Updates `layout.module_names` / `layout.module_name_count` and
 /// appends [`CapDescriptor`] entries for each module. Init looks
-/// modules up by name via the published `module_names` table; the
-/// older `module_frame_base` / `module_frame_count` ordinal surface
-/// was retired with the init-protocol v6→v7 bump.
+/// modules up by name via the published `module_names` table.
 fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
     use boot_protocol::BootModule;

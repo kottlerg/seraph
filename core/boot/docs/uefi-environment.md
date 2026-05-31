@@ -50,8 +50,7 @@ reading. Files are read into physical memory allocated by `AllocatePages`; see
 The bootloader carries only two ESP path constants —
 `\EFI\seraph\kernel` and `\EFI\seraph\bootstrap.bundle` — both
 hardcoded in [`boot/src/main.rs`](../src/main.rs). There is no on-disk
-boot configuration file (`boot.conf` was retired alongside the
-boot-protocol v7 → v8 bump); the bundle is the single composed artifact
+boot configuration file; the bundle is the single composed artifact
 that carries init plus every userspace module the system needs. The
 bundle format itself is specified in
 [`abi/boot-protocol/src/bundle.rs`](../../../abi/boot-protocol/src/bundle.rs).

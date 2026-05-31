@@ -439,8 +439,8 @@ Set a file's length. Token = file cap with `WRITE`.
 
 v1 supports only `new_len == 0`; non-zero replies `IO_ERROR`. The
 wire shape is forward-compatible with later extend-with-zero-fill
-semantics, tracked by the post-#8 `ruststd::fs` completeness-gaps
-Issue. The truncate-to-zero path frees the entire FAT cluster chain
+semantics, tracked by the `ruststd::fs` completeness-gaps issue. The
+truncate-to-zero path frees the entire FAT cluster chain
 and patches the directory entry's first-cluster + size fields to 0.
 
 **Errors**: `INVALID_TOKEN`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,

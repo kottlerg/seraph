@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! Stress test: repeated `CSpace` create + delete past the old cumulative bound.
+//! Stress test: repeated `CSpace` create + delete past the live-count bound.
 //!
-//! Before #137, `CSpaceId` allocation was monotonic (`fetch_add`) and the
-//! namespace was bounded by *cumulative* creates, not live count. The
-//! pre-#137 ceiling was `MAX_CSPACES = 65536`; the ramped ktest sequence
-//! peaked at ~14k cumulative `CSpace`s, with 4× headroom.
-//!
-//! Recycling makes the namespace bounded by *live* count. To prove it, we
-//! create and immediately destroy 10000 `CSpace`s in a tight loop. With
-//! `MAX_CSPACES = 4096` (post-#137), this iteration count is 2.4× the
+//! `CSpaceId`s are recycled via a free list, so the `CSpace` namespace is
+//! bounded by *live* count, not by *cumulative* creates. To prove recycling
+//! holds, this test creates and immediately destroys 10000 `CSpace`s in a
+//! tight loop. With `MAX_CSPACES = 4096`, this iteration count is 2.4× the
 //! ceiling; if recycling were broken, `cap_create_cspace` would surface
 //! `SyscallError::OutOfMemory` at iteration ~4096 and the loop would fail
 //! its first negative return.

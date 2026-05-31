@@ -267,7 +267,7 @@ fn teardown(
 // serializes them, so each unmap's latency also includes the *lock-wait*. The
 // difference between this bench and `bench_tlb_shootdown` at the same CPU count
 // is the global-serialization penalty — the quantity issue #188 is about, and
-// the quantity Phase 2 (per-CPU mailbox) drives to zero.
+// the quantity a per-CPU-mailbox shootdown redesign would drive to zero.
 //
 // Workers are pinned (CPUs `1..=W`, matching `bench_tlb_shootdown`) so each
 // `cycles_now()` bracket starts and ends on the same CPU — an unpinned worker
@@ -303,6 +303,10 @@ static CONC_LAT_SUM: AtomicU64 = AtomicU64::new(0);
 static CONC_LAT_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// Fold one latency sample into the shared min/max/sum/count accumulators.
+///
+/// Relaxed is sufficient: the parent reads these only after every worker's
+/// `done`-bit handshake, and the `signal_send`/`signal_wait` round-trip
+/// establishes the happens-before that publishes the folds.
 fn conc_fold(d: u64)
 {
     CONC_LAT_SUM.fetch_add(d, Ordering::Relaxed);
@@ -312,7 +316,12 @@ fn conc_fold(d: u64)
 }
 
 /// Concurrent-initiator worker. `arg` packs
-/// `ready[15:0] | done[31:16] | bit_index[39:32] | iters[63:40]`.
+/// `ready[15:0] | done[31:16] | bit_index[39:32] | iters[63:40]` — the
+/// iteration count is capped at the 24-bit lane (far above any bench `iters`).
+///
+/// Each worker sends its unique `1 << bit_index` on both `ready` and `done`;
+/// the kernel signal cap OR-accumulates, so identical bits from concurrent
+/// workers would collapse to one wakeup and hang the parent's wait loop.
 // cast_possible_truncation: packed fields fit their lanes by construction.
 #[allow(clippy::cast_possible_truncation)]
 fn conc_worker_entry(arg: u64) -> !
@@ -492,10 +501,18 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     // thread_exit), then delete caps — no cap_delete races a running worker.
     teardown(&threads, &cspaces, spawned, ready, done);
 
-    for fr in frames.iter().take(allocated)
+    for (i, fr) in frames.iter().enumerate().take(allocated)
     {
-        // SAFETY: frame is from the pool and unmapped by its worker's final
-        // loop iteration (or never mapped if the worker failed early).
+        // Defensively unmap each worker's VA before returning the frame to the
+        // pool: a worker that hit an (unexpected) mem_unmap error exits with its
+        // VA still mapped, and frame_pool::free requires the frame unmapped.
+        // mem_unmap is idempotent, so this is a no-op for the normal path and
+        // for frames whose worker never spawned.
+        // cast_possible_truncation: i < allocated ≤ MAX_PINNED.
+        #[allow(clippy::cast_possible_truncation)]
+        let va = CONC_VA_BASE + (i as u64) * CONC_VA_STRIDE;
+        let _ = syscall::mem_unmap(ctx.aspace_cap, va, 1);
+        // SAFETY: frame is from the pool and now unmapped (above).
         unsafe { crate::frame_pool::free(*fr) };
     }
 

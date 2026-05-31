@@ -504,6 +504,29 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
         // Check if the fault came from U-mode (SPP bit 8 = 0) or S-mode (SPP = 1).
         let is_userspace = (sstatus_val & (1 << 8)) == 0;
 
+        // Spurious stale-TLB retry: a U-mode page fault (instruction=12,
+        // load=13, store/AMO=15) whose faulting address is already mapped with
+        // sufficient permissions in the live tables is a stale TLB entry (e.g.
+        // after a remote map/widen whose shootdown was elided). Flush it
+        // locally and re-execute the instruction (sepc not advanced) instead
+        // of killing the thread. Genuine faults fall through to the kill path.
+        if is_userspace && matches!(cause_code, 12 | 13 | 15)
+        {
+            let write = cause_code == 15;
+            let instr = cause_code == 12;
+            // SAFETY: S-mode; the faulting hart's satp is still active (no
+            // context switch since trap entry — SIE is clear).
+            if unsafe { super::paging::user_fault_is_spurious(frame.stval, write, instr) }
+            {
+                // SAFETY: S-mode; drops the stale TLB entry so the retried
+                // instruction re-walks the now-satisfying mapping.
+                unsafe {
+                    super::paging::flush_page(frame.stval);
+                }
+                return;
+            }
+        }
+
         if is_userspace
         {
             // SAFETY: current_tcb() returns this CPU's running thread; valid

@@ -9,8 +9,12 @@
 //! CPUs and performing map/unmap operations that trigger inter-processor
 //! interrupts (IPIs) for TLB invalidation.
 //!
-//! Since ktest runs without page fault handlers, we cannot directly test that
-//! a stale TLB entry causes a fault. Instead, this test verifies that:
+//! ktest threads run in user mode, so a stale-TLB access the shootdown failed
+//! to flush would surface as a page fault. The kernel retries only faults the
+//! live tables already satisfy; an access to an entry that should have been
+//! invalidated terminates the thread (the kill path is covered by
+//! `integration::fault_kills_thread`). This test does not construct such a
+//! window — it verifies that:
 //!
 //! 1. Repeated map/unmap cycles across CPUs complete without deadlock
 //! 2. Threads on different CPUs can safely access newly mapped memory
@@ -185,10 +189,10 @@ fn tlb_worker_thread(p2c_slot: u64) -> !
         {
             // Page is mapped. Access it (read) to load TLB entry.
             //
-            // SAFETY: Parent maps TEST_VA before signaling 0x2. If TLB
-            // shootdown is broken, we'd read stale data or fault after
-            // unmap, but since ktest has no fault handler, we just trust
-            // the kernel correctly invalidated our cached entry.
+            // SAFETY: Parent maps TEST_VA before signaling 0x2. The parent's
+            // prior-cycle unmap shot down this hart's entry, so the read sees
+            // the fresh mapping; a broken shootdown would instead fault here
+            // and terminate this thread.
             let ptr = TEST_VA as *const u64;
             // SAFETY: TEST_VA is mapped by parent; see comment above.
             let _value = unsafe { ptr.read_volatile() };

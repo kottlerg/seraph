@@ -901,6 +901,66 @@ pub unsafe fn translate_user_page(root_virt: u64, virt: u64) -> Option<(u64, u64
     Some((leaf.phys_addr(), leaf.0))
 }
 
+// ── Spurious-fault classification ─────────────────────────────────────────────
+
+/// Whether a leaf PTE grants a user-mode access of the given class.
+///
+/// `write` = the faulting access was a write; `instr` = an instruction fetch
+/// (mutually: a plain read has both false). A user page fault is *spurious*
+/// (stale TLB) only when the live PTE is present, user-accessible, and already
+/// grants the access — on x86 every present page is readable, so a read needs
+/// only presence; a write needs `WRITABLE`; a fetch needs NX clear.
+fn pte_permits_user_access(pte: u64, write: bool, instr: bool) -> bool
+{
+    /// User/Supervisor bit — the page is reachable from ring 3.
+    const USER: u64 = 1 << 2;
+
+    if pte & PRESENT == 0 || pte & USER == 0
+    {
+        return false;
+    }
+    if instr
+    {
+        pte & NO_EXECUTE == 0
+    }
+    else if write
+    {
+        pte & WRITABLE != 0
+    }
+    else
+    {
+        true
+    }
+}
+
+/// Classify a userspace page fault at `va` as a spurious stale-TLB fault.
+///
+/// Walks the *current* (CR3) page tables for `va` and returns `true` iff `va`
+/// is mapped, user-accessible, and the live leaf PTE permits the faulting
+/// access — meaning the fault must be a stale TLB entry the CPU resolves on
+/// retry after a local `invlpg`. Returns `false` for any genuine fault
+/// (unmapped, or the live mapping still forbids the access); the caller then
+/// kills the faulting thread. Because a `true` result requires the live PTE to
+/// grant the access (and x86 updates A/D in hardware), the retried instruction
+/// is guaranteed to make progress — no retry counter is needed.
+///
+/// # Safety
+/// Must run at ring 0 in the faulting thread's context, i.e. before CR3 has
+/// been changed by a context switch.
+#[cfg(not(test))]
+pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool
+{
+    // SAFETY: ring 0; reads CR3 to recover the active page-table root.
+    let root_phys = unsafe { read_root_phys() };
+    let root_virt = crate::mm::paging::phys_to_virt(root_phys);
+    // SAFETY: root_virt is the direct-map VA of the active PML4.
+    match unsafe { translate_user_page(root_virt, va) }
+    {
+        Some((_pa, pte)) => pte_permits_user_access(pte, write, instr),
+        None => false,
+    }
+}
+
 // ── TLB flush operations ──────────────────────────────────────────────────────
 
 /// Flush all TLB entries by reloading CR3.
@@ -1066,5 +1126,45 @@ mod tests
     {
         // VA = 0x0000_0000_0012_3456: bits [20:12] = 0x123 = 291
         assert_eq!(pt_index(0x0000_0000_0012_3000), 0x123);
+    }
+
+    // ── Spurious-fault classification ──────────────────────────────────────────
+
+    const USER_BIT: u64 = 1 << 2;
+
+    #[test]
+    fn permits_read_of_present_user_page()
+    {
+        let pte = PRESENT | USER_BIT | NO_EXECUTE; // R-- (NX, not writable)
+        assert!(pte_permits_user_access(pte, false, false));
+    }
+
+    #[test]
+    fn permits_write_only_when_writable()
+    {
+        let ro = PRESENT | USER_BIT | NO_EXECUTE;
+        let rw = PRESENT | USER_BIT | WRITABLE | NO_EXECUTE;
+        assert!(!pte_permits_user_access(ro, true, false));
+        assert!(pte_permits_user_access(rw, true, false));
+    }
+
+    #[test]
+    fn permits_fetch_only_when_executable()
+    {
+        let nx = PRESENT | USER_BIT | NO_EXECUTE;
+        let exec = PRESENT | USER_BIT; // NX clear
+        assert!(!pte_permits_user_access(nx, false, true));
+        assert!(pte_permits_user_access(exec, false, true));
+    }
+
+    #[test]
+    fn rejects_non_user_and_absent_pages()
+    {
+        // Present + writable but supervisor-only: a user access is genuine.
+        let kernel = PRESENT | WRITABLE;
+        assert!(!pte_permits_user_access(kernel, false, false));
+        // Not present: genuine fault regardless of other bits.
+        let absent = USER_BIT | WRITABLE;
+        assert!(!pte_permits_user_access(absent, false, false));
     }
 }

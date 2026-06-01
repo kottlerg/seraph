@@ -19,7 +19,7 @@ runtimes (`ruststd` and `libc`).
 - Minimal, modular microkernel; most functionality in userspace
 - Capability-based security model throughout
 - Clear component boundaries with explicit IPC contracts
-- Architecture-specific code isolated behind shared traits
+- Architecture-specific code isolated behind a shared arch-dispatch surface
 - Self-hosting as a long-term goal
 
 The framing above and these goals are summarized from [docs/architecture.md](docs/architecture.md);

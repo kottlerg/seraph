@@ -10,7 +10,7 @@ kernel mechanisms and userspace policy.
 - Minimal, modular microkernel; most functionality in userspace
 - Capability-based security model throughout
 - Clear component boundaries with explicit IPC contracts
-- Architecture-specific code isolated behind shared traits
+- Architecture-specific code isolated behind a shared arch-dispatch surface
 - Self-hosting as a long-term goal
 
 Seraph defines its own native interfaces; POSIX API compatibility is not
@@ -227,7 +227,7 @@ a capability; threads MUST hold a valid capability to access any resource.
 Seraph targets 64‑bit architectures with modern MMU and privilege support.
 
 **x86‑64**
-Uses APIC and PCIDs. IOMMU hardware, when present, is discovered and
+Uses APIC. IOMMU hardware, when present, is discovered and
 programmed by devmgr in userspace; the kernel does not touch it.
 
 **RISC‑V**

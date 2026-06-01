@@ -115,24 +115,24 @@ level using the NX bit (x86-64) and the equivalent execute permission control on
 RISC-V. The kernel image itself follows W^X: text is executable but not writable;
 data and heap are writable but not executable.
 
-### TLB Management — PCIDs and ASIDs
+### TLB Management
 
-Context switches between processes normally require a full TLB flush, discarding all
-cached address translations. This is expensive on multi-core systems with large working
-sets.
+A context switch to a different address space performs a full TLB flush. The kernel does
+not use hardware address-space tags (x86-64 PCIDs, RISC-V ASIDs); switching the page-table
+root discards the outgoing space's cached user translations:
 
-Both architectures provide hardware tags for TLB entries:
-- **x86-64:** Process-Context Identifiers (PCIDs) — 12-bit tag per address space
-- **RISC-V:** Address Space Identifiers (ASIDs) — width is implementation-defined,
-  typically 16 bits on RV64
+- **x86-64:** the switch writes CR3 with `CR4.PCIDE` clear, which flushes all non-global
+  TLB entries.
+- **RISC-V:** the switch writes `satp` with ASID 0 and executes `sfence.vma`.
 
-The kernel assigns a PCID/ASID to each address space. On context switch, the
-incoming PCID/ASID is loaded without a full flush — the hardware retains and correctly
-disambiguates cached translations from multiple address spaces. A global flush is only
-required when an address space's PCID/ASID is recycled.
+A switch between threads that share an address space requires no TLB operation.
+Single-address invalidation after a mapping change uses `invlpg` (x86-64) or
+`sfence.vma <va>` (RISC-V); cross-CPU invalidation uses the SMP shootdown protocol
+described in the kernel memory-internals document.
 
-PCID/ASID availability is detected at boot. The kernel falls back to full TLB flushes
-on hardware that does not support them.
+Tagged TLBs would let context switches retain cached translations across address spaces and
+avoid the per-switch flush. They are not implemented; the optimization is tracked as future
+work in [#198](https://github.com/kottlerg/seraph/issues/198).
 
 ### Kernel Isolation — SMEP and SMAP
 

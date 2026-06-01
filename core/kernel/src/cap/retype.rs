@@ -36,8 +36,12 @@
 //! offsets that the lists thread together), but the *head pointers and
 //! bump cursor* live in kernel memory. Userspace `sys_mem_map` writes
 //! against the cap's region therefore cannot corrupt allocator metadata;
-//! they can at worst overwrite a freed offset's `(next, size)` cell —
-//! detected by the bounded-walk corruption check in `try_alloc_page_block`.
+//! they can at worst overwrite a freed offset's link cell. Both allocation
+//! paths validate every inline link before dereferencing it: the page path
+//! via the bounds/iteration-cap walk in `try_alloc_page_block`, the sub-page
+//! path via `subpage_link_ok` in `try_pop_subpage`. A corrupt link is
+//! rejected (the affected list is truncated to `FREE_LIST_END` and the
+//! request falls through to bump allocation), never dereferenced.
 //!
 //! ## Concurrency
 //!
@@ -46,6 +50,13 @@
 //! mutations use atomic `fetch_*` and don't require the lock (callers
 //! reading `available` without the lock get a snapshot, which is exactly
 //! what they want for budget queries).
+//!
+//! [`retype_allocate`] and [`retype_free`] additionally take the cap's read
+//! lock ([`FrameReadGuard`](crate::cap::object::FrameReadGuard)) for their
+//! whole body, because both compare allocator state against `frame.size`
+//! (`retype_allocate`'s bump bound; `retype_free`'s drain-reset) and
+//! `sys_frame_split`/`sys_frame_merge` mutate `frame.size` under the cap
+//! write lock. Lock order: cap-rwlock outer, allocator spinlock inner.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -576,6 +587,16 @@ pub fn current_bump(frame: &FrameObject) -> u64
 pub fn retype_free(frame: &FrameObject, offset: u64, bytes: u64)
 {
     let need = round_to_class(bytes);
+
+    // Read-lock the cap for the duration: the drain-reset below compares
+    // `prev_avail + need` against `frame.size`, and a concurrent
+    // `sys_frame_split`/`sys_frame_merge` mutates `frame.size` under the cap
+    // write lock. Lock order matches `retype_allocate`: cap-rwlock outer,
+    // allocator spinlock inner. Deadlock-free — no `retype_free` caller holds
+    // the ancestor cap rwlock (the dealloc cascade releases `DERIVATION_LOCK`
+    // before invoking this, and reads the immutable `frame.base` without it).
+    let _frame_guard = crate::cap::object::FrameReadGuard::acquire(frame);
+
     let alloc = &frame.allocator;
 
     alloc.lock();

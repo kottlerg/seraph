@@ -11,17 +11,21 @@
 //! those bytes live inline in the Frame's backing region — which a holder can
 //! map writable via `sys_mem_map`. This test seeds bin 0's free list with one
 //! freed slot (offset 0) while keeping a second object live so the list is not
-//! reset by a full drain, clobbers that slot's link cell through a writable
-//! mapping with a bogus out-of-range value, then drives another sub-page
-//! retype. The allocator must reject the corrupt link and fall back to bump
-//! allocation rather than dereferencing it — which would fault the kernel and
-//! prevent the run from ever reaching its terminal marker.
+//! reset by a full drain, then clobbers that slot's link cell — the successor
+//! pointer of the list head — through a writable mapping with a bogus
+//! out-of-range value, and drives another sub-page retype. The allocator pops
+//! the still-valid head (offset 0), reads the clobbered successor, rejects it
+//! (bounds/alignment guard), and truncates the list to empty — returning the
+//! valid head WITHOUT dereferencing the poison. Pre-guard the kernel followed
+//! the poison as a pointer, faulted on the load, and never reached the run's
+//! terminal marker.
 //!
-//! Regression for the `try_pop_subpage` bounds/alignment guard in
-//! `core/kernel/src/cap/retype.rs`.
+//! Regression for the `try_pop_subpage` link guard in
+//! `core/kernel/src/cap/retype.rs` (specifically its successor-validation
+//! branch; the sibling head-validation branch is the same guard applied to
+//! the list head).
 
-use syscall::{cap_create_endpoint, cap_delete, mem_map, mem_unmap};
-use syscall_abi::MAP_WRITABLE;
+use syscall::{MAP_WRITABLE, cap_create_endpoint, cap_delete, mem_map, mem_unmap};
 
 use crate::{TestContext, TestResult};
 
@@ -59,10 +63,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     mem_unmap(ctx.aspace_cap, CLOBBER_VA, 1)
         .map_err(|_| "integration::retype_subpage_clobber: mem_unmap failed")?;
 
-    // Drive another sub-page retype. The allocator pops bin 0, reads the
-    // clobbered link, and must reject it (bounds/alignment guard) and fall back
-    // to bump allocation — NOT dereference POISON. Reaching this line with `Ok`
-    // is the pass criterion; pre-guard the kernel faults here and never returns.
+    // Drive another sub-page retype. The allocator pops the valid head
+    // (offset 0), reads the clobbered successor link, and must reject it
+    // (bounds/alignment guard) — truncating the list rather than dereferencing
+    // POISON. Reaching this line with `Ok` is the pass criterion; pre-guard the
+    // kernel follows POISON as a pointer, faults here, and never returns.
     let d = cap_create_endpoint(frame)
         .map_err(|_| "integration::retype_subpage_clobber: post-clobber retype faulted/failed")?;
 

@@ -722,9 +722,11 @@ pub fn sys_frame_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// - Agree on `owns_memory`.
 /// - Be siblings under the same derivation parent.
 /// - Have no derivation children of their own.
-/// - The tail must be virgin (no live retypes — `allocator == null` and
-///   `available_bytes == size` for retypable caps; non-retypable caps
-///   trivially satisfy this).
+/// - The tail must be virgin (no live retypes): its allocator bump cursor is
+///   at the base (`current_bump == 0`) and `available_bytes == size` for
+///   retypable caps (`== 0` for non-retypable caps, which trivially satisfy
+///   this). `retype_free`'s drain-reset restores `bump == 0` once the last
+///   retyped object is freed, so a fully-drained tail is mergeable again.
 ///
 /// Returns 0 on success. The parent's slot index is unchanged; the tail's
 /// slot is returned to the caller's `CSpace` free list.

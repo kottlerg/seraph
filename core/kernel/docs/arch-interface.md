@@ -6,16 +6,17 @@ by architecture-neutral code through a single module-boundary dispatch surface.
 ---
 
 All architecture-specific behaviour in the Seraph kernel lives under `kernel/src/arch/`.
-Architecture-neutral code reaches it exclusively through the `arch::current` module alias —
-calling `arch::current::<module>::<function>` — and never contains `#[cfg(target_arch)]`
-guards. The single `#[cfg(target_arch)]` site is `arch/mod.rs`, which selects the active
-architecture's module as `current`.
+Architecture-neutral code reaches it through the `arch::current` module alias — calling
+`arch::current::<module>::<function>`. `arch/mod.rs` selects the active architecture's
+module as `current` via `#[cfg(target_arch)]`.
 
 The dispatch surface is **free functions and concrete types grouped into per-concern
-submodules**, not cross-architecture traits. `docs/coding-standards.md` §C permits exactly
-this: the arch-dispatch surface may be "traits, type aliases, or re-exports", and a module
-boundary that re-exports per-architecture free functions satisfies the rule. There are no
-`trait`/`impl` definitions anywhere under `arch/`.
+submodules**, not cross-architecture traits. `docs/coding-standards.md` §C permits this —
+the arch-dispatch surface may be "traits, type aliases, or re-exports", and a module
+boundary that re-exports per-architecture free functions satisfies the rule — and requires
+architecture-neutral code to route arch divergence through the surface rather than
+`#[cfg(target_arch)]` blocks. There are no `trait` definitions or trait `impl`s under
+`arch/`; inherent `impl` blocks on concrete types (`SavedState`, `TrapFrame`, …) are normal.
 
 Every function in the dispatch surface MUST be defined on every supported architecture
 (§C). The completeness check is the per-architecture build: if a surface function is
@@ -153,8 +154,10 @@ pub unsafe fn rebase_boot_stack(direct_map_base: u64);
 `PageFlags` (`mm::paging`) is an architecture-neutral bitfield with fields `readable`,
 `writable`, `executable`, and `uncacheable`. `readable` is meaningful only on RISC-V (x86-64
 has no read-disable bit); `uncacheable` sets PCD|PWT on x86-64 and is a documentation marker
-under Sv48-without-Svpbmt on RISC-V. W^X is enforced in the arch mapping code: a
-simultaneously writable-and-executable request is rejected.
+under Sv48-without-Svpbmt on RISC-V. W^X is enforced at the memory syscall layer
+(`syscall::mem` map/protect reject a writable-and-executable request with
+`SyscallError::WxViolation`); the arch mapping primitives require the caller to have already
+validated W^X.
 
 ---
 
@@ -237,13 +240,12 @@ pub unsafe fn send_wakeup_ipi(target_hw_id: u32);
 /// Spin until `cond` holds, escalating (resend IPIs → NMI backtrace → panic) per
 /// the timing ladder described by `ctx`. Used by the shootdown initiator's wait.
 pub unsafe fn wait_for_ack(cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>);
-
-/// Allocate per-CPU NMI-backtrace storage during boot.
-pub fn init_nmi_backtrace_storage(cpu_count: usize, allocator: &mut BuddyAllocator);
 ```
 
 External-IRQ routing is performed through arch-private modules (`ioapic::route` on x86-64;
 the PLIC path on RISC-V) and is not part of the cross-architecture contract surface.
+NMI-backtrace storage allocation (`init_nmi_backtrace_storage`) is likewise x86-64-private
+(no RISC-V counterpart; its caller is `#[cfg(target_arch = "x86_64")]`-gated).
 
 ---
 

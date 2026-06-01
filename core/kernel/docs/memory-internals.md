@@ -1,9 +1,9 @@
 # Memory Subsystem Internals
 
 This document covers the implementation of the kernel's memory subsystem. The design
-goals (higher-half layout, buddy + slab allocation, W^X enforcement, PCID/ASID
-management) are specified in [docs/memory-model.md](../../../docs/memory-model.md). This
-document describes how those goals are realised in code.
+goals (higher-half layout, buddy + slab allocation, W^X enforcement, TLB management) are
+specified in [docs/memory-model.md](../../../docs/memory-model.md). This document
+describes how those goals are realised in code.
 
 The memory subsystem comprises five components:
 
@@ -11,7 +11,7 @@ The memory subsystem comprises five components:
 2. **Slab allocator** — fixed-size kernel object allocation
 3. **Size-class allocator** — general variable-size kernel heap
 4. **Address space management** — per-process virtual address space objects
-5. **TLB management** — PCID/ASID allocation, shootdown protocol
+5. **TLB management** — local invalidation, full-flush context switch, and SMP shootdown
 
 ---
 
@@ -268,18 +268,20 @@ Each process virtual address space is represented by an `AddressSpace` object:
 ```rust
 pub struct AddressSpace
 {
-    /// Root page table frame (physical address of the PML4 / root Sv48 table).
-    root_table: PhysAddr,
+    /// Physical address of the root page table frame (PML4 / Sv48 root).
+    root_phys: u64,
 
-    /// Assigned PCID/ASID. None if not yet assigned or after recycling.
-    pcid: Option<u16>,
+    /// Virtual address of the root frame (via the direct physical map).
+    root_virt: u64,
 
-    /// Reference count: number of threads currently running in this address space.
-    /// Used to determine when a shootdown IPI is necessary.
-    active_cpu_mask: AtomicU64,  // bitmask of CPUs running threads in this space
+    /// Set of CPUs currently running threads in this address space (bit N = CPU
+    /// N has this AS active). Queried by TLB shootdown to pick IPI targets.
+    active_cpus: AtomicCpuMask,
 
-    /// Lock protecting page table modifications.
-    table_lock: Spinlock,
+    /// CAS spin lock serialising page-table modifications. Does NOT disable
+    /// interrupts (shootdown needs IF=1 to deliver IPIs); preemption is held off
+    /// by the caller.
+    pt_lock: AtomicBool,
 }
 ```
 
@@ -290,15 +292,16 @@ pub struct AddressSpace
    shared PML4/root entry), allocate an `AddressSpace` from the slab cache.
 
 2. **Use**: threads reference the `AddressSpace` via their TCB. When scheduled, the
-   scheduler calls `Paging::activate(table, pcid)` to switch the hardware page table.
+   scheduler calls `arch::current::paging::activate(root_phys)` to switch the hardware
+   page table.
 
 3. **Modification** (`SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`): acquire
-   `table_lock`, call `Paging::map`/`unmap`/`protect`, then perform TLB management
-   (see TLB Management section below).
+   `pt_lock`, call `arch::current::paging::map_user_page`/`unmap_user_page`/
+   `protect_user_page`, then perform TLB management (see TLB Management section below).
 
 4. **Destruction**: when the last capability to the address space is deleted, all
-   page table frames are freed to the buddy allocator, the `AddressSpace` object is
-   freed to the slab cache, and the PCID/ASID is returned to the pool.
+   page table frames are freed to the buddy allocator and the `AddressSpace` object is
+   freed to the slab cache.
 
 ### Fork-Like Operations
 
@@ -308,47 +311,23 @@ is established by mapping the same frame capability into multiple address spaces
 
 ---
 
-## TLB Management (`mm/tlb.rs`)
+## TLB Management
 
-### PCID/ASID Allocation
-
-The kernel maintains a global pool of PCID/ASID values (12 bits on x86-64; hardware-
-defined width on RISC-V, typically 16 bits).
-
-```rust
-pub struct PcidAllocator
-{
-    /// Bitmask of currently-in-use PCID values.
-    /// PCID 0 is reserved for kernel-only contexts (never assigned to a process).
-    in_use: [u64; PCID_POOL_WORDS],
-
-    /// Generation counter, incremented on each full cycle through the pool.
-    /// Used to detect when a recycled PCID has been reassigned.
-    generation: u32,
-}
-```
-
-Allocation is a scan for the first zero bit in `in_use`. On deallocation, the bit
-is cleared and a global TLB flush is issued to invalidate any cached translations
-using that PCID before it is reissued to a new address space.
-
-When the pool is exhausted (all PCIDs in use simultaneously — unusual in practice),
-the oldest PCID is evicted: its address space loses its PCID, a full flush occurs,
-and the PCID is reassigned to the new address space.
+Local invalidation primitives live in the per-architecture paging modules:
+`arch::current::paging::flush_page` invalidates a single VA on the current CPU
+(`invlpg` / `sfence.vma <va>`), and `flush_tlb_all` invalidates all non-global entries
+(CR3 reload / `sfence.vma zero, zero`). Cross-CPU invalidation is the shootdown protocol
+in `mm/tlb_shootdown.rs`. The kernel uses no hardware address-space tags (PCID/ASID); see
+[docs/memory-model.md](../../../docs/memory-model.md). Tagged TLBs are tracked as future
+work in [#198](https://github.com/kottlerg/seraph/issues/198).
 
 ### Context Switch TLB Handling
 
-On each context switch between threads in different address spaces:
-
-```
-1. Look up the target address space's PCID (or allocate one if absent)
-2. Call Paging::activate(table, pcid)
-   - If PCID is valid and not recycled: hardware retains TLB entries tagged with
-     this PCID; no explicit flush needed (hardware TLB tagging handles this)
-   - If PCID was just allocated (new or recycled): a full TLB flush occurs
-```
-
-Threads in the same address space switching on the same CPU require no TLB operation.
+A switch between threads in different address spaces calls
+`arch::current::paging::activate(root_phys)`, which performs a full TLB flush: x86-64
+writes CR3 with `CR4.PCIDE` clear (flushing all non-global entries); RISC-V writes `satp`
+with ASID 0 and executes `sfence.vma`. Threads sharing an address space require no TLB
+operation on switch.
 
 ### SMP TLB Shootdown
 
@@ -364,7 +343,7 @@ its own slot, sets the pending bit of each target CPU, then sends the IPI:
 
 ```
 1. Edit the leaf PTE under pt_lock; release pt_lock.
-2. Read active_cpu_mask; exclude the current CPU.
+2. Read active_cpus; exclude the current CPU.
 3. Publish (root, virt) into this CPU's request slot and set each target's
    pending bit (the bit doubles as the per-target liveness/ack token).
 4. Send the shootdown IPI to the targets and wait for every pending bit to clear.

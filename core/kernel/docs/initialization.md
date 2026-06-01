@@ -39,7 +39,7 @@ instruction is used in a loop to handle spurious wakeups.
 ## Phase 1: Early Console
 
 ```
-1. Call arch::current::EarlyConsole::init(&boot_info)
+1. Call console::init(&boot_info)
    - x86-64: checks boot_info.framebuffer.physical_base; if non-zero,
      initialises a simple pixel-writing framebuffer console;
      also attempts to initialise a COM1 serial port at 115200 8N1
@@ -54,7 +54,7 @@ The early console is allocation-free and output-only.
 **Failure mode:** If no output device is found, initialisation continues silently.
 This is not fatal — a headless system is valid.
 
-**Completion criterion:** `arch::current::EarlyConsole::init()` has returned.
+**Completion criterion:** `console::init()` has returned.
 
 ---
 
@@ -116,8 +116,7 @@ heap exists yet.
    PHYSMAP_BASE = 0xFFFF800000000000 (both architectures)
 5. Map the BootInfo structure and boot modules (needed until they are consumed)
 6. Install the new page table:
-   arch::current::Paging::activate(&new_table, pcid=0)
-   (PCID/ASID 0 is reserved for kernel-only contexts)
+   arch::current::paging::activate(root_phys)
 7. The bootloader page table is no longer referenced; its frames are
    recorded in `BootInfo.reclaim_ranges` (boot protocol v7) and minted
    as reclaimable Frame caps into init's CSpace during Phase 7 by
@@ -316,8 +315,8 @@ are excluded because `mint_module_frame_caps` already covers them).
       (Phase 4); read its top from the IDLE_STACK_TOPS slab
    b. Allocate and initialise an idle TCB:
       - Priority: IDLE_PRIORITY (lowest, reserved; never preempted)
-      - Entry: arch::current::Context::new_state(idle_entry, stack_top, cpu_id, false)
-      - Idle thread entry calls Cpu::halt_until_interrupt() in a loop,
+      - Entry: arch::current::context::new_state(idle_entry, stack_top, cpu_id, false)
+      - Idle thread entry calls cpu::halt_until_interrupt() in a loop,
         checking for pending work before each halt
    c. Set the per-CPU current_thread pointer to the idle TCB
 3. Emit: "scheduler initialised, N CPUs"
@@ -436,15 +435,13 @@ At any phase, if the kernel cannot continue:
 fn fatal(msg: &str) -> !
 {
     // Disable interrupts to prevent re-entrant failure handling.
-    arch::current::Interrupts::disable();
-    arch::current::EarlyConsole::write_str("KERNEL FATAL: ");
-    arch::current::EarlyConsole::write_str(msg);
-    arch::current::EarlyConsole::write_str("\n");
+    arch::current::interrupts::disable();
+    console::panic_write_fmt(format_args!("KERNEL FATAL: {msg}\n"));
     loop
     {
         // Halt until the next interrupt (hlt on x86-64; wfi on RISC-V).
         // Interrupts are left disabled — this CPU is not taking further work.
-        arch::current::Cpu::halt_until_interrupt();
+        arch::current::cpu::halt_until_interrupt();
     }
 }
 ```

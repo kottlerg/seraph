@@ -47,7 +47,7 @@ kernel/
 │   │   ├── size_class.rs       # General size-class allocator (heap)
 │   │   ├── address_space.rs    # Virtual address space objects and lifecycle
 │   │   ├── kernel_pt_pool.rs   # Cap-backed pool for intermediate PT frames
-│   │   └── tlb.rs              # TLB management, PCID/ASID allocation
+│   │   └── tlb_shootdown.rs    # Cross-CPU TLB shootdown protocol (per-CPU request slots)
 │   ├── cap/                    # Capability subsystem
 │   │   ├── mod.rs
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
@@ -71,7 +71,7 @@ kernel/
 │       ├── thread.rs           # Thread syscall implementations
 │       └── wait.rs             # Wait set syscall implementations
 └── docs/
-    ├── arch-interface.md       # Architecture abstraction trait definitions
+    ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase
     ├── syscalls.md             # Syscall ABI and complete syscall table
     ├── memory-internals.md     # Memory subsystem implementation details
@@ -88,8 +88,8 @@ kernel/
 
 ### `arch/`
 
-All architecture-specific code. Each subdirectory implements the traits defined in
-[`docs/arch-interface.md`](docs/arch-interface.md). No code outside `arch/` contains
+All architecture-specific code. Each subdirectory implements the dispatch surface defined
+in [`docs/arch-interface.md`](docs/arch-interface.md). No code outside `arch/` contains
 `#[cfg(target_arch)]` guards. The active architecture module is selected at build time
 and re-exported from `arch/mod.rs` as a unified interface.
 

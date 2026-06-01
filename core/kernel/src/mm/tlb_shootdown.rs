@@ -5,9 +5,15 @@
 
 //! TLB shootdown protocol for cross-CPU page table invalidation.
 //!
-//! When a CPU modifies page tables (unmap, protect) for an address space
-//! active on other CPUs, those CPUs must invalidate their cached TLB entries.
-//! This module implements the synchronous shootdown protocol using IPIs.
+//! When a CPU rewrites a leaf page-table entry in a way that could strand a
+//! dangerous stale TLB entry on other CPUs sharing the address space — an
+//! unmap, a permission narrowing, or a frame replacement — those CPUs must
+//! invalidate their cached translation. Fresh maps and permission widenings
+//! issue no shootdown: any stale entry only triggers a spurious fault the
+//! page-fault handler resolves by re-walking the live PTE. The caller
+//! classifies each rewrite ([`MapOutcome`](crate::mm::paging::MapOutcome)) and
+//! enters this module only for the synchronous cases. This module implements
+//! that protocol using IPIs.
 //!
 //! # Protocol
 //!

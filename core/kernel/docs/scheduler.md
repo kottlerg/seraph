@@ -9,7 +9,7 @@ The scheduler interacts with two subsystems:
 - **IPC** — IPC operations may block threads, wake threads, and trigger direct context
   switches (see [ipc-internals.md](ipc-internals.md))
 - **Architecture layer** — context save/restore and the preemption timer are implemented
-  by the arch traits defined in [arch-interface.md](arch-interface.md)
+  by the arch-dispatch surface defined in [arch-interface.md](arch-interface.md)
 
 ---
 
@@ -166,7 +166,7 @@ pub struct ThreadControlBlock
     // === Context ===
 
     /// Architecture-specific saved register state.
-    saved_state: arch::current::Context::SavedState,
+    saved_state: arch::current::context::SavedState,
 
     /// Kernel stack top (used to restore RSP0/kernel SP on context switch).
     kernel_stack_top: VirtAddr,
@@ -218,12 +218,12 @@ fields are subject to the lock hierarchy specified in that document.
 
 ### What Gets Saved and Restored
 
-On each context switch, the arch `Context::switch` function saves and restores the
+On each context switch, the arch `context::switch` function saves and restores the
 minimal register set needed for correct execution:
 
 **x86-64 (callee-saved registers):**
 - `rbx`, `rbp`, `r12`, `r13`, `r14`, `r15`
-- `rip` (return address, via the call to `Context::switch`)
+- `rip` (return address, via the call to `context::switch`)
 - `rsp` (stack pointer)
 - The `fs_base` MSR (TLS base pointer)
 - The kernel stack pointer is stored separately in the TSS `RSP0` field
@@ -233,7 +233,7 @@ Caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`) are not
 
 **RISC-V (callee-saved registers):**
 - `s0`–`s11` (saved registers)
-- `ra` (return address — `Context::switch` returns here)
+- `ra` (return address — `context::switch` returns here)
 - `sp` (stack pointer)
 - `tp` (thread pointer, used for TLS)
 
@@ -253,13 +253,12 @@ context_switch(current_tcb, next_tcb):
 
     // 2. Switch address space if different.
     if current_tcb.address_space != next_tcb.address_space:
-        pcid = tlb::pcid_for(next_tcb.address_space)
-        arch::current::Paging::activate(next_tcb.address_space.root_table, pcid)
-        // Update active_cpu_mask on both address spaces (for TLB shootdown tracking)
+        arch::current::paging::activate(next_tcb.address_space.root_phys)
+        // Update active_cpus on both address spaces (for TLB shootdown tracking)
 
     // 3. Perform the register-level switch.
     //    Saves current callee-saved registers, restores next's, returns into next_tcb.
-    arch::current::Context::switch(
+    arch::current::context::switch(
         &mut current_tcb.saved_state,
         &next_tcb.saved_state,
     )
@@ -438,7 +437,7 @@ fn idle_thread_entry(cpu_id: u64) -> !
             schedule();
         }
         // Halt until the next interrupt (timer or IPI).
-        arch::current::Cpu::halt_until_interrupt();
+        arch::current::cpu::halt_until_interrupt();
     }
 }
 ```

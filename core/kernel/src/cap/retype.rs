@@ -200,6 +200,15 @@ unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
     unsafe { core::ptr::write_volatile(virt as *mut u64, value) };
 }
 
+/// True if `link` is a structurally valid sub-page free-list pointer for a
+/// region of `frame_size` bytes: either the empty sentinel, or an in-range
+/// offset aligned to the smallest sub-page class. Mirrors the bounds guard in
+/// [`try_alloc_page_block`].
+fn subpage_link_ok(link: u64, frame_size: u64) -> bool
+{
+    link == FREE_LIST_END || (link < frame_size && link.is_multiple_of(BIN_128))
+}
+
 /// Try to pop a slot from the bin's free list. Returns the offset if a slot
 /// was reused, or `None` if the list is empty.
 ///
@@ -216,10 +225,43 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, frame: &FrameObject, bin: usi
     {
         return None;
     }
+    // Validate the head offset before dereferencing it. A freed slot's link
+    // cell lives inline in the cap's backing region; a stray writer there
+    // (the hazard the module docs note) could leave a bogus value. Reject an
+    // out-of-range or misaligned head: drop the corrupted list and fall back
+    // to bump allocation — mirroring the bounded-walk guard in
+    // `try_alloc_page_block`, never dereferencing the bad pointer.
+    if !subpage_link_ok(head, frame.size)
+    {
+        crate::kprintln!(
+            "RETYPE SUBPAGE FREE-LIST CORRUPT: frame.base=0x{:x} size=0x{:x} bin={} head=0x{:x}",
+            frame.base,
+            frame.size,
+            bin,
+            head
+        );
+        alloc.subpage_free_lists[bin].store(FREE_LIST_END, Ordering::Release);
+        return None;
+    }
     // Read next-offset stored at offset `head` within the cap region.
-    // SAFETY: head was previously placed on the free list, meaning it's a
-    // valid offset within the cap region.
+    // SAFETY: head validated in-range above; frame.base + head is direct-map.
     let next = unsafe { read_u64_at(frame.base, head) };
+    // Validate the successor before promoting it to the new head, so a bad
+    // link cannot be dereferenced by the next pop.
+    if !subpage_link_ok(next, frame.size)
+    {
+        crate::kprintln!(
+            "RETYPE SUBPAGE FREE-LIST CORRUPT: frame.base=0x{:x} size=0x{:x} bin={} next=0x{:x}",
+            frame.base,
+            frame.size,
+            bin,
+            next
+        );
+        // `head` itself is valid and returned; truncate the list at the bad
+        // successor.
+        alloc.subpage_free_lists[bin].store(FREE_LIST_END, Ordering::Release);
+        return Some(head);
+    }
     alloc.subpage_free_lists[bin].store(next, Ordering::Release);
     Some(head)
 }
@@ -565,7 +607,25 @@ pub fn retype_free(frame: &FrameObject, offset: u64, bytes: u64)
         unsafe { push_page_block(alloc, frame, offset, pages) };
     }
 
-    frame.available_bytes.fetch_add(need, Ordering::Release);
+    let prev_avail = frame.available_bytes.fetch_add(need, Ordering::Release);
+    if prev_avail + need == frame.size
+    {
+        // Frame fully drained — no live retyped object remains. Reset the
+        // allocator to virgin so a recycled frame carries no bump/free-list
+        // residual into its next consumer, and so a virgin tail lets
+        // `sys_frame_merge` coalesce it back into the free pool. Without this,
+        // a former object-slab keeps its `bump` cursor and freed-slot links for
+        // the `FrameObject`'s whole life (forever for pooled caps): that
+        // residual blocks coalescing the recycled frame — leaving it grantable
+        // as a standalone run that can be handed out a second time — and leaves
+        // a stale free-list link an aliasing writer can clobber.
+        alloc.bump_offset.store(0, Ordering::Release);
+        for head in &alloc.subpage_free_lists
+        {
+            head.store(FREE_LIST_END, Ordering::Release);
+        }
+        alloc.page_free_head.store(FREE_LIST_END, Ordering::Release);
+    }
     alloc.unlock();
 }
 
@@ -845,6 +905,30 @@ mod tests
         assert_eq!(align_up(8, 8), 8);
         assert_eq!(align_up(9, 8), 16);
         assert_eq!(align_up(0x1234, 0x1000), 0x2000);
+    }
+
+    #[test]
+    fn subpage_link_ok_accepts_sentinel_and_valid_offsets()
+    {
+        let size = 0x2000; // 2-page frame
+        // Empty-list sentinel is always valid regardless of size.
+        assert!(subpage_link_ok(FREE_LIST_END, size));
+        // In-range, BIN_128-aligned offsets are valid.
+        assert!(subpage_link_ok(0, size));
+        assert!(subpage_link_ok(BIN_128, size));
+        assert!(subpage_link_ok(size - BIN_128, size));
+    }
+
+    #[test]
+    fn subpage_link_ok_rejects_corrupt_links()
+    {
+        let size = 0x2000;
+        // Out of range (>= size) — e.g. a clobbered user pointer.
+        assert!(!subpage_link_ok(size, size));
+        assert!(!subpage_link_ok(0x7FFF_FFFF_D048, size));
+        // In range but misaligned (not a multiple of BIN_128).
+        assert!(!subpage_link_ok(BIN_128 - 8, size));
+        assert!(!subpage_link_ok(0x40, size));
     }
 
     #[test]

@@ -26,6 +26,7 @@
 //! - `cap_delegation_chain.rs`   — multi-level rights attenuation and cascaded revocation
 //! - `tlb_coherency.rs`          — map/unmap cycles across CPUs exercising TLB shootdown
 //! - `retype_reclaim.rs`         — auto-reclaim invariant for every retypable kernel object
+//! - `retype_subpage_clobber.rs` — a clobbered sub-page free-list link is rejected, not dereferenced
 //! - `priority_preemption.rs`    — higher-priority runnable thread preempts a busy lower-priority one
 //! - `shared_frame_two_aspaces.rs` — one frame mapped into two `AddressSpace` caps; phys round-trip
 //! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
@@ -42,6 +43,7 @@ pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
 pub mod priority_preemption;
 pub mod retype_reclaim;
+pub mod retype_subpage_clobber;
 pub mod shared_frame_two_aspaces;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
@@ -71,6 +73,10 @@ pub fn run_all(ctx: &TestContext)
     );
     run_integration_test!("integration::tlb_coherency", tlb_coherency::run(ctx));
     run_integration_test!("integration::retype_reclaim", retype_reclaim::run(ctx));
+    run_integration_test!(
+        "integration::retype_subpage_clobber",
+        retype_subpage_clobber::run(ctx)
+    );
     run_integration_test!(
         "integration::priority_preemption",
         priority_preemption::run(ctx)

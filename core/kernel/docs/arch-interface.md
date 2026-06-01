@@ -142,6 +142,24 @@ pub unsafe fn flush_page(virt: u64);
 /// (x86-64 CR3 reload; RISC-V `sfence.vma zero, zero`).
 pub unsafe fn flush_tlb_all();
 
+/// Install `root_phys` as the active page table under hardware address-space
+/// tag `tag` (x86-64 PCID / RISC-V ASID) **without** flushing the TLB, so the
+/// outgoing space's cached translations survive (x86-64 sets CR3 bit 63 with
+/// `CR4.PCIDE`; RISC-V writes `satp` with the ASID and no `sfence.vma`). Only
+/// valid when tagging is enabled; the caller performs any required tag
+/// invalidation (the generation check in `AddressSpace::activate`).
+pub unsafe fn activate_tagged(root_phys: u64, tag: u16);
+
+/// Invalidate the current-CPU TLB entry for `virt` tagged with `tag`,
+/// independent of the tag currently loaded (x86-64 INVPCID type 0;
+/// RISC-V `sfence.vma virt, asid`).
+pub unsafe fn flush_page_tagged(virt: u64, tag: u16);
+
+/// Invalidate all current-CPU entries tagged with `tag` (x86-64 INVPCID type 1;
+/// RISC-V `sfence.vma zero, asid`). Used when a tag is reassigned or a
+/// switched-away space accrued unmaps.
+pub unsafe fn flush_tag(tag: u16);
+
 /// Classify a user page fault as spurious (the live PTE already permits the
 /// access — a stale entry the handler resolves by retrying) versus a real fault.
 pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool;

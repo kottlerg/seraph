@@ -204,6 +204,63 @@ pub unsafe fn enable_smep_smap()
     }
 }
 
+// ── PCID (Process-Context Identifiers) ────────────────────────────────────────
+
+/// Enable PCID-tagged TLBs by setting `CR4.PCIDE` (bit 17).
+///
+/// Tagged TLBs require both PCID (`CPUID.01H:ECX[17]`) and INVPCID
+/// (`CPUID.(EAX=07H,ECX=0):EBX[10]`): the kernel uses `invpcid` for
+/// single-address and single-context invalidation. Returns `true` if both
+/// features are present and `CR4.PCIDE` was set, `false` otherwise.
+///
+/// Unlike [`enable_smep_smap`], absence is **not** fatal — tagging is an
+/// optimization, not a security requirement, and the kernel falls back to
+/// full-flush context switches.
+///
+/// Per Intel SDM Vol. 3A §4.10.1, `CR3[11:0]` must be 0 at the moment
+/// `CR4.PCIDE` is set to 1, or the `MOV CR4` `#GP`s. At the call site (Phase 5
+/// BSP / AP init) the active CR3 is the kernel root with zero low bits; this is
+/// asserted in debug builds.
+///
+/// # Safety
+/// Must execute at ring 0, after the IDT is loaded, with the kernel root in
+/// CR3 (low 12 bits zero). Must be called at most once per CPU and before any
+/// PCID-tagged CR3 load.
+// Wired into Phase 5 / AP init by the tagged-TLB boot-enablement path.
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub unsafe fn enable_pcid() -> bool
+{
+    // CPUID.01H:ECX[17] = PCID; CPUID.(07H,0):EBX[10] = INVPCID.
+    let pcid = cpuid(1).2 & (1 << 17) != 0;
+    let invpcid = cpuid(7).1 & (1 << 10) != 0;
+    if !pcid || !invpcid
+    {
+        return false;
+    }
+
+    // CR3[11:0] must be zero before setting PCIDE (SDM Vol. 3A §4.10.1).
+    let cr3: u64;
+    // SAFETY: reading CR3 is a ring-0 primitive.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+    }
+    debug_assert!(
+        cr3.trailing_zeros() >= 12,
+        "enable_pcid: CR3[11:0] must be 0 before setting CR4.PCIDE"
+    );
+
+    // Bit 17 = PCIDE.
+    let cr4 = read_cr4();
+    // SAFETY: CPUID confirmed PCID + INVPCID; CR3 low bits are zero (kernel
+    // root); long mode and PAE are active (4-level paging). The new CR4 value
+    // is valid.
+    unsafe {
+        write_cr4(cr4 | (1 << 17));
+    }
+    true
+}
+
 // ── Misc ──────────────────────────────────────────────────────────────────────
 
 /// Atomically enable interrupts and halt until an interrupt is recognised.

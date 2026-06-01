@@ -293,6 +293,40 @@ pub unsafe fn activate(root_phys: u64)
     }
 }
 
+/// Activate the page tables rooted at `root_phys` under PCID `tag` **without
+/// flushing** the TLB.
+///
+/// Writes CR3 with the PCID in bits \[11:0\] and bit 63 set, which (with
+/// `CR4.PCIDE = 1`) requests "do not invalidate" — cached translations for
+/// `tag` and every other PCID are retained (Intel SDM Vol. 3A §4.10.4.1). This
+/// is the context-switch fast path: the outgoing space's translations survive.
+///
+/// # Safety
+/// Must execute at ring 0 with `CR4.PCIDE` set. `root_phys` must be a valid
+/// PML4 frame (4 KiB-aligned, low 12 bits zero). The tables must map the
+/// currently executing code, the active stack, and all data accessed
+/// immediately after this call. The caller is responsible for any tag
+/// invalidation required for correctness (the generation check in
+/// `AddressSpace::activate`).
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
+{
+    // Bit 63 = no-invalidate request (valid only when CR4.PCIDE = 1); the PCID
+    // occupies bits [11:0]; root_phys supplies bits [51:12] with low bits zero.
+    let cr3 = root_phys | u64::from(tag) | (1u64 << 63);
+    // SAFETY: CR3 write changes the active page table; root_phys is a valid
+    // PML4 frame with zero low bits; PCIDE is set so bit 63 is honoured as the
+    // no-flush request rather than faulting.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) cr3,
+            options(nostack),
+        );
+    }
+}
+
 /// Enable No-Execute by setting `IA32_EFER.NXE` (bit 11) via RDMSR/WRMSR.
 ///
 /// Must be called before activating page tables that use the NX bit,
@@ -653,6 +687,94 @@ pub unsafe fn flush_page(virt: u64)
             in(reg) virt,
             options(nostack),
         );
+    }
+}
+
+// ── Tagged (PCID) invalidation ────────────────────────────────────────────────
+// INVPCID lets a CPU invalidate translations tagged with an arbitrary PCID,
+// independent of the PCID currently loaded in CR3. Used by the tagged-TLB path
+// for per-VA remote shootdown (type 0) and whole-tag flush (type 1).
+
+/// INVPCID type 0: invalidate one linear address within one PCID.
+#[allow(dead_code)]
+const INVPCID_TYPE_ADDR: u64 = 0;
+/// INVPCID type 1: invalidate all non-global entries of one PCID.
+#[allow(dead_code)]
+const INVPCID_TYPE_SINGLE: u64 = 1;
+
+/// 128-bit INVPCID descriptor (Intel SDM Vol. 2A, "INVPCID").
+///
+/// First qword: PCID in bits \[11:0\], bits \[63:12\] reserved (must be zero).
+/// Second qword: the linear address (ignored for type 1).
+///
+/// `dead_code`: the fields are consumed by `invpcid` through a pointer in inline
+/// asm, which the lint cannot see as a read.
+#[allow(dead_code)]
+#[repr(C, align(16))]
+struct InvpcidDescriptor
+{
+    pcid: u64,
+    linear_addr: u64,
+}
+
+/// Execute `invpcid` with the given invalidation `kind` and descriptor.
+///
+/// # Safety
+/// Must execute at ring 0 with `CR4.PCIDE` set; the descriptor's reserved bits
+/// must be zero.
+#[cfg(not(test))]
+#[allow(dead_code)]
+unsafe fn invpcid(kind: u64, desc: &InvpcidDescriptor)
+{
+    // SAFETY: invpcid is a ring-0 TLB primitive; desc is a valid 16-byte
+    // descriptor with reserved bits zero (constructed by the callers below).
+    // The asm reads the descriptor memory, so no nomem/readonly is asserted.
+    unsafe {
+        core::arch::asm!(
+            "invpcid {kind}, [{desc}]",
+            kind = in(reg) kind,
+            desc = in(reg) desc,
+            options(nostack),
+        );
+    }
+}
+
+/// Invalidate the TLB entry for `virt` tagged with PCID `tag` on the current
+/// CPU (INVPCID type 0), regardless of the PCID currently loaded in CR3.
+///
+/// # Safety
+/// Must execute at ring 0 with `CR4.PCIDE` set.
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub unsafe fn flush_page_tagged(virt: u64, tag: u16)
+{
+    let desc = InvpcidDescriptor {
+        pcid: u64::from(tag),
+        linear_addr: virt,
+    };
+    // SAFETY: ring 0 with PCIDE set (caller contract); well-formed type-0 descriptor.
+    unsafe {
+        invpcid(INVPCID_TYPE_ADDR, &desc);
+    }
+}
+
+/// Invalidate all non-global TLB entries tagged with PCID `tag` on the current
+/// CPU (INVPCID type 1). Used when a tag is (re)assigned to a new address space
+/// or when a switched-away space accrued unmaps while this CPU was elsewhere.
+///
+/// # Safety
+/// Must execute at ring 0 with `CR4.PCIDE` set.
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub unsafe fn flush_tag(tag: u16)
+{
+    let desc = InvpcidDescriptor {
+        pcid: u64::from(tag),
+        linear_addr: 0,
+    };
+    // SAFETY: ring 0 with PCIDE set (caller contract); well-formed type-1 descriptor.
+    unsafe {
+        invpcid(INVPCID_TYPE_SINGLE, &desc);
     }
 }
 

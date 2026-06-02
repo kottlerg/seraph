@@ -15,7 +15,7 @@
 //!    read-only, parse the `\_S5_` AML object for `SLP_TYPa`.
 //! 3. [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`] (`PM1a` port) → devmgr carves
 //!    `[PM1a, PM1a+2)` + the 8042 reset port `[0x64, 0x65)` and serves the
-//!    two `IoPortRange` caps.
+//!    two `IoPort` caps.
 //!
 //! Shutdown (ACPI S5 soft-off) binds the `PM1a` cap and writes
 //! `(SLP_TYPa << 10) | SLP_EN` to `PM1a_CNT_BLK`. Reboot binds the 8042
@@ -39,7 +39,7 @@ const FADT_OFF_PM1A_CNT_BLK: usize = 64;
 const FADT_OFF_X_DSDT: usize = 140;
 
 /// Resolved shutdown actuation state. Acquired once at startup from
-/// devmgr; held for pwrmgr's lifetime. The two `IoPortRange` caps are
+/// devmgr; held for pwrmgr's lifetime. The two `IoPort` caps are
 /// narrow (the `PM1a` control pair and the single 8042 reset port).
 pub struct Actuator
 {

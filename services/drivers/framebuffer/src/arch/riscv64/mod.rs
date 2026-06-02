@@ -6,13 +6,13 @@
 //! RISC-V framebuffer MMIO mapping.
 //!
 //! Reserves a contiguous VA range and maps the bootloader-discovered
-//! GOP linear-framebuffer `MmioRegion` cap into it. On QEMU virt the
+//! GOP linear-framebuffer `Mmio` cap into it. On QEMU virt the
 //! framebuffer comes from `-device ramfb`; the bootloader captured its
 //! base via UEFI GOP before `ExitBootServices`.
 
 use std::os::seraph::{fund_aspace_pt_budget, reserve_pages};
 
-/// Reserve `total_pages` VA pages and map the framebuffer `MmioRegion`
+/// Reserve `total_pages` VA pages and map the framebuffer `Mmio`
 /// cap into them as writable MMIO. Returns the mapped base pointer on
 /// success.
 pub fn fb_mmio_init(self_aspace: u32, mmio_cap: u32, total_pages: u64) -> Option<*mut u8>

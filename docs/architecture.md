@@ -177,7 +177,7 @@ Physical MMIO regions are mapped into a driver’s address space under capabilit
 control. Once mapped, drivers access registers directly without kernel mediation.
 
 **Port I/O (x86‑64 only)**
-Drivers receive an IoPortRange capability for assigned port ranges. Binding this
+Drivers receive an IoPort capability for assigned port ranges. Binding this
 capability enables direct execution of port I/O instructions for those ranges.
 Access is revoked automatically when the capability is revoked. RISC‑V does not
 support port I/O.

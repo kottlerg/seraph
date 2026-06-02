@@ -83,7 +83,7 @@ pub mod kind
     pub const APERTURE: u64 = 2;
     pub const ACPI_REGION: u64 = 3;
     /// Round carrying svcmgr publish-authority cap + (x86) the root
-    /// `IoPortRange` cap copy. One-shot, always terminal.
+    /// `IoPort` cap copy. One-shot, always terminal.
     pub const SVCMGR_BUNDLE: u64 = 4;
     /// Round carrying bootloader-discovered framebuffer geometry
     /// (`physical_base`, `width`, `height`, `stride`, `pixel_format`).
@@ -155,7 +155,7 @@ pub struct DevmgrCaps
     // `devmgr.registry`) are init-issued.
     pub svcmgr_publish_cap: u32,
 
-    // Copy of init's root `IoPortRange` cap (x86-64 only; zero on RISC-V).
+    // Copy of init's root `IoPort` cap (x86-64 only; zero on RISC-V).
     // devmgr derives per-driver narrow copies for ISA peripherals
     // (CMOS RTC at ports 0x70-0x71; COM1 at 0x3F8-0x3FF for serial) and,
     // on `QUERY_SHUTDOWN_DEVICE`, the PM1a + 8042-reset ports for pwrmgr.
@@ -417,7 +417,7 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
                 // caps[0] = svcmgr publish-authority cap (always present;
                 //           a zero slot indicates init's derive failed and
                 //           is treated as a bootstrap fatal).
-                // caps[1] = arch shutdown-authority cap: root IoPortRange
+                // caps[1] = arch shutdown-authority cap: root IoPort
                 //           on x86-64, SbiControl on RISC-V. Same slot
                 //           either way; the receiver routes it by arch.
                 if round.cap_count < 1 || round.caps[0] == 0

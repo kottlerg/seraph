@@ -83,7 +83,7 @@ earlier ones, which remain as fallbacks.
 ## The serial driver as sole userspace UART owner
 
 The serial driver owns the platform UART authority cap end-to-end — an
-`IoPortRange` for COM1 on x86-64, an `MmioRegion` for the NS16550 on RISC-V —
+`IoPort` for COM1 on x86-64, an `Mmio` for the NS16550 on RISC-V —
 delegated by devmgr at spawn. It is a device driver, not a console daemon:
 no name registry, no log routing, no VT/ANSI, no read path. Clients obtain a
 write capability through devmgr (a device authority), not through svcmgr (a
@@ -93,7 +93,7 @@ contract is specified in [services/drivers/serial/README.md](../services/drivers
 ## The framebuffer driver as sole userspace framebuffer owner
 
 The framebuffer driver owns the bootloader-discovered GOP linear
-framebuffer end-to-end — an `MmioRegion` carved from a bootloader-
+framebuffer end-to-end — an `Mmio` carved from a bootloader-
 synthesised aperture that covers
 `[physical_base, physical_base + stride * height)` (page-aligned),
 delegated by devmgr at spawn. The driver maps the entire region into its

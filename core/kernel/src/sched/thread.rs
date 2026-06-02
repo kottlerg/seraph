@@ -275,10 +275,10 @@ pub struct ThreadControlBlock
     /// On context switch, if non-null, this bitmap is copied into the TSS
     /// IOPB region so `in`/`out` instructions work for this thread.
     ///
-    // TODO: When an IoPortRange cap (or ancestor) is revoked,
+    // TODO: When an IoPort cap (or ancestor) is revoked,
     // the relevant bits must be re-denied in this bitmap and reloaded into
     // the TSS if this thread is currently running. Requires tracking which
-    // threads hold which IoPortRange bindings. Pick up alongside general
+    // threads hold which IoPort bindings. Pick up alongside general
     // cap revocation side-effect cleanup.
     pub iopb: *mut [u8; crate::arch::current::IOPB_SIZE],
 

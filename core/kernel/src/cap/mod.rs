@@ -11,12 +11,12 @@
 //!
 //! - Usable physical memory → [`CapTag::Memory`] caps (MAP | WRITE | EXECUTE)
 //! - MMIO apertures (coarse non-RAM ranges from the boot protocol)
-//!   → [`CapTag::MmioRegion`] caps (MAP | WRITE)
+//!   → [`CapTag::Mmio`] caps (MAP | WRITE)
 //! - One root [`CapTag::Interrupt`] range cap covering every valid IRQ id
 //!   (userspace narrows via `sys_irq_split`)
 //! - Per `AcpiReclaimable` region, the ACPI RSDP page, and the DTB blob →
 //!   read-only [`CapTag::Memory`] caps so userspace can parse firmware tables
-//! - One root [`CapTag::IoPortRange`] cap covering the full 64K I/O port
+//! - One root [`CapTag::IoPort`] cap covering the full 64K I/O port
 //!   space (x86-64, USE)
 //! - One [`CapTag::SchedControl`] cap (ELEVATE)
 //! - One [`CapTag::SbiControl`] cap on RISC-V (CALL)
@@ -50,9 +50,9 @@ pub use cspace::{CSpace, CapError, L1_SIZE, L2_SIZE};
 pub use derivation::DERIVATION_LOCK;
 #[allow(unused_imports)]
 pub use object::{
-    AddressSpaceObject, CSpaceKernelObject, EndpointObject, InterruptObject, IoPortRangeObject,
-    KernelObjectHeader, MemoryObject, MmioRegionObject, NotificationObject, ObjectType,
-    SbiControlObject, SchedControlObject, ThreadObject,
+    AddressSpaceObject, CSpaceKernelObject, EndpointObject, InterruptObject, IoPortObject,
+    KernelObjectHeader, MemoryObject, MmioObject, NotificationObject, ObjectType, SbiControlObject,
+    SchedControlObject, ThreadObject,
 };
 #[allow(unused_imports)]
 pub use slot::{CSpaceId, CapTag, CapabilitySlot, Rights, SlotId};
@@ -489,8 +489,8 @@ const ROOT_CSPACE_INIT_PAGES: u64 =
 ///
 /// Today's footprint on `x86_64` is ~150 KB:
 /// ~15 KB for sub-page cap-identity bodies (≈ 110 bin-128 slots: 91 other
-/// RAM `MemoryObject`s + 10 `MmioRegion` wrappers + 1 `Interrupt` + 1
-/// `IoPortRange` + 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps +
+/// RAM `MemoryObject`s + 10 `Mmio` wrappers + 1 `Interrupt` + 1
+/// `IoPort` + 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps +
 /// 3 init-segment Memory caps + 1 seed-tail Memory cap, plus the seed's own
 /// `RetypeAllocator` metadata), plus ~130 KB for init's bootstrap state
 /// (one [`AddressSpaceObject`] slab — wrapper page + root PT + PT growth
@@ -509,7 +509,7 @@ const SEED_RESERVE_BYTES: u64 = 512 * 1024;
 /// BSS-static `MemoryObject` covering the seed RAM region.
 ///
 /// Phase 7 mints every initial cap identity (`MemoryObject` for every
-/// drained RAM block, `MmioRegion` / `Interrupt` / `IoPortRange` /
+/// drained RAM block, `Mmio` / `Interrupt` / `IoPort` /
 /// `SchedControl` / `SbiControl` wrappers, plus firmware-table and
 /// boot-module `MemoryObject`s, plus init's ELF-segment `MemoryObject`s,
 /// plus the seed-tail `MemoryObject` exposing the rest of the largest
@@ -1149,7 +1149,7 @@ pub struct CSpaceLayout
 /// Capacity of the [`CSPACE_LAYOUT_DESCRIPTORS`] backing buffer. Bounded
 /// by every cap kind minted at boot:
 /// - [`MAX_DRAIN_BLOCKS`] RAM Memory caps (worst case from the buddy drain).
-/// - ~32 hardware caps (MMIO + IRQ + `IoPortRange`/`SbiControl` + `SchedControl`).
+/// - ~32 hardware caps (MMIO + IRQ + `IoPort`/`SbiControl` + `SchedControl`).
 /// - 8 ACPI region caps (`MAX_ACPI_REGIONS`), 1 ACPI RSDP, 1 DTB.
 /// - ~8 init segment caps + ~16 boot module caps.
 /// - [`boot_protocol::MAX_RECLAIM_RANGES`] reclaim Memory caps (worst case
@@ -1367,9 +1367,9 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
 
 /// Core `CSpace` population logic, separated for testability.
 ///
-/// Creates one capability per usable memory region, one `MmioRegion`
+/// Creates one capability per usable memory region, one `Mmio`
 /// capability per MMIO aperture, and one `SchedControl` capability (plus
-/// the arch-specific root `IoPortRange` on x86-64 and `SbiControl` on
+/// the arch-specific root `IoPort` on x86-64 and `SbiControl` on
 /// RISC-V). Returns a [`CSpaceLayout`] describing the slot ranges and
 /// per-cap descriptors.
 // too_many_lines: one logical pass over all boot-time resource types; splitting
@@ -1529,7 +1529,7 @@ fn populate_cspace(
         memory_count += 1;
     }
 
-    // MMIO apertures → one MmioRegion cap each, MAP | WRITE. Init is root
+    // MMIO apertures → one Mmio cap each, MAP | WRITE. Init is root
     // authority and holds these coarse caps until userspace narrows them
     // (via `mmio_split`) and delegates device-sized sub-caps to drivers.
     //
@@ -1537,7 +1537,7 @@ fn populate_cspace(
     // `BootInfo.kernel_mmio.uart_base` rather than the coarse aperture
     // list (the ns16550 UART sits outside both the PLIC aperture and the
     // PCIe apertures on every supported platform). Synthesise an extra
-    // MmioRegion cap here so userspace init has a cap for it — init's
+    // Mmio cap here so userspace init has a cap for it — init's
     // serial scan looks for any aperture containing the resolved UART base.
     let mut hw_cap_base: u32 = 0;
     let mut hw_cap_count: u32 = 0;
@@ -1546,8 +1546,8 @@ fn populate_cspace(
     {
         let uart_base = crate::arch::current::platform::uart_base();
         let uart_size = crate::arch::current::platform::uart_size();
-        let ptr = mint_phase7_body(MmioRegionObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
+        let ptr = mint_phase7_body(MmioObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
             base: uart_base,
             size: uart_size,
             flags: 0,
@@ -1555,10 +1555,10 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::MmioRegion,
+            CapTag::Mmio,
             Rights::MAP | Rights::WRITE,
             ptr,
-            "Phase 7: cannot allocate MmioRegion capability for console UART",
+            "Phase 7: cannot allocate Mmio capability for console UART",
         );
         if hw_cap_count == 0
         {
@@ -1569,7 +1569,7 @@ fn populate_cspace(
             &mut desc_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::MmioRegion,
+                cap_type: CapType::Mmio,
                 pad: [0; 3],
                 aux0: uart_base,
                 aux1: uart_size,
@@ -1579,8 +1579,8 @@ fn populate_cspace(
 
     for ap in mmio_apertures
     {
-        let ptr = mint_phase7_body(MmioRegionObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
+        let ptr = mint_phase7_body(MmioObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
             base: ap.phys_base,
             size: ap.size,
             flags: 0,
@@ -1588,10 +1588,10 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::MmioRegion,
+            CapTag::Mmio,
             Rights::MAP | Rights::WRITE,
             ptr,
-            "Phase 7: cannot allocate MmioRegion capability for aperture",
+            "Phase 7: cannot allocate Mmio capability for aperture",
         );
         if hw_cap_count == 0
         {
@@ -1601,7 +1601,7 @@ fn populate_cspace(
             &mut desc_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::MmioRegion,
+                cap_type: CapType::Mmio,
                 pad: [0; 3],
                 aux0: ap.phys_base,
                 aux1: ap.size,
@@ -1818,29 +1818,29 @@ fn populate_cspace(
         0
     };
 
-    // x86-64: root IoPortRange covering the full 64K I/O port space.
+    // x86-64: root IoPort covering the full 64K I/O port space.
     // This is a static architectural fact, not derived from any bootloader
     // field. Init subdivides and delegates sub-ranges to services as needed.
     #[cfg(target_arch = "x86_64")]
     {
-        let ptr = mint_phase7_body(IoPortRangeObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::IoPortRange, seed_header_nn()),
+        let ptr = mint_phase7_body(IoPortObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
             base: 0,
             size: 0, // 0 means 0x10000 (full range; u16 cannot hold 65536)
             _pad: 0,
         });
         let ioport_root_slot = insert_or_fatal(
             cspace,
-            CapTag::IoPortRange,
+            CapTag::IoPort,
             Rights::USE,
             ptr,
-            "Phase 7: cannot allocate root IoPortRange capability",
+            "Phase 7: cannot allocate root IoPort capability",
         );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
                 slot: ioport_root_slot,
-                cap_type: CapType::IoPortRange,
+                cap_type: CapType::IoPort,
                 pad: [0; 3],
                 aux0: 0,
                 aux1: 0x10000, // full 64K range

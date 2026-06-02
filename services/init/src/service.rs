@@ -241,7 +241,7 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
     {
         match d.cap_type
         {
-            CapType::MmioRegion if hw.aperture_count < MAX_APERTURE_CAPS =>
+            CapType::Mmio if hw.aperture_count < MAX_APERTURE_CAPS =>
             {
                 hw.apertures[hw.aperture_count] = (d.slot, d.aux0, d.aux1);
                 hw.aperture_count += 1;
@@ -637,7 +637,7 @@ pub fn create_devmgr_with_caps(
     // svcmgr's registry on init's behalf (today's only use is reserved
     // for future devmgr publications; the active publications — `timed`,
     // `rootfs.root`, `svcmgr`, `devmgr.registry` — are init-issued).
-    // The arch shutdown-authority cap is the root `IoPortRange` on x86-64
+    // The arch shutdown-authority cap is the root `IoPort` on x86-64
     // (devmgr derives narrow per-driver IoPort caps from it for ISA
     // peripherals like the CMOS RTC, and carves the PM1a + 8042 ports for
     // pwrmgr) and `SbiControl` on RISC-V (devmgr serves a copy to pwrmgr
@@ -694,7 +694,7 @@ pub fn create_devmgr_with_caps(
 
     let arch_shutdown_cap = if cfg!(target_arch = "x86_64")
     {
-        crate::find_cap_by_type(info, init_protocol::CapType::IoPortRange)
+        crate::find_cap_by_type(info, init_protocol::CapType::IoPort)
             .and_then(|root| syscall::cap_derive(root, syscall::RIGHTS_ALL).ok())
             .unwrap_or(0)
     }

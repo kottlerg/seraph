@@ -13,7 +13,7 @@
 //! involved beyond providing Memory caps for the firmware table regions.
 //!
 //! I/O port permission for `PM1a_CNT_BLK` is obtained at shutdown time via
-//! `ioport::bind_port_range`, which carves a narrow `IoPortRange` cap
+//! `ioport::bind_port_range`, which carves a narrow `IoPort` cap
 //! covering exactly the `PM1a` control register from the residual wide
 //! cap left by earlier consumers.
 

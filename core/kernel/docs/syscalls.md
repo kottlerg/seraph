@@ -1043,7 +1043,7 @@ delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it.
 
 ### `SYS_IOPORT_BIND` (35)
 
-Bind an IoPortRange capability to a thread, granting that thread permission to
+Bind an IoPort capability to a thread, granting that thread permission to
 execute `in`/`out` instructions for the capability's port range via the TSS I/O
 Permission Bitmap (IOPB).
 
@@ -1054,7 +1054,7 @@ Permission Bitmap (IOPB).
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) |
-| 1 | `ioport_cap` | IoPortRange capability (Use rights) |
+| 1 | `ioport_cap` | IoPort capability (Use rights) |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 

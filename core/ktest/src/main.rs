@@ -137,7 +137,7 @@ pub struct TestContext
     /// Used by tests that need to discover the cspace's slot capacity at
     /// runtime via `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` so their scans
     /// cover every slot the kernel may have populated, including those
-    /// allocated after `aspace_cap` (e.g. narrow `IoPortRange` caps minted
+    /// allocated after `aspace_cap` (e.g. narrow `IoPort` caps minted
     /// by `ioport::bind_port_range` callers such as `serial::init` on
     /// `x86_64`).
     pub cspace_cap: u32,
@@ -295,7 +295,7 @@ fn run(info_ptr: u64) -> !
     // aperture later). Must precede `serial::init`/`framebuffer::init`.
     fund_boot_aspace_pt(info);
 
-    // Seed the I/O port subdivider with the root IoPortRange cap so
+    // Seed the I/O port subdivider with the root IoPort cap so
     // `serial::init` and `acpi_shutdown::shutdown` can each carve only
     // the ports they need instead of binding the full 64K range.
     #[cfg(target_arch = "x86_64")]

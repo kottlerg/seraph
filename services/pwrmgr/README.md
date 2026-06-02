@@ -30,7 +30,7 @@ a device driver":
   via `devmgr_labels::QUERY_ACPI_TABLE` (devmgr is the sole owner of the
   `AcpiReclaimable` Memory caps and the only service that walks the ACPI
   table tree). pwrmgr extracts `PM1a_CNT_BLK` from the FADT and the `\_S5_`
-  sleep type from the DSDT, then requests a narrow `IoPortRange` over the
+  sleep type from the DSDT, then requests a narrow `IoPort` over the
   PM1a control port and the 8042 reset port via
   `devmgr_labels::QUERY_SHUTDOWN_DEVICE`.
 - **RISC-V** — `QUERY_SHUTDOWN_DEVICE` serves a `cap_derive` copy of

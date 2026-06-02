@@ -111,7 +111,7 @@ the kernel's own consumption:
   compatible nodes).
 
 A third extraction produces **seed entries** for `mmio_apertures` —
-coarse `{phys_base, size}` regions the kernel mints as `MmioRegion`
+coarse `{phys_base, size}` regions the kernel mints as `Mmio`
 capabilities. The seed covers LAPIC / IOAPIC / PLIC / ECAM / BAR
 windows / `virtio,mmio` transports from the firmware tables and is
 merged with the UEFI memory map's `MemoryMappedIO` regions in step 8.

@@ -469,7 +469,7 @@ fn run(info_ptr: u64) -> !
     // (`procmgr.REGISTER_INIT_TEARDOWN`) can include it: procmgr binds a
     // death-EQ on both init threads and reclaims the init-logd TCB once init
     // is threadless (init-logd outlives main until real-logd's handover).
-    let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
+    let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPort).unwrap_or(0);
     let init_logd_thread_cap = logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap);
 
     // Badged SEND on the log endpoint for init's own `log()` lines so

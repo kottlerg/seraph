@@ -23,7 +23,7 @@ Each function occupies 4 KiB (one page). The bus range is encoded in the
 
 ### Scan Procedure
 
-1. Map the ECAM `MmioRegion` cap into devmgr's address space.
+1. Map the ECAM `Mmio` cap into devmgr's address space.
 2. For each bus in range, each device 0-31, function 0:
    - Read vendor ID (offset 0x00, u16). Skip if `0xFFFF`.
    - Read header type (offset 0x0E, u8). If bit 7 set, scan functions 1-7.
@@ -60,7 +60,7 @@ modules) by device class and vendor/device ID.
 
 For each matched device, devmgr:
 
-1. Splits the PCI MMIO window cap to carve per-BAR `MmioRegion` sub-caps.
+1. Splits the PCI MMIO window cap to carve per-BAR `Mmio` sub-caps.
 2. Matches the PCI interrupt line to an Interrupt cap from init.
 3. Requests procmgr to create the driver process (`CREATE_PROCESS`).
 4. Injects per-device caps into the driver's `CSpace` via `cap_copy`.

@@ -320,17 +320,17 @@ pub struct CapDescriptor
 
     /// Type-specific primary metadata:
     /// - `Memory`: physical base address
-    /// - `MmioRegion`: physical base address
+    /// - `Mmio`: physical base address
     /// - `Interrupt`: starting IRQ line number (range cap; split via `SYS_IRQ_SPLIT`)
-    /// - `IoPortRange`: I/O port base
+    /// - `IoPort`: I/O port base
     /// - `SchedControl`: 0 (unused)
     pub aux0: u64,
 
     /// Type-specific secondary metadata:
     /// - `Memory`: size in bytes
-    /// - `MmioRegion`: size in bytes
+    /// - `Mmio`: size in bytes
     /// - `Interrupt`: number of consecutive IRQ lines covered by the cap
-    /// - `IoPortRange`: port count
+    /// - `IoPort`: port count
     /// - `SchedControl`: 0 (unused)
     pub aux1: u64,
 }
@@ -429,10 +429,10 @@ pub enum CapType
     /// Hardware interrupt range. Matches `CapTag::Interrupt = 6`.
     /// `aux0 = start`, `aux1 = count`. Use `SYS_IRQ_SPLIT` to narrow.
     Interrupt = 6,
-    /// Memory-mapped I/O region. Matches `CapTag::MmioRegion = 7`.
-    MmioRegion = 7,
-    /// x86-64 I/O port range. Matches `CapTag::IoPortRange = 11`.
-    IoPortRange = 11,
+    /// Memory-mapped I/O region. Matches `CapTag::Mmio = 7`.
+    Mmio = 7,
+    /// x86-64 I/O port range. Matches `CapTag::IoPort = 11`.
+    IoPort = 11,
     /// Scheduling control authority. Matches `CapTag::SchedControl = 12`.
     SchedControl = 12,
     /// SBI forwarding authority (RISC-V only). Matches `CapTag::SbiControl = 13`.

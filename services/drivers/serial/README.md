@@ -17,8 +17,8 @@ serial/
     ├── main.rs                   # Driver entry, bootstrap, write service loop
     └── arch/
         ├── mod.rs                # #[cfg(target_arch)] dispatch
-        ├── x86_64/mod.rs         # COM1 IoPortRange (0x3F8): poll LSR, write THR
-        └── riscv64/mod.rs        # NS16550 MmioRegion (ACPI SPCR base): poll LSR, write THR
+        ├── x86_64/mod.rs         # COM1 IoPort (0x3F8): poll LSR, write THR
+        └── riscv64/mod.rs        # NS16550 Mmio (ACPI SPCR base): poll LSR, write THR
 ```
 
 ---
@@ -28,7 +28,7 @@ serial/
 Devmgr discovers the platform UART (ACPI SPCR; COM1 at I/O port `0x3F8` on
 x86-64, a memory-mapped NS16550 at the SPCR-reported base on RISC-V), spawns
 the driver via procmgr, and delegates the per-device arch authority cap — an
-`IoPortRange` on x86-64, an `MmioRegion` on RISC-V. The driver owns that cap
+`IoPort` on x86-64, an `Mmio` on RISC-V. The driver owns that cap
 end-to-end; no other userspace process except init-logd (the permanent
 pre-driver boot fallback) holds UART authority.
 

@@ -7,7 +7,7 @@
 //!
 //! Probes initial capabilities for a Seraph Framebuffer Descriptor (SFBD)
 //! `PlatformTable` page, reads display metadata from it, then maps the
-//! framebuffer pixel memory via its `MmioRegion` capability.
+//! framebuffer pixel memory via its `Mmio` capability.
 //!
 //! Uses the `shared/font` crate's 9×20 bitmap font for text rendering.
 //! Output is best-effort: silently no-ops if no framebuffer is available.
@@ -85,7 +85,7 @@ fn find_cap_by_aux0(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> 
 /// Probe for a framebuffer and map it if found.
 ///
 /// Scans Memory caps for a page containing the SFBD magic, reads metadata,
-/// then maps the corresponding `MmioRegion` for pixel access.
+/// then maps the corresponding `Mmio` for pixel access.
 ///
 /// # Safety
 /// Must be called once during early ktest startup, single-threaded.
@@ -140,13 +140,13 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32)
         return;
     }
 
-    // Phase 2: find and map the framebuffer MmioRegion.
+    // Phase 2: find and map the framebuffer Mmio.
     //
     // The MMIO region cap may cover the entire PCI MMIO window (1+ GiB on
     // QEMU q35). Mapping all of it would consume a huge VA range and collide
     // with ktest test addresses. Split the region down to just the
     // framebuffer pixels (stride × height, page-aligned) before mapping.
-    let Some(mmio_slot) = find_cap_by_aux0(info, CapType::MmioRegion, fb_phys)
+    let Some(mmio_slot) = find_cap_by_aux0(info, CapType::Mmio, fb_phys)
     else
     {
         return;
@@ -171,7 +171,7 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32)
     }
 
     // Clear the screen to black.
-    // SAFETY: FB_VA is mapped and writable (MmioRegion cap has MAP|WRITE).
+    // SAFETY: FB_VA is mapped and writable (Mmio cap has MAP|WRITE).
     unsafe {
         core::ptr::write_bytes(FB_VA as *mut u8, 0, fb_stride as usize * fb_height as usize);
     }

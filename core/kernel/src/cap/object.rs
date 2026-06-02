@@ -33,9 +33,9 @@
 //! |---------------------|-------|
 //! | KernelObjectHeader  | 16 B  |
 //! | MemoryObject         | 64 B  |
-//! | MmioRegionObject    | 40 B  |
+//! | MmioObject    | 40 B  |
 //! | InterruptObject     | 24 B  |
-//! | IoPortRangeObject   | 24 B  |
+//! | IoPortObject   | 24 B  |
 //! | SchedControlObject  | 16 B  |
 //! | SbiControlObject    | 16 B  |
 //! | ThreadObject        | 24 B  |
@@ -60,9 +60,9 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 pub enum ObjectType
 {
     Memory = 0,
-    MmioRegion = 1,
+    Mmio = 1,
     Interrupt = 2,
-    IoPortRange = 3,
+    IoPort = 3,
     SchedControl = 4,
     Thread = 5,
     AddressSpace = 6,
@@ -375,9 +375,9 @@ impl Drop for MemoryReadGuard<'_>
     }
 }
 
-/// Kernel object for a memory-mapped I/O region (`MmioRegion` capability).
+/// Kernel object for a memory-mapped I/O region (`Mmio` capability).
 #[repr(C)]
-pub struct MmioRegionObject
+pub struct MmioObject
 {
     pub header: KernelObjectHeader,
     /// Physical base address of the MMIO region.
@@ -406,9 +406,9 @@ pub struct InterruptObject
     pub count: u32,
 }
 
-/// Kernel object for an x86-64 I/O port range (`IoPortRange` capability).
+/// Kernel object for an x86-64 I/O port range (`IoPort` capability).
 #[repr(C)]
-pub struct IoPortRangeObject
+pub struct IoPortObject
 {
     pub header: KernelObjectHeader,
     /// First port number in the range.
@@ -1112,12 +1112,12 @@ unsafe fn dealloc_object_one(
                 push_ancestor(worklist, head, ancestor_nn);
             }
         }
-        ObjectType::MmioRegion =>
+        ObjectType::Mmio =>
         {
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
             debug_assert!(
                 !ancestor_ptr.is_null(),
-                "MmioRegion: every production cap is retype-backed (Phase-7 SEED, sys_mmio_split SEED)"
+                "Mmio: every production cap is retype-backed (Phase-7 SEED, sys_mmio_split SEED)"
             );
             use crate::cap::retype::retype_free;
             // SAFETY: ancestor_ptr non-null per debug_assert and 4b invariant.
@@ -1125,11 +1125,11 @@ unsafe fn dealloc_object_one(
             let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
             let offset = body_phys - ancestor_memory.base;
             // SAFETY: in-place body; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<MmioRegionObject>()) };
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<MmioObject>()) };
             retype_free(
                 ancestor_memory,
                 offset,
-                core::mem::size_of::<MmioRegionObject>() as u64,
+                core::mem::size_of::<MmioObject>() as u64,
             );
             let new_rc = ancestor_memory.header.dec_ref();
             if new_rc == 0
@@ -1187,12 +1187,12 @@ unsafe fn dealloc_object_one(
                 push_ancestor(worklist, head, ancestor_nn);
             }
         }
-        ObjectType::IoPortRange =>
+        ObjectType::IoPort =>
         {
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
             debug_assert!(
                 !ancestor_ptr.is_null(),
-                "IoPortRange: every production cap is retype-backed (Phase-7 SEED)"
+                "IoPort: every production cap is retype-backed (Phase-7 SEED)"
             );
             use crate::cap::retype::retype_free;
             // SAFETY: ancestor_ptr non-null per 4b invariant.
@@ -1200,11 +1200,11 @@ unsafe fn dealloc_object_one(
             let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
             let offset = body_phys - ancestor_memory.base;
             // SAFETY: in-place body; refcount 0 — unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<IoPortRangeObject>()) };
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<IoPortObject>()) };
             retype_free(
                 ancestor_memory,
                 offset,
-                core::mem::size_of::<IoPortRangeObject>() as u64,
+                core::mem::size_of::<IoPortObject>() as u64,
             );
             let new_rc = ancestor_memory.header.dec_ref();
             if new_rc == 0
@@ -2538,7 +2538,7 @@ mod tests
     #[test]
     fn mmio_object_header_at_offset_zero()
     {
-        assert_eq!(offset_of!(MmioRegionObject, header), 0);
+        assert_eq!(offset_of!(MmioObject, header), 0);
     }
 
     #[test]
@@ -2550,7 +2550,7 @@ mod tests
     #[test]
     fn ioport_object_header_at_offset_zero()
     {
-        assert_eq!(offset_of!(IoPortRangeObject, header), 0);
+        assert_eq!(offset_of!(IoPortObject, header), 0);
     }
 
     #[test]
@@ -2568,12 +2568,12 @@ mod tests
         // MemoryObject: 16 header + 8 base + 8 size + 8 available_bytes +
         // 1 owns_memory + 7 pad + 40 inline allocator + 4 lock + 4 pad = 96 bytes.
         assert_eq!(size_of::<MemoryObject>(), 96);
-        // MmioRegionObject: 16 header + 8 base + 8 size + 4 flags + 4 pad = 40.
-        assert_eq!(size_of::<MmioRegionObject>(), 40);
+        // MmioObject: 16 header + 8 base + 8 size + 4 flags + 4 pad = 40.
+        assert_eq!(size_of::<MmioObject>(), 40);
         // InterruptObject: 16 header + 4 start + 4 count = 24.
         assert_eq!(size_of::<InterruptObject>(), 24);
-        // IoPortRangeObject: 16 header + 2 base + 2 size + 4 pad = 24.
-        assert_eq!(size_of::<IoPortRangeObject>(), 24);
+        // IoPortObject: 16 header + 2 base + 2 size + 4 pad = 24.
+        assert_eq!(size_of::<IoPortObject>(), 24);
         // Wrapper objects: 16 header + 8 ptr = 24.
         assert_eq!(size_of::<SchedControlObject>(), 16);
         assert_eq!(size_of::<SbiControlObject>(), 16);

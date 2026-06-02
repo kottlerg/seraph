@@ -6,7 +6,7 @@
 //! Seraph userspace framebuffer device driver.
 //!
 //! Spawned by devmgr with the bootloader-discovered GOP linear-
-//! framebuffer `MmioRegion` cap plus a RECV cap on its service
+//! framebuffer `Mmio` cap plus a RECV cap on its service
 //! endpoint. Owns the framebuffer end-to-end and is the sole
 //! driver-mediated sink for userspace framebuffer bytes.
 //!

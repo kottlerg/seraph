@@ -146,7 +146,7 @@ Defined in `src/main.rs`:
   test function. `cspace_cap` is queried via
   `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` by hardware tests whose
   scans must cover slots populated after `aspace_cap` (e.g. narrow
-  `IoPortRange` caps carved by `ioport::bind_port_range` on `x86_64`).
+  `IoPort` caps carved by `ioport::bind_port_range` on `x86_64`).
 - `PASS_COUNT` / `FAIL_COUNT` — atomic counters updated by `run_test!`.
 - `log(msg)` / `log_u64(prefix, value)` — heap-free logging utilities.
 - `spawn::new_child(ctx)` / `configure_and_start(child, …)` /

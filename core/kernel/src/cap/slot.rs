@@ -141,7 +141,7 @@ pub enum CapTag
     /// Hardware interrupt line.
     Interrupt = 6,
     /// Memory-mapped I/O region.
-    MmioRegion = 7,
+    Mmio = 7,
     /// Thread control block.
     Thread = 8,
     /// Capability space.
@@ -149,7 +149,7 @@ pub enum CapTag
     /// Wait set (multi-object poll).
     WaitSet = 10,
     /// x86-64 I/O port range.
-    IoPortRange = 11,
+    IoPort = 11,
     /// Scheduling control authority.
     SchedControl = 12,
     /// SBI forwarding authority (RISC-V only).
@@ -222,7 +222,7 @@ impl Rights
     /// May add or remove wait set members.
     pub const MODIFY: Rights = Rights(1 << 17);
 
-    // ── IoPortRange ───────────────────────────────────────────────────────────
+    // ── IoPort ───────────────────────────────────────────────────────────
     /// May bind port range to a thread for in/out access.
     pub const USE: Rights = Rights(1 << 18);
 

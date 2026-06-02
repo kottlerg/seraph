@@ -136,18 +136,18 @@ A capability to a wait set (see IPC design). Rights:
 - **Modify** — may add or remove members
 - **Wait** — may block on the wait set
 
-### IoPortRange (x86-64 only)
+### IoPort (x86-64 only)
 
 A capability to a contiguous range of x86 I/O port numbers. Rights:
 - **Use** — may bind this port range to a thread, allowing that thread to execute
   `in`/`out` instructions for those ports without a syscall
 
-IoPortRange capabilities are created at boot from `IoPortRange` entries in the
+IoPort capabilities are created at boot from `IoPort` entries in the
 boot-provided `platform_resources`. They are not creatable at runtime. A driver
-that needs port I/O access receives a derived IoPortRange capability from init
+that needs port I/O access receives a derived IoPort capability from init
 (via devmgr), covering only its assigned port range.
 
-Revoking an IoPortRange capability removes port access from all threads it has
+Revoking an IoPort capability removes port access from all threads it has
 been bound to. The kernel tracks bindings and updates each affected thread's IOPB
 in the TSS on revocation.
 
@@ -401,7 +401,7 @@ the CSpace with an initial set of capabilities covering all available resources:
 - Interrupt capabilities for all boot-provided interrupt lines
 - Read-only Memory capabilities for firmware table regions (PlatformTable entries),
   allowing userspace to parse ACPI or Device Tree data
-- IoPortRange capabilities for all boot-provided I/O port ranges (x86-64 only)
+- IoPort capabilities for all boot-provided I/O port ranges (x86-64 only)
 - One SchedControl capability (Elevate rights)
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)

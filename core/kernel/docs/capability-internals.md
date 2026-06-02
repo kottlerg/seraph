@@ -143,9 +143,9 @@ pub enum CapTag
     CSpace        = 7,   // capability space; explicit kernel object
     WaitSet       = 8,
     Interrupt     = 9,
-    MmioRegion    = 10,
+    Mmio    = 10,
     Reply         = 11,  // single-use; not derivable
-    IoPortRange   = 12,  // x86-64 only; created at boot from platform_resources
+    IoPort   = 12,  // x86-64 only; created at boot from platform_resources
     SchedControl  = 13,  // authority to set elevated scheduling priorities
 }
 ```
@@ -193,7 +193,7 @@ bitflags! {
         const MODIFY     = 1 << 13;
         // (WAIT reused for wait set wait right)
 
-        // IoPortRange rights
+        // IoPort rights
         const USE        = 1 << 15;  // may bind port range to a thread
 
         // SchedControl rights
@@ -383,7 +383,7 @@ layout via a well-known structure at the top of init's stack.
 | N+1..M | MMIO region capabilities (one per MmioRange / PciEcam entry) |
 | M+1..K | Interrupt capabilities (one per IrqLine entry) |
 | K+1..L | Read-only Memory capabilities (one per PlatformTable entry) |
-| L+1..P | IoPortRange capabilities (one per IoPortRange entry; x86-64 only) |
+| L+1..P | IoPort capabilities (one per IoPort entry; x86-64 only) |
 | P+1..Q | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
 | Q+1..R | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry |
 

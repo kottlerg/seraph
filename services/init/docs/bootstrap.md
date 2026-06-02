@@ -227,9 +227,9 @@ holds:
 |---|---|
 | Self-objects | `Thread`, `AddressSpace`, `CSpace` caps for init itself |
 | Memory | `Memory` caps covering every usable physical memory page |
-| MMIO | One `MmioRegion` cap per coarse MMIO aperture |
+| MMIO | One `Mmio` cap per coarse MMIO aperture |
 | Interrupts | One root `Interrupt` range cap (narrowed per-device in userspace via `sys_irq_split`) |
-| I/O ports (x86-64) | `IoPortRange` cap covering the full 64 KiB port space |
+| I/O ports (x86-64) | `IoPort` cap covering the full 64 KiB port space |
 | SBI (RISC-V) | `SbiControl` cap |
 | Firmware tables | Read-only `Memory` caps covering the ACPI RSDP page, each `AcpiReclaimable` region, and the DTB blob |
 | Scheduler | `SchedControl` cap |
@@ -248,7 +248,7 @@ svcmgr if needed.
 |---|---|---|
 | Raw bootstrap | memmgr | RAM `Memory` cap pool (every Memory cap not consumed by init/procmgr setup) |
 | Raw bootstrap | procmgr | memmgr SEND cap, log endpoint SEND, svcmgr service endpoint SEND, boot-module `Memory` caps for downstream `CREATE_PROCESS` |
-| Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Memory caps; root `IoPortRange` (x86-64) / `SbiControl` (RISC-V) via the terminal `SVCMGR_BUNDLE` round — the hardware + shutdown authority devmgr brokers to drivers and to pwrmgr |
+| Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Memory caps; root `IoPort` (x86-64) / `SbiControl` (RISC-V) via the terminal `SVCMGR_BUNDLE` round — the hardware + shutdown authority devmgr brokers to drivers and to pwrmgr |
 | Raw bootstrap | vfsd | `SEED_AUTHORITY`-badged SEND on vfsd's own service endpoint (gates `GET_SYSTEM_ROOT_CAP`). vfsd self-mounts root, so init issues no `MOUNT` and keeps no FS access of its own. |
 | Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — round 1 (`CAPS`): full-rights SEND on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a badge-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry` publish cap and the `SET_DRIVERS_DIR` cap); rounds 2..N (`SUBSTRATE`): one `(name, thread_cap)` per substrate service for death-supervision binding; terminal round (`LOGD_SOURCES`): a `RIGHTS_ALL` master-log endpoint source and a badge-0 `SEND\|GRANT` procmgr source, both reserved for the system's lifetime so svcmgr can launch + supervise + restart real-logd (minting its master-log RECV, first-launch `HANDOVER_PULL` SEND, and `DEATH_EQ_AUTHORITY` SEND per launch). svcmgr publishes all well-known names itself, sends `SET_DRIVERS_DIR` from these sources, and launches real-logd; init publishes nothing and does not talk to devmgr. |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Memory cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline memory cap, boot-module ELF sources) |

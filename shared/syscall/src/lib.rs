@@ -1068,7 +1068,7 @@ pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Split `mmio_cap` into two non-overlapping child `MmioRegion` caps.
+/// Split `mmio_cap` into two non-overlapping child `Mmio` caps.
 ///
 /// `split_offset` is in bytes and must be page-aligned, > 0, and < the region
 /// size. The original cap is consumed. Returns `(slot1, slot2)` where slot1
@@ -1126,7 +1126,7 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
     }
 }
 
-/// Split an `IoPortRange` cap into two non-overlapping children.
+/// Split an `IoPort` cap into two non-overlapping children.
 ///
 /// `split_at` is the first port of the upper child (and the exclusive upper
 /// bound of the lower child); it must satisfy `base < split_at < base + size`

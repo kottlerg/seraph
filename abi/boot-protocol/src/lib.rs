@@ -507,7 +507,7 @@ impl KernelMmio
 /// platform's non-RAM address space.
 ///
 /// Each entry is a region from which the kernel mints exactly one
-/// `MmioRegion` capability (MAP | WRITE) and hands it to init. Userspace
+/// `Mmio` capability (MAP | WRITE) and hands it to init. Userspace
 /// narrows these to per-device ranges via `mmio_split` (not in this
 /// protocol revision) and distributes them to drivers. Apertures are
 /// intentionally coarse; device-level enumeration is `devmgr`'s job from
@@ -681,7 +681,7 @@ pub struct BootInfo
     pub kernel_mmio: KernelMmio,
 
     /// Coarse-grained MMIO apertures from which the kernel mints
-    /// `MmioRegion` capabilities.
+    /// `Mmio` capabilities.
     ///
     /// One cap minted per entry, handed to init, narrowed and distributed
     /// by userspace. Replaces the per-device `PlatformResource` array from

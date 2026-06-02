@@ -74,7 +74,7 @@ fn main() -> !
         ecam_loc.end_bus
     );
 
-    // Find the aperture covering ECAM and carve a narrow ECAM MmioRegion cap.
+    // Find the aperture covering ECAM and carve a narrow ECAM Mmio cap.
     let Some(ecam_cap) = carve_subrange(&mut caps, ecam_loc.phys_base, ecam_loc.size)
     else
     {
@@ -909,7 +909,7 @@ fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64
 
 /// `QUERY_SHUTDOWN_DEVICE` handler: serve pwrmgr the platform shutdown
 /// actuator caps. devmgr carves exactly what is asked for and runs no
-/// shutdown logic. x86-64: a narrow `IoPortRange` over the caller-supplied
+/// shutdown logic. x86-64: a narrow `IoPort` over the caller-supplied
 /// `PM1a` control port plus the 8042 reset port. RISC-V: a `cap_derive` copy
 /// of `SbiControl`. The caps are re-derived from the root on every call,
 /// so a pwrmgr restart re-acquires them cleanly.
@@ -989,7 +989,7 @@ fn handle_query_shutdown_device(
 
 // ── Aperture splitting helper ───────────────────────────────────────────────
 
-/// Carve a narrow `MmioRegion` cap of `(phys, size)` out of whichever
+/// Carve a narrow `Mmio` cap of `(phys, size)` out of whichever
 /// aperture covers it. Consumes the entry and replaces it with up to
 /// two remainders: the **lower** portion `[ap_base, phys)` becomes a
 /// new aperture slot (if non-empty and a free slot exists), and the
@@ -1380,7 +1380,7 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
 
 // ── Framebuffer driver spawn ────────────────────────────────────────────────
 
-/// Carve a narrow `MmioRegion` cap covering the linear framebuffer and
+/// Carve a narrow `Mmio` cap covering the linear framebuffer and
 /// spawn the framebuffer driver. Registers the geometry in `catalog`
 /// so the driver can fetch it via `QUERY_DEVICE_INFO` at runtime; mints
 /// a badged devmgr-query endpoint for the driver's round-2 cap.
@@ -1589,8 +1589,8 @@ fn spawn_rtc_from_disk(
     }
 }
 
-/// Carve the COM1 `IoPortRange` (`0x3F8`..=`0x3FF`) out of the root
-/// `IoPortRange` cap.
+/// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of the root
+/// `IoPort` cap.
 #[cfg(target_arch = "x86_64")]
 fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
 {
@@ -1616,7 +1616,7 @@ fn carve_rtc_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
     carve_subrange(caps, 0x0010_1000, 0x1000)
 }
 
-/// Carve the NS16550 `MmioRegion` out of the aperture covering the UART
+/// Carve the NS16550 `Mmio` out of the aperture covering the UART
 /// MMIO window.
 ///
 /// The window is the QEMU `virt` NS16550 at `[0x1000_0000, 0x1000_1000)` —
@@ -1631,8 +1631,8 @@ fn carve_uart_authority(caps: &mut caps::DevmgrCaps) -> Option<u32>
     carve_subrange(caps, 0x1000_0000, 0x1000)
 }
 
-/// Carve a narrow `IoPortRange` of `count` ports starting at `base` out of
-/// the root `IoPortRange` cap via two `ioport_split` calls. Returns the
+/// Carve a narrow `IoPort` of `count` ports starting at `base` out of
+/// the root `IoPort` cap via two `ioport_split` calls. Returns the
 /// narrow slot; the unused slabs are deleted. `cap_derive`-copies the root
 /// so it stays intact for further carves. Mirrors init's `ioport_carve`.
 #[cfg(target_arch = "x86_64")]

@@ -34,9 +34,9 @@ Bootstrap caps from devmgr (one round, two caps, `done=true`):
 | Slot      | Cap                                                  |
 |-----------|------------------------------------------------------|
 | `caps[0]` | Service-endpoint RECV (driver receives on this)      |
-| `caps[1]` | `IoPortRange` covering CMOS index/data ports `0x70`–`0x71` |
+| `caps[1]` | `IoPort` covering CMOS index/data ports `0x70`–`0x71` |
 
-The driver binds the `IoPortRange` cap to its main thread via
+The driver binds the `IoPort` cap to its main thread via
 `syscall::ioport_bind` and uses `in`/`out` to drive the CMOS access
 protocol.
 

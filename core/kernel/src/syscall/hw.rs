@@ -10,9 +10,9 @@
 //! - `SYS_IRQ_REGISTER` (30): bind a Notification to an interrupt line.
 //! - `SYS_MMIO_MAP` (34): map an MMIO region into an address space.
 //! - `SYS_IOPORT_BIND` (35): bind an I/O port range to a thread (`x86_64` only).
-//! - `SYS_MMIO_SPLIT` (45): split an `MmioRegion` cap into two sub-regions.
+//! - `SYS_MMIO_SPLIT` (45): split an `Mmio` cap into two sub-regions.
 //! - `SYS_IRQ_SPLIT` (49): split an `Interrupt` range cap into two sub-ranges.
-//! - `SYS_IOPORT_SPLIT` (51): split an `IoPortRange` cap into two sub-ranges
+//! - `SYS_IOPORT_SPLIT` (51): split an `IoPort` cap into two sub-ranges
 //!   (`x86_64` only).
 //!
 //! # Adding new hardware syscalls
@@ -197,7 +197,7 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_MMIO_MAP` (34): map an MMIO region into a user address space.
 ///
 /// arg0 = `AddressSpace` cap index (must have MAP right).
-/// arg1 = `MmioRegion` cap index (must have MAP right).
+/// arg1 = `Mmio` cap index (must have MAP right).
 /// arg2 = virtual base address (page-aligned, user half).
 /// arg3 = flags (bit 1 = WRITE; executable mappings are always rejected).
 ///
@@ -215,7 +215,7 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{AddressSpaceObject, MmioRegionObject};
+    use crate::cap::object::{AddressSpaceObject, MmioObject};
     use crate::cap::slot::{CapTag, Rights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::PageFlags;
@@ -242,15 +242,14 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null; cspace set at thread creation.
     let cspace = unsafe { (*tcb).cspace };
 
-    // Resolve MmioRegion cap.
+    // Resolve Mmio cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let mmio_slot =
-        unsafe { super::lookup_cap(cspace, mmio_idx, CapTag::MmioRegion, Rights::MAP) }?;
+    let mmio_slot = unsafe { super::lookup_cap(cspace, mmio_idx, CapTag::Mmio, Rights::MAP) }?;
     let (mmio_phys, mmio_size) = {
         let obj = mmio_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed MmioRegion; object was allocated as Box<MmioRegionObject>.
+        // SAFETY: tag confirmed Mmio; object was allocated as Box<MmioObject>.
         #[allow(clippy::cast_ptr_alignment)]
-        let mo = unsafe { &*obj.as_ptr().cast::<MmioRegionObject>() };
+        let mo = unsafe { &*obj.as_ptr().cast::<MmioObject>() };
         (mo.base, mo.size)
     };
 
@@ -315,7 +314,7 @@ pub fn sys_mmio_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let phys = mmio_phys + (i * PAGE_SIZE) as u64;
 
         // SAFETY: virt in user range (validated above); phys from a
-        // kernel-provisioned MmioRegion boot object. Pooled vs heap-backed
+        // kernel-provisioned Mmio boot object. Pooled vs heap-backed
         // dispatch is chosen once above from the AS's typed-memory state.
         let result = if pooled
         {
@@ -345,7 +344,7 @@ pub fn sys_mmio_map(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_IOPORT_BIND` (35): grant a thread access to an I/O port range.
 ///
 /// arg0 = Thread cap index (must have CONTROL right).
-/// arg1 = `IoPortRange` cap index (must have USE right).
+/// arg1 = `IoPort` cap index (must have USE right).
 ///
 /// On first bind, a 8 KiB per-thread IOPB bitmap is heap-allocated and all
 /// ports are denied (0xFF). The requested range bits are then cleared (0 =
@@ -372,7 +371,7 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     #[cfg(target_arch = "x86_64")]
     {
         use crate::arch::current::gdt;
-        use crate::cap::object::{IoPortRangeObject, ThreadObject};
+        use crate::cap::object::{IoPortObject, ThreadObject};
         use crate::cap::slot::{CapTag, Rights};
         use crate::syscall::current_tcb;
 
@@ -405,15 +404,15 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidCapability);
         }
 
-        // Resolve IoPortRange cap.
+        // Resolve IoPort cap.
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
         let port_slot =
-            unsafe { super::lookup_cap(cspace, ioport_idx, CapTag::IoPortRange, Rights::USE) }?;
+            unsafe { super::lookup_cap(cspace, ioport_idx, CapTag::IoPort, Rights::USE) }?;
         let (port_base, port_size) = {
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: tag confirmed IoPortRange; object was allocated as Box<IoPortRangeObject>.
+            // SAFETY: tag confirmed IoPort; object was allocated as Box<IoPortObject>.
             #[allow(clippy::cast_ptr_alignment)]
-            let po = unsafe { &*obj.as_ptr().cast::<IoPortRangeObject>() };
+            let po = unsafe { &*obj.as_ptr().cast::<IoPortObject>() };
             (po.base, po.size)
         };
 
@@ -476,13 +475,13 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // ── SYS_MMIO_SPLIT ──────────────────────────────────────────────────────────
 
-/// `SYS_MMIO_SPLIT` (45): split an `MmioRegion` cap into two non-overlapping children.
+/// `SYS_MMIO_SPLIT` (45): split an `Mmio` cap into two non-overlapping children.
 ///
-/// arg0 = `MmioRegion` cap index (must have MAP right).
+/// arg0 = `Mmio` cap index (must have MAP right).
 /// arg1 = split offset in bytes (page-aligned; must be > 0 and < region size).
 /// arg2 = reserved (must be 0).
 ///
-/// Consumes the original cap and creates two new `MmioRegion` caps with the same
+/// Consumes the original cap and creates two new `Mmio` caps with the same
 /// rights and flags, covering `[base, base+split_offset)` and
 /// `[base+split_offset, end)`. Both children are reparented to the original
 /// cap's derivation parent (same revocability semantics as sibling caps).
@@ -497,7 +496,7 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
-    use crate::cap::object::{KernelObjectHeader, MmioRegionObject, ObjectType, dealloc_object};
+    use crate::cap::object::{KernelObjectHeader, MmioObject, ObjectType, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
     use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, Rights, SlotId};
@@ -537,11 +536,11 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let (mmio_phys, mmio_size, mmio_flags, mmio_rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
         let slot =
-            unsafe { super::lookup_cap(caller_cspace, mmio_idx, CapTag::MmioRegion, Rights::MAP) }?;
+            unsafe { super::lookup_cap(caller_cspace, mmio_idx, CapTag::Mmio, Rights::MAP) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed MmioRegion; pointer is valid MmioRegionObject.
+        // SAFETY: tag confirmed Mmio; pointer is valid MmioObject.
         #[allow(clippy::cast_ptr_alignment)]
-        let mo = unsafe { &*(obj_ptr.as_ptr().cast::<MmioRegionObject>()) };
+        let mo = unsafe { &*(obj_ptr.as_ptr().cast::<MmioObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
         let cspace_id = unsafe { (*caller_cspace).id() };
         (mo.base, mo.size, mo.flags, slot.rights, cspace_id, obj_ptr)
@@ -558,15 +557,15 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
-    // ── Create two child MmioRegionObjects ────────────────────────────────────
+    // ── Create two child MmioObjects ────────────────────────────────────
     //
     // Both wrapper bodies live in the kernel SEED Memory cap; their
     // `header.ancestor` points at SEED so dealloc returns the bytes via
     // `retype_free`.
 
     // child1: [base, base + split_offset).
-    let child1_ptr = alloc_in_seed(MmioRegionObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
+    let child1_ptr = alloc_in_seed(MmioObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
         base: mmio_phys,
         size: split_offset,
         flags: mmio_flags,
@@ -574,8 +573,8 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     })?;
 
     // child2: [base + split_offset, end).
-    let child2_ptr = match alloc_in_seed(MmioRegionObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
+    let child2_ptr = match alloc_in_seed(MmioObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
         base: mmio_phys + split_offset,
         size: mmio_size - split_offset,
         flags: mmio_flags,
@@ -597,7 +596,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
     let slot1_nz = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(CapTag::MmioRegion, mmio_rights, child1_ptr);
+        let r = (*caller_cspace).insert_cap(CapTag::Mmio, mmio_rights, child1_ptr);
         (*caller_cspace).lock.unlock_raw(saved);
         r
     }
@@ -614,7 +613,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let slot2_nz = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(CapTag::MmioRegion, mmio_rights, child2_ptr);
+        let r = (*caller_cspace).insert_cap(CapTag::Mmio, mmio_rights, child2_ptr);
         (*caller_cspace).lock.unlock_raw(saved);
         r
     }
@@ -902,15 +901,15 @@ pub fn sys_irq_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // ── SYS_IOPORT_SPLIT ─────────────────────────────────────────────────────────
 
-/// `SYS_IOPORT_SPLIT` (51): split an `IoPortRange` cap into two non-overlapping children.
+/// `SYS_IOPORT_SPLIT` (51): split an `IoPort` cap into two non-overlapping children.
 ///
-/// arg0 = `IoPortRange` cap index (must have USE right).
+/// arg0 = `IoPort` cap index (must have USE right).
 /// arg1 = `split_at` port number. Must satisfy `base < split_at < base + size`
 ///        (with `size == 0` interpreted as full 64K range). The lower child
 ///        covers `[base, split_at)`; the upper child covers
 ///        `[split_at, base + size)`.
 ///
-/// Consumes the original cap and creates two new `IoPortRange` caps with the
+/// Consumes the original cap and creates two new `IoPort` caps with the
 /// same rights, covering the two halves. Both children are reparented to the
 /// original's derivation parent.
 ///
@@ -934,9 +933,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     #[cfg(target_arch = "x86_64")]
     {
         use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
-        use crate::cap::object::{
-            IoPortRangeObject, KernelObjectHeader, ObjectType, dealloc_object,
-        };
+        use crate::cap::object::{IoPortObject, KernelObjectHeader, ObjectType, dealloc_object};
         use crate::cap::retype::alloc_in_seed;
         use crate::cap::seed_header_nn;
         use crate::cap::slot::{CapTag, Rights, SlotId};
@@ -972,13 +969,12 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
         let (base, size_u16, rights, cspace_id, orig_obj_ptr) = {
             // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-            let slot = unsafe {
-                super::lookup_cap(caller_cspace, port_idx, CapTag::IoPortRange, Rights::USE)
-            }?;
+            let slot =
+                unsafe { super::lookup_cap(caller_cspace, port_idx, CapTag::IoPort, Rights::USE) }?;
             let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // SAFETY: tag confirmed IoPortRange; pointer is valid IoPortRangeObject.
+            // SAFETY: tag confirmed IoPort; pointer is valid IoPortObject.
             #[allow(clippy::cast_ptr_alignment)]
-            let po = unsafe { &*(obj_ptr.as_ptr().cast::<IoPortRangeObject>()) };
+            let po = unsafe { &*(obj_ptr.as_ptr().cast::<IoPortObject>()) };
             // SAFETY: caller_cspace validated non-null; id() reads discriminator.
             let cspace_id = unsafe { (*caller_cspace).id() };
             (po.base, po.size, slot.rights, cspace_id, obj_ptr)
@@ -1005,7 +1001,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             return Err(SyscallError::InvalidArgument);
         }
 
-        // ── Create two child IoPortRangeObjects ─────────────────────────────
+        // ── Create two child IoPortObjects ─────────────────────────────
         //
         // Both halves are guaranteed u16-representable because:
         //   lower_count = split_at - base_u32, where 1 <= split_at - base_u32 < 65536
@@ -1016,15 +1012,15 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let upper_count: u16 = (end - split_at) as u16;
         let split_at_u16: u16 = split_at as u16;
 
-        let child1_ptr = alloc_in_seed(IoPortRangeObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::IoPortRange, seed_header_nn()),
+        let child1_ptr = alloc_in_seed(IoPortObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
             base,
             size: lower_count,
             _pad: 0,
         })?;
 
-        let child2_ptr = match alloc_in_seed(IoPortRangeObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::IoPortRange, seed_header_nn()),
+        let child2_ptr = match alloc_in_seed(IoPortObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
             base: split_at_u16,
             size: upper_count,
             _pad: 0,
@@ -1044,7 +1040,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
         let slot1_nz = unsafe {
             let saved = (*caller_cspace).lock.lock_raw();
-            let r = (*caller_cspace).insert_cap(CapTag::IoPortRange, rights, child1_ptr);
+            let r = (*caller_cspace).insert_cap(CapTag::IoPort, rights, child1_ptr);
             (*caller_cspace).lock.unlock_raw(saved);
             r
         }
@@ -1061,7 +1057,7 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
         let slot2_nz = unsafe {
             let saved = (*caller_cspace).lock.lock_raw();
-            let r = (*caller_cspace).insert_cap(CapTag::IoPortRange, rights, child2_ptr);
+            let r = (*caller_cspace).insert_cap(CapTag::IoPort, rights, child2_ptr);
             (*caller_cspace).lock.unlock_raw(saved);
             r
         }

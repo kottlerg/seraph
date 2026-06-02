@@ -16,7 +16,7 @@ static mut UART_BASE: u64 = 0;
 
 /// Initialise UART serial output via MMIO.
 ///
-/// Scans `MmioRegion` descriptors for the aperture containing `UART_PHYS`,
+/// Scans `Mmio` descriptors for the aperture containing `UART_PHYS`,
 /// maps the full aperture at `SERIAL_VA`, and records the UART's virtual
 /// address including its in-aperture offset. v6 apertures are coarse —
 /// the UART is typically one of several devices inside the aperture.
@@ -26,7 +26,7 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u32)
     let mut aperture: Option<(u32, u64, u64)> = None;
     for d in descriptors
     {
-        if d.cap_type != CapType::MmioRegion
+        if d.cap_type != CapType::Mmio
         {
             continue;
         }

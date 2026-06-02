@@ -9,7 +9,7 @@ enumeration, binding, and policy live in `devmgr`.
 ## Boot-Provided Resource Descriptors (summary — [`abi/boot-protocol/`](../abi/boot-protocol/))
 
 The kernel consumes `BootInfo.mmio_apertures` during Phase 7 of
-initialization and mints one `MmioRegion` capability per entry. These
+initialization and mints one `Mmio` capability per entry. These
 coarse apertures, together with the arch-specific `BootInfo.kernel_mmio`
 the kernel reads directly, are the only structured hardware descriptors
 the bootloader produces. Firmware parsing (ACPI / DTB table walking) is

@@ -9,8 +9,8 @@
 //! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`, `SYS_IOPORT_BIND`, `SYS_IOPORT_SPLIT`,
 //! `SYS_SBI_CALL`.
 //!
-//! Tests that require specific hardware capability types (`MmioRegion`, Interrupt,
-//! `IoPortRange`) scan the initial capability set for a matching cap. If none is
+//! Tests that require specific hardware capability types (`Mmio`, Interrupt,
+//! `IoPort`) scan the initial capability set for a matching cap. If none is
 //! found in the current boot configuration, the test is skipped and reports Ok.
 //! Skips are logged to serial so they are visible in the test run output.
 
@@ -39,16 +39,16 @@ const ROOT_CSPACE_MAX_SLOTS: u32 = 14336;
 ///
 /// Maps only a single carved page, not the whole aperture: post-Gap-B,
 /// `sys_mmio_map` draws intermediate PT pages from the *target* AS's own pool,
-/// and the first `MmioRegion` in the boot config can span hundreds of MiB
+/// and the first `Mmio` in the boot config can span hundreds of MiB
 /// (hundreds of PT pages) — mapping it whole would drain `ctx.aspace_cap`'s
 /// pool, which the `mem_map` integration and bench tests share. One page
 /// suffices to exercise the map + `aspace_query` path. The region is split so
-/// its large remainder stays a valid `MmioRegion` for [`mmio_split_carves`].
-/// Skipped if no `MmioRegion` of at least two pages exists in this boot config.
+/// its large remainder stays a valid `Mmio` for [`mmio_split_carves`].
+/// Skipped if no `Mmio` of at least two pages exists in this boot config.
 pub fn mmio_map(ctx: &TestContext) -> TestResult
 {
     // Probe each slot with a one-page split. `InvalidCapability` ⇒ wrong tag;
-    // `InvalidArgument` ⇒ an `MmioRegion` smaller than two pages. Both leave
+    // `InvalidArgument` ⇒ an `Mmio` smaller than two pages. Both leave
     // the cap intact, so the scan is non-destructive until a split succeeds.
     for slot in 1..ctx.aspace_cap
     {
@@ -58,7 +58,7 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
             continue;
         };
         // `lo` covers one page; map and verify it. The remainder child (`_hi`)
-        // stays in the CSpace as a valid `MmioRegion` for the split test that
+        // stays in the CSpace as a valid `Mmio` for the split test that
         // runs next.
         let result = (|| -> TestResult {
             syscall::mmio_map(ctx.aspace_cap, lo, MMIO_TEST_VA, 0)
@@ -76,7 +76,7 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
         return result;
     }
 
-    crate::log("ktest: hw::mmio_map SKIP (no MmioRegion >= 2 pages in initial cap set)");
+    crate::log("ktest: hw::mmio_map SKIP (no Mmio >= 2 pages in initial cap set)");
     Ok(())
 }
 
@@ -120,8 +120,8 @@ pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 /// `ioport_bind` binds an I/O port range to a thread.
 ///
 /// On RISC-V this syscall is not supported and must return `NotSupported`.
-/// On `x86_64`, scans for the first `IoPortRange` cap and binds it to a test
-/// thread. If no `IoPortRange` cap is found, the test is skipped.
+/// On `x86_64`, scans for the first `IoPort` cap and binds it to a test
+/// thread. If no `IoPort` cap is found, the test is skipped.
 ///
 /// The scan bound is the cspace's `max_slots` (queried at runtime via
 /// `cap_info`) so the test stays robust against changes to cap mint
@@ -180,7 +180,7 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
             }
         }
 
-        crate::log("ktest: hw::ioport_bind SKIP (no IoPortRange caps in initial cap set)");
+        crate::log("ktest: hw::ioport_bind SKIP (no IoPort caps in initial cap set)");
         syscall::cap_delete(th).ok();
         syscall::cap_delete(cs).ok();
         Ok(())
@@ -189,16 +189,16 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
 
 // ── SYS_IOPORT_SPLIT ──────────────────────────────────────────────────────────
 
-/// `ioport_split` divides an `IoPortRange` cap into two non-overlapping children.
+/// `ioport_split` divides an `IoPort` cap into two non-overlapping children.
 ///
 /// On RISC-V this syscall is not supported and must return `NotSupported`.
-/// On `x86_64`, scans the cspace for the first `IoPortRange` cap whose
+/// On `x86_64`, scans the cspace for the first `IoPort` cap whose
 /// range covers port 0x80 and splits it there. Slots whose cap is the
-/// wrong type or an `IoPortRange` not covering 0x80 are skipped
+/// wrong type or an `IoPort` not covering 0x80 are skipped
 /// non-destructively. Validates: both child slots are non-zero and
 /// distinct; re-splitting the now-consumed parent slot fails;
 /// out-of-range splits fail with `InvalidArgument`. If no such
-/// `IoPortRange` is found, the test is skipped.
+/// `IoPort` is found, the test is skipped.
 ///
 /// The original cap is consumed by the split; this is the documented
 /// semantics. No later test depends on the same slot.
@@ -219,9 +219,9 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    // x86_64: find an IoPortRange cap covering 0x80 by probing with
+    // x86_64: find an IoPort cap covering 0x80 by probing with
     // `ioport_split`. `ioport_split` returns `InvalidCapability` for
-    // wrong cap types and `InvalidArgument` for an `IoPortRange` whose
+    // wrong cap types and `InvalidArgument` for an `IoPort` whose
     // range doesn't cover the split point. Either result lets us
     // identify the slot's type non-destructively, since neither
     // consumes the cap.
@@ -240,11 +240,11 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
             };
         for slot in 1u32..max_slots
         {
-            // Try splitting at 0x80. If the slot is not an IoPortRange we
+            // Try splitting at 0x80. If the slot is not an IoPort we
             // get InvalidCapability and keep scanning. If it is an
-            // IoPortRange that doesn't cover 0x80 (e.g. a narrow
+            // IoPort that doesn't cover 0x80 (e.g. a narrow
             // sub-range carved by `ioport::bind_port_range`) we also keep
-            // scanning — another slot may hold a wider IoPortRange that
+            // scanning — another slot may hold a wider IoPort that
             // does cover the probe point.
             match syscall::ioport_split(slot, 0x80)
             {
@@ -254,7 +254,7 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
                 }
                 Err(e) if e == SyscallError::InvalidArgument as i64 =>
                 {
-                    // IoPortRange whose range doesn't cover 0x80; cap is
+                    // IoPort whose range doesn't cover 0x80; cap is
                     // intact. Keep scanning for another candidate.
                 }
                 Err(_) =>
@@ -288,16 +288,14 @@ pub fn ioport_split(ctx: &TestContext) -> TestResult
             }
         }
 
-        crate::log(
-            "ktest: hw::ioport_split SKIP (no IoPortRange covering 0x80 in initial cap set)",
-        );
+        crate::log("ktest: hw::ioport_split SKIP (no IoPort covering 0x80 in initial cap set)");
         Ok(())
     }
 }
 
 // ── SYS_MMIO_SPLIT ────────────────────────────────────────────────────────────
 
-/// `mmio_split` on the first `MmioRegion` ≥ 8 KiB returns two valid children
+/// `mmio_split` on the first `Mmio` ≥ 8 KiB returns two valid children
 /// with disjoint base/size. Skipped if no suitable cap exists.
 pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
 {
@@ -307,7 +305,7 @@ pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
     for slot in 1u32..max_slots
     {
         // Probe: split at PAGE_SIZE. InvalidCapability ⇒ wrong tag.
-        // InvalidArgument ⇒ MmioRegion exists but too small.
+        // InvalidArgument ⇒ Mmio exists but too small.
         match mmio_split(slot, 0x1000)
         {
             Err(e) if e == SyscallError::InvalidCapability as i64 =>
@@ -328,7 +326,7 @@ pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
         }
     }
 
-    crate::log("ktest: hw::mmio_split_carves SKIP (no MmioRegion caps in initial cap set)");
+    crate::log("ktest: hw::mmio_split_carves SKIP (no Mmio caps in initial cap set)");
     Ok(())
 }
 

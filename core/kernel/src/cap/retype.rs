@@ -805,7 +805,7 @@ pub const EVENT_QUEUE_RING_OFFSET: u64 = EVENT_QUEUE_WRAPPER_BYTES + EVENT_QUEUE
 /// / `CSpace`). Pass `0` for fixed-size types.
 ///
 /// Returns `None` for object types that cannot be retyped (`Memory` is
-/// retypable; `MmioRegion`/`Interrupt`/`IoPortRange`/`SchedControl`/
+/// retypable; `Mmio`/`Interrupt`/`IoPort`/`SchedControl`/
 /// `SbiControl` are boot-minted only).
 pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEntry>
 {
@@ -878,9 +878,9 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             split: true,
         }),
         // Boot-minted only.
-        ObjectType::MmioRegion
+        ObjectType::Mmio
         | ObjectType::Interrupt
-        | ObjectType::IoPortRange
+        | ObjectType::IoPort
         | ObjectType::SchedControl
         | ObjectType::SbiControl => None,
     }
@@ -1042,9 +1042,9 @@ mod tests
     #[test]
     fn dispatch_boot_minted_types_refused()
     {
-        assert!(dispatch_for(ObjectType::MmioRegion, 0).is_none());
+        assert!(dispatch_for(ObjectType::Mmio, 0).is_none());
         assert!(dispatch_for(ObjectType::Interrupt, 0).is_none());
-        assert!(dispatch_for(ObjectType::IoPortRange, 0).is_none());
+        assert!(dispatch_for(ObjectType::IoPort, 0).is_none());
         assert!(dispatch_for(ObjectType::SchedControl, 0).is_none());
         assert!(dispatch_for(ObjectType::SbiControl, 0).is_none());
     }

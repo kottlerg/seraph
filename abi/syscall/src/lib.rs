@@ -161,7 +161,7 @@ pub const SYS_CAP_DELETE: u64 = 31;
 pub const SYS_MEMORY_SPLIT: u64 = 33;
 /// Memory: map an MMIO region.
 pub const SYS_MMIO_MAP: u64 = 34;
-/// I/O: bind an `IoPortRange` to the calling thread.
+/// I/O: bind an `IoPort` to the calling thread.
 pub const SYS_IOPORT_BIND: u64 = 35;
 /// Capability: read-only inspection of a cap's runtime state.
 ///
@@ -309,7 +309,7 @@ pub const SYS_IPC_BUFFER_SET: u64 = 42;
 pub const SYS_SYSTEM_INFO: u64 = 43;
 /// SBI: forward an SBI call to M-mode firmware (RISC-V only).
 pub const SYS_SBI_CALL: u64 = 44;
-/// Split an `MmioRegion` cap into two non-overlapping children.
+/// Split an `Mmio` cap into two non-overlapping children.
 pub const SYS_MMIO_SPLIT: u64 = 45;
 /// Sleep the calling thread for a specified number of milliseconds.
 pub const SYS_THREAD_SLEEP: u64 = 46;
@@ -321,7 +321,7 @@ pub const SYS_CAP_DERIVE_BADGE: u64 = 48;
 pub const SYS_IRQ_SPLIT: u64 = 49;
 /// Merge two adjacent sibling Memory caps into one covering both ranges.
 pub const SYS_MEMORY_MERGE: u64 = 50;
-/// Split an `IoPortRange` cap into two non-overlapping children (`x86_64` only).
+/// Split an `IoPort` cap into two non-overlapping children (`x86_64` only).
 pub const SYS_IOPORT_SPLIT: u64 = 51;
 
 // ── Error codes ───────────────────────────────────────────────────────────────

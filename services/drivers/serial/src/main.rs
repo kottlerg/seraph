@@ -6,7 +6,7 @@
 //! Seraph userspace serial (UART) device driver.
 //!
 //! Spawned by devmgr with the platform UART authority cap — an
-//! `IoPortRange` covering COM1 on x86-64, an `MmioRegion` covering the
+//! `IoPort` covering COM1 on x86-64, an `Mmio` covering the
 //! ACPI-SPCR-reported NS16550 on RISC-V — plus a RECV cap on its service
 //! endpoint. Owns the UART end-to-end and is the sole driver-mediated sink
 //! for userspace serial bytes: real-logd and every other writer reach it

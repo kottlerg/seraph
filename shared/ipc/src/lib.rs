@@ -639,7 +639,7 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// driver bring-up); it then walks the per-arch driver name
 /// (`cmos-rtc` on x86-64, `goldfish-rtc` on RISC-V) from the subtree
 /// cap, calls [`procmgr_labels::CREATE_FROM_FILE`], and delivers the
-/// per-arch hardware authority cap (ISA `IoPortRange` for CMOS; MMIO
+/// per-arch hardware authority cap (ISA `IoPort` for CMOS; MMIO
 /// aperture for goldfish-rtc) through the bootstrap protocol — all
 /// between the `SET_DRIVERS_DIR` handler's `ipc_reply` and the next
 /// `ipc_recv`. See [`devmgr_labels::SET_DRIVERS_DIR`] for the nested-IPC
@@ -741,7 +741,7 @@ pub const PWRMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the power manager (`pwrmgr`).
 ///
 /// pwrmgr owns the platform shutdown surface: ACPI S5 on x86-64 (the
-/// `PM1a` `IoPortRange` carved from the FADT/DSDT it interprets) and SBI
+/// `PM1a` `IoPort` carved from the FADT/DSDT it interprets) and SBI
 /// SRST on RISC-V (the `SbiControl` cap). It acquires those caps from
 /// devmgr — the hardware/ACPI authority — at startup via
 /// [`devmgr_labels::QUERY_ACPI_TABLE`] and
@@ -1145,9 +1145,9 @@ pub mod devmgr_labels
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]):
-    /// - x86-64: `caps[0]` = a narrow `IoPortRange` over `[pm1a, pm1a+2)`
-    ///   carved from devmgr's root `IoPortRange`; `caps[1]` = a narrow
-    ///   `IoPortRange` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
+    /// - x86-64: `caps[0]` = a narrow `IoPort` over `[pm1a, pm1a+2)`
+    ///   carved from devmgr's root `IoPort`; `caps[1]` = a narrow
+    ///   `IoPort` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
     ///   Both are re-derived from the root on every call, so a pwrmgr
     ///   restart re-acquires them cleanly.
     /// - RISC-V: `caps[0]` = a `cap_derive` copy of devmgr's `SbiControl`
@@ -1257,8 +1257,8 @@ pub const SERIAL_LABELS_VERSION: u32 = 1;
 /// IPC labels for the serial (UART) device driver (`services/drivers/serial`).
 ///
 /// The driver answers a single write operation today. It owns the platform
-/// UART hardware authority (an `IoPortRange` for COM1 on x86-64, an
-/// `MmioRegion` for the ACPI-SPCR-reported NS16550 on RISC-V) and is the
+/// UART hardware authority (an `IoPort` for COM1 on x86-64, an
+/// `Mmio` for the ACPI-SPCR-reported NS16550 on RISC-V) and is the
 /// sole driver-mediated sink for userspace serial bytes. devmgr spawns it
 /// and hands clients a [`serial_labels::WRITE_AUTHORITY`]-badged SEND via
 /// [`devmgr_labels::QUERY_SERIAL_DEVICE`]. Read, line-control, flow-control,

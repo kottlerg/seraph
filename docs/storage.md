@@ -52,8 +52,8 @@ one direction. Each arrow is a single capability transfer; revoking
 any link kills the subtree beneath it.
 
 ```
-kernel (phase 7) mints MmioRegion + IRQ from BootInfo
-  → init delegates MmioRegion + IRQ caps to devmgr
+kernel (phase 7) mints Mmio + IRQ from BootInfo
+  → init delegates Mmio + IRQ caps to devmgr
     → devmgr binds virtio-blk; delegates per-device MMIO + IRQ
       → virtio-blk publishes its whole-disk service endpoint to devmgr
         → vfsd queries devmgr's device registry → whole-disk SEND
@@ -66,7 +66,7 @@ kernel (phase 7) mints MmioRegion + IRQ from BootInfo
                       → init distributes copies via CONFIGURE_NAMESPACE
 ```
 
-The kernel half (BootInfo → MmioRegion mint → devmgr → driver binding)
+The kernel half (BootInfo → Mmio mint → devmgr → driver binding)
 is owned by [`device-management.md`](device-management.md). Badge
 semantics, derivation, and revocation are owned by
 [`capability-model.md`](capability-model.md) §"Badges".

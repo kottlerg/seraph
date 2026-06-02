@@ -263,10 +263,10 @@ Phase 7, and `KERNEL_MMIO` is populated.
 3. Populate the root CSpace with initial capabilities:
    a. Memory capabilities for all usable physical memory ranges
       (one capability per contiguous usable region from the memory map)
-   b. One MmioRegion capability (Map | Write rights) per validated
+   b. One Mmio capability (Map | Write rights) per validated
       `BootInfo.mmio_apertures` entry. Userspace narrows these into
       per-device sub-caps and distributes them to drivers.
-   c. One root IoPortRange capability (x86-64 only, Use rights) covering
+   c. One root IoPort capability (x86-64 only, Use rights) covering
       the full 64K I/O port space; init subdivides for services that
       need port I/O.
    d. One SchedControl capability (Elevate rights) — allows the holder to set

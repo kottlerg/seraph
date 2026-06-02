@@ -88,7 +88,7 @@ endpoint, procmgr `SEND|GRANT`, devmgr registry):
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; HANDOVER_PULL only). `0` on a restart — there is no init-logd left to pull from, so logd skips the history pull |
+| 1 | SEND on the master log endpoint (single-use; carries `HANDOVER_PULL` for the history drain then the terminal `HANDOVER_RELEASE`, then deleted). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover |
 | 2 | Tokened SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | Tokened SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE`) |
 

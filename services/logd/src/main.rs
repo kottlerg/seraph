@@ -153,11 +153,17 @@ fn main() -> !
 
     if caps.log_ep_handover_send != 0
     {
-        // First launch: pull init-logd's accrued boot history, then drop the
-        // single-use SEND so logd carries no SEND cap to its own log endpoint.
+        // First launch: pull init-logd's accrued boot history, release
+        // init-logd, then drop the single-use SEND so logd carries no SEND cap
+        // to its own log endpoint.
         self_log("started; pulling init-logd handover state");
         // SAFETY: ipc_buf is the registered IPC buffer page.
         unsafe { handover::pull_all(caps.log_ep_handover_send, ipc_buf, &mut table) };
+        // Terminal release: init-logd exits on this, not on the drain's DONE,
+        // so a dropped data chunk cannot wedge it (and thus cannot block
+        // procmgr's reap of init's frames).
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { handover::send_release(caps.log_ep_handover_send, ipc_buf) };
         let _ = syscall::cap_delete(caps.log_ep_handover_send);
 
         let mut buf = SerialFmt::new();

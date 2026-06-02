@@ -54,7 +54,9 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    supervise real-logd. Signal `HANDOVER_COMPLETE`; hand init's own kernel
    objects + reclaimable Frame caps to procmgr via `REGISTER_INIT_TEARDOWN`;
    call `sys_thread_exit`. Procmgr binds a death-EQ on both init threads
-   (main + init-logd) and runs the reap path once both have exited.
+   (main + init-logd) and runs the reap path once both have exited; a
+   liveness backstop force-stops a never-released init-logd so a dropped
+   log handover cannot pin init's frames.
    svcmgr publishes the well-known names it now owns (`rootfs.root`,
    `svcmgr`, `devmgr.registry`) and installs devmgr's `/services/drivers/`
    cap via `SET_DRIVERS_DIR` from the endowment; it then launches the

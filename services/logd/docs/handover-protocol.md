@@ -9,10 +9,20 @@ On its **first launch**, real-logd holds a single-use SEND cap on the
 master log endpoint (bootstrap `cap[1]`) and calls
 `log_labels::HANDOVER_PULL` repeatedly on it. Init-logd's receive loop,
 on seeing the label, replies one chunk at a time until its captured
-state is drained, then breaks its loop and calls `sys_thread_exit`.
+state is drained (`DONE`). Real-logd then issues a single
+`log_labels::HANDOVER_RELEASE`; init-logd breaks its loop and calls
+`sys_thread_exit` on that release — **not** on the drain's `DONE`.
 Real-logd's existing tokened SEND caps held by every other sender remain
 valid because the kernel endpoint object is unchanged across the
 transition.
+
+Termination is deliberately decoupled from the data drain. The drain is a
+multi-chunk lockstep over a shared, multi-sender endpoint; a kernel IPC
+rendezvous race can drop one chunk under SMP. If `DONE` were the exit
+trigger, such a drop would leave init-logd running forever, which blocks
+procmgr's reap of init's frames and breaks the all-RAM-accounted identity.
+Gating exit on the single, retried `HANDOVER_RELEASE` instead means a
+dropped data chunk costs at most some unrecovered history.
 
 On a **restart**, svcmgr mints `cap[1] = 0`: init-logd exited after the
 first launch, so there is no handover source. The restarted logd skips
@@ -26,10 +36,12 @@ instance is not recoverable.
 
 * Request: `IpcMessage::new(HANDOVER_PULL)`. Empty payload, no caps.
 * Reply: `label = MORE (0)` for every intermediate chunk;
-  `label = DONE (1)` on the terminal chunk. Init-logd sets its
-  internal `HANDOVER_COMPLETE` flag immediately after replying
-  `DONE`; the next iteration of its receive loop self-terminates the
-  init-logd thread.
+  `label = DONE (1)` on the terminal data chunk. `DONE` means only
+  "no more data" — it does **not** terminate init-logd.
+* Release: `IpcMessage::new(HANDOVER_RELEASE)`. Empty payload, no caps.
+  Init-logd acks (empty reply), sets its internal `HANDOVER_COMPLETE`
+  flag, and self-terminates on its next receive-loop iteration. Real-logd
+  retries the release until the call is acknowledged.
 
 The reply label's upper 16 bits (`(byte_len << 16)`) carry the
 inline byte length on `SLOT` and `LINE` chunk kinds, matching the
@@ -95,21 +107,23 @@ outlive its registering sender's slot in init-logd's small
 ## Termination
 
 After the last `LINE` (or the last `SLOT` if no history), init-logd
-replies `DONE` with `word(0) = LINE` and zero inline bytes, then
-sets `HANDOVER_COMPLETE`. Real-logd, on seeing `DONE`, returns from
-[`handover::pull_all`](../src/handover.rs). Init-logd's next loop
-iteration sees the flag and calls `sys_thread_exit`.
+replies `DONE` with `word(0) = LINE` and zero inline bytes. `DONE`
+transfers no exit semantics; init-logd keeps serving. Real-logd, on
+seeing `DONE`, returns from [`handover::pull_all`](../src/handover.rs)
+and calls [`handover::send_release`](../src/handover.rs), which issues
+`HANDOVER_RELEASE` (retried until acked). Init-logd acks, sets
+`HANDOVER_COMPLETE`, and its next loop iteration calls `sys_thread_exit`.
 
-Between the `DONE` reply and init-logd's thread exit, no further log
-messages are processed by init-logd — any in-flight `STREAM_BYTES`
-sends from other processes queue at the kernel endpoint and are
-drained by real-logd once it enters its main receive loop.
+In-flight `STREAM_BYTES` sends from other processes queue at the kernel
+endpoint and are drained by real-logd once it enters its main receive
+loop.
 
 ## Failure modes
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `HANDOVER_PULL` IPC returns error | `log_ep_handover_send` cap is invalid or init-logd already exited | Real-logd's `pull_all` returns silently; logd boots with an empty `SlotTable`. Pre-handover history is lost. |
+| `HANDOVER_PULL` IPC returns error mid-drain | A kernel IPC rendezvous race on the shared endpoint, or an invalid `log_ep_handover_send` | `pull_all` returns; logd still issues `HANDOVER_RELEASE`, so init-logd is released. At most some pre-handover history is lost. |
+| `HANDOVER_RELEASE` never delivered (cap is `0`, e.g. a logd restart; or logd never launches) | No init-logd→logd channel exists | init-logd would otherwise run forever. procmgr's reap backstop force-stops it after a bounded grace and reaps init regardless (see `services/procmgr/src/init_reap.rs`). |
 | Reply with unknown `word(0)` kind | Wire-format drift; one side built against an out-of-sync `shared/ipc` revision | Real-logd skips the chunk and continues. A bounded iteration cap (`MAX_ITERS`) in `pull_all` guarantees termination on a malformed reply stream. |
 
 ## Reference

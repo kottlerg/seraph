@@ -28,17 +28,19 @@
 //!   `[name] <line>\r\n` to the serial port AND records the line in a
 //!   bounded history ring for handover to real-logd.
 //!
-//! * **Handover (`HANDOVER_PULL`):** real-logd, once up, calls
-//!   `log_labels::HANDOVER_PULL` on the same endpoint. Init-logd
-//!   serialises (token table + history ring) into one or more reply
-//!   chunks, then breaks its loop and `sys_thread_exit`s.
+//! * **Handover (`HANDOVER_PULL` + `HANDOVER_RELEASE`):** real-logd,
+//!   once up, drains (token table + history ring) via repeated
+//!   `log_labels::HANDOVER_PULL` calls on the same endpoint, then issues
+//!   a single `HANDOVER_RELEASE`. Init-logd breaks its loop and
+//!   `sys_thread_exit`s on the RELEASE — not on the drain's `DONE` — so a
+//!   dropped data chunk cannot leave it running and block procmgr's reap.
 
 use crate::PAGE_SIZE;
 use crate::arch;
 use crate::bootstrap::BootArena;
 use init_protocol::InitInfo;
 
-use ipc::log_labels::HANDOVER_PULL;
+use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
 use ipc::stream_labels::STREAM_BYTES;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -417,9 +419,10 @@ fn history_push(slot: &SenderSlot)
 
 /// Receive byte-stream messages from services and write them to the serial
 /// port, prefixing each line with the sender's `[name]` (extracted from the
-/// per-message kernel-delivered token). Also services `HANDOVER_PULL`
-/// from real-logd; on the final chunk reply, sets `HANDOVER_COMPLETE`
-/// and the next loop iteration self-terminates the thread.
+/// per-message kernel-delivered token). Also services real-logd's
+/// `HANDOVER_PULL` data drain and its terminal `HANDOVER_RELEASE`; the
+/// latter sets `HANDOVER_COMPLETE`, and the next loop iteration
+/// self-terminates the thread.
 fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
 {
     let mut slots: [SenderSlot; MAX_SENDERS] = [SenderSlot::empty(); MAX_SENDERS];
@@ -468,6 +471,15 @@ fn log_receive_loop(log_ep: u32, ipc_buf_raw: *mut u64) -> !
                 ipc_buf_raw,
             );
         }
+        else if label_id == HANDOVER_RELEASE
+        {
+            // Real-logd's terminal release: the sole init-logd exit trigger,
+            // independent of the data drain's progress. Ack, set the flag; the
+            // next loop iteration self-terminates the thread.
+            // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
+            HANDOVER_COMPLETE.store(true, core::sync::atomic::Ordering::Release);
+        }
         else
         {
             // Unknown label — reply empty so the sender unblocks.
@@ -506,9 +518,9 @@ mod handover_kind
 
 /// Stage one chunk of handover state into the reply. Cursor state
 /// (`hist_cursor`, `slot_idx`) advances across calls so each pull
-/// returns a fresh chunk. On the last entry, replies with `DONE` and
-/// sets `HANDOVER_COMPLETE`; the receive loop's next iteration exits
-/// the thread.
+/// returns a fresh chunk. On the last entry, replies with `DONE`,
+/// meaning only "no more data" — the init-logd thread terminates on a
+/// separate [`HANDOVER_RELEASE`], not on this `DONE`.
 fn handle_handover_pull(
     slots: &[SenderSlot; MAX_SENDERS],
     hist_cursor: &mut u64,
@@ -599,12 +611,14 @@ fn handle_handover_pull(
         return;
     }
 
-    // Drained. Final reply marks DONE; the receive loop self-
-    // terminates on the next iteration.
+    // Drained. Final reply marks DONE — data only. The thread does NOT
+    // exit here: real-logd issues HANDOVER_RELEASE once its drain settles,
+    // and the receive loop terminates on that. Decoupling termination from
+    // the multi-chunk drain keeps a dropped data chunk from wedging
+    // init-logd (which would block procmgr's reap of init's frames).
     let reply = ipc::IpcMessage::new(handover_reply::DONE);
     // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-    HANDOVER_COMPLETE.store(true, Ordering::Release);
 }
 
 /// Record a display name for the sender identified by `token`. Called

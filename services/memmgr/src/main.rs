@@ -188,6 +188,27 @@ impl FreePool
         Err(())
     }
 
+    /// Push a run, coalescing once and retrying if the array is full.
+    ///
+    /// `push` fails only when all `MAX_FREE_RUNS` slots are occupied.
+    /// Occupancy is dominated by fragmentation — many small runs `frame_merge`
+    /// can fold into fewer, larger ones — so on a full array we `coalesce`
+    /// (freeing a slot per successful merge) and retry the push once. `Err`
+    /// means the array is still full afterward (every run physically
+    /// disjoint). This governs free-pool *residency*, not ownership: a caller
+    /// that retains the cap must account for it on ownership regardless of
+    /// this result. Eliminating the fixed array (so residency cannot fail
+    /// while RAM remains) is tracked as a separate redesign.
+    fn push_or_coalesce(&mut self, run: FreeRun) -> Result<(), ()>
+    {
+        if self.push(run).is_ok()
+        {
+            return Ok(());
+        }
+        self.coalesce();
+        self.push(run)
+    }
+
     /// Find the smallest run covering at least `want` pages. Returns the
     /// array index, or `None` if no run is large enough.
     fn smallest_fit(&self, want: u32) -> Option<usize>
@@ -901,21 +922,23 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
     {
         for frame in record.frames.iter().take(record.used).flatten()
         {
-            let _ = pool.push(FreeRun {
+            // Reachability-only: these pages were already counted in
+            // pool_total at acquisition, so a failure here cannot break the
+            // identity — coalesce-then-retry just shrinks the forgotten-cap
+            // window. The trailing batch coalesce below still runs.
+            let _ = pool.push_or_coalesce(FreeRun {
                 cap_slot: frame.cap_slot,
                 page_count: frame.page_count,
                 phys_base: frame.phys_base,
             });
         }
-        // Coalesce reclaimed runs back into larger contiguous chunks via
-        // `frame_merge`. Probing is O(N²) over MAX_FREE_RUNS but each
-        // probe is a single kernel syscall that returns immediately on
-        // non-adjacency, and successful merges decrease the run count —
-        // amortised cost per death is tolerable at expected workloads.
-        // Without coalescing, fragmentation accumulates monotonically:
-        // every spawn-and-die cycle leaves the pool with smaller runs
-        // than it started, until `MAX_FREE_RUNS` fills and `pool.push`
-        // starts leaking frames.
+        // Restore contiguity across all reclaimed runs in one pass (the
+        // per-frame `push_or_coalesce` above only fires `coalesce` under slot
+        // pressure). Without coalescing, fragmentation accumulates
+        // monotonically: every spawn-and-die cycle leaves the pool with
+        // smaller runs than it started, until the array fills and
+        // `push_or_coalesce` parks reclaimed frames (unreachable for
+        // allocation, though still owned and accounted).
         pool.coalesce();
     }
     // Idempotent: missing token is not an error.
@@ -976,21 +999,23 @@ fn handle_donate_frames(req: &IpcMessage, ipc_buf: *mut u64)
         // run we accept (4 GiB max ≈ 1M pages, well under u32::MAX).
         #[allow(clippy::cast_possible_truncation)]
         let page_count = (size_bytes / 4096) as u32;
-        if pool
-            .push(FreeRun {
-                cap_slot: slot,
-                page_count,
-                phys_base,
-            })
-            .is_err()
-        {
-            // Pool full: cap stays in memmgr's CSpace, leaking until
-            // shutdown. Bumping MAX_FREE_RUNS is the long-term fix.
-            continue;
-        }
+        // The cap is valid and now permanently owned by memmgr (it is never
+        // deleted past this point). Count it on ownership, not on pool-slot
+        // residency: pool_total must equal the live owned set whether the run
+        // lands in a free slot or is parked because the array is full.
         accepted_caps += 1;
         accepted_pages += u64::from(page_count);
         pool_total_add(u64::from(page_count));
+        // Best-effort placement. On failure (array full even after a coalesce
+        // retry) the cap stays owned (counted above) but has no free-pool
+        // slot, unreachable for allocation until a later coalesce frees one:
+        // a reachability leak only, never an identity residual. The structural
+        // fix is a non-fixed free pool (tracked separately).
+        let _ = pool.push_or_coalesce(FreeRun {
+            cap_slot: slot,
+            page_count,
+            phys_base,
+        });
     }
     if accepted_caps > 0
     {
@@ -1026,6 +1051,12 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 /// arenas, and reap donations. memmgr never returns RAM to the kernel, and
 /// `frame_split`/`frame_merge` preserve total page count, so this monotonic
 /// counter equals the live owned set exactly.
+///
+/// Ownership — and therefore the count — is taken when memmgr *retains* a cap
+/// (a donation that passes validation and is not deleted), independent of
+/// whether the run finds a free-pool slot. A run parked because the slot array
+/// is full is still owned and still counted; counting MUST NOT be gated on
+/// `push` success, or the identity under-counts owned-but-parked RAM.
 ///
 /// This is the `pool_total` of the all-RAM-accounted identity
 /// (`system_ram == kernel_reserved + pool_total`). Surfaced in the
@@ -1092,16 +1123,16 @@ fn ingest_pool(boot: &InitBootstrap)
                 "memmgr: ingested RAM Frame cap missing RIGHTS_RETYPE",
             );
         }
-        if pool
-            .push(FreeRun {
-                cap_slot,
-                page_count: boot.page_counts[i],
-                phys_base: boot.phys_bases[i],
-            })
-            .is_ok()
-        {
-            pool_total_add(u64::from(boot.page_counts[i]));
-        }
+        // Ownership is taken on ingest — count on ownership, place best-effort
+        // (mirrors `handle_donate_frames`). Bootstrap never overflows the pool,
+        // but `pool_total` must equal owned RAM uniformly across every ingest
+        // site, never gated on free-slot residency.
+        pool_total_add(u64::from(boot.page_counts[i]));
+        let _ = pool.push_or_coalesce(FreeRun {
+            cap_slot,
+            page_count: boot.page_counts[i],
+            phys_base: boot.phys_bases[i],
+        });
     }
 }
 
@@ -1121,16 +1152,17 @@ fn ingest_in_use(boot: &InitBootstrap)
             ipc::memmgr_bootstrap::IN_USE_KIND_INIT => INIT_SELF_TOKEN,
             _ => continue,
         };
+        // Owned on ingest — count on ownership; the per-process record is
+        // best-effort tracking (these arenas are immortal, never reclaimed), so
+        // a record miss must not under-count `pool_total`.
+        pool_total_add(u64::from(entry.page_count));
         if let Some(record) = table_mut().find_mut(token)
-            && record
-                .push(OwnedFrame {
-                    cap_slot: entry.cap_slot,
-                    page_count: entry.page_count,
-                    phys_base: entry.phys_base,
-                })
-                .is_ok()
         {
-            pool_total_add(u64::from(entry.page_count));
+            let _ = record.push(OwnedFrame {
+                cap_slot: entry.cap_slot,
+                page_count: entry.page_count,
+                phys_base: entry.phys_base,
+            });
         }
     }
 }

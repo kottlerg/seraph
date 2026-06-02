@@ -10,7 +10,6 @@
 //! cap on the driver's service endpoint. Implements the one-label
 //! RTC driver contract ([`rtc_labels::RTC_GET_EPOCH_TIME`]).
 
-#![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_ptr_alignment)]
 

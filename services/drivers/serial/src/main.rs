@@ -19,7 +19,6 @@
 //! pre-driver boot window is covered by init-logd's direct-UART path (see
 //! `docs/console-model.md`).
 
-#![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;

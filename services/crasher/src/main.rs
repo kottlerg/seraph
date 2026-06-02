@@ -19,12 +19,6 @@
 //! re-resolved on every (re)spawn. Log and procmgr endpoints arrive via
 //! `ProcessInfo`, so they need no bootstrap round.
 
-// The `seraph` target is not in rustc's recognised-OS list, so `std` is
-// `restricted_std`-gated for downstream bins. Every std-built service on
-// seraph carries this preamble; RUSTC_BOOTSTRAP=1 (set by xtask for StdUser
-// builds) lets the attribute compile without a nightly-tagged toolchain.
-#![feature(restricted_std)]
-
 use std::os::seraph::startup_info;
 use std::thread;
 use std::time::Duration;

@@ -15,8 +15,6 @@
 //! this binary with `Stdio::piped()`, drains stdout, and asserts the
 //! prefix arrived followed by EOF (no hang) plus a fault `exit_reason`.
 
-#![feature(restricted_std)]
-
 use std::io::Write;
 
 fn main()

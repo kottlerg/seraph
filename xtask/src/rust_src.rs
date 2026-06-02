@@ -107,8 +107,16 @@ impl SeraphToolchain
     /// build through the seraph toolchain mirror: `RUSTC` and
     /// `RUSTC_WORKSPACE_WRAPPER` (mirror entry points), the three
     /// `SERAPH_SHIM_*` config vars (so the shim knows what to exec),
-    /// and `RUSTC_BOOTSTRAP=1` (so the StdUser builds can use
-    /// `restricted_std` and `rustc_private`).
+    /// and `RUSTC_BOOTSTRAP=1`.
+    ///
+    /// `RUSTC_BOOTSTRAP=1` lets the StdUser builds use the unstable
+    /// features `-Zbuild-std` and the std overlay's workspace deps
+    /// (`process-abi`, `syscall`, `ipc`, `shmem`, `log`) require —
+    /// `rustc_private` and the `rustc-dep-of-std` machinery. The
+    /// `seraph` OS is recognised as a std target by an overlay on std's
+    /// `build.rs` (see `apply_restricted_std_overlay`), so `std` is not
+    /// `restricted_std`-gated and service/program sources carry no
+    /// `#![feature(restricted_std)]` opt-in.
     pub fn apply_env(&self, cmd: &mut Command)
     {
         cmd.env("RUSTC", &self.rustc);
@@ -629,6 +637,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
         .context("deriving project root from overlay_root")?;
     apply_sys_visibility_overlay(&rust_src).context("sys visibility overlay")?;
     apply_std_cargo_deps_overlay(&rust_src, project_root).context("std Cargo.toml deps overlay")?;
+    apply_restricted_std_overlay(&rust_src).context("restricted_std OS-recognition overlay")?;
     apply_alloc_overlay(&rust_src, overlay_root).context("alloc overlay")?;
     apply_reserve_overlay(&rust_src, overlay_root).context("reserve overlay")?;
     apply_io_error_overlay(&rust_src).context("io/error overlay")?;
@@ -761,6 +770,23 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
         cargo_toml.display()
     ));
     Ok(())
+}
+
+/// Add `target_os = "seraph"` to the recognised-OS list in std's
+/// `build.rs`, alongside `hermit`/`redox` and the other tier-3 std
+/// targets. Seraph ships a complete `std::sys::seraph` backend (the
+/// overlays in this module), so `std` is built `#![stable]` rather than
+/// `restricted_std`-gated, and downstream bins consume it with no
+/// `#![feature(restricted_std)]` opt-in.
+fn apply_restricted_std_overlay(rust_src: &Path) -> Result<()>
+{
+    let build_rs = rust_src.join("library/std/build.rs");
+    patch_file(
+        &build_rs,
+        "std/build.rs",
+        "        || target_os == \"vexos\"\n",
+        "        || target_os == \"vexos\"\n        // seraph-overlay: seraph ships a full std::sys backend; treat it as a recognised std OS\n        || target_os == \"seraph\"\n",
+    )
 }
 
 /// Widen `mod alloc;` in `sys/mod.rs` to `pub(crate) mod alloc;` so

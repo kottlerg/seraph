@@ -194,7 +194,7 @@ the eventual `PROCESS_DIED`.
 
 ### Label 4: `PROCESS_DIED`
 
-Procmgr notifications process death. memmgr looks up the per-process tracking
+Procmgr signals process death. memmgr looks up the per-process tracking
 entry by badge, reclaims every Memory cap memmgr has issued to that
 process, and runs coalescing. Privilege: procmgr-only.
 

@@ -577,7 +577,7 @@ pub struct ChildEnv<'a>
 
 /// TLS template metadata extracted from a child's `PT_TLS` segment,
 /// propagated verbatim into `ProcessInfo` for spawned-thread block
-/// population. `memsz == 0` notifications "binary has no TLS segment".
+/// population. `memsz == 0` signals "binary has no TLS segment".
 #[derive(Clone, Copy, Default)]
 pub struct ChildTlsTemplate
 {

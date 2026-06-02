@@ -508,7 +508,7 @@ pub fn set_priority_31_err(ctx: &TestContext) -> TestResult
 /// A thread bound to CPU 1 runs and signals back.
 ///
 /// Skips with a log line if only one CPU is online (requires SMP). On SMP
-/// builds, the thread is enqueued on CPU 1's run queue and notifications `0xC1A1`
+/// builds, the thread is enqueued on CPU 1's run queue and signals `0xC1A1`
 /// back to the parent.
 pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
 {

@@ -647,7 +647,7 @@ pub fn create_devmgr_with_caps(
     // preparation failure init MUST still emit a `done=true` round so
     // devmgr's bootstrap_rounds loop in `services/devmgr/src/caps.rs`
     // unblocks; otherwise devmgr spins in `request_round` forever.
-    // Empty-caps terminal round notifications "no bundle delivered"; devmgr's
+    // Empty-caps terminal round signals "no bundle delivered"; devmgr's
     // SVCMGR_BUNDLE absorber rejects a zero-cap message and returns
     // None, which propagates to a clean failure rather than a hang.
     let prep_failed = svcmgr_service_ep == 0;

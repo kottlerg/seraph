@@ -10,7 +10,7 @@
 //!   parallelism.
 //! - Child A (normal priority): tight spin loop, posts a "finished" bit only
 //!   at the end.
-//! - Child B (elevated priority): notifications "ran" immediately and exits.
+//! - Child B (elevated priority): signals "ran" immediately and exits.
 //!
 //! Verification: the parent unblocks on B's "ran" notification well before A's
 //! spinner finishes. Slack: B should arrive within ~5 timer ticks worth

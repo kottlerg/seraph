@@ -440,7 +440,7 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
 
 // ── Child thread entry ────────────────────────────────────────────────────────
 
-/// Child: calls the endpoint with label 0xCAFE, waits for reply, then notifications.
+/// Child: calls the endpoint with label 0xCAFE, waits for reply, then signals.
 ///
 /// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `notify_slot` (in child's `CSpace`).
 fn caller_entry(arg: u64) -> !
@@ -818,7 +818,7 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
     }
 
     // The child must have un-parked observing the synthetic transfer-failed
-    // label. It notifications 0xFA11 in that case (see reply_oom_caller_entry).
+    // label. It signals 0xFA11 in that case (see reply_oom_caller_entry).
     let done_bits =
         notification_wait(done).map_err(|_| "notification_wait(done) for reply_oom failed")?;
     if done_bits != 0xFA11

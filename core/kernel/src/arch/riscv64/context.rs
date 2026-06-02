@@ -234,22 +234,33 @@ pub unsafe extern "C" fn switch(
 /// Activate a new address space and enter user mode for the first time.
 ///
 /// Architecture-neutral entry point for `sched::enter`. On RISC-V, activating
-/// via `satp` + `sfence.vma` is safe to do before `sret` because the boot
-/// stack lives in the direct-mapped region (covered by kernel PPN entries),
-/// which is present in the new address space.
+/// via `satp` is safe to do before `sret` because the boot stack lives in the
+/// direct-mapped region (covered by kernel PPN entries), which is present in the
+/// new address space — so the `ret` from the Rust `activate()` call lands on a
+/// still-mapped stack. Routing through [`AddressSpace::activate`] tags the entry
+/// (claims a tag and loads it, generation-checked) when tagging is enabled, so
+/// init does not run its first quantum untagged.
 ///
 /// `sscratch` must be set to `kernel_stack_top` before this call so that the
 /// trap entry can switch stacks on the first U-mode trap.
 ///
 /// # Safety
-/// `root_phys` must be a valid page-table root. `tf` must point to a
-/// [`TrapFrame`] on the init thread's kernel stack with `sepc` and `sp` set.
+/// `aspace` must be a valid `AddressSpace` already marked active on this CPU
+/// (caller did `mark_active_on_cpu`). `tf` must point to a [`TrapFrame`] on the
+/// init thread's kernel stack with `sepc` and `sp` set.
+///
+/// [`AddressSpace::activate`]: crate::mm::address_space::AddressSpace::activate
 #[cfg(not(test))]
-pub unsafe fn first_entry_to_user(root_phys: u64, tf: *const super::trap_frame::TrapFrame) -> !
+pub unsafe fn first_entry_to_user(
+    aspace: *const crate::mm::address_space::AddressSpace,
+    tf: *const super::trap_frame::TrapFrame,
+) -> !
 {
-    // SAFETY: root_phys is valid page-table root; tf is valid; direct map present in new space.
+    // SAFETY: aspace is a valid AddressSpace marked active on this CPU; tf is
+    // valid; the direct map (and thus the boot stack) is present in the new
+    // space, so activate()'s satp switch and its `ret` are safe before sret.
     unsafe {
-        crate::arch::current::paging::activate(root_phys);
+        (*aspace).activate();
         return_to_user(tf)
     }
 }

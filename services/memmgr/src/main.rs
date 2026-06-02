@@ -1123,16 +1123,16 @@ fn ingest_pool(boot: &InitBootstrap)
                 "memmgr: ingested RAM Frame cap missing RIGHTS_RETYPE",
             );
         }
-        if pool
-            .push(FreeRun {
-                cap_slot,
-                page_count: boot.page_counts[i],
-                phys_base: boot.phys_bases[i],
-            })
-            .is_ok()
-        {
-            pool_total_add(u64::from(boot.page_counts[i]));
-        }
+        // Ownership is taken on ingest — count on ownership, place best-effort
+        // (mirrors `handle_donate_frames`). Bootstrap never overflows the pool,
+        // but `pool_total` must equal owned RAM uniformly across every ingest
+        // site, never gated on free-slot residency.
+        pool_total_add(u64::from(boot.page_counts[i]));
+        let _ = pool.push_or_coalesce(FreeRun {
+            cap_slot,
+            page_count: boot.page_counts[i],
+            phys_base: boot.phys_bases[i],
+        });
     }
 }
 
@@ -1152,16 +1152,17 @@ fn ingest_in_use(boot: &InitBootstrap)
             ipc::memmgr_bootstrap::IN_USE_KIND_INIT => INIT_SELF_TOKEN,
             _ => continue,
         };
+        // Owned on ingest — count on ownership; the per-process record is
+        // best-effort tracking (these arenas are immortal, never reclaimed), so
+        // a record miss must not under-count `pool_total`.
+        pool_total_add(u64::from(entry.page_count));
         if let Some(record) = table_mut().find_mut(token)
-            && record
-                .push(OwnedFrame {
-                    cap_slot: entry.cap_slot,
-                    page_count: entry.page_count,
-                    phys_base: entry.phys_base,
-                })
-                .is_ok()
         {
-            pool_total_add(u64::from(entry.page_count));
+            let _ = record.push(OwnedFrame {
+                cap_slot: entry.cap_slot,
+                page_count: entry.page_count,
+                phys_base: entry.phys_base,
+            });
         }
     }
 }

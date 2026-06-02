@@ -70,11 +70,14 @@ procmgr/
 
 Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff at the end of
 init's Phase 3: init's own `AddressSpace` / `CSpace` / `Thread` caps
-plus every reclaimable Frame cap. Procmgr binds a death-EQ observer
-on init's main thread with `INIT_REAP_CORRELATOR`; on the death event
-(driven by init's `sys_thread_exit`) the reap path tears down init's
-kernel objects in order — Threads → AddressSpace → donate Frame caps
-to memmgr via `DONATE_FRAMES` → CSpace cascade — leaving zero init
+plus every reclaimable Frame cap. Procmgr binds a death-EQ observer on
+**both** init threads (main + init-logd) with `INIT_REAP_CORRELATOR` and
+reaps once both have exited — init-logd outlives main until the
+svcmgr-launched real-logd releases it via `HANDOVER_RELEASE`. A liveness
+backstop force-stops a never-released init-logd past a grace, so a
+dropped log handover cannot pin init's frames. The reap path tears down
+init's kernel objects in order — Threads → AddressSpace → donate Frame
+caps to memmgr via `DONATE_FRAMES` → CSpace cascade — leaving zero init
 residue. Implementation in [`src/init_reap.rs`](src/init_reap.rs).
 
 ---

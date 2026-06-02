@@ -266,8 +266,22 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 #[cfg(not(test))]
 pub unsafe fn write_satp_no_fence(root_phys: u64)
 {
-    // SAFETY: delegated to activate; root_phys is valid per caller contract.
-    unsafe { activate(root_phys) };
+    // With PCID enabled, load the kernel root under PCID 0 without flushing
+    // (CR3 bit 63). Kernel translations are identical across roots, so retaining
+    // PCID 0's cached entries across this transition is correct and avoids a
+    // flush. Without PCID a CR3 write always flushes, so this degrades to the
+    // flushing form (functionally equivalent to `activate`).
+    // SAFETY: root_phys is a valid kernel root per caller contract.
+    unsafe {
+        if crate::mm::tag_allocator::tagging_enabled()
+        {
+            activate_tagged(root_phys, 0);
+        }
+        else
+        {
+            activate(root_phys);
+        }
+    }
 }
 
 /// Activate the page tables rooted at `root_phys` by writing CR3.
@@ -309,7 +323,6 @@ pub unsafe fn activate(root_phys: u64)
 /// invalidation required for correctness (the generation check in
 /// `AddressSpace::activate`).
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
 {
     // Bit 63 = no-invalidate request (valid only when CR4.PCIDE = 1); the PCID
@@ -696,10 +709,8 @@ pub unsafe fn flush_page(virt: u64)
 // for per-VA remote shootdown (type 0) and whole-tag flush (type 1).
 
 /// INVPCID type 0: invalidate one linear address within one PCID.
-#[allow(dead_code)]
 const INVPCID_TYPE_ADDR: u64 = 0;
 /// INVPCID type 1: invalidate all non-global entries of one PCID.
-#[allow(dead_code)]
 const INVPCID_TYPE_SINGLE: u64 = 1;
 
 /// 128-bit INVPCID descriptor (Intel SDM Vol. 2A, "INVPCID").
@@ -723,7 +734,6 @@ struct InvpcidDescriptor
 /// Must execute at ring 0 with `CR4.PCIDE` set; the descriptor's reserved bits
 /// must be zero.
 #[cfg(not(test))]
-#[allow(dead_code)]
 unsafe fn invpcid(kind: u64, desc: &InvpcidDescriptor)
 {
     // SAFETY: invpcid is a ring-0 TLB primitive; desc is a valid 16-byte
@@ -745,7 +755,6 @@ unsafe fn invpcid(kind: u64, desc: &InvpcidDescriptor)
 /// # Safety
 /// Must execute at ring 0 with `CR4.PCIDE` set.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub unsafe fn flush_page_tagged(virt: u64, tag: u16)
 {
     let desc = InvpcidDescriptor {
@@ -765,7 +774,6 @@ pub unsafe fn flush_page_tagged(virt: u64, tag: u16)
 /// # Safety
 /// Must execute at ring 0 with `CR4.PCIDE` set.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub unsafe fn flush_tag(tag: u16)
 {
     let desc = InvpcidDescriptor {
@@ -909,8 +917,9 @@ pub unsafe fn unmap_identity_page(pa: u64)
     {
         crate::percpu::preempt_disable();
         // SAFETY: root_pa is the active kernel PML4; remote covers only
-        // online CPUs; preemption disabled around the shootdown.
-        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt) };
+        // online CPUs; preemption disabled around the shootdown. Tag 0: this is
+        // a kernel identity mapping torn down at boot, not a tagged user space.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt, 0) };
         crate::percpu::preempt_enable();
     }
 }

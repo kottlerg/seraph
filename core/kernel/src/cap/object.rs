@@ -1731,6 +1731,16 @@ unsafe fn dealloc_object_one(
                     count += 1;
                 }
 
+                // Return this space's hardware tag (PCID/ASID) to the pool, if
+                // any. No TLB flush is needed: active_cpus is empty (asserted
+                // above), and any CPU that cached the tag while switched away is
+                // flushed lazily by the generation check the next time it loads
+                // the tag for whatever space claims it next.
+                // SAFETY: as_ptr is a valid AddressSpace being reclaimed; with
+                // active_cpus empty no concurrent activate races this read.
+                let tag = unsafe { (*as_ptr).tag.load(Ordering::Acquire) };
+                crate::mm::tag_allocator::free_tag(tag);
+
                 // Drop in-place objects before reclaiming their storage.
                 // `AddressSpace` and `AddressSpaceObject` have no Drop logic
                 // today; the explicit calls keep the contract correct if

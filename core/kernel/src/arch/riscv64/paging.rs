@@ -314,7 +314,6 @@ pub unsafe fn activate(root_phys: u64)
 /// `root_phys` must be a valid Sv48 root mapping the currently executing code,
 /// the active stack, and the direct map.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
 {
     let satp = (9u64 << 60) | (u64::from(tag) << 44) | (root_phys >> 12);
@@ -643,7 +642,6 @@ pub unsafe fn flush_page(virt: u64)
 /// # Safety
 /// Must execute in S-mode. `virt` need not be mapped.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub unsafe fn flush_page_tagged(virt: u64, tag: u16)
 {
     // SAFETY: sfence.vma with a VA and a non-zero ASID invalidates that leaf
@@ -666,7 +664,6 @@ pub unsafe fn flush_page_tagged(virt: u64, tag: u16)
 /// # Safety
 /// Must execute in S-mode.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub unsafe fn flush_tag(tag: u16)
 {
     // SAFETY: sfence.vma with x0 VA and a non-zero ASID invalidates all leaves
@@ -822,8 +819,10 @@ pub unsafe fn unmap_identity_page(pa: u64)
     {
         crate::percpu::preempt_disable();
         // SAFETY: root_pa is the active kernel Sv48 root; remote covers
-        // only online harts; preemption disabled around the shootdown.
-        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt) };
+        // only online harts; preemption disabled around the shootdown. Tag 0:
+        // this is a kernel identity mapping torn down at boot, not a tagged
+        // user space.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt, 0) };
         crate::percpu::preempt_enable();
     }
 }

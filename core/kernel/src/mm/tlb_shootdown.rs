@@ -64,7 +64,7 @@
 //! - **Release** on a remote CPU's bit clear ensures its TLB flush completes
 //!   before the initiator observes the acknowledgement.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use crate::cpu_mask::{AtomicCpuMask, CpuMask};
 use crate::sched::MAX_CPUS;
@@ -81,6 +81,13 @@ struct TlbShootdownRequest
     /// Virtual address to invalidate. `u64::MAX` means full flush.
     flush_va: AtomicU64,
 
+    /// Hardware address-space tag (PCID / ASID) the invalidation targets, or `0`
+    /// for the untagged path. When non-zero the target CPU invalidates the
+    /// `(tag, va)` entry regardless of the tag it currently has loaded, so a CPU
+    /// that has switched to a different space since the snapshot still flushes
+    /// the right translation.
+    tag: AtomicU16,
+
     /// CPUs that must still acknowledge this request. A set bit is both the
     /// "CPU N must flush" instruction and this request's per-target liveness
     /// token (see module docs).
@@ -94,6 +101,7 @@ impl TlbShootdownRequest
         Self {
             root_phys: AtomicU64::new(0),
             flush_va: AtomicU64::new(u64::MAX),
+            tag: AtomicU16::new(0),
             pending_cpus: AtomicCpuMask::new(),
         }
     }
@@ -145,15 +153,24 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
         }
         let va = req.flush_va.load(Ordering::Acquire);
         let root = req.root_phys.load(Ordering::Acquire);
+        let tag = req.tag.load(Ordering::Acquire);
         // Both `flush_va == u64::MAX` and `root_phys == 0` are full-flush
         // sentinels per shootdown()'s contract; either alone selects flush_tlb_all.
-        // SAFETY: caller guarantees IPI-handler context; flush_page /
-        // flush_tlb_all are valid TLB primitives at ring 0 / S-mode. A per-VA
-        // flush preserves global kernel entries that a full flush would discard.
+        // A non-zero `tag` targets that PCID/ASID specifically (the initiating
+        // space may no longer be the tag loaded on this CPU); `tag == 0` is the
+        // untagged path. A non-zero tag only exists when tagging is enabled, so
+        // the tagged primitive's precondition holds.
+        // SAFETY: caller guarantees IPI-handler context; the flush primitives are
+        // valid at ring 0 / S-mode. A per-VA flush preserves global kernel
+        // entries that a full flush would discard.
         unsafe {
             if va == u64::MAX || root == 0
             {
                 crate::arch::current::paging::flush_tlb_all();
+            }
+            else if tag != 0
+            {
+                crate::arch::current::paging::flush_page_tagged(va, tag);
             }
             else
             {
@@ -175,12 +192,14 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
 /// - Caller must have called `preempt_disable()` before this function.
 /// - `root_phys` must be a valid page table root physical address or 0 for full flush.
 /// - `cpus` must contain only online CPU indices and exclude the current CPU.
+/// - `tag` is the hardware address-space tag (PCID / ASID) to invalidate, or `0`
+///   for the untagged path. A non-zero `tag` must imply tagging is enabled.
 ///
 /// # Safety
 /// Caller must ensure `root_phys` and `cpus` are valid as described above.
 // Used by AddressSpace::map_page, unmap_page, protect_page.
 #[allow(dead_code)]
-pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64)
+pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64, tag: u16)
 {
     if cpus.is_empty()
     {
@@ -217,6 +236,7 @@ pub unsafe fn shootdown(root_phys: u64, cpus: &CpuMask, virt: u64)
     // visible before the IPI.
     req.root_phys.store(root_phys, Ordering::Release);
     req.flush_va.store(virt, Ordering::Release);
+    req.tag.store(tag, Ordering::Release);
     req.pending_cpus.store(cpus, Ordering::Release);
 
     // Drain the store buffer so a remote handler cannot read a stale slot. On

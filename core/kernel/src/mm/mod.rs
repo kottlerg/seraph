@@ -15,6 +15,7 @@ pub mod buddy;
 pub mod init;
 pub mod kernel_pt_pool;
 pub mod paging;
+pub mod tag_allocator;
 #[cfg(not(test))]
 pub mod tlb_shootdown;
 

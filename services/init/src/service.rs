@@ -1294,7 +1294,7 @@ fn handoff_to_procmgr_reap(
         return;
     }
 
-    // Donate every owns_memory Memory cap init solely holds, streamed in
+    // Donate every `owns_memory` Memory cap init solely holds, streamed in
     // MSG_CAP_SLOTS_MAX-sized rounds. Three disjoint sources:
     //  - explicit InitInfo ranges (not in the descriptor array): init's ELF
     //    segments, user stack, and the InitInfo region. (init's IPC buffer is

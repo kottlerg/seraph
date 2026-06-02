@@ -193,7 +193,7 @@ impl Rights
     pub const GRANT: Rights = Rights(1 << 6);
 
     // ── Notification / event queue ──────────────────────────────────────────────────
-    /// May deliver a notification notification.
+    /// May deliver a notification to a notification object.
     pub const NOTIFY: Rights = Rights(1 << 7);
     /// May wait on a notification or wait set.
     pub const WAIT: Rights = Rights(1 << 8);

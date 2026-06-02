@@ -933,7 +933,7 @@ unsafe fn kernel_entry_post_rebase(
             (*info_ptr).init_stack_memory_count = init_stack_memory_count;
         }
 
-        // Patch the immutable memory-accounting facts. All owns_memory Memory
+        // Patch the immutable memory-accounting facts. All `owns_memory` Memory
         // caps minted to init (Phase-7 drain/module/reclaim + the segment,
         // InitInfo, and stack caps above) are now in the ledger, so the
         // reserved total is the complement against installed RAM.

@@ -1735,7 +1735,7 @@ pub struct IpcMessage
 {
     /// Protocol label (opcode / reply code / bit-packed header).
     pub label: u64,
-    /// Endpoint-badge badge delivered by `ipc_recv`; zero on send paths
+    /// Endpoint badge delivered by `ipc_recv`; zero on send paths
     /// and for unbadged endpoints.
     pub badge: u64,
     data: [u64; MSG_DATA_WORDS_MAX],

@@ -109,43 +109,39 @@ Syscall numbers are stable ABI. New syscalls are added at the end; existing numb
 are never reassigned or reused.
 
 ```
- 0  SYS_IPC_CALL              22  SYS_THREAD_EXIT
- 1  SYS_IPC_REPLY             23  SYS_THREAD_CONFIGURE
- 2  SYS_IPC_RECV              24  SYS_CAP_COPY
- 3  SYS_NOTIFICATION_SEND           25  SYS_CAP_MOVE
- 4  SYS_NOTIFICATION_WAIT           26  SYS_WAIT_SET_ADD
- 5  SYS_EVENT_POST            27  SYS_WAIT_SET_REMOVE
- 6  SYS_EVENT_RECV            28  SYS_WAIT_SET_WAIT
- 7  SYS_CAP_CREATE_ENDPOINT   29  SYS_IRQ_ACK
- 8  SYS_CAP_CREATE_NOTIFICATION     30  SYS_IRQ_REGISTER
- 9  SYS_CAP_CREATE_EVENT_Q    31  SYS_CAP_DELETE
-10  SYS_CAP_CREATE_THREAD     32  SYS_CAP_INSERT
-11  SYS_CAP_CREATE_ASPACE     33  SYS_MEMORY_SPLIT
-12  SYS_CAP_CREATE_CSPACE     34  SYS_MMIO_MAP
-13  SYS_CAP_CREATE_WAIT_SET   35  SYS_IOPORT_BIND
-14  SYS_CAP_DERIVE            36  (reserved)
-15  SYS_CAP_REVOKE            37  SYS_THREAD_SET_PRIORITY
-16  SYS_MEM_MAP               38  SYS_THREAD_SET_AFFINITY
-17  SYS_MEM_UNMAP             39  SYS_THREAD_READ_REGS
-18  SYS_MEM_PROTECT           40  SYS_THREAD_WRITE_REGS
-19  SYS_THREAD_START          41  SYS_ASPACE_QUERY
-20  SYS_THREAD_STOP           42  SYS_IPC_BUFFER_SET
-21  SYS_THREAD_YIELD          43  SYS_SYSTEM_INFO
-                                44  SYS_SBI_CALL
-                                45  SYS_MMIO_SPLIT
-                                46  SYS_THREAD_SLEEP
-                                47  SYS_THREAD_BIND_NOTIFICATION
-                                48  SYS_CAP_DERIVE_BADGE
+ 0  SYS_IPC_CALL                 26  SYS_WAIT_SET_ADD
+ 1  SYS_IPC_REPLY                27  SYS_WAIT_SET_REMOVE
+ 2  SYS_IPC_RECV                 28  SYS_WAIT_SET_WAIT
+ 3  SYS_NOTIFICATION_SEND        29  SYS_IRQ_ACK
+ 4  SYS_NOTIFICATION_WAIT        30  SYS_IRQ_REGISTER
+ 5  SYS_EVENT_POST               31  SYS_CAP_DELETE
+ 6  SYS_EVENT_RECV               32  (reserved — was SYS_CAP_INSERT)
+ 7  SYS_CAP_CREATE_ENDPOINT      33  SYS_MEMORY_SPLIT
+ 8  SYS_CAP_CREATE_NOTIFICATION  34  SYS_MMIO_MAP
+ 9  SYS_CAP_CREATE_EVENT_Q       35  SYS_IOPORT_BIND
+10  SYS_CAP_CREATE_THREAD        36  SYS_CAP_INFO
+11  SYS_CAP_CREATE_ASPACE        37  SYS_THREAD_SET_PRIORITY
+12  SYS_CAP_CREATE_CSPACE        38  SYS_THREAD_SET_AFFINITY
+13  SYS_CAP_CREATE_WAIT_SET      39  SYS_THREAD_READ_REGS
+14  SYS_CAP_DERIVE               40  SYS_THREAD_WRITE_REGS
+15  SYS_CAP_REVOKE               41  SYS_ASPACE_QUERY
+16  SYS_MEM_MAP                  42  SYS_IPC_BUFFER_SET
+17  SYS_MEM_UNMAP                43  SYS_SYSTEM_INFO
+18  SYS_MEM_PROTECT              44  SYS_SBI_CALL
+19  SYS_THREAD_START             45  SYS_MMIO_SPLIT
+20  SYS_THREAD_STOP              46  SYS_THREAD_SLEEP
+21  SYS_THREAD_YIELD             47  SYS_THREAD_BIND_NOTIFICATION
+22  SYS_THREAD_EXIT              48  SYS_CAP_DERIVE_BADGE
+23  SYS_THREAD_CONFIGURE         49  SYS_IRQ_SPLIT
+24  SYS_CAP_COPY                 50  SYS_MEMORY_MERGE
+25  SYS_CAP_MOVE                 51  SYS_IOPORT_SPLIT
 ```
 
-**Implementation status.** Handlers implemented: 0–9 (IPC, notification, event
-queue creation and I/O), 7–8 (endpoint/notification creation), 10–13 (thread,
-aspace, cspace, wait set creation), 14–18 (cap management and memory),
-21–28 (thread lifecycle, wait set operations), 29–30 (IRQ ACK and
-register), 31–35 (cap delete/insert, memory split, MMIO map, ioport
-bind), 41–43 (aspace query, ipc buffer set, system info). Slot 36 is
-reserved and returns `UnknownSyscall`. All other unallocated numbers
-return `UnknownSyscall`.
+**Implementation status.** Every number 0–51 has a handler except slot 32,
+which is reserved (formerly `SYS_CAP_INSERT`; its caller-chosen-slot behaviour
+is now reached through `SYS_CAP_COPY`'s destination-slot argument — a value of
+`0` auto-allocates) and returns `UnknownSyscall`. All other unallocated numbers
+also return `UnknownSyscall`.
 
 ---
 
@@ -1116,7 +1112,7 @@ on success; `SyscallError` on failure.
 
 ## Cross-CSpace Syscalls
 
-### `SYS_CAP_COPY` (25)
+### `SYS_CAP_COPY` (24)
 
 Copy a capability from the caller's CSpace into another CSpace, creating a new
 derivation tree node (child of the source slot).
@@ -1127,13 +1123,18 @@ derivation tree node (child of the source slot).
 |---|---|---|
 | 0 | `src_cap` | Capability to copy (source slot in caller's CSpace) |
 | 1 | `dst_cspace_cap` | Target CSpace capability (Insert rights) |
-| 2 | `dst_slot` | Destination slot index in the target CSpace |
+| 2 | `dst_slot` | Destination slot index in the target CSpace, or `0` to let the kernel allocate a free slot (slot 0 is permanently null, so it is a safe "kernel picks" sentinel) |
 | 3 | `rights_mask` | Rights for the copy (must be subset of source rights) |
 
-**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+**Return:** `rax`/`a0`: the destination slot index on success; `SyscallError` on
+failure.
 
 The copy is a derivation (child of `src_cap` in the tree). Both the original and
-the copy remain valid. Used by init to delegate capabilities to services.
+the copy remain valid. With `dst_slot == 0` the kernel auto-allocates a free
+slot (and returns it); with a non-zero `dst_slot` the cap is placed at that
+caller-chosen index — the path init uses to populate well-known slots in new
+service CSpaces before starting their threads. This caller-chosen-slot mode
+absorbed the former `SYS_CAP_INSERT` (slot 32, now reserved).
 
 **Capability requirements:** `src_cap` (at least one right), `dst_cspace_cap` (Insert).
 
@@ -1164,62 +1165,35 @@ or out of range).
 
 ---
 
-### `SYS_CAP_INSERT` (31)
-
-Insert a derived copy of a capability from the caller's CSpace into another CSpace.
-Like `SYS_CAP_COPY` but uses a CSpace capability directly for the destination.
-
-**Arguments:**
-
-| # | Name | Description |
-|---|---|---|
-| 0 | `cspace_cap` | CSpace capability (Insert rights) for the target CSpace |
-| 1 | `source_cap` | Capability to copy |
-| 2 | `dest_slot` | Slot index in the target CSpace |
-| 3 | `rights_mask` | Rights for the inserted capability (subset of source rights) |
-
-**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
-
-Used by init to populate new service CSpaces before starting their threads.
-
-**Capability requirements:** `cspace_cap` (Insert), `source_cap` (at least one right).
-
-**Errors:** `InvalidCapability`, `AccessDenied` (requested rights exceed source rights,
-or dest_slot is already occupied), `InvalidArgument` (dest_slot out of range or
-exceeds CSpace ceiling), `OutOfMemory`.
-
----
-
 ## Address Space Syscall
 
 ### `SYS_ASPACE_QUERY` (41)
 
-Query the mapping at a virtual address in an address space.
+Translate a user virtual address to its mapped physical address.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `aspace_cap` | Address space capability (Read rights) |
-| 1 | `virt` | Virtual address to query (page-aligned) |
-| 2 | `buf_ptr` | Pointer to a buffer to receive mapping info |
+| 0 | `aspace_cap` | AddressSpace cap slot (must have `READ` right) |
+| 1 | `virt` | Page-aligned virtual address to translate (user half only) |
 
-**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+**Return:** `rax`/`a0`: the mapped physical address on success; negative
+`SyscallError` on failure.
 
-The buffer receives an architecture-neutral mapping descriptor: physical address,
-page size, and permission flags. If `virt` is not mapped, the call fails with
-`InvalidArgument`. Layout is defined in the kernel ABI headers.
+**Capability requirement:** `READ` right on the AddressSpace cap.
 
-**Capability requirement:** `aspace_cap` must have Read rights.
-
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (address not
-mapped, unaligned, or non-canonical).
+**Errors:**
+- `InvalidAddress` — `virt` is not page-aligned, outside the user half
+  (`>= 0x0000_8000_0000_0000`), or not currently mapped.
+- `InvalidCapability` — cap slot is null, wrong type, or the object is gone.
+- `InsufficientRights` — cap does not have the `READ` right.
 
 ---
 
 ## IPC Buffer Syscall
 
-### `SYS_IPC_BUFFER_SET` (41)
+### `SYS_IPC_BUFFER_SET` (42)
 
 Register the per-thread IPC buffer page. This is the page the kernel uses for
 extended IPC payloads (when `flags` bit 0 is set in `SYS_IPC_CALL` or
@@ -1312,28 +1286,6 @@ pub enum SystemInfoType
 
 ---
 
-### `SYS_ASPACE_QUERY` (41)
-
-Translate a user virtual address to its mapped physical address.
-
-**Arguments:**
-
-| # | Name | Description |
-|---|---|---|
-| 0 | `aspace_cap` | AddressSpace cap slot (must have `READ` right) |
-| 1 | `virt` | Page-aligned virtual address to translate (user half only) |
-
-**Return:** `rax`/`a0`: the mapped physical address on success; negative `SyscallError` on failure.
-
-**Capability requirement:** `READ` right on the AddressSpace cap.
-
-**Errors:**
-- `InvalidAddress` — `virt` is not page-aligned, outside the user half (`>= 0x0000_8000_0000_0000`), or not currently mapped.
-- `InvalidCapability` — cap slot is null, wrong type, or object is gone.
-- `InsufficientRights` — cap does not have `READ` right.
-
----
-
 ## Revocation Notes
 
 ### `SYS_CAP_REVOKE` targets the caller's own CSpace
@@ -1351,7 +1303,7 @@ To delegate authority that can later be revoked without losing your own access:
 1. Hold capability C (the original)
 2. Derive C1 from C — you retain C1 as an intermediary
 3. Derive C2 from C1 — C2 is the delegated capability
-4. Transfer C2 to the child process via SYS_CAP_INSERT or IPC
+4. Transfer C2 to the child process via SYS_CAP_COPY or IPC
 5. To revoke: call SYS_CAP_REVOKE(C1) — destroys C1 and C2
    You still hold C with full rights.
 ```

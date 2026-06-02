@@ -55,7 +55,7 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "cap_create_endpoint for IPC test failed")?;
 
-    // Notification notification: child sends 0xDEAD (success) or 0xBAD (failure).
+    // Notification round-trip: child sends 0xDEAD (success) or 0xBAD (failure).
     let notify = syscall::cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for IPC notify failed")?;
 

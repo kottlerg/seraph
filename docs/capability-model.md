@@ -105,12 +105,12 @@ The holder registers an endpoint to receive interrupt notifications on that line
 Interrupt capabilities are created by the kernel at boot and initially granted to
 init, which delegates them to appropriate drivers.
 
-### MMIO Region
+### Mmio
 
-A capability to a specific physical address range used for memory-mapped I/O.
-Holding this capability allows mapping the region into an address space (with Map
-right). Without this capability a process cannot map physical addresses — it cannot
-name hardware it has not been granted access to.
+A capability to a specific physical address range (an MMIO aperture) used for
+memory-mapped I/O. Holding this capability allows mapping the region into an
+address space (with Map right). Without this capability a process cannot map
+physical addresses — it cannot name hardware it has not been granted access to.
 
 ### Thread
 
@@ -150,6 +150,22 @@ that needs port I/O access receives a derived IoPort capability from init
 Revoking an IoPort capability removes port access from all threads it has
 been bound to. The kernel tracks bindings and updates each affected thread's IOPB
 in the TSS on revocation.
+
+### SbiControl (RISC-V only)
+
+A capability authorising the holder to forward Supervisor Binary Interface
+(SBI) calls to M-mode firmware via `SYS_SBI_CALL`. Rights:
+- **Call** — may forward an SBI `(EID, FID, args)` tuple to firmware.
+
+There is one SbiControl capability, created at boot on RISC-V; it does not exist
+on x86-64 (no SBI concept). Init holds it and delegates it to the userspace
+component that needs firmware services — today pwrmgr, for system reset (SRST).
+
+The current capability is **coarse**: any holder with the `Call` right may
+forward *any* SBI extension, including extensions the kernel itself manages
+(TIME, IPI, RFENCE, HSM). Constraining this — hard-denying kernel-reserved
+extensions and gating per a permitted-EID set — is tracked in the SbiControl
+gating issue; this section is updated when that work lands.
 
 ### SchedControl
 
@@ -396,12 +412,13 @@ At boot, the kernel creates init's Thread, AddressSpace, and CSpace and populate
 the CSpace with an initial set of capabilities covering all available resources:
 
 - Memory capabilities for all usable physical memory
-- MMIO region capabilities for all boot-provided platform resource regions
+- Mmio capabilities for all boot-provided platform resource regions
   (MmioRange and PciEcam entries from `BootInfo.platform_resources`)
 - Interrupt capabilities for all boot-provided interrupt lines
 - Read-only Memory capabilities for firmware table regions (PlatformTable entries),
   allowing userspace to parse ACPI or Device Tree data
 - IoPort capabilities for all boot-provided I/O port ranges (x86-64 only)
+- One SbiControl capability (RISC-V only; Call rights)
 - One SchedControl capability (Elevate rights)
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)

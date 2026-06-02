@@ -12,8 +12,6 @@
 //! started. This child blocks on `stdin().read_line(..)` until those bytes
 //! arrive, processes them, and emits the result through `println!`.
 
-#![feature(restricted_std)]
-
 use std::io::{BufRead, BufReader};
 
 fn main()

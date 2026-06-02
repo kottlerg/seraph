@@ -20,10 +20,6 @@
 //! See `vfsd/README.md` for the design and `fs/docs/fs-driver-protocol.md`
 //! for the driver-side protocol.
 
-// The `seraph` target is not in rustc's recognised-OS list, so `std` is
-// `restricted_std`-gated for downstream bins. Every std-built service on
-// seraph carries this preamble.
-#![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
 mod driver;

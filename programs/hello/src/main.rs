@@ -10,8 +10,6 @@
 //! child's stdout cap to the system log endpoint with a per-service token;
 //! nothing in this binary knows or cares.
 
-#![feature(restricted_std)]
-
 fn main()
 {
     println!("hello from seraph userspace");

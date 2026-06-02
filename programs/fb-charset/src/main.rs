@@ -29,8 +29,6 @@
 //! (`physical_base == 0`) exits silently. `restart = never`,
 //! `critical = no`.
 
-#![feature(restricted_std)]
-
 use std::os::seraph::startup_info;
 
 use ipc::IpcMessage;

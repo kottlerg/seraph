@@ -41,9 +41,6 @@
 //! handover — same kernel endpoint object, only the RECV-holder
 //! changes.
 
-// The `seraph` target is not in rustc's recognised-OS list, so `std`
-// is `restricted_std`-gated for downstream bins.
-#![feature(restricted_std)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 

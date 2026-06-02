@@ -9,10 +9,6 @@
 //! from devmgr. Initialises the `VirtIO` device via the modern PCI transport,
 //! sets up a split virtqueue, and serves block read requests over IPC.
 
-// The `seraph` target is not in rustc's recognised-OS list, so `std` is
-// `restricted_std`-gated for downstream bins. Every std-built service on
-// seraph carries this preamble.
-#![feature(restricted_std)]
 // cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
 // are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
 #![allow(clippy::cast_possible_truncation)]

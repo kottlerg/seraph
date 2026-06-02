@@ -13,6 +13,12 @@ overlay. The build pipeline applies the overlay onto a vendored
 `library/std` checkout per
 [`docs/build-system.md`](../../docs/build-system.md).
 
+One overlay lists `seraph` among std's recognised target OSes (in
+`library/std/build.rs`), so this `std` is built as a normal stable crate
+rather than `restricted_std`-gated. Downstream seraph bins therefore consume
+`std` with no `#![feature(restricted_std)]` opt-in (see
+[`docs/build-system.md`](../../docs/build-system.md)).
+
 ---
 
 ## VA Management Surfaces

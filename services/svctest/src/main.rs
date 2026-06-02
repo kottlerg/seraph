@@ -20,11 +20,6 @@
 //! * [`ipc_util`] — raw-IPC helpers shared across phases.
 //! * [`phases`] — one module per services-tier surface under test.
 
-// The `seraph` target is not in rustc's recognised-OS list, so `std` is
-// `restricted_std`-gated for downstream bins. RUSTC_BOOTSTRAP=1 (set by
-// xtask for StdUser builds) lets the attribute compile without a
-// nightly-tagged toolchain.
-#![feature(restricted_std)]
 #![feature(thread_local)]
 // svctest is an integration test harness: a standalone binary that
 // panics on failure so faults surface in the log. `expect`/`unwrap` are

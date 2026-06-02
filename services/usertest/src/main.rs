@@ -11,11 +11,6 @@
 //! program's real I/O surface; see [docs/testing.md](../../../docs/testing.md)
 //! for the protocol.
 
-// The `seraph` target is not in rustc's recognised-OS list, so `std` is
-// `restricted_std`-gated for downstream bins. RUSTC_BOOTSTRAP=1 (set by
-// xtask for StdUser builds) lets the attribute compile without a
-// nightly-tagged toolchain.
-#![feature(restricted_std)]
 // usertest is an integration test harness: panics on protocol violation
 // so faults surface in the log. `expect`/`unwrap` are the intended idiom
 // here (coding-standards §D permits them in test code).

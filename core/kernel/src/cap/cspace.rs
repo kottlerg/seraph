@@ -472,8 +472,9 @@ impl CSpace
 
     /// Insert a capability at a caller-chosen slot index.
     ///
-    /// Used by `SYS_CAP_INSERT` to place a cap at a well-known index (e.g.,
-    /// init populating a child's `CSpace`). The target slot must currently be Null.
+    /// Used by `SYS_CAP_COPY`'s explicit-slot path (non-zero destination slot)
+    /// to place a cap at a well-known index (e.g., init populating a child's
+    /// `CSpace`). The target slot must currently be Null.
     ///
     /// # Errors
     ///

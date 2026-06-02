@@ -42,15 +42,15 @@ use syscall_abi::{
     MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
     SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_SIGNAL,
     SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_TOKEN, SYS_CAP_INFO, SYS_CAP_INSERT, SYS_CAP_MOVE, SYS_CAP_REVOKE,
-    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND,
-    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
-    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP,
-    SYS_MMIO_SPLIT, SYS_SBI_CALL, SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO,
-    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
+    SYS_CAP_DERIVE_TOKEN, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
+    SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT,
+    SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER,
+    SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
+    SYS_SBI_CALL, SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT,
 };
 
 pub use syscall_abi::{
@@ -1251,13 +1251,15 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 #[inline]
 pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result<u32, i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
-    // (source slot, dest CSpace cap, rights mask); kernel validates caps and returns new slot.
+    // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
+    // (source slot, dest CSpace cap, dest slot, rights mask); a dest slot of 0 asks the
+    // kernel to allocate a free slot, which it returns.
     let ret = unsafe {
-        syscall3(
+        syscall4(
             SYS_CAP_COPY,
             u64::from(src_slot),
             u64::from(dest_cspace_cap),
+            0,
             rights_mask,
         )
     };
@@ -1372,9 +1374,10 @@ pub fn cap_move(src_slot: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Insert a capability at a specific slot index in another `CSpace` (`SYS_CAP_INSERT`).
+/// Insert a capability at a specific slot index in another `CSpace`.
 ///
-/// Like `cap_copy` but the destination slot index is caller-chosen.
+/// Like `cap_copy` but the destination slot index is caller-chosen — a
+/// shorthand over `SYS_CAP_COPY` with a non-zero destination slot.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
@@ -1387,10 +1390,11 @@ pub fn cap_insert(
 ) -> Result<(), i64>
 {
     // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
-    // (source slot, dest CSpace cap, dest index, rights mask); kernel validates and inserts cap.
+    // (source slot, dest CSpace cap, dest slot, rights mask); kernel validates and inserts cap
+    // at the caller-chosen slot.
     let ret = unsafe {
         syscall4(
-            SYS_CAP_INSERT,
+            SYS_CAP_COPY,
             u64::from(src_slot),
             u64::from(dest_cspace_cap),
             u64::from(dest_index),

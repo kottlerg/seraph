@@ -132,7 +132,15 @@ pub const SYS_THREAD_YIELD: u64 = 21;
 pub const SYS_THREAD_EXIT: u64 = 22;
 /// Thread: configure (set entry, stack, arg).
 pub const SYS_THREAD_CONFIGURE: u64 = 23;
-/// Capability: copy a slot.
+/// Capability: copy a slot into another `CSpace`.
+///
+/// arg0 = source slot index (caller's `CSpace`).
+/// arg1 = destination `CSpace` cap index (must have INSERT right).
+/// arg2 = destination slot index, or `0` to let the kernel allocate a free slot
+///        (slot 0 is permanently null, so it is a safe "kernel picks" sentinel).
+/// arg3 = rights mask (subset of source rights).
+///
+/// Returns the destination slot index.
 pub const SYS_CAP_COPY: u64 = 24;
 /// Capability: move a slot (destroying the source).
 pub const SYS_CAP_MOVE: u64 = 25;
@@ -148,8 +156,7 @@ pub const SYS_IRQ_ACK: u64 = 29;
 pub const SYS_IRQ_REGISTER: u64 = 30;
 /// Capability: delete a slot.
 pub const SYS_CAP_DELETE: u64 = 31;
-/// Capability: insert an object into a specific slot.
-pub const SYS_CAP_INSERT: u64 = 32;
+// 32 reserved (was SYS_CAP_INSERT, merged into SYS_CAP_COPY's dest-slot arg).
 /// Frame: split a large frame into smaller ones.
 pub const SYS_FRAME_SPLIT: u64 = 33;
 /// Memory: map an MMIO region.
@@ -503,7 +510,7 @@ pub const EXIT_FAULT_BASE: u64 = 0x1000;
 // to preserve the positional structure; they will carry non-zero values when
 // the ABI stabilises.
 #[allow(clippy::identity_op, clippy::eq_op)]
-pub const KERNEL_VERSION: u64 = (0u64 << 32) | (0u64 << 16) | 1u64; // 0.0.1
+pub const KERNEL_VERSION: u64 = (0u64 << 32) | (0u64 << 16) | 2u64; // 0.0.2
 
 /// Discriminant for `SYS_SYSTEM_INFO` queries.
 ///

@@ -5,8 +5,9 @@
 
 //! Tier 1 tests for capability syscalls.
 //!
-//! Covers: `SYS_CAP_CREATE_*`, `SYS_CAP_COPY`, `SYS_CAP_MOVE`,
-//! `SYS_CAP_INSERT`, `SYS_CAP_DERIVE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`.
+//! Covers: `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (both auto-allocate and
+//! explicit-slot paths), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_REVOKE`,
+//! `SYS_CAP_DELETE`.
 //!
 //! Each function tests one syscall or one distinct behaviour. Tests clean up
 //! caps they create where convenient, but leaks are acceptable — ktest exits
@@ -135,7 +136,7 @@ pub fn copy(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── SYS_CAP_INSERT ───────────────────────────────────────────────────────────
+// ── SYS_CAP_COPY explicit slot (cap_insert) ──────────────────────────────────
 
 /// `cap_insert` places a copy at a caller-chosen slot index in another `CSpace`.
 ///
@@ -251,7 +252,7 @@ pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── SYS_CAP_INSERT negative ───────────────────────────────────────────────────
+// ── SYS_CAP_COPY explicit slot negative ──────────────────────────────────────
 
 /// `cap_insert` to an already-occupied destination slot must return an error.
 pub fn insert_to_occupied_slot_err(ctx: &TestContext) -> TestResult
@@ -336,7 +337,7 @@ pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── SYS_CAP_INSERT negative (out of bounds) ──────────────────────────────────
+// ── SYS_CAP_COPY explicit slot negative (out of bounds) ──────────────────────
 
 /// `cap_insert` with a slot index beyond the destination `CSpace` capacity must fail.
 pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult

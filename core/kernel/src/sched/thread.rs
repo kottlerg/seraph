@@ -329,7 +329,7 @@ pub struct ThreadControlBlock
     /// Correlator semantics: opaque to the kernel, scoped to one
     /// `(EventQueue, binder)` pair. Not a system-wide identifier, not a PID;
     /// it is whatever the binder needs to route the event to its own
-    /// bookkeeping (e.g. procmgr stashes its internal `ProcessTable` token
+    /// bookkeeping (e.g. procmgr stashes its internal `ProcessTable` badge
     /// in the low 32 bits). Passing `0` recovers the pre-multi-bind
     /// behaviour where the payload is just `exit_reason`.
     ///

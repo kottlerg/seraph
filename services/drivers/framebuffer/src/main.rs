@@ -12,9 +12,9 @@
 //!
 //! Two-round bootstrap (mirrors `services/drivers/virtio/blk`):
 //!   Round 1 (non-terminal): `[service_ep, mmio_cap]`
-//!   Round 2 (terminal):     `[devmgr_query_ep]` (tokened SEND for
+//!   Round 2 (terminal):     `[devmgr_query_ep]` (badged SEND for
 //!                            `QUERY_DEVICE_INFO` with this device's
-//!                            catalog index in the token)
+//!                            catalog index in the badge)
 //!
 //! After bootstrap the driver queries devmgr for its
 //! [`boot_protocol::FramebufferInfo`] (geometry: width, height,

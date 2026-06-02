@@ -2317,8 +2317,8 @@ pub unsafe fn move_cap_between_cspaces(
 {
     use syscall::SyscallError;
 
-    // Read source slot (tag, rights, object pointer, token).
-    let (src_tag, src_rights, src_object, src_token) = {
+    // Read source slot (tag, rights, object pointer, badge).
+    let (src_tag, src_rights, src_object, src_badge) = {
         // SAFETY: src_cspace is a valid CSpace pointer; guaranteed by caller contract.
         let cs = unsafe { &*src_cspace };
         let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -2330,7 +2330,7 @@ pub unsafe fn move_cap_between_cspaces(
             slot.tag,
             slot.rights,
             slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.token,
+            slot.badge,
         )
     };
 
@@ -2364,11 +2364,11 @@ pub unsafe fn move_cap_between_cspaces(
         )
     };
 
-    // Copy token and derivation links to the destination slot.
+    // Copy badge and derivation links to the destination slot.
     // SAFETY: dst_cspace is a valid CSpace pointer; new_idx was just allocated by insert_cap.
     if let Some(dst_slot) = unsafe { (*dst_cspace).slot_mut(new_idx) }
     {
-        dst_slot.token = src_token;
+        dst_slot.badge = src_badge;
         dst_slot.deriv_parent = src_parent;
         dst_slot.deriv_first_child = src_first_child;
         dst_slot.deriv_prev_sibling = src_prev;

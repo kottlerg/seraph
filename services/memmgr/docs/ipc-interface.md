@@ -11,22 +11,22 @@ ones.
 
 memmgr listens on a single IPC endpoint. Init holds the Receive-side at
 boot and transfers it to memmgr during memmgr's bootstrap-IPC round.
-Init then derives a tokened SEND cap on memmgr's endpoint and installs
+Init then derives a badged SEND cap on memmgr's endpoint and installs
 it into procmgr's `ProcessInfo.memmgr_endpoint_cap` so procmgr's heap
 bootstrap reaches memmgr on its first call.
 
 For all subsequent processes, procmgr is the chooser: it calls
-`REGISTER_PROCESS` (below) before spawning a child, receives a tokened
+`REGISTER_PROCESS` (below) before spawning a child, receives a badged
 SEND cap on memmgr's endpoint, and installs that cap into the child's
 `ProcessInfo.memmgr_endpoint_cap`. The child's std heap-bootstrap path
 calls `REQUEST_FRAMES` on it with no further setup.
 
 ---
 
-## Token Discipline
+## Badge Discipline
 
-Every memmgr-callable message arrives over a tokened endpoint cap. The
-token is the procmgr-minted process identity established at
+Every memmgr-callable message arrives over a badged endpoint cap. The
+badge is the procmgr-minted process identity established at
 `REGISTER_PROCESS`; memmgr uses it to key the per-process tracking table
 (see [`frame-pool.md`](frame-pool.md) §"Per-Process Tracking").
 
@@ -34,13 +34,13 @@ Two privilege classes:
 
 - **Procmgr-only** labels (`REGISTER_PROCESS`, `PROCESS_DIED`) are
   callable only over the cap that init transfers to procmgr at
-  procmgr's bootstrap round. memmgr identifies this cap by token and
-  rejects procmgr-only calls received over any other tokened cap.
+  procmgr's bootstrap round. memmgr identifies this cap by badge and
+  rejects procmgr-only calls received over any other badged cap.
 - **Universal** labels (`REQUEST_FRAMES`, `RELEASE_FRAMES`) are
-  callable over any tokened cap, including those memmgr returned from
+  callable over any badged cap, including those memmgr returned from
   `REGISTER_PROCESS`.
 
-Tokens cannot be forged: they are minted by `cap_derive_token` only
+Badges cannot be forged: they are minted by `cap_derive_badge` only
 under the kernel's derivation rules, and procmgr is the only process
 that holds memmgr's procmgr-only cap.
 
@@ -110,7 +110,7 @@ Best-effort replies may use the full reply-side capacity.
 | 1 | `OutOfMemoryContiguous` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
 | 2 | `OutOfMemoryBestEffort` | Pool cannot cover `want_pages` even fragmented |
 | 3 | `Quota` | Per-process frame-record list at static cap |
-| 4 | `InvalidArgument` | `want_pages == 0`, `flags` reserved bits set, or token unknown |
+| 4 | `InvalidArgument` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
 
 ### Label 2: `RELEASE_FRAMES`
 
@@ -143,7 +143,7 @@ range, or by long-lived services pruning their working set.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `InvalidArgument` | `cap_count == 0`, cap not previously issued to this token, or page-count mismatch |
+| 4 | `InvalidArgument` | `cap_count == 0`, cap not previously issued to this badge, or page-count mismatch |
 
 memmgr removes the listed caps from the per-process tracking entry,
 inserts them back into the appropriate free-pool buckets, and runs
@@ -152,7 +152,7 @@ coalescing on adjacent runs.
 ### Label 3: `REGISTER_PROCESS`
 
 Procmgr informs memmgr of a new process. Memmgr allocates a per-process
-tracking entry and returns a tokened SEND cap on memmgr's endpoint
+tracking entry and returns a badged SEND cap on memmgr's endpoint
 that procmgr will install in the new process's
 `ProcessInfo.memmgr_endpoint_cap`. Privilege: procmgr-only.
 
@@ -162,8 +162,8 @@ that procmgr will install in the new process's
 |---|---|
 | label | 3 |
 
-The token of the requesting endpoint identifies procmgr; memmgr verifies
-this and rejects the call otherwise. memmgr mints a fresh token for the
+The badge of the requesting endpoint identifies procmgr; memmgr verifies
+this and rejects the call otherwise. memmgr mints a fresh badge for the
 new process internally — procmgr does not supply it.
 
 **Reply (success):**
@@ -171,11 +171,11 @@ new process internally — procmgr does not supply it.
 | Field | Value |
 |---|---|
 | label | 0 (success) |
-| data[0] | Memmgr-side process token (procmgr forwards this in `PROCESS_DIED`) |
-| cap[0] | Tokened SEND cap on memmgr's endpoint, identifying the new process |
+| data[0] | Memmgr-side process badge (procmgr forwards this in `PROCESS_DIED`) |
+| cap[0] | Badged SEND cap on memmgr's endpoint, identifying the new process |
 
-The token is also encoded in the returned cap, but userspace currently
-has no syscall to read a cap's token, so memmgr returns it explicitly
+The badge is also encoded in the returned cap, but userspace currently
+has no syscall to read a cap's badge, so memmgr returns it explicitly
 in `data[0]` for procmgr to record alongside the cap and forward in
 the eventual `PROCESS_DIED`.
 
@@ -195,7 +195,7 @@ the eventual `PROCESS_DIED`.
 ### Label 4: `PROCESS_DIED`
 
 Procmgr signals process death. memmgr looks up the per-process tracking
-entry by token, reclaims every Frame cap memmgr has issued to that
+entry by badge, reclaims every Frame cap memmgr has issued to that
 process, and runs coalescing. Privilege: procmgr-only.
 
 **Request:**
@@ -203,14 +203,14 @@ process, and runs coalescing. Privilege: procmgr-only.
 | Field | Value |
 |---|---|
 | label | 4 |
-| data[0] | Memmgr-side process token of the dead process |
+| data[0] | Memmgr-side process badge of the dead process |
 
-The token is the value memmgr returned in `REGISTER_PROCESS` reply
+The badge is the value memmgr returned in `REGISTER_PROCESS` reply
 `data[0]`. Procmgr stores it in its per-process record alongside the
-tokened SEND cap and replays it here on death. Procmgr cap-deletes
-its own copy of the dead process's tokened SEND cap separately, after
+badged SEND cap and replays it here on death. Procmgr cap-deletes
+its own copy of the dead process's badged SEND cap separately, after
 the `PROCESS_DIED` round trip; the cap is **not** transferred in this
-IPC. Idempotent on stale tokens (already-reaped or never-registered).
+IPC. Idempotent on stale badges (already-reaped or never-registered).
 
 **Reply (success):**
 
@@ -230,7 +230,7 @@ IPC. Idempotent on stale tokens (already-reaped or never-registered).
 |---|---|---|
 | 5 | `Unauthorized` | Caller is not procmgr |
 
-`PROCESS_DIED` for an unknown token is not an error — memmgr returns
+`PROCESS_DIED` for an unknown badge is not an error — memmgr returns
 success. Reclamation is idempotent.
 
 ---

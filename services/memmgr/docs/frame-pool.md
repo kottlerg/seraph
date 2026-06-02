@@ -74,11 +74,11 @@ to the caller. The intermediary lets memmgr reclaim the cap on
 
 ## Per-Process Tracking
 
-memmgr maintains a per-process table keyed on the procmgr-minted token
+memmgr maintains a per-process table keyed on the procmgr-minted badge
 delivered with every `REQUEST_FRAMES` call (and established at
 `REGISTER_PROCESS`). Each entry records:
 
-- The token (process identity).
+- The badge (process identity).
 - The list of Frame slots memmgr has handed to this process,
   cumulatively, since `REGISTER_PROCESS`.
 
@@ -96,9 +96,9 @@ concurrently-tracked processes. `REGISTER_PROCESS` returns
 
 ## Reclamation
 
-On `PROCESS_DIED(token)` from procmgr:
+On `PROCESS_DIED(badge)` from procmgr:
 
-1. Look up the per-process entry. If absent (untracked token), return
+1. Look up the per-process entry. If absent (untracked badge), return
    silently — the death notification is idempotent.
 2. For each Frame slot in the entry:
    a. Walk back to the original cap memmgr retained at allocation time.

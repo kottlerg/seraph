@@ -28,7 +28,7 @@ fat/
 
 ## IPC surface
 
-| Label | Untokened? | Description |
+| Label | Unbadged? | Description |
 |---|---|---|
 | `FS_MOUNT` | yes | vfsd's BPB-validation probe at mount time |
 | `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` | no | namespace dispatch |
@@ -45,8 +45,8 @@ fat/
 | `FS_TRUNCATE` | no | shrink a file to zero (v1: `new_len == 0` only) |
 
 `FS_RENAME` is single-directory only at v0.1.0 because servers cannot
-introspect the token packed in a received cap; cross-directory rename
-needs either a kernel-level `cap_info` selector for tokens or a wire
+introspect the badge packed in a received cap; cross-directory rename
+needs either a kernel-level `cap_info` selector for badges or a wire
 shape that conveys the destination `NodeId` out-of-band. Tracked as
 [Issue #89](https://github.com/kottlerg/seraph/issues/89).
 

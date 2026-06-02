@@ -11,7 +11,7 @@
 //! it acquires the ACPI tables it parses and the carved I/O-port /
 //! `SbiControl` caps it drives from devmgr (the hardware + ACPI authority)
 //! at startup, "as if it were a device driver". svcmgr publishes a
-//! `SHUTDOWN_AUTHORITY`-tokened SEND (`pwrmgr.shutdown`) and its no-auth
+//! `SHUTDOWN_AUTHORITY`-badged SEND (`pwrmgr.shutdown`) and its no-auth
 //! twin (`pwrmgr.deny`) on pwrmgr's service endpoint to the consumers it
 //! seeds (today: svctest).
 //!
@@ -85,7 +85,7 @@ fn main() -> !
             continue;
         };
 
-        let authorized = msg.token & pwrmgr_labels::SHUTDOWN_AUTHORITY != 0;
+        let authorized = msg.badge & pwrmgr_labels::SHUTDOWN_AUTHORITY != 0;
         match msg.label
         {
             pwrmgr_labels::SHUTDOWN =>

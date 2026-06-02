@@ -150,7 +150,7 @@ pub struct DevmgrCaps
     pub driver_module_count: usize,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
-    // tokened on. Reserved for devmgr-initiated publications; the active
+    // badged on. Reserved for devmgr-initiated publications; the active
     // svcmgr publications (`timed`, `rootfs.root`, `pwrmgr.*`, `svcmgr`,
     // `devmgr.registry`) are init-issued.
     pub svcmgr_publish_cap: u32,

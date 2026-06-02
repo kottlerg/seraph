@@ -48,18 +48,18 @@ procmgr/
   notify memmgr.
 - **Process registry** — maintain a table of running processes; answer
   queries from svcmgr and other services.
-- **Per-child log cap seeding** — derive a tokened SEND cap on the
-  master log endpoint at every spawn (token = the child's process
-  token) and install the slot at `ProcessInfo.log_send_cap`. The
-  un-tokened source cap arrives in procmgr's bootstrap round from
+- **Per-child log cap seeding** — derive a badged SEND cap on the
+  master log endpoint at every spawn (badge = the child's process
+  badge) and install the slot at `ProcessInfo.log_send_cap`. The
+  un-badged source cap arrives in procmgr's bootstrap round from
   init. Children call `seraph::log!` directly through the seeded
   cap; no `GET_LOG_CAP` discovery roundtrip.
 - **Death-notification fan-out to logd** — accept
   `REGISTER_DEATH_EQ` from real-logd (gated by the
-  `DEATH_EQ_AUTHORITY` token), store logd's `EventQueue` cap, bind
+  `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, bind
   it retroactively on every existing thread, and bind it on every
   new spawn alongside procmgr's own death observer (correlator =
-  process token, equal to logd's per-sender slot key).
+  process badge, equal to logd's per-sender slot key).
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff at
   end-of-Phase-3 and tear down init's residue. See the
   [Init reap](#init-reap) subsection below.
@@ -151,7 +151,7 @@ procmgr and memmgr are sister tier-1 services with disjoint authority.
 memmgr owns the frame pool; procmgr owns process lifecycle. procmgr is
 the only privileged caller of memmgr's procmgr-only labels
 (`REGISTER_PROCESS`, `PROCESS_DIED`); no other service can mint or
-retire process tokens against memmgr. See
+retire process badges against memmgr. See
 [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Authority
 Boundaries Between memmgr and procmgr" for the full split.
 

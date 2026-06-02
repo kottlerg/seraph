@@ -196,16 +196,16 @@ fn main() -> !
             continue;
         };
         let label = msg.label;
-        let token = msg.token;
+        let badge = msg.badge;
 
         match label
         {
             ipc::devmgr_labels::QUERY_BLOCK_DEVICE =>
             {
-                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
                 {
                     std::os::seraph::log!(
-                        "QUERY_BLOCK_DEVICE rejected: token lacks REGISTRY_QUERY_AUTHORITY"
+                        "QUERY_BLOCK_DEVICE rejected: badge lacks REGISTRY_QUERY_AUTHORITY"
                     );
                     let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
                     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -224,13 +224,13 @@ fn main() -> !
                 }
                 else if blk_driver_spawned && blk_ep != 0
                 {
-                    // Mint a tokened SEND_GRANT cap with the
+                    // Mint a badged SEND_GRANT cap with the
                     // MOUNT_AUTHORITY verb bit. The bit gates
                     // REGISTER_PARTITION and whole-disk reads at
                     // virtio-blk; consumers without it can only use
-                    // partition-tokened caps the driver issues in
+                    // partition-badged caps the driver issues in
                     // response to a REGISTER_PARTITION call.
-                    if let Ok(derived) = syscall::cap_derive_token(
+                    if let Ok(derived) = syscall::cap_derive_badge(
                         blk_ep,
                         syscall::RIGHTS_SEND_GRANT,
                         ipc::blk_labels::MOUNT_AUTHORITY,
@@ -262,7 +262,7 @@ fn main() -> !
                 // (the log sink), which blocks in this synchronous call
                 // outside its log-recv loop. A log here would deadlock
                 // (devmgr → log_ep → logd, which is waiting on this reply).
-                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
                 {
                     let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
                     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -276,10 +276,10 @@ fn main() -> !
                 }
                 else if serial_spawned && serial_ep != 0
                 {
-                    // Mint a tokened SEND_GRANT cap carrying the
+                    // Mint a badged SEND_GRANT cap carrying the
                     // WRITE_AUTHORITY verb bit on the serial driver's
                     // service endpoint, mirroring QUERY_BLOCK_DEVICE.
-                    if let Ok(derived) = syscall::cap_derive_token(
+                    if let Ok(derived) = syscall::cap_derive_badge(
                         serial_ep,
                         syscall::RIGHTS_SEND_GRANT,
                         ipc::serial_labels::WRITE_AUTHORITY,
@@ -311,7 +311,7 @@ fn main() -> !
                 // If logd ever fans framebuffer output here, a log call
                 // would deadlock (devmgr → log_ep → logd waiting on
                 // this reply).
-                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
                 {
                     let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
                     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -325,7 +325,7 @@ fn main() -> !
                 }
                 else if fb_spawned && fb_ep != 0
                 {
-                    if let Ok(derived) = syscall::cap_derive_token(
+                    if let Ok(derived) = syscall::cap_derive_badge(
                         fb_ep,
                         syscall::RIGHTS_SEND_GRANT,
                         ipc::fb_labels::WRITE_AUTHORITY,
@@ -369,10 +369,10 @@ fn main() -> !
                 // cap dangling in a server's slot is a category of bug
                 // the rest of the codebase consistently avoids.
                 let delivered_cap = msg.caps().first().copied();
-                if token & ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY == 0
+                if badge & ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY == 0
                 {
                     std::os::seraph::log!(
-                        "SET_DRIVERS_DIR rejected: token lacks DRIVERS_DIR_AUTHORITY"
+                        "SET_DRIVERS_DIR rejected: badge lacks DRIVERS_DIR_AUTHORITY"
                     );
                     if let Some(c) = delivered_cap
                     {
@@ -442,7 +442,7 @@ fn main() -> !
                 // received) or failed permanently for this boot —
                 // reply NO_DEVICE either way and the client (timed)
                 // degrades to its no-RTC path.
-                if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+                if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
                 {
                     let reply = IpcMessage::new(ipc::devmgr_errors::UNAUTHORIZED);
                     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -456,7 +456,7 @@ fn main() -> !
                 }
                 else if rtc_ep != 0
                 {
-                    if let Ok(derived) = syscall::cap_derive_token(
+                    if let Ok(derived) = syscall::cap_derive_badge(
                         rtc_ep,
                         syscall::RIGHTS_SEND_GRANT,
                         ipc::rtc_labels::READ_AUTHORITY,
@@ -486,15 +486,15 @@ fn main() -> !
             }
             ipc::devmgr_labels::QUERY_ACPI_TABLE =>
             {
-                handle_query_acpi_table(&caps, &msg, token, ipc_buf);
+                handle_query_acpi_table(&caps, &msg, badge, ipc_buf);
             }
             ipc::devmgr_labels::QUERY_SHUTDOWN_DEVICE =>
             {
-                handle_query_shutdown_device(&caps, &msg, token, ipc_buf);
+                handle_query_shutdown_device(&caps, &msg, badge, ipc_buf);
             }
             ipc::devmgr_labels::QUERY_DEVICE_INFO =>
             {
-                let dev_idx = token.wrapping_sub(1) as usize;
+                let dev_idx = badge.wrapping_sub(1) as usize;
                 if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
                 {
                     let reply = IpcMessage::new(ipc::devmgr_errors::LABEL_VERSION_MISMATCH);
@@ -870,9 +870,9 @@ fn reply_status(code: u64, ipc_buf: *mut u64)
 /// with a read-only Frame cap on its region plus the `(region_base,
 /// region_size, table_phys)` the caller needs to map and read it. devmgr
 /// is the sole ACPI owner; consumers hold no ACPI frames of their own.
-fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, token: u64, ipc_buf: *mut u64)
+fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64, ipc_buf: *mut u64)
 {
-    if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+    if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
     {
         reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
         return;
@@ -916,11 +916,11 @@ fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, token: u64
 fn handle_query_shutdown_device(
     caps: &caps::DevmgrCaps,
     msg: &IpcMessage,
-    token: u64,
+    badge: u64,
     ipc_buf: *mut u64,
 )
 {
-    if token & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
+    if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
     {
         reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
         return;
@@ -1222,7 +1222,7 @@ fn spawn_virtio_blk(
             }
             *catalog.count += 1;
         }
-        let device_token = (dev_idx as u64) + 1;
+        let device_badge = (dev_idx as u64) + 1;
 
         let bar_info = find_virtio_bar_cap(pci_dev, caps);
         let irq_cap = acquire_single_irq_cap(pci_dev, irq_root);
@@ -1241,7 +1241,7 @@ fn spawn_virtio_blk(
             irq_cap,
             service_ep: blk_ep,
             registry_ep: caps.registry_ep,
-            device_token,
+            device_badge,
         };
         spawn::spawn_driver(&config, ipc_buf);
 
@@ -1383,14 +1383,14 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
 /// Carve a narrow `MmioRegion` cap covering the linear framebuffer and
 /// spawn the framebuffer driver. Registers the geometry in `catalog`
 /// so the driver can fetch it via `QUERY_DEVICE_INFO` at runtime; mints
-/// a tokened devmgr-query endpoint for the driver's round-2 cap.
+/// a badged devmgr-query endpoint for the driver's round-2 cap.
 /// Returns `(spawned, fb_ep)`; `fb_ep` is the devmgr-owned service
 /// endpoint used to mint client SEND caps on
 /// [`ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. devmgr does not
 /// retain framebuffer-MMIO authority after a successful spawn — the
 /// carved cap is moved to the driver.
 // too_many_lines: framebuffer spawn is one transaction — carve the MMIO
-// aperture cap, register the device-info catalog entry, mint a tokened
+// aperture cap, register the device-info catalog entry, mint a badged
 // query endpoint, invoke spawn_simple_device. Each fallible step owns
 // slots that must be released cooperatively on partial failure;
 // extracting helpers requires threading the same parameters through.
@@ -1440,7 +1440,7 @@ fn spawn_framebuffer(
     };
 
     // Register a catalog entry so the driver can fetch its geometry via
-    // QUERY_DEVICE_INFO. Token == catalog-index + 1, mirroring virtio.
+    // QUERY_DEVICE_INFO. Badge == catalog-index + 1, mirroring virtio.
     let dev_idx = *catalog.count;
     if dev_idx >= catalog.entries.len()
     {
@@ -1477,15 +1477,15 @@ fn spawn_framebuffer(
         return (false, fb_ep);
     }
     *catalog.count += 1;
-    let device_token = (dev_idx as u64) + 1;
+    let device_badge = (dev_idx as u64) + 1;
 
-    // Tokened devmgr-query endpoint so the driver can call
+    // Badged devmgr-query endpoint so the driver can call
     // QUERY_DEVICE_INFO and retrieve its FramebufferInfo.
     let Ok(devmgr_query_ep) =
-        syscall::cap_derive_token(caps.registry_ep, syscall::RIGHTS_SEND, device_token)
+        syscall::cap_derive_badge(caps.registry_ep, syscall::RIGHTS_SEND, device_badge)
     else
     {
-        std::os::seraph::log!("framebuffer: failed to derive tokened query ep");
+        std::os::seraph::log!("framebuffer: failed to derive badged query ep");
         let _ = syscall::cap_delete(hw_cap);
         return (false, fb_ep);
     };

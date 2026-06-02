@@ -110,7 +110,7 @@ pub struct Definition
     /// under. When non-empty, svcmgr's launch path creates a service
     /// endpoint, serves its RECV half as bootstrap cap[0] (ahead of the
     /// `seed` caps), and publishes one SEND half per entry — each stamped
-    /// with that entry's [`ProvidedName::token`] — into the discovery
+    /// with that entry's [`ProvidedName::badge`] — into the discovery
     /// registry. The endpoint persists across restarts (svcmgr holds the
     /// source), so cached client caps survive a crash-restart cycle and no
     /// re-publish is needed. Empty for pure-consumer services that only
@@ -130,12 +130,12 @@ pub struct Definition
 }
 
 /// One published name in a service's `provides = ...` list, with the
-/// token svcmgr stamps on the SEND it publishes.
+/// badge svcmgr stamps on the SEND it publishes.
 ///
-/// The token rides through publish → registry → `QUERY_ENDPOINT` lookup
-/// unchanged (`cap_derive` inherits a source cap's token), so a consumer
+/// The badge rides through publish → registry → `QUERY_ENDPOINT` lookup
+/// unchanged (`cap_derive` inherits a source cap's badge), so a consumer
 /// that resolves the name receives a SEND already carrying it. The verb
-/// the server gates on is `token & (1 << 63)`, the universal
+/// the server gates on is `badge & (1 << 63)`, the universal
 /// verb-authority bit shared by every `*_AUTHORITY` constant.
 #[derive(Clone, Debug)]
 pub struct ProvidedName
@@ -143,9 +143,9 @@ pub struct ProvidedName
     pub name: String,
     /// `1 << 63` for an `:auth` entry (carries the verb-authority bit),
     /// `1` for a `:deny` entry (present but gate-failing), `0` for a bare
-    /// entry (untokened — published via `cap_derive`, not
-    /// `cap_derive_token`).
-    pub token: u64,
+    /// entry (unbadged — published via `cap_derive`, not
+    /// `cap_derive_badge`).
+    pub badge: u64,
 }
 
 /// Directory svcmgr scans for service definitions. Absolute path

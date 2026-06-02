@@ -213,7 +213,7 @@ pub struct ProcessInfo
     /// calls `SYS_IPC_BUFFER_SET` with this address on startup.
     pub ipc_buffer_vaddr: u64,
 
-    /// `CSpace` slot of a tokened IPC endpoint back to the creating service's
+    /// `CSpace` slot of a badged IPC endpoint back to the creating service's
     /// bootstrap handler.
     ///
     /// The child calls `ipc::bootstrap::REQUEST` on this endpoint in a loop to
@@ -221,7 +221,7 @@ pub struct ProcessInfo
     /// endpoint is provided (child operates without bootstrap caps).
     pub creator_endpoint_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on procmgr's service endpoint.
+    /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint.
     ///
     /// Used for process-lifecycle queries (`QUERY_PROCESS`,
     /// `DESTROY_PROCESS`, future supervision RPCs) and for any future
@@ -231,13 +231,13 @@ pub struct ProcessInfo
     /// before procmgr exists). Consumers must tolerate zero.
     pub procmgr_endpoint_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on memmgr's service endpoint.
+    /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint.
     ///
     /// Every std-built process needs this to bootstrap its heap via
     /// `memmgr_labels::REQUEST_FRAMES`. `std::os::seraph::_start` reads
     /// this slot and initialises the allocator before `lang_start` runs,
     /// so idiomatic `fn main()` code can allocate from the very first
-    /// statement. The tokened cap identifies the holder to memmgr's
+    /// statement. The badged cap identifies the holder to memmgr's
     /// per-process tracking, so allocations are accounted to the correct
     /// process.
     ///
@@ -246,8 +246,8 @@ pub struct ProcessInfo
     pub memmgr_endpoint_cap: u32,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, used
-    /// as the system-wide service-discovery handle. The cap's token
-    /// carries only the child's per-process token — without the
+    /// as the system-wide service-discovery handle. The cap's badge
+    /// carries only the child's per-process badge — without the
     /// `svcmgr_labels::PUBLISH_AUTHORITY` verb-bit — so svcmgr accepts
     /// `QUERY_ENDPOINT` from it but rejects `PUBLISH_ENDPOINT` with
     /// `svcmgr_errors::UNAUTHORIZED`. See `docs/capability-model.md`
@@ -361,7 +361,7 @@ pub struct ProcessInfo
     /// Number of env entries (NUL-terminated `KEY=VALUE` strings) in the blob.
     pub env_count: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on a namespace endpoint
+    /// `CSpace` slot of a badged SEND cap on a namespace endpoint
     /// addressing the directory the process should treat as its
     /// system root. Anchors absolute-path resolution.
     ///
@@ -373,7 +373,7 @@ pub struct ProcessInfo
     /// must tolerate zero by returning `Unsupported`.
     pub system_root_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on a namespace endpoint
+    /// `CSpace` slot of a badged SEND cap on a namespace endpoint
     /// addressing the directory the process should treat as its initial
     /// current working directory. Anchors relative-path resolution.
     ///
@@ -384,7 +384,7 @@ pub struct ProcessInfo
     /// is installed (e.g. via `std::env::set_current_dir`).
     pub current_dir_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on the system log endpoint
+    /// `CSpace` slot of a badged SEND cap on the system log endpoint
     /// suitable for direct `STREAM_BYTES` / `STREAM_REGISTER_NAME`
     /// use.
     ///
@@ -394,9 +394,9 @@ pub struct ProcessInfo
     /// the registry is the system-wide service-discovery channel from
     /// this point forward. See follow-up issue tracking the migration.
     ///
-    /// Procmgr derives this cap per spawn via `cap_derive_token` on
+    /// Procmgr derives this cap per spawn via `cap_derive_badge` on
     /// the log endpoint it holds, using the child's procmgr-assigned
-    /// token as the cap's token. Logd sees the same token on every
+    /// badge as the cap's badge. Logd sees the same badge on every
     /// IPC the child makes, keys its per-sender slot map by it, and
     /// matches it directly against the death-notification correlator
     /// procmgr posts on child exit.
@@ -473,18 +473,18 @@ pub struct StartupInfo
     /// `CSpace` slot of own `CSpace` capability.
     pub self_cspace: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on procmgr's service endpoint.
+    /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint.
     /// Zero when unreachable (procmgr itself, or earlier in the boot chain).
     pub procmgr_endpoint: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on memmgr's service endpoint.
+    /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint.
     /// Used by `std::os::seraph::_start` to bootstrap the heap allocator.
     /// Zero when unreachable (memmgr itself, init, or earlier in the boot
     /// chain).
     pub memmgr_endpoint: u32,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the
-    /// system-wide service-discovery handle. The cap's token lacks the
+    /// system-wide service-discovery handle. The cap's badge lacks the
     /// `svcmgr_labels::PUBLISH_AUTHORITY` verb-bit, so it answers
     /// `QUERY_ENDPOINT` only. `registry-client::lookup(name)` issues
     /// the QUERY against this cap. Zero when svcmgr is not reachable.
@@ -503,12 +503,12 @@ pub struct StartupInfo
     /// is attached.
     pub stderr_frame_cap: u32,
 
-    /// Tokened SEND cap on vfsd's namespace endpoint addressing the
+    /// Badged SEND cap on vfsd's namespace endpoint addressing the
     /// synthetic system root. Zero when vfsd is not reachable. See
     /// `ProcessInfo::system_root_cap`.
     pub system_root_cap: u32,
 
-    /// Tokened SEND cap on a namespace endpoint addressing the initial
+    /// Badged SEND cap on a namespace endpoint addressing the initial
     /// current working directory. Zero means relative-path resolution
     /// is unsupported until the process sets one. See
     /// `ProcessInfo::current_dir_cap`.

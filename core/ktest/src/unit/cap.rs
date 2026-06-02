@@ -15,7 +15,7 @@
 
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_signal,
-    cap_delete, cap_derive, cap_derive_token, cap_insert, cap_move, cap_revoke, event_queue_create,
+    cap_delete, cap_derive, cap_derive_badge, cap_insert, cap_move, cap_revoke, event_queue_create,
     signal_send, signal_wait,
 };
 use syscall_abi::SyscallError;
@@ -436,94 +436,94 @@ pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── SYS_CAP_DERIVE_TOKEN ────────────────────────────────────────────────────
+// ── SYS_CAP_DERIVE_BADGE ────────────────────────────────────────────────────
 
-/// `cap_derive_token` attaches a token to a derived capability.
-pub fn derive_token(ctx: &TestContext) -> TestResult
+/// `cap_derive_badge` attaches a badge to a derived capability.
+pub fn derive_badge(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_frame_base)
-        .map_err(|_| "create_endpoint for derive_token test failed")?;
+        .map_err(|_| "create_endpoint for derive_badge test failed")?;
 
-    let tokened =
-        cap_derive_token(ep, syscall::RIGHTS_ALL, 42).map_err(|_| "cap_derive_token failed")?;
+    let badged =
+        cap_derive_badge(ep, syscall::RIGHTS_ALL, 42).map_err(|_| "cap_derive_badge failed")?;
 
-    // The tokened cap is usable (it's a valid endpoint derivative).
-    cap_delete(tokened).map_err(|_| "cap_delete tokened cap failed")?;
-    cap_delete(ep).map_err(|_| "cap_delete ep after derive_token test failed")?;
+    // The badged cap is usable (it's a valid endpoint derivative).
+    cap_delete(badged).map_err(|_| "cap_delete badged cap failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after derive_badge test failed")?;
     Ok(())
 }
 
-/// `cap_derive_token` with token=0 returns `InvalidArgument`.
-pub fn derive_token_zero_err(ctx: &TestContext) -> TestResult
+/// `cap_derive_badge` with badge=0 returns `InvalidArgument`.
+pub fn derive_badge_zero_err(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_frame_base)
-        .map_err(|_| "create_endpoint for derive_token_zero_err test failed")?;
+        .map_err(|_| "create_endpoint for derive_badge_zero_err test failed")?;
 
-    let err = cap_derive_token(ep, syscall::RIGHTS_ALL, 0);
+    let err = cap_derive_badge(ep, syscall::RIGHTS_ALL, 0);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("cap_derive_token(0) did not return InvalidArgument");
+        return Err("cap_derive_badge(0) did not return InvalidArgument");
     }
 
-    cap_delete(ep).map_err(|_| "cap_delete ep after derive_token_zero_err test failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after derive_badge_zero_err test failed")?;
     Ok(())
 }
 
-/// Re-tokening a cap that already has a token returns `InvalidArgument`.
-pub fn derive_token_retoken_err(ctx: &TestContext) -> TestResult
+/// Re-badging a cap that already has a badge returns `InvalidArgument`.
+pub fn derive_badge_rebadge_err(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_frame_base)
-        .map_err(|_| "create_endpoint for retoken_err test failed")?;
+        .map_err(|_| "create_endpoint for rebadge_err test failed")?;
 
-    let tokened = cap_derive_token(ep, syscall::RIGHTS_ALL, 100)
-        .map_err(|_| "first cap_derive_token failed")?;
+    let badged = cap_derive_badge(ep, syscall::RIGHTS_ALL, 100)
+        .map_err(|_| "first cap_derive_badge failed")?;
 
-    // Attempting to set a new token on an already-tokened cap must fail.
-    let err = cap_derive_token(tokened, syscall::RIGHTS_ALL, 200);
+    // Attempting to set a new badge on an already-badged cap must fail.
+    let err = cap_derive_badge(badged, syscall::RIGHTS_ALL, 200);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("re-tokening did not return InvalidArgument");
+        return Err("re-badging did not return InvalidArgument");
     }
 
-    cap_delete(tokened).map_err(|_| "cap_delete tokened failed")?;
-    cap_delete(ep).map_err(|_| "cap_delete ep after retoken_err test failed")?;
+    cap_delete(badged).map_err(|_| "cap_delete badged failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after rebadge_err test failed")?;
     Ok(())
 }
 
-/// `cap_derive` from a tokened cap inherits the token (verified via IPC delivery).
-pub fn derive_inherits_token(ctx: &TestContext) -> TestResult
+/// `cap_derive` from a badged cap inherits the badge (verified via IPC delivery).
+pub fn derive_inherits_badge(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_frame_base)
         .map_err(|_| "create_endpoint for inherit test failed")?;
 
-    let tokened =
-        cap_derive_token(ep, syscall::RIGHTS_ALL, 77).map_err(|_| "cap_derive_token failed")?;
+    let badged =
+        cap_derive_badge(ep, syscall::RIGHTS_ALL, 77).map_err(|_| "cap_derive_badge failed")?;
 
-    // Derive from the tokened cap — should inherit token=77.
+    // Derive from the badged cap — should inherit badge=77.
     let derived =
-        cap_derive(tokened, syscall::RIGHTS_ALL).map_err(|_| "cap_derive from tokened failed")?;
+        cap_derive(badged, syscall::RIGHTS_ALL).map_err(|_| "cap_derive from badged failed")?;
 
-    // We can't directly inspect the token without IPC, but verify the cap is usable.
+    // We can't directly inspect the badge without IPC, but verify the cap is usable.
     cap_delete(derived).map_err(|_| "cap_delete derived failed")?;
-    cap_delete(tokened).map_err(|_| "cap_delete tokened failed")?;
+    cap_delete(badged).map_err(|_| "cap_delete badged failed")?;
     cap_delete(ep).map_err(|_| "cap_delete ep after inherit test failed")?;
     Ok(())
 }
 
-/// `cap_derive_token` works on non-endpoint caps (tokens are generic).
-pub fn derive_token_on_signal(ctx: &TestContext) -> TestResult
+/// `cap_derive_badge` works on non-endpoint caps (badges are generic).
+pub fn derive_badge_on_signal(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for derive_token_on_signal failed")?;
+        .map_err(|_| "create_signal for derive_badge_on_signal failed")?;
 
-    let tokened = cap_derive_token(sig, syscall::RIGHTS_ALL, 99)
-        .map_err(|_| "cap_derive_token on signal failed")?;
+    let badged = cap_derive_badge(sig, syscall::RIGHTS_ALL, 99)
+        .map_err(|_| "cap_derive_badge on signal failed")?;
 
-    // Tokened signal cap is still usable for signal operations.
-    signal_send(tokened, 0x1).map_err(|_| "signal_send on tokened cap failed")?;
-    signal_wait(sig).map_err(|_| "signal_wait after tokened send failed")?;
+    // Badged signal cap is still usable for signal operations.
+    signal_send(badged, 0x1).map_err(|_| "signal_send on badged cap failed")?;
+    signal_wait(sig).map_err(|_| "signal_wait after badged send failed")?;
 
-    cap_delete(tokened).map_err(|_| "cap_delete tokened signal failed")?;
-    cap_delete(sig).map_err(|_| "cap_delete sig after derive_token_on_signal failed")?;
+    cap_delete(badged).map_err(|_| "cap_delete badged signal failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after derive_badge_on_signal failed")?;
     Ok(())
 }

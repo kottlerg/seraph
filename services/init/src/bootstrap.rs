@@ -7,7 +7,7 @@
 //!
 //! Creates procmgr directly via kernel syscalls (no IPC) since procmgr is the
 //! first process and no process manager exists yet. Installs procmgr's
-//! `creator_endpoint_cap` to point at init's bootstrap endpoint (tokened
+//! `creator_endpoint_cap` to point at init's bootstrap endpoint (badged
 //! per-child) so procmgr receives its memory-pool bounds via the bootstrap
 //! protocol at startup.
 //!
@@ -362,13 +362,13 @@ fn load_elf_into_arena(
 /// remaining frames are handed over to memmgr.
 pub struct MemmgrBootstrap
 {
-    /// Init-side bootstrap token for memmgr's `request_round` reply.
-    pub bootstrap_token: u64,
-    /// Token init used when minting the procmgr-side tokened SEND on
+    /// Init-side bootstrap badge for memmgr's `request_round` reply.
+    pub bootstrap_badge: u64,
+    /// Badge init used when minting the procmgr-side badged SEND on
     /// memmgr's endpoint. Memmgr stores this and uses it to gate the
     /// procmgr-only labels (`REGISTER_PROCESS`, `PROCESS_DIED`).
-    pub procmgr_token: u64,
-    /// Slot in init's `CSpace` of the tokened SEND cap on memmgr's
+    pub procmgr_badge: u64,
+    /// Slot in init's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint that init will install in procmgr's `ProcessInfo`.
     pub procmgr_send_cap: u32,
     /// Memmgr's `CSpace` cap (in init's `CSpace`). Init copies RAM
@@ -507,7 +507,7 @@ fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
 /// init's frame pool before all remaining frames go to memmgr.
 ///
 /// `init_bootstrap_ep` is init's bootstrap endpoint; init derives a
-/// tokened SEND from it and installs it as memmgr's
+/// badged SEND from it and installs it as memmgr's
 /// `creator_endpoint_cap`.
 ///
 /// The memmgr boot module is located in [`InitInfo`] by name via
@@ -573,14 +573,14 @@ pub fn bootstrap_memmgr(
     let _ = syscall::cap_delete(module_ro);
     log("loaded memmgr ELF");
 
-    // Tokened creator endpoint for memmgr (init serves the bootstrap round
+    // Badged creator endpoint for memmgr (init serves the bootstrap round
     // for memmgr, so memmgr's `request_round` lands on init's bootstrap ep
-    // tagged with this token).
-    let memmgr_token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let tokened_creator =
-        syscall::cap_derive_token(init_bootstrap_ep, syscall::RIGHTS_SEND, memmgr_token).ok()?;
+    // tagged with this badge).
+    let memmgr_badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let badged_creator =
+        syscall::cap_derive_badge(init_bootstrap_ep, syscall::RIGHTS_SEND, memmgr_badge).ok()?;
     let mm_creator_slot =
-        syscall::cap_copy(tokened_creator, mm_cspace, syscall::RIGHTS_SEND).ok()?;
+        syscall::cap_copy(badged_creator, mm_cspace, syscall::RIGHTS_SEND).ok()?;
 
     let mm_caps = MemmgrCaps {
         aspace: mm_aspace,
@@ -591,21 +591,21 @@ pub fn bootstrap_memmgr(
     populate_memmgr_info(&mut arena, mm_aspace, &mm_caps, stack_pages)?;
     place_stack_and_ipc(&mut arena, mm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
 
-    // Mint procmgr's tokened SEND cap on memmgr's endpoint. Memmgr will
-    // recognise calls bearing this token as authorised for the
+    // Mint procmgr's badged SEND cap on memmgr's endpoint. Memmgr will
+    // recognise calls bearing this badge as authorised for the
     // procmgr-only labels.
-    let procmgr_token_on_mm =
-        NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let procmgr_send_cap = syscall::cap_derive_token(
+    let procmgr_badge_on_mm =
+        NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let procmgr_send_cap = syscall::cap_derive_badge(
         mm_service_ep,
         syscall::RIGHTS_SEND_GRANT,
-        procmgr_token_on_mm,
+        procmgr_badge_on_mm,
     )
     .ok()?;
 
     Some(MemmgrBootstrap {
-        bootstrap_token: memmgr_token,
-        procmgr_token: procmgr_token_on_mm,
+        bootstrap_badge: memmgr_badge,
+        procmgr_badge: procmgr_badge_on_mm,
         procmgr_send_cap,
         mm_cspace,
         mm_thread,
@@ -945,14 +945,14 @@ struct ProcmgrCaps
     cspace: u32,
     thread: u32,
     creator_endpoint_slot: u32,
-    /// Slot index in procmgr's `CSpace` of the tokened SEND cap on memmgr's
+    /// Slot index in procmgr's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint. Zero when memmgr is not yet wired — an early-boot-only
     /// condition.
     memmgr_endpoint_slot: u32,
-    /// Slot in procmgr's `CSpace` holding a tokened SEND on the
-    /// system log endpoint with token `LOG_TOKEN_PROCMGR`. Std reads
+    /// Slot in procmgr's `CSpace` holding a badged SEND on the
+    /// system log endpoint with badge `LOG_BADGE_PROCMGR`. Std reads
     /// it from `pi.log_send_cap` at `_start` and installs it via
-    /// `::log::install_tokened_cap` for procmgr's own `seraph::log!`
+    /// `::log::install_badged_cap` for procmgr's own `seraph::log!`
     /// writes. Zero when no log endpoint is available.
     log_send_slot: u32,
     /// `PT_TLS` template metadata, propagated into procmgr's `ProcessInfo`
@@ -964,10 +964,10 @@ struct ProcmgrCaps
 /// Populate procmgr's `ProcessInfo` page and map it read-only into procmgr.
 ///
 /// procmgr's stdio cap slots are left zero (procmgr is std-built but
-/// does not drive interactive stdio). The un-tokened SEND on
-/// the log endpoint procmgr uses as the *source* for deriving tokened
+/// does not drive interactive stdio). The un-badged SEND on
+/// the log endpoint procmgr uses as the *source* for deriving badged
 /// SEND caps per child arrives via procmgr's bootstrap round, not via
-/// `ProcessInfo`. The pre-installed tokened SEND cap procmgr uses for
+/// `ProcessInfo`. The pre-installed badged SEND cap procmgr uses for
 /// its OWN `seraph::log!` writes lives in `pi.log_send_cap`.
 #[allow(clippy::similar_names)]
 fn populate_procmgr_info(
@@ -1002,11 +1002,11 @@ fn populate_procmgr_info(
             pi.stdin_frame_cap = 0;
             pi.stdout_frame_cap = 0;
             pi.stderr_frame_cap = 0;
-            // Procmgr's own `seraph::log!` surface. The slot holds a tokened
-            // SEND cap on the log endpoint with token `LOG_TOKEN_PROCMGR`,
-            // derived by init via `cap_derive_token`. Procmgr's std `_start`
-            // installs it via `::log::install_tokened_cap`. The un-tokened
-            // SEND procmgr uses to derive per-child tokened caps is separate
+            // Procmgr's own `seraph::log!` surface. The slot holds a badged
+            // SEND cap on the log endpoint with badge `LOG_BADGE_PROCMGR`,
+            // derived by init via `cap_derive_badge`. Procmgr's std `_start`
+            // installs it via `::log::install_badged_cap`. The un-badged
+            // SEND procmgr uses to derive per-child badged caps is separate
             // (delivered via procmgr's bootstrap round).
             pi.log_send_cap = caps.log_send_slot;
             pi.stdin_data_signal_cap = 0;
@@ -1059,21 +1059,21 @@ pub struct ProcmgrBootstrap
 {
     /// Send cap to procmgr's service endpoint (init uses for `CREATE_PROCESS`).
     pub service_ep: u32,
-    /// Procmgr's bootstrap token on init's bootstrap endpoint.
-    pub bootstrap_token: u64,
-    /// Slot in procmgr's `CSpace` holding an un-tokened SEND cap on
+    /// Procmgr's bootstrap badge on init's bootstrap endpoint.
+    pub bootstrap_badge: u64,
+    /// Slot in procmgr's `CSpace` holding an un-badged SEND cap on
     /// the system log endpoint, used by procmgr as the *source* for
-    /// `cap_derive_token` to mint a tokened SEND cap per child (token =
-    /// the child's process token). The minted cap is placed in the
+    /// `cap_derive_badge` to mint a badged SEND cap per child (badge =
+    /// the child's process badge). The minted cap is placed in the
     /// child's `ProcessInfo.log_send_cap`. Zero when no log endpoint
     /// is available (very early boot); children born in that window
     /// receive zero and silent-drop `seraph::log!`.
     pub log_endpoint_slot: u32,
-    /// Slot in procmgr's `CSpace` holding an un-tokened SEND cap on
+    /// Slot in procmgr's `CSpace` holding an un-badged SEND cap on
     /// svcmgr's service endpoint (the global service registry).
-    /// Procmgr uses it as the *source* for `cap_derive_token` to mint
-    /// a tokened SEND cap per child (token = the child's process
-    /// token, no `PUBLISH_AUTHORITY` bit), which is placed in the
+    /// Procmgr uses it as the *source* for `cap_derive_badge` to mint
+    /// a badged SEND cap per child (badge = the child's process
+    /// badge, no `PUBLISH_AUTHORITY` bit), which is placed in the
     /// child's `ProcessInfo.service_registry_cap`. The child can
     /// `QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT` — publish-authority
     /// caps are minted separately and handed only to init / devmgr /
@@ -1088,13 +1088,13 @@ pub struct ProcmgrBootstrap
     pub arena_cap: u32,
 }
 
-/// Monotonic counter for init-side bootstrap tokens.
-pub static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 =
+/// Monotonic counter for init-side bootstrap badges.
+pub static NEXT_BOOTSTRAP_BADGE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1);
 
 /// Create and start procmgr from its boot module ELF image.
 ///
-/// `init_bootstrap_ep` is init's bootstrap endpoint; a tokened send cap is
+/// `init_bootstrap_ep` is init's bootstrap endpoint; a badged send cap is
 /// derived from it and installed as procmgr's `creator_endpoint_cap`.
 ///
 /// `pm_service_ep` is procmgr's own service endpoint (created by init, copied
@@ -1189,12 +1189,12 @@ pub fn bootstrap_procmgr(
 
     log("loaded procmgr ELF");
 
-    // Derive tokened creator endpoint for procmgr.
-    let procmgr_token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let tokened_creator =
-        syscall::cap_derive_token(init_bootstrap_ep, syscall::RIGHTS_SEND, procmgr_token).ok()?;
+    // Derive badged creator endpoint for procmgr.
+    let procmgr_badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let badged_creator =
+        syscall::cap_derive_badge(init_bootstrap_ep, syscall::RIGHTS_SEND, procmgr_badge).ok()?;
     let pm_creator_slot =
-        syscall::cap_copy(tokened_creator, pm_cspace, syscall::RIGHTS_SEND).ok()?;
+        syscall::cap_copy(badged_creator, pm_cspace, syscall::RIGHTS_SEND).ok()?;
 
     // Procmgr maintains no frame pool of its own; every per-child
     // allocation routes through memmgr. All remaining RAM frames get
@@ -1202,11 +1202,11 @@ pub fn bootstrap_procmgr(
     // has finished consuming init's pool.
     let _ = pm_creator_slot;
 
-    // Derive an un-tokened SEND cap on the log endpoint for procmgr.
+    // Derive an un-badged SEND cap on the log endpoint for procmgr.
     // Kept in init's CSpace and sent to procmgr via the bootstrap round
     // (ipc transfer moves it into procmgr's CSpace at a fresh slot).
-    // Procmgr uses it as the *source* for `cap_derive_token` to mint a
-    // tokened SEND cap per child it spawns.
+    // Procmgr uses it as the *source* for `cap_derive_badge` to mint a
+    // badged SEND cap per child it spawns.
     let pm_log_send = if log_ep == 0
     {
         0
@@ -1216,12 +1216,12 @@ pub fn bootstrap_procmgr(
         syscall::cap_derive(log_ep, syscall::RIGHTS_SEND).ok()?
     };
 
-    // Derive an un-tokened SEND cap on svcmgr's service endpoint for
+    // Derive an un-badged SEND cap on svcmgr's service endpoint for
     // procmgr. Kept in init's CSpace and sent to procmgr via the
     // bootstrap round; procmgr uses it as the *source* for
-    // `cap_derive_token` to mint a tokened SEND cap per child it
+    // `cap_derive_badge` to mint a badged SEND cap per child it
     // spawns, which becomes that child's
-    // `ProcessInfo.service_registry_cap`. Per-child tokens omit the
+    // `ProcessInfo.service_registry_cap`. Per-child badges omit the
     // `PUBLISH_AUTHORITY` bit so children can `QUERY_ENDPOINT` but
     // not `PUBLISH_ENDPOINT`.
     let pm_registry_send = if svcmgr_service_ep == 0
@@ -1233,7 +1233,7 @@ pub fn bootstrap_procmgr(
         syscall::cap_derive(svcmgr_service_ep, syscall::RIGHTS_SEND).ok()?
     };
 
-    // Copy the tokened memmgr SEND cap into procmgr's CSpace. The slot it
+    // Copy the badged memmgr SEND cap into procmgr's CSpace. The slot it
     // lands at gets installed in procmgr's `ProcessInfo.memmgr_endpoint_cap`.
     let memmgr_endpoint_slot = if memmgr_send_cap == 0
     {
@@ -1244,10 +1244,10 @@ pub fn bootstrap_procmgr(
         syscall::cap_copy(memmgr_send_cap, pm_cspace, syscall::RIGHTS_SEND_GRANT).ok()?
     };
 
-    // Derive procmgr's pre-installed tokened SEND cap on the log
-    // endpoint. Token = `LOG_TOKEN_PROCMGR` (reserved). Procmgr's
+    // Derive procmgr's pre-installed badged SEND cap on the log
+    // endpoint. Badge = `LOG_BADGE_PROCMGR` (reserved). Procmgr's
     // `seraph::log!` writes ride this cap; logd attributes them by the
-    // kernel-delivered token. Init derives in its own CSpace then
+    // kernel-delivered badge. Init derives in its own CSpace then
     // copies into procmgr's, mirroring the rights of every other
     // procmgr-CSpace seed.
     let log_send_slot = if log_ep == 0
@@ -1256,10 +1256,10 @@ pub fn bootstrap_procmgr(
     }
     else
     {
-        let init_side = syscall::cap_derive_token(
+        let init_side = syscall::cap_derive_badge(
             log_ep,
             syscall::RIGHTS_SEND,
-            ipc::log_tokens::LOG_TOKEN_PROCMGR,
+            ipc::log_badges::LOG_BADGE_PROCMGR,
         )
         .ok()?;
         let pm_side = syscall::cap_copy(init_side, pm_cspace, syscall::RIGHTS_SEND).ok()?;
@@ -1299,7 +1299,7 @@ pub fn bootstrap_procmgr(
 
     Some(ProcmgrBootstrap {
         service_ep: service_ep_for_init,
-        bootstrap_token: procmgr_token,
+        bootstrap_badge: procmgr_badge,
         log_endpoint_slot: pm_log_send,
         registry_endpoint_slot: pm_registry_send,
         thread: pm_thread,

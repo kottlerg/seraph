@@ -9,7 +9,7 @@ devmgr on x86-64 platforms via the non-PCI simple-device path,
 walks to from the `/services/drivers/` subtree cap init delivers
 post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`. devmgr owns the
 driver's service endpoint and mints client SEND caps on
-`devmgr_labels::QUERY_RTC_DEVICE`, each tokened with
+`devmgr_labels::QUERY_RTC_DEVICE`, each badged with
 `rtc_labels::READ_AUTHORITY`. The `timed` service resolves the SEND
 once at startup to seed its wall-clock offset.
 
@@ -46,7 +46,7 @@ protocol.
 
 * **`rtc_labels::RTC_GET_EPOCH_TIME`** — no payload. The driver
   re-reads the CMOS hardware on every request (no caching). Caller's
-  token must carry `rtc_labels::READ_AUTHORITY` (devmgr stamps it on
+  badge must carry `rtc_labels::READ_AUTHORITY` (devmgr stamps it on
   every SEND minted from `QUERY_RTC_DEVICE`); the driver replies
   `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a
   [`rtc_errors`](../../../shared/ipc/src/lib.rs) status code; on

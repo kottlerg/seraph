@@ -63,19 +63,19 @@ pub struct StartupInfo {
     /// Cap slot of the caller's own CSpace object.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub self_cspace: u32,
-    /// Cap slot of a tokened SEND cap on procmgr. Zero if procmgr is not
+    /// Cap slot of a badged SEND cap on procmgr. Zero if procmgr is not
     /// reachable (the process is procmgr itself, or runs before procmgr
     /// exists). Used for process-lifecycle queries.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub procmgr_endpoint: u32,
-    /// Cap slot of a tokened SEND cap on memmgr. Zero if memmgr is not
+    /// Cap slot of a badged SEND cap on memmgr. Zero if memmgr is not
     /// reachable (memmgr itself, init, or anything earlier in the boot
     /// chain). `_start` consumes this to bootstrap the heap.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub memmgr_endpoint: u32,
     /// Cap slot of a SEND cap on svcmgr's service endpoint, the
     /// system-wide service-discovery handle. Carries only the per-process
-    /// token (no `PUBLISH_AUTHORITY` verb-bit) so it can answer
+    /// badge (no `PUBLISH_AUTHORITY` verb-bit) so it can answer
     /// `svcmgr_labels::QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT`.
     /// `_start` consumes this to install the cap into the
     /// `registry-client` cache, so later `registry_client::lookup(name)`
@@ -95,14 +95,14 @@ pub struct StartupInfo {
     /// attached; writes silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stderr_frame_cap: u32,
-    /// Tokened SEND cap on vfsd's namespace endpoint at the synthetic
+    /// Badged SEND cap on vfsd's namespace endpoint at the synthetic
     /// system root. Installed by the spawner via
     /// `procmgr_labels::CONFIGURE_NAMESPACE` between create and start.
     /// Zero when no spawner-supplied cap was delivered (or vfsd is not
     /// reachable). Reachable application-side via [`root_dir_cap`].
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub system_root_cap: u32,
-    /// Tokened SEND cap on a namespace endpoint addressing the initial
+    /// Badged SEND cap on a namespace endpoint addressing the initial
     /// current working directory. Anchors relative-path resolution.
     /// Zero means relative paths are unsupported until the process
     /// installs one (e.g. via `std::env::set_current_dir`).
@@ -123,7 +123,7 @@ pub struct StartupInfo {
     pub stderr_data_signal_cap: u32,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stderr_space_signal_cap: u32,
-    /// Tokened SEND cap on the system log endpoint, pre-installed by
+    /// Badged SEND cap on the system log endpoint, pre-installed by
     /// procmgr at spawn time. Used by [`log!`] directly — no
     /// discovery roundtrip. Zero when no logger is reachable
     /// (init/memmgr/procmgr themselves, or anything earlier in the
@@ -385,11 +385,11 @@ pub extern "C" fn _start() -> ! {
         info.self_aspace_cap,
     );
 
-    // Install the pre-seeded tokened log SEND cap procmgr placed in
+    // Install the pre-seeded badged log SEND cap procmgr placed in
     // ProcessInfo. `seraph::log!` uses it directly with no discovery
     // roundtrip. Zero is tolerated (the macro silently drops in
     // processes without a logger).
-    ::log::install_tokened_cap(info.log_send_cap);
+    ::log::install_badged_cap(info.log_send_cap);
 
     // Install the per-process svcmgr SEND cap into the registry-client
     // cache. Zero is tolerated (processes spawned before svcmgr exists,
@@ -502,7 +502,7 @@ pub fn abort_thread() -> ! {
 
 // ── System root namespace cap ──────────────────────────────────────────────
 //
-// Tokened SEND on vfsd's namespace endpoint addressing the synthetic
+// Badged SEND on vfsd's namespace endpoint addressing the synthetic
 // system root (`NodeId::ROOT`). `_start` reads
 // `ProcessInfo.system_root_cap` and installs it here; namespace-walking
 // code (`std::fs::File::open` once converted, plus any cap-native
@@ -621,7 +621,7 @@ pub fn set_current_dir(path: &str) -> crate::io::Result<()> {
 }
 
 /// Walk `path` from the supplied namespace cap via `NS_LOOKUP` and return
-/// the resolved file's tokened SEND cap and its size hint.
+/// the resolved file's badged SEND cap and its size hint.
 ///
 /// Each non-final path component must resolve to a directory; the final
 /// component must resolve to a file. The returned cap is freshly derived
@@ -642,7 +642,7 @@ pub fn namespace_lookup_file(root_cap: u32, path: &str) -> crate::io::Result<(u3
 
 /// Walk `path` from the supplied namespace cap via `NS_LOOKUP`,
 /// requesting `requested_rights` per hop, and return the resolved
-/// directory's tokened SEND cap.
+/// directory's badged SEND cap.
 ///
 /// Every hop (including the final) must resolve to a directory. The
 /// returned cap carries at most `requested_rights` intersected with
@@ -713,8 +713,8 @@ pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_page
 
 // ── System log macro surface ────────────────────────────────────────────────
 //
-// The tokened SEND cap procmgr seeds at process create-time (recorded in
-// `StartupInfo::log_send_cap` and installed via `::log::install_tokened_cap`
+// The badged SEND cap procmgr seeds at process create-time (recorded in
+// `StartupInfo::log_send_cap` and installed via `::log::install_badged_cap`
 // during `_start`) is the destination of every `seraph::log!` call. No
 // discovery roundtrip; the cap is live from the first instruction of
 // user code.
@@ -725,14 +725,14 @@ pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_page
 pub mod log {
     use super::current_ipc_buf;
 
-    /// Return the cached tokened SEND cap on the system log endpoint
+    /// Return the cached badged SEND cap on the system log endpoint
     /// (pre-installed at `_start` from `ProcessInfo.log_send_cap`).
     /// Returns `0` when no log cap was seeded for this process (init,
     /// memmgr, procmgr themselves, or processes spawned before logd
     /// existed).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn acquire() -> u32 {
-        ::log::ensure_tokened_cap(current_ipc_buf())
+        ::log::ensure_badged_cap(current_ipc_buf())
     }
 
     /// Register a display name for this process's log stream.
@@ -744,12 +744,12 @@ pub mod log {
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn register_name(name: &[u8]) {
         let buf = current_ipc_buf();
-        let cap = ::log::ensure_tokened_cap(buf);
+        let cap = ::log::ensure_badged_cap(buf);
         ::log::register_name(cap, buf, name);
     }
 
     /// Macro entry point. Resolves the calling thread's IPC buffer and
-    /// the process-global tokened cap, then formats `args` and emits
+    /// the process-global badged cap, then formats `args` and emits
     /// one `STREAM_BYTES` message (split across IPC chunks if longer
     /// than 512 bytes). Silently drops when no log cap is acquirable.
     #[doc(hidden)]
@@ -790,7 +790,7 @@ pub mod registry {
 }
 
 /// System-log macro. Formats and emits one log line on the process's
-/// tokened SEND cap, lazy-acquired from the discovery cap on first
+/// badged SEND cap, lazy-acquired from the discovery cap on first
 /// call. The receiver tags each line with the registered display name
 /// (default `[?]`); see [`log::register_name`].
 ///

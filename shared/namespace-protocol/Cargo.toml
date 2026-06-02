@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 # no_std: shared namespace-protocol implementation. Hosts the IPC dispatch
-# loop, name validation, rights composition, and token packing common to
+# loop, name validation, rights composition, and badge packing common to
 # every namespace server (vfsd synthetic root, fs/fat, future fs/ext4 /
 # tmpfs / etc.). Servers implement the `NamespaceBackend` trait against
 # their storage layer; this crate owns the security-relevant code path so

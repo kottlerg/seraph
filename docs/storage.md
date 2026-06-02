@@ -31,8 +31,8 @@ Four system-scope invariants govern the stack:
   corrupt another. `vfsd` is the supervisor for the fs-driver
   lifecycle.
 - **Block access is partition-scoped at the capability layer.** The
-  block driver exposes one untokened whole-disk endpoint (held by
-  vfsd alone) and tokened per-partition endpoints (handed to fs
+  block driver exposes one unbadged whole-disk endpoint (held by
+  vfsd alone) and badged per-partition endpoints (handed to fs
   drivers). Out-of-bounds LBAs are rejected by the block driver on
   every request.
 - **System root is delivered, never discovered.** Every process's
@@ -58,7 +58,7 @@ kernel (phase 7) mints MmioRegion + IRQ from BootInfo
       → virtio-blk publishes its whole-disk service endpoint to devmgr
         → vfsd queries devmgr's device registry → whole-disk SEND
           → vfsd issues REGISTER_PARTITION (whole-disk endpoint only)
-            → vfsd derives a tokened per-partition SEND
+            → vfsd derives a badged per-partition SEND
               → vfsd spawns fs driver; injects partition-scoped block cap
                 → fs driver issues FS_MOUNT, reads BPB, replies OK
                   → vfsd captures fs driver's root namespace cap
@@ -67,14 +67,14 @@ kernel (phase 7) mints MmioRegion + IRQ from BootInfo
 ```
 
 The kernel half (BootInfo → MmioRegion mint → devmgr → driver binding)
-is owned by [`device-management.md`](device-management.md). Token
+is owned by [`device-management.md`](device-management.md). Badge
 semantics, derivation, and revocation are owned by
-[`capability-model.md`](capability-model.md) §"Tokens".
+[`capability-model.md`](capability-model.md) §"Badges".
 
-`REGISTER_PARTITION` is rejected over tokened callers: only the holder
+`REGISTER_PARTITION` is rejected over badged callers: only the holder
 of the whole-disk endpoint (vfsd) can mint a partition binding. The
 block driver enforces the LBA bound on every read and write against
-the caller's token. See
+the caller's badge. See
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
 
 ---
@@ -118,7 +118,7 @@ is owned by [`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vf
 Three actors cooperate to bring a filesystem online:
 
 **init** holds one storage-relevant cap after vfsd is spawned: a
-`SEED_AUTHORITY`-tokened SEND on vfsd's service endpoint (required by
+`SEED_AUTHORITY`-badged SEND on vfsd's service endpoint (required by
 the `GET_SYSTEM_ROOT_CAP` gate). Init issues no `MOUNT` — vfsd
 self-mounts root. Init pulls the system root via
 `GET_SYSTEM_ROOT_CAP` (which vfsd serves only once root is mounted, so
@@ -140,7 +140,7 @@ foreign-GUID mounts and shares this resolution path.
 
 **fs driver** runs as a separate process. After `FS_MOUNT` succeeds,
 it serves the cap-native `NS_*` protocol plus the surviving
-`FS_*` labels against per-node tokened SEND caps on its own
+`FS_*` labels against per-node badged SEND caps on its own
 endpoint. The block endpoint it receives is partition-scoped at
 delivery time; the fs driver reads and writes by partition-relative
 LBA.
@@ -162,11 +162,11 @@ by structure.
 The contract between fs drivers and the block driver has three
 elements:
 
-- **Two-tier endpoint.** Whole-disk untokened (vfsd only) versus
-  per-partition tokened (fs drivers). The block driver distinguishes
-  by the kernel-supplied caller token.
+- **Two-tier endpoint.** Whole-disk unbadged (vfsd only) versus
+  per-partition badged (fs drivers). The block driver distinguishes
+  by the kernel-supplied caller badge.
 - **Partition-scoped LBA.** Reads and writes carry an LBA relative
-  to the caller token's partition base. The block driver enforces
+  to the caller badge's partition base. The block driver enforces
   the bound on every request.
 - **Single-page Frame-cap DMA.** Each read or write transfers one
   Frame cap as the DMA target; the Frame is moved back to the caller

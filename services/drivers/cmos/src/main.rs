@@ -293,7 +293,7 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64)
     {
         rtc_labels::RTC_GET_EPOCH_TIME =>
         {
-            if msg.token & rtc_labels::READ_AUTHORITY == 0
+            if msg.badge & rtc_labels::READ_AUTHORITY == 0
             {
                 IpcMessage::new(rtc_errors::UNAUTHORIZED)
             }

@@ -61,7 +61,7 @@ struct TagPool
 {
     /// Bit `t` set ⇒ tag `t` is in use. Tag 0 is never allocated.
     in_use: [u64; BITMAP_WORDS],
-    /// Owner token per tag (an `*const AddressSpace` as `usize`; `0` = free).
+    /// Owner badge per tag (an `*const AddressSpace` as `usize`; `0` = free).
     owners: [usize; TAG_CAP],
     /// `alloc_gen` value stamped when each tag was last claimed (`0` = free).
     /// Unique per claim, so it doubles as the least-recently-claimed key.

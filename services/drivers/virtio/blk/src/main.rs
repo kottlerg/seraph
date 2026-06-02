@@ -35,19 +35,19 @@ use crate::io::IoLayout;
 /// Queue size we request (must be <= device max).
 const QUEUE_SIZE: u16 = 128;
 
-/// Maximum number of tokened partitions this driver can serve concurrently.
+/// Maximum number of badged partitions this driver can serve concurrently.
 ///
-/// Partition identity is the caller's cap token. vfsd registers one entry
+/// Partition identity is the caller's cap badge. vfsd registers one entry
 /// per mount; 16 is ample for early boot (typical disk has 1–2 partitions).
 const PARTITION_TABLE_SIZE: usize = 16;
 
-/// Per-token partition bound: absolute LBA range the caller is permitted
-/// to access. Token 0 is reserved for the un-tokened (whole-disk) endpoint
+/// Per-badge partition bound: absolute LBA range the caller is permitted
+/// to access. Badge 0 is reserved for the un-badged (whole-disk) endpoint
 /// and is never stored here.
 #[derive(Clone, Copy)]
 struct PartitionBound
 {
-    token: u64,
+    badge: u64,
     base_lba: u64,
     length_lba: u64,
 }
@@ -69,16 +69,16 @@ impl PartitionTable
         }
     }
 
-    /// Return the bound for `token`, or `None` if no entry is registered.
-    fn lookup(&self, token: u64) -> Option<PartitionBound>
+    /// Return the bound for `badge`, or `None` if no entry is registered.
+    fn lookup(&self, badge: u64) -> Option<PartitionBound>
     {
-        if token == 0
+        if badge == 0
         {
             return None;
         }
         for b in self.entries.iter().flatten()
         {
-            if b.token == token
+            if b.badge == badge
             {
                 return Some(*b);
             }
@@ -86,11 +86,11 @@ impl PartitionTable
         None
     }
 
-    /// Insert a bound. Fails if `token == 0`, a duplicate token exists, or
+    /// Insert a bound. Fails if `badge == 0`, a duplicate badge exists, or
     /// the table is full.
     fn insert(&mut self, bound: PartitionBound) -> Result<(), ()>
     {
-        if bound.token == 0 || bound.length_lba == 0
+        if bound.badge == 0 || bound.length_lba == 0
         {
             return Err(());
         }
@@ -99,7 +99,7 @@ impl PartitionTable
         {
             match entry
             {
-                Some(b) if b.token == bound.token => return Err(()),
+                Some(b) if b.badge == bound.badge => return Err(()),
                 None if empty_idx.is_none() => empty_idx = Some(i),
                 _ =>
                 {}
@@ -116,13 +116,13 @@ impl PartitionTable
         }
     }
 
-    /// Remove the entry matching `token`, if any. Used to roll back an
+    /// Remove the entry matching `badge`, if any. Used to roll back an
     /// insert when downstream cap derivation fails.
-    fn remove(&mut self, token: u64)
+    fn remove(&mut self, badge: u64)
     {
         for entry in &mut self.entries
         {
-            if matches!(entry, Some(b) if b.token == token)
+            if matches!(entry, Some(b) if b.badge == badge)
             {
                 *entry = None;
                 return;
@@ -139,7 +139,7 @@ impl PartitionTable
 //   caps[1]: IRQ line
 //   caps[2]: service endpoint (virtio-blk receives on this)
 // Round 2 (1 cap):
-//   caps[0]: devmgr query endpoint (tokened per-device — for QUERY_DEVICE_INFO)
+//   caps[0]: devmgr query endpoint (badged per-device — for QUERY_DEVICE_INFO)
 //
 // log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through
 // this protocol.
@@ -190,7 +190,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
 
 /// Query devmgr for `VirtIO` PCI capability locations via IPC.
 ///
-/// The driver's devmgr endpoint is tokened — the token identifies the
+/// The driver's devmgr endpoint is badged — the badge identifies the
 /// device. Devmgr replies in the generic `QUERY_DEVICE_INFO` schema:
 /// `word[0]` = kind, `word[1]` = version, `word[2]` = `byte_len`,
 /// payload bytes packed into the subsequent data words. The driver
@@ -478,19 +478,19 @@ pub struct BlkRuntime<'a>
     pub queue_notify_off: u16,
     pub irq_signal: u32,
     pub irq_cap: u32,
-    /// Un-tokened `SEND_GRANT` cap on this driver's service endpoint;
-    /// kept so `handle_register_partition` can `cap_derive_token` per-
-    /// partition tokened caps from it. The kernel rejects re-tokening
-    /// of a tokened source, so partition cap derivation must happen
+    /// Un-badged `SEND_GRANT` cap on this driver's service endpoint;
+    /// kept so `handle_register_partition` can `cap_derive_badge` per-
+    /// partition badged caps from it. The kernel rejects re-badging
+    /// of a badged source, so partition cap derivation must happen
     /// here (server-side) and not at the caller (which holds a
-    /// MOUNT_AUTHORITY-tokened cap).
+    /// MOUNT_AUTHORITY-badged cap).
     pub service_ep: u32,
     partitions: PartitionTable,
     capacity: u64,
-    /// Monotonic counter for partition-identity tokens. The
+    /// Monotonic counter for partition-identity badges. The
     /// `MOUNT_AUTHORITY` bit lives at `1 << 63`; this counter stays in
     /// the low bits and so is bit-disjoint by construction.
-    next_partition_token: u64,
+    next_partition_badge: u64,
 }
 
 /// Handle incoming IPC requests on the service endpoint.
@@ -635,7 +635,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     {
         0
     };
-    let absolute_sector = match resolve_sector(msg.token, sector, rt)
+    let absolute_sector = match resolve_sector(msg.badge, sector, rt)
     {
         Ok(s) => s,
         Err(code) =>
@@ -648,7 +648,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     // resolve_sector only checks the starting LBA. Re-check the inclusive
     // end LBA so a multi-sector ask doesn't walk past the partition.
     let last_relative = sector.saturating_add(sector_count - 1);
-    if resolve_sector(msg.token, last_relative, rt).is_err()
+    if resolve_sector(msg.badge, last_relative, rt).is_err()
     {
         reply_with(ipc::blk_errors::OUT_OF_BOUNDS, ipc_buf);
         return;
@@ -775,7 +775,7 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
     {
         0
     };
-    let absolute_sector = match resolve_sector(msg.token, sector, rt)
+    let absolute_sector = match resolve_sector(msg.badge, sector, rt)
     {
         Ok(s) => s,
         Err(code) =>
@@ -785,7 +785,7 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
         }
     };
     let last_relative = sector.saturating_add(sector_count - 1);
-    if resolve_sector(msg.token, last_relative, rt).is_err()
+    if resolve_sector(msg.badge, last_relative, rt).is_err()
     {
         reply_with(ipc::blk_errors::OUT_OF_BOUNDS, ipc_buf);
         return;
@@ -815,26 +815,26 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
 }
 
 /// Translate a caller-supplied sector number into an absolute device LBA,
-/// enforcing per-token partition bounds. Returns a [`blk_errors`] code on
+/// enforcing per-badge partition bounds. Returns a [`blk_errors`] code on
 /// rejection.
 ///
-/// Token semantics:
-/// * Token bit [`MOUNT_AUTHORITY`] set → whole-disk read; bounded only
+/// Badge semantics:
+/// * Badge bit [`MOUNT_AUTHORITY`] set → whole-disk read; bounded only
 ///   by device capacity. Held by callers (currently just vfsd) that
 ///   need to walk the partition table before partitioning is complete.
-/// * Token with [`MOUNT_AUTHORITY`] clear and non-zero low bits →
-///   partition-identity token issued by [`handle_register_partition`];
+/// * Badge with [`MOUNT_AUTHORITY`] clear and non-zero low bits →
+///   partition-identity badge issued by [`handle_register_partition`];
 ///   bounded by the registered partition.
-/// * `token == 0` → un-tokened caller; rejected. Every consumer of
-///   this endpoint holds a tokened cap.
-fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
+/// * `badge == 0` → un-badged caller; rejected. Every consumer of
+///   this endpoint holds a badged cap.
+fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 {
-    if token == 0
+    if badge == 0
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
     }
 
-    if token & ipc::blk_labels::MOUNT_AUTHORITY != 0
+    if badge & ipc::blk_labels::MOUNT_AUTHORITY != 0
     {
         // MOUNT_AUTHORITY holders read the whole disk directly,
         // bounded only by device capacity.
@@ -845,7 +845,7 @@ fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
         return Ok(sector);
     }
 
-    let Some(bound) = rt.partitions.lookup(token)
+    let Some(bound) = rt.partitions.lookup(badge)
     else
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
@@ -864,17 +864,17 @@ fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 
 /// Handle a `REGISTER_PARTITION` request.
 ///
-/// Authority: caller's token must have [`MOUNT_AUTHORITY`] set. Un-
-/// tokened callers and partition-tokened callers are rejected — the
+/// Authority: caller's badge must have [`MOUNT_AUTHORITY`] set. Un-
+/// badged callers and partition-badged callers are rejected — the
 /// latter is already partition-scoped and has no authority to create
 /// additional scopes.
 ///
 /// Data words: `[base_lba, length_lba]`. The driver allocates a fresh
-/// partition-identity token from its monotonic counter, inserts the
-/// bound, derives a tokened `SEND_GRANT` cap on its own service endpoint
-/// scoped to that token, and returns the cap in `caps[0]` of the reply.
+/// partition-identity badge from its monotonic counter, inserts the
+/// bound, derives a badged `SEND_GRANT` cap on its own service endpoint
+/// scoped to that badge, and returns the cap in `caps[0]` of the reply.
 /// Server-side derivation is required because [`MOUNT_AUTHORITY`] caps
-/// are tokened and the kernel rejects re-tokening of a tokened source —
+/// are badged and the kernel rejects re-badging of a badged source —
 /// the caller cannot mint partition caps itself.
 fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
@@ -884,7 +884,7 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     };
 
-    if msg.token & ipc::blk_labels::MOUNT_AUTHORITY == 0
+    if msg.badge & ipc::blk_labels::MOUNT_AUTHORITY == 0
     {
         reject(ipc_buf);
         return;
@@ -913,21 +913,21 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
         return;
     }
 
-    let new_token = rt.next_partition_token;
+    let new_badge = rt.next_partition_badge;
     // Saturating increment so a (theoretical) wrap collides with the
     // MOUNT_AUTHORITY bit instead of silently aliasing a live partition
-    // token to a verb-bit value.
-    if new_token & ipc::blk_labels::MOUNT_AUTHORITY != 0
+    // badge to a verb-bit value.
+    if new_badge & ipc::blk_labels::MOUNT_AUTHORITY != 0
     {
         reject(ipc_buf);
         return;
     }
-    rt.next_partition_token = new_token.saturating_add(1);
+    rt.next_partition_badge = new_badge.saturating_add(1);
 
     if rt
         .partitions
         .insert(PartitionBound {
-            token: new_token,
+            badge: new_badge,
             base_lba,
             length_lba,
         })
@@ -938,12 +938,12 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
     }
 
     let Ok(partition_cap) =
-        syscall::cap_derive_token(rt.service_ep, syscall::RIGHTS_SEND_GRANT, new_token)
+        syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_SEND_GRANT, new_badge)
     else
     {
         // Roll back the partition insert so the table doesn't grow a
         // bound the caller has no cap to address.
-        rt.partitions.remove(new_token);
+        rt.partitions.remove(new_badge);
         reject(ipc_buf);
         return;
     };
@@ -1082,7 +1082,7 @@ fn main() -> !
         service_ep: caps.service_ep,
         partitions: PartitionTable::new(),
         capacity,
-        next_partition_token: 1,
+        next_partition_badge: 1,
     };
     service_loop(caps.service_ep, ipc_buf, &mut rt);
 }

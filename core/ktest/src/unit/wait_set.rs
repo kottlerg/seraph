@@ -29,7 +29,7 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 // ── wait_set_add (signal, immediate wake) ────────────────────────────────────
 
 /// Adding a signal with pre-set bits to a wait set causes `wait_set_wait`
-/// to return immediately with the correct token.
+/// to return immediately with the correct badge.
 pub fn add_signal_immediate(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
@@ -44,7 +44,7 @@ pub fn add_signal_immediate(ctx: &TestContext) -> TestResult
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait(signal, immediate) failed")?;
     if tok != 42
     {
-        return Err("wait_set_wait returned wrong token for signal source");
+        return Err("wait_set_wait returned wrong badge for signal source");
     }
 
     // Drain the signal bits.
@@ -58,7 +58,7 @@ pub fn add_signal_immediate(ctx: &TestContext) -> TestResult
 // ── wait_set_add (event queue, immediate wake) ────────────────────────────────
 
 /// Adding an event queue with a pre-posted entry causes `wait_set_wait`
-/// to return immediately with the correct token.
+/// to return immediately with the correct badge.
 pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_frame_base)
@@ -74,7 +74,7 @@ pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait(queue, immediate) failed")?;
     if tok != 99
     {
-        return Err("wait_set_wait returned wrong token for queue source");
+        return Err("wait_set_wait returned wrong badge for queue source");
     }
 
     // Drain the queue.
@@ -115,7 +115,7 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait (blocking) failed")?;
     if tok != 7
     {
-        return Err("wait_set_wait (blocking) returned wrong token");
+        return Err("wait_set_wait (blocking) returned wrong badge");
     }
 
     // Drain the signal bits.
@@ -136,8 +136,8 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
 
 /// After `wait_set_remove`, the removed source no longer wakes the wait set.
 ///
-/// Registers a signal (token 1) and an event queue (token 2). Removes the
-/// signal. Posts to the event queue and verifies only token 2 fires.
+/// Registers a signal (badge 1) and an event queue (badge 2). Removes the
+/// signal. Posts to the event queue and verifies only badge 2 fires.
 pub fn remove(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_frame_base)
@@ -153,12 +153,12 @@ pub fn remove(ctx: &TestContext) -> TestResult
     // Remove the signal — only the queue remains.
     wait_set_remove(ws, sig).map_err(|_| "wait_set_remove(sig) failed")?;
 
-    // Post to the queue; wait_set_wait must return token 2.
+    // Post to the queue; wait_set_wait must return badge 2.
     event_post(eq, 0xFF).map_err(|_| "event_post after remove failed")?;
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait after remove failed")?;
     if tok != 2
     {
-        return Err("wait_set_wait returned wrong token after signal removed (expected 2)");
+        return Err("wait_set_wait returned wrong badge after signal removed (expected 2)");
     }
 
     // Drain the queue.
@@ -176,7 +176,7 @@ pub fn remove(ctx: &TestContext) -> TestResult
 /// the only user-held cap to a signal that is already in a wait set must not
 /// reclaim the signal state — the wait set still references it. A subsequent
 /// `wait_set_wait` must observe the previously-sent bits and return the
-/// member's token. Dropping the wait-set cap then cascades the source's
+/// member's badge. Dropping the wait-set cap then cascades the source's
 /// reclaim through `wait_set_drop`.
 pub fn source_signal_pinned_by_member(ctx: &TestContext) -> TestResult
 {
@@ -195,7 +195,7 @@ pub fn source_signal_pinned_by_member(ctx: &TestContext) -> TestResult
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait after sig cap drop failed")?;
     if tok != 31
     {
-        return Err("wait_set_wait returned wrong token after sig cap drop");
+        return Err("wait_set_wait returned wrong badge after sig cap drop");
     }
 
     // Cascade-reclaims the signal state through wait_set_drop's dec_ref.
@@ -220,7 +220,7 @@ pub fn source_eventqueue_pinned_by_member(ctx: &TestContext) -> TestResult
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait after eq cap drop failed")?;
     if tok != 73
     {
-        return Err("wait_set_wait returned wrong token after eq cap drop");
+        return Err("wait_set_wait returned wrong badge after eq cap drop");
     }
 
     cap_delete(ws).map_err(|_| "cap_delete(ws) cascade-drop failed")?;

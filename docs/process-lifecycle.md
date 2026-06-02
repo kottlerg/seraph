@@ -96,7 +96,7 @@ Init creates procmgr's `AddressSpace`, `CSpace`, and `Thread` and loads
 procmgr's ELF identically to memmgr. Before starting procmgr's thread,
 init:
 
-1. Calls `memmgr.REGISTER_PROCESS` to mint a tokened SEND cap on
+1. Calls `memmgr.REGISTER_PROCESS` to mint a badged SEND cap on
    memmgr's endpoint identifying procmgr.
 2. Installs that cap into procmgr's `ProcessInfo.memmgr_endpoint_cap`
    so procmgr's std `_start` finds memmgr on its first IPC.
@@ -129,7 +129,7 @@ post-handover.
 Init then serves svcmgr the **handover endowment** over the
 bootstrap-round protocol: round 1 carries svcmgr's own endpoints plus the
 publish-role source caps (a `SEND` on the root filesystem namespace
-endpoint and a token-0 `SEND|GRANT` source on devmgr's registry
+endpoint and a badge-0 `SEND|GRANT` source on devmgr's registry
 endpoint); each subsequent round carries one `(name, thread_cap)` pair for
 a substrate service init bootstrapped (`memmgr`, `procmgr`, `devmgr`,
 `vfsd`, `logd`). svcmgr — not init — then publishes the well-known names
@@ -203,7 +203,7 @@ read-only sources.
 
 Procmgr is the privileged caller for memmgr's two procmgr-only labels
 (`REGISTER_PROCESS`, `PROCESS_DIED`). No other service can mint or
-retire process tokens against memmgr.
+retire process badges against memmgr.
 
 ---
 
@@ -227,16 +227,16 @@ at creation time. Examples:
 
 - `ProcessInfo.ipc_buffer_vaddr` — procmgr picks the IPC-buffer VA per
   child.
-- `ProcessInfo.creator_endpoint_cap` — tokened SEND back to the parent's
+- `ProcessInfo.creator_endpoint_cap` — badged SEND back to the parent's
   bootstrap endpoint, distinct per child.
-- `ProcessInfo.memmgr_endpoint_cap` — tokened SEND on memmgr's endpoint,
+- `ProcessInfo.memmgr_endpoint_cap` — badged SEND on memmgr's endpoint,
   identifying this process; minted by `REGISTER_PROCESS` per child.
-- `ProcessInfo.procmgr_endpoint_cap` — tokened SEND on procmgr's
+- `ProcessInfo.procmgr_endpoint_cap` — badged SEND on procmgr's
   endpoint, for process-lifecycle queries.
-- `ProcessInfo.log_send_cap` — tokened SEND cap on the master log
+- `ProcessInfo.log_send_cap` — badged SEND cap on the master log
   endpoint, minted by procmgr per child via
-  `cap_derive_token(log_send_source, RIGHTS_SEND, process_token)`.
-  The cap's kernel-attached token equals procmgr's process token,
+  `cap_derive_badge(log_send_source, RIGHTS_SEND, process_badge)`.
+  The cap's kernel-attached badge equals procmgr's process badge,
   which also equals the death-EQ correlator procmgr posts to
   logd. Identity is reconciled across the three views without
   any auxiliary mapping.
@@ -271,7 +271,7 @@ After bootstrap, every process is created by procmgr. The flow:
    and computes the segment layout. ELF-load scratch frames come from
    procmgr's own heap (backed by memmgr).
 3. **Procmgr → memmgr.** Procmgr calls `memmgr.REGISTER_PROCESS` and
-   receives a tokened SEND cap identifying the new process.
+   receives a badged SEND cap identifying the new process.
 4. **Procmgr kernel-object allocation.** Procmgr creates the new
    process's `AddressSpace`, `CSpace`, and `Thread` via the
    `cap_create_*` syscalls.
@@ -320,8 +320,8 @@ The death-notification flow:
    the death (death notification on the child's thread cap, or
    explicit teardown initiated by procmgr itself).
 2. **Procmgr → memmgr.** Procmgr sends `PROCESS_DIED` to memmgr,
-   transferring the dead process's tokened endpoint cap. The cap's
-   token identifies which per-process record memmgr reclaims.
+   transferring the dead process's badged endpoint cap. The cap's
+   badge identifies which per-process record memmgr reclaims.
 3. **Memmgr reclaims.** Memmgr walks the per-process frame list and
    inserts each Frame cap back into its free pool.
 4. **Memmgr coalesces.** Reverse-`frame_split` merges adjacent free
@@ -349,7 +349,7 @@ to recreate procmgr (see
 
 memmgr is unaffected by procmgr restart in steady state — memmgr's
 state is independent of procmgr's, and memmgr's `REGISTER_PROCESS`
-authority is held by whichever process holds the procmgr-side tokened
+authority is held by whichever process holds the procmgr-side badged
 cap at the time. svcmgr re-establishes that cap when restarting
 procmgr; the concrete protocol is owned by svcmgr's design and is out
 of scope here.

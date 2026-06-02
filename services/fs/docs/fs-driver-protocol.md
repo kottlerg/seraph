@@ -8,7 +8,7 @@ codes) is specified in
 this document covers the labels that remain fs-driver-specific:
 
 - `FS_MOUNT` — vfsd-to-driver BPB-validation probe at mount time.
-- `FS_READ` — inline read on a per-node tokened cap.
+- `FS_READ` — inline read on a per-node badged cap.
 - `FS_READ_FRAME` / `FS_RELEASE_FRAME` / `FS_RELEASE_ACK` — frame-cap
   read protocol with cooperative release.
 - `FS_CLOSE` — release driver-side per-node bookkeeping; the holder
@@ -16,11 +16,11 @@ this document covers the labels that remain fs-driver-specific:
 - `END_OF_DIR` — readdir terminator, reused by `NS_READDIR`.
 
 A driver runs as a separate process. After `FS_MOUNT` succeeds, the
-driver dispatches incoming requests by their token shape:
+driver dispatches incoming requests by their badge shape:
 
-- `token == 0` — service-level request from vfsd (only `FS_MOUNT`
+- `badge == 0` — service-level request from vfsd (only `FS_MOUNT`
   today).
-- `token != 0` carrying namespace rights in bits 40..64 — node-cap
+- `badge != 0` carrying namespace rights in bits 40..64 — node-cap
   request. Per-node opcodes (`NS_*`, `FS_READ`, `FS_READ_FRAME`,
   `FS_RELEASE_FRAME`, `FS_CLOSE`) are dispatched by label.
 
@@ -30,15 +30,15 @@ driver dispatches incoming requests by their token shape:
 
 A filesystem driver exposes one IPC endpoint, used as both:
 
-- the un-tokened **service endpoint** (vfsd holds a SEND, derives
-  per-node tokened SENDs); and
-- the un-tokened **namespace endpoint** routed through
+- the un-badged **service endpoint** (vfsd holds a SEND, derives
+  per-node badged SENDs); and
+- the un-badged **namespace endpoint** routed through
   [`namespace_protocol::dispatch_request`] for `NS_*` dispatch.
 
 The receive-side cap is injected into the driver's CSpace at two-
 phase process creation. The same endpoint is also the kernel-
 derivation parent for every node cap the driver ever issues via
-`cap_derive_token`.
+`cap_derive_badge`.
 
 Numeric label values live in [`ipc::fs_labels`] (this document) and
 [`ipc::ns_labels`] (namespace-protocol document).
@@ -47,7 +47,7 @@ Numeric label values live in [`ipc::fs_labels`] (this document) and
 
 ## Label 10: `FS_MOUNT`
 
-Mount-time probe. Sent by vfsd on the un-tokened service endpoint
+Mount-time probe. Sent by vfsd on the un-badged service endpoint
 after the driver process is spawned and the partition is registered
 with virtio-blk. The driver MUST read the superblock / BPB through
 its block device endpoint and reply success or a typed error.
@@ -71,9 +71,9 @@ time; see [Bootstrap caps](#bootstrap-caps).
 
 ## Label 2: `FS_READ`
 
-Inline read against a per-node tokened cap. The kernel delivers the
-node's `(NodeId, NamespaceRights)` token to the driver via
-`ipc_recv.token`; the driver MUST verify the `READ` rights bit and
+Inline read against a per-node badged cap. The kernel delivers the
+node's `(NodeId, NamespaceRights)` badge to the driver via
+`ipc_recv.badge`; the driver MUST verify the `READ` rights bit and
 reject with `NsError::PermissionDenied` otherwise.
 
 Used for short reads (≤ 504 bytes that fit within the current page);
@@ -280,7 +280,7 @@ kernel reference.
 | Field | Value |
 |---|---|
 | `label` | `3` |
-| body | empty (target identified by token) |
+| body | empty (target identified by badge) |
 
 **Reply (success)**: `label = 0`, empty body.
 
@@ -292,7 +292,7 @@ evicted the per-node slot under cache pressure; in that case
 
 ## Label 4: `FS_WRITE`
 
-Inline write to a file. Token = file cap; the token must carry the
+Inline write to a file. Badge = file cap; the badge must carry the
 `WRITE` namespace right.
 
 **Request**:
@@ -306,7 +306,7 @@ Inline write to a file. Token = file cap; the token must carry the
 **Reply (success)**: `label = 0`, `data[0]` = bytes_written. May be
 short on `NO_SPACE`; callers iterate.
 
-**Errors**: `INVALID_TOKEN`, `IS_A_DIRECTORY`, `IO_ERROR`,
+**Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
 `PERMISSION_DENIED`, `NO_SPACE`.
 
 ---
@@ -335,15 +335,15 @@ The driver mem-maps the source frame read-only into its own address
 space for the duration of the copy. The cap returns to the caller in
 every outcome (mirror of the read-frame ownership discipline).
 
-**Errors**: `INVALID_TOKEN`, `IS_A_DIRECTORY`, `IO_ERROR`,
+**Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
 `PERMISSION_DENIED`, `NO_SPACE`, `BAD_FRAME_OFFSET`.
 
 ---
 
 ## Label 13: `FS_CREATE`
 
-Create a new file in a directory. Token = parent-directory cap; the
-token must carry the `MUTATE_DIR` namespace right.
+Create a new file in a directory. Badge = parent-directory cap; the
+badge must carry the `MUTATE_DIR` namespace right.
 
 **Request**:
 
@@ -356,7 +356,7 @@ token must carry the `MUTATE_DIR` namespace right.
 `caps[0]` = node cap for the newly-created file. The new file starts
 empty (size 0, no allocated cluster).
 
-**Errors**: `INVALID_TOKEN`, `EXISTS` (the dispatch may currently
+**Errors**: `INVALID_BADGE`, `EXISTS` (the dispatch may currently
 surface `NO_SPACE` for duplicate names — to be tightened),
 `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
 
@@ -364,7 +364,7 @@ surface `NO_SPACE` for duplicate names — to be tightened),
 
 ## Label 14: `FS_REMOVE`
 
-Unlink a file or empty directory. Token = parent-directory cap with
+Unlink a file or empty directory. Badge = parent-directory cap with
 `MUTATE_DIR`.
 
 **Request**:
@@ -396,7 +396,7 @@ the directory entry is inserted in the parent.
 
 ## Label 16: `FS_RENAME`
 
-Rename a directory entry within a single directory. Token =
+Rename a directory entry within a single directory. Badge =
 directory cap with `MUTATE_DIR`.
 
 **Request**:
@@ -411,7 +411,7 @@ directory cap with `MUTATE_DIR`.
 **Reply (success)**: `label = 0`, empty body.
 
 Cross-directory rename is deferred: servers cannot introspect the
-token packed in a received cap, so a second-directory cap cannot
+badge packed in a received cap, so a second-directory cap cannot
 resolve to a `NodeId`. A future Issue may add a wire shape that
 conveys the destination directory's `NodeId` explicitly.
 
@@ -426,7 +426,7 @@ occupied), `NO_SPACE`, `IO_ERROR`, `PERMISSION_DENIED`.
 
 ## Label 17: `FS_TRUNCATE`
 
-Set a file's length. Token = file cap with `WRITE`.
+Set a file's length. Badge = file cap with `WRITE`.
 
 **Request**:
 
@@ -443,7 +443,7 @@ semantics, tracked by the `ruststd::fs` completeness-gaps issue. The
 truncate-to-zero path frees the entire FAT cluster chain
 and patches the directory entry's first-cluster + size fields to 0.
 
-**Errors**: `INVALID_TOKEN`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
+**Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
 `IO_ERROR` (chain walk / `FSInfo` flush failure, or non-zero
 `new_len` until the v2 extend path lands).
 
@@ -491,7 +491,7 @@ bound on every `BLK_READ_INTO_FRAME`. See
 | [docs/namespace-model.md](../../../docs/namespace-model.md) | Cap-as-namespace principles |
 | [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, cap transfer |
 | [services/vfsd/docs/namespace-composition.md](../../vfsd/docs/namespace-composition.md) | How vfsd composes the system root from per-mount caps |
-| [services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md) | Block device IPC, partition tokens |
+| [services/drivers/virtio/blk/README.md](../../drivers/virtio/blk/README.md) | Block device IPC, partition badges |
 
 ---
 

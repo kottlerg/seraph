@@ -115,7 +115,7 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, offset: Option<u64>) -> !
 // ── Entry ──────────────────────────────────────────────────────────────────
 
 /// Resolve the RTC SEND via devmgr's `QUERY_RTC_DEVICE`. Returns `0`
-/// when devmgr replies anything other than success (registry token
+/// when devmgr replies anything other than success (registry badge
 /// rejected, label-version mismatch, no RTC driver bound).
 fn resolve_rtc_cap(devmgr_registry_ep: u32, ipc_buf: *mut u64) -> u32
 {

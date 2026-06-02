@@ -48,7 +48,7 @@ pub fn pwrmgr_cap_deny_phase(caps: &Caps)
 /// Terminal-only. On the success path the platform powers off and
 /// QEMU exits; no return. A reply arrives only on failure (pwrmgr
 /// could not power off the platform, or the cap is missing the
-/// authority token); in that case svctest logs and falls through to
+/// authority badge); in that case svctest logs and falls through to
 /// its normal `thread_exit`, leaving the system idle.
 pub fn pwrmgr_shutdown_phase(caps: &Caps)
 {

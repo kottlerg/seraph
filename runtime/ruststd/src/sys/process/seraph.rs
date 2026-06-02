@@ -33,7 +33,7 @@
 //
 // Identity:
 //   * `Process::id()` returns the low 32 bits of procmgr's internal process
-//     token (unique, monotonic, nonzero). Not a POSIX pid — processes in
+//     badge (unique, monotonic, nonzero). Not a POSIX pid — processes in
 //     Seraph are identified by capability, not pid.
 //
 // Argv/env:
@@ -312,7 +312,7 @@ impl Command {
         let ipc_ptr = info.ipc_buffer as *mut u64;
 
         // Walk the spawner's namespace cap to the binary node. The
-        // resulting tokened SEND on the owning fs driver's namespace
+        // resulting badged SEND on the owning fs driver's namespace
         // endpoint is transferred to procmgr in caps[0] of CREATE_FROM_FILE
         // — procmgr never holds a namespace cap.
         let parent_root = crate::os::seraph::root_dir_cap();
@@ -1185,8 +1185,8 @@ fn map_procmgr_error(code: u64) -> io::Error {
         procmgr_errors::OUT_OF_MEMORY => {
             io::Error::new(io::ErrorKind::OutOfMemory, "OUT_OF_MEMORY")
         }
-        procmgr_errors::INVALID_TOKEN => {
-            io::Error::new(io::ErrorKind::InvalidInput, "INVALID_TOKEN")
+        procmgr_errors::INVALID_BADGE => {
+            io::Error::new(io::ErrorKind::InvalidInput, "INVALID_BADGE")
         }
         procmgr_errors::ALREADY_STARTED => {
             io::Error::new(io::ErrorKind::AlreadyExists, "ALREADY_STARTED")

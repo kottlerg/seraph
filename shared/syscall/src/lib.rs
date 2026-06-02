@@ -42,7 +42,7 @@ use syscall_abi::{
     MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
     SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_SIGNAL,
     SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_TOKEN, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
+    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
     SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT,
     SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER,
     SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
@@ -341,7 +341,7 @@ unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
 
 /// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
 ///
-/// Used by `ipc_recv` to retrieve `(ret, label, token, word_count)`.
+/// Used by `ipc_recv` to retrieve `(ret, label, badge, word_count)`.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -651,14 +651,14 @@ pub fn raw_ipc_call(
 /// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
 /// entry point.
 ///
-/// Returns `(label, token, word_count)` on success.
+/// Returns `(label, badge, word_count)` on success.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 {
     // SAFETY: syscall1_ret4 issues raw syscall; kernel writes into the
     // per-thread IPC buffer and returns four values in return registers.
-    let (ret, label, token, word_count) = unsafe { syscall1_ret4(SYS_IPC_RECV, u64::from(ep)) };
+    let (ret, label, badge, word_count) = unsafe { syscall1_ret4(SYS_IPC_RECV, u64::from(ep)) };
     if ret < 0
     {
         Err(ret)
@@ -669,7 +669,7 @@ pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
         // kernel clamps word_count to MSG_DATA_WORDS_MAX = 64 before write.
         #[allow(clippy::cast_possible_truncation)]
         let word_count = (word_count as usize).min(MSG_DATA_WORDS_MAX);
-        Ok((label, token, word_count))
+        Ok((label, badge, word_count))
     }
 }
 
@@ -1287,31 +1287,31 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Derive a capability with a token attached (`SYS_CAP_DERIVE_TOKEN`).
+/// Derive a capability with a badge attached (`SYS_CAP_DERIVE_BADGE`).
 ///
 /// Creates a new slot in the caller's `CSpace` with attenuated rights and the
-/// specified `token` value. The token is delivered to the receiver on `ipc_recv`
+/// specified `badge` value. The badge is delivered to the receiver on `ipc_recv`
 /// when the capability is used for IPC.
 ///
-/// `token` must be non-zero. The source capability must have `token == 0`
-/// (no re-tokening).
+/// `badge` must be non-zero. The source capability must have `badge == 0`
+/// (no re-badging).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the source cap is invalid, the token
-/// is zero, the source already has a token, or the `CSpace` is full.
+/// Returns a negative `i64` error code if the source cap is invalid, the badge
+/// is zero, the source already has a badge, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn cap_derive_token(src_slot: u32, rights_mask: u64, token: u64) -> Result<u32, i64>
+pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u32, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; src_slot is cap index, rights_mask
-    // is bitmask, token is the token value; kernel validates and creates tokened derivative.
+    // is bitmask, badge is the badge value; kernel validates and creates badged derivative.
     let ret = unsafe {
         syscall3(
-            SYS_CAP_DERIVE_TOKEN,
+            SYS_CAP_DERIVE_BADGE,
             u64::from(src_slot),
             rights_mask,
-            token,
+            badge,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
@@ -1613,7 +1613,7 @@ pub fn wait_set_create(frame_cap: u32) -> Result<u32, i64>
 }
 
 /// Register `source_cap` (Endpoint/Signal/EventQueue) in `ws_cap` with a
-/// caller-chosen opaque `token`. The token is returned by `wait_set_wait`
+/// caller-chosen opaque `badge`. The badge is returned by `wait_set_wait`
 /// when this source fires.
 ///
 /// Returns `SyscallError::InvalidArgument` (-5) if the wait set is full
@@ -1623,16 +1623,16 @@ pub fn wait_set_create(frame_cap: u32) -> Result<u32, i64>
 /// Returns a negative `i64` error code if either cap is invalid, the source
 /// is already in a wait set, or the wait set is full.
 #[inline]
-pub fn wait_set_add(ws_cap: u32, source_cap: u32, token: u64) -> Result<(), i64>
+pub fn wait_set_add(ws_cap: u32, source_cap: u32, badge: u64) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
-    // (wait set cap, source cap, opaque token); kernel validates caps and registers source.
+    // (wait set cap, source cap, opaque badge); kernel validates caps and registers source.
     let ret = unsafe {
         syscall3(
             SYS_WAIT_SET_ADD,
             u64::from(ws_cap),
             u64::from(source_cap),
-            token,
+            badge,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }
@@ -1660,9 +1660,9 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 
 /// Block until any registered source in `ws_cap` becomes ready.
 ///
-/// Returns the opaque token chosen at `wait_set_add` time for the source that
-/// fired. The token is delivered in the secondary return register (rdx / a1).
-/// If multiple sources are ready, each call returns one token without re-blocking.
+/// Returns the opaque badge chosen at `wait_set_add` time for the source that
+/// fired. The badge is delivered in the secondary return register (rdx / a1).
+/// If multiple sources are ready, each call returns one badge without re-blocking.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the wait set cap is invalid or
@@ -1671,9 +1671,9 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; ws_cap is cap index as u64;
-    // kernel validates cap, blocks until source ready, returns token in secondary register.
-    let (ret, token) = unsafe { syscall5_ret2(SYS_WAIT_SET_WAIT, u64::from(ws_cap), 0, 0, 0, 0) };
-    if ret < 0 { Err(ret) } else { Ok(token) }
+    // kernel validates cap, blocks until source ready, returns badge in secondary register.
+    let (ret, badge) = unsafe { syscall5_ret2(SYS_WAIT_SET_WAIT, u64::from(ws_cap), 0, 0, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(badge) }
 }
 
 // ── Hardware access wrappers ──────────────────────────────────────────────────
@@ -1957,7 +1957,7 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 /// `correlator` is opaque to the kernel. Its meaning is scoped to one
 /// `(event queue, binder)` pair — not a system-wide identifier, not a
 /// process id. Typical use: the binder stashes an internal routing tag
-/// (e.g. procmgr's `ProcessTable` token) so it can dispatch the death
+/// (e.g. procmgr's `ProcessTable` badge) so it can dispatch the death
 /// event to the right bookkeeping without a secondary lookup.
 ///
 /// # Errors

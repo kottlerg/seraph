@@ -344,7 +344,7 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: cspace_ptr validated above.
     let slot = unsafe { lookup_cap(cspace_ptr, ep_idx, CapTag::Endpoint, required_rights) }?;
-    let caller_token = slot.token;
+    let caller_badge = slot.badge;
 
     // Extract EndpointState pointer from the slot's object.
     // SAFETY: slot.object is a NonNull<KernelObjectHeader> at offset 0 of
@@ -358,7 +358,7 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     };
 
     let mut msg = Message::new(label);
-    msg.token = caller_token;
+    msg.badge = caller_badge;
     msg.data_count = data_count;
     if data_count > 0
     {
@@ -550,7 +550,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 write_ipc_buf(server_buf, msg.data_count, &msg.data);
             }
         }
-        tf.set_ipc_recv_return(0, msg.label, msg.token, msg.data_count as u64);
+        tf.set_ipc_recv_return(0, msg.label, msg.badge, msg.data_count as u64);
         return Ok(0);
     }
     // else: No caller; server is now Blocked on recv queue. Yield.
@@ -606,7 +606,7 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             write_ipc_buf(server_buf, msg.data_count, &msg.data);
         }
     }
-    tf.set_ipc_recv_return(0, msg.label, msg.token, msg.data_count as u64);
+    tf.set_ipc_recv_return(0, msg.label, msg.badge, msg.data_count as u64);
     Ok(0)
 }
 
@@ -1217,7 +1217,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = wait set cap index (must have MODIFY right).
 /// arg1 = source cap index (Endpoint with RECEIVE, Signal with WAIT, or
 ///        `EventQueue` with RECV).
-/// arg2 = caller-chosen opaque u64 token (returned by `SYS_WAIT_SET_WAIT`
+/// arg2 = caller-chosen opaque u64 badge (returned by `SYS_WAIT_SET_WAIT`
 ///        when this source fires).
 ///
 /// Returns `SyscallError::InvalidArgument` if the wait set is full
@@ -1237,7 +1237,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
     let src_idx = tf.arg(1) as u32;
-    let token = tf.arg(2);
+    let badge = tf.arg(2);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1358,7 +1358,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let saved = (*ep).lock.lock_raw();
                 let res = if (*ep).wait_set.is_null()
                 {
-                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, token)
+                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
                     {
                         Ok(idx) =>
                         {
@@ -1387,7 +1387,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let saved = (*sig).lock.lock_raw();
                 let res = if (*sig).wait_set.is_null()
                 {
-                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, token)
+                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
                     {
                         Ok(idx) =>
                         {
@@ -1417,7 +1417,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let saved = (*eq).lock.lock_raw();
                 let res = if (*eq).wait_set.is_null()
                 {
-                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, token)
+                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
                     {
                         Ok(idx) =>
                         {
@@ -1637,7 +1637,7 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// arg0 = wait set cap index (must have WAIT right).
 ///
 /// If a source is already ready (from a prior notification), returns immediately.
-/// Otherwise blocks until any member fires. The opaque token chosen at
+/// Otherwise blocks until any member fires. The opaque badge chosen at
 /// `SYS_WAIT_SET_ADD` time is returned in the secondary return register
 /// (rdx on x86-64, a1 on RISC-V). The caller then reads from the identified
 /// source normally.
@@ -1674,10 +1674,10 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: ws_state valid; scheduler lock not held.
     let result = unsafe { crate::ipc::wait_set::waitset_wait(ws_state, tcb) };
 
-    if let Ok(token) = result
+    if let Ok(badge) = result
     {
-        // A source was already ready; return its token.
-        tf.set_ipc_return(0, token);
+        // A source was already ready; return its badge.
+        tf.set_ipc_return(0, badge);
         return Ok(0);
     }
     // else: No source ready; thread is Blocked. Yield CPU.
@@ -1687,13 +1687,13 @@ pub fn sys_wait_set_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         crate::sched::schedule(false);
     }
 
-    // On resume, waitset_notify stored the token in wakeup_value.
+    // On resume, waitset_notify stored the badge in wakeup_value.
     // SAFETY: tcb still valid after resume; wakeup_value set by waitset_notify.
-    let token = unsafe { (*tcb).wakeup_value };
+    let badge = unsafe { (*tcb).wakeup_value };
     // SAFETY: tcb validated above; clearing wakeup_value for next wait.
     unsafe {
         (*tcb).wakeup_value = 0;
     }
-    tf.set_ipc_return(0, token);
+    tf.set_ipc_return(0, badge);
     Ok(0)
 }

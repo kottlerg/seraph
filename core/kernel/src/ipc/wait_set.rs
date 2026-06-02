@@ -7,7 +7,7 @@
 //!
 //! A wait set aggregates up to `WAIT_SET_MAX_MEMBERS` IPC sources (endpoints,
 //! signals, event queues). A caller blocks on the wait set and is woken when
-//! any member becomes ready. The caller receives the opaque `token` it chose
+//! any member becomes ready. The caller receives the opaque `badge` it chose
 //! at `sys_wait_set_add` time, then reads from the source normally.
 //!
 //! # Readiness model
@@ -128,8 +128,8 @@ pub struct WaitSetMember
     /// Kind of source, determines how `source_ptr` is interpreted.
     /// Meaningful only when `source_ptr` is non-null.
     pub source_tag: WaitSetSourceTag,
-    /// Caller-chosen opaque token returned by `sys_wait_set_wait`.
-    pub token: u64,
+    /// Caller-chosen opaque badge returned by `sys_wait_set_wait`.
+    pub badge: u64,
 }
 
 impl WaitSetMember
@@ -141,7 +141,7 @@ impl WaitSetMember
         Self {
             source_ptr: core::ptr::null_mut(),
             source_tag: WaitSetSourceTag::Endpoint,
-            token: 0,
+            badge: 0,
         }
     }
 
@@ -259,7 +259,7 @@ impl WaitSetState
 
     /// Pop from the ready ring, skipping stale (removed) entries.
     ///
-    /// Returns `Some(token)` for the first live member found, `None` if empty
+    /// Returns `Some(badge)` for the first live member found, `None` if empty
     /// or all remaining entries are stale.
     fn pop_ready(&mut self) -> Option<u64>
     {
@@ -270,7 +270,7 @@ impl WaitSetState
             let m = &self.members[idx];
             if m.is_occupied()
             {
-                return Some(m.token);
+                return Some(m.badge);
             }
             // Entry is stale (member was removed) — skip.
         }
@@ -328,14 +328,14 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
             .store(1, core::sync::atomic::Ordering::Release);
     }
 
-    let token = {
+    let badge = {
         let m = &ws.members[member_idx as usize];
-        if m.is_occupied() { m.token } else { 0 }
+        if m.is_occupied() { m.badge } else { 0 }
     };
 
     // SAFETY: waiter is a valid TCB placed by waitset_wait.
     let target_cpu = unsafe {
-        (*waiter).wakeup_value = token;
+        (*waiter).wakeup_value = badge;
         crate::sched::select_target_cpu(waiter)
     };
 
@@ -346,9 +346,9 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u8)
     unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
 }
 
-/// Block `caller` until any member becomes ready, or return the next pending token.
+/// Block `caller` until any member becomes ready, or return the next pending badge.
 ///
-/// - If the ready ring is non-empty, pops and returns `Ok(token)` without blocking.
+/// - If the ready ring is non-empty, pops and returns `Ok(badge)` without blocking.
 /// - If empty, sets `caller` as waiter and returns `Err(())`.
 ///   The syscall handler calls `schedule()`, then reads `caller.wakeup_value`.
 ///
@@ -368,11 +368,11 @@ pub unsafe fn waitset_wait(
     // SAFETY: lock is owned by ws; matched unlock_raw on every return path.
     let saved = unsafe { ws.lock.lock_raw() };
 
-    if let Some(token) = ws.pop_ready()
+    if let Some(badge) = ws.pop_ready()
     {
         // SAFETY: paired with lock_raw above.
         unsafe { ws.lock.unlock_raw(saved) };
-        return Ok(token);
+        return Ok(badge);
     }
 
     // Level-state self-heal. Source notifications are edge-triggered:
@@ -391,7 +391,7 @@ pub unsafe fn waitset_wait(
         {
             continue;
         }
-        let (source_ptr, source_tag, token) = (m.source_ptr, m.source_tag, m.token);
+        let (source_ptr, source_tag, badge) = (m.source_ptr, m.source_tag, m.badge);
         // SAFETY: source_ptr is pinned alive by the +1 cap-level ref this
         // member holds on its source's `KernelObjectHeader` (see module
         // docs). Reads use atomic loads where appropriate; no source-side
@@ -400,7 +400,7 @@ pub unsafe fn waitset_wait(
         {
             // SAFETY: paired with lock_raw above.
             unsafe { ws.lock.unlock_raw(saved) };
-            return Ok(token);
+            return Ok(badge);
         }
     }
 
@@ -456,7 +456,7 @@ pub unsafe fn waitset_add(
     ws: *mut WaitSetState,
     source_ptr: *mut u8,
     source_tag: WaitSetSourceTag,
-    token: u64,
+    badge: u64,
 ) -> Result<u8, ()>
 {
     // SAFETY: ws valid for &mut access for the duration; cap pins it.
@@ -476,7 +476,7 @@ pub unsafe fn waitset_add(
     ws.members[idx] = WaitSetMember {
         source_ptr,
         source_tag,
-        token,
+        badge,
     };
     ws.member_count += 1;
 
@@ -497,7 +497,7 @@ pub unsafe fn waitset_add(
             ws.waiter = core::ptr::null_mut();
             // SAFETY: waiter is a valid TCB. Claim for wake under ws.lock (#160).
             let target_cpu = unsafe {
-                (*waiter).wakeup_value = token;
+                (*waiter).wakeup_value = badge;
                 (*waiter)
                     .wake_in_flight
                     .store(1, core::sync::atomic::Ordering::Release);

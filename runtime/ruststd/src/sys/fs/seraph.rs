@@ -46,7 +46,7 @@
 //! `FileAttr::modified()` surfaces `Unsupported` in that case.
 //!
 //! ## Per-`File` release-endpoint plumbing
-//! A tokened derivation off the per-process release endpoint owned
+//! A badged derivation off the per-process release endpoint owned
 //! by [`release_handler`] is allocated on every open and transferred
 //! to the driver via `caps[0]` of the first
 //! [`fs_labels::FS_READ_FRAME`] request for that `File`. The driver
@@ -416,7 +416,7 @@ impl DirEntry
 /// Result of [`walk_path_to_file`].
 pub(crate) struct WalkedFile
 {
-    /// Tokened SEND addressing the resolved file node. Caller owns and
+    /// Badged SEND addressing the resolved file node. Caller owns and
     /// must `cap_delete` when no longer needed.
     pub file_cap: u32,
     /// Size of the file as reported by the final `NS_LOOKUP`'s size hint.
@@ -426,7 +426,7 @@ pub(crate) struct WalkedFile
 /// Result of [`walk_path_to_dir`].
 pub(crate) struct WalkedDir
 {
-    /// Tokened SEND addressing the resolved directory node. Caller owns
+    /// Badged SEND addressing the resolved directory node. Caller owns
     /// and must `cap_delete` when no longer needed.
     pub dir_cap: u32,
 }
@@ -435,7 +435,7 @@ pub(crate) struct WalkedDir
 ///
 /// Splits on `/`, drops empty segments, validates component names per
 /// the namespace-protocol rules. Every hop (including the final) must
-/// resolve to a directory. Returns a freshly derived tokened SEND on
+/// resolve to a directory. Returns a freshly derived badged SEND on
 /// the directory. On any error the helper deletes any partial cap it
 /// owns before returning.
 ///
@@ -476,7 +476,7 @@ pub(crate) fn walk_path_to_dir_with_rights(
 /// Splits on `/`, drops empty segments, validates component names per
 /// the namespace-protocol rules. Each non-final hop must resolve to a
 /// directory; the final hop must resolve to a file. Returns a freshly
-/// derived tokened SEND on the file plus its size hint. On any error
+/// derived badged SEND on the file plus its size hint. On any error
 /// the helper deletes any partial cap it owns before returning.
 ///
 /// Used by `File::open` and by `Command::spawn` (binary lookup); both
@@ -690,7 +690,7 @@ fn walk_components(
 /// uses [`walk_path_to_dir`] anchored at `root_dir_cap` for absolute
 /// paths and `current_dir_cap` for relative paths. If the parent is
 /// the anchor itself (no intermediate components), the anchor cap is
-/// returned with `parent_owned == false`; otherwise an owned tokened
+/// returned with `parent_owned == false`; otherwise an owned badged
 /// SEND is returned and the caller is responsible for `cap_delete`.
 ///
 /// Used by `unlink`, `rmdir`, `rename`, `DirBuilder::mkdir`, and the
@@ -1016,12 +1016,12 @@ pub struct File
     /// FS_READ_FRAME, FS_WRITE, FS_WRITE_FRAME, FS_TRUNCATE,
     /// FS_CLOSE, synchronous client-initiated FS_RELEASE_FRAME).
     file_cap: u32,
-    /// Token identifying this `File` for the release-handler dispatch.
+    /// Badge identifying this `File` for the release-handler dispatch.
     /// Carried inside the per-process release endpoint so an inbound
     /// `FS_RELEASE_FRAME` from the driver routes to this `File`'s
     /// outstanding-mappings registry.
-    token: u64,
-    /// Tokened SEND on the per-process release endpoint. We retain
+    badge: u64,
+    /// Badged SEND on the per-process release endpoint. We retain
     /// the parent in our CSpace; on Drop we delete it so any
     /// in-flight forced release fails cleanly at the kernel.
     release_send: u32,
@@ -1174,20 +1174,20 @@ impl File
                 return Err(e);
             }
         };
-        let token = release_handler::allocate_token(state);
-        let entry = release_handler::register(state, token);
+        let badge = release_handler::allocate_badge(state);
+        let entry = release_handler::register(state, badge);
 
         let release_ep = release_handler::release_endpoint(state);
         let release_send =
-            match syscall::cap_derive_token(release_ep, syscall::RIGHTS_SEND, token)
+            match syscall::cap_derive_badge(release_ep, syscall::RIGHTS_SEND, badge)
             {
                 Ok(c) => c,
                 Err(_) =>
                 {
-                    let _ = release_handler::unregister(state, token);
+                    let _ = release_handler::unregister(state, badge);
                     let _ = syscall::cap_delete(file_cap);
                     return Err(io::Error::other(
-                        "seraph fs: cap_derive_token (release send) failed",
+                        "seraph fs: cap_derive_badge (release send) failed",
                     ));
                 }
             };
@@ -1197,7 +1197,7 @@ impl File
 
         Ok(File {
             file_cap,
-            token,
+            badge,
             release_send,
             release_delivered: AtomicBool::new(false),
             aspace: info.self_aspace,
@@ -1552,7 +1552,7 @@ impl fmt::Debug for File
     {
         f.debug_struct("File")
             .field("file_cap", &self.file_cap)
-            .field("token", &self.token)
+            .field("badge", &self.badge)
             .field("size", &self.size.load(Ordering::Relaxed))
             .finish()
     }
@@ -1578,11 +1578,11 @@ impl Drop for File
 
         // Drain the registry entry. After unregister, the handler
         // thread cannot route any further FS_RELEASE_FRAME to this
-        // File — a late forced release on our token finds no entry
+        // File — a late forced release on our badge finds no entry
         // and no-ops with an ack.
         if let Some(state) = release_handler::state()
         {
-            if let Some(entry) = release_handler::unregister(state, self.token)
+            if let Some(entry) = release_handler::unregister(state, self.badge)
             {
                 for m in release_handler::drain_mappings(entry.as_ref())
                 {
@@ -1597,7 +1597,7 @@ impl Drop for File
             }
         }
 
-        // Drop the per-File tokened SEND. fs's caps[0] copy survives
+        // Drop the per-File badged SEND. fs's caps[0] copy survives
         // until cap_delete on its slot; revoke would also kill it but
         // we rely on fs's FS_CLOSE handler having already cleared its
         // OpenFile entry, after which fs's slot is a dangling SEND
@@ -1664,8 +1664,8 @@ fn map_fs_error(label: u64) -> io::Error
             io::const_error!(io::ErrorKind::Other, "fs: io error"),
         fs_errors::TOO_MANY_OPEN =>
             io::const_error!(io::ErrorKind::ResourceBusy, "fs: too many open files"),
-        fs_errors::INVALID_TOKEN =>
-            io::const_error!(io::ErrorKind::Other, "fs: file token invalid"),
+        fs_errors::INVALID_BADGE =>
+            io::const_error!(io::ErrorKind::Other, "fs: file badge invalid"),
         fs_errors::RELEASE_TIMEOUT =>
             io::const_error!(io::ErrorKind::TimedOut, "fs: release timeout"),
         fs_errors::BAD_FRAME_OFFSET =>

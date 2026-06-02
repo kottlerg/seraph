@@ -431,7 +431,7 @@ fn run(info_ptr: u64) -> !
 
     // svcmgr's service endpoint backs the system-wide service registry
     // (PUBLISH_ENDPOINT / QUERY_ENDPOINT). Created here, before
-    // bootstrap_procmgr, so procmgr can receive an un-tokened SEND on
+    // bootstrap_procmgr, so procmgr can receive an un-badged SEND on
     // it in its bootstrap round. The RECV side is handed to svcmgr
     // in phase 3 when init launches the binary; the same endpoint
     // object backs both the early per-child query caps and svcmgr's
@@ -445,7 +445,7 @@ fn run(info_ptr: u64) -> !
 
     // Create the log endpoint. Init holds the full-rights cap; procmgr
     // receives a SEND copy in its bootstrap round and `cap_copy`s it
-    // and uses as the source for per-child `cap_derive_token` to seed
+    // and uses as the source for per-child `cap_derive_badge` to seed
     // `ProcessInfo.log_send_cap`. Spawn the log
     // thread as soon as its prerequisites (allocator, IPC buffer,
     // log_ep) are satisfied so init's own subsequent log lines ride IPC
@@ -455,7 +455,7 @@ fn run(info_ptr: u64) -> !
     // sources init endows) takes over the receive side via the
     // `log_labels::HANDOVER_PULL` exchange — see
     // `services/logd/docs/handover-protocol.md`. The same kernel endpoint
-    // object is reused, so every existing tokened SEND cap survives the
+    // object is reused, so every existing badged SEND cap survives the
     // handover unchanged.
     let Ok(log_ep) = syscall::cap_create_endpoint(endpoint_slab())
     else
@@ -471,17 +471,17 @@ fn run(info_ptr: u64) -> !
     let ioport_cap = find_cap_by_type(info, init_protocol::CapType::IoPortRange).unwrap_or(0);
     let init_logd_thread_cap = logging::spawn_log_thread(info, &mut init_arena, log_ep, ioport_cap);
 
-    // Tokened SEND on the log endpoint for init's own `log()` lines so
-    // they appear under `[init]`. `LOG_TOKEN_INIT` (= 1) is reserved
-    // for init in the log endpoint's token space.
-    let Ok(init_log_send) = syscall::cap_derive_token(
+    // Badged SEND on the log endpoint for init's own `log()` lines so
+    // they appear under `[init]`. `LOG_BADGE_INIT` (= 1) is reserved
+    // for init in the log endpoint's badge space.
+    let Ok(init_log_send) = syscall::cap_derive_badge(
         log_ep,
         syscall::RIGHTS_SEND,
-        ipc::log_tokens::LOG_TOKEN_INIT,
+        ipc::log_badges::LOG_BADGE_INIT,
     )
     else
     {
-        logging::log("init: FATAL: cannot derive tokened log SEND");
+        logging::log("init: FATAL: cannot derive badged log SEND");
         syscall::thread_exit();
     };
     // SAFETY: INIT_IPC_BUF_VA is registered and page-aligned.
@@ -577,7 +577,7 @@ fn run(info_ptr: u64) -> !
     //       [1] read-only Frame cap covering the phys-table page; memmgr
     //           reads `mm_frame_count` u64 phys_base entries from it
     //           parallel to the page-count array, then drops the cap.
-    // Data: [frame_base, frame_count, procmgr_token, page_counts...].
+    // Data: [frame_base, frame_count, procmgr_badge, page_counts...].
     let Ok(mm_service_cap_for_mm) = syscall::cap_derive(memmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
@@ -589,7 +589,7 @@ fn run(info_ptr: u64) -> !
     let mut mm_boot_data = [0u64; 64];
     mm_boot_data[0] = u64::from(mm_final.mm_frame_base);
     mm_boot_data[1] = u64::from(mm_final.mm_frame_count);
-    mm_boot_data[2] = mm.procmgr_token;
+    mm_boot_data[2] = mm.procmgr_badge;
     let count = mm_final.mm_frame_count as usize;
     let packed_words = count.div_ceil(2);
     for w in 0..packed_words
@@ -612,7 +612,7 @@ fn run(info_ptr: u64) -> !
     if unsafe {
         ipc::bootstrap::serve_round(
             init_bootstrap_ep,
-            mm.bootstrap_token,
+            mm.bootstrap_badge,
             ipc_buf,
             true,
             &[mm_service_cap_for_mm, phys_table_ro_cap],
@@ -637,12 +637,12 @@ fn run(info_ptr: u64) -> !
     //
     // Caps:
     //   [0] procmgr's own service endpoint (RECV; procmgr ipc_recv on it)
-    //   [1] un-tokened SEND on the log endpoint, slotted in procmgr's
-    //       CSpace by `bootstrap_procmgr`. Procmgr re-derives tokened
+    //   [1] un-badged SEND on the log endpoint, slotted in procmgr's
+    //       CSpace by `bootstrap_procmgr`. Procmgr re-derives badged
     //       SEND caps from this for every child it spawns.
-    //   [2] un-tokened SEND on svcmgr's service endpoint, slotted in
+    //   [2] un-badged SEND on svcmgr's service endpoint, slotted in
     //       procmgr's CSpace by `bootstrap_procmgr`. Procmgr derives a
-    //       tokened SEND per child for `ProcessInfo.service_registry_cap`.
+    //       badged SEND per child for `ProcessInfo.service_registry_cap`.
     //
     // No data words: every per-child allocation routes through memmgr.
     let Ok(pm_service_cap_for_pm) = syscall::cap_derive(procmgr_service_ep, syscall::RIGHTS_ALL)
@@ -655,7 +655,7 @@ fn run(info_ptr: u64) -> !
     if unsafe {
         ipc::bootstrap::serve_round(
             init_bootstrap_ep,
-            pm.bootstrap_token,
+            pm.bootstrap_badge,
             ipc_buf,
             true,
             &[
@@ -689,10 +689,10 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // Derive a tokened call cap with the `SEED_AUTHORITY` bit set so vfsd's
+    // Derive a badged call cap with the `SEED_AUTHORITY` bit set so vfsd's
     // `GET_SYSTEM_ROOT_CAP` accepts the init request. MOUNT is un-gated and
-    // uses the un-tokened service cap.
-    let Ok(vfsd_seed_cap) = syscall::cap_derive_token(
+    // uses the un-badged service cap.
+    let Ok(vfsd_seed_cap) = syscall::cap_derive_badge(
         vfsd_service_ep,
         syscall::RIGHTS_SEND,
         ipc::vfsd_labels::SEED_AUTHORITY,
@@ -761,7 +761,7 @@ fn run(info_ptr: u64) -> !
     // is mounted, so the call blocks until the root filesystem is up. The
     // cap drives every Phase 3 walk-and-spawn — children receive a
     // `cap_copy` via `procmgr_labels::CONFIGURE_NAMESPACE`. The
-    // `SEED_AUTHORITY` tokened cap is required by vfsd's gate.
+    // `SEED_AUTHORITY` badged cap is required by vfsd's gate.
     logging::log("phase 2: acquiring system-root cap (vfsd self-mounts root)");
     let system_root_cap = mount::request_system_root(vfsd_seed_cap, ipc_buf);
     if system_root_cap == 0

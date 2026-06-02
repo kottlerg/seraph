@@ -16,7 +16,7 @@
 //   * stdin read returns Ok(0) (immediate EOF).
 //
 // Panic output continues to route through the system log endpoint
-// (pre-seeded tokened SEND cap in `ProcessInfo.log_send_cap`); this
+// (pre-seeded badged SEND cap in `ProcessInfo.log_send_cap`); this
 // file does NOT touch the log.
 
 use crate::cell::UnsafeCell;
@@ -270,7 +270,7 @@ pub fn close_all() {
 
 /// Panic-output sink that emits through the system log endpoint.
 ///
-/// Uses the process's pre-seeded tokened SEND cap from
+/// Uses the process's pre-seeded badged SEND cap from
 /// `ProcessInfo.log_send_cap` (installed by `_start`) and sends each
 /// `write` as `STREAM_BYTES` chunks. Non-allocating — `log::write_bytes`
 /// stages bytes into the per-thread IPC buffer, so panics survive
@@ -280,7 +280,7 @@ pub struct LogPanicWriter;
 impl io::Write for LogPanicWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let ipc_ptr = current_ipc_buf();
-        let cap = ::log::ensure_tokened_cap(ipc_ptr);
+        let cap = ::log::ensure_badged_cap(ipc_ptr);
         if cap == 0 || ipc_ptr.is_null() {
             return Ok(buf.len());
         }

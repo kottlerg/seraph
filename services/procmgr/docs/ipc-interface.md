@@ -44,13 +44,13 @@ identity caps. The thread is **not** started.
 | Field | Value |
 |---|---|
 | label | 0 (success) |
-| cap[0] | Process handle (tokened endpoint identifying this process) |
+| cap[0] | Process handle (badged endpoint identifying this process) |
 | cap[1] | Child `CSpace` capability (full rights) |
 | cap[2] | `ProcessInfo` frame capability (MAP\|WRITE rights) |
 | cap[3] | Child `Thread` capability (Control right) |
 
-The process handle is a tokened endpoint capability. The caller uses it
-to send `START_PROCESS` (and future per-process operations) — the token
+The process handle is a badged endpoint capability. The caller uses it
+to send `START_PROCESS` (and future per-process operations) — the badge
 identifies the process without a forgeable PID. The `CSpace` cap allows
 the caller to inject capabilities into the child's capability space via
 `cap_copy`. The `ProcessInfo` frame cap allows the caller to map the page
@@ -80,18 +80,18 @@ Start a previously created (suspended) process. The caller must have
 completed any capability injection and `ProcessInfo` patching before
 calling this operation.
 
-The call is sent to the **process handle** (tokened endpoint) returned by
-`CREATE_PROCESS`, not to the main procmgr endpoint. The token identifies
+The call is sent to the **process handle** (badged endpoint) returned by
+`CREATE_PROCESS`, not to the main procmgr endpoint. The badge identifies
 which process to start.
 
 **Request:**
 
 | Field | Value |
 |---|---|
-| endpoint | Process handle (tokened endpoint from `CREATE_PROCESS` reply cap[0]) |
+| endpoint | Process handle (badged endpoint from `CREATE_PROCESS` reply cap[0]) |
 | label | 2 |
 
-No data words are required — the process is identified by the token
+No data words are required — the process is identified by the badge
 embedded in the endpoint capability.
 
 **Reply (success):**
@@ -110,7 +110,7 @@ embedded in the endpoint capability.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `InvalidToken` | No process with the given token exists |
+| 4 | `InvalidBadge` | No process with the given badge exists |
 | 5 | `AlreadyStarted` | Process was already started |
 
 ### Label 3: `EXIT_PROCESS`
@@ -151,7 +151,7 @@ Same as `CREATE_PROCESS`:
 | Field | Value |
 |---|---|
 | label | 0 (success) |
-| cap[0] | Process handle (tokened endpoint) |
+| cap[0] | Process handle (badged endpoint) |
 | cap[1] | Child `CSpace` capability (full rights) |
 | cap[2] | `ProcessInfo` frame capability (MAP\|WRITE rights) |
 | cap[3] | Child `Thread` capability (Control right) |
@@ -201,7 +201,7 @@ message). On `CREATE_PROCESS`, the caller's Frame cap is moved into procmgr's
 CSpace atomically with the message delivery. procmgr consumes the cap during
 process creation and does not return it.
 
-On reply, procmgr transfers a tokened process handle endpoint (for
+On reply, procmgr transfers a badged process handle endpoint (for
 subsequent per-process operations) and derived copies of the child's
 `CSpace`, `ProcessInfo` frame, and `Thread` capabilities to the caller.
 procmgr retains the original caps for process lifecycle management.
@@ -215,16 +215,16 @@ Wire format:
 | Field | Meaning |
 |---|---|
 | label | `procmgr_labels::REGISTER_DEATH_EQ` (14) |
-| caller's cap token | MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY` (`1 << 62`); init mints this tokened SEND cap and gives it exclusively to real-logd at bootstrap |
+| caller's cap badge | MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY` (`1 << 62`); init mints this badged SEND cap and gives it exclusively to real-logd at bootstrap |
 | `caps[0]` | `EventQueue` cap with `POST` right; procmgr binds it as a second death observer on every supervised thread |
 
 Procmgr stores the cap in
 [`process::LOGD_DEATH_EQ`](../src/process.rs) and immediately
 walks its process table, calling
 `sys_thread_bind_notification(entry.thread_cap, logd_eq,
-entry.token as u32)` on every live entry. From that moment onward,
+entry.badge as u32)` on every live entry. From that moment onward,
 [`finalize_creation`](../src/process.rs) also binds the same EQ on
-every newly spawned child (correlator = process token).
+every newly spawned child (correlator = process badge).
 
 Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
 caller lacks `DEATH_EQ_AUTHORITY`, `INVALID_ARGUMENT` if no cap was

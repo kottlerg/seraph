@@ -7,8 +7,8 @@
 //! history ring of completed lines retained for future query/disk/syslog
 //! sinks.
 //!
-//! Slots are keyed by the kernel-delivered token on every IPC message —
-//! the same `u64` procmgr uses as the child's process token and the
+//! Slots are keyed by the kernel-delivered badge on every IPC message —
+//! the same `u64` procmgr uses as the child's process badge and the
 //! correlator on its death-EQ binding. Slot eviction is driven by the
 //! death-EQ event drained inside logd's main loop.
 
@@ -70,7 +70,7 @@ impl Slot
     }
 }
 
-/// Token-keyed slot map. `Default::default()` is the empty state at
+/// Badge-keyed slot map. `Default::default()` is the empty state at
 /// boot; the ingested handover state from init-logd is merged in via
 /// [`Self::install_from_handover`].
 #[derive(Default)]
@@ -81,35 +81,35 @@ pub struct SlotTable
 
 impl SlotTable
 {
-    pub fn get_or_create(&mut self, token: u64) -> &mut Slot
+    pub fn get_or_create(&mut self, badge: u64) -> &mut Slot
     {
-        self.slots.entry(token).or_default()
+        self.slots.entry(badge).or_default()
     }
 
-    /// Look up `token`, returning `None` when the sender has been
+    /// Look up `badge`, returning `None` when the sender has been
     /// evicted (by death-EQ) or never logged. Used by future query
     /// surfaces; kept for symmetry with `get_or_create` even though
     /// no caller in this PR exercises it.
     #[allow(dead_code)]
-    pub fn get(&self, token: u64) -> Option<&Slot>
+    pub fn get(&self, badge: u64) -> Option<&Slot>
     {
-        self.slots.get(&token)
+        self.slots.get(&badge)
     }
 
-    /// Evict the slot for `token`. Called when procmgr's death-EQ
-    /// notification fires (correlator = process token). Idempotent on
-    /// unknown tokens.
-    pub fn evict(&mut self, token: u64) -> bool
+    /// Evict the slot for `badge`. Called when procmgr's death-EQ
+    /// notification fires (correlator = process badge). Idempotent on
+    /// unknown badges.
+    pub fn evict(&mut self, badge: u64) -> bool
     {
-        self.slots.remove(&token).is_some()
+        self.slots.remove(&badge).is_some()
     }
 
-    /// Install one slot's (token, name) pair from the init-logd
+    /// Install one slot's (badge, name) pair from the init-logd
     /// handover replies. History lines arrive separately as
     /// [`Self::install_history_line`].
-    pub fn install_from_handover(&mut self, token: u64, name: &[u8])
+    pub fn install_from_handover(&mut self, badge: u64, name: &[u8])
     {
-        let slot = self.get_or_create(token);
+        let slot = self.get_or_create(badge);
         let n = name.len().min(MAX_NAME_LEN);
         slot.name.clear();
         slot.name.extend_from_slice(&name[..n]);
@@ -119,9 +119,9 @@ impl SlotTable
     /// matching slot's ring. Creates the slot if absent (some history
     /// lines may have originated from senders whose slot was evicted
     /// from init-logd's small ring; the line itself still attributes
-    /// to its token).
-    pub fn install_history_line(&mut self, token: u64, us: u64, bytes: &[u8])
+    /// to its badge).
+    pub fn install_history_line(&mut self, badge: u64, us: u64, bytes: &[u8])
     {
-        self.get_or_create(token).push_history(us, bytes);
+        self.get_or_create(badge).push_history(us, bytes);
     }
 }

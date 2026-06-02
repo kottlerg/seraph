@@ -10,7 +10,7 @@
 //! from the VFS. See `procmgr/docs/ipc-interface.md`.
 //!
 //! `CREATE_PROCESS` and `CREATE_FROM_FILE` accept the child's module source and
-//! the caller's bootstrap endpoint (a tokened send cap); the endpoint is
+//! the caller's bootstrap endpoint (a badged send cap); the endpoint is
 //! installed in the child `CSpace` and recorded in `ProcessInfo` as the
 //! `creator_endpoint_cap`. The child requests its initial cap set from the
 //! caller over IPC at startup. procmgr itself has no knowledge of the child's
@@ -32,14 +32,14 @@ use std::os::seraph::startup_info;
 
 /// Init → procmgr bootstrap plan (one round on procmgr's creator endpoint):
 ///   caps[0]: service endpoint (procmgr receives requests on this)
-///   caps[1]: un-tokened SEND copy of the system log endpoint. Procmgr
+///   caps[1]: un-badged SEND copy of the system log endpoint. Procmgr
 ///            `cap_copy`s this into every child's
 ///            `ProcessInfo.log_send_cap` at `CREATE_PROCESS` time.
 ///            Zero means no log endpoint is available yet; children
 ///            born in that window receive zero and silent-drop
 ///            `std::os::seraph::log!`.
-///   caps[2]: un-tokened SEND copy of svcmgr's service endpoint (the
-///            global service registry). Procmgr derives a tokened SEND
+///   caps[2]: un-badged SEND copy of svcmgr's service endpoint (the
+///            global service registry). Procmgr derives a badged SEND
 ///            per child for `ProcessInfo.service_registry_cap`; the
 ///            child can `QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT`.
 ///            Zero means no registry is available yet.
@@ -130,11 +130,11 @@ fn main() -> !
     {
         syscall::thread_exit();
     };
-    if syscall::wait_set_add(ws_cap, boot.service_ep, WS_TOKEN_SERVICE).is_err()
+    if syscall::wait_set_add(ws_cap, boot.service_ep, WS_BADGE_SERVICE).is_err()
     {
         syscall::thread_exit();
     }
-    if syscall::wait_set_add(ws_cap, death_eq, WS_TOKEN_DEATH).is_err()
+    if syscall::wait_set_add(ws_cap, death_eq, WS_BADGE_DEATH).is_err()
     {
         syscall::thread_exit();
     }
@@ -152,7 +152,7 @@ fn main() -> !
 
     loop
     {
-        let Ok(token) = syscall::wait_set_wait(ws_cap)
+        let Ok(badge) = syscall::wait_set_wait(ws_cap)
         else
         {
             continue;
@@ -180,13 +180,13 @@ fn main() -> !
         // until the deadline, and once init is reaped.
         init_reap::check_backstop(ctx.memmgr_ep, ipc_buf);
 
-        match token
+        match badge
         {
-            WS_TOKEN_SERVICE =>
+            WS_BADGE_SERVICE =>
             {
                 dispatch_ipc(service_ep, ipc_buf, &mut ctx, &mut table, &recent);
             }
-            WS_TOKEN_DEATH =>
+            WS_BADGE_DEATH =>
             {
                 // Already drained above; nothing to do.
             }
@@ -195,10 +195,10 @@ fn main() -> !
     }
 }
 
-/// `WaitSet` token for procmgr's service endpoint.
-const WS_TOKEN_SERVICE: u64 = 0;
-/// `WaitSet` token for procmgr's shared death event queue.
-const WS_TOKEN_DEATH: u64 = 1;
+/// `WaitSet` badge for procmgr's service endpoint.
+const WS_BADGE_SERVICE: u64 = 0;
+/// `WaitSet` badge for procmgr's shared death event queue.
+const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
 /// retype slab. The kernel consumes `KERNEL_STACK_PAGES + 1 = 5` pages
@@ -229,7 +229,7 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 5;
 
 /// Register a new child with memmgr. On success returns
-/// `(memmgr_send_cap_slot, memmgr_token)`. On any failure (memmgr
+/// `(memmgr_send_cap_slot, memmgr_badge)`. On any failure (memmgr
 /// unwired, IPC error, OOM) returns `(0, 0)`.
 ///
 /// The cap slot lands in procmgr's `CSpace`; procmgr both:
@@ -238,7 +238,7 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 5;
 ///  * copies it into the child's `ProcessInfo.memmgr_endpoint_cap` so the
 ///    child's std heap-bootstrap can call `REQUEST_FRAMES` on it.
 ///
-/// The token is opaque to procmgr but is sent back in the
+/// The badge is opaque to procmgr but is sent back in the
 /// `PROCESS_DIED` payload at child teardown so memmgr can reclaim the
 /// right record.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -262,8 +262,8 @@ pub fn register_with_memmgr(memmgr_ep: u32, ipc_buf: *mut u64) -> (u32, u64)
         return (0, 0);
     }
     let cap = reply.caps().first().copied().unwrap_or(0);
-    let token = reply.word(0);
-    (cap, token)
+    let badge = reply.word(0);
+    (cap, badge)
 }
 
 /// Allocate exactly one page from memmgr. Returns the cap slot of the
@@ -388,7 +388,7 @@ fn dispatch_ipc(
         return;
     };
     let label = req.label;
-    let token = req.token;
+    let badge = req.badge;
 
     match label & 0xFFFF
     {
@@ -399,8 +399,8 @@ fn dispatch_ipc(
 
         procmgr_labels::START_PROCESS =>
         {
-            // Token from ipc_recv identifies which process to start.
-            let code = match process::start_process(token, table, ctx.self_aspace)
+            // Badge from ipc_recv identifies which process to start.
+            let code = match process::start_process(badge, table, ctx.self_aspace)
             {
                 Ok(()) => procmgr_errors::SUCCESS,
                 Err(code) => code,
@@ -410,17 +410,17 @@ fn dispatch_ipc(
 
         procmgr_labels::DESTROY_PROCESS =>
         {
-            // Token from ipc_recv identifies which process to destroy.
-            process::destroy_process(token, ctx.memmgr_ep, ipc_buf, table);
+            // Badge from ipc_recv identifies which process to destroy.
+            process::destroy_process(badge, ctx.memmgr_ep, ipc_buf, table);
             reply_empty(ipc_buf, procmgr_errors::SUCCESS);
         }
 
         procmgr_labels::QUERY_PROCESS =>
         {
-            // Token identifies which process to query. Reply data:
+            // Badge identifies which process to query. Reply data:
             //   word 0 = state code (see `procmgr_process_state`)
             //   word 1 = exit_reason (only meaningful for `EXITED`)
-            let (state, exit_reason) = resolve_query_state(token, table, recent);
+            let (state, exit_reason) = resolve_query_state(badge, table, recent);
             let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
                 .word(0, state)
                 .word(1, exit_reason)
@@ -471,17 +471,17 @@ fn dispatch_ipc(
 /// every thread currently in the process table.
 ///
 /// Wire format:
-/// * `caller token` MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY`
-///   (init derives the authorised tokened SEND cap and hands it
+/// * `caller badge` MUST equal `procmgr_labels::DEATH_EQ_AUTHORITY`
+///   (init derives the authorised badged SEND cap and hands it
 ///   exclusively to real-logd at bootstrap).
 /// * `caps[0]` = `EventQueue` cap with POST right.
 ///
 /// Reply: `procmgr_errors::SUCCESS` on bind, `UNAUTHORIZED` if the
-/// caller lacks the authority token, `INVALID_ARGUMENT` if no cap
+/// caller lacks the authority badge, `INVALID_ARGUMENT` if no cap
 /// arrives.
 fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
 {
-    if req.token != procmgr_labels::DEATH_EQ_AUTHORITY
+    if req.badge != procmgr_labels::DEATH_EQ_AUTHORITY
     {
         reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
         return;
@@ -525,13 +525,13 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64, table: &mut pro
 /// "wait then `QUERY_PROCESS`" sequence and produces a transient ALIVE
 /// answer for an already-dead child.
 fn resolve_query_state(
-    token: u64,
+    badge: u64,
     table: &process::ProcessTable,
     recent: &process::RecentExits,
 ) -> (u64, u64)
 {
     use ipc::procmgr_process_state;
-    if let Some((started, thread_cap)) = table.query_by_token(token)
+    if let Some((started, thread_cap)) = table.query_by_badge(badge)
     {
         // Kernel-authoritative override: if the thread has transitioned to
         // Exited, report EXITED with the kernel-recorded reason regardless
@@ -554,7 +554,7 @@ fn resolve_query_state(
             (procmgr_process_state::CREATED, 0u64)
         }
     }
-    else if let Some(reason) = recent.find(token)
+    else if let Some(reason) = recent.find(badge)
     {
         (procmgr_process_state::EXITED, reason)
     }
@@ -595,8 +595,8 @@ fn dispatch_death(
         }
         if let Some(entry) = table.take_by_correlator(correlator)
         {
-            let entry_token = entry.token();
-            recent.record(entry_token, exit_reason);
+            let entry_badge = entry.badge();
+            recent.record(entry_badge, exit_reason);
             process::teardown_entry(entry, memmgr_ep, ipc_buf);
         }
     }
@@ -627,7 +627,7 @@ fn handle_configure_pipe(
     table: &mut process::ProcessTable,
 )
 {
-    let token = req.token;
+    let badge = req.badge;
     let direction = req.word(0);
     let caps = req.caps();
     if caps.len() < 3
@@ -640,7 +640,7 @@ fn handle_configure_pipe(
     let space_signal = caps[2];
 
     let code = match table.configure_pipe(
-        token,
+        badge,
         self_aspace,
         direction,
         frame,
@@ -678,7 +678,7 @@ fn handle_configure_namespace(
     table: &mut process::ProcessTable,
 )
 {
-    let token = req.token;
+    let badge = req.badge;
     let caps = req.caps();
     if caps.is_empty()
     {
@@ -687,7 +687,7 @@ fn handle_configure_namespace(
     }
     let root_cap = caps[0];
     let cwd_cap = caps.get(1).copied().unwrap_or(0);
-    let code = match table.configure_namespace(token, root_cap, cwd_cap)
+    let code = match table.configure_namespace(badge, root_cap, cwd_cap)
     {
         Ok(()) => procmgr_errors::SUCCESS,
         Err(code) => code,
@@ -728,7 +728,7 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 ///
 /// Expects `caps = [module_frame, creator_endpoint?]`. Stdio pipe
 /// wiring is installed via separate `CONFIGURE_PIPE` IPCs (one per
-/// piped direction) on the returned tokened `process_handle` between
+/// piped direction) on the returned badged `process_handle` between
 /// create and `START_PROCESS`; the create path itself stays
 /// stdio-agnostic.
 fn handle_create(
@@ -797,21 +797,21 @@ fn handle_create(
         count: env_count,
     };
 
-    // Register this child with memmgr. memmgr replies with a tokened SEND
-    // cap on its endpoint plus the memmgr-side process token. Procmgr:
+    // Register this child with memmgr. memmgr replies with a badged SEND
+    // cap on its endpoint plus the memmgr-side process badge. Procmgr:
     //   - uses the cap for every per-child frame allocation (so memmgr
     //     accounts them to the child's record from the moment they leave
     //     the pool); and
     //   - copies the cap into the child's `ProcessInfo.memmgr_endpoint_cap`
     //     so the child's std heap-bootstrap can call `REQUEST_FRAMES`; and
-    //   - sends the token in `PROCESS_DIED` at child teardown.
-    let (memmgr_send, memmgr_token) = register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+    //   - sends the badge in `PROCESS_DIED` at child teardown.
+    let (memmgr_send, memmgr_badge) = register_with_memmgr(ctx.memmgr_ep, ipc_buf);
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
         log_send_source: ctx.log_ep,
         memmgr_endpoint: memmgr_send,
-        memmgr_token,
+        memmgr_badge,
         registry_send_source: ctx.registry_ep,
     };
 
@@ -829,7 +829,7 @@ fn handle_create(
         ctx.death_eq,
     );
 
-    // Procmgr's parent-side copy of the tokened cap stays in procmgr's
+    // Procmgr's parent-side copy of the badged cap stays in procmgr's
     // CSpace as long as the child is alive: it's the channel procmgr
     // uses to call `PROCESS_DIED` at teardown. The slot is recorded in
     // ProcessEntry.memmgr_send_cap and dropped only after PROCESS_DIED.
@@ -870,37 +870,37 @@ pub struct ProcmgrCtx
 {
     pub self_aspace: u32,
     pub self_endpoint: u32,
-    /// Un-tokened SEND cap on the log endpoint received from init
+    /// Un-badged SEND cap on the log endpoint received from init
     /// during procmgr's own bootstrap. Procmgr uses it as the
-    /// `cap_derive_token` source for minting a tokened SEND cap per
-    /// child it spawns (token = the child's process token). The
+    /// `cap_derive_badge` source for minting a badged SEND cap per
+    /// child it spawns (badge = the child's process badge). The
     /// minted cap is placed in the child's `ProcessInfo.log_send_cap`.
     /// Zero if init did not provide one (very early boot); children
     /// born in that window receive zero and silent-drop
     /// `std::os::seraph::log!`.
     pub log_ep: u32,
-    /// Un-tokened SEND cap on svcmgr's service endpoint, received from init
-    /// during procmgr's own bootstrap. Used as the `cap_derive_token` source
-    /// for minting a per-child tokened SEND (token = the child's process
-    /// token), installed in the child's `ProcessInfo.service_registry_cap`
+    /// Un-badged SEND cap on svcmgr's service endpoint, received from init
+    /// during procmgr's own bootstrap. Used as the `cap_derive_badge` source
+    /// for minting a per-child badged SEND (badge = the child's process
+    /// badge), installed in the child's `ProcessInfo.service_registry_cap`
     /// so the child can issue `svcmgr_labels::QUERY_ENDPOINT` against svcmgr
     /// for service-name lookups. Zero if init has not yet wired it; children
     /// born in that window receive zero and `registry_client::lookup` no-ops.
     pub registry_ep: u32,
-    /// Tokened SEND cap on memmgr's service endpoint, identifying procmgr.
+    /// Badged SEND cap on memmgr's service endpoint, identifying procmgr.
     /// Used to mint per-child memmgr SENDs via `REGISTER_PROCESS`, to
     /// notify `PROCESS_DIED`, and as the destination for procmgr's own
-    /// frame allocations (memmgr auto-registers procmgr's token at
+    /// frame allocations (memmgr auto-registers procmgr's badge at
     /// bootstrap so `REQUEST_FRAMES` on this cap is allowed).
     pub memmgr_ep: u32,
     /// Single shared death-notification event queue. Every spawned child
     /// binds its thread to this queue (via multi-bind in the kernel) with
-    /// `correlator = entry.token as u32`. Multiplexed alongside the
+    /// `correlator = entry.badge as u32`. Multiplexed alongside the
     /// service endpoint via the wait-set in `ws_cap`.
     pub death_eq: u32,
     /// Wait-set cap. Multiplexes procmgr's service endpoint
-    /// (`WS_TOKEN_SERVICE`) and the shared death event queue
-    /// (`WS_TOKEN_DEATH`). Fixed two members.
+    /// (`WS_BADGE_SERVICE`) and the shared death event queue
+    /// (`WS_BADGE_DEATH`). Fixed two members.
     pub ws_cap: u32,
 }
 

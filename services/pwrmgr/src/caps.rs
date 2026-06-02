@@ -11,7 +11,7 @@
 //! * `caps[0]` = pwrmgr's own service endpoint (RECV; the SHUTDOWN/REBOOT
 //!   receive end). svcmgr holds the persistent source and publishes
 //!   `pwrmgr.shutdown` / `pwrmgr.deny` SENDs against it.
-//! * `caps[1]` = `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's
+//! * `caps[1]` = `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's
 //!   registry endpoint (from `pwrmgr.svc` `seed = devmgr.registry`).
 //!
 //! pwrmgr owns no hardware caps directly. It acquires its shutdown
@@ -30,7 +30,7 @@ pub struct Bootstrap
 {
     /// pwrmgr's service endpoint (RECV). Zero if the round was empty.
     pub service_ep: u32,
-    /// `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry
+    /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
     /// endpoint. Zero if absent — the arch module then degrades to its
     /// no-actuator path.
     pub devmgr_registry: u32,

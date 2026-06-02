@@ -7,15 +7,15 @@
 //!
 //! Implements read-write FAT16/FAT32 filesystem support. Serves the
 //! cap-native namespace protocol (`NS_LOOKUP` / `NS_STAT` /
-//! `NS_READDIR`) for directory walks; per-node tokened caps carry
+//! `NS_READDIR`) for directory walks; per-node badged caps carry
 //! the read side (`FS_READ`, `FS_READ_FRAME`, `FS_RELEASE_FRAME`,
 //! `FS_CLOSE`) and the write side (`FS_WRITE`, `FS_WRITE_FRAME`,
 //! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`). `FS_MOUNT` is
-//! the one untokened service-level request, used by vfsd as a
+//! the one unbadged service-level request, used by vfsd as a
 //! BPB-validation probe at mount time. All disk I/O is performed via
 //! the block device IPC endpoint received at creation time.
 //!
-//! Per-node tokens are minted by `NS_LOOKUP` (token = `(NodeId,
+//! Per-node badges are minted by `NS_LOOKUP` (badge = `(NodeId,
 //! NamespaceRights)`); per-node ops look the node up in `NodeTable`
 //! and act on either the lazily-allocated `OpenFile` slot (read-side
 //! frame caps) or the cached `DirEntryLocation` (write-side metadata
@@ -59,20 +59,20 @@ use eviction::{EvictReq, EvictionState};
 use fat::{next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
-use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_token};
+use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
 use syscall_abi::{PAGE_SIZE, RIGHTS_MAP_READ};
 
-/// Monotonic counter for token allocation. Starts at 1 (0 = untokened).
-static NEXT_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// Monotonic counter for badge allocation. Starts at 1 (0 = unbadged).
+static NEXT_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 //
 // vfsd → fatfs bootstrap plan (one round, 2 caps, 0 data words):
-//   caps[0]: block device (SEND) — partition-scoped tokened cap on virtio-blk.
+//   caps[0]: block device (SEND) — partition-scoped badged cap on virtio-blk.
 //            vfsd registers the partition bound with virtio-blk before
 //            delivering this cap; fatfs reads by partition-relative LBA and
-//            virtio-blk enforces the bound per-token.
-//   caps[1]: fatfs service endpoint (RIGHTS_ALL — receive + derive tokens)
+//            virtio-blk enforces the bound per-badge.
+//   caps[1]: fatfs service endpoint (RIGHTS_ALL — receive + derive badges)
 //
 // log and procmgr endpoints arrive via `ProcessInfo`/`StartupInfo`.
 //
@@ -204,11 +204,11 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
 /// Main FAT service loop.
 ///
 /// Three request shapes share one endpoint:
-/// - `FS_MOUNT` — untokened (token == 0); vfsd's BPB-validation probe.
+/// - `FS_MOUNT` — unbadged (badge == 0); vfsd's BPB-validation probe.
 /// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
 ///   the protocol crate.
 /// - Per-node `FS_READ` / `FS_READ_FRAME` / `FS_RELEASE_FRAME` /
-///   `FS_CLOSE` — token packs `(NodeId, NamespaceRights)`; the slot is
+///   `FS_CLOSE` — badge packs `(NodeId, NamespaceRights)`; the slot is
 ///   resolved through `NodeTable` and the lazily-allocated `OpenFile`.
 ///
 /// The open-file table is shared with the eviction worker via a
@@ -238,8 +238,8 @@ fn service_loop(
 
         let opcode = msg.label & 0xFFFF;
 
-        // Untokened service-level requests: FS_MOUNT only.
-        if msg.token == 0
+        // Unbadged service-level requests: FS_MOUNT only.
+        if msg.badge == 0
         {
             let code = match opcode
             {
@@ -288,7 +288,7 @@ fn service_loop(
         // FS_CREATE/FS_MKDIR must not exceed it, or a caller holding
         // a `MUTATE_DIR`-only parent would silently gain `READ` /
         // `WRITE` / `EXEC` on every child they create.
-        let (node_id, parent_rights) = match gate(msg.label, msg.token)
+        let (node_id, parent_rights) = match gate(msg.label, msg.badge)
         {
             Ok(pair) => pair,
             Err(GateError::UnknownLabel) =>
@@ -445,14 +445,14 @@ fn handle_read_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
     if node.kind != NodeKind::File
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
@@ -485,7 +485,7 @@ fn handle_read_node_cap(
 }
 
 /// `FS_READ_FRAME` body, parameterised by a pre-resolved `OpenFile`
-/// slot index. `handle_read_frame_node_cap` resolves the token via
+/// slot index. `handle_read_frame_node_cap` resolves the badge via
 /// `NodeTable.open_slot` (lazy-allocating on first call) and delegates
 /// here for the cluster walk, cache acquisition, two-step cap
 /// derivation, and outstanding-page tracking.
@@ -654,14 +654,14 @@ fn pick_eviction_candidate(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<EvictRe
 {
     for file in files
     {
-        if file.token == 0
+        if file.badge == 0
         {
             continue;
         }
         if let Some(entry) = file.outstanding.iter().flatten().next()
         {
             return Some(EvictReq {
-                file_token: file.token,
+                file_badge: file.badge,
                 cookie: entry.cookie,
                 slot_idx: entry.slot_idx,
                 ancestor_cap: entry.ancestor_cap,
@@ -692,14 +692,14 @@ fn handle_read_frame_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
     if node.kind != NodeKind::File
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
@@ -715,10 +715,10 @@ fn handle_read_frame_node_cap(
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             return;
         };
-        // Slot identity for the eviction worker's `find_by_token`
+        // Slot identity for the eviction worker's `find_by_badge`
         // lookup. Never seen on the wire — node-cap requests resolve
         // through `FatNode.open_slot`.
-        let token = NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let badge = NEXT_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // First FS_READ_FRAME for a (client, node) pair MAY carry the
         // client's per-process release-endpoint SEND in caps[0]. The
         // kernel `transfer_caps` path moved it into our CSpace if
@@ -729,7 +729,7 @@ fn handle_read_frame_node_cap(
         // the same client carry no caps.
         let release_endpoint_cap = msg.caps().first().copied().unwrap_or(0);
         files[slot_idx] = OpenFile {
-            token,
+            badge,
             start_cluster: node.cluster,
             file_size: node.size,
             outstanding: [None; file::MAX_OUTSTANDING],
@@ -983,7 +983,7 @@ fn write_file_bytes(
     Ok((chain_head, new_size))
 }
 
-/// `FS_WRITE` inline write. Token = file cap (must carry `WRITE`).
+/// `FS_WRITE` inline write. Badge = file cap (must carry `WRITE`).
 /// `label[16..32]` = byte length (≤504), `data[0]` = offset, payload
 /// bytes packed from word 1 onward.
 fn handle_write_node_cap(
@@ -999,7 +999,7 @@ fn handle_write_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File
@@ -1092,7 +1092,7 @@ fn handle_write_frame_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_with(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_with(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File
@@ -1262,7 +1262,7 @@ fn self_aspace_cap() -> Option<u32>
     Some(cap).filter(|&c| c != 0)
 }
 
-/// `FS_CREATE`: create a new file in a directory. Token = parent-dir
+/// `FS_CREATE`: create a new file in a directory. Badge = parent-dir
 /// cap (must carry `MUTATE_DIR`). `label[16..32]` = name length, name
 /// from word 0. `parent_rights` is the caller's effective rights on
 /// the parent dir; the returned child cap is attenuated by it.
@@ -1333,7 +1333,7 @@ fn create_entry_common(
     let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
@@ -1434,8 +1434,8 @@ fn create_entry_common(
         ),
     };
     let child_rights = parent_rights.intersect(kind_max);
-    let token = pack_token(new_node_id, child_rights);
-    let Ok(new_cap) = syscall::cap_derive_token(caps.service, syscall::RIGHTS_SEND_GRANT, token)
+    let badge = pack_badge(new_node_id, child_rights);
+    let Ok(new_cap) = syscall::cap_derive_badge(caps.service, syscall::RIGHTS_SEND_GRANT, badge)
     else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
@@ -1450,7 +1450,7 @@ fn create_entry_common(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// `FS_REMOVE`: unlink a file or empty directory. Token = parent-dir
+/// `FS_REMOVE`: unlink a file or empty directory. Badge = parent-dir
 /// cap (must carry `MUTATE_DIR`). Name in label[16..32] + data bytes.
 fn handle_remove_node_cap(
     node_id: NodeId,
@@ -1465,7 +1465,7 @@ fn handle_remove_node_cap(
     let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
@@ -1553,7 +1553,7 @@ fn handle_rename_node_cap(
     let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     let src_len = msg.word(0) as usize;
@@ -1633,7 +1633,7 @@ fn handle_rename_node_cap(
 
 /// `FS_TRUNCATE`: shrink a file to a new length.
 ///
-/// Token = file cap (must carry `WRITE`). `data[0]` = new length.
+/// Badge = file cap (must carry `WRITE`). `data[0]` = new length.
 /// v1 supports only `new_len == 0`; non-zero replies `IO_ERROR` so
 /// the wire shape is forward-compatible with later extend-with-
 /// zero-fill semantics tracked by the `ruststd::fs` completeness-gaps
@@ -1651,7 +1651,7 @@ fn handle_truncate_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File

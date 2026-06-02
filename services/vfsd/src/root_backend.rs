@@ -6,19 +6,19 @@
 //! Synthetic system-root [`NamespaceBackend`] composed at boot time.
 //!
 //! `VfsdRootBackend` is vfsd's in-process namespace server. It owns no
-//! storage; every directory entry is either a tokened SEND on a peer
+//! storage; every directory entry is either a badged SEND on a peer
 //! filesystem driver's namespace endpoint (a *terminal* mount node) or
 //! a synthetic intermediate directory created on demand to host a
 //! multi-component mount path (a *synthetic intermediate* node). A
-//! client holding a tokened SEND on vfsd's namespace endpoint at
+//! client holding a badged SEND on vfsd's namespace endpoint at
 //! `NodeId::ROOT` walks into mounts via `NS_LOOKUP`; the protocol crate
 //! returns either a `cap_derive`-d copy of the underlying driver's
-//! root cap (External entry, terminal node) or a tokened SEND on
+//! root cap (External entry, terminal node) or a badged SEND on
 //! vfsd's own namespace endpoint addressing the intermediate's
 //! `NodeId` (Local entry, synthetic intermediate).
 //!
 //! Each synthetic intermediate may also carry a `fallthrough_cap` —
-//! a tokened SEND on the root mount's namespace endpoint addressing
+//! a badged SEND on the root mount's namespace endpoint addressing
 //! the directory at the corresponding path in the root filesystem.
 //! When a `NS_LOOKUP` against an intermediate misses every local
 //! child, vfsd's namespace dispatcher forwards the request verbatim
@@ -64,11 +64,11 @@ pub struct TreeNode
     pub parent: u32,
     pub first_child: u32,
     pub next_sibling: u32,
-    /// Tokened SEND on the underlying driver's namespace endpoint,
+    /// Badged SEND on the underlying driver's namespace endpoint,
     /// captured at MOUNT time. Non-zero on terminal nodes, zero on
     /// synthetic intermediates.
     pub terminal_cap: u32,
-    /// Tokened SEND on the root mount's namespace endpoint addressing
+    /// Badged SEND on the root mount's namespace endpoint addressing
     /// the directory at the path corresponding to this node, used to
     /// forward unmatched `NS_LOOKUP` requests so root-fs entries
     /// remain reachable through synthetic intermediates. Zero when no
@@ -331,7 +331,7 @@ impl VfsdRootBackend
         Some(written)
     }
 
-    /// Tokened SEND on the root mount's namespace endpoint, or `0` if
+    /// Badged SEND on the root mount's namespace endpoint, or `0` if
     /// no root mount has been installed. Consulted by mount-config
     /// parsing and the install-time fall-through walk.
     #[must_use]

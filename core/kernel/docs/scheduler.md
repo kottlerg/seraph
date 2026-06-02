@@ -157,8 +157,8 @@ pub struct ThreadControlBlock
     /// Wakeup value (payload for signal/event wakeup).
     wakeup_value: u64,
 
-    /// Token from a wait set wakeup.
-    wakeup_token: u64,
+    /// Badge from a wait set wakeup.
+    wakeup_badge: u64,
 
     /// Intrusive IPC wait queue link.
     ipc_wait_next: Option<*mut ThreadControlBlock>,

@@ -980,7 +980,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Copies the source capability's kernel object into the destination `CSpace`
 /// with the requested (attenuated) rights, increments the object's reference
-/// count, propagates the source token, and wires the new slot as a child of the
+/// count, propagates the source badge, and wires the new slot as a child of the
 /// source in the derivation tree. When `arg2 == 0` a free slot is allocated;
 /// otherwise the cap is placed at the caller-chosen index — init populates
 /// well-known slots in child `CSpaces` this way.
@@ -1013,7 +1013,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let caller_cspace_id = unsafe { (*caller_cspace).id() };
 
     // Resolve source slot (any non-null tag, any rights — just non-null).
-    let (src_tag, src_rights, src_object, src_token) = {
+    let (src_tag, src_rights, src_object, src_badge) = {
         // SAFETY: caller_cspace validated non-null above.
         let cs = unsafe { &*caller_cspace };
         let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -1025,7 +1025,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             slot.tag,
             slot.rights,
             slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.token,
+            slot.badge,
         )
     };
 
@@ -1069,7 +1069,7 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Insert into the destination CSpace under cspace.lock so the freelist/tag
     // invariant cannot tear against a concurrent SYS_CAP_CREATE_*. dest_slot_idx
     // == 0 allocates a free slot; otherwise the cap is placed at the
-    // caller-chosen index. The token write happens in the same critical section.
+    // caller-chosen index. The badge write happens in the same critical section.
     // SAFETY: dest_cs_ptr validated above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*dest_cs_ptr).lock.lock_raw();
@@ -1088,10 +1088,10 @@ pub fn sys_cap_copy(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 .map(|()| dest_slot_idx)
         };
         if let Ok(idx) = r
-            && src_token != 0
+            && src_badge != 0
             && let Some(new_slot) = (*dest_cs_ptr).slot_mut(idx)
         {
-            new_slot.token = src_token;
+            new_slot.badge = src_badge;
         }
         (*dest_cs_ptr).lock.unlock_raw(saved);
         r
@@ -1160,7 +1160,7 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cspace_id = unsafe { (*caller_cspace).id() };
 
     // Resolve source slot.
-    let (src_tag, src_rights, src_object, src_token) = {
+    let (src_tag, src_rights, src_object, src_badge) = {
         // SAFETY: caller_cspace validated non-null above.
         let cs = unsafe { &*caller_cspace };
         let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -1172,7 +1172,7 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             slot.tag,
             slot.rights,
             slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.token,
+            slot.badge,
         )
     };
 
@@ -1185,7 +1185,7 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Insert under cspace.lock so the freelist/tag invariant cannot tear
-    // against a concurrent SYS_CAP_CREATE_*. Token write happens in the same
+    // against a concurrent SYS_CAP_CREATE_*. Badge write happens in the same
     // critical section so the new slot's fields are atomic w.r.t. other
     // observers.
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
@@ -1193,10 +1193,10 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let saved = (*caller_cspace).lock.lock_raw();
         let r = (*caller_cspace).insert_cap(src_tag, effective_rights, src_object);
         if let Ok(idx) = r
-            && src_token != 0
+            && src_badge != 0
             && let Some(new_slot) = (*caller_cspace).slot_mut(idx.get())
         {
-            new_slot.token = src_token;
+            new_slot.badge = src_badge;
         }
         (*caller_cspace).lock.unlock_raw(saved);
         r
@@ -1228,28 +1228,28 @@ pub fn sys_cap_derive(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(u64::from(new_idx))
 }
 
-/// `SYS_CAP_DERIVE_TOKEN` (48): derive a capability with a token attached.
+/// `SYS_CAP_DERIVE_BADGE` (48): derive a capability with a badge attached.
 ///
 /// arg0 = source slot index (caller's `CSpace`).
 /// arg1 = rights mask (must be a subset of source rights).
-/// arg2 = token value (must be non-zero; source must have token == 0).
+/// arg2 = badge value (must be non-zero; source must have badge == 0).
 ///
-/// Creates a new slot with the attenuated rights and the specified token.
-/// The token is immutable once set — deriving from a tokened cap inherits
-/// the token (via `SYS_CAP_DERIVE`), but setting a new token on an already-
-/// tokened cap returns `InvalidArgument`.
+/// Creates a new slot with the attenuated rights and the specified badge.
+/// The badge is immutable once set — deriving from a badged cap inherits
+/// the badge (via `SYS_CAP_DERIVE`), but setting a new badge on an already-
+/// badged cap returns `InvalidArgument`.
 ///
 /// Returns the new slot index.
 #[cfg(not(test))]
-pub fn sys_cap_derive_token(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_derive_badge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::slot::Rights;
 
     let src_idx = tf.arg(0) as u32;
     let rights_mask = Rights(tf.arg(1) as u32);
-    let token_value = tf.arg(2);
+    let badge_value = tf.arg(2);
 
-    if token_value == 0
+    if badge_value == 0
     {
         return Err(SyscallError::InvalidArgument);
     }
@@ -1270,7 +1270,7 @@ pub fn sys_cap_derive_token(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let cspace_id = unsafe { (*caller_cspace).id() };
 
     // Resolve source slot.
-    let (src_tag, src_rights, src_object, src_token) = {
+    let (src_tag, src_rights, src_object, src_badge) = {
         // SAFETY: caller_cspace validated non-null above.
         let cs = unsafe { &*caller_cspace };
         let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -1282,12 +1282,12 @@ pub fn sys_cap_derive_token(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             slot.tag,
             slot.rights,
             slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.token,
+            slot.badge,
         )
     };
 
-    // Cannot re-token a capability that already has a token.
-    if src_token != 0
+    // Cannot re-badge a capability that already has a badge.
+    if src_badge != 0
     {
         return Err(SyscallError::InvalidArgument);
     }
@@ -1301,7 +1301,7 @@ pub fn sys_cap_derive_token(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Insert under cspace.lock so the freelist/tag invariant cannot tear
-    // against a concurrent SYS_CAP_CREATE_*. Token write happens in the same
+    // against a concurrent SYS_CAP_CREATE_*. Badge write happens in the same
     // critical section.
     // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
@@ -1310,7 +1310,7 @@ pub fn sys_cap_derive_token(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         if let Ok(idx) = r
             && let Some(new_slot) = (*caller_cspace).slot_mut(idx.get())
         {
-            new_slot.token = token_value;
+            new_slot.badge = badge_value;
         }
         (*caller_cspace).lock.unlock_raw(saved);
         r
@@ -1644,7 +1644,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let dest_cspace_id = unsafe { (*dest_cs_ptr).id() };
 
     // Read source slot contents.
-    let (src_tag, src_rights, src_object, src_token) = {
+    let (src_tag, src_rights, src_object, src_badge) = {
         // SAFETY: caller_cspace validated non-null above.
         let cs = unsafe { &*caller_cspace };
         let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -1656,7 +1656,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             slot.tag,
             slot.rights,
             slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.token,
+            slot.badge,
         )
     };
 
@@ -1748,7 +1748,7 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: dest_cs_ptr validated; DERIVATION_LOCK held.
     if let Some(dst_slot) = unsafe { (*dest_cs_ptr).slot_mut(dest_idx) }
     {
-        dst_slot.token = src_token;
+        dst_slot.badge = src_badge;
         dst_slot.deriv_parent = src_parent;
         dst_slot.deriv_first_child = src_first_child;
         dst_slot.deriv_prev_sibling = src_prev;

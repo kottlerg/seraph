@@ -34,7 +34,7 @@ use std::time::Duration;
 use ipc::{IpcMessage, fs_labels};
 
 use crate::cache::PageCache;
-use crate::file::{MAX_OPEN_FILES, MAX_OUTSTANDING, OpenFile, find_by_token};
+use crate::file::{MAX_OPEN_FILES, MAX_OUTSTANDING, OpenFile, find_by_badge};
 
 /// Cooperative release watchdog: the client must reply with
 /// `FS_RELEASE_ACK` within this many milliseconds, else the worker
@@ -53,13 +53,13 @@ const MAX_PENDING_EVICTIONS: usize = MAX_OPEN_FILES * MAX_OUTSTANDING;
 #[derive(Clone, Copy)]
 pub struct EvictReq
 {
-    /// `OpenFile.token` identifying which file this entry belongs
+    /// `OpenFile.badge` identifying which file this entry belongs
     /// to. Used at cleanup time to clear the matching
     /// outstanding-page slot.
-    pub file_token: u64,
+    pub file_badge: u64,
     /// Caller-visible cookie originally returned in
     /// `FS_READ_FRAME`. Carried in `FS_RELEASE_FRAME`'s `data[0]`
-    /// and used to disambiguate cleanup against `file_token`.
+    /// and used to disambiguate cleanup against `file_badge`.
     pub cookie: u64,
     /// Cache slot whose refcount is held by this entry.
     pub slot_idx: usize,
@@ -106,8 +106,8 @@ impl EvictionState
         else
         {
             std::os::seraph::log!(
-                "eviction enqueue overflow: dropped req (token={}, cookie={}, slot={}, qlen={})",
-                req.file_token,
+                "eviction enqueue overflow: dropped req (badge={}, cookie={}, slot={}, qlen={})",
+                req.file_badge,
                 req.cookie,
                 req.slot_idx,
                 q.len()
@@ -146,8 +146,8 @@ pub fn worker_loop(
         if !acked
         {
             std::os::seraph::log!(
-                "FS_RELEASE_FRAME timeout, hard-revoking parent cap (token={}, slot={})",
-                req.file_token,
+                "FS_RELEASE_FRAME timeout, hard-revoking parent cap (badge={}, slot={})",
+                req.file_badge,
                 req.slot_idx
             );
         }
@@ -160,7 +160,7 @@ pub fn worker_loop(
         let _ = syscall::cap_revoke(req.ancestor_cap);
         let _ = syscall::cap_delete(req.ancestor_cap);
         cache.release_slot(req.slot_idx);
-        clear_outstanding(&files, req.file_token, req.cookie);
+        clear_outstanding(&files, req.file_badge, req.cookie);
     }
 }
 
@@ -244,10 +244,10 @@ fn cooperative_release(req: &EvictReq) -> bool
     acked
 }
 
-fn clear_outstanding(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, file_token: u64, cookie: u64)
+fn clear_outstanding(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, file_badge: u64, cookie: u64)
 {
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(idx) = find_by_token(&files_g, file_token)
+    let Some(idx) = find_by_badge(&files_g, file_badge)
     else
     {
         return;

@@ -1,6 +1,6 @@
 # vfsd Service Interface
 
-IPC interface vfsd exposes on its un-tokened **service endpoint**.
+IPC interface vfsd exposes on its un-badged **service endpoint**.
 Two labels: `MOUNT` and `GET_SYSTEM_ROOT_CAP`. The namespace surface
 (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR` against the synthetic system
 root) lives on a separate endpoint and is specified in
@@ -13,7 +13,7 @@ The system-root cap is requested by init via
 service thread starts, and replies `NO_MOUNT` to this request until
 root is mounted, so the pull blocks until the root filesystem is up
 (and fails fast — letting init FATAL — if the self-mount failed).
-Vfsd derives a fresh tokened SEND on its own namespace endpoint
+Vfsd derives a fresh badged SEND on its own namespace endpoint
 addressing `NodeId::ROOT` at full namespace rights and replies with
 it. Init holds the cap as the seed for all later tier-3 namespace-cap
 distribution; children of init receive a `cap_copy` of it via
@@ -30,9 +30,9 @@ is reserved and MUST NOT be reused for an unrelated request.
 
 ## Endpoint
 
-vfsd holds the receive side of one un-tokened service endpoint,
+vfsd holds the receive side of one un-badged service endpoint,
 created and delivered by init at vfsd's bootstrap (round 1, `caps[0]`).
-Init holds a tokened `SEED_AUTHORITY` SEND for `GET_SYSTEM_ROOT_CAP`
+Init holds a badged `SEED_AUTHORITY` SEND for `GET_SYSTEM_ROOT_CAP`
 during boot; it issues no `MOUNT`, since vfsd self-mounts root.
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). Numeric
@@ -55,7 +55,7 @@ looks the partition up in its parsed GPT table via
 priority tie-break on attribute bits 48-63; tied priorities are
 fatal), registers the partition bound with virtio-blk, spawns a fatfs
 driver, sends `FS_MOUNT` to validate the BPB, captures the driver's
-root cap into [`VfsdRootBackend`], and replies with a tokened SEND on
+root cap into [`VfsdRootBackend`], and replies with a badged SEND on
 the new filesystem's namespace endpoint addressing its root. A mount
 on `/` is rejected (`NO_MOUNT`) once root is already mounted.
 
@@ -81,7 +81,7 @@ is identified by the standard EFI System Partition type GUID
 | Field | Value |
 |---|---|
 | `label` | `vfsd_errors::SUCCESS` (0) |
-| `caps[0]` | Tokened SEND on the new filesystem's namespace endpoint, addressing its root (omitted if cap derivation failed; the mount itself still landed) |
+| `caps[0]` | Badged SEND on the new filesystem's namespace endpoint, addressing its root (omitted if cap derivation failed; the mount itself still landed) |
 
 **Reply (error)**: `label = vfsd_errors::*` (`NOT_FOUND` for an
 unknown role byte or invalid path length, `NO_MOUNT` if no partition
@@ -103,7 +103,7 @@ via the root mount's transparent delegation.
 | [shared/namespace-protocol/README.md](../../../shared/namespace-protocol/README.md) | NS_* wire surface |
 | [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Filesystem-driver IPC (FS_MOUNT and per-node ops) |
 | [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, cap transfer |
-| [docs/capability-model.md](../../../docs/capability-model.md) | Token semantics, derivation tree |
+| [docs/capability-model.md](../../../docs/capability-model.md) | Badge semantics, derivation tree |
 
 ---
 

@@ -360,7 +360,7 @@ its own slot, sets the pending bit of each target CPU, then sends the IPI:
 2. Bump the space's tlb_gen and fence (so a switched-away CPU flushes on
    reactivation); read active_cpus; exclude the current CPU.
 3. Publish (root, virt, tag) into this CPU's request slot and set each target's
-   pending bit (the bit doubles as the per-target liveness/ack token).
+   pending bit (the bit doubles as the per-target liveness/ack badge).
 4. Send the shootdown IPI to the targets and wait for every pending bit to clear.
 ```
 

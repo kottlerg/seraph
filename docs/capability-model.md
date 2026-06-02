@@ -191,82 +191,82 @@ capability slots across all processes, enabling correct revocation.
 
 ---
 
-## Tokens
+## Badges
 
-A capability may carry an immutable **token** — a `u64` value attached at derivation
-time via `SYS_CAP_DERIVE_TOKEN`. When a tokened endpoint capability is used for IPC,
-the kernel delivers the token to the receiver alongside the message label.
+A capability may carry an immutable **badge** — a `u64` value attached at derivation
+time via `SYS_CAP_DERIVE_BADGE`. When a badged endpoint capability is used for IPC,
+the kernel delivers the badge to the receiver alongside the message label.
 
-Tokens are generic: any capability type may carry one. For endpoints, the kernel
-delivers the token on `ipc_recv`. For other types, the token is stored but not
+Badges are generic: any capability type may carry one. For endpoints, the kernel
+delivers the badge on `ipc_recv`. For other types, the badge is stored but not
 automatically delivered — userspace may use it for bookkeeping.
 
 ### Kernel guarantees
 
-`SYS_CAP_DERIVE_TOKEN` enforces two invariants:
+`SYS_CAP_DERIVE_BADGE` enforces two invariants:
 
-1. **Tokens are set-once.** A non-zero token may be attached only to a source
-   capability that does NOT already carry one (`src_token != 0` is rejected).
-   Deriving from an already-tokened cap propagates the parent's token unchanged;
-   the parent's token cannot be replaced or shadowed.
-2. **Tokens propagate through the derivation tree.** Every derived child inherits
-   the parent's token (when non-zero). Once a cap is tokened, every cap reachable
-   from it through `cap_derive` / `cap_copy` carries the same token.
+1. **Badges are set-once.** A non-zero badge may be attached only to a source
+   capability that does NOT already carry one (`src_badge != 0` is rejected).
+   Deriving from an already-badged cap propagates the parent's badge unchanged;
+   the parent's badge cannot be replaced or shadowed.
+2. **Badges propagate through the derivation tree.** Every derived child inherits
+   the parent's badge (when non-zero). Once a cap is badged, every cap reachable
+   from it through `cap_derive` / `cap_copy` carries the same badge.
 
-These guarantees give the **receiver** of an IPC message a kernel-delivered token
+These guarantees give the **receiver** of an IPC message a kernel-delivered badge
 field it can trust: the value cannot be lied about on the receive path, cannot be
 changed after the fact, and is locked to whichever derivation chain the cap belongs
 to.
 
 ### What the kernel does NOT guarantee
 
-The kernel does NOT restrict which token *value* a caller chooses when attaching a
-token to an un-tokened source. Any holder of an un-tokened cap on an endpoint may
-mint a tokened child cap with any non-zero u64 value, including values that the
+The kernel does NOT restrict which badge *value* a caller chooses when attaching a
+badge to an un-badged source. Any holder of an un-badged cap on an endpoint may
+mint a badged child cap with any non-zero u64 value, including values that the
 endpoint's server uses as authority markers (e.g.,
 `procmgr_labels::DEATH_EQ_AUTHORITY`, `pwrmgr_labels::SHUTDOWN_AUTHORITY`).
 
-This is the correct kernel semantics — minting un-tokened sources is the
-mechanism by which servers distribute tokened identities. The implication for
+This is the correct kernel semantics — minting un-badged sources is the
+mechanism by which servers distribute badged identities. The implication for
 servers is structural, not cryptographic.
 
 ### Server-side rule for authority-bearing endpoints
 
-**Never distribute an un-tokened SEND cap on an authority-bearing endpoint to a
+**Never distribute an un-badged SEND cap on an authority-bearing endpoint to a
 holder that should not be able to mint arbitrary identities on it.** The
-un-tokened cap is a blank cheque — it is, by design, the source from which any
-tokened child can be derived.
+un-badged cap is a blank cheque — it is, by design, the source from which any
+badged child can be derived.
 
-In practice this means: the un-tokened source cap on a server's endpoint lives
+In practice this means: the un-badged source cap on a server's endpoint lives
 exclusively in the server's own CSpace (used internally to mint per-client
-tokened copies) and in the CSpaces of trusted bootstrap-time minters (today: init,
+badged copies) and in the CSpaces of trusted bootstrap-time minters (today: init,
 which dies and is fully reclaimed at the end of Phase 3). Every other client
-receives a tokened cap whose token value is chosen by the trusted minter — the
-client cannot subsequently re-tokenize it because of the set-once rule above.
+receives a badged cap whose badge value is chosen by the trusted minter — the
+client cannot subsequently re-badgeize it because of the set-once rule above.
 
-Trying to harden a public authority-bearing token value by making it "hard to
+Trying to harden a public authority-bearing badge value by making it "hard to
 guess" (long random sentinel, etc.) is obscurity, not security: the same cap_derive
 chain that would produce the well-known constant can produce any other u64.
-Security comes from controlling *who holds an un-tokened cap*, not from secrecy
-of the token bits.
+Security comes from controlling *who holds an un-badged cap*, not from secrecy
+of the badge bits.
 
 ### Verb-bit authority pattern
 
 Endpoints that serve a mix of unprivileged and privileged labels gate
-the privileged labels on a verb-bit in the caller's token, rather than
+the privileged labels on a verb-bit in the caller's badge, rather than
 splitting across separate endpoints. By convention the high bit
-(`1u64 << 63`) is the first verb-bit. The set-once token rules above
+(`1u64 << 63`) is the first verb-bit. The set-once badge rules above
 mean only the server and its trusted bootstrap-time minters can set
 the verb-bit; a holder of an unprivileged cap cannot re-derive an
 authority cap. The server's dispatcher checks
-`msg.token & VERB_BIT != 0` before servicing the privileged label and
+`msg.badge & VERB_BIT != 0` before servicing the privileged label and
 replies `UNAUTHORIZED` otherwise.
 
 ---
 
 ## Capabilities as Namespaces
 
-The capability and token primitives above compose into Seraph's
+The capability and badge primitives above compose into Seraph's
 filesystem namespace mechanism (node capabilities, attenuation through
 rights bits, sandboxing by cap distribution) without any kernel support
 beyond what this document specifies. The full model is in

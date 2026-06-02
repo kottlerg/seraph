@@ -315,8 +315,8 @@ pub const SYS_MMIO_SPLIT: u64 = 45;
 pub const SYS_THREAD_SLEEP: u64 = 46;
 /// Bind a death notification `EventQueue` to a thread.
 pub const SYS_THREAD_BIND_NOTIFICATION: u64 = 47;
-/// Capability: derive with an attached token value.
-pub const SYS_CAP_DERIVE_TOKEN: u64 = 48;
+/// Capability: derive with an attached badge value.
+pub const SYS_CAP_DERIVE_BADGE: u64 = 48;
 /// Split an `Interrupt` range cap into two non-overlapping children.
 pub const SYS_IRQ_SPLIT: u64 = 49;
 /// Merge two adjacent sibling Frame caps into one covering both ranges.

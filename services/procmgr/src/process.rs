@@ -26,33 +26,33 @@ const CHILD_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 /// Max file data bytes per VFS read IPC. Word 0 = `bytes_read`, words 1..63 = data.
 const VFS_CHUNK_SIZE: u64 = 63 * 8; // 504 bytes
 
-/// Next token value (monotonically increasing, never zero). Starts at
-/// `LOG_TOKEN_FIRST_CHILD` so per-child log tokens never collide with
-/// the reserved system-special tokens (init=1, procmgr=2, 3..15
-/// reserved). The same value is procmgr's process token, memmgr's
-/// per-process ledger key, the tokened SEND-cap token on the log
+/// Next badge value (monotonically increasing, never zero). Starts at
+/// `LOG_BADGE_FIRST_CHILD` so per-child log badges never collide with
+/// the reserved system-special badges (init=1, procmgr=2, 3..15
+/// reserved). The same value is procmgr's process badge, memmgr's
+/// per-process ledger key, the badged SEND-cap badge on the log
 /// endpoint, and procmgr's death-EQ correlator — one u64, four roles.
-static NEXT_TOKEN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(ipc::log_tokens::LOG_TOKEN_FIRST_CHILD);
+static NEXT_BADGE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(ipc::log_badges::LOG_BADGE_FIRST_CHILD);
 
-/// Reserve the next process token. Single allocation point so the
+/// Reserve the next process badge. Single allocation point so the
 /// value can be threaded to `populate_child_info` (writes it into
-/// `pi.log_send_cap`'s tokened SEND derivation) AND `finalize_creation`
+/// `pi.log_send_cap`'s badged SEND derivation) AND `finalize_creation`
 /// (uses it as the table key, death-EQ correlator, and process-handle
-/// token).
+/// badge).
 ///
-/// Skips tokens whose lower 32 bits would collide with reserved
+/// Skips badges whose lower 32 bits would collide with reserved
 /// death-EQ correlators (currently `INIT_REAP_CORRELATOR = u32::MAX`).
 /// The death-EQ binding API takes a `u32` correlator while process
-/// tokens are `u64`; without this guard the truncated correlator
+/// badges are `u64`; without this guard the truncated correlator
 /// could match the reserved value at u32 wrap (~4.3B spawns) and
 /// the matching child's death would be silently absorbed by the
 /// init-reap branch in `dispatch_death`.
-fn next_process_token() -> u64
+fn next_process_badge() -> u64
 {
     loop
     {
-        let t = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = NEXT_BADGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if (t as u32) != ipc::procmgr_labels::INIT_REAP_CORRELATOR
         {
             return t;
@@ -81,7 +81,7 @@ pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 ///
 /// First-wins semantics: returns `false` (and changes nothing) if a
 /// previous registration already filled the slot. This mitigates the
-/// pre-existing `sys_cap_derive_token` weakness in which any holder of
+/// pre-existing `sys_cap_derive_badge` weakness in which any holder of
 /// a `SEND_GRANT` cap on procmgr's endpoint can mint
 /// `DEATH_EQ_AUTHORITY` and hijack logd's death stream — since logd
 /// registers at startup before any other user process is spawned, a
@@ -113,12 +113,12 @@ pub fn install_logd_death_eq(table: &mut ProcessTable, logd_eq: u32) -> bool
     // forward; only the pre-existing table is subject to this.
     LOGD_DEATH_EQ.store(logd_eq, std::sync::atomic::Ordering::Release);
     table.for_each(|entry| {
-        let correlator = entry.token as u32;
+        let correlator = entry.badge as u32;
         if syscall::thread_bind_notification(entry.thread_cap, logd_eq, correlator).is_err()
         {
             std::os::seraph::log!(
-                "install_logd_death_eq: bind failed for entry token={} (logd will miss its death event; procmgr observer unaffected)",
-                entry.token,
+                "install_logd_death_eq: bind failed for entry badge={} (logd will miss its death event; procmgr observer unaffected)",
+                entry.badge,
             );
         }
     });
@@ -150,20 +150,20 @@ pub const MAX_PROCESSES: usize = 32;
 #[allow(dead_code)]
 pub struct ProcessEntry
 {
-    token: u64,
+    badge: u64,
     aspace_cap: u32,
     cspace_cap: u32,
     thread_cap: u32,
     pi_frame_cap: u32,
     tls_frame_cap: u32,
-    /// Slot in procmgr's `CSpace` of the tokened SEND cap on memmgr's
+    /// Slot in procmgr's `CSpace` of the badged SEND cap on memmgr's
     /// endpoint that procmgr minted via `REGISTER_PROCESS` for this child.
     /// Held until `PROCESS_DIED`. Zero when memmgr was unwired at create
     /// time (early-boot regression path).
     memmgr_send_cap: u32,
-    /// Memmgr-side process token for this child. Sent in the
+    /// Memmgr-side process badge for this child. Sent in the
     /// `PROCESS_DIED` payload so memmgr can reclaim the right record.
-    memmgr_token: u64,
+    memmgr_badge: u64,
     /// Per-process system-root cap installed by
     /// [`ProcessTable::configure_namespace`]. Zero means the child
     /// runs with no namespace authority (`ProcessInfo.system_root_cap`
@@ -187,16 +187,16 @@ pub struct ProcessEntry
 
 impl ProcessEntry
 {
-    pub fn token(&self) -> u64
+    pub fn badge(&self) -> u64
     {
-        self.token
+        self.badge
     }
 }
 
 /// Ring of recently auto-reaped processes, queried on `QUERY_PROCESS`
 /// table miss to distinguish "exited recently" from "never existed".
 /// Best-effort retention: oldest entries are overwritten as new ones
-/// arrive; queries on rotated-out tokens return `None`.
+/// arrive; queries on rotated-out badges return `None`.
 #[derive(Clone, Copy)]
 pub struct RecentExits
 {
@@ -207,7 +207,7 @@ pub struct RecentExits
 #[derive(Clone, Copy)]
 struct RecentExit
 {
-    token: u64,
+    badge: u64,
     exit_reason: u64,
 }
 
@@ -223,18 +223,18 @@ impl RecentExits
         }
     }
 
-    pub fn record(&mut self, token: u64, exit_reason: u64)
+    pub fn record(&mut self, badge: u64, exit_reason: u64)
     {
-        self.ring[self.head] = Some(RecentExit { token, exit_reason });
+        self.ring[self.head] = Some(RecentExit { badge, exit_reason });
         self.head = (self.head + 1) % RECENT_EXITS_SLOTS;
     }
 
-    pub fn find(&self, token: u64) -> Option<u64>
+    pub fn find(&self, badge: u64) -> Option<u64>
     {
         self.ring
             .iter()
             .filter_map(|s| s.as_ref())
-            .find(|e| e.token == token)
+            .find(|e| e.badge == badge)
             .map(|e| e.exit_reason)
     }
 }
@@ -267,20 +267,20 @@ impl ProcessTable
         false
     }
 
-    fn find_mut_by_token(&mut self, token: u64) -> Option<&mut ProcessEntry>
+    fn find_mut_by_badge(&mut self, badge: u64) -> Option<&mut ProcessEntry>
     {
         self.entries
             .iter_mut()
             .filter_map(|s| s.as_mut())
-            .find(|e| e.token == token)
+            .find(|e| e.badge == badge)
     }
 
-    fn take_by_token(&mut self, token: u64) -> Option<ProcessEntry>
+    fn take_by_badge(&mut self, badge: u64) -> Option<ProcessEntry>
     {
         for slot in &mut self.entries
         {
             if let Some(entry) = slot.as_ref()
-                && entry.token == token
+                && entry.badge == badge
             {
                 return slot.take();
             }
@@ -288,7 +288,7 @@ impl ProcessTable
         None
     }
 
-    /// Remove and return the entry whose token matches `correlator` in its
+    /// Remove and return the entry whose badge matches `correlator` in its
     /// low 32 bits. Used by the auto-reap dispatch to resolve a death event
     /// back to its process. Stale correlators (entry already reaped)
     /// return `None`; callers drop such events silently.
@@ -297,7 +297,7 @@ impl ProcessTable
         for slot in &mut self.entries
         {
             if let Some(entry) = slot.as_ref()
-                && (entry.token as u32) == correlator
+                && (entry.badge as u32) == correlator
             {
                 return slot.take();
             }
@@ -321,22 +321,22 @@ impl ProcessTable
 
     /// Lightweight status lookup for `QUERY_PROCESS`. Returns
     /// `(started, thread_cap)` when an entry is present; `None` if the
-    /// token is unknown (already reaped or never existed).
+    /// badge is unknown (already reaped or never existed).
     ///
     /// `thread_cap` is procmgr's `CSpace` slot for the child's main thread,
     /// suitable for `cap_info`'s `CAP_INFO_THREAD_STATE` selector to
     /// fetch the kernel-authoritative lifecycle snapshot.
-    pub fn query_by_token(&self, token: u64) -> Option<(bool, u32)>
+    pub fn query_by_badge(&self, badge: u64) -> Option<(bool, u32)>
     {
         self.entries
             .iter()
             .filter_map(|s| s.as_ref())
-            .find(|e| e.token == token)
+            .find(|e| e.badge == badge)
             .map(|e| (e.started, e.thread_cap))
     }
 
     /// Install one direction's shmem pipe on a suspended child
-    /// identified by `token`.
+    /// identified by `badge`.
     ///
     /// `direction` is one of `ipc::procmgr_labels::PIPE_DIR_STDIN`,
     /// `PIPE_DIR_STDOUT`, `PIPE_DIR_STDERR`. The three caps are
@@ -353,14 +353,14 @@ impl ProcessTable
     /// independent.
     ///
     /// # Errors
-    /// - `procmgr_errors::INVALID_TOKEN` — no entry for `token`.
+    /// - `procmgr_errors::INVALID_BADGE` — no entry for `badge`.
     /// - `procmgr_errors::ALREADY_STARTED` — target is already running.
     /// - `procmgr_errors::INVALID_ARGUMENT` — bad direction selector or
     ///   any cap is zero.
     /// - `procmgr_errors::OUT_OF_MEMORY` — mapping / `cap_copy` failure.
     pub fn configure_pipe(
         &mut self,
-        token: u64,
+        badge: u64,
         self_aspace: u32,
         direction: u64,
         frame: u32,
@@ -373,8 +373,8 @@ impl ProcessTable
             return Err(procmgr_errors::INVALID_ARGUMENT);
         }
         let entry = self
-            .find_mut_by_token(token)
-            .ok_or(procmgr_errors::INVALID_TOKEN)?;
+            .find_mut_by_badge(badge)
+            .ok_or(procmgr_errors::INVALID_BADGE)?;
         if entry.started
         {
             return Err(procmgr_errors::ALREADY_STARTED);
@@ -434,12 +434,12 @@ impl ProcessTable
     /// side before being replaced.
     ///
     /// # Errors
-    /// - `procmgr_errors::INVALID_TOKEN` — no entry for `token` (caps dropped).
+    /// - `procmgr_errors::INVALID_BADGE` — no entry for `badge` (caps dropped).
     /// - `procmgr_errors::ALREADY_STARTED` — target is already running (caps dropped).
     /// - `procmgr_errors::INVALID_ARGUMENT` — `root_cap` is zero.
     pub fn configure_namespace(
         &mut self,
-        token: u64,
+        badge: u64,
         root_cap: u32,
         cwd_cap: u32,
     ) -> Result<(), u64>
@@ -452,7 +452,7 @@ impl ProcessTable
             }
             return Err(procmgr_errors::INVALID_ARGUMENT);
         }
-        let Some(entry) = self.find_mut_by_token(token)
+        let Some(entry) = self.find_mut_by_badge(badge)
         else
         {
             let _ = syscall::cap_delete(root_cap);
@@ -460,7 +460,7 @@ impl ProcessTable
             {
                 let _ = syscall::cap_delete(cwd_cap);
             }
-            return Err(procmgr_errors::INVALID_TOKEN);
+            return Err(procmgr_errors::INVALID_BADGE);
         };
         if entry.started
         {
@@ -490,7 +490,7 @@ impl ProcessTable
 /// Result of a successful process creation call.
 pub struct CreateResult
 {
-    /// Tokened endpoint cap for the caller to use with `START_PROCESS`.
+    /// Badged endpoint cap for the caller to use with `START_PROCESS`.
     pub process_handle: u32,
     /// Derived Thread cap to transfer to caller (CONTROL right).
     pub thread_for_caller: u32,
@@ -502,13 +502,13 @@ pub struct CreateResult
 ///
 /// Procmgr's own service endpoint plus the log-cap derivation source.
 ///
-/// The child receives a tokened SEND copy of `procmgr_endpoint` so it
+/// The child receives a badged SEND copy of `procmgr_endpoint` so it
 /// can call `REQUEST_FRAMES` / `CREATE_PROCESS`, and a
-/// freshly-derived tokened SEND cap on the log endpoint (token = the
-/// child's process token) so `seraph::log!` writes go directly to logd
+/// freshly-derived badged SEND cap on the log endpoint (badge = the
+/// child's process badge) so `seraph::log!` writes go directly to logd
 /// with the kernel-attached identity. `log_send_source` is procmgr's
-/// un-tokened SEND cap on the log endpoint, used as the source for
-/// each per-child `cap_derive_token`.
+/// un-badged SEND cap on the log endpoint, used as the source for
+/// each per-child `cap_derive_badge`.
 ///
 /// Stdio caps (stdin, stdout, stderr) are intentionally NOT part of this
 /// struct: they are not a universal property of processes, and each can
@@ -519,15 +519,15 @@ pub struct CreateResult
 pub struct UniversalCaps
 {
     pub procmgr_endpoint: u32,
-    /// Un-tokened SEND cap on the system log endpoint, sourced from
+    /// Un-badged SEND cap on the system log endpoint, sourced from
     /// the slot procmgr received during init bootstrap. Used as the
-    /// `cap_derive_token` source for minting a tokened SEND per child
-    /// (token = child's process token). Zero when procmgr has no log
+    /// `cap_derive_badge` source for minting a badged SEND per child
+    /// (badge = child's process badge). Zero when procmgr has no log
     /// endpoint (e.g. a future no-log boot mode); children born in
     /// that case receive zero in `pi.log_send_cap` and silent-drop
     /// `seraph::log!`.
     pub log_send_source: u32,
-    /// Tokened SEND cap on memmgr's service endpoint, freshly minted by
+    /// Badged SEND cap on memmgr's service endpoint, freshly minted by
     /// `memmgr_labels::REGISTER_PROCESS` for this child. The cap lives in
     /// procmgr's `CSpace` on entry; `populate_child_info` copies it into
     /// the child's `CSpace` and records the destination slot in
@@ -535,14 +535,14 @@ pub struct UniversalCaps
     /// reachable (procmgr itself, init); the child's heap-bootstrap then
     /// no-ops and the child cannot allocate.
     pub memmgr_endpoint: u32,
-    /// Memmgr-side process token paired with `memmgr_endpoint`. Sent in
+    /// Memmgr-side process badge paired with `memmgr_endpoint`. Sent in
     /// `memmgr_labels::PROCESS_DIED` at child teardown so memmgr can
     /// reclaim the right ledger entry. Zero when memmgr is not wired.
-    pub memmgr_token: u64,
-    /// Un-tokened SEND cap on svcmgr's service endpoint, sourced from
+    pub memmgr_badge: u64,
+    /// Un-badged SEND cap on svcmgr's service endpoint, sourced from
     /// the slot procmgr received during init bootstrap. Used as the
-    /// `cap_derive_token` source for minting a per-child tokened SEND
-    /// (token = child's process token) attenuated to QUERY-only rights.
+    /// `cap_derive_badge` source for minting a per-child badged SEND
+    /// (badge = child's process badge) attenuated to QUERY-only rights.
     /// The minted cap is installed in `ProcessInfo.service_registry_cap`
     /// and is how every child resolves service names via
     /// `svcmgr_labels::QUERY_ENDPOINT`. Zero when svcmgr is not yet
@@ -633,7 +633,7 @@ fn populate_child_info(
     env: &ChildEnv<'_>,
     ipc_buf: *mut u64,
     stack_pages: u32,
-    process_token: u64,
+    process_badge: u64,
 ) -> Option<u32>
 {
     let pi_frame = crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)?;
@@ -653,7 +653,7 @@ fn populate_child_info(
     {
         // Preserve source rights: try ALL first (for services where
         // creator_endpoint doubles as a recv endpoint, e.g. fatfs service ep);
-        // fall back to SEND for tokened send caps used by the bootstrap protocol.
+        // fall back to SEND for badged send caps used by the bootstrap protocol.
         syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_ALL)
             .or_else(|_| syscall::cap_copy(creator_endpoint, child_cspace, syscall::RIGHTS_SEND))
             .ok()?
@@ -664,30 +664,30 @@ fn populate_child_info(
     };
 
     // procmgr's own service endpoint: install a SEND+GRANT copy
-    // tokened with the child's `process_token`. The token gives
+    // badged with the child's `process_badge`. The badge gives
     // procmgr's handlers a kernel-delivered identity for every IPC
     // the child makes (used today by no handler; available for
     // future per-child authorisation), but more importantly it
-    // locks the child OUT of `cap_derive_token` on this cap —
-    // `sys_cap_derive_token` rejects sources with `src_token != 0`,
+    // locks the child OUT of `cap_derive_badge` on this cap —
+    // `sys_cap_derive_badge` rejects sources with `src_badge != 0`,
     // so the child cannot mint a parallel cap with a privileged
-    // token value (`procmgr_labels::DEATH_EQ_AUTHORITY`, etc.). The
-    // un-tokened source cap stays exclusively in procmgr's own
-    // CSpace; init holds the only other un-tokened copy and reaps
+    // badge value (`procmgr_labels::DEATH_EQ_AUTHORITY`, etc.). The
+    // un-badged source cap stays exclusively in procmgr's own
+    // CSpace; init holds the only other un-badged copy and reaps
     // before any non-trusted process is spawned that could
     // theoretically exploit it. Zero when procmgr has no procmgr
     // above it — e.g. procmgr itself, when init populates its
     // `ProcessInfo`.
     let procmgr_ep_in_child = if universals.procmgr_endpoint != 0
     {
-        let tokened = syscall::cap_derive_token(
+        let badged = syscall::cap_derive_badge(
             universals.procmgr_endpoint,
             syscall::RIGHTS_SEND_GRANT,
-            process_token,
+            process_badge,
         )
         .ok()?;
-        let in_child = syscall::cap_copy(tokened, child_cspace, syscall::RIGHTS_SEND_GRANT).ok()?;
-        let _ = syscall::cap_delete(tokened);
+        let in_child = syscall::cap_copy(badged, child_cspace, syscall::RIGHTS_SEND_GRANT).ok()?;
+        let _ = syscall::cap_delete(badged);
         in_child
     }
     else
@@ -695,20 +695,20 @@ fn populate_child_info(
         0
     };
 
-    // Tokened SEND cap on the system log endpoint: derived from the
-    // procmgr-held un-tokened source cap with token = child's process
-    // token. Child's std `_start` installs it via
-    // `::log::install_tokened_cap`; `seraph::log!` writes ride it
+    // Badged SEND cap on the system log endpoint: derived from the
+    // procmgr-held un-badged source cap with badge = child's process
+    // badge. Child's std `_start` installs it via
+    // `::log::install_badged_cap`; `seraph::log!` writes ride it
     // directly with no discovery roundtrip. Logd attributes the
-    // writes by the kernel-delivered token, which equals procmgr's
-    // process token, which equals the death-EQ correlator —
+    // writes by the kernel-delivered badge, which equals procmgr's
+    // process badge, which equals the death-EQ correlator —
     // self-reconciliation across the three views.
     let log_send_in_child = if universals.log_send_source != 0
     {
-        let proc_side = syscall::cap_derive_token(
+        let proc_side = syscall::cap_derive_badge(
             universals.log_send_source,
             syscall::RIGHTS_SEND,
-            process_token,
+            process_badge,
         )
         .ok()?;
         let child_side = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_SEND).ok()?;
@@ -721,17 +721,17 @@ fn populate_child_info(
     };
 
     // Mirror of the log_send derivation, for the system-wide service-
-    // discovery handle. The token carries only the child's process token
+    // discovery handle. The badge carries only the child's process badge
     // — without `svcmgr_labels::PUBLISH_AUTHORITY` — so the cap answers
     // QUERY_ENDPOINT only; svcmgr rejects PUBLISH_ENDPOINT calls whose
-    // token lacks the verb-bit with `UNAUTHORIZED`. See
+    // badge lacks the verb-bit with `UNAUTHORIZED`. See
     // `docs/capability-model.md` "verb-bit authority pattern".
     let registry_send_in_child = if universals.registry_send_source != 0
     {
-        let proc_side = syscall::cap_derive_token(
+        let proc_side = syscall::cap_derive_badge(
             universals.registry_send_source,
             syscall::RIGHTS_SEND,
-            process_token,
+            process_badge,
         )
         .ok()?;
         let Ok(child_side) = syscall::cap_copy(proc_side, child_cspace, syscall::RIGHTS_SEND)
@@ -768,18 +768,18 @@ fn populate_child_info(
     {
         // Plain `cap_copy` here is structurally safe — and
         // intentionally asymmetric with the
-        // `cap_derive_token(..., process_token)` shape used for
+        // `cap_derive_badge(..., process_badge)` shape used for
         // `procmgr_endpoint_cap` just above. The reason:
-        // `universals.memmgr_endpoint` is the per-child tokened cap
+        // `universals.memmgr_endpoint` is the per-child badged cap
         // memmgr minted in its `REGISTER_PROCESS` handler at
         // `services/memmgr/src/main.rs:781`
-        // (`cap_derive_token(service_ep, SEND_GRANT, new_token)`),
+        // (`cap_derive_badge(service_ep, SEND_GRANT, new_badge)`),
         // returned via IPC in `register_with_memmgr`
         // (`services/procmgr/src/main.rs:222-244`). The source is
-        // already kernel-tokened with a memmgr-private per-child
-        // value; `cap_copy` propagates the token to the child slot.
-        // Children therefore cannot `sys_cap_derive_token` to mint a
-        // privileged twin on memmgr's endpoint (the `src_token != 0`
+        // already kernel-badged with a memmgr-private per-child
+        // value; `cap_copy` propagates the badge to the child slot.
+        // Children therefore cannot `sys_cap_derive_badge` to mint a
+        // privileged twin on memmgr's endpoint (the `src_badge != 0`
         // rejection applies). SEND_GRANT lets the child grant onward;
         // no current protocol uses that, mirrored shape with
         // `procmgr_endpoint_cap`.
@@ -1140,21 +1140,21 @@ fn finalize_creation(
     self_endpoint: u32,
     death_eq: u32,
     memmgr_send_cap: u32,
-    memmgr_token: u64,
-    process_token: u64,
+    memmgr_badge: u64,
+    process_badge: u64,
 ) -> Option<CreateResult>
 {
-    let token = process_token;
+    let badge = process_badge;
 
     // Bind procmgr's shared death queue as an observer on the child's
-    // main thread. Correlator = low 32 bits of the table token; on death,
+    // main thread. Correlator = low 32 bits of the table badge; on death,
     // dispatch_death recovers the entry via `take_by_correlator`.
-    let correlator = token as u32;
+    let correlator = badge as u32;
     syscall::thread_bind_notification(child_thread, death_eq, correlator).ok()?;
 
     // If logd has registered its own death EQ via REGISTER_DEATH_EQ,
     // bind it as a second observer with the same correlator (logd's
-    // slot map is keyed by process_token, which equals this token).
+    // slot map is keyed by process_badge, which equals this badge).
     // Children spawned before logd registers are bound retroactively
     // by `install_logd_death_eq`.
     let logd_eq = LOGD_DEATH_EQ.load(std::sync::atomic::Ordering::Acquire);
@@ -1163,10 +1163,10 @@ fn finalize_creation(
         let _ = syscall::thread_bind_notification(child_thread, logd_eq, correlator);
     }
 
-    // Derive a tokened endpoint cap for the caller. The token identifies this
+    // Derive a badged endpoint cap for the caller. The badge identifies this
     // process on subsequent START_PROCESS / REQUEST_FRAMES calls.
     let process_handle =
-        syscall::cap_derive_token(self_endpoint, syscall::RIGHTS_SEND_GRANT, token).ok()?;
+        syscall::cap_derive_badge(self_endpoint, syscall::RIGHTS_SEND_GRANT, badge).ok()?;
     let Ok(thread_for_caller) = syscall::cap_derive(child_thread, syscall::RIGHTS_THREAD)
     else
     {
@@ -1175,14 +1175,14 @@ fn finalize_creation(
     };
 
     if !table.insert(ProcessEntry {
-        token,
+        badge,
         aspace_cap: child_aspace,
         cspace_cap: child_cspace,
         thread_cap: child_thread,
         pi_frame_cap,
         tls_frame_cap: main_tls.frame_cap,
         memmgr_send_cap,
-        memmgr_token,
+        memmgr_badge,
         namespace_override: 0,
         cwd_override: 0,
         entry_point,
@@ -1321,7 +1321,7 @@ fn create_process_from_bytes(
         MainTls::default()
     };
 
-    let process_token = next_process_token();
+    let process_badge = next_process_badge();
     let pi_frame_cap = populate_child_info(
         self_aspace,
         child_aspace,
@@ -1334,7 +1334,7 @@ fn create_process_from_bytes(
         env,
         ipc_buf,
         stack_pages,
-        process_token,
+        process_badge,
     )?;
     map_child_stack_and_ipc(child_aspace, child_memmgr_send, ipc_buf, stack_pages)?;
 
@@ -1349,8 +1349,8 @@ fn create_process_from_bytes(
         self_endpoint,
         death_eq,
         child_memmgr_send,
-        universals.memmgr_token,
-        process_token,
+        universals.memmgr_badge,
+        process_badge,
     )
 }
 
@@ -1544,19 +1544,19 @@ impl Drop for FileCapGuard
     }
 }
 
-/// Holds a child-billed memmgr SEND cap and its memmgr-side token. The pair
+/// Holds a child-billed memmgr SEND cap and its memmgr-side badge. The pair
 /// is moved into `UniversalCaps` and then into the `ProcessEntry` on success.
 struct MemmgrSendGuard
 {
     cap: u32,
-    token: u64,
+    badge: u64,
 }
 
 impl MemmgrSendGuard
 {
-    fn new(cap: u32, token: u64) -> Self
+    fn new(cap: u32, badge: u64) -> Self
     {
-        Self { cap, token }
+        Self { cap, badge }
     }
 
     fn cap(&self) -> u32
@@ -1564,16 +1564,16 @@ impl MemmgrSendGuard
         self.cap
     }
 
-    fn token(&self) -> u64
+    fn badge(&self) -> u64
     {
-        self.token
+        self.badge
     }
 
     fn disarm(mut self) -> (u32, u64)
     {
-        let p = (self.cap, self.token);
+        let p = (self.cap, self.badge);
         self.cap = 0;
-        self.token = 0;
+        self.badge = 0;
         p
     }
 }
@@ -1696,7 +1696,7 @@ impl Drop for CapGuard
 
 /// Everything `load_elf_page_streaming` needs beyond the per-page arguments:
 /// the VFS file handle, IPC buffer, parent/child address spaces, and the
-/// child's tokened SEND on memmgr (so frames are billed to the child).
+/// child's badged SEND on memmgr (so frames are billed to the child).
 pub struct ElfLoadCtx
 {
     pub file_cap: u32,
@@ -1900,12 +1900,12 @@ pub fn create_process_from_file(
         return Err(procmgr_errors::INVALID_ELF);
     }
 
-    // Mint a fresh tokened SEND on memmgr's endpoint for this child up
+    // Mint a fresh badged SEND on memmgr's endpoint for this child up
     // front; the header scratch frame, the per-segment frames, and all
     // subsequent allocations route through this cap so memmgr accounts
     // them to the child's record from the moment they leave the pool.
-    let (mms_cap, mms_token) = crate::register_with_memmgr(ctx.memmgr_ep, ipc_buf);
-    let mms = MemmgrSendGuard::new(mms_cap, mms_token);
+    let (mms_cap, mms_badge) = crate::register_with_memmgr(ctx.memmgr_ep, ipc_buf);
+    let mms = MemmgrSendGuard::new(mms_cap, mms_badge);
     if mms.cap() == 0
     {
         return Err(procmgr_errors::OUT_OF_MEMORY);
@@ -2121,10 +2121,10 @@ pub fn create_process_from_file(
         procmgr_endpoint: ctx.self_endpoint,
         log_send_source: ctx.log_ep,
         memmgr_endpoint: mms.cap(),
-        memmgr_token: mms.token(),
+        memmgr_badge: mms.badge(),
         registry_send_source: ctx.registry_ep,
     };
-    let process_token = next_process_token();
+    let process_badge = next_process_badge();
     let pi_frame_cap = populate_child_info(
         self_aspace,
         child_objs.aspace(),
@@ -2137,7 +2137,7 @@ pub fn create_process_from_file(
         env,
         ipc_buf,
         stack_pages,
-        process_token,
+        process_badge,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     let pi_frame_guard = CapGuard::new(pi_frame_cap);
@@ -2167,8 +2167,8 @@ pub fn create_process_from_file(
         self_endpoint,
         death_eq,
         mms.cap(),
-        mms.token(),
-        process_token,
+        mms.badge(),
+        process_badge,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY);
     if result.is_ok()
@@ -2205,7 +2205,7 @@ pub fn reap_by_correlator(
     teardown_entry(entry, memmgr_ep, ipc_buf);
 }
 
-/// Destroy a process identified by `token`.
+/// Destroy a process identified by `badge`.
 ///
 /// For each kernel object procmgr held on behalf of the child
 /// (`thread`, `aspace`, `cspace`, `ProcessInfo` frame) we first `cap_revoke`
@@ -2225,10 +2225,10 @@ pub fn reap_by_correlator(
 /// frees nothing to the sealed buddy; memmgr reclaims those pages into its
 /// pool via the process-death notification.
 ///
-/// Idempotent: returns silently if the token is unknown (already destroyed).
-pub fn destroy_process(token: u64, memmgr_ep: u32, ipc_buf: *mut u64, table: &mut ProcessTable)
+/// Idempotent: returns silently if the badge is unknown (already destroyed).
+pub fn destroy_process(badge: u64, memmgr_ep: u32, ipc_buf: *mut u64, table: &mut ProcessTable)
 {
-    let Some(entry) = table.take_by_token(token)
+    let Some(entry) = table.take_by_badge(badge)
     else
     {
         return;
@@ -2237,15 +2237,15 @@ pub fn destroy_process(token: u64, memmgr_ep: u32, ipc_buf: *mut u64, table: &mu
 }
 
 /// Notify memmgr that a process died. Memmgr returns every frame attributed
-/// to the process token to the free pool. Idempotent on memmgr's side.
-fn notify_memmgr_died(memmgr_ep: u32, memmgr_token: u64, ipc_buf: *mut u64)
+/// to the process badge to the free pool. Idempotent on memmgr's side.
+fn notify_memmgr_died(memmgr_ep: u32, memmgr_badge: u64, ipc_buf: *mut u64)
 {
-    if memmgr_ep == 0 || memmgr_token == 0
+    if memmgr_ep == 0 || memmgr_badge == 0
     {
         return;
     }
     let msg = IpcMessage::builder(memmgr_labels::PROCESS_DIED)
-        .word(0, memmgr_token)
+        .word(0, memmgr_badge)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
@@ -2296,8 +2296,8 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
     }
 
     // Notify memmgr to reclaim every frame attributed to this child's
-    // memmgr token, then drop procmgr's tokened SEND copy.
-    notify_memmgr_died(memmgr_ep, entry.memmgr_token, ipc_buf);
+    // memmgr badge, then drop procmgr's badged SEND copy.
+    notify_memmgr_died(memmgr_ep, entry.memmgr_badge, ipc_buf);
     if entry.memmgr_send_cap != 0
     {
         let _ = syscall::cap_delete(entry.memmgr_send_cap);
@@ -2314,11 +2314,11 @@ pub fn teardown_entry(entry: ProcessEntry, memmgr_ep: u32, ipc_buf: *mut u64)
 /// namespace authority. `finalize_creation` already bound the child's
 /// main thread to procmgr's shared death queue, so this just configures
 /// the thread and kicks it.
-pub fn start_process(token: u64, table: &mut ProcessTable, self_aspace: u32) -> Result<(), u64>
+pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u32) -> Result<(), u64>
 {
     let entry = table
-        .find_mut_by_token(token)
-        .ok_or(procmgr_errors::INVALID_TOKEN)?;
+        .find_mut_by_badge(badge)
+        .ok_or(procmgr_errors::INVALID_BADGE)?;
 
     if entry.started
     {

@@ -11,7 +11,7 @@
 //! requests on init's bootstrap endpoint to deliver their per-service
 //! capability set.
 
-use crate::bootstrap::NEXT_BOOTSTRAP_TOKEN;
+use crate::bootstrap::NEXT_BOOTSTRAP_BADGE;
 use crate::idle_loop;
 use crate::logging::log;
 use crate::walk;
@@ -39,11 +39,11 @@ pub struct ServiceThreadCaps
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn derive_tokened_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
+fn derive_badged_creator(bootstrap_ep: u32) -> Option<(u32, u64)>
 {
-    let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let tokened = syscall::cap_derive_token(bootstrap_ep, syscall::RIGHTS_SEND, token).ok()?;
-    Some((tokened, token))
+    let badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
+    Some((badged, badge))
 }
 
 /// Issue `procmgr_labels::CONFIGURE_NAMESPACE` on a freshly-created
@@ -124,7 +124,7 @@ fn configure_child_namespace(
 }
 
 /// Tear down a partially-created child: send `DESTROY_PROCESS` over its
-/// tokened handle and release init's procmgr-side slot. Used by every
+/// badged handle and release init's procmgr-side slot. Used by every
 /// helper that reaches a failure between procmgr's CREATE and START.
 fn destroy_partial_child(process_handle: u32, ipc_buf: *mut u64)
 {
@@ -134,7 +134,7 @@ fn destroy_partial_child(process_handle: u32, ipc_buf: *mut u64)
     let _ = syscall::cap_delete(process_handle);
 }
 
-/// Start a process by calling `START_PROCESS` on its tokened process handle.
+/// Start a process by calling `START_PROCESS` on its badged process handle.
 fn start_process(process_handle: u32, ipc_buf: *mut u64, ok_msg: &str, fail_msg: &str) -> bool
 {
     let msg = IpcMessage::new(procmgr_labels::START_PROCESS);
@@ -157,7 +157,7 @@ fn start_process(process_handle: u32, ipc_buf: *mut u64, ok_msg: &str, fail_msg:
 /// Serve one bootstrap round from init to the named child.
 fn serve(
     bootstrap_ep: u32,
-    token: u64,
+    badge: u64,
     ipc_buf: *mut u64,
     done: bool,
     caps: &[u32],
@@ -166,7 +166,7 @@ fn serve(
 ) -> bool
 {
     // SAFETY: ipc_buf is caller's registered IPC buffer.
-    if unsafe { ipc::bootstrap::serve_round(bootstrap_ep, token, ipc_buf, done, caps, data) }
+    if unsafe { ipc::bootstrap::serve_round(bootstrap_ep, badge, ipc_buf, done, caps, data) }
         .is_err()
     {
         log(context);
@@ -350,13 +350,13 @@ pub fn create_devmgr_with_caps(
     let devmgr_frame_cap = crate::find_module_by_name(info, b"devmgr")?;
     let devmgr_module_copy = module_spawn_copy(devmgr_frame_cap)?;
 
-    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
+    let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
 
     // caps: [module, creator]. No stdio pipes — devmgr reaches the
     // system log via the discovery cap procmgr installs in ProcessInfo.
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
         .cap(devmgr_module_copy)
-        .cap(tokened_creator)
+        .cap(badged_creator)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
@@ -460,7 +460,7 @@ pub fn create_devmgr_with_caps(
     }
     if !serve(
         bootstrap_ep,
-        child_token,
+        child_badge,
         ipc_buf,
         false,
         &r1_caps[..r1_cap_count],
@@ -498,7 +498,7 @@ pub fn create_devmgr_with_caps(
 
         if !serve(
             bootstrap_ep,
-            child_token,
+            child_badge,
             ipc_buf,
             false,
             &caps[..batch_count],
@@ -534,7 +534,7 @@ pub fn create_devmgr_with_caps(
 
         if !serve(
             bootstrap_ep,
-            child_token,
+            child_badge,
             ipc_buf,
             false,
             &caps[..batch_count],
@@ -589,7 +589,7 @@ pub fn create_devmgr_with_caps(
             module_data[1] = n as u64;
             if !serve(
                 bootstrap_ep,
-                child_token,
+                child_badge,
                 ipc_buf,
                 false,
                 &module_caps[..n],
@@ -617,7 +617,7 @@ pub fn create_devmgr_with_caps(
         let sf = u64::from(fb.stride) | (u64::from(pf_disc) << 32);
         if !serve(
             bootstrap_ep,
-            child_token,
+            child_badge,
             ipc_buf,
             false,
             &[],
@@ -633,7 +633,7 @@ pub fn create_devmgr_with_caps(
     //
     // caps: [svcmgr_publish_cap, arch_shutdown_cap]. The SEND-rights cap
     // on svcmgr's service endpoint is stamped with the PUBLISH_AUTHORITY
-    // verb-bit in its token so devmgr can register service caps in
+    // verb-bit in its badge so devmgr can register service caps in
     // svcmgr's registry on init's behalf (today's only use is reserved
     // for future devmgr publications; the active publications — `timed`,
     // `rootfs.root`, `svcmgr`, `devmgr.registry` — are init-issued).
@@ -660,7 +660,7 @@ pub fn create_devmgr_with_caps(
         // RIGHTS_SEND_GRANT (not bare SEND): PUBLISH_ENDPOINT carries the
         // service's SEND cap in the message, and the IPC kernel requires the
         // GRANT bit on the caller's send-cap to transfer caps.
-        syscall::cap_derive_token(
+        syscall::cap_derive_badge(
             svcmgr_service_ep,
             syscall::RIGHTS_SEND_GRANT,
             ipc::svcmgr_labels::PUBLISH_AUTHORITY,
@@ -682,7 +682,7 @@ pub fn create_devmgr_with_caps(
         // but it WILL exit the round-receive loop.
         let _ = serve(
             bootstrap_ep,
-            child_token,
+            child_badge,
             ipc_buf,
             true,
             &[],
@@ -714,7 +714,7 @@ pub fn create_devmgr_with_caps(
 
     let _ = serve(
         bootstrap_ep,
-        child_token,
+        child_badge,
         ipc_buf,
         true,
         &bundle_caps[..bundle_cap_count],
@@ -746,11 +746,11 @@ pub fn create_vfsd_with_caps(
     let vfsd_frame_cap = crate::find_module_by_name(info, b"vfsd")?;
     let vfsd_module_copy = module_spawn_copy(vfsd_frame_cap)?;
 
-    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
+    let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
 
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
         .cap(vfsd_module_copy)
-        .cap(tokened_creator)
+        .cap(badged_creator)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
@@ -783,7 +783,7 @@ pub fn create_vfsd_with_caps(
     // tag its SEND with `REGISTRY_QUERY_AUTHORITY` so devmgr's
     // upstream gate admits the call. Future registry consumers
     // receive a copy without the bit and are rejected at devmgr.
-    let Ok(registry_copy) = syscall::cap_derive_token(
+    let Ok(registry_copy) = syscall::cap_derive_badge(
         spawn.registry_ep,
         syscall::RIGHTS_SEND,
         ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
@@ -807,7 +807,7 @@ pub fn create_vfsd_with_caps(
     // (log + procmgr auto-delivered via ProcessInfo.)
     if !serve(
         bootstrap_ep,
-        child_token,
+        child_badge,
         ipc_buf,
         false,
         &[service_copy, registry_copy],
@@ -827,7 +827,7 @@ pub fn create_vfsd_with_caps(
 
     let _ = serve(
         bootstrap_ep,
-        child_token,
+        child_badge,
         ipc_buf,
         true,
         &[fatfs_cap],
@@ -843,7 +843,7 @@ pub fn create_vfsd_with_caps(
 /// Create svcmgr from `/services/svcmgr` via `CREATE_FROM_FILE` and install
 /// init's seed system-root cap on the child via `CONFIGURE_NAMESPACE`.
 ///
-/// Returns `(process_handle, child_token)` on success.
+/// Returns `(process_handle, child_badge)` on success.
 pub fn create_svcmgr_from_file(
     procmgr_ep: u32,
     bootstrap_ep: u32,
@@ -854,12 +854,12 @@ pub fn create_svcmgr_from_file(
 {
     let walked = walk::walk_to_file(system_root_cap, b"/services/svcmgr", 0xFFFF, ipc_buf)?;
 
-    let (tokened_creator, child_token) = derive_tokened_creator(bootstrap_ep)?;
+    let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
 
     let msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
         .word(0, walked.size)
         .cap(walked.file_cap)
-        .cap(tokened_creator)
+        .cap(badged_creator)
         .build();
 
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -908,7 +908,7 @@ pub fn create_svcmgr_from_file(
         return None;
     }
 
-    Some((process_handle, child_token))
+    Some((process_handle, child_badge))
 }
 
 /// Round kinds for the svcmgr handover endowment, tagged in `data[0]`.
@@ -943,7 +943,7 @@ pub struct SvcmgrEndowment
     /// keeps the endpoint object alive across a logd crash so log senders are
     /// agnostic to which process holds the RECV.
     pub master_log_source: u32,
-    /// Reserved token-0 `SEND|GRANT` source on procmgr's service endpoint.
+    /// Reserved badge-0 `SEND|GRANT` source on procmgr's service endpoint.
     /// svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch
     /// (used by logd to register sender death-notifications for slot reclaim).
     pub procmgr_death_auth_source: u32,
@@ -955,7 +955,7 @@ pub struct SvcmgrEndowment
 /// Round 1 (`CAPS`) delivers svcmgr's service + bootstrap endpoints (full
 /// rights) and the publish-role source caps: a `SEND` on the root
 /// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
-/// a token-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
+/// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
 /// the `REGISTRY_QUERY_AUTHORITY` `devmgr.registry` publish cap and the
 /// `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it). An absent source
 /// cap rides as a zero slot, which svcmgr tolerates.
@@ -966,7 +966,7 @@ pub struct SvcmgrEndowment
 ///
 /// The terminal `LOGD_SOURCES` round delivers the two reserved caps svcmgr
 /// keeps to launch + supervise + restart real-logd: the master-log endpoint
-/// source and a token-0 procmgr `SEND|GRANT` source (see [`SvcmgrEndowment`]).
+/// source and a badge-0 procmgr `SEND|GRANT` source (see [`SvcmgrEndowment`]).
 ///
 /// Best-effort: a failed round logs and aborts the endowment; svcmgr then
 /// runs with whatever it received (the system is already non-viable if a
@@ -974,7 +974,7 @@ pub struct SvcmgrEndowment
 fn endow_svcmgr(
     bootstrap_ep: u32,
     process_handle: u32,
-    child_token: u64,
+    child_badge: u64,
     endow: &SvcmgrEndowment,
     thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
@@ -1002,7 +1002,7 @@ fn endow_svcmgr(
         log("phase 3: svcmgr bootstrap-ep derive failed");
         return;
     };
-    // rootfs.root SEND — token inherited from the root fs namespace cap.
+    // rootfs.root SEND — badge inherited from the root fs namespace cap.
     let rootfs_send = if endow.rootfs_root_cap != 0
     {
         syscall::cap_derive(endow.rootfs_root_cap, syscall::RIGHTS_SEND).unwrap_or(0)
@@ -1011,8 +1011,8 @@ fn endow_svcmgr(
     {
         0
     };
-    // devmgr-registry source: token-0 SEND|GRANT so svcmgr can mint the
-    // tokened query + drivers-dir caps. SEND|GRANT (not RIGHTS_ALL) is the
+    // devmgr-registry source: badge-0 SEND|GRANT so svcmgr can mint the
+    // badged query + drivers-dir caps. SEND|GRANT (not RIGHTS_ALL) is the
     // minimum — it withholds the RECV right on devmgr's registry endpoint.
     let devmgr_registry_src = if endow.devmgr_registry_ep != 0
     {
@@ -1039,7 +1039,7 @@ fn endow_svcmgr(
     // The LOGD_SOURCES round is always terminal, so no earlier round is.
     if !serve(
         bootstrap_ep,
-        child_token,
+        child_badge,
         ipc_buf,
         false,
         &[service_copy, boot_copy, rootfs_send, devmgr_registry_src],
@@ -1065,7 +1065,7 @@ fn endow_svcmgr(
         data[2..2 + nw].copy_from_slice(&name_words[..nw]);
         if !serve(
             bootstrap_ep,
-            child_token,
+            child_badge,
             ipc_buf,
             false,
             &[thread_cap],
@@ -1078,12 +1078,12 @@ fn endow_svcmgr(
     }
 
     // Terminal round (LOGD_SOURCES): the reserved master-log endpoint source
-    // and the token-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
+    // and the badge-0 procmgr `SEND|GRANT` source. svcmgr mints real-logd's
     // bootstrap caps from these on every (re)launch. A zero slot rides if a
     // source derive failed; svcmgr degrades (logd unlaunchable) but survives.
     let _ = serve(
         bootstrap_ep,
-        child_token,
+        child_badge,
         ipc_buf,
         true,
         &[endow.master_log_source, endow.procmgr_death_auth_source],
@@ -1124,7 +1124,7 @@ pub fn phase3_svcmgr_handover(
     let init_self_cspace = info.cspace_cap;
 
     // svcmgr's service endpoint is created in early init
-    // (before bootstrap_procmgr) so procmgr can receive an un-tokened
+    // (before bootstrap_procmgr) so procmgr can receive an un-badged
     // SEND on it in its bootstrap round and distribute query caps via
     // `ProcessInfo.service_registry_cap`. svcmgr's bootstrap endpoint
     // is local to this phase and stays created here.
@@ -1136,7 +1136,7 @@ pub fn phase3_svcmgr_handover(
     };
 
     log("phase 3: loading svcmgr from /services/svcmgr");
-    let Some((svcmgr_handle, svcmgr_token)) = create_svcmgr_from_file(
+    let Some((svcmgr_handle, svcmgr_badge)) = create_svcmgr_from_file(
         procmgr_ep,
         bootstrap_ep,
         system_root_cap,
@@ -1164,7 +1164,7 @@ pub fn phase3_svcmgr_handover(
     // (vfsd's synthetic root): vfsd self-mounts root, so there is no
     // per-mount fatfs cap to publish.
     let master_log_source = syscall::cap_derive(log_ep, syscall::RIGHTS_ALL).unwrap_or(0);
-    // Token-0 `SEND|GRANT` source on procmgr's service endpoint; svcmgr mints
+    // Badge-0 `SEND|GRANT` source on procmgr's service endpoint; svcmgr mints
     // logd's `DEATH_EQ_AUTHORITY` SEND from it. `GRANT` because logd's
     // death-EQ registration transfers a cap, which the IPC kernel gates on it.
     let procmgr_death_auth_source =
@@ -1180,7 +1180,7 @@ pub fn phase3_svcmgr_handover(
     endow_svcmgr(
         bootstrap_ep,
         svcmgr_handle,
-        svcmgr_token,
+        svcmgr_badge,
         &endowment,
         thread_caps,
         ipc_buf,

@@ -26,10 +26,10 @@ pub struct Message
 {
     /// Operation tag — caller-defined; not interpreted by the kernel.
     pub label: u64,
-    /// Token from the sender's endpoint capability slot. Zero if untokened.
+    /// Badge from the sender's endpoint capability slot. Zero if unbadged.
     /// Set by `sys_ipc_call` from the caller's endpoint cap; delivered to the
     /// receiver via the third return register of `ipc_recv`.
-    pub token: u64,
+    pub badge: u64,
     /// Inline data words.
     pub data: [u64; MSG_DATA_WORDS_MAX],
     /// Actual number of valid entries in `data` (`0..=MSG_DATA_WORDS_MAX`).
@@ -46,7 +46,7 @@ impl Default for Message
     {
         Self {
             label: 0,
-            token: 0,
+            badge: 0,
             data: [0u64; MSG_DATA_WORDS_MAX],
             data_count: 0,
             cap_slots: [0u32; MSG_CAP_SLOTS_MAX],

@@ -305,7 +305,7 @@ pub fn violates_wx(rights: Rights) -> bool
 ///       0     1  tag
 ///       1     3  pad   (aligns rights to offset 4)
 ///       4     4  rights
-///       8     8  token  (caller-identifying label; 0 = untokened)
+///       8     8  badge  (caller-identifying label; 0 = unbadged)
 ///      16     8  object (naturally 8-byte aligned at offset 16)
 ///      24    12  deriv_parent   (next_free index when tag == Null)
 ///      36    12  deriv_first_child
@@ -317,24 +317,24 @@ pub fn violates_wx(rights: Rights) -> bool
 /// Each `Option<SlotId>` derivation pointer is 12 bytes (3 × u32, niche on
 /// `index: NonZeroU32`). Without explicit `pad`, `#[repr(C)]` would insert 2
 /// bytes before `rights` (to satisfy 4-byte alignment) and 6 bytes before
-/// `token` (8-byte alignment); the 3-byte pad absorbs both gaps. The struct
-/// alignment is 8 (from `token` and `object`); 72 is already a multiple of 8
+/// `badge` (8-byte alignment); the 3-byte pad absorbs both gaps. The struct
+/// alignment is 8 (from `badge` and `object`); 72 is already a multiple of 8
 /// so no trailing pad is required.
 #[repr(C)]
 pub struct CapabilitySlot
 {
     /// Capability type; `Null` means the slot is empty.
     pub tag: CapTag,
-    /// Explicit padding: aligns `rights` to offset 4 and `token` to offset 8.
+    /// Explicit padding: aligns `rights` to offset 4 and `badge` to offset 8.
     pad: [u8; 3],
     /// Rights bitmask (type-specific).
     pub rights: Rights,
-    /// Caller-identifying token, set via `SYS_CAP_DERIVE_TOKEN`. Zero means
-    /// untokened. Immutable once set — re-tokening a capability that already
-    /// has a non-zero token returns an error. Inherited by derivation and copy.
-    /// For endpoint caps, the kernel delivers the token to the receiver on
+    /// Caller-identifying badge, set via `SYS_CAP_DERIVE_BADGE`. Zero means
+    /// unbadged. Immutable once set — re-badging a capability that already
+    /// has a non-zero badge returns an error. Inherited by derivation and copy.
+    /// For endpoint caps, the kernel delivers the badge to the receiver on
     /// `ipc_recv`.
-    pub token: u64,
+    pub badge: u64,
     /// Pointer to the kernel object (None when tag == Null).
     pub object: Option<NonNull<KernelObjectHeader>>,
     /// Derivation parent, or next-free index when tag == Null.
@@ -363,7 +363,7 @@ impl CapabilitySlot
             tag: CapTag::Null,
             pad: [0; 3],
             rights: Rights::NONE,
-            token: 0,
+            badge: 0,
             object: None,
             deriv_parent: None,
             deriv_first_child: None,
@@ -404,7 +404,7 @@ impl CapabilitySlot
         self.tag = CapTag::Null;
         self.pad = [0; 3];
         self.rights = Rights::NONE;
-        self.token = 0;
+        self.badge = 0;
         self.object = None;
         self.deriv_first_child = None;
         self.deriv_next_sibling = None;

@@ -35,7 +35,7 @@ use syscall::SyscallError;
 use syscall::{
     SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
     SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_SIGNAL, SYS_CAP_CREATE_THREAD,
-    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_TOKEN, SYS_CAP_INFO,
+    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
     SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT,
     SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV,
     SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT,
@@ -121,7 +121,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
         SYS_SBI_CALL => sbi::sys_sbi_call(tf),
         SYS_THREAD_SLEEP => sys_thread_sleep(tf),
         SYS_THREAD_BIND_NOTIFICATION => sys_thread_bind_notification(tf),
-        SYS_CAP_DERIVE_TOKEN => cap::sys_cap_derive_token(tf),
+        SYS_CAP_DERIVE_BADGE => cap::sys_cap_derive_badge(tf),
         SYS_CAP_INFO => cap::sys_cap_info(tf),
         _ => Err(SyscallError::UnknownSyscall),
     };

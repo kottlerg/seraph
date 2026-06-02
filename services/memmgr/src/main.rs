@@ -121,11 +121,11 @@ struct OwnedFrame
     phys_base: u64,
 }
 
-/// Process accounting record: token plus the list of frames memmgr has
+/// Process accounting record: badge plus the list of frames memmgr has
 /// issued to that process.
 struct ProcessRecord
 {
-    token: u64,
+    badge: u64,
     used: usize,
     frames: [Option<OwnedFrame>; MAX_PER_PROC],
 }
@@ -136,10 +136,10 @@ impl ProcessRecord
     // ProcessTable, so this initializer never lands on a runtime stack
     // frame. const-evaluated at static-init time.
     #[allow(clippy::large_stack_arrays)]
-    const fn new(token: u64) -> Self
+    const fn new(badge: u64) -> Self
     {
         Self {
-            token,
+            badge,
             used: 0,
             frames: [None; MAX_PER_PROC],
         }
@@ -321,7 +321,7 @@ impl FreePool
 }
 
 /// Process tracking table: dense array of records, indexed by an internal
-/// monotonically-incremented token (held externally as the procmgr-minted
+/// monotonically-incremented badge (held externally as the procmgr-minted
 /// process identity).
 struct ProcessTable
 {
@@ -341,25 +341,25 @@ impl ProcessTable
         }
     }
 
-    fn insert(&mut self, token: u64) -> Option<&mut ProcessRecord>
+    fn insert(&mut self, badge: u64) -> Option<&mut ProcessRecord>
     {
         for slot in &mut self.records
         {
             if slot.is_none()
             {
-                *slot = Some(ProcessRecord::new(token));
+                *slot = Some(ProcessRecord::new(badge));
                 return slot.as_mut();
             }
         }
         None
     }
 
-    fn find_mut(&mut self, token: u64) -> Option<&mut ProcessRecord>
+    fn find_mut(&mut self, badge: u64) -> Option<&mut ProcessRecord>
     {
         for slot in &mut self.records
         {
             if let Some(rec) = slot
-                && rec.token == token
+                && rec.badge == badge
             {
                 return slot.as_mut();
             }
@@ -367,12 +367,12 @@ impl ProcessTable
         None
     }
 
-    fn take(&mut self, token: u64) -> Option<ProcessRecord>
+    fn take(&mut self, badge: u64) -> Option<ProcessRecord>
     {
         for slot in &mut self.records
         {
             if let Some(rec) = slot
-                && rec.token == token
+                && rec.badge == badge
             {
                 return slot.take();
             }
@@ -381,9 +381,9 @@ impl ProcessTable
     }
 }
 
-/// Token counter for memmgr-minted process identities. Each
+/// Badge counter for memmgr-minted process identities. Each
 /// `REGISTER_PROCESS` call consumes one.
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_BADGE: AtomicU64 = AtomicU64::new(1);
 
 // Per-process tracking and the free pool live in statics so the ~150 KB of
 // per-process bookkeeping never lands on a syscall stack frame. memmgr is
@@ -424,16 +424,16 @@ fn table_mut() -> &'static mut ProcessTable
 /// `ipc::memmgr_bootstrap::MAX_FRAMES`.
 const BOOTSTRAP_MAX_FRAMES: usize = ipc::memmgr_bootstrap::MAX_FRAMES;
 
-/// Reserved process-table token for memmgr's own bootstrap-backing record.
-/// Out of range of every minted token (memmgr's `NEXT_TOKEN` and init's
-/// bootstrap tokens both start at 1), so no real caller can match it.
-const MEMMGR_SELF_TOKEN: u64 = u64::MAX;
+/// Reserved process-table badge for memmgr's own bootstrap-backing record.
+/// Out of range of every minted badge (memmgr's `NEXT_BADGE` and init's
+/// bootstrap badges both start at 1), so no real caller can match it.
+const MEMMGR_SELF_BADGE: u64 = u64::MAX;
 
-/// Reserved process-table token for init's orphaned bootstrap-backing record.
+/// Reserved process-table badge for init's orphaned bootstrap-backing record.
 /// init exits at reap, so no live process owns its arena; its pages stay
-/// parked and accounted here. Like `MEMMGR_SELF_TOKEN`, far out of minted-token
+/// parked and accounted here. Like `MEMMGR_SELF_BADGE`, far out of minted-badge
 /// range, so no real caller can match it.
-const INIT_SELF_TOKEN: u64 = u64::MAX - 1;
+const INIT_SELF_BADGE: u64 = u64::MAX - 1;
 
 /// Scratch VA in memmgr's address space for mapping the bootstrap
 /// phys-table frame. One page; mapped RO during `bootstrap_from_init`,
@@ -456,7 +456,7 @@ struct BootInUse
 struct InitBootstrap
 {
     service_ep: u32,
-    procmgr_token: u64,
+    procmgr_badge: u64,
     frame_base: u32,
     frame_count: u32,
     page_counts: [u32; BOOTSTRAP_MAX_FRAMES],
@@ -570,7 +570,7 @@ fn bootstrap_from_init(
 
     Some(InitBootstrap {
         service_ep: round.caps[0],
-        procmgr_token: round.data[2],
+        procmgr_badge: round.data[2],
         frame_base: round.data[0] as u32,
         frame_count,
         page_counts,
@@ -730,7 +730,7 @@ fn rollback_selection(
 
 fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    let token = req.token;
+    let badge = req.badge;
     let arg = req.word(0);
     let want_pages = (arg & 0xFFFF_FFFF) as u32;
     let flags = (arg >> 32) as u32;
@@ -742,7 +742,7 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
     }
 
     let pool = pool_mut();
-    let Some(record) = table_mut().find_mut(token)
+    let Some(record) = table_mut().find_mut(badge)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -844,9 +844,9 @@ fn handle_release_frames(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
-fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32, procmgr_token: u64)
+fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32, procmgr_badge: u64)
 {
-    if req.token != procmgr_token
+    if req.badge != procmgr_badge
     {
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
@@ -859,44 +859,44 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
     }
 
     let table = table_mut();
-    let new_token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let new_badge = NEXT_BADGE.fetch_add(1, Ordering::Relaxed);
 
-    if table.insert(new_token).is_none()
+    if table.insert(new_badge).is_none()
     {
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     }
 
-    let Ok(send_cap) = syscall::cap_derive_token(service_ep, syscall::RIGHTS_SEND_GRANT, new_token)
+    let Ok(send_cap) = syscall::cap_derive_badge(service_ep, syscall::RIGHTS_SEND_GRANT, new_badge)
     else
     {
         // Roll back the table insertion.
-        let _ = table.take(new_token);
+        let _ = table.take(new_badge);
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     };
 
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
-        .word(0, new_token)
+        .word(0, new_badge)
         .cap(send_cap)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
+fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 {
-    if req.token != procmgr_token
+    if req.badge != procmgr_badge
     {
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
     }
-    // The dead process's tokened SEND cap arrives in `caps[0]` (when the
-    // caller transfers it). The kernel does not surface the token of a
-    // transferred cap to the receiver — only the token of the
+    // The dead process's badged SEND cap arrives in `caps[0]` (when the
+    // caller transfers it). The kernel does not surface the badge of a
+    // transferred cap to the receiver — only the badge of the
     // receive-side cap — so procmgr also encodes the dead process's
-    // token in `data[0]` for memmgr's table lookup.
-    let dead_token = req.word(0);
+    // badge in `data[0]` for memmgr's table lookup.
+    let dead_badge = req.word(0);
 
     // Auto-reclaim invariant (documented, not asserted in-line):
     //
@@ -918,7 +918,7 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
     // `integration::retype_reclaim` covers the same invariant on a
     // dedicated source cap with no allocator residual.
     let pool = pool_mut();
-    if let Some(record) = table_mut().take(dead_token)
+    if let Some(record) = table_mut().take(dead_badge)
     {
         for frame in record.frames.iter().take(record.used).flatten()
         {
@@ -941,10 +941,10 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
         // allocation, though still owned and accounted).
         pool.coalesce();
     }
-    // Idempotent: missing token is not an error.
+    // Idempotent: missing badge is not an error.
 
     // Drop any caps the caller transferred (typically the dead process's
-    // tokened SEND cap, no longer useful).
+    // badged SEND cap, no longer useful).
     for &slot in req.caps()
     {
         let _ = syscall::cap_delete(slot);
@@ -1145,18 +1145,18 @@ fn ingest_in_use(boot: &InitBootstrap)
 {
     for entry in boot.in_use.iter().take(boot.in_use_count)
     {
-        let token = match entry.kind
+        let badge = match entry.kind
         {
-            ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR => MEMMGR_SELF_TOKEN,
-            ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR => boot.procmgr_token,
-            ipc::memmgr_bootstrap::IN_USE_KIND_INIT => INIT_SELF_TOKEN,
+            ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR => MEMMGR_SELF_BADGE,
+            ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR => boot.procmgr_badge,
+            ipc::memmgr_bootstrap::IN_USE_KIND_INIT => INIT_SELF_BADGE,
             _ => continue,
         };
         // Owned on ingest — count on ownership; the per-process record is
         // best-effort tracking (these arenas are immortal, never reclaimed), so
         // a record miss must not under-count `pool_total`.
         pool_total_add(u64::from(entry.page_count));
-        if let Some(record) = table_mut().find_mut(token)
+        if let Some(record) = table_mut().find_mut(badge)
         {
             let _ = record.push(OwnedFrame {
                 cap_slot: entry.cap_slot,
@@ -1181,11 +1181,11 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         }
         memmgr_labels::REGISTER_PROCESS =>
         {
-            handle_register_process(req, ipc_buf, boot.service_ep, boot.procmgr_token);
+            handle_register_process(req, ipc_buf, boot.service_ep, boot.procmgr_badge);
         }
         memmgr_labels::PROCESS_DIED =>
         {
-            handle_process_died(req, ipc_buf, boot.procmgr_token);
+            handle_process_died(req, ipc_buf, boot.procmgr_badge);
         }
         memmgr_labels::DONATE_FRAMES =>
         {
@@ -1222,20 +1222,20 @@ fn main(startup: &StartupInfo) -> !
     ingest_pool(&boot);
 
     // Auto-register procmgr's record so `REQUEST_FRAMES` against
-    // procmgr's tokened SEND succeeds — procmgr's own std heap-bootstrap
+    // procmgr's badged SEND succeeds — procmgr's own std heap-bootstrap
     // is the first IPC memmgr serves after entering the loop. The
-    // procmgr_token cap doubles as the auth gate for `REGISTER_PROCESS`
-    // and `PROCESS_DIED`; both code paths still check `req.token` against
-    // `boot.procmgr_token` independently of the table entry.
+    // procmgr_badge cap doubles as the auth gate for `REGISTER_PROCESS`
+    // and `PROCESS_DIED`; both code paths still check `req.badge` against
+    // `boot.procmgr_badge` independently of the table entry.
     //
     // Register memmgr-self and init-self records too: `ingest_in_use` files
     // memmgr's, procmgr's, and init's bootstrap arenas against them so every
     // arena's pages join `pool_total`. procmgr and memmgr never die; init exits
     // at reap but its arena stays parked, so none of these records is ever
     // reclaimed.
-    if table_mut().insert(boot.procmgr_token).is_none()
-        || table_mut().insert(MEMMGR_SELF_TOKEN).is_none()
-        || table_mut().insert(INIT_SELF_TOKEN).is_none()
+    if table_mut().insert(boot.procmgr_badge).is_none()
+        || table_mut().insert(MEMMGR_SELF_BADGE).is_none()
+        || table_mut().insert(INIT_SELF_BADGE).is_none()
     {
         // Process table full at boot — fatal; refuse to enter dispatch.
         syscall::thread_exit();

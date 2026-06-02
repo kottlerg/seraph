@@ -25,7 +25,7 @@
 //! caller's MOUNT. After the worker signals delivery, main sends a
 //! zero-payload `FS_MOUNT` to the new driver as a BPB-validation probe.
 //!
-//! The `partition_ep` passed in is a tokened SEND cap on virtio-blk's service
+//! The `partition_ep` passed in is a badged SEND cap on virtio-blk's service
 //! endpoint, already registered with virtio-blk against a specific LBA range.
 //! fatfs is never handed the whole-disk cap and cannot escape the partition
 //! regardless of what sector number it computes.
@@ -37,8 +37,8 @@ use ipc::{FS_LABELS_VERSION, IpcMessage, fs_labels, procmgr_labels};
 use crate::VfsdCaps;
 use crate::worker_pool::{BootstrapOrder, CreateFromFileOrder, WorkOrder, WorkerPool};
 
-/// Monotonic counter for fatfs-child bootstrap tokens.
-static NEXT_BOOTSTRAP_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// Monotonic counter for fatfs-child bootstrap badges.
+static NEXT_BOOTSTRAP_BADGE: AtomicU64 = AtomicU64::new(1);
 
 /// Spawn a fatfs driver instance for a partition and return its `SEND_GRANT`
 /// service endpoint. `module_cap` is non-zero only for the root mount; pass
@@ -62,33 +62,33 @@ pub fn spawn_fatfs_driver(
 
     // Create fatfs's service endpoint. fatfs receives service calls on
     // this; vfsd holds a SEND_GRANT copy for the FS_MOUNT BPB-validation
-    // probe and for `cap_derive_token`-ing the synthetic-root and
+    // probe and for `cap_derive_badge`-ing the synthetic-root and
     // caller-root caps in `do_mount`.
     let slab = std::os::seraph::object_slab_acquire(88)?;
     let driver_ep = syscall::cap_create_endpoint(slab).ok()?;
     let driver_ep_for_child = syscall::cap_derive(driver_ep, syscall::RIGHTS_ALL).ok()?;
     let driver_send = syscall::cap_derive(driver_ep, syscall::RIGHTS_SEND_GRANT).ok()?;
 
-    // Allocate a bootstrap token and a tokened SEND on the worker-owned
-    // bootstrap endpoint. The child receives the tokened cap as its
+    // Allocate a bootstrap badge and a badged SEND on the worker-owned
+    // bootstrap endpoint. The child receives the badged cap as its
     // `creator_endpoint` and uses it to fetch its caps via the bootstrap
-    // protocol; the bootstrap worker matches by token.
-    let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, Ordering::Relaxed);
-    let tokened_creator =
-        syscall::cap_derive_token(caps.bootstrap_ep, syscall::RIGHTS_SEND, token).ok()?;
+    // protocol; the bootstrap worker matches by badge.
+    let badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, Ordering::Relaxed);
+    let badged_creator =
+        syscall::cap_derive_badge(caps.bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
     let bootstrap = BootstrapOrder {
-        token,
+        badge,
         blk: partition_ep,
         service: driver_ep_for_child,
     };
 
     let spawn_ok = if module_cap != 0
     {
-        spawn_via_module(caps, pool, bootstrap, module_cap, tokened_creator, ipc_buf)
+        spawn_via_module(caps, pool, bootstrap, module_cap, badged_creator, ipc_buf)
     }
     else
     {
-        spawn_via_vfs(caps, pool, bootstrap, tokened_creator, system_root_cap)
+        spawn_via_vfs(caps, pool, bootstrap, badged_creator, system_root_cap)
     };
 
     if !spawn_ok
@@ -122,7 +122,7 @@ fn spawn_via_module(
     pool: &WorkerPool,
     bootstrap: BootstrapOrder,
     module_cap: u32,
-    tokened_creator: u32,
+    badged_creator: u32,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -136,13 +136,13 @@ fn spawn_via_module(
     else
     {
         let _ = syscall::cap_delete(module_copy);
-        let _ = syscall::cap_delete(tokened_creator);
+        let _ = syscall::cap_delete(badged_creator);
         return false;
     };
 
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
         .cap(module_copy)
-        .cap(tokened_creator)
+        .cap(badged_creator)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let Ok(create_reply) = (unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) })
@@ -197,7 +197,7 @@ fn spawn_via_vfs(
     caps: &VfsdCaps,
     pool: &WorkerPool,
     bootstrap: BootstrapOrder,
-    tokened_creator: u32,
+    badged_creator: u32,
     system_root_cap: u32,
 ) -> bool
 {
@@ -208,7 +208,7 @@ fn spawn_via_vfs(
             Err(e) =>
             {
                 std::os::seraph::log!("fatfs spawn: NS_LOOKUP /services/fs/fatfs failed: {e}");
-                let _ = syscall::cap_delete(tokened_creator);
+                let _ = syscall::cap_delete(badged_creator);
                 return false;
             }
         };
@@ -217,13 +217,13 @@ fn spawn_via_vfs(
         procmgr_ep: caps.procmgr_ep,
         file_cap,
         file_size,
-        tokened_creator,
+        badged_creator,
         bootstrap,
     }))
     else
     {
         let _ = syscall::cap_delete(file_cap);
-        let _ = syscall::cap_delete(tokened_creator);
+        let _ = syscall::cap_delete(badged_creator);
         return false;
     };
 

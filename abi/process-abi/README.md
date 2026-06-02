@@ -66,7 +66,7 @@ pub struct ProcessInfo {
     /// before the process starts.
     pub ipc_buffer_vaddr: u64,
 
-    /// CSpace slot of a tokened send cap to the creator's bootstrap
+    /// CSpace slot of a badged send cap to the creator's bootstrap
     /// endpoint.
     ///
     /// For processes created by procmgr directly, this points at procmgr's
@@ -81,18 +81,18 @@ pub struct ProcessInfo {
 
     // ── Universal service endpoints ─────────────────────────────────
 
-    /// CSpace slot of a tokened SEND cap on memmgr's service endpoint.
+    /// CSpace slot of a badged SEND cap on memmgr's service endpoint.
     ///
     /// Populated for every procmgr-spawned child. `std::os::seraph::
     /// _start` calls `memmgr_labels::REQUEST_FRAMES` on this cap to
     /// bootstrap the `System` allocator before the user's `fn main()`
-    /// runs. The tokened cap identifies this process to memmgr, so
+    /// runs. The badged cap identifies this process to memmgr, so
     /// memmgr accounts allocations against the correct per-process
     /// frame record. Zero for processes with no memmgr above them
     /// (init and memmgr itself).
     pub memmgr_endpoint_cap: u32,
 
-    /// CSpace slot of a tokened SEND cap on procmgr's service endpoint.
+    /// CSpace slot of a badged SEND cap on procmgr's service endpoint.
     ///
     /// Used for process-lifecycle queries (and any future
     /// procmgr-served operation that is not heap-bootstrap). Zero for
@@ -124,9 +124,9 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 | `self_thread_cap` | Thread capability (Control) |
 | `self_aspace_cap` | AddressSpace capability |
 | `self_cspace_cap` | CSpace capability |
-| `creator_endpoint_cap` | Tokened send cap back to the creator's bootstrap endpoint (if nonzero) |
-| `memmgr_endpoint_cap` | Tokened SEND cap on memmgr's service endpoint (if nonzero) |
-| `procmgr_endpoint_cap` | Tokened SEND cap on procmgr's service endpoint (if nonzero) |
+| `creator_endpoint_cap` | Badged send cap back to the creator's bootstrap endpoint (if nonzero) |
+| `memmgr_endpoint_cap` | Badged SEND cap on memmgr's service endpoint (if nonzero) |
+| `procmgr_endpoint_cap` | Badged SEND cap on procmgr's service endpoint (if nonzero) |
 | `log_endpoint_cap` | SEND cap on the system log endpoint (if nonzero) |
 
 ---
@@ -154,11 +154,11 @@ pub struct StartupInfo {
     /// CSpace slot of own CSpace capability.
     pub self_cspace: u32,
 
-    /// CSpace slot of a tokened SEND cap on memmgr's service endpoint.
+    /// CSpace slot of a badged SEND cap on memmgr's service endpoint.
     /// Zero when unreachable.
     pub memmgr_endpoint: u32,
 
-    /// CSpace slot of a tokened SEND cap on procmgr's service endpoint.
+    /// CSpace slot of a badged SEND cap on procmgr's service endpoint.
     /// Zero when unreachable.
     pub procmgr_endpoint: u32,
 

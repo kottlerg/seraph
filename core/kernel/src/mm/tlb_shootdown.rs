@@ -34,7 +34,7 @@
 //! different slots, so concurrent shootdowns — even on the same address space —
 //! proceed in parallel.
 //!
-//! # The acknowledgement bit is the liveness token
+//! # The acknowledgement bit is the liveness badge
 //!
 //! A target acts on a slot only when it observes its own bit set in that slot's
 //! `pending_cpus` (Acquire). The owning CPU sets those bits (Release) only after
@@ -90,7 +90,7 @@ struct TlbShootdownRequest
 
     /// CPUs that must still acknowledge this request. A set bit is both the
     /// "CPU N must flush" instruction and this request's per-target liveness
-    /// token (see module docs).
+    /// badge (see module docs).
     pending_cpus: AtomicCpuMask,
 }
 

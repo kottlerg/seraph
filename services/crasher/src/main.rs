@@ -12,7 +12,7 @@
 //! write) so svcmgr respawns it under `restart = always`. A surface that
 //! fails to round-trip (notably one dropped on restart) is logged with a
 //! `FATAL:` prefix, which run-parallel's fail regex catches and fails the
-//! run; the deliberate `USERSPACE FAULT` itself is not a fail token.
+//! run; the deliberate `USERSPACE FAULT` itself is not a fail badge.
 //!
 //! Capabilities: the bootstrap round delivers the recipe's two seeds —
 //! `caps[0]` = svcmgr service endpoint, `caps[1]` = pwrmgr deny twin —

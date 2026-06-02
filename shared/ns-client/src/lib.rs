@@ -5,7 +5,7 @@
 
 //! No-std namespace walk helpers.
 //!
-//! Any service holding a tokened SEND on a vfsd namespace endpoint (the
+//! Any service holding a badged SEND on a vfsd namespace endpoint (the
 //! seed cap obtained via `vfsd_labels::GET_SYSTEM_ROOT_CAP` for init, or
 //! a subtree cap delivered to a child service) can use these helpers to
 //!
@@ -30,7 +30,7 @@ use ipc::{IpcMessage, ns_labels};
 /// Result of [`walk_to_file`].
 pub struct WalkedFile
 {
-    /// Tokened SEND addressing the resolved file node. Caller owns and
+    /// Badged SEND addressing the resolved file node. Caller owns and
     /// must `cap_delete` when no longer needed.
     pub file_cap: u32,
     /// Size hint reported by the resolving `NS_LOOKUP`.

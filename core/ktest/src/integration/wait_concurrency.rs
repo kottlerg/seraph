@@ -5,13 +5,13 @@
 
 //! Integration: wait set with concurrent signal and event queue sources.
 //!
-//! Registers two sources in one wait set — a signal (token 1) and an event
-//! queue (token 2) — and verifies that the correct token is returned under
+//! Registers two sources in one wait set — a signal (badge 1) and an event
+//! queue (badge 2) — and verifies that the correct badge is returned under
 //! three distinct conditions:
 //!
-//!   A. Queue has a pre-posted entry → `wait_set_wait` returns immediately with token 2.
-//!   B. A child thread fires the signal while we block → returns token 1.
-//!   C. Signal removed; queue posted again → returns token 2 (only member remaining).
+//!   A. Queue has a pre-posted entry → `wait_set_wait` returns immediately with badge 2.
+//!   B. A child thread fires the signal while we block → returns badge 1.
+//!   C. Signal removed; queue posted again → returns badge 2 (only member remaining).
 //!
 //! This tests that:
 //!   - The wait set correctly identifies which source woke it.
@@ -53,7 +53,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     if tok_a != 2
     {
         return Err(
-            "integration::wait_concurrency: part A returned wrong token (expected 2 for queue)",
+            "integration::wait_concurrency: part A returned wrong badge (expected 2 for queue)",
         );
     }
     event_recv(eq)
@@ -75,7 +75,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     if tok_b != 1
     {
         return Err(
-            "integration::wait_concurrency: part B returned wrong token (expected 1 for signal)",
+            "integration::wait_concurrency: part B returned wrong badge (expected 1 for signal)",
         );
     }
     // Drain the signal bits before proceeding.
@@ -98,7 +98,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     if tok_c != 2
     {
         return Err(
-            "integration::wait_concurrency: part C returned wrong token after signal removed (expected 2)",
+            "integration::wait_concurrency: part C returned wrong badge after signal removed (expected 2)",
         );
     }
     event_recv(eq)

@@ -27,13 +27,13 @@ devmgr's device registry; vfsd queries devmgr to obtain the whole-disk
 SEND cap.
 
 Two access tiers exist on this endpoint, distinguished by the kernel-supplied
-caller token:
+caller badge:
 
-1. **Whole-disk (untokened)** — vfsd holds this cap directly. Permitted to
-   issue `REGISTER_PARTITION` to mint partition-scoped tokens.
-2. **Per-partition (tokened)** — derived by vfsd from the whole-disk cap and
+1. **Whole-disk (unbadged)** — vfsd holds this cap directly. Permitted to
+   issue `REGISTER_PARTITION` to mint partition-scoped badges.
+2. **Per-partition (badged)** — derived by vfsd from the whole-disk cap and
    handed to filesystem drivers. Reads are bounded by the partition LBA range
-   registered for the token.
+   registered for the badge.
 
 ---
 
@@ -44,15 +44,15 @@ defined in `shared/ipc::blk_labels`; error codes in `shared/ipc::blk_errors`.
 
 ### Label 2: `REGISTER_PARTITION`
 
-Mint a partition-scoped binding for a tokened SEND cap. Callable only over
-the whole-disk endpoint; tokened callers are rejected.
+Mint a partition-scoped binding for a badged SEND cap. Callable only over
+the whole-disk endpoint; badged callers are rejected.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label | 2 |
-| data[0] | Token to bind |
+| data[0] | Badge to bind |
 | data[1] | Base LBA |
 | data[2] | Length in sectors |
 
@@ -73,7 +73,7 @@ page, packed contiguously; the rest of the page is unspecified.
 | Field | Value |
 |---|---|
 | label | 3 |
-| data[0] | Starting LBA (relative to the caller token's partition base) |
+| data[0] | Starting LBA (relative to the caller badge's partition base) |
 | data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
 | caps[0] | Target Frame, `MAP \| WRITE`, at least `count * 512` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
@@ -92,7 +92,7 @@ page, packed contiguously; the rest of the page is unspecified.
 |---|---|---|
 | 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
-| 3 | `OutOfBounds` | LBA outside the caller token's partition range |
+| 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
 | 5 | `InvalidFrameCap` | Target Frame missing `MAP\|WRITE`, sized other than one page, or absent |
 
 #### Reserved cap slots and the IOMMU forward-compat shape
@@ -123,7 +123,7 @@ read.
 | Field | Value |
 |---|---|
 | label | 4 |
-| data[0] | Starting LBA (relative to the caller token's partition base) |
+| data[0] | Starting LBA (relative to the caller badge's partition base) |
 | data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
 | caps[0] | Source Frame, `MAP \| READ`, at least `count * 512` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
@@ -142,7 +142,7 @@ read.
 |---|---|---|
 | 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
-| 3 | `OutOfBounds` | LBA outside the caller token's partition range |
+| 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
 | 5 | `InvalidFrameCap` | Source Frame missing `MAP\|READ`, sized smaller than `count * 512`, or absent |
 
 ---
@@ -181,7 +181,7 @@ values in the `CapDescriptor.aux0` field, per
 | [services/fs/docs/fs-driver-protocol.md](../../../fs/docs/fs-driver-protocol.md) | Filesystem-driver IPC; the only client of this driver today |
 | [docs/device-management.md](../../../../docs/device-management.md) | Driver lifecycle, DMA safety, security boundary |
 | [docs/ipc-design.md](../../../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
-| [docs/capability-model.md](../../../../docs/capability-model.md) | Capability types, rights, delegation, tokens |
+| [docs/capability-model.md](../../../../docs/capability-model.md) | Capability types, rights, delegation, badges |
 
 ---
 

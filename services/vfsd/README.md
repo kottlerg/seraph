@@ -1,7 +1,7 @@
 # vfsd
 
 Virtual filesystem daemon. vfsd is a namespace server with no on-disk
-storage: it composes a synthetic system root from per-mount tokened
+storage: it composes a synthetic system root from per-mount badged
 SEND caps on filesystem drivers, mints the root cap that every
 process receives in `ProcessInfo.system_root_cap`, and stays out of
 the I/O path after the walk. vfsd self-mounts the Seraph root partition
@@ -45,7 +45,7 @@ vfsd/
   are spawned only after the mount, so `GET_SYSTEM_ROOT_CAP` is never
   served against an unmounted root.
 - **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
-  its un-tokened service endpoint, with multi-threaded recv so a
+  its un-badged service endpoint, with multi-threaded recv so a
   worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
   flight reply. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts); no in-tree caller issues
@@ -101,7 +101,7 @@ not on the request path.
 devmgr discovers storage hardware, spawns block device drivers, and
 publishes their endpoints in the device registry. vfsd queries the
 registry at startup to obtain the whole-disk virtio-blk endpoint;
-per-mount partition tokens are derived from it. See
+per-mount partition badges are derived from it. See
 [`docs/device-management.md`](../../docs/device-management.md).
 
 ---
@@ -111,7 +111,7 @@ per-mount partition tokens are derived from it. See
 | Document | Content |
 |---|---|
 | [docs/namespace-model.md](../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing |
-| [docs/capability-model.md](../../docs/capability-model.md) | Token semantics, derivation, revocation |
+| [docs/capability-model.md](../../docs/capability-model.md) | Badge semantics, derivation, revocation |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
 | [docs/device-management.md](../../docs/device-management.md) | Device registry, block device endpoints |
 | [docs/architecture.md](../../docs/architecture.md) | vfsd role in the boot lifecycle |

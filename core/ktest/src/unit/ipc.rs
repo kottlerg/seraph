@@ -36,7 +36,7 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 static mut RECV_BLOCKS_STACK: ChildStack = ChildStack::ZERO;
 static mut DATA_WORDS_STACK: ChildStack = ChildStack::ZERO;
 static mut CAP_XFER_STACK: ChildStack = ChildStack::ZERO;
-static mut TOKEN_STACK: ChildStack = ChildStack::ZERO;
+static mut BADGE_STACK: ChildStack = ChildStack::ZERO;
 static mut SNAPSHOT_STACK: ChildStack = ChildStack::ZERO;
 static mut REPLY_OOM_STACK: ChildStack = ChildStack::ZERO;
 static mut RECV_OOM_STACK: ChildStack = ChildStack::ZERO;
@@ -331,104 +331,104 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── Token delivery via IPC ───────────────────────────────────────────────────
+// ── Badge delivery via IPC ───────────────────────────────────────────────────
 
-/// `ipc_recv` delivers the token from the sender's endpoint cap.
+/// `ipc_recv` delivers the badge from the sender's endpoint cap.
 ///
-/// The child calls via a tokened endpoint cap (token=0x1234). The server
-/// receives and verifies the token value in the third return register.
-pub fn recv_delivers_token(ctx: &TestContext) -> TestResult
+/// The child calls via a badged endpoint cap (badge=0x1234). The server
+/// receives and verifies the badge value in the third return register.
+pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_endpoint for recv_delivers_token failed")?;
+        .map_err(|_| "cap_create_endpoint for recv_delivers_badge failed")?;
     let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_signal for recv_delivers_token failed")?;
+        .map_err(|_| "cap_create_signal for recv_delivers_badge failed")?;
 
-    // Derive a tokened send+grant cap.
-    let tokened_ep = syscall::cap_derive_token(ep, RIGHTS_SEND_GRANT, 0x1234)
-        .map_err(|_| "cap_derive_token for recv_delivers_token failed")?;
+    // Derive a badged send+grant cap.
+    let badged_ep = syscall::cap_derive_badge(ep, RIGHTS_SEND_GRANT, 0x1234)
+        .map_err(|_| "cap_derive_badge for recv_delivers_badge failed")?;
 
     let child = crate::spawn::new_child(ctx)
-        .map_err(|_| "ipc::recv_delivers_token: spawn::new_child failed")?;
-    let child_ep = cap_copy(tokened_ep, child.cs, syscall::RIGHTS_ALL)
-        .map_err(|_| "cap_copy tokened ep for recv_delivers_token failed")?;
+        .map_err(|_| "ipc::recv_delivers_badge: spawn::new_child failed")?;
+    let child_ep = cap_copy(badged_ep, child.cs, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_copy badged ep for recv_delivers_badge failed")?;
     let child_done = cap_copy(done, child.cs, 1 << 7)
-        .map_err(|_| "cap_copy done for recv_delivers_token failed")?;
+        .map_err(|_| "cap_copy done for recv_delivers_badge failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(TOKEN_STACK));
-    crate::spawn::configure_and_start(&child, token_caller_entry, stack_top, child_arg)
-        .map_err(|_| "ipc::recv_delivers_token: configure_and_start failed")?;
+    let stack_top = ChildStack::top(core::ptr::addr_of!(BADGE_STACK));
+    crate::spawn::configure_and_start(&child, badge_caller_entry, stack_top, child_arg)
+        .map_err(|_| "ipc::recv_delivers_badge: configure_and_start failed")?;
 
-    // Server: receive and check token.
+    // Server: receive and check badge.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
-        .map_err(|_| "ipc_recv for recv_delivers_token failed")?;
+        .map_err(|_| "ipc_recv for recv_delivers_badge failed")?;
 
     if msg.label != 0xD00D
     {
-        return Err("recv_delivers_token: wrong label (expected 0xD00D)");
+        return Err("recv_delivers_badge: wrong label (expected 0xD00D)");
     }
-    if msg.token != 0x1234
+    if msg.badge != 0x1234
     {
-        return Err("recv_delivers_token: wrong token (expected 0x1234)");
+        return Err("recv_delivers_badge: wrong badge (expected 0x1234)");
     }
 
     // Reply so child can finish.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }
-        .map_err(|_| "ipc_reply for recv_delivers_token failed")?;
+        .map_err(|_| "ipc_reply for recv_delivers_badge failed")?;
 
-    signal_wait(done).map_err(|_| "signal_wait for recv_delivers_token failed")?;
+    signal_wait(done).map_err(|_| "signal_wait for recv_delivers_badge failed")?;
 
     cap_delete(child.th).ok();
-    cap_delete(tokened_ep).ok();
+    cap_delete(badged_ep).ok();
     cap_delete(ep).ok();
     cap_delete(done).ok();
     cap_delete(child.cs).ok();
     Ok(())
 }
 
-/// `ipc_recv` returns token=0 when the sender uses an untokened cap.
-pub fn recv_untokened_returns_zero(ctx: &TestContext) -> TestResult
+/// `ipc_recv` returns badge=0 when the sender uses an unbadged cap.
+pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_endpoint for recv_untokened failed")?;
+        .map_err(|_| "cap_create_endpoint for recv_unbadged failed")?;
     let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_signal for recv_untokened failed")?;
+        .map_err(|_| "cap_create_signal for recv_unbadged failed")?;
 
-    // Give child an untokened send+grant cap (regular derive, no token).
+    // Give child an unbadged send+grant cap (regular derive, no badge).
     let child = crate::spawn::new_child(ctx)
-        .map_err(|_| "ipc::recv_untokened_returns_zero: spawn::new_child failed")?;
+        .map_err(|_| "ipc::recv_unbadged_returns_zero: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
-        .map_err(|_| "cap_copy ep for recv_untokened failed")?;
+        .map_err(|_| "cap_copy ep for recv_unbadged failed")?;
     let child_done =
-        cap_copy(done, child.cs, 1 << 7).map_err(|_| "cap_copy done for recv_untokened failed")?;
+        cap_copy(done, child.cs, 1 << 7).map_err(|_| "cap_copy done for recv_unbadged failed")?;
     let child_arg = u64::from(child_ep) | (u64::from(child_done) << 16);
 
     // Reuse the caller_entry (sends 0xCAFE, expects reply 0xBEEF).
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     crate::spawn::configure_and_start(&child, caller_entry, stack_top, child_arg)
-        .map_err(|_| "ipc::recv_untokened_returns_zero: configure_and_start failed")?;
+        .map_err(|_| "ipc::recv_unbadged_returns_zero: configure_and_start failed")?;
 
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
-        .map_err(|_| "ipc_recv for recv_untokened failed")?;
+        .map_err(|_| "ipc_recv for recv_unbadged failed")?;
 
     if msg.label != 0xCAFE
     {
-        return Err("recv_untokened: wrong label");
+        return Err("recv_unbadged: wrong label");
     }
-    if msg.token != 0
+    if msg.badge != 0
     {
-        return Err("recv_untokened: token should be 0 for untokened cap");
+        return Err("recv_unbadged: badge should be 0 for unbadged cap");
     }
 
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     unsafe { ipc::ipc_reply(&IpcMessage::new(0xBEEF), ctx.ipc_buf) }
-        .map_err(|_| "ipc_reply for recv_untokened failed")?;
+        .map_err(|_| "ipc_reply for recv_unbadged failed")?;
 
-    signal_wait(done).map_err(|_| "signal_wait for recv_untokened failed")?;
+    signal_wait(done).map_err(|_| "signal_wait for recv_unbadged failed")?;
 
     cap_delete(child.th).ok();
     cap_delete(ep).ok();
@@ -584,10 +584,10 @@ fn cap_xfer_caller_entry(arg: u64) -> !
     thread_exit()
 }
 
-/// Child for `recv_delivers_token`: calls endpoint with label 0xD00D.
+/// Child for `recv_delivers_badge`: calls endpoint with label 0xD00D.
 ///
 /// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`.
-fn token_caller_entry(arg: u64) -> !
+fn badge_caller_entry(arg: u64) -> !
 {
     let ep_slot = (arg & 0xFFFF) as u32;
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;

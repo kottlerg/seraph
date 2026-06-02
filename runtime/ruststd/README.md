@@ -74,11 +74,11 @@ mappings go through the page-reservation allocator above.
 `std::os::seraph` exposes two process-global namespace caps that anchor
 `std::fs` path resolution:
 
-- **System root cap** (`root_dir_cap()`) — tokened SEND on vfsd's
+- **System root cap** (`root_dir_cap()`) — badged SEND on vfsd's
   namespace endpoint addressing the synthetic system root. Absolute
   paths (leading `/`) start every per-component `NS_LOOKUP` walk
   here.
-- **Current directory cap** (`current_dir_cap()`) — tokened SEND on
+- **Current directory cap** (`current_dir_cap()`) — badged SEND on
   some namespace endpoint addressing a directory node. Relative paths
   resolve from this cap.
 

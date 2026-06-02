@@ -41,7 +41,7 @@ kernel's own source layout.
 
 | File | Syscalls / behaviour exercised |
 |---|---|
-| `cap.rs` | `SYS_CAP_CREATE_*`, `CAP_COPY`, `CAP_MOVE`, `CAP_INSERT`, `CAP_DERIVE`, `CAP_DERIVE_TOKEN`, `CAP_REVOKE`, `CAP_DELETE` |
+| `cap.rs` | `SYS_CAP_CREATE_*`, `CAP_COPY`, `CAP_MOVE`, `CAP_INSERT`, `CAP_DERIVE`, `CAP_DERIVE_BADGE`, `CAP_REVOKE`, `CAP_DELETE` |
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, type-specific fields) |
 | `retype.rs` | Retype primitive: CSpace/AddressSpace augmentation, page-table walk budget, kernel PT pool consumption |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_FRAME_SPLIT`, `SYS_ASPACE_QUERY` |

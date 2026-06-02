@@ -44,9 +44,9 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
             continue;
         };
         let label = recv.label;
-        let token = recv.token;
+        let badge = recv.badge;
 
-        if token == 0
+        if badge == 0
         {
             // SAFETY: ipc_buf is the thread-registered IPC buffer page.
             let _ = unsafe { bootstrap::reply_error(bootstrap_errors::NO_CHILD, ipc_buf) };
@@ -55,7 +55,7 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
 
         if (label & 0xFFFF) != bootstrap::REQUEST
         {
-            let pending = take_pending_by_token(state, token);
+            let pending = take_pending_by_badge(state, badge);
             // SAFETY: ipc_buf is the thread-registered IPC buffer page.
             let _ = unsafe { bootstrap::reply_error(bootstrap_errors::INVALID, ipc_buf) };
             if let Some(p) = pending
@@ -65,7 +65,7 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
             continue;
         }
 
-        let Some(pending) = take_pending_by_token(state, token)
+        let Some(pending) = take_pending_by_badge(state, badge)
         else
         {
             // SAFETY: ipc_buf is the thread-registered IPC buffer page.
@@ -131,7 +131,7 @@ fn handle_create_from_file(
         procmgr_ep,
         file_cap,
         file_size,
-        tokened_creator,
+        badged_creator,
         bootstrap,
     } = order;
 
@@ -140,18 +140,18 @@ fn handle_create_from_file(
     {
         // No room in the bootstrap registry — drop the caps we own.
         let _ = syscall::cap_delete(file_cap);
-        let _ = syscall::cap_delete(tokened_creator);
+        let _ = syscall::cap_delete(badged_creator);
         return false;
     };
 
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
         .word(0, file_size)
         .cap(file_cap)
-        .cap(tokened_creator)
+        .cap(badged_creator)
         .build();
 
     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-    // file_cap and tokened_creator ownership transfer via the IPC.
+    // file_cap and badged_creator ownership transfer via the IPC.
     let Ok(create_reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
@@ -189,14 +189,14 @@ fn handle_create_from_file(
     bootstrap_handle.wait()
 }
 
-/// Find and remove a pending-bootstrap slot whose token matches.
-fn take_pending_by_token(state: &Mutex<BootstrapState>, token: u64) -> Option<PendingBootstrap>
+/// Find and remove a pending-bootstrap slot whose badge matches.
+fn take_pending_by_badge(state: &Mutex<BootstrapState>, badge: u64) -> Option<PendingBootstrap>
 {
     let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
     for slot in &mut st.pending
     {
         if let Some(p) = slot.as_ref()
-            && p.token == token
+            && p.badge == badge
         {
             return slot.take();
         }

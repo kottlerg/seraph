@@ -392,7 +392,7 @@ impl CSpace
         let slot = self.slot_mut(index.get()).ok_or(CapError::InvalidIndex)?;
         slot.tag = tag;
         slot.rights = rights;
-        slot.token = 0;
+        slot.badge = 0;
         slot.object = Some(object);
         slot.deriv_parent = None;
         slot.deriv_first_child = None;
@@ -522,7 +522,7 @@ impl CSpace
         let slot = self.slot_mut(index).ok_or(CapError::InvalidIndex)?;
         slot.tag = tag;
         slot.rights = rights;
-        slot.token = 0;
+        slot.badge = 0;
         slot.object = Some(object);
         slot.deriv_parent = None;
         slot.deriv_first_child = None;

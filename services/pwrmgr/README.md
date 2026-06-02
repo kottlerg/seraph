@@ -45,7 +45,7 @@ It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
 - `REBOOT` — cold reboot the platform (8042 KBC reset on x86-64, SBI SRST
   type 2 on RISC-V).
 
-Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (token bit
+Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.
 
 ---
@@ -56,16 +56,16 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (token bit
    `provides = pwrmgr.shutdown:auth pwrmgr.deny:deny` directive makes svcmgr
    create pwrmgr's service endpoint, serve its RECV as bootstrap `cap[0]`,
    and publish two SENDs into the discovery registry: `pwrmgr.shutdown`
-   (`SHUTDOWN_AUTHORITY`-tokened) and `pwrmgr.deny` (a no-authority twin).
+   (`SHUTDOWN_AUTHORITY`-badged) and `pwrmgr.deny` (a no-authority twin).
    The endpoint persists across restarts.
-2. `seed = devmgr.registry` delivers a `REGISTRY_QUERY_AUTHORITY`-tokened
+2. `seed = devmgr.registry` delivers a `REGISTRY_QUERY_AUTHORITY`-badged
    SEND on devmgr's registry as bootstrap `cap[1]`. pwrmgr uses it to
    resolve its actuation state from devmgr (see Responsibilities). pwrmgr
    never holds a platform cap longer than it needs — the served ACPI Frame
    caps are mapped read-only and dropped after parsing.
 3. Consumers permitted to power the platform off seed `pwrmgr.shutdown`
    (e.g. svctest, and svcmgr's own critical-service-death escalation); the
-   token rides through the registry lookup unchanged. svctest also seeds
+   badge rides through the registry lookup unchanged. svctest also seeds
    `pwrmgr.deny` to assert the gate rejects an unauthorised cap.
 4. svctest, at the end of `main()` after `ALL TESTS PASSED`, sends
    `pwrmgr_labels::SHUTDOWN` through the authorised cap. pwrmgr executes

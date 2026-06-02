@@ -4,7 +4,7 @@
 //! Per-process release-handler thread for the seraph fs frame protocol.
 //!
 //! The fs driver evicts cached pages by sending `FS_RELEASE_FRAME` on
-//! a tokened SEND derived from the per-process release endpoint owned
+//! a badged SEND derived from the per-process release endpoint owned
 //! by this module. The SEND is transferred to the driver in `caps[0]`
 //! of the first [`fs_labels::FS_READ_FRAME`] request for each opened
 //! file (see [`super::File::read_frame`]); from that point on the
@@ -56,13 +56,13 @@ pub(super) struct FileEntry
 /// [`super::File::open`] call; held forever for the process lifetime.
 pub(super) struct ReleaseState
 {
-    /// Untokened endpoint cap owned by this process; tokened SENDs
+    /// Unbadged endpoint cap owned by this process; badged SENDs
     /// derived from it would live in fs's CSpace once a delivery
     /// channel exists. Revoking this cap (which we never do) would
     /// tear down every fs-side derived child atomically.
     release_ep: u32,
     registry: Mutex<BTreeMap<u64, Arc<FileEntry>>>,
-    next_token: AtomicU64,
+    next_badge: AtomicU64,
     /// Process aspace cap, captured at init for the handler's
     /// `mem_unmap` calls. Equal to `StartupInfo::self_aspace`.
     aspace: u32,
@@ -108,7 +108,7 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
         ReleaseState {
             release_ep,
             registry: Mutex::new(BTreeMap::new()),
-            next_token: AtomicU64::new(1),
+            next_badge: AtomicU64::new(1),
             aspace,
         }
     });
@@ -138,25 +138,25 @@ pub(super) fn state() -> Option<&'static ReleaseState>
     STATE.get()
 }
 
-/// Untokened endpoint cap the per-`File` SEND derivation hangs off.
+/// Unbadged endpoint cap the per-`File` SEND derivation hangs off.
 pub(super) fn release_endpoint(state: &ReleaseState) -> u32
 {
     state.release_ep
 }
 
-/// Allocate a fresh non-zero per-`File` token.
-pub(super) fn allocate_token(state: &ReleaseState) -> u64
+/// Allocate a fresh non-zero per-`File` badge.
+pub(super) fn allocate_badge(state: &ReleaseState) -> u64
 {
-    let mut t = state.next_token.fetch_add(1, Ordering::Relaxed);
+    let mut t = state.next_badge.fetch_add(1, Ordering::Relaxed);
     while t == 0
     {
-        t = state.next_token.fetch_add(1, Ordering::Relaxed);
+        t = state.next_badge.fetch_add(1, Ordering::Relaxed);
     }
     t
 }
 
 /// Register a `File` with the handler, returning its `FileEntry`.
-pub(super) fn register(state: &ReleaseState, token: u64) -> Arc<FileEntry>
+pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
 {
     let entry = Arc::new(FileEntry {
         mappings: Mutex::new(Vec::new()),
@@ -165,20 +165,20 @@ pub(super) fn register(state: &ReleaseState, token: u64) -> Arc<FileEntry>
         .registry
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    reg.insert(token, entry.clone());
+    reg.insert(badge, entry.clone());
     entry
 }
 
 /// Remove a `File`'s registration. After this call the handler cannot
 /// dispatch any further releases to the file; subsequent
 /// `FS_RELEASE_FRAME` arrivals look up an empty slot and ack-without-act.
-pub(super) fn unregister(state: &ReleaseState, token: u64) -> Option<Arc<FileEntry>>
+pub(super) fn unregister(state: &ReleaseState, badge: u64) -> Option<Arc<FileEntry>>
 {
     let mut reg = state
         .registry
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    reg.remove(&token)
+    reg.remove(&badge)
 }
 
 /// Add an outstanding mapping to a `FileEntry`. Called by `File::read`
@@ -265,7 +265,7 @@ fn handler_main()
             continue;
         }
 
-        let token = msg.token;
+        let badge = msg.badge;
         let cookie = msg.word(0);
 
         // Snapshot the FileEntry under the registry lock, then drop the
@@ -276,7 +276,7 @@ fn handler_main()
                 .registry
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            reg.get(&token).cloned()
+            reg.get(&badge).cloned()
         };
 
         if let Some(entry) = entry

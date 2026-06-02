@@ -363,7 +363,7 @@ pub struct WaitSet
 {
     lock: Spinlock,
 
-    /// Members of this wait set. Each entry pairs a source with its token.
+    /// Members of this wait set. Each entry pairs a source with its badge.
     /// Fixed capacity; SYS_WAIT_SET_ADD returns OutOfMemory when full.
     members: [Option<WaitSetMember>; WAIT_SET_MAX_MEMBERS],
 
@@ -387,8 +387,8 @@ struct WaitSetMember
     /// The IPC object being watched.
     source: WaitSetSource,
 
-    /// Opaque token returned to the caller when this source is ready.
-    token: u64,
+    /// Opaque badge returned to the caller when this source is ready.
+    badge: u64,
 
     /// Whether this source currently has pending readiness (to handle
     /// readiness arriving before the waiter blocks).
@@ -418,7 +418,7 @@ waitset_notify(wait_set, member_idx):
     Acquire wait_set.lock
     if waiter is Some(tcb):
         waiter = None
-        tcb.wakeup_token = members[member_idx].token
+        tcb.wakeup_badge = members[member_idx].badge
         Release lock
         Mark tcb as Ready; enqueue
     else:
@@ -436,12 +436,12 @@ waitset_notify(wait_set, member_idx):
 2. if ready_queue is non-empty:
    a. member_idx = ready_queue.pop_front()
    b. members[member_idx].pending = false
-   c. token = members[member_idx].token
-   d. Release lock; return token
+   c. badge = members[member_idx].badge
+   d. Release lock; return badge
 3. else:
    a. waiter = current_tcb
    b. Release lock
-   c. Block current thread; return wakeup_token when woken
+   c. Block current thread; return wakeup_badge when woken
 ```
 
 ### Wait Set Add/Remove

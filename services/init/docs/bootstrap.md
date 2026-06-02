@@ -33,7 +33,7 @@ process creation to procmgr IPC.
 - Mint endpoint objects: init's bootstrap endpoint, procmgr's
   service endpoint, memmgr's service endpoint, svcmgr's service
   endpoint (`../src/main.rs:439`; minted here so procmgr can receive
-  an un-tokened SEND on it during procmgr's bootstrap round), and
+  an un-badged SEND on it during procmgr's bootstrap round), and
   the master log endpoint (`../src/main.rs:460`).
 - Spawn the init-logd thread — a second thread of the init process
   that drains the master log endpoint and writes lines to the serial
@@ -90,7 +90,7 @@ init's wait-for-root barrier.
 - Pull the seed system-root cap via `GET_SYSTEM_ROOT_CAP`
   (`mount::request_system_root`). vfsd replies `NO_MOUNT` until it has
   mounted root, so the call blocks until the root filesystem is up; a
-  zero return is FATAL. The success reply is a tokened SEND on vfsd's
+  zero return is FATAL. The success reply is a badged SEND on vfsd's
   namespace endpoint at the synthetic root with full namespace rights
   — every later child receives a `cap_copy` of it via
   `procmgr_labels::CONFIGURE_NAMESPACE`, and svcmgr derives the
@@ -119,7 +119,7 @@ services, and talks to devmgr, all from the endowment.
   - **Round 1 (`CAPS`)** — svcmgr's service + bootstrap endpoints
     (full rights), plus the publish-role source caps: a `SEND` on the
     root filesystem's namespace endpoint (svcmgr publishes it as
-    `rootfs.root`) and a token-0 `SEND|GRANT` source on
+    `rootfs.root`) and a badge-0 `SEND|GRANT` source on
     `devmgr_registry_ep` (svcmgr mints the `REGISTRY_QUERY_AUTHORITY`
     `devmgr.registry` publish cap and the `DRIVERS_DIR_AUTHORITY`
     `SET_DRIVERS_DIR` cap from it). `data[1]` carries
@@ -138,7 +138,7 @@ services, and talks to devmgr, all from the endowment.
     `master_log_source`, a `RIGHTS_ALL` derive of init's master log
     endpoint (svcmgr mints real-logd's master-log RECV from it on every
     (re)launch, plus the one-shot `HANDOVER_PULL` SEND on the first
-    launch), and `procmgr_death_auth_source`, a token-0
+    launch), and `procmgr_death_auth_source`, a badge-0
     `RIGHTS_SEND_GRANT` derive of procmgr's service endpoint (svcmgr
     mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it for per-sender
     death-EQ registration). Holding `master_log_source` keeps the log
@@ -150,17 +150,17 @@ services, and talks to devmgr, all from the endowment.
   drivers dir:
   - `rootfs.root` — the endowed `SEND` on the root filesystem's
     namespace endpoint (FS-driver-agnostic by design).
-  - `svcmgr` — un-tokened SEND on svcmgr's own service endpoint.
-  - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-tokened SEND minted
+  - `svcmgr` — un-badged SEND on svcmgr's own service endpoint.
+  - `devmgr.registry` — `REGISTRY_QUERY_AUTHORITY`-badged SEND minted
     from the endowed devmgr-registry source. Consumers needing to
     resolve a device driver themselves (`programs/fb-charset` →
     `QUERY_FRAMEBUFFER_DEVICE`; timed and pwrmgr → their devmgr queries;
     future: any non-init caller of devmgr's discovery surface) seed this
-    name. The token bit survives svcmgr's plain `cap_derive` in
+    name. The badge bit survives svcmgr's plain `cap_derive` in
     `registry_lookup_derived`.
   - `SET_DRIVERS_DIR` — svcmgr walks its universal root to
     `/services/drivers/` at `LOOKUP | READ` and hands devmgr the subtree
-    cap on a `DRIVERS_DIR_AUTHORITY`-tokened copy of the
+    cap on a `DRIVERS_DIR_AUTHORITY`-badged copy of the
     devmgr-registry source. Devmgr replies SUCCESS *before* any spawn
     work, then walks the per-arch RTC name and spawns the driver between
     its `ipc_reply` and next `ipc_recv` (procmgr `CREATE_FROM_FILE` —
@@ -249,8 +249,8 @@ svcmgr if needed.
 | Raw bootstrap | memmgr | RAM `Frame` pool (every Frame cap not consumed by init/procmgr setup) |
 | Raw bootstrap | procmgr | memmgr SEND cap, log endpoint SEND, svcmgr service endpoint SEND, boot-module `Frame` caps for downstream `CREATE_PROCESS` |
 | Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Frame caps; root `IoPortRange` (x86-64) / `SbiControl` (RISC-V) via the terminal `SVCMGR_BUNDLE` round — the hardware + shutdown authority devmgr brokers to drivers and to pwrmgr |
-| Raw bootstrap | vfsd | `SEED_AUTHORITY`-tokened SEND on vfsd's own service endpoint (gates `GET_SYSTEM_ROOT_CAP`). vfsd self-mounts root, so init issues no `MOUNT` and keeps no FS access of its own. |
-| Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — round 1 (`CAPS`): full-rights SEND on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a token-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry` publish cap and the `SET_DRIVERS_DIR` cap); rounds 2..N (`SUBSTRATE`): one `(name, thread_cap)` per substrate service for death-supervision binding; terminal round (`LOGD_SOURCES`): a `RIGHTS_ALL` master-log endpoint source and a token-0 `SEND\|GRANT` procmgr source, both reserved for the system's lifetime so svcmgr can launch + supervise + restart real-logd (minting its master-log RECV, first-launch `HANDOVER_PULL` SEND, and `DEATH_EQ_AUTHORITY` SEND per launch). svcmgr publishes all well-known names itself, sends `SET_DRIVERS_DIR` from these sources, and launches real-logd; init publishes nothing and does not talk to devmgr. |
+| Raw bootstrap | vfsd | `SEED_AUTHORITY`-badged SEND on vfsd's own service endpoint (gates `GET_SYSTEM_ROOT_CAP`). vfsd self-mounts root, so init issues no `MOUNT` and keeps no FS access of its own. |
+| Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — round 1 (`CAPS`): full-rights SEND on its own service + bootstrap endpoints, a `SEND` on the root filesystem namespace endpoint (svcmgr publishes as `rootfs.root`) and a badge-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry` publish cap and the `SET_DRIVERS_DIR` cap); rounds 2..N (`SUBSTRATE`): one `(name, thread_cap)` per substrate service for death-supervision binding; terminal round (`LOGD_SOURCES`): a `RIGHTS_ALL` master-log endpoint source and a badge-0 `SEND\|GRANT` procmgr source, both reserved for the system's lifetime so svcmgr can launch + supervise + restart real-logd (minting its master-log RECV, first-launch `HANDOVER_PULL` SEND, and `DEATH_EQ_AUTHORITY` SEND per launch). svcmgr publishes all well-known names itself, sends `SET_DRIVERS_DIR` from these sources, and launches real-logd; init publishes nothing and does not talk to devmgr. |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Frame cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline frame, boot-module ELF sources) |
 
 ---

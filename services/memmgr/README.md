@@ -41,7 +41,7 @@ address space at virtual addresses they choose themselves.
   the `REQUIRE_CONTIGUOUS` flag for callers that need a single multi-page
   cap (DMA buffers, large heap grow operations).
 - **Per-process tracking** — maintain a per-process record of the Frame
-  caps memmgr has handed out, keyed on a procmgr-minted token.
+  caps memmgr has handed out, keyed on a procmgr-minted badge.
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
   reclaim the dead process's frames into the free pool.
 - **Coalescing** — fold adjacent free pages back into larger contiguous
@@ -73,8 +73,8 @@ The full memmgr IPC specification is in
 
 - `REQUEST_FRAMES(want_pages, flags) → frame_caps[..]`
 - `RELEASE_FRAMES(frame_caps[..])`
-- `REGISTER_PROCESS(...) → tokened_endpoint_cap` (procmgr-only)
-- `PROCESS_DIED(token)` (procmgr-only)
+- `REGISTER_PROCESS(...) → badged_endpoint_cap` (procmgr-only)
+- `PROCESS_DIED(badge)` (procmgr-only)
 
 ---
 
@@ -158,7 +158,7 @@ memmgr and procmgr are sister tier-1 services with disjoint authority:
 procmgr is the privileged caller that registers new processes with
 memmgr (so memmgr can tag the per-process frame list) and notifies
 memmgr of deaths (so memmgr can reclaim). Ordinary callers cannot
-mint or retire process tokens.
+mint or retire process badges.
 
 ---
 

@@ -5,7 +5,7 @@
 
 //! Open file table for the FAT driver.
 //!
-//! Tracks open files by token value (assigned via `cap_derive_token`).
+//! Tracks open files by badge value (assigned via `cap_derive_badge`).
 //! Each open file carries a fixed-capacity table of outstanding cache
 //! pages handed out via `FS_READ_FRAME`; each entry holds the cookie the
 //! client uses to reference the page, the cache slot the page lives in
@@ -41,15 +41,15 @@ pub struct OutstandingPage
     pub ancestor_cap: u32,
 }
 
-/// A single open file, identified by its capability token.
+/// A single open file, identified by its capability badge.
 pub struct OpenFile
 {
     /// Monotonic identity stamped on slot allocation (0 = unused slot).
     /// Used by the eviction worker to address a slot through
-    /// `find_by_token`; the slot itself is reached via
-    /// `FatNode.open_slot` on the cap-native path, so this token does
+    /// `find_by_badge`; the slot itself is reached via
+    /// `FatNode.open_slot` on the cap-native path, so this badge does
     /// not appear on the wire.
-    pub token: u64,
+    pub badge: u64,
     pub start_cluster: u32,
     pub file_size: u32,
     pub outstanding: [Option<OutstandingPage>; MAX_OUTSTANDING],
@@ -69,7 +69,7 @@ impl OpenFile
     pub const fn empty() -> Self
     {
         Self {
-            token: 0,
+            badge: 0,
             start_cluster: 0,
             file_size: 0,
             outstanding: [None; MAX_OUTSTANDING],
@@ -93,14 +93,14 @@ impl OpenFile
     }
 }
 
-/// Find the file table index for a given token.
-pub fn find_by_token(files: &[OpenFile; MAX_OPEN_FILES], token: u64) -> Option<usize>
+/// Find the file table index for a given badge.
+pub fn find_by_badge(files: &[OpenFile; MAX_OPEN_FILES], badge: u64) -> Option<usize>
 {
-    files.iter().position(|f| f.token == token)
+    files.iter().position(|f| f.badge == badge)
 }
 
 /// Allocate a free slot, returning its index.
 pub fn alloc_slot(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<usize>
 {
-    files.iter().position(|f| f.token == 0)
+    files.iter().position(|f| f.badge == 0)
 }

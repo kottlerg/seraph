@@ -8,7 +8,7 @@
 //! This crate owns the security-relevant code path that every namespace
 //! server runs: IPC dispatch, name validation, rights composition,
 //! per-entry visibility filtering, and node-cap minting via
-//! `cap_derive_token`. Storage backends — fatfs, future ext4, tmpfs,
+//! `cap_derive_badge`. Storage backends — fatfs, future ext4, tmpfs,
 //! vfsd's synthetic root — implement [`NamespaceBackend`], own their
 //! own `ipc_recv` loop on their namespace endpoint, and route each
 //! `NS_*` request through [`dispatch_request`]. They do not
@@ -27,16 +27,16 @@ extern crate rustc_std_workspace_core as core;
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
+pub mod badge;
 pub mod gate;
 pub mod name;
 pub mod rights;
-pub mod token;
 pub mod wire;
 
+pub use badge::{NODE_ID_BITS, NODE_ID_MASK, NodeId, pack};
 pub use gate::{GateError, compose_forward_lookup_rights, gate};
 pub use name::{MAX_NAME_LEN, MIN_NAME_LEN, NameError, validate_name};
 pub use rights::{NamespaceRights, RIGHTS_BITS, RIGHTS_MASK};
-pub use token::{NODE_ID_BITS, NODE_ID_MASK, NodeId, pack};
 pub use wire::NsError;
 
 /// Whether a node is a directory or a regular file.
@@ -115,7 +115,7 @@ impl EntryName
 /// Where the cap returned by `NS_LOOKUP` for a directory entry comes from.
 ///
 /// `Local` entries are minted on this server's namespace endpoint via
-/// `cap_derive_token` against the entry's stored [`NodeId`] (the common
+/// `cap_derive_badge` against the entry's stored [`NodeId`] (the common
 /// case). `External` entries return a pre-installed cap on a different
 /// server's namespace endpoint via `cap_copy` (the mount-point case).
 /// The composing backend stores `External` entries when boot-time
@@ -254,7 +254,7 @@ pub trait NamespaceBackend
 /// caller-rights / visibility / name-validation checks documented in
 /// `docs/namespace-model.md`, calls into `backend` for the underlying
 /// storage operation, mints child caps from `namespace_endpoint` via
-/// `cap_derive_token`, and writes the reply through `ipc_reply`.
+/// `cap_derive_badge`, and writes the reply through `ipc_reply`.
 ///
 /// Each namespace server owns its own `ipc_recv` loop — the receive
 /// surface is not bundled here because every realistic backend
@@ -265,7 +265,7 @@ pub trait NamespaceBackend
 /// `ns_labels::*` and pass them here; everything else is theirs to
 /// handle.
 ///
-/// `received.token` MUST be the `pack(node_id, rights)` token the
+/// `received.badge` MUST be the `pack(node_id, rights)` badge the
 /// kernel delivered with the request. Backends do not see the wire
 /// layer — they only see decoded `NodeId` / `&[u8]` / `u64`
 /// arguments.
@@ -325,7 +325,7 @@ fn handle_lookup<B: NamespaceBackend>(
     namespace_endpoint: u32,
 ) -> ipc::IpcMessage
 {
-    let (parent, parent_rights) = token::unpack(msg.token);
+    let (parent, parent_rights) = badge::unpack(msg.badge);
     if !parent_rights.contains(rights::LOOKUP)
     {
         return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
@@ -368,10 +368,10 @@ fn handle_lookup<B: NamespaceBackend>(
     {
         EntryTarget::Local(node) =>
         {
-            let token = pack(node, returned_rights);
-            if token == 0
+            let badge = pack(node, returned_rights);
+            if badge == 0
             {
-                // cap_derive_token requires non-zero token.
+                // cap_derive_badge requires non-zero badge.
                 return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
             }
             // SEND_GRANT lets the holder attach caps to IPC requests
@@ -380,10 +380,10 @@ fn handle_lookup<B: NamespaceBackend>(
             // `FS_READ_FRAME`). It does not widen authority — the
             // recipient still validates every received cap. SEND-only
             // would force the kernel to reject any cap-bearing IPC.
-            match syscall::cap_derive_token(
+            match syscall::cap_derive_badge(
                 namespace_endpoint,
                 syscall_abi::RIGHTS_SEND_GRANT,
-                token,
+                badge,
             )
             {
                 Ok(slot) => slot,
@@ -413,7 +413,7 @@ fn handle_lookup<B: NamespaceBackend>(
 
 fn handle_stat<B: NamespaceBackend>(backend: &mut B, msg: &ipc::IpcMessage) -> ipc::IpcMessage
 {
-    let (node, node_rights) = token::unpack(msg.token);
+    let (node, node_rights) = badge::unpack(msg.badge);
     if !node_rights.contains(rights::STAT)
     {
         return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
@@ -431,7 +431,7 @@ fn handle_stat<B: NamespaceBackend>(backend: &mut B, msg: &ipc::IpcMessage) -> i
 
 fn handle_readdir<B: NamespaceBackend>(backend: &mut B, msg: &ipc::IpcMessage) -> ipc::IpcMessage
 {
-    let (dir, dir_rights) = token::unpack(msg.token);
+    let (dir, dir_rights) = badge::unpack(msg.badge);
     if !dir_rights.contains(rights::READDIR)
     {
         return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());

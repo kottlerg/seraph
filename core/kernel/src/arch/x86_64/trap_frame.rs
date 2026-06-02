@@ -145,12 +145,12 @@ impl TrapFrame
         self.rdx = label;
     }
 
-    /// Write IPC return values with token: primary in rax, label in rdx, token in rsi.
-    pub fn set_ipc_return_with_token(&mut self, primary: u64, label: u64, token: u64)
+    /// Write IPC return values with badge: primary in rax, label in rdx, badge in rsi.
+    pub fn set_ipc_return_with_badge(&mut self, primary: u64, label: u64, badge: u64)
     {
         self.rax = primary;
         self.rdx = label;
-        self.rsi = token;
+        self.rsi = badge;
     }
 
     /// Write `SYS_IPC_CALL` return values: primary in rax, reply label in
@@ -163,12 +163,12 @@ impl TrapFrame
     }
 
     /// Write `SYS_IPC_RECV` return values: primary in rax, label in rdx,
-    /// token in rsi, data-word count in r8. Matches `shared/syscall::syscall1_ret4`.
-    pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, token: u64, word_count: u64)
+    /// badge in rsi, data-word count in r8. Matches `shared/syscall::syscall1_ret4`.
+    pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, badge: u64, word_count: u64)
     {
         self.rax = primary;
         self.rdx = label;
-        self.rsi = token;
+        self.rsi = badge;
         self.r8 = word_count;
     }
 

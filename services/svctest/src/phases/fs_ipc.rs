@@ -225,7 +225,7 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
         unknown_reply.label,
         ipc::fs_errors::UNKNOWN_OPCODE,
     );
-    std::os::seraph::log!("fs_rights_attenuation: unknown tokened label rejected");
+    std::os::seraph::log!("fs_rights_attenuation: unknown badged label rejected");
 
     let _ = syscall::cap_delete(stat_cap);
 

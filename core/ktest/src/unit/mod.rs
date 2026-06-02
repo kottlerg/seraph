@@ -94,22 +94,22 @@ pub fn run_all(ctx: &TestContext)
         "cap::create_event_q_over_max_err",
         cap::create_event_q_over_max_err(ctx)
     );
-    run_test!("cap::derive_token", cap::derive_token(ctx));
+    run_test!("cap::derive_badge", cap::derive_badge(ctx));
     run_test!(
-        "cap::derive_token_zero_err",
-        cap::derive_token_zero_err(ctx)
+        "cap::derive_badge_zero_err",
+        cap::derive_badge_zero_err(ctx)
     );
     run_test!(
-        "cap::derive_token_retoken_err",
-        cap::derive_token_retoken_err(ctx)
+        "cap::derive_badge_rebadge_err",
+        cap::derive_badge_rebadge_err(ctx)
     );
     run_test!(
-        "cap::derive_inherits_token",
-        cap::derive_inherits_token(ctx)
+        "cap::derive_inherits_badge",
+        cap::derive_inherits_badge(ctx)
     );
     run_test!(
-        "cap::derive_token_on_signal",
-        cap::derive_token_on_signal(ctx)
+        "cap::derive_badge_on_signal",
+        cap::derive_badge_on_signal(ctx)
     );
 
     // ── Capability inspection (SYS_CAP_INFO) ──────────────────────────────────
@@ -343,10 +343,10 @@ pub fn run_all(ctx: &TestContext)
         "ipc::call_with_cap_transfer",
         ipc::call_with_cap_transfer(ctx)
     );
-    run_test!("ipc::recv_delivers_token", ipc::recv_delivers_token(ctx));
+    run_test!("ipc::recv_delivers_badge", ipc::recv_delivers_badge(ctx));
     run_test!(
-        "ipc::recv_untokened_returns_zero",
-        ipc::recv_untokened_returns_zero(ctx)
+        "ipc::recv_unbadged_returns_zero",
+        ipc::recv_unbadged_returns_zero(ctx)
     );
     run_test!(
         "ipc::recv_snapshot_survives_buffer_clobber",

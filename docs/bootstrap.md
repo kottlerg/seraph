@@ -85,7 +85,7 @@ writes lines to serial directly from early boot onward. svcmgr launches and
 supervises the real `logd` post-handover, minting its bootstrap caps from the
 reserved log-sink sources init endows; the real `logd` then takes the receive
 side of the master log endpoint and pulls init-logd's captured history. The
-kernel endpoint object is unchanged across the transition, so existing tokened
+kernel endpoint object is unchanged across the transition, so existing badged
 SEND caps continue to work without re-derivation. See
 [`services/logd/docs/handover-protocol.md`](../services/logd/docs/handover-protocol.md).
 

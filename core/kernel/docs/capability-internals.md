@@ -99,9 +99,9 @@ pub struct CapabilitySlot
     /// Rights bitmask for this slot. Interpretation is tag-dependent.
     rights: Rights,
 
-    /// Caller-identifying token (0 = untokened). Set via SYS_CAP_DERIVE_TOKEN.
+    /// Caller-identifying badge (0 = unbadged). Set via SYS_CAP_DERIVE_BADGE.
     /// Immutable once set; inherited by derivation and copy.
-    token: u64,
+    badge: u64,
 
     /// Pointer to the kernel object this capability refers to.
     /// Null when tag == CapTag::Null.

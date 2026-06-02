@@ -34,9 +34,9 @@ pre-driver boot fallback) holds UART authority.
 
 Clients obtain a write cap through devmgr, not svcmgr: a UART is a device, not
 a service. devmgr answers [`devmgr_labels::QUERY_SERIAL_DEVICE`] by minting a
-[`serial_labels::WRITE_AUTHORITY`]-tokened `SEND_GRANT` cap on the driver's
+[`serial_labels::WRITE_AUTHORITY`]-badged `SEND_GRANT` cap on the driver's
 service endpoint, mirroring the `QUERY_BLOCK_DEVICE` flow. The caller's
-devmgr-registry token must carry `REGISTRY_QUERY_AUTHORITY`.
+devmgr-registry badge must carry `REGISTRY_QUERY_AUTHORITY`.
 
 The boot-phase ownership of console output (bootloader → kernel early console →
 init-logd direct-UART fallback → this driver) is described in
@@ -91,7 +91,7 @@ implemented.
 | [services/drivers/docs/driver-model.md](../docs/driver-model.md) | Driver lifecycle and capability delegation |
 | [docs/device-management.md](../../../docs/device-management.md) | Driver discovery, spawning, security boundary |
 | [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
-| [docs/capability-model.md](../../../docs/capability-model.md) | Capability types, rights, delegation, tokens |
+| [docs/capability-model.md](../../../docs/capability-model.md) | Capability types, rights, delegation, badges |
 
 ---
 

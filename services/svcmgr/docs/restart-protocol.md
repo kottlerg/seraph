@@ -13,8 +13,8 @@ service's table index as the correlator. When a thread exits — either
 cleanly via `SYS_THREAD_EXIT` or due to an unhandled fault — the
 kernel posts `(correlator << 32) | exit_reason` to `deaths_eq`.
 
-The WaitSet has two members: the service endpoint (token 0) and the
-deaths queue (token 1). On wakeup svcmgr drains the queue and routes
+The WaitSet has two members: the service endpoint (badge 0) and the
+deaths queue (badge 1). On wakeup svcmgr drains the queue and routes
 each payload to its `ServiceEntry` via the correlator, then dispatches
 through [`restart::handle_death`](../src/restart.rs).
 
@@ -93,7 +93,7 @@ the same procmgr-side primitives so a service's spawn shape is
 identical across both code paths:
 
 * [`mint_child_creator`](../src/restart.rs) — allocate a fresh
-  bootstrap token + tokened SEND on svcmgr's `bootstrap_ep`.
+  bootstrap badge + badged SEND on svcmgr's `bootstrap_ep`.
 * [`walk_and_create_from_file`](../src/restart.rs) — walk svcmgr's
   universal `root_dir_cap` for the binary path, then call
   `procmgr_labels::CREATE_FROM_FILE` with argv / env blobs. Both paths

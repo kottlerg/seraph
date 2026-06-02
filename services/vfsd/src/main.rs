@@ -7,7 +7,7 @@
 //!
 //! vfsd presents a unified virtual filesystem namespace to all other
 //! processes via a synthetic system-root cap. A mount installs a
-//! tokened SEND on the underlying driver's namespace endpoint into
+//! badged SEND on the underlying driver's namespace endpoint into
 //! `VfsdRootBackend`; clients walk that root via `NS_LOOKUP` and reach
 //! per-file node caps directly on the driver. After the walk vfsd is
 //! out of the path: file reads, frame requests, and closes go straight
@@ -62,7 +62,7 @@ pub struct VfsdCaps
     pub fatfs_module_cap: u32,
     pub self_aspace: u32,
     /// Worker-owned bootstrap endpoint. Populated after the bootstrap worker
-    /// thread is spawned. Main derives tokened SEND caps on this slot to hand
+    /// thread is spawned. Main derives badged SEND caps on this slot to hand
     /// to each fatfs child as its creator endpoint.
     pub bootstrap_ep: u32,
 }
@@ -237,11 +237,11 @@ fn main() -> !
     // resolving `/services/fs/fatfs` before a worker spawns a fresh fatfs
     // instance via procmgr `CREATE_FROM_FILE`). Mirrors the cap shape
     // returned by `GET_SYSTEM_ROOT_CAP` to external callers.
-    let token = namespace_protocol::pack(
+    let badge = namespace_protocol::pack(
         namespace_protocol::NodeId::ROOT,
         namespace_protocol::NamespaceRights::ALL,
     );
-    let Ok(system_root_cap) = syscall::cap_derive_token(namespace_ep, syscall::RIGHTS_SEND, token)
+    let Ok(system_root_cap) = syscall::cap_derive_badge(namespace_ep, syscall::RIGHTS_SEND, badge)
     else
     {
         std::os::seraph::log!("FATAL: vfsd internal system-root cap derive failed");
@@ -313,12 +313,12 @@ pub struct VfsdRuntime
     /// Boot-module fatfs cap consumed (and zeroed) by the very first MOUNT.
     /// Mutex-guarded because that MOUNT may land on any handler thread.
     pub boot_module_cap: Mutex<u32>,
-    /// Un-tokened SEND on vfsd's own namespace endpoint. Source of every
+    /// Un-badged SEND on vfsd's own namespace endpoint. Source of every
     /// node cap minted on the synthetic root (the system-root cap and
     /// any descendants that resolve to vfsd-local nodes — currently
     /// none, since the synthetic root only carries External entries).
     pub namespace_ep: u32,
-    /// Tokened SEND on `namespace_ep` addressing the synthetic root at
+    /// Badged SEND on `namespace_ep` addressing the synthetic root at
     /// full namespace rights. Vfsd's own copy of the system-root cap,
     /// minted at boot. Used by worker threads to walk the namespace
     /// (e.g. resolving `/services/fs/fatfs`) before issuing
@@ -372,17 +372,17 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
 
         let label = recv.label;
         let opcode = label & 0xFFFF;
-        let token = recv.token;
+        let badge = recv.badge;
 
         match opcode
         {
             ipc::vfsd_labels::MOUNT => handle_mount_request(&recv, ipc_buf, rt),
             ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
             {
-                if token & ipc::vfsd_labels::SEED_AUTHORITY == 0
+                if badge & ipc::vfsd_labels::SEED_AUTHORITY == 0
                 {
                     std::os::seraph::log!(
-                        "GET_SYSTEM_ROOT_CAP rejected: token lacks SEED_AUTHORITY"
+                        "GET_SYSTEM_ROOT_CAP rejected: badge lacks SEED_AUTHORITY"
                     );
                     let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
                     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
@@ -472,8 +472,8 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: ipc_buf invariant carried through; rt.namespace_ep is
-        // the un-tokened source for child caps minted by the protocol
-        // crate's `cap_derive_token` calls.
+        // the un-badged source for child caps minted by the protocol
+        // crate's `cap_derive_badge` calls.
         unsafe {
             namespace_protocol::dispatch_request(&mut *backend, &recv, rt.namespace_ep, ipc_buf);
         }
@@ -489,11 +489,11 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
 /// The outbound message is rebuilt with the same label, name bytes,
 /// and shape, but its `caller_requested` word (`word(0)`) is replaced
 /// by the intersection of the caller's parent rights (extracted from
-/// `recv.token`) with the caller's original `caller_requested` —
+/// `recv.badge`) with the caller's original `caller_requested` —
 /// computed via [`compose_forward_lookup_rights`]. Forwarding the
 /// caller's `word(0)` verbatim would launder authority because the
 /// receiving fs driver composes against the *destination cap's*
-/// token (the fall-through cap, full rights), not the caller's. The
+/// badge (the fall-through cap, full rights), not the caller's. The
 /// reply travels back unchanged: any cap it surfaces is the upstream
 /// fs's freshly-minted node cap, handed to the original caller
 /// directly. vfsd performs no cap derivation here, so no per-lookup
@@ -514,7 +514,7 @@ fn try_forward_lookup_fallthrough(
     // will produce the matching `NsError` reply (PermissionDenied or
     // NotSupported). Forwarding a request the caller could not have
     // issued locally would launder authority across the mount.
-    let parent = match gate(recv.label, recv.token)
+    let parent = match gate(recv.label, recv.badge)
     {
         Ok((node, _)) => node,
         Err(GateError::PermissionDenied | GateError::UnknownLabel) => return false,
@@ -553,8 +553,8 @@ fn try_forward_lookup_fallthrough(
     // so the receiving fs driver's
     // `parent_rights ∩ entry.max_rights ∩ caller_requested`
     // composition reflects the original caller's authority rather
-    // than the fall-through cap's full-rights token.
-    let composed_rights = compose_forward_lookup_rights(recv.token, recv.word(0));
+    // than the fall-through cap's full-rights badge.
+    let composed_rights = compose_forward_lookup_rights(recv.badge, recv.word(0));
     let forward = IpcMessage::builder(recv.label)
         .word(0, u64::from(composed_rights))
         .bytes(1, name)
@@ -573,14 +573,14 @@ fn try_forward_lookup_fallthrough(
 
 // ── System-root cap delivery ─────────────────────────────────────────────
 
-/// Handle [`vfsd_labels::GET_SYSTEM_ROOT_CAP`]: mint a fresh tokened SEND
+/// Handle [`vfsd_labels::GET_SYSTEM_ROOT_CAP`]: mint a fresh badged SEND
 /// on vfsd's namespace endpoint addressing the synthetic root at full
 /// rights and reply with it.
 ///
 /// Source for the seed cap init holds at bootstrap and from which all
 /// later tier-3 namespace-cap distribution flows. The dispatcher gates
 /// this entry on [`vfsd_labels::SEED_AUTHORITY`] in the caller's
-/// service-endpoint token: holding the bit is equivalent to holding
+/// service-endpoint badge: holding the bit is equivalent to holding
 /// the system-root cap, so only consumers explicitly entrusted with
 /// seed authority reach this handler.
 ///
@@ -605,12 +605,12 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
         return;
     }
 
-    let token = namespace_protocol::pack(
+    let badge = namespace_protocol::pack(
         namespace_protocol::NodeId::ROOT,
         namespace_protocol::NamespaceRights::ALL,
     );
     let reply = if let Ok(cap) =
-        syscall::cap_derive_token(rt.namespace_ep, syscall::RIGHTS_SEND, token)
+        syscall::cap_derive_badge(rt.namespace_ep, syscall::RIGHTS_SEND, badge)
     {
         IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
             .cap(cap)
@@ -811,11 +811,11 @@ fn log_cap_delete(context: &str, slot: u32)
 ///
 /// Looks up the UUID in the GPT table, registers the partition bound
 /// with virtio-blk, spawns a fatfs driver, registers a mount entry,
-/// and captures a tokened SEND on the driver's namespace endpoint
+/// and captures a badged SEND on the driver's namespace endpoint
 /// into [`VfsdRootBackend`] so the system-root cap can resolve through
 /// the new mount.
 ///
-/// On success returns a fresh tokened SEND for the caller (zero if
+/// On success returns a fresh badged SEND for the caller (zero if
 /// minting failed; the mount itself still landed). On failure
 /// returns the matching `vfsd_errors::*` label.
 // do_mount runs the full mount-and-publish transaction inline:
@@ -910,7 +910,7 @@ fn do_mount_internal(
     // transferred a derived child to procmgr; this releases vfsd's outer slot.
     log_cap_delete("module_cap (post-spawn)", module_cap_for_spawn);
 
-    // Mint two tokened SEND caps on the driver's namespace endpoint,
+    // Mint two badged SEND caps on the driver's namespace endpoint,
     // both addressing this mount's root at full namespace rights:
     //   - `caller_root_cap` rides back to the caller (or is dropped
     //     by an internal caller).
@@ -930,14 +930,14 @@ fn do_mount_internal(
     // (see `docs/namespace-model.md` § Revocation). Per-cap revocation
     // (e.g. revoking the synthetic-root entry without affecting the
     // caller's copy) is not supported by this scheme.
-    let root_token = namespace_protocol::pack(
+    let root_badge = namespace_protocol::pack(
         namespace_protocol::NodeId::ROOT,
         namespace_protocol::NamespaceRights::ALL,
     );
     let caller_root_cap =
-        syscall::cap_derive_token(driver_ep, syscall::RIGHTS_SEND, root_token).ok();
+        syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_SEND, root_badge).ok();
     let synthetic_root_cap =
-        syscall::cap_derive_token(driver_ep, syscall::RIGHTS_SEND, root_token).ok();
+        syscall::cap_derive_badge(driver_ep, syscall::RIGHTS_SEND, root_badge).ok();
 
     let Some(cap) = synthetic_root_cap
     else
@@ -1106,11 +1106,11 @@ fn idle_loop() -> !
 }
 
 /// Register a partition bound with virtio-blk and receive back a
-/// tokened `SEND_GRANT` cap scoped to that partition.
+/// badged `SEND_GRANT` cap scoped to that partition.
 ///
-/// vfsd's `rt.blk_ep` is itself a tokened cap (the `MOUNT_AUTHORITY` cap
+/// vfsd's `rt.blk_ep` is itself a badged cap (the `MOUNT_AUTHORITY` cap
 /// minted by devmgr), so vfsd cannot mint partition caps locally — the
-/// kernel rejects re-tokening of a tokened source. Partition cap
+/// kernel rejects re-badging of a badged source. Partition cap
 /// derivation lives server-side in virtio-blk; this call just sends the
 /// bounds and consumes the cap from the reply.
 fn derive_and_register_partition(

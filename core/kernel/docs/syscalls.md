@@ -135,7 +135,7 @@ are never reassigned or reused.
                                 45  SYS_MMIO_SPLIT
                                 46  SYS_THREAD_SLEEP
                                 47  SYS_THREAD_BIND_NOTIFICATION
-                                48  SYS_CAP_DERIVE_TOKEN
+                                48  SYS_CAP_DERIVE_BADGE
 ```
 
 **Implementation status.** Handlers implemented: 0–9 (IPC, signal, event
@@ -273,15 +273,15 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: label from the incoming message
-- `rsi`/`a2`: token from the sender's endpoint capability (0 if untokened)
+- `rsi`/`a2`: badge from the sender's endpoint capability (0 if unbadged)
 
 Data words up to `MSG_REGS_DATA_MAX` are returned in registers. Extended payload
 (when the sender set `flags` bit 0) is written to the receiver's IPC buffer page.
 The kernel places a reply capability into a per-thread slot (`reply_cap_slot`);
 this capability is retrieved implicitly by `SYS_IPC_REPLY`.
 
-The token is the value attached to the sender's endpoint capability via
-`SYS_CAP_DERIVE_TOKEN`. It identifies the caller without a forgeable PID.
+The badge is the value attached to the sender's endpoint capability via
+`SYS_CAP_DERIVE_BADGE`. It identifies the caller without a forgeable PID.
 
 **Capability requirement:** `endpoint_cap` must have Receive rights.
 
@@ -514,13 +514,13 @@ in the global derivation tree for revocation tracking.
 **Errors:** `InvalidCapability` (source invalid or null), `AccessDenied` (requested
 rights exceed those held in source), `OutOfMemory` (no free CSpace slot).
 
-If the source capability has a non-zero token, the derived capability inherits it.
+If the source capability has a non-zero badge, the derived capability inherits it.
 
 ---
 
-### `SYS_CAP_DERIVE_TOKEN` (48)
+### `SYS_CAP_DERIVE_BADGE` (48)
 
-Derive a new capability with an attached token value.
+Derive a new capability with an attached badge value.
 
 **Arguments:**
 
@@ -528,24 +528,24 @@ Derive a new capability with an attached token value.
 |---|---|---|
 | 0 | `source_cap` | Source capability descriptor |
 | 1 | `rights_mask` | Rights bitmask for the derived capability (subset of source) |
-| 2 | `token` | Token value to attach (must be non-zero) |
+| 2 | `badge` | Badge value to attach (must be non-zero) |
 
 **Return:** `rax`/`a0`: new capability descriptor on success; `SyscallError` on failure.
 
-The token is an immutable `u64` value stored in the capability slot. When the
-tokened capability is used for IPC (via `SYS_IPC_CALL`), the kernel delivers
-the token to the receiver as the third return value of `SYS_IPC_RECV`.
+The badge is an immutable `u64` value stored in the capability slot. When the
+badged capability is used for IPC (via `SYS_IPC_CALL`), the kernel delivers
+the badge to the receiver as the third return value of `SYS_IPC_RECV`.
 
-Tokens are generic — any capability type can carry a token, not just endpoints.
-For non-endpoint types, the token is stored but not delivered via any kernel
+Badges are generic — any capability type can carry a badge, not just endpoints.
+For non-endpoint types, the badge is stored but not delivered via any kernel
 mechanism; userspace can use it for bookkeeping.
 
-The source capability must have `token == 0`. Re-tokening (setting a new token
-on an already-tokened cap) returns `InvalidArgument`. Derivation via
-`SYS_CAP_DERIVE` inherits the source's token.
+The source capability must have `badge == 0`. Re-badging (setting a new badge
+on an already-badged cap) returns `InvalidArgument`. Derivation via
+`SYS_CAP_DERIVE` inherits the source's badge.
 
-**Errors:** `InvalidCapability`, `InvalidArgument` (token is zero or source
-already tokened), `OutOfMemory`.
+**Errors:** `InvalidCapability`, `InvalidArgument` (badge is zero or source
+already badged), `OutOfMemory`.
 
 ---
 
@@ -930,11 +930,11 @@ Add an IPC primitive to a wait set.
 |---|---|---|
 | 0 | `wait_set_cap` | Wait set capability (Modify rights) |
 | 1 | `source_cap` | Capability to an endpoint, signal, or event queue |
-| 2 | `token` | Opaque u64 returned to the caller when this source is ready |
+| 2 | `badge` | Opaque u64 returned to the caller when this source is ready |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The `token` is chosen by the caller to identify the source in a subsequent
+The `badge` is chosen by the caller to identify the source in a subsequent
 `SYS_WAIT_SET_WAIT` result. The kernel does not interpret it.
 
 **Capability requirements:** `wait_set_cap` (Modify), `source_cap` (at least one of
@@ -977,7 +977,7 @@ Block until any member of the wait set becomes ready.
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: token of the ready source (valid on success)
+- `rdx`/`a1`: badge of the ready source (valid on success)
 
 Only one ready source is returned per call (wake-one semantics). If multiple sources
 are ready simultaneously, subsequent calls return them without blocking.

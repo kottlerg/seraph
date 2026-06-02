@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// shared/namespace-protocol/src/token.rs
+// shared/namespace-protocol/src/badge.rs
 
-//! Node-cap token packing.
+//! Node-cap badge packing.
 //!
-//! A node cap is a tokened SEND on a server's namespace endpoint. The
-//! kernel does not interpret token bits; the namespace-protocol contract
+//! A node cap is a badged SEND on a server's namespace endpoint. The
+//! kernel does not interpret badge bits; the namespace-protocol contract
 //! owns the layout. This module is the single point at which that layout
 //! is defined.
 //!
@@ -31,18 +31,18 @@ use core::prelude::rust_2024::*;
 
 use crate::rights::{NamespaceRights, RIGHTS_MASK};
 
-/// Width of the `node_id` field within a node-cap token, in bits.
+/// Width of the `node_id` field within a node-cap badge, in bits.
 pub const NODE_ID_BITS: u32 = 40;
 
 /// Mask of all bits valid in a [`NodeId`] backing value.
 pub const NODE_ID_MASK: u64 = (1u64 << NODE_ID_BITS) - 1;
 
 /// Server-private inode identifier carried in the low [`NODE_ID_BITS`]
-/// of a node-cap token.
+/// of a node-cap badge.
 ///
 /// `NodeId(0)` is reserved as "the root of this server's namespace" by
 /// convention; backends MAY assign it any meaning they wish, but the
-/// crate emits root caps with token bits 0..40 = 0 by default.
+/// crate emits root caps with badge bits 0..40 = 0 by default.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 #[repr(transparent)]
 pub struct NodeId(u64);
@@ -87,23 +87,23 @@ impl NodeId
     }
 }
 
-/// Pack `(node_id, rights)` into the node-cap token's `u64` form.
+/// Pack `(node_id, rights)` into the node-cap badge's `u64` form.
 #[must_use]
 pub const fn pack(node_id: NodeId, rights: NamespaceRights) -> u64
 {
     node_id.raw() | ((rights.raw() as u64) << NODE_ID_BITS)
 }
 
-/// Unpack a node-cap token into `(node_id, rights)`. `pub(crate)` —
+/// Unpack a node-cap badge into `(node_id, rights)`. `pub(crate)` —
 /// external callers go through [`crate::gate::gate`]. Bits beyond the
 /// defined fields are masked off.
 #[must_use]
-pub(crate) const fn unpack(token: u64) -> (NodeId, NamespaceRights)
+pub(crate) const fn unpack(badge: u64) -> (NodeId, NamespaceRights)
 {
-    let node = NodeId::from_raw_truncated(token);
+    let node = NodeId::from_raw_truncated(badge);
     // Cast is range-safe: `RIGHTS_MASK` (24 bits) fits in u32.
     #[allow(clippy::cast_possible_truncation)]
-    let rights_raw = ((token >> NODE_ID_BITS) as u32) & RIGHTS_MASK;
+    let rights_raw = ((badge >> NODE_ID_BITS) as u32) & RIGHTS_MASK;
     (node, NamespaceRights::from_raw(rights_raw))
 }
 
@@ -139,8 +139,8 @@ mod tests
     {
         let node = NodeId::new(0xABCD_EF12).unwrap();
         let rights = NamespaceRights::from_raw(LOOKUP | READ | STAT);
-        let token = pack(node, rights);
-        let (n2, r2) = unpack(token);
+        let badge = pack(node, rights);
+        let (n2, r2) = unpack(badge);
         assert_eq!(n2, node);
         assert_eq!(r2, rights);
     }
@@ -148,28 +148,28 @@ mod tests
     #[test]
     fn pack_places_rights_in_high_bits()
     {
-        let token = pack(NodeId::ROOT, NamespaceRights::from_raw(LOOKUP));
-        assert_eq!(token, (LOOKUP as u64) << NODE_ID_BITS);
+        let badge = pack(NodeId::ROOT, NamespaceRights::from_raw(LOOKUP));
+        assert_eq!(badge, (LOOKUP as u64) << NODE_ID_BITS);
     }
 
     #[test]
     fn pack_places_node_id_in_low_bits()
     {
         let node = NodeId::new(0x1234_5678).unwrap();
-        let token = pack(node, NamespaceRights::NONE);
-        assert_eq!(token, node.raw());
+        let badge = pack(node, NamespaceRights::NONE);
+        assert_eq!(badge, node.raw());
     }
 
     #[test]
     fn unpack_preserves_reserved_rights_bits()
     {
         // Bits 8..23 of the rights field are reserved for future
-        // expansion. Reserved bits set in a packed token MUST round-
+        // expansion. Reserved bits set in a packed badge MUST round-
         // trip through unpack: future protocol revisions assigning
         // these bits MUST NOT be silently stripped by an older decoder.
         let reserved = NamespaceRights::from_raw(1 << 23);
-        let token = pack(NodeId::ROOT, reserved);
-        let (_, r) = unpack(token);
+        let badge = pack(NodeId::ROOT, reserved);
+        let (_, r) = unpack(badge);
         assert_eq!(r, reserved);
     }
 

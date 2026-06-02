@@ -13,8 +13,8 @@
 //!
 //! Every supervised service binds death notification onto the same
 //! `deaths_eq` with `correlator = service_index`. The wait set has two
-//! members: the service endpoint (token 0) and the deaths queue
-//! (token 1). On death wakeup svcmgr drains the queue and routes each
+//! members: the service endpoint (badge 0) and the deaths queue
+//! (badge 1). On death wakeup svcmgr drains the queue and routes each
 //! payload to its `ServiceEntry` via the correlator. Multiplexing
 //! avoids consuming a wait-set slot per supervised process and keeps
 //! the wait set inside the 16-member retype-bin sizing.
@@ -177,12 +177,12 @@ fn main() -> !
         halt_loop();
     };
 
-    if syscall::wait_set_add(ws_cap, caps.service_ep, WS_TOKEN_SERVICE).is_err()
+    if syscall::wait_set_add(ws_cap, caps.service_ep, WS_BADGE_SERVICE).is_err()
     {
         std::os::seraph::log!("failed to add service endpoint to wait set");
         halt_loop();
     }
-    if syscall::wait_set_add(ws_cap, deaths_eq, WS_TOKEN_DEATHS).is_err()
+    if syscall::wait_set_add(ws_cap, deaths_eq, WS_BADGE_DEATHS).is_err()
     {
         std::os::seraph::log!("failed to add deaths event queue to wait set");
         halt_loop();
@@ -210,7 +210,7 @@ fn main() -> !
 
 /// Publish the well-known names svcmgr owns into its own discovery
 /// registry, from the caps init endowed at handover. These are internal
-/// `registry.publish` calls (no `PUBLISH_AUTHORITY` token — svcmgr owns
+/// `registry.publish` calls (no `PUBLISH_AUTHORITY` badge — svcmgr owns
 /// the registry). Each provider's own `provides` names are published
 /// separately on the launch path ([`definitions::launch`]).
 fn publish_well_known(
@@ -220,7 +220,7 @@ fn publish_well_known(
 {
     // rootfs.root — SEND on the root filesystem's namespace endpoint,
     // endowed pre-derived by init. Published as-is; `registry_lookup_derived`
-    // re-derives a SEND per consumer and the token survives.
+    // re-derives a SEND per consumer and the badge survives.
     if caps.rootfs_root != 0
     {
         if registry
@@ -252,12 +252,12 @@ fn publish_well_known(
         Err(_) => std::os::seraph::log!("derive svcmgr SEND failed"),
     }
 
-    // devmgr.registry — `REGISTRY_QUERY_AUTHORITY`-tokened SEND minted from
-    // the endowed token-0 `SEND|GRANT` source. The token bit rides through
+    // devmgr.registry — `REGISTRY_QUERY_AUTHORITY`-badged SEND minted from
+    // the endowed badge-0 `SEND|GRANT` source. The badge bit rides through
     // `registry_lookup_derived`'s plain `cap_derive` to consumers.
     if caps.devmgr_registry != 0
     {
-        match syscall::cap_derive_token(
+        match syscall::cap_derive_badge(
             caps.devmgr_registry,
             syscall::RIGHTS_SEND,
             ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY,
@@ -322,7 +322,7 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
 
     // `RIGHTS_SEND_GRANT` (not bare SEND): SET_DRIVERS_DIR transfers the
     // dir cap, and the IPC kernel requires the GRANT bit to move caps.
-    let Ok(bind_ep) = syscall::cap_derive_token(
+    let Ok(bind_ep) = syscall::cap_derive_badge(
         caps.devmgr_registry,
         syscall::RIGHTS_SEND_GRANT,
         ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY,
@@ -359,10 +359,10 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
     }
 }
 
-/// `WaitSet` token for svcmgr's service endpoint.
-const WS_TOKEN_SERVICE: u64 = 0;
-/// `WaitSet` token for svcmgr's shared death event queue.
-const WS_TOKEN_DEATHS: u64 = 1;
+/// `WaitSet` badge for svcmgr's service endpoint.
+const WS_BADGE_SERVICE: u64 = 0;
+/// `WaitSet` badge for svcmgr's shared death event queue.
+const WS_BADGE_DEATHS: u64 = 1;
 
 /// Monitored service table, pending-registration table, discovery
 /// registry, and handover flag. Held across the event loop for the
@@ -413,18 +413,18 @@ fn event_loop(
 
     loop
     {
-        let Ok(token) = syscall::wait_set_wait(ws_cap)
+        let Ok(badge) = syscall::wait_set_wait(ws_cap)
         else
         {
             std::os::seraph::log!("wait_set_wait failed");
             continue;
         };
 
-        match token
+        match badge
         {
-            WS_TOKEN_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx),
-            WS_TOKEN_DEATHS => dispatch_deaths(deaths_eq, state, &restart_ctx),
-            _ => std::os::seraph::log!("unexpected wait-set token"),
+            WS_BADGE_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx),
+            WS_BADGE_DEATHS => dispatch_deaths(deaths_eq, state, &restart_ctx),
+            _ => std::os::seraph::log!("unexpected wait-set badge"),
         }
     }
 }
@@ -521,7 +521,7 @@ fn handle_publish_endpoint(
         code
     };
 
-    if msg.token & svcmgr_labels::PUBLISH_AUTHORITY == 0
+    if msg.badge & svcmgr_labels::PUBLISH_AUTHORITY == 0
     {
         return reject(ipc::svcmgr_errors::UNAUTHORIZED);
     }

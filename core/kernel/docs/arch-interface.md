@@ -220,13 +220,16 @@ pub unsafe extern "C" fn switch(
     save_flag: *const AtomicU32,
 );
 
-/// Activate `root_phys` and enter user mode for the first time via the trap
-/// frame `tf`. Does not return. On x86-64 the CR3 write and stack switch are
-/// atomic with `iretq` because the boot stack is absent from user address
-/// spaces; on RISC-V the boot stack lives in the direct map, so `satp` is
-/// written (with `sfence.vma`) and `sret` executed as separate steps.
-/// `set_kernel_trap_stack` must be called first.
-pub unsafe fn first_entry_to_user(root_phys: u64, tf: *const TrapFrame) -> !;
+/// Activate `aspace` and enter user mode for the first time via the trap frame
+/// `tf`. Does not return. Tags the entry when tagging is enabled, so init does
+/// not run its first quantum untagged. On x86-64 the CR3 write and stack switch
+/// stay atomic with `iretq` (the boot stack is absent from user address spaces),
+/// so the tag bookkeeping runs in Rust beforehand and the composed CR3 (root +
+/// PCID) is handed to the naked switch; on RISC-V the boot stack lives in the
+/// direct map, so this routes through `AddressSpace::activate` (tagged `satp`
+/// write + generation check) then `sret`. `aspace` must already be marked active
+/// on this CPU, and `set_kernel_trap_stack` must have been called first.
+pub unsafe fn first_entry_to_user(aspace: *const AddressSpace, tf: *const TrapFrame) -> !;
 
 /// Return from a trap to userspace, restoring full user register state from `tf`.
 /// Does not return.

@@ -334,10 +334,13 @@ generation check then flushes only that tag if it was reissued to a different sp
 (`tag_gen` mismatch) or accrued unmaps while this CPU was switched away (`tlb_gen` lag). A
 `SeqCst` fence between the scheduler's `mark_active` and the generation reads is the
 load-bearing barrier (paired with fences in the unmap and eviction paths) that closes the
-switch-away races. Where tagging is unavailable, or the tag pool is momentarily exhausted,
-`activate` falls back to `arch::current::paging::activate(root_phys)`, a full flush (CR3
-write with `CR4.PCIDE` clear / `satp` ASID 0 + `sfence.vma`). Threads sharing an address
-space require no TLB operation on switch. The per-CPU elided/performed flush counts are
+switch-away races. Where tagging is unavailable — no hardware tags, or a tag field too
+narrow to provide more usable tags than CPUs — `activate` uses the full-flush path
+`arch::current::paging::activate(root_phys)` (CR3 write with `CR4.PCIDE` clear / `satp`
+ASID 0 + `sfence.vma`) on every switch. When tagging is enabled the pool can never be
+exhausted (the allocator keeps more usable tags than CPUs, and at most one space per CPU is
+active), so a claim always succeeds and no user space ever runs untagged. Threads sharing an
+address space require no TLB operation on switch. The per-CPU elided/performed flush counts are
 summed by the `CAP_INFO_TLB_*` `cap_info` selectors.
 
 ### SMP TLB Shootdown

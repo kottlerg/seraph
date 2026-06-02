@@ -308,9 +308,17 @@ mod glue
     /// allocating the per-CPU tag-state slab for `cpu_count` CPUs.
     ///
     /// Call once on the BSP, before any AP runs a user thread. `hw_tags` is the
-    /// hardware tag count (`1 << PCID/ASID width`), clamped to [`TAG_CAP`]. If
-    /// fewer than two tags are usable (only the reserved tag 0), tagging stays
-    /// disabled and the full-flush fallback remains in effect.
+    /// hardware tag count (`1 << PCID/ASID width`), clamped to [`TAG_CAP`].
+    ///
+    /// Tagging is enabled only when the **usable** tag count (`n - 1`; tag 0 is
+    /// reserved) strictly exceeds `cpu_count`. This is load-bearing for
+    /// correctness, not just efficiency: at most `cpu_count` tags are active at
+    /// any instant, so `usable > cpu_count` guarantees a free-or-inactive tag
+    /// always exists and [`claim`] never has to run a user space untagged. A
+    /// user space under tag 0 while another CPU runs it under a real tag would
+    /// mix tags across the space and miss a shootdown. Where the hardware tag
+    /// field is too narrow (e.g. a 1-bit RISC-V ASID), tagging stays disabled
+    /// and the full-flush fallback remains in effect.
     ///
     /// # Safety
     /// Must run once on the BSP after the frame allocator is live (Phase 5),
@@ -323,7 +331,9 @@ mod glue
     )
     {
         let n = hw_tags.min(TAG_CAP);
-        if n < 2
+        // Usable tags are `1..n` (n - 1 of them); require strictly more than the
+        // CPU count so claim always succeeds (see the doc above).
+        if n < cpu_count + 2
         {
             return;
         }
@@ -344,10 +354,9 @@ mod glue
 
     /// Claim a tag for `as_ref`, allocating or evicting as needed.
     ///
-    /// Returns the claimed tag (`1..num_tags`), or `0` if every tag is currently
-    /// active and none can be evicted — the caller then falls back to the
-    /// untagged full-flush path. Stamps `as_ref.tag_gen` and publishes
-    /// `as_ref.tag`.
+    /// Returns a usable tag in `1..num_tags`; it never returns 0 while tagging
+    /// is enabled (the enablement gate guarantees a free-or-inactive tag always
+    /// exists). Stamps `as_ref.tag_gen` and publishes `as_ref.tag`.
     ///
     /// The current CPU must already be marked active on `as_ref` (the scheduler
     /// does this before `activate`), so this space cannot be chosen as its own
@@ -375,49 +384,69 @@ mod glue
             }
 
             // Pool full: evict the least-recently-claimed space whose tag is not
-            // currently active on any CPU (INV-4).
-            let mut floor = 0u64;
+            // currently active on any CPU (INV-4). The enablement gate keeps the
+            // usable tag count strictly above `cpu_count`, and active spaces are
+            // bounded by the CPU count, so an inactive in-use tag always exists.
+            // claim therefore never returns 0 when tagging is enabled — no user
+            // space ever runs untagged. The outer loop retries the scan to ride
+            // out the transient case where a candidate activates between
+            // selection and the active check (the least-recently-claimed tag is
+            // almost always inactive, so the first pass succeeds in practice).
+            let mut spins = 0u64;
             loop
             {
-                let Some((victim_tag, victim_at)) = pool.oldest_used_above(floor)
-                else
+                let mut floor = 0u64;
+                while let Some((victim_tag, victim_at)) = pool.oldest_used_above(floor)
                 {
-                    // Every tag is active; caller falls back to untagged.
-                    return 0;
-                };
+                    let victim = pool.owners[victim_tag as usize] as *const AddressSpace;
+                    // INV-1: under the pool lock we are the sole writer of any tag.
+                    // SAFETY: the victim is a live AddressSpace — its tag was
+                    // claimed under this lock and free_tag() (called before the
+                    // space is dropped) also takes this lock, so the pointer is
+                    // valid here.
+                    unsafe {
+                        (*victim).tag.store(0, Ordering::Release);
+                    }
+                    // INV-3 eviction-race Dekker: the revoke (store) is ordered
+                    // before the active-mask read (load), pairing with activate's
+                    // fence.
+                    core::sync::atomic::fence(Ordering::SeqCst);
+                    // SAFETY: victim is a live AddressSpace (see above).
+                    let active_empty = unsafe { (*victim).active_cpu_mask().is_empty() };
+                    if active_empty
+                    {
+                        // Safe to reuse: the victim is not running this tag. Other
+                        // CPUs that cached it while switched away are flushed
+                        // lazily by the owner_gen check on their next load of it.
+                        let claim_gen = pool.next_gen();
+                        pool.record(victim_tag, owner, claim_gen);
+                        as_ref.tag_gen.store(claim_gen, Ordering::Relaxed);
+                        as_ref.tag.store(victim_tag, Ordering::Release);
+                        return victim_tag;
+                    }
 
-                let victim = pool.owners[victim_tag as usize] as *const AddressSpace;
-                // INV-1: under the pool lock we are the sole writer of any tag.
-                // SAFETY: the victim is a live AddressSpace — its tag was claimed
-                // under this lock and free_tag() (called before the space is
-                // dropped) also takes this lock, so the pointer is valid here.
-                unsafe {
-                    (*victim).tag.store(0, Ordering::Release);
+                    // Victim is (or just became) active and may be running this
+                    // tag. Restore its claim (sole writer, INV-1) and try the
+                    // next-oldest. A transient tag-0 window on a *consistently*
+                    // tagged active space is harmless: its shootdowns degrade to
+                    // current-PCID invalidation, which is correct because all its
+                    // active CPUs share the same loaded tag.
+                    // SAFETY: victim is a live AddressSpace (see above).
+                    unsafe {
+                        (*victim).tag.store(victim_tag, Ordering::Release);
+                    }
+                    floor = victim_at;
                 }
-                // INV-3 eviction-race Dekker: the revoke (store) is ordered before
-                // the active-mask read (load), pairing with activate's fence.
-                core::sync::atomic::fence(Ordering::SeqCst);
-                // SAFETY: victim is a live AddressSpace (see above).
-                let active_empty = unsafe { (*victim).active_cpu_mask().is_empty() };
-                if active_empty
+
+                // A whole pass found every in-use tag transiently active. Given
+                // the gate this is a rare race, not exhaustion; retry. The guard
+                // mirrors the frame-allocator deadlock guard and fires only if
+                // the gate invariant is somehow violated.
+                spins += 1;
+                if spins > 10_000_000
                 {
-                    // Safe to reuse: the victim is not running this tag. Other
-                    // CPUs that cached it while switched away are flushed lazily
-                    // by the owner_gen check on their next load of this tag.
-                    let claim_gen = pool.next_gen();
-                    pool.record(victim_tag, owner, claim_gen);
-                    as_ref.tag_gen.store(claim_gen, Ordering::Relaxed);
-                    as_ref.tag.store(victim_tag, Ordering::Release);
-                    return victim_tag;
+                    crate::fatal("tag_allocator: eviction found no inactive victim");
                 }
-
-                // Victim is (or just became) active and may be running this tag.
-                // Restore its claim (sole writer, INV-1) and try the next-oldest.
-                // SAFETY: victim is a live AddressSpace (see above).
-                unsafe {
-                    (*victim).tag.store(victim_tag, Ordering::Release);
-                }
-                floor = victim_at;
             }
         })
     }

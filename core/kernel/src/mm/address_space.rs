@@ -106,6 +106,8 @@ pub struct AddressSpace
     /// unavailable). Claimed lazily on first `activate` from
     /// [`crate::mm::tag_allocator`]. Written only under the tag-pool lock
     /// (by the owner's own claim or by eviction); read lock-free by `activate`.
+    // dead_code: the tag fields are accessed only on `#[cfg(not(test))]` paths
+    // (activate / shootdown / destroy), so host-test builds see them as unread.
     #[allow(dead_code)]
     pub(crate) tag: AtomicU16,
     /// The global allocator generation stamped when this space claimed its
@@ -113,13 +115,13 @@ pub struct AddressSpace
     /// claim on a tag from any later space that reuses the same tag value, so a
     /// per-CPU generation check flushes a tag before its first use under a new
     /// owner.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // see `tag`
     pub(crate) tag_gen: AtomicU64,
     /// Bumped on every Replace-class modification (`unmap`, permission narrow).
     /// A CPU switched away from this space compares its last-synced value
     /// against this on reactivation and flushes the tag if it lags, catching
     /// unmaps it missed while it was elsewhere.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // see `tag`
     pub(crate) tlb_gen: AtomicU64,
 }
 
@@ -700,16 +702,21 @@ impl AddressSpace
         if tag == 0
         {
             tag = tag_allocator::claim(self);
-            if tag == 0
-            {
-                // Pool exhausted (every tag active): untagged full-flush fallback.
-                // SAFETY: caller's contract; root_phys is a valid root.
-                unsafe {
-                    activate(self.root_phys);
-                }
-                crate::percpu::record_ctxsw_flush(false);
-                return;
+        }
+        // `claim` never returns 0 when tagging is enabled (the enablement gate
+        // keeps usable tags > cpu_count, so a tag is always available). This
+        // defensive full-flush is unreachable; it exists so a logic error can
+        // never run a user space under tag 0 (which would mix tags across the
+        // space and miss a shootdown).
+        if tag == 0
+        {
+            debug_assert!(tag != 0, "claim returned 0 with tagging enabled");
+            // SAFETY: caller's contract; root_phys is a valid root.
+            unsafe {
+                activate(self.root_phys);
             }
+            crate::percpu::record_ctxsw_flush(false);
+            return;
         }
 
         let tag_gen = self.tag_gen.load(Ordering::Acquire);

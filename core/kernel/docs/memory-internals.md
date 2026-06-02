@@ -11,7 +11,7 @@ The memory subsystem comprises five components:
 2. **Slab allocator** — fixed-size kernel object allocation
 3. **Size-class allocator** — general variable-size kernel heap
 4. **Address space management** — per-process virtual address space objects
-5. **TLB management** — local invalidation, full-flush context switch, and SMP shootdown
+5. **TLB management** — local invalidation, tagged (PCID/ASID) no-flush context switch with a full-flush fallback, and SMP shootdown
 
 ---
 

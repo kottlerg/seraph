@@ -329,6 +329,24 @@ pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
     }
 }
 
+/// Per-CPU enable of ASID-tagged TLBs: report the number of hardware tags
+/// (ASIDs) this hart implements, or `0` when the `satp` ASID field is
+/// zero-width.
+///
+/// Called on the BSP and every AP. RISC-V needs no per-hart enable bit — the
+/// ASID is written directly into `satp` — so this only probes the implemented
+/// width. The BSP uses the returned count to seed the tag pool.
+///
+/// # Safety
+/// Must execute in S-mode with `satp` holding a valid root (Phase 5 onward).
+#[cfg(not(test))]
+pub unsafe fn enable_tagged_tlb() -> usize
+{
+    // SAFETY: caller's contract (S-mode, valid satp).
+    let bits = unsafe { super::cpu::probe_asid_bits() };
+    if bits == 0 { 0 } else { 1usize << bits }
+}
+
 /// No-op on RISC-V: the XN/NX mechanism is always available via PTE X bit.
 #[cfg(not(test))]
 pub unsafe fn enable_nx() {}
@@ -405,8 +423,10 @@ pub unsafe fn read_root_phys() -> u64
     unsafe {
         core::arch::asm!("csrr {}, satp", out(reg) satp, options(nostack, nomem));
     }
-    // PPN is satp[43:0]; physical address = PPN << 12.
-    (satp & 0x000F_FFFF_FFFF_FFFF) << 12
+    // PPN is satp[43:0] (44 bits); physical address = PPN << 12. The mask must
+    // exclude the ASID field (satp[59:44]) — a non-zero ASID under tagged TLBs
+    // would otherwise leak into the returned address.
+    (satp & 0x0000_0FFF_FFFF_FFFF) << 12
 }
 
 /// Map a single 4 KiB user page `virt` → `phys` in the Sv48 page table

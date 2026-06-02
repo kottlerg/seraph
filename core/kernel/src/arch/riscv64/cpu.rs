@@ -77,9 +77,7 @@ pub fn current_id() -> u32
 /// Must execute in S-mode with `satp` already holding a valid root (Phase 5
 /// onward). Transiently changes the active ASID; the restore + fence makes the
 /// change invisible to translation.
-// Wired into Phase 5 / AP init by the tagged-TLB boot-enablement path.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub unsafe fn probe_asid_bits() -> u32
 {
     /// ASID field starts at bit 44 of `satp` on RV64.

@@ -226,9 +226,7 @@ pub unsafe fn enable_smep_smap()
 /// Must execute at ring 0, after the IDT is loaded, with the kernel root in
 /// CR3 (low 12 bits zero). Must be called at most once per CPU and before any
 /// PCID-tagged CR3 load.
-// Wired into Phase 5 / AP init by the tagged-TLB boot-enablement path.
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub unsafe fn enable_pcid() -> bool
 {
     // CPUID.01H:ECX[17] = PCID; CPUID.(07H,0):EBX[10] = INVPCID.

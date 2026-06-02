@@ -160,6 +160,13 @@ pub unsafe fn flush_page_tagged(virt: u64, tag: u16);
 /// switched-away space accrued unmaps.
 pub unsafe fn flush_tag(tag: u16);
 
+/// Per-CPU enable of tagged TLBs; returns the number of hardware tags available
+/// (`0` when unsupported). x86-64 sets `CR4.PCIDE` and returns 4096; RISC-V
+/// probes the `satp` ASID width and returns `1 << width`. Called on the BSP
+/// (whose return seeds the tag pool) and on every AP (which must set its own
+/// `CR4.PCIDE` before any tagged CR3 load).
+pub unsafe fn enable_tagged_tlb() -> usize;
+
 /// Classify a user page fault as spurious (the live PTE already permits the
 /// access — a stale entry the handler resolves by retrying) versus a real fault.
 pub unsafe fn user_fault_is_spurious(va: u64, write: bool, instr: bool) -> bool;

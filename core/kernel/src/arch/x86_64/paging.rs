@@ -340,6 +340,30 @@ pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
     }
 }
 
+/// Per-CPU enable of PCID-tagged TLBs: set `CR4.PCIDE` and report the number of
+/// hardware tags (PCIDs) available, or `0` when PCID/INVPCID are unsupported.
+///
+/// Called on the BSP and every AP. On the BSP the returned count seeds the tag
+/// pool; on every CPU it sets `CR4.PCIDE`, required before any tagged CR3 load.
+///
+/// # Safety
+/// Must execute at ring 0 with the kernel root in CR3 (low 12 bits zero), at
+/// most once per CPU, before any tagged CR3 load.
+#[cfg(not(test))]
+pub unsafe fn enable_tagged_tlb() -> usize
+{
+    // SAFETY: caller's contract (ring 0, kernel root in CR3).
+    if unsafe { super::cpu::enable_pcid() }
+    {
+        // 12-bit PCID field ⇒ 4096 tags; tag 0 is reserved for kernel/fallback.
+        4096
+    }
+    else
+    {
+        0
+    }
+}
+
 /// Enable No-Execute by setting `IA32_EFER.NXE` (bit 11) via RDMSR/WRMSR.
 ///
 /// Must be called before activating page tables that use the NX bit,

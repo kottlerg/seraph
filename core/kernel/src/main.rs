@@ -294,6 +294,18 @@ unsafe fn kernel_entry_post_rebase(
         percpu::init_bsp();
     }
     kprintln!("percpu ok");
+    // Enable hardware address-space tags (x86-64 PCID / RISC-V ASID) where
+    // available, seeding the tag pool sized to boot_cpu_count. Where the feature
+    // is absent this is a no-op and the kernel keeps the full-flush
+    // context-switch path. Must precede any tagged activate (Phase 9 / scheduler).
+    #[cfg(not(test))]
+    // SAFETY: BSP, ring 0 / S-mode; kernel root active; `allocator` is the live
+    // frame allocator; called once before any tagged activate.
+    unsafe {
+        let hw_tags = arch::current::paging::enable_tagged_tlb();
+        mm::tag_allocator::enable(hw_tags, boot_cpu_count as usize, allocator);
+    }
+    kprintln!("tagged-tlb ok");
     // SAFETY: IDT installed and interrupts initialized above; syscall entry
     // point registered during arch init; single-threaded boot phase.
     unsafe {
@@ -1252,6 +1264,18 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // handler registered (Phase 5, BSP); per-CPU timer configuration.
     unsafe {
         arch::current::timer::init_ap(1_000);
+    }
+
+    // Enable hardware address-space tags on this AP (x86-64 sets CR4.PCIDE;
+    // RISC-V probes its ASID width). Must precede this AP's first tagged
+    // activate in the scheduler. If the BSP enabled tagging but this CPU lacks
+    // the feature, the tagged path cannot run here — a fatal heterogeneity.
+    // SAFETY: ring 0 / S-mode; kernel root active; once per AP, before any
+    // tagged activate.
+    let ap_hw_tags = unsafe { arch::current::paging::enable_tagged_tlb() };
+    if mm::tag_allocator::tagging_enabled() && ap_hw_tags == 0
+    {
+        fatal("AP lacks the hardware TLB tags enabled on the BSP");
     }
 
     kprintln!("smp: AP {} online", cpu_id);

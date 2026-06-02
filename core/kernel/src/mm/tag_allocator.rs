@@ -314,10 +314,13 @@ mod glue
     ///
     /// # Safety
     /// Must run once on the BSP after the frame allocator is live (Phase 5),
-    /// before any CPU performs a tagged activate.
-    // Wired into Phase 5 / AP init by the tagged-TLB boot-enablement path.
-    #[allow(dead_code)]
-    pub unsafe fn enable(hw_tags: usize, cpu_count: usize)
+    /// before any CPU performs a tagged activate. `allocator` must be the live
+    /// frame allocator (exclusive access during this call).
+    pub unsafe fn enable(
+        hw_tags: usize,
+        cpu_count: usize,
+        allocator: &mut crate::mm::BuddyAllocator,
+    )
     {
         let n = hw_tags.min(TAG_CAP);
         if n < 2
@@ -328,9 +331,8 @@ mod glue
         // Zero-filled slab: owner_gen 0 never matches a real tag_gen, so the
         // first activate of any tag on any CPU flushes it.
         let bytes = cpu_count * n * core::mem::size_of::<TagState>();
-        let slab = crate::mm::with_frame_allocator(|alloc| {
-            crate::sched::alloc_zeroed_slab::<TagState>(bytes, alloc, "PER_CPU_TAG_STATE")
-        });
+        let slab =
+            crate::sched::alloc_zeroed_slab::<TagState>(bytes, allocator, "PER_CPU_TAG_STATE");
         PER_CPU_TAG_STATE.store(slab, Ordering::Release);
 
         with_tag_pool(|pool| pool.configure(n));

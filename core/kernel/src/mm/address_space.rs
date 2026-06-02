@@ -707,6 +707,7 @@ impl AddressSpace
                 unsafe {
                     activate(self.root_phys);
                 }
+                crate::percpu::record_ctxsw_flush(false);
                 return;
             }
         }
@@ -735,6 +736,11 @@ impl AddressSpace
                 flush_tag(tag);
                 tag_allocator::set_tag_state(cpu, tag, tag_gen, tlb_gen);
             }
+            crate::percpu::record_ctxsw_flush(false);
+        }
+        else
+        {
+            crate::percpu::record_ctxsw_flush(true);
         }
     }
 

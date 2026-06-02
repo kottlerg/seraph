@@ -173,4 +173,21 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     {
         crate::log_u64("ktest: bench  cycles_per_switch=", per);
     }
+
+    // Tagged-TLB intrinsic metric. These are cumulative system-wide counts of
+    // context-switch activations that elided the TLB flush versus performed it
+    // (tag reissue, switched-away unmap catch-up, or fallback). This is the
+    // emulation-independent signal: QEMU TCG does not model TLB-refill timing,
+    // so cycles_per_switch above is not a faithful cost measure, but these
+    // counters reflect intrinsic behaviour. A working optimization shows elided
+    // dominating; both are 0 when the hardware lacks tagging (full-flush path).
+    // The parent⇄child ping-pong above shares an address space, so it adds no
+    // tagged activations of its own; the totals reflect every cross-space and
+    // post-block re-activation since boot.
+    let elided =
+        syscall::cap_info(ctx.memory_frame_base, syscall_abi::CAP_INFO_TLB_ELIDED).unwrap_or(0);
+    let performed =
+        syscall::cap_info(ctx.memory_frame_base, syscall_abi::CAP_INFO_TLB_PERFORMED).unwrap_or(0);
+    crate::log_u64("ktest: bench  ctxsw_flush_elided_total=", elided);
+    crate::log_u64("ktest: bench  ctxsw_flush_performed_total=", performed);
 }

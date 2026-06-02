@@ -296,4 +296,4 @@ The merge-gating rule (CI must pass green before merge) lives in
 
 ## Summarized By
 
-[README.md](../README.md), [conventions.md](conventions.md)
+[README.md](../README.md), [conventions.md](conventions.md), [ruststd/README.md](../runtime/ruststd/README.md)

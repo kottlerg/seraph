@@ -109,8 +109,8 @@ impl SeraphToolchain
     /// `SERAPH_SHIM_*` config vars (so the shim knows what to exec),
     /// and `RUSTC_BOOTSTRAP=1`.
     ///
-    /// `RUSTC_BOOTSTRAP=1` lets the StdUser builds use the unstable
-    /// features `-Zbuild-std` and the std overlay's workspace deps
+    /// `RUSTC_BOOTSTRAP=1` unlocks the unstable features that
+    /// `-Zbuild-std` and the std overlay's workspace deps
     /// (`process-abi`, `syscall`, `ipc`, `shmem`, `log`) require —
     /// `rustc_private` and the `rustc-dep-of-std` machinery. The
     /// `seraph` OS is recognised as a std target by an overlay on std's

@@ -74,22 +74,24 @@ Manages hardware page tables. A page table is referenced by its physical root fr
 intermediate frames are allocated from and returned to the kernel page-table pool.
 
 ```rust
-/// Install `root_phys` as the active page table for the current CPU.
-///
-/// Performs a full TLB flush: x86-64 writes CR3 (with CR4.PCIDE clear, so the
-/// write flushes all non-global entries); RISC-V writes `satp` (ASID 0) and
-/// executes `sfence.vma`. The kernel does not use hardware address-space tags;
-/// see docs/memory-model.md (tagged TLBs are tracked in #198).
+/// Install `root_phys` as the active page table for the current CPU with a full
+/// TLB flush: x86-64 writes CR3 with PCID 0 (flushing PCID 0's entries); RISC-V
+/// writes `satp` with ASID 0 and executes `sfence.vma`. This is the untagged
+/// fallback path, used when hardware tagging is unavailable or the tag pool is
+/// exhausted; the tagged context-switch path uses `activate_tagged` (below),
+/// driven by `AddressSpace::activate`. See docs/memory-model.md.
 ///
 /// # Safety
 /// `root_phys` must be a valid page-table root mapping current code, stack, and
 /// the direct map.
 pub unsafe fn activate(root_phys: u64);
 
-/// Write the page-table root without an explicit flush. On RISC-V this writes
-/// `satp` without `sfence.vma` (idle-thread transitions, where stale user
-/// entries are harmless). On x86-64 a CR3 write always flushes, so this is a
-/// compatibility shim equivalent to `activate`.
+/// Write the page-table root without an explicit flush (idle / kernel
+/// transitions, where the outgoing space's stale user entries are harmless).
+/// RISC-V writes `satp` (ASID 0) without `sfence.vma`. On x86-64 this loads the
+/// kernel root under PCID 0 with CR3 bit 63 (no invalidation) when `CR4.PCIDE`
+/// is set; without PCID a CR3 write necessarily flushes, so it degrades to
+/// `activate`.
 pub unsafe fn write_satp_no_fence(root_phys: u64);
 
 /// Read the active page-table root physical address (CR3 on x86-64 with the low

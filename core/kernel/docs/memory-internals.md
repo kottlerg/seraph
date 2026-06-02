@@ -316,18 +316,29 @@ is established by mapping the same frame capability into multiple address spaces
 Local invalidation primitives live in the per-architecture paging modules:
 `arch::current::paging::flush_page` invalidates a single VA on the current CPU
 (`invlpg` / `sfence.vma <va>`), and `flush_tlb_all` invalidates all non-global entries
-(CR3 reload / `sfence.vma zero, zero`). Cross-CPU invalidation is the shootdown protocol
-in `mm/tlb_shootdown.rs`. The kernel uses no hardware address-space tags (PCID/ASID); see
-[docs/memory-model.md](../../../docs/memory-model.md). Tagged TLBs are tracked as future
-work in [#198](https://github.com/kottlerg/seraph/issues/198).
+(CR3 reload / `sfence.vma zero, zero`). When tagging is active, `flush_page_tagged` and
+`flush_tag` invalidate a single VA or a whole tag for an arbitrary PCID/ASID (`invpcid` /
+`sfence.vma <va>, <asid>` and `sfence.vma zero, <asid>`), independent of the tag currently
+loaded. Cross-CPU invalidation is the shootdown protocol in `mm/tlb_shootdown.rs`. The tag
+allocator and per-address-space tag state live in `mm/tag_allocator.rs`; see
+[docs/memory-model.md](../../../docs/memory-model.md) for the model.
 
 ### Context Switch TLB Handling
 
-A switch between threads in different address spaces calls
-`arch::current::paging::activate(root_phys)`, which performs a full TLB flush: x86-64
-writes CR3 with `CR4.PCIDE` clear (flushing all non-global entries); RISC-V writes `satp`
-with ASID 0 and executes `sfence.vma`. Threads sharing an address space require no TLB
-operation on switch.
+When tagging is enabled, a switch to a different address space calls
+`AddressSpace::activate`, which claims a hardware tag for the space (lazily, on first
+activation) and loads the root under that tag **without** flushing
+(`arch::current::paging::activate_tagged`): x86-64 writes CR3 with the PCID and bit 63 set
+(`CR4.PCIDE` is on); RISC-V writes `satp` with the ASID and no `sfence.vma`. A per-CPU
+generation check then flushes only that tag if it was reissued to a different space
+(`tag_gen` mismatch) or accrued unmaps while this CPU was switched away (`tlb_gen` lag). A
+`SeqCst` fence between the scheduler's `mark_active` and the generation reads is the
+load-bearing barrier (paired with fences in the unmap and eviction paths) that closes the
+switch-away races. Where tagging is unavailable, or the tag pool is momentarily exhausted,
+`activate` falls back to `arch::current::paging::activate(root_phys)`, a full flush (CR3
+write with `CR4.PCIDE` clear / `satp` ASID 0 + `sfence.vma`). Threads sharing an address
+space require no TLB operation on switch. The per-CPU elided/performed flush counts are
+summed by the `CAP_INFO_TLB_*` `cap_info` selectors.
 
 ### SMP TLB Shootdown
 
@@ -338,20 +349,22 @@ work: holding it across the IPI ack-wait would serialize every concurrent map/un
 on the address space behind cross-CPU latency.
 
 The shootdown itself is lock-free — there is no global shootdown lock and no IPI
-payload. Each CPU owns a request slot. The initiator publishes `(root, virt)` into
+payload. Each CPU owns a request slot. The initiator publishes `(root, virt, tag)` into
 its own slot, sets the pending bit of each target CPU, then sends the IPI:
 
 ```
 1. Edit the leaf PTE under pt_lock; release pt_lock.
-2. Read active_cpus; exclude the current CPU.
-3. Publish (root, virt) into this CPU's request slot and set each target's
+2. Bump the space's tlb_gen and fence (so a switched-away CPU flushes on
+   reactivation); read active_cpus; exclude the current CPU.
+3. Publish (root, virt, tag) into this CPU's request slot and set each target's
    pending bit (the bit doubles as the per-target liveness/ack token).
 4. Send the shootdown IPI to the targets and wait for every pending bit to clear.
 ```
 
 A target services the slot only once it observes its own pending bit set, so it never
-reads a half-published request; it flushes the named VA and clears its bit. Preemption
-stays disabled across the whole edit-then-shootdown sequence.
+reads a half-published request; it invalidates the named VA for `tag` (so a CPU that has
+since switched to another space still flushes the right translation) and clears its bit.
+Preemption stays disabled across the whole edit-then-shootdown sequence.
 
 The shootdown is **not** issued unconditionally. Each rewrite is classified as it
 commits (`MapOutcome`):
@@ -364,8 +377,14 @@ commits (`MapOutcome`):
   shootdown above: a stale entry would alias a freed/reused frame or cache revoked
   rights, which no retry can recover. `unmap` is always synchronous.
 
-A CPU that switches away from the address space before acking is harmless: a context
-switch reloads the page-table root and flushes that space's user entries.
+The shootdown targets only CPUs currently running the space (`active_cpus`). A CPU that
+switched away still holds the space's tagged entries (the switch did not flush them), so it
+is reached not by the IPI but by the per-CPU generation check on its next reactivation: step
+2 bumped the space's `tlb_gen` before snapshotting `active_cpus`, and a `SeqCst` fence on
+each side guarantees that for every CPU either the initiator sees it active (and IPIs it) or
+it observes the bumped `tlb_gen` on reactivation (and flushes the tag). Never neither. On
+the full-flush fallback (no tagging) the request carries `tag == 0` and the switch already
+flushed the outgoing space's entries, so a switched-away CPU has nothing stale.
 
 ### Direct Physical Map Access
 

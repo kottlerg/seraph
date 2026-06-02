@@ -2695,12 +2695,10 @@ pub fn enter() -> !
     // find the correct frame when the thread is running.
     init_tcb.trap_frame = tf_ptr;
 
-    // Read init's page table root before entering the switch function.
-    // SAFETY: init_tcb.address_space is non-null and valid, set up in main.rs Phase 9 init;
-    // root_phys field is always valid.
-    let root_phys = unsafe { (*init_tcb.address_space).root_phys };
-
-    // Mark init's address space as active on CPU 0 (BSP) before entering user mode.
+    // Mark init's address space as active on CPU 0 (BSP) before entering user
+    // mode. Must precede `first_entry_to_user`, which tags the entry: the active
+    // bit lets init's space claim a tag without being its own eviction victim,
+    // and pairs with the SeqCst fence in `AddressSpace::activate`.
     // SAFETY: init_tcb.address_space is a valid AddressSpace pointer; mark_active_on_cpu
     // uses Release ordering to ensure address space setup is visible before marking active.
     unsafe {
@@ -2713,13 +2711,13 @@ pub fn enter() -> !
 
     crate::kprintln!("sched: enter - handing control to init");
 
-    // Activate init's address space and enter user mode.
-    // `first_entry_to_user` handles the arch-specific sequence:
-    //   x86-64: atomically switches CR3 and executes iretq from init's kernel stack.
-    //   RISC-V: writes satp (sfence serializes), then executes sret.
-    // SAFETY: root_phys is init's valid page-table root (from Phase 9 init address space);
+    // Activate init's address space (tagged when tagging is enabled) and enter
+    // user mode. `first_entry_to_user` handles the arch-specific sequence:
+    //   x86-64: switches CR3 (root + PCID) and executes iretq from init's kernel stack.
+    //   RISC-V: writes satp (tagged), generation-checks, then executes sret.
+    // SAFETY: init_tcb.address_space is a valid AddressSpace marked active above;
     // tf_ptr points to a valid, initialized TrapFrame on init's kernel stack.
     unsafe {
-        crate::arch::current::context::first_entry_to_user(root_phys, tf_ptr);
+        crate::arch::current::context::first_entry_to_user(init_tcb.address_space, tf_ptr);
     }
 }

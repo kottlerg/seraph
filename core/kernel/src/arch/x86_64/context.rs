@@ -312,21 +312,61 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
 
 // ── first_entry_to_user ───────────────────────────────────────────────────────
 
-/// Switch to a new address space and enter user mode for the first time.
+/// Switch to a new (tagged) address space and enter user mode for the first
+/// time.
 ///
-/// Architecture-neutral entry point for `sched::enter`. On x86-64 this
-/// delegates to [`switch_and_enter_user`], which atomically switches CR3 and
-/// discards the boot stack before executing `iretq`.
+/// Architecture-neutral entry point for `sched::enter`. The CR3 write happens
+/// inside the naked [`switch_and_enter_user`] because the boot stack (identity-
+/// mapped, PML4 0–255) vanishes after the switch, so `AddressSpace::activate`
+/// cannot run between the CR3 write and `iretq` — its `ret` would fault on the
+/// gone boot stack. Instead this does the tagged bookkeeping (claim a tag,
+/// record the per-CPU sync) in Rust here, on the still-mapped boot stack, then
+/// hands the composed CR3 value (root | PCID) to the naked switch. With tagging
+/// disabled it passes the bare root (a full-flush CR3 load).
 ///
 /// # Safety
-/// Same contract as [`switch_and_enter_user`]: TSS RSP0 and
+/// `aspace` must be a valid `AddressSpace` already marked active on this CPU.
+/// Otherwise the [`switch_and_enter_user`] contract: TSS RSP0 and
 /// `SYSCALL_KERNEL_RSP` must already be set to init's `kernel_stack_top`.
+///
+/// [`AddressSpace::activate`]: crate::mm::address_space::AddressSpace::activate
 #[cfg(not(test))]
-pub unsafe fn first_entry_to_user(root_phys: u64, tf: *const super::trap_frame::TrapFrame) -> !
+pub unsafe fn first_entry_to_user(
+    aspace: *const crate::mm::address_space::AddressSpace,
+    tf: *const super::trap_frame::TrapFrame,
+) -> !
 {
-    // SAFETY: caller guarantees root_phys and tf satisfy switch_and_enter_user contract;
-    // TSS RSP0 and SYSCALL_KERNEL_RSP already set.
-    unsafe { switch_and_enter_user(root_phys, tf) }
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: aspace is a valid AddressSpace (caller's contract).
+    let root = unsafe { (*aspace).root_phys };
+    let cr3 = if crate::mm::tag_allocator::tagging_enabled()
+    {
+        // Claim init's tag and record this CPU's sync for it. The CR3 write in
+        // switch_and_enter_user has bit 63 clear, so it flushes PCID `tag`
+        // (correct for the first use of the tag), and the recorded sync makes
+        // init's next activate elide.
+        // SAFETY: tagging enabled; aspace is active on this CPU (the scheduler
+        // marked it), so it cannot be its own eviction victim; the per-CPU slab
+        // is initialised and cpu/tag are in range.
+        let tag = crate::mm::tag_allocator::claim(unsafe { &*aspace });
+        let cpu = super::cpu::current_cpu() as usize;
+        // SAFETY: see above.
+        unsafe {
+            let tag_gen = (*aspace).tag_gen.load(Ordering::Acquire);
+            let tlb_gen = (*aspace).tlb_gen.load(Ordering::Acquire);
+            crate::mm::tag_allocator::set_tag_state(cpu, tag, tag_gen, tlb_gen);
+        }
+        root | u64::from(tag)
+    }
+    else
+    {
+        root
+    };
+
+    // SAFETY: cr3 is a valid CR3 value (PML4 root + optional PCID, bit 63 clear);
+    // tf satisfies switch_and_enter_user's contract; TSS RSP0 / SYSCALL_KERNEL_RSP set.
+    unsafe { switch_and_enter_user(cr3, tf) }
 }
 
 // ── switch_and_enter_user ─────────────────────────────────────────────────────
@@ -341,13 +381,15 @@ pub unsafe fn first_entry_to_user(root_phys: u64, tf: *const super::trap_frame::
 /// spaces).
 ///
 /// # Parameters
-/// - `root_phys` (rdi): physical address of init's PML4 root.
+/// - `cr3` (rdi): the CR3 value to load — init's PML4 root, optionally OR'd with
+///   a PCID in bits \[11:0\] (bit 63 clear, so the load flushes that PCID).
 /// - `tf` (rsi): pointer to the zeroed-and-filled [`TrapFrame`] on init's
 ///   kernel stack (at `kernel_stack_top - sizeof(TrapFrame)`).
 ///
 /// # Safety
-/// - `root_phys` must be the physical address of a valid 4 KiB-aligned PML4
-///   that maps the kernel upper half (entries 256–511) and the direct map.
+/// - `cr3` must encode a valid 4 KiB-aligned PML4 that maps the kernel upper
+///   half (entries 256–511) and the direct map; any PCID bits require
+///   `CR4.PCIDE` set.
 /// - `tf` must point to a `TrapFrame` on the direct-mapped init kernel stack,
 ///   with `rip`, `rsp`, `cs`, `ss`, and `rflags` set for user-mode entry.
 /// - TSS RSP0 and `SYSCALL_KERNEL_RSP` must be set to init's `kernel_stack_top`
@@ -355,11 +397,11 @@ pub unsafe fn first_entry_to_user(root_phys: u64, tf: *const super::trap_frame::
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_and_enter_user(
-    root_phys: u64,
+    cr3: u64,
     tf: *const super::trap_frame::TrapFrame,
 ) -> !
 {
-    // rdi = root_phys, rsi = tf (*const TrapFrame)
+    // rdi = cr3 value, rsi = tf (*const TrapFrame)
     // TrapFrame field offsets (from trap_frame.rs):
     //   rax=0, rbx=8, rcx=16, rdx=24, rsi=32, rdi=40, rbp=48,
     //   r8=56, r9=64, r10=72, r11=80, r12=88, r13=96, r14=104, r15=112,

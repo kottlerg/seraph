@@ -1268,14 +1268,17 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
 
     // Enable hardware address-space tags on this AP (x86-64 sets CR4.PCIDE;
     // RISC-V probes its ASID width). Must precede this AP's first tagged
-    // activate in the scheduler. If the BSP enabled tagging but this CPU lacks
-    // the feature, the tagged path cannot run here — a fatal heterogeneity.
+    // activate in the scheduler. If this CPU provides fewer tags than the pool
+    // the BSP configured, the tagged path could load a tag past this hart's
+    // tag-field width (RISC-V: a too-narrow ASID), aliasing address spaces —
+    // a fatal heterogeneity. (`< num_tags` also covers a CPU with no tags at
+    // all; on x86 enable_tagged_tlb returns 4096 or 0, so only 0 trips it.)
     // SAFETY: ring 0 / S-mode; kernel root active; once per AP, before any
     // tagged activate.
     let ap_hw_tags = unsafe { arch::current::paging::enable_tagged_tlb() };
-    if mm::tag_allocator::tagging_enabled() && ap_hw_tags == 0
+    if mm::tag_allocator::tagging_enabled() && ap_hw_tags < mm::tag_allocator::num_tags()
     {
-        fatal("AP lacks the hardware TLB tags enabled on the BSP");
+        fatal("AP provides fewer hardware TLB tags than the BSP configured");
     }
 
     kprintln!("smp: AP {} online", cpu_id);

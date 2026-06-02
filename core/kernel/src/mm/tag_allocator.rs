@@ -37,11 +37,17 @@
 //! `SeqCst` fence between revoking a victim's tag and reading its active-CPU
 //! mask is the eviction-side half of the Dekker exclusion with `activate`.
 
-/// Maximum number of tags the pool tracks, regardless of how many the hardware
-/// supports. Bounds the per-CPU tag-state slab (`TAG_CAP * size_of::<TagState>`
-/// bytes per CPU). x86-64 exposes 4096 PCIDs; capping keeps the slab small
-/// while still comfortably exceeding realistic concurrent-address-space counts.
-pub const TAG_CAP: usize = 512;
+/// Maximum number of tags the pool tracks. The configured count is
+/// `NUM_TAGS = min(hardware tags, TAG_CAP, slab-fit limit)` (see [`enable`]),
+/// sized from the hardware at boot, so this is just an upper bound on the static
+/// pool arrays and the per-CPU tag-state slab stride. Set to the x86-64 PCID
+/// maximum (4096) so all PCIDs are usable; RISC-V uses its detected ASID count.
+/// Memory: the pool's `owners`/`claimed_at` arrays are `TAG_CAP * 8` bytes each
+/// (~64 KiB total, in BSS), and the per-CPU slab is `NUM_TAGS * 16` bytes per
+/// CPU. `enable` additionally caps `NUM_TAGS` so the single slab allocation
+/// (`cpu_count * NUM_TAGS * 16`) fits the buddy's largest block, trimming the
+/// tag count on high-CPU-count machines instead of overflowing the allocator.
+pub const TAG_CAP: usize = 4096;
 
 /// Number of `u64` words in the in-use bitmap.
 const BITMAP_WORDS: usize = TAG_CAP / 64;
@@ -68,6 +74,10 @@ struct TagPool
 
 impl TagPool
 {
+    // large_stack_arrays: this is the initializer for the `static mut TAG_POOL`,
+    // so the TAG_CAP-sized arrays live in BSS, not on the stack. The only stack
+    // instantiation is in the host unit tests, whose stacks are ample.
+    #[allow(clippy::large_stack_arrays)]
     const fn new() -> Self
     {
         Self {
@@ -228,8 +238,6 @@ mod glue
     }
 
     /// The number of usable tags (`0` when tagging is disabled).
-    // Consumed by the boot-enablement and measurement paths.
-    #[allow(dead_code)]
     #[inline]
     pub fn num_tags() -> usize
     {
@@ -330,7 +338,14 @@ mod glue
         allocator: &mut crate::mm::BuddyAllocator,
     )
     {
-        let n = hw_tags.min(TAG_CAP);
+        // The per-CPU tag-state slab is one `cpu_count * n * size_of::<TagState>()`
+        // allocation, which must fit the buddy's largest single block
+        // (`2^MAX_ORDER` pages). Cap `n` so it always does — on a high-CPU-count
+        // machine this trims the tag count (down to the `< cpu_count + 2` gate,
+        // where tagging disables) rather than overflowing the allocator at boot.
+        let max_slab_bytes = (1usize << crate::mm::buddy::MAX_ORDER) * crate::mm::PAGE_SIZE;
+        let max_fit = max_slab_bytes / (cpu_count.max(1) * core::mem::size_of::<TagState>());
+        let n = hw_tags.min(TAG_CAP).min(max_fit);
         // Usable tags are `1..n` (n - 1 of them); require strictly more than the
         // CPU count so claim always succeeds (see the doc above).
         if n < cpu_count + 2

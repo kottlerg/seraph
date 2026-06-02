@@ -1456,10 +1456,25 @@ pub mod log_labels
     ///   sequence for any further legacy callers.
     ///
     /// Wire encoding is documented in
-    /// `services/logd/docs/handover-protocol.md`. After the final
-    /// chunk is replied, init-logd breaks its receive loop and calls
-    /// `sys_thread_exit`.
+    /// `services/logd/docs/handover-protocol.md`. The data drain
+    /// (`MORE`/`DONE` chunks) only transfers state; init-logd's thread
+    /// terminates on [`HANDOVER_RELEASE`], not on the `DONE` chunk.
     pub const HANDOVER_PULL: u64 = 13;
+
+    /// One-shot terminal release: real-logd tells init-logd to exit.
+    ///
+    /// Sent by real-logd on the same single-use SEND cap, exactly once,
+    /// after its [`HANDOVER_PULL`] drain settles (whether the drain ran
+    /// to `DONE`, aborted on an IPC error, or hit its iteration cap).
+    /// Real-logd retries until the call is acknowledged. Init-logd, on
+    /// receipt, sets its handover-complete flag, replies an empty ack,
+    /// and `sys_thread_exit`s on its next loop iteration.
+    ///
+    /// Decoupling termination from the multi-chunk data drain keeps a
+    /// dropped data chunk (a kernel IPC rendezvous race on the shared,
+    /// multi-sender log endpoint) from wedging init-logd — which would
+    /// otherwise block procmgr's reap of init's frames indefinitely.
+    pub const HANDOVER_RELEASE: u64 = 14;
 }
 
 // ── Bootstrap protocol ──────────────────────────────────────────────────────

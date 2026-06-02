@@ -34,9 +34,10 @@ earlier ones, which remain as fallbacks.
    `services/init/src/logging.rs`) drains the master log endpoint and writes
    lines to the UART directly. It owns console output from the moment init
    spawns it through the entire init → svcmgr handover and svcmgr's reconcile,
-   until the svcmgr-launched real-logd assumes the endpoint's RECV and pulls
-   init-logd's captured history via `log_labels::HANDOVER_PULL` — at which
-   point init-logd self-terminates. This direct path is **permanent**, not
+   until the svcmgr-launched real-logd assumes the endpoint's RECV, pulls
+   init-logd's captured history via `log_labels::HANDOVER_PULL`, then releases
+   it with `log_labels::HANDOVER_RELEASE` — at which point init-logd
+   self-terminates. This direct path is **permanent**, not
    transitional: it is the only writer before the serial driver is up, and the
    fallback if the driver fails to come up. There is no parallel init-logd
    direct-framebuffer path today; pre-driver framebuffer writes are deferred

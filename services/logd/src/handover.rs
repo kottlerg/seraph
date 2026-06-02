@@ -24,7 +24,7 @@
 //! See `services/logd/docs/handover-protocol.md`.
 
 use ipc::IpcMessage;
-use ipc::log_labels::HANDOVER_PULL;
+use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
 
 use crate::slot::SlotTable;
 
@@ -37,11 +37,13 @@ const KIND_HEADER: u64 = 1;
 const KIND_SLOT: u64 = 2;
 const KIND_LINE: u64 = 3;
 
-/// Drain init-logd's handover state into `table`. Returns on the
-/// first `DONE` reply (init-logd has at that point set its
-/// handover-complete flag and will self-terminate on its next loop
-/// iteration). Caps the loop at a generous iteration bound to
-/// guarantee termination on a malformed init-logd reply.
+/// Drain init-logd's handover state into `table`, best-effort. Returns
+/// on the `DONE` reply (no more data), on an `ipc_call` error (drain
+/// aborted), or at the iteration cap. `DONE` means only "no more data" —
+/// init-logd's thread does NOT terminate here; the caller must follow
+/// with [`send_release`], which is what actually releases init-logd. A
+/// dropped data chunk therefore loses at most some boot history; it
+/// cannot wedge init-logd.
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
@@ -62,6 +64,10 @@ pub unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
         let Ok(reply) = (unsafe { ipc::ipc_call(handover_send_cap, &req, ipc_buf) })
         else
         {
+            // Drain aborted (e.g. a kernel IPC rendezvous race on the shared
+            // log endpoint dropped this call). Non-fatal: the caller still
+            // issues HANDOVER_RELEASE, so init-logd is released regardless —
+            // at most some boot history is not transferred.
             return;
         };
         // Init-logd packs SLOT/LINE byte lengths into label bits
@@ -113,5 +119,36 @@ pub unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
             return;
         }
         debug_assert_eq!(status, REPLY_MORE);
+    }
+}
+
+/// Tell init-logd to terminate, retrying until the call is acknowledged.
+///
+/// Issued once [`pull_all`] settles (DONE, abort, or iteration cap).
+/// Init-logd's thread terminates on this message — not on the data drain's
+/// `DONE` chunk — so a dropped data chunk (a kernel IPC rendezvous race on
+/// the shared, multi-sender log endpoint) cannot leave init-logd running and
+/// block procmgr's reap of init's frames.
+///
+/// Init-logd is alive until it processes a RELEASE, so the first *delivered*
+/// call is acknowledged and returns `Ok`. The retry recovers a `RELEASE`
+/// whose request was dropped (init-logd never saw it, so it is still
+/// serving). The cap bounds the loop; a genuinely unreachable init-logd is
+/// covered by procmgr's reap backstop, never by an unbounded spin here.
+///
+/// # Safety
+/// `ipc_buf` must be the calling thread's registered IPC buffer.
+pub unsafe fn send_release(handover_send_cap: u32, ipc_buf: *mut u64)
+{
+    const MAX_RETRIES: usize = 64;
+    let req = IpcMessage::new(HANDOVER_RELEASE);
+    for _ in 0..MAX_RETRIES
+    {
+        // SAFETY: caller's invariant — ipc_buf is the registered IPC buffer.
+        if (unsafe { ipc::ipc_call(handover_send_cap, &req, ipc_buf) }).is_ok()
+        {
+            return;
+        }
+        let _ = syscall::thread_yield();
     }
 }

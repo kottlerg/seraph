@@ -37,11 +37,15 @@
 //! `SeqCst` fence between revoking a victim's tag and reading its active-CPU
 //! mask is the eviction-side half of the Dekker exclusion with `activate`.
 
-/// Maximum number of tags the pool tracks, regardless of how many the hardware
-/// supports. Bounds the per-CPU tag-state slab (`TAG_CAP * size_of::<TagState>`
-/// bytes per CPU). x86-64 exposes 4096 PCIDs; capping keeps the slab small
-/// while still comfortably exceeding realistic concurrent-address-space counts.
-pub const TAG_CAP: usize = 512;
+/// Maximum number of tags the pool tracks. `NUM_TAGS = min(hardware tags,
+/// TAG_CAP)` is sized from the hardware at boot, so this is just an upper bound
+/// on the static pool arrays and the per-CPU tag-state slab stride. Set to the
+/// x86-64 PCID maximum (4096) so all PCIDs are usable; RISC-V uses its detected
+/// ASID count. Memory: the pool's `owners`/`claimed_at` arrays are
+/// `TAG_CAP * 8` bytes each (~64 KiB total), and the per-CPU slab is
+/// `NUM_TAGS * 16` bytes per CPU (allocated dynamically to the configured
+/// `NUM_TAGS`, not `TAG_CAP`). `boot_protocol::MAX_CPUS` bounds the worst case.
+pub const TAG_CAP: usize = 4096;
 
 /// Number of `u64` words in the in-use bitmap.
 const BITMAP_WORDS: usize = TAG_CAP / 64;
@@ -68,6 +72,10 @@ struct TagPool
 
 impl TagPool
 {
+    // large_stack_arrays: this is the initializer for the `static mut TAG_POOL`,
+    // so the TAG_CAP-sized arrays live in BSS, not on the stack. The only stack
+    // instantiation is in the host unit tests, whose stacks are ample.
+    #[allow(clippy::large_stack_arrays)]
     const fn new() -> Self
     {
         Self {
@@ -228,8 +236,6 @@ mod glue
     }
 
     /// The number of usable tags (`0` when tagging is disabled).
-    // Consumed by the boot-enablement and measurement paths.
-    #[allow(dead_code)]
     #[inline]
     pub fn num_tags() -> usize
     {

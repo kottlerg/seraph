@@ -1378,18 +1378,6 @@ unsafe fn dealloc_object_one(
                         }
                     };
 
-                    // Check if the thread is actively running (sched.current)
-                    // on any CPU.
-                    let mut running_on: Option<usize> = None;
-                    for cpu in 0..cpu_count
-                    {
-                        if crate::sched::scheduler_for(cpu).current == tcb
-                        {
-                            running_on = Some(cpu);
-                            break;
-                        }
-                    }
-
                     // Release all locks.
                     for cpu in (0..cpu_count).rev()
                     {
@@ -1397,30 +1385,60 @@ unsafe fn dealloc_object_one(
                         s.lock.unlock_raw(s.saved_lock_flags);
                     }
 
-                    // UAF gate: wait for the in-flight switch (if any) to
-                    // both move off `tcb` AND publish context_saved=1. The
-                    // context_saved spin is unconditional — the all-locks
-                    // running_on snapshot can race past schedule()'s
-                    // pre-save lock release. See
-                    // docs/scheduling-internals.md § Cross-CPU TCB Ownership.
+                    // UAF gate: a TCB that is `current` on any CPU MUST NOT be
+                    // reclaimed until every CPU has switched away from it AND
+                    // the in-flight register save has published. Two steps:
                     //
-                    // The spin runs with interrupts ENABLED and preemption
+                    //   1. Spin until `tcb` is not `current` on ANY CPU —
+                    //      unconditional, across every CPU. A single-CPU wait
+                    //      keyed on one all-locks snapshot would be insufficient:
+                    //      such a snapshot names at most one CPU and can be stale
+                    //      the instant the locks drop (a CPU mid-`schedule()` may
+                    //      install or retain `tcb` as `current` after it was
+                    //      taken). #207.
+                    //   2. Spin until `context_saved == 1`, covering the window
+                    //      where a CPU set `current = next` and dropped its lock
+                    //      but `switch()` has not yet saved `tcb`'s registers.
+                    //
+                    // The spins run with interrupts ENABLED and preemption
                     // DISABLED, mirroring `mm::tlb_shootdown::shootdown`. We
                     // enter dealloc from a syscall with `IF=0`; spinning here
                     // with `IF=0` blocks incoming IPIs (FPU flush, TLB
                     // shootdown) targeted at this CPU and deadlocks them.
-                    // Enabling IF lets us service those, while
-                    // `preempt_disable` keeps the scheduler from migrating us
-                    // mid-dealloc (which would invalidate the `running_on`
-                    // snapshot we captured under the all-locks region).
+                    // Enabling IF lets us service those, while `preempt_disable`
+                    // keeps the scheduler from migrating us mid-dealloc.
                     crate::percpu::preempt_disable();
                     // SAFETY: ring 0; saved in matching restore below.
                     let saved_int = crate::arch::current::cpu::save_and_disable_interrupts();
                     // SAFETY: ring 0; IDT loaded; preempt disabled.
                     crate::arch::current::interrupts::enable();
 
-                    if let Some(run_cpu) = running_on
+                    // Step 1: not `current` on any CPU. Find the (at most one)
+                    // CPU still running `tcb`, spin on just that CPU's lock
+                    // until it switches away, then re-scan; once a full scan is
+                    // clean, no CPU can re-install `tcb` (it is `Exited` and
+                    // unlinked from every run queue under the all-locks region).
+                    loop
                     {
+                        let run_cpu = 'scan: {
+                            for cpu in 0..cpu_count
+                            {
+                                let s = crate::sched::scheduler_for(cpu);
+                                let f = s.lock.lock_raw();
+                                let is_cur = s.current == tcb;
+                                s.lock.unlock_raw(f);
+                                if is_cur
+                                {
+                                    break 'scan Some(cpu);
+                                }
+                            }
+                            None
+                        };
+                        let Some(run_cpu) = run_cpu
+                        else
+                        {
+                            break;
+                        };
                         let sched = crate::sched::scheduler_for(run_cpu);
                         while {
                             let s = sched.lock.lock_raw();
@@ -1432,6 +1450,8 @@ unsafe fn dealloc_object_one(
                             core::hint::spin_loop();
                         }
                     }
+
+                    // Step 2: register save published.
                     while (*tcb)
                         .context_saved
                         .load(core::sync::atomic::Ordering::Acquire)
@@ -1449,8 +1469,8 @@ unsafe fn dealloc_object_one(
                     // needed: `nm_handler` only ever names the currently
                     // Running thread on its CPU, and `switch_out_save`
                     // clears the slot on switch-out — so by the time the
-                    // `running_on` and `context_saved` spins above have
-                    // completed, no CPU's owner slot can name this TCB.
+                    // not-`current`-anywhere and `context_saved` spins above
+                    // have completed, no CPU's owner slot can name this TCB.
                 }
 
                 // Wake the captured reply-bound client outside the all-locks

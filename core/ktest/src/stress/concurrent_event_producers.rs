@@ -116,7 +116,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         per_producer[producer_id][seq] = true;
     }
 
-    // Wait for all producers to notify done.
+    // Wait for all producers to signal done.
     let all_done = (1u64 << NUM_PRODUCERS) - 1;
     let mut done_bits: u64 = 0;
     while done_bits & all_done != all_done

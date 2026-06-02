@@ -112,7 +112,7 @@ static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 
 /// `thread_configure` sets entry, stack, and arg; `thread_start` makes it runnable.
 ///
-/// The child notifications 0xBEEF back to confirm it executed.
+/// The child signals 0xBEEF back to confirm it executed.
 pub fn configure_start(ctx: &TestContext) -> TestResult
 {
     let sig = cap_create_notification(ctx.memory_base)
@@ -152,7 +152,7 @@ pub fn r#yield(_ctx: &TestContext) -> TestResult
 /// `thread_stop` transitions a running/blocked thread to Stopped; `thread_read_regs`
 /// returns the thread's register file.
 ///
-/// The child notifications readiness (0x1) then blocks in `notification_wait` to provide a
+/// The child signals readiness (0x1) then blocks in `notification_wait` to provide a
 /// stable `TrapFrame`. The parent stops it and reads registers.
 pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 {
@@ -173,7 +173,7 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
         .map_err(|_| "thread::stop_read_regs: configure_and_start failed")?;
 
-    // Wait for the child to notify readiness then enter its blocking notification_wait.
+    // Wait for the child to signal readiness then enter its blocking notification_wait.
     let ready_bits =
         notification_wait(ready).map_err(|_| "notification_wait (readiness) failed")?;
     if ready_bits != 0x1
@@ -420,7 +420,7 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 
 /// `thread_configure` on a thread that is already Running or Blocked must fail.
 ///
-/// The child notifications readiness then blocks in `notification_wait`, giving the parent
+/// The child signals readiness then blocks in `notification_wait`, giving the parent
 /// a stable point at which the thread is no longer in `Created` state.
 pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 {
@@ -440,7 +440,7 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
         .map_err(|_| "thread::configure_running_thread_err: configure_and_start failed")?;
 
-    // Wait for the child to notify readiness (it is now Running or Blocked).
+    // Wait for the child to signal readiness (it is now Running or Blocked).
     notification_wait(ready).map_err(|_| "notification_wait for readiness failed")?;
 
     // Attempting to configure a non-Created thread must fail. The helper is
@@ -505,7 +505,7 @@ pub fn set_priority_31_err(ctx: &TestContext) -> TestResult
 
 // ── SYS_THREAD_SET_AFFINITY + SYS_THREAD_START ───────────────────────────────
 
-/// A thread bound to CPU 1 runs and notifications back.
+/// A thread bound to CPU 1 runs and signals back.
 ///
 /// Skips with a log line if only one CPU is online (requires SMP). On SMP
 /// builds, the thread is enqueued on CPU 1's run queue and notifications `0xC1A1`
@@ -974,7 +974,7 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
     )
     .map_err(|_| "thread::affinity_respected: configure_and_start_pinned failed")?;
 
-    // If the thread successfully notifications back, affinity routing worked.
+    // If the thread successfully signals back, affinity routing worked.
     let bits =
         notification_wait(sig).map_err(|_| "notification_wait for affinity_respected failed")?;
     if bits != 0xC1A1
@@ -993,7 +993,7 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
 /// Phase D uses a simple routing policy: `AFFINITY_ANY` threads are assigned
 /// to CPU 0 (the bootstrap processor). Phase F will change this to load-balance
 /// across all CPUs. This test verifies the Phase D behavior by creating a thread
-/// with `AFFINITY_ANY`, then checking it starts and notifications back. Since we cannot
+/// with `AFFINITY_ANY`, then checking it starts and signals back. Since we cannot
 /// query the current CPU ID from userspace without a `CurrentCpu` syscall variant,
 /// this test indirectly validates default affinity by confirming the thread runs
 /// successfully (which it will only do if it was enqueued on a valid CPU).
@@ -1024,7 +1024,7 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
         .map_err(|_| "thread::default_affinity_bsp: configure_and_start failed")?;
 
-    // If the thread successfully notifications back, default affinity routing worked.
+    // If the thread successfully signals back, default affinity routing worked.
     let bits =
         notification_wait(sig).map_err(|_| "notification_wait for default_affinity_bsp failed")?;
     if bits != 0xBEEF
@@ -1061,7 +1061,7 @@ fn sender_entry(sig_slot: u64) -> !
     thread_exit()
 }
 
-/// Phase 1 blocker: notifications readiness (0x1) then blocks in `notification_wait`.
+/// Phase 1 blocker: signals readiness (0x1) then blocks in `notification_wait`.
 ///
 /// The parent stops this thread while it is blocked, giving a stable
 /// `TrapFrame` for `thread_read_regs` / `thread_write_regs`. If the parent

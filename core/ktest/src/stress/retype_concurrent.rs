@@ -138,7 +138,7 @@ fn worker_entry(arg: u64) -> !
         }
         else
         {
-            // Refusing to set the done bit notifications failure to the parent.
+            // Refusing to set the done bit signals failure to the parent.
             thread_exit();
         }
     }

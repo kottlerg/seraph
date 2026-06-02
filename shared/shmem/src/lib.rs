@@ -322,7 +322,7 @@ fn unmap_range(aspace: u32, vaddr: u64, count: u32)
 /// Fixed in-memory header at the start of an SPSC shared region.
 ///
 /// Two atomic indices plus a u32 `capacity` (byte buffer length, must be a
-/// power of two) and a `closed` flag used by pipe peers to notify EOF.
+/// power of two) and a `closed` flag used by pipe peers to signal EOF.
 /// The byte buffer follows immediately after this struct, aligned to the
 /// ring's alignment (u64 is enough for our use case).
 #[repr(C)]

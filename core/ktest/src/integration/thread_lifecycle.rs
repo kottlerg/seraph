@@ -10,7 +10,7 @@
 //!
 //!   1. Create thread (`cap_create_thread`, `cap_create_cspace`)
 //!   2. Configure entry, stack, arg (`thread_configure`)
-//!   3. Start (`thread_start`) → child notifications readiness (0x1)
+//!   3. Start (`thread_start`) → child signals readiness (0x1)
 //!   4. Stop while child is blocked in `notification_wait` (`thread_stop`)
 //!   5. Read register state (`thread_read_regs`) → verify IP non-zero
 //!   6. Redirect IP via `write_regs` (`thread_write_regs`) → `phase2_entry`
@@ -65,7 +65,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     let blocker_arg = (u64::from(child_ready) << 32) | u64::from(child_block);
 
-    // ── Step 3: Start — child notifications readiness. ──────────────────────────────
+    // ── Step 3: Start — child signals readiness. ──────────────────────────────
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
         .map_err(|_| "integration::thread_lifecycle: configure_and_start failed")?;
     let ready_bits = notification_wait(ready)

@@ -104,7 +104,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             return Err("concurrent_ipc: not all callers received");
         }
 
-        // Wait for all children to notify done. Each child sends a unique
+        // Wait for all children to signal done. Each child sends a unique
         // bit (1<<i), so we wait until every bit is set.
         let all_done = expected;
         let mut done_bits: u64 = 0;

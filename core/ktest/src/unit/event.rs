@@ -331,7 +331,7 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
 
 // ── Child thread entry ────────────────────────────────────────────────────────
 
-/// Child: blocks on `event_recv` then notifications the received payload back.
+/// Child: blocks on `event_recv` then signals the received payload back.
 ///
 /// `arg`: bits[15:0] = `eq_slot`, bits[31:16] = `sync_slot` (in child's `CSpace`).
 fn recv_and_report_entry(arg: u64) -> !

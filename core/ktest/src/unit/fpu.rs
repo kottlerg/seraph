@@ -763,7 +763,7 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
 
         // Wait for the child to become `fpu_owner` on CPU 0 and notification ready.
         // The parent blocks (yielding CPU 0) so the child can run; the child
-        // then loads PATTERN_A, briefly spins, notifications ready, and blocks on
+        // then loads PATTERN_A, briefly spins, signals ready, and blocks on
         // sig_resume.
         let _ = notification_wait(sig_ready)
             .map_err(|_| "notification_wait ready for preempt_isolation_cross_cpu failed")?;

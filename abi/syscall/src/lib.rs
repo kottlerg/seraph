@@ -503,7 +503,7 @@ pub const EXIT_FAULT_BASE: u64 = 0x1000;
 /// patch = version & 0xFFFF
 /// ```
 ///
-/// The version is `0.0.1` during initial kernel development. Major will remain
+/// The version is `0.0.2` during initial kernel development. Major will remain
 /// `0` until the kernel reaches a meaningful level of completeness; during this
 /// phase all ABI changes are considered fully fluid regardless of minor/patch.
 // Encode as (major << 32) | (minor << 16) | patch. The zero shifts are retained

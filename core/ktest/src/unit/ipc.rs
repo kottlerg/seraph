@@ -46,7 +46,7 @@ static mut RECV_OOM_STACK: ChildStack = ChildStack::ZERO;
 /// Full synchronous IPC round-trip: child calls, server receives and replies.
 ///
 /// The child sends label 0xCAFE. The server verifies the label and replies
-/// with label 0xBEEF. The child verifies the reply label and notifications done.
+/// with label 0xBEEF. The child verifies the reply label and signals done.
 ///
 /// A separate sync notification (`done_sig`) lets the server wait for the child to
 /// complete its post-reply verification before the test returns.
@@ -482,7 +482,7 @@ fn caller_entry(arg: u64) -> !
 }
 
 /// Child for `recv_finds_queued_caller`: calls endpoint immediately (no server
-/// yet), then notifications the result after the server replies.
+/// yet), then signals the result after the server replies.
 ///
 /// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot` (in child's `CSpace`).
 fn queued_caller_entry(arg: u64) -> !
@@ -836,7 +836,7 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
 }
 
 /// Child for `reply_oom_wakes_caller_with_transfer_failed`: registers IPC
-/// buffer, fills its own `CSpace`, notifications readiness, then issues an
+/// buffer, fills its own `CSpace`, signals readiness, then issues an
 /// `ipc_call`. Reports `0xFA11` if the kernel-synthesised
 /// `IPC_REPLY_TRANSFER_FAILED` label arrives, `0xBAD` otherwise.
 fn reply_oom_caller_entry(arg: u64) -> !

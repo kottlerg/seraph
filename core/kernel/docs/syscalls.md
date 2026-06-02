@@ -491,7 +491,7 @@ Create a new wait set.
 
 ---
 
-### `SYS_CAP_DERIVE` (13)
+### `SYS_CAP_DERIVE` (14)
 
 Derive a new capability from an existing one, with equal or fewer rights.
 
@@ -545,7 +545,7 @@ already badged), `OutOfMemory`.
 
 ---
 
-### `SYS_CAP_REVOKE` (14)
+### `SYS_CAP_REVOKE` (15)
 
 Revoke a capability and all capabilities derived from it, across all processes.
 
@@ -564,7 +564,7 @@ The underlying kernel object is not freed unless this was the last reference to 
 
 ---
 
-### `SYS_CAP_DELETE` (15)
+### `SYS_CAP_DELETE` (31)
 
 Delete a single capability from the caller's CSpace. Does not affect derived capabilities.
 
@@ -1143,7 +1143,7 @@ or out of range), `OutOfMemory`.
 
 ---
 
-### `SYS_CAP_MOVE` (26)
+### `SYS_CAP_MOVE` (25)
 
 Move a capability from the caller's CSpace into another CSpace. Transfer semantics:
 the source slot is cleared; the destination inherits the source's derivation position.

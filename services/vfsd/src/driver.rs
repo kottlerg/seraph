@@ -22,7 +22,7 @@
 //!
 //! Both paths route the per-child cap delivery through the bootstrap worker
 //! so the main thread's `reply_tcb` is never clobbered while servicing the
-//! caller's MOUNT. After the worker notifications delivery, main sends a
+//! caller's MOUNT. After the worker signals delivery, main sends a
 //! zero-payload `FS_MOUNT` to the new driver as a BPB-validation probe.
 //!
 //! The `partition_ep` passed in is a badged SEND cap on virtio-blk's service

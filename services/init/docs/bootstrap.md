@@ -109,7 +109,7 @@ init's wait-for-root barrier.
 
 `service::phase3_svcmgr_handover` (in `../src/service.rs`, called
 from `../src/main.rs`) loads svcmgr, serves it the handover endowment,
-notifications handover, and hands init's own kernel objects to procmgr for
+signals handover, and hands init's own kernel objects to procmgr for
 reaping. svcmgr — not init — publishes the well-known caps, registers
 services, and talks to devmgr, all from the endowment.
 

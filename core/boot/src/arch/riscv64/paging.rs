@@ -195,7 +195,7 @@ impl BootPageTable
     /// zeroed frame, writes an intermediate PTE (V=1, R=0, W=0, X=0), and returns
     /// the new frame address.
     ///
-    /// Intermediate PTEs have only V=1 set (R=0, W=0, X=0), which notifications to the
+    /// Intermediate PTEs have only V=1 set (R=0, W=0, X=0), which signals to the
     /// hardware that this is a pointer to the next-level table, not a leaf.
     fn ensure_table(&mut self, entry: &mut u64) -> Result<u64, MapError>
     {

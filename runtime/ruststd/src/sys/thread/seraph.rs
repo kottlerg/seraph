@@ -3,7 +3,7 @@
 // Thread spawning backed by the Seraph kernel's Thread/Notification primitives.
 // Stacks and per-thread IPC buffers are allocated from the process heap
 // (page-aligned, no guard pages for now — deferred polish). Join
-// synchronises on a Notification cap; the child thread notifications just before
+// synchronises on a Notification cap; the child thread signals just before
 // calling SYS_THREAD_EXIT.
 //
 // Native ELF TLS is live: `SYS_THREAD_CONFIGURE` accepts `tls_base`, the
@@ -228,7 +228,7 @@ impl Thread {
     }
 
     pub fn join(self) {
-        // Wait for the child to notify completion of its rust_start and
+        // Wait for the child to signal completion of its rust_start and
         // reach `notification_send`. After this point the child's next action is
         // `syscall::thread_exit` — its stack, IPC buffer, and TLS block
         // are safe to reclaim because control has left user-mode and will

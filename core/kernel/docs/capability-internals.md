@@ -415,10 +415,11 @@ transfer_cap(sender, sender_slot_idx, receiver, receiver_slot_idx):
 The derivation write lock is held for the duration of the transfer. This ensures
 no revocation can run concurrently with a transfer, preventing torn state.
 
-Reply capabilities (`CapTag::Reply`) are not part of the derivation tree — they are
-single-use, cannot be derived, and are not tracked for revocation. They are created
-by the kernel at `SYS_IPC_RECV` time and stored in a per-thread slot, outside the
-process CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
+Reply capabilities are not part of the derivation tree — they are single-use,
+cannot be derived, and are not tracked for revocation. A reply capability is not
+a `CapTag` variant; it is an implicit per-thread mechanism created by the kernel
+at `SYS_IPC_RECV` time and stored in a per-thread slot, outside the process
+CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
 
 ---
 

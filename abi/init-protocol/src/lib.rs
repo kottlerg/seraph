@@ -67,6 +67,10 @@
 ///     reserve) that let the dynamic memory pool be reconciled against
 ///     the all-RAM-accounted identity. Both `u64`, placed before
 ///     `framebuffer` so that field remains last.
+/// v11: Capability naming alignment (#184). `CapType::Frame` → `Memory`,
+///     `MmioRegion` → `Mmio`, `IoPortRange` → `IoPort`; the `*_frame_*`
+///     `InitInfo` slot-range fields renamed to `*_memory_*`. Source-level
+///     rename only — discriminant values and field layout are unchanged.
 pub const INIT_PROTOCOL_VERSION: u32 = 11;
 
 /// Length of [`InitModuleName::name`], matching

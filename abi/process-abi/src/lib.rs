@@ -525,7 +525,7 @@ pub struct StartupInfo
     pub stderr_space_notification_cap: u32,
 
     /// Virtual address of the `PT_TLS` template in the loaded image.
-    /// `tls_template_memsz == 0` notifications that the process has no TLS.
+    /// `tls_template_memsz == 0` signals that the process has no TLS.
     pub tls_template_vaddr: u64,
 
     /// Size of the initialized portion of the template (`.tdata`).

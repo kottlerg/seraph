@@ -88,7 +88,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     )
     .map_err(|_| "integration::tlb_coherency: configure_and_start_pinned failed")?;
 
-    // Wait for child to notify readiness on c2p.
+    // Wait for child to signal readiness on c2p.
     let ready = notification_wait(c2p)
         .map_err(|_| "integration::tlb_coherency: notification_wait (readiness) failed")?;
     if ready != 0x1

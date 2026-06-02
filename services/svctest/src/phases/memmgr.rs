@@ -171,8 +171,10 @@ pub fn alloc_grow_phase(_: &Caps)
 /// transient positive residual (donations still in flight). The residual only
 /// shrinks — `kernel_reserved` is fixed and `pool_total` only grows as
 /// donations land — so polling converges to zero on a clean system. A real
-/// leak (a minted page that never reaches the pool) holds the residual above
-/// zero and the poll times out.
+/// leak (a page memmgr never takes ownership of) holds the residual above
+/// zero and the poll times out. memmgr counts a donated page on ownership,
+/// not on free-pool residency, so a run parked by a full pool still closes
+/// the identity.
 pub fn ram_accounted_identity_phase(_: &Caps)
 {
     const MAX_POLL: u32 = 4096;

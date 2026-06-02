@@ -89,13 +89,22 @@ are easy to find when those workloads grow.
 |---|---|---|---|
 | `MAX_PROCESSES` | 64 | `REGISTER_PROCESS` returns `TooManyProcesses` | a workload approaches ~50 concurrent processes |
 | `MAX_PER_PROC` | 512 | `REQUEST_FRAMES` returns `Quota` | a single process needs > 2 MiB of pinned frames (current value bumped from 256; equivalent to ~2 MiB of pinned pages per process; covers std heap + thread stacks + a few zero-copy buffers for current workloads) |
-| `MAX_FREE_RUNS` | 512 | `pool.push` returns `Err` and the frame is leaked until a process-death `coalesce` recovers it | post-coalesce free-run count regularly approaches 512 |
+| `MAX_FREE_RUNS` | 512 | `push_or_coalesce` parks the run after a coalesce retry: still owned and counted in `pool_total`, but with no free-pool slot (unreachable for allocation until a later coalesce frees one) | post-coalesce free-run count regularly approaches 512 |
 
 `MAX_PER_PROC` is not a security quota; it is a structural bound that
 keeps memmgr's per-process record statically sized.
 
-Coalesce on `PROCESS_DIED` is enabled, so the `MAX_FREE_RUNS` leak path
-is reachable only if fragmentation exceeds what coalescing can recover.
+Donation and reclamation push through `push_or_coalesce`, which coalesces
+and retries before parking, so the `MAX_FREE_RUNS` park path is reachable
+only if fragmentation exceeds what coalescing can recover. A parked run is
+an allocatability degradation only — it never breaks the all-RAM-accounted
+identity, because `pool_total` counts owned RAM regardless of slot residency.
+
+These three constants are fixed static bounds: any value is permanently
+either undersized (parks RAM / rejects work under load) or oversized
+(wastes static RAM), so none can scale to a hardware-bound process count.
+Eliminating them via self-hosted, dynamically-sized bookkeeping is tracked
+as a separate redesign rather than resolved by raising a number.
 
 ---
 

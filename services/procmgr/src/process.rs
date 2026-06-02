@@ -341,12 +341,12 @@ impl ProcessTable
     /// `direction` is one of `ipc::procmgr_labels::PIPE_DIR_STDIN`,
     /// `PIPE_DIR_STDOUT`, `PIPE_DIR_STDERR`. The three caps are
     /// `cap_copy`'d into the child's `CSpace` with `RIGHTS_MAP_RW` for
-    /// the frame and `RIGHTS_ALL` for the two signals (signal objects
+    /// the frame and `RIGHTS_ALL` for the two notifications (notification objects
     /// don't currently distinguish send/wait at the cap-rights level —
     /// each peer holds a full cap and uses send or wait as appropriate).
     /// The resulting slot indices are written into the matching
-    /// `<dir>_frame_cap` / `<dir>_data_signal_cap` /
-    /// `<dir>_space_signal_cap` fields of the child's `ProcessInfo`.
+    /// `<dir>_frame_cap` / `<dir>_data_notification_cap` /
+    /// `<dir>_space_notification_cap` fields of the child's `ProcessInfo`.
     ///
     /// Idempotent per direction before start; later calls overwrite the
     /// previous triple for that direction. Different directions are
@@ -364,11 +364,11 @@ impl ProcessTable
         self_aspace: u32,
         direction: u64,
         frame: u32,
-        data_signal: u32,
-        space_signal: u32,
+        data_notification: u32,
+        space_notification: u32,
     ) -> Result<(), u64>
     {
-        if frame == 0 || data_signal == 0 || space_signal == 0
+        if frame == 0 || data_notification == 0 || space_notification == 0
         {
             return Err(procmgr_errors::INVALID_ARGUMENT);
         }
@@ -392,9 +392,9 @@ impl ProcessTable
 
         let frame_slot = syscall::cap_copy(frame, child_cspace, syscall::RIGHTS_MAP_RW)
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-        let data_slot = syscall::cap_copy(data_signal, child_cspace, syscall::RIGHTS_ALL)
+        let data_slot = syscall::cap_copy(data_notification, child_cspace, syscall::RIGHTS_ALL)
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-        let space_slot = syscall::cap_copy(space_signal, child_cspace, syscall::RIGHTS_ALL)
+        let space_slot = syscall::cap_copy(space_notification, child_cspace, syscall::RIGHTS_ALL)
             .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
 
         match direction
@@ -402,20 +402,20 @@ impl ProcessTable
             ipc::procmgr_labels::PIPE_DIR_STDIN =>
             {
                 pi.stdin_frame_cap = frame_slot;
-                pi.stdin_data_signal_cap = data_slot;
-                pi.stdin_space_signal_cap = space_slot;
+                pi.stdin_data_notification_cap = data_slot;
+                pi.stdin_space_notification_cap = space_slot;
             }
             ipc::procmgr_labels::PIPE_DIR_STDOUT =>
             {
                 pi.stdout_frame_cap = frame_slot;
-                pi.stdout_data_signal_cap = data_slot;
-                pi.stdout_space_signal_cap = space_slot;
+                pi.stdout_data_notification_cap = data_slot;
+                pi.stdout_space_notification_cap = space_slot;
             }
             ipc::procmgr_labels::PIPE_DIR_STDERR =>
             {
                 pi.stderr_frame_cap = frame_slot;
-                pi.stderr_data_signal_cap = data_slot;
-                pi.stderr_space_signal_cap = space_slot;
+                pi.stderr_data_notification_cap = data_slot;
+                pi.stderr_space_notification_cap = space_slot;
             }
             _ =>
             {
@@ -577,7 +577,7 @@ pub struct ChildEnv<'a>
 
 /// TLS template metadata extracted from a child's `PT_TLS` segment,
 /// propagated verbatim into `ProcessInfo` for spawned-thread block
-/// population. `memsz == 0` signals "binary has no TLS segment".
+/// population. `memsz == 0` notifications "binary has no TLS segment".
 #[derive(Clone, Copy, Default)]
 pub struct ChildTlsTemplate
 {
@@ -602,7 +602,7 @@ pub struct MainTls
 ///
 /// Installs the creator endpoint cap (if any) and the procmgr service
 /// endpoint into the child `CSpace` and records their slots in the child's
-/// `ProcessInfo`. Stdio pipe slots (frame + two signal caps per
+/// `ProcessInfo`. Stdio pipe slots (frame + two notification caps per
 /// direction) are left zero here and are populated afterwards by
 /// [`ProcessTable::configure_pipe`], which remaps the same `pi_frame`
 /// writable, installs caller-supplied caps via `cap_copy` into the
@@ -750,9 +750,9 @@ fn populate_child_info(
 
     // Stdio pipe caps are not installed here — CONFIGURE_PIPE remaps
     // this same pi_frame writable and fills in one direction's triple
-    // (frame + data signal + space signal) per call, before the child
+    // (frame + data notification + space notification) per call, before the child
     // is started. Children that ship without any CONFIGURE_PIPE call
-    // see all-zero stdio frame/signal slots, which std maps to silent
+    // see all-zero stdio frame/notification slots, which std maps to silent
     // println! / EOF on stdin.
 
     // SAFETY: scratch_va is page-aligned and mapped writable.
@@ -805,12 +805,12 @@ fn populate_child_info(
     pi.current_dir_cap = 0;
     pi.log_send_cap = log_send_in_child;
     pi.service_registry_cap = registry_send_in_child;
-    pi.stdin_data_signal_cap = 0;
-    pi.stdin_space_signal_cap = 0;
-    pi.stdout_data_signal_cap = 0;
-    pi.stdout_space_signal_cap = 0;
-    pi.stderr_data_signal_cap = 0;
-    pi.stderr_space_signal_cap = 0;
+    pi.stdin_data_notification_cap = 0;
+    pi.stdin_space_notification_cap = 0;
+    pi.stdout_data_notification_cap = 0;
+    pi.stdout_space_notification_cap = 0;
+    pi.stderr_data_notification_cap = 0;
+    pi.stderr_space_notification_cap = 0;
     pi.tls_template_vaddr = tls.vaddr;
     pi.tls_template_filesz = tls.filesz;
     pi.tls_template_memsz = tls.memsz;

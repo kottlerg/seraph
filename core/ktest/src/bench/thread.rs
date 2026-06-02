@@ -3,7 +3,10 @@
 
 //! Thread lifecycle benchmark: create → start → exit → cleanup.
 
-use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
+use syscall::{
+    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
+    thread_exit,
+};
 
 use super::{cycles_now, log_bench_header};
 use crate::{ChildStack, spawn};
@@ -14,7 +17,7 @@ fn lifecycle_entry(done_slot: u64) -> !
 {
     // cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
     #[allow(clippy::cast_possible_truncation)]
-    signal_send(done_slot as u32, 0x1).ok();
+    notification_send(done_slot as u32, 0x1).ok();
     thread_exit()
 }
 
@@ -24,7 +27,7 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     let n = iters.min(100);
     let n64 = u64::from(n);
 
-    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         return;
@@ -55,7 +58,7 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
         {
             break;
         }
-        signal_wait(done).ok();
+        notification_wait(done).ok();
         cap_delete(child.th).ok();
         cap_delete(child.cs).ok();
 
@@ -94,7 +97,7 @@ static mut BENCH_CTXSWITCH_STACK: ChildStack = ChildStack::ZERO;
 static BENCH_CTXSWITCH_ITERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Child entry: ping-pong via `thread_yield` for `BENCH_CTXSWITCH_ITERS`
-/// iterations, then signal `done_slot` and exit.
+/// iterations, then notification `done_slot` and exit.
 fn ctxswitch_child_entry(done_slot: u64) -> !
 {
     let n = BENCH_CTXSWITCH_ITERS.load(core::sync::atomic::Ordering::Acquire);
@@ -104,7 +107,7 @@ fn ctxswitch_child_entry(done_slot: u64) -> !
     }
     // cast_possible_truncation: done_slot is a kernel cap slot index < 2^32.
     #[allow(clippy::cast_possible_truncation)]
-    signal_send(done_slot as u32, 0x1).ok();
+    notification_send(done_slot as u32, 0x1).ok();
     thread_exit()
 }
 
@@ -121,7 +124,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     let n = u64::from(iters);
     BENCH_CTXSWITCH_ITERS.store(n, core::sync::atomic::Ordering::Release);
 
-    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         return;
@@ -159,7 +162,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     }
     let t1 = cycles_now();
 
-    signal_wait(done).ok();
+    notification_wait(done).ok();
     cap_delete(child.th).ok();
     cap_delete(child.cs).ok();
     cap_delete(done).ok();
@@ -177,7 +180,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     // Tagged-TLB intrinsic metric. These are cumulative system-wide counts of
     // context-switch activations that elided the TLB flush versus performed it
     // (tag reissue, switched-away unmap catch-up, or fallback). This is the
-    // emulation-independent signal: QEMU TCG does not model TLB-refill timing,
+    // emulation-independent notification: QEMU TCG does not model TLB-refill timing,
     // so cycles_per_switch above is not a faithful cost measure, but these
     // counters reflect intrinsic behaviour. A working optimization shows elided
     // dominating; both are 0 when the hardware lacks tagging (full-flush path).

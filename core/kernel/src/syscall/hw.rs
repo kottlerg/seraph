@@ -7,7 +7,7 @@
 //!
 //! Implements:
 //! - `SYS_IRQ_ACK` (29): re-enable a masked interrupt line.
-//! - `SYS_IRQ_REGISTER` (30): bind a Signal to an interrupt line.
+//! - `SYS_IRQ_REGISTER` (30): bind a Notification to an interrupt line.
 //! - `SYS_MMIO_MAP` (34): map an MMIO region into an address space.
 //! - `SYS_IOPORT_BIND` (35): bind an I/O port range to a thread (`x86_64` only).
 //! - `SYS_MMIO_SPLIT` (45): split an `MmioRegion` cap into two sub-regions.
@@ -33,7 +33,7 @@ use syscall::SyscallError;
 /// `SYS_IRQ_ACK` (29): re-enable an interrupt line after the driver has handled
 /// the interrupt.
 ///
-/// arg0 = Interrupt cap index (must have SIGNAL right).
+/// arg0 = Interrupt cap index (must have NOTIFY right).
 ///
 /// Unmasks the IRQ line at the interrupt controller, allowing the next
 /// interrupt delivery. The driver must call this after clearing the interrupt
@@ -60,7 +60,7 @@ pub fn sys_irq_ack(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let irq_slot =
-        unsafe { super::lookup_cap(cspace, irq_cap_idx, CapTag::Interrupt, Rights::SIGNAL) }?;
+        unsafe { super::lookup_cap(cspace, irq_cap_idx, CapTag::Interrupt, Rights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
@@ -87,15 +87,15 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // ── SYS_IRQ_REGISTER ─────────────────────────────────────────────────────────
 
-/// `SYS_IRQ_REGISTER` (30): bind a Signal to an interrupt line.
+/// `SYS_IRQ_REGISTER` (30): bind a Notification to an interrupt line.
 ///
-/// arg0 = Interrupt cap index (must have SIGNAL right).
-/// arg1 = Signal cap index (must have SIGNAL right).
+/// arg0 = Interrupt cap index (must have NOTIFY right).
+/// arg1 = Notification cap index (must have NOTIFY right).
 ///
 /// When the interrupt fires:
 /// 1. The IRQ is masked at the controller.
-/// 2. Bit 0 is `ORed` into the Signal.
-/// 3. Any thread blocked on `SYS_SIGNAL_WAIT` for this signal is woken.
+/// 2. Bit 0 is `ORed` into the Notification.
+/// 3. Any thread blocked on `SYS_NOTIFICATION_WAIT` for this notification is woken.
 /// 4. The driver must call `SYS_IRQ_ACK` to re-enable delivery.
 ///
 /// On `x86_64`: programs the IOAPIC redirection entry (masked until first ACK).
@@ -105,7 +105,7 @@ pub fn sys_irq_ack(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{InterruptObject, SignalObject};
+    use crate::cap::object::{InterruptObject, NotificationObject};
     use crate::cap::slot::{CapTag, Rights};
     use crate::syscall::current_tcb;
 
@@ -124,7 +124,7 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Resolve Interrupt cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let irq_slot =
-        unsafe { super::lookup_cap(cspace, irq_cap_idx, CapTag::Interrupt, Rights::SIGNAL) }?;
+        unsafe { super::lookup_cap(cspace, irq_cap_idx, CapTag::Interrupt, Rights::NOTIFY) }?;
     let irq_id = {
         let obj = irq_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; object was allocated as Box<InterruptObject>.
@@ -138,20 +138,20 @@ pub fn sys_irq_register(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         io.start
     };
 
-    // Resolve Signal cap.
+    // Resolve Notification cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let sig_slot =
-        unsafe { super::lookup_cap(cspace, sig_cap_idx, CapTag::Signal, Rights::SIGNAL) }?;
+        unsafe { super::lookup_cap(cspace, sig_cap_idx, CapTag::Notification, Rights::NOTIFY) }?;
     let sig_state = {
         let obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed Signal; object was allocated as Box<SignalObject>.
+        // SAFETY: tag confirmed Notification; object was allocated as Box<NotificationObject>.
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
-            (*obj.as_ptr().cast::<SignalObject>()).state
+            (*obj.as_ptr().cast::<NotificationObject>()).state
         }
     };
 
-    // Register the signal in the IRQ routing table.
+    // Register the notification in the IRQ routing table.
     // Disable interrupts to serialise with dispatch_device_irq, which reads
     // the table from interrupt context.
     // SAFETY: save_and_disable_interrupts/restore_interrupts are paired;
@@ -706,7 +706,7 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_IRQ_SPLIT` (49): split an `Interrupt` range cap into two non-overlapping children.
 ///
-/// arg0 = `Interrupt` cap index (must have SIGNAL right).
+/// arg0 = `Interrupt` cap index (must have NOTIFY right).
 /// arg1 = `split_at` IRQ id. Must satisfy `start < split_at < start + count`.
 ///        The lower child covers `[start, split_at)`; the upper child covers
 ///        `[split_at, start + count)`.
@@ -750,7 +750,7 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let (start, count, rights, cspace_id, orig_obj_ptr) = {
         // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
         let slot = unsafe {
-            super::lookup_cap(caller_cspace, irq_idx, CapTag::Interrupt, Rights::SIGNAL)
+            super::lookup_cap(caller_cspace, irq_idx, CapTag::Interrupt, Rights::NOTIFY)
         }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; pointer is valid InterruptObject.

@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 15;
+pub const PROCESS_ABI_VERSION: u32 = 16;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -273,9 +273,9 @@ pub struct ProcessInfo
     /// One 4 KiB page laid out as `shmem::SpscHeader` followed by a
     /// power-of-two byte ring. The frame is shared with the spawner; the
     /// spawner is the writer (parent → child), the child is the reader.
-    /// Wakeup signals live in `stdin_data_signal_cap` (writer-kicks-reader)
-    /// and `stdin_space_signal_cap` (reader-kicks-writer); EOF rides on the
-    /// header's `closed` flag plus a final signal kick.
+    /// Wakeup notifications live in `stdin_data_notification_cap` (writer-kicks-reader)
+    /// and `stdin_space_notification_cap` (reader-kicks-writer); EOF rides on the
+    /// header's `closed` flag plus a final notification kick.
     ///
     /// Zero means "no stdin attached"; reads return `Ok(0)` (EOF)
     /// immediately. The standard case for services spawned by init.
@@ -285,7 +285,7 @@ pub struct ProcessInfo
     ///
     /// Same layout as `stdin_frame_cap` but with the child as the writer
     /// (child → parent) and the spawner as the reader. Wakeup pair is
-    /// `stdout_data_signal_cap` / `stdout_space_signal_cap`.
+    /// `stdout_data_notification_cap` / `stdout_space_notification_cap`.
     ///
     /// Zero when no sink is attached; writes are silently dropped.
     pub stdout_frame_cap: u32,
@@ -293,8 +293,8 @@ pub struct ProcessInfo
     /// `CSpace` slot of the shmem frame cap backing `std::io::stderr`.
     ///
     /// Same shape as `stdout_frame_cap`; an independent ring so stdout and
-    /// stderr stream separately. Wakeup pair is `stderr_data_signal_cap` /
-    /// `stderr_space_signal_cap`. Zero means writes are silently dropped.
+    /// stderr stream separately. Wakeup pair is `stderr_data_notification_cap` /
+    /// `stderr_space_notification_cap`. Zero means writes are silently dropped.
     pub stderr_frame_cap: u32,
 
     // ── Thread-local storage template ──────────────────────────────────
@@ -406,35 +406,35 @@ pub struct ProcessInfo
     /// `seraph::log!` silently drops in that case.
     pub log_send_cap: u32,
 
-    // ── Stdio pipe wakeup signals ──────────────────────────────────────
+    // ── Stdio pipe wakeup notifications ──────────────────────────────────────
     //
-    // Each piped direction gets two signal caps:
-    //   * `data_signal`  — writer kicks reader after producing bytes;
+    // Each piped direction gets two notification caps:
+    //   * `data_notification`  — writer kicks reader after producing bytes;
     //                      reader awaits this when the ring is empty.
-    //   * `space_signal` — reader kicks writer after consuming bytes;
+    //   * `space_notification` — reader kicks writer after consuming bytes;
     //                      writer awaits this when the ring is full.
     //
-    // Both processes hold caps to both signals (kernel signal objects do
+    // Both processes hold caps to both notifications (kernel notification objects do
     // not distinguish send/wait rights at the cap level). Single-waiter
-    // invariant holds because at most one side blocks on each signal at
+    // invariant holds because at most one side blocks on each notification at
     // any given moment.
     //
-    // Zero in any slot means the corresponding signal is not attached;
-    // the AnonPipe peer treats `signal_wait` as a no-op and falls back
+    // Zero in any slot means the corresponding notification is not attached;
+    // the AnonPipe peer treats `notification_wait` as a no-op and falls back
     // to spinning on the ring header (used during silent-drop init when
     // a frame cap is also zero).
-    /// Data-available signal for the stdin pipe. Writer-kicked.
-    pub stdin_data_signal_cap: u32,
-    /// Space-available signal for the stdin pipe. Reader-kicked.
-    pub stdin_space_signal_cap: u32,
-    /// Data-available signal for the stdout pipe. Writer-kicked.
-    pub stdout_data_signal_cap: u32,
-    /// Space-available signal for the stdout pipe. Reader-kicked.
-    pub stdout_space_signal_cap: u32,
-    /// Data-available signal for the stderr pipe. Writer-kicked.
-    pub stderr_data_signal_cap: u32,
-    /// Space-available signal for the stderr pipe. Reader-kicked.
-    pub stderr_space_signal_cap: u32,
+    /// Data-available notification for the stdin pipe. Writer-kicked.
+    pub stdin_data_notification_cap: u32,
+    /// Space-available notification for the stdin pipe. Reader-kicked.
+    pub stdin_space_notification_cap: u32,
+    /// Data-available notification for the stdout pipe. Writer-kicked.
+    pub stdout_data_notification_cap: u32,
+    /// Space-available notification for the stdout pipe. Reader-kicked.
+    pub stdout_space_notification_cap: u32,
+    /// Data-available notification for the stderr pipe. Writer-kicked.
+    pub stderr_data_notification_cap: u32,
+    /// Space-available notification for the stderr pipe. Reader-kicked.
+    pub stderr_space_notification_cap: u32,
 
     // ── Main-thread stack envelope ─────────────────────────────────────
     //
@@ -514,18 +514,18 @@ pub struct StartupInfo
     /// `ProcessInfo::current_dir_cap`.
     pub current_dir_cap: u32,
 
-    /// Wakeup signal caps for the three stdio pipes. Zero when the
+    /// Wakeup notification caps for the three stdio pipes. Zero when the
     /// corresponding direction is not piped. See `ProcessInfo` for the
     /// full data-vs-space and writer-vs-reader semantics.
-    pub stdin_data_signal_cap: u32,
-    pub stdin_space_signal_cap: u32,
-    pub stdout_data_signal_cap: u32,
-    pub stdout_space_signal_cap: u32,
-    pub stderr_data_signal_cap: u32,
-    pub stderr_space_signal_cap: u32,
+    pub stdin_data_notification_cap: u32,
+    pub stdin_space_notification_cap: u32,
+    pub stdout_data_notification_cap: u32,
+    pub stdout_space_notification_cap: u32,
+    pub stderr_data_notification_cap: u32,
+    pub stderr_space_notification_cap: u32,
 
     /// Virtual address of the `PT_TLS` template in the loaded image.
-    /// `tls_template_memsz == 0` signals that the process has no TLS.
+    /// `tls_template_memsz == 0` notifications that the process has no TLS.
     pub tls_template_vaddr: u64,
 
     /// Size of the initialized portion of the template (`.tdata`).

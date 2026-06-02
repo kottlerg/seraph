@@ -51,7 +51,7 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    one `(name, thread_cap)` round per init-bootstrapped substrate
    service, and a terminal round carrying the reserved log-sink sources
    (master-log endpoint + procmgr `SEND|GRANT`) svcmgr keeps to launch and
-   supervise real-logd. Signal `HANDOVER_COMPLETE`; hand init's own kernel
+   supervise real-logd. Notification `HANDOVER_COMPLETE`; hand init's own kernel
    objects + reclaimable Frame caps to procmgr via `REGISTER_INIT_TEARDOWN`;
    call `sys_thread_exit`. Procmgr binds a death-EQ on both init threads
    (main + init-logd) and runs the reap path once both have exited; a

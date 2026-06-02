@@ -37,7 +37,7 @@ claims.
    one of: `delivered` (cite `path:line` evidence), `dropped` (cite the
    rationale text), or `not delivered, no rationale` (FAIL).
 
-6. Silent-deferral scan. The target signal is *intent to defer
+6. Silent-deferral scan. The target notification is *intent to defer
    mechanically-reachable work this PR should have covered*, not in-code
    work markers — `docs/documentation-standards.md` endorses bare `TODO`
    tokens as the canonical in-code annotation for independent future

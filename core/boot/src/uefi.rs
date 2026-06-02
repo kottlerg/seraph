@@ -43,7 +43,7 @@ pub const ALLOCATE_ADDRESS: u32 = 2;
 /// Memory type used for all bootloader allocations.
 ///
 /// `EfiLoaderData` regions appear in the final memory map as `Loaded` in the
-/// boot protocol, signalling to the kernel that these regions are in-use.
+/// boot protocol, notifying to the kernel that these regions are in-use.
 pub const EFI_LOADER_DATA: u32 = 2;
 
 // ── GUIDs ─────────────────────────────────────────────────────────────────────

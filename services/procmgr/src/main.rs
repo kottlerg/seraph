@@ -618,8 +618,8 @@ fn reply_empty(ipc_buf: *mut u64, code: u64)
 /// * `data[1]` = ring byte capacity (informational; procmgr does not
 ///   re-init the header — the spawner already called `SpscHeader::init`)
 /// * `caps[0]` = frame cap (one shmem page)
-/// * `caps[1]` = data-available signal cap
-/// * `caps[2]` = space-available signal cap
+/// * `caps[1]` = data-available notification cap
+/// * `caps[2]` = space-available notification cap
 fn handle_configure_pipe(
     req: &IpcMessage,
     ipc_buf: *mut u64,
@@ -636,16 +636,16 @@ fn handle_configure_pipe(
         return;
     }
     let frame = caps[0];
-    let data_signal = caps[1];
-    let space_signal = caps[2];
+    let data_notification = caps[1];
+    let space_notification = caps[2];
 
     let code = match table.configure_pipe(
         badge,
         self_aspace,
         direction,
         frame,
-        data_signal,
-        space_signal,
+        data_notification,
+        space_notification,
     )
     {
         Ok(()) => procmgr_errors::SUCCESS,
@@ -657,8 +657,8 @@ fn handle_configure_pipe(
     // release. Idempotent on zero. On the failure path the cap_copy may
     // not have happened yet — cap_delete on a stale slot is a no-op.
     let _ = syscall::cap_delete(frame);
-    let _ = syscall::cap_delete(data_signal);
-    let _ = syscall::cap_delete(space_signal);
+    let _ = syscall::cap_delete(data_notification);
+    let _ = syscall::cap_delete(space_notification);
 
     reply_empty(ipc_buf, code);
 }

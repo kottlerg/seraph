@@ -6,13 +6,13 @@
 //! Wait set — multiplexed blocking on multiple IPC sources.
 //!
 //! A wait set aggregates up to `WAIT_SET_MAX_MEMBERS` IPC sources (endpoints,
-//! signals, event queues). A caller blocks on the wait set and is woken when
+//! notifications, event queues). A caller blocks on the wait set and is woken when
 //! any member becomes ready. The caller receives the opaque `badge` it chose
 //! at `sys_wait_set_add` time, then reads from the source normally.
 //!
 //! # Readiness model
 //! - **Endpoint**: has at least one pending sender.
-//! - **Signal**: has non-zero bits.
+//! - **Notification**: has non-zero bits.
 //! - **`EventQueue`**: has at least one entry.
 //!
 //! # Ready ring
@@ -26,7 +26,7 @@
 //!
 //! # Lifetime — wait-set membership refcount
 //! Each `WaitSetMember` holds a +1 cap-level reference on its source's
-//! `KernelObjectHeader` (Endpoint / Signal / `EventQueue`). The +1 is taken in
+//! `KernelObjectHeader` (Endpoint / Notification / `EventQueue`). The +1 is taken in
 //! `sys_wait_set_add` after the back-pointer is published, and released in
 //! `sys_wait_set_remove` and in `wait_set_drop`. Source state is therefore
 //! pinned alive for as long as any member references it; the dealloc arms
@@ -65,15 +65,15 @@ pub const WAIT_SET_MAX_MEMBERS: usize = 16;
 pub enum WaitSetSourceTag
 {
     Endpoint = 0,
-    Signal = 1,
+    Notification = 1,
     EventQueue = 2,
 }
 
 // ── Source wrapper layout ─────────────────────────────────────────────────────
 
-/// Byte distance from the start of an Endpoint/Signal/EventQueue retype slot
+/// Byte distance from the start of an Endpoint/Notification/EventQueue retype slot
 /// (where the wrapper carrying `KernelObjectHeader` lives) to the embedded
-/// state body. Equals `size_of::<EndpointObject>() == size_of::<SignalObject>()
+/// state body. Equals `size_of::<EndpointObject>() == size_of::<NotificationObject>()
 /// == size_of::<EventQueueObject>() == 24` — see
 /// `cap::retype::EVENT_QUEUE_WRAPPER_BYTES` and the `dispatch_for` entries in
 /// `core/kernel/src/cap/retype.rs`. The wrapper structs themselves are defined
@@ -88,7 +88,7 @@ const SOURCE_WRAPPER_BYTES: usize = 24;
 ///
 /// # Safety
 /// `state_ptr` must be the state pointer registered by `waitset_add` and must
-/// point into a retype-backed source slot (Endpoint/Signal/EventQueue). The
+/// point into a retype-backed source slot (Endpoint/Notification/EventQueue). The
 /// production paths in `sys_cap_create_*` always retype-back these objects,
 /// and the dealloc arms in `cap::object::dealloc_object_one` assert
 /// `ancestor.is_some()`; the legacy heap-allocated paths are not exercised.
@@ -97,7 +97,7 @@ unsafe fn source_header(state_ptr: *mut u8) -> *mut crate::cap::object::KernelOb
     // SAFETY: state_ptr is the inner-body pointer; the wrapper (with header at
     // offset 0) precedes it by SOURCE_WRAPPER_BYTES inside the same retype slot.
     // cast_ptr_alignment: the retype slot is allocated to the alignment of its
-    // wrapper (`EndpointObject` / `SignalObject` / `EventQueueObject`), each of
+    // wrapper (`EndpointObject` / `NotificationObject` / `EventQueueObject`), each of
     // which begins with a `KernelObjectHeader` (8-byte aligned); the state body
     // is 24 bytes past that start so subtracting 24 lands on the wrapper start.
     #[allow(clippy::cast_ptr_alignment)]
@@ -120,7 +120,7 @@ unsafe fn source_header(state_ptr: *mut u8) -> *mut crate::cap::object::KernelOb
 /// fixed metadata.
 pub struct WaitSetMember
 {
-    /// Raw pointer to the source's state struct (`EndpointState` / `SignalState` /
+    /// Raw pointer to the source's state struct (`EndpointState` / `NotificationState` /
     /// `EventQueueState`). Null when the slot is vacant; otherwise used as a
     /// key for removal and for ready-at-add-time checks. Cast to the concrete
     /// type via `source_tag`.
@@ -169,8 +169,8 @@ pub struct WaitSetState
     /// pointers. Acquired by `waitset_wait`, `waitset_notify`,
     /// `waitset_add`, `waitset_remove`, and `wait_set_drop`.
     ///
-    /// Lock order: `<source>.lock` (Signal/Endpoint/EventQueue) is OUTER,
-    /// `WaitSetState.lock` is INNER. `signal_send` already holds `sig.lock`
+    /// Lock order: `<source>.lock` (Notification/Endpoint/EventQueue) is OUTER,
+    /// `WaitSetState.lock` is INNER. `notification_send` already holds `sig.lock`
     /// when it calls into `waitset_notify`; the registration and removal
     /// paths in `sys_wait_set_add` / `sys_wait_set_remove` take the
     /// source's lock before calling `waitset_add` / `waitset_remove`.
@@ -181,7 +181,7 @@ pub struct WaitSetState
     /// Source liveness during member dispatch is now guaranteed by the
     /// membership refcount (see module docs); the lock-order discipline
     /// continues to govern back-pointer consistency and the side channels
-    /// between `signal_send`/`event_post`/`endpoint_call` and
+    /// between `notification_send`/`event_post`/`endpoint_call` and
     /// `waitset_notify`.
     pub lock: crate::sync::Spinlock,
     /// Registered members. A slot with `source_ptr.is_null()` is vacant.
@@ -282,7 +282,7 @@ impl WaitSetState
 
 /// Notify the wait set that member `member_idx` is ready.
 ///
-/// Called from source objects (`signal_send`, `endpoint_call`, `event_queue_post`)
+/// Called from source objects (`notification_send`, `endpoint_call`, `event_queue_post`)
 /// when they transition from not-ready to ready.
 ///
 /// If a thread is blocked in `waitset_wait`, it is woken immediately.
@@ -407,7 +407,7 @@ pub unsafe fn waitset_wait(
     // Nothing ready — block caller.
     //
     // Clear context_saved before making the thread visible as a waiter.
-    // See signal.rs signal_wait for the full rationale.
+    // See notification.rs notification_wait for the full rationale.
     // SAFETY: caller is a valid TCB; context_saved is AtomicU32.
     unsafe {
         (*caller)
@@ -575,7 +575,7 @@ pub unsafe fn waitset_remove(ws: *mut WaitSetState, source_ptr: *mut u8) -> Resu
 /// the caller drops the outer `WaitSetObject` storage.
 ///
 /// Lock discipline: clears each source's back-pointer FIRST under the
-/// source's own lock — this is the inverse of the `signal_send →
+/// source's own lock — this is the inverse of the `notification_send →
 /// waitset_notify` direction (`source.lock` → `ws.lock`), and walking the
 /// members under `ws.lock` while taking source locks would invert that
 /// order. By clearing back-pointers first we guarantee no future
@@ -596,7 +596,7 @@ pub unsafe fn wait_set_drop(
     let ws_ref = unsafe { &mut *ws };
 
     // Step 1: clear back-pointers under each source's own lock so no
-    // concurrent signal_send / event_post / endpoint_call can call back
+    // concurrent notification_send / event_post / endpoint_call can call back
     // into waitset_notify after this point. We snapshot member info into
     // a stack array first because we cannot hold ws.lock while taking
     // source locks (that would invert the lock order).
@@ -700,10 +700,10 @@ unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
             // SAFETY: ep is a valid EndpointState.
             !unsafe { (*ep).send_head.is_null() }
         }
-        WaitSetSourceTag::Signal =>
+        WaitSetSourceTag::Notification =>
         {
-            let sig = source_ptr.cast::<crate::ipc::signal::SignalState>();
-            // SAFETY: sig is a valid SignalState.
+            let sig = source_ptr.cast::<crate::ipc::notification::NotificationState>();
+            // SAFETY: sig is a valid NotificationState.
             unsafe { (*sig).bits.load(Ordering::Acquire) != 0 }
         }
         WaitSetSourceTag::EventQueue =>
@@ -718,7 +718,7 @@ unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
 /// Clear the back-pointer on a source so it stops notifying this wait set.
 ///
 /// Acquires the source's own lock to serialise against any concurrent
-/// `signal_send` / `event_post` / `endpoint_call` that is reading
+/// `notification_send` / `event_post` / `endpoint_call` that is reading
 /// `source.wait_set` to dispatch a notification. Without this lock the
 /// reader could see a non-null pointer, then release its read of the
 /// pointer's target after we've torn down the wait set — UAF.
@@ -743,9 +743,9 @@ unsafe fn clear_source_backpointer(source_ptr: *mut u8, tag: WaitSetSourceTag)
                 (*ep).lock.unlock_raw(saved);
             }
         }
-        WaitSetSourceTag::Signal =>
+        WaitSetSourceTag::Notification =>
         {
-            let sig = source_ptr.cast::<crate::ipc::signal::SignalState>();
+            let sig = source_ptr.cast::<crate::ipc::notification::NotificationState>();
             // SAFETY: sig is valid; acquire its lock for the back-pointer write.
             unsafe {
                 let saved = (*sig).lock.lock_raw();

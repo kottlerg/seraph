@@ -200,7 +200,7 @@ The following slab caches are registered during Phase 4 of initialization:
 | `cap_slot_cache` | `CapabilitySlot` |
 | `tcb_cache` | `ThreadControlBlock` |
 | `endpoint_cache` | `Endpoint` |
-| `signal_cache` | `Signal` |
+| `notification_cache` | `Notification` |
 | `event_queue_cache` | `EventQueueHeader` |
 | `wait_set_cache` | `WaitSet` |
 | `address_space_cache` | `AddressSpace` |

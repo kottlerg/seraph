@@ -480,12 +480,12 @@ fn populate_memmgr_info(
             pi.stdout_frame_cap = 0;
             pi.stderr_frame_cap = 0;
             pi.log_send_cap = 0;
-            pi.stdin_data_signal_cap = 0;
-            pi.stdin_space_signal_cap = 0;
-            pi.stdout_data_signal_cap = 0;
-            pi.stdout_space_signal_cap = 0;
-            pi.stderr_data_signal_cap = 0;
-            pi.stderr_space_signal_cap = 0;
+            pi.stdin_data_notification_cap = 0;
+            pi.stdin_space_notification_cap = 0;
+            pi.stdout_data_notification_cap = 0;
+            pi.stdout_space_notification_cap = 0;
+            pi.stderr_data_notification_cap = 0;
+            pi.stderr_space_notification_cap = 0;
             pi.stack_top_vaddr = PROCESS_STACK_TOP;
             pi.stack_pages = stack_pages;
         },
@@ -1009,12 +1009,12 @@ fn populate_procmgr_info(
             // SEND procmgr uses to derive per-child badged caps is separate
             // (delivered via procmgr's bootstrap round).
             pi.log_send_cap = caps.log_send_slot;
-            pi.stdin_data_signal_cap = 0;
-            pi.stdin_space_signal_cap = 0;
-            pi.stdout_data_signal_cap = 0;
-            pi.stdout_space_signal_cap = 0;
-            pi.stderr_data_signal_cap = 0;
-            pi.stderr_space_signal_cap = 0;
+            pi.stdin_data_notification_cap = 0;
+            pi.stdin_space_notification_cap = 0;
+            pi.stdout_data_notification_cap = 0;
+            pi.stdout_space_notification_cap = 0;
+            pi.stderr_data_notification_cap = 0;
+            pi.stderr_space_notification_cap = 0;
             pi.tls_template_vaddr = caps.tls.vaddr;
             pi.tls_template_filesz = caps.tls.filesz;
             pi.tls_template_memsz = caps.tls.memsz;

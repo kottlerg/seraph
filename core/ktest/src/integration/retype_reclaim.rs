@@ -16,7 +16,7 @@
 //!
 //! Object types covered:
 //! - `Endpoint`     (sub-page, in-place)
-//! - `Signal`       (sub-page, in-place)
+//! - `Notification`       (sub-page, in-place)
 //! - `WaitSet`      (sub-page, in-place)
 //! - `EventQueue`   (sub-page when small, page-aligned split when large)
 //! - `Thread`       (page-aligned split — kstack + wrapper page)
@@ -34,7 +34,7 @@
 //! — the round-trip equality still holds either way.
 
 use syscall::{
-    cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_signal,
+    cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_create_thread, cap_delete, cap_info, event_queue_create, wait_set_create,
 };
 use syscall_abi::CAP_INFO_FRAME_AVAILABLE;
@@ -92,17 +92,17 @@ pub fn run(ctx: &TestContext) -> TestResult
         baseline,
     )?;
 
-    // ── Signal ───────────────────────────────────────────────────────────────
-    let sig = cap_create_signal(frame)
-        .map_err(|_| "integration::retype_reclaim: cap_create_signal failed")?;
+    // ── Notification ───────────────────────────────────────────────────────────────
+    let sig = cap_create_notification(frame)
+        .map_err(|_| "integration::retype_reclaim: cap_create_notification failed")?;
     let mid = read_available(frame)?;
     if mid >= baseline
     {
-        return Err("integration::retype_reclaim: Signal mint did not debit available_bytes");
+        return Err("integration::retype_reclaim: Notification mint did not debit available_bytes");
     }
-    cap_delete(sig).map_err(|_| "integration::retype_reclaim: cap_delete(signal) failed")?;
+    cap_delete(sig).map_err(|_| "integration::retype_reclaim: cap_delete(notification) failed")?;
     assert_baseline(
-        "integration::retype_reclaim: Signal reclaim mismatch",
+        "integration::retype_reclaim: Notification reclaim mismatch",
         frame,
         baseline,
     )?;
@@ -231,8 +231,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         cap_create_endpoint(frame).map_err(|_| "integration::retype_reclaim: batch ep1 failed")?;
     let e2 =
         cap_create_endpoint(frame).map_err(|_| "integration::retype_reclaim: batch ep2 failed")?;
-    let s1 =
-        cap_create_signal(frame).map_err(|_| "integration::retype_reclaim: batch sig1 failed")?;
+    let s1 = cap_create_notification(frame)
+        .map_err(|_| "integration::retype_reclaim: batch sig1 failed")?;
     let w1 = wait_set_create(frame).map_err(|_| "integration::retype_reclaim: batch ws1 failed")?;
     let a1 = cap_create_aspace(frame, 0, 8)
         .map_err(|_| "integration::retype_reclaim: batch aspace1 failed")?;

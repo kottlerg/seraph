@@ -109,7 +109,7 @@ init's wait-for-root barrier.
 
 `service::phase3_svcmgr_handover` (in `../src/service.rs`, called
 from `../src/main.rs`) loads svcmgr, serves it the handover endowment,
-signals handover, and hands init's own kernel objects to procmgr for
+notifications handover, and hands init's own kernel objects to procmgr for
 reaping. svcmgr — not init — publishes the well-known caps, registers
 services, and talks to devmgr, all from the endowment.
 
@@ -178,7 +178,7 @@ services, and talks to devmgr, all from the endowment.
   `QUERY_SHUTDOWN_DEVICE` for pwrmgr). The RTC chip driver (cmos-rtc on
   x86-64, goldfish-rtc on RISC-V) is spawned by devmgr from
   `/services/drivers/<chip>` after svcmgr's `SET_DRIVERS_DIR` handshake.
-- Signal `HANDOVER_COMPLETE`. svcmgr scans `/config/svcmgr/services/`,
+- Notification `HANDOVER_COMPLETE`. svcmgr scans `/config/svcmgr/services/`,
   reconciles the parked substrate against the recipes, and launches any
   defined-but-unparked services (`timed`, `pwrmgr`, staged harnesses)
   from disk.

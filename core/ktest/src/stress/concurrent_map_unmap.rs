@@ -8,8 +8,8 @@
 //! lock contention and TLB shootdown under load.
 
 use syscall::{
-    cap_copy, cap_create_signal, cap_delete, mem_map, mem_unmap, signal_send, signal_wait,
-    thread_exit,
+    cap_copy, cap_create_notification, cap_delete, mem_map, mem_unmap, notification_send,
+    notification_wait, thread_exit,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -20,7 +20,7 @@ const MAP_ITERATIONS: usize = 1000;
 // done_bit is packed at bits 48..63 of the spawn arg (16-bit lane), so
 // `1u64 << i` must fit in 16 bits — bounding NUM_CHILDREN at 16. Raising
 // past 16 requires widening the lane or switching to bit-index packing
-// (see concurrent_signal.rs for the larger-lane idiom).
+// (see concurrent_notification.rs for the larger-lane idiom).
 const _: () = assert!(NUM_CHILDREN <= 16);
 
 /// Base VA for stress mappings, well above normal test VAs.
@@ -30,7 +30,7 @@ const VA_STRIDE: u64 = 0x1_0000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let done = cap_create_signal(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_frame_base)
         .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
     // Allocate frames from pool for each child.
@@ -83,7 +83,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut child_failed = false;
     while done_bits & all_done != all_done
     {
-        let bits = signal_wait(done).map_err(|_| "concurrent_map_unmap: signal_wait failed")?;
+        let bits = notification_wait(done)
+            .map_err(|_| "concurrent_map_unmap: notification_wait failed")?;
         done_bits |= bits;
         // Bit 32 is the error indicator (well clear of done_bit range for
         // NUM_CHILDREN up to 32).
@@ -137,7 +138,7 @@ fn mapper_entry(arg: u64) -> !
         if mem_map(frame_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
         {
             // Send done_bit | error indicator (bit 32).
-            signal_send(done_slot, done_bit | (1 << 32)).ok();
+            notification_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
 
@@ -148,17 +149,17 @@ fn mapper_entry(arg: u64) -> !
         // ktest's own statics.
         if syscall::aspace_query(aspace, va).is_err()
         {
-            signal_send(done_slot, done_bit | (1 << 32)).ok();
+            notification_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
 
         if mem_unmap(aspace, va, 1).is_err()
         {
-            signal_send(done_slot, done_bit | (1 << 32)).ok();
+            notification_send(done_slot, done_bit | (1 << 32)).ok();
             thread_exit();
         }
     }
 
-    signal_send(done_slot, done_bit).ok();
+    notification_send(done_slot, done_bit).ok();
     thread_exit()
 }

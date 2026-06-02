@@ -79,7 +79,7 @@ implemented.
 - `SERIAL_READ_BYTES` — read available input bytes from the UART receive path.
 - `SERIAL_SET_LINE_CONTROL` — configure baud rate, parity, and stop bits.
 - `SERIAL_SET_FLOW_CONTROL` — configure hardware/software flow control.
-- `SERIAL_REGISTER_RX_NOTIFY` — register a signal cap kicked on receive-data-ready.
+- `SERIAL_REGISTER_RX_NOTIFY` — register a notification cap kicked on receive-data-ready.
 
 ---
 

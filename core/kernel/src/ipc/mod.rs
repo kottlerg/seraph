@@ -3,11 +3,11 @@
 
 // kernel/src/ipc/mod.rs
 
-//! IPC subsystem — synchronous endpoint messaging, signals, event queues, wait sets.
+//! IPC subsystem — synchronous endpoint messaging, notifications, event queues, wait sets.
 //!
 //! Implements the kernel side of:
 //! - [`endpoint`]: blocking call/recv/reply using intrusive TCB queues.
-//! - [`signal`]: bitmask-based asynchronous notification (OR bits / wait).
+//! - [`notification`]: bitmask-based asynchronous notification (OR bits / wait).
 //! - [`event_queue`]: ordered, non-coalescing ring buffer with a single waiter.
 //! - [`wait_set`]: multiplexed blocking on any combination of the above.
 //! - [`message`]: the `Message` struct transferred through both mechanisms.
@@ -15,5 +15,5 @@
 pub mod endpoint;
 pub mod event_queue;
 pub mod message;
-pub mod signal;
+pub mod notification;
 pub mod wait_set;

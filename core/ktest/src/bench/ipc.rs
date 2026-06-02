@@ -9,8 +9,8 @@
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, signal_send, signal_wait,
-    thread_exit,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
+    notification_wait, thread_exit,
 };
 
 use super::{cycles_now, log_bench_header};
@@ -28,7 +28,7 @@ fn ipc_caller_entry(arg: u64) -> !
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
     {
-        signal_send(done_slot, 1).ok();
+        notification_send(done_slot, 1).ok();
         thread_exit()
     }
     let ipc_buf = buf_addr as *mut u64;
@@ -42,7 +42,7 @@ fn ipc_caller_entry(arg: u64) -> !
             break;
         }
     }
-    signal_send(done_slot, 1).ok();
+    notification_send(done_slot, 1).ok();
     thread_exit()
 }
 
@@ -56,7 +56,7 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     {
         return;
     };
-    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         return;
@@ -118,7 +118,7 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
         completed += 1;
     }
 
-    signal_wait(done).ok();
+    notification_wait(done).ok();
 
     log_bench_header("ipc_round_trip", iters);
     if let Some(mean) = total.checked_div(completed)

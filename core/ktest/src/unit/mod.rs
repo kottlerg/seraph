@@ -24,7 +24,7 @@
 //! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
 //! - `retype.rs`   — retype primitive: aspace/cspace augment, PT budget, kernel PT pool
 //! - `mm.rs`       — memory map/unmap/protect, frame split, address space query
-//! - `signal.rs`   — signal send and wait (blocking and timeout)
+//! - `notification.rs`   — notification send and wait (blocking and timeout)
 //! - `event.rs`    — event queue post and receive (blocking, try, timeout)
 //! - `wait_set.rs` — wait set add, remove, wait
 //! - `ipc.rs`      — IPC call, reply, recv, buffer set
@@ -40,8 +40,8 @@ pub mod fpu;
 pub mod hw;
 pub mod ipc;
 pub mod mm;
+pub mod notification;
 pub mod retype;
-pub mod signal;
 pub mod sysinfo;
 pub mod thread;
 pub mod wait_set;
@@ -58,7 +58,7 @@ use crate::run_test;
 pub fn run_all(ctx: &TestContext)
 {
     // ── Capability syscalls ───────────────────────────────────────────────────
-    run_test!("cap::create_signal", cap::create_signal(ctx));
+    run_test!("cap::create_notification", cap::create_notification(ctx));
     run_test!("cap::create_endpoint", cap::create_endpoint(ctx));
     run_test!("cap::create_event_q", cap::create_event_q(ctx));
     run_test!("cap::create_cspace", cap::create_cspace(ctx));
@@ -108,8 +108,8 @@ pub fn run_all(ctx: &TestContext)
         cap::derive_inherits_badge(ctx)
     );
     run_test!(
-        "cap::derive_badge_on_signal",
-        cap::derive_badge_on_signal(ctx)
+        "cap::derive_badge_on_notification",
+        cap::derive_badge_on_notification(ctx)
     );
 
     // ── Capability inspection (SYS_CAP_INFO) ──────────────────────────────────
@@ -122,8 +122,8 @@ pub fn run_all(ctx: &TestContext)
         cap_info::tag_rights_frame(ctx)
     );
     run_test!(
-        "cap_info::tag_rights_signal",
-        cap_info::tag_rights_signal(ctx)
+        "cap_info::tag_rights_notification",
+        cap_info::tag_rights_notification(ctx)
     );
     run_test!("cap_info::frame_fields", cap_info::frame_fields(ctx));
     run_test!(
@@ -220,47 +220,47 @@ pub fn run_all(ctx: &TestContext)
         mm::init_segment_caps_aligned(ctx)
     );
 
-    // ── Signal syscalls ───────────────────────────────────────────────────────
-    run_test!("signal::send", signal::send(ctx));
+    // ── Notification syscalls ───────────────────────────────────────────────────────
+    run_test!("notification::send", notification::send(ctx));
     run_test!(
-        "signal::send_wait_blocking",
-        signal::send_wait_blocking(ctx)
+        "notification::send_wait_blocking",
+        notification::send_wait_blocking(ctx)
     );
     run_test!(
-        "signal::send_before_wait_immediate",
-        signal::send_before_wait_immediate(ctx)
+        "notification::send_before_wait_immediate",
+        notification::send_before_wait_immediate(ctx)
     );
     run_test!(
-        "signal::wait_insufficient_rights",
-        signal::wait_insufficient_rights(ctx)
+        "notification::wait_insufficient_rights",
+        notification::wait_insufficient_rights(ctx)
     );
     run_test!(
-        "signal::multiple_sends_before_wait_accumulate_bits",
-        signal::multiple_sends_before_wait_accumulate_bits(ctx)
+        "notification::multiple_sends_before_wait_accumulate_bits",
+        notification::multiple_sends_before_wait_accumulate_bits(ctx)
     );
     run_test!(
-        "signal::send_zero_bits_is_noop",
-        signal::send_zero_bits_is_noop(ctx)
+        "notification::send_zero_bits_is_noop",
+        notification::send_zero_bits_is_noop(ctx)
     );
     run_test!(
-        "signal::send_insufficient_rights",
-        signal::send_insufficient_rights(ctx)
+        "notification::send_insufficient_rights",
+        notification::send_insufficient_rights(ctx)
     );
     run_test!(
-        "signal::wait_timeout_fires",
-        signal::wait_timeout_fires(ctx)
+        "notification::wait_timeout_fires",
+        notification::wait_timeout_fires(ctx)
     );
     run_test!(
-        "signal::wait_timeout_returns_bits_first",
-        signal::wait_timeout_returns_bits_first(ctx)
+        "notification::wait_timeout_returns_bits_first",
+        notification::wait_timeout_returns_bits_first(ctx)
     );
     run_test!(
-        "signal::wait_high_bit_roundtrip",
-        signal::wait_high_bit_roundtrip(ctx)
+        "notification::wait_high_bit_roundtrip",
+        notification::wait_high_bit_roundtrip(ctx)
     );
     run_test!(
-        "signal::wait_high_bit_parked_wakeup",
-        signal::wait_high_bit_parked_wakeup(ctx)
+        "notification::wait_high_bit_parked_wakeup",
+        notification::wait_high_bit_parked_wakeup(ctx)
     );
 
     // ── Event queue syscalls ──────────────────────────────────────────────────
@@ -302,8 +302,8 @@ pub fn run_all(ctx: &TestContext)
 
     // ── Wait set syscalls ─────────────────────────────────────────────────────
     run_test!(
-        "wait_set::add_signal_immediate",
-        wait_set::add_signal_immediate(ctx)
+        "wait_set::add_notification_immediate",
+        wait_set::add_notification_immediate(ctx)
     );
     run_test!(
         "wait_set::add_queue_immediate",
@@ -312,8 +312,8 @@ pub fn run_all(ctx: &TestContext)
     run_test!("wait_set::blocking_wait", wait_set::blocking_wait(ctx));
     run_test!("wait_set::remove", wait_set::remove(ctx));
     run_test!(
-        "wait_set::source_signal_pinned_by_member",
-        wait_set::source_signal_pinned_by_member(ctx)
+        "wait_set::source_notification_pinned_by_member",
+        wait_set::source_notification_pinned_by_member(ctx)
     );
     run_test!(
         "wait_set::source_eventqueue_pinned_by_member",

@@ -86,7 +86,7 @@ diagnostics if something went wrong.
 systems, some virtual-machine configurations, serial-only platforms — is
 a valid configuration, not an error. The bootloader's `FramebufferInfo`
 field is zeroed in that case (`physical_base == 0`), which is the
-boot-protocol contract's signal for "no framebuffer present". Neither
+boot-protocol contract's notification for "no framebuffer present". Neither
 the bootloader nor the kernel treats this as failure.
 
 GOP query runs in Step 1 of the boot sequence; the result feeds both the

@@ -753,7 +753,7 @@ mod tests
 {
     use super::*;
 
-    /// `empty()` must signal "no framebuffer" via physical_base == 0.
+    /// `empty()` must notification "no framebuffer" via physical_base == 0.
     #[test]
     fn framebuffer_info_empty_physical_base_is_zero()
     {

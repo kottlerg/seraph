@@ -24,7 +24,7 @@ use crate::TestContext;
 /// Child-thread handle returned by [`new_child`].
 ///
 /// Caller is responsible for deleting both caps when the child has exited
-/// (typically via `signal_wait`-based handshake). Order: `th` first,
+/// (typically via `notification_wait`-based handshake). Order: `th` first,
 /// then `cs`.
 pub struct SpawnedChild
 {

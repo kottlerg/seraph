@@ -534,7 +534,7 @@ const fn empty_slab() -> ObjectSlab {
     }
 }
 
-/// Slab serving sub-page requests `<= 128 B` (Endpoint, Signal).
+/// Slab serving sub-page requests `<= 128 B` (Endpoint, Notification).
 static SLAB_BIN_128: ObjectSlab = empty_slab();
 /// Slab serving sub-page requests `> 128 B && <= 512 B` (WaitSet).
 static SLAB_BIN_512: ObjectSlab = empty_slab();

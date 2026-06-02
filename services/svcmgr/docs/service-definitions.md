@@ -63,7 +63,7 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 
 | Value | Semantics |
 |---|---|
-| `never` | Service is one-shot; never restarted, even on fault. Used for integration-test fixtures (e.g. `svctest`) whose clean exit is the success signal. |
+| `never` | Service is one-shot; never restarted, even on fault. Used for integration-test fixtures (e.g. `svctest`) whose clean exit is the success notification. |
 | `on_failure` | Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`). Clean exits are treated as intentional. |
 | `always` | Restart on every exit, clean or faulty. Default for daemons that should never terminate during normal operation. |
 

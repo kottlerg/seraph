@@ -426,7 +426,7 @@ impl TrapFrame {
 - Slab allocator and size-class allocator
 - CSpace slot storage, lookup, and growth
 - Capability derivation tree and revocation algorithm
-- Endpoint, signal, event queue, and wait set objects
+- Endpoint, notification, event queue, and wait set objects
 - Thread control block structure (except the `SavedState` field)
 - Run queue management, priority levels, and time-slice accounting
 - Load balancing decisions

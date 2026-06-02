@@ -161,7 +161,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 }
 
 /// Spin (no yield) until `PHASE` reaches `target`, polling the child's liveness
-/// so a child that died before signalling does not spin to the bound. Returns
+/// so a child that died before notifying does not spin to the bound. Returns
 /// `false` on timeout or an early child exit.
 fn parent_wait_phase(target: u32, child: &crate::spawn::SpawnedChild) -> bool
 {
@@ -233,7 +233,7 @@ fn widen_child(_arg: u64) -> !
         syscall::thread_exit();
     }
     // Read to cache a read-only TLB entry for WIDEN_VA on this CPU.
-    // SAFETY: the parent mapped WIDEN_VA read-only before signalling.
+    // SAFETY: the parent mapped WIDEN_VA read-only before notifying.
     let _ = unsafe { p.read_volatile() };
     PHASE.store(PHASE_CACHED, Ordering::Release);
 

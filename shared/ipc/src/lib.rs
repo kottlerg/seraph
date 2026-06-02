@@ -140,12 +140,12 @@ pub mod procmgr_labels
     ///   minus header). v1 uses 2048.
     /// * `caps[0]` — frame cap (one shmem page; spawner has already
     ///   initialised the [`SpscHeader`] via `init`).
-    /// * `caps[1]` — data-available signal cap.
-    /// * `caps[2]` — space-available signal cap.
+    /// * `caps[1]` — data-available notification cap.
+    /// * `caps[2]` — space-available notification cap.
     ///
     /// procmgr `cap_copy`s each cap into the child's `CSpace` and writes
     /// the resulting slot indices into the matching `<dir>_frame_cap`,
-    /// `<dir>_data_signal_cap`, and `<dir>_space_signal_cap` slots of
+    /// `<dir>_data_notification_cap`, and `<dir>_space_notification_cap` slots of
     /// the child's `ProcessInfo`. All three caps are required; missing
     /// cap slots reply `INVALID_ARGUMENT`.
     ///
@@ -261,7 +261,7 @@ pub mod procmgr_labels
     /// `procmgr_errors::SUCCESS`.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
-    /// Signal end of init's reap-handoff cap stream. After this call
+    /// Notification end of init's reap-handoff cap stream. After this call
     /// init has no caps left to transfer; procmgr's state machine
     /// transitions to "armed", awaiting the death-EQ event. Init
     /// calls `sys_thread_exit` immediately after this IPC replies.
@@ -313,7 +313,7 @@ pub mod memmgr_labels
     /// identifying the new process. Procmgr installs the returned cap in
     /// the new process's `ProcessInfo.memmgr_endpoint_cap`.
     pub const REGISTER_PROCESS: u64 = 3;
-    /// Procmgr-only: signal process death. The transferred cap (`caps[0]`)
+    /// Procmgr-only: notification process death. The transferred cap (`caps[0]`)
     /// carries the dead process's badge; memmgr reclaims every Frame cap
     /// it had issued to that badge, runs coalescing, and clears the
     /// per-process record. Idempotent on unknown badges.
@@ -526,7 +526,7 @@ pub mod svcmgr_labels
     /// line in `/config/svcmgr/services/<name>.svc` so attenuation survives a
     /// crash-restart cycle.
     pub const NS_POLICY_SUBTREE: u8 = 2;
-    /// Signal that init handover is complete.
+    /// Notification that init handover is complete.
     pub const HANDOVER_COMPLETE: u64 = 2;
     /// Publish a named endpoint into the discovery registry.
     ///

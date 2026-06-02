@@ -134,8 +134,8 @@ pub enum CapTag
     AddressSpace = 2,
     /// IPC endpoint.
     Endpoint = 3,
-    /// Bitmask-based async signal.
-    Signal = 4,
+    /// Bitmask-based async notification.
+    Notification = 4,
     /// Ordered event queue.
     EventQueue = 5,
     /// Hardware interrupt line.
@@ -192,10 +192,10 @@ impl Rights
     /// May include capabilities in IPC messages.
     pub const GRANT: Rights = Rights(1 << 6);
 
-    // ── Signal / event queue ──────────────────────────────────────────────────
-    /// May deliver a signal notification.
-    pub const SIGNAL: Rights = Rights(1 << 7);
-    /// May wait on a signal or wait set.
+    // ── Notification / event queue ──────────────────────────────────────────────────
+    /// May deliver a notification notification.
+    pub const NOTIFY: Rights = Rights(1 << 7);
+    /// May wait on a notification or wait set.
     pub const WAIT: Rights = Rights(1 << 8);
     /// May post an entry to an event queue.
     pub const POST: Rights = Rights(1 << 9);
@@ -577,7 +577,7 @@ mod tests
             | Rights::SEND
             | Rights::RECEIVE
             | Rights::GRANT
-            | Rights::SIGNAL
+            | Rights::NOTIFY
             | Rights::WAIT
             | Rights::POST
             | Rights::RECV

@@ -60,7 +60,7 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
             let _ = unsafe { bootstrap::reply_error(bootstrap_errors::INVALID, ipc_buf) };
             if let Some(p) = pending
             {
-                signal_channel(&p.channel, false);
+                notification_channel(&p.channel, false);
             }
             continue;
         }
@@ -76,7 +76,7 @@ pub fn bootstrap_loop(bootstrap_ep: u32, state: &Mutex<BootstrapState>) -> !
         let caps = [pending.blk, pending.service];
         // SAFETY: ipc_buf is the thread-registered IPC buffer page.
         let ok = unsafe { bootstrap::reply_round(true, &caps, &[], ipc_buf) }.is_ok();
-        signal_channel(&pending.channel, ok);
+        notification_channel(&pending.channel, ok);
     }
 }
 
@@ -95,7 +95,7 @@ pub fn active_loop(active: &ActiveState, bootstrap_state: &Mutex<BootstrapState>
     {
         let job = take_next_active_job(active);
         let ok = handle_create_from_file(job.order, bootstrap_state, ipc_buf);
-        signal_channel(&job.completion, ok);
+        notification_channel(&job.completion, ok);
     }
 }
 
@@ -205,7 +205,7 @@ fn take_pending_by_badge(state: &Mutex<BootstrapState>, badge: u64) -> Option<Pe
 }
 
 /// Write a result into a per-request channel and wake the waiter.
-fn signal_channel(channel: &Channel, ok: bool)
+fn notification_channel(channel: &Channel, ok: bool)
 {
     let mut st = channel.0.lock().unwrap_or_else(PoisonError::into_inner);
     *st = Some(ok);

@@ -169,7 +169,7 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// CPUs as a vector of `AtomicU64` words.
 ///
 /// Load-bearing for the idle-wake primitive. Set producer-side in
-/// `enqueue_and_wake` before the wake signal (IPI) is sent. Consumed by the
+/// `enqueue_and_wake` before the wake notification (IPI) is sent. Consumed by the
 /// target CPU's idle loop with interrupts disabled, paired with
 /// `halt_until_interrupt`:
 ///
@@ -179,7 +179,7 @@ pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 ///   run queue → if either set, clear flag and dispatch; else
 ///   `halt_until_interrupt` (atomic enable+halt).
 ///
-/// This closes the "window B" race: a wake signal that races between the
+/// This closes the "window B" race: a wake notification that races between the
 /// consumer's check and its halt lands either as an observed flag (via
 /// `take_reschedule_pending`) or as a pending interrupt that
 /// `halt_until_interrupt` wakes on atomically.
@@ -511,7 +511,7 @@ pub fn sleep_list_add(tcb: *mut ThreadControlBlock) -> Result<(), ()>
     result
 }
 
-/// Remove a thread from the sleep list if present. Called by `signal_send`
+/// Remove a thread from the sleep list if present. Called by `notification_send`
 /// when waking a waiter that was registered with a timeout, so the timer
 /// path does not later try to double-wake it.
 ///
@@ -548,14 +548,14 @@ pub fn sleep_list_remove(tcb: *mut ThreadControlBlock) -> bool
 /// Called from `timer_tick()` on the BSP. Collects expired threads under the
 /// sleep list lock, then wakes them after releasing it.
 ///
-/// Signal-wait-with-timeout threads are on this list AND registered as a
-/// signal waiter. If `signal_send` claims the waiter first, it removes the
+/// Notification-wait-with-timeout threads are on this list AND registered as a
+/// notification waiter. If `notification_send` claims the waiter first, it removes the
 /// tcb from the sleep list under `sig.lock`, so we will not see it here.
-/// If we reach a signal-waiter tcb here, we must arbitrate against a
-/// concurrent `signal_send` by taking `sig.lock` and checking whether we
+/// If we reach a notification-waiter tcb here, we must arbitrate against a
+/// concurrent `notification_send` by taking `sig.lock` and checking whether we
 /// are still registered as the waiter before claiming the wake.
 // too_many_lines: flat dispatch over every claimable `IpcThreadState`
-// (signal, event queue, reply, plain sleep); each arm is independent and
+// (notification, event queue, reply, plain sleep); each arm is independent and
 // short, and splitting would require duplicating the SLEEP_LIST snapshot
 // plumbing.
 #[allow(clippy::too_many_lines)]
@@ -565,8 +565,8 @@ pub fn sleep_check_wakeups()
     let now = crate::arch::current::timer::current_tick();
 
     // Collect expired threads under the lock into the CPU0-timer-private
-    // scratch buffer. Do not touch state yet — for signal-wait-timeout entries
-    // we need to take the signal's lock first.
+    // scratch buffer. Do not touch state yet — for notification-wait-timeout entries
+    // we need to take the notification's lock first.
     // SAFETY: runs only on CPU0 behind an interrupt gate (non-reentrant), so
     // this &mut borrow of EXPIRED_SCRATCH is exclusive for the call. Only
     // entries [0, n) are written below and read back; stale tail entries are
@@ -619,25 +619,26 @@ pub fn sleep_check_wakeups()
 
         let claimed = match ipc_state
         {
-            crate::sched::thread::IpcThreadState::BlockedOnSignal if !blocked_on.is_null() =>
+            crate::sched::thread::IpcThreadState::BlockedOnNotification
+                if !blocked_on.is_null() =>
             {
-                // SAFETY: BlockedOnSignal implies blocked_on_object is a
-                // valid *mut SignalState (see `ipc::signal::signal_wait`).
-                // The kernel allocator guarantees SignalState alignment;
+                // SAFETY: BlockedOnNotification implies blocked_on_object is a
+                // valid *mut NotificationState (see `ipc::notification::notification_wait`).
+                // The kernel allocator guarantees NotificationState alignment;
                 // the cast_ptr_alignment lint is suppressed here because
                 // the pointer is type-erased as *mut u8 in the TCB to
                 // break a circular module import.
                 #[allow(clippy::cast_ptr_alignment)]
-                let sig_state = blocked_on.cast::<crate::ipc::signal::SignalState>();
+                let sig_state = blocked_on.cast::<crate::ipc::notification::NotificationState>();
                 // SAFETY: sig_state is valid for the duration of the wait;
-                // lock serialises against signal_send.
+                // lock serialises against notification_send.
                 let saved_sig = unsafe { (*sig_state).lock.lock_raw() };
                 // SAFETY: same as above.
                 let we_win = unsafe { (*sig_state).waiter } == tcb;
                 if we_win
                 {
                     // SAFETY: we hold sig.lock. wakeup_value=0 is the
-                    // timeout marker (signal_send rejects 0-bit sends, so
+                    // timeout marker (notification_send rejects 0-bit sends, so
                     // 0 is unambiguous). State/ipc_state/blocked_on are
                     // committed by enqueue_and_wake under sched.lock.
                     unsafe {
@@ -660,7 +661,7 @@ pub fn sleep_check_wakeups()
                 // SAFETY: BlockedOnEventQueue implies blocked_on_object is
                 // a valid *mut EventQueueState (see
                 // `ipc::event_queue::event_queue_recv`). cast_ptr_alignment
-                // suppressed for the same reason as the signal arm above.
+                // suppressed for the same reason as the notification arm above.
                 #[allow(clippy::cast_ptr_alignment)]
                 let eq_state = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
                 // SAFETY: eq_state is valid for the duration of the wait;
@@ -716,7 +717,7 @@ pub fn sleep_check_wakeups()
                 // server/cancel/dealloc beat us. Lock order: SLEEP_LIST_LOCK
                 // was released above; this is a lock-free atomic.
                 // cast_ptr_alignment suppressed for the same reason as the
-                // signal arm above.
+                // notification arm above.
                 #[allow(clippy::cast_ptr_alignment)]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
                 // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
@@ -792,7 +793,7 @@ pub fn alloc_thread_id() -> u32
 ///   interrupts are disabled, so the subsequent IPI is held pending at
 ///   the halt boundary; `halt_until_interrupt` wakes atomically, the loop
 ///   iterates, observes the flag, dispatches.
-/// - If the signal arrives during the halt: standard halt wake; loop
+/// - If the notification arrives during the halt: standard halt wake; loop
 ///   iterates, observes the flag, dispatches.
 ///
 /// No reliance on timer-tick recovery. See `RESCHEDULE_PENDING` doc and
@@ -809,7 +810,7 @@ fn idle_thread_entry(_cpu_id: u64) -> !
 
             // Step 1: disable interrupts. The check below and the halt must
             // be on the same side of the interrupt-masking boundary so a
-            // concurrent producer-signal races into a pending interrupt
+            // concurrent producer-notification races into a pending interrupt
             // rather than disappearing.
             // SAFETY: ring-0 / S-mode; halt_until_interrupt re-enables.
             unsafe {
@@ -1949,7 +1950,7 @@ unsafe fn wake_idle_cpu(_target_cpu: usize) {}
 /// not be re-enqueued.
 ///
 /// **Why a parameter instead of checking `state == Running`:** after a
-/// voluntary block (`signal_wait`, IPC), the thread's state is `Blocked`.
+/// voluntary block (`notification_wait`, IPC), the thread's state is `Blocked`.
 /// But between the IPC lock release and this function acquiring the
 /// scheduler lock, another CPU can wake the thread, enqueue it on a
 /// different CPU, dequeue it, and set its state back to `Running`. If

@@ -347,7 +347,7 @@ impl CSpace
     /// Rejects re-freeing the current `free_head`: pushing it again would
     /// set `slot.next_free = slot`, a self-loop that turns the next
     /// `allocate_slot` into an unbounded spin under IRQs-off cspace.lock.
-    /// A Null tag alone is not a "double-free" signal — `allocate_slot`
+    /// A Null tag alone is not a "double-free" notification — `allocate_slot`
     /// clears the slot on pop, so a freshly-allocated, not-yet-populated
     /// slot is also Null-tagged but legitimately off the list.
     pub fn free_slot(&mut self, index: u32)

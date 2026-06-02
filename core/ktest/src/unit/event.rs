@@ -11,9 +11,9 @@
 //! blocks only when the queue is empty. We pre-fill queues before receiving.
 
 use syscall::{
-    cap_copy, cap_create_signal, cap_delete, event_post, event_queue_create, event_recv,
-    event_recv_timeout, event_try_recv, signal_send, signal_wait, system_info, thread_exit,
-    thread_sleep, thread_yield,
+    cap_copy, cap_create_notification, cap_delete, event_post, event_queue_create, event_recv,
+    event_recv_timeout, event_try_recv, notification_send, notification_wait, system_info,
+    thread_exit, thread_sleep, thread_yield,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -100,16 +100,16 @@ pub fn queue_full_err(ctx: &TestContext) -> TestResult
 ///
 /// A child thread calls `event_recv` on an initially empty queue. The main
 /// thread yields once to let the child block, then posts 0x42. The child
-/// verifies the received payload and reports it back via a signal.
+/// verifies the received payload and reports it back via a notification.
 pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
 {
     let eq =
         event_queue_create(ctx.memory_frame_base, 4).map_err(|_| "event_queue_create failed")?;
-    let sync = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_signal for sync failed")?;
+    let sync = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_notification for sync failed")?;
 
     let child = crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child failed")?;
-    // Pass all rights for the queue; SIGNAL right for the sync signal.
+    // Pass all rights for the queue; NOTIFY right for the sync notification.
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_sync = cap_copy(sync, child.cs, 1 << 7).map_err(|_| "cap_copy sync failed")?;
     let child_arg = u64::from(child_eq) | (u64::from(child_sync) << 16);
@@ -124,8 +124,8 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     // Post a value — the blocked child wakes and receives it.
     event_post(eq, 0x42).map_err(|_| "event_post failed")?;
 
-    // Child sends the received value back via the sync signal.
-    let bits = signal_wait(sync).map_err(|_| "signal_wait for result failed")?;
+    // Child sends the received value back via the sync notification.
+    let bits = notification_wait(sync).map_err(|_| "notification_wait for result failed")?;
     if bits != 0x42
     {
         return Err("child received wrong event payload (expected 0x42)");
@@ -334,7 +334,7 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
 
 // ── Child thread entry ────────────────────────────────────────────────────────
 
-/// Child: blocks on `event_recv` then signals the received payload back.
+/// Child: blocks on `event_recv` then notifications the received payload back.
 ///
 /// `arg`: bits[15:0] = `eq_slot`, bits[31:16] = `sync_slot` (in child's `CSpace`).
 fn recv_and_report_entry(arg: u64) -> !
@@ -346,11 +346,11 @@ fn recv_and_report_entry(arg: u64) -> !
     {
         Ok(val) =>
         {
-            signal_send(sync_slot, val).ok();
+            notification_send(sync_slot, val).ok();
         }
         Err(_) =>
         {
-            signal_send(sync_slot, 0xBAD).ok();
+            notification_send(sync_slot, 0xBAD).ok();
         }
     }
     thread_exit()

@@ -56,7 +56,7 @@ kernel/
 │   ├── ipc/                    # IPC subsystem
 │   │   ├── mod.rs
 │   │   ├── endpoint.rs         # Endpoint object: wait queues, state machine
-│   │   ├── signal.rs           # Signal object: atomic bitmask
+│   │   ├── notification.rs           # Notification object: atomic bitmask
 │   │   ├── event_queue.rs      # Event queue: ring buffer
 │   │   └── wait_set.rs         # Wait set: multi-source aggregation
 │   ├── sched/                  # Scheduler
@@ -109,7 +109,7 @@ See [`docs/capability-internals.md`](docs/capability-internals.md).
 
 ### `ipc/`
 
-IPC kernel objects: endpoints for synchronous call/reply, signals for coalescing async
+IPC kernel objects: endpoints for synchronous call/reply, notifications for coalescing async
 notification, event queues for ordered async notification, and wait sets for
 multiplexed waiting. See [`docs/ipc-internals.md`](docs/ipc-internals.md).
 

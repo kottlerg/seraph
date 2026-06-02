@@ -35,7 +35,7 @@ pub const POLICY_ALWAYS: u8 = 0;
 pub const POLICY_ON_FAILURE: u8 = 1;
 
 /// Restart policy: never restart, even on fault. Used for one-shot
-/// integration-test fixtures whose exit is the success signal.
+/// integration-test fixtures whose exit is the success notification.
 pub const POLICY_NEVER: u8 = 2;
 
 // ── Service table ───────────────────────────────────────────────────────────

@@ -1283,7 +1283,7 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
 
     kprintln!("smp: AP {} online", cpu_id);
 
-    // 6. Signal BSP that this AP is ready.
+    // 6. Notification BSP that this AP is ready.
     APS_READY.fetch_add(1, Ordering::Release);
 
     // 7. Enter idle loop (never returns).

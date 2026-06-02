@@ -128,7 +128,7 @@ pub struct PendingBootstrap
 }
 
 /// Shared state between the main thread (publisher) and the bootstrap worker
-/// thread (consumer/signaller).
+/// thread (consumer/notifier).
 pub struct BootstrapState
 {
     pub pending: [Option<PendingBootstrap>; MAX_PENDING_BOOTSTRAPS],

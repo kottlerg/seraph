@@ -108,21 +108,21 @@ pub struct StartupInfo {
     /// installs one (e.g. via `std::env::set_current_dir`).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub current_dir_cap: u32,
-    /// Wakeup signal caps for the stdio pipes. See `process_abi::ProcessInfo`
+    /// Wakeup notification caps for the stdio pipes. See `process_abi::ProcessInfo`
     /// for full data-vs-space and writer-vs-reader semantics. Zero when
     /// the corresponding direction is not piped.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdin_data_signal_cap: u32,
+    pub stdin_data_notification_cap: u32,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdin_space_signal_cap: u32,
+    pub stdin_space_notification_cap: u32,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdout_data_signal_cap: u32,
+    pub stdout_data_notification_cap: u32,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdout_space_signal_cap: u32,
+    pub stdout_space_notification_cap: u32,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stderr_data_signal_cap: u32,
+    pub stderr_data_notification_cap: u32,
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stderr_space_signal_cap: u32,
+    pub stderr_space_notification_cap: u32,
     /// Badged SEND cap on the system log endpoint, pre-installed by
     /// procmgr at spawn time. Used by [`log!`] directly — no
     /// discovery roundtrip. Zero when no logger is reachable
@@ -344,12 +344,12 @@ pub extern "C" fn _start() -> ! {
         stderr_frame_cap: info.stderr_frame_cap,
         system_root_cap: info.system_root_cap,
         current_dir_cap: info.current_dir_cap,
-        stdin_data_signal_cap: info.stdin_data_signal_cap,
-        stdin_space_signal_cap: info.stdin_space_signal_cap,
-        stdout_data_signal_cap: info.stdout_data_signal_cap,
-        stdout_space_signal_cap: info.stdout_space_signal_cap,
-        stderr_data_signal_cap: info.stderr_data_signal_cap,
-        stderr_space_signal_cap: info.stderr_space_signal_cap,
+        stdin_data_notification_cap: info.stdin_data_notification_cap,
+        stdin_space_notification_cap: info.stdin_space_notification_cap,
+        stdout_data_notification_cap: info.stdout_data_notification_cap,
+        stdout_space_notification_cap: info.stdout_space_notification_cap,
+        stderr_data_notification_cap: info.stderr_data_notification_cap,
+        stderr_space_notification_cap: info.stderr_space_notification_cap,
         log_send_cap: info.log_send_cap,
         tls_template_vaddr: info.tls_template_vaddr,
         tls_template_filesz: info.tls_template_filesz,
@@ -368,20 +368,20 @@ pub extern "C" fn _start() -> ! {
     STARTUP_READY.store(true, Ordering::Release);
 
     // Wire the three stdio pipes before the heap bootstrap. Each
-    // direction takes (frame_cap, data_signal_cap, space_signal_cap);
+    // direction takes (frame_cap, data_notification_cap, space_notification_cap);
     // zero frame caps are tolerated (writes silently drop / reads
     // return EOF), matching the "no pipe attached" state for processes
     // born without `Stdio::piped()`.
     pal_stdio::stdio_init(
         info.stdin_frame_cap,
-        info.stdin_data_signal_cap,
-        info.stdin_space_signal_cap,
+        info.stdin_data_notification_cap,
+        info.stdin_space_notification_cap,
         info.stdout_frame_cap,
-        info.stdout_data_signal_cap,
-        info.stdout_space_signal_cap,
+        info.stdout_data_notification_cap,
+        info.stdout_space_notification_cap,
         info.stderr_frame_cap,
-        info.stderr_data_signal_cap,
-        info.stderr_space_signal_cap,
+        info.stderr_data_notification_cap,
+        info.stderr_space_notification_cap,
         info.self_aspace_cap,
     );
 
@@ -448,7 +448,7 @@ pub extern "C" fn _start() -> ! {
     let _ = unsafe { main(0, core::ptr::null()) };
 
     // Tear down stdio pipes before exit so the close protocol fires
-    // (header `closed` flag + signal kick) and any parent blocked on
+    // (header `closed` flag + notification kick) and any parent blocked on
     // a read/write returns cleanly.
     pal_stdio::close_all();
 

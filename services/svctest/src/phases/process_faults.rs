@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! Kernel process-fault surfaces (stack guard, future signal paths).
+//! Kernel process-fault surfaces (stack guard, future notification paths).
 
 use std::os::seraph::startup_info;
 

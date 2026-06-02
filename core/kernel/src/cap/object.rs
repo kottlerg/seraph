@@ -42,7 +42,7 @@
 //! | AddressSpaceObject  | 432 B |
 //! | CSpaceKernelObject  | 432 B |
 //! | EndpointObject      | 24 B  |
-//! | SignalObject        | 24 B  |
+//! | NotificationObject        | 24 B  |
 //! | EventQueueObject    | 24 B  |
 //! | WaitSetObject       | 24 B  |
 
@@ -68,7 +68,7 @@ pub enum ObjectType
     AddressSpace = 6,
     CSpaceObj = 7,
     Endpoint = 8,
-    Signal = 9,
+    Notification = 9,
     EventQueue = 10,
     WaitSet = 11,
     SbiControl = 12,
@@ -881,21 +881,21 @@ unsafe impl Send for EndpointObject {}
 // SAFETY: EndpointObject is accessed only under the scheduler lock.
 unsafe impl Sync for EndpointObject {}
 
-/// Kernel object for a signal (Signal capability).
+/// Kernel object for a notification (Notification capability).
 #[repr(C)]
-pub struct SignalObject
+pub struct NotificationObject
 {
     pub header: KernelObjectHeader,
-    /// Pointer to the signal's mutable state. Inline for retype-backed
-    /// Signals, separately heap-allocated for legacy Signals; discriminated
+    /// Pointer to the notification's mutable state. Inline for retype-backed
+    /// Notifications, separately heap-allocated for legacy Notifications; discriminated
     /// by `header.ancestor`.
-    pub state: *mut crate::ipc::signal::SignalState,
+    pub state: *mut crate::ipc::notification::NotificationState,
 }
 
-// SAFETY: SignalObject is accessed only under the scheduler lock.
-unsafe impl Send for SignalObject {}
-// SAFETY: SignalObject is accessed only under the scheduler lock.
-unsafe impl Sync for SignalObject {}
+// SAFETY: NotificationObject is accessed only under the scheduler lock.
+unsafe impl Send for NotificationObject {}
+// SAFETY: NotificationObject is accessed only under the scheduler lock.
+unsafe impl Sync for NotificationObject {}
 
 /// Kernel object for an event queue (`EventQueue` capability).
 ///
@@ -1146,7 +1146,7 @@ unsafe fn dealloc_object_one(
             let start = obj.start;
             let count = obj.count;
 
-            // Only single-IRQ caps ever register a signal with the routing
+            // Only single-IRQ caps ever register a notification with the routing
             // table and program the controller (sys_irq_register asserts
             // `count == 1`). Range caps are delegation authorities; they
             // have no routing-table footprint to clean up.
@@ -1482,9 +1482,9 @@ unsafe fn dealloc_object_one(
                 }
 
                 // Unlink this thread from any IPC object it's blocked on.
-                // Without this, a signal/endpoint/event_queue retains a
+                // Without this, a notification/endpoint/event_queue retains a
                 // dangling waiter pointer to the freed TCB. A subsequent
-                // signal_send would return that pointer, and the caller
+                // notification_send would return that pointer, and the caller
                 // would enqueue_and_wake a freed TCB — use-after-free.
                 // SAFETY: tcb is valid (not yet freed); blocked_on_object
                 // and ipc_state are always valid on an initialized TCB.
@@ -1495,10 +1495,11 @@ unsafe fn dealloc_object_one(
                     {
                         match (*tcb).ipc_state
                         {
-                            IpcThreadState::BlockedOnSignal =>
+                            IpcThreadState::BlockedOnNotification =>
                             {
-                                let sig = blocked_obj.cast::<crate::ipc::signal::SignalState>();
-                                // SAFETY: sig is valid; lock serialises with signal_send.
+                                let sig = blocked_obj
+                                    .cast::<crate::ipc::notification::NotificationState>();
+                                // SAFETY: sig is valid; lock serialises with notification_send.
                                 let saved = (*sig).lock.lock_raw();
                                 if (*sig).waiter == tcb
                                 {
@@ -1595,7 +1596,7 @@ unsafe fn dealloc_object_one(
                 }
 
                 // Wake-in-flight gate (#160): a waker that popped this thread
-                // from a wait object (signal/endpoint/event_queue/wait_set)
+                // from a wait object (notification/endpoint/event_queue/wait_set)
                 // under that object's lock sets `wake_in_flight = 1` before
                 // releasing the lock and clears it in `enqueue_and_wake`. The
                 // unlink above acquired the same wait-object lock after any
@@ -2068,25 +2069,25 @@ unsafe fn dealloc_object_one(
             }
         }
 
-        // ── Signal ────────────────────────────────────────────────────────
-        ObjectType::Signal =>
+        // ── Notification ────────────────────────────────────────────────────────
+        ObjectType::Notification =>
         {
             // Branch on `header.ancestor`: heap-backed (legacy) vs retype-backed.
             let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
 
-            // SAFETY: ptr originally points to a SignalObject; header at offset 0.
-            let obj = unsafe { &*(ptr.as_ptr().cast::<SignalObject>()) };
+            // SAFETY: ptr originally points to a NotificationObject; header at offset 0.
+            let obj = unsafe { &*(ptr.as_ptr().cast::<NotificationObject>()) };
             let state = obj.state;
 
             if !state.is_null()
             {
                 // Clear any IRQ routing table entries that point to this
-                // SignalState. A hardware interrupt firing after the signal
-                // is freed would otherwise call signal_send on a dead slot.
+                // NotificationState. A hardware interrupt firing after the notification
+                // is freed would otherwise call notification_send on a dead slot.
                 // SAFETY: interrupts disabled to serialize with IRQ delivery.
                 unsafe {
                     let saved = crate::arch::current::cpu::save_and_disable_interrupts();
-                    crate::irq::unregister_signal(state);
+                    crate::irq::unregister_notification(state);
                     crate::arch::current::cpu::restore_interrupts(saved);
                 }
 
@@ -2094,17 +2095,17 @@ unsafe fn dealloc_object_one(
                 // (see `sys_wait_set_add` / `wait_set_drop`); reaching dealloc
                 // with `wait_set` still set means the refcount invariant is
                 // broken.
-                // SAFETY: state validated non-null; SignalState live.
+                // SAFETY: state validated non-null; NotificationState live.
                 let wait_set_clear = unsafe { (*state).wait_set.is_null() };
                 debug_assert!(
                     wait_set_clear,
-                    "Signal dealloc with live wait-set membership — \
+                    "Notification dealloc with live wait-set membership — \
                      refcount invariant broken"
                 );
 
                 // Wake a blocked waiter with wakeup_value = 0.
                 // TODO: return SyscallError::ObjectGone when a proper wakeup
-                // error path is available in sys_signal_wait.
+                // error path is available in sys_notification_wait.
                 // SAFETY: state validated non-null; waiter TCB still valid.
                 unsafe {
                     let sig = &mut *state;
@@ -2123,12 +2124,12 @@ unsafe fn dealloc_object_one(
 
             debug_assert!(
                 !ancestor_ptr.is_null(),
-                "Signal: every production cap is retype-backed via cap_create_signal"
+                "Notification: every production cap is retype-backed via cap_create_notification"
             );
             // Wrapper + state are in-place inside the ancestor Frame cap's
             // region.
             use crate::cap::retype::{dispatch_for, retype_free};
-            let raw_bytes = dispatch_for(ObjectType::Signal, 0).map_or(120, |e| e.raw_bytes);
+            let raw_bytes = dispatch_for(ObjectType::Notification, 0).map_or(120, |e| e.raw_bytes);
 
             // SAFETY: ancestor_ptr is non-null per debug_assert; the
             // FrameObject is kept alive by the retype-time refcount lease.
@@ -2144,8 +2145,8 @@ unsafe fn dealloc_object_one(
                 // cap; refcount reached 0 — unique accessor.
                 unsafe { core::ptr::drop_in_place(state) };
             }
-            // SAFETY: ptr is the in-place SignalObject; unique access.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<SignalObject>()) };
+            // SAFETY: ptr is the in-place NotificationObject; unique access.
+            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<NotificationObject>()) };
 
             retype_free(ancestor_frame, offset, raw_bytes);
 
@@ -2578,7 +2579,7 @@ mod tests
         assert_eq!(size_of::<SbiControlObject>(), 16);
         assert_eq!(size_of::<ThreadObject>(), 24);
         assert_eq!(size_of::<EndpointObject>(), 24);
-        assert_eq!(size_of::<SignalObject>(), 24);
+        assert_eq!(size_of::<NotificationObject>(), 24);
         assert_eq!(size_of::<EventQueueObject>(), 24);
         assert_eq!(size_of::<WaitSetObject>(), 24);
         // PoolChunkSlot: 8 ancestor + 8 base_offset + 8 page_count = 24 B.

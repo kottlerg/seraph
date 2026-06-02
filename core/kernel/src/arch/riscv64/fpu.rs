@@ -433,7 +433,7 @@ pub unsafe fn lazy_restore_fp_v(_area: *const u8, _frame: &mut super::trap_frame
 // ── V (Vector) state save / restore ───────────────────────────────────────────
 
 /// Cached value of CSR `vlenb` (vector length in bytes), populated at boot
-/// by [`cache_vlenb`]. Zero before that call, signalling "V missing or not
+/// by [`cache_vlenb`]. Zero before that call, notifying "V missing or not
 /// yet probed" and disabling V save/restore in the lazy-trap path.
 static VLENB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

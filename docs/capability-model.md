@@ -86,11 +86,11 @@ A send capability without grant right cannot pass capabilities to the server.
 A server that should not receive unexpected resources from clients holds a receive
 capability without grant on its own endpoint.
 
-### Signal
+### Notification
 
-A capability to a signal object (bitmask-based async notification). Rights:
-- **Signal** — may OR bits into the signal word (deliver notifications)
-- **Wait** — may wait on this signal object and read the bitmask
+A capability to a notification object (bitmask-based async notification). Rights:
+- **Notification** — may OR bits into the notification word (deliver notifications)
+- **Wait** — may wait on this notification object and read the bitmask
 
 ### Event Queue
 
@@ -309,7 +309,7 @@ backing region, debiting bytes from the Frame's available-bytes ledger.
 
 ```
 create_endpoint(frame)             → endpoint_cap  (Send + Receive + Grant)
-create_signal(frame)               → signal_cap    (Signal + Wait)
+create_notification(frame)               → notification_cap    (Notification + Wait)
 create_event_queue(frame, n)       → queue_cap     (Post + Recv)
 create_thread(frame, aspace, cs)   → thread_cap    (Control)
 create_address_space(frame, ...)   → aspace_cap    (Map)

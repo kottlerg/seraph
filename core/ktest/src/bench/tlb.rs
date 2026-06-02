@@ -29,7 +29,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
-    cap_create_signal, cap_delete, signal_send, signal_wait, system_info, thread_exit, thread_yield,
+    cap_create_notification, cap_delete, notification_send, notification_wait, system_info,
+    thread_exit, thread_yield,
 };
 use syscall_abi::SystemInfoType;
 
@@ -44,20 +45,20 @@ const MAX_PINNED: usize = 7;
 static mut SHOOTDOWN_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; MAX_PINNED];
 
 /// Set by the parent before its `cap_delete` cleanup. Workers poll this
-/// between yields and exit cleanly when set; the parent then `signal_wait`s
+/// between yields and exit cleanly when set; the parent then `notification_wait`s
 /// on the per-worker exited-bits before deleting any Thread cap, so
 /// `cap_delete` never has to reap a running thread.
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Worker entry: signal "ready" with this worker's unique bit, then
+/// Worker entry: notification "ready" with this worker's unique bit, then
 /// loop yielding until the parent sets `EXIT_REQUESTED`. On exit,
-/// signal the parent's `done_slot` with the same unique bit so the
+/// notify the parent's `done_slot` with the same unique bit so the
 /// parent knows it's safe to `cap_delete`.
 ///
 /// `arg` packs `ready_slot[15:0] | done_slot[31:16] | bit_index[39:32]`.
-/// Unique bits matter: the kernel's signal cap is a 64-bit OR-accumulator,
+/// Unique bits matter: the kernel's notification cap is a 64-bit OR-accumulator,
 /// so if all workers sent the same bit (`0x1`), N concurrent
-/// `signal_send`s collapse to one wakeup and the parent's `signal_wait`
+/// `notification_send`s collapse to one wakeup and the parent's `notification_wait`
 /// loop hangs on the second iteration.
 // cast_possible_truncation: slot indices and bit index fit in their packed widths.
 #[allow(clippy::cast_possible_truncation)]
@@ -68,12 +69,12 @@ fn shootdown_spinner_entry(arg: u64) -> !
     let bit_index = ((arg >> 32) & 0xFF) as u32;
     let bit = 1u64 << bit_index;
 
-    signal_send(ready_slot, bit).ok();
+    notification_send(ready_slot, bit).ok();
     while !EXIT_REQUESTED.load(Ordering::Acquire)
     {
         let _ = thread_yield();
     }
-    signal_send(done_slot, bit).ok();
+    notification_send(done_slot, bit).ok();
     thread_exit()
 }
 
@@ -82,7 +83,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 {
     const BENCH_VA: u64 = 0x6200_0000;
 
-    // Print the header up front so failures in the spawn / signal_wait /
+    // Print the header up front so failures in the spawn / notification_wait /
     // measure loop are bisectable on the boot log instead of looking
     // like the bench never ran. Min/mean/max are logged after teardown
     // if the measure loop made progress.
@@ -98,12 +99,12 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     // contract from a clean state.
     EXIT_REQUESTED.store(false, Ordering::Release);
 
-    let Ok(ready) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(ready) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         cap_delete(ready).ok();
@@ -159,7 +160,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     crate::log_u64("ktest: bench  pinned_workers=", spawned as u64);
 
     // Wait for every spawned child's unique ready-bit (saturate then drop
-    // the loop). Single-shot signal_wait would race when N workers post
+    // the loop). Single-shot notification_wait would race when N workers post
     // identical bits concurrently — the kernel OR-accumulates and only
     // wakes the parent once. Each worker sends `1 << i` instead.
     if spawned > 0
@@ -168,7 +169,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         let mut ready_bits: u64 = 0;
         while ready_bits & all_ready != all_ready
         {
-            ready_bits |= signal_wait(ready).unwrap_or(0);
+            ready_bits |= notification_wait(ready).unwrap_or(0);
         }
     }
 
@@ -225,7 +226,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 }
 
 /// Wait for every spawned worker's `done` bit, then `cap_delete` all
-/// thread + cspace caps. Each worker `signal_send`s its `1 << i` bit on
+/// thread + cspace caps. Each worker `notification_send`s its `1 << i` bit on
 /// `done` right before `thread_exit`; the parent accumulates all bits
 /// before issuing any `cap_delete`, so every Thread cap deleted is in
 /// the Exited state.
@@ -245,7 +246,7 @@ fn teardown(
         let mut done_bits: u64 = 0;
         while done_bits & all_done != all_done
         {
-            done_bits |= signal_wait(done).unwrap_or(0);
+            done_bits |= notification_wait(done).unwrap_or(0);
         }
     }
     for i in 0..spawned
@@ -288,13 +289,13 @@ static mut CONC_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; 
 
 /// Child-cspace slot of each worker's frame cap, indexed by worker bit-index.
 /// Set by the parent before starting each worker; read by the worker. (Arg
-/// packing has no room for both frame and aspace slots alongside the signal
+/// packing has no room for both frame and aspace slots alongside the notification
 /// slots, so these go through statics.)
 static CONC_FRAME_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
 /// Child-cspace slot of each worker's aspace cap, indexed by worker bit-index.
 static CONC_ASPACE_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
 
-/// Release barrier: workers spin here after signalling ready so every worker
+/// Release barrier: workers spin here after notifying ready so every worker
 /// starts its measured loop at the same instant (maximising overlap, which is
 /// the contention the bench measures).
 static CONC_GO: AtomicBool = AtomicBool::new(false);
@@ -318,7 +319,7 @@ static CONC_MAP_CNT: AtomicU64 = AtomicU64::new(0);
 /// Fold one unmap-latency sample into the shared min/max/sum/count accumulators.
 ///
 /// Relaxed is sufficient: the parent reads these only after every worker's
-/// `done`-bit handshake, and the `signal_send`/`signal_wait` round-trip
+/// `done`-bit handshake, and the `notification_send`/`notification_wait` round-trip
 /// establishes the happens-before that publishes the folds.
 fn conc_fold(d: u64)
 {
@@ -342,7 +343,7 @@ fn conc_map_fold(d: u64)
 /// iteration count is capped at the 24-bit lane (far above any bench `iters`).
 ///
 /// Each worker sends its unique `1 << bit_index` on both `ready` and `done`;
-/// the kernel signal cap OR-accumulates, so identical bits from concurrent
+/// the kernel notification cap OR-accumulates, so identical bits from concurrent
 /// workers would collapse to one wakeup and hang the parent's wait loop.
 // cast_possible_truncation: packed fields fit their lanes by construction.
 #[allow(clippy::cast_possible_truncation)]
@@ -359,7 +360,7 @@ fn conc_worker_entry(arg: u64) -> !
     let va = CONC_VA_BASE + (bit_index as u64) * CONC_VA_STRIDE;
 
     // Ready, then wait for the common GO so all initiators contend together.
-    signal_send(ready_slot, bit).ok();
+    notification_send(ready_slot, bit).ok();
     while !CONC_GO.load(Ordering::Acquire)
     {
         let _ = thread_yield();
@@ -374,7 +375,7 @@ fn conc_worker_entry(arg: u64) -> !
         let m1 = cycles_now();
         if mr.is_err()
         {
-            signal_send(done_slot, bit).ok();
+            notification_send(done_slot, bit).ok();
             thread_exit();
         }
         conc_map_fold(m1.saturating_sub(m0));
@@ -384,13 +385,13 @@ fn conc_worker_entry(arg: u64) -> !
         let t1 = cycles_now();
         if r.is_err()
         {
-            signal_send(done_slot, bit).ok();
+            notification_send(done_slot, bit).ok();
             thread_exit();
         }
         conc_fold(t1.saturating_sub(t0));
     }
 
-    signal_send(done_slot, bit).ok();
+    notification_send(done_slot, bit).ok();
     thread_exit()
 }
 
@@ -423,12 +424,12 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     CONC_MAP_SUM.store(0, Ordering::Release);
     CONC_MAP_CNT.store(0, Ordering::Release);
 
-    let Ok(ready) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(ready) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         cap_delete(ready).ok();
@@ -524,7 +525,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
         let mut ready_bits: u64 = 0;
         while ready_bits & all_ready != all_ready
         {
-            ready_bits |= signal_wait(ready).unwrap_or(0);
+            ready_bits |= notification_wait(ready).unwrap_or(0);
         }
     }
     CONC_GO.store(true, Ordering::Release);

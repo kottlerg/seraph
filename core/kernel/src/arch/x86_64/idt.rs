@@ -520,7 +520,7 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 /// 3. Calls `irq::dispatch_device_irq(gsi)`.
 /// 4. Restores registers and executes `iretq`.
 ///
-/// `dispatch_device_irq` handles masking, signal delivery, and EOI internally.
+/// `dispatch_device_irq` handles masking, notification delivery, and EOI internally.
 ///
 /// # Modification notes
 /// - To add more GSIs: `device_irq_stub!(isr_devN, N)` then `set(33+N, isr_devN, 0)`.
@@ -629,7 +629,7 @@ unsafe extern "C" fn isr_spurious()
 /// `#NM` (Device Not Available, vector 7) handler stub.
 ///
 /// `#NM` fires when CR0.TS = 1 and a user thread executes an x87/SSE/AVX
-/// instruction — the kernel's lazy-trap signal that this thread is about
+/// instruction — the kernel's lazy-trap notification that this thread is about
 /// to touch extended state. The handler clears CR0.TS and returns; the
 /// trapping instruction is re-executed by hardware and proceeds normally.
 ///

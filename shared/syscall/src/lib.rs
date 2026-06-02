@@ -40,17 +40,17 @@ use core::prelude::rust_2024::*;
 
 use syscall_abi::{
     MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
-    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_SIGNAL,
-    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
-    SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT,
-    SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER,
-    SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
-    SYS_SBI_CALL, SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT,
+    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
+    SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
+    SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
+    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND,
+    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
+    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SYSTEM_INFO,
+    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS,
+    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
 };
 
 pub use syscall_abi::{
@@ -703,20 +703,20 @@ pub fn raw_ipc_reply(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Send `bits` to a signal cap. `bits` must be non-zero.
+/// Send `bits` to a notification cap. `bits` must be non-zero.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the signal cap is invalid or `bits` is zero.
+/// Returns a negative `i64` error code if the notification cap is invalid or `bits` is zero.
 #[inline]
-pub fn signal_send(sig: u32, bits: u64) -> Result<(), i64>
+pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; sig is cap index as u64, bits is bitmask;
-    // kernel validates cap and updates signal state.
-    let ret = unsafe { syscall2(SYS_SIGNAL_SEND, u64::from(sig), bits) };
+    // kernel validates cap and updates notification state.
+    let ret = unsafe { syscall2(SYS_NOTIFICATION_SEND, u64::from(sig), bits) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Block until any bits are set on a signal cap. Returns the acquired bitmask.
+/// Block until any bits are set on a notification cap. Returns the acquired bitmask.
 ///
 /// The primary return register holds status (`0` on success, negative
 /// `SyscallError` on failure); the bitmask is delivered in the secondary
@@ -724,39 +724,39 @@ pub fn signal_send(sig: u32, bits: u64) -> Result<(), i64>
 /// bit-63-set bitmasks with the dispatcher's negative-Err encoding.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the signal cap is invalid or the
+/// Returns a negative `i64` error code if the notification cap is invalid or the
 /// wait is interrupted.
 #[inline]
-pub fn signal_wait(sig: u32) -> Result<u64, i64>
+pub fn notification_wait(sig: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; sig is cap
     // index as u64, arg1 = 0 selects indefinite blocking; kernel validates
     // cap and writes the bitmask into the secondary return register.
-    let (ret, bits) = unsafe { syscall5_ret2(SYS_SIGNAL_WAIT, u64::from(sig), 0, 0, 0, 0) };
+    let (ret, bits) = unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, u64::from(sig), 0, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
-/// Block until any bits are set on a signal cap, or until `timeout_ms`
+/// Block until any bits are set on a notification cap, or until `timeout_ms`
 /// elapses. Returns the acquired bitmask (non-zero) on wake, or `Ok(0)`
 /// on timeout.
 ///
-/// `timeout_ms == 0` is equivalent to [`signal_wait`] — block indefinitely.
+/// `timeout_ms == 0` is equivalent to [`notification_wait`] — block indefinitely.
 /// Callers that want a non-blocking poll should use `timeout_ms = 1`.
 ///
-/// Same register layout as [`signal_wait`]: status in the primary register,
-/// bitmask in the secondary. Timeout is signalled in-band as `bits == 0`
-/// (legitimate because `signal_send` rejects zero-bit sends).
+/// Same register layout as [`notification_wait`]: status in the primary register,
+/// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
+/// (legitimate because `notification_send` rejects zero-bit sends).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the signal cap is invalid or
+/// Returns a negative `i64` error code if the notification cap is invalid or
 /// the wait is interrupted.
 #[inline]
-pub fn signal_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
+pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 {
-    // SAFETY: same as `signal_wait`; arg1 carries the timeout sentinel
+    // SAFETY: same as `notification_wait`; arg1 carries the timeout sentinel
     // (0 = infinite, matching the single-arg behaviour).
     let (ret, bits) =
-        unsafe { syscall5_ret2(SYS_SIGNAL_WAIT, u64::from(sig), timeout_ms, 0, 0, 0) };
+        unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, u64::from(sig), timeout_ms, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
@@ -783,11 +783,11 @@ pub fn cap_create_endpoint(frame_cap: u32) -> Result<u32, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Retype a Frame cap into a new Signal. Returns the `CSpace` slot index.
+/// Retype a Frame cap into a new Notification. Returns the `CSpace` slot index.
 ///
 /// `frame_cap` MUST carry `RIGHTS_RETYPE` and have at least 120 B of
 /// `available_bytes`. Bytes are debited from the Frame cap and credited back
-/// when the Signal is destroyed.
+/// when the Notification is destroyed.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if `frame_cap` is invalid, lacks
@@ -797,11 +797,11 @@ pub fn cap_create_endpoint(frame_cap: u32) -> Result<u32, i64>
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_signal(frame_cap: u32) -> Result<u32, i64>
+pub fn cap_create_notification(frame_cap: u32) -> Result<u32, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments;
     // kernel retypes the Frame-cap region and returns the new slot index.
-    let ret = unsafe { syscall2(SYS_CAP_CREATE_SIGNAL, u64::from(frame_cap), 0) };
+    let ret = unsafe { syscall2(SYS_CAP_CREATE_NOTIFICATION, u64::from(frame_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
@@ -1551,7 +1551,7 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 = 0 is the
-    // "block forever" sentinel for `SYS_EVENT_RECV` (matches `SYS_SIGNAL_WAIT`).
+    // "block forever" sentinel for `SYS_EVENT_RECV` (matches `SYS_NOTIFICATION_WAIT`).
     let (ret, payload) = unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), 0, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(payload) }
 }
@@ -1612,7 +1612,7 @@ pub fn wait_set_create(frame_cap: u32) -> Result<u32, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Register `source_cap` (Endpoint/Signal/EventQueue) in `ws_cap` with a
+/// Register `source_cap` (Endpoint/Notification/EventQueue) in `ws_cap` with a
 /// caller-chosen opaque `badge`. The badge is returned by `wait_set_wait`
 /// when this source fires.
 ///
@@ -1678,7 +1678,7 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 
 // ── Hardware access wrappers ──────────────────────────────────────────────────
 
-/// Bind `signal_cap` to receive notifications when `irq_cap`'s interrupt fires.
+/// Bind `notification_cap` to receive notifications when `irq_cap`'s interrupt fires.
 ///
 /// After registration the IRQ is masked until the first `irq_ack`. The driver
 /// must call `irq_ack` after servicing each interrupt to re-enable delivery.
@@ -1687,11 +1687,17 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 /// Returns a negative `i64` error code if either cap is invalid or the IRQ
 /// is already bound.
 #[inline]
-pub fn irq_register(irq_cap: u32, signal_cap: u32) -> Result<(), i64>
+pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; irq_cap and signal_cap are cap indices as u64;
-    // kernel validates caps and binds IRQ to signal for interrupt delivery.
-    let ret = unsafe { syscall2(SYS_IRQ_REGISTER, u64::from(irq_cap), u64::from(signal_cap)) };
+    // SAFETY: syscall2 issues raw syscall instruction; irq_cap and notification_cap are cap indices as u64;
+    // kernel validates caps and binds IRQ to a notification for interrupt delivery.
+    let ret = unsafe {
+        syscall2(
+            SYS_IRQ_REGISTER,
+            u64::from(irq_cap),
+            u64::from(notification_cap),
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 

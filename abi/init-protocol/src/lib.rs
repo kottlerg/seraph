@@ -418,7 +418,7 @@ impl InitFramebufferInfo
 ///
 /// Discriminant values match the kernel's `CapTag` enum for the types that
 /// appear in init's initial `CSpace` population. Types that are never present
-/// at boot (Endpoint, Signal, Thread, etc.) are omitted.
+/// at boot (Endpoint, Notification, Thread, etc.) are omitted.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapType

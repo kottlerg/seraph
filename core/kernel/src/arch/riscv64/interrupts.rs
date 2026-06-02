@@ -346,7 +346,7 @@ fn handle_software_interrupt()
     // Clearing SSIP *after* the scan is racy: a wakeup IPI sets SSIP, we
     // enter and find no request (the shootdown store hasn't happened yet),
     // then the shootdown IPI arrives (SSIP already 1, no new edge), and
-    // clear_sip_ssip wipes both signals — the shootdown is never processed.
+    // clear_sip_ssip wipes both notifications — the shootdown is never processed.
     // The initiator's SeqCst fence orders its slot store before the IPI, so
     // any IPI whose SSIP-set precedes our clear has a slot store visible to
     // the scan; any later IPI re-triggers via a fresh SSIP edge.
@@ -693,7 +693,7 @@ pub fn unmask(irq: u32)
     let _ = irq;
 }
 
-/// Dispatch an external interrupt from the PLIC to its registered signal.
+/// Dispatch an external interrupt from the PLIC to its registered notification.
 ///
 /// Called from `trap_dispatch` after claiming the interrupt. Routing is
 /// handled by [`crate::irq::dispatch_device_irq`], which masks the source

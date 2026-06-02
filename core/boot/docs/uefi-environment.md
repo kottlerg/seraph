@@ -72,7 +72,7 @@ allocation fails fatally. Page table frames use `AllocateAnyPages`.
 
 All allocation uses memory type `EfiLoaderData`. UEFI memory map entries for
 `EfiLoaderData` regions translate to `MemoryType::Loaded` in the boot protocol,
-signalling to the kernel that these regions are in use and must not be reused until
+notifying to the kernel that these regions are in use and must not be reused until
 explicitly reclaimed.
 
 There is no deallocation path before `ExitBootServices`. Memory is allocated once

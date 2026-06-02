@@ -813,11 +813,11 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 }
 
-/// `SYS_SIGNAL_SEND` (3): OR bits into a signal object.
+/// `SYS_NOTIFICATION_SEND` (3): OR bits into a notification object.
 ///
-/// arg0 = signal cap index, arg1 = bits to send (must be non-zero).
+/// arg0 = notification cap index, arg1 = bits to send (must be non-zero).
 #[cfg(not(test))]
-pub fn sys_signal_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_notification_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -838,32 +838,32 @@ pub fn sys_signal_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null above.
     let cspace_ptr = unsafe { (*tcb).cspace };
     // SAFETY: cspace_ptr validated above.
-    let slot = unsafe { lookup_cap(cspace_ptr, sig_idx, CapTag::Signal, Rights::SIGNAL) }?;
+    let slot = unsafe { lookup_cap(cspace_ptr, sig_idx, CapTag::Notification, Rights::NOTIFY) }?;
 
-    // SAFETY: slot validated; object pointer is valid Signal.
+    // SAFETY: slot validated; object pointer is valid Notification.
     let sig_state = unsafe {
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
         // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
         #[allow(clippy::cast_ptr_alignment)]
-        let sig_obj = obj_ptr.cast::<crate::cap::object::SignalObject>();
+        let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
         (*sig_obj).state
     };
 
-    // SAFETY: sig_state extracted from validated Signal object.
-    let woken = unsafe { crate::ipc::signal::signal_send(sig_state, bits) };
+    // SAFETY: sig_state extracted from validated Notification object.
+    let woken = unsafe { crate::ipc::notification::notification_send(sig_state, bits) };
 
     if let Some(waiter) = woken
     {
-        // SAFETY: waiter returned by signal_send; is valid TCB.
+        // SAFETY: waiter returned by notification_send; is valid TCB.
         unsafe {
             debug_assert!(
                 (*waiter).magic == crate::sched::thread::TCB_MAGIC,
-                "sys_signal_send: woken waiter magic corrupt"
+                "sys_notification_send: woken waiter magic corrupt"
             );
             let target_cpu = crate::sched::select_target_cpu(waiter);
             debug_assert!(
                 target_cpu < crate::sched::MAX_CPUS,
-                "sys_signal_send: target_cpu {target_cpu} out of range"
+                "sys_notification_send: target_cpu {target_cpu} out of range"
             );
             crate::sched::enqueue_and_wake(waiter, target_cpu);
         }
@@ -872,22 +872,22 @@ pub fn sys_signal_send(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// `SYS_SIGNAL_WAIT` (4): block until a signal bit is set, then return the bits.
+/// `SYS_NOTIFICATION_WAIT` (4): block until a notification bit is set, then return the bits.
 ///
-/// arg0 = signal cap index (WAIT right).
+/// arg0 = notification cap index (WAIT right).
 /// arg1 = `timeout_ms`. `0` blocks indefinitely. `> 0` blocks until bits
 ///        are delivered *or* `timeout_ms` milliseconds have elapsed.
 ///
 /// On success returns `0` in rax/a0 and the bitmask in the secondary return
 /// register (rdx/a1). On timeout returns `0` in both registers — unambiguous
-/// because `signal_send` rejects zero-bit sends, so a legitimate wake always
+/// because `notification_send` rejects zero-bit sends, so a legitimate wake always
 /// carries non-zero bits. The split is required because the bitmask is an
 /// unrestricted `u64`: an in-band encoding via `cast_signed` would alias
 /// bit-63-set payloads with the dispatcher's negative-Err codes. Same
 /// register layout as `sys_event_recv`; see that handler for the broader
 /// pattern.
 #[cfg(not(test))]
-pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_notification_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     // cast_possible_truncation: kernel runs on 64-bit only; value is bounded by kernel policy.
     #[allow(clippy::cast_possible_truncation)]
@@ -903,19 +903,19 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb validated non-null above.
     let cspace_ptr = unsafe { (*tcb).cspace };
     // SAFETY: cspace_ptr validated above.
-    let slot = unsafe { lookup_cap(cspace_ptr, sig_idx, CapTag::Signal, Rights::WAIT) }?;
+    let slot = unsafe { lookup_cap(cspace_ptr, sig_idx, CapTag::Notification, Rights::WAIT) }?;
 
-    // SAFETY: slot validated; object pointer is valid Signal.
+    // SAFETY: slot validated; object pointer is valid Notification.
     let sig_state = unsafe {
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
         // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
         #[allow(clippy::cast_ptr_alignment)]
-        let sig_obj = obj_ptr.cast::<crate::cap::object::SignalObject>();
+        let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
         (*sig_obj).state
     };
 
-    // SAFETY: sig_state extracted from validated Signal object.
-    let result = unsafe { crate::ipc::signal::signal_wait(sig_state, tcb) };
+    // SAFETY: sig_state extracted from validated Notification object.
+    let result = unsafe { crate::ipc::notification::notification_wait(sig_state, tcb) };
 
     if let Ok(bits) = result
     {
@@ -925,9 +925,9 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // For a timed wait, arm the sleep list. Re-acquire sig.lock and check
-    // `sig.waiter == tcb` first: a concurrent signal_send may have woken
+    // `sig.waiter == tcb` first: a concurrent notification_send may have woken
     // us already; arming unconditionally would leave a stale entry that
-    // hijacks a later unrelated signal_wait. See
+    // hijacks a later unrelated notification_wait. See
     // docs/thread-lifecycle-and-sleep.md § Sleep List Invariants rule 8.
     if timeout_ms != 0
     {
@@ -940,7 +940,7 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let still_waiter = unsafe { (*sig_state).waiter } == tcb;
         if still_waiter
         {
-            // SAFETY: tcb valid; sig.lock held excludes signal_send wake.
+            // SAFETY: tcb valid; sig.lock held excludes notification_send wake.
             unsafe {
                 (*tcb).sleep_deadline = deadline;
             }
@@ -949,7 +949,7 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 // Sleep list full: fall back to indefinite wait — the IPC
                 // source can still wake us, only the timeout is lost.
                 crate::kprintln!(
-                    "kernel: sleep_list capacity reached ({}); signal_wait \
+                    "kernel: sleep_list capacity reached ({}); notification_wait \
                      falling back to indefinite wait",
                     crate::sched::MAX_SLEEPING,
                 );
@@ -969,7 +969,7 @@ pub fn sys_signal_wait(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         crate::sched::schedule(false);
     }
 
-    // On resume, either `signal_send` stored delivered bits in wakeup_value,
+    // On resume, either `notification_send` stored delivered bits in wakeup_value,
     // or the timer path cleared wakeup_value to 0 (timeout). Both paths
     // clear `sleep_deadline` as part of claiming the wake.
     // SAFETY: tcb still valid after resume; wakeup_value set by the waker.
@@ -1058,8 +1058,8 @@ pub fn sys_event_post(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// register (rdx/a1). The disambiguation between "data wake" and "timer
 /// wake" uses `tcb.timed_out` rather than an in-band sentinel on
 /// `wakeup_value`, because event payloads may be any `u64` including 0
-/// (contrast `sys_signal_wait`, where `wakeup_value == 0` works because
-/// `signal_send` rejects zero-bit sends).
+/// (contrast `sys_notification_wait`, where `wakeup_value == 0` works because
+/// `notification_send` rejects zero-bit sends).
 #[cfg(not(test))]
 pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -1149,7 +1149,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Bounded wait: arm the sleep-list timer. Same waiter-recheck rule as
-    // sys_signal_wait — see docs/thread-lifecycle-and-sleep.md
+    // sys_notification_wait — see docs/thread-lifecycle-and-sleep.md
     // § Sleep List Invariants rule 8.
     if timeout_ms != 0
     {
@@ -1215,7 +1215,7 @@ pub fn sys_event_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// `SYS_WAIT_SET_ADD` (26): register a source in a wait set.
 ///
 /// arg0 = wait set cap index (must have MODIFY right).
-/// arg1 = source cap index (Endpoint with RECEIVE, Signal with WAIT, or
+/// arg1 = source cap index (Endpoint with RECEIVE, Notification with WAIT, or
 ///        `EventQueue` with RECV).
 /// arg2 = caller-chosen opaque u64 badge (returned by `SYS_WAIT_SET_WAIT`
 ///        when this source fires).
@@ -1263,7 +1263,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (*ws_obj).state
     };
 
-    // Look up source cap — accept Endpoint, Signal, or EventQueue.
+    // Look up source cap — accept Endpoint, Notification, or EventQueue.
     // We must accept any of the three tags, so we read the slot directly
     // instead of calling lookup_cap (which checks a single expected tag).
     //
@@ -1296,7 +1296,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
                 (ep_state, WaitSetSourceTag::Endpoint, header)
             }
-            CapTag::Signal =>
+            CapTag::Notification =>
             {
                 if !src_slot.rights.contains(Rights::WAIT)
                 {
@@ -1308,10 +1308,10 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     .as_ptr();
                 // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
                 #[allow(clippy::cast_ptr_alignment)]
-                let sig_obj = obj_ptr.cast::<crate::cap::object::SignalObject>();
+                let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
                 let sig_state = (*sig_obj).state.cast::<u8>();
                 let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
-                (sig_state, WaitSetSourceTag::Signal, header)
+                (sig_state, WaitSetSourceTag::Notification, header)
             }
             CapTag::EventQueue =>
             {
@@ -1338,7 +1338,7 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // duplicate-registration check, waitset_add (which takes ws.lock
     // INNER — see WaitSetState::lock for the ordering rationale), the
     // back-pointer write, and the +1 inc_ref on the source's header must
-    // all be atomic from the source's perspective. Otherwise signal_send
+    // all be atomic from the source's perspective. Otherwise notification_send
     // / event_post / endpoint_call could read a partially-installed
     // back-pointer and call into waitset_notify with an unregistered
     // member, or skip the notify when the source is in fact ready.
@@ -1379,11 +1379,11 @@ pub fn sys_wait_set_add(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 (*ep).lock.unlock_raw(saved);
                 res
             }
-            WaitSetSourceTag::Signal =>
+            WaitSetSourceTag::Notification =>
             {
                 // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let sig = source_ptr.cast::<crate::ipc::signal::SignalState>();
+                let sig = source_ptr.cast::<crate::ipc::notification::NotificationState>();
                 let saved = (*sig).lock.lock_raw();
                 let res = if (*sig).wait_set.is_null()
                 {
@@ -1514,7 +1514,7 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     header,
                 )
             }
-            CapTag::Signal =>
+            CapTag::Notification =>
             {
                 let obj_ptr = src_slot
                     .object
@@ -1522,11 +1522,11 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                     .as_ptr();
                 // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
                 #[allow(clippy::cast_ptr_alignment)]
-                let sig_obj = obj_ptr.cast::<crate::cap::object::SignalObject>();
+                let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
                 let header = obj_ptr.cast::<crate::cap::object::KernelObjectHeader>();
                 (
                     (*sig_obj).state.cast::<u8>(),
-                    WaitSetSourceTag::Signal,
+                    WaitSetSourceTag::Notification,
                     header,
                 )
             }
@@ -1580,11 +1580,11 @@ pub fn sys_wait_set_remove(tf: &mut TrapFrame) -> Result<u64, SyscallError>
                 (*ep).lock.unlock_raw(saved);
                 res
             }
-            WaitSetSourceTag::Signal =>
+            WaitSetSourceTag::Notification =>
             {
                 // cast_ptr_alignment: kernel allocator guarantees object alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let sig = source_ptr.cast::<crate::ipc::signal::SignalState>();
+                let sig = source_ptr.cast::<crate::ipc::notification::NotificationState>();
                 let saved = (*sig).lock.lock_raw();
                 let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
                 if res.is_ok()

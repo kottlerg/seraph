@@ -24,20 +24,20 @@
 //! confirming the protocol operates correctly under concurrent access.
 
 use syscall::{
-    cap_copy, cap_create_signal, cap_delete, mem_map, mem_unmap, signal_send, signal_wait,
-    system_info, thread_exit,
+    cap_copy, cap_create_notification, cap_delete, mem_map, mem_unmap, notification_send,
+    notification_wait, system_info, thread_exit,
 };
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
 const TEST_VA: u64 = 0x5000_0000; // 1.25 GiB — distinct from other integration tests.
-const RIGHTS_SIGNAL_WAIT: u64 = (1 << 7) | (1 << 8);
+const RIGHTS_NOTIFY_WAIT: u64 = (1 << 7) | (1 << 8);
 const CYCLES: usize = 100;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-/// Child's c2p (child-to-parent) signal slot, written by parent before `thread_start`.
+/// Child's c2p (child-to-parent) notification slot, written by parent before `thread_start`.
 static mut CHILD_C2P_SLOT: u32 = 0;
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -55,22 +55,22 @@ pub fn run(ctx: &TestContext) -> TestResult
     let frame_cap =
         crate::frame_pool::alloc().ok_or("integration::tlb_coherency: frame pool exhausted")?;
 
-    // ── 2. Set up two signals for parent-child coordination. ─────────────────
+    // ── 2. Set up two notifications for parent-child coordination. ─────────────────
     //
-    // Fix B1: use separate signals for each direction to prevent bit
+    // Fix B1: use separate notifications for each direction to prevent bit
     // accumulation across directions (parent→child vs child→parent).
-    let p2c = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "integration::tlb_coherency: cap_create_signal (p2c) failed")?;
-    let c2p = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "integration::tlb_coherency: cap_create_signal (c2p) failed")?;
+    let p2c = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "integration::tlb_coherency: cap_create_notification (p2c) failed")?;
+    let c2p = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "integration::tlb_coherency: cap_create_notification (c2p) failed")?;
 
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::tlb_coherency: spawn::new_child failed")?;
 
-    // Copy both signals into child's cspace.
-    let child_p2c = cap_copy(p2c, child.cs, RIGHTS_SIGNAL_WAIT)
+    // Copy both notifications into child's cspace.
+    let child_p2c = cap_copy(p2c, child.cs, RIGHTS_NOTIFY_WAIT)
         .map_err(|_| "integration::tlb_coherency: cap_copy (p2c) failed")?;
-    let child_c2p = cap_copy(c2p, child.cs, RIGHTS_SIGNAL_WAIT)
+    let child_c2p = cap_copy(c2p, child.cs, RIGHTS_NOTIFY_WAIT)
         .map_err(|_| "integration::tlb_coherency: cap_copy (c2p) failed")?;
 
     // Pass child's c2p slot via static (thread_configure only has one arg).
@@ -88,9 +88,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     )
     .map_err(|_| "integration::tlb_coherency: configure_and_start_pinned failed")?;
 
-    // Wait for child to signal readiness on c2p.
-    let ready = signal_wait(c2p)
-        .map_err(|_| "integration::tlb_coherency: signal_wait (readiness) failed")?;
+    // Wait for child to notify readiness on c2p.
+    let ready = notification_wait(c2p)
+        .map_err(|_| "integration::tlb_coherency: notification_wait (readiness) failed")?;
     if ready != 0x1
     {
         return Err("integration::tlb_coherency: child sent wrong readiness bits");
@@ -100,7 +100,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     //
     // Each cycle:
     //   a. Map page at TEST_VA
-    //   b. Signal child on p2c that page is mapped (0x2)
+    //   b. Notification child on p2c that page is mapped (0x2)
     //   c. Wait for child to confirm access on c2p (0x4)
     //   d. Unmap page (triggers TLB shootdown IPI to CPU 1)
     //
@@ -119,13 +119,13 @@ pub fn run(ctx: &TestContext) -> TestResult
         )
         .map_err(|_| "integration::tlb_coherency: mem_map failed")?;
 
-        // Signal child on p2c: page is mapped, you may access it.
-        signal_send(p2c, 0x2)
-            .map_err(|_| "integration::tlb_coherency: signal_send (map) failed")?;
+        // Notification child on p2c: page is mapped, you may access it.
+        notification_send(p2c, 0x2)
+            .map_err(|_| "integration::tlb_coherency: notification_send (map) failed")?;
 
         // Wait for child to confirm access on c2p.
-        let ack =
-            signal_wait(c2p).map_err(|_| "integration::tlb_coherency: signal_wait (ack) failed")?;
+        let ack = notification_wait(c2p)
+            .map_err(|_| "integration::tlb_coherency: notification_wait (ack) failed")?;
         if ack != 0x4
         {
             return Err("integration::tlb_coherency: child sent wrong ack bits");
@@ -142,8 +142,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
     }
 
-    // ── 5. Signal child to exit on p2c. ──────────────────────────────────────
-    signal_send(p2c, 0x80).map_err(|_| "integration::tlb_coherency: signal_send (exit) failed")?;
+    // ── 5. Notification child to exit on p2c. ──────────────────────────────────────
+    notification_send(p2c, 0x80)
+        .map_err(|_| "integration::tlb_coherency: notification_send (exit) failed")?;
 
     // ── 6. Clean up. ─────────────────────────────────────────────────────────
     cap_delete(child.th).map_err(|_| "integration::tlb_coherency: cap_delete (th) failed")?;
@@ -165,7 +166,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 ///
 /// # Arguments
 ///
-/// * `p2c_slot` — parent-to-child Signal capability slot.
+/// * `p2c_slot` — parent-to-child Notification capability slot.
 // cast_possible_truncation: p2c_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn tlb_worker_thread(p2c_slot: u64) -> !
@@ -174,14 +175,14 @@ fn tlb_worker_thread(p2c_slot: u64) -> !
     // SAFETY: parent wrote CHILD_C2P_SLOT before thread_start; no concurrent writes.
     let c2p = unsafe { CHILD_C2P_SLOT };
 
-    // Signal parent on c2p: we're ready.
-    signal_send(c2p, 0x1).ok();
+    // Notification parent on c2p: we're ready.
+    notification_send(c2p, 0x1).ok();
 
-    while let Ok(bits) = signal_wait(p2c)
+    while let Ok(bits) = notification_wait(p2c)
     {
         if bits & 0x80 != 0
         {
-            // Exit signal received.
+            // Exit notification received.
             break;
         }
 
@@ -189,7 +190,7 @@ fn tlb_worker_thread(p2c_slot: u64) -> !
         {
             // Page is mapped. Access it (read) to load TLB entry.
             //
-            // SAFETY: Parent maps TEST_VA before signaling 0x2. The parent's
+            // SAFETY: Parent maps TEST_VA before notifying 0x2. The parent's
             // prior-cycle unmap shot down this hart's entry, so the read sees
             // the fresh mapping; a broken shootdown would instead fault here
             // and terminate this thread.
@@ -198,7 +199,7 @@ fn tlb_worker_thread(p2c_slot: u64) -> !
             let _value = unsafe { ptr.read_volatile() };
 
             // Acknowledge to parent on c2p: we've accessed the page.
-            signal_send(c2p, 0x4).ok();
+            notification_send(c2p, 0x4).ok();
         }
     }
 

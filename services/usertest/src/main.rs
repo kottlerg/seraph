@@ -138,7 +138,7 @@ fn run_one(path: &Path) -> Result<(), String>
         Err(match status.code()
         {
             Some(c) => format!("exit={c}"),
-            None => "killed by signal".to_string(),
+            None => "killed by notification".to_string(),
         })
     }
 }

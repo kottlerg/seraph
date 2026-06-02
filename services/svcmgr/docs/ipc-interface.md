@@ -74,7 +74,7 @@ label field identifies the operation.
 
 ### Label 2: `HANDOVER_COMPLETE`
 
-Signals that init has finished serving the handover endowment. svcmgr
+Notifications that init has finished serving the handover endowment. svcmgr
 replies `SUCCESS` immediately (so init can proceed to teardown), then runs
 [`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
 

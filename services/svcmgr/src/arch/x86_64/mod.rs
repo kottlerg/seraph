@@ -15,7 +15,7 @@ pub fn halt()
 {
     // SAFETY: hlt halts the CPU until the next interrupt. Only legal at
     // CPL 0; invoking it from svcmgr (CPL 3) raises #GP, which is the
-    // deliberate escalation signal for halt_loop() — the kernel terminates
+    // deliberate escalation notification for halt_loop() — the kernel terminates
     // the faulting thread.
     unsafe {
         core::arch::asm!("hlt", options(nomem, nostack));

@@ -15,7 +15,7 @@
 //! Skips are logged to serial so they are visible in the test run output.
 
 use syscall::{
-    aspace_query, cap_create_signal, irq_ack, irq_register, irq_split, mem_unmap, mmio_split,
+    aspace_query, cap_create_notification, irq_ack, irq_register, irq_split, mem_unmap, mmio_split,
 };
 #[cfg(target_arch = "x86_64")]
 use syscall::{cap_create_cspace, cap_create_thread};
@@ -82,15 +82,15 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
 
 // ── SYS_IRQ_REGISTER / SYS_IRQ_ACK ───────────────────────────────────────────
 
-/// `irq_register` binds a signal to an interrupt; `irq_ack` re-enables delivery.
+/// `irq_register` binds a notification to an interrupt; `irq_ack` re-enables delivery.
 ///
-/// Scans for the first Interrupt capability. Creates a signal for delivery.
+/// Scans for the first Interrupt capability. Creates a notification for delivery.
 /// After registration, ACKs to re-enable the interrupt line. If no Interrupt
 /// cap is found, the test is skipped.
 pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 {
-    let irq_sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_signal for IRQ test failed")?;
+    let irq_sig = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_notification for IRQ test failed")?;
 
     for slot in 1..ctx.aspace_cap
     {

@@ -18,7 +18,7 @@
 
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_thread, cap_delete, cap_info,
-    signal_send, signal_wait, thread_configure, thread_exit, thread_start,
+    notification_send, notification_wait, thread_configure, thread_exit, thread_start,
 };
 use syscall_abi::CAP_INFO_FRAME_AVAILABLE;
 
@@ -52,8 +52,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let baseline = cap_info(frame, CAP_INFO_FRAME_AVAILABLE)
         .map_err(|_| "stress::retype_concurrent: cap_info(baseline) failed")?;
 
-    // Done signal: each worker ORs its bit when finished.
-    let done = syscall::cap_create_signal(frame)
+    // Done notification: each worker ORs its bit when finished.
+    let done = syscall::cap_create_notification(frame)
         .map_err(|_| "stress::retype_concurrent: create done failed")?;
 
     let mut threads = [0u32; NUM_WORKERS];
@@ -86,8 +86,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut done_bits: u64 = 0;
     while done_bits & ALL_BITS != ALL_BITS
     {
-        let bits =
-            signal_wait(done).map_err(|_| "stress::retype_concurrent: signal_wait done failed")?;
+        let bits = notification_wait(done)
+            .map_err(|_| "stress::retype_concurrent: notification_wait done failed")?;
         done_bits |= bits;
     }
 
@@ -138,11 +138,11 @@ fn worker_entry(arg: u64) -> !
         }
         else
         {
-            // Refusing to set the done bit signals failure to the parent.
+            // Refusing to set the done bit notifications failure to the parent.
             thread_exit();
         }
     }
 
-    signal_send(done_slot, bit).ok();
+    notification_send(done_slot, bit).ok();
     thread_exit()
 }

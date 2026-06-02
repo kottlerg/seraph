@@ -51,8 +51,8 @@ pub use derivation::DERIVATION_LOCK;
 #[allow(unused_imports)]
 pub use object::{
     AddressSpaceObject, CSpaceKernelObject, EndpointObject, FrameObject, InterruptObject,
-    IoPortRangeObject, KernelObjectHeader, MmioRegionObject, ObjectType, SbiControlObject,
-    SchedControlObject, SignalObject, ThreadObject,
+    IoPortRangeObject, KernelObjectHeader, MmioRegionObject, NotificationObject, ObjectType,
+    SbiControlObject, SchedControlObject, ThreadObject,
 };
 #[allow(unused_imports)]
 pub use slot::{CSpaceId, CapTag, CapabilitySlot, Rights, SlotId};
@@ -1636,7 +1636,7 @@ fn populate_cspace(
     let irq_range_slot = insert_or_fatal(
         cspace,
         CapTag::Interrupt,
-        Rights::SIGNAL,
+        Rights::NOTIFY,
         irq_ptr,
         "Phase 7: cannot allocate root Interrupt range capability",
     );

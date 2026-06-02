@@ -13,45 +13,45 @@
 //! only the remaining member can wake the wait set after removal.
 
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, event_post, event_queue_create,
-    event_recv, signal_send, signal_wait, thread_exit, wait_set_add, wait_set_create,
-    wait_set_remove, wait_set_wait,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, event_post,
+    event_queue_create, event_recv, notification_send, notification_wait, thread_exit,
+    wait_set_add, wait_set_create, wait_set_remove, wait_set_wait,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// Signal right only (no WAIT). Children only send on signals.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+// Notification right only (no WAIT). Children only send on notifications.
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 
 // Child stack for the blocking_wait test.
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
-// ── wait_set_add (signal, immediate wake) ────────────────────────────────────
+// ── wait_set_add (notification, immediate wake) ────────────────────────────────────
 
-/// Adding a signal with pre-set bits to a wait set causes `wait_set_wait`
+/// Adding a notification with pre-set bits to a wait set causes `wait_set_wait`
 /// to return immediately with the correct badge.
-pub fn add_signal_immediate(ctx: &TestContext) -> TestResult
+pub fn add_notification_immediate(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_signal for ws-signal test failed")?;
+    let sig = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_notification for ws-notification test failed")?;
 
-    wait_set_add(ws, sig, 42).map_err(|_| "wait_set_add(signal) failed")?;
+    wait_set_add(ws, sig, 42).map_err(|_| "wait_set_add(notification) failed")?;
 
-    // Pre-set bits so the signal is immediately ready.
-    signal_send(sig, 0x1).map_err(|_| "signal_send before wait_set_wait failed")?;
+    // Pre-set bits so the notification is immediately ready.
+    notification_send(sig, 0x1).map_err(|_| "notification_send before wait_set_wait failed")?;
 
-    let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait(signal, immediate) failed")?;
+    let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait(notification, immediate) failed")?;
     if tok != 42
     {
-        return Err("wait_set_wait returned wrong badge for signal source");
+        return Err("wait_set_wait returned wrong badge for notification source");
     }
 
-    // Drain the signal bits.
-    signal_wait(sig).map_err(|_| "signal_wait to drain after wait_set_wait failed")?;
+    // Drain the notification bits.
+    notification_wait(sig).map_err(|_| "notification_wait to drain after wait_set_wait failed")?;
 
-    cap_delete(sig).map_err(|_| "cap_delete sig after ws-signal test failed")?;
-    cap_delete(ws).map_err(|_| "cap_delete ws after ws-signal test failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after ws-notification test failed")?;
+    cap_delete(ws).map_err(|_| "cap_delete ws after ws-notification test failed")?;
     Ok(())
 }
 
@@ -91,38 +91,39 @@ pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 
 // ── wait_set_wait (blocking) ──────────────────────────────────────────────────
 
-/// `wait_set_wait` blocks until a child thread fires a registered signal.
+/// `wait_set_wait` blocks until a child thread fires a registered notification.
 pub fn blocking_wait(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_frame_base)
         .map_err(|_| "wait_set_create for blocking test failed")?;
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_signal for blocking test failed")?;
+    let sig = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_notification for blocking test failed")?;
 
     wait_set_add(ws, sig, 7).map_err(|_| "wait_set_add for blocking test failed")?;
 
-    // Set up a child thread that sends on the signal.
+    // Set up a child thread that sends on the notification.
     let child =
         crate::spawn::new_child(ctx).map_err(|_| "spawn::new_child for blocking test failed")?;
     let child_sig =
-        cap_copy(sig, child.cs, RIGHTS_SIGNAL).map_err(|_| "cap_copy for blocking test failed")?;
+        cap_copy(sig, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy for blocking test failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
         .map_err(|_| "configure_and_start for blocking test failed")?;
 
-    // Block until the child fires the signal.
+    // Block until the child fires the notification.
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait (blocking) failed")?;
     if tok != 7
     {
         return Err("wait_set_wait (blocking) returned wrong badge");
     }
 
-    // Drain the signal bits.
-    let bits = signal_wait(sig).map_err(|_| "signal_wait to drain after blocking wait failed")?;
+    // Drain the notification bits.
+    let bits = notification_wait(sig)
+        .map_err(|_| "notification_wait to drain after blocking wait failed")?;
     if bits != 0xBEEF
     {
-        return Err("signal bits after blocking wait_set_wait are wrong (expected 0xBEEF)");
+        return Err("notification bits after blocking wait_set_wait are wrong (expected 0xBEEF)");
     }
 
     cap_delete(child.th).map_err(|_| "cap_delete th after blocking test failed")?;
@@ -136,21 +137,21 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
 
 /// After `wait_set_remove`, the removed source no longer wakes the wait set.
 ///
-/// Registers a signal (badge 1) and an event queue (badge 2). Removes the
-/// signal. Posts to the event queue and verifies only badge 2 fires.
+/// Registers a notification (badge 1) and an event queue (badge 2). Removes the
+/// notification. Posts to the event queue and verifies only badge 2 fires.
 pub fn remove(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_frame_base)
         .map_err(|_| "wait_set_create for remove test failed")?;
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_signal for remove test failed")?;
+    let sig = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_notification for remove test failed")?;
     let eq = event_queue_create(ctx.memory_frame_base, 4)
         .map_err(|_| "event_queue_create for remove test failed")?;
 
     wait_set_add(ws, sig, 1).map_err(|_| "wait_set_add(sig) for remove test failed")?;
     wait_set_add(ws, eq, 2).map_err(|_| "wait_set_add(eq) for remove test failed")?;
 
-    // Remove the signal — only the queue remains.
+    // Remove the notification — only the queue remains.
     wait_set_remove(ws, sig).map_err(|_| "wait_set_remove(sig) failed")?;
 
     // Post to the queue; wait_set_wait must return badge 2.
@@ -158,7 +159,7 @@ pub fn remove(ctx: &TestContext) -> TestResult
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait after remove failed")?;
     if tok != 2
     {
-        return Err("wait_set_wait returned wrong badge after signal removed (expected 2)");
+        return Err("wait_set_wait returned wrong badge after notification removed (expected 2)");
     }
 
     // Drain the queue.
@@ -173,24 +174,25 @@ pub fn remove(ctx: &TestContext) -> TestResult
 // ── Source pin via wait-set membership (refcount invariant) ──────────────────
 
 /// Wait-set membership holds a +1 cap-level reference on the source. Dropping
-/// the only user-held cap to a signal that is already in a wait set must not
-/// reclaim the signal state — the wait set still references it. A subsequent
+/// the only user-held cap to a notification that is already in a wait set must not
+/// reclaim the notification state — the wait set still references it. A subsequent
 /// `wait_set_wait` must observe the previously-sent bits and return the
 /// member's badge. Dropping the wait-set cap then cascades the source's
 /// reclaim through `wait_set_drop`.
-pub fn source_signal_pinned_by_member(ctx: &TestContext) -> TestResult
+pub fn source_notification_pinned_by_member(ctx: &TestContext) -> TestResult
 {
     let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
-    let sig = cap_create_signal(ctx.memory_frame_base).map_err(|_| "cap_create_signal failed")?;
+    let sig = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_notification failed")?;
 
     wait_set_add(ws, sig, 31).map_err(|_| "wait_set_add(sig) failed")?;
-    signal_send(sig, 0xCAFE).map_err(|_| "signal_send before drop failed")?;
+    notification_send(sig, 0xCAFE).map_err(|_| "notification_send before drop failed")?;
 
-    // Drop the only user-held cap to the signal while a wait-set member still
-    // references it. The +1 from membership must keep the SignalState alive.
+    // Drop the only user-held cap to the notification while a wait-set member still
+    // references it. The +1 from membership must keep the NotificationState alive.
     cap_delete(sig).map_err(|_| "cap_delete(sig) while member-bound failed")?;
 
-    // The signal state should still be live: wait_set_wait observes the
+    // The notification state should still be live: wait_set_wait observes the
     // previously-stored bits via the level-state self-heal loop.
     let tok = wait_set_wait(ws).map_err(|_| "wait_set_wait after sig cap drop failed")?;
     if tok != 31
@@ -198,12 +200,12 @@ pub fn source_signal_pinned_by_member(ctx: &TestContext) -> TestResult
         return Err("wait_set_wait returned wrong badge after sig cap drop");
     }
 
-    // Cascade-reclaims the signal state through wait_set_drop's dec_ref.
+    // Cascade-reclaims the notification state through wait_set_drop's dec_ref.
     cap_delete(ws).map_err(|_| "cap_delete(ws) cascade-drop failed")?;
     Ok(())
 }
 
-/// Symmetric to `source_signal_pinned_by_member` for `EventQueue`. Posting an
+/// Symmetric to `source_notification_pinned_by_member` for `EventQueue`. Posting an
 /// entry before dropping the cap ensures the queue is "ready" so the
 /// post-drop `wait_set_wait` can observe its live state.
 pub fn source_eventqueue_pinned_by_member(ctx: &TestContext) -> TestResult
@@ -253,6 +255,6 @@ pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
 #[allow(clippy::cast_possible_truncation)]
 fn sender_entry(sig_slot: u64) -> !
 {
-    signal_send(sig_slot as u32, 0xBEEF).ok();
+    notification_send(sig_slot as u32, 0xBEEF).ok();
     thread_exit()
 }

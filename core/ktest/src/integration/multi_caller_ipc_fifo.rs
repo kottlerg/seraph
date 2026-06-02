@@ -15,13 +15,13 @@
 //! `ipc_call`, so after one yield it is blocked on the send queue.  The server
 //! then calls `ipc_recv` three times and verifies the label sequence 1 → 2 → 3.
 //!
-//! Each caller ORs a distinct bit into the shared `done` signal after receiving
+//! Each caller ORs a distinct bit into the shared `done` notification after receiving
 //! its reply; the server waits for all three bits before returning.
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, signal_send, signal_wait,
-    thread_exit, thread_yield,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
+    notification_wait, thread_exit, thread_yield,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -40,8 +40,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let ep = cap_create_endpoint(ctx.memory_frame_base)
         .map_err(|_| "multi_caller_ipc_fifo: cap_create_endpoint failed")?;
-    let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "multi_caller_ipc_fifo: cap_create_signal failed")?;
+    let done = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "multi_caller_ipc_fifo: cap_create_notification failed")?;
 
     // ── Build and start caller A ──────────────────────────────────────────────
     let child_a = spawn::new_child(ctx).map_err(|_| "multi_caller_ipc_fifo: new_child A failed")?;
@@ -122,13 +122,13 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Wait for all three callers to confirm they received their reply.
     //
-    // signal_wait returns as soon as ANY bits are set, not necessarily all three.
+    // notification_wait returns as soon as ANY bits are set, not necessarily all three.
     // Accumulate via repeated waits until all three bits (0x7) arrive.
     let mut all_done = 0u64;
     while all_done != 0x7
     {
-        let bits =
-            signal_wait(done).map_err(|_| "multi_caller_ipc_fifo: signal_wait done failed")?;
+        let bits = notification_wait(done)
+            .map_err(|_| "multi_caller_ipc_fifo: notification_wait done failed")?;
         all_done |= bits;
     }
 
@@ -148,7 +148,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 // ── Child thread entry ────────────────────────────────────────────────────────
 
 /// Caller entry: calls the endpoint immediately with its label, then ORs its
-/// bit into the `done` signal when the reply arrives.
+/// bit into the `done` notification when the reply arrives.
 ///
 /// `arg`: bits[15:0] = `ep_slot`, bits[31:16] = `done_slot`, bits[47:32] = label
 /// (all in the child's own `CSpace`).
@@ -170,7 +170,7 @@ fn caller_entry(arg: u64) -> !
     {
         // OR the bit for this caller's label (label 1→bit0, 2→bit1, 3→bit2).
         let bit = 1u64 << (label - 1);
-        signal_send(done_slot, bit).ok();
+        notification_send(done_slot, bit).ok();
     }
     /* else: no bit set — server detects the missing bit */
     thread_exit()

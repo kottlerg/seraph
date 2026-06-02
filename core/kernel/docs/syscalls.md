@@ -112,12 +112,12 @@ are never reassigned or reused.
  0  SYS_IPC_CALL              22  SYS_THREAD_EXIT
  1  SYS_IPC_REPLY             23  SYS_THREAD_CONFIGURE
  2  SYS_IPC_RECV              24  SYS_CAP_COPY
- 3  SYS_SIGNAL_SEND           25  SYS_CAP_MOVE
- 4  SYS_SIGNAL_WAIT           26  SYS_WAIT_SET_ADD
+ 3  SYS_NOTIFICATION_SEND           25  SYS_CAP_MOVE
+ 4  SYS_NOTIFICATION_WAIT           26  SYS_WAIT_SET_ADD
  5  SYS_EVENT_POST            27  SYS_WAIT_SET_REMOVE
  6  SYS_EVENT_RECV            28  SYS_WAIT_SET_WAIT
  7  SYS_CAP_CREATE_ENDPOINT   29  SYS_IRQ_ACK
- 8  SYS_CAP_CREATE_SIGNAL     30  SYS_IRQ_REGISTER
+ 8  SYS_CAP_CREATE_NOTIFICATION     30  SYS_IRQ_REGISTER
  9  SYS_CAP_CREATE_EVENT_Q    31  SYS_CAP_DELETE
 10  SYS_CAP_CREATE_THREAD     32  SYS_CAP_INSERT
 11  SYS_CAP_CREATE_ASPACE     33  SYS_FRAME_SPLIT
@@ -138,8 +138,8 @@ are never reassigned or reused.
                                 48  SYS_CAP_DERIVE_BADGE
 ```
 
-**Implementation status.** Handlers implemented: 0–9 (IPC, signal, event
-queue creation and I/O), 7–8 (endpoint/signal creation), 10–13 (thread,
+**Implementation status.** Handlers implemented: 0–9 (IPC, notification, event
+queue creation and I/O), 7–8 (endpoint/notification creation), 10–13 (thread,
 aspace, cspace, wait set creation), 14–18 (cap management and memory),
 21–28 (thread lifecycle, wait set operations), 29–30 (IRQ ACK and
 register), 31–35 (cap delete/insert, frame split, MMIO map, ioport
@@ -289,28 +289,28 @@ The badge is the value attached to the sender's endpoint capability via
 
 ---
 
-### `SYS_SIGNAL_SEND` (3)
+### `SYS_NOTIFICATION_SEND` (3)
 
-OR bits into a signal object. Non-blocking; wakes the waiter if one is present.
+OR bits into a notification object. Non-blocking; wakes the waiter if one is present.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `signal_cap` | Signal capability with Signal rights |
-| 1 | `bits` | Bitmask to OR into the signal word |
+| 0 | `notification_cap` | Notification capability with Notification rights |
+| 1 | `bits` | Bitmask to OR into the notification word |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-**Capability requirement:** `signal_cap` must have Signal rights.
+**Capability requirement:** `notification_cap` must have Notification rights.
 
 **Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (bits == 0).
 
 ---
 
-### `SYS_SIGNAL_WAIT` (4)
+### `SYS_NOTIFICATION_WAIT` (4)
 
-Block until at least one bit is set in the signal object, or until the
+Block until at least one bit is set in the notification object, or until the
 optional millisecond timeout elapses. Returns and atomically clears the
 entire bitmask.
 
@@ -318,21 +318,21 @@ entire bitmask.
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `signal_cap` | Signal capability with Wait rights |
+| 0 | `notification_cap` | Notification capability with Wait rights |
 | 1 | `timeout_ms` | `0` = block indefinitely; `>0` = wake after at most `timeout_ms` ms |
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: acquired bitmask on success (non-zero on signal wake; `0`
-  on timeout — unambiguous because `signal_send` rejects zero-bit sends,
+- `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake; `0`
+  on timeout — unambiguous because `notification_send` rejects zero-bit sends,
   so a real wake always carries a non-zero mask)
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
 full 64-bit bitmask range is usable.
 
-**Capability requirement:** `signal_cap` must have Wait rights.
+**Capability requirement:** `notification_cap` must have Wait rights.
 
 **Errors:** `InvalidCapability`, `AccessDenied`, `Interrupted`.
 
@@ -368,7 +368,7 @@ Dequeue the next entry from an event queue with optional bounded wait.
 | 0 | `queue_cap`  | Event queue capability with Recv rights                 |
 | 1 | `timeout_ms` | Wait policy: see sentinels below                        |
 
-`timeout_ms` sentinels (matches `SYS_SIGNAL_WAIT`):
+`timeout_ms` sentinels (matches `SYS_NOTIFICATION_WAIT`):
 
 | Value             | Behaviour                                                       |
 |-------------------|-----------------------------------------------------------------|
@@ -389,8 +389,8 @@ Dequeue the next entry from an event queue with optional bounded wait.
 the caller already knows which mode it asked for. The kernel uses an
 out-of-band marker (`tcb.timed_out`) rather than an in-band
 `wakeup_value` sentinel because event-queue payloads may be any `u64`
-(including 0) — contrast `SYS_SIGNAL_WAIT`, where `wakeup_value == 0`
-suffices because `signal_send` rejects zero-bit sends.
+(including 0) — contrast `SYS_NOTIFICATION_WAIT`, where `wakeup_value == 0`
+suffices because `notification_send` rejects zero-bit sends.
 
 ---
 
@@ -410,9 +410,9 @@ Create a new IPC endpoint. Returns a capability with Send + Receive + Grant righ
 
 ---
 
-### `SYS_CAP_CREATE_SIGNAL` (8)
+### `SYS_CAP_CREATE_NOTIFICATION` (8)
 
-Create a new signal object. Returns a capability with Signal + Wait rights.
+Create a new notification object. Returns a capability with Notification + Wait rights.
 
 **Arguments:** None.
 
@@ -929,7 +929,7 @@ Add an IPC primitive to a wait set.
 | # | Name | Description |
 |---|---|---|
 | 0 | `wait_set_cap` | Wait set capability (Modify rights) |
-| 1 | `source_cap` | Capability to an endpoint, signal, or event queue |
+| 1 | `source_cap` | Capability to an endpoint, notification, or event queue |
 | 2 | `badge` | Opaque u64 returned to the caller when this source is ready |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
@@ -1017,25 +1017,25 @@ specific line.
 
 ### `SYS_IRQ_REGISTER` (30)
 
-Register a signal to receive interrupt notifications for a hardware interrupt line.
+Register a notification to receive interrupt notifications for a hardware interrupt line.
 When the interrupt fires, the kernel delivers it by ORing a notification bit into
-the registered signal.
+the registered notification.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `irq_cap` | Interrupt capability for the line to register |
-| 1 | `signal_cap` | Signal capability (Signal rights) to notify on interrupt |
+| 1 | `notification_cap` | Notification capability (Notification rights) to notify on interrupt |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-Only one signal may be registered per interrupt line at a time. A second call
+Only one notification may be registered per interrupt line at a time. A second call
 replaces the previous registration. The kernel masks the interrupt line before
 delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it.
 
-**Capability requirements:** `irq_cap` (valid interrupt capability), `signal_cap`
-(Signal rights).
+**Capability requirements:** `irq_cap` (valid interrupt capability), `notification_cap`
+(Notification rights).
 
 **Errors:** `InvalidCapability`, `AccessDenied`.
 
@@ -1384,7 +1384,7 @@ all its descendants (including C2) but leaves C and any other children of C inta
   uses appropriate locks and re-checks state on resumption to ensure correctness.
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
-  `SYS_IPC_RECV`, `SYS_SIGNAL_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`) returns
+  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`) returns
   `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`.
 
 ---

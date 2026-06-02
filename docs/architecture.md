@@ -204,7 +204,7 @@ All inter‑process communication occurs via the kernel’s IPC mechanism. Share
 is established only via explicit capability-granted mappings.
 
 - **Synchronous calls** for structured request/reply between services.
-- **Asynchronous notifications** for interrupts and completion signals.
+- **Asynchronous notifications** for interrupts and completion notifications.
 
 ---
 

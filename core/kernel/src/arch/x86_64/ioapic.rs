@@ -38,7 +38,7 @@
 //!
 //! # Modification notes
 //! - To add a new GSI: `route(gsi, DEVICE_VECTOR_BASE + gsi as u8)` then
-//!   `unmask(gsi)` after registering a signal handler.
+//!   `unmask(gsi)` after registering a notification handler.
 //! - To support level-triggered IRQs: set bit 15 (level-sensitive) and
 //!   bit 13 (active-low polarity) in the redirection entry low dword.
 

@@ -144,7 +144,7 @@ all svcmgr-supervised services live on disk at
 
 ### Init reap
 
-After Phase 3 signals `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
+After Phase 3 notifications `svcmgr_labels::HANDOVER_COMPLETE` (svcmgr
 replies immediately, then scans `/config/svcmgr/services/`, binds the
 endowed substrate bind-only, and launches every defined-but-unparked
 service — `logd`, the `timed` and `pwrmgr` providers on a normal boot,

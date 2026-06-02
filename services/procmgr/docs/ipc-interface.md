@@ -257,7 +257,7 @@ Reply: `procmgr_errors::SUCCESS` on accept, `INVALID_ARGUMENT` on
 wrong round shape (wrong cap count on round 1, or `done` before any
 round 1).
 
-## INIT_TEARDOWN_DONE — end-of-stream signal
+## INIT_TEARDOWN_DONE — end-of-stream notification
 
 Wire format:
 

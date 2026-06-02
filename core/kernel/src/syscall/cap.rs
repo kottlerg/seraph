@@ -152,25 +152,25 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 }
 
-/// `SYS_CAP_CREATE_SIGNAL` (8): retype a Frame cap into a new Signal.
+/// `SYS_CAP_CREATE_NOTIFICATION` (8): retype a Frame cap into a new Notification.
 ///
 /// arg0 = Frame-cap slot index in the caller's `CSpace`. The Frame cap MUST
-/// carry `Rights::RETYPE` and have at least `dispatch_for(Signal, 0).raw_bytes`
+/// carry `Rights::RETYPE` and have at least `dispatch_for(Notification, 0).raw_bytes`
 /// of `available_bytes`.
 ///
-/// On success, the wrapper + `SignalState` are constructed in place inside
-/// the source Frame cap's region; a cap with `SIGNAL | WAIT` rights is
+/// On success, the wrapper + `NotificationState` are constructed in place inside
+/// the source Frame cap's region; a cap with `NOTIFY | WAIT` rights is
 /// inserted into the caller's `CSpace`; returns the slot index.
 ///
 /// Auto-reclaim (`dec_ref → 0`) consults `header.ancestor` and credits bytes
 /// back to the source Frame cap.
 #[cfg(not(test))]
-pub fn sys_cap_create_signal(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, SignalObject};
+    use crate::cap::object::{FrameObject, KernelObjectHeader, NotificationObject, ObjectType};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
-    use crate::ipc::signal::SignalState;
+    use crate::ipc::notification::NotificationState;
     use core::ptr::NonNull;
 
     let frame_slot = tf.arg(0) as u32;
@@ -197,18 +197,18 @@ pub fn sys_cap_create_signal(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: lookup_cap returned a live Frame slot.
     let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
 
-    let entry = dispatch_for(ObjectType::Signal, 0).ok_or(SyscallError::InvalidArgument)?;
+    let entry = dispatch_for(ObjectType::Notification, 0).ok_or(SyscallError::InvalidArgument)?;
 
     let offset = retype_allocate(frame, entry.raw_bytes)?;
 
     let block_phys = frame.base + offset;
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
-    // Layout: SignalObject at offset 0; SignalState at offset
-    // size_of::<SignalObject>() (24).
-    let sig_obj_ptr = block_virt as *mut SignalObject;
-    let state_offset = core::mem::size_of::<SignalObject>() as u64;
-    let sig_state_ptr = (block_virt + state_offset) as *mut SignalState;
+    // Layout: NotificationObject at offset 0; NotificationState at offset
+    // size_of::<NotificationObject>() (24).
+    let sig_obj_ptr = block_virt as *mut NotificationObject;
+    let state_offset = core::mem::size_of::<NotificationObject>() as u64;
+    let sig_state_ptr = (block_virt + state_offset) as *mut NotificationState;
 
     let ancestor = frame_obj_nn;
 
@@ -216,11 +216,11 @@ pub fn sys_cap_create_signal(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // size-class alignment (BIN_128 = 128 B granular) exceeds the 8-byte
     // alignment requirement of both structs.
     unsafe {
-        core::ptr::write(sig_state_ptr, SignalState::new());
+        core::ptr::write(sig_state_ptr, NotificationState::new());
         core::ptr::write(
             sig_obj_ptr,
-            SignalObject {
-                header: KernelObjectHeader::with_ancestor(ObjectType::Signal, ancestor),
+            NotificationObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::Notification, ancestor),
                 state: sig_state_ptr,
             },
         );
@@ -229,13 +229,13 @@ pub fn sys_cap_create_signal(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: ancestor is the FrameObject's header at offset 0.
     unsafe { ancestor.as_ref().inc_ref() };
 
-    // SAFETY: header at offset 0 of SignalObject.
+    // SAFETY: header at offset 0 of NotificationObject.
     let nonnull = unsafe { NonNull::new_unchecked(sig_obj_ptr.cast::<KernelObjectHeader>()) };
 
     // SAFETY: cspace validated non-null; lock_raw/unlock_raw paired.
     let idx_res = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap(CapTag::Signal, Rights::SIGNAL | Rights::WAIT, nonnull);
+        let r = (*cspace).insert_cap(CapTag::Notification, Rights::NOTIFY | Rights::WAIT, nonnull);
         (*cspace).lock.unlock_raw(saved);
         r
     };
@@ -2314,7 +2314,7 @@ pub fn sys_cap_create_endpoint(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 }
 
 #[cfg(test)]
-pub fn sys_cap_create_signal(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_cap_create_notification(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

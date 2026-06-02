@@ -647,7 +647,7 @@ pub fn create_devmgr_with_caps(
     // preparation failure init MUST still emit a `done=true` round so
     // devmgr's bootstrap_rounds loop in `services/devmgr/src/caps.rs`
     // unblocks; otherwise devmgr spins in `request_round` forever.
-    // Empty-caps terminal round signals "no bundle delivered"; devmgr's
+    // Empty-caps terminal round notifications "no bundle delivered"; devmgr's
     // SVCMGR_BUNDLE absorber rejects a zero-cap message and returns
     // None, which propagates to a clean failure rather than a hang.
     let prep_failed = svcmgr_service_ep == 0;
@@ -1097,7 +1097,7 @@ fn endow_svcmgr(
 /// Phase 3: load svcmgr, serve it the handover endowment (its own
 /// endpoints + publish-role source caps + one `(name, thread_cap)` round
 /// per init-bootstrapped substrate service + the reserved log-sink
-/// sources), then signal `HANDOVER_COMPLETE` so svcmgr scans
+/// sources), then notification `HANDOVER_COMPLETE` so svcmgr scans
 /// `/config/svcmgr/services/`. svcmgr owns all post-handover work from the
 /// endowment: it publishes the well-known names, installs devmgr's drivers
 /// dir, and launches + supervises the non-bootstrap services. On a normal
@@ -1253,7 +1253,7 @@ fn module_spawn_copy(module_frame_cap: u32) -> Option<u32>
 }
 
 /// Move init's kernel-object caps + every reclaimable Frame cap to
-/// procmgr via `REGISTER_INIT_TEARDOWN`, then signal
+/// procmgr via `REGISTER_INIT_TEARDOWN`, then notification
 /// `INIT_TEARDOWN_DONE`. IPC cap-transfer MOVES caps, so after this
 /// returns init's `CSpace` no longer holds the transferred slots.
 ///
@@ -1378,7 +1378,7 @@ fn handoff_to_procmgr_reap(
         unsafe { send_teardown_round(procmgr_ep, &chunk[..cn], ipc_buf) };
     }
 
-    // Signal the cap stream is closed. Procmgr arms the death-EQ
+    // Notification the cap stream is closed. Procmgr arms the death-EQ
     // observer; the next event with INIT_REAP_CORRELATOR triggers the
     // reap. (Done by this point — REGISTER_INIT_TEARDOWN's first round
     // already bound the EQ.)

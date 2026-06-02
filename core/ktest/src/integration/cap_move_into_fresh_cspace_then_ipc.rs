@@ -11,7 +11,9 @@
 //! `ipc_recv` the child's call.
 
 use ipc::IpcMessage;
-use syscall::{cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, signal_wait};
+use syscall::{
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_wait,
+};
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -21,7 +23,7 @@ const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 /// Child entry: issue one `ipc_call` via the slot whose index is packed
-/// in the low 32 bits of `arg`. Signal `done_slot` (high 32 bits) and exit.
+/// in the low 32 bits of `arg`. Notification `done_slot` (high 32 bits) and exit.
 // cast_possible_truncation: slot indices are < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn caller_entry(arg: u64) -> !
@@ -33,13 +35,13 @@ fn caller_entry(arg: u64) -> !
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
     {
-        syscall::signal_send(done_slot, 1).ok();
+        syscall::notification_send(done_slot, 1).ok();
         syscall::thread_exit();
     }
     let msg = IpcMessage::new(0xABC);
     // SAFETY: buf_addr was registered as this thread's IPC buffer above.
     let _ = unsafe { ipc::ipc_call(ep_slot, &msg, buf_addr as *mut u64) };
-    syscall::signal_send(done_slot, 1).ok();
+    syscall::notification_send(done_slot, 1).ok();
     syscall::thread_exit();
 }
 
@@ -55,8 +57,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     let ep_donor = cap_copy(ep_parent, ctx.cspace_cap, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: sibling cap_copy (donor) failed")?;
 
-    let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: cap_create_signal (done) failed")?;
+    let done = cap_create_notification(ctx.memory_frame_base).map_err(
+        |_| "cap_move_into_fresh_cspace_then_ipc: cap_create_notification (done) failed",
+    )?;
 
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: spawn::new_child failed")?;
@@ -72,7 +75,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Verify: the parent's ep_donor slot must be null now (any operation
     // returns an error).
-    if syscall::signal_send(ep_donor, 0).is_ok()
+    if syscall::notification_send(ep_donor, 0).is_ok()
     {
         return Err("cap_move_into_fresh_cspace_then_ipc: source slot still usable after cap_move");
     }
@@ -97,7 +100,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: ipc_reply failed")?;
 
     // Wait for the child to exit cleanly.
-    signal_wait(done).ok();
+    notification_wait(done).ok();
 
     cap_delete(child.th).ok();
     cap_delete(child.cs).ok();

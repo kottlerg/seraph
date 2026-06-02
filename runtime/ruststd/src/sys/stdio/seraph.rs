@@ -1,9 +1,9 @@
 // seraph-overlay: std::sys::stdio::seraph
 //
 // Stdin/Stdout/Stderr for Seraph userspace, backed by shmem SPSC rings
-// + signal caps (Phase 3 of LOGGING_STDIO_ROADMAP). Each direction is
+// + notification caps (Phase 3 of LOGGING_STDIO_ROADMAP). Each direction is
 // an independent `sys::pipe::seraph::Pipe` end attached at child
-// startup from the (frame, data_signal, space_signal) triple the
+// startup from the (frame, data_notification, space_notification) triple the
 // spawner installed via `procmgr_labels::CONFIGURE_PIPE`.
 //
 // Cap topology per direction:
@@ -68,8 +68,8 @@ fn pipe_for(idx: usize) -> Option<&'static Pipe> {
 /// for `stdio_init`.
 fn try_attach(
     frame: u32,
-    data_signal: u32,
-    space_signal: u32,
+    data_notification: u32,
+    space_notification: u32,
     role: Role,
     aspace: u32,
     child_va: u64,
@@ -77,7 +77,7 @@ fn try_attach(
     if frame == 0 {
         return None;
     }
-    Pipe::attach_from_caps(frame, data_signal, space_signal, role, aspace, child_va).ok()
+    Pipe::attach_from_caps(frame, data_notification, space_notification, role, aspace, child_va).ok()
 }
 
 /// Install the stdio pipe ends from `ProcessInfo` cap triples. Called
@@ -249,7 +249,7 @@ pub fn is_ebadf(_err: &io::Error) -> bool {
 
 /// Tear down all stdio pipe ends. Called from the process-exit path
 /// (`sys::exit::exit` and the post-`main` epilogue in `os::seraph::
-/// _start`) so the close protocol fires (header `closed = 1` + signal
+/// _start`) so the close protocol fires (header `closed = 1` + notification
 /// kick) before the kernel destroys this aspace and the parent's
 /// blocking read/write would otherwise hang. Idempotent — second call
 /// is a no-op.
@@ -259,7 +259,7 @@ pub fn close_all() {
     }
     // SAFETY: STDIO_READY just toggled off; no concurrent reader past
     // the Acquire load in `pipe_for`. Drop runs on each Pipe end and
-    // marks closed + sends one final signal kick to wake the peer.
+    // marks closed + sends one final notification kick to wake the peer.
     unsafe {
         let slots = &mut *STDIO.0.get();
         drop(slots[IDX_STDIN].take());

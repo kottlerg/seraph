@@ -12,7 +12,7 @@ Three independent versioning axes; each axis answers a different question and bu
 
 The top-level identifier. Workspace-inherited Cargo crate version and git tag at every release point are three views of the same number.
 
-- `X = 0` — pre-stable signal. Stays `0` until the system is judged stable enough for a 1.0 commitment.
+- `X = 0` — pre-stable notification. Stays `0` until the system is judged stable enough for a 1.0 commitment.
 - `Y` — milestone counter. Each bump corresponds to a named milestone with documented contents.
 - `Z` — patches between milestones. Bumps only when there is value in tagging a specific known-good point between `Y` releases. Stays at `0` if no patches ship.
 

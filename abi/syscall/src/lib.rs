@@ -62,23 +62,23 @@ pub const SYS_IPC_CALL: u64 = 0;
 pub const SYS_IPC_REPLY: u64 = 1;
 /// IPC: receive a call on an endpoint.
 pub const SYS_IPC_RECV: u64 = 2;
-/// Signal: send (OR bits into signal object).
-pub const SYS_SIGNAL_SEND: u64 = 3;
-/// Signal: wait (read-and-clear; blocks if zero).
+/// Notification: send (OR bits into notification object).
+pub const SYS_NOTIFICATION_SEND: u64 = 3;
+/// Notification: wait (read-and-clear; blocks if zero).
 ///
-/// arg0 = signal cap index (WAIT right). arg1 = `timeout_ms`: `0` means
+/// arg0 = notification cap index (WAIT right). arg1 = `timeout_ms`: `0` means
 /// block indefinitely (the only behaviour before the timeout extension);
 /// `> 0` means block until bits are delivered *or* `timeout_ms`
 /// milliseconds have elapsed, whichever comes first.
 ///
 /// On success returns `0` in the primary return register and the bitmask
 /// in the secondary register (rdx / a1); on timeout returns `0` in both
-/// (unambiguous because `signal_send` rejects zero-bit sends, so a
+/// (unambiguous because `notification_send` rejects zero-bit sends, so a
 /// legitimate wake always carries non-zero bits). The split avoids
 /// aliasing bit-63-set bitmasks with the dispatcher's negative-Err
 /// encoding — the full 64-bit bitmask range is usable. Same register
 /// layout as `SYS_EVENT_RECV`.
-pub const SYS_SIGNAL_WAIT: u64 = 4;
+pub const SYS_NOTIFICATION_WAIT: u64 = 4;
 /// `EventQueue`: post an entry.
 pub const SYS_EVENT_POST: u64 = 5;
 /// `EventQueue`: receive an entry.
@@ -93,15 +93,15 @@ pub const SYS_EVENT_POST: u64 = 5;
 ///   available"; the caller already knows which mode it asked for).
 ///
 /// On success returns `0` plus the payload in the secondary return
-/// register. Sentinel layout matches `SYS_SIGNAL_WAIT` (`0` = forever),
+/// register. Sentinel layout matches `SYS_NOTIFICATION_WAIT` (`0` = forever),
 /// but event-queue payloads may be any `u64` including 0, so the kernel
 /// uses an out-of-band `tcb.timed_out` marker instead of an in-band
 /// sentinel on the payload register.
 pub const SYS_EVENT_RECV: u64 = 6;
 /// Capability: create an `Endpoint` object.
 pub const SYS_CAP_CREATE_ENDPOINT: u64 = 7;
-/// Capability: create a `Signal` object.
-pub const SYS_CAP_CREATE_SIGNAL: u64 = 8;
+/// Capability: create a `Notification` object.
+pub const SYS_CAP_CREATE_NOTIFICATION: u64 = 8;
 /// Capability: create an `EventQueue` object.
 pub const SYS_CAP_CREATE_EVENT_Q: u64 = 9;
 /// Capability: create a `Thread` object.
@@ -152,7 +152,7 @@ pub const SYS_WAIT_SET_REMOVE: u64 = 27;
 pub const SYS_WAIT_SET_WAIT: u64 = 28;
 /// IRQ: acknowledge a delivered interrupt.
 pub const SYS_IRQ_ACK: u64 = 29;
-/// IRQ: register a signal to receive interrupt notifications.
+/// IRQ: register a notification to receive interrupt notifications.
 pub const SYS_IRQ_REGISTER: u64 = 30;
 /// Capability: delete a slot.
 pub const SYS_CAP_DELETE: u64 = 31;

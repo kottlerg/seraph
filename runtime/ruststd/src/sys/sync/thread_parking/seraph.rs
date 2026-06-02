@@ -1,10 +1,10 @@
 // seraph-overlay: std::sys::sync::thread_parking::seraph
 //
 // Per-Parker AtomicU32 state (EMPTY / NOTIFIED / PARKED) backed by a
-// lazily-allocated Signal cap. Patterned after `sync/thread_parking/
-// futex.rs` but using `SYS_SIGNAL_WAIT` (kernel cap-based, no address
+// lazily-allocated Notification cap. Patterned after `sync/thread_parking/
+// futex.rs` but using `SYS_NOTIFICATION_WAIT` (kernel cap-based, no address
 // expectation) in place of a futex. `park_timeout` uses the timeout
-// variant (`signal_wait_timeout`, backed by `SYS_SIGNAL_WAIT` with
+// variant (`notification_wait_timeout`, backed by `SYS_NOTIFICATION_WAIT` with
 // `arg1 = ms`) so a concurrent `unpark` still wakes us early and the
 // timer path wakes us otherwise.
 
@@ -21,7 +21,7 @@ const PARKED: u32 = 2;
 
 pub struct Parker {
     state: AtomicU32,
-    signal: AtomicU32,
+    notification: AtomicU32,
 }
 
 impl Parker {
@@ -29,7 +29,7 @@ impl Parker {
     /// `parker` must be a properly-aligned, writable `*mut Parker`.
     pub unsafe fn new_in_place(parker: *mut Parker) {
         unsafe {
-            parker.write(Self { state: AtomicU32::new(EMPTY), signal: AtomicU32::new(0) });
+            parker.write(Self { state: AtomicU32::new(EMPTY), notification: AtomicU32::new(0) });
         }
     }
 
@@ -39,7 +39,7 @@ impl Parker {
         if self.state.swap(EMPTY, Acquire) == NOTIFIED {
             return;
         }
-        let sig = ensure_signal(&self.signal);
+        let sig = ensure_notification(&self.notification);
         loop {
             match self.state.compare_exchange(EMPTY, PARKED, AcqRel, Acquire) {
                 Ok(_) => {}
@@ -50,7 +50,7 @@ impl Parker {
                 Err(_) => continue,
             }
             if sig != 0 {
-                let _ = syscall::signal_wait(sig);
+                let _ = syscall::notification_wait(sig);
             } else {
                 core::hint::spin_loop();
             }
@@ -67,9 +67,9 @@ impl Parker {
         if self.state.swap(EMPTY, Acquire) == NOTIFIED {
             return;
         }
-        // Publish PARKED so a concurrent `unpark` sees we want the signal.
+        // Publish PARKED so a concurrent `unpark` sees we want the notification.
         let _ = self.state.compare_exchange(EMPTY, PARKED, AcqRel, Acquire);
-        let sig = ensure_signal(&self.signal);
+        let sig = ensure_notification(&self.notification);
         // Round the Duration to millisecond resolution. Guard against the
         // `timeout_ms == 0` special case: the syscall treats 0 as "block
         // indefinitely", which is the opposite of what `Duration::ZERO`
@@ -80,7 +80,7 @@ impl Parker {
         }
         let ms = u64::try_from(ms).unwrap_or(u64::MAX);
         if sig != 0 && ms != 0 {
-            let _ = syscall::signal_wait_timeout(sig, ms);
+            let _ = syscall::notification_wait_timeout(sig, ms);
         } else if ms == 0 {
             // Zero-duration park — don't block.
         } else {
@@ -93,9 +93,9 @@ impl Parker {
     #[inline]
     pub fn unpark(self: Pin<&Self>) {
         if self.state.swap(NOTIFIED, Release) == PARKED {
-            let sig = self.signal.load(Relaxed);
+            let sig = self.notification.load(Relaxed);
             if sig != 0 {
-                let _ = syscall::signal_send(sig, 1);
+                let _ = syscall::notification_send(sig, 1);
             }
         }
     }
@@ -103,14 +103,14 @@ impl Parker {
 
 impl Drop for Parker {
     fn drop(&mut self) {
-        let sig = *self.signal.get_mut();
+        let sig = *self.notification.get_mut();
         if sig != 0 {
             let _ = syscall::cap_delete(sig);
         }
     }
 }
 
-fn ensure_signal(slot: &AtomicU32) -> u32 {
+fn ensure_notification(slot: &AtomicU32) -> u32 {
     let existing = slot.load(Acquire);
     if existing != 0 {
         return existing;
@@ -118,7 +118,7 @@ fn ensure_signal(slot: &AtomicU32) -> u32 {
     let Some(slab) = crate::sys::alloc::seraph::object_slab_acquire(120) else {
         return 0;
     };
-    let Ok(fresh) = syscall::cap_create_signal(slab) else {
+    let Ok(fresh) = syscall::cap_create_notification(slab) else {
         return 0;
     };
     match slot.compare_exchange(0, fresh, AcqRel, Acquire) {

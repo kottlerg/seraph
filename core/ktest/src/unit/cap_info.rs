@@ -12,13 +12,13 @@
 //!
 //! Field coverage:
 //! - `CAP_INFO_TAG_RIGHTS` against several cap tags (`Frame`, `AddressSpace`,
-//!   `Signal`).
+//!   `Notification`).
 //! - `CAP_INFO_FRAME_*` against a Frame cap.
 //! - `CAP_INFO_CSPACE_*` against a `CSpace` cap.
 //! - Negative paths: null slot index (`InvalidCapability`) and tag-mismatched
 //!   selector (`InvalidArgument`).
 
-use syscall::{cap_create_cspace, cap_create_signal, cap_delete, cap_info};
+use syscall::{cap_create_cspace, cap_create_notification, cap_delete, cap_info};
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
     CAP_INFO_FRAME_AVAILABLE, CAP_INFO_FRAME_HAS_RETYPE, CAP_INFO_FRAME_SIZE, CAP_INFO_TAG_RIGHTS,
@@ -93,24 +93,25 @@ pub fn tag_rights_frame(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `cap_info(<signal cap>, CAP_INFO_TAG_RIGHTS)` reports `Signal` tag.
+/// `cap_info(<notification cap>, CAP_INFO_TAG_RIGHTS)` reports `Notification` tag.
 ///
-/// Allocates a fresh signal cap to verify the universal field works for
+/// Allocates a fresh notification cap to verify the universal field works for
 /// non-memory tags as well.
-pub fn tag_rights_signal(ctx: &TestContext) -> TestResult
+pub fn tag_rights_notification(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base).map_err(|_| "cap_create_signal failed")?;
-    let value =
-        cap_info(sig, CAP_INFO_TAG_RIGHTS).map_err(|_| "cap_info(signal, TAG_RIGHTS) failed")?;
+    let sig = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_notification failed")?;
+    let value = cap_info(sig, CAP_INFO_TAG_RIGHTS)
+        .map_err(|_| "cap_info(notification, TAG_RIGHTS) failed")?;
     let (tag, rights) = unpack_tag_rights(value);
-    cap_delete(sig).map_err(|_| "cap_delete(signal) failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete(notification) failed")?;
     if tag != TAG_SIGNAL
     {
-        return Err("cap_info on signal cap returned unexpected tag");
+        return Err("cap_info on notification cap returned unexpected tag");
     }
     if rights == 0
     {
-        return Err("cap_info on signal cap reported empty rights bitmask");
+        return Err("cap_info on notification cap reported empty rights bitmask");
     }
     Ok(())
 }
@@ -254,15 +255,16 @@ pub fn null_slot_invalid(_ctx: &TestContext) -> TestResult
 
 /// Tag-specific selector on a non-matching cap returns `InvalidArgument`.
 ///
-/// We use a freshly created `Signal` cap and ask for `FRAME_SIZE`.
+/// We use a freshly created `Notification` cap and ask for `FRAME_SIZE`.
 pub fn tag_mismatch_invalid_arg(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base).map_err(|_| "cap_create_signal failed")?;
+    let sig = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "cap_create_notification failed")?;
     let err = cap_info(sig, CAP_INFO_FRAME_SIZE);
-    cap_delete(sig).map_err(|_| "cap_delete(signal) failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete(notification) failed")?;
     if err != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("cap_info(signal, FRAME_SIZE) did not return InvalidArgument");
+        return Err("cap_info(notification, FRAME_SIZE) did not return InvalidArgument");
     }
     Ok(())
 }

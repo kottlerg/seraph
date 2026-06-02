@@ -816,8 +816,8 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: 88,
             split: false,
         }),
-        // Signal: 24 wrapper + 96 SignalState = 120 → BIN_128.
-        ObjectType::Signal => Some(DispatchEntry {
+        // Notification: 24 wrapper + 96 NotificationState = 120 → BIN_128.
+        ObjectType::Notification => Some(DispatchEntry {
             raw_bytes: 120,
             split: false,
         }),
@@ -968,7 +968,7 @@ mod tests
         assert!(!e.split);
         assert_eq!(round_to_class(e.raw_bytes), BIN_128);
 
-        let s = dispatch_for(ObjectType::Signal, 0).unwrap();
+        let s = dispatch_for(ObjectType::Notification, 0).unwrap();
         assert!(!s.split);
         assert_eq!(round_to_class(s.raw_bytes), BIN_128);
 

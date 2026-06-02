@@ -215,7 +215,7 @@ pub unsafe extern "C" fn switch(
         "ld s10,   96(a1)",
         "ld s11,  104(a1)",
         "ld a0,   112(a1)", // argument for first-entry threads
-        // ── Signal save complete (Release) ────────────────────────────────
+        // ── Notification save complete (Release) ────────────────────────────────
         // Set context_saved = 1 so a remote CPU spinning in schedule() can
         // proceed to load this thread's SavedState. The Release fence
         // ensures all prior stores (the register saves above) are globally

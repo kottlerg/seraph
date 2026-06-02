@@ -3,15 +3,15 @@
 
 // kernel/src/irq.rs
 
-//! Kernel IRQ routing table — maps interrupt lines to signal objects.
+//! Kernel IRQ routing table — maps interrupt lines to notification objects.
 //!
 //! When a device IRQ fires, the arch-specific interrupt handler calls
 //! [`dispatch_device_irq`] with the interrupt line number. This module
-//! looks up the registered [`SignalState`], masks the IRQ at the controller
+//! looks up the registered [`NotificationState`], masks the IRQ at the controller
 //! (preventing further delivery until the driver ACKs), ORs a notification
-//! bit into the signal, and wakes any blocked waiter.
+//! bit into the notification, and wakes any blocked waiter.
 //!
-//! Drivers register a signal via `SYS_IRQ_REGISTER` and re-enable delivery
+//! Drivers register a notification via `SYS_IRQ_REGISTER` and re-enable delivery
 //! via `SYS_IRQ_ACK` after handling.
 //!
 //! # Thread safety
@@ -20,13 +20,13 @@
 //! context and cannot spin on locks; atomic loads provide lock-free access.
 //!
 //! # Modification notes
-//! - To support multiple signals per IRQ line (e.g. shared interrupts): replace
+//! - To support multiple notifications per IRQ line (e.g. shared interrupts): replace
 //!   the single pointer with a small fixed-size list.
 
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::ipc::signal::SignalState;
+use crate::ipc::notification::NotificationState;
 
 // ── Routing table ─────────────────────────────────────────────────────────────
 
@@ -37,9 +37,9 @@ const MAX_IRQ: usize = 256;
 /// Per-IRQ routing entry.
 struct IrqRoute
 {
-    /// Atomic pointer to the `SignalState` to notify, or null if unregistered.
+    /// Atomic pointer to the `NotificationState` to notify, or null if unregistered.
     /// Uses Release/Acquire ordering for SMP-safe updates and reads.
-    signal: AtomicPtr<SignalState>,
+    notification: AtomicPtr<NotificationState>,
 }
 
 impl IrqRoute
@@ -47,7 +47,7 @@ impl IrqRoute
     const fn empty() -> Self
     {
         Self {
-            signal: AtomicPtr::new(null_mut()),
+            notification: AtomicPtr::new(null_mut()),
         }
     }
 }
@@ -66,23 +66,23 @@ static IRQ_TABLE: [IrqRoute; MAX_IRQ] = {
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-/// Register `signal` to receive notifications for interrupt line `irq`.
+/// Register `notification` to receive notifications for interrupt line `irq`.
 ///
 /// Replaces any previous registration for the same line using atomic Release
 /// ordering, ensuring visibility to all CPUs that later load the pointer.
 ///
 /// # Safety
 /// - `irq` must be < [`MAX_IRQ`].
-/// - `signal` must be a valid, live `SignalState` pointer (or null to clear).
+/// - `notification` must be a valid, live `NotificationState` pointer (or null to clear).
 #[cfg(not(test))]
-pub unsafe fn register(irq: u32, signal: *mut SignalState)
+pub unsafe fn register(irq: u32, notification: *mut NotificationState)
 {
     debug_assert!((irq as usize) < MAX_IRQ, "irq out of range");
     // SAFETY: index is bounds-checked by debug_assert; Release ordering ensures
     // the stored pointer becomes visible to all CPUs that Acquire-load it.
     IRQ_TABLE[irq as usize]
-        .signal
-        .store(signal, Ordering::Release);
+        .notification
+        .store(notification, Ordering::Release);
 }
 
 /// Clear the routing entry for `irq` (called when the Interrupt cap is freed).
@@ -96,31 +96,31 @@ pub unsafe fn unregister(irq: u32)
     // SAFETY: index is bounds-checked by debug_assert; Release ordering ensures
     // the null write becomes visible to all CPUs.
     IRQ_TABLE[irq as usize]
-        .signal
+        .notification
         .store(null_mut(), Ordering::Release);
 }
 
-/// Clear all routing entries that point to `signal` (called when a Signal
+/// Clear all routing entries that point to `notification` (called when a Notification
 /// object is being freed). Prevents use-after-free if a hardware IRQ fires
-/// after the `SignalState` has been deallocated.
+/// after the `NotificationState` has been deallocated.
 ///
-/// O(`MAX_IRQ`) scan; acceptable since signal deallocation is infrequent.
+/// O(`MAX_IRQ`) scan; acceptable since notification deallocation is infrequent.
 ///
 /// # Safety
-/// - `signal` must be a valid (still live) `SignalState` pointer.
+/// - `notification` must be a valid (still live) `NotificationState` pointer.
 #[cfg(not(test))]
-pub unsafe fn unregister_signal(signal: *mut SignalState)
+pub unsafe fn unregister_notification(notification: *mut NotificationState)
 {
     for (i, entry) in IRQ_TABLE.iter().enumerate()
     {
         // SAFETY: Acquire ordering ensures we see the latest stored pointer value.
         // Pointer equality check is safe even if the pointer is dangling (no deref).
-        let current = entry.signal.load(Ordering::Acquire);
-        if core::ptr::eq(current, signal)
+        let current = entry.notification.load(Ordering::Acquire);
+        if core::ptr::eq(current, notification)
         {
             // SAFETY: Release ordering ensures the null write becomes visible to
             // all CPUs. Index is in bounds (iterator over IRQ_TABLE).
-            entry.signal.store(null_mut(), Ordering::Release);
+            entry.notification.store(null_mut(), Ordering::Release);
             // Mask the IRQ line since there's no longer a handler.
             // i is always < MAX_IRQ (= 256) which fits u32.
             #[allow(clippy::cast_possible_truncation)]
@@ -129,18 +129,18 @@ pub unsafe fn unregister_signal(signal: *mut SignalState)
     }
 }
 
-/// Dispatch a hardware interrupt for `irq` to its registered signal.
+/// Dispatch a hardware interrupt for `irq` to its registered notification.
 ///
 /// Called from the arch-specific device IRQ stub (x86-64: vectors 33–55;
 /// RISC-V: PLIC external interrupt handler) with interrupts disabled.
 ///
 /// Flow:
 /// 1. Mask the IRQ at the controller (prevents re-entry until ACK).
-/// 2. OR notification bit 0 into the registered signal.
+/// 2. OR notification bit 0 into the registered notification.
 /// 3. If a waiter was unblocked, enqueue it on the scheduler.
 /// 4. Acknowledge at the controller (send EOI / PLIC complete).
 ///
-/// If no signal is registered, the IRQ is silently dropped (masked; no ACK).
+/// If no notification is registered, the IRQ is silently dropped (masked; no ACK).
 ///
 /// # Safety
 /// Must only be called from interrupt context with interrupts disabled.
@@ -154,7 +154,7 @@ pub unsafe fn dispatch_device_irq(irq: u32)
 
     // SAFETY: index is bounds-checked; Acquire ordering ensures we see the
     // latest pointer stored by register/unregister on any CPU.
-    let sig_ptr = IRQ_TABLE[irq as usize].signal.load(Ordering::Acquire);
+    let sig_ptr = IRQ_TABLE[irq as usize].notification.load(Ordering::Acquire);
     if sig_ptr.is_null()
     {
         // No handler registered — mask and drop. Must still acknowledge at the
@@ -170,18 +170,18 @@ pub unsafe fn dispatch_device_irq(irq: u32)
     // is slow to ACK. The driver calls SYS_IRQ_ACK to unmask.
     crate::arch::current::interrupts::mask(irq);
 
-    // Deliver one notification bit into the signal. Bit 0 is used for
-    // single-IRQ-per-signal registration (the standard case).
+    // Deliver one notification bit into the notification. Bit 0 is used for
+    // single-IRQ-per-notification registration (the standard case).
     // SAFETY: sig_ptr is valid and non-null; interrupts are disabled.
-    let woken = unsafe { crate::ipc::signal::signal_send(sig_ptr, 1) };
+    let woken = unsafe { crate::ipc::notification::notification_send(sig_ptr, 1) };
 
     // Acknowledge at the interrupt controller (EOI / PLIC complete).
     crate::arch::current::interrupts::acknowledge(irq);
 
-    // If signal_send woke a waiter, enqueue it so the scheduler picks it up.
+    // If notification_send woke a waiter, enqueue it so the scheduler picks it up.
     if let Some(tcb) = woken
     {
-        // SAFETY: tcb is a valid ThreadControlBlock pointer returned by signal_send.
+        // SAFETY: tcb is a valid ThreadControlBlock pointer returned by notification_send.
         let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
         // SAFETY: tcb and target_cpu are valid; enqueue_and_wake sends wakeup IPI if needed.
         unsafe {

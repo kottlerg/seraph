@@ -149,7 +149,7 @@ Emit "fatal: cannot build kernel page tables (OOM)" and halt.
    - CapabilitySlot (fixed size)
    - ThreadControlBlock (fixed size)
    - Endpoint (fixed size)
-   - Signal (fixed size)
+   - Notification (fixed size)
    - EventQueue header (fixed size; ring buffer body from size-class allocator)
    - WaitSet (fixed size)
    - AddressSpace (fixed size)

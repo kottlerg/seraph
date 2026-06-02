@@ -211,7 +211,7 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
 /// next death-EQ event with `INIT_REAP_CORRELATOR` triggers `run_reap`.
 ///
 /// Rejects when state is `None` (no preceding first round) or when
-/// already armed (re-arm is meaningless and signals a malformed
+/// already armed (re-arm is meaningless and notifications a malformed
 /// caller).
 pub fn handle_done(ipc_buf: *mut u64)
 {

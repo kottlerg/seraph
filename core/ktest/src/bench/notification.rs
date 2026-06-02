@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! Signal ping-pong round-trip benchmark.
+//! Notification ping-pong round-trip benchmark.
 //!
-//! Parent and child ping-pong via two signals. Per-iteration bracketing
+//! Parent and child ping-pong via two notifications. Per-iteration bracketing
 //! on the parent side.
 
-use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
+use syscall::{
+    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
+    thread_exit,
+};
 
 use super::{cycles_now, log_bench_header};
 use crate::{ChildStack, spawn};
 
 static mut BENCH_SIGNAL_STACK: ChildStack = ChildStack::ZERO;
 
-fn signal_pong_entry(arg: u64) -> !
+fn notification_pong_entry(arg: u64) -> !
 {
     let in_slot = (arg & 0xFFFF) as u32;
     let out_slot = ((arg >> 16) & 0xFFFF) as u32;
@@ -22,38 +25,38 @@ fn signal_pong_entry(arg: u64) -> !
 
     for _ in 0..n
     {
-        if signal_wait(in_slot).is_err()
+        if notification_wait(in_slot).is_err()
         {
             break;
         }
-        if signal_send(out_slot, 1).is_err()
+        if notification_send(out_slot, 1).is_err()
         {
             break;
         }
     }
-    signal_send(done_slot, 1).ok();
+    notification_send(done_slot, 1).ok();
     thread_exit()
 }
 
 // similar_names: ping/pong are intentionally paired names for the two directions.
 #[allow(clippy::similar_names)]
-pub(super) fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
+pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
 {
-    const RIGHTS_SIGNAL: u64 = 1 << 7;
+    const RIGHTS_NOTIFY: u64 = 1 << 7;
     const RIGHTS_WAIT: u64 = 1 << 8;
     let n = u64::from(iters);
 
-    let Ok(ping) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(ping) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         return;
     };
-    let Ok(pong) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(pong) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
     else
     {
         return;
@@ -69,12 +72,12 @@ pub(super) fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
     {
         return;
     };
-    let Ok(child_pong) = cap_copy(pong, child.cs, RIGHTS_SIGNAL)
+    let Ok(child_pong) = cap_copy(pong, child.cs, RIGHTS_NOTIFY)
     else
     {
         return;
     };
-    let Ok(child_done) = cap_copy(done, child.cs, RIGHTS_SIGNAL)
+    let Ok(child_done) = cap_copy(done, child.cs, RIGHTS_NOTIFY)
     else
     {
         return;
@@ -86,7 +89,7 @@ pub(super) fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
         | (n << 48);
     let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_SIGNAL_STACK));
 
-    if spawn::configure_and_start(&child, signal_pong_entry, stack_top, arg).is_err()
+    if spawn::configure_and_start(&child, notification_pong_entry, stack_top, arg).is_err()
     {
         return;
     }
@@ -98,11 +101,11 @@ pub(super) fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
     for _ in 0..n
     {
         let t0 = cycles_now();
-        if signal_send(ping, 1).is_err()
+        if notification_send(ping, 1).is_err()
         {
             break;
         }
-        if signal_wait(pong).is_err()
+        if notification_wait(pong).is_err()
         {
             break;
         }
@@ -119,9 +122,9 @@ pub(super) fn bench_signal_roundtrip(ctx: &crate::TestContext, iters: u32)
         total = total.saturating_add(delta);
         completed += 1;
     }
-    signal_wait(done).ok();
+    notification_wait(done).ok();
 
-    log_bench_header("signal_roundtrip", iters);
+    log_bench_header("notification_roundtrip", iters);
     if let Some(mean) = total.checked_div(completed)
     {
         crate::log_u64("ktest: bench  cycles_min=", min);

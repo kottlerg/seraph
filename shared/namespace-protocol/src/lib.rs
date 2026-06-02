@@ -196,7 +196,7 @@ pub trait NamespaceBackend
 
     /// Return the entry at zero-based index `idx` within `dir`. The
     /// crate iterates by incrementing `idx` until the backend returns
-    /// `Ok(None)`, signalling end-of-directory.
+    /// `Ok(None)`, notifying end-of-directory.
     ///
     /// # Errors
     ///
@@ -243,7 +243,7 @@ pub trait NamespaceBackend
     fn release_frame(&mut self, file: NodeId, cookie: u64);
 
     /// Best-effort cleanup hint when a holder is closing its cap on
-    /// `node`. Cap revocation is the authoritative lifetime signal;
+    /// `node`. Cap revocation is the authoritative lifetime notification;
     /// `close` allows backends to drop cached state opportunistically.
     fn close(&mut self, node: NodeId);
 }

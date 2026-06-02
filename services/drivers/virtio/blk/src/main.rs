@@ -476,7 +476,7 @@ pub struct BlkRuntime<'a>
     pub vq: &'a mut SplitVirtqueue,
     pub transport: &'a PciTransport,
     pub queue_notify_off: u16,
-    pub irq_signal: u32,
+    pub irq_notification: u32,
     pub irq_cap: u32,
     /// Un-badged `SEND_GRANT` cap on this driver's service endpoint;
     /// kept so `handle_register_partition` can `cap_derive_badge` per-
@@ -665,7 +665,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
         rt.vq,
         rt.transport,
         rt.queue_notify_off,
-        rt.irq_signal,
+        rt.irq_notification,
         rt.irq_cap,
     )
     {
@@ -802,7 +802,7 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
         rt.vq,
         rt.transport,
         rt.queue_notify_off,
-        rt.irq_signal,
+        rt.irq_notification,
         rt.irq_cap,
     )
     {
@@ -1032,20 +1032,20 @@ fn main() -> !
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     std::os::seraph::log!("device ready");
 
-    // Set up IRQ-driven completion: create a signal and bind it to the IRQ.
+    // Set up IRQ-driven completion: create a notification and bind it to the IRQ.
     if caps.irq_slot == 0
     {
         std::os::seraph::log!("no IRQ cap, cannot operate");
         syscall::thread_exit();
     }
-    let Some(irq_signal) = std::os::seraph::object_slab_acquire(120)
-        .and_then(|slab| syscall::cap_create_signal(slab).ok())
+    let Some(irq_notification) = std::os::seraph::object_slab_acquire(120)
+        .and_then(|slab| syscall::cap_create_notification(slab).ok())
     else
     {
-        std::os::seraph::log!("failed to create IRQ signal");
+        std::os::seraph::log!("failed to create IRQ notification");
         syscall::thread_exit();
     };
-    if syscall::irq_register(caps.irq_slot, irq_signal).is_err()
+    if syscall::irq_register(caps.irq_slot, irq_notification).is_err()
     {
         std::os::seraph::log!("irq_register failed");
         syscall::thread_exit();
@@ -1077,7 +1077,7 @@ fn main() -> !
         vq: &mut vq,
         transport: &transport,
         queue_notify_off,
-        irq_signal,
+        irq_notification,
         irq_cap,
         service_ep: caps.service_ep,
         partitions: PartitionTable::new(),

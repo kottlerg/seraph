@@ -1,25 +1,25 @@
 // seraph-overlay: std::sys::sync::mutex::seraph
 //
-// Futex-style three-state Mutex backed by a lazily-allocated Signal cap.
+// Futex-style three-state Mutex backed by a lazily-allocated Notification cap.
 // Uncontended lock/unlock is a single CAS on `state`. Contention allocates
-// a Signal (once per Mutex, cached in `signal`) and blocks via
-// `SYS_SIGNAL_WAIT`; the releasing thread wakes one waiter via
-// `SYS_SIGNAL_SEND`. Matches the state machine of upstream
+// a Notification (once per Mutex, cached in `notification`) and blocks via
+// `SYS_NOTIFICATION_WAIT`; the releasing thread wakes one waiter via
+// `SYS_NOTIFICATION_SEND`. Matches the state machine of upstream
 // `sync/mutex/futex.rs` with one structural deviation.
 //
-// Seraph's Signal cap is a separately-allocated kernel object (unlike
+// Seraph's Notification cap is a separately-allocated kernel object (unlike
 // upstream futex where the state atom address IS the wait key), so the
 // slot is populated lazily on first contention. The contender in
-// `lock_contended` installs the Signal cap BEFORE publishing `CONTENDED`
+// `lock_contended` installs the Notification cap BEFORE publishing `CONTENDED`
 // so that any concurrent `unlock` observing `CONTENDED` is guaranteed to
 // see a non-zero slot and deliver the wake. Skipping this step allowed
 // a lost-wakeup deadlock when the slot was populated after the unlock's
 // check — `threading_phase` intermittently parked one worker on a cap
-// nobody would ever signal.
+// nobody would ever notification.
 //
 // `swap` on `state` uses `AcqRel`: Release publishes the install (and
 // any critical-section stores on unlock); Acquire synchronizes with the
-// other side's Release so the subsequent `signal` load is guaranteed to
+// other side's Release so the subsequent `notification` load is guaranteed to
 // observe the install on weak-memory architectures (RVWMO).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -33,13 +33,13 @@ const CONTENDED: u32 = 2;
 
 pub struct Mutex {
     state: AtomicU32,
-    signal: AtomicU32,
+    notification: AtomicU32,
 }
 
 impl Mutex {
     #[inline]
     pub const fn new() -> Self {
-        Self { state: AtomicU32::new(UNLOCKED), signal: AtomicU32::new(0) }
+        Self { state: AtomicU32::new(UNLOCKED), notification: AtomicU32::new(0) }
     }
 
     #[inline]
@@ -62,16 +62,16 @@ impl Mutex {
         {
             return;
         }
-        // Install the Signal cap BEFORE publishing `CONTENDED` so a
+        // Install the Notification cap BEFORE publishing `CONTENDED` so a
         // concurrent unlock that observes `CONTENDED` is guaranteed to see
         // a non-zero slot and deliver the wake.
-        let sig = ensure_signal(&self.signal);
+        let sig = ensure_notification(&self.notification);
         loop {
             if state != CONTENDED && self.state.swap(CONTENDED, AcqRel) == UNLOCKED {
                 return;
             }
             if sig != 0 {
-                let _ = syscall::signal_wait(sig);
+                let _ = syscall::notification_wait(sig);
             } else {
                 core::hint::spin_loop();
             }
@@ -97,9 +97,9 @@ impl Mutex {
     #[inline]
     pub unsafe fn unlock(&self) {
         if self.state.swap(UNLOCKED, AcqRel) == CONTENDED {
-            let sig = self.signal.load(Relaxed);
+            let sig = self.notification.load(Relaxed);
             if sig != 0 {
-                let _ = syscall::signal_send(sig, 1);
+                let _ = syscall::notification_send(sig, 1);
             }
         }
     }
@@ -107,16 +107,16 @@ impl Mutex {
 
 impl Drop for Mutex {
     fn drop(&mut self) {
-        let sig = *self.signal.get_mut();
+        let sig = *self.notification.get_mut();
         if sig != 0 {
             let _ = syscall::cap_delete(sig);
         }
     }
 }
 
-/// Lazily allocate a Signal cap on first contention. Returns 0 if allocation
+/// Lazily allocate a Notification cap on first contention. Returns 0 if allocation
 /// fails; callers fall back to busy-spinning.
-fn ensure_signal(slot: &AtomicU32) -> u32 {
+fn ensure_notification(slot: &AtomicU32) -> u32 {
     let existing = slot.load(Acquire);
     if existing != 0 {
         return existing;
@@ -124,7 +124,7 @@ fn ensure_signal(slot: &AtomicU32) -> u32 {
     let Some(slab) = crate::sys::alloc::seraph::object_slab_acquire(120) else {
         return 0;
     };
-    let Ok(fresh) = syscall::cap_create_signal(slab) else {
+    let Ok(fresh) = syscall::cap_create_notification(slab) else {
         return 0;
     };
     match slot.compare_exchange(0, fresh, AcqRel, Acquire) {

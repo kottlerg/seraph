@@ -4,16 +4,16 @@
 //   * low 30 bits — reader count (up to `MAX_READERS`).
 //   * bit 30       — writer bit (set while a writer holds the lock).
 //   * bit 31       — waiters bit (at least one thread has parked or is about
-//                    to park on the lazy Signal).
+//                    to park on the lazy Notification).
 //
-// Blocking waiters share one Signal cap. `signal_send` wakes exactly one,
+// Blocking waiters share one Notification cap. `notification_send` wakes exactly one,
 // so we rely on a chain-wake pattern: every unlock that observes the
-// waiters bit does one `signal_send`; the awoken thread either takes the
+// waiters bit does one `notification_send`; the awoken thread either takes the
 // lock (and eventually unlocks, triggering the next wake) or re-parks,
 // re-asserting the waiters bit. The design is simple but serialises
 // waiters; good enough until contention profiles force a richer queue.
 //
-// Readers and writers park on the same Signal, so a wake_one may pick
+// Readers and writers park on the same Notification, so a wake_one may pick
 // either a reader or a writer. A waking reader that acquires a shared
 // lock before queued writers is the standard "reader preference" tradeoff.
 
@@ -29,13 +29,13 @@ const MAX_READERS: u32 = READER_MASK - 1;
 
 pub struct RwLock {
     state: AtomicU32,
-    signal: AtomicU32,
+    notification: AtomicU32,
 }
 
 impl RwLock {
     #[inline]
     pub const fn new() -> Self {
-        Self { state: AtomicU32::new(0), signal: AtomicU32::new(0) }
+        Self { state: AtomicU32::new(0), notification: AtomicU32::new(0) }
     }
 
     #[inline]
@@ -68,14 +68,14 @@ impl RwLock {
 
     #[cold]
     fn read_contended(&self) {
-        let sig = ensure_signal(&self.signal);
+        let sig = ensure_notification(&self.notification);
         loop {
             if self.try_read_fast() {
                 return;
             }
             self.state.fetch_or(WAITERS_BIT, Release);
             if sig != 0 {
-                let _ = syscall::signal_wait(sig);
+                let _ = syscall::notification_wait(sig);
             } else {
                 core::hint::spin_loop();
             }
@@ -96,7 +96,7 @@ impl RwLock {
 
     #[cold]
     fn write_contended(&self) {
-        let sig = ensure_signal(&self.signal);
+        let sig = ensure_notification(&self.notification);
         loop {
             let cur = self.state.load(Relaxed);
             if cur & (WRITER_BIT | READER_MASK) == 0
@@ -109,7 +109,7 @@ impl RwLock {
             }
             self.state.fetch_or(WAITERS_BIT, Release);
             if sig != 0 {
-                let _ = syscall::signal_wait(sig);
+                let _ = syscall::notification_wait(sig);
             } else {
                 core::hint::spin_loop();
             }
@@ -152,23 +152,23 @@ impl RwLock {
 
     #[cold]
     fn wake_one(&self) {
-        let sig = self.signal.load(Relaxed);
+        let sig = self.notification.load(Relaxed);
         if sig != 0 {
-            let _ = syscall::signal_send(sig, 1);
+            let _ = syscall::notification_send(sig, 1);
         }
     }
 }
 
 impl Drop for RwLock {
     fn drop(&mut self) {
-        let sig = *self.signal.get_mut();
+        let sig = *self.notification.get_mut();
         if sig != 0 {
             let _ = syscall::cap_delete(sig);
         }
     }
 }
 
-fn ensure_signal(slot: &AtomicU32) -> u32 {
+fn ensure_notification(slot: &AtomicU32) -> u32 {
     let existing = slot.load(Acquire);
     if existing != 0 {
         return existing;
@@ -176,7 +176,7 @@ fn ensure_signal(slot: &AtomicU32) -> u32 {
     let Some(slab) = crate::sys::alloc::seraph::object_slab_acquire(120) else {
         return 0;
     };
-    let Ok(fresh) = syscall::cap_create_signal(slab) else {
+    let Ok(fresh) = syscall::cap_create_notification(slab) else {
         return 0;
     };
     match slot.compare_exchange(0, fresh, AcqRel, Acquire) {

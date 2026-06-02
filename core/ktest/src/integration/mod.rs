@@ -20,7 +20,7 @@
 //! Files:
 //! - `thread_lifecycle.rs`       — full thread lifecycle end-to-end
 //! - `cap_transfer.rs`           — capability rights through an IPC endpoint round-trip
-//! - `wait_concurrency.rs`       — wait set with simultaneous signal and queue sources
+//! - `wait_concurrency.rs`       — wait set with simultaneous notification and queue sources
 //! - `memory_lifecycle.rs`       — frame split → map → protect → unmap with state checks
 //! - `multi_caller_ipc_fifo.rs`  — endpoint send-queue FIFO ordering with three concurrent callers
 //! - `cap_delegation_chain.rs`   — multi-level rights attenuation and cascaded revocation

@@ -109,7 +109,7 @@ until implemented.
 - `FB_CLEAR` — clear the framebuffer to a caller-supplied colour.
 - `FB_SET_CURSOR` — move the text cursor to a (col, row) cell.
 - `FB_BLIT_RECT` — blit a caller-supplied pixel buffer into a rectangle.
-- `FB_REGISTER_RESIZE_NOTIFY` — register a signal cap kicked on geometry change.
+- `FB_REGISTER_RESIZE_NOTIFY` — register a notification cap kicked on geometry change.
 - `FB_SET_PALETTE` — set the foreground/background colour palette.
 
 Multi-head dispatch (v1 binds the single bootloader-handed framebuffer)

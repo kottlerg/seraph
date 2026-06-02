@@ -137,7 +137,7 @@ pub enum CapTag
     Frame         = 1,
     AddressSpace  = 2,
     Endpoint      = 3,
-    Signal        = 4,
+    Notification        = 4,
     EventQueue    = 5,
     Thread        = 6,
     CSpace        = 7,   // capability space; explicit kernel object
@@ -171,8 +171,8 @@ bitflags! {
         const RECEIVE    = 1 << 4;
         const GRANT      = 1 << 5;
 
-        // Signal rights
-        const SIGNAL     = 1 << 6;
+        // Notification rights
+        const NOTIFY     = 1 << 6;
         const WAIT       = 1 << 7;
 
         // Event queue rights
@@ -226,7 +226,7 @@ mapping — no page may be simultaneously writable and executable.
 
 ### Kernel Object Reference Counting
 
-Each kernel object (Endpoint, Signal, EventQueue, etc.) has an embedded reference
+Each kernel object (Endpoint, Notification, EventQueue, etc.) has an embedded reference
 count representing the number of capability slots that point to it:
 
 ```rust
@@ -246,7 +246,7 @@ membership is one such owner: `sys_wait_set_add` `inc_ref`s the source's
 header under the source's lock together with the back-pointer publication;
 `sys_wait_set_remove` and `wait_set_drop` perform the matching `dec_ref`. The
 source's state therefore outlives every wait-set member referencing it; the
-Endpoint/Signal/EventQueue dealloc arms only `debug_assert` that
+Endpoint/Notification/EventQueue dealloc arms only `debug_assert` that
 `state.wait_set` is null on entry (the invariant follows from the refcount).
 
 ---

@@ -5,18 +5,18 @@
 // children spawned with piped stdio.
 //
 // Each pipe is one 4 KiB shmem frame holding a `shmem::SpscHeader` plus
-// a power-of-two byte ring, plus two signal caps:
+// a power-of-two byte ring, plus two notification caps:
 //
-//   * data_signal  — writer kicks reader after producing bytes; reader
+//   * data_notification  — writer kicks reader after producing bytes; reader
 //                    waits on this when the ring is empty.
-//   * space_signal — reader kicks writer after consuming bytes; writer
+//   * space_notification — reader kicks writer after consuming bytes; writer
 //                    waits on this when the ring is full.
 //
 // Each `Pipe` instance represents one end (Reader or Writer). Both ends
-// hold caps to all three objects (the same frame and both signals are
+// hold caps to all three objects (the same frame and both notifications are
 // mapped/copied into both processes' CSpaces); read/write logic drives
-// the appropriate signal direction. EOF/BrokenPipe is signalled via
-// the header's `closed` flag, set on Drop with one final signal kick
+// the appropriate notification direction. EOF/BrokenPipe is notified via
+// the header's `closed` flag, set on Drop with one final notification kick
 // so the surviving peer wakes and observes the flag.
 //
 // `pipe()` itself returns `Unsupported`: the symmetric upstream
@@ -90,14 +90,14 @@ pub enum Role {
 #[derive(Clone, Copy)]
 pub struct PipeCaps {
     pub frame: u32,
-    pub data_signal: u32,
-    pub space_signal: u32,
+    pub data_notification: u32,
+    pub space_notification: u32,
 }
 
 /// One end of a shmem-backed pipe.
 ///
 /// Read and write operations are non-blocking on partial progress and
-/// block (via `signal_wait`) only when the ring is empty (reader) or
+/// block (via `notification_wait`) only when the ring is empty (reader) or
 /// full (writer). EOF / BrokenPipe is observed via the ring header's
 /// `closed` flag, set by the peer's `Drop`, OR via the parent-side
 /// `peer_dead` flag set by the spawner's death-bridge thread when the
@@ -105,8 +105,8 @@ pub struct PipeCaps {
 pub struct Pipe {
     frame_cap: u32,
     ring_vaddr: u64,
-    data_signal: u32,
-    space_signal: u32,
+    data_notification: u32,
+    space_notification: u32,
     role: Role,
     aspace: u32,
     /// True when this end allocated its VA from the parent slot pool
@@ -154,7 +154,7 @@ impl Pipe {
         unsafe { SpscReader::from_raw(self.ring_vaddr) }
     }
 
-    /// Allocate a fresh shmem frame + two signals, map the frame at a
+    /// Allocate a fresh shmem frame + two notifications, map the frame at a
     /// parent-side VA, initialise the ring header, and build the
     /// parent-side `Pipe` for `parent_role`. Returns the parent-side
     /// `Pipe` plus the cap triple to install in the child via
@@ -202,9 +202,9 @@ impl Pipe {
             // Allocator failure here is rare (memmgr unreachable / OOM).
             io::Error::other("seraph pipe: object_slab_acquire (data) failed")
         });
-        let data_signal = match data_slab.and_then(|slab| {
-            syscall::cap_create_signal(slab)
-                .map_err(|_| io::Error::other("seraph pipe: cap_create_signal (data) failed"))
+        let data_notification = match data_slab.and_then(|slab| {
+            syscall::cap_create_notification(slab)
+                .map_err(|_| io::Error::other("seraph pipe: cap_create_notification (data) failed"))
         }) {
             Ok(s) => s,
             Err(e) => {
@@ -217,13 +217,13 @@ impl Pipe {
         let space_slab = crate::sys::alloc::seraph::object_slab_acquire(120).ok_or_else(|| {
             io::Error::other("seraph pipe: object_slab_acquire (space) failed")
         });
-        let space_signal = match space_slab.and_then(|slab| {
-            syscall::cap_create_signal(slab)
-                .map_err(|_| io::Error::other("seraph pipe: cap_create_signal (space) failed"))
+        let space_notification = match space_slab.and_then(|slab| {
+            syscall::cap_create_notification(slab)
+                .map_err(|_| io::Error::other("seraph pipe: cap_create_notification (space) failed"))
         }) {
             Ok(s) => s,
             Err(e) => {
-                let _ = syscall::cap_delete(data_signal);
+                let _ = syscall::cap_delete(data_notification);
                 drop(sb);
                 let _ = syscall::cap_delete(frame_cap);
                 free_parent_va(parent_va);
@@ -244,8 +244,8 @@ impl Pipe {
         let frame_handoff = match syscall::cap_derive(frame_cap, syscall::RIGHTS_MAP_RW) {
             Ok(s) => s,
             Err(_) => {
-                let _ = syscall::cap_delete(space_signal);
-                let _ = syscall::cap_delete(data_signal);
+                let _ = syscall::cap_delete(space_notification);
+                let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(frame_cap);
                 free_parent_va(parent_va);
@@ -254,12 +254,12 @@ impl Pipe {
                 ));
             }
         };
-        let data_handoff = match syscall::cap_derive(data_signal, syscall::RIGHTS_ALL) {
+        let data_handoff = match syscall::cap_derive(data_notification, syscall::RIGHTS_ALL) {
             Ok(s) => s,
             Err(_) => {
                 let _ = syscall::cap_delete(frame_handoff);
-                let _ = syscall::cap_delete(space_signal);
-                let _ = syscall::cap_delete(data_signal);
+                let _ = syscall::cap_delete(space_notification);
+                let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(frame_cap);
                 free_parent_va(parent_va);
@@ -268,13 +268,13 @@ impl Pipe {
                 ));
             }
         };
-        let space_handoff = match syscall::cap_derive(space_signal, syscall::RIGHTS_ALL) {
+        let space_handoff = match syscall::cap_derive(space_notification, syscall::RIGHTS_ALL) {
             Ok(s) => s,
             Err(_) => {
                 let _ = syscall::cap_delete(data_handoff);
                 let _ = syscall::cap_delete(frame_handoff);
-                let _ = syscall::cap_delete(space_signal);
-                let _ = syscall::cap_delete(data_signal);
+                let _ = syscall::cap_delete(space_notification);
+                let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
                 let _ = syscall::cap_delete(frame_cap);
                 free_parent_va(parent_va);
@@ -288,8 +288,8 @@ impl Pipe {
             Pipe {
                 frame_cap,
                 ring_vaddr: parent_va,
-                data_signal,
-                space_signal,
+                data_notification,
+                space_notification,
                 role: parent_role,
                 aspace,
                 owns_parent_slot: true,
@@ -297,8 +297,8 @@ impl Pipe {
             },
             PipeCaps {
                 frame: frame_handoff,
-                data_signal: data_handoff,
-                space_signal: space_handoff,
+                data_notification: data_handoff,
+                space_notification: space_handoff,
             },
         ))
     }
@@ -309,8 +309,8 @@ impl Pipe {
     /// piped direction.
     pub fn attach_from_caps(
         frame_cap: u32,
-        data_signal: u32,
-        space_signal: u32,
+        data_notification: u32,
+        space_notification: u32,
         role: Role,
         aspace: u32,
         child_va: u64,
@@ -324,8 +324,8 @@ impl Pipe {
         Ok(Pipe {
             frame_cap,
             ring_vaddr: child_va,
-            data_signal,
-            space_signal,
+            data_notification,
+            space_notification,
             role,
             aspace,
             owns_parent_slot: false,
@@ -341,18 +341,18 @@ impl Pipe {
         self.peer_dead = Some(flag);
     }
 
-    /// Parent-side `data_signal` cap slot. Exposed for the death-bridge
-    /// thread to `signal_send` on, to wake any blocked reader after
+    /// Parent-side `data_notification` cap slot. Exposed for the death-bridge
+    /// thread to `notification_send` on, to wake any blocked reader after
     /// `peer_dead` is flipped.
-    pub fn data_signal_cap(&self) -> u32 {
-        self.data_signal
+    pub fn data_notification_cap(&self) -> u32 {
+        self.data_notification
     }
 
-    /// Parent-side `space_signal` cap slot. Symmetric to
-    /// `data_signal_cap`; the bridge kicks this to wake any blocked
+    /// Parent-side `space_notification` cap slot. Symmetric to
+    /// `data_notification_cap`; the bridge kicks this to wake any blocked
     /// writer.
-    pub fn space_signal_cap(&self) -> u32 {
-        self.space_signal
+    pub fn space_notification_cap(&self) -> u32 {
+        self.space_notification
     }
 
     /// Snapshot the abnormal-exit flag if attached.
@@ -384,7 +384,7 @@ impl Pipe {
             let n = reader.read(buf);
             if n > 0 {
                 // Wake any blocked writer that's waiting for space.
-                let _ = syscall::signal_send(self.space_signal, 1);
+                let _ = syscall::notification_send(self.space_notification, 1);
                 return Ok(n);
             }
             if self.header().is_closed() {
@@ -394,7 +394,7 @@ impl Pipe {
                 let mut reader = self.reader();
                 let n2 = reader.read(buf);
                 if n2 > 0 {
-                    let _ = syscall::signal_send(self.space_signal, 1);
+                    let _ = syscall::notification_send(self.space_notification, 1);
                     return Ok(n2);
                 }
                 return Ok(0);
@@ -402,18 +402,18 @@ impl Pipe {
             if self.peer_dead() {
                 // Peer process exited without running `Drop` (fault,
                 // abort). Bridge has flipped the flag and kicked our
-                // signal; ring may still hold buffered bytes the peer
+                // notification; ring may still hold buffered bytes the peer
                 // wrote before faulting, but we already drained above.
                 return Ok(0);
             }
-            if self.data_signal == 0 {
-                // No wakeup signal attached — fall back to immediate EOF
+            if self.data_notification == 0 {
+                // No wakeup notification attached — fall back to immediate EOF
                 // rather than spin (silent-drop init path).
                 return Ok(0);
             }
-            // Block until writer kicks the data signal, peer closes,
+            // Block until writer kicks the data notification, peer closes,
             // or the death bridge fires.
-            let _ = syscall::signal_wait(self.data_signal);
+            let _ = syscall::notification_wait(self.data_notification);
         }
     }
 
@@ -482,16 +482,16 @@ impl Pipe {
             let n = writer.write(buf);
             if n > 0 {
                 // Wake any blocked reader.
-                let _ = syscall::signal_send(self.data_signal, 1);
+                let _ = syscall::notification_send(self.data_notification, 1);
                 return Ok(n);
             }
-            if self.space_signal == 0 {
-                // No wakeup signal — drop bytes silently to avoid spin.
+            if self.space_notification == 0 {
+                // No wakeup notification — drop bytes silently to avoid spin.
                 return Ok(buf.len());
             }
-            // Block until reader kicks the space signal, peer closes,
+            // Block until reader kicks the space notification, peer closes,
             // or the death bridge fires.
-            let _ = syscall::signal_wait(self.space_signal);
+            let _ = syscall::notification_wait(self.space_notification);
         }
     }
 
@@ -523,19 +523,19 @@ impl Pipe {
 impl Drop for Pipe {
     fn drop(&mut self) {
         // Closer protocol: mark the ring closed, then send one final
-        // signal kick on the *opposite-direction* signal so the peer
-        // wakes from any blocking signal_wait and observes the flag.
+        // notification kick on the *opposite-direction* notification so the peer
+        // wakes from any blocking notification_wait and observes the flag.
         self.header().mark_closed();
         match self.role {
             Role::Reader =>
             {
-                // Wake writer (it's waiting on space_signal).
-                let _ = syscall::signal_send(self.space_signal, 1);
+                // Wake writer (it's waiting on space_notification).
+                let _ = syscall::notification_send(self.space_notification, 1);
             }
             Role::Writer =>
             {
-                // Wake reader (it's waiting on data_signal).
-                let _ = syscall::signal_send(self.data_signal, 1);
+                // Wake reader (it's waiting on data_notification).
+                let _ = syscall::notification_send(self.data_notification, 1);
             }
         }
         // Unmap the ring page from this process's aspace.
@@ -546,11 +546,11 @@ impl Drop for Pipe {
         if self.frame_cap != 0 {
             let _ = syscall::cap_delete(self.frame_cap);
         }
-        if self.data_signal != 0 {
-            let _ = syscall::cap_delete(self.data_signal);
+        if self.data_notification != 0 {
+            let _ = syscall::cap_delete(self.data_notification);
         }
-        if self.space_signal != 0 {
-            let _ = syscall::cap_delete(self.space_signal);
+        if self.space_notification != 0 {
+            let _ = syscall::cap_delete(self.space_notification);
         }
         if self.owns_parent_slot {
             free_parent_va(self.ring_vaddr);

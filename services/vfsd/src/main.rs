@@ -794,7 +794,7 @@ fn auto_mount_esp(rt: &VfsdRuntime, ipc_buf: *mut u64)
 /// `slot == 0` (sentinel for "no cap held"). Used at every `cap_delete`
 /// site whose failure would otherwise be operator-invisible: the kernel
 /// reports invalid-slot / table-corruption via the returned code and
-/// silent discards leak that signal.
+/// silent discards leak that notification.
 fn log_cap_delete(context: &str, slot: u32)
 {
     if slot == 0

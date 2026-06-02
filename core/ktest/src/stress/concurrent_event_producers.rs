@@ -15,8 +15,8 @@
 //! producer set and asserts each set is `0..MESSAGES_PER_PRODUCER`.
 
 use syscall::{
-    cap_copy, cap_create_signal, cap_delete, event_post, event_queue_create, event_recv,
-    signal_send, signal_wait, thread_exit,
+    cap_copy, cap_create_notification, cap_delete, event_post, event_queue_create, event_recv,
+    notification_send, notification_wait, thread_exit,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -29,8 +29,8 @@ const MESSAGES_PER_PRODUCER: u32 = 64;
 #[allow(clippy::cast_possible_truncation)]
 const TOTAL_MESSAGES: u32 = NUM_PRODUCERS as u32 * MESSAGES_PER_PRODUCER;
 
-/// SIGNAL right (send) only.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+/// NOTIFY right (send) only.
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 /// `EventQueue` POST right (bit 9 per the kernel).
 const RIGHTS_POST: u64 = 1 << 9;
 
@@ -56,7 +56,7 @@ fn producer_entry(arg: u64) -> !
             break;
         }
     }
-    signal_send(done_slot, 1u64 << producer_id).ok();
+    notification_send(done_slot, 1u64 << producer_id).ok();
     thread_exit()
 }
 
@@ -64,8 +64,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     let eq = event_queue_create(ctx.memory_frame_base, TOTAL_MESSAGES)
         .map_err(|_| "concurrent_event_producers: event_queue_create failed")?;
-    let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "concurrent_event_producers: cap_create_signal failed")?;
+    let done = cap_create_notification(ctx.memory_frame_base)
+        .map_err(|_| "concurrent_event_producers: cap_create_notification failed")?;
 
     let mut threads = [0u32; NUM_PRODUCERS];
     let mut cspaces = [0u32; NUM_PRODUCERS];
@@ -76,7 +76,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "concurrent_event_producers: spawn::new_child failed")?;
         let child_eq = cap_copy(eq, child.cs, RIGHTS_POST)
             .map_err(|_| "concurrent_event_producers: cap_copy queue failed")?;
-        let child_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
+        let child_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
             .map_err(|_| "concurrent_event_producers: cap_copy done failed")?;
         let arg = u64::from(child_eq) | (u64::from(child_done) << 16) | ((i as u64) << 32);
 
@@ -116,12 +116,12 @@ pub fn run(ctx: &TestContext) -> TestResult
         per_producer[producer_id][seq] = true;
     }
 
-    // Wait for all producers to signal done.
+    // Wait for all producers to notify done.
     let all_done = (1u64 << NUM_PRODUCERS) - 1;
     let mut done_bits: u64 = 0;
     while done_bits & all_done != all_done
     {
-        done_bits |= signal_wait(done).unwrap_or(0);
+        done_bits |= notification_wait(done).unwrap_or(0);
     }
 
     // Verify every producer's full sequence arrived.

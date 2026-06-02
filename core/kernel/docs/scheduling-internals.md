@@ -93,7 +93,7 @@ The transition table below pins every ThreadState write to a syscall/event, the 
 | `Ready` | `Stopped` | `sys_thread_stop` on a Ready target | calling CPU | `set_state_under_all_locks(Stopped)`; the helper also walks every CPU's run queue and calls `remove_from_queue` inside the all-locks region. See § *Stopped/Exited drain* below. |
 | `Blocked` | `Stopped` | `sys_thread_stop` on blocked target | calling CPU | `cancel_ipc_block` first (acquires the source IPC lock and unlinks the waiter), then `set_state_under_all_locks(Stopped)` |
 | `*` | `Exited` | `sys_thread_exit` (self) or fault handler | running CPU | `set_state_under_all_locks(Exited)` (on the dying CPU), then `schedule(false)` |
-| `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, snapshots `running_on`, releases all; then waits for both `sched.current != tcb` *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
+| `*` | `Exited` | `dealloc_object(Thread)` (refcount → 0) | calling CPU | acquires every CPU's scheduler.lock in ascending order, writes `Exited`, walks `remove_from_queue` for every CPU, releases all; then waits unconditionally for `sched.current != tcb` on *every* CPU *and* `tcb.context_saved == 1` (see Cross-CPU TCB Ownership) before freeing |
 
 All `Running→Blocked` parks MUST route through `commit_blocked_under_local_lock`; all `Blocked→Ready` wakes MUST route through `enqueue_and_wake`. Direct `(*tcb).state` writes from an IPC primitive — under the source lock or otherwise — are forbidden; they race `set_state_under_all_locks(Stopped)` and silently clobber Stopped.
 
@@ -235,14 +235,15 @@ Remote dequeue (after dequeue_highest returns this TCB):
   7. // saved_state is now safe to read on this CPU
 
 dealloc_object(Thread) (after the all-locks region releases):
-  8. if running_on == Some(cpu): spin until sched.current != tcb
+  8. loop { scan every cpu under its sched.lock; if some cpu.current == tcb,
+            spin on that cpu until cpu.current != tcb, then re-scan }  // unconditional, all-CPU
   9. while context_saved.load(Acquire) == 0 { spin_loop() }    // unconditional
  10. // safe to free TCB body and kernel stack
 ```
 
 Step 3.5 is the outgoing CPU's cross-CPU dispatch barrier: when this CPU is about to switch INTO `next`, it must observe `next.context_saved == 1` from the CPU that previously ran `next`. Step 3.5 MUST run with the local `sched.lock` already released (step 3). Holding the lock across the spin re-introduces issue #144's cross-CPU deadlock: a peer CPU's cross-CPU `enqueue_and_wake` (e.g. its own outgoing-branch re-enqueue) targets this CPU's lock; if this CPU is spinning on `next.context_saved` under the lock while waiting on the peer to publish, the peer cannot reach its own `switch()` and the cycle never breaks. Step 3.5 runs lockless on both arches.
 
-The Release in step 5 pairs with both the Acquire in step 6 (cross-CPU dequeue), the Acquire in step 3.5 (outgoing-CPU dispatch barrier), and the Acquire in step 9 (TCB free). Without step 9, the lock release at step 3 lets `dealloc_object(Thread)` observe `sched.current = idle` (set at step 2) *while step 4 is still writing into `tcb.saved_state`* — freeing the TCB at that point lets the next allocation reuse the memory and `switch()` then corrupts the new allocation. The check is unconditional on the result of `running_on`, because the all-locks `running_on` snapshot can race step 2/3 and miss the in-flight switch. New TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
+The Release in step 5 pairs with both the Acquire in step 6 (cross-CPU dequeue), the Acquire in step 3.5 (outgoing-CPU dispatch barrier), and the Acquire in step 9 (TCB free). Step 8 is the prerequisite: it scans *every* CPU and will not let the free proceed while any CPU still names `tcb` as `current`, so it does not rely on an all-locks `running_on` snapshot (which names at most one CPU and can be stale once the locks drop). Step 9 then closes the residual window step 8 cannot see: the lock release at step 3 lets a peer observe `sched.current = next` (set at step 2) *while step 4 is still writing into `tcb.saved_state`* — a CPU that has just switched *away* passes step 8 but its register save may still be in flight, and freeing the TCB there lets the next allocation reuse the memory while `switch()` corrupts it. Step 9 is unconditional; new TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
 
 **`context_saved = 1` and `popfq` ordering inside `context::switch` (issue #117).** Step 5 above hides a finer-grained ordering invariant inside the `switch()` asm itself. Both the `context_saved = 1` publication AND the `popfq` that restores `next.saved_state.rflags` (which may set `IF = 1`) MUST happen AFTER `mov rsp, [rsi + 8]` (the rsp swap to the next thread's kstack), not before it. Doing either earlier opens this window:
 1. `popfq` before the rsp swap re-enables interrupts while this CPU is still executing on the OUTGOING thread's kstack. A trap taken in that window pushes its iretq frame onto the outgoing kstack.

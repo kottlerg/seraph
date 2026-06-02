@@ -3,15 +3,15 @@
 
 //! Per-process release-handler thread for the seraph fs frame protocol.
 //!
-//! The fs driver evicts cached pages by sending `FS_RELEASE_FRAME` on
-//! a tokened SEND derived from the per-process release endpoint owned
+//! The fs driver evicts cached pages by sending `FS_RELEASE_MEMORY` on
+//! a badged SEND derived from the per-process release endpoint owned
 //! by this module. The SEND is transferred to the driver in `caps[0]`
-//! of the first [`fs_labels::FS_READ_FRAME`] request for each opened
+//! of the first [`fs_labels::FS_READ_MEMORY`] request for each opened
 //! file (see [`super::File::read_frame`]); from that point on the
 //! driver's eviction worker can route cooperative releases here. The
 //! handler removes the matching outstanding mapping from the
 //! per-`File` registry (race-safe against the local read path's
-//! immediate-release cleanup), unmaps the page, drops the frame cap,
+//! immediate-release cleanup), unmaps the page, drops the memory cap,
 //! returns the VA to the reservation arena, and replies
 //! [`fs_labels::FS_RELEASE_ACK`].
 //!
@@ -34,13 +34,13 @@ use crate::sys::reserve as pal_reserve;
 use crate::sys::reserve::ReservedRange;
 
 /// One outstanding cache-page mapping the local read path has obtained
-/// from the fs driver via `FS_READ_FRAME`. Carries everything the
+/// from the fs driver via `FS_READ_MEMORY`. Carries everything the
 /// release path (local or driver-initiated) needs to unmap and free.
 pub(super) struct OutstandingMapping
 {
     pub cookie: u64,
     pub range: ReservedRange,
-    pub frame_cap: u32,
+    pub memory_cap: u32,
 }
 
 /// Per-`File` registration entry held by the release handler under its
@@ -56,13 +56,13 @@ pub(super) struct FileEntry
 /// [`super::File::open`] call; held forever for the process lifetime.
 pub(super) struct ReleaseState
 {
-    /// Untokened endpoint cap owned by this process; tokened SENDs
+    /// Unbadged endpoint cap owned by this process; badged SENDs
     /// derived from it would live in fs's CSpace once a delivery
     /// channel exists. Revoking this cap (which we never do) would
     /// tear down every fs-side derived child atomically.
     release_ep: u32,
     registry: Mutex<BTreeMap<u64, Arc<FileEntry>>>,
-    next_token: AtomicU64,
+    next_badge: AtomicU64,
     /// Process aspace cap, captured at init for the handler's
     /// `mem_unmap` calls. Equal to `StartupInfo::self_aspace`.
     aspace: u32,
@@ -108,7 +108,7 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
         ReleaseState {
             release_ep,
             registry: Mutex::new(BTreeMap::new()),
-            next_token: AtomicU64::new(1),
+            next_badge: AtomicU64::new(1),
             aspace,
         }
     });
@@ -138,25 +138,25 @@ pub(super) fn state() -> Option<&'static ReleaseState>
     STATE.get()
 }
 
-/// Untokened endpoint cap the per-`File` SEND derivation hangs off.
+/// Unbadged endpoint cap the per-`File` SEND derivation hangs off.
 pub(super) fn release_endpoint(state: &ReleaseState) -> u32
 {
     state.release_ep
 }
 
-/// Allocate a fresh non-zero per-`File` token.
-pub(super) fn allocate_token(state: &ReleaseState) -> u64
+/// Allocate a fresh non-zero per-`File` badge.
+pub(super) fn allocate_badge(state: &ReleaseState) -> u64
 {
-    let mut t = state.next_token.fetch_add(1, Ordering::Relaxed);
+    let mut t = state.next_badge.fetch_add(1, Ordering::Relaxed);
     while t == 0
     {
-        t = state.next_token.fetch_add(1, Ordering::Relaxed);
+        t = state.next_badge.fetch_add(1, Ordering::Relaxed);
     }
     t
 }
 
 /// Register a `File` with the handler, returning its `FileEntry`.
-pub(super) fn register(state: &ReleaseState, token: u64) -> Arc<FileEntry>
+pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
 {
     let entry = Arc::new(FileEntry {
         mappings: Mutex::new(Vec::new()),
@@ -165,24 +165,24 @@ pub(super) fn register(state: &ReleaseState, token: u64) -> Arc<FileEntry>
         .registry
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    reg.insert(token, entry.clone());
+    reg.insert(badge, entry.clone());
     entry
 }
 
 /// Remove a `File`'s registration. After this call the handler cannot
 /// dispatch any further releases to the file; subsequent
-/// `FS_RELEASE_FRAME` arrivals look up an empty slot and ack-without-act.
-pub(super) fn unregister(state: &ReleaseState, token: u64) -> Option<Arc<FileEntry>>
+/// `FS_RELEASE_MEMORY` arrivals look up an empty slot and ack-without-act.
+pub(super) fn unregister(state: &ReleaseState, badge: u64) -> Option<Arc<FileEntry>>
 {
     let mut reg = state
         .registry
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    reg.remove(&token)
+    reg.remove(&badge)
 }
 
 /// Add an outstanding mapping to a `FileEntry`. Called by `File::read`
-/// after a successful `FS_READ_FRAME` so a forced release can find it.
+/// after a successful `FS_READ_MEMORY` so a forced release can find it.
 pub(super) fn add_mapping(entry: &FileEntry, m: OutstandingMapping)
 {
     let mut maps = entry.mappings.lock().unwrap_or_else(PoisonError::into_inner);
@@ -209,7 +209,7 @@ pub(super) fn drain_mappings(entry: &FileEntry) -> Vec<OutstandingMapping>
 }
 
 /// Local cleanup of a single mapping by cookie. Called after a
-/// successful synchronous `FS_RELEASE_FRAME` round-trip from
+/// successful synchronous `FS_RELEASE_MEMORY` round-trip from
 /// `File::read` to release the resources the read held briefly. If the
 /// handler thread already cleaned up this cookie (rare but possible
 /// during a contended eviction), this is a no-op.
@@ -221,7 +221,7 @@ pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
         return;
     };
     let _ = syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count());
-    let _ = syscall::cap_delete(m.frame_cap);
+    let _ = syscall::cap_delete(m.memory_cap);
     pal_reserve::unreserve_pages(m.range);
 }
 
@@ -254,7 +254,7 @@ fn handler_main()
             Err(_) => continue,
         };
 
-        if msg.label != fs_labels::FS_RELEASE_FRAME
+        if msg.label != fs_labels::FS_RELEASE_MEMORY
         {
             // Unknown opcode — reply with label zero (cheap empty ack)
             // so the sender's blocking ipc_call returns and we don't
@@ -265,7 +265,7 @@ fn handler_main()
             continue;
         }
 
-        let token = msg.token;
+        let badge = msg.badge;
         let cookie = msg.word(0);
 
         // Snapshot the FileEntry under the registry lock, then drop the
@@ -276,7 +276,7 @@ fn handler_main()
                 .registry
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            reg.get(&token).cloned()
+            reg.get(&badge).cloned()
         };
 
         if let Some(entry) = entry

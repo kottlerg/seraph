@@ -8,7 +8,7 @@
 //! This crate owns the security-relevant code path that every namespace
 //! server runs: IPC dispatch, name validation, rights composition,
 //! per-entry visibility filtering, and node-cap minting via
-//! `cap_derive_token`. Storage backends — fatfs, future ext4, tmpfs,
+//! `cap_derive_badge`. Storage backends — fatfs, future ext4, tmpfs,
 //! vfsd's synthetic root — implement [`NamespaceBackend`], own their
 //! own `ipc_recv` loop on their namespace endpoint, and route each
 //! `NS_*` request through [`dispatch_request`]. They do not
@@ -27,16 +27,16 @@ extern crate rustc_std_workspace_core as core;
 #[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
+pub mod badge;
 pub mod gate;
 pub mod name;
 pub mod rights;
-pub mod token;
 pub mod wire;
 
+pub use badge::{NODE_ID_BITS, NODE_ID_MASK, NodeId, pack};
 pub use gate::{GateError, compose_forward_lookup_rights, gate};
 pub use name::{MAX_NAME_LEN, MIN_NAME_LEN, NameError, validate_name};
 pub use rights::{NamespaceRights, RIGHTS_BITS, RIGHTS_MASK};
-pub use token::{NODE_ID_BITS, NODE_ID_MASK, NodeId, pack};
 pub use wire::NsError;
 
 /// Whether a node is a directory or a regular file.
@@ -48,7 +48,7 @@ pub use wire::NsError;
 #[repr(u64)]
 pub enum NodeKind
 {
-    /// A regular file. Permits `NS_READ`, `NS_READ_FRAME`, `NS_STAT`.
+    /// A regular file. Permits `NS_READ`, `NS_READ_MEMORY`, `NS_STAT`.
     File = 0,
     /// A directory. Permits `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`.
     Dir = 1,
@@ -115,7 +115,7 @@ impl EntryName
 /// Where the cap returned by `NS_LOOKUP` for a directory entry comes from.
 ///
 /// `Local` entries are minted on this server's namespace endpoint via
-/// `cap_derive_token` against the entry's stored [`NodeId`] (the common
+/// `cap_derive_badge` against the entry's stored [`NodeId`] (the common
 /// case). `External` entries return a pre-installed cap on a different
 /// server's namespace endpoint via `cap_copy` (the mount-point case).
 /// The composing backend stores `External` entries when boot-time
@@ -156,23 +156,23 @@ pub struct EntryView
     pub visible_requires: NamespaceRights,
 }
 
-/// Reply payload returned by [`NamespaceBackend::read_frame`].
+/// Reply payload returned by [`NamespaceBackend::read_memory`].
 ///
-/// `frame_cap` is a single-page Frame cap with `MAP|READ` rights
+/// `memory_cap` is a single-page Memory cap with `MAP|READ` rights
 /// covering the cached file page. The cookie value echoes the
 /// caller-supplied request cookie unchanged. `bytes_valid` is bounded
 /// by file end, the current backend cluster boundary, and the page
 /// tail.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct FrameReply
+pub struct MemoryReply
 {
-    /// Single-page Frame cap (`MAP|READ`) covering the cached page.
-    pub frame_cap: u32,
-    /// Bytes of valid file content starting at `frame_data_offset`.
+    /// Single-page Memory cap (`MAP|READ`) covering the cached page.
+    pub memory_cap: u32,
+    /// Bytes of valid file content starting at `memory_data_offset`.
     pub bytes_valid: u32,
-    /// Byte offset within the returned frame at which valid content
+    /// Byte offset within the returned page at which valid content
     /// for the requested file offset begins.
-    pub frame_data_offset: u32,
+    pub memory_data_offset: u32,
     /// Release cookie echoed from the request.
     pub cookie: u64,
 }
@@ -196,7 +196,7 @@ pub trait NamespaceBackend
 
     /// Return the entry at zero-based index `idx` within `dir`. The
     /// crate iterates by incrementing `idx` until the backend returns
-    /// `Ok(None)`, signalling end-of-directory.
+    /// `Ok(None)`, notifying end-of-directory.
     ///
     /// # Errors
     ///
@@ -225,7 +225,7 @@ pub trait NamespaceBackend
         dst: &mut [u8],
     ) -> Result<usize, NsError>;
 
-    /// Frame-cap read: return a Frame cap covering the cached page for
+    /// Memory-cap read: return a Memory cap covering the cached page for
     /// `file` at `offset`, with `cookie` recorded for cooperative
     /// release.
     ///
@@ -233,17 +233,21 @@ pub trait NamespaceBackend
     ///
     /// Returns [`NsError::InvalidCookie`] for malformed cookies and
     /// other [`NsError`] variants for backend-defined failures.
-    fn read_frame(&mut self, file: NodeId, offset: u64, cookie: u64)
-    -> Result<FrameReply, NsError>;
+    fn read_memory(
+        &mut self,
+        file: NodeId,
+        offset: u64,
+        cookie: u64,
+    ) -> Result<MemoryReply, NsError>;
 
-    /// Best-effort release of a previously-issued frame for `file`
+    /// Best-effort release of a previously-issued page for `file`
     /// keyed by `cookie`. A cookie not currently outstanding is
     /// silently ignored. Drives the cooperative-release side of the
     /// eviction protocol.
-    fn release_frame(&mut self, file: NodeId, cookie: u64);
+    fn release_memory(&mut self, file: NodeId, cookie: u64);
 
     /// Best-effort cleanup hint when a holder is closing its cap on
-    /// `node`. Cap revocation is the authoritative lifetime signal;
+    /// `node`. Cap revocation is the authoritative lifetime notification;
     /// `close` allows backends to drop cached state opportunistically.
     fn close(&mut self, node: NodeId);
 }
@@ -254,7 +258,7 @@ pub trait NamespaceBackend
 /// caller-rights / visibility / name-validation checks documented in
 /// `docs/namespace-model.md`, calls into `backend` for the underlying
 /// storage operation, mints child caps from `namespace_endpoint` via
-/// `cap_derive_token`, and writes the reply through `ipc_reply`.
+/// `cap_derive_badge`, and writes the reply through `ipc_reply`.
 ///
 /// Each namespace server owns its own `ipc_recv` loop — the receive
 /// surface is not bundled here because every realistic backend
@@ -265,7 +269,7 @@ pub trait NamespaceBackend
 /// `ns_labels::*` and pass them here; everything else is theirs to
 /// handle.
 ///
-/// `received.token` MUST be the `pack(node_id, rights)` token the
+/// `received.badge` MUST be the `pack(node_id, rights)` badge the
 /// kernel delivered with the request. Backends do not see the wire
 /// layer — they only see decoded `NodeId` / `&[u8]` / `u64`
 /// arguments.
@@ -325,7 +329,7 @@ fn handle_lookup<B: NamespaceBackend>(
     namespace_endpoint: u32,
 ) -> ipc::IpcMessage
 {
-    let (parent, parent_rights) = token::unpack(msg.token);
+    let (parent, parent_rights) = badge::unpack(msg.badge);
     if !parent_rights.contains(rights::LOOKUP)
     {
         return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
@@ -368,22 +372,22 @@ fn handle_lookup<B: NamespaceBackend>(
     {
         EntryTarget::Local(node) =>
         {
-            let token = pack(node, returned_rights);
-            if token == 0
+            let badge = pack(node, returned_rights);
+            if badge == 0
             {
-                // cap_derive_token requires non-zero token.
+                // cap_derive_badge requires non-zero badge.
                 return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
             }
             // SEND_GRANT lets the holder attach caps to IPC requests
             // through this node cap (e.g. the per-process release-
             // endpoint SEND that travels in `caps[0]` of the first
-            // `FS_READ_FRAME`). It does not widen authority — the
+            // `FS_READ_MEMORY`). It does not widen authority — the
             // recipient still validates every received cap. SEND-only
             // would force the kernel to reject any cap-bearing IPC.
-            match syscall::cap_derive_token(
+            match syscall::cap_derive_badge(
                 namespace_endpoint,
                 syscall_abi::RIGHTS_SEND_GRANT,
-                token,
+                badge,
             )
             {
                 Ok(slot) => slot,
@@ -413,7 +417,7 @@ fn handle_lookup<B: NamespaceBackend>(
 
 fn handle_stat<B: NamespaceBackend>(backend: &mut B, msg: &ipc::IpcMessage) -> ipc::IpcMessage
 {
-    let (node, node_rights) = token::unpack(msg.token);
+    let (node, node_rights) = badge::unpack(msg.badge);
     if !node_rights.contains(rights::STAT)
     {
         return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());
@@ -431,7 +435,7 @@ fn handle_stat<B: NamespaceBackend>(backend: &mut B, msg: &ipc::IpcMessage) -> i
 
 fn handle_readdir<B: NamespaceBackend>(backend: &mut B, msg: &ipc::IpcMessage) -> ipc::IpcMessage
 {
-    let (dir, dir_rights) = token::unpack(msg.token);
+    let (dir, dir_rights) = badge::unpack(msg.badge);
     if !dir_rights.contains(rights::READDIR)
     {
         return ipc::IpcMessage::new(NsError::PermissionDenied.as_label());

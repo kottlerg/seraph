@@ -1,9 +1,9 @@
 // seraph-overlay: std::sys::thread::seraph
 //
-// Thread spawning backed by the Seraph kernel's Thread/Signal primitives.
+// Thread spawning backed by the Seraph kernel's Thread/Notification primitives.
 // Stacks and per-thread IPC buffers are allocated from the process heap
 // (page-aligned, no guard pages for now — deferred polish). Join
-// synchronises on a Signal cap; the child thread signals just before
+// synchronises on a Notification cap; the child thread signals just before
 // calling SYS_THREAD_EXIT.
 //
 // Native ELF TLS is live: `SYS_THREAD_CONFIGURE` accepts `tls_base`, the
@@ -38,12 +38,12 @@ const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 struct SpawnArgs {
     ipc_buffer_vaddr: u64,
     init: *mut ThreadInit,
-    done_signal: u32,
+    done_notification: u32,
 }
 
 pub struct Thread {
     thread_cap: u32,
-    done_signal: u32,
+    done_notification: u32,
     stack_base: *mut u8,
     stack_layout: Layout,
     ipc_buf_base: *mut u8,
@@ -53,7 +53,7 @@ pub struct Thread {
 }
 
 // SAFETY: every field of Thread is either a plain integer (thread_cap,
-// done_signal) or an owned pointer to a distinct heap allocation whose
+// done_notification) or an owned pointer to a distinct heap allocation whose
 // ownership is not shared with any other thread.
 unsafe impl Send for Thread {}
 // SAFETY: &Thread hands out only integer field copies through `join`; no
@@ -110,8 +110,8 @@ impl Thread {
             }
         };
 
-        let done_signal = match crate::sys::alloc::seraph::object_slab_acquire(120)
-            .and_then(|slab| syscall::cap_create_signal(slab).ok())
+        let done_notification = match crate::sys::alloc::seraph::object_slab_acquire(120)
+            .and_then(|slab| syscall::cap_create_notification(slab).ok())
         {
             Some(cap) => cap,
             None => {
@@ -123,14 +123,14 @@ impl Thread {
                     dealloc(ipc_buf_base, ipc_buf_layout);
                     dealloc(stack_base, stack_layout);
                 }
-                return Err(io::Error::other("seraph: signal cap alloc failed"));
+                return Err(io::Error::other("seraph: notification cap alloc failed"));
             }
         };
 
         let args = Box::into_raw(Box::new(SpawnArgs {
             ipc_buffer_vaddr: ipc_buf_base as u64,
             init: Box::into_raw(init),
-            done_signal,
+            done_notification,
         }));
 
         // 5-page slab for the Thread retype slot (kstack + wrapper/TCB).
@@ -217,7 +217,7 @@ impl Thread {
 
         Ok(Thread {
             thread_cap,
-            done_signal,
+            done_notification,
             stack_base,
             stack_layout,
             ipc_buf_base,
@@ -229,14 +229,14 @@ impl Thread {
 
     pub fn join(self) {
         // Wait for the child to signal completion of its rust_start and
-        // reach `signal_send`. After this point the child's next action is
+        // reach `notification_send`. After this point the child's next action is
         // `syscall::thread_exit` — its stack, IPC buffer, and TLS block
         // are safe to reclaim because control has left user-mode and will
         // never return. A spurious wake on another bit is fine — we just
         // observed the thread finishing.
-        let _ = syscall::signal_wait(self.done_signal);
-        let _ = syscall::cap_delete(self.done_signal);
-        // SAFETY: child reached signal_send, so its remaining execution is
+        let _ = syscall::notification_wait(self.done_notification);
+        let _ = syscall::cap_delete(self.done_notification);
+        // SAFETY: child reached notification_send, so its remaining execution is
         // strictly inside the kernel (thread_exit); the allocations we own
         // are no longer read or written from user space.
         unsafe {
@@ -271,7 +271,7 @@ impl Drop for Thread {
         // allocations join it here until Seraph has a thread-detach
         // syscall that reclaims memory on thread_exit.
         let _ = self.thread_cap;
-        let _ = self.done_signal;
+        let _ = self.done_notification;
         let _ = self.stack_base;
         let _ = self.ipc_buf_base;
         let _ = self.tls_block;
@@ -344,7 +344,7 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     let rust_start = init_box.rust_start;
     rust_start();
 
-    let _ = syscall::signal_send(args.done_signal, 1);
+    let _ = syscall::notification_send(args.done_notification, 1);
     syscall::thread_exit();
 }
 

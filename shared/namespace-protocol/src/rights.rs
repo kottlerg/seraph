@@ -5,15 +5,15 @@
 
 //! Namespace rights newtype and bit constants.
 //!
-//! Namespace rights are packed into the high bits of a node-cap token
-//! (see [`crate::token`]). They are distinct from kernel capability
+//! Namespace rights are packed into the high bits of a node-cap badge
+//! (see [`crate::badge`]). They are distinct from kernel capability
 //! rights (`RIGHTS_SEND`, `RIGHTS_MAP`, …): a node cap is always a SEND
 //! cap from the kernel's perspective, and the namespace rights live
-//! entirely in the cap's token bits, inspected only by the server.
+//! entirely in the cap's badge bits, inspected only by the server.
 //!
 //! Bit assignments are defined by the namespace-protocol contract.
 //! Servers MUST reject any operation requiring a bit not set in the
-//! caller's token; rights MUST NOT be promoted at any operation.
+//! caller's badge; rights MUST NOT be promoted at any operation.
 
 // Under `rustc-dep-of-std` the crate root is `no_core` and the usual
 // prelude is not auto-imported into submodules. Mirrors the
@@ -24,9 +24,9 @@ use core::prelude::rust_2024::*;
 
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Sub};
 
-/// Width of the namespace-rights field within a node-cap token, in bits.
+/// Width of the namespace-rights field within a node-cap badge, in bits.
 ///
-/// 24 bits packed at token[40..64]. Eight defined; sixteen reserved
+/// 24 bits packed at badge[40..64]. Eight defined; sixteen reserved
 /// for future use (`APPEND`, `TRUNCATE`, `RENAME`, `UNLINK`,
 /// `SYMLINK_FOLLOW`, `WATCH`, `SET_TIMES`, `XATTR_GET`, `XATTR_SET`,
 /// `LOCK`, identity-related bits, MAC labels, …).
@@ -41,9 +41,9 @@ pub const LOOKUP: u32 = 1 << 0;
 pub const READDIR: u32 = 1 << 1;
 /// `NS_STAT` on this node is permitted.
 pub const STAT: u32 = 1 << 2;
-/// `NS_READ` / `NS_READ_FRAME` on this file is permitted.
+/// `NS_READ` / `NS_READ_MEMORY` on this file is permitted.
 pub const READ: u32 = 1 << 3;
-/// `FS_WRITE` / `FS_WRITE_FRAME` on this file is permitted.
+/// `FS_WRITE` / `FS_WRITE_MEMORY` on this file is permitted.
 pub const WRITE: u32 = 1 << 4;
 /// File is executable; consumed by ELF loaders to gate spawn.
 pub const EXEC: u32 = 1 << 5;
@@ -55,7 +55,7 @@ pub const MUTATE_DIR: u32 = 1 << 6;
 /// rule in `docs/namespace-model.md`).
 pub const ADMIN: u32 = 1 << 7;
 
-/// Set of namespace rights packed in a node-cap token.
+/// Set of namespace rights packed in a node-cap badge.
 ///
 /// 24-bit field; bits beyond [`RIGHTS_BITS`] MUST be zero in any
 /// constructed value. The newtype is `Copy` and supports bitwise ops

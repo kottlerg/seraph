@@ -5,33 +5,35 @@
 
 //! Tier 1 tests for capability syscalls.
 //!
-//! Covers: `SYS_CAP_CREATE_*`, `SYS_CAP_COPY`, `SYS_CAP_MOVE`,
-//! `SYS_CAP_INSERT`, `SYS_CAP_DERIVE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`.
+//! Covers: `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (both auto-allocate and
+//! explicit-slot paths), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_REVOKE`,
+//! `SYS_CAP_DELETE`.
 //!
 //! Each function tests one syscall or one distinct behaviour. Tests clean up
 //! caps they create where convenient, but leaks are acceptable — ktest exits
 //! after all tests finish.
 
 use syscall::{
-    cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_signal,
-    cap_delete, cap_derive, cap_derive_token, cap_insert, cap_move, cap_revoke, event_queue_create,
-    signal_send, signal_wait,
+    cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
+    cap_delete, cap_derive, cap_derive_badge, cap_insert, cap_move, cap_revoke, event_queue_create,
+    notification_send, notification_wait,
 };
 use syscall_abi::SyscallError;
 
 use crate::{TestContext, TestResult};
 
 // Rights bit constants (from kernel/src/cap/slot.rs).
-// SIGNAL = bit 7 (send), WAIT = bit 8 (receive/block), SEND = bit 4, GRANT = bit 6.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+// NOTIFY = bit 7 (send), WAIT = bit 8 (receive/block), SEND = bit 4, GRANT = bit 6.
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 
-// ── SYS_CAP_CREATE_SIGNAL ────────────────────────────────────────────────────
+// ── SYS_CAP_CREATE_NOTIFICATION ────────────────────────────────────────────────────
 
-/// `cap_create_signal` returns a usable slot.
-pub fn create_signal(ctx: &TestContext) -> TestResult
+/// `cap_create_notification` returns a usable slot.
+pub fn create_notification(ctx: &TestContext) -> TestResult
 {
-    let slot = cap_create_signal(ctx.memory_frame_base).map_err(|_| "cap_create_signal failed")?;
-    cap_delete(slot).map_err(|_| "cap_delete after create_signal failed")?;
+    let slot =
+        cap_create_notification(ctx.memory_base).map_err(|_| "cap_create_notification failed")?;
+    cap_delete(slot).map_err(|_| "cap_delete after create_notification failed")?;
     Ok(())
 }
 
@@ -40,8 +42,7 @@ pub fn create_signal(ctx: &TestContext) -> TestResult
 /// `cap_create_endpoint` returns a usable slot.
 pub fn create_endpoint(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        cap_create_endpoint(ctx.memory_frame_base).map_err(|_| "cap_create_endpoint failed")?;
+    let slot = cap_create_endpoint(ctx.memory_base).map_err(|_| "cap_create_endpoint failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_endpoint failed")?;
     Ok(())
 }
@@ -51,8 +52,7 @@ pub fn create_endpoint(ctx: &TestContext) -> TestResult
 /// `cap_create_event_q` (via `event_queue_create`) returns a usable slot.
 pub fn create_event_q(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        event_queue_create(ctx.memory_frame_base, 8).map_err(|_| "event_queue_create failed")?;
+    let slot = event_queue_create(ctx.memory_base, 8).map_err(|_| "event_queue_create failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_event_q failed")?;
     Ok(())
 }
@@ -62,8 +62,8 @@ pub fn create_event_q(ctx: &TestContext) -> TestResult
 /// `cap_create_cspace` succeeds with a valid slot count.
 pub fn create_cspace(ctx: &TestContext) -> TestResult
 {
-    let slot = cap_create_cspace(ctx.memory_frame_base, 0, 4, 32)
-        .map_err(|_| "cap_create_cspace(32) failed")?;
+    let slot =
+        cap_create_cspace(ctx.memory_base, 0, 4, 32).map_err(|_| "cap_create_cspace(32) failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_cspace failed")?;
     Ok(())
 }
@@ -73,8 +73,7 @@ pub fn create_cspace(ctx: &TestContext) -> TestResult
 /// `cap_create_aspace` returns a usable slot.
 pub fn create_aspace(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        cap_create_aspace(ctx.memory_frame_base, 0, 8).map_err(|_| "cap_create_aspace failed")?;
+    let slot = cap_create_aspace(ctx.memory_base, 0, 8).map_err(|_| "cap_create_aspace failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_aspace failed")?;
     Ok(())
 }
@@ -97,45 +96,44 @@ pub fn create_thread(ctx: &TestContext) -> TestResult
 /// `cap_create_wait_set` (via `wait_set_create`) returns a usable slot.
 pub fn create_wait_set(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        cap_create_wait_set(ctx.memory_frame_base).map_err(|_| "cap_create_wait_set failed")?;
+    let slot = cap_create_wait_set(ctx.memory_base).map_err(|_| "cap_create_wait_set failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_wait_set failed")?;
     Ok(())
 }
 
 // Thin wrapper — the syscall wrapper is `wait_set_create` in shared/syscall but
 // the underlying syscall number is `SYS_CAP_CREATE_WAIT_SET`.
-fn cap_create_wait_set(frame_cap: u32) -> Result<u32, i64>
+fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 {
-    syscall::wait_set_create(frame_cap)
+    syscall::wait_set_create(memory_cap)
 }
 
 // ── SYS_CAP_COPY ─────────────────────────────────────────────────────────────
 
 /// `cap_copy` places a copy of a cap into another `CSpace`.
 ///
-/// The copy is verified to be independently usable (`signal_send` still works
+/// The copy is verified to be independently usable (`notification_send` still works
 /// on the source; the destination `CSpace` is deleted as cleanup, which drops
 /// all caps inside it).
 pub fn copy(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for copy test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for copy test failed")?;
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for copy test failed")?;
 
     // Copy with all rights — `syscall::RIGHTS_ALL` passes through whatever rights the source has.
     cap_copy(sig, dest_cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy failed")?;
 
     // Source slot is still valid after a copy.
-    signal_send(sig, 0x1).map_err(|_| "signal_send on source after cap_copy failed")?;
+    notification_send(sig, 0x1).map_err(|_| "notification_send on source after cap_copy failed")?;
 
     cap_delete(sig).map_err(|_| "cap_delete sig after copy test failed")?;
     cap_delete(dest_cs).map_err(|_| "cap_delete dest_cs after copy test failed")?;
     Ok(())
 }
 
-// ── SYS_CAP_INSERT ───────────────────────────────────────────────────────────
+// ── SYS_CAP_COPY explicit slot (cap_insert) ──────────────────────────────────
 
 /// `cap_insert` places a copy at a caller-chosen slot index in another `CSpace`.
 ///
@@ -143,16 +141,17 @@ pub fn copy(ctx: &TestContext) -> TestResult
 /// is unaffected (insert is a copy, not a move).
 pub fn insert(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for insert test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for insert test failed")?;
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for insert test failed")?;
 
     // Insert at slot 5 in dest_cs.
     cap_insert(sig, dest_cs, 5, syscall::RIGHTS_ALL).map_err(|_| "cap_insert failed")?;
 
     // Source slot is preserved (insert = copy, not move).
-    signal_send(sig, 0x1).map_err(|_| "signal_send on source after cap_insert failed")?;
+    notification_send(sig, 0x1)
+        .map_err(|_| "notification_send on source after cap_insert failed")?;
 
     cap_delete(sig).map_err(|_| "cap_delete sig after insert test failed")?;
     cap_delete(dest_cs).map_err(|_| "cap_delete dest_cs after insert test failed")?;
@@ -164,16 +163,16 @@ pub fn insert(ctx: &TestContext) -> TestResult
 /// `cap_move` transfers a cap to another `CSpace` and nulls the source slot.
 pub fn r#move(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for move test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for move test failed")?;
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for move test failed")?;
 
     // Move to dest_cs; auto-allocate destination slot (dest_index = 0).
     cap_move(sig, dest_cs, 0).map_err(|_| "cap_move failed")?;
 
     // Source slot must now be null — using it should fail.
-    let err = signal_send(sig, 0x1);
+    let err = notification_send(sig, 0x1);
     if err.is_ok()
     {
         return Err("source slot still usable after cap_move (expected null)");
@@ -188,36 +187,38 @@ pub fn r#move(ctx: &TestContext) -> TestResult
 /// `cap_derive` produces an attenuated cap; the derived cap has at most the
 /// rights of the source masked by `rights_mask`.
 ///
-/// We create a signal with SIGNAL+WAIT rights, derive a copy with SIGNAL only,
+/// We create a notification with NOTIFY+WAIT rights, derive a copy with NOTIFY only,
 /// then verify:
-///  - The derived cap can send (has SIGNAL).
+///  - The derived cap can send (has NOTIFY).
 ///  - The derived cap cannot wait (lacks WAIT) — kernel returns `InsufficientRights`.
 pub fn derive_attenuation(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for derive test failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for derive test failed")?;
 
-    // Derive with SIGNAL right only (no WAIT).
-    let derived = cap_derive(sig, RIGHTS_SIGNAL).map_err(|_| "cap_derive failed")?;
+    // Derive with NOTIFY right only (no WAIT).
+    let derived = cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive failed")?;
 
     // Derived cap can send.
-    signal_send(derived, 0x1).map_err(|_| "signal_send on derived cap failed")?;
+    notification_send(derived, 0x1).map_err(|_| "notification_send on derived cap failed")?;
 
     // Derived cap cannot wait — InsufficientRights (-3).
-    // We call signal_wait on a cap that has no bits set AND no WAIT right.
+    // We call notification_wait on a cap that has no bits set AND no WAIT right.
     // The kernel should reject with InsufficientRights before blocking.
-    let wait_err = syscall::signal_wait(derived);
+    let wait_err = syscall::notification_wait(derived);
     if wait_err != Err(SyscallError::InsufficientRights as i64)
     {
         // If the kernel returns a different error (or somehow succeeds),
         // something is wrong with rights enforcement.
-        // Note: if signal bits were set (from our send above), the kernel might
+        // Note: if notification bits were set (from our send above), the kernel might
         // return them before checking rights. Clear is fine for this test since
-        // signal_send ORs bits and signal_wait clears them — after send(0x1) and
+        // notification_send ORs bits and notification_wait clears them — after send(0x1) and
         // then a wait, the bits are consumed. The next wait on derived must fail.
-        // ... actually signal_wait on a cap with WAIT right AND bits set would
+        // ... actually notification_wait on a cap with WAIT right AND bits set would
         // succeed. But derived has NO WAIT right, so kernel checks rights first.
-        return Err("signal_wait on SIGNAL-only derived cap did not return InsufficientRights");
+        return Err(
+            "notification_wait on NOTIFY-only derived cap did not return InsufficientRights",
+        );
     }
 
     cap_delete(derived).map_err(|_| "cap_delete derived cap failed")?;
@@ -232,16 +233,16 @@ pub fn derive_attenuation(ctx: &TestContext) -> TestResult
 /// After revoking the parent, the derived cap must be unusable.
 pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for revoke test failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for revoke test failed")?;
     let derived =
-        cap_derive(sig, RIGHTS_SIGNAL).map_err(|_| "cap_derive for revoke test failed")?;
+        cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive for revoke test failed")?;
 
     // Revoke all descendants of sig (derived is now invalid).
     cap_revoke(sig).map_err(|_| "cap_revoke failed")?;
 
     // Derived cap must now fail.
-    let err = signal_send(derived, 0x1);
+    let err = notification_send(derived, 0x1);
     if err.is_ok()
     {
         return Err("derived cap still usable after cap_revoke");
@@ -251,14 +252,14 @@ pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── SYS_CAP_INSERT negative ───────────────────────────────────────────────────
+// ── SYS_CAP_COPY explicit slot negative ──────────────────────────────────────
 
 /// `cap_insert` to an already-occupied destination slot must return an error.
 pub fn insert_to_occupied_slot_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for occupied-slot test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for occupied-slot test failed")?;
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for occupied-slot test failed")?;
 
     // First insert at slot 5 — must succeed.
@@ -281,14 +282,14 @@ pub fn insert_to_occupied_slot_err(ctx: &TestContext) -> TestResult
 
 /// `cap_copy` using a non-`CSpace` cap as the destination `CSpace` must fail.
 ///
-/// Passing a Signal cap where a `CSpace` cap is expected should be rejected
+/// Passing a Notification cap where a `CSpace` cap is expected should be rejected
 /// before any modification occurs.
 pub fn copy_into_non_cspace_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for non-cspace test failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for non-cspace test failed")?;
 
-    // sig is a Signal, not a CSpace — using it as dest_cs must fail.
+    // sig is a Notification, not a CSpace — using it as dest_cs must fail.
     let err = cap_copy(sig, sig, syscall::RIGHTS_ALL);
     if err.is_ok()
     {
@@ -304,19 +305,19 @@ pub fn copy_into_non_cspace_err(ctx: &TestContext) -> TestResult
 /// `cap_delete` removes a cap from the `CSpace`; the slot becomes unusable.
 pub fn delete(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for delete test failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for delete test failed")?;
 
     // Verify it's usable before deletion.
-    signal_send(sig, 0x1).map_err(|_| "signal_send before delete failed")?;
+    notification_send(sig, 0x1).map_err(|_| "notification_send before delete failed")?;
 
     cap_delete(sig).map_err(|_| "cap_delete failed")?;
 
-    // After deletion the slot is null; signal_send must fail.
-    let err = signal_send(sig, 0x1);
+    // After deletion the slot is null; notification_send must fail.
+    let err = notification_send(sig, 0x1);
     if err.is_ok()
     {
-        return Err("signal_send succeeded after cap_delete (slot not null)");
+        return Err("notification_send succeeded after cap_delete (slot not null)");
     }
 
     Ok(())
@@ -327,8 +328,8 @@ pub fn delete(ctx: &TestContext) -> TestResult
 /// `cap_delete` on an already-null slot returns Ok (idempotent).
 pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for delete_null_slot_ok failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for delete_null_slot_ok failed")?;
     cap_delete(sig).map_err(|_| "first cap_delete failed")?;
 
     // Second delete on the now-null slot must succeed (no-op).
@@ -336,15 +337,15 @@ pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── SYS_CAP_INSERT negative (out of bounds) ──────────────────────────────────
+// ── SYS_CAP_COPY explicit slot negative (out of bounds) ──────────────────────
 
 /// `cap_insert` with a slot index beyond the destination `CSpace` capacity must fail.
 pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for insert_oob test failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for insert_oob test failed")?;
     // CSpace capacity is clamped to [256, 14336]; create the smallest possible.
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for insert_oob test failed")?;
 
     // Slot 99999 is beyond any cspace capacity.
@@ -365,29 +366,29 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 /// any operation.
 pub fn derive_zero_rights(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for derive_zero_rights failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for derive_zero_rights failed")?;
 
     let derived = cap_derive(sig, 0).map_err(|_| "cap_derive(0) failed")?;
 
     // Derived cap with zero rights cannot send.
-    let send_err = signal_send(derived, 0x1);
+    let send_err = notification_send(derived, 0x1);
     if send_err.is_ok()
     {
-        return Err("signal_send on zero-rights derived cap should fail");
+        return Err("notification_send on zero-rights derived cap should fail");
     }
 
     // Derived cap with zero rights cannot wait.
-    // Pre-set bits on the real signal so we test rights, not blocking.
-    signal_send(sig, 0x1).map_err(|_| "signal_send on root failed")?;
-    let wait_err = signal_wait(derived);
+    // Pre-set bits on the real notification so we test rights, not blocking.
+    notification_send(sig, 0x1).map_err(|_| "notification_send on root failed")?;
+    let wait_err = notification_wait(derived);
     if wait_err.is_ok()
     {
-        return Err("signal_wait on zero-rights derived cap should fail");
+        return Err("notification_wait on zero-rights derived cap should fail");
     }
 
     // Drain the bits.
-    signal_wait(sig).ok();
+    notification_wait(sig).ok();
     cap_delete(derived).map_err(|_| "cap_delete derived failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after derive_zero_rights failed")?;
     Ok(())
@@ -398,8 +399,8 @@ pub fn derive_zero_rights(ctx: &TestContext) -> TestResult
 /// `cap_revoke` on a null slot returns an error.
 pub fn revoke_null_slot_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for revoke_null_slot_err failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for revoke_null_slot_err failed")?;
     cap_delete(sig).map_err(|_| "cap_delete failed")?;
 
     // Slot is now null; revoke must fail.
@@ -416,7 +417,7 @@ pub fn revoke_null_slot_err(ctx: &TestContext) -> TestResult
 /// `event_queue_create(0)` must return `InvalidArgument` (capacity must be 1-4096).
 pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
 {
-    let err = event_queue_create(ctx.memory_frame_base, 0);
+    let err = event_queue_create(ctx.memory_base, 0);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("event_queue_create(0) did not return InvalidArgument");
@@ -427,7 +428,7 @@ pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
 /// `event_queue_create(4097)` must return `InvalidArgument` (max capacity is 4096).
 pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
 {
-    let err = event_queue_create(ctx.memory_frame_base, 4097);
+    let err = event_queue_create(ctx.memory_base, 4097);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("event_queue_create(4097) did not return InvalidArgument");
@@ -435,94 +436,94 @@ pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-// ── SYS_CAP_DERIVE_TOKEN ────────────────────────────────────────────────────
+// ── SYS_CAP_DERIVE_BADGE ────────────────────────────────────────────────────
 
-/// `cap_derive_token` attaches a token to a derived capability.
-pub fn derive_token(ctx: &TestContext) -> TestResult
+/// `cap_derive_badge` attaches a badge to a derived capability.
+pub fn derive_badge(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
-        .map_err(|_| "create_endpoint for derive_token test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "create_endpoint for derive_badge test failed")?;
 
-    let tokened =
-        cap_derive_token(ep, syscall::RIGHTS_ALL, 42).map_err(|_| "cap_derive_token failed")?;
+    let badged =
+        cap_derive_badge(ep, syscall::RIGHTS_ALL, 42).map_err(|_| "cap_derive_badge failed")?;
 
-    // The tokened cap is usable (it's a valid endpoint derivative).
-    cap_delete(tokened).map_err(|_| "cap_delete tokened cap failed")?;
-    cap_delete(ep).map_err(|_| "cap_delete ep after derive_token test failed")?;
+    // The badged cap is usable (it's a valid endpoint derivative).
+    cap_delete(badged).map_err(|_| "cap_delete badged cap failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after derive_badge test failed")?;
     Ok(())
 }
 
-/// `cap_derive_token` with token=0 returns `InvalidArgument`.
-pub fn derive_token_zero_err(ctx: &TestContext) -> TestResult
+/// `cap_derive_badge` with badge=0 returns `InvalidArgument`.
+pub fn derive_badge_zero_err(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
-        .map_err(|_| "create_endpoint for derive_token_zero_err test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "create_endpoint for derive_badge_zero_err test failed")?;
 
-    let err = cap_derive_token(ep, syscall::RIGHTS_ALL, 0);
+    let err = cap_derive_badge(ep, syscall::RIGHTS_ALL, 0);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("cap_derive_token(0) did not return InvalidArgument");
+        return Err("cap_derive_badge(0) did not return InvalidArgument");
     }
 
-    cap_delete(ep).map_err(|_| "cap_delete ep after derive_token_zero_err test failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after derive_badge_zero_err test failed")?;
     Ok(())
 }
 
-/// Re-tokening a cap that already has a token returns `InvalidArgument`.
-pub fn derive_token_retoken_err(ctx: &TestContext) -> TestResult
+/// Re-badging a cap that already has a badge returns `InvalidArgument`.
+pub fn derive_badge_rebadge_err(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
-        .map_err(|_| "create_endpoint for retoken_err test failed")?;
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "create_endpoint for rebadge_err test failed")?;
 
-    let tokened = cap_derive_token(ep, syscall::RIGHTS_ALL, 100)
-        .map_err(|_| "first cap_derive_token failed")?;
+    let badged = cap_derive_badge(ep, syscall::RIGHTS_ALL, 100)
+        .map_err(|_| "first cap_derive_badge failed")?;
 
-    // Attempting to set a new token on an already-tokened cap must fail.
-    let err = cap_derive_token(tokened, syscall::RIGHTS_ALL, 200);
+    // Attempting to set a new badge on an already-badged cap must fail.
+    let err = cap_derive_badge(badged, syscall::RIGHTS_ALL, 200);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("re-tokening did not return InvalidArgument");
+        return Err("re-badging did not return InvalidArgument");
     }
 
-    cap_delete(tokened).map_err(|_| "cap_delete tokened failed")?;
-    cap_delete(ep).map_err(|_| "cap_delete ep after retoken_err test failed")?;
+    cap_delete(badged).map_err(|_| "cap_delete badged failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after rebadge_err test failed")?;
     Ok(())
 }
 
-/// `cap_derive` from a tokened cap inherits the token (verified via IPC delivery).
-pub fn derive_inherits_token(ctx: &TestContext) -> TestResult
+/// `cap_derive` from a badged cap inherits the badge (verified via IPC delivery).
+pub fn derive_inherits_badge(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "create_endpoint for inherit test failed")?;
 
-    let tokened =
-        cap_derive_token(ep, syscall::RIGHTS_ALL, 77).map_err(|_| "cap_derive_token failed")?;
+    let badged =
+        cap_derive_badge(ep, syscall::RIGHTS_ALL, 77).map_err(|_| "cap_derive_badge failed")?;
 
-    // Derive from the tokened cap — should inherit token=77.
+    // Derive from the badged cap — should inherit badge=77.
     let derived =
-        cap_derive(tokened, syscall::RIGHTS_ALL).map_err(|_| "cap_derive from tokened failed")?;
+        cap_derive(badged, syscall::RIGHTS_ALL).map_err(|_| "cap_derive from badged failed")?;
 
-    // We can't directly inspect the token without IPC, but verify the cap is usable.
+    // We can't directly inspect the badge without IPC, but verify the cap is usable.
     cap_delete(derived).map_err(|_| "cap_delete derived failed")?;
-    cap_delete(tokened).map_err(|_| "cap_delete tokened failed")?;
+    cap_delete(badged).map_err(|_| "cap_delete badged failed")?;
     cap_delete(ep).map_err(|_| "cap_delete ep after inherit test failed")?;
     Ok(())
 }
 
-/// `cap_derive_token` works on non-endpoint caps (tokens are generic).
-pub fn derive_token_on_signal(ctx: &TestContext) -> TestResult
+/// `cap_derive_badge` works on non-endpoint caps (badges are generic).
+pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for derive_token_on_signal failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for derive_badge_on_notification failed")?;
 
-    let tokened = cap_derive_token(sig, syscall::RIGHTS_ALL, 99)
-        .map_err(|_| "cap_derive_token on signal failed")?;
+    let badged = cap_derive_badge(sig, syscall::RIGHTS_ALL, 99)
+        .map_err(|_| "cap_derive_badge on notification failed")?;
 
-    // Tokened signal cap is still usable for signal operations.
-    signal_send(tokened, 0x1).map_err(|_| "signal_send on tokened cap failed")?;
-    signal_wait(sig).map_err(|_| "signal_wait after tokened send failed")?;
+    // Badged notification cap is still usable for notification operations.
+    notification_send(badged, 0x1).map_err(|_| "notification_send on badged cap failed")?;
+    notification_wait(sig).map_err(|_| "notification_wait after badged send failed")?;
 
-    cap_delete(tokened).map_err(|_| "cap_delete tokened signal failed")?;
-    cap_delete(sig).map_err(|_| "cap_delete sig after derive_token_on_signal failed")?;
+    cap_delete(badged).map_err(|_| "cap_delete badged notification failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig after derive_badge_on_notification failed")?;
     Ok(())
 }

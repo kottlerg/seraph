@@ -2,7 +2,7 @@
 
 vfsd is a namespace server that owns no on-disk storage. Its
 [`NamespaceBackend`] implementation, [`VfsdRootBackend`], composes a
-synthetic system root from per-mount tokened SEND caps captured at
+synthetic system root from per-mount badged SEND caps captured at
 boot time and on each successful `MOUNT`. Clients holding the
 system-root cap walk into mounted filesystems through this
 composition; the cross-server reply hands them a cap on the owning
@@ -33,8 +33,8 @@ The cap-as-namespace model is defined by
 |---|---|
 | `name` / `name_len` | Path component captured at install time |
 | `parent` / `first_child` / `next_sibling` | Tree links |
-| `terminal_cap` | Tokened SEND on the underlying driver's namespace endpoint, set on a node that is itself a mount point; zero on a synthetic intermediate |
-| `fallthrough_cap` | Tokened SEND on the root mount's namespace endpoint addressing the directory at this node's path in the root filesystem; zero if no such fall-through is available |
+| `terminal_cap` | Badged SEND on the underlying driver's namespace endpoint, set on a node that is itself a mount point; zero on a synthetic intermediate |
+| `fallthrough_cap` | Badged SEND on the root mount's namespace endpoint addressing the directory at this node's path in the root filesystem; zero if no such fall-through is available |
 
 The synthetic root is `NodeId::ROOT` (pool index 0) and is always
 active; its `fallthrough_cap` carries the root mount cap captured
@@ -66,7 +66,7 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    namespace endpoint; subsequent walks bypass vfsd entirely. A
    match on a *synthetic intermediate* child returns an
    [`EntryTarget::Local`] view; the protocol crate mints a
-   `cap_derive_token` on `namespace_ep` addressing the intermediate's
+   `cap_derive_badge` on `namespace_ep` addressing the intermediate's
    `NodeId`, so the next `NS_LOOKUP` lands back on vfsd.
 
 2. **Fall-through.** If no local child matches and the parent has a
@@ -74,7 +74,7 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    in `services/vfsd/src/main.rs`) forwards the `NS_LOOKUP` to the
    fall-through cap and replies with the upstream response. The
    request body is repacked before forwarding: vfsd extracts the
-   caller's parent rights from the inbound cap's token, intersects
+   caller's parent rights from the inbound cap's badge, intersects
    them with the request's `caller_requested` word
    (via `namespace_protocol::compose_forward_lookup_rights`), and
    writes the resulting mask into the outbound message's `word(0)`.
@@ -82,7 +82,7 @@ endpoint dispatches in two stages, from `vfsd::namespace_loop`:
    travels back unchanged. This is required because the fall-through
    cap was minted by vfsd's own walk and carries full namespace
    rights — the receiving fs driver composes its returned rights
-   against the destination cap's token, so without the repack the
+   against the destination cap's badge, so without the repack the
    caller's attenuation would be discarded. Repacking preserves the
    `docs/namespace-model.md` § "Walking" invariant
    (walk-monotonic-attenuation) across mount boundaries: a child cap
@@ -109,7 +109,7 @@ by name.
 
 ## Two derives, not cap_copy
 
-A successful `MOUNT` mints **two** tokened SEND caps on the driver's
+A successful `MOUNT` mints **two** badged SEND caps on the driver's
 namespace endpoint, both addressing the driver's root at full
 namespace rights:
 
@@ -139,7 +139,7 @@ This is the `kill the server` shape documented in
 Per-mount per-cap revocation (revoke the synthetic-root entry without
 affecting the caller's copy of the same node) is not supported by
 this scheme. Calling `cap_revoke` on `synthetic_root_cap` would
-behave like `cap_revoke` on any tokened SEND derived from the
+behave like `cap_revoke` on any badged SEND derived from the
 endpoint and trigger the kernel's per-cap revocation, which on the
 namespace endpoint cascades to every sibling derivation — equivalent
 to the destroy-driver hammer for callers' purposes. The two-derive
@@ -150,7 +150,7 @@ per-cap revocation.
 
 ## Two endpoints, one process
 
-vfsd holds two un-tokened endpoints:
+vfsd holds two un-badged endpoints:
 
 - **Service endpoint** — `MOUNT` and `GET_SYSTEM_ROOT_CAP`.
   Multi-threaded recv (4 handlers today) so
@@ -165,7 +165,7 @@ vfsd holds two un-tokened endpoints:
   bounded by `MAX_TREE_NODES` and the only blocking call is the
   optional fall-through `ipc_call`. The same endpoint is the
   kernel-derivation parent for every system-root cap vfsd ever
-  issues via `cap_derive_token` (the synthetic root cap, plus a
+  issues via `cap_derive_badge` (the synthetic root cap, plus a
   fresh cap per synthetic intermediate descent).
 
 vfsd is also the owner of fs-process lifecycle: `MOUNT` spawns the
@@ -197,7 +197,7 @@ seeing different roots) and `cap_revoke`-driven unmount.
 |---|---|
 | [shared/namespace-protocol/README.md](../../../shared/namespace-protocol/README.md) | NS_* wire surface and dispatch crate |
 | [docs/namespace-model.md](../../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing |
-| [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Filesystem-driver-specific labels (FS_READ, FS_READ_FRAME, …) |
+| [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Filesystem-driver-specific labels (FS_READ, FS_READ_MEMORY, …) |
 | [services/vfsd/docs/vfs-ipc-interface.md](vfs-ipc-interface.md) | vfsd service-endpoint surface (MOUNT, GET_SYSTEM_ROOT_CAP) |
 
 ---

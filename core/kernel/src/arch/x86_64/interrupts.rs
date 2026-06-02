@@ -294,7 +294,7 @@ const APIC_ICR_HIGH: usize = 0x310;
 const ICR_PENDING: u32 = 1 << 12;
 /// ICR value for INIT IPI: level-assert, trigger=level, delivery=INIT.
 const ICR_INIT_ASSERT: u32 = 0x0000_C500;
-/// ICR value for INIT de-assert (clears INIT signal).
+/// ICR value for INIT de-assert (clears INIT notification).
 const ICR_INIT_DEASSERT: u32 = 0x0000_8500;
 /// ICR base value for STARTUP IPI: delivery=STARTUP, vector in bits[7:0].
 const ICR_SIPI_BASE: u32 = 0x0000_4600;
@@ -729,7 +729,7 @@ pub fn are_enabled() -> bool
     rflags & (1 << 9) != 0
 }
 
-/// Send the end-of-interrupt signal to the local APIC.
+/// Send the end-of-interrupt notification to the local APIC.
 ///
 /// Must be called from within an interrupt handler before returning.
 /// `_irq` is ignored (the local-APIC EOI register is level-independent).

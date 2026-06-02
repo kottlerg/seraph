@@ -12,21 +12,21 @@
 //!   at the end.
 //! - Child B (elevated priority): signals "ran" immediately and exits.
 //!
-//! Verification: the parent unblocks on B's "ran" signal well before A's
+//! Verification: the parent unblocks on B's "ran" notification well before A's
 //! spinner finishes. Slack: B should arrive within ~5 timer ticks worth
 //! of wall time of being made runnable. Skipped if no `SchedControl` cap
 //! exists in the initial cap set (no elevation path).
 
 use syscall::{
-    cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait_timeout, system_info,
-    thread_exit, thread_set_priority, thread_yield,
+    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait_timeout,
+    system_info, thread_exit, thread_set_priority, thread_yield,
 };
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-/// SIGNAL right (send) only.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+/// NOTIFY right (send) only.
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 
 /// Spin iterations for the low-priority hog. Large enough that, absent
 /// preemption, the hog dominates the CPU for tens of ms.
@@ -58,7 +58,7 @@ fn hog_entry(arg: u64) -> !
         core::hint::black_box(n);
         n -= 1;
     }
-    signal_send(done_slot, done_bit).ok();
+    notification_send(done_slot, done_bit).ok();
     thread_exit();
 }
 
@@ -70,7 +70,7 @@ fn elevated_entry(arg: u64) -> !
 {
     let done_slot = (arg & 0xFFFF_FFFF) as u32;
     let done_bit = arg >> 32;
-    signal_send(done_slot, done_bit).ok();
+    notification_send(done_slot, done_bit).ok();
     thread_exit();
 }
 
@@ -109,13 +109,13 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     };
 
-    let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "priority_preemption: cap_create_signal (done) failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "priority_preemption: cap_create_notification (done) failed")?;
 
     // ── Hog: spawn, pin to CPU 0, default priority. ──────────────────────────
     let hog = crate::spawn::new_child(ctx)
         .map_err(|_| "priority_preemption: spawn::new_child (hog) failed")?;
-    let hog_done = cap_copy(done, hog.cs, RIGHTS_SIGNAL)
+    let hog_done = cap_copy(done, hog.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy hog_done failed")?;
     let hog_arg = u64::from(hog_done) | (0x1u64 << 32);
     let hog_stack = ChildStack::top(core::ptr::addr_of!(HOG_STACK));
@@ -128,7 +128,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Elevated: spawn, pin to CPU 0, elevated priority. ────────────────────
     let elevated = crate::spawn::new_child(ctx)
         .map_err(|_| "priority_preemption: spawn::new_child (elevated) failed")?;
-    let elevated_done = cap_copy(done, elevated.cs, RIGHTS_SIGNAL)
+    let elevated_done = cap_copy(done, elevated.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy elevated_done failed")?;
     thread_set_priority(elevated.th, 20, sched_cap)
         .map_err(|_| "priority_preemption: thread_set_priority (elevated) failed")?;
@@ -146,10 +146,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     )
     .map_err(|_| "priority_preemption: elevated configure_and_start_pinned failed")?;
 
-    // Wait for either signal: elevated bit 0x2 means preemption succeeded,
+    // Wait for either notification: elevated bit 0x2 means preemption succeeded,
     // hog bit 0x1 means the hog finished before being preempted (failure).
-    let bits = signal_wait_timeout(done, PREEMPT_BUDGET_US / 1000)
-        .map_err(|_| "priority_preemption: signal_wait_timeout failed")?;
+    let bits = notification_wait_timeout(done, PREEMPT_BUDGET_US / 1000)
+        .map_err(|_| "priority_preemption: notification_wait_timeout failed")?;
 
     let t_observed = system_info(SystemInfoType::ElapsedUs as u64)
         .map_err(|_| "priority_preemption: system_info after wait failed")?;
@@ -159,19 +159,23 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         crate::log_u64("priority_preemption: bits=", bits);
         crate::log_u64("priority_preemption: elapsed_us=", elapsed_us);
-        return Err("priority_preemption: elevated child did not signal within preemption budget");
+        return Err(
+            "priority_preemption: elevated child did not notification within preemption budget",
+        );
     }
 
     if elapsed_us > PREEMPT_BUDGET_US
     {
         crate::log_u64("priority_preemption: elapsed_us=", elapsed_us);
-        return Err("priority_preemption: elevated signal arrived but exceeded preemption budget");
+        return Err(
+            "priority_preemption: elevated notification arrived but exceeded preemption budget",
+        );
     }
 
     // Drain the hog's done bit (it will finish eventually).
     loop
     {
-        let bits = signal_wait_timeout(done, 5_000).unwrap_or(0);
+        let bits = notification_wait_timeout(done, 5_000).unwrap_or(0);
         if bits & 0x1 != 0
         {
             break;

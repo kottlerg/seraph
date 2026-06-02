@@ -109,43 +109,39 @@ Syscall numbers are stable ABI. New syscalls are added at the end; existing numb
 are never reassigned or reused.
 
 ```
- 0  SYS_IPC_CALL              22  SYS_THREAD_EXIT
- 1  SYS_IPC_REPLY             23  SYS_THREAD_CONFIGURE
- 2  SYS_IPC_RECV              24  SYS_CAP_COPY
- 3  SYS_SIGNAL_SEND           25  SYS_CAP_MOVE
- 4  SYS_SIGNAL_WAIT           26  SYS_WAIT_SET_ADD
- 5  SYS_EVENT_POST            27  SYS_WAIT_SET_REMOVE
- 6  SYS_EVENT_RECV            28  SYS_WAIT_SET_WAIT
- 7  SYS_CAP_CREATE_ENDPOINT   29  SYS_IRQ_ACK
- 8  SYS_CAP_CREATE_SIGNAL     30  SYS_IRQ_REGISTER
- 9  SYS_CAP_CREATE_EVENT_Q    31  SYS_CAP_DELETE
-10  SYS_CAP_CREATE_THREAD     32  SYS_CAP_INSERT
-11  SYS_CAP_CREATE_ASPACE     33  SYS_FRAME_SPLIT
-12  SYS_CAP_CREATE_CSPACE     34  SYS_MMIO_MAP
-13  SYS_CAP_CREATE_WAIT_SET   35  SYS_IOPORT_BIND
-14  SYS_CAP_DERIVE            36  (reserved)
-15  SYS_CAP_REVOKE            37  SYS_THREAD_SET_PRIORITY
-16  SYS_MEM_MAP               38  SYS_THREAD_SET_AFFINITY
-17  SYS_MEM_UNMAP             39  SYS_THREAD_READ_REGS
-18  SYS_MEM_PROTECT           40  SYS_THREAD_WRITE_REGS
-19  SYS_THREAD_START          41  SYS_ASPACE_QUERY
-20  SYS_THREAD_STOP           42  SYS_IPC_BUFFER_SET
-21  SYS_THREAD_YIELD          43  SYS_SYSTEM_INFO
-                                44  SYS_SBI_CALL
-                                45  SYS_MMIO_SPLIT
-                                46  SYS_THREAD_SLEEP
-                                47  SYS_THREAD_BIND_NOTIFICATION
-                                48  SYS_CAP_DERIVE_TOKEN
+ 0  SYS_IPC_CALL                 26  SYS_WAIT_SET_ADD
+ 1  SYS_IPC_REPLY                27  SYS_WAIT_SET_REMOVE
+ 2  SYS_IPC_RECV                 28  SYS_WAIT_SET_WAIT
+ 3  SYS_NOTIFICATION_SEND        29  SYS_IRQ_ACK
+ 4  SYS_NOTIFICATION_WAIT        30  SYS_IRQ_REGISTER
+ 5  SYS_EVENT_POST               31  SYS_CAP_DELETE
+ 6  SYS_EVENT_RECV               32  (reserved — was SYS_CAP_INSERT)
+ 7  SYS_CAP_CREATE_ENDPOINT      33  SYS_MEMORY_SPLIT
+ 8  SYS_CAP_CREATE_NOTIFICATION  34  SYS_MMIO_MAP
+ 9  SYS_CAP_CREATE_EVENT_Q       35  SYS_IOPORT_BIND
+10  SYS_CAP_CREATE_THREAD        36  SYS_CAP_INFO
+11  SYS_CAP_CREATE_ASPACE        37  SYS_THREAD_SET_PRIORITY
+12  SYS_CAP_CREATE_CSPACE        38  SYS_THREAD_SET_AFFINITY
+13  SYS_CAP_CREATE_WAIT_SET      39  SYS_THREAD_READ_REGS
+14  SYS_CAP_DERIVE               40  SYS_THREAD_WRITE_REGS
+15  SYS_CAP_REVOKE               41  SYS_ASPACE_QUERY
+16  SYS_MEM_MAP                  42  SYS_IPC_BUFFER_SET
+17  SYS_MEM_UNMAP                43  SYS_SYSTEM_INFO
+18  SYS_MEM_PROTECT              44  SYS_SBI_CALL
+19  SYS_THREAD_START             45  SYS_MMIO_SPLIT
+20  SYS_THREAD_STOP              46  SYS_THREAD_SLEEP
+21  SYS_THREAD_YIELD             47  SYS_THREAD_BIND_NOTIFICATION
+22  SYS_THREAD_EXIT              48  SYS_CAP_DERIVE_BADGE
+23  SYS_THREAD_CONFIGURE         49  SYS_IRQ_SPLIT
+24  SYS_CAP_COPY                 50  SYS_MEMORY_MERGE
+25  SYS_CAP_MOVE                 51  SYS_IOPORT_SPLIT
 ```
 
-**Implementation status.** Handlers implemented: 0–9 (IPC, signal, event
-queue creation and I/O), 7–8 (endpoint/signal creation), 10–13 (thread,
-aspace, cspace, wait set creation), 14–18 (cap management and memory),
-21–28 (thread lifecycle, wait set operations), 29–30 (IRQ ACK and
-register), 31–35 (cap delete/insert, frame split, MMIO map, ioport
-bind), 41–43 (aspace query, ipc buffer set, system info). Slot 36 is
-reserved and returns `UnknownSyscall`. All other unallocated numbers
-return `UnknownSyscall`.
+**Implementation status.** Every number 0–51 has a handler except slot 32,
+which is reserved (formerly `SYS_CAP_INSERT`; its caller-chosen-slot behaviour
+is now reached through `SYS_CAP_COPY`'s destination-slot argument — a value of
+`0` auto-allocates) and returns `UnknownSyscall`. All other unallocated numbers
+also return `UnknownSyscall`.
 
 ---
 
@@ -273,15 +269,15 @@ Wait for a call on an endpoint. Blocks until a caller arrives.
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
 - `rdx`/`a1`: label from the incoming message
-- `rsi`/`a2`: token from the sender's endpoint capability (0 if untokened)
+- `rsi`/`a2`: badge from the sender's endpoint capability (0 if unbadged)
 
 Data words up to `MSG_REGS_DATA_MAX` are returned in registers. Extended payload
 (when the sender set `flags` bit 0) is written to the receiver's IPC buffer page.
 The kernel places a reply capability into a per-thread slot (`reply_cap_slot`);
 this capability is retrieved implicitly by `SYS_IPC_REPLY`.
 
-The token is the value attached to the sender's endpoint capability via
-`SYS_CAP_DERIVE_TOKEN`. It identifies the caller without a forgeable PID.
+The badge is the value attached to the sender's endpoint capability via
+`SYS_CAP_DERIVE_BADGE`. It identifies the caller without a forgeable PID.
 
 **Capability requirement:** `endpoint_cap` must have Receive rights.
 
@@ -289,28 +285,28 @@ The token is the value attached to the sender's endpoint capability via
 
 ---
 
-### `SYS_SIGNAL_SEND` (3)
+### `SYS_NOTIFICATION_SEND` (3)
 
-OR bits into a signal object. Non-blocking; wakes the waiter if one is present.
+OR bits into a notification object. Non-blocking; wakes the waiter if one is present.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `signal_cap` | Signal capability with Signal rights |
-| 1 | `bits` | Bitmask to OR into the signal word |
+| 0 | `notification_cap` | Notification capability with Notification rights |
+| 1 | `bits` | Bitmask to OR into the notification word |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-**Capability requirement:** `signal_cap` must have Signal rights.
+**Capability requirement:** `notification_cap` must have Notification rights.
 
 **Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (bits == 0).
 
 ---
 
-### `SYS_SIGNAL_WAIT` (4)
+### `SYS_NOTIFICATION_WAIT` (4)
 
-Block until at least one bit is set in the signal object, or until the
+Block until at least one bit is set in the notification object, or until the
 optional millisecond timeout elapses. Returns and atomically clears the
 entire bitmask.
 
@@ -318,21 +314,21 @@ entire bitmask.
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `signal_cap` | Signal capability with Wait rights |
+| 0 | `notification_cap` | Notification capability with Wait rights |
 | 1 | `timeout_ms` | `0` = block indefinitely; `>0` = wake after at most `timeout_ms` ms |
 
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: acquired bitmask on success (non-zero on signal wake; `0`
-  on timeout — unambiguous because `signal_send` rejects zero-bit sends,
+- `rdx`/`a1`: acquired bitmask on success (non-zero on notification wake; `0`
+  on timeout — unambiguous because `notification_send` rejects zero-bit sends,
   so a real wake always carries a non-zero mask)
 
 Same register layout as `SYS_EVENT_RECV`. The split avoids aliasing
 bit-63-set bitmasks with the dispatcher's negative-Err encoding, so the
 full 64-bit bitmask range is usable.
 
-**Capability requirement:** `signal_cap` must have Wait rights.
+**Capability requirement:** `notification_cap` must have Wait rights.
 
 **Errors:** `InvalidCapability`, `AccessDenied`, `Interrupted`.
 
@@ -368,7 +364,7 @@ Dequeue the next entry from an event queue with optional bounded wait.
 | 0 | `queue_cap`  | Event queue capability with Recv rights                 |
 | 1 | `timeout_ms` | Wait policy: see sentinels below                        |
 
-`timeout_ms` sentinels (matches `SYS_SIGNAL_WAIT`):
+`timeout_ms` sentinels (matches `SYS_NOTIFICATION_WAIT`):
 
 | Value             | Behaviour                                                       |
 |-------------------|-----------------------------------------------------------------|
@@ -389,8 +385,8 @@ Dequeue the next entry from an event queue with optional bounded wait.
 the caller already knows which mode it asked for. The kernel uses an
 out-of-band marker (`tcb.timed_out`) rather than an in-band
 `wakeup_value` sentinel because event-queue payloads may be any `u64`
-(including 0) — contrast `SYS_SIGNAL_WAIT`, where `wakeup_value == 0`
-suffices because `signal_send` rejects zero-bit sends.
+(including 0) — contrast `SYS_NOTIFICATION_WAIT`, where `wakeup_value == 0`
+suffices because `notification_send` rejects zero-bit sends.
 
 ---
 
@@ -410,9 +406,9 @@ Create a new IPC endpoint. Returns a capability with Send + Receive + Grant righ
 
 ---
 
-### `SYS_CAP_CREATE_SIGNAL` (8)
+### `SYS_CAP_CREATE_NOTIFICATION` (8)
 
-Create a new signal object. Returns a capability with Signal + Wait rights.
+Create a new notification object. Returns a capability with Notification + Wait rights.
 
 **Arguments:** None.
 
@@ -495,7 +491,7 @@ Create a new wait set.
 
 ---
 
-### `SYS_CAP_DERIVE` (13)
+### `SYS_CAP_DERIVE` (14)
 
 Derive a new capability from an existing one, with equal or fewer rights.
 
@@ -514,13 +510,13 @@ in the global derivation tree for revocation tracking.
 **Errors:** `InvalidCapability` (source invalid or null), `AccessDenied` (requested
 rights exceed those held in source), `OutOfMemory` (no free CSpace slot).
 
-If the source capability has a non-zero token, the derived capability inherits it.
+If the source capability has a non-zero badge, the derived capability inherits it.
 
 ---
 
-### `SYS_CAP_DERIVE_TOKEN` (48)
+### `SYS_CAP_DERIVE_BADGE` (48)
 
-Derive a new capability with an attached token value.
+Derive a new capability with an attached badge value.
 
 **Arguments:**
 
@@ -528,28 +524,28 @@ Derive a new capability with an attached token value.
 |---|---|---|
 | 0 | `source_cap` | Source capability descriptor |
 | 1 | `rights_mask` | Rights bitmask for the derived capability (subset of source) |
-| 2 | `token` | Token value to attach (must be non-zero) |
+| 2 | `badge` | Badge value to attach (must be non-zero) |
 
 **Return:** `rax`/`a0`: new capability descriptor on success; `SyscallError` on failure.
 
-The token is an immutable `u64` value stored in the capability slot. When the
-tokened capability is used for IPC (via `SYS_IPC_CALL`), the kernel delivers
-the token to the receiver as the third return value of `SYS_IPC_RECV`.
+The badge is an immutable `u64` value stored in the capability slot. When the
+badged capability is used for IPC (via `SYS_IPC_CALL`), the kernel delivers
+the badge to the receiver as the third return value of `SYS_IPC_RECV`.
 
-Tokens are generic — any capability type can carry a token, not just endpoints.
-For non-endpoint types, the token is stored but not delivered via any kernel
+Badges are generic — any capability type can carry a badge, not just endpoints.
+For non-endpoint types, the badge is stored but not delivered via any kernel
 mechanism; userspace can use it for bookkeeping.
 
-The source capability must have `token == 0`. Re-tokening (setting a new token
-on an already-tokened cap) returns `InvalidArgument`. Derivation via
-`SYS_CAP_DERIVE` inherits the source's token.
+The source capability must have `badge == 0`. Re-badging (setting a new badge
+on an already-badged cap) returns `InvalidArgument`. Derivation via
+`SYS_CAP_DERIVE` inherits the source's badge.
 
-**Errors:** `InvalidCapability`, `InvalidArgument` (token is zero or source
-already tokened), `OutOfMemory`.
+**Errors:** `InvalidCapability`, `InvalidArgument` (badge is zero or source
+already badged), `OutOfMemory`.
 
 ---
 
-### `SYS_CAP_REVOKE` (14)
+### `SYS_CAP_REVOKE` (15)
 
 Revoke a capability and all capabilities derived from it, across all processes.
 
@@ -568,7 +564,7 @@ The underlying kernel object is not freed unless this was the last reference to 
 
 ---
 
-### `SYS_CAP_DELETE` (15)
+### `SYS_CAP_DELETE` (31)
 
 Delete a single capability from the caller's CSpace. Does not affect derived capabilities.
 
@@ -590,30 +586,30 @@ If this is the last reference to the underlying object, the object is freed.
 
 ### `SYS_MEM_MAP` (16)
 
-Map pages from a physical frame capability into an address space.
+Map pages from a physical memory capability into an address space.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `frame_cap` | Frame capability (Map rights) |
+| 0 | `memory_cap` | Memory capability (Map rights) |
 | 1 | `aspace_cap` | Address space capability (Map rights) |
 | 2 | `virt` | Virtual address to map at (page-aligned, user range) |
 | 3 | `offset_pages` | Page offset into the frame |
 | 4 | `page_count` | Number of pages to map (nonzero) |
-| 5 | `prot_bits` | Protection bits: bit 0 = READ, bit 1 = WRITE, bit 2 = EXECUTE. If zero, derived from frame cap rights |
+| 5 | `prot_bits` | Protection bits: bit 0 = READ, bit 1 = WRITE, bit 2 = EXECUTE. If zero, derived from memory cap rights |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If `prot_bits` is nonzero, the requested permissions must be a subset of the frame
+If `prot_bits` is nonzero, the requested permissions must be a subset of the memory
 cap's rights. W^X is enforced: WRITE and EXECUTE may not both be set. Bit 0 (READ)
 carries no permission of its own; it makes an otherwise-empty read-only request
 nonzero so the explicit path is taken instead of deriving from the cap's rights.
 
-If `prot_bits` is zero, permissions are derived from the frame cap's rights directly.
-This fails with `WxViolation` if the frame cap has both WRITE and EXECUTE rights.
+If `prot_bits` is zero, permissions are derived from the memory cap's rights directly.
+This fails with `WxViolation` if the memory cap has both WRITE and EXECUTE rights.
 
-**Capability requirements:** `frame_cap` (Map), `aspace_cap` (Map).
+**Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (requested prot exceeds cap
 rights), `WxViolation` (both WRITE and EXECUTE requested), `InvalidArgument`
@@ -635,7 +631,7 @@ Remove a mapping from an address space.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The physical frame is not freed — only the virtual mapping is removed. The frame
+The physical frame is not freed — only the virtual mapping is removed. The memory
 capability continues to exist. TLB shootdowns are performed on all CPUs running
 threads in `aspace_cap`.
 
@@ -661,7 +657,7 @@ Change the permission flags on an existing mapping without altering the physical
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 W^X is enforced on the new flags. The caller cannot grant rights beyond what the
-frame capability allows (but the frame capability is not re-checked here — the kernel
+memory capability allows (but the memory capability is not re-checked here — the kernel
 records the maximum rights at map time).
 
 **Capability requirement:** `aspace_cap` must have Map rights.
@@ -671,9 +667,9 @@ initial mapping rights), `InvalidArgument` (address not mapped).
 
 ---
 
-### `SYS_FRAME_SPLIT` (33)
+### `SYS_MEMORY_SPLIT` (33)
 
-Split a frame capability at a page boundary, producing two frame capabilities that
+Split a memory capability at a page boundary, producing two memory capabilities that
 together cover the same physical range as the original. The original capability is
 consumed.
 
@@ -681,7 +677,7 @@ consumed.
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `frame_cap` | Frame capability to split |
+| 0 | `memory_cap` | Memory capability to split |
 | 1 | `offset_pages` | Page offset within the frame at which to split |
 
 **Return:**
@@ -691,7 +687,7 @@ consumed.
 - `rdx`/`a1`: capability descriptor for the upper portion (pages offset_pages..end)
   on success
 
-The original `frame_cap` is consumed by this call. Both halves inherit the same
+The original `memory_cap` is consumed by this call. Both halves inherit the same
 rights as the original. The derivation tree treats both halves as children of the
 original's position.
 
@@ -929,12 +925,12 @@ Add an IPC primitive to a wait set.
 | # | Name | Description |
 |---|---|---|
 | 0 | `wait_set_cap` | Wait set capability (Modify rights) |
-| 1 | `source_cap` | Capability to an endpoint, signal, or event queue |
-| 2 | `token` | Opaque u64 returned to the caller when this source is ready |
+| 1 | `source_cap` | Capability to an endpoint, notification, or event queue |
+| 2 | `badge` | Opaque u64 returned to the caller when this source is ready |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The `token` is chosen by the caller to identify the source in a subsequent
+The `badge` is chosen by the caller to identify the source in a subsequent
 `SYS_WAIT_SET_WAIT` result. The kernel does not interpret it.
 
 **Capability requirements:** `wait_set_cap` (Modify), `source_cap` (at least one of
@@ -977,7 +973,7 @@ Block until any member of the wait set becomes ready.
 **Return:**
 
 - `rax`/`a0`: 0 on success; `SyscallError` on failure
-- `rdx`/`a1`: token of the ready source (valid on success)
+- `rdx`/`a1`: badge of the ready source (valid on success)
 
 Only one ready source is returned per call (wake-one semantics). If multiple sources
 are ready simultaneously, subsequent calls return them without blocking.
@@ -1017,25 +1013,25 @@ specific line.
 
 ### `SYS_IRQ_REGISTER` (30)
 
-Register a signal to receive interrupt notifications for a hardware interrupt line.
+Register a notification to receive interrupt notifications for a hardware interrupt line.
 When the interrupt fires, the kernel delivers it by ORing a notification bit into
-the registered signal.
+the registered notification.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
 | 0 | `irq_cap` | Interrupt capability for the line to register |
-| 1 | `signal_cap` | Signal capability (Signal rights) to notify on interrupt |
+| 1 | `notification_cap` | Notification capability (Notification rights) to notify on interrupt |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-Only one signal may be registered per interrupt line at a time. A second call
+Only one notification may be registered per interrupt line at a time. A second call
 replaces the previous registration. The kernel masks the interrupt line before
 delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it.
 
-**Capability requirements:** `irq_cap` (valid interrupt capability), `signal_cap`
-(Signal rights).
+**Capability requirements:** `irq_cap` (valid interrupt capability), `notification_cap`
+(Notification rights).
 
 **Errors:** `InvalidCapability`, `AccessDenied`.
 
@@ -1043,7 +1039,7 @@ delivering the notification; the driver MUST call `SYS_IRQ_ACK` to re-enable it.
 
 ### `SYS_IOPORT_BIND` (35)
 
-Bind an IoPortRange capability to a thread, granting that thread permission to
+Bind an IoPort capability to a thread, granting that thread permission to
 execute `in`/`out` instructions for the capability's port range via the TSS I/O
 Permission Bitmap (IOPB).
 
@@ -1054,7 +1050,7 @@ Permission Bitmap (IOPB).
 | # | Name | Description |
 |---|---|---|
 | 0 | `thread_cap` | Thread capability (Control rights) |
-| 1 | `ioport_cap` | IoPortRange capability (Use rights) |
+| 1 | `ioport_cap` | IoPort capability (Use rights) |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
@@ -1116,7 +1112,7 @@ on success; `SyscallError` on failure.
 
 ## Cross-CSpace Syscalls
 
-### `SYS_CAP_COPY` (25)
+### `SYS_CAP_COPY` (24)
 
 Copy a capability from the caller's CSpace into another CSpace, creating a new
 derivation tree node (child of the source slot).
@@ -1127,13 +1123,18 @@ derivation tree node (child of the source slot).
 |---|---|---|
 | 0 | `src_cap` | Capability to copy (source slot in caller's CSpace) |
 | 1 | `dst_cspace_cap` | Target CSpace capability (Insert rights) |
-| 2 | `dst_slot` | Destination slot index in the target CSpace |
+| 2 | `dst_slot` | Destination slot index in the target CSpace, or `0` to let the kernel allocate a free slot (slot 0 is permanently null, so it is a safe "kernel picks" sentinel) |
 | 3 | `rights_mask` | Rights for the copy (must be subset of source rights) |
 
-**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+**Return:** `rax`/`a0`: the destination slot index on success; `SyscallError` on
+failure.
 
 The copy is a derivation (child of `src_cap` in the tree). Both the original and
-the copy remain valid. Used by init to delegate capabilities to services.
+the copy remain valid. With `dst_slot == 0` the kernel auto-allocates a free
+slot (and returns it); with a non-zero `dst_slot` the cap is placed at that
+caller-chosen index — the path init uses to populate well-known slots in new
+service CSpaces before starting their threads. This caller-chosen-slot mode
+absorbed the former `SYS_CAP_INSERT` (slot 32, now reserved).
 
 **Capability requirements:** `src_cap` (at least one right), `dst_cspace_cap` (Insert).
 
@@ -1142,7 +1143,7 @@ or out of range), `OutOfMemory`.
 
 ---
 
-### `SYS_CAP_MOVE` (26)
+### `SYS_CAP_MOVE` (25)
 
 Move a capability from the caller's CSpace into another CSpace. Transfer semantics:
 the source slot is cleared; the destination inherits the source's derivation position.
@@ -1164,62 +1165,35 @@ or out of range).
 
 ---
 
-### `SYS_CAP_INSERT` (31)
-
-Insert a derived copy of a capability from the caller's CSpace into another CSpace.
-Like `SYS_CAP_COPY` but uses a CSpace capability directly for the destination.
-
-**Arguments:**
-
-| # | Name | Description |
-|---|---|---|
-| 0 | `cspace_cap` | CSpace capability (Insert rights) for the target CSpace |
-| 1 | `source_cap` | Capability to copy |
-| 2 | `dest_slot` | Slot index in the target CSpace |
-| 3 | `rights_mask` | Rights for the inserted capability (subset of source rights) |
-
-**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
-
-Used by init to populate new service CSpaces before starting their threads.
-
-**Capability requirements:** `cspace_cap` (Insert), `source_cap` (at least one right).
-
-**Errors:** `InvalidCapability`, `AccessDenied` (requested rights exceed source rights,
-or dest_slot is already occupied), `InvalidArgument` (dest_slot out of range or
-exceeds CSpace ceiling), `OutOfMemory`.
-
----
-
 ## Address Space Syscall
 
 ### `SYS_ASPACE_QUERY` (41)
 
-Query the mapping at a virtual address in an address space.
+Translate a user virtual address to its mapped physical address.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `aspace_cap` | Address space capability (Read rights) |
-| 1 | `virt` | Virtual address to query (page-aligned) |
-| 2 | `buf_ptr` | Pointer to a buffer to receive mapping info |
+| 0 | `aspace_cap` | AddressSpace cap slot (must have `READ` right) |
+| 1 | `virt` | Page-aligned virtual address to translate (user half only) |
 
-**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+**Return:** `rax`/`a0`: the mapped physical address on success; negative
+`SyscallError` on failure.
 
-The buffer receives an architecture-neutral mapping descriptor: physical address,
-page size, and permission flags. If `virt` is not mapped, the call fails with
-`InvalidArgument`. Layout is defined in the kernel ABI headers.
+**Capability requirement:** `READ` right on the AddressSpace cap.
 
-**Capability requirement:** `aspace_cap` must have Read rights.
-
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidArgument` (address not
-mapped, unaligned, or non-canonical).
+**Errors:**
+- `InvalidAddress` — `virt` is not page-aligned, outside the user half
+  (`>= 0x0000_8000_0000_0000`), or not currently mapped.
+- `InvalidCapability` — cap slot is null, wrong type, or the object is gone.
+- `InsufficientRights` — cap does not have the `READ` right.
 
 ---
 
 ## IPC Buffer Syscall
 
-### `SYS_IPC_BUFFER_SET` (41)
+### `SYS_IPC_BUFFER_SET` (42)
 
 Register the per-thread IPC buffer page. This is the page the kernel uses for
 extended IPC payloads (when `flags` bit 0 is set in `SYS_IPC_CALL` or
@@ -1312,28 +1286,6 @@ pub enum SystemInfoType
 
 ---
 
-### `SYS_ASPACE_QUERY` (41)
-
-Translate a user virtual address to its mapped physical address.
-
-**Arguments:**
-
-| # | Name | Description |
-|---|---|---|
-| 0 | `aspace_cap` | AddressSpace cap slot (must have `READ` right) |
-| 1 | `virt` | Page-aligned virtual address to translate (user half only) |
-
-**Return:** `rax`/`a0`: the mapped physical address on success; negative `SyscallError` on failure.
-
-**Capability requirement:** `READ` right on the AddressSpace cap.
-
-**Errors:**
-- `InvalidAddress` — `virt` is not page-aligned, outside the user half (`>= 0x0000_8000_0000_0000`), or not currently mapped.
-- `InvalidCapability` — cap slot is null, wrong type, or object is gone.
-- `InsufficientRights` — cap does not have `READ` right.
-
----
-
 ## Revocation Notes
 
 ### `SYS_CAP_REVOKE` targets the caller's own CSpace
@@ -1351,7 +1303,7 @@ To delegate authority that can later be revoked without losing your own access:
 1. Hold capability C (the original)
 2. Derive C1 from C — you retain C1 as an intermediary
 3. Derive C2 from C1 — C2 is the delegated capability
-4. Transfer C2 to the child process via SYS_CAP_INSERT or IPC
+4. Transfer C2 to the child process via SYS_CAP_COPY or IPC
 5. To revoke: call SYS_CAP_REVOKE(C1) — destroys C1 and C2
    You still hold C with full rights.
 ```
@@ -1384,7 +1336,7 @@ all its descendants (including C2) but leaves C and any other children of C inta
   uses appropriate locks and re-checks state on resumption to ensure correctness.
 
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
-  `SYS_IPC_RECV`, `SYS_SIGNAL_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`) returns
+  `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`) returns
   `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`.
 
 ---

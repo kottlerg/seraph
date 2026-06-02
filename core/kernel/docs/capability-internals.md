@@ -99,9 +99,9 @@ pub struct CapabilitySlot
     /// Rights bitmask for this slot. Interpretation is tag-dependent.
     rights: Rights,
 
-    /// Caller-identifying token (0 = untokened). Set via SYS_CAP_DERIVE_TOKEN.
+    /// Caller-identifying badge (0 = unbadged). Set via SYS_CAP_DERIVE_BADGE.
     /// Immutable once set; inherited by derivation and copy.
-    token: u64,
+    badge: u64,
 
     /// Pointer to the kernel object this capability refers to.
     /// Null when tag == CapTag::Null.
@@ -134,19 +134,19 @@ mis-target the new tenant. See #137 for the recycling allocator design.
 pub enum CapTag
 {
     Null          = 0,
-    Frame         = 1,
+    Memory        = 1,   // memory authority (Untyped/retype source)
     AddressSpace  = 2,
     Endpoint      = 3,
-    Signal        = 4,
+    Notification  = 4,   // bitmask-based async notification
     EventQueue    = 5,
-    Thread        = 6,
-    CSpace        = 7,   // capability space; explicit kernel object
-    WaitSet       = 8,
-    Interrupt     = 9,
-    MmioRegion    = 10,
-    Reply         = 11,  // single-use; not derivable
-    IoPortRange   = 12,  // x86-64 only; created at boot from platform_resources
-    SchedControl  = 13,  // authority to set elevated scheduling priorities
+    Interrupt     = 6,
+    Mmio          = 7,   // memory-mapped I/O region
+    Thread        = 8,
+    CSpace        = 9,   // capability space; explicit kernel object
+    WaitSet       = 10,
+    IoPort        = 11,  // x86-64 only; created at boot from platform_resources
+    SchedControl  = 12,  // authority to set elevated scheduling priorities
+    SbiControl    = 13,  // SBI forwarding authority (RISC-V only)
 }
 ```
 
@@ -156,48 +156,47 @@ pub enum CapTag
 bitflags! {
     pub struct Rights: u32
     {
-        // Frame rights
-        const MAP        = 1 << 0;
-        const WRITE      = 1 << 1;
-        const EXECUTE    = 1 << 2;
+        // Memory / address space
+        const MAP        = 1 << 0;   // may map this memory into an address space
+        const WRITE      = 1 << 1;   // may create writable mappings
+        const EXECUTE    = 1 << 2;   // may create executable mappings
+        const READ       = 1 << 3;   // may read/inspect mappings (AddressSpace)
 
-        // Address space rights
-        // MAP reused — same bit, tag-dependent: covers both "map frames into
-        // this address space" and "create threads that run in this address space"
-        const READ_ASPACE = 1 << 14;  // may inspect current mappings
+        // IPC endpoint
+        const SEND       = 1 << 4;
+        const RECEIVE    = 1 << 5;
+        const GRANT      = 1 << 6;   // may include capabilities in IPC messages
 
-        // Endpoint rights
-        const SEND       = 1 << 3;
-        const RECEIVE    = 1 << 4;
-        const GRANT      = 1 << 5;
+        // Notification / event queue
+        const NOTIFY     = 1 << 7;
+        const WAIT       = 1 << 8;   // notification or wait set
+        const POST       = 1 << 9;
+        const RECV       = 1 << 10;
 
-        // Signal rights
-        const SIGNAL     = 1 << 6;
-        const WAIT       = 1 << 7;
+        // Thread
+        const CONTROL    = 1 << 11;  // start, stop, configure
+        const OBSERVE    = 1 << 12;  // read register state
 
-        // Event queue rights
-        const POST       = 1 << 8;
-        const RECV       = 1 << 9;
+        // CSpace
+        const INSERT     = 1 << 13;
+        const DELETE     = 1 << 14;
+        const DERIVE     = 1 << 15;
+        const REVOKE     = 1 << 16;
 
-        // Thread rights
-        const CONTROL    = 1 << 10;
-        const OBSERVE    = 1 << 11;
+        // WaitSet
+        const MODIFY     = 1 << 17;  // add or remove members
 
-        // CSpace rights
-        const INSERT     = 1 << 12;  // may place a capability into a slot
-        // (DELETE reuses a bit below)
-        const DERIVE_CAP = 1 << 17;  // may derive a cap from an existing slot
-        const REVOKE_CAP = 1 << 18;  // may revoke a cap and all its descendants
+        // IoPort
+        const USE        = 1 << 18;  // bind port range to a thread
 
-        // Wait set rights
-        const MODIFY     = 1 << 13;
-        // (WAIT reused for wait set wait right)
+        // SchedControl
+        const ELEVATE    = 1 << 19;  // set thread priority in the elevated range
 
-        // IoPortRange rights
-        const USE        = 1 << 15;  // may bind port range to a thread
+        // SbiControl
+        const CALL       = 1 << 20;  // forward SBI calls to firmware (RISC-V only)
 
-        // SchedControl rights
-        const ELEVATE    = 1 << 16;  // may set thread priority in elevated range (21–30)
+        // Memory retype
+        const RETYPE     = 1 << 21;  // retype a Memory cap's region into kernel objects
     }
 }
 ```
@@ -226,7 +225,7 @@ mapping — no page may be simultaneously writable and executable.
 
 ### Kernel Object Reference Counting
 
-Each kernel object (Endpoint, Signal, EventQueue, etc.) has an embedded reference
+Each kernel object (Endpoint, Notification, EventQueue, etc.) has an embedded reference
 count representing the number of capability slots that point to it:
 
 ```rust
@@ -246,7 +245,7 @@ membership is one such owner: `sys_wait_set_add` `inc_ref`s the source's
 header under the source's lock together with the back-pointer publication;
 `sys_wait_set_remove` and `wait_set_drop` perform the matching `dec_ref`. The
 source's state therefore outlives every wait-set member referencing it; the
-Endpoint/Signal/EventQueue dealloc arms only `debug_assert` that
+Endpoint/Notification/EventQueue dealloc arms only `debug_assert` that
 `state.wait_set` is null on entry (the invariant follows from the refcount).
 
 ---
@@ -339,7 +338,7 @@ own access:
 1. Hold capability C (the original).
 2. Derive C1 from C — you retain C1 as an intermediary.
 3. Derive C2 from C1 — C2 is the delegated capability.
-4. Transfer C2 to the child process via SYS_CAP_INSERT or IPC capability slots.
+4. Transfer C2 to the child process via SYS_CAP_COPY or IPC capability slots.
 5. To revoke: call SYS_CAP_REVOKE on your slot holding C1.
    This destroys C1 and C2 (all descendants of C1).
    You still hold C with its full rights intact.
@@ -379,13 +378,13 @@ layout via a well-known structure at the top of init's stack.
 | 2 | Init's own address space capability |
 | 3 | Init's own CSpace capability |
 | 4 | SchedControl capability (Elevate rights) |
-| 5..N | Frame capabilities (one per usable physical region) |
+| 5..N | Memory capabilities (one per usable physical region) |
 | N+1..M | MMIO region capabilities (one per MmioRange / PciEcam entry) |
 | M+1..K | Interrupt capabilities (one per IrqLine entry) |
-| K+1..L | Read-only Frame capabilities (one per PlatformTable entry) |
-| L+1..P | IoPortRange capabilities (one per IoPortRange entry; x86-64 only) |
-| P+1..Q | Frame capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
-| Q+1..R | Reclaimable Frame capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Frame caps above) — one cap per `BootInfo.reclaim_ranges` entry |
+| K+1..L | Read-only Memory capabilities (one per PlatformTable entry) |
+| L+1..P | IoPort capabilities (one per IoPort entry; x86-64 only) |
+| P+1..Q | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
+| Q+1..R | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry |
 
 The exact slot numbers are passed to init in the `KernelHandoff` structure placed
 on init's user stack before it begins execution.
@@ -416,10 +415,11 @@ transfer_cap(sender, sender_slot_idx, receiver, receiver_slot_idx):
 The derivation write lock is held for the duration of the transfer. This ensures
 no revocation can run concurrently with a transfer, preventing torn state.
 
-Reply capabilities (`CapTag::Reply`) are not part of the derivation tree — they are
-single-use, cannot be derived, and are not tracked for revocation. They are created
-by the kernel at `SYS_IPC_RECV` time and stored in a per-thread slot, outside the
-process CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
+Reply capabilities are not part of the derivation tree — they are single-use,
+cannot be derived, and are not tracked for revocation. A reply capability is not
+a `CapTag` variant; it is an implicit per-thread mechanism created by the kernel
+at `SYS_IPC_RECV` time and stored in a per-thread slot, outside the process
+CSpace. The kernel clears the per-thread reply slot after `SYS_IPC_REPLY`.
 
 ---
 

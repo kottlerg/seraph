@@ -16,7 +16,7 @@ use std::os::seraph::StartupInfo;
 /// `MAX_APERTURE_CAPS`.
 pub const MAX_APERTURES: usize = 32;
 
-/// Maximum ACPI reclaimable-region Frame caps. Matches init's
+/// Maximum ACPI reclaimable-region Memory caps. Matches init's
 /// `MAX_ACPI_REGION_CAPS`.
 pub const MAX_ACPI_REGIONS: usize = 8;
 
@@ -41,7 +41,7 @@ impl Aperture
     }
 }
 
-/// An ACPI reclaimable-region Frame cap with its physical range.
+/// An ACPI reclaimable-region Memory cap with its physical range.
 #[derive(Clone, Copy)]
 pub struct AcpiRegion
 {
@@ -83,7 +83,7 @@ pub mod kind
     pub const APERTURE: u64 = 2;
     pub const ACPI_REGION: u64 = 3;
     /// Round carrying svcmgr publish-authority cap + (x86) the root
-    /// `IoPortRange` cap copy. One-shot, always terminal.
+    /// `IoPort` cap copy. One-shot, always terminal.
     pub const SVCMGR_BUNDLE: u64 = 4;
     /// Round carrying bootloader-discovered framebuffer geometry
     /// (`physical_base`, `width`, `height`, `stride`, `pixel_format`).
@@ -123,9 +123,9 @@ pub struct DevmgrCaps
 {
     // Authority caps from init.
     pub irq_range_cap: u32,
-    pub rsdp_frame_cap: u32,
+    pub rsdp_memory_cap: u32,
     pub rsdp_page_base: u64,
-    pub dtb_frame_cap: u32,
+    pub dtb_memory_cap: u32,
     pub dtb_page_base: u64,
     pub dtb_size: u64,
 
@@ -133,7 +133,7 @@ pub struct DevmgrCaps
     pub apertures: [Aperture; MAX_APERTURES],
     pub aperture_count: usize,
 
-    // ACPI reclaimable-region Frame caps.
+    // ACPI reclaimable-region Memory caps.
     pub acpi_regions: [AcpiRegion; MAX_ACPI_REGIONS],
     pub acpi_region_count: usize,
 
@@ -150,12 +150,12 @@ pub struct DevmgrCaps
     pub driver_module_count: usize,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
-    // tokened on. Reserved for devmgr-initiated publications; the active
+    // badged on. Reserved for devmgr-initiated publications; the active
     // svcmgr publications (`timed`, `rootfs.root`, `pwrmgr.*`, `svcmgr`,
     // `devmgr.registry`) are init-issued.
     pub svcmgr_publish_cap: u32,
 
-    // Copy of init's root `IoPortRange` cap (x86-64 only; zero on RISC-V).
+    // Copy of init's root `IoPort` cap (x86-64 only; zero on RISC-V).
     // devmgr derives per-driver narrow copies for ISA peripherals
     // (CMOS RTC at ports 0x70-0x71; COM1 at 0x3F8-0x3FF for serial) and,
     // on `QUERY_SHUTDOWN_DEVICE`, the PM1a + 8042-reset ports for pwrmgr.
@@ -181,9 +181,9 @@ impl DevmgrCaps
     {
         Self {
             irq_range_cap: 0,
-            rsdp_frame_cap: 0,
+            rsdp_memory_cap: 0,
             rsdp_page_base: 0,
-            dtb_frame_cap: 0,
+            dtb_memory_cap: 0,
             dtb_page_base: 0,
             dtb_size: 0,
             apertures: [Aperture::empty(); MAX_APERTURES],
@@ -266,12 +266,12 @@ fn bootstrap_round1(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
     }
     if presence & present::RSDP != 0 && idx < round1.cap_count
     {
-        caps.rsdp_frame_cap = round1.caps[idx];
+        caps.rsdp_memory_cap = round1.caps[idx];
         idx += 1;
     }
     if presence & present::DTB != 0 && idx < round1.cap_count
     {
-        caps.dtb_frame_cap = round1.caps[idx];
+        caps.dtb_memory_cap = round1.caps[idx];
         idx += 1;
     }
     let _ = idx;
@@ -417,7 +417,7 @@ fn bootstrap_rounds(creator: u32, ipc_buf: *mut u64, caps: &mut DevmgrCaps) -> O
                 // caps[0] = svcmgr publish-authority cap (always present;
                 //           a zero slot indicates init's derive failed and
                 //           is treated as a bootstrap fatal).
-                // caps[1] = arch shutdown-authority cap: root IoPortRange
+                // caps[1] = arch shutdown-authority cap: root IoPort
                 //           on x86-64, SbiControl on RISC-V. Same slot
                 //           either way; the receiver routes it by arch.
                 if round.cap_count < 1 || round.caps[0] == 0

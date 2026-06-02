@@ -11,18 +11,18 @@
 //! ## Read path
 //! - Reads ≤ 504 bytes that fit within the current page use the
 //!   inline `FS_READ` path; payload bytes ride in the IPC buffer.
-//! - Larger reads use `FS_READ_FRAME`: the driver returns a Frame
+//! - Larger reads use `FS_READ_MEMORY`: the driver returns a Memory cap
 //!   cap covering one cached page; we reserve VA, `mem_map` it
 //!   read-only, memcpy out, then proactively release the cache slot
-//!   via `FS_RELEASE_FRAME` and tear the mapping down locally.
+//!   via `FS_RELEASE_MEMORY` and tear the mapping down locally.
 //!
 //! ## Write path
 //! - Writes ≤ 504 bytes use the inline `FS_WRITE` path with the
 //!   payload riding in the IPC buffer.
-//! - Larger writes use `FS_WRITE_FRAME`: one memmgr-allocated page
+//! - Larger writes use `FS_WRITE_MEMORY`: one memmgr-allocated page
 //!   is mapped MAP_WRITABLE in the caller's address space, filled
 //!   chunk-by-chunk, and handed to the driver as a DMA source. The
-//!   driver returns the same Frame cap back to us in the reply so
+//!   driver returns the same Memory cap back to us in the reply so
 //!   the cap slot id is rebound across iterations.
 //!
 //! ## Directory mutation
@@ -46,12 +46,12 @@
 //! `FileAttr::modified()` surfaces `Unsupported` in that case.
 //!
 //! ## Per-`File` release-endpoint plumbing
-//! A tokened derivation off the per-process release endpoint owned
+//! A badged derivation off the per-process release endpoint owned
 //! by [`release_handler`] is allocated on every open and transferred
 //! to the driver via `caps[0]` of the first
-//! [`fs_labels::FS_READ_FRAME`] request for that `File`. The driver
+//! [`fs_labels::FS_READ_MEMORY`] request for that `File`. The driver
 //! records it on the file's `OpenFile` slot; its eviction worker
-//! uses it to issue cooperative [`fs_labels::FS_RELEASE_FRAME`] back
+//! uses it to issue cooperative [`fs_labels::FS_RELEASE_MEMORY`] back
 //! to us before falling through to hard-revoke. Files that never
 //! trigger a frame-read (only inline `FS_READ` / `FS_WRITE`) never
 //! deliver the cap and get the hard-revoke fallback; the cap is
@@ -95,7 +95,7 @@ use release_handler::{FileEntry, OutstandingMapping};
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
 /// Per-call crossover threshold between the inline FS_READ path and the
-/// zero-copy FS_READ_FRAME path. A `read()` of at most this many bytes
+/// zero-copy FS_READ_MEMORY path. A `read()` of at most this many bytes
 /// that also fits within the current page goes inline; anything larger
 /// or page-straddling takes the frame path.
 ///
@@ -109,7 +109,7 @@ const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 const READ_INLINE_THRESHOLD: usize = 504;
 
 /// Per-call crossover threshold between the inline FS_WRITE path and
-/// the zero-copy FS_WRITE_FRAME path. A `write()` of at most this many
+/// the zero-copy FS_WRITE_MEMORY path. A `write()` of at most this many
 /// bytes goes inline; anything larger takes the frame path. Mirrors
 /// `READ_INLINE_THRESHOLD` for symmetry: 504 bytes = 63 data words ×
 /// 8 bytes − 8 bytes of length prefix in word 0.
@@ -416,7 +416,7 @@ impl DirEntry
 /// Result of [`walk_path_to_file`].
 pub(crate) struct WalkedFile
 {
-    /// Tokened SEND addressing the resolved file node. Caller owns and
+    /// Badged SEND addressing the resolved file node. Caller owns and
     /// must `cap_delete` when no longer needed.
     pub file_cap: u32,
     /// Size of the file as reported by the final `NS_LOOKUP`'s size hint.
@@ -426,7 +426,7 @@ pub(crate) struct WalkedFile
 /// Result of [`walk_path_to_dir`].
 pub(crate) struct WalkedDir
 {
-    /// Tokened SEND addressing the resolved directory node. Caller owns
+    /// Badged SEND addressing the resolved directory node. Caller owns
     /// and must `cap_delete` when no longer needed.
     pub dir_cap: u32,
 }
@@ -435,7 +435,7 @@ pub(crate) struct WalkedDir
 ///
 /// Splits on `/`, drops empty segments, validates component names per
 /// the namespace-protocol rules. Every hop (including the final) must
-/// resolve to a directory. Returns a freshly derived tokened SEND on
+/// resolve to a directory. Returns a freshly derived badged SEND on
 /// the directory. On any error the helper deletes any partial cap it
 /// owns before returning.
 ///
@@ -476,7 +476,7 @@ pub(crate) fn walk_path_to_dir_with_rights(
 /// Splits on `/`, drops empty segments, validates component names per
 /// the namespace-protocol rules. Each non-final hop must resolve to a
 /// directory; the final hop must resolve to a file. Returns a freshly
-/// derived tokened SEND on the file plus its size hint. On any error
+/// derived badged SEND on the file plus its size hint. On any error
 /// the helper deletes any partial cap it owns before returning.
 ///
 /// Used by `File::open` and by `Command::spawn` (binary lookup); both
@@ -690,7 +690,7 @@ fn walk_components(
 /// uses [`walk_path_to_dir`] anchored at `root_dir_cap` for absolute
 /// paths and `current_dir_cap` for relative paths. If the parent is
 /// the anchor itself (no intermediate components), the anchor cap is
-/// returned with `parent_owned == false`; otherwise an owned tokened
+/// returned with `parent_owned == false`; otherwise an owned badged
 /// SEND is returned and the caller is responsible for `cap_delete`.
 ///
 /// Used by `unlink`, `rmdir`, `rename`, `DirBuilder::mkdir`, and the
@@ -829,12 +829,12 @@ fn write_inline(
     Ok(reply.word(0) as usize)
 }
 
-/// Bulk write via `FS_WRITE_FRAME`. Acquires one page-sized DMA
+/// Bulk write via `FS_WRITE_MEMORY`. Acquires one page-sized DMA
 /// source frame from memmgr, maps it MAP_WRITABLE, then loops chunks
 /// of at most `PAGE_SIZE` bytes through the frame and into the file.
 /// The server returns the source frame in the reply caps each
 /// round-trip, so the cap slot id is rebound on every iteration.
-fn write_frame_chunks(
+fn write_memory_chunks(
     file_cap: u32,
     aspace: u32,
     memmgr_ep: u32,
@@ -846,31 +846,31 @@ fn write_frame_chunks(
     use ipc::{memmgr_errors, memmgr_labels};
 
     // Acquire one single-page frame from memmgr.
-    let req = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+    let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(memmgr_ep, &req, ipc_buf) }
-        .map_err(|_| io::Error::other("seraph fs: memmgr REQUEST_FRAMES ipc_call failed"))?;
+        .map_err(|_| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS ipc_call failed"))?;
     if reply.label != memmgr_errors::SUCCESS
     {
-        return Err(io::Error::other("seraph fs: memmgr REQUEST_FRAMES failed"));
+        return Err(io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"));
     }
-    let mut frame_cap = *reply
+    let mut memory_cap = *reply
         .caps()
         .first()
         .ok_or_else(|| io::Error::other("seraph fs: memmgr returned no frame"))?;
 
     // Reserve VA and map the frame MAP_WRITABLE.
     let range = crate::sys::reserve::reserve_pages(1).map_err(|_| {
-        let _ = syscall::cap_delete(frame_cap);
+        let _ = syscall::cap_delete(memory_cap);
         io::Error::other("seraph fs: reserve_pages failed for write frame")
     })?;
     let va = range.va_start();
-    if syscall::mem_map(frame_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
+    if syscall::mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
     {
         crate::sys::reserve::unreserve_pages(range);
-        let _ = syscall::cap_delete(frame_cap);
+        let _ = syscall::cap_delete(memory_cap);
         return Err(io::Error::other("seraph fs: mem_map MAP_WRITABLE failed"));
     }
 
@@ -890,23 +890,23 @@ fn write_frame_chunks(
                 );
             }
             let chunk_offset = base_offset.saturating_add(total as u64);
-            let msg = IpcMessage::builder(fs_labels::FS_WRITE_FRAME)
+            let msg = IpcMessage::builder(fs_labels::FS_WRITE_MEMORY)
                 .word(0, chunk_offset)
                 .word(1, chunk_len as u64)
                 .word(2, 0)
-                .cap(frame_cap)
+                .cap(memory_cap)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer.
             let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
-                .map_err(|_| io::Error::other("seraph fs: FS_WRITE_FRAME ipc_call failed"))?;
+                .map_err(|_| io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed"))?;
             if reply.label != fs_errors::SUCCESS
             {
                 return Err(map_fs_error(reply.label));
             }
             // Server moves the source frame back in caps[0]; the slot
             // id may differ from the one we sent.
-            frame_cap = *reply.caps().first().ok_or_else(|| {
-                io::Error::other("seraph fs: FS_WRITE_FRAME reply missing frame cap")
+            memory_cap = *reply.caps().first().ok_or_else(|| {
+                io::Error::other("seraph fs: FS_WRITE_MEMORY reply missing memory cap")
             })?;
             let n = reply.word(0) as usize;
             total += n;
@@ -921,7 +921,7 @@ fn write_frame_chunks(
 
     // Tear down regardless of result.
     let _ = syscall::mem_unmap(aspace, va, 1);
-    let _ = syscall::cap_delete(frame_cap);
+    let _ = syscall::cap_delete(memory_cap);
     crate::sys::reserve::unreserve_pages(range);
 
     result.map(|()| total)
@@ -1013,20 +1013,20 @@ pub struct File
 {
     /// Per-file node capability returned by the final `NS_LOOKUP` of
     /// the open walk. Receives every file-scoped op (FS_READ,
-    /// FS_READ_FRAME, FS_WRITE, FS_WRITE_FRAME, FS_TRUNCATE,
-    /// FS_CLOSE, synchronous client-initiated FS_RELEASE_FRAME).
+    /// FS_READ_MEMORY, FS_WRITE, FS_WRITE_MEMORY, FS_TRUNCATE,
+    /// FS_CLOSE, synchronous client-initiated FS_RELEASE_MEMORY).
     file_cap: u32,
-    /// Token identifying this `File` for the release-handler dispatch.
+    /// Badge identifying this `File` for the release-handler dispatch.
     /// Carried inside the per-process release endpoint so an inbound
-    /// `FS_RELEASE_FRAME` from the driver routes to this `File`'s
+    /// `FS_RELEASE_MEMORY` from the driver routes to this `File`'s
     /// outstanding-mappings registry.
-    token: u64,
-    /// Tokened SEND on the per-process release endpoint. We retain
+    badge: u64,
+    /// Badged SEND on the per-process release endpoint. We retain
     /// the parent in our CSpace; on Drop we delete it so any
     /// in-flight forced release fails cleanly at the kernel.
     release_send: u32,
     /// True once the per-process release-endpoint SEND has been
-    /// transmitted to the driver via `caps[0]` of an `FS_READ_FRAME`
+    /// transmitted to the driver via `caps[0]` of an `FS_READ_MEMORY`
     /// request. Set on first successful frame-read; subsequent reads
     /// omit the cap so the kernel does not perform a wasted transfer.
     /// `swap` is the only mutator — first reader wins under contention.
@@ -1160,9 +1160,9 @@ impl File
         // ── Release-handler plumbing ─────────────────────────────────
         //
         // The `release_send` cap is unused on the inline `FS_READ`/
-        // `FS_WRITE` paths; on the first `FS_READ_FRAME` it is
+        // `FS_WRITE` paths; on the first `FS_READ_MEMORY` it is
         // transferred to the driver in `caps[0]` so the driver's
-        // eviction worker can route cooperative `FS_RELEASE_FRAME`
+        // eviction worker can route cooperative `FS_RELEASE_MEMORY`
         // back here. Failure paths below roll the setup back so a
         // refused open never leaks an entry into the release handler.
         let state = match release_handler::ensure_started()
@@ -1174,20 +1174,20 @@ impl File
                 return Err(e);
             }
         };
-        let token = release_handler::allocate_token(state);
-        let entry = release_handler::register(state, token);
+        let badge = release_handler::allocate_badge(state);
+        let entry = release_handler::register(state, badge);
 
         let release_ep = release_handler::release_endpoint(state);
         let release_send =
-            match syscall::cap_derive_token(release_ep, syscall::RIGHTS_SEND, token)
+            match syscall::cap_derive_badge(release_ep, syscall::RIGHTS_SEND, badge)
             {
                 Ok(c) => c,
                 Err(_) =>
                 {
-                    let _ = release_handler::unregister(state, token);
+                    let _ = release_handler::unregister(state, badge);
                     let _ = syscall::cap_delete(file_cap);
                     return Err(io::Error::other(
-                        "seraph fs: cap_derive_token (release send) failed",
+                        "seraph fs: cap_derive_badge (release send) failed",
                     ));
                 }
             };
@@ -1197,7 +1197,7 @@ impl File
 
         Ok(File {
             file_cap,
-            token,
+            badge,
             release_send,
             release_delivered: AtomicBool::new(false),
             aspace: info.self_aspace,
@@ -1325,17 +1325,17 @@ impl File
     {
         let ipc_buf = crate::os::seraph::current_ipc_buf();
         let cookie = next_cookie();
-        // First FS_READ_FRAME for this File carries the per-process
+        // First FS_READ_MEMORY for this File carries the per-process
         // release-endpoint SEND in caps[0]; the driver records it on
         // the OpenFile slot's first allocation so the eviction worker
-        // can route cooperative FS_RELEASE_FRAME back to us instead
+        // can route cooperative FS_RELEASE_MEMORY back to us instead
         // of hard-revoking the page. `swap` ensures only one concurrent
         // reader attempts the transfer — the kernel `transfer_caps`
         // path moves the cap out of our CSpace, leaving the source slot
         // null, so a second concurrent attempt would fail at kernel
         // pre-validation.
         let send_release = !self.release_delivered.swap(true, Ordering::Relaxed);
-        let mut builder = IpcMessage::builder(fs_labels::FS_READ_FRAME)
+        let mut builder = IpcMessage::builder(fs_labels::FS_READ_MEMORY)
             .word(0, pos)
             .word(1, cookie);
         if send_release
@@ -1345,35 +1345,35 @@ impl File
         let msg = builder.build();
         // SAFETY: ipc_buf is the registered IPC buffer.
         let reply = unsafe { ipc::ipc_call(self.file_cap, &msg, ipc_buf) }
-            .map_err(|_| io::Error::other("seraph fs: FS_READ_FRAME ipc_call failed"))?;
+            .map_err(|_| io::Error::other("seraph fs: FS_READ_MEMORY ipc_call failed"))?;
         if reply.label != fs_errors::SUCCESS
         {
             return Err(map_fs_error(reply.label));
         }
         let bytes_valid = reply.word(0) as usize;
-        let frame_data_offset = reply.word(2) as usize;
+        let memory_data_offset = reply.word(2) as usize;
         let caps = reply.caps();
         if bytes_valid == 0 || caps.is_empty()
         {
             return Ok(0);
         }
-        let frame_cap = caps[0];
+        let memory_cap = caps[0];
 
         let range = match crate::sys::reserve::reserve_pages(1)
         {
             Ok(r) => r,
             Err(_) =>
             {
-                let _ = syscall::cap_delete(frame_cap);
+                let _ = syscall::cap_delete(memory_cap);
                 self.release_frame(cookie);
                 return Err(io::Error::other("seraph fs: reserve_pages failed"));
             }
         };
         let va = range.va_start();
-        if syscall::mem_map(frame_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY).is_err()
+        if syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READONLY).is_err()
         {
             crate::sys::reserve::unreserve_pages(range);
-            let _ = syscall::cap_delete(frame_cap);
+            let _ = syscall::cap_delete(memory_cap);
             self.release_frame(cookie);
             return Err(io::Error::other("seraph fs: mem_map failed"));
         }
@@ -1387,23 +1387,23 @@ impl File
             OutstandingMapping {
                 cookie,
                 range,
-                frame_cap,
+                memory_cap,
             },
         );
 
         let copy_len = bytes_valid.min(buf.len());
         // SAFETY: VA is mapped read-only for one page; the fs invariant
-        // is `frame_data_offset + bytes_valid <= PAGE_SIZE`.
+        // is `memory_data_offset + bytes_valid <= PAGE_SIZE`.
         let src = unsafe {
             core::slice::from_raw_parts(
-                (va + frame_data_offset as u64) as *const u8,
+                (va + memory_data_offset as u64) as *const u8,
                 bytes_valid,
             )
         };
         buf[..copy_len].copy_from_slice(&src[..copy_len]);
         self.pos.fetch_add(copy_len as u64, Ordering::Relaxed);
 
-        // Proactive release: synchronous FS_RELEASE_FRAME on the file
+        // Proactive release: synchronous FS_RELEASE_MEMORY on the file
         // cap clears the fs-side outstanding entry and decrements the
         // cache slot's refcount. After ack we own the local cleanup
         // (take_mapping is no-op if the handler thread already grabbed
@@ -1417,7 +1417,7 @@ impl File
     fn release_frame(&self, cookie: u64)
     {
         let ipc_buf = crate::os::seraph::current_ipc_buf();
-        let msg = IpcMessage::builder(fs_labels::FS_RELEASE_FRAME)
+        let msg = IpcMessage::builder(fs_labels::FS_RELEASE_MEMORY)
             .word(0, cookie)
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer. Failure is
@@ -1487,7 +1487,7 @@ impl File
         }
         else
         {
-            write_frame_chunks(
+            write_memory_chunks(
                 self.file_cap,
                 self.aspace,
                 self.memmgr_ep,
@@ -1552,7 +1552,7 @@ impl fmt::Debug for File
     {
         f.debug_struct("File")
             .field("file_cap", &self.file_cap)
-            .field("token", &self.token)
+            .field("badge", &self.badge)
             .field("size", &self.size.load(Ordering::Relaxed))
             .finish()
     }
@@ -1577,12 +1577,12 @@ impl Drop for File
         let _ = syscall::cap_delete(self.file_cap);
 
         // Drain the registry entry. After unregister, the handler
-        // thread cannot route any further FS_RELEASE_FRAME to this
-        // File — a late forced release on our token finds no entry
+        // thread cannot route any further FS_RELEASE_MEMORY to this
+        // File — a late forced release on our badge finds no entry
         // and no-ops with an ack.
         if let Some(state) = release_handler::state()
         {
-            if let Some(entry) = release_handler::unregister(state, self.token)
+            if let Some(entry) = release_handler::unregister(state, self.badge)
             {
                 for m in release_handler::drain_mappings(entry.as_ref())
                 {
@@ -1591,13 +1591,13 @@ impl Drop for File
                         m.range.va_start(),
                         m.range.page_count(),
                     );
-                    let _ = syscall::cap_delete(m.frame_cap);
+                    let _ = syscall::cap_delete(m.memory_cap);
                     crate::sys::reserve::unreserve_pages(m.range);
                 }
             }
         }
 
-        // Drop the per-File tokened SEND. fs's caps[0] copy survives
+        // Drop the per-File badged SEND. fs's caps[0] copy survives
         // until cap_delete on its slot; revoke would also kill it but
         // we rely on fs's FS_CLOSE handler having already cleared its
         // OpenFile entry, after which fs's slot is a dangling SEND
@@ -1638,12 +1638,12 @@ fn ns_error_to_io(label: u64) -> io::Error
             io::const_error!(io::ErrorKind::InvalidInput, "ns: invalid name"),
         l if l == NsError::InvalidOffset.as_label() =>
             io::const_error!(io::ErrorKind::InvalidInput, "ns: invalid offset"),
-        l if l == NsError::InvalidFrameCap.as_label() =>
-            io::const_error!(io::ErrorKind::InvalidInput, "ns: invalid frame cap"),
+        l if l == NsError::InvalidMemoryCap.as_label() =>
+            io::const_error!(io::ErrorKind::InvalidInput, "ns: invalid memory cap"),
         l if l == NsError::InvalidCookie.as_label() =>
             io::const_error!(io::ErrorKind::InvalidInput, "ns: invalid cookie"),
         l if l == NsError::Evicted.as_label() =>
-            io::const_error!(io::ErrorKind::UnexpectedEof, "ns: frame evicted"),
+            io::const_error!(io::ErrorKind::UnexpectedEof, "ns: page evicted"),
         l if l == NsError::IoError.as_label() =>
             io::const_error!(io::ErrorKind::Other, "ns: backend io error"),
         l if l == NsError::NotSupported.as_label() =>
@@ -1664,11 +1664,11 @@ fn map_fs_error(label: u64) -> io::Error
             io::const_error!(io::ErrorKind::Other, "fs: io error"),
         fs_errors::TOO_MANY_OPEN =>
             io::const_error!(io::ErrorKind::ResourceBusy, "fs: too many open files"),
-        fs_errors::INVALID_TOKEN =>
-            io::const_error!(io::ErrorKind::Other, "fs: file token invalid"),
+        fs_errors::INVALID_BADGE =>
+            io::const_error!(io::ErrorKind::Other, "fs: file badge invalid"),
         fs_errors::RELEASE_TIMEOUT =>
             io::const_error!(io::ErrorKind::TimedOut, "fs: release timeout"),
-        fs_errors::BAD_FRAME_OFFSET =>
+        fs_errors::BAD_MEMORY_OFFSET =>
             io::const_error!(io::ErrorKind::InvalidInput, "fs: bad frame offset"),
         fs_errors::PERMISSION_DENIED =>
             io::const_error!(io::ErrorKind::PermissionDenied, "fs: permission denied"),

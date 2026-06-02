@@ -16,7 +16,7 @@
 //! - `trap_frame`: pointer to the user register snapshot on the kernel stack.
 //! - `is_user`: true for user-mode threads.
 //! - `ipc_buffer`: virtual address of the per-thread IPC buffer page (0 = none).
-//! - `wakeup_value`: value delivered by a signal sender to an unblocked waiter.
+//! - `wakeup_value`: value delivered by a notification sender to an unblocked waiter.
 
 use crate::arch::current::context::SavedState;
 
@@ -125,8 +125,8 @@ pub enum IpcThreadState
     BlockedOnRecv,
     /// Blocked waiting for a `reply` after a `call`.
     BlockedOnReply,
-    /// Blocked waiting for a signal bitmask to become non-zero.
-    BlockedOnSignal,
+    /// Blocked waiting for a notification bitmask to become non-zero.
+    BlockedOnNotification,
     /// Blocked waiting for an event queue to receive an entry.
     BlockedOnEventQueue,
     /// Blocked waiting for any member of a wait set to become ready.
@@ -162,7 +162,7 @@ pub enum ThreadState
     Ready,
     /// Currently executing on a CPU.
     Running,
-    /// Waiting on IPC, a signal, or a timer.
+    /// Waiting on IPC, a notification, or a timer.
     Blocked,
     /// Stopped by `SYS_THREAD_STOP`.
     Stopped,
@@ -251,10 +251,10 @@ pub struct ThreadControlBlock
     /// to this page when `data_count > 0`.
     pub ipc_buffer: u64,
 
-    /// Wakeup value delivered to this thread when unblocked from a signal wait.
+    /// Wakeup value delivered to this thread when unblocked from a notification wait.
     ///
-    /// Set by `signal_send` when it wakes a blocked waiter: stores the bits that
-    /// were acquired on the waiter's behalf. Read by `sys_signal_wait` on resume.
+    /// Set by `notification_send` when it wakes a blocked waiter: stores the bits that
+    /// were acquired on the waiter's behalf. Read by `sys_notification_wait` on resume.
     pub wakeup_value: u64,
 
     /// Out-of-band timeout marker. True iff the most recent wake came from
@@ -264,8 +264,8 @@ pub struct ThreadControlBlock
     /// Required by `sys_event_recv` because event-queue payloads may be any
     /// `u64` (including 0), so `wakeup_value` cannot itself encode the
     /// distinction between "data delivered" and "timer fired" — contrast
-    /// `sys_signal_wait`, which uses `wakeup_value == 0` because
-    /// `signal_send` rejects zero-bit sends.
+    /// `sys_notification_wait`, which uses `wakeup_value == 0` because
+    /// `notification_send` rejects zero-bit sends.
     pub timed_out: bool,
 
     // === I/O port permissions (x86_64 only) ===
@@ -275,10 +275,10 @@ pub struct ThreadControlBlock
     /// On context switch, if non-null, this bitmap is copied into the TSS
     /// IOPB region so `in`/`out` instructions work for this thread.
     ///
-    // TODO: When an IoPortRange cap (or ancestor) is revoked,
+    // TODO: When an IoPort cap (or ancestor) is revoked,
     // the relevant bits must be re-denied in this bitmap and reloaded into
     // the TSS if this thread is currently running. Requires tracking which
-    // threads hold which IoPortRange bindings. Pick up alongside general
+    // threads hold which IoPort bindings. Pick up alongside general
     // cap revocation side-effect cleanup.
     pub iopb: *mut [u8; crate::arch::current::IOPB_SIZE],
 
@@ -286,7 +286,7 @@ pub struct ThreadControlBlock
     /// Pointer to the kernel IPC object this thread is currently blocked on
     /// (null when not blocked). Cast to the concrete type using `ipc_state`:
     /// - `BlockedOnSend`/`BlockedOnRecv` → `*mut EndpointState`
-    /// - `BlockedOnSignal` → `*mut SignalState`
+    /// - `BlockedOnNotification` → `*mut NotificationState`
     /// - `BlockedOnEventQueue` → `*mut EventQueueState`
     /// - `BlockedOnWaitSet` → `*mut WaitSetState`
     ///
@@ -307,7 +307,7 @@ pub struct ThreadControlBlock
     pub context_saved: core::sync::atomic::AtomicU32,
 
     /// Set to 1 by a waker that has popped this thread from a wait object
-    /// (signal, endpoint, event queue, or wait set) under that object's lock
+    /// (notification, endpoint, event queue, or wait set) under that object's lock
     /// but has not yet called `enqueue_and_wake`; cleared to 0 by
     /// `enqueue_and_wake`.
     /// `dealloc_object(Thread)` spins on this (Acquire) after its wait-object
@@ -329,7 +329,7 @@ pub struct ThreadControlBlock
     /// Correlator semantics: opaque to the kernel, scoped to one
     /// `(EventQueue, binder)` pair. Not a system-wide identifier, not a PID;
     /// it is whatever the binder needs to route the event to its own
-    /// bookkeeping (e.g. procmgr stashes its internal `ProcessTable` token
+    /// bookkeeping (e.g. procmgr stashes its internal `ProcessTable` badge
     /// in the low 32 bits). Passing `0` recovers the pre-multi-bind
     /// behaviour where the payload is just `exit_reason`.
     ///

@@ -6,7 +6,7 @@
 //
 // Semantics of the blob (see `project_argv_env_invariants.md`):
 //   * Concatenation of `args_count` NUL-terminated UTF-8 strings.
-//   * No embedded cap references, tokens, or security data — argv is
+//   * No embedded cap references, badges, or security data — argv is
 //     plain data, set exclusively by the spawning process.
 //   * Single encoding across the system (UTF-8); non-UTF-8 bytes are
 //     surfaced losslessly via `args_os` (`OsString` on seraph is

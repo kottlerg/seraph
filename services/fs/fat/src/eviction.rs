@@ -5,11 +5,11 @@
 
 //! Eviction worker for the FAT page cache.
 //!
-//! When `handle_read_frame` cannot acquire a cache slot (every slot
+//! When `handle_read_memory` cannot acquire a cache slot (every slot
 //! has `refcount > 0`), main scans the per-file outstanding-page
 //! tables for a candidate, enqueues an [`EvictReq`], and replies
 //! `IO_ERROR`. The eviction worker pops the request, sends
-//! `FS_RELEASE_FRAME` on the client's release endpoint, and waits
+//! `FS_RELEASE_MEMORY` on the client's release endpoint, and waits
 //! up to [`RELEASE_TIMEOUT_MS`] for `FS_RELEASE_ACK`. On ack the
 //! cache slot is reclaimed cooperatively; on timeout the worker
 //! `cap_revoke`s the per-cookie ancestor cap and the client's
@@ -34,7 +34,7 @@ use std::time::Duration;
 use ipc::{IpcMessage, fs_labels};
 
 use crate::cache::PageCache;
-use crate::file::{MAX_OPEN_FILES, MAX_OUTSTANDING, OpenFile, find_by_token};
+use crate::file::{MAX_OPEN_FILES, MAX_OUTSTANDING, OpenFile, find_by_badge};
 
 /// Cooperative release watchdog: the client must reply with
 /// `FS_RELEASE_ACK` within this many milliseconds, else the worker
@@ -53,21 +53,21 @@ const MAX_PENDING_EVICTIONS: usize = MAX_OPEN_FILES * MAX_OUTSTANDING;
 #[derive(Clone, Copy)]
 pub struct EvictReq
 {
-    /// `OpenFile.token` identifying which file this entry belongs
+    /// `OpenFile.badge` identifying which file this entry belongs
     /// to. Used at cleanup time to clear the matching
     /// outstanding-page slot.
-    pub file_token: u64,
+    pub file_badge: u64,
     /// Caller-visible cookie originally returned in
-    /// `FS_READ_FRAME`. Carried in `FS_RELEASE_FRAME`'s `data[0]`
-    /// and used to disambiguate cleanup against `file_token`.
+    /// `FS_READ_MEMORY`. Carried in `FS_RELEASE_MEMORY`'s `data[0]`
+    /// and used to disambiguate cleanup against `file_badge`.
     pub cookie: u64,
     /// Cache slot whose refcount is held by this entry.
     pub slot_idx: usize,
     /// Per-cookie ancestor cap derived under the cache slot's
-    /// frame cap. Revoking it kills only the caller's child cap.
+    /// memory cap. Revoking it kills only the caller's child cap.
     pub ancestor_cap: u32,
     /// SEND cap on the client's release endpoint, addressed by
-    /// `FS_RELEASE_FRAME`. Zero means the client did not provide
+    /// `FS_RELEASE_MEMORY`. Zero means the client did not provide
     /// one, in which case the worker skips straight to hard-revoke.
     pub release_endpoint_cap: u32,
 }
@@ -106,8 +106,8 @@ impl EvictionState
         else
         {
             std::os::seraph::log!(
-                "eviction enqueue overflow: dropped req (token={}, cookie={}, slot={}, qlen={})",
-                req.file_token,
+                "eviction enqueue overflow: dropped req (badge={}, cookie={}, slot={}, qlen={})",
+                req.file_badge,
                 req.cookie,
                 req.slot_idx,
                 q.len()
@@ -146,8 +146,8 @@ pub fn worker_loop(
         if !acked
         {
             std::os::seraph::log!(
-                "FS_RELEASE_FRAME timeout, hard-revoking parent cap (token={}, slot={})",
-                req.file_token,
+                "FS_RELEASE_MEMORY timeout, hard-revoking parent cap (badge={}, slot={})",
+                req.file_badge,
                 req.slot_idx
             );
         }
@@ -160,7 +160,7 @@ pub fn worker_loop(
         let _ = syscall::cap_revoke(req.ancestor_cap);
         let _ = syscall::cap_delete(req.ancestor_cap);
         cache.release_slot(req.slot_idx);
-        clear_outstanding(&files, req.file_token, req.cookie);
+        clear_outstanding(&files, req.file_badge, req.cookie);
     }
 }
 
@@ -177,7 +177,7 @@ fn pop_blocking(state: &EvictionState) -> EvictReq
     }
 }
 
-/// Send `FS_RELEASE_FRAME` to the client and wait up to
+/// Send `FS_RELEASE_MEMORY` to the client and wait up to
 /// `RELEASE_TIMEOUT_MS` for the ack. Returns `true` iff the
 /// client replied with `FS_RELEASE_ACK` in time.
 ///
@@ -200,7 +200,7 @@ fn cooperative_release(req: &EvictReq) -> bool
         .name("fatfs-release-watchdog".into())
         .spawn(move || {
             let ipc_buf = std::os::seraph::current_ipc_buf();
-            let msg = IpcMessage::builder(fs_labels::FS_RELEASE_FRAME)
+            let msg = IpcMessage::builder(fs_labels::FS_RELEASE_MEMORY)
                 .word(0, cookie)
                 .build();
             // SAFETY: `ipc_buf` is the registered IPC buffer for this
@@ -244,10 +244,10 @@ fn cooperative_release(req: &EvictReq) -> bool
     acked
 }
 
-fn clear_outstanding(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, file_token: u64, cookie: u64)
+fn clear_outstanding(files: &Mutex<[OpenFile; MAX_OPEN_FILES]>, file_badge: u64, cookie: u64)
 {
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(idx) = find_by_token(&files_g, file_token)
+    let Some(idx) = find_by_badge(&files_g, file_badge)
     else
     {
         return;

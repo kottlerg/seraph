@@ -11,25 +11,25 @@
 //! issuing repeated calls. The shape mirrors `SYS_SYSTEM_INFO`.
 //!
 //! Field coverage:
-//! - `CAP_INFO_TAG_RIGHTS` against several cap tags (`Frame`, `AddressSpace`,
-//!   `Signal`).
-//! - `CAP_INFO_FRAME_*` against a Frame cap.
+//! - `CAP_INFO_TAG_RIGHTS` against several cap tags (`Memory`, `AddressSpace`,
+//!   `Notification`).
+//! - `CAP_INFO_MEMORY_*` against a Memory cap.
 //! - `CAP_INFO_CSPACE_*` against a `CSpace` cap.
 //! - Negative paths: null slot index (`InvalidCapability`) and tag-mismatched
 //!   selector (`InvalidArgument`).
 
-use syscall::{cap_create_cspace, cap_create_signal, cap_delete, cap_info};
+use syscall::{cap_create_cspace, cap_create_notification, cap_delete, cap_info};
 use syscall_abi::{
     CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED,
-    CAP_INFO_FRAME_AVAILABLE, CAP_INFO_FRAME_HAS_RETYPE, CAP_INFO_FRAME_SIZE, CAP_INFO_TAG_RIGHTS,
-    SyscallError,
+    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_SIZE,
+    CAP_INFO_TAG_RIGHTS, SyscallError,
 };
 
 use crate::{TestContext, TestResult};
 
 // CapTag discriminants (kernel/src/cap/slot.rs). Keep in sync with the
 // `#[repr(u8)]` enum.
-const TAG_FRAME: u8 = 1;
+const TAG_MEMORY: u8 = 1;
 const TAG_ADDRESS_SPACE: u8 = 2;
 const TAG_SIGNAL: u8 = 4;
 const TAG_CSPACE: u8 = 9;
@@ -72,17 +72,17 @@ pub fn tag_rights_aspace(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `cap_info(<frame cap>, CAP_INFO_TAG_RIGHTS)` reports `Frame` tag.
+/// `cap_info(<memory cap>, CAP_INFO_TAG_RIGHTS)` reports `Memory` tag.
 ///
-/// Uses the TEXT segment frame (`aspace_cap + 1`), present as a `Frame` cap
-/// with at least `MAP | EXECUTE` rights.
-pub fn tag_rights_frame(ctx: &TestContext) -> TestResult
+/// Uses the TEXT segment Memory cap (`aspace_cap + 1`), present as a `Memory`
+/// cap with at least `MAP | EXECUTE` rights.
+pub fn tag_rights_memory(ctx: &TestContext) -> TestResult
 {
-    let frame_cap = ctx.aspace_cap + 1;
-    let value = cap_info(frame_cap, CAP_INFO_TAG_RIGHTS)
-        .map_err(|_| "cap_info(frame_cap, TAG_RIGHTS) failed")?;
+    let memory_cap = ctx.aspace_cap + 1;
+    let value = cap_info(memory_cap, CAP_INFO_TAG_RIGHTS)
+        .map_err(|_| "cap_info(memory_cap, TAG_RIGHTS) failed")?;
     let (tag, rights) = unpack_tag_rights(value);
-    if tag != TAG_FRAME
+    if tag != TAG_MEMORY
     {
         return Err("cap_info on TEXT segment cap returned unexpected tag");
     }
@@ -93,116 +93,118 @@ pub fn tag_rights_frame(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `cap_info(<signal cap>, CAP_INFO_TAG_RIGHTS)` reports `Signal` tag.
+/// `cap_info(<notification cap>, CAP_INFO_TAG_RIGHTS)` reports `Notification` tag.
 ///
-/// Allocates a fresh signal cap to verify the universal field works for
+/// Allocates a fresh notification cap to verify the universal field works for
 /// non-memory tags as well.
-pub fn tag_rights_signal(ctx: &TestContext) -> TestResult
+pub fn tag_rights_notification(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base).map_err(|_| "cap_create_signal failed")?;
-    let value =
-        cap_info(sig, CAP_INFO_TAG_RIGHTS).map_err(|_| "cap_info(signal, TAG_RIGHTS) failed")?;
+    let sig =
+        cap_create_notification(ctx.memory_base).map_err(|_| "cap_create_notification failed")?;
+    let value = cap_info(sig, CAP_INFO_TAG_RIGHTS)
+        .map_err(|_| "cap_info(notification, TAG_RIGHTS) failed")?;
     let (tag, rights) = unpack_tag_rights(value);
-    cap_delete(sig).map_err(|_| "cap_delete(signal) failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete(notification) failed")?;
     if tag != TAG_SIGNAL
     {
-        return Err("cap_info on signal cap returned unexpected tag");
+        return Err("cap_info on notification cap returned unexpected tag");
     }
     if rights == 0
     {
-        return Err("cap_info on signal cap reported empty rights bitmask");
+        return Err("cap_info on notification cap reported empty rights bitmask");
     }
     Ok(())
 }
 
-// ── Frame-specific fields ────────────────────────────────────────────────────
+// ── Memory-specific fields ───────────────────────────────────────────────────
 
-/// Frame fields are consistent: `size > 0`, `available <= size`, `has_retype`
+/// Memory fields are consistent: `size > 0`, `available <= size`, `has_retype`
 /// is `0` or `1`.
 ///
 /// Uses a frame from the pool — these are buddy-backed RAM frames carrying
 /// the `RETYPE` right at boot.
-pub fn frame_fields(_ctx: &TestContext) -> TestResult
+pub fn memory_fields(_ctx: &TestContext) -> TestResult
 {
-    let frame = crate::frame_pool::alloc().ok_or("cap_info::frame_fields: frame pool exhausted")?;
+    let memory_cap =
+        crate::frame_pool::alloc().ok_or("cap_info::memory_fields: frame pool exhausted")?;
 
-    let size =
-        cap_info(frame, CAP_INFO_FRAME_SIZE).map_err(|_| "cap_info(frame, FRAME_SIZE) failed")?;
-    let available = cap_info(frame, CAP_INFO_FRAME_AVAILABLE)
-        .map_err(|_| "cap_info(frame, FRAME_AVAILABLE) failed")?;
-    let has_retype = cap_info(frame, CAP_INFO_FRAME_HAS_RETYPE)
-        .map_err(|_| "cap_info(frame, FRAME_HAS_RETYPE) failed")?;
+    let size = cap_info(memory_cap, CAP_INFO_MEMORY_SIZE)
+        .map_err(|_| "cap_info(memory_cap, MEMORY_SIZE) failed")?;
+    let available = cap_info(memory_cap, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "cap_info(memory_cap, MEMORY_AVAILABLE) failed")?;
+    let has_retype = cap_info(memory_cap, CAP_INFO_MEMORY_HAS_RETYPE)
+        .map_err(|_| "cap_info(memory_cap, MEMORY_HAS_RETYPE) failed")?;
 
     // SAFETY: alloc() returned the cap; pool is single-threaded for tests.
-    unsafe { crate::frame_pool::free(frame) };
+    unsafe { crate::frame_pool::free(memory_cap) };
 
     if size == 0
     {
-        return Err("cap_info(frame, FRAME_SIZE) returned 0");
+        return Err("cap_info(memory_cap, MEMORY_SIZE) returned 0");
     }
     if available > size
     {
-        return Err("cap_info(frame, FRAME_AVAILABLE) > FRAME_SIZE");
+        return Err("cap_info(memory_cap, MEMORY_AVAILABLE) > MEMORY_SIZE");
     }
     if has_retype > 1
     {
-        return Err("cap_info(frame, FRAME_HAS_RETYPE) returned non-boolean value");
+        return Err("cap_info(memory_cap, MEMORY_HAS_RETYPE) returned non-boolean value");
     }
 
     // Cross-check the boolean against the rights bitmask via TAG_RIGHTS.
-    let value =
-        cap_info(frame, CAP_INFO_TAG_RIGHTS).map_err(|_| "cap_info(frame, TAG_RIGHTS) failed")?;
+    let value = cap_info(memory_cap, CAP_INFO_TAG_RIGHTS)
+        .map_err(|_| "cap_info(memory_cap, TAG_RIGHTS) failed")?;
     let (_tag, rights) = unpack_tag_rights(value);
     let expected = u64::from((rights & RIGHTS_RETYPE_BIT) != 0);
     if has_retype != expected
     {
-        return Err("FRAME_HAS_RETYPE disagrees with TAG_RIGHTS bitmask");
+        return Err("MEMORY_HAS_RETYPE disagrees with TAG_RIGHTS bitmask");
     }
     Ok(())
 }
 
-/// RAM Frame caps minted by the kernel at boot carry the `RETYPE` right.
+/// RAM Memory caps minted by the kernel at boot carry the `RETYPE` right.
 ///
-/// Every usable-RAM Frame cap minted by the kernel at Phase 7
+/// Every usable-RAM Memory cap minted by the kernel at Phase 7
 /// (`core/kernel/src/cap/mod.rs`) carries `Rights::RETYPE`. The bit must
 /// propagate through the cap-routing graph (kernel → init → memmgr →
 /// child via `REQUEST_FRAMES`) so memmgr's consumers can retype frames
 /// into kernel objects under the typed-memory contract.
 ///
-/// ktest is loaded as init and so receives the RAM Frame caps directly
-/// at slots `info.memory_frame_base..+memory_frame_count`. These are the
-/// caps the kernel actually stamps with RETYPE; segment-derived frame
+/// ktest is loaded as init and so receives the RAM Memory caps directly
+/// at slots `info.memory_base..+memory_count`. These are the
+/// caps the kernel actually stamps with RETYPE; segment-derived Memory
 /// caps (the BSS-derived `frame_pool` slots used elsewhere in this file)
 /// are intentionally minted *without* RETYPE since they back ELF pages,
 /// not retypable RAM.
-pub fn frame_caps_carry_retype_right(ctx: &TestContext) -> TestResult
+pub fn memory_caps_carry_retype_right(ctx: &TestContext) -> TestResult
 {
-    let frame = ctx.memory_frame_base;
-    if frame == 0
+    let memory = ctx.memory_base;
+    if memory == 0
     {
-        return Err("frame_caps_carry_retype_right: ctx.memory_frame_base is zero");
+        return Err("memory_caps_carry_retype_right: ctx.memory_base is zero");
     }
 
     // Path 1: read the rights bitmask via TAG_RIGHTS.
     let value =
-        cap_info(frame, CAP_INFO_TAG_RIGHTS).map_err(|_| "cap_info(frame, TAG_RIGHTS) failed")?;
+        cap_info(memory, CAP_INFO_TAG_RIGHTS).map_err(|_| "cap_info(memory, TAG_RIGHTS) failed")?;
     let (tag, rights) = unpack_tag_rights(value);
 
     // Path 2: read the RETYPE-only boolean via the dedicated selector.
-    let has_retype = cap_info(frame, CAP_INFO_FRAME_HAS_RETYPE)
-        .map_err(|_| "cap_info(frame, FRAME_HAS_RETYPE) failed")?;
+    let has_retype = cap_info(memory, CAP_INFO_MEMORY_HAS_RETYPE)
+        .map_err(|_| "cap_info(memory, MEMORY_HAS_RETYPE) failed")?;
 
-    if tag != TAG_FRAME
+    if tag != TAG_MEMORY
     {
-        return Err("frame_caps_carry_retype_right: cap reported non-Frame tag");
+        return Err("memory_caps_carry_retype_right: cap reported non-Memory tag");
     }
     if rights & RIGHTS_RETYPE_BIT == 0
     {
-        return Err("frame_caps_carry_retype_right: TAG_RIGHTS missing RETYPE bit");
+        return Err("memory_caps_carry_retype_right: TAG_RIGHTS missing RETYPE bit");
     }
     if has_retype != 1
     {
-        return Err("frame_caps_carry_retype_right: FRAME_HAS_RETYPE != 1");
+        return Err("memory_caps_carry_retype_right: MEMORY_HAS_RETYPE != 1");
     }
     Ok(())
 }
@@ -216,7 +218,7 @@ pub fn frame_caps_carry_retype_right(ctx: &TestContext) -> TestResult
 pub fn cspace_fields(ctx: &TestContext) -> TestResult
 {
     const REQUESTED: u64 = 64;
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, REQUESTED)
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4, REQUESTED)
         .map_err(|_| "cap_create_cspace failed")?;
 
     let capacity = cap_info(cs, CAP_INFO_CSPACE_CAPACITY)
@@ -254,15 +256,16 @@ pub fn null_slot_invalid(_ctx: &TestContext) -> TestResult
 
 /// Tag-specific selector on a non-matching cap returns `InvalidArgument`.
 ///
-/// We use a freshly created `Signal` cap and ask for `FRAME_SIZE`.
+/// We use a freshly created `Notification` cap and ask for `MEMORY_SIZE`.
 pub fn tag_mismatch_invalid_arg(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base).map_err(|_| "cap_create_signal failed")?;
-    let err = cap_info(sig, CAP_INFO_FRAME_SIZE);
-    cap_delete(sig).map_err(|_| "cap_delete(signal) failed")?;
+    let sig =
+        cap_create_notification(ctx.memory_base).map_err(|_| "cap_create_notification failed")?;
+    let err = cap_info(sig, CAP_INFO_MEMORY_SIZE);
+    cap_delete(sig).map_err(|_| "cap_delete(notification) failed")?;
     if err != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("cap_info(signal, FRAME_SIZE) did not return InvalidArgument");
+        return Err("cap_info(notification, MEMORY_SIZE) did not return InvalidArgument");
     }
     Ok(())
 }
@@ -283,7 +286,7 @@ pub fn unknown_field_invalid_arg(ctx: &TestContext) -> TestResult
 // variant the constants above need updating in lockstep.
 const _: () = {
     // Static cross-checks (shake out typos at compile time).
-    assert!(TAG_FRAME == 1);
+    assert!(TAG_MEMORY == 1);
     assert!(TAG_ADDRESS_SPACE == 2);
     assert!(TAG_SIGNAL == 4);
     assert!(TAG_CSPACE == 9);

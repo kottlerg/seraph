@@ -1,14 +1,14 @@
 # IPC Subsystem Internals
 
 This document covers the implementation of the IPC subsystem. IPC semantics —
-the call/reply model, signals, event queues, wait sets, and capability transfer —
+the call/reply model, notifications, event queues, wait sets, and capability transfer —
 are specified in [docs/ipc-design.md](../../../docs/ipc-design.md). This document
 describes how those semantics are implemented in the kernel.
 
 The IPC subsystem comprises four kernel object types:
 
 1. **Endpoint** — synchronous call/reply rendezvous point
-2. **Signal** — coalescing asynchronous bitmask notification
+2. **Notification** — coalescing asynchronous bitmask notification
 3. **EventQueue** — ordered asynchronous ring buffer
 4. **WaitSet** — multi-source aggregation for multiplexed waiting
 
@@ -165,17 +165,17 @@ The direct switch is only valid when:
 
 ---
 
-## Signal (`ipc/signal.rs`)
+## Notification (`ipc/notification.rs`)
 
 ### Object Structure
 
 ```rust
-pub struct SignalState
+pub struct NotificationState
 {
     /// Atomic bitmask: set bits represent pending events.
     pub bits: AtomicU64,
 
-    /// Waiter waiting in SYS_SIGNAL_WAIT, or null.
+    /// Waiter waiting in SYS_NOTIFICATION_WAIT, or null.
     /// Protected by `lock` (see scheduling-internals.md § Lock Hierarchy).
     pub waiter: *mut ThreadControlBlock,
 
@@ -184,7 +184,7 @@ pub struct SignalState
     pub wait_set_member_idx: u8,
 
     /// Lock-free fast-path flag: non-zero iff a waiter or wait-set is registered.
-    /// Read with a SeqCst fence in the signal_send fast path; the Dekker pair
+    /// Read with a SeqCst fence in the notification_send fast path; the Dekker pair
     /// is documented in scheduling-internals.md § Atomic Ordering Invariants.
     pub has_observer: AtomicU8,
 
@@ -195,17 +195,17 @@ pub struct SignalState
 
 ### Send Path
 
-`SYS_SIGNAL_SEND`:
+`SYS_NOTIFICATION_SEND`:
 
 ```
 1. bits.fetch_or(bits_arg, Ordering::Relaxed)
-2. SeqCst fence (Dekker pair with signal_wait)
+2. SeqCst fence (Dekker pair with notification_wait)
 3. if has_observer == 0: return None      // lock-free fast path
 4. Acquire sig.lock
 5. if waiter is Some(tcb):
    a. delivered = bits.swap(0, Ordering::Relaxed)
    b. if delivered == 0: release sig.lock; return None
-      (a fast-path signal_wait between steps 1 and 4 consumed our
+      (a fast-path notification_wait between steps 1 and 4 consumed our
        bits; the current sig.waiter is a *new* waiter who must NOT
        be touched, else they receive wakeup_value=0 — a spurious
        wake, since 0-bit sends are rejected at step 1)
@@ -224,7 +224,7 @@ behaviour.
 
 ### Wait Path
 
-`SYS_SIGNAL_WAIT`:
+`SYS_NOTIFICATION_WAIT`:
 
 ```
 1. acquired = bits.swap(0, Ordering::Acquire)
@@ -363,7 +363,7 @@ pub struct WaitSet
 {
     lock: Spinlock,
 
-    /// Members of this wait set. Each entry pairs a source with its token.
+    /// Members of this wait set. Each entry pairs a source with its badge.
     /// Fixed capacity; SYS_WAIT_SET_ADD returns OutOfMemory when full.
     members: [Option<WaitSetMember>; WAIT_SET_MAX_MEMBERS],
 
@@ -387,8 +387,8 @@ struct WaitSetMember
     /// The IPC object being watched.
     source: WaitSetSource,
 
-    /// Opaque token returned to the caller when this source is ready.
-    token: u64,
+    /// Opaque badge returned to the caller when this source is ready.
+    badge: u64,
 
     /// Whether this source currently has pending readiness (to handle
     /// readiness arriving before the waiter blocks).
@@ -398,7 +398,7 @@ struct WaitSetMember
 enum WaitSetSource
 {
     Endpoint(NonNull<Endpoint>),
-    Signal(NonNull<Signal>),
+    Notification(NonNull<Notification>),
     EventQueue(NonNull<EventQueueHeader>),
 }
 ```
@@ -411,14 +411,14 @@ require a second lock (the allocator lock) and create a lock-ordering hazard.
 
 Each IPC object type is extended with a "wait set registration" — a pointer back to
 the `WaitSet` and the member index. When an object becomes ready (a sender calls an
-endpoint, a signal has bits set, an event is posted), it calls into the wait set:
+endpoint, a notification has bits set, an event is posted), it calls into the wait set:
 
 ```
 waitset_notify(wait_set, member_idx):
     Acquire wait_set.lock
     if waiter is Some(tcb):
         waiter = None
-        tcb.wakeup_token = members[member_idx].token
+        tcb.wakeup_badge = members[member_idx].badge
         Release lock
         Mark tcb as Ready; enqueue
     else:
@@ -436,12 +436,12 @@ waitset_notify(wait_set, member_idx):
 2. if ready_queue is non-empty:
    a. member_idx = ready_queue.pop_front()
    b. members[member_idx].pending = false
-   c. token = members[member_idx].token
-   d. Release lock; return token
+   c. badge = members[member_idx].badge
+   d. Release lock; return badge
 3. else:
    a. waiter = current_tcb
    b. Release lock
-   c. Block current thread; return wakeup_token when woken
+   c. Block current thread; return wakeup_badge when woken
 ```
 
 ### Wait Set Add/Remove
@@ -496,11 +496,11 @@ delivery, consumer-side atomic check-and-halt — is specified in
 IPC primitives invoke `enqueue_and_wake` after releasing their source IPC lock
 per [§ Lock Hierarchy rule 5](scheduling-internals.md#lock-hierarchy).
 
-### Lock-Free Signal Fast Path
+### Lock-Free Notification Fast Path
 
-Signal delivery (OR bits) uses an atomic operation and avoids acquiring the waiter
+Notification delivery (OR bits) uses an atomic operation and avoids acquiring the waiter
 lock in the common case of no waiter. Only after the atomic OR, if a waiter is
-suspected, is the lock acquired. This makes the signal send path essentially one
+suspected, is the lock acquired. This makes the notification send path essentially one
 atomic instruction in the no-waiter case.
 
 ---

@@ -5,7 +5,7 @@
 
 //! Per-thread I/O port access for ktest (x86-64).
 //!
-//! Owns the kernel-minted root [`CapType::IoPortRange`] cap and derives
+//! Owns the kernel-minted root [`CapType::IoPort`] cap and derives
 //! narrow sub-range caps via `ioport_split` as consumers (`serial`,
 //! `acpi_shutdown`) request specific ports. This keeps each grant
 //! confined to the ports the consumer actually drives instead of
@@ -20,7 +20,7 @@
 
 use init_protocol::{CapType, InitInfo};
 
-/// Widest live `IoPortRange` cap, plus the port range it covers.
+/// Widest live `IoPort` cap, plus the port range it covers.
 #[derive(Clone, Copy)]
 struct WideCap
 {
@@ -39,7 +39,7 @@ static mut WIDE: WideCap = WideCap {
     end: 0,
 };
 
-/// Seed the wide cap from the root `IoPortRange` descriptor in `InitInfo`.
+/// Seed the wide cap from the root `IoPort` descriptor in `InitInfo`.
 ///
 /// Called once from `main::run` before any `bind_port_range` consumer.
 /// A second call would overwrite the residual-cap slot tracked here
@@ -95,7 +95,7 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
         // ktest itself never drives the prefix range [base, port_start),
         // but the carved-off prefix cap is left alive in the cspace so
         // that any consumer (test harness, future module, debug probe)
-        // that wants to claim those ports can find an IoPortRange
+        // that wants to claim those ports can find an IoPort
         // covering them. See `core/ktest/src/unit/hw.rs::ioport_split`
         // for the test that relies on this for coverage of the
         // `ioport_split` syscall.
@@ -136,7 +136,7 @@ pub fn bind_port_range(thread_cap: u32, port: u16, count: u16) -> bool
     syscall::ioport_bind(thread_cap, slot).is_ok()
 }
 
-/// Locate the root `IoPortRange` descriptor in `InitInfo`.
+/// Locate the root `IoPort` descriptor in `InitInfo`.
 fn find_root(info: &InitInfo) -> Option<(u32, u32, u32)>
 {
     let base = core::ptr::from_ref::<InitInfo>(info).cast::<u8>();
@@ -151,13 +151,13 @@ fn find_root(info: &InitInfo) -> Option<(u32, u32, u32)>
     };
     for d in descs
     {
-        if d.cap_type == CapType::IoPortRange
+        if d.cap_type == CapType::IoPort
         {
             // aux0 = base port, aux1 = size in ports. The kernel emits
             // aux1 = 0x10000 directly for the full 64K root cap
             // (`core/kernel/src/cap/mod.rs`); the aux1 == 0 branch is
             // defensive against a future change that adopts the in-object
-            // `IoPortRangeObject.size == 0` encoding at this surface.
+            // `IoPortObject.size == 0` encoding at this surface.
             #[allow(clippy::cast_possible_truncation)]
             let base_u32 = d.aux0 as u32;
             #[allow(clippy::cast_possible_truncation)]

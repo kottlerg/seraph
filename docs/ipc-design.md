@@ -9,7 +9,7 @@ All communication between processes goes through the kernel's IPC mechanism.
 Two processes that do not share an IPC capability cannot communicate.
 
 - **Synchronous calls** for structured request/reply between services.
-- **Asynchronous primitives** for event delivery: signals (coalescing
+- **Asynchronous primitives** for event delivery: notifications (coalescing
   bitmask) and event queues (ordered ring).
 
 ---
@@ -81,22 +81,22 @@ kernel copy occurs. The capability controls access rights (read-only, read-write
 
 Two primitives handle non-blocking event delivery:
 
-### Signals
+### Notifications
 
-A signal is a kernel object containing a single machine word used as a bitmask. Each
-bit represents a distinct event type, defined by the service using the signal.
+A notification is a kernel object containing a single machine word used as a bitmask. Each
+bit represents a distinct event type, defined by the service using the notification.
 
-**Delivery:** The sender ORs one or more bits into the signal word. This is O(1) and
+**Delivery:** The sender ORs one or more bits into the notification word. This is O(1) and
 never blocks. If the receiver is already waiting, it is woken immediately. If not,
 the bits accumulate until the receiver next waits.
 
 **Coalescing:** Setting an already-set bit is idempotent.
 
-**Receipt:** The receiver waits on the signal object and receives the full bitmask,
+**Receipt:** The receiver waits on the notification object and receives the full bitmask,
 which is atomically cleared on read. The receiver then inspects each set bit and
 acts accordingly.
 
-Signals are appropriate for: hardware interrupt delivery, timer expiry, IPC endpoint
+Notifications are appropriate for: hardware interrupt delivery, timer expiry, IPC endpoint
 readiness, DMA completion, and any event where what matters is that something happened,
 not how many times or in what order.
 
@@ -117,7 +117,7 @@ as two distinct entries in order.
 If multiple entries are available, subsequent receives return them in order without
 blocking.
 
-Event queues are appropriate for: process lifecycle events (exit, signal delivery),
+Event queues are appropriate for: process lifecycle events (exit, notification delivery),
 anything where ordering or count of events matters, and cases where coalescing would
 cause correctness problems.
 
@@ -125,7 +125,7 @@ cause correctness problems.
 
 ## Waiting on Multiple Sources
 
-A **wait set** aggregates any combination of endpoints, signals, and event queues.
+A **wait set** aggregates any combination of endpoints, notifications, and event queues.
 A process waits on the set and is woken when any member becomes ready; the result
 identifies which source triggered the wake.
 

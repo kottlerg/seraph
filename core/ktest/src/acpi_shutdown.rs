@@ -5,15 +5,15 @@
 
 //! ACPI S5 (soft-off) shutdown for x86-64.
 //!
-//! Locates FADT and DSDT by scanning each `AcpiReclaimable` Frame cap for
+//! Locates FADT and DSDT by scanning each `AcpiReclaimable` Memory cap for
 //! the ACPI signatures, extracts `PM1a_CNT_BLK` and `SLP_TYPa`, then writes
 //! the shutdown command to the `PM1a` control register.
 //!
 //! All ACPI parsing happens in userspace — the kernel and bootloader are not
-//! involved beyond providing Frame caps for the firmware table regions.
+//! involved beyond providing Memory caps for the firmware table regions.
 //!
 //! I/O port permission for `PM1a_CNT_BLK` is obtained at shutdown time via
-//! `ioport::bind_port_range`, which carves a narrow `IoPortRange` cap
+//! `ioport::bind_port_range`, which carves a narrow `IoPort` cap
 //! covering exactly the `PM1a` control register from the residual wide
 //! cap left by earlier consumers.
 
@@ -122,12 +122,12 @@ fn locate_and_parse_dsdt(info: &InitInfo, dsdt_phys: u64) -> Option<u16>
 {
     for d in descriptors(info)
     {
-        if d.cap_type != CapType::Frame
+        if d.cap_type != CapType::Memory
         {
             continue;
         }
-        if d.slot < info.acpi_region_frame_base
-            || d.slot >= info.acpi_region_frame_base + info.acpi_region_frame_count
+        if d.slot < info.acpi_region_memory_base
+            || d.slot >= info.acpi_region_memory_base + info.acpi_region_memory_count
         {
             continue;
         }
@@ -178,12 +178,12 @@ fn find_table_in_acpi_regions(
 {
     for d in descriptors(info)
     {
-        if d.cap_type != CapType::Frame
+        if d.cap_type != CapType::Memory
         {
             continue;
         }
-        if d.slot < info.acpi_region_frame_base
-            || d.slot >= info.acpi_region_frame_base + info.acpi_region_frame_count
+        if d.slot < info.acpi_region_memory_base
+            || d.slot >= info.acpi_region_memory_base + info.acpi_region_memory_count
         {
             continue;
         }

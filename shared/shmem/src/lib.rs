@@ -7,8 +7,8 @@
 //!
 //! Two-layer helper:
 //!
-//! 1. [`SharedBuffer`] — request N frames from procmgr, map them contiguous
-//!    at a chosen VA. Caller moves the frame caps to a peer over IPC; the
+//! 1. [`SharedBuffer`] — request N pages from procmgr, map them contiguous
+//!    at a chosen VA. Caller moves the Memory caps to a peer over IPC; the
 //!    peer calls [`SharedBuffer::attach`] to map them at its own VA.
 //! 2. [`SpscRing`] — single-producer / single-consumer byte ring over a
 //!    [`SharedBuffer`]. Classic Lamport layout: two `AtomicU32` indices at
@@ -20,7 +20,7 @@
 //!
 //! This crate holds only the userspace mechanism. Blocking/notification —
 //! "reader waits until writer has pushed N bytes" — is out of scope; use a
-//! signal cap out-of-band when that is wanted (pipes).
+//! notification cap out-of-band when that is wanted (pipes).
 
 // Under `rustc-dep-of-std` (build-std), use the core facade and no_core
 // so this crate can sit inside std's dep graph. Mirrors abi/syscall,
@@ -68,7 +68,7 @@ const PAGE_SIZE: u64 = 4096;
 
 /// Maximum number of pages per `SharedBuffer`.
 ///
-/// Bounded by `MSG_CAP_SLOTS_MAX` on IPC transfer (each frame travels in
+/// Bounded by `MSG_CAP_SLOTS_MAX` on IPC transfer (each Memory cap travels in
 /// its own cap slot when the peer attaches). Keep in lockstep with the
 /// IPC abi.
 pub const MAX_PAGES: u32 = 4;
@@ -79,18 +79,18 @@ pub enum ShmemError
 {
     /// `pages` is zero or exceeds [`MAX_PAGES`].
     InvalidPageCount,
-    /// procmgr rejected the frame request (OOM, or no procmgr endpoint).
+    /// procmgr rejected the memory request (OOM, or no procmgr endpoint).
     RequestFailed,
     /// `sys_mem_map` failed partway through — pages already mapped are
     /// unmapped before the error surfaces.
     MapFailed,
-    /// `sys_cap_delete` failed while releasing a frame cap we obtained
+    /// `sys_cap_delete` failed while releasing a Memory cap we obtained
     /// from procmgr. Returned only when cleaning up an error path.
     CapDeleteFailed,
 }
 
 /// A contiguous, page-aligned region of shared memory mapped into the
-/// caller's address space. Frame caps are either still held by this
+/// caller's address space. Memory caps are either still held by this
 /// process (for share with a peer) or already moved.
 pub struct SharedBuffer
 {
@@ -101,20 +101,20 @@ pub struct SharedBuffer
 
 impl SharedBuffer
 {
-    /// Allocate `pages` pages via memmgr's `REQUEST_FRAMES` and map them
+    /// Allocate `pages` pages via memmgr's `REQUEST_MEMORY_CAPS` and map them
     /// read-write at `vaddr` in `aspace`. Returns the handle plus the
-    /// frame caps; the caller moves those caps to the peer (e.g. via
+    /// Memory caps; the caller moves those caps to the peer (e.g. via
     /// `ipc_call` with caps attached) and the peer calls
     /// [`SharedBuffer::attach`].
     ///
     /// Pages are requested one at a time so each entry in the returned
-    /// `frames` array is a single-page Frame cap — peers expect to map
+    /// `memory_caps` array is a single-page Memory cap — peers expect to map
     /// each cap as one page.
     ///
     /// # Errors
     /// * [`ShmemError::InvalidPageCount`] if `pages == 0` or `> MAX_PAGES`.
     /// * [`ShmemError::RequestFailed`] if memmgr rejects the request.
-    /// * [`ShmemError::MapFailed`] if mapping the returned frames fails.
+    /// * [`ShmemError::MapFailed`] if mapping the returned pages fails.
     pub fn create(
         memmgr_ep: u32,
         aspace: u32,
@@ -128,13 +128,13 @@ impl SharedBuffer
             return Err(ShmemError::InvalidPageCount);
         }
 
-        // Request pages one at a time. memmgr's REQUEST_FRAMES with
+        // Request pages one at a time. memmgr's REQUEST_MEMORY_CAPS with
         // want_pages=1 always returns exactly one cap covering one page,
         // which is what shmem's per-cap mapping contract requires.
-        let mut frames = [0u32; MAX_PAGES as usize];
+        let mut memory_caps = [0u32; MAX_PAGES as usize];
         for i in 0..pages as usize
         {
-            let request = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_FRAMES)
+            let request = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
                 .word(0, 1)
                 .build();
             // SAFETY: ipc_buf is the caller's registered IPC buffer page.
@@ -143,7 +143,7 @@ impl SharedBuffer
                 Ok(r) => r,
                 Err(_) =>
                 {
-                    for &c in frames.iter().take(i)
+                    for &c in memory_caps.iter().take(i)
                     {
                         let _ = syscall::cap_delete(c);
                     }
@@ -156,7 +156,7 @@ impl SharedBuffer
                 {
                     let _ = syscall::cap_delete(c);
                 }
-                for &c in frames.iter().take(i)
+                for &c in memory_caps.iter().take(i)
                 {
                     let _ = syscall::cap_delete(c);
                 }
@@ -165,19 +165,19 @@ impl SharedBuffer
             let Some(&cap) = reply.caps().first()
             else
             {
-                for &c in frames.iter().take(i)
+                for &c in memory_caps.iter().take(i)
                 {
                     let _ = syscall::cap_delete(c);
                 }
                 return Err(ShmemError::RequestFailed);
             };
-            frames[i] = cap;
+            memory_caps[i] = cap;
         }
 
-        // Map each frame sequentially at vaddr + i*PAGE_SIZE.
+        // Map each page sequentially at vaddr + i*PAGE_SIZE.
         for i in 0..pages
         {
-            let rw = match syscall::cap_derive(frames[i as usize], syscall::RIGHTS_MAP_RW)
+            let rw = match syscall::cap_derive(memory_caps[i as usize], syscall::RIGHTS_MAP_RW)
             {
                 Ok(c) => c,
                 Err(_) =>
@@ -209,24 +209,29 @@ impl SharedBuffer
                 page_count: pages,
                 aspace,
             },
-            frames,
+            memory_caps,
         ))
     }
 
-    /// Attach to a shared buffer using frame caps received from the peer.
-    /// Maps `frames[..pages]` sequentially read-write at `vaddr`.
+    /// Attach to a shared buffer using memory caps received from the peer.
+    /// Maps `memory_caps[..pages]` sequentially read-write at `vaddr`.
     ///
     /// # Errors
     /// [`ShmemError::MapFailed`] if any map call rejects.
-    pub fn attach(frames: &[u32], pages: u32, aspace: u32, vaddr: u64) -> Result<Self, ShmemError>
+    pub fn attach(
+        memory_caps: &[u32],
+        pages: u32,
+        aspace: u32,
+        vaddr: u64,
+    ) -> Result<Self, ShmemError>
     {
-        if pages == 0 || pages > MAX_PAGES || frames.len() < pages as usize
+        if pages == 0 || pages > MAX_PAGES || memory_caps.len() < pages as usize
         {
             return Err(ShmemError::InvalidPageCount);
         }
         for i in 0..pages
         {
-            let rw = match syscall::cap_derive(frames[i as usize], syscall::RIGHTS_MAP_RW)
+            let rw = match syscall::cap_derive(memory_caps[i as usize], syscall::RIGHTS_MAP_RW)
             {
                 Ok(c) => c,
                 Err(_) =>
@@ -284,7 +289,7 @@ impl SharedBuffer
     ///
     /// # Safety
     /// Only one thread in this process may hold a mutable slice at a time;
-    /// the underlying memory is shared with another process via raw frame
+    /// the underlying memory is shared with another process via raw Memory
     /// caps and does not enforce aliasing.
     pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8]
     {
@@ -399,7 +404,7 @@ pub struct SpscReader<'a>
     mask: u32,
 }
 
-// SAFETY: the header is shared between processes via a frame-cap mapping;
+// SAFETY: the header is shared between processes via a Memory-cap mapping;
 // the raw pointers point into that shared region. Send across threads in
 // one process is fine because all reads/writes through the raw pointers
 // go through the atomic indices in the header.

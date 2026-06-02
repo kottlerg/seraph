@@ -12,7 +12,7 @@
 //! `IoLayout` owns the driver's permanent 1-page DMA buffer. The request
 //! header (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live
 //! there permanently. The 512-byte data segment is supplied per-request by
-//! the caller as a Frame cap; [`IoLayout::read_chain`] /
+//! the caller as a Memory cap; [`IoLayout::read_chain`] /
 //! [`IoLayout::write_chain`] parameterise the data-segment physical
 //! address. The driver's own page never holds bulk data.
 
@@ -28,9 +28,9 @@ const VIRTIO_BLK_T_OUT: u32 = 1;
 #[derive(Copy, Clone)]
 pub enum IoDirection
 {
-    /// Sector read: device DMAs data into the caller-supplied frame.
+    /// Sector read: device DMAs data into the caller-supplied memory cap.
     Read,
-    /// Sector write: device DMAs data out of the caller-supplied frame.
+    /// Sector write: device DMAs data out of the caller-supplied memory cap.
     Write,
 }
 
@@ -92,7 +92,7 @@ impl IoLayout
     /// must be a non-zero multiple of 512).
     ///
     /// Mirror of [`Self::read_chain`] with the data segment's writable
-    /// flag flipped: the device reads from the caller-supplied frame and
+    /// flag flipped: the device reads from the caller-supplied memory cap and
     /// writes only the completion status byte in the driver's page.
     pub fn write_chain(&self, data_phys: u64, data_len: u32) -> [(u64, u32, bool); 3]
     {
@@ -142,7 +142,7 @@ impl IoLayout
 /// Maximum wait iterations before treating the request as timed out.
 const MAX_WAIT_ATTEMPTS: usize = 1000;
 
-/// Per-iteration timeout on the IRQ-signal wait, in milliseconds.
+/// Per-iteration timeout on the IRQ-notification wait, in milliseconds.
 ///
 /// Bounded so that a lost PLIC external interrupt on QEMU virt RISC-V (see
 /// the wait loop comment) cannot park this thread indefinitely: the next
@@ -153,22 +153,22 @@ const MAX_WAIT_ATTEMPTS: usize = 1000;
 /// (`MAX_WAIT_ATTEMPTS * IRQ_WAIT_TIMEOUT_MS` = 50 s upper bound).
 const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 
-/// Submit a read or write request and wait for completion via IRQ signal.
+/// Submit a read or write request and wait for completion via IRQ notification.
 ///
-/// `data_phys` is the physical address of the caller-supplied frame's
-/// data segment (offset 0 of the frame per the `BLK_READ_INTO_FRAME` /
-/// `BLK_WRITE_FROM_FRAME` contract). `data_len` is `count * 512` for
+/// `data_phys` is the physical address of the caller-supplied memory cap's
+/// data segment (offset 0 of the memory cap per the `BLK_READ_INTO_MEMORY` /
+/// `BLK_WRITE_FROM_MEMORY` contract). `data_len` is `count * 512` for
 /// `count` consecutive sectors starting at `sector`; the device
 /// transfers the entire run in one descriptor chain.
 ///
-/// Blocks on a bounded `signal_wait_timeout` per iteration until the device
+/// Blocks on a bounded `notification_wait_timeout` per iteration until the device
 /// raises an interrupt or the per-iteration timeout elapses, then reads the
 /// device ISR to deassert the level-triggered interrupt, acknowledges at the
 /// controller for re-arming, and re-polls the used ring. The bounded wait
 /// ensures that a lost PLIC external interrupt on QEMU virt RISC-V cannot
 /// park this thread indefinitely — see the wait loop body for details.
 // too_many_arguments: layout + direction + sector + data_phys + data_len
-// + four hardware handles (virtqueue, transport, irq signal, irq cap) is
+// + four hardware handles (virtqueue, transport, irq notification, irq cap) is
 // the minimal set this path needs; bundling for the lint would obscure
 // the per-call inputs (direction, sector, data_phys, data_len) that vary
 // per request.
@@ -182,7 +182,7 @@ pub fn submit_and_wait(
     vq: &mut SplitVirtqueue,
     transport: &PciTransport,
     queue_notify_off: u16,
-    irq_signal: u32,
+    irq_notification: u32,
     irq_cap: u32,
 ) -> bool
 {
@@ -215,7 +215,7 @@ pub fn submit_and_wait(
     // processes the request — we have confirmed via instrumentation that
     // completion happens but the PLIC-delivered external interrupt never
     // fires. Two defenses against a lost IRQ: each iteration does a short
-    // poll burst, and the per-iteration signal wait carries a bounded
+    // poll burst, and the per-iteration notification wait carries a bounded
     // timeout so a completion that lands between the poll burst and the
     // kernel parking the thread is recovered on the next iteration's burst
     // rather than wedging the driver forever.
@@ -239,11 +239,11 @@ pub fn submit_and_wait(
             core::hint::spin_loop();
         }
 
-        // No completion yet — block on the IRQ signal with a bounded timeout.
-        // Ok(0) means timeout (signal_send rejects zero-bit sends, so 0 is
+        // No completion yet — block on the IRQ notification with a bounded timeout.
+        // Ok(0) means timeout (notification_send rejects zero-bit sends, so 0 is
         // unambiguous); Ok(_) means a real wake; Err means the cap path
         // failed and there's nothing useful to do but fall through and poll.
-        let _ = syscall::signal_wait_timeout(irq_signal, IRQ_WAIT_TIMEOUT_MS);
+        let _ = syscall::notification_wait_timeout(irq_notification, IRQ_WAIT_TIMEOUT_MS);
 
         // Read ISR to clear level-triggered interrupt at the device before
         // unmasking at the controller, preventing immediate re-delivery.

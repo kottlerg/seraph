@@ -36,7 +36,7 @@ kind in `data[0]`:
 | caps[0] | svcmgr's service endpoint (RECV) |
 | caps[1] | svcmgr's own bootstrap endpoint (RECV — serves launched/restarted children) |
 | caps[2] | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; `0` if init could not derive it) |
-| caps[3] | `SEND\|GRANT`, token-0 source on devmgr's registry endpoint (`0` if absent) |
+| caps[3] | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (`0` if absent) |
 | data[0] | `1` (`CAPS`) |
 | data[1] | `SVCMGR_LABELS_VERSION` (currently `4`) handshake |
 
@@ -74,7 +74,7 @@ label field identifies the operation.
 
 ### Label 2: `HANDOVER_COMPLETE`
 
-Signals that init has finished serving the handover endowment. svcmgr
+Notifications that init has finished serving the handover endowment. svcmgr
 replies `SUCCESS` immediately (so init can proceed to teardown), then runs
 [`definitions::reconcile::reconcile_and_launch`](../src/definitions/reconcile.rs):
 
@@ -115,14 +115,14 @@ Insert a `name → cap` mapping into svcmgr's discovery registry.
 | label | `3 \| (name_len << 16)` |
 | words 0.. | `name` bytes |
 | caps[0] | The endpoint the name resolves to (transferred to svcmgr). |
-| token | MUST carry [`PUBLISH_AUTHORITY`](#publish-authority); rejected with `UNAUTHORIZED` otherwise. |
+| badge | MUST carry [`PUBLISH_AUTHORITY`](#publish-authority); rejected with `UNAUTHORIZED` otherwise. |
 
 **Reply:**
 
 | label value | Meaning |
 |---|---|
 | `0` (`SUCCESS`) | Stored |
-| `UNAUTHORIZED` | Caller's token lacks `PUBLISH_AUTHORITY` |
+| `UNAUTHORIZED` | Caller's badge lacks `PUBLISH_AUTHORITY` |
 | `INVALID_NAME` | `name_len` is 0 or exceeds `registry::NAME_MAX` |
 | `INSUFFICIENT_CAPS` | `caps[0]` missing or zero |
 | `REGISTER_REJECTED` | Registry is full or name already registered |
@@ -153,14 +153,14 @@ freshly-derived `RIGHTS_SEND` cap on the published endpoint.
 ## Publish authority
 
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
-caller's cap token) gating `PUBLISH_ENDPOINT` for *external* publishers.
+caller's cap badge) gating `PUBLISH_ENDPOINT` for *external* publishers.
 svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
 `devmgr.registry`, and each provider's `provides` names) directly into
-its own registry, so those need no token. The gate exists for a future
-external publisher — devmgr holds a `PUBLISH_AUTHORITY`-tokened SEND from
+its own registry, so those need no badge. The gate exists for a future
+external publisher — devmgr holds a `PUBLISH_AUTHORITY`-badged SEND from
 its bootstrap bundle, reserved for driver registrations. The SEND
 distributed to every process via `ProcessInfo.service_registry_cap`
-carries a per-process token *without* the bit, so it is accepted for
+carries a per-process badge *without* the bit, so it is accepted for
 `QUERY_ENDPOINT` only.
 
 Cap derivation for an external publish cap MUST use `RIGHTS_SEND_GRANT`,
@@ -179,8 +179,8 @@ See [`docs/capability-model.md`](../../../docs/capability-model.md)
 svcmgr maintains one shared EventQueue (`deaths_eq`). At
 reconciliation time, every supervised service has its main thread
 bound to `deaths_eq` with `correlator = service_table_index`. The
-WaitSet has two members: the service endpoint (token 0) and the
-deaths queue (token 1).
+WaitSet has two members: the service endpoint (badge 0) and the
+deaths queue (badge 1).
 
 When a thread exits (clean or fault), the kernel posts
 `(correlator << 32) | exit_reason` to `deaths_eq`. svcmgr drains the

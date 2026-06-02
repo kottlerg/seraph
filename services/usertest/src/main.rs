@@ -133,7 +133,7 @@ fn run_one(path: &Path) -> Result<(), String>
         Err(match status.code()
         {
             Some(c) => format!("exit={c}"),
-            None => "killed by signal".to_string(),
+            None => "killed by notification".to_string(),
         })
     }
 }
@@ -176,7 +176,7 @@ fn forward_lines<R: std::io::Read>(tester: &str, stream: &str, mut r: R)
 }
 
 /// Bootstrap one cap from the creator-endpoint round: pwrmgr's SHUTDOWN-
-/// tokened SEND (slot 0). The recipe seeds `pwrmgr.shutdown` first; absent
+/// badged SEND (slot 0). The recipe seeds `pwrmgr.shutdown` first; absent
 /// caps come back as zero and the shutdown step logs a skip instead of
 /// powering off (boot stays up for inspection).
 fn bootstrap_pwrmgr_auth() -> u32
@@ -206,7 +206,7 @@ fn bootstrap_pwrmgr_auth() -> u32
 }
 
 /// Terminal — pwrmgr powers off and QEMU exits. A reply arrives only on
-/// failure (cap missing the authority token or pwrmgr cannot power off);
+/// failure (cap missing the authority badge or pwrmgr cannot power off);
 /// in that case the log records the symptom and the process falls through
 /// to its normal exit, leaving the system idle.
 fn shutdown(pwrmgr_auth: u32)

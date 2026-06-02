@@ -37,7 +37,7 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 15;
+pub const PROCESS_ABI_VERSION: u32 = 16;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -213,7 +213,7 @@ pub struct ProcessInfo
     /// calls `SYS_IPC_BUFFER_SET` with this address on startup.
     pub ipc_buffer_vaddr: u64,
 
-    /// `CSpace` slot of a tokened IPC endpoint back to the creating service's
+    /// `CSpace` slot of a badged IPC endpoint back to the creating service's
     /// bootstrap handler.
     ///
     /// The child calls `ipc::bootstrap::REQUEST` on this endpoint in a loop to
@@ -221,7 +221,7 @@ pub struct ProcessInfo
     /// endpoint is provided (child operates without bootstrap caps).
     pub creator_endpoint_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on procmgr's service endpoint.
+    /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint.
     ///
     /// Used for process-lifecycle queries (`QUERY_PROCESS`,
     /// `DESTROY_PROCESS`, future supervision RPCs) and for any future
@@ -231,13 +231,13 @@ pub struct ProcessInfo
     /// before procmgr exists). Consumers must tolerate zero.
     pub procmgr_endpoint_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on memmgr's service endpoint.
+    /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint.
     ///
     /// Every std-built process needs this to bootstrap its heap via
-    /// `memmgr_labels::REQUEST_FRAMES`. `std::os::seraph::_start` reads
+    /// `memmgr_labels::REQUEST_MEMORY_CAPS`. `std::os::seraph::_start` reads
     /// this slot and initialises the allocator before `lang_start` runs,
     /// so idiomatic `fn main()` code can allocate from the very first
-    /// statement. The tokened cap identifies the holder to memmgr's
+    /// statement. The badged cap identifies the holder to memmgr's
     /// per-process tracking, so allocations are accounted to the correct
     /// process.
     ///
@@ -246,8 +246,8 @@ pub struct ProcessInfo
     pub memmgr_endpoint_cap: u32,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, used
-    /// as the system-wide service-discovery handle. The cap's token
-    /// carries only the child's per-process token — without the
+    /// as the system-wide service-discovery handle. The cap's badge
+    /// carries only the child's per-process badge — without the
     /// `svcmgr_labels::PUBLISH_AUTHORITY` verb-bit — so svcmgr accepts
     /// `QUERY_ENDPOINT` from it but rejects `PUBLISH_ENDPOINT` with
     /// `svcmgr_errors::UNAUTHORIZED`. See `docs/capability-model.md`
@@ -268,34 +268,34 @@ pub struct ProcessInfo
     /// before svcmgr exists). Consumers must tolerate zero.
     pub service_registry_cap: u32,
 
-    /// `CSpace` slot of the shmem frame cap backing `std::io::stdin`.
+    /// `CSpace` slot of the shmem memory cap backing `std::io::stdin`.
     ///
     /// One 4 KiB page laid out as `shmem::SpscHeader` followed by a
-    /// power-of-two byte ring. The frame is shared with the spawner; the
+    /// power-of-two byte ring. The page is shared with the spawner; the
     /// spawner is the writer (parent → child), the child is the reader.
-    /// Wakeup signals live in `stdin_data_signal_cap` (writer-kicks-reader)
-    /// and `stdin_space_signal_cap` (reader-kicks-writer); EOF rides on the
-    /// header's `closed` flag plus a final signal kick.
+    /// Wakeup notifications live in `stdin_data_notification_cap` (writer-kicks-reader)
+    /// and `stdin_space_notification_cap` (reader-kicks-writer); EOF rides on the
+    /// header's `closed` flag plus a final notification kick.
     ///
     /// Zero means "no stdin attached"; reads return `Ok(0)` (EOF)
     /// immediately. The standard case for services spawned by init.
-    pub stdin_frame_cap: u32,
+    pub stdin_memory_cap: u32,
 
-    /// `CSpace` slot of the shmem frame cap backing `std::io::stdout`.
+    /// `CSpace` slot of the shmem memory cap backing `std::io::stdout`.
     ///
-    /// Same layout as `stdin_frame_cap` but with the child as the writer
+    /// Same layout as `stdin_memory_cap` but with the child as the writer
     /// (child → parent) and the spawner as the reader. Wakeup pair is
-    /// `stdout_data_signal_cap` / `stdout_space_signal_cap`.
+    /// `stdout_data_notification_cap` / `stdout_space_notification_cap`.
     ///
     /// Zero when no sink is attached; writes are silently dropped.
-    pub stdout_frame_cap: u32,
+    pub stdout_memory_cap: u32,
 
-    /// `CSpace` slot of the shmem frame cap backing `std::io::stderr`.
+    /// `CSpace` slot of the shmem memory cap backing `std::io::stderr`.
     ///
-    /// Same shape as `stdout_frame_cap`; an independent ring so stdout and
-    /// stderr stream separately. Wakeup pair is `stderr_data_signal_cap` /
-    /// `stderr_space_signal_cap`. Zero means writes are silently dropped.
-    pub stderr_frame_cap: u32,
+    /// Same shape as `stdout_memory_cap`; an independent ring so stdout and
+    /// stderr stream separately. Wakeup pair is `stderr_data_notification_cap` /
+    /// `stderr_space_notification_cap`. Zero means writes are silently dropped.
+    pub stderr_memory_cap: u32,
 
     // ── Thread-local storage template ──────────────────────────────────
     //
@@ -361,7 +361,7 @@ pub struct ProcessInfo
     /// Number of env entries (NUL-terminated `KEY=VALUE` strings) in the blob.
     pub env_count: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on a namespace endpoint
+    /// `CSpace` slot of a badged SEND cap on a namespace endpoint
     /// addressing the directory the process should treat as its
     /// system root. Anchors absolute-path resolution.
     ///
@@ -373,7 +373,7 @@ pub struct ProcessInfo
     /// must tolerate zero by returning `Unsupported`.
     pub system_root_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on a namespace endpoint
+    /// `CSpace` slot of a badged SEND cap on a namespace endpoint
     /// addressing the directory the process should treat as its initial
     /// current working directory. Anchors relative-path resolution.
     ///
@@ -384,7 +384,7 @@ pub struct ProcessInfo
     /// is installed (e.g. via `std::env::set_current_dir`).
     pub current_dir_cap: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on the system log endpoint
+    /// `CSpace` slot of a badged SEND cap on the system log endpoint
     /// suitable for direct `STREAM_BYTES` / `STREAM_REGISTER_NAME`
     /// use.
     ///
@@ -394,9 +394,9 @@ pub struct ProcessInfo
     /// the registry is the system-wide service-discovery channel from
     /// this point forward. See follow-up issue tracking the migration.
     ///
-    /// Procmgr derives this cap per spawn via `cap_derive_token` on
+    /// Procmgr derives this cap per spawn via `cap_derive_badge` on
     /// the log endpoint it holds, using the child's procmgr-assigned
-    /// token as the cap's token. Logd sees the same token on every
+    /// badge as the cap's badge. Logd sees the same badge on every
     /// IPC the child makes, keys its per-sender slot map by it, and
     /// matches it directly against the death-notification correlator
     /// procmgr posts on child exit.
@@ -406,35 +406,35 @@ pub struct ProcessInfo
     /// `seraph::log!` silently drops in that case.
     pub log_send_cap: u32,
 
-    // ── Stdio pipe wakeup signals ──────────────────────────────────────
+    // ── Stdio pipe wakeup notifications ──────────────────────────────────────
     //
-    // Each piped direction gets two signal caps:
-    //   * `data_signal`  — writer kicks reader after producing bytes;
+    // Each piped direction gets two notification caps:
+    //   * `data_notification`  — writer kicks reader after producing bytes;
     //                      reader awaits this when the ring is empty.
-    //   * `space_signal` — reader kicks writer after consuming bytes;
+    //   * `space_notification` — reader kicks writer after consuming bytes;
     //                      writer awaits this when the ring is full.
     //
-    // Both processes hold caps to both signals (kernel signal objects do
+    // Both processes hold caps to both notifications (kernel notification objects do
     // not distinguish send/wait rights at the cap level). Single-waiter
-    // invariant holds because at most one side blocks on each signal at
+    // invariant holds because at most one side blocks on each notification at
     // any given moment.
     //
-    // Zero in any slot means the corresponding signal is not attached;
-    // the AnonPipe peer treats `signal_wait` as a no-op and falls back
+    // Zero in any slot means the corresponding notification is not attached;
+    // the AnonPipe peer treats `notification_wait` as a no-op and falls back
     // to spinning on the ring header (used during silent-drop init when
-    // a frame cap is also zero).
-    /// Data-available signal for the stdin pipe. Writer-kicked.
-    pub stdin_data_signal_cap: u32,
-    /// Space-available signal for the stdin pipe. Reader-kicked.
-    pub stdin_space_signal_cap: u32,
-    /// Data-available signal for the stdout pipe. Writer-kicked.
-    pub stdout_data_signal_cap: u32,
-    /// Space-available signal for the stdout pipe. Reader-kicked.
-    pub stdout_space_signal_cap: u32,
-    /// Data-available signal for the stderr pipe. Writer-kicked.
-    pub stderr_data_signal_cap: u32,
-    /// Space-available signal for the stderr pipe. Reader-kicked.
-    pub stderr_space_signal_cap: u32,
+    // a memory cap is also zero).
+    /// Data-available notification for the stdin pipe. Writer-kicked.
+    pub stdin_data_notification_cap: u32,
+    /// Space-available notification for the stdin pipe. Reader-kicked.
+    pub stdin_space_notification_cap: u32,
+    /// Data-available notification for the stdout pipe. Writer-kicked.
+    pub stdout_data_notification_cap: u32,
+    /// Space-available notification for the stdout pipe. Reader-kicked.
+    pub stdout_space_notification_cap: u32,
+    /// Data-available notification for the stderr pipe. Writer-kicked.
+    pub stderr_data_notification_cap: u32,
+    /// Space-available notification for the stderr pipe. Reader-kicked.
+    pub stderr_space_notification_cap: u32,
 
     // ── Main-thread stack envelope ─────────────────────────────────────
     //
@@ -473,56 +473,56 @@ pub struct StartupInfo
     /// `CSpace` slot of own `CSpace` capability.
     pub self_cspace: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on procmgr's service endpoint.
+    /// `CSpace` slot of a badged SEND cap on procmgr's service endpoint.
     /// Zero when unreachable (procmgr itself, or earlier in the boot chain).
     pub procmgr_endpoint: u32,
 
-    /// `CSpace` slot of a tokened SEND cap on memmgr's service endpoint.
+    /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint.
     /// Used by `std::os::seraph::_start` to bootstrap the heap allocator.
     /// Zero when unreachable (memmgr itself, init, or earlier in the boot
     /// chain).
     pub memmgr_endpoint: u32,
 
     /// `CSpace` slot of a SEND cap on svcmgr's service endpoint, the
-    /// system-wide service-discovery handle. The cap's token lacks the
+    /// system-wide service-discovery handle. The cap's badge lacks the
     /// `svcmgr_labels::PUBLISH_AUTHORITY` verb-bit, so it answers
     /// `QUERY_ENDPOINT` only. `registry-client::lookup(name)` issues
     /// the QUERY against this cap. Zero when svcmgr is not reachable.
     /// See `ProcessInfo::service_registry_cap` for the long form.
     pub service_registry_cap: u32,
 
-    /// `CSpace` slot of the stdin shmem frame cap. Zero when no input
+    /// `CSpace` slot of the stdin shmem memory cap. Zero when no input
     /// pipe is attached.
-    pub stdin_frame_cap: u32,
+    pub stdin_memory_cap: u32,
 
-    /// `CSpace` slot of the stdout shmem frame cap. Zero when no sink
+    /// `CSpace` slot of the stdout shmem memory cap. Zero when no sink
     /// is attached.
-    pub stdout_frame_cap: u32,
+    pub stdout_memory_cap: u32,
 
-    /// `CSpace` slot of the stderr shmem frame cap. Zero when no sink
+    /// `CSpace` slot of the stderr shmem memory cap. Zero when no sink
     /// is attached.
-    pub stderr_frame_cap: u32,
+    pub stderr_memory_cap: u32,
 
-    /// Tokened SEND cap on vfsd's namespace endpoint addressing the
+    /// Badged SEND cap on vfsd's namespace endpoint addressing the
     /// synthetic system root. Zero when vfsd is not reachable. See
     /// `ProcessInfo::system_root_cap`.
     pub system_root_cap: u32,
 
-    /// Tokened SEND cap on a namespace endpoint addressing the initial
+    /// Badged SEND cap on a namespace endpoint addressing the initial
     /// current working directory. Zero means relative-path resolution
     /// is unsupported until the process sets one. See
     /// `ProcessInfo::current_dir_cap`.
     pub current_dir_cap: u32,
 
-    /// Wakeup signal caps for the three stdio pipes. Zero when the
+    /// Wakeup notification caps for the three stdio pipes. Zero when the
     /// corresponding direction is not piped. See `ProcessInfo` for the
     /// full data-vs-space and writer-vs-reader semantics.
-    pub stdin_data_signal_cap: u32,
-    pub stdin_space_signal_cap: u32,
-    pub stdout_data_signal_cap: u32,
-    pub stdout_space_signal_cap: u32,
-    pub stderr_data_signal_cap: u32,
-    pub stderr_space_signal_cap: u32,
+    pub stdin_data_notification_cap: u32,
+    pub stdin_space_notification_cap: u32,
+    pub stdout_data_notification_cap: u32,
+    pub stdout_space_notification_cap: u32,
+    pub stderr_data_notification_cap: u32,
+    pub stderr_space_notification_cap: u32,
 
     /// Virtual address of the `PT_TLS` template in the loaded image.
     /// `tls_template_memsz == 0` signals that the process has no TLS.

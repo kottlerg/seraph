@@ -25,9 +25,9 @@
 //! - **`CSpace` slot-page growth** — populating slots beyond the first
 //!   `CSpace` slot page demonstrates `CSpace::grow` consuming pool pages.
 //!
-//! All retype sources come from `ctx.memory_frame_base` directly; the
-//! source cap is never deleted (the parent frame is shared across the
-//! suite). Each test cleans up only its own derived caps.
+//! All retype sources come from `ctx.memory_base` directly; the
+//! source cap is never deleted (the parent Memory cap is shared across
+//! the suite). Each test cleans up only its own derived caps.
 
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_delete, cap_info,
@@ -46,17 +46,17 @@ const SYS_OUT_OF_MEMORY: i64 = -8;
 /// growth budget without creating a new AS.
 pub fn aspace_augment_grows_budget(ctx: &TestContext) -> TestResult
 {
-    let frame = ctx.memory_frame_base;
+    let memory = ctx.memory_base;
 
     // Create an AS with the minimum useful slab: page 0 = wrapper page,
     // page 1 = root PT, no pool pages.
-    let aspace = cap_create_aspace(frame, 0, 2)
+    let aspace = cap_create_aspace(memory, 0, 2)
         .map_err(|_| "retype::aspace_augment: cap_create_aspace failed")?;
     let initial_budget = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
         .map_err(|_| "retype::aspace_augment: cap_info(initial budget) failed")?;
 
     // Augment by 4 pages.
-    if cap_create_aspace(frame, aspace, 4).is_err()
+    if cap_create_aspace(memory, aspace, 4).is_err()
     {
         cap_delete(aspace).ok();
         return Err("retype::aspace_augment: augment cap_create_aspace failed");
@@ -77,14 +77,14 @@ pub fn aspace_augment_grows_budget(ctx: &TestContext) -> TestResult
 /// page growth budget without creating a new CS.
 pub fn cspace_augment_grows_budget(ctx: &TestContext) -> TestResult
 {
-    let frame = ctx.memory_frame_base;
+    let memory = ctx.memory_base;
 
-    let cspace = cap_create_cspace(frame, 0, 1, 256)
+    let cspace = cap_create_cspace(memory, 0, 1, 256)
         .map_err(|_| "retype::cspace_augment: cap_create_cspace failed")?;
     let initial_budget = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
         .map_err(|_| "retype::cspace_augment: cap_info(initial budget) failed")?;
 
-    if cap_create_cspace(frame, cspace, 2, 0).is_err()
+    if cap_create_cspace(memory, cspace, 2, 0).is_err()
     {
         cap_delete(cspace).ok();
         return Err("retype::cspace_augment: augment cap_create_cspace failed");
@@ -107,12 +107,12 @@ pub fn cspace_augment_grows_budget(ctx: &TestContext) -> TestResult
 /// allocation.
 pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
 {
-    let frame = ctx.memory_frame_base;
+    let memory = ctx.memory_base;
 
     // Slab layout: page 0 = wrapper, page 1 = root PT, pages 2..4 = 2
     // pool pages — enough to allocate a few intermediate PT pages but
     // not unbounded. The map loop below is sized to exhaust this.
-    let aspace = cap_create_aspace(frame, 0, 4)
+    let aspace = cap_create_aspace(memory, 0, 4)
         .map_err(|_| "retype::pt_budget: cap_create_aspace failed")?;
 
     // Map further pages spaced by 1 GiB so each new mapping forces a
@@ -122,7 +122,7 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
     for i in 0..16u64
     {
         let va = TEST_VA_BASE + i * 0x4000_0000; // 1 GiB stride
-        match mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE)
+        match mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE)
         {
             Ok(()) =>
             {}
@@ -149,20 +149,20 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
 /// pool, every map must succeed.
 pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
 {
-    let frame = ctx.memory_frame_base;
+    let memory = ctx.memory_base;
 
     // 32 pool pages covers ≥ 4 mappings spread across distinct PML2 /
     // intermediate PT regions on x86-64 / sv48 (each fresh region needs
     // 2-3 intermediate PT pages depending on arch + sharing).
-    let aspace =
-        cap_create_aspace(frame, 0, 32).map_err(|_| "retype::deep_pt: cap_create_aspace failed")?;
+    let aspace = cap_create_aspace(memory, 0, 32)
+        .map_err(|_| "retype::deep_pt: cap_create_aspace failed")?;
 
     let mappings = 4usize;
     let stride: u64 = 0x4000_0000; // 1 GiB stride forces fresh PML2 entries.
     for i in 0..mappings
     {
         let va = TEST_VA_BASE + i as u64 * stride;
-        if mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE).is_err()
+        if mem_map(memory, aspace, va, 0, 1, MAP_WRITABLE).is_err()
         {
             cap_delete(aspace).ok();
             return Err("retype::deep_pt: mem_map failed despite ample budget");
@@ -185,18 +185,18 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
 /// drops in step.
 pub fn cspace_grow_consumes_pool(ctx: &TestContext) -> TestResult
 {
-    let frame = ctx.memory_frame_base;
+    let memory = ctx.memory_base;
 
     // 3 slot pages = ~192 slots (depending on slot size). max_slots set
     // generously so insertion isn't capped by max_slots.
-    let cspace = cap_create_cspace(frame, 0, 3, 4096)
+    let cspace = cap_create_cspace(memory, 0, 3, 4096)
         .map_err(|_| "retype::cspace_grow: cap_create_cspace failed")?;
     let used_before = cap_info(cspace, CAP_INFO_CSPACE_USED)
         .map_err(|_| "retype::cspace_grow: cap_info(used before) failed")?;
     let budget_before = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
         .map_err(|_| "retype::cspace_grow: cap_info(budget before) failed")?;
 
-    let probe = cap_create_endpoint(frame)
+    let probe = cap_create_endpoint(memory)
         .map_err(|_| "retype::cspace_grow: cap_create_endpoint failed")?;
 
     // Copy enough times to spill past the first slot page. ~70 copies

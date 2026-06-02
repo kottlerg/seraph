@@ -5,7 +5,7 @@
 
 //! RISC-V serial output via a memory-mapped NS16550 UART.
 //!
-//! The driver maps the `MmioRegion` cap devmgr delegated (the ACPI-SPCR
+//! The driver maps the `Mmio` cap devmgr delegated (the ACPI-SPCR
 //! UART base; `0x10000000` on QEMU virt) into its own address space, then
 //! writes the transmit register after polling the line status register.
 //! Registers are byte-addressed (reg-shift 0), matching the bootloader's
@@ -22,7 +22,7 @@ const UART_LSR: u64 = 5; // line status register
 /// Mapped UART base virtual address, set once by [`serial_init`].
 static UART_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// Reserve a VA page and map the UART `MmioRegion` cap into it. The
+/// Reserve a VA page and map the UART `Mmio` cap into it. The
 /// reservation lives for the process's lifetime. `self_thread` is unused on
 /// RISC-V. Returns `false` if reservation or mapping fails.
 pub fn serial_init(_self_thread: u32, self_aspace: u32, mmio_cap: u32) -> bool

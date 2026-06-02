@@ -35,13 +35,13 @@
 /// v5: Range-cap semantics on `CapType::Interrupt` (`aux0 = start`,
 ///     `aux1 = count`). Dropped `CapType::PciEcam`. Added named
 ///     `InitInfo` slots for the root IRQ range cap and firmware-table
-///     Frame caps (RSDP, ACPI reclaimable regions, DTB).
-/// v6: Added `init_stack_frame_*` / `init_info_frame_*` slot ranges for
+///     `Memory` caps (RSDP, ACPI reclaimable regions, DTB).
+/// v6: Added `init_stack_memory_*` / `init_info_memory_*` slot ranges for
 ///     init self-reclaim.
 /// v7: Added a fixed-size [`InitInfo::module_names`] table so init can
 ///     map bundle-entry names (carried by the bootloader through
 ///     `BootModule.name`) to the kernel's `CSpace` slot index of each
-///     module's `Frame` cap. The table lives in the `InitInfo` header so
+///     module's `Memory` cap. The table lives in the `InitInfo` header so
 ///     it sits on the first `InitInfo` page; the [`CapDescriptor`] array
 ///     layout is unchanged. Removed `module_frame_base` /
 ///     `module_frame_count` (init now resolves modules by name via
@@ -67,7 +67,11 @@
 ///     reserve) that let the dynamic memory pool be reconciled against
 ///     the all-RAM-accounted identity. Both `u64`, placed before
 ///     `framebuffer` so that field remains last.
-pub const INIT_PROTOCOL_VERSION: u32 = 10;
+/// v11: Capability naming alignment (#184). `CapType::Frame` → `Memory`,
+///     `MmioRegion` → `Mmio`, `IoPortRange` → `IoPort`; the `*_frame_*`
+///     `InitInfo` slot-range fields renamed to `*_memory_*`. Source-level
+///     rename only — discriminant values and field layout are unchanged.
+pub const INIT_PROTOCOL_VERSION: u32 = 11;
 
 /// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
@@ -144,15 +148,15 @@ pub struct InitInfo
     pub sched_control_cap: u32,
 
     // ── CSpace slot ranges (contiguous) ──────────────────────────────────
-    /// First slot index of usable physical memory `Frame` capabilities.
-    pub memory_frame_base: u32,
-    /// Number of usable memory `Frame` capabilities.
-    pub memory_frame_count: u32,
+    /// First slot index of usable physical memory `Memory` capabilities.
+    pub memory_base: u32,
+    /// Number of usable memory `Memory` capabilities.
+    pub memory_count: u32,
 
-    /// First slot index of init's ELF segment `Frame` capabilities.
-    pub segment_frame_base: u32,
-    /// Number of segment `Frame` capabilities.
-    pub segment_frame_count: u32,
+    /// First slot index of init's ELF segment `Memory` capabilities.
+    pub segment_memory_base: u32,
+    /// Number of segment `Memory` capabilities.
+    pub segment_memory_count: u32,
 
     /// First slot index of hardware resource capabilities (MMIO, IRQ, I/O port).
     pub hw_cap_base: u32,
@@ -162,7 +166,7 @@ pub struct InitInfo
     /// Byte offset from the start of this struct to the first [`CapDescriptor`].
     ///
     /// The descriptor array contains `cap_descriptor_count` entries, one per
-    /// capability in the hardware resource and memory frame ranges. Init uses
+    /// capability in the hardware resource and memory cap ranges. Init uses
     /// these to identify what each capability slot represents without probing.
     pub cap_descriptors_offset: u32,
 
@@ -194,39 +198,39 @@ pub struct InitInfo
     /// drivers. Zero if no valid range could be determined at boot.
     pub irq_range_cap: u32,
 
-    /// Slot index of the read-only `Frame` cap covering the 4 KiB page
+    /// Slot index of the read-only `Memory` cap covering the 4 KiB page
     /// that contains the ACPI RSDP.
     ///
     /// RSDP commonly lives in firmware-reserved memory outside
     /// `AcpiReclaimable`, so it gets its own slot. Zero if no RSDP
     /// address was reported (pure-DTB platforms).
-    pub acpi_rsdp_frame_cap: u32,
+    pub acpi_rsdp_memory_cap: u32,
 
-    /// First slot index of the read-only `Frame` caps covering each
+    /// First slot index of the read-only `Memory` caps covering each
     /// `MemoryType::AcpiReclaimable` region in the boot memory map.
-    pub acpi_region_frame_base: u32,
+    pub acpi_region_memory_base: u32,
 
-    /// Number of ACPI reclaimable-region `Frame` caps.
-    pub acpi_region_frame_count: u32,
+    /// Number of ACPI reclaimable-region `Memory` caps.
+    pub acpi_region_memory_count: u32,
 
-    /// Slot index of the read-only `Frame` cap covering the DTB blob,
+    /// Slot index of the read-only `Memory` cap covering the DTB blob,
     /// or zero if no DTB was supplied (pure-ACPI platforms).
-    pub dtb_frame_cap: u32,
+    pub dtb_memory_cap: u32,
 
     // ── Init self-reclaim cap surfaces (added in protocol v6) ───────────
-    /// First slot index of init's user stack `Frame` caps.
+    /// First slot index of init's user stack `Memory` caps.
     ///
     /// Each cap covers one 4 KiB stack page; init holds
-    /// `init_stack_frame_count` consecutive caps starting at this slot.
+    /// `init_stack_memory_count` consecutive caps starting at this slot.
     /// Used by init's reap-handoff (`procmgr.REGISTER_INIT_TEARDOWN`) to
     /// donate the stack pages back to memmgr's pool after init's
     /// `AddressSpace` is torn down. Zero if the kernel did not mint stack
     /// caps (legacy boot path).
-    pub init_stack_frame_base: u32,
-    /// Number of stack `Frame` caps (typically `INIT_STACK_PAGES = 4`).
-    pub init_stack_frame_count: u32,
+    pub init_stack_memory_base: u32,
+    /// Number of stack `Memory` caps (typically `INIT_STACK_PAGES = 4`).
+    pub init_stack_memory_count: u32,
 
-    /// First slot index of init's `InitInfo`-region `Frame` caps.
+    /// First slot index of init's `InitInfo`-region `Memory` caps.
     ///
     /// Each cap covers one 4 KiB page of the kernel-allocated
     /// `InitInfo` region (header — which includes the boot-module name
@@ -236,9 +240,9 @@ pub struct InitInfo
     /// struct itself — once init has read `InitInfo` at `_start`, the
     /// pages can be reclaimed safely. Zero if the kernel did not mint
     /// `InitInfo` caps (legacy boot path).
-    pub init_info_frame_base: u32,
-    /// Number of `InitInfo` `Frame` caps (1..=[`INIT_INFO_MAX_PAGES`]).
-    pub init_info_frame_count: u32,
+    pub init_info_memory_base: u32,
+    /// Number of `InitInfo` `Memory` caps (1..=[`INIT_INFO_MAX_PAGES`]).
+    pub init_info_memory_count: u32,
 
     // ── Boot-module name table (added in protocol version 7) ────────────
     /// Number of valid [`InitModuleName`] entries in [`module_names`].
@@ -246,7 +250,7 @@ pub struct InitInfo
     /// [`INIT_MODULE_NAME_EMPTY`].
     pub module_name_count: u32,
 
-    /// Bundle-entry-name → `CSpace`-slot mapping for boot-module Frame
+    /// Bundle-entry-name → `CSpace`-slot mapping for boot-module `Memory`
     /// caps. Lives inside the `InitInfo` header so it sits entirely on
     /// the first `InitInfo` page (the [`CapDescriptor`] array that
     /// follows the header may span pages).
@@ -319,18 +323,18 @@ pub struct CapDescriptor
     pub pad: [u8; 3],
 
     /// Type-specific primary metadata:
-    /// - `Frame`: physical base address
-    /// - `MmioRegion`: physical base address
+    /// - `Memory`: physical base address
+    /// - `Mmio`: physical base address
     /// - `Interrupt`: starting IRQ line number (range cap; split via `SYS_IRQ_SPLIT`)
-    /// - `IoPortRange`: I/O port base
+    /// - `IoPort`: I/O port base
     /// - `SchedControl`: 0 (unused)
     pub aux0: u64,
 
     /// Type-specific secondary metadata:
-    /// - `Frame`: size in bytes
-    /// - `MmioRegion`: size in bytes
+    /// - `Memory`: size in bytes
+    /// - `Mmio`: size in bytes
     /// - `Interrupt`: number of consecutive IRQ lines covered by the cap
-    /// - `IoPortRange`: port count
+    /// - `IoPort`: port count
     /// - `SchedControl`: 0 (unused)
     pub aux1: u64,
 }
@@ -339,7 +343,7 @@ pub struct CapDescriptor
 ///
 /// Maps a bundle-entry name (carried through
 /// [`boot_protocol::BootModule::name`]) to the `CSpace` slot index of
-/// the module's `Frame` capability. The table sits in the `InitInfo`
+/// the module's `Memory` capability. The table sits in the `InitInfo`
 /// header so it always lives on the first `InitInfo` page and does not
 /// interact with the variable-length [`CapDescriptor`] array, which
 /// may span pages once `INIT_MAX_NAMED_MODULES` modules are minted.
@@ -347,7 +351,7 @@ pub struct CapDescriptor
 #[derive(Clone, Copy)]
 pub struct InitModuleName
 {
-    /// `CSpace` slot index of the module's `Frame` cap.
+    /// `CSpace` slot index of the module's `Memory` cap.
     pub slot: u32,
     /// Explicit padding so `name` starts 8-byte aligned within the
     /// surrounding `[InitModuleName; N]` array.
@@ -418,20 +422,21 @@ impl InitFramebufferInfo
 ///
 /// Discriminant values match the kernel's `CapTag` enum for the types that
 /// appear in init's initial `CSpace` population. Types that are never present
-/// at boot (Endpoint, Signal, Thread, etc.) are omitted.
+/// at boot (Endpoint, Notification, Thread, etc.) are omitted.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapType
 {
-    /// Physical memory frame(s). Matches `CapTag::Frame = 1`.
-    Frame = 1,
+    /// Memory authority cap over a contiguous physical region — the
+    /// retypable Untyped/map-as-memory object. Matches `CapTag::Memory = 1`.
+    Memory = 1,
     /// Hardware interrupt range. Matches `CapTag::Interrupt = 6`.
     /// `aux0 = start`, `aux1 = count`. Use `SYS_IRQ_SPLIT` to narrow.
     Interrupt = 6,
-    /// Memory-mapped I/O region. Matches `CapTag::MmioRegion = 7`.
-    MmioRegion = 7,
-    /// x86-64 I/O port range. Matches `CapTag::IoPortRange = 11`.
-    IoPortRange = 11,
+    /// Memory-mapped I/O region. Matches `CapTag::Mmio = 7`.
+    Mmio = 7,
+    /// x86-64 I/O port range. Matches `CapTag::IoPort = 11`.
+    IoPort = 11,
     /// Scheduling control authority. Matches `CapTag::SchedControl = 12`.
     SchedControl = 12,
     /// SBI forwarding authority (RISC-V only). Matches `CapTag::SbiControl = 13`.
@@ -448,7 +453,7 @@ pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
     &name[..end]
 }
 
-/// Locate a boot-module `Frame` cap by its bundle-entry name.
+/// Locate a boot-module `Memory` cap by its bundle-entry name.
 ///
 /// Returns the `CSpace` slot index from the first matching
 /// [`InitModuleName`] in [`InitInfo::module_names`], or `None` if no

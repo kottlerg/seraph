@@ -3,7 +3,7 @@
 
 //! Capability operation benchmarks.
 
-use syscall::{cap_create_signal, cap_delete};
+use syscall::{cap_create_notification, cap_delete};
 
 use super::{cycles_now, log_bench_header};
 
@@ -17,7 +17,7 @@ pub(super) fn bench_cap_create_delete(ctx: &crate::TestContext, iters: u32)
     for _ in 0..n
     {
         let t0 = cycles_now();
-        let Ok(sig) = cap_create_signal(ctx.memory_frame_base)
+        let Ok(sig) = cap_create_notification(ctx.memory_base)
         else
         {
             break;

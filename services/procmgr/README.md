@@ -7,7 +7,7 @@ process-death observation. All non-bootstrap process creation in the
 running system goes through procmgr.
 
 procmgr is itself a memmgr client: it is std-using and bootstraps its
-heap by calling memmgr on its first IPC. Frame caps for child stacks,
+heap by calling memmgr on its first IPC. Memory caps for child stacks,
 IPC buffers, `ProcessInfo` pages, TLS blocks, and ELF segments come
 from memmgr, not from a procmgr-owned pool.
 
@@ -32,7 +32,7 @@ procmgr/
 ## Responsibilities
 
 - **ELF loading** — parse ELF images from boot modules or filesystem,
-  request frames from memmgr, map LOAD segments with correct
+  request memory caps from memmgr, map LOAD segments with correct
   permissions.
 - **Process creation** — create `AddressSpace`, `CSpace`, and `Thread`
   kernel objects; configure the thread's address space, CSpace, and
@@ -48,18 +48,18 @@ procmgr/
   notify memmgr.
 - **Process registry** — maintain a table of running processes; answer
   queries from svcmgr and other services.
-- **Per-child log cap seeding** — derive a tokened SEND cap on the
-  master log endpoint at every spawn (token = the child's process
-  token) and install the slot at `ProcessInfo.log_send_cap`. The
-  un-tokened source cap arrives in procmgr's bootstrap round from
+- **Per-child log cap seeding** — derive a badged SEND cap on the
+  master log endpoint at every spawn (badge = the child's process
+  badge) and install the slot at `ProcessInfo.log_send_cap`. The
+  un-badged source cap arrives in procmgr's bootstrap round from
   init. Children call `seraph::log!` directly through the seeded
   cap; no `GET_LOG_CAP` discovery roundtrip.
 - **Death-notification fan-out to logd** — accept
   `REGISTER_DEATH_EQ` from real-logd (gated by the
-  `DEATH_EQ_AUTHORITY` token), store logd's `EventQueue` cap, bind
+  `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, bind
   it retroactively on every existing thread, and bind it on every
   new spawn alongside procmgr's own death observer (correlator =
-  process token, equal to logd's per-sender slot key).
+  process badge, equal to logd's per-sender slot key).
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff at
   end-of-Phase-3 and tear down init's residue. See the
   [Init reap](#init-reap) subsection below.
@@ -70,23 +70,23 @@ procmgr/
 
 Procmgr accepts init's `REGISTER_INIT_TEARDOWN` handoff at the end of
 init's Phase 3: init's own `AddressSpace` / `CSpace` / `Thread` caps
-plus every reclaimable Frame cap. Procmgr binds a death-EQ observer on
+plus every reclaimable Memory cap. Procmgr binds a death-EQ observer on
 **both** init threads (main + init-logd) with `INIT_REAP_CORRELATOR` and
 reaps once both have exited — init-logd outlives main until the
 svcmgr-launched real-logd releases it via `HANDOVER_RELEASE`. A liveness
 backstop force-stops a never-released init-logd past a grace, so a
-dropped log handover cannot pin init's frames. The reap path tears down
-init's kernel objects in order — Threads → AddressSpace → donate Frame
-caps to memmgr via `DONATE_FRAMES` → CSpace cascade — leaving zero init
+dropped log handover cannot pin init's memory caps. The reap path tears down
+init's kernel objects in order — Threads → AddressSpace → donate Memory
+caps to memmgr via `DONATE_MEMORY_CAPS` → CSpace cascade — leaving zero init
 residue. Implementation in [`src/init_reap.rs`](src/init_reap.rs).
 
 ---
 
 ## What procmgr does NOT do
 
-- **Allocate or own frames.** memmgr holds the RAM frame pool. procmgr
+- **Allocate or own memory caps.** memmgr holds the RAM memory-cap pool. procmgr
   is a memmgr client like every other std-built service.
-- **Track per-process frame ownership.** memmgr's per-process records
+- **Track per-process memory-cap ownership.** memmgr's per-process records
   cover this; procmgr only tracks the kernel objects it owns
   (`AddressSpace`, `Thread`, etc.) plus the procmgr-side process
   registry.
@@ -123,7 +123,7 @@ The full procmgr IPC specification is in
   `ProcessInfo.system_root_cap` / `current_dir_cap`. Procmgr holds no
   namespace cap of its own.
 
-Frame allocation is not part of procmgr's interface; see
+Memory-cap allocation is not part of procmgr's interface; see
 [`services/memmgr/docs/ipc-interface.md`](../memmgr/docs/ipc-interface.md).
 
 ---
@@ -148,10 +148,10 @@ same `main()` signature defined in `abi/process-abi`.
 ## Relationship to memmgr
 
 procmgr and memmgr are sister tier-1 services with disjoint authority.
-memmgr owns the frame pool; procmgr owns process lifecycle. procmgr is
+memmgr owns the memory-cap pool; procmgr owns process lifecycle. procmgr is
 the only privileged caller of memmgr's procmgr-only labels
 (`REGISTER_PROCESS`, `PROCESS_DIED`); no other service can mint or
-retire process tokens against memmgr. See
+retire process badges against memmgr. See
 [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Authority
 Boundaries Between memmgr and procmgr" for the full split.
 
@@ -172,9 +172,9 @@ only case where a process is created without going through procmgr.
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Boot order, ProcessInfo handover, process-death flow |
-| [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Memory ownership, frame contract, page-reservation contract |
+| [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Memory ownership, memory-cap contract, page-reservation contract |
 | [docs/capability-model.md](../../docs/capability-model.md) | CSpace, AddressSpace, Thread caps |
-| [services/memmgr/README.md](../memmgr/README.md) | Sister tier-1 service for the frame pool |
+| [services/memmgr/README.md](../memmgr/README.md) | Sister tier-1 service for the memory-cap pool |
 | [abi/boot-protocol/](../../abi/boot-protocol/) | Boot module format (`BootModule` type) |
 | [abi/process-abi](../../abi/process-abi/README.md) | Process startup ABI: ProcessInfo, StartupInfo, main() |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |

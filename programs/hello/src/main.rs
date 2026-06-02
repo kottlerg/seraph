@@ -7,7 +7,7 @@
 //!
 //! Demonstrates that a binary built against `std` with zero `std::os::seraph`
 //! imports can produce stdout output via `println!`. The spawner wires the
-//! child's stdout cap to the system log endpoint with a per-service token;
+//! child's stdout cap to the system log endpoint with a per-service badge;
 //! nothing in this binary knows or cares.
 
 fn main()

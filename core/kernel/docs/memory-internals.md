@@ -200,7 +200,7 @@ The following slab caches are registered during Phase 4 of initialization:
 | `cap_slot_cache` | `CapabilitySlot` |
 | `tcb_cache` | `ThreadControlBlock` |
 | `endpoint_cache` | `Endpoint` |
-| `signal_cache` | `Signal` |
+| `notification_cache` | `Notification` |
 | `event_queue_cache` | `EventQueueHeader` |
 | `wait_set_cache` | `WaitSet` |
 | `address_space_cache` | `AddressSpace` |
@@ -307,7 +307,7 @@ pub struct AddressSpace
 
 Seraph does not provide a `fork()` equivalent. New address spaces are created empty
 and populated by the process loader. Copy-on-write is not implemented. Shared memory
-is established by mapping the same frame capability into multiple address spaces.
+is established by mapping the same memory capability into multiple address spaces.
 
 ---
 
@@ -360,7 +360,7 @@ its own slot, sets the pending bit of each target CPU, then sends the IPI:
 2. Bump the space's tlb_gen and fence (so a switched-away CPU flushes on
    reactivation); read active_cpus; exclude the current CPU.
 3. Publish (root, virt, tag) into this CPU's request slot and set each target's
-   pending bit (the bit doubles as the per-target liveness/ack token).
+   pending bit (the bit doubles as the per-target liveness/ack badge).
 4. Send the shootdown IPI to the targets and wait for every pending bit to clear.
 ```
 

@@ -9,10 +9,10 @@
 // Wire-up:
 //   * Create: ipc_call(procmgr_endpoint, CREATE_FROM_FILE, ...).
 //             Reply caps: [process_handle, thread_for_caller].
-//   * Pipe (per piped direction): allocate (frame, data_sig, space_sig)
+//   * Pipe (per piped direction): allocate (memory, data_sig, space_sig)
 //             via Pipe::create_for_child; ipc_call(process_handle,
 //             CONFIGURE_PIPE, data=[direction, ring_capacity],
-//             caps=[frame_handoff, data_sig_handoff, space_sig_handoff]).
+//             caps=[memory_handoff, data_sig_handoff, space_sig_handoff]).
 //             Parent retains its own Pipe end (the originals).
 //   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
 //   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
@@ -27,13 +27,13 @@
 //   * `Stdio::Inherit` (default) / `Stdio::Null` — no pipe installed
 //     for that direction. Child reads return EOF; child writes silent-
 //     drop. Same shape as a Unix daemon with no stderr.
-//   * `Stdio::MakePipe` — allocates a shmem SPSC ring + 2 signal caps,
+//   * `Stdio::MakePipe` — allocates a shmem SPSC ring + 2 notification caps,
 //     calls CONFIGURE_PIPE, and retains the parent-side Pipe end as
 //     `ChildStdin` / `ChildStdout` / `ChildStderr`.
 //
 // Identity:
 //   * `Process::id()` returns the low 32 bits of procmgr's internal process
-//     token (unique, monotonic, nonzero). Not a POSIX pid — processes in
+//     badge (unique, monotonic, nonzero). Not a POSIX pid — processes in
 //     Seraph are identified by capability, not pid.
 //
 // Argv/env:
@@ -312,7 +312,7 @@ impl Command {
         let ipc_ptr = info.ipc_buffer as *mut u64;
 
         // Walk the spawner's namespace cap to the binary node. The
-        // resulting tokened SEND on the owning fs driver's namespace
+        // resulting badged SEND on the owning fs driver's namespace
         // endpoint is transferred to procmgr in caps[0] of CREATE_FROM_FILE
         // — procmgr never holds a namespace cap.
         let parent_root = crate::os::seraph::root_dir_cap();
@@ -418,7 +418,7 @@ impl Command {
         }
 
         // For each piped direction, allocate a parent-side `Pipe` end
-        // (frame + 2 signal caps) and install the corresponding triple
+        // (memory cap + 2 notification caps) and install the corresponding triple
         // into the child's CSpace via `CONFIGURE_PIPE`. Per-direction
         // calls are independent — we issue 0–3 IPC rounds depending on
         // which directions the caller piped. Errors tear the partial
@@ -488,30 +488,30 @@ impl Command {
             let bridge_setup = (|| -> io::Result<Bridge> {
                 let completion_slab = crate::sys::alloc::seraph::object_slab_acquire(120)
                     .ok_or_else(|| io::Error::other("object_slab_acquire (completion) failed"))?;
-                let completion_signal = syscall::cap_create_signal(completion_slab)
-                    .map_err(|_| io::Error::other("cap_create_signal for completion failed"))?;
+                let completion_notification = syscall::cap_create_notification(completion_slab)
+                    .map_err(|_| io::Error::other("cap_create_notification for completion failed"))?;
                 let exit_reason = Arc::new(AtomicU64::new(0));
                 let peer_dead = Arc::new(AtomicBool::new(false));
 
-                let mut pipe_signals: [Option<PipeBridgeSignals>; 3] = [None, None, None];
-                for (slot, pipe) in pipe_signals.iter_mut().zip([
+                let mut pipe_notifications: [Option<PipeBridgeNotifications>; 3] = [None, None, None];
+                for (slot, pipe) in pipe_notifications.iter_mut().zip([
                     child_stdin_pipe.as_mut(),
                     child_stdout_pipe.as_mut(),
                     child_stderr_pipe.as_mut(),
                 ]) {
                     if let Some(p) = pipe {
                         p.set_peer_dead(peer_dead.clone());
-                        *slot = Some(PipeBridgeSignals {
-                            data_signal: p.data_signal_cap(),
-                            space_signal: p.space_signal_cap(),
+                        *slot = Some(PipeBridgeNotifications {
+                            data_notification: p.data_notification_cap(),
+                            space_notification: p.space_notification_cap(),
                         });
                     }
                 }
 
                 let handles = BridgeHandles {
                     death_eq,
-                    completion_signal,
-                    pipe_signals,
+                    completion_notification,
+                    pipe_notifications,
                     exit_reason: exit_reason.clone(),
                     peer_dead,
                 };
@@ -522,7 +522,7 @@ impl Command {
                         "spawn death-bridge thread failed: {e}"
                     )))?;
                 Ok(Bridge {
-                    completion_signal,
+                    completion_notification,
                     handle: Some(handle),
                     exit_reason,
                 })
@@ -610,7 +610,7 @@ impl Command {
                     if let Some(h) = b.handle {
                         let _ = h.join();
                     }
-                    let _ = syscall::cap_delete(b.completion_signal);
+                    let _ = syscall::cap_delete(b.completion_notification);
                 }
                 let _ = syscall::cap_delete(death_eq);
                 let _ = syscall::cap_delete(thread_cap);
@@ -649,7 +649,7 @@ impl Command {
                         if let Some(h) = b.handle {
                             let _ = h.join();
                         }
-                        let _ = syscall::cap_delete(b.completion_signal);
+                        let _ = syscall::cap_delete(b.completion_notification);
                     }
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
@@ -664,7 +664,7 @@ impl Command {
                         if let Some(h) = b.handle {
                             let _ = h.join();
                         }
-                        let _ = syscall::cap_delete(b.completion_signal);
+                        let _ = syscall::cap_delete(b.completion_notification);
                     }
                     let _ = syscall::cap_delete(death_eq);
                     let _ = syscall::cap_delete(thread_cap);
@@ -689,7 +689,7 @@ impl Command {
                 if let Some(h) = b.handle {
                     let _ = h.join();
                 }
-                let _ = syscall::cap_delete(b.completion_signal);
+                let _ = syscall::cap_delete(b.completion_notification);
             }
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);
@@ -734,9 +734,9 @@ fn install_pipe(
     let cap_msg = ipc::IpcMessage::builder(procmgr_labels::CONFIGURE_PIPE)
         .word(0, direction)
         .word(1, u64::from(RING_CAPACITY))
-        .cap(caps.frame)
-        .cap(caps.data_signal)
-        .cap(caps.space_signal)
+        .cap(caps.memory)
+        .cap(caps.data_notification)
+        .cap(caps.space_notification)
         .build();
     // SAFETY: `ipc_ptr` is the calling thread's kernel-registered IPC
     // buffer (installed by `_start`).
@@ -801,16 +801,16 @@ impl fmt::Debug for Stdio {
 
 /// Per-spawn state used only when stdio is piped. Non-piped spawns
 /// skip the bridge thread entirely and use `event_recv(death_eq)`
-/// directly — no signal cap, no Arcs, no extra thread.
+/// directly — no notification cap, no Arcs, no extra thread.
 struct Bridge {
-    /// Bridge → `wait` rendezvous. Bridge `signal_send`s once after
-    /// publishing `exit_reason`; `wait` `signal_wait`s.
-    completion_signal: u32,
+    /// Bridge → `wait` rendezvous. Bridge `notification_send`s once after
+    /// publishing `exit_reason`; `wait` `notification_wait`s.
+    completion_notification: u32,
     /// Bridge thread handle. Taken by `wait` (after completion fires)
     /// or `Drop` (after sentinel post).
     handle: Option<JoinHandle<()>>,
     /// Exit reason published by the bridge before raising
-    /// `completion_signal`. Read by `wait` after the wake.
+    /// `completion_notification`. Read by `wait` after the wake.
     exit_reason: Arc<AtomicU64>,
 }
 
@@ -823,7 +823,7 @@ pub struct Process {
     death_eq: u32,
     /// Per-spawn bridge state — only allocated for piped spawns. The
     /// bridge translates a child death into the parent-side `peer_dead`
-    /// atomic + pipe-signal wakes that unblock any blocked
+    /// atomic + pipe-notification wakes that unblock any blocked
     /// `Pipe::read` / `write`. Non-piped spawns leave this `None` and
     /// `wait` reads `death_eq` directly, saving an entire userspace
     /// thread per spawn.
@@ -861,12 +861,12 @@ impl Process {
             return Ok(cached);
         }
         let reason = if let Some(b) = self.bridge.as_mut() {
-            // Bridge raises `completion_signal` exactly once after
+            // Bridge raises `completion_notification` exactly once after
             // publishing `exit_reason`. Loop on zero-bit wakes
             // (e.g. spurious / timeout) until real bits arrive.
             loop {
-                let bits = syscall::signal_wait(b.completion_signal)
-                    .map_err(|_| io::Error::other("signal_wait on completion_signal failed"))?;
+                let bits = syscall::notification_wait(b.completion_notification)
+                    .map_err(|_| io::Error::other("notification_wait on completion_notification failed"))?;
                 if bits != 0 {
                     break;
                 }
@@ -891,10 +891,10 @@ impl Process {
             return Ok(Some(cached));
         }
         let reason = if let Some(b) = self.bridge.as_mut() {
-            // `signal_wait_timeout(_, 0)` returns immediately. Non-zero
+            // `notification_wait_timeout(_, 0)` returns immediately. Non-zero
             // wakeup_value means the bridge published `exit_reason` and
-            // raised `completion_signal`; zero means "nothing pending".
-            match syscall::signal_wait_timeout(b.completion_signal, 0) {
+            // raised `completion_notification`; zero means "nothing pending".
+            match syscall::notification_wait_timeout(b.completion_notification, 0) {
                 Ok(bits) if bits != 0 => {
                     if let Some(h) = b.handle.take() {
                         let _ = h.join();
@@ -904,7 +904,7 @@ impl Process {
                 Ok(_) => return Ok(None),
                 Err(_) => {
                     return Err(io::Error::other(
-                        "signal_wait_timeout on completion_signal failed",
+                        "notification_wait_timeout on completion_notification failed",
                     ));
                 }
             }
@@ -947,7 +947,7 @@ impl Drop for Process {
             }
         }
         if let Some(b) = self.bridge.as_ref() {
-            let _ = syscall::cap_delete(b.completion_signal);
+            let _ = syscall::cap_delete(b.completion_notification);
         }
         let _ = syscall::cap_delete(self.death_eq);
         let _ = syscall::cap_delete(self.thread_cap);
@@ -958,39 +958,39 @@ impl Drop for Process {
 // ── Death bridge ───────────────────────────────────────────────────────────
 //
 // One thread per piped spawn (the bridge runs unconditionally — even
-// non-piped children benefit from the `completion_signal` rendezvous,
+// non-piped children benefit from the `completion_notification` rendezvous,
 // and the per-pipe arrays are simply empty). Receives the kernel's
 // death notification on `death_eq` and translates it into:
 //   * `peer_dead.store(true)` — every parent-side `Pipe` checks this
-//     atom before each `signal_wait`, so the next read/write observes
+//     atom before each `notification_wait`, so the next read/write observes
 //     EOF / `BrokenPipe` regardless of the ring header's `closed`
 //     flag (which the child may not have set if it exited
 //     abnormally).
-//   * `signal_send` on each piped direction's data and space signals,
-//     so any reader/writer currently parked in `signal_wait` wakes
+//   * `notification_send` on each piped direction's data and space notifications,
+//     so any reader/writer currently parked in `notification_wait` wakes
 //     and re-checks the flag.
-//   * `exit_reason.store(reason)` + `signal_send(completion_signal)`
+//   * `exit_reason.store(reason)` + `notification_send(completion_notification)`
 //     — the rendezvous point `Process::wait` blocks on.
 //
 // Bridge does NOT touch the ring memory: the parent's `Pipe::Drop`
 // can run before, during, or after the bridge fires without aliasing
 // concerns. The atomics live on heap-allocated `Arc`s independent of
-// any frame mapping.
+// any page mapping.
 //
 // The bridge also recognises `BRIDGE_SENTINEL_DROP` posted by
 // `Process::Drop` and exits without firing any wakes — the spawner
 // is discarding the child anyway.
 
 #[derive(Clone, Copy)]
-struct PipeBridgeSignals {
-    data_signal: u32,
-    space_signal: u32,
+struct PipeBridgeNotifications {
+    data_notification: u32,
+    space_notification: u32,
 }
 
 struct BridgeHandles {
     death_eq: u32,
-    completion_signal: u32,
-    pipe_signals: [Option<PipeBridgeSignals>; 3],
+    completion_notification: u32,
+    pipe_notifications: [Option<PipeBridgeNotifications>; 3],
     exit_reason: Arc<AtomicU64>,
     peer_dead: Arc<AtomicBool>,
 }
@@ -1009,15 +1009,15 @@ fn bridge_main(h: BridgeHandles) {
     let reason = payload & 0xFFFF_FFFF;
     h.exit_reason.store(reason, Ordering::Release);
     h.peer_dead.store(true, Ordering::Release);
-    for sig in h.pipe_signals.iter().flatten() {
+    for sig in h.pipe_notifications.iter().flatten() {
         // Any non-zero bits — the wake is just a kick; the reader /
         // writer re-checks `peer_dead` on its next loop turn.
-        let _ = syscall::signal_send(sig.data_signal, 1);
-        let _ = syscall::signal_send(sig.space_signal, 1);
+        let _ = syscall::notification_send(sig.data_notification, 1);
+        let _ = syscall::notification_send(sig.space_notification, 1);
     }
-    // Raise the rendezvous signal last so a `wait` that wakes
+    // Raise the rendezvous notification last so a `wait` that wakes
     // observes `exit_reason` already published.
-    let _ = syscall::signal_send(h.completion_signal, 1);
+    let _ = syscall::notification_send(h.completion_notification, 1);
 }
 
 // ── ExitStatus / ExitCode ───────────────────────────────────────────────────
@@ -1131,7 +1131,7 @@ pub type ChildPipe = crate::boxed::Box<crate::sys::pipe::Pipe>;
 /// Drain `out` and `err` to their respective vectors. Sequential v1
 /// implementation: stdout first, then stderr. Children that fill the
 /// stderr ring before the parent finishes draining stdout can stall —
-/// signal-based wakeup unblocks them once the parent moves to stderr.
+/// notification-based wakeup unblocks them once the parent moves to stderr.
 /// True deadlock is impossible because each ring is bounded and
 /// `closed`-flag-aware; pathological children that depend on
 /// interleaved drain semantics are not supported.
@@ -1185,8 +1185,8 @@ fn map_procmgr_error(code: u64) -> io::Error {
         procmgr_errors::OUT_OF_MEMORY => {
             io::Error::new(io::ErrorKind::OutOfMemory, "OUT_OF_MEMORY")
         }
-        procmgr_errors::INVALID_TOKEN => {
-            io::Error::new(io::ErrorKind::InvalidInput, "INVALID_TOKEN")
+        procmgr_errors::INVALID_BADGE => {
+            io::Error::new(io::ErrorKind::InvalidInput, "INVALID_BADGE")
         }
         procmgr_errors::ALREADY_STARTED => {
             io::Error::new(io::ErrorKind::AlreadyExists, "ALREADY_STARTED")

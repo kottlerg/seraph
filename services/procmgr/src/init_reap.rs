@@ -2,10 +2,10 @@
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
 //! Init reap-handoff: receives init's own kernel-object caps and
-//! reclaimable Frame caps in the post-Phase-3 exit IPCs, binds death-EQ
+//! reclaimable Memory caps in the post-Phase-3 exit IPCs, binds death-EQ
 //! observers on both init threads (main + init-logd), and once both have
 //! exited — init threadless — tears down init's
-//! `AddressSpace`/`CSpace`/`Thread` objects and donates the Frame caps to
+//! `AddressSpace`/`CSpace`/`Thread` objects and donates the Memory caps to
 //! memmgr. init-logd outlives the main thread until the svcmgr-launched
 //! real-logd pulls its handover, so the reap waits for the later of the two
 //! deaths; reclaiming init's aspace/cspace while a thread still runs in them
@@ -20,7 +20,7 @@
 //!   ▼
 //! Collecting{aspace, cspace, main_thread, logd_thread, caps[..]}
 //!   │  REGISTER_INIT_TEARDOWN  (subsequent rounds; data[0] == 0)
-//!   ▼ (appends Frame caps to caps[..])
+//!   ▼ (appends Memory caps to caps[..])
 //! Collecting
 //!   │  INIT_TEARDOWN_DONE
 //!   ▼
@@ -39,7 +39,7 @@
 //!   1. cap_delete(logd_thread)                — Exited, or Stopped→Exited
 //!   2. cap_delete(main_thread)
 //!   3. cap_revoke + cap_delete(aspace)        — mappings gone
-//!   4. DONATE_FRAMES(caps[..]) → memmgr       — safe; no aliasing
+//!   4. DONATE_MEMORY_CAPS(caps[..]) → memmgr       — safe; no aliasing
 //!   5. cap_revoke + cap_delete(cspace)        — cascade drops
 //!                                                init's last caps;
 //!                                                none free to the
@@ -58,13 +58,13 @@ use std::sync::Mutex;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use syscall_abi::MSG_CAP_SLOTS_MAX;
 
-/// Init's kernel-object and reclaim-Frame caps, accumulated across
+/// Init's kernel-object and reclaim-Memory caps, accumulated across
 /// `REGISTER_INIT_TEARDOWN` rounds and consumed by `run_reap`.
 ///
 /// `aspace`/`cspace`/`main_thread`/`logd_thread` are the procmgr-side
 /// slots holding the moved-in caps; `donate_caps` is the list of
-/// reclaimable Frame caps (ELF segments, user stack pages, `InitInfo`
-/// pages, bootloader/bundle reclaim ranges, the AP-trampoline frame,
+/// reclaimable Memory caps (ELF segments, user stack pages, `InitInfo`
+/// pages, bootloader/bundle reclaim ranges, the AP-trampoline memory cap,
 /// and boot-module ELF sources).
 pub struct InitReapState
 {
@@ -87,7 +87,7 @@ pub struct InitReapState
     /// `HANDOVER_RELEASE` (e.g. a logd restart with no handover source, or
     /// logd never launching) left it serving forever — `check_backstop`
     /// force-stops it and reaps anyway, so a wedged handover can never
-    /// permanently block reclamation of init's frames.
+    /// permanently block reclamation of init's memory caps.
     first_death_us: u64,
 }
 
@@ -108,7 +108,7 @@ static STATE: Mutex<Option<InitReapState>> = Mutex::new(None);
 /// Handle a `REGISTER_INIT_TEARDOWN` IPC.
 ///
 /// `data[0] != 0` marks the first round (carrying the 4 kernel-object
-/// caps); subsequent rounds carry only reclaimable Frame caps. On the
+/// caps); subsequent rounds carry only reclaimable Memory caps. On the
 /// first round, binds death-EQ observers on both init threads (main +
 /// init-logd) with `INIT_REAP_CORRELATOR` and arms `pending_deaths = 2`.
 pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
@@ -122,7 +122,7 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, death_eq: u32)
     //   * AddressSpace caps would trip `dealloc_object`'s
     //     `active_cpu_mask == 0` assert — init's threads are still
     //     running on that AS while this IPC is in flight.
-    //   * Frame caps (donation rounds) would buddy-free pages that
+    //   * Memory caps (donation rounds) would buddy-free pages that
     //     init's still-live AS has mapped, recreating the very
     //     aliasing window the reap ordering exists to prevent.
     // Init is the sole legitimate caller, all reject arms are
@@ -364,7 +364,7 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
     let _ = syscall::cap_revoke(aspace);
     let _ = syscall::cap_delete(aspace);
 
-    // 4. Donate every reclaim Frame cap to memmgr. Safe now that
+    // 4. Donate every reclaim Memory cap to memmgr. Safe now that
     //    init's AS is dead: no live mapping references the phys
     //    ranges, so memmgr can reissue them without aliasing.
     let (donated_caps, donated_pages, pool_total) =
@@ -372,9 +372,9 @@ fn do_reap(state: InitReapState, memmgr_ep: u32, ipc_buf: *mut u64)
 
     // 5. Destroy init's CSpace last. The cascade in `dealloc_object`
     //    drops every cap init still held — endpoint SENDs and the
-    //    endpoint-slab arena Frame. That arena is retype-pinned and
+    //    endpoint-slab arena Memory cap. That arena is retype-pinned and
     //    already forwarded to memmgr's pool, and every reclaimable
-    //    Frame was donated in step 4, so no `owns_memory` cap reaches
+    //    Memory cap was donated in step 4, so no `owns_memory` cap reaches
     //    its last reference here: nothing frees to the sealed buddy.
     let _ = syscall::cap_revoke(cspace);
     let _ = syscall::cap_delete(cspace);
@@ -411,7 +411,7 @@ fn donate_to_memmgr(memmgr_ep: u32, caps: &[u32], ipc_buf: *mut u64) -> (u32, u6
     while i < caps.len()
     {
         let end = (i + chunk_size).min(caps.len());
-        let mut builder = IpcMessage::builder(memmgr_labels::DONATE_FRAMES);
+        let mut builder = IpcMessage::builder(memmgr_labels::DONATE_MEMORY_CAPS);
         for &slot in &caps[i..end]
         {
             builder = builder.cap(slot);

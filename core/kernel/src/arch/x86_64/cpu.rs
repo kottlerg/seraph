@@ -271,8 +271,8 @@ pub unsafe fn enable_pcid() -> bool
 /// Per Intel SDM Vol. 2B (STI): when `STI` is immediately followed by `HLT`,
 /// the processor delays interrupt recognition until after `HLT` begins
 /// execution. The pair is therefore atomic: no interrupt is lost between
-/// the enable and the halt. A producer that raises a wake signal (IPI)
-/// between the idle loop's flag check and this call will find the signal
+/// the enable and the halt. A producer that raises a wake notification (IPI)
+/// between the idle loop's flag check and this call will find the notification
 /// pending in the local APIC at `HLT`, waking it immediately.
 ///
 /// `nomem` is intentionally omitted so the compiler may not reorder

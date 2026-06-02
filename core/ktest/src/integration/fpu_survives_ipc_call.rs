@@ -7,7 +7,7 @@
 //! round-trip across CPU migration.
 //!
 //! Mirrors `unit/fpu.rs::preempt_isolation_cross_cpu` but substitutes the
-//! signal rendezvous for an IPC call/reply. The child issues `SYS_IPC_CALL`
+//! notification rendezvous for an IPC call/reply. The child issues `SYS_IPC_CALL`
 //! directly via inline asm so no Rust function boundary clobbers the live
 //! FP register file between "load pattern" and "capture pattern
 //! post-migration"; this is the only ktest call site that exercises the
@@ -15,7 +15,7 @@
 //! wrappers.
 //!
 //! Coverage: the kernel's eager-save / lazy-restore path is already
-//! exercised by `unit/fpu.rs::preempt_isolation_cross_cpu` via the signal
+//! exercised by `unit/fpu.rs::preempt_isolation_cross_cpu` via the notification
 //! rendezvous. This file adds the IPC-dispatch path — `sys_ipc_call`'s
 //! endpoint-block branch into the scheduler, and `sys_ipc_reply`'s wake —
 //! so a future IPC fast-path optimisation that skipped `switch_out_save`
@@ -25,8 +25,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, ipc_buffer_set, signal_send,
-    signal_wait, system_info, thread_exit, thread_set_affinity,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
+    notification_send, notification_wait, system_info, thread_exit, thread_set_affinity,
 };
 use syscall_abi::SystemInfoType;
 
@@ -34,8 +34,8 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 
 /// SEND | GRANT (bits 4 and 6) — the child needs SEND to issue `ipc_call`.
 const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
-/// Signal right (bit 7) — covers both `signal_send` and `signal_wait`.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+/// Notification right (bit 7) — covers both `notification_send` and `notification_wait`.
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 
 /// 64-bit pattern loaded into every FP register before the call.
 const PATTERN: u64 = 0xA5A5_A5A5_A5A5_A5A5;
@@ -46,7 +46,7 @@ const REPLY_LABEL: u64 = 0xBEEF;
 
 /// Spin between FP load and `SYS_IPC_CALL` so timer ticks fire while the
 /// child is `fpu_owner` on the source CPU. Same sizing rationale as the
-/// cross-CPU signal test in `unit/fpu.rs`.
+/// cross-CPU notification test in `unit/fpu.rs`.
 const SPIN_ITERS: u64 = 50_000;
 
 static mut STACK: ChildStack = ChildStack::ZERO;
@@ -163,7 +163,7 @@ fn child_entry(_arg: u64) -> !
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
     OBSERVED_CPU.store(u32::try_from(cpu).unwrap_or(u32::MAX), Ordering::Release);
 
-    let _ = signal_send(CHILD_DONE.load(Ordering::Acquire), 0x1);
+    let _ = notification_send(CHILD_DONE.load(Ordering::Acquire), 0x1);
     thread_exit();
 }
 
@@ -296,7 +296,7 @@ fn child_entry(_arg: u64) -> !
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
     OBSERVED_CPU.store(u32::try_from(cpu).unwrap_or(u32::MAX), Ordering::Release);
 
-    let _ = signal_send(CHILD_DONE.load(Ordering::Acquire), 0x1);
+    let _ = notification_send(CHILD_DONE.load(Ordering::Acquire), 0x1);
     thread_exit();
 }
 
@@ -313,16 +313,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     MISMATCHES.store(0, Ordering::Release);
     OBSERVED_CPU.store(u32::MAX, Ordering::Release);
 
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "fpu_survives_ipc_call: cap_create_endpoint failed")?;
-    let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "fpu_survives_ipc_call: cap_create_signal failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "fpu_survives_ipc_call: cap_create_notification failed")?;
 
     let child =
         spawn::new_child(ctx).map_err(|_| "fpu_survives_ipc_call: spawn::new_child failed")?;
     let child_ep = cap_copy(ep, child.cs, RIGHTS_SEND_GRANT)
         .map_err(|_| "fpu_survives_ipc_call: cap_copy ep failed")?;
-    let child_done = cap_copy(done, child.cs, RIGHTS_SIGNAL)
+    let child_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "fpu_survives_ipc_call: cap_copy done failed")?;
 
     CHILD_EP.store(child_ep, Ordering::Release);
@@ -359,7 +359,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     unsafe { ipc::ipc_reply(&IpcMessage::new(REPLY_LABEL), ctx.ipc_buf) }
         .map_err(|_| "fpu_survives_ipc_call: ipc_reply failed")?;
 
-    let _ = signal_wait(done).map_err(|_| "fpu_survives_ipc_call: signal_wait done failed")?;
+    let _ = notification_wait(done)
+        .map_err(|_| "fpu_survives_ipc_call: notification_wait done failed")?;
 
     let mismatches = MISMATCHES.load(Ordering::Acquire);
     let observed_cpu = OBSERVED_CPU.load(Ordering::Acquire);

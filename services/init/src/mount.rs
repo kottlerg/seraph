@@ -23,7 +23,7 @@ use ipc::vfsd_labels;
 
 /// Request vfsd's system-root cap via [`vfsd_labels::GET_SYSTEM_ROOT_CAP`].
 ///
-/// Returns the tokened SEND cap on vfsd's namespace endpoint addressing
+/// Returns the badged SEND cap on vfsd's namespace endpoint addressing
 /// the synthetic root at full namespace rights, or `0` on failure. vfsd
 /// replies an error (and this returns `0`) until it has mounted root, so
 /// the call blocks until the root filesystem is available. Init holds

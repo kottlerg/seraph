@@ -12,7 +12,7 @@ three parts of `BootInfo`:
 3. `mmio_apertures` — a short list of coarse `{phys_base, size}` MMIO
    regions, used as seeds into the final aperture list that is merged
    with the UEFI memory map's MMIO classifications. The kernel mints
-   one `MmioRegion` capability per aperture entry.
+   one `Mmio` capability per aperture entry.
 
 The bootloader does **not** emit per-device capabilities, interrupt
 descriptors, PCI ECAM descriptors, or firmware-table read-only caps.

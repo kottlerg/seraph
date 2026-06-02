@@ -40,16 +40,16 @@ so the bootloader is the only entity that can carry this information to
 userspace.
 
 Devmgr spawns the driver via the `simple-device` path with a round-2
-tokened SEND on its registry endpoint so the driver can fetch its
+badged SEND on its registry endpoint so the driver can fetch its
 geometry via `QUERY_DEVICE_INFO` (generic kind/version/bytes payload
 schema, shared with virtio).
 
 Clients obtain a write cap through devmgr, not svcmgr: a framebuffer is a
 device, not a service. Devmgr answers
 [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`] by minting a
-[`fb_labels::WRITE_AUTHORITY`]-tokened `SEND_GRANT` cap on the driver's
+[`fb_labels::WRITE_AUTHORITY`]-badged `SEND_GRANT` cap on the driver's
 service endpoint, mirroring the `QUERY_SERIAL_DEVICE` flow. The caller's
-devmgr-registry token must carry `REGISTRY_QUERY_AUTHORITY`.
+devmgr-registry badge must carry `REGISTRY_QUERY_AUTHORITY`.
 
 ---
 
@@ -109,7 +109,7 @@ until implemented.
 - `FB_CLEAR` — clear the framebuffer to a caller-supplied colour.
 - `FB_SET_CURSOR` — move the text cursor to a (col, row) cell.
 - `FB_BLIT_RECT` — blit a caller-supplied pixel buffer into a rectangle.
-- `FB_REGISTER_RESIZE_NOTIFY` — register a signal cap kicked on geometry change.
+- `FB_REGISTER_RESIZE_NOTIFY` — register a notification cap kicked on geometry change.
 - `FB_SET_PALETTE` — set the foreground/background colour palette.
 
 Multi-head dispatch (v1 binds the single bootloader-handed framebuffer)
@@ -126,7 +126,7 @@ and mode-set are deferred to a follow-up issue when a real consumer
 | [services/drivers/docs/driver-model.md](../docs/driver-model.md) | Driver lifecycle and capability delegation |
 | [docs/device-management.md](../../../docs/device-management.md) | Driver discovery, spawning, security boundary |
 | [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
-| [docs/capability-model.md](../../../docs/capability-model.md) | Capability types, rights, delegation, tokens |
+| [docs/capability-model.md](../../../docs/capability-model.md) | Capability types, rights, delegation, badges |
 
 ---
 

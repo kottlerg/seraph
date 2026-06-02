@@ -6,7 +6,10 @@
 //! Creates and destroys 20 threads sequentially, verifying that kernel
 //! resource cleanup (TCBs, `CSpace` refcounts) works correctly under churn.
 
-use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
+use syscall::{
+    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
+    thread_exit,
+};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -14,8 +17,8 @@ const ITERATIONS: usize = 1000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "thread_churn: create_signal failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "thread_churn: create_notification failed")?;
 
     for _i in 0..ITERATIONS
     {
@@ -29,7 +32,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "thread_churn: configure_and_start failed")?;
 
         // Wait for child to complete.
-        let bits = signal_wait(done).map_err(|_| "thread_churn: signal_wait failed")?;
+        let bits = notification_wait(done).map_err(|_| "thread_churn: notification_wait failed")?;
         if bits != 0x1
         {
             return Err("thread_churn: child sent unexpected bits");
@@ -47,6 +50,6 @@ pub fn run(ctx: &TestContext) -> TestResult
 #[allow(clippy::cast_possible_truncation)]
 fn churn_entry(done_slot: u64) -> !
 {
-    signal_send(done_slot as u32, 0x1).ok();
+    notification_send(done_slot as u32, 0x1).ok();
     thread_exit()
 }

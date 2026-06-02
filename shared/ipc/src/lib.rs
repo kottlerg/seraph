@@ -54,8 +54,8 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     LOG_LABELS_VERSION    — log_labels::GET_LOG_CAP            (std process ↔ logd)
 //
 //   Implicitly covered by parent-channel handshake — the channel was opened
-//   against a cap-token first minted by a handshake-checked namespace; the
-//   token's presence is the version stamp, zero per-message cost.
+//   against a cap-badge first minted by a handshake-checked namespace; the
+//   badge's presence is the version stamp, zero per-message cost.
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
 //     STREAM_LABELS_VERSION — caps from log_labels handshake
 //
@@ -76,10 +76,10 @@ pub const PROCMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
-    /// Create a new process from a boot module frame. Caps: `[module,
+    /// Create a new process from a boot module Memory cap. Caps: `[module,
     /// creator_endpoint?]`. Stdio pipes (stdin/stdout/stderr) are
     /// configured through one or more [`CONFIGURE_PIPE`] calls against
-    /// the returned tokened `process_handle` — procmgr's CREATE path
+    /// the returned badged `process_handle` — procmgr's CREATE path
     /// carries no stdio caps so stdout and stderr can be piped
     /// independently and so the core process-creation primitive stays
     /// stdio-agnostic.
@@ -89,8 +89,8 @@ pub mod procmgr_labels
     /// Create a new process from a caller-supplied file cap (ELF binary).
     ///
     /// The caller already walked its own namespace cap to the binary node
-    /// and attaches the resulting tokened file cap. Procmgr issues
-    /// `FS_READ` / `FS_READ_FRAME` against that cap to stream the ELF —
+    /// and attaches the resulting badged file cap. Procmgr issues
+    /// `FS_READ` / `FS_READ_MEMORY` against that cap to stream the ELF —
     /// it never holds a namespace cap of its own.
     ///
     /// Label layout:
@@ -112,14 +112,14 @@ pub mod procmgr_labels
     /// separate [`CONFIGURE_PIPE`] calls between create and start.
     pub const CREATE_FROM_FILE: u64 = 13;
     /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
-    /// cspace, `ProcessInfo` frame), dec-refing any frames the child still
-    /// holds so they recycle back into the kernel buddy allocator. The
-    /// caller identifies the process via the tokened `process_handle`
-    /// received from `CREATE_PROCESS` / `CREATE_FROM_FILE`; the token is
+    /// cspace, `ProcessInfo` Memory cap), dec-refing any pages the child
+    /// still holds so they recycle back into the kernel buddy allocator. The
+    /// caller identifies the process via the badged `process_handle`
+    /// received from `CREATE_PROCESS` / `CREATE_FROM_FILE`; the badge is
     /// delivered by `ipc_recv` and looked up in procmgr's table. Idempotent
-    /// on already-destroyed tokens.
+    /// on already-destroyed badges.
     pub const DESTROY_PROCESS: u64 = 8;
-    /// Query a process's state. Caller identifies the target via the tokened
+    /// Query a process's state. Caller identifies the target via the badged
     /// `process_handle` (delivered by `ipc_recv` on procmgr's side). Reply
     /// carries one data word encoding the state (see
     /// [`procmgr_process_state`]) and a second word carrying the exit reason
@@ -131,27 +131,27 @@ pub mod procmgr_labels
     /// created via [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] but not yet
     /// started.
     ///
-    /// Request: caller invokes on the tokened `process_handle` returned
-    /// by the creation call; procmgr uses `recv.token` to find the entry.
+    /// Request: caller invokes on the badged `process_handle` returned
+    /// by the creation call; procmgr uses `recv.badge` to find the entry.
     /// Wire format:
     /// * `data[0]` — direction selector ([`PIPE_DIR_STDIN`] /
     ///   [`PIPE_DIR_STDOUT`] / [`PIPE_DIR_STDERR`]).
     /// * `data[1]` — ring byte capacity (power of two, ≤ ring page bytes
     ///   minus header). v1 uses 2048.
-    /// * `caps[0]` — frame cap (one shmem page; spawner has already
+    /// * `caps[0]` — memory cap (one shmem page; spawner has already
     ///   initialised the [`SpscHeader`] via `init`).
-    /// * `caps[1]` — data-available signal cap.
-    /// * `caps[2]` — space-available signal cap.
+    /// * `caps[1]` — data-available notification cap.
+    /// * `caps[2]` — space-available notification cap.
     ///
     /// procmgr `cap_copy`s each cap into the child's `CSpace` and writes
-    /// the resulting slot indices into the matching `<dir>_frame_cap`,
-    /// `<dir>_data_signal_cap`, and `<dir>_space_signal_cap` slots of
+    /// the resulting slot indices into the matching `<dir>_memory_cap`,
+    /// `<dir>_data_notification_cap`, and `<dir>_space_notification_cap` slots of
     /// the child's `ProcessInfo`. All three caps are required; missing
     /// cap slots reply `INVALID_ARGUMENT`.
     ///
     /// Ordering: valid only between `CREATE_PROCESS` and `START_PROCESS`.
     /// Replies `ALREADY_STARTED` if the target is running.
-    /// `INVALID_TOKEN` if the `process_handle` is unknown. Idempotent
+    /// `INVALID_BADGE` if the `process_handle` is unknown. Idempotent
     /// per direction before start; later calls overwrite the previous
     /// triple for that direction.
     ///
@@ -182,9 +182,9 @@ pub mod procmgr_labels
     /// this IPC is the only path that installs namespace caps on the
     /// child.
     ///
-    /// Request: caller invokes on the tokened `process_handle` returned
+    /// Request: caller invokes on the badged `process_handle` returned
     /// by [`CREATE_PROCESS`] or [`CREATE_FROM_FILE`]; procmgr uses
-    /// `recv.token` to find the entry. Wire format:
+    /// `recv.badge` to find the entry. Wire format:
     /// * `caps[0]` — root cap to deliver to the child (mandatory).
     /// * `caps[1]` — cwd cap to deliver to the child (optional). When
     ///   absent the child's `current_dir_cap` slot stays zero.
@@ -192,7 +192,7 @@ pub mod procmgr_labels
     /// Spawners obtain these caps by `cap_copy` of their own
     /// `root_dir_cap()` / `current_dir_cap()` (parent-inherit default)
     /// or by walk-and-attenuate against a sub-tree. procmgr does not
-    /// validate cap shape — any tokened SEND on a namespace endpoint
+    /// validate cap shape — any badged SEND on a namespace endpoint
     /// is accepted.
     ///
     /// procmgr stores the IPC-delivered copies in per-process state
@@ -204,7 +204,7 @@ pub mod procmgr_labels
     ///
     /// Ordering: valid only between create and `START_PROCESS`.
     /// Replies `ALREADY_STARTED` if the target is running.
-    /// `INVALID_TOKEN` if the `process_handle` is unknown.
+    /// `INVALID_BADGE` if the `process_handle` is unknown.
     /// `INVALID_ARGUMENT` if no cap was provided in `caps[0]`.
     /// Idempotent before start; later calls overwrite the previous
     /// caps (the prior caps are `cap_delete`'d procmgr-side).
@@ -214,7 +214,7 @@ pub mod procmgr_labels
     ///
     /// Wire format:
     /// * `caps[0]` = `EventQueue` cap (POST right) on which procmgr
-    ///   posts `(process_token as u32) << 32 | exit_reason` for every
+    ///   posts `(process_badge as u32) << 32 | exit_reason` for every
     ///   tracked process when it exits or faults.
     ///
     /// Procmgr stores the cap and, for every process already in its
@@ -225,19 +225,19 @@ pub mod procmgr_labels
     /// observer slot — re-registration replaces the previous cap.
     ///
     /// Real-logd uses this to learn about sender deaths so it can
-    /// evict the corresponding slot in its hash-keyed token table.
+    /// evict the corresponding slot in its hash-keyed badge table.
     /// Reply is `procmgr_errors::SUCCESS` on bind, `INVALID_ARGUMENT`
     /// if the cap is missing or wrong type, `UNAUTHORIZED` if called
-    /// over a non-privileged path (gated by tokened SEND cap).
+    /// over a non-privileged path (gated by badged SEND cap).
     pub const REGISTER_DEATH_EQ: u64 = 14;
 
-    /// Token bit on procmgr service caps that authorises
-    /// `REGISTER_DEATH_EQ`. Init derives this tokened SEND cap and
-    /// hands it to real-logd at bootstrap; the un-tokened or
-    /// differently-tokened twins are rejected.
+    /// Badge bit on procmgr service caps that authorises
+    /// `REGISTER_DEATH_EQ`. Init derives this badged SEND cap and
+    /// hands it to real-logd at bootstrap; the un-badged or
+    /// differently-badged twins are rejected.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
 
-    /// Hand init's kernel-object caps + reclaimable Frame caps to procmgr
+    /// Hand init's kernel-object caps + reclaimable Memory caps to procmgr
     /// for post-death reap. Init calls this in the post-Phase-3 exit
     /// path, then `sys_thread_exit`s.
     ///
@@ -249,11 +249,11 @@ pub mod procmgr_labels
     ///               as a previously-exited thread — its TCB is reclaimed
     ///               on `cap_delete` regardless of state).
     /// Subsequent rounds (`data[0] == 0`):
-    ///   `caps[0..N]` = reclaimable Frame caps (segments + stack +
+    ///   `caps[0..N]` = reclaimable Memory caps (segments + stack +
     ///                  `InitInfo` + IPC buffer + any other init-owned
-    ///                  donatable Frame). MOVED out of init's `CSpace`
+    ///                  donatable Memory cap). MOVED out of init's `CSpace`
     ///                  via IPC cap-transfer; procmgr accumulates them
-    ///                  for the eventual `memmgr.DONATE_FRAMES` chunk.
+    ///                  for the eventual `memmgr.DONATE_MEMORY_CAPS` chunk.
     ///
     /// Procmgr binds the death-EQ on both init threads (main and
     /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
@@ -261,15 +261,15 @@ pub mod procmgr_labels
     /// `procmgr_errors::SUCCESS`.
     pub const REGISTER_INIT_TEARDOWN: u64 = 15;
 
-    /// Signal end of init's reap-handoff cap stream. After this call
+    /// Notification end of init's reap-handoff cap stream. After this call
     /// init has no caps left to transfer; procmgr's state machine
     /// transitions to "armed", awaiting the death-EQ event. Init
     /// calls `sys_thread_exit` immediately after this IPC replies.
     pub const INIT_TEARDOWN_DONE: u64 = 16;
 
     /// Reserved death-notification correlator used by `REGISTER_INIT_TEARDOWN`.
-    /// Per-child correlators are `process_token as u32` starting at
-    /// `log_tokens::LOG_TOKEN_FIRST_CHILD = 16`; reserving the top of
+    /// Per-child correlators are `process_badge as u32` starting at
+    /// `log_badges::LOG_BADGE_FIRST_CHILD = 16`; reserving the top of
     /// the u32 range avoids collision.
     pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
@@ -278,65 +278,65 @@ pub const MEMMGR_LABELS_VERSION: u32 = 2;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
-/// bootstrap their heap by calling `REQUEST_FRAMES` on a tokened SEND
+/// bootstrap their heap by calling `REQUEST_MEMORY_CAPS` on a badged SEND
 /// cap installed in `ProcessInfo.memmgr_endpoint_cap`. Procmgr is the
-/// privileged caller that registers and retires process tokens.
+/// privileged caller that registers and retires process badges.
 ///
 /// See `services/memmgr/docs/ipc-interface.md` for the authoritative wire
 /// shape.
 pub mod memmgr_labels
 {
-    /// Allocate one or more Frame caps covering at least `want_pages` pages.
+    /// Allocate one or more Memory caps covering at least `want_pages` pages.
     ///
-    /// Universal label — callable from any tokened cap on memmgr's
+    /// Universal label — callable from any badged cap on memmgr's
     /// endpoint. Wire format:
     ///
     /// * `data[0]` low 32 bits — `want_pages: u32`.
     /// * `data[0]` high 32 bits — `flags: u32` (see flag constants below).
     ///
     /// Reply (success): `data[0]` = `returned_cap_count: u32`;
-    /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Frame
+    /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Memory
     /// capabilities (MAP|WRITE rights). `sum(page_count_for_cap_i) ==
     /// want_pages` for both contiguous and best-effort replies. Each reply
     /// cap MUST additionally carry `Rights::RETYPE` so the caller can
-    /// retype the frame into kernel objects via the `SYS_CAP_CREATE_*`
+    /// retype the memory into kernel objects via the `SYS_CAP_CREATE_*`
     /// syscalls; memmgr derives reply caps with `RIGHTS_ALL`, which
     /// preserves the RETYPE bit stamped at boot by the kernel.
-    pub const REQUEST_FRAMES: u64 = 1;
-    /// Voluntarily return Frame caps to the pool. Callable from any
-    /// tokened cap. Wire format: `data[0]` = `cap_count`; `data[1+i]` =
-    /// `page_count_for_cap_i`; `caps[0..cap_count]` = Frame caps to release.
-    /// memmgr verifies each cap was previously issued to the caller's token.
-    pub const RELEASE_FRAMES: u64 = 2;
+    pub const REQUEST_MEMORY_CAPS: u64 = 1;
+    /// Voluntarily return Memory caps to the pool. Callable from any
+    /// badged cap. Wire format: `data[0]` = `cap_count`; `data[1+i]` =
+    /// `page_count_for_cap_i`; `caps[0..cap_count]` = Memory caps to release.
+    /// memmgr verifies each cap was previously issued to the caller's badge.
+    pub const RELEASE_MEMORY_CAPS: u64 = 2;
     /// Procmgr-only: register a new process. memmgr allocates a per-process
-    /// tracking entry and replies with a tokened SEND cap on its endpoint
+    /// tracking entry and replies with a badged SEND cap on its endpoint
     /// identifying the new process. Procmgr installs the returned cap in
     /// the new process's `ProcessInfo.memmgr_endpoint_cap`.
     pub const REGISTER_PROCESS: u64 = 3;
-    /// Procmgr-only: signal process death. The transferred cap (`caps[0]`)
-    /// carries the dead process's token; memmgr reclaims every Frame cap
-    /// it had issued to that token, runs coalescing, and clears the
-    /// per-process record. Idempotent on unknown tokens.
+    /// Procmgr-only: notification process death. The transferred cap (`caps[0]`)
+    /// carries the dead process's badge; memmgr reclaims every Memory cap
+    /// it had issued to that badge, runs coalescing, and clears the
+    /// per-process record. Idempotent on unknown badges.
     pub const PROCESS_DIED: u64 = 4;
-    /// Permanently transfer a Frame cap into memmgr's pool.
+    /// Permanently transfer a Memory cap into memmgr's pool.
     ///
-    /// Used by init and procmgr to return boot-module Frame caps after the
+    /// Used by init and procmgr to return boot-module Memory caps after the
     /// loader has copied the ELF contents into the target process's
     /// `AddressSpace`. The transferred cap (`caps[0]`) becomes part of
-    /// memmgr's free pool; subsequent `REQUEST_FRAMES` callers may receive
+    /// memmgr's free pool; subsequent `REQUEST_MEMORY_CAPS` callers may receive
     /// pages derived from it.
     ///
     /// Wire format:
-    /// * `caps[0]` — the Frame cap to transfer (must carry `Rights::RETYPE`).
+    /// * `caps[0]` — the Memory cap to transfer (must carry `Rights::RETYPE`).
     ///
     /// memmgr derives `phys_base` and `size` from the cap itself via
     /// `cap_info`, so no caller-side bookkeeping is required. Reply is
     /// `memmgr_errors::SUCCESS` on ingestion, `INVALID_ARGUMENT` if the
     /// cap is missing RETYPE or the pool is full (cap is dropped on
     /// reject).
-    pub const DONATE_FRAMES: u64 = 5;
+    pub const DONATE_MEMORY_CAPS: u64 = 5;
     /// Read-only query of the all-RAM-accounted identity. Callable from any
-    /// tokened cap; returns aggregate counts only — no caps, no state change.
+    /// badged cap; returns aggregate counts only — no caps, no state change.
     ///
     /// Wire format: request carries no words. Reply (`SUCCESS`):
     ///
@@ -353,7 +353,7 @@ pub mod memmgr_labels
     /// "dark" memory.
     pub const QUERY_POOL_STATUS: u64 = 6;
 
-    /// `REQUEST_FRAMES` flag: reply MUST contain exactly one Frame cap
+    /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap
     /// covering all `want_pages`, or fail with
     /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
     /// the flags half of `data[0]`.
@@ -377,9 +377,9 @@ pub mod memmgr_errors
     /// consuming an unreasonable number of frames.
     pub const QUOTA: u64 = 3;
     /// `want_pages == 0`, reserved flag bits set, page-count mismatch on
-    /// `RELEASE_FRAMES`, or token unknown.
+    /// `RELEASE_MEMORY_CAPS`, or badge unknown.
     pub const INVALID_ARGUMENT: u64 = 4;
-    /// Procmgr-only label called over a non-procmgr token.
+    /// Procmgr-only label called over a non-procmgr badge.
     pub const UNAUTHORIZED: u64 = 5;
     /// `REGISTER_PROCESS` failed because the per-process tracking table
     /// is at static cap. Procmgr handles this as a process-creation
@@ -396,17 +396,17 @@ pub mod memmgr_errors
 ///
 /// memmgr is created directly by init (no procmgr exists yet), so its startup
 /// pool bounds arrive over a single bootstrap round on memmgr's creator
-/// endpoint plus one auxiliary read-only Frame cap (`caps[1]` of that round) —
+/// endpoint plus one auxiliary read-only Memory cap (`caps[1]` of that round) —
 /// the "phys-table" page. This module is the single source of truth for the
 /// payload layout; init writes it and memmgr reads it.
 ///
 /// Round (`ipc::bootstrap` caps + data words):
 /// * `caps[0]` — memmgr's own service endpoint (full rights; its RECV side).
-/// * `caps[1]` — read-only Frame cap covering the phys-table page (below).
-/// * `data[0]` — `frame_base`: first `CSpace` slot of the free RAM Frame caps
+/// * `caps[1]` — read-only Memory cap covering the phys-table page (below).
+/// * `data[0]` — `frame_base`: first `CSpace` slot of the free RAM Memory caps
 ///   init copied into memmgr's `CSpace`.
 /// * `data[1]` — `frame_count`: number of consecutive free RAM frames.
-/// * `data[2]` — `procmgr_token`: token init burned into procmgr's tokened
+/// * `data[2]` — `procmgr_badge`: badge init burned into procmgr's badged
 ///   SEND on memmgr's endpoint; gates the procmgr-only labels.
 /// * `data[3..3 + frame_count.div_ceil(2)]` — `page_count` per free frame,
 ///   packed two per word (low 32 bits = even index, high 32 = odd index).
@@ -425,11 +425,11 @@ pub mod memmgr_bootstrap
     /// Maximum free RAM frames init delivers in the round's data words:
     /// `MSG_DATA_WORDS_MAX` minus the 3-word prefix, two `page_count`s per
     /// remaining word.
-    pub const MAX_FRAMES: usize = (MSG_DATA_WORDS_MAX - 3) * 2;
+    pub const MAX_MEMORY_CAPS: usize = (MSG_DATA_WORDS_MAX - 3) * 2;
 
     /// Phys-table `u64` index of the first immutable fact
-    /// (`system_ram_bytes`). Sits past the `MAX_FRAMES`-entry `phys_base`
-    /// table (`MAX_FRAMES * 8 = 976 B`) so the two regions never overlap.
+    /// (`system_ram_bytes`). Sits past the `MAX_MEMORY_CAPS`-entry `phys_base`
+    /// table (`MAX_MEMORY_CAPS * 8 = 976 B`) so the two regions never overlap.
     pub const FACTS_SYSTEM_RAM_IDX: usize = 128;
     /// Phys-table `u64` index of `kernel_reserved_bytes`.
     pub const FACTS_KERNEL_RESERVED_IDX: usize = 129;
@@ -472,13 +472,13 @@ pub mod procmgr_process_state
     /// Entry exists but the process has not yet been started (still in the
     /// suspended post-CREATE state). Rare for external queriers to see.
     pub const CREATED: u64 = 1;
-    /// No entry for this token — already reaped, or the token was never
+    /// No entry for this badge — already reaped, or the badge was never
     /// valid. Equivalent to `ESRCH`.
     pub const UNKNOWN: u64 = 2;
-    /// Entry has been auto-reaped by procmgr but the token is still in the
+    /// Entry has been auto-reaped by procmgr but the badge is still in the
     /// recent-exits ring. Reply word 1 carries the kernel-encoded
     /// `exit_reason`. Recent-exit retention is best-effort; once the ring
-    /// rotates, queries on the same token return `UNKNOWN`.
+    /// rotates, queries on the same badge return `UNKNOWN`.
     pub const EXITED: u64 = 3;
 }
 
@@ -526,7 +526,7 @@ pub mod svcmgr_labels
     /// line in `/config/svcmgr/services/<name>.svc` so attenuation survives a
     /// crash-restart cycle.
     pub const NS_POLICY_SUBTREE: u8 = 2;
-    /// Signal that init handover is complete.
+    /// Notification that init handover is complete.
     pub const HANDOVER_COMPLETE: u64 = 2;
     /// Publish a named endpoint into the discovery registry.
     ///
@@ -540,29 +540,29 @@ pub mod svcmgr_labels
     /// success, or returns `svcmgr_errors::UNKNOWN_NAME` on miss.
     pub const QUERY_ENDPOINT: u64 = 4;
 
-    /// Verb-bit carried by the caller's token to authorise
+    /// Verb-bit carried by the caller's badge to authorise
     /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
     /// identity in the low bits today — server-side auth is binary: have
     /// the bit, or don't). svcmgr publishes the well-known names it owns
     /// (`rootfs.root`, `svcmgr`, `devmgr.registry`, and each provider's
     /// `provides` names) directly into its own registry, so those need no
-    /// token. The gate exists for a future external publisher — devmgr
-    /// holds a `PUBLISH_AUTHORITY`-tokened SEND from its bootstrap bundle,
+    /// badge. The gate exists for a future external publisher — devmgr
+    /// holds a `PUBLISH_AUTHORITY`-badged SEND from its bootstrap bundle,
     /// reserved for driver registrations.
     ///
     /// The SEND distributed to every process via
     /// `ProcessInfo.service_registry_cap` carries the child's
-    /// per-process token (no `PUBLISH_AUTHORITY` bit), so it is
+    /// per-process badge (no `PUBLISH_AUTHORITY` bit), so it is
     /// accepted for `QUERY_ENDPOINT` only; svcmgr rejects publish
-    /// attempts whose token lacks the bit with
+    /// attempts whose badge lacks the bit with
     /// [`svcmgr_errors::UNAUTHORIZED`]. See
     /// `docs/capability-model.md` "verb-bit authority pattern" for
     /// the rationale and parallel use in
     /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`.
     ///
     /// Per-publisher attenuation (e.g. name-prefix restrictions in
-    /// the low token bits, so a session daemon can publish only
-    /// `user.*`) is the future-work shape and the token namespace
+    /// the low badge bits, so a session daemon can publish only
+    /// `user.*`) is the future-work shape and the badge namespace
     /// reserves it — see GitHub issue #76.
     pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
 }
@@ -583,18 +583,18 @@ pub mod svcmgr_labels
 /// derivation, not the published name nor any consumer.
 pub mod published_names
 {
-    /// Tokened SEND on the root filesystem's namespace endpoint at
+    /// Badged SEND on the root filesystem's namespace endpoint at
     /// its root directory. The driver behind it (fatfs today, any
     /// FS driver tomorrow) is opaque to consumers.
     pub const ROOTFS_ROOT: &[u8] = b"rootfs.root";
 
-    /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's
+    /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's
     /// service endpoint. Consumers needing power-off authority
     /// resolve this name and call [`pwrmgr_labels::SHUTDOWN`] /
     /// [`pwrmgr_labels::REBOOT`] through the returned cap.
     pub const PWRMGR_SHUTDOWN: &[u8] = b"pwrmgr.shutdown";
 
-    /// No-authority SEND on pwrmgr's service endpoint, tokenised
+    /// No-authority SEND on pwrmgr's service endpoint, badgeised
     /// with a non-`SHUTDOWN_AUTHORITY` sentinel. Used by negative
     /// tests (e.g. svctest's `pwrmgr_cap_deny`) that need a cap
     /// pointing at pwrmgr without the shutdown bit to verify the
@@ -606,13 +606,13 @@ pub mod published_names
     /// `service_registry_cap` (today: crasher's `seed = svcmgr`).
     pub const SVCMGR: &[u8] = b"svcmgr";
 
-    /// `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry
+    /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
     /// endpoint. Consumers needing to resolve a device driver
     /// themselves (today: `programs/fb-charset` →
     /// `QUERY_FRAMEBUFFER_DEVICE`; future: any non-init caller of
     /// devmgr's discovery surface) seed this name. svcmgr publishes it
     /// post-handover from the devmgr-registry source cap init endows it
-    /// with; the `REGISTRY_QUERY_AUTHORITY` token bit is preserved
+    /// with; the `REGISTRY_QUERY_AUTHORITY` badge bit is preserved
     /// through svcmgr's plain `cap_derive` in `registry_lookup_derived`.
     pub const DEVMGR_REGISTRY: &[u8] = b"devmgr.registry";
 }
@@ -624,7 +624,7 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// Every RTC driver implements exactly one operation: return the current
 /// wall-clock time, as `u64` microseconds since the Unix epoch. devmgr
 /// owns the per-board RTC and hands clients a
-/// [`READ_AUTHORITY`](rtc_labels::READ_AUTHORITY)-tokened SEND via
+/// [`READ_AUTHORITY`](rtc_labels::READ_AUTHORITY)-badged SEND via
 /// [`devmgr_labels::QUERY_RTC_DEVICE`]. `timed` is the sole client
 /// today: it resolves the SEND once at startup, computes
 /// `offset = rtc_us - kernel_monotonic_us`, and serves
@@ -639,7 +639,7 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// driver bring-up); it then walks the per-arch driver name
 /// (`cmos-rtc` on x86-64, `goldfish-rtc` on RISC-V) from the subtree
 /// cap, calls [`procmgr_labels::CREATE_FROM_FILE`], and delivers the
-/// per-arch hardware authority cap (ISA `IoPortRange` for CMOS; MMIO
+/// per-arch hardware authority cap (ISA `IoPort` for CMOS; MMIO
 /// aperture for goldfish-rtc) through the bootstrap protocol — all
 /// between the `SET_DRIVERS_DIR` handler's `ipc_reply` and the next
 /// `ipc_recv`. See [`devmgr_labels::SET_DRIVERS_DIR`] for the nested-IPC
@@ -659,12 +659,12 @@ pub mod rtc_labels
     /// Wire format: empty body (no data words, no caps). Reply:
     /// `data[0]` is `u64` microseconds since the Unix epoch. Reply
     /// label carries a status code in the lower 16 bits. Caller's
-    /// token must carry [`READ_AUTHORITY`] (devmgr stamps it on every
+    /// badge must carry [`READ_AUTHORITY`] (devmgr stamps it on every
     /// SEND it mints from `QUERY_RTC_DEVICE`); the driver replies
     /// [`rtc_errors::UNAUTHORIZED`] otherwise.
     pub const RTC_GET_EPOCH_TIME: u64 = 1;
 
-    /// Authority bit in the RTC-service-endpoint token's high u64 bit.
+    /// Authority bit in the RTC-service-endpoint badge's high u64 bit.
     /// Set on caps devmgr mints in response to
     /// [`devmgr_labels::QUERY_RTC_DEVICE`]; gates [`RTC_GET_EPOCH_TIME`].
     /// A verb ("may read"), not an identity. Shares the same `1 << 63`
@@ -691,11 +691,11 @@ pub mod rtc_errors
     /// today — `RTC_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
-    /// Caller's token lacked [`rtc_labels::READ_AUTHORITY`]. Backstops
+    /// Caller's badge lacked [`rtc_labels::READ_AUTHORITY`]. Backstops
     /// the upstream gate at [`devmgr_labels::QUERY_RTC_DEVICE`]: a
     /// well-behaved client only ever sees this if a SEND cap leaked
     /// without the verb bit (or a future verb-set partition refuses
-    /// reads with a more restrictive token).
+    /// reads with a more restrictive badge).
     pub const UNAUTHORIZED: u64 = 4;
 }
 
@@ -741,12 +741,12 @@ pub const PWRMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the power manager (`pwrmgr`).
 ///
 /// pwrmgr owns the platform shutdown surface: ACPI S5 on x86-64 (the
-/// `PM1a` `IoPortRange` carved from the FADT/DSDT it interprets) and SBI
+/// `PM1a` `IoPort` carved from the FADT/DSDT it interprets) and SBI
 /// SRST on RISC-V (the `SbiControl` cap). It acquires those caps from
 /// devmgr — the hardware/ACPI authority — at startup via
 /// [`devmgr_labels::QUERY_ACPI_TABLE`] and
 /// [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`], not from init. Callers that
-/// may invoke shutdown receive a tokened SEND on pwrmgr's service
+/// may invoke shutdown receive a badged SEND on pwrmgr's service
 /// endpoint with the [`pwrmgr_labels::SHUTDOWN_AUTHORITY`] verb bit set.
 ///
 /// See `services/pwrmgr/README.md` for the authoritative description.
@@ -754,7 +754,7 @@ pub mod pwrmgr_labels
 {
     /// Power off the platform.
     ///
-    /// Wire format: empty body. The handler verifies the caller's token
+    /// Wire format: empty body. The handler verifies the caller's badge
     /// carries [`SHUTDOWN_AUTHORITY`] and replies
     /// [`pwrmgr_errors::UNAUTHORIZED`] otherwise. On the success path the
     /// platform powers off and no reply is delivered (QEMU exits the
@@ -767,7 +767,7 @@ pub mod pwrmgr_labels
     /// machine cold-boots back through the bootloader.
     pub const REBOOT: u64 = 2;
 
-    /// Authority bit in the pwrmgr-service-endpoint token's high u64
+    /// Authority bit in the pwrmgr-service-endpoint badge's high u64
     /// bit. Set on caps minted for consumers permitted to call
     /// [`SHUTDOWN`] and [`REBOOT`]. Without it the handler replies
     /// [`pwrmgr_errors::UNAUTHORIZED`].
@@ -778,7 +778,7 @@ pub mod pwrmgr_labels
 pub mod pwrmgr_errors
 {
     pub const SUCCESS: u64 = 0;
-    /// Caller's token lacks the verb bit required by the handler
+    /// Caller's badge lacks the verb bit required by the handler
     /// ([`pwrmgr_labels::SHUTDOWN_AUTHORITY`] for SHUTDOWN / REBOOT).
     pub const UNAUTHORIZED: u64 = 1;
     /// Malformed request (unknown opcode, label-version mismatch on a
@@ -801,18 +801,18 @@ pub mod vfsd_labels
     /// selecting which GPT type-GUID role to mount; vfsd looks the
     /// partition up itself.
     pub const MOUNT: u64 = 10;
-    /// Mint a fresh tokened SEND on vfsd's namespace endpoint addressing
+    /// Mint a fresh badged SEND on vfsd's namespace endpoint addressing
     /// the synthetic system root at full namespace rights and return it
     /// to the caller.
     ///
     /// Empty request body. Reply: `SUCCESS` with `caps[0]` = the
-    /// system-root cap; `UNAUTHORIZED` when the caller's token lacks
+    /// system-root cap; `UNAUTHORIZED` when the caller's badge lacks
     /// [`SEED_AUTHORITY`]. Init calls this once during bootstrap (after
     /// the role-byte root mount completes) to obtain the seed cap from
     /// which all later namespace-cap distribution flows.
     pub const GET_SYSTEM_ROOT_CAP: u64 = 13;
 
-    /// Authority bit in the vfsd-service-endpoint token. Set on caps
+    /// Authority bit in the vfsd-service-endpoint badge. Set on caps
     /// minted for consumers permitted to call
     /// [`GET_SYSTEM_ROOT_CAP`]. Without it the handler replies
     /// `UNAUTHORIZED`. Holding this cap is equivalent to holding the
@@ -826,7 +826,7 @@ pub const NS_LABELS_VERSION: u32 = 1;
 /// IPC labels for the namespace protocol (cap-as-namespace surface).
 ///
 /// Numbered in a reserved range above the surviving [`fs_labels`] codes
-/// (`FS_READ`, `FS_CLOSE`, `FS_READ_FRAME`, `FS_RELEASE_FRAME`,
+/// (`FS_READ`, `FS_CLOSE`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
 /// `FS_RELEASE_ACK`, `FS_MOUNT`, `END_OF_DIR`) so node-cap and per-file
 /// requests share one fs-driver endpoint with no opcode collisions.
 /// [`fs_labels::END_OF_DIR`] is reused unchanged as the readdir
@@ -850,7 +850,7 @@ pub mod ns_labels
     /// cached size hint, `caps[0]` = derived child node cap. On error
     /// the label is the matching `NsError` wire code with no caps.
     pub const NS_LOOKUP: u64 = 20;
-    /// Attribute snapshot for the node addressed by the caller's token.
+    /// Attribute snapshot for the node addressed by the caller's badge.
     ///
     /// Request: empty body. Reply on success: label = 0, `data[0]` =
     /// size, `data[1]` = `mtime_us` (best-effort; zero on backends that
@@ -858,7 +858,7 @@ pub mod ns_labels
     /// [`NS_LOOKUP`].
     pub const NS_STAT: u64 = 21;
     /// One-entry-per-call enumeration of the directory addressed by the
-    /// caller's token.
+    /// caller's badge.
     ///
     /// Request: `data[0]` = zero-based entry index. Reply on success:
     /// label = 0, `data[0]` = kind, `data[1]` = name length in bytes,
@@ -880,7 +880,7 @@ pub mod fs_labels
     /// per-call payload at the IPC inline ceiling; callers iterate.
     pub const FS_READ: u64 = 2;
     /// Close a node cap, releasing any lazily-allocated driver-side
-    /// bookkeeping bound to the file (outstanding `FS_READ_FRAME`
+    /// bookkeeping bound to the file (outstanding `FS_READ_MEMORY`
     /// pages, open-file slot, etc.). The caller still cap-deletes the
     /// node cap to drop the kernel-side reference.
     pub const FS_CLOSE: u64 = 3;
@@ -889,7 +889,7 @@ pub mod fs_labels
     /// Request: `label = FS_WRITE | (byte_len << 16)` (bits 0-15 = label
     /// ID, bits 16-31 = payload byte length, ≤ 504), `data[0]` = file
     /// byte offset, payload bytes packed from word 1 onward via
-    /// `IpcMessageBuilder::bytes(1, &payload)`. Token must carry the
+    /// `IpcMessageBuilder::bytes(1, &payload)`. Badge must carry the
     /// `WRITE` namespace right (see `namespace-protocol::rights`).
     ///
     /// Reply (success label `fs_errors::SUCCESS`): `data[0]` =
@@ -899,60 +899,60 @@ pub mod fs_labels
     pub const FS_WRITE: u64 = 4;
     /// End-of-directory marker in `NS_READDIR` replies.
     pub const END_OF_DIR: u64 = 6;
-    /// Read file content into a cached Frame cap returned in the reply.
+    /// Read file content into a cached Memory cap returned in the reply.
     ///
-    /// Request: token identifies the file (per-file cap), `data[0]` =
+    /// Request: badge identifies the file (per-file cap), `data[0]` =
     /// byte offset (no alignment requirement), `data[1]` = client-chosen
     /// release cookie (must be non-zero). `caps[0]` = optional per-process
     /// release-endpoint SEND, transferred only on the first
-    /// `FS_READ_FRAME` for a given (client, file) pair; the driver
+    /// `FS_READ_MEMORY` for a given (client, file) pair; the driver
     /// records it on the lazy `OpenFile` slot allocated at that point
-    /// so its eviction worker can route cooperative `FS_RELEASE_FRAME`
-    /// back to the client. Subsequent `FS_READ_FRAME`s for the same
+    /// so its eviction worker can route cooperative `FS_RELEASE_MEMORY`
+    /// back to the client. Subsequent `FS_READ_MEMORY`s for the same
     /// pair carry no caps. Clients that opt out of cooperative release
     /// omit the cap on every call; eviction falls back to hard-revoke.
-    /// Reply: `data[0]` = bytes valid in the returned frame starting at
-    /// the indicated frame offset, `data[1]` = the same release cookie
-    /// echoed back, `data[2]` = byte offset within the returned frame
+    /// Reply: `data[0]` = bytes valid in the returned page starting at
+    /// the indicated page offset, `data[1]` = the same release cookie
+    /// echoed back, `data[2]` = byte offset within the returned page
     /// where the file's content for the requested `offset` begins,
-    /// `caps[0]` = single-page Frame cap with `MAP|READ` rights
+    /// `caps[0]` = single-page Memory cap with `MAP|READ` rights
     /// covering the cached file page.
     ///
     /// `bytes_valid` is bounded by file end, the current cluster
     /// boundary on the underlying filesystem, and the page tail
-    /// (`PAGE_SIZE - frame_data_offset`); callers iterate forward from
+    /// (`PAGE_SIZE - memory_data_offset`); callers iterate forward from
     /// `offset + bytes_valid` to read past those boundaries.
-    pub const FS_READ_FRAME: u64 = 7;
+    pub const FS_READ_MEMORY: u64 = 7;
     /// Filesystem-driver request to a client to release a previously-returned
-    /// Frame. Sent on the per-file release endpoint cap. Token identifies the
-    /// file; `data[0]` = the release cookie naming the Frame to unmap.
-    pub const FS_RELEASE_FRAME: u64 = 8;
-    /// Client acknowledgement of [`FS_RELEASE_FRAME`]: synchronous reply,
+    /// page. Sent on the per-file release endpoint cap. Badge identifies the
+    /// file; `data[0]` = the release cookie naming the Memory cap to unmap.
+    pub const FS_RELEASE_MEMORY: u64 = 8;
+    /// Client acknowledgement of [`FS_RELEASE_MEMORY`]: synchronous reply,
     /// empty body.
     pub const FS_RELEASE_ACK: u64 = 9;
     /// Mount notification from vfsd.
     pub const FS_MOUNT: u64 = 10;
-    /// Write file content from a caller-supplied source Frame cap.
+    /// Write file content from a caller-supplied source Memory cap.
     ///
-    /// Mirror of [`FS_READ_FRAME`] for the write direction. Caller maps,
-    /// fills, then transfers a Frame holding the bytes to write.
+    /// Mirror of [`FS_READ_MEMORY`] for the write direction. Caller maps,
+    /// fills, then transfers a Memory cap holding the bytes to write.
     ///
-    /// Request: token identifies the file (per-file cap),
+    /// Request: badge identifies the file (per-file cap),
     /// `data[0]` = file byte offset (no alignment requirement),
-    /// `data[1]` = bytes to write from the frame (`≤ PAGE_SIZE -
-    /// frame_data_offset`), `data[2]` = byte offset within the source
-    /// frame where the data begins. `caps[0]` = source Frame cap with
-    /// at least `MAP|READ` rights, sized one page. Token must carry the
+    /// `data[1]` = bytes to write from the page (`≤ PAGE_SIZE -
+    /// memory_data_offset`), `data[2]` = byte offset within the source
+    /// page where the data begins. `caps[0]` = source Memory cap with
+    /// at least `MAP|READ` rights, sized one page. Badge must carry the
     /// `WRITE` namespace right.
     ///
     /// Reply (label `fs_errors::SUCCESS`): `data[0]` = `bytes_written`
     /// (short on `NO_SPACE` or cluster-boundary truncation; callers
-    /// iterate). `caps[0]` = the source Frame cap moved back to the
+    /// iterate). `caps[0]` = the source Memory cap moved back to the
     /// caller. Errors per [`fs_errors`].
-    pub const FS_WRITE_FRAME: u64 = 12;
+    pub const FS_WRITE_MEMORY: u64 = 12;
     /// Create a new file in a directory.
     ///
-    /// Request: token = parent-directory cap (must carry `MUTATE_DIR`),
+    /// Request: badge = parent-directory cap (must carry `MUTATE_DIR`),
     /// `label = FS_CREATE | (name_len << 16)`, name bytes packed from
     /// word 0 via `IpcMessageBuilder::bytes(0, name)`. Name validated
     /// per `namespace-protocol::validate_name`.
@@ -964,7 +964,7 @@ pub mod fs_labels
     pub const FS_CREATE: u64 = 13;
     /// Remove a file or empty directory from a directory.
     ///
-    /// Request: token = parent-directory cap (must carry `MUTATE_DIR`),
+    /// Request: badge = parent-directory cap (must carry `MUTATE_DIR`),
     /// `label = FS_REMOVE | (name_len << 16)`, name bytes from word 0.
     ///
     /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
@@ -972,7 +972,7 @@ pub mod fs_labels
     pub const FS_REMOVE: u64 = 14;
     /// Create a new (empty) directory in a directory.
     ///
-    /// Request: identical shape to [`FS_CREATE`]. Token must carry
+    /// Request: identical shape to [`FS_CREATE`]. Badge must carry
     /// `MUTATE_DIR`. Allocates one cluster zero-filled with `.` and
     /// `..` entries.
     ///
@@ -980,7 +980,7 @@ pub mod fs_labels
     pub const FS_MKDIR: u64 = 15;
     /// Rename a directory entry within a single directory.
     ///
-    /// Request: token = directory cap (must carry `MUTATE_DIR`),
+    /// Request: badge = directory cap (must carry `MUTATE_DIR`),
     /// `data[0]` = source name length, `data[1]` = destination name
     /// length, name bytes packed contiguously from word 2 via
     /// `IpcMessageBuilder::bytes(2, &concat(src, dst))` — source bytes
@@ -988,8 +988,8 @@ pub mod fs_labels
     ///
     /// Cross-directory rename is deferred to a follow-up Issue: the
     /// caller cannot supply a second directory cap because servers
-    /// cannot introspect the token packed inside a cap they receive
-    /// (`cap_info` does not expose token bits), so a cross-directory
+    /// cannot introspect the badge packed inside a cap they receive
+    /// (`cap_info` does not expose badge bits), so a cross-directory
     /// destination cannot be resolved to a `NodeId` server-side.
     ///
     /// Not atomic: an interrupted rename can leave both names present
@@ -1001,7 +1001,7 @@ pub mod fs_labels
     pub const FS_RENAME: u64 = 16;
     /// Truncate a file to a new length.
     ///
-    /// Request: token = file-node cap (must carry `WRITE`),
+    /// Request: badge = file-node cap (must carry `WRITE`),
     /// `label = FS_TRUNCATE`, `data[0]` = new length in bytes.
     ///
     /// v1 supports only `new_len == 0` (sufficient for
@@ -1011,7 +1011,7 @@ pub mod fs_labels
     /// follow-up is tracked in the `ruststd::fs` completeness-gaps Issue.
     ///
     /// Reply (label `fs_errors::SUCCESS`): empty body. Errors:
-    /// `INVALID_TOKEN`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
+    /// `INVALID_BADGE`, `IS_A_DIRECTORY`, `PERMISSION_DENIED`,
     /// `IO_ERROR` (chain walk / `FSInfo` flush failure, or non-zero
     /// `new_len` until the v2 extend path lands).
     pub const FS_TRUNCATE: u64 = 17;
@@ -1023,15 +1023,15 @@ pub mod devmgr_labels
 {
     /// Query for a block device endpoint.
     ///
-    /// Mints a `MOUNT_AUTHORITY`-tokened `SEND_GRANT` cap on
-    /// `blk_ep` to the caller. Caller's token must have
+    /// Mints a `MOUNT_AUTHORITY`-badged `SEND_GRANT` cap on
+    /// `blk_ep` to the caller. Caller's badge must have
     /// [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
     /// `UNAUTHORIZED` otherwise.
     pub const QUERY_BLOCK_DEVICE: u64 = 1;
     /// Query a device's startup-info payload from devmgr's catalog.
     ///
-    /// The caller's token identifies the device by indexing devmgr's
-    /// [`DeviceCatalog`] (token == entry index + 1). Devmgr stores the
+    /// The caller's badge identifies the device by indexing devmgr's
+    /// [`DeviceCatalog`] (badge == entry index + 1). Devmgr stores the
     /// payload bytes opaquely; the per-class shape lives in the driver
     /// crate. Reply schema (generic for every kind):
     /// - `word[0]` = `kind` discriminant ([`super::device_info_kind`])
@@ -1045,25 +1045,25 @@ pub mod devmgr_labels
     pub const QUERY_DEVICE_INFO: u64 = 2;
     /// Query for the serial (UART) device endpoint.
     ///
-    /// Mints a `serial_labels::WRITE_AUTHORITY`-tokened `SEND_GRANT`
+    /// Mints a `serial_labels::WRITE_AUTHORITY`-badged `SEND_GRANT`
     /// cap on the serial driver's service endpoint to the caller.
-    /// Caller's token must have [`REGISTRY_QUERY_AUTHORITY`] set; the
+    /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
     /// [`QUERY_BLOCK_DEVICE`].
     pub const QUERY_SERIAL_DEVICE: u64 = 3;
     /// Query for the framebuffer device endpoint.
     ///
-    /// Mints a `fb_labels::WRITE_AUTHORITY`-tokened `SEND_GRANT` cap
+    /// Mints a `fb_labels::WRITE_AUTHORITY`-badged `SEND_GRANT` cap
     /// on the framebuffer driver's service endpoint to the caller.
-    /// Caller's token must have [`REGISTRY_QUERY_AUTHORITY`] set; the
+    /// Caller's badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the
     /// handler replies `UNAUTHORIZED` otherwise. Mirrors
     /// [`QUERY_SERIAL_DEVICE`].
     pub const QUERY_FRAMEBUFFER_DEVICE: u64 = 4;
     /// Query for the platform real-time-clock device endpoint.
     ///
-    /// Mints a `rtc_labels::READ_AUTHORITY`-tokened `SEND_GRANT` cap
+    /// Mints a `rtc_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap
     /// on the RTC driver's service endpoint to the caller. Caller's
-    /// token must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
+    /// badge must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler
     /// replies `UNAUTHORIZED` otherwise. Mirrors
     /// [`QUERY_SERIAL_DEVICE`]. Today's sole consumer is `timed`,
     /// which seeds its wall-clock offset from one
@@ -1075,11 +1075,11 @@ pub mod devmgr_labels
     /// which devmgr walks its on-disk driver binaries.
     ///
     /// Request: `data[0]` = caller's compiled
-    /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = tokened SEND on a
+    /// [`super::DEVMGR_LABELS_VERSION`]; `caps[0]` = badged SEND on a
     /// vfsd directory node rooted at the system's `/services/drivers/`
     /// path, derived by svcmgr via
     /// `namespace_lookup_dir(root_dir_cap, …, LOOKUP | READ)`.
-    /// Caller's token MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
+    /// Caller's badge MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Devmgr stashes the cap and replies
@@ -1110,19 +1110,19 @@ pub mod devmgr_labels
     /// devmgr is the sole owner of ACPI data and the only service that
     /// navigates the table tree (RSDP → XSDT). Callers that need a table
     /// (today: `pwrmgr`, for the FADT + DSDT it interprets for S5
-    /// shutdown) request it here rather than holding ACPI frames of
+    /// shutdown) request it here rather than holding ACPI Memory caps of
     /// their own.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = 4-byte table signature packed little-endian (e.g.
     /// `FACP`), or `0` to look up by physical address; `data[2]` =
     /// table physical address (used when `data[1] == 0`, e.g. the DSDT,
-    /// whose address the caller reads from the FADT). Caller's token MUST
+    /// whose address the caller reads from the FADT). Caller's badge MUST
     /// carry [`REGISTRY_QUERY_AUTHORITY`]; the handler replies
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a derived
-    /// **read-only-intended** Frame cap on the ACPI region containing the
+    /// **read-only-intended** Memory cap on the ACPI region containing the
     /// table (the caller maps it `MAP_READONLY`); `data[0]` = region
     /// physical base, `data[1]` = region size in bytes, `data[2]` = the
     /// table's physical address. The caller maps the region and reads the
@@ -1141,13 +1141,13 @@ pub mod devmgr_labels
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = the `PM1a` control port (x86-64; ignored on RISC-V).
-    /// Caller's token MUST carry [`REGISTRY_QUERY_AUTHORITY`]; the handler
+    /// Caller's badge MUST carry [`REGISTRY_QUERY_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]):
-    /// - x86-64: `caps[0]` = a narrow `IoPortRange` over `[pm1a, pm1a+2)`
-    ///   carved from devmgr's root `IoPortRange`; `caps[1]` = a narrow
-    ///   `IoPortRange` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
+    /// - x86-64: `caps[0]` = a narrow `IoPort` over `[pm1a, pm1a+2)`
+    ///   carved from devmgr's root `IoPort`; `caps[1]` = a narrow
+    ///   `IoPort` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
     ///   Both are re-derived from the root on every call, so a pwrmgr
     ///   restart re-acquires them cleanly.
     /// - RISC-V: `caps[0]` = a `cap_derive` copy of devmgr's `SbiControl`
@@ -1157,7 +1157,7 @@ pub mod devmgr_labels
     /// the platform authority cap is absent.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
-    /// Authority bit in the devmgr-registry-endpoint token's high
+    /// Authority bit in the devmgr-registry-endpoint badge's high
     /// u64 bit. Set on caps minted for consumers permitted to call
     /// [`QUERY_BLOCK_DEVICE`] (today: vfsd). Without it the handler
     /// replies `UNAUTHORIZED`. Gating `QUERY_BLOCK_DEVICE` upstream of
@@ -1192,75 +1192,75 @@ pub const BLK_LABELS_VERSION: u32 = 2;
 /// IPC labels for block device drivers.
 pub mod blk_labels
 {
-    /// Authority bit in the block-service-endpoint token's high u64
+    /// Authority bit in the block-service-endpoint badge's high u64
     /// bit. Set on caps minted for consumers that may invoke
     /// [`REGISTER_PARTITION`] and may issue whole-disk sector reads
-    /// via [`BLK_READ_INTO_FRAME`]. The bit is a verb — "may invoke
+    /// via [`BLK_READ_INTO_MEMORY`]. The bit is a verb — "may invoke
     /// these labels" — not an identity: multiple consumers may hold
     /// it, and the bit alone does not encode "is vfsd."
     ///
-    /// Disjoint from partition-identity tokens. The driver allocates
-    /// partition tokens from a monotonic counter in the low bits of
+    /// Disjoint from partition-identity badges. The driver allocates
+    /// partition badges from a monotonic counter in the low bits of
     /// the u64 (top bit clear); the partition table is keyed by the
-    /// full token value so collision is impossible.
+    /// full badge value so collision is impossible.
     pub const MOUNT_AUTHORITY: u64 = 1u64 << 63;
 
-    /// Register a partition range, receiving back a tokened SEND cap
+    /// Register a partition range, receiving back a badged SEND cap
     /// scoped to that partition.
     ///
-    /// Caller's token must have [`MOUNT_AUTHORITY`] set; un-tokened
-    /// or partition-tokened callers are rejected. Data words:
+    /// Caller's badge must have [`MOUNT_AUTHORITY`] set; un-badged
+    /// or partition-badged callers are rejected. Data words:
     /// `[base_lba, length_lba]`. The driver allocates a fresh
-    /// partition-identity token, inserts the bound, and replies with
+    /// partition-identity badge, inserts the bound, and replies with
     /// the partition cap in `caps[0]` — server-side derivation is
-    /// required because [`MOUNT_AUTHORITY`] caps are tokened and the
-    /// kernel rejects re-tokening of a tokened source.
+    /// required because [`MOUNT_AUTHORITY`] caps are badged and the
+    /// kernel rejects re-badging of a badged source.
     pub const REGISTER_PARTITION: u64 = 2;
-    /// Read one or more contiguous sectors into a caller-supplied Frame cap.
+    /// Read one or more contiguous sectors into a caller-supplied Memory cap.
     ///
     /// Request: `data[0]` = starting LBA, `data[1]` = sector count
     /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// target Frame (`MAP|WRITE`; the driver writes `count * 512` bytes
-    /// starting at offset 0 of the frame, packed contiguously). The frame
+    /// target Memory cap (`MAP|WRITE`; the driver writes `count * 512` bytes
+    /// starting at offset 0 of the page, packed contiguously). The page
     /// must be at least `count * 512` bytes; the driver rejects with
-    /// `INVALID_FRAME_CAP` otherwise. `caps[1]` is reserved for a future
+    /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
     /// per-request release handle and is null today. `caps[2]` is a
     /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
     /// the kernel transports nothing for this slot and has no awareness
     /// of IOMMU semantics — IOMMU enforcement is permanently userspace.
     /// Reply: empty body, label is the success or error code; the target
-    /// Frame is moved back to the caller in `caps[0]` of the reply.
-    pub const BLK_READ_INTO_FRAME: u64 = 3;
-    /// Write one or more contiguous sectors from a caller-supplied Frame cap.
+    /// Memory cap is moved back to the caller in `caps[0]` of the reply.
+    pub const BLK_READ_INTO_MEMORY: u64 = 3;
+    /// Write one or more contiguous sectors from a caller-supplied Memory cap.
     ///
-    /// Mirror of [`BLK_READ_INTO_FRAME`] for the write direction. The
-    /// caller fills the source frame, then issues the request; the
+    /// Mirror of [`BLK_READ_INTO_MEMORY`] for the write direction. The
+    /// caller fills the source page, then issues the request; the
     /// driver reads `count * 512` bytes starting at offset 0 and writes
     /// them to disk.
     ///
     /// Request: `data[0]` = starting LBA, `data[1]` = sector count
     /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// source Frame (`MAP|READ`; the driver reads `count * 512` bytes
-    /// starting at offset 0 of the frame, packed contiguously). The frame
+    /// source Memory cap (`MAP|READ`; the driver reads `count * 512` bytes
+    /// starting at offset 0 of the page, packed contiguously). The page
     /// must be at least `count * 512` bytes; the driver rejects with
-    /// `INVALID_FRAME_CAP` otherwise. `caps[1]` is reserved for a future
+    /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
     /// per-request release handle and is null today. `caps[2]` is a
     /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
-    /// see [`BLK_READ_INTO_FRAME`] for the userspace-IOMMU framing.
+    /// see [`BLK_READ_INTO_MEMORY`] for the userspace-IOMMU framing.
     /// Reply: empty body, label is the success or error code; the source
-    /// Frame is moved back to the caller in `caps[0]` of the reply (same
+    /// Memory cap is moved back to the caller in `caps[0]` of the reply (same
     /// discipline as the read path).
-    pub const BLK_WRITE_FROM_FRAME: u64 = 4;
+    pub const BLK_WRITE_FROM_MEMORY: u64 = 4;
 }
 
 pub const SERIAL_LABELS_VERSION: u32 = 1;
 /// IPC labels for the serial (UART) device driver (`services/drivers/serial`).
 ///
 /// The driver answers a single write operation today. It owns the platform
-/// UART hardware authority (an `IoPortRange` for COM1 on x86-64, an
-/// `MmioRegion` for the ACPI-SPCR-reported NS16550 on RISC-V) and is the
+/// UART hardware authority (an `IoPort` for COM1 on x86-64, an
+/// `Mmio` for the ACPI-SPCR-reported NS16550 on RISC-V) and is the
 /// sole driver-mediated sink for userspace serial bytes. devmgr spawns it
-/// and hands clients a [`serial_labels::WRITE_AUTHORITY`]-tokened SEND via
+/// and hands clients a [`serial_labels::WRITE_AUTHORITY`]-badged SEND via
 /// [`devmgr_labels::QUERY_SERIAL_DEVICE`]. Read, line-control, flow-control,
 /// and RX-notify surfaces are planned but unimplemented (see the driver
 /// `README.md`); they are not on the wire.
@@ -1279,7 +1279,7 @@ pub mod serial_labels
     /// - Bits 16-31: byte length of the payload in this call (0..=512).
     pub const SERIAL_WRITE_BYTES: u64 = 1;
 
-    /// Authority bit in the serial-service-endpoint token's high u64 bit.
+    /// Authority bit in the serial-service-endpoint badge's high u64 bit.
     /// Set on caps devmgr mints in response to
     /// [`devmgr_labels::QUERY_SERIAL_DEVICE`]; gates [`SERIAL_WRITE_BYTES`].
     /// A verb ("may write"), not an identity.
@@ -1305,7 +1305,7 @@ pub const FB_LABELS_VERSION: u32 = 1;
 /// The driver answers a single write operation today. It owns the
 /// bootloader-handed GOP linear-framebuffer MMIO end-to-end and is the
 /// sole driver-mediated sink for userspace framebuffer bytes. devmgr
-/// spawns it and hands clients a [`fb_labels::WRITE_AUTHORITY`]-tokened
+/// spawns it and hands clients a [`fb_labels::WRITE_AUTHORITY`]-badged
 /// SEND via [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]. Graphical
 /// primitives, cursor control, mode set, and multi-head dispatch are
 /// planned but unimplemented (see the driver `README.md`); they are not
@@ -1327,7 +1327,7 @@ pub mod fb_labels
     /// - Bits 16-31: byte length of the payload in this call (0..=512).
     pub const FB_WRITE_BYTES: u64 = 1;
 
-    /// Authority bit in the framebuffer-service-endpoint token's high
+    /// Authority bit in the framebuffer-service-endpoint badge's high
     /// u64 bit. Set on caps devmgr mints in response to
     /// [`devmgr_labels::QUERY_FRAMEBUFFER_DEVICE`]; gates
     /// [`FB_WRITE_BYTES`]. A verb ("may write"), not an identity.
@@ -1369,42 +1369,42 @@ pub mod stream_labels
     ///
     /// Payload: name bytes via `.bytes(0, name)` with byte length in bits
     /// 16-31 of the label, same encoding as `STREAM_BYTES`. The mediator
-    /// looks up the slot for the sender's token (delivered by the kernel
-    /// from the tokened SEND cap) and stores the bytes as that slot's
-    /// display name. Names that would collide with another token's name
+    /// looks up the slot for the sender's badge (delivered by the kernel
+    /// from the badged SEND cap) and stores the bytes as that slot's
+    /// display name. Names that would collide with another badge's name
     /// are stored with a `.2` / `.3` / … suffix; re-registration by the
-    /// same token with its own current name is a silent no-op. Names
+    /// same badge with its own current name is a silent no-op. Names
     /// longer than the mediator's per-slot buffer are truncated.
     pub const STREAM_REGISTER_NAME: u64 = 11;
 }
 
-/// Reserved log-endpoint tokens.
+/// Reserved log-endpoint badges.
 ///
-/// Every tokened SEND cap on the log endpoint carries a `u64` token
-/// (kernel-attached at `cap_derive_token` time, immutable thereafter).
-/// The cap's holder is identified to the receiver by that token. For
-/// procmgr-spawned children the token equals the child's procmgr-
-/// assigned process token; the kernel-side identity, the receiver's
+/// Every badged SEND cap on the log endpoint carries a `u64` badge
+/// (kernel-attached at `cap_derive_badge` time, immutable thereafter).
+/// The cap's holder is identified to the receiver by that badge. For
+/// procmgr-spawned children the badge equals the child's procmgr-
+/// assigned process badge; the kernel-side identity, the receiver's
 /// per-sender slot key, and procmgr's death-notification correlator
 /// thus all share one u64. To leave room for system-special senders
-/// whose identity is not a procmgr process token, procmgr's per-child
-/// token counter starts at [`LOG_TOKEN_FIRST_CHILD`].
-pub mod log_tokens
+/// whose identity is not a procmgr process badge, procmgr's per-child
+/// badge counter starts at [`LOG_BADGE_FIRST_CHILD`].
+pub mod log_badges
 {
-    /// init's self-identity. Init derives `cap_derive_token(log_ep,
-    /// SEND, LOG_TOKEN_INIT)` at boot and uses the cap for its own
+    /// init's self-identity. Init derives `cap_derive_badge(log_ep,
+    /// SEND, LOG_BADGE_INIT)` at boot and uses the cap for its own
     /// `seraph::log!` writes.
-    pub const LOG_TOKEN_INIT: u64 = 1;
-    /// procmgr's self-identity. Init derives a tokened SEND cap with
-    /// this token at procmgr-bootstrap time and seeds it into
+    pub const LOG_BADGE_INIT: u64 = 1;
+    /// procmgr's self-identity. Init derives a badged SEND cap with
+    /// this badge at procmgr-bootstrap time and seeds it into
     /// `ProcessInfo.log_send_cap` so procmgr's std `_start` can
     /// install it. Procmgr's `seraph::log!` writes ride this cap.
-    pub const LOG_TOKEN_PROCMGR: u64 = 2;
-    /// First token value procmgr's per-child counter
-    /// (`NEXT_PROCESS_TOKEN`) hands out. Lower values are reserved
+    pub const LOG_BADGE_PROCMGR: u64 = 2;
+    /// First badge value procmgr's per-child counter
+    /// (`NEXT_PROCESS_BADGE`) hands out. Lower values are reserved
     /// for the system specials above; raising this leaves room to
     /// reserve more.
-    pub const LOG_TOKEN_FIRST_CHILD: u64 = 16;
+    pub const LOG_BADGE_FIRST_CHILD: u64 = 16;
 }
 
 pub const LOG_LABELS_VERSION: u32 = 1;
@@ -1412,28 +1412,28 @@ pub const LOG_LABELS_VERSION: u32 = 1;
 /// and the one-shot init-logd → real-logd handover.
 ///
 /// Distinct from [`stream_labels`]: the latter carry payload (bytes,
-/// names) on tokened SEND caps that have already been minted; these
+/// names) on badged SEND caps that have already been minted; these
 /// labels are spoken on caps that mediate cap acquisition or state
 /// transfer.
 ///
-/// New std-built spawns post-pivot receive a pre-installed tokened
+/// New std-built spawns post-pivot receive a pre-installed badged
 /// SEND cap in `ProcessInfo.log_send_cap` and never call
 /// [`GET_LOG_CAP`]. The label remains for pre-pivot live writers that
-/// acquired their tokened caps under it; the receive handler stays in
+/// acquired their badged caps under it; the receive handler stays in
 /// init-logd and real-logd until those callers are migrated.
 pub mod log_labels
 {
-    /// Legacy discovery: request a freshly-minted tokened SEND cap on
+    /// Legacy discovery: request a freshly-minted badged SEND cap on
     /// the log endpoint.
     ///
     /// Wire format: `word(0) = LOG_LABELS_VERSION` (mismatch → reply
-    /// code 3). Reply: one cap (a tokened SEND on the log endpoint
-    /// whose token uniquely identifies this caller) plus
+    /// code 3). Reply: one cap (a badged SEND on the log endpoint
+    /// whose badge uniquely identifies this caller) plus
     /// `word(0) = status` (zero on success). Callers cache the
     /// returned cap process-globally.
     ///
-    /// The receiver mints the token (counter-allocated by init-logd
-    /// or real-logd). Tokens are unforgeable identities; display
+    /// The receiver mints the badge (counter-allocated by init-logd
+    /// or real-logd). Badges are unforgeable identities; display
     /// names registered later via `STREAM_REGISTER_NAME` are mutable
     /// labels bound to that identity.
     pub const GET_LOG_CAP: u64 = 12;
@@ -1445,13 +1445,13 @@ pub mod log_labels
     /// pending sends from the log endpoint's queue, then replies with
     /// one or more chunks carrying:
     ///
-    /// * The token table — for every active sender token init-logd
-    ///   has seen, the `(token, display_name)` pair.
+    /// * The badge table — for every active sender badge init-logd
+    ///   has seen, the `(badge, display_name)` pair.
     /// * The captured-history ring — all complete lines init-logd has
-    ///   buffered since boot, attributed by token and timestamped at
+    ///   buffered since boot, attributed by badge and timestamped at
     ///   the original receipt instant.
-    /// * The next-token counter (init-logd's
-    ///   `INIT_DISCOVERY_NEXT_TOKEN` value at the moment of handover)
+    /// * The next-badge counter (init-logd's
+    ///   `INIT_DISCOVERY_NEXT_BADGE` value at the moment of handover)
     ///   so real-logd's `GET_LOG_CAP` handler can continue the same
     ///   sequence for any further legacy callers.
     ///
@@ -1473,7 +1473,7 @@ pub mod log_labels
     /// Decoupling termination from the multi-chunk data drain keeps a
     /// dropped data chunk (a kernel IPC rendezvous race on the shared,
     /// multi-sender log endpoint) from wedging init-logd — which would
-    /// otherwise block procmgr's reap of init's frames indefinitely.
+    /// otherwise block procmgr's reap of init's Memory caps indefinitely.
     pub const HANDOVER_RELEASE: u64 = 14;
 }
 
@@ -1495,7 +1495,7 @@ pub mod bootstrap;
 /// Bootstrap-protocol error reply codes (creator → child).
 pub mod bootstrap_errors
 {
-    /// Creator has no bootstrap plan for the sending child's token.
+    /// Creator has no bootstrap plan for the sending child's badge.
     pub const NO_CHILD: u64 = 2;
     /// Creator's bootstrap plan for this child is already drained.
     pub const EXHAUSTED: u64 = 3;
@@ -1517,8 +1517,8 @@ pub mod procmgr_errors
     pub const INVALID_ELF: u64 = 1;
     /// Out of memory during process creation.
     pub const OUT_OF_MEMORY: u64 = 2;
-    /// Process handle token not found in process table.
-    pub const INVALID_TOKEN: u64 = 4;
+    /// Process handle badge not found in process table.
+    pub const INVALID_BADGE: u64 = 4;
     /// Attempt to start a process that was already started.
     pub const ALREADY_STARTED: u64 = 5;
     /// Invalid argument to an IPC request.
@@ -1532,10 +1532,10 @@ pub mod procmgr_errors
     pub const IO_ERROR: u64 = 10;
     /// `mem_map` or scratch mapping failed during ELF page load.
     pub const MAP_FAILED: u64 = 11;
-    /// Cap rights derivation failed (e.g. `derive_frame_for_prot`)
+    /// Cap rights derivation failed (e.g. `derive_memory_for_prot`)
     /// during ELF page load.
     pub const INSUFFICIENT_RIGHTS: u64 = 12;
-    /// Caller's cap lacks the required authority token for a gated
+    /// Caller's cap lacks the required authority badge for a gated
     /// label (e.g. `REGISTER_DEATH_EQ` requires `DEATH_EQ_AUTHORITY`).
     pub const UNAUTHORIZED: u64 = 13;
     /// Unknown opcode on procmgr endpoint.
@@ -1558,7 +1558,7 @@ pub mod vfsd_errors
     pub const IO_ERROR: u64 = 5;
     /// Mount table full.
     pub const TABLE_FULL: u64 = 6;
-    /// Caller's token lacks the verb bit required by the handler
+    /// Caller's badge lacks the verb bit required by the handler
     /// (e.g. `SEED_AUTHORITY` for `GET_SYSTEM_ROOT_CAP`).
     pub const UNAUTHORIZED: u64 = 9;
     /// Caller's compiled `VFSD_LABELS_VERSION` does not match the receiver's.
@@ -1580,15 +1580,15 @@ pub mod fs_errors
     pub const IO_ERROR: u64 = 2;
     /// Out of file-handle slots.
     pub const TOO_MANY_OPEN: u64 = 3;
-    /// File token is invalid or expired.
-    pub const INVALID_TOKEN: u64 = 4;
+    /// File badge is invalid or expired.
+    pub const INVALID_BADGE: u64 = 4;
     /// Cooperative-release watchdog fired; the driver revoked the parent
-    /// Frame cap and any derived caps the client still held are now dead.
+    /// Memory cap and any derived caps the client still held are now dead.
     pub const RELEASE_TIMEOUT: u64 = 5;
-    /// `FS_READ_FRAME` cookie is invalid (zero — collides with the
+    /// `FS_READ_MEMORY` cookie is invalid (zero — collides with the
     /// `OutstandingPage::None` sentinel in fs driver tracking).
-    pub const BAD_FRAME_OFFSET: u64 = 6;
-    /// Caller's node-cap token lacks a rights bit required by the
+    pub const BAD_MEMORY_OFFSET: u64 = 6;
+    /// Caller's node-cap badge lacks a rights bit required by the
     /// requested operation (see `namespace-protocol::rights`).
     pub const PERMISSION_DENIED: u64 = 7;
     /// Caller's compiled `FS_LABELS_VERSION` does not match the receiver's.
@@ -1619,7 +1619,7 @@ pub mod devmgr_errors
     pub const SUCCESS: u64 = 0;
     /// Cap derivation failed, or invalid device index.
     pub const INVALID_REQUEST: u64 = 1;
-    /// Caller's token lacks the verb bit required by the handler
+    /// Caller's badge lacks the verb bit required by the handler
     /// (e.g. `REGISTRY_QUERY_AUTHORITY` for `QUERY_BLOCK_DEVICE`).
     pub const UNAUTHORIZED: u64 = 2;
     /// Caller's compiled `DEVMGR_LABELS_VERSION` does not match the receiver's.
@@ -1663,7 +1663,7 @@ pub mod svcmgr_errors
     /// mismatch here means the caller was built against a different
     /// revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
-    /// Caller's token lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
+    /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
     /// `PUBLISH_ENDPOINT` request.
     pub const UNAUTHORIZED: u64 = 8;
     /// Client-side: the underlying `ipc_call` returned `Err` (no reply
@@ -1683,14 +1683,14 @@ pub mod blk_errors
     /// Values 1 (IOERR), 2 (UNSUPP) per `VirtIO` 1.2 §5.2.6.
     pub const DEVICE_STATUS_IOERR: u64 = 1;
     pub const DEVICE_STATUS_UNSUPP: u64 = 2;
-    /// Read LBA is outside the bounds registered for the caller's token.
+    /// Read LBA is outside the bounds registered for the caller's badge.
     pub const OUT_OF_BOUNDS: u64 = 3;
     /// Partition registration rejected (no authority, table full, or bad args).
     pub const REGISTER_REJECTED: u64 = 4;
-    /// Frame cap rejected: `BLK_READ_INTO_FRAME` target missing
-    /// `MAP|WRITE` rights, `BLK_WRITE_FROM_FRAME` source missing
+    /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
+    /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
     /// `MAP|READ` rights, sized other than one page, or absent.
-    pub const INVALID_FRAME_CAP: u64 = 5;
+    pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the
     /// caller's version as `data[0]` (with `base_lba` shifted to `data[1]`
@@ -1716,7 +1716,7 @@ pub const ARGS_BLOB_MAX: usize = 256;
 
 // ── IpcMessage ──────────────────────────────────────────────────────────────
 
-/// Stack-owned snapshot of an IPC message — label, token, data words, and
+/// Stack-owned snapshot of an IPC message — label, badge, data words, and
 /// received cap-slot indices, carried by value across the IPC wrapper
 /// boundary.
 ///
@@ -1735,9 +1735,9 @@ pub struct IpcMessage
 {
     /// Protocol label (opcode / reply code / bit-packed header).
     pub label: u64,
-    /// Endpoint-badge token delivered by `ipc_recv`; zero on send paths
-    /// and for untokened endpoints.
-    pub token: u64,
+    /// Endpoint badge delivered by `ipc_recv`; zero on send paths
+    /// and for unbadged endpoints.
+    pub badge: u64,
     data: [u64; MSG_DATA_WORDS_MAX],
     /// Number of valid `u64` words in `data`. `<= MSG_DATA_WORDS_MAX`.
     data_len: u8,
@@ -1749,13 +1749,13 @@ pub struct IpcMessage
 impl IpcMessage
 {
     /// Zero-length message carrying only a label (no data, no caps, no
-    /// token).
+    /// badge).
     #[must_use]
     pub const fn new(label: u64) -> Self
     {
         Self {
             label,
-            token: 0,
+            badge: 0,
             data: [0; MSG_DATA_WORDS_MAX],
             data_len: 0,
             cap_count: 0,
@@ -1838,7 +1838,7 @@ impl IpcMessage
     pub unsafe fn from_ipc_buf(
         ipc_buf: *const u64,
         label: u64,
-        token: u64,
+        badge: u64,
         word_count: usize,
     ) -> Self
     {
@@ -1867,7 +1867,7 @@ impl IpcMessage
         }
         Self {
             label,
-            token,
+            badge,
             data,
             data_len: word_count as u8,
             cap_count: cap_count as u8,
@@ -2064,7 +2064,7 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 
 /// Receive on an endpoint cap, returning a stack-owned message snapshot.
 ///
-/// Blocks until a caller sends. Copies the message (label, token, data
+/// Blocks until a caller sends. Copies the message (label, badge, data
 /// words, cap metadata) from the registered IPC buffer into a fresh
 /// [`IpcMessage`] before returning. After return the IPC buffer is scratch
 /// — nested IPC between `ipc_recv` and reading the message is safe.
@@ -2079,11 +2079,11 @@ pub unsafe fn ipc_call(ep: u32, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<I
 #[inline]
 pub unsafe fn ipc_recv(ep: u32, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
-    let (label, token, word_count) = syscall::raw_ipc_recv(ep)?;
+    let (label, badge, word_count) = syscall::raw_ipc_recv(ep)?;
     // SAFETY: `ipc_buf` is the registered IPC buffer; kernel wrote data +
     // cap metadata there before return. `word_count` is already clamped to
     // MSG_DATA_WORDS_MAX by `raw_ipc_recv`.
-    Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, label, token, word_count) })
+    Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, label, badge, word_count) })
 }
 
 /// Reply to the current thread's pending caller with `msg`.

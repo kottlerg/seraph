@@ -177,7 +177,7 @@ Physical MMIO regions are mapped into a driver’s address space under capabilit
 control. Once mapped, drivers access registers directly without kernel mediation.
 
 **Port I/O (x86‑64 only)**
-Drivers receive an IoPortRange capability for assigned port ranges. Binding this
+Drivers receive an IoPort capability for assigned port ranges. Binding this
 capability enables direct execution of port I/O instructions for those ranges.
 Access is revoked automatically when the capability is revoked. RISC‑V does not
 support port I/O.
@@ -187,8 +187,8 @@ DMA isolation is exclusively a userspace concern. devmgr discovers IOMMU
 hardware (via firmware-table passthrough), programs the translation tables
 itself, and authorises DMA on a per-device basis. The kernel reads no
 IOMMU registers, holds no per-device DMA state, and exposes no DMA-grant
-syscall. Frame physical-base addresses (which DMA-issuing drivers program
-into device transports) reach drivers through memmgr's `REQUEST_FRAMES`
+syscall. Memory physical-base addresses (which DMA-issuing drivers program
+into device transports) reach drivers through memmgr's `REQUEST_MEMORY_CAPS`
 reply. See `device-management.md`.
 
 **Interrupts**
@@ -204,7 +204,7 @@ All inter‑process communication occurs via the kernel’s IPC mechanism. Share
 is established only via explicit capability-granted mappings.
 
 - **Synchronous calls** for structured request/reply between services.
-- **Asynchronous notifications** for interrupts and completion signals.
+- **Asynchronous notifications** for interrupts and completion notifications.
 
 ---
 

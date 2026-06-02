@@ -24,7 +24,7 @@ use crate::TestContext;
 /// Child-thread handle returned by [`new_child`].
 ///
 /// Caller is responsible for deleting both caps when the child has exited
-/// (typically via `signal_wait`-based handshake). Order: `th` first,
+/// (typically via `notification_wait`-based handshake). Order: `th` first,
 /// then `cs`.
 pub struct SpawnedChild
 {
@@ -37,15 +37,15 @@ pub struct SpawnedChild
 /// performs any required `cap_copy` into `child.cs` first.
 pub fn new_child(ctx: &TestContext) -> Result<SpawnedChild, &'static str>
 {
-    // cap_create_cspace(frame, l1_idx=0, l1_depth=4, l2_size=16) — the
+    // cap_create_cspace(memory, l1_idx=0, l1_depth=4, l2_size=16) — the
     // 16-slot cspace covers tests that copy 1-3 caps into the child
     // plus headroom. Tests with wider cap layouts (e.g.
     // integration/cap_transfer.rs uses a 32-slot cspace,
     // stress/retype_concurrent.rs uses 64) bypass this helper and
     // call cap_create_cspace directly.
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "spawn::new_child: cap_create_cspace failed")?;
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs)
         .map_err(|_| "spawn::new_child: cap_create_thread failed")?;
     Ok(SpawnedChild { th, cs })
 }

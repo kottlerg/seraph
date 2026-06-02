@@ -15,7 +15,7 @@ by devmgr on RISC-V QEMU virt via the non-PCI simple-device path,
 walks to from the `/services/drivers/` subtree cap init delivers
 post-vfsd-mount via `devmgr_labels::SET_DRIVERS_DIR`. devmgr owns the
 driver's service endpoint and mints client SEND caps on
-`devmgr_labels::QUERY_RTC_DEVICE`, each tokened with
+`devmgr_labels::QUERY_RTC_DEVICE`, each badged with
 `rtc_labels::READ_AUTHORITY`. The `timed` service resolves the SEND
 once at startup to seed its wall-clock offset.
 
@@ -40,18 +40,18 @@ Bootstrap caps from devmgr (one round, two caps, `done=true`):
 | Slot      | Cap                                                  |
 |-----------|------------------------------------------------------|
 | `caps[0]` | Service-endpoint RECV (driver receives on this)      |
-| `caps[1]` | `MmioRegion` covering one page at `0x101000`         |
+| `caps[1]` | `Mmio` covering one page at `0x101000`         |
 
 The driver reserves one page of VA via `reserve_pages`, funds the AS's
 page-table growth budget for that page via `fund_aspace_pt_budget`, and maps
-the `MmioRegion` cap into it via `syscall::mmio_map`.
+the `Mmio` cap into it via `syscall::mmio_map`.
 
 ---
 
 ## IPC Interface
 
 * **`rtc_labels::RTC_GET_EPOCH_TIME`** — no payload. The driver
-  re-reads the device on every request. Caller's token must carry
+  re-reads the device on every request. Caller's badge must carry
   `rtc_labels::READ_AUTHORITY` (devmgr stamps it on every SEND minted
   from `QUERY_RTC_DEVICE`); the driver replies
   `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a

@@ -4,16 +4,16 @@
 //! Wait-set create → add → wait → remove → delete cycle benchmark.
 
 use syscall::{
-    cap_create_signal, cap_delete, signal_send, signal_wait, wait_set_add, wait_set_remove,
-    wait_set_wait,
+    cap_create_notification, cap_delete, notification_send, notification_wait, wait_set_add,
+    wait_set_remove, wait_set_wait,
 };
 
 use super::{cycles_now, log_bench_header};
 
 // Thin wrapper — same as in unit/cap.rs.
-fn cap_create_wait_set(frame_cap: u32) -> Result<u32, i64>
+fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 {
-    syscall::wait_set_create(frame_cap)
+    syscall::wait_set_create(memory_cap)
 }
 
 pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
@@ -22,7 +22,7 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
     // heap allocations that fragment under high churn.
     let n = u64::from(iters.min(100));
 
-    let Ok(sig) = cap_create_signal(ctx.memory_frame_base)
+    let Ok(sig) = cap_create_notification(ctx.memory_base)
     else
     {
         return;
@@ -34,11 +34,11 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
 
     for _ in 0..n
     {
-        // Pre-arm the signal so wait_set_wait returns immediately.
-        signal_send(sig, 0x1).ok();
+        // Pre-arm the notification so wait_set_wait returns immediately.
+        notification_send(sig, 0x1).ok();
 
         let t0 = cycles_now();
-        let Ok(ws) = cap_create_wait_set(ctx.memory_frame_base)
+        let Ok(ws) = cap_create_wait_set(ctx.memory_base)
         else
         {
             break;
@@ -53,8 +53,8 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
         cap_delete(ws).ok();
         let t1 = cycles_now();
 
-        // Drain bits left by signal_send.
-        signal_wait(sig).ok();
+        // Drain bits left by notification_send.
+        notification_wait(sig).ok();
 
         let delta = t1.saturating_sub(t0);
         if delta < min

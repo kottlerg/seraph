@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// kernel/src/ipc/signal.rs
+// kernel/src/ipc/notification.rs
 
-//! Signal IPC — bitmask-based async notification.
+//! Notification IPC — bitmask-based async notification.
 //!
-//! A signal object holds a 64-bit bitmask. Senders OR bits into it;
+//! A notification object holds a 64-bit bitmask. Senders OR bits into it;
 //! a single waiter reads-and-clears the bitmask. If the waiter finds
 //! zero bits set, it blocks until a sender delivers bits.
 //!
 //! # Blocking semantics
-//! Only one thread may wait on a signal at a time (single-waiter invariant).
+//! Only one thread may wait on a notification at a time (single-waiter invariant).
 //! The waiter is woken immediately if bits are already set when it calls wait.
 //!
 //! # Thread safety
@@ -20,39 +20,39 @@
 //!
 //! # Adding multi-waiter support
 //! Replace `waiter` with an intrusive queue of TCBs and wake all of them
-//! on signal delivery.
+//! on notification delivery.
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::sched::thread::ThreadControlBlock;
 
-// ── SignalObject ───────────────────────────────────────────────────────────────
+// ── NotificationObject ───────────────────────────────────────────────────────────────
 
-/// Kernel object backing a Signal capability.
+/// Kernel object backing a Notification capability.
 ///
 /// Allocated from the kernel heap via `Box`. The `KernelObjectHeader` is
-/// NOT included here; it lives in `cap::object::SignalKernelObject` which
+/// NOT included here; it lives in `cap::object::NotificationKernelObject` which
 /// wraps this struct.
-pub struct SignalState
+pub struct NotificationState
 {
-    /// Pending signal bits. Senders OR into this; the waiter read-and-clears.
+    /// Pending notification bits. Senders OR into this; the waiter read-and-clears.
     pub bits: AtomicU64,
     /// The single thread blocked waiting for a non-zero bitmask, or null.
     pub waiter: *mut ThreadControlBlock,
-    /// Opaque pointer to the `WaitSetState` this signal is registered with,
+    /// Opaque pointer to the `WaitSetState` this notification is registered with,
     /// or null if not in any wait set. Type-erased to avoid a circular import.
     /// Cast to `*mut WaitSetState` only inside `wait_set.rs`.
     pub wait_set: *mut u8,
-    /// Index of this signal's entry in `WaitSetState::members`.
+    /// Index of this notification's entry in `WaitSetState::members`.
     pub wait_set_member_idx: u8,
     /// Non-zero when a waiter or wait set is registered.
     ///
-    /// `signal_send` uses this as a lock-free fast-path check: when zero,
+    /// `notification_send` uses this as a lock-free fast-path check: when zero,
     /// the sender can OR bits without acquiring the lock (no one to wake).
     /// Maintained under `lock`; read outside the lock with a `SeqCst` fence
     /// (Dekker pattern) to prevent lost wakeups on RVWMO.
     pub has_observer: AtomicU8,
-    /// Serialises wakeup coordination between `signal_send` and `signal_wait`.
+    /// Serialises wakeup coordination between `notification_send` and `notification_wait`.
     ///
     /// The lock is only needed when a waiter or wait set is present (the slow
     /// path). The common no-observer path is lock-free: an atomic OR into
@@ -60,14 +60,14 @@ pub struct SignalState
     pub lock: crate::sync::Spinlock,
 }
 
-// SAFETY: SignalState is accessed only under the relevant scheduler lock.
-unsafe impl Send for SignalState {}
-// SAFETY: SignalState is accessed only under the relevant scheduler lock; no Sync violation.
-unsafe impl Sync for SignalState {}
+// SAFETY: NotificationState is accessed only under the relevant scheduler lock.
+unsafe impl Send for NotificationState {}
+// SAFETY: NotificationState is accessed only under the relevant scheduler lock; no Sync violation.
+unsafe impl Sync for NotificationState {}
 
-impl SignalState
+impl NotificationState
 {
-    /// Create a new, empty signal with no pending bits and no waiter.
+    /// Create a new, empty notification with no pending bits and no waiter.
     pub fn new() -> Self
     {
         Self {
@@ -85,7 +85,7 @@ impl SignalState
 
 /// Deliver `bits` to `sig`.
 ///
-/// ORs the given bits into the signal bitmask. If a thread is currently
+/// ORs the given bits into the notification bitmask. If a thread is currently
 /// blocked waiting, wakes it (moves it to Ready state) and clears `waiter`.
 ///
 /// Returns `Some(*mut TCB)` if a thread was woken (caller must enqueue it).
@@ -94,12 +94,15 @@ impl SignalState
 /// When `has_observer` is zero (no waiter, no wait set), the bits are OR'd
 /// atomically and the function returns without acquiring the lock. A `SeqCst`
 /// fence between the OR and the flag check forms one half of a Dekker-style
-/// pair with `signal_wait`, preventing lost wakeups on RVWMO.
+/// pair with `notification_wait`, preventing lost wakeups on RVWMO.
 ///
 /// # Safety
-/// `sig` must be a valid pointer to a live `SignalState`.
+/// `sig` must be a valid pointer to a live `NotificationState`.
 #[cfg(not(test))]
-pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut ThreadControlBlock>
+pub unsafe fn notification_send(
+    sig: *mut NotificationState,
+    bits: u64,
+) -> Option<*mut ThreadControlBlock>
 {
     // SAFETY: caller guarantees sig is valid.
     let sig = unsafe { &mut *sig };
@@ -109,7 +112,7 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
     sig.bits.fetch_or(bits, Ordering::Relaxed);
 
     // Dekker fence: ensures our OR is visible before we read has_observer.
-    // Pairs with the SeqCst fence in signal_wait (between setting
+    // Pairs with the SeqCst fence in notification_wait (between setting
     // has_observer and swapping bits). Guarantees at least one side observes
     // the other's store, preventing lost wakeups on RVWMO.
     core::sync::atomic::fence(Ordering::SeqCst);
@@ -131,10 +134,10 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
 
         if delivered == 0
         {
-            // A concurrent fast-path signal_wait already consumed our
+            // A concurrent fast-path notification_wait already consumed our
             // bits. The current sig.waiter is a *new* waiter; do NOT
             // touch it (delivering wakeup_value=0 would be a spurious
-            // wake, since signal_send rejects 0-bit sends). See
+            // wake, since notification_send rejects 0-bit sends). See
             // ipc-internals.md § Send Path.
             None
         }
@@ -154,15 +157,15 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
             }
             sig.has_observer
                 .store(u8::from(!sig.wait_set.is_null()), Ordering::Relaxed);
-            // SAFETY: waiter is a valid TCB pointer placed here by signal_wait.
+            // SAFETY: waiter is a valid TCB pointer placed here by notification_wait.
             unsafe {
                 debug_assert!(
                     (*waiter).magic == crate::sched::thread::TCB_MAGIC,
-                    "signal_send: waiter TCB magic corrupt — use-after-free?"
+                    "notification_send: waiter TCB magic corrupt — use-after-free?"
                 );
                 (*waiter).wakeup_value = delivered;
             }
-            // If the waiter was registered with a `SYS_SIGNAL_WAIT` timeout, it
+            // If the waiter was registered with a `SYS_NOTIFICATION_WAIT` timeout, it
             // is also on the global sleep list. Remove it here so the timer
             // path will not try to double-wake this thread. We hold `sig.lock`;
             // `sleep_list_remove` acquires `SLEEP_LIST_LOCK` internally
@@ -176,7 +179,7 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
             // expired when `(*tcb).sleep_deadline <= now`. Clearing the
             // deadline first creates a window where the entry is still on
             // the list with `deadline == 0 <= now`, making the timer claim a
-            // wake that this `signal_send` is concurrently delivering →
+            // wake that this `notification_send` is concurrently delivering →
             // double-`enqueue_and_wake` of the waiter and a corrupted run
             // queue (intrusive-list self-cycle).
             // SAFETY: waiter is the TCB we just dequeued from sig.waiter.
@@ -220,14 +223,16 @@ pub unsafe fn signal_send(sig: *mut SignalState, bits: u64) -> Option<*mut Threa
 /// # Dekker ordering
 /// Under the lock, the waiter is registered and `has_observer` is set
 /// **before** the bits swap. A `SeqCst` fence between these steps pairs with
-/// the fence in `signal_send` to guarantee: if `signal_send`'s fast path
+/// the fence in `notification_send` to guarantee: if `notification_send`'s fast path
 /// sees `has_observer == 0`, then this swap will see the `ORed` bits.
 ///
 /// # Safety
 /// `sig` and `caller` must be valid pointers.
 #[cfg(not(test))]
-pub unsafe fn signal_wait(sig: *mut SignalState, caller: *mut ThreadControlBlock)
--> Result<u64, ()>
+pub unsafe fn notification_wait(
+    sig: *mut NotificationState,
+    caller: *mut ThreadControlBlock,
+) -> Result<u64, ()>
 {
     // SAFETY: caller guarantees sig is valid.
     let sig = unsafe { &mut *sig };
@@ -247,15 +252,15 @@ pub unsafe fn signal_wait(sig: *mut SignalState, caller: *mut ThreadControlBlock
             .store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
-    // Register the waiter and mark the signal as observed. This must happen
-    // before the bits swap so that a concurrent signal_send that bypasses
+    // Register the waiter and mark the notification as observed. This must happen
+    // before the bits swap so that a concurrent notification_send that bypasses
     // the lock (fast path) will either:
     //   (a) see has_observer==1 → take the slow path and wake us, OR
     //   (b) have its OR visible to our swap below (we get the bits).
     sig.waiter = caller;
     sig.has_observer.store(1, Ordering::Relaxed);
 
-    // Dekker fence: pairs with the SeqCst fence in signal_send.
+    // Dekker fence: pairs with the SeqCst fence in notification_send.
     core::sync::atomic::fence(Ordering::SeqCst);
 
     // Attempt to harvest pending bits.
@@ -283,7 +288,7 @@ pub unsafe fn signal_wait(sig: *mut SignalState, caller: *mut ThreadControlBlock
     let committed = unsafe {
         crate::sched::commit_blocked_under_local_lock(
             caller,
-            IpcThreadState::BlockedOnSignal,
+            IpcThreadState::BlockedOnNotification,
             blocked_on,
         )
     };
@@ -320,7 +325,7 @@ mod tests
     #[test]
     fn new_state_is_zeroed()
     {
-        let s = SignalState::new();
+        let s = NotificationState::new();
         assert_eq!(s.bits.load(Ordering::Relaxed), 0);
         assert!(s.waiter.is_null());
         assert!(s.wait_set.is_null());
@@ -331,7 +336,7 @@ mod tests
     #[test]
     fn bits_fetch_or_accumulates()
     {
-        let s = SignalState::new();
+        let s = NotificationState::new();
         s.bits.fetch_or(0x0F, Ordering::Relaxed);
         s.bits.fetch_or(0xF0, Ordering::Relaxed);
         assert_eq!(s.bits.load(Ordering::Relaxed), 0xFF);
@@ -340,7 +345,7 @@ mod tests
     #[test]
     fn bits_swap_clears_and_returns_value()
     {
-        let s = SignalState::new();
+        let s = NotificationState::new();
         s.bits.fetch_or(0xDEAD_BEEF, Ordering::Relaxed);
         let got = s.bits.swap(0, Ordering::Relaxed);
         assert_eq!(got, 0xDEAD_BEEF);
@@ -351,7 +356,7 @@ mod tests
     fn bits_independent_after_swap()
     {
         // After a swap-to-zero, subsequent ORs start fresh.
-        let s = SignalState::new();
+        let s = NotificationState::new();
         s.bits.fetch_or(0xFF, Ordering::Relaxed);
         s.bits.swap(0, Ordering::Relaxed);
         s.bits.fetch_or(0x01, Ordering::Relaxed);
@@ -362,7 +367,7 @@ mod tests
     fn multiple_fetch_or_accumulates_all_bits()
     {
         // Four non-overlapping ORs must accumulate into a single value.
-        let s = SignalState::new();
+        let s = NotificationState::new();
         s.bits.fetch_or(0x1, Ordering::Relaxed);
         s.bits.fetch_or(0x2, Ordering::Relaxed);
         s.bits.fetch_or(0x4, Ordering::Relaxed);
@@ -375,7 +380,7 @@ mod tests
     fn swap_after_multiple_ors_leaves_state_zero()
     {
         // swap-to-zero clears all accumulated bits; subsequent ORs start fresh.
-        let s = SignalState::new();
+        let s = NotificationState::new();
         s.bits.fetch_or(0xDEAD, Ordering::Relaxed);
         s.bits.fetch_or(0xBEEF, Ordering::Relaxed);
         let before = s.bits.swap(0, Ordering::Relaxed);

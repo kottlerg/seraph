@@ -154,10 +154,10 @@ via direct `QUERY_ENDPOINT` calls.
 
 | Name | Source | Cap shape |
 |---|---|---|
-| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | tokened SEND on the root filesystem's namespace endpoint at its root directory |
-| `svcmgr` | svcmgr (its own service ep) | un-tokened SEND on svcmgr's own service endpoint |
-| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry endpoint |
-| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
+| `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on the root filesystem's namespace endpoint at its root directory |
+| `svcmgr` | svcmgr (its own service ep) | un-badged SEND on svcmgr's own service endpoint |
+| `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
+| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
 | `timed` | svcmgr (`timed.svc` provider) | SEND on timed's service endpoint |
 

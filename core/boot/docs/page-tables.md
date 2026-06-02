@@ -250,8 +250,8 @@ intermediate table allocated during `map` — in an inline `frame_log`.
 After step 8, step 9 reads this log via the trait method
 `PageTableBuilder::allocated_frames` and appends one
 `boot_protocol::ReclaimRange` per frame to `BootInfo.reclaim_ranges`.
-The kernel mints reclaimable Frame caps over the recorded frames during
-Phase 7 (`cap::mint_reclaim_frame_caps`), so they flow into userspace
+The kernel mints reclaimable Memory caps over the recorded frames during
+Phase 7 (`cap::mint_reclaim_memory_caps`), so they flow into userspace
 through the standard `CapDescriptor` path rather than being orphaned as
 `MemoryType::Loaded` pages outside the buddy.
 

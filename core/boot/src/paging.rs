@@ -73,7 +73,7 @@ pub trait PageTableBuilder: Sized
     /// [`map`][Self::map]).
     ///
     /// The bootloader records these in `BootInfo.reclaim_ranges` so the kernel
-    /// can mint reclaimable Frame caps over them once Phase 3 has installed the
+    /// can mint reclaimable Memory caps over them once Phase 3 has installed the
     /// kernel's own page tables and the bootloader's transient tables are dead.
     fn allocated_frames(&self) -> &[u64];
 }

@@ -18,14 +18,15 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::system_info;
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, thread_configure, thread_exit, thread_set_affinity, thread_start,
+    cap_copy, cap_create_cspace, cap_create_notification, cap_create_thread, cap_delete,
+    notification_send, notification_wait, thread_configure, thread_exit, thread_set_affinity,
+    thread_start,
 };
 use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult};
 
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 
 /// Spin-loop length in the inline-asm hot path. Sized to give the timer
 /// many opportunities to preempt at the default tick rate while finishing
@@ -41,13 +42,13 @@ static mut STACK_A: ChildStack = ChildStack::ZERO;
 static mut STACK_B: ChildStack = ChildStack::ZERO;
 
 // Children write the mismatch count after the spin completes and the parent
-// reads it only after the corresponding signal_send is observed, so the zero
+// reads it only after the corresponding notification_send is observed, so the zero
 // default is never mistaken for a result.
 static A_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static B_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
 // Non-zero initialised static. Forces LLD to emit a `.data` section in the
-// ktest ELF, exercising the path where the kernel mints a Frame cap whose
+// ktest ELF, exercising the path where the kernel mints a Memory cap whose
 // underlying segment has a sub-page-aligned ELF VA. The cap must still
 // expose a page-aligned `base` and whole-page `size` to userspace — see
 // `mm::init_segment_caps_aligned`.
@@ -62,7 +63,7 @@ extern "C" fn child_a_entry(sig_slot: u64) -> !
     // buffer; no aliasing with outer state.
     let mismatches = unsafe { spin_and_check(PATTERN_A) };
     A_MISMATCHES.store(mismatches, Ordering::Release);
-    let _ = signal_send(u32::try_from(sig_slot).unwrap_or(0), 0x1);
+    let _ = notification_send(u32::try_from(sig_slot).unwrap_or(0), 0x1);
     thread_exit();
 }
 
@@ -71,7 +72,7 @@ extern "C" fn child_b_entry(sig_slot: u64) -> !
     // SAFETY: see child_a_entry.
     let mismatches = unsafe { spin_and_check(PATTERN_B) };
     B_MISMATCHES.store(mismatches, Ordering::Release);
-    let _ = signal_send(u32::try_from(sig_slot).unwrap_or(0), 0x1);
+    let _ = notification_send(u32::try_from(sig_slot).unwrap_or(0), 0x1);
     thread_exit();
 }
 
@@ -366,22 +367,22 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
     A_MISMATCHES.store(0, Ordering::Release);
     B_MISMATCHES.store(0, Ordering::Release);
 
-    let sig_a = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal a for fpu::preempt_isolation failed")?;
-    let sig_b = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal b for fpu::preempt_isolation failed")?;
-    let cs_a = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let sig_a = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification a for fpu::preempt_isolation failed")?;
+    let sig_b = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification b for fpu::preempt_isolation failed")?;
+    let cs_a = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace a for fpu::preempt_isolation failed")?;
-    let cs_b = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let cs_b = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace b for fpu::preempt_isolation failed")?;
-    let child_sig_a = cap_copy(sig_a, cs_a, RIGHTS_SIGNAL)
+    let child_sig_a = cap_copy(sig_a, cs_a, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy sig_a for fpu::preempt_isolation failed")?;
-    let child_sig_b = cap_copy(sig_b, cs_b, RIGHTS_SIGNAL)
+    let child_sig_b = cap_copy(sig_b, cs_b, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy sig_b for fpu::preempt_isolation failed")?;
 
-    let th_a = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_a)
+    let th_a = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_a)
         .map_err(|_| "cap_create_thread a for fpu::preempt_isolation failed")?;
-    let th_b = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_b)
+    let th_b = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_b)
         .map_err(|_| "cap_create_thread b for fpu::preempt_isolation failed")?;
 
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
@@ -411,8 +412,10 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
     thread_start(th_a).map_err(|_| "thread_start a for fpu::preempt_isolation failed")?;
     thread_start(th_b).map_err(|_| "thread_start b for fpu::preempt_isolation failed")?;
 
-    let _ = signal_wait(sig_a).map_err(|_| "signal_wait a for fpu::preempt_isolation failed")?;
-    let _ = signal_wait(sig_b).map_err(|_| "signal_wait b for fpu::preempt_isolation failed")?;
+    let _ = notification_wait(sig_a)
+        .map_err(|_| "notification_wait a for fpu::preempt_isolation failed")?;
+    let _ = notification_wait(sig_b)
+        .map_err(|_| "notification_wait b for fpu::preempt_isolation failed")?;
 
     let a_mis = A_MISMATCHES.load(Ordering::Acquire);
     let b_mis = B_MISMATCHES.load(Ordering::Acquire);
@@ -439,7 +442,7 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
 
 /// Per-thread stack for the cross-CPU child.
 static mut STACK_CROSS: ChildStack = ChildStack::ZERO;
-/// Signal indices passed into the cross-CPU child by index (the child's
+/// Notification indices passed into the cross-CPU child by index (the child's
 /// cspace cap is published here so the inline-asm syscall sites can read
 /// them without crossing a Rust function boundary that would clobber the
 /// FP register file).
@@ -447,7 +450,7 @@ static CROSS_SIG_READY: AtomicU32 = AtomicU32::new(0);
 static CROSS_SIG_RESUME: AtomicU32 = AtomicU32::new(0);
 static CROSS_SIG_DONE: AtomicU32 = AtomicU32::new(0);
 /// Mismatch count written by the cross-CPU child after the post-migration
-/// register capture. The parent reads it only after the `done` signal so
+/// register capture. The parent reads it only after the `done` notification so
 /// the zero default is never mistaken for a pass.
 static CROSS_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 /// CPU id observed by the cross-CPU child after migration, sanity-checked
@@ -455,7 +458,7 @@ static CROSS_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static CROSS_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Cross-CPU child entry: load `PATTERN_A` into the extended-state register
-/// file, signal "ready", block on "resume", then capture the registers
+/// file, notification "ready", block on "resume", then capture the registers
 /// back to a stack buffer.
 ///
 /// The entire load → block → capture sequence runs inside a single inline-
@@ -475,7 +478,7 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     let mut buf = [[0u64; 2]; 16];
     let sig_ready = CROSS_SIG_READY.load(Ordering::Acquire);
     let sig_resume = CROSS_SIG_RESUME.load(Ordering::Acquire);
-    // Brief spin between FP load and signal_send so timer ticks fire while
+    // Brief spin between FP load and notification_send so timer ticks fire while
     // we are fpu_owner on the source CPU.
     let spin: u64 = 50_000;
 
@@ -507,12 +510,12 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
             "pause",
             "dec {it}",
             "jnz 2b",
-            // Syscall SYS_SIGNAL_SEND(sig_ready, 0x1). rax = 3.
+            // Syscall SYS_NOTIFICATION_SEND(sig_ready, 0x1). rax = 3.
             "mov rax, 3",
             "mov edi, {sig_ready:e}",
             "mov esi, 1",
             "syscall",
-            // Syscall SYS_SIGNAL_WAIT(sig_resume, 0). rax = 4.
+            // Syscall SYS_NOTIFICATION_WAIT(sig_resume, 0). rax = 4.
             "mov rax, 4",
             "mov edi, {sig_resume:e}",
             "mov esi, 0",
@@ -560,11 +563,11 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
     CROSS_OBSERVED_CPU.store(u32::try_from(cpu).unwrap_or(u32::MAX), Ordering::Release);
 
-    let _ = signal_send(CROSS_SIG_DONE.load(Ordering::Acquire), 0x1);
+    let _ = notification_send(CROSS_SIG_DONE.load(Ordering::Acquire), 0x1);
     thread_exit();
 }
 
-/// RISC-V cross-CPU child entry: load `PATTERN_A` into f0..f31, signal
+/// RISC-V cross-CPU child entry: load `PATTERN_A` into f0..f31, notification
 /// "ready", block on "resume", then capture f0..f31 back to a stack buffer.
 ///
 /// Same shape as the x86-64 sibling. ecall uses a7 as the syscall number
@@ -633,7 +636,7 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
             "ecall",
             // SIGNAL_WAIT(sig_resume, 0): a7=4, a0=sig_resume, a1=0 (no
             // timeout). MUST zero a1 explicitly — the kernel reads
-            // tf.arg(1) as `timeout_ms` (sys_signal_wait at
+            // tf.arg(1) as `timeout_ms` (sys_notification_wait at
             // core/kernel/src/syscall/ipc.rs:895), and the previous
             // SIGNAL_SEND left a1=1 in the register file. Without this
             // store the wait runs with a 1 ms timeout and the test
@@ -698,7 +701,7 @@ extern "C" fn child_cross_entry(_arg: u64) -> !
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
     CROSS_OBSERVED_CPU.store(u32::try_from(cpu).unwrap_or(u32::MAX), Ordering::Release);
 
-    let _ = signal_send(CROSS_SIG_DONE.load(Ordering::Acquire), 0x1);
+    let _ = notification_send(CROSS_SIG_DONE.load(Ordering::Acquire), 0x1);
     thread_exit();
 }
 
@@ -725,27 +728,27 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         CROSS_MISMATCHES.store(0, Ordering::Release);
         CROSS_OBSERVED_CPU.store(u32::MAX, Ordering::Release);
 
-        let sig_ready = cap_create_signal(ctx.memory_frame_base)
-            .map_err(|_| "create_signal ready for preempt_isolation_cross_cpu failed")?;
-        let sig_resume = cap_create_signal(ctx.memory_frame_base)
-            .map_err(|_| "create_signal resume for preempt_isolation_cross_cpu failed")?;
-        let sig_done = cap_create_signal(ctx.memory_frame_base)
-            .map_err(|_| "create_signal done for preempt_isolation_cross_cpu failed")?;
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        let sig_ready = cap_create_notification(ctx.memory_base)
+            .map_err(|_| "create_notification ready for preempt_isolation_cross_cpu failed")?;
+        let sig_resume = cap_create_notification(ctx.memory_base)
+            .map_err(|_| "create_notification resume for preempt_isolation_cross_cpu failed")?;
+        let sig_done = cap_create_notification(ctx.memory_base)
+            .map_err(|_| "create_notification done for preempt_isolation_cross_cpu failed")?;
+        let cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
             .map_err(|_| "create_cspace for preempt_isolation_cross_cpu failed")?;
 
-        let child_ready = cap_copy(sig_ready, cs, RIGHTS_SIGNAL)
+        let child_ready = cap_copy(sig_ready, cs, RIGHTS_NOTIFY)
             .map_err(|_| "cap_copy ready for preempt_isolation_cross_cpu failed")?;
-        let child_resume = cap_copy(sig_resume, cs, RIGHTS_SIGNAL)
+        let child_resume = cap_copy(sig_resume, cs, RIGHTS_NOTIFY)
             .map_err(|_| "cap_copy resume for preempt_isolation_cross_cpu failed")?;
-        let child_done = cap_copy(sig_done, cs, RIGHTS_SIGNAL)
+        let child_done = cap_copy(sig_done, cs, RIGHTS_NOTIFY)
             .map_err(|_| "cap_copy done for preempt_isolation_cross_cpu failed")?;
 
         CROSS_SIG_READY.store(child_ready, Ordering::Release);
         CROSS_SIG_RESUME.store(child_resume, Ordering::Release);
         CROSS_SIG_DONE.store(child_done, Ordering::Release);
 
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs)
             .map_err(|_| "cap_create_thread for preempt_isolation_cross_cpu failed")?;
 
         // Pin to CPU 0 initially: child must run and become CPU 0's
@@ -758,12 +761,12 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
             .map_err(|_| "thread_configure for preempt_isolation_cross_cpu failed")?;
         thread_start(th).map_err(|_| "thread_start for preempt_isolation_cross_cpu failed")?;
 
-        // Wait for the child to become `fpu_owner` on CPU 0 and signal ready.
+        // Wait for the child to become `fpu_owner` on CPU 0 and notification ready.
         // The parent blocks (yielding CPU 0) so the child can run; the child
         // then loads PATTERN_A, briefly spins, signals ready, and blocks on
         // sig_resume.
-        let _ = signal_wait(sig_ready)
-            .map_err(|_| "signal_wait ready for preempt_isolation_cross_cpu failed")?;
+        let _ = notification_wait(sig_ready)
+            .map_err(|_| "notification_wait ready for preempt_isolation_cross_cpu failed")?;
 
         // Change affinity to CPU 1 while the child is Blocked. This just
         // updates the affinity field; the migration happens at wake time.
@@ -777,11 +780,11 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         // child then runs on CPU 1; the first FP op (the capture vmovdqu)
         // traps to `#NM`, which XRSTORs the area into CPU 1's hardware
         // before the store executes.
-        signal_send(sig_resume, 0x1)
-            .map_err(|_| "signal_send resume for preempt_isolation_cross_cpu failed")?;
+        notification_send(sig_resume, 0x1)
+            .map_err(|_| "notification_send resume for preempt_isolation_cross_cpu failed")?;
 
-        let _ = signal_wait(sig_done)
-            .map_err(|_| "signal_wait done for preempt_isolation_cross_cpu failed")?;
+        let _ = notification_wait(sig_done)
+            .map_err(|_| "notification_wait done for preempt_isolation_cross_cpu failed")?;
 
         let mismatches = CROSS_MISMATCHES.load(Ordering::Acquire);
         let observed_cpu = CROSS_OBSERVED_CPU.load(Ordering::Acquire);

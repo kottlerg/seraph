@@ -37,7 +37,7 @@ In scope:
 
 ## Sleep List Invariants
 
-The sleep list is a single global fixed-capacity array of TCB pointers. A TCB is on the list when its `sleep_deadline != 0` AND it has been registered via `sleep_list_add`. The BSP timer tick scans the list, claims expired entries under `SLEEP_LIST_LOCK`, releases the lock, and arbitrates wake claims against concurrent IPC sources via the relevant source IPC lock (Signal / EventQueue / "plain sleep" only — `sys_thread_sleep` is a plain sleep with no source).
+The sleep list is a single global fixed-capacity array of TCB pointers. A TCB is on the list when its `sleep_deadline != 0` AND it has been registered via `sleep_list_add`. The BSP timer tick scans the list, claims expired entries under `SLEEP_LIST_LOCK`, releases the lock, and arbitrates wake claims against concurrent IPC sources via the relevant source IPC lock (Notification / EventQueue / "plain sleep" only — `sys_thread_sleep` is a plain sleep with no source).
 
 **Invariants the sleep list MUST hold:**
 
@@ -45,27 +45,27 @@ The sleep list is a single global fixed-capacity array of TCB pointers. A TCB is
 
 2. **A TCB on the sleep list MUST be in `Blocked` state.** The timer arbitration relies on this; non-`Blocked` is treated as already-woken and the claim fails benignly.
 
-3. **`sleep_deadline != 0` is the in-band "registered" signal.** Set before `sleep_list_add`; cleared by whichever path claims the wake (sender, timer, or `cancel_ipc_block`). `sleep_list_remove` is idempotent.
+3. **`sleep_deadline != 0` is the in-band "registered" notification.** Set before `sleep_list_add`; cleared by whichever path claims the wake (sender, timer, or `cancel_ipc_block`). `sleep_list_remove` is idempotent.
 
-4. **Capacity is hard.** At `SLEEP_COUNT == MAX_SLEEPING`, `sleep_list_add` returns `Err(())`. Parking syscalls either roll back to an indefinite IPC wait (`sys_signal_wait`, `sys_event_recv`) or surface `OutOfMemory` (`sys_thread_sleep`). Silent drop is forbidden — it would hang the parker.
+4. **Capacity is hard.** At `SLEEP_COUNT == MAX_SLEEPING`, `sleep_list_add` returns `Err(())`. Parking syscalls either roll back to an indefinite IPC wait (`sys_notification_wait`, `sys_event_recv`) or surface `OutOfMemory` (`sys_thread_sleep`). Silent drop is forbidden — it would hang the parker.
 
 5. **`sleep_check_wakeups` is BSP-only.** APs' timer ticks do not touch the sleep list. A BSP stuck in an interrupt-disabled critical section delays all timeout wakes; this is a deliberate simplification, not an oversight.
 
 6. **Snapshot-then-claim arbitration.** The timer drains `expired[..n]` under `SLEEP_LIST_LOCK`, releases, then for each entry snapshots `(ipc_state, blocked_on_object)` and dispatches:
-   - `BlockedOnSignal` / `BlockedOnEventQueue`: take the source lock; claim iff `(*src).waiter == tcb`.
+   - `BlockedOnNotification` / `BlockedOnEventQueue`: take the source lock; claim iff `(*src).waiter == tcb`.
    - default (plain sleep, `None`): claim unconditionally; no concurrent waker.
 
    The snapshot is read without the source lock; the `waiter == tcb` check under the source lock is the authoritative arbitration (stale snapshot = benign skip).
 
-7. **Wake-side `sleep_list_remove` MUST be inside the source IPC lock, preceded by clearing `sleep_deadline = 0`.** Producer half of the snapshot-then-claim protocol. See `signal_send` and `event_queue_post`.
+7. **Wake-side `sleep_list_remove` MUST be inside the source IPC lock, preceded by clearing `sleep_deadline = 0`.** Producer half of the snapshot-then-claim protocol. See `notification_send` and `event_queue_post`.
 
-8. **`sleep_list_add` from a parking syscall MUST re-acquire the source IPC lock and verify `(*src).waiter == tcb` before arming.** Without the recheck, a wake firing in the window between the IPC primitive releasing its source lock and the syscall arming the deadline leaves the TCB on the sleep list with stale state. The next unrelated `signal_wait` / `event_recv` on this TCB is then hijacked by `sleep_check_wakeups`, delivering `wakeup_value = 0` instead of real bits/payload. See `sys_signal_wait` and `sys_event_recv`.
+8. **`sleep_list_add` from a parking syscall MUST re-acquire the source IPC lock and verify `(*src).waiter == tcb` before arming.** Without the recheck, a wake firing in the window between the IPC primitive releasing its source lock and the syscall arming the deadline leaves the TCB on the sleep list with stale state. The next unrelated `notification_wait` / `event_recv` on this TCB is then hijacked by `sleep_check_wakeups`, delivering `wakeup_value = 0` instead of real bits/payload. See `sys_notification_wait` and `sys_event_recv`.
 
 ---
 
 ## `timed_out` Cross-CPU Protocol
 
-`tcb.timed_out: bool` is a single-cell out-of-band marker that distinguishes "data-delivered wake" from "timeout wake" for IPC primitives whose payload may itself be zero (notably `sys_event_recv`, contrast `sys_signal_wait` whose `wakeup_value == 0` is unambiguous because `signal_send` rejects zero-bit sends).
+`tcb.timed_out: bool` is a single-cell out-of-band marker that distinguishes "data-delivered wake" from "timeout wake" for IPC primitives whose payload may itself be zero (notably `sys_event_recv`, contrast `sys_notification_wait` whose `wakeup_value == 0` is unambiguous because `notification_send` rejects zero-bit sends).
 
 **Invariants:**
 
@@ -153,7 +153,7 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 11. Acquire the source IPC lock for tcb's blocked_on_object (if any) and unlink
     tcb from the source's wait queue / waiter slot. Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.
-      - BlockedOnSignal: sig.lock; clear waiter if it == tcb.
+      - BlockedOnNotification: sig.lock; clear waiter if it == tcb.
       - BlockedOnEventQueue: eq.lock; clear waiter if it == tcb.
       - BlockedOnWaitSet: ws.lock; clear waiter if it == tcb.
       - BlockedOnReply: blocked_on_object is the *server* TCB; mirror

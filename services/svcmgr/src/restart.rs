@@ -40,12 +40,12 @@ pub enum DeathOutcome
     Unrecoverable,
 }
 
-/// Monotonic counter for child bootstrap tokens. Shared between the
+/// Monotonic counter for child bootstrap badges. Shared between the
 /// restart path and the post-handover launch path: every child that
 /// receives its bootstrap round on svcmgr's `bootstrap_ep` gets a
-/// distinct token so svcmgr can correlate the round to the right
+/// distinct badge so svcmgr can correlate the round to the right
 /// service entry.
-static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static NEXT_BOOTSTRAP_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Result of a successful `CREATE_FROM_FILE` reply, shared by the
 /// restart path and the post-handover launch path.
@@ -53,16 +53,16 @@ pub struct CreatedProcess
 {
     pub process_handle: u32,
     pub thread_cap: u32,
-    pub child_token: u64,
+    pub child_badge: u64,
 }
 
-/// Allocate a fresh bootstrap token and mint a tokened SEND on
+/// Allocate a fresh bootstrap badge and mint a badged SEND on
 /// `bootstrap_ep` for a soon-to-spawn child.
 pub fn mint_child_creator(bootstrap_ep: u32) -> Option<(u64, u32)>
 {
-    let token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let tokened = syscall::cap_derive_token(bootstrap_ep, syscall::RIGHTS_SEND, token).ok()?;
-    Some((token, tokened))
+    let badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let badged = syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, badge).ok()?;
+    Some((badge, badged))
 }
 
 /// Argv and env blobs seeded into a child at `CREATE_FROM_FILE` time.
@@ -101,13 +101,13 @@ pub fn walk_and_create_from_file(
     ipc_buf: *mut u64,
 ) -> Option<CreatedProcess>
 {
-    let (child_token, tokened_creator) = mint_child_creator(bootstrap_ep)?;
+    let (child_badge, badged_creator) = mint_child_creator(bootstrap_ep)?;
 
     let root_cap = std::os::seraph::root_dir_cap();
     if root_cap == 0
     {
         std::os::seraph::log!("create: no root_dir_cap configured");
-        let _ = syscall::cap_delete(tokened_creator);
+        let _ = syscall::cap_delete(badged_creator);
         return None;
     }
     let (file_cap, file_size) = match std::os::seraph::namespace_lookup_file(root_cap, path)
@@ -116,7 +116,7 @@ pub fn walk_and_create_from_file(
         Err(e) =>
         {
             std::os::seraph::log!("create: NS_LOOKUP {path:?} failed: {e}");
-            let _ = syscall::cap_delete(tokened_creator);
+            let _ = syscall::cap_delete(badged_creator);
             return None;
         }
     };
@@ -153,7 +153,7 @@ pub fn walk_and_create_from_file(
     {
         builder = builder.bytes(env_blob_word_offset, blobs.env);
     }
-    let create_msg = builder.cap(file_cap).cap(tokened_creator).build();
+    let create_msg = builder.cap(file_cap).cap(badged_creator).build();
 
     // SAFETY: `ipc_buf` is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) }.ok()?;
@@ -171,11 +171,11 @@ pub fn walk_and_create_from_file(
     Some(CreatedProcess {
         process_handle: reply_caps[0],
         thread_cap: reply_caps[1],
-        child_token,
+        child_badge,
     })
 }
 
-/// Send `START_PROCESS` via the tokened process handle. Shared by the
+/// Send `START_PROCESS` via the badged process handle. Shared by the
 /// restart path and the post-handover launch path.
 pub fn start_process(process_handle: u32, ipc_buf: *mut u64) -> bool
 {
@@ -202,17 +202,17 @@ pub struct RestartCtx
     /// the routing in `dispatch_deaths` continues to land on the
     /// correct `ServiceEntry`.
     pub deaths_eq: u32,
-    /// Frame slab svcmgr retypes provider service endpoints from
+    /// Memory-cap slab svcmgr retypes provider service endpoints from
     /// (`cap_create_endpoint`). One slab backs every `provides = ...`
     /// service's endpoint; sized for the handful of provider services.
     pub endpoint_slab: u32,
     /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
     /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
     pub master_log_source: u32,
-    /// Token-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
+    /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
     /// real-logd's `DEATH_EQ_AUTHORITY` SEND from it.
     pub procmgr_death_auth_source: u32,
-    /// Token-0 `SEND|GRANT` source on devmgr's registry endpoint. svcmgr mints
+    /// Badge-0 `SEND|GRANT` source on devmgr's registry endpoint. svcmgr mints
     /// real-logd's `REGISTRY_QUERY_AUTHORITY` query cap from it.
     pub devmgr_registry: u32,
 }
@@ -337,8 +337,8 @@ fn restart_process(
 ) -> bool
 {
     // Reclaim the previous instance's kernel objects (thread/aspace/cspace/
-    // ProcessInfo frame) before spawning a fresh one. CSpace teardown
-    // cascades: frames handed to the dead process via `REQUEST_FRAMES`
+    // ProcessInfo memory cap) before spawning a fresh one. CSpace teardown
+    // cascades: memory caps handed to the dead process via `REQUEST_MEMORY_CAPS`
     // (which procmgr no longer holds caps on) get dec-ref'd and reclaimed
     // into memmgr's pool. The initial instance was created
     // by init, not svcmgr, so svcmgr has no handle for it — `process_handle
@@ -352,7 +352,7 @@ fn restart_process(
         svc.process_handle = 0;
     }
 
-    let Some((process_handle, new_thread_cap, child_token)) = create_process(svc, recipe, ctx)
+    let Some((process_handle, new_thread_cap, child_badge)) = create_process(svc, recipe, ctx)
     else
     {
         return false;
@@ -447,7 +447,7 @@ fn restart_process(
     if unsafe {
         ipc::bootstrap::serve_round(
             ctx.bootstrap_ep,
-            child_token,
+            child_badge,
             ctx.ipc_buf,
             true,
             &boot_caps,
@@ -467,7 +467,7 @@ fn restart_process(
         return false;
     }
 
-    svc.bootstrap_token = child_token;
+    svc.bootstrap_badge = child_badge;
 
     rebind_death_notification(svc, ctx.deaths_eq, new_thread_cap, correlator)
 }
@@ -475,7 +475,7 @@ fn restart_process(
 /// Spawn a fresh instance of `svc` via procmgr from its recorded
 /// `vfs_path` ([`walk_and_create_from_file`]). After create, applies the
 /// per-service namespace policy recorded at registration via
-/// `CONFIGURE_NAMESPACE`. Returns `(process_handle, thread, child_token)`.
+/// `CONFIGURE_NAMESPACE`. Returns `(process_handle, thread, child_badge)`.
 fn create_process(
     svc: &ServiceEntry,
     recipe: Option<&RestartRecipe>,
@@ -517,7 +517,7 @@ fn create_process(
     Some((
         created.process_handle,
         created.thread_cap,
-        created.child_token,
+        created.child_badge,
     ))
 }
 
@@ -698,7 +698,7 @@ pub(crate) fn configure_namespace_caps(
 }
 
 /// Tear down a partially-created child: send `DESTROY_PROCESS` over its
-/// tokened handle and release procmgr-side cap slots. Called when a step
+/// badged handle and release procmgr-side cap slots. Called when a step
 /// between procmgr's CREATE and START fails and the partial child must
 /// be reaped before the supervision loop retries.
 pub(crate) fn destroy_partial_child(process_handle: u32, thread_cap: u32, ipc_buf: *mut u64)

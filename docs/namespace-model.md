@@ -27,11 +27,11 @@ override.
 
 ## Node Capabilities
 
-A **node capability** is a tokened send capability on a namespace
-server's endpoint. The token packs a 40-bit server-private node
+A **node capability** is a badged send capability on a namespace
+server's endpoint. The badge packs a 40-bit server-private node
 identifier and a 24-bit namespace rights mask (see
 [Namespace Rights](#namespace-rights)). See
-[capability-model.md](capability-model.md) §"Tokens" for the
+[capability-model.md](capability-model.md) §"Badges" for the
 kernel-side derivation and set-once semantics that govern these caps.
 
 A node capability is one of two kinds, distinguished only by the rights
@@ -41,7 +41,7 @@ addressed node:
 - **Directory capability** — references a directory node. Operations:
   `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`.
 - **File capability** — references a file node. Operations: `NS_READ`,
-  `NS_READ_FRAME`, `NS_RELEASE_FRAME`/`_ACK`, `NS_STAT`.
+  `NS_READ_MEMORY`, `NS_RELEASE_MEMORY`/`_ACK`, `NS_STAT`.
 
 The kernel layer holds no notion of "directory" or "file." Type
 distinctions are server-private and surface to clients via the
@@ -50,7 +50,7 @@ distinctions are server-private and surface to clients via the
 ### Derivation root
 
 Every node capability the system ever issues derives from a server's
-**namespace endpoint capability**: an un-tokened send capability the
+**namespace endpoint capability**: an un-badged send capability the
 server holds in its own CSpace. The namespace tree therefore lives in
 server state, not in the kernel's derivation graph.
 
@@ -65,7 +65,7 @@ capability. Already-derived descendants in the namespace tree remain
 valid until their holders close them or the server is killed.
 
 Per-namespace-subtree revocation requires server-side bookkeeping
-(revocation epochs in the token, or per-server revoked-subtree
+(revocation epochs in the badge, or per-server revoked-subtree
 tracking). A server MAY implement it; the protocol contract does
 not require it.
 
@@ -74,7 +74,7 @@ not require it.
 ## Namespace Rights
 
 Namespace rights are a 24-bit mask packed into the high bits of the
-node-capability token. They are distinct from the kernel's
+node-capability badge. They are distinct from the kernel's
 [capability rights](capability-model.md#rights-and-attenuation), which
 govern the cap-as-send-capability layer (`SEND`, `MAP`, etc.). Every
 node capability is a `SEND` cap from the kernel's perspective; namespace
@@ -85,7 +85,7 @@ rights are only inspected by the server.
 | 0 | `LOOKUP` | NS_LOOKUP into this directory is permitted |
 | 1 | `READDIR` | NS_READDIR enumeration of this directory is permitted |
 | 2 | `STAT` | NS_STAT on this node is permitted |
-| 3 | `READ` | NS_READ / NS_READ_FRAME on this file is permitted |
+| 3 | `READ` | NS_READ / NS_READ_MEMORY on this file is permitted |
 | 4 | `WRITE` | NS_WRITE on this file is permitted |
 | 5 | `EXEC` | This file is executable (consumed by ELF loaders) |
 | 6 | `MUTATE_DIR` | NS_CREATE / NS_UNLINK in this directory are permitted |
@@ -93,7 +93,7 @@ rights are only inspected by the server.
 | 8..23 | — | Reserved; MUST be zero on derive, ignored on read |
 
 Servers MUST reject any operation requiring a rights bit that is not
-set in the caller's token. Servers MUST NOT promote rights at any
+set in the caller's badge. Servers MUST NOT promote rights at any
 operation; rights can only narrow.
 
 ---
@@ -153,7 +153,7 @@ name containing `/` (0x2F) or `\0` (0x00). See Naming.
 ### Current working directory
 
 Relative-path resolution anchors at a process's *current directory
-capability* — a tokened SEND on some namespace endpoint addressing
+capability* — a badged SEND on some namespace endpoint addressing
 a directory node. The cwd cap is independent of the root cap and
 need not be related to it; a process can hold a root cap addressing
 `/` and a cwd cap addressing some restricted subtree, or vice versa,

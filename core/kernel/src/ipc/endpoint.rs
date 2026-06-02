@@ -50,7 +50,7 @@ pub struct EndpointState
     pub wait_set: *mut u8,
     /// Index of this endpoint's entry in `WaitSetState::members`.
     pub wait_set_member_idx: u8,
-    /// Serialises call/recv/reply across CPUs (see signal.rs for rationale).
+    /// Serialises call/recv/reply across CPUs (see notification.rs for rationale).
     pub lock: crate::sync::Spinlock,
 }
 
@@ -188,7 +188,7 @@ pub unsafe fn endpoint_call(
             // the Release carry it, so no claimant can observe the stale
             // context_saved==1 left by the caller's previous switch-in and
             // dispatch it onto a stack its switch() has not yet vacated.
-            // Mirrors signal_wait's clear-before-register ordering (signal.rs).
+            // Mirrors notification_wait's clear-before-register ordering (notification.rs).
             (*caller)
                 .context_saved
                 .store(0, core::sync::atomic::Ordering::Relaxed);
@@ -258,7 +258,7 @@ pub unsafe fn endpoint_call(
     // No server available — block caller on send queue.
     let was_empty = ep.send_head.is_null();
     // Clear context_saved before enqueuing on the send queue.
-    // See signal.rs signal_wait for the full rationale.
+    // See notification.rs notification_wait for the full rationale.
     // SAFETY: caller validated by syscall layer; context_saved is AtomicU32.
     unsafe {
         (*caller)
@@ -352,7 +352,7 @@ pub unsafe fn endpoint_recv(
 
     // No sender — block server on recv queue.
     // Clear context_saved before enqueuing on the recv queue.
-    // See signal.rs signal_wait for the full rationale.
+    // See notification.rs notification_wait for the full rationale.
     // SAFETY: server validated by syscall layer; context_saved is AtomicU32.
     unsafe {
         (*server)

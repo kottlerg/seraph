@@ -37,13 +37,13 @@ capability".
 Each capability type represents a distinct kind of kernel object. The rights attached
 to a capability are type-specific.
 
-### Memory Frame
+### Memory
 
 A capability to one or more contiguous physical frames. Rights:
 - **Map** — may map these frames into an address space
 - **Write** — authority to create writable mappings
 - **Execute** — authority to create executable mappings
-- **Retype** — authority to consume bytes of this Frame's region as the
+- **Retype** — authority to consume bytes of this Memory's region as the
   backing storage for a newly created kernel object (see
   [Typed Memory](#typed-memory))
 
@@ -52,17 +52,17 @@ authorities over the same physical memory. W^X is enforced at mapping time: the
 kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
-The kernel mints Frame caps for all usable RAM at boot with `Map | Write |
-Execute | Retype` and places them in init's CSpace. Frame caps minted for
+The kernel mints Memory caps for all usable RAM at boot with `Map | Write |
+Execute | Retype` and places them in init's CSpace. Memory caps minted for
 firmware tables (ACPI regions, RSDP, DTB), boot modules, and init's own
 ELF segments mint without `Retype` — they are mappable read-only references
 to fixed-purpose memory and cannot be consumed for kernel-object creation.
 
-Init transfers RAM Frame caps (via the derive-twice pattern) to memmgr, which
-thereafter owns userspace RAM frame allocation and answers `REQUEST_FRAMES`
+Init transfers RAM Memory caps (via the derive-twice pattern) to memmgr, which
+thereafter owns userspace RAM frame allocation and answers `REQUEST_MEMORY_CAPS`
 for every std-built service. See
 [`userspace-memory-model.md`](userspace-memory-model.md) and
-[`services/memmgr/README.md`](../services/memmgr/README.md). MMIO Frame caps
+[`services/memmgr/README.md`](../services/memmgr/README.md). MMIO Memory caps
 follow a separate flow through devmgr; see
 [`device-management.md`](device-management.md).
 
@@ -86,11 +86,11 @@ A send capability without grant right cannot pass capabilities to the server.
 A server that should not receive unexpected resources from clients holds a receive
 capability without grant on its own endpoint.
 
-### Signal
+### Notification
 
-A capability to a signal object (bitmask-based async notification). Rights:
-- **Signal** — may OR bits into the signal word (deliver notifications)
-- **Wait** — may wait on this signal object and read the bitmask
+A capability to a notification object (bitmask-based async notification). Rights:
+- **Notification** — may OR bits into the notification word (deliver notifications)
+- **Wait** — may wait on this notification object and read the bitmask
 
 ### Event Queue
 
@@ -105,12 +105,12 @@ The holder registers an endpoint to receive interrupt notifications on that line
 Interrupt capabilities are created by the kernel at boot and initially granted to
 init, which delegates them to appropriate drivers.
 
-### MMIO Region
+### Mmio
 
-A capability to a specific physical address range used for memory-mapped I/O.
-Holding this capability allows mapping the region into an address space (with Map
-right). Without this capability a process cannot map physical addresses — it cannot
-name hardware it has not been granted access to.
+A capability to a specific physical address range (an MMIO aperture) used for
+memory-mapped I/O. Holding this capability allows mapping the region into an
+address space (with Map right). Without this capability a process cannot map
+physical addresses — it cannot name hardware it has not been granted access to.
 
 ### Thread
 
@@ -136,20 +136,36 @@ A capability to a wait set (see IPC design). Rights:
 - **Modify** — may add or remove members
 - **Wait** — may block on the wait set
 
-### IoPortRange (x86-64 only)
+### IoPort (x86-64 only)
 
 A capability to a contiguous range of x86 I/O port numbers. Rights:
 - **Use** — may bind this port range to a thread, allowing that thread to execute
   `in`/`out` instructions for those ports without a syscall
 
-IoPortRange capabilities are created at boot from `IoPortRange` entries in the
+IoPort capabilities are created at boot from `IoPort` entries in the
 boot-provided `platform_resources`. They are not creatable at runtime. A driver
-that needs port I/O access receives a derived IoPortRange capability from init
+that needs port I/O access receives a derived IoPort capability from init
 (via devmgr), covering only its assigned port range.
 
-Revoking an IoPortRange capability removes port access from all threads it has
+Revoking an IoPort capability removes port access from all threads it has
 been bound to. The kernel tracks bindings and updates each affected thread's IOPB
 in the TSS on revocation.
+
+### SbiControl (RISC-V only)
+
+A capability authorising the holder to forward Supervisor Binary Interface
+(SBI) calls to M-mode firmware via `SYS_SBI_CALL`. Rights:
+- **Call** — may forward an SBI `(EID, FID, args)` tuple to firmware.
+
+There is one SbiControl capability, created at boot on RISC-V; it does not exist
+on x86-64 (no SBI concept). Init holds it and delegates it to the userspace
+component that needs firmware services — today pwrmgr, for system reset (SRST).
+
+The current capability is **coarse**: any holder with the `Call` right may
+forward *any* SBI extension, including extensions the kernel itself manages
+(TIME, IPI, RFENCE, HSM). Constraining this — hard-denying kernel-reserved
+extensions and gating per a permitted-EID set — is tracked in the SbiControl
+gating issue; this section is updated when that work lands.
 
 ### SchedControl
 
@@ -191,82 +207,82 @@ capability slots across all processes, enabling correct revocation.
 
 ---
 
-## Tokens
+## Badges
 
-A capability may carry an immutable **token** — a `u64` value attached at derivation
-time via `SYS_CAP_DERIVE_TOKEN`. When a tokened endpoint capability is used for IPC,
-the kernel delivers the token to the receiver alongside the message label.
+A capability may carry an immutable **badge** — a `u64` value attached at derivation
+time via `SYS_CAP_DERIVE_BADGE`. When a badged endpoint capability is used for IPC,
+the kernel delivers the badge to the receiver alongside the message label.
 
-Tokens are generic: any capability type may carry one. For endpoints, the kernel
-delivers the token on `ipc_recv`. For other types, the token is stored but not
+Badges are generic: any capability type may carry one. For endpoints, the kernel
+delivers the badge on `ipc_recv`. For other types, the badge is stored but not
 automatically delivered — userspace may use it for bookkeeping.
 
 ### Kernel guarantees
 
-`SYS_CAP_DERIVE_TOKEN` enforces two invariants:
+`SYS_CAP_DERIVE_BADGE` enforces two invariants:
 
-1. **Tokens are set-once.** A non-zero token may be attached only to a source
-   capability that does NOT already carry one (`src_token != 0` is rejected).
-   Deriving from an already-tokened cap propagates the parent's token unchanged;
-   the parent's token cannot be replaced or shadowed.
-2. **Tokens propagate through the derivation tree.** Every derived child inherits
-   the parent's token (when non-zero). Once a cap is tokened, every cap reachable
-   from it through `cap_derive` / `cap_copy` carries the same token.
+1. **Badges are set-once.** A non-zero badge may be attached only to a source
+   capability that does NOT already carry one (`src_badge != 0` is rejected).
+   Deriving from an already-badged cap propagates the parent's badge unchanged;
+   the parent's badge cannot be replaced or shadowed.
+2. **Badges propagate through the derivation tree.** Every derived child inherits
+   the parent's badge (when non-zero). Once a cap is badged, every cap reachable
+   from it through `cap_derive` / `cap_copy` carries the same badge.
 
-These guarantees give the **receiver** of an IPC message a kernel-delivered token
+These guarantees give the **receiver** of an IPC message a kernel-delivered badge
 field it can trust: the value cannot be lied about on the receive path, cannot be
 changed after the fact, and is locked to whichever derivation chain the cap belongs
 to.
 
 ### What the kernel does NOT guarantee
 
-The kernel does NOT restrict which token *value* a caller chooses when attaching a
-token to an un-tokened source. Any holder of an un-tokened cap on an endpoint may
-mint a tokened child cap with any non-zero u64 value, including values that the
+The kernel does NOT restrict which badge *value* a caller chooses when attaching a
+badge to an un-badged source. Any holder of an un-badged cap on an endpoint may
+mint a badged child cap with any non-zero u64 value, including values that the
 endpoint's server uses as authority markers (e.g.,
 `procmgr_labels::DEATH_EQ_AUTHORITY`, `pwrmgr_labels::SHUTDOWN_AUTHORITY`).
 
-This is the correct kernel semantics — minting un-tokened sources is the
-mechanism by which servers distribute tokened identities. The implication for
+This is the correct kernel semantics — minting un-badged sources is the
+mechanism by which servers distribute badged identities. The implication for
 servers is structural, not cryptographic.
 
 ### Server-side rule for authority-bearing endpoints
 
-**Never distribute an un-tokened SEND cap on an authority-bearing endpoint to a
+**Never distribute an un-badged SEND cap on an authority-bearing endpoint to a
 holder that should not be able to mint arbitrary identities on it.** The
-un-tokened cap is a blank cheque — it is, by design, the source from which any
-tokened child can be derived.
+un-badged cap is a blank cheque — it is, by design, the source from which any
+badged child can be derived.
 
-In practice this means: the un-tokened source cap on a server's endpoint lives
+In practice this means: the un-badged source cap on a server's endpoint lives
 exclusively in the server's own CSpace (used internally to mint per-client
-tokened copies) and in the CSpaces of trusted bootstrap-time minters (today: init,
+badged copies) and in the CSpaces of trusted bootstrap-time minters (today: init,
 which dies and is fully reclaimed at the end of Phase 3). Every other client
-receives a tokened cap whose token value is chosen by the trusted minter — the
-client cannot subsequently re-tokenize it because of the set-once rule above.
+receives a badged cap whose badge value is chosen by the trusted minter — the
+client cannot subsequently re-badgeize it because of the set-once rule above.
 
-Trying to harden a public authority-bearing token value by making it "hard to
+Trying to harden a public authority-bearing badge value by making it "hard to
 guess" (long random sentinel, etc.) is obscurity, not security: the same cap_derive
 chain that would produce the well-known constant can produce any other u64.
-Security comes from controlling *who holds an un-tokened cap*, not from secrecy
-of the token bits.
+Security comes from controlling *who holds an un-badged cap*, not from secrecy
+of the badge bits.
 
 ### Verb-bit authority pattern
 
 Endpoints that serve a mix of unprivileged and privileged labels gate
-the privileged labels on a verb-bit in the caller's token, rather than
+the privileged labels on a verb-bit in the caller's badge, rather than
 splitting across separate endpoints. By convention the high bit
-(`1u64 << 63`) is the first verb-bit. The set-once token rules above
+(`1u64 << 63`) is the first verb-bit. The set-once badge rules above
 mean only the server and its trusted bootstrap-time minters can set
 the verb-bit; a holder of an unprivileged cap cannot re-derive an
 authority cap. The server's dispatcher checks
-`msg.token & VERB_BIT != 0` before servicing the privileged label and
+`msg.badge & VERB_BIT != 0` before servicing the privileged label and
 replies `UNAUTHORIZED` otherwise.
 
 ---
 
 ## Capabilities as Namespaces
 
-The capability and token primitives above compose into Seraph's
+The capability and badge primitives above compose into Seraph's
 filesystem namespace mechanism (node capabilities, attenuation through
 rights bits, sandboxing by cap distribution) without any kernel support
 beyond what this document specifies. The full model is in
@@ -303,13 +319,13 @@ withdrawn. If the revoker still holds the parent capability, it retains access.
 ## Object Creation
 
 New kernel objects are created via typed syscalls. Every creation call
-consumes a Frame capability with the `Retype` right as its first
-argument; the kernel constructs the new object inside that Frame's
-backing region, debiting bytes from the Frame's available-bytes ledger.
+consumes a Memory capability with the `Retype` right as its first
+argument; the kernel constructs the new object inside that Memory's
+backing region, debiting bytes from the Memory's available-bytes ledger.
 
 ```
 create_endpoint(frame)             → endpoint_cap  (Send + Receive + Grant)
-create_signal(frame)               → signal_cap    (Signal + Wait)
+create_notification(frame)               → notification_cap    (Notification + Wait)
 create_event_queue(frame, n)       → queue_cap     (Post + Recv)
 create_thread(frame, aspace, cs)   → thread_cap    (Control)
 create_address_space(frame, ...)   → aspace_cap    (Map)
@@ -317,28 +333,28 @@ create_cspace(frame, ...)          → cspace_cap    (Insert + Delete + Derive +
 create_wait_set(frame)             → wait_set_cap  (Modify + Wait)
 ```
 
-The kernel rejects creation if the Frame cap lacks `Retype` rights or
+The kernel rejects creation if the Memory cap lacks `Retype` rights or
 if its available-bytes ledger has insufficient room for the requested
 object. The returned capability is placed in a free slot in the caller's
 CSpace. The caller holds all rights on a freshly created object.
 
 The kernel does not track ownership beyond the derivation tree. If a process destroys
 all capabilities in the derivation tree for an object — including its own — the kernel
-reclaims the object's bytes (returning them to the Frame cap from which the object
+reclaims the object's bytes (returning them to the Memory cap from which the object
 was retyped) and frees the slot. Objects do not outlive all references to them.
 
 ---
 
 ## Typed Memory
 
-Every kernel object's backing storage is accounted to a specific Frame
+Every kernel object's backing storage is accounted to a specific Memory
 capability. There is no ambient kernel pool from which a process can
 draw kernel-object memory; a process can only create kernel objects
-against Frame caps it holds with `Retype` rights.
+against Memory caps it holds with `Retype` rights.
 
 ### Available-bytes ledger
 
-Each retypable Frame capability carries an `available_bytes` counter.
+Each retypable Memory capability carries an `available_bytes` counter.
 Creating a kernel object against the cap debits the counter by the
 object's byte cost (rounded up to a fixed size class). Destroying
 the object credits the bytes back. The counter is observable via
@@ -346,7 +362,7 @@ the object credits the bytes back. The counter is observable via
 
 The ledger gives userspace memory managers a single primitive for
 budgeting both *mapped* memory (via `mem_map`) and *kernel-object*
-memory (via the create syscalls above): one Frame cap, two consuming
+memory (via the create syscalls above): one Memory cap, two consuming
 operations, one budget. A misbehaving service cannot inflate kernel
 memory through a back channel — every byte of kernel-object backing
 is debited from a cap the service holds.
@@ -355,7 +371,7 @@ is debited from a cap the service holds.
 
 When a kernel object's reference count reaches zero (every cap referring
 to it has been destroyed), the kernel reclaims its bytes back to the
-Frame capability the object was retyped from. If the source Frame cap's
+Memory capability the object was retyped from. If the source Memory cap's
 own reference count then reaches zero, the reclamation cascades upward
 through the derivation chain. Process death is an instance of this
 cascade: revoking a child's CSpace destroys all caps the child held,
@@ -369,20 +385,20 @@ Page tables and CSpace slot pages are kernel-half memory that grows
 during normal operation as a process maps memory or accumulates caps.
 Each `AddressSpace` and `CSpace` capability carries its own growth
 budget — a pool of pages donated at creation time from a Retype-bearing
-Frame cap — from which `mem_map` and `cap_insert` allocate. Exhausting
+Memory cap — from which `mem_map` and `cap_insert` allocate. Exhausting
 the budget returns `NoMemory`; the budget refills via *augment mode* on
 the same create syscall (passing the existing AS/CS slot as the augment
 target merges a new slab of pages into its growth budget).
 
 This means every kernel-half page-table and slot-page allocation is
-gated by a Frame cap the owning process holds. There is no untracked
+gated by a Memory cap the owning process holds. There is no untracked
 kernel growth path.
 
 ### Cap introspection
 
 `SYS_CAP_INFO` is a read-only inquiry that returns runtime state for
 a held capability: tag and rights for any cap; size, available-bytes,
-and retype-rights flag for Frame caps; PT growth budget for AddressSpace
+and retype-rights flag for Memory caps; PT growth budget for AddressSpace
 caps; slot capacity, slots used, and growth budget for CSpace caps.
 The syscall enables defensive ledger checks (e.g. memmgr can verify a
 returning cap's available-bytes), and lets receivers of a cap from a
@@ -395,16 +411,17 @@ less-trusted source validate its shape before relying on it.
 At boot, the kernel creates init's Thread, AddressSpace, and CSpace and populates
 the CSpace with an initial set of capabilities covering all available resources:
 
-- Frame capabilities for all usable physical memory
-- MMIO region capabilities for all boot-provided platform resource regions
+- Memory capabilities for all usable physical memory
+- Mmio capabilities for all boot-provided platform resource regions
   (MmioRange and PciEcam entries from `BootInfo.platform_resources`)
 - Interrupt capabilities for all boot-provided interrupt lines
-- Read-only Frame capabilities for firmware table regions (PlatformTable entries),
+- Read-only Memory capabilities for firmware table regions (PlatformTable entries),
   allowing userspace to parse ACPI or Device Tree data
-- IoPortRange capabilities for all boot-provided I/O port ranges (x86-64 only)
+- IoPort capabilities for all boot-provided I/O port ranges (x86-64 only)
+- One SbiControl capability (RISC-V only; Call rights)
 - One SchedControl capability (Elevate rights)
 - Thread, AddressSpace, and CSpace capabilities for init itself
-- Frame capabilities for each boot module image (raw ELF images for early services)
+- Memory capabilities for each boot module image (raw ELF images for early services)
 
 Init is responsible for delegating appropriate subsets of this authority to each service it starts,
 following the principle of least privilege. See [device-management.md](device-management.md#what-devmgr-receives-from-init)

@@ -384,7 +384,7 @@ fn collect_usable_ranges(info: &BootInfo) -> RangeList<MAX_RANGES>
 /// against the `EfiBootServicesData → Usable` mis-typing risk noted at the
 /// trampoline guard's own comment. The authoritative reclamation mechanism
 /// for bootloader scratch pages is `BootInfo.reclaim_ranges`, consumed by
-/// `cap::mint_reclaim_frame_caps` during Phase 7.
+/// `cap::mint_reclaim_memory_caps` during Phase 7.
 fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
 {
     let mut excl = RangeList::new();
@@ -442,7 +442,7 @@ fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
     }
 
     // DTB blob pages. Commonly reported as EfiBootServicesData → Usable by
-    // UEFI; userspace parses the DTB through a read-only Frame cap minted
+    // UEFI; userspace parses the DTB through a read-only Memory cap minted
     // in Phase 7. Excluding the pages from the buddy keeps that cap's
     // backing memory live.
     if info.device_tree != 0
@@ -457,7 +457,7 @@ fn collect_exclusions(info: &BootInfo) -> RangeList<MAX_EXCL>
 /// Read the `totalsize` field of a flattened device tree blob.
 ///
 /// Returns `None` if the magic does not match or the reported size is
-/// implausible. Size is clamped to `DTB_MAX_SIZE` to bound the Frame cap.
+/// implausible. Size is clamped to `DTB_MAX_SIZE` to bound the Memory cap.
 fn read_dtb_totalsize(phys: u64) -> Option<u64>
 {
     /// FDT magic in big-endian: bytes `d0 0d fe ed`.

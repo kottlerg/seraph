@@ -631,7 +631,7 @@ fn user_walk_or_alloc_pooled(
 /// (`retype_free` per chunk → ancestor `dec_ref`), not via this function.
 ///
 /// Leaf PTEs (4 KiB and 2 MiB large pages) point at physical memory owned by
-/// Frame capabilities; those frames are freed through `FrameObject` teardown
+/// Memory capabilities; those frames are freed through `MemoryObject` teardown
 /// when the owning `CSpace` is destroyed, not here. This function only
 /// reclaims the *page-table* pages the aspace allocated via
 /// `user_walk_or_alloc`. The root PML4 itself is not freed here; the caller

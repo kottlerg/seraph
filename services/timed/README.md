@@ -35,7 +35,7 @@ Bootstrap caps from init (one round, two caps, `done=true`):
 | Slot      | Cap                                                          |
 |-----------|--------------------------------------------------------------|
 | `caps[0]` | Service-endpoint RECV (timed receives on this)               |
-| `caps[1]` | SEND on devmgr's registry endpoint, tokened with `REGISTRY_QUERY_AUTHORITY` |
+| `caps[1]` | SEND on devmgr's registry endpoint, badged with `REGISTRY_QUERY_AUTHORITY` |
 
 No other caps are needed; the registry SEND is used once for the
 `QUERY_RTC_DEVICE` resolve and then discarded.
@@ -63,7 +63,7 @@ through devmgr), timed enters a degraded state and replies
 
 1. Pull the service endpoint and devmgr-registry SEND via the
    spawner's bootstrap round.
-2. `devmgr.QUERY_RTC_DEVICE` → `READ_AUTHORITY`-tokened SEND on the
+2. `devmgr.QUERY_RTC_DEVICE` → `READ_AUTHORITY`-badged SEND on the
    per-board RTC driver bound by devmgr.
 3. `rtc_driver.RTC_GET_EPOCH_TIME` → `rtc_us` (Unix-epoch us).
 4. Snapshot `kernel_us = system_info(ElapsedUs)`.

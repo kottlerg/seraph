@@ -9,8 +9,8 @@
 
 use ipc::IpcMessage;
 use syscall::{
-    cap_copy, cap_create_endpoint, cap_create_signal, cap_delete, signal_send, signal_wait,
-    thread_exit,
+    cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_send,
+    notification_wait, thread_exit,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
@@ -25,10 +25,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     for _cycle in 0..CYCLES
     {
-        let ep = cap_create_endpoint(ctx.memory_frame_base)
+        let ep = cap_create_endpoint(ctx.memory_base)
             .map_err(|_| "concurrent_ipc: create_endpoint failed")?;
-        let done = cap_create_signal(ctx.memory_frame_base)
-            .map_err(|_| "concurrent_ipc: create_signal failed")?;
+        let done = cap_create_notification(ctx.memory_base)
+            .map_err(|_| "concurrent_ipc: create_notification failed")?;
 
         let mut threads = [0u32; NUM_CALLERS];
         let mut cspaces = [0u32; NUM_CALLERS];
@@ -110,7 +110,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         let mut done_bits: u64 = 0;
         while done_bits != all_done
         {
-            let bits = signal_wait(done).map_err(|_| "concurrent_ipc: signal_wait done failed")?;
+            let bits = notification_wait(done)
+                .map_err(|_| "concurrent_ipc: notification_wait done failed")?;
             done_bits |= bits;
         }
 
@@ -141,12 +142,12 @@ fn caller_entry(arg: u64) -> !
     let buf_addr = core::ptr::addr_of_mut!(crate::IPC_BUF) as u64;
     if syscall::ipc_buffer_set(buf_addr).is_err()
     {
-        signal_send(done_slot, done_bit).ok();
+        notification_send(done_slot, done_bit).ok();
         thread_exit()
     }
 
     // SAFETY: buf_addr was registered as this thread's IPC buffer above.
     let _ = unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(label), buf_addr as *mut u64) };
-    signal_send(done_slot, done_bit).ok();
+    notification_send(done_slot, done_bit).ok();
     thread_exit()
 }

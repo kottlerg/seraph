@@ -1029,7 +1029,7 @@ unsafe fn step9_populate_boot_info(
 
     // Build the reclaim-after-Phase-7 array in the dedicated 4 KiB page at
     // `allocs.reclaim_array_phys`. AP trampoline is handled by kernel-side
-    // late reclaim after SMP bringup (see `mint_late_reclaim_frame_caps`);
+    // late reclaim after SMP bringup (see `mint_late_reclaim_memory_caps`);
     // every other bootloader scratch page lands here. The reclaim-array page
     // is itself recorded as the final entry so the kernel reclaims it last.
     // SAFETY: reclaim_array_phys is a valid 4 KiB allocation; we treat it as
@@ -1078,7 +1078,7 @@ unsafe fn step9_populate_boot_info(
         push_reclaim(frame, 1, 0);
     }
     // Bundle blob: emit reclaim ranges over every bundle page NOT
-    // covered by a module Frame cap. Module bodies are 4 KiB-aligned
+    // covered by a module Memory cap. Module bodies are 4 KiB-aligned
     // per `bundle::BODY_ALIGNMENT` (enforced by `bundle::parse_header`),
     // and `mods.modules[..mods.count]` arrives in ascending
     // `physical_base` because `xtask/src/bundle.rs::write_bundle` lays
@@ -1090,7 +1090,7 @@ unsafe fn step9_populate_boot_info(
     // step 4), and any inter-module or trailing slack pages.
     //
     // Module-covered pages are accounted exclusively by
-    // `cap::mint_module_frame_caps`; carving around them keeps the
+    // `cap::mint_module_memory_caps`; carving around them keeps the
     // `register_owned_range` ledger entries disjoint and avoids the
     // double-count / double-free trap that motivated PR #138 commit 6.
     let bundle_end = bundle.phys + (bundle.pages as u64) * 4096;

@@ -3,10 +3,10 @@
 
 // memmgr/src/main.rs
 
-//! Tier-1 userspace service that owns the userspace RAM frame pool.
+//! Tier-1 userspace service that owns the userspace RAM memory-cap pool.
 //!
-//! memmgr serves frame allocation, release, and per-process accounting over
-//! IPC. See `memmgr/docs/{frame-pool,ipc-interface}.md` for the authoritative
+//! memmgr serves memory-cap allocation, release, and per-process accounting over
+//! IPC. See `memmgr/docs/{memory-pool,ipc-interface}.md` for the authoritative
 //! contracts. memmgr is `no_std` and uses statically-bounded data structures
 //! only — it cannot bootstrap a heap against itself.
 
@@ -31,7 +31,7 @@ process_abi::stack_pages!(12);
 // ── Bespoke runtime ─────────────────────────────────────────────────────────
 //
 // memmgr cannot share `std::sys::seraph::_start`: that path bootstraps a heap
-// by calling `REQUEST_FRAMES` against memmgr itself, and memmgr must serve
+// by calling `REQUEST_MEMORY_CAPS` against memmgr itself, and memmgr must serve
 // that call. The bespoke `_start` here runs on `core` + raw syscalls only.
 
 #[unsafe(no_mangle)]
@@ -56,17 +56,17 @@ pub extern "C" fn _start(_info_ptr: u64) -> !
         procmgr_endpoint: info.procmgr_endpoint_cap,
         memmgr_endpoint: info.memmgr_endpoint_cap,
         service_registry_cap: info.service_registry_cap,
-        stdin_frame_cap: info.stdin_frame_cap,
-        stdout_frame_cap: info.stdout_frame_cap,
-        stderr_frame_cap: info.stderr_frame_cap,
+        stdin_memory_cap: info.stdin_memory_cap,
+        stdout_memory_cap: info.stdout_memory_cap,
+        stderr_memory_cap: info.stderr_memory_cap,
         system_root_cap: info.system_root_cap,
         current_dir_cap: info.current_dir_cap,
-        stdin_data_signal_cap: info.stdin_data_signal_cap,
-        stdin_space_signal_cap: info.stdin_space_signal_cap,
-        stdout_data_signal_cap: info.stdout_data_signal_cap,
-        stdout_space_signal_cap: info.stdout_space_signal_cap,
-        stderr_data_signal_cap: info.stderr_data_signal_cap,
-        stderr_space_signal_cap: info.stderr_space_signal_cap,
+        stdin_data_notification_cap: info.stdin_data_notification_cap,
+        stdin_space_notification_cap: info.stdin_space_notification_cap,
+        stdout_data_notification_cap: info.stdout_data_notification_cap,
+        stdout_space_notification_cap: info.stdout_space_notification_cap,
+        stderr_data_notification_cap: info.stderr_data_notification_cap,
+        stderr_space_notification_cap: info.stderr_space_notification_cap,
         tls_template_vaddr: info.tls_template_vaddr,
         tls_template_filesz: info.tls_template_filesz,
         tls_template_memsz: info.tls_template_memsz,
@@ -92,13 +92,13 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 
 /// Maximum concurrent processes memmgr will track.
 const MAX_PROCESSES: usize = 64;
-/// Maximum frame records per process.
+/// Maximum memory-cap records per process.
 const MAX_PER_PROC: usize = 512;
-/// Maximum free runs in the pool. Each run is one Frame cap covering one
+/// Maximum free runs in the pool. Each run is one Memory cap covering one
 /// or more contiguous pages.
 const MAX_FREE_RUNS: usize = 512;
 
-/// One free run: a Frame cap memmgr owns, covering `page_count` pages
+/// One free run: a Memory cap memmgr owns, covering `page_count` pages
 /// starting at physical address `phys_base`.
 #[derive(Clone, Copy)]
 struct FreeRun
@@ -108,10 +108,10 @@ struct FreeRun
     phys_base: u64,
 }
 
-/// One per-process frame record.
+/// One per-process memory-cap record.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-struct OwnedFrame
+struct OwnedMemory
 {
     /// Slot index in memmgr's `CSpace` where memmgr retains the outer
     /// derivation (the parent of the cap handed to the caller). Used to
@@ -121,13 +121,13 @@ struct OwnedFrame
     phys_base: u64,
 }
 
-/// Process accounting record: token plus the list of frames memmgr has
+/// Process accounting record: badge plus the list of memory caps memmgr has
 /// issued to that process.
 struct ProcessRecord
 {
-    token: u64,
+    badge: u64,
     used: usize,
-    frames: [Option<OwnedFrame>; MAX_PER_PROC],
+    memory_caps: [Option<OwnedMemory>; MAX_PER_PROC],
 }
 
 impl ProcessRecord
@@ -136,22 +136,22 @@ impl ProcessRecord
     // ProcessTable, so this initializer never lands on a runtime stack
     // frame. const-evaluated at static-init time.
     #[allow(clippy::large_stack_arrays)]
-    const fn new(token: u64) -> Self
+    const fn new(badge: u64) -> Self
     {
         Self {
-            token,
+            badge,
             used: 0,
-            frames: [None; MAX_PER_PROC],
+            memory_caps: [None; MAX_PER_PROC],
         }
     }
 
-    fn push(&mut self, frame: OwnedFrame) -> Result<(), ()>
+    fn push(&mut self, memory_cap: OwnedMemory) -> Result<(), ()>
     {
         if self.used >= MAX_PER_PROC
         {
             return Err(());
         }
-        self.frames[self.used] = Some(frame);
+        self.memory_caps[self.used] = Some(memory_cap);
         self.used += 1;
         Ok(())
     }
@@ -191,7 +191,7 @@ impl FreePool
     /// Push a run, coalescing once and retrying if the array is full.
     ///
     /// `push` fails only when all `MAX_FREE_RUNS` slots are occupied.
-    /// Occupancy is dominated by fragmentation — many small runs `frame_merge`
+    /// Occupancy is dominated by fragmentation — many small runs `memory_merge`
     /// can fold into fewer, larger ones — so on a full array we `coalesce`
     /// (freeing a slot per successful merge) and retry the push once. `Err`
     /// means the array is still full afterward (every run physically
@@ -248,10 +248,10 @@ impl FreePool
 
     /// Coalesce free runs into larger physically-contiguous chunks.
     ///
-    /// `frame_merge` only joins runs adjacent in physical memory, so sorting
+    /// `memory_merge` only joins runs adjacent in physical memory, so sorting
     /// the populated runs by `phys_base` places every mergeable pair
     /// consecutively. A single linear pass then folds each run into its
-    /// lower-addressed neighbour with one `frame_merge` per pair: O(P)
+    /// lower-addressed neighbour with one `memory_merge` per pair: O(P)
     /// syscalls over P populated runs, versus the O(P²) of blind all-pairs
     /// probing. The distinction is load-bearing once the pool spans the whole
     /// machine and every process death coalesces — a syscall per ordered pair
@@ -287,7 +287,7 @@ impl FreePool
             }
             order[b] = key;
         }
-        // Fold each run into the current survivor while `frame_merge` accepts
+        // Fold each run into the current survivor while `memory_merge` accepts
         // the pair. The survivor is the lower-addressed run, so it is always
         // the merge parent; a rejection (non-adjacent or foreign parent) ends
         // this survivor's run and promotes the rejecting run to survivor.
@@ -303,7 +303,7 @@ impl FreePool
                 {
                     break;
                 };
-                if syscall::frame_merge(parent.cap_slot, tail.cap_slot).is_err()
+                if syscall::memory_merge(parent.cap_slot, tail.cap_slot).is_err()
                 {
                     break;
                 }
@@ -321,7 +321,7 @@ impl FreePool
 }
 
 /// Process tracking table: dense array of records, indexed by an internal
-/// monotonically-incremented token (held externally as the procmgr-minted
+/// monotonically-incremented badge (held externally as the procmgr-minted
 /// process identity).
 struct ProcessTable
 {
@@ -341,25 +341,25 @@ impl ProcessTable
         }
     }
 
-    fn insert(&mut self, token: u64) -> Option<&mut ProcessRecord>
+    fn insert(&mut self, badge: u64) -> Option<&mut ProcessRecord>
     {
         for slot in &mut self.records
         {
             if slot.is_none()
             {
-                *slot = Some(ProcessRecord::new(token));
+                *slot = Some(ProcessRecord::new(badge));
                 return slot.as_mut();
             }
         }
         None
     }
 
-    fn find_mut(&mut self, token: u64) -> Option<&mut ProcessRecord>
+    fn find_mut(&mut self, badge: u64) -> Option<&mut ProcessRecord>
     {
         for slot in &mut self.records
         {
             if let Some(rec) = slot
-                && rec.token == token
+                && rec.badge == badge
             {
                 return slot.as_mut();
             }
@@ -367,12 +367,12 @@ impl ProcessTable
         None
     }
 
-    fn take(&mut self, token: u64) -> Option<ProcessRecord>
+    fn take(&mut self, badge: u64) -> Option<ProcessRecord>
     {
         for slot in &mut self.records
         {
             if let Some(rec) = slot
-                && rec.token == token
+                && rec.badge == badge
             {
                 return slot.take();
             }
@@ -381,9 +381,9 @@ impl ProcessTable
     }
 }
 
-/// Token counter for memmgr-minted process identities. Each
+/// Badge counter for memmgr-minted process identities. Each
 /// `REGISTER_PROCESS` call consumes one.
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_BADGE: AtomicU64 = AtomicU64::new(1);
 
 // Per-process tracking and the free pool live in statics so the ~150 KB of
 // per-process bookkeeping never lands on a syscall stack frame. memmgr is
@@ -415,34 +415,34 @@ fn table_mut() -> &'static mut ProcessTable
 // The init → memmgr bootstrap payload layout (round caps + data words and the
 // auxiliary phys-table page) is defined in `ipc::memmgr_bootstrap`. memmgr
 // reads the free-run prefix from the data words and, from the phys-table page,
-// the per-frame physical bases plus the in-use bootstrap arenas (memmgr's,
+// the per-cap physical bases plus the in-use bootstrap arenas (memmgr's,
 // procmgr's, and init's own backing). The arenas are recorded against per-owner
 // process records so `pool_total` spans every page of RAM memmgr owns, not only
 // the free runs and reap donations.
 
-/// Maximum free RAM frames init delivers in one bootstrap round; see
-/// `ipc::memmgr_bootstrap::MAX_FRAMES`.
-const BOOTSTRAP_MAX_FRAMES: usize = ipc::memmgr_bootstrap::MAX_FRAMES;
+/// Maximum free RAM memory caps init delivers in one bootstrap round; see
+/// `ipc::memmgr_bootstrap::MAX_MEMORY_CAPS`.
+const BOOTSTRAP_MAX_MEMORY_CAPS: usize = ipc::memmgr_bootstrap::MAX_MEMORY_CAPS;
 
-/// Reserved process-table token for memmgr's own bootstrap-backing record.
-/// Out of range of every minted token (memmgr's `NEXT_TOKEN` and init's
-/// bootstrap tokens both start at 1), so no real caller can match it.
-const MEMMGR_SELF_TOKEN: u64 = u64::MAX;
+/// Reserved process-table badge for memmgr's own bootstrap-backing record.
+/// Out of range of every minted badge (memmgr's `NEXT_BADGE` and init's
+/// bootstrap badges both start at 1), so no real caller can match it.
+const MEMMGR_SELF_BADGE: u64 = u64::MAX;
 
-/// Reserved process-table token for init's orphaned bootstrap-backing record.
+/// Reserved process-table badge for init's orphaned bootstrap-backing record.
 /// init exits at reap, so no live process owns its arena; its pages stay
-/// parked and accounted here. Like `MEMMGR_SELF_TOKEN`, far out of minted-token
+/// parked and accounted here. Like `MEMMGR_SELF_BADGE`, far out of minted-badge
 /// range, so no real caller can match it.
-const INIT_SELF_TOKEN: u64 = u64::MAX - 1;
+const INIT_SELF_BADGE: u64 = u64::MAX - 1;
 
 /// Scratch VA in memmgr's address space for mapping the bootstrap
-/// phys-table frame. One page; mapped RO during `bootstrap_from_init`,
+/// phys-table memory cap. One page; mapped RO during `bootstrap_from_init`,
 /// unmapped before the dispatch loop entry.
 const PHYS_TABLE_TEMP_VA: u64 = 0x0000_5000_0000_0000;
 
-/// One in-use bootstrap arena delivered by init: a Frame cap covering a
+/// One in-use bootstrap arena delivered by init: a Memory cap covering a
 /// tier-1 service's whole backing (retype slabs + offset-mapped pages),
-/// recorded as an `OwnedFrame` against the owning service's record so its
+/// recorded as an `OwnedMemory` against the owning service's record so its
 /// pages count toward `pool_total`.
 #[derive(Clone, Copy, Default)]
 struct BootInUse
@@ -456,11 +456,11 @@ struct BootInUse
 struct InitBootstrap
 {
     service_ep: u32,
-    procmgr_token: u64,
-    frame_base: u32,
-    frame_count: u32,
-    page_counts: [u32; BOOTSTRAP_MAX_FRAMES],
-    phys_bases: [u64; BOOTSTRAP_MAX_FRAMES],
+    procmgr_badge: u64,
+    memory_base: u32,
+    memory_count: u32,
+    page_counts: [u32; BOOTSTRAP_MAX_MEMORY_CAPS],
+    phys_bases: [u64; BOOTSTRAP_MAX_MEMORY_CAPS],
     in_use: [BootInUse; ipc::memmgr_bootstrap::MAX_IN_USE],
     in_use_count: usize,
     system_ram_bytes: u64,
@@ -485,15 +485,15 @@ fn bootstrap_from_init(
     {
         return None;
     }
-    let frame_count = round.data[1] as u32;
-    let packed_words = (frame_count as usize).div_ceil(2);
-    if (frame_count as usize) > BOOTSTRAP_MAX_FRAMES || 3 + packed_words > round.data_words
+    let memory_count = round.data[1] as u32;
+    let packed_words = (memory_count as usize).div_ceil(2);
+    if (memory_count as usize) > BOOTSTRAP_MAX_MEMORY_CAPS || 3 + packed_words > round.data_words
     {
         return None;
     }
     // Unpack 2 page_counts per word: low 32 bits = even index, high 32
     // bits = odd index.
-    let mut page_counts = [0u32; BOOTSTRAP_MAX_FRAMES];
+    let mut page_counts = [0u32; BOOTSTRAP_MAX_MEMORY_CAPS];
     for w in 0..packed_words
     {
         let word = round.data[3 + w];
@@ -501,27 +501,30 @@ fn bootstrap_from_init(
         let hi = (word >> 32) as u32;
         let i0 = w * 2;
         page_counts[i0] = lo;
-        if i0 + 1 < frame_count as usize
+        if i0 + 1 < memory_count as usize
         {
             page_counts[i0 + 1] = hi;
         }
     }
 
-    // Map the phys-table frame and copy out frame_count u64 entries.
+    // Map the phys-table memory cap and copy out memory_count u64 entries.
     let phys_table_cap = round.caps[1];
-    let mut phys_bases = [0u64; BOOTSTRAP_MAX_FRAMES];
+    let mut phys_bases = [0u64; BOOTSTRAP_MAX_MEMORY_CAPS];
     if syscall::mem_map(phys_table_cap, self_aspace, PHYS_TABLE_TEMP_VA, 0, 1, 0).is_err()
     {
         return None;
     }
     // SAFETY: PHYS_TABLE_TEMP_VA is mapped RO, one page. Init wrote the
-    // first `frame_count` u64 entries; the rest is zero. The pointer is
+    // first `memory_count` u64 entries; the rest is zero. The pointer is
     // page-aligned (4 KiB) so u64 alignment is satisfied.
     #[allow(clippy::cast_ptr_alignment)]
     let phys_ptr = PHYS_TABLE_TEMP_VA as *const u64;
-    for (i, slot) in phys_bases.iter_mut().enumerate().take(frame_count as usize)
+    for (i, slot) in phys_bases
+        .iter_mut()
+        .enumerate()
+        .take(memory_count as usize)
     {
-        // SAFETY: i < frame_count <= BOOTSTRAP_MAX_FRAMES = 122; 122 * 8 =
+        // SAFETY: i < memory_count <= BOOTSTRAP_MAX_MEMORY_CAPS = 122; 122 * 8 =
         // 976 B fits in one 4 KiB page.
         *slot = unsafe { core::ptr::read_volatile(phys_ptr.add(i)) };
     }
@@ -570,9 +573,9 @@ fn bootstrap_from_init(
 
     Some(InitBootstrap {
         service_ep: round.caps[0],
-        procmgr_token: round.data[2],
-        frame_base: round.data[0] as u32,
-        frame_count,
+        procmgr_badge: round.data[2],
+        memory_base: round.data[0] as u32,
+        memory_count,
         page_counts,
         phys_bases,
         in_use,
@@ -585,7 +588,7 @@ fn bootstrap_from_init(
 // ── Allocation primitives ────────────────────────────────────────────────────
 
 /// Peel exactly `want` pages off the run at index `idx`. If the run is
-/// larger, splits via `frame_split`; the residue is reinserted into the
+/// larger, splits via `memory_split`; the residue is reinserted into the
 /// pool. Returns the cap slot (in memmgr's `CSpace`) covering exactly `want`
 /// pages plus that slot's physical base address.
 fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<(u32, u64)>
@@ -601,10 +604,10 @@ fn take_exactly(pool: &mut FreePool, idx: usize, want: u32) -> Option<(u32, u64)
         return None;
     }
     let split_offset = u64::from(want) * PAGE_SIZE;
-    // Option-D frame_split: `run.cap_slot` shrinks in place to cover the
+    // Option-D memory_split: `run.cap_slot` shrinks in place to cover the
     // first `split_offset` bytes; the returned slot is the new tail covering
     // the remainder at `phys_base + split_offset`.
-    let tail = syscall::frame_split(run.cap_slot, split_offset).ok()?;
+    let tail = syscall::memory_split(run.cap_slot, split_offset).ok()?;
     pool.runs[idx] = Some(FreeRun {
         cap_slot: tail,
         page_count: run.page_count - want,
@@ -629,23 +632,23 @@ fn derive_for_caller(outer_slot: u32) -> Option<u32>
 
 // ── IPC handlers ─────────────────────────────────────────────────────────────
 
-/// Reply slot count for `REQUEST_FRAMES`. Per-cap page counts pack into
+/// Reply slot count for `REQUEST_MEMORY_CAPS`. Per-cap page counts pack into
 /// `data[1..1+count]`; `data[0]` holds the count itself.
 const MAX_REPLY_CAPS: usize = syscall_abi::MSG_CAP_SLOTS_MAX;
 
 /// One peeled selection entry: `(outer_cap_slot, page_count, phys_base)`.
 type GrantEntry = (u32, u32, u64);
 
-/// Result of a single `select_frames` call: the array of peeled entries
+/// Result of a single `select_memory_caps` call: the array of peeled entries
 /// plus the count of valid entries.
 type GrantArray = [GrantEntry; MAX_REPLY_CAPS];
 
-/// Pool selection for a single `REQUEST_FRAMES` call. Returns the array of
+/// Pool selection for a single `REQUEST_MEMORY_CAPS` call. Returns the array of
 /// peeled `(outer_cap, page_count, phys_base)` entries plus their count, or
 /// an error code on failure. On error the pool is unchanged; on success the
 /// caller owns each outer cap and is responsible for either accounting it
 /// to a process record or pushing it back via `pool.push`.
-fn select_frames(
+fn select_memory_caps(
     pool: &mut FreePool,
     want_pages: u32,
     contiguous: bool,
@@ -728,9 +731,9 @@ fn rollback_selection(
     }
 }
 
-fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
+fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    let token = req.token;
+    let badge = req.badge;
     let arg = req.word(0);
     let want_pages = (arg & 0xFFFF_FFFF) as u32;
     let flags = (arg >> 32) as u32;
@@ -742,7 +745,7 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
     }
 
     let pool = pool_mut();
-    let Some(record) = table_mut().find_mut(token)
+    let Some(record) = table_mut().find_mut(badge)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -750,7 +753,7 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
     };
 
     let contiguous = flags & memmgr_labels::REQUIRE_CONTIGUOUS != 0;
-    let (granted, granted_count) = match select_frames(pool, want_pages, contiguous)
+    let (granted, granted_count) = match select_memory_caps(pool, want_pages, contiguous)
     {
         Ok(v) => v,
         Err(code) =>
@@ -785,7 +788,7 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
     for (i, &(outer, pages, phys)) in granted.iter().take(granted_count).enumerate()
     {
         if record
-            .push(OwnedFrame {
+            .push(OwnedMemory {
                 cap_slot: outer,
                 page_count: pages,
                 phys_base: phys,
@@ -802,7 +805,7 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
             rollback_selection(pool, &granted, granted_count, &inner, i);
             // Drop the just-pushed record entry too.
             record.used -= 1;
-            record.frames[record.used] = None;
+            record.memory_caps[record.used] = None;
             reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
             return;
         };
@@ -813,7 +816,7 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
     //   data[0]                  = cap_count
     //   data[1..1+count]         = page_count_for_cap_i (u32 in low half)
     //   data[1+count..1+2*count] = phys_base_for_cap_i (u64)
-    //   caps[0..count]           = Frame caps (MAP|WRITE)
+    //   caps[0..count]           = Memory caps (MAP|WRITE)
     let mut builder = IpcMessage::builder(memmgr_errors::SUCCESS).word(0, granted_count as u64);
     for (i, &(_, pages, phys)) in granted.iter().take(granted_count).enumerate()
     {
@@ -829,7 +832,7 @@ fn handle_request_frames(req: &IpcMessage, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-fn handle_release_frames(req: &IpcMessage, ipc_buf: *mut u64)
+fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
     // First-cut RELEASE: receive the caller's caps, drop them. Per-process
     // tracking is not updated; the underlying physical region remains
@@ -844,9 +847,9 @@ fn handle_release_frames(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
-fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32, procmgr_token: u64)
+fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32, procmgr_badge: u64)
 {
-    if req.token != procmgr_token
+    if req.badge != procmgr_badge
     {
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
@@ -859,58 +862,58 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
     }
 
     let table = table_mut();
-    let new_token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let new_badge = NEXT_BADGE.fetch_add(1, Ordering::Relaxed);
 
-    if table.insert(new_token).is_none()
+    if table.insert(new_badge).is_none()
     {
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     }
 
-    let Ok(send_cap) = syscall::cap_derive_token(service_ep, syscall::RIGHTS_SEND_GRANT, new_token)
+    let Ok(send_cap) = syscall::cap_derive_badge(service_ep, syscall::RIGHTS_SEND_GRANT, new_badge)
     else
     {
         // Roll back the table insertion.
-        let _ = table.take(new_token);
+        let _ = table.take(new_badge);
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     };
 
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
-        .word(0, new_token)
+        .word(0, new_badge)
         .cap(send_cap)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
+fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 {
-    if req.token != procmgr_token
+    if req.badge != procmgr_badge
     {
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
     }
-    // The dead process's tokened SEND cap arrives in `caps[0]` (when the
-    // caller transfers it). The kernel does not surface the token of a
-    // transferred cap to the receiver — only the token of the
+    // The dead process's badged SEND cap arrives in `caps[0]` (when the
+    // caller transfers it). The kernel does not surface the badge of a
+    // transferred cap to the receiver — only the badge of the
     // receive-side cap — so procmgr also encodes the dead process's
-    // token in `data[0]` for memmgr's table lookup.
-    let dead_token = req.word(0);
+    // badge in `data[0]` for memmgr's table lookup.
+    let dead_badge = req.word(0);
 
     // Auto-reclaim invariant (documented, not asserted in-line):
     //
     // By the time PROCESS_DIED reaches memmgr, procmgr has revoked +
     // deleted the child's CSpace, which cascades through every derived
-    // inner Frame cap *and* every kernel object retyped from those caps.
+    // inner Memory cap *and* every kernel object retyped from those caps.
     // Auto-reclaim (`KernelObjectHeader.ancestor`) credits each retype's
-    // bytes back to the source `FrameObject` — which memmgr's outer cap
+    // bytes back to the source `MemoryObject` — which memmgr's outer cap
     // and the child's inner cap share. With the child gone, only the
     // outer cap remains.
     //
     // We do *not* assert `available_bytes == size` here: the per-cap
     // `RetypeAllocator` metadata at offset 0 of the cap region (debited
-    // on first retype) stays charged for as long as the FrameObject
+    // on first retype) stays charged for as long as the MemoryObject
     // lives, which is until memmgr's outer cap is also released — i.e.
     // forever for pool caps. A correct cross-check would compare against
     // the available value snapshotted at grant time, which is more state
@@ -918,33 +921,33 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
     // `integration::retype_reclaim` covers the same invariant on a
     // dedicated source cap with no allocator residual.
     let pool = pool_mut();
-    if let Some(record) = table_mut().take(dead_token)
+    if let Some(record) = table_mut().take(dead_badge)
     {
-        for frame in record.frames.iter().take(record.used).flatten()
+        for memory_cap in record.memory_caps.iter().take(record.used).flatten()
         {
             // Reachability-only: these pages were already counted in
             // pool_total at acquisition, so a failure here cannot break the
             // identity — coalesce-then-retry just shrinks the forgotten-cap
             // window. The trailing batch coalesce below still runs.
             let _ = pool.push_or_coalesce(FreeRun {
-                cap_slot: frame.cap_slot,
-                page_count: frame.page_count,
-                phys_base: frame.phys_base,
+                cap_slot: memory_cap.cap_slot,
+                page_count: memory_cap.page_count,
+                phys_base: memory_cap.phys_base,
             });
         }
         // Restore contiguity across all reclaimed runs in one pass (the
-        // per-frame `push_or_coalesce` above only fires `coalesce` under slot
+        // per-cap `push_or_coalesce` above only fires `coalesce` under slot
         // pressure). Without coalescing, fragmentation accumulates
         // monotonically: every spawn-and-die cycle leaves the pool with
         // smaller runs than it started, until the array fills and
-        // `push_or_coalesce` parks reclaimed frames (unreachable for
+        // `push_or_coalesce` parks reclaimed memory caps (unreachable for
         // allocation, though still owned and accounted).
         pool.coalesce();
     }
-    // Idempotent: missing token is not an error.
+    // Idempotent: missing badge is not an error.
 
     // Drop any caps the caller transferred (typically the dead process's
-    // tokened SEND cap, no longer useful).
+    // badged SEND cap, no longer useful).
     for &slot in req.caps()
     {
         let _ = syscall::cap_delete(slot);
@@ -953,10 +956,10 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_token: u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
-fn handle_donate_frames(req: &IpcMessage, ipc_buf: *mut u64)
+fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
     // Caller (init or procmgr) is permanently transferring boot-module
-    // Frame caps into memmgr's pool after loading the ELF contents. Each
+    // Memory caps into memmgr's pool after loading the ELF contents. Each
     // donated cap must carry RETYPE so memmgr's downstream `cap_derive`
     // calls produce caps that consumers can retype into kernel objects.
     //
@@ -969,7 +972,7 @@ fn handle_donate_frames(req: &IpcMessage, ipc_buf: *mut u64)
     let mut accepted_pages: u64 = 0;
     for &slot in req.caps()
     {
-        // Required: Frame tag implied by FRAME_SIZE selector returning Ok.
+        // Required: Memory tag implied by MEMORY_SIZE selector returning Ok.
         // Required: RETYPE rights so derived caps can retype.
         // Required: contiguous run (we read the whole cap as one run).
         let Ok(packed) = syscall::cap_info(slot, syscall::CAP_INFO_TAG_RIGHTS)
@@ -983,13 +986,13 @@ fn handle_donate_frames(req: &IpcMessage, ipc_buf: *mut u64)
             let _ = syscall::cap_delete(slot);
             continue;
         }
-        let Ok(size_bytes) = syscall::cap_info(slot, syscall::CAP_INFO_FRAME_SIZE)
+        let Ok(size_bytes) = syscall::cap_info(slot, syscall::CAP_INFO_MEMORY_SIZE)
         else
         {
             let _ = syscall::cap_delete(slot);
             continue;
         };
-        let Ok(phys_base) = syscall::cap_info(slot, syscall::CAP_INFO_FRAME_PHYS_BASE)
+        let Ok(phys_base) = syscall::cap_info(slot, syscall::CAP_INFO_MEMORY_PHYS_BASE)
         else
         {
             let _ = syscall::cap_delete(slot);
@@ -1049,7 +1052,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 /// Total pages of RAM memmgr owns: every page it has taken ownership of since
 /// boot, across all dispositions — bootstrap free runs, in-use bootstrap
 /// arenas, and reap donations. memmgr never returns RAM to the kernel, and
-/// `frame_split`/`frame_merge` preserve total page count, so this monotonic
+/// `memory_split`/`memory_merge` preserve total page count, so this monotonic
 /// counter equals the live owned set exactly.
 ///
 /// Ownership — and therefore the count — is taken when memmgr *retains* a cap
@@ -1060,7 +1063,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 ///
 /// This is the `pool_total` of the all-RAM-accounted identity
 /// (`system_ram == kernel_reserved + pool_total`). Surfaced in the
-/// `DONATE_FRAMES` reply (`word(2)`) so callers can read it without a separate
+/// `DONATE_MEMORY_CAPS` reply (`word(2)`) so callers can read it without a separate
 /// IPC. Single-threaded memmgr — plain static suffices.
 static mut POOL_TOTAL_PAGES: u64 = 0;
 
@@ -1092,15 +1095,15 @@ fn reply_label(ipc_buf: *mut u64, label: u64)
 fn ingest_pool(boot: &InitBootstrap)
 {
     let pool = pool_mut();
-    for i in 0..(boot.frame_count as usize)
+    for i in 0..(boot.memory_count as usize)
     {
-        let cap_slot = boot.frame_base + i as u32;
-        // Every RAM Frame cap memmgr ingests from init MUST carry
+        let cap_slot = boot.memory_base + i as u32;
+        // Every RAM Memory cap memmgr ingests from init MUST carry
         // `Rights::RETYPE`. The kernel stamps RETYPE on usable RAM at
         // Phase-7 mint (`core/kernel/src/cap/mod.rs`), and init's
         // `finalize_memmgr` forwards caps through `cap_derive(_, RIGHTS_ALL)`
         // which preserves RETYPE. If this ever fires, memmgr cannot retype
-        // these frames into kernel objects on its consumers' behalf and the
+        // these memory caps into kernel objects on its consumers' behalf and the
         // typed-memory contract is broken — fail fast at boot. The check
         // fires for at least the first cap (gating panic on i == 0);
         // subsequent caps would be debit-cheap to also check, but the
@@ -1116,15 +1119,15 @@ fn ingest_pool(boot: &InitBootstrap)
             let Ok(packed) = syscall::cap_info(cap_slot, syscall::CAP_INFO_TAG_RIGHTS)
             else
             {
-                panic!("memmgr: cap_info failed on bootstrap Frame cap");
+                panic!("memmgr: cap_info failed on bootstrap Memory cap");
             };
             assert!(
                 packed & syscall::RIGHTS_RETYPE != 0,
-                "memmgr: ingested RAM Frame cap missing RIGHTS_RETYPE",
+                "memmgr: ingested RAM Memory cap missing RIGHTS_RETYPE",
             );
         }
         // Ownership is taken on ingest — count on ownership, place best-effort
-        // (mirrors `handle_donate_frames`). Bootstrap never overflows the pool,
+        // (mirrors `handle_donate_memory_caps`). Bootstrap never overflows the pool,
         // but `pool_total` must equal owned RAM uniformly across every ingest
         // site, never gated on free-slot residency.
         pool_total_add(u64::from(boot.page_counts[i]));
@@ -1136,7 +1139,7 @@ fn ingest_pool(boot: &InitBootstrap)
     }
 }
 
-/// Record each in-use bootstrap arena as an `OwnedFrame` against the owning
+/// Record each in-use bootstrap arena as an `OwnedMemory` against the owning
 /// service's process record so the arena's pages count toward `pool_total`.
 /// The arenas are retype-pinned and offset-mapped for the immortal service's
 /// life — memmgr never allocates from or frees them; this is pure accounting.
@@ -1145,20 +1148,20 @@ fn ingest_in_use(boot: &InitBootstrap)
 {
     for entry in boot.in_use.iter().take(boot.in_use_count)
     {
-        let token = match entry.kind
+        let badge = match entry.kind
         {
-            ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR => MEMMGR_SELF_TOKEN,
-            ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR => boot.procmgr_token,
-            ipc::memmgr_bootstrap::IN_USE_KIND_INIT => INIT_SELF_TOKEN,
+            ipc::memmgr_bootstrap::IN_USE_KIND_MEMMGR => MEMMGR_SELF_BADGE,
+            ipc::memmgr_bootstrap::IN_USE_KIND_PROCMGR => boot.procmgr_badge,
+            ipc::memmgr_bootstrap::IN_USE_KIND_INIT => INIT_SELF_BADGE,
             _ => continue,
         };
         // Owned on ingest — count on ownership; the per-process record is
         // best-effort tracking (these arenas are immortal, never reclaimed), so
         // a record miss must not under-count `pool_total`.
         pool_total_add(u64::from(entry.page_count));
-        if let Some(record) = table_mut().find_mut(token)
+        if let Some(record) = table_mut().find_mut(badge)
         {
-            let _ = record.push(OwnedFrame {
+            let _ = record.push(OwnedMemory {
                 cap_slot: entry.cap_slot,
                 page_count: entry.page_count,
                 phys_base: entry.phys_base,
@@ -1171,25 +1174,25 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
 {
     match req.label & 0xFFFF
     {
-        memmgr_labels::REQUEST_FRAMES =>
+        memmgr_labels::REQUEST_MEMORY_CAPS =>
         {
-            handle_request_frames(req, ipc_buf);
+            handle_request_memory_caps(req, ipc_buf);
         }
-        memmgr_labels::RELEASE_FRAMES =>
+        memmgr_labels::RELEASE_MEMORY_CAPS =>
         {
-            handle_release_frames(req, ipc_buf);
+            handle_release_memory_caps(req, ipc_buf);
         }
         memmgr_labels::REGISTER_PROCESS =>
         {
-            handle_register_process(req, ipc_buf, boot.service_ep, boot.procmgr_token);
+            handle_register_process(req, ipc_buf, boot.service_ep, boot.procmgr_badge);
         }
         memmgr_labels::PROCESS_DIED =>
         {
-            handle_process_died(req, ipc_buf, boot.procmgr_token);
+            handle_process_died(req, ipc_buf, boot.procmgr_badge);
         }
-        memmgr_labels::DONATE_FRAMES =>
+        memmgr_labels::DONATE_MEMORY_CAPS =>
         {
-            handle_donate_frames(req, ipc_buf);
+            handle_donate_memory_caps(req, ipc_buf);
         }
         memmgr_labels::QUERY_POOL_STATUS =>
         {
@@ -1221,21 +1224,21 @@ fn main(startup: &StartupInfo) -> !
 
     ingest_pool(&boot);
 
-    // Auto-register procmgr's record so `REQUEST_FRAMES` against
-    // procmgr's tokened SEND succeeds — procmgr's own std heap-bootstrap
+    // Auto-register procmgr's record so `REQUEST_MEMORY_CAPS` against
+    // procmgr's badged SEND succeeds — procmgr's own std heap-bootstrap
     // is the first IPC memmgr serves after entering the loop. The
-    // procmgr_token cap doubles as the auth gate for `REGISTER_PROCESS`
-    // and `PROCESS_DIED`; both code paths still check `req.token` against
-    // `boot.procmgr_token` independently of the table entry.
+    // procmgr_badge cap doubles as the auth gate for `REGISTER_PROCESS`
+    // and `PROCESS_DIED`; both code paths still check `req.badge` against
+    // `boot.procmgr_badge` independently of the table entry.
     //
     // Register memmgr-self and init-self records too: `ingest_in_use` files
     // memmgr's, procmgr's, and init's bootstrap arenas against them so every
     // arena's pages join `pool_total`. procmgr and memmgr never die; init exits
     // at reap but its arena stays parked, so none of these records is ever
     // reclaimed.
-    if table_mut().insert(boot.procmgr_token).is_none()
-        || table_mut().insert(MEMMGR_SELF_TOKEN).is_none()
-        || table_mut().insert(INIT_SELF_TOKEN).is_none()
+    if table_mut().insert(boot.procmgr_badge).is_none()
+        || table_mut().insert(MEMMGR_SELF_BADGE).is_none()
+        || table_mut().insert(INIT_SELF_BADGE).is_none()
     {
         // Process table full at boot — fatal; refuse to enter dispatch.
         syscall::thread_exit();

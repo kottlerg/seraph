@@ -49,9 +49,9 @@ pub enum WorkOrder
 /// Caps to deliver to one fatfs child during its bootstrap round.
 pub struct BootstrapOrder
 {
-    /// Token the child carries on its REQUEST; identifies which order to fill.
-    pub token: u64,
-    /// Partition-scoped (tokened) SEND cap on virtio-blk's service endpoint.
+    /// Badge the child carries on its REQUEST; identifies which order to fill.
+    pub badge: u64,
+    /// Partition-scoped (badged) SEND cap on virtio-blk's service endpoint.
     pub blk: u32,
     /// Service-endpoint cap with `RIGHTS_ALL` for the new fatfs instance.
     pub service: u32,
@@ -64,7 +64,7 @@ pub struct BootstrapOrder
 pub struct CreateFromFileOrder
 {
     pub procmgr_ep: u32,
-    /// Tokened SEND on the owning fs driver's namespace endpoint
+    /// Badged SEND on the owning fs driver's namespace endpoint
     /// addressing the binary node. Ownership transferred to the worker;
     /// the worker forwards it to procmgr in `caps[0]` of `CREATE_FROM_FILE`.
     pub file_cap: u32,
@@ -72,10 +72,10 @@ pub struct CreateFromFileOrder
     /// rides as data word 0 of `CREATE_FROM_FILE` so procmgr can bound
     /// header / section walks during ELF load.
     pub file_size: u64,
-    /// Tokened SEND cap on the bootstrap endpoint, derived by the caller and
+    /// Badged SEND cap on the bootstrap endpoint, derived by the caller and
     /// moved to the worker. Forwarded to procmgr as the child's
     /// `creator_endpoint`.
-    pub tokened_creator: u32,
+    pub badged_creator: u32,
     /// The bootstrap caps to deliver once the child REQUESTs.
     pub bootstrap: BootstrapOrder,
 }
@@ -121,14 +121,14 @@ impl WorkHandle
 /// One pending-bootstrap slot in the shared state.
 pub struct PendingBootstrap
 {
-    pub token: u64,
+    pub badge: u64,
     pub blk: u32,
     pub service: u32,
     pub channel: Channel,
 }
 
 /// Shared state between the main thread (publisher) and the bootstrap worker
-/// thread (consumer/signaller).
+/// thread (consumer/notifier).
 pub struct BootstrapState
 {
     pub pending: [Option<PendingBootstrap>; MAX_PENDING_BOOTSTRAPS],
@@ -213,7 +213,7 @@ impl WorkerPool
         })
     }
 
-    /// SEND cap on the bootstrap endpoint. The main thread derives tokened
+    /// SEND cap on the bootstrap endpoint. The main thread derives badged
     /// SEND copies of this cap as the `creator_endpoint` handed to each child.
     pub fn bootstrap_ep(&self) -> u32
     {
@@ -253,7 +253,7 @@ impl WorkerPool
 pub fn submit_bootstrap(
     state: &Mutex<BootstrapState>,
     BootstrapOrder {
-        token,
+        badge,
         blk,
         service,
     }: BootstrapOrder,
@@ -263,7 +263,7 @@ pub fn submit_bootstrap(
     let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
     let slot = st.pending.iter_mut().find(|s| s.is_none())?;
     *slot = Some(PendingBootstrap {
-        token,
+        badge,
         blk,
         service,
         channel: channel.clone(),

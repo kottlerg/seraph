@@ -131,7 +131,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u
     };
     let death_auth = if ctx.procmgr_death_auth_source != 0
     {
-        syscall::cap_derive_token(
+        syscall::cap_derive_badge(
             ctx.procmgr_death_auth_source,
             syscall::RIGHTS_SEND_GRANT,
             procmgr_labels::DEATH_EQ_AUTHORITY,
@@ -144,7 +144,7 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u
     };
     let registry_query = if ctx.devmgr_registry != 0
     {
-        syscall::cap_derive_token(
+        syscall::cap_derive_badge(
             ctx.devmgr_registry,
             syscall::RIGHTS_SEND,
             devmgr_labels::REGISTRY_QUERY_AUTHORITY,
@@ -161,8 +161,8 @@ pub(crate) fn mint_logd_boot_caps(ctx: &RestartCtx, first_launch: bool) -> Vec<u
 /// Publish each name in a provider's `provides` list under the discovery
 /// registry once the endpoint exists, so consumers launched after it
 /// resolve them. Each name's SEND is stamped with its
-/// [`ProvidedName::token`] (`cap_derive_token` when non-zero, plain
-/// `cap_derive` for a bare entry); the token rides through to a
+/// [`ProvidedName::badge`] (`cap_derive_badge` when non-zero, plain
+/// `cap_derive` for a bare entry); the badge rides through to a
 /// consumer's `QUERY_ENDPOINT` lookup unchanged. The endpoint persists on
 /// the `ServiceEntry`, so the SENDs stay valid across restarts. No-op for
 /// a pure consumer (`provided_endpoint == 0`) or an empty list.
@@ -179,13 +179,13 @@ fn publish_provided(
     }
     for p in provides
     {
-        let derived = if p.token == 0
+        let derived = if p.badge == 0
         {
             syscall::cap_derive(provided_endpoint, syscall::RIGHTS_SEND)
         }
         else
         {
-            syscall::cap_derive_token(provided_endpoint, syscall::RIGHTS_SEND, p.token)
+            syscall::cap_derive_badge(provided_endpoint, syscall::RIGHTS_SEND, p.badge)
         };
         let Ok(send) = derived
         else
@@ -353,7 +353,7 @@ pub fn launch(
     let bootstrap_result = unsafe {
         ipc::bootstrap::serve_round(
             ctx.bootstrap_ep,
-            created.child_token,
+            created.child_badge,
             ctx.ipc_buf,
             true,
             &boot_caps,

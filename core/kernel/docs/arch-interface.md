@@ -389,12 +389,12 @@ impl TrapFrame {
     /// Read syscall argument `n` (rdi/rsi/rdx/r10/r8/r9 or a0..a5); 0 for n >= 6.
     pub fn arg(&self, n: usize) -> u64;
 
-    /// Write IPC return values (primary + label, optionally a token), and the
+    /// Write IPC return values (primary + label, optionally a badge), and the
     /// call/recv reply variants used by the IPC fast paths.
     pub fn set_ipc_return(&mut self, primary: u64, label: u64);
-    pub fn set_ipc_return_with_token(&mut self, primary: u64, label: u64, token: u64);
+    pub fn set_ipc_return_with_badge(&mut self, primary: u64, label: u64, badge: u64);
     pub fn set_ipc_call_return(&mut self, primary: u64, reply_label: u64, reply_word_count: u64);
-    pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, token: u64, word_count: u64);
+    pub fn set_ipc_recv_return(&mut self, primary: u64, label: u64, badge: u64, word_count: u64);
 
     /// Initialise the frame for first entry to user mode (entry PC + user SP);
     /// other fields must be zeroed first. Set the first argument or TLS base.
@@ -426,7 +426,7 @@ impl TrapFrame {
 - Slab allocator and size-class allocator
 - CSpace slot storage, lookup, and growth
 - Capability derivation tree and revocation algorithm
-- Endpoint, signal, event queue, and wait set objects
+- Endpoint, notification, event queue, and wait set objects
 - Thread control block structure (except the `SavedState` field)
 - Run queue management, priority levels, and time-slice accounting
 - Load balancing decisions

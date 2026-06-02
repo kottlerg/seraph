@@ -26,7 +26,7 @@ use crate::dir::{
     read_dir_entry_at_index,
 };
 use namespace_protocol::{
-    EntryName, EntryTarget, EntryView, FrameReply, NamespaceBackend, NamespaceRights, NodeId,
+    EntryName, EntryTarget, EntryView, MemoryReply, NamespaceBackend, NamespaceRights, NodeId,
     NodeKind, NodeStat, NsError, rights,
 };
 
@@ -43,7 +43,7 @@ pub const MAX_NODES: usize = 128;
 /// reports `cluster == 0`, but `kind` distinguishes).
 ///
 /// `open_slot` tracks a lazily-allocated [`crate::file::OpenFile`]
-/// when this node has fielded a `FS_READ_FRAME` against its node cap.
+/// when this node has fielded a `FS_READ_MEMORY` against its node cap.
 /// The slot carries the per-file outstanding-page table so cookie
 /// release and revoke-on-close work the same as for legacy `FS_OPEN`
 /// callers. Sentinel `u32::MAX` means "no slot allocated".
@@ -65,7 +65,7 @@ pub struct FatNode
 
 /// Sentinel for [`FatNode::open_slot`] meaning "no `OpenFile` slot
 /// associated yet". The slot is allocated lazily on first
-/// `FS_READ_FRAME` against the node cap.
+/// `FS_READ_MEMORY` against the node cap.
 pub const NO_OPEN_SLOT: u32 = u32::MAX;
 
 /// Append-only table of non-root nodes minted by [`FatfsBackend::lookup`].
@@ -141,7 +141,7 @@ impl NodeTable
     }
 
     /// Set or clear the lazy `OpenFile` slot index for `id`. Used by
-    /// the node-cap dispatch arms in `main.rs` when a `FS_READ_FRAME`
+    /// the node-cap dispatch arms in `main.rs` when a `FS_READ_MEMORY`
     /// against a node cap allocates an `OpenFile` slot, and on
     /// `FS_CLOSE` to clear it back to [`NO_OPEN_SLOT`].
     ///
@@ -388,17 +388,17 @@ impl NamespaceBackend for FatfsBackend<'_>
         Err(NsError::NotSupported)
     }
 
-    fn read_frame(
+    fn read_memory(
         &mut self,
         _file: NodeId,
         _offset: u64,
         _cookie: u64,
-    ) -> Result<FrameReply, NsError>
+    ) -> Result<MemoryReply, NsError>
     {
         Err(NsError::NotSupported)
     }
 
-    fn release_frame(&mut self, _file: NodeId, _cookie: u64) {}
+    fn release_memory(&mut self, _file: NodeId, _cookie: u64) {}
 
     fn close(&mut self, _node: NodeId) {}
 }

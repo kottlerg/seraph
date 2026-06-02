@@ -1141,7 +1141,7 @@ fn apply_thread_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "thread/mod.rs",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};\n\n        #[expect(dead_code)]\n        mod unsupported;\n        pub use unsupported::{current_os_id, set_name};\n    }\n",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};\n\n        #[expect(dead_code)]\n        mod unsupported;\n        pub use unsupported::{current_os_id, set_name};\n    }\n    \
-         // seraph-overlay: seraph thread via Signal caps\n    \
+         // seraph-overlay: seraph thread via Notification caps\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::{Thread, available_parallelism, current_os_id, set_name, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};\n    }\n",
     )?;
@@ -1175,7 +1175,7 @@ fn apply_sync_mutex_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "sync/mutex/mod.rs",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Mutex;\n    }\n",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Mutex;\n    }\n    \
-         // seraph-overlay: seraph mutex via Signal caps\n    \
+         // seraph-overlay: seraph mutex via Notification caps\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::Mutex;\n    }\n",
     )
@@ -1195,7 +1195,7 @@ fn apply_sync_rwlock_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "sync/rwlock/mod.rs",
         "    target_os = \"solid_asp3\" => {\n        mod solid;\n        pub use solid::RwLock;\n    }\n",
         "    target_os = \"solid_asp3\" => {\n        mod solid;\n        pub use solid::RwLock;\n    }\n    \
-         // seraph-overlay: seraph rwlock via Signal caps\n    \
+         // seraph-overlay: seraph rwlock via Notification caps\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::RwLock;\n    }\n",
     )
@@ -1215,7 +1215,7 @@ fn apply_sync_once_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "sync/once/mod.rs",
         "    any(\n        windows,\n        target_family = \"unix\",\n        all(target_vendor = \"fortanix\", target_env = \"sgx\"),\n        target_os = \"solid_asp3\",\n        target_os = \"xous\",\n    ) => {\n        mod queue;\n        pub use queue::{Once, OnceState};\n    }\n",
         "    any(\n        windows,\n        target_family = \"unix\",\n        all(target_vendor = \"fortanix\", target_env = \"sgx\"),\n        target_os = \"solid_asp3\",\n        target_os = \"xous\",\n    ) => {\n        mod queue;\n        pub use queue::{Once, OnceState};\n    }\n    \
-         // seraph-overlay: seraph once via Signal caps\n    \
+         // seraph-overlay: seraph once via Notification caps\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::{Once, OnceState};\n    }\n",
     )
@@ -1235,7 +1235,7 @@ fn apply_sync_condvar_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()
         "sync/condvar/mod.rs",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Condvar;\n    }\n",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Condvar;\n    }\n    \
-         // seraph-overlay: seraph condvar via Signal caps\n    \
+         // seraph-overlay: seraph condvar via Notification caps\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::Condvar;\n    }\n",
     )
@@ -1332,7 +1332,7 @@ fn apply_sync_thread_parking_overlay(rust_src: &Path, overlay_root: &Path) -> Re
         "sync/thread_parking/mod.rs",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Parker;\n    }\n",
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::Parker;\n    }\n    \
-         // seraph-overlay: seraph parker via Signal caps\n    \
+         // seraph-overlay: seraph parker via Notification caps\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          pub use seraph::Parker;\n    }\n",
     )

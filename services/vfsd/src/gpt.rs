@@ -8,8 +8,8 @@
 //! Reads the GUID Partition Table from a block device via IPC and populates
 //! a fixed-size partition array with UUID and starting LBA for each entry.
 //!
-//! Block reads use [`BLK_READ_INTO_FRAME`](ipc::blk_labels::BLK_READ_INTO_FRAME):
-//! a single scratch Frame cap (allocated via [`alloc_scratch`] at startup)
+//! Block reads use [`BLK_READ_INTO_MEMORY`](ipc::blk_labels::BLK_READ_INTO_MEMORY):
+//! a single scratch Memory cap (allocated via [`alloc_scratch`] at startup)
 //! is reused across every GPT read, moved out and back through IPC each
 //! call. The sector lands at offset 512 of the scratch page per the wire
 //! contract; vfsd memcpys 512 B from there into a stack buffer.
@@ -25,9 +25,9 @@ pub const MAX_GPT_PARTS: usize = 8;
 /// Sector size for block I/O.
 const SECTOR_SIZE: usize = 512;
 
-/// Offset within the scratch page where `BLK_READ_INTO_FRAME` deposits the
+/// Offset within the scratch page where `BLK_READ_INTO_MEMORY` deposits the
 /// 512-byte sector (per the wire contract).
-const SECTOR_OFFSET_IN_FRAME: u64 = 0;
+const SECTOR_OFFSET_IN_MEMORY: u64 = 0;
 
 /// A discovered GPT partition.
 ///
@@ -78,12 +78,12 @@ pub fn new_gpt_table() -> [GptEntry; MAX_GPT_PARTS]
     ]
 }
 
-/// Allocate one scratch Frame cap from memmgr, reserve a 1-page VA window,
-/// and map the frame into vfsd's AS at that VA.
+/// Allocate one scratch Memory cap from memmgr, reserve a 1-page VA window,
+/// and map the memory cap into vfsd's AS at that VA.
 ///
 /// Returns `(cap_slot, scratch_va)`. Both the cap and the VA reservation
 /// live for the vfsd process's lifetime; the `ReservedRange` has no Drop
-/// and the frame is intentionally not released.
+/// and the memory cap is intentionally not released.
 pub fn alloc_scratch(memmgr_ep: u32, self_aspace: u32, ipc_buf: *mut u64) -> Option<(u32, u64)>
 {
     let scratch_va = {
@@ -95,11 +95,11 @@ pub fn alloc_scratch(memmgr_ep: u32, self_aspace: u32, ipc_buf: *mut u64) -> Opt
     Some((cap, scratch_va))
 }
 
-/// Acquire one single-page Frame cap from memmgr.
+/// Acquire one single-page Memory cap from memmgr.
 fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
 {
     let arg = 1u64 | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
-    let req = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+    let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, arg)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -115,7 +115,7 @@ fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
     reply.caps().first().copied()
 }
 
-/// Read a single sector from the block device via `BLK_READ_INTO_FRAME`.
+/// Read a single sector from the block device via `BLK_READ_INTO_MEMORY`.
 ///
 /// `scratch_cap` is moved out to the driver and moved back in the reply;
 /// the slot index of the returned cap may differ from the input, so the
@@ -134,7 +134,7 @@ fn read_block_sector(
     {
         return false;
     }
-    let msg = IpcMessage::builder(blk_labels::BLK_READ_INTO_FRAME)
+    let msg = IpcMessage::builder(blk_labels::BLK_READ_INTO_MEMORY)
         .word(0, sector)
         .cap(*scratch_cap)
         .build();
@@ -153,10 +153,10 @@ fn read_block_sector(
         return false;
     }
     // SAFETY: scratch_va is a writable single-page mapping owned by vfsd.
-    // The driver has just DMAed 512 B at offset SECTOR_OFFSET_IN_FRAME.
+    // The driver has just DMAed 512 B at offset SECTOR_OFFSET_IN_MEMORY.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            (scratch_va + SECTOR_OFFSET_IN_FRAME) as *const u8,
+            (scratch_va + SECTOR_OFFSET_IN_MEMORY) as *const u8,
             buf.as_mut_ptr(),
             SECTOR_SIZE,
         );
@@ -308,7 +308,7 @@ fn iter_entries(
 /// each non-empty partition. Returns the number of entries found, or an
 /// error if the header cannot be read or validated.
 ///
-/// `scratch_cap` and `scratch_va` describe a single-page Frame allocated
+/// `scratch_cap` and `scratch_va` describe a single-page Memory cap allocated
 /// via [`alloc_scratch`]. The cap is moved through IPC on every block
 /// read; the slot index in `*scratch_cap` is updated to track where the
 /// kernel deposited the returned cap.

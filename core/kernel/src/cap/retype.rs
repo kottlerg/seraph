@@ -3,25 +3,25 @@
 
 // kernel/src/cap/retype.rs
 
-//! Retype primitive — turn Frame-cap-backed memory into kernel-object backings.
+//! Retype primitive — turn Memory-cap-backed memory into kernel-object backings.
 //!
-//! The seven `SYS_CAP_CREATE_*` handlers consume a Frame cap with
+//! The seven `SYS_CAP_CREATE_*` handlers consume a Memory cap with
 //! `Rights::RETYPE` and call [`retype_allocate`] to carve out a sub-region
 //! of the cap's backing memory; the kernel object is constructed in place
 //! at the returned offset. On `dec_ref → 0`, the dealloc path looks at
 //! `KernelObjectHeader.ancestor` and calls [`retype_free`] to return the
-//! bytes to the source `FrameObject`.
+//! bytes to the source `MemoryObject`.
 //!
 //! ## Authority
 //!
-//! The caller MUST validate `tag == Frame && rights.contains(RETYPE)` on the
+//! The caller MUST validate `tag == Memory && rights.contains(RETYPE)` on the
 //! source slot before invoking [`retype_allocate`]. This module trusts the
 //! caller; the syscall handler enforces the gate.
 //!
 //! ## Allocator semantics
 //!
-//! Each retypable Frame cap carries an inline [`RetypeAllocator`] in its
-//! [`FrameObject`] (kernel-owned memory). The allocator manages two pools:
+//! Each retypable Memory cap carries an inline [`RetypeAllocator`] in its
+//! [`MemoryObject`] (kernel-owned memory). The allocator manages two pools:
 //!
 //! - **Sub-page bins** (`BIN_128`, `BIN_512`) — fixed-size free lists. Each
 //!   freed slot's first 8 bytes hold the next-offset pointer for the bin's
@@ -52,16 +52,16 @@
 //! what they want for budget queries).
 //!
 //! [`retype_allocate`] and [`retype_free`] additionally take the cap's read
-//! lock ([`FrameReadGuard`](crate::cap::object::FrameReadGuard)) for their
-//! whole body, because both compare allocator state against `frame.size`
+//! lock ([`MemoryReadGuard`](crate::cap::object::MemoryReadGuard)) for their
+//! whole body, because both compare allocator state against `memory.size`
 //! (`retype_allocate`'s bump bound; `retype_free`'s drain-reset) and
-//! `sys_frame_split`/`sys_frame_merge` mutate `frame.size` under the cap
+//! `sys_memory_split`/`sys_memory_merge` mutate `memory.size` under the cap
 //! write lock. Lock order: cap-rwlock outer, allocator spinlock inner.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
 use crate::mm::PAGE_SIZE;
 use syscall::SyscallError;
 
@@ -74,10 +74,10 @@ const BIN_512: u64 = 512;
 const NUM_SUBPAGE_BINS: usize = 2;
 
 /// Sentinel value for an empty free list. Real offsets are bounded by
-/// `frame.size` (well below `u64::MAX`).
+/// `memory.size` (well below `u64::MAX`).
 const FREE_LIST_END: u64 = u64::MAX;
 
-/// Per-Frame-cap retype allocator. Lives inline in [`FrameObject`] (kernel-
+/// Per-Memory-cap retype allocator. Lives inline in [`MemoryObject`] (kernel-
 /// owned memory). Manages bump-allocation plus per-class free lists over
 /// the cap's backing region.
 #[repr(C)]
@@ -86,7 +86,7 @@ pub struct RetypeAllocator
     /// Spinlock guarding the bump pointer and free lists.
     /// `0` = unlocked, `1` = locked. Acquired with CAS.
     lock: AtomicU64,
-    /// Next free byte (high water mark) within the Frame cap region.
+    /// Next free byte (high water mark) within the Memory cap region.
     bump_offset: AtomicU64,
     /// Sub-page free-list heads, one per size class. `FREE_LIST_END` = empty.
     /// At each non-empty offset, the first 8 bytes of the freed slot hold
@@ -184,7 +184,7 @@ fn align_up(value: u64, align: u64) -> u64
 ///
 /// # Safety
 ///
-/// `phys + offset` must be inside a live Frame cap region; the bytes at that
+/// `phys + offset` must be inside a live Memory cap region; the bytes at that
 /// location must be safe to read (not concurrently written by anyone other
 /// than the holder of the allocator lock).
 #[cfg(not(test))]
@@ -200,7 +200,7 @@ unsafe fn read_u64_at(phys: u64, offset: u64) -> u64
 ///
 /// # Safety
 ///
-/// `phys + offset` must be inside a live Frame cap region; the bytes at that
+/// `phys + offset` must be inside a live Memory cap region; the bytes at that
 /// location must be safe to write (the slot is freed and not aliased).
 #[cfg(not(test))]
 unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
@@ -212,12 +212,12 @@ unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
 }
 
 /// True if `link` is a structurally valid sub-page free-list pointer for a
-/// region of `frame_size` bytes: either the empty sentinel, or an in-range
+/// region of `memory_size` bytes: either the empty sentinel, or an in-range
 /// offset aligned to the smallest sub-page class. Mirrors the bounds guard in
 /// [`try_alloc_page_block`].
-fn subpage_link_ok(link: u64, frame_size: u64) -> bool
+fn subpage_link_ok(link: u64, memory_size: u64) -> bool
 {
-    link == FREE_LIST_END || (link < frame_size && link.is_multiple_of(BIN_128))
+    link == FREE_LIST_END || (link < memory_size && link.is_multiple_of(BIN_128))
 }
 
 /// Try to pop a slot from the bin's free list. Returns the offset if a slot
@@ -227,9 +227,10 @@ fn subpage_link_ok(link: u64, frame_size: u64) -> bool
 ///
 /// # Safety
 ///
-/// `frame.base + head_offset` must be a valid kernel direct-map address.
+/// `memory.base + head_offset` must be a valid kernel direct-map address.
 #[cfg(not(test))]
-unsafe fn try_pop_subpage(alloc: &RetypeAllocator, frame: &FrameObject, bin: usize) -> Option<u64>
+unsafe fn try_pop_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: usize)
+-> Option<u64>
 {
     let head = alloc.subpage_free_lists[bin].load(Ordering::Acquire);
     if head == FREE_LIST_END
@@ -242,12 +243,12 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, frame: &FrameObject, bin: usi
     // out-of-range or misaligned head: drop the corrupted list and fall back
     // to bump allocation — mirroring the bounded-walk guard in
     // `try_alloc_page_block`, never dereferencing the bad pointer.
-    if !subpage_link_ok(head, frame.size)
+    if !subpage_link_ok(head, memory.size)
     {
         crate::kprintln!(
-            "RETYPE SUBPAGE FREE-LIST CORRUPT: frame.base=0x{:x} size=0x{:x} bin={} head=0x{:x}",
-            frame.base,
-            frame.size,
+            "RETYPE SUBPAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} bin={} head=0x{:x}",
+            memory.base,
+            memory.size,
             bin,
             head
         );
@@ -255,16 +256,16 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, frame: &FrameObject, bin: usi
         return None;
     }
     // Read next-offset stored at offset `head` within the cap region.
-    // SAFETY: head validated in-range above; frame.base + head is direct-map.
-    let next = unsafe { read_u64_at(frame.base, head) };
+    // SAFETY: head validated in-range above; memory.base + head is direct-map.
+    let next = unsafe { read_u64_at(memory.base, head) };
     // Validate the successor before promoting it to the new head, so a bad
     // link cannot be dereferenced by the next pop.
-    if !subpage_link_ok(next, frame.size)
+    if !subpage_link_ok(next, memory.size)
     {
         crate::kprintln!(
-            "RETYPE SUBPAGE FREE-LIST CORRUPT: frame.base=0x{:x} size=0x{:x} bin={} next=0x{:x}",
-            frame.base,
-            frame.size,
+            "RETYPE SUBPAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} bin={} next=0x{:x}",
+            memory.base,
+            memory.size,
             bin,
             next
         );
@@ -284,15 +285,15 @@ unsafe fn try_pop_subpage(alloc: &RetypeAllocator, frame: &FrameObject, bin: usi
 ///
 /// # Safety
 ///
-/// `frame.base + offset` must be a valid kernel direct-map address; the
+/// `memory.base + offset` must be a valid kernel direct-map address; the
 /// slot must not be concurrently aliased.
 #[cfg(not(test))]
-unsafe fn push_subpage(alloc: &RetypeAllocator, frame: &FrameObject, bin: usize, offset: u64)
+unsafe fn push_subpage(alloc: &RetypeAllocator, memory: &MemoryObject, bin: usize, offset: u64)
 {
     let prev_head = alloc.subpage_free_lists[bin].load(Ordering::Acquire);
     // Write next-offset at the start of the freed slot.
     // SAFETY: caller guarantees the slot is no longer in use.
-    unsafe { write_u64_at(frame.base, offset, prev_head) };
+    unsafe { write_u64_at(memory.base, offset, prev_head) };
     alloc.subpage_free_lists[bin].store(offset, Ordering::Release);
 }
 
@@ -300,14 +301,14 @@ unsafe fn push_subpage(alloc: &RetypeAllocator, frame: &FrameObject, bin: usize,
 ///
 /// The list head lives in the `RetypeAllocator` (which itself sits at
 /// offset 0 of the cap region); mid-list next-pointers live inline at
-/// `frame.base + offset + 8`. The two storage shapes need different
+/// `memory.base + offset + 8`. The two storage shapes need different
 /// update paths, captured here.
 enum PagePrev
 {
     /// Predecessor is the allocator's `page_free_head` field.
     Head,
     /// Predecessor is an inline next-pointer slot at the given cap offset.
-    /// The next-pointer is at `frame.base + offset + 8`.
+    /// The next-pointer is at `memory.base + offset + 8`.
     InCap(u64),
 }
 
@@ -321,11 +322,11 @@ enum PagePrev
 ///
 /// # Safety
 ///
-/// `frame.base` must be a valid kernel direct-map address.
+/// `memory.base` must be a valid kernel direct-map address.
 #[cfg(not(test))]
 unsafe fn try_alloc_page_block(
     alloc: &RetypeAllocator,
-    frame: &FrameObject,
+    memory: &MemoryObject,
     pages: u64,
 ) -> Option<u64>
 {
@@ -340,29 +341,29 @@ unsafe fn try_alloc_page_block(
         if iter > 1024
         {
             crate::kprintln!(
-                "RETYPE PAGE FREE-LIST CYCLE: frame.base=0x{:x} size=0x{:x} head=0x{:x} cur=0x{:x} iter={}",
-                frame.base,
-                frame.size,
+                "RETYPE PAGE FREE-LIST CYCLE: memory.base=0x{:x} size=0x{:x} head=0x{:x} cur=0x{:x} iter={}",
+                memory.base,
+                memory.size,
                 alloc.page_free_head.load(Ordering::Acquire),
                 cur,
                 iter
             );
             return None;
         }
-        if cur >= frame.size
+        if cur >= memory.size
         {
             crate::kprintln!(
-                "RETYPE PAGE FREE-LIST CORRUPT: frame.base=0x{:x} size=0x{:x} cur=0x{:x} (out of range)",
-                frame.base,
-                frame.size,
+                "RETYPE PAGE FREE-LIST CORRUPT: memory.base=0x{:x} size=0x{:x} cur=0x{:x} (out of range)",
+                memory.base,
+                memory.size,
                 cur
             );
             return None;
         }
         // SAFETY: cur is a valid offset placed by a previous push.
-        let block_pages = unsafe { read_u64_at(frame.base, cur) };
+        let block_pages = unsafe { read_u64_at(memory.base, cur) };
         // SAFETY: same as above; next is at offset cur+8.
-        let block_next = unsafe { read_u64_at(frame.base, cur + 8) };
+        let block_next = unsafe { read_u64_at(memory.base, cur + 8) };
 
         if block_pages >= pages
         {
@@ -378,7 +379,7 @@ unsafe fn try_alloc_page_block(
                 {
                     // SAFETY: prev_off was produced by a prior iteration's
                     // observation of a valid free-list node.
-                    unsafe { write_u64_at(frame.base, prev_off + 8, block_next) };
+                    unsafe { write_u64_at(memory.base, prev_off + 8, block_next) };
                 }
             }
 
@@ -394,9 +395,9 @@ unsafe fn try_alloc_page_block(
             let remainder_pages = block_pages - pages;
             let cur_head = alloc.page_free_head.load(Ordering::Acquire);
             // SAFETY: remainder_offset is page-aligned and within the cap.
-            unsafe { write_u64_at(frame.base, remainder_offset, remainder_pages) };
+            unsafe { write_u64_at(memory.base, remainder_offset, remainder_pages) };
             // SAFETY: same.
-            unsafe { write_u64_at(frame.base, remainder_offset + 8, cur_head) };
+            unsafe { write_u64_at(memory.base, remainder_offset + 8, cur_head) };
             alloc
                 .page_free_head
                 .store(remainder_offset, Ordering::Release);
@@ -418,20 +419,20 @@ unsafe fn try_alloc_page_block(
 /// # Safety
 ///
 /// `offset` must be page-aligned and within the cap; the bytes at
-/// `frame.base + offset` must not be concurrently aliased.
+/// `memory.base + offset` must not be concurrently aliased.
 #[cfg(not(test))]
-unsafe fn push_page_block(alloc: &RetypeAllocator, frame: &FrameObject, offset: u64, pages: u64)
+unsafe fn push_page_block(alloc: &RetypeAllocator, memory: &MemoryObject, offset: u64, pages: u64)
 {
     let prev_head = alloc.page_free_head.load(Ordering::Acquire);
     // SAFETY: caller guarantees offset is page-aligned within the cap and
     // no longer aliased.
-    unsafe { write_u64_at(frame.base, offset, pages) };
+    unsafe { write_u64_at(memory.base, offset, pages) };
     // SAFETY: same.
-    unsafe { write_u64_at(frame.base, offset + 8, prev_head) };
+    unsafe { write_u64_at(memory.base, offset + 8, prev_head) };
     alloc.page_free_head.store(offset, Ordering::Release);
 }
 
-/// Reserve `bytes` from `frame`'s region. Returns the offset within the cap
+/// Reserve `bytes` from `memory`'s region. Returns the offset within the cap
 /// where the new kernel object should be placed.
 ///
 /// `bytes` is the *raw* requested size; it is rounded up to the next size
@@ -441,16 +442,16 @@ unsafe fn push_page_block(alloc: &RetypeAllocator, frame: &FrameObject, offset: 
 /// the cap.
 ///
 /// Returns `Err(SyscallError::OutOfMemory)` if the cap doesn't have enough
-/// room. Caller must validate `tag == Frame && rights.contains(RETYPE)`
+/// room. Caller must validate `tag == Memory && rights.contains(RETYPE)`
 /// before invoking.
 ///
 /// # Safety
 ///
-/// `frame` must be a valid, live `FrameObject` reference. Returned offset
-/// is valid only while `frame` is live; use `frame.base + offset` and
+/// `memory` must be a valid, live `MemoryObject` reference. Returned offset
+/// is valid only while `memory` is live; use `memory.base + offset` and
 /// `phys_to_virt` to access the memory.
 #[cfg(not(test))]
-pub fn retype_allocate(frame: &FrameObject, bytes: u64) -> Result<u64, SyscallError>
+pub fn retype_allocate(memory: &MemoryObject, bytes: u64) -> Result<u64, SyscallError>
 {
     let need = round_to_class(bytes);
     if need == 0
@@ -458,28 +459,28 @@ pub fn retype_allocate(frame: &FrameObject, bytes: u64) -> Result<u64, SyscallEr
         return Err(SyscallError::InvalidArgument);
     }
 
-    // Read-lock the cap for the duration: a concurrent `sys_frame_split`
-    // would otherwise mutate `frame.size` between the bump validation
-    // (`new_bump > frame.size`) and the commit. Lock order: cap-rwlock
+    // Read-lock the cap for the duration: a concurrent `sys_memory_split`
+    // would otherwise mutate `memory.size` between the bump validation
+    // (`new_bump > memory.size`) and the commit. Lock order: cap-rwlock
     // outer, allocator spinlock inner.
-    let _frame_guard = crate::cap::object::FrameReadGuard::acquire(frame);
+    let _memory_guard = crate::cap::object::MemoryReadGuard::acquire(memory);
 
-    if frame.available_bytes.load(Ordering::Acquire) < need
+    if memory.available_bytes.load(Ordering::Acquire) < need
     {
         return Err(SyscallError::OutOfMemory);
     }
 
-    let alloc = &frame.allocator;
+    let alloc = &memory.allocator;
     alloc.lock();
 
     // Try the appropriate free list first.
     if let Some(bin) = subpage_bin_for(need)
     {
         // SAFETY: alloc lock held; bin is a valid index.
-        if let Some(off) = unsafe { try_pop_subpage(alloc, frame, bin) }
+        if let Some(off) = unsafe { try_pop_subpage(alloc, memory, bin) }
         {
             // Free-list reuse — debit available_bytes.
-            frame.available_bytes.fetch_sub(need, Ordering::AcqRel);
+            memory.available_bytes.fetch_sub(need, Ordering::AcqRel);
             alloc.unlock();
             return Ok(off);
         }
@@ -489,9 +490,9 @@ pub fn retype_allocate(frame: &FrameObject, bytes: u64) -> Result<u64, SyscallEr
         // Page-aligned: walk the page free list.
         let pages = need / PAGE_SIZE as u64;
         // SAFETY: alloc lock held.
-        if let Some(off) = unsafe { try_alloc_page_block(alloc, frame, pages) }
+        if let Some(off) = unsafe { try_alloc_page_block(alloc, memory, pages) }
         {
-            frame.available_bytes.fetch_sub(need, Ordering::AcqRel);
+            memory.available_bytes.fetch_sub(need, Ordering::AcqRel);
             alloc.unlock();
             return Ok(off);
         }
@@ -510,7 +511,7 @@ pub fn retype_allocate(frame: &FrameObject, bytes: u64) -> Result<u64, SyscallEr
     let alignment_pad = aligned_bump - bump;
     let new_bump = aligned_bump + need;
 
-    if new_bump > frame.size
+    if new_bump > memory.size
     {
         alloc.unlock();
         return Err(SyscallError::OutOfMemory);
@@ -521,10 +522,10 @@ pub fn retype_allocate(frame: &FrameObject, bytes: u64) -> Result<u64, SyscallEr
     // ledger. This matters when a sub-page bump is followed by a page-aligned
     // request: the gap (up to one page) is recovered into the free lists
     // rather than lost to the bump.
-    let prev_avail = frame.available_bytes.fetch_sub(need, Ordering::AcqRel);
+    let prev_avail = memory.available_bytes.fetch_sub(need, Ordering::AcqRel);
     if prev_avail < need
     {
-        frame.available_bytes.fetch_add(need, Ordering::Release);
+        memory.available_bytes.fetch_add(need, Ordering::Release);
         alloc.unlock();
         return Err(SyscallError::OutOfMemory);
     }
@@ -538,14 +539,14 @@ pub fn retype_allocate(frame: &FrameObject, bytes: u64) -> Result<u64, SyscallEr
         while remaining >= BIN_512
         {
             // SAFETY: alloc lock held; cursor is within the cap region.
-            unsafe { push_subpage(alloc, frame, 1, cursor) };
+            unsafe { push_subpage(alloc, memory, 1, cursor) };
             cursor += BIN_512;
             remaining -= BIN_512;
         }
         while remaining >= BIN_128
         {
             // SAFETY: alloc lock held.
-            unsafe { push_subpage(alloc, frame, 0, cursor) };
+            unsafe { push_subpage(alloc, memory, 0, cursor) };
             cursor += BIN_128;
             remaining -= BIN_128;
         }
@@ -559,53 +560,53 @@ pub fn retype_allocate(frame: &FrameObject, bytes: u64) -> Result<u64, SyscallEr
     Ok(aligned_bump)
 }
 
-/// Read the current bump offset against `frame`.
+/// Read the current bump offset against `memory`.
 ///
-/// Used by `sys_frame_split` to enforce the Option D invariant that a
+/// Used by `sys_memory_split` to enforce the Option D invariant that a
 /// split offset cannot land below the highest live retype.
 ///
 /// # Safety
 ///
-/// Caller must hold either `frame.read_lock()` or `frame.write_lock()` so
+/// Caller must hold either `memory.read_lock()` or `memory.write_lock()` so
 /// the cap's `size` cannot change under the reader.
 #[cfg(not(test))]
-pub fn current_bump(frame: &FrameObject) -> u64
+pub fn current_bump(memory: &MemoryObject) -> u64
 {
-    frame.allocator.bump_offset.load(Ordering::Acquire)
+    memory.allocator.bump_offset.load(Ordering::Acquire)
 }
 
-/// Return `bytes` to `frame`'s region. Pushes the freed slot onto the
+/// Return `bytes` to `memory`'s region. Pushes the freed slot onto the
 /// matching free list and credits `available_bytes`.
 ///
 /// # Safety
 ///
-/// `frame` must be a valid `FrameObject` reference; `offset` and `bytes`
+/// `memory` must be a valid `MemoryObject` reference; `offset` and `bytes`
 /// must match a previous successful [`retype_allocate`] return. The slot
 /// at `offset` must not contain a live kernel object — caller has dropped
 /// any state, drained wait queues, etc., before calling.
 #[cfg(not(test))]
-pub fn retype_free(frame: &FrameObject, offset: u64, bytes: u64)
+pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 {
     let need = round_to_class(bytes);
 
     // Read-lock the cap for the duration: the drain-reset below compares
-    // `prev_avail + need` against `frame.size`, and a concurrent
-    // `sys_frame_split`/`sys_frame_merge` mutates `frame.size` under the cap
+    // `prev_avail + need` against `memory.size`, and a concurrent
+    // `sys_memory_split`/`sys_memory_merge` mutates `memory.size` under the cap
     // write lock. Lock order matches `retype_allocate`: cap-rwlock outer,
     // allocator spinlock inner. Deadlock-free — no `retype_free` caller holds
     // the ancestor cap rwlock (the dealloc cascade releases `DERIVATION_LOCK`
-    // before invoking this, and reads the immutable `frame.base` without it).
-    let _frame_guard = crate::cap::object::FrameReadGuard::acquire(frame);
+    // before invoking this, and reads the immutable `memory.base` without it).
+    let _memory_guard = crate::cap::object::MemoryReadGuard::acquire(memory);
 
-    let alloc = &frame.allocator;
+    let alloc = &memory.allocator;
 
     alloc.lock();
 
     // Bump rollback when the freed block sits at the top of the allocator's
     // bump frontier: the freed range is contiguous with `bump_offset`, no
     // live retype lives above it, so we can shrink the bump back to `offset`.
-    // This keeps `sys_frame_split` usable on caps that have been retyped and
-    // then freed — without it, a Frame that was once the source for a
+    // This keeps `sys_memory_split` usable on caps that have been retyped and
+    // then freed — without it, a Memory cap that was once the source for a
     // `cap_create_aspace` slab can never again be split into smaller pieces,
     // even after the AS is dealloc'd. (The allocator's free list still
     // services future retypes either way; this rollback only affects what
@@ -618,26 +619,26 @@ pub fn retype_free(frame: &FrameObject, offset: u64, bytes: u64)
     else if let Some(bin) = subpage_bin_for(need)
     {
         // SAFETY: lock held; offset is from a prior successful allocation.
-        unsafe { push_subpage(alloc, frame, bin, offset) };
+        unsafe { push_subpage(alloc, memory, bin, offset) };
     }
     else
     {
         let pages = need / PAGE_SIZE as u64;
         // SAFETY: lock held; offset is page-aligned (was returned by
         // retype_allocate's page-aligned path).
-        unsafe { push_page_block(alloc, frame, offset, pages) };
+        unsafe { push_page_block(alloc, memory, offset, pages) };
     }
 
-    let prev_avail = frame.available_bytes.fetch_add(need, Ordering::Release);
-    if prev_avail + need == frame.size
+    let prev_avail = memory.available_bytes.fetch_add(need, Ordering::Release);
+    if prev_avail + need == memory.size
     {
-        // Frame fully drained — no live retyped object remains. Reset the
-        // allocator to virgin so a recycled frame carries no bump/free-list
+        // Memory cap fully drained — no live retyped object remains. Reset the
+        // allocator to virgin so a recycled Memory cap carries no bump/free-list
         // residual into its next consumer, and so a virgin tail lets
-        // `sys_frame_merge` coalesce it back into the free pool. Without this,
+        // `sys_memory_merge` coalesce it back into the free pool. Without this,
         // a former object-slab keeps its `bump` cursor and freed-slot links for
-        // the `FrameObject`'s whole life (forever for pooled caps): that
-        // residual blocks coalescing the recycled frame — leaving it grantable
+        // the `MemoryObject`'s whole life (forever for pooled caps): that
+        // residual blocks coalescing the recycled Memory cap — leaving it grantable
         // as a standalone run that can be handed out a second time — and leaves
         // a stale free-list link an aliasing writer can clobber.
         alloc.bump_offset.store(0, Ordering::Release);
@@ -664,19 +665,19 @@ pub fn retype_free(frame: &FrameObject, offset: u64, bytes: u64)
 /// the returned pointer can be cast back to `*mut T` by the dealloc path via
 /// `header.obj_type` dispatch.
 ///
-/// Used by `cap::populate_cspace` and `mint_module_frame_caps` (Phase 7) and
-/// by `core/kernel/src/main.rs` (Phase 9, init segment Frame caps).
+/// Used by `cap::populate_cspace` and `mint_module_memory_caps` (Phase 7) and
+/// by `core/kernel/src/main.rs` (Phase 9, init segment Memory caps).
 ///
 /// Calls [`crate::fatal`] on `OutOfMemory` — Phase 7 boot-time mints cannot
 /// recover from a too-small seed.
 #[cfg(not(test))]
-pub fn boot_retype_body<T>(seed: &FrameObject, body: T) -> NonNull<KernelObjectHeader>
+pub fn boot_retype_body<T>(seed: &MemoryObject, body: T) -> NonNull<KernelObjectHeader>
 {
     let bytes = core::mem::size_of::<T>() as u64;
     let Ok(offset) = retype_allocate(seed, bytes)
     else
     {
-        crate::fatal("Phase 7: seed Frame too small for boot mint");
+        crate::fatal("Phase 7: seed Memory cap too small for boot mint");
     };
     let virt = crate::mm::paging::phys_to_virt(seed.base + offset) as *mut T;
     // SAFETY: `virt` is in the kernel direct map, freshly carved out by
@@ -688,13 +689,13 @@ pub fn boot_retype_body<T>(seed: &FrameObject, body: T) -> NonNull<KernelObjectH
     unsafe { NonNull::new_unchecked(virt.cast::<KernelObjectHeader>()) }
 }
 
-/// Runtime mint: allocate `size_of::<T>()` bytes from the kernel SEED Frame
+/// Runtime mint: allocate `size_of::<T>()` bytes from the kernel SEED Memory
 /// cap, write `body` in place, bump SEED's refcount, and return a pointer
 /// suitable for `CSpace::insert_cap`.
 ///
-/// SEED is the only kernel-internal Frame cap; it backs the wrapper bodies
+/// SEED is the only kernel-internal Memory cap; it backs the wrapper bodies
 /// of split-derived caps (`sys_mmio_split`, `sys_irq_split`, the tail of
-/// `sys_frame_split`) and lazy per-thread state (`sys_iopb_set`'s IOPB).
+/// `sys_memory_split`) and lazy per-thread state (`sys_iopb_set`'s IOPB).
 /// All callers debit `SEED.available_bytes`; runtime exhaustion returns
 /// `OutOfMemory` to the syscall surface (unlike [`boot_retype_body`] which
 /// fatals).
@@ -708,7 +709,7 @@ pub fn boot_retype_body<T>(seed: &FrameObject, body: T) -> NonNull<KernelObjectH
 #[cfg(not(test))]
 pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallError>
 {
-    let seed = crate::cap::seed_frame_ref();
+    let seed = crate::cap::seed_memory_ref();
     let bytes = core::mem::size_of::<T>() as u64;
     let offset = retype_allocate(seed, bytes)?;
     let virt = crate::mm::paging::phys_to_virt(seed.base + offset) as *mut T;
@@ -736,11 +737,11 @@ pub fn alloc_in_seed<T>(body: T) -> Result<NonNull<KernelObjectHeader>, SyscallE
 /// bitmap and never calls this. The per-thread FPU/SIMD/V save area is
 /// not allocated through this path — it is carved as part of the Thread
 /// retype slot (an extra page beyond kstack + wrapper) so its memory
-/// comes from the user's Frame cap rather than the SEED bootstrap reserve.
+/// comes from the user's Memory cap rather than the SEED bootstrap reserve.
 #[cfg(all(not(test), target_arch = "x86_64"))]
 pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 {
-    let seed = crate::cap::seed_frame_ref();
+    let seed = crate::cap::seed_memory_ref();
     let offset = retype_allocate(seed, bytes)?;
     seed.header.inc_ref();
     Ok(crate::mm::paging::phys_to_virt(seed.base + offset) as *mut u8)
@@ -756,7 +757,7 @@ pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 #[cfg(all(not(test), target_arch = "x86_64"))]
 pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
 {
-    let seed = crate::cap::seed_frame_ref();
+    let seed = crate::cap::seed_memory_ref();
     let phys = crate::mm::paging::virt_to_phys(ptr as u64);
     let offset = phys - seed.base;
     retype_free(seed, offset, bytes);
@@ -800,11 +801,11 @@ pub const EVENT_QUEUE_RING_OFFSET: u64 = EVENT_QUEUE_WRAPPER_BYTES + EVENT_QUEUE
 /// Look up the byte cost and allocation mode for a given `ObjectType`.
 ///
 /// `size_arg` is the variable-size argument (capacity for `EventQueue`,
-/// page count for `Frame`, initial growth-budget pages for `AddressSpace`
+/// page count for `Memory`, initial growth-budget pages for `AddressSpace`
 /// / `CSpace`). Pass `0` for fixed-size types.
 ///
-/// Returns `None` for object types that cannot be retyped (`Frame` is
-/// retypable; `MmioRegion`/`Interrupt`/`IoPortRange`/`SchedControl`/
+/// Returns `None` for object types that cannot be retyped (`Memory` is
+/// retypable; `Mmio`/`Interrupt`/`IoPort`/`SchedControl`/
 /// `SbiControl` are boot-minted only).
 pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEntry>
 {
@@ -816,8 +817,8 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: 88,
             split: false,
         }),
-        // Signal: 24 wrapper + 96 SignalState = 120 → BIN_128.
-        ObjectType::Signal => Some(DispatchEntry {
+        // Notification: 24 wrapper + 96 NotificationState = 120 → BIN_128.
+        ObjectType::Notification => Some(DispatchEntry {
             raw_bytes: 120,
             split: false,
         }),
@@ -871,15 +872,15 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
             raw_bytes: size_arg.checked_mul(PAGE_SIZE as u64)?,
             split: true,
         }),
-        // Frame retype: subsumes today's frame_split. size_arg is page count.
-        ObjectType::Frame => Some(DispatchEntry {
+        // Memory retype: subsumes today's memory_split. size_arg is page count.
+        ObjectType::Memory => Some(DispatchEntry {
             raw_bytes: size_arg.saturating_mul(PAGE_SIZE as u64),
             split: true,
         }),
         // Boot-minted only.
-        ObjectType::MmioRegion
+        ObjectType::Mmio
         | ObjectType::Interrupt
-        | ObjectType::IoPortRange
+        | ObjectType::IoPort
         | ObjectType::SchedControl
         | ObjectType::SbiControl => None,
     }
@@ -931,7 +932,7 @@ mod tests
     #[test]
     fn subpage_link_ok_accepts_sentinel_and_valid_offsets()
     {
-        let size = 0x2000; // 2-page frame
+        let size = 0x2000; // 2-page Memory cap region
         // Empty-list sentinel is always valid regardless of size.
         assert!(subpage_link_ok(FREE_LIST_END, size));
         // In-range, BIN_128-aligned offsets are valid.
@@ -968,7 +969,7 @@ mod tests
         assert!(!e.split);
         assert_eq!(round_to_class(e.raw_bytes), BIN_128);
 
-        let s = dispatch_for(ObjectType::Signal, 0).unwrap();
+        let s = dispatch_for(ObjectType::Notification, 0).unwrap();
         assert!(!s.split);
         assert_eq!(round_to_class(s.raw_bytes), BIN_128);
 
@@ -1030,10 +1031,10 @@ mod tests
     }
 
     #[test]
-    fn dispatch_frame_retype_pages()
+    fn dispatch_memory_retype_pages()
     {
         let p = PAGE_SIZE as u64;
-        let f = dispatch_for(ObjectType::Frame, 4).unwrap();
+        let f = dispatch_for(ObjectType::Memory, 4).unwrap();
         assert!(f.split);
         assert_eq!(f.raw_bytes, 4 * p);
     }
@@ -1041,9 +1042,9 @@ mod tests
     #[test]
     fn dispatch_boot_minted_types_refused()
     {
-        assert!(dispatch_for(ObjectType::MmioRegion, 0).is_none());
+        assert!(dispatch_for(ObjectType::Mmio, 0).is_none());
         assert!(dispatch_for(ObjectType::Interrupt, 0).is_none());
-        assert!(dispatch_for(ObjectType::IoPortRange, 0).is_none());
+        assert!(dispatch_for(ObjectType::IoPort, 0).is_none());
         assert!(dispatch_for(ObjectType::SchedControl, 0).is_none());
         assert!(dispatch_for(ObjectType::SbiControl, 0).is_none());
     }

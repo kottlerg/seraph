@@ -12,7 +12,7 @@ on seeing the label, replies one chunk at a time until its captured
 state is drained (`DONE`). Real-logd then issues a single
 `log_labels::HANDOVER_RELEASE`; init-logd breaks its loop and calls
 `sys_thread_exit` on that release — **not** on the drain's `DONE`.
-Real-logd's existing tokened SEND caps held by every other sender remain
+Real-logd's existing badged SEND caps held by every other sender remain
 valid because the kernel endpoint object is unchanged across the
 transition.
 
@@ -20,7 +20,7 @@ Termination is deliberately decoupled from the data drain. The drain is a
 multi-chunk lockstep over a shared, multi-sender endpoint; a kernel IPC
 rendezvous race can drop one chunk under SMP. If `DONE` were the exit
 trigger, such a drop would leave init-logd running forever, which blocks
-procmgr's reap of init's frames and breaks the all-RAM-accounted identity.
+procmgr's reap of init's memory caps and breaks the all-RAM-accounted identity.
 Gating exit on the single, retried `HANDOVER_RELEASE` instead means a
 dropped data chunk costs at most some unrecovered history.
 
@@ -61,7 +61,7 @@ state up front.
 |---|---|
 | 0 | `HEADER` |
 | 1 | total history-line count ever pushed (monotonic; may exceed ring size if wrapped) |
-| 2 | active sender-slot count (non-zero tokens in init-logd's slot table) |
+| 2 | active sender-slot count (non-zero badges in init-logd's slot table) |
 
 No inline bytes. No transferred caps.
 
@@ -73,13 +73,13 @@ non-zero slot, in slot-index order.
 | Word | Meaning |
 |---|---|
 | 0 | `SLOT` |
-| 1 | sender token (kernel-delivered identity on every IPC) |
+| 1 | sender badge (kernel-delivered identity on every IPC) |
 | 2 | display-name length in bytes |
 | 3..  | name bytes (packed via `IpcMessage::builder.bytes(3, ...)`, offset 24 in `data_bytes`) |
 
 The reply label's upper 16 bits carry the name length again (stream-
 protocol convention). Real-logd installs each slot into its own
-hash-keyed token table via
+hash-keyed badge table via
 [`SlotTable::install_from_handover`](../src/slot.rs).
 
 ### `LINE` (3)
@@ -91,7 +91,7 @@ in FIFO order: oldest entry first when the ring has wrapped; index
 | Word | Meaning |
 |---|---|
 | 0 | `LINE` |
-| 1 | sender token at receipt time |
+| 1 | sender badge at receipt time |
 | 2 | receipt timestamp in microseconds since boot |
 | 3 | line byte length |
 | 4..  | line bytes (packed via `.bytes(4, ...)`, offset 32 in `data_bytes`) |

@@ -15,7 +15,7 @@
 //!
 //! * Inline measurement: chunk into <= 504-byte reads that don't cross
 //!   a page tail. Loop until `size` bytes consumed.
-//! * Frame measurement: always pass a `PAGE_SIZE` buffer (so `want` is
+//! * Memory-cap measurement: always pass a `PAGE_SIZE` buffer (so `want` is
 //!   4096 which exceeds 504). Each `read` returns up to one page. For
 //!   `size < 4096` the call still pays the full single-page frame cost.
 //!

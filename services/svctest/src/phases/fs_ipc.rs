@@ -51,8 +51,8 @@ pub fn phases_pre_relative() -> &'static [Phase]
             run: fs_rename_phase,
         },
         Phase {
-            name: "fs_write_frame",
-            run: fs_write_frame_phase,
+            name: "fs_write_memory",
+            run: fs_write_memory_phase,
         },
         Phase {
             name: "fs_write_cache_coherence",
@@ -198,21 +198,21 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
     );
     std::os::seraph::log!("fs_rights_attenuation: FS_READ rejected on STAT-only cap");
 
-    let frame_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_FRAME)
+    let memory_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
         .word(0, 0)
         .word(1, 1)
         .build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let frame_reply = unsafe { ipc::ipc_call(stat_cap, &frame_msg, ipc_buf) }
-        .expect("fs_rights_attenuation: FS_READ_FRAME ipc_call failed");
+    let memory_reply = unsafe { ipc::ipc_call(stat_cap, &memory_msg, ipc_buf) }
+        .expect("fs_rights_attenuation: FS_READ_MEMORY ipc_call failed");
     assert_eq!(
-        frame_reply.label,
+        memory_reply.label,
         ipc::fs_errors::PERMISSION_DENIED,
-        "fs_rights_attenuation: FS_READ_FRAME on STAT-only cap returned {} (expected PERMISSION_DENIED={})",
-        frame_reply.label,
+        "fs_rights_attenuation: FS_READ_MEMORY on STAT-only cap returned {} (expected PERMISSION_DENIED={})",
+        memory_reply.label,
         ipc::fs_errors::PERMISSION_DENIED,
     );
-    std::os::seraph::log!("fs_rights_attenuation: FS_READ_FRAME rejected on STAT-only cap");
+    std::os::seraph::log!("fs_rights_attenuation: FS_READ_MEMORY rejected on STAT-only cap");
 
     let unknown_msg = ipc::IpcMessage::new(0x9999);
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
@@ -225,27 +225,27 @@ pub fn fs_rights_attenuation_phase(_: &Caps)
         unknown_reply.label,
         ipc::fs_errors::UNKNOWN_OPCODE,
     );
-    std::os::seraph::log!("fs_rights_attenuation: unknown tokened label rejected");
+    std::os::seraph::log!("fs_rights_attenuation: unknown badged label rejected");
 
     let _ = syscall::cap_delete(stat_cap);
 
     let (empty_cap, _kind, _) = ns_lookup(data_cap, b"test.txt", 0, ipc_buf)
         .expect("fs_rights_attenuation: NS_LOOKUP /data/test.txt (empty) failed");
-    let release_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_FRAME)
+    let release_msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
         .word(0, 1)
         .build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let release_reply = unsafe { ipc::ipc_call(empty_cap, &release_msg, ipc_buf) }
-        .expect("fs_rights_attenuation: FS_RELEASE_FRAME ipc_call failed");
+        .expect("fs_rights_attenuation: FS_RELEASE_MEMORY ipc_call failed");
     assert_eq!(
         release_reply.label,
         ipc::fs_errors::PERMISSION_DENIED,
-        "fs_rights_attenuation: FS_RELEASE_FRAME on empty-rights cap returned {} (expected \
+        "fs_rights_attenuation: FS_RELEASE_MEMORY on empty-rights cap returned {} (expected \
          PERMISSION_DENIED={})",
         release_reply.label,
         ipc::fs_errors::PERMISSION_DENIED,
     );
-    std::os::seraph::log!("fs_rights_attenuation: FS_RELEASE_FRAME rejected on empty-rights cap");
+    std::os::seraph::log!("fs_rights_attenuation: FS_RELEASE_MEMORY rejected on empty-rights cap");
     let _ = syscall::cap_delete(empty_cap);
 
     let (full_cap, _kind, _) = ns_lookup(data_cap, b"test.txt", 0xFFFF, ipc_buf)
@@ -409,7 +409,7 @@ pub fn fs_rename_phase(_: &Caps)
 }
 
 #[allow(clippy::too_many_lines, clippy::items_after_statements)]
-pub fn fs_write_frame_phase(_: &Caps)
+pub fn fs_write_memory_phase(_: &Caps)
 {
     use std::io::Read;
 
@@ -427,27 +427,27 @@ pub fn fs_write_frame_phase(_: &Caps)
 
     let (file_cap, _) = fs_create(svctest, name, ipc_buf).expect("FS_CREATE wrtf failed");
 
-    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_FRAMES)
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)
         .build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(info.memmgr_endpoint, &req, ipc_buf) }
-        .expect("memmgr REQUEST_FRAMES ipc_call failed");
+        .expect("memmgr REQUEST_MEMORY_CAPS ipc_call failed");
     assert_eq!(
         reply.label,
         ipc::memmgr_errors::SUCCESS,
-        "REQUEST_FRAMES status"
+        "REQUEST_MEMORY_CAPS status"
     );
     assert_eq!(reply.word(0), 1);
-    let frame_cap = *reply
+    let memory_cap = *reply
         .caps()
         .first()
-        .expect("REQUEST_FRAMES returned no cap");
+        .expect("REQUEST_MEMORY_CAPS returned no cap");
 
     let range = std::os::seraph::reserve_pages(1).expect("reserve_pages");
     let va = range.va_start();
-    syscall::mem_map(frame_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE)
-        .expect("mem_map frame failed");
+    syscall::mem_map(memory_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE)
+        .expect("mem_map memory cap failed");
 
     // SAFETY: va just mapped MAP_WRITABLE for one page; WRITE_LEN ≤ PAGE_SIZE.
     unsafe {
@@ -457,19 +457,19 @@ pub fn fs_write_frame_phase(_: &Caps)
         }
     }
 
-    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_WRITE_FRAME)
+    let msg = ipc::IpcMessage::builder(ipc::fs_labels::FS_WRITE_MEMORY)
         .word(0, 0)
         .word(1, WRITE_LEN as u64)
         .word(2, 0)
-        .cap(frame_cap)
+        .cap(memory_cap)
         .build();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let reply =
-        unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.expect("FS_WRITE_FRAME ipc_call failed");
+        unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }.expect("FS_WRITE_MEMORY ipc_call failed");
     assert_eq!(
         reply.label,
         ipc::fs_errors::SUCCESS,
-        "FS_WRITE_FRAME status {} (expected SUCCESS={})",
+        "FS_WRITE_MEMORY status {} (expected SUCCESS={})",
         reply.label,
         ipc::fs_errors::SUCCESS
     );
@@ -477,7 +477,7 @@ pub fn fs_write_frame_phase(_: &Caps)
     let returned = *reply
         .caps()
         .first()
-        .expect("FS_WRITE_FRAME returned no cap");
+        .expect("FS_WRITE_MEMORY returned no cap");
     let _ = syscall::cap_delete(returned);
 
     let _ = syscall::mem_unmap(info.self_aspace, va, 1);
@@ -500,7 +500,7 @@ pub fn fs_write_frame_phase(_: &Caps)
 
     fs_remove(svctest, name, ipc_buf).expect("cleanup wrtf");
     let _ = syscall::cap_delete(svctest);
-    std::os::seraph::log!("fs_write_frame phase passed");
+    std::os::seraph::log!("fs_write_memory phase passed");
 }
 
 pub fn fs_write_cache_coherence_phase(_: &Caps)

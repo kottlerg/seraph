@@ -577,7 +577,7 @@ impl AddressSpace
         // Drop pt_lock BEFORE the synchronous remote shootdown so concurrent
         // map/unmap on this address space need not wait behind our IPI
         // ack-wait. preempt stays disabled, so the unmap is fully TLB-coherent
-        // before this returns (the page's frame is owned by its Frame cap and
+        // before this returns (the page's frame is owned by its Memory cap and
         // is not reclaimed here, so no early-reuse hazard). See
         // `shootdown_remote`.
         self.pt_unlock();

@@ -33,7 +33,7 @@ use crate::os::seraph::current_ipc_buf;
 use crate::ptr::{NonNull, null_mut};
 use crate::sync::atomic::{AtomicBool, Ordering};
 
-use ipc::memmgr_labels::REQUEST_FRAMES;
+use ipc::memmgr_labels::REQUEST_MEMORY_CAPS;
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
 // Heap-zone VAs are private to the std-overlay allocator. They sit
@@ -53,7 +53,7 @@ const HEAP_MAX: u64 = 0x0000_0000_8000_0000;
 /// buffer pages, typical collection workloads, AND the peak of a piped
 /// `Command::spawn` (parent-side `Pipe×3` + death-bridge thread stack +
 /// per-thread IPC buffer + Arc<Packet> for join-handle) without ever
-/// needing `grow`. Cost is one `REQUEST_FRAMES` round-trip at bootstrap,
+/// needing `grow`. Cost is one `REQUEST_MEMORY_CAPS` round-trip at bootstrap,
 /// ≈ 2 MiB of physical RAM.
 const HEAP_INITIAL_PAGES: u64 = 512;
 
@@ -63,7 +63,7 @@ const HEAP_INITIAL_PAGES: u64 = 512;
 const GROW_MIN_PAGES: u64 = 16;
 
 /// Upper bound on a single `grow` call's page count. memmgr's reply is
-/// bounded by `MSG_CAP_SLOTS_MAX = 4` Frame caps per round; with
+/// bounded by `MSG_CAP_SLOTS_MAX = 4` Memory caps per round; with
 /// best-effort allocation each cap may cover many pages, so this cap is
 /// not driven by per-page CSpace consumption. It is sized so typical
 /// large `Vec` reallocations stay within a single round.
@@ -116,12 +116,12 @@ fn align_up(addr: usize, align: usize) -> usize {
 struct Heap {
     head: Option<NonNull<FreeNode>>,
     /// First VA above the currently mapped heap region. Grows upward toward
-    /// `HEAP_MAX` as `grow` maps fresh frames. Zero before bootstrap.
+    /// `HEAP_MAX` as `grow` maps fresh pages. Zero before bootstrap.
     mapped_end: usize,
     /// Cached memmgr endpoint cap used by `grow` to request additional
-    /// frames. Zero before bootstrap; `grow` returns false in that state.
+    /// pages. Zero before bootstrap; `grow` returns false in that state.
     memmgr_ep: u32,
-    /// Cached aspace cap for mapping grow-path frames. Zero before bootstrap.
+    /// Cached aspace cap for mapping grow-path pages. Zero before bootstrap.
     self_aspace: u32,
 }
 
@@ -243,13 +243,13 @@ impl Heap {
         null_mut()
     }
 
-    /// Extend the heap by requesting fresh frames from procmgr, mapping
+    /// Extend the heap by requesting fresh pages from procmgr, mapping
     /// them immediately above `mapped_end`, and appending the new region
     /// to the free list.
     ///
     /// Returns `true` if the heap grew by enough pages to cover
     /// `want_bytes`, `false` on any IPC / map failure or when the heap
-    /// has reached `HEAP_MAX`. A partial failure (some frames mapped,
+    /// has reached `HEAP_MAX`. A partial failure (some pages mapped,
     /// then a later batch fails) leaves the successfully-mapped pages
     /// outside the free list — effectively leaked address space until
     /// a future successful grow. This keeps the failure path simple and
@@ -283,15 +283,15 @@ impl Heap {
         self.grow_exact(pages, start_va)
     }
 
-    /// Request and map exactly `pages` frames starting at `start_va`,
+    /// Request and map exactly `pages` pages starting at `start_va`,
     /// then append the new region to the free list. Returns true on
     /// full success.
     ///
-    /// memmgr's `REQUEST_FRAMES` reply may carry up to
-    /// `MSG_CAP_SLOTS_MAX = 4` Frame caps in best-effort mode, each
+    /// memmgr's `REQUEST_MEMORY_CAPS` reply may carry up to
+    /// `MSG_CAP_SLOTS_MAX = 4` Memory caps in best-effort mode, each
     /// covering one or more contiguous pages. The reply layout:
     /// `data[0]` = `returned_cap_count`; `data[1+i]` = `page_count_for_cap_i`;
-    /// `caps[0..count]` = Frame caps. We map each returned cap with its
+    /// `caps[0..count]` = Memory caps. We map each returned cap with its
     /// declared `page_count` in a single `mem_map` call, advancing
     /// `start_va` by the same number of pages.
     fn grow_exact(&mut self, pages: u64, start_va: u64) -> bool {
@@ -317,7 +317,7 @@ impl Heap {
 
             let want = pages - mapped;
             // data[0] low half = want_pages, high half = flags (best-effort = 0).
-            let msg = ipc::IpcMessage::builder(REQUEST_FRAMES).word(0, want).build();
+            let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, want).build();
             // SAFETY: ipc_buf_u64 is the current thread's kernel-registered,
             // page-aligned IPC buffer.
             let reply = match unsafe { ipc::ipc_call(self.memmgr_ep, &msg, ipc_buf_u64) } {
@@ -364,13 +364,13 @@ impl Heap {
     ///
     /// `mem_map` returns `OutOfMemory` (-8) when the destination AS's PT
     /// growth budget is exhausted (a new intermediate page-table page is
-    /// needed but the budget has none). We acquire a fresh Frame cap from
-    /// memmgr, augment the AS via `cap_create_aspace(frame, self_aspace,
+    /// needed but the budget has none). We acquire a fresh Memory cap from
+    /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
     /// init_pages=1)`, and retry the map. One augment per failure; if the
     /// retry also fails the caller treats the grow as failed.
-    fn mem_map_with_augment_retry(&self, frame_cap: u32, va: u64, pages: u64) -> bool {
+    fn mem_map_with_augment_retry(&self, memory_cap: u32, va: u64, pages: u64) -> bool {
         const SYSCALL_OUT_OF_MEMORY: i64 = -8;
-        match syscall::mem_map(frame_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
+        match syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) {
             Ok(()) => return true,
             Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
             Err(_) => return false,
@@ -378,17 +378,17 @@ impl Heap {
         // Augment: request 1 page from memmgr, feed to cap_create_aspace
         // in augment mode (target = self_aspace). Single page covers
         // ~511 new PT-entries' worth of mappable VA.
-        let Some(aug_frame) = slab_acquire_fresh(PAGE_SIZE, 2) else {
+        let Some(aug_memory) = slab_acquire_fresh(PAGE_SIZE, 2) else {
             return false;
         };
-        if syscall::cap_create_aspace(aug_frame, self.self_aspace, 1).is_err() {
+        if syscall::cap_create_aspace(aug_memory, self.self_aspace, 1).is_err() {
             // Augment-mode returns 0 on success; treat any error as fatal
-            // for this grow. Drop the unused frame.
-            let _ = syscall::cap_delete(aug_frame);
+            // for this grow. Drop the unused Memory cap.
+            let _ = syscall::cap_delete(aug_memory);
             return false;
         }
         // The augment cap is consumed by cap_create_aspace; do not delete.
-        syscall::mem_map(frame_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
+        syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE).is_ok()
     }
 }
 
@@ -411,7 +411,7 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ── Bootstrap ───────────────────────────────────────────────────────────────
 
-/// Initialise the heap by requesting frames from memmgr and mapping them
+/// Initialise the heap by requesting pages from memmgr and mapping them
 /// at `HEAP_BASE`. Idempotent — only the first call performs real work.
 ///
 /// The IPC buffer used for the bootstrap round is taken from the calling
@@ -449,7 +449,7 @@ pub fn heap_bootstrap(memmgr_ep: u32, self_aspace: u32) -> bool {
         rounds += 1;
 
         let want = HEAP_INITIAL_PAGES - mapped;
-        let msg = ipc::IpcMessage::builder(REQUEST_FRAMES).word(0, want).build();
+        let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, want).build();
         // SAFETY: ipc_buf_u64 is the registered, page-aligned buffer.
         let reply = match unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf_u64) } {
             Ok(r) => r,
@@ -501,7 +501,7 @@ pub fn heap_is_initialized() -> bool {
 
 // ── Object slabs ────────────────────────────────────────────────────────────
 //
-// Per-process working Frame caps that back kernel-object retypes
+// Per-process working Memory caps that back kernel-object retypes
 // (`SYS_CAP_CREATE_*`). Two cached slabs — one per kernel sub-page bin —
 // plus a no-cache path for page-aligned requests. Lazily acquired from
 // memmgr on first call; reused across all retypes until exhausted, then a
@@ -534,7 +534,7 @@ const fn empty_slab() -> ObjectSlab {
     }
 }
 
-/// Slab serving sub-page requests `<= 128 B` (Endpoint, Signal).
+/// Slab serving sub-page requests `<= 128 B` (Endpoint, Notification).
 static SLAB_BIN_128: ObjectSlab = empty_slab();
 /// Slab serving sub-page requests `> 128 B && <= 512 B` (WaitSet).
 static SLAB_BIN_512: ObjectSlab = empty_slab();
@@ -564,8 +564,8 @@ fn slab_round_to_class(bytes: u64) -> u64 {
     }
 }
 
-/// Request a Frame cap from memmgr covering at least `min_pages` 4-KiB
-/// pages. memmgr's best-effort reply may return up to four Frame caps, each
+/// Request a Memory cap from memmgr covering at least `min_pages` 4-KiB
+/// pages. memmgr's best-effort reply may return up to four Memory caps, each
 /// covering one or more contiguous pages. We accept the first cap whose
 /// declared `page_count` is `>= min_pages`; if none qualifies, we fall back
 /// to the first returned cap (any cap unblocks sub-page retypes; a too-small
@@ -578,7 +578,7 @@ fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64)> {
     if ipc_buf.is_null() {
         return None;
     }
-    let msg = ipc::IpcMessage::builder(REQUEST_FRAMES).word(0, min_pages).build();
+    let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, min_pages).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }.ok()?;
     if reply.label != 0 {
@@ -602,7 +602,7 @@ fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64)> {
 
 /// Number of pages to request when refilling the object slab.
 ///
-/// The kernel's per-Frame retype allocator carves a small metadata header
+/// The kernel's per-Memory-cap retype allocator carves a small metadata header
 /// (≈ 48 B) out of the cap's `available_bytes` on first use. A page-aligned
 /// retype therefore cannot fit in a single 4-KiB cap; we always grab two
 /// pages so a `PAGE_SIZE`-byte request (e.g. `WaitSet`) succeeds, and a
@@ -648,7 +648,7 @@ fn slab_acquire_pooled(pool: &ObjectSlab, need: u64, want_pages: u64) -> Option<
     res
 }
 
-/// Acquire a fresh, dedicated Frame cap for a page-aligned retype. No
+/// Acquire a fresh, dedicated Memory cap for a page-aligned retype. No
 /// caching — the cap is consumed entirely by the caller's single retype
 /// (or by a few retypes against the leftover sub-page tail, which the
 /// caller manages). Used by variable-size types (`EventQueue`, `Thread`,
@@ -668,7 +668,7 @@ fn slab_acquire_fresh(need: u64, want_pages: u64) -> Option<u32> {
     Some(new_cap)
 }
 
-/// Return a Frame-cap slot with at least `min_bytes` of `available_bytes`
+/// Return a Memory-cap slot with at least `min_bytes` of `available_bytes`
 /// for retype.
 ///
 /// Caller passes the raw byte cost of the upcoming retype (e.g. 88 for
@@ -699,7 +699,7 @@ pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
 /// `region_pages`-page foreign-frame region (MMIO, DMA) into a
 /// retype-backed `AddressSpace`.
 ///
-/// Requests a Frame cap from memmgr (via the object slab) and retypes it
+/// Requests a Memory cap from memmgr (via the object slab) and retypes it
 /// onto the AS's PT pool with `cap_create_aspace` in augment mode, so the
 /// kernel draws the region's intermediate page tables from this
 /// caller-funded, memmgr-accounted budget rather than the fixed kernel PT
@@ -752,7 +752,7 @@ unsafe impl GlobalAlloc for System {
             // grow-increment larger than the largest existing free block;
             // anything beyond that returns null to `handle_alloc_error`.
             // Multiple grow rounds are NOT attempted: each grown page
-            // consumes one CSpace slot (procmgr's `REQUEST_FRAMES` ABI
+            // consumes one CSpace slot (procmgr's `REQUEST_MEMORY_CAPS` ABI
             // is one cap per page), and the fixed 256-slot child CSpace
             // saturates after a few hundred pages. Once that cap-transfer
             // fails, the kernel's `ipc_reply` currently leaves the caller

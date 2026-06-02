@@ -35,7 +35,7 @@ pub const MAX_IRQ_ID: u32 = 255;
 #[allow(dead_code)]
 pub const MIN_IRQ_ID: u32 = 0;
 
-/// x86-64 has I/O port space; `IoPortRange` resources are valid here.
+/// x86-64 has I/O port space; `IoPort` resources are valid here.
 #[allow(dead_code)]
 pub const HAS_IO_PORTS: bool = true;
 

@@ -35,8 +35,8 @@ mod cap;
 mod event;
 mod ipc;
 mod mm;
+mod notification;
 mod null;
-mod signal;
 mod thread;
 mod tlb;
 mod wait_set;
@@ -148,7 +148,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
 {
     null::bench_null_syscall(ctx, iters);
     ipc::bench_ipc_round_trip(ctx, iters);
-    signal::bench_signal_roundtrip(ctx, iters);
+    notification::bench_notification_roundtrip(ctx, iters);
     cap::bench_cap_create_delete(ctx, iters);
     mm::bench_mem_map_unmap(ctx, iters);
     mm::bench_mem_protect(ctx, iters);

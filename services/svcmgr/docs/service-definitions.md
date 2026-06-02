@@ -49,21 +49,21 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | Key | Required | Value |
 |---|---|---|
 | `binary` | yes | Absolute path under svcmgr's root. Walked from `system_root_cap` at launch / restart. |
-| `argv` | no | Space-separated tokens. Becomes NUL-separated, NUL-terminated bytes on the wire. |
-| `env` | no | Space-separated `KEY=VAL` tokens. Same NUL packing as `argv`. |
+| `argv` | no | Space-separated badges. Becomes NUL-separated, NUL-terminated bytes on the wire. |
+| `env` | no | Space-separated `KEY=VAL` badges. Same NUL packing as `argv`. |
 | `restart` | yes | One of `never`, `on_failure`, `always`. |
 | `critical` | yes | `yes` or `no`. Whether the system is viable without this service once it is permanently down. Orthogonal to `restart`. |
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
 | `cwd` | no | Path interpreted relative to svcmgr's universal root. Forbidden when `namespace = none`. |
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name). |
-| `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one tokened SEND per entry into the discovery registry. See [`provides`](#provides). |
+| `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 
 ## `restart`
 
 | Value | Semantics |
 |---|---|
-| `never` | Service is one-shot; never restarted, even on fault. Used for integration-test fixtures (e.g. `svctest`) whose clean exit is the success signal. |
+| `never` | Service is one-shot; never restarted, even on fault. Used for integration-test fixtures (e.g. `svctest`) whose clean exit is the success notification. |
 | `on_failure` | Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`). Clean exits are treated as intentional. |
 | `always` | Restart on every exit, clean or faulty. Default for daemons that should never terminate during normal operation. |
 
@@ -108,7 +108,7 @@ The primary lever for confining a service to only what it needs.
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported`. Default tight choice for services with no filesystem dependency. |
 | `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority (vfsd as the namespace authority, devmgr for `/dev`, procmgr for walking `/services` and `/programs`, svctest as the namespace tester). |
-| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<rights>` is a `+`-joined list of named tokens (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown tokens are parser errors. Empty rights list is a parser error. |
+| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<rights>` is a `+`-joined list of named badges (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown badges are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
 
@@ -154,12 +154,12 @@ Well-known names are centralised in
 
 | Name | Publisher (today) | Cap shape |
 |---|---|---|
-| `rootfs.root` | init Phase 3 | tokened SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
-| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-tokened SEND on pwrmgr's service endpoint |
+| `rootfs.root` | init Phase 3 | badged SEND on the root filesystem's namespace endpoint at its root directory (FS-driver-agnostic) |
+| `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) |
-| `timed` | svcmgr (`timed.svc` provider) | un-tokened SEND on timed's service endpoint (wall-clock) |
-| `svcmgr` | init Phase 3 | un-tokened SEND on svcmgr's own service endpoint |
-| `devmgr.registry` | init Phase 3 | `REGISTRY_QUERY_AUTHORITY`-tokened SEND on devmgr's registry endpoint |
+| `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) |
+| `svcmgr` | init Phase 3 | un-badged SEND on svcmgr's own service endpoint |
+| `devmgr.registry` | init Phase 3 | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint |
 
 ## `provides`
 
@@ -172,13 +172,13 @@ restarts (svcmgr holds the source), so a cached client cap survives a
 crash-restart and no re-publish is needed.
 
 Each space-separated entry is `name[:auth|:deny]`; the suffix selects the
-token svcmgr stamps on that name's SEND (the token rides through a
+badge svcmgr stamps on that name's SEND (the badge rides through a
 consumer's `QUERY_ENDPOINT` lookup unchanged):
 
-| Suffix | Token | Use |
+| Suffix | Badge | Use |
 |---|---|---|
-| *(none)* | `0` (untokened) | Plain SEND. e.g. `timed`. |
-| `:auth` | `1 << 63` | The universal verb-authority bit shared by every `*_AUTHORITY` constant — the server's `token & (1 << 63)` gate passes. e.g. `pwrmgr.shutdown:auth`. |
+| *(none)* | `0` (unbadged) | Plain SEND. e.g. `timed`. |
+| `:auth` | `1 << 63` | The universal verb-authority bit shared by every `*_AUTHORITY` constant — the server's `badge & (1 << 63)` gate passes. e.g. `pwrmgr.shutdown:auth`. |
 | `:deny` | `1` | Present so the cap resolves, but the authority gate fails. The negative-test twin. e.g. `pwrmgr.deny:deny`. |
 
 ```
@@ -202,8 +202,8 @@ death-auth source — see
 |---|---|
 | 0 | `RECV` on the master log endpoint |
 | 1 | `SEND` on the master log endpoint (single-use; `HANDOVER_PULL` only). `0` on a restart — no init-logd remains to pull from |
-| 2 | tokened `SEND` on procmgr carrying `DEATH_EQ_AUTHORITY` (logd registers per-sender death-notifications for slot reclaim) |
-| 3 | tokened `SEND` on devmgr's registry carrying `REGISTRY_QUERY_AUTHORITY` (logd resolves the serial driver via `QUERY_SERIAL_DEVICE`) |
+| 2 | badged `SEND` on procmgr carrying `DEATH_EQ_AUTHORITY` (logd registers per-sender death-notifications for slot reclaim) |
+| 3 | badged `SEND` on devmgr's registry carrying `REGISTRY_QUERY_AUTHORITY` (logd resolves the serial driver via `QUERY_SERIAL_DEVICE`) |
 
 Because these slots are svcmgr-minted, `seed` and `provides` have no
 position in the round; declaring either alongside `log_sink = yes` is a

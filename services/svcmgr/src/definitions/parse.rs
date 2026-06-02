@@ -17,15 +17,15 @@ use namespace_protocol::rights as ns_rights;
 
 use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy};
 
-/// Token stamped on an `:auth` provider SEND — the universal
+/// Badge stamped on an `:auth` provider SEND — the universal
 /// verb-authority bit (`1 << 63`), shared by every `*_AUTHORITY`
 /// constant the various services gate on.
-const PROVIDES_AUTH_TOKEN: u64 = 1 << 63;
-/// Token stamped on a `:deny` provider SEND — present so the cap
+const PROVIDES_AUTH_BADGE: u64 = 1 << 63;
+/// Badge stamped on a `:deny` provider SEND — present so the cap
 /// resolves, but lacking the authority bit, so the server's
-/// `token & (1 << 63)` gate fails. Distinct from a bare (untokened)
+/// `badge & (1 << 63)` gate fails. Distinct from a bare (unbadged)
 /// entry only in intent; both are rejected by an authority gate.
-const PROVIDES_DENY_TOKEN: u64 = 1;
+const PROVIDES_DENY_BADGE: u64 = 1;
 
 /// Reasons a `.svc` file is rejected. Stringified into the boot log so
 /// an operator can find the bad line at a glance.
@@ -201,10 +201,10 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 seen_provides = true;
                 for tok in value.split_whitespace()
                 {
-                    let (name, token) = match tok.split_once(':')
+                    let (name, badge) = match tok.split_once(':')
                     {
-                        Some((n, "auth")) => (n, PROVIDES_AUTH_TOKEN),
-                        Some((n, "deny")) => (n, PROVIDES_DENY_TOKEN),
+                        Some((n, "auth")) => (n, PROVIDES_AUTH_BADGE),
+                        Some((n, "deny")) => (n, PROVIDES_DENY_BADGE),
                         Some((_, _)) =>
                         {
                             return Err(ParseError::InvalidValue(
@@ -223,7 +223,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     }
                     provides.push(ProvidedName {
                         name: name.to_owned(),
-                        token,
+                        badge,
                     });
                 }
                 if provides.is_empty()

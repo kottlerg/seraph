@@ -6,15 +6,15 @@
 //! Seraph userspace framebuffer device driver.
 //!
 //! Spawned by devmgr with the bootloader-discovered GOP linear-
-//! framebuffer `MmioRegion` cap plus a RECV cap on its service
+//! framebuffer `Mmio` cap plus a RECV cap on its service
 //! endpoint. Owns the framebuffer end-to-end and is the sole
 //! driver-mediated sink for userspace framebuffer bytes.
 //!
 //! Two-round bootstrap (mirrors `services/drivers/virtio/blk`):
 //!   Round 1 (non-terminal): `[service_ep, mmio_cap]`
-//!   Round 2 (terminal):     `[devmgr_query_ep]` (tokened SEND for
+//!   Round 2 (terminal):     `[devmgr_query_ep]` (badged SEND for
 //!                            `QUERY_DEVICE_INFO` with this device's
-//!                            catalog index in the token)
+//!                            catalog index in the badge)
 //!
 //! After bootstrap the driver queries devmgr for its
 //! [`boot_protocol::FramebufferInfo`] (geometry: width, height,

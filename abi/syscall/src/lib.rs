@@ -62,23 +62,23 @@ pub const SYS_IPC_CALL: u64 = 0;
 pub const SYS_IPC_REPLY: u64 = 1;
 /// IPC: receive a call on an endpoint.
 pub const SYS_IPC_RECV: u64 = 2;
-/// Signal: send (OR bits into signal object).
-pub const SYS_SIGNAL_SEND: u64 = 3;
-/// Signal: wait (read-and-clear; blocks if zero).
+/// Notification: send (OR bits into notification object).
+pub const SYS_NOTIFICATION_SEND: u64 = 3;
+/// Notification: wait (read-and-clear; blocks if zero).
 ///
-/// arg0 = signal cap index (WAIT right). arg1 = `timeout_ms`: `0` means
+/// arg0 = notification cap index (WAIT right). arg1 = `timeout_ms`: `0` means
 /// block indefinitely (the only behaviour before the timeout extension);
 /// `> 0` means block until bits are delivered *or* `timeout_ms`
 /// milliseconds have elapsed, whichever comes first.
 ///
 /// On success returns `0` in the primary return register and the bitmask
 /// in the secondary register (rdx / a1); on timeout returns `0` in both
-/// (unambiguous because `signal_send` rejects zero-bit sends, so a
+/// (unambiguous because `notification_send` rejects zero-bit sends, so a
 /// legitimate wake always carries non-zero bits). The split avoids
 /// aliasing bit-63-set bitmasks with the dispatcher's negative-Err
 /// encoding — the full 64-bit bitmask range is usable. Same register
 /// layout as `SYS_EVENT_RECV`.
-pub const SYS_SIGNAL_WAIT: u64 = 4;
+pub const SYS_NOTIFICATION_WAIT: u64 = 4;
 /// `EventQueue`: post an entry.
 pub const SYS_EVENT_POST: u64 = 5;
 /// `EventQueue`: receive an entry.
@@ -93,15 +93,15 @@ pub const SYS_EVENT_POST: u64 = 5;
 ///   available"; the caller already knows which mode it asked for).
 ///
 /// On success returns `0` plus the payload in the secondary return
-/// register. Sentinel layout matches `SYS_SIGNAL_WAIT` (`0` = forever),
+/// register. Sentinel layout matches `SYS_NOTIFICATION_WAIT` (`0` = forever),
 /// but event-queue payloads may be any `u64` including 0, so the kernel
 /// uses an out-of-band `tcb.timed_out` marker instead of an in-band
 /// sentinel on the payload register.
 pub const SYS_EVENT_RECV: u64 = 6;
 /// Capability: create an `Endpoint` object.
 pub const SYS_CAP_CREATE_ENDPOINT: u64 = 7;
-/// Capability: create a `Signal` object.
-pub const SYS_CAP_CREATE_SIGNAL: u64 = 8;
+/// Capability: create a `Notification` object.
+pub const SYS_CAP_CREATE_NOTIFICATION: u64 = 8;
 /// Capability: create an `EventQueue` object.
 pub const SYS_CAP_CREATE_EVENT_Q: u64 = 9;
 /// Capability: create a `Thread` object.
@@ -116,7 +116,7 @@ pub const SYS_CAP_CREATE_WAIT_SET: u64 = 13;
 pub const SYS_CAP_DERIVE: u64 = 14;
 /// Capability: revoke a capability and all descendants.
 pub const SYS_CAP_REVOKE: u64 = 15;
-/// Memory: map a Frame into an address space.
+/// Memory: map a Memory cap into an address space.
 pub const SYS_MEM_MAP: u64 = 16;
 /// Memory: unmap a region from an address space.
 pub const SYS_MEM_UNMAP: u64 = 17;
@@ -132,7 +132,15 @@ pub const SYS_THREAD_YIELD: u64 = 21;
 pub const SYS_THREAD_EXIT: u64 = 22;
 /// Thread: configure (set entry, stack, arg).
 pub const SYS_THREAD_CONFIGURE: u64 = 23;
-/// Capability: copy a slot.
+/// Capability: copy a slot into another `CSpace`.
+///
+/// arg0 = source slot index (caller's `CSpace`).
+/// arg1 = destination `CSpace` cap index (must have INSERT right).
+/// arg2 = destination slot index, or `0` to let the kernel allocate a free slot
+///        (slot 0 is permanently null, so it is a safe "kernel picks" sentinel).
+/// arg3 = rights mask (subset of source rights).
+///
+/// Returns the destination slot index.
 pub const SYS_CAP_COPY: u64 = 24;
 /// Capability: move a slot (destroying the source).
 pub const SYS_CAP_MOVE: u64 = 25;
@@ -144,22 +152,21 @@ pub const SYS_WAIT_SET_REMOVE: u64 = 27;
 pub const SYS_WAIT_SET_WAIT: u64 = 28;
 /// IRQ: acknowledge a delivered interrupt.
 pub const SYS_IRQ_ACK: u64 = 29;
-/// IRQ: register a signal to receive interrupt notifications.
+/// IRQ: register a notification to receive interrupt notifications.
 pub const SYS_IRQ_REGISTER: u64 = 30;
 /// Capability: delete a slot.
 pub const SYS_CAP_DELETE: u64 = 31;
-/// Capability: insert an object into a specific slot.
-pub const SYS_CAP_INSERT: u64 = 32;
-/// Frame: split a large frame into smaller ones.
-pub const SYS_FRAME_SPLIT: u64 = 33;
+// 32 reserved (was SYS_CAP_INSERT, merged into SYS_CAP_COPY's dest-slot arg).
+/// Memory: split a large Memory cap into smaller ones.
+pub const SYS_MEMORY_SPLIT: u64 = 33;
 /// Memory: map an MMIO region.
 pub const SYS_MMIO_MAP: u64 = 34;
-/// I/O: bind an `IoPortRange` to the calling thread.
+/// I/O: bind an `IoPort` to the calling thread.
 pub const SYS_IOPORT_BIND: u64 = 35;
 /// Capability: read-only inspection of a cap's runtime state.
 ///
 /// Returns a discriminated union keyed by `CapTag`:
-/// - `Frame` → `(size_bytes, available_bytes, has_retype_right)`
+/// - `Memory` → `(size_bytes, available_bytes, has_retype_right)`
 /// - `AddressSpace` → `(pt_growth_budget_bytes)`
 /// - `CSpace` → `(slot_capacity, slots_used, growth_budget_bytes)`
 /// - all other tags → `(tag, rights)` only
@@ -195,23 +202,23 @@ pub const SYS_CAP_INFO: u64 = 36;
 /// ```
 pub const CAP_INFO_TAG_RIGHTS: u64 = 0;
 
-/// `Frame` only — total byte size of the frame region.
+/// `Memory` only — total byte size of the memory region.
 ///
-/// Returns `FrameObject::size`. Calling on a non-Frame slot returns
+/// Returns `MemoryObject::size`. Calling on a non-Memory slot returns
 /// [`SyscallError::InvalidArgument`].
-pub const CAP_INFO_FRAME_SIZE: u64 = 1;
+pub const CAP_INFO_MEMORY_SIZE: u64 = 1;
 
-/// `Frame` only — bytes still available to retype or map from this frame.
+/// `Memory` only — bytes still available to retype or map from this cap.
 ///
-/// Returns the current value of `FrameObject::available_bytes`. Calling on
-/// a non-Frame slot returns [`SyscallError::InvalidArgument`].
-pub const CAP_INFO_FRAME_AVAILABLE: u64 = 2;
+/// Returns the current value of `MemoryObject::available_bytes`. Calling on
+/// a non-Memory slot returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_MEMORY_AVAILABLE: u64 = 2;
 
-/// `Frame` only — `1` if the cap holds the `RETYPE` right, otherwise `0`.
+/// `Memory` only — `1` if the cap holds the `RETYPE` right, otherwise `0`.
 ///
-/// Returns `1` or `0`. Calling on a non-Frame slot returns
+/// Returns `1` or `0`. Calling on a non-Memory slot returns
 /// [`SyscallError::InvalidArgument`].
-pub const CAP_INFO_FRAME_HAS_RETYPE: u64 = 3;
+pub const CAP_INFO_MEMORY_HAS_RETYPE: u64 = 3;
 
 /// `AddressSpace` only — bytes available to back new intermediate page-table pages.
 ///
@@ -237,13 +244,13 @@ pub const CAP_INFO_CSPACE_USED: u64 = 6;
 /// Calling on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_CSPACE_BUDGET: u64 = 7;
 
-/// `Frame` only — physical base address of the frame region.
+/// `Memory` only — physical base address of the memory region.
 ///
-/// Returns `FrameObject::base`. Calling on a non-Frame slot returns
+/// Returns `MemoryObject::base`. Calling on a non-Memory slot returns
 /// [`SyscallError::InvalidArgument`]. Used by memmgr to track contiguity
-/// when ingesting Frame caps it did not itself mint (e.g., boot-module
-/// caps donated through `memmgr_labels::DONATE_FRAMES`).
-pub const CAP_INFO_FRAME_PHYS_BASE: u64 = 8;
+/// when ingesting Memory caps it did not itself mint (e.g., boot-module
+/// caps donated through `memmgr_labels::DONATE_MEMORY_CAPS`).
+pub const CAP_INFO_MEMORY_PHYS_BASE: u64 = 8;
 
 /// `Thread` only — kernel-authoritative lifecycle snapshot.
 ///
@@ -284,8 +291,8 @@ pub const CAP_INFO_TLB_PERFORMED: u64 = 11;
 // extract the tag from a [`CAP_INFO_TAG_RIGHTS`] result. Only the variants
 // userspace currently needs to identify are exposed.
 
-/// `CapTag::Frame` discriminant.
-pub const CAP_TAG_FRAME: u8 = 1;
+/// `CapTag::Memory` discriminant.
+pub const CAP_TAG_MEMORY: u8 = 1;
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;
 /// Thread: set CPU affinity.
@@ -302,19 +309,19 @@ pub const SYS_IPC_BUFFER_SET: u64 = 42;
 pub const SYS_SYSTEM_INFO: u64 = 43;
 /// SBI: forward an SBI call to M-mode firmware (RISC-V only).
 pub const SYS_SBI_CALL: u64 = 44;
-/// Split an `MmioRegion` cap into two non-overlapping children.
+/// Split an `Mmio` cap into two non-overlapping children.
 pub const SYS_MMIO_SPLIT: u64 = 45;
 /// Sleep the calling thread for a specified number of milliseconds.
 pub const SYS_THREAD_SLEEP: u64 = 46;
 /// Bind a death notification `EventQueue` to a thread.
 pub const SYS_THREAD_BIND_NOTIFICATION: u64 = 47;
-/// Capability: derive with an attached token value.
-pub const SYS_CAP_DERIVE_TOKEN: u64 = 48;
+/// Capability: derive with an attached badge value.
+pub const SYS_CAP_DERIVE_BADGE: u64 = 48;
 /// Split an `Interrupt` range cap into two non-overlapping children.
 pub const SYS_IRQ_SPLIT: u64 = 49;
-/// Merge two adjacent sibling Frame caps into one covering both ranges.
-pub const SYS_FRAME_MERGE: u64 = 50;
-/// Split an `IoPortRange` cap into two non-overlapping children (`x86_64` only).
+/// Merge two adjacent sibling Memory caps into one covering both ranges.
+pub const SYS_MEMORY_MERGE: u64 = 50;
+/// Split an `IoPort` cap into two non-overlapping children (`x86_64` only).
 pub const SYS_IOPORT_SPLIT: u64 = 51;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
@@ -416,7 +423,7 @@ pub const MAP_READONLY: u64 = 0;
 /// Mapping protection: explicit read-only. Bit 0, matching the kernel
 /// `Rights::READ` layout.
 ///
-/// Unlike `MAP_READONLY` (= 0, which derives permissions from the Frame
+/// Unlike `MAP_READONLY` (= 0, which derives permissions from the Memory
 /// cap's rights), this nonzero value forces a read-only mapping regardless
 /// of the cap's WRITE/EXECUTE rights, so a full-rights cap can be mapped
 /// read-only without first deriving a narrowed child cap. W^X holds
@@ -440,13 +447,13 @@ pub const RIGHTS_RECEIVE: u64 = 1 << 5;
 /// Send + grant: may call and include capabilities in messages.
 pub const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
 
-/// Frame: map read-only.
+/// Memory: map read-only.
 pub const RIGHTS_MAP_READ: u64 = 1 << 0;
 
-/// Frame: map read-write.
+/// Memory: map read-write.
 pub const RIGHTS_MAP_RW: u64 = (1 << 0) | (1 << 1);
 
-/// Frame: map read-execute.
+/// Memory: map read-execute.
 pub const RIGHTS_MAP_RX: u64 = (1 << 0) | (1 << 2);
 
 /// Thread: full control (start, stop, configure, observe).
@@ -455,10 +462,10 @@ pub const RIGHTS_THREAD: u64 = (1 << 11) | (1 << 12);
 /// `CSpace`: full management (insert, delete, derive, revoke).
 pub const RIGHTS_CSPACE: u64 = (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
 
-/// Frame: authority to retype memory into kernel objects.
+/// Memory: authority to retype memory into kernel objects.
 ///
-/// Held by RAM Frame caps minted from buddy at boot; never held by firmware-
-/// table / boot-module / init-segment Frame caps. Required by every retype-
+/// Held by RAM Memory caps minted from buddy at boot; never held by firmware-
+/// table / boot-module / init-segment Memory caps. Required by every retype-
 /// consuming syscall.
 pub const RIGHTS_RETYPE: u64 = 1 << 21;
 
@@ -496,14 +503,14 @@ pub const EXIT_FAULT_BASE: u64 = 0x1000;
 /// patch = version & 0xFFFF
 /// ```
 ///
-/// The version is `0.0.1` during initial kernel development. Major will remain
+/// The version is `0.0.2` during initial kernel development. Major will remain
 /// `0` until the kernel reaches a meaningful level of completeness; during this
 /// phase all ABI changes are considered fully fluid regardless of minor/patch.
 // Encode as (major << 32) | (minor << 16) | patch. The zero shifts are retained
 // to preserve the positional structure; they will carry non-zero values when
 // the ABI stabilises.
 #[allow(clippy::identity_op, clippy::eq_op)]
-pub const KERNEL_VERSION: u64 = (0u64 << 32) | (0u64 << 16) | 1u64; // 0.0.1
+pub const KERNEL_VERSION: u64 = (0u64 << 32) | (0u64 << 16) | 2u64; // 0.0.2
 
 /// Discriminant for `SYS_SYSTEM_INFO` queries.
 ///

@@ -13,7 +13,7 @@ security-relevant code path.
 
 This crate is authoritative for the **wire format and dispatch
 semantics** of the `NS_*` namespace protocol — labels, request and
-reply layouts, error codes, name rules, token shape, and rights
+reply layouts, error codes, name rules, badge shape, and rights
 composition.
 
 The high-level capability model (cap-as-namespace, sandboxing,
@@ -44,10 +44,10 @@ reply label; success replies use label `0`.
 
 ---
 
-## Token shape
+## Badge shape
 
-Every node capability is a tokened SEND on a server's namespace
-endpoint. The token is opaque to the kernel; servers decode it on
+Every node capability is a badged SEND on a server's namespace
+endpoint. The badge is opaque to the kernel; servers decode it on
 every request. Layout (low-to-high):
 
 | Bits | Field | Meaning |
@@ -58,14 +58,14 @@ every request. Layout (low-to-high):
 `node_id == 0` is conventionally the server's root directory. [`pack`]
 and [`unpack`] are the canonical conversions. Backends that need more
 than 2^40 distinct nodes per server lifetime MUST split into multiple
-servers; the protocol does not provide token expansion.
+servers; the protocol does not provide badge expansion.
 
 ---
 
 ## NS_LOOKUP
 
 Walk one component within the directory addressed by the caller's
-token.
+badge.
 
 **Request**
 
@@ -84,13 +84,13 @@ token.
 | `label` | `0` |
 | `data[0]` | Entry kind: `0 = File`, `1 = Dir` |
 | `data[1]` | Cached size hint in bytes (zero for directories) |
-| `caps[0]` | Tokened SEND on the owning server's namespace endpoint |
+| `caps[0]` | Badged SEND on the owning server's namespace endpoint |
 
 **Reply (error)** — label is the matching [`NsError`] code (no caps).
 
 The server MUST:
 
-1. Reject with `PermissionDenied` if the caller's token lacks the
+1. Reject with `PermissionDenied` if the caller's badge lacks the
    `LOOKUP` rights bit.
 2. Reject with `InvalidName` if the requested name fails
    [`validate_name`].
@@ -101,7 +101,7 @@ The server MUST:
 5. Compute returned rights as
    `parent_rights ∩ entry.max_rights ∩ caller_requested`.
 6. Mint the child cap from the server's namespace endpoint via
-   `cap_derive_token` for [`EntryTarget::Local`], or via `cap_derive`
+   `cap_derive_badge` for [`EntryTarget::Local`], or via `cap_derive`
    of a stored cap for [`EntryTarget::External`] (mount points and
    other cross-server entries).
 
@@ -112,7 +112,7 @@ backends own only the storage lookup.
 
 ## NS_STAT
 
-Attribute snapshot for the node addressed by the caller's token.
+Attribute snapshot for the node addressed by the caller's badge.
 
 **Request**
 
@@ -132,7 +132,7 @@ Attribute snapshot for the node addressed by the caller's token.
 
 **Reply (error)** — label is the matching [`NsError`] code.
 
-The server MUST reject with `PermissionDenied` if the caller's token
+The server MUST reject with `PermissionDenied` if the caller's badge
 lacks the `STAT` rights bit.
 
 ---
@@ -167,7 +167,7 @@ two protocols.
 
 **Reply (error)** — label is the matching [`NsError`] code.
 
-The server MUST reject with `PermissionDenied` if the caller's token
+The server MUST reject with `PermissionDenied` if the caller's badge
 lacks the `READDIR` rights bit.
 
 `NS_READDIR` returns names only; clients follow up with `NS_LOOKUP`
@@ -197,7 +197,7 @@ limits, case-sensitivity rules); such restrictions surface as
 
 ## Rights
 
-Namespace rights are a 24-bit mask packed in token bits 40..64. Eight
+Namespace rights are a 24-bit mask packed in badge bits 40..64. Eight
 bits are defined; sixteen are reserved.
 
 | Bit | Constant | Meaning |
@@ -205,7 +205,7 @@ bits are defined; sixteen are reserved.
 | 0 | `LOOKUP` | `NS_LOOKUP` into this directory |
 | 1 | `READDIR` | `NS_READDIR` enumeration |
 | 2 | `STAT` | `NS_STAT` |
-| 3 | `READ` | `NS_READ` / `NS_READ_FRAME` (file) |
+| 3 | `READ` | `NS_READ` / `NS_READ_MEMORY` (file) |
 | 4 | `WRITE` | `NS_WRITE` (deferred; reserved) |
 | 5 | `EXEC` | File is executable; consumed by ELF loaders |
 | 6 | `MUTATE_DIR` | `NS_CREATE` / `NS_UNLINK` (deferred; reserved) |
@@ -226,14 +226,14 @@ this through the intersection at step 5 of `NS_LOOKUP`.
 | Code | Variant | Meaning |
 |---:|---|---|
 | 1 | `NotFound` | Name absent or hidden by visibility |
-| 2 | `PermissionDenied` | Caller's token lacks the required right |
+| 2 | `PermissionDenied` | Caller's badge lacks the required right |
 | 3 | `NotADirectory` | Operation requires a directory; node is a file |
 | 4 | `IsADirectory` | Operation requires a file; node is a directory |
 | 5 | `InvalidName` | Name failed [`validate_name`] |
 | 6 | `InvalidOffset` | Read past EOF |
-| 7 | `InvalidFrameCap` | `NS_READ_FRAME` reply target frame-cap shape wrong |
-| 8 | `InvalidCookie` | Frame-cap cookie zero or duplicate |
-| 9 | `Evicted` | Frame referenced by a held cookie has been evicted |
+| 7 | `InvalidMemoryCap` | `NS_READ_MEMORY` reply target Memory-cap shape wrong |
+| 8 | `InvalidCookie` | Memory-cap cookie zero or duplicate |
+| 9 | `Evicted` | Page referenced by a held cookie has been evicted |
 | 10 | `IoError` | Backend storage failed |
 | 11 | `NotSupported` | Operation not implemented on this server |
 | 12 | `OutOfResources` | Server resource exhaustion |
@@ -257,11 +257,11 @@ filtering — backends never re-implement those checks.
 | `readdir_entry` | `NS_READDIR` |
 | `stat` | `NS_STAT` |
 | `read_inline` | future `NS_READ` |
-| `read_frame` | future `NS_READ_FRAME` |
-| `release_frame` | future `NS_RELEASE_FRAME` |
+| `read_memory` | future `NS_READ_MEMORY` |
+| `release_memory` | future `NS_RELEASE_MEMORY` |
 | `close` | future `NS_CLOSE` (best-effort cleanup hint) |
 
-Frame-cap reads continue to use the [`ipc::fs_labels::FS_READ_FRAME`]
+Memory-cap reads continue to use the [`ipc::fs_labels::FS_READ_MEMORY`]
 surface today; they are documented in
 [`services/fs/docs/fs-driver-protocol.md`](../../services/fs/docs/fs-driver-protocol.md).
 Migration of the read surface to `NS_*` labels is a follow-up phase.
@@ -285,7 +285,7 @@ describes vfsd's synthetic-root composition in detail.
 | Document | Content |
 |---|---|
 | [docs/namespace-model.md](../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing, visibility |
-| [docs/capability-model.md](../../docs/capability-model.md) | Token semantics, derivation tree |
+| [docs/capability-model.md](../../docs/capability-model.md) | Badge semantics, derivation tree |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC message format |
 | [services/fs/docs/fs-driver-protocol.md](../../services/fs/docs/fs-driver-protocol.md) | Surviving fs-driver-specific labels |
 | [services/vfsd/docs/namespace-composition.md](../../services/vfsd/docs/namespace-composition.md) | vfsd's synthetic root and root-mount delegation |

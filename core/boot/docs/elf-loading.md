@@ -155,8 +155,8 @@ module, the bootloader's bundle walker:
 
 Bundle bodies are 4 KiB-aligned per `BODY_ALIGNMENT`, so
 `physical_base` is page-aligned and a downstream consumer that needs
-a page-rounded allocation (the kernel's `mint_module_frame_caps`,
-which rounds `size` up to the next page boundary for the Frame cap)
+a page-rounded allocation (the kernel's `mint_module_memory_caps`,
+which rounds `size` up to the next page boundary for the Memory cap)
 does not need to copy or relocate bytes. Init receives the module
 slice via its initial `CSpace` and is responsible for validating and
 starting each service.

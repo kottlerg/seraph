@@ -14,7 +14,7 @@
 //! function calls `thread_exit()`.
 //!
 //! The `write_regs_resume` test redirects a stopped child's instruction
-//! pointer to a second entry point (`phase2_entry`). To hand the signal cap
+//! pointer to a second entry point (`phase2_entry`). To hand the notification cap
 //! to phase2 without relying on an argument register (which RISC-V's syscall
 //! return path clobbers in `a0`), the cap slot is stored in `PHASE2_SIG`
 //! before resuming. See the comment on that static for details.
@@ -22,20 +22,20 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
-    cap_copy, cap_create_signal, cap_delete, event_queue_create, event_recv, signal_send,
-    signal_wait, signal_wait_timeout, system_info, thread_bind_notification, thread_configure,
-    thread_exit, thread_read_regs, thread_set_affinity, thread_set_priority, thread_sleep,
-    thread_start, thread_stop, thread_write_regs,
+    cap_copy, cap_create_notification, cap_delete, event_queue_create, event_recv,
+    notification_send, notification_wait, notification_wait_timeout, system_info,
+    thread_bind_notification, thread_configure, thread_exit, thread_read_regs, thread_set_affinity,
+    thread_set_priority, thread_sleep, thread_start, thread_stop, thread_write_regs,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult};
 
-// SIGNAL = bit 7, WAIT = bit 8. Tests that pin a child in signal_wait give
-// the child SIGNAL on the readiness cap and WAIT on a *separate* blocking
+// NOTIFY = bit 7, WAIT = bit 8. Tests that pin a child in notification_wait give
+// the child NOTIFY on the readiness cap and WAIT on a *separate* blocking
 // cap, so the child cannot self-deliver its own readiness send before the
 // parent has registered as the waiter.
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 const RIGHTS_WAIT: u64 = 1 << 8;
 
 // Expected TrapFrame size per architecture (kernel/src/arch/*/trap_frame.rs).
@@ -76,7 +76,7 @@ static mut STACK_BALANCE_SPINNERS: [ChildStack; BALANCE_MAX_SPINNERS] = [
 /// every iteration; the parent reads this to detect migration.
 static MIGRATE_OBSERVED_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Signals the migration spinner to exit cleanly once the parent has
+/// Notifications the migration spinner to exit cleanly once the parent has
 /// observed the migration.
 static MIGRATE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
 
@@ -97,7 +97,7 @@ static BALANCE_OBSERVED_CPU: [AtomicU32; BALANCE_MAX_SPINNERS] = [
 /// Set when the parent wants the balancer spinners to exit.
 static BALANCE_SHOULD_EXIT: AtomicU32 = AtomicU32::new(0);
 
-/// Signal cap slot passed to `phase2_entry` via a static rather than a
+/// Notification cap slot passed to `phase2_entry` via a static rather than a
 /// register argument.
 ///
 /// On RISC-V, `a0` is both the first function argument AND the syscall
@@ -115,18 +115,18 @@ static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 /// The child signals 0xBEEF back to confirm it executed.
 pub fn configure_start(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for configure_start failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for configure_start failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::configure_start: spawn::new_child failed")?;
-    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for configure_start failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE));
     crate::spawn::configure_and_start(&child, sender_entry, stack_top, u64::from(child_sig))
         .map_err(|_| "thread::configure_start: configure_and_start failed")?;
 
-    let bits = signal_wait(sig).map_err(|_| "signal_wait after thread_start failed")?;
+    let bits = notification_wait(sig).map_err(|_| "notification_wait after thread_start failed")?;
     if bits != 0xBEEF
     {
         return Err("thread did not send expected bits (expected 0xBEEF)");
@@ -152,18 +152,18 @@ pub fn r#yield(_ctx: &TestContext) -> TestResult
 /// `thread_stop` transitions a running/blocked thread to Stopped; `thread_read_regs`
 /// returns the thread's register file.
 ///
-/// The child signals readiness (0x1) then blocks in `signal_wait` to provide a
+/// The child signals readiness (0x1) then blocks in `notification_wait` to provide a
 /// stable `TrapFrame`. The parent stops it and reads registers.
 pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 {
     const BUF_SIZE: usize = 512; // Larger than any architecture's TrapFrame.
-    let ready = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal (ready) for stop_read_regs failed")?;
-    let block = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal (block) for stop_read_regs failed")?;
+    let ready = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification (ready) for stop_read_regs failed")?;
+    let block = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification (block) for stop_read_regs failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::stop_read_regs: spawn::new_child failed")?;
-    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy (ready) for stop_read_regs failed")?;
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for stop_read_regs failed")?;
@@ -173,8 +173,9 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
         .map_err(|_| "thread::stop_read_regs: configure_and_start failed")?;
 
-    // Wait for the child to signal readiness then enter its blocking signal_wait.
-    let ready_bits = signal_wait(ready).map_err(|_| "signal_wait (readiness) failed")?;
+    // Wait for the child to signal readiness then enter its blocking notification_wait.
+    let ready_bits =
+        notification_wait(ready).map_err(|_| "notification_wait (readiness) failed")?;
     if ready_bits != 0x1
     {
         return Err("child sent wrong readiness bits (expected 0x1)");
@@ -216,13 +217,13 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 /// Stopping an already-stopped thread returns `InvalidState`.
 pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 {
-    let ready = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal (ready) for double-stop test failed")?;
-    let block = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal (block) for double-stop test failed")?;
+    let ready = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification (ready) for double-stop test failed")?;
+    let block = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification (block) for double-stop test failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::stop_again_invalid_state: spawn::new_child failed")?;
-    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy (ready) for double-stop test failed")?;
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for double-stop test failed")?;
@@ -234,7 +235,7 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
         .map_err(|_| "thread::stop_again_invalid_state: configure_and_start failed")?;
 
-    let _ = signal_wait(ready); // Wait for readiness signal.
+    let _ = notification_wait(ready); // Wait for readiness notification.
     thread_stop(child.th).map_err(|_| "first thread_stop failed")?;
 
     // Second stop on a Stopped thread must return InvalidState.
@@ -256,18 +257,18 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 /// `thread_write_regs` modifies a stopped thread's register state; `thread_start`
 /// resumes it at the new instruction pointer.
 ///
-/// The child is stopped while blocked in `signal_wait`. Its IP is redirected to
+/// The child is stopped while blocked in `notification_wait`. Its IP is redirected to
 /// `phase2_entry`. On resume, phase2 reads `PHASE2_SIG` and sends 0x2.
 pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 {
     const BUF_SIZE: usize = 512;
-    let ready = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal (ready) for write_regs_resume failed")?;
-    let block = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal (block) for write_regs_resume failed")?;
+    let ready = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification (ready) for write_regs_resume failed")?;
+    let block = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification (block) for write_regs_resume failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::write_regs_resume: spawn::new_child failed")?;
-    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy (ready) for write_regs_resume failed")?;
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for write_regs_resume failed")?;
@@ -278,10 +279,10 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::write_regs_resume: configure_and_start failed")?;
 
     // Wait for readiness then stop while the child is blocked.
-    let _ = signal_wait(ready);
+    let _ = notification_wait(ready);
     thread_stop(child.th).map_err(|_| "thread_stop for write_regs_resume failed")?;
 
-    // Publish the signal cap phase2_entry will send through.
+    // Publish the notification cap phase2_entry will send through.
     PHASE2_SIG.store(child_ready, Ordering::Release);
 
     let mut reg_buf = [0u8; BUF_SIZE];
@@ -299,7 +300,8 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
     // so the resume calls `thread_start` directly.
     thread_start(child.th).map_err(|_| "thread_start (resume) for write_regs_resume failed")?;
 
-    let bits = signal_wait(ready).map_err(|_| "signal_wait for phase2 confirmation failed")?;
+    let bits =
+        notification_wait(ready).map_err(|_| "notification_wait for phase2 confirmation failed")?;
     if bits != 0x2
     {
         return Err("phase2_entry did not send expected value 0x2 after write_regs resume");
@@ -418,17 +420,17 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 
 /// `thread_configure` on a thread that is already Running or Blocked must fail.
 ///
-/// The child signals readiness then blocks in `signal_wait`, giving the parent
+/// The child signals readiness then blocks in `notification_wait`, giving the parent
 /// a stable point at which the thread is no longer in `Created` state.
 pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 {
-    let ready = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal (ready) for configure_running_thread_err failed")?;
-    let block = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal (block) for configure_running_thread_err failed")?;
+    let ready = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification (ready) for configure_running_thread_err failed")?;
+    let block = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification (block) for configure_running_thread_err failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::configure_running_thread_err: spawn::new_child failed")?;
-    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy (ready) for configure_running_thread_err failed")?;
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for configure_running_thread_err failed")?;
@@ -439,7 +441,7 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::configure_running_thread_err: configure_and_start failed")?;
 
     // Wait for the child to signal readiness (it is now Running or Blocked).
-    signal_wait(ready).map_err(|_| "signal_wait for readiness failed")?;
+    notification_wait(ready).map_err(|_| "notification_wait for readiness failed")?;
 
     // Attempting to configure a non-Created thread must fail. The helper is
     // single-shot for the started-from-Created path; re-configuring uses the
@@ -519,11 +521,11 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for affinity_bind_cpu1 failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for affinity_bind_cpu1 failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_bind_cpu1: spawn::new_child failed")?;
-    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_bind_cpu1 failed")?;
 
     // Bind to CPU 1 before starting.
@@ -537,7 +539,8 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
     )
     .map_err(|_| "thread::affinity_bind_cpu1: configure_and_start_pinned failed")?;
 
-    let bits = signal_wait(sig).map_err(|_| "signal_wait for affinity_bind_cpu1 failed")?;
+    let bits =
+        notification_wait(sig).map_err(|_| "notification_wait for affinity_bind_cpu1 failed")?;
     if bits != 0xC1A1
     {
         return Err("affinity thread did not send expected bits (expected 0xC1A1)");
@@ -572,11 +575,11 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
 ///
 /// Together these make `sys_thread_set_affinity` deterministically observe
 /// `state == Ready` for T on CPU 0, exercising `migrate_ready_thread`. When
-/// the parent then blocks in `signal_wait`, CPU 1 picks T (its only Ready
+/// the parent then blocks in `notification_wait`, CPU 1 picks T (its only Ready
 /// thread) and T reports CPU 1.
 ///
 /// T reports the CPU it actually ran on via `SystemInfoType::CurrentCpu`,
-/// encoded in the signal value. Without active migration, T would stay on
+/// encoded in the notification value. Without active migration, T would stay on
 /// CPU 0's run queue and report CPU 0 instead, failing the test.
 ///
 /// Requires SMP; skips otherwise.
@@ -610,11 +613,11 @@ pub fn affinity_migrate_ready_queued(ctx: &TestContext) -> TestResult
 
 fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for affinity_migrate_ready_queued failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for affinity_migrate_ready_queued failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_migrate_ready_queued: spawn::new_child failed")?;
-    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_migrate_ready_queued failed")?;
 
     // Priority 1 (strict-lower than the parent's INIT_PRIORITY of 15) so
@@ -644,20 +647,20 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
     thread_set_affinity(child.th, 1)
         .map_err(|_| "active migration thread_set_affinity(1) failed")?;
 
-    // Block on the signal: parent leaves CPU 0, CPU 1 runs T which reports
-    // its actual CPU id back through the signal bits. `report_cpu_entry`
+    // Block on the notification: parent leaves CPU 0, CPU 1 runs T which reports
+    // its actual CPU id back through the notification bits. `report_cpu_entry`
     // encodes the CPU id as `1u64.wrapping_shl(cpu)` (always non-zero by
     // the modulo-64 shift semantics) so any missed wake — including a
     // `cpu == 0` report from an unexpected stale-CPU run — surfaces as a
-    // deterministic test FAIL instead of a HANG. `signal_send(sig, 0)`
+    // deterministic test FAIL instead of a HANG. `notification_send(sig, 0)`
     // would be rejected and the parent would park indefinitely (see
     // issue #116). The 5 s timeout is a defensive backstop against any
     // other missed-wake mode.
-    let bits = signal_wait_timeout(sig, 5_000)
-        .map_err(|_| "signal_wait for affinity_migrate_ready_queued failed")?;
+    let bits = notification_wait_timeout(sig, 5_000)
+        .map_err(|_| "notification_wait for affinity_migrate_ready_queued failed")?;
     if bits == 0
     {
-        return Err("affinity_migrate_ready_queued timed out — child never signaled");
+        return Err("affinity_migrate_ready_queued timed out — child never notified");
     }
     if bits != (1u64 << 1)
     {
@@ -696,11 +699,11 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     MIGRATE_OBSERVED_CPU.store(u32::MAX, Ordering::Relaxed);
     MIGRATE_SHOULD_EXIT.store(0, Ordering::Relaxed);
 
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for affinity_migrate_running failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for affinity_migrate_running failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_migrate_running: spawn::new_child failed")?;
-    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_migrate_running failed")?;
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_RUNNING));
@@ -742,9 +745,9 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
         }
     }
 
-    // Tell T to exit and wait for the exit signal.
+    // Tell T to exit and wait for the exit notification.
     MIGRATE_SHOULD_EXIT.store(1, Ordering::Relaxed);
-    signal_wait(sig).map_err(|_| "signal_wait for migrate_spinner exit failed")?;
+    notification_wait(sig).map_err(|_| "notification_wait for migrate_spinner exit failed")?;
 
     cap_delete(child.th).map_err(|_| "cap_delete th after affinity_migrate_running failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after affinity_migrate_running failed")?;
@@ -756,7 +759,7 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
 
 /// Helper: spawn `n` CPU-bound spinners, initially pinned to `initial_cpu`,
 /// then change each one's affinity to `final_affinity`. Returns the
-/// (thread, cspace, signal) cap triples for cleanup.
+/// (thread, cspace, notification) cap triples for cleanup.
 ///
 /// Each spinner publishes its current CPU into `BALANCE_OBSERVED_CPU[i]`
 /// on every loop iteration and exits when `BALANCE_SHOULD_EXIT` is set.
@@ -773,11 +776,11 @@ fn balance_spawn_spinners(
     for i in 0..n
     {
         BALANCE_OBSERVED_CPU[i].store(u32::MAX, Ordering::Relaxed);
-        let sig = cap_create_signal(ctx.memory_frame_base)
-            .map_err(|_| "balance: cap_create_signal failed")?;
+        let sig = cap_create_notification(ctx.memory_base)
+            .map_err(|_| "balance: cap_create_notification failed")?;
         let child = crate::spawn::new_child(ctx).map_err(|_| "balance: spawn::new_child failed")?;
         let child_sig =
-            cap_copy(sig, child.cs, RIGHTS_SIGNAL).map_err(|_| "balance: cap_copy failed")?;
+            cap_copy(sig, child.cs, RIGHTS_NOTIFY).map_err(|_| "balance: cap_copy failed")?;
 
         // Initial pinning to `initial_cpu` forces the first enqueue there.
         // SAFETY: per-spinner stack slot, no aliasing.
@@ -808,14 +811,14 @@ fn balance_spawn_spinners(
 }
 
 /// Helper: tear down the spinners spawned by `balance_spawn_spinners`.
-/// Signals exit, drains each thread's `signal_send`, and deletes the caps.
+/// Notifications exit, drains each thread's `notification_send`, and deletes the caps.
 fn balance_teardown(triples: &[(u32, u32, u32); BALANCE_MAX_SPINNERS], n: usize) -> TestResult
 {
     BALANCE_SHOULD_EXIT.store(1, Ordering::Relaxed);
     for &(_, _, sig) in triples.iter().take(n)
     {
         // Each spinner sends 0xC0FE before exiting.
-        signal_wait(sig).map_err(|_| "balance: signal_wait teardown failed")?;
+        notification_wait(sig).map_err(|_| "balance: notification_wait teardown failed")?;
     }
     BALANCE_SHOULD_EXIT.store(0, Ordering::Relaxed);
     for &(th, cs, sig) in triples.iter().take(n)
@@ -938,7 +941,7 @@ pub fn load_balancer_skips_pinned(ctx: &TestContext) -> TestResult
 ///
 /// Phase D routes threads to their affinity CPU via `select_target_cpu`.
 /// This test verifies that threads with affinity set to CPU 1 can start,
-/// execute, and signal back to the parent. This confirms basic Phase D
+/// execute, and notification back to the parent. This confirms basic Phase D
 /// affinity routing without requiring a `CurrentCpu` syscall variant.
 ///
 /// Skips if only one CPU is online (requires SMP).
@@ -953,11 +956,11 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for affinity_respected failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for affinity_respected failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_respected: spawn::new_child failed")?;
-    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_respected failed")?;
 
     // Bind to CPU 1 before starting.
@@ -972,7 +975,8 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
     .map_err(|_| "thread::affinity_respected: configure_and_start_pinned failed")?;
 
     // If the thread successfully signals back, affinity routing worked.
-    let bits = signal_wait(sig).map_err(|_| "signal_wait for affinity_respected failed")?;
+    let bits =
+        notification_wait(sig).map_err(|_| "notification_wait for affinity_respected failed")?;
     if bits != 0xC1A1
     {
         return Err("affinity thread did not send expected bits (expected 0xC1A1)");
@@ -1006,11 +1010,11 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "create_signal for default_affinity_bsp failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for default_affinity_bsp failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::default_affinity_bsp: spawn::new_child failed")?;
-    let child_sig = cap_copy(sig, child.cs, RIGHTS_SIGNAL)
+    let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for default_affinity_bsp failed")?;
 
     // Do NOT set affinity — leave it at default (AFFINITY_ANY).
@@ -1021,7 +1025,8 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::default_affinity_bsp: configure_and_start failed")?;
 
     // If the thread successfully signals back, default affinity routing worked.
-    let bits = signal_wait(sig).map_err(|_| "signal_wait for default_affinity_bsp failed")?;
+    let bits =
+        notification_wait(sig).map_err(|_| "notification_wait for default_affinity_bsp failed")?;
     if bits != 0xBEEF
     {
         return Err("default affinity thread did not send expected bits (expected 0xBEEF)");
@@ -1038,12 +1043,12 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
 /// Affinity test sender: sends 0xC1A1 and exits.
 ///
 /// Used by [`affinity_bind_cpu1`] — the child is bound to CPU 1 and confirms
-/// it ran by signalling back.
+/// it ran by notifying back.
 // cast_possible_truncation: sig_slot is a kernel cap slot index, guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn affinity_sender_entry(sig_slot: u64) -> !
 {
-    signal_send(sig_slot as u32, 0xC1A1).ok();
+    notification_send(sig_slot as u32, 0xC1A1).ok();
     thread_exit()
 }
 
@@ -1052,16 +1057,16 @@ fn affinity_sender_entry(sig_slot: u64) -> !
 #[allow(clippy::cast_possible_truncation)]
 fn sender_entry(sig_slot: u64) -> !
 {
-    signal_send(sig_slot as u32, 0xBEEF).ok();
+    notification_send(sig_slot as u32, 0xBEEF).ok();
     thread_exit()
 }
 
-/// Phase 1 blocker: signals readiness (0x1) then blocks in `signal_wait`.
+/// Phase 1 blocker: signals readiness (0x1) then blocks in `notification_wait`.
 ///
 /// The parent stops this thread while it is blocked, giving a stable
 /// `TrapFrame` for `thread_read_regs` / `thread_write_regs`. If the parent
 /// later resumes it (via `write_regs` redirect), execution jumps to `phase2_entry`
-/// instead of returning from this `signal_wait`.
+/// instead of returning from this `notification_wait`.
 // cast_possible_truncation: cap slot indices are guaranteed < 2^32.
 #[allow(clippy::cast_possible_truncation)]
 fn blocker_entry(arg: u64) -> !
@@ -1071,10 +1076,10 @@ fn blocker_entry(arg: u64) -> !
     // registered as the waiter.
     let ready_slot = (arg >> 32) as u32;
     let block_slot = (arg & 0xFFFF_FFFF) as u32;
-    signal_send(ready_slot, 0x1).ok();
+    notification_send(ready_slot, 0x1).ok();
     // Block so the parent can stop us and read a stable TrapFrame.
     // If write_regs redirects our IP, we jump directly to phase2_entry on resume.
-    signal_wait(block_slot).ok();
+    notification_wait(block_slot).ok();
     // Not normally reached — parent always stops us while blocked.
     loop
     {
@@ -1082,17 +1087,17 @@ fn blocker_entry(arg: u64) -> !
     }
 }
 
-/// Reports the current CPU id back through the signal value and exits.
+/// Reports the current CPU id back through the notification value and exits.
 ///
 /// Used by [`affinity_migrate_ready_queued`] — the child is queued on one
 /// CPU, then migrated by the parent via `thread_set_affinity`. The CPU id
 /// reported here MUST be the post-migration CPU.
 ///
 /// The CPU id is encoded as `1u64 << cpu` (one bit per CPU) rather than
-/// the raw integer. Raw encoding fails when `cpu == 0`: `signal_send`
+/// the raw integer. Raw encoding fails when `cpu == 0`: `notification_send`
 /// rejects zero-bit sends with `InvalidArgument` (see
 /// `core/kernel/src/syscall/ipc.rs:832–835`), the child silently exits,
-/// and the parent's `signal_wait` parks indefinitely — manifesting as the
+/// and the parent's `notification_wait` parks indefinitely — manifesting as the
 /// all-CPUs-idle stall in issue #116. The bit-per-CPU encoding is always
 /// non-zero for any valid CPU id, so the wake always lands; a stale-CPU
 /// run shows up as a deterministic test FAIL ("not landed on CPU 1")
@@ -1104,18 +1109,18 @@ fn report_cpu_entry(sig_slot: u64) -> !
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
     // `wrapping_shl` masks the shift count modulo the type width (64),
     // keeping the result non-zero (and therefore acceptable to
-    // `signal_send`) even on the defensive `u64::MAX` fallback above —
+    // `notification_send`) even on the defensive `u64::MAX` fallback above —
     // a plain `1u64 << cpu` would shift-overflow and panic in debug.
-    signal_send(sig_slot as u32, 1u64.wrapping_shl(cpu as u32)).ok();
+    notification_send(sig_slot as u32, 1u64.wrapping_shl(cpu as u32)).ok();
     thread_exit()
 }
 
 /// Spinner used by the load-balancer tests.
 ///
-/// `arg` packs `(spinner_index << 32) | exit_signal_cap`. On every iteration
+/// `arg` packs `(spinner_index << 32) | exit_notification_cap`. On every iteration
 /// the spinner publishes the current CPU id into the per-index slot of
 /// [`BALANCE_OBSERVED_CPU`]. When [`BALANCE_SHOULD_EXIT`] is set, the
-/// spinner sends `0xC0FE` on its signal cap and exits.
+/// spinner sends `0xC0FE` on its notification cap and exits.
 // cast_possible_truncation: spinner indices and cap slot indices fit in u32.
 #[allow(clippy::cast_possible_truncation)]
 fn balance_spinner_entry(arg: u64) -> !
@@ -1131,7 +1136,7 @@ fn balance_spinner_entry(arg: u64) -> !
         }
         if BALANCE_SHOULD_EXIT.load(Ordering::Relaxed) != 0
         {
-            signal_send(sig_slot, 0xC0FE).ok();
+            notification_send(sig_slot, 0xC0FE).ok();
             thread_exit();
         }
         for _ in 0..64
@@ -1144,8 +1149,8 @@ fn balance_spinner_entry(arg: u64) -> !
 /// Tight `CurrentCpu` observation loop used by [`affinity_migrate_running`].
 ///
 /// Publishes the latest observed CPU id into [`MIGRATE_OBSERVED_CPU`] on
-/// every iteration. Exits when [`MIGRATE_SHOULD_EXIT`] is set, signalling
-/// the parent first so it can complete `signal_wait`.
+/// every iteration. Exits when [`MIGRATE_SHOULD_EXIT`] is set, notifying
+/// the parent first so it can complete `notification_wait`.
 // cast_possible_truncation: cap slot indices and CPU ids fit comfortably in u32.
 #[allow(clippy::cast_possible_truncation)]
 fn migrate_spinner_entry(sig_slot: u64) -> !
@@ -1156,7 +1161,7 @@ fn migrate_spinner_entry(sig_slot: u64) -> !
         MIGRATE_OBSERVED_CPU.store(cpu, Ordering::Relaxed);
         if MIGRATE_SHOULD_EXIT.load(Ordering::Relaxed) != 0
         {
-            signal_send(sig_slot as u32, 0xC0FE).ok();
+            notification_send(sig_slot as u32, 0xC0FE).ok();
             thread_exit();
         }
         // Tiny back-off so the parent gets a chance to run between observations.
@@ -1167,7 +1172,7 @@ fn migrate_spinner_entry(sig_slot: u64) -> !
     }
 }
 
-/// Phase 2 entry: reads the signal cap from `PHASE2_SIG` and sends 0x2.
+/// Phase 2 entry: reads the notification cap from `PHASE2_SIG` and sends 0x2.
 ///
 /// Entered after the parent rewrites this thread's instruction pointer via
 /// `thread_write_regs`. See the `PHASE2_SIG` doc comment for why the cap is
@@ -1175,7 +1180,7 @@ fn migrate_spinner_entry(sig_slot: u64) -> !
 fn phase2_entry() -> !
 {
     let sig = PHASE2_SIG.load(Ordering::Acquire);
-    signal_send(sig, 0x2).ok();
+    notification_send(sig, 0x2).ok();
     thread_exit()
 }
 
@@ -1223,7 +1228,7 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
 {
     const CORRELATOR: u32 = 0xCAFEu32;
 
-    let eq = event_queue_create(ctx.memory_frame_base, 4)
+    let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "thread::bind_notification_fires_on_exit: event_queue_create failed")?;
 
     let child = crate::spawn::new_child(ctx)

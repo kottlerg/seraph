@@ -32,7 +32,7 @@ drivers/
 │   │       └── lib.rs
 │   └── blk/                        # VirtIO block device driver (binary)
 │       ├── Cargo.toml
-│       ├── README.md               # Block-driver IPC interface (BLK_READ_INTO_FRAME, REGISTER_PARTITION)
+│       ├── README.md               # Block-driver IPC interface (BLK_READ_INTO_MEMORY, REGISTER_PARTITION)
 │       └── src/
 │           ├── main.rs
 │           └── io.rs
@@ -54,7 +54,7 @@ holds ambient hardware authority. The full driver lifecycle is specified in
   cannot corrupt another driver or the kernel.
 - **Per-device capabilities** — devmgr delegates the minimum capability set
   for each device: MMIO region, interrupt line, and optionally DMA grant and
-  IoPortRange (x86-64). See
+  IoPort (x86-64). See
   [docs/capability-model.md](../../docs/capability-model.md) for capability types
   and rights.
 - **Spawning** — devmgr discovers devices (PCI enumeration, firmware tables),

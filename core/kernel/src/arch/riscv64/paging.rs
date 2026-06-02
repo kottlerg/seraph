@@ -554,8 +554,8 @@ fn rv_walk_or_alloc_pooled(
 /// every intermediate table frame (VPN\[2\], VPN\[1\], VPN\[0\]) back to
 /// `allocator`.
 ///
-/// Leaf PTEs (R/W/X any set) point at physical memory owned by Frame
-/// capabilities; those frames are freed through `FrameObject` teardown when
+/// Leaf PTEs (R/W/X any set) point at physical memory owned by Memory
+/// capabilities; those frames are freed through `MemoryObject` teardown when
 /// the owning `CSpace` is destroyed, not here. This function only reclaims
 /// the *page-table* pages the aspace allocated via `rv_walk_or_alloc`. The
 /// root VPN\[3\] frame itself is not freed here; the caller in

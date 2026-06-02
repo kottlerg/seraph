@@ -9,7 +9,7 @@
 ///
 /// Invoked from unrecoverable failure paths. On RISC-V U-mode, `wfi` is
 /// implementation-defined: with `mstatus.TW=1` it traps as illegal
-/// instruction, which is the intended escalation signal; with `TW=0` it
+/// instruction, which is the intended escalation notification; with `TW=0` it
 /// stalls until the next interrupt, which also suspends the failed service.
 #[inline]
 pub fn halt()

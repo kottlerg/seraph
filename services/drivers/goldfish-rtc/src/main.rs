@@ -5,7 +5,7 @@
 
 //! Seraph Goldfish RTC driver (QEMU `virt` RISC-V).
 //!
-//! Spawned by devmgr with a one-page `MmioRegion` cap covering the
+//! Spawned by devmgr with a one-page `Mmio` cap covering the
 //! Goldfish RTC register page (`0x101000` on QEMU virt) plus a RECV
 //! cap on the driver's service endpoint. Implements the one-label
 //! RTC driver contract ([`rtc_labels::RTC_GET_EPOCH_TIME`]).
@@ -74,7 +74,7 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64, base_va: u64)
     {
         rtc_labels::RTC_GET_EPOCH_TIME =>
         {
-            if msg.token & rtc_labels::READ_AUTHORITY == 0
+            if msg.badge & rtc_labels::READ_AUTHORITY == 0
             {
                 IpcMessage::new(rtc_errors::UNAUTHORIZED)
             }

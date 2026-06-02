@@ -31,19 +31,19 @@ use crate::io::IoLayout;
 /// Queue size we request (must be <= device max).
 const QUEUE_SIZE: u16 = 128;
 
-/// Maximum number of tokened partitions this driver can serve concurrently.
+/// Maximum number of badged partitions this driver can serve concurrently.
 ///
-/// Partition identity is the caller's cap token. vfsd registers one entry
+/// Partition identity is the caller's cap badge. vfsd registers one entry
 /// per mount; 16 is ample for early boot (typical disk has 1–2 partitions).
 const PARTITION_TABLE_SIZE: usize = 16;
 
-/// Per-token partition bound: absolute LBA range the caller is permitted
-/// to access. Token 0 is reserved for the un-tokened (whole-disk) endpoint
+/// Per-badge partition bound: absolute LBA range the caller is permitted
+/// to access. Badge 0 is reserved for the un-badged (whole-disk) endpoint
 /// and is never stored here.
 #[derive(Clone, Copy)]
 struct PartitionBound
 {
-    token: u64,
+    badge: u64,
     base_lba: u64,
     length_lba: u64,
 }
@@ -65,16 +65,16 @@ impl PartitionTable
         }
     }
 
-    /// Return the bound for `token`, or `None` if no entry is registered.
-    fn lookup(&self, token: u64) -> Option<PartitionBound>
+    /// Return the bound for `badge`, or `None` if no entry is registered.
+    fn lookup(&self, badge: u64) -> Option<PartitionBound>
     {
-        if token == 0
+        if badge == 0
         {
             return None;
         }
         for b in self.entries.iter().flatten()
         {
-            if b.token == token
+            if b.badge == badge
             {
                 return Some(*b);
             }
@@ -82,11 +82,11 @@ impl PartitionTable
         None
     }
 
-    /// Insert a bound. Fails if `token == 0`, a duplicate token exists, or
+    /// Insert a bound. Fails if `badge == 0`, a duplicate badge exists, or
     /// the table is full.
     fn insert(&mut self, bound: PartitionBound) -> Result<(), ()>
     {
-        if bound.token == 0 || bound.length_lba == 0
+        if bound.badge == 0 || bound.length_lba == 0
         {
             return Err(());
         }
@@ -95,7 +95,7 @@ impl PartitionTable
         {
             match entry
             {
-                Some(b) if b.token == bound.token => return Err(()),
+                Some(b) if b.badge == bound.badge => return Err(()),
                 None if empty_idx.is_none() => empty_idx = Some(i),
                 _ =>
                 {}
@@ -112,13 +112,13 @@ impl PartitionTable
         }
     }
 
-    /// Remove the entry matching `token`, if any. Used to roll back an
+    /// Remove the entry matching `badge`, if any. Used to roll back an
     /// insert when downstream cap derivation fails.
-    fn remove(&mut self, token: u64)
+    fn remove(&mut self, badge: u64)
     {
         for entry in &mut self.entries
         {
-            if matches!(entry, Some(b) if b.token == token)
+            if matches!(entry, Some(b) if b.badge == badge)
             {
                 *entry = None;
                 return;
@@ -135,7 +135,7 @@ impl PartitionTable
 //   caps[1]: IRQ line
 //   caps[2]: service endpoint (virtio-blk receives on this)
 // Round 2 (1 cap):
-//   caps[0]: devmgr query endpoint (tokened per-device — for QUERY_DEVICE_INFO)
+//   caps[0]: devmgr query endpoint (badged per-device — for QUERY_DEVICE_INFO)
 //
 // log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through
 // this protocol.
@@ -186,7 +186,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
 
 /// Query devmgr for `VirtIO` PCI capability locations via IPC.
 ///
-/// The driver's devmgr endpoint is tokened — the token identifies the
+/// The driver's devmgr endpoint is badged — the badge identifies the
 /// device. Devmgr replies in the generic `QUERY_DEVICE_INFO` schema:
 /// `word[0]` = kind, `word[1]` = version, `word[2]` = `byte_len`,
 /// payload bytes packed into the subsequent data words. The driver
@@ -249,16 +249,16 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     info
 }
 
-// ── Frame allocation via memmgr IPC ────────────────────────────────────────
+// ── Memory-cap allocation via memmgr IPC ────────────────────────────────────────
 
-/// Request a single contiguous Frame cap covering `page_count` pages from
+/// Request a single contiguous Memory cap covering `page_count` pages from
 /// memmgr. Returns `(cap_slot, phys_base)` on success — the physical base
 /// address is needed for DMA programming on no-IOMMU systems and is
-/// supplied by memmgr in the `REQUEST_FRAMES` reply alongside the cap.
-fn request_frames(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<(u32, u64)>
+/// supplied by memmgr in the `REQUEST_MEMORY_CAPS` reply alongside the cap.
+fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<(u32, u64)>
 {
     let arg = page_count | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
-    let request = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+    let request = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, arg)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -324,10 +324,10 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
 -> (u64, u64, u64)
 {
     let ring_pages = virtqueue::ring_pages(queue_size) as u64;
-    let Some((ring_frame, ring_phys)) = request_frames(caps.memmgr_ep, ring_pages, ipc_buf)
+    let Some((ring_memory, ring_phys)) = request_memory_caps(caps.memmgr_ep, ring_pages, ipc_buf)
     else
     {
-        std::os::seraph::log!("failed to allocate ring frames");
+        std::os::seraph::log!("failed to allocate ring memory caps");
         syscall::thread_exit();
     };
     // The ring mapping lives for the driver process's lifetime; the
@@ -341,7 +341,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     };
     let ring_va = ring_range.va_start();
     if syscall::mem_map(
-        ring_frame,
+        ring_memory,
         caps.self_aspace,
         ring_va,
         0,
@@ -425,10 +425,10 @@ fn setup_virtqueue(
 /// Allocate and map the data buffer page for block I/O, returning an `IoLayout`.
 fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
 {
-    let Some((data_frame, data_phys)) = request_frames(caps.memmgr_ep, 1, ipc_buf)
+    let Some((data_memory, data_phys)) = request_memory_caps(caps.memmgr_ep, 1, ipc_buf)
     else
     {
-        std::os::seraph::log!("failed to allocate data frame");
+        std::os::seraph::log!("failed to allocate data memory cap");
         syscall::thread_exit();
     };
     // The data mapping lives for the driver process's lifetime; the
@@ -442,7 +442,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     };
     let data_va = data_range.va_start();
     if syscall::mem_map(
-        data_frame,
+        data_memory,
         caps.self_aspace,
         data_va,
         0,
@@ -472,21 +472,21 @@ pub struct BlkRuntime<'a>
     pub vq: &'a mut SplitVirtqueue,
     pub transport: &'a PciTransport,
     pub queue_notify_off: u16,
-    pub irq_signal: u32,
+    pub irq_notification: u32,
     pub irq_cap: u32,
-    /// Un-tokened `SEND_GRANT` cap on this driver's service endpoint;
-    /// kept so `handle_register_partition` can `cap_derive_token` per-
-    /// partition tokened caps from it. The kernel rejects re-tokening
-    /// of a tokened source, so partition cap derivation must happen
+    /// Un-badged `SEND_GRANT` cap on this driver's service endpoint;
+    /// kept so `handle_register_partition` can `cap_derive_badge` per-
+    /// partition badged caps from it. The kernel rejects re-badging
+    /// of a badged source, so partition cap derivation must happen
     /// here (server-side) and not at the caller (which holds a
-    /// MOUNT_AUTHORITY-tokened cap).
+    /// MOUNT_AUTHORITY-badged cap).
     pub service_ep: u32,
     partitions: PartitionTable,
     capacity: u64,
-    /// Monotonic counter for partition-identity tokens. The
+    /// Monotonic counter for partition-identity badges. The
     /// `MOUNT_AUTHORITY` bit lives at `1 << 63`; this counter stays in
     /// the low bits and so is bit-disjoint by construction.
-    next_partition_token: u64,
+    next_partition_badge: u64,
 }
 
 /// Handle incoming IPC requests on the service endpoint.
@@ -504,13 +504,13 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 
         match msg.label
         {
-            blk_labels::BLK_READ_INTO_FRAME =>
+            blk_labels::BLK_READ_INTO_MEMORY =>
             {
-                handle_read_block_into_frame(&msg, ipc_buf, rt);
+                handle_read_block_into_memory(&msg, ipc_buf, rt);
             }
-            blk_labels::BLK_WRITE_FROM_FRAME =>
+            blk_labels::BLK_WRITE_FROM_MEMORY =>
             {
-                handle_write_block_from_frame(&msg, ipc_buf, rt);
+                handle_write_block_from_memory(&msg, ipc_buf, rt);
             }
             blk_labels::REGISTER_PARTITION =>
             {
@@ -526,25 +526,25 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
     }
 }
 
-/// Handle a `BLK_READ_INTO_FRAME` request.
+/// Handle a `BLK_READ_INTO_MEMORY` request.
 ///
-/// Reads `caps[0]` (target Frame) and DMAs `data[1]` consecutive sectors
-/// (default 1) starting at LBA `data[0]` into the frame at offset 0,
-/// packed contiguously. The frame must be at least `count * 512` bytes;
-/// the driver rejects with `INVALID_FRAME_CAP` otherwise.
+/// Reads `caps[0]` (target Memory cap) and DMAs `data[1]` consecutive sectors
+/// (default 1) starting at LBA `data[0]` into the memory cap at offset 0,
+/// packed contiguously. The memory cap must be at least `count * 512` bytes;
+/// the driver rejects with `INVALID_MEMORY_CAP` otherwise.
 ///
 /// `caps[1]` and `caps[2]` are reserved IPC-shape slots and remain null
-/// pre-IOMMU; the driver does not inspect them. The target Frame is
+/// pre-IOMMU; the driver does not inspect them. The target Memory cap is
 /// moved back to the caller in `caps[0]` of the reply regardless of
 /// success — leaving the cap in the driver's `CSpace` would leak it.
-// too_many_lines: handle_read_block_into_frame folds nine validation
+// too_many_lines: handle_read_block_into_memory folds nine validation
 // gates (cap presence, sector count, descriptor-length bound, three
 // cap_info lookups, partition resolution for start and end LBA) into
 // one flat dispatch; each rejection path replies with the cap moved
 // back so it never leaks. Extracting helpers would still leave the
 // reply-with-cap pattern wired through main.
 #[allow(clippy::too_many_lines)]
-fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
     const SECTOR_SIZE: u64 = 512;
 
@@ -563,7 +563,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
 
     if target_cap == 0
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
 
@@ -577,49 +577,49 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     };
     if sector_count == 0
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
     let data_len_bytes = sector_count * SECTOR_SIZE;
     // VirtIO descriptor length is u32; this also bounds total transfer
-    // well below any plausible per-frame ask.
+    // well below any plausible per-cap ask.
     if data_len_bytes > u64::from(u32::MAX)
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
 
-    // Validate the target cap: must be a Frame with MAP+WRITE rights and
+    // Validate the target cap: must be a Memory cap with MAP+WRITE rights and
     // at least `data_len_bytes` of capacity.
     let Ok(tag_rights) = syscall::cap_info(target_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
     let tag = (tag_rights >> 32) as u8;
     let rights = tag_rights & 0xFFFF_FFFF;
     let required = syscall::RIGHTS_MAP_RW;
-    if u64::from(tag) != u64::from(syscall::CAP_TAG_FRAME) || (rights & required) != required
+    if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Ok(size) = syscall::cap_info(target_cap, syscall::CAP_INFO_FRAME_SIZE)
+    let Ok(size) = syscall::cap_info(target_cap, syscall::CAP_INFO_MEMORY_SIZE)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
     if size < data_len_bytes
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Ok(phys_base) = syscall::cap_info(target_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+    let Ok(phys_base) = syscall::cap_info(target_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
 
@@ -631,7 +631,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     {
         0
     };
-    let absolute_sector = match resolve_sector(msg.token, sector, rt)
+    let absolute_sector = match resolve_sector(msg.badge, sector, rt)
     {
         Ok(s) => s,
         Err(code) =>
@@ -644,7 +644,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     // resolve_sector only checks the starting LBA. Re-check the inclusive
     // end LBA so a multi-sector ask doesn't walk past the partition.
     let last_relative = sector.saturating_add(sector_count - 1);
-    if resolve_sector(msg.token, last_relative, rt).is_err()
+    if resolve_sector(msg.badge, last_relative, rt).is_err()
     {
         reply_with(ipc::blk_errors::OUT_OF_BOUNDS, ipc_buf);
         return;
@@ -661,7 +661,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
         rt.vq,
         rt.transport,
         rt.queue_notify_off,
-        rt.irq_signal,
+        rt.irq_notification,
         rt.irq_cap,
     )
     {
@@ -673,19 +673,19 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     reply_with(ipc::blk_errors::SUCCESS, ipc_buf);
 }
 
-/// Handle a `BLK_WRITE_FROM_FRAME` request.
+/// Handle a `BLK_WRITE_FROM_MEMORY` request.
 ///
-/// Mirror of [`handle_read_block_into_frame`] with the data direction
-/// inverted. Reads `caps[0]` (source Frame, `MAP|READ`) and DMAs
+/// Mirror of [`handle_read_block_into_memory`] with the data direction
+/// inverted. Reads `caps[0]` (source Memory cap, `MAP|READ`) and DMAs
 /// `data[1]` consecutive sectors (default 1) starting at LBA `data[0]`
-/// out of the frame at offset 0, packed contiguously. The source Frame
+/// out of the memory cap at offset 0, packed contiguously. The source Memory cap
 /// is moved back to the caller in `caps[0]` of the reply.
 // too_many_lines: matches the read sibling — the same validation gates
 // (cap presence, sector count, descriptor-length bound, three cap_info
 // lookups, two partition resolutions for start and end LBA) all apply
 // here, and the reply-with-cap pattern is unchanged.
 #[allow(clippy::too_many_lines)]
-fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+fn handle_write_block_from_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
     const SECTOR_SIZE: u64 = 512;
 
@@ -704,7 +704,7 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
 
     if source_cap == 0
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
 
@@ -718,48 +718,48 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
     };
     if sector_count == 0
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
     let data_len_bytes = sector_count * SECTOR_SIZE;
     if data_len_bytes > u64::from(u32::MAX)
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
 
-    // Source frame must be a Frame cap with at least MAP+READ rights
+    // Source memory cap must be a Memory cap with at least MAP+READ rights
     // (device reads sector data out of it) and large enough to cover the
     // requested run.
     let Ok(tag_rights) = syscall::cap_info(source_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
     let tag = (tag_rights >> 32) as u8;
     let rights = tag_rights & 0xFFFF_FFFF;
     let required = syscall::RIGHTS_MAP_READ;
-    if u64::from(tag) != u64::from(syscall::CAP_TAG_FRAME) || (rights & required) != required
+    if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Ok(size) = syscall::cap_info(source_cap, syscall::CAP_INFO_FRAME_SIZE)
+    let Ok(size) = syscall::cap_info(source_cap, syscall::CAP_INFO_MEMORY_SIZE)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
     if size < data_len_bytes
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Ok(phys_base) = syscall::cap_info(source_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+    let Ok(phys_base) = syscall::cap_info(source_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
 
@@ -771,7 +771,7 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
     {
         0
     };
-    let absolute_sector = match resolve_sector(msg.token, sector, rt)
+    let absolute_sector = match resolve_sector(msg.badge, sector, rt)
     {
         Ok(s) => s,
         Err(code) =>
@@ -781,7 +781,7 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
         }
     };
     let last_relative = sector.saturating_add(sector_count - 1);
-    if resolve_sector(msg.token, last_relative, rt).is_err()
+    if resolve_sector(msg.badge, last_relative, rt).is_err()
     {
         reply_with(ipc::blk_errors::OUT_OF_BOUNDS, ipc_buf);
         return;
@@ -798,7 +798,7 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
         rt.vq,
         rt.transport,
         rt.queue_notify_off,
-        rt.irq_signal,
+        rt.irq_notification,
         rt.irq_cap,
     )
     {
@@ -811,26 +811,26 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
 }
 
 /// Translate a caller-supplied sector number into an absolute device LBA,
-/// enforcing per-token partition bounds. Returns a [`blk_errors`] code on
+/// enforcing per-badge partition bounds. Returns a [`blk_errors`] code on
 /// rejection.
 ///
-/// Token semantics:
-/// * Token bit [`MOUNT_AUTHORITY`] set → whole-disk read; bounded only
+/// Badge semantics:
+/// * Badge bit [`MOUNT_AUTHORITY`] set → whole-disk read; bounded only
 ///   by device capacity. Held by callers (currently just vfsd) that
 ///   need to walk the partition table before partitioning is complete.
-/// * Token with [`MOUNT_AUTHORITY`] clear and non-zero low bits →
-///   partition-identity token issued by [`handle_register_partition`];
+/// * Badge with [`MOUNT_AUTHORITY`] clear and non-zero low bits →
+///   partition-identity badge issued by [`handle_register_partition`];
 ///   bounded by the registered partition.
-/// * `token == 0` → un-tokened caller; rejected. Every consumer of
-///   this endpoint holds a tokened cap.
-fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
+/// * `badge == 0` → un-badged caller; rejected. Every consumer of
+///   this endpoint holds a badged cap.
+fn resolve_sector(badge: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 {
-    if token == 0
+    if badge == 0
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
     }
 
-    if token & ipc::blk_labels::MOUNT_AUTHORITY != 0
+    if badge & ipc::blk_labels::MOUNT_AUTHORITY != 0
     {
         // MOUNT_AUTHORITY holders read the whole disk directly,
         // bounded only by device capacity.
@@ -841,7 +841,7 @@ fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
         return Ok(sector);
     }
 
-    let Some(bound) = rt.partitions.lookup(token)
+    let Some(bound) = rt.partitions.lookup(badge)
     else
     {
         return Err(ipc::blk_errors::OUT_OF_BOUNDS);
@@ -860,17 +860,17 @@ fn resolve_sector(token: u64, sector: u64, rt: &BlkRuntime) -> Result<u64, u64>
 
 /// Handle a `REGISTER_PARTITION` request.
 ///
-/// Authority: caller's token must have [`MOUNT_AUTHORITY`] set. Un-
-/// tokened callers and partition-tokened callers are rejected — the
+/// Authority: caller's badge must have [`MOUNT_AUTHORITY`] set. Un-
+/// badged callers and partition-badged callers are rejected — the
 /// latter is already partition-scoped and has no authority to create
 /// additional scopes.
 ///
 /// Data words: `[base_lba, length_lba]`. The driver allocates a fresh
-/// partition-identity token from its monotonic counter, inserts the
-/// bound, derives a tokened `SEND_GRANT` cap on its own service endpoint
-/// scoped to that token, and returns the cap in `caps[0]` of the reply.
+/// partition-identity badge from its monotonic counter, inserts the
+/// bound, derives a badged `SEND_GRANT` cap on its own service endpoint
+/// scoped to that badge, and returns the cap in `caps[0]` of the reply.
 /// Server-side derivation is required because [`MOUNT_AUTHORITY`] caps
-/// are tokened and the kernel rejects re-tokening of a tokened source —
+/// are badged and the kernel rejects re-badging of a badged source —
 /// the caller cannot mint partition caps itself.
 fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
@@ -880,7 +880,7 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     };
 
-    if msg.token & ipc::blk_labels::MOUNT_AUTHORITY == 0
+    if msg.badge & ipc::blk_labels::MOUNT_AUTHORITY == 0
     {
         reject(ipc_buf);
         return;
@@ -909,21 +909,21 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
         return;
     }
 
-    let new_token = rt.next_partition_token;
+    let new_badge = rt.next_partition_badge;
     // Saturating increment so a (theoretical) wrap collides with the
     // MOUNT_AUTHORITY bit instead of silently aliasing a live partition
-    // token to a verb-bit value.
-    if new_token & ipc::blk_labels::MOUNT_AUTHORITY != 0
+    // badge to a verb-bit value.
+    if new_badge & ipc::blk_labels::MOUNT_AUTHORITY != 0
     {
         reject(ipc_buf);
         return;
     }
-    rt.next_partition_token = new_token.saturating_add(1);
+    rt.next_partition_badge = new_badge.saturating_add(1);
 
     if rt
         .partitions
         .insert(PartitionBound {
-            token: new_token,
+            badge: new_badge,
             base_lba,
             length_lba,
         })
@@ -934,12 +934,12 @@ fn handle_register_partition(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRu
     }
 
     let Ok(partition_cap) =
-        syscall::cap_derive_token(rt.service_ep, syscall::RIGHTS_SEND_GRANT, new_token)
+        syscall::cap_derive_badge(rt.service_ep, syscall::RIGHTS_SEND_GRANT, new_badge)
     else
     {
         // Roll back the partition insert so the table doesn't grow a
         // bound the caller has no cap to address.
-        rt.partitions.remove(new_token);
+        rt.partitions.remove(new_badge);
         reject(ipc_buf);
         return;
     };
@@ -1028,20 +1028,20 @@ fn main() -> !
         .set_status(STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     std::os::seraph::log!("device ready");
 
-    // Set up IRQ-driven completion: create a signal and bind it to the IRQ.
+    // Set up IRQ-driven completion: create a notification and bind it to the IRQ.
     if caps.irq_slot == 0
     {
         std::os::seraph::log!("no IRQ cap, cannot operate");
         syscall::thread_exit();
     }
-    let Some(irq_signal) = std::os::seraph::object_slab_acquire(120)
-        .and_then(|slab| syscall::cap_create_signal(slab).ok())
+    let Some(irq_notification) = std::os::seraph::object_slab_acquire(120)
+        .and_then(|slab| syscall::cap_create_notification(slab).ok())
     else
     {
-        std::os::seraph::log!("failed to create IRQ signal");
+        std::os::seraph::log!("failed to create IRQ notification");
         syscall::thread_exit();
     };
-    if syscall::irq_register(caps.irq_slot, irq_signal).is_err()
+    if syscall::irq_register(caps.irq_slot, irq_notification).is_err()
     {
         std::os::seraph::log!("irq_register failed");
         syscall::thread_exit();
@@ -1053,8 +1053,8 @@ fn main() -> !
 
     // Set up I/O buffer (driver-owned page hosting request header at offset
     // 0 and status byte at offset 1024). Data segments live in caller-supplied
-    // Frame caps per the BLK_READ_INTO_FRAME contract, so no driver-side
-    // smoke-read is possible without allocating a throwaway frame; the fs
+    // Memory caps per the BLK_READ_INTO_MEMORY contract, so no driver-side
+    // smoke-read is possible without allocating a throwaway memory cap; the fs
     // driver's first BPB read serves as the real first-use sanity check.
     let layout = setup_io_buffer(&caps, ipc_buf);
 
@@ -1073,12 +1073,12 @@ fn main() -> !
         vq: &mut vq,
         transport: &transport,
         queue_notify_off,
-        irq_signal,
+        irq_notification,
         irq_cap,
         service_ep: caps.service_ep,
         partitions: PartitionTable::new(),
         capacity,
-        next_partition_token: 1,
+        next_partition_badge: 1,
     };
     service_loop(caps.service_ep, ipc_buf, &mut rt);
 }

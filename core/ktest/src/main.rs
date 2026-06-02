@@ -137,7 +137,7 @@ pub struct TestContext
     /// Used by tests that need to discover the cspace's slot capacity at
     /// runtime via `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` so their scans
     /// cover every slot the kernel may have populated, including those
-    /// allocated after `aspace_cap` (e.g. narrow `IoPortRange` caps minted
+    /// allocated after `aspace_cap` (e.g. narrow `IoPort` caps minted
     /// by `ioport::bind_port_range` callers such as `serial::init` on
     /// `x86_64`).
     pub cspace_cap: u32,
@@ -156,13 +156,13 @@ pub struct TestContext
     /// and received cap-slot indices.
     pub ipc_buf: *mut u64,
 
-    /// First RAM Frame cap slot in ktest's `CSpace`, kernel-minted at
-    /// Phase 7. ktest is loaded as init and inherits the RAM Frame caps
+    /// First RAM Memory cap slot in ktest's `CSpace`, kernel-minted at
+    /// Phase 7. ktest is loaded as init and inherits the RAM Memory caps
     /// directly (the same caps init forwards to memmgr). Used by tests
     /// that need to inspect the rights/state of an actual RAM cap; the
     /// `frame_pool` slots elsewhere are derived from a segment cap and
     /// therefore lack the RETYPE right.
-    pub memory_frame_base: u32,
+    pub memory_base: u32,
 
     /// RISC-V SBI control cap (slot index), kernel-minted in init's
     /// initial cap set. Zero on x86-64, where SBI is unavailable.
@@ -228,8 +228,8 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 
 /// Fund extra page-table growth budget on ktest's own (boot) `AddressSpace`
 /// via the real userspace mechanism — `cap_create_aspace` augment-mode off an
-/// inherited RAM Frame cap. Drivers fund this way after obtaining a frame from
-/// memmgr; ktest has no memmgr, so it draws on the kernel-minted RAM caps it
+/// inherited RAM Memory cap. Drivers fund this way after obtaining a Memory cap
+/// from memmgr; ktest has no memmgr, so it draws on the kernel-minted RAM caps it
 /// inherits as init.
 ///
 /// Post-Gap-B, `sys_mmio_map` and `sys_mem_map` into ktest's retype-backed boot
@@ -237,7 +237,7 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 /// reserve. The seeded `INIT_ASPACE_PAGES` pool sizes init's own bootstrap
 /// footprint; ktest additionally maps the framebuffer and serial MMIO and runs
 /// the `mem_map` suite against this AS, so it needs a modest top-up. Source the
-/// slabs from spare RAM caps — every inherited RAM cap except `memory_frame_base`,
+/// slabs from spare RAM caps — every inherited RAM cap except `memory_base`,
 /// which `frame_pool` and the retype-heavy tests draw from. The drain leaves one
 /// large cap plus many smaller fragments, so accumulate across several augments.
 /// Best-effort: a partial top-up still helps; failures surface in the tests.
@@ -247,12 +247,12 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
     const PER_AUGMENT_MAX: u64 = 64;
     const MIN_SPARE_PAGES: u64 = 16;
     const MAX_AUGMENTS: u32 = 8; // stay within MAX_PT_CHUNKS headroom
-    if info.memory_frame_count < 2
+    if info.memory_count < 2
     {
         return;
     }
     let mut augments = 0u32;
-    for slot in (info.memory_frame_base + 1)..(info.memory_frame_base + info.memory_frame_count)
+    for slot in (info.memory_base + 1)..(info.memory_base + info.memory_count)
     {
         if augments >= MAX_AUGMENTS
             || syscall::cap_info(info.aspace_cap, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET)
@@ -261,13 +261,13 @@ fn fund_boot_aspace_pt(info: &init_protocol::InitInfo)
             break;
         }
         let avail_pages =
-            syscall::cap_info(slot, syscall_abi::CAP_INFO_FRAME_AVAILABLE).map_or(0, |a| a / 4096);
+            syscall::cap_info(slot, syscall_abi::CAP_INFO_MEMORY_AVAILABLE).map_or(0, |a| a / 4096);
         if avail_pages < MIN_SPARE_PAGES
         {
             continue;
         }
         // Leave one page for the retype metadata header the kernel carves on a
-        // frame's first retype; cap each augment to bound the per-chunk size.
+        // Memory cap's first retype; cap each augment to bound the per-chunk size.
         let want = (avail_pages - 1).min(PER_AUGMENT_MAX);
         if syscall::cap_create_aspace(slot, info.aspace_cap, want).is_ok()
         {
@@ -295,7 +295,7 @@ fn run(info_ptr: u64) -> !
     // aperture later). Must precede `serial::init`/`framebuffer::init`.
     fund_boot_aspace_pt(info);
 
-    // Seed the I/O port subdivider with the root IoPortRange cap so
+    // Seed the I/O port subdivider with the root IoPort cap so
     // `serial::init` and `acpi_shutdown::shutdown` can each carve only
     // the ports they need instead of binding the full 64K range.
     #[cfg(target_arch = "x86_64")]
@@ -322,7 +322,7 @@ fn run(info_ptr: u64) -> !
         halt()
     });
 
-    // Initialize the frame pool before running tests. Tests consume frame caps
+    // Initialize the frame pool before running tests. Tests consume Memory caps
     // via splits; without pooling, resources are exhausted after ~10 tests.
     // SAFETY: Called once before any tests run; no concurrent access yet.
     unsafe {
@@ -334,7 +334,7 @@ fn run(info_ptr: u64) -> !
         cspace_cap: info.cspace_cap,
         thread_cap: info.thread_cap,
         ipc_buf: ipc_buf_ptr,
-        memory_frame_base: info.memory_frame_base,
+        memory_base: info.memory_base,
         sbi_control_cap: info.sbi_control_cap,
     };
 

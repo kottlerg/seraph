@@ -8,7 +8,7 @@
 //! Provides FAT-table lookups with single-sector caching and
 //! cluster-chain-walking file reads. Sector reads go through
 //! [`PageCache::read_sector`] directly; partition-scoping is enforced by
-//! the block driver per the per-token bound vfsd registered at mount.
+//! the block driver per the per-badge bound vfsd registered at mount.
 
 use crate::bpb::{FatState, FatType, SECTOR_SIZE};
 use crate::cache::PageCache;

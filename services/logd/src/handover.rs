@@ -16,9 +16,9 @@
 //! * `word(0)` = chunk kind: `HEADER` (1), `SLOT` (2), `LINE` (3).
 //! * `HEADER`: `word(1)` = total history-entry count, `word(2)` =
 //!   active slot count.
-//! * `SLOT`: `word(1)` = token, `word(2)` = name length;
+//! * `SLOT`: `word(1)` = badge, `word(2)` = name length;
 //!   `bytes(3, ...)` = name payload.
-//! * `LINE`: `word(1)` = token, `word(2)` = receipt microseconds,
+//! * `LINE`: `word(1)` = badge, `word(2)` = receipt microseconds,
 //!   `word(3)` = byte length; `bytes(4, ...)` = line payload.
 //!
 //! See `services/logd/docs/handover-protocol.md`.
@@ -84,7 +84,7 @@ pub unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
             }
             KIND_SLOT =>
             {
-                let token = reply.word(1);
+                let badge = reply.word(1);
                 let name_len = reply.word(2) as usize;
                 let bytes = reply.data_bytes();
                 // Inline bytes start at data word 3. Mirror init-logd's
@@ -93,12 +93,12 @@ pub unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
                 let end = (start + name_len).min(bytes.len());
                 if start < bytes.len()
                 {
-                    table.install_from_handover(token, &bytes[start..end]);
+                    table.install_from_handover(badge, &bytes[start..end]);
                 }
             }
             KIND_LINE =>
             {
-                let token = reply.word(1);
+                let badge = reply.word(1);
                 let us = reply.word(2);
                 let byte_len = reply.word(3) as usize;
                 let bytes = reply.data_bytes();
@@ -108,7 +108,7 @@ pub unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
                 let end = (start + byte_len).min(bytes.len());
                 if start < bytes.len()
                 {
-                    table.install_history_line(token, us, &bytes[start..end]);
+                    table.install_history_line(badge, us, &bytes[start..end]);
                 }
             }
             _ =>
@@ -128,7 +128,7 @@ pub unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
 /// Init-logd's thread terminates on this message — not on the data drain's
 /// `DONE` chunk — so a dropped data chunk (a kernel IPC rendezvous race on
 /// the shared, multi-sender log endpoint) cannot leave init-logd running and
-/// block procmgr's reap of init's frames.
+/// block procmgr's reap of init's memory caps.
 ///
 /// Init-logd is alive until it processes a RELEASE, so the first *delivered*
 /// call is acknowledged and returns `Ok`. The retry recovers a `RELEASE`

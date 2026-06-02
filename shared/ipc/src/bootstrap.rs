@@ -187,11 +187,11 @@ pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
     unsafe { crate::ipc_reply(&msg, ipc_buf) }
 }
 
-/// Receive one bootstrap request, verify the sender's token, and reply
+/// Receive one bootstrap request, verify the sender's badge, and reply
 /// with the given round.
 ///
-/// Blocks until a `BOOTSTRAP_REQUEST` arrives on `bootstrap_ep`. If the token
-/// embedded in the received cap does not match `expected_token`, replies with
+/// Blocks until a `BOOTSTRAP_REQUEST` arrives on `bootstrap_ep`. If the badge
+/// embedded in the received cap does not match `expected_badge`, replies with
 /// [`bootstrap_errors::NO_CHILD`] and returns `Err`. If the label is not
 /// [`REQUEST`], replies with [`bootstrap_errors::INVALID`] and returns `Err`.
 /// Otherwise, replies with the round (caps + data + done flag).
@@ -200,11 +200,11 @@ pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
 /// `ipc_buf` must point to the caller thread's registered IPC buffer page.
 ///
 /// # Errors
-/// * `Err(bootstrap_errors::NO_CHILD)` — unexpected token.
+/// * `Err(bootstrap_errors::NO_CHILD)` — unexpected badge.
 /// * `Err(bootstrap_errors::INVALID)` — protocol error.
 pub unsafe fn serve_round(
     bootstrap_ep: u32,
-    expected_token: u64,
+    expected_badge: u64,
     ipc_buf: *mut u64,
     done: bool,
     caps: &[u32],
@@ -215,7 +215,7 @@ pub unsafe fn serve_round(
     let request =
         unsafe { crate::ipc_recv(bootstrap_ep, ipc_buf) }.map_err(|_| bootstrap_errors::INVALID)?;
 
-    if request.token != expected_token
+    if request.badge != expected_badge
     {
         // SAFETY: same invariant.
         let _ = unsafe { reply_error(bootstrap_errors::NO_CHILD, ipc_buf) };

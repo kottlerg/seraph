@@ -9,7 +9,7 @@
 //! 1. Mints a fresh thread, pins to CPU 0.
 //! 2. Child loads `PATTERN_A` into the entire extended-state register file
 //!    (`xmm0..xmm15` on `x86_64`; `f0..f31` on `riscv64`).
-//! 3. Child becomes `fpu_owner` of CPU 0, blocks on a signal.
+//! 3. Child becomes `fpu_owner` of CPU 0, blocks on a notification.
 //! 4. Parent flips affinity to CPU 1 and wakes the child.
 //! 5. Child resumes (potentially on CPU 1), captures register file,
 //!    asserts no mismatch.

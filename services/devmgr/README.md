@@ -34,7 +34,7 @@ on restart. The full design is specified in
 responsibilities are:
 
 - **Parse firmware tables** — read ACPI tables (x86-64) or Device Tree blob
-  (RISC-V) from read-only frame capabilities to resolve interrupt routing,
+  (RISC-V) from read-only memory capabilities to resolve interrupt routing,
   power domains, and the PCI hierarchy.
 - **Enumerate PCI devices** — reserve VA, fund the AS's page-table growth
   budget via `fund_aspace_pt_budget`, then map the ECAM MMIO region via
@@ -44,21 +44,21 @@ responsibilities are:
 - **Bind drivers** — match discovered devices to driver binaries in
   [`drivers/`](../drivers/README.md), request procmgr to create driver
   processes, and delegate per-device capabilities (MMIO, interrupt, and
-  IoPortRange where applicable). PCI devices spawn through the
+  IoPort where applicable). PCI devices spawn through the
   BAR/IRQ-shaped path; fixed-location platform devices (the serial
   UART, the platform RTC chip — `cmos-rtc` on x86-64, `goldfish-rtc`
   on RISC-V) spawn through a simpler path that delivers a service
-  endpoint and one arch authority cap (`IoPortRange` for COM1 and
-  CMOS, `MmioRegion` for an NS16550 or the goldfish RTC at `0x101000`).
+  endpoint and one arch authority cap (`IoPort` for COM1 and
+  CMOS, `Mmio` for an NS16550 or the goldfish RTC at `0x101000`).
   Drivers that need physical-base addresses for device DMA
-  programming obtain them from memmgr's `REQUEST_FRAMES` reply alongside
-  the Frame caps; DMA isolation, when established, is programmed by devmgr
-  through IOMMU hardware it acquires via the `MmioRegion` cap flow.
+  programming obtain them from memmgr's `REQUEST_MEMORY_CAPS` reply alongside
+  the Memory caps; DMA isolation, when established, is programmed by devmgr
+  through IOMMU hardware it acquires via the `Mmio` cap flow.
 
   Driver binaries are sourced from one of two places:
 
   - **Boot bundle** — bootstrap-essentials (virtio-blk, serial,
-    framebuffer) arrive as `procmgr_labels::CREATE_PROCESS`-ready Frame
+    framebuffer) arrive as `procmgr_labels::CREATE_PROCESS`-ready Memory
     caps in devmgr's MODULE bootstrap round. devmgr spawns these
     during initial enumeration, before the registry loop opens.
   - **On-disk rootfs** — non-essential drivers (today: the per-arch
@@ -77,14 +77,14 @@ responsibilities are:
   (`QUERY_SERIAL_DEVICE`), `programs/fb-charset` resolves the framebuffer
   driver (`QUERY_FRAMEBUFFER_DEVICE`), timed resolves the platform RTC
   (`QUERY_RTC_DEVICE`), and netd in due course. devmgr owns each driver's
-  service endpoint and mints a tokened SEND on query.
+  service endpoint and mints a badged SEND on query.
 - **Broker ACPI and shutdown hardware to pwrmgr** — devmgr is the sole
-  owner of the ACPI Frame caps and the only service that walks the ACPI
+  owner of the ACPI Memory caps and the only service that walks the ACPI
   table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by
   signature or physical address and serves a read-only view of it (devmgr
   reads only the directory and table headers, never a table body).
   `QUERY_SHUTDOWN_DEVICE` carves the shutdown-actuator caps pwrmgr asks
-  for — a narrow `IoPortRange` over the PM1a control and 8042 reset ports
+  for — a narrow `IoPort` over the PM1a control and 8042 reset ports
   on x86-64 (the port pwrmgr computed from the FADT), or a `cap_derive`
   copy of `SbiControl` on RISC-V. devmgr runs no shutdown logic; it brokers
   the hardware, pwrmgr interprets and actuates. Both are gated on
@@ -106,15 +106,15 @@ how devmgr uses them.
 |---|---|---|
 | MMIO Region (per platform resource) | Map | Map device register regions into driver address spaces |
 | Interrupt (per IRQ line) | — | Delegate to drivers for hardware interrupt delivery |
-| IoPortRange (x86-64, root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
+| IoPort (x86-64, root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
 | SbiControl (RISC-V, root) | Delegate | Broker a copy to pwrmgr for SBI SRST shutdown / reboot |
-| Frame (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob (incl. IOMMU topology: DMAR on x86-64, `iommu` / `iommu-map` on RISC-V); broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE` |
+| Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob (incl. IOMMU topology: DMAR on x86-64, `iommu` / `iommu-map` on RISC-V); broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE` |
 | SchedControl | Elevate | Assign elevated priorities to latency-sensitive drivers |
 
 IOMMU register regions are not pre-minted as distinct capabilities.
 `devmgr` discovers IOMMU units from the firmware passthrough (DMAR or
 DTB) and acquires MMIO-region caps for their register ranges through
-the same `MmioRegion` flow as any other device.
+the same `Mmio` flow as any other device.
 
 ---
 

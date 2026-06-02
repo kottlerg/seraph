@@ -11,7 +11,7 @@
 //!   1. Create thread (`cap_create_thread`, `cap_create_cspace`)
 //!   2. Configure entry, stack, arg (`thread_configure`)
 //!   3. Start (`thread_start`) → child signals readiness (0x1)
-//!   4. Stop while child is blocked in `signal_wait` (`thread_stop`)
+//!   4. Stop while child is blocked in `notification_wait` (`thread_stop`)
 //!   5. Read register state (`thread_read_regs`) → verify IP non-zero
 //!   6. Redirect IP via `write_regs` (`thread_write_regs`) → `phase2_entry`
 //!   7. Resume (`thread_start`) → child sends 0x2 to confirm redirection
@@ -25,14 +25,14 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
-    cap_copy, cap_create_cspace, cap_create_signal, cap_create_thread, cap_delete, signal_send,
-    signal_wait, thread_exit, thread_read_regs, thread_set_affinity, thread_set_priority,
-    thread_start, thread_stop, thread_write_regs,
+    cap_copy, cap_create_cspace, cap_create_notification, cap_create_thread, cap_delete,
+    notification_send, notification_wait, thread_exit, thread_read_regs, thread_set_affinity,
+    thread_set_priority, thread_start, thread_stop, thread_write_regs,
 };
 
 use crate::{ChildStack, TestContext, TestResult};
 
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 const RIGHTS_WAIT: u64 = 1 << 8;
 
 #[cfg(target_arch = "x86_64")]
@@ -48,16 +48,16 @@ static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 pub fn run(ctx: &TestContext) -> TestResult
 {
     const BUF: usize = 512;
-    // Two distinct signals — child→parent readiness and child blocking
+    // Two distinct notifications — child→parent readiness and child blocking
     // primitive — so the child cannot self-deliver its own readiness send
     // before the parent has registered as the waiter (race observed on SMP).
-    let ready = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "integration::thread_lifecycle: cap_create_signal (ready) failed")?;
-    let block = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "integration::thread_lifecycle: cap_create_signal (block) failed")?;
+    let ready = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "integration::thread_lifecycle: cap_create_notification (ready) failed")?;
+    let block = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "integration::thread_lifecycle: cap_create_notification (block) failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::thread_lifecycle: spawn::new_child failed")?;
-    let child_ready = cap_copy(ready, child.cs, RIGHTS_SIGNAL)
+    let child_ready = cap_copy(ready, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "integration::thread_lifecycle: cap_copy (ready→child) failed")?;
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "integration::thread_lifecycle: cap_copy (block→child) failed")?;
@@ -68,8 +68,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Step 3: Start — child signals readiness. ──────────────────────────────
     crate::spawn::configure_and_start(&child, blocker_entry, stack_top, blocker_arg)
         .map_err(|_| "integration::thread_lifecycle: configure_and_start failed")?;
-    let ready_bits = signal_wait(ready)
-        .map_err(|_| "integration::thread_lifecycle: signal_wait (readiness) failed")?;
+    let ready_bits = notification_wait(ready)
+        .map_err(|_| "integration::thread_lifecycle: notification_wait (readiness) failed")?;
     if ready_bits != 0x1
     {
         return Err("integration::thread_lifecycle: child sent wrong readiness bits");
@@ -105,8 +105,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     // ── Step 7: Resume — child lands in phase2_entry and sends 0x2. ──────────
     thread_start(child.th)
         .map_err(|_| "integration::thread_lifecycle: thread_start (resume) failed")?;
-    let phase2_bits = signal_wait(ready)
-        .map_err(|_| "integration::thread_lifecycle: signal_wait (phase2) failed")?;
+    let phase2_bits = notification_wait(ready)
+        .map_err(|_| "integration::thread_lifecycle: notification_wait (phase2) failed")?;
     if phase2_bits != 0x2
     {
         return Err("integration::thread_lifecycle: phase2_entry did not send 0x2");
@@ -117,9 +117,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // The thread cap is still valid even after the thread exits; the kernel
     // allows these operations on any Thread object. Create a fresh thread just
     // to test these without depending on child exit timing.
-    let cs2 = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+    let cs2 = cap_create_cspace(ctx.memory_base, 0, 4, 8)
         .map_err(|_| "integration::thread_lifecycle: cap_create_cspace (step 8) failed")?;
-    let th2 = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs2)
+    let th2 = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs2)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread (step 8) failed")?;
 
     thread_set_priority(th2, 5, 0)
@@ -142,8 +142,8 @@ fn blocker_entry(arg: u64) -> !
 {
     let ready_slot = (arg >> 32) as u32;
     let block_slot = (arg & 0xFFFF_FFFF) as u32;
-    signal_send(ready_slot, 0x1).ok();
-    signal_wait(block_slot).ok();
+    notification_send(ready_slot, 0x1).ok();
+    notification_wait(block_slot).ok();
     loop
     {
         core::hint::spin_loop();
@@ -153,6 +153,6 @@ fn blocker_entry(arg: u64) -> !
 fn phase2_entry() -> !
 {
     let sig = PHASE2_SIG.load(Ordering::Acquire);
-    signal_send(sig, 0x2).ok();
+    notification_send(sig, 0x2).ok();
     thread_exit()
 }

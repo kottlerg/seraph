@@ -5,14 +5,14 @@
 
 //! x86-64 serial output via COM1.
 //!
-//! The driver binds the `IoPortRange` cap devmgr delegated (COM1, `0x3F8`)
+//! The driver binds the `IoPort` cap devmgr delegated (COM1, `0x3F8`)
 //! to its thread, then writes the transmit register after polling the line
 //! status register. The UART was programmed by an earlier boot stage and
 //! that state persists, so no re-initialization is required here.
 
 const COM1: u16 = 0x3F8;
 
-/// Bind the COM1 `IoPortRange` cap to `self_thread` so `out`/`in` against
+/// Bind the COM1 `IoPort` cap to `self_thread` so `out`/`in` against
 /// the UART do not fault. `self_aspace` is unused on x86-64. Returns
 /// `false` if the bind fails.
 pub fn serial_init(self_thread: u32, _self_aspace: u32, ioport_cap: u32) -> bool
@@ -24,7 +24,7 @@ pub fn serial_init(self_thread: u32, _self_aspace: u32, ioport_cap: u32) -> bool
 /// empty (LSR bit `0x20`).
 pub fn serial_write_byte(byte: u8)
 {
-    // SAFETY: COM1 is within the IoPortRange bound by `serial_init`; reading
+    // SAFETY: COM1 is within the IoPort bound by `serial_init`; reading
     // the LSR is side-effect-free.
     while unsafe { inb(COM1 + 5) } & 0x20 == 0
     {}

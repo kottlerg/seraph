@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# no_std: namespace-walk helpers for any service holding a tokened SEND on
+# no_std: namespace-walk helpers for any service holding a badged SEND on
 # a vfsd namespace endpoint. Resolve paths to per-file caps for
 # `procmgr_labels::CREATE_FROM_FILE`, or to attenuated subtree / cwd caps
 # for `procmgr_labels::CONFIGURE_NAMESPACE`. Originally lived in

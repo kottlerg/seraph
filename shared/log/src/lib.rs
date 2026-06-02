@@ -10,11 +10,11 @@
 //! * **Wire-format helpers ([`write_bytes`], [`write_args`],
 //!   [`register_name`]):** thin no-allocation wrappers over the IPC
 //!   labels defined in `ipc::stream_labels`. Callers supply their
-//!   tokened SEND cap and IPC buffer pointer explicitly.
-//! * **Process-global cap cache ([`install_tokened_cap`],
-//!   [`ensure_tokened_cap`]):** holds the pre-installed tokened SEND
+//!   badged SEND cap and IPC buffer pointer explicitly.
+//! * **Process-global cap cache ([`install_badged_cap`],
+//!   [`ensure_badged_cap`]):** holds the pre-installed badged SEND
 //!   cap. Std's `_start` installs the cap procmgr seeded in
-//!   `ProcessInfo.log_send_cap`; init installs its own token-1 cap
+//!   `ProcessInfo.log_send_cap`; init installs its own badge-1 cap
 //!   derived directly from the log endpoint it owns. No discovery
 //!   roundtrip — the cap is live from the first user instruction.
 //!
@@ -57,29 +57,29 @@ const STACK_BUF_LEN: usize = CHUNK_SIZE;
 
 // ── Process-global cap cache ────────────────────────────────────────────────
 
-/// Tokened SEND cap on the log endpoint, pre-installed at process
-/// startup via [`install_tokened_cap`]. Zero when no logger is
+/// Badged SEND cap on the log endpoint, pre-installed at process
+/// startup via [`install_badged_cap`]. Zero when no logger is
 /// reachable (init/memmgr/procmgr-self before its bootstrap completes,
 /// or any tier of the boot chain that runs before the log endpoint
 /// exists); [`emit`] silently drops in that case.
-static TOKENED_CAP: AtomicU32 = AtomicU32::new(0);
+static BADGEED_CAP: AtomicU32 = AtomicU32::new(0);
 
-/// Pre-install a tokened SEND cap on the log endpoint. Called by
+/// Pre-install a badged SEND cap on the log endpoint. Called by
 /// std's `_start` with the cap procmgr seeded in
-/// `ProcessInfo.log_send_cap`, and by init with its self-token-1 cap
+/// `ProcessInfo.log_send_cap`, and by init with its self-badge-1 cap
 /// derived directly from the log endpoint it owns. Idempotent — last
 /// writer wins.
-pub fn install_tokened_cap(cap: u32)
+pub fn install_badged_cap(cap: u32)
 {
-    TOKENED_CAP.store(cap, Ordering::Release);
+    BADGEED_CAP.store(cap, Ordering::Release);
 }
 
-/// Return the pre-installed tokened SEND cap, or zero. Caller is
-/// expected to have set it via [`install_tokened_cap`] before the
+/// Return the pre-installed badged SEND cap, or zero. Caller is
+/// expected to have set it via [`install_badged_cap`] before the
 /// first log call.
-pub fn ensure_tokened_cap(_ipc_buf: *mut u64) -> u32
+pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u32
 {
-    TOKENED_CAP.load(Ordering::Acquire)
+    BADGEED_CAP.load(Ordering::Acquire)
 }
 
 // ── Wire-format primitives ──────────────────────────────────────────────────
@@ -178,17 +178,17 @@ pub fn write_args(cap: u32, ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
     write_bytes(cap, ipc_buf, &buf.data[..buf.used]);
 }
 
-/// One-shot emit: format `args` and send on the pre-installed tokened
+/// One-shot emit: format `args` and send on the pre-installed badged
 /// SEND cap. Silently drops when no cap is installed (the process has
 /// no log access — init/memmgr/procmgr-self before bootstrap, or any
 /// process spawned before the log endpoint existed).
 pub fn emit(ipc_buf: *mut u64, args: core::fmt::Arguments<'_>)
 {
-    let cap = ensure_tokened_cap(ipc_buf);
+    let cap = ensure_badged_cap(ipc_buf);
     if cap == 0
     {
         // Reaching here means the binary linked `seraph::log!` but
-        // received no pre-installed tokened cap. Tier-2 binaries that
+        // received no pre-installed badged cap. Tier-2 binaries that
         // never call `log!` never reach this function (dead-code-
         // eliminated). Loud in debug; silent drop in release for
         // cap-oblivious tier-2 use.

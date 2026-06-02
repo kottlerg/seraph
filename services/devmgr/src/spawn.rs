@@ -14,7 +14,7 @@ use ipc::{IpcMessage, procmgr_labels};
 
 /// Source the child's ELF binary is loaded from. Selected per spawn site:
 /// boot-bundle modules (the bootstrap-essential drivers virtio-blk,
-/// serial, framebuffer) carry a procmgr Frame cap and use
+/// serial, framebuffer) carry a procmgr Memory cap and use
 /// [`CreateSource::Module`]; non-essential drivers loaded from the rootfs
 /// (today: the per-arch RTC, walked by devmgr through its
 /// `SET_DRIVERS_DIR` subtree cap) carry a vfsd file SEND cap plus a size
@@ -25,7 +25,7 @@ use ipc::{IpcMessage, procmgr_labels};
 #[derive(Clone, Copy)]
 pub enum CreateSource
 {
-    /// Frame cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
+    /// Memory cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
     /// Caller retains the slot on failure to match the existing
     /// `spawn_simple_device` contract; kernel transfers ownership on
     /// successful `CREATE_PROCESS`.
@@ -41,8 +41,8 @@ pub enum CreateSource
     },
 }
 
-/// Monotonic counter for driver-child bootstrap tokens.
-static NEXT_BOOTSTRAP_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// Monotonic counter for driver-child bootstrap badges.
+static NEXT_BOOTSTRAP_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Per-device BAR capability set delivered to a driver. `bases` and `sizes`
 /// parallel `caps` and are retained for future multi-BAR drivers; only the
@@ -66,14 +66,14 @@ pub struct DriverSpawnConfig<'a>
     pub irq_cap: Option<u32>,
     pub service_ep: u32,
     pub registry_ep: u32,
-    pub device_token: u64,
+    pub device_badge: u64,
 }
 
 /// Spawn a driver process with per-device capabilities.
 ///
 /// Creates the process via procmgr, starts it, and serves its bootstrap over
-/// IPC to deliver the BAR MMIO, IRQ, and endpoint caps. The `device_token` is
-/// used to derive a per-device tokened send cap from `registry_ep` so the
+/// IPC to deliver the BAR MMIO, IRQ, and endpoint caps. The `device_badge` is
+/// used to derive a per-device badged send cap from `registry_ep` so the
 /// driver can query devmgr for its device configuration.
 ///
 /// Layout matches `drivers/virtio/blk/src/main.rs::bootstrap_caps`:
@@ -110,15 +110,15 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     let module_cap = config.module_cap;
     let service_ep = config.service_ep;
     let registry_ep = config.registry_ep;
-    let device_token = config.device_token;
+    let device_badge = config.device_badge;
 
-    // Allocate a bootstrap token for the child.
-    let child_token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let Ok(tokened_creator) =
-        syscall::cap_derive_token(bootstrap_ep, syscall::RIGHTS_SEND, child_token)
+    // Allocate a bootstrap badge for the child.
+    let child_badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let Ok(badged_creator) =
+        syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, child_badge)
     else
     {
-        std::os::seraph::log!("driver spawn: tokened creator derivation failed");
+        std::os::seraph::log!("driver spawn: badged creator derivation failed");
         return;
     };
 
@@ -127,7 +127,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     // discovery cap procmgr installs in `ProcessInfo`.
     let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
         .cap(module_cap)
-        .cap(tokened_creator)
+        .cap(badged_creator)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
@@ -170,7 +170,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
         0
     };
     let Ok(devmgr_copy) =
-        syscall::cap_derive_token(registry_ep, syscall::RIGHTS_SEND, device_token)
+        syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_SEND, device_badge)
     else
     {
         return;
@@ -194,7 +194,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     if unsafe {
         ipc::bootstrap::serve_round(
             bootstrap_ep,
-            child_token,
+            child_badge,
             ipc_buf,
             false,
             &[bar_copy, irq_copy, service_copy],
@@ -212,7 +212,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     if unsafe {
         ipc::bootstrap::serve_round(
             bootstrap_ep,
-            child_token,
+            child_badge,
             ipc_buf,
             true,
             &[devmgr_copy],
@@ -232,7 +232,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
 /// RECV-rights copy of `service_ep` plus the device's arch authority cap
 /// (`hw_cap`). Unlike [`spawn_driver`] there is no BAR or IRQ.
 ///
-/// `devmgr_query_ep` is an optional tokened SEND on devmgr's
+/// `devmgr_query_ep` is an optional badged SEND on devmgr's
 /// registry-query endpoint, delivered as a round-2 cap so the driver can
 /// fetch runtime metadata via `QUERY_DEVICE_INFO`. Pass `0` to omit
 /// (single terminal round `[service, hw_cap]`, behaviour identical to
@@ -272,7 +272,7 @@ pub fn spawn_simple_device(
     // Source-aware cleanup: on any failure before the procmgr ipc_call
     // completes, `CreateSource::File`'s file_cap is deleted (the
     // namespace walk just produced it; there is no retry value), while
-    // `CreateSource::Module`'s frame cap stays in the caller's slot
+    // `CreateSource::Module`'s memory cap stays in the caller's slot
     // (existing contract — module caps came from bootstrap and the
     // caller may have other uses for them).
     let source_cap_to_clean: u32 = match source
@@ -304,12 +304,12 @@ pub fn spawn_simple_device(
         return false;
     }
 
-    let child_token = NEXT_BOOTSTRAP_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let Ok(tokened_creator) =
-        syscall::cap_derive_token(bootstrap_ep, syscall::RIGHTS_SEND, child_token)
+    let child_badge = NEXT_BOOTSTRAP_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let Ok(badged_creator) =
+        syscall::cap_derive_badge(bootstrap_ep, syscall::RIGHTS_SEND, child_badge)
     else
     {
-        std::os::seraph::log!("simple-device spawn: tokened creator derivation failed");
+        std::os::seraph::log!("simple-device spawn: badged creator derivation failed");
         cleanup_on_fail(hw_cap, devmgr_query_ep, source_cap_to_clean);
         return false;
     };
@@ -318,14 +318,14 @@ pub fn spawn_simple_device(
     {
         CreateSource::Module(module_cap) => IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
             .cap(module_cap)
-            .cap(tokened_creator)
+            .cap(badged_creator)
             .build(),
         CreateSource::File { file_cap, size } =>
         {
             IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
                 .word(0, size)
                 .cap(file_cap)
-                .cap(tokened_creator)
+                .cap(badged_creator)
                 .build()
         }
     };
@@ -405,7 +405,7 @@ pub fn spawn_simple_device(
     if unsafe {
         ipc::bootstrap::serve_round(
             bootstrap_ep,
-            child_token,
+            child_badge,
             ipc_buf,
             round1_done,
             &[service_copy, hw_cap],
@@ -432,7 +432,7 @@ pub fn spawn_simple_device(
         if unsafe {
             ipc::bootstrap::serve_round(
                 bootstrap_ep,
-                child_token,
+                child_badge,
                 ipc_buf,
                 true,
                 &[devmgr_query_ep],

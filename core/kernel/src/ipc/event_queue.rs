@@ -33,7 +33,7 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 /// distinguish full from empty using the one-slot-gap strategy. The ring
 /// pointer is set at construction by `EventQueueState::new` and remains
 /// stable for the lifetime of the cap; reclaim is uniform with the rest
-/// of the slot via `retype_free` against the source `Frame` cap.
+/// of the slot via `retype_free` against the source `Memory` cap.
 pub struct EventQueueState
 {
     /// Raw pointer to the inline ring buffer of `capacity + 1` `u64`
@@ -55,7 +55,7 @@ pub struct EventQueueState
     pub wait_set: *mut u8,
     /// Index of this queue's entry in `WaitSetState::members`.
     pub wait_set_member_idx: u8,
-    /// Serialises post/recv across CPUs (see signal.rs for rationale).
+    /// Serialises post/recv across CPUs (see notification.rs for rationale).
     pub lock: crate::sync::Spinlock,
 }
 
@@ -148,7 +148,7 @@ pub unsafe fn event_queue_post(
         // eq.lock — so no circular wait).
         //
         // ORDER (issue #117): call `sleep_list_remove` BEFORE clearing
-        // `sleep_deadline`. See `signal_send` for the race description.
+        // `sleep_deadline`. See `notification_send` for the race description.
         // SAFETY: waiter is the TCB we just dequeued from eq.waiter.
         unsafe {
             if (*waiter).sleep_deadline != 0
@@ -227,7 +227,7 @@ pub unsafe fn event_queue_recv(
     // Queue empty — block caller.
     //
     // Clear context_saved before making the thread visible as a waiter.
-    // See signal.rs signal_wait for the full rationale.
+    // See notification.rs notification_wait for the full rationale.
     // SAFETY: caller is a valid TCB; context_saved is AtomicU32.
     unsafe {
         (*caller)

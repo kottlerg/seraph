@@ -1,7 +1,7 @@
 # vfsd
 
 Virtual filesystem daemon. vfsd is a namespace server with no on-disk
-storage: it composes a synthetic system root from per-mount tokened
+storage: it composes a synthetic system root from per-mount badged
 SEND caps on filesystem drivers, mints the root cap that every
 process receives in `ProcessInfo.system_root_cap`, and stays out of
 the I/O path after the walk. vfsd self-mounts the Seraph root partition
@@ -45,7 +45,7 @@ vfsd/
   are spawned only after the mount, so `GET_SYSTEM_ROOT_CAP` is never
   served against an unmounted root.
 - **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
-  its un-tokened service endpoint, with multi-threaded recv so a
+  its un-badged service endpoint, with multi-threaded recv so a
   worker-driven `CREATE_FROM_FILE` re-entry cannot deadlock an in-
   flight reply. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts); no in-tree caller issues
@@ -70,7 +70,7 @@ vfsd/
   elsewhere. vfsd supplies each driver with a partition-scoped block
   device endpoint and the receive side of its own service endpoint.
 - **GPT enumeration + mount discovery** — parses the GPT partition
-  table from a single scratch frame at startup, then resolves the
+  table from a single scratch memory cap at startup, then resolves the
   arch-conditional root GUID in `src/role_guids.rs` via
   `gpt::lookup_partition_by_type_guid` for the self-mount. The EFI
   System Partition (matched by its standard type GUID) auto-mounts at
@@ -90,7 +90,7 @@ virtio-blk's whole-disk endpoint.
 
 Once a client holds a node cap returned by `NS_LOOKUP` through the
 synthetic root or via transparent root delegation, every subsequent
-operation (`NS_LOOKUP` on subdirectories, `NS_READ` / `NS_READ_FRAME`,
+operation (`NS_LOOKUP` on subdirectories, `NS_READ` / `NS_READ_MEMORY`,
 `FS_CLOSE`) goes directly to the owning filesystem driver. vfsd is
 not on the request path.
 
@@ -101,7 +101,7 @@ not on the request path.
 devmgr discovers storage hardware, spawns block device drivers, and
 publishes their endpoints in the device registry. vfsd queries the
 registry at startup to obtain the whole-disk virtio-blk endpoint;
-per-mount partition tokens are derived from it. See
+per-mount partition badges are derived from it. See
 [`docs/device-management.md`](../../docs/device-management.md).
 
 ---
@@ -111,12 +111,12 @@ per-mount partition tokens are derived from it. See
 | Document | Content |
 |---|---|
 | [docs/namespace-model.md](../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing |
-| [docs/capability-model.md](../../docs/capability-model.md) | Token semantics, derivation, revocation |
+| [docs/capability-model.md](../../docs/capability-model.md) | Badge semantics, derivation, revocation |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
 | [docs/device-management.md](../../docs/device-management.md) | Device registry, block device endpoints |
 | [docs/architecture.md](../../docs/architecture.md) | vfsd role in the boot lifecycle |
 | [shared/namespace-protocol/README.md](../../shared/namespace-protocol/README.md) | NS_* wire surface |
-| [services/fs/docs/fs-driver-protocol.md](../fs/docs/fs-driver-protocol.md) | Filesystem-driver protocol (FS_MOUNT, FS_READ, FS_READ_FRAME, …) |
+| [services/fs/docs/fs-driver-protocol.md](../fs/docs/fs-driver-protocol.md) | Filesystem-driver protocol (FS_MOUNT, FS_READ, FS_READ_MEMORY, …) |
 
 ---
 

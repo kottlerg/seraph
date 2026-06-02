@@ -17,12 +17,12 @@ the one-time init-logd history pull is skipped on restart.
 ## Role
 
 * **Receiver of the master log endpoint.** Every userspace process
-  holds a pre-installed tokened SEND cap on the same kernel endpoint
+  holds a pre-installed badged SEND cap on the same kernel endpoint
   (seeded into `ProcessInfo.log_send_cap` by procmgr at spawn time;
   see [`services/procmgr/src/process.rs`](../procmgr/src/process.rs)).
   Across the init-logd → real-logd handover the kernel endpoint
   object is unchanged — only the holder of the RECV cap changes —
-  so every pre-existing tokened SEND cap continues to work without
+  so every pre-existing badged SEND cap continues to work without
   re-derivation or re-registration.
 
 * **Driver-mediated serial writer.** logd emits received log lines
@@ -48,12 +48,12 @@ the one-time init-logd history pull is skipped on restart.
 
 * **Per-sender slot reclamation.** logd creates an `EventQueue` and
   registers it with procmgr via `procmgr_labels::REGISTER_DEATH_EQ`
-  (authorised by the `DEATH_EQ_AUTHORITY` tokened SEND cap svcmgr mints
+  (authorised by the `DEATH_EQ_AUTHORITY` badged SEND cap svcmgr mints
   into logd's bootstrap round). Procmgr binds that EQ as an
   additional death observer on every existing thread and on every
   future spawn. When a process exits, logd's EQ receives
-  `(process_token << 32) | exit_reason`; logd evicts the matching
-  slot from its hash-keyed token table. This is the slot-table
+  `(process_badge << 32) | exit_reason`; logd evicts the matching
+  slot from its hash-keyed badge table. This is the slot-table
   scale + reclamation work folded into the same service per issue
   [#1](https://github.com/kottlerg/seraph/issues/1).
 
@@ -75,7 +75,7 @@ logd/
     ├── main.rs                 # entry, bootstrap, event loop,
     │                           # driver-mediated serial emit, self_log
     ├── handover.rs             # HANDOVER_PULL caller
-    └── slot.rs                 # SlotTable: HashMap<token, Slot>
+    └── slot.rs                 # SlotTable: HashMap<badge, Slot>
                                 # with per-sender history ring
 ```
 
@@ -89,8 +89,8 @@ endpoint, procmgr `SEND|GRANT`, devmgr registry):
 |---|---|
 | 0 | RECV on the master log endpoint |
 | 1 | SEND on the master log endpoint (single-use; carries `HANDOVER_PULL` for the history drain then the terminal `HANDOVER_RELEASE`, then deleted). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover |
-| 2 | Tokened SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
-| 3 | Tokened SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE`) |
+| 2 | Badged SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
+| 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE`) |
 
 logd registers its death-EQ with procmgr before the handover pull (while
 init-logd still drains the endpoint and procmgr is not yet reaping init),

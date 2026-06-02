@@ -51,12 +51,12 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    one `(name, thread_cap)` round per init-bootstrapped substrate
    service, and a terminal round carrying the reserved log-sink sources
    (master-log endpoint + procmgr `SEND|GRANT`) svcmgr keeps to launch and
-   supervise real-logd. Signal `HANDOVER_COMPLETE`; hand init's own kernel
-   objects + reclaimable Frame caps to procmgr via `REGISTER_INIT_TEARDOWN`;
+   supervise real-logd. Notification `HANDOVER_COMPLETE`; hand init's own kernel
+   objects + reclaimable Memory caps to procmgr via `REGISTER_INIT_TEARDOWN`;
    call `sys_thread_exit`. Procmgr binds a death-EQ on both init threads
    (main + init-logd) and runs the reap path once both have exited; a
    liveness backstop force-stops a never-released init-logd so a dropped
-   log handover cannot pin init's frames.
+   log handover cannot pin init's memory caps.
    svcmgr publishes the well-known names it now owns (`rootfs.root`,
    `svcmgr`, `devmgr.registry`) and installs devmgr's `/services/drivers/`
    cap via `SET_DRIVERS_DIR` from the endowment; it then launches the
@@ -97,7 +97,7 @@ transfer table.
 | [docs/namespace-model.md](../../docs/namespace-model.md) | Namespace-cap distribution invariants |
 | [abi/boot-protocol/](../../abi/boot-protocol/) | `BootInfo`, `bootstrap.bundle`, initial CSpace |
 | [abi/init-protocol/](../../abi/init-protocol/) | Kernel-to-init handover (`InitInfo`, module-name table) |
-| [services/memmgr/README.md](../memmgr/README.md) | First service init creates; receives the RAM Frame pool |
+| [services/memmgr/README.md](../memmgr/README.md) | First service init creates; receives the RAM Memory cap pool |
 | [services/procmgr/README.md](../procmgr/README.md) | Owns process creation post-bootstrap; runs init's reap path |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Takes over as resident supervisor after `HANDOVER_COMPLETE` |
 | [services/logd/README.md](../logd/README.md) | Master log endpoint owner; svcmgr-launched, pulls init-logd's history at handover |

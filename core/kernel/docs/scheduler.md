@@ -154,11 +154,11 @@ pub struct ThreadControlBlock
     /// Pending send message buffer (used while BlockedOnSend).
     pending_send: PendingSendBuffer,
 
-    /// Wakeup value (payload for signal/event wakeup).
+    /// Wakeup value (payload for notification/event wakeup).
     wakeup_value: u64,
 
-    /// Token from a wait set wakeup.
-    wakeup_token: u64,
+    /// Badge from a wait set wakeup.
+    wakeup_badge: u64,
 
     /// Intrusive IPC wait queue link.
     ipc_wait_next: Option<*mut ThreadControlBlock>,
@@ -195,7 +195,7 @@ Created ──(SYS_THREAD_START)──► Ready ──(scheduled)──► Runni
                                   │     yield)            │
                                   │◄──────────────────────┘
                                   │
-                          (IPC block, signal wait, etc.)
+                          (IPC block, notification wait, etc.)
                                   │
                                 Blocked
                                   │

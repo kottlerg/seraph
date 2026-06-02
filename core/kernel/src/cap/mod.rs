@@ -9,21 +9,21 @@
 //! (id 0) populated with initial capabilities for all boot-provided hardware
 //! resources:
 //!
-//! - Usable physical memory → [`CapTag::Frame`] caps (MAP | WRITE | EXECUTE)
+//! - Usable physical memory → [`CapTag::Memory`] caps (MAP | WRITE | EXECUTE)
 //! - MMIO apertures (coarse non-RAM ranges from the boot protocol)
-//!   → [`CapTag::MmioRegion`] caps (MAP | WRITE)
+//!   → [`CapTag::Mmio`] caps (MAP | WRITE)
 //! - One root [`CapTag::Interrupt`] range cap covering every valid IRQ id
 //!   (userspace narrows via `sys_irq_split`)
 //! - Per `AcpiReclaimable` region, the ACPI RSDP page, and the DTB blob →
-//!   read-only [`CapTag::Frame`] caps so userspace can parse firmware tables
-//! - One root [`CapTag::IoPortRange`] cap covering the full 64K I/O port
+//!   read-only [`CapTag::Memory`] caps so userspace can parse firmware tables
+//! - One root [`CapTag::IoPort`] cap covering the full 64K I/O port
 //!   space (x86-64, USE)
 //! - One [`CapTag::SchedControl`] cap (ELEVATE)
 //! - One [`CapTag::SbiControl`] cap on RISC-V (CALL)
 //!
 //! The populated `CSpace` is stored in [`ROOT_CSPACE`] until Phase 9 hands it
-//! to the init process. Boot module ELF images get their own RO Frame caps
-//! in [`mint_module_frame_caps`].
+//! to the init process. Boot module ELF images get their own RO Memory caps
+//! in [`mint_module_memory_caps`].
 
 // cast_possible_truncation: u64→usize/u32/u16 capability field extractions bounded by capability space.
 #![allow(clippy::cast_possible_truncation)]
@@ -50,9 +50,9 @@ pub use cspace::{CSpace, CapError, L1_SIZE, L2_SIZE};
 pub use derivation::DERIVATION_LOCK;
 #[allow(unused_imports)]
 pub use object::{
-    AddressSpaceObject, CSpaceKernelObject, EndpointObject, FrameObject, InterruptObject,
-    IoPortRangeObject, KernelObjectHeader, MmioRegionObject, ObjectType, SbiControlObject,
-    SchedControlObject, SignalObject, ThreadObject,
+    AddressSpaceObject, CSpaceKernelObject, EndpointObject, InterruptObject, IoPortObject,
+    KernelObjectHeader, MemoryObject, MmioObject, NotificationObject, ObjectType, SbiControlObject,
+    SchedControlObject, ThreadObject,
 };
 #[allow(unused_imports)]
 pub use slot::{CSpaceId, CapTag, CapabilitySlot, Rights, SlotId};
@@ -70,7 +70,7 @@ use crate::mm::paging::phys_to_virt;
 ///
 /// The pointer indexes into a SEED-derived retype slab whose storage is
 /// pinned for the lifetime of the kernel (the seed's pin keeps the chunk
-/// alive — see [`install_seed_frame`]). Set in [`init_capability_system`]
+/// alive — see [`install_seed_memory`]). Set in [`init_capability_system`]
 /// via [`boot_retype_cspace`]; consumed (read out into init's TCB) during
 /// Phase 9. Access is single-threaded during boot; `static mut` is safe
 /// here under that invariant.
@@ -421,7 +421,7 @@ pub fn lookup_cspace(id: CSpaceId, expected_epoch: u32) -> Option<*mut CSpace>
     Some(ptr)
 }
 
-/// Sum [`FrameObject::available_bytes`] across every [`CapTag::Frame`] cap
+/// Sum [`MemoryObject::available_bytes`] across every [`CapTag::Memory`] cap
 /// in `cspace`. Used by Phase 9 to print the boot-handover ledger so that
 /// "RAM granted to userspace as retypable bytes" can be reconciled against
 /// the buddy/SEED bookkeeping over time.
@@ -429,20 +429,20 @@ pub fn lookup_cspace(id: CSpaceId, expected_epoch: u32) -> Option<*mut CSpace>
 /// Must be called single-threaded with no concurrent retype/dealloc.
 #[cfg(not(test))]
 #[must_use]
-pub fn sum_frame_available_bytes(cspace: &cspace::CSpace) -> u64
+pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 {
     use core::sync::atomic::Ordering;
     let mut sum: u64 = 0;
     cspace.for_each_object(|obj_nn| {
         // SAFETY: for_each_object yields live KernelObjectHeader pointers.
         let obj_type = unsafe { obj_nn.as_ref().obj_type };
-        if obj_type == object::ObjectType::Frame
+        if obj_type == object::ObjectType::Memory
         {
-            // cast_ptr_alignment: header at offset 0; FrameObject is repr(C).
+            // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
             #[allow(clippy::cast_ptr_alignment)]
-            // SAFETY: obj_type confirms FrameObject layout; pointer live.
-            let frame = unsafe { &*obj_nn.as_ptr().cast::<object::FrameObject>() };
-            sum += frame.available_bytes.load(Ordering::Acquire);
+            // SAFETY: obj_type confirms MemoryObject layout; pointer live.
+            let memory = unsafe { &*obj_nn.as_ptr().cast::<object::MemoryObject>() };
+            sum += memory.available_bytes.load(Ordering::Acquire);
         }
     });
     sum
@@ -453,14 +453,14 @@ const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
 
 /// Target slot capacity for the root `CSpace`'s initial slot-page pool.
 ///
-/// `populate_cspace` plus [`mint_module_frame_caps`] mint ~150 caps into
+/// `populate_cspace` plus [`mint_module_memory_caps`] mint ~150 caps into
 /// the root; userspace init then mints, copies, and derives ~700 more
 /// caps during memmgr / procmgr bootstrap (kernel-object inserts +
-/// per-RAM-Frame derive/copy chains in `finalize_memmgr`). Sized at
+/// per-RAM-Memory derive/copy chains in `finalize_memmgr`). Sized at
 /// 1536 slots: roughly 1.8× the observed ~850-cap pre-memmgr-handover
 /// peak. The headroom absorbs realistic per-RAM-block-count growth
-/// (more drained blocks ⇒ more init-time Frame-cap derivations) and
-/// per-service growth (more boot modules ⇒ more module-frame caps)
+/// (more drained blocks ⇒ more init-time Memory-cap derivations) and
+/// per-service growth (more boot modules ⇒ more module-memory caps)
 /// without revisiting this knob.
 ///
 /// MUST be kept in sync with the boot footprint: a target below the
@@ -472,7 +472,7 @@ const ROOT_CSPACE_MAX_SLOTS: usize = 14336;
 #[cfg(not(test))]
 const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 
-/// Pages carved from `SEED_FRAME` for the root `CSpace` slab: page 0 is the
+/// Pages carved from `SEED_MEMORY` for the root `CSpace` slab: page 0 is the
 /// wrapper page (`CSpaceKernelObject` + inlined `CSpace`); the remaining
 /// pages seed the slot-page pool. Sized so the pool holds at least
 /// [`ROOT_CSPACE_INIT_SLOT_CAPACITY`] slots regardless of `L2_SIZE`
@@ -482,16 +482,16 @@ const ROOT_CSPACE_INIT_SLOT_CAPACITY: u64 = 1536;
 const ROOT_CSPACE_INIT_PAGES: u64 =
     1 + ROOT_CSPACE_INIT_SLOT_CAPACITY.div_ceil(cspace::L2_SIZE as u64);
 
-// ── Phase-7 seed Frame cap ───────────────────────────────────────────────────
+// ── Phase-7 seed Memory cap ───────────────────────────────────────────────────
 
 /// Bytes carved off the front of the largest drained RAM block to host
 /// every initial cap-identity body.
 ///
 /// Today's footprint on `x86_64` is ~150 KB:
 /// ~15 KB for sub-page cap-identity bodies (≈ 110 bin-128 slots: 91 other
-/// RAM `FrameObject`s + 10 `MmioRegion` wrappers + 1 `Interrupt` + 1
-/// `IoPortRange` + 1 `SchedControl` + 2 ACPI Frames + 6 module Frames +
-/// 3 init-segment Frames + 1 seed-tail Frame, plus the seed's own
+/// RAM `MemoryObject`s + 10 `Mmio` wrappers + 1 `Interrupt` + 1
+/// `IoPort` + 1 `SchedControl` + 2 ACPI Memory caps + 6 module Memory caps +
+/// 3 init-segment Memory caps + 1 seed-tail Memory cap, plus the seed's own
 /// `RetypeAllocator` metadata), plus ~130 KB for init's bootstrap state
 /// (one [`AddressSpaceObject`] slab — wrapper page + root PT + PT growth
 /// pool, one [`CSpaceKernelObject`] slab — wrapper page + slot-page pool,
@@ -500,19 +500,19 @@ const ROOT_CSPACE_INIT_PAGES: u64 =
 /// cap types and longer module lists land without revisiting the constant.
 ///
 /// The remainder of the largest block is exposed to userspace as a
-/// regular retype-backed RAM Frame cap (the "seed-tail"), so init and
+/// regular retype-backed RAM Memory cap (the "seed-tail"), so init and
 /// memmgr operate on virgin caps with zero behavioural change in their
 /// front-split allocators.
 #[cfg(not(test))]
 const SEED_RESERVE_BYTES: u64 = 512 * 1024;
 
-/// BSS-static `FrameObject` covering the seed RAM region.
+/// BSS-static `MemoryObject` covering the seed RAM region.
 ///
-/// Phase 7 mints every initial cap identity (`FrameObject` for every
-/// drained RAM block, `MmioRegion` / `Interrupt` / `IoPortRange` /
+/// Phase 7 mints every initial cap identity (`MemoryObject` for every
+/// drained RAM block, `Mmio` / `Interrupt` / `IoPort` /
 /// `SchedControl` / `SbiControl` wrappers, plus firmware-table and
-/// boot-module `FrameObject`s, plus init's ELF-segment `FrameObject`s,
-/// plus the seed-tail `FrameObject` exposing the rest of the largest
+/// boot-module `MemoryObject`s, plus init's ELF-segment `MemoryObject`s,
+/// plus the seed-tail `MemoryObject` exposing the rest of the largest
 /// drained block) from this seed via [`crate::cap::retype::boot_retype_body`].
 /// The bodies land inside the seed's `SEED_RESERVE_BYTES` reservation,
 /// debited from `available_bytes` like every other byte.
@@ -520,9 +520,9 @@ const SEED_RESERVE_BYTES: u64 = 512 * 1024;
 /// The seed itself is **not** inserted into init's `CSpace`: it is pure
 /// kernel-internal storage. Userspace sees the largest drained block's
 /// RAM via the seed-tail cap, which is virgin (`bump_offset = 0`) and
-/// behaves like every other RAM Frame cap.
+/// behaves like every other RAM Memory cap.
 ///
-/// Pinned with a `+1` refcount in [`install_seed_frame`] so dealloc never
+/// Pinned with a `+1` refcount in [`install_seed_memory`] so dealloc never
 /// fires against this static. The static's initial `ref_count = 1`
 /// represents that pin; every retyped descendant body adds another
 /// reference; reclaim of every descendant drops back to `1`, which is
@@ -532,10 +532,10 @@ const SEED_RESERVE_BYTES: u64 = 512 * 1024;
 /// Single-threaded boot context permits `static mut`; `addr_of(_mut)!`
 /// access patterns sidestep the `static_mut_refs` lint.
 #[cfg(not(test))]
-static mut SEED_FRAME: object::FrameObject = object::FrameObject {
+static mut SEED_MEMORY: object::MemoryObject = object::MemoryObject {
     header: object::KernelObjectHeader {
         ref_count: AtomicU32::new(1),
-        obj_type: object::ObjectType::Frame,
+        obj_type: object::ObjectType::Memory,
         flags: 0,
         _pad: [0; 2],
         ancestor: AtomicPtr::new(core::ptr::null_mut()),
@@ -548,28 +548,28 @@ static mut SEED_FRAME: object::FrameObject = object::FrameObject {
     lock: AtomicU32::new(0),
 };
 
-/// Borrow the seed `FrameObject` shared.
+/// Borrow the seed `MemoryObject` shared.
 ///
-/// `base`/`size` are mutated only during [`install_seed_frame`] (single-
+/// `base`/`size` are mutated only during [`install_seed_memory`] (single-
 /// threaded Phase 7); after that, retype/dealloc paths see them as stable.
 #[cfg(not(test))]
-pub(crate) fn seed_frame_ref() -> &'static object::FrameObject
+pub(crate) fn seed_memory_ref() -> &'static object::MemoryObject
 {
-    let p = core::ptr::addr_of!(SEED_FRAME);
-    // SAFETY: `SEED_FRAME` is a non-null BSS static; `addr_of!` produces a
+    let p = core::ptr::addr_of!(SEED_MEMORY);
+    // SAFETY: `SEED_MEMORY` is a non-null BSS static; `addr_of!` produces a
     // valid pointer for shared access.
     unsafe { &*p }
 }
 
-/// `NonNull` over the seed `FrameObject`'s header for use as a
+/// `NonNull` over the seed `MemoryObject`'s header for use as a
 /// `KernelObjectHeader::with_ancestor` argument and as the seed slot's
 /// `object` pointer.
 #[cfg(not(test))]
 pub(crate) fn seed_header_nn() -> NonNull<object::KernelObjectHeader>
 {
-    // SAFETY: `SEED_FRAME` is a non-null BSS static; `addr_of_mut!` produces
+    // SAFETY: `SEED_MEMORY` is a non-null BSS static; `addr_of_mut!` produces
     // a valid pointer.
-    let p = unsafe { core::ptr::addr_of_mut!(SEED_FRAME.header) };
+    let p = unsafe { core::ptr::addr_of_mut!(SEED_MEMORY.header) };
     // SAFETY: `p` is non-null; the lifetime of the underlying storage is
     // the kernel image lifetime (the seed is pinned).
     unsafe { NonNull::new_unchecked(p) }
@@ -586,7 +586,7 @@ pub(crate) fn seed_header_nn() -> NonNull<object::KernelObjectHeader>
     NonNull::dangling()
 }
 
-/// One-shot Phase-7 seed initializer. Sets the seed `FrameObject`'s runtime
+/// One-shot Phase-7 seed initializer. Sets the seed `MemoryObject`'s runtime
 /// fields (covering the front [`SEED_RESERVE_BYTES`] of the largest
 /// drained block) and bumps the refcount once for the kernel pin. Caller
 /// must invoke before any [`crate::cap::retype::boot_retype_body`] against
@@ -596,9 +596,9 @@ pub(crate) fn seed_header_nn() -> NonNull<object::KernelObjectHeader>
 ///
 /// Call exactly once during Phase 7, single-threaded.
 #[cfg(not(test))]
-unsafe fn install_seed_frame(base: u64)
+unsafe fn install_seed_memory(base: u64)
 {
-    let p = core::ptr::addr_of_mut!(SEED_FRAME);
+    let p = core::ptr::addr_of_mut!(SEED_MEMORY);
     // SAFETY: single-threaded boot; the seed is not published anywhere
     // until after this call, so no other reader exists.
     unsafe {
@@ -612,7 +612,7 @@ unsafe fn install_seed_frame(base: u64)
 
 /// Drain results: per-RAM-block (physical base, size in bytes). The seed
 /// block contributes only its post-reserve tail; every other block its
-/// full size. `populate_cspace` mints one Frame cap per entry.
+/// full size. `populate_cspace` mints one Memory cap per entry.
 ///
 /// Production path populates this from the buddy drain via
 /// [`drain_and_install_seed`]; the test path passes an empty slice and
@@ -749,10 +749,10 @@ pub(crate) fn init_stack_phys(i: usize) -> u64
     phys
 }
 
-/// Drain user-cap RAM from the buddy and install [`SEED_FRAME`] over the
+/// Drain user-cap RAM from the buddy and install [`SEED_MEMORY`] over the
 /// largest drained block, reserving its first [`SEED_RESERVE_BYTES`] for
 /// kernel-internal cap-identity storage. Returns the per-block
-/// (base, size) records ready for `populate_cspace` to mint Frame caps.
+/// (base, size) records ready for `populate_cspace` to mint Memory caps.
 ///
 /// Before draining, reserves init's Phase-9 backing (the `InitInfo` block and
 /// user stack) and seeds [`crate::mm::kernel_pt_pool`] from the pristine buddy,
@@ -814,7 +814,7 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
 
     if block_count == 0
     {
-        crate::fatal("Phase 7: no drained RAM blocks to seed Frame caps");
+        crate::fatal("Phase 7: no drained RAM blocks to seed Memory caps");
     }
 
     // Largest block hosts the seed; anything else is exposed verbatim.
@@ -831,7 +831,7 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
     }
 
     // SAFETY: first and only call; single-threaded Phase 7.
-    unsafe { install_seed_frame(seed_block_base) };
+    unsafe { install_seed_memory(seed_block_base) };
 
     let mut drained_pages: usize = 0;
     for (i, &(addr, order)) in order_buf[..block_count].iter().enumerate()
@@ -842,7 +842,7 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
         {
             // Seed-tail: front SEED_RESERVE_BYTES go to the SEED's pool
             // (kernel-internal); the remainder is exposed as a virgin RAM
-            // Frame cap.
+            // Memory cap.
             (
                 seed_block_base + SEED_RESERVE_BYTES,
                 seed_block_size - SEED_RESERVE_BYTES,
@@ -883,7 +883,7 @@ pub(crate) unsafe fn drain_and_install_seed(out: &mut [RamBlock]) -> usize
 #[cfg(not(test))]
 #[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe fn boot_retype_aspace(
-    seed: &object::FrameObject,
+    seed: &object::MemoryObject,
     init_pages: u64,
 ) -> (
     NonNull<object::KernelObjectHeader>,
@@ -904,10 +904,10 @@ pub(crate) unsafe fn boot_retype_aspace(
     let Ok(offset) = retype::retype_allocate(seed, bytes)
     else
     {
-        crate::fatal("boot_retype_aspace: seed Frame too small");
+        crate::fatal("boot_retype_aspace: seed Memory cap too small");
     };
-    let frame_base = seed.base;
-    let wrapper_phys = frame_base + offset;
+    let memory_base = seed.base;
+    let wrapper_phys = memory_base + offset;
     let root_pt_phys = wrapper_phys + PAGE_SIZE as u64;
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
@@ -955,7 +955,13 @@ pub(crate) unsafe fn boot_retype_aspace(
     let pool_pages = init_pages - 2;
     // SAFETY: aso_ptr just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
-        (*aso_ptr).add_chunk(seed_header_nn(), frame_base, offset, init_pages, pool_pages)
+        (*aso_ptr).add_chunk(
+            seed_header_nn(),
+            memory_base,
+            offset,
+            init_pages,
+            pool_pages,
+        )
     };
     if res.is_err()
     {
@@ -980,7 +986,7 @@ pub(crate) unsafe fn boot_retype_aspace(
 #[cfg(not(test))]
 #[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe fn boot_retype_cspace(
-    seed: &object::FrameObject,
+    seed: &object::MemoryObject,
     init_pages: u64,
     max_slots: usize,
     id: CSpaceId,
@@ -1000,10 +1006,10 @@ pub(crate) unsafe fn boot_retype_cspace(
     let Ok(offset) = retype::retype_allocate(seed, bytes)
     else
     {
-        crate::fatal("boot_retype_cspace: seed Frame too small");
+        crate::fatal("boot_retype_cspace: seed Memory cap too small");
     };
-    let frame_base = seed.base;
-    let wrapper_phys = frame_base + offset;
+    let memory_base = seed.base;
+    let wrapper_phys = memory_base + offset;
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
     // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
@@ -1049,7 +1055,13 @@ pub(crate) unsafe fn boot_retype_cspace(
     let pool_pages = init_pages - 1;
     // SAFETY: wrapper just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
-        (*cs_kobj_ptr).add_chunk(seed_header_nn(), frame_base, offset, init_pages, pool_pages)
+        (*cs_kobj_ptr).add_chunk(
+            seed_header_nn(),
+            memory_base,
+            offset,
+            init_pages,
+            pool_pages,
+        )
     };
     if res.is_err()
     {
@@ -1062,7 +1074,7 @@ pub(crate) unsafe fn boot_retype_cspace(
 }
 
 /// Phase-7 mint helper: in production, retype `body` in place inside the
-/// seed Frame cap and bump the seed's refcount; in tests, leak `body` via
+/// seed Memory cap and bump the seed's refcount; in tests, leak `body` via
 /// `Box`. Returns a `NonNull<KernelObjectHeader>` suitable for
 /// [`insert_or_fatal`].
 ///
@@ -1074,7 +1086,7 @@ pub(crate) fn mint_phase7_body<T>(body: T) -> NonNull<object::KernelObjectHeader
 {
     #[cfg(not(test))]
     {
-        crate::cap::retype::boot_retype_body(seed_frame_ref(), body)
+        crate::cap::retype::boot_retype_body(seed_memory_ref(), body)
     }
     #[cfg(test)]
     {
@@ -1092,10 +1104,10 @@ pub(crate) fn mint_phase7_body<T>(body: T) -> NonNull<object::KernelObjectHeader
 /// [`InitInfo`](init_protocol::InitInfo) page without re-scanning the `CSpace`.
 pub struct CSpaceLayout
 {
-    /// First slot index of usable memory `Frame` capabilities.
-    pub memory_frame_base: u32,
-    /// Number of usable memory `Frame` capabilities.
-    pub memory_frame_count: u32,
+    /// First slot index of usable memory `Memory` capabilities.
+    pub memory_base: u32,
+    /// Number of usable memory `Memory` capabilities.
+    pub memory_count: u32,
     /// First slot index of hardware resource capabilities (MMIO, IRQ, I/O port, firmware tables).
     pub hw_cap_base: u32,
     /// Number of hardware resource capabilities.
@@ -1107,17 +1119,17 @@ pub struct CSpaceLayout
     /// Slot index of the root `Interrupt` range capability. Zero if no
     /// valid range could be determined at boot.
     pub irq_range_slot: u32,
-    /// Slot index of the RO `Frame` cap covering the ACPI RSDP page.
+    /// Slot index of the RO `Memory` cap covering the ACPI RSDP page.
     /// Zero if `BootInfo.acpi_rsdp` is zero.
-    pub acpi_rsdp_frame_slot: u32,
-    /// First slot index of the RO `Frame` caps covering the
+    pub acpi_rsdp_memory_slot: u32,
+    /// First slot index of the RO `Memory` caps covering the
     /// `AcpiReclaimable` regions from the boot memory map.
-    pub acpi_region_frame_base: u32,
-    /// Number of ACPI reclaimable-region `Frame` caps.
-    pub acpi_region_frame_count: u32,
-    /// Slot index of the RO `Frame` cap covering the DTB blob.
+    pub acpi_region_memory_base: u32,
+    /// Number of ACPI reclaimable-region `Memory` caps.
+    pub acpi_region_memory_count: u32,
+    /// Slot index of the RO `Memory` cap covering the DTB blob.
     /// Zero if `BootInfo.device_tree` is zero.
-    pub dtb_frame_slot: u32,
+    pub dtb_memory_slot: u32,
     /// Total number of populated slots.
     pub total_populated: usize,
     /// Number of valid entries in the global [`CSPACE_LAYOUT_DESCRIPTORS`]
@@ -1129,19 +1141,19 @@ pub struct CSpaceLayout
     pub module_name_count: u32,
     /// Module-name → cap-slot table mirroring
     /// [`init_protocol::InitInfo::module_names`]. Populated by
-    /// `mint_module_frame_caps` and written verbatim into the
+    /// `mint_module_memory_caps` and written verbatim into the
     /// `InitInfo` header by Phase 9.
     pub module_names: [init_protocol::InitModuleName; init_protocol::INIT_MAX_NAMED_MODULES],
 }
 
 /// Capacity of the [`CSPACE_LAYOUT_DESCRIPTORS`] backing buffer. Bounded
 /// by every cap kind minted at boot:
-/// - [`MAX_DRAIN_BLOCKS`] RAM Frame caps (worst case from the buddy drain).
-/// - ~32 hardware caps (MMIO + IRQ + `IoPortRange`/`SbiControl` + `SchedControl`).
+/// - [`MAX_DRAIN_BLOCKS`] RAM Memory caps (worst case from the buddy drain).
+/// - ~32 hardware caps (MMIO + IRQ + `IoPort`/`SbiControl` + `SchedControl`).
 /// - 8 ACPI region caps (`MAX_ACPI_REGIONS`), 1 ACPI RSDP, 1 DTB.
 /// - ~8 init segment caps + ~16 boot module caps.
-/// - [`boot_protocol::MAX_RECLAIM_RANGES`] reclaim Frame caps (worst case
-///   from `mint_reclaim_frame_caps`).
+/// - [`boot_protocol::MAX_RECLAIM_RANGES`] reclaim Memory caps (worst case
+///   from `mint_reclaim_memory_caps`).
 ///
 /// `4096 + 256 + 128 = 4480` covers the worst case with headroom; BSS
 /// cost is 4480 × 24 B ≈ 105 KiB, comfortably small relative to total
@@ -1160,7 +1172,7 @@ pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESC
     #[allow(clippy::declare_interior_mutable_const)]
     const VACANT: CapDescriptor = CapDescriptor {
         slot: 0,
-        cap_type: init_protocol::CapType::Frame,
+        cap_type: init_protocol::CapType::Memory,
         pad: [0; 3],
         aux0: 0,
         aux1: 0,
@@ -1173,7 +1185,7 @@ pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESC
 pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESCRIPTORS] =
     [CapDescriptor {
         slot: 0,
-        cap_type: init_protocol::CapType::Frame,
+        cap_type: init_protocol::CapType::Memory,
         pad: [0; 3],
         aux0: 0,
         aux1: 0,
@@ -1186,8 +1198,8 @@ pub static mut CSPACE_LAYOUT_DESCRIPTORS: [CapDescriptor; CSPACE_LAYOUT_MAX_DESC
 ///
 /// # Safety
 /// `layout.descriptor_count` must reflect the entries written by the
-/// `populate_cspace`, `mint_module_frame_caps`, and
-/// `mint_reclaim_frame_caps` writers that produced `layout`.
+/// `populate_cspace`, `mint_module_memory_caps`, and
+/// `mint_reclaim_memory_caps` writers that produced `layout`.
 /// Single-threaded boot guarantees no concurrent writer.
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn descriptors(layout: &CSpaceLayout) -> &'static [CapDescriptor]
@@ -1204,21 +1216,21 @@ pub unsafe fn descriptors(layout: &CSpaceLayout) -> &'static [CapDescriptor]
     &arr_ref[..layout.descriptor_count]
 }
 
-/// Running total of `owns_memory = true` `Frame` cap bytes minted into
+/// Running total of `owns_memory = true` `Memory` cap bytes minted into
 /// init's root `CSpace`. These pages are the reclaimable complement of the
 /// fixed kernel reserve; `kernel_reserved_bytes = system_ram - this`.
 /// Single-threaded boot, so a relaxed atomic suffices.
 static OWNS_MEMORY_MINTED_BYTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// Record `bytes` of a newly-minted `owns_memory` `Frame` cap toward the
+/// Record `bytes` of a newly-minted `owns_memory` `Memory` cap toward the
 /// minted-to-init ledger. Called at every Phase-7/Phase-9 mint site.
 pub(crate) fn note_owns_memory_minted(bytes: u64)
 {
     OWNS_MEMORY_MINTED_BYTES.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Total `owns_memory` `Frame` cap bytes minted to init.
+/// Total `owns_memory` `Memory` cap bytes minted to init.
 #[must_use]
 pub(crate) fn owns_memory_minted_bytes() -> u64
 {
@@ -1279,14 +1291,14 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
     };
 
     // ── Production path ───────────────────────────────────────────────────
-    // 1. Drain the buddy + install SEED_FRAME (largest block hosts the seed
+    // 1. Drain the buddy + install SEED_MEMORY (largest block hosts the seed
     //    reserve; remainder exposed as the seed-tail cap).
     // 2. Boot-retype the root CSpace from SEED into a typed-memory slab.
-    // 3. populate_cspace fills the root with Frame caps (from the drained
+    // 3. populate_cspace fills the root with Memory caps (from the drained
     //    blocks) plus all hardware-resource caps.
-    // 4. mint_module_frame_caps appends boot-module Frame caps.
-    // 5. mint_reclaim_frame_caps appends reclaimable bootloader-scratch
-    //    Frame caps (BootInfo, descriptor arrays, transient PT frames).
+    // 4. mint_module_memory_caps appends boot-module Memory caps.
+    // 5. mint_reclaim_memory_caps appends reclaimable bootloader-scratch
+    //    Memory caps (BootInfo, descriptor arrays, transient PT frames).
     // 6. Stash the root CSpace pointer; Phase 9 hands it to init.
     #[cfg(not(test))]
     {
@@ -1307,7 +1319,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         // SAFETY: SEED installed above.
         let (_cs_kobj_nn, cs_ptr) = unsafe {
             boot_retype_cspace(
-                seed_frame_ref(),
+                seed_memory_ref(),
                 ROOT_CSPACE_INIT_PAGES,
                 ROOT_CSPACE_MAX_SLOTS,
                 id,
@@ -1323,8 +1335,8 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         // (single-threaded Phase 7).
         let cspace = unsafe { &mut *cs_ptr };
         let mut layout = populate_cspace(cspace, ram_blocks, mmap, mmio_apertures, info);
-        mint_module_frame_caps(cspace, info, &mut layout);
-        mint_reclaim_frame_caps(cspace, info, &mut layout);
+        mint_module_memory_caps(cspace, info, &mut layout);
+        mint_reclaim_memory_caps(cspace, info, &mut layout);
 
         // SAFETY: single-threaded boot; ROOT_CSPACE not yet observed.
         unsafe { ROOT_CSPACE = cs_ptr };
@@ -1334,7 +1346,7 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
 
     // ── Test path ─────────────────────────────────────────────────────────
     // Tests don't exercise the SEED / boot-retype machinery (no buddy, no
-    // direct map, no FrameObject lifecycle in the test stub). They allocate
+    // direct map, no MemoryObject lifecycle in the test stub). They allocate
     // a heap-backed CSpace and let `populate_cspace`'s test-only RAM-mint
     // branch iterate `mmap` directly — `ram_blocks` is empty.
     #[cfg(test)]
@@ -1343,8 +1355,8 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
         let mut cspace = Box::new(CSpace::new(id, ROOT_CSPACE_MAX_SLOTS));
         let empty: [RamBlock; 0] = [];
         let mut layout = populate_cspace(&mut cspace, &empty, mmap, mmio_apertures, info);
-        mint_module_frame_caps(&mut cspace, info, &mut layout);
-        mint_reclaim_frame_caps(&mut cspace, info, &mut layout);
+        mint_module_memory_caps(&mut cspace, info, &mut layout);
+        mint_reclaim_memory_caps(&mut cspace, info, &mut layout);
         // Tests intentionally leak the box; isolated unit-test invariants
         // (every kernel object Boxed via `nonnull_from_box`) make explicit
         // teardown unnecessary.
@@ -1355,9 +1367,9 @@ pub fn init_capability_system(mmio_apertures: &[MmioAperture], boot_info_phys: u
 
 /// Core `CSpace` population logic, separated for testability.
 ///
-/// Creates one capability per usable memory region, one `MmioRegion`
+/// Creates one capability per usable memory region, one `Mmio`
 /// capability per MMIO aperture, and one `SchedControl` capability (plus
-/// the arch-specific root `IoPortRange` on x86-64 and `SbiControl` on
+/// the arch-specific root `IoPort` on x86-64 and `SbiControl` on
 /// RISC-V). Returns a [`CSpaceLayout`] describing the slot ranges and
 /// per-cap descriptors.
 // too_many_lines: one logical pass over all boot-time resource types; splitting
@@ -1391,45 +1403,45 @@ fn populate_cspace(
     // buffer; this counter tracks how many have been written.
     let mut desc_count: usize = 0;
 
-    // Usable physical memory → Frame caps with MAP | WRITE | EXECUTE.
-    // Init is root authority; it holds the full right set for each frame.
+    // Usable physical memory → Memory caps with MAP | WRITE | EXECUTE.
+    // Init is root authority; it holds the full right set for each Memory cap.
     // W^X is enforced at mapping time — no page can be simultaneously
     // writable and executable — but the cap carries both rights so init
     // can derive attenuated sub-caps (MAP|WRITE for data, MAP|EXECUTE
     // for code) when loading processes.
     //
-    // Frame caps are allocated FROM the buddy allocator so the same
+    // Memory caps are allocated FROM the buddy allocator so the same
     // physical pages are not double-booked between the kernel's internal
     // frame pool and userspace capabilities.
     // Initialised to 0 so the test build (which uses an `if count == 0`
     // guard inside its mmap loop to capture the first slot) compiles; the
     // production build overwrites both before any read.
     #[allow(unused_assignments)]
-    let mut memory_frame_base: u32 = 0;
+    let mut memory_base: u32 = 0;
     #[allow(unused_assignments)]
-    let mut memory_frame_count: u32 = 0;
+    let mut memory_count: u32 = 0;
 
     #[cfg(not(test))]
     {
         let seed_anc = seed_header_nn();
 
-        // Mint one Frame cap per drained RAM block. `ram_blocks` is the
+        // Mint one Memory cap per drained RAM block. `ram_blocks` is the
         // already-resolved (base, size) list from `drain_and_install_seed`:
         // the seed block contributes only its post-reserve tail; every
         // other block contributes its full size. SEED itself is never
         // inserted into the CSpace — it's pure kernel-internal storage.
         for &(cap_base, cap_size) in ram_blocks
         {
-            let ptr = mint_phase7_body(FrameObject {
-                header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_anc),
+            let ptr = mint_phase7_body(MemoryObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_anc),
                 base: cap_base,
                 size: cap_size,
                 // Full retypable budget: this cap covers virgin RAM. The
-                // seed's ledger only debits for the FrameObject body bytes.
+                // seed's ledger only debits for the MemoryObject body bytes.
                 available_bytes: core::sync::atomic::AtomicU64::new(cap_size),
                 // Buddy-backed: responsible for freeing its (disjoint) range
                 // on final destruction. The seed's own SEED_RESERVE_BYTES
-                // prefix is owned by the pinned SEED_FRAME and never returns
+                // prefix is owned by the pinned SEED_MEMORY and never returns
                 // to the buddy.
                 owns_memory: core::sync::atomic::AtomicBool::new(true),
                 allocator: crate::cap::retype::RetypeAllocator::new_inline(),
@@ -1437,39 +1449,39 @@ fn populate_cspace(
             });
             let slot = insert_or_fatal(
                 cspace,
-                CapTag::Frame,
+                CapTag::Memory,
                 Rights::MAP | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
                 ptr,
-                "Phase 7: cannot allocate Frame capability for usable memory",
+                "Phase 7: cannot allocate Memory capability for usable memory",
             );
-            if memory_frame_count == 0
+            if memory_count == 0
             {
-                memory_frame_base = slot;
+                memory_base = slot;
             }
             push_descriptor(
                 &mut desc_count,
                 CapDescriptor {
                     slot,
-                    cap_type: CapType::Frame,
+                    cap_type: CapType::Memory,
                     pad: [0; 3],
                     aux0: cap_base,
                     aux1: cap_size,
                 },
             );
             note_owns_memory_minted(cap_size);
-            memory_frame_count += 1;
+            memory_count += 1;
         }
 
         crate::kprintln!(
-            "Phase 7: {} Frame caps minted from {} drained RAM blocks",
-            memory_frame_count,
+            "Phase 7: {} Memory caps minted from {} drained RAM blocks",
+            memory_count,
             ram_blocks.len(),
         );
     }
     #[cfg(test)]
     let _ = ram_blocks;
 
-    // Test builds: create Frame caps directly from mmap entries (no buddy).
+    // Test builds: create Memory caps directly from mmap entries (no buddy).
     #[cfg(test)]
     for entry in mmap
     {
@@ -1477,11 +1489,11 @@ fn populate_cspace(
         {
             continue;
         }
-        // FrameObject invariant: page-aligned base, whole-page size.
+        // MemoryObject invariant: page-aligned base, whole-page size.
         let aligned_base = entry.physical_base & !0xFFF_u64;
         let aligned_size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFF_u64;
-        let obj = Box::new(FrameObject {
-            header: KernelObjectHeader::new(ObjectType::Frame),
+        let obj = Box::new(MemoryObject {
+            header: KernelObjectHeader::new(ObjectType::Memory),
             base: aligned_base,
             size: aligned_size,
             // RAM cap: full retypable budget mirrors the production path.
@@ -1495,29 +1507,29 @@ fn populate_cspace(
         let ptr = nonnull_from_box(obj);
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Frame,
+            CapTag::Memory,
             Rights::MAP | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
             ptr,
-            "Phase 7: cannot allocate Frame capability for usable memory",
+            "Phase 7: cannot allocate Memory capability for usable memory",
         );
-        if memory_frame_count == 0
+        if memory_count == 0
         {
-            memory_frame_base = slot;
+            memory_base = slot;
         }
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::Frame,
+                cap_type: CapType::Memory,
                 pad: [0; 3],
                 aux0: aligned_base,
                 aux1: aligned_size,
             },
         );
-        memory_frame_count += 1;
+        memory_count += 1;
     }
 
-    // MMIO apertures → one MmioRegion cap each, MAP | WRITE. Init is root
+    // MMIO apertures → one Mmio cap each, MAP | WRITE. Init is root
     // authority and holds these coarse caps until userspace narrows them
     // (via `mmio_split`) and delegates device-sized sub-caps to drivers.
     //
@@ -1525,7 +1537,7 @@ fn populate_cspace(
     // `BootInfo.kernel_mmio.uart_base` rather than the coarse aperture
     // list (the ns16550 UART sits outside both the PLIC aperture and the
     // PCIe apertures on every supported platform). Synthesise an extra
-    // MmioRegion cap here so userspace init has a cap for it — init's
+    // Mmio cap here so userspace init has a cap for it — init's
     // serial scan looks for any aperture containing the resolved UART base.
     let mut hw_cap_base: u32 = 0;
     let mut hw_cap_count: u32 = 0;
@@ -1534,8 +1546,8 @@ fn populate_cspace(
     {
         let uart_base = crate::arch::current::platform::uart_base();
         let uart_size = crate::arch::current::platform::uart_size();
-        let ptr = mint_phase7_body(MmioRegionObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
+        let ptr = mint_phase7_body(MmioObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
             base: uart_base,
             size: uart_size,
             flags: 0,
@@ -1543,10 +1555,10 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::MmioRegion,
+            CapTag::Mmio,
             Rights::MAP | Rights::WRITE,
             ptr,
-            "Phase 7: cannot allocate MmioRegion capability for console UART",
+            "Phase 7: cannot allocate Mmio capability for console UART",
         );
         if hw_cap_count == 0
         {
@@ -1557,7 +1569,7 @@ fn populate_cspace(
             &mut desc_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::MmioRegion,
+                cap_type: CapType::Mmio,
                 pad: [0; 3],
                 aux0: uart_base,
                 aux1: uart_size,
@@ -1567,8 +1579,8 @@ fn populate_cspace(
 
     for ap in mmio_apertures
     {
-        let ptr = mint_phase7_body(MmioRegionObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::MmioRegion, seed_header_nn()),
+        let ptr = mint_phase7_body(MmioObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Mmio, seed_header_nn()),
             base: ap.phys_base,
             size: ap.size,
             flags: 0,
@@ -1576,10 +1588,10 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::MmioRegion,
+            CapTag::Mmio,
             Rights::MAP | Rights::WRITE,
             ptr,
-            "Phase 7: cannot allocate MmioRegion capability for aperture",
+            "Phase 7: cannot allocate Mmio capability for aperture",
         );
         if hw_cap_count == 0
         {
@@ -1589,7 +1601,7 @@ fn populate_cspace(
             &mut desc_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::MmioRegion,
+                cap_type: CapType::Mmio,
                 pad: [0; 3],
                 aux0: ap.phys_base,
                 aux1: ap.size,
@@ -1636,7 +1648,7 @@ fn populate_cspace(
     let irq_range_slot = insert_or_fatal(
         cspace,
         CapTag::Interrupt,
-        Rights::SIGNAL,
+        Rights::NOTIFY,
         irq_ptr,
         "Phase 7: cannot allocate root Interrupt range capability",
     );
@@ -1651,18 +1663,18 @@ fn populate_cspace(
         },
     );
 
-    // Read-only Frame caps covering each AcpiReclaimable region. userspace
+    // Read-only Memory caps covering each AcpiReclaimable region. userspace
     // parses XSDT / MADT / MCFG through these. Capped by `MAX_ACPI_REGIONS`
     // so a pathological firmware cannot exhaust the CSpace here.
-    let mut acpi_region_frame_base: u32 = 0;
-    let mut acpi_region_frame_count: u32 = 0;
+    let mut acpi_region_memory_base: u32 = 0;
+    let mut acpi_region_memory_count: u32 = 0;
     for entry in mmap
     {
         if entry.memory_type != MemoryType::AcpiReclaimable
         {
             continue;
         }
-        if (acpi_region_frame_count as usize) >= MAX_ACPI_REGIONS
+        if (acpi_region_memory_count as usize) >= MAX_ACPI_REGIONS
         {
             #[cfg(not(test))]
             crate::kprintln!(
@@ -1672,15 +1684,15 @@ fn populate_cspace(
             break;
         }
         // UEFI memory map entries are page-aligned per UEFI spec §7.2,
-        // but mask defensively to uphold FrameObject's alignment invariant.
+        // but mask defensively to uphold MemoryObject's alignment invariant.
         let aligned_base = entry.physical_base & !0xFFF;
         let size = (entry.physical_base - aligned_base + entry.size + 0xFFF) & !0xFFF;
         if size == 0
         {
             continue;
         }
-        let ptr = mint_phase7_body(FrameObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
+        let ptr = mint_phase7_body(MemoryObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
             base: aligned_base,
             size,
             // Firmware table: not retypable; cap minted without RETYPE.
@@ -1692,40 +1704,40 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Frame,
+            CapTag::Memory,
             Rights::MAP | Rights::READ,
             ptr,
-            "Phase 7: cannot allocate Frame capability for ACPI region",
+            "Phase 7: cannot allocate Memory capability for ACPI region",
         );
-        if acpi_region_frame_count == 0
+        if acpi_region_memory_count == 0
         {
-            acpi_region_frame_base = slot;
+            acpi_region_memory_base = slot;
         }
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::Frame,
+                cap_type: CapType::Memory,
                 pad: [0; 3],
                 aux0: aligned_base,
                 aux1: size,
             },
         );
-        acpi_region_frame_count += 1;
+        acpi_region_memory_count += 1;
     }
 
-    // RO Frame cap over the single 4 KiB page containing the ACPI RSDP.
+    // RO Memory cap over the single 4 KiB page containing the ACPI RSDP.
     // RSDP commonly sits in firmware-reserved memory outside
     // `AcpiReclaimable`, so it gets its own cap regardless of the region scan.
     //
-    // The cap's backing Frame covers the page (aligned base, 4 KiB size),
+    // The cap's backing region covers the page (aligned base, 4 KiB size),
     // but the descriptor's `aux0` carries the exact RSDP physical address
     // so userspace knows where inside the page to start reading.
-    let acpi_rsdp_frame_slot: u32 = if info.acpi_rsdp != 0
+    let acpi_rsdp_memory_slot: u32 = if info.acpi_rsdp != 0
     {
         let page_base = info.acpi_rsdp & !0xFFF;
-        let ptr = mint_phase7_body(FrameObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
+        let ptr = mint_phase7_body(MemoryObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
             base: page_base,
             size: 0x1000,
             // Firmware table: not retypable; cap minted without RETYPE.
@@ -1736,16 +1748,16 @@ fn populate_cspace(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Frame,
+            CapTag::Memory,
             Rights::MAP | Rights::READ,
             ptr,
-            "Phase 7: cannot allocate Frame capability for ACPI RSDP page",
+            "Phase 7: cannot allocate Memory capability for ACPI RSDP page",
         );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::Frame,
+                cap_type: CapType::Memory,
                 pad: [0; 3],
                 aux0: info.acpi_rsdp,
                 aux1: 0x1000,
@@ -1758,17 +1770,17 @@ fn populate_cspace(
         0
     };
 
-    // RO Frame cap covering the DTB blob. The kernel read the totalsize
+    // RO Memory cap covering the DTB blob. The kernel read the totalsize
     // header in `mm::init::collect_exclusions` to keep these pages out of
     // the buddy pool; repeat the read here to size the cap.
-    let dtb_frame_slot: u32 = if info.device_tree != 0
+    let dtb_memory_slot: u32 = if info.device_tree != 0
     {
         let dtb_size = read_dtb_totalsize(info.device_tree).unwrap_or(0);
         if dtb_size != 0
         {
             let rounded = (dtb_size + 0xFFF) & !0xFFF;
-            let ptr = mint_phase7_body(FrameObject {
-                header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
+            let ptr = mint_phase7_body(MemoryObject {
+                header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
                 base: info.device_tree & !0xFFF,
                 size: rounded,
                 // Firmware table: not retypable; cap minted without RETYPE.
@@ -1779,16 +1791,16 @@ fn populate_cspace(
             });
             let slot = insert_or_fatal(
                 cspace,
-                CapTag::Frame,
+                CapTag::Memory,
                 Rights::MAP | Rights::READ,
                 ptr,
-                "Phase 7: cannot allocate Frame capability for DTB blob",
+                "Phase 7: cannot allocate Memory capability for DTB blob",
             );
             push_descriptor(
                 &mut desc_count,
                 CapDescriptor {
                     slot,
-                    cap_type: CapType::Frame,
+                    cap_type: CapType::Memory,
                     pad: [0; 3],
                     aux0: info.device_tree & !0xFFF,
                     aux1: rounded,
@@ -1806,29 +1818,29 @@ fn populate_cspace(
         0
     };
 
-    // x86-64: root IoPortRange covering the full 64K I/O port space.
+    // x86-64: root IoPort covering the full 64K I/O port space.
     // This is a static architectural fact, not derived from any bootloader
     // field. Init subdivides and delegates sub-ranges to services as needed.
     #[cfg(target_arch = "x86_64")]
     {
-        let ptr = mint_phase7_body(IoPortRangeObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::IoPortRange, seed_header_nn()),
+        let ptr = mint_phase7_body(IoPortObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::IoPort, seed_header_nn()),
             base: 0,
             size: 0, // 0 means 0x10000 (full range; u16 cannot hold 65536)
             _pad: 0,
         });
         let ioport_root_slot = insert_or_fatal(
             cspace,
-            CapTag::IoPortRange,
+            CapTag::IoPort,
             Rights::USE,
             ptr,
-            "Phase 7: cannot allocate root IoPortRange capability",
+            "Phase 7: cannot allocate root IoPort capability",
         );
         push_descriptor(
             &mut desc_count,
             CapDescriptor {
                 slot: ioport_root_slot,
-                cap_type: CapType::IoPortRange,
+                cap_type: CapType::IoPort,
                 pad: [0; 3],
                 aux0: 0,
                 aux1: 0x10000, // full 64K range
@@ -1865,17 +1877,17 @@ fn populate_cspace(
     let sbi_control_slot = 0u32;
 
     CSpaceLayout {
-        memory_frame_base,
-        memory_frame_count,
+        memory_base,
+        memory_count,
         hw_cap_base,
         hw_cap_count,
         sched_control_slot,
         sbi_control_slot,
         irq_range_slot,
-        acpi_rsdp_frame_slot,
-        acpi_region_frame_base,
-        acpi_region_frame_count,
-        dtb_frame_slot,
+        acpi_rsdp_memory_slot,
+        acpi_region_memory_base,
+        acpi_region_memory_count,
+        dtb_memory_slot,
         total_populated: cspace.populated_count(),
         descriptor_count: desc_count,
         module_name_count: 0,
@@ -1914,17 +1926,17 @@ fn read_dtb_totalsize(phys: u64) -> Option<u64>
     Some(size)
 }
 
-/// Mint `Frame` capabilities for boot modules into the root `CSpace`.
+/// Mint `Memory` capabilities for boot modules into the root `CSpace`.
 ///
 /// Each boot module (raw ELF image for an early service) gets a read-only
-/// Frame cap. The kernel additionally publishes a name → slot mapping in
+/// Memory cap. The kernel additionally publishes a name → slot mapping in
 /// [`CSpaceLayout::module_names`] so init can match modules by their
 /// bundle entry identifier instead of relying on ordinal position.
 ///
 /// Updates `layout.module_names` / `layout.module_name_count` and
 /// appends [`CapDescriptor`] entries for each module. Init looks
 /// modules up by name via the published `module_names` table.
-fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
+fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
     use boot_protocol::BootModule;
     use init_protocol::CapType;
@@ -1947,7 +1959,7 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
     for module in modules
     {
         // UEFI `AllocatePages` returns page-aligned bases, but mask
-        // defensively to uphold FrameObject's alignment invariant.
+        // defensively to uphold MemoryObject's alignment invariant.
         let aligned_base = module.physical_base & !0xFFF;
         // Round size up so the cap covers every page that holds module bytes.
         let rounded_size = (module.physical_base - aligned_base + module.size + 0xFFF) & !0xFFF;
@@ -1969,8 +1981,8 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
             });
         }
 
-        let ptr = mint_phase7_body(FrameObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
+        let ptr = mint_phase7_body(MemoryObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
             base: aligned_base,
             size: rounded_size,
             // Boot module pages are reclaimable: full byte ledger so the
@@ -1994,17 +2006,17 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
         // cap allowing WRITE.
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Frame,
+            CapTag::Memory,
             Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
             ptr,
-            "Phase 7: cannot allocate Frame capability for boot module",
+            "Phase 7: cannot allocate Memory capability for boot module",
         );
         note_owns_memory_minted(rounded_size);
         push_descriptor(
             &mut layout.descriptor_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::Frame,
+                cap_type: CapType::Memory,
                 pad: [0; 3],
                 aux0: module.physical_base,
                 aux1: module.size,
@@ -2027,15 +2039,15 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
     layout.total_populated = cspace.populated_count();
 }
 
-/// Mint reclaimable `Frame` capabilities over bootloader scratch ranges.
+/// Mint reclaimable `Memory` capabilities over bootloader scratch ranges.
 ///
 /// Walks `boot_info.reclaim_ranges` — the `BootInfo` page, module
 /// descriptor array, memory-map entry array, MMIO aperture array, the
 /// reclaim-array page itself, the bootloader's transient page-table
 /// frames, and the bundle's non-module pages (header + entry table +
 /// pad, init ELF source body, inter-module and trailing slack —
-/// module bodies are excluded because [`mint_module_frame_caps`]
-/// covers them) — and mints one reclaimable `FrameObject`
+/// module bodies are excluded because [`mint_module_memory_caps`]
+/// covers them) — and mints one reclaimable `MemoryObject`
 /// cap per range with `owns_memory = true` and the full byte ledger.
 /// Each cap is inserted into the root `CSpace` and a matching
 /// `CapDescriptor` entry pushed into `layout.descriptors`, so the cap
@@ -2045,34 +2057,34 @@ fn mint_module_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mu
 /// path is a tripwire for a leaked cap, not a routine reclaim.
 ///
 /// Entries marked [`boot_protocol::RECLAIM_FLAG_LATE`] are skipped here
-/// and minted later by [`mint_late_reclaim_frame_caps`] after SMP
+/// and minted later by [`mint_late_reclaim_memory_caps`] after SMP
 /// bringup completes (the AP SIPI trampoline is the only such entry
 /// today).
 ///
-/// Symmetric to [`mint_module_frame_caps`]; runs immediately after it.
+/// Symmetric to [`mint_module_memory_caps`]; runs immediately after it.
 /// The kernel MUST NOT dereference any address inside a recorded
 /// non-late range after this function returns.
 ///
 /// Appends one [`CapDescriptor`] entry per reclaimed range; init walks
 /// the descriptor table to discover the caps. There is no dedicated
-/// `reclaim_frame_base` / `reclaim_frame_count` pair on [`CSpaceLayout`]
+/// `reclaim_memory_base` / `reclaim_memory_count` pair on [`CSpaceLayout`]
 /// because reclaim caps carry no per-index meaning — unlike boot
 /// modules where slot N == module N, reclaim caps are a homogeneous
 /// pool and userspace inspects each `CapDescriptor.aux0`/`aux1` to
 /// learn the underlying physical range.
-fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
+fn mint_reclaim_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
     mint_reclaim_pass(cspace, boot_info, layout, false, "reclaim");
 }
 
-/// Mint reclaimable `Frame` capabilities for entries flagged
+/// Mint reclaimable `Memory` capabilities for entries flagged
 /// [`boot_protocol::RECLAIM_FLAG_LATE`] in `boot_info.reclaim_ranges`.
 ///
 /// Caller MUST have already (a) completed SMP bringup so no AP is
 /// executing inside any late-flagged page, and (b) torn down any kernel
 /// identity mapping that aliases the page (see
 /// [`crate::mm::paging::unmap_identity_page`]). The mint itself is
-/// identical to [`mint_reclaim_frame_caps`] — same `FrameObject`
+/// identical to [`mint_reclaim_memory_caps`] — same `MemoryObject`
 /// shape, same `register_owned_range` ledger entry, same descriptor
 /// push — so init discovers the cap through the standard descriptor
 /// walk.
@@ -2080,7 +2092,7 @@ fn mint_reclaim_frame_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// Must run before Phase 9 consumes [`descriptors`] so the new entry
 /// reaches init via the same `CSpace` handoff.
 #[cfg(not(test))]
-pub(crate) fn mint_late_reclaim_frame_caps(
+pub(crate) fn mint_late_reclaim_memory_caps(
     cspace: &mut CSpace,
     boot_info: &BootInfo,
     layout: &mut CSpaceLayout,
@@ -2095,7 +2107,7 @@ pub(crate) fn mint_late_reclaim_frame_caps(
 /// prefixes the diagnostic line so the two passes are distinguishable
 /// in the boot log.
 // Linear Phase-7 sequence: per-range overlap check, owned-range
-// registration, FrameObject mint, descriptor push. The debug-only
+// registration, MemoryObject mint, descriptor push. The debug-only
 // overlap assertion adds ~25 lines without a natural extraction point.
 #[allow(clippy::too_many_lines)]
 fn mint_reclaim_pass(
@@ -2143,7 +2155,7 @@ fn mint_reclaim_pass(
         // SAFETY: boot_info.modules was validated by the bootloader; the
         // entries pointer is in the direct physical map (active since
         // Phase 3) — same provenance as the slice in
-        // `mint_module_frame_caps`.
+        // `mint_module_memory_caps`.
         unsafe {
             core::slice::from_raw_parts(
                 phys_to_virt(boot_info.modules.entries as u64) as *const boot_protocol::BootModule,
@@ -2171,7 +2183,7 @@ fn mint_reclaim_pass(
         let size_bytes = u64::from(range.page_count) * (crate::mm::PAGE_SIZE as u64);
         pages_total += u64::from(range.page_count);
 
-        // Catch double-coverage with module Frame caps: any overlap here
+        // Catch double-coverage with module Memory caps: any overlap here
         // would have `register_owned_range` double-bump `total_pages` and
         // (on cap destroy) cause `free_range` to double-free into the
         // buddy. The bootloader (`step9` bundle carve-out, scratch-page
@@ -2186,7 +2198,7 @@ fn mint_reclaim_pass(
                 let m_end = (m.physical_base + m.size + 0xFFF) & !0xFFF;
                 debug_assert!(
                     range_end <= m_base || phys_base >= m_end,
-                    "reclaim range overlaps module Frame cap",
+                    "reclaim range overlaps module Memory cap",
                 );
             }
         }
@@ -2210,8 +2222,8 @@ fn mint_reclaim_pass(
             });
         }
 
-        let ptr = mint_phase7_body(FrameObject {
-            header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
+        let ptr = mint_phase7_body(MemoryObject {
+            header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
             base: phys_base,
             size: size_bytes,
             // Reclaim pages carry the full byte ledger and `owns_memory = true`
@@ -2226,16 +2238,16 @@ fn mint_reclaim_pass(
         });
         let slot = insert_or_fatal(
             cspace,
-            CapTag::Frame,
+            CapTag::Memory,
             Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE,
             ptr,
-            "Phase 7: cannot allocate Frame capability for reclaimed boot scratch",
+            "Phase 7: cannot allocate Memory capability for reclaimed boot scratch",
         );
         push_descriptor(
             &mut layout.descriptor_count,
             CapDescriptor {
                 slot,
-                cap_type: CapType::Frame,
+                cap_type: CapType::Memory,
                 pad: [0; 3],
                 aux0: phys_base,
                 aux1: size_bytes,
@@ -2252,7 +2264,7 @@ fn mint_reclaim_pass(
     {
         let total_after = crate::mm::with_frame_allocator(|alloc| alloc.total_page_count());
         crate::kprintln!(
-            "{}: minted {} Frame caps over {} scratch pages (total accounted {} → {})",
+            "{}: minted {} Memory caps over {} scratch pages (total accounted {} → {})",
             label,
             count,
             pages_total,
@@ -2267,7 +2279,7 @@ fn mint_reclaim_pass(
 /// Cast `Box<T>` to `NonNull<KernelObjectHeader>` by leaking the box.
 ///
 /// Used only by the test build's `mint_phase7_body` arm and by the test
-/// build's RAM-Frame mint loop; the production path mints exclusively
+/// build's RAM-Memory mint loop; the production path mints exclusively
 /// through `cap::retype::boot_retype_body`.
 ///
 /// # Safety contract
@@ -2317,8 +2329,8 @@ pub unsafe fn move_cap_between_cspaces(
 {
     use syscall::SyscallError;
 
-    // Read source slot (tag, rights, object pointer, token).
-    let (src_tag, src_rights, src_object, src_token) = {
+    // Read source slot (tag, rights, object pointer, badge).
+    let (src_tag, src_rights, src_object, src_badge) = {
         // SAFETY: src_cspace is a valid CSpace pointer; guaranteed by caller contract.
         let cs = unsafe { &*src_cspace };
         let slot = cs.slot(src_idx).ok_or(SyscallError::InvalidCapability)?;
@@ -2330,7 +2342,7 @@ pub unsafe fn move_cap_between_cspaces(
             slot.tag,
             slot.rights,
             slot.object.ok_or(SyscallError::InvalidCapability)?,
-            slot.token,
+            slot.badge,
         )
     };
 
@@ -2364,11 +2376,11 @@ pub unsafe fn move_cap_between_cspaces(
         )
     };
 
-    // Copy token and derivation links to the destination slot.
+    // Copy badge and derivation links to the destination slot.
     // SAFETY: dst_cspace is a valid CSpace pointer; new_idx was just allocated by insert_cap.
     if let Some(dst_slot) = unsafe { (*dst_cspace).slot_mut(new_idx) }
     {
-        dst_slot.token = src_token;
+        dst_slot.badge = src_badge;
         dst_slot.deriv_parent = src_parent;
         dst_slot.deriv_first_child = src_first_child;
         dst_slot.deriv_prev_sibling = src_prev;

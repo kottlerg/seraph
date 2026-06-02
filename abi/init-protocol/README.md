@@ -11,8 +11,8 @@ MUST check the version field before accessing any other fields.
 increment `INIT_PROTOCOL_VERSION`.
 
 The kernel-to-init contract is unchanged by the memmgr split. `InitInfo`
-delivers the full RAM Frame cap range
-(`memory_frame_base`/`memory_frame_count`) to init's CSpace; init then
+delivers the full RAM Memory cap range
+(`memory_base`/`memory_count`) to init's CSpace; init then
 transfers those caps to memmgr via the derive-twice pattern before spawning
 procmgr. Authoritative description of the userspace boot order lives in
 [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md).

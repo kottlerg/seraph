@@ -128,20 +128,20 @@ pub enum CapTag
 {
     /// Empty slot — no capability present.
     Null = 0,
-    /// Physical memory frame(s).
-    Frame = 1,
+    /// Memory authority (Untyped/retype source).
+    Memory = 1,
     /// Virtual address space.
     AddressSpace = 2,
     /// IPC endpoint.
     Endpoint = 3,
-    /// Bitmask-based async signal.
-    Signal = 4,
+    /// Bitmask-based async notification.
+    Notification = 4,
     /// Ordered event queue.
     EventQueue = 5,
     /// Hardware interrupt line.
     Interrupt = 6,
     /// Memory-mapped I/O region.
-    MmioRegion = 7,
+    Mmio = 7,
     /// Thread control block.
     Thread = 8,
     /// Capability space.
@@ -149,7 +149,7 @@ pub enum CapTag
     /// Wait set (multi-object poll).
     WaitSet = 10,
     /// x86-64 I/O port range.
-    IoPortRange = 11,
+    IoPort = 11,
     /// Scheduling control authority.
     SchedControl = 12,
     /// SBI forwarding authority (RISC-V only).
@@ -174,12 +174,12 @@ impl Rights
     /// No rights.
     pub const NONE: Rights = Rights(0);
 
-    // ── Memory frame / address space ──────────────────────────────────────────
-    /// May map frames into an address space.
+    // ── Memory / address space ──────────────────────────────────────────────
+    /// May map this memory into an address space.
     pub const MAP: Rights = Rights(1 << 0);
-    /// Authority to create writable mappings from this frame.
+    /// Authority to create writable mappings from this memory.
     pub const WRITE: Rights = Rights(1 << 1);
-    /// Authority to create executable mappings from this frame.
+    /// Authority to create executable mappings from this memory.
     pub const EXECUTE: Rights = Rights(1 << 2);
     /// May read/inspect mappings (`AddressSpace`).
     pub const READ: Rights = Rights(1 << 3);
@@ -192,10 +192,10 @@ impl Rights
     /// May include capabilities in IPC messages.
     pub const GRANT: Rights = Rights(1 << 6);
 
-    // ── Signal / event queue ──────────────────────────────────────────────────
-    /// May deliver a signal notification.
-    pub const SIGNAL: Rights = Rights(1 << 7);
-    /// May wait on a signal or wait set.
+    // ── Notification / event queue ──────────────────────────────────────────────────
+    /// May deliver a notification to a notification object.
+    pub const NOTIFY: Rights = Rights(1 << 7);
+    /// May wait on a notification or wait set.
     pub const WAIT: Rights = Rights(1 << 8);
     /// May post an entry to an event queue.
     pub const POST: Rights = Rights(1 << 9);
@@ -222,7 +222,7 @@ impl Rights
     /// May add or remove wait set members.
     pub const MODIFY: Rights = Rights(1 << 17);
 
-    // ── IoPortRange ───────────────────────────────────────────────────────────
+    // ── IoPort ───────────────────────────────────────────────────────────
     /// May bind port range to a thread for in/out access.
     pub const USE: Rights = Rights(1 << 18);
 
@@ -234,13 +234,13 @@ impl Rights
     /// May forward SBI calls to M-mode firmware (RISC-V only).
     pub const CALL: Rights = Rights(1 << 20);
 
-    // ── Frame retype ──────────────────────────────────────────────────────────
-    /// Authority to retype this Frame's memory into kernel objects.
+    // ── Memory retype ──────────────────────────────────────────────────────────
+    /// Authority to retype this Memory cap's region into kernel objects.
     ///
-    /// Stamped on RAM Frame caps minted from the buddy allocator at boot.
-    /// Firmware-table / boot-module / init-segment Frame caps never hold this
+    /// Stamped on RAM Memory caps minted from the buddy allocator at boot.
+    /// Firmware-table / boot-module / init-segment Memory caps never hold this
     /// bit. Every retype-consuming syscall checks
-    /// `tag == Frame && rights.contains(RETYPE)`.
+    /// `tag == Memory && rights.contains(RETYPE)`.
     pub const RETYPE: Rights = Rights(1 << 21);
 
     /// Return `true` if all bits in `mask` are present in `self`.
@@ -305,7 +305,7 @@ pub fn violates_wx(rights: Rights) -> bool
 ///       0     1  tag
 ///       1     3  pad   (aligns rights to offset 4)
 ///       4     4  rights
-///       8     8  token  (caller-identifying label; 0 = untokened)
+///       8     8  badge  (caller-identifying label; 0 = unbadged)
 ///      16     8  object (naturally 8-byte aligned at offset 16)
 ///      24    12  deriv_parent   (next_free index when tag == Null)
 ///      36    12  deriv_first_child
@@ -317,24 +317,24 @@ pub fn violates_wx(rights: Rights) -> bool
 /// Each `Option<SlotId>` derivation pointer is 12 bytes (3 × u32, niche on
 /// `index: NonZeroU32`). Without explicit `pad`, `#[repr(C)]` would insert 2
 /// bytes before `rights` (to satisfy 4-byte alignment) and 6 bytes before
-/// `token` (8-byte alignment); the 3-byte pad absorbs both gaps. The struct
-/// alignment is 8 (from `token` and `object`); 72 is already a multiple of 8
+/// `badge` (8-byte alignment); the 3-byte pad absorbs both gaps. The struct
+/// alignment is 8 (from `badge` and `object`); 72 is already a multiple of 8
 /// so no trailing pad is required.
 #[repr(C)]
 pub struct CapabilitySlot
 {
     /// Capability type; `Null` means the slot is empty.
     pub tag: CapTag,
-    /// Explicit padding: aligns `rights` to offset 4 and `token` to offset 8.
+    /// Explicit padding: aligns `rights` to offset 4 and `badge` to offset 8.
     pad: [u8; 3],
     /// Rights bitmask (type-specific).
     pub rights: Rights,
-    /// Caller-identifying token, set via `SYS_CAP_DERIVE_TOKEN`. Zero means
-    /// untokened. Immutable once set — re-tokening a capability that already
-    /// has a non-zero token returns an error. Inherited by derivation and copy.
-    /// For endpoint caps, the kernel delivers the token to the receiver on
+    /// Caller-identifying badge, set via `SYS_CAP_DERIVE_BADGE`. Zero means
+    /// unbadged. Immutable once set — re-badging a capability that already
+    /// has a non-zero badge returns an error. Inherited by derivation and copy.
+    /// For endpoint caps, the kernel delivers the badge to the receiver on
     /// `ipc_recv`.
-    pub token: u64,
+    pub badge: u64,
     /// Pointer to the kernel object (None when tag == Null).
     pub object: Option<NonNull<KernelObjectHeader>>,
     /// Derivation parent, or next-free index when tag == Null.
@@ -363,7 +363,7 @@ impl CapabilitySlot
             tag: CapTag::Null,
             pad: [0; 3],
             rights: Rights::NONE,
-            token: 0,
+            badge: 0,
             object: None,
             deriv_parent: None,
             deriv_first_child: None,
@@ -404,7 +404,7 @@ impl CapabilitySlot
         self.tag = CapTag::Null;
         self.pad = [0; 3];
         self.rights = Rights::NONE;
-        self.token = 0;
+        self.badge = 0;
         self.object = None;
         self.deriv_first_child = None;
         self.deriv_next_sibling = None;
@@ -460,7 +460,7 @@ mod tests
     fn cap_tag_discriminants()
     {
         assert_eq!(CapTag::Null as u8, 0);
-        assert_eq!(CapTag::Frame as u8, 1);
+        assert_eq!(CapTag::Memory as u8, 1);
         assert_eq!(CapTag::SchedControl as u8, 12);
     }
 
@@ -577,7 +577,7 @@ mod tests
             | Rights::SEND
             | Rights::RECEIVE
             | Rights::GRANT
-            | Rights::SIGNAL
+            | Rights::NOTIFY
             | Rights::WAIT
             | Rights::POST
             | Rights::RECV

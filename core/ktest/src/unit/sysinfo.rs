@@ -17,7 +17,7 @@ use crate::{TestContext, TestResult};
 
 /// `system_info(KernelVersion)` returns the expected version constant.
 ///
-/// The kernel version is `0.0.1` (packed as `1`). See `KERNEL_VERSION` in
+/// The kernel version is `0.0.2` (packed as `2`). See `KERNEL_VERSION` in
 /// `abi/syscall/src/lib.rs` for the encoding details.
 pub fn kernel_version(_ctx: &TestContext) -> TestResult
 {

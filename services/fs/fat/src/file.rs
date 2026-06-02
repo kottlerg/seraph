@@ -5,9 +5,9 @@
 
 //! Open file table for the FAT driver.
 //!
-//! Tracks open files by token value (assigned via `cap_derive_token`).
+//! Tracks open files by badge value (assigned via `cap_derive_badge`).
 //! Each open file carries a fixed-capacity table of outstanding cache
-//! pages handed out via `FS_READ_FRAME`; each entry holds the cookie the
+//! pages handed out via `FS_READ_MEMORY`; each entry holds the cookie the
 //! client uses to reference the page, the cache slot the page lives in
 //! (so the slot's refcount can be decremented on release), and an
 //! ancestor cap interposed between the slot's parent cap and the
@@ -16,19 +16,19 @@
 /// Maximum number of simultaneously open files.
 pub const MAX_OPEN_FILES: usize = 8;
 
-/// Maximum outstanding `FS_READ_FRAME` pages per open file.
+/// Maximum outstanding `FS_READ_MEMORY` pages per open file.
 ///
 /// The per-call ancestor caps live in the fs's `CSpace` until released
 /// or close. 16 leaves headroom over typical sequential read patterns
 /// without putting `CSpace` pressure on the fs process.
 pub const MAX_OUTSTANDING: usize = 16;
 
-/// One outstanding page handed to a client via `FS_READ_FRAME`.
+/// One outstanding page handed to a client via `FS_READ_MEMORY`.
 #[derive(Clone, Copy)]
 pub struct OutstandingPage
 {
     /// Caller-visible identifier for this page; round-trips through
-    /// `FS_RELEASE_FRAME`. Disambiguates which outstanding entry an
+    /// `FS_RELEASE_MEMORY`. Disambiguates which outstanding entry an
     /// inbound client release or worker-driven eviction targets when
     /// multiple pages of the same file are mapped concurrently.
     pub cookie: u64,
@@ -41,24 +41,24 @@ pub struct OutstandingPage
     pub ancestor_cap: u32,
 }
 
-/// A single open file, identified by its capability token.
+/// A single open file, identified by its capability badge.
 pub struct OpenFile
 {
     /// Monotonic identity stamped on slot allocation (0 = unused slot).
     /// Used by the eviction worker to address a slot through
-    /// `find_by_token`; the slot itself is reached via
-    /// `FatNode.open_slot` on the cap-native path, so this token does
+    /// `find_by_badge`; the slot itself is reached via
+    /// `FatNode.open_slot` on the cap-native path, so this badge does
     /// not appear on the wire.
-    pub token: u64,
+    pub badge: u64,
     pub start_cluster: u32,
     pub file_size: u32,
     pub outstanding: [Option<OutstandingPage>; MAX_OUTSTANDING],
     /// SEND cap on the client's release endpoint. Recorded from
-    /// `caps[0]` of the first `FS_READ_FRAME` against this slot's
+    /// `caps[0]` of the first `FS_READ_MEMORY` against this slot's
     /// node cap; the eviction worker addresses cooperative
-    /// `FS_RELEASE_FRAME` requests to it when reclaiming an
+    /// `FS_RELEASE_MEMORY` requests to it when reclaiming an
     /// outstanding cache page. A zero cap indicates the client opted
-    /// out (no caps on the first frame request); eviction falls
+    /// out (no caps on the first memory-cap request); eviction falls
     /// straight through to the hard-revoke path. Deleted from the
     /// fs's `CSpace` at `FS_CLOSE` time.
     pub release_endpoint_cap: u32,
@@ -69,7 +69,7 @@ impl OpenFile
     pub const fn empty() -> Self
     {
         Self {
-            token: 0,
+            badge: 0,
             start_cluster: 0,
             file_size: 0,
             outstanding: [None; MAX_OUTSTANDING],
@@ -93,14 +93,14 @@ impl OpenFile
     }
 }
 
-/// Find the file table index for a given token.
-pub fn find_by_token(files: &[OpenFile; MAX_OPEN_FILES], token: u64) -> Option<usize>
+/// Find the file table index for a given badge.
+pub fn find_by_badge(files: &[OpenFile; MAX_OPEN_FILES], badge: u64) -> Option<usize>
 {
-    files.iter().position(|f| f.token == token)
+    files.iter().position(|f| f.badge == badge)
 }
 
 /// Allocate a free slot, returning its index.
 pub fn alloc_slot(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<usize>
 {
-    files.iter().position(|f| f.token == 0)
+    files.iter().position(|f| f.badge == 0)
 }

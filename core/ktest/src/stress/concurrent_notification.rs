@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-//! Stress test: concurrent signal send/wait races.
+//! Stress test: concurrent notification send/wait races.
 //!
 //! `NUM_SENDERS` child threads simultaneously send distinct bit patterns
-//! to the same signal. The parent waits for all children to finish, then
-//! verifies every bit pattern arrived in the accumulated signal state.
+//! to the same notification. The parent waits for all children to finish, then
+//! verifies every bit pattern arrived in the accumulated notification state.
 
-use syscall::{cap_copy, cap_create_signal, cap_delete, signal_send, signal_wait, thread_exit};
+use syscall::{
+    cap_copy, cap_create_notification, cap_delete, notification_send, notification_wait,
+    thread_exit,
+};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -15,7 +18,7 @@ const NUM_SENDERS: usize = 64;
 const SEND_ITERATIONS: u64 = 5000;
 
 /// Each sender ORs its unique bit (`1 << i`) once per iteration. The
-/// signal's bit width is 64; one sender per bit saturates the bitmask.
+/// notification's bit width is 64; one sender per bit saturates the bitmask.
 const fn sender_bits() -> [u64; NUM_SENDERS]
 {
     let mut bits = [0u64; NUM_SENDERS];
@@ -32,10 +35,10 @@ const ALL_BITS: u64 = u64::MAX;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let target = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "concurrent_signal: create target failed")?;
-    let done = cap_create_signal(ctx.memory_frame_base)
-        .map_err(|_| "concurrent_signal: create done failed")?;
+    let target = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "concurrent_notification: create target failed")?;
+    let done = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "concurrent_notification: create done failed")?;
 
     // Spawn `NUM_SENDERS` sender threads.
     let mut threads = [0u32; NUM_SENDERS];
@@ -43,13 +46,13 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for i in 0..NUM_SENDERS
     {
-        let child =
-            spawn::new_child(ctx).map_err(|_| "concurrent_signal: spawn::new_child failed")?;
-        // Child needs SIGNAL right on target and done.
+        let child = spawn::new_child(ctx)
+            .map_err(|_| "concurrent_notification: spawn::new_child failed")?;
+        // Child needs NOTIFY right on target and done.
         let child_target = cap_copy(target, child.cs, 1 << 7)
-            .map_err(|_| "concurrent_signal: cap_copy target failed")?;
+            .map_err(|_| "concurrent_notification: cap_copy target failed")?;
         let child_done = cap_copy(done, child.cs, 1 << 7)
-            .map_err(|_| "concurrent_signal: cap_copy done failed")?;
+            .map_err(|_| "concurrent_notification: cap_copy done failed")?;
 
         // Pack: bits[15:0]=target_slot, bits[31:16]=done_slot, bits[47:32]=bit_index
         let arg = u64::from(child_target) | (u64::from(child_done) << 16) | ((i as u64) << 32);
@@ -57,7 +60,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // SAFETY: Sequential setup; each child gets a unique stack index.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
         spawn::configure_and_start(&child, sender_entry, stack_top, arg)
-            .map_err(|_| "concurrent_signal: configure_and_start failed")?;
+            .map_err(|_| "concurrent_notification: configure_and_start failed")?;
 
         threads[i] = child.th;
         cspaces[i] = child.cs;
@@ -69,15 +72,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut done_bits: u64 = 0;
     while done_bits != ALL_BITS
     {
-        let bits = signal_wait(done).map_err(|_| "concurrent_signal: signal_wait done failed")?;
+        let bits = notification_wait(done)
+            .map_err(|_| "concurrent_notification: notification_wait done failed")?;
         done_bits |= bits;
     }
 
     // All children have finished. Collect accumulated bits from target.
-    // Children sent non-blocking (signal_send), so bits have been ORed into
-    // the target signal. One wait collects everything.
-    let accumulated =
-        signal_wait(target).map_err(|_| "concurrent_signal: signal_wait target failed")?;
+    // Children sent non-blocking (notification_send), so bits have been ORed into
+    // the target notification. One wait collects everything.
+    let accumulated = notification_wait(target)
+        .map_err(|_| "concurrent_notification: notification_wait target failed")?;
 
     // Clean up.
     for i in 0..NUM_SENDERS
@@ -90,7 +94,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     if accumulated & ALL_BITS != ALL_BITS
     {
-        return Err("concurrent_signal: not all bit patterns received");
+        return Err("concurrent_notification: not all bit patterns received");
     }
     Ok(())
 }
@@ -107,11 +111,11 @@ fn sender_entry(arg: u64) -> !
 
     for _ in 0..SEND_ITERATIONS
     {
-        signal_send(target_slot, bits).ok();
+        notification_send(target_slot, bits).ok();
     }
 
-    // Signal done with this child's unique bit so the parent can track
+    // Notification done with this child's unique bit so the parent can track
     // completion of each sender individually.
-    signal_send(done_slot, bits).ok();
+    notification_send(done_slot, bits).ok();
     thread_exit()
 }

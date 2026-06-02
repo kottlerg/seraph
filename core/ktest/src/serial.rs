@@ -8,8 +8,8 @@
 //! Drives the serial port from userspace using capabilities received via the
 //! init protocol, eliminating the need for `SYS_DEBUG_LOG`.
 //!
-//! - **x86-64**: COM1 (I/O port 0x3F8) via `IoPortRange` cap + `ioport_bind`.
-//! - **RISC-V**: MMIO 16550 (`0x1000_0000`) via `MmioRegion` cap + `mmio_map`.
+//! - **x86-64**: COM1 (I/O port 0x3F8) via `IoPort` cap + `ioport_bind`.
+//! - **RISC-V**: MMIO 16550 (`0x1000_0000`) via `Mmio` cap + `mmio_map`.
 //!
 //! Call [`init`] once during early startup (after `InitInfo` is available, before
 //! any logging). After that, [`write_str`] and [`write_byte`] are available.
@@ -46,7 +46,7 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 
 /// Scan the `CapDescriptor` array for a cap matching `wanted_type` and
 /// `wanted_aux0`. Returns the `CSpace` slot index if found.
-#[allow(dead_code)] // Used on RISC-V (MmioRegion lookup), not on x86-64.
+#[allow(dead_code)] // Used on RISC-V (Mmio lookup), not on x86-64.
 fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u32>
 {
     for d in descriptors(info)
@@ -72,7 +72,7 @@ mod arch
 
     /// Initialise COM1 serial output.
     ///
-    /// Carves a narrow `IoPortRange` cap covering exactly COM1's 8 ports
+    /// Carves a narrow `IoPort` cap covering exactly COM1's 8 ports
     /// from the root cap (via `ioport::bind_port_range`) and binds it to
     /// the current thread, then programs the UART to 115200 8N1.
     ///
@@ -86,7 +86,7 @@ mod arch
     {
         if !crate::ioport::bind_port_range(thread_cap, COM1, COM1_PORTS)
         {
-            return; // no IoPortRange cap, or carve/bind failed
+            return; // no IoPort cap, or carve/bind failed
         }
 
         // SAFETY: bind_port_range succeeded; I/O port access for [COM1,
@@ -181,17 +181,17 @@ mod arch
 
     /// Initialise MMIO serial output.
     ///
-    /// Finds the `MmioRegion` cap for the UART, maps it into the address
+    /// Finds the `Mmio` cap for the UART, maps it into the address
     /// space, then programs the UART to 8N1.
     ///
     /// # Safety
     /// Must be called once, from the main thread, after `InitInfo` is mapped.
     pub unsafe fn init(info: &super::InitInfo, aspace_cap: u32)
     {
-        let Some(slot) = super::find_cap(info, super::CapType::MmioRegion, UART_PHYS)
+        let Some(slot) = super::find_cap(info, super::CapType::Mmio, UART_PHYS)
         else
         {
-            return; // no UART MmioRegion cap — serial stays uninitialised
+            return; // no UART Mmio cap — serial stays uninitialised
         };
 
         if syscall::mmio_map(aspace_cap, slot, SERIAL_VA, 0).is_err()
@@ -249,8 +249,8 @@ mod arch
 
 /// Initialise the serial port using capabilities from the init protocol.
 ///
-/// On x86-64, binds the COM1 `IoPortRange` cap to the current thread.
-/// On RISC-V, maps the UART `MmioRegion` cap into the address space.
+/// On x86-64, binds the COM1 `IoPort` cap to the current thread.
+/// On RISC-V, maps the UART `Mmio` cap into the address space.
 ///
 /// # Safety
 /// Must be called once during early ktest startup, before any `write_str`

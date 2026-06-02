@@ -8,20 +8,20 @@
 //! Verifies no kernel panic or use-after-free occurs.
 
 use syscall::{
-    cap_copy, cap_create_signal, cap_delete, cap_derive, cap_revoke, signal_send, signal_wait,
-    thread_exit, thread_yield,
+    cap_copy, cap_create_notification, cap_delete, cap_derive, cap_revoke, notification_send,
+    notification_wait, thread_exit, thread_yield,
 };
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
 const NUM_CHILDREN: usize = 64;
-const RIGHTS_SIGNAL: u64 = 1 << 7;
+const RIGHTS_NOTIFY: u64 = 1 << 7;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let root = cap_create_signal(ctx.memory_frame_base)
+    let root = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_revoke_under_use: create root failed")?;
-    let done = cap_create_signal(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_revoke_under_use: create done failed")?;
 
     // Derive NUM_CHILDREN children from root.
@@ -29,7 +29,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     for slot in &mut derived
     {
         *slot =
-            cap_derive(root, RIGHTS_SIGNAL).map_err(|_| "cap_revoke_under_use: derive failed")?;
+            cap_derive(root, RIGHTS_NOTIFY).map_err(|_| "cap_revoke_under_use: derive failed")?;
     }
 
     // Spawn NUM_CHILDREN threads, each sending on its derived cap.
@@ -39,7 +39,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let child =
             spawn::new_child(ctx).map_err(|_| "cap_revoke_under_use: spawn::new_child failed")?;
-        let child_sig = cap_copy(derived[i], child.cs, RIGHTS_SIGNAL)
+        let child_sig = cap_copy(derived[i], child.cs, RIGHTS_NOTIFY)
             .map_err(|_| "cap_revoke_under_use: cap_copy sig failed")?;
         let child_done = cap_copy(done, child.cs, 1 << 7)
             .map_err(|_| "cap_revoke_under_use: cap_copy done failed")?;
@@ -80,12 +80,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut done_bits: u64 = 0;
     while done_bits != all_done
     {
-        done_bits |= signal_wait(done).unwrap_or(0);
+        done_bits |= notification_wait(done).unwrap_or(0);
     }
 
     // Root must still be valid.
-    signal_send(root, 0x1).map_err(|_| "cap_revoke_under_use: root invalid after revoke")?;
-    signal_wait(root).ok();
+    notification_send(root, 0x1).map_err(|_| "cap_revoke_under_use: root invalid after revoke")?;
+    notification_wait(root).ok();
 
     // Clean up.
     for i in 0..NUM_CHILDREN
@@ -110,12 +110,12 @@ fn sender_loop_entry(arg: u64) -> !
     // Send in a tight loop until the cap is revoked.
     loop
     {
-        if signal_send(sig_slot, 0x1).is_err()
+        if notification_send(sig_slot, 0x1).is_err()
         {
             break;
         }
     }
 
-    signal_send(done_slot, done_bit).ok();
+    notification_send(done_slot, done_bit).ok();
     thread_exit()
 }

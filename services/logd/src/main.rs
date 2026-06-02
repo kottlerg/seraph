@@ -21,8 +21,8 @@
 //! 3. Creates an `EventQueue` for procmgr-routed death notifications.
 //! 4. Registers the EQ with procmgr via `REGISTER_DEATH_EQ`. Procmgr
 //!    retroactively binds it on every existing thread and on every
-//!    future spawn (correlator = process token, equal to the log
-//!    token logd sees on `STREAM_BYTES`).
+//!    future spawn (correlator = process badge, equal to the log
+//!    badge logd sees on `STREAM_BYTES`).
 //! 5. Enters the main wait loop, draining death notifications first
 //!    then servicing log endpoint messages.
 //!
@@ -36,7 +36,7 @@
 //! per-slot history ring; the pre-driver boot window is covered by
 //! init-logd's direct-UART fallback (see `docs/console-model.md`).
 //!
-//! The pre-existing tokened SEND caps held by memmgr, procmgr,
+//! The pre-existing badged SEND caps held by memmgr, procmgr,
 //! tier-1 services, and every Phase-3 child remain valid across the
 //! handover — same kernel endpoint object, only the RECV-holder
 //! changes.
@@ -56,10 +56,10 @@ use std::os::seraph::startup_info;
 
 use crate::slot::{LINE_BUF_SIZE, MAX_NAME_LEN, SlotTable};
 
-/// `WaitSet` token for the master log endpoint.
-const WS_TOKEN_LOG: u64 = 0;
-/// `WaitSet` token for the death-notification event queue.
-const WS_TOKEN_DEATH: u64 = 1;
+/// `WaitSet` badge for the master log endpoint.
+const WS_BADGE_LOG: u64 = 0;
+/// `WaitSet` badge for the death-notification event queue.
+const WS_BADGE_DEATH: u64 = 1;
 
 /// Caps real-logd receives from init's bootstrap round.
 struct BootCaps
@@ -158,7 +158,7 @@ fn main() -> !
         unsafe { handover::pull_all(caps.log_ep_handover_send, ipc_buf, &mut table) };
         // Terminal release: init-logd exits on this, not on the drain's DONE,
         // so a dropped data chunk cannot wedge it (and thus cannot block
-        // procmgr's reap of init's frames).
+        // procmgr's reap of init's memory caps).
         // SAFETY: ipc_buf is the registered IPC buffer page.
         unsafe { handover::send_release(caps.log_ep_handover_send, ipc_buf) };
         let _ = syscall::cap_delete(caps.log_ep_handover_send);
@@ -195,8 +195,8 @@ fn create_death_eq() -> Option<u32>
     syscall::event_queue_create(slab, MAX_DEATHS_PER_BURST).ok()
 }
 
-/// Build a 2-member wait set: the log endpoint (`WS_TOKEN_LOG`) and
-/// the death event queue (`WS_TOKEN_DEATH`).
+/// Build a 2-member wait set: the log endpoint (`WS_BADGE_LOG`) and
+/// the death event queue (`WS_BADGE_DEATH`).
 fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
 {
     let slab = std::os::seraph::object_slab_acquire(4096)?;
@@ -211,14 +211,14 @@ fn create_wait_set(log_ep_recv: u32, death_eq: u32) -> Option<u32>
             return None;
         }
     };
-    if let Err(e) = syscall::wait_set_add(ws, log_ep_recv, WS_TOKEN_LOG)
+    if let Err(e) = syscall::wait_set_add(ws, log_ep_recv, WS_BADGE_LOG)
     {
         let mut buf = SerialFmt::new();
         let _ = write!(buf, "wait_set_add(log) err={e}");
         buf.flush_self_log();
         return None;
     }
-    if let Err(e) = syscall::wait_set_add(ws, death_eq, WS_TOKEN_DEATH)
+    if let Err(e) = syscall::wait_set_add(ws, death_eq, WS_BADGE_DEATH)
     {
         let mut buf = SerialFmt::new();
         let _ = write!(buf, "wait_set_add(death) err={e}");
@@ -293,16 +293,16 @@ fn event_loop(
 {
     loop
     {
-        let Ok(token) = syscall::wait_set_wait(ws_cap)
+        let Ok(badge) = syscall::wait_set_wait(ws_cap)
         else
         {
             continue;
         };
         drain_deaths(death_eq, table);
-        // Only WS_TOKEN_LOG warrants service action; deaths were
-        // already drained above. WS_TOKEN_DEATH and unknown tokens
+        // Only WS_BADGE_LOG warrants service action; deaths were
+        // already drained above. WS_BADGE_DEATH and unknown badges
         // fall through silently.
-        if token == WS_TOKEN_LOG
+        if badge == WS_BADGE_LOG
         {
             dispatch_log(log_ep_recv, ipc_buf, table);
         }
@@ -310,8 +310,8 @@ fn event_loop(
 }
 
 /// Non-blocking drain of the death event queue. Each payload encodes
-/// `(process_token as u32) << 32 | exit_reason`. We evict the
-/// matching slot from the token table.
+/// `(process_badge as u32) << 32 | exit_reason`. We evict the
+/// matching slot from the badge table.
 fn drain_deaths(death_eq: u32, table: &mut SlotTable)
 {
     loop
@@ -323,8 +323,8 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable)
         };
         let correlator = (payload >> 32) as u32;
         let exit_reason = payload as u32;
-        // Token in logd's slot map is the full u64; the correlator
-        // procmgr binds is `process_token as u32`. Match against the
+        // Badge in logd's slot map is the full u64; the correlator
+        // procmgr binds is `process_badge as u32`. Match against the
         // low 32 bits.
         let dead: Vec<u64> = table
             .slots
@@ -332,12 +332,12 @@ fn drain_deaths(death_eq: u32, table: &mut SlotTable)
             .copied()
             .filter(|&t| (t as u32) == correlator)
             .collect();
-        for token in dead
+        for badge in dead
         {
-            if table.evict(token)
+            if table.evict(badge)
             {
                 let mut buf = SerialFmt::new();
-                let _ = write!(buf, "reclaim: token={token} exit_reason=0x{exit_reason:x}");
+                let _ = write!(buf, "reclaim: badge={badge} exit_reason=0x{exit_reason:x}");
                 buf.flush_self_log();
             }
         }
@@ -356,12 +356,12 @@ fn dispatch_log(log_ep_recv: u32, ipc_buf: *mut u64, table: &mut SlotTable)
     let byte_len = ((recv.label >> 16) & 0xFFFF) as usize;
     if label_id == STREAM_BYTES
     {
-        consume_bytes(table, recv.token, &recv, byte_len);
+        consume_bytes(table, recv.badge, &recv, byte_len);
         reply_ack(ipc_buf);
     }
     else if label_id == STREAM_REGISTER_NAME
     {
-        register_name(table, recv.token, &recv, byte_len);
+        register_name(table, recv.badge, &recv, byte_len);
         reply_ack(ipc_buf);
     }
     else
@@ -379,7 +379,7 @@ fn reply_ack(ipc_buf: *mut u64)
 }
 
 /// Append `byte_len` bytes from the IPC payload onto the slot for
-/// `token`, flushing complete lines (`\n`-terminated) to the serial
+/// `badge`, flushing complete lines (`\n`-terminated) to the serial
 /// port AND recording them into the per-slot history ring.
 ///
 /// Accepts up to `STREAM_CHUNK_SIZE = MSG_DATA_WORDS_MAX * 8` bytes
@@ -387,7 +387,7 @@ fn reply_ack(ipc_buf: *mut u64)
 /// per-line buffer is `LINE_BUF_SIZE` and force-flushes when full,
 /// so a chunk longer than `LINE_BUF_SIZE` produces multiple emitted
 /// lines rather than truncated output (matches init-logd's behaviour).
-fn consume_bytes(table: &mut SlotTable, token: u64, msg: &IpcMessage, byte_len: usize)
+fn consume_bytes(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: usize)
 {
     const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
@@ -397,19 +397,19 @@ fn consume_bytes(table: &mut SlotTable, token: u64, msg: &IpcMessage, byte_len: 
     // mutably without aliasing the IPC buffer.
     let mut staged = [0u8; STREAM_CHUNK_SIZE];
     staged[..n].copy_from_slice(&bytes[..n]);
-    let slot = table.get_or_create(token);
+    let slot = table.get_or_create(badge);
     for &b in &staged[..n]
     {
         if b == b'\n'
         {
-            flush_partial(token, slot);
+            flush_partial(badge, slot);
         }
         else if slot.partial.len() < LINE_BUF_SIZE
         {
             slot.partial.push(b);
             if slot.partial.len() == LINE_BUF_SIZE
             {
-                flush_partial(token, slot);
+                flush_partial(badge, slot);
             }
         }
     }
@@ -419,26 +419,26 @@ fn consume_bytes(table: &mut SlotTable, token: u64, msg: &IpcMessage, byte_len: 
 /// it to the history ring, clear the partial buffer. Separated so
 /// the `&slot.name`/`&slot.partial` borrows don't alias the
 /// subsequent `&mut slot` calls.
-fn flush_partial(token: u64, slot: &mut crate::slot::Slot)
+fn flush_partial(badge: u64, slot: &mut crate::slot::Slot)
 {
     let name = slot.name.clone();
     let line: Vec<u8> = slot.partial.drain(..).collect();
-    emit_line(token, &name, &line);
+    emit_line(badge, &name, &line);
     let us = elapsed_us();
     slot.push_history(us, &line);
 }
 
-/// Record / update the display name for `token`. Lines emitted with
+/// Record / update the display name for `badge`. Lines emitted with
 /// the old name remain attributed to the old name in history (those
 /// are immutable); subsequent emissions render under the new name.
 /// Long names truncated. No collision-suffix policy (procmgr's
-/// process token is unique, so name collisions only happen if two
+/// process badge is unique, so name collisions only happen if two
 /// processes intentionally pick the same display name).
-fn register_name(table: &mut SlotTable, token: u64, msg: &IpcMessage, byte_len: usize)
+fn register_name(table: &mut SlotTable, badge: u64, msg: &IpcMessage, byte_len: usize)
 {
     let bytes = msg.data_bytes();
     let n = byte_len.min(bytes.len()).min(MAX_NAME_LEN);
-    let slot = table.get_or_create(token);
+    let slot = table.get_or_create(badge);
     slot.name.clear();
     slot.name.extend_from_slice(&bytes[..n]);
 }
@@ -636,7 +636,7 @@ impl LineBuf
 /// Emit `[sec.usfrac] [name] <bytes>\r\n` to the serial driver. Mirrors
 /// init-logd's `flush_line` shape so the post-handover output stream looks
 /// identical to the pre-handover output.
-fn emit_line(_token: u64, name: &[u8], line: &[u8])
+fn emit_line(_badge: u64, name: &[u8], line: &[u8])
 {
     let mut out = LineBuf::new();
     out.push_timestamp();

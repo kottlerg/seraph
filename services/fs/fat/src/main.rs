@@ -7,23 +7,23 @@
 //!
 //! Implements read-write FAT16/FAT32 filesystem support. Serves the
 //! cap-native namespace protocol (`NS_LOOKUP` / `NS_STAT` /
-//! `NS_READDIR`) for directory walks; per-node tokened caps carry
-//! the read side (`FS_READ`, `FS_READ_FRAME`, `FS_RELEASE_FRAME`,
-//! `FS_CLOSE`) and the write side (`FS_WRITE`, `FS_WRITE_FRAME`,
+//! `NS_READDIR`) for directory walks; per-node badged caps carry
+//! the read side (`FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
+//! `FS_CLOSE`) and the write side (`FS_WRITE`, `FS_WRITE_MEMORY`,
 //! `FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`). `FS_MOUNT` is
-//! the one untokened service-level request, used by vfsd as a
+//! the one unbadged service-level request, used by vfsd as a
 //! BPB-validation probe at mount time. All disk I/O is performed via
 //! the block device IPC endpoint received at creation time.
 //!
-//! Per-node tokens are minted by `NS_LOOKUP` (token = `(NodeId,
+//! Per-node badges are minted by `NS_LOOKUP` (badge = `(NodeId,
 //! NamespaceRights)`); per-node ops look the node up in `NodeTable`
 //! and act on either the lazily-allocated `OpenFile` slot (read-side
-//! frame caps) or the cached `DirEntryLocation` (write-side metadata
+//! memory caps) or the cached `DirEntryLocation` (write-side metadata
 //! patching).
 //!
 //! Cache coherence: writes go through write-through
 //! ([`cache::PageCache::write_sector`]) so any outstanding
-//! `FS_READ_FRAME` cap aliasing the same page observes new bytes
+//! `FS_READ_MEMORY` cap aliasing the same page observes new bytes
 //! immediately. FAT-entry mutations invalidate the per-`FatState`
 //! private `cached_fat_sector` to prevent stale FAT chain walks.
 //! Crash window discussion lives in
@@ -55,20 +55,20 @@ use eviction::{EvictReq, EvictionState};
 use fat::{next_cluster, read_file_data};
 use file::{MAX_OPEN_FILES, OpenFile, OutstandingPage};
 use ipc::{IpcMessage, fs_labels, ns_labels};
-use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_token};
+use namespace_protocol::{GateError, NamespaceRights, NodeId, NodeKind, gate, pack as pack_badge};
 use syscall_abi::{PAGE_SIZE, RIGHTS_MAP_READ};
 
-/// Monotonic counter for token allocation. Starts at 1 (0 = untokened).
-static NEXT_TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// Monotonic counter for badge allocation. Starts at 1 (0 = unbadged).
+static NEXT_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 //
 // vfsd → fatfs bootstrap plan (one round, 2 caps, 0 data words):
-//   caps[0]: block device (SEND) — partition-scoped tokened cap on virtio-blk.
+//   caps[0]: block device (SEND) — partition-scoped badged cap on virtio-blk.
 //            vfsd registers the partition bound with virtio-blk before
 //            delivering this cap; fatfs reads by partition-relative LBA and
-//            virtio-blk enforces the bound per-token.
-//   caps[1]: fatfs service endpoint (RIGHTS_ALL — receive + derive tokens)
+//            virtio-blk enforces the bound per-badge.
+//   caps[1]: fatfs service endpoint (RIGHTS_ALL — receive + derive badges)
 //
 // log and procmgr endpoints arrive via `ProcessInfo`/`StartupInfo`.
 //
@@ -130,7 +130,7 @@ fn main() -> !
     let eviction = Arc::new(EvictionState::new());
 
     // Spawn the cache-pressure eviction worker. The worker owns
-    // outbound `FS_RELEASE_FRAME` issuance and the cooperative-
+    // outbound `FS_RELEASE_MEMORY` issuance and the cooperative-
     // release watchdog; main only enqueues. Spawn failure is
     // process-fatal — without the worker, cache pressure cannot
     // be relieved and reads degrade to permanent IO_ERROR once
@@ -200,11 +200,11 @@ fn validate_bpb(caps: &FatCaps, state: &mut FatState, cache: &PageCache, ipc_buf
 /// Main FAT service loop.
 ///
 /// Three request shapes share one endpoint:
-/// - `FS_MOUNT` — untokened (token == 0); vfsd's BPB-validation probe.
+/// - `FS_MOUNT` — unbadged (badge == 0); vfsd's BPB-validation probe.
 /// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
 ///   the protocol crate.
-/// - Per-node `FS_READ` / `FS_READ_FRAME` / `FS_RELEASE_FRAME` /
-///   `FS_CLOSE` — token packs `(NodeId, NamespaceRights)`; the slot is
+/// - Per-node `FS_READ` / `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` /
+///   `FS_CLOSE` — badge packs `(NodeId, NamespaceRights)`; the slot is
 ///   resolved through `NodeTable` and the lazily-allocated `OpenFile`.
 ///
 /// The open-file table is shared with the eviction worker via a
@@ -234,8 +234,8 @@ fn service_loop(
 
         let opcode = msg.label & 0xFFFF;
 
-        // Untokened service-level requests: FS_MOUNT only.
-        if msg.token == 0
+        // Unbadged service-level requests: FS_MOUNT only.
+        if msg.badge == 0
         {
             let code = match opcode
             {
@@ -284,7 +284,7 @@ fn service_loop(
         // FS_CREATE/FS_MKDIR must not exceed it, or a caller holding
         // a `MUTATE_DIR`-only parent would silently gain `READ` /
         // `WRITE` / `EXEC` on every child they create.
-        let (node_id, parent_rights) = match gate(msg.label, msg.token)
+        let (node_id, parent_rights) = match gate(msg.label, msg.badge)
         {
             Ok(pair) => pair,
             Err(GateError::UnknownLabel) =>
@@ -319,9 +319,9 @@ fn service_loop(
                 handle_write_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
                 continue;
             }
-            fs_labels::FS_WRITE_FRAME =>
+            fs_labels::FS_WRITE_MEMORY =>
             {
-                handle_write_frame_node_cap(
+                handle_write_memory_node_cap(
                     node_id,
                     &msg,
                     state,
@@ -390,9 +390,9 @@ fn service_loop(
         let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
         match opcode
         {
-            fs_labels::FS_READ_FRAME =>
+            fs_labels::FS_READ_MEMORY =>
             {
-                handle_read_frame_node_cap(
+                handle_read_memory_node_cap(
                     node_id,
                     &msg,
                     state,
@@ -404,9 +404,9 @@ fn service_loop(
                     eviction,
                 );
             }
-            fs_labels::FS_RELEASE_FRAME =>
+            fs_labels::FS_RELEASE_MEMORY =>
             {
-                handle_release_frame_node_cap(node_id, &msg, nodes, &mut files_g, cache, ipc_buf);
+                handle_release_memory_node_cap(node_id, &msg, nodes, &mut files_g, cache, ipc_buf);
             }
             fs_labels::FS_CLOSE =>
             {
@@ -441,14 +441,14 @@ fn handle_read_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
     if node.kind != NodeKind::File
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
@@ -480,13 +480,13 @@ fn handle_read_node_cap(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// `FS_READ_FRAME` body, parameterised by a pre-resolved `OpenFile`
-/// slot index. `handle_read_frame_node_cap` resolves the token via
+/// `FS_READ_MEMORY` body, parameterised by a pre-resolved `OpenFile`
+/// slot index. `handle_read_memory_node_cap` resolves the badge via
 /// `NodeTable.open_slot` (lazy-allocating on first call) and delegates
 /// here for the cluster walk, cache acquisition, two-step cap
 /// derivation, and outstanding-page tracking.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn read_frame_at_slot(
+fn read_memory_at_slot(
     msg: &IpcMessage,
     idx: usize,
     state: &mut FatState,
@@ -503,7 +503,7 @@ fn read_frame_at_slot(
     if cookie == 0
     {
         // Cookie 0 collides with the OutstandingPage::None sentinel.
-        let reply = IpcMessage::new(ipc::fs_errors::BAD_FRAME_OFFSET);
+        let reply = IpcMessage::new(ipc::fs_errors::BAD_MEMORY_OFFSET);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
@@ -551,12 +551,12 @@ fn read_frame_at_slot(
     }
     let sector = u64::from(state.cluster_to_sector(cluster) + sector_in_cluster);
     let page_base = cache::page_base_of(sector);
-    // The file's byte at `offset` lives at frame offset
+    // The file's byte at `offset` lives at memory-cap offset
     // `(sector - page_base) * SECTOR_SIZE + byte_in_sector` within the
     // returned slot. For sector- and page-aligned data areas this folds
     // to zero; for misaligned data areas (data area starting mid-page)
     // the sector-position term is non-zero on the page boundary.
-    let frame_data_offset = (sector - page_base) * SECTOR_SIZE as u64 + byte_in_sector;
+    let memory_data_offset = (sector - page_base) * SECTOR_SIZE as u64 + byte_in_sector;
 
     let Some(slot_idx) = cache.acquire_page(page_base, block_dev, ipc_buf)
     else
@@ -575,7 +575,7 @@ fn read_frame_at_slot(
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
-    let slot_cap = cache.slot_frame_cap(slot_idx);
+    let slot_cap = cache.slot_memory_cap(slot_idx);
     if slot_cap == 0
     {
         cache.release_slot(slot_idx);
@@ -625,17 +625,17 @@ fn read_frame_at_slot(
     //   - file end:    file_size - offset
     //   - one cluster: cluster_size - offset_in_cluster
     //                  (we only read sectors from one cluster per call)
-    //   - frame tail:  PAGE_SIZE - frame_data_offset
-    //                  (bytes before frame_data_offset belong to other files
+    //   - memory-cap tail:  PAGE_SIZE - memory_data_offset
+    //                  (bytes before memory_data_offset belong to other files
     //                   or the previous cluster's leftover sectors)
     let cluster_remaining = cluster_size - offset_in_cluster;
     let bytes_valid = (file_size - offset)
         .min(cluster_remaining)
-        .min(PAGE_SIZE - frame_data_offset);
+        .min(PAGE_SIZE - memory_data_offset);
     let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, bytes_valid)
         .word(1, cookie)
-        .word(2, frame_data_offset)
+        .word(2, memory_data_offset)
         .cap(child)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -650,14 +650,14 @@ fn pick_eviction_candidate(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<EvictRe
 {
     for file in files
     {
-        if file.token == 0
+        if file.badge == 0
         {
             continue;
         }
         if let Some(entry) = file.outstanding.iter().flatten().next()
         {
             return Some(EvictReq {
-                file_token: file.token,
+                file_badge: file.badge,
                 cookie: entry.cookie,
                 slot_idx: entry.slot_idx,
                 ancestor_cap: entry.ancestor_cap,
@@ -668,12 +668,12 @@ fn pick_eviction_candidate(files: &[OpenFile; MAX_OPEN_FILES]) -> Option<EvictRe
     None
 }
 
-/// `FS_READ_FRAME` against a node cap. Lazily allocates an
+/// `FS_READ_MEMORY` against a node cap. Lazily allocates an
 /// [`OpenFile`] slot bound to the node on first call (recorded into
 /// [`backend::FatNode::open_slot`]) and delegates to
-/// [`read_frame_at_slot`]. The slot is reaped at `FS_CLOSE`.
+/// [`read_memory_at_slot`]. The slot is reaped at `FS_CLOSE`.
 #[allow(clippy::too_many_arguments)]
-fn handle_read_frame_node_cap(
+fn handle_read_memory_node_cap(
     node_id: NodeId,
     msg: &IpcMessage,
     state: &mut FatState,
@@ -688,14 +688,14 @@ fn handle_read_frame_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
     };
     if node.kind != NodeKind::File
     {
-        let reply = IpcMessage::new(ipc::fs_errors::INVALID_TOKEN);
+        let reply = IpcMessage::new(ipc::fs_errors::INVALID_BADGE);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return;
@@ -711,21 +711,21 @@ fn handle_read_frame_node_cap(
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             return;
         };
-        // Slot identity for the eviction worker's `find_by_token`
+        // Slot identity for the eviction worker's `find_by_badge`
         // lookup. Never seen on the wire — node-cap requests resolve
         // through `FatNode.open_slot`.
-        let token = NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        // First FS_READ_FRAME for a (client, node) pair MAY carry the
+        let badge = NEXT_BADGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // First FS_READ_MEMORY for a (client, node) pair MAY carry the
         // client's per-process release-endpoint SEND in caps[0]. The
         // kernel `transfer_caps` path moved it into our CSpace if
         // present; record it on the slot so the eviction worker can
-        // route cooperative `FS_RELEASE_FRAME` back to the client.
+        // route cooperative `FS_RELEASE_MEMORY` back to the client.
         // A zero cap indicates an opt-out client; eviction falls back
-        // to the hard-revoke path. Subsequent FS_READ_FRAMEs from
+        // to the hard-revoke path. Subsequent FS_READ_MEMORYs from
         // the same client carry no caps.
         let release_endpoint_cap = msg.caps().first().copied().unwrap_or(0);
         files[slot_idx] = OpenFile {
-            token,
+            badge,
             start_cluster: node.cluster,
             file_size: node.size,
             outstanding: [None; file::MAX_OUTSTANDING],
@@ -740,7 +740,7 @@ fn handle_read_frame_node_cap(
         node.open_slot as usize
     };
 
-    read_frame_at_slot(
+    read_memory_at_slot(
         msg,
         idx,
         state,
@@ -752,11 +752,11 @@ fn handle_read_frame_node_cap(
     );
 }
 
-/// `FS_RELEASE_FRAME` against a node cap. Resolves the lazy
+/// `FS_RELEASE_MEMORY` against a node cap. Resolves the lazy
 /// [`OpenFile`] slot through [`backend::FatNode::open_slot`] and
 /// drops the matching outstanding page. Replies success when the
 /// cookie is unknown — release is idempotent.
-fn handle_release_frame_node_cap(
+fn handle_release_memory_node_cap(
     node_id: NodeId,
     msg: &IpcMessage,
     nodes: &NodeTable,
@@ -812,7 +812,7 @@ fn handle_close_node_cap(
             cache.release_slot(entry.slot_idx);
         }
         // Drop the per-File release-endpoint SEND the client transferred
-        // on first FS_READ_FRAME — leaving it in our CSpace would
+        // on first FS_READ_MEMORY — leaving it in our CSpace would
         // accumulate a stale SEND per opened file across the fs's
         // lifetime.
         if files[idx].release_endpoint_cap != 0
@@ -872,7 +872,7 @@ fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> 
 }
 
 /// Common cluster-walk-and-write engine used by `FS_WRITE` and
-/// `FS_WRITE_FRAME`. Walks the file's cluster chain from `offset`,
+/// `FS_WRITE_MEMORY`. Walks the file's cluster chain from `offset`,
 /// allocating new clusters as needed, and writes `data` sector-by-
 /// sector through [`PageCache::write_sector`] (read-modify-write
 /// applies for partial-sector writes). Returns the number of bytes
@@ -979,7 +979,7 @@ fn write_file_bytes(
     Ok((chain_head, new_size))
 }
 
-/// `FS_WRITE` inline write. Token = file cap (must carry `WRITE`).
+/// `FS_WRITE` inline write. Badge = file cap (must carry `WRITE`).
 /// `label[16..32]` = byte length (≤504), `data[0]` = offset, payload
 /// bytes packed from word 1 onward.
 fn handle_write_node_cap(
@@ -995,7 +995,7 @@ fn handle_write_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File
@@ -1050,14 +1050,14 @@ fn handle_write_node_cap(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// `FS_WRITE_FRAME`: caller supplies a source Frame cap; data lives
-/// at `frame_data_offset..frame_data_offset + byte_count` in the
-/// frame. The Frame is mapped into fatfs's address space at a
+/// `FS_WRITE_MEMORY`: caller supplies a source Memory cap; data lives
+/// at `memory_data_offset..memory_data_offset + byte_count` in the
+/// memory cap. The Memory cap is mapped into fatfs's address space at a
 /// process-static scratch VA, copied into a stack buffer, and the
-/// scratch VA unmapped before the actual writes. The Frame is moved
+/// scratch VA unmapped before the actual writes. The Memory cap is moved
 /// back to the caller in the reply.
 #[allow(clippy::too_many_lines)]
-fn handle_write_frame_node_cap(
+fn handle_write_memory_node_cap(
     node_id: NodeId,
     msg: &IpcMessage,
     state: &mut FatState,
@@ -1088,7 +1088,7 @@ fn handle_write_frame_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_with(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_with(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File
@@ -1099,17 +1099,17 @@ fn handle_write_frame_node_cap(
 
     let offset = msg.word(0);
     let byte_count = msg.word(1) as usize;
-    let frame_data_offset = msg.word(2) as usize;
+    let memory_data_offset = msg.word(2) as usize;
     let page_size = PAGE_SIZE as usize;
     if byte_count == 0
-        || frame_data_offset >= page_size
-        || byte_count > page_size - frame_data_offset
+        || memory_data_offset >= page_size
+        || byte_count > page_size - memory_data_offset
     {
-        reply_with(ipc::fs_errors::BAD_FRAME_OFFSET, ipc_buf);
+        reply_with(ipc::fs_errors::BAD_MEMORY_OFFSET, ipc_buf);
         return;
     }
 
-    // Validate the source frame: Frame cap with at least MAP|READ
+    // Validate the source memory cap: Memory cap with at least MAP|READ
     // rights.
     let Ok(tag_rights) = syscall::cap_info(src_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
@@ -1119,14 +1119,14 @@ fn handle_write_frame_node_cap(
     };
     let tag = (tag_rights >> 32) as u8;
     let cap_rights = tag_rights & 0xFFFF_FFFF;
-    if u64::from(tag) != u64::from(syscall::CAP_TAG_FRAME)
+    if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY)
         || (cap_rights & RIGHTS_MAP_READ) != RIGHTS_MAP_READ
     {
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     }
 
-    let va = write_frame_va();
+    let va = write_memory_va();
     if va == 0
     {
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
@@ -1138,7 +1138,7 @@ fn handle_write_frame_node_cap(
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    // memmgr-issued frames carry RIGHTS_ALL (both WRITE and EXECUTE);
+    // memmgr-issued memory caps carry RIGHTS_ALL (both WRITE and EXECUTE);
     // mem_map with MAP_READONLY (= 0) on such a cap derives both w and
     // x from the cap rights and trips the kernel's W^X check. Derive a
     // sub-cap restricted to MAP_READ first; delete it after the unmap.
@@ -1164,14 +1164,14 @@ fn handle_write_frame_node_cap(
     }
 
     // Heap-allocated: a 4 KiB on-stack buffer would push the
-    // FS_WRITE_FRAME path past the default 32 KiB stack envelope
+    // FS_WRITE_MEMORY path past the default 32 KiB stack envelope
     // once it cascades into `write_file_bytes → insert_entry → …`.
     let mut buf = Box::new([0u8; PAGE_SIZE as usize]);
     // SAFETY: va just mapped MAP_READONLY for one page; bounds checked
     // above.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            (va + frame_data_offset as u64) as *const u8,
+            (va + memory_data_offset as u64) as *const u8,
             buf.as_mut_ptr(),
             byte_count,
         );
@@ -1220,9 +1220,9 @@ fn handle_write_frame_node_cap(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Lazy process-local VA reservation for `FS_WRITE_FRAME` source-frame
+/// Lazy process-local VA reservation for `FS_WRITE_MEMORY` source-memory-cap
 /// mapping. Returns the VA on success, `0` on reserve failure.
-fn write_frame_va() -> u64
+fn write_memory_va() -> u64
 {
     use std::sync::OnceLock;
     static VA: OnceLock<u64> = OnceLock::new();
@@ -1258,7 +1258,7 @@ fn self_aspace_cap() -> Option<u32>
     Some(cap).filter(|&c| c != 0)
 }
 
-/// `FS_CREATE`: create a new file in a directory. Token = parent-dir
+/// `FS_CREATE`: create a new file in a directory. Badge = parent-dir
 /// cap (must carry `MUTATE_DIR`). `label[16..32]` = name length, name
 /// from word 0. `parent_rights` is the caller's effective rights on
 /// the parent dir; the returned child cap is attenuated by it.
@@ -1329,7 +1329,7 @@ fn create_entry_common(
     let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
@@ -1430,8 +1430,8 @@ fn create_entry_common(
         ),
     };
     let child_rights = parent_rights.intersect(kind_max);
-    let token = pack_token(new_node_id, child_rights);
-    let Ok(new_cap) = syscall::cap_derive_token(caps.service, syscall::RIGHTS_SEND_GRANT, token)
+    let badge = pack_badge(new_node_id, child_rights);
+    let Ok(new_cap) = syscall::cap_derive_badge(caps.service, syscall::RIGHTS_SEND_GRANT, badge)
     else
     {
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
@@ -1446,7 +1446,7 @@ fn create_entry_common(
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// `FS_REMOVE`: unlink a file or empty directory. Token = parent-dir
+/// `FS_REMOVE`: unlink a file or empty directory. Badge = parent-dir
 /// cap (must carry `MUTATE_DIR`). Name in label[16..32] + data bytes.
 fn handle_remove_node_cap(
     node_id: NodeId,
@@ -1461,7 +1461,7 @@ fn handle_remove_node_cap(
     let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     let name_len = ((msg.label >> 16) & 0xFFFF) as usize;
@@ -1549,7 +1549,7 @@ fn handle_rename_node_cap(
     let Some(parent_cluster) = resolve_dir_cluster(node_id, state, nodes)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     let src_len = msg.word(0) as usize;
@@ -1629,7 +1629,7 @@ fn handle_rename_node_cap(
 
 /// `FS_TRUNCATE`: shrink a file to a new length.
 ///
-/// Token = file cap (must carry `WRITE`). `data[0]` = new length.
+/// Badge = file cap (must carry `WRITE`). `data[0]` = new length.
 /// v1 supports only `new_len == 0`; non-zero replies `IO_ERROR` so
 /// the wire shape is forward-compatible with later extend-with-
 /// zero-fill semantics tracked by the `ruststd::fs` completeness-gaps
@@ -1647,7 +1647,7 @@ fn handle_truncate_node_cap(
     let Some(node) = nodes.get(node_id)
     else
     {
-        reply_err(ipc::fs_errors::INVALID_TOKEN, ipc_buf);
+        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
     if node.kind != NodeKind::File

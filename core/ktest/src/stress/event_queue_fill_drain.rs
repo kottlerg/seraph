@@ -16,7 +16,7 @@ const CYCLES: usize = 2000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(ctx.memory_frame_base, CAPACITY)
+    let eq = event_queue_create(ctx.memory_base, CAPACITY)
         .map_err(|_| "event_fill_drain: event_queue_create failed")?;
 
     for cycle in 0..CYCLES

@@ -3,11 +3,11 @@
 
 // ktest/src/stress/retype_concurrent.rs
 
-//! Stress test: concurrent retype + reclaim against a single Frame cap.
+//! Stress test: concurrent retype + reclaim against a single Memory cap.
 //!
-//! N child threads hammer the same retype-source Frame cap with
+//! N child threads hammer the same retype-source Memory cap with
 //! `cap_create_endpoint` + `cap_delete` cycles. The retype-allocator's
-//! per-cap spinlock and per-`FrameObject` rwlock are the load-bearing
+//! per-cap spinlock and per-`MemoryObject` rwlock are the load-bearing
 //! invariants — interleavings between retype-consume and dealloc-reclaim
 //! must not corrupt free-list links or double-debit `available_bytes`.
 //!
@@ -18,9 +18,9 @@
 
 use syscall::{
     cap_copy, cap_create_cspace, cap_create_endpoint, cap_create_thread, cap_delete, cap_info,
-    signal_send, signal_wait, thread_configure, thread_exit, thread_start,
+    notification_send, notification_wait, thread_configure, thread_exit, thread_start,
 };
-use syscall_abi::CAP_INFO_FRAME_AVAILABLE;
+use syscall_abi::CAP_INFO_MEMORY_AVAILABLE;
 
 use crate::{ChildStack, TestContext, TestResult};
 
@@ -42,18 +42,18 @@ const WORKER_BIT: [u64; NUM_WORKERS] = worker_bits();
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    // Pre-warm: pay the per-FrameObject allocator metadata cost on
-    // ctx.memory_frame_base (if some earlier test hasn't already) so the
+    // Pre-warm: pay the per-MemoryObject allocator metadata cost on
+    // ctx.memory_base (if some earlier test hasn't already) so the
     // post-stress baseline matches the pre-stress baseline.
-    let frame = ctx.memory_frame_base;
-    let warm = syscall::cap_create_endpoint(frame)
+    let memory = ctx.memory_base;
+    let warm = syscall::cap_create_endpoint(memory)
         .map_err(|_| "stress::retype_concurrent: warmup endpoint failed")?;
     cap_delete(warm).ok();
-    let baseline = cap_info(frame, CAP_INFO_FRAME_AVAILABLE)
+    let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "stress::retype_concurrent: cap_info(baseline) failed")?;
 
-    // Done signal: each worker ORs its bit when finished.
-    let done = syscall::cap_create_signal(frame)
+    // Done notification: each worker ORs its bit when finished.
+    let done = syscall::cap_create_notification(memory)
         .map_err(|_| "stress::retype_concurrent: create done failed")?;
 
     let mut threads = [0u32; NUM_WORKERS];
@@ -61,16 +61,16 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     for i in 0..NUM_WORKERS
     {
-        let cs = cap_create_cspace(frame, 0, 4, 64)
+        let cs = cap_create_cspace(memory, 0, 4, 64)
             .map_err(|_| "stress::retype_concurrent: create_cspace failed")?;
-        let child_frame = cap_copy(frame, cs, syscall::RIGHTS_RETYPE | syscall::RIGHTS_MAP_RW)
-            .map_err(|_| "stress::retype_concurrent: cap_copy frame failed")?;
+        let child_memory = cap_copy(memory, cs, syscall::RIGHTS_RETYPE | syscall::RIGHTS_MAP_RW)
+            .map_err(|_| "stress::retype_concurrent: cap_copy memory failed")?;
         let child_done = cap_copy(done, cs, 1 << 7)
             .map_err(|_| "stress::retype_concurrent: cap_copy done failed")?;
-        let th = cap_create_thread(frame, ctx.aspace_cap, cs)
+        let th = cap_create_thread(memory, ctx.aspace_cap, cs)
             .map_err(|_| "stress::retype_concurrent: create_thread failed")?;
 
-        let arg = u64::from(child_frame) | (u64::from(child_done) << 16) | ((i as u64) << 32);
+        let arg = u64::from(child_memory) | (u64::from(child_done) << 16) | ((i as u64) << 32);
 
         // SAFETY: stress tests run sequentially; each worker uses a distinct stack.
         let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
@@ -86,8 +86,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut done_bits: u64 = 0;
     while done_bits & ALL_BITS != ALL_BITS
     {
-        let bits =
-            signal_wait(done).map_err(|_| "stress::retype_concurrent: signal_wait done failed")?;
+        let bits = notification_wait(done)
+            .map_err(|_| "stress::retype_concurrent: notification_wait done failed")?;
         done_bits |= bits;
     }
 
@@ -101,7 +101,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Verify the source cap returned to baseline. Any leak or double-
     // debit shows up as a discrepancy here.
-    let after = cap_info(frame, CAP_INFO_FRAME_AVAILABLE)
+    let after = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "stress::retype_concurrent: cap_info(after) failed")?;
 
     if after != baseline
@@ -122,7 +122,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 #[allow(clippy::cast_possible_truncation)]
 fn worker_entry(arg: u64) -> !
 {
-    let frame_slot = (arg & 0xFFFF) as u32;
+    let memory_slot = (arg & 0xFFFF) as u32;
     let done_slot = ((arg >> 16) & 0xFFFF) as u32;
     let bit_index = ((arg >> 32) & 0xFFFF) as usize;
     let bit = WORKER_BIT[bit_index.min(NUM_WORKERS - 1)];
@@ -130,9 +130,9 @@ fn worker_entry(arg: u64) -> !
     for _ in 0..ITERS_PER_WORKER
     {
         // Tight retype + reclaim loop. Every Endpoint occupies a BIN_128
-        // slot inside `frame_slot`; concurrent workers compete on the
+        // slot inside `memory_slot`; concurrent workers compete on the
         // bin's free list and the per-cap allocator spinlock.
-        if let Ok(ep) = cap_create_endpoint(frame_slot)
+        if let Ok(ep) = cap_create_endpoint(memory_slot)
         {
             cap_delete(ep).ok();
         }
@@ -143,6 +143,6 @@ fn worker_entry(arg: u64) -> !
         }
     }
 
-    signal_send(done_slot, bit).ok();
+    notification_send(done_slot, bit).ok();
     thread_exit()
 }

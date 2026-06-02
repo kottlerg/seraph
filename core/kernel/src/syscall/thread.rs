@@ -355,7 +355,7 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
     use crate::ipc::endpoint::{EndpointState, unlink_from_wait_queue};
     use crate::ipc::event_queue::EventQueueState;
-    use crate::ipc::signal::SignalState;
+    use crate::ipc::notification::NotificationState;
     use crate::ipc::wait_set::WaitSetState;
     use crate::sched::thread::IpcThreadState;
     use syscall::SyscallError;
@@ -438,14 +438,14 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
             }
         }
 
-        IpcThreadState::BlockedOnSignal =>
+        IpcThreadState::BlockedOnNotification =>
         {
             if !blocked_on.is_null()
             {
                 // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
                 #[allow(clippy::cast_ptr_alignment)]
-                let sig = blocked_on.cast::<SignalState>();
-                // SAFETY: blocked_on is a valid SignalState ptr.
+                let sig = blocked_on.cast::<NotificationState>();
+                // SAFETY: blocked_on is a valid NotificationState ptr.
                 unsafe {
                     let saved = (*sig).lock.lock_raw();
                     if core::ptr::eq((*sig).waiter, tcb)
@@ -499,7 +499,7 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
         {}
     }
 
-    // If the thread was parked with a timeout (signal-wait or event-recv
+    // If the thread was parked with a timeout (notification-wait or event-recv
     // with `timeout_ms != 0`), it is also on the global sleep list. Drop
     // the entry now so a later timer tick does not dereference a freed TCB.
     //

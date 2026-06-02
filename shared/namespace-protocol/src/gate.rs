@@ -3,16 +3,16 @@
 
 // shared/namespace-protocol/src/gate.rs
 
-//! Per-label rights gate for tokened namespace endpoints.
+//! Per-label rights gate for badged namespace endpoints.
 //!
-//! [`gate`] is the only public path from a `(label, token)` pair to a
+//! [`gate`] is the only public path from a `(label, badge)` pair to a
 //! [`NodeId`] outside this crate. Servers call it before dispatching
-//! any tokened message; it looks up the operation's rights requirement
-//! in [`RIGHTS_TABLE`], unpacks the token, and returns
-//! `Ok((node_id, rights))` only when the token's rights mask satisfies
+//! any badged message; it looks up the operation's rights requirement
+//! in [`RIGHTS_TABLE`], unpacks the badge, and returns
+//! `Ok((node_id, rights))` only when the badge's rights mask satisfies
 //! the requirement.
 //!
-//! Adding a new tokened label requires one row in [`RIGHTS_TABLE`]
+//! Adding a new badged label requires one row in [`RIGHTS_TABLE`]
 //! next to the wire-protocol definition; an unmatched opcode replies
 //! [`GateError::UnknownLabel`] (mapped to the wire's `UNKNOWN_OPCODE`).
 
@@ -22,8 +22,8 @@ use core::prelude::rust_2024::*;
 
 use core::num::NonZeroU32;
 
+use crate::badge::{NodeId, unpack};
 use crate::rights::{self, NamespaceRights};
-use crate::token::{NodeId, unpack};
 
 /// Failure modes for [`gate`]. Callers map to their wire layer's
 /// `UNKNOWN_OPCODE` / `PERMISSION_DENIED` codes.
@@ -32,12 +32,12 @@ pub enum GateError
 {
     /// Opcode is not registered in [`RIGHTS_TABLE`].
     UnknownLabel,
-    /// Token's rights mask is missing a required bit (or is empty for
+    /// Badge's rights mask is missing a required bit (or is empty for
     /// [`RightsRequirement::AnyNonEmpty`] operations).
     PermissionDenied,
 }
 
-/// Decode a tokened request and enforce its rights requirement.
+/// Decode a badged request and enforce its rights requirement.
 ///
 /// `label` is the full IPC label; the opcode is `label & 0xFFFF` so
 /// callers may pass labels carrying payload length in high bits
@@ -46,13 +46,13 @@ pub enum GateError
 /// # Errors
 ///
 /// [`GateError::UnknownLabel`] when the opcode is absent from
-/// [`RIGHTS_TABLE`]; [`GateError::PermissionDenied`] when the token's
+/// [`RIGHTS_TABLE`]; [`GateError::PermissionDenied`] when the badge's
 /// rights mask does not satisfy the entry.
-pub fn gate(label: u64, token: u64) -> Result<(NodeId, NamespaceRights), GateError>
+pub fn gate(label: u64, badge: u64) -> Result<(NodeId, NamespaceRights), GateError>
 {
     let opcode = label & 0xFFFF;
     let req = required_rights_for(opcode).ok_or(GateError::UnknownLabel)?;
-    let (node, rights) = unpack(token);
+    let (node, rights) = unpack(badge);
     let ok = match req
     {
         RightsRequirement::Bits(bits) => rights.contains(bits.get()),
@@ -72,7 +72,7 @@ pub fn gate(label: u64, token: u64) -> Result<(NodeId, NamespaceRights), GateErr
 /// namespace server is about to forward to another (e.g. vfsd's
 /// fall-through delegation to a mounted filesystem driver).
 ///
-/// Decodes the caller's parent rights from `recv_token`, decodes
+/// Decodes the caller's parent rights from `recv_badge`, decodes
 /// `recv_word0` (treating the wire's `0xFFFF` "everything I'm allowed"
 /// sentinel as [`NamespaceRights::ALL`]), and returns the raw mask of
 /// their intersection. The forwarder writes this mask into the
@@ -82,7 +82,7 @@ pub fn gate(label: u64, token: u64) -> Result<(NodeId, NamespaceRights), GateErr
 ///
 /// The receiving server composes its returned rights as
 /// `parent_rights ∩ entry.max_rights ∩ caller_requested`, where
-/// `parent_rights` is unpacked from the **destination cap's** token —
+/// `parent_rights` is unpacked from the **destination cap's** badge —
 /// i.e. the forwarding intermediary's authority on the receiver, not
 /// the original caller's authority on the intermediary. Forwarding
 /// the caller's `word(0)` verbatim therefore launders authority: a
@@ -100,9 +100,9 @@ pub fn gate(label: u64, token: u64) -> Result<(NodeId, NamespaceRights), GateErr
 /// already decodes raw rights bits the same way — and no protocol
 /// version change is required.
 #[must_use]
-pub fn compose_forward_lookup_rights(recv_token: u64, recv_word0: u64) -> u32
+pub fn compose_forward_lookup_rights(recv_badge: u64, recv_word0: u64) -> u32
 {
-    let (_, parent_rights) = unpack(recv_token);
+    let (_, parent_rights) = unpack(recv_badge);
     let caller_requested = crate::decode_caller_requested(recv_word0);
     (parent_rights & caller_requested).raw()
 }
@@ -110,10 +110,10 @@ pub fn compose_forward_lookup_rights(recv_token: u64, recv_word0: u64) -> u32
 #[derive(Copy, Clone)]
 enum RightsRequirement
 {
-    /// Token must contain every bit in this mask. The [`NonZeroU32`]
+    /// Badge must contain every bit in this mask. The [`NonZeroU32`]
     /// makes the empty mask unrepresentable.
     Bits(NonZeroU32),
-    /// Token's rights mask must be non-empty. For bookkeeping
+    /// Badge's rights mask must be non-empty. For bookkeeping
     /// operations on already-issued resources where authority lives at
     /// issuance.
     AnyNonEmpty,
@@ -128,7 +128,7 @@ const fn nz(bit: u32) -> NonZeroU32
     }
 }
 
-/// Per-tokened-label rights requirements. Untokened service-level
+/// Per-badged-label rights requirements. Unbadged service-level
 /// labels (e.g. `FS_MOUNT`) are dispatched separately and do not
 /// appear here.
 const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
@@ -149,11 +149,11 @@ const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
         RightsRequirement::Bits(nz(rights::READ)),
     ),
     (
-        ipc::fs_labels::FS_READ_FRAME,
+        ipc::fs_labels::FS_READ_MEMORY,
         RightsRequirement::Bits(nz(rights::READ)),
     ),
     (
-        ipc::fs_labels::FS_RELEASE_FRAME,
+        ipc::fs_labels::FS_RELEASE_MEMORY,
         RightsRequirement::AnyNonEmpty,
     ),
     (ipc::fs_labels::FS_CLOSE, RightsRequirement::AnyNonEmpty),
@@ -162,7 +162,7 @@ const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
         RightsRequirement::Bits(nz(rights::WRITE)),
     ),
     (
-        ipc::fs_labels::FS_WRITE_FRAME,
+        ipc::fs_labels::FS_WRITE_MEMORY,
         RightsRequirement::Bits(nz(rights::WRITE)),
     ),
     (
@@ -206,9 +206,9 @@ fn required_rights_for(opcode: u64) -> Option<RightsRequirement>
 mod tests
 {
     use super::*;
-    use crate::token::pack;
+    use crate::badge::pack;
 
-    fn token_with(rights_bits: u32) -> u64
+    fn badge_with(rights_bits: u32) -> u64
     {
         pack(
             NodeId::new(0x42).unwrap(),
@@ -220,23 +220,23 @@ mod tests
     fn unknown_opcode_returns_unknown_label()
     {
         assert_eq!(
-            gate(0x9999, token_with(0xFFFF)),
+            gate(0x9999, badge_with(0xFFFF)),
             Err(GateError::UnknownLabel)
         );
     }
 
     #[test]
-    fn ns_lookup_accepts_token_with_lookup_bit()
+    fn ns_lookup_accepts_badge_with_lookup_bit()
     {
-        let (node, _) = gate(ipc::ns_labels::NS_LOOKUP, token_with(rights::LOOKUP)).unwrap();
+        let (node, _) = gate(ipc::ns_labels::NS_LOOKUP, badge_with(rights::LOOKUP)).unwrap();
         assert_eq!(node.raw(), 0x42);
     }
 
     #[test]
-    fn ns_lookup_rejects_token_without_lookup_bit()
+    fn ns_lookup_rejects_badge_without_lookup_bit()
     {
         assert_eq!(
-            gate(ipc::ns_labels::NS_LOOKUP, token_with(rights::STAT)),
+            gate(ipc::ns_labels::NS_LOOKUP, badge_with(rights::STAT)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -244,9 +244,9 @@ mod tests
     #[test]
     fn ns_stat_gates_on_stat_bit()
     {
-        assert!(gate(ipc::ns_labels::NS_STAT, token_with(rights::STAT)).is_ok());
+        assert!(gate(ipc::ns_labels::NS_STAT, badge_with(rights::STAT)).is_ok());
         assert_eq!(
-            gate(ipc::ns_labels::NS_STAT, token_with(rights::READ)),
+            gate(ipc::ns_labels::NS_STAT, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -254,9 +254,9 @@ mod tests
     #[test]
     fn ns_readdir_gates_on_readdir_bit()
     {
-        assert!(gate(ipc::ns_labels::NS_READDIR, token_with(rights::READDIR)).is_ok());
+        assert!(gate(ipc::ns_labels::NS_READDIR, badge_with(rights::READDIR)).is_ok());
         assert_eq!(
-            gate(ipc::ns_labels::NS_READDIR, token_with(rights::LOOKUP)),
+            gate(ipc::ns_labels::NS_READDIR, badge_with(rights::LOOKUP)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -264,14 +264,14 @@ mod tests
     #[test]
     fn fs_read_and_fs_read_frame_share_the_read_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_READ, token_with(rights::READ)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_READ_FRAME, token_with(rights::READ)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_READ, badge_with(rights::READ)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_READ_MEMORY, badge_with(rights::READ)).is_ok());
         assert_eq!(
-            gate(ipc::fs_labels::FS_READ, token_with(rights::STAT)),
+            gate(ipc::fs_labels::FS_READ, badge_with(rights::STAT)),
             Err(GateError::PermissionDenied)
         );
         assert_eq!(
-            gate(ipc::fs_labels::FS_READ_FRAME, token_with(rights::STAT)),
+            gate(ipc::fs_labels::FS_READ_MEMORY, badge_with(rights::STAT)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -279,16 +279,16 @@ mod tests
     #[test]
     fn fs_release_frame_accepts_any_single_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_RELEASE_FRAME, token_with(rights::READ)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_RELEASE_FRAME, token_with(rights::STAT)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_RELEASE_FRAME, token_with(rights::ADMIN)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::READ)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::STAT)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::ADMIN)).is_ok());
     }
 
     #[test]
     fn fs_release_frame_rejects_empty_rights_mask()
     {
         assert_eq!(
-            gate(ipc::fs_labels::FS_RELEASE_FRAME, token_with(0)),
+            gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(0)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -297,7 +297,7 @@ mod tests
     fn fs_close_rejects_empty_rights_mask()
     {
         assert_eq!(
-            gate(ipc::fs_labels::FS_CLOSE, token_with(0)),
+            gate(ipc::fs_labels::FS_CLOSE, badge_with(0)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -305,14 +305,14 @@ mod tests
     #[test]
     fn fs_write_and_fs_write_frame_share_the_write_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_WRITE, token_with(rights::WRITE)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_WRITE_FRAME, token_with(rights::WRITE)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_WRITE, badge_with(rights::WRITE)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_WRITE_MEMORY, badge_with(rights::WRITE)).is_ok());
         assert_eq!(
-            gate(ipc::fs_labels::FS_WRITE, token_with(rights::READ)),
+            gate(ipc::fs_labels::FS_WRITE, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
         );
         assert_eq!(
-            gate(ipc::fs_labels::FS_WRITE_FRAME, token_with(rights::READ)),
+            gate(ipc::fs_labels::FS_WRITE_MEMORY, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -328,11 +328,11 @@ mod tests
         ]
         {
             assert!(
-                gate(label, token_with(rights::MUTATE_DIR)).is_ok(),
+                gate(label, badge_with(rights::MUTATE_DIR)).is_ok(),
                 "label {label:#x} should accept MUTATE_DIR"
             );
             assert_eq!(
-                gate(label, token_with(rights::LOOKUP | rights::READDIR)),
+                gate(label, badge_with(rights::LOOKUP | rights::READDIR)),
                 Err(GateError::PermissionDenied),
                 "label {label:#x} should reject without MUTATE_DIR"
             );
@@ -342,13 +342,13 @@ mod tests
     #[test]
     fn fs_truncate_gates_on_write_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_TRUNCATE, token_with(rights::WRITE)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_TRUNCATE, badge_with(rights::WRITE)).is_ok());
         assert_eq!(
-            gate(ipc::fs_labels::FS_TRUNCATE, token_with(rights::READ)),
+            gate(ipc::fs_labels::FS_TRUNCATE, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
         );
         assert_eq!(
-            gate(ipc::fs_labels::FS_TRUNCATE, token_with(rights::MUTATE_DIR)),
+            gate(ipc::fs_labels::FS_TRUNCATE, badge_with(rights::MUTATE_DIR)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -358,14 +358,14 @@ mod tests
     {
         // NS_LOOKUP encodes name length in bits 16..32.
         let label = ipc::ns_labels::NS_LOOKUP | (5u64 << 16);
-        assert!(gate(label, token_with(rights::LOOKUP)).is_ok());
+        assert!(gate(label, badge_with(rights::LOOKUP)).is_ok());
     }
 
     #[test]
-    fn returned_rights_match_token_rights()
+    fn returned_rights_match_badge_rights()
     {
         let bits = rights::LOOKUP | rights::READ | rights::STAT;
-        let (_, r) = gate(ipc::ns_labels::NS_LOOKUP, token_with(bits)).unwrap();
+        let (_, r) = gate(ipc::ns_labels::NS_LOOKUP, badge_with(bits)).unwrap();
         assert_eq!(r.raw(), bits);
     }
 
@@ -373,15 +373,15 @@ mod tests
     fn compose_forward_lookup_rights_intersects_parent_with_request()
     {
         let parent = rights::LOOKUP | rights::READ | rights::STAT;
-        let token = token_with(parent);
+        let badge = badge_with(parent);
         // Caller asks for exactly READ — receiver should see READ.
         assert_eq!(
-            compose_forward_lookup_rights(token, u64::from(rights::READ)),
+            compose_forward_lookup_rights(badge, u64::from(rights::READ)),
             rights::READ
         );
         // Caller asks for STAT|READ — receiver should see STAT|READ.
         assert_eq!(
-            compose_forward_lookup_rights(token, u64::from(rights::READ | rights::STAT)),
+            compose_forward_lookup_rights(badge, u64::from(rights::READ | rights::STAT)),
             rights::READ | rights::STAT,
         );
     }
@@ -390,10 +390,10 @@ mod tests
     fn compose_forward_lookup_rights_resolves_sentinel_against_parent()
     {
         let parent = rights::LOOKUP | rights::STAT;
-        let token = token_with(parent);
+        let badge = badge_with(parent);
         // 0xFFFF means "everything I'm allowed"; intersected with parent
         // it must collapse to exactly the parent rights.
-        assert_eq!(compose_forward_lookup_rights(token, 0xFFFF), parent);
+        assert_eq!(compose_forward_lookup_rights(badge, 0xFFFF), parent);
     }
 
     #[test]
@@ -401,9 +401,9 @@ mod tests
     {
         // Parent only has LOOKUP|STAT; caller's request body asks for READ.
         // Forwarded mask must not include READ.
-        let token = token_with(rights::LOOKUP | rights::STAT);
+        let badge = badge_with(rights::LOOKUP | rights::STAT);
         assert_eq!(
-            compose_forward_lookup_rights(token, u64::from(rights::READ)),
+            compose_forward_lookup_rights(badge, u64::from(rights::READ)),
             0
         );
     }
@@ -413,8 +413,8 @@ mod tests
     {
         // Reserved high bits in word(0) (above RIGHTS_MASK) must not
         // bleed into the forwarded mask.
-        let token = token_with(rights::LOOKUP);
+        let badge = badge_with(rights::LOOKUP);
         let raw = u64::from(rights::LOOKUP) | (1u64 << 31);
-        assert_eq!(compose_forward_lookup_rights(token, raw), rights::LOOKUP,);
+        assert_eq!(compose_forward_lookup_rights(badge, raw), rights::LOOKUP,);
     }
 }

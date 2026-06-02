@@ -1,8 +1,8 @@
 // seraph-overlay: std::sys::sync::once::seraph
 //
 // Atomic state machine matching the upstream `sync/once/futex.rs` design,
-// but with `futex_wait` replaced by `signal_wait` on a lazily-allocated
-// Signal cap. Because signal_send wakes one thread at a time we emulate
+// but with `futex_wait` replaced by `notification_wait` on a lazily-allocated
+// Notification cap. Because notification_send wakes one thread at a time we emulate
 // wake_all by issuing a bounded burst; a waiter that awakes spuriously
 // just rechecks state and re-parks (setting the QUEUED bit again).
 
@@ -28,7 +28,7 @@ const WAKE_BURST: u32 = 16;
 
 pub struct Once {
     state_and_queued: AtomicU32,
-    signal: AtomicU32,
+    notification: AtomicU32,
 }
 
 pub struct OnceState {
@@ -65,12 +65,12 @@ impl<'a> Drop for CompletionGuard<'a> {
 impl Once {
     #[inline]
     pub const fn new() -> Once {
-        Once { state_and_queued: AtomicU32::new(INCOMPLETE), signal: AtomicU32::new(0) }
+        Once { state_and_queued: AtomicU32::new(INCOMPLETE), notification: AtomicU32::new(0) }
     }
 
     #[inline]
     pub const fn new_complete() -> Once {
-        Once { state_and_queued: AtomicU32::new(COMPLETE), signal: AtomicU32::new(0) }
+        Once { state_and_queued: AtomicU32::new(COMPLETE), notification: AtomicU32::new(0) }
     }
 
     #[inline]
@@ -123,9 +123,9 @@ impl Once {
                         }
                         snapshot = want;
                     }
-                    let sig = ensure_signal(&self.signal);
+                    let sig = ensure_notification(&self.notification);
                     if sig != 0 {
-                        let _ = syscall::signal_wait(sig);
+                        let _ = syscall::notification_wait(sig);
                     } else {
                         core::hint::spin_loop();
                     }
@@ -181,9 +181,9 @@ impl Once {
                         }
                         snapshot = want;
                     }
-                    let sig = ensure_signal(&self.signal);
+                    let sig = ensure_notification(&self.notification);
                     if sig != 0 {
-                        let _ = syscall::signal_wait(sig);
+                        let _ = syscall::notification_wait(sig);
                     } else {
                         core::hint::spin_loop();
                     }
@@ -195,12 +195,12 @@ impl Once {
 
     #[cold]
     fn wake_all(&self) {
-        let sig = self.signal.load(Relaxed);
+        let sig = self.notification.load(Relaxed);
         if sig == 0 {
             return;
         }
         for _ in 0..WAKE_BURST {
-            if syscall::signal_send(sig, 1).is_err() {
+            if syscall::notification_send(sig, 1).is_err() {
                 break;
             }
         }
@@ -209,14 +209,14 @@ impl Once {
 
 impl Drop for Once {
     fn drop(&mut self) {
-        let sig = *self.signal.get_mut();
+        let sig = *self.notification.get_mut();
         if sig != 0 {
             let _ = syscall::cap_delete(sig);
         }
     }
 }
 
-fn ensure_signal(slot: &AtomicU32) -> u32 {
+fn ensure_notification(slot: &AtomicU32) -> u32 {
     let existing = slot.load(Acquire);
     if existing != 0 {
         return existing;
@@ -224,7 +224,7 @@ fn ensure_signal(slot: &AtomicU32) -> u32 {
     let Some(slab) = crate::sys::alloc::seraph::object_slab_acquire(120) else {
         return 0;
     };
-    let Ok(fresh) = syscall::cap_create_signal(slab) else {
+    let Ok(fresh) = syscall::cap_create_notification(slab) else {
         return 0;
     };
     match slot.compare_exchange(0, fresh, AcqRel, Acquire) {

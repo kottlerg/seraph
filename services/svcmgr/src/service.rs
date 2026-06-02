@@ -35,7 +35,7 @@ pub const POLICY_ALWAYS: u8 = 0;
 pub const POLICY_ON_FAILURE: u8 = 1;
 
 /// Restart policy: never restart, even on fault. Used for one-shot
-/// integration-test fixtures whose exit is the success signal.
+/// integration-test fixtures whose exit is the success notification.
 pub const POLICY_NEVER: u8 = 2;
 
 // ── Service table ───────────────────────────────────────────────────────────
@@ -79,14 +79,14 @@ pub struct ServiceEntry
     pub restart_count: u32,
     /// Whether this service is currently active.
     pub active: bool,
-    /// Per-child token used on the svcmgr bootstrap endpoint for restart
-    /// bootstrap (`cap_derive_token(svcmgr_bootstrap_ep, SEND, token)`).
-    pub bootstrap_token: u64,
-    /// Tokened SEND cap on procmgr's service endpoint identifying the
+    /// Per-child badge used on the svcmgr bootstrap endpoint for restart
+    /// bootstrap (`cap_derive_badge(svcmgr_bootstrap_ep, SEND, badge)`).
+    pub bootstrap_badge: u64,
+    /// Badged SEND cap on procmgr's service endpoint identifying the
     /// current process instance. Populated by the restart path after the
     /// first successful `CREATE_PROCESS` reply; used to call
     /// `DESTROY_PROCESS` before spawning the next restart so procmgr can
-    /// reclaim kernel objects and return its frames to memmgr's pool.
+    /// reclaim kernel objects and return its memory caps to memmgr's pool.
     /// Zero for the initial instance (which svcmgr never created — init
     /// did), so the first death cannot destroy; subsequent deaths can.
     pub process_handle: u32,
@@ -128,7 +128,7 @@ impl ServiceEntry
             system_critical: false,
             restart_count: 0,
             active: false,
-            bootstrap_token: 0,
+            bootstrap_badge: 0,
             process_handle: 0,
             // Fail-safe default: an empty slot has no installed
             // policy yet, so `None` (no namespace cap delivered) is
@@ -181,7 +181,7 @@ pub struct RestartRecipe
 //     caps[2]: SEND on the root filesystem's namespace endpoint, which
 //              svcmgr publishes as `rootfs.root` (0 if init could not
 //              derive it)
-//     caps[3]: SEND|GRANT (token 0) source on devmgr's registry endpoint,
+//     caps[3]: SEND|GRANT (badge 0) source on devmgr's registry endpoint,
 //              from which svcmgr mints the `REGISTRY_QUERY_AUTHORITY`
 //              `devmgr.registry` publish cap and the
 //              `DRIVERS_DIR_AUTHORITY` SET_DRIVERS_DIR cap (0 if absent)
@@ -196,7 +196,7 @@ pub struct RestartRecipe
 //     caps[0]: reserved master-log endpoint source (svcmgr mints real-logd's
 //              RECV from it per launch, and the first-launch HANDOVER_PULL
 //              SEND); held for the system's life so it can relaunch logd
-//     caps[1]: token-0 `SEND|GRANT` source on procmgr's service endpoint
+//     caps[1]: badge-0 `SEND|GRANT` source on procmgr's service endpoint
 //              (svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` SEND from it)
 //
 // The substrate pairs land in `pending`; `HANDOVER_COMPLETE` later
@@ -227,7 +227,7 @@ pub struct SvcmgrCaps
     /// SEND on the root filesystem's namespace endpoint, published as
     /// `rootfs.root`. Zero if init could not derive it.
     pub rootfs_root: u32,
-    /// `SEND|GRANT`, token-0 source on devmgr's registry endpoint. svcmgr
+    /// `SEND|GRANT`, badge-0 source on devmgr's registry endpoint. svcmgr
     /// mints the `devmgr.registry` publish cap (`REGISTRY_QUERY_AUTHORITY`)
     /// and the `SET_DRIVERS_DIR` cap (`DRIVERS_DIR_AUTHORITY`) from it.
     /// Zero if absent.
@@ -237,7 +237,7 @@ pub struct SvcmgrCaps
     /// one-shot `HANDOVER_PULL` SEND on the first launch. Holding it keeps the
     /// log endpoint object alive across a logd crash. Zero if absent.
     pub master_log_source: u32,
-    /// Token-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
+    /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
     /// real-logd's `DEATH_EQ_AUTHORITY` SEND from it per launch. Zero if absent.
     pub procmgr_death_auth_source: u32,
 }

@@ -23,7 +23,7 @@ mod cap_tree_deep;
 mod concurrent_event_producers;
 mod concurrent_ipc;
 mod concurrent_map_unmap;
-mod concurrent_signal;
+mod concurrent_notification;
 mod cspace_recycle;
 mod event_queue_fill_drain;
 mod fpu_migration_churn;
@@ -36,8 +36,8 @@ use crate::{ChildStack, TestContext, run_integration_test};
 
 /// Maximum concurrent child threads across all stress tests.
 ///
-/// 64 matches the width of the `u64` signal bitmask used by tests that
-/// allocate one bit per worker (`concurrent_signal`, `retype_concurrent`,
+/// 64 matches the width of the `u64` notification bitmask used by tests that
+/// allocate one bit per worker (`concurrent_notification`, `retype_concurrent`,
 /// `cap_revoke_under_use`). Bumping past 64 requires refactoring those
 /// tests to use an atomic-counter ledger instead of one bit per worker.
 /// 64 × 16 KiB `ChildStack` = 1 MiB BSS — fits comfortably in ktest's
@@ -66,7 +66,10 @@ pub fn run_all(ctx: &TestContext)
         "stress::priority_dealloc_race",
         priority_dealloc_race::run(ctx)
     );
-    run_integration_test!("stress::concurrent_signal", concurrent_signal::run(ctx));
+    run_integration_test!(
+        "stress::concurrent_notification",
+        concurrent_notification::run(ctx)
+    );
     run_integration_test!("stress::concurrent_ipc", concurrent_ipc::run(ctx));
     run_integration_test!(
         "stress::cap_revoke_under_use",

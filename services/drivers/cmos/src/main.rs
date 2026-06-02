@@ -5,7 +5,7 @@
 
 //! Seraph x86-64 CMOS / MC146818-compatible RTC driver.
 //!
-//! Spawned by devmgr with a narrow `IoPortRange` cap covering CMOS
+//! Spawned by devmgr with a narrow `IoPort` cap covering CMOS
 //! index/data ports `0x70`–`0x71` plus a RECV cap on the driver's
 //! service endpoint. Implements the one-label RTC driver contract
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]) by re-reading hardware on
@@ -94,7 +94,7 @@ unsafe fn inb(port: u16) -> u8
 
 fn cmos_read(reg: u8) -> u8
 {
-    // SAFETY: CMOS_INDEX / CMOS_DATA are in the bound IoPortRange.
+    // SAFETY: CMOS_INDEX / CMOS_DATA are in the bound IoPort.
     unsafe {
         outb(CMOS_INDEX, reg);
         inb(CMOS_DATA)
@@ -292,7 +292,7 @@ fn handle_request(msg: &IpcMessage, ipc_buf: *mut u64)
     {
         rtc_labels::RTC_GET_EPOCH_TIME =>
         {
-            if msg.token & rtc_labels::READ_AUTHORITY == 0
+            if msg.badge & rtc_labels::READ_AUTHORITY == 0
             {
                 IpcMessage::new(rtc_errors::UNAUTHORIZED)
             }

@@ -40,13 +40,13 @@ use core::prelude::rust_2024::*;
 
 use syscall_abi::{
     MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
-    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_SIGNAL,
-    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_TOKEN, SYS_CAP_INFO, SYS_CAP_INSERT, SYS_CAP_MOVE, SYS_CAP_REVOKE,
-    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_FRAME_MERGE, SYS_FRAME_SPLIT, SYS_IOPORT_BIND,
-    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
-    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MMIO_MAP,
-    SYS_MMIO_SPLIT, SYS_SBI_CALL, SYS_SIGNAL_SEND, SYS_SIGNAL_WAIT, SYS_SYSTEM_INFO,
+    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
+    SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
+    SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
+    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
+    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SYSTEM_INFO,
     SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS,
     SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
     SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
@@ -55,8 +55,8 @@ use syscall_abi::{
 
 pub use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
-    CAP_INFO_CSPACE_USED, CAP_INFO_FRAME_AVAILABLE, CAP_INFO_FRAME_HAS_RETYPE,
-    CAP_INFO_FRAME_PHYS_BASE, CAP_INFO_FRAME_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_FRAME,
+    CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
+    CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
     MAP_EXECUTABLE, MAP_READ, MAP_READONLY, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_CSPACE,
     RIGHTS_MAP_READ, RIGHTS_MAP_RW, RIGHTS_MAP_RX, RIGHTS_RECEIVE, RIGHTS_RETYPE, RIGHTS_SEND,
     RIGHTS_SEND_GRANT, RIGHTS_THREAD,
@@ -341,7 +341,7 @@ unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
 
 /// Issue a syscall with 1 argument. Returns (primary, secondary, tertiary, quaternary).
 ///
-/// Used by `ipc_recv` to retrieve `(ret, label, token, word_count)`.
+/// Used by `ipc_recv` to retrieve `(ret, label, badge, word_count)`.
 #[cfg(target_arch = "x86_64")]
 // inline_always: syscall wrapper contains inline asm; must inline to call site.
 // cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
@@ -651,14 +651,14 @@ pub fn raw_ipc_call(
 /// `IpcMessage`-snapshot wrapper; other callers should use that higher-level
 /// entry point.
 ///
-/// Returns `(label, token, word_count)` on success.
+/// Returns `(label, badge, word_count)` on success.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
 {
     // SAFETY: syscall1_ret4 issues raw syscall; kernel writes into the
     // per-thread IPC buffer and returns four values in return registers.
-    let (ret, label, token, word_count) = unsafe { syscall1_ret4(SYS_IPC_RECV, u64::from(ep)) };
+    let (ret, label, badge, word_count) = unsafe { syscall1_ret4(SYS_IPC_RECV, u64::from(ep)) };
     if ret < 0
     {
         Err(ret)
@@ -669,7 +669,7 @@ pub fn raw_ipc_recv(ep: u32) -> Result<(u64, u64, usize), i64>
         // kernel clamps word_count to MSG_DATA_WORDS_MAX = 64 before write.
         #[allow(clippy::cast_possible_truncation)]
         let word_count = (word_count as usize).min(MSG_DATA_WORDS_MAX);
-        Ok((label, token, word_count))
+        Ok((label, badge, word_count))
     }
 }
 
@@ -703,20 +703,20 @@ pub fn raw_ipc_reply(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Send `bits` to a signal cap. `bits` must be non-zero.
+/// Send `bits` to a notification cap. `bits` must be non-zero.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the signal cap is invalid or `bits` is zero.
+/// Returns a negative `i64` error code if the notification cap is invalid or `bits` is zero.
 #[inline]
-pub fn signal_send(sig: u32, bits: u64) -> Result<(), i64>
+pub fn notification_send(sig: u32, bits: u64) -> Result<(), i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; sig is cap index as u64, bits is bitmask;
-    // kernel validates cap and updates signal state.
-    let ret = unsafe { syscall2(SYS_SIGNAL_SEND, u64::from(sig), bits) };
+    // kernel validates cap and updates notification state.
+    let ret = unsafe { syscall2(SYS_NOTIFICATION_SEND, u64::from(sig), bits) };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Block until any bits are set on a signal cap. Returns the acquired bitmask.
+/// Block until any bits are set on a notification cap. Returns the acquired bitmask.
 ///
 /// The primary return register holds status (`0` on success, negative
 /// `SyscallError` on failure); the bitmask is delivered in the secondary
@@ -724,93 +724,93 @@ pub fn signal_send(sig: u32, bits: u64) -> Result<(), i64>
 /// bit-63-set bitmasks with the dispatcher's negative-Err encoding.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the signal cap is invalid or the
+/// Returns a negative `i64` error code if the notification cap is invalid or the
 /// wait is interrupted.
 #[inline]
-pub fn signal_wait(sig: u32) -> Result<u64, i64>
+pub fn notification_wait(sig: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; sig is cap
     // index as u64, arg1 = 0 selects indefinite blocking; kernel validates
     // cap and writes the bitmask into the secondary return register.
-    let (ret, bits) = unsafe { syscall5_ret2(SYS_SIGNAL_WAIT, u64::from(sig), 0, 0, 0, 0) };
+    let (ret, bits) = unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, u64::from(sig), 0, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
-/// Block until any bits are set on a signal cap, or until `timeout_ms`
+/// Block until any bits are set on a notification cap, or until `timeout_ms`
 /// elapses. Returns the acquired bitmask (non-zero) on wake, or `Ok(0)`
 /// on timeout.
 ///
-/// `timeout_ms == 0` is equivalent to [`signal_wait`] — block indefinitely.
+/// `timeout_ms == 0` is equivalent to [`notification_wait`] — block indefinitely.
 /// Callers that want a non-blocking poll should use `timeout_ms = 1`.
 ///
-/// Same register layout as [`signal_wait`]: status in the primary register,
-/// bitmask in the secondary. Timeout is signalled in-band as `bits == 0`
-/// (legitimate because `signal_send` rejects zero-bit sends).
+/// Same register layout as [`notification_wait`]: status in the primary register,
+/// bitmask in the secondary. Timeout is notified in-band as `bits == 0`
+/// (legitimate because `notification_send` rejects zero-bit sends).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the signal cap is invalid or
+/// Returns a negative `i64` error code if the notification cap is invalid or
 /// the wait is interrupted.
 #[inline]
-pub fn signal_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
+pub fn notification_wait_timeout(sig: u32, timeout_ms: u64) -> Result<u64, i64>
 {
-    // SAFETY: same as `signal_wait`; arg1 carries the timeout sentinel
+    // SAFETY: same as `notification_wait`; arg1 carries the timeout sentinel
     // (0 = infinite, matching the single-arg behaviour).
     let (ret, bits) =
-        unsafe { syscall5_ret2(SYS_SIGNAL_WAIT, u64::from(sig), timeout_ms, 0, 0, 0) };
+        unsafe { syscall5_ret2(SYS_NOTIFICATION_WAIT, u64::from(sig), timeout_ms, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(bits) }
 }
 
-/// Retype a Frame cap into a new Endpoint. Returns the `CSpace` slot index.
+/// Retype a Memory cap into a new Endpoint. Returns the `CSpace` slot index.
 ///
-/// `frame_cap` is the source Frame-cap slot; it MUST carry `RIGHTS_RETYPE`
+/// `memory_cap` is the source Memory-cap slot; it MUST carry `RIGHTS_RETYPE`
 /// and have at least 88 B of `available_bytes` (the Endpoint wrapper plus
-/// state). Bytes are debited from the Frame cap and credited back when the
+/// state). Bytes are debited from the Memory cap and credited back when the
 /// Endpoint is destroyed.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if `frame_cap` is invalid, lacks
+/// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_endpoint(frame_cap: u32) -> Result<u32, i64>
+pub fn cap_create_endpoint(memory_cap: u32) -> Result<u32, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments;
-    // kernel retypes the Frame-cap region and returns the new slot index.
-    let ret = unsafe { syscall2(SYS_CAP_CREATE_ENDPOINT, u64::from(frame_cap), 0) };
+    // kernel retypes the Memory-cap region and returns the new slot index.
+    let ret = unsafe { syscall2(SYS_CAP_CREATE_ENDPOINT, u64::from(memory_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Retype a Frame cap into a new Signal. Returns the `CSpace` slot index.
+/// Retype a Memory cap into a new Notification. Returns the `CSpace` slot index.
 ///
-/// `frame_cap` MUST carry `RIGHTS_RETYPE` and have at least 120 B of
-/// `available_bytes`. Bytes are debited from the Frame cap and credited back
-/// when the Signal is destroyed.
+/// `memory_cap` MUST carry `RIGHTS_RETYPE` and have at least 120 B of
+/// `available_bytes`. Bytes are debited from the Memory cap and credited back
+/// when the Notification is destroyed.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if `frame_cap` is invalid, lacks
+/// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_RETYPE`, has insufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_signal(frame_cap: u32) -> Result<u32, i64>
+pub fn cap_create_notification(memory_cap: u32) -> Result<u32, i64>
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments;
-    // kernel retypes the Frame-cap region and returns the new slot index.
-    let ret = unsafe { syscall2(SYS_CAP_CREATE_SIGNAL, u64::from(frame_cap), 0) };
+    // kernel retypes the Memory-cap region and returns the new slot index.
+    let ret = unsafe { syscall2(SYS_CAP_CREATE_NOTIFICATION, u64::from(memory_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
 /// Create a new `AddressSpace` object. Returns the `CSpace` slot index.
 ///
-/// Retype a Frame cap into a new `AddressSpace`, or augment an existing
+/// Retype a Memory cap into a new `AddressSpace`, or augment an existing
 /// one's PT growth budget.
 ///
-/// `frame_cap` must carry `Rights::RETYPE` and have at least
+/// `memory_cap` must carry `Rights::RETYPE` and have at least
 /// `init_pages * PAGE_SIZE` of `available_bytes`. Page 0 of the slab
 /// becomes the root PT; pages 1..`init_pages` form the initial PT growth
 /// pool. `init_pages` must be `>= 1`.
@@ -821,17 +821,18 @@ pub fn cap_create_signal(frame_cap: u32) -> Result<u32, i64>
 ///   returns `0`.
 ///
 /// # Errors
-/// Returns a negative `i64` error code on insufficient frame budget,
+/// Returns a negative `i64` error code on insufficient memory budget,
 /// invalid cap, or a full `CSpace`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_aspace(frame_cap: u32, augment_target: u32, init_pages: u64) -> Result<u32, i64>
+pub fn cap_create_aspace(memory_cap: u32, augment_target: u32, init_pages: u64)
+-> Result<u32, i64>
 {
     // SAFETY: syscall3 issues a raw syscall; arguments are scalar.
     let ret = unsafe {
         syscall3(
             SYS_CAP_CREATE_ASPACE,
-            u64::from(frame_cap),
+            u64::from(memory_cap),
             u64::from(augment_target),
             init_pages,
         )
@@ -839,10 +840,10 @@ pub fn cap_create_aspace(frame_cap: u32, augment_target: u32, init_pages: u64) -
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Retype a Frame cap into a new `CSpace`, or augment an existing one's
+/// Retype a Memory cap into a new `CSpace`, or augment an existing one's
 /// slot-page growth budget.
 ///
-/// `frame_cap` must carry `Rights::RETYPE` and have at least
+/// `memory_cap` must carry `Rights::RETYPE` and have at least
 /// `init_pages * PAGE_SIZE` of `available_bytes`. All `init_pages`
 /// become the initial slot-page pool (the first `CSpace::grow` consumes
 /// one). `init_pages` must be `>= 1`.
@@ -854,12 +855,12 @@ pub fn cap_create_aspace(frame_cap: u32, augment_target: u32, init_pages: u64) -
 ///   `max_slots` argument is ignored in augment mode.
 ///
 /// # Errors
-/// Returns a negative `i64` error code on insufficient frame budget,
+/// Returns a negative `i64` error code on insufficient memory budget,
 /// invalid cap, or a full `CSpace`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
 pub fn cap_create_cspace(
-    frame_cap: u32,
+    memory_cap: u32,
     augment_target: u32,
     init_pages: u64,
     max_slots: u64,
@@ -869,7 +870,7 @@ pub fn cap_create_cspace(
     let ret = unsafe {
         syscall4(
             SYS_CAP_CREATE_CSPACE,
-            u64::from(frame_cap),
+            u64::from(memory_cap),
             u64::from(augment_target),
             init_pages,
             max_slots,
@@ -878,30 +879,30 @@ pub fn cap_create_cspace(
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Retype a Frame cap into a new Thread bound to `aspace_cap` and
+/// Retype a Memory cap into a new Thread bound to `aspace_cap` and
 /// `cspace_cap`. Returns the `CSpace` slot index of the new Thread cap.
 ///
-/// `frame_cap` must carry `Rights::RETYPE` and have at least 5 pages of
+/// `memory_cap` must carry `Rights::RETYPE` and have at least 5 pages of
 /// `available_bytes` (4 kstack pages plus 1 page for the wrapper and
 /// TCB; see `cap::retype::dispatch_for(Thread)`).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if any cap is invalid, the Frame
+/// Returns a negative `i64` error code if any cap is invalid, the Memory
 /// cap lacks `RETYPE` or sufficient `available_bytes`, or the caller's
 /// `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn cap_create_thread(frame_cap: u32, aspace_cap: u32, cspace_cap: u32) -> Result<u32, i64>
+pub fn cap_create_thread(memory_cap: u32, aspace_cap: u32, cspace_cap: u32) -> Result<u32, i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; frame_cap, aspace_cap, and
+    // SAFETY: syscall3 issues raw syscall instruction; memory_cap, aspace_cap, and
     // cspace_cap are cap indices passed as u64; kernel validates caps, retypes,
     // returns slot index.
     let ret = unsafe {
         syscall3(
             SYS_CAP_CREATE_THREAD,
-            u64::from(frame_cap),
+            u64::from(memory_cap),
             u64::from(aspace_cap),
             u64::from(cspace_cap),
         )
@@ -909,25 +910,25 @@ pub fn cap_create_thread(frame_cap: u32, aspace_cap: u32, cspace_cap: u32) -> Re
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Map `page_count` pages of a Frame cap into an address space.
+/// Map `page_count` pages of a Memory cap into an address space.
 ///
-/// - `frame_cap`: cap index of the source Frame.
+/// - `memory_cap`: cap index of the source Memory cap.
 /// - `aspace_cap`: cap index of the target `AddressSpace`.
 /// - `virt`: virtual address to map at (page-aligned, < `0x0000_8000_0000_0000`).
-/// - `offset_pages`: first page within the frame to map.
+/// - `offset_pages`: first page within the memory region to map.
 /// - `page_count`: number of pages to map.
 /// - `prot_bits`: explicit permission bits (bit 1 = WRITE, bit 2 = EXECUTE).
-///   Must be a subset of the Frame cap's rights. If zero, permissions are
-///   derived from the Frame cap's rights directly.
+///   Must be a subset of the Memory cap's rights. If zero, permissions are
+///   derived from the Memory cap's rights directly.
 ///
 /// W^X is enforced: WRITE and EXECUTE may not both be set.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, `virt` is
-/// not page-aligned or out of range, the frame is too small, or W^X is violated.
+/// not page-aligned or out of range, the memory region is too small, or W^X is violated.
 #[inline]
 pub fn mem_map(
-    frame_cap: u32,
+    memory_cap: u32,
     aspace_cap: u32,
     virt: u64,
     offset_pages: u64,
@@ -941,7 +942,7 @@ pub fn mem_map(
     let ret = unsafe {
         syscall6(
             SYS_MEM_MAP,
-            u64::from(frame_cap),
+            u64::from(memory_cap),
             u64::from(aspace_cap),
             virt,
             offset_pages,
@@ -971,8 +972,8 @@ pub fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 
 /// Change permission flags on `page_count` existing mappings in `aspace_cap`.
 ///
-/// `frame_cap` authorises the requested permissions: they must be a subset of
-/// the Frame cap's rights. `prot` encoding: bit 1 = WRITE, bit 2 = EXECUTE.
+/// `memory_cap` authorises the requested permissions: they must be a subset of
+/// the Memory cap's rights. `prot` encoding: bit 1 = WRITE, bit 2 = EXECUTE.
 /// W^X is enforced. Returns an error if any page is not currently mapped.
 ///
 /// # Errors
@@ -981,7 +982,7 @@ pub fn mem_unmap(aspace_cap: u32, virt: u64, page_count: u64) -> Result<(), i64>
 /// not currently mapped.
 #[inline]
 pub fn mem_protect(
-    frame_cap: u32,
+    memory_cap: u32,
     aspace_cap: u32,
     virt: u64,
     page_count: u64,
@@ -993,7 +994,7 @@ pub fn mem_protect(
     let ret = unsafe {
         syscall5(
             SYS_MEM_PROTECT,
-            u64::from(frame_cap),
+            u64::from(memory_cap),
             u64::from(aspace_cap),
             virt,
             page_count,
@@ -1003,14 +1004,14 @@ pub fn mem_protect(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Carve a virgin tail off `frame_cap`.
+/// Carve a virgin tail off `memory_cap`.
 ///
-/// `split_offset` is in bytes and must be page-aligned, > 0, < the frame
-/// size, and at or above the next page boundary above the cap's highest
+/// `split_offset` is in bytes and must be page-aligned, > 0, < the memory
+/// region size, and at or above the next page boundary above the cap's highest
 /// live retype offset (a cap that has never been retyped has bump = 0,
 /// so any in-range page-aligned offset is acceptable).
 ///
-/// The parent (`frame_cap`) stays in its slot; its `size` shrinks to
+/// The parent (`memory_cap`) stays in its slot; its `size` shrinks to
 /// `split_offset` and its `available_bytes` debits accordingly. A new
 /// child cap covering `[base + split_offset, base + orig_size)` is
 /// inserted in the caller's `CSpace` as a derivation sibling of the
@@ -1024,17 +1025,17 @@ pub fn mem_protect(
 // cast_possible_truncation: returned value is a 32-bit slot index.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 #[inline]
-pub fn frame_split(frame_cap: u32, split_offset: u64) -> Result<u32, i64>
+pub fn memory_split(memory_cap: u32, split_offset: u64) -> Result<u32, i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; frame_cap is cap index as u64, split_offset
+    // SAFETY: syscall3 issues raw syscall instruction; memory_cap is cap index as u64, split_offset
     // is byte offset; kernel validates cap and offset, returns the new tail slot.
-    let ret = unsafe { syscall3(SYS_FRAME_SPLIT, u64::from(frame_cap), split_offset, 0) };
+    let ret = unsafe { syscall3(SYS_MEMORY_SPLIT, u64::from(memory_cap), split_offset, 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Absorb a virgin tail Frame cap back into its parent.
+/// Absorb a virgin tail Memory cap back into its parent.
 ///
-/// Inverse of [`frame_split`] under Option D. `parent_cap` covers the
+/// Inverse of [`memory_split`] under Option D. `parent_cap` covers the
 /// physically-lower half and `tail_cap` the upper;
 /// `parent.base + parent.size == tail.base` is required. Both caps must
 /// share the same rights, `owns_memory` state, derivation parent, and
@@ -1043,22 +1044,22 @@ pub fn frame_split(frame_cap: u32, split_offset: u64) -> Result<u32, i64>
 ///
 /// `parent_cap`'s slot stays valid; its `size` and `available_bytes`
 /// grow to cover the absorbed tail. `tail_cap`'s slot is freed; the tail
-/// `FrameObject` is dec-ref'd without buddy-freeing the underlying
+/// `MemoryObject` is dec-ref'd without buddy-freeing the underlying
 /// physical region (parent now covers it).
 ///
-/// Used by memmgr to coalesce free-pool runs after `RELEASE_FRAMES` and
+/// Used by memmgr to coalesce free-pool runs after `RELEASE_MEMORY_CAPS` and
 /// `PROCESS_DIED` reclamation.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the caps fail validation.
 #[inline]
-pub fn frame_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
+pub fn memory_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; both caps are u32 cap indices;
     // kernel validates contiguity, rights, and derivation invariants.
     let ret = unsafe {
         syscall3(
-            SYS_FRAME_MERGE,
+            SYS_MEMORY_MERGE,
             u64::from(parent_cap),
             u64::from(tail_cap),
             0,
@@ -1067,7 +1068,7 @@ pub fn frame_merge(parent_cap: u32, tail_cap: u32) -> Result<(), i64>
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Split `mmio_cap` into two non-overlapping child `MmioRegion` caps.
+/// Split `mmio_cap` into two non-overlapping child `Mmio` caps.
 ///
 /// `split_offset` is in bytes and must be page-aligned, > 0, and < the region
 /// size. The original cap is consumed. Returns `(slot1, slot2)` where slot1
@@ -1125,7 +1126,7 @@ pub fn irq_split(irq_cap: u32, split_at: u32) -> Result<(u32, u32), i64>
     }
 }
 
-/// Split an `IoPortRange` cap into two non-overlapping children.
+/// Split an `IoPort` cap into two non-overlapping children.
 ///
 /// `split_at` is the first port of the upper child (and the exclusive upper
 /// bound of the lower child); it must satisfy `base < split_at < base + size`
@@ -1251,13 +1252,15 @@ pub fn thread_start(thread_cap: u32) -> Result<(), i64>
 #[inline]
 pub fn cap_copy(src_slot: u32, dest_cspace_cap: u32, rights_mask: u64) -> Result<u32, i64>
 {
-    // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
-    // (source slot, dest CSpace cap, rights mask); kernel validates caps and returns new slot.
+    // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
+    // (source slot, dest CSpace cap, dest slot, rights mask); a dest slot of 0 asks the
+    // kernel to allocate a free slot, which it returns.
     let ret = unsafe {
-        syscall3(
+        syscall4(
             SYS_CAP_COPY,
             u64::from(src_slot),
             u64::from(dest_cspace_cap),
+            0,
             rights_mask,
         )
     };
@@ -1285,31 +1288,31 @@ pub fn cap_derive(src_slot: u32, rights_mask: u64) -> Result<u32, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Derive a capability with a token attached (`SYS_CAP_DERIVE_TOKEN`).
+/// Derive a capability with a badge attached (`SYS_CAP_DERIVE_BADGE`).
 ///
 /// Creates a new slot in the caller's `CSpace` with attenuated rights and the
-/// specified `token` value. The token is delivered to the receiver on `ipc_recv`
+/// specified `badge` value. The badge is delivered to the receiver on `ipc_recv`
 /// when the capability is used for IPC.
 ///
-/// `token` must be non-zero. The source capability must have `token == 0`
-/// (no re-tokening).
+/// `badge` must be non-zero. The source capability must have `badge == 0`
+/// (no re-badging).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the source cap is invalid, the token
-/// is zero, the source already has a token, or the `CSpace` is full.
+/// Returns a negative `i64` error code if the source cap is invalid, the badge
+/// is zero, the source already has a badge, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn cap_derive_token(src_slot: u32, rights_mask: u64, token: u64) -> Result<u32, i64>
+pub fn cap_derive_badge(src_slot: u32, rights_mask: u64, badge: u64) -> Result<u32, i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; src_slot is cap index, rights_mask
-    // is bitmask, token is the token value; kernel validates and creates tokened derivative.
+    // is bitmask, badge is the badge value; kernel validates and creates badged derivative.
     let ret = unsafe {
         syscall3(
-            SYS_CAP_DERIVE_TOKEN,
+            SYS_CAP_DERIVE_BADGE,
             u64::from(src_slot),
             rights_mask,
-            token,
+            badge,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
@@ -1372,9 +1375,10 @@ pub fn cap_move(src_slot: u32, dest_cspace_cap: u32, dest_index: u32) -> Result<
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Insert a capability at a specific slot index in another `CSpace` (`SYS_CAP_INSERT`).
+/// Insert a capability at a specific slot index in another `CSpace`.
 ///
-/// Like `cap_copy` but the destination slot index is caller-chosen.
+/// Like `cap_copy` but the destination slot index is caller-chosen — a
+/// shorthand over `SYS_CAP_COPY` with a non-zero destination slot.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if either cap is invalid, the caller
@@ -1387,10 +1391,11 @@ pub fn cap_insert(
 ) -> Result<(), i64>
 {
     // SAFETY: syscall4 issues raw syscall instruction; all arguments are scalar u64 values
-    // (source slot, dest CSpace cap, dest index, rights mask); kernel validates and inserts cap.
+    // (source slot, dest CSpace cap, dest slot, rights mask); kernel validates and inserts cap
+    // at the caller-chosen slot.
     let ret = unsafe {
         syscall4(
-            SYS_CAP_INSERT,
+            SYS_CAP_COPY,
             u64::from(src_slot),
             u64::from(dest_cspace_cap),
             u64::from(dest_index),
@@ -1441,7 +1446,7 @@ pub fn system_info(kind: u64) -> Result<u64, i64>
 /// - `CAP_INFO_TAG_RIGHTS` is valid for any non-null slot and returns
 ///   `((tag as u8 as u64) << 32) | (rights as u32 as u64)`.
 /// - All other selectors are tag-specific:
-///   - `CAP_INFO_FRAME_*` require `CapTag::Frame`.
+///   - `CAP_INFO_MEMORY_*` require `CapTag::Memory`.
 ///   - `CAP_INFO_ASPACE_*` require `CapTag::AddressSpace`.
 ///   - `CAP_INFO_CSPACE_*` require `CapTag::CSpace`.
 ///
@@ -1490,29 +1495,29 @@ pub fn aspace_query(aspace_cap: u32, virt: u64) -> Result<u64, i64>
 
 // ── Event Queue wrappers ──────────────────────────────────────────────────────
 
-/// Retype a Frame cap into a new `EventQueue` with the given capacity (1..=4096).
+/// Retype a Memory cap into a new `EventQueue` with the given capacity (1..=4096).
 ///
-/// `frame_cap` MUST carry `RIGHTS_RETYPE`; the wrapper, state, and ring
+/// `memory_cap` MUST carry `RIGHTS_RETYPE`; the wrapper, state, and ring
 /// buffer all live inline in the same retype slot. Sub-page in-place when
 /// the total fits in `BIN_512` (≈ capacity ≤ 54), page-aligned split for
 /// larger rings.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if `frame_cap` is invalid, lacks
+/// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_RETYPE`, has insufficient `available_bytes`, `capacity` is out
 /// of range, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn event_queue_create(frame_cap: u32, capacity: u32) -> Result<u32, i64>
+pub fn event_queue_create(memory_cap: u32, capacity: u32) -> Result<u32, i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; arg0 = source Frame
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 = source Memory
     // cap slot, arg1 = capacity. Kernel retypes the region.
     let ret = unsafe {
         syscall2(
             SYS_CAP_CREATE_EVENT_Q,
-            u64::from(frame_cap),
+            u64::from(memory_cap),
             u64::from(capacity),
         )
     };
@@ -1547,7 +1552,7 @@ pub fn event_post(queue_cap: u32, payload: u64) -> Result<(), i64>
 pub fn event_recv(queue_cap: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; arg1 = 0 is the
-    // "block forever" sentinel for `SYS_EVENT_RECV` (matches `SYS_SIGNAL_WAIT`).
+    // "block forever" sentinel for `SYS_EVENT_RECV` (matches `SYS_NOTIFICATION_WAIT`).
     let (ret, payload) = unsafe { syscall5_ret2(SYS_EVENT_RECV, u64::from(queue_cap), 0, 0, 0, 0) };
     if ret < 0 { Err(ret) } else { Ok(payload) }
 }
@@ -1588,28 +1593,28 @@ pub fn event_recv_timeout(queue_cap: u32, timeout_ms: u64) -> Result<u64, i64>
 
 // ── Wait Set wrappers ─────────────────────────────────────────────────────────
 
-/// Retype a Frame cap into a new `WaitSet` with `MODIFY | WAIT` rights.
+/// Retype a Memory cap into a new `WaitSet` with `MODIFY | WAIT` rights.
 ///
-/// `frame_cap` MUST carry `RIGHTS_RETYPE` and have ≥ 512 bytes of
+/// `memory_cap` MUST carry `RIGHTS_RETYPE` and have ≥ 512 bytes of
 /// `available_bytes` (the `BIN_512` size class debited from the ledger).
 ///
 /// # Errors
-/// Returns a negative `i64` error code if `frame_cap` is invalid, lacks
+/// Returns a negative `i64` error code if `memory_cap` is invalid, lacks
 /// `RIGHTS_RETYPE`, or the `CSpace` is full.
 // cast_possible_truncation, cast_sign_loss: ret is a non-negative CSpace slot index
 // guaranteed to fit in u32 (max CSpace size is 14336).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[inline]
-pub fn wait_set_create(frame_cap: u32) -> Result<u32, i64>
+pub fn wait_set_create(memory_cap: u32) -> Result<u32, i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; arg0 = source Frame
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 = source Memory
     // cap slot. Kernel retypes the region.
-    let ret = unsafe { syscall2(SYS_CAP_CREATE_WAIT_SET, u64::from(frame_cap), 0) };
+    let ret = unsafe { syscall2(SYS_CAP_CREATE_WAIT_SET, u64::from(memory_cap), 0) };
     if ret < 0 { Err(ret) } else { Ok(ret as u32) }
 }
 
-/// Register `source_cap` (Endpoint/Signal/EventQueue) in `ws_cap` with a
-/// caller-chosen opaque `token`. The token is returned by `wait_set_wait`
+/// Register `source_cap` (Endpoint/Notification/EventQueue) in `ws_cap` with a
+/// caller-chosen opaque `badge`. The badge is returned by `wait_set_wait`
 /// when this source fires.
 ///
 /// Returns `SyscallError::InvalidArgument` (-5) if the wait set is full
@@ -1619,16 +1624,16 @@ pub fn wait_set_create(frame_cap: u32) -> Result<u32, i64>
 /// Returns a negative `i64` error code if either cap is invalid, the source
 /// is already in a wait set, or the wait set is full.
 #[inline]
-pub fn wait_set_add(ws_cap: u32, source_cap: u32, token: u64) -> Result<(), i64>
+pub fn wait_set_add(ws_cap: u32, source_cap: u32, badge: u64) -> Result<(), i64>
 {
     // SAFETY: syscall3 issues raw syscall instruction; all arguments are scalar u64 values
-    // (wait set cap, source cap, opaque token); kernel validates caps and registers source.
+    // (wait set cap, source cap, opaque badge); kernel validates caps and registers source.
     let ret = unsafe {
         syscall3(
             SYS_WAIT_SET_ADD,
             u64::from(ws_cap),
             u64::from(source_cap),
-            token,
+            badge,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }
@@ -1656,9 +1661,9 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 
 /// Block until any registered source in `ws_cap` becomes ready.
 ///
-/// Returns the opaque token chosen at `wait_set_add` time for the source that
-/// fired. The token is delivered in the secondary return register (rdx / a1).
-/// If multiple sources are ready, each call returns one token without re-blocking.
+/// Returns the opaque badge chosen at `wait_set_add` time for the source that
+/// fired. The badge is delivered in the secondary return register (rdx / a1).
+/// If multiple sources are ready, each call returns one badge without re-blocking.
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the wait set cap is invalid or
@@ -1667,14 +1672,14 @@ pub fn wait_set_remove(ws_cap: u32, source_cap: u32) -> Result<(), i64>
 pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 {
     // SAFETY: syscall5_ret2 issues raw syscall instruction; ws_cap is cap index as u64;
-    // kernel validates cap, blocks until source ready, returns token in secondary register.
-    let (ret, token) = unsafe { syscall5_ret2(SYS_WAIT_SET_WAIT, u64::from(ws_cap), 0, 0, 0, 0) };
-    if ret < 0 { Err(ret) } else { Ok(token) }
+    // kernel validates cap, blocks until source ready, returns badge in secondary register.
+    let (ret, badge) = unsafe { syscall5_ret2(SYS_WAIT_SET_WAIT, u64::from(ws_cap), 0, 0, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(badge) }
 }
 
 // ── Hardware access wrappers ──────────────────────────────────────────────────
 
-/// Bind `signal_cap` to receive notifications when `irq_cap`'s interrupt fires.
+/// Bind `notification_cap` to receive notifications when `irq_cap`'s interrupt fires.
 ///
 /// After registration the IRQ is masked until the first `irq_ack`. The driver
 /// must call `irq_ack` after servicing each interrupt to re-enable delivery.
@@ -1683,11 +1688,17 @@ pub fn wait_set_wait(ws_cap: u32) -> Result<u64, i64>
 /// Returns a negative `i64` error code if either cap is invalid or the IRQ
 /// is already bound.
 #[inline]
-pub fn irq_register(irq_cap: u32, signal_cap: u32) -> Result<(), i64>
+pub fn irq_register(irq_cap: u32, notification_cap: u32) -> Result<(), i64>
 {
-    // SAFETY: syscall2 issues raw syscall instruction; irq_cap and signal_cap are cap indices as u64;
-    // kernel validates caps and binds IRQ to signal for interrupt delivery.
-    let ret = unsafe { syscall2(SYS_IRQ_REGISTER, u64::from(irq_cap), u64::from(signal_cap)) };
+    // SAFETY: syscall2 issues raw syscall instruction; irq_cap and notification_cap are cap indices as u64;
+    // kernel validates caps and binds IRQ to a notification for interrupt delivery.
+    let ret = unsafe {
+        syscall2(
+            SYS_IRQ_REGISTER,
+            u64::from(irq_cap),
+            u64::from(notification_cap),
+        )
+    };
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
@@ -1953,7 +1964,7 @@ pub fn thread_sleep(ms: u64) -> Result<(), i64>
 /// `correlator` is opaque to the kernel. Its meaning is scoped to one
 /// `(event queue, binder)` pair — not a system-wide identifier, not a
 /// process id. Typical use: the binder stashes an internal routing tag
-/// (e.g. procmgr's `ProcessTable` token) so it can dispatch the death
+/// (e.g. procmgr's `ProcessTable` badge) so it can dispatch the death
 /// event to the right bookkeeping without a secondary lookup.
 ///
 /// # Errors

@@ -27,7 +27,7 @@ the full contract.
 
 `std::sys::seraph::alloc` declares the global allocator. Every `Box`, `Vec`,
 `String`, and `alloc`/`std` collection allocates here. The grow path
-requests Frame caps from memmgr via `memmgr_labels::REQUEST_FRAMES` on
+requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
 `ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the
 heap's high-water mark with a single multi-page `mem_map` per returned cap.
 The bootstrap heap is allocated by `std::os::seraph::_start` before
@@ -35,22 +35,22 @@ The bootstrap heap is allocated by `std::os::seraph::_start` before
 
 ### Page reservations
 
-For foreign Frame caps (MMIO from devmgr, DMA buffers from drivers, shmem
+For foreign Memory caps (MMIO from devmgr, DMA buffers from drivers, shmem
 backings, zero-copy file pages from fs drivers, ELF-load scratch in
 procmgr), `std::sys::seraph` exposes a page-granular reservation allocator:
 
 ```rust
 let range = std::os::seraph::reserve_pages(n)?;     // unmapped VA range
 std::os::seraph::fund_aspace_pt_budget(self_aspace, n); // fund PT growth
-syscall::mem_map(frame_cap, self_aspace, range.va, 0, n, prot)?;
+syscall::mem_map(memory_cap, self_aspace, range.va, 0, n, prot)?;
 // ... use the mapping ...
 syscall::mem_unmap(self_aspace, range.va, n)?;
 std::os::seraph::unreserve_pages(range);
 ```
 
-Mapping a foreign Frame cap into a retype-backed `AddressSpace` first funds
+Mapping a foreign Memory cap into a retype-backed `AddressSpace` first funds
 that AS's page-table growth budget: `fund_aspace_pt_budget(self_aspace, n)`
-acquires a memmgr-backed RETYPE frame and augments the AS's PT pool via
+acquires a memmgr-backed RETYPE Memory cap and augments the AS's PT pool via
 `cap_create_aspace`. It MUST be called after reserving VA and before
 `mem_map`/`mmio_map`, or the map fails with `OutOfMemory`.
 
@@ -133,7 +133,7 @@ require a POSIX layer; it maps directly onto Seraph primitives.
 |---|---|
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model, frame-allocation contract |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline |
-| [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_FRAMES`/`RELEASE_FRAMES` |
+| [services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) | Wire shape of `REQUEST_MEMORY_CAPS`/`RELEASE_MEMORY_CAPS` |
 | [abi/process-abi/README.md](../../abi/process-abi/README.md) | `ProcessInfo`, `StartupInfo`, `main()` signature |
 
 ---

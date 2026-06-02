@@ -169,15 +169,15 @@ elements:
   to the caller badge's partition base. The block driver enforces
   the bound on every request.
 - **Single-page Frame-cap DMA.** Each read or write transfers one
-  Frame cap as the DMA target; the Frame is moved back to the caller
+  Memory cap as the DMA target; the Memory cap is moved back to the caller
   in every reply (success or error). The block driver never retains
-  the data Frame.
+  the data Memory cap.
 
 Authoritative wire shapes for `REGISTER_PARTITION`,
-`BLK_READ_INTO_FRAME`, and `BLK_WRITE_FROM_FRAME` live in
+`BLK_READ_INTO_MEMORY`, and `BLK_WRITE_FROM_MEMORY` live in
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
-The fs-driver side — `FS_MOUNT`, `FS_READ`, `FS_READ_FRAME`,
-`FS_RELEASE_FRAME`, `FS_WRITE`, `FS_WRITE_FRAME`, `FS_CLOSE`, and
+The fs-driver side — `FS_MOUNT`, `FS_READ`, `FS_READ_MEMORY`,
+`FS_RELEASE_MEMORY`, `FS_WRITE`, `FS_WRITE_MEMORY`, `FS_CLOSE`, and
 the directory-mutation labels — is owned by
 [`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md).
 

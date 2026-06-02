@@ -620,15 +620,15 @@ impl Drop for CSpace
 mod tests
 {
     use super::*;
-    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
     use core::ptr::NonNull;
 
     /// Construct a dummy NonNull<KernelObjectHeader> backed by a leaked Box
     /// so tests don't need unsafe pointer arithmetic.
     fn dummy_object() -> NonNull<KernelObjectHeader>
     {
-        let obj = Box::new(FrameObject {
-            header: KernelObjectHeader::new(ObjectType::Frame),
+        let obj = Box::new(MemoryObject {
+            header: KernelObjectHeader::new(ObjectType::Memory),
             base: 0,
             size: 0x1000,
             available_bytes: core::sync::atomic::AtomicU64::new(0),
@@ -673,10 +673,10 @@ mod tests
         let mut cs = CSpace::new(0, 16384);
         let obj = dummy_object();
         let idx = cs
-            .insert_cap(CapTag::Frame, Rights::MAP | Rights::WRITE, obj)
+            .insert_cap(CapTag::Memory, Rights::MAP | Rights::WRITE, obj)
             .unwrap();
         let slot = cs.slot(idx.get()).unwrap();
-        assert_eq!(slot.tag, CapTag::Frame);
+        assert_eq!(slot.tag, CapTag::Memory);
         assert!(slot.rights.contains(Rights::MAP));
         assert!(slot.rights.contains(Rights::WRITE));
         assert_eq!(slot.object, Some(obj));
@@ -731,7 +731,7 @@ mod tests
         let mut cs = CSpace::new(0, 16384);
         let obj = dummy_object();
         let slot = cs
-            .insert_cap(CapTag::Frame, Rights::WRITE | Rights::EXECUTE, obj)
+            .insert_cap(CapTag::Memory, Rights::WRITE | Rights::EXECUTE, obj)
             .expect("WRITE|EXECUTE cap should be allowed at cap level");
         let s = cs.slot(slot.get()).unwrap();
         assert!(s.rights.contains(Rights::WRITE | Rights::EXECUTE));
@@ -751,7 +751,7 @@ mod tests
         let mut cs = CSpace::new(0, 16384);
         assert_eq!(cs.populated_count(), 0);
         let obj = dummy_object();
-        cs.insert_cap(CapTag::Frame, Rights::MAP, obj).unwrap();
+        cs.insert_cap(CapTag::Memory, Rights::MAP, obj).unwrap();
         assert_eq!(cs.populated_count(), 1);
     }
 
@@ -790,7 +790,7 @@ mod tests
 
         for expected in 1..=5usize
         {
-            cs.insert_cap(CapTag::Frame, Rights::MAP, obj).unwrap();
+            cs.insert_cap(CapTag::Memory, Rights::MAP, obj).unwrap();
             assert_eq!(
                 cs.populated_count(),
                 expected,

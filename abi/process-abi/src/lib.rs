@@ -234,7 +234,7 @@ pub struct ProcessInfo
     /// `CSpace` slot of a badged SEND cap on memmgr's service endpoint.
     ///
     /// Every std-built process needs this to bootstrap its heap via
-    /// `memmgr_labels::REQUEST_FRAMES`. `std::os::seraph::_start` reads
+    /// `memmgr_labels::REQUEST_MEMORY_CAPS`. `std::os::seraph::_start` reads
     /// this slot and initialises the allocator before `lang_start` runs,
     /// so idiomatic `fn main()` code can allocate from the very first
     /// statement. The badged cap identifies the holder to memmgr's
@@ -268,10 +268,10 @@ pub struct ProcessInfo
     /// before svcmgr exists). Consumers must tolerate zero.
     pub service_registry_cap: u32,
 
-    /// `CSpace` slot of the shmem frame cap backing `std::io::stdin`.
+    /// `CSpace` slot of the shmem memory cap backing `std::io::stdin`.
     ///
     /// One 4 KiB page laid out as `shmem::SpscHeader` followed by a
-    /// power-of-two byte ring. The frame is shared with the spawner; the
+    /// power-of-two byte ring. The page is shared with the spawner; the
     /// spawner is the writer (parent → child), the child is the reader.
     /// Wakeup notifications live in `stdin_data_notification_cap` (writer-kicks-reader)
     /// and `stdin_space_notification_cap` (reader-kicks-writer); EOF rides on the
@@ -279,23 +279,23 @@ pub struct ProcessInfo
     ///
     /// Zero means "no stdin attached"; reads return `Ok(0)` (EOF)
     /// immediately. The standard case for services spawned by init.
-    pub stdin_frame_cap: u32,
+    pub stdin_memory_cap: u32,
 
-    /// `CSpace` slot of the shmem frame cap backing `std::io::stdout`.
+    /// `CSpace` slot of the shmem memory cap backing `std::io::stdout`.
     ///
-    /// Same layout as `stdin_frame_cap` but with the child as the writer
+    /// Same layout as `stdin_memory_cap` but with the child as the writer
     /// (child → parent) and the spawner as the reader. Wakeup pair is
     /// `stdout_data_notification_cap` / `stdout_space_notification_cap`.
     ///
     /// Zero when no sink is attached; writes are silently dropped.
-    pub stdout_frame_cap: u32,
+    pub stdout_memory_cap: u32,
 
-    /// `CSpace` slot of the shmem frame cap backing `std::io::stderr`.
+    /// `CSpace` slot of the shmem memory cap backing `std::io::stderr`.
     ///
-    /// Same shape as `stdout_frame_cap`; an independent ring so stdout and
+    /// Same shape as `stdout_memory_cap`; an independent ring so stdout and
     /// stderr stream separately. Wakeup pair is `stderr_data_notification_cap` /
     /// `stderr_space_notification_cap`. Zero means writes are silently dropped.
-    pub stderr_frame_cap: u32,
+    pub stderr_memory_cap: u32,
 
     // ── Thread-local storage template ──────────────────────────────────
     //
@@ -422,7 +422,7 @@ pub struct ProcessInfo
     // Zero in any slot means the corresponding notification is not attached;
     // the AnonPipe peer treats `notification_wait` as a no-op and falls back
     // to spinning on the ring header (used during silent-drop init when
-    // a frame cap is also zero).
+    // a memory cap is also zero).
     /// Data-available notification for the stdin pipe. Writer-kicked.
     pub stdin_data_notification_cap: u32,
     /// Space-available notification for the stdin pipe. Reader-kicked.
@@ -491,17 +491,17 @@ pub struct StartupInfo
     /// See `ProcessInfo::service_registry_cap` for the long form.
     pub service_registry_cap: u32,
 
-    /// `CSpace` slot of the stdin shmem frame cap. Zero when no input
+    /// `CSpace` slot of the stdin shmem memory cap. Zero when no input
     /// pipe is attached.
-    pub stdin_frame_cap: u32,
+    pub stdin_memory_cap: u32,
 
-    /// `CSpace` slot of the stdout shmem frame cap. Zero when no sink
+    /// `CSpace` slot of the stdout shmem memory cap. Zero when no sink
     /// is attached.
-    pub stdout_frame_cap: u32,
+    pub stdout_memory_cap: u32,
 
-    /// `CSpace` slot of the stderr shmem frame cap. Zero when no sink
+    /// `CSpace` slot of the stderr shmem memory cap. Zero when no sink
     /// is attached.
-    pub stderr_frame_cap: u32,
+    pub stderr_memory_cap: u32,
 
     /// Badged SEND cap on vfsd's namespace endpoint addressing the
     /// synthetic system root. Zero when vfsd is not reachable. See

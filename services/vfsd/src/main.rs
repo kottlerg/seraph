@@ -10,7 +10,7 @@
 //! badged SEND on the underlying driver's namespace endpoint into
 //! `VfsdRootBackend`; clients walk that root via `NS_LOOKUP` and reach
 //! per-file node caps directly on the driver. After the walk vfsd is
-//! out of the path: file reads, frame requests, and closes go straight
+//! out of the path: file reads, memory-cap requests, and closes go straight
 //! from client to driver.
 //!
 //! vfsd self-mounts the Seraph root partition at `/` (and the ESP at
@@ -74,7 +74,7 @@ pub struct VfsdCaps
 //     caps[0]: service endpoint (vfsd receives on this)
 //     caps[1]: devmgr registry endpoint
 //   Round 2 (1 cap, 0 data words):
-//     caps[0]: fatfs module frame cap
+//     caps[0]: fatfs module memory cap
 //
 // log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through
 // this protocol.
@@ -180,10 +180,10 @@ fn main() -> !
     let blk_ep = reply_caps[0];
     std::os::seraph::log!("block device endpoint acquired");
 
-    // Allocate a single scratch frame for GPT block reads. The
-    // BLK_READ_INTO_FRAME contract requires the caller to supply the DMA
-    // target frame; vfsd reuses one scratch page across all GPT reads.
-    // The frame and its VA reservation are process-lifetime-leaked.
+    // Allocate a single scratch memory cap for GPT block reads. The
+    // BLK_READ_INTO_MEMORY contract requires the caller to supply the DMA
+    // target memory cap; vfsd reuses one scratch page across all GPT reads.
+    // The memory cap and its VA reservation are process-lifetime-leaked.
     let Some((mut scratch_cap, scratch_va)) =
         gpt::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
     else

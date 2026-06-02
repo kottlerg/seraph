@@ -6,13 +6,13 @@
 //! Integration: end-to-end auto-reclaim of every retyped kernel-object type.
 //!
 //! For each of the seven retypable `ObjectType` variants, mints a kernel
-//! object from a dedicated Frame cap and asserts that destroying it returns
+//! object from a dedicated Memory cap and asserts that destroying it returns
 //! the source cap's `available_bytes` ledger to the pre-mint value. This is
 //! the userspace-visible invariant relied on for process-death reclaim
 //! correctness — when a child dies, every kernel object it created against
 //! memmgr-derived inner caps cascades back through
 //! `KernelObjectHeader.ancestor` and credits bytes to the source
-//! `FrameObject`.
+//! `MemoryObject`.
 //!
 //! Object types covered:
 //! - `Endpoint`     (sub-page, in-place)
@@ -25,8 +25,8 @@
 //!
 //! ## Test isolation
 //!
-//! Every retype runs against `ctx.memory_frame_base`. A throwaway
-//! `cap_create_endpoint` + delete pays the per-`FrameObject` allocator-
+//! Every retype runs against `ctx.memory_base`. A throwaway
+//! `cap_create_endpoint` + delete pays the per-`MemoryObject` allocator-
 //! metadata cost (paid once on the cap's lifetime) before the baseline
 //! read, so the post-mint-then-delete equality check reflects steady
 //! state. If an earlier test already paid the metadata cost, the warmup
@@ -37,19 +37,19 @@ use syscall::{
     cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_create_thread, cap_delete, cap_info, event_queue_create, wait_set_create,
 };
-use syscall_abi::CAP_INFO_FRAME_AVAILABLE;
+use syscall_abi::CAP_INFO_MEMORY_AVAILABLE;
 
 use crate::{TestContext, TestResult};
 
-fn read_available(frame_cap: u32) -> Result<u64, &'static str>
+fn read_available(memory_cap: u32) -> Result<u64, &'static str>
 {
-    cap_info(frame_cap, CAP_INFO_FRAME_AVAILABLE)
-        .map_err(|_| "integration::retype_reclaim: cap_info(FRAME_AVAILABLE) failed")
+    cap_info(memory_cap, CAP_INFO_MEMORY_AVAILABLE)
+        .map_err(|_| "integration::retype_reclaim: cap_info(MEMORY_AVAILABLE) failed")
 }
 
-fn assert_baseline(label: &'static str, frame_cap: u32, baseline: u64) -> TestResult
+fn assert_baseline(label: &'static str, memory_cap: u32, baseline: u64) -> TestResult
 {
-    let now = read_available(frame_cap)?;
+    let now = read_available(memory_cap)?;
     if now != baseline
     {
         crate::log(label);
@@ -65,22 +65,22 @@ fn assert_baseline(label: &'static str, frame_cap: u32, baseline: u64) -> TestRe
 #[allow(clippy::too_many_lines)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let frame = ctx.memory_frame_base;
+    let memory = ctx.memory_base;
 
-    // Pre-warm: pay the per-FrameObject allocator metadata cost (if not
+    // Pre-warm: pay the per-MemoryObject allocator metadata cost (if not
     // already paid by an earlier test) so the baseline reflects steady
     // state. The mint-and-immediate-delete cycle leaves `available_bytes`
     // exactly where it was after the metadata debit.
-    let warmup = cap_create_endpoint(frame)
+    let warmup = cap_create_endpoint(memory)
         .map_err(|_| "integration::retype_reclaim: warmup cap_create_endpoint failed")?;
     cap_delete(warmup).map_err(|_| "integration::retype_reclaim: warmup cap_delete failed")?;
 
-    let baseline = read_available(frame)?;
+    let baseline = read_available(memory)?;
 
     // ── Endpoint ─────────────────────────────────────────────────────────────
-    let ep = cap_create_endpoint(frame)
+    let ep = cap_create_endpoint(memory)
         .map_err(|_| "integration::retype_reclaim: cap_create_endpoint failed")?;
-    let mid = read_available(frame)?;
+    let mid = read_available(memory)?;
     if mid >= baseline
     {
         return Err("integration::retype_reclaim: Endpoint mint did not debit available_bytes");
@@ -88,14 +88,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(ep).map_err(|_| "integration::retype_reclaim: cap_delete(endpoint) failed")?;
     assert_baseline(
         "integration::retype_reclaim: Endpoint reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 
     // ── Notification ───────────────────────────────────────────────────────────────
-    let sig = cap_create_notification(frame)
+    let sig = cap_create_notification(memory)
         .map_err(|_| "integration::retype_reclaim: cap_create_notification failed")?;
-    let mid = read_available(frame)?;
+    let mid = read_available(memory)?;
     if mid >= baseline
     {
         return Err("integration::retype_reclaim: Notification mint did not debit available_bytes");
@@ -103,14 +103,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(sig).map_err(|_| "integration::retype_reclaim: cap_delete(notification) failed")?;
     assert_baseline(
         "integration::retype_reclaim: Notification reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 
     // ── WaitSet ──────────────────────────────────────────────────────────────
-    let ws = wait_set_create(frame)
+    let ws = wait_set_create(memory)
         .map_err(|_| "integration::retype_reclaim: wait_set_create failed")?;
-    let mid = read_available(frame)?;
+    let mid = read_available(memory)?;
     if mid >= baseline
     {
         return Err("integration::retype_reclaim: WaitSet mint did not debit available_bytes");
@@ -118,16 +118,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(ws).map_err(|_| "integration::retype_reclaim: cap_delete(wait_set) failed")?;
     assert_baseline(
         "integration::retype_reclaim: WaitSet reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 
     // ── EventQueue (small — sub-page) ────────────────────────────────────────
     //
     // capacity 4 → 24 + 56 + 5*8 = 120 B → BIN_128 in-place.
-    let eq_small = event_queue_create(frame, 4)
+    let eq_small = event_queue_create(memory, 4)
         .map_err(|_| "integration::retype_reclaim: event_queue_create(4) failed")?;
-    let mid = read_available(frame)?;
+    let mid = read_available(memory)?;
     if mid >= baseline
     {
         return Err(
@@ -137,16 +137,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(eq_small).map_err(|_| "integration::retype_reclaim: cap_delete(eq_small) failed")?;
     assert_baseline(
         "integration::retype_reclaim: small EventQueue reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 
     // ── EventQueue (large — page-aligned split) ──────────────────────────────
     //
     // capacity 64 → 24 + 56 + 65*8 = 600 B → exceeds BIN_512 → split mode.
-    let eq_large = event_queue_create(frame, 64)
+    let eq_large = event_queue_create(memory, 64)
         .map_err(|_| "integration::retype_reclaim: event_queue_create(64) failed")?;
-    let mid = read_available(frame)?;
+    let mid = read_available(memory)?;
     if mid >= baseline
     {
         return Err(
@@ -156,16 +156,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(eq_large).map_err(|_| "integration::retype_reclaim: cap_delete(eq_large) failed")?;
     assert_baseline(
         "integration::retype_reclaim: large EventQueue reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 
     // ── AddressSpace ─────────────────────────────────────────────────────────
     //
     // 8 pages of PT pool (page 0 root, pages 1..8 growth budget).
-    let aspace_cap = cap_create_aspace(frame, 0, 8)
+    let aspace_cap = cap_create_aspace(memory, 0, 8)
         .map_err(|_| "integration::retype_reclaim: cap_create_aspace failed")?;
-    let mid = read_available(frame)?;
+    let mid = read_available(memory)?;
     if mid >= baseline
     {
         return Err("integration::retype_reclaim: AddressSpace mint did not debit available_bytes");
@@ -173,16 +173,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(aspace_cap).map_err(|_| "integration::retype_reclaim: cap_delete(aspace) failed")?;
     assert_baseline(
         "integration::retype_reclaim: AddressSpace reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 
     // ── CSpaceObj ────────────────────────────────────────────────────────────
     //
     // 4 slot pages, max_slots 256 → fits in pool.
-    let cspace_cap = cap_create_cspace(frame, 0, 4, 256)
+    let cspace_cap = cap_create_cspace(memory, 0, 4, 256)
         .map_err(|_| "integration::retype_reclaim: cap_create_cspace failed")?;
-    let mid = read_available(frame)?;
+    let mid = read_available(memory)?;
     if mid >= baseline
     {
         return Err("integration::retype_reclaim: CSpace mint did not debit available_bytes");
@@ -190,7 +190,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(cspace_cap).map_err(|_| "integration::retype_reclaim: cap_delete(cspace) failed")?;
     assert_baseline(
         "integration::retype_reclaim: CSpace reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 
@@ -200,13 +200,13 @@ pub fn run(ctx: &TestContext) -> TestResult
     // cap, mint a thread, then delete in reverse-creation order. The thread
     // is never started — `cap_create_thread` constructs a suspended TCB; we
     // just verify mint-then-delete reclaims correctly.
-    let aspace_for_thread = cap_create_aspace(frame, 0, 8)
+    let aspace_for_thread = cap_create_aspace(memory, 0, 8)
         .map_err(|_| "integration::retype_reclaim: cap_create_aspace (for thread) failed")?;
-    let cspace_for_thread = cap_create_cspace(frame, 0, 4, 16)
+    let cspace_for_thread = cap_create_cspace(memory, 0, 4, 16)
         .map_err(|_| "integration::retype_reclaim: cap_create_cspace (for thread) failed")?;
-    let thread_cap = cap_create_thread(frame, aspace_for_thread, cspace_for_thread)
+    let thread_cap = cap_create_thread(memory, aspace_for_thread, cspace_for_thread)
         .map_err(|_| "integration::retype_reclaim: cap_create_thread failed")?;
-    let mid = read_available(frame)?;
+    let mid = read_available(memory)?;
     if mid >= baseline
     {
         return Err("integration::retype_reclaim: Thread mint did not debit available_bytes");
@@ -218,23 +218,24 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::retype_reclaim: cap_delete(aspace_for_thread) failed")?;
     assert_baseline(
         "integration::retype_reclaim: Thread reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 
     // ── Mixed batch — mint several types, delete all, verify reclaim. ────────
     //
-    // Validates that the per-FrameObject sub-allocator's free lists handle
+    // Validates that the per-MemoryObject sub-allocator's free lists handle
     // multi-type churn without leaking bytes. Endpoints land in BIN_128;
     // WaitSets in BIN_512; AddressSpace in the page-aligned free list.
     let e1 =
-        cap_create_endpoint(frame).map_err(|_| "integration::retype_reclaim: batch ep1 failed")?;
+        cap_create_endpoint(memory).map_err(|_| "integration::retype_reclaim: batch ep1 failed")?;
     let e2 =
-        cap_create_endpoint(frame).map_err(|_| "integration::retype_reclaim: batch ep2 failed")?;
-    let s1 = cap_create_notification(frame)
+        cap_create_endpoint(memory).map_err(|_| "integration::retype_reclaim: batch ep2 failed")?;
+    let s1 = cap_create_notification(memory)
         .map_err(|_| "integration::retype_reclaim: batch sig1 failed")?;
-    let w1 = wait_set_create(frame).map_err(|_| "integration::retype_reclaim: batch ws1 failed")?;
-    let a1 = cap_create_aspace(frame, 0, 8)
+    let w1 =
+        wait_set_create(memory).map_err(|_| "integration::retype_reclaim: batch ws1 failed")?;
+    let a1 = cap_create_aspace(memory, 0, 8)
         .map_err(|_| "integration::retype_reclaim: batch aspace1 failed")?;
 
     cap_delete(a1).map_err(|_| "integration::retype_reclaim: batch delete a1 failed")?;
@@ -244,7 +245,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     cap_delete(e1).map_err(|_| "integration::retype_reclaim: batch delete e1 failed")?;
     assert_baseline(
         "integration::retype_reclaim: mixed batch reclaim mismatch",
-        frame,
+        memory,
         baseline,
     )?;
 

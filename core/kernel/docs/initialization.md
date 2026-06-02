@@ -119,13 +119,13 @@ heap exists yet.
    arch::current::paging::activate(root_phys)
 7. The bootloader page table is no longer referenced; its frames are
    recorded in `BootInfo.reclaim_ranges` (boot protocol v7) and minted
-   as reclaimable Frame caps into init's CSpace during Phase 7 by
-   `cap::mint_reclaim_frame_caps`, alongside the other bootloader
+   as reclaimable Memory caps into init's CSpace during Phase 7 by
+   `cap::mint_reclaim_memory_caps`, alongside the other bootloader
    scratch pages (`BootInfo` page, descriptor arrays, MMIO aperture
    array, reclaim-array page) and the bundle's non-module pages
    (header + entry table + 4 KiB pad, init ELF source body, and any
    inter-module or trailing slack — module bodies are excluded because
-   `mint_module_frame_caps` already covers them).
+   `mint_module_memory_caps` already covers them).
 8. Emit: "page tables established, physmap at 0xFFFF800000000000"
 ```
 
@@ -261,7 +261,7 @@ Phase 7, and `KERNEL_MMIO` is populated.
    - Initial capacity: ROOT_CSPACE_INITIAL_SLOTS (e.g. 1024 slots)
    - Slot 0 is permanently null
 3. Populate the root CSpace with initial capabilities:
-   a. Frame capabilities for all usable physical memory ranges
+   a. Memory capabilities for all usable physical memory ranges
       (one capability per contiguous usable region from the memory map)
    b. One MmioRegion capability (Map | Write rights) per validated
       `BootInfo.mmio_apertures` entry. Userspace narrows these into
@@ -275,8 +275,8 @@ Phase 7, and `KERNEL_MMIO` is populated.
    e. One SbiControl capability (RISC-V only; Call rights) for init to
       forward SBI calls.
    f. (Thread and process capabilities for init are added in Phase 9)
-4. Mint reclaimable Frame caps from `BootInfo.reclaim_ranges` via
-   `cap::mint_reclaim_frame_caps`:
+4. Mint reclaimable Memory caps from `BootInfo.reclaim_ranges` via
+   `cap::mint_reclaim_memory_caps`:
    - One cap per range with `owns_memory = true` and full byte ledger;
      inserted into the root CSpace so the cap reaches init through the
      standard `CapDescriptor` walk in Phase 9.
@@ -295,12 +295,12 @@ Phase 7, and `KERNEL_MMIO` is populated.
 "fatal: cannot initialise capability system".
 
 **Completion criterion:** Root CSpace exists and contains capabilities for all
-boot-provided hardware resources, including the reclaimable Frame caps
+boot-provided hardware resources, including the reclaimable Memory caps
 covering bootloader scratch pages (`BootInfo` page, descriptor arrays,
 MMIO aperture array, reclaim-array page, transient page-table frames)
 and the bundle's non-module pages (header + entry table + 4 KiB pad,
 init ELF source body, inter-module and trailing slack — module bodies
-are excluded because `mint_module_frame_caps` already covers them).
+are excluded because `mint_module_memory_caps` already covers them).
 
 ---
 
@@ -328,14 +328,14 @@ are excluded because `mint_module_frame_caps` already covers them).
       jumped from the trampoline page to its kernel-VA entry)
 5. Tear down the low-VA identity mapping at the trampoline PA via
    mm::paging::unmap_identity_page (TLB shootdown to all other CPUs).
-6. Mint a late-reclaim Frame cap over the trampoline page via
-   cap::mint_late_reclaim_frame_caps; the descriptor lands in
+6. Mint a late-reclaim Memory cap over the trampoline page via
+   cap::mint_late_reclaim_memory_caps; the descriptor lands in
    cspace_layout so init sees the cap through the standard CSpace
    handoff in Phase 9.
 ```
 
 The AP SIPI trampoline page is flagged `RECLAIM_FLAG_LATE` in
-`BootInfo.reclaim_ranges`. `cap::mint_reclaim_frame_caps` skips it in
+`BootInfo.reclaim_ranges`. `cap::mint_reclaim_memory_caps` skips it in
 Phase 7; this phase mints it after SMP bringup completes and
 `mm::paging::unmap_identity_page` retires the low-VA identity-RWX
 mapping. (Both arches install this identity mapping in Phase 3 — the
@@ -355,7 +355,7 @@ individual AP is logged and skipped (that CPU stays offline).
 
 **Completion criterion:** Per-CPU scheduler state and idle threads are
 initialised for all CPUs, every AP has incremented `APS_READY`, the
-trampoline identity mapping is torn down, and its Frame cap is in init's
+trampoline identity mapping is torn down, and its Memory cap is in init's
 CSpace descriptor table.
 
 ---
@@ -387,10 +387,10 @@ calls `sched::enter()`.
 4. Allocate init's user stack (inlined in `kernel_entry`):
    a. Allocate INIT_STACK_PAGES (4) frames from the buddy allocator
       one at a time so each phys address is captured for the reclaim
-      Frame cap minted alongside it
+      Memory cap minted alongside it
    b. Zero each frame
    c. Map below INIT_STACK_TOP (0x7FFF_FFFF_E000) with read/write permissions
-   d. Mint a reclaimable Frame cap per stack page into the root CSpace
+   d. Mint a reclaimable Memory cap per stack page into the root CSpace
       so init can donate the pages to memmgr on reap
    e. Guard page (unmapped) sits immediately below the stack; stack overflows fault
 5. Create init's TCB:

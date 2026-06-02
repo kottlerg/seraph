@@ -35,9 +35,9 @@ const ALL_BITS: u64 = u64::MAX;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let target = cap_create_notification(ctx.memory_frame_base)
+    let target = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_notification: create target failed")?;
-    let done = cap_create_notification(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_notification: create done failed")?;
 
     // Spawn `NUM_SENDERS` sender threads.

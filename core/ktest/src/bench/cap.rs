@@ -17,7 +17,7 @@ pub(super) fn bench_cap_create_delete(ctx: &crate::TestContext, iters: u32)
     for _ in 0..n
     {
         let t0 = cycles_now();
-        let Ok(sig) = cap_create_notification(ctx.memory_frame_base)
+        let Ok(sig) = cap_create_notification(ctx.memory_base)
         else
         {
             break;

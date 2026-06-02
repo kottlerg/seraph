@@ -6,7 +6,7 @@
 //! Seraph process manager — IPC server for process lifecycle management.
 //!
 //! Receives requests via IPC to create, configure, and start new processes.
-//! Supports both in-memory ELF loading from boot module frames and streaming
+//! Supports both in-memory ELF loading from boot module memory caps and streaming
 //! from the VFS. See `procmgr/docs/ipc-interface.md`.
 //!
 //! `CREATE_PROCESS` and `CREATE_FROM_FILE` accept the child's module source and
@@ -162,7 +162,7 @@ fn main() -> !
         // SERVICE handlers may allocate from memmgr; without this, a child
         // can die in the same wakeup batch as the parent's spawn-causing
         // IPC, and the SERVICE branch wins the wait_set_wait dispatch
-        // ordering — leaving the dead child's frames pinned in memmgr's
+        // ordering — leaving the dead child's memory caps pinned in memmgr's
         // per-process record until the next loop iteration. Under fast
         // spawn-after-wait churn that races allocations against pool
         // reclaim. dispatch_death is a no-op when the EQ is empty.
@@ -176,7 +176,7 @@ fn main() -> !
 
         // Liveness backstop: if init's main thread has exited but init-logd is
         // still wedged past the grace (a dropped HANDOVER_RELEASE), force-stop
-        // it and reap so init's frames cannot be pinned indefinitely. No-op
+        // it and reap so init's memory caps cannot be pinned indefinitely. No-op
         // until the deadline, and once init is reaped.
         init_reap::check_backstop(ctx.memmgr_ep, ipc_buf);
 
@@ -202,7 +202,7 @@ const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
 /// retype slab. The kernel consumes `KERNEL_STACK_PAGES + 1 = 5` pages
-/// (4 kstack + 1 wrapper/TCB) plus a small one-time per-`FrameObject`
+/// (4 kstack + 1 wrapper/TCB) plus a small one-time per-`MemoryObject`
 /// allocator metadata footprint; one extra page is included so the
 /// retype's `available_bytes >= raw_bytes` check passes after that
 /// metadata debit.
@@ -210,11 +210,11 @@ pub(crate) const THREAD_RETYPE_PAGES: u64 = 6;
 
 /// Pages requested from memmgr for the child's `AddressSpace` retype slab.
 /// Page 0 becomes the root PT; the remaining pages form the initial PT
-/// growth pool. The +1 covers the ~64 B per-Frame allocator metadata
+/// growth pool. The +1 covers the ~64 B per-memory-cap allocator metadata
 /// footprint debited at the first retype.
 ///
 /// Sized to cover the typical small-process mapping pattern: 3-6 LOAD
-/// segments + stack + IPC buffer + TLS + `ProcessInfo` frame. Each
+/// segments + stack + IPC buffer + TLS + `ProcessInfo` memory cap. Each
 /// distinct user VA region whose PT entry isn't already populated
 /// consumes up to 3 intermediate PT pages (PDPT/PD/PT on x86-64).
 /// Larger processes refill via augment-mode `cap_create_aspace`.
@@ -222,7 +222,7 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 33;
 
 /// Pages requested from memmgr for the child's `CSpace` retype slab.
 /// Each slot page holds `L2_SIZE` capability slots (currently 56 slots
-/// × 72 B = 4032 B/page); the +1 covers the per-Frame allocator
+/// × 72 B = 4032 B/page); the +1 covers the per-memory-cap allocator
 /// metadata footprint. Larger `CSpace`s refill via augment-mode
 /// `cap_create_cspace`. Five pages → 4 slot pages → ~224 slots covers a
 /// small driver's lifetime.
@@ -233,10 +233,10 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 5;
 /// unwired, IPC error, OOM) returns `(0, 0)`.
 ///
 /// The cap slot lands in procmgr's `CSpace`; procmgr both:
-///  * uses it for every per-child frame allocation (so memmgr accounts
+///  * uses it for every per-child memory-cap allocation (so memmgr accounts
 ///    them to the child's record from the moment they leave the pool); and
 ///  * copies it into the child's `ProcessInfo.memmgr_endpoint_cap` so the
-///    child's std heap-bootstrap can call `REQUEST_FRAMES` on it.
+///    child's std heap-bootstrap can call `REQUEST_MEMORY_CAPS` on it.
 ///
 /// The badge is opaque to procmgr but is sent back in the
 /// `PROCESS_DIED` payload at child teardown so memmgr can reclaim the
@@ -267,12 +267,12 @@ pub fn register_with_memmgr(memmgr_ep: u32, ipc_buf: *mut u64) -> (u32, u64)
 }
 
 /// Allocate exactly one page from memmgr. Returns the cap slot of the
-/// (single-page) Frame in procmgr's `CSpace`, or zero on any failure
+/// (single-page) Memory cap in procmgr's `CSpace`, or zero on any failure
 /// (memmgr not wired, OOM, derive failure). Caller is responsible for
 /// `mem_map`-ping it where appropriate.
 ///
-/// Frames allocated against `child_send_cap` are accounted to that child's
-/// memmgr record and reclaimed on `PROCESS_DIED`. Frames allocated against
+/// Memory caps allocated against `child_send_cap` are accounted to that child's
+/// memmgr record and reclaimed on `PROCESS_DIED`. Memory caps allocated against
 /// procmgr's own `pi.memmgr_endpoint_cap` are accounted to procmgr.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
@@ -282,7 +282,7 @@ pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
         std::os::seraph::log!("procmgr: alloc_page: memmgr_send=0");
         return None;
     }
-    let msg = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+    let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -323,10 +323,10 @@ pub fn memmgr_alloc_page(memmgr_send: u32, ipc_buf: *mut u64) -> Option<u32>
 }
 
 /// Allocate exactly `pages` contiguous pages from `memmgr_send` as a
-/// single Frame cap. Returns the cap slot in procmgr's `CSpace`, or
+/// single Memory cap. Returns the cap slot in procmgr's `CSpace`, or
 /// `None` on any failure (memmgr unwired, OOM, fragmented reply).
 ///
-/// Used to back kernel-object retypes whose source Frame cap must be
+/// Used to back kernel-object retypes whose source Memory cap must be
 /// contiguous (e.g. `Thread`, `AddressSpace`, `CSpace`). Unlike
 /// `memmgr_alloc_page`, this rejects multi-cap replies and any cap
 /// whose declared `page_count` does not equal `pages` — retypes
@@ -339,7 +339,7 @@ pub fn memmgr_alloc_pages_contig(memmgr_send: u32, pages: u64, ipc_buf: *mut u64
     {
         return None;
     }
-    let msg = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+    let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, pages)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -358,7 +358,7 @@ pub fn memmgr_alloc_pages_contig(memmgr_send: u32, pages: u64, ipc_buf: *mut u64
         return None;
     }
     let cap = caps[0];
-    if syscall::cap_info(cap, syscall_abi::CAP_INFO_FRAME_SIZE)
+    if syscall::cap_info(cap, syscall_abi::CAP_INFO_MEMORY_SIZE)
         .is_ok_and(|size| size == pages * 4096)
     {
         Some(cap)
@@ -588,7 +588,7 @@ fn dispatch_death(
         {
             // An init thread exited. `run_reap` counts down the two init
             // threads and, on the last exit, tears down init's
-            // AS/CSpace/Thread objects and donates its reclaimable Frame
+            // AS/CSpace/Thread objects and donates its reclaimable Memory caps
             // caps to memmgr's pool.
             init_reap::run_reap(memmgr_ep, ipc_buf);
             continue;
@@ -617,7 +617,7 @@ fn reply_empty(ipc_buf: *mut u64, code: u64)
 /// * `data[0]` = direction (`PIPE_DIR_STDIN` / `STDOUT` / `STDERR`)
 /// * `data[1]` = ring byte capacity (informational; procmgr does not
 ///   re-init the header — the spawner already called `SpscHeader::init`)
-/// * `caps[0]` = frame cap (one shmem page)
+/// * `caps[0]` = memory cap (one shmem page)
 /// * `caps[1]` = data-available notification cap
 /// * `caps[2]` = space-available notification cap
 fn handle_configure_pipe(
@@ -635,7 +635,7 @@ fn handle_configure_pipe(
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    let frame = caps[0];
+    let memory_cap = caps[0];
     let data_notification = caps[1];
     let space_notification = caps[2];
 
@@ -643,7 +643,7 @@ fn handle_configure_pipe(
         badge,
         self_aspace,
         direction,
-        frame,
+        memory_cap,
         data_notification,
         space_notification,
     )
@@ -656,7 +656,7 @@ fn handle_configure_pipe(
     // procmgr-side slots so refcounts hit zero when both peers later
     // release. Idempotent on zero. On the failure path the cap_copy may
     // not have happened yet — cap_delete on a stale slot is a no-op.
-    let _ = syscall::cap_delete(frame);
+    let _ = syscall::cap_delete(memory_cap);
     let _ = syscall::cap_delete(data_notification);
     let _ = syscall::cap_delete(space_notification);
 
@@ -708,7 +708,7 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&msg, ipc_buf) };
 }
 
-/// Handle `CREATE_PROCESS` — create a process from a boot module frame.
+/// Handle `CREATE_PROCESS` — create a process from a boot module memory cap.
 ///
 /// Label layout:
 ///   bits [0..16]  = opcode (`CREATE_PROCESS`)
@@ -726,7 +726,7 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 ///   word `argv_words+1..`        = env blob, `env_bytes.div_ceil(8)` words
 ///                                  (only present when `env_count > 0`)
 ///
-/// Expects `caps = [module_frame, creator_endpoint?]`. Stdio pipe
+/// Expects `caps = [module_memory, creator_endpoint?]`. Stdio pipe
 /// wiring is installed via separate `CONFIGURE_PIPE` IPCs (one per
 /// piped direction) on the returned badged `process_handle` between
 /// create and `START_PROCESS`; the create path itself stays
@@ -799,11 +799,11 @@ fn handle_create(
 
     // Register this child with memmgr. memmgr replies with a badged SEND
     // cap on its endpoint plus the memmgr-side process badge. Procmgr:
-    //   - uses the cap for every per-child frame allocation (so memmgr
+    //   - uses the cap for every per-child memory-cap allocation (so memmgr
     //     accounts them to the child's record from the moment they leave
     //     the pool); and
     //   - copies the cap into the child's `ProcessInfo.memmgr_endpoint_cap`
-    //     so the child's std heap-bootstrap can call `REQUEST_FRAMES`; and
+    //     so the child's std heap-bootstrap can call `REQUEST_MEMORY_CAPS`; and
     //   - sends the badge in `PROCESS_DIED` at child teardown.
     let (memmgr_send, memmgr_badge) = register_with_memmgr(ctx.memmgr_ep, ipc_buf);
 
@@ -841,9 +841,9 @@ fn handle_create(
     }
 
     // Module cap disposition: the module cap is a borrowed derivation of the
-    // caller's module-source frame. The loader has copied the ELF contents
+    // caller's module-source memory cap. The loader has copied the ELF contents
     // into the child's AddressSpace and has no further use for the source, so
-    // delete it. The owner (init) retains the source frame and donates it to
+    // delete it. The owner (init) retains the source memory cap and donates it to
     // memmgr's pool at reap.
     if module_cap != 0
     {
@@ -890,8 +890,8 @@ pub struct ProcmgrCtx
     /// Badged SEND cap on memmgr's service endpoint, identifying procmgr.
     /// Used to mint per-child memmgr SENDs via `REGISTER_PROCESS`, to
     /// notify `PROCESS_DIED`, and as the destination for procmgr's own
-    /// frame allocations (memmgr auto-registers procmgr's badge at
-    /// bootstrap so `REQUEST_FRAMES` on this cap is allowed).
+    /// memory-cap allocations (memmgr auto-registers procmgr's badge at
+    /// bootstrap so `REQUEST_MEMORY_CAPS` on this cap is allowed).
     pub memmgr_ep: u32,
     /// Single shared death-notification event queue. Every spawned child
     /// binds its thread to this queue (via multi-bind in the kernel) with

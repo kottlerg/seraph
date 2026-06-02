@@ -52,12 +52,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Mint two siblings of the same underlying endpoint object: the parent
     // keeps one (in its own cspace) and the other is the cap that will be
     // moved into the child cspace.
-    let ep_parent = cap_create_endpoint(ctx.memory_frame_base)
+    let ep_parent = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: cap_create_endpoint (parent) failed")?;
     let ep_donor = cap_copy(ep_parent, ctx.cspace_cap, RIGHTS_SEND_GRANT)
         .map_err(|_| "cap_move_into_fresh_cspace_then_ipc: sibling cap_copy (donor) failed")?;
 
-    let done = cap_create_notification(ctx.memory_frame_base).map_err(
+    let done = cap_create_notification(ctx.memory_base).map_err(
         |_| "cap_move_into_fresh_cspace_then_ipc: cap_create_notification (done) failed",
     )?;
 

@@ -30,17 +30,18 @@ const VA_STRIDE: u64 = 0x1_0000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let done = cap_create_notification(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_map_unmap: create done failed")?;
 
     // Allocate frames from pool for each child.
-    let mut frames = [0u32; NUM_CHILDREN];
-    for frame in &mut frames
+    let mut memory_caps = [0u32; NUM_CHILDREN];
+    for memory_cap in &mut memory_caps
     {
-        *frame = crate::frame_pool::alloc().ok_or("concurrent_map_unmap: frame pool exhausted")?;
+        *memory_cap =
+            crate::frame_pool::alloc().ok_or("concurrent_map_unmap: frame pool exhausted")?;
     }
 
-    // Spawn children. Each child gets copies of its frame cap and the aspace
+    // Spawn children. Each child gets copies of its Memory cap and the aspace
     // cap in its own CSpace.
     let mut threads = [0u32; NUM_CHILDREN];
     let mut cspaces = [0u32; NUM_CHILDREN];
@@ -50,22 +51,22 @@ pub fn run(ctx: &TestContext) -> TestResult
             spawn::new_child(ctx).map_err(|_| "concurrent_map_unmap: spawn::new_child failed")?;
         let child_done = cap_copy(done, child.cs, 1 << 7)
             .map_err(|_| "concurrent_map_unmap: cap_copy done failed")?;
-        // Copy frame and aspace caps into child's CSpace with full rights.
-        let child_frame = cap_copy(frames[i], child.cs, syscall::RIGHTS_ALL)
-            .map_err(|_| "concurrent_map_unmap: cap_copy frame failed")?;
+        // Copy memory and aspace caps into child's CSpace with full rights.
+        let child_memory = cap_copy(memory_caps[i], child.cs, syscall::RIGHTS_ALL)
+            .map_err(|_| "concurrent_map_unmap: cap_copy memory failed")?;
         let child_aspace = cap_copy(ctx.aspace_cap, child.cs, syscall::RIGHTS_ALL)
             .map_err(|_| "concurrent_map_unmap: cap_copy aspace failed")?;
 
         let done_bit = 1u64 << i;
         let va = STRESS_MAP_BASE + (i as u64) * VA_STRIDE;
-        // Pack: done_slot[15:0], child_frame[31:16], child_aspace[47:32], done_bit[63:48]
+        // Pack: done_slot[15:0], child_memory[31:16], child_aspace[47:32], done_bit[63:48]
         let arg = u64::from(child_done)
-            | (u64::from(child_frame) << 16)
+            | (u64::from(child_memory) << 16)
             | (u64::from(child_aspace) << 32)
             | (done_bit << 48);
 
         // Set the VA for this child via a static. Children read it from
-        // a shared array indexed by child_frame slot (deterministic mapping).
+        // a shared array indexed by child_memory slot (deterministic mapping).
         VA_PER_CHILD[i].store(va, core::sync::atomic::Ordering::Release);
 
         // SAFETY: Each child uses a distinct stack index.
@@ -99,8 +100,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         cap_delete(threads[i]).ok();
         cap_delete(cspaces[i]).ok();
-        // SAFETY: frames are from pool and unmapped by children.
-        unsafe { crate::frame_pool::free(frames[i]) };
+        // SAFETY: memory_caps are from pool and unmapped by children.
+        unsafe { crate::frame_pool::free(memory_caps[i]) };
     }
     cap_delete(done).ok();
 
@@ -123,7 +124,7 @@ static VA_PER_CHILD: [core::sync::atomic::AtomicU64; NUM_CHILDREN] = {
 fn mapper_entry(arg: u64) -> !
 {
     let done_slot = (arg & 0xFFFF) as u32;
-    let frame_cap = ((arg >> 16) & 0xFFFF) as u32;
+    let memory_cap = ((arg >> 16) & 0xFFFF) as u32;
     let aspace = ((arg >> 32) & 0xFFFF) as u32;
     // done_bit is `1u64 << i` for i in 0..NUM_CHILDREN; at NUM=16 it spans
     // bits 0..15, so the mask is 16-bit not 8-bit.
@@ -135,7 +136,7 @@ fn mapper_entry(arg: u64) -> !
 
     for _ in 0..MAP_ITERATIONS
     {
-        if mem_map(frame_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
+        if mem_map(memory_cap, aspace, va, 0, 1, syscall::MAP_WRITABLE).is_err()
         {
             // Send done_bit | error indicator (bit 32).
             notification_send(done_slot, done_bit | (1 << 32)).ok();

@@ -18,7 +18,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     for _pass in 0..PASSES
     {
-        let root = cap_create_notification(ctx.memory_frame_base)
+        let root = cap_create_notification(ctx.memory_base)
             .map_err(|_| "cap_tree_deep: create_notification failed")?;
 
         // Build chain: root → level[0] → level[1] → ... → level[7]

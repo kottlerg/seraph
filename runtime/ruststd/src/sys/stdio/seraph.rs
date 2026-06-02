@@ -3,7 +3,7 @@
 // Stdin/Stdout/Stderr for Seraph userspace, backed by shmem SPSC rings
 // + notification caps (Phase 3 of LOGGING_STDIO_ROADMAP). Each direction is
 // an independent `sys::pipe::seraph::Pipe` end attached at child
-// startup from the (frame, data_notification, space_notification) triple the
+// startup from the (memory, data_notification, space_notification) triple the
 // spawner installed via `procmgr_labels::CONFIGURE_PIPE`.
 //
 // Cap topology per direction:
@@ -11,7 +11,7 @@
 //   * stdout: child = Writer (child writes out; parent reads).
 //   * stderr: child = Writer.
 //
-// Frame cap zero in any direction means "no pipe attached":
+// Memory cap zero in any direction means "no pipe attached":
 //   * stdout/stderr write returns Ok(buf.len()) (silent drop).
 //   * stdin read returns Ok(0) (immediate EOF).
 //
@@ -64,35 +64,35 @@ fn pipe_for(idx: usize) -> Option<&'static Pipe> {
     slots.get(idx).and_then(|s| s.as_ref())
 }
 
-/// Install one direction's pipe if a frame cap was provided. Helper
+/// Install one direction's pipe if a memory cap was provided. Helper
 /// for `stdio_init`.
 fn try_attach(
-    frame: u32,
+    memory: u32,
     data_notification: u32,
     space_notification: u32,
     role: Role,
     aspace: u32,
     child_va: u64,
 ) -> Option<Pipe> {
-    if frame == 0 {
+    if memory == 0 {
         return None;
     }
-    Pipe::attach_from_caps(frame, data_notification, space_notification, role, aspace, child_va).ok()
+    Pipe::attach_from_caps(memory, data_notification, space_notification, role, aspace, child_va).ok()
 }
 
 /// Install the stdio pipe ends from `ProcessInfo` cap triples. Called
 /// once from `_start` after the IPC buffer is registered. Each direction
-/// is independent: any combination of zero/non-zero frame caps is
+/// is independent: any combination of zero/non-zero memory caps is
 /// tolerated.
 #[allow(clippy::too_many_arguments)]
 pub fn stdio_init(
-    stdin_frame: u32,
+    stdin_memory: u32,
     stdin_data_sig: u32,
     stdin_space_sig: u32,
-    stdout_frame: u32,
+    stdout_memory: u32,
     stdout_data_sig: u32,
     stdout_space_sig: u32,
-    stderr_frame: u32,
+    stderr_memory: u32,
     stderr_data_sig: u32,
     stderr_space_sig: u32,
     aspace: u32,
@@ -102,7 +102,7 @@ pub fn stdio_init(
     unsafe {
         let slots = &mut *STDIO.0.get();
         slots[IDX_STDIN] = try_attach(
-            stdin_frame,
+            stdin_memory,
             stdin_data_sig,
             stdin_space_sig,
             Role::Reader,
@@ -110,7 +110,7 @@ pub fn stdio_init(
             STDIN_RING_VA,
         );
         slots[IDX_STDOUT] = try_attach(
-            stdout_frame,
+            stdout_memory,
             stdout_data_sig,
             stdout_space_sig,
             Role::Writer,
@@ -118,7 +118,7 @@ pub fn stdio_init(
             STDOUT_RING_VA,
         );
         slots[IDX_STDERR] = try_attach(
-            stderr_frame,
+            stderr_memory,
             stderr_data_sig,
             stderr_space_sig,
             Role::Writer,

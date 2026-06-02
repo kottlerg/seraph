@@ -494,7 +494,7 @@ pub fn init_kernel_page_tables(
     // (DIRECT_MAP_BASE, kernel image), so the low-VA identity mapping does
     // not conflict. Once SMP bringup completes,
     // `mm::paging::unmap_identity_page` (called in Phase 8) retires the
-    // mapping so the page can be reclaimed as a Frame cap.
+    // mapping so the page can be reclaimed as a Memory cap.
     if info.ap_trampoline_page != 0
     {
         let tramp = info.ap_trampoline_page;

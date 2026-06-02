@@ -128,7 +128,7 @@ pub unsafe fn pull_all(handover_send_cap: u32, ipc_buf: *mut u64, table: &mut Sl
 /// Init-logd's thread terminates on this message — not on the data drain's
 /// `DONE` chunk — so a dropped data chunk (a kernel IPC rendezvous race on
 /// the shared, multi-sender log endpoint) cannot leave init-logd running and
-/// block procmgr's reap of init's frames.
+/// block procmgr's reap of init's memory caps.
 ///
 /// Init-logd is alive until it processes a RELEASE, so the first *delivered*
 /// call is acknowledged and returns `Ok`. The retry recovers a `RELEASE`

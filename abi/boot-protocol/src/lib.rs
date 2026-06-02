@@ -48,7 +48,7 @@ pub mod role_guids;
 ///     the kernel's Phase-7 capability system has consumed them. The
 ///     slice is backed by a dedicated 4 KiB scratch page; that page is
 ///     itself the final entry in the array so the kernel reclaims it
-///     last. The kernel mints reclaimable Frame caps over each range
+///     last. The kernel mints reclaimable Memory caps over each range
 ///     inside `populate_cspace` so the pages reach userspace through
 ///     the same `CapDescriptor` path as boot modules.
 ///     Renamed `ReclaimRange.reserved` to `ReclaimRange.flags` (no
@@ -557,7 +557,7 @@ unsafe impl Sync for MmioApertureSlice {}
 /// capability system has consumed it.
 ///
 /// The kernel walks the [`ReclaimSlice`] in [`BootInfo`] inside
-/// `populate_cspace`, mints one reclaimable `FrameObject` cap per range, and
+/// `populate_cspace`, mints one reclaimable `MemoryObject` cap per range, and
 /// inserts each into the root `CSpace` so the cap reaches userspace through
 /// the standard `CapDescriptor` path. Once `populate_cspace` returns, the
 /// kernel MUST NOT dereference any address inside a recorded range.
@@ -580,7 +580,7 @@ pub struct ReclaimRange
 /// arches (x86-64 and RISC-V) install a low-VA identity-RWX mapping over
 /// the trampoline page so the AP can continue fetching instructions at
 /// its PA after enabling paging, and the kernel must retire that mapping
-/// via TLB shootdown before handing the page to userspace as a Frame cap.
+/// via TLB shootdown before handing the page to userspace as a Memory cap.
 pub const RECLAIM_FLAG_LATE: u32 = 1;
 
 /// Maximum number of [`ReclaimRange`] entries one 4 KiB reclaim-array page
@@ -599,7 +599,7 @@ pub const MAX_RECLAIM_RANGES: usize = 256;
 /// underlying array lives in its own dedicated 4 KiB scratch page,
 /// avoiding inline pressure on the `BootInfo` page-fit budget. The
 /// array's backing page is itself one of the recorded entries — the
-/// kernel reclaims it via `cap::mint_reclaim_frame_caps` once the
+/// kernel reclaims it via `cap::mint_reclaim_memory_caps` once the
 /// scan completes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

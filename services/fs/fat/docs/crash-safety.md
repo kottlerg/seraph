@@ -78,7 +78,7 @@ between write and read for correctness within the lifetime of a
 process.
 
 The other write-side phases (`fs_write_phase`, `fs_create_remove_phase`,
-`fs_mkdir_phase`, `fs_rename_phase`, `fs_write_frame_phase`) are
+`fs_mkdir_phase`, `fs_rename_phase`, `fs_write_memory_phase`) are
 golden-path round-trip tests; the windows above are not exercised
 by deliberate crash injection at v0.1.0. A two-boot QEMU harness for
 remount-survive testing is tracked as a follow-up.

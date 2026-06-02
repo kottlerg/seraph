@@ -52,16 +52,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── 1. Allocate a frame from the pool. ───────────────────────────────────
-    let frame_cap =
+    let memory_cap =
         crate::frame_pool::alloc().ok_or("integration::tlb_coherency: frame pool exhausted")?;
 
     // ── 2. Set up two notifications for parent-child coordination. ─────────────────
     //
     // Fix B1: use separate notifications for each direction to prevent bit
     // accumulation across directions (parent→child vs child→parent).
-    let p2c = cap_create_notification(ctx.memory_frame_base)
+    let p2c = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::tlb_coherency: cap_create_notification (p2c) failed")?;
-    let c2p = cap_create_notification(ctx.memory_frame_base)
+    let c2p = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::tlb_coherency: cap_create_notification (c2p) failed")?;
 
     let child = crate::spawn::new_child(ctx)
@@ -110,7 +110,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         // Map the page.
         mem_map(
-            frame_cap,
+            memory_cap,
             ctx.aspace_cap,
             TEST_VA,
             0,
@@ -154,7 +154,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     // Return frame to pool.
     // SAFETY: We've unmapped all pages using this frame in the loop above.
-    unsafe { crate::frame_pool::free(frame_cap) };
+    unsafe { crate::frame_pool::free(memory_cap) };
 
     Ok(())
 }

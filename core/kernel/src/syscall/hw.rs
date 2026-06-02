@@ -418,7 +418,7 @@ pub fn sys_ioport_bind(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         };
 
         // Allocate per-thread IOPB on first bind. Sourced from the kernel
-        // SEED Frame cap (no heap alloc); freed back to SEED on thread
+        // SEED Memory cap (no heap alloc); freed back to SEED on thread
         // dealloc via the Thread arm of `dealloc_object`.
         // SAFETY: target_tcb validated non-null; iopb field always valid.
         if unsafe { (*target_tcb).iopb.is_null() }
@@ -560,7 +560,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Create two child MmioRegionObjects ────────────────────────────────────
     //
-    // Both wrapper bodies live in the kernel SEED Frame cap; their
+    // Both wrapper bodies live in the kernel SEED Memory cap; their
     // `header.ancestor` points at SEED so dealloc returns the bytes via
     // `retype_free`.
 
@@ -640,7 +640,7 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Wire derivation tree ──────────────────────────────────────────────────
     //
-    // Pattern mirrors sys_frame_split: reparent original's children to its
+    // Pattern mirrors sys_memory_split: reparent original's children to its
     // parent, unlink original, then link both new caps to that same parent.
 
     let mmio_idx_nz =
@@ -774,7 +774,7 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let lower_count = split_at - start;
     let upper_count = count - lower_count;
 
-    // Both wrapper bodies live in the kernel SEED Frame cap; their
+    // Both wrapper bodies live in the kernel SEED Memory cap; their
     // `header.ancestor` points at SEED so dealloc returns the bytes via
     // `retype_free`.
 

@@ -54,8 +54,8 @@ fn main() -> !
         caps.aperture_count as u64,
         caps.acpi_region_count as u64,
         u64::from(caps.irq_range_cap),
-        u64::from(caps.rsdp_frame_cap),
-        u64::from(caps.dtb_frame_cap)
+        u64::from(caps.rsdp_memory_cap),
+        u64::from(caps.dtb_memory_cap)
     );
 
     // Parse firmware to locate the PCI ECAM. ACPI wins when RSDP is
@@ -547,12 +547,12 @@ fn main() -> !
 
 fn discover_ecam(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
 {
-    if caps.rsdp_frame_cap != 0
+    if caps.rsdp_memory_cap != 0
         && let Some(loc) = discover_ecam_acpi(caps)
     {
         return Some(loc);
     }
-    if caps.dtb_frame_cap != 0
+    if caps.dtb_memory_cap != 0
         && let Some(loc) = discover_ecam_dtb(caps)
     {
         return Some(loc);
@@ -622,17 +622,17 @@ fn discover_ecam_acpi(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
 /// no RSDP was delivered or the table is pre-ACPI-2.0.
 fn read_xsdt_phys(caps: &caps::DevmgrCaps) -> Option<u64>
 {
-    if caps.rsdp_frame_cap == 0
+    if caps.rsdp_memory_cap == 0
     {
         return None;
     }
     // `rsdp_page_base` carries the exact RSDP physical address (see
-    // init-protocol v5 docs); the backing Frame cap covers the page.
+    // init-protocol v5 docs); the backing Memory cap covers the page.
     let rsdp_page_offset = (caps.rsdp_page_base & 0xFFF) as usize;
     let range = reserve_pages(1).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
-        caps.rsdp_frame_cap,
+        caps.rsdp_memory_cap,
         caps.self_aspace,
         va,
         0,
@@ -744,7 +744,7 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
     let range = reserve_pages(map_pages).ok()?;
     let va = range.va_start();
     if syscall::mem_map(
-        caps.dtb_frame_cap,
+        caps.dtb_memory_cap,
         caps.self_aspace,
         va,
         0,
@@ -770,7 +770,7 @@ fn discover_ecam_dtb(caps: &caps::DevmgrCaps) -> Option<firmware::EcamLocation>
     ecam
 }
 
-/// Find which ACPI region's Frame cap covers `phys` and return `(region,
+/// Find which ACPI region's Memory cap covers `phys` and return `(region,
 /// in-region byte offset)`.
 fn find_region_for(caps: &caps::DevmgrCaps, phys: u64) -> Option<(caps::AcpiRegion, usize)>
 {
@@ -867,9 +867,9 @@ fn reply_status(code: u64, ipc_buf: *mut u64)
 }
 
 /// `QUERY_ACPI_TABLE` handler: locate the requested ACPI table and reply
-/// with a read-only Frame cap on its region plus the `(region_base,
+/// with a read-only Memory cap on its region plus the `(region_base,
 /// region_size, table_phys)` the caller needs to map and read it. devmgr
-/// is the sole ACPI owner; consumers hold no ACPI frames of their own.
+/// is the sole ACPI owner; consumers hold no ACPI memory caps of their own.
 fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64, ipc_buf: *mut u64)
 {
     if badge & ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY == 0
@@ -888,7 +888,7 @@ fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64
         reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
         return;
     };
-    let Ok(frame) = syscall::cap_derive(region.slot, syscall::RIGHTS_ALL)
+    let Ok(memory_cap) = syscall::cap_derive(region.slot, syscall::RIGHTS_ALL)
     else
     {
         reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
@@ -898,12 +898,12 @@ fn handle_query_acpi_table(caps: &caps::DevmgrCaps, msg: &IpcMessage, badge: u64
         .word(0, region.base)
         .word(1, region.size)
         .word(2, table_phys)
-        .cap(frame)
+        .cap(memory_cap)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
     {
-        let _ = syscall::cap_delete(frame);
+        let _ = syscall::cap_delete(memory_cap);
     }
 }
 

@@ -21,14 +21,14 @@
 //! - `thread_lifecycle.rs`       — full thread lifecycle end-to-end
 //! - `cap_transfer.rs`           — capability rights through an IPC endpoint round-trip
 //! - `wait_concurrency.rs`       — wait set with simultaneous notification and queue sources
-//! - `memory_lifecycle.rs`       — frame split → map → protect → unmap with state checks
+//! - `memory_lifecycle.rs`       — memory split → map → protect → unmap with state checks
 //! - `multi_caller_ipc_fifo.rs`  — endpoint send-queue FIFO ordering with three concurrent callers
 //! - `cap_delegation_chain.rs`   — multi-level rights attenuation and cascaded revocation
 //! - `tlb_coherency.rs`          — map/unmap cycles across CPUs exercising TLB shootdown
 //! - `retype_reclaim.rs`         — auto-reclaim invariant for every retypable kernel object
 //! - `retype_subpage_clobber.rs` — a clobbered sub-page free-list link is rejected, not dereferenced
 //! - `priority_preemption.rs`    — higher-priority runnable thread preempts a busy lower-priority one
-//! - `shared_frame_two_aspaces.rs` — one frame mapped into two `AddressSpace` caps; phys round-trip
+//! - `shared_memory_two_aspaces.rs` — one Memory cap mapped into two `AddressSpace` caps; phys round-trip
 //! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
 //! - `fpu_survives_ipc_call.rs` — FP register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration
 //! - `fault_kills_thread.rs`     — a genuine userspace page fault terminates the thread with the right exit reason
@@ -44,7 +44,7 @@ pub mod multi_caller_ipc_fifo;
 pub mod priority_preemption;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
-pub mod shared_frame_two_aspaces;
+pub mod shared_memory_two_aspaces;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
@@ -82,8 +82,8 @@ pub fn run_all(ctx: &TestContext)
         priority_preemption::run(ctx)
     );
     run_integration_test!(
-        "integration::shared_frame_two_aspaces",
-        shared_frame_two_aspaces::run(ctx)
+        "integration::shared_memory_two_aspaces",
+        shared_memory_two_aspaces::run(ctx)
     );
     run_integration_test!(
         "integration::cap_move_into_fresh_cspace_then_ipc",

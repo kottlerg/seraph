@@ -20,7 +20,7 @@ Termination is deliberately decoupled from the data drain. The drain is a
 multi-chunk lockstep over a shared, multi-sender endpoint; a kernel IPC
 rendezvous race can drop one chunk under SMP. If `DONE` were the exit
 trigger, such a drop would leave init-logd running forever, which blocks
-procmgr's reap of init's frames and breaks the all-RAM-accounted identity.
+procmgr's reap of init's memory caps and breaks the all-RAM-accounted identity.
 Gating exit on the single, retried `HANDOVER_RELEASE` instead means a
 dropped data chunk costs at most some unrecovered history.
 

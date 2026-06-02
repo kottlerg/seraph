@@ -11,7 +11,7 @@ pub(super) fn bench_event_post_recv(ctx: &crate::TestContext, iters: u32)
 {
     let n = u64::from(iters);
 
-    let Ok(eq) = event_queue_create(ctx.memory_frame_base, 4)
+    let Ok(eq) = event_queue_create(ctx.memory_base, 4)
     else
     {
         return;

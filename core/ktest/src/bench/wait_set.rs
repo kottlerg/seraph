@@ -11,9 +11,9 @@ use syscall::{
 use super::{cycles_now, log_bench_header};
 
 // Thin wrapper — same as in unit/cap.rs.
-fn cap_create_wait_set(frame_cap: u32) -> Result<u32, i64>
+fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 {
-    syscall::wait_set_create(frame_cap)
+    syscall::wait_set_create(memory_cap)
 }
 
 pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
@@ -22,7 +22,7 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
     // heap allocations that fragment under high churn.
     let n = u64::from(iters.min(100));
 
-    let Ok(sig) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(sig) = cap_create_notification(ctx.memory_base)
     else
     {
         return;
@@ -38,7 +38,7 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
         notification_send(sig, 0x1).ok();
 
         let t0 = cycles_now();
-        let Ok(ws) = cap_create_wait_set(ctx.memory_frame_base)
+        let Ok(ws) = cap_create_wait_set(ctx.memory_base)
         else
         {
             break;

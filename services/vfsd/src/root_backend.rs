@@ -31,7 +31,7 @@
 //! `MOUNT path="/"` succeeds.
 
 use namespace_protocol::{
-    EntryName, EntryTarget, EntryView, FrameReply, NamespaceBackend, NamespaceRights, NodeId,
+    EntryName, EntryTarget, EntryView, MemoryReply, NamespaceBackend, NamespaceRights, NodeId,
     NodeKind, NodeStat, NsError,
 };
 
@@ -500,17 +500,17 @@ impl NamespaceBackend for VfsdRootBackend
         Err(NsError::NotSupported)
     }
 
-    fn read_frame(
+    fn read_memory(
         &mut self,
         _file: NodeId,
         _offset: u64,
         _cookie: u64,
-    ) -> Result<FrameReply, NsError>
+    ) -> Result<MemoryReply, NsError>
     {
         Err(NsError::NotSupported)
     }
 
-    fn release_frame(&mut self, _file: NodeId, _cookie: u64) {}
+    fn release_memory(&mut self, _file: NodeId, _cookie: u64) {}
 
     fn close(&mut self, _node: NodeId) {}
 }

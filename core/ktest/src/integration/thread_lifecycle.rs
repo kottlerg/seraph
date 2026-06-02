@@ -51,9 +51,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Two distinct notifications — child→parent readiness and child blocking
     // primitive — so the child cannot self-deliver its own readiness send
     // before the parent has registered as the waiter (race observed on SMP).
-    let ready = cap_create_notification(ctx.memory_frame_base)
+    let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::thread_lifecycle: cap_create_notification (ready) failed")?;
-    let block = cap_create_notification(ctx.memory_frame_base)
+    let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::thread_lifecycle: cap_create_notification (block) failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::thread_lifecycle: spawn::new_child failed")?;
@@ -117,9 +117,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // The thread cap is still valid even after the thread exits; the kernel
     // allows these operations on any Thread object. Create a fresh thread just
     // to test these without depending on child exit timing.
-    let cs2 = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+    let cs2 = cap_create_cspace(ctx.memory_base, 0, 4, 8)
         .map_err(|_| "integration::thread_lifecycle: cap_create_cspace (step 8) failed")?;
-    let th2 = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs2)
+    let th2 = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs2)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread (step 8) failed")?;
 
     thread_set_priority(th2, 5, 0)

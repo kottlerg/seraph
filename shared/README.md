@@ -12,7 +12,7 @@ Internal utility crates with no cross-boundary stability obligation. See
 | `mmio/` | Architecture-specific MMIO ordering barriers for device drivers |
 | `namespace-protocol/` | Cap-native namespace wire format, name validation, rights composition, and `NamespaceBackend` dispatch loop shared by every namespace server |
 | `registry/` | Fixed-capacity name→endpoint-cap registry used by supervisor services |
-| `shmem/` | Shared-memory byte transport — multi-frame `SharedBuffer` plus SPSC ring |
+| `shmem/` | Shared-memory byte transport — multi-page `SharedBuffer` plus SPSC ring |
 | `syscall/` | Userspace syscall wrappers — inline asm over `abi/syscall/` |
 
 ---

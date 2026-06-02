@@ -4,7 +4,7 @@
 // and the per-direction backing of `std::io::{stdin, stdout, stderr}` on
 // children spawned with piped stdio.
 //
-// Each pipe is one 4 KiB shmem frame holding a `shmem::SpscHeader` plus
+// Each pipe is one 4 KiB shmem page holding a `shmem::SpscHeader` plus
 // a power-of-two byte ring, plus two notification caps:
 //
 //   * data_notification  — writer kicks reader after producing bytes; reader
@@ -13,8 +13,8 @@
 //                    waits on this when the ring is full.
 //
 // Each `Pipe` instance represents one end (Reader or Writer). Both ends
-// hold caps to all three objects (the same frame and both notifications are
-// mapped/copied into both processes' CSpaces); read/write logic drives
+// hold caps to all three objects (the same memory cap and both notifications
+// are mapped/copied into both processes' CSpaces); read/write logic drives
 // the appropriate notification direction. EOF/BrokenPipe is notified via
 // the header's `closed` flag, set on Drop with one final notification kick
 // so the surviving peer wakes and observes the flag.
@@ -89,7 +89,7 @@ pub enum Role {
 /// responsibility once the transfer completes (no caller cleanup).
 #[derive(Clone, Copy)]
 pub struct PipeCaps {
-    pub frame: u32,
+    pub memory: u32,
     pub data_notification: u32,
     pub space_notification: u32,
 }
@@ -103,7 +103,7 @@ pub struct PipeCaps {
 /// `peer_dead` flag set by the spawner's death-bridge thread when the
 /// peer process exits without running `Drop` (fault, abort).
 pub struct Pipe {
-    frame_cap: u32,
+    memory_cap: u32,
     ring_vaddr: u64,
     data_notification: u32,
     space_notification: u32,
@@ -137,7 +137,7 @@ unsafe impl Sync for Pipe {}
 
 impl Pipe {
     fn header(&self) -> &SpscHeader {
-        // SAFETY: ring_vaddr points at a frame mapped read-write for the
+        // SAFETY: ring_vaddr points at a page mapped read-write for the
         // lifetime of this Pipe; layout starts with SpscHeader.
         unsafe { &*(self.ring_vaddr as *const SpscHeader) }
     }
@@ -154,7 +154,7 @@ impl Pipe {
         unsafe { SpscReader::from_raw(self.ring_vaddr) }
     }
 
-    /// Allocate a fresh shmem frame + two notifications, map the frame at a
+    /// Allocate a fresh shmem page + two notifications, map the page at a
     /// parent-side VA, initialise the ring header, and build the
     /// parent-side `Pipe` for `parent_role`. Returns the parent-side
     /// `Pipe` plus the cap triple to install in the child via
@@ -183,12 +183,12 @@ impl Pipe {
             .ok_or_else(|| io::Error::other("seraph pipe: parent VA pool exhausted"))?;
 
         // Allocate one shmem page mapped at parent_va in this process.
-        let (sb, frames) = SharedBuffer::create(memmgr_ep, aspace, parent_va, 1, ipc_buf)
+        let (sb, memory_caps) = SharedBuffer::create(memmgr_ep, aspace, parent_va, 1, ipc_buf)
             .map_err(|_| {
                 free_parent_va(parent_va);
                 io::Error::other("seraph pipe: SharedBuffer::create failed")
             })?;
-        let frame_cap = frames[0];
+        let memory_cap = memory_caps[0];
 
         // Initialise the ring header in shared memory before either end
         // touches it. SAFETY: parent_va is mapped writable for one page;
@@ -209,7 +209,7 @@ impl Pipe {
             Ok(s) => s,
             Err(e) => {
                 drop(sb);
-                let _ = syscall::cap_delete(frame_cap);
+                let _ = syscall::cap_delete(memory_cap);
                 free_parent_va(parent_va);
                 return Err(e);
             }
@@ -225,7 +225,7 @@ impl Pipe {
             Err(e) => {
                 let _ = syscall::cap_delete(data_notification);
                 drop(sb);
-                let _ = syscall::cap_delete(frame_cap);
+                let _ = syscall::cap_delete(memory_cap);
                 free_parent_va(parent_va);
                 return Err(e);
             }
@@ -241,27 +241,27 @@ impl Pipe {
         // procmgr's CSpace when they appear in CONFIGURE_PIPE's
         // cap-list, leaving the originals intact. On any error here we
         // free the originals and the parent VA before returning.
-        let frame_handoff = match syscall::cap_derive(frame_cap, syscall::RIGHTS_MAP_RW) {
+        let memory_handoff = match syscall::cap_derive(memory_cap, syscall::RIGHTS_MAP_RW) {
             Ok(s) => s,
             Err(_) => {
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(frame_cap);
+                let _ = syscall::cap_delete(memory_cap);
                 free_parent_va(parent_va);
                 return Err(io::Error::other(
-                    "seraph pipe: cap_derive (frame handoff) failed",
+                    "seraph pipe: cap_derive (memory handoff) failed",
                 ));
             }
         };
         let data_handoff = match syscall::cap_derive(data_notification, syscall::RIGHTS_ALL) {
             Ok(s) => s,
             Err(_) => {
-                let _ = syscall::cap_delete(frame_handoff);
+                let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(frame_cap);
+                let _ = syscall::cap_delete(memory_cap);
                 free_parent_va(parent_va);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (data handoff) failed",
@@ -272,11 +272,11 @@ impl Pipe {
             Ok(s) => s,
             Err(_) => {
                 let _ = syscall::cap_delete(data_handoff);
-                let _ = syscall::cap_delete(frame_handoff);
+                let _ = syscall::cap_delete(memory_handoff);
                 let _ = syscall::cap_delete(space_notification);
                 let _ = syscall::cap_delete(data_notification);
                 let _ = syscall::mem_unmap(aspace, parent_va, 1);
-                let _ = syscall::cap_delete(frame_cap);
+                let _ = syscall::cap_delete(memory_cap);
                 free_parent_va(parent_va);
                 return Err(io::Error::other(
                     "seraph pipe: cap_derive (space handoff) failed",
@@ -286,7 +286,7 @@ impl Pipe {
 
         Ok((
             Pipe {
-                frame_cap,
+                memory_cap,
                 ring_vaddr: parent_va,
                 data_notification,
                 space_notification,
@@ -296,33 +296,33 @@ impl Pipe {
                 peer_dead: None,
             },
             PipeCaps {
-                frame: frame_handoff,
+                memory: memory_handoff,
                 data_notification: data_handoff,
                 space_notification: space_handoff,
             },
         ))
     }
 
-    /// Child-side attach. Maps the frame received from the parent at
+    /// Child-side attach. Maps the page received from the parent at
     /// `child_va` in `aspace`; assumes the header is already
     /// initialised by the parent. Used by `stdio::stdio_init` once per
     /// piped direction.
     pub fn attach_from_caps(
-        frame_cap: u32,
+        memory_cap: u32,
         data_notification: u32,
         space_notification: u32,
         role: Role,
         aspace: u32,
         child_va: u64,
     ) -> io::Result<Pipe> {
-        let frames = [frame_cap, 0, 0, 0];
-        let sb = SharedBuffer::attach(&frames, 1, aspace, child_va).map_err(|_| {
+        let memory_caps = [memory_cap, 0, 0, 0];
+        let sb = SharedBuffer::attach(&memory_caps, 1, aspace, child_va).map_err(|_| {
             io::Error::other("seraph pipe: SharedBuffer::attach failed")
         })?;
         // Same forget-the-SharedBuffer trick: Pipe's Drop unmaps.
         core::mem::forget(sb);
         Ok(Pipe {
-            frame_cap,
+            memory_cap,
             ring_vaddr: child_va,
             data_notification,
             space_notification,
@@ -543,8 +543,8 @@ impl Drop for Pipe {
         // Release this side's cap slots. The peer's Drop releases its
         // own copies; the underlying kernel objects free when refcount
         // hits zero.
-        if self.frame_cap != 0 {
-            let _ = syscall::cap_delete(self.frame_cap);
+        if self.memory_cap != 0 {
+            let _ = syscall::cap_delete(self.memory_cap);
         }
         if self.data_notification != 0 {
             let _ = syscall::cap_delete(self.data_notification);
@@ -562,14 +562,14 @@ impl fmt::Debug for Pipe {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pipe")
             .field("role", &self.role)
-            .field("frame_cap", &self.frame_cap)
+            .field("memory_cap", &self.memory_cap)
             .field("ring_vaddr", &format_args!("{:#x}", self.ring_vaddr))
             .finish()
     }
 }
 
 /// Stub for the upstream symmetric pipe constructor. Our pipe model is
-/// asymmetric (parent-side reader holds the same frame the child-side
+/// asymmetric (parent-side reader holds the same memory cap the child-side
 /// writer maps elsewhere), so a single-process `(read, write)` pair is
 /// not constructible; callers use [`Pipe::create_for_child`].
 #[inline]

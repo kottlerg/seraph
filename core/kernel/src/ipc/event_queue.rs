@@ -33,7 +33,7 @@ use crate::sched::thread::{IpcThreadState, ThreadControlBlock};
 /// distinguish full from empty using the one-slot-gap strategy. The ring
 /// pointer is set at construction by `EventQueueState::new` and remains
 /// stable for the lifetime of the cap; reclaim is uniform with the rest
-/// of the slot via `retype_free` against the source `Frame` cap.
+/// of the slot via `retype_free` against the source `Memory` cap.
 pub struct EventQueueState
 {
     /// Raw pointer to the inline ring buffer of `capacity + 1` `u64`

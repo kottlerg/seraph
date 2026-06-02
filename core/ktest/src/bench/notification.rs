@@ -46,17 +46,17 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
     const RIGHTS_WAIT: u64 = 1 << 8;
     let n = u64::from(iters);
 
-    let Ok(ping) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(ping) = cap_create_notification(ctx.memory_base)
     else
     {
         return;
     };
-    let Ok(pong) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(pong) = cap_create_notification(ctx.memory_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         return;

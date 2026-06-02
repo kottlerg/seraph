@@ -26,28 +26,28 @@ use syscall::SyscallError;
 #[cfg(not(test))]
 use super::current_tcb;
 
-/// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Frame cap into a new Endpoint.
+/// `SYS_CAP_CREATE_ENDPOINT` (7): retype a Memory cap into a new Endpoint.
 ///
-/// arg0 = Frame-cap slot index in the caller's `CSpace`. The Frame cap
+/// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap
 /// MUST carry `Rights::RETYPE` and have at least
 /// `dispatch_for(Endpoint, 0).raw_bytes` (88 B) of `available_bytes`.
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
-/// the source Frame cap's region; a cap with `SEND | RECEIVE | GRANT` rights
+/// the source Memory cap's region; a cap with `SEND | RECEIVE | GRANT` rights
 /// is inserted into the caller's `CSpace`; returns the slot index.
 ///
-/// On `dec_ref → 0`, auto-reclaim returns the bytes to the source Frame cap
+/// On `dec_ref → 0`, auto-reclaim returns the bytes to the source Memory cap
 /// via [`crate::cap::object::dealloc_object`] consulting `header.ancestor`.
 #[cfg(not(test))]
 pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{EndpointObject, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{EndpointObject, KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::endpoint::EndpointState;
     use core::ptr::NonNull;
 
-    let frame_slot = tf.arg(0) as u32;
+    let memory_slot = tf.arg(0) as u32;
 
     // SAFETY: syscall entry ensures current_tcb() returns the active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -62,24 +62,24 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Frame cap. Requires Rights::RETYPE.
+    // Resolve the source Memory cap. Requires Rights::RETYPE.
     // SAFETY: cspace validated non-null above.
-    let frame_slot_ref =
-        unsafe { super::lookup_cap(cspace, frame_slot, CapTag::Frame, Rights::RETYPE)? };
-    let frame_obj_nn = frame_slot_ref
+    let memory_slot_ref =
+        unsafe { super::lookup_cap(cspace, memory_slot, CapTag::Memory, Rights::RETYPE)? };
+    let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
-    // SAFETY: lookup_cap returned a live Frame slot whose object pointer is
+    // SAFETY: lookup_cap returned a live Memory slot whose object pointer is
     // valid for the lifetime of the slot.
-    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+    let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
     let entry = dispatch_for(ObjectType::Endpoint, 0).ok_or(SyscallError::InvalidArgument)?;
 
-    // Reserve bytes in the Frame cap region.
-    let offset = retype_allocate(frame, entry.raw_bytes)?;
+    // Reserve bytes in the Memory cap region.
+    let offset = retype_allocate(memory, entry.raw_bytes)?;
 
     // Compute the kernel direct-map virtual address of the new object.
-    let block_phys = frame.base + offset;
+    let block_phys = memory.base + offset;
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: EndpointObject at offset 0; EndpointState at offset
@@ -88,10 +88,10 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let state_offset = core::mem::size_of::<EndpointObject>() as u64;
     let ep_state_ptr = (block_virt + state_offset) as *mut EndpointState;
 
-    let ancestor = frame_obj_nn;
+    let ancestor = memory_obj_nn;
 
     // SAFETY: ep_state_ptr / ep_obj_ptr point into the just-allocated region;
-    // alignment: the region is page-aligned (frame.base is page-aligned, and
+    // alignment: the region is page-aligned (memory.base is page-aligned, and
     // BIN_128 sub-page slots inherit 8-byte alignment from `bump_offset`'s
     // initialisation at zero plus 128 B granularity, which exceeds the
     // 8-byte alignment requirement of both structs).
@@ -107,7 +107,7 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // Bump the ancestor's refcount: each retyped descendant holds a lease.
-    // SAFETY: ancestor is the FrameObject's header (offset 0 of FrameObject);
+    // SAFETY: ancestor is the MemoryObject's header (offset 0 of MemoryObject);
     // dereferencing through the header is safe.
     unsafe { ancestor.as_ref().inc_ref() };
 
@@ -145,35 +145,35 @@ pub fn sys_cap_create_endpoint(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(ep_obj_ptr);
             core::ptr::drop_in_place(ep_state_ptr);
         }
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         // SAFETY: matches the inc_ref above.
         unsafe { ancestor.as_ref().dec_ref() };
         Err(SyscallError::OutOfMemory)
     }
 }
 
-/// `SYS_CAP_CREATE_NOTIFICATION` (8): retype a Frame cap into a new Notification.
+/// `SYS_CAP_CREATE_NOTIFICATION` (8): retype a Memory cap into a new Notification.
 ///
-/// arg0 = Frame-cap slot index in the caller's `CSpace`. The Frame cap MUST
+/// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap MUST
 /// carry `Rights::RETYPE` and have at least `dispatch_for(Notification, 0).raw_bytes`
 /// of `available_bytes`.
 ///
 /// On success, the wrapper + `NotificationState` are constructed in place inside
-/// the source Frame cap's region; a cap with `NOTIFY | WAIT` rights is
+/// the source Memory cap's region; a cap with `NOTIFY | WAIT` rights is
 /// inserted into the caller's `CSpace`; returns the slot index.
 ///
 /// Auto-reclaim (`dec_ref → 0`) consults `header.ancestor` and credits bytes
-/// back to the source Frame cap.
+/// back to the source Memory cap.
 #[cfg(not(test))]
 pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{FrameObject, KernelObjectHeader, NotificationObject, ObjectType};
+    use crate::cap::object::{KernelObjectHeader, MemoryObject, NotificationObject, ObjectType};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::notification::NotificationState;
     use core::ptr::NonNull;
 
-    let frame_slot = tf.arg(0) as u32;
+    let memory_slot = tf.arg(0) as u32;
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -189,19 +189,19 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
     }
 
     // SAFETY: cspace validated; lookup_cap checks tag and rights.
-    let frame_slot_ref =
-        unsafe { super::lookup_cap(cspace, frame_slot, CapTag::Frame, Rights::RETYPE)? };
-    let frame_obj_nn = frame_slot_ref
+    let memory_slot_ref =
+        unsafe { super::lookup_cap(cspace, memory_slot, CapTag::Memory, Rights::RETYPE)? };
+    let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
-    // SAFETY: lookup_cap returned a live Frame slot.
-    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+    // SAFETY: lookup_cap returned a live Memory slot.
+    let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
     let entry = dispatch_for(ObjectType::Notification, 0).ok_or(SyscallError::InvalidArgument)?;
 
-    let offset = retype_allocate(frame, entry.raw_bytes)?;
+    let offset = retype_allocate(memory, entry.raw_bytes)?;
 
-    let block_phys = frame.base + offset;
+    let block_phys = memory.base + offset;
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: NotificationObject at offset 0; NotificationState at offset
@@ -210,7 +210,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
     let state_offset = core::mem::size_of::<NotificationObject>() as u64;
     let sig_state_ptr = (block_virt + state_offset) as *mut NotificationState;
 
-    let ancestor = frame_obj_nn;
+    let ancestor = memory_obj_nn;
 
     // SAFETY: pointers are inside the freshly-allocated retype slot;
     // size-class alignment (BIN_128 = 128 B granular) exceeds the 8-byte
@@ -226,7 +226,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
         );
     }
 
-    // SAFETY: ancestor is the FrameObject's header at offset 0.
+    // SAFETY: ancestor is the MemoryObject's header at offset 0.
     unsafe { ancestor.as_ref().inc_ref() };
 
     // SAFETY: header at offset 0 of NotificationObject.
@@ -252,7 +252,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
             core::ptr::drop_in_place(sig_obj_ptr);
             core::ptr::drop_in_place(sig_state_ptr);
         }
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         // SAFETY: matches the inc_ref above.
         unsafe { ancestor.as_ref().dec_ref() };
         Err(SyscallError::OutOfMemory)
@@ -262,10 +262,10 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 /// `SYS_CAP_CREATE_ASPACE` (11): create a new `AddressSpace` object, or
 /// augment an existing one's PT growth budget.
 ///
-/// arg0 = source Frame-cap slot (must carry `Rights::RETYPE`, with at least
+/// arg0 = source Memory-cap slot (must carry `Rights::RETYPE`, with at least
 ///        `init_pages * PAGE_SIZE` available bytes).
 /// arg1 = augment-target `AddressSpace` cap slot, or `0` to create new.
-/// arg2 = `init_pages`: number of PT pages to carve from the Frame cap.
+/// arg2 = `init_pages`: number of PT pages to carve from the Memory cap.
 ///        Create-mode requires `init_pages >= 2` (one wrapper page + one
 ///        root PT page; the remainder seed the PT growth pool).
 ///        Augment-mode accepts `init_pages >= 1`.
@@ -291,7 +291,7 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{
-        AddressSpaceObject, FrameObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
+        AddressSpaceObject, KernelObjectHeader, MemoryObject, ObjectType, vacant_chunk_slots,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
@@ -301,7 +301,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use core::ptr::NonNull;
     use core::sync::atomic::AtomicU64;
 
-    let frame_idx = tf.arg(0) as u32;
+    let memory_idx = tf.arg(0) as u32;
     let augment_idx = tf.arg(1) as u32;
     let init_pages = tf.arg(2);
 
@@ -329,15 +329,15 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Frame cap (RETYPE-rights gated).
+    // Resolve the source Memory cap (RETYPE-rights gated).
     // SAFETY: cspace validated non-null above.
-    let frame_slot_ref =
-        unsafe { super::lookup_cap(cspace, frame_idx, CapTag::Frame, Rights::RETYPE)? };
-    let frame_obj_nn = frame_slot_ref
+    let memory_slot_ref =
+        unsafe { super::lookup_cap(cspace, memory_idx, CapTag::Memory, Rights::RETYPE)? };
+    let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
-    // SAFETY: lookup_cap returned a live Frame slot.
-    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+    // SAFETY: lookup_cap returned a live Memory slot.
+    let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
     // Validate dispatch math against the user-provided init_pages.
     let entry =
@@ -345,10 +345,10 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     debug_assert!(entry.split);
     debug_assert_eq!(entry.raw_bytes, init_bytes);
 
-    // Reserve the contiguous slab from the Frame cap. The slab will be split
+    // Reserve the contiguous slab from the Memory cap. The slab will be split
     // page-by-page onto the target AS's pool.
-    let offset = retype_allocate(frame, entry.raw_bytes)?;
-    let frame_base = frame.base;
+    let offset = retype_allocate(memory, entry.raw_bytes)?;
+    let memory_base = memory.base;
 
     // Augment-mode: push all carved pages onto the target AS's pool.
     if augment_idx != 0
@@ -362,18 +362,18 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let target_aso = unsafe { &*target_aso_nn.as_ptr().cast::<AddressSpaceObject>() };
 
         // SAFETY: ref is held until AS-dealloc (released per chunk slot).
-        unsafe { frame_obj_nn.as_ref().inc_ref() };
+        unsafe { memory_obj_nn.as_ref().inc_ref() };
 
         // SAFETY: target_aso wraps a live AS; offset/init_pages are from a
-        // successful retype against `frame`.
+        // successful retype against `memory`.
         let res = unsafe {
-            target_aso.add_chunk(frame_obj_nn, frame_base, offset, init_pages, init_pages)
+            target_aso.add_chunk(memory_obj_nn, memory_base, offset, init_pages, init_pages)
         };
         if res.is_err()
         {
-            retype_free(frame, offset, entry.raw_bytes);
+            retype_free(memory, offset, entry.raw_bytes);
             // SAFETY: matches the inc_ref above.
-            unsafe { frame_obj_nn.as_ref().dec_ref() };
+            unsafe { memory_obj_nn.as_ref().dec_ref() };
             return Err(SyscallError::OutOfMemory);
         }
         return Ok(0);
@@ -383,11 +383,11 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // Requires `init_pages >= 2`.
     if init_pages < 2
     {
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         return Err(SyscallError::InvalidArgument);
     }
 
-    let wrapper_phys = frame_base + offset;
+    let wrapper_phys = memory_base + offset;
     let root_pt_phys = wrapper_phys + PAGE_SIZE as u64;
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
@@ -424,7 +424,7 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         core::ptr::write(
             aso_ptr,
             AddressSpaceObject {
-                header: KernelObjectHeader::with_ancestor(ObjectType::AddressSpace, frame_obj_nn),
+                header: KernelObjectHeader::with_ancestor(ObjectType::AddressSpace, memory_obj_nn),
                 address_space: aspace_ptr,
                 pt_growth_budget_bytes: AtomicU64::new(0),
                 pt_pool_lock: AtomicU64::new(0),
@@ -434,19 +434,19 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         );
     }
 
-    // Hold a reference on the source Frame cap for the AS's lifetime; the
+    // Hold a reference on the source Memory cap for the AS's lifetime; the
     // matching dec_ref happens in `dealloc_object(AddressSpace)` after the
     // chunk is reclaimed.
-    // SAFETY: frame_obj_nn is a live FrameObject.
-    unsafe { frame_obj_nn.as_ref().inc_ref() };
+    // SAFETY: memory_obj_nn is a live MemoryObject.
+    unsafe { memory_obj_nn.as_ref().inc_ref() };
 
     // Record the chunk covering all `init_pages`; the lower 2 pages
     // (wrapper + root PT) are reserved, the remainder seeds the pool.
     let pool_pages = init_pages - 2;
     // SAFETY: aso just constructed; offset/init_pages from a successful
-    // retype against `frame`.
+    // retype against `memory`.
     let res =
-        unsafe { (*aso_ptr).add_chunk(frame_obj_nn, frame_base, offset, init_pages, pool_pages) };
+        unsafe { (*aso_ptr).add_chunk(memory_obj_nn, memory_base, offset, init_pages, pool_pages) };
     if res.is_err()
     {
         // Roll back: drop the in-place objects, free the slab, dec_ref the
@@ -457,9 +457,9 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(aso_ptr);
             core::ptr::drop_in_place(aspace_ptr);
         }
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         // SAFETY: matches inc_ref above.
-        unsafe { frame_obj_nn.as_ref().dec_ref() };
+        unsafe { memory_obj_nn.as_ref().dec_ref() };
         return Err(SyscallError::OutOfMemory);
     }
 
@@ -478,12 +478,12 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Ok(u64::from(idx.get()))
 }
 
-/// `SYS_CAP_CREATE_CSPACE` (12): retype a Frame cap into a new `CSpace`,
+/// `SYS_CAP_CREATE_CSPACE` (12): retype a Memory cap into a new `CSpace`,
 /// or augment an existing one's slot-page growth budget.
 ///
-/// arg0 = source Frame-cap slot (must carry `Rights::RETYPE`).
+/// arg0 = source Memory-cap slot (must carry `Rights::RETYPE`).
 /// arg1 = augment-target `CSpace` cap slot, or `0` to create new.
-/// arg2 = `init_pages`: number of pages to carve from the Frame cap.
+/// arg2 = `init_pages`: number of pages to carve from the Memory cap.
 ///        Create-mode requires `init_pages >= 1` (one wrapper page; the
 ///        remainder seed the slot-page pool — `init_pages == 1` yields an
 ///        empty pool that requires immediate augment-mode refill before any
@@ -507,7 +507,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::cap::alloc_cspace_id;
     use crate::cap::cspace::CSpace;
     use crate::cap::object::{
-        CSpaceKernelObject, FrameObject, KernelObjectHeader, ObjectType, vacant_chunk_slots,
+        CSpaceKernelObject, KernelObjectHeader, MemoryObject, ObjectType, vacant_chunk_slots,
     };
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
@@ -518,7 +518,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     const MAX_SLOTS: usize = 14336;
 
-    let frame_idx = tf.arg(0) as u32;
+    let memory_idx = tf.arg(0) as u32;
     let augment_idx = tf.arg(1) as u32;
     let init_pages = tf.arg(2);
     let requested_max_slots = tf.arg(3);
@@ -546,23 +546,23 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Frame cap.
+    // Resolve the source Memory cap.
     // SAFETY: cspace validated non-null above.
-    let frame_slot_ref =
-        unsafe { super::lookup_cap(cspace, frame_idx, CapTag::Frame, Rights::RETYPE)? };
-    let frame_obj_nn = frame_slot_ref
+    let memory_slot_ref =
+        unsafe { super::lookup_cap(cspace, memory_idx, CapTag::Memory, Rights::RETYPE)? };
+    let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
-    // SAFETY: lookup_cap returned a live Frame slot.
-    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+    // SAFETY: lookup_cap returned a live Memory slot.
+    let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
     let entry =
         dispatch_for(ObjectType::CSpaceObj, init_pages).ok_or(SyscallError::InvalidArgument)?;
     debug_assert!(entry.split);
     debug_assert_eq!(entry.raw_bytes, init_bytes);
 
-    let offset = retype_allocate(frame, entry.raw_bytes)?;
-    let frame_base = frame.base;
+    let offset = retype_allocate(memory, entry.raw_bytes)?;
+    let memory_base = memory.base;
 
     // Augment-mode.
     if augment_idx != 0
@@ -576,17 +576,17 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         let target_kobj = unsafe { &*target_kobj_nn.as_ptr().cast::<CSpaceKernelObject>() };
 
         // SAFETY: ref kept until CS-dealloc.
-        unsafe { frame_obj_nn.as_ref().inc_ref() };
+        unsafe { memory_obj_nn.as_ref().inc_ref() };
 
         // SAFETY: target_kobj is live.
         let res = unsafe {
-            target_kobj.add_chunk(frame_obj_nn, frame_base, offset, init_pages, init_pages)
+            target_kobj.add_chunk(memory_obj_nn, memory_base, offset, init_pages, init_pages)
         };
         if res.is_err()
         {
-            retype_free(frame, offset, entry.raw_bytes);
+            retype_free(memory, offset, entry.raw_bytes);
             // SAFETY: matches inc_ref above.
-            unsafe { frame_obj_nn.as_ref().dec_ref() };
+            unsafe { memory_obj_nn.as_ref().dec_ref() };
             return Err(SyscallError::OutOfMemory);
         }
         return Ok(0);
@@ -605,7 +605,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         (requested_max_slots as usize).clamp(1, MAX_SLOTS)
     };
 
-    let wrapper_phys = frame_base + offset;
+    let wrapper_phys = memory_base + offset;
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
     // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
@@ -627,7 +627,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         // Free list empty and high-water at MAX_CSPACES — namespace
         // exhausted. Surface to userspace; the retype carve is undone below
         // by `retype_free` after the error return.
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         return Err(SyscallError::OutOfMemory);
     };
 
@@ -642,7 +642,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         core::ptr::write(
             cs_kobj_ptr,
             CSpaceKernelObject {
-                header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, frame_obj_nn),
+                header: KernelObjectHeader::with_ancestor(ObjectType::CSpaceObj, memory_obj_nn),
                 cspace: cs_ptr,
                 cspace_growth_budget_bytes: AtomicU64::new(0),
                 cs_pool_lock: AtomicU64::new(0),
@@ -669,21 +669,21 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(cs_kobj_ptr);
             core::ptr::drop_in_place(cs_ptr);
         }
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         return Err(SyscallError::OutOfMemory);
     }
 
-    // Hold a reference on the source Frame cap.
-    // SAFETY: frame_obj_nn is live.
-    unsafe { frame_obj_nn.as_ref().inc_ref() };
+    // Hold a reference on the source Memory cap.
+    // SAFETY: memory_obj_nn is live.
+    unsafe { memory_obj_nn.as_ref().inc_ref() };
 
     // Record the chunk covering all init_pages; reserve page 0 (wrapper),
     // pool seeds pages 1..init_pages.
     let pool_pages = init_pages - 1;
     // SAFETY: wrapper just constructed; offset/init_pages from a successful
-    // retype against `frame`.
+    // retype against `memory`.
     let res = unsafe {
-        (*cs_kobj_ptr).add_chunk(frame_obj_nn, frame_base, offset, init_pages, pool_pages)
+        (*cs_kobj_ptr).add_chunk(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
     };
     if res.is_err()
     {
@@ -693,9 +693,9 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(cs_ptr);
         }
         crate::cap::unregister_cspace(id);
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         // SAFETY: matches inc_ref above.
-        unsafe { frame_obj_nn.as_ref().dec_ref() };
+        unsafe { memory_obj_nn.as_ref().dec_ref() };
         return Err(SyscallError::OutOfMemory);
     }
 
@@ -716,12 +716,12 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let Ok(idx) = insert_res
     else
     {
-        // Roll back the registry slot, the frame inc_ref, the in-place
+        // Roll back the registry slot, the memory inc_ref, the in-place
         // wrapper/CSpace constructions, and the retype carve. Without
         // this rollback, a failed `insert_cap` would leak a live CSpace
-        // registry entry, leave `frame_obj_nn`'s refcount permanently
+        // registry entry, leave `memory_obj_nn`'s refcount permanently
         // incremented, and surrender the carved offset back to the
-        // retype allocator only when the source frame itself was
+        // retype allocator only when the source memory itself was
         // dec_ref'd to zero.
         crate::cap::unregister_cspace(id);
         // SAFETY: wrapper/cs not observed externally (no slot in any
@@ -731,9 +731,9 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(cs_kobj_ptr);
             core::ptr::drop_in_place(cs_ptr);
         }
-        retype_free(frame, offset, entry.raw_bytes);
-        // SAFETY: matches the `frame_obj_nn.as_ref().inc_ref()` above.
-        unsafe { frame_obj_nn.as_ref().dec_ref() };
+        retype_free(memory, offset, entry.raw_bytes);
+        // SAFETY: matches the `memory_obj_nn.as_ref().inc_ref()` above.
+        unsafe { memory_obj_nn.as_ref().dec_ref() };
         return Err(SyscallError::OutOfMemory);
     };
 
@@ -753,7 +753,7 @@ pub fn sys_cap_create_cspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
-    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, ThreadObject};
+    use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType, ThreadObject};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::message::Message;
@@ -770,7 +770,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
-    let frame_idx = tf.arg(0) as u32;
+    let memory_idx = tf.arg(0) as u32;
     #[allow(clippy::cast_possible_truncation)]
     // cast_possible_truncation: Seraph targets 64-bit only; cap slot indices fit in u32.
     let as_idx = tf.arg(1) as u32;
@@ -791,16 +791,16 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve the source Frame cap; consumes 5 retype-pages (4 kstack +
+    // Resolve the source Memory cap; consumes 5 retype-pages (4 kstack +
     // 1 wrapper/TCB).
     // SAFETY: caller_cspace validated non-null above.
-    let frame_slot_ref =
-        unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::RETYPE)? };
-    let frame_obj_nn = frame_slot_ref
+    let memory_slot_ref =
+        unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::RETYPE)? };
+    let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
-    // SAFETY: lookup_cap returned a live Frame slot.
-    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+    // SAFETY: lookup_cap returned a live Memory slot.
+    let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
     // Resolve AddressSpace cap.
     // SAFETY: caller_cspace validated non-null above.
@@ -828,7 +828,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         cs_obj.cspace
     };
 
-    // Reserve the 6-page slot from the source Frame cap. Layout:
+    // Reserve the 6-page slot from the source Memory cap. Layout:
     //   pages 0..3 (16 KiB) — kstack
     //   page 4              — ThreadObject (24 B) followed by TCB
     //   page 5              — per-thread FPU/SIMD/V save area
@@ -837,8 +837,8 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         entry.raw_bytes,
         (KERNEL_STACK_PAGES as u64 + 2) * PAGE_SIZE as u64
     );
-    let offset = retype_allocate(frame, entry.raw_bytes)?;
-    let block_phys = frame.base + offset;
+    let offset = retype_allocate(memory, entry.raw_bytes)?;
+    let block_phys = memory.base + offset;
     let block_virt = phys_to_virt(block_phys);
 
     let kstack_virt = block_virt;
@@ -875,7 +875,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         true,
     );
 
-    let ancestor = frame_obj_nn;
+    let ancestor = memory_obj_nn;
 
     // SAFETY: pointers are inside the freshly-allocated retype slot.
     // Both the wrapper and the TCB land on page 4 of the slot, so they
@@ -929,7 +929,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         );
     }
 
-    // SAFETY: ancestor is the FrameObject's header at offset 0; this lease
+    // SAFETY: ancestor is the MemoryObject's header at offset 0; this lease
     // bump is undone on rollback below or when the Thread cap is dealloc'd.
     unsafe { ancestor.as_ref().inc_ref() };
 
@@ -962,7 +962,7 @@ pub fn sys_cap_create_thread(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(tcb_ptr);
             core::ptr::drop_in_place(thread_obj_ptr);
         }
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         // SAFETY: matches the inc_ref above.
         unsafe { ancestor.as_ref().dec_ref() };
         Err(SyscallError::OutOfMemory)
@@ -1857,14 +1857,14 @@ pub fn sys_cap_move(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{EventQueueObject, FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{EventQueueObject, KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype::{EVENT_QUEUE_RING_OFFSET, dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::event_queue::EventQueueState;
     use core::ptr::NonNull;
     use syscall::EVENT_QUEUE_MAX_CAPACITY;
 
-    let frame_slot = tf.arg(0) as u32;
+    let memory_slot = tf.arg(0) as u32;
     let capacity = tf.arg(1) as u32;
     if capacity == 0 || capacity > EVENT_QUEUE_MAX_CAPACITY
     {
@@ -1885,20 +1885,20 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
     }
 
     // SAFETY: cspace validated; lookup_cap checks tag and rights.
-    let frame_slot_ref =
-        unsafe { super::lookup_cap(cspace, frame_slot, CapTag::Frame, Rights::RETYPE)? };
-    let frame_obj_nn = frame_slot_ref
+    let memory_slot_ref =
+        unsafe { super::lookup_cap(cspace, memory_slot, CapTag::Memory, Rights::RETYPE)? };
+    let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
-    // SAFETY: lookup_cap returned a live Frame slot.
-    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+    // SAFETY: lookup_cap returned a live Memory slot.
+    let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
     let entry = dispatch_for(ObjectType::EventQueue, u64::from(capacity))
         .ok_or(SyscallError::InvalidArgument)?;
 
-    let offset = retype_allocate(frame, entry.raw_bytes)?;
+    let offset = retype_allocate(memory, entry.raw_bytes)?;
 
-    let block_phys = frame.base + offset;
+    let block_phys = memory.base + offset;
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout (matches `cap::retype::event_queue_raw_bytes`):
@@ -1911,7 +1911,7 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
     let ring_ptr = (block_virt + EVENT_QUEUE_RING_OFFSET) as *mut u64;
     let ring_len = (capacity as usize) + 1;
 
-    let ancestor = frame_obj_nn;
+    let ancestor = memory_obj_nn;
 
     // SAFETY: pointers are inside the freshly-allocated retype slot.
     // The ring lives inline; zero it first since retype memory is not
@@ -1929,7 +1929,7 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
         );
     }
 
-    // SAFETY: ancestor is the FrameObject's header at offset 0.
+    // SAFETY: ancestor is the MemoryObject's header at offset 0.
     unsafe { ancestor.as_ref().inc_ref() };
 
     // SAFETY: header at offset 0 of EventQueueObject.
@@ -1959,27 +1959,27 @@ pub fn sys_cap_create_event_queue(tf: &mut TrapFrame) -> Result<u64, SyscallErro
             core::ptr::drop_in_place(eq_state_ptr);
             core::ptr::drop_in_place(eq_obj_ptr);
         }
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         // SAFETY: matches the inc_ref above.
         unsafe { ancestor.as_ref().dec_ref() };
         Err(SyscallError::OutOfMemory)
     }
 }
 
-/// `SYS_CAP_CREATE_WAIT_SET` (13): retype a Frame cap into a new `WaitSet`.
+/// `SYS_CAP_CREATE_WAIT_SET` (13): retype a Memory cap into a new `WaitSet`.
 ///
-/// arg0 = Frame-cap slot. The Frame cap MUST carry `Rights::RETYPE` and have
+/// arg0 = Memory-cap slot. The Memory cap MUST carry `Rights::RETYPE` and have
 /// at least `dispatch_for(WaitSet, 0).raw_bytes` (504) of `available_bytes`.
 #[cfg(not(test))]
 pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType, WaitSetObject};
+    use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType, WaitSetObject};
     use crate::cap::retype::{dispatch_for, retype_allocate, retype_free};
     use crate::cap::slot::{CapTag, Rights};
     use crate::ipc::wait_set::WaitSetState;
     use core::ptr::NonNull;
 
-    let frame_slot = tf.arg(0) as u32;
+    let memory_slot = tf.arg(0) as u32;
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
     let tcb = unsafe { current_tcb() };
@@ -1995,19 +1995,19 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // SAFETY: cspace validated; lookup_cap checks tag and rights.
-    let frame_slot_ref =
-        unsafe { super::lookup_cap(cspace, frame_slot, CapTag::Frame, Rights::RETYPE)? };
-    let frame_obj_nn = frame_slot_ref
+    let memory_slot_ref =
+        unsafe { super::lookup_cap(cspace, memory_slot, CapTag::Memory, Rights::RETYPE)? };
+    let memory_obj_nn = memory_slot_ref
         .object
         .ok_or(SyscallError::InvalidCapability)?;
-    // SAFETY: lookup_cap returned a live Frame slot.
-    let frame = unsafe { &*frame_obj_nn.as_ptr().cast::<FrameObject>() };
+    // SAFETY: lookup_cap returned a live Memory slot.
+    let memory = unsafe { &*memory_obj_nn.as_ptr().cast::<MemoryObject>() };
 
     let entry = dispatch_for(ObjectType::WaitSet, 0).ok_or(SyscallError::InvalidArgument)?;
 
-    let offset = retype_allocate(frame, entry.raw_bytes)?;
+    let offset = retype_allocate(memory, entry.raw_bytes)?;
 
-    let block_phys = frame.base + offset;
+    let block_phys = memory.base + offset;
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: WaitSetObject at offset 0; WaitSetState at offset 24.
@@ -2015,7 +2015,7 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let state_offset = core::mem::size_of::<WaitSetObject>() as u64;
     let ws_state_ptr = (block_virt + state_offset) as *mut WaitSetState;
 
-    let ancestor = frame_obj_nn;
+    let ancestor = memory_obj_nn;
 
     // SAFETY: pointers are inside the freshly-allocated retype slot.
     unsafe {
@@ -2029,7 +2029,7 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         );
     }
 
-    // SAFETY: ancestor is the FrameObject's header at offset 0.
+    // SAFETY: ancestor is the MemoryObject's header at offset 0.
     unsafe { ancestor.as_ref().inc_ref() };
 
     // SAFETY: header at offset 0 of WaitSetObject.
@@ -2055,7 +2055,7 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             core::ptr::drop_in_place(ws_obj_ptr);
             core::ptr::drop_in_place(ws_state_ptr);
         }
-        retype_free(frame, offset, entry.raw_bytes);
+        retype_free(memory, offset, entry.raw_bytes);
         // SAFETY: matches the inc_ref above.
         unsafe { ancestor.as_ref().dec_ref() };
         Err(SyscallError::OutOfMemory)
@@ -2074,8 +2074,8 @@ pub fn sys_cap_create_wait_set(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// # Field selectors
 /// - [`syscall::CAP_INFO_TAG_RIGHTS`] — universal; returns
 ///   `((tag as u8 as u64) << 32) | (rights.0 as u64)`.
-/// - [`syscall::CAP_INFO_FRAME_SIZE`] / `_AVAILABLE` / `_HAS_RETYPE` —
-///   require `CapTag::Frame`.
+/// - [`syscall::CAP_INFO_MEMORY_SIZE`] / `_AVAILABLE` / `_HAS_RETYPE` —
+///   require `CapTag::Memory`.
 /// - [`syscall::CAP_INFO_ASPACE_PT_BUDGET`] — requires `CapTag::AddressSpace`.
 /// - [`syscall::CAP_INFO_CSPACE_CAPACITY`] / `_USED` / `_BUDGET` —
 ///   require `CapTag::CSpace`.
@@ -2097,13 +2097,13 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     use syscall::{
         CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
-        CAP_INFO_CSPACE_USED, CAP_INFO_FRAME_AVAILABLE, CAP_INFO_FRAME_HAS_RETYPE,
-        CAP_INFO_FRAME_PHYS_BASE, CAP_INFO_FRAME_SIZE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE,
-        CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED,
-        THREAD_STATE_EXITED,
+        CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
+        CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS,
+        CAP_INFO_THREAD_STATE, CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE,
+        THREAD_STATE_CREATED, THREAD_STATE_EXITED,
     };
 
-    use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, FrameObject, ThreadObject};
+    use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, MemoryObject, ThreadObject};
     use crate::cap::slot::{CapTag, Rights};
     use crate::sched::thread::ThreadState;
 
@@ -2154,47 +2154,47 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             Ok(crate::percpu::ctxsw_flush_totals().0)
         }
         CAP_INFO_TLB_PERFORMED => Ok(crate::percpu::ctxsw_flush_totals().1),
-        CAP_INFO_FRAME_SIZE =>
+        CAP_INFO_MEMORY_SIZE =>
         {
-            if tag != CapTag::Frame
+            if tag != CapTag::Memory
             {
                 return Err(SyscallError::InvalidArgument);
             }
-            // SAFETY: tag confirmed Frame; header is at offset 0 of FrameObject.
-            // cast_ptr_alignment: FrameObject (8-byte aligned via Box) holds the header at offset 0.
+            // SAFETY: tag confirmed Memory; header is at offset 0 of MemoryObject.
+            // cast_ptr_alignment: MemoryObject (8-byte aligned via Box) holds the header at offset 0.
             #[allow(clippy::cast_ptr_alignment)]
-            let frame = unsafe { &*(obj.as_ptr().cast::<FrameObject>()) };
-            Ok(frame.size)
+            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            Ok(memory.size)
         }
-        CAP_INFO_FRAME_AVAILABLE =>
+        CAP_INFO_MEMORY_AVAILABLE =>
         {
-            if tag != CapTag::Frame
+            if tag != CapTag::Memory
             {
                 return Err(SyscallError::InvalidArgument);
             }
-            // SAFETY: tag confirmed Frame.
+            // SAFETY: tag confirmed Memory.
             #[allow(clippy::cast_ptr_alignment)]
-            let frame = unsafe { &*(obj.as_ptr().cast::<FrameObject>()) };
-            Ok(frame.available_bytes.load(Ordering::Acquire))
+            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            Ok(memory.available_bytes.load(Ordering::Acquire))
         }
-        CAP_INFO_FRAME_HAS_RETYPE =>
+        CAP_INFO_MEMORY_HAS_RETYPE =>
         {
-            if tag != CapTag::Frame
+            if tag != CapTag::Memory
             {
                 return Err(SyscallError::InvalidArgument);
             }
             Ok(u64::from(rights.contains(Rights::RETYPE)))
         }
-        CAP_INFO_FRAME_PHYS_BASE =>
+        CAP_INFO_MEMORY_PHYS_BASE =>
         {
-            if tag != CapTag::Frame
+            if tag != CapTag::Memory
             {
                 return Err(SyscallError::InvalidArgument);
             }
-            // SAFETY: tag confirmed Frame.
+            // SAFETY: tag confirmed Memory.
             #[allow(clippy::cast_ptr_alignment)]
-            let frame = unsafe { &*(obj.as_ptr().cast::<FrameObject>()) };
-            Ok(frame.base)
+            let memory = unsafe { &*(obj.as_ptr().cast::<MemoryObject>()) };
+            Ok(memory.base)
         }
         CAP_INFO_THREAD_STATE =>
         {

@@ -5,26 +5,26 @@
 
 //! Page-granular sector cache for FAT block I/O.
 //!
-//! 128 single-page slots, each backed by a Frame cap mapped into the fs
+//! 128 single-page slots, each backed by a Memory cap mapped into the fs
 //! process's address space at a fixed VA. Each slot holds one *page* of
 //! contiguous on-disk sectors (`SECTORS_PER_PAGE` = 8 for a 4 KiB page).
 //! Slots are keyed on the page-aligned LBA-base (`lba & !7`); a single
-//! cache miss fills all 8 sectors via one `BLK_READ_INTO_FRAME` IPC,
+//! cache miss fills all 8 sectors via one `BLK_READ_INTO_MEMORY` IPC,
 //! amortising the round-trip cost over the page. LRU eviction by
 //! monotonic sequence counter; only slots with `refcount == 0` are
 //! eviction candidates.
 //!
-//! Fill path: issue `BLK_READ_INTO_FRAME` with `data[0]` = page-base LBA
-//! and `data[1]` = `SECTORS_PER_PAGE`, transferring the slot's Frame cap
+//! Fill path: issue `BLK_READ_INTO_MEMORY` with `data[0]` = page-base LBA
+//! and `data[1]` = `SECTORS_PER_PAGE`, transferring the slot's Memory cap
 //! as `caps[0]`. The driver DMAs `SECTORS_PER_PAGE * 512` bytes directly
-//! into the slot's frame at offset 0 (per the wire contract) and returns
+//! into the slot's memory cap at offset 0 (per the wire contract) and returns
 //! the cap in the reply. The cap may land at a different `CSpace` slot
-//! index on return, so the slot's `frame_cap` is updated from
-//! `reply.caps()[0]`; the underlying `FrameObject` identity is preserved
+//! index on return, so the slot's `memory_cap` is updated from
+//! `reply.caps()[0]`; the underlying `MemoryObject` identity is preserved
 //! through the move, and the existing AS mapping at the slot's VA
 //! continues to point at the same physical pages.
 //!
-//! Slot caps are minted once at startup via memmgr `REQUEST_FRAMES` with
+//! Slot caps are minted once at startup via memmgr `REQUEST_MEMORY_CAPS` with
 //! the `REQUIRE_CONTIGUOUS` flag (one IPC per slot — slot count is bounded
 //! and the round-trip cost is paid once). Each slot's mapping is held for
 //! the fs process's lifetime; the reservation is intentionally leaked
@@ -39,31 +39,31 @@ use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
 use crate::bpb::SECTOR_SIZE;
 
-/// Process-static scratch frame used for single-sector writeback in
+/// Process-static scratch memory cap used for single-sector writeback in
 /// [`PageCache::write_sector`].
 ///
 /// virtio-blk DMAs sector data starting at offset 0 of the supplied
-/// frame, so we cannot pass a cache page directly when only one of its
+/// memory cap, so we cannot pass a cache page directly when only one of its
 /// eight sectors has been dirtied (the device would over-write the
 /// other seven on the disk side using whatever happened to be in the
-/// page). The scratch frame holds a single 512-byte sector copy per
+/// page). The scratch memory cap holds a single 512-byte sector copy per
 /// write and is reused across calls; allocated lazily on first write
 /// and held for the process lifetime.
-static SCRATCH_FRAME: OnceLock<ScratchFrame> = OnceLock::new();
+static SCRATCH_MEMORY: OnceLock<ScratchMemory> = OnceLock::new();
 
-struct ScratchFrame
+struct ScratchMemory
 {
     cap: AtomicU32,
     va: u64,
 }
 
-// SAFETY: ScratchFrame holds an AtomicU32 cap (Sync by construction) and
+// SAFETY: ScratchMemory holds an AtomicU32 cap (Sync by construction) and
 // a raw VA value (u64) that is process-static. Concurrent callers
-// serialise their use of the frame via the cap_swap dance in
+// serialise their use of the memory cap via the cap_swap dance in
 // write_sector, not via Rust borrow checking.
-unsafe impl Send for ScratchFrame {}
+unsafe impl Send for ScratchMemory {}
 // SAFETY: see Send above — same justification.
-unsafe impl Sync for ScratchFrame {}
+unsafe impl Sync for ScratchMemory {}
 
 /// Number of cache slots.
 pub const SLOT_COUNT: usize = 128;
@@ -79,20 +79,20 @@ const PAGE_BASE_EMPTY: u64 = u64::MAX;
 
 /// One cache slot. Holds `SECTORS_PER_PAGE` consecutive sectors starting
 /// at `page_lba_base`, packed contiguously from offset 0 of the slot's
-/// frame.
+/// memory cap.
 struct CacheSlot
 {
     /// Page-aligned starting LBA (`SECTORS_PER_PAGE`-multiple) of the
     /// sector run cached here. `PAGE_BASE_EMPTY` if unfilled.
     page_lba_base: AtomicU64,
-    /// `CSpace` slot index of the Frame cap backing this cache page.
+    /// `CSpace` slot index of the Memory cap backing this cache page.
     ///
-    /// Atomic because each `BLK_READ_INTO_FRAME` round trip moves the cap
+    /// Atomic because each `BLK_READ_INTO_MEMORY` round trip moves the cap
     /// out and back; the kernel may install the returned cap at a
     /// different `CSpace` index, so the field is rewritten on every fill.
     /// Synchronisation is via the slot `refcount` `AcqRel` pair — readers
-    /// load `frame_cap` only after a successful refcount bump.
-    frame_cap: AtomicU32,
+    /// load `memory_cap` only after a successful refcount bump.
+    memory_cap: AtomicU32,
     va: u64,
     refcount: AtomicU32,
     lru_seq: AtomicU64,
@@ -115,14 +115,14 @@ pub enum InitError
     Memmgr,
     /// VA arena is exhausted.
     Reserve,
-    /// `mem_map` failed for one of the slot frames.
+    /// `mem_map` failed for one of the slot memory caps.
     Map,
 }
 
 impl PageCache
 {
-    /// Allocate `SLOT_COUNT` single-page Frame caps, reserve a contiguous
-    /// VA window, map each frame into its slot's VA, and return the
+    /// Allocate `SLOT_COUNT` single-page Memory caps, reserve a contiguous
+    /// VA window, map each memory cap into its slot's VA, and return the
     /// process-static cache.
     pub fn init(
         memmgr_ep: u32,
@@ -146,7 +146,7 @@ impl PageCache
         let cache: &'static mut Self = Box::leak(Box::new(Self {
             slots: core::array::from_fn(|i| CacheSlot {
                 page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
-                frame_cap: AtomicU32::new(0),
+                memory_cap: AtomicU32::new(0),
                 va: base_va + (i as u64) * PAGE_SIZE,
                 refcount: AtomicU32::new(0),
                 lru_seq: AtomicU64::new(0),
@@ -162,10 +162,10 @@ impl PageCache
             // process exit (no caller-side cleanup needed).
             syscall::mem_map(cap, self_aspace, slot.va, 0, 1, MAP_WRITABLE)
                 .map_err(|_| InitError::Map)?;
-            slot.frame_cap.store(cap, Ordering::Release);
+            slot.memory_cap.store(cap, Ordering::Release);
         }
 
-        // Allocate and map the single-page scratch frame used for
+        // Allocate and map the single-page scratch memory cap used for
         // single-sector writeback in `write_sector`. Lazy fallback would
         // need to re-do the request/reserve/map dance under an Ordering
         // discipline; doing it once at startup keeps `write_sector`
@@ -174,8 +174,8 @@ impl PageCache
         let scratch_cap = request_one_page(memmgr_ep, ipc_buf).ok_or(InitError::Memmgr)?;
         syscall::mem_map(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE)
             .map_err(|_| InitError::Map)?;
-        SCRATCH_FRAME
-            .set(ScratchFrame {
+        SCRATCH_MEMORY
+            .set(ScratchMemory {
                 cap: AtomicU32::new(scratch_cap),
                 va: scratch_va,
             })
@@ -187,16 +187,16 @@ impl PageCache
     /// Write one 512-byte sector through the cache (write-through).
     ///
     /// Acquires the page covering `lba`, updates the affected sector in
-    /// place within the cached page (so any outstanding `FS_READ_FRAME`
+    /// place within the cached page (so any outstanding `FS_READ_MEMORY`
     /// cap aliasing that page observes the new bytes immediately), then
-    /// copies the same sector into a process-static scratch frame and
-    /// issues one `BLK_WRITE_FROM_FRAME` against the block device.
+    /// copies the same sector into a process-static scratch memory cap and
+    /// issues one `BLK_WRITE_FROM_MEMORY` against the block device.
     ///
     /// Single-sector writeback only. Multi-sector cache pages cannot be
     /// flushed as a unit because the unmodified neighbouring sectors
     /// have no known-good source if the write fails mid-flight.
     ///
-    /// Returns `false` on cache acquire failure, missing scratch frame
+    /// Returns `false` on cache acquire failure, missing scratch memory cap
     /// (cache init never ran), or block-driver error.
     pub fn write_sector(
         &self,
@@ -206,7 +206,7 @@ impl PageCache
         ipc_buf: *mut u64,
     ) -> bool
     {
-        let Some(scratch) = SCRATCH_FRAME.get()
+        let Some(scratch) = SCRATCH_MEMORY.get()
         else
         {
             return false;
@@ -223,7 +223,7 @@ impl PageCache
 
         // SAFETY: refcount > 0 for the duration of these borrows. The
         // cache page is single-process owned and mapped writable; the
-        // scratch frame VA is process-static and mapped writable. Both
+        // scratch memory-cap VA is process-static and mapped writable. Both
         // are 512-byte sector copies into pages this process owns.
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -240,7 +240,7 @@ impl PageCache
     }
 
     /// Read one 512-byte sector through the cache into `buf`. Single-call
-    /// helper for callers that don't need the underlying frame: handles
+    /// helper for callers that don't need the underlying memory cap: handles
     /// page-fill-on-miss, hit refcounting, and release.
     pub fn read_sector(
         &self,
@@ -293,14 +293,14 @@ impl PageCache
         self.get_or_fill(page_lba_base, block_dev, ipc_buf)
     }
 
-    /// Snapshot the Frame cap currently backing slot `idx`.
+    /// Snapshot the Memory cap currently backing slot `idx`.
     ///
     /// Returns `0` if the slot is in a degraded state (cap lost on a
     /// previous fill failure). Callers must hold a refcount on the slot
     /// before observing the cap.
-    pub fn slot_frame_cap(&self, idx: usize) -> u32
+    pub fn slot_memory_cap(&self, idx: usize) -> u32
     {
-        self.slots[idx].frame_cap.load(Ordering::Acquire)
+        self.slots[idx].memory_cap.load(Ordering::Acquire)
     }
 
     /// Drop a refcount on slot `idx`. Pair with [`acquire_page`].
@@ -388,22 +388,22 @@ pub fn page_base_of(lba: u64) -> u64
 }
 
 /// Fill `slot` with `SECTORS_PER_PAGE` consecutive sectors starting at
-/// `page_lba_base`, by issuing one `BLK_READ_INTO_FRAME` against the
+/// `page_lba_base`, by issuing one `BLK_READ_INTO_MEMORY` against the
 /// block device.
 ///
-/// The slot's Frame cap is moved to the driver as `caps[0]` and moved
+/// The slot's Memory cap is moved to the driver as `caps[0]` and moved
 /// back in the reply (typically — but not necessarily — to the same
-/// `CSpace` slot index). `slot.frame_cap` is rewritten from
+/// `CSpace` slot index). `slot.memory_cap` is rewritten from
 /// `reply.caps()[0]` on every outcome so the cache and the kernel agree
 /// on where the cap lives. The AS mapping at `slot.va` is unaffected by
 /// the move because mappings are page-table-resident and keyed on the
-/// underlying `FrameObject`'s physical pages, which the move preserves.
+/// underlying `MemoryObject`'s physical pages, which the move preserves.
 ///
 /// Returns `false` on any failure path (IPC error, driver error, missing
-/// returned cap). On `false`, the slot's `frame_cap` is left at whatever
+/// returned cap). On `false`, the slot's `memory_cap` is left at whatever
 /// the kernel put back: the caller invalidates the slot's page base
 /// before calling, so a broken slot is naturally not hit by future
-/// lookups even if its cap is genuinely lost (`frame_cap == 0`).
+/// lookups even if its cap is genuinely lost (`memory_cap == 0`).
 fn fill_via_block_dev(
     slot: &CacheSlot,
     page_lba_base: u64,
@@ -411,12 +411,12 @@ fn fill_via_block_dev(
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let cap = slot.frame_cap.load(Ordering::Acquire);
+    let cap = slot.memory_cap.load(Ordering::Acquire);
     if cap == 0
     {
         return false;
     }
-    let msg = IpcMessage::builder(blk_labels::BLK_READ_INTO_FRAME)
+    let msg = IpcMessage::builder(blk_labels::BLK_READ_INTO_MEMORY)
         .word(0, page_lba_base)
         .word(1, SECTORS_PER_PAGE)
         .cap(cap)
@@ -427,22 +427,22 @@ fn fill_via_block_dev(
     {
         // Cap was moved out and never returned (kernel-level failure).
         // Mark the slot as having no cap so it won't be reused for fills.
-        slot.frame_cap.store(0, Ordering::Release);
+        slot.memory_cap.store(0, Ordering::Release);
         return false;
     };
     let returned = reply.caps().first().copied().unwrap_or(0);
-    slot.frame_cap.store(returned, Ordering::Release);
+    slot.memory_cap.store(returned, Ordering::Release);
     reply.label == blk_errors::SUCCESS && returned != 0
 }
 
-/// Issue `BLK_WRITE_FROM_FRAME` with the scratch frame as the source.
+/// Issue `BLK_WRITE_FROM_MEMORY` with the scratch memory cap as the source.
 ///
 /// Mirrors [`fill_via_block_dev`] for the write direction. The scratch
-/// frame's cap is moved out and back across the call; the returned cap
+/// memory cap is moved out and back across the call; the returned cap
 /// (which may land at a different `CSpace` index) is restored in
 /// `scratch.cap`.
 fn writeback_via_block_dev(
-    scratch: &ScratchFrame,
+    scratch: &ScratchMemory,
     lba: u64,
     block_dev: u32,
     ipc_buf: *mut u64,
@@ -453,7 +453,7 @@ fn writeback_via_block_dev(
     {
         return false;
     }
-    let msg = IpcMessage::builder(blk_labels::BLK_WRITE_FROM_FRAME)
+    let msg = IpcMessage::builder(blk_labels::BLK_WRITE_FROM_MEMORY)
         .word(0, lba)
         .word(1, 1)
         .cap(cap)
@@ -470,11 +470,11 @@ fn writeback_via_block_dev(
     reply.label == blk_errors::SUCCESS && returned != 0
 }
 
-/// Acquire one single-page Frame cap from memmgr.
+/// Acquire one single-page Memory cap from memmgr.
 fn request_one_page(memmgr_ep: u32, ipc_buf: *mut u64) -> Option<u32>
 {
     let arg = 1u64 | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
-    let req = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+    let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, arg)
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.

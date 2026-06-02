@@ -41,7 +41,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     crate::log("cap_delegation_chain: starting");
 
     // Root cap: full NOTIFY+WAIT rights.
-    let root = cap_create_notification(ctx.memory_frame_base)
+    let root = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_delegation_chain: cap_create_notification failed")?;
 
     // ── Level 1: derive from root with NOTIFY only ────────────────────────────

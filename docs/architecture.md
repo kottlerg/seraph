@@ -187,8 +187,8 @@ DMA isolation is exclusively a userspace concern. devmgr discovers IOMMU
 hardware (via firmware-table passthrough), programs the translation tables
 itself, and authorises DMA on a per-device basis. The kernel reads no
 IOMMU registers, holds no per-device DMA state, and exposes no DMA-grant
-syscall. Frame physical-base addresses (which DMA-issuing drivers program
-into device transports) reach drivers through memmgr's `REQUEST_FRAMES`
+syscall. Memory physical-base addresses (which DMA-issuing drivers program
+into device transports) reach drivers through memmgr's `REQUEST_MEMORY_CAPS`
 reply. See `device-management.md`.
 
 **Interrupts**

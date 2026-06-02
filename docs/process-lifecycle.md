@@ -30,9 +30,9 @@ kernel (Phase 9 handoff)
    ▼
 init                  no_std; receives the full initial CSpace
    │
-   ├── spawns memmgr   no_std; receives all RAM Frame caps
+   ├── spawns memmgr   no_std; receives all RAM Memory caps
    │     │
-   │     └── ready to serve REQUEST_FRAMES
+   │     └── ready to serve REQUEST_MEMORY_CAPS
    │
    ├── spawns procmgr  std-using; bootstraps its heap via memmgr
    │     │
@@ -61,9 +61,9 @@ applications) is std-built and bootstraps its heap via memmgr.
 The kernel hands init the maximal capability set in init's CSpace
 (see [`capability-model.md`](capability-model.md) §"Initial Capability
 Distribution") and the `InitInfo` page at `INIT_INFO_VADDR` describing
-it. `InitInfo.memory_frame_base` and `InitInfo.memory_frame_count`
+it. `InitInfo.memory_base` and `InitInfo.memory_count`
 identify the contiguous slot range in init's CSpace holding the RAM
-Frame caps.
+Memory caps.
 
 Init never gives up the kernel-minted root caps directly — it derives
 intermediaries (the "derive twice" pattern in
@@ -74,17 +74,17 @@ revoke if a service misbehaves before svcmgr takes over supervision.
 ### Init → memmgr
 
 Init creates memmgr's `AddressSpace`, `CSpace`, and `Thread` via raw
-syscalls. It loads memmgr's ELF (from a boot module Frame cap), maps
+syscalls. It loads memmgr's ELF (from a boot module Memory cap), maps
 the segments into memmgr's address space, populates memmgr's
-`ProcessInfo`, copies every RAM Frame cap from init's CSpace into
+`ProcessInfo`, copies every RAM Memory cap from init's CSpace into
 memmgr's CSpace using derive-twice, and starts memmgr's thread.
 
 Init then serves a single bootstrap-IPC round to memmgr carrying the
-Frame slot range `(memory_frame_base, memory_frame_count)` so memmgr
+Memory slot range `(memory_base, memory_count)` so memmgr
 knows where in its own CSpace the pool lives.
 
-After this step, memmgr is ready: it serves `REQUEST_FRAMES`,
-`RELEASE_FRAMES`, `REGISTER_PROCESS`, and `PROCESS_DIED` (the last two
+After this step, memmgr is ready: it serves `REQUEST_MEMORY_CAPS`,
+`RELEASE_MEMORY_CAPS`, `REGISTER_PROCESS`, and `PROCESS_DIED` (the last two
 restricted to procmgr; see [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)).
 
 memmgr is `no_std` and inherits the constraint that motivated the split:
@@ -101,7 +101,7 @@ init:
 2. Installs that cap into procmgr's `ProcessInfo.memmgr_endpoint_cap`
    so procmgr's std `_start` finds memmgr on its first IPC.
 3. Starts procmgr's thread. Procmgr's heap-bootstrap path issues
-   `REQUEST_FRAMES` on `ProcessInfo.memmgr_endpoint_cap` and the
+   `REQUEST_MEMORY_CAPS` on `ProcessInfo.memmgr_endpoint_cap` and the
    `System` allocator comes online.
 
 Procmgr is the first std-using process in the system. Every later
@@ -152,7 +152,7 @@ plus any staged test recipes such as `svctest.svc` / `usertest.svc` and
 the co-staged `crasher.svc` restart fixture), init signs over its own
 kernel-object caps
 (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) and
-every reclaimable Frame cap it solely owns (ELF segments, user stack
+every reclaimable Memory cap it solely owns (ELF segments, user stack
 pages, `InitInfo` pages, the bootloader/bundle reclaim ranges, the
 AP-trampoline frame, and the boot-module ELF sources) to
 procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN`, then
@@ -160,7 +160,7 @@ procmgr via `procmgr_labels::REGISTER_INIT_TEARDOWN`, then
 firmware read-only caps (RSDP/ACPI/DTB) are excluded. init's own
 bootstrap backing — its endpoint and log-thread retype slabs plus the
 offset-mapped IPC buffer and log-thread stack/IPC — is not in this set:
-it lives in a single contiguous arena Frame cap that init forwards to
+it lives in a single contiguous arena Memory cap that init forwards to
 memmgr as an in-use run at bootstrap (`finalize_memmgr`), so those pages
 are already accounted in memmgr's pool and never reach the reap route.
 
@@ -171,7 +171,7 @@ master log endpoint until the svcmgr-launched real-logd pulls its
 handover, so it outlives main; reclaiming init's address space while a
 thread still runs in it would fault that thread. On the last death procmgr
 tears down init's kernel objects in order (Threads → AddressSpace → donate
-Frame caps to memmgr → CSpace cascade), leaving zero init residue. The
+Memory caps to memmgr → CSpace cascade), leaving zero init residue. The
 implementation is in
 [`services/procmgr/README.md`](../services/procmgr/README.md) §"Init
 reap".
@@ -194,10 +194,10 @@ memmgr and procmgr are sister tier-1 services with disjoint authority:
 | Process registry and lifecycle queries | procmgr |
 | Service supervision and restart | svcmgr (post-init) |
 
-Procmgr is itself a memmgr client. Its heap is backed by `REQUEST_FRAMES`,
+Procmgr is itself a memmgr client. Its heap is backed by `REQUEST_MEMORY_CAPS`,
 its driver-allocated DMA frames (during ELF-load scratch and `ProcessInfo`
-population) come from the same path. Procmgr never sees a Frame cap that
-did not originate in memmgr — except for the boot-module ELF Frame caps
+population) come from the same path. Procmgr never sees a Memory cap that
+did not originate in memmgr — except for the boot-module ELF Memory caps
 that init transfers to it for ELF loading, which procmgr consumes as
 read-only sources.
 
@@ -240,7 +240,7 @@ at creation time. Examples:
   which also equals the death-EQ correlator procmgr posts to
   logd. Identity is reconciled across the three views without
   any auxiliary mapping.
-- `InitInfo.memory_frame_base`, `InitInfo.memory_frame_count` — chosen
+- `InitInfo.memory_base`, `InitInfo.memory_count` — chosen
   by the kernel per init invocation.
 
 ### ABI constants
@@ -275,7 +275,7 @@ After bootstrap, every process is created by procmgr. The flow:
 4. **Procmgr kernel-object allocation.** Procmgr creates the new
    process's `AddressSpace`, `CSpace`, and `Thread` via the
    `cap_create_*` syscalls.
-5. **Procmgr → memmgr (frames).** Procmgr requests Frame caps from
+5. **Procmgr → memmgr (frames).** Procmgr requests Memory caps from
    memmgr to back the child's stack, IPC buffer, `ProcessInfo` page,
    TLS block, and ELF segments. These calls go over procmgr's own
    `memmgr_endpoint_cap`, so memmgr accounts the frames against
@@ -285,18 +285,18 @@ After bootstrap, every process is created by procmgr. The flow:
    into the child's address space at procmgr-chosen VAs, copies ELF
    segment bytes, populates `ProcessInfo` (including
    `memmgr_endpoint_cap` from step 3 and the procmgr/log endpoints).
-7. **Procmgr transfers ownership.** For each Frame cap that should
+7. **Procmgr transfers ownership.** For each Memory cap that should
    belong to the child, procmgr derives a copy into the child's CSpace
-   and informs memmgr (a single `RELEASE_FRAMES`-style accounting
+   and informs memmgr (a single `RELEASE_MEMORY_CAPS`-style accounting
    message; or memmgr accepts the transfer as part of `REGISTER_PROCESS`
    bookkeeping — concrete shape lives in
    [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)).
 8. **Procmgr starts the thread.** `thread_configure` + `thread_start`.
    The child's std `_start` registers its IPC buffer, bootstraps the
-   heap by calling `REQUEST_FRAMES` on its own
+   heap by calling `REQUEST_MEMORY_CAPS` on its own
    `memmgr_endpoint_cap`, and enters `main()`.
 9. **Procmgr replies to caller.** `CREATE_PROCESS` returns the
-   process handle, child CSpace cap, `ProcessInfo` frame cap, and
+   process handle, child CSpace cap, `ProcessInfo` memory cap, and
    thread cap to the original caller.
 
 A process created via `CREATE_PROCESS` is suspended until
@@ -323,15 +323,15 @@ The death-notification flow:
    transferring the dead process's badged endpoint cap. The cap's
    badge identifies which per-process record memmgr reclaims.
 3. **Memmgr reclaims.** Memmgr walks the per-process frame list and
-   inserts each Frame cap back into its free pool.
-4. **Memmgr coalesces.** Reverse-`frame_split` merges adjacent free
+   inserts each Memory cap back into its free pool.
+4. **Memmgr coalesces.** Reverse-`memory_split` merges adjacent free
    runs to sustain `REQUIRE_CONTIGUOUS` success rates. See
-   [`memmgr/docs/frame-pool.md`](../services/memmgr/docs/frame-pool.md)
+   [`memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md)
    §"Coalescing".
 5. **Procmgr clears its registry entry.** Independent of memmgr's
    reclamation; the procmgr-side process table releases its slot.
 
-Frame caps the dead process held in its CSpace become unreachable as
+Memory caps the dead process held in its CSpace become unreachable as
 part of the kernel's CSpace teardown when the `AddressSpace` is
 revoked. Memmgr's intermediary derivations (retained at allocation time
 per the derive-twice pattern) are unaffected and are what the
@@ -364,7 +364,7 @@ fault. svcmgr does not restart memmgr.
 
 Seraph does not implement `fork()` or copy-on-write. Process creation
 is always from-scratch via `CREATE_PROCESS`; zero-copy buffer handoff
-between processes uses Frame-cap moves over IPC.
+between processes uses Memory-cap moves over IPC.
 
 Page faults are not delivered to userspace; faulting threads terminate,
 which surfaces through the normal process-death notification flow above.

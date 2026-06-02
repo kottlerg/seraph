@@ -160,7 +160,7 @@ impl WaitSetMember
 /// Sized to fit, together with the 24 B `WaitSetObject` wrapper, inside
 /// the 512 B retype bin (≈ 440 B: 16 × 24 B members, plus ready ring,
 /// waiter pointer, and bookkeeping). The cap-create path constructs
-/// both objects in place inside the source `Frame` cap's region;
+/// both objects in place inside the source `Memory` cap's region;
 /// nothing is heap-allocated.
 pub struct WaitSetState
 {

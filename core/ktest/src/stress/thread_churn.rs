@@ -17,7 +17,7 @@ const ITERATIONS: usize = 1000;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let done = cap_create_notification(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "thread_churn: create_notification failed")?;
 
     for _i in 0..ITERATIONS

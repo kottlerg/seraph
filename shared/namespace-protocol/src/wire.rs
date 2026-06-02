@@ -50,16 +50,16 @@ pub enum NsError
     InvalidName = 5,
     /// Read offset is out of range for the addressed file.
     InvalidOffset = 6,
-    /// `NS_READ_FRAME` reply target frame cap is missing required
+    /// `NS_READ_MEMORY` reply target Memory cap is missing required
     /// rights or has the wrong shape. Preserved from the existing
     /// fs-frame protocol.
-    InvalidFrameCap = 7,
-    /// `NS_READ_FRAME` cookie is invalid (e.g., zero, or duplicates an
+    InvalidMemoryCap = 7,
+    /// `NS_READ_MEMORY` cookie is invalid (e.g., zero, or duplicates an
     /// outstanding cookie). Preserved from the existing fs-frame
     /// protocol.
     InvalidCookie = 8,
-    /// Frame referenced by a held cookie has been evicted; the client
-    /// MUST drop the stale frame cap and reissue. Preserved from the
+    /// Page referenced by a held cookie has been evicted; the client
+    /// MUST drop the stale Memory cap and reissue. Preserved from the
     /// existing fs-frame protocol.
     Evicted = 9,
     /// Backend storage failed (disk read error, filesystem
@@ -101,7 +101,7 @@ mod tests
         assert_eq!(NsError::IsADirectory.as_label(), 4);
         assert_eq!(NsError::InvalidName.as_label(), 5);
         assert_eq!(NsError::InvalidOffset.as_label(), 6);
-        assert_eq!(NsError::InvalidFrameCap.as_label(), 7);
+        assert_eq!(NsError::InvalidMemoryCap.as_label(), 7);
         assert_eq!(NsError::InvalidCookie.as_label(), 8);
         assert_eq!(NsError::Evicted.as_label(), 9);
         assert_eq!(NsError::IoError.as_label(), 10);
@@ -121,7 +121,7 @@ mod tests
             NsError::IsADirectory,
             NsError::InvalidName,
             NsError::InvalidOffset,
-            NsError::InvalidFrameCap,
+            NsError::InvalidMemoryCap,
             NsError::InvalidCookie,
             NsError::Evicted,
             NsError::IoError,

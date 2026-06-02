@@ -76,7 +76,7 @@ pub const PROCMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
-    /// Create a new process from a boot module frame. Caps: `[module,
+    /// Create a new process from a boot module Memory cap. Caps: `[module,
     /// creator_endpoint?]`. Stdio pipes (stdin/stdout/stderr) are
     /// configured through one or more [`CONFIGURE_PIPE`] calls against
     /// the returned badged `process_handle` — procmgr's CREATE path
@@ -90,7 +90,7 @@ pub mod procmgr_labels
     ///
     /// The caller already walked its own namespace cap to the binary node
     /// and attaches the resulting badged file cap. Procmgr issues
-    /// `FS_READ` / `FS_READ_FRAME` against that cap to stream the ELF —
+    /// `FS_READ` / `FS_READ_MEMORY` against that cap to stream the ELF —
     /// it never holds a namespace cap of its own.
     ///
     /// Label layout:
@@ -112,8 +112,8 @@ pub mod procmgr_labels
     /// separate [`CONFIGURE_PIPE`] calls between create and start.
     pub const CREATE_FROM_FILE: u64 = 13;
     /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
-    /// cspace, `ProcessInfo` frame), dec-refing any frames the child still
-    /// holds so they recycle back into the kernel buddy allocator. The
+    /// cspace, `ProcessInfo` Memory cap), dec-refing any pages the child
+    /// still holds so they recycle back into the kernel buddy allocator. The
     /// caller identifies the process via the badged `process_handle`
     /// received from `CREATE_PROCESS` / `CREATE_FROM_FILE`; the badge is
     /// delivered by `ipc_recv` and looked up in procmgr's table. Idempotent
@@ -138,13 +138,13 @@ pub mod procmgr_labels
     ///   [`PIPE_DIR_STDOUT`] / [`PIPE_DIR_STDERR`]).
     /// * `data[1]` — ring byte capacity (power of two, ≤ ring page bytes
     ///   minus header). v1 uses 2048.
-    /// * `caps[0]` — frame cap (one shmem page; spawner has already
+    /// * `caps[0]` — memory cap (one shmem page; spawner has already
     ///   initialised the [`SpscHeader`] via `init`).
     /// * `caps[1]` — data-available notification cap.
     /// * `caps[2]` — space-available notification cap.
     ///
     /// procmgr `cap_copy`s each cap into the child's `CSpace` and writes
-    /// the resulting slot indices into the matching `<dir>_frame_cap`,
+    /// the resulting slot indices into the matching `<dir>_memory_cap`,
     /// `<dir>_data_notification_cap`, and `<dir>_space_notification_cap` slots of
     /// the child's `ProcessInfo`. All three caps are required; missing
     /// cap slots reply `INVALID_ARGUMENT`.
@@ -237,7 +237,7 @@ pub mod procmgr_labels
     /// differently-badged twins are rejected.
     pub const DEATH_EQ_AUTHORITY: u64 = 1u64 << 62;
 
-    /// Hand init's kernel-object caps + reclaimable Frame caps to procmgr
+    /// Hand init's kernel-object caps + reclaimable Memory caps to procmgr
     /// for post-death reap. Init calls this in the post-Phase-3 exit
     /// path, then `sys_thread_exit`s.
     ///
@@ -249,11 +249,11 @@ pub mod procmgr_labels
     ///               as a previously-exited thread — its TCB is reclaimed
     ///               on `cap_delete` regardless of state).
     /// Subsequent rounds (`data[0] == 0`):
-    ///   `caps[0..N]` = reclaimable Frame caps (segments + stack +
+    ///   `caps[0..N]` = reclaimable Memory caps (segments + stack +
     ///                  `InitInfo` + IPC buffer + any other init-owned
-    ///                  donatable Frame). MOVED out of init's `CSpace`
+    ///                  donatable Memory cap). MOVED out of init's `CSpace`
     ///                  via IPC cap-transfer; procmgr accumulates them
-    ///                  for the eventual `memmgr.DONATE_FRAMES` chunk.
+    ///                  for the eventual `memmgr.DONATE_MEMORY_CAPS` chunk.
     ///
     /// Procmgr binds the death-EQ on both init threads (main and
     /// init-logd) with correlator `INIT_REAP_CORRELATOR` as part of the
@@ -278,7 +278,7 @@ pub const MEMMGR_LABELS_VERSION: u32 = 2;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
-/// bootstrap their heap by calling `REQUEST_FRAMES` on a badged SEND
+/// bootstrap their heap by calling `REQUEST_MEMORY_CAPS` on a badged SEND
 /// cap installed in `ProcessInfo.memmgr_endpoint_cap`. Procmgr is the
 /// privileged caller that registers and retires process badges.
 ///
@@ -286,7 +286,7 @@ pub const MEMMGR_LABELS_VERSION: u32 = 2;
 /// shape.
 pub mod memmgr_labels
 {
-    /// Allocate one or more Frame caps covering at least `want_pages` pages.
+    /// Allocate one or more Memory caps covering at least `want_pages` pages.
     ///
     /// Universal label — callable from any badged cap on memmgr's
     /// endpoint. Wire format:
@@ -295,46 +295,46 @@ pub mod memmgr_labels
     /// * `data[0]` high 32 bits — `flags: u32` (see flag constants below).
     ///
     /// Reply (success): `data[0]` = `returned_cap_count: u32`;
-    /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Frame
+    /// `data[1+i]` = `page_count_for_cap_i: u32`; `caps[0..count]` = Memory
     /// capabilities (MAP|WRITE rights). `sum(page_count_for_cap_i) ==
     /// want_pages` for both contiguous and best-effort replies. Each reply
     /// cap MUST additionally carry `Rights::RETYPE` so the caller can
-    /// retype the frame into kernel objects via the `SYS_CAP_CREATE_*`
+    /// retype the memory into kernel objects via the `SYS_CAP_CREATE_*`
     /// syscalls; memmgr derives reply caps with `RIGHTS_ALL`, which
     /// preserves the RETYPE bit stamped at boot by the kernel.
-    pub const REQUEST_FRAMES: u64 = 1;
-    /// Voluntarily return Frame caps to the pool. Callable from any
+    pub const REQUEST_MEMORY_CAPS: u64 = 1;
+    /// Voluntarily return Memory caps to the pool. Callable from any
     /// badged cap. Wire format: `data[0]` = `cap_count`; `data[1+i]` =
-    /// `page_count_for_cap_i`; `caps[0..cap_count]` = Frame caps to release.
+    /// `page_count_for_cap_i`; `caps[0..cap_count]` = Memory caps to release.
     /// memmgr verifies each cap was previously issued to the caller's badge.
-    pub const RELEASE_FRAMES: u64 = 2;
+    pub const RELEASE_MEMORY_CAPS: u64 = 2;
     /// Procmgr-only: register a new process. memmgr allocates a per-process
     /// tracking entry and replies with a badged SEND cap on its endpoint
     /// identifying the new process. Procmgr installs the returned cap in
     /// the new process's `ProcessInfo.memmgr_endpoint_cap`.
     pub const REGISTER_PROCESS: u64 = 3;
     /// Procmgr-only: notification process death. The transferred cap (`caps[0]`)
-    /// carries the dead process's badge; memmgr reclaims every Frame cap
+    /// carries the dead process's badge; memmgr reclaims every Memory cap
     /// it had issued to that badge, runs coalescing, and clears the
     /// per-process record. Idempotent on unknown badges.
     pub const PROCESS_DIED: u64 = 4;
-    /// Permanently transfer a Frame cap into memmgr's pool.
+    /// Permanently transfer a Memory cap into memmgr's pool.
     ///
-    /// Used by init and procmgr to return boot-module Frame caps after the
+    /// Used by init and procmgr to return boot-module Memory caps after the
     /// loader has copied the ELF contents into the target process's
     /// `AddressSpace`. The transferred cap (`caps[0]`) becomes part of
-    /// memmgr's free pool; subsequent `REQUEST_FRAMES` callers may receive
+    /// memmgr's free pool; subsequent `REQUEST_MEMORY_CAPS` callers may receive
     /// pages derived from it.
     ///
     /// Wire format:
-    /// * `caps[0]` — the Frame cap to transfer (must carry `Rights::RETYPE`).
+    /// * `caps[0]` — the Memory cap to transfer (must carry `Rights::RETYPE`).
     ///
     /// memmgr derives `phys_base` and `size` from the cap itself via
     /// `cap_info`, so no caller-side bookkeeping is required. Reply is
     /// `memmgr_errors::SUCCESS` on ingestion, `INVALID_ARGUMENT` if the
     /// cap is missing RETYPE or the pool is full (cap is dropped on
     /// reject).
-    pub const DONATE_FRAMES: u64 = 5;
+    pub const DONATE_MEMORY_CAPS: u64 = 5;
     /// Read-only query of the all-RAM-accounted identity. Callable from any
     /// badged cap; returns aggregate counts only — no caps, no state change.
     ///
@@ -353,7 +353,7 @@ pub mod memmgr_labels
     /// "dark" memory.
     pub const QUERY_POOL_STATUS: u64 = 6;
 
-    /// `REQUEST_FRAMES` flag: reply MUST contain exactly one Frame cap
+    /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap
     /// covering all `want_pages`, or fail with
     /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
     /// the flags half of `data[0]`.
@@ -377,7 +377,7 @@ pub mod memmgr_errors
     /// consuming an unreasonable number of frames.
     pub const QUOTA: u64 = 3;
     /// `want_pages == 0`, reserved flag bits set, page-count mismatch on
-    /// `RELEASE_FRAMES`, or badge unknown.
+    /// `RELEASE_MEMORY_CAPS`, or badge unknown.
     pub const INVALID_ARGUMENT: u64 = 4;
     /// Procmgr-only label called over a non-procmgr badge.
     pub const UNAUTHORIZED: u64 = 5;
@@ -396,14 +396,14 @@ pub mod memmgr_errors
 ///
 /// memmgr is created directly by init (no procmgr exists yet), so its startup
 /// pool bounds arrive over a single bootstrap round on memmgr's creator
-/// endpoint plus one auxiliary read-only Frame cap (`caps[1]` of that round) —
+/// endpoint plus one auxiliary read-only Memory cap (`caps[1]` of that round) —
 /// the "phys-table" page. This module is the single source of truth for the
 /// payload layout; init writes it and memmgr reads it.
 ///
 /// Round (`ipc::bootstrap` caps + data words):
 /// * `caps[0]` — memmgr's own service endpoint (full rights; its RECV side).
-/// * `caps[1]` — read-only Frame cap covering the phys-table page (below).
-/// * `data[0]` — `frame_base`: first `CSpace` slot of the free RAM Frame caps
+/// * `caps[1]` — read-only Memory cap covering the phys-table page (below).
+/// * `data[0]` — `frame_base`: first `CSpace` slot of the free RAM Memory caps
 ///   init copied into memmgr's `CSpace`.
 /// * `data[1]` — `frame_count`: number of consecutive free RAM frames.
 /// * `data[2]` — `procmgr_badge`: badge init burned into procmgr's badged
@@ -425,11 +425,11 @@ pub mod memmgr_bootstrap
     /// Maximum free RAM frames init delivers in the round's data words:
     /// `MSG_DATA_WORDS_MAX` minus the 3-word prefix, two `page_count`s per
     /// remaining word.
-    pub const MAX_FRAMES: usize = (MSG_DATA_WORDS_MAX - 3) * 2;
+    pub const MAX_MEMORY_CAPS: usize = (MSG_DATA_WORDS_MAX - 3) * 2;
 
     /// Phys-table `u64` index of the first immutable fact
-    /// (`system_ram_bytes`). Sits past the `MAX_FRAMES`-entry `phys_base`
-    /// table (`MAX_FRAMES * 8 = 976 B`) so the two regions never overlap.
+    /// (`system_ram_bytes`). Sits past the `MAX_MEMORY_CAPS`-entry `phys_base`
+    /// table (`MAX_MEMORY_CAPS * 8 = 976 B`) so the two regions never overlap.
     pub const FACTS_SYSTEM_RAM_IDX: usize = 128;
     /// Phys-table `u64` index of `kernel_reserved_bytes`.
     pub const FACTS_KERNEL_RESERVED_IDX: usize = 129;
@@ -826,7 +826,7 @@ pub const NS_LABELS_VERSION: u32 = 1;
 /// IPC labels for the namespace protocol (cap-as-namespace surface).
 ///
 /// Numbered in a reserved range above the surviving [`fs_labels`] codes
-/// (`FS_READ`, `FS_CLOSE`, `FS_READ_FRAME`, `FS_RELEASE_FRAME`,
+/// (`FS_READ`, `FS_CLOSE`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`,
 /// `FS_RELEASE_ACK`, `FS_MOUNT`, `END_OF_DIR`) so node-cap and per-file
 /// requests share one fs-driver endpoint with no opcode collisions.
 /// [`fs_labels::END_OF_DIR`] is reused unchanged as the readdir
@@ -880,7 +880,7 @@ pub mod fs_labels
     /// per-call payload at the IPC inline ceiling; callers iterate.
     pub const FS_READ: u64 = 2;
     /// Close a node cap, releasing any lazily-allocated driver-side
-    /// bookkeeping bound to the file (outstanding `FS_READ_FRAME`
+    /// bookkeeping bound to the file (outstanding `FS_READ_MEMORY`
     /// pages, open-file slot, etc.). The caller still cap-deletes the
     /// node cap to drop the kernel-side reference.
     pub const FS_CLOSE: u64 = 3;
@@ -899,57 +899,57 @@ pub mod fs_labels
     pub const FS_WRITE: u64 = 4;
     /// End-of-directory marker in `NS_READDIR` replies.
     pub const END_OF_DIR: u64 = 6;
-    /// Read file content into a cached Frame cap returned in the reply.
+    /// Read file content into a cached Memory cap returned in the reply.
     ///
     /// Request: badge identifies the file (per-file cap), `data[0]` =
     /// byte offset (no alignment requirement), `data[1]` = client-chosen
     /// release cookie (must be non-zero). `caps[0]` = optional per-process
     /// release-endpoint SEND, transferred only on the first
-    /// `FS_READ_FRAME` for a given (client, file) pair; the driver
+    /// `FS_READ_MEMORY` for a given (client, file) pair; the driver
     /// records it on the lazy `OpenFile` slot allocated at that point
-    /// so its eviction worker can route cooperative `FS_RELEASE_FRAME`
-    /// back to the client. Subsequent `FS_READ_FRAME`s for the same
+    /// so its eviction worker can route cooperative `FS_RELEASE_MEMORY`
+    /// back to the client. Subsequent `FS_READ_MEMORY`s for the same
     /// pair carry no caps. Clients that opt out of cooperative release
     /// omit the cap on every call; eviction falls back to hard-revoke.
-    /// Reply: `data[0]` = bytes valid in the returned frame starting at
-    /// the indicated frame offset, `data[1]` = the same release cookie
-    /// echoed back, `data[2]` = byte offset within the returned frame
+    /// Reply: `data[0]` = bytes valid in the returned page starting at
+    /// the indicated page offset, `data[1]` = the same release cookie
+    /// echoed back, `data[2]` = byte offset within the returned page
     /// where the file's content for the requested `offset` begins,
-    /// `caps[0]` = single-page Frame cap with `MAP|READ` rights
+    /// `caps[0]` = single-page Memory cap with `MAP|READ` rights
     /// covering the cached file page.
     ///
     /// `bytes_valid` is bounded by file end, the current cluster
     /// boundary on the underlying filesystem, and the page tail
-    /// (`PAGE_SIZE - frame_data_offset`); callers iterate forward from
+    /// (`PAGE_SIZE - memory_data_offset`); callers iterate forward from
     /// `offset + bytes_valid` to read past those boundaries.
-    pub const FS_READ_FRAME: u64 = 7;
+    pub const FS_READ_MEMORY: u64 = 7;
     /// Filesystem-driver request to a client to release a previously-returned
-    /// Frame. Sent on the per-file release endpoint cap. Badge identifies the
-    /// file; `data[0]` = the release cookie naming the Frame to unmap.
-    pub const FS_RELEASE_FRAME: u64 = 8;
-    /// Client acknowledgement of [`FS_RELEASE_FRAME`]: synchronous reply,
+    /// page. Sent on the per-file release endpoint cap. Badge identifies the
+    /// file; `data[0]` = the release cookie naming the Memory cap to unmap.
+    pub const FS_RELEASE_MEMORY: u64 = 8;
+    /// Client acknowledgement of [`FS_RELEASE_MEMORY`]: synchronous reply,
     /// empty body.
     pub const FS_RELEASE_ACK: u64 = 9;
     /// Mount notification from vfsd.
     pub const FS_MOUNT: u64 = 10;
-    /// Write file content from a caller-supplied source Frame cap.
+    /// Write file content from a caller-supplied source Memory cap.
     ///
-    /// Mirror of [`FS_READ_FRAME`] for the write direction. Caller maps,
-    /// fills, then transfers a Frame holding the bytes to write.
+    /// Mirror of [`FS_READ_MEMORY`] for the write direction. Caller maps,
+    /// fills, then transfers a Memory cap holding the bytes to write.
     ///
     /// Request: badge identifies the file (per-file cap),
     /// `data[0]` = file byte offset (no alignment requirement),
-    /// `data[1]` = bytes to write from the frame (`≤ PAGE_SIZE -
-    /// frame_data_offset`), `data[2]` = byte offset within the source
-    /// frame where the data begins. `caps[0]` = source Frame cap with
+    /// `data[1]` = bytes to write from the page (`≤ PAGE_SIZE -
+    /// memory_data_offset`), `data[2]` = byte offset within the source
+    /// page where the data begins. `caps[0]` = source Memory cap with
     /// at least `MAP|READ` rights, sized one page. Badge must carry the
     /// `WRITE` namespace right.
     ///
     /// Reply (label `fs_errors::SUCCESS`): `data[0]` = `bytes_written`
     /// (short on `NO_SPACE` or cluster-boundary truncation; callers
-    /// iterate). `caps[0]` = the source Frame cap moved back to the
+    /// iterate). `caps[0]` = the source Memory cap moved back to the
     /// caller. Errors per [`fs_errors`].
-    pub const FS_WRITE_FRAME: u64 = 12;
+    pub const FS_WRITE_MEMORY: u64 = 12;
     /// Create a new file in a directory.
     ///
     /// Request: badge = parent-directory cap (must carry `MUTATE_DIR`),
@@ -1110,7 +1110,7 @@ pub mod devmgr_labels
     /// devmgr is the sole owner of ACPI data and the only service that
     /// navigates the table tree (RSDP → XSDT). Callers that need a table
     /// (today: `pwrmgr`, for the FADT + DSDT it interprets for S5
-    /// shutdown) request it here rather than holding ACPI frames of
+    /// shutdown) request it here rather than holding ACPI Memory caps of
     /// their own.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
@@ -1122,7 +1122,7 @@ pub mod devmgr_labels
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a derived
-    /// **read-only-intended** Frame cap on the ACPI region containing the
+    /// **read-only-intended** Memory cap on the ACPI region containing the
     /// table (the caller maps it `MAP_READONLY`); `data[0]` = region
     /// physical base, `data[1]` = region size in bytes, `data[2]` = the
     /// table's physical address. The caller maps the region and reads the
@@ -1195,7 +1195,7 @@ pub mod blk_labels
     /// Authority bit in the block-service-endpoint badge's high u64
     /// bit. Set on caps minted for consumers that may invoke
     /// [`REGISTER_PARTITION`] and may issue whole-disk sector reads
-    /// via [`BLK_READ_INTO_FRAME`]. The bit is a verb — "may invoke
+    /// via [`BLK_READ_INTO_MEMORY`]. The bit is a verb — "may invoke
     /// these labels" — not an identity: multiple consumers may hold
     /// it, and the bit alone does not encode "is vfsd."
     ///
@@ -1216,41 +1216,41 @@ pub mod blk_labels
     /// required because [`MOUNT_AUTHORITY`] caps are badged and the
     /// kernel rejects re-badging of a badged source.
     pub const REGISTER_PARTITION: u64 = 2;
-    /// Read one or more contiguous sectors into a caller-supplied Frame cap.
+    /// Read one or more contiguous sectors into a caller-supplied Memory cap.
     ///
     /// Request: `data[0]` = starting LBA, `data[1]` = sector count
     /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// target Frame (`MAP|WRITE`; the driver writes `count * 512` bytes
-    /// starting at offset 0 of the frame, packed contiguously). The frame
+    /// target Memory cap (`MAP|WRITE`; the driver writes `count * 512` bytes
+    /// starting at offset 0 of the page, packed contiguously). The page
     /// must be at least `count * 512` bytes; the driver rejects with
-    /// `INVALID_FRAME_CAP` otherwise. `caps[1]` is reserved for a future
+    /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
     /// per-request release handle and is null today. `caps[2]` is a
     /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
     /// the kernel transports nothing for this slot and has no awareness
     /// of IOMMU semantics — IOMMU enforcement is permanently userspace.
     /// Reply: empty body, label is the success or error code; the target
-    /// Frame is moved back to the caller in `caps[0]` of the reply.
-    pub const BLK_READ_INTO_FRAME: u64 = 3;
-    /// Write one or more contiguous sectors from a caller-supplied Frame cap.
+    /// Memory cap is moved back to the caller in `caps[0]` of the reply.
+    pub const BLK_READ_INTO_MEMORY: u64 = 3;
+    /// Write one or more contiguous sectors from a caller-supplied Memory cap.
     ///
-    /// Mirror of [`BLK_READ_INTO_FRAME`] for the write direction. The
-    /// caller fills the source frame, then issues the request; the
+    /// Mirror of [`BLK_READ_INTO_MEMORY`] for the write direction. The
+    /// caller fills the source page, then issues the request; the
     /// driver reads `count * 512` bytes starting at offset 0 and writes
     /// them to disk.
     ///
     /// Request: `data[0]` = starting LBA, `data[1]` = sector count
     /// (`>= 1`; defaults to `1` if `data[1]` is absent). Caps: `caps[0]` =
-    /// source Frame (`MAP|READ`; the driver reads `count * 512` bytes
-    /// starting at offset 0 of the frame, packed contiguously). The frame
+    /// source Memory cap (`MAP|READ`; the driver reads `count * 512` bytes
+    /// starting at offset 0 of the page, packed contiguously). The page
     /// must be at least `count * 512` bytes; the driver rejects with
-    /// `INVALID_FRAME_CAP` otherwise. `caps[1]` is reserved for a future
+    /// `INVALID_MEMORY_CAP` otherwise. `caps[1]` is reserved for a future
     /// per-request release handle and is null today. `caps[2]` is a
     /// reserved IPC-shape slot for a future userspace IOMMU-grant cap;
-    /// see [`BLK_READ_INTO_FRAME`] for the userspace-IOMMU framing.
+    /// see [`BLK_READ_INTO_MEMORY`] for the userspace-IOMMU framing.
     /// Reply: empty body, label is the success or error code; the source
-    /// Frame is moved back to the caller in `caps[0]` of the reply (same
+    /// Memory cap is moved back to the caller in `caps[0]` of the reply (same
     /// discipline as the read path).
-    pub const BLK_WRITE_FROM_FRAME: u64 = 4;
+    pub const BLK_WRITE_FROM_MEMORY: u64 = 4;
 }
 
 pub const SERIAL_LABELS_VERSION: u32 = 1;
@@ -1473,7 +1473,7 @@ pub mod log_labels
     /// Decoupling termination from the multi-chunk data drain keeps a
     /// dropped data chunk (a kernel IPC rendezvous race on the shared,
     /// multi-sender log endpoint) from wedging init-logd — which would
-    /// otherwise block procmgr's reap of init's frames indefinitely.
+    /// otherwise block procmgr's reap of init's Memory caps indefinitely.
     pub const HANDOVER_RELEASE: u64 = 14;
 }
 
@@ -1532,7 +1532,7 @@ pub mod procmgr_errors
     pub const IO_ERROR: u64 = 10;
     /// `mem_map` or scratch mapping failed during ELF page load.
     pub const MAP_FAILED: u64 = 11;
-    /// Cap rights derivation failed (e.g. `derive_frame_for_prot`)
+    /// Cap rights derivation failed (e.g. `derive_memory_for_prot`)
     /// during ELF page load.
     pub const INSUFFICIENT_RIGHTS: u64 = 12;
     /// Caller's cap lacks the required authority badge for a gated
@@ -1583,11 +1583,11 @@ pub mod fs_errors
     /// File badge is invalid or expired.
     pub const INVALID_BADGE: u64 = 4;
     /// Cooperative-release watchdog fired; the driver revoked the parent
-    /// Frame cap and any derived caps the client still held are now dead.
+    /// Memory cap and any derived caps the client still held are now dead.
     pub const RELEASE_TIMEOUT: u64 = 5;
-    /// `FS_READ_FRAME` cookie is invalid (zero — collides with the
+    /// `FS_READ_MEMORY` cookie is invalid (zero — collides with the
     /// `OutstandingPage::None` sentinel in fs driver tracking).
-    pub const BAD_FRAME_OFFSET: u64 = 6;
+    pub const BAD_MEMORY_OFFSET: u64 = 6;
     /// Caller's node-cap badge lacks a rights bit required by the
     /// requested operation (see `namespace-protocol::rights`).
     pub const PERMISSION_DENIED: u64 = 7;
@@ -1687,10 +1687,10 @@ pub mod blk_errors
     pub const OUT_OF_BOUNDS: u64 = 3;
     /// Partition registration rejected (no authority, table full, or bad args).
     pub const REGISTER_REJECTED: u64 = 4;
-    /// Frame cap rejected: `BLK_READ_INTO_FRAME` target missing
-    /// `MAP|WRITE` rights, `BLK_WRITE_FROM_FRAME` source missing
+    /// Memory cap rejected: `BLK_READ_INTO_MEMORY` target missing
+    /// `MAP|WRITE` rights, `BLK_WRITE_FROM_MEMORY` source missing
     /// `MAP|READ` rights, sized other than one page, or absent.
-    pub const INVALID_FRAME_CAP: u64 = 5;
+    pub const INVALID_MEMORY_CAP: u64 = 5;
     /// Caller's compiled `BLK_LABELS_VERSION` does not match the receiver's.
     /// `REGISTER_PARTITION` is the handshake entry point and carries the
     /// caller's version as `data[0]` (with `base_lba` shifted to `data[1]`

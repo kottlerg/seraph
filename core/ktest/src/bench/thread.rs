@@ -27,7 +27,7 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     let n = iters.min(100);
     let n64 = u64::from(n);
 
-    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         return;
@@ -124,7 +124,7 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     let n = u64::from(iters);
     BENCH_CTXSWITCH_ITERS.store(n, core::sync::atomic::Ordering::Release);
 
-    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         return;
@@ -187,10 +187,9 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     // The parent⇄child ping-pong above shares an address space, so it adds no
     // tagged activations of its own; the totals reflect every cross-space and
     // post-block re-activation since boot.
-    let elided =
-        syscall::cap_info(ctx.memory_frame_base, syscall_abi::CAP_INFO_TLB_ELIDED).unwrap_or(0);
+    let elided = syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_TLB_ELIDED).unwrap_or(0);
     let performed =
-        syscall::cap_info(ctx.memory_frame_base, syscall_abi::CAP_INFO_TLB_PERFORMED).unwrap_or(0);
+        syscall::cap_info(ctx.memory_base, syscall_abi::CAP_INFO_TLB_PERFORMED).unwrap_or(0);
     crate::log_u64("ktest: bench  ctxsw_flush_elided_total=", elided);
     crate::log_u64("ktest: bench  ctxsw_flush_performed_total=", performed);
 }

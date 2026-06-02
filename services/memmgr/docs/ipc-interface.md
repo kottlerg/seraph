@@ -19,7 +19,7 @@ For all subsequent processes, procmgr is the chooser: it calls
 `REGISTER_PROCESS` (below) before spawning a child, receives a badged
 SEND cap on memmgr's endpoint, and installs that cap into the child's
 `ProcessInfo.memmgr_endpoint_cap`. The child's std heap-bootstrap path
-calls `REQUEST_FRAMES` on it with no further setup.
+calls `REQUEST_MEMORY_CAPS` on it with no further setup.
 
 ---
 
@@ -28,7 +28,7 @@ calls `REQUEST_FRAMES` on it with no further setup.
 Every memmgr-callable message arrives over a badged endpoint cap. The
 badge is the procmgr-minted process identity established at
 `REGISTER_PROCESS`; memmgr uses it to key the per-process tracking table
-(see [`frame-pool.md`](frame-pool.md) §"Per-Process Tracking").
+(see [`memory-pool.md`](memory-pool.md) §"Per-Process Tracking").
 
 Two privilege classes:
 
@@ -36,7 +36,7 @@ Two privilege classes:
   callable only over the cap that init transfers to procmgr at
   procmgr's bootstrap round. memmgr identifies this cap by badge and
   rejects procmgr-only calls received over any other badged cap.
-- **Universal** labels (`REQUEST_FRAMES`, `RELEASE_FRAMES`) are
+- **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`) are
   callable over any badged cap, including those memmgr returned from
   `REGISTER_PROCESS`.
 
@@ -52,9 +52,9 @@ All requests use `SYS_IPC_CALL` (synchronous call/reply). The message
 label field identifies the operation. Data words and capability slots
 carry arguments; the reply carries results.
 
-### Label 1: `REQUEST_FRAMES`
+### Label 1: `REQUEST_MEMORY_CAPS`
 
-Allocate one or more Frame capabilities covering at least `want_pages`
+Allocate one or more Memory capabilities covering at least `want_pages`
 pages. Privilege: universal.
 
 **Request:**
@@ -68,7 +68,7 @@ pages. Privilege: universal.
 
 | Bit | Name | Meaning |
 |---|---|---|
-| 0 | `REQUIRE_CONTIGUOUS` | Reply MUST contain exactly one Frame cap covering all `want_pages`, or fail |
+| 0 | `REQUIRE_CONTIGUOUS` | Reply MUST contain exactly one Memory cap covering all `want_pages`, or fail |
 
 `flags` bits not listed above are reserved and MUST be zero.
 
@@ -79,8 +79,8 @@ pages. Privilege: universal.
 | label | 0 (success) |
 | data[0] | `returned_cap_count` (u32) |
 | data[1 + i] | `page_count_for_cap_i` (u32) for each returned cap, `i ∈ [0, count)` |
-| data[1 + count + i] | `phys_base_for_cap_i` (u64) — physical base address of the contiguous frame run described by `page_count_for_cap_i`, `i ∈ [0, count)` |
-| cap[0..returned_cap_count] | Frame capabilities (MAP\|WRITE rights) |
+| data[1 + count + i] | `phys_base_for_cap_i` (u64) — physical base address of the contiguous page run described by `page_count_for_cap_i`, `i ∈ [0, count)` |
+| cap[0..returned_cap_count] | Memory capabilities (MAP\|WRITE rights) |
 
 The cumulative `sum(page_count_for_cap_i) == want_pages` for both
 contiguous and best-effort replies. With `REQUIRE_CONTIGUOUS` the reply
@@ -109,12 +109,12 @@ Best-effort replies may use the full reply-side capacity.
 |---|---|---|
 | 1 | `OutOfMemoryContiguous` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
 | 2 | `OutOfMemoryBestEffort` | Pool cannot cover `want_pages` even fragmented |
-| 3 | `Quota` | Per-process frame-record list at static cap |
+| 3 | `Quota` | Per-process memory-cap-record list at static cap |
 | 4 | `InvalidArgument` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
 
-### Label 2: `RELEASE_FRAMES`
+### Label 2: `RELEASE_MEMORY_CAPS`
 
-Voluntarily return Frame caps to the pool. Privilege: universal.
+Voluntarily return Memory caps to the pool. Privilege: universal.
 Typically called by `unreserve_pages` after the caller has unmapped the
 range, or by long-lived services pruning their working set.
 
@@ -125,7 +125,7 @@ range, or by long-lived services pruning their working set.
 | label | 2 |
 | data[0] | `cap_count` (u32) |
 | data[1+i] | `page_count_for_cap_i` (u32) for each released cap |
-| cap[0..cap_count] | Frame capabilities being released |
+| cap[0..cap_count] | Memory capabilities being released |
 
 **Reply (success):**
 
@@ -195,7 +195,7 @@ the eventual `PROCESS_DIED`.
 ### Label 4: `PROCESS_DIED`
 
 Procmgr notifications process death. memmgr looks up the per-process tracking
-entry by badge, reclaims every Frame cap memmgr has issued to that
+entry by badge, reclaims every Memory cap memmgr has issued to that
 process, and runs coalescing. Privilege: procmgr-only.
 
 **Request:**
@@ -237,12 +237,12 @@ success. Reclamation is idempotent.
 
 ## Capability Transfer
 
-Every Frame cap memmgr returns is a derive-twice copy: memmgr retains
+Every Memory cap memmgr returns is a derive-twice copy: memmgr retains
 an intermediary in its own CSpace, the caller receives the second
 derivation. This guarantees memmgr can reclaim on `PROCESS_DIED` even
 after the caller's CSpace is torn down.
 
-`RELEASE_FRAMES` and `PROCESS_DIED` move caps out of the caller's
+`RELEASE_MEMORY_CAPS` and `PROCESS_DIED` move caps out of the caller's
 CSpace via IPC transfer; the caller's slots become null. memmgr does
 not derive further from received caps — it inserts the underlying
 intermediary back into the free pool.
@@ -253,11 +253,11 @@ intermediary back into the free pool.
 
 memmgr serialises all incoming calls on a single thread; there is no
 ordering hazard between concurrent callers. Within a single caller,
-the kernel guarantees that `REQUEST_FRAMES` and `RELEASE_FRAMES`
+the kernel guarantees that `REQUEST_MEMORY_CAPS` and `RELEASE_MEMORY_CAPS`
 execute in the order the caller issued them.
 
 `PROCESS_DIED` for process P MUST NOT race ahead of P's last
-`REQUEST_FRAMES` reply: procmgr observes P's death (via the existing
+`REQUEST_MEMORY_CAPS` reply: procmgr observes P's death (via the existing
 supervision path) only after the kernel has stopped all of P's threads,
 which in turn cannot occur while P is mid-IPC with memmgr. The
 reply-then-death ordering is therefore enforced by the kernel.
@@ -268,7 +268,7 @@ reply-then-death ordering is therefore enforced by the kernel.
 
 | Document | Content |
 |---|---|
-| [memmgr/docs/frame-pool.md](frame-pool.md) | Pool structure, allocation, reclamation, coalescing |
+| [memmgr/docs/memory-pool.md](memory-pool.md) | Pool structure, allocation, reclamation, coalescing |
 | [docs/process-lifecycle.md](../../../docs/process-lifecycle.md) | Boot order, ProcessInfo handover, death-notification flow |
 | [docs/ipc-design.md](../../../docs/ipc-design.md) | IPC message format, cap transfer protocol, reply-side limits |
 | [abi/process-abi](../../../abi/process-abi/README.md) | `ProcessInfo.memmgr_endpoint_cap` placement |

@@ -313,9 +313,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     MISMATCHES.store(0, Ordering::Release);
     OBSERVED_CPU.store(u32::MAX, Ordering::Release);
 
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "fpu_survives_ipc_call: cap_create_endpoint failed")?;
-    let done = cap_create_notification(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "fpu_survives_ipc_call: cap_create_notification failed")?;
 
     let child =

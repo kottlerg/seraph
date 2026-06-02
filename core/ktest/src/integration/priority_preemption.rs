@@ -109,7 +109,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     };
 
-    let done = cap_create_notification(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "priority_preemption: cap_create_notification (done) failed")?;
 
     // ── Hog: spawn, pin to CPU 0, default priority. ──────────────────────────

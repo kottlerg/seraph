@@ -17,7 +17,7 @@ Authority over memory is partitioned across four layers:
   canonical-address enforcement. Does not track named regions; every
   mapping syscall takes an explicit caller-supplied virtual address.
 - **memmgr** — tier-1 userspace service holding the userspace RAM
-  frame pool. Allocates Frame capabilities to all std-built services
+  frame pool. Allocates Memory capabilities to all std-built services
   on demand, tracks per-process ownership, reclaims on process death,
   coalesces freed runs. memmgr knows nothing about virtual addresses.
   See [`services/memmgr/README.md`](../services/memmgr/README.md).
@@ -29,9 +29,9 @@ Authority over memory is partitioned across four layers:
 - **`std::sys::seraph`** — per-process Rust standard library platform
   layer. Owns the process's virtual address space layout, hosts the
   `#[global_allocator]`, and hosts the page-granular reservation
-  allocator for foreign Frame mappings.
+  allocator for foreign Memory mappings.
 
-The kernel hands the initial RAM frame caps to init at boot. Init
+The kernel hands the initial RAM memory caps to init at boot. Init
 transfers them to memmgr (derive-twice). From that point on, memmgr is
 the sole userspace authority over RAM frame allocation; the kernel does
 not delegate further to anyone.
@@ -39,11 +39,11 @@ not delegate further to anyone.
 The handoff is total. At Phase 7 the kernel reserves its fixed
 contributors (PT-pool seed, idle-thread stacks, the `InitInfo` block,
 init's user stack, the SEED arena) from the pristine buddy, then drains
-**every** remaining page into userspace Frame caps and *seals* the buddy.
+**every** remaining page into userspace Memory caps and *seals* the buddy.
 After the seal the buddy is an inert boot artifact: it holds no free
 pages, allocates nothing, and must receive no frees. Every page of RAM is
 therefore either a bounded fixed kernel reserve or owned by memmgr's pool
-— nothing is invisible. memmgr holds its `owns_memory` Frame caps
+— nothing is invisible. memmgr holds its `owns_memory` Memory caps
 permanently (consumers receive `owns_memory=false` derivations that return
 to the pool on death), so no cap ever cascades back to the kernel
 allocator. A free into the sealed buddy means an `owns_memory` cap was
@@ -53,7 +53,7 @@ closing identity `system_ram == kernel_reserved + pool_total` checked by
 svctest.
 
 No process manipulates another process's address space. Sharing is
-explicit and capability-mediated: a Frame cap is sent over IPC and the
+explicit and capability-mediated: a Memory cap is sent over IPC and the
 receiver maps it into its own address space at a VA the receiver chose.
 
 ---
@@ -66,7 +66,7 @@ disjoint surfaces:
 | Surface | Granularity | Owner | Used for |
 |---|---|---|---|
 | Byte heap | Bytes | `std::sys::seraph::alloc` (`#[global_allocator]`) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
-| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Frame mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, per-thread stacks and IPC buffers when not heap-allocated |
+| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, per-thread stacks and IPC buffers when not heap-allocated |
 | Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo`/`InitInfo` page, main-thread stack, main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
@@ -83,14 +83,14 @@ communicates them via `ProcessInfo` / `InitInfo`.
 `alloc` / `std` collections surface (`Box`, `Vec`, `String`,
 `BTreeMap`, …) is available to every std-built service.
 
-- **Backing store.** The allocator's grow path requests Frame caps
-  from memmgr via `REQUEST_FRAMES` on the process's
+- **Backing store.** The allocator's grow path requests Memory caps
+  from memmgr via `REQUEST_MEMORY_CAPS` on the process's
   `ProcessInfo.memmgr_endpoint_cap` and maps them at a contiguous VA
   range above its current high-water mark. Multi-page contiguous
   caps (one cap covering many pages) are requested when available;
   the multi-page-cap reply path collapses what would otherwise be
   many single-page IPCs into a single round.
-- **Bootstrap.** `std::os::seraph::_start` calls `REQUEST_FRAMES`
+- **Bootstrap.** `std::os::seraph::_start` calls `REQUEST_MEMORY_CAPS`
   before `fn main()` runs and maps the returned caps at the process's
   initial heap base. The size of the initial bootstrap heap is a
   `std::sys::seraph` implementation detail.
@@ -102,18 +102,18 @@ communicates them via `ProcessInfo` / `InitInfo`.
   services share one allocator instance.
 - **`no_std` exceptions.** `init` and `memmgr` are `no_std` and have
   no `#[global_allocator]`. They allocate frames (where applicable)
-  via direct kernel object handling at boot, not via `REQUEST_FRAMES`.
+  via direct kernel object handling at boot, not via `REQUEST_MEMORY_CAPS`.
 
 ### Page Reservations
 
-Foreign Frame caps (from devmgr for MMIO, from drivers for shmem
+Foreign Memory caps (from devmgr for MMIO, from drivers for shmem
 buffers, from fs drivers for zero-copy file pages, from memmgr for
 heap-disjoint allocations like long-lived DMA regions) are mapped into
 the process via the page-reservation allocator inside `std::sys::seraph`.
 
 - **API surface.** `std::os::seraph::reserve_pages(n) → ReservedRange`
   returns a contiguous unmapped VA range of `n` pages.
-  `unreserve_pages(range)` releases it. The caller maps owned Frame
+  `unreserve_pages(range)` releases it. The caller maps owned Memory
   caps into the reservation with `mem_map`. The caller is responsible
   for `mem_unmap` before `unreserve_pages`.
 - **Arena.** Each process carves a fixed-size arena out of its own
@@ -151,7 +151,7 @@ the child's `_start` will find them.
   macro); binaries that omit the note inherit
   `DEFAULT_PROCESS_STACK_PAGES`. Loaders clamp to
   `MAX_PROCESS_STACK_PAGES`; memmgr's per-process quota remains the
-  policy gate on the resulting `REQUEST_FRAMES` calls.
+  policy gate on the resulting `REQUEST_MEMORY_CAPS` calls.
 - **Main-thread IPC buffer.** Procmgr picks a per-process VA and writes
   it into `ProcessInfo.ipc_buffer_vaddr` — this is already a runtime
   field, not an ABI constant.
@@ -170,23 +170,23 @@ handover discipline.
 
 ---
 
-## Frame Allocation Contract
+## Memory Allocation Contract
 
 memmgr serves frame requests over IPC. The contract:
 
-- **Request shape.** `REQUEST_FRAMES(want_pages, flags)`. `flags`
+- **Request shape.** `REQUEST_MEMORY_CAPS(want_pages, flags)`. `flags`
   carries `REQUIRE_CONTIGUOUS`; unset means best-effort.
-- **`REQUIRE_CONTIGUOUS` reply.** A single Frame cap covering exactly
+- **`REQUIRE_CONTIGUOUS` reply.** A single Memory cap covering exactly
   `want_pages`, or an `OutOfMemoryContiguous` error.
-- **Best-effort reply.** One or more Frame caps whose page counts sum
+- **Best-effort reply.** One or more Memory caps whose page counts sum
   to `want_pages`. The reply carries each returned cap's page count
   alongside it. memmgr prefers fewer caps over many.
 - **No fixed cap-count ceiling.** Replies may use the full IPC
   reply-side cap-slot capacity; there is no 4-cap limit.
-- **Caller maps.** Every returned Frame cap is mapped at a caller-
+- **Caller maps.** Every returned Memory cap is mapped at a caller-
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).
-- **Caller releases.** `RELEASE_FRAMES` returns specific caps to the
+- **Caller releases.** `RELEASE_MEMORY_CAPS` returns specific caps to the
   pool. Process death triggers automatic reclamation via procmgr's
   `PROCESS_DIED` notification to memmgr.
 
@@ -200,12 +200,12 @@ Authoritative wire shape lives in
 The kernel does not track per-process memory abstractions; userspace
 owns them.
 
-- **Heap** — the kernel only sees mappings of Frame caps at user-
+- **Heap** — the kernel only sees mappings of Memory caps at user-
   supplied VAs.
 - **VA allocation policy** — the kernel enforces page alignment and
   the user-half bound; it does not track or allocate VAs.
-- **Frame ownership beyond the derivation tree** — the kernel does
-  not know which process "owns" a Frame.
+- **Memory ownership beyond the derivation tree** — the kernel does
+  not know which process "owns" a Memory.
 - **Process death implications for memory** — when a process's
   `AddressSpace` is revoked, the kernel tears down threads and page
   tables. memmgr's reclamation runs separately, driven by procmgr's
@@ -216,7 +216,7 @@ The userspace process abstraction itself is owned by
 Userspace Abstractions".
 
 File-backed access via `mmap()` does not exist. Zero-copy file access
-is via fs-driver IPC returning Frame caps for file pages, mapped by
+is via fs-driver IPC returning Memory caps for file pages, mapped by
 the client through the page-reservation allocator.
 
 ---

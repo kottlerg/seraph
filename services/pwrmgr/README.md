@@ -28,7 +28,7 @@ a device driver":
 
 - **x86-64** — the FADT and DSDT it parses are served read-only by devmgr
   via `devmgr_labels::QUERY_ACPI_TABLE` (devmgr is the sole owner of the
-  `AcpiReclaimable` Frame caps and the only service that walks the ACPI
+  `AcpiReclaimable` Memory caps and the only service that walks the ACPI
   table tree). pwrmgr extracts `PM1a_CNT_BLK` from the FADT and the `\_S5_`
   sleep type from the DSDT, then requests a narrow `IoPortRange` over the
   PM1a control port and the 8042 reset port via
@@ -61,7 +61,7 @@ Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 2. `seed = devmgr.registry` delivers a `REGISTRY_QUERY_AUTHORITY`-badged
    SEND on devmgr's registry as bootstrap `cap[1]`. pwrmgr uses it to
    resolve its actuation state from devmgr (see Responsibilities). pwrmgr
-   never holds a platform cap longer than it needs — the served ACPI Frame
+   never holds a platform cap longer than it needs — the served ACPI Memory
    caps are mapped read-only and dropped after parsing.
 3. Consumers permitted to power the platform off seed `pwrmgr.shutdown`
    (e.g. svctest, and svcmgr's own critical-service-death escalation); the

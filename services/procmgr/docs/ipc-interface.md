@@ -23,7 +23,7 @@ the reply carries results.
 
 Create a new process from a raw ELF module. The process is created in a
 **suspended** state — the thread is not started. The caller receives the
-child's `CSpace` capability and `ProcessInfo` frame capability so it can
+child's `CSpace` capability and `ProcessInfo` memory capability so it can
 inject initial capabilities and write `CapDescriptor` / startup message data
 before starting the process via `START_PROCESS`.
 
@@ -32,10 +32,10 @@ before starting the process via `START_PROCESS`.
 | Field | Value |
 |---|---|
 | label | 1 |
-| cap[0] | Frame capability for the ELF module image |
+| cap[0] | Memory capability for the ELF module image |
 
-The caller transfers a Frame cap covering the raw ELF bytes. procmgr maps
-the frame, parses the ELF, creates an address space, CSpace, and thread,
+The caller transfers a Memory cap covering the raw ELF bytes. procmgr maps
+the memory cap, parses the ELF, creates an address space, CSpace, and thread,
 maps LOAD segments, and populates the `ProcessInfo` handover page with
 identity caps. The thread is **not** started.
 
@@ -46,14 +46,14 @@ identity caps. The thread is **not** started.
 | label | 0 (success) |
 | cap[0] | Process handle (badged endpoint identifying this process) |
 | cap[1] | Child `CSpace` capability (full rights) |
-| cap[2] | `ProcessInfo` frame capability (MAP\|WRITE rights) |
+| cap[2] | `ProcessInfo` memory capability (MAP\|WRITE rights) |
 | cap[3] | Child `Thread` capability (Control right) |
 
 The process handle is a badged endpoint capability. The caller uses it
 to send `START_PROCESS` (and future per-process operations) — the badge
 identifies the process without a forgeable PID. The `CSpace` cap allows
 the caller to inject capabilities into the child's capability space via
-`cap_copy`. The `ProcessInfo` frame cap allows the caller to map the page
+`cap_copy`. The `ProcessInfo` memory cap allows the caller to map the page
 writable and patch `initial_caps_base`, `initial_caps_count`,
 `cap_descriptor_count`, `cap_descriptors_offset`, and startup message
 fields. The `Thread` cap allows the caller to bind death notifications or
@@ -71,7 +71,7 @@ stop/configure the thread.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `InvalidElf` | ELF validation failed (bad magic, wrong arch, corrupt headers) |
-| 2 | `OutOfMemory` | Insufficient frame caps to allocate stack, ProcessInfo page, or IPC buffer |
+| 2 | `OutOfMemory` | Insufficient memory caps to allocate stack, ProcessInfo page, or IPC buffer |
 | 3 | `CSpaceFull` | Cannot allocate kernel objects (address space, CSpace, thread) |
 
 ### Label 2: `START_PROCESS`
@@ -123,9 +123,9 @@ Deferred. Not implemented.
 
 ### Label 5: reserved
 
-Frame allocation is owned by memmgr, not procmgr. See
+Memory-cap allocation is owned by memmgr, not procmgr. See
 [`services/memmgr/docs/ipc-interface.md`](../../memmgr/docs/ipc-interface.md)
-for `REQUEST_FRAMES` and related labels.
+for `REQUEST_MEMORY_CAPS` and related labels.
 
 ### Label 6: `CREATE_PROCESS_FROM_VFS`
 
@@ -153,7 +153,7 @@ Same as `CREATE_PROCESS`:
 | label | 0 (success) |
 | cap[0] | Process handle (badged endpoint) |
 | cap[1] | Child `CSpace` capability (full rights) |
-| cap[2] | `ProcessInfo` frame capability (MAP\|WRITE rights) |
+| cap[2] | `ProcessInfo` memory capability (MAP\|WRITE rights) |
 | cap[3] | Child `Thread` capability (Control right) |
 
 **Reply (error):**
@@ -167,7 +167,7 @@ Same as `CREATE_PROCESS`:
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `InvalidElf` | ELF validation failed |
-| 2 | `OutOfMemory` | Insufficient frame caps |
+| 2 | `OutOfMemory` | Insufficient memory caps |
 | 3 | `CSpaceFull` | Cannot allocate kernel objects |
 | 8 | `NoVfsEndpoint` | No vfsd endpoint configured |
 | 9 | `FileNotFound` | vfsd OPEN failed for the given path |
@@ -197,13 +197,13 @@ configuration; subsequent calls overwrite the stored endpoint.
 ## Capability Transfer
 
 Capability transfer uses the IPC message's cap slot array (up to 4 caps per
-message). On `CREATE_PROCESS`, the caller's Frame cap is moved into procmgr's
+message). On `CREATE_PROCESS`, the caller's Memory cap is moved into procmgr's
 CSpace atomically with the message delivery. procmgr consumes the cap during
 process creation and does not return it.
 
 On reply, procmgr transfers a badged process handle endpoint (for
 subsequent per-process operations) and derived copies of the child's
-`CSpace`, `ProcessInfo` frame, and `Thread` capabilities to the caller.
+`CSpace`, `ProcessInfo` memory cap, and `Thread` capabilities to the caller.
 procmgr retains the original caps for process lifecycle management.
 
 ---
@@ -245,12 +245,12 @@ Wire format:
 |---|---|
 | label | `procmgr_labels::REGISTER_INIT_TEARDOWN` (15) |
 | `data[0]` | `1` on the first round (carrying kernel-object caps); `0` on subsequent donation rounds |
-| `caps[0..]` | Round 1: 4 kernel-object caps (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) — MOVED out of init's CSpace via IPC cap-transfer. Subsequent rounds: 1-4 reclaimable Frame caps per round (segments, stack, `InitInfo` pages, IPC buffer). |
+| `caps[0..]` | Round 1: 4 kernel-object caps (`AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`) — MOVED out of init's CSpace via IPC cap-transfer. Subsequent rounds: 1-4 reclaimable Memory caps per round (segments, stack, `InitInfo` pages, IPC buffer). |
 
 On the first round procmgr stores the kernel-object caps and calls
 `syscall::thread_bind_notification(main_thread, death_eq,
 procmgr_labels::INIT_REAP_CORRELATOR)`. Subsequent rounds append to
-the donation Frame cap list. `INIT_TEARDOWN_DONE` (label 16, no
+the donation Memory cap list. `INIT_TEARDOWN_DONE` (label 16, no
 caps, no data words) closes the stream and arms the state machine.
 
 Reply: `procmgr_errors::SUCCESS` on accept, `INVALID_ARGUMENT` on
@@ -270,7 +270,7 @@ Procmgr replies `SUCCESS` then arms the state machine. Init proceeds
 to `sys_thread_exit` immediately; the death-EQ event with
 `INIT_REAP_CORRELATOR` (reserved `u32::MAX`) triggers
 [`init_reap::run_reap`](../src/init_reap.rs) which executes the six-step
-teardown (Threads → AddressSpace → DONATE_FRAMES → CSpace → log).
+teardown (Threads → AddressSpace → DONATE_MEMORY_CAPS → CSpace → log).
 
 ---
 
@@ -282,7 +282,7 @@ teardown (Threads → AddressSpace → DONATE_FRAMES → CSpace → log).
 | [docs/process-lifecycle.md](../../../docs/process-lifecycle.md) | System-scope creation order; procmgr's role and authority boundary with memmgr |
 | [abi/process-abi](../../../abi/process-abi/README.md) | ProcessInfo handover struct |
 | [abi/syscall](../../../abi/syscall/README.md) | Syscall numbers and register conventions |
-| [services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) | Frame allocation IPC |
+| [services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) | Memory-cap allocation IPC |
 
 ---
 

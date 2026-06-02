@@ -41,9 +41,9 @@ pub const LOOKUP: u32 = 1 << 0;
 pub const READDIR: u32 = 1 << 1;
 /// `NS_STAT` on this node is permitted.
 pub const STAT: u32 = 1 << 2;
-/// `NS_READ` / `NS_READ_FRAME` on this file is permitted.
+/// `NS_READ` / `NS_READ_MEMORY` on this file is permitted.
 pub const READ: u32 = 1 << 3;
-/// `FS_WRITE` / `FS_WRITE_FRAME` on this file is permitted.
+/// `FS_WRITE` / `FS_WRITE_MEMORY` on this file is permitted.
 pub const WRITE: u32 = 1 << 4;
 /// File is executable; consumed by ELF loaders to gate spawn.
 pub const EXEC: u32 = 1 << 5;

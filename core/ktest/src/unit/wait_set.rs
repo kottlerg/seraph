@@ -32,8 +32,8 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 /// to return immediately with the correct badge.
 pub fn add_notification_immediate(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for ws-notification test failed")?;
 
     wait_set_add(ws, sig, 42).map_err(|_| "wait_set_add(notification) failed")?;
@@ -61,9 +61,9 @@ pub fn add_notification_immediate(ctx: &TestContext) -> TestResult
 /// to return immediately with the correct badge.
 pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_frame_base)
-        .map_err(|_| "wait_set_create for ws-queue test failed")?;
-    let eq = event_queue_create(ctx.memory_frame_base, 4)
+    let ws =
+        wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for ws-queue test failed")?;
+    let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "event_queue_create for ws-queue test failed")?;
 
     wait_set_add(ws, eq, 99).map_err(|_| "wait_set_add(queue) failed")?;
@@ -94,9 +94,9 @@ pub fn add_queue_immediate(ctx: &TestContext) -> TestResult
 /// `wait_set_wait` blocks until a child thread fires a registered notification.
 pub fn blocking_wait(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_frame_base)
-        .map_err(|_| "wait_set_create for blocking test failed")?;
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let ws =
+        wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for blocking test failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for blocking test failed")?;
 
     wait_set_add(ws, sig, 7).map_err(|_| "wait_set_add for blocking test failed")?;
@@ -141,11 +141,11 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
 /// notification. Posts to the event queue and verifies only badge 2 fires.
 pub fn remove(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_frame_base)
-        .map_err(|_| "wait_set_create for remove test failed")?;
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let ws =
+        wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create for remove test failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for remove test failed")?;
-    let eq = event_queue_create(ctx.memory_frame_base, 4)
+    let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "event_queue_create for remove test failed")?;
 
     wait_set_add(ws, sig, 1).map_err(|_| "wait_set_add(sig) for remove test failed")?;
@@ -181,9 +181,9 @@ pub fn remove(ctx: &TestContext) -> TestResult
 /// reclaim through `wait_set_drop`.
 pub fn source_notification_pinned_by_member(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
-    let sig = cap_create_notification(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_notification failed")?;
+    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
+    let sig =
+        cap_create_notification(ctx.memory_base).map_err(|_| "cap_create_notification failed")?;
 
     wait_set_add(ws, sig, 31).map_err(|_| "wait_set_add(sig) failed")?;
     notification_send(sig, 0xCAFE).map_err(|_| "notification_send before drop failed")?;
@@ -210,9 +210,8 @@ pub fn source_notification_pinned_by_member(ctx: &TestContext) -> TestResult
 /// post-drop `wait_set_wait` can observe its live state.
 pub fn source_eventqueue_pinned_by_member(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
-    let eq =
-        event_queue_create(ctx.memory_frame_base, 4).map_err(|_| "event_queue_create failed")?;
+    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
+    let eq = event_queue_create(ctx.memory_base, 4).map_err(|_| "event_queue_create failed")?;
 
     wait_set_add(ws, eq, 73).map_err(|_| "wait_set_add(eq) failed")?;
     event_post(eq, 0xABCD_EF01).map_err(|_| "event_post before drop failed")?;
@@ -235,9 +234,8 @@ pub fn source_eventqueue_pinned_by_member(ctx: &TestContext) -> TestResult
 /// without UAF — the source is reclaimed via `wait_set_drop`'s cascade.
 pub fn source_endpoint_pinned_by_member(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_frame_base).map_err(|_| "wait_set_create failed")?;
-    let ep =
-        cap_create_endpoint(ctx.memory_frame_base).map_err(|_| "cap_create_endpoint failed")?;
+    let ws = wait_set_create(ctx.memory_base).map_err(|_| "wait_set_create failed")?;
+    let ep = cap_create_endpoint(ctx.memory_base).map_err(|_| "cap_create_endpoint failed")?;
 
     wait_set_add(ws, ep, 19).map_err(|_| "wait_set_add(ep) failed")?;
 

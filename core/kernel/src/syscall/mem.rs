@@ -18,16 +18,16 @@
 use crate::arch::current::trap_frame::TrapFrame;
 use syscall::SyscallError;
 
-/// `SYS_MEM_MAP` (16): map a physical Frame into a user address space.
+/// `SYS_MEM_MAP` (16): map a Memory cap's pages into a user address space.
 ///
-/// arg0 = Frame cap index (must have MAP right; WRITE/EXECUTE determine page perms).
+/// arg0 = Memory cap index (must have MAP right; WRITE/EXECUTE determine page perms).
 /// arg1 = `AddressSpace` cap index (must have MAP right).
 /// arg2 = virtual address of the first page to map (must be page-aligned, user range).
-/// arg3 = offset into the frame in pages (0 = start of frame).
+/// arg3 = offset into the Memory cap region in pages (0 = start of region).
 /// arg4 = number of pages to map.
 /// arg5 = protection bits (bit 1 = WRITE, bit 2 = EXECUTE; bit 0 = READ, no
 ///         effect on permissions but makes a read-only request nonzero and
-///         thus explicit). If zero, permissions are derived from the Frame
+///         thus explicit). If zero, permissions are derived from the Memory
 ///         cap's rights. If nonzero, WRITE/EXECUTE must each be a subset of
 ///         the cap's rights. W^X is enforced: WRITE and EXECUTE may not both
 ///         be set.
@@ -39,7 +39,7 @@ use syscall::SyscallError;
 #[allow(clippy::too_many_lines)]
 pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::{AddressSpaceObject, FrameObject};
+    use crate::cap::object::{AddressSpaceObject, MemoryObject};
     use crate::cap::slot::{CapTag, Rights};
     use crate::mm::PAGE_SIZE;
     use crate::mm::paging::PageFlags;
@@ -47,7 +47,7 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
 
-    let frame_idx = tf.arg(0) as u32;
+    let memory_idx = tf.arg(0) as u32;
     let aspace_idx = tf.arg(1) as u32;
     let virt_base = tf.arg(2);
     let offset_pages = tf.arg(3) as usize;
@@ -101,41 +101,41 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Resolve Frame cap.
+    // Resolve Memory cap.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let frame_slot =
-        unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::MAP) }?;
-    let frame_obj_nn = frame_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    let memory_slot =
+        unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::MAP) }?;
+    let memory_obj_nn = memory_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
-    // SAFETY: tag confirmed Frame; pointer remains valid for the whole syscall
+    // SAFETY: tag confirmed Memory; pointer remains valid for the whole syscall
     // (cap held by caller's CSpace; refcount > 0).
     #[allow(clippy::cast_ptr_alignment)]
-    let frame_ref = unsafe { &*(frame_obj_nn.as_ptr().cast::<FrameObject>()) };
+    let memory_ref = unsafe { &*(memory_obj_nn.as_ptr().cast::<MemoryObject>()) };
 
     // Read-lock the cap across the validate-and-commit sequence: shrinks of
-    // `frame.size` by a concurrent `sys_frame_split` would otherwise race
+    // `memory.size` by a concurrent `sys_memory_split` would otherwise race
     // with the bound check below or the mapping loop. RAII guard releases on
     // every return path.
-    let _frame_guard = crate::cap::object::FrameReadGuard::acquire(frame_ref);
+    let _frame_guard = crate::cap::object::MemoryReadGuard::acquire(memory_ref);
 
-    let frame_phys = frame_ref.base;
-    let frame_size = frame_ref.size;
-    let frame_rights = frame_slot.rights;
+    let memory_phys = memory_ref.base;
+    let memory_size = memory_ref.size;
+    let memory_rights = memory_slot.rights;
 
-    // Validate that offset + page_count stays within the frame.
+    // Validate that offset + page_count stays within the Memory cap region.
     let byte_offset = offset_pages
         .checked_mul(PAGE_SIZE)
         .ok_or(SyscallError::InvalidArgument)? as u64;
     let byte_end = byte_offset
         .checked_add(mapping_size as u64)
         .ok_or(SyscallError::InvalidArgument)?;
-    if byte_end > frame_size
+    if byte_end > memory_size
     {
         return Err(SyscallError::InvalidArgument);
     }
 
     // Determine page permissions. If prot_bits is nonzero, use explicit
-    // permissions (must be a subset of the Frame cap's rights). If zero,
+    // permissions (must be a subset of the Memory cap's rights). If zero,
     // derive from the cap's rights directly. Callers that hold a cap with
     // both WRITE and EXECUTE must use a derived sub-cap (or explicit
     // prot_bits) to avoid the W^X check below.
@@ -143,11 +143,11 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         let w = (prot_bits & 0x2) != 0;
         let x = (prot_bits & 0x4) != 0;
-        if w && !frame_rights.contains(Rights::WRITE)
+        if w && !memory_rights.contains(Rights::WRITE)
         {
             return Err(SyscallError::InsufficientRights);
         }
-        if x && !frame_rights.contains(Rights::EXECUTE)
+        if x && !memory_rights.contains(Rights::EXECUTE)
         {
             return Err(SyscallError::InsufficientRights);
         }
@@ -156,8 +156,8 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     else
     {
         (
-            frame_rights.contains(Rights::WRITE),
-            frame_rights.contains(Rights::EXECUTE),
+            memory_rights.contains(Rights::WRITE),
+            memory_rights.contains(Rights::EXECUTE),
         )
     };
     // W^X is enforced at mapping time: no page may be both writable and executable.
@@ -203,10 +203,10 @@ pub fn sys_mem_map(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     for i in 0..page_count
     {
         let virt = virt_base + (i * PAGE_SIZE) as u64;
-        let phys = frame_phys + byte_offset + (i * PAGE_SIZE) as u64;
+        let phys = memory_phys + byte_offset + (i * PAGE_SIZE) as u64;
 
         // SAFETY: virt is in user range (validated above); phys is from a
-        // Frame cap confirmed by the kernel at capability creation.
+        // Memory cap confirmed by the kernel at capability creation.
         // as_ptr validated non-null. Pooled vs heap-backed dispatch is
         // chosen once above based on the AS's typed-memory state.
         let result = if pooled
@@ -334,13 +334,13 @@ pub fn sys_mem_unmap(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 /// `SYS_MEM_PROTECT` (18): change permission flags on existing page mappings.
 ///
-/// arg0 = Frame cap index (must have MAP right; authorises the new permissions).
+/// arg0 = Memory cap index (must have MAP right; authorises the new permissions).
 /// arg1 = `AddressSpace` cap index (must have MAP right).
 /// arg2 = virtual address of the first page (page-aligned, user range).
 /// arg3 = number of pages (non-zero).
 /// arg4 = new protection bits: bit 1 = WRITE, bit 2 = EXECUTE (matches Rights layout).
 ///
-/// The new permissions must be a subset of the Frame cap's rights. W^X is
+/// The new permissions must be a subset of the Memory cap's rights. W^X is
 /// enforced: WRITE and EXECUTE may not both be set. Protecting a page that
 /// is not mapped returns `InvalidAddress`.
 ///
@@ -355,7 +355,7 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
     const USER_HALF_TOP: u64 = 0x0000_8000_0000_0000;
 
-    let frame_idx = tf.arg(0) as u32;
+    let memory_idx = tf.arg(0) as u32;
     let aspace_idx = tf.arg(1) as u32;
     let virt_base = tf.arg(2);
     let page_count = tf.arg(3) as usize;
@@ -411,20 +411,20 @@ pub fn sys_mem_protect(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Frame cap authorises the permission level.
+    // Memory cap authorises the permission level.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-    let frame_slot =
-        unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::MAP) }?;
+    let memory_slot =
+        unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::MAP) }?;
     // Verify object pointer is valid; rights are read from the slot directly.
-    let _ = frame_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    let frame_rights = frame_slot.rights;
+    let _ = memory_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    let memory_rights = memory_slot.rights;
 
-    // Requested permissions must be a subset of what the Frame cap allows.
-    if writable && !frame_rights.contains(Rights::WRITE)
+    // Requested permissions must be a subset of what the Memory cap allows.
+    if writable && !memory_rights.contains(Rights::WRITE)
     {
         return Err(SyscallError::InsufficientRights);
     }
-    if executable && !frame_rights.contains(Rights::EXECUTE)
+    if executable && !memory_rights.contains(Rights::EXECUTE)
     {
         return Err(SyscallError::InsufficientRights);
     }
@@ -471,11 +471,11 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Err(SyscallError::NotSupported)
 }
 
-// ── SYS_FRAME_SPLIT ───────────────────────────────────────────────────────────
+// ── SYS_MEMORY_SPLIT ───────────────────────────────────────────────────────────
 
-/// `SYS_FRAME_SPLIT` (33): carve a virgin tail off a Frame cap.
+/// `SYS_MEMORY_SPLIT` (33): carve a virgin tail off a Memory cap.
 ///
-/// arg0 = Frame cap index (must have MAP right).
+/// arg0 = Memory cap index (must have MAP right).
 /// arg1 = split offset in bytes (page-aligned; > 0 and < cap size; must be
 ///        at or above the cap's highest live retype offset, page-aligned).
 /// arg2 = reserved (must be 0).
@@ -496,17 +496,17 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// Returns the new tail-cap slot on success.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_memory_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::derivation::{DERIVATION_LOCK, link_child};
-    use crate::cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+    use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::retype;
     use crate::cap::seed_header_nn;
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
 
-    let frame_idx = tf.arg(0) as u32;
+    let memory_idx = tf.arg(0) as u32;
     let split_offset = tf.arg(1);
     // arg2 is reserved; ignore.
 
@@ -538,20 +538,20 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let parent_slot =
-        unsafe { super::lookup_cap(caller_cspace, frame_idx, CapTag::Frame, Rights::MAP) }?;
+        unsafe { super::lookup_cap(caller_cspace, memory_idx, CapTag::Memory, Rights::MAP) }?;
     let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: FrameObject (8-byte) behind KernelObjectHeader header.
-    // SAFETY: tag confirmed Frame; pointer is valid FrameObject.
+    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
+    // SAFETY: tag confirmed Memory; pointer is valid MemoryObject.
     #[allow(clippy::cast_ptr_alignment)]
-    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<FrameObject>()) };
+    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     let parent_rights = parent_slot.rights;
     let parent_retypable = parent_rights.contains(Rights::RETYPE);
     // SAFETY: caller_cspace validated non-null; id() reads discriminator.
     let cspace_id = unsafe { (*caller_cspace).id() };
 
-    let frame_idx_nz =
-        core::num::NonZeroU32::new(frame_idx).ok_or(SyscallError::InvalidCapability)?;
-    let parent_id = SlotId::current(cspace_id, frame_idx_nz);
+    let memory_idx_nz =
+        core::num::NonZeroU32::new(memory_idx).ok_or(SyscallError::InvalidCapability)?;
+    let parent_id = SlotId::current(cspace_id, memory_idx_nz);
 
     // ── Acquire locks (DERIVATION outer, frame-write inner) ──────────────────
     DERIVATION_LOCK.write_lock();
@@ -566,14 +566,14 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         .load(core::sync::atomic::Ordering::Acquire);
 
     // Refuse split when the parent has cap-derivation children. Their
-    // FrameObject pointer would still alias the (shrunken) parent and could
+    // MemoryObject pointer would still alias the (shrunken) parent and could
     // observe a region the parent no longer owns. memmgr / init / ktest's
     // split callers never derive before splitting.
-    // SAFETY: caller_cspace validated; frame_idx within CSpace bounds;
+    // SAFETY: caller_cspace validated; memory_idx within CSpace bounds;
     // DERIVATION_LOCK held.
     let parent_first_child = unsafe {
         (*caller_cspace)
-            .slot(frame_idx)
+            .slot(memory_idx)
             .and_then(|s| s.deriv_first_child)
     };
     if parent_first_child.is_some()
@@ -608,14 +608,14 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let tail_size = orig_size - split_offset;
     let tail_avail = if parent_retypable { tail_size } else { 0 };
 
-    // ── Mint tail FrameObject ─────────────────────────────────────────────────
+    // ── Mint tail MemoryObject ─────────────────────────────────────────────────
     //
-    // The wrapper body lives in the kernel SEED Frame cap; on tail
+    // The wrapper body lives in the kernel SEED Memory cap; on tail
     // dealloc, two independent reclaims fire: `owns_memory` returns the
     // tail's region to the buddy, and `header.ancestor=SEED` returns the
     // wrapper bytes via `retype_free`.
-    let tail_ptr = retype::alloc_in_seed(FrameObject {
-        header: KernelObjectHeader::with_ancestor(ObjectType::Frame, seed_header_nn()),
+    let tail_ptr = retype::alloc_in_seed(MemoryObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::Memory, seed_header_nn()),
         base: parent_phys + split_offset,
         size: tail_size,
         available_bytes: core::sync::atomic::AtomicU64::new(tail_avail),
@@ -633,11 +633,11 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // Insert under cspace.lock to keep the freelist/tag invariant against a
     // concurrent SYS_CAP_CREATE_* on the same cspace. Lock order: parent
-    // FrameObject lock → DERIVATION_LOCK → cspace.lock.
+    // MemoryObject lock → DERIVATION_LOCK → cspace.lock.
     // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
     let insert_res = unsafe {
         let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(CapTag::Frame, parent_rights, tail_ptr);
+        let r = (*caller_cspace).insert_cap(CapTag::Memory, parent_rights, tail_ptr);
         (*caller_cspace).lock.unlock_raw(saved);
         r
     };
@@ -655,10 +655,10 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // ── Wire derivation: tail becomes a sibling of parent under parent's parent ──
 
-    // SAFETY: DERIVATION_LOCK held; frame_idx within CSpace bounds.
+    // SAFETY: DERIVATION_LOCK held; memory_idx within CSpace bounds.
     let parent_deriv_parent = unsafe {
         (*caller_cspace)
-            .slot(frame_idx)
+            .slot(memory_idx)
             .and_then(|s| s.deriv_parent)
     };
     if let Some(grandparent) = parent_deriv_parent
@@ -683,7 +683,7 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // No reference is created from the raw pointer; the write goes directly
     // through `parent_obj_nn` (a NonNull obtained from the cap slot).
     unsafe {
-        let parent_mut = parent_obj_nn.as_ptr().cast::<FrameObject>();
+        let parent_mut = parent_obj_nn.as_ptr().cast::<MemoryObject>();
         (*parent_mut).size = split_offset;
     }
     if parent_retypable
@@ -701,22 +701,22 @@ pub fn sys_frame_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // Test stub.
 #[cfg(test)]
-pub fn sys_frame_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_memory_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }
 
-// ── SYS_FRAME_MERGE ───────────────────────────────────────────────────────────
+// ── SYS_MEMORY_MERGE ───────────────────────────────────────────────────────────
 
-/// `SYS_FRAME_MERGE` (50): absorb a virgin tail Frame cap back into its parent.
+/// `SYS_MEMORY_MERGE` (50): absorb a virgin tail Memory cap back into its parent.
 ///
-/// arg0 = parent Frame cap index (must have MAP right; physically-lower half).
+/// arg0 = parent Memory cap index (must have MAP right; physically-lower half).
 ///        Stays valid; its `size` grows to cover the absorbed tail's region.
-/// arg1 = tail Frame cap index (must have MAP right; physically-upper half).
+/// arg1 = tail Memory cap index (must have MAP right; physically-upper half).
 ///        Consumed; its slot is freed.
 /// arg2 = reserved (must be 0).
 ///
-/// Inverse of [`sys_frame_split`] under Option D. Both caps must:
+/// Inverse of [`sys_memory_split`] under Option D. Both caps must:
 /// - Be physically contiguous (`parent.base + parent.size == tail.base`).
 /// - Carry identical rights.
 /// - Agree on `owns_memory`.
@@ -732,10 +732,10 @@ pub fn sys_frame_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// slot is returned to the caller's `CSpace` free list.
 #[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
-pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_memory_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::derivation::{DERIVATION_LOCK, unlink_node};
-    use crate::cap::object::{FrameObject, dealloc_object};
+    use crate::cap::object::{MemoryObject, dealloc_object};
     use crate::cap::slot::{CapTag, Rights, SlotId};
     use crate::syscall::current_tcb;
 
@@ -765,11 +765,11 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let parent_slot =
-        unsafe { super::lookup_cap(caller_cspace, parent_idx, CapTag::Frame, Rights::MAP) }?;
+        unsafe { super::lookup_cap(caller_cspace, parent_idx, CapTag::Memory, Rights::MAP) }?;
     let parent_obj_nn = parent_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let tail_slot =
-        unsafe { super::lookup_cap(caller_cspace, tail_idx, CapTag::Frame, Rights::MAP) }?;
+        unsafe { super::lookup_cap(caller_cspace, tail_idx, CapTag::Memory, Rights::MAP) }?;
     let tail_obj_nn = tail_slot.object.ok_or(SyscallError::InvalidCapability)?;
 
     if parent_obj_nn == tail_obj_nn
@@ -784,14 +784,14 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let merged_retypable = merged_rights.contains(Rights::RETYPE);
 
     #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: tag confirmed Frame; cap held by caller's CSpace, ref count > 0.
-    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<FrameObject>()) };
+    // SAFETY: tag confirmed Memory; cap held by caller's CSpace, ref count > 0.
+    let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: tag confirmed Frame; cap held by caller's CSpace, ref count > 0.
-    let tail_ref = unsafe { &*(tail_obj_nn.as_ptr().cast::<FrameObject>()) };
+    // SAFETY: tag confirmed Memory; cap held by caller's CSpace, ref count > 0.
+    let tail_ref = unsafe { &*(tail_obj_nn.as_ptr().cast::<MemoryObject>()) };
 
     // ── Acquire locks (DERIVATION outer; per-cap write locks inner, ordered
-    // by FrameObject pointer to avoid deadlocks against concurrent merges) ──
+    // by MemoryObject pointer to avoid deadlocks against concurrent merges) ──
     DERIVATION_LOCK.write_lock();
 
     let (lock_first, lock_second) = if core::ptr::from_ref(parent_ref)
@@ -919,7 +919,7 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     let merged_size = parent_size + tail_size; // contiguity already verified
     // SAFETY: parent's write_lock held; this is the only mutator of size.
     unsafe {
-        let parent_mut = parent_obj_nn.as_ptr().cast::<FrameObject>();
+        let parent_mut = parent_obj_nn.as_ptr().cast::<MemoryObject>();
         (*parent_mut).size = merged_size;
     }
     if merged_retypable
@@ -967,7 +967,7 @@ pub fn sys_frame_merge(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // Test stub.
 #[cfg(test)]
-pub fn sys_frame_merge(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+pub fn sys_memory_merge(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

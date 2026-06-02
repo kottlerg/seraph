@@ -48,7 +48,7 @@ pub use wire::NsError;
 #[repr(u64)]
 pub enum NodeKind
 {
-    /// A regular file. Permits `NS_READ`, `NS_READ_FRAME`, `NS_STAT`.
+    /// A regular file. Permits `NS_READ`, `NS_READ_MEMORY`, `NS_STAT`.
     File = 0,
     /// A directory. Permits `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`.
     Dir = 1,
@@ -156,23 +156,23 @@ pub struct EntryView
     pub visible_requires: NamespaceRights,
 }
 
-/// Reply payload returned by [`NamespaceBackend::read_frame`].
+/// Reply payload returned by [`NamespaceBackend::read_memory`].
 ///
-/// `frame_cap` is a single-page Frame cap with `MAP|READ` rights
+/// `memory_cap` is a single-page Memory cap with `MAP|READ` rights
 /// covering the cached file page. The cookie value echoes the
 /// caller-supplied request cookie unchanged. `bytes_valid` is bounded
 /// by file end, the current backend cluster boundary, and the page
 /// tail.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct FrameReply
+pub struct MemoryReply
 {
-    /// Single-page Frame cap (`MAP|READ`) covering the cached page.
-    pub frame_cap: u32,
-    /// Bytes of valid file content starting at `frame_data_offset`.
+    /// Single-page Memory cap (`MAP|READ`) covering the cached page.
+    pub memory_cap: u32,
+    /// Bytes of valid file content starting at `memory_data_offset`.
     pub bytes_valid: u32,
-    /// Byte offset within the returned frame at which valid content
+    /// Byte offset within the returned page at which valid content
     /// for the requested file offset begins.
-    pub frame_data_offset: u32,
+    pub memory_data_offset: u32,
     /// Release cookie echoed from the request.
     pub cookie: u64,
 }
@@ -225,7 +225,7 @@ pub trait NamespaceBackend
         dst: &mut [u8],
     ) -> Result<usize, NsError>;
 
-    /// Frame-cap read: return a Frame cap covering the cached page for
+    /// Memory-cap read: return a Memory cap covering the cached page for
     /// `file` at `offset`, with `cookie` recorded for cooperative
     /// release.
     ///
@@ -233,14 +233,18 @@ pub trait NamespaceBackend
     ///
     /// Returns [`NsError::InvalidCookie`] for malformed cookies and
     /// other [`NsError`] variants for backend-defined failures.
-    fn read_frame(&mut self, file: NodeId, offset: u64, cookie: u64)
-    -> Result<FrameReply, NsError>;
+    fn read_memory(
+        &mut self,
+        file: NodeId,
+        offset: u64,
+        cookie: u64,
+    ) -> Result<MemoryReply, NsError>;
 
-    /// Best-effort release of a previously-issued frame for `file`
+    /// Best-effort release of a previously-issued page for `file`
     /// keyed by `cookie`. A cookie not currently outstanding is
     /// silently ignored. Drives the cooperative-release side of the
     /// eviction protocol.
-    fn release_frame(&mut self, file: NodeId, cookie: u64);
+    fn release_memory(&mut self, file: NodeId, cookie: u64);
 
     /// Best-effort cleanup hint when a holder is closing its cap on
     /// `node`. Cap revocation is the authoritative lifetime notification;
@@ -377,7 +381,7 @@ fn handle_lookup<B: NamespaceBackend>(
             // SEND_GRANT lets the holder attach caps to IPC requests
             // through this node cap (e.g. the per-process release-
             // endpoint SEND that travels in `caps[0]` of the first
-            // `FS_READ_FRAME`). It does not widen authority — the
+            // `FS_READ_MEMORY`). It does not widen authority — the
             // recipient still validates every received cap. SEND-only
             // would force the kernel to reject any cap-bearing IPC.
             match syscall::cap_derive_badge(

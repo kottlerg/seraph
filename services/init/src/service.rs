@@ -182,7 +182,7 @@ fn serve(
 /// is a comfortable upper bound.
 const MAX_APERTURE_CAPS: usize = 32;
 
-/// Maximum number of ACPI reclaimable-region Frame caps. Matches the
+/// Maximum number of ACPI reclaimable-region Memory caps. Matches the
 /// kernel's `MAX_ACPI_REGIONS`; 8 is generous.
 const MAX_ACPI_REGION_CAPS: usize = 8;
 
@@ -192,17 +192,17 @@ struct HwCaps
 {
     /// Root `Interrupt` range cap. Zero if the kernel did not mint one.
     irq_range_slot: u32,
-    /// RO Frame cap covering the ACPI RSDP page. Zero if none.
+    /// RO Memory cap covering the ACPI RSDP page. Zero if none.
     rsdp_slot: u32,
     rsdp_page_base: u64,
-    /// RO Frame cap covering the DTB blob. Zero if none.
+    /// RO Memory cap covering the DTB blob. Zero if none.
     dtb_slot: u32,
     dtb_page_base: u64,
     dtb_size: u64,
     /// All MMIO aperture caps (slot, base, size).
     apertures: [(u32, u64, u64); MAX_APERTURE_CAPS],
     aperture_count: usize,
-    /// ACPI reclaimable-region Frame caps (slot, base, size).
+    /// ACPI reclaimable-region Memory caps (slot, base, size).
     acpi_regions: [(u32, u64, u64); MAX_ACPI_REGION_CAPS],
     acpi_region_count: usize,
 }
@@ -232,8 +232,8 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
 
     // Named slots from InitInfo (protocol v5).
     hw.irq_range_slot = info.irq_range_cap;
-    hw.rsdp_slot = info.acpi_rsdp_frame_cap;
-    hw.dtb_slot = info.dtb_frame_cap;
+    hw.rsdp_slot = info.acpi_rsdp_memory_cap;
+    hw.dtb_slot = info.dtb_memory_cap;
 
     // Walk the descriptor array once to capture aperture + ACPI-region
     // metadata. RSDP / DTB base + size come from their descriptors too.
@@ -246,11 +246,11 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
                 hw.apertures[hw.aperture_count] = (d.slot, d.aux0, d.aux1);
                 hw.aperture_count += 1;
             }
-            CapType::Frame if d.slot == hw.rsdp_slot && hw.rsdp_slot != 0 =>
+            CapType::Memory if d.slot == hw.rsdp_slot && hw.rsdp_slot != 0 =>
             {
                 hw.rsdp_page_base = d.aux0;
             }
-            CapType::Frame if d.slot == hw.dtb_slot && hw.dtb_slot != 0 =>
+            CapType::Memory if d.slot == hw.dtb_slot && hw.dtb_slot != 0 =>
             {
                 hw.dtb_page_base = d.aux0;
                 hw.dtb_size = d.aux1;
@@ -261,15 +261,15 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
     }
 
     // ACPI region caps occupy a contiguous slot range starting at
-    // `acpi_region_frame_base`. Walk the descriptor array a second time
+    // `acpi_region_memory_base`. Walk the descriptor array a second time
     // to pick them out by slot range; their aux0/aux1 carry (base, size).
-    let ar_start = info.acpi_region_frame_base;
-    let ar_end = ar_start + info.acpi_region_frame_count;
-    if info.acpi_region_frame_count != 0
+    let ar_start = info.acpi_region_memory_base;
+    let ar_end = ar_start + info.acpi_region_memory_count;
+    if info.acpi_region_memory_count != 0
     {
         for d in crate::descriptors(info)
         {
-            if d.cap_type == CapType::Frame
+            if d.cap_type == CapType::Memory
                 && d.slot >= ar_start
                 && d.slot < ar_end
                 && hw.acpi_region_count < MAX_ACPI_REGION_CAPS
@@ -325,7 +325,7 @@ mod present
 /// The bootstrap protocol is:
 ///
 /// * Round 1 (fixed, 4 caps, 3 data words)
-///   - caps: `[registry_ep, irq_range, rsdp_frame, dtb_frame]`
+///   - caps: `[registry_ep, irq_range, rsdp_memory, dtb_memory]`
 ///     (zero-slots pass through where the kernel minted none)
 ///   - data: `[rsdp_page_base, dtb_page_base, dtb_size]`
 /// * Round 2+ (variable, ≤4 caps, up to 9 data words)
@@ -347,8 +347,8 @@ pub fn create_devmgr_with_caps(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    let devmgr_frame_cap = crate::find_module_by_name(info, b"devmgr")?;
-    let devmgr_module_copy = module_spawn_copy(devmgr_frame_cap)?;
+    let devmgr_memory_cap = crate::find_module_by_name(info, b"devmgr")?;
+    let devmgr_module_copy = module_spawn_copy(devmgr_memory_cap)?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
 
@@ -743,8 +743,8 @@ pub fn create_vfsd_with_caps(
     ipc_buf: *mut u64,
 ) -> Option<u32>
 {
-    let vfsd_frame_cap = crate::find_module_by_name(info, b"vfsd")?;
-    let vfsd_module_copy = module_spawn_copy(vfsd_frame_cap)?;
+    let vfsd_memory_cap = crate::find_module_by_name(info, b"vfsd")?;
+    let vfsd_module_copy = module_spawn_copy(vfsd_memory_cap)?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
 
@@ -1117,8 +1117,8 @@ pub fn phase3_svcmgr_handover(
     thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
     init_logd_thread_cap: u32,
-    mem_frame_reap_floor: u32,
-    orphan_frames: &[u32],
+    mem_reap_floor: u32,
+    orphan_memory_caps: &[u32],
 ) -> !
 {
     let init_self_cspace = info.cspace_cap;
@@ -1195,18 +1195,18 @@ pub fn phase3_svcmgr_handover(
     }
 
     // Reap-handoff: move init's kernel-object caps + every reclaimable
-    // Frame cap to procmgr. Procmgr binds a death-EQ on both of init's
+    // Memory cap to procmgr. Procmgr binds a death-EQ on both of init's
     // threads (main + init-logd) and reaps once both have exited — init-logd
     // outlives this main thread until the svcmgr-launched real-logd pulls
     // `HANDOVER_PULL`. The reap tears init's AS/CSpace/Threads down and
-    // donates the Frame caps to memmgr's pool.
+    // donates the Memory caps to memmgr's pool.
     handoff_to_procmgr_reap(
         info,
         procmgr_ep,
         init_logd_thread_cap,
         ipc_buf,
-        mem_frame_reap_floor,
-        orphan_frames,
+        mem_reap_floor,
+        orphan_memory_caps,
     );
 
     log("main thread exiting; init handed off to procmgr for reap");
@@ -1242,17 +1242,17 @@ unsafe fn send_teardown_round(procmgr_ep: u32, slots: &[u32], ipc_buf: *mut u64)
     }
 }
 
-/// Derive a transient full-rights copy of a boot-module Frame cap for a
+/// Derive a transient full-rights copy of a boot-module Memory cap for a
 /// `CREATE_PROCESS` spawn. Init retains the original — it is the sole owner
-/// of the module-source `FrameObject` and donates it to memmgr at reap. The
+/// of the module-source `MemoryObject` and donates it to memmgr at reap. The
 /// loader borrows this copy (deriving a read-only child for the load-time
 /// mapping) and deletes it once the ELF is loaded.
-fn module_spawn_copy(module_frame_cap: u32) -> Option<u32>
+fn module_spawn_copy(module_memory_cap: u32) -> Option<u32>
 {
-    syscall::cap_derive(module_frame_cap, syscall::RIGHTS_ALL).ok()
+    syscall::cap_derive(module_memory_cap, syscall::RIGHTS_ALL).ok()
 }
 
-/// Move init's kernel-object caps + every reclaimable Frame cap to
+/// Move init's kernel-object caps + every reclaimable Memory cap to
 /// procmgr via `REGISTER_INIT_TEARDOWN`, then notification
 /// `INIT_TEARDOWN_DONE`. IPC cap-transfer MOVES caps, so after this
 /// returns init's `CSpace` no longer holds the transferred slots.
@@ -1266,8 +1266,8 @@ fn handoff_to_procmgr_reap(
     procmgr_ep: u32,
     init_logd_thread_cap: u32,
     ipc_buf: *mut u64,
-    mem_frame_reap_floor: u32,
-    orphan_frames: &[u32],
+    mem_reap_floor: u32,
+    orphan_memory_caps: &[u32],
 )
 {
     // Round 1: kernel-object caps. `data[0] = 1` distinguishes from
@@ -1294,36 +1294,36 @@ fn handoff_to_procmgr_reap(
         return;
     }
 
-    // Donate every owns_memory Frame cap init solely holds, streamed in
+    // Donate every owns_memory Memory cap init solely holds, streamed in
     // MSG_CAP_SLOTS_MAX-sized rounds. Three disjoint sources:
     //  - explicit InitInfo ranges (not in the descriptor array): init's ELF
     //    segments, user stack, and the InitInfo region. (init's IPC buffer is
     //    not here: it lives in init's bootstrap arena, forwarded to memmgr at
     //    `finalize_memmgr` as an in-use run, not donated at reap.)
-    //  - a descriptor walk for the unnamed reclaimable Frame caps — the
+    //  - a descriptor walk for the unnamed reclaimable Memory caps — the
     //    bootloader and bundle reclaim ranges plus the AP-trampoline late
     //    cap — which carry no named InitInfo slot.
-    //  - FrameAlloc's orphans: free remainders abandoned while carving the
+    //  - MemoryAlloc's orphans: free remainders abandoned while carving the
     //    bootstrap arenas, below the floor with no descriptor.
     // The walk skips caps init does not solely own or that are not RAM: the
-    // consumed/forwarded usable-RAM prefix (below `mem_frame_reap_floor` —
-    // `FrameAlloc` arenas and the frames `finalize_memmgr` already forwarded;
+    // consumed/forwarded usable-RAM prefix (below `mem_reap_floor` —
+    // `MemoryAlloc` arenas and the memory caps `finalize_memmgr` already forwarded;
     // memmgr keeps them alive) and the firmware read-only caps (RSDP/ACPI/DTB;
     // owns_memory=false). The usable-RAM *tail* at or above the floor — free
-    // frames that did not fit the single bootstrap round — IS donated here, so
-    // every page of RAM reaches memmgr's pool. Boot-module Frame caps are also
+    // memory caps that did not fit the single bootstrap round — IS donated here, so
+    // every page of RAM reaches memmgr's pool. Boot-module Memory caps are also
     // included: init is their sole owner once every loader has copied the ELF
     // and dropped its borrowed read-only derivation.
-    let seg = info.segment_frame_base..info.segment_frame_base + info.segment_frame_count;
+    let seg = info.segment_memory_base..info.segment_memory_base + info.segment_memory_count;
     let stack =
-        info.init_stack_frame_base..info.init_stack_frame_base + info.init_stack_frame_count;
-    let inf = info.init_info_frame_base..info.init_info_frame_base + info.init_info_frame_count;
+        info.init_stack_memory_base..info.init_stack_memory_base + info.init_stack_memory_count;
+    let inf = info.init_info_memory_base..info.init_info_memory_base + info.init_info_memory_count;
 
-    let mem_lo = info.memory_frame_base;
-    let acpi_lo = info.acpi_region_frame_base;
+    let mem_lo = info.memory_base;
+    let acpi_lo = info.acpi_region_memory_base;
     let acpi_hi = info
-        .acpi_region_frame_base
-        .saturating_add(info.acpi_region_frame_count);
+        .acpi_region_memory_base
+        .saturating_add(info.acpi_region_memory_count);
 
     let mut chunk = [0u32; syscall_abi::MSG_CAP_SLOTS_MAX];
     let mut cn = 0usize;
@@ -1345,29 +1345,29 @@ fn handoff_to_procmgr_reap(
         }
         for desc in crate::descriptors(info)
         {
-            if desc.cap_type != CapType::Frame
+            if desc.cap_type != CapType::Memory
             {
                 continue;
             }
             let s = desc.slot;
-            if s >= mem_lo && s < mem_frame_reap_floor
+            if s >= mem_lo && s < mem_reap_floor
             {
                 continue;
             }
-            if (info.acpi_rsdp_frame_cap != 0 && s == info.acpi_rsdp_frame_cap)
-                || (info.dtb_frame_cap != 0 && s == info.dtb_frame_cap)
-                || (info.acpi_region_frame_count != 0 && s >= acpi_lo && s < acpi_hi)
+            if (info.acpi_rsdp_memory_cap != 0 && s == info.acpi_rsdp_memory_cap)
+                || (info.dtb_memory_cap != 0 && s == info.dtb_memory_cap)
+                || (info.acpi_region_memory_count != 0 && s >= acpi_lo && s < acpi_hi)
             {
                 continue;
             }
             push(s);
         }
-        // The free Frame caps FrameAlloc abandoned while carving bootstrap
-        // arenas: frame_split remainders below the floor with no descriptor.
+        // The free Memory caps MemoryAlloc abandoned while carving bootstrap
+        // arenas: memory_split remainders below the floor with no descriptor.
         // Without this they would cascade into the sealed buddy at CSpace
         // teardown and leak. They carry RETYPE + owns_memory like any RAM
-        // frame, so memmgr ingests them into its pool.
-        for &slot in orphan_frames
+        // memory cap, so memmgr ingests them into its pool.
+        for &slot in orphan_memory_caps
         {
             push(slot);
         }

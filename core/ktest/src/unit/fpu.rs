@@ -48,7 +48,7 @@ static A_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static B_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
 // Non-zero initialised static. Forces LLD to emit a `.data` section in the
-// ktest ELF, exercising the path where the kernel mints a Frame cap whose
+// ktest ELF, exercising the path where the kernel mints a Memory cap whose
 // underlying segment has a sub-page-aligned ELF VA. The cap must still
 // expose a page-aligned `base` and whole-page `size` to userspace — see
 // `mm::init_segment_caps_aligned`.
@@ -367,22 +367,22 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
     A_MISMATCHES.store(0, Ordering::Release);
     B_MISMATCHES.store(0, Ordering::Release);
 
-    let sig_a = cap_create_notification(ctx.memory_frame_base)
+    let sig_a = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification a for fpu::preempt_isolation failed")?;
-    let sig_b = cap_create_notification(ctx.memory_frame_base)
+    let sig_b = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification b for fpu::preempt_isolation failed")?;
-    let cs_a = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let cs_a = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace a for fpu::preempt_isolation failed")?;
-    let cs_b = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let cs_b = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace b for fpu::preempt_isolation failed")?;
     let child_sig_a = cap_copy(sig_a, cs_a, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy sig_a for fpu::preempt_isolation failed")?;
     let child_sig_b = cap_copy(sig_b, cs_b, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy sig_b for fpu::preempt_isolation failed")?;
 
-    let th_a = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_a)
+    let th_a = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_a)
         .map_err(|_| "cap_create_thread a for fpu::preempt_isolation failed")?;
-    let th_b = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs_b)
+    let th_b = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs_b)
         .map_err(|_| "cap_create_thread b for fpu::preempt_isolation failed")?;
 
     let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
@@ -728,13 +728,13 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         CROSS_MISMATCHES.store(0, Ordering::Release);
         CROSS_OBSERVED_CPU.store(u32::MAX, Ordering::Release);
 
-        let sig_ready = cap_create_notification(ctx.memory_frame_base)
+        let sig_ready = cap_create_notification(ctx.memory_base)
             .map_err(|_| "create_notification ready for preempt_isolation_cross_cpu failed")?;
-        let sig_resume = cap_create_notification(ctx.memory_frame_base)
+        let sig_resume = cap_create_notification(ctx.memory_base)
             .map_err(|_| "create_notification resume for preempt_isolation_cross_cpu failed")?;
-        let sig_done = cap_create_notification(ctx.memory_frame_base)
+        let sig_done = cap_create_notification(ctx.memory_base)
             .map_err(|_| "create_notification done for preempt_isolation_cross_cpu failed")?;
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+        let cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
             .map_err(|_| "create_cspace for preempt_isolation_cross_cpu failed")?;
 
         let child_ready = cap_copy(sig_ready, cs, RIGHTS_NOTIFY)
@@ -748,7 +748,7 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
         CROSS_SIG_RESUME.store(child_resume, Ordering::Release);
         CROSS_SIG_DONE.store(child_done, Ordering::Release);
 
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs)
             .map_err(|_| "cap_create_thread for preempt_isolation_cross_cpu failed")?;
 
         // Pin to CPU 0 initially: child must run and become CPU 0's

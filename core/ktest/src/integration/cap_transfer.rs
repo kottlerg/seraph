@@ -39,17 +39,17 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     crate::log("cap_transfer: entering run");
     // Create the endpoint for the IPC call.
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "integration::cap_transfer: cap_create_endpoint failed")?;
     crate::log("cap_transfer: ep created");
 
     // test_sig is the cap the child will transfer to the server via IPC.
-    let test_sig = cap_create_notification(ctx.memory_frame_base)
+    let test_sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::cap_transfer: cap_create_notification (test_sig) failed")?;
     crate::log("cap_transfer: test_sig created");
 
     // sync_sig is used by the child to report its post-reply verification result.
-    let sync_sig = cap_create_notification(ctx.memory_frame_base)
+    let sync_sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::cap_transfer: cap_create_notification (sync_sig) failed")?;
     crate::log("cap_transfer: sync_sig created");
 
@@ -57,7 +57,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     //   child_ep       — SEND | GRANT copy of ep (needed to call and transfer caps)
     //   child_test_sig — NOTIFY-only copy of test_sig (the cap to transfer)
     //   child_sync_sig — NOTIFY-only copy of sync_sig (for reporting back)
-    let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 32)
+    let cs = cap_create_cspace(ctx.memory_base, 0, 4, 32)
         .map_err(|_| "integration::cap_transfer: cap_create_cspace failed")?;
     crate::log("cap_transfer: cspace created");
 
@@ -75,7 +75,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let child_arg =
         u64::from(child_ep) | (u64::from(child_test_sig) << 16) | (u64::from(child_sync_sig) << 32);
 
-    let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+    let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs)
         .map_err(|_| "integration::cap_transfer: cap_create_thread failed")?;
     crate::log("cap_transfer: child thread created");
 

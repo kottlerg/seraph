@@ -103,7 +103,7 @@ slot for specialised purposes and follow their own bootstrap shape.
 ## Handover to svcmgr
 
 At the end of Phase 3, init transfers its kernel-object and
-reclaimable Frame capabilities to procmgr via
+reclaimable Memory capabilities to procmgr via
 `REGISTER_INIT_TEARDOWN` and exits; procmgr reaps the kernel objects
 and reclaims the frames. See
 [`process-lifecycle.md`](process-lifecycle.md) §"Init reap".

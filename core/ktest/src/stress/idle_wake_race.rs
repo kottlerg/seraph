@@ -76,9 +76,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let p2c = cap_create_notification(ctx.memory_frame_base)
+    let p2c = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::idle_wake_race: cap_create_notification (p2c) failed")?;
-    let c2p = cap_create_notification(ctx.memory_frame_base)
+    let c2p = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::idle_wake_race: cap_create_notification (c2p) failed")?;
 
     let child = crate::spawn::new_child(ctx)

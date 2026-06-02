@@ -1,7 +1,7 @@
 # virtio/blk
 
 VirtIO block device driver. Exposes a per-request DMA IPC interface for
-filesystem drivers; the data segment of every read targets a Frame
+filesystem drivers; the data segment of every read targets a Memory
 capability the caller transfers in.
 
 ---
@@ -62,9 +62,9 @@ the whole-disk endpoint; badged callers are rejected.
 |---|---|
 | label | 0 (success) or `RegisterRejected` (4) |
 
-### Label 3: `BLK_READ_INTO_FRAME`
+### Label 3: `BLK_READ_INTO_MEMORY`
 
-Read one or more contiguous sectors into a caller-supplied Frame. The
+Read one or more contiguous sectors into a caller-supplied Memory cap. The
 driver writes `count * 512` bytes starting at offset 0 of the supplied
 page, packed contiguously; the rest of the page is unspecified.
 
@@ -75,7 +75,7 @@ page, packed contiguously; the rest of the page is unspecified.
 | label | 3 |
 | data[0] | Starting LBA (relative to the caller badge's partition base) |
 | data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
-| caps[0] | Target Frame, `MAP \| WRITE`, at least `count * 512` bytes |
+| caps[0] | Target Memory cap, `MAP | WRITE`, at least `count * 512` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
 | caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
 
@@ -84,7 +84,7 @@ page, packed contiguously; the rest of the page is unspecified.
 | Field | Value |
 |---|---|
 | label | 0 (success) or one of the error codes below |
-| caps[0] | The target Frame, moved back to the caller |
+| caps[0] | The target Memory cap, moved back to the caller |
 
 **Error codes:**
 
@@ -93,7 +93,7 @@ page, packed contiguously; the rest of the page is unspecified.
 | 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
-| 5 | `InvalidFrameCap` | Target Frame missing `MAP\|WRITE`, sized other than one page, or absent |
+| 5 | `InvalidMemoryCap` | Target Memory cap missing `MAP|WRITE`, sized other than one page, or absent |
 
 #### Reserved cap slots and the IOMMU forward-compat shape
 
@@ -111,11 +111,11 @@ that introduction.
 release protocol grows a block-layer analogue; today the cap is null and
 the slot is unused.
 
-### Label 4: `BLK_WRITE_FROM_FRAME`
+### Label 4: `BLK_WRITE_FROM_MEMORY`
 
-Mirror of `BLK_READ_INTO_FRAME` for the write direction. The driver
+Mirror of `BLK_READ_INTO_MEMORY` for the write direction. The driver
 reads `count * 512` bytes starting at offset 0 of the supplied page and
-writes them to disk. The frame contents past the requested run are not
+writes them to disk. The memory cap contents past the requested run are not
 read.
 
 **Request:**
@@ -125,7 +125,7 @@ read.
 | label | 4 |
 | data[0] | Starting LBA (relative to the caller badge's partition base) |
 | data[1] | Sector count (`>= 1`; defaults to `1` if absent) |
-| caps[0] | Source Frame, `MAP \| READ`, at least `count * 512` bytes |
+| caps[0] | Source Memory cap, `MAP | READ`, at least `count * 512` bytes |
 | caps[1] | Reserved (null today; future per-request release handle) |
 | caps[2] | Reserved IPC-shape slot (null today; future userspace-IOMMU grant) |
 
@@ -134,7 +134,7 @@ read.
 | Field | Value |
 |---|---|
 | label | 0 (success) or one of the error codes below |
-| caps[0] | The source Frame, moved back to the caller |
+| caps[0] | The source Memory cap, moved back to the caller |
 
 **Error codes:**
 
@@ -143,7 +143,7 @@ read.
 | 1 | `DeviceStatusIoerr` | VirtIO device returned `VIRTIO_BLK_S_IOERR` |
 | 2 | `DeviceStatusUnsupp` | VirtIO device returned `VIRTIO_BLK_S_UNSUPP` |
 | 3 | `OutOfBounds` | LBA outside the caller badge's partition range |
-| 5 | `InvalidFrameCap` | Source Frame missing `MAP\|READ`, sized smaller than `count * 512`, or absent |
+| 5 | `InvalidMemoryCap` | Source Memory cap missing `MAP|READ`, sized smaller than `count * 512`, or absent |
 
 ---
 
@@ -151,11 +151,11 @@ read.
 
 The driver owns a single 1-page DMA buffer for the request header and
 status byte (offsets 0 and 1024). The data segment of every read or
-write is the caller-supplied Frame: the driver queries `phys_base` via
-`cap_info` without mapping the frame into its own address space (the
+write is the caller-supplied Memory cap: the driver queries `phys_base` via
+`cap_info` without mapping the memory cap into its own address space (the
 device DMAs to or from the physical address; the driver never touches
 the data), then programs the descriptor chain to point at `phys_base`.
-The Frame cap is moved back to the caller in the reply on every
+The Memory cap is moved back to the caller in the reply on every
 outcome, so it never accumulates in the driver's `CSpace`.
 
 The notify-after-avail-update memory-ordering pair (release fence on the

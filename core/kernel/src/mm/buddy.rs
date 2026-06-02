@@ -34,11 +34,11 @@
 //! # Post-handoff sealing
 //!
 //! The buddy is a boot-time allocator only. Phase 7 ([`crate::cap`]) drains
-//! every page into userspace Frame caps (`drain_for_usercaps(0, …)`), then
+//! every page into userspace Memory caps (`drain_for_usercaps(0, …)`), then
 //! [`seal`][BuddyAllocator::seal]s the allocator. memmgr is the sole dynamic
 //! memory authority thereafter; the buddy neither allocates (its free list is
 //! empty) nor should receive frees. A post-seal [`free_range`][BuddyAllocator::free_range]
-//! means an `owns_memory` Frame cap was destroyed after handoff — RAM leaked
+//! means an `owns_memory` Memory cap was destroyed after handoff — RAM leaked
 //! into an allocator nothing draws from — and trips a `debug_assert`.
 
 // cast_possible_truncation: u64→usize and usize→u16 casts bounded by physical address ranges.
@@ -238,7 +238,7 @@ impl BuddyAllocator
     /// Records that all RAM has been handed to userspace and the buddy is now
     /// a sealed boot artifact. Subsequent [`free_range`][Self::free_range]
     /// calls trip a `debug_assert`: post-handoff the only owner of buddy-backed
-    /// RAM is memmgr, which holds its `owns_memory` Frame caps permanently, so
+    /// RAM is memmgr, which holds its `owns_memory` Memory caps permanently, so
     /// a free here is an accounting violation. Called once, at the end of the
     /// drain, while the free list is empty.
     #[cfg_attr(test, allow(dead_code))]
@@ -252,7 +252,7 @@ impl BuddyAllocator
     ///
     /// Used at boot for owned regions whose pages live outside the free
     /// list but may later be returned via [`free_range`][Self::free_range]
-    /// — e.g., boot-module Frame caps minted with `owns_memory = true`.
+    /// — e.g., boot-module Memory caps minted with `owns_memory = true`.
     /// Bumping `total_pages` keeps the `free / total` memory-pressure
     /// ratio well-defined if those pages are eventually reclaimed.
     ///
@@ -275,23 +275,23 @@ impl BuddyAllocator
     /// the range re-coalesces into the largest naturally-aligned blocks
     /// available once all pages are returned.
     ///
-    /// Used by [`FrameObject`](crate::cap::object::FrameObject) teardown to
+    /// Used by [`MemoryObject`](crate::cap::object::MemoryObject) teardown to
     /// return an entire cap-backed region (which need not be a single
-    /// power-of-two block after `frame_split`) in one call. Before the
+    /// power-of-two block after `memory_split`) in one call. Before the
     /// Phase-7 [`seal`][Self::seal] this balances the boot-time ledger; after
     /// it, see the post-seal `debug_assert` below.
     ///
     /// # Safety
     ///
     /// Every 4 KiB page in `[base, base + size_bytes)` must have been
-    /// previously allocated from this buddy (directly or via a `frame_split`
+    /// previously allocated from this buddy (directly or via a `memory_split`
     /// sub-region) and must not be accessed by any code during or after
     /// this call. `base` and `size_bytes` must be `PAGE_SIZE`-aligned.
     pub unsafe fn free_range(&mut self, base: u64, size_bytes: u64)
     {
         debug_assert!(base.is_multiple_of(PAGE_SIZE as u64));
         debug_assert!(size_bytes.is_multiple_of(PAGE_SIZE as u64));
-        // The sole runtime caller is `dealloc_object`'s Frame arm, reached
+        // The sole runtime caller is `dealloc_object`'s Memory arm, reached
         // only for an `owns_memory` cap at its last reference. Every such cap
         // is minted at or after the Phase-7 drain and routes to memmgr, which
         // never destroys it — so post-seal this path is unreachable on a
@@ -412,19 +412,19 @@ impl BuddyAllocator
         Some(addr)
     }
 
-    /// Drain free blocks for userspace Frame caps, keeping at least
+    /// Drain free blocks for userspace Memory caps, keeping at least
     /// `reserve_pages` pages for kernel-internal use (page tables, heap, stacks).
     ///
     /// Pops blocks from highest order downward, writing `(physical_address, order)`
     /// pairs into `out`. Returns the number of entries written.
     ///
     /// Called once during Phase 7 to partition physical memory between the kernel
-    /// buddy allocator and userspace Frame capabilities.
+    /// buddy allocator and userspace Memory capabilities.
     pub fn drain_for_usercaps(&mut self, reserve_pages: usize, out: &mut [(u64, usize)]) -> usize
     {
         let mut count = 0;
 
-        // Drain from highest order first to produce fewer, larger Frame caps.
+        // Drain from highest order first to produce fewer, larger Memory caps.
         for order in (0..=MAX_ORDER).rev()
         {
             while self.free_pages > reserve_pages && count < out.len()

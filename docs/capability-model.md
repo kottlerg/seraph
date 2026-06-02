@@ -37,13 +37,13 @@ capability".
 Each capability type represents a distinct kind of kernel object. The rights attached
 to a capability are type-specific.
 
-### Memory Frame
+### Memory
 
 A capability to one or more contiguous physical frames. Rights:
 - **Map** — may map these frames into an address space
 - **Write** — authority to create writable mappings
 - **Execute** — authority to create executable mappings
-- **Retype** — authority to consume bytes of this Frame's region as the
+- **Retype** — authority to consume bytes of this Memory's region as the
   backing storage for a newly created kernel object (see
   [Typed Memory](#typed-memory))
 
@@ -52,17 +52,17 @@ authorities over the same physical memory. W^X is enforced at mapping time: the
 kernel rejects any `mem_map` or `mem_protect` call that would make a page
 simultaneously writable and executable.
 
-The kernel mints Frame caps for all usable RAM at boot with `Map | Write |
-Execute | Retype` and places them in init's CSpace. Frame caps minted for
+The kernel mints Memory caps for all usable RAM at boot with `Map | Write |
+Execute | Retype` and places them in init's CSpace. Memory caps minted for
 firmware tables (ACPI regions, RSDP, DTB), boot modules, and init's own
 ELF segments mint without `Retype` — they are mappable read-only references
 to fixed-purpose memory and cannot be consumed for kernel-object creation.
 
-Init transfers RAM Frame caps (via the derive-twice pattern) to memmgr, which
-thereafter owns userspace RAM frame allocation and answers `REQUEST_FRAMES`
+Init transfers RAM Memory caps (via the derive-twice pattern) to memmgr, which
+thereafter owns userspace RAM frame allocation and answers `REQUEST_MEMORY_CAPS`
 for every std-built service. See
 [`userspace-memory-model.md`](userspace-memory-model.md) and
-[`services/memmgr/README.md`](../services/memmgr/README.md). MMIO Frame caps
+[`services/memmgr/README.md`](../services/memmgr/README.md). MMIO Memory caps
 follow a separate flow through devmgr; see
 [`device-management.md`](device-management.md).
 
@@ -303,9 +303,9 @@ withdrawn. If the revoker still holds the parent capability, it retains access.
 ## Object Creation
 
 New kernel objects are created via typed syscalls. Every creation call
-consumes a Frame capability with the `Retype` right as its first
-argument; the kernel constructs the new object inside that Frame's
-backing region, debiting bytes from the Frame's available-bytes ledger.
+consumes a Memory capability with the `Retype` right as its first
+argument; the kernel constructs the new object inside that Memory's
+backing region, debiting bytes from the Memory's available-bytes ledger.
 
 ```
 create_endpoint(frame)             → endpoint_cap  (Send + Receive + Grant)
@@ -317,28 +317,28 @@ create_cspace(frame, ...)          → cspace_cap    (Insert + Delete + Derive +
 create_wait_set(frame)             → wait_set_cap  (Modify + Wait)
 ```
 
-The kernel rejects creation if the Frame cap lacks `Retype` rights or
+The kernel rejects creation if the Memory cap lacks `Retype` rights or
 if its available-bytes ledger has insufficient room for the requested
 object. The returned capability is placed in a free slot in the caller's
 CSpace. The caller holds all rights on a freshly created object.
 
 The kernel does not track ownership beyond the derivation tree. If a process destroys
 all capabilities in the derivation tree for an object — including its own — the kernel
-reclaims the object's bytes (returning them to the Frame cap from which the object
+reclaims the object's bytes (returning them to the Memory cap from which the object
 was retyped) and frees the slot. Objects do not outlive all references to them.
 
 ---
 
 ## Typed Memory
 
-Every kernel object's backing storage is accounted to a specific Frame
+Every kernel object's backing storage is accounted to a specific Memory
 capability. There is no ambient kernel pool from which a process can
 draw kernel-object memory; a process can only create kernel objects
-against Frame caps it holds with `Retype` rights.
+against Memory caps it holds with `Retype` rights.
 
 ### Available-bytes ledger
 
-Each retypable Frame capability carries an `available_bytes` counter.
+Each retypable Memory capability carries an `available_bytes` counter.
 Creating a kernel object against the cap debits the counter by the
 object's byte cost (rounded up to a fixed size class). Destroying
 the object credits the bytes back. The counter is observable via
@@ -346,7 +346,7 @@ the object credits the bytes back. The counter is observable via
 
 The ledger gives userspace memory managers a single primitive for
 budgeting both *mapped* memory (via `mem_map`) and *kernel-object*
-memory (via the create syscalls above): one Frame cap, two consuming
+memory (via the create syscalls above): one Memory cap, two consuming
 operations, one budget. A misbehaving service cannot inflate kernel
 memory through a back channel — every byte of kernel-object backing
 is debited from a cap the service holds.
@@ -355,7 +355,7 @@ is debited from a cap the service holds.
 
 When a kernel object's reference count reaches zero (every cap referring
 to it has been destroyed), the kernel reclaims its bytes back to the
-Frame capability the object was retyped from. If the source Frame cap's
+Memory capability the object was retyped from. If the source Memory cap's
 own reference count then reaches zero, the reclamation cascades upward
 through the derivation chain. Process death is an instance of this
 cascade: revoking a child's CSpace destroys all caps the child held,
@@ -369,20 +369,20 @@ Page tables and CSpace slot pages are kernel-half memory that grows
 during normal operation as a process maps memory or accumulates caps.
 Each `AddressSpace` and `CSpace` capability carries its own growth
 budget — a pool of pages donated at creation time from a Retype-bearing
-Frame cap — from which `mem_map` and `cap_insert` allocate. Exhausting
+Memory cap — from which `mem_map` and `cap_insert` allocate. Exhausting
 the budget returns `NoMemory`; the budget refills via *augment mode* on
 the same create syscall (passing the existing AS/CS slot as the augment
 target merges a new slab of pages into its growth budget).
 
 This means every kernel-half page-table and slot-page allocation is
-gated by a Frame cap the owning process holds. There is no untracked
+gated by a Memory cap the owning process holds. There is no untracked
 kernel growth path.
 
 ### Cap introspection
 
 `SYS_CAP_INFO` is a read-only inquiry that returns runtime state for
 a held capability: tag and rights for any cap; size, available-bytes,
-and retype-rights flag for Frame caps; PT growth budget for AddressSpace
+and retype-rights flag for Memory caps; PT growth budget for AddressSpace
 caps; slot capacity, slots used, and growth budget for CSpace caps.
 The syscall enables defensive ledger checks (e.g. memmgr can verify a
 returning cap's available-bytes), and lets receivers of a cap from a
@@ -395,16 +395,16 @@ less-trusted source validate its shape before relying on it.
 At boot, the kernel creates init's Thread, AddressSpace, and CSpace and populates
 the CSpace with an initial set of capabilities covering all available resources:
 
-- Frame capabilities for all usable physical memory
+- Memory capabilities for all usable physical memory
 - MMIO region capabilities for all boot-provided platform resource regions
   (MmioRange and PciEcam entries from `BootInfo.platform_resources`)
 - Interrupt capabilities for all boot-provided interrupt lines
-- Read-only Frame capabilities for firmware table regions (PlatformTable entries),
+- Read-only Memory capabilities for firmware table regions (PlatformTable entries),
   allowing userspace to parse ACPI or Device Tree data
 - IoPortRange capabilities for all boot-provided I/O port ranges (x86-64 only)
 - One SchedControl capability (Elevate rights)
 - Thread, AddressSpace, and CSpace capabilities for init itself
-- Frame capabilities for each boot module image (raw ELF images for early services)
+- Memory capabilities for each boot module image (raw ELF images for early services)
 
 Init is responsible for delegating appropriate subsets of this authority to each service it starts,
 following the principle of least privilege. See [device-management.md](device-management.md#what-devmgr-receives-from-init)

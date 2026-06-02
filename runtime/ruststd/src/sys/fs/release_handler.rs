@@ -3,15 +3,15 @@
 
 //! Per-process release-handler thread for the seraph fs frame protocol.
 //!
-//! The fs driver evicts cached pages by sending `FS_RELEASE_FRAME` on
+//! The fs driver evicts cached pages by sending `FS_RELEASE_MEMORY` on
 //! a badged SEND derived from the per-process release endpoint owned
 //! by this module. The SEND is transferred to the driver in `caps[0]`
-//! of the first [`fs_labels::FS_READ_FRAME`] request for each opened
+//! of the first [`fs_labels::FS_READ_MEMORY`] request for each opened
 //! file (see [`super::File::read_frame`]); from that point on the
 //! driver's eviction worker can route cooperative releases here. The
 //! handler removes the matching outstanding mapping from the
 //! per-`File` registry (race-safe against the local read path's
-//! immediate-release cleanup), unmaps the page, drops the frame cap,
+//! immediate-release cleanup), unmaps the page, drops the memory cap,
 //! returns the VA to the reservation arena, and replies
 //! [`fs_labels::FS_RELEASE_ACK`].
 //!
@@ -34,13 +34,13 @@ use crate::sys::reserve as pal_reserve;
 use crate::sys::reserve::ReservedRange;
 
 /// One outstanding cache-page mapping the local read path has obtained
-/// from the fs driver via `FS_READ_FRAME`. Carries everything the
+/// from the fs driver via `FS_READ_MEMORY`. Carries everything the
 /// release path (local or driver-initiated) needs to unmap and free.
 pub(super) struct OutstandingMapping
 {
     pub cookie: u64,
     pub range: ReservedRange,
-    pub frame_cap: u32,
+    pub memory_cap: u32,
 }
 
 /// Per-`File` registration entry held by the release handler under its
@@ -171,7 +171,7 @@ pub(super) fn register(state: &ReleaseState, badge: u64) -> Arc<FileEntry>
 
 /// Remove a `File`'s registration. After this call the handler cannot
 /// dispatch any further releases to the file; subsequent
-/// `FS_RELEASE_FRAME` arrivals look up an empty slot and ack-without-act.
+/// `FS_RELEASE_MEMORY` arrivals look up an empty slot and ack-without-act.
 pub(super) fn unregister(state: &ReleaseState, badge: u64) -> Option<Arc<FileEntry>>
 {
     let mut reg = state
@@ -182,7 +182,7 @@ pub(super) fn unregister(state: &ReleaseState, badge: u64) -> Option<Arc<FileEnt
 }
 
 /// Add an outstanding mapping to a `FileEntry`. Called by `File::read`
-/// after a successful `FS_READ_FRAME` so a forced release can find it.
+/// after a successful `FS_READ_MEMORY` so a forced release can find it.
 pub(super) fn add_mapping(entry: &FileEntry, m: OutstandingMapping)
 {
     let mut maps = entry.mappings.lock().unwrap_or_else(PoisonError::into_inner);
@@ -209,7 +209,7 @@ pub(super) fn drain_mappings(entry: &FileEntry) -> Vec<OutstandingMapping>
 }
 
 /// Local cleanup of a single mapping by cookie. Called after a
-/// successful synchronous `FS_RELEASE_FRAME` round-trip from
+/// successful synchronous `FS_RELEASE_MEMORY` round-trip from
 /// `File::read` to release the resources the read held briefly. If the
 /// handler thread already cleaned up this cookie (rare but possible
 /// during a contended eviction), this is a no-op.
@@ -221,7 +221,7 @@ pub(super) fn release_one_local(entry: &FileEntry, aspace: u32, cookie: u64)
         return;
     };
     let _ = syscall::mem_unmap(aspace, m.range.va_start(), m.range.page_count());
-    let _ = syscall::cap_delete(m.frame_cap);
+    let _ = syscall::cap_delete(m.memory_cap);
     pal_reserve::unreserve_pages(m.range);
 }
 
@@ -254,7 +254,7 @@ fn handler_main()
             Err(_) => continue,
         };
 
-        if msg.label != fs_labels::FS_RELEASE_FRAME
+        if msg.label != fs_labels::FS_RELEASE_MEMORY
         {
             // Unknown opcode — reply with label zero (cheap empty ack)
             // so the sender's blocking ipc_call returns and we don't

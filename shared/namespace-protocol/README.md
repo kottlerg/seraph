@@ -205,7 +205,7 @@ bits are defined; sixteen are reserved.
 | 0 | `LOOKUP` | `NS_LOOKUP` into this directory |
 | 1 | `READDIR` | `NS_READDIR` enumeration |
 | 2 | `STAT` | `NS_STAT` |
-| 3 | `READ` | `NS_READ` / `NS_READ_FRAME` (file) |
+| 3 | `READ` | `NS_READ` / `NS_READ_MEMORY` (file) |
 | 4 | `WRITE` | `NS_WRITE` (deferred; reserved) |
 | 5 | `EXEC` | File is executable; consumed by ELF loaders |
 | 6 | `MUTATE_DIR` | `NS_CREATE` / `NS_UNLINK` (deferred; reserved) |
@@ -231,9 +231,9 @@ this through the intersection at step 5 of `NS_LOOKUP`.
 | 4 | `IsADirectory` | Operation requires a file; node is a directory |
 | 5 | `InvalidName` | Name failed [`validate_name`] |
 | 6 | `InvalidOffset` | Read past EOF |
-| 7 | `InvalidFrameCap` | `NS_READ_FRAME` reply target frame-cap shape wrong |
-| 8 | `InvalidCookie` | Frame-cap cookie zero or duplicate |
-| 9 | `Evicted` | Frame referenced by a held cookie has been evicted |
+| 7 | `InvalidMemoryCap` | `NS_READ_MEMORY` reply target Memory-cap shape wrong |
+| 8 | `InvalidCookie` | Memory-cap cookie zero or duplicate |
+| 9 | `Evicted` | Page referenced by a held cookie has been evicted |
 | 10 | `IoError` | Backend storage failed |
 | 11 | `NotSupported` | Operation not implemented on this server |
 | 12 | `OutOfResources` | Server resource exhaustion |
@@ -257,11 +257,11 @@ filtering — backends never re-implement those checks.
 | `readdir_entry` | `NS_READDIR` |
 | `stat` | `NS_STAT` |
 | `read_inline` | future `NS_READ` |
-| `read_frame` | future `NS_READ_FRAME` |
-| `release_frame` | future `NS_RELEASE_FRAME` |
+| `read_memory` | future `NS_READ_MEMORY` |
+| `release_memory` | future `NS_RELEASE_MEMORY` |
 | `close` | future `NS_CLOSE` (best-effort cleanup hint) |
 
-Frame-cap reads continue to use the [`ipc::fs_labels::FS_READ_FRAME`]
+Memory-cap reads continue to use the [`ipc::fs_labels::FS_READ_MEMORY`]
 surface today; they are documented in
 [`services/fs/docs/fs-driver-protocol.md`](../../services/fs/docs/fs-driver-protocol.md).
 Migration of the read surface to `NS_*` labels is a follow-up phase.

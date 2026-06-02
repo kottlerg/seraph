@@ -12,7 +12,7 @@
 //! `IoLayout` owns the driver's permanent 1-page DMA buffer. The request
 //! header (offset 0, 16 bytes) and status byte (offset 1024, 1 byte) live
 //! there permanently. The 512-byte data segment is supplied per-request by
-//! the caller as a Frame cap; [`IoLayout::read_chain`] /
+//! the caller as a Memory cap; [`IoLayout::read_chain`] /
 //! [`IoLayout::write_chain`] parameterise the data-segment physical
 //! address. The driver's own page never holds bulk data.
 
@@ -28,9 +28,9 @@ const VIRTIO_BLK_T_OUT: u32 = 1;
 #[derive(Copy, Clone)]
 pub enum IoDirection
 {
-    /// Sector read: device DMAs data into the caller-supplied frame.
+    /// Sector read: device DMAs data into the caller-supplied memory cap.
     Read,
-    /// Sector write: device DMAs data out of the caller-supplied frame.
+    /// Sector write: device DMAs data out of the caller-supplied memory cap.
     Write,
 }
 
@@ -92,7 +92,7 @@ impl IoLayout
     /// must be a non-zero multiple of 512).
     ///
     /// Mirror of [`Self::read_chain`] with the data segment's writable
-    /// flag flipped: the device reads from the caller-supplied frame and
+    /// flag flipped: the device reads from the caller-supplied memory cap and
     /// writes only the completion status byte in the driver's page.
     pub fn write_chain(&self, data_phys: u64, data_len: u32) -> [(u64, u32, bool); 3]
     {
@@ -155,9 +155,9 @@ const IRQ_WAIT_TIMEOUT_MS: u64 = 50;
 
 /// Submit a read or write request and wait for completion via IRQ notification.
 ///
-/// `data_phys` is the physical address of the caller-supplied frame's
-/// data segment (offset 0 of the frame per the `BLK_READ_INTO_FRAME` /
-/// `BLK_WRITE_FROM_FRAME` contract). `data_len` is `count * 512` for
+/// `data_phys` is the physical address of the caller-supplied memory cap's
+/// data segment (offset 0 of the memory cap per the `BLK_READ_INTO_MEMORY` /
+/// `BLK_WRITE_FROM_MEMORY` contract). `data_len` is `count * 512` for
 /// `count` consecutive sectors starting at `sector`; the device
 /// transfers the entire run in one descriptor chain.
 ///

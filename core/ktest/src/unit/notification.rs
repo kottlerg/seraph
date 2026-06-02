@@ -31,7 +31,7 @@ static mut HIGH_BIT_CHILD_STACK: ChildStack = ChildStack::ZERO;
 /// `notification_send` ORs bits into a notification object. Non-blocking.
 pub fn send(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for send test failed")?;
     notification_send(sig, 0xABCD).map_err(|_| "notification_send failed")?;
     // Drain the bits so subsequent tests are not surprised by a pre-set notification.
@@ -45,7 +45,7 @@ pub fn send(ctx: &TestContext) -> TestResult
 /// `notification_wait` blocks until a child sends bits; returns the sent bitmask.
 pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for blocking-wait test failed")?;
 
     // Create a child CSpace + thread, copy the notification cap (NOTIFY right only).
@@ -73,7 +73,7 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
 /// `notification_wait` returns immediately when bits are already set.
 pub fn send_before_wait_immediate(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for immediate-wait test failed")?;
     notification_send(sig, 0x1234).map_err(|_| "notification_send failed")?;
     // Bits are already set — notification_wait must return without blocking.
@@ -92,7 +92,7 @@ pub fn send_before_wait_immediate(ctx: &TestContext) -> TestResult
 /// with `InsufficientRights`.
 pub fn wait_insufficient_rights(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for rights test failed")?;
     // Derive a cap with NOTIFY (send) right only — no WAIT (receive) right.
     let send_only =
@@ -123,7 +123,7 @@ pub fn wait_insufficient_rights(ctx: &TestContext) -> TestResult
 /// return the OR of all three (0x7), not just the last value.
 pub fn multiple_sends_before_wait_accumulate_bits(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for multi-send test failed")?;
 
     notification_send(sig, 0x1).map_err(|_| "notification_send(0x1) failed")?;
@@ -149,7 +149,7 @@ pub fn multiple_sends_before_wait_accumulate_bits(ctx: &TestContext) -> TestResu
 /// 2. A subsequent non-zero send arrives intact (error did not corrupt state).
 pub fn send_zero_bits_is_noop(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for zero-send test failed")?;
 
     // Kernel rejects zero-bit send.
@@ -176,7 +176,7 @@ pub fn send_zero_bits_is_noop(ctx: &TestContext) -> TestResult
 /// `notification_send` on a cap with only WAIT right (no NOTIFY) must fail.
 pub fn send_insufficient_rights(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for send_insufficient_rights failed")?;
 
     // Derive a cap with WAIT right only — no NOTIFY (send) right.
@@ -201,7 +201,7 @@ pub fn send_insufficient_rights(ctx: &TestContext) -> TestResult
 /// timeout less a small slack.
 pub fn wait_timeout_fires(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for wait_timeout_fires failed")?;
 
     let t0 = system_info(SystemInfoType::ElapsedUs as u64)
@@ -234,7 +234,7 @@ pub fn wait_timeout_fires(ctx: &TestContext) -> TestResult
 /// bit-63-set bitmasks to userspace as `Err(i64::MIN)`.
 pub fn wait_high_bit_roundtrip(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for wait_high_bit_roundtrip failed")?;
 
     // Bit 63 alone — the aliasing case.
@@ -264,7 +264,7 @@ pub fn wait_high_bit_roundtrip(ctx: &TestContext) -> TestResult
 /// immediate-bits fast path covered by `wait_high_bit_roundtrip`.
 pub fn wait_high_bit_parked_wakeup(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for wait_high_bit_parked_wakeup failed")?;
 
     let child = crate::spawn::new_child(ctx)
@@ -295,7 +295,7 @@ pub fn wait_high_bit_parked_wakeup(ctx: &TestContext) -> TestResult
 /// Pre-notified bits must be returned immediately, ahead of the timeout.
 pub fn wait_timeout_returns_bits_first(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for wait_timeout_returns_bits_first failed")?;
 
     notification_send(sig, 0xABCD)

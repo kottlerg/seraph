@@ -3,16 +3,16 @@
 
 // ktest/src/integration/memory_lifecycle.rs
 
-//! Integration: frame split → map → protect → unmap.
+//! Integration: memory split → map → protect → unmap.
 //!
 //! Exercises the full memory management lifecycle as a single coherent scenario,
 //! verifying the address-space state with `aspace_query` at each step.
 //!
-//! Scans the initial segment frame caps for one splittable at a page boundary;
+//! Scans the initial segment Memory caps for one splittable at a page boundary;
 //! skips if none qualify (e.g. all segments fit in one page).
 //!
 //! Syscalls exercised in sequence:
-//!   `frame_split` → `mem_map` → `aspace_query` (expect mapped) →
+//!   `memory_split` → `mem_map` → `aspace_query` (expect mapped) →
 //!   `mem_protect` → `mem_unmap` → `aspace_query` (expect not mapped) →
 //!   `mem_unmap` (idempotent check)
 
@@ -26,19 +26,19 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     // ── 1. Allocate two frames from the pool. ────────────────────────────────
     //
-    // Pool frames are single-page (frame_split already consumed the BSS segment
-    // during init), so we can't test frame_split here. Instead, allocate two
+    // Pool frames are single-page (memory_split already consumed the BSS segment
+    // during init), so we can't test memory_split here. Instead, allocate two
     // frames to test map/unmap/protect without consuming segments.
-    let mut frame_a = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
+    let mut memory_a = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("integration::memory_lifecycle: frame pool exhausted (a)")?;
-    let frame_b = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
+    let memory_b = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
         .ok_or("integration::memory_lifecycle: frame pool exhausted (b)")?;
 
-    // Drop frame_b immediately — we only needed it to verify pool has capacity.
-    drop(frame_b);
+    // Drop memory_b immediately — we only needed it to verify pool has capacity.
+    drop(memory_b);
 
-    // ── 2. Map frame_a (one page) at TEST_VA. ────────────────────────────────
-    frame_a
+    // ── 2. Map memory_a (one page) at TEST_VA. ───────────────────────────────
+    memory_a
         .map(TEST_VA)
         .map_err(|_| "integration::memory_lifecycle: mem_map failed")?;
 
@@ -51,11 +51,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     }
 
     // ── 4. Change protection to read-only. ───────────────────────────────────
-    mem_protect(frame_a.cap(), ctx.aspace_cap, TEST_VA, 1, 0)
+    mem_protect(memory_a.cap(), ctx.aspace_cap, TEST_VA, 1, 0)
         .map_err(|_| "integration::memory_lifecycle: mem_protect (read-only) failed")?;
 
     // ── 5. Protect an unmapped VA — must fail. ────────────────────────────────
-    let protect_err = mem_protect(frame_a.cap(), ctx.aspace_cap, TEST_VA + 0x10_0000, 1, 0);
+    let protect_err = mem_protect(memory_a.cap(), ctx.aspace_cap, TEST_VA + 0x10_0000, 1, 0);
     if protect_err.is_ok()
     {
         return Err("integration::memory_lifecycle: mem_protect on unmapped VA should fail");

@@ -31,8 +31,8 @@ const RIGHTS_NOTIFY: u64 = 1 << 7;
 /// `cap_create_notification` returns a usable slot.
 pub fn create_notification(ctx: &TestContext) -> TestResult
 {
-    let slot = cap_create_notification(ctx.memory_frame_base)
-        .map_err(|_| "cap_create_notification failed")?;
+    let slot =
+        cap_create_notification(ctx.memory_base).map_err(|_| "cap_create_notification failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_notification failed")?;
     Ok(())
 }
@@ -42,8 +42,7 @@ pub fn create_notification(ctx: &TestContext) -> TestResult
 /// `cap_create_endpoint` returns a usable slot.
 pub fn create_endpoint(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        cap_create_endpoint(ctx.memory_frame_base).map_err(|_| "cap_create_endpoint failed")?;
+    let slot = cap_create_endpoint(ctx.memory_base).map_err(|_| "cap_create_endpoint failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_endpoint failed")?;
     Ok(())
 }
@@ -53,8 +52,7 @@ pub fn create_endpoint(ctx: &TestContext) -> TestResult
 /// `cap_create_event_q` (via `event_queue_create`) returns a usable slot.
 pub fn create_event_q(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        event_queue_create(ctx.memory_frame_base, 8).map_err(|_| "event_queue_create failed")?;
+    let slot = event_queue_create(ctx.memory_base, 8).map_err(|_| "event_queue_create failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_event_q failed")?;
     Ok(())
 }
@@ -64,8 +62,8 @@ pub fn create_event_q(ctx: &TestContext) -> TestResult
 /// `cap_create_cspace` succeeds with a valid slot count.
 pub fn create_cspace(ctx: &TestContext) -> TestResult
 {
-    let slot = cap_create_cspace(ctx.memory_frame_base, 0, 4, 32)
-        .map_err(|_| "cap_create_cspace(32) failed")?;
+    let slot =
+        cap_create_cspace(ctx.memory_base, 0, 4, 32).map_err(|_| "cap_create_cspace(32) failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_cspace failed")?;
     Ok(())
 }
@@ -75,8 +73,7 @@ pub fn create_cspace(ctx: &TestContext) -> TestResult
 /// `cap_create_aspace` returns a usable slot.
 pub fn create_aspace(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        cap_create_aspace(ctx.memory_frame_base, 0, 8).map_err(|_| "cap_create_aspace failed")?;
+    let slot = cap_create_aspace(ctx.memory_base, 0, 8).map_err(|_| "cap_create_aspace failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_aspace failed")?;
     Ok(())
 }
@@ -99,17 +96,16 @@ pub fn create_thread(ctx: &TestContext) -> TestResult
 /// `cap_create_wait_set` (via `wait_set_create`) returns a usable slot.
 pub fn create_wait_set(ctx: &TestContext) -> TestResult
 {
-    let slot =
-        cap_create_wait_set(ctx.memory_frame_base).map_err(|_| "cap_create_wait_set failed")?;
+    let slot = cap_create_wait_set(ctx.memory_base).map_err(|_| "cap_create_wait_set failed")?;
     cap_delete(slot).map_err(|_| "cap_delete after create_wait_set failed")?;
     Ok(())
 }
 
 // Thin wrapper — the syscall wrapper is `wait_set_create` in shared/syscall but
 // the underlying syscall number is `SYS_CAP_CREATE_WAIT_SET`.
-fn cap_create_wait_set(frame_cap: u32) -> Result<u32, i64>
+fn cap_create_wait_set(memory_cap: u32) -> Result<u32, i64>
 {
-    syscall::wait_set_create(frame_cap)
+    syscall::wait_set_create(memory_cap)
 }
 
 // ── SYS_CAP_COPY ─────────────────────────────────────────────────────────────
@@ -121,9 +117,9 @@ fn cap_create_wait_set(frame_cap: u32) -> Result<u32, i64>
 /// all caps inside it).
 pub fn copy(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for copy test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for copy test failed")?;
 
     // Copy with all rights — `syscall::RIGHTS_ALL` passes through whatever rights the source has.
@@ -145,9 +141,9 @@ pub fn copy(ctx: &TestContext) -> TestResult
 /// is unaffected (insert is a copy, not a move).
 pub fn insert(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for insert test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for insert test failed")?;
 
     // Insert at slot 5 in dest_cs.
@@ -167,9 +163,9 @@ pub fn insert(ctx: &TestContext) -> TestResult
 /// `cap_move` transfers a cap to another `CSpace` and nulls the source slot.
 pub fn r#move(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for move test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for move test failed")?;
 
     // Move to dest_cs; auto-allocate destination slot (dest_index = 0).
@@ -197,7 +193,7 @@ pub fn r#move(ctx: &TestContext) -> TestResult
 ///  - The derived cap cannot wait (lacks WAIT) — kernel returns `InsufficientRights`.
 pub fn derive_attenuation(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for derive test failed")?;
 
     // Derive with NOTIFY right only (no WAIT).
@@ -237,7 +233,7 @@ pub fn derive_attenuation(ctx: &TestContext) -> TestResult
 /// After revoking the parent, the derived cap must be unusable.
 pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for revoke test failed")?;
     let derived =
         cap_derive(sig, RIGHTS_NOTIFY).map_err(|_| "cap_derive for revoke test failed")?;
@@ -261,9 +257,9 @@ pub fn revoke_invalidates(ctx: &TestContext) -> TestResult
 /// `cap_insert` to an already-occupied destination slot must return an error.
 pub fn insert_to_occupied_slot_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for occupied-slot test failed")?;
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for occupied-slot test failed")?;
 
     // First insert at slot 5 — must succeed.
@@ -290,7 +286,7 @@ pub fn insert_to_occupied_slot_err(ctx: &TestContext) -> TestResult
 /// before any modification occurs.
 pub fn copy_into_non_cspace_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for non-cspace test failed")?;
 
     // sig is a Notification, not a CSpace — using it as dest_cs must fail.
@@ -309,7 +305,7 @@ pub fn copy_into_non_cspace_err(ctx: &TestContext) -> TestResult
 /// `cap_delete` removes a cap from the `CSpace`; the slot becomes unusable.
 pub fn delete(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for delete test failed")?;
 
     // Verify it's usable before deletion.
@@ -332,7 +328,7 @@ pub fn delete(ctx: &TestContext) -> TestResult
 /// `cap_delete` on an already-null slot returns Ok (idempotent).
 pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for delete_null_slot_ok failed")?;
     cap_delete(sig).map_err(|_| "first cap_delete failed")?;
 
@@ -346,10 +342,10 @@ pub fn delete_null_slot_ok(ctx: &TestContext) -> TestResult
 /// `cap_insert` with a slot index beyond the destination `CSpace` capacity must fail.
 pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for insert_oob test failed")?;
     // CSpace capacity is clamped to [256, 14336]; create the smallest possible.
-    let dest_cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 16)
+    let dest_cs = cap_create_cspace(ctx.memory_base, 0, 4, 16)
         .map_err(|_| "create_cspace for insert_oob test failed")?;
 
     // Slot 99999 is beyond any cspace capacity.
@@ -370,7 +366,7 @@ pub fn insert_out_of_bounds_err(ctx: &TestContext) -> TestResult
 /// any operation.
 pub fn derive_zero_rights(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for derive_zero_rights failed")?;
 
     let derived = cap_derive(sig, 0).map_err(|_| "cap_derive(0) failed")?;
@@ -403,7 +399,7 @@ pub fn derive_zero_rights(ctx: &TestContext) -> TestResult
 /// `cap_revoke` on a null slot returns an error.
 pub fn revoke_null_slot_err(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for revoke_null_slot_err failed")?;
     cap_delete(sig).map_err(|_| "cap_delete failed")?;
 
@@ -421,7 +417,7 @@ pub fn revoke_null_slot_err(ctx: &TestContext) -> TestResult
 /// `event_queue_create(0)` must return `InvalidArgument` (capacity must be 1-4096).
 pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
 {
-    let err = event_queue_create(ctx.memory_frame_base, 0);
+    let err = event_queue_create(ctx.memory_base, 0);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("event_queue_create(0) did not return InvalidArgument");
@@ -432,7 +428,7 @@ pub fn create_event_q_zero_capacity_err(ctx: &TestContext) -> TestResult
 /// `event_queue_create(4097)` must return `InvalidArgument` (max capacity is 4096).
 pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
 {
-    let err = event_queue_create(ctx.memory_frame_base, 4097);
+    let err = event_queue_create(ctx.memory_base, 4097);
     if err != Err(SyscallError::InvalidArgument as i64)
     {
         return Err("event_queue_create(4097) did not return InvalidArgument");
@@ -445,7 +441,7 @@ pub fn create_event_q_over_max_err(ctx: &TestContext) -> TestResult
 /// `cap_derive_badge` attaches a badge to a derived capability.
 pub fn derive_badge(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "create_endpoint for derive_badge test failed")?;
 
     let badged =
@@ -460,7 +456,7 @@ pub fn derive_badge(ctx: &TestContext) -> TestResult
 /// `cap_derive_badge` with badge=0 returns `InvalidArgument`.
 pub fn derive_badge_zero_err(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "create_endpoint for derive_badge_zero_err test failed")?;
 
     let err = cap_derive_badge(ep, syscall::RIGHTS_ALL, 0);
@@ -476,7 +472,7 @@ pub fn derive_badge_zero_err(ctx: &TestContext) -> TestResult
 /// Re-badging a cap that already has a badge returns `InvalidArgument`.
 pub fn derive_badge_rebadge_err(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "create_endpoint for rebadge_err test failed")?;
 
     let badged = cap_derive_badge(ep, syscall::RIGHTS_ALL, 100)
@@ -497,7 +493,7 @@ pub fn derive_badge_rebadge_err(ctx: &TestContext) -> TestResult
 /// `cap_derive` from a badged cap inherits the badge (verified via IPC delivery).
 pub fn derive_inherits_badge(ctx: &TestContext) -> TestResult
 {
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "create_endpoint for inherit test failed")?;
 
     let badged =
@@ -517,7 +513,7 @@ pub fn derive_inherits_badge(ctx: &TestContext) -> TestResult
 /// `cap_derive_badge` works on non-endpoint caps (badges are generic).
 pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for derive_badge_on_notification failed")?;
 
     let badged = cap_derive_badge(sig, syscall::RIGHTS_ALL, 99)

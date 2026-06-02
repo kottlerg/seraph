@@ -128,8 +128,8 @@ pub enum CapTag
 {
     /// Empty slot — no capability present.
     Null = 0,
-    /// Physical memory frame(s).
-    Frame = 1,
+    /// Memory authority (Untyped/retype source).
+    Memory = 1,
     /// Virtual address space.
     AddressSpace = 2,
     /// IPC endpoint.
@@ -174,12 +174,12 @@ impl Rights
     /// No rights.
     pub const NONE: Rights = Rights(0);
 
-    // ── Memory frame / address space ──────────────────────────────────────────
-    /// May map frames into an address space.
+    // ── Memory / address space ──────────────────────────────────────────────
+    /// May map this memory into an address space.
     pub const MAP: Rights = Rights(1 << 0);
-    /// Authority to create writable mappings from this frame.
+    /// Authority to create writable mappings from this memory.
     pub const WRITE: Rights = Rights(1 << 1);
-    /// Authority to create executable mappings from this frame.
+    /// Authority to create executable mappings from this memory.
     pub const EXECUTE: Rights = Rights(1 << 2);
     /// May read/inspect mappings (`AddressSpace`).
     pub const READ: Rights = Rights(1 << 3);
@@ -234,13 +234,13 @@ impl Rights
     /// May forward SBI calls to M-mode firmware (RISC-V only).
     pub const CALL: Rights = Rights(1 << 20);
 
-    // ── Frame retype ──────────────────────────────────────────────────────────
-    /// Authority to retype this Frame's memory into kernel objects.
+    // ── Memory retype ──────────────────────────────────────────────────────────
+    /// Authority to retype this Memory cap's region into kernel objects.
     ///
-    /// Stamped on RAM Frame caps minted from the buddy allocator at boot.
-    /// Firmware-table / boot-module / init-segment Frame caps never hold this
+    /// Stamped on RAM Memory caps minted from the buddy allocator at boot.
+    /// Firmware-table / boot-module / init-segment Memory caps never hold this
     /// bit. Every retype-consuming syscall checks
-    /// `tag == Frame && rights.contains(RETYPE)`.
+    /// `tag == Memory && rights.contains(RETYPE)`.
     pub const RETYPE: Rights = Rights(1 << 21);
 
     /// Return `true` if all bits in `mask` are present in `self`.
@@ -460,7 +460,7 @@ mod tests
     fn cap_tag_discriminants()
     {
         assert_eq!(CapTag::Null as u8, 0);
-        assert_eq!(CapTag::Frame as u8, 1);
+        assert_eq!(CapTag::Memory as u8, 1);
         assert_eq!(CapTag::SchedControl as u8, 12);
     }
 

@@ -138,7 +138,7 @@ fn main() -> !
     let Some(ws_slab) = std::os::seraph::object_slab_acquire(512)
     else
     {
-        std::os::seraph::log!("failed to acquire frame for wait set");
+        std::os::seraph::log!("failed to acquire memory cap for wait set");
         halt_loop();
     };
     let Ok(ws_cap) = syscall::wait_set_create(ws_slab)
@@ -157,7 +157,7 @@ fn main() -> !
     let Some(eq_slab) = std::os::seraph::object_slab_acquire(deaths_eq_slab_bytes)
     else
     {
-        std::os::seraph::log!("failed to acquire frame for deaths event queue");
+        std::os::seraph::log!("failed to acquire memory cap for deaths event queue");
         halt_loop();
     };
     let Ok(deaths_eq) = syscall::event_queue_create(eq_slab, (MAX_SERVICES as u32) * 2)
@@ -167,13 +167,13 @@ fn main() -> !
         halt_loop();
     };
 
-    // Frame slab svcmgr retypes provider service endpoints from. One page
+    // Memory-cap slab svcmgr retypes provider service endpoints from. One page
     // backs every `provides = ...` service (each `cap_create_endpoint`
     // carves an endpoint object from it); the provider set is small.
     let Some(endpoint_slab) = std::os::seraph::object_slab_acquire(syscall_abi::PAGE_SIZE)
     else
     {
-        std::os::seraph::log!("failed to acquire frame for provider endpoint slab");
+        std::os::seraph::log!("failed to acquire memory cap for provider endpoint slab");
         halt_loop();
     };
 

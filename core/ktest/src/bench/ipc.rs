@@ -51,12 +51,12 @@ pub(super) fn bench_ipc_round_trip(ctx: &crate::TestContext, iters: u32)
     const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
     let n = u64::from(iters);
 
-    let Ok(ep) = cap_create_endpoint(ctx.memory_frame_base)
+    let Ok(ep) = cap_create_endpoint(ctx.memory_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         return;

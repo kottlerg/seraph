@@ -84,7 +84,7 @@ pub struct ProcessInfo {
     /// CSpace slot of a badged SEND cap on memmgr's service endpoint.
     ///
     /// Populated for every procmgr-spawned child. `std::os::seraph::
-    /// _start` calls `memmgr_labels::REQUEST_FRAMES` on this cap to
+    /// _start` calls `memmgr_labels::REQUEST_MEMORY_CAPS` on this cap to
     /// bootstrap the `System` allocator before the user's `fn main()`
     /// runs. The badged cap identifies this process to memmgr, so
     /// memmgr accounts allocations against the correct per-process
@@ -215,7 +215,7 @@ happen).
 | Consumer | init, ktest | All other processes |
 | Handover struct | `InitInfo` | `ProcessInfo` |
 | Placed at | `INIT_INFO_VADDR` | `PROCESS_INFO_VADDR` |
-| Contains platform-global state | Yes (all memory frames, all HW caps, firmware tables) | No |
+| Contains platform-global state | Yes (all memory caps, all HW caps, firmware tables) | No |
 | Contains parent endpoint | No (init has no parent) | Yes |
 | `main()` signature | Same (`&StartupInfo`) | Same (`&StartupInfo`) |
 
@@ -252,7 +252,7 @@ declare a stack size without an extra Cargo dep on `process-abi`.
 
 `MAX_PROCESS_STACK_PAGES` is a loader-side hard cap (256 pages = 1 MiB)
 that catches a corrupt or hostile note. memmgr's existing per-process
-quota remains the actual policy gate on the resulting `REQUEST_FRAMES`
+quota remains the actual policy gate on the resulting `REQUEST_MEMORY_CAPS`
 calls.
 
 The on-disk shape is read by `elf::parse_stack_note` (full-bytes path,

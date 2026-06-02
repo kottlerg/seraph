@@ -26,7 +26,7 @@ Each filesystem implementation is a standalone userspace process. A
 driver is a namespace server: it serves the cap-native `NS_*`
 protocol against per-node badged SEND caps on its own endpoint, plus
 the surviving fs-driver-specific labels (`FS_MOUNT`, `FS_READ`,
-`FS_READ_FRAME` family, `FS_CLOSE`). vfsd captures the driver's root
+`FS_READ_MEMORY` family, `FS_CLOSE`). vfsd captures the driver's root
 cap at mount time and forwards walks through it; subsequent
 operations bypass vfsd entirely. See
 [`vfsd/README.md`](../vfsd/README.md) for the composition layer.

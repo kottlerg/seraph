@@ -116,7 +116,7 @@ pub const SYS_CAP_CREATE_WAIT_SET: u64 = 13;
 pub const SYS_CAP_DERIVE: u64 = 14;
 /// Capability: revoke a capability and all descendants.
 pub const SYS_CAP_REVOKE: u64 = 15;
-/// Memory: map a Frame into an address space.
+/// Memory: map a Memory cap into an address space.
 pub const SYS_MEM_MAP: u64 = 16;
 /// Memory: unmap a region from an address space.
 pub const SYS_MEM_UNMAP: u64 = 17;
@@ -157,8 +157,8 @@ pub const SYS_IRQ_REGISTER: u64 = 30;
 /// Capability: delete a slot.
 pub const SYS_CAP_DELETE: u64 = 31;
 // 32 reserved (was SYS_CAP_INSERT, merged into SYS_CAP_COPY's dest-slot arg).
-/// Frame: split a large frame into smaller ones.
-pub const SYS_FRAME_SPLIT: u64 = 33;
+/// Memory: split a large Memory cap into smaller ones.
+pub const SYS_MEMORY_SPLIT: u64 = 33;
 /// Memory: map an MMIO region.
 pub const SYS_MMIO_MAP: u64 = 34;
 /// I/O: bind an `IoPortRange` to the calling thread.
@@ -166,7 +166,7 @@ pub const SYS_IOPORT_BIND: u64 = 35;
 /// Capability: read-only inspection of a cap's runtime state.
 ///
 /// Returns a discriminated union keyed by `CapTag`:
-/// - `Frame` → `(size_bytes, available_bytes, has_retype_right)`
+/// - `Memory` → `(size_bytes, available_bytes, has_retype_right)`
 /// - `AddressSpace` → `(pt_growth_budget_bytes)`
 /// - `CSpace` → `(slot_capacity, slots_used, growth_budget_bytes)`
 /// - all other tags → `(tag, rights)` only
@@ -202,23 +202,23 @@ pub const SYS_CAP_INFO: u64 = 36;
 /// ```
 pub const CAP_INFO_TAG_RIGHTS: u64 = 0;
 
-/// `Frame` only — total byte size of the frame region.
+/// `Memory` only — total byte size of the memory region.
 ///
-/// Returns `FrameObject::size`. Calling on a non-Frame slot returns
+/// Returns `MemoryObject::size`. Calling on a non-Memory slot returns
 /// [`SyscallError::InvalidArgument`].
-pub const CAP_INFO_FRAME_SIZE: u64 = 1;
+pub const CAP_INFO_MEMORY_SIZE: u64 = 1;
 
-/// `Frame` only — bytes still available to retype or map from this frame.
+/// `Memory` only — bytes still available to retype or map from this cap.
 ///
-/// Returns the current value of `FrameObject::available_bytes`. Calling on
-/// a non-Frame slot returns [`SyscallError::InvalidArgument`].
-pub const CAP_INFO_FRAME_AVAILABLE: u64 = 2;
+/// Returns the current value of `MemoryObject::available_bytes`. Calling on
+/// a non-Memory slot returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_MEMORY_AVAILABLE: u64 = 2;
 
-/// `Frame` only — `1` if the cap holds the `RETYPE` right, otherwise `0`.
+/// `Memory` only — `1` if the cap holds the `RETYPE` right, otherwise `0`.
 ///
-/// Returns `1` or `0`. Calling on a non-Frame slot returns
+/// Returns `1` or `0`. Calling on a non-Memory slot returns
 /// [`SyscallError::InvalidArgument`].
-pub const CAP_INFO_FRAME_HAS_RETYPE: u64 = 3;
+pub const CAP_INFO_MEMORY_HAS_RETYPE: u64 = 3;
 
 /// `AddressSpace` only — bytes available to back new intermediate page-table pages.
 ///
@@ -244,13 +244,13 @@ pub const CAP_INFO_CSPACE_USED: u64 = 6;
 /// Calling on a non-`CSpace` slot returns [`SyscallError::InvalidArgument`].
 pub const CAP_INFO_CSPACE_BUDGET: u64 = 7;
 
-/// `Frame` only — physical base address of the frame region.
+/// `Memory` only — physical base address of the memory region.
 ///
-/// Returns `FrameObject::base`. Calling on a non-Frame slot returns
+/// Returns `MemoryObject::base`. Calling on a non-Memory slot returns
 /// [`SyscallError::InvalidArgument`]. Used by memmgr to track contiguity
-/// when ingesting Frame caps it did not itself mint (e.g., boot-module
-/// caps donated through `memmgr_labels::DONATE_FRAMES`).
-pub const CAP_INFO_FRAME_PHYS_BASE: u64 = 8;
+/// when ingesting Memory caps it did not itself mint (e.g., boot-module
+/// caps donated through `memmgr_labels::DONATE_MEMORY_CAPS`).
+pub const CAP_INFO_MEMORY_PHYS_BASE: u64 = 8;
 
 /// `Thread` only — kernel-authoritative lifecycle snapshot.
 ///
@@ -291,8 +291,8 @@ pub const CAP_INFO_TLB_PERFORMED: u64 = 11;
 // extract the tag from a [`CAP_INFO_TAG_RIGHTS`] result. Only the variants
 // userspace currently needs to identify are exposed.
 
-/// `CapTag::Frame` discriminant.
-pub const CAP_TAG_FRAME: u8 = 1;
+/// `CapTag::Memory` discriminant.
+pub const CAP_TAG_MEMORY: u8 = 1;
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;
 /// Thread: set CPU affinity.
@@ -319,8 +319,8 @@ pub const SYS_THREAD_BIND_NOTIFICATION: u64 = 47;
 pub const SYS_CAP_DERIVE_BADGE: u64 = 48;
 /// Split an `Interrupt` range cap into two non-overlapping children.
 pub const SYS_IRQ_SPLIT: u64 = 49;
-/// Merge two adjacent sibling Frame caps into one covering both ranges.
-pub const SYS_FRAME_MERGE: u64 = 50;
+/// Merge two adjacent sibling Memory caps into one covering both ranges.
+pub const SYS_MEMORY_MERGE: u64 = 50;
 /// Split an `IoPortRange` cap into two non-overlapping children (`x86_64` only).
 pub const SYS_IOPORT_SPLIT: u64 = 51;
 
@@ -423,7 +423,7 @@ pub const MAP_READONLY: u64 = 0;
 /// Mapping protection: explicit read-only. Bit 0, matching the kernel
 /// `Rights::READ` layout.
 ///
-/// Unlike `MAP_READONLY` (= 0, which derives permissions from the Frame
+/// Unlike `MAP_READONLY` (= 0, which derives permissions from the Memory
 /// cap's rights), this nonzero value forces a read-only mapping regardless
 /// of the cap's WRITE/EXECUTE rights, so a full-rights cap can be mapped
 /// read-only without first deriving a narrowed child cap. W^X holds
@@ -447,13 +447,13 @@ pub const RIGHTS_RECEIVE: u64 = 1 << 5;
 /// Send + grant: may call and include capabilities in messages.
 pub const RIGHTS_SEND_GRANT: u64 = (1 << 4) | (1 << 6);
 
-/// Frame: map read-only.
+/// Memory: map read-only.
 pub const RIGHTS_MAP_READ: u64 = 1 << 0;
 
-/// Frame: map read-write.
+/// Memory: map read-write.
 pub const RIGHTS_MAP_RW: u64 = (1 << 0) | (1 << 1);
 
-/// Frame: map read-execute.
+/// Memory: map read-execute.
 pub const RIGHTS_MAP_RX: u64 = (1 << 0) | (1 << 2);
 
 /// Thread: full control (start, stop, configure, observe).
@@ -462,10 +462,10 @@ pub const RIGHTS_THREAD: u64 = (1 << 11) | (1 << 12);
 /// `CSpace`: full management (insert, delete, derive, revoke).
 pub const RIGHTS_CSPACE: u64 = (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
 
-/// Frame: authority to retype memory into kernel objects.
+/// Memory: authority to retype memory into kernel objects.
 ///
-/// Held by RAM Frame caps minted from buddy at boot; never held by firmware-
-/// table / boot-module / init-segment Frame caps. Required by every retype-
+/// Held by RAM Memory caps minted from buddy at boot; never held by firmware-
+/// table / boot-module / init-segment Memory caps. Required by every retype-
 /// consuming syscall.
 pub const RIGHTS_RETYPE: u64 = 1 << 21;
 

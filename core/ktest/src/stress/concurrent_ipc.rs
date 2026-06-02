@@ -25,9 +25,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     for _cycle in 0..CYCLES
     {
-        let ep = cap_create_endpoint(ctx.memory_frame_base)
+        let ep = cap_create_endpoint(ctx.memory_base)
             .map_err(|_| "concurrent_ipc: create_endpoint failed")?;
-        let done = cap_create_notification(ctx.memory_frame_base)
+        let done = cap_create_notification(ctx.memory_base)
             .map_err(|_| "concurrent_ipc: create_notification failed")?;
 
         let mut threads = [0u32; NUM_CALLERS];

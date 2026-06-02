@@ -23,7 +23,7 @@
 //! - `cap.rs`      — capability creation, copy, move, insert, derive, revoke, delete
 //! - `cap_info.rs` — read-only capability state inspection (`SYS_CAP_INFO`)
 //! - `retype.rs`   — retype primitive: aspace/cspace augment, PT budget, kernel PT pool
-//! - `mm.rs`       — memory map/unmap/protect, frame split, address space query
+//! - `mm.rs`       — memory map/unmap/protect, memory split, address space query
 //! - `notification.rs`   — notification send and wait (blocking and timeout)
 //! - `event.rs`    — event queue post and receive (blocking, try, timeout)
 //! - `wait_set.rs` — wait set add, remove, wait
@@ -118,17 +118,17 @@ pub fn run_all(ctx: &TestContext)
         cap_info::tag_rights_aspace(ctx)
     );
     run_test!(
-        "cap_info::tag_rights_frame",
-        cap_info::tag_rights_frame(ctx)
+        "cap_info::tag_rights_memory",
+        cap_info::tag_rights_memory(ctx)
     );
     run_test!(
         "cap_info::tag_rights_notification",
         cap_info::tag_rights_notification(ctx)
     );
-    run_test!("cap_info::frame_fields", cap_info::frame_fields(ctx));
+    run_test!("cap_info::memory_fields", cap_info::memory_fields(ctx));
     run_test!(
-        "cap_info::frame_caps_carry_retype_right",
-        cap_info::frame_caps_carry_retype_right(ctx)
+        "cap_info::memory_caps_carry_retype_right",
+        cap_info::memory_caps_carry_retype_right(ctx)
     );
     run_test!("cap_info::cspace_fields", cap_info::cspace_fields(ctx));
     run_test!(
@@ -167,7 +167,7 @@ pub fn run_all(ctx: &TestContext)
     );
 
     // ── Memory management syscalls ────────────────────────────────────────────
-    run_test!("mm::frame_split_merge", mm::frame_split_merge(ctx));
+    run_test!("mm::memory_split_merge", mm::memory_split_merge(ctx));
     run_test!("mm::mem_map_unmap", mm::mem_map_unmap(ctx));
     run_test!("mm::mem_protect", mm::mem_protect(ctx));
     run_test!(
@@ -189,8 +189,8 @@ pub fn run_all(ctx: &TestContext)
         mm::mem_map_kernel_half_err(ctx)
     );
     run_test!(
-        "mm::frame_split_at_zero_err",
-        mm::frame_split_at_zero_err(ctx)
+        "mm::memory_split_at_zero_err",
+        mm::memory_split_at_zero_err(ctx)
     );
     run_test!(
         "mm::mem_protect_exceeds_cap_rights_err",
@@ -202,8 +202,8 @@ pub fn run_all(ctx: &TestContext)
         mm::mem_map_zero_pages_err(ctx)
     );
     run_test!(
-        "mm::mem_map_offset_beyond_frame_err",
-        mm::mem_map_offset_beyond_frame_err(ctx)
+        "mm::mem_map_offset_beyond_memory_err",
+        mm::mem_map_offset_beyond_memory_err(ctx)
     );
     run_test!(
         "mm::mem_unmap_unaligned_err",
@@ -212,8 +212,8 @@ pub fn run_all(ctx: &TestContext)
     run_test!("mm::mem_protect_wx_err", mm::mem_protect_wx_err(ctx));
     run_test!("mm::mem_map_wx_prot_err", mm::mem_map_wx_prot_err(ctx));
     run_test!(
-        "mm::frame_split_at_end_err",
-        mm::frame_split_at_end_err(ctx)
+        "mm::memory_split_at_end_err",
+        mm::memory_split_at_end_err(ctx)
     );
     run_test!(
         "mm::init_segment_caps_aligned",

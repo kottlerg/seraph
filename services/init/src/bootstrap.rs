@@ -14,7 +14,7 @@
 //! All subsequent services are created through procmgr IPC.
 
 use crate::logging::log;
-use crate::{FrameAlloc, PAGE_SIZE, TEMP_MAP_BASE, arch};
+use crate::{MemoryAlloc, PAGE_SIZE, TEMP_MAP_BASE, arch};
 use init_protocol::{CapDescriptor, InitInfo};
 use process_abi::{
     DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION, PROCESS_INFO_VADDR,
@@ -37,12 +37,12 @@ const PROCMGR_IPC_BUF_VA: u64 = 0x0000_7FFF_FFFE_0000;
 // ── Bootstrap arena ────────────────────────────────────────────────────────────
 //
 // Each tier-1 service (memmgr, procmgr) is backed by one contiguous arena
-// Frame cap carved from init's pool. Its front `[0, RETYPE_RESERVE_PAGES)`
+// Memory cap carved from init's pool. Its front `[0, RETYPE_RESERVE_PAGES)`
 // is consumed by the service's `AddressSpace` / `CSpace` / `Thread` retypes
 // (a monotonic page-aligned front bump in the cap's `RetypeAllocator`); the
 // remainder is offset-mapped page-by-page as the service's loaded backing
 // (ELF segments, TLS, `ProcessInfo`, stack, IPC buffer). The retypes each
-// hold an ancestor reference on the arena's `FrameObject` for the immortal
+// hold an ancestor reference on the arena's `MemoryObject` for the immortal
 // service's life, so init's eventual cap-drop at reap never brings the
 // refcount to zero: the offset-mapped backing never dangles and the arena
 // never frees into the post-handoff buddy.
@@ -75,11 +75,11 @@ const RETYPE_RESERVE_PAGES: u64 = (crate::ASPACE_RETYPE_PAGES - 1)
 /// never crossed this bound before forwarding the arena.
 pub(crate) const INIT_RETYPE_RESERVE_PAGES: u64 = 1 + crate::THREAD_RETYPE_PAGES + 1;
 
-/// A service's contiguous backing arena: one Frame cap plus a page cursor
+/// A service's contiguous backing arena: one Memory cap plus a page cursor
 /// into its offset-mapped backing region.
 pub(crate) struct BootArena
 {
-    /// Arena Frame cap in init's `CSpace`. Full rights (R+W+X+RETYPE):
+    /// Arena Memory cap in init's `CSpace`. Full rights (R+W+X+RETYPE):
     /// retyped from its front, offset-mapped past the retype bump.
     pub(crate) cap: u32,
     /// `AddressSpace` cap the transient per-page scratch maps land in at
@@ -96,7 +96,7 @@ impl BootArena
     /// `alloc` with the cursor positioned past the retype reserve. The
     /// caller performs the three retypes against [`Self::cap`] before
     /// placing any backing page.
-    fn carve(alloc: &mut FrameAlloc, init_aspace: u32, backing_pages: u64) -> Option<Self>
+    fn carve(alloc: &mut MemoryAlloc, init_aspace: u32, backing_pages: u64) -> Option<Self>
     {
         Self::carve_reserve(alloc, init_aspace, RETYPE_RESERVE_PAGES, backing_pages)
     }
@@ -106,7 +106,7 @@ impl BootArena
     /// every retype against [`Self::cap`] within the `reserve_pages` front
     /// bound before placing backing pages at or above it.
     pub(crate) fn carve_reserve(
-        alloc: &mut FrameAlloc,
+        alloc: &mut MemoryAlloc,
         init_aspace: u32,
         reserve_pages: u64,
         backing_pages: u64,
@@ -126,7 +126,7 @@ impl BootArena
     /// `prot`. Advances the cursor. `prot` is an explicit mapping mode
     /// (`MAP_READ` / `MAP_WRITABLE` / `MAP_EXECUTABLE`) applied directly to
     /// the full-rights arena cap — no per-page derived child, so no live
-    /// derivation blocks a later `frame_split` of the arena.
+    /// derivation blocks a later `memory_split` of the arena.
     pub(crate) fn place_page(
         &mut self,
         target_aspace: u32,
@@ -356,10 +356,10 @@ fn load_elf_into_arena(
 // ── Memmgr bootstrap ────────────────────────────────────────────────────────
 
 /// Result of bootstrapping memmgr's setup (kernel objects + ELF load +
-/// PI / stack / IPC mappings + creator endpoint). Frame-pool delegation
+/// PI / stack / IPC mappings + creator endpoint). Memory-cap-pool delegation
 /// and `thread_start` happen later via [`finalize_memmgr`] so that
 /// procmgr's setup pages can also draw from init's pool before all
-/// remaining frames are handed over to memmgr.
+/// remaining memory caps are handed over to memmgr.
 pub struct MemmgrBootstrap
 {
     /// Init-side bootstrap badge for memmgr's `request_round` reply.
@@ -372,12 +372,12 @@ pub struct MemmgrBootstrap
     /// endpoint that init will install in procmgr's `ProcessInfo`.
     pub procmgr_send_cap: u32,
     /// Memmgr's `CSpace` cap (in init's `CSpace`). Init copies RAM
-    /// Frame caps into here at [`finalize_memmgr`] time.
+    /// Memory caps into here at [`finalize_memmgr`] time.
     pub mm_cspace: u32,
     /// Memmgr's main `Thread` cap (in init's `CSpace`). Init invokes
     /// `thread_configure` + `thread_start` at [`finalize_memmgr`] time.
     pub mm_thread: u32,
-    /// Memmgr's contiguous backing arena Frame cap (in init's `CSpace`).
+    /// Memmgr's contiguous backing arena Memory cap (in init's `CSpace`).
     /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
     /// as an in-use arena so its pages are accounted in memmgr's pool.
     pub arena_cap: u32,
@@ -386,8 +386,8 @@ pub struct MemmgrBootstrap
 }
 
 /// One in-use bootstrap arena forwarded to memmgr for accounting. Its whole
-/// Frame cap is copied into memmgr's `CSpace`; memmgr records it as an
-/// `OwnedFrame` against the owning service's record so the arena's pages count
+/// Memory cap is copied into memmgr's `CSpace`; memmgr records it as an
+/// `OwnedMemory` against the owning service's record so the arena's pages count
 /// toward `pool_total` without ever becoming allocatable. The arena is
 /// retype-pinned and offset-mapped for the immortal service's life, so this is
 /// pure accounting — memmgr never frees it.
@@ -409,24 +409,24 @@ pub struct InUseArena
 ///
 /// Page counts are packed two per `u64` (low 32 bits = even index,
 /// high 32 bits = odd index) so the 64-word IPC data field can carry
-/// up to `ipc::memmgr_bootstrap::MAX_FRAMES` entries after the 3-word
-/// prefix. Physical bases travel out-of-band via a read-only Frame cap
+/// up to `ipc::memmgr_bootstrap::MAX_MEMORY_CAPS` entries after the 3-word
+/// prefix. Physical bases travel out-of-band via a read-only Memory cap
 /// (`caps[1]` in the bootstrap reply); init writes `phys_bases` into the
 /// page before deriving the RO cap. Memmgr maps the page, copies the
 /// values into its `FreeRun` records, and drops the cap.
 pub struct MemmgrFinalize
 {
-    /// First slot of the RAM Frame caps init copied into memmgr's
+    /// First slot of the RAM Memory caps init copied into memmgr's
     /// `CSpace` during finalization.
-    pub mm_frame_base: u32,
-    /// Number of RAM frames delegated to memmgr.
-    pub mm_frame_count: u32,
-    /// Page count for each delegated frame, in slot order.
-    pub page_counts: [u32; ipc::memmgr_bootstrap::MAX_FRAMES],
-    /// Physical base address for each delegated frame, in slot order.
-    /// Sourced from `CapDescriptor.aux0` of the underlying RAM Frame
+    pub mm_memory_base: u32,
+    /// Number of RAM memory caps delegated to memmgr.
+    pub mm_memory_count: u32,
+    /// Page count for each delegated memory cap, in slot order.
+    pub page_counts: [u32; ipc::memmgr_bootstrap::MAX_MEMORY_CAPS],
+    /// Physical base address for each delegated memory cap, in slot order.
+    /// Sourced from `CapDescriptor.aux0` of the underlying RAM Memory
     /// caps minted by the kernel at boot.
-    pub phys_bases: [u64; ipc::memmgr_bootstrap::MAX_FRAMES],
+    pub phys_bases: [u64; ipc::memmgr_bootstrap::MAX_MEMORY_CAPS],
     /// In-use bootstrap arenas (memmgr's, procmgr's, and init's own
     /// backing) copied into memmgr's `CSpace`. Init writes these into the
     /// phys-table page's in-use section; memmgr records them against
@@ -476,9 +476,9 @@ fn populate_memmgr_info(
             pi.creator_endpoint_cap = caps.creator_endpoint_slot;
             pi.procmgr_endpoint_cap = 0;
             pi.memmgr_endpoint_cap = 0;
-            pi.stdin_frame_cap = 0;
-            pi.stdout_frame_cap = 0;
-            pi.stderr_frame_cap = 0;
+            pi.stdin_memory_cap = 0;
+            pi.stdout_memory_cap = 0;
+            pi.stderr_memory_cap = 0;
             pi.log_send_cap = 0;
             pi.stdin_data_notification_cap = 0;
             pi.stdin_space_notification_cap = 0;
@@ -502,9 +502,9 @@ fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
 
 /// Set up memmgr's kernel objects, load its ELF, populate `ProcessInfo`,
 /// map stack and IPC buffer, and mint the creator + procmgr SEND caps.
-/// **Does not delegate frames or start memmgr's thread** — those happen
+/// **Does not delegate memory caps or start memmgr's thread** — those happen
 /// later in [`finalize_memmgr`] so procmgr's setup can still draw from
-/// init's frame pool before all remaining frames go to memmgr.
+/// init's memory-cap pool before all remaining memory caps go to memmgr.
 ///
 /// `init_bootstrap_ep` is init's bootstrap endpoint; init derives a
 /// badged SEND from it and installs it as memmgr's
@@ -519,22 +519,22 @@ fn descriptor_for(info: &InitInfo, slot: u32) -> Option<&CapDescriptor>
 #[allow(clippy::similar_names, clippy::too_many_lines)]
 pub fn bootstrap_memmgr(
     info: &InitInfo,
-    alloc: &mut FrameAlloc,
+    alloc: &mut MemoryAlloc,
     init_bootstrap_ep: u32,
     mm_service_ep: u32,
 ) -> Option<MemmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;
-    let module_frame_cap = crate::find_module_by_name(info, b"memmgr")?;
-    let module_size = descriptor_for(info, module_frame_cap).map(|d| d.aux1)?;
+    let module_memory_cap = crate::find_module_by_name(info, b"memmgr")?;
+    let module_size = descriptor_for(info, module_memory_cap).map(|d| d.aux1)?;
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
-    // The module Frame cap carries full rights (R+W+X+RETYPE): init retains
+    // The module Memory cap carries full rights (R+W+X+RETYPE): init retains
     // it as the module-source owner and donates it to memmgr's pool at reap,
     // where RETYPE lets memmgr re-derive. Derive a read-only child cap for the
     // load-time mapping so `mem_map`'s derive-from-cap path produces a strictly
     // read-only page (otherwise W+X cap rights trip W^X).
-    let module_ro = syscall::cap_derive(module_frame_cap, syscall::RIGHTS_MAP_READ).ok()?;
+    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MAP_READ).ok()?;
     syscall::mem_map(
         module_ro,
         init_aspace,
@@ -544,7 +544,7 @@ pub fn bootstrap_memmgr(
         syscall::MAP_READONLY,
     )
     .ok()?;
-    // SAFETY: module frame mapped read-only at TEMP_MAP_BASE.
+    // SAFETY: module memory cap mapped read-only at TEMP_MAP_BASE.
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
@@ -618,13 +618,13 @@ pub fn bootstrap_memmgr(
 /// [`InUseArena`] descriptor. Mirrors the free-run forward: derive a
 /// full-rights intermediary, copy it into `mm_cspace`, and read the arena's
 /// physical base + size from the cap. The arena is exact-sized (no free
-/// tail), so it is never `frame_split`; the copy gives memmgr the accounting
-/// anchor while the original cap and the retypes keep the `FrameObject`
+/// tail), so it is never `memory_split`; the copy gives memmgr the accounting
+/// anchor while the original cap and the retypes keep the `MemoryObject`
 /// pinned for the immortal service's life.
 fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena>
 {
-    let phys_base = syscall::cap_info(arena_cap, syscall::CAP_INFO_FRAME_PHYS_BASE).ok()?;
-    let size_bytes = syscall::cap_info(arena_cap, syscall::CAP_INFO_FRAME_SIZE).ok()?;
+    let phys_base = syscall::cap_info(arena_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE).ok()?;
+    let size_bytes = syscall::cap_info(arena_cap, syscall::CAP_INFO_MEMORY_SIZE).ok()?;
     let intermediary = syscall::cap_derive(arena_cap, syscall::RIGHTS_ALL).ok()?;
     let cap_slot = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL).ok()?;
     Some(InUseArena {
@@ -635,11 +635,11 @@ fn forward_arena(arena_cap: u32, mm_cspace: u32, kind: u64) -> Option<InUseArena
     })
 }
 
-/// Forward a single Frame cap covering `pages` free pages into memmgr's
+/// Forward a single Memory cap covering `pages` free pages into memmgr's
 /// `CSpace` as a free run: derive a full-rights intermediary, copy it into
 /// `mm_cspace`, and append the run to the parallel `page_counts`/`phys_bases`
 /// tables (advancing `count`, recording `base` on the first run). Used for the
-/// `FrameAlloc` tail and the transient phys-table page — both `frame_split`
+/// `MemoryAlloc` tail and the transient phys-table page — both `memory_split`
 /// products with no `InitInfo` descriptor that would otherwise free into the
 /// sealed post-handoff buddy.
 #[allow(clippy::too_many_arguments)]
@@ -657,7 +657,7 @@ fn push_free_run(
     {
         return;
     }
-    if let Ok(phys_base) = syscall::cap_info(src_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+    if let Ok(phys_base) = syscall::cap_info(src_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
         && let Ok(intermediary) = syscall::cap_derive(src_cap, syscall::RIGHTS_ALL)
         && let Ok(dst_slot) = syscall::cap_copy(intermediary, mm_cspace, syscall::RIGHTS_ALL)
     {
@@ -681,8 +681,8 @@ fn push_free_run(
 fn assert_init_arena_front_bounded(init_arena_cap: u32)
 {
     if let (Ok(size), Ok(available)) = (
-        syscall::cap_info(init_arena_cap, syscall::CAP_INFO_FRAME_SIZE),
-        syscall::cap_info(init_arena_cap, syscall::CAP_INFO_FRAME_AVAILABLE),
+        syscall::cap_info(init_arena_cap, syscall::CAP_INFO_MEMORY_SIZE),
+        syscall::cap_info(init_arena_cap, syscall::CAP_INFO_MEMORY_AVAILABLE),
     )
     {
         let front_bump = size.saturating_sub(available);
@@ -693,14 +693,14 @@ fn assert_init_arena_front_bounded(init_arena_cap: u32)
     }
 }
 
-/// Delegate every remaining RAM Frame cap from init's pool into memmgr's
+/// Delegate every remaining RAM Memory cap from init's pool into memmgr's
 /// `CSpace`, forward the in-use bootstrap arenas (memmgr's, procmgr's, and
 /// init's own backing), then `thread_configure` + `thread_start` memmgr.
 ///
 /// Call after every `alloc.alloc_page()` consumer (memmgr's own setup,
 /// procmgr's setup) has run — at that point everything left in init's
-/// frame pool is RAM that memmgr should own. After this call, init has
-/// no more frames; subsequent allocations route through memmgr like any
+/// memory-cap pool is RAM that memmgr should own. After this call, init has
+/// no more memory caps; subsequent allocations route through memmgr like any
 /// other process.
 ///
 /// `pm_arena_cap` is procmgr's backing arena and `init_arena_cap` is init's own
@@ -708,7 +708,7 @@ fn assert_init_arena_front_bounded(init_arena_cap: u32)
 /// memmgr's own arena (`mm.arena_cap`) so memmgr's `pool_total` spans every page
 /// of bootstrap-consumed RAM, not only the free runs.
 ///
-/// `phys_table_frame` is the auxiliary phys-table page (written after this
+/// `phys_table_memory` is the auxiliary phys-table page (written after this
 /// call). It is a transient bootstrap artifact, so it is forwarded as a free
 /// run — its keep-alive moves to memmgr's pool copy, and after memmgr reads it
 /// through the read-only `caps[1]` derivation the page becomes allocatable like
@@ -716,69 +716,69 @@ fn assert_init_arena_front_bounded(init_arena_cap: u32)
 #[allow(clippy::similar_names, clippy::too_many_lines)]
 pub fn finalize_memmgr(
     info: &InitInfo,
-    alloc: &mut FrameAlloc,
+    alloc: &mut MemoryAlloc,
     mm: &MemmgrBootstrap,
     pm_arena_cap: u32,
     init_arena_cap: u32,
-    phys_table_frame: u32,
+    phys_table_memory: u32,
 ) -> Option<MemmgrFinalize>
 {
     // The bootstrap-IPC payload to memmgr packs 2 page_counts per word after
-    // a 3-word prefix; `ipc::memmgr_bootstrap::MAX_FRAMES` entries fit, of
-    // which the loop below claims at most `MAX_FRAMES - 2` for regular memory
-    // frames and leaves two for the FrameAlloc tail and the phys-table page.
+    // a 3-word prefix; `ipc::memmgr_bootstrap::MAX_MEMORY_CAPS` entries fit, of
+    // which the loop below claims at most `MAX_MEMORY_CAPS - 2` for regular memory
+    // memory caps and leaves two for the MemoryAlloc tail and the phys-table page.
     // That is enough to seed memmgr's pool for procmgr's first allocations;
-    // any regular frames beyond the cap (the buddy can drain into more blocks
+    // any regular memory caps beyond the cap (the buddy can drain into more blocks
     // than fit when the memory map is fragmented) are delivered later via the
     // reap-donation route (`handoff_to_procmgr_reap` → procmgr →
-    // `DONATE_FRAMES`), which streams without a per-round cap. So this bound is
+    // `DONATE_MEMORY_CAPS`), which streams without a per-round cap. So this bound is
     // a round-size limit, not a ceiling on total RAM forwarded — the reap floor
     // below picks up the rest. (The tail and phys-table page have no InitInfo
     // descriptor, so the reap walk cannot reach them; they must ride here.)
-    let mut page_counts = [0u32; ipc::memmgr_bootstrap::MAX_FRAMES];
-    let mut phys_bases = [0u64; ipc::memmgr_bootstrap::MAX_FRAMES];
-    let mut mm_frame_base: u32 = 0;
-    let mut mm_frame_count: u32 = 0;
-    let total_remaining = info.memory_frame_count.saturating_sub(alloc.next_idx);
+    let mut page_counts = [0u32; ipc::memmgr_bootstrap::MAX_MEMORY_CAPS];
+    let mut phys_bases = [0u64; ipc::memmgr_bootstrap::MAX_MEMORY_CAPS];
+    let mut mm_memory_base: u32 = 0;
+    let mut mm_memory_count: u32 = 0;
+    let total_remaining = info.memory_count.saturating_sub(alloc.next_idx);
     for i in 0..total_remaining
     {
-        // Reserve two payload slots for the FrameAlloc tail and the phys-table
-        // page forwarded below. Both are `frame_split` products with no
+        // Reserve two payload slots for the MemoryAlloc tail and the phys-table
+        // page forwarded below. Both are `memory_split` products with no
         // InitInfo descriptor, so the reap walk cannot reach them — they MUST
-        // ride this bootstrap round. Regular frames that no longer fit are
+        // ride this bootstrap round. Regular memory caps that no longer fit are
         // delivered to memmgr's pool via reap instead.
-        if mm_frame_count as usize >= ipc::memmgr_bootstrap::MAX_FRAMES - 2
+        if mm_memory_count as usize >= ipc::memmgr_bootstrap::MAX_MEMORY_CAPS - 2
         {
             break;
         }
-        let src_slot = info.memory_frame_base + alloc.next_idx + i;
+        let src_slot = info.memory_base + alloc.next_idx + i;
         let Some(desc) = descriptor_for(info, src_slot)
         else
         {
             // Keep the forwarded set a contiguous prefix: stop here and let
-            // the reap route donate this frame and everything after it.
+            // the reap route donate this memory cap and everything after it.
             break;
         };
         let bytes = desc.aux1;
         let phys_base = desc.aux0;
-        // Every RAM Frame cap init forwards to memmgr MUST carry
+        // Every RAM Memory cap init forwards to memmgr MUST carry
         // `Rights::RETYPE`. The kernel stamps RETYPE on usable RAM at
         // Phase-7 mint (`core/kernel/src/cap/mod.rs`); init holds these
         // caps unchanged. If this assertion ever fires, memmgr will be
-        // unable to retype frames into kernel objects and the typed-memory
+        // unable to retype memory caps into kernel objects and the typed-memory
         // contract is broken. `cap_info` on a non-null slot never fails for
         // the universal `TAG_RIGHTS` field; an Err here means the cap-
         // routing graph is broken and the bootstrap invariant fails.
         let Ok(packed) = syscall::cap_info(src_slot, syscall::CAP_INFO_TAG_RIGHTS)
         else
         {
-            panic!("init: cap_info failed on RAM Frame cap before memmgr forward");
+            panic!("init: cap_info failed on RAM Memory cap before memmgr forward");
         };
         // Packed value is `(tag << 32) | rights`; `RIGHTS_RETYPE` is a
         // low-bit-position right so the u64 mask is exact.
         assert!(
             packed & syscall::RIGHTS_RETYPE != 0,
-            "init: RAM Frame cap missing RIGHTS_RETYPE before memmgr forward",
+            "init: RAM Memory cap missing RIGHTS_RETYPE before memmgr forward",
         );
         let Ok(intermediary) = syscall::cap_derive(src_slot, syscall::RIGHTS_ALL)
         else
@@ -790,28 +790,28 @@ pub fn finalize_memmgr(
         {
             break;
         };
-        if mm_frame_count == 0
+        if mm_memory_count == 0
         {
-            mm_frame_base = dst_slot;
+            mm_memory_base = dst_slot;
         }
-        page_counts[mm_frame_count as usize] = (bytes / PAGE_SIZE) as u32;
-        phys_bases[mm_frame_count as usize] = phys_base;
-        mm_frame_count += 1;
+        page_counts[mm_memory_count as usize] = (bytes / PAGE_SIZE) as u32;
+        phys_bases[mm_memory_count as usize] = phys_base;
+        mm_memory_count += 1;
     }
-    // Advance only past the frames actually forwarded this round (a
-    // contiguous prefix — the loop breaks on the first frame it cannot
-    // forward). `memory_frame_base + alloc.next_idx` is now the reap floor:
-    // every memory-frame cap at or above it is still solely init's, never
-    // handed out by `FrameAlloc` nor forwarded here, and is donated to
-    // memmgr's pool via the reap route, which has no per-round frame cap.
-    alloc.next_idx += mm_frame_count;
+    // Advance only past the memory caps actually forwarded this round (a
+    // contiguous prefix — the loop breaks on the first memory cap it cannot
+    // forward). `memory_base + alloc.next_idx` is now the reap floor:
+    // every memory cap at or above it is still solely init's, never
+    // handed out by `MemoryAlloc` nor forwarded here, and is donated to
+    // memmgr's pool via the reap route, which has no per-round cap.
+    alloc.next_idx += mm_memory_count;
 
     // Forward the partial tail left in `alloc.current`: the unallocated
-    // remainder of the last frame `FrameAlloc` split from. It is a
-    // `frame_split` product, so it carries no named `InitInfo` descriptor and
+    // remainder of the last memory cap `MemoryAlloc` split from. It is a
+    // `memory_split` product, so it carries no named `InitInfo` descriptor and
     // is excluded from the reap donation walk; without this it would free into
     // the post-handoff buddy (which nothing allocates from) and be lost. It is
-    // free RAM, so it joins memmgr's pool as a run like any forwarded frame.
+    // free RAM, so it joins memmgr's pool as a run like any forwarded memory cap.
     if alloc.remaining >= PAGE_SIZE
     {
         let tail_pages = (alloc.remaining / PAGE_SIZE) as u32;
@@ -821,25 +821,25 @@ pub fn finalize_memmgr(
             mm.mm_cspace,
             &mut page_counts,
             &mut phys_bases,
-            &mut mm_frame_base,
-            &mut mm_frame_count,
+            &mut mm_memory_base,
+            &mut mm_memory_count,
         );
         alloc.remaining = 0;
     }
 
     // Forward the transient phys-table page as a free run too (same rationale
-    // as the tail: a descriptor-less `frame_split` product). Its content is
+    // as the tail: a descriptor-less `memory_split` product). Its content is
     // written after this call and read once by memmgr through the read-only
     // `caps[1]` derivation; the free-run copy is the page's keep-alive, and
     // after the read the page is allocatable like any other.
     push_free_run(
-        phys_table_frame,
+        phys_table_memory,
         1,
         mm.mm_cspace,
         &mut page_counts,
         &mut phys_bases,
-        &mut mm_frame_base,
-        &mut mm_frame_count,
+        &mut mm_memory_base,
+        &mut mm_memory_count,
     );
 
     // Forward the in-use bootstrap arenas. These are the RAM init carved to
@@ -878,8 +878,8 @@ pub fn finalize_memmgr(
     log("memmgr started");
 
     Some(MemmgrFinalize {
-        mm_frame_base,
-        mm_frame_count,
+        mm_memory_base,
+        mm_memory_count,
         page_counts,
         phys_bases,
         in_use,
@@ -895,14 +895,18 @@ pub fn finalize_memmgr(
 ///
 /// # Safety
 /// `phys_dst` must point at init's writable mapping of the one-page phys-table
-/// frame (at least 4 KiB, `u64`-aligned).
-pub unsafe fn write_memmgr_aux_frame(phys_dst: *mut u64, info: &InitInfo, mm_final: &MemmgrFinalize)
+/// memory cap (at least 4 KiB, `u64`-aligned).
+pub unsafe fn write_memmgr_aux_memory(
+    phys_dst: *mut u64,
+    info: &InitInfo,
+    mm_final: &MemmgrFinalize,
+)
 {
     use ipc::memmgr_bootstrap as mb;
 
-    for i in 0..(mm_final.mm_frame_count as usize)
+    for i in 0..(mm_final.mm_memory_count as usize)
     {
-        // SAFETY: i < mm_frame_count <= MAX_FRAMES; within the mapped page.
+        // SAFETY: i < mm_memory_count <= MAX_MEMORY_CAPS; within the mapped page.
         unsafe { core::ptr::write_volatile(phys_dst.add(i), mm_final.phys_bases[i]) };
     }
     // SAFETY: the facts and in-use-count indices lie within the mapped page.
@@ -999,9 +1003,9 @@ fn populate_procmgr_info(
             // procmgr has no procmgr above it; leave zero.
             pi.procmgr_endpoint_cap = 0;
             pi.memmgr_endpoint_cap = caps.memmgr_endpoint_slot;
-            pi.stdin_frame_cap = 0;
-            pi.stdout_frame_cap = 0;
-            pi.stderr_frame_cap = 0;
+            pi.stdin_memory_cap = 0;
+            pi.stdout_memory_cap = 0;
+            pi.stderr_memory_cap = 0;
             // Procmgr's own `seraph::log!` surface. The slot holds a badged
             // SEND cap on the log endpoint with badge `LOG_BADGE_PROCMGR`,
             // derived by init via `cap_derive_badge`. Procmgr's std `_start`
@@ -1082,7 +1086,7 @@ pub struct ProcmgrBootstrap
     /// Procmgr's main thread cap (in init's `CSpace`). Used by
     /// [`start_procmgr`] to launch procmgr after memmgr is live.
     pub thread: u32,
-    /// Procmgr's contiguous backing arena Frame cap (in init's `CSpace`).
+    /// Procmgr's contiguous backing arena Memory cap (in init's `CSpace`).
     /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
     /// as an in-use arena so its pages are accounted in memmgr's pool.
     pub arena_cap: u32,
@@ -1117,7 +1121,7 @@ pub static NEXT_BOOTSTRAP_BADGE: core::sync::atomic::AtomicU64 =
 )]
 pub fn bootstrap_procmgr(
     info: &InitInfo,
-    alloc: &mut FrameAlloc,
+    alloc: &mut MemoryAlloc,
     init_bootstrap_ep: u32,
     pm_service_ep: u32,
     log_ep: u32,
@@ -1127,16 +1131,16 @@ pub fn bootstrap_procmgr(
 {
     let init_aspace = info.aspace_cap;
 
-    let module_frame_cap = crate::find_module_by_name(info, b"procmgr")?;
+    let module_memory_cap = crate::find_module_by_name(info, b"procmgr")?;
     let module_size = crate::descriptors(info)
         .iter()
-        .find(|d| d.slot == module_frame_cap)
+        .find(|d| d.slot == module_memory_cap)
         .map(|d| d.aux1)?;
 
     let module_pages = (module_size + 0xFFF) / PAGE_SIZE;
 
     // Derive a read-only child cap (see `bootstrap_memmgr` for rationale).
-    let module_ro = syscall::cap_derive(module_frame_cap, syscall::RIGHTS_MAP_READ).ok()?;
+    let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MAP_READ).ok()?;
     syscall::mem_map(
         module_ro,
         init_aspace,
@@ -1147,7 +1151,7 @@ pub fn bootstrap_procmgr(
     )
     .ok()?;
 
-    // SAFETY: module frame is now mapped read-only at TEMP_MAP_BASE.
+    // SAFETY: module memory cap is now mapped read-only at TEMP_MAP_BASE.
     let module_bytes =
         unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, module_size as usize) };
 
@@ -1196,8 +1200,8 @@ pub fn bootstrap_procmgr(
     let pm_creator_slot =
         syscall::cap_copy(badged_creator, pm_cspace, syscall::RIGHTS_SEND).ok()?;
 
-    // Procmgr maintains no frame pool of its own; every per-child
-    // allocation routes through memmgr. All remaining RAM frames get
+    // Procmgr maintains no memory-cap pool of its own; every per-child
+    // allocation routes through memmgr. All remaining RAM memory caps get
     // delegated to memmgr in `finalize_memmgr` after every setup path
     // has finished consuming init's pool.
     let _ = pm_creator_slot;
@@ -1289,7 +1293,7 @@ pub fn bootstrap_procmgr(
     )
     .ok()?;
     // **Don't** thread_start here — procmgr's `_start` calls
-    // `heap_bootstrap` which calls memmgr's `REQUEST_FRAMES`, so memmgr
+    // `heap_bootstrap` which calls memmgr's `REQUEST_MEMORY_CAPS`, so memmgr
     // must already be ingested + serving before procmgr starts. Caller
     // runs `finalize_memmgr` first, then `start_procmgr`.
 

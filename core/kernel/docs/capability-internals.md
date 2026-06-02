@@ -134,7 +134,7 @@ mis-target the new tenant. See #137 for the recycling allocator design.
 pub enum CapTag
 {
     Null          = 0,
-    Frame         = 1,
+    Memory        = 1,
     AddressSpace  = 2,
     Endpoint      = 3,
     Notification        = 4,
@@ -156,7 +156,7 @@ pub enum CapTag
 bitflags! {
     pub struct Rights: u32
     {
-        // Frame rights
+        // Memory rights
         const MAP        = 1 << 0;
         const WRITE      = 1 << 1;
         const EXECUTE    = 1 << 2;
@@ -379,13 +379,13 @@ layout via a well-known structure at the top of init's stack.
 | 2 | Init's own address space capability |
 | 3 | Init's own CSpace capability |
 | 4 | SchedControl capability (Elevate rights) |
-| 5..N | Frame capabilities (one per usable physical region) |
+| 5..N | Memory capabilities (one per usable physical region) |
 | N+1..M | MMIO region capabilities (one per MmioRange / PciEcam entry) |
 | M+1..K | Interrupt capabilities (one per IrqLine entry) |
-| K+1..L | Read-only Frame capabilities (one per PlatformTable entry) |
+| K+1..L | Read-only Memory capabilities (one per PlatformTable entry) |
 | L+1..P | IoPortRange capabilities (one per IoPortRange entry; x86-64 only) |
-| P+1..Q | Frame capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
-| Q+1..R | Reclaimable Frame capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Frame caps above) — one cap per `BootInfo.reclaim_ranges` entry |
+| P+1..Q | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
+| Q+1..R | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry |
 
 The exact slot numbers are passed to init in the `KernelHandoff` structure placed
 on init's user stack before it begins execution.

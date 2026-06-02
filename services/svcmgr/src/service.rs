@@ -86,7 +86,7 @@ pub struct ServiceEntry
     /// current process instance. Populated by the restart path after the
     /// first successful `CREATE_PROCESS` reply; used to call
     /// `DESTROY_PROCESS` before spawning the next restart so procmgr can
-    /// reclaim kernel objects and return its frames to memmgr's pool.
+    /// reclaim kernel objects and return its memory caps to memmgr's pool.
     /// Zero for the initial instance (which svcmgr never created — init
     /// did), so the first death cannot destroy; subsequent deaths can.
     pub process_handle: u32,

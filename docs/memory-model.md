@@ -175,7 +175,7 @@ boot modules, and reserved regions is marked unavailable.
 ### Bootloader Scratch Reclamation
 
 Pages the bootloader allocated for its own scratch use are recorded in
-`BootInfo.reclaim_ranges` and minted as reclaimable Frame caps into
+`BootInfo.reclaim_ranges` and minted as reclaimable Memory caps into
 init's CSpace by the kernel-initialisation reclaim-minting steps. See
 [`core/kernel/docs/initialization.md`](../core/kernel/docs/initialization.md)
 Phase 7 (standard reclaim mint) and Phase 8 (`RECLAIM_FLAG_LATE`

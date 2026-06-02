@@ -99,12 +99,12 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     // contract from a clean state.
     EXIT_REQUESTED.store(false, Ordering::Release);
 
-    let Ok(ready) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(ready) = cap_create_notification(ctx.memory_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         cap_delete(ready).ok();
@@ -173,7 +173,7 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         }
     }
 
-    let Some(frame) = crate::frame_pool::alloc()
+    let Some(memory_cap) = crate::frame_pool::alloc()
     else
     {
         // Cooperative teardown even on the early-return path.
@@ -189,7 +189,15 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 
     for _ in 0..n
     {
-        if syscall::mem_map(frame, ctx.aspace_cap, BENCH_VA, 0, 1, syscall::MAP_WRITABLE).is_err()
+        if syscall::mem_map(
+            memory_cap,
+            ctx.aspace_cap,
+            BENCH_VA,
+            0,
+            1,
+            syscall::MAP_WRITABLE,
+        )
+        .is_err()
         {
             break;
         }
@@ -209,8 +217,8 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         total = total.saturating_add(delta);
     }
 
-    // SAFETY: frame is from pool and now unmapped.
-    unsafe { crate::frame_pool::free(frame) };
+    // SAFETY: memory_cap is from pool and now unmapped.
+    unsafe { crate::frame_pool::free(memory_cap) };
 
     // Cooperative teardown: flip the flag, wait for every worker's
     // exit-bit on `done`, then cap_delete (each Thread is already Exited).
@@ -287,11 +295,11 @@ const CONC_VA_STRIDE: u64 = 0x1_0000;
 // `teardown` helper's fixed-size signature.
 static mut CONC_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; MAX_PINNED];
 
-/// Child-cspace slot of each worker's frame cap, indexed by worker bit-index.
+/// Child-cspace slot of each worker's Memory cap, indexed by worker bit-index.
 /// Set by the parent before starting each worker; read by the worker. (Arg
-/// packing has no room for both frame and aspace slots alongside the notification
+/// packing has no room for both memory and aspace slots alongside the notification
 /// slots, so these go through statics.)
-static CONC_FRAME_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
+static CONC_MEMORY_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
 /// Child-cspace slot of each worker's aspace cap, indexed by worker bit-index.
 static CONC_ASPACE_SLOT: [AtomicU32; MAX_PINNED] = [const { AtomicU32::new(0) }; MAX_PINNED];
 
@@ -355,7 +363,7 @@ fn conc_worker_entry(arg: u64) -> !
     let iters = (arg >> 40) & 0xFF_FFFF;
     let bit = 1u64 << bit_index;
 
-    let frame = CONC_FRAME_SLOT[bit_index].load(Ordering::Acquire);
+    let memory = CONC_MEMORY_SLOT[bit_index].load(Ordering::Acquire);
     let aspace = CONC_ASPACE_SLOT[bit_index].load(Ordering::Acquire);
     let va = CONC_VA_BASE + (bit_index as u64) * CONC_VA_STRIDE;
 
@@ -371,7 +379,7 @@ fn conc_worker_entry(arg: u64) -> !
         // Time the map — a fresh map (the VA is unmapped at loop top), whose
         // remote shootdown the operation-class elision skips.
         let m0 = cycles_now();
-        let mr = syscall::mem_map(frame, aspace, va, 0, 1, syscall::MAP_WRITABLE);
+        let mr = syscall::mem_map(memory, aspace, va, 0, 1, syscall::MAP_WRITABLE);
         let m1 = cycles_now();
         if mr.is_err()
         {
@@ -424,12 +432,12 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     CONC_MAP_SUM.store(0, Ordering::Release);
     CONC_MAP_CNT.store(0, Ordering::Release);
 
-    let Ok(ready) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(ready) = cap_create_notification(ctx.memory_base)
     else
     {
         return;
     };
-    let Ok(done) = cap_create_notification(ctx.memory_frame_base)
+    let Ok(done) = cap_create_notification(ctx.memory_base)
     else
     {
         cap_delete(ready).ok();
@@ -437,9 +445,9 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     };
 
     // One pool frame per worker.
-    let mut frames = [0u32; MAX_PINNED];
+    let mut memory_caps = [0u32; MAX_PINNED];
     let mut allocated = 0usize;
-    for f in frames.iter_mut().take(want)
+    for f in memory_caps.iter_mut().take(want)
     {
         match crate::frame_pool::alloc()
         {
@@ -476,7 +484,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             cap_delete(child.cs).ok();
             break;
         };
-        let Ok(child_frame) = syscall::cap_copy(frames[i], child.cs, syscall::RIGHTS_ALL)
+        let Ok(child_memory) = syscall::cap_copy(memory_caps[i], child.cs, syscall::RIGHTS_ALL)
         else
         {
             cap_delete(child.th).ok();
@@ -491,7 +499,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
             break;
         };
 
-        CONC_FRAME_SLOT[i].store(child_frame, Ordering::Release);
+        CONC_MEMORY_SLOT[i].store(child_memory, Ordering::Release);
         CONC_ASPACE_SLOT[i].store(child_aspace, Ordering::Release);
 
         // SAFETY: bench tier runs sequentially; this is the only use of
@@ -534,7 +542,7 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     // thread_exit), then delete caps — no cap_delete races a running worker.
     teardown(&threads, &cspaces, spawned, ready, done);
 
-    for (i, fr) in frames.iter().enumerate().take(allocated)
+    for (i, fr) in memory_caps.iter().enumerate().take(allocated)
     {
         // Defensively unmap each worker's VA before returning the frame to the
         // pool: a worker that hit an (unexpected) mem_unmap error exits with its

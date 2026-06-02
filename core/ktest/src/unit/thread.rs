@@ -115,7 +115,7 @@ static PHASE2_SIG: AtomicU32 = AtomicU32::new(0);
 /// The child notifications 0xBEEF back to confirm it executed.
 pub fn configure_start(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for configure_start failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::configure_start: spawn::new_child failed")?;
@@ -157,9 +157,9 @@ pub fn r#yield(_ctx: &TestContext) -> TestResult
 pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 {
     const BUF_SIZE: usize = 512; // Larger than any architecture's TrapFrame.
-    let ready = cap_create_notification(ctx.memory_frame_base)
+    let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (ready) for stop_read_regs failed")?;
-    let block = cap_create_notification(ctx.memory_frame_base)
+    let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (block) for stop_read_regs failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::stop_read_regs: spawn::new_child failed")?;
@@ -217,9 +217,9 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 /// Stopping an already-stopped thread returns `InvalidState`.
 pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 {
-    let ready = cap_create_notification(ctx.memory_frame_base)
+    let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (ready) for double-stop test failed")?;
-    let block = cap_create_notification(ctx.memory_frame_base)
+    let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (block) for double-stop test failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::stop_again_invalid_state: spawn::new_child failed")?;
@@ -262,9 +262,9 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
 pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 {
     const BUF_SIZE: usize = 512;
-    let ready = cap_create_notification(ctx.memory_frame_base)
+    let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (ready) for write_regs_resume failed")?;
-    let block = cap_create_notification(ctx.memory_frame_base)
+    let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (block) for write_regs_resume failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::write_regs_resume: spawn::new_child failed")?;
@@ -424,9 +424,9 @@ pub fn set_affinity_invalid_err(ctx: &TestContext) -> TestResult
 /// a stable point at which the thread is no longer in `Created` state.
 pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
 {
-    let ready = cap_create_notification(ctx.memory_frame_base)
+    let ready = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (ready) for configure_running_thread_err failed")?;
-    let block = cap_create_notification(ctx.memory_frame_base)
+    let block = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification (block) for configure_running_thread_err failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::configure_running_thread_err: spawn::new_child failed")?;
@@ -521,7 +521,7 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for affinity_bind_cpu1 failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_bind_cpu1: spawn::new_child failed")?;
@@ -613,7 +613,7 @@ pub fn affinity_migrate_ready_queued(ctx: &TestContext) -> TestResult
 
 fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
 {
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for affinity_migrate_ready_queued failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_migrate_ready_queued: spawn::new_child failed")?;
@@ -699,7 +699,7 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     MIGRATE_OBSERVED_CPU.store(u32::MAX, Ordering::Relaxed);
     MIGRATE_SHOULD_EXIT.store(0, Ordering::Relaxed);
 
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for affinity_migrate_running failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_migrate_running: spawn::new_child failed")?;
@@ -776,7 +776,7 @@ fn balance_spawn_spinners(
     for i in 0..n
     {
         BALANCE_OBSERVED_CPU[i].store(u32::MAX, Ordering::Relaxed);
-        let sig = cap_create_notification(ctx.memory_frame_base)
+        let sig = cap_create_notification(ctx.memory_base)
             .map_err(|_| "balance: cap_create_notification failed")?;
         let child = crate::spawn::new_child(ctx).map_err(|_| "balance: spawn::new_child failed")?;
         let child_sig =
@@ -956,7 +956,7 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for affinity_respected failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::affinity_respected: spawn::new_child failed")?;
@@ -1010,7 +1010,7 @@ pub fn default_affinity_bsp(ctx: &TestContext) -> TestResult
         return Ok(());
     }
 
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "create_notification for default_affinity_bsp failed")?;
     let child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::default_affinity_bsp: spawn::new_child failed")?;
@@ -1228,7 +1228,7 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
 {
     const CORRELATOR: u32 = 0xCAFEu32;
 
-    let eq = event_queue_create(ctx.memory_frame_base, 4)
+    let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "thread::bind_notification_fires_on_exit: event_queue_create failed")?;
 
     let child = crate::spawn::new_child(ctx)

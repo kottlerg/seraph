@@ -62,9 +62,9 @@ fn producer_entry(arg: u64) -> !
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let eq = event_queue_create(ctx.memory_frame_base, TOTAL_MESSAGES)
+    let eq = event_queue_create(ctx.memory_base, TOTAL_MESSAGES)
         .map_err(|_| "concurrent_event_producers: event_queue_create failed")?;
-    let done = cap_create_notification(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "concurrent_event_producers: cap_create_notification failed")?;
 
     let mut threads = [0u32; NUM_PRODUCERS];

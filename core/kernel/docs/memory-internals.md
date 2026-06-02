@@ -307,7 +307,7 @@ pub struct AddressSpace
 
 Seraph does not provide a `fork()` equivalent. New address spaces are created empty
 and populated by the process loader. Copy-on-write is not implemented. Shared memory
-is established by mapping the same frame capability into multiple address spaces.
+is established by mapping the same memory capability into multiple address spaces.
 
 ---
 

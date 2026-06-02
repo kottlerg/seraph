@@ -120,7 +120,7 @@ are never reassigned or reused.
  8  SYS_CAP_CREATE_NOTIFICATION     30  SYS_IRQ_REGISTER
  9  SYS_CAP_CREATE_EVENT_Q    31  SYS_CAP_DELETE
 10  SYS_CAP_CREATE_THREAD     32  SYS_CAP_INSERT
-11  SYS_CAP_CREATE_ASPACE     33  SYS_FRAME_SPLIT
+11  SYS_CAP_CREATE_ASPACE     33  SYS_MEMORY_SPLIT
 12  SYS_CAP_CREATE_CSPACE     34  SYS_MMIO_MAP
 13  SYS_CAP_CREATE_WAIT_SET   35  SYS_IOPORT_BIND
 14  SYS_CAP_DERIVE            36  (reserved)
@@ -142,7 +142,7 @@ are never reassigned or reused.
 queue creation and I/O), 7–8 (endpoint/notification creation), 10–13 (thread,
 aspace, cspace, wait set creation), 14–18 (cap management and memory),
 21–28 (thread lifecycle, wait set operations), 29–30 (IRQ ACK and
-register), 31–35 (cap delete/insert, frame split, MMIO map, ioport
+register), 31–35 (cap delete/insert, memory split, MMIO map, ioport
 bind), 41–43 (aspace query, ipc buffer set, system info). Slot 36 is
 reserved and returns `UnknownSyscall`. All other unallocated numbers
 return `UnknownSyscall`.
@@ -590,30 +590,30 @@ If this is the last reference to the underlying object, the object is freed.
 
 ### `SYS_MEM_MAP` (16)
 
-Map pages from a physical frame capability into an address space.
+Map pages from a physical memory capability into an address space.
 
 **Arguments:**
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `frame_cap` | Frame capability (Map rights) |
+| 0 | `memory_cap` | Memory capability (Map rights) |
 | 1 | `aspace_cap` | Address space capability (Map rights) |
 | 2 | `virt` | Virtual address to map at (page-aligned, user range) |
 | 3 | `offset_pages` | Page offset into the frame |
 | 4 | `page_count` | Number of pages to map (nonzero) |
-| 5 | `prot_bits` | Protection bits: bit 0 = READ, bit 1 = WRITE, bit 2 = EXECUTE. If zero, derived from frame cap rights |
+| 5 | `prot_bits` | Protection bits: bit 0 = READ, bit 1 = WRITE, bit 2 = EXECUTE. If zero, derived from memory cap rights |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-If `prot_bits` is nonzero, the requested permissions must be a subset of the frame
+If `prot_bits` is nonzero, the requested permissions must be a subset of the memory
 cap's rights. W^X is enforced: WRITE and EXECUTE may not both be set. Bit 0 (READ)
 carries no permission of its own; it makes an otherwise-empty read-only request
 nonzero so the explicit path is taken instead of deriving from the cap's rights.
 
-If `prot_bits` is zero, permissions are derived from the frame cap's rights directly.
-This fails with `WxViolation` if the frame cap has both WRITE and EXECUTE rights.
+If `prot_bits` is zero, permissions are derived from the memory cap's rights directly.
+This fails with `WxViolation` if the memory cap has both WRITE and EXECUTE rights.
 
-**Capability requirements:** `frame_cap` (Map), `aspace_cap` (Map).
+**Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (requested prot exceeds cap
 rights), `WxViolation` (both WRITE and EXECUTE requested), `InvalidArgument`
@@ -635,7 +635,7 @@ Remove a mapping from an address space.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The physical frame is not freed — only the virtual mapping is removed. The frame
+The physical frame is not freed — only the virtual mapping is removed. The memory
 capability continues to exist. TLB shootdowns are performed on all CPUs running
 threads in `aspace_cap`.
 
@@ -661,7 +661,7 @@ Change the permission flags on an existing mapping without altering the physical
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
 W^X is enforced on the new flags. The caller cannot grant rights beyond what the
-frame capability allows (but the frame capability is not re-checked here — the kernel
+memory capability allows (but the memory capability is not re-checked here — the kernel
 records the maximum rights at map time).
 
 **Capability requirement:** `aspace_cap` must have Map rights.
@@ -671,9 +671,9 @@ initial mapping rights), `InvalidArgument` (address not mapped).
 
 ---
 
-### `SYS_FRAME_SPLIT` (33)
+### `SYS_MEMORY_SPLIT` (33)
 
-Split a frame capability at a page boundary, producing two frame capabilities that
+Split a memory capability at a page boundary, producing two memory capabilities that
 together cover the same physical range as the original. The original capability is
 consumed.
 
@@ -681,7 +681,7 @@ consumed.
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `frame_cap` | Frame capability to split |
+| 0 | `memory_cap` | Memory capability to split |
 | 1 | `offset_pages` | Page offset within the frame at which to split |
 
 **Return:**
@@ -691,7 +691,7 @@ consumed.
 - `rdx`/`a1`: capability descriptor for the upper portion (pages offset_pages..end)
   on success
 
-The original `frame_cap` is consumed by this call. Both halves inherit the same
+The original `memory_cap` is consumed by this call. Both halves inherit the same
 rights as the original. The derivation tree treats both halves as children of the
 original's position.
 

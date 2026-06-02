@@ -19,11 +19,11 @@
 //! - Phase 5: architecture hardware init (GDT/IDT/APIC or stvec/PLIC, timer, syscall).
 //! - Phase 6: cache `kernel_mmio` and validate `mmio_apertures` slice before capability minting.
 //! - Phase 7: initialise capability subsystem; mint root `CSpace` with initial hardware caps;
-//!   mint reclaimable Frame caps over bootloader scratch pages (`BootInfo`,
+//!   mint reclaimable Memory caps over bootloader scratch pages (`BootInfo`,
 //!   descriptor arrays, transient PT frames) so they flow to userspace via the
 //!   standard `CapDescriptor` path.
 //! - Phase 8: initialise per-CPU scheduler state and idle threads, start APs,
-//!   and retire the AP trampoline identity mapping into a reclaimable Frame cap.
+//!   and retire the AP trampoline identity mapping into a reclaimable Memory cap.
 //! - Phase 9: create init process address space + TCB; hand off root `CSpace`; enter user mode.
 
 #![cfg_attr(not(test), no_std)]
@@ -247,7 +247,7 @@ unsafe fn kernel_entry_post_rebase(
 
     // ── Phase 4: typed-memory cap surface ────────────────────────────────────
     // The kernel does not run a `GlobalAlloc`; every kernel-object body is
-    // sourced from a Frame cap via `crate::cap::retype` (caller-supplied at
+    // sourced from a Memory cap via `crate::cap::retype` (caller-supplied at
     // userspace `cap_create_*` boundaries; SEED-backed at boot time and for
     // split-derived wrappers). Phase 4 carries no setup cost — the typed-
     // memory machinery is ready as soon as `SEED_FRAME` is installed in
@@ -256,7 +256,7 @@ unsafe fn kernel_entry_post_rebase(
     // Note on bootloader page table frame reclamation:
     // Bootloader transient page-table frames are now recorded in
     // `BootInfo.reclaim_ranges` (boot protocol v7) and minted into init's
-    // CSpace by `cap::mint_reclaim_frame_caps`. The remaining un-reclaimed
+    // CSpace by `cap::mint_reclaim_memory_caps`. The remaining un-reclaimed
     // category is `BOOT_TABLE_POOL` (BSS array): part of the kernel image,
     // cannot be freed to buddy; the unused portion (~750 KiB) is acceptable
     // waste.
@@ -436,7 +436,7 @@ unsafe fn kernel_entry_post_rebase(
     // both arches; required for the post-`csrw satp` / post-CR3-write
     // instructions inside the trampoline to fetch correctly) is no
     // longer reachable by any code path. Tear it down with a TLB
-    // shootdown across all online CPUs, then mint a reclaimable Frame
+    // shootdown across all online CPUs, then mint a reclaimable Memory
     // cap over the page so it reaches init via the standard
     // `CapDescriptor` walk.
     #[cfg(not(test))]
@@ -461,7 +461,7 @@ unsafe fn kernel_entry_post_rebase(
         unsafe {
             let cs = cap::root_cspace_mut()
                 .unwrap_or_else(|| fatal("late reclaim: ROOT_CSPACE missing"));
-            cap::mint_late_reclaim_frame_caps(cs, info_dm, &mut cspace_layout);
+            cap::mint_late_reclaim_memory_caps(cs, info_dm, &mut cspace_layout);
         }
     }
 
@@ -501,7 +501,7 @@ unsafe fn kernel_entry_post_rebase(
         const INIT_ASPACE_PAGES: u64 = 18;
         // SAFETY: SEED installed in Phase 7; single-threaded Phase 9.
         let (init_as_obj_nn, init_as_ptr) =
-            unsafe { cap::boot_retype_aspace(cap::seed_frame_ref(), INIT_ASPACE_PAGES) };
+            unsafe { cap::boot_retype_aspace(cap::seed_memory_ref(), INIT_ASPACE_PAGES) };
         // init's AS is built from typed memory (boot_retype_aspace), so the
         // buddy allocator is unused here.
         let _ = allocator;
@@ -521,12 +521,12 @@ unsafe fn kernel_entry_post_rebase(
         }
 
         // Insert an AddressSpace cap for init's own address space into the root
-        // CSpace, followed by Frame caps for each init segment. These are needed
+        // CSpace, followed by Memory caps for each init segment. These are needed
         // so init can create child threads bound to its own address space and map
         // its code pages into child processes once a process manager is available.
-        let (init_aspace_cap_slot, segment_frame_base, segment_frame_count) = {
+        let (init_aspace_cap_slot, segment_memory_base, segment_memory_count) = {
             use boot_protocol::SegmentFlags;
-            use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+            use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::{CapTag, Rights};
 
             // SAFETY: ROOT_CSPACE initialized in Phase 7, still owned by kernel
@@ -542,7 +542,7 @@ unsafe fn kernel_entry_post_rebase(
                 )
                 .unwrap_or_else(|_| fatal("Phase 9: cannot insert init AddressSpace cap"));
 
-            // Frame caps for each init segment (phys base + size + permissions).
+            // Memory caps for each init segment (phys base + size + permissions).
             // Minted reclaimable: full byte ledger + `owns_memory = true` +
             // `register_owned_range` so init's reap-handoff donation
             // (`procmgr.REGISTER_INIT_TEARDOWN` → `memmgr.DONATE_FRAMES`)
@@ -565,11 +565,11 @@ unsafe fn kernel_entry_post_rebase(
                 };
                 // The bootloader encodes the ELF in-page offset into
                 // `phys_addr` so `map_segment` can preserve
-                // `phys & 0xFFF == virt & 0xFFF`. The Frame cap exposed
+                // `phys & 0xFFF == virt & 0xFFF`. The Memory cap exposed
                 // to userspace describes whole pages, so mask the base
                 // down and ceil-round the size to PAGE_SIZE — upholds
-                // FrameObject's alignment invariant for downstream
-                // sys_mem_map / sys_frame_split.
+                // MemoryObject's alignment invariant for downstream
+                // sys_mem_map / sys_memory_split.
                 let page_mask = mm::PAGE_SIZE as u64 - 1;
                 let phys_aligned = seg.phys_addr & !page_mask;
                 let in_page_off = seg.phys_addr & page_mask;
@@ -582,9 +582,9 @@ unsafe fn kernel_entry_post_rebase(
                         alloc.register_owned_range(phys_aligned, size_aligned);
                     });
                 }
-                let fo_nn = cap::mint_phase7_body(FrameObject {
+                let fo_nn = cap::mint_phase7_body(MemoryObject {
                     header: KernelObjectHeader::with_ancestor(
-                        ObjectType::Frame,
+                        ObjectType::Memory,
                         cap::seed_header_nn(),
                     ),
                     base: phys_aligned,
@@ -595,8 +595,8 @@ unsafe fn kernel_entry_post_rebase(
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
                 let slot = cs
-                    .insert_cap(CapTag::Frame, rights, fo_nn)
-                    .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Frame cap"));
+                    .insert_cap(CapTag::Memory, rights, fo_nn)
+                    .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Memory cap"));
                 cap::note_owns_memory_minted(size_aligned);
                 if i == 0
                 {
@@ -604,7 +604,7 @@ unsafe fn kernel_entry_post_rebase(
                 }
             }
             kprintln!(
-                "init: aspace cap={} + {} frame caps",
+                "init: aspace cap={} + {} memory caps",
                 aspace_slot.get(),
                 seg_count,
             );
@@ -615,11 +615,11 @@ unsafe fn kernel_entry_post_rebase(
         // Allocate enough physical pages for InitInfo + CapDescriptor array +
         // command line, fill them via the direct map, then map read-only into
         // init's address space starting at INIT_INFO_VADDR. Each backing page
-        // also gets a reclaimable Frame cap minted into init's CSpace so the
+        // also gets a reclaimable Memory cap minted into init's CSpace so the
         // pages flow into memmgr's pool through init's reap-handoff donate
         // path (see `services/init/src/service.rs` end-of-phase-3).
         let info_page_virt = {
-            use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+            use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::{CapTag, Rights};
             use init_protocol::{
                 INIT_INFO_VADDR, INIT_PROTOCOL_VERSION, InitFramebufferInfo, InitInfo,
@@ -733,10 +733,10 @@ unsafe fn kernel_entry_post_rebase(
                 cap_descriptor_count: desc_count as u32,
                 aspace_cap: init_aspace_cap_slot,
                 sched_control_cap: cspace_layout.sched_control_slot,
-                memory_frame_base: cspace_layout.memory_frame_base,
-                memory_frame_count: cspace_layout.memory_frame_count,
-                segment_frame_base,
-                segment_frame_count,
+                memory_base: cspace_layout.memory_base,
+                memory_count: cspace_layout.memory_count,
+                segment_memory_base,
+                segment_memory_count,
                 hw_cap_base: cspace_layout.hw_cap_base,
                 hw_cap_count: cspace_layout.hw_cap_count,
                 cap_descriptors_offset: descriptors_offset,
@@ -744,14 +744,14 @@ unsafe fn kernel_entry_post_rebase(
                 sbi_control_cap: cspace_layout.sbi_control_slot,
                 cspace_cap: 0, // patched below after CSpace cap is minted
                 irq_range_cap: cspace_layout.irq_range_slot,
-                acpi_rsdp_frame_cap: cspace_layout.acpi_rsdp_frame_slot,
-                acpi_region_frame_base: cspace_layout.acpi_region_frame_base,
-                acpi_region_frame_count: cspace_layout.acpi_region_frame_count,
-                dtb_frame_cap: cspace_layout.dtb_frame_slot,
-                init_stack_frame_base: 0,  // patched after stack mint
-                init_stack_frame_count: 0, // patched after stack mint
-                init_info_frame_base: 0,   // patched after self-mint below
-                init_info_frame_count: 0,  // patched after self-mint below
+                acpi_rsdp_memory_cap: cspace_layout.acpi_rsdp_memory_slot,
+                acpi_region_memory_base: cspace_layout.acpi_region_memory_base,
+                acpi_region_memory_count: cspace_layout.acpi_region_memory_count,
+                dtb_memory_cap: cspace_layout.dtb_memory_slot,
+                init_stack_memory_base: 0,  // patched after stack mint
+                init_stack_memory_count: 0, // patched after stack mint
+                init_info_memory_base: 0,   // patched after self-mint below
+                init_info_memory_count: 0,  // patched after self-mint below
                 module_name_count: cspace_layout.module_name_count,
                 module_names: cspace_layout.module_names,
                 system_ram_bytes: 0, // patched below after all owns_memory mints
@@ -781,7 +781,7 @@ unsafe fn kernel_entry_post_rebase(
                 written += chunk;
             }
 
-            // Mint a reclaimable Frame cap per InitInfo page so init's
+            // Mint a reclaimable Memory cap per InitInfo page so init's
             // reap-handoff donates the pages back to memmgr after AS
             // teardown. Caps carry MAP|READ rights (matching the
             // userspace mapping) and the standard reclaim flags
@@ -789,16 +789,16 @@ unsafe fn kernel_entry_post_rebase(
             // SAFETY: ROOT_CSPACE initialised in Phase 7; single-threaded boot.
             let cs = unsafe { cap::root_cspace_mut() }
                 .unwrap_or_else(|| fatal("Phase 9: ROOT_CSPACE missing for InitInfo mint"));
-            let mut info_frame_base_slot: u32 = 0;
+            let mut info_memory_base_slot: u32 = 0;
             for pg in 0..info_pages
             {
                 let phys = page_phys[pg];
                 // No register_owned_range: these pages came from the buddy
                 // (reserved at Phase 7), so they are already in `total_pages`.
                 // `register_owned_range` would double-count.
-                let fo_nn = cap::mint_phase7_body(FrameObject {
+                let fo_nn = cap::mint_phase7_body(MemoryObject {
                     header: KernelObjectHeader::with_ancestor(
-                        ObjectType::Frame,
+                        ObjectType::Memory,
                         cap::seed_header_nn(),
                     ),
                     base: phys,
@@ -810,15 +810,15 @@ unsafe fn kernel_entry_post_rebase(
                 });
                 let slot = cs
                     .insert_cap(
-                        CapTag::Frame,
+                        CapTag::Memory,
                         Rights::MAP | Rights::READ | Rights::RETYPE,
                         fo_nn,
                     )
-                    .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Frame cap"));
+                    .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
                 if pg == 0
                 {
-                    info_frame_base_slot = slot.get();
+                    info_memory_base_slot = slot.get();
                 }
             }
 
@@ -829,8 +829,8 @@ unsafe fn kernel_entry_post_rebase(
             #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 let info_ptr = info_base.cast::<InitInfo>();
-                (*info_ptr).init_info_frame_base = info_frame_base_slot;
-                (*info_ptr).init_info_frame_count = info_pages as u32;
+                (*info_ptr).init_info_memory_base = info_memory_base_slot;
+                (*info_ptr).init_info_memory_count = info_pages as u32;
             }
 
             kprintln!(
@@ -844,14 +844,14 @@ unsafe fn kernel_entry_post_rebase(
         };
 
         // Map init's user stack (INIT_STACK_PAGES pages below INIT_STACK_TOP)
-        // and mint a reclaimable Frame cap for each backing page. Inlined
+        // and mint a reclaimable Memory cap for each backing page. Inlined
         // (rather than calling `map_stack`) so we capture each phys address
         // for cap minting; `register_owned_range` accounts for the pages in
         // the buddy's `total_pages` ledger. The caps route to memmgr via reap;
         // post-handoff the buddy is sealed, so the dealloc `free_range` path
         // is a tripwire, not an expected reclaim.
-        let (init_stack_frame_base, init_stack_frame_count) = {
-            use cap::object::{FrameObject, KernelObjectHeader, ObjectType};
+        let (init_stack_memory_base, init_stack_memory_count) = {
+            use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::{CapTag, Rights};
 
             const STACK_PAGES: usize = mm::address_space::INIT_STACK_PAGES;
@@ -889,13 +889,13 @@ unsafe fn kernel_entry_post_rebase(
                         .unwrap_or_else(|()| fatal("Phase 9: failed to map init stack page"));
                 }
 
-                // Mint a reclaimable Frame cap covering this page.
+                // Mint a reclaimable Memory cap covering this page.
                 // No register_owned_range: the page came from the buddy
                 // (reserved at Phase 7), so it is already in `total_pages`.
                 // `register_owned_range` would double-count.
-                let fo_nn = cap::mint_phase7_body(FrameObject {
+                let fo_nn = cap::mint_phase7_body(MemoryObject {
                     header: KernelObjectHeader::with_ancestor(
-                        ObjectType::Frame,
+                        ObjectType::Memory,
                         cap::seed_header_nn(),
                     ),
                     base: phys,
@@ -907,11 +907,11 @@ unsafe fn kernel_entry_post_rebase(
                 });
                 let slot = cs
                     .insert_cap(
-                        CapTag::Frame,
+                        CapTag::Memory,
                         Rights::MAP | Rights::READ | Rights::WRITE | Rights::RETYPE,
                         fo_nn,
                     )
-                    .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Frame cap"));
+                    .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
                 if i == 0
                 {
@@ -929,11 +929,11 @@ unsafe fn kernel_entry_post_rebase(
         #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
-            (*info_ptr).init_stack_frame_base = init_stack_frame_base;
-            (*info_ptr).init_stack_frame_count = init_stack_frame_count;
+            (*info_ptr).init_stack_memory_base = init_stack_memory_base;
+            (*info_ptr).init_stack_memory_count = init_stack_memory_count;
         }
 
-        // Patch the immutable memory-accounting facts. All owns_memory Frame
+        // Patch the immutable memory-accounting facts. All owns_memory Memory
         // caps minted to init (Phase-7 drain/module/reclaim + the segment,
         // InitInfo, and stack caps above) are now in the ledger, so the
         // reserved total is the complement against installed RAM.
@@ -981,7 +981,7 @@ unsafe fn kernel_entry_post_rebase(
             use cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
 
             let bytes = INIT_THREAD_PAGES * mm::PAGE_SIZE as u64;
-            let seed = cap::seed_frame_ref();
+            let seed = cap::seed_memory_ref();
             let offset = cap::retype::retype_allocate(seed, bytes)
                 .unwrap_or_else(|_| fatal("Phase 9: SEED too small for init Thread slab"));
             let block_phys = seed.base + offset;
@@ -1156,7 +1156,7 @@ unsafe fn kernel_entry_post_rebase(
         );
 
         // ── Boot-handover ledger ────────────────────────────────────────────
-        // Sum FrameObject.available_bytes across every Frame cap in init's
+        // Sum MemoryObject.available_bytes across every Memory cap in init's
         // CSpace plus SEED's residual reserve. After 4b, SEED is the kernel's
         // ongoing body source for split-derived wrappers and per-thread IOPB
         // pages; printing both makes the invariant
@@ -1168,8 +1168,8 @@ unsafe fn kernel_entry_post_rebase(
         // observable byte-for-byte. The kernel heap is deleted; no `Box::new`
         // path remains in production.
         // SAFETY: init_cspace_ptr is the root CSpace, single-threaded boot.
-        let cap_available_bytes = unsafe { cap::sum_frame_available_bytes(&*init_cspace_ptr) };
-        let seed_available_bytes = cap::seed_frame_ref()
+        let cap_available_bytes = unsafe { cap::sum_memory_available_bytes(&*init_cspace_ptr) };
+        let seed_available_bytes = cap::seed_memory_ref()
             .available_bytes
             .load(core::sync::atomic::Ordering::Acquire);
         let kstack_bytes =

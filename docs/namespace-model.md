@@ -41,7 +41,7 @@ addressed node:
 - **Directory capability** — references a directory node. Operations:
   `NS_LOOKUP`, `NS_READDIR`, `NS_STAT`.
 - **File capability** — references a file node. Operations: `NS_READ`,
-  `NS_READ_FRAME`, `NS_RELEASE_FRAME`/`_ACK`, `NS_STAT`.
+  `NS_READ_MEMORY`, `NS_RELEASE_MEMORY`/`_ACK`, `NS_STAT`.
 
 The kernel layer holds no notion of "directory" or "file." Type
 distinctions are server-private and surface to clients via the
@@ -85,7 +85,7 @@ rights are only inspected by the server.
 | 0 | `LOOKUP` | NS_LOOKUP into this directory is permitted |
 | 1 | `READDIR` | NS_READDIR enumeration of this directory is permitted |
 | 2 | `STAT` | NS_STAT on this node is permitted |
-| 3 | `READ` | NS_READ / NS_READ_FRAME on this file is permitted |
+| 3 | `READ` | NS_READ / NS_READ_MEMORY on this file is permitted |
 | 4 | `WRITE` | NS_WRITE on this file is permitted |
 | 5 | `EXEC` | This file is executable (consumed by ELF loaders) |
 | 6 | `MUTATE_DIR` | NS_CREATE / NS_UNLINK in this directory are permitted |

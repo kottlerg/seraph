@@ -197,7 +197,7 @@ seeing different roots) and `cap_revoke`-driven unmount.
 |---|---|
 | [shared/namespace-protocol/README.md](../../../shared/namespace-protocol/README.md) | NS_* wire surface and dispatch crate |
 | [docs/namespace-model.md](../../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing |
-| [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Filesystem-driver-specific labels (FS_READ, FS_READ_FRAME, …) |
+| [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Filesystem-driver-specific labels (FS_READ, FS_READ_MEMORY, …) |
 | [services/vfsd/docs/vfs-ipc-interface.md](vfs-ipc-interface.md) | vfsd service-endpoint surface (MOUNT, GET_SYSTEM_ROOT_CAP) |
 
 ---

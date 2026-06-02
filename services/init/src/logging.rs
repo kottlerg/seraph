@@ -278,7 +278,7 @@ pub fn spawn_log_thread(info: &InitInfo, arena: &mut BootArena, log_ep: u32, iop
 
     // Create the log thread by retyping from the arena front, bound to init's
     // own address space and CSpace. The retype holds an ancestor reference on
-    // the arena's FrameObject, pinning it for the thread's life.
+    // the arena's MemoryObject, pinning it for the thread's life.
     let Ok(thread_cap) = syscall::cap_create_thread(arena.cap, info.aspace_cap, info.cspace_cap)
     else
     {
@@ -615,7 +615,7 @@ fn handle_handover_pull(
     // exit here: real-logd issues HANDOVER_RELEASE once its drain settles,
     // and the receive loop terminates on that. Decoupling termination from
     // the multi-chunk drain keeps a dropped data chunk from wedging
-    // init-logd (which would block procmgr's reap of init's frames).
+    // init-logd (which would block procmgr's reap of init's memory caps).
     let reply = ipc::IpcMessage::new(handover_reply::DONE);
     // SAFETY: ipc_buf is the log thread's registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

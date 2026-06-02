@@ -32,7 +32,7 @@ drivers/
 │   │       └── lib.rs
 │   └── blk/                        # VirtIO block device driver (binary)
 │       ├── Cargo.toml
-│       ├── README.md               # Block-driver IPC interface (BLK_READ_INTO_FRAME, REGISTER_PARTITION)
+│       ├── README.md               # Block-driver IPC interface (BLK_READ_INTO_MEMORY, REGISTER_PARTITION)
 │       └── src/
 │           ├── main.rs
 │           └── io.rs

@@ -14,7 +14,7 @@ use ipc::{IpcMessage, procmgr_labels};
 
 /// Source the child's ELF binary is loaded from. Selected per spawn site:
 /// boot-bundle modules (the bootstrap-essential drivers virtio-blk,
-/// serial, framebuffer) carry a procmgr Frame cap and use
+/// serial, framebuffer) carry a procmgr Memory cap and use
 /// [`CreateSource::Module`]; non-essential drivers loaded from the rootfs
 /// (today: the per-arch RTC, walked by devmgr through its
 /// `SET_DRIVERS_DIR` subtree cap) carry a vfsd file SEND cap plus a size
@@ -25,7 +25,7 @@ use ipc::{IpcMessage, procmgr_labels};
 #[derive(Clone, Copy)]
 pub enum CreateSource
 {
-    /// Frame cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
+    /// Memory cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
     /// Caller retains the slot on failure to match the existing
     /// `spawn_simple_device` contract; kernel transfers ownership on
     /// successful `CREATE_PROCESS`.
@@ -272,7 +272,7 @@ pub fn spawn_simple_device(
     // Source-aware cleanup: on any failure before the procmgr ipc_call
     // completes, `CreateSource::File`'s file_cap is deleted (the
     // namespace walk just produced it; there is no retry value), while
-    // `CreateSource::Module`'s frame cap stays in the caller's slot
+    // `CreateSource::Module`'s memory cap stays in the caller's slot
     // (existing contract — module caps came from bootstrap and the
     // caller may have other uses for them).
     let source_cap_to_clean: u32 = match source

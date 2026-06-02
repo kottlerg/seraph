@@ -8,7 +8,7 @@
 //! Creates fatfs driver processes via procmgr. Two spawn paths exist:
 //!
 //! * **Boot-module path** (root mount only): the very first MOUNT consumes
-//!   the boot-module fatfs frame cap delivered to vfsd at bootstrap. This is
+//!   the boot-module fatfs memory cap delivered to vfsd at bootstrap. This is
 //!   the only way to get fatfs running before any filesystem is mounted, so
 //!   the cap chain `init → vfsd → procmgr` is unavoidable for the root
 //!   mount. After the root MOUNT succeeds, `/services/fs/fatfs` is reachable through

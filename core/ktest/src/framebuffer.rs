@@ -84,7 +84,7 @@ fn find_cap_by_aux0(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> 
 
 /// Probe for a framebuffer and map it if found.
 ///
-/// Scans Frame caps for a page containing the SFBD magic, reads metadata,
+/// Scans Memory caps for a page containing the SFBD magic, reads metadata,
 /// then maps the corresponding `MmioRegion` for pixel access.
 ///
 /// # Safety
@@ -93,7 +93,7 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32)
 {
     let descs = descriptors(info);
 
-    // Phase 1: find the SFBD descriptor page among Frame caps.
+    // Phase 1: find the SFBD descriptor page among Memory caps.
     let mut fb_phys: u64 = 0;
     let mut fb_width: u32 = 0;
     let mut fb_height: u32 = 0;
@@ -101,7 +101,7 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32)
 
     for d in descs
     {
-        if d.cap_type != CapType::Frame || d.aux1 != 4096
+        if d.cap_type != CapType::Memory || d.aux1 != 4096
         {
             continue;
         }

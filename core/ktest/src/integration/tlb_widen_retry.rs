@@ -82,29 +82,29 @@ pub fn run(ctx: &TestContext) -> TestResult
     PHASE.store(0, Ordering::Release);
     RESULT.store(0, Ordering::Release);
 
-    let frame =
+    let memory_cap =
         crate::frame_pool::alloc().ok_or("integration::tlb_widen_retry: frame pool exhausted")?;
 
-    // Map the page read-only. MAP_READ forces R-- regardless of the frame cap's
+    // Map the page read-only. MAP_READ forces R-- regardless of the Memory cap's
     // rights, so the child caches a narrow entry the widen can later broaden.
-    if mem_map(frame, ctx.aspace_cap, WIDEN_VA, 0, 1, MAP_READ).is_err()
+    if mem_map(memory_cap, ctx.aspace_cap, WIDEN_VA, 0, 1, MAP_READ).is_err()
     {
-        // SAFETY: frame is from the pool and was never mapped.
-        unsafe { crate::frame_pool::free(frame) };
+        // SAFETY: memory_cap is from the pool and was never mapped.
+        unsafe { crate::frame_pool::free(memory_cap) };
         return Err("integration::tlb_widen_retry: mem_map read-only failed");
     }
 
     let Ok(child) = crate::spawn::new_child(ctx)
     else
     {
-        cleanup(ctx, None, frame);
+        cleanup(ctx, None, memory_cap);
         return Err("integration::tlb_widen_retry: spawn::new_child failed");
     };
 
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
     if crate::spawn::configure_and_start_pinned(&child, widen_child, stack_top, 0, 1).is_err()
     {
-        cleanup(ctx, Some(&child), frame);
+        cleanup(ctx, Some(&child), memory_cap);
         return Err("integration::tlb_widen_retry: configure_and_start_pinned failed");
     }
 
@@ -113,15 +113,22 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Wait for the child to cache the read-only entry on CPU 1.
     if !parent_wait_phase(PHASE_CACHED, &child)
     {
-        cleanup(ctx, Some(&child), frame);
+        cleanup(ctx, Some(&child), memory_cap);
         return Err("integration::tlb_widen_retry: child never cached the mapping");
     }
 
-    // Widen R-- → RW-. Same frame, strictly broader rights ⇒ MapOutcome::Widen ⇒
+    // Widen R-- → RW-. Same Memory cap, strictly broader rights ⇒ MapOutcome::Widen ⇒
     // the kernel elides the remote shootdown, leaving CPU 1's stale entry live.
-    if mem_protect(frame, ctx.aspace_cap, WIDEN_VA, 1, MAP_READ | MAP_WRITABLE).is_err()
+    if mem_protect(
+        memory_cap,
+        ctx.aspace_cap,
+        WIDEN_VA,
+        1,
+        MAP_READ | MAP_WRITABLE,
+    )
+    .is_err()
     {
-        cleanup(ctx, Some(&child), frame);
+        cleanup(ctx, Some(&child), memory_cap);
         return Err("integration::tlb_widen_retry: mem_protect widen failed");
     }
     PHASE.store(PHASE_WIDENED, Ordering::Release);
@@ -138,13 +145,13 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
         if child_exited(&child)? && PHASE.load(Ordering::Acquire) < PHASE_WROTE
         {
-            cleanup(ctx, Some(&child), frame);
+            cleanup(ctx, Some(&child), memory_cap);
             return Err("integration::tlb_widen_retry: child killed writing widened mapping");
         }
         polls += 1;
         if polls >= MAX_POLLS
         {
-            cleanup(ctx, Some(&child), frame);
+            cleanup(ctx, Some(&child), memory_cap);
             return Err("integration::tlb_widen_retry: child never completed the write");
         }
         thread_sleep(1).ok();
@@ -152,11 +159,11 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     if RESULT.load(Ordering::Acquire) != SENTINEL
     {
-        cleanup(ctx, Some(&child), frame);
+        cleanup(ctx, Some(&child), memory_cap);
         return Err("integration::tlb_widen_retry: widened write produced the wrong value");
     }
 
-    cleanup(ctx, Some(&child), frame);
+    cleanup(ctx, Some(&child), memory_cap);
     Ok(())
 }
 
@@ -195,8 +202,8 @@ fn child_exited(child: &crate::spawn::SpawnedChild) -> Result<bool, &'static str
 }
 
 /// Wait for the child to exit cooperatively, then delete its caps, unmap the
-/// page, and return the frame to the pool. Safe to call on any error path.
-fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, frame: u32)
+/// page, and return the cap to the pool. Safe to call on any error path.
+fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, memory_cap: u32)
 {
     if let Some(child) = child
     {
@@ -217,8 +224,8 @@ fn cleanup(ctx: &TestContext, child: Option<&crate::spawn::SpawnedChild>, frame:
         cap_delete(child.cs).ok();
     }
     mem_unmap(ctx.aspace_cap, WIDEN_VA, 1).ok();
-    // SAFETY: the page is now unmapped, so the frame is free to return.
-    unsafe { crate::frame_pool::free(frame) };
+    // SAFETY: the page is now unmapped, so the cap is free to return.
+    unsafe { crate::frame_pool::free(memory_cap) };
 }
 
 /// Child entry: cache a read-only TLB entry, wait for the parent's widen, then

@@ -160,18 +160,18 @@ fn halt() -> !
 // ── devmgr ACPI-table acquisition ───────────────────────────────────────────
 
 /// A read-only ACPI table view served by devmgr's `QUERY_ACPI_TABLE`: a
-/// Frame cap on the containing region plus the geometry needed to map it
+/// Memory cap on the containing region plus the geometry needed to map it
 /// and index to the table.
 struct TableView
 {
-    frame_cap: u32,
+    memory_cap: u32,
     region_base: u64,
     region_size: u64,
     table_phys: u64,
 }
 
 /// Query devmgr for an ACPI table by signature (`phys == 0`) or by
-/// physical address (`sig == 0`). Returns the served Frame cap + geometry.
+/// physical address (`sig == 0`). Returns the served Memory cap + geometry.
 fn query_acpi_table(registry: u32, sig: u64, phys: u64, ipc_buf: *mut u64) -> Option<TableView>
 {
     let reply = devmgr_call(
@@ -181,9 +181,9 @@ fn query_acpi_table(registry: u32, sig: u64, phys: u64, ipc_buf: *mut u64) -> Op
         phys,
         ipc_buf,
     )?;
-    let frame_cap = *reply.caps().first()?;
+    let memory_cap = *reply.caps().first()?;
     Some(TableView {
-        frame_cap,
+        memory_cap,
         region_base: reply.word(0),
         region_size: reply.word(1),
         table_phys: reply.word(2),
@@ -191,7 +191,7 @@ fn query_acpi_table(registry: u32, sig: u64, phys: u64, ipc_buf: *mut u64) -> Op
 }
 
 /// Map the region behind a [`TableView`] read-only, hand the table's
-/// virtual address to `f`, then unmap, unreserve, and release the Frame
+/// virtual address to `f`, then unmap, unreserve, and release the Memory cap
 /// cap. The cap is devmgr's to own; pwrmgr drops its copy after reading.
 fn with_table_mapped<F, R>(self_aspace: u32, view: &TableView, f: F) -> Option<R>
 where
@@ -201,7 +201,7 @@ where
     let range = reserve_pages(pages).ok()?;
     let map_vaddr = range.va_start();
     let mapped = syscall::mem_map(
-        view.frame_cap,
+        view.memory_cap,
         self_aspace,
         map_vaddr,
         0,
@@ -210,7 +210,7 @@ where
     );
     let out = if mapped.is_ok()
     {
-        // The frame maps from the page containing `region_base`; the table
+        // The memory cap maps from the page containing `region_base`; the table
         // sits at `table_phys` within it.
         let table_vaddr = map_vaddr + (view.table_phys - (view.region_base & !0xFFF));
         let r = f(table_vaddr);
@@ -222,7 +222,7 @@ where
         None
     };
     unreserve_pages(range);
-    let _ = syscall::cap_delete(view.frame_cap);
+    let _ = syscall::cap_delete(view.memory_cap);
     out
 }
 

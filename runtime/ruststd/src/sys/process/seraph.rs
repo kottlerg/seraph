@@ -9,10 +9,10 @@
 // Wire-up:
 //   * Create: ipc_call(procmgr_endpoint, CREATE_FROM_FILE, ...).
 //             Reply caps: [process_handle, thread_for_caller].
-//   * Pipe (per piped direction): allocate (frame, data_sig, space_sig)
+//   * Pipe (per piped direction): allocate (memory, data_sig, space_sig)
 //             via Pipe::create_for_child; ipc_call(process_handle,
 //             CONFIGURE_PIPE, data=[direction, ring_capacity],
-//             caps=[frame_handoff, data_sig_handoff, space_sig_handoff]).
+//             caps=[memory_handoff, data_sig_handoff, space_sig_handoff]).
 //             Parent retains its own Pipe end (the originals).
 //   * Bind death: syscall::thread_bind_notification(thread_cap, event_queue_cap).
 //   * Start: ipc_call(process_handle, START_PROCESS, 0, &[]).
@@ -418,7 +418,7 @@ impl Command {
         }
 
         // For each piped direction, allocate a parent-side `Pipe` end
-        // (frame + 2 notification caps) and install the corresponding triple
+        // (memory cap + 2 notification caps) and install the corresponding triple
         // into the child's CSpace via `CONFIGURE_PIPE`. Per-direction
         // calls are independent — we issue 0–3 IPC rounds depending on
         // which directions the caller piped. Errors tear the partial
@@ -734,7 +734,7 @@ fn install_pipe(
     let cap_msg = ipc::IpcMessage::builder(procmgr_labels::CONFIGURE_PIPE)
         .word(0, direction)
         .word(1, u64::from(RING_CAPACITY))
-        .cap(caps.frame)
+        .cap(caps.memory)
         .cap(caps.data_notification)
         .cap(caps.space_notification)
         .build();
@@ -975,7 +975,7 @@ impl Drop for Process {
 // Bridge does NOT touch the ring memory: the parent's `Pipe::Drop`
 // can run before, during, or after the bridge fires without aliasing
 // concerns. The atomics live on heap-allocated `Arc`s independent of
-// any frame mapping.
+// any page mapping.
 //
 // The bridge also recognises `BRIDGE_SENTINEL_DROP` posted by
 // `Process::Drop` and exits without firing any wakes — the spawner

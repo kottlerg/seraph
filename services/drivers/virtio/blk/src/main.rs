@@ -253,16 +253,16 @@ fn query_device_info(devmgr_ep: u32, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     info
 }
 
-// ── Frame allocation via memmgr IPC ────────────────────────────────────────
+// ── Memory-cap allocation via memmgr IPC ────────────────────────────────────────
 
-/// Request a single contiguous Frame cap covering `page_count` pages from
+/// Request a single contiguous Memory cap covering `page_count` pages from
 /// memmgr. Returns `(cap_slot, phys_base)` on success — the physical base
 /// address is needed for DMA programming on no-IOMMU systems and is
-/// supplied by memmgr in the `REQUEST_FRAMES` reply alongside the cap.
-fn request_frames(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<(u32, u64)>
+/// supplied by memmgr in the `REQUEST_MEMORY_CAPS` reply alongside the cap.
+fn request_memory_caps(memmgr_ep: u32, page_count: u64, ipc_buf: *mut u64) -> Option<(u32, u64)>
 {
     let arg = page_count | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
-    let request = IpcMessage::builder(memmgr_labels::REQUEST_FRAMES)
+    let request = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, arg)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -328,10 +328,10 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
 -> (u64, u64, u64)
 {
     let ring_pages = virtqueue::ring_pages(queue_size) as u64;
-    let Some((ring_frame, ring_phys)) = request_frames(caps.memmgr_ep, ring_pages, ipc_buf)
+    let Some((ring_memory, ring_phys)) = request_memory_caps(caps.memmgr_ep, ring_pages, ipc_buf)
     else
     {
-        std::os::seraph::log!("failed to allocate ring frames");
+        std::os::seraph::log!("failed to allocate ring memory caps");
         syscall::thread_exit();
     };
     // The ring mapping lives for the driver process's lifetime; the
@@ -345,7 +345,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     };
     let ring_va = ring_range.va_start();
     if syscall::mem_map(
-        ring_frame,
+        ring_memory,
         caps.self_aspace,
         ring_va,
         0,
@@ -429,10 +429,10 @@ fn setup_virtqueue(
 /// Allocate and map the data buffer page for block I/O, returning an `IoLayout`.
 fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
 {
-    let Some((data_frame, data_phys)) = request_frames(caps.memmgr_ep, 1, ipc_buf)
+    let Some((data_memory, data_phys)) = request_memory_caps(caps.memmgr_ep, 1, ipc_buf)
     else
     {
-        std::os::seraph::log!("failed to allocate data frame");
+        std::os::seraph::log!("failed to allocate data memory cap");
         syscall::thread_exit();
     };
     // The data mapping lives for the driver process's lifetime; the
@@ -446,7 +446,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     };
     let data_va = data_range.va_start();
     if syscall::mem_map(
-        data_frame,
+        data_memory,
         caps.self_aspace,
         data_va,
         0,
@@ -508,13 +508,13 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
 
         match msg.label
         {
-            blk_labels::BLK_READ_INTO_FRAME =>
+            blk_labels::BLK_READ_INTO_MEMORY =>
             {
-                handle_read_block_into_frame(&msg, ipc_buf, rt);
+                handle_read_block_into_memory(&msg, ipc_buf, rt);
             }
-            blk_labels::BLK_WRITE_FROM_FRAME =>
+            blk_labels::BLK_WRITE_FROM_MEMORY =>
             {
-                handle_write_block_from_frame(&msg, ipc_buf, rt);
+                handle_write_block_from_memory(&msg, ipc_buf, rt);
             }
             blk_labels::REGISTER_PARTITION =>
             {
@@ -530,25 +530,25 @@ fn service_loop(service_ep: u32, ipc_buf: *mut u64, rt: &mut BlkRuntime) -> !
     }
 }
 
-/// Handle a `BLK_READ_INTO_FRAME` request.
+/// Handle a `BLK_READ_INTO_MEMORY` request.
 ///
-/// Reads `caps[0]` (target Frame) and DMAs `data[1]` consecutive sectors
-/// (default 1) starting at LBA `data[0]` into the frame at offset 0,
-/// packed contiguously. The frame must be at least `count * 512` bytes;
-/// the driver rejects with `INVALID_FRAME_CAP` otherwise.
+/// Reads `caps[0]` (target Memory cap) and DMAs `data[1]` consecutive sectors
+/// (default 1) starting at LBA `data[0]` into the memory cap at offset 0,
+/// packed contiguously. The memory cap must be at least `count * 512` bytes;
+/// the driver rejects with `INVALID_MEMORY_CAP` otherwise.
 ///
 /// `caps[1]` and `caps[2]` are reserved IPC-shape slots and remain null
-/// pre-IOMMU; the driver does not inspect them. The target Frame is
+/// pre-IOMMU; the driver does not inspect them. The target Memory cap is
 /// moved back to the caller in `caps[0]` of the reply regardless of
 /// success — leaving the cap in the driver's `CSpace` would leak it.
-// too_many_lines: handle_read_block_into_frame folds nine validation
+// too_many_lines: handle_read_block_into_memory folds nine validation
 // gates (cap presence, sector count, descriptor-length bound, three
 // cap_info lookups, partition resolution for start and end LBA) into
 // one flat dispatch; each rejection path replies with the cap moved
 // back so it never leaks. Extracting helpers would still leave the
 // reply-with-cap pattern wired through main.
 #[allow(clippy::too_many_lines)]
-fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+fn handle_read_block_into_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
     const SECTOR_SIZE: u64 = 512;
 
@@ -567,7 +567,7 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
 
     if target_cap == 0
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
 
@@ -581,49 +581,49 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     };
     if sector_count == 0
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
     let data_len_bytes = sector_count * SECTOR_SIZE;
     // VirtIO descriptor length is u32; this also bounds total transfer
-    // well below any plausible per-frame ask.
+    // well below any plausible per-cap ask.
     if data_len_bytes > u64::from(u32::MAX)
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
 
-    // Validate the target cap: must be a Frame with MAP+WRITE rights and
+    // Validate the target cap: must be a Memory cap with MAP+WRITE rights and
     // at least `data_len_bytes` of capacity.
     let Ok(tag_rights) = syscall::cap_info(target_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
     let tag = (tag_rights >> 32) as u8;
     let rights = tag_rights & 0xFFFF_FFFF;
     let required = syscall::RIGHTS_MAP_RW;
-    if u64::from(tag) != u64::from(syscall::CAP_TAG_FRAME) || (rights & required) != required
+    if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Ok(size) = syscall::cap_info(target_cap, syscall::CAP_INFO_FRAME_SIZE)
+    let Ok(size) = syscall::cap_info(target_cap, syscall::CAP_INFO_MEMORY_SIZE)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
     if size < data_len_bytes
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Ok(phys_base) = syscall::cap_info(target_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+    let Ok(phys_base) = syscall::cap_info(target_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
 
@@ -677,19 +677,19 @@ fn handle_read_block_into_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut Bl
     reply_with(ipc::blk_errors::SUCCESS, ipc_buf);
 }
 
-/// Handle a `BLK_WRITE_FROM_FRAME` request.
+/// Handle a `BLK_WRITE_FROM_MEMORY` request.
 ///
-/// Mirror of [`handle_read_block_into_frame`] with the data direction
-/// inverted. Reads `caps[0]` (source Frame, `MAP|READ`) and DMAs
+/// Mirror of [`handle_read_block_into_memory`] with the data direction
+/// inverted. Reads `caps[0]` (source Memory cap, `MAP|READ`) and DMAs
 /// `data[1]` consecutive sectors (default 1) starting at LBA `data[0]`
-/// out of the frame at offset 0, packed contiguously. The source Frame
+/// out of the memory cap at offset 0, packed contiguously. The source Memory cap
 /// is moved back to the caller in `caps[0]` of the reply.
 // too_many_lines: matches the read sibling — the same validation gates
 // (cap presence, sector count, descriptor-length bound, three cap_info
 // lookups, two partition resolutions for start and end LBA) all apply
 // here, and the reply-with-cap pattern is unchanged.
 #[allow(clippy::too_many_lines)]
-fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
+fn handle_write_block_from_memory(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime)
 {
     const SECTOR_SIZE: u64 = 512;
 
@@ -708,7 +708,7 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
 
     if source_cap == 0
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
 
@@ -722,48 +722,48 @@ fn handle_write_block_from_frame(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut B
     };
     if sector_count == 0
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
     let data_len_bytes = sector_count * SECTOR_SIZE;
     if data_len_bytes > u64::from(u32::MAX)
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
 
-    // Source frame must be a Frame cap with at least MAP+READ rights
+    // Source memory cap must be a Memory cap with at least MAP+READ rights
     // (device reads sector data out of it) and large enough to cover the
     // requested run.
     let Ok(tag_rights) = syscall::cap_info(source_cap, syscall::CAP_INFO_TAG_RIGHTS)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
     let tag = (tag_rights >> 32) as u8;
     let rights = tag_rights & 0xFFFF_FFFF;
     let required = syscall::RIGHTS_MAP_READ;
-    if u64::from(tag) != u64::from(syscall::CAP_TAG_FRAME) || (rights & required) != required
+    if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY) || (rights & required) != required
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Ok(size) = syscall::cap_info(source_cap, syscall::CAP_INFO_FRAME_SIZE)
+    let Ok(size) = syscall::cap_info(source_cap, syscall::CAP_INFO_MEMORY_SIZE)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
     if size < data_len_bytes
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     }
-    let Ok(phys_base) = syscall::cap_info(source_cap, syscall::CAP_INFO_FRAME_PHYS_BASE)
+    let Ok(phys_base) = syscall::cap_info(source_cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
     else
     {
-        reply_with(ipc::blk_errors::INVALID_FRAME_CAP, ipc_buf);
+        reply_with(ipc::blk_errors::INVALID_MEMORY_CAP, ipc_buf);
         return;
     };
 
@@ -1057,8 +1057,8 @@ fn main() -> !
 
     // Set up I/O buffer (driver-owned page hosting request header at offset
     // 0 and status byte at offset 1024). Data segments live in caller-supplied
-    // Frame caps per the BLK_READ_INTO_FRAME contract, so no driver-side
-    // smoke-read is possible without allocating a throwaway frame; the fs
+    // Memory caps per the BLK_READ_INTO_MEMORY contract, so no driver-side
+    // smoke-read is possible without allocating a throwaway memory cap; the fs
     // driver's first BPB read serves as the real first-use sanity check.
     let layout = setup_io_buffer(&caps, ipc_buf);
 

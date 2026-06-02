@@ -202,7 +202,7 @@ pub struct RestartCtx
     /// the routing in `dispatch_deaths` continues to land on the
     /// correct `ServiceEntry`.
     pub deaths_eq: u32,
-    /// Frame slab svcmgr retypes provider service endpoints from
+    /// Memory-cap slab svcmgr retypes provider service endpoints from
     /// (`cap_create_endpoint`). One slab backs every `provides = ...`
     /// service's endpoint; sized for the handful of provider services.
     pub endpoint_slab: u32,
@@ -337,8 +337,8 @@ fn restart_process(
 ) -> bool
 {
     // Reclaim the previous instance's kernel objects (thread/aspace/cspace/
-    // ProcessInfo frame) before spawning a fresh one. CSpace teardown
-    // cascades: frames handed to the dead process via `REQUEST_FRAMES`
+    // ProcessInfo memory cap) before spawning a fresh one. CSpace teardown
+    // cascades: memory caps handed to the dead process via `REQUEST_MEMORY_CAPS`
     // (which procmgr no longer holds caps on) get dec-ref'd and reclaimed
     // into memmgr's pool. The initial instance was created
     // by init, not svcmgr, so svcmgr has no handle for it — `process_handle

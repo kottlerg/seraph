@@ -83,18 +83,18 @@ pub struct StartupInfo {
     /// reachable.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub service_registry_cap: u32,
-    /// Shmem frame cap backing `std::io::stdin`. Zero when no input
+    /// Shmem memory cap backing `std::io::stdin`. Zero when no input
     /// pipe is attached; reads return `Ok(0)` (EOF).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdin_frame_cap: u32,
-    /// Shmem frame cap backing `std::io::stdout`. Zero when no sink is
+    pub stdin_memory_cap: u32,
+    /// Shmem memory cap backing `std::io::stdout`. Zero when no sink is
     /// attached; writes silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stdout_frame_cap: u32,
-    /// Shmem frame cap backing `std::io::stderr`. Zero when no sink is
+    pub stdout_memory_cap: u32,
+    /// Shmem memory cap backing `std::io::stderr`. Zero when no sink is
     /// attached; writes silently drop.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub stderr_frame_cap: u32,
+    pub stderr_memory_cap: u32,
     /// Badged SEND cap on vfsd's namespace endpoint at the synthetic
     /// system root. Installed by the spawner via
     /// `procmgr_labels::CONFIGURE_NAMESPACE` between create and start.
@@ -339,9 +339,9 @@ pub extern "C" fn _start() -> ! {
         procmgr_endpoint: info.procmgr_endpoint_cap,
         memmgr_endpoint: info.memmgr_endpoint_cap,
         service_registry_cap: info.service_registry_cap,
-        stdin_frame_cap: info.stdin_frame_cap,
-        stdout_frame_cap: info.stdout_frame_cap,
-        stderr_frame_cap: info.stderr_frame_cap,
+        stdin_memory_cap: info.stdin_memory_cap,
+        stdout_memory_cap: info.stdout_memory_cap,
+        stderr_memory_cap: info.stderr_memory_cap,
         system_root_cap: info.system_root_cap,
         current_dir_cap: info.current_dir_cap,
         stdin_data_notification_cap: info.stdin_data_notification_cap,
@@ -368,18 +368,18 @@ pub extern "C" fn _start() -> ! {
     STARTUP_READY.store(true, Ordering::Release);
 
     // Wire the three stdio pipes before the heap bootstrap. Each
-    // direction takes (frame_cap, data_notification_cap, space_notification_cap);
-    // zero frame caps are tolerated (writes silently drop / reads
+    // direction takes (memory_cap, data_notification_cap, space_notification_cap);
+    // zero memory caps are tolerated (writes silently drop / reads
     // return EOF), matching the "no pipe attached" state for processes
     // born without `Stdio::piped()`.
     pal_stdio::stdio_init(
-        info.stdin_frame_cap,
+        info.stdin_memory_cap,
         info.stdin_data_notification_cap,
         info.stdin_space_notification_cap,
-        info.stdout_frame_cap,
+        info.stdout_memory_cap,
         info.stdout_data_notification_cap,
         info.stdout_space_notification_cap,
-        info.stderr_frame_cap,
+        info.stderr_memory_cap,
         info.stderr_data_notification_cap,
         info.stderr_space_notification_cap,
         info.self_aspace_cap,
@@ -433,7 +433,7 @@ pub extern "C" fn _start() -> ! {
             syscall::thread_exit();
         }
         // Wire the object-slab refill path against the same memmgr endpoint.
-        // Cap-create syscalls retype memory out of a slab Frame cap acquired
+        // Cap-create syscalls retype memory out of a slab Memory cap acquired
         // lazily on first use.
         pal_alloc::object_slab_init(info.memmgr_endpoint_cap);
     }
@@ -666,7 +666,7 @@ pub fn namespace_lookup_dir(
     Ok(walked.dir_cap)
 }
 
-/// Return a Frame-cap slot suitable as the source for a `cap_create_*`
+/// Return a Memory-cap slot suitable as the source for a `cap_create_*`
 /// retype, with at least `min_bytes` of `available_bytes`.
 ///
 /// `min_bytes` is the raw byte cost of the kernel object the caller is
@@ -682,10 +682,10 @@ pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
 }
 
 /// Fund `self_aspace`'s page-table growth budget to cover mapping a
-/// `region_pages`-page foreign-frame region (MMIO, DMA) into a
+/// `region_pages`-page foreign-memory region (MMIO, DMA) into a
 /// retype-backed `AddressSpace`.
 ///
-/// Requests Frame backing from memmgr and retypes it onto the AS's PT pool
+/// Requests Memory backing from memmgr and retypes it onto the AS's PT pool
 /// via `cap_create_aspace` augment-mode, so `mmio_map`/`mem_map` of the
 /// region draws its intermediate page tables from this caller-funded,
 /// memmgr-accounted budget rather than the fixed kernel PT reserve. Call
@@ -703,7 +703,7 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
 // ── Page-reservation allocator ──────────────────────────────────────────────
 //
 // Re-exports from `crate::sys::reserve`. See that module for the per-process
-// arena layout and concurrency model. Used for foreign Frame mappings —
+// arena layout and concurrency model. Used for foreign Memory mappings —
 // MMIO from devmgr, DMA buffers from drivers, shmem backings, zero-copy
 // file pages from fs drivers, ELF-load scratch in procmgr — i.e. every
 // page-granular VA need that is not the byte heap.

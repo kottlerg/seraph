@@ -18,7 +18,7 @@ fat/
     ├── alloc.rs                # Cluster allocator, FAT-mirror writes, FSInfo flush
     ├── dir.rs                  # Directory walks and mutation (insert/remove/rename)
     ├── fat.rs                  # FAT-entry reads and chain walks
-    ├── cache.rs                # PageCache: read/write through BLK_*_FROM_FRAME
+    ├── cache.rs                # PageCache: read/write through BLK_*_FROM_MEMORY
     ├── eviction.rs             # Cooperative-release eviction worker
     ├── file.rs                 # OpenFile / OutstandingPage bookkeeping
     └── backend.rs              # NamespaceBackend impl + NodeTable
@@ -33,11 +33,11 @@ fat/
 | `FS_MOUNT` | yes | vfsd's BPB-validation probe at mount time |
 | `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` | no | namespace dispatch |
 | `FS_READ` | no | inline read on a file cap |
-| `FS_READ_FRAME` | no | zero-copy read via a returned `Frame` cap |
-| `FS_RELEASE_FRAME` | no | client-side cooperative release |
+| `FS_READ_MEMORY` | no | zero-copy read via a returned `Memory` cap |
+| `FS_RELEASE_MEMORY` | no | client-side cooperative release |
 | `FS_CLOSE` | no | release per-file driver-side bookkeeping |
 | `FS_WRITE` | no | inline write on a file cap |
-| `FS_WRITE_FRAME` | no | caller-supplied source `Frame` cap |
+| `FS_WRITE_MEMORY` | no | caller-supplied source `Memory` cap |
 | `FS_CREATE` | no | new file in a directory |
 | `FS_REMOVE` | no | unlink a file or empty directory |
 | `FS_MKDIR` | no | new empty directory |
@@ -80,10 +80,10 @@ into `READ` or `WRITE` on the created entry.
   `0x40` LFN sequence flag and `LDIR_Chksum` computation match the
   Microsoft FAT specification.
 * **Page cache** (`src/cache.rs`): 128 single-page slots backed by
-  `BLK_READ_INTO_FRAME` for fills and a process-static scratch frame
-  for single-sector `BLK_WRITE_FROM_FRAME` writebacks. Write-through:
+  `BLK_READ_INTO_MEMORY` for fills and a process-static scratch memory cap
+  for single-sector `BLK_WRITE_FROM_MEMORY` writebacks. Write-through:
   the cached page is updated in place before the on-disk write so any
-  outstanding `FS_READ_FRAME` cap aliasing the page observes new bytes
+  outstanding `FS_READ_MEMORY` cap aliasing the page observes new bytes
   immediately.
 * **NodeTable** (`src/backend.rs`): dedupes by on-disk slot
   `(sector_lba, offset_in_sector)`; two distinct on-disk entries

@@ -1,8 +1,8 @@
 # memmgr
 
-Tier-1 userspace service that owns the userspace physical-frame pool. memmgr
-allocates Frame capabilities to all std-built services on demand, tracks
-per-process frame ownership, and reclaims frames when a process dies.
+Tier-1 userspace service that owns the userspace physical-memory-cap pool. memmgr
+allocates Memory capabilities to all std-built services on demand, tracks
+per-process memory-cap ownership, and reclaims memory caps when a process dies.
 
 memmgr is a `no_std` binary: it cannot bootstrap a heap against itself, so
 its bookkeeping uses statically-bounded data structures only. After memmgr
@@ -20,7 +20,7 @@ memmgr/
 ├── src/
 │   └── main.rs                 # _start() entry point, IPC dispatch loop
 └── docs/
-    ├── frame-pool.md           # Pool, allocation, reclamation, coalescing
+    ├── memory-pool.md          # Pool, allocation, reclamation, coalescing
     └── ipc-interface.md        # memmgr IPC labels and wire shapes
 ```
 
@@ -28,37 +28,37 @@ memmgr/
 
 ## Role
 
-memmgr is the sole holder of the userspace RAM frame pool. Every std-built
+memmgr is the sole holder of the userspace RAM memory-cap pool. Every std-built
 process bootstraps its heap by calling memmgr; drivers acquiring DMA-capable
 memory call memmgr; vfsd and fs drivers backing zero-copy file pages call
-memmgr. memmgr returns Frame capabilities; callers map them into their own
+memmgr. memmgr returns Memory capabilities; callers map them into their own
 address space at virtual addresses they choose themselves.
 
 ## Responsibilities
 
-- **Frame allocation** — serve the `REQUEST_FRAMES` IPC, returning one or
-  more Frame caps that cumulatively cover the requested page count. Honour
+- **Memory-cap allocation** — serve the `REQUEST_MEMORY_CAPS` IPC, returning one or
+  more Memory caps that cumulatively cover the requested page count. Honour
   the `REQUIRE_CONTIGUOUS` flag for callers that need a single multi-page
   cap (DMA buffers, large heap grow operations).
-- **Per-process tracking** — maintain a per-process record of the Frame
+- **Per-process tracking** — maintain a per-process record of the Memory
   caps memmgr has handed out, keyed on a procmgr-minted badge.
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
-  reclaim the dead process's frames into the free pool.
+  reclaim the dead process's memory caps into the free pool.
 - **Coalescing** — fold adjacent free pages back into larger contiguous
-  Frame caps via reverse-`frame_split`, sustaining the success rate of
+  Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments.
 
 ## What memmgr deliberately does NOT do
 
 - **Choose virtual addresses.** Each process owns its own VA policy. memmgr
-  hands back Frame caps; the caller maps them where it wants.
+  hands back Memory caps; the caller maps them where it wants.
 - **Manage process lifecycles.** That is procmgr's role. memmgr learns of
   process births and deaths via IPC from procmgr, but it does not create,
   schedule, or terminate processes.
-- **Serve MMIO or IOMMU frames.** memmgr's pool is RAM only. MMIO Frame
+- **Serve MMIO or IOMMU memory caps.** memmgr's pool is RAM only. MMIO Memory
   caps come from devmgr (see [device-management.md](../../docs/device-management.md));
   memmgr never sees them.
-- **Implement swap, paging, or page-fault handling.** Frames are allocated
+- **Implement swap, paging, or page-fault handling.** Memory caps are allocated
   out of physical RAM; there is no backing store. A failed allocation
   returns an out-of-memory error to the caller.
 - **Operate a page cache.** Caching of file pages (when fs drivers
@@ -71,8 +71,8 @@ address space at virtual addresses they choose themselves.
 The full memmgr IPC specification is in
 [`docs/ipc-interface.md`](docs/ipc-interface.md). Key operations:
 
-- `REQUEST_FRAMES(want_pages, flags) → frame_caps[..]`
-- `RELEASE_FRAMES(frame_caps[..])`
+- `REQUEST_MEMORY_CAPS(want_pages, flags) → memory_caps[..]`
+- `RELEASE_MEMORY_CAPS(memory_caps[..])`
 - `REGISTER_PROCESS(...) → badged_endpoint_cap` (procmgr-only)
 - `PROCESS_DIED(badge)` (procmgr-only)
 
@@ -88,7 +88,7 @@ are easy to find when those workloads grow.
 | Constant | Value | Surface effect on overflow | Revisit when |
 |---|---|---|---|
 | `MAX_PROCESSES` | 64 | `REGISTER_PROCESS` returns `TooManyProcesses` | a workload approaches ~50 concurrent processes |
-| `MAX_PER_PROC` | 512 | `REQUEST_FRAMES` returns `Quota` | a single process needs > 2 MiB of pinned frames (current value bumped from 256; equivalent to ~2 MiB of pinned pages per process; covers std heap + thread stacks + a few zero-copy buffers for current workloads) |
+| `MAX_PER_PROC` | 512 | `REQUEST_MEMORY_CAPS` returns `Quota` | a single process needs > 2 MiB of pinned memory caps (current value bumped from 256; equivalent to ~2 MiB of pinned pages per process; covers std heap + thread stacks + a few zero-copy buffers for current workloads) |
 | `MAX_FREE_RUNS` | 512 | `push_or_coalesce` parks the run after a coalesce retry: still owned and counted in `pool_total`, but with no free-pool slot (unreachable for allocation until a later coalesce frees one) | post-coalesce free-run count regularly approaches 512 |
 
 `MAX_PER_PROC` is not a security quota; it is a structural bound that
@@ -110,12 +110,12 @@ as a separate redesign rather than resolved by raising a number.
 
 ## Bootstrap
 
-memmgr is created by init. At init's entry, the kernel has placed Frame
+memmgr is created by init. At init's entry, the kernel has placed Memory
 caps for all usable physical RAM in init's CSpace (see
 [`docs/capability-model.md`](../../docs/capability-model.md) §"Initial
 Capability Distribution"). Init parses the memmgr ELF from its boot
 module, creates memmgr's AddressSpace, CSpace, and Thread, and copies the
-RAM Frame caps into memmgr's CSpace using the derive-twice pattern. Init
+RAM Memory caps into memmgr's CSpace using the derive-twice pattern. Init
 then starts memmgr's thread and proceeds to spawn procmgr — installing
 a SEND cap on memmgr's service endpoint into procmgr's `ProcessInfo`
 so procmgr's heap-bootstrap path reaches memmgr on its first IPC.
@@ -123,26 +123,26 @@ so procmgr's heap-bootstrap path reaches memmgr on its first IPC.
 Authoritative description of the boot order, capability flow, and
 ProcessInfo handover lives in [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md).
 
-### Bootstrap-IPC frame-count cap
+### Bootstrap-IPC memory-cap-count cap
 
-Init delivers RAM Frame caps to memmgr in a single bootstrap-IPC round,
+Init delivers RAM Memory caps to memmgr in a single bootstrap-IPC round,
 packed two page-counts per `u64` after a three-word prefix. The capacity
-of a single round is `MEMMGR_BOOTSTRAP_MAX_FRAMES = 122` frames. Init
-currently has ~90 RAM frames at boot, so this fits comfortably.
+of a single round is `MEMMGR_BOOTSTRAP_MAX_MEMORY_CAPS = 122` memory caps. Init
+currently has ~90 RAM memory caps at boot, so this fits comfortably.
 
 If a future memory map (or an architecture with fragmented physical RAM)
-produces more than 122 RAM frame caps, memmgr will own only the first
+produces more than 122 RAM memory caps, memmgr will own only the first
 122 and the rest will sit unused in init's CSpace. Resolutions when
 needed:
 
 - **Multi-round bootstrap.** init does N `serve_round`s, each carrying
   up to 122 page-counts; memmgr's `_start` does N `request_round`s.
   Small change to memmgr's bootstrap parser and init's main.
-- **Frame-count discovery via a kernel syscall** that reads the size
+- **Memory-cap-count discovery via a kernel syscall** that reads the size
   from the cap itself. No such syscall exists today; would also enable
-  cleaner per-frame accounting throughout.
+  cleaner per-cap accounting throughout.
 
-Not pressing until init's frame count grows past 122.
+Not pressing until init's memory-cap count grows past 122.
 
 ---
 
@@ -150,13 +150,13 @@ Not pressing until init's frame count grows past 122.
 
 memmgr and procmgr are sister tier-1 services with disjoint authority:
 
-- **memmgr** owns the RAM frame pool and answers `REQUEST_FRAMES`.
+- **memmgr** owns the RAM memory-cap pool and answers `REQUEST_MEMORY_CAPS`.
 - **procmgr** owns process lifecycle, ELF loading, and `ProcessInfo`
   population; it is itself a memmgr client (procmgr is std-using and
   bootstraps its own heap against memmgr).
 
 procmgr is the privileged caller that registers new processes with
-memmgr (so memmgr can tag the per-process frame list) and notifies
+memmgr (so memmgr can tag the per-process memory-cap list) and notifies
 memmgr of deaths (so memmgr can reclaim). Ordinary callers cannot
 mint or retire process badges.
 
@@ -166,12 +166,12 @@ mint or retire process badges.
 
 | Document | Content |
 |---|---|
-| [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | System-wide memory ownership, frame contract, page-reservation contract |
+| [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | System-wide memory ownership, memory-cap contract, page-reservation contract |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Boot order, ProcessInfo/InitInfo handover, process-death flow |
-| [docs/capability-model.md](../../docs/capability-model.md) | Frame cap rights, derivation, revocation |
+| [docs/capability-model.md](../../docs/capability-model.md) | Memory cap rights, derivation, revocation |
 | [docs/architecture.md](../../docs/architecture.md) | System design, tier-1 service roles |
 | [services/procmgr/README.md](../procmgr/README.md) | Sister tier-1 service for process lifecycle |
-| [services/init/README.md](../init/README.md) | Boot-time origin of memmgr's frame pool |
+| [services/init/README.md](../init/README.md) | Boot-time origin of memmgr's memory-cap pool |
 
 ---
 

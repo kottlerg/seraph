@@ -19,9 +19,9 @@ const RIGHTS_NOTIFY: u64 = 1 << 7;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let root = cap_create_notification(ctx.memory_frame_base)
+    let root = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_revoke_under_use: create root failed")?;
-    let done = cap_create_notification(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_revoke_under_use: create done failed")?;
 
     // Derive NUM_CHILDREN children from root.

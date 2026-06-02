@@ -149,11 +149,11 @@ const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
         RightsRequirement::Bits(nz(rights::READ)),
     ),
     (
-        ipc::fs_labels::FS_READ_FRAME,
+        ipc::fs_labels::FS_READ_MEMORY,
         RightsRequirement::Bits(nz(rights::READ)),
     ),
     (
-        ipc::fs_labels::FS_RELEASE_FRAME,
+        ipc::fs_labels::FS_RELEASE_MEMORY,
         RightsRequirement::AnyNonEmpty,
     ),
     (ipc::fs_labels::FS_CLOSE, RightsRequirement::AnyNonEmpty),
@@ -162,7 +162,7 @@ const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
         RightsRequirement::Bits(nz(rights::WRITE)),
     ),
     (
-        ipc::fs_labels::FS_WRITE_FRAME,
+        ipc::fs_labels::FS_WRITE_MEMORY,
         RightsRequirement::Bits(nz(rights::WRITE)),
     ),
     (
@@ -265,13 +265,13 @@ mod tests
     fn fs_read_and_fs_read_frame_share_the_read_bit()
     {
         assert!(gate(ipc::fs_labels::FS_READ, badge_with(rights::READ)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_READ_FRAME, badge_with(rights::READ)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_READ_MEMORY, badge_with(rights::READ)).is_ok());
         assert_eq!(
             gate(ipc::fs_labels::FS_READ, badge_with(rights::STAT)),
             Err(GateError::PermissionDenied)
         );
         assert_eq!(
-            gate(ipc::fs_labels::FS_READ_FRAME, badge_with(rights::STAT)),
+            gate(ipc::fs_labels::FS_READ_MEMORY, badge_with(rights::STAT)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -279,16 +279,16 @@ mod tests
     #[test]
     fn fs_release_frame_accepts_any_single_bit()
     {
-        assert!(gate(ipc::fs_labels::FS_RELEASE_FRAME, badge_with(rights::READ)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_RELEASE_FRAME, badge_with(rights::STAT)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_RELEASE_FRAME, badge_with(rights::ADMIN)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::READ)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::STAT)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(rights::ADMIN)).is_ok());
     }
 
     #[test]
     fn fs_release_frame_rejects_empty_rights_mask()
     {
         assert_eq!(
-            gate(ipc::fs_labels::FS_RELEASE_FRAME, badge_with(0)),
+            gate(ipc::fs_labels::FS_RELEASE_MEMORY, badge_with(0)),
             Err(GateError::PermissionDenied)
         );
     }
@@ -306,13 +306,13 @@ mod tests
     fn fs_write_and_fs_write_frame_share_the_write_bit()
     {
         assert!(gate(ipc::fs_labels::FS_WRITE, badge_with(rights::WRITE)).is_ok());
-        assert!(gate(ipc::fs_labels::FS_WRITE_FRAME, badge_with(rights::WRITE)).is_ok());
+        assert!(gate(ipc::fs_labels::FS_WRITE_MEMORY, badge_with(rights::WRITE)).is_ok());
         assert_eq!(
             gate(ipc::fs_labels::FS_WRITE, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
         );
         assert_eq!(
-            gate(ipc::fs_labels::FS_WRITE_FRAME, badge_with(rights::READ)),
+            gate(ipc::fs_labels::FS_WRITE_MEMORY, badge_with(rights::READ)),
             Err(GateError::PermissionDenied)
         );
     }

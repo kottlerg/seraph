@@ -38,9 +38,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     crate::log("multi_caller_ipc_fifo: starting");
 
-    let ep = cap_create_endpoint(ctx.memory_frame_base)
+    let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "multi_caller_ipc_fifo: cap_create_endpoint failed")?;
-    let done = cap_create_notification(ctx.memory_frame_base)
+    let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "multi_caller_ipc_fifo: cap_create_notification failed")?;
 
     // ── Build and start caller A ──────────────────────────────────────────────

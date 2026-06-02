@@ -26,7 +26,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         // Smallest viable CSpace: 4 init_pages (wrapper page + 3 pool pages,
         // matching `unit/cap.rs::insert_out_of_bounds_err`'s sizing) and
         // 64 max_slots (well below L1_SIZE * L2_SIZE = 14336).
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 64)
+        let cs = cap_create_cspace(ctx.memory_base, 0, 4, 64)
             .map_err(|_| "cspace_recycle: cap_create_cspace failed (namespace exhausted?)")?;
         cap_delete(cs).map_err(|_| "cspace_recycle: cap_delete failed")?;
     }

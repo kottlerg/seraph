@@ -89,7 +89,7 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
 /// cap is found, the test is skipped.
 pub fn irq_register_ack(ctx: &TestContext) -> TestResult
 {
-    let irq_sig = cap_create_notification(ctx.memory_frame_base)
+    let irq_sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "cap_create_notification for IRQ test failed")?;
 
     for slot in 1..ctx.aspace_cap
@@ -147,9 +147,9 @@ pub fn ioport_bind(ctx: &TestContext) -> TestResult
     // x86_64: create a thread to receive the port range and scan for a cap.
     #[cfg(target_arch = "x86_64")]
     {
-        let cs = cap_create_cspace(ctx.memory_frame_base, 0, 4, 8)
+        let cs = cap_create_cspace(ctx.memory_base, 0, 4, 8)
             .map_err(|_| "create_cspace for ioport_bind test failed")?;
-        let th = cap_create_thread(ctx.memory_frame_base, ctx.aspace_cap, cs)
+        let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs)
             .map_err(|_| "cap_create_thread for ioport_bind test failed")?;
 
         let max_slots = if let Ok(n) =
@@ -332,10 +332,10 @@ pub fn mmio_split_carves(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `mmio_split` on a Frame cap (wrong tag) must return `InvalidCapability`.
+/// `mmio_split` on a Memory cap (wrong tag) must return `InvalidCapability`.
 pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 {
-    let err = mmio_split(ctx.memory_frame_base, 0x1000);
+    let err = mmio_split(ctx.memory_base, 0x1000);
     if err != Err(SyscallError::InvalidCapability as i64)
     {
         return Err("hw::mmio_split_wrong_tag_err: did not return InvalidCapability");
@@ -377,10 +377,10 @@ pub fn irq_split_carves(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `irq_split` on a Frame cap (wrong tag) must return `InvalidCapability`.
+/// `irq_split` on a Memory cap (wrong tag) must return `InvalidCapability`.
 pub fn irq_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 {
-    let err = irq_split(ctx.memory_frame_base, 0);
+    let err = irq_split(ctx.memory_base, 0);
     if err != Err(SyscallError::InvalidCapability as i64)
     {
         return Err("hw::irq_split_wrong_tag_err: did not return InvalidCapability");

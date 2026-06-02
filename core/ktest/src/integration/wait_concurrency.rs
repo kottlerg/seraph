@@ -32,11 +32,11 @@ static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
-    let ws = wait_set_create(ctx.memory_frame_base)
+    let ws = wait_set_create(ctx.memory_base)
         .map_err(|_| "integration::wait_concurrency: wait_set_create failed")?;
-    let sig = cap_create_notification(ctx.memory_frame_base)
+    let sig = cap_create_notification(ctx.memory_base)
         .map_err(|_| "integration::wait_concurrency: cap_create_notification failed")?;
-    let eq = event_queue_create(ctx.memory_frame_base, 4)
+    let eq = event_queue_create(ctx.memory_base, 4)
         .map_err(|_| "integration::wait_concurrency: event_queue_create failed")?;
 
     wait_set_add(ws, sig, 1)

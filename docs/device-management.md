@@ -113,10 +113,10 @@ devmgr still derives the authorising capability, but the physical isolation is
 absent — this is a userspace policy decision (refuse / warn / restrict), not a
 kernel-enforced mode. The kernel is agnostic to both outcomes.
 
-Frame physical-base addresses, where drivers need them (e.g. to program
+Memory physical-base addresses, where drivers need them (e.g. to program
 device DMA transports on no-IOMMU systems), are supplied to drivers by
-memmgr in the `REQUEST_FRAMES` reply alongside the Frame caps themselves.
-The kernel exposes no syscall for translating a Frame cap into its
+memmgr in the `REQUEST_MEMORY_CAPS` reply alongside the Memory caps themselves.
+The kernel exposes no syscall for translating a Memory cap into its
 physical address.
 
 ---
@@ -144,7 +144,7 @@ managed by init's bootstrap sequence (for early boot) and svcmgr (for restarts).
 devmgr loads driver binaries from one of two places:
 
 - **Boot bundle** — bootstrap-essentials (virtio-blk, serial,
-  framebuffer) ship in the bundle and arrive as Frame caps in devmgr's
+  framebuffer) ship in the bundle and arrive as Memory caps in devmgr's
   MODULE bootstrap round. devmgr spawns them via
   `procmgr_labels::CREATE_PROCESS` during initial enumeration.
 - **On-disk rootfs** — non-essentials (today: the per-arch RTC) live

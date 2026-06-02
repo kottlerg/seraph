@@ -3,10 +3,10 @@
 // Page-granular reservation allocator. Owns one fixed-size arena per
 // process, carved out at process start. Hands out unmapped contiguous VA
 // ranges; the caller is responsible for `mem_map` / `mem_unmap` against
-// owned Frame caps. The arena holds no Frame caps and issues no syscalls
+// owned Memory caps. The arena holds no Memory caps and issues no syscalls
 // — it is pure VA bookkeeping.
 //
-// Used for foreign Frame mappings: MMIO from devmgr, DMA buffers from
+// Used for foreign Memory mappings: MMIO from devmgr, DMA buffers from
 // drivers, shmem backings, zero-copy file pages from fs drivers, ELF-load
 // scratch in procmgr. The byte heap (`#[global_allocator]`) is a
 // disjoint surface owned by `sys::alloc::seraph`.
@@ -232,7 +232,7 @@ pub fn reserve_pages(n: u64) -> Result<ReservedRange, ReserveError> {
 }
 
 /// Release a reservation back to the arena. The caller must have
-/// `mem_unmap`'d every Frame it mapped into the range before calling;
+/// `mem_unmap`'d every Memory cap it mapped into the range before calling;
 /// the arena does not inspect mappings.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn unreserve_pages(range: ReservedRange) {

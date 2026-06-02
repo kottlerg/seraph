@@ -677,13 +677,13 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     {
         // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
         // sets the SERAPH_SHIM_* config (so the shim knows what to
-        // exec), and applies RUSTC_BOOTSTRAP=1. The latter unlocks
-        // `restricted_std`/`rustc_private` — StdUser bins target a
-        // custom triple ("seraph") that rustc doesn't recognise in
-        // its built-in list, and the std overlay loads workspace
-        // crates (process-abi, syscall, ipc, shmem, log) as std
-        // deps; matches how hermit and other tier-3 custom-std
-        // targets unlock the same gates.
+        // exec), and applies RUSTC_BOOTSTRAP=1 — unlocking the unstable
+        // features that `-Zbuild-std` and the std overlay's workspace
+        // deps (process-abi, syscall, ipc, shmem, log) require:
+        // `rustc_private` and `rustc-dep-of-std`. The `seraph` OS is
+        // recognised as a std target by the std `build.rs` overlay, so
+        // `std` is not `restricted_std`-gated and bins need no feature
+        // preamble.
         s.apply_env(&mut cmd);
     }
     run_cmd(&mut cmd)?;
@@ -797,8 +797,9 @@ fn clippy_check_ext(
             cmd.arg("check").args(flags);
             // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
             // sets the SERAPH_SHIM_* config, and re-applies
-            // RUSTC_BOOTSTRAP=1 (unlocks restricted_std + rustc_private
-            // so service code stays preamble-free).
+            // RUSTC_BOOTSTRAP=1. `std` is a recognised (non-restricted)
+            // target via the std `build.rs` overlay, so service code
+            // stays preamble-free.
             s.apply_env(&mut cmd);
             // Clippy-driver splits CLIPPY_ARGS on __CLIPPY_HACKERY__; this
             // matches the encoding cargo-clippy uses internally when

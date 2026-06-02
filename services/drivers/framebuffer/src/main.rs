@@ -36,7 +36,6 @@
 //! (`core/kernel/src/framebuffer.rs`) remains the early-boot / panic
 //! fallback (see `docs/console-model.md`).
 
-#![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
 mod arch;

@@ -14,8 +14,6 @@
 //! Driven by `services/svctest`'s `stack_overflow_phase`, which spawns this
 //! binary, waits for exit, and asserts the non-zero fault reason.
 
-#![feature(restricted_std)]
-
 fn main()
 {
     overflow(0);

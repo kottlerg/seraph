@@ -16,9 +16,6 @@
 //! caller over IPC at startup. procmgr itself has no knowledge of the child's
 //! service-specific capabilities.
 
-// The `seraph` target is not in rustc's recognised-OS list, so `std` is
-// `restricted_std`-gated for downstream bins.
-#![feature(restricted_std)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 

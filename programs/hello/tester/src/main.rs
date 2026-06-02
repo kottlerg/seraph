@@ -7,7 +7,6 @@
 //! asserts the expected line appears, and asserts a clean exit. See
 //! [docs/testing.md](../../../docs/testing.md) for the protocol.
 
-#![feature(restricted_std)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::Read;

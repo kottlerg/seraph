@@ -11,7 +11,6 @@
 //! clock, and serves [`timed_labels::GET_WALL_TIME`] from `offset +
 //! system_info(ElapsedUs)` thereafter.
 
-#![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
 use ipc::{

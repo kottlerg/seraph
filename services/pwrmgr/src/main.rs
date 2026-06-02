@@ -18,10 +18,6 @@
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
 
-// The `seraph` target is not in rustc's recognised-OS list, so `std` is
-// `restricted_std`-gated for downstream bins. Every std-built service on
-// seraph carries this preamble.
-#![feature(restricted_std)]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
 #![allow(clippy::cast_possible_truncation)]
 

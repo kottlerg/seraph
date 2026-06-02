@@ -8,7 +8,6 @@
 //! reply (byte count, uppercase echo, `PASS`) appears and the child exits
 //! cleanly. See [docs/testing.md](../../../docs/testing.md).
 
-#![feature(restricted_std)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::{Read, Write};

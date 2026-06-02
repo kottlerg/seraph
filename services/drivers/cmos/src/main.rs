@@ -11,7 +11,6 @@
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]) by re-reading hardware on
 //! every request.
 
-#![feature(restricted_std)]
 #![allow(clippy::cast_possible_truncation)]
 
 use ipc::{IpcMessage, rtc_errors, rtc_labels};

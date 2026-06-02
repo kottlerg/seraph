@@ -96,6 +96,14 @@ kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace
 triples) to rebuild the standard library from source. The build scripts
 pass the flag explicitly.
 
+By default `os: seraph` is not in rustc's recognised-OS list, so upstream
+`std`'s build script would mark the crate `restricted_std`-gated. Because
+Seraph ships a complete `std::sys::seraph` backend, the build pipeline
+overlays std's `build.rs` to list `seraph` alongside the other recognised
+std targets (`hermit`, `redox`, …). `std` is therefore built as a normal
+stable crate, and std-userspace bins need no `#![feature(restricted_std)]`
+opt-in.
+
 ---
 
 ## Build Output: the Sysroot
@@ -288,4 +296,4 @@ The merge-gating rule (CI must pass green before merge) lives in
 
 ## Summarized By
 
-[README.md](../README.md), [conventions.md](conventions.md)
+[README.md](../README.md), [conventions.md](conventions.md), [ruststd/README.md](../runtime/ruststd/README.md)

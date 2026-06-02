@@ -104,7 +104,7 @@ This table is the authoritative per-transition rule set for the lifecycle syscal
 | `sys_thread_write_regs` | `Stopped` | `Stopped` | calling CPU | none beyond the source-state check. Validates user `TrapFrame` then writes; target is not running (state == Stopped). |
 | `sys_exit` (self) | `*` | `Exited` | running CPU = current CPU | `set_state_under_all_locks(self, Exited)`, then `post_death_notification`, then `schedule(false)`. The all-locks write ensures any peer-CPU `schedule()` reading `state` under its own sched.lock sees `Exited` and refuses to re-enqueue. |
 | arch fault handler (page fault, GP fault, etc.) | `*` | `Exited` | trapping CPU = current CPU | Same as `sys_exit`. |
-| `dealloc_object(Thread)` | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, snapshots `running_on`, releases all. After release: spins on `sched.current != tcb` (if `running_on = Some(cpu)`), then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
+| `dealloc_object(Thread)` | `*` | `Exited` | calling CPU (refcount → 0) | Acquires every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then proceeds to source-IPC unlink + free. See Drain Protocol below. |
 
 **Why the all-CPU lock acquire in `dealloc_object(Thread)`:**
 
@@ -131,12 +131,17 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
    blocked_on = null, trap_frame.return = Interrupted). The actual
    enqueue_and_wake happens AFTER step 7 because it would deadlock against
    the held scheduler.locks.
-6. For each CPU: check if scheduler_for(cpu).current == tcb; record running_on
-   (at most one).
+6. No in-region `current` snapshot is required: the post-release gate (step 9)
+   scans every CPU unconditionally, so reclamation does not depend on an
+   all-locks `running_on` reading (which names at most one CPU and can be stale
+   the instant the locks drop).
 7. Release every scheduler.lock in descending order.
 8. If a server_reply_wake was prepared in step 5, enqueue_and_wake(bound, ...).
-9. If running_on was recorded, spin (re-acquire that CPU's lock per iteration)
-   until scheduler_for(run_cpu).current != tcb.
+9. `current`-anywhere gate (UNCONDITIONAL): scan every CPU, each under its own
+   scheduler.lock; if some CPU has `scheduler_for(cpu).current == tcb`, spin on
+   that CPU's lock until it switches away, then re-scan. Proceed only when a
+   full scan finds no CPU running tcb. tcb is `Exited` and unlinked from every
+   run queue (steps 3-4), so no CPU can re-install it after a clean scan.
 10. Spin on tcb.context_saved.load(Acquire) == 1 (UNCONDITIONAL — see invariant 4).
     Steps 9-10 run with `preempt_disable` and interrupts enabled
     (`save_and_disable_interrupts` → `enable`); the local CPU MUST be
@@ -144,8 +149,7 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
     spin or it deadlocks against a peer CPU sending an IPI to it
     (observed locally and on `ubuntu-latest` CI). Preemption is
     disabled so a timer tick mid-spin cannot reschedule the dealloc
-    caller off this CPU (which would invalidate the `running_on`
-    snapshot captured at step 6).
+    caller off this CPU.
 11. Acquire the source IPC lock for tcb's blocked_on_object (if any) and unlink
     tcb from the source's wait queue / waiter slot. Branches:
       - BlockedOnSend / BlockedOnRecv: ep.lock; unlink_from_wait_queue.
@@ -171,11 +175,11 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 
 2. **Step 3 (state = Exited) commits under all locks.** No `schedule()` on any CPU can subsequently observe this TCB as `Ready` or `Running` for purposes of re-enqueue — the protection in `schedule()` reads `state` while holding its CPU's scheduler.lock and refuses to re-enqueue if `state ∈ {Exited, Stopped}`. `enqueue_and_wake` performs the same check before enqueueing (see [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy) rule 9).
 
-3. **Step 9's `running_on` spin is bounded.** The remote CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch switch on both arches — `release_lock_only` runs in Rust before `switch()`), the spin exits.
+3. **Step 9's `current`-anywhere scan is bounded.** A TCB is `current` on at most one CPU at a time. That CPU is mid-`schedule()`; once it sets `current = next_tcb` (which happens *before* the arch switch on both arches — `release_lock_only` runs in Rust before `switch()`), the inner spin exits. After it switches away no CPU can re-install tcb (it is `Exited` and unlinked from every run queue), so the next full scan is clean and the loop terminates. The scan does not rely on the all-locks `running_on` snapshot, which names at most one CPU and may be stale once the locks drop.
 
 4a. **No `fpu_owner` sweep is needed after eager save (#108).** The `#NM` handler only ever installs the currently Running thread on its CPU as `fpu_owner`. `switch_out_save` clears the slot on switch-out before the thread re-enters the Ready / Blocked / Stopped / Exited states. By the time steps 9 and 10 above have completed — the thread has switched out on every CPU and `context_saved == 1` — no CPU's owner slot can name this TCB. Steps 9-10's interrupt-enabled-while-spinning discipline is still required to prevent the spin from deadlocking against a peer CPU's TLB-shootdown IPI; without it, two CPUs in mutual TLB shootdown would deadlock.
 
-4. **Step 10's `context_saved` spin is the load-bearing UAF gate, and is unconditional.** On both arches, `schedule()` calls `set_current(next)` and `release_lock_only(sched.lock)` *before* `switch()` saves the dying thread's registers into `tcb.saved_state`. A peer CPU acquiring the same lock at any moment after the release can therefore observe `sched.current = idle` while `switch()` is still mid-save into `tcb.saved_state`. Freeing the TCB at that point lets the next allocation reuse the memory; `switch()` then corrupts the new allocation, producing hangs (`stress::thread_churn`, `bench thread_lifecycle`) or worse. Step 10 closes the window: `context_saved` is cleared by `schedule()` *before* the save and written `1` (Release) by `switch()` *after* the save; spinning on the Acquire load until it observes `1` guarantees the save has fully published. The spin is unconditional on the result of `running_on`, because the all-locks `running_on` snapshot can race past the lock release and miss the in-flight switch entirely. New TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
+4. **Step 10's `context_saved` spin is the load-bearing UAF gate, and is unconditional.** On both arches, `schedule()` calls `set_current(next)` and `release_lock_only(sched.lock)` *before* `switch()` saves the dying thread's registers into `tcb.saved_state`. A peer CPU acquiring the same lock at any moment after the release can therefore observe `sched.current = idle` while `switch()` is still mid-save into `tcb.saved_state`. Freeing the TCB at that point lets the next allocation reuse the memory; `switch()` then corrupts the new allocation, producing hangs (`stress::thread_churn`, `bench thread_lifecycle`) or worse. Step 10 closes the window: `context_saved` is cleared by `schedule()` *before* the save and written `1` (Release) by `switch()` *after* the save; spinning on the Acquire load until it observes `1` guarantees the save has fully published. It is unconditional and runs after step 9's `current`-anywhere scan: that scan guarantees no CPU still names tcb as `current`, but a CPU that has just switched *away* may still be mid-save into `tcb.saved_state` (the save trails the `current = next` store and the lock release), and step 10 is what waits for that save. New TCBs initialise `context_saved = 1`, so the wait is bounded for threads that never ran.
 
 5. **Step 11's source-IPC unlink MUST acquire the source's lock for every variant.** This is the symmetry rule with `cancel_ipc_block`: both clear IPC-blocking field-group writes from a non-owning CPU and MUST hold the matching source lock.
 

@@ -4,18 +4,21 @@
 //! Stress: race `sys_thread_set_priority` against `cap_delete(Thread)` and
 //! the load balancer.
 //!
-//! Reproduces issue #122 family hazards by writing the same scheduler-owned
-//! TCB fields (`priority`, `state`, `run_queue_next`) from cross-CPU
-//! syscalls under contention:
+//! Reproduces issue #122 / #207 family hazards by writing the same
+//! scheduler-owned TCB fields (`priority`, `state`, `run_queue_next`) from
+//! cross-CPU syscalls under contention, and by freeing a TCB while it is
+//! `current` on another CPU:
 //!
 //!   * **Phase 1** churns priority on every worker each cycle and, once
 //!     per 4-cycle window, also flips affinity — the load balancer /
 //!     active migration races the priority-change's locate-and-relocate
 //!     and exercises the cross-CPU outgoing re-enqueue branch under heavy
 //!     contention.
-//!   * **Phase 2** does two rapid priority writes followed by
-//!     `cap_delete(Thread)` — the dealloc all-locks walk races the
-//!     priority-change in flight.
+//!   * **Phase 2** pins each worker to a remote CPU and yields so it runs
+//!     there, then does two rapid priority writes followed by
+//!     `cap_delete(Thread)` — the dealloc all-locks walk + drain protocol
+//!     race the priority-change in flight *and* a target that is `current`
+//!     on another CPU (the #207 free-vs-`current`-read window).
 //!
 //! Pass criterion: harness boots clean to `[ktest] ALL TESTS PASSED`. Any
 //! double-link, stale-link UAF, or magic-cookie corruption surfaces as a
@@ -89,14 +92,32 @@ pub fn run(ctx: &TestContext) -> TestResult
         }
     }
 
-    // ── Phase 2: priority churn racing dealloc. ──────────────────────────
+    // ── Phase 2: dealloc racing a remote-running, priority-churned target. ─
     //
     // Hazard 1 surface: dealloc reads priority under all-CPU locks and
     // calls remove_from_queue per CPU; a concurrent set_priority that
     // changes the priority field without relocating the queue entry would
     // leave a stale link the dealloc misses.
+    //
+    // #207 surface: each worker is pinned to a CPU and given a slice to run
+    // there *before* deletion, so `cap_delete` drives the dealloc drain
+    // protocol against a TCB that is `current` on another CPU — the exact
+    // free-vs-`current`-read window the timer-tick magic assert guards.
+    // `(i + 1) % cpus` spreads the workers across CPUs; with cpus > 1 most
+    // land on a CPU other than the controller's, which is the case of interest
+    // (it is not guaranteed for every worker — the controller's own CPU may
+    // coincide with a target, which is harmless).
     for i in 0..NUM_WORKERS
     {
+        let i_u32 = u32::try_from(i).unwrap_or(0);
+        let target_cpu = (i_u32 + 1) % cpu_mod;
+        let _ = thread_set_affinity(threads[i], target_cpu);
+        // Yield so the pinned worker migrates to and starts running on the
+        // remote CPU before we churn its priority and delete it.
+        for _ in 0..4
+        {
+            let _ = thread_yield();
+        }
         let _ = thread_set_priority(threads[i], 5, 0);
         let _ = thread_set_priority(threads[i], 11, 0);
         cap_delete(threads[i])

@@ -117,22 +117,37 @@ data and heap are writable but not executable.
 
 ### TLB Management
 
-A context switch to a different address space performs a full TLB flush. The kernel does
-not use hardware address-space tags (x86-64 PCIDs, RISC-V ASIDs); switching the page-table
-root discards the outgoing space's cached user translations:
+Where the hardware provides address-space tags (x86-64 PCID, RISC-V ASID), the kernel
+assigns a tag per address space so a context switch loads the outgoing space's page-table
+root **without** flushing the TLB — cached translations survive across switches. Support is
+detected at boot; where it is unavailable the kernel falls back to a full flush on every
+switch (writing CR3 with `CR4.PCIDE` clear, or `satp` with ASID 0 followed by `sfence.vma`).
+A switch between threads that share an address space requires no TLB operation either way.
 
-- **x86-64:** the switch writes CR3 with `CR4.PCIDE` clear, which flushes all non-global
-  TLB entries.
-- **RISC-V:** the switch writes `satp` with ASID 0 and executes `sfence.vma`.
+Eliding the per-switch flush requires keeping tagged entries coherent without it. Two
+generation counters do this:
 
-A switch between threads that share an address space requires no TLB operation.
-Single-address invalidation after a mapping change uses `invlpg` (x86-64) or
-`sfence.vma <va>` (RISC-V); cross-CPU invalidation uses the SMP shootdown protocol
-described in the kernel memory-internals document.
+- A global tag allocator stamps each tag claim with a unique generation. A CPU records, per
+  tag, the generation it last loaded; when it loads a tag whose recorded generation differs,
+  the tag was reissued to a different address space and the CPU flushes just that tag. This
+  is the cross-CPU invalidation-before-reissue guarantee, so a finite tag pool can be
+  recycled safely — on exhaustion the least-recently-claimed tag whose owner is not active
+  on any CPU is evicted.
+- Each address space carries a TLB generation bumped on every unmap or permission
+  narrowing. A CPU that was switched away when the change happened flushes the tag on its
+  next reactivation if its synced generation lags; CPUs currently running the space are
+  reached directly by the SMP shootdown.
 
-Tagged TLBs would let context switches retain cached translations across address spaces and
-avoid the per-switch flush. They are not implemented; the optimization is tracked as future
-work in [#198](https://github.com/kottlerg/seraph/issues/198).
+Tag 0 is reserved for the kernel/idle context and the full-flush fallback and is never
+assigned to a user space. Single-address invalidation after a mapping change uses `invlpg`
+(x86-64) or `sfence.vma <va>` (RISC-V) on the current space; cross-CPU shootdown uses the
+tag-targeted forms (`invpcid` / `sfence.vma <va>, <asid>`) so a CPU that has since switched
+spaces still invalidates the right translation. Cross-CPU invalidation uses the SMP
+shootdown protocol described in the kernel memory-internals document.
+
+The `CAP_INFO_TLB_ELIDED` / `CAP_INFO_TLB_PERFORMED` `cap_info` selectors expose system-wide
+counts of context switches that elided versus performed the flush — the
+emulation-independent measure of the optimization.
 
 ### Kernel Isolation — SMEP and SMAP
 

@@ -65,7 +65,7 @@
 // cast_possible_truncation: u64→usize page count arithmetic; bounded by address space size.
 #![allow(clippy::cast_possible_truncation)]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use boot_protocol::{InitSegment, SegmentFlags};
 
@@ -101,6 +101,28 @@ pub struct AddressSpace
     /// IF=1 to deliver IPIs). Preemption is prevented by caller's
     /// `preempt_disable()`.
     pt_lock: AtomicBool,
+    /// Hardware address-space tag (x86-64 PCID / RISC-V ASID), or `0` when
+    /// untagged (unclaimed, or the full-flush fallback when tagging is
+    /// unavailable). Claimed lazily on first `activate` from
+    /// [`crate::mm::tag_allocator`]. Written only under the tag-pool lock
+    /// (by the owner's own claim or by eviction); read lock-free by `activate`.
+    // dead_code: the tag fields are accessed only on `#[cfg(not(test))]` paths
+    // (activate / shootdown / destroy), so host-test builds see them as unread.
+    #[allow(dead_code)]
+    pub(crate) tag: AtomicU16,
+    /// The global allocator generation stamped when this space claimed its
+    /// current `tag`. Globally unique per claim; distinguishes this space's
+    /// claim on a tag from any later space that reuses the same tag value, so a
+    /// per-CPU generation check flushes a tag before its first use under a new
+    /// owner.
+    #[allow(dead_code)] // see `tag`
+    pub(crate) tag_gen: AtomicU64,
+    /// Bumped on every Replace-class modification (`unmap`, permission narrow).
+    /// A CPU switched away from this space compares its last-synced value
+    /// against this on reactivation and flushes the tag if it lags, catching
+    /// unmaps it missed while it was elsewhere.
+    #[allow(dead_code)] // see `tag`
+    pub(crate) tlb_gen: AtomicU64,
 }
 
 // SAFETY: All mutable state is protected by pt_lock (page tables) or atomic
@@ -187,6 +209,27 @@ impl AddressSpace
     #[inline]
     fn shootdown_remote(&self, virt: u64)
     {
+        // This is the Replace-class path (unmap / frame-replace / permission
+        // narrow). Reading `self.tag` is safe without the pool lock: the current
+        // CPU is running this space (it is performing the modification), so the
+        // space is active and cannot be selected as an eviction victim, so its
+        // tag is stable here.
+        let tag = self.tag.load(Ordering::Acquire);
+
+        if crate::mm::tag_allocator::tagging_enabled()
+        {
+            // Bump the per-space TLB generation so a CPU that was switched away
+            // (and is therefore NOT in active_cpus, so gets no IPI below) flushes
+            // this tag on its next reactivation. The SeqCst fence is the A-side
+            // of the INV-3 unmap-race Dekker: it orders the bump before the
+            // active-CPU snapshot, pairing with the fence in `activate`. Together
+            // they guarantee that for any CPU caching this space, either it is in
+            // the snapshot (gets an IPI) or it observes the bumped tlb_gen on
+            // reactivation. Never neither.
+            self.tlb_gen.fetch_add(1, Ordering::Release);
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+
         let mut remote_cpus = self.active_cpu_mask();
         let current = crate::arch::current::cpu::current_cpu() as usize;
         remote_cpus.clear(current);
@@ -196,7 +239,7 @@ impl AddressSpace
             // contains only online CPUs (enforced by scheduler); the caller
             // holds preempt_disable() and no longer holds pt_lock.
             unsafe {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote_cpus, virt);
+                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote_cpus, virt, tag);
             }
         }
     }
@@ -247,6 +290,9 @@ impl AddressSpace
             root_virt,
             active_cpus: AtomicCpuMask::new(),
             pt_lock: AtomicBool::new(false),
+            tag: AtomicU16::new(0),
+            tag_gen: AtomicU64::new(0),
+            tlb_gen: AtomicU64::new(0),
         }
     }
 
@@ -285,6 +331,9 @@ impl AddressSpace
             root_virt,
             active_cpus: AtomicCpuMask::new(),
             pt_lock: AtomicBool::new(false),
+            tag: AtomicU16::new(0),
+            tag_gen: AtomicU64::new(0),
+            tlb_gen: AtomicU64::new(0),
         }
     }
 
@@ -611,8 +660,17 @@ impl AddressSpace
 
     /// Activate this address space on the current CPU.
     ///
-    /// On x86-64: writes `root_phys` to CR3 (flushes TLB).
-    /// On RISC-V: writes the Sv48 SATP value and issues `sfence.vma`.
+    /// With tagging disabled this writes the page-table root with a full TLB
+    /// flush (x86-64 CR3 write; RISC-V `satp` + `sfence.vma`). With tagging
+    /// enabled it loads the root under this space's hardware tag **without**
+    /// flushing, then flushes only that tag if a per-CPU generation check shows
+    /// the tag was reissued to a different space or accrued unmaps while this
+    /// CPU was switched away.
+    ///
+    /// The caller (scheduler / first user entry) MUST have marked this CPU
+    /// active on this space (`mark_active_on_cpu`) before calling, both so the
+    /// space cannot be selected as its own eviction victim and so the INV-3
+    /// fence below has an active-bit store to order against.
     ///
     /// # Safety
     /// Must be called at ring 0 / S-mode. After this call, all virtual
@@ -620,10 +678,76 @@ impl AddressSpace
     #[cfg(not(test))]
     pub unsafe fn activate(&self)
     {
-        use crate::arch::current::paging::activate;
-        // SAFETY: caller's contract; root_phys is a valid page table root.
+        use crate::arch::current::paging::{activate, activate_tagged, flush_tag};
+        use crate::mm::tag_allocator;
+
+        if !tag_allocator::tagging_enabled()
+        {
+            // SAFETY: caller's contract; root_phys is a valid page table root.
+            unsafe {
+                activate(self.root_phys);
+            }
+            return;
+        }
+
+        // INV-3: the scheduler published this CPU's active bit (Release) before
+        // calling. This fence orders that store before the tag/generation reads
+        // below, forming the B-side of the unmap and eviction Dekker exclusions
+        // (paired with the SeqCst fences in `unmap_page`/`protect_page` and in
+        // `tag_allocator::claim`'s eviction). Without it a CPU could miss an
+        // unmap that did not IPI it and later run a stale tagged translation.
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        let mut tag = self.tag.load(Ordering::Acquire);
+        if tag == 0
+        {
+            tag = tag_allocator::claim(self);
+        }
+        // `claim` never returns 0 when tagging is enabled (the enablement gate
+        // keeps usable tags > cpu_count, so a tag is always available). This
+        // defensive full-flush is unreachable; it exists so a logic error can
+        // never run a user space under tag 0 (which would mix tags across the
+        // space and miss a shootdown).
+        if tag == 0
+        {
+            debug_assert!(tag != 0, "claim returned 0 with tagging enabled");
+            // SAFETY: caller's contract; root_phys is a valid root.
+            unsafe {
+                activate(self.root_phys);
+            }
+            crate::percpu::record_ctxsw_flush(false);
+            return;
+        }
+
+        let tag_gen = self.tag_gen.load(Ordering::Acquire);
+        let tlb_gen = self.tlb_gen.load(Ordering::Acquire);
+
+        // Load the tagged page tables without flushing — the optimization.
+        // SAFETY: tagging enabled ⇒ CR4.PCIDE set / ASID width > 0; root_phys is
+        // a valid root mapping current code, stack, and the direct map.
         unsafe {
-            activate(self.root_phys);
+            activate_tagged(self.root_phys, tag);
+        }
+
+        // Per-CPU generation check: flush this tag iff it was reissued to a
+        // different space (owner_gen mismatch) or this space accrued unmaps
+        // while this CPU was switched away (synced_tlb_gen lag).
+        let cpu = crate::arch::current::cpu::current_cpu() as usize;
+        // SAFETY: tagging enabled ⇒ the per-CPU slab is initialised; cpu is the
+        // current CPU and < cpu_count; tag < num_tags.
+        let (owner_gen, synced) = unsafe { tag_allocator::tag_state(cpu, tag) };
+        if owner_gen != tag_gen || synced < tlb_gen
+        {
+            // SAFETY: ring 0 / S-mode; tagging enabled.
+            unsafe {
+                flush_tag(tag);
+                tag_allocator::set_tag_state(cpu, tag, tag_gen, tlb_gen);
+            }
+            crate::percpu::record_ctxsw_flush(false);
+        }
+        else
+        {
+            crate::percpu::record_ctxsw_flush(true);
         }
     }
 

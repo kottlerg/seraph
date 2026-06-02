@@ -74,22 +74,24 @@ Manages hardware page tables. A page table is referenced by its physical root fr
 intermediate frames are allocated from and returned to the kernel page-table pool.
 
 ```rust
-/// Install `root_phys` as the active page table for the current CPU.
-///
-/// Performs a full TLB flush: x86-64 writes CR3 (with CR4.PCIDE clear, so the
-/// write flushes all non-global entries); RISC-V writes `satp` (ASID 0) and
-/// executes `sfence.vma`. The kernel does not use hardware address-space tags;
-/// see docs/memory-model.md (tagged TLBs are tracked in #198).
+/// Install `root_phys` as the active page table for the current CPU with a full
+/// TLB flush: x86-64 writes CR3 with PCID 0 (flushing PCID 0's entries); RISC-V
+/// writes `satp` with ASID 0 and executes `sfence.vma`. This is the untagged
+/// fallback path, used when hardware tagging is unavailable or the tag pool is
+/// exhausted; the tagged context-switch path uses `activate_tagged` (below),
+/// driven by `AddressSpace::activate`. See docs/memory-model.md.
 ///
 /// # Safety
 /// `root_phys` must be a valid page-table root mapping current code, stack, and
 /// the direct map.
 pub unsafe fn activate(root_phys: u64);
 
-/// Write the page-table root without an explicit flush. On RISC-V this writes
-/// `satp` without `sfence.vma` (idle-thread transitions, where stale user
-/// entries are harmless). On x86-64 a CR3 write always flushes, so this is a
-/// compatibility shim equivalent to `activate`.
+/// Write the page-table root without an explicit flush (idle / kernel
+/// transitions, where the outgoing space's stale user entries are harmless).
+/// RISC-V writes `satp` (ASID 0) without `sfence.vma`. On x86-64 this loads the
+/// kernel root under PCID 0 with CR3 bit 63 (no invalidation) when `CR4.PCIDE`
+/// is set; without PCID a CR3 write necessarily flushes, so it degrades to
+/// `activate`.
 pub unsafe fn write_satp_no_fence(root_phys: u64);
 
 /// Read the active page-table root physical address (CR3 on x86-64 with the low
@@ -141,6 +143,31 @@ pub unsafe fn flush_page(virt: u64);
 /// Invalidate all non-global TLB entries on the current CPU
 /// (x86-64 CR3 reload; RISC-V `sfence.vma zero, zero`).
 pub unsafe fn flush_tlb_all();
+
+/// Install `root_phys` as the active page table under hardware address-space
+/// tag `tag` (x86-64 PCID / RISC-V ASID) **without** flushing the TLB, so the
+/// outgoing space's cached translations survive (x86-64 sets CR3 bit 63 with
+/// `CR4.PCIDE`; RISC-V writes `satp` with the ASID and no `sfence.vma`). Only
+/// valid when tagging is enabled; the caller performs any required tag
+/// invalidation (the generation check in `AddressSpace::activate`).
+pub unsafe fn activate_tagged(root_phys: u64, tag: u16);
+
+/// Invalidate the current-CPU TLB entry for `virt` tagged with `tag`,
+/// independent of the tag currently loaded (x86-64 INVPCID type 0;
+/// RISC-V `sfence.vma virt, asid`).
+pub unsafe fn flush_page_tagged(virt: u64, tag: u16);
+
+/// Invalidate all current-CPU entries tagged with `tag` (x86-64 INVPCID type 1;
+/// RISC-V `sfence.vma zero, asid`). Used when a tag is reassigned or a
+/// switched-away space accrued unmaps.
+pub unsafe fn flush_tag(tag: u16);
+
+/// Per-CPU enable of tagged TLBs; returns the number of hardware tags available
+/// (`0` when unsupported). x86-64 sets `CR4.PCIDE` and returns 4096; RISC-V
+/// probes the `satp` ASID width and returns `1 << width`. Called on the BSP
+/// (whose return seeds the tag pool) and on every AP (which must set its own
+/// `CR4.PCIDE` before any tagged CR3 load).
+pub unsafe fn enable_tagged_tlb() -> usize;
 
 /// Classify a user page fault as spurious (the live PTE already permits the
 /// access — a stale entry the handler resolves by retrying) versus a real fault.

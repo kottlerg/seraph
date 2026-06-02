@@ -61,6 +61,60 @@ pub fn current_id() -> u32
     0
 }
 
+// ── ASID width probe ──────────────────────────────────────────────────────────
+
+/// Probe the number of implemented ASID bits in `satp[59:44]`.
+///
+/// Per RISC-V Privileged ISA §4.1.11, software discovers the ASID width by
+/// writing ones to every ASID bit and reading back which ones stick. This
+/// writes a test `satp` with all ASID bits set (preserving MODE and PPN), reads
+/// it back, restores the original `satp`, and issues `sfence.vma` to discard
+/// any translation cached under the transient ASID. Returns the count of
+/// implemented ASID bits; `0` means ASIDs are unsupported and the kernel falls
+/// back to full-flush context switches.
+///
+/// # Safety
+/// Must execute in S-mode with `satp` already holding a valid root (Phase 5
+/// onward). Transiently changes the active ASID; the restore + fence makes the
+/// change invisible to translation.
+#[cfg(not(test))]
+pub unsafe fn probe_asid_bits() -> u32
+{
+    /// ASID field starts at bit 44 of `satp` on RV64.
+    const ASID_SHIFT: u64 = 44;
+    /// 16 ASID bits maximum on RV64 (`satp[59:44]`).
+    const ASID_MASK: u64 = 0xFFFF << ASID_SHIFT;
+
+    let orig: u64;
+    // SAFETY: reading satp is always safe in S-mode.
+    unsafe {
+        core::arch::asm!("csrr {}, satp", out(reg) orig, options(nostack, nomem));
+    }
+
+    let probe = orig | ASID_MASK;
+    let readback: u64;
+    // SAFETY: the probe value keeps the original MODE and PPN, so the active
+    // translation root is unchanged; only the (unused) ASID field differs. satp
+    // is restored to `orig` and the TLB fenced before this returns.
+    unsafe {
+        core::arch::asm!(
+            "csrw satp, {probe}",
+            "csrr {back}, satp",
+            "csrw satp, {orig}",
+            "sfence.vma zero, zero",
+            probe = in(reg) probe,
+            back = out(reg) readback,
+            orig = in(reg) orig,
+            options(nostack),
+        );
+    }
+
+    // Implemented ASID bits are the contiguous low-order bits of the field that
+    // read back as 1.
+    let implemented = (readback & ASID_MASK) >> ASID_SHIFT;
+    implemented.count_ones()
+}
+
 // ── Per-CPU tp register ───────────────────────────────────────────────────────
 
 /// Install `addr` as the per-CPU data pointer for the current hart.

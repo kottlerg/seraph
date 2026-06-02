@@ -267,6 +267,17 @@ pub const THREAD_STATE_ALIVE: u32 = 1;
 /// State code for `CAP_INFO_THREAD_STATE`: thread has exited or faulted.
 pub const THREAD_STATE_EXITED: u32 = 2;
 
+/// `cap_info` selector: total context-switch activations across all CPUs that
+/// loaded a tagged address space **without** flushing (the tagged-TLB
+/// optimization firing). System-wide diagnostic; the slot argument is ignored
+/// beyond requiring a live capability. Zero when tagging is disabled.
+pub const CAP_INFO_TLB_ELIDED: u64 = 10;
+
+/// `cap_info` selector: total context-switch activations across all CPUs that
+/// performed a TLB flush (tag reissue, switched-away unmap catch-up, or
+/// pool-exhaustion fallback). Pairs with [`CAP_INFO_TLB_ELIDED`].
+pub const CAP_INFO_TLB_PERFORMED: u64 = 11;
+
 // ── CapTag discriminants ─────────────────────────────────────────────────────
 //
 // Userspace constants matching the kernel `CapTag` enum, for callers that

@@ -266,8 +266,22 @@ fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64
 #[cfg(not(test))]
 pub unsafe fn write_satp_no_fence(root_phys: u64)
 {
-    // SAFETY: delegated to activate; root_phys is valid per caller contract.
-    unsafe { activate(root_phys) };
+    // With PCID enabled, load the kernel root under PCID 0 without flushing
+    // (CR3 bit 63). Kernel translations are identical across roots, so retaining
+    // PCID 0's cached entries across this transition is correct and avoids a
+    // flush. Without PCID a CR3 write always flushes, so this degrades to the
+    // flushing form (functionally equivalent to `activate`).
+    // SAFETY: root_phys is a valid kernel root per caller contract.
+    unsafe {
+        if crate::mm::tag_allocator::tagging_enabled()
+        {
+            activate_tagged(root_phys, 0);
+        }
+        else
+        {
+            activate(root_phys);
+        }
+    }
 }
 
 /// Activate the page tables rooted at `root_phys` by writing CR3.
@@ -290,6 +304,63 @@ pub unsafe fn activate(root_phys: u64)
             in(reg) root_phys,
             options(nostack),
         );
+    }
+}
+
+/// Activate the page tables rooted at `root_phys` under PCID `tag` **without
+/// flushing** the TLB.
+///
+/// Writes CR3 with the PCID in bits \[11:0\] and bit 63 set, which (with
+/// `CR4.PCIDE = 1`) requests "do not invalidate" — cached translations for
+/// `tag` and every other PCID are retained (Intel SDM Vol. 3A §4.10.4.1). This
+/// is the context-switch fast path: the outgoing space's translations survive.
+///
+/// # Safety
+/// Must execute at ring 0 with `CR4.PCIDE` set. `root_phys` must be a valid
+/// PML4 frame (4 KiB-aligned, low 12 bits zero). The tables must map the
+/// currently executing code, the active stack, and all data accessed
+/// immediately after this call. The caller is responsible for any tag
+/// invalidation required for correctness (the generation check in
+/// `AddressSpace::activate`).
+#[cfg(not(test))]
+pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
+{
+    // Bit 63 = no-invalidate request (valid only when CR4.PCIDE = 1); the PCID
+    // occupies bits [11:0]; root_phys supplies bits [51:12] with low bits zero.
+    let cr3 = root_phys | u64::from(tag) | (1u64 << 63);
+    // SAFETY: CR3 write changes the active page table; root_phys is a valid
+    // PML4 frame with zero low bits; PCIDE is set so bit 63 is honoured as the
+    // no-flush request rather than faulting.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) cr3,
+            options(nostack),
+        );
+    }
+}
+
+/// Per-CPU enable of PCID-tagged TLBs: set `CR4.PCIDE` and report the number of
+/// hardware tags (PCIDs) available, or `0` when PCID/INVPCID are unsupported.
+///
+/// Called on the BSP and every AP. On the BSP the returned count seeds the tag
+/// pool; on every CPU it sets `CR4.PCIDE`, required before any tagged CR3 load.
+///
+/// # Safety
+/// Must execute at ring 0 with the kernel root in CR3 (low 12 bits zero), at
+/// most once per CPU, before any tagged CR3 load.
+#[cfg(not(test))]
+pub unsafe fn enable_tagged_tlb() -> usize
+{
+    // SAFETY: caller's contract (ring 0, kernel root in CR3).
+    if unsafe { super::cpu::enable_pcid() }
+    {
+        // 12-bit PCID field ⇒ 4096 tags; tag 0 is reserved for kernel/fallback.
+        4096
+    }
+    else
+    {
+        0
     }
 }
 
@@ -656,6 +727,89 @@ pub unsafe fn flush_page(virt: u64)
     }
 }
 
+// ── Tagged (PCID) invalidation ────────────────────────────────────────────────
+// INVPCID lets a CPU invalidate translations tagged with an arbitrary PCID,
+// independent of the PCID currently loaded in CR3. Used by the tagged-TLB path
+// for per-VA remote shootdown (type 0) and whole-tag flush (type 1).
+
+/// INVPCID type 0: invalidate one linear address within one PCID.
+const INVPCID_TYPE_ADDR: u64 = 0;
+/// INVPCID type 1: invalidate all non-global entries of one PCID.
+const INVPCID_TYPE_SINGLE: u64 = 1;
+
+/// 128-bit INVPCID descriptor (Intel SDM Vol. 2A, "INVPCID").
+///
+/// First qword: PCID in bits \[11:0\], bits \[63:12\] reserved (must be zero).
+/// Second qword: the linear address (ignored for type 1).
+///
+/// `dead_code`: the fields are consumed by `invpcid` through a pointer in inline
+/// asm, which the lint cannot see as a read.
+#[allow(dead_code)]
+#[repr(C, align(16))]
+struct InvpcidDescriptor
+{
+    pcid: u64,
+    linear_addr: u64,
+}
+
+/// Execute `invpcid` with the given invalidation `kind` and descriptor.
+///
+/// # Safety
+/// Must execute at ring 0 with `CR4.PCIDE` set; the descriptor's reserved bits
+/// must be zero.
+#[cfg(not(test))]
+unsafe fn invpcid(kind: u64, desc: &InvpcidDescriptor)
+{
+    // SAFETY: invpcid is a ring-0 TLB primitive; desc is a valid 16-byte
+    // descriptor with reserved bits zero (constructed by the callers below).
+    // The asm reads the descriptor memory, so no nomem/readonly is asserted.
+    unsafe {
+        core::arch::asm!(
+            "invpcid {kind}, [{desc}]",
+            kind = in(reg) kind,
+            desc = in(reg) desc,
+            options(nostack),
+        );
+    }
+}
+
+/// Invalidate the TLB entry for `virt` tagged with PCID `tag` on the current
+/// CPU (INVPCID type 0), regardless of the PCID currently loaded in CR3.
+///
+/// # Safety
+/// Must execute at ring 0 with `CR4.PCIDE` set.
+#[cfg(not(test))]
+pub unsafe fn flush_page_tagged(virt: u64, tag: u16)
+{
+    let desc = InvpcidDescriptor {
+        pcid: u64::from(tag),
+        linear_addr: virt,
+    };
+    // SAFETY: ring 0 with PCIDE set (caller contract); well-formed type-0 descriptor.
+    unsafe {
+        invpcid(INVPCID_TYPE_ADDR, &desc);
+    }
+}
+
+/// Invalidate all non-global TLB entries tagged with PCID `tag` on the current
+/// CPU (INVPCID type 1). Used when a tag is (re)assigned to a new address space
+/// or when a switched-away space accrued unmaps while this CPU was elsewhere.
+///
+/// # Safety
+/// Must execute at ring 0 with `CR4.PCIDE` set.
+#[cfg(not(test))]
+pub unsafe fn flush_tag(tag: u16)
+{
+    let desc = InvpcidDescriptor {
+        pcid: u64::from(tag),
+        linear_addr: 0,
+    };
+    // SAFETY: ring 0 with PCIDE set (caller contract); well-formed type-1 descriptor.
+    unsafe {
+        invpcid(INVPCID_TYPE_SINGLE, &desc);
+    }
+}
+
 /// Remove a single user-space mapping at `virt` from the page table rooted at
 /// `root_virt`.
 ///
@@ -787,8 +941,9 @@ pub unsafe fn unmap_identity_page(pa: u64)
     {
         crate::percpu::preempt_disable();
         // SAFETY: root_pa is the active kernel PML4; remote covers only
-        // online CPUs; preemption disabled around the shootdown.
-        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt) };
+        // online CPUs; preemption disabled around the shootdown. Tag 0: this is
+        // a kernel identity mapping torn down at boot, not a tagged user space.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt, 0) };
         crate::percpu::preempt_enable();
     }
 }

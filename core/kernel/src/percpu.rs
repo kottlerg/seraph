@@ -37,7 +37,7 @@
 //! add a test in the `tests` module, and update any assembly that addresses
 //! the struct by offset.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::sched::MAX_CPUS;
 use crate::sched::thread::ThreadControlBlock;
@@ -174,6 +174,14 @@ pub struct PerCpuData
     /// `arch/x86_64/fpu.rs` module docs. Unused on RISC-V (lazy via
     /// `sstatus.FS/VS`).
     pub fpu_owner: AtomicPtr<ThreadControlBlock>,
+    /// Count of context-switch activations on this CPU that loaded a tagged
+    /// address space **without** flushing (the tagged-TLB optimization firing).
+    /// Single-writer (this CPU's own `activate`); summed read-only for the
+    /// `CAP_INFO_TLB_*` diagnostic.
+    pub ctxsw_flush_elided: AtomicU64,
+    /// Count of context-switch activations on this CPU that performed a flush
+    /// (tag reissue, switched-away unmap catch-up, or pool-exhaustion fallback).
+    pub ctxsw_flush_performed: AtomicU64,
 }
 
 impl PerCpuData
@@ -190,6 +198,8 @@ impl PerCpuData
             preempt_count: 0,
             _pad1: 0,
             fpu_owner: AtomicPtr::new(core::ptr::null_mut()),
+            ctxsw_flush_elided: AtomicU64::new(0),
+            ctxsw_flush_performed: AtomicU64::new(0),
         }
     }
 }
@@ -377,6 +387,50 @@ pub fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
     unsafe { &*core::ptr::addr_of!((*per_cpu_ptr(cpu)).fpu_owner) }
 }
 
+// ── Tagged-TLB context-switch flush counters ─────────────────────────────────
+
+/// Record a context-switch activation on the current CPU as either flush-elided
+/// (`elided = true`, the tagged-TLB optimization fired) or flush-performed.
+///
+/// Single-writer: only the owning CPU's `activate` calls this, so `Relaxed` is
+/// sufficient.
+#[cfg(not(test))]
+pub fn record_ctxsw_flush(elided: bool)
+{
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: cpu is the current CPU (< CPU_COUNT); the PER_CPU slab is
+    // initialised before any tagged activate (Phase 5).
+    let pc = unsafe { &*per_cpu_ptr(cpu) };
+    let counter = if elided
+    {
+        &pc.ctxsw_flush_elided
+    }
+    else
+    {
+        &pc.ctxsw_flush_performed
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Sum the tagged-TLB flush counters across all online CPUs as
+/// `(elided, performed)`. Read-only diagnostic; monotonic counters, so a
+/// lock-free `Relaxed` sum is fine.
+#[cfg(not(test))]
+pub fn ctxsw_flush_totals() -> (u64, u64)
+{
+    let n = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
+    let mut elided = 0u64;
+    let mut performed = 0u64;
+    for cpu in 0..n
+    {
+        // SAFETY: cpu < CPU_COUNT; the PER_CPU slab covers CPU_COUNT entries.
+        let pc = unsafe { &*per_cpu_ptr(cpu) };
+        elided += pc.ctxsw_flush_elided.load(Ordering::Relaxed);
+        performed += pc.ctxsw_flush_performed.load(Ordering::Relaxed);
+    }
+    (elided, performed)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -416,11 +470,13 @@ mod tests
     }
 
     #[test]
-    fn percpu_size_is_56_bytes()
+    fn percpu_size_is_72_bytes()
     {
         // cpu_id(4) + _pad0(4) + kernel_rsp(8) + user_rsp(8) + scratch(8) + tss_ptr(8)
-        // + preempt_count(4) + _pad1(4) + fpu_owner(8) = 56
-        assert_eq!(core::mem::size_of::<PerCpuData>(), 56);
+        // + preempt_count(4) + _pad1(4) + fpu_owner(8) + ctxsw_flush_elided(8)
+        // + ctxsw_flush_performed(8) = 72. The two tagged-TLB counters are
+        // appended after fpu_owner, so the asm-referenced offsets are unchanged.
+        assert_eq!(core::mem::size_of::<PerCpuData>(), 72);
     }
 
     #[test]

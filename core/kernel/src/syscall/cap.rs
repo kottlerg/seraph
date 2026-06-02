@@ -2209,7 +2209,8 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_CAPACITY,
         CAP_INFO_CSPACE_USED, CAP_INFO_FRAME_AVAILABLE, CAP_INFO_FRAME_HAS_RETYPE,
         CAP_INFO_FRAME_PHYS_BASE, CAP_INFO_FRAME_SIZE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE,
-        THREAD_STATE_ALIVE, THREAD_STATE_CREATED, THREAD_STATE_EXITED,
+        CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED,
+        THREAD_STATE_EXITED,
     };
 
     use crate::cap::object::{AddressSpaceObject, CSpaceKernelObject, FrameObject, ThreadObject};
@@ -2257,6 +2258,12 @@ pub fn sys_cap_info(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             let packed = (u64::from(tag as u8) << 32) | u64::from(rights.0);
             Ok(packed)
         }
+        CAP_INFO_TLB_ELIDED =>
+        {
+            // System-wide tagged-TLB diagnostic; independent of the slot.
+            Ok(crate::percpu::ctxsw_flush_totals().0)
+        }
+        CAP_INFO_TLB_PERFORMED => Ok(crate::percpu::ctxsw_flush_totals().1),
         CAP_INFO_FRAME_SIZE =>
         {
             if tag != CapTag::Frame

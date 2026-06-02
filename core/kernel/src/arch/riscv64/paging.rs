@@ -301,6 +301,52 @@ pub unsafe fn activate(root_phys: u64)
     }
 }
 
+/// Activate the Sv48 tables rooted at `root_phys` under ASID `tag` **without**
+/// issuing `sfence.vma`.
+///
+/// Encodes `tag` into `satp[59:44]` and the root PPN into `satp[43:0]`; cached
+/// translations for `tag` and every other ASID survive (the context-switch fast
+/// path). The caller is responsible for any ASID invalidation required for
+/// correctness (the generation check in `AddressSpace::activate`).
+///
+/// # Safety
+/// Must execute in S-mode on a hart with a non-zero implemented ASID width.
+/// `root_phys` must be a valid Sv48 root mapping the currently executing code,
+/// the active stack, and the direct map.
+#[cfg(not(test))]
+pub unsafe fn activate_tagged(root_phys: u64, tag: u16)
+{
+    let satp = (9u64 << 60) | (u64::from(tag) << 44) | (root_phys >> 12);
+    // SAFETY: satp write switches the active Sv48 root and ASID; the deliberate
+    // absence of sfence.vma retains cached translations; caller guarantees the
+    // tables map current code, stack, and the direct map.
+    unsafe {
+        core::arch::asm!(
+            "csrw satp, {}",
+            in(reg) satp,
+            options(nostack),
+        );
+    }
+}
+
+/// Per-CPU enable of ASID-tagged TLBs: report the number of hardware tags
+/// (ASIDs) this hart implements, or `0` when the `satp` ASID field is
+/// zero-width.
+///
+/// Called on the BSP and every AP. RISC-V needs no per-hart enable bit — the
+/// ASID is written directly into `satp` — so this only probes the implemented
+/// width. The BSP uses the returned count to seed the tag pool.
+///
+/// # Safety
+/// Must execute in S-mode with `satp` holding a valid root (Phase 5 onward).
+#[cfg(not(test))]
+pub unsafe fn enable_tagged_tlb() -> usize
+{
+    // SAFETY: caller's contract (S-mode, valid satp).
+    let bits = unsafe { super::cpu::probe_asid_bits() };
+    if bits == 0 { 0 } else { 1usize << bits }
+}
+
 /// No-op on RISC-V: the XN/NX mechanism is always available via PTE X bit.
 #[cfg(not(test))]
 pub unsafe fn enable_nx() {}
@@ -377,8 +423,10 @@ pub unsafe fn read_root_phys() -> u64
     unsafe {
         core::arch::asm!("csrr {}, satp", out(reg) satp, options(nostack, nomem));
     }
-    // PPN is satp[43:0]; physical address = PPN << 12.
-    (satp & 0x000F_FFFF_FFFF_FFFF) << 12
+    // PPN is satp[43:0] (44 bits); physical address = PPN << 12. The mask must
+    // exclude the ASID field (satp[59:44]) — a non-zero ASID under tagged TLBs
+    // would otherwise leak into the returned address.
+    (satp & 0x0000_0FFF_FFFF_FFFF) << 12
 }
 
 /// Map a single 4 KiB user page `virt` → `phys` in the Sv48 page table
@@ -603,6 +651,52 @@ pub unsafe fn flush_page(virt: u64)
     }
 }
 
+// ── Tagged (ASID) invalidation ────────────────────────────────────────────────
+// `sfence.vma` with a non-zero ASID operand invalidates only that ASID's
+// translations, independent of the ASID currently loaded in `satp`. Used by the
+// tagged-TLB path for per-VA remote shootdown and whole-tag flush.
+
+/// Invalidate the TLB entry for `virt` tagged with ASID `tag` on the current
+/// hart (`sfence.vma virt, asid`), regardless of the ASID in `satp`.
+///
+/// # Safety
+/// Must execute in S-mode. `virt` need not be mapped.
+#[cfg(not(test))]
+pub unsafe fn flush_page_tagged(virt: u64, tag: u16)
+{
+    // SAFETY: sfence.vma with a VA and a non-zero ASID invalidates that leaf
+    // within that ASID; S-mode primitive, safe for any VA.
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma {va}, {asid}",
+            va = in(reg) virt,
+            asid = in(reg) u64::from(tag),
+            options(nostack),
+        );
+    }
+}
+
+/// Invalidate all entries tagged with ASID `tag` on the current hart
+/// (`sfence.vma zero, asid`). Used when an ASID is (re)assigned to a new address
+/// space or when a switched-away space accrued unmaps while this hart was
+/// elsewhere.
+///
+/// # Safety
+/// Must execute in S-mode.
+#[cfg(not(test))]
+pub unsafe fn flush_tag(tag: u16)
+{
+    // SAFETY: sfence.vma with x0 VA and a non-zero ASID invalidates all leaves
+    // within that ASID; S-mode primitive.
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma zero, {asid}",
+            asid = in(reg) u64::from(tag),
+            options(nostack),
+        );
+    }
+}
+
 /// Remove a single user-space mapping at `virt` from the Sv48 page table
 /// rooted at `root_virt`.
 ///
@@ -745,8 +839,10 @@ pub unsafe fn unmap_identity_page(pa: u64)
     {
         crate::percpu::preempt_disable();
         // SAFETY: root_pa is the active kernel Sv48 root; remote covers
-        // only online harts; preemption disabled around the shootdown.
-        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt) };
+        // only online harts; preemption disabled around the shootdown. Tag 0:
+        // this is a kernel identity mapping torn down at boot, not a tagged
+        // user space.
+        unsafe { crate::mm::tlb_shootdown::shootdown(root_pa, &remote, virt, 0) };
         crate::percpu::preempt_enable();
     }
 }

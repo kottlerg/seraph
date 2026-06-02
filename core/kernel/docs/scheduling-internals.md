@@ -387,7 +387,7 @@ There is no FPU flush IPI on either arch. x86-64 uses eager XSAVE on switch-out 
 
 ### Future IPIs (out of scope)
 
-Process-stop ("kill process across all CPUs"), tagged-TLB shootdown variants (see [#198](https://github.com/kottlerg/seraph/issues/198)), and scheduler-quiesce IPIs are not in the current kernel. If added, they MUST be documented in this section before landing.
+Process-stop ("kill process across all CPUs") and scheduler-quiesce IPIs are not in the current kernel. If added, they MUST be documented in this section before landing. (Tagged-TLB invalidation does not add an IPI: it reuses the existing TLB-shootdown IPI, whose request slot now carries the target PCID/ASID — see [memory-internals.md](memory-internals.md).)
 
 ---
 

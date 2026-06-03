@@ -9,9 +9,9 @@
 //! actual firmware action (the only sanctioned extension wired to a side effect
 //! here, SRST, would reset the machine):
 //!
-//! 1. **Kernel floor** — an extension with no sanctioned right is rejected with
-//!    `InvalidArgument` regardless of cap. Covered for a kernel-reserved
-//!    extension (TIME) and an architecturally-disallowed one (DBCN).
+//! 1. **Kernel floor** — a kernel-managed extension (no right in the vocabulary)
+//!    is rejected with `InvalidArgument` regardless of cap, even when the cap
+//!    holds every sanctioned right. Covered for TIME and HSM.
 //! 2. **Per-extension rights** — a sanctioned extension (SRST) is rejected with
 //!    `InsufficientRights` when the cap lacks its right (`SBI_RESET`). The
 //!    rejection happens before forwarding, so no reset occurs.
@@ -25,9 +25,9 @@ use crate::{TestContext, TestResult};
 #[cfg(target_arch = "riscv64")]
 const SBI_EXT_TIME: u64 = 0x5449_4D45;
 
-/// SBI Debug Console extension ID (architecturally disallowed: console model).
+/// SBI Hart State Management extension ID (kernel-reserved: hart lifecycle).
 #[cfg(target_arch = "riscv64")]
-const SBI_EXT_DBCN: u64 = 0x4442_434E;
+const SBI_EXT_HSM: u64 = 0x0048_534D;
 
 /// SBI System Reset extension ID (sanctioned, requires `SBI_RESET`).
 #[cfg(target_arch = "riscv64")]
@@ -53,11 +53,11 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("sbi_gating: TIME (reserved) should be rejected with InvalidArgument");
     }
 
-    // ── Kernel floor: architecturally-disallowed extension also rejected ─────
-    if sbi_call(ctx.sbi_control_cap, SBI_EXT_DBCN, 0, 0, 0, 0)
+    // ── Kernel floor: a second reserved extension, same rejection ────────────
+    if sbi_call(ctx.sbi_control_cap, SBI_EXT_HSM, 0, 0, 0, 0)
         != Err(SyscallError::InvalidArgument as i64)
     {
-        return Err("sbi_gating: DBCN (disallowed) should be rejected with InvalidArgument");
+        return Err("sbi_gating: HSM (reserved) should be rejected with InvalidArgument");
     }
 
     // ── Per-extension rights: SRST without SBI_RESET is denied, no reset ──────

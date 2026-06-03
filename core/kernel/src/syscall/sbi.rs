@@ -8,10 +8,11 @@
 //! RISC-V only. The kernel forwards an SBI call only for a fixed set of
 //! sanctioned extensions, each gated by a per-extension `SbiControl` right.
 //! [`sbi_required_right`] maps an extension ID to the right it requires; an
-//! extension with no entry — kernel-reserved (TIME/IPI/RFENCE/HSM) or
-//! architecturally disallowed (DBCN/PMU) — is never forwardable, regardless
-//! of cap. A sanctioned extension is forwarded only if the caller's `SbiControl`
-//! cap carries the required right. See `docs/capability-model.md`.
+//! extension with no entry is one the kernel manages internally
+//! (TIME/IPI/RFENCE/HSM) and is never forwardable, regardless of cap. Every
+//! other extension is sanctioned and forwarded only if the caller's `SbiControl`
+//! cap carries the required right; whether any consumer holds such a cap is
+//! userspace policy. See `docs/capability-model.md`.
 //!
 //! On x86-64, this syscall returns `SyscallError::NotSupported`.
 //!
@@ -48,12 +49,21 @@ const SBI_EXT_CPPC: u64 = 0x4350_5043;
 #[cfg(all(not(test), target_arch = "riscv64"))]
 const SBI_EXT_BASE: u64 = 0x10;
 
+/// SBI Debug Console (DBCN) extension ID — ASCII "DBCN".
+#[cfg(all(not(test), target_arch = "riscv64"))]
+const SBI_EXT_DBCN: u64 = 0x4442_434E;
+
+/// SBI Performance Monitoring Unit (PMU) extension ID — ASCII "PMU".
+#[cfg(all(not(test), target_arch = "riscv64"))]
+const SBI_EXT_PMU: u64 = 0x0050_4D55;
+
 /// Map an SBI extension ID to the `SbiControl` right required to forward it.
 ///
-/// `None` means the extension is not sanctioned for userspace forwarding —
-/// either kernel-reserved (TIME/IPI/RFENCE/HSM) or architecturally disallowed
-/// (DBCN/PMU) — and `sys_sbi_call` rejects it regardless of cap. Adding a
-/// sanctioned extension is one entry here plus one `Rights` bit in
+/// `None` means the extension is the kernel's to manage internally
+/// (TIME/IPI/RFENCE/HSM) and is never forwardable from userspace regardless of
+/// cap. Every other extension is sanctioned with a right; whether any consumer
+/// receives a cap bearing that right is userspace cap-distribution policy.
+/// Adding a sanctioned extension is one entry here plus one `Rights` bit in
 /// `cap::slot::Rights`.
 #[cfg(all(not(test), target_arch = "riscv64"))]
 fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::Rights>
@@ -65,6 +75,8 @@ fn sbi_required_right(extension: u64) -> Option<crate::cap::slot::Rights>
         SBI_EXT_SUSP => Some(Rights::SBI_SUSPEND),
         SBI_EXT_CPPC => Some(Rights::SBI_CPPC),
         SBI_EXT_BASE => Some(Rights::SBI_BASE),
+        SBI_EXT_DBCN => Some(Rights::SBI_DBCN),
+        SBI_EXT_PMU => Some(Rights::SBI_PMU),
         _ => None,
     }
 }

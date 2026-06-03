@@ -235,8 +235,11 @@ impl Rights
     // One right per sanctioned SBI extension (RISC-V only). `sys_sbi_call` maps
     // an extension ID to the right it requires; an extension with no right here
     // is absent from the vocabulary and can never be forwarded, regardless of
-    // cap. Kernel-reserved extensions (TIME/IPI/RFENCE/HSM) and architecturally
-    // disallowed ones (DBCN/PMU) are deliberately omitted. See
+    // cap. Only the extensions the kernel manages internally (TIME/IPI/RFENCE/
+    // HSM) are deliberately omitted — forwarding them would break a kernel
+    // invariant (scheduling, TLB coherence, hart lifecycle). Extensions that are
+    // merely undesirable for our userspace (DBCN, PMU) are sanctioned here and
+    // withheld by cap distribution, not by the kernel. See
     // `docs/capability-model.md`.
     /// May forward the SBI System Reset (SRST) extension to firmware.
     pub const SBI_RESET: Rights = Rights(1 << 20);
@@ -247,6 +250,10 @@ impl Rights
     pub const SBI_CPPC: Rights = Rights(1 << 23);
     /// May forward the read-only SBI Base extension (version / extension probe).
     pub const SBI_BASE: Rights = Rights(1 << 24);
+    /// May forward the SBI Debug Console (DBCN) extension to firmware.
+    pub const SBI_DBCN: Rights = Rights(1 << 25);
+    /// May forward the SBI Performance Monitoring Unit (PMU) extension.
+    pub const SBI_PMU: Rights = Rights(1 << 26);
 
     // ── Memory retype ──────────────────────────────────────────────────────────
     /// Authority to retype this Memory cap's region into kernel objects.
@@ -581,8 +588,8 @@ mod tests
     {
         // Bit 21 — must match `RIGHTS_RETYPE` in `abi/syscall/src/lib.rs`
         // and remain disjoint from every other Rights bit. The SbiControl
-        // rights (SBI_RESET=20, SBI_SUSPEND=22, SBI_CPPC=23, SBI_BASE=24)
-        // bracket bit 21 without colliding with it.
+        // rights (SBI_RESET=20, SBI_SUSPEND=22, SBI_CPPC=23, SBI_BASE=24,
+        // SBI_DBCN=25, SBI_PMU=26) bracket bit 21 without colliding with it.
         assert_eq!(Rights::RETYPE.0, 1 << 21);
         // Disjoint from all other rights.
         let combined = Rights::MAP
@@ -607,7 +614,9 @@ mod tests
             | Rights::SBI_RESET
             | Rights::SBI_SUSPEND
             | Rights::SBI_CPPC
-            | Rights::SBI_BASE;
+            | Rights::SBI_BASE
+            | Rights::SBI_DBCN
+            | Rights::SBI_PMU;
         assert_eq!((combined & Rights::RETYPE).0, 0);
     }
 }

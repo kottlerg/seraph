@@ -1869,7 +1869,12 @@ fn populate_cspace(
         let slot = insert_or_fatal(
             cspace,
             CapTag::SbiControl,
-            Rights::SBI_RESET | Rights::SBI_SUSPEND | Rights::SBI_CPPC | Rights::SBI_BASE,
+            Rights::SBI_RESET
+                | Rights::SBI_SUSPEND
+                | Rights::SBI_CPPC
+                | Rights::SBI_BASE
+                | Rights::SBI_DBCN
+                | Rights::SBI_PMU,
             ptr,
             "Phase 7: cannot allocate SbiControl capability",
         );

@@ -9,7 +9,9 @@
 //! arbitrary SBI calls from S-mode to M-mode firmware. The wrapper itself is
 //! unrestricted; the userspace-reachable path (`SYS_SBI_CALL`) admits only the
 //! sanctioned extensions enumerated by `syscall::sbi::sbi_required_right`
-//! (SRST, SUSP, CPPC, Base), each behind a per-extension `SbiControl` right.
+//! (SRST, SUSP, CPPC, Base, DBCN, PMU), each behind a per-extension
+//! `SbiControl` right; the kernel-managed extensions (TIME/IPI/RFENCE/HSM) are
+//! never forwardable.
 
 /// SBI return value: error code and value.
 pub struct SbiRet

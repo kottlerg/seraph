@@ -165,35 +165,41 @@ own right:
 - **Suspend** — forward System Suspend (SUSP).
 - **Cppc** — forward processor performance control (CPPC).
 - **Base** — forward the read-only Base extension (version / extension probe).
+- **Dbcn** — forward the Debug Console extension.
+- **Pmu** — forward the Performance Monitoring Unit extension.
 
 `SYS_SBI_CALL` maps the requested extension ID to the right it requires and
 rejects the call with `InsufficientRights` unless the cap carries that right.
 
-**Kernel floor.** An extension with no right is absent from the vocabulary and
-can never be forwarded from userspace, regardless of cap (`InvalidArgument`).
-Two classes are deliberately excluded:
-- *Kernel-reserved* — TIME (scheduler timer), IPI (TLB shootdown / wakeups),
-  RFENCE (remote fences), HSM (hart lifecycle). The kernel manages these
-  internally; forwarding them from userspace is a soundness violation — it could
-  halt a hart or break scheduling.
-- *Architecturally disallowed* — DBCN (debug console) and PMU. Not kernel-unsafe,
-  but each bypasses a kernel-owned, userspace-facing subsystem (the
-  console-ownership model; performance-counter mediation).
+**Kernel floor.** The kernel hard-denies exactly one class, regardless of cap
+(`InvalidArgument`): the extensions it manages internally — TIME (scheduler
+timer), IPI (TLB shootdown / wakeups), RFENCE (remote fences), HSM (hart
+lifecycle). These have no right and are absent from the vocabulary; forwarding
+them from userspace would break a kernel invariant — halt a hart, corrupt TLB
+coherence, or derail scheduling. The kernel draws the line at *soundness* only;
+it does not encode preference about which otherwise-harmless extensions
+userspace "should" use.
 
-**Distribution.** The root cap, created at boot, carries every sanctioned right.
-Init holds it and attenuates per-consumer copies with `cap_derive` (rights only
-narrow, never widen — the same attenuation as every other cap). devmgr brokers
-the platform-shutdown cap and serves pwrmgr a copy narrowed to **Reset** only;
-no other consumer receives a forwarding cap. Narrowing the set a cap may forward
-*is* this rights attenuation — there is no dedicated SBI split operation.
+**Distribution is policy, not kernel enforcement.** Every non-reserved extension
+is sanctioned with a right, but a holder can only forward an extension whose
+right its cap actually carries — so what userspace may do is set by which caps
+are handed out, by ordinary minimum-privilege distribution. The root cap, created
+at boot, carries every sanctioned right; init holds it and attenuates per-consumer
+copies with `cap_derive` (rights only narrow, never widen). devmgr brokers the
+platform-shutdown cap and serves pwrmgr a copy narrowed to **Reset** only. No
+consumer is given **Dbcn** (the userspace serial driver owns the console, so
+delegating it would bypass the console-ownership model) or **Pmu** (no perf
+consumer; counts are unmediated across context switches) — that withholding is a
+distribution choice, not a kernel wall. Narrowing the set a cap may forward *is*
+this rights attenuation; there is no dedicated SBI split operation.
 
 **Gating-granularity decision.** Per-cap authority is encoded as rights bits, not
-an EID set carried by `SbiControlObject`, because the sanctioned set is small and
-non-numeric and there is a single consumer (pwrmgr, SRST-only). `SbiControlObject`
-stays bare and the init descriptor is unchanged (`aux0 = aux1 = 0`), so
-`INIT_PROTOCOL_VERSION` is not bumped. The shared 32-bit `Rights` budget bounds
-how many extensions can be sanctioned this way; revisiting that budget (per-type
-rights) is tracked separately.
+an EID set carried by `SbiControlObject`, because the extension set is small and
+non-numeric and only one actuating consumer exists (pwrmgr, SRST-only).
+`SbiControlObject` stays bare and the init descriptor is unchanged
+(`aux0 = aux1 = 0`), so `INIT_PROTOCOL_VERSION` is not bumped. The shared 32-bit
+`Rights` budget bounds how many extensions can be sanctioned this way; revisiting
+that budget (per-type rights) is tracked separately.
 
 ### SchedControl
 

@@ -34,9 +34,11 @@ notifications. The kernel enforces that communication occurs only via authorised
 capabilities and does not interpret message contents.
 
 **Scheduling**
-Preemptive, priority‑based scheduling across all CPUs. Userspace may freely alter
-priority to some level; changes beyond a certain level require explicit authority
-via capabilies.
+Preemptive, priority‑based scheduling across all CPUs. Assigning a thread's
+priority requires a SchedControl capability whose `[min, max]` band covers the
+requested level; there is no ambient priority authority. The normal/elevated
+partition is userspace policy expressed through capability distribution, not a
+kernel boundary — see [capability-model.md](capability-model.md#schedcontrol).
 
 **Memory management**
 Physical frame allocation, virtual address space management, and page table

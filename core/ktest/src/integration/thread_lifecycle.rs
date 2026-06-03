@@ -15,7 +15,7 @@
 //!   5. Read register state (`thread_read_regs`) → verify IP non-zero
 //!   6. Redirect IP via `write_regs` (`thread_write_regs`) → `phase2_entry`
 //!   7. Resume (`thread_start`) → child sends 0x2 to confirm redirection
-//!   8. Set priority within the harness's SchedControl band (`thread_set_priority`)
+//!   8. Set priority within the harness's `SchedControl` band (`thread_set_priority`)
 //!   9. Set affinity to CPU 0 (`thread_set_affinity`)
 //!
 //! The intent is to validate that each step leaves the thread in the correct

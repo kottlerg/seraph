@@ -77,6 +77,8 @@ Overall project design documents live in [`docs/`](docs/):
   ProcessInfo/InitInfo handover, process-death flow
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
+- [Fault Handling](docs/fault-handling.md) — userspace fault-handler protocol (pager):
+  per-thread fault endpoint, fault taxonomy, suspend/resume/kill semantics, demand paging
 - [Namespace Model](docs/namespace-model.md) — node capabilities, per-entry rights and
   visibility, walking, sandboxing as cap-distribution
 - [Storage](docs/storage.md) — composition of vfsd, fs drivers, and block drivers;

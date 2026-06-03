@@ -580,8 +580,9 @@ mod tests
     fn rights_retype_bit_position()
     {
         // Bit 21 — must match `RIGHTS_RETYPE` in `abi/syscall/src/lib.rs`
-        // and remain disjoint from every other Rights bit (last existing bit
-        // is CALL at 20).
+        // and remain disjoint from every other Rights bit. The SbiControl
+        // rights (SBI_RESET=20, SBI_SUSPEND=22, SBI_CPPC=23, SBI_BASE=24)
+        // bracket bit 21 without colliding with it.
         assert_eq!(Rights::RETYPE.0, 1 << 21);
         // Disjoint from all other rights.
         let combined = Rights::MAP

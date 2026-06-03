@@ -156,7 +156,26 @@ pub const SYS_IRQ_ACK: u64 = 29;
 pub const SYS_IRQ_REGISTER: u64 = 30;
 /// Capability: delete a slot.
 pub const SYS_CAP_DELETE: u64 = 31;
-// 32 reserved (was SYS_CAP_INSERT, merged into SYS_CAP_COPY's dest-slot arg).
+/// Thread: bind (or clear) the per-thread fault-handler endpoint.
+///
+/// Reuses the slot vacated by `SYS_CAP_INSERT` (merged into `SYS_CAP_COPY`'s
+/// dest-slot arg), the same way `SYS_CAP_INFO` reclaimed the `SYS_DMA_GRANT`
+/// slot.
+///
+/// arg0 = Thread cap index (must have CONTROL) — selects the thread whose
+///        handler is set.
+/// arg1 = Endpoint cap index, or `0` to **unbind**. Must refer to an
+///        `Endpoint`. The binding takes a reference on the endpoint object
+///        for its lifetime.
+/// arg2 = `badge` — caller-chosen value delivered as the fault message badge,
+///        identifying the faulting thread/process to the handler. Opaque to
+///        the kernel.
+/// arg3 = `fault_class_mask` — selects which fault classes this handler
+///        covers. v1 accepts only [`FAULT_CLASS_ALL`]; the argument reserves
+///        the encoding for future per-class handlers without a new syscall.
+///
+/// See [Fault Handling](../../../docs/fault-handling.md) for the protocol.
+pub const SYS_THREAD_SET_FAULT_HANDLER: u64 = 32;
 /// Memory: split a large Memory cap into smaller ones.
 pub const SYS_MEMORY_SPLIT: u64 = 33;
 /// Memory: map an MMIO region.
@@ -502,6 +521,57 @@ pub const EXIT_VOLUNTARY: u64 = 0;
 /// fault vector/cause to this base: `EXIT_FAULT_BASE + vector` (x86-64) or
 /// `EXIT_FAULT_BASE + cause` (RISC-V).
 pub const EXIT_FAULT_BASE: u64 = 0x1000;
+
+// ── Fault-handler protocol ─────────────────────────────────────────────────────
+//
+// Stable cross-boundary contract for the kernel → userspace fault redirection
+// delivered to a thread's bound fault-handler endpoint (see
+// `SYS_THREAD_SET_FAULT_HANDLER` and `docs/fault-handling.md`). The message the
+// kernel synthesizes on the faulting thread's behalf carries `FAULT_LABEL`, the
+// bound badge, and four data words: `[kind, d1, d2, ip]`.
+
+/// Reserved IPC label marking a kernel-originated fault message. Distinct so a
+/// handler that multiplexes other traffic can detect kernel origin. Userspace
+/// cannot forge it: the kernel synthesizes fault delivery via the binding and
+/// distributes no SEND cap to the fault endpoint. Reserved by the kernel;
+/// servers must not produce this label themselves. Chosen adjacent to
+/// [`IPC_REPLY_TRANSFER_FAILED`] (`u64::MAX`) in the reserved high range.
+pub const FAULT_LABEL: u64 = u64::MAX - 1;
+
+/// Fault kind (data word 0): a virtual-memory (page) fault. Data words 1–3 are
+/// `[faulting_va, access_flags, faulting_ip]`, where `access_flags` is a mask of
+/// the `FAULT_ACCESS_*` bits.
+pub const FAULT_KIND_VM: u64 = 0;
+
+/// Fault kind (data word 0): a CPU exception with no kernel resolution (illegal
+/// instruction, alignment, divide error, …). Data words 1–3 are
+/// `[normalized_code, arch_aux_code, faulting_ip]`. Routed by a later phase;
+/// reserved here so the taxonomy is stable.
+pub const FAULT_KIND_EXCEPTION: u64 = 1;
+
+/// `FAULT_KIND_VM` access flag: the access was a read.
+pub const FAULT_ACCESS_READ: u64 = 1 << 0;
+/// `FAULT_KIND_VM` access flag: the access was a write.
+pub const FAULT_ACCESS_WRITE: u64 = 1 << 1;
+/// `FAULT_KIND_VM` access flag: the access was an instruction fetch.
+pub const FAULT_ACCESS_EXEC: u64 = 1 << 2;
+/// `FAULT_KIND_VM` access flag: the page was present (protection violation)
+/// rather than not-present.
+pub const FAULT_ACCESS_PRESENT: u64 = 1 << 3;
+
+/// Fault reply label: resume the faulting thread (re-execute the faulting
+/// instruction, or continue from a handler-modified instruction pointer). The
+/// default disposition; the kernel ignores reply data words and caps.
+pub const FAULT_REPLY_RESUME: u64 = 0;
+
+/// Fault reply label: the handler declines; the kernel kills the faulting
+/// thread as an unhandled fault.
+pub const FAULT_REPLY_KILL: u64 = 1;
+
+/// `fault_class_mask` value covering all fault classes — the only value v1 of
+/// `SYS_THREAD_SET_FAULT_HANDLER` accepts. Reserves the encoding for future
+/// per-class handlers.
+pub const FAULT_CLASS_ALL: u64 = !0u64;
 
 // ── System info ───────────────────────────────────────────────────────────────
 

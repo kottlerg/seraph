@@ -532,6 +532,28 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             // SAFETY: current_tcb() returns this CPU's running thread; valid
             // in exception context because we entered from a running user thread.
             let tcb = unsafe { crate::syscall::current_tcb() };
+
+            // Redirect a page fault (cause 12/13/15) to the thread's bound fault
+            // handler, if any. On a resume reply the trap returns and `sret`
+            // re-executes the faulting instruction (sepc is not advanced for
+            // faults) or continues from a handler-modified sepc.
+            // SAFETY: tcb is the running user thread; has_handler only reads the
+            // atomic fault_handler field.
+            let handler_bound = matches!(cause_code, 12 | 13 | 15)
+                && !tcb.is_null()
+                && unsafe { crate::ipc::fault::has_handler(tcb) };
+            if handler_bound
+            {
+                // SAFETY: frame is the live trap frame on this kernel stack; the
+                // redirect points trap_frame at it for the handler's reg access
+                // and returns whether to resume.
+                if unsafe { redirect_user_page_fault(tcb, frame, cause_code) }
+                {
+                    return;
+                }
+                // Handler declined (Kill) — fall through to terminate the thread.
+            }
+
             let tid = if tcb.is_null()
             {
                 0u32
@@ -618,6 +640,65 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
         crate::kprintln!("  ra={:#x} sp={:#x} a7={:#x}", frame.ra, frame.sp, frame.a7);
         crate::fatal("TrapFrame sepc corruption");
     }
+}
+
+/// Redirect a genuine userspace page fault to the faulting thread's bound fault
+/// handler. Returns `true` if the handler resolved the fault and the thread
+/// should resume (re-execute the faulting instruction), `false` if the fault is
+/// terminal (the handler declined or the binding was severed).
+///
+/// RISC-V already uses a single [`TrapFrame`] for every kernel entry, so — unlike
+/// x86-64 — no frame copy is needed: `(*tcb).trap_frame` is pointed at the live
+/// trap `frame` for the duration of the block, so the handler's
+/// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` read and edit the faulting
+/// registers in place, and `sret` restores the same frame on resume.
+///
+/// # Safety
+/// `tcb` is the current user thread and has a bound handler; `frame` is the live
+/// trap frame on the current kernel stack; no lock is held.
+#[cfg(not(test))]
+unsafe fn redirect_user_page_fault(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    frame: &mut TrapFrame,
+    cause_code: u64,
+) -> bool
+{
+    // scause: 12 = instruction page fault, 13 = load page fault, 15 = store/AMO
+    // page fault. RISC-V does not encode present-vs-not-present in scause, so the
+    // PRESENT flag is left unset (a handler that needs it inspects its mappings).
+    let access = match cause_code
+    {
+        12 => syscall::FAULT_ACCESS_EXEC,
+        15 => syscall::FAULT_ACCESS_WRITE,
+        _ => syscall::FAULT_ACCESS_READ, // 13 = load
+    };
+
+    let info = crate::ipc::fault::FaultInfo {
+        kind: syscall::FAULT_KIND_VM,
+        d1: frame.stval,
+        d2: access,
+        ip: frame.sepc,
+    };
+
+    // Point trap_frame at the live frame so the handler's register access targets
+    // the faulting state; restore the previous pointer afterward.
+    // SAFETY: tcb valid; frame is a valid live TrapFrame.
+    let saved_tf = unsafe { (*tcb).trap_frame };
+    // SAFETY: tcb valid; trap_frame is the pointer the register syscalls read
+    // while this thread is BlockedOnFault.
+    unsafe {
+        (*tcb).trap_frame = core::ptr::from_mut(frame);
+    }
+
+    // SAFETY: handler bound; trap_frame points at the live frame; no lock held.
+    let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, &info) };
+
+    // SAFETY: restore the previous trap_frame pointer.
+    unsafe {
+        (*tcb).trap_frame = saved_tf;
+    }
+
+    matches!(outcome, crate::ipc::fault::FaultOutcome::Resume)
 }
 
 /// Enable PLIC `source` on the BSP's S-mode context.

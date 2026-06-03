@@ -32,12 +32,18 @@
 //! - `cap_move_into_fresh_cspace_then_ipc.rs` — `cap_move` an endpoint into a child cspace; child IPC-calls through it
 //! - `fpu_survives_ipc_call.rs` — FP register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration
 //! - `fault_kills_thread.rs`     — a genuine userspace page fault terminates the thread with the right exit reason
+//! - `fault_pager_roundtrip.rs`  — a bound userspace pager maps a frame on fault and resumes the thread
+//! - `fault_resume_modifies_pc.rs` — a handler reads/edits the fault-blocked thread's registers and resumes it at a new PC
+//! - `fault_handler_declines_kills.rs` — a handler that replies KILL terminates the faulting thread
 //! - `tlb_widen_retry.rs`        — a permission-widen elides its shootdown; a remote stale-TLB write still completes via spurious-fault retry
 
 pub mod cap_delegation_chain;
 pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
+pub mod fault_handler_declines_kills;
 pub mod fault_kills_thread;
+pub mod fault_pager_roundtrip;
+pub mod fault_resume_modifies_pc;
 pub mod fpu_survives_ipc_call;
 pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
@@ -98,6 +104,18 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fault_kills_thread",
         fault_kills_thread::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_pager_roundtrip",
+        fault_pager_roundtrip::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_resume_modifies_pc",
+        fault_resume_modifies_pc::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_handler_declines_kills",
+        fault_handler_declines_kills::run(ctx)
     );
     run_integration_test!("integration::tlb_widen_retry", tlb_widen_retry::run(ctx));
 }

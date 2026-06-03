@@ -53,9 +53,10 @@ The sleep list is a single global fixed-capacity array of TCB pointers. A TCB is
 
 6. **Snapshot-then-claim arbitration.** The timer drains `expired[..n]` under `SLEEP_LIST_LOCK`, releases, then for each entry snapshots `(ipc_state, blocked_on_object)` and dispatches:
    - `BlockedOnNotification` / `BlockedOnEventQueue`: take the source lock; claim iff `(*src).waiter == tcb`.
+   - `BlockedOnReply` / `BlockedOnFault` (defensive — neither is ever placed on the sleep list today, since IPC call/reply and fault delivery take no timeout): `compare_exchange` the server/handler `reply_tcb` from `tcb` to null; claim iff won. Forecloses a future timeout surface letting the `default` arm mis-claim a reply/fault waiter and race a concurrent reply/cancel into a double-wake. `BlockedOnFault` additionally records `fault_outcome = Kill` on a win (a timeout is a cancellation).
    - default (plain sleep, `None`): claim unconditionally; no concurrent waker.
 
-   The snapshot is read without the source lock; the `waiter == tcb` check under the source lock is the authoritative arbitration (stale snapshot = benign skip).
+   The snapshot is read without the source lock; the `waiter == tcb` (or `reply_tcb` CAS) check under the source lock / on the atomic is the authoritative arbitration (stale snapshot = benign skip).
 
 7. **Wake-side `sleep_list_remove` MUST be inside the source IPC lock, preceded by clearing `sleep_deadline = 0`.** Producer half of the snapshot-then-claim protocol. See `notification_send` and `event_queue_post`.
 
@@ -161,12 +162,24 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
                         (*server).reply_tcb from tcb to null with AcqRel /
                         Acquire so the server's next endpoint_reply finds
                         no caller and returns None.
+      - BlockedOnFault: blocked_on_object is the *handler* (server) TCB;
+                        identical to BlockedOnReply — compare_exchange
+                        (*handler).reply_tcb from tcb to null so a later
+                        fault reply does not target this freed faulter. The
+                        faulter never resumes, so no fault_outcome is recorded.
       - None: no source-side cleanup needed.
 12. Clear tcb.blocked_on_object = null.
-13. (x86_64 only) Release IOPB if bound.
-14. Poison: tcb.magic = 0; tcb.priority = 0xFF.
-15. drop_in_place(tcb).
-16. retype_free + ancestor dec_ref + cascade.
+13. Release tcb's fault-handler binding, if any: atomically swap
+    tcb.fault_handler to null and dec_ref the prior EndpointObject; if its
+    refcount reaches 0, enqueue the orphaned endpoint header on the cascade
+    worklist (step 17's mechanism) rather than recursing into dealloc_object.
+    Done after the step-11 unlink so the endpoint dealloc cannot observe this
+    thread still on its send queue.
+14. (x86_64 only) Release IOPB if bound.
+15. Poison: tcb.magic = 0; tcb.priority = 0xFF.
+16. drop_in_place(tcb).
+17. retype_free + ancestor dec_ref + cascade (the worklist driven by
+    dealloc_object; step 13's orphaned endpoint, if any, is processed here).
 ```
 
 **Invariants the drain protocol MUST hold:**
@@ -183,24 +196,27 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 
 5. **Step 11's source-IPC unlink MUST acquire the source's lock for every variant.** This is the symmetry rule with `cancel_ipc_block`: both clear IPC-blocking field-group writes from a non-owning CPU and MUST hold the matching source lock.
 
-6. **Step 11 BlockedOnReply.** The client's `blocked_on_object` is the *server* TCB pointer (the server is the lifetime owner of `reply_tcb`). The dealloc'd client must claim its own slot via `compare_exchange(self, null, AcqRel, Acquire)` before freeing — otherwise a later `endpoint_reply` on the still-live server would load the freed client pointer and UAF on the message-copy write. Stores to `null` outside `ep.lock` MUST use compare_exchange (never an unconditional store) so a concurrent cancel cannot lose a peer client's binding.
+6. **Step 11 BlockedOnReply / BlockedOnFault.** The client's (or faulter's) `blocked_on_object` is the *server* / *handler* TCB pointer (the lifetime owner of `reply_tcb`). The dealloc'd thread must claim its own slot via `compare_exchange(self, null, AcqRel, Acquire)` before freeing — otherwise a later `endpoint_reply` / fault reply on the still-live server would load the freed pointer and UAF on the message-copy write. `BlockedOnFault` is handled identically (it reuses `reply_tcb`). Stores to `null` outside `ep.lock` MUST use compare_exchange (never an unconditional store) so a concurrent cancel cannot lose a peer client's binding.
 
-7. **Step 14's poison precedes step 15's drop.** `magic = 0` and `priority = 0xFF` are the use-after-free traps — any later code that reads these fields and dereferences will fail loudly via the `debug_assert!((*tcb).magic == TCB_MAGIC, ...)` checks in the scheduler. Step 15 calls `drop_in_place(tcb)` on the in-place body; `ThreadControlBlock` has no Drop today, so this is a no-op kept for future fields whose drop semantics matter.
+6a. **Step 13 fault-handler binding release.** A thread that *holds* a fault-handler binding (independent of whether it is itself fault-blocked) owns one `inc_ref` on its `fault_handler` EndpointObject. The drain swaps the field to null and dec_refs; if the endpoint's refcount reaches 0 it is enqueued on the cascade worklist (step 17), not freed by a nested `dealloc_object` call — the function's worklist mechanism exists precisely to keep the cascade non-recursive. Ordering after step 11 ensures a queued faulter is off the endpoint's send queue before the endpoint can be torn down.
+
+7. **Step 15's poison precedes step 16's drop.** `magic = 0` and `priority = 0xFF` are the use-after-free traps — any later code that reads these fields and dereferences will fail loudly via the `debug_assert!((*tcb).magic == TCB_MAGIC, ...)` checks in the scheduler. Step 16 calls `drop_in_place(tcb)` on the in-place body; `ThreadControlBlock` has no Drop today, so this is a no-op kept for future fields whose drop semantics matter.
 
 ---
 
 ## BlockedOnReply Edge — Symmetry Rules
 
-The `BlockedOnReply` state is structurally different from the other `BlockedOn*` states: there is no dedicated source lock. The "source" is the server TCB itself, and the slot the client is registered into is `(*server).reply_tcb: AtomicPtr<ThreadControlBlock>`. Three actors can mutate this slot from different lock domains:
+The `BlockedOnReply` state is structurally different from the other `BlockedOn*` states: there is no dedicated source lock. The "source" is the server TCB itself, and the slot the client is registered into is `(*server).reply_tcb: AtomicPtr<ThreadControlBlock>`. The `BlockedOnFault` state (fault redirection) reuses this same slot and discipline — the faulter is parked exactly as a caller and the handler is the "server" — so every actor below applies to fault delivery as well, distinguished only by `ipc_state` at the wake site. The following actors can mutate this slot from different lock domains:
 
 1. **Server in `endpoint_call`** — sets `reply_tcb = caller` under `ep.lock`.
 2. **Server in `endpoint_recv`** — sets `reply_tcb = caller` under `ep.lock`.
 3. **Server in `endpoint_reply`** — loads `reply_tcb` (Acquire), stores `null` (Release) under `ep.lock`.
 4. **Client cancel via `cancel_ipc_block`** — `compare_exchange(this_client, null, AcqRel, Acquire)` from the client's CPU's scheduler.lock, NOT under `ep.lock`.
 5. **Client dealloc via `dealloc_object(Thread)`** — `compare_exchange(this_client, null, AcqRel, Acquire)` in the BlockedOnReply branch of the source-IPC unlink walk. Mirrors `cancel_ipc_block`'s discipline.
-6. **Server dealloc via `dealloc_object(Thread)`** — under all-CPU scheduler.locks, reads `(*server).reply_tcb`; if non-null, `compare_exchange(bound, null, AcqRel, Acquire)` to claim the binding, then prepares the bound client for wake (state = Ready, ipc_state = None, blocked_on = null, trap_frame.return = `Interrupted`) and schedules an `enqueue_and_wake` for after the all-locks region releases. Without this, a client BlockedOnReply on a dying server would remain blocked indefinitely with a dangling `blocked_on_object` pointer to freed memory.
+6. **Server dealloc via `dealloc_object(Thread)`** — under all-CPU scheduler.locks, reads `(*server).reply_tcb`; if non-null, `compare_exchange(bound, null, AcqRel, Acquire)` to claim the binding, then prepares the bound client for wake and schedules an `enqueue_and_wake` for after the all-locks region releases. For a `BlockedOnReply` client it writes `trap_frame.return = Interrupted`; for a `BlockedOnFault` client (handler-thread death) it instead records `fault_outcome = Kill` (read on entry to the branch, before `ipc_state` is cleared) so the faulter runs its kill path on resume. Without this, a client blocked on a dying server/handler would remain blocked indefinitely with a dangling `blocked_on_object` pointer to freed memory.
+7. **Timer defensive arm in `sleep_check_wakeups`** — for `BlockedOnReply` / `BlockedOnFault` entries (never on the sleep list today; see Sleep List Invariant 6), `compare_exchange(this_client, null, AcqRel, Acquire)`; on a `BlockedOnFault` win it records `fault_outcome = Kill`. Defensive only — forecloses a future timeout surface racing a reply/cancel.
 
-**Symmetry rule:** every actor that may invalidate a client's place in the reply slot MUST use `compare_exchange(this_client, null, ...)` (never an unconditional store) so concurrent actors can determine whether they got there first. Stores to `null` are only safe inside `ep.lock` because that lock ensures no other actor is concurrently setting a *different* non-null caller.
+**Symmetry rule:** every actor that may invalidate a client's place in the reply slot MUST use `compare_exchange(this_client, null, ...)` (never an unconditional store) so concurrent actors can determine whether they got there first. The single `fault_outcome` writer is whichever actor wins this CAS, so a fault's resume-vs-kill disposition is never decided by two racing actors. Stores to `null` are only safe inside `ep.lock` because that lock ensures no other actor is concurrently setting a *different* non-null caller.
 
 **Invariants on the BlockedOnReply protocol:**
 

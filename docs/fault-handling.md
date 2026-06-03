@@ -36,13 +36,28 @@ checks) is owned by the [memory model](memory-model.md) and the
 
 ## Implementation Status
 
-This document is a design specification. The protocol is **not yet implemented**: the kernel
-currently terminates a faulting userspace thread unconditionally (the no-handler-bound
-behavior described below). `SYS_THREAD_SET_FAULT_HANDLER`, the fault-handler binding, the
-[fault message](#fault-message), and the [resume and kill](#delivery-resume-and-kill) paths
-do not yet exist; the `ProcessInfo` pager field referenced under
-[Demand Paging](#demand-paging-and-the-default-system-pager) is likewise not present yet.
-This section is narrowed as each part is implemented.
+The **page-fault** path of this protocol is implemented on both x86-64 and RISC-V:
+`SYS_THREAD_SET_FAULT_HANDLER`, the per-thread fault-handler binding, the
+[fault message](#fault-message) for `FAULT_KIND_VM`, and the
+[resume and kill](#delivery-resume-and-kill) state machine — including register inspection
+and modification of a fault-blocked thread via
+[`SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS`](capability-model.md#thread). A thread with
+no handler bound is still terminated, the behavior for all faults absent this mechanism.
+
+Not yet implemented (this section is narrowed as each part lands):
+
+- **Non-VM fault kinds.** Only page faults (`FAULT_KIND_VM`) are routed; other CPU
+  exceptions (`FAULT_KIND_EXCEPTION`) still terminate the thread. The taxonomy and message
+  reserve the encoding.
+- **The demand-paging consumer.** The `ProcessInfo` pager field referenced under
+  [Demand Paging](#demand-paging-and-the-default-system-pager) and the demand-paged-memory
+  consumer are not present yet.
+- **Active unbind/rebind cancellation.** Clearing or rebinding a handler governs *future*
+  faults; it does not yet actively cancel a fault already in flight on the affected thread.
+  An in-flight fault is still resolved by the handler's reply, handler-thread death, the
+  faulting thread being stopped or destroyed, or the handler endpoint being destroyed (all
+  implemented). The remaining trigger — the binding being cleared mid-fault — is the only
+  [Kill](#delivery-resume-and-kill) path not yet wired.
 
 ---
 

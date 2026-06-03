@@ -105,8 +105,11 @@ On `ECALL` from U-mode:
 **Authoritative source:** `abi/syscall/src/lib.rs` — the constants defined there
 are the single source of truth. This table must match that file exactly.
 
-Syscall numbers are stable ABI. New syscalls are added at the end; existing numbers
-are never reassigned or reused.
+Syscall numbers are stable ABI. A new syscall takes the next free number; while
+the ABI is pre-1.0 (unstable), a *vacated* number may be reclaimed for a new
+syscall (slot 36 was reclaimed for `SYS_CAP_INFO` after `SYS_DMA_GRANT`'s
+removal; slot 32 for `SYS_THREAD_SET_FAULT_HANDLER` after `SYS_CAP_INSERT`'s),
+but a number in active use is never reassigned.
 
 ```
  0  SYS_IPC_CALL                 26  SYS_WAIT_SET_ADD
@@ -115,7 +118,7 @@ are never reassigned or reused.
  3  SYS_NOTIFICATION_SEND        29  SYS_IRQ_ACK
  4  SYS_NOTIFICATION_WAIT        30  SYS_IRQ_REGISTER
  5  SYS_EVENT_POST               31  SYS_CAP_DELETE
- 6  SYS_EVENT_RECV               32  (reserved — was SYS_CAP_INSERT)
+ 6  SYS_EVENT_RECV               32  SYS_THREAD_SET_FAULT_HANDLER
  7  SYS_CAP_CREATE_ENDPOINT      33  SYS_MEMORY_SPLIT
  8  SYS_CAP_CREATE_NOTIFICATION  34  SYS_MMIO_MAP
  9  SYS_CAP_CREATE_EVENT_Q       35  SYS_IOPORT_BIND
@@ -138,11 +141,11 @@ are never reassigned or reused.
                                  52  SYS_SCHED_SPLIT
 ```
 
-**Implementation status.** Every number 0–52 has a handler except slot 32,
-which is reserved (formerly `SYS_CAP_INSERT`; its caller-chosen-slot behaviour
-is now reached through `SYS_CAP_COPY`'s destination-slot argument — a value of
-`0` auto-allocates) and returns `UnknownSyscall`. All other unallocated numbers
-also return `UnknownSyscall`.
+**Implementation status.** Every number 0–52 has a handler. (Slot 32 formerly
+held `SYS_CAP_INSERT`, whose caller-chosen-slot behaviour is now reached through
+`SYS_CAP_COPY`'s destination-slot argument — a value of `0` auto-allocates; the
+number was reclaimed for `SYS_THREAD_SET_FAULT_HANDLER`.) Unallocated numbers
+return `UnknownSyscall`.
 
 ---
 
@@ -911,14 +914,17 @@ Read the full register state of a stopped thread into a caller-supplied buffer.
 
 **Return:** `rax`/`a0`: number of bytes written on success; `SyscallError` on failure.
 
-The thread MUST be in `Stopped` state. The buffer receives an architecture-defined
-register file structure (layout published in the kernel ABI headers). If `buf_size`
-is smaller than the required size, the call fails with `InvalidArgument`.
+The thread MUST be in `Stopped` state, or fault-blocked awaiting a fault-handler
+reply (`BlockedOnFault`) — the latter lets a bound fault handler inspect the
+faulting registers (see [`docs/fault-handling.md`](../../../docs/fault-handling.md)).
+The buffer receives an architecture-defined register file structure (layout
+published in the kernel ABI headers). If `buf_size` is smaller than the required
+size, the call fails with `InvalidArgument`.
 
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread not stopped),
-`InvalidArgument` (buffer too small or invalid pointer).
+**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread neither
+stopped nor fault-blocked), `InvalidArgument` (buffer too small or invalid pointer).
 
 ---
 
@@ -936,14 +942,56 @@ Write register state into a stopped thread from a caller-supplied buffer.
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The thread MUST be in `Stopped` state. The kernel validates that the register values
-are safe (e.g. the instruction pointer is in a canonical range; privilege bits cannot
-be set).
+The thread MUST be in `Stopped` state, or fault-blocked awaiting a fault-handler
+reply (`BlockedOnFault`) — the latter lets a bound fault handler advance the PC
+or otherwise edit the faulting thread before replying (see
+[`docs/fault-handling.md`](../../../docs/fault-handling.md)). The kernel validates
+that the register values are safe (e.g. the instruction pointer is in a canonical
+range; privilege bits cannot be set).
 
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
-**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread not stopped),
-`InvalidArgument` (buffer wrong size, invalid pointer, or illegal register values).
+**Errors:** `InvalidCapability`, `AccessDenied`, `InvalidState` (thread neither
+stopped nor fault-blocked), `InvalidArgument` (buffer wrong size, invalid pointer,
+or illegal register values).
+
+---
+
+### `SYS_THREAD_SET_FAULT_HANDLER` (32)
+
+Bind (or clear) the per-thread fault-handler endpoint. A kernel-unresolvable fault
+on the target thread is delivered as a synchronous, kernel-originated IPC to this
+endpoint's receiver, suspending the thread until the handler replies; with no
+handler bound the fault is terminal. See
+[`docs/fault-handling.md`](../../../docs/fault-handling.md).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Control rights) — the thread whose handler is set |
+| 1 | `endpoint_cap` | `Endpoint` capability, or `0` to unbind |
+| 2 | `badge` | Caller-chosen value delivered as the fault message badge |
+| 3 | `fault_class_mask` | Fault classes covered; only `FAULT_CLASS_ALL` is accepted |
+
+**Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
+
+Binding takes a reference on the endpoint object for the binding's lifetime;
+rebinding, unbinding, or thread destruction releases it. Binding requires only a
+valid `Endpoint` cap — `Control` on the thread is the authority; the endpoint cap
+merely names where the thread's faults are delivered. The kernel synthesizes fault
+delivery via the binding and distributes no send capability to the endpoint, so a
+fault message bearing `FAULT_LABEL` cannot be forged.
+
+Only page faults (`FAULT_KIND_VM`) are routed in the current implementation; see
+the fault-handling design doc's implementation-status note.
+
+**Capability requirement:** `thread_cap` MUST have Control rights; `endpoint_cap`
+(when non-zero) MUST refer to an `Endpoint`.
+
+**Errors:** `InvalidCapability` (bad thread or endpoint cap), `InsufficientRights`
+(thread lacks Control), `InvalidArgument` (`fault_class_mask` other than
+`FAULT_CLASS_ALL`).
 
 ---
 

@@ -219,6 +219,11 @@ File-backed access via `mmap()` does not exist. Zero-copy file access
 is via fs-driver IPC returning Memory caps for file pages, mapped by
 the client through the page-reservation allocator.
 
+Lazy or demand backing of a reservation — mapping frames only on first
+access rather than up front — is a userspace-pager policy built on the
+fault-handler protocol, not a kernel feature; see
+[Fault Handling](fault-handling.md).
+
 ---
 
 ## Summarized By

@@ -308,6 +308,10 @@ A process created via `CREATE_PROCESS` is suspended until
 `START_PROCESS`; the heap-bootstrap step (8) only runs after the caller
 has finished injecting any additional capabilities.
 
+The creator MAY bind the initial thread's fault handler (for example a
+demand-paging pager) before starting it; see
+[Fault Handling](fault-handling.md).
+
 ---
 
 ## Process Death

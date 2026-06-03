@@ -822,9 +822,10 @@ unsafe extern "C" fn isr_page_fault()
 /// userspace fault, or any kernel fault) is handed to
 /// [`common_exception_handler`], which never returns.
 #[cfg(not(test))]
-extern "C" fn page_fault_handler(frame: *const ExceptionFrame)
+extern "C" fn page_fault_handler(frame: *mut ExceptionFrame)
 {
     /// `#PF` error-code bits (Intel SDM Vol 3 §4.7).
+    const ERR_PRESENT: u64 = 1 << 0;
     const ERR_WRITE: u64 = 1 << 1;
     const ERR_RSVD: u64 = 1 << 3;
     const ERR_INSTR: u64 = 1 << 4;
@@ -855,13 +856,204 @@ extern "C" fn page_fault_handler(frame: *const ExceptionFrame)
             }
             return;
         }
+
+        // Genuine userspace page fault. If the faulting thread has a fault
+        // handler bound, redirect the fault to it; on a resume reply the stub's
+        // `iretq` re-executes the faulting instruction (now satisfiable) or
+        // continues from a handler-modified PC.
+        // SAFETY: from_user implies a running user thread; current_tcb is valid
+        // in exception context (the kill path uses it too).
+        let tcb = unsafe { crate::syscall::current_tcb() };
+        // SAFETY: tcb is the running user thread; has_handler only reads the
+        // atomic fault_handler field.
+        let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
+        if handler_bound
+        {
+            let present = f.error_code & ERR_PRESENT != 0;
+            // SAFETY: frame is the live ExceptionFrame; the redirect copies it
+            // to/from the canonical TrapFrame and returns whether to resume.
+            if unsafe { redirect_user_page_fault(tcb, frame, cr2, write, instr, present) }
+            {
+                return;
+            }
+            // Handler declined (Kill) — fall through to terminate the thread.
+        }
     }
 
-    // Not a recoverable spurious fault — kill (userspace) or fatal (kernel).
+    // Not a recoverable spurious fault and not resumed by a handler — kill
+    // (userspace) or fatal (kernel).
     // SAFETY: frame is valid; common_exception_handler never returns.
     unsafe {
-        common_exception_handler(frame);
+        common_exception_handler(frame.cast_const());
     }
+}
+
+/// Redirect a genuine userspace page fault to the faulting thread's bound
+/// fault handler. Returns `true` if the handler resolved the fault and the
+/// thread should resume (re-execute the faulting instruction), `false` if the
+/// fault is terminal (the handler declined or the binding was severed).
+///
+/// The `#PF` stub frame ([`ExceptionFrame`]) differs in layout from the
+/// canonical [`TrapFrame`](crate::arch::current::trap_frame::TrapFrame) the
+/// register syscalls operate on, and the two overlap on the kernel stack, so
+/// the faulting registers are copied into a stack-local `TrapFrame` for the
+/// duration of the block. `(*tcb).trap_frame` is repointed at that copy so the
+/// handler's `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` see and edit the
+/// faulting state; on resume the (possibly edited) copy is written back into the
+/// `ExceptionFrame` so the stub's `iretq` uses it. (Full entry-frame
+/// unification, which would remove this copy, is a deferred follow-up that does
+/// not change the userspace ABI.)
+///
+/// # Safety
+/// `tcb` is the current user thread and has a bound handler; `frame` is the live
+/// `#PF` `ExceptionFrame` on the current kernel stack; no lock is held.
+#[cfg(not(test))]
+unsafe fn redirect_user_page_fault(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    frame: *mut ExceptionFrame,
+    cr2: u64,
+    write: bool,
+    instr: bool,
+    present: bool,
+) -> bool
+{
+    let mut access = 0u64;
+    if write
+    {
+        access |= syscall::FAULT_ACCESS_WRITE;
+    }
+    if instr
+    {
+        access |= syscall::FAULT_ACCESS_EXEC;
+    }
+    if !write && !instr
+    {
+        access |= syscall::FAULT_ACCESS_READ;
+    }
+    if present
+    {
+        access |= syscall::FAULT_ACCESS_PRESENT;
+    }
+
+    // SAFETY: frame is valid.
+    let rip = unsafe { (*frame).rip };
+    let info = crate::ipc::fault::FaultInfo {
+        kind: syscall::FAULT_KIND_VM,
+        d1: cr2,
+        d2: access,
+        ip: rip,
+    };
+
+    // Canonical register frame the handler reads/edits. Lives in this kernel
+    // stack frame, which is preserved across the block (the context switch saves
+    // and restores the kernel rsp), so the pointer stays valid while the faulter
+    // is descheduled.
+    // SAFETY: frame valid.
+    let mut canonical = unsafe { exception_to_trap_frame(&*frame) };
+    // SAFETY: tcb valid; repoint trap_frame at the canonical copy for the
+    // duration of the block, restoring the kstack slot afterward.
+    let saved_tf = unsafe { (*tcb).trap_frame };
+    // SAFETY: tcb valid; trap_frame is the canonical-frame pointer read by the
+    // register syscalls while this thread is BlockedOnFault.
+    unsafe {
+        (*tcb).trap_frame = core::ptr::from_mut(&mut canonical);
+    }
+
+    // SAFETY: handler bound; trap_frame points at the canonical frame; no lock held.
+    let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, &info) };
+
+    // SAFETY: restore the canonical kstack-slot pointer.
+    unsafe {
+        (*tcb).trap_frame = saved_tf;
+    }
+
+    match outcome
+    {
+        crate::ipc::fault::FaultOutcome::Resume =>
+        {
+            // SAFETY: frame valid and mutable; write back the (possibly edited)
+            // registers so the stub's iretq uses them.
+            unsafe {
+                trap_frame_to_exception(&canonical, frame);
+            }
+            true
+        }
+        crate::ipc::fault::FaultOutcome::Kill => false,
+    }
+}
+
+/// Copy a `#PF`/exception [`ExceptionFrame`] into a canonical
+/// [`TrapFrame`](crate::arch::current::trap_frame::TrapFrame).
+///
+/// `fs_base` is left zero: on x86-64 the authoritative TLS base lives in
+/// `SavedState.fs_base`, not the trap frame (the trap-frame field is retained
+/// for layout stability only — see `trap_frame.rs`), so the contained copy does
+/// not round-trip it.
+#[cfg(not(test))]
+fn exception_to_trap_frame(f: &ExceptionFrame) -> crate::arch::current::trap_frame::TrapFrame
+{
+    crate::arch::current::trap_frame::TrapFrame {
+        rax: f.rax,
+        rbx: f.rbx,
+        rcx: f.rcx,
+        rdx: f.rdx,
+        rsi: f.rsi,
+        rdi: f.rdi,
+        rbp: f.rbp,
+        r8: f.r8,
+        r9: f.r9,
+        r10: f.r10,
+        r11: f.r11,
+        r12: f.r12,
+        r13: f.r13,
+        r14: f.r14,
+        r15: f.r15,
+        rip: f.rip,
+        rflags: f.rflags,
+        rsp: f.rsp,
+        cs: f.cs,
+        ss: f.ss,
+        fs_base: 0,
+    }
+}
+
+/// Write a canonical [`TrapFrame`](crate::arch::current::trap_frame::TrapFrame)
+/// back into a `#PF` [`ExceptionFrame`] before the stub's `iretq`.
+///
+/// The `vector` / `error_code` fields are not restored — the stub drops them
+/// (`add rsp, 16`) before `iretq`. `fs_base` is not propagated (see
+/// [`exception_to_trap_frame`]).
+///
+/// # Safety
+/// `frame` must point at a valid, writable `ExceptionFrame`.
+#[cfg(not(test))]
+unsafe fn trap_frame_to_exception(
+    t: &crate::arch::current::trap_frame::TrapFrame,
+    frame: *mut ExceptionFrame,
+)
+{
+    // SAFETY: frame validated by caller.
+    let f = unsafe { &mut *frame };
+    f.rax = t.rax;
+    f.rbx = t.rbx;
+    f.rcx = t.rcx;
+    f.rdx = t.rdx;
+    f.rsi = t.rsi;
+    f.rdi = t.rdi;
+    f.rbp = t.rbp;
+    f.r8 = t.r8;
+    f.r9 = t.r9;
+    f.r10 = t.r10;
+    f.r11 = t.r11;
+    f.r12 = t.r12;
+    f.r13 = t.r13;
+    f.r14 = t.r14;
+    f.r15 = t.r15;
+    f.rip = t.rip;
+    f.rflags = t.rflags;
+    f.rsp = t.rsp;
+    f.cs = t.cs;
+    f.ss = t.ss;
 }
 
 /// TLB shootdown IPI handler stub (vector 250).

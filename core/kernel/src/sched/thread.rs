@@ -125,6 +125,16 @@ pub enum IpcThreadState
     BlockedOnRecv,
     /// Blocked waiting for a `reply` after a `call`.
     BlockedOnReply,
+    /// Suspended awaiting a fault-handler reply after a kernel-unresolvable
+    /// fault was delivered to the thread's bound fault-handler endpoint.
+    ///
+    /// Distinct from [`Self::BlockedOnReply`] because resume semantics differ:
+    /// a fault-blocked thread resumes by re-executing its faulting instruction
+    /// (or continuing from a handler-modified PC), not by returning a syscall
+    /// value, and cancellation kills it rather than returning `Interrupted`.
+    /// The disposition is carried in `ThreadControlBlock::fault_outcome`. See
+    /// `docs/fault-handling.md`.
+    BlockedOnFault,
     /// Blocked waiting for a notification bitmask to become non-zero.
     BlockedOnNotification,
     /// Blocked waiting for an event queue to receive an entry.
@@ -219,6 +229,45 @@ pub struct ThreadControlBlock
 
     /// Intrusive IPC wait-queue link.
     pub ipc_wait_next: Option<*mut ThreadControlBlock>,
+
+    // === Fault-handler binding ===
+    /// Bound fault-handler endpoint object (`null` = none). Kernel-unresolvable
+    /// faults on this thread are delivered to this endpoint's receiver; with no
+    /// handler bound the fault is terminal. Stored as the `EndpointObject`
+    /// (not the bare `EndpointState`) so the binding can hold an `inc_ref` on
+    /// the object for its lifetime — closing the liveness gap where a
+    /// fault-blocked thread (queued on neither the endpoint's send nor receive
+    /// queue) could be stranded by the endpoint being freed. See
+    /// `docs/fault-handling.md` § Liveness.
+    ///
+    /// `AtomicPtr` because the binder (`SYS_THREAD_SET_FAULT_HANDLER`, holding
+    /// the thread's `CONTROL` cap) runs on a different thread than the target,
+    /// which loads this field lock-free when it faults. The binder swaps the
+    /// pointer (releasing the previous object's ref); the faulter loads it.
+    pub fault_handler: core::sync::atomic::AtomicPtr<crate::cap::object::EndpointObject>,
+
+    /// Caller-chosen identity delivered as the fault message badge, identifying
+    /// this thread (or its process) to the handler. Opaque to the kernel;
+    /// mirrors the death-observer correlator. `AtomicU64` for the same
+    /// cross-thread binder/faulter access as [`Self::fault_handler`].
+    pub fault_badge: core::sync::atomic::AtomicU64,
+
+    /// Disposition of an in-flight fault delivery, read by the fault helper
+    /// when the thread resumes from `BlockedOnFault`. One of
+    /// [`crate::ipc::fault::FAULT_OUTCOME_PENDING`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_RESUME`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`]. Set to `RESUME`/`KILL` by the
+    /// single wake-claim winner (genuine reply, handler death, cancellation),
+    /// so resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
+    pub fault_outcome: core::sync::atomic::AtomicU8,
+
+    /// True while this thread is delivering / blocked on a fault. Set before
+    /// the fault is delivered to the handler endpoint and cleared when the
+    /// thread resumes. Read by `endpoint_recv` to transition a dequeued
+    /// fault sender to `BlockedOnFault` (rather than `BlockedOnReply`) and by
+    /// the cancellation paths to mark the [`fault_outcome`](Self::fault_outcome)
+    /// as `KILL`.
+    pub in_fault_delivery: bool,
 
     // === Context ===
     /// Whether this thread executes in user mode (ring 3 / U-mode).

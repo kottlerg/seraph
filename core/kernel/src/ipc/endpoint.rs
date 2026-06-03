@@ -140,8 +140,16 @@ unsafe fn dequeue(
 /// Attempt an IPC call on `ep` from `caller` with `msg`.
 ///
 /// Returns `Ok(woken_server)` if a receiver was waiting and was woken (caller
-/// is now blocked on reply). Returns `Err(())` if no receiver was available
-/// (caller is now blocked on the send queue).
+/// is now blocked awaiting reply). Returns `Err(())` if no receiver was
+/// available (caller is now blocked on the send queue).
+///
+/// `parked_state` is the blocked state the caller commits when a receiver was
+/// waiting: [`IpcThreadState::BlockedOnReply`] for a normal `SYS_IPC_CALL`, or
+/// [`IpcThreadState::BlockedOnFault`] for kernel-synthesized fault delivery
+/// (see [`crate::ipc::fault`]). On the send-queue path the caller commits
+/// `BlockedOnSend` regardless; the fault discriminator carried on the caller's
+/// `in_fault_delivery` flag tells a later [`endpoint_recv`] which awaiting-reply
+/// state to transition it to.
 ///
 /// # Safety
 /// Must be called with the scheduler lock held.
@@ -150,6 +158,7 @@ pub unsafe fn endpoint_call(
     ep: *mut EndpointState,
     caller: *mut ThreadControlBlock,
     msg: &Message,
+    parked_state: IpcThreadState,
 ) -> Result<*mut ThreadControlBlock, ()>
 {
     // SAFETY: ep validated by caller.
@@ -215,11 +224,7 @@ pub unsafe fn endpoint_call(
         }
         // SAFETY: caller validated; held ep.lock excludes recv-queue writes.
         let committed = unsafe {
-            crate::sched::commit_blocked_under_local_lock(
-                caller,
-                IpcThreadState::BlockedOnReply,
-                server.cast::<u8>(),
-            )
+            crate::sched::commit_blocked_under_local_lock(caller, parked_state, server.cast::<u8>())
         };
         if !committed
         {
@@ -340,9 +345,21 @@ pub unsafe fn endpoint_recv(
                 .reply_tcb
                 .store(caller, core::sync::atomic::Ordering::Release);
         }
+        // A fault sender (kernel-synthesized delivery) parks as BlockedOnFault
+        // so its resume re-executes the faulting instruction and its
+        // cancellation kills it; a normal call sender parks as BlockedOnReply.
+        // SAFETY: caller dequeued from send_head; in_fault_delivery always valid.
+        let parked = if unsafe { (*caller).in_fault_delivery }
+        {
+            IpcThreadState::BlockedOnFault
+        }
+        else
+        {
+            IpcThreadState::BlockedOnReply
+        };
         // SAFETY: caller dequeued from send_head.
         unsafe {
-            (*caller).ipc_state = IpcThreadState::BlockedOnReply;
+            (*caller).ipc_state = parked;
             (*caller).blocked_on_object = server.cast::<u8>();
         }
         // SAFETY: paired with lock_raw above.

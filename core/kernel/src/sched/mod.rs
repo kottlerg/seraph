@@ -746,6 +746,47 @@ pub fn sleep_check_wakeups()
                 we_win
             }
 
+            crate::sched::thread::IpcThreadState::BlockedOnFault if !blocked_on.is_null() =>
+            {
+                // Defensive: fault delivery never arms the sleep list, so this
+                // arm is currently unreachable. It forecloses the same hazard the
+                // BlockedOnReply arm documents — were a fault-timeout surface ever
+                // added, the `_` fall-through would treat a BlockedOnFault waiter
+                // as a plain sleep and claim it unconditionally, racing a
+                // concurrent reply/cancel into a double-wake. `blocked_on` is the
+                // handler (server) TCB; CAS its reply_tcb the same way every other
+                // reply-side writer does; on win, a timeout is a cancellation, so
+                // mark the disposition Kill.
+                // cast_ptr_alignment suppressed as in the notification arm above.
+                #[allow(clippy::cast_ptr_alignment)]
+                let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
+                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
+                let we_win = unsafe {
+                    (*server)
+                        .reply_tcb
+                        .compare_exchange(
+                            tcb,
+                            core::ptr::null_mut(),
+                            core::sync::atomic::Ordering::AcqRel,
+                            core::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                };
+                if we_win
+                {
+                    // SAFETY: tcb still valid; fault_outcome / sleep_deadline
+                    // always valid. State committed by enqueue_and_wake.
+                    unsafe {
+                        (*tcb).fault_outcome.store(
+                            crate::ipc::fault::FAULT_OUTCOME_KILL,
+                            core::sync::atomic::Ordering::Release,
+                        );
+                        (*tcb).sleep_deadline = 0;
+                    }
+                }
+                we_win
+            }
+
             _ =>
             {
                 // Plain sleep — we are the only waker.
@@ -916,6 +957,10 @@ pub fn init(cpu_count: u32) -> u32
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     ipc_wait_next: None,
+                    fault_handler: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                    fault_badge: core::sync::atomic::AtomicU64::new(0),
+                    fault_outcome: core::sync::atomic::AtomicU8::new(0),
+                    in_fault_delivery: false,
                     is_user: false,
                     saved_state: saved,
                     kernel_stack_top: stack_top,

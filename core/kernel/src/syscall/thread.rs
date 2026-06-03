@@ -385,6 +385,21 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                     (*ep).lock.unlock_raw(saved);
                 }
             }
+            // A fault sender (queued for delivery) cancelled mid-fault must kill,
+            // not resume, when next scheduled: its resume runs the fault helper,
+            // which has no syscall to return `Interrupted` to. No reply can be
+            // in flight for a send-queued faulter, so the marker is unconditional.
+            // SAFETY: tcb valid; fault_outcome / in_fault_delivery always valid.
+            if unsafe { (*tcb).in_fault_delivery }
+            {
+                // SAFETY: tcb valid.
+                unsafe {
+                    (*tcb).fault_outcome.store(
+                        crate::ipc::fault::FAULT_OUTCOME_KILL,
+                        core::sync::atomic::Ordering::Release,
+                    );
+                }
+            }
         }
 
         IpcThreadState::BlockedOnRecv =>
@@ -430,6 +445,45 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
                     // never fire (#160).
                     if cancelled
                     {
+                        (*tcb)
+                            .wake_in_flight
+                            .store(0, core::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        IpcThreadState::BlockedOnFault =>
+        {
+            // Mirror BlockedOnReply: `blocked_on` is the handler (server) TCB,
+            // whose `reply_tcb` points at this faulter. CAS-clear it so a later
+            // handler reply cannot double-wake. On a successful cancel, mark the
+            // disposition Kill (the fault helper terminates the thread on
+            // resume) and release the wake-in-flight claim. If the CAS loses, a
+            // genuine reply already won and committed its own disposition — leave
+            // it untouched.
+            if !blocked_on.is_null()
+            {
+                // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
+                #[allow(clippy::cast_ptr_alignment)]
+                let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
+                // SAFETY: server is a valid TCB pointer; reply_tcb is AtomicPtr.
+                unsafe {
+                    let cancelled = (*server)
+                        .reply_tcb
+                        .compare_exchange(
+                            tcb,
+                            core::ptr::null_mut(),
+                            core::sync::atomic::Ordering::AcqRel,
+                            core::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok();
+                    if cancelled
+                    {
+                        (*tcb).fault_outcome.store(
+                            crate::ipc::fault::FAULT_OUTCOME_KILL,
+                            core::sync::atomic::Ordering::Release,
+                        );
                         (*tcb)
                             .wake_in_flight
                             .store(0, core::sync::atomic::Ordering::Release);
@@ -535,6 +589,123 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
             (*trap_frame).set_return(SyscallError::Interrupted as i64);
         }
     }
+}
+
+/// `SYS_THREAD_SET_FAULT_HANDLER` (32): bind or clear a thread's fault-handler
+/// endpoint.
+///
+/// arg0 = Thread cap index (must have CONTROL) — the thread whose handler is set.
+/// arg1 = Endpoint cap index, or `0` to **unbind**.
+/// arg2 = `badge` delivered in the fault message identifying the faulting thread.
+/// arg3 = `fault_class_mask`; v1 accepts only [`syscall::FAULT_CLASS_ALL`].
+///
+/// Binding takes a reference on the endpoint object for the binding's lifetime
+/// (see `docs/fault-handling.md` § Liveness); rebinding / unbinding / thread
+/// destruction releases it. Binding requires only a valid `Endpoint` cap —
+/// `CONTROL` on the thread is the authority; the endpoint cap merely names where
+/// this thread's kernel-unresolvable faults are delivered.
+///
+/// Returns 0 on success.
+#[cfg(not(test))]
+pub fn sys_thread_set_fault_handler(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::object::{EndpointObject, KernelObjectHeader, ThreadObject};
+    use crate::cap::slot::{CapTag, Rights};
+    use crate::syscall::current_tcb;
+    use core::sync::atomic::Ordering;
+
+    let thread_idx = tf.arg(0) as u32;
+    let endpoint_idx = tf.arg(1) as u32;
+    let badge = tf.arg(2);
+    let fault_class_mask = tf.arg(3);
+
+    // v1 supports only the all-classes mask; the argument reserves the encoding
+    // for future per-class handlers without a new syscall.
+    if fault_class_mask != syscall::FAULT_CLASS_ALL
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // SAFETY: current_tcb() returns current thread; valid in syscall context.
+    let caller_tcb = unsafe { current_tcb() };
+    if caller_tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: caller_tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*caller_tcb).cspace };
+
+    // SAFETY: caller_cspace validated; CONTROL required to mutate the target.
+    let thread_slot =
+        unsafe { super::lookup_cap(caller_cspace, thread_idx, CapTag::Thread, Rights::CONTROL) }?;
+    let target_tcb = {
+        let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
+        // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
+        #[allow(clippy::cast_ptr_alignment)]
+        let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
+        to.tcb
+    };
+    if target_tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    // Resolve the new handler object (index 0 = unbind).
+    let new_ep: *mut EndpointObject = if endpoint_idx == 0
+    {
+        core::ptr::null_mut()
+    }
+    else
+    {
+        // SAFETY: caller_cspace validated; no specific endpoint right required.
+        let ep_slot = unsafe {
+            super::lookup_cap(caller_cspace, endpoint_idx, CapTag::Endpoint, Rights::NONE)
+        }?;
+        let obj = ep_slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // cast_ptr_alignment: header at offset 0 of EndpointObject; allocator guarantees alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        let p = obj.as_ptr().cast::<EndpointObject>();
+        p
+    };
+
+    // Take the new binding's reference before publishing it, so the object
+    // cannot be freed between publish and a faulter's load.
+    if !new_ep.is_null()
+    {
+        // SAFETY: new_ep is a live EndpointObject (its cap slot holds a ref).
+        unsafe { (*new_ep).header.inc_ref() };
+    }
+
+    // Publish the badge first, then atomically swap the handler pointer, so a
+    // faulter that observes the new handler also observes the matching badge.
+    // SAFETY: target_tcb is kept alive by the caller's Thread cap reference;
+    // both fields are atomics safe to write cross-thread.
+    let old_ep = unsafe {
+        (*target_tcb).fault_badge.store(badge, Ordering::Release);
+        (*target_tcb).fault_handler.swap(new_ep, Ordering::AcqRel)
+    };
+
+    // Release the previous binding's reference, freeing the object if this was
+    // its last reference (mirrors cap_delete's dec-ref-then-dealloc, outside any
+    // lock since dealloc_object may take inner locks). Rebinding to the same
+    // endpoint nets to a no-op (the inc above balances this dec).
+    if !old_ep.is_null()
+    {
+        // SAFETY: old_ep was a live EndpointObject referenced by this binding.
+        let remaining = unsafe { (*old_ep).header.dec_ref() };
+        if remaining == 0
+        {
+            // SAFETY: refcount reached 0; old_ep header is at offset 0.
+            unsafe {
+                crate::cap::object::dealloc_object(core::ptr::NonNull::new_unchecked(
+                    old_ep.cast::<KernelObjectHeader>(),
+                ));
+            }
+        }
+    }
+
+    Ok(0)
 }
 
 /// `SYS_THREAD_SET_PRIORITY` (37): change a thread's scheduling priority.
@@ -999,7 +1170,15 @@ pub fn sys_thread_read_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: target_tcb validated non-null; state/trap_frame fields always valid.
     unsafe {
-        if (*target_tcb).state != ThreadState::Stopped
+        // A fault-blocked thread (Blocked + BlockedOnFault) exposes its faulting
+        // register frame through `trap_frame` for the bound handler to read and
+        // modify before replying, so the fault-handler protocol permits register
+        // access in that state too — not only `Stopped`. See
+        // `docs/fault-handling.md` § Modifying the faulting thread.
+        let st = (*target_tcb).state;
+        let fault_blocked = st == ThreadState::Blocked
+            && (*target_tcb).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault;
+        if st != ThreadState::Stopped && !fault_blocked
         {
             return Err(SyscallError::InvalidState);
         }
@@ -1080,7 +1259,15 @@ pub fn sys_thread_write_regs(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     // SAFETY: target_tcb is valid.
     unsafe {
-        if (*target_tcb).state != ThreadState::Stopped
+        // A fault-blocked thread (Blocked + BlockedOnFault) exposes its faulting
+        // register frame through `trap_frame` for the bound handler to read and
+        // modify before replying, so the fault-handler protocol permits register
+        // access in that state too — not only `Stopped`. See
+        // `docs/fault-handling.md` § Modifying the faulting thread.
+        let st = (*target_tcb).state;
+        let fault_blocked = st == ThreadState::Blocked
+            && (*target_tcb).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault;
+        if st != ThreadState::Stopped && !fault_blocked
         {
             return Err(SyscallError::InvalidState);
         }

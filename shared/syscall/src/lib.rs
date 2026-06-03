@@ -48,9 +48,10 @@ use syscall_abi::{
     SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
     SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
     SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP,
-    SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
+    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT,
 };
 
 pub use syscall_abi::{
@@ -1867,6 +1868,41 @@ pub fn thread_set_affinity(thread_cap: u32, cpu_id: u32) -> Result<(), i64>
             SYS_THREAD_SET_AFFINITY,
             u64::from(thread_cap),
             u64::from(cpu_id),
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Bind (or clear) a thread's per-thread fault-handler endpoint.
+///
+/// `endpoint_cap` is the `Endpoint` whose receiver services this thread's
+/// kernel-unresolvable faults, or `0` to unbind. `badge` is delivered as the
+/// fault message badge to identify the faulting thread. `fault_class_mask`
+/// selects the covered fault classes; pass [`syscall_abi::FAULT_CLASS_ALL`].
+///
+/// Requires `CONTROL` on `thread_cap`. See `docs/fault-handling.md`.
+///
+/// # Errors
+/// Returns a negative `i64` error code if the thread cap lacks `CONTROL`,
+/// `endpoint_cap` is non-zero but not an `Endpoint`, or `fault_class_mask`
+/// is unsupported.
+#[inline]
+pub fn thread_set_fault_handler(
+    thread_cap: u32,
+    endpoint_cap: u32,
+    badge: u64,
+    fault_class_mask: u64,
+) -> Result<(), i64>
+{
+    // SAFETY: syscall4 issues a raw syscall; all arguments are scalar values.
+    // The kernel validates the caps and rebinds (or clears) the handler.
+    let ret = unsafe {
+        syscall4(
+            SYS_THREAD_SET_FAULT_HANDLER,
+            u64::from(thread_cap),
+            u64::from(endpoint_cap),
+            badge,
+            fault_class_mask,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(()) }

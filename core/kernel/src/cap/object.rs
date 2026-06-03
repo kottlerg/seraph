@@ -1368,13 +1368,30 @@ unsafe fn dealloc_object_one(
                             )
                             .is_ok()
                         {
+                            // Distinguish a fault-blocked client (handler death
+                            // cancels its in-flight fault → Kill on resume in the
+                            // fault helper) from a syscall caller (returns
+                            // Interrupted). Read the state before clearing it.
+                            let was_fault = (*bound).ipc_state
+                                == crate::sched::thread::IpcThreadState::BlockedOnFault;
                             (*bound).blocked_on_object = core::ptr::null_mut();
                             (*bound).ipc_state = crate::sched::thread::IpcThreadState::None;
                             (*bound).state = ThreadState::Ready;
-                            let trap_frame = (*bound).trap_frame;
-                            if !trap_frame.is_null()
+                            if was_fault
                             {
-                                (*trap_frame).set_return(syscall::SyscallError::Interrupted as i64);
+                                (*bound).fault_outcome.store(
+                                    crate::ipc::fault::FAULT_OUTCOME_KILL,
+                                    Ordering::Release,
+                                );
+                            }
+                            else
+                            {
+                                let trap_frame = (*bound).trap_frame;
+                                if !trap_frame.is_null()
+                                {
+                                    (*trap_frame)
+                                        .set_return(syscall::SyscallError::Interrupted as i64);
+                                }
                             }
                             let bcpu = crate::sched::select_target_cpu(bound);
                             Some((bound, bcpu))
@@ -1596,10 +1613,60 @@ unsafe fn dealloc_object_one(
                                     (*tcb).wake_in_flight.store(0, Ordering::Release);
                                 }
                             }
+                            IpcThreadState::BlockedOnFault =>
+                            {
+                                // A dying fault-blocked thread: `blocked_obj` is
+                                // its handler (server) TCB. CAS-clear the
+                                // handler's reply slot so a later reply does not
+                                // target this freed faulter. Mirrors
+                                // BlockedOnReply; the faulter never resumes, so no
+                                // disposition is recorded.
+                                use core::sync::atomic::Ordering;
+                                let server =
+                                    blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
+                                let cancelled = (*server)
+                                    .reply_tcb
+                                    .compare_exchange(
+                                        tcb,
+                                        core::ptr::null_mut(),
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok();
+                                if cancelled
+                                {
+                                    (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                }
+                            }
                             IpcThreadState::None =>
                             {}
                         }
                         (*tcb).blocked_on_object = core::ptr::null_mut();
+                    }
+                }
+
+                // Release this thread's fault-handler binding, if any. The
+                // binding held an inc_ref on the endpoint object for its lifetime
+                // (see ThreadControlBlock::fault_handler); drop it, freeing the
+                // endpoint if this was its last reference. Done after the unlink
+                // above (which removed this thread from the endpoint's send queue
+                // if it was a queued faulter) so the endpoint dealloc cannot
+                // observe this thread still on its queue.
+                // SAFETY: tcb valid (not yet freed); fault_handler is atomic; the
+                // dec-ref-then-dealloc mirrors cap_delete and holds no lock here.
+                unsafe {
+                    let ep = (*tcb)
+                        .fault_handler
+                        .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+                    if !ep.is_null()
+                    {
+                        let remaining = (*ep).header.dec_ref();
+                        if remaining == 0
+                        {
+                            dealloc_object(core::ptr::NonNull::new_unchecked(
+                                ep.cast::<KernelObjectHeader>(),
+                            ));
+                        }
                     }
                 }
 
@@ -2001,6 +2068,18 @@ unsafe fn dealloc_object_one(
                     {
                         let next = (*tcb).ipc_wait_next;
                         (*tcb).ipc_wait_next = None;
+                        // A queued fault sender (its handler never received) must
+                        // kill, not resume, when woken: its resume runs the fault
+                        // helper, which reads this disposition. Covers the
+                        // unbind-drops-last-ref liveness case (fault-handling.md
+                        // § Liveness rule 3).
+                        if (*tcb).in_fault_delivery
+                        {
+                            (*tcb).fault_outcome.store(
+                                crate::ipc::fault::FAULT_OUTCOME_KILL,
+                                core::sync::atomic::Ordering::Release,
+                            );
+                        }
                         let target_cpu = crate::sched::select_target_cpu(tcb);
                         crate::sched::enqueue_and_wake(tcb, target_cpu);
                         tcb = next.unwrap_or(core::ptr::null_mut());

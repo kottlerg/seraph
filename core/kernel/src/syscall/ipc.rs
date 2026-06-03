@@ -391,7 +391,14 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     // SAFETY: ep_state is valid; scheduler lock not held.
-    let result = unsafe { crate::ipc::endpoint::endpoint_call(ep_state, tcb, &msg) };
+    let result = unsafe {
+        crate::ipc::endpoint::endpoint_call(
+            ep_state,
+            tcb,
+            &msg,
+            crate::sched::thread::IpcThreadState::BlockedOnReply,
+        )
+    };
 
     if let Ok(woken_server) = result
     {
@@ -659,6 +666,10 @@ unsafe fn fail_reply_and_wake_caller(
 /// Capabilities are moved from the server's `CSpace` to the caller's `CSpace`
 /// atomically with the reply. No GRANT right check: the server is trusted
 /// by virtue of holding RECEIVE on the endpoint.
+// too_many_lines: a single logical operation (validate + cap pre-alloc + reply
+// dispatch, with a fault-reply fast path); splitting would obscure the
+// all-or-nothing reply atomicity.
+#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
@@ -768,6 +779,42 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     {
         Some(caller) =>
         {
+            // Fault reply: the caller is a thread the kernel parked
+            // BlockedOnFault by fault redirection, not a SYS_IPC_CALL caller.
+            // The kernel ignores the reply payload and caps; the reply label
+            // conveys the disposition (RESUME default, KILL declines). Record it
+            // for the fault helper and wake the faulter, which resumes by
+            // re-executing its faulting instruction (or continuing from a
+            // handler-modified PC) rather than returning a syscall value. We won
+            // the reply_tcb CAS inside endpoint_reply, so no canceller will also
+            // wake this faulter — recording the outcome here is race-free.
+            // SAFETY: caller returned by endpoint_reply; valid TCB. ipc_state is
+            // still BlockedOnFault until enqueue_and_wake clears it.
+            if unsafe { (*caller).ipc_state }
+                == crate::sched::thread::IpcThreadState::BlockedOnFault
+            {
+                let outcome = if label == syscall::FAULT_REPLY_KILL
+                {
+                    crate::ipc::fault::FAULT_OUTCOME_KILL
+                }
+                else
+                {
+                    crate::ipc::fault::FAULT_OUTCOME_RESUME
+                };
+                // SAFETY: caller valid; transitions to Ready under sched.lock in
+                // enqueue_and_wake.
+                unsafe {
+                    (*caller)
+                        .fault_outcome
+                        .store(outcome, core::sync::atomic::Ordering::Release);
+                    debug_assert!((*caller).magic == crate::sched::thread::TCB_MAGIC);
+                    let target_cpu = crate::sched::select_target_cpu(caller);
+                    debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+                    crate::sched::enqueue_and_wake(caller, target_cpu);
+                }
+                return Ok(0);
+            }
+
             // Transfer caps from server to caller (if any).
             // Cap result indices are stored in the caller's ipc_msg so that
             // sys_ipc_call can write them to the caller's IPC buffer when the

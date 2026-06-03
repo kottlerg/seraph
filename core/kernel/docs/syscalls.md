@@ -983,8 +983,10 @@ merely names where the thread's faults are delivered. The kernel synthesizes fau
 delivery via the binding and distributes no send capability to the endpoint, so a
 fault message bearing `FAULT_LABEL` cannot be forged.
 
-Only page faults (`FAULT_KIND_VM`) are routed in the current implementation; see
-the fault-handling design doc's implementation-status note.
+Both page faults (`FAULT_KIND_VM`) and other kernel-unresolvable ring-3 exceptions
+(`FAULT_KIND_EXCEPTION`) are routed to the bound handler; the handler dispatches on
+the fault kind and replies `FAULT_REPLY_KILL` for kinds it does not handle. See the
+fault-handling design doc's implementation-status note.
 
 **Capability requirement:** `thread_cap` MUST have Control rights; `endpoint_cap`
 (when non-zero) MUST refer to an `Endpoint`.

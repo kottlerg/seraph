@@ -36,19 +36,17 @@ checks) is owned by the [memory model](memory-model.md) and the
 
 ## Implementation Status
 
-The **page-fault** path of this protocol is implemented on both x86-64 and RISC-V:
-`SYS_THREAD_SET_FAULT_HANDLER`, the per-thread fault-handler binding, the
-[fault message](#fault-message) for `FAULT_KIND_VM`, and the
-[resume and kill](#delivery-resume-and-kill) state machine — including register inspection
-and modification of a fault-blocked thread via
+The fault-redirection mechanism is implemented on both x86-64 and RISC-V for **both**
+fault kinds: `SYS_THREAD_SET_FAULT_HANDLER`, the per-thread fault-handler binding, the
+[fault message](#fault-message) for `FAULT_KIND_VM` (page faults) and `FAULT_KIND_EXCEPTION`
+(every other kernel-unresolvable ring-3 exception — illegal instruction, breakpoint,
+alignment, divide, …), and the [resume and kill](#delivery-resume-and-kill) state machine —
+including register inspection and modification of a fault-blocked thread via
 [`SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS`](capability-model.md#thread). A thread with
 no handler bound is still terminated, the behavior for all faults absent this mechanism.
 
 Not yet implemented (this section is narrowed as each part lands):
 
-- **Non-VM fault kinds.** Only page faults (`FAULT_KIND_VM`) are routed; other CPU
-  exceptions (`FAULT_KIND_EXCEPTION`) still terminate the thread. The taxonomy and message
-  reserve the encoding.
 - **The demand-paging consumer.** The `ProcessInfo` pager field referenced under
   [Demand Paging](#demand-paging-and-the-default-system-pager) and the demand-paged-memory
   consumer are not present yet.
@@ -144,8 +142,13 @@ thread's behalf. Its format is a stable cross-boundary contract.
 - **Data words 1–3** — kind-specific:
   - `FAULT_KIND_VM`: faulting virtual address; access flags (bit 0 read, bit 1 write,
     bit 2 instruction fetch, bit 3 present-vs-not-present); faulting instruction pointer.
-  - `FAULT_KIND_EXCEPTION`: normalized exception code; architecture auxiliary/error code;
-    faulting instruction pointer.
+  - `FAULT_KIND_EXCEPTION`: a **normalized exception code** (an architecture-neutral class —
+    illegal instruction, breakpoint, alignment, divide, protection, … — so a handler
+    dispatches without architecture knowledge; an unrecognized code is treated as the
+    unknown class); the **architecture auxiliary code** (x86-64 the hardware error code,
+    `0` where the vector has none; RISC-V `stval`); the faulting instruction pointer. The
+    kernel maps each architecture's raw vector/cause to a normalized class
+    (`arch/x86_64/idt.rs`, `arch/riscv64/interrupts.rs`).
 
 The faulting thread's full register state is not embedded; a handler that needs it reads
 it with [`SYS_THREAD_READ_REGS`](capability-model.md#thread) on the faulting thread.

@@ -35,11 +35,15 @@
 //! - `fault_pager_roundtrip.rs`  — a bound userspace pager maps a frame on fault and resumes the thread
 //! - `fault_resume_modifies_pc.rs` — a handler reads/edits the fault-blocked thread's registers and resumes it at a new PC
 //! - `fault_handler_declines_kills.rs` — a handler that replies KILL terminates the faulting thread
+//! - `fault_exception_redirect.rs` — a non-page-fault CPU exception is redirected to a handler that resumes the thread at a new PC
+//! - `fault_exception_no_handler_kills.rs` — a non-page-fault CPU exception with no handler bound terminates the thread
 //! - `tlb_widen_retry.rs`        — a permission-widen elides its shootdown; a remote stale-TLB write still completes via spurious-fault retry
 
 pub mod cap_delegation_chain;
 pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
+pub mod fault_exception_no_handler_kills;
+pub mod fault_exception_redirect;
 pub mod fault_handler_declines_kills;
 pub mod fault_kills_thread;
 pub mod fault_pager_roundtrip;
@@ -116,6 +120,14 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fault_handler_declines_kills",
         fault_handler_declines_kills::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_exception_redirect",
+        fault_exception_redirect::run(ctx)
+    );
+    run_integration_test!(
+        "integration::fault_exception_no_handler_kills",
+        fault_exception_no_handler_kills::run(ctx)
     );
     run_integration_test!("integration::tlb_widen_retry", tlb_widen_retry::run(ctx));
 }

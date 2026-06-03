@@ -689,86 +689,106 @@ pub fn sys_ipc_reply(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    let mut msg = Message::new(label);
-    msg.data_count = data_count;
-    if data_count > 0
-    {
-        // SAFETY: tcb validated above; ipc_buffer is user-mapped or 0.
-        let buf = unsafe { (*tcb).ipc_buffer };
-        // SAFETY: buf validated by read_ipc_buf.
-        if let Err(e) = unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }
-        {
-            // SAFETY: tcb validated above.
-            return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
-        }
-    }
+    // Peek whether the pending caller is fault-blocked. A fault reply's data
+    // words and caps are ignored by the kernel — the reply label alone carries
+    // the disposition (RESUME/KILL) — so they MUST NOT be validated here. The
+    // normal path below diverts a payload/cap error to a synthetic
+    // `IPC_REPLY_TRANSFER_FAILED` wake via `fail_reply_and_wake_caller`, which
+    // records no `fault_outcome`; for a faulter that wake would be read as
+    // `Pending` and silently kill it. Skipping payload/cap processing for a
+    // fault reply also avoids needlessly growing the faulter's CSpace. The
+    // BlockedOnFault re-check in the `Some(caller)` arm below is the
+    // authoritative dispatch; this peek only gates the skip.
+    // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
+    let fault_reply = unsafe {
+        let c = (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire);
+        !c.is_null() && (*c).ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault
+    };
 
-    // Populate cap_slots (indices in server's CSpace). Pre-validate before reply.
-    if cap_count > 0
+    let mut msg = Message::new(label);
+    if !fault_reply
     {
-        // SAFETY: tcb validated above.
-        let server_cspace = unsafe { (*tcb).cspace };
-        let indices = unpack_cap_slots(cap_packed, cap_count);
+        msg.data_count = data_count;
+        if data_count > 0
         {
-            // SAFETY: server_cspace extracted from validated TCB.
-            let cs = unsafe { &*server_cspace };
-            for &idx in indices.iter().take(cap_count)
+            // SAFETY: tcb validated above; ipc_buffer is user-mapped or 0.
+            let buf = unsafe { (*tcb).ipc_buffer };
+            // SAFETY: buf validated by read_ipc_buf.
+            if let Err(e) = unsafe { read_ipc_buf(buf, data_count, &mut msg.data) }
             {
-                let Some(slot) = cs.slot(idx)
-                else
-                {
-                    // SAFETY: tcb validated above.
-                    return Err(unsafe {
-                        fail_reply_and_wake_caller(tcb, SyscallError::InvalidCapability)
-                    });
-                };
-                if slot.tag == CapTag::Null
-                {
-                    // SAFETY: tcb validated above.
-                    return Err(unsafe {
-                        fail_reply_and_wake_caller(tcb, SyscallError::InvalidCapability)
-                    });
-                }
+                // SAFETY: tcb validated above.
+                return Err(unsafe { fail_reply_and_wake_caller(tcb, e) });
             }
         }
-        msg.cap_slots = indices;
-        msg.cap_count = cap_count;
 
-        // Pre-allocate caller's CSpace destination slots before transitioning
-        // its state. `endpoint_reply` atomically moves the caller from
-        // BlockedOnReply to Ready and clears (*server).reply_tcb; if cap
-        // transfer were to fail after that, the caller would be Ready but
-        // never enqueued and unreachable by cancel_ipc_block. Pre-allocating
-        // here guarantees the post-`endpoint_reply` cap move cannot OOM.
-        // The inner pre_allocate inside `transfer_caps` remains as
-        // defense-in-depth against concurrent CSpace mutation in the
-        // unlocked window before its dst-CSpace lock acquisition.
-        // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
-        let caller_peek = unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
-        if caller_peek.is_null()
+        // Populate cap_slots (indices in server's CSpace). Pre-validate before reply.
+        if cap_count > 0
         {
-            // No parked caller (cancelled by SYS_THREAD_STOP); nothing to wake.
-            return Err(SyscallError::InvalidCapability);
-        }
-        // SAFETY: caller_peek non-null; magic check guards UAF in debug builds.
-        debug_assert!(unsafe { (*caller_peek).magic } == crate::sched::thread::TCB_MAGIC);
-        // SAFETY: caller_peek is a valid TCB; cspace is set at TCB creation
-        // and never reassigned.
-        let caller_cspace = unsafe { (*caller_peek).cspace };
-        // SAFETY: caller_cspace extracted from valid TCB; lock_raw/unlock_raw paired.
-        let pre_res = unsafe {
-            let saved = (*caller_cspace).lock.lock_raw();
-            let r = (*caller_cspace).pre_allocate(cap_count);
-            (*caller_cspace).lock.unlock_raw(saved);
-            r
-        };
-        if pre_res.is_err()
-        {
-            // Caller's CSpace cannot accept reply caps. Wake the caller with
-            // a synthetic failure reply so it un-parks and surfaces the error
-            // rather than dead-locking; bubble OOM to the server.
             // SAFETY: tcb validated above.
-            return Err(unsafe { fail_reply_and_wake_caller(tcb, SyscallError::OutOfMemory) });
+            let server_cspace = unsafe { (*tcb).cspace };
+            let indices = unpack_cap_slots(cap_packed, cap_count);
+            {
+                // SAFETY: server_cspace extracted from validated TCB.
+                let cs = unsafe { &*server_cspace };
+                for &idx in indices.iter().take(cap_count)
+                {
+                    let Some(slot) = cs.slot(idx)
+                    else
+                    {
+                        // SAFETY: tcb validated above.
+                        return Err(unsafe {
+                            fail_reply_and_wake_caller(tcb, SyscallError::InvalidCapability)
+                        });
+                    };
+                    if slot.tag == CapTag::Null
+                    {
+                        // SAFETY: tcb validated above.
+                        return Err(unsafe {
+                            fail_reply_and_wake_caller(tcb, SyscallError::InvalidCapability)
+                        });
+                    }
+                }
+            }
+            msg.cap_slots = indices;
+            msg.cap_count = cap_count;
+
+            // Pre-allocate caller's CSpace destination slots before transitioning
+            // its state. `endpoint_reply` atomically moves the caller from
+            // BlockedOnReply to Ready and clears (*server).reply_tcb; if cap
+            // transfer were to fail after that, the caller would be Ready but
+            // never enqueued and unreachable by cancel_ipc_block. Pre-allocating
+            // here guarantees the post-`endpoint_reply` cap move cannot OOM.
+            // The inner pre_allocate inside `transfer_caps` remains as
+            // defense-in-depth against concurrent CSpace mutation in the
+            // unlocked window before its dst-CSpace lock acquisition.
+            // SAFETY: tcb validated above; reply_tcb field always valid in TCB.
+            let caller_peek =
+                unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
+            if caller_peek.is_null()
+            {
+                // No parked caller (cancelled by SYS_THREAD_STOP); nothing to wake.
+                return Err(SyscallError::InvalidCapability);
+            }
+            // SAFETY: caller_peek non-null; magic check guards UAF in debug builds.
+            debug_assert!(unsafe { (*caller_peek).magic } == crate::sched::thread::TCB_MAGIC);
+            // SAFETY: caller_peek is a valid TCB; cspace is set at TCB creation
+            // and never reassigned.
+            let caller_cspace = unsafe { (*caller_peek).cspace };
+            // SAFETY: caller_cspace extracted from valid TCB; lock_raw/unlock_raw paired.
+            let pre_res = unsafe {
+                let saved = (*caller_cspace).lock.lock_raw();
+                let r = (*caller_cspace).pre_allocate(cap_count);
+                (*caller_cspace).lock.unlock_raw(saved);
+                r
+            };
+            if pre_res.is_err()
+            {
+                // Caller's CSpace cannot accept reply caps. Wake the caller with
+                // a synthetic failure reply so it un-parks and surfaces the error
+                // rather than dead-locking; bubble OOM to the server.
+                // SAFETY: tcb validated above.
+                return Err(unsafe { fail_reply_and_wake_caller(tcb, SyscallError::OutOfMemory) });
+            }
         }
     }
 

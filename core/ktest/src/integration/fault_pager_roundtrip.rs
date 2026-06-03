@@ -99,9 +99,18 @@ pub fn run(ctx: &TestContext) -> TestResult
     mem_map(mem, ctx.aspace_cap, RESERVED_VA, 0, 1, MAP_WRITABLE)
         .map_err(|_| "fault_pager_roundtrip: mem_map failed")?;
 
+    // Reply RESUME, deliberately attaching a (null) cap slot. The kernel must
+    // ignore a fault reply's payload and caps — not validate-then-kill the
+    // faulter — so a stray cap here must NOT terminate the child. Regression
+    // guard for the fault-reply fast path. Slot 0 is the permanent null slot.
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-    unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ctx.ipc_buf) }
-        .map_err(|_| "fault_pager_roundtrip: ipc_reply(RESUME) failed")?;
+    unsafe {
+        ipc::ipc_reply(
+            &IpcMessage::builder(FAULT_REPLY_RESUME).cap(0).build(),
+            ctx.ipc_buf,
+        )
+    }
+    .map_err(|_| "fault_pager_roundtrip: ipc_reply(RESUME) failed")?;
 
     // The child re-executes the store, verifies it, and signals success.
     notification_wait(sig).map_err(|_| "fault_pager_roundtrip: notification_wait failed")?;

@@ -1647,26 +1647,26 @@ unsafe fn dealloc_object_one(
 
                 // Release this thread's fault-handler binding, if any. The
                 // binding held an inc_ref on the endpoint object for its lifetime
-                // (see ThreadControlBlock::fault_handler); drop it, freeing the
-                // endpoint if this was its last reference. Done after the unlink
-                // above (which removed this thread from the endpoint's send queue
-                // if it was a queued faulter) so the endpoint dealloc cannot
-                // observe this thread still on its queue.
-                // SAFETY: tcb valid (not yet freed); fault_handler is atomic; the
-                // dec-ref-then-dealloc mirrors cap_delete and holds no lock here.
+                // (see ThreadControlBlock::fault_handler); drop it, and if this
+                // was its last reference enqueue the orphaned endpoint on the
+                // cascade worklist (rather than recursing into `dealloc_object`,
+                // which this function's worklist mechanism exists to avoid). Done
+                // after the unlink above (which removed this thread from the
+                // endpoint's send queue if it was a queued faulter) so the
+                // endpoint dealloc cannot observe this thread still on its queue.
+                // SAFETY: tcb valid (not yet freed); fault_handler is atomic; no
+                // lock is held here.
                 unsafe {
                     let ep = (*tcb)
                         .fault_handler
                         .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
-                    if !ep.is_null()
+                    if !ep.is_null() && (*ep).header.dec_ref() == 0
                     {
-                        let remaining = (*ep).header.dec_ref();
-                        if remaining == 0
-                        {
-                            dealloc_object(core::ptr::NonNull::new_unchecked(
-                                ep.cast::<KernelObjectHeader>(),
-                            ));
-                        }
+                        push_ancestor(
+                            worklist,
+                            head,
+                            core::ptr::NonNull::new_unchecked(ep.cast::<KernelObjectHeader>()),
+                        );
                     }
                 }
 

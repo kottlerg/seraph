@@ -103,6 +103,20 @@ const MAX_REGIONS_PER_PROC: usize = 8;
 /// or more contiguous pages.
 const MAX_FREE_RUNS: usize = 512;
 
+/// Rights every pool frame MUST carry. A pool frame is general anonymous RAM:
+/// memmgr derives an R / RW / RX inner from it on demand (`cap_derive`, which
+/// only narrows), so the outer must hold WRITE (`1 << 1`) and EXECUTE
+/// (`1 << 2`) — the `cap::slot::Rights` bit positions mirrored by
+/// `RIGHTS_MAP_RW` / `RIGHTS_MAP_RX` — plus RETYPE so a consumer can still
+/// retype the frame. READ is omitted: the kernel grants read at every map
+/// (`sys_mem_map`) and the bulk usable-RAM caps are minted without it. Enforced
+/// at both pool entry points (`ingest_pool`, `handle_donate_memory_caps`) so a
+/// kernel mint-rights regression fails loudly instead of surfacing as an
+/// intermittent consumer fault.
+const POOL_FRAME_RIGHTS: u64 = ((syscall::RIGHTS_MAP_RW | syscall::RIGHTS_MAP_RX)
+    & !syscall::RIGHTS_MAP_READ)
+    | syscall::RIGHTS_RETYPE;
+
 /// One free run: a Memory cap memmgr owns, covering `page_count` pages
 /// starting at physical address `phys_base`.
 #[derive(Clone, Copy)]
@@ -1062,22 +1076,24 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 
 fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
-    // Caller (init or procmgr) is permanently transferring boot-module
-    // Memory caps into memmgr's pool after loading the ELF contents. Each
-    // donated cap must carry RETYPE so memmgr's downstream `cap_derive`
-    // calls produce caps that consumers can retype into kernel objects.
+    // Caller (init or procmgr) is permanently transferring reclaimed Memory
+    // caps (init's ELF segments, InitInfo, stack, boot-module ELF sources,
+    // reclaim scratch, AP trampoline) into memmgr's pool. Each donated cap
+    // must carry the full pool-frame rights ([`POOL_FRAME_RIGHTS`]) so memmgr
+    // can derive the R / RW / RX inner a demand fault or REQUEST_MEMORY_CAPS
+    // consumer needs and retype on their behalf.
     //
     // We trust the caller (single-tenant userspace; donation is gated by
     // possessing a memmgr SEND cap, which only init and procmgr hold) but
-    // still validate the cap shape via `cap_info` — a malformed cap from
-    // a buggy loader should reject, not poison the pool.
+    // still validate the cap shape via `cap_info` — a malformed or under-rights
+    // cap from a buggy loader should reject, not poison the pool.
     let pool = pool_mut();
     let mut accepted_caps: u32 = 0;
     let mut accepted_pages: u64 = 0;
     for &slot in req.caps()
     {
         // Required: Memory tag implied by MEMORY_SIZE selector returning Ok.
-        // Required: RETYPE rights so derived caps can retype.
+        // Required: full pool-frame rights (WRITE|EXECUTE|RETYPE).
         // Required: contiguous run (we read the whole cap as one run).
         let Ok(packed) = syscall::cap_info(slot, syscall::CAP_INFO_TAG_RIGHTS)
         else
@@ -1085,8 +1101,16 @@ fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
             let _ = syscall::cap_delete(slot);
             continue;
         };
-        if packed & syscall::RIGHTS_RETYPE == 0
+        if packed & POOL_FRAME_RIGHTS != POOL_FRAME_RIGHTS
         {
+            // Under-rights frame: cannot derive the R/RW/RX inner a demand
+            // fault or REQUEST_MEMORY_CAPS consumer needs (cap_derive only
+            // narrows). Reject rather than poison the pool — a pool frame that
+            // silently lacks WRITE/EXECUTE surfaces later as an intermittent
+            // consumer fault when allocation order happens to draw it. The
+            // kernel mints every donatable RAM cap full-rights
+            // (`core/kernel/src/main.rs`, `core/kernel/src/cap/mod.rs`), so this
+            // only fires on a mint-rights regression.
             let _ = syscall::cap_delete(slot);
             continue;
         }
@@ -1383,21 +1407,22 @@ fn ingest_pool(boot: &InitBootstrap)
     for i in 0..(boot.memory_count as usize)
     {
         let cap_slot = boot.memory_base + i as u32;
-        // Every RAM Memory cap memmgr ingests from init MUST carry
-        // `Rights::RETYPE`. The kernel stamps RETYPE on usable RAM at
-        // Phase-7 mint (`core/kernel/src/cap/mod.rs`), and init's
-        // `finalize_memmgr` forwards caps through `cap_derive(_, RIGHTS_ALL)`
-        // which preserves RETYPE. If this ever fires, memmgr cannot retype
-        // these memory caps into kernel objects on its consumers' behalf and the
-        // typed-memory contract is broken — fail fast at boot. The check
-        // fires for at least the first cap (gating panic on i == 0);
-        // subsequent caps would be debit-cheap to also check, but the
-        // kernel mints them as a uniform batch so one is sufficient.
+        // Every RAM Memory cap memmgr ingests from init MUST carry the full
+        // pool-frame rights ([`POOL_FRAME_RIGHTS`]: WRITE | EXECUTE | RETYPE).
+        // The kernel stamps these on usable RAM at Phase-7 mint
+        // (`core/kernel/src/cap/mod.rs`), and init's `finalize_memmgr` forwards
+        // caps through `cap_derive(_, RIGHTS_ALL)` which preserves them. If this
+        // ever fires, memmgr cannot derive the writable/executable inner a
+        // consumer needs (nor retype on its behalf) and the pool contract is
+        // broken — fail fast at boot rather than surface as an intermittent
+        // consumer fault. The check fires for at least the first cap (gating
+        // panic on i == 0); the kernel mints them as a uniform batch so one is
+        // sufficient.
         if i == 0
         {
             // `packed` is `(tag << 32) | rights`; low 32 bits are rights, and
-            // `RIGHTS_RETYPE` (1 << 21) is a low-bit-position right so the
-            // comparison against the full u64 is exact. cap_info(slot,
+            // every bit in `POOL_FRAME_RIGHTS` is a low-bit-position right so the
+            // mask comparison against the full u64 is exact. cap_info(slot,
             // TAG_RIGHTS) cannot fail on a non-null slot — init has just
             // forwarded the cap, so an Err here means the cap-routing graph
             // is broken and the bootstrap invariant fails.
@@ -1407,8 +1432,8 @@ fn ingest_pool(boot: &InitBootstrap)
                 panic!("memmgr: cap_info failed on bootstrap Memory cap");
             };
             assert!(
-                packed & syscall::RIGHTS_RETYPE != 0,
-                "memmgr: ingested RAM Memory cap missing RIGHTS_RETYPE",
+                packed & POOL_FRAME_RIGHTS == POOL_FRAME_RIGHTS,
+                "memmgr: ingested RAM Memory cap missing pool-frame rights (WRITE|EXECUTE|RETYPE)",
             );
         }
         // Ownership is taken on ingest — count on ownership, place best-effort

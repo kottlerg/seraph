@@ -813,10 +813,23 @@ unsafe fn kernel_entry_post_rebase(
                     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
+                // Full rights, matching the segment caps above. This cap is
+                // held only to donate the page into memmgr's pool at init's
+                // reap, where it becomes general anonymous RAM any consumer may
+                // map writable or executable (demand paging, REQUEST_MEMORY_CAPS).
+                // Cap rights gate derivation, not the live mapping: the InitInfo
+                // region is already mapped read-only into init by `map_page`
+                // above, so a writable cap cannot widen it. A narrower cap
+                // donates a frame that cannot satisfy a downstream RW/RX map and
+                // fails the consumer's fault.
                 let slot = cs
                     .insert_cap(
                         CapTag::Memory,
-                        Rights::MAP | Rights::READ | Rights::RETYPE,
+                        Rights::MAP
+                            | Rights::READ
+                            | Rights::WRITE
+                            | Rights::EXECUTE
+                            | Rights::RETYPE,
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
@@ -910,10 +923,22 @@ unsafe fn kernel_entry_post_rebase(
                     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
+                // Full rights, matching the segment and InitInfo caps. This cap
+                // is held only to donate the page into memmgr's pool at init's
+                // reap, where it becomes general anonymous RAM any consumer may
+                // map writable or executable. Cap rights gate derivation, not
+                // the live mapping: init's stack is already mapped RW by
+                // `map_page` above, so the EXECUTE right cannot make the running
+                // stack executable. A narrower cap donates a frame that cannot
+                // satisfy a downstream RX map and fails the consumer's fault.
                 let slot = cs
                     .insert_cap(
                         CapTag::Memory,
-                        Rights::MAP | Rights::READ | Rights::WRITE | Rights::RETYPE,
+                        Rights::MAP
+                            | Rights::READ
+                            | Rights::WRITE
+                            | Rights::EXECUTE
+                            | Rights::RETYPE,
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Memory cap"));

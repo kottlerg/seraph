@@ -24,6 +24,21 @@ each ingested cap at its native size; splitting happens on the
 allocation path via `memory_split`, and coalescing reverses the split on
 the free path.
 
+Beyond the bootstrap pool, memmgr also receives reclaimed frames at init's reap
+(`DONATE_MEMORY_CAPS`: init's ELF segments, InitInfo, stack, boot-module ELF
+sources, reclaim scratch, AP trampoline). Both entry points feed the same free
+pool, so every pool frame is uniform anonymous RAM: a consumer may map any of
+it read-only, read-write, or read-execute (W^X still enforced at map time).
+This requires each pool frame's Memory cap to carry **WRITE, EXECUTE, and
+RETYPE** rights — memmgr derives the R/RW/RX inner from the pooled outer on
+demand and `cap_derive` only narrows rights, so a frame whose outer lacks WRITE
+(or EXECUTE) cannot satisfy a writable (or executable) map and would fail the
+consumer's fault. The kernel mints every donatable RAM cap with these rights
+(rights gate derivation, not the live mapping); memmgr enforces the invariant at
+both ingest and donation, rejecting (or, for the bootstrap pool, panicking on) a
+frame that lacks them so a mint-rights regression fails loudly rather than
+surfacing as an intermittent consumer fault.
+
 ---
 
 ## Free-Pool Data Structure

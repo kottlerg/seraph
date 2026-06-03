@@ -117,6 +117,7 @@ pub enum BuildComponent
     Fsbench,
     Pipefault,
     Stackoverflow,
+    Demandpaged,
     Stdiotest,
     StdiotestTester,
     All,

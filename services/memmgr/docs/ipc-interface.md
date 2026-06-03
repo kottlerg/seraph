@@ -32,17 +32,27 @@ badge is the procmgr-minted process identity established at
 
 Two privilege classes:
 
-- **Procmgr-only** labels (`REGISTER_PROCESS`, `PROCESS_DIED`) are
-  callable only over the cap that init transfers to procmgr at
-  procmgr's bootstrap round. memmgr identifies this cap by badge and
-  rejects procmgr-only calls received over any other badged cap.
-- **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`) are
-  callable over any badged cap, including those memmgr returned from
-  `REGISTER_PROCESS`.
+- **Procmgr-only** labels (`REGISTER_PROCESS`, `PROCESS_DIED`,
+  `DELEGATE_ASPACE`) are callable only over the cap that init transfers
+  to procmgr at procmgr's bootstrap round. memmgr identifies this cap by
+  badge and rejects procmgr-only calls received over any other badged cap.
+- **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
+  `REGISTER_REGION`) are callable over any badged cap, including those
+  memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION` is attributed
+  to the caller by its own badge.
 
 Badges cannot be forged: they are minted by `cap_derive_badge` only
 under the kernel's derivation rules, and procmgr is the only process
 that holds memmgr's procmgr-only cap.
+
+A third, kernel-origin class is the **fault message**: when a demand-paged
+process's thread takes a page fault, the kernel (not a userspace caller)
+synthesises an IPC to memmgr's endpoint with label `FAULT_LABEL`
+(`u64::MAX - 1`) and `badge` set to the faulting process's memmgr badge.
+Userspace cannot forge it — no SEND cap to the fault delivery is
+distributed; the binding is installed by procmgr via
+`SYS_THREAD_SET_FAULT_HANDLER` and the kernel owns the send. See
+[docs/fault-handling.md](../../../docs/fault-handling.md).
 
 ---
 
@@ -232,6 +242,78 @@ IPC. Idempotent on stale badges (already-reaped or never-registered).
 
 `PROCESS_DIED` for an unknown badge is not an error — memmgr returns
 success. Reclamation is idempotent.
+
+### Label 7: `REGISTER_REGION`
+
+A demand-paged process registers an anonymous region it has reserved (but
+not backed). A later page fault inside the region is backed on demand by
+the fault arm below; a fault outside every registered region is declined
+(the thread is killed), preserving segfault semantics. Privilege:
+universal — attributed to the caller by `recv.badge`.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 7 |
+| data[0] | `va_base` (page-aligned virtual address) |
+| data[1] | `len_bytes` (region length; page-multiple, nonzero) |
+| data[2] | `prot` (MAP_* protection bits; W^X enforced) |
+
+**Reply (success):** `label` 0. No mapping is installed — backing happens
+lazily on fault, and only once procmgr has delegated this process's
+`AddressSpace` cap via `DELEGATE_ASPACE`.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 3 | `Quota` | Per-process region list at static cap |
+| 4 | `InvalidArgument` | Bad alignment, zero length, W^X violation, unknown prot bit, unknown badge, or overlap |
+
+### Label 8: `DELEGATE_ASPACE`
+
+Procmgr delegates a demand-paged child's `AddressSpace` cap to memmgr so
+the pager can map backing frames into it on fault. Sent at process
+finalize, after the child address space exists (so it cannot ride on the
+earlier `REGISTER_PROCESS` handshake). Privilege: procmgr-only.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 8 |
+| data[0] | `child_memmgr_badge` (from the child's `REGISTER_PROCESS` reply) |
+| cap[0] | the child `AddressSpace` cap (MAP rights); ownership transfers to memmgr |
+
+memmgr stores the cap against the child's tracking entry and drops it on
+`PROCESS_DIED`.
+
+**Reply (success):** `label` 0.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `InvalidArgument` | Unknown badge or missing cap (a stray transferred cap is dropped) |
+| 5 | `Unauthorized` | Caller is not procmgr |
+
+### Kernel-origin fault message (`FAULT_LABEL`)
+
+Not a callable label. When a demand-paged process's thread takes a page
+fault the kernel cannot resolve, it synthesises an IPC to memmgr's
+endpoint with label `FAULT_LABEL` (`u64::MAX - 1`), `badge` = the faulting
+process's memmgr badge, and data words `[kind, faulting_va, access, ip]`
+(see [docs/fault-handling.md](../../../docs/fault-handling.md)). For a
+`FAULT_KIND_VM` fault whose `faulting_va` lies in a registered region of a
+process with a delegated address space, memmgr allocates one frame, maps
+it at the faulting page with the region's protection, and replies
+`FAULT_REPLY_RESUME` to retry the access. Every other case — non-VM fault,
+unknown process, address outside every region, no delegated AS, or any
+allocation/map failure — replies `FAULT_REPLY_KILL`. Demand frames are
+tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so `PROCESS_DIED`
+reclaims them and the all-RAM-accounted identity is unaffected (the page
+moves from a free run to the process record; it was already owned).
 
 ---
 

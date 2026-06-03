@@ -39,6 +39,7 @@ members = [
     "shared/registry-client",
     "shared/shmem",
     "shared/text",
+    "programs/demandpaged",
     "programs/fb-charset",
     "programs/fsbench",
     "programs/hello",

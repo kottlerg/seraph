@@ -21,7 +21,7 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{
     PROCESS_ABI_VERSION, PROCESS_INFO_VADDR, ProcessInfo, StartupInfo, process_info_ref,
 };
-use syscall_abi::PAGE_SIZE;
+use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE};
 
 // memmgr's bootstrap parser carries page-count buffers on stack and
 // pushes deeper through `bootstrap_from_init`; declare a 12-page
@@ -77,6 +77,8 @@ pub extern "C" fn _start(_info_ptr: u64) -> !
         env_count: 0,
         stack_top_vaddr: info.stack_top_vaddr,
         stack_pages: info.stack_pages,
+        pager_endpoint_cap: info.pager_endpoint_cap,
+        pager_badge: info.pager_badge,
     };
 
     main(&startup)
@@ -94,6 +96,9 @@ fn panic(_info: &core::panic::PanicInfo) -> !
 const MAX_PROCESSES: usize = 64;
 /// Maximum memory-cap records per process.
 const MAX_PER_PROC: usize = 512;
+/// Maximum demand-paged regions tracked per process. Generous for the
+/// anonymous-memory consumer; a process needing more registers coarser regions.
+const MAX_REGIONS_PER_PROC: usize = 8;
 /// Maximum free runs in the pool. Each run is one Memory cap covering one
 /// or more contiguous pages.
 const MAX_FREE_RUNS: usize = 512;
@@ -121,6 +126,17 @@ struct OwnedMemory
     phys_base: u64,
 }
 
+/// One demand-paged anonymous region a process registered via
+/// `REGISTER_REGION`. A page fault inside `[va_base, va_base + len)` is backed
+/// on demand with `prot`; a fault outside every region is declined.
+#[derive(Clone, Copy)]
+struct DemandRegion
+{
+    va_base: u64,
+    len: u64,
+    prot: u64,
+}
+
 /// Process accounting record: badge plus the list of memory caps memmgr has
 /// issued to that process.
 struct ProcessRecord
@@ -128,6 +144,13 @@ struct ProcessRecord
     badge: u64,
     used: usize,
     memory_caps: [Option<OwnedMemory>; MAX_PER_PROC],
+    /// Demand-paged child `AddressSpace` cap delegated by procmgr, or `0` when
+    /// the process is not demand-paged. memmgr maps fault-backing frames into
+    /// it.
+    aspace_cap: u32,
+    /// Registered demand-paged regions and their live count.
+    regions: [Option<DemandRegion>; MAX_REGIONS_PER_PROC],
+    region_count: usize,
 }
 
 impl ProcessRecord
@@ -142,6 +165,9 @@ impl ProcessRecord
             badge,
             used: 0,
             memory_caps: [None; MAX_PER_PROC],
+            aspace_cap: 0,
+            regions: [None; MAX_REGIONS_PER_PROC],
+            region_count: 0,
         }
     }
 
@@ -154,6 +180,52 @@ impl ProcessRecord
         self.memory_caps[self.used] = Some(memory_cap);
         self.used += 1;
         Ok(())
+    }
+
+    /// Undo the most recent [`Self::push`]. Used to roll an accounting entry
+    /// back when a later step in the same handler fails.
+    fn pop(&mut self)
+    {
+        if self.used > 0
+        {
+            self.used -= 1;
+            self.memory_caps[self.used] = None;
+        }
+    }
+
+    /// Register a demand-paged region, rejecting overlap and over-quota.
+    /// Returns the `memmgr_errors` code to reply with on failure.
+    fn add_region(&mut self, region: DemandRegion) -> Result<(), u64>
+    {
+        if self.region_count >= MAX_REGIONS_PER_PROC
+        {
+            return Err(memmgr_errors::QUOTA);
+        }
+        let new_end = region.va_base.saturating_add(region.len);
+        for existing in self.regions.iter().take(self.region_count).flatten()
+        {
+            let end = existing.va_base.saturating_add(existing.len);
+            if region.va_base < end && existing.va_base < new_end
+            {
+                return Err(memmgr_errors::INVALID_ARGUMENT);
+            }
+        }
+        self.regions[self.region_count] = Some(region);
+        self.region_count += 1;
+        Ok(())
+    }
+
+    /// Find the registered region containing `va`, if any.
+    fn region_for(&self, va: u64) -> Option<DemandRegion>
+    {
+        for region in self.regions.iter().take(self.region_count).flatten()
+        {
+            if va >= region.va_base && va < region.va_base.saturating_add(region.len)
+            {
+                return Some(*region);
+            }
+        }
+        None
     }
 }
 
@@ -943,6 +1015,14 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         // `push_or_coalesce` parks reclaimed memory caps (unreachable for
         // allocation, though still owned and accounted).
         pool.coalesce();
+
+        // Drop memmgr's copy of a demand-paged process's delegated address
+        // space, freeing the CSpace slot. The child's own AS is torn down by
+        // procmgr; this only releases memmgr's reference.
+        if record.aspace_cap != 0
+        {
+            let _ = syscall::cap_delete(record.aspace_cap);
+        }
     }
     // Idempotent: missing badge is not an error.
 
@@ -1047,6 +1127,181 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Register a demand-paged anonymous region for the calling process.
+///
+/// Attributed by `req.badge` (the caller's per-process badge). The region is
+/// validated (page alignment, nonzero length, W^X, known prot bits) and stored
+/// against the caller's record; no mapping is installed here — backing happens
+/// lazily in [`handle_fault`].
+fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let va_base = req.word(0);
+    let len = req.word(1);
+    let prot = req.word(2);
+
+    let known_prot = MAP_READ | MAP_WRITABLE | MAP_EXECUTABLE;
+    let wx = MAP_WRITABLE | MAP_EXECUTABLE;
+    if len == 0
+        || !va_base.is_multiple_of(PAGE_SIZE)
+        || !len.is_multiple_of(PAGE_SIZE)
+        || va_base.checked_add(len).is_none()
+        || prot & !known_prot != 0
+        || prot & wx == wx
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+
+    let Some(record) = table_mut().find_mut(req.badge)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    match record.add_region(DemandRegion { va_base, len, prot })
+    {
+        Ok(()) => reply_label(ipc_buf, memmgr_errors::SUCCESS),
+        Err(code) => reply_label(ipc_buf, code),
+    }
+}
+
+/// Procmgr-only: store a demand-paged child's delegated `AddressSpace` cap so
+/// [`handle_fault`] can map backing frames into it. Keyed by the child's
+/// memmgr badge in `data[0]`; the cap arrives in `caps[0]`.
+fn handle_delegate_aspace(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
+{
+    if req.badge != procmgr_badge
+    {
+        for &slot in req.caps()
+        {
+            let _ = syscall::cap_delete(slot);
+        }
+        reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
+        return;
+    }
+    let child_badge = req.word(0);
+    let Some(&as_cap) = req.caps().first()
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let Some(record) = table_mut().find_mut(child_badge)
+    else
+    {
+        let _ = syscall::cap_delete(as_cap);
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    // Replace any prior delegation, dropping the stale cap.
+    if record.aspace_cap != 0
+    {
+        let _ = syscall::cap_delete(record.aspace_cap);
+    }
+    record.aspace_cap = as_cap;
+    reply_label(ipc_buf, memmgr_errors::SUCCESS);
+}
+
+/// Service a kernel-synthesized page fault for a demand-paged process.
+///
+/// `req.badge` is the faulting process's memmgr badge; words are
+/// `[kind, faulting_va, access, ip]`. On a VM fault whose address lies in a
+/// registered region of a process with a delegated address space, memmgr
+/// allocates one frame, maps it at the faulting page with the region's
+/// protection, and replies [`syscall_abi::FAULT_REPLY_RESUME`]. Every other
+/// case — non-VM fault, unknown process, address outside every region, no
+/// delegated AS, or any allocation/map failure — replies
+/// [`syscall_abi::FAULT_REPLY_KILL`], preserving default segfault semantics.
+///
+/// The frame is accounted to the process record (reclaimed on `PROCESS_DIED`
+/// like any other issued cap); `pool_total` is unchanged because the page was
+/// already owned — it moves from a free run to the process's record.
+fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    if req.word(0) != syscall_abi::FAULT_KIND_VM
+    {
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    }
+    let va = req.word(1);
+    let page_base = va & !(PAGE_SIZE - 1);
+
+    let pool = pool_mut();
+    let Some(record) = table_mut().find_mut(req.badge)
+    else
+    {
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    };
+    let Some(region) = record.region_for(va)
+    else
+    {
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    };
+    if record.aspace_cap == 0
+    {
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    }
+
+    let Ok((granted, _count)) = select_memory_caps(pool, 1, true)
+    else
+    {
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    };
+    let (outer, pages, phys) = granted[0];
+
+    // Account the frame so it is reclaimed on death; roll back to the pool on
+    // any subsequent failure.
+    if record
+        .push(OwnedMemory {
+            cap_slot: outer,
+            page_count: pages,
+            phys_base: phys,
+        })
+        .is_err()
+    {
+        let _ = pool.push(FreeRun {
+            cap_slot: outer,
+            page_count: pages,
+            phys_base: phys,
+        });
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    }
+
+    let Some(inner) = derive_for_caller(outer)
+    else
+    {
+        record.pop();
+        let _ = pool.push(FreeRun {
+            cap_slot: outer,
+            page_count: pages,
+            phys_base: phys,
+        });
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    };
+    if syscall::mem_map(inner, record.aspace_cap, page_base, 0, 1, region.prot).is_err()
+    {
+        let _ = syscall::cap_delete(inner);
+        record.pop();
+        let _ = pool.push(FreeRun {
+            cap_slot: outer,
+            page_count: pages,
+            phys_base: phys,
+        });
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
+        return;
+    }
+    // The kernel holds the mapping independently of the inner cap; the outer
+    // pins the frame until reclaim.
+    let _ = syscall::cap_delete(inner);
+    reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
 }
 
 /// Total pages of RAM memmgr owns: every page it has taken ownership of since
@@ -1172,6 +1427,14 @@ fn ingest_in_use(boot: &InitBootstrap)
 
 fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
 {
+    // The kernel-synthesized fault IPC carries the full `FAULT_LABEL` sentinel
+    // (`u64::MAX - 1`), which would alias other opcodes under the `& 0xFFFF`
+    // mask below; match it on the full label first.
+    if req.label == syscall_abi::FAULT_LABEL
+    {
+        handle_fault(req, ipc_buf);
+        return;
+    }
     match req.label & 0xFFFF
     {
         memmgr_labels::REQUEST_MEMORY_CAPS =>
@@ -1197,6 +1460,14 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         memmgr_labels::QUERY_POOL_STATUS =>
         {
             handle_query_pool_status(ipc_buf, boot);
+        }
+        memmgr_labels::REGISTER_REGION =>
+        {
+            handle_register_region(req, ipc_buf);
+        }
+        memmgr_labels::DELEGATE_ASPACE =>
+        {
+            handle_delegate_aspace(req, ipc_buf, boot.procmgr_badge);
         }
         _ =>
         {

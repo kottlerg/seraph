@@ -111,6 +111,17 @@ pub mod procmgr_labels
     /// completes (success or failure). Stdio pipes are installed via
     /// separate [`CONFIGURE_PIPE`] calls between create and start.
     pub const CREATE_FROM_FILE: u64 = 13;
+    /// Label flag (bit 16) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+    /// create the new process as demand-paged. At finalize procmgr binds
+    /// the child's main thread fault handler to memmgr (the system pager),
+    /// delegates the child `AddressSpace` cap to memmgr via
+    /// `memmgr_labels::DELEGATE_ASPACE`, and advertises the pager in
+    /// `ProcessInfo` (`pager_endpoint_cap` / `pager_badge`) so the runtime
+    /// inherits it onto spawned threads. Occupies bit 16 of the reserved
+    /// `[16..32]` label window. Infrastructure processes (badge below
+    /// `log_badges::LOG_BADGE_FIRST_CHILD`) are never paged regardless of
+    /// this flag.
+    pub const CREATE_DEMAND_PAGED: u64 = 1 << 16;
     /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
     /// cspace, `ProcessInfo` Memory cap), dec-refing any pages the child
     /// still holds so they recycle back into the kernel buddy allocator. The
@@ -274,7 +285,7 @@ pub mod procmgr_labels
     pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
 
-pub const MEMMGR_LABELS_VERSION: u32 = 2;
+pub const MEMMGR_LABELS_VERSION: u32 = 3;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -352,6 +363,47 @@ pub mod memmgr_labels
     /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
     /// "dark" memory.
     pub const QUERY_POOL_STATUS: u64 = 6;
+    /// Register a demand-paged anonymous region for the calling process.
+    ///
+    /// Universal label — attributed to the caller by `recv.badge` (the
+    /// per-process badge minted at [`REGISTER_PROCESS`], carried by the
+    /// badged SEND cap installed in `ProcessInfo.memmgr_endpoint_cap`).
+    /// memmgr records the region against that badge's tracking entry; a
+    /// later page fault inside a registered region is backed on demand by
+    /// the fault-handler arm, while a fault outside every registered region
+    /// is declined (the faulting thread is killed), preserving segfault
+    /// semantics.
+    ///
+    /// Wire format:
+    /// * `data[0]` — `va_base` (page-aligned virtual address).
+    /// * `data[1]` — `len_bytes` (region length; page-multiple, nonzero).
+    /// * `data[2]` — `prot` (MAP_* protection bits; W^X enforced).
+    ///
+    /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (bad alignment,
+    /// zero length, W^X violation, unknown badge, or overlap); or `QUOTA`
+    /// (per-process region list at static cap). No mapping is installed
+    /// here — backing happens lazily on fault, and only once procmgr has
+    /// delegated the process `AddressSpace` cap via [`DELEGATE_ASPACE`].
+    pub const REGISTER_REGION: u64 = 7;
+    /// Procmgr-only: delegate a demand-paged child's `AddressSpace` cap to
+    /// memmgr so the pager can map frames into it on fault.
+    ///
+    /// Sent at process finalize for processes created with the
+    /// [`CREATE_DEMAND_PAGED`] flag, after the child address space exists
+    /// (so it cannot ride on the earlier [`REGISTER_PROCESS`] handshake).
+    /// memmgr stores the transferred cap against the child's tracking
+    /// entry, keyed by the badge minted at [`REGISTER_PROCESS`].
+    ///
+    /// Wire format:
+    /// * `data[0]` — `child_memmgr_badge` (from the child's
+    ///   `REGISTER_PROCESS` reply).
+    /// * `caps[0]` — the child `AddressSpace` cap (MAP rights); ownership
+    ///   transfers to memmgr.
+    ///
+    /// Reply: `memmgr_errors::SUCCESS`; `UNAUTHORIZED` (caller is not
+    /// procmgr); or `INVALID_ARGUMENT` (unknown badge or missing cap — a
+    /// stray transferred cap is dropped).
+    pub const DELEGATE_ASPACE: u64 = 8;
 
     /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap
     /// covering all `want_pages`, or fail with

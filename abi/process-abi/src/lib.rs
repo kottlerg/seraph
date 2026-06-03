@@ -41,7 +41,11 @@ use core::prelude::rust_2024::*;
 /// v17: Added [`ProcessInfo::sched_control_cap`] (#185) — a baseline
 ///      `SchedControl` cap so a process can set its own threads' priorities
 ///      within its delegated band. Zero when none is delegated.
-pub const PROCESS_ABI_VERSION: u32 = 17;
+/// v18: Added [`ProcessInfo::pager_endpoint_cap`] / [`ProcessInfo::pager_badge`]
+///      (#34) — the demand-paging fault handler advertised to the runtime so it
+///      can inherit the pager onto spawned threads. Both zero when the process
+///      is not demand-paged.
+pub const PROCESS_ABI_VERSION: u32 = 18;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -462,6 +466,21 @@ pub struct ProcessInfo
 
     /// Number of 4 KiB pages mapped for the main-thread stack.
     pub stack_pages: u32,
+
+    /// `CSpace` slot of an `Endpoint` cap on the process's demand-paging
+    /// pager (memmgr's service endpoint), or zero when the process is not
+    /// demand-paged.
+    ///
+    /// procmgr binds the main thread's fault handler to this endpoint at
+    /// creation; the runtime reads this slot and `pager_badge` to bind the
+    /// same handler onto every thread it spawns, so demand paging covers the
+    /// whole process and not just the main thread. Consumers must tolerate
+    /// zero.
+    pub pager_endpoint_cap: u32,
+
+    /// Fault-message badge bound with [`Self::pager_endpoint_cap`],
+    /// identifying this process to the pager. Zero when not demand-paged.
+    pub pager_badge: u64,
 }
 
 // ── StartupInfo ──────────────────────────────────────────────────────────────
@@ -573,6 +592,15 @@ pub struct StartupInfo
 
     /// Number of 4 KiB pages mapped for the main-thread stack.
     pub stack_pages: u32,
+
+    /// `CSpace` slot of the demand-paging pager endpoint, or zero when the
+    /// process is not demand-paged. The runtime binds this onto every
+    /// thread it spawns. See `ProcessInfo::pager_endpoint_cap`.
+    pub pager_endpoint_cap: u32,
+
+    /// Fault-message badge bound with [`Self::pager_endpoint_cap`]. Zero
+    /// when not demand-paged.
+    pub pager_badge: u64,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

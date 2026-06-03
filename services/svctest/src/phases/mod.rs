@@ -36,6 +36,7 @@ pub mod fs_ipc;
 pub mod fs_std;
 pub mod memmgr;
 pub mod namespace;
+pub mod pager;
 pub mod pipes;
 pub mod process_faults;
 pub mod procmgr;
@@ -55,6 +56,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(threading::phases());
     out.extend_from_slice(procmgr::spawn_only());
     out.extend_from_slice(process_faults::phases());
+    out.extend_from_slice(pager::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

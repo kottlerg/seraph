@@ -494,6 +494,10 @@ fn populate_memmgr_info(
             pi.stderr_space_notification_cap = 0;
             pi.stack_top_vaddr = PROCESS_STACK_TOP;
             pi.stack_pages = stack_pages;
+            // Infrastructure is never demand-paged (would recurse on its own
+            // faults); leave the pager unbound.
+            pi.pager_endpoint_cap = 0;
+            pi.pager_badge = 0;
         },
     )?;
 
@@ -1041,6 +1045,10 @@ fn populate_procmgr_info(
             pi.tls_template_align = caps.tls.align;
             pi.stack_top_vaddr = PROCESS_STACK_TOP;
             pi.stack_pages = stack_pages;
+            // Infrastructure is never demand-paged (would recurse on its own
+            // faults); leave the pager unbound.
+            pi.pager_endpoint_cap = 0;
+            pi.pager_badge = 0;
         },
     )?;
 

@@ -10,12 +10,12 @@
 //! suspended processes.
 
 use crate::loader::{self, ScratchMapping};
-use ipc::{IpcMessage, memmgr_labels, procmgr_errors};
+use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{
     DEFAULT_PROCESS_STACK_PAGES, MAX_PROCESS_STACK_PAGES, PROCESS_ABI_VERSION, PROCESS_INFO_VADDR,
     PROCESS_MAIN_TLS_MAX_PAGES, PROCESS_MAIN_TLS_VADDR, PROCESS_STACK_TOP,
 };
-use syscall_abi::PAGE_SIZE;
+use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE};
 
 // Bootstrap-cross-boundary VA: procmgr picks the per-child main-thread
 // IPC-buffer VA and writes it into `ProcessInfo.ipc_buffer_vaddr`. The
@@ -556,6 +556,17 @@ pub struct UniversalCaps
     /// priorities within the band. Zero when procmgr was given no baseline;
     /// children then receive zero and cannot set any priority.
     pub sched_baseline: u32,
+    /// Whether the caller requested a demand-paged child (the
+    /// `procmgr_labels::CREATE_DEMAND_PAGED` flag). When set and the child is
+    /// not infrastructure, `finalize_creation` binds the child's main-thread
+    /// fault handler to memmgr and delegates the child `AddressSpace`, and
+    /// `populate_child_info` advertises the pager in `ProcessInfo`.
+    pub demand_paged: bool,
+    /// Procmgr's own (procmgr-badged) SEND cap on memmgr's endpoint, used to
+    /// issue the procmgr-only `DELEGATE_ASPACE`. Distinct from
+    /// [`Self::memmgr_endpoint`] (the child's badged cap). Zero when memmgr is
+    /// not reachable.
+    pub self_memmgr_ep: u32,
 }
 
 /// Program arguments delivered to a child process at spawn time.
@@ -836,6 +847,16 @@ fn populate_child_info(
     pi.tls_template_align = tls.align;
     pi.stack_top_vaddr = PROCESS_STACK_TOP;
     pi.stack_pages = stack_pages;
+    // Advertise the demand-paging pager so the runtime can inherit it onto
+    // spawned threads. The child's badged memmgr endpoint is the pager
+    // endpoint; the fault badge equals the child's memmgr badge so the
+    // kernel-synthesized fault is attributed to the right memmgr record.
+    // procmgr binds the main thread separately in `finalize_creation`.
+    if universals.demand_paged
+    {
+        pi.pager_endpoint_cap = pi.memmgr_endpoint_cap;
+        pi.pager_badge = universals.memmgr_badge;
+    }
 
     // Write the argv blob, then the env blob, into the page region
     // following the struct. Each blob begins at a u64-aligned offset so
@@ -1161,6 +1182,9 @@ fn finalize_creation(
     memmgr_send_cap: u32,
     memmgr_badge: u64,
     process_badge: u64,
+    demand_paged: bool,
+    self_memmgr_ep: u32,
+    ipc_buf: *mut u64,
 ) -> Option<CreateResult>
 {
     let badge = process_badge;
@@ -1215,6 +1239,49 @@ fn finalize_creation(
         let _ = syscall::cap_delete(thread_for_caller);
         let _ = syscall::cap_delete(process_handle);
         return None;
+    }
+
+    // Demand-paged wiring (best-effort): delegate the child address space to
+    // memmgr and bind the main thread's fault handler to it. A failure here
+    // degrades to "no pager" (faults kill the thread) rather than failing an
+    // otherwise-complete creation. Infrastructure (badge below
+    // LOG_BADGE_FIRST_CHILD) is never paged; procmgr never spawns it anyway,
+    // but the floor is an explicit guard.
+    if demand_paged
+        && process_badge >= ipc::log_badges::LOG_BADGE_FIRST_CHILD
+        && memmgr_send_cap != 0
+        && self_memmgr_ep != 0
+    {
+        // Hand memmgr its own copy of the child AS, keyed by the child's
+        // memmgr badge, over procmgr's (procmgr-badged) endpoint so it lands
+        // on the privileged DELEGATE_ASPACE tier. procmgr keeps `child_aspace`.
+        if let Ok(as_copy) = syscall::cap_derive(child_aspace, syscall::RIGHTS_ALL)
+        {
+            let msg = IpcMessage::builder(memmgr_labels::DELEGATE_ASPACE)
+                .word(0, memmgr_badge)
+                .cap(as_copy)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            let delegated = unsafe { ipc::ipc_call(self_memmgr_ep, &msg, ipc_buf) }
+                .is_ok_and(|r| r.label == memmgr_errors::SUCCESS);
+            if delegated
+            {
+                // Bind only after the AS is delegated, so memmgr can service
+                // the first fault. fault_badge = the child's memmgr badge.
+                let _ = syscall::thread_set_fault_handler(
+                    child_thread,
+                    memmgr_send_cap,
+                    memmgr_badge,
+                    FAULT_CLASS_ALL,
+                );
+            }
+            else
+            {
+                // Call failed or memmgr declined: drop the copy if the IPC did
+                // not transfer it (deleting an already-moved slot is harmless).
+                let _ = syscall::cap_delete(as_copy);
+            }
+        }
     }
 
     Some(CreateResult {
@@ -1370,6 +1437,9 @@ fn create_process_from_bytes(
         child_memmgr_send,
         universals.memmgr_badge,
         process_badge,
+        universals.demand_paged,
+        universals.self_memmgr_ep,
+        ipc_buf,
     )
 }
 
@@ -1907,6 +1977,7 @@ pub fn create_process_from_file(
     args: &ChildArgs<'_>,
     env: &ChildEnv<'_>,
     death_eq: u32,
+    demand_paged: bool,
 ) -> Result<CreateResult, u64>
 {
     let self_aspace = ctx.self_aspace;
@@ -2146,6 +2217,8 @@ pub fn create_process_from_file(
         memmgr_badge: mms.badge(),
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
+        demand_paged,
+        self_memmgr_ep: ctx.memmgr_ep,
     };
     let process_badge = next_process_badge();
     let pi_memory_cap = populate_child_info(
@@ -2192,6 +2265,9 @@ pub fn create_process_from_file(
         mms.cap(),
         mms.badge(),
         process_badge,
+        universals.demand_paged,
+        universals.self_memmgr_ep,
+        ipc_buf,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY);
     if result.is_ok()

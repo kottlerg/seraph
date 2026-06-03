@@ -178,6 +178,16 @@ pub struct StartupInfo {
     /// Number of 4 KiB pages mapped for the main-thread stack.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub stack_pages: u32,
+    /// `Endpoint` cap on the process's demand-paging pager, or zero when
+    /// the process is not demand-paged. The runtime binds this as the fault
+    /// handler on every thread it spawns; the main thread is bound by
+    /// procmgr at creation. See `process_abi::ProcessInfo::pager_endpoint_cap`.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub pager_endpoint_cap: u32,
+    /// Fault-message badge bound with [`Self::pager_endpoint_cap`]. Zero
+    /// when not demand-paged.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub pager_badge: u64,
 }
 
 // SAFETY: `ipc_buffer` points at a process-global page mapped for the life of
@@ -368,6 +378,8 @@ pub extern "C" fn _start() -> ! {
         env_count: info.env_count as usize,
         stack_top_vaddr: info.stack_top_vaddr,
         stack_pages: info.stack_pages,
+        pager_endpoint_cap: info.pager_endpoint_cap,
+        pager_badge: info.pager_badge,
     };
 
     // SAFETY: single writer; we are the only code running at this point.
@@ -718,6 +730,47 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_pages};
 
+/// Reserve `pages` of unbacked virtual address space and register it as a
+/// read-write demand-paged region with the process's pager (memmgr).
+///
+/// The range maps lazily: the first access to each page faults, the pager
+/// backs it read-write, and the access retries transparently. The process
+/// must be demand-paged (created with `procmgr_labels::CREATE_DEMAND_PAGED`);
+/// otherwise the first fault kills the thread.
+///
+/// On any failure the reservation is released. On success the caller owns the
+/// range and must `mem_unmap` any backed pages, then `unreserve_pages`, when
+/// done.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
+    let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return Err(crate::io::Error::other("seraph: IPC buffer not registered"));
+    }
+    let memmgr_ep = startup_info().memmgr_endpoint;
+    if memmgr_ep == 0 {
+        return Err(crate::io::Error::other("seraph: no pager (memmgr unreachable)"));
+    }
+    let range = reserve_pages(pages)
+        .map_err(|_| crate::io::Error::other("seraph: VA reservation failed"))?;
+    let len_bytes = pages.saturating_mul(syscall_abi::PAGE_SIZE);
+    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_REGION)
+        .word(0, range.va_start())
+        .word(1, len_bytes)
+        .word(2, syscall_abi::MAP_WRITABLE)
+        .build();
+    // SAFETY: current_ipc_buf returns the registered IPC buffer page.
+    let accepted = matches!(
+        unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) },
+        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
+    );
+    if !accepted {
+        unreserve_pages(range);
+        return Err(crate::io::Error::other("seraph: REGISTER_REGION rejected"));
+    }
+    Ok(range)
+}
+
 // ── System log macro surface ────────────────────────────────────────────────
 //
 // The badged SEND cap procmgr seeds at process create-time (recorded in
@@ -881,6 +934,15 @@ pub mod process {
         /// default chain.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn cwd_dir_cap(&mut self, cap: u32) -> &mut Self;
+
+        /// Create the child as demand-paged: procmgr binds its main thread's
+        /// fault handler to the system pager (memmgr) and delegates the child
+        /// address space, and the runtime inherits the pager onto threads the
+        /// child spawns. The child can then back regions lazily via
+        /// [`super::register_demand_paged`]. No effect on infrastructure
+        /// processes. Defaults to off.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn demand_paged(&mut self, on: bool) -> &mut Self;
     }
 
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -892,6 +954,11 @@ pub mod process {
 
         fn cwd_dir_cap(&mut self, cap: u32) -> &mut Command {
             self.as_inner_mut().set_cwd_dir_cap(cap);
+            self
+        }
+
+        fn demand_paged(&mut self, on: bool) -> &mut Command {
+            self.as_inner_mut().set_demand_paged(on);
             self
         }
     }

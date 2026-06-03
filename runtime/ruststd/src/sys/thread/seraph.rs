@@ -22,7 +22,7 @@ use crate::num::NonZero;
 use crate::thread::ThreadInit;
 use crate::time::Duration;
 
-use syscall_abi::PAGE_SIZE;
+use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE};
 
 /// Default minimum stack size. Matches the upstream unsupported-PAL value.
 pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
@@ -197,6 +197,18 @@ impl Thread {
                 dealloc(stack_base, stack_layout);
             }
             return Err(io::Error::other("seraph: thread_configure failed"));
+        }
+
+        // Inherit the process's demand-paging pager onto this thread before it
+        // starts (the main thread is bound by procmgr at creation). Best-effort
+        // and a no-op for non-demand-paged processes (`pager_endpoint_cap == 0`).
+        if info.pager_endpoint_cap != 0 {
+            let _ = syscall::thread_set_fault_handler(
+                thread_cap,
+                info.pager_endpoint_cap,
+                info.pager_badge,
+                FAULT_CLASS_ALL,
+            );
         }
 
         if let Err(_) = syscall::thread_start(thread_cap) {

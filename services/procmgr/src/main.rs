@@ -812,6 +812,8 @@ fn handle_create(
         memmgr_badge,
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
+        demand_paged: label & procmgr_labels::CREATE_DEMAND_PAGED != 0,
+        self_memmgr_ep: ctx.memmgr_ep,
     };
 
     let result = process::create_process(
@@ -990,6 +992,7 @@ fn handle_create_from_file(
         &args,
         &env,
         ctx.death_eq,
+        label & procmgr_labels::CREATE_DEMAND_PAGED != 0,
     );
 
     match result

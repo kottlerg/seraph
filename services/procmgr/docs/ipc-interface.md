@@ -74,6 +74,19 @@ stop/configure the thread.
 | 2 | `OutOfMemory` | Insufficient memory caps to allocate stack, ProcessInfo page, or IPC buffer |
 | 3 | `CSpaceFull` | Cannot allocate kernel objects (address space, CSpace, thread) |
 
+**Demand-paged flag.** The label's bit 16 (`CREATE_DEMAND_PAGED`, in the
+reserved `[16..32]` window shared with `CREATE_FROM_FILE`) requests a
+demand-paged child. At finalize, for non-infrastructure children (badge
+≥ `LOG_BADGE_FIRST_CHILD`), procmgr binds the main thread's fault handler to
+memmgr (the system pager) via `SYS_THREAD_SET_FAULT_HANDLER`, delegates the
+child `AddressSpace` to memmgr via `memmgr_labels::DELEGATE_ASPACE`, and sets
+`ProcessInfo.pager_endpoint_cap` / `pager_badge` so the runtime inherits the
+handler onto spawned threads. The child then backs reserved regions lazily via
+`std::os::seraph::register_demand_paged`. See
+[docs/fault-handling.md](../../../docs/fault-handling.md). The binding is
+best-effort: a failure degrades to "no pager" (faults kill), never blocking
+creation.
+
 ### Label 2: `START_PROCESS`
 
 Start a previously created (suspended) process. The caller must have

@@ -140,6 +140,10 @@ pub struct Command {
     /// then `current_dir_cap()` parent inherit, then zero). Same
     /// ownership contract as `namespace_cap`.
     cwd_dir_cap: u32,
+    /// When set, spawn ORs `procmgr_labels::CREATE_DEMAND_PAGED` into the
+    /// `CREATE_FROM_FILE` label so procmgr binds the child to the system
+    /// pager. Set via `CommandExt::demand_paged`. Defaults to off.
+    demand_paged: bool,
 }
 
 impl Command {
@@ -154,6 +158,7 @@ impl Command {
             stderr: None,
             namespace_cap: 0,
             cwd_dir_cap: 0,
+            demand_paged: false,
         }
     }
 
@@ -169,6 +174,11 @@ impl Command {
     /// `ProcessInfo.current_dir_cap`. Called by `CommandExt::cwd_dir_cap`.
     pub fn set_cwd_dir_cap(&mut self, cap: u32) {
         self.cwd_dir_cap = cap;
+    }
+
+    /// Request a demand-paged child. Called by `CommandExt::demand_paged`.
+    pub fn set_demand_paged(&mut self, on: bool) {
+        self.demand_paged = on;
     }
 
     pub fn arg(&mut self, arg: &OsStr) {
@@ -350,7 +360,13 @@ impl Command {
         let env_len_word_offset = argv_word_offset + argv_words;
         let env_blob_word_offset = env_len_word_offset + 1;
 
+        let demand_paged_flag = if self.demand_paged {
+            procmgr_labels::CREATE_DEMAND_PAGED
+        } else {
+            0
+        };
         let builder = ipc::IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE
+            | demand_paged_flag
             | ((args_blob.len() as u64) << 32)
             | ((u64::from(args_count)) << 48)
             | ((u64::from(env_count)) << 56))

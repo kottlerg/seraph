@@ -153,7 +153,9 @@ pub struct ExceptionFrame
 
 // ── Common exception handler ──────────────────────────────────────────────────
 
-/// Called from all exception stubs with a pointer to the exception frame.
+/// The terminal exception path: a fault that no fault handler resolved. Invoked
+/// (and never returned from) by [`exception_handler`], [`page_fault_handler`],
+/// and the NMI handler once they determine the fault is unrecoverable.
 ///
 /// If the fault originated in userspace (CPL != 0), the faulting thread is
 /// terminated and a death notification is posted (if bound). If the fault
@@ -280,6 +282,58 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
         crate::kprintln!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
         dump_x86_regs_console(f);
         fatal("unhandled kernel exception");
+    }
+}
+
+/// Generic exception dispatch for vectors routed through
+/// [`common_exception_trampoline`] (every ring-3-reachable vector except `#PF`,
+/// `#NM`, and NMI, which have dedicated stubs).
+///
+/// A userspace exception whose thread has a bound fault handler is redirected to
+/// it ([`redirect_user_exception`]); on a resume reply this returns and the
+/// trampoline's `iretq` re-executes the faulting instruction (or continues from a
+/// handler-modified PC). Every other case — no/declined handler, the
+/// non-restartable abort vectors, or any kernel exception — is handed to the
+/// diverging [`common_exception_handler`], so this returns only on a
+/// resolved-and-resumed userspace fault.
+///
+/// Mirrors the call-from-naked-asm pattern of [`page_fault_handler`]: the
+/// trampoline upholds the precondition that `frame` is a valid, writable
+/// `ExceptionFrame` on the current stack, so this is a safe `extern "C"` fn.
+#[cfg(not(test))]
+extern "C" fn exception_handler(frame: *mut ExceptionFrame)
+{
+    // SAFETY: frame is constructed by common_exception_trampoline on this stack.
+    let f = unsafe { &*frame };
+    let from_user = (f.cs & 3) != 0;
+    // #DF (8) and #MC (18) are non-restartable aborts; #DF additionally runs on a
+    // dedicated IST stack that is not re-entrant across the reschedule a redirect
+    // performs. They are never delivered to a resumable handler — always terminal.
+    let redirectable = f.vector != 8 && f.vector != 18;
+    if from_user && redirectable
+    {
+        // SAFETY: from_user implies a running user thread; current_tcb is valid
+        // in exception context (the kill path uses it too).
+        let tcb = unsafe { crate::syscall::current_tcb() };
+        // SAFETY: tcb is the running user thread; has_handler only reads the
+        // atomic fault_handler field.
+        let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
+        if handler_bound
+        {
+            // SAFETY: frame is the live ExceptionFrame; the redirect copies it
+            // to/from the canonical TrapFrame and returns whether to resume.
+            if unsafe { redirect_user_exception(tcb, frame) }
+            {
+                return;
+            }
+            // Handler declined (Kill) — fall through to terminate the thread.
+        }
+    }
+
+    // Not resumed by a handler — kill (userspace) or fatal (kernel).
+    // SAFETY: frame valid; common_exception_handler never returns.
+    unsafe {
+        common_exception_handler(frame.cast_const());
     }
 }
 
@@ -421,7 +475,13 @@ macro_rules! isr_stub {
     };
 }
 
-/// Common trampoline: saves GPRs and calls `common_exception_handler`.
+/// Common trampoline: saves GPRs, calls [`exception_handler`], then — reached
+/// only when a userspace exception was redirected to a bound fault handler that
+/// resolved it — restores the (possibly handler-edited) register state and
+/// `iretq`s, re-executing the faulting instruction (or continuing from a
+/// handler-modified PC). Every terminal fault (no/declined handler, or any
+/// kernel exception) diverges inside [`exception_handler`] →
+/// `common_exception_handler`, so the restore tail is dead for those.
 ///
 /// At entry, the stack holds the ISR stub frame (vector + error code) and
 /// hardware frame (rip, cs, rflags, rsp, ss). We push all GPRs to create
@@ -450,9 +510,26 @@ unsafe extern "C" fn common_exception_trampoline()
         // rsp now points at the full ExceptionFrame.
         "mov rdi, rsp",
         "call {handler}",
-        // common_exception_handler never returns; ud2 guards against it.
-        "ud2",
-        handler = sym common_exception_handler,
+        // Reached only on a resolved-and-resumed userspace exception; restore the
+        // register state the handler may have edited and re-enter userspace.
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "add rsp, 16", // drop vector + error_code
+        "iretq",
+        handler = sym exception_handler,
     );
 }
 
@@ -888,21 +965,10 @@ extern "C" fn page_fault_handler(frame: *mut ExceptionFrame)
     }
 }
 
-/// Redirect a genuine userspace page fault to the faulting thread's bound
-/// fault handler. Returns `true` if the handler resolved the fault and the
-/// thread should resume (re-execute the faulting instruction), `false` if the
-/// fault is terminal (the handler declined or the binding was severed).
-///
-/// The `#PF` stub frame ([`ExceptionFrame`]) differs in layout from the
-/// canonical [`TrapFrame`](crate::arch::current::trap_frame::TrapFrame) the
-/// register syscalls operate on, and the two overlap on the kernel stack, so
-/// the faulting registers are copied into a stack-local `TrapFrame` for the
-/// duration of the block. `(*tcb).trap_frame` is repointed at that copy so the
-/// handler's `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` see and edit the
-/// faulting state; on resume the (possibly edited) copy is written back into the
-/// `ExceptionFrame` so the stub's `iretq` uses it. (Full entry-frame
-/// unification, which would remove this copy, is a deferred follow-up that does
-/// not change the userspace ABI.)
+/// Redirect a genuine userspace page fault to the faulting thread's bound fault
+/// handler. Builds the `FAULT_KIND_VM` message describing the access and delegates
+/// the block to [`redirect_user_fault`]. Returns `true` to resume, `false` to
+/// terminate (handler declined or binding severed).
 ///
 /// # Safety
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live
@@ -944,6 +1010,86 @@ unsafe fn redirect_user_page_fault(
         ip: rip,
     };
 
+    // SAFETY: preconditions forwarded — handler bound, live frame, no lock held.
+    unsafe { redirect_user_fault(tcb, frame, &info) }
+}
+
+/// Redirect a genuine userspace CPU exception (any vector routed through
+/// [`exception_handler`]) to the faulting thread's bound fault handler. Builds the
+/// `FAULT_KIND_EXCEPTION` message (normalized class + hardware error code +
+/// faulting `rip`) and delegates the block to [`redirect_user_fault`]. Returns
+/// `true` to resume, `false` to terminate.
+///
+/// # Safety
+/// `tcb` is the current user thread and has a bound handler; `frame` is the live
+/// exception `ExceptionFrame` on the current kernel stack; no lock is held.
+#[cfg(not(test))]
+unsafe fn redirect_user_exception(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    frame: *mut ExceptionFrame,
+) -> bool
+{
+    // SAFETY: frame is valid.
+    let f = unsafe { &*frame };
+    let info = crate::ipc::fault::FaultInfo {
+        kind: syscall::FAULT_KIND_EXCEPTION,
+        d1: normalize_x86_exception(f.vector),
+        d2: f.error_code,
+        ip: f.rip,
+    };
+
+    // SAFETY: preconditions forwarded — handler bound, live frame, no lock held.
+    unsafe { redirect_user_fault(tcb, frame, &info) }
+}
+
+/// Map an x86-64 exception vector to the architecture-neutral
+/// [`syscall::FAULT_EXC_UNKNOWN`]-family normalized code delivered in a
+/// `FAULT_KIND_EXCEPTION` message. Vectors with a dedicated path (`#PF` = 14,
+/// `#NM` = 7, NMI = 2) never reach here.
+#[cfg(not(test))]
+fn normalize_x86_exception(vector: u64) -> u64
+{
+    match vector
+    {
+        0 => syscall::FAULT_EXC_DIVIDE,              // #DE
+        1 => syscall::FAULT_EXC_DEBUG,               // #DB
+        3 => syscall::FAULT_EXC_BREAKPOINT,          // #BP
+        4 => syscall::FAULT_EXC_OVERFLOW,            // #OF
+        5 => syscall::FAULT_EXC_BOUND_RANGE,         // #BR
+        6 => syscall::FAULT_EXC_ILLEGAL_INSTRUCTION, // #UD
+        10..=13 => syscall::FAULT_EXC_PROTECTION,    // #TS #NP #SS #GP
+        16 | 19 => syscall::FAULT_EXC_FP,            // #MF #XM
+        17 => syscall::FAULT_EXC_ALIGNMENT,          // #AC
+        _ => syscall::FAULT_EXC_UNKNOWN,
+    }
+}
+
+/// Deliver `info` to `tcb`'s bound handler and block until it resolves the fault
+/// or the binding is severed. Returns `true` if the thread should resume
+/// (re-execute the faulting instruction, or continue from a handler-modified PC),
+/// `false` if the fault is terminal.
+///
+/// The stub frame ([`ExceptionFrame`]) differs in layout from the canonical
+/// [`TrapFrame`](crate::arch::current::trap_frame::TrapFrame) the register
+/// syscalls operate on, and the two overlap on the kernel stack, so the faulting
+/// registers are copied into a stack-local `TrapFrame` for the duration of the
+/// block. `(*tcb).trap_frame` is repointed at that copy so the handler's
+/// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` see and edit the faulting
+/// state; on resume the (possibly edited) copy is written back into the
+/// `ExceptionFrame` so the stub's `iretq` uses it. (Full entry-frame unification,
+/// which would remove this copy, is a deferred follow-up that does not change the
+/// userspace ABI.)
+///
+/// # Safety
+/// `tcb` is the current user thread and has a bound handler; `frame` is the live
+/// `ExceptionFrame` on the current kernel stack; no lock is held.
+#[cfg(not(test))]
+unsafe fn redirect_user_fault(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    frame: *mut ExceptionFrame,
+    info: &crate::ipc::fault::FaultInfo,
+) -> bool
+{
     // Canonical register frame the handler reads/edits. Lives in this kernel
     // stack frame, which is preserved across the block (the context switch saves
     // and restores the kernel rsp), so the pointer stays valid while the faulter
@@ -960,7 +1106,7 @@ unsafe fn redirect_user_page_fault(
     }
 
     // SAFETY: handler bound; trap_frame points at the canonical frame; no lock held.
-    let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, &info) };
+    let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, info) };
 
     // SAFETY: restore the canonical kstack-slot pointer.
     unsafe {

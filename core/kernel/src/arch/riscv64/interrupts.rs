@@ -533,21 +533,23 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
             // in exception context because we entered from a running user thread.
             let tcb = unsafe { crate::syscall::current_tcb() };
 
-            // Redirect a page fault (cause 12/13/15) to the thread's bound fault
-            // handler, if any. On a resume reply the trap returns and `sret`
-            // re-executes the faulting instruction (sepc is not advanced for
-            // faults) or continues from a handler-modified sepc.
+            // Redirect a kernel-unresolvable U-mode exception to the thread's
+            // bound fault handler, if any. Page faults (cause 12/13/15) carry
+            // `FAULT_KIND_VM`; every other U-mode exception carries
+            // `FAULT_KIND_EXCEPTION` (see `fault_info_for`). On a resume reply the
+            // trap returns and `sret` re-executes the faulting instruction (sepc
+            // is not advanced for faults) or continues from a handler-modified
+            // sepc.
             // SAFETY: tcb is the running user thread; has_handler only reads the
             // atomic fault_handler field.
-            let handler_bound = matches!(cause_code, 12 | 13 | 15)
-                && !tcb.is_null()
-                && unsafe { crate::ipc::fault::has_handler(tcb) };
+            let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
             if handler_bound
             {
+                let info = fault_info_for(cause_code, frame);
                 // SAFETY: frame is the live trap frame on this kernel stack; the
                 // redirect points trap_frame at it for the handler's reg access
                 // and returns whether to resume.
-                if unsafe { redirect_user_page_fault(tcb, frame, cause_code) }
+                if unsafe { redirect_user_fault(tcb, frame, &info) }
                 {
                     return;
                 }
@@ -642,10 +644,65 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
     }
 }
 
-/// Redirect a genuine userspace page fault to the faulting thread's bound fault
+/// Build the architecture-neutral [`FaultInfo`](crate::ipc::fault::FaultInfo) for
+/// a U-mode exception `cause_code`. Page faults (12/13/15) become `FAULT_KIND_VM`
+/// with access flags; every other cause becomes `FAULT_KIND_EXCEPTION` with a
+/// normalized class and `stval` as the architecture auxiliary datum.
+#[cfg(not(test))]
+fn fault_info_for(cause_code: u64, frame: &TrapFrame) -> crate::ipc::fault::FaultInfo
+{
+    match cause_code
+    {
+        // scause: 12 = instruction page fault, 13 = load page fault, 15 =
+        // store/AMO page fault. RISC-V does not encode present-vs-not-present in
+        // scause, so the PRESENT flag is left unset (a handler that needs it
+        // inspects its mappings).
+        12 | 13 | 15 =>
+        {
+            let access = match cause_code
+            {
+                12 => syscall::FAULT_ACCESS_EXEC,
+                15 => syscall::FAULT_ACCESS_WRITE,
+                _ => syscall::FAULT_ACCESS_READ, // 13 = load
+            };
+            crate::ipc::fault::FaultInfo {
+                kind: syscall::FAULT_KIND_VM,
+                d1: frame.stval,
+                d2: access,
+                ip: frame.sepc,
+            }
+        }
+        _ => crate::ipc::fault::FaultInfo {
+            kind: syscall::FAULT_KIND_EXCEPTION,
+            d1: normalize_riscv_exception(cause_code),
+            d2: frame.stval,
+            ip: frame.sepc,
+        },
+    }
+}
+
+/// Map a RISC-V exception cause code to the architecture-neutral
+/// [`syscall::FAULT_EXC_UNKNOWN`]-family normalized code delivered in a
+/// `FAULT_KIND_EXCEPTION` message. Page-fault causes (12/13/15) and `ecall`
+/// (cause 8) are handled elsewhere and never reach here.
+#[cfg(not(test))]
+fn normalize_riscv_exception(cause: u64) -> u64
+{
+    match cause
+    {
+        0 | 4 | 6 => syscall::FAULT_EXC_ALIGNMENT, // instr / load / store misaligned
+        1 | 5 | 7 => syscall::FAULT_EXC_ACCESS,    // instr / load / store access fault
+        2 => syscall::FAULT_EXC_ILLEGAL_INSTRUCTION,
+        3 => syscall::FAULT_EXC_BREAKPOINT,
+        _ => syscall::FAULT_EXC_UNKNOWN,
+    }
+}
+
+/// Redirect a genuine userspace fault to the faulting thread's bound fault
 /// handler. Returns `true` if the handler resolved the fault and the thread
-/// should resume (re-execute the faulting instruction), `false` if the fault is
-/// terminal (the handler declined or the binding was severed).
+/// should resume (re-execute the faulting instruction, or continue from a
+/// handler-modified sepc), `false` if the fault is terminal (the handler declined
+/// or the binding was severed).
 ///
 /// RISC-V already uses a single [`TrapFrame`] for every kernel entry, so — unlike
 /// x86-64 — no frame copy is needed: `(*tcb).trap_frame` is pointed at the live
@@ -657,29 +714,12 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live
 /// trap frame on the current kernel stack; no lock is held.
 #[cfg(not(test))]
-unsafe fn redirect_user_page_fault(
+unsafe fn redirect_user_fault(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
     frame: &mut TrapFrame,
-    cause_code: u64,
+    info: &crate::ipc::fault::FaultInfo,
 ) -> bool
 {
-    // scause: 12 = instruction page fault, 13 = load page fault, 15 = store/AMO
-    // page fault. RISC-V does not encode present-vs-not-present in scause, so the
-    // PRESENT flag is left unset (a handler that needs it inspects its mappings).
-    let access = match cause_code
-    {
-        12 => syscall::FAULT_ACCESS_EXEC,
-        15 => syscall::FAULT_ACCESS_WRITE,
-        _ => syscall::FAULT_ACCESS_READ, // 13 = load
-    };
-
-    let info = crate::ipc::fault::FaultInfo {
-        kind: syscall::FAULT_KIND_VM,
-        d1: frame.stval,
-        d2: access,
-        ip: frame.sepc,
-    };
-
     // Point trap_frame at the live frame so the handler's register access targets
     // the faulting state; restore the previous pointer afterward.
     // SAFETY: tcb valid; frame is a valid live TrapFrame.
@@ -691,7 +731,7 @@ unsafe fn redirect_user_page_fault(
     }
 
     // SAFETY: handler bound; trap_frame points at the live frame; no lock held.
-    let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, &info) };
+    let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, info) };
 
     // SAFETY: restore the previous trap_frame pointer.
     unsafe {

@@ -544,9 +544,14 @@ pub const FAULT_LABEL: u64 = u64::MAX - 1;
 pub const FAULT_KIND_VM: u64 = 0;
 
 /// Fault kind (data word 0): a CPU exception with no kernel resolution (illegal
-/// instruction, alignment, divide error, …). Data words 1–3 are
-/// `[normalized_code, arch_aux_code, faulting_ip]`. Routed by a later phase;
-/// reserved here so the taxonomy is stable.
+/// instruction, alignment, breakpoint, …). Data words 1–3 are
+/// `[normalized_code, arch_aux_code, faulting_ip]`:
+/// - `normalized_code` is an architecture-neutral [`FAULT_EXC_UNKNOWN`]-family
+///   class so a handler can dispatch without architecture knowledge.
+/// - `arch_aux_code` is the architecture's auxiliary datum for the trap:
+///   x86-64 the hardware error code (`0` when the vector has none); RISC-V
+///   `stval` (the faulting address for misaligned/access faults, the faulting
+///   instruction bits for an illegal instruction).
 pub const FAULT_KIND_EXCEPTION: u64 = 1;
 
 /// `FAULT_KIND_VM` access flag: the access was a read.
@@ -558,6 +563,43 @@ pub const FAULT_ACCESS_EXEC: u64 = 1 << 2;
 /// `FAULT_KIND_VM` access flag: the page was present (protection violation)
 /// rather than not-present.
 pub const FAULT_ACCESS_PRESENT: u64 = 1 << 3;
+
+// ── Normalized exception codes (FAULT_KIND_EXCEPTION data word 1) ───────────────
+//
+// Architecture-neutral classification of a CPU exception, so a handler dispatches
+// on the class without architecture knowledge. The raw architectural code/value
+// is carried separately in `arch_aux_code` (data word 2). Values not listed are
+// reserved; a handler MUST treat an unrecognized code as [`FAULT_EXC_UNKNOWN`].
+
+/// Normalized exception: unclassified — the architecture raised a U-mode
+/// exception that maps to no class below. Consult `arch_aux_code` for detail.
+pub const FAULT_EXC_UNKNOWN: u64 = 0;
+/// Normalized exception: illegal / undefined instruction (x86-64 `#UD`; RISC-V
+/// illegal instruction).
+pub const FAULT_EXC_ILLEGAL_INSTRUCTION: u64 = 1;
+/// Normalized exception: software breakpoint (x86-64 `#BP`; RISC-V `ebreak`).
+pub const FAULT_EXC_BREAKPOINT: u64 = 2;
+/// Normalized exception: debug trap — single-step or hardware breakpoint
+/// (x86-64 `#DB`). No RISC-V mapping (debug is an external-debugger facility).
+pub const FAULT_EXC_DEBUG: u64 = 3;
+/// Normalized exception: integer divide error (x86-64 `#DE`). RISC-V has no
+/// hardware divide trap.
+pub const FAULT_EXC_DIVIDE: u64 = 4;
+/// Normalized exception: arithmetic overflow trap (x86-64 `#OF` / `INTO`).
+pub const FAULT_EXC_OVERFLOW: u64 = 5;
+/// Normalized exception: bound-range exceeded (x86-64 `#BR`).
+pub const FAULT_EXC_BOUND_RANGE: u64 = 6;
+/// Normalized exception: misaligned access (x86-64 `#AC`; RISC-V instruction /
+/// load / store address-misaligned).
+pub const FAULT_EXC_ALIGNMENT: u64 = 7;
+/// Normalized exception: physical access fault — the access reached memory the
+/// hardware forbids (RISC-V instruction / load / store access fault).
+pub const FAULT_EXC_ACCESS: u64 = 8;
+/// Normalized exception: protection / segmentation violation (x86-64 `#GP`,
+/// `#SS`, `#NP`, `#TS`).
+pub const FAULT_EXC_PROTECTION: u64 = 9;
+/// Normalized exception: floating-point / SIMD error (x86-64 `#MF` / `#XM`).
+pub const FAULT_EXC_FP: u64 = 10;
 
 /// Fault reply label: resume the faulting thread (re-execute the faulting
 /// instruction, or continue from a handler-modified instruction pointer). The

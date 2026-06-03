@@ -19,7 +19,7 @@
 //! - One root [`CapTag::IoPort`] cap covering the full 64K I/O port
 //!   space (x86-64, USE)
 //! - One [`CapTag::SchedControl`] cap spanning the full userspace priority range
-//! - One [`CapTag::SbiControl`] cap on RISC-V (CALL)
+//! - One [`CapTag::SbiControl`] cap on RISC-V (all sanctioned SBI rights)
 //!
 //! The populated `CSpace` is stored in [`ROOT_CSPACE`] until Phase 9 hands it
 //! to the init process. Boot module ELF images get their own RO Memory caps
@@ -1858,7 +1858,9 @@ fn populate_cspace(
         );
     }
 
-    // RISC-V: one SbiControl capability — grants authority to forward SBI calls.
+    // RISC-V: one SbiControl capability — the root forwarding authority. It
+    // carries every sanctioned SBI right; init attenuates per-consumer copies
+    // (devmgr serves pwrmgr a `SBI_RESET`-only derivative).
     #[cfg(target_arch = "riscv64")]
     let sbi_control_slot = {
         let ptr = mint_phase7_body(SbiControlObject {
@@ -1867,7 +1869,7 @@ fn populate_cspace(
         let slot = insert_or_fatal(
             cspace,
             CapTag::SbiControl,
-            Rights::CALL,
+            Rights::SBI_RESET | Rights::SBI_SUSPEND | Rights::SBI_CPPC | Rights::SBI_BASE,
             ptr,
             "Phase 7: cannot allocate SbiControl capability",
         );

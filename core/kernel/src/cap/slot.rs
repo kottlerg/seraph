@@ -232,8 +232,21 @@ impl Rights
     // nothing to gate with a right. Bit 19 is unused.
 
     // ── SbiControl ───────────────────────────────────────────────────────────
-    /// May forward SBI calls to M-mode firmware (RISC-V only).
-    pub const CALL: Rights = Rights(1 << 20);
+    // One right per sanctioned SBI extension (RISC-V only). `sys_sbi_call` maps
+    // an extension ID to the right it requires; an extension with no right here
+    // is absent from the vocabulary and can never be forwarded, regardless of
+    // cap. Kernel-reserved extensions (TIME/IPI/RFENCE/HSM) and architecturally
+    // disallowed ones (DBCN/PMU) are deliberately omitted. See
+    // `docs/capability-model.md`.
+    /// May forward the SBI System Reset (SRST) extension to firmware.
+    pub const SBI_RESET: Rights = Rights(1 << 20);
+    /// May forward the SBI System Suspend (SUSP) extension to firmware.
+    pub const SBI_SUSPEND: Rights = Rights(1 << 22);
+    /// May forward the SBI CPPC (processor performance control) extension to
+    /// firmware.
+    pub const SBI_CPPC: Rights = Rights(1 << 23);
+    /// May forward the read-only SBI Base extension (version / extension probe).
+    pub const SBI_BASE: Rights = Rights(1 << 24);
 
     // ── Memory retype ──────────────────────────────────────────────────────────
     /// Authority to retype this Memory cap's region into kernel objects.
@@ -590,7 +603,10 @@ mod tests
             | Rights::REVOKE
             | Rights::MODIFY
             | Rights::USE
-            | Rights::CALL;
+            | Rights::SBI_RESET
+            | Rights::SBI_SUSPEND
+            | Rights::SBI_CPPC
+            | Rights::SBI_BASE;
         assert_eq!((combined & Rights::RETYPE).0, 0);
     }
 }

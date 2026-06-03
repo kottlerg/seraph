@@ -969,7 +969,8 @@ fn handle_query_shutdown_device(
             reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
             return;
         }
-        let Ok(sbi) = syscall::cap_derive(caps.sbi_control_cap, syscall::RIGHTS_ALL)
+        // pwrmgr needs only system reset (SRST); attenuate to the minimum.
+        let Ok(sbi) = syscall::cap_derive(caps.sbi_control_cap, syscall::RIGHTS_SBI_RESET)
         else
         {
             reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);

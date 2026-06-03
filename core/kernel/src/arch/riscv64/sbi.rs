@@ -6,9 +6,10 @@
 //! Generic SBI ecall forwarding for RISC-V.
 //!
 //! Provides a thin wrapper around the `ecall` instruction that forwards
-//! arbitrary SBI calls from S-mode to M-mode firmware. Used by the
-//! `SYS_SBI_CALL` syscall to let userspace invoke SBI extensions
-//! (SRST, HSM, PMU, etc.) through the kernel.
+//! arbitrary SBI calls from S-mode to M-mode firmware. The wrapper itself is
+//! unrestricted; the userspace-reachable path (`SYS_SBI_CALL`) admits only the
+//! sanctioned extensions enumerated by `syscall::sbi::sbi_required_right`
+//! (SRST, SUSP, CPPC, Base), each behind a per-extension `SbiControl` right.
 
 /// SBI return value: error code and value.
 pub struct SbiRet

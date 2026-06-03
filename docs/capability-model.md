@@ -153,19 +153,47 @@ in the TSS on revocation.
 
 ### SbiControl (RISC-V only)
 
-A capability authorising the holder to forward Supervisor Binary Interface
-(SBI) calls to M-mode firmware via `SYS_SBI_CALL`. Rights:
-- **Call** — may forward an SBI `(EID, FID, args)` tuple to firmware.
+A capability authorising the holder to forward a *sanctioned* Supervisor Binary
+Interface (SBI) extension to M-mode firmware via `SYS_SBI_CALL`. RISC-V only; it
+does not exist on x86-64 (no SBI concept).
 
-There is one SbiControl capability, created at boot on RISC-V; it does not exist
-on x86-64 (no SBI concept). Init holds it and delegates it to the userspace
-component that needs firmware services — today pwrmgr, for system reset (SRST).
+Authority is **per extension**, expressed as rights rather than a numeric range —
+SBI extension IDs are sparse and non-numeric, so the cap does not join the
+range-authority family and has no split/merge. Each sanctioned extension has its
+own right:
+- **Reset** — forward System Reset (SRST).
+- **Suspend** — forward System Suspend (SUSP).
+- **Cppc** — forward processor performance control (CPPC).
+- **Base** — forward the read-only Base extension (version / extension probe).
 
-The current capability is **coarse**: any holder with the `Call` right may
-forward *any* SBI extension, including extensions the kernel itself manages
-(TIME, IPI, RFENCE, HSM). Constraining this — hard-denying kernel-reserved
-extensions and gating per a permitted-EID set — is tracked in the SbiControl
-gating issue; this section is updated when that work lands.
+`SYS_SBI_CALL` maps the requested extension ID to the right it requires and
+rejects the call with `InsufficientRights` unless the cap carries that right.
+
+**Kernel floor.** An extension with no right is absent from the vocabulary and
+can never be forwarded from userspace, regardless of cap (`InvalidArgument`).
+Two classes are deliberately excluded:
+- *Kernel-reserved* — TIME (scheduler timer), IPI (TLB shootdown / wakeups),
+  RFENCE (remote fences), HSM (hart lifecycle). The kernel manages these
+  internally; forwarding them from userspace is a soundness violation — it could
+  halt a hart or break scheduling.
+- *Architecturally disallowed* — DBCN (debug console) and PMU. Not kernel-unsafe,
+  but each bypasses a kernel-owned, userspace-facing subsystem (the
+  console-ownership model; performance-counter mediation).
+
+**Distribution.** The root cap, created at boot, carries every sanctioned right.
+Init holds it and attenuates per-consumer copies with `cap_derive` (rights only
+narrow, never widen — the same attenuation as every other cap). devmgr brokers
+the platform-shutdown cap and serves pwrmgr a copy narrowed to **Reset** only;
+no other consumer receives a forwarding cap. Narrowing the set a cap may forward
+*is* this rights attenuation — there is no dedicated SBI split operation.
+
+**Gating-granularity decision.** Per-cap authority is encoded as rights bits, not
+an EID set carried by `SbiControlObject`, because the sanctioned set is small and
+non-numeric and there is a single consumer (pwrmgr, SRST-only). `SbiControlObject`
+stays bare and the init descriptor is unchanged (`aux0 = aux1 = 0`), so
+`INIT_PROTOCOL_VERSION` is not bumped. The shared 32-bit `Rights` budget bounds
+how many extensions can be sanctioned this way; revisiting that budget (per-type
+rights) is tracked separately.
 
 ### SchedControl
 
@@ -429,7 +457,7 @@ the CSpace with an initial set of capabilities covering all available resources:
 - Read-only Memory capabilities for firmware table regions (PlatformTable entries),
   allowing userspace to parse ACPI or Device Tree data
 - IoPort capabilities for all boot-provided I/O port ranges (x86-64 only)
-- One SbiControl capability (RISC-V only; Call rights)
+- One SbiControl capability (RISC-V only) carrying every sanctioned SBI right
 - One SchedControl capability spanning the full userspace priority range `[1, PRIORITY_MAX]`
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)

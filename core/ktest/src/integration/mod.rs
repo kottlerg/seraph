@@ -44,6 +44,7 @@ pub mod multi_caller_ipc_fifo;
 pub mod priority_preemption;
 pub mod retype_reclaim;
 pub mod retype_subpage_clobber;
+pub mod sbi_gating;
 pub mod shared_memory_two_aspaces;
 pub mod thread_lifecycle;
 pub mod tlb_coherency;
@@ -71,6 +72,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::cap_delegation_chain",
         cap_delegation_chain::run(ctx)
     );
+    run_integration_test!("integration::sbi_gating", sbi_gating::run(ctx));
     run_integration_test!("integration::tlb_coherency", tlb_coherency::run(ctx));
     run_integration_test!("integration::retype_reclaim", retype_reclaim::run(ctx));
     run_integration_test!(

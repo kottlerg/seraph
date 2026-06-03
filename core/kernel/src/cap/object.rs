@@ -36,7 +36,7 @@
 //! | MmioObject    | 40 B  |
 //! | InterruptObject     | 24 B  |
 //! | IoPortObject   | 24 B  |
-//! | SchedControlObject  | 20 B  |
+//! | SchedControlObject  | 24 B  |
 //! | SbiControlObject    | 16 B  |
 //! | ThreadObject        | 24 B  |
 //! | AddressSpaceObject  | 432 B |
@@ -2582,8 +2582,8 @@ mod tests
         assert_eq!(size_of::<InterruptObject>(), 24);
         // IoPortObject: 16 header + 2 base + 2 size + 4 pad = 24.
         assert_eq!(size_of::<IoPortObject>(), 24);
-        // SchedControlObject: 16 header + 1 min + 1 max + 2 pad = 20.
-        assert_eq!(size_of::<SchedControlObject>(), 20);
+        // SchedControlObject: 16 header + 1 min + 1 max + 6 pad = 24 (8-align).
+        assert_eq!(size_of::<SchedControlObject>(), 24);
         assert_eq!(size_of::<SbiControlObject>(), 16);
         assert_eq!(size_of::<ThreadObject>(), 24);
         assert_eq!(size_of::<EndpointObject>(), 24);

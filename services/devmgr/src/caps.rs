@@ -162,10 +162,12 @@ pub struct DevmgrCaps
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub ioport_root_cap: u32,
 
-    // Copy of init's `SbiControl` cap (RISC-V only; zero on x86-64). The
-    // SBI SRST shutdown/reboot authority; devmgr serves a `cap_derive`
-    // copy to pwrmgr on `QUERY_SHUTDOWN_DEVICE`. devmgr itself never
-    // forwards an SBI call — it only brokers the cap.
+    // Steady-state holder of the platform power-state SBI authority (RISC-V
+    // only; zero on x86-64): a Reset + Suspend `SbiControl` cap from init,
+    // which is reaped. devmgr serves pwrmgr a `cap_derive` copy narrowed to
+    // Reset on `QUERY_SHUTDOWN_DEVICE`; Suspend is held against a future
+    // path. devmgr itself never forwards an SBI call — it only holds and
+    // brokers the cap.
     #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
     pub sbi_control_cap: u32,
 

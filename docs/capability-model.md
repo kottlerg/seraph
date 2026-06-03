@@ -183,15 +183,22 @@ userspace "should" use.
 **Distribution is policy, not kernel enforcement.** Every non-reserved extension
 is sanctioned with a right, but a holder can only forward an extension whose
 right its cap actually carries — so what userspace may do is set by which caps
-are handed out, by ordinary minimum-privilege distribution. The root cap, created
-at boot, carries every sanctioned right; init holds it and attenuates per-consumer
-copies with `cap_derive` (rights only narrow, never widen). devmgr brokers the
-platform-shutdown cap and serves pwrmgr a copy narrowed to **Reset** only. No
-consumer is given **Dbcn** (the userspace serial driver owns the console, so
-delegating it would bypass the console-ownership model) or **Pmu** (no perf
-consumer; counts are unmediated across context switches) — that withholding is a
-distribution choice, not a kernel wall. Narrowing the set a cap may forward *is*
-this rights attenuation; there is no dedicated SBI split operation.
+are handed out, by ordinary minimum-privilege distribution (`cap_derive`, which
+only narrows rights, never widens; there is no dedicated SBI split operation).
+
+The kernel mints the root cap once at boot, carrying every sanctioned right, into
+init's cspace. **init is reaped after bootstrap, so any right not transferred to a
+surviving service before the reap is dropped — unforwardable until the next boot.
+This, not a kernel wall, is what bounds the live extension set.** init transfers a
+cap narrowed to **Reset** + **Suspend** to devmgr, the steady-state holder of
+platform firmware authority (it sits alongside the ACPI / MMIO / IRQ resources
+devmgr already brokers). The remaining sanctioned rights are carried into no
+surviving cap and die at init's reap: **Dbcn** is thrown away by design (the
+userspace serial driver owns the console; forwarding the firmware console would
+bypass the console-ownership model), and **Cppc** / **Base** / **Pmu** are simply
+not needed by any current service. devmgr serves pwrmgr a copy further narrowed to
+**Reset** only (system reset / reboot); **Suspend** is retained against a future
+power-management path but delegated to no one today.
 
 **Gating-granularity decision.** Per-cap authority is encoded as rights bits, not
 an EID set carried by `SbiControlObject`, because the extension set is small and

@@ -747,12 +747,22 @@ pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
     if ipc_buf.is_null() {
         return Err(crate::io::Error::other("seraph: IPC buffer not registered"));
     }
-    let memmgr_ep = startup_info().memmgr_endpoint;
+    let info = startup_info();
+    let memmgr_ep = info.memmgr_endpoint;
     if memmgr_ep == 0 {
         return Err(crate::io::Error::other("seraph: no pager (memmgr unreachable)"));
     }
     let range = reserve_pages(pages)
         .map_err(|_| crate::io::Error::other("seraph: VA reservation failed"))?;
+    // Fund this address space's page-table growth budget for the region. The
+    // pager maps frames into this AS on fault via `map_page_pooled`, which
+    // draws intermediate page tables from the AS's own retype-backed pool; the
+    // demand region is far from the eager mappings, so without funding the pool
+    // is exhausted and the on-fault map fails (the pager then kills the thread).
+    if !fund_aspace_pt_budget(info.self_aspace, pages) {
+        unreserve_pages(range);
+        return Err(crate::io::Error::other("seraph: page-table budget funding failed"));
+    }
     let len_bytes = pages.saturating_mul(syscall_abi::PAGE_SIZE);
     let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_REGION)
         .word(0, range.va_start())

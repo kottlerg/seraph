@@ -171,6 +171,19 @@ impl ProcessRecord
         }
     }
 
+    /// Reuse this free slot for `badge`, in place. Resets only the scalar
+    /// cursors — stale `memory_caps` / `regions` entries beyond `used` /
+    /// `region_count` are never read, so they need no clearing. In-place reset
+    /// is load-bearing: constructing a fresh `ProcessRecord` by value (~12 KiB)
+    /// would overflow memmgr's VA-capped main-thread stack.
+    fn reset(&mut self, badge: u64)
+    {
+        self.badge = badge;
+        self.used = 0;
+        self.aspace_cap = 0;
+        self.region_count = 0;
+    }
+
     fn push(&mut self, memory_cap: OwnedMemory) -> Result<(), ()>
     {
         if self.used >= MAX_PER_PROC
@@ -397,59 +410,48 @@ impl FreePool
 /// process identity).
 struct ProcessTable
 {
-    records: [Option<ProcessRecord>; MAX_PROCESSES],
+    /// Slots are stored inline (not `Option`) so insert/free never move a
+    /// ~12 KiB `ProcessRecord` by value onto memmgr's VA-capped stack. A slot
+    /// is free iff `badge == 0` (every minted badge is nonzero).
+    records: [ProcessRecord; MAX_PROCESSES],
 }
 
 impl ProcessTable
 {
-    // large_stack_arrays: const-evaluated at static-initialization time;
-    // never touches a runtime stack frame.
+    // large_stack_arrays: const-evaluated at static-initialization time. The
+    // EMPTY record is all-zero, so the static lands in .bss — never a stack
+    // frame.
     #[allow(clippy::large_stack_arrays)]
     const fn new() -> Self
     {
-        const NONE: Option<ProcessRecord> = None;
+        const EMPTY: ProcessRecord = ProcessRecord::new(0);
         Self {
-            records: [NONE; MAX_PROCESSES],
+            records: [EMPTY; MAX_PROCESSES],
         }
     }
 
+    /// Claim a free slot for `badge`, resetting it in place. Returns `None`
+    /// when the table is full.
     fn insert(&mut self, badge: u64) -> Option<&mut ProcessRecord>
     {
-        for slot in &mut self.records
-        {
-            if slot.is_none()
-            {
-                *slot = Some(ProcessRecord::new(badge));
-                return slot.as_mut();
-            }
-        }
-        None
+        let slot = self.records.iter_mut().find(|slot| slot.badge == 0)?;
+        slot.reset(badge);
+        Some(slot)
     }
 
     fn find_mut(&mut self, badge: u64) -> Option<&mut ProcessRecord>
     {
-        for slot in &mut self.records
-        {
-            if let Some(rec) = slot
-                && rec.badge == badge
-            {
-                return slot.as_mut();
-            }
-        }
-        None
+        self.records.iter_mut().find(|slot| slot.badge == badge)
     }
 
-    fn take(&mut self, badge: u64) -> Option<ProcessRecord>
+    /// Mark the slot owned by `badge` free (reusable) in place. The caller has
+    /// already reclaimed the record's resources.
+    fn free(&mut self, badge: u64)
     {
-        for slot in &mut self.records
+        if let Some(rec) = self.find_mut(badge)
         {
-            if let Some(rec) = slot
-                && rec.badge == badge
-            {
-                return slot.take();
-            }
+            rec.badge = 0;
         }
-        None
     }
 }
 
@@ -702,6 +704,26 @@ fn derive_for_caller(outer_slot: u32) -> Option<u32>
     syscall::cap_derive(outer_slot, syscall::RIGHTS_ALL).ok()
 }
 
+/// Map a demand-region protection mask to the cap rights to derive for the
+/// fault-backing inner cap: least-privilege, exactly the rights `mem_map` will
+/// validate against the requested prot bits. `region.prot` is W^X-exclusive
+/// (checked at registration), so this never produces a W+X cap.
+fn rights_for_prot(prot: u64) -> u64
+{
+    if prot & MAP_EXECUTABLE != 0
+    {
+        syscall::RIGHTS_MAP_RX
+    }
+    else if prot & MAP_WRITABLE != 0
+    {
+        syscall::RIGHTS_MAP_RW
+    }
+    else
+    {
+        syscall::RIGHTS_MAP_READ
+    }
+}
+
 // ── IPC handlers ─────────────────────────────────────────────────────────────
 
 /// Reply slot count for `REQUEST_MEMORY_CAPS`. Per-cap page counts pack into
@@ -946,7 +968,7 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u32,
     else
     {
         // Roll back the table insertion.
-        let _ = table.take(new_badge);
+        table.free(new_badge);
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     };
@@ -993,7 +1015,7 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // `integration::retype_reclaim` covers the same invariant on a
     // dedicated source cap with no allocator residual.
     let pool = pool_mut();
-    if let Some(record) = table_mut().take(dead_badge)
+    if let Some(record) = table_mut().find_mut(dead_badge)
     {
         for memory_cap in record.memory_caps.iter().take(record.used).flatten()
         {
@@ -1023,6 +1045,8 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         {
             let _ = syscall::cap_delete(record.aspace_cap);
         }
+        // Free the slot in place (mark reusable); no by-value move.
+        record.badge = 0;
     }
     // Idempotent: missing badge is not an error.
 
@@ -1274,7 +1298,13 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     }
 
-    let Some(inner) = derive_for_caller(outer)
+    // Derive the inner mapping cap with exactly the rights the region's
+    // protection needs (R / R+W / R+X), least-privilege. Pool outers are
+    // full-rights (every RAM frame, including init's donated segments, carries
+    // WRITE), so the narrowing always succeeds; `mem_map` then validates the
+    // requested prot bits against these rights. Mirrors procmgr's RW mapping
+    // pattern (`cap_derive(_, RIGHTS_MAP_RW)`).
+    let Ok(inner) = syscall::cap_derive(outer, rights_for_prot(region.prot))
     else
     {
         record.pop();

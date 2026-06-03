@@ -525,7 +525,6 @@ unsafe fn kernel_entry_post_rebase(
         // so init can create child threads bound to its own address space and map
         // its code pages into child processes once a process manager is available.
         let (init_aspace_cap_slot, segment_memory_base, segment_memory_count) = {
-            use boot_protocol::SegmentFlags;
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::{CapTag, Rights};
 
@@ -557,12 +556,18 @@ unsafe fn kernel_entry_post_rebase(
             for i in 0..seg_count
             {
                 let seg = &init_image.segments[i];
-                let rights = match seg.flags
-                {
-                    SegmentFlags::Read => Rights::MAP | Rights::RETYPE,
-                    SegmentFlags::ReadWrite => Rights::MAP | Rights::WRITE | Rights::RETYPE,
-                    SegmentFlags::ReadExecute => Rights::MAP | Rights::EXECUTE | Rights::RETYPE,
-                };
+                // Full rights regardless of the segment's protection. This cap
+                // is held only to donate the frame into memmgr's pool at init's
+                // reap, where it becomes general anonymous RAM any consumer may
+                // map writable (demand paging, REQUEST_MEMORY_CAPS). Cap rights
+                // gate derivation, not the live mapping: init's segments are
+                // already mapped at their true protection (R/RW/RX) by
+                // `map_segment` above, so a writable cap cannot widen a running
+                // segment. A narrower cap donates a non-writable frame that
+                // fails downstream writable maps. Mirrors the boot-module and
+                // reclaim-scratch mints (`cap/mod.rs`).
+                let rights =
+                    Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE;
                 // The bootloader encodes the ELF in-page offset into
                 // `phys_addr` so `map_segment` can preserve
                 // `phys & 0xFFF == virt & 0xFFF`. The Memory cap exposed

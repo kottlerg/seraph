@@ -192,8 +192,13 @@ bitflags! {
         // SchedControl carries no rights bit — bit 19 is unused. A
         // SchedControl's authority is its presence plus its [min, max] band.
 
-        // SbiControl
-        const CALL       = 1 << 20;  // forward SBI calls to firmware (RISC-V only)
+        // SbiControl — one right per sanctioned SBI extension (RISC-V only)
+        const SBI_RESET   = 1 << 20;  // forward SRST (system reset)
+        const SBI_SUSPEND = 1 << 22;  // forward SUSP (system suspend)
+        const SBI_CPPC    = 1 << 23;  // forward CPPC (perf control)
+        const SBI_BASE    = 1 << 24;  // forward Base (read-only version probe)
+        const SBI_DBCN    = 1 << 25;  // forward DBCN (debug console)
+        const SBI_PMU     = 1 << 26;  // forward PMU (perf monitoring)
 
         // Memory retype
         const RETYPE     = 1 << 21;  // retype a Memory cap's region into kernel objects

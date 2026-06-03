@@ -700,9 +700,17 @@ pub fn create_devmgr_with_caps(
     }
     else if info.sbi_control_cap != 0
     {
-        // RISC-V: SbiControl is the platform shutdown authority. devmgr
-        // serves a copy to pwrmgr on QUERY_SHUTDOWN_DEVICE for SBI SRST.
-        syscall::cap_derive(info.sbi_control_cap, syscall::RIGHTS_ALL).unwrap_or(0)
+        // RISC-V: devmgr is the steady-state holder of the platform firmware
+        // authority (init is reaped, so its root cap is dropped). Transfer only
+        // the power-state extensions — system reset (served to pwrmgr on
+        // QUERY_SHUTDOWN_DEVICE, narrowed to Reset there) and suspend (reserved
+        // for a future path). The other sanctioned SBI rights are carried into
+        // no surviving cap and are therefore dropped at init's reap.
+        syscall::cap_derive(
+            info.sbi_control_cap,
+            syscall::RIGHTS_SBI_RESET | syscall::RIGHTS_SBI_SUSPEND,
+        )
+        .unwrap_or(0)
     }
     else
     {

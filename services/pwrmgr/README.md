@@ -97,7 +97,7 @@ Out of scope for v0.1.0; deferred until concrete consumers exist:
 
 - **Suspend** (ACPI S3) and **hibernate** (ACPI S4) — RAM-image
   persistence, driver quiescence protocol, BSP/AP resume vector. RISC-V
-  deep sleep via the SBI HSM extension.
+  deep sleep via the SBI System Suspend (SUSP) extension.
 - **Runtime power management** — per-device D-states, CPU C-states / idle
   governors, frequency scaling.
 - **Battery and thermal monitoring** — ACPI `_BST` / `_TZ`, RISC-V

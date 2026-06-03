@@ -472,6 +472,25 @@ pub const RIGHTS_CSPACE: u64 = (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
 /// consuming syscall.
 pub const RIGHTS_RETYPE: u64 = 1 << 21;
 
+/// `SbiControl`: may forward the SBI System Reset (SRST) extension (RISC-V only).
+pub const RIGHTS_SBI_RESET: u64 = 1 << 20;
+
+/// `SbiControl`: may forward the SBI System Suspend (SUSP) extension (RISC-V only).
+pub const RIGHTS_SBI_SUSPEND: u64 = 1 << 22;
+
+/// `SbiControl`: may forward the SBI CPPC perf-control extension (RISC-V only).
+pub const RIGHTS_SBI_CPPC: u64 = 1 << 23;
+
+/// `SbiControl`: may forward the read-only SBI Base extension (RISC-V only).
+pub const RIGHTS_SBI_BASE: u64 = 1 << 24;
+
+/// `SbiControl`: may forward the SBI Debug Console (DBCN) extension (RISC-V only).
+pub const RIGHTS_SBI_DBCN: u64 = 1 << 25;
+
+/// `SbiControl`: may forward the SBI Performance Monitoring Unit (PMU) extension
+/// (RISC-V only).
+pub const RIGHTS_SBI_PMU: u64 = 1 << 26;
+
 // ── Exit reason constants ─────────────────────────────────────────────────────
 //
 // Values passed via death notification when a thread exits or faults.

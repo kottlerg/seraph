@@ -274,8 +274,9 @@ Phase 7, and `KERNEL_MMIO` is populated.
       priorities within that band. Init splits it into a baseline band and an
       elevated remainder and delegates copies per policy (see
       [capability-model.md § SchedControl](../../../docs/capability-model.md))
-   e. One SbiControl capability (RISC-V only; Call rights) for init to
-      forward SBI calls.
+   e. One SbiControl capability (RISC-V only) carrying every sanctioned SBI
+      right, for init to forward sanctioned SBI extensions and attenuate
+      per-consumer copies.
    f. (Thread and process capabilities for init are added in Phase 9)
 4. Mint reclaimable Memory caps from `BootInfo.reclaim_ranges` via
    `cap::mint_reclaim_memory_caps`:

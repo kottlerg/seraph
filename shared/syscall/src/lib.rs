@@ -58,8 +58,9 @@ pub use syscall_abi::{
     CAP_INFO_CSPACE_USED, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
     CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
     MAP_EXECUTABLE, MAP_READ, MAP_READONLY, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_CSPACE,
-    RIGHTS_MAP_READ, RIGHTS_MAP_RW, RIGHTS_MAP_RX, RIGHTS_RECEIVE, RIGHTS_RETYPE, RIGHTS_SEND,
-    RIGHTS_SEND_GRANT, RIGHTS_THREAD,
+    RIGHTS_MAP_READ, RIGHTS_MAP_RW, RIGHTS_MAP_RX, RIGHTS_RECEIVE, RIGHTS_RETYPE, RIGHTS_SBI_BASE,
+    RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
+    RIGHTS_SEND, RIGHTS_SEND_GRANT, RIGHTS_THREAD,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -1941,8 +1942,11 @@ pub fn thread_write_regs(thread_cap: u32, buf: *const u8, buf_size: usize) -> Re
 /// Returns the SBI return value on success.
 ///
 /// # Errors
-/// Returns a negative `i64` error code if the kernel rejects the call
-/// (e.g., invalid cap, or SBI firmware returns an error).
+/// Returns a negative `i64` error code if the kernel rejects the call:
+/// `InvalidArgument` if `extension` is not a sanctioned extension,
+/// `InsufficientRights` if `sbi_cap` lacks that extension's right (e.g.
+/// `RIGHTS_SBI_RESET` for SRST), `InvalidCapability` for a bad slot, or
+/// `NotSupported` if SBI firmware itself returns an error.
 #[inline]
 pub fn sbi_call(
     sbi_cap: u32,

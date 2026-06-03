@@ -153,19 +153,60 @@ in the TSS on revocation.
 
 ### SbiControl (RISC-V only)
 
-A capability authorising the holder to forward Supervisor Binary Interface
-(SBI) calls to M-mode firmware via `SYS_SBI_CALL`. Rights:
-- **Call** — may forward an SBI `(EID, FID, args)` tuple to firmware.
+A capability authorising the holder to forward a *sanctioned* Supervisor Binary
+Interface (SBI) extension to M-mode firmware via `SYS_SBI_CALL`. RISC-V only; it
+does not exist on x86-64 (no SBI concept).
 
-There is one SbiControl capability, created at boot on RISC-V; it does not exist
-on x86-64 (no SBI concept). Init holds it and delegates it to the userspace
-component that needs firmware services — today pwrmgr, for system reset (SRST).
+Authority is **per extension**, expressed as rights rather than a numeric range —
+SBI extension IDs are sparse and non-numeric, so the cap does not join the
+range-authority family and has no split/merge. Each sanctioned extension has its
+own right:
+- **Reset** — forward System Reset (SRST).
+- **Suspend** — forward System Suspend (SUSP).
+- **Cppc** — forward processor performance control (CPPC).
+- **Base** — forward the read-only Base extension (version / extension probe).
+- **Dbcn** — forward the Debug Console extension.
+- **Pmu** — forward the Performance Monitoring Unit extension.
 
-The current capability is **coarse**: any holder with the `Call` right may
-forward *any* SBI extension, including extensions the kernel itself manages
-(TIME, IPI, RFENCE, HSM). Constraining this — hard-denying kernel-reserved
-extensions and gating per a permitted-EID set — is tracked in the SbiControl
-gating issue; this section is updated when that work lands.
+`SYS_SBI_CALL` maps the requested extension ID to the right it requires and
+rejects the call with `InsufficientRights` unless the cap carries that right.
+
+**Kernel floor.** The kernel hard-denies exactly one class, regardless of cap
+(`InvalidArgument`): the extensions it manages internally — TIME (scheduler
+timer), IPI (TLB shootdown / wakeups), RFENCE (remote fences), HSM (hart
+lifecycle). These have no right and are absent from the vocabulary; forwarding
+them from userspace would break a kernel invariant — halt a hart, corrupt TLB
+coherence, or derail scheduling. The kernel draws the line at *soundness* only;
+it does not encode preference about which otherwise-harmless extensions
+userspace "should" use.
+
+**Distribution is policy, not kernel enforcement.** Every non-reserved extension
+is sanctioned with a right, but a holder can only forward an extension whose
+right its cap actually carries — so what userspace may do is set by which caps
+are handed out, by ordinary minimum-privilege distribution (`cap_derive`, which
+only narrows rights, never widens; there is no dedicated SBI split operation).
+
+The kernel mints the root cap once at boot, carrying every sanctioned right, into
+init's cspace. **init is reaped after bootstrap, so any right not transferred to a
+surviving service before the reap is dropped — unforwardable until the next boot.
+This, not a kernel wall, is what bounds the live extension set.** init transfers a
+cap narrowed to **Reset** + **Suspend** to devmgr, the steady-state holder of
+platform firmware authority (it sits alongside the ACPI / MMIO / IRQ resources
+devmgr already brokers). The remaining sanctioned rights are carried into no
+surviving cap and die at init's reap: **Dbcn** is thrown away by design (the
+userspace serial driver owns the console; forwarding the firmware console would
+bypass the console-ownership model), and **Cppc** / **Base** / **Pmu** are simply
+not needed by any current service. devmgr serves pwrmgr a copy further narrowed to
+**Reset** only (system reset / reboot); **Suspend** is retained against a future
+power-management path but delegated to no one today.
+
+**Gating-granularity decision.** Per-cap authority is encoded as rights bits, not
+an EID set carried by `SbiControlObject`, because the extension set is small and
+non-numeric and only one actuating consumer exists (pwrmgr, SRST-only).
+`SbiControlObject` stays bare and the init descriptor is unchanged
+(`aux0 = aux1 = 0`), so `INIT_PROTOCOL_VERSION` is not bumped. The shared 32-bit
+`Rights` budget bounds how many extensions can be sanctioned this way; revisiting
+that budget (per-type rights) is tracked separately.
 
 ### SchedControl
 
@@ -429,7 +470,7 @@ the CSpace with an initial set of capabilities covering all available resources:
 - Read-only Memory capabilities for firmware table regions (PlatformTable entries),
   allowing userspace to parse ACPI or Device Tree data
 - IoPort capabilities for all boot-provided I/O port ranges (x86-64 only)
-- One SbiControl capability (RISC-V only; Call rights)
+- One SbiControl capability (RISC-V only) carrying every sanctioned SBI right
 - One SchedControl capability spanning the full userspace priority range `[1, PRIORITY_MAX]`
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)

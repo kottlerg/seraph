@@ -22,10 +22,11 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
-    cap_copy, cap_create_notification, cap_delete, event_queue_create, event_recv,
-    notification_send, notification_wait, notification_wait_timeout, system_info,
-    thread_bind_notification, thread_configure, thread_exit, thread_read_regs, thread_set_affinity,
-    thread_set_priority, thread_sleep, thread_start, thread_stop, thread_write_regs,
+    RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_derive, event_queue_create,
+    event_recv, notification_send, notification_wait, notification_wait_timeout, sched_split,
+    system_info, thread_bind_notification, thread_configure, thread_exit, thread_read_regs,
+    thread_set_affinity, thread_set_priority, thread_sleep, thread_start, thread_stop,
+    thread_write_regs,
 };
 use syscall_abi::{SyscallError, SystemInfoType};
 
@@ -316,69 +317,76 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
 
 // ── SYS_THREAD_SET_PRIORITY ───────────────────────────────────────────────────
 
-/// `thread_set_priority` in the normal range (1–20) succeeds without a
-/// `SchedControl` capability.
-pub fn set_priority_normal(ctx: &TestContext) -> TestResult
+/// `thread_set_priority` succeeds when the `SchedControl` cap's band covers the
+/// requested level. ktest holds the root cap spanning the full range.
+pub fn set_priority_in_band(ctx: &TestContext) -> TestResult
 {
     let child = crate::spawn::new_child(ctx)
-        .map_err(|_| "thread::set_priority_normal: spawn::new_child failed")?;
+        .map_err(|_| "thread::set_priority_in_band: spawn::new_child failed")?;
 
-    // Priority 5 is in the normal range (1–20); sched_cap = 0 → not required.
-    thread_set_priority(child.th, 5, 0).map_err(|_| "thread_set_priority(5) failed")?;
+    // 5 and PRIORITY_MAX (30) are both inside the root band [1, PRIORITY_MAX].
+    thread_set_priority(child.th, 5, ctx.sched_control_cap)
+        .map_err(|_| "thread_set_priority(5, root) failed")?;
+    thread_set_priority(child.th, 30, ctx.sched_control_cap)
+        .map_err(|_| "thread_set_priority(30, root) failed")?;
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_normal failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_normal failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after set_priority_in_band failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after set_priority_in_band failed")?;
     Ok(())
 }
 
-/// `thread_set_priority` with priority ≥ `SCHED_ELEVATED_MIN` (21) fails when
-/// no `SchedControl` capability is provided.
-pub fn set_priority_elevated_no_cap_err(ctx: &TestContext) -> TestResult
+/// Setting any priority without a `SchedControl` cap fails — there is no ambient
+/// priority authority. (`sched_idx = 0` holds no `SchedControl`.)
+pub fn set_priority_no_cap_err(ctx: &TestContext) -> TestResult
 {
     let child = crate::spawn::new_child(ctx)
-        .map_err(|_| "thread::set_priority_elevated_no_cap_err: spawn::new_child failed")?;
+        .map_err(|_| "thread::set_priority_no_cap_err: spawn::new_child failed")?;
 
-    // Priority 25 requires a SchedControl cap; passing 0 must fail.
-    let err = thread_set_priority(child.th, 25, 0);
+    let err = thread_set_priority(child.th, 5, 0);
     if err.is_ok()
     {
-        return Err("thread_set_priority(25, no_cap) should fail without SchedControl");
+        return Err("thread_set_priority(5, no_cap) should fail without SchedControl");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after elevated_no_cap test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after elevated_no_cap test failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after no_cap test failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after no_cap test failed")?;
     Ok(())
 }
 
-/// `thread_set_priority` with priority ≥ 21 succeeds when a valid `SchedControl`
-/// capability is provided.
-///
-/// The test scans slots up to `aspace_cap + 20` for a slot that accepts
-/// elevated priority. If no `SchedControl` cap is found, the test is skipped
-/// (reports Ok — the test was not applicable, not a failure).
-pub fn set_priority_elevated_with_cap(ctx: &TestContext) -> TestResult
+/// `sched_split` produces two disjoint bands and each child cap enforces its own
+/// range: the lower band accepts levels up to the split and rejects above; the
+/// upper band the reverse.
+pub fn sched_split_enforces_bands(ctx: &TestContext) -> TestResult
 {
+    // Derive a full-range copy so the split consumes the copy, not ktest's
+    // shared root cap. cap_derive shares the object, preserving the band.
+    let root_copy = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
+        .map_err(|_| "thread::sched_split_enforces_bands: cap_derive(root) failed")?;
+    // Split at 21: lower = [1, 20], upper = [21, PRIORITY_MAX].
+    let (lower, upper) = sched_split(root_copy, 21)
+        .map_err(|_| "thread::sched_split_enforces_bands: sched_split failed")?;
+
     let child = crate::spawn::new_child(ctx)
-        .map_err(|_| "thread::set_priority_elevated_with_cap: spawn::new_child failed")?;
+        .map_err(|_| "thread::sched_split_enforces_bands: spawn::new_child failed")?;
 
-    // Scan for a SchedControl cap in the initial capability set.
-    let mut found = false;
-    for slot in 1..ctx.aspace_cap + 20
+    // Lower band [1, 20]: 20 succeeds, 21 rejected.
+    thread_set_priority(child.th, 20, lower).map_err(|_| "set 20 with lower band failed")?;
+    if thread_set_priority(child.th, 21, lower).is_ok()
     {
-        if thread_set_priority(child.th, 25, slot).is_ok()
-        {
-            found = true;
-            break;
-        }
+        return Err("lower band [1,20] must reject priority 21");
     }
 
-    if !found
+    // Upper band [21, PRIORITY_MAX]: 21 succeeds, 20 rejected.
+    thread_set_priority(child.th, 21, upper).map_err(|_| "set 21 with upper band failed")?;
+    if thread_set_priority(child.th, 20, upper).is_ok()
     {
-        crate::log("ktest: thread::set_priority_elevated_with_cap SKIP (no SchedControl cap)");
+        return Err("upper band [21,30] must reject priority 20");
     }
 
-    cap_delete(child.th).map_err(|_| "cap_delete th after elevated_with_cap test failed")?;
-    cap_delete(child.cs).map_err(|_| "cap_delete cs after elevated_with_cap test failed")?;
+    cap_delete(child.th).map_err(|_| "cap_delete th after sched_split test failed")?;
+    cap_delete(child.cs).map_err(|_| "cap_delete cs after sched_split test failed")?;
+    cap_delete(lower).map_err(|_| "cap_delete lower band failed")?;
+    cap_delete(upper).map_err(|_| "cap_delete upper band failed")?;
     Ok(())
 }
 
@@ -622,10 +630,10 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
 
     // Priority 1 (strict-lower than the parent's INIT_PRIORITY of 15) so
     // CPU 0's `dequeue_highest` always selects the parent over T while
-    // both are Ready/Running there. Priority 1 is below
-    // SCHED_ELEVATED_MIN so no SchedControl cap is required
-    // (sched_idx = 0). Must be set before `thread_start`.
-    thread_set_priority(child.th, 1, 0)
+    // both are Ready/Running there. Setting any priority needs a SchedControl
+    // cap covering the level; ktest's root band [1, PRIORITY_MAX] covers 1.
+    // Must be set before `thread_start`.
+    thread_set_priority(child.th, 1, ctx.sched_control_cap)
         .map_err(|_| "thread_set_priority(1) for affinity_migrate_ready_queued failed")?;
 
     // Pin to CPU 0 initially so T's first enqueue lands on CPU 0's run queue.

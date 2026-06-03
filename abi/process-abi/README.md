@@ -57,6 +57,12 @@ pub struct ProcessInfo {
     /// CSpace slot of the process's own CSpace capability.
     pub self_cspace_cap: u32,
 
+    /// CSpace slot of a baseline `SchedControl` cap (default band `[1, 20]`),
+    /// or zero. Authorises `SYS_THREAD_SET_PRIORITY` within the band; zero
+    /// means no scheduling authority. procmgr `cap_copy`s its own baseline
+    /// into every child.
+    pub sched_control_cap: u32,
+
     // ── IPC ─────────────────────────────────────────────────────────
 
     /// Virtual address of the pre-mapped IPC buffer page.
@@ -124,6 +130,7 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 | `self_thread_cap` | Thread capability (Control) |
 | `self_aspace_cap` | AddressSpace capability |
 | `self_cspace_cap` | CSpace capability |
+| `sched_control_cap` | Baseline `SchedControl` cap, band `[1, 20]` (if nonzero) |
 | `creator_endpoint_cap` | Badged send cap back to the creator's bootstrap endpoint (if nonzero) |
 | `memmgr_endpoint_cap` | Badged SEND cap on memmgr's service endpoint (if nonzero) |
 | `procmgr_endpoint_cap` | Badged SEND cap on procmgr's service endpoint (if nonzero) |

@@ -78,7 +78,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         for (i, &th) in threads.iter().enumerate()
         {
             let prio: u8 = if (cycle + i) & 1 == 0 { 3 } else { 9 };
-            let _ = thread_set_priority(th, prio, 0);
+            let _ = thread_set_priority(th, prio, ctx.sched_control_cap);
             if cycle % 4 == 0
             {
                 let i_u32 = u32::try_from(i).unwrap_or(0);
@@ -118,8 +118,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             let _ = thread_yield();
         }
-        let _ = thread_set_priority(threads[i], 5, 0);
-        let _ = thread_set_priority(threads[i], 11, 0);
+        let _ = thread_set_priority(threads[i], 5, ctx.sched_control_cap);
+        let _ = thread_set_priority(threads[i], 11, ctx.sched_control_cap);
         cap_delete(threads[i])
             .map_err(|_| "stress::priority_dealloc_race: cap_delete thread failed")?;
         cap_delete(cspaces[i])

@@ -144,6 +144,7 @@ fn main() -> !
         memmgr_ep: startup.memmgr_endpoint,
         death_eq,
         ws_cap,
+        sched_baseline: startup.sched_control_cap,
     };
     let service_ep = boot.service_ep;
 
@@ -810,6 +811,7 @@ fn handle_create(
         memmgr_endpoint: memmgr_send,
         memmgr_badge,
         registry_send_source: ctx.registry_ep,
+        sched_baseline: ctx.sched_baseline,
     };
 
     let result = process::create_process(
@@ -899,6 +901,11 @@ pub struct ProcmgrCtx
     /// (`WS_BADGE_SERVICE`) and the shared death event queue
     /// (`WS_BADGE_DEATH`). Fixed two members.
     pub ws_cap: u32,
+    /// Procmgr's baseline `SchedControl` cap, delivered via its own
+    /// `ProcessInfo.sched_control_cap` (default band `[1, 20]`). `cap_copy`d
+    /// into every child as the child's `ProcessInfo.sched_control_cap`. Zero if
+    /// init delegated none; children then cannot set any priority.
+    pub sched_baseline: u32,
 }
 
 /// Handle `CREATE_FROM_FILE` — create a process from a caller-supplied file cap.

@@ -74,40 +74,18 @@ fn elevated_entry(arg: u64) -> !
     thread_exit();
 }
 
-/// Scan ktest's initial cap set for the first slot accepting an elevated
-/// priority — that's the `SchedControl` cap. Mirrors the discovery in
-/// `unit/thread::set_priority_elevated_with_cap`.
-fn find_sched_control(probe_thread: u32, max_slot: u32) -> Option<u32>
-{
-    for slot in 1..max_slot
-    {
-        if thread_set_priority(probe_thread, 25, slot).is_ok()
-        {
-            // Reset probe back to normal priority.
-            let _ = thread_set_priority(probe_thread, 10, slot);
-            return Some(slot);
-        }
-    }
-    None
-}
-
 pub fn run(ctx: &TestContext) -> TestResult
 {
     crate::log("priority_preemption: starting");
 
-    // Discover SchedControl by probing on a throwaway thread.
-    let probe = crate::spawn::new_child(ctx)
-        .map_err(|_| "priority_preemption: spawn::new_child (probe) failed")?;
-    let sched_cap = find_sched_control(probe.th, ctx.aspace_cap + 20);
-    cap_delete(probe.th).ok();
-    cap_delete(probe.cs).ok();
-
-    let Some(sched_cap) = sched_cap
-    else
+    // ktest is loaded as init and holds the root SchedControl spanning the full
+    // userspace range; use it directly to assign the elevated priority.
+    let sched_cap = ctx.sched_control_cap;
+    if sched_cap == 0
     {
         crate::log("ktest: priority_preemption SKIP (no SchedControl cap in initial cap set)");
         return Ok(());
-    };
+    }
 
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "priority_preemption: cap_create_notification (done) failed")?;

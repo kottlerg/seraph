@@ -169,14 +169,25 @@ gating issue; this section is updated when that work lands.
 
 ### SchedControl
 
-A capability granting authority to assign elevated scheduling priorities. Rights:
-- **Elevate** — may set thread priorities in the elevated range
+A capability granting authority to assign thread priorities within a bounded
+band. Like `Interrupt`/`Mmio`/`IoPort`, it is a **range authority**: the object
+carries a `[min, max]` priority band, and holding the cap authorises setting any
+priority in that band via `SYS_THREAD_SET_PRIORITY`. It carries **no rights bit** —
+presence of the cap plus its band *is* the authority (a band-less or right-less
+`SchedControl` would be inert, so there is nothing to gate). Narrow a band into
+two disjoint children with `SYS_SCHED_SPLIT`; `cap_derive` cannot shrink a band
+(it attenuates rights only).
 
-There is one SchedControl capability, created at boot. Init holds it and delegates
-derived copies to services that need real-time-ish scheduling (e.g. audio servers,
-device managers). Without a SchedControl capability, a process can only set thread
-priorities in the normal range. For priority levels, ranges, and constants, see
-[core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
+There is no ambient priority authority: a process holding no `SchedControl`
+cannot set *any* thread priority. The kernel does not define a normal/elevated
+boundary — that partition is userspace policy expressed through cap
+distribution. The root cap spans the full userspace range `[1, PRIORITY_MAX]`
+and is created at boot. Init splits it into a baseline band (`[1, 20]` by
+default) and an elevated remainder (`[21, PRIORITY_MAX]`); every spawned process
+receives a baseline copy via `ProcessInfo.sched_control_cap` (procmgr fans it out
+at `CREATE_PROCESS`), and services needing elevated scheduling receive an
+explicit grant from the remainder. For priority levels, ranges, and constants,
+see [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
 
 ---
 
@@ -419,7 +430,7 @@ the CSpace with an initial set of capabilities covering all available resources:
   allowing userspace to parse ACPI or Device Tree data
 - IoPort capabilities for all boot-provided I/O port ranges (x86-64 only)
 - One SbiControl capability (RISC-V only; Call rights)
-- One SchedControl capability (Elevate rights)
+- One SchedControl capability spanning the full userspace priority range `[1, PRIORITY_MAX]`
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)
 

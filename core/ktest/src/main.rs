@@ -168,6 +168,13 @@ pub struct TestContext
     /// initial cap set. Zero on x86-64, where SBI is unavailable.
     /// Tests of `SYS_SBI_CALL` use this cap.
     pub sbi_control_cap: u32,
+
+    /// Root `SchedControl` cap (slot index), kernel-minted in init's initial
+    /// cap set, spanning the full userspace priority range `[1, PRIORITY_MAX]`.
+    /// ktest is loaded as init, so it holds the unsplit root. Priority tests
+    /// pass it (or a `sched_split` child) as the `SchedControl` argument to
+    /// `SYS_THREAD_SET_PRIORITY`.
+    pub sched_control_cap: u32,
 }
 
 /// 16 KiB stack for a child thread, aligned per the System V ABI.
@@ -336,6 +343,7 @@ fn run(info_ptr: u64) -> !
         ipc_buf: ipc_buf_ptr,
         memory_base: info.memory_base,
         sbi_control_cap: info.sbi_control_cap,
+        sched_control_cap: info.sched_control_cap,
     };
 
     let config = cmdline::KtestConfig::DEFAULT;

@@ -269,9 +269,11 @@ Phase 7, and `KERNEL_MMIO` is populated.
    c. One root IoPort capability (x86-64 only, Use rights) covering
       the full 64K I/O port space; init subdivides for services that
       need port I/O.
-   d. One SchedControl capability (Elevate rights) — allows the holder to set
-      thread priorities in the elevated range (21–30); delegated by init to
-      services that require real-time-ish scheduling priority
+   d. One SchedControl capability spanning the full userspace priority range
+      `[1, PRIORITY_MAX]` — holding it (plus its band) authorises setting thread
+      priorities within that band. Init splits it into a baseline band and an
+      elevated remainder and delegates copies per policy (see
+      [capability-model.md § SchedControl](../../../docs/capability-model.md))
    e. One SbiControl capability (RISC-V only; Call rights) for init to
       forward SBI calls.
    f. (Thread and process capabilities for init are added in Phase 9)

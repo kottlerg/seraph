@@ -37,7 +37,11 @@ use core::prelude::rust_2024::*;
 
 /// Process ABI version. Incremented on any breaking change to the
 /// [`ProcessInfo`] layout or field semantics.
-pub const PROCESS_ABI_VERSION: u32 = 16;
+///
+/// v17: Added [`ProcessInfo::sched_control_cap`] (#185) — a baseline
+///      `SchedControl` cap so a process can set its own threads' priorities
+///      within its delegated band. Zero when none is delegated.
+pub const PROCESS_ABI_VERSION: u32 = 17;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -205,6 +209,15 @@ pub struct ProcessInfo
 
     /// `CSpace` slot of the process's own `CSpace` capability.
     pub self_cspace_cap: u32,
+
+    /// `CSpace` slot of a baseline `SchedControl` capability, or zero.
+    ///
+    /// Authorises `SYS_THREAD_SET_PRIORITY` for the priority band the cap
+    /// spans (default `[1, 20]`, delegated by procmgr per process). Pass this
+    /// slot as the `SchedControl` argument when setting a thread's priority.
+    /// Zero when no scheduling authority is delegated (the process then cannot
+    /// set any priority). See [capability-model.md](../../docs/capability-model.md).
+    pub sched_control_cap: u32,
 
     /// Virtual address of the pre-mapped IPC buffer page.
     ///

@@ -347,6 +347,13 @@ pub extern "C" fn _start(info_ptr: u64) -> !
 // already factored through service::create_*_with_caps /
 // service::phase3_svcmgr_handover for the subsystem-specific work; what
 // remains is the fixed orchestration sequence.
+/// Highest priority level in the default baseline `SchedControl` band that
+/// init delegates to every spawned process. Init splits its full-range root
+/// cap into this baseline (`[PRIORITY_MIN, BASELINE_PRIORITY_MAX]`) and the
+/// elevated remainder it retains. This partition is init policy, not a kernel
+/// invariant — the kernel no longer defines a normal/elevated boundary (#185).
+pub(crate) const BASELINE_PRIORITY_MAX: u8 = 20;
+
 #[allow(clippy::too_many_lines)]
 fn run(info_ptr: u64) -> !
 {
@@ -491,6 +498,19 @@ fn run(info_ptr: u64) -> !
     logging::set_ipc_logging(init_log_send, ipc_buf);
     logging::register_name(b"init");
 
+    // Split init's full-range root SchedControl into the baseline band every
+    // spawned process receives ([PRIORITY_MIN, BASELINE_PRIORITY_MAX]) and the
+    // elevated remainder init retains for explicit grants. `_elevated` stays in
+    // init's CSpace. Both memmgr and procmgr get a baseline copy; procmgr also
+    // uses it as the fan-out source for every process it creates. (#185)
+    let Ok((baseline_sched, _elevated)) =
+        syscall::sched_split(info.sched_control_cap, BASELINE_PRIORITY_MAX + 1)
+    else
+    {
+        logging::log("init: FATAL: SchedControl baseline split failed");
+        syscall::thread_exit();
+    };
+
     // ── Bootstrap memmgr (raw ELF load; first half of remaining memory caps) ──────
 
     if find_module_by_name(info, b"memmgr").is_none()
@@ -503,8 +523,13 @@ fn run(info_ptr: u64) -> !
     // mappings, creator + procmgr SEND caps. Memory-cap delegation and
     // thread_start are deferred to `finalize_memmgr` so procmgr's setup
     // can still draw from init's memory-cap pool.
-    let Some(mm) =
-        bootstrap::bootstrap_memmgr(info, &mut alloc, init_bootstrap_ep, memmgr_service_ep)
+    let Some(mm) = bootstrap::bootstrap_memmgr(
+        info,
+        &mut alloc,
+        init_bootstrap_ep,
+        memmgr_service_ep,
+        baseline_sched,
+    )
     else
     {
         logging::log("FATAL: failed to bootstrap memmgr");
@@ -521,6 +546,7 @@ fn run(info_ptr: u64) -> !
         log_ep,
         svcmgr_service_ep,
         mm.procmgr_send_cap,
+        baseline_sched,
     )
     else
     {

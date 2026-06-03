@@ -145,7 +145,7 @@ pub enum CapTag
     CSpace        = 9,   // capability space; explicit kernel object
     WaitSet       = 10,
     IoPort        = 11,  // x86-64 only; created at boot from platform_resources
-    SchedControl  = 12,  // authority to set elevated scheduling priorities
+    SchedControl  = 12,  // priority-band authority; carries [min, max], no rights bit
     SbiControl    = 13,  // SBI forwarding authority (RISC-V only)
 }
 ```
@@ -189,8 +189,8 @@ bitflags! {
         // IoPort
         const USE        = 1 << 18;  // bind port range to a thread
 
-        // SchedControl
-        const ELEVATE    = 1 << 19;  // set thread priority in the elevated range
+        // SchedControl carries no rights bit — bit 19 is unused. A
+        // SchedControl's authority is its presence plus its [min, max] band.
 
         // SbiControl
         const CALL       = 1 << 20;  // forward SBI calls to firmware (RISC-V only)
@@ -377,7 +377,7 @@ layout via a well-known structure at the top of init's stack.
 | 1 | Init's own thread capability |
 | 2 | Init's own address space capability |
 | 3 | Init's own CSpace capability |
-| 4 | SchedControl capability (Elevate rights) |
+| 4 | SchedControl capability (band `[1, PRIORITY_MAX]`) |
 | 5..N | Memory capabilities (one per usable physical region) |
 | N+1..M | MMIO region capabilities (one per MmioRange / PciEcam entry) |
 | M+1..K | Interrupt capabilities (one per IrqLine entry) |

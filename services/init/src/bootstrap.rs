@@ -443,6 +443,8 @@ struct MemmgrCaps
     cspace: u32,
     thread: u32,
     creator_endpoint_slot: u32,
+    /// Baseline `SchedControl` cap (in init's `CSpace`) copied into memmgr.
+    sched_baseline: u32,
 }
 
 /// Populate memmgr's `ProcessInfo` page from `arena` and map it read-only
@@ -460,6 +462,9 @@ fn populate_memmgr_info(
     let mm_aspace_in_mm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
     let mm_cspace_in_mm =
         syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CSPACE).ok()?;
+    // Baseline SchedControl so memmgr can set its own threads' priorities.
+    let mm_sched_in_mm =
+        syscall::cap_copy(caps.sched_baseline, caps.cspace, syscall::RIGHTS_ALL).ok()?;
 
     arena.place_page(
         target_aspace,
@@ -472,6 +477,7 @@ fn populate_memmgr_info(
             pi.self_thread_cap = mm_thread_in_mm;
             pi.self_aspace_cap = mm_aspace_in_mm;
             pi.self_cspace_cap = mm_cspace_in_mm;
+            pi.sched_control_cap = mm_sched_in_mm;
             pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
             pi.creator_endpoint_cap = caps.creator_endpoint_slot;
             pi.procmgr_endpoint_cap = 0;
@@ -522,6 +528,7 @@ pub fn bootstrap_memmgr(
     alloc: &mut MemoryAlloc,
     init_bootstrap_ep: u32,
     mm_service_ep: u32,
+    baseline_sched: u32,
 ) -> Option<MemmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;
@@ -587,6 +594,7 @@ pub fn bootstrap_memmgr(
         cspace: mm_cspace,
         thread: mm_thread,
         creator_endpoint_slot: mm_creator_slot,
+        sched_baseline: baseline_sched,
     };
     populate_memmgr_info(&mut arena, mm_aspace, &mm_caps, stack_pages)?;
     place_stack_and_ipc(&mut arena, mm_aspace, PROCMGR_IPC_BUF_VA, stack_pages)?;
@@ -963,6 +971,9 @@ struct ProcmgrCaps
     /// so spawned-thread allocations (via std) can populate matching
     /// blocks. Zero `memsz` means "no TLS".
     tls: ChildTlsMeta,
+    /// Baseline `SchedControl` cap (in init's `CSpace`). Copied into procmgr for
+    /// its own use and as the fan-out source for every process procmgr creates.
+    sched_baseline: u32,
 }
 
 /// Populate procmgr's `ProcessInfo` page and map it read-only into procmgr.
@@ -986,6 +997,10 @@ fn populate_procmgr_info(
     let pm_aspace_in_pm = syscall::cap_copy(caps.aspace, caps.cspace, syscall::RIGHTS_ALL).ok()?;
     let pm_cspace_in_pm =
         syscall::cap_copy(caps.cspace, caps.cspace, syscall::RIGHTS_CSPACE).ok()?;
+    // Baseline SchedControl: procmgr's own scheduling authority and the
+    // fan-out source it cap_copies into every process it creates.
+    let pm_sched_in_pm =
+        syscall::cap_copy(caps.sched_baseline, caps.cspace, syscall::RIGHTS_ALL).ok()?;
 
     arena.place_page(
         target_aspace,
@@ -998,6 +1013,7 @@ fn populate_procmgr_info(
             pi.self_thread_cap = pm_thread_in_pm;
             pi.self_aspace_cap = pm_aspace_in_pm;
             pi.self_cspace_cap = pm_cspace_in_pm;
+            pi.sched_control_cap = pm_sched_in_pm;
             pi.ipc_buffer_vaddr = PROCMGR_IPC_BUF_VA;
             pi.creator_endpoint_cap = caps.creator_endpoint_slot;
             // procmgr has no procmgr above it; leave zero.
@@ -1127,6 +1143,7 @@ pub fn bootstrap_procmgr(
     log_ep: u32,
     svcmgr_service_ep: u32,
     memmgr_send_cap: u32,
+    baseline_sched: u32,
 ) -> Option<ProcmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;
@@ -1279,6 +1296,7 @@ pub fn bootstrap_procmgr(
         memmgr_endpoint_slot,
         log_send_slot,
         tls: pm_tls_meta,
+        sched_baseline: baseline_sched,
     };
     populate_procmgr_info(&mut arena, pm_aspace, &pm_caps, stack_pages)?;
 

@@ -15,7 +15,7 @@
 //!   5. Read register state (`thread_read_regs`) → verify IP non-zero
 //!   6. Redirect IP via `write_regs` (`thread_write_regs`) → `phase2_entry`
 //!   7. Resume (`thread_start`) → child sends 0x2 to confirm redirection
-//!   8. Set priority in normal range (`thread_set_priority`)
+//!   8. Set priority within the harness's `SchedControl` band (`thread_set_priority`)
 //!   9. Set affinity to CPU 0 (`thread_set_affinity`)
 //!
 //! The intent is to validate that each step leaves the thread in the correct
@@ -122,7 +122,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let th2 = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs2)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread (step 8) failed")?;
 
-    thread_set_priority(th2, 5, 0)
+    thread_set_priority(th2, 5, ctx.sched_control_cap)
         .map_err(|_| "integration::thread_lifecycle: thread_set_priority failed")?;
     thread_set_affinity(th2, 0)
         .map_err(|_| "integration::thread_lifecycle: thread_set_affinity failed")?;

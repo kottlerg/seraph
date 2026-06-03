@@ -107,7 +107,7 @@ how devmgr uses them.
 | MMIO Region (per platform resource) | Map | Map device register regions into driver address spaces |
 | Interrupt (per IRQ line) | — | Delegate to drivers for hardware interrupt delivery |
 | IoPort (x86-64, root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
-| SbiControl (RISC-V, root) | Delegate | Broker a copy to pwrmgr for SBI SRST shutdown / reboot |
+| SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only copy to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob (incl. IOMMU topology: DMAR on x86-64, `iommu` / `iommu-map` on RISC-V); broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE` |
 | SchedControl (baseline, via `ProcessInfo`) | band `[1, 20]` | Set driver/thread priorities within the baseline band. Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`), not the init bootstrap rounds; elevated bands for latency-sensitive drivers require an explicit init grant (not currently wired) |
 

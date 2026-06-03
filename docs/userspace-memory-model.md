@@ -221,8 +221,8 @@ the client through the page-reservation allocator.
 
 Lazy or demand backing of a reservation — mapping frames only on first
 access rather than up front — is a userspace-pager policy built on the
-fault-handler protocol, not a kernel feature; see
-[Fault Handling](fault-handling.md).
+fault-handler protocol ([Fault Handling](fault-handling.md); specified, not
+yet implemented), not a kernel feature.
 
 ---
 

@@ -308,9 +308,9 @@ A process created via `CREATE_PROCESS` is suspended until
 `START_PROCESS`; the heap-bootstrap step (8) only runs after the caller
 has finished injecting any additional capabilities.
 
-The creator MAY bind the initial thread's fault handler (for example a
-demand-paging pager) before starting it; see
-[Fault Handling](fault-handling.md).
+Once the fault-handler protocol is implemented, the creator MAY bind the
+initial thread's fault handler (for example a demand-paging pager) before
+starting it; see [Fault Handling](fault-handling.md).
 
 ---
 
@@ -375,8 +375,11 @@ Seraph does not implement `fork()` or copy-on-write. Process creation
 is always from-scratch via `CREATE_PROCESS`; zero-copy buffer handoff
 between processes uses Memory-cap moves over IPC.
 
-Page faults are not delivered to userspace; faulting threads terminate,
-which surfaces through the normal process-death notification flow above.
+Userspace fault handling is specified separately as the pager protocol in
+[Fault Handling](fault-handling.md); it is not yet implemented. Absent a
+bound fault handler — the only behavior today — a faulting thread
+terminates, which surfaces through the normal process-death notification
+flow above.
 
 ---
 

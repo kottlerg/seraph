@@ -27,10 +27,22 @@ Out of scope (the kernel never does these):
 - Kernel-internal page-CoW. CoW, if built, is a userspace handler policy expressed over
   explicit capability operations.
 
-The handler installs mappings with the ordinary [`SYS_MEM_MAP`](memory-model.md)
-authority; the kernel adds no fault-specific mapping path. Mapping validation (W^X,
-rights subsetting, address-range checks) is owned by the memory model and the
+The handler installs mappings with the ordinary `SYS_MEM_MAP` authority; the kernel adds
+no fault-specific mapping path. Mapping validation (W^X, rights subsetting, address-range
+checks) is owned by the [memory model](memory-model.md) and the
 [capability model](capability-model.md), unchanged.
+
+---
+
+## Implementation Status
+
+This document is a design specification. The protocol is **not yet implemented**: the kernel
+currently terminates a faulting userspace thread unconditionally (the no-handler-bound
+behavior described below). `SYS_THREAD_SET_FAULT_HANDLER`, the fault-handler binding, the
+[fault message](#fault-message), and the [resume and kill](#delivery-resume-and-kill) paths
+do not yet exist; the `ProcessInfo` pager field referenced under
+[Demand Paging](#demand-paging-and-the-default-system-pager) is likewise not present yet.
+This section is narrowed as each part is implemented.
 
 ---
 

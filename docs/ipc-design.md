@@ -141,9 +141,11 @@ Capabilities passed in IPC messages are moved, not copied; see [capability-model
 
 ## Fault Delivery
 
-A userspace thread fault the kernel cannot resolve is delivered to the thread's bound
-fault-handler endpoint as a kernel-originated synchronous message, suspending the thread
-until the handler replies to resume (or the binding is severed and the thread is killed).
+Under the fault-handler protocol ([Fault Handling](fault-handling.md); not yet
+implemented), a userspace thread fault the kernel cannot resolve is delivered to the
+thread's bound fault-handler endpoint as a kernel-originated synchronous message,
+suspending the thread until the handler replies to resume (or the binding is severed and
+the thread is killed).
 This reuses the call/reply machinery above — the suspended thread occupies the caller's
 role and the handler services it with the ordinary receive/reply cycle. See
 [Fault Handling](fault-handling.md).

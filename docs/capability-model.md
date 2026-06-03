@@ -86,9 +86,10 @@ A send capability without grant right cannot pass capabilities to the server.
 A server that should not receive unexpected resources from clients holds a receive
 capability without grant on its own endpoint.
 
-An endpoint may additionally be designated a thread's **fault handler** — there is no
-distinct fault-endpoint capability type; the kernel delivers that thread's unresolvable
-faults to the bound endpoint. See [Fault Handling](fault-handling.md).
+An endpoint may additionally be designated a thread's **fault handler** — a protocol
+specified in [Fault Handling](fault-handling.md) (not yet implemented), with no distinct
+fault-endpoint capability type: the kernel delivers that thread's unresolvable faults to
+the bound endpoint.
 
 ### Notification
 

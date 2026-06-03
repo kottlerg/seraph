@@ -788,8 +788,8 @@ unsafe fn kernel_entry_post_rebase(
 
             // Mint a reclaimable Memory cap per InitInfo page so init's
             // reap-handoff donates the pages back to memmgr after AS
-            // teardown. Caps carry MAP|READ rights (matching the
-            // userspace mapping) and the standard reclaim flags
+            // teardown. Caps carry full pool-frame rights (see the per-mint
+            // comment below) and the standard reclaim flags
             // (RETYPE + owns_memory=true + full ledger).
             // SAFETY: ROOT_CSPACE initialised in Phase 7; single-threaded boot.
             let cs = unsafe { cap::root_cspace_mut() }

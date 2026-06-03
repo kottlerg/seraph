@@ -109,7 +109,7 @@ how devmgr uses them.
 | IoPort (x86-64, root) | Use / carve | Carve narrow per-driver port caps (CMOS, COM1) and pwrmgr's PM1a + 8042 reset ports |
 | SbiControl (RISC-V, root) | Delegate | Broker a copy to pwrmgr for SBI SRST shutdown / reboot |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob (incl. IOMMU topology: DMAR on x86-64, `iommu` / `iommu-map` on RISC-V); broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE` |
-| SchedControl | Elevate | Assign elevated priorities to latency-sensitive drivers |
+| SchedControl (baseline, via `ProcessInfo`) | band `[1, 20]` | Set driver/thread priorities within the baseline band. Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`), not the init bootstrap rounds; elevated bands for latency-sensitive drivers require an explicit init grant (not currently wired) |
 
 IOMMU register regions are not pre-minted as distinct capabilities.
 `devmgr` discovers IOMMU units from the firmware passthrough (DMAR or

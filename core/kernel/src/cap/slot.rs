@@ -227,8 +227,9 @@ impl Rights
     pub const USE: Rights = Rights(1 << 18);
 
     // ── SchedControl ──────────────────────────────────────────────────────────
-    /// May set thread priorities in the elevated range.
-    pub const ELEVATE: Rights = Rights(1 << 19);
+    // No rights bit. A `SchedControl` cap's authority is its presence plus the
+    // `[min, max]` priority band it carries (see `SchedControlObject`); there is
+    // nothing to gate with a right. Bit 19 is unused.
 
     // ── SbiControl ───────────────────────────────────────────────────────────
     /// May forward SBI calls to M-mode firmware (RISC-V only).
@@ -589,7 +590,6 @@ mod tests
             | Rights::REVOKE
             | Rights::MODIFY
             | Rights::USE
-            | Rights::ELEVATE
             | Rights::CALL;
         assert_eq!((combined & Rights::RETYPE).0, 0);
     }

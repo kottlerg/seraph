@@ -539,9 +539,15 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 
 /// `SYS_THREAD_SET_PRIORITY` (37): change a thread's scheduling priority.
 ///
-/// arg0 = Thread cap index (must have CONTROL).
+/// arg0 = Thread cap index (selects *which* thread; must have CONTROL).
 /// arg1 = New priority (`1`–`PRIORITY_MAX`; 0 and 31 are rejected).
-/// arg2 = `SchedControl` cap index (required only when priority ≥ `SCHED_ELEVATED_MIN`).
+/// arg2 = `SchedControl` cap index (governs *which level*; always required).
+///
+/// Composition: the Thread/CONTROL cap authorises mutating that thread; the
+/// `SchedControl` cap authorises the requested level — it must be a
+/// `SchedControl` whose `[min, max]` band covers `arg1`. Holding no
+/// `SchedControl` (or one whose band excludes the level) cannot set any
+/// priority. There is no ambient priority authority.
 ///
 /// The change takes effect at the next scheduler invocation. If the thread is
 /// currently in the Ready state, it is moved to the new priority queue immediately.
@@ -550,11 +556,11 @@ unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadControlBlock)
 #[cfg(not(test))]
 pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::object::ThreadObject;
+    use crate::cap::object::{SchedControlObject, ThreadObject};
     use crate::cap::slot::{CapTag, Rights};
     use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
-    use syscall::{PRIORITY_MAX, SCHED_ELEVATED_MIN};
+    use syscall::PRIORITY_MAX;
 
     let thread_idx = tf.arg(0) as u32;
     let priority = tf.arg(1) as u8;
@@ -575,18 +581,19 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_tcb validated non-null; cspace set at thread creation.
     let caller_cspace = unsafe { (*caller_tcb).cspace };
 
-    // Elevated priorities require a SchedControl cap with ELEVATE rights.
-    if priority >= SCHED_ELEVATED_MIN
+    // Setting any priority requires a SchedControl cap whose band covers the
+    // requested level. Presence-only — no rights bit to check.
+    // SAFETY: caller_cspace validated; lookup_cap checks the tag.
+    let sched_slot =
+        unsafe { super::lookup_cap(caller_cspace, sched_idx, CapTag::SchedControl, Rights::NONE) }?;
+    let sched_obj = sched_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // cast_ptr_alignment: header at offset 0 of SchedControlObject; allocator guarantees alignment.
+    // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
+    #[allow(clippy::cast_ptr_alignment)]
+    let sched = unsafe { &*(sched_obj.as_ptr().cast::<SchedControlObject>()) };
+    if priority < sched.min || priority > sched.max
     {
-        // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
-        unsafe {
-            super::lookup_cap(
-                caller_cspace,
-                sched_idx,
-                CapTag::SchedControl,
-                Rights::ELEVATE,
-            )
-        }?;
+        return Err(SyscallError::InsufficientRights);
     }
 
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
@@ -674,6 +681,117 @@ pub fn sys_thread_set_priority(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     }
 
     Ok(0)
+}
+
+/// `SYS_SCHED_SPLIT` (52): split a `SchedControl` cap into two children
+/// covering disjoint priority bands.
+///
+/// arg0 = `SchedControl` cap index.
+/// arg1 = `split_at`: the lowest priority level of the upper child. Must
+///        satisfy `min < split_at <= max` on the cap being split. The lower
+///        child covers `[min, split_at - 1]`; the upper child covers
+///        `[split_at, max]`.
+///
+/// Consumes the original cap and creates two new `SchedControl` caps covering
+/// the two bands; both are reparented to the original's derivation parent.
+/// `cap_derive` cannot narrow a band (it attenuates rights only), so this is
+/// the sole way to hand out a sub-band. Presence-only authority; no rights bit.
+///
+/// Returns `slot1 | (slot2 << 32)` on success.
+#[cfg(not(test))]
+pub fn sys_sched_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::object::{KernelObjectHeader, ObjectType, SchedControlObject, dealloc_object};
+    use crate::cap::retype::alloc_in_seed;
+    use crate::cap::seed_header_nn;
+    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::split::install_split_children;
+    use crate::syscall::current_tcb;
+
+    let sched_idx = tf.arg(0) as u32;
+    let split_at = tf.arg(1) as u8;
+    // arg2 reserved.
+
+    // ── Capability lookup ─────────────────────────────────────────────────────
+
+    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*tcb).cspace };
+    if caller_cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    let (min, max, rights, cspace_id, orig_obj_ptr) = {
+        // SAFETY: caller_cspace validated; lookup_cap checks the tag (presence-only).
+        let slot = unsafe {
+            super::lookup_cap(caller_cspace, sched_idx, CapTag::SchedControl, Rights::NONE)
+        }?;
+        let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
+        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
+        // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
+        #[allow(clippy::cast_ptr_alignment)]
+        let sc = unsafe { &*(obj_ptr.as_ptr().cast::<SchedControlObject>()) };
+        // SAFETY: caller_cspace validated non-null; id() reads discriminator.
+        let cspace_id = unsafe { (*caller_cspace).id() };
+        (sc.min, sc.max, slot.rights, cspace_id, obj_ptr)
+    };
+
+    // ── Validation ────────────────────────────────────────────────────────────
+
+    // split_at is the first level of the upper child; both halves must be
+    // non-empty: lower = [min, split_at - 1], upper = [split_at, max].
+    if split_at <= min || split_at > max
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // ── Create two child SchedControlObjects ───────────────────────────────────
+
+    let child1_ptr = alloc_in_seed(SchedControlObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::SchedControl, seed_header_nn()),
+        min,
+        max: split_at - 1,
+    })?;
+
+    let child2_ptr = match alloc_in_seed(SchedControlObject {
+        header: KernelObjectHeader::with_ancestor(ObjectType::SchedControl, seed_header_nn()),
+        min: split_at,
+        max,
+    })
+    {
+        Ok(p) => p,
+        Err(e) =>
+        {
+            // SAFETY: child1_ptr is a freshly-allocated SEED-backed body with
+            // refcount 1 and not yet inserted into any CSpace.
+            unsafe { dealloc_object(child1_ptr) };
+            return Err(e);
+        }
+    };
+
+    // Install both children, rewire the derivation tree, and consume the
+    // original — shared with the hardware range splits.
+    // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
+    // children are freshly-allocated SEED-backed SchedControlObjects (refcount 1);
+    // orig_obj_ptr is the live original from lookup_cap.
+    unsafe {
+        install_split_children(
+            caller_cspace,
+            cspace_id,
+            sched_idx,
+            CapTag::SchedControl,
+            rights,
+            orig_obj_ptr,
+            child1_ptr,
+            child2_ptr,
+        )
+    }
 }
 
 /// `SYS_THREAD_SET_AFFINITY` (38): set a thread's CPU affinity.
@@ -1090,6 +1208,12 @@ pub fn sys_thread_stop(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 #[cfg(test)]
 pub fn sys_thread_set_priority(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+#[cfg(test)]
+pub fn sys_sched_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

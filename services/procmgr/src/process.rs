@@ -549,6 +549,13 @@ pub struct UniversalCaps
     /// reachable; children born in that case receive zero in
     /// `pi.service_registry_cap` and `registry_client::lookup` no-ops.
     pub registry_send_source: u32,
+    /// Baseline `SchedControl` cap in procmgr's `CSpace` (procmgr's own
+    /// `ProcessInfo.sched_control_cap`, default band `[1, 20]`). `cap_copy`d
+    /// into every child's `CSpace` and recorded in the child's
+    /// `ProcessInfo.sched_control_cap` so the child can set its own threads'
+    /// priorities within the band. Zero when procmgr was given no baseline;
+    /// children then receive zero and cannot set any priority.
+    pub sched_baseline: u32,
 }
 
 /// Program arguments delivered to a child process at spawn time.
@@ -755,12 +762,24 @@ fn populate_child_info(
     // see all-zero stdio memory-cap/notification slots, which std maps to silent
     // println! / EOF on stdin.
 
+    // Baseline SchedControl: a copy of procmgr's band into the child so it can
+    // set its own threads' priorities within the band. Presence-only authority.
+    let sched_in_child = if universals.sched_baseline != 0
+    {
+        syscall::cap_copy(universals.sched_baseline, child_cspace, syscall::RIGHTS_ALL).ok()?
+    }
+    else
+    {
+        0
+    };
+
     // SAFETY: scratch_va is page-aligned and mapped writable.
     let pi = unsafe { process_abi::process_info_mut(scratch_va) };
     pi.version = PROCESS_ABI_VERSION;
     pi.self_thread_cap = child_thread_in_child;
     pi.self_aspace_cap = child_aspace_in_child;
     pi.self_cspace_cap = child_cspace_in_child;
+    pi.sched_control_cap = sched_in_child;
     pi.ipc_buffer_vaddr = CHILD_IPC_BUF_VA;
     pi.creator_endpoint_cap = creator_ep_in_child;
     pi.procmgr_endpoint_cap = procmgr_ep_in_child;
@@ -2126,6 +2145,7 @@ pub fn create_process_from_file(
         memmgr_endpoint: mms.cap(),
         memmgr_badge: mms.badge(),
         registry_send_source: ctx.registry_ep,
+        sched_baseline: ctx.sched_baseline,
     };
     let process_badge = next_process_badge();
     let pi_memory_cap = populate_child_info(

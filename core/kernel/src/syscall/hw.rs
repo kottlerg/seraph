@@ -495,11 +495,11 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
     use crate::cap::object::{KernelObjectHeader, MmioObject, ObjectType, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
     use crate::cap::seed_header_nn;
-    use crate::cap::slot::{CapTag, Rights, SlotId};
+    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::split::install_split_children;
     use crate::mm::PAGE_SIZE;
     use crate::syscall::current_tcb;
 
@@ -591,108 +591,23 @@ pub fn sys_mmio_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Insert both children into the caller's CSpace under cspace.lock so the
-    // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*.
-    // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
-    let slot1_nz = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(CapTag::Mmio, mmio_rights, child1_ptr);
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
-    }
-    .map_err(|_| {
-        // SAFETY: child1_ptr and child2_ptr just allocated above with
-        // refcount 1; neither has been inserted into any CSpace.
-        unsafe {
-            dealloc_object(child1_ptr);
-            dealloc_object(child2_ptr);
-        }
-        SyscallError::OutOfMemory
-    })?;
-    let slot1 = slot1_nz.get();
-    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
-    let slot2_nz = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(CapTag::Mmio, mmio_rights, child2_ptr);
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
-    }
-    .map_err(|_| {
-        // Undo slot1 insertion and release both objects: child1_ptr was
-        // inserted (held only via slot1, which we are about to free);
-        // child2_ptr was passed to the failing insert_cap and never
-        // stored, so the kernel object is unreachable unless dropped.
-        // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
-        unsafe {
-            let saved = (*caller_cspace).lock.lock_raw();
-            (*caller_cspace).free_slot(slot1);
-            (*caller_cspace).lock.unlock_raw(saved);
-        }
-        // SAFETY: both child pointers just allocated above with refcount 1.
-        unsafe {
-            dealloc_object(child1_ptr);
-            dealloc_object(child2_ptr);
-        }
-        SyscallError::OutOfMemory
-    })?;
-    let slot2 = slot2_nz.get();
-
-    // ── Wire derivation tree ──────────────────────────────────────────────────
-    //
-    // Pattern mirrors sys_memory_split: reparent original's children to its
-    // parent, unlink original, then link both new caps to that same parent.
-
-    let mmio_idx_nz =
-        core::num::NonZeroU32::new(mmio_idx).ok_or(SyscallError::InvalidCapability)?;
-
-    DERIVATION_LOCK.write_lock();
-
-    let orig_node = SlotId::current(cspace_id, mmio_idx_nz);
-    let child1_id = SlotId::current(cspace_id, slot1_nz);
-    let child2_id = SlotId::current(cspace_id, slot2_nz);
-
-    // Read the original's parent before we modify anything.
-    // SAFETY: caller_cspace validated; mmio_idx within CSpace bounds.
-    let orig_parent = unsafe { (*caller_cspace).slot(mmio_idx).and_then(|s| s.deriv_parent) };
-
-    // Reparent original's existing children (if any) to its parent.
-    // SAFETY: DERIVATION_LOCK held; orig_node/orig_parent valid.
-    unsafe { reparent_children(orig_node, orig_parent) };
-    // Unlink the original node from the tree.
-    // SAFETY: DERIVATION_LOCK held; orig_node valid.
-    unsafe { unlink_node(orig_node) };
-
-    // Link both new caps to the original's parent (if any).
-    if let Some(parent_id) = orig_parent
-    {
-        // SAFETY: DERIVATION_LOCK held; parent_id/child1_id/child2_id valid.
-        unsafe { link_child(parent_id, child1_id) };
-        // SAFETY: DERIVATION_LOCK held; parent_id/child2_id valid.
-        unsafe { link_child(parent_id, child2_id) };
-    }
-
-    DERIVATION_LOCK.write_unlock();
-
-    // ── Consume the original cap ──────────────────────────────────────────────
-
-    // Return original slot to free list (tag becomes Null) under cspace.lock.
-    // SAFETY: caller_cspace validated; mmio_idx within CSpace bounds.
+    // Install both children, rewire the derivation tree, and consume the
+    // original — shared with the other range splits.
+    // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
+    // children are freshly-allocated SEED-backed MmioObjects (refcount 1);
+    // orig_obj_ptr is the live original from lookup_cap.
     unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        (*caller_cspace).free_slot(mmio_idx);
-        (*caller_cspace).lock.unlock_raw(saved);
+        install_split_children(
+            caller_cspace,
+            cspace_id,
+            mmio_idx,
+            CapTag::Mmio,
+            mmio_rights,
+            orig_obj_ptr,
+            child1_ptr,
+            child2_ptr,
+        )
     }
-
-    // Dec-ref original object; free if no references remain.
-    // SAFETY: orig_obj_ptr from lookup_cap; object still valid (ref > 0 at lookup).
-    let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };
-    if remaining == 0
-    {
-        // SAFETY: ref count reached zero; no other references exist.
-        unsafe { dealloc_object(orig_obj_ptr) };
-    }
-
-    Ok(u64::from(slot1) | (u64::from(slot2) << 32))
 }
 
 #[cfg(test)]
@@ -720,11 +635,11 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 #[cfg(not(test))]
 pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
-    use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
     use crate::cap::object::{InterruptObject, KernelObjectHeader, ObjectType, dealloc_object};
     use crate::cap::retype::alloc_in_seed;
     use crate::cap::seed_header_nn;
-    use crate::cap::slot::{CapTag, Rights, SlotId};
+    use crate::cap::slot::{CapTag, Rights};
+    use crate::cap::split::install_split_children;
     use crate::syscall::current_tcb;
 
     let irq_idx = tf.arg(0) as u32;
@@ -799,98 +714,23 @@ pub fn sys_irq_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         }
     };
 
-    // Insert both children into the caller's CSpace under cspace.lock so the
-    // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*.
-    // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
-    let slot1_nz = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(CapTag::Interrupt, rights, child1_ptr);
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
-    }
-    .map_err(|_| {
-        // SAFETY: child1_ptr and child2_ptr just allocated above with
-        // refcount 1; neither has been inserted into any CSpace.
-        unsafe {
-            dealloc_object(child1_ptr);
-            dealloc_object(child2_ptr);
-        }
-        SyscallError::OutOfMemory
-    })?;
-    let slot1 = slot1_nz.get();
-    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
-    let slot2_nz = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap(CapTag::Interrupt, rights, child2_ptr);
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
-    }
-    .map_err(|_| {
-        // Undo slot1 insertion and release both objects: child1_ptr was
-        // inserted (held only via slot1, which we are about to free);
-        // child2_ptr was passed to the failing insert_cap and never
-        // stored.
-        // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
-        unsafe {
-            let saved = (*caller_cspace).lock.lock_raw();
-            (*caller_cspace).free_slot(slot1);
-            (*caller_cspace).lock.unlock_raw(saved);
-        }
-        // SAFETY: both child pointers just allocated above with refcount 1.
-        unsafe {
-            dealloc_object(child1_ptr);
-            dealloc_object(child2_ptr);
-        }
-        SyscallError::OutOfMemory
-    })?;
-    let slot2 = slot2_nz.get();
-
-    // ── Wire derivation tree ──────────────────────────────────────────────────
-
-    let irq_idx_nz = core::num::NonZeroU32::new(irq_idx).ok_or(SyscallError::InvalidCapability)?;
-
-    DERIVATION_LOCK.write_lock();
-
-    let orig_node = SlotId::current(cspace_id, irq_idx_nz);
-    let child1_id = SlotId::current(cspace_id, slot1_nz);
-    let child2_id = SlotId::current(cspace_id, slot2_nz);
-
-    // SAFETY: caller_cspace validated; irq_idx within CSpace bounds.
-    let orig_parent = unsafe { (*caller_cspace).slot(irq_idx).and_then(|s| s.deriv_parent) };
-
-    // SAFETY: DERIVATION_LOCK held; orig_node/orig_parent valid.
-    unsafe { reparent_children(orig_node, orig_parent) };
-    // SAFETY: DERIVATION_LOCK held; orig_node valid.
-    unsafe { unlink_node(orig_node) };
-
-    if let Some(parent_id) = orig_parent
-    {
-        // SAFETY: DERIVATION_LOCK held; parent_id/child1_id/child2_id valid.
-        unsafe { link_child(parent_id, child1_id) };
-        // SAFETY: DERIVATION_LOCK held; parent_id/child2_id valid.
-        unsafe { link_child(parent_id, child2_id) };
-    }
-
-    DERIVATION_LOCK.write_unlock();
-
-    // ── Consume the original cap ──────────────────────────────────────────────
-
-    // SAFETY: caller_cspace validated; irq_idx within CSpace bounds.
+    // Install both children, rewire the derivation tree, and consume the
+    // original — shared with the other range splits.
+    // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
+    // children are freshly-allocated SEED-backed InterruptObjects (refcount 1);
+    // orig_obj_ptr is the live original from lookup_cap.
     unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        (*caller_cspace).free_slot(irq_idx);
-        (*caller_cspace).lock.unlock_raw(saved);
+        install_split_children(
+            caller_cspace,
+            cspace_id,
+            irq_idx,
+            CapTag::Interrupt,
+            rights,
+            orig_obj_ptr,
+            child1_ptr,
+            child2_ptr,
+        )
     }
-
-    // SAFETY: orig_obj_ptr from lookup_cap; object still valid (ref > 0 at lookup).
-    let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };
-    if remaining == 0
-    {
-        // SAFETY: ref count reached zero; no other references exist.
-        unsafe { dealloc_object(orig_obj_ptr) };
-    }
-
-    Ok(u64::from(slot1) | (u64::from(slot2) << 32))
 }
 
 #[cfg(test)]
@@ -932,11 +772,11 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     #[cfg(target_arch = "x86_64")]
     {
-        use crate::cap::derivation::{DERIVATION_LOCK, link_child, reparent_children, unlink_node};
         use crate::cap::object::{IoPortObject, KernelObjectHeader, ObjectType, dealloc_object};
         use crate::cap::retype::alloc_in_seed;
         use crate::cap::seed_header_nn;
-        use crate::cap::slot::{CapTag, Rights, SlotId};
+        use crate::cap::slot::{CapTag, Rights};
+        use crate::cap::split::install_split_children;
         use crate::syscall::current_tcb;
 
         let port_idx = tf.arg(0) as u32;
@@ -1036,98 +876,23 @@ pub fn sys_ioport_split(tf: &mut TrapFrame) -> Result<u64, SyscallError>
             }
         };
 
-        // Insert both children into the caller's CSpace under cspace.lock.
-        // SAFETY: caller_cspace validated non-null; lock_raw/unlock_raw paired.
-        let slot1_nz = unsafe {
-            let saved = (*caller_cspace).lock.lock_raw();
-            let r = (*caller_cspace).insert_cap(CapTag::IoPort, rights, child1_ptr);
-            (*caller_cspace).lock.unlock_raw(saved);
-            r
-        }
-        .map_err(|_| {
-            // SAFETY: child1_ptr and child2_ptr just allocated above with
-            // refcount 1; neither has been inserted into any CSpace.
-            unsafe {
-                dealloc_object(child1_ptr);
-                dealloc_object(child2_ptr);
-            }
-            SyscallError::OutOfMemory
-        })?;
-        let slot1 = slot1_nz.get();
-        // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
-        let slot2_nz = unsafe {
-            let saved = (*caller_cspace).lock.lock_raw();
-            let r = (*caller_cspace).insert_cap(CapTag::IoPort, rights, child2_ptr);
-            (*caller_cspace).lock.unlock_raw(saved);
-            r
-        }
-        .map_err(|_| {
-            // Undo slot1 insertion and release both objects: child1_ptr was
-            // inserted (held only via slot1, which we are about to free);
-            // child2_ptr was passed to the failing insert_cap and never
-            // stored.
-            // SAFETY: caller_cspace validated; lock_raw/unlock_raw paired.
-            unsafe {
-                let saved = (*caller_cspace).lock.lock_raw();
-                (*caller_cspace).free_slot(slot1);
-                (*caller_cspace).lock.unlock_raw(saved);
-            }
-            // SAFETY: both child pointers just allocated above with refcount 1.
-            unsafe {
-                dealloc_object(child1_ptr);
-                dealloc_object(child2_ptr);
-            }
-            SyscallError::OutOfMemory
-        })?;
-        let slot2 = slot2_nz.get();
-
-        // ── Wire derivation tree ─────────────────────────────────────────────
-
-        let port_idx_nz =
-            core::num::NonZeroU32::new(port_idx).ok_or(SyscallError::InvalidCapability)?;
-
-        DERIVATION_LOCK.write_lock();
-
-        let orig_node = SlotId::current(cspace_id, port_idx_nz);
-        let child1_id = SlotId::current(cspace_id, slot1_nz);
-        let child2_id = SlotId::current(cspace_id, slot2_nz);
-
-        // SAFETY: caller_cspace validated; port_idx within CSpace bounds.
-        let orig_parent = unsafe { (*caller_cspace).slot(port_idx).and_then(|s| s.deriv_parent) };
-
-        // SAFETY: DERIVATION_LOCK held; orig_node/orig_parent valid.
-        unsafe { reparent_children(orig_node, orig_parent) };
-        // SAFETY: DERIVATION_LOCK held; orig_node valid.
-        unsafe { unlink_node(orig_node) };
-
-        if let Some(parent_id) = orig_parent
-        {
-            // SAFETY: DERIVATION_LOCK held; parent_id/child1_id/child2_id valid.
-            unsafe { link_child(parent_id, child1_id) };
-            // SAFETY: DERIVATION_LOCK held; parent_id/child2_id valid.
-            unsafe { link_child(parent_id, child2_id) };
-        }
-
-        DERIVATION_LOCK.write_unlock();
-
-        // ── Consume the original cap ─────────────────────────────────────────
-
-        // SAFETY: caller_cspace validated; port_idx within CSpace bounds.
+        // Install both children, rewire the derivation tree, and consume the
+        // original — shared with the other range splits.
+        // SAFETY: caller_cspace validated non-null; cspace_id is its id; both
+        // children are freshly-allocated SEED-backed IoPortObjects (refcount 1);
+        // orig_obj_ptr is the live original from lookup_cap.
         unsafe {
-            let saved = (*caller_cspace).lock.lock_raw();
-            (*caller_cspace).free_slot(port_idx);
-            (*caller_cspace).lock.unlock_raw(saved);
+            install_split_children(
+                caller_cspace,
+                cspace_id,
+                port_idx,
+                CapTag::IoPort,
+                rights,
+                orig_obj_ptr,
+                child1_ptr,
+                child2_ptr,
+            )
         }
-
-        // SAFETY: orig_obj_ptr from lookup_cap; object still valid (ref > 0 at lookup).
-        let remaining = unsafe { (*orig_obj_ptr.as_ptr()).dec_ref() };
-        if remaining == 0
-        {
-            // SAFETY: ref count reached zero; no other references exist.
-            unsafe { dealloc_object(orig_obj_ptr) };
-        }
-
-        Ok(u64::from(slot1) | (u64::from(slot2) << 32))
     }
 }
 

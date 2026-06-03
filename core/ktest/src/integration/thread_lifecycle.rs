@@ -122,7 +122,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let th2 = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs2)
         .map_err(|_| "integration::thread_lifecycle: cap_create_thread (step 8) failed")?;
 
-    thread_set_priority(th2, 5, 0)
+    thread_set_priority(th2, 5, ctx.sched_control_cap)
         .map_err(|_| "integration::thread_lifecycle: thread_set_priority failed")?;
     thread_set_affinity(th2, 0)
         .map_err(|_| "integration::thread_lifecycle: thread_set_affinity failed")?;

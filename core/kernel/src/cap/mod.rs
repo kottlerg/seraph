@@ -18,7 +18,7 @@
 //!   read-only [`CapTag::Memory`] caps so userspace can parse firmware tables
 //! - One root [`CapTag::IoPort`] cap covering the full 64K I/O port
 //!   space (x86-64, USE)
-//! - One [`CapTag::SchedControl`] cap (ELEVATE)
+//! - One [`CapTag::SchedControl`] cap spanning the full userspace priority range
 //! - One [`CapTag::SbiControl`] cap on RISC-V (CALL)
 //!
 //! The populated `CSpace` is stored in [`ROOT_CSPACE`] until Phase 9 hands it
@@ -41,6 +41,7 @@ pub mod derivation;
 pub mod object;
 pub mod retype;
 pub mod slot;
+pub mod split;
 
 // Re-exports for convenience. Many are consumed by future phases; suppress the
 // unused lint rather than removing symbols that future code will reference.
@@ -1610,14 +1611,19 @@ fn populate_cspace(
         hw_cap_count += 1;
     }
 
-    // One SchedControl capability — grants elevated scheduling authority.
+    // One root SchedControl capability spanning the full userspace priority
+    // range. Holding it (plus its band) is the authority to assign priorities
+    // in that band; init narrows it with `SYS_SCHED_SPLIT` and delegates
+    // baseline bands to services. Presence-only — no rights bit.
     let ptr = mint_phase7_body(SchedControlObject {
         header: KernelObjectHeader::with_ancestor(ObjectType::SchedControl, seed_header_nn()),
+        min: syscall::PRIORITY_MIN,
+        max: syscall::PRIORITY_MAX,
     });
     let sched_control_slot = insert_or_fatal(
         cspace,
         CapTag::SchedControl,
-        Rights::ELEVATE,
+        Rights::NONE,
         ptr,
         "Phase 7: cannot allocate SchedControl capability",
     );
@@ -1627,8 +1633,8 @@ fn populate_cspace(
             slot: sched_control_slot,
             cap_type: CapType::SchedControl,
             pad: [0; 3],
-            aux0: 0,
-            aux1: 0,
+            aux0: u64::from(syscall::PRIORITY_MIN),
+            aux1: u64::from(syscall::PRIORITY_MAX),
         },
     );
 

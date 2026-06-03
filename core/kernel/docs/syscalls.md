@@ -135,9 +135,10 @@ are never reassigned or reused.
 23  SYS_THREAD_CONFIGURE         49  SYS_IRQ_SPLIT
 24  SYS_CAP_COPY                 50  SYS_MEMORY_MERGE
 25  SYS_CAP_MOVE                 51  SYS_IOPORT_SPLIT
+                                 52  SYS_SCHED_SPLIT
 ```
 
-**Implementation status.** Every number 0–51 has a handler except slot 32,
+**Implementation status.** Every number 0–52 has a handler except slot 32,
 which is reserved (formerly `SYS_CAP_INSERT`; its caller-chosen-slot behaviour
 is now reached through `SYS_CAP_COPY`'s destination-slot argument — a value of
 `0` auto-allocates) and returns `UnknownSyscall`. All other unallocated numbers
@@ -447,13 +448,14 @@ Create a new thread in an existing address space.
 | 1 | `entry` | Virtual address of the thread entry point |
 | 2 | `stack_top` | Initial stack pointer |
 | 3 | `arg` | Value passed in first argument register |
-| 4 | `priority` | Scheduling priority (1–`PRIORITY_MAX`); priorities ≥ `SCHED_ELEVATED_MIN` require a SchedControl capability held by the creating process |
 
 **Return:** `rax`/`a0`: new thread capability (Control rights) on success;
 `SyscallError` on failure.
 
 The thread is created in the `Created` state; it does not begin execution until
-`SYS_THREAD_START` is called.
+`SYS_THREAD_START` is called. Creation takes no priority argument — the thread
+starts at the default priority (`INIT_PRIORITY`) and is re-prioritised, if
+needed, via `SYS_THREAD_SET_PRIORITY` (which requires a `SchedControl` cap).
 
 **Capability requirement:** `aspace_cap` must have Map rights. Map is intentionally
 reused here: a process that can modify an address space's mappings is inherently
@@ -804,28 +806,59 @@ Change a thread's scheduling priority after creation.
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `thread_cap` | Thread capability (Control rights) |
+| 0 | `thread_cap` | Thread capability (Control rights): selects *which* thread |
 | 1 | `priority` | New priority (1–`PRIORITY_MAX`) |
-| 2 | `sched_cap` | SchedControl capability (Elevate rights); use 0 if not needed |
+| 2 | `sched_cap` | `SchedControl` capability whose `[min, max]` band covers `priority`: governs *which level*. Always required |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The priority range is divided into two tiers:
-
-- **Normal range (1–20):** `sched_cap` is ignored. Any holder of the thread's
-  Control capability may set priorities freely in this range.
-- **Elevated range (21–30):** `sched_cap` MUST be a valid SchedControl capability
-  with Elevate rights. Without it, the call returns `AccessDenied`.
+Assigning a priority is capability-gated with no ambient authority. `thread_cap`
+(Control) authorises mutating the target thread; `sched_cap` must be a
+`SchedControl` whose band includes `priority`. A process holding no `SchedControl`
+(or one whose band excludes the requested level) cannot set any priority — there
+is no free "normal" range. The kernel defines no normal/elevated boundary; that
+partition is userspace policy expressed through `SchedControl` band distribution
+(see [scheduler.md § Priority Authority](scheduler.md#priority-authority)).
 
 Priority 0 (idle) and priority 31 (reserved) cannot be requested. The change takes
 effect at the next scheduler invocation.
 
-**Capability requirements:** `thread_cap` (Control rights); `sched_cap` (Elevate
-rights) when `priority` ≥ `SCHED_ELEVATED_MIN`.
+**Capability requirements:** `thread_cap` (Control rights); `sched_cap` (a
+`SchedControl` whose band covers `priority`).
 
-**Errors:** `InvalidCapability`, `AccessDenied` (insufficient rights for the
-requested priority tier), `InvalidArgument` (priority 0, priority 31, or out
-of range).
+**Errors:** `InvalidCapability` (no valid `SchedControl` at `sched_cap`),
+`InsufficientRights` (band does not cover `priority`), `InvalidArgument`
+(priority 0, priority 31, or out of range).
+
+---
+
+### `SYS_SCHED_SPLIT` (52)
+
+Split a `SchedControl` capability into two children covering disjoint priority
+bands. Mirrors the range-split shape of `SYS_IRQ_SPLIT` / `SYS_MMIO_SPLIT` /
+`SYS_IOPORT_SPLIT`.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `sched_cap` | `SchedControl` capability to split |
+| 1 | `split_at` | Lowest priority level of the upper child; must satisfy `min < split_at <= max` on the cap being split |
+
+**Return:** `rax`/`a0`: packed `lower_slot | (upper_slot << 32)` on success;
+`SyscallError` on failure.
+
+The lower child covers `[min, split_at - 1]`, the upper child `[split_at, max]`.
+The original cap is consumed; both children are reparented to the original's
+derivation parent and carry the same (absent) rights. This is the only way to
+narrow a band — `SYS_CAP_DERIVE` attenuates rights and cannot shrink a range.
+
+**Capability requirements:** `sched_cap` must be a `SchedControl` (presence-only;
+no rights bit).
+
+**Errors:** `InvalidCapability` (not a `SchedControl`), `InvalidArgument`
+(`split_at` outside `(min, max]`), `OutOfMemory` (child allocation or slot
+insertion failed).
 
 ---
 
@@ -1347,8 +1380,7 @@ all its descendants (including C2) but leaves C and any other children of C inta
 |---|---|---|
 | `MSG_DATA_WORDS_MAX` | TBD (≥4) | Maximum data words per message |
 | `MSG_CAP_SLOTS_MAX` | 4 | Maximum capabilities per message |
-| `PRIORITY_DEFAULT` | 10 | Default priority for newly created threads |
-| `SCHED_ELEVATED_MIN` | 21 | First priority level requiring SchedControl capability |
+| `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 4096 | Maximum entries in an event queue |
 | `BOOT_PROTOCOL_VERSION` | 5 | Expected version in `BootInfo.version` |

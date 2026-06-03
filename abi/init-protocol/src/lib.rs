@@ -71,7 +71,12 @@
 ///     `MmioRegion` → `Mmio`, `IoPortRange` → `IoPort`; the `*_frame_*`
 ///     `InitInfo` slot-range fields renamed to `*_memory_*`. Source-level
 ///     rename only — discriminant values and field layout are unchanged.
-pub const INIT_PROTOCOL_VERSION: u32 = 11;
+/// v12: `SchedControl` carries a `[min, max]` priority range (#185). The
+///     `SchedControl` [`CapDescriptor`] now reports `aux0 = min`, `aux1 = max`
+///     (previously both 0). `Rights::ELEVATE` is removed: holding a
+///     `SchedControl` cap plus its range is the authority. Field layout
+///     unchanged; semantic change to the `SchedControl` descriptor only.
+pub const INIT_PROTOCOL_VERSION: u32 = 12;
 
 /// Length of [`InitModuleName::name`], matching
 /// [`boot_protocol::BOOT_MODULE_NAME_LEN`] so the kernel copies the bundle
@@ -327,7 +332,7 @@ pub struct CapDescriptor
     /// - `Mmio`: physical base address
     /// - `Interrupt`: starting IRQ line number (range cap; split via `SYS_IRQ_SPLIT`)
     /// - `IoPort`: I/O port base
-    /// - `SchedControl`: 0 (unused)
+    /// - `SchedControl`: minimum priority level in the cap's range
     pub aux0: u64,
 
     /// Type-specific secondary metadata:
@@ -335,7 +340,7 @@ pub struct CapDescriptor
     /// - `Mmio`: size in bytes
     /// - `Interrupt`: number of consecutive IRQ lines covered by the cap
     /// - `IoPort`: port count
-    /// - `SchedControl`: 0 (unused)
+    /// - `SchedControl`: maximum priority level in the cap's range
     pub aux1: u64,
 }
 

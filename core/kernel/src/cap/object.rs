@@ -36,7 +36,7 @@
 //! | MmioObject    | 40 B  |
 //! | InterruptObject     | 24 B  |
 //! | IoPortObject   | 24 B  |
-//! | SchedControlObject  | 16 B  |
+//! | SchedControlObject  | 20 B  |
 //! | SbiControlObject    | 16 B  |
 //! | ThreadObject        | 24 B  |
 //! | AddressSpaceObject  | 432 B |
@@ -422,11 +422,19 @@ pub struct IoPortObject
 
 /// Kernel object for scheduling control authority (`SchedControl` capability).
 ///
-/// There is exactly one `SchedControl` object, created at boot.
+/// Carries the priority band `[min, max]` the cap authorises. Holding a
+/// `SchedControl` cap whose band covers a level is the authority to assign that
+/// level via `SYS_THREAD_SET_PRIORITY`. The root cap (spanning the full
+/// userspace range) is minted at boot; narrower bands are produced by
+/// `SYS_SCHED_SPLIT`.
 #[repr(C)]
 pub struct SchedControlObject
 {
     pub header: KernelObjectHeader,
+    /// Lowest priority level this cap authorises (inclusive).
+    pub min: u8,
+    /// Highest priority level this cap authorises (inclusive).
+    pub max: u8,
 }
 
 /// Kernel object for SBI forwarding authority (`SbiControl` capability).
@@ -2574,8 +2582,8 @@ mod tests
         assert_eq!(size_of::<InterruptObject>(), 24);
         // IoPortObject: 16 header + 2 base + 2 size + 4 pad = 24.
         assert_eq!(size_of::<IoPortObject>(), 24);
-        // Wrapper objects: 16 header + 8 ptr = 24.
-        assert_eq!(size_of::<SchedControlObject>(), 16);
+        // SchedControlObject: 16 header + 1 min + 1 max + 2 pad = 20.
+        assert_eq!(size_of::<SchedControlObject>(), 20);
         assert_eq!(size_of::<SbiControlObject>(), 16);
         assert_eq!(size_of::<ThreadObject>(), 24);
         assert_eq!(size_of::<EndpointObject>(), 24);

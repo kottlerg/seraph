@@ -24,34 +24,39 @@ There are `NUM_PRIORITY_LEVELS` = 32 priority levels, numbered 0 (lowest) throug
 - **Priorities 1–30** — available to userspace. `PRIORITY_MAX` = 30.
 - **Priority 31** — reserved; cannot be requested by userspace.
 
-Userspace threads specify a priority in [1, `PRIORITY_MAX`] at creation time
-(`SYS_CAP_CREATE_THREAD`) or via `SYS_THREAD_SET_PRIORITY`. The kernel does not
-implement dynamic priority adjustment or aging.
+Threads are created at a fixed default priority (`INIT_PRIORITY` = 15);
+`SYS_CAP_CREATE_THREAD` takes no priority argument. Priority is changed only via
+`SYS_THREAD_SET_PRIORITY`. The kernel does not implement dynamic priority
+adjustment or aging.
 
 ### Priority Authority
 
-The usable priority range is split into two tiers, controlling who may assign a
-given priority:
+Assigning a priority is capability-gated. `SYS_THREAD_SET_PRIORITY` takes two
+caps: a Thread cap with the Control right (selecting *which* thread) and a
+`SchedControl` cap (governing *which level*). A `SchedControl` carries a
+`[min, max]` priority band; the call succeeds only if the requested level lies
+within that band. There is no ambient authority — a process holding no
+`SchedControl` (or one whose band excludes the level) cannot set that priority.
+Lowering is not special-cased; every assignment is checked against the band.
 
-| Range | Name | Authority required |
-|---|---|---|
-| 1–20 | Normal | Thread Control capability only |
-| 21–30 | Elevated | Thread Control + SchedControl (Elevate rights) |
+The kernel does **not** define a normal/elevated boundary. The numeric level
+space is uniform; any partition into tiers is userspace policy, expressed by how
+`SchedControl` bands are distributed:
 
-`PRIORITY_DEFAULT = 10` is the baseline for newly created threads. Processes may
-freely adjust their own threads within the normal range (1–20) — lowering priority
-is always permitted, and raising within the normal range requires only the thread's
-Control capability.
+- The root `SchedControl` spans `[1, PRIORITY_MAX]`, is created at boot, and is
+  held by init.
+- Init narrows it with `SYS_SCHED_SPLIT` into a baseline band — `[1, 20]` by
+  default — and an elevated remainder `[21, PRIORITY_MAX]`.
+- Every spawned process receives a baseline copy through
+  `ProcessInfo.sched_control_cap` (procmgr fans it out at `CREATE_PROCESS`), so a
+  service self-schedules within the baseline without further grants.
+- Services needing real-time-ish scheduling (audio servers, device managers,
+  high-priority drivers) receive an explicit cap carved from the remainder.
 
-`SCHED_ELEVATED_MIN = 21` is the first priority that requires a SchedControl
-capability. The SchedControl capability is created at boot (one for the entire
-system) and held by init, which delegates derived copies to services that need
-real-time-ish scheduling — audio servers, device managers, high-priority drivers.
-Services without a SchedControl capability cannot assign elevated priorities
-regardless of what other capabilities they hold.
-
-This replaces the earlier ungated model in which any Control-capability holder
-could set any priority in the 1–30 range.
+`SchedControl` is the sole authority; see
+[capability-model.md § SchedControl](../../../docs/capability-model.md) for the
+cap shape, `SYS_SCHED_SPLIT`-based band splitting, and delegation. `cap_derive`
+cannot shrink a band — it attenuates rights only.
 
 ### Run Queue Structure
 

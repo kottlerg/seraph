@@ -63,6 +63,12 @@ pub struct StartupInfo {
     /// Cap slot of the caller's own CSpace object.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub self_cspace: u32,
+    /// Cap slot of a baseline `SchedControl` cap, or zero. Pass it as the
+    /// `sched_cap` argument to [`crate::os::seraph::syscall`]-level
+    /// `thread_set_priority` to set a thread's priority within the cap's band
+    /// (default `[1, 20]`). Zero means no scheduling authority was delegated.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub sched_control_cap: u32,
     /// Cap slot of a badged SEND cap on procmgr. Zero if procmgr is not
     /// reachable (the process is procmgr itself, or runs before procmgr
     /// exists). Used for process-lifecycle queries.
@@ -336,6 +342,7 @@ pub extern "C" fn _start() -> ! {
         self_thread: info.self_thread_cap,
         self_aspace: info.self_aspace_cap,
         self_cspace: info.self_cspace_cap,
+        sched_control_cap: info.sched_control_cap,
         procmgr_endpoint: info.procmgr_endpoint_cap,
         memmgr_endpoint: info.memmgr_endpoint_cap,
         service_registry_cap: info.service_registry_cap,

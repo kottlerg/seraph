@@ -371,16 +371,16 @@ pub fn run_all(ctx: &TestContext)
     );
     run_test!("thread::write_regs_resume", thread::write_regs_resume(ctx));
     run_test!(
-        "thread::set_priority_normal",
-        thread::set_priority_normal(ctx)
+        "thread::set_priority_in_band",
+        thread::set_priority_in_band(ctx)
     );
     run_test!(
-        "thread::set_priority_elevated_no_cap_err",
-        thread::set_priority_elevated_no_cap_err(ctx)
+        "thread::set_priority_no_cap_err",
+        thread::set_priority_no_cap_err(ctx)
     );
     run_test!(
-        "thread::set_priority_elevated_with_cap",
-        thread::set_priority_elevated_with_cap(ctx)
+        "thread::sched_split_enforces_bands",
+        thread::sched_split_enforces_bands(ctx)
     );
     run_test!(
         "thread::set_affinity_valid",

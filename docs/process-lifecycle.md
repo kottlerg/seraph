@@ -240,6 +240,11 @@ at creation time. Examples:
   which also equals the death-EQ correlator procmgr posts to
   logd. Identity is reconciled across the three views without
   any auxiliary mapping.
+- `ProcessInfo.sched_control_cap` — baseline `SchedControl` cap (default
+  band `[1, 20]`) so the child can set its own threads' priorities. procmgr
+  `cap_copy`s its own baseline (delivered by init) into every child; a child
+  with a zero slot holds no scheduling authority and cannot set any priority.
+  Added in `PROCESS_ABI_VERSION` 17 (#185).
 - `InitInfo.memory_base`, `InitInfo.memory_count` — chosen
   by the kernel per init invocation.
 

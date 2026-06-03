@@ -323,6 +323,8 @@ pub const SYS_IRQ_SPLIT: u64 = 49;
 pub const SYS_MEMORY_MERGE: u64 = 50;
 /// Split an `IoPort` cap into two non-overlapping children (`x86_64` only).
 pub const SYS_IOPORT_SPLIT: u64 = 51;
+/// Split a `SchedControl` cap into two children covering disjoint priority bands.
+pub const SYS_SCHED_SPLIT: u64 = 52;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 
@@ -370,10 +372,11 @@ pub enum SyscallError
 
 // ── Scheduling constants ──────────────────────────────────────────────────────
 
-/// Default scheduling priority for newly created threads.
-pub const PRIORITY_DEFAULT: u8 = 10;
-/// First priority level requiring a `SchedControl` capability with `Elevate` rights.
-pub const SCHED_ELEVATED_MIN: u8 = 21;
+/// Lowest priority a userspace thread may be assigned (0 is the idle band).
+///
+/// A `SchedControl` cap spanning `[PRIORITY_MIN, PRIORITY_MAX]` is the full
+/// userspace priority authority; the kernel mints init's cap with this span.
+pub const PRIORITY_MIN: u8 = 1;
 /// Maximum priority available to userspace threads.
 pub const PRIORITY_MAX: u8 = 30;
 

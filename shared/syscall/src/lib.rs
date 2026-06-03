@@ -46,10 +46,10 @@ use syscall_abi::{
     SYS_EVENT_POST, SYS_EVENT_RECV, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
     SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
     SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SYSTEM_INFO,
-    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
+    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
+    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP,
+    SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
     SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
 };
 
@@ -1168,6 +1168,43 @@ pub fn ioport_split(ioport_cap: u32, split_at: u16) -> Result<(u32, u32), i64>
     }
 }
 
+/// Split a `SchedControl` cap into two children covering disjoint priority bands.
+///
+/// `split_at` is the lowest priority level of the upper child (and one past the
+/// top of the lower child); it must satisfy `min < split_at <= max` on the cap
+/// being split. The lower child covers `[min, split_at - 1]`, the upper child
+/// `[split_at, max]`. The original cap is revoked on success. Returns packed
+/// `(lower_slot, upper_slot)`. `cap_derive` cannot narrow a band, so this is the
+/// only way to hand out a sub-band.
+///
+/// # Errors
+/// Returns a negative `i64` error code if the cap is invalid or `split_at`
+/// falls outside the cap's band.
+// cast_sign_loss / cast_possible_truncation: identical to `mmio_split`.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[inline]
+pub fn sched_split(sched_cap: u32, split_at: u8) -> Result<(u32, u32), i64>
+{
+    // SAFETY: syscall3 issues raw syscall instruction; kernel validates cap and split point.
+    let ret = unsafe {
+        syscall3(
+            SYS_SCHED_SPLIT,
+            u64::from(sched_cap),
+            u64::from(split_at),
+            0,
+        )
+    };
+    if ret < 0
+    {
+        Err(ret)
+    }
+    else
+    {
+        let v = ret as u64;
+        Ok(((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32))
+    }
+}
+
 /// Set the entry point, stack, and initial argument for a thread cap.
 ///
 /// The thread must be in `Created` state (not yet started). Call
@@ -1784,13 +1821,16 @@ pub fn thread_stop(thread_cap: u32) -> Result<(), i64>
 
 /// Change a thread's scheduling priority.
 ///
-/// `priority` must be in `[1, PRIORITY_MAX]`. Priorities `>= SCHED_ELEVATED_MIN`
-/// require a valid `sched_cap` with Elevate rights. Pass `sched_cap = 0` for
-/// normal-range changes.
+/// `priority` must be in `[1, PRIORITY_MAX]`. `sched_cap` must be a
+/// `SchedControl` cap whose `[min, max]` band covers `priority`; it is always
+/// required. There is no ambient priority authority — holding no `SchedControl`
+/// (or one whose band excludes `priority`) cannot set any priority. Narrow a
+/// band with [`sched_split`].
 ///
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid,
-/// `priority` is out of range, or `sched_cap` is invalid when required.
+/// `priority` is out of range, `sched_cap` is not a `SchedControl`, or its band
+/// does not cover `priority`.
 #[inline]
 pub fn thread_set_priority(thread_cap: u32, priority: u8, sched_cap: u32) -> Result<(), i64>
 {

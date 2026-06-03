@@ -172,7 +172,7 @@ The teardown sequence binds the following ordered steps. Each step's preconditio
 13. Release tcb's fault-handler binding, if any: atomically swap
     tcb.fault_handler to null and dec_ref the prior EndpointObject; if its
     refcount reaches 0, enqueue the orphaned endpoint header on the cascade
-    worklist (step 16's mechanism) rather than recursing into dealloc_object.
+    worklist (step 17's mechanism) rather than recursing into dealloc_object.
     Done after the step-11 unlink so the endpoint dealloc cannot observe this
     thread still on its send queue.
 14. (x86_64 only) Release IOPB if bound.

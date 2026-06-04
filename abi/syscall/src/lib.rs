@@ -486,6 +486,20 @@ pub const RIGHTS_THREAD: u64 = (1 << 11) | (1 << 12);
 /// `CSpace`: full management (insert, delete, derive, revoke).
 pub const RIGHTS_CSPACE: u64 = (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16);
 
+/// `EventQueue`: post-only. Permits `event_post` and binding as a
+/// notification observer (`thread_bind_notification` /
+/// `aspace_bind_notification`), but not draining (`RECV`). Derive a copy
+/// narrowed to this right to hand a queue to another component as a
+/// write-only sink while retaining `RECV` on the original.
+pub const RIGHTS_POST: u64 = 1 << 9;
+
+/// Control authority over a kernel object. On a `Thread` cap it permits
+/// start/stop/configure; on an `AddressSpace` cap it permits registering
+/// terminal-fault death observers (`aspace_bind_notification`). Held by
+/// the object's creator; mask it out of derived copies handed to
+/// components that only need to map or run within the object.
+pub const RIGHTS_CONTROL: u64 = 1 << 11;
+
 /// Memory: authority to retype memory into kernel objects.
 ///
 /// Held by RAM Memory caps minted from buddy at boot; never held by firmware-

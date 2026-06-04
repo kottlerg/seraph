@@ -106,10 +106,15 @@ pub mod procmgr_labels
     /// * `word 1+argv_words` — `env_bytes` (low 16 bits; only when `env_count > 0`)
     /// * words after the env header — env blob, `env_bytes.div_ceil(8)` words
     ///
-    /// Caps: `[file_cap, creator_endpoint?]`. `file_cap` ownership transfers
-    /// to procmgr; procmgr `FS_CLOSE`s and `cap_delete`s it after the load
-    /// completes (success or failure). Stdio pipes are installed via
-    /// separate [`CONFIGURE_PIPE`] calls between create and start.
+    /// Caps: `[file_cap, creator_endpoint?, death_relay?]`. `file_cap`
+    /// ownership transfers to procmgr; procmgr `FS_CLOSE`s and
+    /// `cap_delete`s it after the load completes (success or failure). The
+    /// optional `death_relay` POST-only `EventQueue` cap is present iff
+    /// [`CREATE_DEATH_RELAY`] is set in the label; when present it is the
+    /// LAST cap in the message (procmgr peels it off the tail, so the
+    /// `creator_endpoint` slot stays positionally fixed regardless of
+    /// relay presence). Stdio pipes are installed via separate
+    /// [`CONFIGURE_PIPE`] calls between create and start.
     pub const CREATE_FROM_FILE: u64 = 13;
     /// Label flag (bit 16) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// create the new process as demand-paged. At finalize procmgr binds
@@ -122,6 +127,16 @@ pub mod procmgr_labels
     /// `log_badges::LOG_BADGE_FIRST_CHILD`) are never paged regardless of
     /// this flag.
     pub const CREATE_DEMAND_PAGED: u64 = 1 << 16;
+    /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
+    /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the
+    /// message). At finalize procmgr binds it as an `AddressSpace` death
+    /// observer (correlator 0) on the child so that a terminal fault in any
+    /// of the child's threads posts the fault class straight to the
+    /// spawner's own death queue, letting `Child::wait()` return. procmgr
+    /// `cap_delete`s its copy after the bind (the kernel captured the
+    /// `EventQueue` state at bind time). Occupies bit 17 of the reserved
+    /// `[16..32]` label window.
+    pub const CREATE_DEATH_RELAY: u64 = 1 << 17;
     /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
     /// cspace, `ProcessInfo` Memory cap), dec-refing any pages the child
     /// still holds so they recycle back into the kernel buddy allocator. The

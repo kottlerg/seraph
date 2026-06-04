@@ -934,7 +934,22 @@ fn handle_create_from_file(
             return;
         }
     };
-    let creator_ep = caps.get(1).copied().unwrap_or(0);
+    // The death-relay POST cap, when present, is the LAST cap in the message
+    // (see `CREATE_DEATH_RELAY`). Peel it off the tail first so the
+    // `creator_endpoint` slot stays positionally fixed at caps[1].
+    let parent_relay_cap = if label & procmgr_labels::CREATE_DEATH_RELAY != 0
+    {
+        caps.last().copied().unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
+    let creator_ep = match caps.get(1).copied()
+    {
+        Some(c) if c != parent_relay_cap => c,
+        _ => 0,
+    };
 
     let file_size = req.word(0);
 
@@ -993,6 +1008,7 @@ fn handle_create_from_file(
         &env,
         ctx.death_eq,
         label & procmgr_labels::CREATE_DEMAND_PAGED != 0,
+        parent_relay_cap,
     );
 
     match result
@@ -1000,6 +1016,13 @@ fn handle_create_from_file(
         Ok(result) => reply_create_result(&result, ipc_buf),
         Err(code) =>
         {
+            // The relay cap is consumed (bound + deleted) only on the
+            // success path inside `finalize_creation`; drop procmgr's copy
+            // here on any earlier failure so it does not leak.
+            if parent_relay_cap != 0
+            {
+                let _ = syscall::cap_delete(parent_relay_cap);
+            }
             reply_empty(ipc_buf, code);
         }
     }

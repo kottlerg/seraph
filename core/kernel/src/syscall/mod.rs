@@ -320,15 +320,16 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         .state
     };
 
-    // Append a new observer. `death_observer_count` is only mutated here
-    // (and cleared on TCB init); the death-post path reads under scheduler
-    // lock so the append must also be protected.
+    // Append a new observer. No intrinsic lock guards `death_observers`/
+    // `death_observer_count` against the death-post reader
+    // ([`crate::sched::post_death_notification`]); soundness relies on binds
+    // completing before the thread runs (procmgr binds the main-thread observer
+    // in `finalize_creation` before `thread_start`). Binding on an already
+    // -running thread would race the reader and needs a lock first. Mirrors
+    // `AddressSpace::bind_death_observer`.
     //
     // SAFETY: target_tcb is a valid TCB from a validated Thread cap; the
-    // scheduler lock is held across this syscall entry, so the TCB's
-    // observer array is not concurrently mutated.
-    // SAFETY: target_tcb validated non-null; read pre-append snapshot.
-    // SAFETY: target_tcb is a valid TCB from a validated Thread cap.
+    // append stays within MAX_DEATH_OBSERVERS (bounds-checked below).
     unsafe {
         let count = (*target_tcb).death_observer_count as usize;
         if count >= MAX_DEATH_OBSERVERS

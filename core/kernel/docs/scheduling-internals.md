@@ -402,7 +402,7 @@ Every synchronous-IPI ack wait MUST route through `arch::current::interrupts::wa
 |---|---|---|
 | A | 0 – 250 ms | Spin with `core::hint::spin_loop()` while `cond()` reports unacked. |
 | B | 250 – 750 ms | Call `ctx.resend()` once at the boundary, then continue spinning. Recovers from a dropped IPI under emulators with non-deterministic LAPIC delivery. |
-| C | 750 ms – 5 s | x86-64: set `NMI_BACKTRACE_REQUEST[target_cpu]` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `ExceptionFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
+| C | 750 ms – 5 s | x86-64: set `NMI_BACKTRACE_REQUEST[target_cpu]` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
 | D | > 5 s | Print `target_cpu`, `op_name`, `elapsed_ms` to serial, then `crate::fatal`. |
 
 `wait_for_ack` MUST be called with preemption disabled and `IF=1` / `sstatus.SIE=1` — the same envelope `mm::tlb_shootdown::shootdown` establishes. The `cond` closure MUST be side-effect-free beyond the atomic loads needed to inspect pending state (it runs many times per spin).
@@ -415,7 +415,7 @@ For broadcast IPIs (TLB shootdown), `target_cpu` names the lowest-numbered CPU s
 
 ### `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`
 
-The x86-64 IDT registers a dedicated stub at vector 2 (IST=2 per the NMI ABI) that saves the standard `ExceptionFrame` shape, calls a returning handler, then restores GPRs and `iretq`s. The handler reads `NMI_BACKTRACE_REQUEST[cpu]`:
+The x86-64 IDT registers a dedicated stub at vector 2 (IST=2 per the NMI ABI) that builds the canonical `TrapFrame`, calls a returning handler, then writes back and `iretq`s. The handler reads `NMI_BACKTRACE_REQUEST[cpu]`:
 - **Set** (watchdog-requested): dump the saved frame to serial and return; the stub's `iretq` resumes the interrupted code.
 - **Clear** (real hardware NMI): tail-call `common_exception_handler` which never returns — the stub's `iretq` tail is dead code in that case.
 

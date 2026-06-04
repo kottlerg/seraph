@@ -11,6 +11,11 @@
 //! - Stubs for the APIC timer (vector 32) and spurious (vector 255).
 //! - A common exception handler that prints diagnostics and halts.
 //!
+//! Every ring-3 entry at which a thread can be stopped (exception, `#PF`, NMI,
+//! and ring-3 IRQ) builds the one canonical [`TrapFrame`] on the kernel stack via
+//! `tf_build_asm`/`tf_resume_asm`; the fault redirect points `tcb->trap_frame`
+//! at that live frame with no copy. See the "Unified entry frame" section.
+//!
 //! # Exception vector groups
 //! Vectors with a hardware-pushed error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30.
 //! All others: a dummy 0 is pushed by the stub to keep the frame layout uniform.
@@ -29,6 +34,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use super::gdt::KERNEL_CS;
+use super::trap_frame::TrapFrame;
 #[cfg(not(test))]
 use crate::fatal;
 
@@ -105,50 +111,119 @@ struct Idtr
     base: u64,
 }
 
-// ── ExceptionFrame ────────────────────────────────────────────────────────────
+// ── Unified entry frame ─────────────────────────────────────────────────────
+//
+// Every ring-3 entry at which a thread can be stopped — syscall (syscall.rs),
+// exception/#PF/NMI, and ring-3 IRQ — lands on the one canonical `TrapFrame`
+// (the userspace register ABI). The fault redirect points `tcb->trap_frame` at
+// the live on-stack frame directly (symmetric with
+// riscv64/interrupts.rs::redirect_user_fault), so there is no second frame type
+// and no copy.
+//
+// The CPU + each stub leave a uniform stub frame on entry to a trampoline
+// (S = rsp at the trampoline label):
+//
+//   [S+0]   vector       (pushed by the stub)
+//   [S+8]   error_code   (hardware where the vector has one, else a stub-pushed 0)
+//   [S+16]  rip          (hardware)
+//   [S+24]  cs           (hardware)
+//   [S+32]  rflags       (hardware)
+//   [S+40]  rsp          (hardware — always present in long mode)
+//   [S+48]  ss           (hardware — always present in long mode)
+//
+// `tf_build_asm` reserves the 168-byte TrapFrame below this stub frame (leaving
+// it intact for `iretq`) and fills it; `tf_resume_asm` writes any handler-edited
+// CPU-state back into the stub frame and `iretq`s. The two-word error_code +
+// vector stub prologue is load-bearing for 16-byte `call` alignment — see the
+// stub macros.
+//
+// vector/error_code are passed to handlers as arguments, not stored in the
+// frame: they are consumed at fault-classification time only. cr2 is read via
+// `mov reg, cr2` in the handler. fs_base is zeroed (the authoritative TLS base
+// lives in SavedState.fs_base; see trap_frame.rs).
 
-/// Full register state saved on the stack by the ISR trampoline.
+/// Naked-asm fragment: build the canonical [`TrapFrame`] from the stub frame.
 ///
-/// The trampoline pushes all GPRs before calling the exception handler, so
-/// fault diagnostics can dump the complete register snapshot. Layout:
-///
-/// ```text
-/// [rsp+0..120]  GPRs: rax rbx rcx rdx rsi rdi rbp r8-r15
-/// [rsp+120]     vector        (pushed by ISR stub)
-/// [rsp+128]     error_code    (hardware or dummy 0)
-/// [rsp+136]     rip           (hardware)
-/// [rsp+144]     cs            (hardware)
-/// [rsp+152]     rflags        (hardware)
-/// [rsp+160]     rsp           (hardware; pushed on CPL change only)
-/// [rsp+168]     ss            (hardware; pushed on CPL change only)
-/// ```
-#[repr(C)]
-pub struct ExceptionFrame
-{
-    // GPRs pushed by trampoline (lowest addresses).
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    // Hardware + stub fields (higher addresses).
-    pub vector: u64,
-    pub error_code: u64,
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
+/// On entry rsp = `S` (stub-frame layout above). Reserves 168 bytes with
+/// `sub rsp` and fills every field with explicit `mov`s (the `syscall_entry`
+/// pattern — chosen over `push qword ptr [rsp+disp]` because the
+/// effective-address timing of an rsp-relative `push` source is error-prone).
+/// `rax` is saved first, then reused as the copy scratch. After the fragment
+/// rsp = `S-168` = `TrapFrame` base; the stub frame sits at `[rsp+168 ..=
+/// rsp+216]`.
+#[cfg(not(test))]
+macro_rules! tf_build_asm {
+    () => {
+        concat!(
+            "sub rsp, 168\n",
+            "mov [rsp + 0], rax\n",
+            "mov [rsp + 8], rbx\n",
+            "mov [rsp + 16], rcx\n",
+            "mov [rsp + 24], rdx\n",
+            "mov [rsp + 32], rsi\n",
+            "mov [rsp + 40], rdi\n",
+            "mov [rsp + 48], rbp\n",
+            "mov [rsp + 56], r8\n",
+            "mov [rsp + 64], r9\n",
+            "mov [rsp + 72], r10\n",
+            "mov [rsp + 80], r11\n",
+            "mov [rsp + 88], r12\n",
+            "mov [rsp + 96], r13\n",
+            "mov [rsp + 104], r14\n",
+            "mov [rsp + 112], r15\n",
+            "mov rax, [rsp + 184]\n", // stub rip
+            "mov [rsp + 120], rax\n",
+            "mov rax, [rsp + 200]\n", // stub rflags
+            "mov [rsp + 128], rax\n",
+            "mov rax, [rsp + 208]\n", // stub rsp
+            "mov [rsp + 136], rax\n",
+            "mov rax, [rsp + 192]\n", // stub cs
+            "mov [rsp + 144], rax\n",
+            "mov rax, [rsp + 216]\n", // stub ss
+            "mov [rsp + 152], rax\n",
+            "mov qword ptr [rsp + 160], 0\n", // fs_base
+        )
+    };
+}
+
+/// Naked-asm fragment: write the (possibly handler-edited) `TrapFrame`
+/// CPU-state back into the stub frame, restore all GPRs from the frame, drop the
+/// frame + stub prologue, and `iretq`. Inverse of `tf_build_asm`; rsp on entry
+/// = `TrapFrame` base, on exit (`iretq`) the stub frame's hardware iret words are
+/// at the top of stack. `rax` is the copy scratch, then restored from the frame.
+#[cfg(not(test))]
+macro_rules! tf_resume_asm {
+    () => {
+        concat!(
+            "mov rax, [rsp + 120]\n", // rip
+            "mov [rsp + 184], rax\n",
+            "mov rax, [rsp + 128]\n", // rflags
+            "mov [rsp + 200], rax\n",
+            "mov rax, [rsp + 136]\n", // rsp
+            "mov [rsp + 208], rax\n",
+            "mov rax, [rsp + 144]\n", // cs
+            "mov [rsp + 192], rax\n",
+            "mov rax, [rsp + 152]\n", // ss
+            "mov [rsp + 216], rax\n",
+            "mov rax, [rsp + 0]\n",
+            "mov rbx, [rsp + 8]\n",
+            "mov rcx, [rsp + 16]\n",
+            "mov rdx, [rsp + 24]\n",
+            "mov rsi, [rsp + 32]\n",
+            "mov rdi, [rsp + 40]\n",
+            "mov rbp, [rsp + 48]\n",
+            "mov r8, [rsp + 56]\n",
+            "mov r9, [rsp + 64]\n",
+            "mov r10, [rsp + 72]\n",
+            "mov r11, [rsp + 80]\n",
+            "mov r12, [rsp + 88]\n",
+            "mov r13, [rsp + 96]\n",
+            "mov r14, [rsp + 104]\n",
+            "mov r15, [rsp + 112]\n",
+            "add rsp, 184\n", // drop frame (168) + vector + error_code (16)
+            "iretq\n",
+        )
+    };
 }
 
 // ── Common exception handler ──────────────────────────────────────────────────
@@ -162,14 +237,19 @@ pub struct ExceptionFrame
 /// originated in the kernel, diagnostics are printed and the system halts.
 ///
 /// # Safety
-/// `frame` must point to a valid `ExceptionFrame` on the current stack.
+/// `tf` must point to a valid [`TrapFrame`] on the current stack; `vector` and
+/// `error_code` are the trap metadata from the stub frame.
 #[cfg(not(test))]
-unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
+unsafe extern "C" fn common_exception_handler(
+    tf: *const TrapFrame,
+    vector: u64,
+    error_code: u64,
+) -> !
 {
-    // SAFETY: frame pointer is valid — constructed by ISR stubs on this stack.
-    let f = unsafe { &*frame };
+    // SAFETY: tf is valid — constructed by the entry trampoline on this stack.
+    let f = unsafe { &*tf };
     // Read CR2 (faulting address) for page faults (vector 14).
-    let cr2: u64 = if f.vector == 14
+    let cr2: u64 = if vector == 14
     {
         let v: u64;
         // SAFETY: CR2 is a valid read-only register at ring 0; page fault context.
@@ -210,9 +290,9 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
             "USERSPACE FAULT: tid={} cpu={} cause={} (vec={} err={:#x})",
             tid,
             cpu,
-            x86_exception_name(f.vector),
-            f.vector,
-            f.error_code,
+            x86_exception_name(vector),
+            vector,
+            error_code,
         );
         // Include fs_base (IA32_FS_BASE) to aid TLS-plumbing diagnosis.
         // SAFETY: interrupts are disabled above; rdmsr on IA32_FS_BASE is
@@ -246,7 +326,7 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
             // observes the reason alongside the Exited transition.
             // SAFETY: tcb validated non-null.
             unsafe {
-                (*tcb).exit_reason = 0x1000 + f.vector;
+                (*tcb).exit_reason = 0x1000 + vector;
                 crate::sched::set_state_under_all_locks(
                     tcb,
                     crate::sched::thread::ThreadState::Exited,
@@ -257,7 +337,7 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
             // EXIT_FAULT_BASE = 0x1000 (matches syscall_abi::EXIT_FAULT_BASE).
             // SAFETY: tcb is valid; post_death_notification handles null check.
             unsafe {
-                crate::sched::post_death_notification(tcb, 0x1000 + f.vector);
+                crate::sched::post_death_notification(tcb, 0x1000 + vector);
             }
         }
 
@@ -274,9 +354,9 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
         crate::kprintln!(
             "KERNEL EXCEPTION: cpu={} cause={} (vec={} err={:#x})",
             cpu,
-            x86_exception_name(f.vector),
-            f.vector,
-            f.error_code,
+            x86_exception_name(vector),
+            vector,
+            error_code,
         );
         crate::kprintln!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
         crate::kprintln!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
@@ -298,18 +378,19 @@ unsafe extern "C" fn common_exception_handler(frame: *const ExceptionFrame) -> !
 /// resolved-and-resumed userspace fault.
 ///
 /// Mirrors the call-from-naked-asm pattern of [`page_fault_handler`]: the
-/// trampoline upholds the precondition that `frame` is a valid, writable
-/// `ExceptionFrame` on the current stack, so this is a safe `extern "C"` fn.
+/// trampoline upholds the precondition that `tf` is a valid, writable
+/// [`TrapFrame`] on the current stack, so this is a safe `extern "C"` fn.
+/// `vector`/`error_code` are the trap metadata from the stub frame.
 #[cfg(not(test))]
-extern "C" fn exception_handler(frame: *mut ExceptionFrame)
+extern "C" fn exception_handler(tf: *mut TrapFrame, vector: u64, error_code: u64)
 {
-    // SAFETY: frame is constructed by common_exception_trampoline on this stack.
-    let f = unsafe { &*frame };
+    // SAFETY: tf is constructed by common_exception_trampoline on this stack.
+    let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
     // #DF (8) and #MC (18) are non-restartable aborts; #DF additionally runs on a
     // dedicated IST stack that is not re-entrant across the reschedule a redirect
     // performs. They are never delivered to a resumable handler — always terminal.
-    let redirectable = f.vector != 8 && f.vector != 18;
+    let redirectable = vector != 8 && vector != 18;
     if from_user && redirectable
     {
         // SAFETY: from_user implies a running user thread; current_tcb is valid
@@ -320,9 +401,9 @@ extern "C" fn exception_handler(frame: *mut ExceptionFrame)
         let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
         if handler_bound
         {
-            // SAFETY: frame is the live ExceptionFrame; the redirect copies it
-            // to/from the canonical TrapFrame and returns whether to resume.
-            if unsafe { redirect_user_exception(tcb, frame) }
+            // SAFETY: tf is the live TrapFrame; the redirect points the TCB at it
+            // for the block and returns whether to resume.
+            if unsafe { redirect_user_exception(tcb, tf, vector, error_code) }
             {
                 return;
             }
@@ -331,9 +412,9 @@ extern "C" fn exception_handler(frame: *mut ExceptionFrame)
     }
 
     // Not resumed by a handler — kill (userspace) or fatal (kernel).
-    // SAFETY: frame valid; common_exception_handler never returns.
+    // SAFETY: tf valid; common_exception_handler never returns.
     unsafe {
-        common_exception_handler(frame.cast_const());
+        common_exception_handler(tf.cast_const(), vector, error_code);
     }
 }
 
@@ -368,8 +449,8 @@ fn x86_exception_name(vector: u64) -> &'static str
     }
 }
 
-/// Dump all general-purpose registers from an x86-64 exception frame (serial only).
-fn dump_x86_regs(f: &ExceptionFrame)
+/// Dump all general-purpose registers from an x86-64 trap frame (serial only).
+fn dump_x86_regs(f: &TrapFrame)
 {
     crate::kprintln_serial!(
         "  rax={:#018x}  rbx={:#018x}  rcx={:#018x}  rdx={:#018x}",
@@ -402,7 +483,7 @@ fn dump_x86_regs(f: &ExceptionFrame)
 }
 
 /// Dump all general-purpose registers to both serial and framebuffer (for kernel faults).
-fn dump_x86_regs_console(f: &ExceptionFrame)
+fn dump_x86_regs_console(f: &TrapFrame)
 {
     crate::kprintln!(
         "  rax={:#018x}  rbx={:#018x}  rcx={:#018x}  rdx={:#018x}",
@@ -475,60 +556,31 @@ macro_rules! isr_stub {
     };
 }
 
-/// Common trampoline: saves GPRs, calls [`exception_handler`], then — reached
-/// only when a userspace exception was redirected to a bound fault handler that
-/// resolved it — restores the (possibly handler-edited) register state and
-/// `iretq`s, re-executing the faulting instruction (or continuing from a
-/// handler-modified PC). Every terminal fault (no/declined handler, or any
-/// kernel exception) diverges inside [`exception_handler`] →
-/// `common_exception_handler`, so the restore tail is dead for those.
+/// Common trampoline: builds the canonical [`TrapFrame`] (`tf_build_asm`),
+/// calls [`exception_handler`] with the frame pointer + trap metadata, then —
+/// reached only when a userspace exception was redirected to a bound fault
+/// handler that resolved it — writes back the (possibly handler-edited) register
+/// state and `iretq`s (`tf_resume_asm`), re-executing the faulting instruction
+/// (or continuing from a handler-modified PC). Every terminal fault (no/declined
+/// handler, or any kernel exception) diverges inside [`exception_handler`] →
+/// `common_exception_handler`, so the resume tail is dead for those.
 ///
-/// At entry, the stack holds the ISR stub frame (vector + error code) and
-/// hardware frame (rip, cs, rflags, rsp, ss). We push all GPRs to create
-/// a full [`ExceptionFrame`], then pass a pointer to it.
+/// At entry the stack holds the stub frame (vector + `error_code` + hardware iret
+/// frame); the build reserves the `TrapFrame` below it and the resume tail leaves
+/// the hardware iret frame at the top of stack for `iretq`.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn common_exception_trampoline()
 {
     core::arch::naked_asm!(
-        // Save all GPRs (must match ExceptionFrame field order).
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-        // rsp now points at the full ExceptionFrame.
-        "mov rdi, rsp",
-        "call {handler}",
-        // Reached only on a resolved-and-resumed userspace exception; restore the
-        // register state the handler may have edited and re-enter userspace.
-        "pop rax",
-        "pop rbx",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop rbp",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-        "add rsp, 16", // drop vector + error_code
-        "iretq",
+        concat!(
+            tf_build_asm!(),
+            "mov rdi, rsp\n",          // arg0 = *mut TrapFrame
+            "mov rsi, [rsp + 168]\n",  // arg1 = vector
+            "mov rdx, [rsp + 176]\n",  // arg2 = error_code
+            "call {handler}\n",
+            tf_resume_asm!(),
+        ),
         handler = sym exception_handler,
     );
 }
@@ -573,123 +625,164 @@ isr_stub!(isr31, 31, has_error_code = false, ist = 0);
 
 // ── Timer and spurious stubs ──────────────────────────────────────────────────
 
+// ── Shared IRQ trampoline ─────────────────────────────────────────────────────
+
+/// Route a device/timer/IPI interrupt by its IDT vector to the existing handler.
+///
+/// Called from [`common_irq_trampoline`] with the stub-pushed vector. Each
+/// handler performs its own EOI; this only dispatches. The device range carries
+/// the GSI as `vector - 33` (the GSI indexes `IRQ_TABLE`; see `irq.rs`).
+#[cfg(not(test))]
+extern "C" fn irq_dispatch(vector: u64)
+{
+    match vector
+    {
+        v if v == u64::from(super::timer::TIMER_VECTOR) => super::timer::timer_isr(),
+        33..=55 =>
+        {
+            // SAFETY: IRQ-handler context at ring 0; `dispatch_device_irq` masks
+            // and EOIs internally. `vector - 33` is in 0..=22 (one IOAPIC GSI).
+            unsafe {
+                crate::irq::dispatch_device_irq((vector - 33) as u32);
+            }
+        }
+        v if v == u64::from(super::interrupts::IPI_VECTOR_TLB_SHOOTDOWN) =>
+        {
+            ipi_tlb_shootdown_handler();
+        }
+        v if v == u64::from(super::interrupts::IPI_VECTOR_WAKEUP) => ipi_wakeup_handler(),
+        // No routed vector falls here; matches the spurious vector's no-EOI policy.
+        _ =>
+        {}
+    }
+}
+
+/// Shared trampoline for device/timer/IPI interrupts (vectors routed through
+/// [`irq_dispatch`]). Branches on the interrupted privilege level (saved CS RPL):
+///
+/// - **Ring-3 origin** (a user thread was preempted): builds the canonical
+///   [`TrapFrame`] (`tf_build_asm`) so a complete, live user register snapshot
+///   exists on the kernel stack (the invariant a userspace debugger consumes —
+///   see #233), dispatches, then returns frame-authoritatively (`tf_resume_asm`) —
+///   all GPRs are restored from the frame, not from the implicit call-chain
+///   preservation.
+/// - **Ring-0 origin** (the kernel/idle was interrupted): the interrupted context
+///   carries no user state (any in-flight user state lives in the thread's syscall
+///   frame), so only caller-clobbered registers are saved, matching the legacy
+///   minimal path.
+///
+/// Each stub enters via `push 0; push <vector>; jmp` — the two-word prologue keeps
+/// the `call` 16-byte aligned (identical parity to the exception stubs).
+#[cfg(not(test))]
+#[unsafe(naked)]
+unsafe extern "C" fn common_irq_trampoline()
+{
+    core::arch::naked_asm!(
+        concat!(
+            "test byte ptr [rsp + 24], 0x3\n", // saved CS RPL; 0 => ring 0
+            "jz 2f\n",
+            // ── ring-3: build TrapFrame, dispatch, frame-authoritative return ──
+            tf_build_asm!(),
+            "mov rdi, [rsp + 168]\n", // arg0 = vector
+            "call {dispatch}\n",
+            tf_resume_asm!(),
+            // ── ring-0: minimal save (no user state) ──
+            "2:\n",
+            "push rax\n",
+            "push rcx\n",
+            "push rdx\n",
+            "push rsi\n",
+            "push rdi\n",
+            "push r8\n",
+            "push r9\n",
+            "push r10\n",
+            "push r11\n",
+            "mov rdi, [rsp + 72]\n", // arg0 = vector
+            "call {dispatch}\n",
+            "pop r11\n",
+            "pop r10\n",
+            "pop r9\n",
+            "pop r8\n",
+            "pop rdi\n",
+            "pop rsi\n",
+            "pop rdx\n",
+            "pop rcx\n",
+            "pop rax\n",
+            "add rsp, 16\n", // drop vector + placeholder
+            "iretq\n",
+        ),
+        dispatch = sym irq_dispatch,
+    );
+}
+
 // ── Device IRQ stubs ──────────────────────────────────────────────────────────
 
 /// Generate a naked device IRQ stub for IDT vector `$vector`.
 ///
-/// Each stub:
-/// 1. Saves all caller-saved registers.
-/// 2. Calls `irq::dispatch_device_irq(gsi)` where `gsi = vector - 33`.
-/// 3. Restores registers and executes `iretq`.
-///
-/// `dispatch_device_irq` handles masking and EOI internally; the stub itself
-/// does not interact with the APIC or IOAPIC.
+/// Each stub pushes the two-word `placeholder + vector` prologue and jumps to
+/// [`common_irq_trampoline`], which builds the [`TrapFrame`] (ring-3 origin) and
+/// routes to `irq::dispatch_device_irq(vector - 33)` via [`irq_dispatch`].
+/// `dispatch_device_irq` handles masking, notification delivery, and EOI.
 ///
 /// # Modification notes
-/// - To add more GSIs: invoke `device_irq_stub!(isr_devN, N)` for each
-///   new vector N, then add `set(N, isr_devN, 0)` in `init()`.
-///
-/// Generate a naked device IRQ stub for IDT vector `DEVICE_VECTOR_BASE + $gsi`.
-///
-/// Each stub:
-/// 1. Saves all caller-saved registers.
-/// 2. Loads the GSI number into `edi` (first argument register).
-/// 3. Calls `irq::dispatch_device_irq(gsi)`.
-/// 4. Restores registers and executes `iretq`.
-///
-/// `dispatch_device_irq` handles masking, notification delivery, and EOI internally.
-///
-/// # Modification notes
-/// - To add more GSIs: `device_irq_stub!(isr_devN, N)` then `set(33+N, isr_devN, 0)`.
+/// - To add more GSIs: `device_irq_stub!(isr_devN, 33+N)` then
+///   `set(33+N, isr_devN, 0)` in `init()`.
 macro_rules! device_irq_stub {
-    ($name:ident, $gsi:literal) => {
+    ($name:ident, $vector:literal) => {
         #[cfg(not(test))]
         #[unsafe(naked)]
         unsafe extern "C" fn $name()
         {
             core::arch::naked_asm!(
-                "push rax",
-                "push rcx",
-                "push rdx",
-                "push rsi",
-                "push rdi",
-                "push r8",
-                "push r9",
-                "push r10",
-                "push r11",
-                concat!("mov edi, ", $gsi), // GSI as first argument
-                "call {dispatch}",
-                "pop r11",
-                "pop r10",
-                "pop r9",
-                "pop r8",
-                "pop rdi",
-                "pop rsi",
-                "pop rdx",
-                "pop rcx",
-                "pop rax",
-                "iretq",
-                dispatch = sym crate::irq::dispatch_device_irq,
+                concat!("push 0\n", "push ", $vector, "\n"), // placeholder + vector
+                "jmp {tramp}",
+                tramp = sym common_irq_trampoline,
             );
         }
     };
 }
 
-device_irq_stub!(isr_dev0, 0);
-device_irq_stub!(isr_dev1, 1);
-device_irq_stub!(isr_dev2, 2);
-device_irq_stub!(isr_dev3, 3);
-device_irq_stub!(isr_dev4, 4);
-device_irq_stub!(isr_dev5, 5);
-device_irq_stub!(isr_dev6, 6);
-device_irq_stub!(isr_dev7, 7);
-device_irq_stub!(isr_dev8, 8);
-device_irq_stub!(isr_dev9, 9);
-device_irq_stub!(isr_dev10, 10);
-device_irq_stub!(isr_dev11, 11);
-device_irq_stub!(isr_dev12, 12);
-device_irq_stub!(isr_dev13, 13);
-device_irq_stub!(isr_dev14, 14);
-device_irq_stub!(isr_dev15, 15);
-device_irq_stub!(isr_dev16, 16);
-device_irq_stub!(isr_dev17, 17);
-device_irq_stub!(isr_dev18, 18);
-device_irq_stub!(isr_dev19, 19);
-device_irq_stub!(isr_dev20, 20);
-device_irq_stub!(isr_dev21, 21);
-device_irq_stub!(isr_dev22, 22);
+device_irq_stub!(isr_dev0, 33);
+device_irq_stub!(isr_dev1, 34);
+device_irq_stub!(isr_dev2, 35);
+device_irq_stub!(isr_dev3, 36);
+device_irq_stub!(isr_dev4, 37);
+device_irq_stub!(isr_dev5, 38);
+device_irq_stub!(isr_dev6, 39);
+device_irq_stub!(isr_dev7, 40);
+device_irq_stub!(isr_dev8, 41);
+device_irq_stub!(isr_dev9, 42);
+device_irq_stub!(isr_dev10, 43);
+device_irq_stub!(isr_dev11, 44);
+device_irq_stub!(isr_dev12, 45);
+device_irq_stub!(isr_dev13, 46);
+device_irq_stub!(isr_dev14, 47);
+device_irq_stub!(isr_dev15, 48);
+device_irq_stub!(isr_dev16, 49);
+device_irq_stub!(isr_dev17, 50);
+device_irq_stub!(isr_dev18, 51);
+device_irq_stub!(isr_dev19, 52);
+device_irq_stub!(isr_dev20, 53);
+device_irq_stub!(isr_dev21, 54);
+device_irq_stub!(isr_dev22, 55);
 
 // ── Timer and spurious stubs ──────────────────────────────────────────────────
 
 /// APIC timer ISR stub (vector 32).
 ///
-/// Calls `timer::timer_isr`, which increments the tick counter and sends EOI.
+/// Pushes the `placeholder + vector` prologue and jumps to
+/// [`common_irq_trampoline`], which (ring-3 origin) builds the [`TrapFrame`] and
+/// routes to `timer::timer_isr` via [`irq_dispatch`] — `timer_isr` increments the
+/// tick counter, sends EOI, and may preempt.
 #[cfg(not(test))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn isr_timer()
 {
     core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "iretq",
-        handler = sym super::timer::timer_isr,
+        "push 0",  // placeholder
+        "push 32", // vector
+        "jmp {tramp}",
+        tramp = sym common_irq_trampoline,
     );
 }
 
@@ -838,52 +931,26 @@ extern "C" fn nm_handler()
 
 /// Page-fault (`#PF`, vector 14) stub.
 ///
-/// Saves the full [`ExceptionFrame`] (the hardware already pushed the error
-/// code; this stub pushes the vector), calls [`page_fault_handler`], then —
-/// reached only when the fault was a resolved spurious stale-TLB fault —
-/// restores the unmodified user register state and `iretq`s, re-executing the
-/// faulting instruction. For every genuine fault the handler diverges
-/// (`common_exception_handler` never returns) and the restore tail is dead.
+/// Builds the canonical [`TrapFrame`] (`tf_build_asm`; the hardware already
+/// pushed the error code, this stub pushes the vector), calls
+/// [`page_fault_handler`], then — reached only when the fault was a resolved
+/// spurious stale-TLB fault — writes back the unmodified register state and
+/// `iretq`s (`tf_resume_asm`), re-executing the faulting instruction. For every
+/// genuine fault the handler diverges (`common_exception_handler` never returns)
+/// and the resume tail is dead.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn isr_page_fault()
 {
     core::arch::naked_asm!(
-        "push 14", // vector (hardware already pushed the error code)
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-        "mov rdi, rsp",
-        "call {handler}",
-        "pop rax",
-        "pop rbx",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop rbp",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-        "add rsp, 16", // drop vector + error_code
-        "iretq",
+        concat!(
+            "push 14\n", // vector (hardware already pushed the error code)
+            tf_build_asm!(),
+            "mov rdi, rsp\n",          // arg0 = *mut TrapFrame
+            "mov rsi, [rsp + 176]\n",  // arg1 = error_code (vector is implicit 14)
+            "call {handler}\n",
+            tf_resume_asm!(),
+        ),
         handler = sym page_fault_handler,
     );
 }
@@ -899,7 +966,7 @@ unsafe extern "C" fn isr_page_fault()
 /// userspace fault, or any kernel fault) is handed to
 /// [`common_exception_handler`], which never returns.
 #[cfg(not(test))]
-extern "C" fn page_fault_handler(frame: *mut ExceptionFrame)
+extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
 {
     /// `#PF` error-code bits (Intel SDM Vol 3 §4.7).
     const ERR_PRESENT: u64 = 1 << 0;
@@ -907,12 +974,12 @@ extern "C" fn page_fault_handler(frame: *mut ExceptionFrame)
     const ERR_RSVD: u64 = 1 << 3;
     const ERR_INSTR: u64 = 1 << 4;
 
-    // SAFETY: frame is constructed by isr_page_fault on this stack.
-    let f = unsafe { &*frame };
+    // SAFETY: tf is constructed by isr_page_fault on this stack.
+    let f = unsafe { &*tf };
     let from_user = (f.cs & 3) != 0;
     // A reserved-bit violation is never a stale-TLB fault; only well-formed
     // present/permission faults from userspace are retry candidates.
-    if from_user && f.error_code & ERR_RSVD == 0
+    if from_user && error_code & ERR_RSVD == 0
     {
         let cr2: u64;
         // SAFETY: CR2 holds the faulting linear address for a #PF; read-only at
@@ -920,8 +987,8 @@ extern "C" fn page_fault_handler(frame: *mut ExceptionFrame)
         unsafe {
             core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem));
         }
-        let write = f.error_code & ERR_WRITE != 0;
-        let instr = f.error_code & ERR_INSTR != 0;
+        let write = error_code & ERR_WRITE != 0;
+        let instr = error_code & ERR_INSTR != 0;
         // SAFETY: ring 0; the faulting thread's CR3 is still active (no context
         // switch since entry — the interrupt gate left IF=0).
         if unsafe { super::paging::user_fault_is_spurious(cr2, write, instr) }
@@ -946,10 +1013,10 @@ extern "C" fn page_fault_handler(frame: *mut ExceptionFrame)
         let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb) };
         if handler_bound
         {
-            let present = f.error_code & ERR_PRESENT != 0;
-            // SAFETY: frame is the live ExceptionFrame; the redirect copies it
-            // to/from the canonical TrapFrame and returns whether to resume.
-            if unsafe { redirect_user_page_fault(tcb, frame, cr2, write, instr, present) }
+            let present = error_code & ERR_PRESENT != 0;
+            // SAFETY: tf is the live TrapFrame; the redirect points the TCB at it
+            // for the block and returns whether to resume.
+            if unsafe { redirect_user_page_fault(tcb, tf, cr2, write, instr, present) }
             {
                 return;
             }
@@ -959,9 +1026,9 @@ extern "C" fn page_fault_handler(frame: *mut ExceptionFrame)
 
     // Not a recoverable spurious fault and not resumed by a handler — kill
     // (userspace) or fatal (kernel).
-    // SAFETY: frame is valid; common_exception_handler never returns.
+    // SAFETY: tf is valid; common_exception_handler never returns.
     unsafe {
-        common_exception_handler(frame.cast_const());
+        common_exception_handler(tf.cast_const(), 14, error_code);
     }
 }
 
@@ -972,11 +1039,11 @@ extern "C" fn page_fault_handler(frame: *mut ExceptionFrame)
 ///
 /// # Safety
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live
-/// `#PF` `ExceptionFrame` on the current kernel stack; no lock is held.
+/// `#PF` [`TrapFrame`] on the current kernel stack; no lock is held.
 #[cfg(not(test))]
 unsafe fn redirect_user_page_fault(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
-    frame: *mut ExceptionFrame,
+    frame: *mut TrapFrame,
     cr2: u64,
     write: bool,
     instr: bool,
@@ -1022,20 +1089,23 @@ unsafe fn redirect_user_page_fault(
 ///
 /// # Safety
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live
-/// exception `ExceptionFrame` on the current kernel stack; no lock is held.
+/// exception [`TrapFrame`] on the current kernel stack; `vector`/`error_code` are
+/// the trap metadata from the stub frame; no lock is held.
 #[cfg(not(test))]
 unsafe fn redirect_user_exception(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
-    frame: *mut ExceptionFrame,
+    frame: *mut TrapFrame,
+    vector: u64,
+    error_code: u64,
 ) -> bool
 {
     // SAFETY: frame is valid.
-    let f = unsafe { &*frame };
+    let ip = unsafe { (*frame).rip };
     let info = crate::ipc::fault::FaultInfo {
         kind: syscall::FAULT_KIND_EXCEPTION,
-        d1: normalize_x86_exception(f.vector),
-        d2: f.error_code,
-        ip: f.rip,
+        d1: normalize_x86_exception(vector),
+        d2: error_code,
+        ip,
     };
 
     // SAFETY: preconditions forwarded — handler bound, live frame, no lock held.
@@ -1069,223 +1139,89 @@ fn normalize_x86_exception(vector: u64) -> u64
 /// (re-execute the faulting instruction, or continue from a handler-modified PC),
 /// `false` if the fault is terminal.
 ///
-/// The stub frame ([`ExceptionFrame`]) differs in layout from the canonical
-/// [`TrapFrame`](crate::arch::current::trap_frame::TrapFrame) the register
-/// syscalls operate on, and the two overlap on the kernel stack, so the faulting
-/// registers are copied into a stack-local `TrapFrame` for the duration of the
-/// block. `(*tcb).trap_frame` is repointed at that copy so the handler's
-/// `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` see and edit the faulting
-/// state; on resume the (possibly edited) copy is written back into the
-/// `ExceptionFrame` so the stub's `iretq` uses it. (Full entry-frame unification,
-/// which would remove this copy, is a deferred follow-up that does not change the
-/// userspace ABI.)
+/// `frame` is the live canonical [`TrapFrame`] the entry trampoline built on the
+/// kernel stack — the same layout the register syscalls operate on — so
+/// `(*tcb).trap_frame` is pointed at it directly with no copy. The kernel stack
+/// (and thus the frame) is preserved across the block: the context switch saves
+/// and restores the kernel rsp, so the pointer stays valid while the faulter is
+/// descheduled. The handler's `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`
+/// see and edit the live frame; on resume the trampoline's `tf_resume_asm`
+/// writes any edits back into the iret frame. Symmetric with
+/// `riscv64/interrupts.rs::redirect_user_fault`.
 ///
 /// # Safety
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live
-/// `ExceptionFrame` on the current kernel stack; no lock is held.
+/// [`TrapFrame`] on the current kernel stack; no lock is held.
 #[cfg(not(test))]
 unsafe fn redirect_user_fault(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
-    frame: *mut ExceptionFrame,
+    frame: *mut TrapFrame,
     info: &crate::ipc::fault::FaultInfo,
 ) -> bool
 {
-    // Canonical register frame the handler reads/edits. Lives in this kernel
-    // stack frame, which is preserved across the block (the context switch saves
-    // and restores the kernel rsp), so the pointer stays valid while the faulter
-    // is descheduled.
-    // SAFETY: frame valid.
-    let mut canonical = unsafe { exception_to_trap_frame(&*frame) };
-    // SAFETY: tcb valid; repoint trap_frame at the canonical copy for the
-    // duration of the block, restoring the kstack slot afterward.
+    // SAFETY: tcb valid; repoint trap_frame at the live frame for the duration of
+    // the block, restoring the prior pointer afterward.
     let saved_tf = unsafe { (*tcb).trap_frame };
-    // SAFETY: tcb valid; trap_frame is the canonical-frame pointer read by the
+    // SAFETY: tcb valid; trap_frame is the live-frame pointer read/edited by the
     // register syscalls while this thread is BlockedOnFault.
     unsafe {
-        (*tcb).trap_frame = core::ptr::from_mut(&mut canonical);
+        (*tcb).trap_frame = frame;
     }
 
-    // SAFETY: handler bound; trap_frame points at the canonical frame; no lock held.
+    // SAFETY: handler bound; trap_frame points at the live frame; no lock held.
     let outcome = unsafe { crate::ipc::fault::fault_dispatch(tcb, info) };
 
-    // SAFETY: restore the canonical kstack-slot pointer.
+    // SAFETY: restore the prior trap_frame pointer.
     unsafe {
         (*tcb).trap_frame = saved_tf;
     }
 
-    match outcome
-    {
-        crate::ipc::fault::FaultOutcome::Resume =>
-        {
-            // SAFETY: frame valid and mutable; write back the (possibly edited)
-            // registers so the stub's iretq uses them.
-            unsafe {
-                trap_frame_to_exception(&canonical, frame);
-            }
-            true
-        }
-        crate::ipc::fault::FaultOutcome::Kill => false,
-    }
-}
-
-/// Copy a `#PF`/exception [`ExceptionFrame`] into a canonical
-/// [`TrapFrame`](crate::arch::current::trap_frame::TrapFrame).
-///
-/// `fs_base` is left zero: on x86-64 the authoritative TLS base lives in
-/// `SavedState.fs_base`, not the trap frame (the trap-frame field is retained
-/// for layout stability only — see `trap_frame.rs`), so the contained copy does
-/// not round-trip it.
-#[cfg(not(test))]
-fn exception_to_trap_frame(f: &ExceptionFrame) -> crate::arch::current::trap_frame::TrapFrame
-{
-    crate::arch::current::trap_frame::TrapFrame {
-        rax: f.rax,
-        rbx: f.rbx,
-        rcx: f.rcx,
-        rdx: f.rdx,
-        rsi: f.rsi,
-        rdi: f.rdi,
-        rbp: f.rbp,
-        r8: f.r8,
-        r9: f.r9,
-        r10: f.r10,
-        r11: f.r11,
-        r12: f.r12,
-        r13: f.r13,
-        r14: f.r14,
-        r15: f.r15,
-        rip: f.rip,
-        rflags: f.rflags,
-        rsp: f.rsp,
-        cs: f.cs,
-        ss: f.ss,
-        fs_base: 0,
-    }
-}
-
-/// Write a canonical [`TrapFrame`](crate::arch::current::trap_frame::TrapFrame)
-/// back into a `#PF` [`ExceptionFrame`] before the stub's `iretq`.
-///
-/// The `vector` / `error_code` fields are not restored — the stub drops them
-/// (`add rsp, 16`) before `iretq`. `fs_base` is not propagated (see
-/// [`exception_to_trap_frame`]).
-///
-/// # Safety
-/// `frame` must point at a valid, writable `ExceptionFrame`.
-#[cfg(not(test))]
-unsafe fn trap_frame_to_exception(
-    t: &crate::arch::current::trap_frame::TrapFrame,
-    frame: *mut ExceptionFrame,
-)
-{
-    // SAFETY: frame validated by caller.
-    let f = unsafe { &mut *frame };
-    f.rax = t.rax;
-    f.rbx = t.rbx;
-    f.rcx = t.rcx;
-    f.rdx = t.rdx;
-    f.rsi = t.rsi;
-    f.rdi = t.rdi;
-    f.rbp = t.rbp;
-    f.r8 = t.r8;
-    f.r9 = t.r9;
-    f.r10 = t.r10;
-    f.r11 = t.r11;
-    f.r12 = t.r12;
-    f.r13 = t.r13;
-    f.r14 = t.r14;
-    f.r15 = t.r15;
-    f.rip = t.rip;
-    f.rflags = t.rflags;
-    f.rsp = t.rsp;
-    f.cs = t.cs;
-    f.ss = t.ss;
+    matches!(outcome, crate::ipc::fault::FaultOutcome::Resume)
 }
 
 /// TLB shootdown IPI handler stub (vector 250).
 ///
-/// Saves caller-clobbered registers, calls the Rust handler — which services
-/// any shootdown request naming this CPU and clears its acknowledgement bit —
-/// then restores and `iretq`s.
+/// Pushes the `placeholder + vector` prologue and jumps to
+/// [`common_irq_trampoline`], which routes to `ipi_tlb_shootdown_handler` via
+/// [`irq_dispatch`] — the handler services any shootdown request naming this CPU,
+/// clears its acknowledgement bit, and EOIs.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn ipi_tlb_shootdown_stub()
 {
     core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "iretq",
-        handler = sym ipi_tlb_shootdown_handler,
+        "push 0",   // placeholder
+        "push 250", // vector
+        "jmp {tramp}",
+        tramp = sym common_irq_trampoline,
     );
 }
 
 /// NMI backtrace stub (vector 2 with IST=2).
 ///
-/// Replaces the generic exception stub for NMI. Saves the same
-/// `ExceptionFrame` shape as `common_exception_trampoline`, calls the
-/// returning [`ipi_nmi_backtrace_handler`], then restores GPRs and
-/// `iretq`s. The handler decides at runtime whether the NMI is a
-/// watchdog backtrace request (returns normally → iretq fires) or a
-/// real hardware NMI (falls through to `common_exception_handler` which
-/// never returns — the iretq tail is unreachable in that case).
+/// Builds the canonical [`TrapFrame`] (`tf_build_asm`) — unconditionally, since
+/// an NMI backtraces whatever ran (kernel or user) and the long-mode iret frame is
+/// always present — calls the returning [`ipi_nmi_backtrace_handler`], then writes
+/// back and `iretq`s (`tf_resume_asm`). The handler decides at runtime whether
+/// the NMI is a watchdog backtrace request (returns normally → iretq fires) or a
+/// real hardware NMI (falls through to `common_exception_handler` which never
+/// returns — the resume tail is unreachable in that case). The two-word
+/// `placeholder + vector` prologue matches the exception stubs' alignment parity.
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn ipi_nmi_backtrace_stub()
 {
     core::arch::naked_asm!(
-        "push 0",      // dummy error code (NMI has none)
-        "push 2",      // vector
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-        "mov rdi, rsp",
-        "call {handler}",
-        "pop rax",
-        "pop rbx",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop rbp",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-        "add rsp, 16",  // drop vector + error_code
-        "iretq",
+        concat!(
+            "push 0\n", // placeholder (NMI has no error code)
+            "push 2\n", // vector
+            tf_build_asm!(),
+            "mov rdi, rsp\n",         // arg0 = *mut TrapFrame
+            "mov rsi, [rsp + 168]\n", // arg1 = vector (= 2)
+            "mov rdx, [rsp + 176]\n", // arg2 = error_code (= placeholder 0)
+            "call {handler}\n",
+            tf_resume_asm!(),
+        ),
         handler = sym ipi_nmi_backtrace_handler,
     );
 }
@@ -1299,7 +1235,7 @@ unsafe extern "C" fn ipi_nmi_backtrace_stub()
 ///
 /// NMI is not APIC-EOI'd, so no `acknowledge()` call.
 #[cfg(not(test))]
-extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
+extern "C" fn ipi_nmi_backtrace_handler(tf: *const TrapFrame, vector: u64, error_code: u64)
 {
     let cpu = super::cpu::current_cpu() as usize;
     let requested = super::interrupts::nmi_backtrace_request(cpu)
@@ -1307,13 +1243,13 @@ extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
     if !requested
     {
         // Real hardware NMI — defer to the standard fatal path.
-        // SAFETY: frame pointer constructed by ipi_nmi_backtrace_stub above.
+        // SAFETY: tf constructed by ipi_nmi_backtrace_stub above.
         unsafe {
-            common_exception_handler(frame);
+            common_exception_handler(tf, vector, error_code);
         }
     }
-    // SAFETY: frame pointer constructed by ipi_nmi_backtrace_stub above.
-    let f = unsafe { &*frame };
+    // SAFETY: tf constructed by ipi_nmi_backtrace_stub above.
+    let f = unsafe { &*tf };
     // Use the NMI-safe console path: `CONSOLE_LOCK` is swap-and-
     // restored rather than spin-acquired, so an NMI that interrupts
     // the lock-holder does not deadlock the dump.
@@ -1358,34 +1294,19 @@ extern "C" fn ipi_nmi_backtrace_handler(frame: *const ExceptionFrame)
 
 /// Wakeup IPI handler stub (vector 251).
 ///
-/// Breaks idle CPUs out of `hlt` when work is enqueued. The handler itself
-/// just sends EOI; the interrupt is sufficient to wake the CPU.
+/// Breaks idle CPUs out of `hlt` when work is enqueued. Pushes the
+/// `placeholder + vector` prologue and jumps to [`common_irq_trampoline`], which
+/// routes to `ipi_wakeup_handler` via [`irq_dispatch`]; the handler just sends EOI
+/// (the interrupt itself wakes the CPU).
 #[cfg(not(test))]
 #[unsafe(naked)]
 unsafe extern "C" fn ipi_wakeup_stub()
 {
     core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "call {handler}",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "iretq",
-        handler = sym ipi_wakeup_handler,
+        "push 0",   // placeholder
+        "push 251", // vector
+        "jmp {tramp}",
+        tramp = sym common_irq_trampoline,
     );
 }
 

@@ -37,6 +37,7 @@
 //! - `fault_handler_declines_kills.rs` — a handler that replies KILL terminates the faulting thread
 //! - `fault_exception_redirect.rs` — a non-page-fault CPU exception is redirected to a handler that resumes the thread at a new PC
 //! - `fault_exception_no_handler_kills.rs` — a non-page-fault CPU exception with no handler bound terminates the thread
+//! - `irq_preserves_user_regs.rs` — a ring-3 thread's callee-saved registers survive a timer preemption (frame-authoritative IRQ path)
 //! - `tlb_widen_retry.rs`        — a permission-widen elides its shootdown; a remote stale-TLB write still completes via spurious-fault retry
 
 pub mod cap_delegation_chain;
@@ -49,6 +50,7 @@ pub mod fault_kills_thread;
 pub mod fault_pager_roundtrip;
 pub mod fault_resume_modifies_pc;
 pub mod fpu_survives_ipc_call;
+pub mod irq_preserves_user_regs;
 pub mod memory_lifecycle;
 pub mod multi_caller_ipc_fifo;
 pub mod priority_preemption;
@@ -128,6 +130,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fault_exception_no_handler_kills",
         fault_exception_no_handler_kills::run(ctx)
+    );
+    run_integration_test!(
+        "integration::irq_preserves_user_regs",
+        irq_preserves_user_regs::run(ctx)
     );
     run_integration_test!("integration::tlb_widen_retry", tlb_widen_retry::run(ctx));
 }

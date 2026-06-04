@@ -306,7 +306,7 @@ pub const IPI_VECTOR_WAKEUP: u8 = 251;
 /// Per-CPU "dump backtrace from your NMI handler" request flag, set by the
 /// synchronous-IPI watchdog before raising a vector-2 NMI at the stuck
 /// target CPU. The target's NMI handler reads it, dumps the saved
-/// `ExceptionFrame` to serial, and clears the flag. A hardware NMI with
+/// `TrapFrame` to serial, and clears the flag. A hardware NMI with
 /// the flag clear falls through to the existing fatal path.
 ///
 /// Single-bit publication, no caller-side ordering beyond Release/Acquire
@@ -543,7 +543,7 @@ pub struct IpiWaitCtx<'a>
 /// - **C** (750 ms → ~5 s): at the boundary, set
 ///   the `nmi_backtrace_request` flag for `ctx.target_cpu` and send a vector-2
 ///   NMI to that CPU. The receiver's handler dumps its
-///   `ExceptionFrame` to serial so a subsequent panic is diagnosable.
+///   `TrapFrame` to serial so a subsequent panic is diagnosable.
 /// - **D** (>5 s): print the context and fatal.
 ///
 /// # Safety

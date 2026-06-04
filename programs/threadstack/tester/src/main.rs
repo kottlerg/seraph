@@ -3,8 +3,9 @@
 
 // programs/threadstack/tester/src/main.rs
 
-//! Per-program tester for `/programs/threadstack`. Spawns it demand-paged in
-//! two modes and asserts, capability-natively (stdout marker is the verdict;
+//! Per-program tester for `/programs/threadstack`. Spawns it in two modes
+//! (demand-paged by the system default) and asserts, capability-natively
+//! (stdout marker is the verdict;
 //! the kernel's fault-class exit reason is corroborating mechanism only):
 //!
 //!   * `grow` — a worker recurses deep into its demand-paged stack and joins;
@@ -19,7 +20,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::Read;
-use std::os::seraph::process::CommandExt;
 use std::process::{Command, Stdio};
 
 /// Base exit reason for a fault-induced death (`abi/syscall` `EXIT_FAULT_BASE`).
@@ -32,13 +32,12 @@ fn fail(msg: &str) -> !
     std::process::exit(1);
 }
 
-/// Spawn `/programs/threadstack <mode>` demand-paged, capture stdout, and
-/// return `(stdout, ExitStatus)`.
+/// Spawn `/programs/threadstack <mode>` (demand-paged by the system default),
+/// capture stdout, and return `(stdout, ExitStatus)`.
 fn run(mode: &str) -> (String, std::process::ExitStatus)
 {
     let mut child = Command::new("/programs/threadstack")
         .arg(mode)
-        .demand_paged(true)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn /programs/threadstack");

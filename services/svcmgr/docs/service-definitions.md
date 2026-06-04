@@ -59,6 +59,13 @@ seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
 | `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 
+There is deliberately no paging key. Demand paging is procmgr's system-wide default
+(see [Fault Handling](../../../docs/fault-handling.md#default-system-pager)); every
+svcmgr-launched service is demand-paged. A pinned opt-out
+(`procmgr_labels::CREATE_PINNED`) exists for DMA drivers, which devmgr spawns — not svcmgr.
+A declarative paging key here is a reserved future extension, to be added only when the
+first pinned svcmgr-launched service exists.
+
 ## `restart`
 
 | Value | Semantics |

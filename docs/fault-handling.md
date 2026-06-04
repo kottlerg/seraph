@@ -46,9 +46,10 @@ including register inspection and modification of a fault-blocked thread via
 no handler bound is still terminated, the behavior for all faults absent this mechanism.
 
 The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
-processes created with the `CREATE_DEMAND_PAGED` flag and delegates the child address space,
-and the `ProcessInfo` pager field (`pager_endpoint_cap` / `pager_badge`, `PROCESS_ABI_VERSION`
-18) advertises it so the runtime inherits the handler onto spawned threads. Userspace reserves
+every ordinary process it creates (demand paging is the default; a process opts out with the
+`CREATE_PINNED` flag) and delegates the child address space, and the `ProcessInfo` pager
+field (`pager_endpoint_cap` / `pager_badge`, `PROCESS_ABI_VERSION` 19) advertises it so the
+runtime inherits the handler onto spawned threads. Userspace reserves
 unbacked VA and registers it via `std::os::seraph::register_demand_paged`; first touch faults,
 memmgr maps a frame and resumes. See
 [memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md) (`REGISTER_REGION`,
@@ -252,15 +253,35 @@ process-death path of [Process Lifecycle](process-lifecycle.md#process-death).
 
 The broadly useful memory policies — lazy and guard-page stack growth, zero-fill-on-demand
 anonymous memory, copy-on-write sharing, swap and overcommit, working-set tracking,
-snapshotting — exist only if a manager sits on the fault path of most processes. The
-mechanism is designed so binding a default pager to all ordinary processes is a userspace
-policy decision (a creator default plus runtime propagation via `ProcessInfo`).
+snapshotting — exist only if a manager sits on the fault path of most processes. Binding a
+default pager to all ordinary processes is a userspace policy decision (a creator default
+plus runtime propagation via `ProcessInfo`), not a kernel one.
 
-Such a default MUST exempt infrastructure that cannot depend on the fault path — init, the
-frame manager, the pager itself, and drivers requiring pinned memory — by leaving them
-without a pager (eager-mapped). A demand-paged pager would otherwise recurse on its own
-faults. A userspace fault round-trip is costlier than a kernel-internal fill; this cost is
-accepted to keep paging policy out of the kernel.
+Demand paging is the **system-wide default**: procmgr binds memmgr (the pager) as the
+fault handler on every process it creates and advertises it in
+[`ProcessInfo`](process-lifecycle.md#processinfo--initinfo-handover-discipline)
+(`pager_endpoint_cap` / `pager_badge`), and the runtime inherits it onto spawned threads.
+It is not a per-tier or per-service decision; a process is demand-paged simply because it is
+a process.
+
+The default MUST exempt only the narrow set that cannot depend on the fault path:
+
+- **init, the frame manager, and the pager itself** — these are pre-pager and are never
+  routed through procmgr's pager-binding path (init is created by the kernel; it creates
+  memmgr and procmgr via raw syscalls), so they are pinned by construction. A demand-paged
+  pager would recurse on its own faults.
+- **Drivers requiring pinned memory (DMA)** — a device may write a process's memory before a
+  demand fault could back it, so DMA-capable drivers must be eager-mapped. The creator opts a
+  process out with `procmgr_labels::CREATE_PINNED`; devmgr sets it for the DMA-capable driver
+  class (PCI devices with BAR + IRQ). The exemption is a capability-flag decision, never a
+  badge-range test.
+
+A userspace fault round-trip is costlier than a kernel-internal fill; this cost is accepted
+to keep paging policy out of the kernel.
+
+A declarative paging key on svcmgr service definitions is a reserved future extension: no
+svcmgr-launched service does DMA or sits on the fault path today, so none needs to opt out.
+It would be added when the first pinned svcmgr-launched service exists.
 
 ---
 

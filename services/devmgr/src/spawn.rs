@@ -125,10 +125,17 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     // CREATE_PROCESS via procmgr. Caps [module, creator]. The child has no
     // stdio wired by default — it logs through `seraph::log!` via the
     // discovery cap procmgr installs in `ProcessInfo`.
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(module_cap)
-        .cap(badged_creator)
-        .build();
+    //
+    // CREATE_PINNED: drivers reached through `spawn_driver` are PCI devices
+    // with BAR + IRQ — the DMA-capable class. A device may write driver memory
+    // before a demand fault could back it (the kernel never pins), so these
+    // must be eager-mapped, not demand-paged. Keyed off the spawn path for now;
+    // #165 replaces this with an explicit per-driver DMA attribute.
+    let create_msg =
+        IpcMessage::builder(procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_PINNED)
+            .cap(module_cap)
+            .cap(badged_creator)
+            .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else

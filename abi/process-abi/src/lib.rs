@@ -45,7 +45,12 @@ use core::prelude::rust_2024::*;
 ///      (#34) — the demand-paging fault handler advertised to the runtime so it
 ///      can inherit the pager onto spawned threads. Both zero when the process
 ///      is not demand-paged.
-pub const PROCESS_ABI_VERSION: u32 = 18;
+/// v19: Demand paging is now the system-wide default (#225). Layout unchanged
+///      from v18, but the field semantics flip: [`ProcessInfo::pager_endpoint_cap`]
+///      / [`ProcessInfo::pager_badge`] are nonzero for default-spawned processes
+///      and zero only for pinned ones (`procmgr_labels::CREATE_PINNED`, e.g. DMA
+///      drivers) and the pre-pager bootstrap (init/memmgr/procmgr).
+pub const PROCESS_ABI_VERSION: u32 = 19;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -468,8 +473,10 @@ pub struct ProcessInfo
     pub stack_pages: u32,
 
     /// `CSpace` slot of an `Endpoint` cap on the process's demand-paging
-    /// pager (memmgr's service endpoint), or zero when the process is not
-    /// demand-paged.
+    /// pager (memmgr's service endpoint). Nonzero for ordinary processes —
+    /// demand paging is the system-wide default — and zero only for pinned
+    /// processes (`procmgr_labels::CREATE_PINNED`, e.g. DMA drivers) and the
+    /// pre-pager bootstrap (init/memmgr/procmgr).
     ///
     /// procmgr binds the main thread's fault handler to this endpoint at
     /// creation; the runtime reads this slot and `pager_badge` to bind the
@@ -479,7 +486,8 @@ pub struct ProcessInfo
     pub pager_endpoint_cap: u32,
 
     /// Fault-message badge bound with [`Self::pager_endpoint_cap`],
-    /// identifying this process to the pager. Zero when not demand-paged.
+    /// identifying this process to the pager. Zero when the process is pinned
+    /// (no pager).
     pub pager_badge: u64,
 }
 

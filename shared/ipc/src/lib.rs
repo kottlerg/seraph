@@ -300,7 +300,7 @@ pub mod procmgr_labels
     pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
 
-pub const MEMMGR_LABELS_VERSION: u32 = 3;
+pub const MEMMGR_LABELS_VERSION: u32 = 4;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -396,9 +396,10 @@ pub mod memmgr_labels
     ///
     /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (bad alignment,
     /// zero length, W^X violation, unknown badge, or overlap); or `QUOTA`
-    /// (per-process region list at static cap). No mapping is installed
-    /// here — backing happens lazily on fault, and only once procmgr has
-    /// delegated the process `AddressSpace` cap via [`DELEGATE_ASPACE`].
+    /// (metadata arena could not grow — system RAM exhausted). No mapping is
+    /// installed here — backing happens lazily on fault, and only once procmgr
+    /// has delegated the process `AddressSpace` cap via [`DELEGATE_ASPACE`].
+    /// Reverse with [`UNREGISTER_REGION`].
     pub const REGISTER_REGION: u64 = 7;
     /// Procmgr-only: delegate a demand-paged child's `AddressSpace` cap to
     /// memmgr so the pager can map frames into it on fault.
@@ -420,6 +421,24 @@ pub mod memmgr_labels
     /// stray transferred cap is dropped).
     pub const DELEGATE_ASPACE: u64 = 8;
 
+    /// Unregister a demand-paged region previously [`REGISTER_REGION`]'d,
+    /// reclaiming every frame memmgr mapped inside it.
+    ///
+    /// Universal label — attributed to the caller by `recv.badge`. memmgr
+    /// finds the exact-match region, unmaps each backing frame from the
+    /// caller's `AddressSpace`, returns the frame to the pool, and frees the
+    /// region. The reverse of [`REGISTER_REGION`] plus the on-fault backing;
+    /// used when a demand-paged stack (or other anonymous region) is torn down
+    /// mid-life — e.g. ruststd freeing a joined thread's guarded stack.
+    ///
+    /// Wire format:
+    /// * `data[0]` — `va_base` (must equal the registered base).
+    /// * `data[1]` — `len_bytes` (must equal the registered length).
+    ///
+    /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (unknown badge or no
+    /// region matches `[va_base, len)` exactly).
+    pub const UNREGISTER_REGION: u64 = 9;
+
     /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap
     /// covering all `want_pages`, or fail with
     /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
@@ -440,8 +459,10 @@ pub mod memmgr_errors
     /// Pool cannot cover `want_pages` even fragmented. System-wide RAM
     /// exhaustion.
     pub const OUT_OF_MEMORY_BEST_EFFORT: u64 = 2;
-    /// Per-process frame-record list at static cap. The caller is
-    /// consuming an unreasonable number of frames.
+    /// memmgr could not allocate per-process tracking metadata for a frame or
+    /// region: the self-hosted node arena could not grow because system RAM is
+    /// exhausted. Per-process region and frame counts are otherwise RAM-bound,
+    /// not capped by a constant.
     pub const QUOTA: u64 = 3;
     /// `want_pages == 0`, reserved flag bits set, page-count mismatch on
     /// `RELEASE_MEMORY_CAPS`, or badge unknown.

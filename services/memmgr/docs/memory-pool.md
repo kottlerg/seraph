@@ -43,8 +43,10 @@ surfacing as an intermittent consumer fault.
 
 ## Free-Pool Data Structure
 
-memmgr is `no_std` and cannot allocate — every data structure is sized
-at compile time. The free pool is organised for two access patterns:
+memmgr is `no_std` and has no general allocator; the free pool itself is
+sized at compile time (per-process descriptors instead live in the
+RAM-backed metadata arena above). The free pool is organised for two access
+patterns:
 
 - **Contiguous allocation fast path.** A `REQUIRE_CONTIGUOUS` request
   for `N` pages must locate a free run of at least `N` pages in O(1) or
@@ -94,18 +96,51 @@ delivered with every `REQUEST_MEMORY_CAPS` call (and established at
 `REGISTER_PROCESS`). Each entry records:
 
 - The badge (process identity).
-- The list of Memory cap slots memmgr has handed to this process,
-  cumulatively, since `REGISTER_PROCESS`.
+- The head of an intrusive list of the Memory cap slots memmgr has handed
+  to this process, cumulatively, since `REGISTER_PROCESS`.
+- The head of an intrusive list of the demand-paged regions the process has
+  registered (`REGISTER_REGION`).
+- The delegated child `AddressSpace` cap, when demand-paged.
 
-The list is statically bounded — there is a maximum number of memory-cap
-records per process. Allocations beyond that bound return
-`OutOfMemory{quota}`. The bound is sized to cover practical workloads
-including a multi-MiB heap, driver DMA regions, and zero-copy file
-mappings; it is not a security quota.
+The frame and region list nodes live in a self-hosted metadata arena (below),
+not in the record, so per-process frame and region counts are bounded by RAM —
+not by a fixed constant. The arena is what makes the demand-paged thread-stack
+consumer (one region plus many lazily-grown frames per thread) viable: a fixed
+per-process array would cap thread count at a small constant. Allocation fails
+only when the arena cannot grow because system RAM is exhausted, surfaced as
+`OutOfMemory{quota}`.
 
 The table itself is statically bounded by the maximum number of
-concurrently-tracked processes. `REGISTER_PROCESS` returns
-`OutOfMemory{too_many_processes}` if the table is full.
+concurrently-tracked processes (`MAX_PROCESSES`). `REGISTER_PROCESS` returns
+`OutOfMemory{too_many_processes}` if the table is full. Lifting that bound to a
+hardware-bound process count, reusing this arena, is tracked separately.
+
+---
+
+## Metadata Arena
+
+Per-process frame and region descriptors are nodes drawn from a self-hosted
+arena rather than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap
+a general heap against itself, but it *can* host fixed-size descriptor nodes in
+pages carved from its own pool:
+
+- Nodes are fixed-size `Slot`s (a tagged region/frame/free payload plus a `next`
+  index) reached by index from a contiguous VA window in memmgr's own address
+  space.
+- A global free list threads the unused slots. Allocation pops the head; free
+  pushes it back.
+- When the free list is empty, memmgr pulls one frame from the pool
+  (`select_memory_caps`, contiguous, one page), maps it at the next arena page
+  in its own address space, and carves it into free slots.
+
+The arena only grows, and a page once carved is permanent memmgr-owned metadata.
+This preserves the all-RAM-accounted identity: the page was counted in
+`pool_total` at ingest and is never returned, exactly like an in-use bootstrap
+arena. Growth stops at the peak concurrent node count — freed nodes return to
+the arena's own free list and are reused — so spawn/grow/die churn leaks no
+pages. Refilling the free list can draw a pool frame and map it from inside a
+fault handler; this is bounded (one frame, no recursion into per-process
+accounting) and never breaks the identity.
 
 ---
 
@@ -115,22 +150,33 @@ On `PROCESS_DIED(badge)` from procmgr:
 
 1. Look up the per-process entry. If absent (untracked badge), return
    silently — the death notification is idempotent.
-2. For each Memory cap slot in the entry:
-   a. Walk back to the original cap memmgr retained at allocation time.
-   b. Insert it into the appropriate free-pool bucket.
-3. Run coalescing across the newly-freed runs and their adjacent
+2. For each frame node in the entry's frame list:
+   a. Insert the retained Memory cap into the appropriate free-pool bucket.
+   b. Return the node to the arena free list.
+3. Return every region node to the arena free list.
+4. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
-4. Clear the per-process entry.
+5. Clear the per-process entry.
 
-The dead process's CSpace is torn down by procmgr (which revokes the
-AddressSpace cap; see
+No unmap is performed: the dead process's CSpace is torn down by procmgr
+(which revokes the AddressSpace cap; see
 [`docs/capability-model.md`](../../../docs/capability-model.md) §"Kill
-process pattern"). The caller-side derivation copies of the Memory caps
-become unreachable as part of that teardown. memmgr's intermediary
-copies remain valid and are what the free-pool insertion uses.
+process pattern"), which already tore down the child's mappings. The
+caller-side derivation copies of the Memory caps become unreachable as part
+of that teardown; memmgr's intermediary copies remain valid and are what the
+free-pool insertion uses.
 
 `RELEASE_MEMORY_CAPS` from a live process follows the same path for the
 listed slots without touching the per-process entry's other records.
+
+`UNREGISTER_REGION` from a live process is the mid-life counterpart for a
+demand-paged region: memmgr removes the region node, and for each frame it
+backed inside that region **actively unmaps** the page from the delegated
+child `AddressSpace` (the process is still alive, so the mapping must be
+removed before the frame returns to the pool), inserts the cap back into the
+pool, and frees the node. Frames the caller mapped itself are left untouched.
+This is the reclamation path the ruststd guarded-stack consumer uses on
+`join()`.
 
 ---
 
@@ -164,7 +210,7 @@ derivation ancestor.
 |---|---|---|
 | `OutOfMemory{contiguous}` | No free run satisfies `REQUIRE_CONTIGUOUS` | Reply with error label; caller may retry without the flag, or fail |
 | `OutOfMemory{best_effort}` | Pool cannot cover `want_pages` even fragmented | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `OutOfMemory{quota}` | Per-process memory-cap-record list at static cap | Reply with error label; caller is consuming an unreasonable number of memory caps |
+| `OutOfMemory{quota}` | Tracking-metadata arena could not grow (system RAM exhausted) | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `OutOfMemory{too_many_processes}` | Per-process table at static cap | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy
@@ -183,8 +229,8 @@ exits the thread, matching today's behaviour.
   exiting (or calling `RELEASE_MEMORY_CAPS`) and the resulting coalesce.
 - **MMIO and IOMMU memory caps.** Out of scope; see
   [`docs/device-management.md`](../../../docs/device-management.md).
-- **Quota policy.** The static per-process memory-cap-record cap is a
-  resource ceiling, not a security policy. System-wide quota and
+- **Quota policy.** Per-process frame and region counts are bounded by RAM
+  (the metadata arena), not by a security policy. System-wide quota and
   pressure mechanisms are out of scope for the first cut.
 
 ---

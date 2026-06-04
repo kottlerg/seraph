@@ -150,8 +150,9 @@ the child's `_start` will find them.
   (declared via the `process_abi::stack_pages!` / `seraph::stack_pages!`
   macro); binaries that omit the note inherit
   `DEFAULT_PROCESS_STACK_PAGES`. Loaders clamp to
-  `MAX_PROCESS_STACK_PAGES`; memmgr's per-process quota remains the
-  policy gate on the resulting `REQUEST_MEMORY_CAPS` calls.
+  `MAX_PROCESS_STACK_PAGES`; the pool's available RAM is the remaining
+  gate on the resulting `REQUEST_MEMORY_CAPS` calls (memmgr tracks
+  per-process frames in a RAM-bound arena, not a fixed quota).
 - **Main-thread IPC buffer.** Procmgr picks a per-process VA and writes
   it into `ProcessInfo.ipc_buffer_vaddr` — this is already a runtime
   field, not an ABI constant.

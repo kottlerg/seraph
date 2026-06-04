@@ -97,6 +97,17 @@ const MAX_PROCESSES: usize = 64;
 /// Maximum free runs in the pool. Each run is one Memory cap covering one
 /// or more contiguous pages.
 const MAX_FREE_RUNS: usize = 512;
+/// Pages backed per demand fault. memmgr maps a contiguous chunk of up to this
+/// many pages (clamped to the region) on each fault rather than a single page,
+/// so a process's demand-backed cap-slot use is `backed_pages /
+/// DEMAND_CHUNK_PAGES`, not one cap per page. Stacks grow contiguously, so a
+/// chunk's pages are consumed as the stack descends; the only over-commit is
+/// the partial deepest chunk (≤ `DEMAND_CHUNK_PAGES - 1` pages). This bounds
+/// memmgr's `CSpace` pressure — one Memory cap (and its `memory_split` tail) per
+/// chunk — so a deep demand stack cannot exhaust the fixed `CSpace`. The
+/// remaining ceiling (a fixed `CSpace`) is the growable-`CSpace` work (#41); the
+/// broader fixed-limit sweep is #177.
+const DEMAND_CHUNK_PAGES: u32 = 16;
 
 /// Rights every pool frame MUST carry. A pool frame is general anonymous RAM:
 /// memmgr derives an R / RW / RX inner from it on demand (`cap_derive`, which
@@ -465,6 +476,29 @@ impl ProcessRecord
             cur = s.next;
         }
         None
+    }
+
+    /// True if a memmgr-mapped frame (chunk) already covers `page_base` — the
+    /// page is backed, so a (re-)fault on it should resume without allocating.
+    /// Guards against a stale-TLB redelivery of a page another fault's chunk
+    /// already mapped.
+    fn frame_covering(&self, page_base: u64) -> bool
+    {
+        let mut cur = self.frame_head;
+        while cur != NODE_NULL
+        {
+            // SAFETY: cur is a live frame node.
+            let s = unsafe { *slot_ptr(cur) };
+            if let Node::Frame { va, page_count, .. } = s.node
+                && va != FRAME_VA_UNMAPPED
+                && page_base >= va
+                && page_base < va + u64::from(page_count) * PAGE_SIZE
+            {
+                return true;
+            }
+            cur = s.next;
+        }
+        false
     }
 
     /// Remove the region exactly matching `[va_base, va_base + len)`, freeing
@@ -1054,24 +1088,22 @@ fn derive_for_caller(outer_slot: u32) -> Option<u32>
     syscall::cap_derive(outer_slot, syscall::RIGHTS_ALL).ok()
 }
 
-/// Map a demand-region protection mask to the cap rights to derive for the
-/// fault-backing inner cap: least-privilege, exactly the rights `mem_map` will
-/// validate against the requested prot bits. `region.prot` is W^X-exclusive
-/// (checked at registration), so this never produces a W+X cap.
-fn rights_for_prot(prot: u64) -> u64
+/// The contiguous chunk of `region` that backs a fault at `page_base`: the
+/// `DEMAND_CHUNK_PAGES`-aligned window within the region containing the page,
+/// clamped to the region end (the last chunk may be shorter). Chunks are
+/// fixed and non-overlapping, so each region page belongs to exactly one.
+/// Returns `(chunk_base, chunk_pages)` with `chunk_pages ∈ [1, DEMAND_CHUNK_PAGES]`.
+fn chunk_for(region: &DemandRegion, page_base: u64) -> (u64, u32)
 {
-    if prot & MAP_EXECUTABLE != 0
-    {
-        syscall::RIGHTS_MAP_RX
-    }
-    else if prot & MAP_WRITABLE != 0
-    {
-        syscall::RIGHTS_MAP_RW
-    }
-    else
-    {
-        syscall::RIGHTS_MAP_READ
-    }
+    let chunk_bytes = u64::from(DEMAND_CHUNK_PAGES) * PAGE_SIZE;
+    // page_base >= region.va_base: region_for matched `va`, and va_base is
+    // page-aligned, so the page containing `va` cannot precede it.
+    let chunk_idx = (page_base - region.va_base) / chunk_bytes;
+    let chunk_base = region.va_base + chunk_idx * chunk_bytes;
+    let region_end = region.va_base + region.len;
+    let chunk_end = (chunk_base + chunk_bytes).min(region_end);
+    let chunk_pages = ((chunk_end - chunk_base) / PAGE_SIZE) as u32;
+    (chunk_base, chunk_pages)
 }
 
 // ── IPC handlers ─────────────────────────────────────────────────────────────
@@ -1616,16 +1648,19 @@ fn handle_delegate_aspace(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u6
 ///
 /// `req.badge` is the faulting process's memmgr badge; words are
 /// `[kind, faulting_va, access, ip]`. On a VM fault whose address lies in a
-/// registered region of a process with a delegated address space, memmgr
-/// allocates one frame, maps it at the faulting page with the region's
-/// protection, and replies [`syscall_abi::FAULT_REPLY_RESUME`]. Every other
-/// case — non-VM fault, unknown process, address outside every region, no
-/// delegated AS, or any allocation/map failure — replies
-/// [`syscall_abi::FAULT_REPLY_KILL`], preserving default segfault semantics.
+/// registered region of a process with a delegated address space, memmgr backs
+/// the [`chunk_for`] chunk containing the faulting page — one contiguous
+/// Memory cap mapped across up to [`DEMAND_CHUNK_PAGES`] pages — and replies
+/// [`syscall_abi::FAULT_REPLY_RESUME`]. Backing a chunk rather than a single
+/// page bounds cap-slot consumption (one cap per chunk) so a deep demand stack
+/// cannot exhaust memmgr's `CSpace`. Every other case — non-VM fault, unknown
+/// process, address outside every region, no delegated AS, or any
+/// allocation/map failure — replies [`syscall_abi::FAULT_REPLY_KILL`],
+/// preserving default segfault semantics.
 ///
-/// The frame is accounted to the process record (reclaimed on `PROCESS_DIED`
-/// like any other issued cap); `pool_total` is unchanged because the page was
-/// already owned — it moves from a free run to the process's record.
+/// The chunk is accounted to the process record (reclaimed on `PROCESS_DIED` /
+/// `UNREGISTER_REGION` like any issued cap); `pool_total` is unchanged because
+/// the pages were already owned — they move from a free run to the record.
 fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 {
     if req.word(0) != syscall_abi::FAULT_KIND_VM
@@ -1654,8 +1689,16 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     }
+    // Already backed by an earlier chunk (stale-TLB redelivery): resume.
+    if record.frame_covering(page_base)
+    {
+        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
+        return;
+    }
 
-    let Ok((granted, _count)) = select_memory_caps(pool, 1, true)
+    // Back the whole chunk containing the faulting page with one Memory cap.
+    let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
+    let Ok((granted, _count)) = select_memory_caps(pool, chunk_pages, true)
     else
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
@@ -1663,11 +1706,11 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     };
     let (outer, pages, phys) = granted[0];
 
-    // Account the frame so it is reclaimed on death; roll back to the pool on
-    // any subsequent failure. `page_base` is recorded as the frame's mapped VA
-    // so UNREGISTER_REGION can find and unmap it.
+    // Account the chunk so it is reclaimed on death/unregister; roll back to the
+    // pool on any subsequent failure. `chunk_base` is the chunk's mapped VA so
+    // UNREGISTER_REGION can find and unmap it.
     if record
-        .push_frame(outer, pages, phys, page_base, pool)
+        .push_frame(outer, pages, phys, chunk_base, pool)
         .is_err()
     {
         let _ = pool.push(FreeRun {
@@ -1679,27 +1722,21 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     }
 
-    // Derive the inner mapping cap with exactly the rights the region's
-    // protection needs (R / R+W / R+X), least-privilege. Pool outers are
-    // full-rights (every RAM frame, including init's donated segments, carries
-    // WRITE), so the narrowing always succeeds; `mem_map` then validates the
-    // requested prot bits against these rights. Mirrors procmgr's RW mapping
-    // pattern (`cap_derive(_, RIGHTS_MAP_RW)`).
-    let Ok(inner) = syscall::cap_derive(outer, rights_for_prot(region.prot))
-    else
+    // Map the whole chunk into the child at `chunk_base` with the region's prot.
+    // Pool outers are full-rights, so `mem_map` gates the mapping to `region.prot`
+    // directly (the kernel grants read at every map, and W^X is enforced); no
+    // per-fault inner derivation is needed. The kernel holds the mapping
+    // independently of the cap, which stays in memmgr as the reclaim anchor.
+    if syscall::mem_map(
+        outer,
+        record.aspace_cap,
+        chunk_base,
+        0,
+        u64::from(pages),
+        region.prot,
+    )
+    .is_err()
     {
-        record.pop_frame();
-        let _ = pool.push(FreeRun {
-            cap_slot: outer,
-            page_count: pages,
-            phys_base: phys,
-        });
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
-        return;
-    };
-    if syscall::mem_map(inner, record.aspace_cap, page_base, 0, 1, region.prot).is_err()
-    {
-        let _ = syscall::cap_delete(inner);
         record.pop_frame();
         let _ = pool.push(FreeRun {
             cap_slot: outer,
@@ -1709,9 +1746,6 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_KILL);
         return;
     }
-    // The kernel holds the mapping independently of the inner cap; the outer
-    // pins the frame until reclaim.
-    let _ = syscall::cap_delete(inner);
     reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
 }
 

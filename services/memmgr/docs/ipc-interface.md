@@ -340,14 +340,18 @@ endpoint with label `FAULT_LABEL` (`u64::MAX - 1`), `badge` = the faulting
 process's memmgr badge, and data words `[kind, faulting_va, access, ip]`
 (see [docs/fault-handling.md](../../../docs/fault-handling.md)). For a
 `FAULT_KIND_VM` fault whose `faulting_va` lies in a registered region of a
-process with a delegated address space, memmgr allocates one frame, maps
-it at the faulting page with the region's protection, and replies
-`FAULT_REPLY_RESUME` to retry the access. Every other case — non-VM fault,
-unknown process, address outside every region, no delegated AS, or any
-allocation/map failure — replies `FAULT_REPLY_KILL`. Demand frames are
-tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so `PROCESS_DIED`
-reclaims them and the all-RAM-accounted identity is unaffected (the page
-moves from a free run to the process record; it was already owned).
+process with a delegated address space, memmgr backs the contiguous chunk of
+the region containing the page — one Memory cap mapped across up to
+`DEMAND_CHUNK_PAGES` pages — with the region's protection, and replies
+`FAULT_REPLY_RESUME` to retry the access. Backing a chunk rather than a single
+page keeps cap-slot consumption to one cap per chunk, so a deep demand stack
+cannot exhaust memmgr's CSpace; stacks grow contiguously, so a chunk's pages are
+consumed as the stack descends. Every other case — non-VM fault, unknown
+process, address outside every region, no delegated AS, or any allocation/map
+failure — replies `FAULT_REPLY_KILL`. Demand chunks are tracked exactly like
+`REQUEST_MEMORY_CAPS` allocations, so `PROCESS_DIED` / `UNREGISTER_REGION`
+reclaim them and the all-RAM-accounted identity is unaffected (the pages move
+from a free run to the process record; they were already owned).
 
 ---
 

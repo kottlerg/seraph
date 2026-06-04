@@ -40,82 +40,35 @@ for init at `INIT_INFO_VADDR`.
 The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 `version == PROCESS_ABI_VERSION` before accessing any other field.
 
-```rust
-#[repr(C)]
-pub struct ProcessInfo {
-    /// Protocol version. Must equal `PROCESS_ABI_VERSION`.
-    pub version: u32,
+The authoritative field list, with per-field doc comments and exact order, is
+[`src/lib.rs`](src/lib.rs) (`struct ProcessInfo`). This README summarises the
+field groups rather than mirroring every field, so the two cannot drift. As of
+`PROCESS_ABI_VERSION` 18 the groups are:
 
-    // ── Process identity ────────────────────────────────────────────
+- **Process identity** — `version`, `self_thread_cap`, `self_aspace_cap`,
+  `self_cspace_cap`, `sched_control_cap`.
+- **IPC / bootstrap** — `ipc_buffer_vaddr`, `creator_endpoint_cap`.
+- **Universal service endpoints** — `procmgr_endpoint_cap`, `memmgr_endpoint_cap`,
+  `service_registry_cap` (the single system-wide service-discovery handle).
+- **Stdio rings** — `stdin_memory_cap`, `stdout_memory_cap`, `stderr_memory_cap`
+  and their six `*_data_notification_cap` / `*_space_notification_cap` wakeup slots.
+- **TLS template** — `tls_template_vaddr`, `tls_template_filesz`,
+  `tls_template_memsz`, `tls_template_align`.
+- **argv / env blobs** — `args_offset`, `args_bytes`, `args_count`,
+  `env_offset`, `env_bytes`, `env_count` (blobs are written into the same page
+  after the fixed struct, bounded by the page remainder).
+- **Namespace** — `system_root_cap`, `current_dir_cap`.
+- **Logging** — `log_send_cap` (deprecated; migrating to `service_registry_cap`).
+- **Main-thread stack envelope** — `stack_top_vaddr`, `stack_pages`.
+- **Demand-paging pager** (v18, #34) — `pager_endpoint_cap`, `pager_badge`. The
+  `Endpoint` cap + badge of the process's pager (memmgr) when the process is
+  created demand-paged (`procmgr_labels::CREATE_DEMAND_PAGED`); both zero
+  otherwise. procmgr binds the main thread's fault handler to this endpoint at
+  creation, and the runtime inherits it onto every thread it spawns. Consumers
+  must tolerate zero.
 
-    /// CSpace slot of the process's own Thread capability (Control right).
-    pub self_thread_cap: u32,
-
-    /// CSpace slot of the process's own AddressSpace capability.
-    pub self_aspace_cap: u32,
-
-    /// CSpace slot of the process's own CSpace capability.
-    pub self_cspace_cap: u32,
-
-    /// CSpace slot of a baseline `SchedControl` cap (default band `[1, 20]`),
-    /// or zero. Authorises `SYS_THREAD_SET_PRIORITY` within the band; zero
-    /// means no scheduling authority. procmgr `cap_copy`s its own baseline
-    /// into every child.
-    pub sched_control_cap: u32,
-
-    // ── IPC ─────────────────────────────────────────────────────────
-
-    /// Virtual address of the pre-mapped IPC buffer page.
-    ///
-    /// Every thread requires a registered IPC buffer for extended message
-    /// payloads. procmgr maps this page and registers it with the kernel
-    /// before the process starts.
-    pub ipc_buffer_vaddr: u64,
-
-    /// CSpace slot of a badged send cap to the creator's bootstrap
-    /// endpoint.
-    ///
-    /// For processes created by procmgr directly, this points at procmgr's
-    /// bootstrap endpoint or, for services created on behalf of another
-    /// service (devmgr spawning a driver, vfsd spawning a filesystem
-    /// driver), at that service's bootstrap endpoint. The child issues
-    /// `ipc::bootstrap::REQUEST` rounds on this cap to collect its
-    /// service-specific capability set. Zero when no creator endpoint is
-    /// supplied (e.g. processes that receive all of their caps through
-    /// `ProcessInfo` alone).
-    pub creator_endpoint_cap: u32,
-
-    // ── Universal service endpoints ─────────────────────────────────
-
-    /// CSpace slot of a badged SEND cap on memmgr's service endpoint.
-    ///
-    /// Populated for every procmgr-spawned child. `std::os::seraph::
-    /// _start` calls `memmgr_labels::REQUEST_MEMORY_CAPS` on this cap to
-    /// bootstrap the `System` allocator before the user's `fn main()`
-    /// runs. The badged cap identifies this process to memmgr, so
-    /// memmgr accounts allocations against the correct per-process
-    /// frame record. Zero for processes with no memmgr above them
-    /// (init and memmgr itself).
-    pub memmgr_endpoint_cap: u32,
-
-    /// CSpace slot of a badged SEND cap on procmgr's service endpoint.
-    ///
-    /// Used for process-lifecycle queries (and any future
-    /// procmgr-served operation that is not heap-bootstrap). Zero for
-    /// processes with no procmgr above them (procmgr itself, or
-    /// init/ktest which receive `InitInfo` instead).
-    pub procmgr_endpoint_cap: u32,
-
-    /// CSpace slot of a SEND cap on the system log endpoint.
-    ///
-    /// Bound to `Stdout`/`Stderr` by `std::os::seraph::_start`, so
-    /// `println!`/`eprintln!` work without per-service bootstrap-round
-    /// wiring. Zero when no log sink is available — consumers MUST
-    /// tolerate zero (stdio writes are silently dropped, matching
-    /// `unsupported` semantics).
-    pub log_endpoint_cap: u32,
-}
-```
+Every cap field names a `CSpace` slot (`0` = absent); `*_vaddr` / size / count
+fields are plain values.
 
 ### Fixed CSpace slot conventions
 
@@ -134,7 +87,9 @@ protocol on `creator_endpoint_cap`, not through `ProcessInfo`.
 | `creator_endpoint_cap` | Badged send cap back to the creator's bootstrap endpoint (if nonzero) |
 | `memmgr_endpoint_cap` | Badged SEND cap on memmgr's service endpoint (if nonzero) |
 | `procmgr_endpoint_cap` | Badged SEND cap on procmgr's service endpoint (if nonzero) |
-| `log_endpoint_cap` | SEND cap on the system log endpoint (if nonzero) |
+| `service_registry_cap` | SEND cap on svcmgr's service-discovery endpoint (if nonzero) |
+| `log_send_cap` | Badged SEND cap on the system log endpoint (deprecated; if nonzero) |
+| `pager_endpoint_cap` | `Endpoint` cap on the demand-paging pager (if nonzero) |
 
 ---
 
@@ -144,39 +99,17 @@ The struct passed to `main()`. This is a Rust-native type (NOT `#[repr(C)]`)
 providing ergonomic access to the handover data. It is constructed by `_start()`
 from either `ProcessInfo` (normal processes) or `InitInfo` (init/ktest).
 
-```rust
-pub struct StartupInfo {
-    /// Virtual address of the IPC buffer page.
-    pub ipc_buffer: *mut u8,
-
-    /// CSpace slot of the creator endpoint. Zero if none.
-    pub creator_endpoint: u32,
-
-    /// CSpace slot of own Thread capability.
-    pub self_thread: u32,
-
-    /// CSpace slot of own AddressSpace capability.
-    pub self_aspace: u32,
-
-    /// CSpace slot of own CSpace capability.
-    pub self_cspace: u32,
-
-    /// CSpace slot of a badged SEND cap on memmgr's service endpoint.
-    /// Zero when unreachable.
-    pub memmgr_endpoint: u32,
-
-    /// CSpace slot of a badged SEND cap on procmgr's service endpoint.
-    /// Zero when unreachable.
-    pub procmgr_endpoint: u32,
-
-    /// CSpace slot of a SEND cap on the system log endpoint. Zero when
-    /// no log sink has been attached yet.
-    pub log_endpoint: u32,
-}
-```
+The authoritative definition is [`src/lib.rs`](src/lib.rs) (`struct StartupInfo`);
+the std overlay carries a `#[stable]`-attributed mirror at
+`runtime/ruststd/src/os/seraph.rs`. It exposes the same groups as `ProcessInfo`
+(identity, service endpoints, stdio rings + notifications, TLS template,
+argv/env as resolved `&[u8]` slices, namespace, stack envelope, and the v18
+`pager_endpoint_cap` / `pager_badge`), with cap slots delivered as `u32` values
+and `args_blob` / `env_blob` resolved from the handover page into slices.
 
 Values are copied out of the handover page verbatim, so the struct does
-not borrow from it.
+not borrow from it (except the argv/env slices, which point into the
+read-only handover page that lives for the process's lifetime).
 
 ---
 

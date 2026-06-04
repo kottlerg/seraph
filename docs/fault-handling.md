@@ -45,11 +45,19 @@ including register inspection and modification of a fault-blocked thread via
 [`SYS_THREAD_READ_REGS`/`SYS_THREAD_WRITE_REGS`](capability-model.md#thread). A thread with
 no handler bound is still terminated, the behavior for all faults absent this mechanism.
 
+The demand-paging consumer is implemented: memmgr acts as the pager, procmgr binds it for
+processes created with the `CREATE_DEMAND_PAGED` flag and delegates the child address space,
+and the `ProcessInfo` pager field (`pager_endpoint_cap` / `pager_badge`, `PROCESS_ABI_VERSION`
+18) advertises it so the runtime inherits the handler onto spawned threads. Userspace reserves
+unbacked VA and registers it via `std::os::seraph::register_demand_paged`; first touch faults,
+memmgr maps a frame and resumes. See
+[memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md) (`REGISTER_REGION`,
+`DELEGATE_ASPACE`, and the fault arm). Binding a default pager to *all* ordinary processes
+remains a userspace policy decision (a creator default plus runtime propagation), not yet
+enabled.
+
 Not yet implemented (this section is narrowed as each part lands):
 
-- **The demand-paging consumer.** The `ProcessInfo` pager field referenced under
-  [Demand Paging](#demand-paging-and-the-default-system-pager) and the demand-paged-memory
-  consumer are not present yet.
 - **Active unbind/rebind cancellation.** Clearing or rebinding a handler governs *future*
   faults; it does not yet actively cancel a fault already in flight on the affected thread.
   An in-flight fault is still resolved by the handler's reply, handler-thread death, the

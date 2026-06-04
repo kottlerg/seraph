@@ -304,6 +304,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "demandpaged",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
         name: "stdiotest",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -349,6 +356,7 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Fsbench => "fsbench",
         BuildComponent::Stackoverflow => "stackoverflow",
         BuildComponent::Pipefault => "pipefault",
+        BuildComponent::Demandpaged => "demandpaged",
         BuildComponent::Stdiotest => "stdiotest",
         BuildComponent::StdiotestTester => "stdiotest-tester",
     };

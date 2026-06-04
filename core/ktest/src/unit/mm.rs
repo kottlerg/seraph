@@ -9,9 +9,14 @@
 //! `SYS_MEM_PROTECT`, `SYS_ASPACE_QUERY`.
 //!
 //! Memory cap layout after `aspace_cap` (as provided by the kernel/bootloader):
-//!   `aspace_cap + 1` — TEXT segment Memory cap (MAP | EXECUTE)
-//!   `aspace_cap + 2` — RODATA segment Memory cap (MAP)
-//!   `aspace_cap + 3` — BSS/DATA segment Memory cap (MAP | WRITE)
+//!   `aspace_cap + 1` — TEXT segment Memory cap
+//!   `aspace_cap + 2` — RODATA segment Memory cap
+//!   `aspace_cap + 3` — BSS/DATA segment Memory cap
+//!
+//! Every segment cap carries full rights (`MAP|READ|WRITE|EXECUTE|RETYPE`): the
+//! kernel mints all RAM frames uniformly so they flow into memmgr's pool as
+//! general RAM at init reap. Page-table protection (R/RW/RX) is applied at map
+//! time by `map_segment`, independent of cap rights.
 //!
 //! Segment Memory caps own their physical memory (the kernel mints them with
 //! `owns_memory=true` so the init-reap donation cascade can return them to
@@ -22,7 +27,7 @@
 //! Split/merge/delete exercises operate on pool-allocated frames; segments
 //! are read-only test surfaces for `mem_map` / `mem_protect`.
 
-use syscall::{MAP_READONLY, MAP_WRITABLE, aspace_query, mem_map, mem_unmap};
+use syscall::{MAP_READ, MAP_WRITABLE, aspace_query, mem_map, mem_unmap};
 
 use crate::{TestContext, TestResult};
 
@@ -273,45 +278,38 @@ pub fn memory_split_at_zero_err(_ctx: &TestContext) -> TestResult
 
 /// `mem_protect` requesting permissions beyond the Memory cap's rights must fail.
 ///
-/// Pool frames have `MAP|WRITE|EXECUTE` rights. To test insufficient rights,
-/// we'd need to derive an attenuated cap. For now, this test verifies that
-/// `mem_protect` with valid rights on a mapped page succeeds (sanity check).
-///
-/// A true negative test for insufficient rights would require capability
-/// derivation with attenuation, which is tested in `cap::derive_attenuation`.
+/// Maps a full-rights pool frame, then derives a no-WRITE cap over the same
+/// frame and requests WRITE through it via `mem_protect` — which must be rejected
+/// with `InsufficientRights`. Attenuation supplies the no-WRITE cap: every RAM
+/// frame the kernel mints (init segments included) carries full rights, so a
+/// segment cap can no longer serve as the no-WRITE surface.
 pub fn mem_protect_exceeds_cap_rights_err(ctx: &TestContext) -> TestResult
 {
     // Use a VA distinct from TEST_VA=0x4000_0000 to avoid conflicts.
     const PROTECT_TEST_VA: u64 = 0x4100_0000;
 
-    // Use the TEXT segment Memory cap which has MAP|EXECUTE but no WRITE.
-    let text_memory = ctx.aspace_cap + 1;
+    let mut frame = crate::frame_pool::FrameGuard::new(ctx.aspace_cap)
+        .ok_or("mem_protect_exceeds_cap_rights_err: frame pool exhausted")?;
+    frame
+        .map(PROTECT_TEST_VA)
+        .map_err(|_| "mem_map for protect-rights test failed")?;
 
-    mem_map(
-        text_memory,
-        ctx.aspace_cap,
-        PROTECT_TEST_VA,
-        0,
-        1,
-        MAP_READONLY,
-    )
-    .map_err(|_| "mem_map for protect-rights test failed")?;
+    // Attenuate to a no-WRITE cap (MAP only) over the same frame; mem_protect
+    // checks the requested perms against this cap's rights, not the mapping cap.
+    let ro_cap = syscall::cap_derive(frame.cap(), syscall::RIGHTS_MAP_READ)
+        .map_err(|_| "mem_protect_exceeds_cap_rights_err: cap_derive failed")?;
 
-    // TEXT cap has MAP|EXECUTE but no WRITE — requesting WRITE must fail.
-    let err = syscall::mem_protect(
-        text_memory,
-        ctx.aspace_cap,
-        PROTECT_TEST_VA,
-        1,
-        MAP_WRITABLE,
-    );
+    // Read-only cap has no WRITE — requesting WRITE must fail.
+    let err = syscall::mem_protect(ro_cap, ctx.aspace_cap, PROTECT_TEST_VA, 1, MAP_WRITABLE);
 
-    // Always unmap regardless of protect result.
-    mem_unmap(ctx.aspace_cap, PROTECT_TEST_VA, 1).ok();
+    // The parent frame keeps the object alive, so deleting the derived slot is
+    // safe; FrameGuard's drop unmaps PROTECT_TEST_VA and returns the frame.
+    syscall::cap_delete(ro_cap).ok();
+    drop(frame);
 
     if err.is_ok()
     {
-        return Err("mem_protect with WRITE on MAP|EXECUTE cap should fail (InsufficientRights)");
+        return Err("mem_protect with WRITE on a read-only cap should fail (InsufficientRights)");
     }
     Ok(())
 }
@@ -521,8 +519,11 @@ pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
     for i in 0..SEG_COUNT
     {
         let seg_cap = ctx.aspace_cap + 1 + i;
-        // TEXT lacks the WRITE right; map every segment read-only.
-        mem_map(seg_cap, ctx.aspace_cap, SEG_PROBE_VA, 0, 1, MAP_READONLY)
+        // Map read-only via explicit prot (not prot=0): segment caps are now
+        // full-rights, so deriving perms from cap rights would request W+X and
+        // trip W^X. Explicit MAP_READ maps read-only regardless of cap rights;
+        // the probe only needs the page's phys base.
+        mem_map(seg_cap, ctx.aspace_cap, SEG_PROBE_VA, 0, 1, MAP_READ)
             .map_err(|_| "init_segment_caps_aligned: mem_map failed")?;
 
         let phys = aspace_query(ctx.aspace_cap, SEG_PROBE_VA)

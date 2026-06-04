@@ -525,7 +525,6 @@ unsafe fn kernel_entry_post_rebase(
         // so init can create child threads bound to its own address space and map
         // its code pages into child processes once a process manager is available.
         let (init_aspace_cap_slot, segment_memory_base, segment_memory_count) = {
-            use boot_protocol::SegmentFlags;
             use cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
             use cap::slot::{CapTag, Rights};
 
@@ -557,12 +556,18 @@ unsafe fn kernel_entry_post_rebase(
             for i in 0..seg_count
             {
                 let seg = &init_image.segments[i];
-                let rights = match seg.flags
-                {
-                    SegmentFlags::Read => Rights::MAP | Rights::RETYPE,
-                    SegmentFlags::ReadWrite => Rights::MAP | Rights::WRITE | Rights::RETYPE,
-                    SegmentFlags::ReadExecute => Rights::MAP | Rights::EXECUTE | Rights::RETYPE,
-                };
+                // Full rights regardless of the segment's protection. This cap
+                // is held only to donate the frame into memmgr's pool at init's
+                // reap, where it becomes general anonymous RAM any consumer may
+                // map writable (demand paging, REQUEST_MEMORY_CAPS). Cap rights
+                // gate derivation, not the live mapping: init's segments are
+                // already mapped at their true protection (R/RW/RX) by
+                // `map_segment` above, so a writable cap cannot widen a running
+                // segment. A narrower cap donates a non-writable frame that
+                // fails downstream writable maps. Mirrors the boot-module and
+                // reclaim-scratch mints (`cap/mod.rs`).
+                let rights =
+                    Rights::MAP | Rights::READ | Rights::WRITE | Rights::EXECUTE | Rights::RETYPE;
                 // The bootloader encodes the ELF in-page offset into
                 // `phys_addr` so `map_segment` can preserve
                 // `phys & 0xFFF == virt & 0xFFF`. The Memory cap exposed
@@ -783,8 +788,8 @@ unsafe fn kernel_entry_post_rebase(
 
             // Mint a reclaimable Memory cap per InitInfo page so init's
             // reap-handoff donates the pages back to memmgr after AS
-            // teardown. Caps carry MAP|READ rights (matching the
-            // userspace mapping) and the standard reclaim flags
+            // teardown. Caps carry full pool-frame rights (see the per-mint
+            // comment below) and the standard reclaim flags
             // (RETYPE + owns_memory=true + full ledger).
             // SAFETY: ROOT_CSPACE initialised in Phase 7; single-threaded boot.
             let cs = unsafe { cap::root_cspace_mut() }
@@ -808,10 +813,23 @@ unsafe fn kernel_entry_post_rebase(
                     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
+                // Full rights, matching the segment caps above. This cap is
+                // held only to donate the page into memmgr's pool at init's
+                // reap, where it becomes general anonymous RAM any consumer may
+                // map writable or executable (demand paging, REQUEST_MEMORY_CAPS).
+                // Cap rights gate derivation, not the live mapping: the InitInfo
+                // region is already mapped read-only into init by `map_page`
+                // above, so a writable cap cannot widen it. A narrower cap
+                // donates a frame that cannot satisfy a downstream RW/RX map and
+                // fails the consumer's fault.
                 let slot = cs
                     .insert_cap(
                         CapTag::Memory,
-                        Rights::MAP | Rights::READ | Rights::RETYPE,
+                        Rights::MAP
+                            | Rights::READ
+                            | Rights::WRITE
+                            | Rights::EXECUTE
+                            | Rights::RETYPE,
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
@@ -905,10 +923,22 @@ unsafe fn kernel_entry_post_rebase(
                     allocator: crate::cap::retype::RetypeAllocator::new_inline(),
                     lock: core::sync::atomic::AtomicU32::new(0),
                 });
+                // Full rights, matching the segment and InitInfo caps. This cap
+                // is held only to donate the page into memmgr's pool at init's
+                // reap, where it becomes general anonymous RAM any consumer may
+                // map writable or executable. Cap rights gate derivation, not
+                // the live mapping: init's stack is already mapped RW by
+                // `map_page` above, so the EXECUTE right cannot make the running
+                // stack executable. A narrower cap donates a frame that cannot
+                // satisfy a downstream RX map and fails the consumer's fault.
                 let slot = cs
                     .insert_cap(
                         CapTag::Memory,
-                        Rights::MAP | Rights::READ | Rights::WRITE | Rights::RETYPE,
+                        Rights::MAP
+                            | Rights::READ
+                            | Rights::WRITE
+                            | Rights::EXECUTE
+                            | Rights::RETYPE,
                         fo_nn,
                     )
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Memory cap"));

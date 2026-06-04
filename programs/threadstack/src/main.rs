@@ -61,8 +61,8 @@ fn touch(buf: &[u8; FRAME_BYTES]) -> u64
 /// Recurse, consuming one per-frame stack buffer per level so the stack grows
 /// page by page (each frame faults in its demand page on first touch).
 ///
-/// `down` selects the direction: false counts `depth` down to a real base case
-/// (bounded, used by `grow`); true counts *up*, never reaching the base case at
+/// `down` selects the direction: true counts `depth` down to a real base case
+/// (bounded, used by `grow`); false counts *up*, never reaching the base case at
 /// runtime (used by `guard` to overflow into the guard page).
 ///
 /// The recursive call goes through a `black_box`'d function pointer, so the

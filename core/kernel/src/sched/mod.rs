@@ -2508,6 +2508,11 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
 /// on the local run queue. The kernel only notifies here — it does not
 /// enumerate or terminate the address space's threads.
 ///
+/// On a main-thread terminal fault this fires in addition to the per-thread
+/// [`post_death_notification`]; when both target the same consumer queue
+/// (procmgr's death EQ), the consumer reaps the first and the second is harmless
+/// residue — the process is torn down regardless.
+///
 /// # Safety
 /// `as_ptr` may be null (no-op) or a valid `AddressSpace` pointer. Must be
 /// called from the terminal-fault path after the faulting thread has been

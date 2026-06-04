@@ -420,12 +420,12 @@ fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         .state
     };
 
-    // Append the observer. Like the per-TCB bind, `death_observer_count` is
-    // mutated only here; the terminal-fault read path runs under the same
-    // syscall/fault serialization, so no intrinsic lock is added.
+    // Append the observer. No intrinsic lock guards the observer array against
+    // the terminal-fault reader; soundness relies on binds completing before the
+    // address space runs (procmgr binds in `finalize_creation` before
+    // `thread_start`). See `AddressSpace::bind_death_observer`.
     //
-    // SAFETY: as_ptr is a valid AddressSpace from a validated AddressSpace cap;
-    // the syscall context serializes this append against the fault-path read.
+    // SAFETY: as_ptr is a valid AddressSpace from a validated AddressSpace cap.
     let aspace = unsafe { &mut *as_ptr };
     aspace
         .bind_death_observer(eq_state, correlator)

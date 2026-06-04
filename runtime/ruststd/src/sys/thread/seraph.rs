@@ -44,9 +44,6 @@ const DEFAULT_DEMAND_STACK_PAGES: u64 = 512;
 /// Per-thread context the entry trampoline pulls off the `arg` slot of
 /// `thread_configure`. Owned by the spawning thread until the child takes
 /// it over on entry (the child drops it after extracting the pieces).
-///
-/// `tls_base`, `tls_block`, and `tls_layout` are zero/null for threads
-/// spawned in a process whose binary has no `PT_TLS` segment.
 struct SpawnArgs {
     ipc_buffer_vaddr: u64,
     init: *mut ThreadInit,

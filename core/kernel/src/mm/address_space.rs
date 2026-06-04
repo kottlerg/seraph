@@ -389,13 +389,14 @@ impl AddressSpace
     /// Append a terminal-fault death observer to this address space.
     ///
     /// Mirrors `sys_thread_bind_notification`'s append onto a TCB. Returns
-    /// `Err(())` if `death_observers` is already full
-    /// (`MAX_DEATH_OBSERVERS`). The caller must serialize binds against the
-    /// terminal-fault read path the same way the per-TCB observer set is
-    /// serialized: `death_observer_count` is mutated only here, and the
-    /// fault-path reader ([`crate::sched::post_aspace_death_notification`])
-    /// reads it from the syscall/fault context that already serializes the
-    /// observer arrays — so no intrinsic lock is added here.
+    /// `Err(())` if `death_observers` is already full (`MAX_DEATH_OBSERVERS`).
+    ///
+    /// No intrinsic lock guards `death_observers`/`death_observer_count` against
+    /// the terminal-fault reader ([`crate::sched::post_aspace_death_notification`]).
+    /// Soundness relies on all observers being bound *before* the address space
+    /// runs: procmgr binds them in `finalize_creation` before `thread_start`, so
+    /// no thread can fault and read the array until binds complete. Binding on an
+    /// already-running address space would race the reader and needs a lock first.
     #[cfg(not(test))]
     pub fn bind_death_observer(
         &mut self,

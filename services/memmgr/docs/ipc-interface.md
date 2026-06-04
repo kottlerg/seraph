@@ -37,9 +37,9 @@ Two privilege classes:
   to procmgr at procmgr's bootstrap round. memmgr identifies this cap by
   badge and rejects procmgr-only calls received over any other badged cap.
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
-  `REGISTER_REGION`) are callable over any badged cap, including those
-  memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION` is attributed
-  to the caller by its own badge.
+  `REGISTER_REGION`, `UNREGISTER_REGION`) are callable over any badged cap,
+  including those memmgr returned from `REGISTER_PROCESS`. `REGISTER_REGION`
+  and `UNREGISTER_REGION` are attributed to the caller by its own badge.
 
 Badges cannot be forged: they are minted by `cap_derive_badge` only
 under the kernel's derivation rules, and procmgr is the only process
@@ -119,7 +119,7 @@ Best-effort replies may use the full reply-side capacity.
 |---|---|---|
 | 1 | `OutOfMemoryContiguous` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
 | 2 | `OutOfMemoryBestEffort` | Pool cannot cover `want_pages` even fragmented |
-| 3 | `Quota` | Per-process memory-cap-record list at static cap |
+| 3 | `Quota` | Tracking-metadata arena could not grow (system RAM exhausted) |
 | 4 | `InvalidArgument` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
 
 ### Label 2: `RELEASE_MEMORY_CAPS`
@@ -268,8 +268,12 @@ lazily on fault, and only once procmgr has delegated this process's
 
 | Code | Name | Meaning |
 |---|---|---|
-| 3 | `Quota` | Per-process region list at static cap |
+| 3 | `Quota` | Tracking-metadata arena could not grow (system RAM exhausted) |
 | 4 | `InvalidArgument` | Bad alignment, zero length, W^X violation, unknown prot bit, unknown badge, or overlap |
+
+Per-process region and frame counts are bounded by RAM (the self-hosted
+node arena), not by a fixed constant; `Quota` therefore signals genuine RAM
+exhaustion, not a per-process ceiling.
 
 ### Label 8: `DELEGATE_ASPACE`
 
@@ -298,6 +302,36 @@ memmgr stores the cap against the child's tracking entry and drops it on
 | 4 | `InvalidArgument` | Unknown badge or missing cap (a stray transferred cap is dropped) |
 | 5 | `Unauthorized` | Caller is not procmgr |
 
+### Label 9: `UNREGISTER_REGION`
+
+Unregister a region previously registered with `REGISTER_REGION`, reclaiming
+every frame memmgr mapped inside it. Privilege: universal — attributed to the
+caller by `recv.badge`. Used when a demand-paged anonymous region is torn down
+mid-life — e.g. ruststd freeing a joined thread's guarded stack.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 9 |
+| data[0] | `va_base` (must equal the registered base) |
+| data[1] | `len_bytes` (must equal the registered length) |
+
+memmgr finds the exact-match region, unmaps each backing frame from the
+caller's delegated `AddressSpace`, returns the frame to the free pool, and
+frees the region. Frames the caller mapped itself (e.g. `REQUEST_MEMORY_CAPS`
+grants) are never unmapped — only frames memmgr backed on fault inside the
+region. The frames return to the pool as on `PROCESS_DIED`, so the
+all-RAM-accounted identity is unaffected.
+
+**Reply (success):** `label` 0.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `InvalidArgument` | Unknown badge, or no region matches `[va_base, len)` exactly |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page
@@ -306,14 +340,18 @@ endpoint with label `FAULT_LABEL` (`u64::MAX - 1`), `badge` = the faulting
 process's memmgr badge, and data words `[kind, faulting_va, access, ip]`
 (see [docs/fault-handling.md](../../../docs/fault-handling.md)). For a
 `FAULT_KIND_VM` fault whose `faulting_va` lies in a registered region of a
-process with a delegated address space, memmgr allocates one frame, maps
-it at the faulting page with the region's protection, and replies
-`FAULT_REPLY_RESUME` to retry the access. Every other case — non-VM fault,
-unknown process, address outside every region, no delegated AS, or any
-allocation/map failure — replies `FAULT_REPLY_KILL`. Demand frames are
-tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so `PROCESS_DIED`
-reclaims them and the all-RAM-accounted identity is unaffected (the page
-moves from a free run to the process record; it was already owned).
+process with a delegated address space, memmgr backs the contiguous chunk of
+the region containing the page — one Memory cap mapped across up to
+`DEMAND_CHUNK_PAGES` pages — with the region's protection, and replies
+`FAULT_REPLY_RESUME` to retry the access. Backing a chunk rather than a single
+page keeps cap-slot consumption to one cap per chunk, so a deep demand stack
+cannot exhaust memmgr's CSpace; stacks grow contiguously, so a chunk's pages are
+consumed as the stack descends. Every other case — non-VM fault, unknown
+process, address outside every region, no delegated AS, or any allocation/map
+failure — replies `FAULT_REPLY_KILL`. Demand chunks are tracked exactly like
+`REQUEST_MEMORY_CAPS` allocations, so `PROCESS_DIED` / `UNREGISTER_REGION`
+reclaim them and the all-RAM-accounted identity is unaffected (the pages move
+from a free run to the process record; they were already owned).
 
 ---
 

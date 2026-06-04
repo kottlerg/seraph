@@ -1,0 +1,13 @@
+[package]
+name = "threadstack"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "threadstack"
+path = "src/main.rs"
+test = false
+
+[lints]
+workspace = true

@@ -281,8 +281,11 @@ pub fn sys_cap_create_notification(tf: &mut TrapFrame) -> Result<u64, SyscallErr
 ///   [`AddressSpace::map_page`](crate::mm::address_space::AddressSpace::map_page)
 ///   for intermediate PT levels.
 ///
-/// Inserts a cap with `MAP | READ` rights into the caller's `CSpace`.
-/// Returns the new slot index.
+/// Inserts a cap with `MAP | READ | CONTROL` rights into the caller's
+/// `CSpace`. `CONTROL` lets the creator register terminal-fault death
+/// observers on the address space via `SYS_ASPACE_BIND_NOTIFICATION`;
+/// derived copies handed to other components (e.g. memmgr) drop it via
+/// the `cap_derive` rights mask. Returns the new slot index.
 ///
 /// Augment-mode: pushes all carved pages onto the target AS's PT growth pool
 /// and increases its `pt_growth_budget_bytes`. Returns `0` on success.
@@ -469,7 +472,11 @@ pub fn sys_cap_create_aspace(tf: &mut TrapFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
     let idx = unsafe {
         let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap(CapTag::AddressSpace, Rights::MAP | Rights::READ, nonnull);
+        let r = (*cspace).insert_cap(
+            CapTag::AddressSpace,
+            Rights::MAP | Rights::READ | Rights::CONTROL,
+            nonnull,
+        );
         (*cspace).lock.unlock_raw(saved);
         r
     }

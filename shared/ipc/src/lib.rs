@@ -106,10 +106,15 @@ pub mod procmgr_labels
     /// * `word 1+argv_words` — `env_bytes` (low 16 bits; only when `env_count > 0`)
     /// * words after the env header — env blob, `env_bytes.div_ceil(8)` words
     ///
-    /// Caps: `[file_cap, creator_endpoint?]`. `file_cap` ownership transfers
-    /// to procmgr; procmgr `FS_CLOSE`s and `cap_delete`s it after the load
-    /// completes (success or failure). Stdio pipes are installed via
-    /// separate [`CONFIGURE_PIPE`] calls between create and start.
+    /// Caps: `[file_cap, creator_endpoint?, death_relay?]`. `file_cap`
+    /// ownership transfers to procmgr; procmgr `FS_CLOSE`s and
+    /// `cap_delete`s it after the load completes (success or failure). The
+    /// optional `death_relay` POST-only `EventQueue` cap is present iff
+    /// [`CREATE_DEATH_RELAY`] is set in the label; when present it is the
+    /// LAST cap in the message (procmgr peels it off the tail, so the
+    /// `creator_endpoint` slot stays positionally fixed regardless of
+    /// relay presence). Stdio pipes are installed via separate
+    /// [`CONFIGURE_PIPE`] calls between create and start.
     pub const CREATE_FROM_FILE: u64 = 13;
     /// Label flag (bit 16) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// create the new process as demand-paged. At finalize procmgr binds
@@ -122,6 +127,16 @@ pub mod procmgr_labels
     /// `log_badges::LOG_BADGE_FIRST_CHILD`) are never paged regardless of
     /// this flag.
     pub const CREATE_DEMAND_PAGED: u64 = 1 << 16;
+    /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
+    /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the
+    /// message). At finalize procmgr binds it as an `AddressSpace` death
+    /// observer (correlator 0) on the child so that a terminal fault in any
+    /// of the child's threads posts the fault class straight to the
+    /// spawner's own death queue, letting `Child::wait()` return. procmgr
+    /// `cap_delete`s its copy after the bind (the kernel captured the
+    /// `EventQueue` state at bind time). Occupies bit 17 of the reserved
+    /// `[16..32]` label window.
+    pub const CREATE_DEATH_RELAY: u64 = 1 << 17;
     /// Destroy a process: `cap_delete` its kernel objects (thread, aspace,
     /// cspace, `ProcessInfo` Memory cap), dec-refing any pages the child
     /// still holds so they recycle back into the kernel buddy allocator. The
@@ -285,7 +300,7 @@ pub mod procmgr_labels
     pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
 
-pub const MEMMGR_LABELS_VERSION: u32 = 3;
+pub const MEMMGR_LABELS_VERSION: u32 = 4;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -381,9 +396,10 @@ pub mod memmgr_labels
     ///
     /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (bad alignment,
     /// zero length, W^X violation, unknown badge, or overlap); or `QUOTA`
-    /// (per-process region list at static cap). No mapping is installed
-    /// here — backing happens lazily on fault, and only once procmgr has
-    /// delegated the process `AddressSpace` cap via [`DELEGATE_ASPACE`].
+    /// (metadata arena could not grow — system RAM exhausted). No mapping is
+    /// installed here — backing happens lazily on fault, and only once procmgr
+    /// has delegated the process `AddressSpace` cap via [`DELEGATE_ASPACE`].
+    /// Reverse with [`UNREGISTER_REGION`].
     pub const REGISTER_REGION: u64 = 7;
     /// Procmgr-only: delegate a demand-paged child's `AddressSpace` cap to
     /// memmgr so the pager can map frames into it on fault.
@@ -405,6 +421,24 @@ pub mod memmgr_labels
     /// stray transferred cap is dropped).
     pub const DELEGATE_ASPACE: u64 = 8;
 
+    /// Unregister a demand-paged region previously [`REGISTER_REGION`]'d,
+    /// reclaiming every frame memmgr mapped inside it.
+    ///
+    /// Universal label — attributed to the caller by `recv.badge`. memmgr
+    /// finds the exact-match region, unmaps each backing frame from the
+    /// caller's `AddressSpace`, returns the frame to the pool, and frees the
+    /// region. The reverse of [`REGISTER_REGION`] plus the on-fault backing;
+    /// used when a demand-paged stack (or other anonymous region) is torn down
+    /// mid-life — e.g. ruststd freeing a joined thread's guarded stack.
+    ///
+    /// Wire format:
+    /// * `data[0]` — `va_base` (must equal the registered base).
+    /// * `data[1]` — `len_bytes` (must equal the registered length).
+    ///
+    /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (unknown badge or no
+    /// region matches `[va_base, len)` exactly).
+    pub const UNREGISTER_REGION: u64 = 9;
+
     /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap
     /// covering all `want_pages`, or fail with
     /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
@@ -425,8 +459,10 @@ pub mod memmgr_errors
     /// Pool cannot cover `want_pages` even fragmented. System-wide RAM
     /// exhaustion.
     pub const OUT_OF_MEMORY_BEST_EFFORT: u64 = 2;
-    /// Per-process frame-record list at static cap. The caller is
-    /// consuming an unreasonable number of frames.
+    /// memmgr could not allocate per-process tracking metadata for a frame or
+    /// region: the self-hosted node arena could not grow because system RAM is
+    /// exhausted. Per-process region and frame counts are otherwise RAM-bound,
+    /// not capped by a constant.
     pub const QUOTA: u64 = 3;
     /// `want_pages == 0`, reserved flag bits set, page-count mismatch on
     /// `RELEASE_MEMORY_CAPS`, or badge unknown.

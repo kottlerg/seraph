@@ -386,8 +386,8 @@ pub struct MemmgrBootstrap
 }
 
 /// One in-use bootstrap arena forwarded to memmgr for accounting. Its whole
-/// Memory cap is copied into memmgr's `CSpace`; memmgr records it as an
-/// `OwnedMemory` against the owning service's record so the arena's pages count
+/// Memory cap is copied into memmgr's `CSpace`; memmgr records it as a backing
+/// frame against the owning service's record so the arena's pages count
 /// toward `pool_total` without ever becoming allocatable. The arena is
 /// retype-pinned and offset-mapped for the immortal service's life, so this is
 /// pure accounting — memmgr never frees it.

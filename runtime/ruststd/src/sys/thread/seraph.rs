@@ -29,12 +29,21 @@ pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
 
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
+/// Guard pages below a demand-paged thread stack. The guard is reserved but
+/// unregistered: a stack overflow faults in this hole, the pager declines the
+/// unregistered address, and the thread — and the whole process, via the
+/// address-space death-observer — is killed instead of silently corrupting
+/// adjacent memory.
+const GUARD_PAGES: u64 = 1;
+
+/// Default usable pages for a demand-paged thread stack (2 MiB). Lazily backed
+/// — only touched pages cost RAM — so this floor is generous without eager
+/// allocation. A larger `Builder::stack_size` raises it.
+const DEFAULT_DEMAND_STACK_PAGES: u64 = 512;
+
 /// Per-thread context the entry trampoline pulls off the `arg` slot of
 /// `thread_configure`. Owned by the spawning thread until the child takes
 /// it over on entry (the child drops it after extracting the pieces).
-///
-/// `tls_base`, `tls_block`, and `tls_layout` are zero/null for threads
-/// spawned in a process whose binary has no `PT_TLS` segment.
 struct SpawnArgs {
     ipc_buffer_vaddr: u64,
     init: *mut ThreadInit,
@@ -44,8 +53,7 @@ struct SpawnArgs {
 pub struct Thread {
     thread_cap: u32,
     done_notification: u32,
-    stack_base: *mut u8,
-    stack_layout: Layout,
+    stack: StackAlloc,
     ipc_buf_base: *mut u8,
     ipc_buf_layout: Layout,
     tls_block: *mut u8,
@@ -53,45 +61,100 @@ pub struct Thread {
 }
 
 // SAFETY: every field of Thread is either a plain integer (thread_cap,
-// done_notification) or an owned pointer to a distinct heap allocation whose
-// ownership is not shared with any other thread.
+// done_notification), an owned pointer to a distinct heap allocation, or an
+// owned stack allocation — none shared with any other thread.
 unsafe impl Send for Thread {}
 // SAFETY: &Thread hands out only integer field copies through `join`; no
 // interior mutability is exposed.
 unsafe impl Sync for Thread {}
 
+/// How a spawned thread's stack is backed.
+enum StackAlloc {
+    /// Eager heap allocation: a non-demand-paged process, or a demand-paged one
+    /// whose reservation failed. No guard page.
+    Heap { base: *mut u8, layout: Layout },
+    /// Guarded demand-paged stack: a large reserved VA window, lazily grown,
+    /// with an unregistered guard page below that faults fatally on overflow.
+    Demand(crate::os::seraph::GuardedStack),
+}
+
+impl StackAlloc {
+    /// Initial stack pointer: top of the usable region, 16-byte aligned for the
+    /// SysV ABI (the stack grows down).
+    fn sp(&self) -> u64 {
+        match self {
+            StackAlloc::Heap { base, layout } => {
+                let top = (*base as usize).saturating_add(layout.size());
+                (top & !15) as u64
+            }
+            StackAlloc::Demand(g) => g.usable_top() & !15,
+        }
+    }
+}
+
+/// Allocate a spawned thread's stack. A demand-paged process gets a guarded
+/// demand stack; on any failure — or for a non-demand-paged process, whose
+/// guard-page fault would have no pager to make it fatal — it falls back to the
+/// eager-heap path, preserving liveness.
+fn alloc_stack(
+    info: &crate::os::seraph::StartupInfo,
+    requested_bytes: usize,
+) -> io::Result<StackAlloc> {
+    if info.pager_endpoint_cap != 0 {
+        let floor = crate::cmp::max(requested_bytes, DEFAULT_MIN_STACK_SIZE);
+        let requested_pages = floor.div_ceil(PAGE_SIZE_USIZE) as u64;
+        let usable_pages = crate::cmp::max(requested_pages, DEFAULT_DEMAND_STACK_PAGES);
+        if let Ok(g) = crate::os::seraph::reserve_guarded_stack(usable_pages, GUARD_PAGES) {
+            return Ok(StackAlloc::Demand(g));
+        }
+    }
+    let stack_size = crate::cmp::max(requested_bytes, DEFAULT_MIN_STACK_SIZE);
+    let stack_size = (stack_size + PAGE_SIZE_USIZE - 1) & !(PAGE_SIZE_USIZE - 1);
+    let layout = Layout::from_size_align(stack_size, PAGE_SIZE_USIZE)
+        .map_err(|_| io::Error::other("seraph: stack layout too large"))?;
+    // SAFETY: `layout` has a non-zero size and power-of-two alignment.
+    let base = unsafe { alloc(layout) };
+    if base.is_null() {
+        return Err(io::Error::other("seraph: stack allocation failed"));
+    }
+    Ok(StackAlloc::Heap { base, layout })
+}
+
+/// Release a stack allocation: a heap stack is `dealloc`'d; a demand stack is
+/// unregistered (memmgr unmaps and reclaims its backing frames) and its VA
+/// released. Call only when the thread no longer uses the stack — on the error
+/// unwind in [`Thread::new`] (before start) or in [`Thread::join`] (after the
+/// thread has left user-mode).
+fn free_stack(stack: StackAlloc) {
+    match stack {
+        // SAFETY: `base` came from `alloc(layout)` in `alloc_stack`.
+        StackAlloc::Heap { base, layout } => unsafe { dealloc(base, layout) },
+        StackAlloc::Demand(g) => crate::os::seraph::unregister_guarded_stack(g),
+    }
+}
+
 impl Thread {
     /// # Safety
     /// See `std::thread::Builder::spawn_unchecked` for the caller-side
     /// safety contract.
-    pub unsafe fn new(stack: usize, init: Box<ThreadInit>) -> io::Result<Thread> {
+    pub unsafe fn new(stack_bytes: usize, init: Box<ThreadInit>) -> io::Result<Thread> {
         let info = crate::os::seraph::try_startup_info().ok_or_else(|| {
             io::Error::other("std::os::seraph::_start has not initialised startup state")
         })?;
 
-        let stack_size = crate::cmp::max(stack, DEFAULT_MIN_STACK_SIZE);
-        let stack_size = (stack_size + PAGE_SIZE_USIZE - 1) & !(PAGE_SIZE_USIZE - 1);
-        let stack_layout = Layout::from_size_align(stack_size, PAGE_SIZE_USIZE)
-            .map_err(|_| io::Error::other("seraph: stack layout too large"))?;
-        // SAFETY: `stack_layout` has a non-zero size and power-of-two alignment.
-        let stack_base = unsafe { alloc(stack_layout) };
-        if stack_base.is_null() {
-            return Err(io::Error::other("seraph: stack allocation failed"));
-        }
+        let stack = alloc_stack(info, stack_bytes)?;
 
         let ipc_buf_layout = match Layout::from_size_align(PAGE_SIZE_USIZE, PAGE_SIZE_USIZE) {
             Ok(l) => l,
             Err(_) => {
-                // SAFETY: stack_base came from `alloc(stack_layout)` above.
-                unsafe { dealloc(stack_base, stack_layout) };
+                free_stack(stack);
                 return Err(io::Error::other("seraph: ipc buffer layout invalid"));
             }
         };
         // SAFETY: `ipc_buf_layout` has a non-zero size and power-of-two alignment.
         let ipc_buf_base = unsafe { alloc(ipc_buf_layout) };
         if ipc_buf_base.is_null() {
-            // SAFETY: stack_base came from `alloc(stack_layout)` above.
-            unsafe { dealloc(stack_base, stack_layout) };
+            free_stack(stack);
             return Err(io::Error::other("seraph: ipc buffer allocation failed"));
         }
 
@@ -101,11 +164,9 @@ impl Thread {
         let (tls_block, tls_layout, tls_base) = match alloc_thread_tls(info) {
             Ok(triple) => triple,
             Err(e) => {
-                // SAFETY: both pointers came from matching `alloc` calls above.
-                unsafe {
-                    dealloc(ipc_buf_base, ipc_buf_layout);
-                    dealloc(stack_base, stack_layout);
-                }
+                // SAFETY: ipc_buf_base came from `alloc(ipc_buf_layout)` above.
+                unsafe { dealloc(ipc_buf_base, ipc_buf_layout) };
+                free_stack(stack);
                 return Err(e);
             }
         };
@@ -115,14 +176,14 @@ impl Thread {
         {
             Some(cap) => cap,
             None => {
-                // SAFETY: allocations owned by this function.
+                // SAFETY: heap allocations owned by this function.
                 unsafe {
                     if let Some(l) = tls_layout {
                         dealloc(tls_block, l);
                     }
                     dealloc(ipc_buf_base, ipc_buf_layout);
-                    dealloc(stack_base, stack_layout);
                 }
+                free_stack(stack);
                 return Err(io::Error::other("seraph: notification cap alloc failed"));
             }
         };
@@ -144,14 +205,14 @@ impl Thread {
                     let args_owned = unsafe { Box::from_raw(args) };
                     // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
                     let _init = unsafe { Box::from_raw(args_owned.init) };
-                    // SAFETY: allocations owned by this function.
+                    // SAFETY: heap allocations owned by this function.
                     unsafe {
                         if let Some(l) = tls_layout {
                             dealloc(tls_block, l);
                         }
                         dealloc(ipc_buf_base, ipc_buf_layout);
-                        dealloc(stack_base, stack_layout);
                     }
+                    free_stack(stack);
                     return Err(io::Error::other("seraph: thread retype slab alloc failed"));
                 }
             };
@@ -164,21 +225,21 @@ impl Thread {
                     let args_owned = unsafe { Box::from_raw(args) };
                     // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
                     let _init = unsafe { Box::from_raw(args_owned.init) };
-                    // SAFETY: allocations owned by this function.
+                    // SAFETY: heap allocations owned by this function.
                     unsafe {
                         if let Some(l) = tls_layout {
                             dealloc(tls_block, l);
                         }
                         dealloc(ipc_buf_base, ipc_buf_layout);
-                        dealloc(stack_base, stack_layout);
                     }
+                    free_stack(stack);
                     return Err(io::Error::other("seraph: thread cap alloc failed"));
                 }
             };
 
-        // Stack grows down. Point SP at the top, 16-byte aligned for SysV ABI.
-        let stack_top = (stack_base as usize).saturating_add(stack_size);
-        let sp = (stack_top & !15) as u64;
+        // SP at the top of the usable stack region, 16-byte aligned for SysV
+        // ABI; the stack grows down toward the guard page (demand) or heap base.
+        let sp = stack.sp();
         let entry_addr = thread_entry as extern "C" fn(u64) -> ! as usize as u64;
 
         if let Err(_) =
@@ -188,14 +249,14 @@ impl Thread {
             let args_owned = unsafe { Box::from_raw(args) };
             // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
             let _init = unsafe { Box::from_raw(args_owned.init) };
-            // SAFETY: allocations owned by this function.
+            // SAFETY: heap allocations owned by this function.
             unsafe {
                 if let Some(l) = tls_layout {
                     dealloc(tls_block, l);
                 }
                 dealloc(ipc_buf_base, ipc_buf_layout);
-                dealloc(stack_base, stack_layout);
             }
+            free_stack(stack);
             return Err(io::Error::other("seraph: thread_configure failed"));
         }
 
@@ -216,22 +277,21 @@ impl Thread {
             let args_owned = unsafe { Box::from_raw(args) };
             // SAFETY: `args_owned.init` was just leaked via `Box::into_raw`.
             let _init = unsafe { Box::from_raw(args_owned.init) };
-            // SAFETY: allocations owned by this function.
+            // SAFETY: heap allocations owned by this function.
             unsafe {
                 if let Some(l) = tls_layout {
                     dealloc(tls_block, l);
                 }
                 dealloc(ipc_buf_base, ipc_buf_layout);
-                dealloc(stack_base, stack_layout);
             }
+            free_stack(stack);
             return Err(io::Error::other("seraph: thread_start failed"));
         }
 
         Ok(Thread {
             thread_cap,
             done_notification,
-            stack_base,
-            stack_layout,
+            stack,
             ipc_buf_base,
             ipc_buf_layout,
             tls_block,
@@ -256,8 +316,14 @@ impl Thread {
                 dealloc(self.tls_block, l);
             }
             dealloc(self.ipc_buf_base, self.ipc_buf_layout);
-            dealloc(self.stack_base, self.stack_layout);
         }
+        // Reclaim the stack per its kind: a heap stack is freed; a demand stack
+        // is UNREGISTER_REGION'd (memmgr unmaps and returns its frames to the
+        // pool) and its VA released.
+        // SAFETY: `self.stack` is a valid initialised field; `forget(self)`
+        // below suppresses its destructor, so this read is not a double-free.
+        let stack = unsafe { core::ptr::read(&self.stack) };
+        free_stack(stack);
         // Prevent Drop from running the leak path below; we already
         // reclaimed everything.
         core::mem::forget(self);
@@ -279,12 +345,15 @@ impl Drop for Thread {
         // thread. The only correct choice for a detached child on seraph
         // is to leak everything this handle owns.
         //
-        // `thread_cap` was already leaked by design; the other three
-        // allocations join it here until Seraph has a thread-detach
-        // syscall that reclaims memory on thread_exit.
+        // `thread_cap` was already leaked by design; the stack, IPC buffer,
+        // and TLS block join it here until Seraph has a thread-detach syscall
+        // that reclaims memory on thread_exit. The `stack` field drops as a
+        // no-op (its variants own no `Drop` resources), so a demand stack's VA
+        // reservation and registered region also leak — the same detach
+        // semantics as the heap path.
         let _ = self.thread_cap;
         let _ = self.done_notification;
-        let _ = self.stack_base;
+        let _ = &self.stack;
         let _ = self.ipc_buf_base;
         let _ = self.tls_block;
     }

@@ -597,6 +597,19 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame)
                 unsafe {
                     crate::sched::post_death_notification(tcb, 0x1000 + cause_code);
                 }
+
+                // Terminal fault (no handler bound, or handler replied KILL): notify
+                // the faulting thread's address-space observers with the fault class
+                // so procmgr can tear the whole process down. Reached only on the
+                // terminal path; normal thread_exit never lands here.
+                // SAFETY: tcb validated non-null; address_space may be null for
+                // kernel threads, which post_aspace_death_notification handles.
+                unsafe {
+                    crate::sched::post_aspace_death_notification(
+                        (*tcb).address_space,
+                        0x1000 + cause_code,
+                    );
+                }
             }
 
             // SAFETY: schedule(false) context-switches away; the exited thread

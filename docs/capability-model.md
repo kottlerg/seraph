@@ -486,10 +486,21 @@ for devmgr's specific initial capability set.
 
 ### "Kill process" pattern
 
-Since there is no Process kernel object, terminating a process is done by revoking
-its AddressSpace capability. The kernel tracks which threads are bound to each
-AddressSpace; on revocation, all bound threads are stopped and removed from run queues.
-The process's resources are reclaimed as their capability reference counts reach zero.
+Since there is no Process kernel object, terminating a process is a userspace
+(procmgr) policy, not a single kernel operation. procmgr revokes the capabilities
+backing the process's threads; each revocation stops that thread and removes it
+from the run queues. The kernel does not track which threads belong to an address
+space and never bulk-terminates threads on its own. The process's resources are
+reclaimed as their capability reference counts reach zero.
+
+The kernel's only role in death is *notification*. An `AddressSpace` carries a
+death-observer set (mirroring the per-thread death observers). On a terminal
+fault by any thread in the address space — no fault handler bound, or the handler
+replied `KILL` — the kernel posts the fault class (`EXIT_FAULT_BASE + vector`) to
+each bound observer and exits the faulting thread. procmgr binds such an observer
+at process creation, so a fatal fault on any thread — a worker, not just the main
+thread — drives procmgr's teardown of the whole process. Normal thread exit does
+not fire these observers.
 
 ---
 

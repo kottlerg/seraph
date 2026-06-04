@@ -1184,6 +1184,7 @@ fn finalize_creation(
     process_badge: u64,
     demand_paged: bool,
     self_memmgr_ep: u32,
+    parent_relay_cap: u32,
     ipc_buf: *mut u64,
 ) -> Option<CreateResult>
 {
@@ -1194,6 +1195,26 @@ fn finalize_creation(
     // dispatch_death recovers the entry via `take_by_correlator`.
     let correlator = badge as u32;
     syscall::thread_bind_notification(child_thread, death_eq, correlator).ok()?;
+
+    // Also bind procmgr's death queue as an address-space observer with the
+    // SAME correlator, so a terminal fault in a *spawned* (non-main) thread —
+    // which the main-thread binding above does not cover — still routes into
+    // `dispatch_death` → `take_by_correlator` → teardown. On a main-thread
+    // fault both observers fire with the same correlator and `take_by_correlator`
+    // reaps exactly once (the second event is a stale-correlator no-op).
+    let _ = syscall::aspace_bind_notification(child_aspace, death_eq, correlator);
+
+    // If the spawner supplied a death-relay POST cap, bind it as a second
+    // address-space observer (correlator 0) so a terminal fault in any child
+    // thread posts the fault class straight to the spawner's death queue and
+    // `Child::wait()` returns. The kernel captures the EventQueue state at
+    // bind time, so procmgr drops its copy afterwards (mirrors how the
+    // main-thread death_eq binding leaves no procmgr-side ownership concern).
+    if parent_relay_cap != 0
+    {
+        let _ = syscall::aspace_bind_notification(child_aspace, parent_relay_cap, 0);
+        let _ = syscall::cap_delete(parent_relay_cap);
+    }
 
     // If logd has registered its own death EQ via REGISTER_DEATH_EQ,
     // bind it as a second observer with the same correlator (logd's
@@ -1255,7 +1276,11 @@ fn finalize_creation(
         // Hand memmgr its own copy of the child AS, keyed by the child's
         // memmgr badge, over procmgr's (procmgr-badged) endpoint so it lands
         // on the privileged DELEGATE_ASPACE tier. procmgr keeps `child_aspace`.
-        if let Ok(as_copy) = syscall::cap_derive(child_aspace, syscall::RIGHTS_ALL)
+        // Mask out CONTROL: memmgr only maps pages into the AS; the authority
+        // to register terminal-fault death observers stays with procmgr (the
+        // creator), which holds the CONTROL-bearing `child_aspace`.
+        if let Ok(as_copy) =
+            syscall::cap_derive(child_aspace, syscall::RIGHTS_ALL & !syscall::RIGHTS_CONTROL)
         {
             let msg = IpcMessage::builder(memmgr_labels::DELEGATE_ASPACE)
                 .word(0, memmgr_badge)
@@ -1439,6 +1464,9 @@ fn create_process_from_bytes(
         process_badge,
         universals.demand_paged,
         universals.self_memmgr_ep,
+        // Boot-module spawns (CREATE_PROCESS) have no parent death queue to
+        // relay terminal faults to; only CREATE_FROM_FILE carries a relay.
+        0,
         ipc_buf,
     )
 }
@@ -1978,6 +2006,7 @@ pub fn create_process_from_file(
     env: &ChildEnv<'_>,
     death_eq: u32,
     demand_paged: bool,
+    parent_relay_cap: u32,
 ) -> Result<CreateResult, u64>
 {
     let self_aspace = ctx.self_aspace;
@@ -2267,6 +2296,7 @@ pub fn create_process_from_file(
         process_badge,
         universals.demand_paged,
         universals.self_memmgr_ep,
+        parent_relay_cap,
         ipc_buf,
     )
     .ok_or(procmgr_errors::OUT_OF_MEMORY);

@@ -353,9 +353,38 @@ impl Command {
             0
         };
 
+        // Create the per-child death `EventQueue` BEFORE issuing
+        // CREATE_FROM_FILE so a POST-only copy can ride along as the
+        // death-relay cap. procmgr binds that copy as an address-space death
+        // observer on the child, so a terminal fault in *any* of the child's
+        // threads (not just the main thread) posts the fault class to this
+        // queue and `wait()` returns.
+        let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+        let death_eq = crate::sys::alloc::seraph::object_slab_acquire(88)
+            .and_then(|slab| syscall::event_queue_create(slab, 4).ok())
+            .ok_or_else(|| {
+                // The child does not exist yet; just drop the file cap we
+                // would otherwise transfer to procmgr.
+                let _ = syscall::cap_delete(file_cap);
+                io::Error::other("event_queue_create for child failed")
+            })?;
+
+        // Derive a POST-only copy of the death queue to hand to procmgr.
+        // `ipc_call` MOVES it into procmgr's CSpace, so the spawner keeps
+        // `RECV` on `death_eq` for its own drain/bridge.
+        let death_relay = match syscall::cap_derive(death_eq, syscall::RIGHTS_POST) {
+            Ok(slot) => slot,
+            Err(_) => {
+                let _ = syscall::cap_delete(death_eq);
+                let _ = syscall::cap_delete(file_cap);
+                return Err(io::Error::other("cap_derive death-relay POST failed"));
+            }
+        };
+
         // CREATE_FROM_FILE wire: word 0 = file_size, words 1.. = argv,
-        // env header, env. Caps: [file_cap, creator_endpoint?]. Command-
-        // spawned children skip the creator endpoint slot.
+        // env header, env. Caps: [file_cap, death_relay]. Command-spawned
+        // children skip the creator endpoint slot; the death relay is the
+        // trailing cap (flagged by `CREATE_DEATH_RELAY`).
         let argv_word_offset: usize = 1;
         let env_len_word_offset = argv_word_offset + argv_words;
         let env_blob_word_offset = env_len_word_offset + 1;
@@ -367,6 +396,7 @@ impl Command {
         };
         let builder = ipc::IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE
             | demand_paged_flag
+            | procmgr_labels::CREATE_DEATH_RELAY
             | ((args_blob.len() as u64) << 32)
             | ((u64::from(args_count)) << 48)
             | ((u64::from(env_count)) << 56))
@@ -384,20 +414,28 @@ impl Command {
         } else {
             builder
         };
+        // Death relay is the trailing cap (peeled off the tail procmgr-side).
+        let builder = builder.cap(death_relay);
         let total_words = 1 + argv_words + env_header_words;
         let msg = builder.word_count(total_words).build();
 
         // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page for
-        // this thread, installed at `_start` time. file_cap ownership
-        // transfers to procmgr via the IPC; procmgr cap_deletes it.
+        // this thread, installed at `_start` time. file_cap and death_relay
+        // ownership transfer to procmgr via the IPC; procmgr cap_deletes the
+        // file cap and binds-then-deletes the relay.
         let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) }
-            .map_err(|_| io::Error::other("CREATE_FROM_FILE syscall failed"))?;
+            .map_err(|_| {
+                let _ = syscall::cap_delete(death_eq);
+                io::Error::other("CREATE_FROM_FILE syscall failed")
+            })?;
         if reply.label != procmgr_errors::SUCCESS {
+            let _ = syscall::cap_delete(death_eq);
             return Err(map_procmgr_error(reply.label));
         }
 
         let reply_caps = reply.caps();
         if reply_caps.len() < 2 {
+            let _ = syscall::cap_delete(death_eq);
             return Err(io::Error::other(
                 "CREATE_FROM_FILE reply missing process_handle or thread cap",
             ));
@@ -405,25 +443,11 @@ impl Command {
         let process_handle = reply_caps[0];
         let thread_cap = reply_caps[1];
 
-        // Bind an `EventQueue` to the child's main thread BEFORE start, so a
-        // short-lived child cannot exit before the binding lands and leave
-        // `wait()` blocked forever.
-        let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
-        let death_eq = match crate::sys::alloc::seraph::object_slab_acquire(88)
-            .and_then(|slab| syscall::event_queue_create(slab, 4).ok())
-        {
-            Some(eq) => eq,
-            None => {
-                let _ = syscall::cap_delete(thread_cap);
-                // SAFETY: `ipc_ptr` is the kernel-registered IPC buffer page.
-                let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_ptr) };
-                let _ = syscall::cap_delete(process_handle);
-                return Err(io::Error::other("event_queue_create for child failed"));
-            }
-        };
-        // Correlator 0: the spawner uses a dedicated per-child EventQueue,
-        // so routing is trivial (one thread per queue) and the payload
-        // stays equal to `exit_reason`.
+        // Bind the death `EventQueue` to the child's main thread BEFORE start,
+        // so a short-lived child cannot exit before the binding lands and
+        // leave `wait()` blocked forever. Correlator 0: the spawner uses a
+        // dedicated per-child EventQueue, so routing is trivial (one thread
+        // per queue) and the payload stays equal to `exit_reason`.
         if syscall::thread_bind_notification(thread_cap, death_eq, 0).is_err() {
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(thread_cap);

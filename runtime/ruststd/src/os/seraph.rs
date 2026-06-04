@@ -781,6 +781,103 @@ pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
     Ok(range)
 }
 
+/// A guarded demand-paged thread stack: a reserved VA window whose upper
+/// `usable_pages` are registered RW-demand and whose lowest `guard_pages` are
+/// reserved but left unregistered. Because the stack grows down, an overflow
+/// past the usable region faults in the guard hole; the pager declines the
+/// unregistered address and the kernel kills the thread (and, via the
+/// address-space death-observer, the whole process) instead of letting the
+/// stack silently grow into adjacent memory.
+pub(crate) struct GuardedStack {
+    /// The whole reservation (guard + usable), released on teardown.
+    range: ReservedRange,
+    /// Base of the usable (registered) region — `range.va_start +
+    /// guard_pages * PAGE_SIZE`.
+    usable_base: u64,
+    usable_pages: u64,
+}
+
+impl GuardedStack {
+    /// Top of the usable region — the initial stack pointer (the stack grows
+    /// down from here toward the guard page).
+    pub(crate) fn usable_top(&self) -> u64 {
+        self.usable_base + self.usable_pages * syscall_abi::PAGE_SIZE
+    }
+}
+
+/// Reserve a guarded demand-paged stack: `guard_pages` unregistered pages below
+/// `usable_pages` of RW demand-paged stack. The process must be demand-paged
+/// (`CREATE_DEMAND_PAGED`). On any failure the reservation is released.
+///
+/// Composes [`register_demand_paged`]'s steps but registers only the upper
+/// `usable_pages`, leaving the guard hole below to fault fatally. Pairs with
+/// [`unregister_guarded_stack`].
+pub(crate) fn reserve_guarded_stack(
+    usable_pages: u64,
+    guard_pages: u64,
+) -> crate::io::Result<GuardedStack> {
+    let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return Err(crate::io::Error::other("seraph: IPC buffer not registered"));
+    }
+    let info = startup_info();
+    let memmgr_ep = info.memmgr_endpoint;
+    if memmgr_ep == 0 {
+        return Err(crate::io::Error::other("seraph: no pager (memmgr unreachable)"));
+    }
+    let total = guard_pages
+        .checked_add(usable_pages)
+        .filter(|&t| t != 0 && usable_pages != 0)
+        .ok_or_else(|| crate::io::Error::other("seraph: invalid stack geometry"))?;
+    let range = reserve_pages(total)
+        .map_err(|_| crate::io::Error::other("seraph: VA reservation failed"))?;
+    let usable_base = range.va_start() + guard_pages * syscall_abi::PAGE_SIZE;
+    // Fund this address space's page-table growth budget for the usable region
+    // only — the guard page is never backed.
+    if !fund_aspace_pt_budget(info.self_aspace, usable_pages) {
+        unreserve_pages(range);
+        return Err(crate::io::Error::other("seraph: page-table budget funding failed"));
+    }
+    let usable_len = usable_pages.saturating_mul(syscall_abi::PAGE_SIZE);
+    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_REGION)
+        .word(0, usable_base)
+        .word(1, usable_len)
+        .word(2, syscall_abi::MAP_WRITABLE)
+        .build();
+    // SAFETY: current_ipc_buf returns the registered IPC buffer page.
+    let accepted = matches!(
+        unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) },
+        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
+    );
+    if !accepted {
+        unreserve_pages(range);
+        return Err(crate::io::Error::other("seraph: REGISTER_REGION rejected"));
+    }
+    Ok(GuardedStack {
+        range,
+        usable_base,
+        usable_pages,
+    })
+}
+
+/// Tear down a guarded stack: UNREGISTER_REGION the usable region (memmgr unmaps
+/// every frame it backed and returns them to the pool), then release the VA.
+/// Call only once the thread has left user-mode — its stack is no longer in use.
+pub(crate) fn unregister_guarded_stack(stack: GuardedStack) {
+    let ipc_buf = current_ipc_buf();
+    let memmgr_ep = startup_info().memmgr_endpoint;
+    if !ipc_buf.is_null() && memmgr_ep != 0 {
+        let usable_len = stack.usable_pages.saturating_mul(syscall_abi::PAGE_SIZE);
+        let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::UNREGISTER_REGION)
+            .word(0, stack.usable_base)
+            .word(1, usable_len)
+            .build();
+        // SAFETY: current_ipc_buf returns the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
+    }
+    unreserve_pages(stack.range);
+}
+
 // ── System log macro surface ────────────────────────────────────────────────
 //
 // The badged SEND cap procmgr seeds at process create-time (recorded in

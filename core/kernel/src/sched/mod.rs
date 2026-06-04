@@ -2499,6 +2499,63 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
     }
 }
 
+/// Post a terminal-fault notification to an address space's death observers.
+///
+/// Mirrors [`post_death_notification`] but iterates the per-address-space
+/// observer set bound by `SYS_ASPACE_BIND_NOTIFICATION`. Walks the observers
+/// and posts `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to each
+/// registered `EventQueue`; any post that wakes a blocked receiver enqueues it
+/// on the local run queue. The kernel only notifies here — it does not
+/// enumerate or terminate the address space's threads.
+///
+/// # Safety
+/// `as_ptr` may be null (no-op) or a valid `AddressSpace` pointer. Must be
+/// called from the terminal-fault path after the faulting thread has been
+/// marked `Exited`.
+#[cfg(not(test))]
+pub unsafe fn post_aspace_death_notification(
+    as_ptr: *mut crate::mm::address_space::AddressSpace,
+    exit_reason: u64,
+)
+{
+    if as_ptr.is_null()
+    {
+        return;
+    }
+
+    // SAFETY: as_ptr validated non-null; the fault path holds it exclusively
+    // for the duration of this read.
+    let aspace = unsafe { &*as_ptr };
+    let (observers, count) = aspace.death_observers();
+    if count == 0
+    {
+        return;
+    }
+
+    let exit_bits = exit_reason & 0xFFFF_FFFF;
+    let cpu = crate::arch::current::cpu::current_cpu() as usize;
+
+    for observer in &observers[..count]
+    {
+        if observer.eq.is_null()
+        {
+            continue;
+        }
+        let payload = (u64::from(observer.correlator) << 32) | exit_bits;
+
+        // SAFETY: observer.eq is a valid EventQueueState pointer stored by
+        // SYS_ASPACE_BIND_NOTIFICATION; event_queue_post acquires its own lock.
+        let result = unsafe { crate::ipc::event_queue::event_queue_post(observer.eq, payload) };
+        if let Ok(Some(woken_tcb)) = result
+        {
+            // SAFETY: cpu is valid; woken_tcb is valid and Ready.
+            unsafe {
+                enqueue_and_wake(woken_tcb, cpu);
+            }
+        }
+    }
+}
+
 // ── Timer tick ───────────────────────────────────────────────────────────────
 
 /// Timer interrupt handler: decrement current thread's time slice.

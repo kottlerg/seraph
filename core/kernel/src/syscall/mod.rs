@@ -33,13 +33,13 @@ use syscall::SyscallError;
 
 #[cfg(not(test))]
 use syscall::{
-    SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
-    SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
-    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST,
-    SYS_EVENT_RECV, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL,
-    SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP,
-    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
+    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
+    SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
+    SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
+    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
+    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
+    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
     SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
     SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
     SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
@@ -125,6 +125,7 @@ pub unsafe fn dispatch(tf: *mut TrapFrame)
         SYS_SBI_CALL => sbi::sys_sbi_call(tf),
         SYS_THREAD_SLEEP => sys_thread_sleep(tf),
         SYS_THREAD_BIND_NOTIFICATION => sys_thread_bind_notification(tf),
+        SYS_ASPACE_BIND_NOTIFICATION => sys_aspace_bind_notification(tf),
         SYS_CAP_DERIVE_BADGE => cap::sys_cap_derive_badge(tf),
         SYS_CAP_INFO => cap::sys_cap_info(tf),
         _ => Err(SyscallError::UnknownSyscall),
@@ -340,6 +341,95 @@ fn sys_thread_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         };
         (*target_tcb).death_observer_count = (count + 1) as u8;
     }
+
+    Ok(0)
+}
+
+/// `SYS_ASPACE_BIND_NOTIFICATION` (53): bind a terminal-fault death observer
+/// to an address space.
+///
+/// arg0 = `AddressSpace` cap slot index (`CONTROL` right required).
+/// arg1 = `EventQueue` cap slot index (`POST` right required).
+/// arg2 = caller-chosen `correlator` (opaque routing tag).
+///
+/// On a terminal fault by any thread in the address space (no handler bound,
+/// or handler replied `KILL`), the kernel posts the fault class to each bound
+/// observer. The kernel only notifies; it never enumerates or terminates
+/// threads, and normal `thread_exit` does NOT fire these observers. Returns
+/// `OutOfMemory` if the per-address-space observer array is full.
+#[cfg(not(test))]
+#[allow(clippy::cast_possible_truncation)]
+fn sys_aspace_bind_notification(tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::slot::{CapTag, Rights};
+
+    let aspace_cap_idx = tf.arg(0) as u32;
+    let eq_cap_idx = tf.arg(1) as u32;
+    let correlator = tf.arg(2) as u32;
+
+    // SAFETY: current_tcb valid in syscall context.
+    let caller = unsafe { current_tcb() };
+    if caller.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: caller validated non-null.
+    let cspace = unsafe { (*caller).cspace };
+
+    // Look up the AddressSpace cap (CONTROL right required).
+    // SAFETY: cspace from current thread; lookup_cap validates index, tag, rights.
+    let aspace_slot = unsafe {
+        lookup_cap(
+            cspace,
+            aspace_cap_idx,
+            CapTag::AddressSpace,
+            Rights::CONTROL,
+        )
+    }?;
+
+    // Extract the inner AddressSpace from the AddressSpace cap.
+    // SAFETY: slot validated as AddressSpace cap; header at offset 0.
+    let aspace_obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // cast_ptr_alignment: AddressSpaceObject (8-byte) stored behind the 4-byte
+    // KernelObjectHeader; Box<AddressSpaceObject> guarantees 8-byte alignment.
+    // SAFETY: tag confirmed AddressSpace; pointer is valid AddressSpaceObject.
+    #[allow(clippy::cast_ptr_alignment)]
+    let as_ptr = unsafe {
+        (*aspace_obj
+            .as_ptr()
+            .cast::<crate::cap::object::AddressSpaceObject>())
+        .address_space
+    };
+    if as_ptr.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    // Look up the EventQueue cap (POST right required).
+    // SAFETY: cspace from current thread; lookup_cap validates.
+    let eq_slot = unsafe { lookup_cap(cspace, eq_cap_idx, CapTag::EventQueue, Rights::POST) }?;
+
+    let eq_obj = eq_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // cast_ptr_alignment: header at offset 0 of EventQueueObject; allocator guarantees alignment.
+    // SAFETY: tag confirmed EventQueue; pointer is valid EventQueueObject.
+    #[allow(clippy::cast_ptr_alignment)]
+    let eq_state = unsafe {
+        (*eq_obj
+            .as_ptr()
+            .cast::<crate::cap::object::EventQueueObject>())
+        .state
+    };
+
+    // Append the observer. Like the per-TCB bind, `death_observer_count` is
+    // mutated only here; the terminal-fault read path runs under the same
+    // syscall/fault serialization, so no intrinsic lock is added.
+    //
+    // SAFETY: as_ptr is a valid AddressSpace from a validated AddressSpace cap;
+    // the syscall context serializes this append against the fault-path read.
+    let aspace = unsafe { &mut *as_ptr };
+    aspace
+        .bind_death_observer(eq_state, correlator)
+        .map_err(|()| SyscallError::OutOfMemory)?;
 
     Ok(0)
 }

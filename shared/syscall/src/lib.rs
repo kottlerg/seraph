@@ -39,19 +39,19 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
-    MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
-    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
-    SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
-    SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
-    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
-    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_REGISTER, SYS_IRQ_SPLIT,
-    SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
-    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT,
+    MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_QUERY,
+    SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT,
+    SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD,
+    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
+    SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_IOPORT_BIND,
+    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
+    SYS_IRQ_REGISTER, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
+    SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
+    SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT,
 };
 
 pub use syscall_abi::{
@@ -2063,6 +2063,49 @@ pub fn thread_bind_notification(
         syscall3(
             SYS_THREAD_BIND_NOTIFICATION,
             u64::from(thread_cap),
+            u64::from(event_queue_cap),
+            u64::from(correlator),
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Register a terminal-fault death-notification observer on an address space.
+///
+/// When a thread in the target address space takes a *terminal* fault — no
+/// fault handler bound, or the handler replies `KILL` — the kernel posts
+/// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` to
+/// `event_queue_cap`, where `exit_reason` is the fault class
+/// (`EXIT_FAULT_BASE + vector`). Normal `thread_exit` does NOT post to these
+/// observers. Passing `correlator = 0` keeps the payload equal to the bare
+/// fault class (low 32 bits).
+///
+/// `aspace_cap` requires the `CONTROL` right; `event_queue_cap` requires the
+/// `POST` right. Multiple observers can be registered — up to the kernel's
+/// per-address-space cap. The kernel only notifies; it never enumerates or
+/// terminates threads.
+///
+/// `correlator` is opaque to the kernel. Its meaning is scoped to one
+/// `(event queue, binder)` pair — not a system-wide identifier, not a
+/// process id. Typical use: procmgr stashes its `ProcessTable` badge so the
+/// terminal-fault event routes into its teardown bookkeeping.
+///
+/// # Errors
+/// Returns a negative `i64` error code if either cap is invalid or the
+/// address space's observer array is full.
+#[inline]
+pub fn aspace_bind_notification(
+    aspace_cap: u32,
+    event_queue_cap: u32,
+    correlator: u32,
+) -> Result<(), i64>
+{
+    // SAFETY: syscall3 issues raw syscall instruction; cap indices and
+    // correlator are plain scalar values.
+    let ret = unsafe {
+        syscall3(
+            SYS_ASPACE_BIND_NOTIFICATION,
+            u64::from(aspace_cap),
             u64::from(event_queue_cap),
             u64::from(correlator),
         )

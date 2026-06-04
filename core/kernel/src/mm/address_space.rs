@@ -123,6 +123,23 @@ pub struct AddressSpace
     /// unmaps it missed while it was elsewhere.
     #[allow(dead_code)] // see `tag`
     pub(crate) tlb_gen: AtomicU64,
+    /// Observers to notify when a thread in this address space takes a
+    /// *terminal* fault (no handler bound, or handler replied `KILL`).
+    ///
+    /// Mirrors the per-thread `ThreadControlBlock::death_observers` set: each
+    /// observer pairs an `EventQueueState` post target with a caller-chosen
+    /// `correlator`, and the kernel posts the packed payload
+    /// `(correlator as u64) << 32 | (exit_reason & 0xFFFF_FFFF)` on a terminal
+    /// fault. procmgr binds one at process creation so a worker thread's fatal
+    /// fault drives the process teardown cascade; the kernel only *notifies*,
+    /// it never enumerates or terminates threads. Normal `thread_exit` does
+    /// NOT post to these observers. Entries past `death_observer_count` are
+    /// invalid.
+    death_observers:
+        [crate::sched::thread::DeathObserver; crate::sched::thread::MAX_DEATH_OBSERVERS],
+    /// Number of populated entries in `death_observers`
+    /// (`0..=MAX_DEATH_OBSERVERS`).
+    death_observer_count: u8,
 }
 
 // SAFETY: All mutable state is protected by pt_lock (page tables) or atomic
@@ -293,6 +310,9 @@ impl AddressSpace
             tag: AtomicU16::new(0),
             tag_gen: AtomicU64::new(0),
             tlb_gen: AtomicU64::new(0),
+            death_observers: [crate::sched::thread::DeathObserver::empty();
+                crate::sched::thread::MAX_DEATH_OBSERVERS],
+            death_observer_count: 0,
         }
     }
 
@@ -334,6 +354,9 @@ impl AddressSpace
             tag: AtomicU16::new(0),
             tag_gen: AtomicU64::new(0),
             tlb_gen: AtomicU64::new(0),
+            death_observers: [crate::sched::thread::DeathObserver::empty();
+                crate::sched::thread::MAX_DEATH_OBSERVERS],
+            death_observer_count: 0,
         }
     }
 
@@ -361,6 +384,41 @@ impl AddressSpace
         unsafe {
             core::ptr::copy_nonoverlapping(src, dst, 256);
         }
+    }
+
+    /// Append a terminal-fault death observer to this address space.
+    ///
+    /// Mirrors `sys_thread_bind_notification`'s append onto a TCB. Returns
+    /// `Err(())` if `death_observers` is already full
+    /// (`MAX_DEATH_OBSERVERS`). The caller must serialize binds against the
+    /// terminal-fault read path the same way the per-TCB observer set is
+    /// serialized: `death_observer_count` is mutated only here, and the
+    /// fault-path reader ([`crate::sched::post_aspace_death_notification`])
+    /// reads it from the syscall/fault context that already serializes the
+    /// observer arrays — so no intrinsic lock is added here.
+    #[cfg(not(test))]
+    pub fn bind_death_observer(
+        &mut self,
+        eq: *mut crate::ipc::event_queue::EventQueueState,
+        correlator: u32,
+    ) -> Result<(), ()>
+    {
+        let count = self.death_observer_count as usize;
+        if count >= crate::sched::thread::MAX_DEATH_OBSERVERS
+        {
+            return Err(());
+        }
+        self.death_observers[count] = crate::sched::thread::DeathObserver { eq, correlator };
+        self.death_observer_count = (count + 1) as u8;
+        Ok(())
+    }
+
+    /// Return the populated death-observer slots for the terminal-fault post
+    /// path: the full backing array plus the count of valid leading entries.
+    #[cfg(not(test))]
+    pub fn death_observers(&self) -> (&[crate::sched::thread::DeathObserver], usize)
+    {
+        (&self.death_observers, self.death_observer_count as usize)
     }
 
     /// Map `virt` → `phys` as a 4 KiB page with the given permission flags.

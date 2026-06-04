@@ -344,6 +344,8 @@ pub const SYS_MEMORY_MERGE: u64 = 50;
 pub const SYS_IOPORT_SPLIT: u64 = 51;
 /// Split a `SchedControl` cap into two children covering disjoint priority bands.
 pub const SYS_SCHED_SPLIT: u64 = 52;
+/// Bind a death notification `EventQueue` to an address space (terminal fault).
+pub const SYS_ASPACE_BIND_NOTIFICATION: u64 = 53;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 

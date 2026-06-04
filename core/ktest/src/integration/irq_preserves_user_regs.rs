@@ -19,7 +19,8 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use syscall::{cap_delete, thread_exit, thread_sleep};
+use syscall::{cap_delete, system_info, thread_exit, thread_sleep};
+use syscall_abi::SystemInfoType;
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
@@ -27,10 +28,20 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// preempting sibling that leaves its own value in a register is detected.
 static PATTERN: [u64; 2] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888];
 
-/// Iterations each spinner runs. Sized so the round-robin timer fires many times
-/// across the loop; the per-iteration check means a single corrupting preemption
-/// is caught, so the exact count is not load-bearing for correctness.
-const SPIN_ITERS: u64 = 4_000_000;
+/// Iterations per asm chunk. Sized so a chunk spans well under a timer period on
+/// fast emulators yet keeps syscall overhead negligible; the spinner runs chunks
+/// until the time budget elapses, so this is not the loop bound.
+const CHUNK_ITERS: u64 = 200_000;
+
+/// Guest-time each spinner runs, in microseconds. Bounding by elapsed time (not a
+/// host-speed-dependent iteration count) guarantees the spin spans many timer
+/// periods, so the two same-CPU spinners are repeatedly preempted and interleaved
+/// — otherwise a fast host could run the whole spin inside one quantum and never
+/// exercise the IRQ frame path.
+const TIME_BUDGET_US: u64 = 100_000; // 100 ms
+
+/// Backstop chunk cap so the loop terminates even if `ElapsedUs` never advances.
+const MAX_CHUNKS: u64 = 5_000;
 
 /// Set non-zero by any spinner that observes a corrupted callee-saved register.
 static MISMATCHES: AtomicU64 = AtomicU64::new(0);
@@ -38,14 +49,24 @@ static MISMATCHES: AtomicU64 = AtomicU64::new(0);
 /// Incremented by each spinner as it exits its loop. The parent waits for 2.
 static DONE: AtomicU32 = AtomicU32::new(0);
 
+/// Per-spinner chunk progress, published between asm chunks. A spinner that
+/// observes the sibling's value advance while it was itself running proves the
+/// two were time-sliced on the one CPU — i.e. a timer preemption occurred, so
+/// the frame save/restore path was actually exercised (not a no-op pass).
+static PROGRESS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Set to 1 by a spinner that observed the sibling advancing mid-run. If it
+/// stays 0, no preemption interleaved the spinners and the test exercised
+/// nothing — a hard failure, not a silent pass.
+static PREEMPT_OBSERVED: AtomicU32 = AtomicU32::new(0);
+
 static mut STACK0: ChildStack = ChildStack::ZERO;
 static mut STACK1: ChildStack = ChildStack::ZERO;
 
 #[cfg(target_arch = "x86_64")]
-fn spin_check(pat_ptr: *const u64) -> u64
+fn spin_check(pat_ptr: *const u64, iters: u64) -> u64
 {
     let mut mism: u64 = 0;
-    let iters: u64 = SPIN_ITERS;
     // SAFETY: loads the sentinel at `pat_ptr` into r12..r15, then re-checks each
     // against the (stable, in-memory) sentinel every iteration. r12..r15 are
     // callee-saved; a timer preemption that mishandles the entry frame would
@@ -87,10 +108,9 @@ fn spin_check(pat_ptr: *const u64) -> u64
 }
 
 #[cfg(target_arch = "riscv64")]
-fn spin_check(pat_ptr: *const u64) -> u64
+fn spin_check(pat_ptr: *const u64, iters: u64) -> u64
 {
     let mut mism: u64 = 0;
-    let iters: u64 = SPIN_ITERS;
     // SAFETY: loads the sentinel at `pat_ptr` into s2..s5 (callee-saved), then
     // re-checks each against the in-memory sentinel every iteration via t0; t1
     // is the store scratch for the mismatch flag. See the x86-64 sibling.
@@ -131,11 +151,32 @@ fn spin_check(pat_ptr: *const u64) -> u64
 fn spinner_entry(id: u64) -> !
 {
     let idx = usize::from(id & 1 != 0);
+    let other = idx ^ 1;
     // PATTERN is a read-only static; the index is 0 or 1.
     let pat_ptr = core::ptr::addr_of!(PATTERN[idx]);
-    if spin_check(pat_ptr) != 0
+    let start_us = system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0);
+    let mut c: u64 = 0;
+    while c < MAX_CHUNKS
     {
-        MISMATCHES.fetch_add(1, Ordering::AcqRel);
+        let sibling_before = PROGRESS[other].load(Ordering::Acquire);
+        if spin_check(pat_ptr, CHUNK_ITERS) != 0
+        {
+            MISMATCHES.fetch_add(1, Ordering::AcqRel);
+            break;
+        }
+        c += 1;
+        PROGRESS[idx].store(c, Ordering::Release);
+        // The sibling advanced a chunk while this thread held the CPU ⇒ the timer
+        // time-sliced them on the one CPU ⇒ the ring-3 IRQ frame path ran.
+        if PROGRESS[other].load(Ordering::Acquire) != sibling_before
+        {
+            PREEMPT_OBSERVED.store(1, Ordering::Release);
+        }
+        let now = system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(u64::MAX);
+        if now.saturating_sub(start_us) >= TIME_BUDGET_US
+        {
+            break;
+        }
     }
     DONE.fetch_add(1, Ordering::AcqRel);
     thread_exit();
@@ -145,6 +186,9 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     MISMATCHES.store(0, Ordering::Release);
     DONE.store(0, Ordering::Release);
+    PREEMPT_OBSERVED.store(0, Ordering::Release);
+    PROGRESS[0].store(0, Ordering::Release);
+    PROGRESS[1].store(0, Ordering::Release);
 
     let child0 =
         spawn::new_child(ctx).map_err(|_| "irq_preserves_user_regs: spawn::new_child(0) failed")?;
@@ -172,6 +216,7 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let done = DONE.load(Ordering::Acquire);
     let mismatches = MISMATCHES.load(Ordering::Acquire);
+    let preempted = PREEMPT_OBSERVED.load(Ordering::Acquire);
 
     cap_delete(child0.th).map_err(|_| "irq_preserves_user_regs: cap_delete child0.th failed")?;
     cap_delete(child0.cs).map_err(|_| "irq_preserves_user_regs: cap_delete child0.cs failed")?;
@@ -189,6 +234,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     if mismatches != 0
     {
         return Err("callee-saved register corrupted across timer preemption");
+    }
+    // Guard against a vacuous pass: if the timer never preempted, the spinners
+    // ran sequentially and the frame path was never exercised.
+    if preempted == 0
+    {
+        return Err("irq_preserves_user_regs: no timer preemption observed — test was vacuous");
     }
     Ok(())
 }

@@ -13,7 +13,7 @@
 //!
 //! Every ring-3 entry at which a thread can be stopped (exception, `#PF`, NMI,
 //! and ring-3 IRQ) builds the one canonical [`TrapFrame`] on the kernel stack via
-//! [`tf_build_asm`]/[`tf_resume_asm`]; the fault redirect points `tcb->trap_frame`
+//! `tf_build_asm`/`tf_resume_asm`; the fault redirect points `tcb->trap_frame`
 //! at that live frame with no copy. See the "Unified entry frame" section.
 //!
 //! # Exception vector groups
@@ -188,7 +188,7 @@ macro_rules! tf_build_asm {
 
 /// Naked-asm fragment: write the (possibly handler-edited) `TrapFrame`
 /// CPU-state back into the stub frame, restore all GPRs from the frame, drop the
-/// frame + stub prologue, and `iretq`. Inverse of [`tf_build_asm`]; rsp on entry
+/// frame + stub prologue, and `iretq`. Inverse of `tf_build_asm`; rsp on entry
 /// = `TrapFrame` base, on exit (`iretq`) the stub frame's hardware iret words are
 /// at the top of stack. `rax` is the copy scratch, then restored from the frame.
 #[cfg(not(test))]
@@ -556,11 +556,11 @@ macro_rules! isr_stub {
     };
 }
 
-/// Common trampoline: builds the canonical [`TrapFrame`] ([`tf_build_asm`]),
+/// Common trampoline: builds the canonical [`TrapFrame`] (`tf_build_asm`),
 /// calls [`exception_handler`] with the frame pointer + trap metadata, then —
 /// reached only when a userspace exception was redirected to a bound fault
 /// handler that resolved it — writes back the (possibly handler-edited) register
-/// state and `iretq`s ([`tf_resume_asm`]), re-executing the faulting instruction
+/// state and `iretq`s (`tf_resume_asm`), re-executing the faulting instruction
 /// (or continuing from a handler-modified PC). Every terminal fault (no/declined
 /// handler, or any kernel exception) diverges inside [`exception_handler`] →
 /// `common_exception_handler`, so the resume tail is dead for those.
@@ -661,9 +661,9 @@ extern "C" fn irq_dispatch(vector: u64)
 /// [`irq_dispatch`]). Branches on the interrupted privilege level (saved CS RPL):
 ///
 /// - **Ring-3 origin** (a user thread was preempted): builds the canonical
-///   [`TrapFrame`] ([`tf_build_asm`]) so a complete, live user register snapshot
+///   [`TrapFrame`] (`tf_build_asm`) so a complete, live user register snapshot
 ///   exists on the kernel stack (the invariant a userspace debugger consumes —
-///   see #233), dispatches, then returns frame-authoritatively ([`tf_resume_asm`]) —
+///   see #233), dispatches, then returns frame-authoritatively (`tf_resume_asm`) —
 ///   all GPRs are restored from the frame, not from the implicit call-chain
 ///   preservation.
 /// - **Ring-0 origin** (the kernel/idle was interrupted): the interrupted context
@@ -931,11 +931,11 @@ extern "C" fn nm_handler()
 
 /// Page-fault (`#PF`, vector 14) stub.
 ///
-/// Builds the canonical [`TrapFrame`] ([`tf_build_asm`]; the hardware already
+/// Builds the canonical [`TrapFrame`] (`tf_build_asm`; the hardware already
 /// pushed the error code, this stub pushes the vector), calls
 /// [`page_fault_handler`], then — reached only when the fault was a resolved
 /// spurious stale-TLB fault — writes back the unmodified register state and
-/// `iretq`s ([`tf_resume_asm`]), re-executing the faulting instruction. For every
+/// `iretq`s (`tf_resume_asm`), re-executing the faulting instruction. For every
 /// genuine fault the handler diverges (`common_exception_handler` never returns)
 /// and the resume tail is dead.
 #[cfg(not(test))]
@@ -1145,7 +1145,7 @@ fn normalize_x86_exception(vector: u64) -> u64
 /// (and thus the frame) is preserved across the block: the context switch saves
 /// and restores the kernel rsp, so the pointer stays valid while the faulter is
 /// descheduled. The handler's `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS`
-/// see and edit the live frame; on resume the trampoline's [`tf_resume_asm`]
+/// see and edit the live frame; on resume the trampoline's `tf_resume_asm`
 /// writes any edits back into the iret frame. Symmetric with
 /// `riscv64/interrupts.rs::redirect_user_fault`.
 ///
@@ -1199,10 +1199,10 @@ unsafe extern "C" fn ipi_tlb_shootdown_stub()
 
 /// NMI backtrace stub (vector 2 with IST=2).
 ///
-/// Builds the canonical [`TrapFrame`] ([`tf_build_asm`]) — unconditionally, since
+/// Builds the canonical [`TrapFrame`] (`tf_build_asm`) — unconditionally, since
 /// an NMI backtraces whatever ran (kernel or user) and the long-mode iret frame is
 /// always present — calls the returning [`ipi_nmi_backtrace_handler`], then writes
-/// back and `iretq`s ([`tf_resume_asm`]). The handler decides at runtime whether
+/// back and `iretq`s (`tf_resume_asm`). The handler decides at runtime whether
 /// the NMI is a watchdog backtrace request (returns normally → iretq fires) or a
 /// real hardware NMI (falls through to `common_exception_handler` which never
 /// returns — the resume tail is unreachable in that case). The two-word

@@ -324,6 +324,20 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::TestsPrograms,
         arch_only: None,
     },
+    Spec {
+        name: "threadstack",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Programs,
+        arch_only: None,
+    },
+    Spec {
+        name: "threadstack-tester",
+        install_name: Some("threadstack"),
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::TestsPrograms,
+        arch_only: None,
+    },
 ];
 
 fn spec_for(component: BuildComponent) -> Option<&'static Spec>
@@ -359,6 +373,8 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
         BuildComponent::Demandpaged => "demandpaged",
         BuildComponent::Stdiotest => "stdiotest",
         BuildComponent::StdiotestTester => "stdiotest-tester",
+        BuildComponent::Threadstack => "threadstack",
+        BuildComponent::ThreadstackTester => "threadstack-tester",
     };
     SPECS.iter().find(|s| s.name == name)
 }

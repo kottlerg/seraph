@@ -977,6 +977,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadstack"
+version = "0.1.0"
+
+[[package]]
+name = "threadstack-tester"
+version = "0.1.0"
+
+[[package]]
 name = "timed"
 version = "0.1.0"
 dependencies = [

@@ -120,6 +120,8 @@ pub enum BuildComponent
     Demandpaged,
     Stdiotest,
     StdiotestTester,
+    Threadstack,
+    ThreadstackTester,
     All,
 }
 

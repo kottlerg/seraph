@@ -48,6 +48,8 @@ members = [
     "programs/stackoverflow",
     "programs/stdiotest",
     "programs/stdiotest/tester",
+    "programs/threadstack",
+    "programs/threadstack/tester",
     "xtask",
     "xtask/wrapper-shim",
 ]

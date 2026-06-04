@@ -1194,6 +1194,18 @@ pub fn phase3_svcmgr_handover(
         ipc_buf,
     );
 
+    // Bind procmgr's init-reap death observers on both init threads BEFORE the
+    // svcmgr handover. svcmgr launches real-logd in response to
+    // HANDOVER_COMPLETE, and real-logd's HANDOVER_PULL releases init-logd; if
+    // the observer bind ran after that release it would land on an already
+    // -exited init-logd and silently lose the death — the kernel bind only
+    // appends an observer, it does not fire for a thread that has already
+    // exited — stranding the reap on the liveness backstop. Transferring init's
+    // kernel-object caps here is safe: svcmgr is already created and endowed
+    // (the only consumer of init's own CSpace cap), and the cap handles move
+    // while the underlying objects keep backing init's still-running threads.
+    let reap_bound = register_init_reap_objects(procmgr_ep, info, init_logd_thread_cap, ipc_buf);
+
     let handover_msg = IpcMessage::new(svcmgr_labels::HANDOVER_COMPLETE);
     // SAFETY: ipc_buf is caller's registered IPC buffer.
     match unsafe { ipc::ipc_call(svcmgr_service_ep, &handover_msg, ipc_buf) }
@@ -1202,20 +1214,22 @@ pub fn phase3_svcmgr_handover(
         _ => log("phase 3: handover failed"),
     }
 
-    // Reap-handoff: move init's kernel-object caps + every reclaimable
-    // Memory cap to procmgr. Procmgr binds a death-EQ on both of init's
-    // threads (main + init-logd) and reaps once both have exited — init-logd
-    // outlives this main thread until the svcmgr-launched real-logd pulls
-    // `HANDOVER_PULL`. The reap tears init's AS/CSpace/Threads down and
-    // donates the Memory caps to memmgr's pool.
-    handoff_to_procmgr_reap(
-        info,
-        procmgr_ep,
-        init_logd_thread_cap,
-        ipc_buf,
-        mem_reap_floor,
-        orphan_memory_caps,
-    );
+    // Reap-handoff (donation + arm): stream init's reclaimable Memory caps to
+    // procmgr and notify INIT_TEARDOWN_DONE. The death observers were bound
+    // above; procmgr reaps once both init threads have exited — init-logd when
+    // real-logd pulls the handover, main on the thread_exit below. The Memory
+    // caps land in memmgr's pool at reap. Skipped if the object round failed:
+    // the reap cannot run without it.
+    if reap_bound
+    {
+        finish_init_reap_handoff(
+            info,
+            procmgr_ep,
+            ipc_buf,
+            mem_reap_floor,
+            orphan_memory_caps,
+        );
+    }
 
     log("main thread exiting; init handed off to procmgr for reap");
     syscall::thread_exit();
@@ -1260,26 +1274,27 @@ fn module_spawn_copy(module_memory_cap: u32) -> Option<u32>
     syscall::cap_derive(module_memory_cap, syscall::RIGHTS_ALL).ok()
 }
 
-/// Move init's kernel-object caps + every reclaimable Memory cap to
-/// procmgr via `REGISTER_INIT_TEARDOWN`, then notification
-/// `INIT_TEARDOWN_DONE`. IPC cap-transfer MOVES caps, so after this
-/// returns init's `CSpace` no longer holds the transferred slots.
+/// Round 1 of the reap handoff: transfer init's four kernel-object caps
+/// (aspace, cspace, main thread, init-logd thread) to procmgr, which binds a
+/// death-EQ observer on both threads (`data[0] = 1` distinguishes this from the
+/// later donate-only rounds). IPC cap-transfer MOVES the caps; after this init's
+/// `CSpace` no longer holds those four slots, but its threads keep running in
+/// the underlying objects.
 ///
-/// Failures here are logged but otherwise non-fatal — init still calls
-/// `sys_thread_exit` afterward, just leaving the un-transferred caps
-/// to cascade through `CSpace` teardown to the kernel buddy on eventual
-/// cap death.
-fn handoff_to_procmgr_reap(
-    info: &InitInfo,
+/// MUST run before the svcmgr handover — see the call site. Returns whether the
+/// round succeeded; on failure the caller skips the donation rounds and arming,
+/// since the reap cannot run without the bound observers.
+///
+/// # Safety
+/// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
+/// `SEND|GRANT`.
+fn register_init_reap_objects(
     procmgr_ep: u32,
+    info: &InitInfo,
     init_logd_thread_cap: u32,
     ipc_buf: *mut u64,
-    mem_reap_floor: u32,
-    orphan_memory_caps: &[u32],
-)
+) -> bool
 {
-    // Round 1: kernel-object caps. `data[0] = 1` distinguishes from
-    // subsequent donate-only rounds.
     let round1 = IpcMessage::builder(procmgr_labels::REGISTER_INIT_TEARDOWN)
         .word(0, 1)
         .cap(info.aspace_cap)
@@ -1288,20 +1303,40 @@ fn handoff_to_procmgr_reap(
         .cap(init_logd_thread_cap)
         .build();
     // SAFETY: ipc_buf is init's registered IPC buffer; procmgr_ep carries SEND|GRANT.
-    if let Ok(reply) = unsafe { ipc::ipc_call(procmgr_ep, &round1, ipc_buf) }
+    match unsafe { ipc::ipc_call(procmgr_ep, &round1, ipc_buf) }
     {
-        if reply.label != ipc::procmgr_errors::SUCCESS
+        Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS => true,
+        Ok(_) =>
         {
-            log("reap-handoff: procmgr refused kernel-object round; aborting handoff");
-            return;
+            log("reap-handoff: procmgr refused kernel-object round; skipping reap handoff");
+            false
+        }
+        Err(_) =>
+        {
+            log("reap-handoff: kernel-object round IPC failed; skipping reap handoff");
+            false
         }
     }
-    else
-    {
-        log("reap-handoff: kernel-object round IPC failed; aborting handoff");
-        return;
-    }
+}
 
+/// Donation + arm phase of the reap handoff: stream every reclaimable Memory
+/// cap init solely holds to procmgr, then notify `INIT_TEARDOWN_DONE`. Run after
+/// the svcmgr handover and only when [`register_init_reap_objects`] bound the
+/// death observers. IPC cap-transfer MOVES the donated caps out of init's
+/// `CSpace`.
+///
+/// Failures here are logged but otherwise non-fatal — init still calls
+/// `sys_thread_exit` afterward, just leaving the un-transferred caps
+/// to cascade through `CSpace` teardown to the kernel buddy on eventual
+/// cap death.
+fn finish_init_reap_handoff(
+    info: &InitInfo,
+    procmgr_ep: u32,
+    ipc_buf: *mut u64,
+    mem_reap_floor: u32,
+    orphan_memory_caps: &[u32],
+)
+{
     // Donate every `owns_memory` Memory cap init solely holds, streamed in
     // MSG_CAP_SLOTS_MAX-sized rounds. Three disjoint sources:
     //  - explicit InitInfo ranges (not in the descriptor array): init's ELF

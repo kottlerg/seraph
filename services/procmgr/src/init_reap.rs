@@ -247,30 +247,38 @@ pub fn run_reap(memmgr_ep: u32, ipc_buf: *mut u64)
         {
             return;
         };
-        if !s.armed
-        {
-            return;
-        }
+        // Count the death as soon as it is observed, even before
+        // `INIT_TEARDOWN_DONE` arms the reap. The death-EQ observers are bound
+        // (first round) before the svcmgr handover can release init-logd, so
+        // init-logd's exit may fire while init is still streaming donation
+        // rounds — i.e. pre-arm. Dropping a pre-arm death would strand
+        // `pending_deaths` and force the liveness backstop. Anchor the backstop
+        // from the first death regardless. Only the *execution* of the reap
+        // waits for `armed`: init must finish donating its reclaimable caps,
+        // and `do_reap` consumes the kernel-object caps that round delivers.
         s.pending_deaths = s.pending_deaths.saturating_sub(1);
+        if s.first_death_us == 0
+        {
+            s.first_death_us = elapsed_us();
+        }
         if s.pending_deaths > 0
         {
-            // One init thread exited (the main thread); the other still runs
-            // in init's aspace/cspace. Reclaiming now would fault it — wait.
-            // Anchor the liveness backstop from this instant so a wedged
-            // handover (init-logd never released) cannot block the reap
-            // forever; the common path still reaps on init-logd's own exit
-            // below, well before the deadline.
-            if s.first_death_us == 0
-            {
-                s.first_death_us = elapsed_us();
-            }
             std::os::seraph::log!(
                 "init-reap: an init thread exited; {} still running",
                 s.pending_deaths
             );
             return;
         }
-        guard.take().expect("armed init-reap state present")
+        if !s.armed
+        {
+            // Both threads exited before arming. init's main thread sends
+            // `INIT_TEARDOWN_DONE` before its own `thread_exit`, so main's death
+            // is always post-arm and this branch is unreachable in well-formed
+            // teardown; leave the reap for the arming path / backstop rather
+            // than reaping before init has finished donating.
+            return;
+        }
+        guard.take().expect("init-reap state present")
     };
 
     do_reap(state, memmgr_ep, ipc_buf);

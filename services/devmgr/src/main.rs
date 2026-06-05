@@ -1179,6 +1179,14 @@ fn spawn_virtio_blk(
     catalog: &mut DeviceCatalog,
 ) -> bool
 {
+    // Guard the boot module across every retained exit — no virtio device, no
+    // module delivered, or a catalog-serialisation failure — until it is handed
+    // to `spawn_driver`. A retained module cap is a live derivation child of
+    // init's donated pool-run source and pins that run unsplittable. Disarmed
+    // immediately before the spawn, which then owns the cap's lifecycle.
+    let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
+    let mut module_guard = spawn::ModuleCapGuard::new(module_cap);
+
     for pci_dev in devices
     {
         if !pci::is_virtio_blk(pci_dev)
@@ -1227,8 +1235,6 @@ fn spawn_virtio_blk(
         let bar_info = find_virtio_bar_cap(pci_dev, caps);
         let irq_cap = acquire_single_irq_cap(pci_dev, irq_root);
 
-        let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
-
         let config = spawn::DriverSpawnConfig {
             procmgr_ep: caps.procmgr_ep,
             bootstrap_ep: caps.self_bootstrap_ep,
@@ -1245,19 +1251,13 @@ fn spawn_virtio_blk(
         };
         // `spawn_driver` owns the module cap's lifecycle from here (guarded
         // internally: consumed by CREATE_PROCESS, or released on failure).
+        module_guard.disarm();
         spawn::spawn_driver(&config, ipc_buf);
 
         return true;
     }
 
-    // No virtio block device present: the module was never handed to a spawn,
-    // so it is still a live derivation child of init's donated pool-run source.
-    // Release it so that run stays splittable.
-    let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
-    if module_cap != 0
-    {
-        let _ = syscall::cap_delete(module_cap);
-    }
+    // No virtio block device present: `module_guard` releases the module here.
     false
 }
 

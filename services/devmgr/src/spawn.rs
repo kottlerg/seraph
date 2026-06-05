@@ -26,9 +26,11 @@ use ipc::{IpcMessage, procmgr_labels};
 pub enum CreateSource
 {
     /// Memory cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
-    /// Caller retains the slot on failure to match the existing
-    /// `spawn_simple_device` contract; kernel transfers ownership on
-    /// successful `CREATE_PROCESS`.
+    /// A `CREATE_PROCESS` `ipc_call` transfers the cap to procmgr (which deletes
+    /// it on both success and failure). On any failure BEFORE that transfer,
+    /// [`spawn_simple_device`] deletes the cap on the caller's behalf — a
+    /// retained boot-module cap is a live derivation child of init's donated
+    /// pool-run source and pins that run unsplittable.
     Module(u32),
     /// vfsd file SEND cap (`procmgr_labels::CREATE_FROM_FILE`). `size` is
     /// the file size hint reported by the resolving `NS_LOOKUP`. On any

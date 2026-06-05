@@ -9,6 +9,7 @@
 //! appropriate protection rights, and loading ELF segment pages from memory
 //! into freshly allocated memory caps.
 
+use ipc::procmgr_errors;
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use syscall_abi::PAGE_SIZE;
 
@@ -132,11 +133,94 @@ pub fn derive_memory_for_prot(memory_cap: u32, prot: u64) -> Option<u32>
     }
 }
 
-/// Copy one ELF segment page into a fresh memory cap and map it into the child.
+/// Allocate one fresh memory cap, fill its zeroed scratch page via `fill`, then
+/// derive a `prot`-restricted cap and map it into the child at `page_vaddr`.
 ///
 /// Memory caps are allocated against `child_memmgr_send` so memmgr accounts them
-/// to the child from the moment they leave the pool — `PROCESS_DIED`
-/// reclaims the entire set when the child exits.
+/// to the child from the moment they leave the pool — `PROCESS_DIED` reclaims
+/// the entire set when the child exits.
+///
+/// Every error exit deletes the caps it allocated (the `memory_cap`, plus the
+/// `derived` cap once derivation succeeds). The success path drops the same
+/// transient slots: the mapping owns no cap-refcount on the underlying
+/// `MemoryObject` — memmgr's outer pins the page until `PROCESS_DIED` — so the
+/// slots must be released either way or they accumulate across an unbounded
+/// create/destroy loop.
+///
+/// `fill` receives the writable scratch VA of the zeroed page and writes the
+/// segment bytes in (in-memory slice copy or VFS stream); it is infallible — a
+/// short read leaves the page tail zeroed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_elf_page_into_child(
+    page_vaddr: u64,
+    prot: u64,
+    self_aspace: u32,
+    child_aspace: u32,
+    child_memmgr_send: u32,
+    ipc_buf: *mut u64,
+    fill: impl FnOnce(u64),
+) -> Result<(), u64>
+{
+    let Some(memory_cap) = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
+    else
+    {
+        std::os::seraph::log!(
+            "procmgr: load_elf_page: alloc None vaddr=0x{:x}",
+            page_vaddr
+        );
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    };
+
+    let Some(scratch) = ScratchMapping::map(self_aspace, memory_cap, 1, syscall::MAP_WRITABLE)
+    else
+    {
+        std::os::seraph::log!(
+            "procmgr: load_elf_page: scratch map None vaddr=0x{:x}",
+            page_vaddr
+        );
+        let _ = syscall::cap_delete(memory_cap);
+        return Err(procmgr_errors::MAP_FAILED);
+    };
+    let scratch_va = scratch.va();
+    // SAFETY: scratch_va is mapped writable, one page.
+    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
+
+    fill(scratch_va);
+
+    drop(scratch);
+
+    let Some(derived) = derive_memory_for_prot(memory_cap, prot)
+    else
+    {
+        std::os::seraph::log!(
+            "procmgr: load_elf_page: derive None vaddr=0x{:x} prot=0x{:x}",
+            page_vaddr,
+            prot
+        );
+        let _ = syscall::cap_delete(memory_cap);
+        return Err(procmgr_errors::INSUFFICIENT_RIGHTS);
+    };
+    if let Err(e) = syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0)
+    {
+        std::os::seraph::log!(
+            "procmgr: load_elf_page: mem_map err={} vaddr=0x{:x}",
+            e,
+            page_vaddr
+        );
+        let _ = syscall::cap_delete(derived);
+        let _ = syscall::cap_delete(memory_cap);
+        return Err(procmgr_errors::MAP_FAILED);
+    }
+
+    let _ = syscall::cap_delete(derived);
+    let _ = syscall::cap_delete(memory_cap);
+
+    Ok(())
+}
+
+/// Copy one in-memory ELF segment page into a fresh memory cap and map it into
+/// the child. Thin wrapper over [`load_elf_page_into_child`] supplying the
+/// in-memory slice-copy fill.
 #[allow(clippy::too_many_arguments)]
 pub fn load_elf_page(
     page_vaddr: u64,
@@ -149,27 +233,16 @@ pub fn load_elf_page(
     ipc_buf: *mut u64,
 ) -> Option<()>
 {
-    let memory_cap = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?;
-
-    let scratch = ScratchMapping::map(self_aspace, memory_cap, 1, syscall::MAP_WRITABLE)?;
-    let scratch_va = scratch.va();
-    // SAFETY: scratch_va is mapped writable, one page.
-    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
-
-    copy_segment_data(scratch_va, page_vaddr, seg_vaddr, file_data);
-
-    drop(scratch);
-
-    let derived = derive_memory_for_prot(memory_cap, prot)?;
-    syscall::mem_map(derived, child_aspace, page_vaddr, 0, 1, 0).ok()?;
-
-    // The mapping owns no cap-refcount on the underlying MemoryObject; memmgr's
-    // outer keeps it alive until PROCESS_DIED. Drop procmgr's transient slots
-    // so they don't accumulate across an unbounded create/destroy loop.
-    let _ = syscall::cap_delete(derived);
-    let _ = syscall::cap_delete(memory_cap);
-
-    Some(())
+    load_elf_page_into_child(
+        page_vaddr,
+        prot,
+        self_aspace,
+        child_aspace,
+        child_memmgr_send,
+        ipc_buf,
+        |scratch_va| copy_segment_data(scratch_va, page_vaddr, seg_vaddr, file_data),
+    )
+    .ok()
 }
 
 /// Copy file data for one segment page into the memory cap mapped at `scratch_va`.

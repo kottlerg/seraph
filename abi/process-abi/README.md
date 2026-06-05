@@ -43,7 +43,7 @@ The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 The authoritative field list, with per-field doc comments and exact order, is
 [`src/lib.rs`](src/lib.rs) (`struct ProcessInfo`). This README summarises the
 field groups rather than mirroring every field, so the two cannot drift. As of
-`PROCESS_ABI_VERSION` 18 the groups are:
+`PROCESS_ABI_VERSION` 19 the groups are:
 
 - **Process identity** — `version`, `self_thread_cap`, `self_aspace_cap`,
   `self_cspace_cap`, `sched_control_cap`.
@@ -60,12 +60,13 @@ field groups rather than mirroring every field, so the two cannot drift. As of
 - **Namespace** — `system_root_cap`, `current_dir_cap`.
 - **Logging** — `log_send_cap` (deprecated; migrating to `service_registry_cap`).
 - **Main-thread stack envelope** — `stack_top_vaddr`, `stack_pages`.
-- **Demand-paging pager** (v18, #34) — `pager_endpoint_cap`, `pager_badge`. The
-  `Endpoint` cap + badge of the process's pager (memmgr) when the process is
-  created demand-paged (`procmgr_labels::CREATE_DEMAND_PAGED`); both zero
-  otherwise. procmgr binds the main thread's fault handler to this endpoint at
-  creation, and the runtime inherits it onto every thread it spawns. Consumers
-  must tolerate zero.
+- **Demand-paging pager** (v18, #34; default-on v19, #225) — `pager_endpoint_cap`,
+  `pager_badge`. The `Endpoint` cap + badge of the process's pager (memmgr).
+  Demand paging is the system-wide default, so these are nonzero for ordinary
+  processes and zero only for pinned ones (`procmgr_labels::CREATE_PINNED`, e.g.
+  DMA drivers) and the pre-pager bootstrap. procmgr binds the main thread's fault
+  handler to this endpoint at creation, and the runtime inherits it onto every
+  thread it spawns. Consumers must tolerate zero.
 
 Every cap field names a `CSpace` slot (`0` = absent); `*_vaddr` / size / count
 fields are plain values.

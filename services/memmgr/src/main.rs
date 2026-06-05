@@ -1410,13 +1410,17 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         // allocation, though still owned and accounted).
         pool.coalesce();
 
-        // Drop memmgr's copy of a demand-paged process's delegated address
-        // space, freeing the CSpace slot. The child's own AS is torn down by
-        // procmgr; this only releases memmgr's reference.
-        if record.aspace_cap != 0
-        {
-            let _ = syscall::cap_delete(record.aspace_cap);
-        }
+        // Do NOT delete memmgr's delegated address-space cap here. It is a
+        // `cap_derive` child of the child's AddressSpace cap (procmgr's
+        // `DELEGATE_ASPACE` derivation), so procmgr's `cap_revoke` of that
+        // AddressSpace during child teardown — which runs before this
+        // `PROCESS_DIED` — has already revoked memmgr's copy and freed its
+        // CSpace slot. By this point `record.aspace_cap` is a stale slot index
+        // that memmgr's allocator may have already reused for an unrelated cap
+        // (e.g. a pool-run tail); deleting it would free that unrelated cap and
+        // corrupt the free pool. The delegated copy's teardown is owned by
+        // procmgr's revocation of the parent aspace.
+        record.aspace_cap = 0;
         // Free the slot in place (mark reusable); no by-value move.
         record.badge = 0;
     }

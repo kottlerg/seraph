@@ -735,8 +735,9 @@ pub use pal_reserve::{ReserveError, ReservedRange, reserve_pages, unreserve_page
 ///
 /// The range maps lazily: the first access to each page faults, the pager
 /// backs it read-write, and the access retries transparently. The process
-/// must be demand-paged (created with `procmgr_labels::CREATE_DEMAND_PAGED`);
-/// otherwise the first fault kills the thread.
+/// must be demand-paged — the system default; not created with
+/// `procmgr_labels::CREATE_PINNED` — otherwise the first fault kills the
+/// thread.
 ///
 /// On any failure the reservation is released. On success the caller owns the
 /// range and must `mem_unmap` any backed pages, then `unreserve_pages`, when
@@ -807,7 +808,8 @@ impl GuardedStack {
 
 /// Reserve a guarded demand-paged stack: `guard_pages` unregistered pages below
 /// `usable_pages` of RW demand-paged stack. The process must be demand-paged
-/// (`CREATE_DEMAND_PAGED`). On any failure the reservation is released.
+/// (the system default; not `CREATE_PINNED`). On any failure the reservation is
+/// released.
 ///
 /// Composes [`register_demand_paged`]'s steps but registers only the upper
 /// `usable_pages`, leaving the guard hole below to fault fatally. Pairs with
@@ -1042,14 +1044,16 @@ pub mod process {
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn cwd_dir_cap(&mut self, cap: u32) -> &mut Self;
 
-        /// Create the child as demand-paged: procmgr binds its main thread's
+        /// Create the child *pinned*: eager-mapped, with no system pager.
+        /// By default a child is demand-paged — procmgr binds its main thread's
         /// fault handler to the system pager (memmgr) and delegates the child
         /// address space, and the runtime inherits the pager onto threads the
-        /// child spawns. The child can then back regions lazily via
-        /// [`super::register_demand_paged`]. No effect on infrastructure
-        /// processes. Defaults to off.
+        /// child spawns, so the child can back regions lazily via
+        /// [`super::register_demand_paged`]. Set `pinned(true)` only for a
+        /// child that cannot depend on the fault path — e.g. one doing DMA.
+        /// Defaults to off.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
-        fn demand_paged(&mut self, on: bool) -> &mut Self;
+        fn pinned(&mut self, on: bool) -> &mut Self;
     }
 
     #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -1064,8 +1068,8 @@ pub mod process {
             self
         }
 
-        fn demand_paged(&mut self, on: bool) -> &mut Command {
-            self.as_inner_mut().set_demand_paged(on);
+        fn pinned(&mut self, on: bool) -> &mut Command {
+            self.as_inner_mut().set_pinned(on);
             self
         }
     }

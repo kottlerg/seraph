@@ -5,9 +5,10 @@
 
 //! Demand-paging fixture for the svctest pager phase.
 //!
-//! Spawned with `std::os::seraph::CommandExt::demand_paged(true)`, so procmgr
-//! binds this process's fault handler to memmgr (the pager). Two modes,
-//! selected by argv:
+//! Demand paging is the system-wide default, so when spawned normally procmgr
+//! binds this process's fault handler to memmgr (the pager). The pager phase
+//! also spawns it `pinned(true)` to prove the opt-out leaves it with no pager.
+//! Two modes, selected by argv:
 //!
 //!   * default — reserve an unbacked region, register it as demand-paged, and
 //!     write a per-page pattern across it. Each first touch faults to memmgr,

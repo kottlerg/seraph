@@ -26,9 +26,11 @@ use ipc::{IpcMessage, procmgr_labels};
 pub enum CreateSource
 {
     /// Memory cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
-    /// Caller retains the slot on failure to match the existing
-    /// `spawn_simple_device` contract; kernel transfers ownership on
-    /// successful `CREATE_PROCESS`.
+    /// A `CREATE_PROCESS` `ipc_call` transfers the cap to procmgr (which deletes
+    /// it on both success and failure). On any failure BEFORE that transfer,
+    /// [`spawn_simple_device`] deletes the cap on the caller's behalf — a
+    /// retained boot-module cap is a live derivation child of init's donated
+    /// pool-run source and pins that run unsplittable.
     Module(u32),
     /// vfsd file SEND cap (`procmgr_labels::CREATE_FROM_FILE`). `size` is
     /// the file size hint reported by the resolving `NS_LOOKUP`. On any
@@ -39,6 +41,46 @@ pub enum CreateSource
     {
         file_cap: u32, size: u64
     },
+}
+
+/// RAII guard for a boot-module Memory cap not yet consumed by a successful
+/// `CREATE_PROCESS`. While armed, `Drop` `cap_delete`s the slot.
+///
+/// A retained module cap is a live `cap_derive` child of init's donated
+/// pool-run source, so leaving it held pins that run unsplittable (a later
+/// demand fault landing on it is then wrongly killed). Guarding it releases the
+/// cap on every not-consumed exit — a skipped spawn (e.g. headless framebuffer,
+/// absent virtio device) or any failure before `CREATE_PROCESS` moves the cap
+/// to procmgr. Call [`disarm`](Self::disarm) once ownership has moved on (the
+/// `CREATE_PROCESS` `ipc_call` returned, transferring the cap, or an inner spawn
+/// step has taken over its lifecycle) so the cap is not double-freed — the slot
+/// is freed and the kernel's LIFO freelist promptly reuses it for a live cap.
+pub struct ModuleCapGuard(u32);
+
+impl ModuleCapGuard
+{
+    /// Arm a guard over `slot` (0 = nothing to guard).
+    pub fn new(slot: u32) -> Self
+    {
+        Self(slot)
+    }
+
+    /// Disarm: the cap's ownership has moved on; do not delete on drop.
+    pub fn disarm(&mut self)
+    {
+        self.0 = 0;
+    }
+}
+
+impl Drop for ModuleCapGuard
+{
+    fn drop(&mut self)
+    {
+        if self.0 != 0
+        {
+            let _ = syscall::cap_delete(self.0);
+        }
+    }
 }
 
 /// Monotonic counter for driver-child bootstrap badges.
@@ -93,6 +135,11 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     let _ = config.bars.bases;
     let _ = config.bars.sizes;
 
+    // Release the module cap on every exit before CREATE_PROCESS consumes it
+    // (missing BAR/IRQ, badge-derive failure, ipc_call failure). Disarmed once
+    // the ipc_call returns, which transfers the cap to procmgr.
+    let mut module_guard = ModuleCapGuard::new(config.module_cap);
+
     let Some(bar_cap) = config.bars.caps.first().copied()
     else
     {
@@ -125,10 +172,17 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     // CREATE_PROCESS via procmgr. Caps [module, creator]. The child has no
     // stdio wired by default — it logs through `seraph::log!` via the
     // discovery cap procmgr installs in `ProcessInfo`.
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(module_cap)
-        .cap(badged_creator)
-        .build();
+    //
+    // CREATE_PINNED: drivers reached through `spawn_driver` are PCI devices
+    // with BAR + IRQ — the DMA-capable class. A device may write driver memory
+    // before a demand fault could back it (the kernel never pins), so these
+    // must be eager-mapped, not demand-paged. Keyed off the spawn path for now;
+    // #165 replaces this with an explicit per-driver DMA attribute.
+    let create_msg =
+        IpcMessage::builder(procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_PINNED)
+            .cap(module_cap)
+            .cap(badged_creator)
+            .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
@@ -136,6 +190,10 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
         std::os::seraph::log!("driver CREATE_PROCESS ipc_call failed");
         return;
     };
+    // ipc_call returned: the module cap was transferred to procmgr regardless of
+    // the reply label (procmgr owns its teardown on its own failure). Disarm so
+    // the guard does not free the now-reused slot.
+    module_guard.disarm();
     if reply.label != 0
     {
         std::os::seraph::log!("driver CREATE_PROCESS failed");
@@ -270,14 +328,15 @@ pub fn spawn_simple_device(
 ) -> bool
 {
     // Source-aware cleanup: on any failure before the procmgr ipc_call
-    // completes, `CreateSource::File`'s file_cap is deleted (the
-    // namespace walk just produced it; there is no retry value), while
-    // `CreateSource::Module`'s memory cap stays in the caller's slot
-    // (existing contract — module caps came from bootstrap and the
-    // caller may have other uses for them).
+    // completes (so the source cap was not transferred), the source cap is
+    // deleted. For `File` the namespace walk just produced it; for `Module` a
+    // retained cap is a live derivation child of init's donated pool-run source
+    // and pins that run unsplittable, so it must be freed. The post-ipc_call
+    // failure paths below do NOT run this cleanup — there the source cap is
+    // already owned by procmgr.
     let source_cap_to_clean: u32 = match source
     {
-        CreateSource::Module(_) => 0,
+        CreateSource::Module(m) => m,
         CreateSource::File { file_cap, .. } => file_cap,
     };
     let source_cap_present: bool = match source

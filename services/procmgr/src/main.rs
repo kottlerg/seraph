@@ -710,7 +710,8 @@ fn reply_create_result(result: &process::CreateResult, ipc_buf: *mut u64)
 ///
 /// Label layout:
 ///   bits [0..16]  = opcode (`CREATE_PROCESS`)
-///   bits [16..32] = reserved
+///   bit  16       = `CREATE_PINNED` (opt out of the default system pager)
+///   bits [17..32] = reserved (bit 17 = `CREATE_DEATH_RELAY` on `CREATE_FROM_FILE`)
 ///   bits [32..48] = `args_bytes` (total byte length of the argv blob; u16)
 ///   bits [48..56] = `args_count` (number of NUL-terminated strings; u8)
 ///   bits [56..64] = `env_count` (number of NUL-terminated `KEY=VALUE`
@@ -812,7 +813,7 @@ fn handle_create(
         memmgr_badge,
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
-        demand_paged: label & procmgr_labels::CREATE_DEMAND_PAGED != 0,
+        demand_paged: label & procmgr_labels::CREATE_PINNED == 0,
         self_memmgr_ep: ctx.memmgr_ep,
     };
 
@@ -1007,7 +1008,7 @@ fn handle_create_from_file(
         &args,
         &env,
         ctx.death_eq,
-        label & procmgr_labels::CREATE_DEMAND_PAGED != 0,
+        label & procmgr_labels::CREATE_PINNED == 0,
         parent_relay_cap,
     );
 

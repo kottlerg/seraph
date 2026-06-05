@@ -556,11 +556,12 @@ pub struct UniversalCaps
     /// priorities within the band. Zero when procmgr was given no baseline;
     /// children then receive zero and cannot set any priority.
     pub sched_baseline: u32,
-    /// Whether the caller requested a demand-paged child (the
-    /// `procmgr_labels::CREATE_DEMAND_PAGED` flag). When set and the child is
-    /// not infrastructure, `finalize_creation` binds the child's main-thread
-    /// fault handler to memmgr and delegates the child `AddressSpace`, and
-    /// `populate_child_info` advertises the pager in `ProcessInfo`.
+    /// Whether the child is demand-paged. Demand paging is the default; this
+    /// is false only when the caller set `procmgr_labels::CREATE_PINNED` (a
+    /// DMA driver that must be eager-mapped). When true, `finalize_creation`
+    /// binds the child's main-thread fault handler to memmgr and delegates the
+    /// child `AddressSpace`, and `populate_child_info` advertises the pager in
+    /// `ProcessInfo`.
     pub demand_paged: bool,
     /// Procmgr's own (procmgr-badged) SEND cap on memmgr's endpoint, used to
     /// issue the procmgr-only `DELEGATE_ASPACE`. Distinct from
@@ -1265,13 +1266,12 @@ fn finalize_creation(
     // Demand-paged wiring (best-effort): delegate the child address space to
     // memmgr and bind the main thread's fault handler to it. A failure here
     // degrades to "no pager" (faults kill the thread) rather than failing an
-    // otherwise-complete creation. Infrastructure (badge below
-    // LOG_BADGE_FIRST_CHILD) is never paged; procmgr never spawns it anyway,
-    // but the floor is an explicit guard.
-    if demand_paged
-        && process_badge >= ipc::log_badges::LOG_BADGE_FIRST_CHILD
-        && memmgr_send_cap != 0
-        && self_memmgr_ep != 0
+    // otherwise-complete creation. Demand paging is the system-wide default;
+    // `demand_paged` is false only when the caller set `CREATE_PINNED` (a DMA
+    // driver). init, memmgr, and procmgr are pre-pager and are never routed
+    // through this path, so they are pinned by construction — the exemption is
+    // a capability-flag decision, never a badge-range test.
+    if demand_paged && memmgr_send_cap != 0 && self_memmgr_ep != 0
     {
         // Hand memmgr its own copy of the child AS, keyed by the child's
         // memmgr badge, over procmgr's (procmgr-badged) endpoint so it lands

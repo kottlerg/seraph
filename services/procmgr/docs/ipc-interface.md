@@ -74,15 +74,17 @@ stop/configure the thread.
 | 2 | `OutOfMemory` | Insufficient memory caps to allocate stack, ProcessInfo page, or IPC buffer |
 | 3 | `CSpaceFull` | Cannot allocate kernel objects (address space, CSpace, thread) |
 
-**Demand-paged flag.** The label's bit 16 (`CREATE_DEMAND_PAGED`, in the
-reserved `[16..32]` window shared with `CREATE_FROM_FILE`) requests a
-demand-paged child. At finalize, for non-infrastructure children (badge
-≥ `LOG_BADGE_FIRST_CHILD`), procmgr binds the main thread's fault handler to
-memmgr (the system pager) via `SYS_THREAD_SET_FAULT_HANDLER`, delegates the
-child `AddressSpace` to memmgr via `memmgr_labels::DELEGATE_ASPACE`, and sets
-`ProcessInfo.pager_endpoint_cap` / `pager_badge` so the runtime inherits the
-handler onto spawned threads. The child then backs reserved regions lazily via
-`std::os::seraph::register_demand_paged`. See
+**Pinned flag.** Demand paging is the default: at finalize procmgr binds every
+child's main thread fault handler to memmgr (the system pager) via
+`SYS_THREAD_SET_FAULT_HANDLER`, delegates the child `AddressSpace` to memmgr via
+`memmgr_labels::DELEGATE_ASPACE`, and sets `ProcessInfo.pager_endpoint_cap` /
+`pager_badge` so the runtime inherits the handler onto spawned threads. The
+child then backs reserved regions lazily via
+`std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,
+in the reserved `[16..32]` window shared with `CREATE_FROM_FILE`) opts out: the
+child is left eager-mapped with no pager. Set it only for a process that cannot
+depend on the fault path — a DMA driver. init, memmgr, and procmgr are pre-pager
+and never routed through this path, so they are pinned by construction. See
 [docs/fault-handling.md](../../../docs/fault-handling.md). The binding is
 best-effort: a failure degrades to "no pager" (faults kill), never blocking
 creation.

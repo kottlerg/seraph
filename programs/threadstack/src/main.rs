@@ -5,7 +5,7 @@
 
 //! Guarded demand-stack fixture for the usertest `threadstack` tester.
 //!
-//! Spawned demand-paged (`CommandExt::demand_paged(true)`), so threads this
+//! Spawned demand-paged (the system default; no opt-in needed), so threads this
 //! process spawns get a guarded demand-paged stack: a large lazily-grown
 //! usable region with an unregistered guard page below it. Two modes, by argv:
 //!

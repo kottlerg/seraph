@@ -1179,6 +1179,14 @@ fn spawn_virtio_blk(
     catalog: &mut DeviceCatalog,
 ) -> bool
 {
+    // Guard the boot module across every retained exit — no virtio device, no
+    // module delivered, or a catalog-serialisation failure — until it is handed
+    // to `spawn_driver`. A retained module cap is a live derivation child of
+    // init's donated pool-run source and pins that run unsplittable. Disarmed
+    // immediately before the spawn, which then owns the cap's lifecycle.
+    let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
+    let mut module_guard = spawn::ModuleCapGuard::new(module_cap);
+
     for pci_dev in devices
     {
         if !pci::is_virtio_blk(pci_dev)
@@ -1227,8 +1235,6 @@ fn spawn_virtio_blk(
         let bar_info = find_virtio_bar_cap(pci_dev, caps);
         let irq_cap = acquire_single_irq_cap(pci_dev, irq_root);
 
-        let module_cap = caps.module_cap_for_kind(caps::module_kind::VIRTIO_BLK);
-
         let config = spawn::DriverSpawnConfig {
             procmgr_ep: caps.procmgr_ep,
             bootstrap_ep: caps.self_bootstrap_ep,
@@ -1243,11 +1249,15 @@ fn spawn_virtio_blk(
             registry_ep: caps.registry_ep,
             device_badge,
         };
+        // `spawn_driver` owns the module cap's lifecycle from here (guarded
+        // internally: consumed by CREATE_PROCESS, or released on failure).
+        module_guard.disarm();
         spawn::spawn_driver(&config, ipc_buf);
 
         return true;
     }
 
+    // No virtio block device present: `module_guard` releases the module here.
     false
 }
 
@@ -1347,6 +1357,9 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
         std::os::seraph::log!("serial: no serial driver module delivered");
         return (false, 0);
     }
+    // Release the module cap on any exit before it is handed to the spawn (which
+    // then owns its lifecycle); a retained cap pins its donated pool run.
+    let mut module_guard = spawn::ModuleCapGuard::new(module_cap);
 
     // devmgr-owned service endpoint: the driver receives on a RIGHTS_ALL
     // copy; devmgr keeps the original to mint client SEND caps on query.
@@ -1366,6 +1379,7 @@ fn spawn_serial(caps: &mut caps::DevmgrCaps, ipc_buf: *mut u64) -> (bool, u32)
         return (false, serial_ep);
     };
 
+    module_guard.disarm();
     let spawned = spawn::spawn_simple_device(
         caps.procmgr_ep,
         caps.self_bootstrap_ep,
@@ -1401,6 +1415,14 @@ fn spawn_framebuffer(
     ipc_buf: *mut u64,
 ) -> (bool, u32)
 {
+    // Resolve and guard the module cap before the headless check: on a headless
+    // boot (`fb_info == None`) the framebuffer driver is never spawned, so its
+    // module cap would otherwise stay held — a live derivation child pinning
+    // init's donated pool-run source unsplittable. The guard releases it on
+    // every early exit until it is handed to the spawn.
+    let module_cap = caps.module_cap_for_kind(caps::module_kind::FRAMEBUFFER);
+    let mut module_guard = spawn::ModuleCapGuard::new(module_cap);
+
     let Some(fb) = caps.fb_info
     else
     {
@@ -1408,7 +1430,6 @@ fn spawn_framebuffer(
         return (false, 0);
     };
 
-    let module_cap = caps.module_cap_for_kind(caps::module_kind::FRAMEBUFFER);
     if module_cap == 0
     {
         std::os::seraph::log!("framebuffer: no framebuffer driver module delivered");
@@ -1490,6 +1511,7 @@ fn spawn_framebuffer(
         return (false, fb_ep);
     };
 
+    module_guard.disarm();
     let spawned = spawn::spawn_simple_device(
         caps.procmgr_ep,
         caps.self_bootstrap_ep,

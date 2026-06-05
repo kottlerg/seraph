@@ -72,7 +72,7 @@ use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     TIMED_LABELS_VERSION
 //     SERIAL_LABELS_VERSION
 
-pub const PROCMGR_LABELS_VERSION: u32 = 1;
+pub const PROCMGR_LABELS_VERSION: u32 = 2;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -117,16 +117,19 @@ pub mod procmgr_labels
     /// [`CONFIGURE_PIPE`] calls between create and start.
     pub const CREATE_FROM_FILE: u64 = 13;
     /// Label flag (bit 16) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
-    /// create the new process as demand-paged. At finalize procmgr binds
+    /// create the new process *pinned* — eager-mapped, with no system pager.
+    /// Demand paging is the default: when this flag is clear, procmgr binds
     /// the child's main thread fault handler to memmgr (the system pager),
     /// delegates the child `AddressSpace` cap to memmgr via
     /// `memmgr_labels::DELEGATE_ASPACE`, and advertises the pager in
     /// `ProcessInfo` (`pager_endpoint_cap` / `pager_badge`) so the runtime
-    /// inherits it onto spawned threads. Occupies bit 16 of the reserved
-    /// `[16..32]` label window. Infrastructure processes (badge below
-    /// `log_badges::LOG_BADGE_FIRST_CHILD`) are never paged regardless of
-    /// this flag.
-    pub const CREATE_DEMAND_PAGED: u64 = 1 << 16;
+    /// inherits it onto spawned threads. Set this flag only for a process
+    /// that cannot depend on the fault path — a driver doing DMA, whose
+    /// memory a device may write before a demand fault could back it.
+    /// Occupies bit 16 of the reserved `[16..32]` label window. init,
+    /// memmgr, and procmgr are pre-pager and never routed through this
+    /// binding path, so they are pinned by construction regardless.
+    pub const CREATE_PINNED: u64 = 1 << 16;
     /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
     /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the
     /// message). At finalize procmgr binds it as an `AddressSpace` death
@@ -404,9 +407,10 @@ pub mod memmgr_labels
     /// Procmgr-only: delegate a demand-paged child's `AddressSpace` cap to
     /// memmgr so the pager can map frames into it on fault.
     ///
-    /// Sent at process finalize for processes created with the
-    /// [`CREATE_DEMAND_PAGED`] flag, after the child address space exists
-    /// (so it cannot ride on the earlier [`REGISTER_PROCESS`] handshake).
+    /// Sent at process finalize for demand-paged processes — the default;
+    /// not those created with the [`CREATE_PINNED`] flag — after the child
+    /// address space exists (so it cannot ride on the earlier
+    /// [`REGISTER_PROCESS`] handshake).
     /// memmgr stores the transferred cap against the child's tracking
     /// entry, keyed by the badge minted at [`REGISTER_PROCESS`].
     ///

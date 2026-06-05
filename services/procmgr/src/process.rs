@@ -1828,8 +1828,9 @@ pub struct ElfLoadCtx
 
 /// Load one ELF segment page by streaming file data from VFS.
 ///
-/// On failure returns a `procmgr_errors::*` code distinguishing
-/// allocation, mapping, and rights-derivation failures.
+/// Thin wrapper over [`loader::load_elf_page_into_child`] supplying the VFS
+/// stream fill. On failure returns the core's `procmgr_errors::*` code
+/// distinguishing allocation, mapping, and rights-derivation failures.
 fn load_elf_page_streaming(
     page_vaddr: u64,
     seg: &elf::LoadSegment,
@@ -1837,62 +1838,15 @@ fn load_elf_page_streaming(
     ctx: &ElfLoadCtx,
 ) -> Result<(), u64>
 {
-    let Some(memory_cap) = crate::memmgr_alloc_page(ctx.child_memmgr_send, ctx.ipc_buf)
-    else
-    {
-        std::os::seraph::log!(
-            "procmgr: load_elf_page_streaming: alloc_page None vaddr=0x{:x}",
-            page_vaddr
-        );
-        return Err(procmgr_errors::OUT_OF_MEMORY);
-    };
-
-    let Some(scratch) = ScratchMapping::map(ctx.self_aspace, memory_cap, 1, syscall::MAP_WRITABLE)
-    else
-    {
-        std::os::seraph::log!(
-            "procmgr: load_elf_page_streaming: ScratchMapping::map None vaddr=0x{:x}",
-            page_vaddr
-        );
-        let _ = syscall::cap_delete(memory_cap);
-        return Err(procmgr_errors::MAP_FAILED);
-    };
-    let scratch_va = scratch.va();
-    // SAFETY: scratch_va mapped writable, one page.
-    unsafe { core::ptr::write_bytes(scratch_va as *mut u8, 0, PAGE_SIZE as usize) };
-
-    stream_segment_to_memory(scratch_va, page_vaddr, seg, ctx);
-
-    drop(scratch);
-
-    let Some(derived) = loader::derive_memory_for_prot(memory_cap, prot)
-    else
-    {
-        std::os::seraph::log!(
-            "procmgr: load_elf_page_streaming: derive_memory_for_prot None vaddr=0x{:x} prot=0x{:x}",
-            page_vaddr,
-            prot
-        );
-        let _ = syscall::cap_delete(memory_cap);
-        return Err(procmgr_errors::INSUFFICIENT_RIGHTS);
-    };
-    if let Err(e) = syscall::mem_map(derived, ctx.child_aspace, page_vaddr, 0, 1, 0)
-    {
-        std::os::seraph::log!(
-            "procmgr: load_elf_page_streaming: mem_map err={} vaddr=0x{:x}",
-            e,
-            page_vaddr
-        );
-        let _ = syscall::cap_delete(derived);
-        let _ = syscall::cap_delete(memory_cap);
-        return Err(procmgr_errors::MAP_FAILED);
-    }
-
-    // See `loader::load_elf_page` for the cap-refcount story.
-    let _ = syscall::cap_delete(derived);
-    let _ = syscall::cap_delete(memory_cap);
-
-    Ok(())
+    loader::load_elf_page_into_child(
+        page_vaddr,
+        prot,
+        ctx.self_aspace,
+        ctx.child_aspace,
+        ctx.child_memmgr_send,
+        ctx.ipc_buf,
+        |scratch_va| stream_segment_to_memory(scratch_va, page_vaddr, seg, ctx),
+    )
 }
 
 /// Stream segment file data from VFS into the memory cap mapped at `scratch_va`.

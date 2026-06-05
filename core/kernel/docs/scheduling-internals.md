@@ -469,6 +469,38 @@ The kernel does not auto-cascade IPC unblock on process exit. The contract:
 
 ---
 
+## Off-Stack Scratch for Ceiling-Sized Arrays
+
+Kernel scratch whose length is a compile-time ceiling (`MAX_CPUS`,
+`MAX_SLEEPING`) MUST NOT be allocated as a stack-local array in either context
+below. It MUST live off-stack via one of the two idioms in the table.
+
+- **Timer-ISR-reachable paths.** `sleep_check_wakeups` is inlined into
+  `timer_tick`, which runs in the timer ISR (`isr_timer`, IST=0) on the kernel
+  stack of whatever thread the tick interrupted. A `[_; MAX_SLEEPING]` frame
+  there overruns that borrowed stack.
+- **All-CPU-locks lifecycle paths.** `set_state_under_all_locks`,
+  `sys_thread_set_priority`, and `dealloc_object(Thread)` each save one
+  interrupt-flag word per CPU across the all-CPU-locks region (Lock Hierarchy
+  rule 4). A `[u64; MAX_CPUS]` frame on the caller's syscall stack scales with
+  the CPU ceiling — 4 KiB at `MAX_CPUS = 512`.
+
+The failure mode is silent and not size-checked by the compiler: the oversized
+frame clobbers a saved return-address chain and the next `ret` faults with
+`#PF rip=0` (reproduced for the timer-ISR case at ~5 % on x86_64 TCG-SMP;
+PR #167).
+
+| Off-stack idiom | Use when | Why no extra synchronisation | Site |
+|---|---|---|---|
+| CPU0-owned `static mut` singleton | The path runs in exactly one non-reentrant context — a CPU0-gated ISR path behind an interrupt gate (IF=0). | The path is non-reentrant, so the single buffer needs no lock. | `EXPIRED_SCRATCH` (`core/kernel/src/sched/mod.rs`) — `sleep_check_wakeups` expired-TCB snapshot (PR #167). |
+| Per-CPU field on `PerCpuScheduler`, written under that CPU's own `scheduler.lock` | Several CPUs run the path serially and each needs its own slot. | Each CPU writes only its own slot, only while holding that CPU's `scheduler.lock`; the all-CPU-locks region serialises every writer of a given slot, so the field needs no atomicity. | `saved_lock_flags` (`core/kernel/src/sched/run_queue.rs`) — per-CPU flag word for all three all-CPU-locks sites above (issue #168). |
+
+No `[_; MAX_CPUS]` or `[_; MAX_SLEEPING]` stack scratch remains in the kernel;
+CPU-set state at the ceiling is carried as bitvectors
+(`core/kernel/src/cpu_mask.rs`), not per-CPU stack arrays.
+
+---
+
 ## Softlockup Watchdog
 
 Permanent kernel feature. Detects "every CPU stalled in kernel mode" — the

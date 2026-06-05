@@ -163,6 +163,25 @@ fn main() -> !
         std::os::seraph::log!("devmgr: framebuffer driver spawned");
     }
 
+    // Boot-module driver caps are single-use: each bootstrap-essential driver is
+    // spawned from its module exactly once above, which moves the cap into
+    // procmgr (`CREATE_PROCESS`). Any module cap still held here — a driver whose
+    // spawn was skipped (e.g. the framebuffer on a headless boot) or failed —
+    // must be released now. init donates every boot-module source to memmgr's
+    // pool at reap; a retained derivation pins that pool run unsplittable, so a
+    // later demand fault landing on it is wrongly killed. `cap_delete` on an
+    // already-moved (empty) slot is an idempotent no-op. No driver is ever
+    // re-spawned from a module after boot — the rootfs/VFS path serves those.
+    for i in 0..caps.driver_module_count
+    {
+        let slot = caps.driver_module_slots[i];
+        if slot != 0
+        {
+            let _ = syscall::cap_delete(slot);
+        }
+        caps.driver_module_slots[i] = 0;
+    }
+
     // On-disk driver state. The RTC binary lives on the rootfs at
     // `/services/drivers/<chip>`, not in the boot bundle — RTC is not
     // bootstrap-essential. svcmgr delivers a `LOOKUP | READ`-attenuated

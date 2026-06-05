@@ -295,6 +295,58 @@ unsafe fn transfer_caps(
 
 // ── IPC syscall handlers ──────────────────────────────────────────────────────
 
+/// Move the caps carried by a `SYS_IPC_CALL` message from the running caller's
+/// `CSpace` into a server that was already blocked in recv, stashing the
+/// destination slot indices in the server's `ipc_msg` so it publishes them when
+/// it resumes.
+///
+/// Runs in the caller's context: the caller's `CSpace` is live (it is the
+/// running thread) and `server_tcb` is pinned by the `wake_in_flight` claim
+/// `endpoint_call` set under `ep.lock` (not yet enqueued, so it cannot run).
+/// Doing the move here keeps the server's resumed `sys_ipc_recv` off the
+/// hazardous path of re-deriving the caller from `reply_tcb`, which a concurrent
+/// `cancel_ipc_block` / `dealloc_object(Thread)` can clear to null or free. The
+/// server pre-allocated worst-case headroom before blocking, so the move cannot
+/// OOM; on the (practically unreachable) failure the message is delivered
+/// without caps rather than stranding the already-parked caller.
+///
+/// # Safety
+/// `caller_tcb` must be the running thread; `server_tcb` a valid TCB pinned by
+/// `wake_in_flight` and not yet enqueued.
+#[cfg(not(test))]
+unsafe fn deliver_call_caps(
+    caller_tcb: *mut crate::sched::thread::ThreadControlBlock,
+    server_tcb: *mut crate::sched::thread::ThreadControlBlock,
+    msg: &Message,
+)
+{
+    if msg.cap_count == 0
+    {
+        return;
+    }
+    // SAFETY: caller_tcb is the running caller; server_tcb a valid pinned TCB.
+    let caller_cspace = unsafe { (*caller_tcb).cspace };
+    // SAFETY: server_tcb valid and pinned by wake_in_flight.
+    let server_cspace = unsafe { (*server_tcb).cspace };
+    let mut dst_indices = [0u32; MSG_CAP_SLOTS_MAX];
+    // SAFETY: CSpace pointers extracted from valid, live TCBs.
+    let transferred = unsafe {
+        transfer_caps(
+            caller_cspace,
+            &msg.cap_slots[..msg.cap_count],
+            server_cspace,
+            &mut dst_indices,
+        )
+    }
+    .unwrap_or(0);
+    // SAFETY: server_tcb is pinned and not yet enqueued (so it cannot be
+    // running); finalizing its ipc_msg cap results is race-free.
+    unsafe {
+        (*server_tcb).ipc_msg.cap_slots = dst_indices;
+        (*server_tcb).ipc_msg.cap_count = transferred;
+    }
+}
+
 /// `SYS_IPC_CALL` (0): synchronous call on an endpoint.
 ///
 /// arg0 = endpoint cap index, arg1 = label, arg2 = `data_count`,
@@ -402,7 +454,18 @@ pub fn sys_ipc_call(tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
     if let Ok(woken_server) = result
     {
-        // A server was waiting; enqueue it and yield so it can run.
+        // The server was already blocked in recv: endpoint_call completed the
+        // rendezvous. Move any caps in this caller's context before waking the
+        // server, so its resumed recv only publishes the results and never
+        // re-derives this caller from reply_tcb (which a concurrent
+        // cancel/dealloc of the caller can clear to null or free). See
+        // `deliver_call_caps`.
+        // SAFETY: tcb is the running caller; woken_server is a valid TCB pinned
+        // by its wake_in_flight claim until the enqueue_and_wake below.
+        unsafe {
+            deliver_call_caps(tcb, woken_server, &msg);
+        }
+        // Enqueue the server and yield so it can run.
         // SAFETY: woken_server returned by endpoint_call; is valid TCB.
         unsafe {
             debug_assert!((*woken_server).magic == crate::sched::thread::TCB_MAGIC);
@@ -567,43 +630,27 @@ pub fn sys_ipc_recv(tf: &mut TrapFrame) -> Result<u64, SyscallError>
         crate::sched::schedule(false);
     }
 
-    // On resume (caller arrived), deliver message from ipc_msg.
-    // SAFETY: tcb validated above; ipc_msg populated by endpoint_recv on wakeup.
+    // On resume, deliver the message the waking caller copied into ipc_msg.
+    //
+    // The caller-side `sys_ipc_call` already performed any cap move in its own
+    // context (where its CSpace is provably live) and overwrote ipc_msg's
+    // cap_slots/cap_count with the DESTINATION slot indices and the transferred
+    // count. We MUST NOT re-derive the caller from reply_tcb to move caps here:
+    // a concurrent cancel/dealloc of the caller may have cleared the slot to
+    // null or freed the caller, and dereferencing it crashes under SMP load. We
+    // only publish the already-moved results. See the server-was-waiting branch
+    // of `sys_ipc_call`.
+    // SAFETY: tcb validated above; ipc_msg populated by endpoint_call on wakeup.
     let msg = unsafe { (*tcb).ipc_msg };
     // SAFETY: tcb validated above; ipc_buffer is immutable.
     let server_buf = unsafe { (*tcb).ipc_buffer };
 
-    let mut transferred: usize = 0;
-    let mut dst_indices = [0u32; MSG_CAP_SLOTS_MAX];
-    if msg.cap_count > 0
-    {
-        // SAFETY: tcb validated; reply_tcb set by endpoint_recv to caller's TCB.
-        let caller = unsafe { (*tcb).reply_tcb.load(core::sync::atomic::Ordering::Acquire) };
-        // SAFETY: caller is valid TCB from reply_tcb.
-        let caller_cspace = unsafe { (*caller).cspace };
-        // SAFETY: tcb validated above.
-        let server_cspace = unsafe { (*tcb).cspace };
-        // On failure: deliver message data without caps (cap_count=0 in buf).
-        // The caller stays blocked awaiting a reply; the server receives an
-        // incomplete message but is not crashed.
-        // SAFETY: CSpace pointers extracted from valid TCBs.
-        if let Ok(t) = unsafe {
-            transfer_caps(
-                caller_cspace,
-                &msg.cap_slots[..msg.cap_count],
-                server_cspace,
-                &mut dst_indices,
-            )
-        }
-        {
-            transferred = t;
-        }
-    }
-    // Always write cap_count (see immediate-delivery path above for the
-    // rationale).
+    // Always write the cap_count word (including the zero-cap case) so a prior
+    // IPC's cap metadata cannot be mis-read as this delivery's. cap_slots holds
+    // the destination indices written by the caller's transfer.
     // SAFETY: server_buf is user-mapped or 0.
     unsafe {
-        write_cap_results(server_buf, transferred, &dst_indices);
+        write_cap_results(server_buf, msg.cap_count, &msg.cap_slots);
     }
 
     if msg.data_count > 0

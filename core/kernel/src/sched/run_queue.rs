@@ -216,8 +216,8 @@ pub struct PerCpuScheduler
     /// as part of an all-CPU-locks operation (`set_state_under_all_locks`,
     /// `sys_thread_set_priority`, `dealloc_object(Thread)`); read back at the
     /// matching `unlock_raw`. Written only under this scheduler's own lock, so
-    /// it needs no atomicity. Lives here rather than in a `MAX_CPUS`-wide stack
-    /// array that would scale with the CPU ceiling.
+    /// it needs no atomicity. Off-stack per the per-CPU-field idiom of
+    /// docs/scheduling-internals.md § Off-Stack Scratch for Ceiling-Sized Arrays.
     pub saved_lock_flags: u64,
 }
 

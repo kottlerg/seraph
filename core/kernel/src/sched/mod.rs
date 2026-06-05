@@ -471,14 +471,12 @@ static mut SLEEP_COUNT: usize = 0;
 /// Scratch buffer holding the TCBs `sleep_check_wakeups` collects between
 /// dropping `SLEEP_LIST_LOCK` and waking them.
 ///
-/// Kept off the stack deliberately: at `MAX_SLEEPING * 8 = 1 KiB` a
-/// stack-local snapshot inflated the frame of `timer_tick` (which inlines
-/// `sleep_check_wakeups`). `timer_tick` runs in the timer ISR (`isr_timer`,
-/// IST=0) on the kernel stack of whatever thread the tick interrupted; the
-/// oversized frame overran that stack's saved return-address chain, faulting
-/// with `rip=0` on the next `ret`. `sleep_check_wakeups` runs only on CPU0
-/// (see `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it
-/// is non-reentrant and this single buffer needs no lock of its own.
+/// Off-stack via the CPU0-static idiom of docs/scheduling-internals.md
+/// § Off-Stack Scratch for Ceiling-Sized Arrays: a `[_; MAX_SLEEPING]` frame in
+/// `timer_tick` (which inlines `sleep_check_wakeups`) would overrun the timer
+/// ISR's borrowed kernel stack. `sleep_check_wakeups` runs only on CPU0 (see
+/// `timer_tick`'s `cpu == 0` gate) behind an interrupt gate (IF=0), so it is
+/// non-reentrant and this single buffer needs no lock of its own.
 #[cfg(not(test))]
 static mut EXPIRED_SCRATCH: [*mut ThreadControlBlock; MAX_SLEEPING] =
     [core::ptr::null_mut(); MAX_SLEEPING];

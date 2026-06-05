@@ -647,6 +647,21 @@ impl FreePool
         }
     }
 
+    /// Pages currently parked in free runs — owned by memmgr but lent to no
+    /// process. Unlike `pool_total` (monotonic owned-RAM), this falls as pages
+    /// are allocated and rises as they are reclaimed (`PROCESS_DIED`,
+    /// `RELEASE_MEMORY_CAPS`, `UNREGISTER_REGION`), so it is the observable a
+    /// caller polls to confirm a dead process's pages came back.
+    fn free_pages(&self) -> u64
+    {
+        let mut total: u64 = 0;
+        for run in self.runs.iter().flatten()
+        {
+            total = total.saturating_add(u64::from(run.page_count));
+        }
+        total
+    }
+
     fn push(&mut self, run: FreeRun) -> Result<(), ()>
     {
         for slot in &mut self.runs
@@ -1523,17 +1538,22 @@ fn handle_donate_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Reply with the all-RAM-accounted identity terms (all in bytes):
-/// `system_ram`, `kernel_reserved`, `pool_total`. Read-only; the caller asserts
-/// `system_ram == kernel_reserved + pool_total`. `pool_total` is the page
-/// counter scaled to bytes; the facts arrive verbatim from the kernel.
+/// Reply with the all-RAM-accounted identity terms plus the current free total
+/// (all in bytes): `system_ram`, `kernel_reserved`, `pool_total`, `free`.
+/// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
+/// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
+/// the subset currently parked in free runs (lent to no process), which falls
+/// on allocation and rises on reclamation. The identity facts arrive verbatim
+/// from the kernel.
 fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 {
     let pool_total_bytes = pool_total_pages().saturating_mul(PAGE_SIZE);
+    let free_bytes = pool_mut().free_pages().saturating_mul(PAGE_SIZE);
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, boot.system_ram_bytes)
         .word(1, boot.kernel_reserved_bytes)
         .word(2, pool_total_bytes)
+        .word(3, free_bytes)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

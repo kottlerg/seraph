@@ -375,11 +375,17 @@ pub mod memmgr_labels
     ///   (`system_ram_bytes` minus every `owns_memory` page minted to init).
     /// * `data[2]` — `pool_total_bytes`: every page memmgr owns, across free
     ///   runs, in-use bootstrap arenas, and reap donations.
+    /// * `data[3]` — `free_bytes`: the subset of `pool_total_bytes` currently
+    ///   parked in free runs (owned by memmgr, lent to no process). Unlike
+    ///   `pool_total` it falls on allocation and rises on reclamation
+    ///   (`PROCESS_DIED`, `RELEASE_MEMORY_CAPS`, `UNREGISTER_REGION`), so a
+    ///   caller polls it to confirm a dead process's pages were reclaimed.
     ///
     /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
     /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
     /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-    /// "dark" memory.
+    /// "dark" memory. `data[3]` is an appended field — readers needing only the
+    /// identity may ignore it.
     pub const QUERY_POOL_STATUS: u64 = 6;
     /// Register a demand-paged anonymous region for the calling process.
     ///
@@ -1248,6 +1254,19 @@ pub mod devmgr_labels
     /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
     /// the platform authority cap is absent.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
+
+    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
+    /// label: trigger devmgr's spawn-orphan fault-injection shim (#176). The
+    /// handler replies `SUCCESS` immediately (the forced-failure spawn does
+    /// nested `ipc_call`s that would clobber the reply context), then forces a
+    /// round-2 bootstrap failure and stashes the outcome for
+    /// [`TEST_ORPHAN_RESULT`].
+    pub const TEST_SPAWN_ORPHAN: u64 = 9;
+    /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
+    /// label: report the last [`TEST_SPAWN_ORPHAN`] outcome in reply `data[0]`
+    /// — `0` not run, `1` spawn failed as expected (unwind fired), `2`
+    /// unexpected success, `3` shim setup error.
+    pub const TEST_ORPHAN_RESULT: u64 = 10;
 
     /// Authority bit in the devmgr-registry-endpoint badge's high
     /// u64 bit. Set on caps minted for consumers permitted to call

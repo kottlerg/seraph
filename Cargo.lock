@@ -970,6 +970,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-orphan"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "syscall",
+]
+
+[[package]]
 name = "text"
 version = "0.1.0"
 dependencies = [

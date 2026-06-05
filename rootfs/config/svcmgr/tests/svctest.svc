@@ -3,7 +3,9 @@
 # One-shot: exits cleanly on completion; svcmgr never restarts it.
 # Seeds resolve through svcmgr's discovery registry: rootfs.root is
 # the FS-driver-agnostic root-mount cap; pwrmgr.shutdown/pwrmgr.deny
-# are the SHUTDOWN_AUTHORITY-tokened SEND and its no-auth twin.
+# are the SHUTDOWN_AUTHORITY-tokened SEND and its no-auth twin;
+# devmgr.registry is the REGISTRY_QUERY_AUTHORITY SEND that drives the
+# devmgr orphan-teardown phase's TEST_SPAWN_ORPHAN shim (TODO(#165)).
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
 # scan. To enable in a boot, copy this file into
@@ -16,4 +18,4 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny
+seed      = rootfs.root pwrmgr.shutdown pwrmgr.deny devmgr.registry

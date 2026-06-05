@@ -179,6 +179,12 @@ fn main() -> !
     let mut rtc_ep: u32 = 0;
     let mut rtc_spawn_attempted: bool = false;
 
+    // TODO(#165): remove with the devmgr enumeration redesign. Outcome of the
+    // last TEST_SPAWN_ORPHAN trigger, reported by TEST_ORPHAN_RESULT. 0=not
+    // run, 1=spawn failed as expected (#176 unwind fired), 2=unexpected
+    // success, 3=shim setup error.
+    let mut orphan_test_result: u64 = 0;
+
     if caps.registry_ep == 0
     {
         std::os::seraph::log!("no registry endpoint injected, halting");
@@ -531,6 +537,32 @@ fn main() -> !
                     // SAFETY: ipc_buf is the registered IPC buffer.
                     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 }
+            }
+            // TODO(#165): remove with the devmgr enumeration redesign.
+            // Test-only fault injection for #176. The forced-failure spawn
+            // does nested `ipc_call`s that would clobber the implicit reply
+            // context, so ack first (mirroring SET_DRIVERS_DIR), then run the
+            // spawn and stash the outcome for TEST_ORPHAN_RESULT.
+            ipc::devmgr_labels::TEST_SPAWN_ORPHAN =>
+            {
+                let reply = IpcMessage::new(ipc::devmgr_errors::SUCCESS);
+                // SAFETY: ipc_buf is the registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                orphan_test_result = match test_spawn_orphan(&mut caps, drivers_dir_cap, ipc_buf)
+                {
+                    Some(false) => 1,
+                    Some(true) => 2,
+                    None => 3,
+                };
+            }
+            // TODO(#165): report the stashed test-orphan outcome (no nested IPC).
+            ipc::devmgr_labels::TEST_ORPHAN_RESULT =>
+            {
+                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                    .word(0, orphan_test_result)
+                    .build();
+                // SAFETY: ipc_buf is the registered IPC buffer.
+                let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             }
             _ =>
             {
@@ -1609,6 +1641,82 @@ fn spawn_rtc_from_disk(
         let _ = syscall::cap_delete(rtc_ep);
         None
     }
+}
+
+/// TODO(#165): remove with the devmgr enumeration redesign.
+///
+/// Fault-injection shim for #176: spawn the on-disk `test-orphan` driver via
+/// the normal [`spawn::spawn_simple_device`] path with a non-zero query
+/// endpoint (forcing the two-round protocol), where the driver deliberately
+/// fails its round-2 request. The spawn helper's orphan-teardown then destroys
+/// the child, returning its pages to memmgr.
+///
+/// Returns `Some(false)` when the spawn failed as designed (the unwind ran),
+/// `Some(true)` if it unexpectedly succeeded, and `None` if the shim could not
+/// be set up (driver binary absent, or endpoint/cap minting failed).
+fn test_spawn_orphan(
+    caps: &mut caps::DevmgrCaps,
+    drivers_dir_cap: u32,
+    ipc_buf: *mut u64,
+) -> Option<bool>
+{
+    /// Arbitrary non-zero badge for the forced two-round query endpoint; the
+    /// round-2 failure means it is never delivered.
+    const QUERY_BADGE: u64 = 0x7E57;
+
+    let requested_rights = u64::from(namespace_protocol::rights::READ);
+    let walked =
+        ns_client::walk_to_file(drivers_dir_cap, b"test-orphan", requested_rights, ipc_buf)?;
+
+    // Throwaway service + hw endpoints handed to the child in round 1. Ownership
+    // of `hw_cap` transfers to `spawn_simple_device` (moved into the child or
+    // deleted on failure); `service_ep` is retained here and released below.
+    let service_ep = std::os::seraph::object_slab_acquire(88)
+        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
+        .unwrap_or(0);
+    let hw_cap = std::os::seraph::object_slab_acquire(88)
+        .and_then(|slab| syscall::cap_create_endpoint(slab).ok())
+        .unwrap_or(0);
+    // Non-zero query endpoint forces the two-round protocol so round 2 is reached.
+    let query_ep =
+        syscall::cap_derive_badge(caps.registry_ep, syscall::RIGHTS_SEND, QUERY_BADGE).unwrap_or(0);
+    if service_ep == 0 || hw_cap == 0 || query_ep == 0
+    {
+        std::os::seraph::log!("test-orphan: failed to mint shim caps");
+        let _ = syscall::cap_delete(walked.file_cap);
+        if service_ep != 0
+        {
+            let _ = syscall::cap_delete(service_ep);
+        }
+        if hw_cap != 0
+        {
+            let _ = syscall::cap_delete(hw_cap);
+        }
+        if query_ep != 0
+        {
+            let _ = syscall::cap_delete(query_ep);
+        }
+        return None;
+    }
+
+    let spawned = spawn::spawn_simple_device(
+        caps.procmgr_ep,
+        caps.self_bootstrap_ep,
+        spawn::CreateSource::File {
+            file_cap: walked.file_cap,
+            size: walked.size,
+        },
+        service_ep,
+        hw_cap,
+        query_ep,
+        ipc_buf,
+    );
+
+    // `spawn_simple_device` owns `hw_cap` and `query_ep` (moved into the child
+    // or released on failure). devmgr still holds the original `service_ep` —
+    // there is no live driver to keep it for, so release it.
+    let _ = syscall::cap_delete(service_ep);
+    Some(spawned)
 }
 
 /// Carve the COM1 `IoPort` (`0x3F8`..=`0x3FF`) out of the root

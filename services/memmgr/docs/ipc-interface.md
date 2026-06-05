@@ -243,6 +243,34 @@ IPC. Idempotent on stale badges (already-reaped or never-registered).
 `PROCESS_DIED` for an unknown badge is not an error — memmgr returns
 success. Reclamation is idempotent.
 
+### Label 6: `QUERY_POOL_STATUS`
+
+Read-only query of the all-RAM-accounted identity plus the current free
+total. Privilege: universal — returns aggregate counts only, no caps and no
+state change.
+
+**Request:** label 6, no words, no caps.
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| data[0] | `system_ram_bytes` — total installed RAM the kernel computed at boot |
+| data[1] | `kernel_reserved_bytes` — the fixed kernel reserve |
+| data[2] | `pool_total_bytes` — every page memmgr owns (free runs, in-use arenas, reap donations); monotonic |
+| data[3] | `free_bytes` — subset of `pool_total_bytes` parked in free runs, lent to no process |
+
+The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
+is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
+RAM and is invariant across a process's lifetime, so it cannot witness
+reclamation. `free_bytes` (`data[3]`) is the page count currently in free
+runs: it falls as `REQUEST_MEMORY_CAPS` lends pages and rises as
+`PROCESS_DIED`, `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` return them.
+A caller asserting that a dead process's pages were reclaimed polls `data[3]`
+back to its pre-spawn baseline. `data[3]` is appended after the identity
+terms; readers needing only the identity may ignore it.
+
 ### Label 7: `REGISTER_REGION`
 
 A demand-paged process registers an anonymous region it has reserved (but

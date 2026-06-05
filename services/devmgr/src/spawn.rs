@@ -83,6 +83,65 @@ impl Drop for ModuleCapGuard
     }
 }
 
+/// RAII guard for a child created via `CREATE_PROCESS` whose bootstrap has not
+/// yet reached its final `done` round. `Drop` always releases the caller-side
+/// `process_handle` and `thread_cap` slots delivered in the `CREATE_PROCESS`
+/// reply — devmgr retains no per-child handle past a spawn, so leaving them
+/// held leaks devmgr `CSpace` slots for its resident lifetime. While still armed,
+/// `Drop` additionally sends `DESTROY_PROCESS` over the badged `process_handle`
+/// first, so procmgr reaps the orphan (thread, cspace, aspace torn down; pages
+/// returned to memmgr) instead of leaving it hung in `request_round`.
+///
+/// Call [`disarm`](Self::disarm) once the final round's `done` reply has been
+/// served and the child owns its full cap set: the slots are still freed, but
+/// the now-live child is left running.
+struct ChildGuard
+{
+    process_handle: u32,
+    thread_cap: u32,
+    ipc_buf: *mut u64,
+    destroy: bool,
+}
+
+impl ChildGuard
+{
+    /// Arm a guard over a freshly-created child's reply caps.
+    fn new(process_handle: u32, thread_cap: u32, ipc_buf: *mut u64) -> Self
+    {
+        Self {
+            process_handle,
+            thread_cap,
+            ipc_buf,
+            destroy: true,
+        }
+    }
+
+    /// Bootstrap completed: keep the child alive. `Drop` still frees devmgr's
+    /// handles to it but no longer destroys it.
+    fn disarm(&mut self)
+    {
+        self.destroy = false;
+    }
+}
+
+impl Drop for ChildGuard
+{
+    fn drop(&mut self)
+    {
+        if self.destroy
+        {
+            let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            let _ = unsafe { ipc::ipc_call(self.process_handle, &destroy_msg, self.ipc_buf) };
+        }
+        let _ = syscall::cap_delete(self.process_handle);
+        if self.thread_cap != 0
+        {
+            let _ = syscall::cap_delete(self.thread_cap);
+        }
+    }
+}
+
 /// Monotonic counter for driver-child bootstrap badges.
 static NEXT_BOOTSTRAP_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
@@ -207,16 +266,25 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
         return;
     }
     let process_handle = reply_caps[0];
+    let thread_cap = reply_caps[1];
+    // Tear down the child (and free its reply-cap slots) on any failure before
+    // the final bootstrap round completes; disarmed on success.
+    let mut child_guard = ChildGuard::new(process_handle, thread_cap, ipc_buf);
 
-    // Derive all per-child caps for delivery via bootstrap.
+    // Derive all per-child caps for delivery via bootstrap. Each derivation
+    // owns a devmgr slot that must be released on later failure paths so devmgr
+    // does not leak it; the child itself is reaped by `child_guard`.
     let Ok(bar_copy) = syscall::cap_derive(bar_cap, syscall::RIGHTS_ALL)
     else
     {
+        std::os::seraph::log!("driver bar cap derivation failed");
         return;
     };
     let Ok(irq_copy) = syscall::cap_derive(irq_slot, syscall::RIGHTS_ALL)
     else
     {
+        std::os::seraph::log!("driver irq cap derivation failed");
+        let _ = syscall::cap_delete(bar_copy);
         return;
     };
     let service_copy = if service_ep != 0
@@ -231,7 +299,27 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
         syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_SEND, device_badge)
     else
     {
+        std::os::seraph::log!("driver devmgr query cap derivation failed");
+        let _ = syscall::cap_delete(bar_copy);
+        let _ = syscall::cap_delete(irq_copy);
+        if service_copy != 0
+        {
+            let _ = syscall::cap_delete(service_copy);
+        }
         return;
+    };
+
+    // Best-effort release of every derived per-child cap. Deleting a slot a
+    // serve_round transfer already consumed is a no-op, so it is safe on any
+    // post-derive failure arm.
+    let drop_derived = || {
+        let _ = syscall::cap_delete(bar_copy);
+        let _ = syscall::cap_delete(irq_copy);
+        if service_copy != 0
+        {
+            let _ = syscall::cap_delete(service_copy);
+        }
+        let _ = syscall::cap_delete(devmgr_copy);
     };
 
     // START_PROCESS.
@@ -244,6 +332,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     if !start_ok
     {
         std::os::seraph::log!("driver START_PROCESS failed");
+        drop_derived();
         return;
     }
 
@@ -262,6 +351,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     .is_err()
     {
         std::os::seraph::log!("driver bootstrap round 1 failed");
+        drop_derived();
         return;
     }
 
@@ -280,9 +370,12 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     .is_err()
     {
         std::os::seraph::log!("driver bootstrap round 2 failed");
+        drop_derived();
         return;
     }
 
+    // Child owns its full cap set: keep it alive, but release devmgr's handles.
+    child_guard.disarm();
     std::os::seraph::log!("driver started");
 }
 
@@ -414,6 +507,9 @@ pub fn spawn_simple_device(
     let reply_caps = reply.caps();
     if reply_caps.is_empty()
     {
+        // CREATE reported success but delivered no handle, so there is no badge
+        // to tear the child down with. Defensive — procmgr returns two caps on
+        // success.
         std::os::seraph::log!("simple-device CREATE_PROCESS reply missing caps");
         let _ = syscall::cap_delete(hw_cap);
         if devmgr_query_ep != 0
@@ -423,6 +519,12 @@ pub fn spawn_simple_device(
         return false;
     }
     let process_handle = reply_caps[0];
+    let thread_cap = reply_caps.get(1).copied().unwrap_or(0);
+    // Tear down the child (and free its reply-cap slots) on any failure before
+    // the final bootstrap round completes; disarmed on success. The source cap
+    // is already owned by procmgr (the CREATE ipc_call transferred it), so the
+    // guard never touches it.
+    let mut child_guard = ChildGuard::new(process_handle, thread_cap, ipc_buf);
 
     // RECV-rights copy of the service endpoint for the child; devmgr keeps
     // the original to mint client SEND caps on query.
@@ -506,6 +608,8 @@ pub fn spawn_simple_device(
         }
     }
 
+    // Child owns its full cap set: keep it alive, but release devmgr's handles.
+    child_guard.disarm();
     std::os::seraph::log!("simple-device driver started");
     true
 }

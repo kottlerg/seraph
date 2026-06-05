@@ -14,6 +14,10 @@
 //!     service endpoint (zero when pwrmgr is absent)
 //!   * `caps[2]`: SEND on pwrmgr's service endpoint without the
 //!     `SHUTDOWN_AUTHORITY` badge bit (zero when pwrmgr is absent)
+//!   * `caps[3]`: `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's
+//!     registry endpoint (zero when devmgr is absent). Drives the
+//!     `TEST_SPAWN_ORPHAN` fault-injection shim in the devmgr
+//!     orphan-teardown phase. TODO(#165): retire with that shim.
 //!
 //! The launcher requests the round from `info.creator_endpoint`; if no
 //! creator endpoint is present (`== 0`), every slot stays zero and
@@ -31,6 +35,9 @@ pub struct Caps
     pub root_fs: u32,
     pub pwrmgr_auth: u32,
     pub pwrmgr_noauth: u32,
+    /// `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry
+    /// endpoint. TODO(#165): retire with the `TEST_SPAWN_ORPHAN` shim.
+    pub devmgr_registry: u32,
 }
 
 /// Drain the bootstrap round from `creator_endpoint` and pull caps out.
@@ -66,6 +73,10 @@ pub fn request() -> Caps
     if round.cap_count >= 3
     {
         caps.pwrmgr_noauth = round.caps[2];
+    }
+    if round.cap_count >= 4
+    {
+        caps.devmgr_registry = round.caps[3];
     }
 
     caps

@@ -30,7 +30,8 @@ use super::current_tcb;
 ///
 /// arg0 = Memory-cap slot index in the caller's `CSpace`. The Memory cap
 /// MUST carry `Rights::RETYPE` and have at least
-/// `dispatch_for(Endpoint, 0).raw_bytes` (88 B) of `available_bytes`.
+/// `dispatch_for(Endpoint, 0).raw_bytes` (80 B = 24 wrapper + 56
+/// `EndpointState`) of `available_bytes`.
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
 /// the source Memory cap's region; a cap with `SEND | RECEIVE | GRANT` rights

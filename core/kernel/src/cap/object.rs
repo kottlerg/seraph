@@ -2118,8 +2118,13 @@ unsafe fn dealloc_object_one(
             use crate::cap::retype::{dispatch_for, retype_free};
             // dispatch_for is total over the kernel's retypable types; the
             // Endpoint arm always returns Some. Unwrap-or-fall-through with
-            // a fallback raw size keeps the lint quiet without panicking.
-            let raw_bytes = dispatch_for(ObjectType::Endpoint, 0).map_or(88, |e| e.raw_bytes);
+            // a fallback raw size keeps the lint quiet without panicking. The
+            // fallback mirrors dispatch_for's computed value (24 wrapper +
+            // EndpointState) so it cannot drift from the alloc-side size.
+            let raw_bytes = dispatch_for(ObjectType::Endpoint, 0).map_or(
+                24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64,
+                |e| e.raw_bytes,
+            );
 
             // SAFETY: ancestor_ptr is non-null; it was set by `with_ancestor`
             // at retype time and points at the source MemoryObject's header.

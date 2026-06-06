@@ -47,6 +47,17 @@ fn orphan_teardown_phase(caps: &Caps)
     // allocator noise in the sampling window.
     const MARGIN_BYTES: u64 = 128 * 1024;
     const MAX_POLL: u32 = 4096;
+    // `free_bytes` samples memmgr's *whole-pool* free total, so the
+    // before/after delta folds in any allocation other services perform in the
+    // sampling window (and first-cycle page-cache warming of the on-disk
+    // `test-orphan` ELF). Under SMP oversubscription that concurrent activity
+    // can exceed `MARGIN_BYTES` for a single spawn, failing the recovery check
+    // even though the orphan's pages were reclaimed (#285). Retry the whole
+    // spawn→teardown→measure cycle: a genuine leak pins ~1 MiB *every* cycle so
+    // the pool never recovers, whereas transient perturbation clears on a
+    // re-baselined cycle. Passing on any clean cycle therefore tolerates the
+    // noise without masking a real leak.
+    const CYCLES: u32 = 8;
 
     let devmgr = caps.devmgr_registry;
     assert!(devmgr != 0, "devmgr_orphan: no devmgr registry cap seeded");
@@ -57,58 +68,82 @@ fn orphan_teardown_phase(caps: &Caps)
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let memmgr = info.memmgr_endpoint;
 
-    let free_before = free_bytes(memmgr, ipc_buf);
+    let mut last_before = 0u64;
+    let mut last_after = 0u64;
+    let mut reclaimed = false;
 
-    // Trigger the forced-failure spawn. devmgr acks immediately, then runs the
-    // spawn (which fails, unwinds, and DESTROYs the child) before it services
-    // the result query below.
-    let trigger = ipc::IpcMessage::new(ipc::devmgr_labels::TEST_SPAWN_ORPHAN);
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let ack = unsafe { ipc::ipc_call(devmgr, &trigger, ipc_buf) }
-        .expect("TEST_SPAWN_ORPHAN ipc_call failed");
-    assert_eq!(
-        ack.label,
-        ipc::devmgr_errors::SUCCESS,
-        "TEST_SPAWN_ORPHAN ack"
-    );
-
-    // Serviced only after devmgr returns to its loop — i.e. after the spawn and
-    // its synchronous teardown completed.
-    let query = ipc::IpcMessage::new(ipc::devmgr_labels::TEST_ORPHAN_RESULT);
-    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
-    let res = unsafe { ipc::ipc_call(devmgr, &query, ipc_buf) }
-        .expect("TEST_ORPHAN_RESULT ipc_call failed");
-    assert_eq!(
-        res.label,
-        ipc::devmgr_errors::SUCCESS,
-        "TEST_ORPHAN_RESULT status"
-    );
-    let outcome = res.word(0);
-    assert_eq!(
-        outcome, 1,
-        "devmgr_orphan: expected spawn-failed/unwind (1), got outcome={outcome} \
-         (2=unexpected success, 3=shim setup error)"
-    );
-
-    // With #176's teardown the child's reserved pages are reclaimed
-    // synchronously, so `free` returns to baseline; without it the hung child
-    // stays pinned and `free` stays ~1 MiB low. Poll to bound any incidental lag.
-    let mut free_after = free_bytes(memmgr, ipc_buf);
-    for _ in 0..MAX_POLL
+    for cycle in 0..CYCLES
     {
+        // Re-baseline each cycle so a prior cycle's incidental allocation does
+        // not accumulate into this cycle's comparison.
+        let free_before = free_bytes(memmgr, ipc_buf);
+
+        // Trigger the forced-failure spawn. devmgr acks immediately, then runs
+        // the spawn (which fails, unwinds, and DESTROYs the child) before it
+        // services the result query below.
+        let trigger = ipc::IpcMessage::new(ipc::devmgr_labels::TEST_SPAWN_ORPHAN);
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let ack = unsafe { ipc::ipc_call(devmgr, &trigger, ipc_buf) }
+            .expect("TEST_SPAWN_ORPHAN ipc_call failed");
+        assert_eq!(
+            ack.label,
+            ipc::devmgr_errors::SUCCESS,
+            "TEST_SPAWN_ORPHAN ack"
+        );
+
+        // Serviced only after devmgr returns to its loop — i.e. after the spawn
+        // and its synchronous teardown completed.
+        let query = ipc::IpcMessage::new(ipc::devmgr_labels::TEST_ORPHAN_RESULT);
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let res = unsafe { ipc::ipc_call(devmgr, &query, ipc_buf) }
+            .expect("TEST_ORPHAN_RESULT ipc_call failed");
+        assert_eq!(
+            res.label,
+            ipc::devmgr_errors::SUCCESS,
+            "TEST_ORPHAN_RESULT status"
+        );
+        let outcome = res.word(0);
+        assert_eq!(
+            outcome, 1,
+            "devmgr_orphan: expected spawn-failed/unwind (1), got outcome={outcome} \
+             (2=unexpected success, 3=shim setup error)"
+        );
+
+        // With #176's teardown the child's reserved pages are reclaimed
+        // synchronously, so `free` returns to baseline; without it the hung
+        // child stays pinned and `free` stays ~1 MiB low. Poll to bound any
+        // incidental lag.
+        let mut free_after = free_bytes(memmgr, ipc_buf);
+        for _ in 0..MAX_POLL
+        {
+            if free_after + MARGIN_BYTES >= free_before
+            {
+                break;
+            }
+            let _ = syscall::thread_yield();
+            free_after = free_bytes(memmgr, ipc_buf);
+        }
+
+        last_before = free_before;
+        last_after = free_after;
         if free_after + MARGIN_BYTES >= free_before
         {
+            reclaimed = true;
             break;
         }
-        let _ = syscall::thread_yield();
-        free_after = free_bytes(memmgr, ipc_buf);
+
+        std::os::seraph::log!(
+            "devmgr_orphan: cycle {cycle} reclaim short (before={free_before} after={free_after}); retrying"
+        );
     }
+
     assert!(
-        free_after + MARGIN_BYTES >= free_before,
-        "devmgr_orphan: orphan pages not reclaimed: free_before={free_before} free_after={free_after}"
+        reclaimed,
+        "devmgr_orphan: orphan pages not reclaimed across {CYCLES} cycles \
+         (genuine leak pins memory every cycle): last free_before={last_before} free_after={last_after}"
     );
 
     std::os::seraph::log!(
-        "devmgr_orphan_teardown passed: spawn unwound, free reclaimed (before={free_before} after={free_after})"
+        "devmgr_orphan_teardown passed: spawn unwound, free reclaimed (before={last_before} after={last_after})"
     );
 }

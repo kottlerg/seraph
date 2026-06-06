@@ -59,6 +59,13 @@ pub enum CliCommand
     /// to run the kernel test harness; the default is `--harness init`.
     /// Requires a populated sysroot from a prior `cargo xtask build`.
     ComposeBundle(ComposeBundleArgs),
+
+    /// Boot the virtio-input interactive smoke test: launch QEMU with a QMP
+    /// control socket, wait for the guest's READY marker, inject a known key
+    /// sequence, and assert the guest reports `ALL TESTS PASSED`. Requires the
+    /// `inputtest` recipe staged into `sysroot/config/svcmgr/services/` and
+    /// `disk.img` repacked (`cargo xtask mkdisk`) — see xtask/README.md.
+    TestInput(TestInputArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -169,6 +176,20 @@ pub struct MkdiskArgs
     /// Target architecture — must match the existing sysroot's arch tag.
     #[arg(long, default_value = "x86_64")]
     pub arch: Arch,
+}
+
+// ── TestInput ───────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestInputArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
 }
 
 // ── ComposeBundle ────────────────────────────────────────────────────────────

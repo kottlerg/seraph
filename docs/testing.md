@@ -15,6 +15,7 @@ Three harnesses exercise three surfaces:
 | `ktest` | Kernel | `core/ktest/` | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
 | `svctest` | Services | `services/svctest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
 | `usertest` | Programs | `services/usertest/` | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces |
+| `inputtest` | Device input | `services/inputtest/` | `svcmgr` spawns from recipe; driven by `cargo xtask test-input`, which injects keys over QMP and asserts the decoded keysyms |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
@@ -157,12 +158,38 @@ Reset to the default-init bundle by re-running `cargo xtask build` or
 compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-compose-bundle)).
 
+### Interactive input (`inputtest`)
+
+`inputtest` cannot run as an autonomous recipe: its keysyms must come from
+real `EV_KEY` events on the virtio-input device, which the guest cannot
+synthesise for itself. It is driven instead by `cargo xtask test-input`,
+which boots QEMU with a QMP control socket, waits for the guest's
+`inputtest: READY for injection` marker on the serial log, injects a known
+key sequence via QMP `input-send-event`, and scrapes the `ALL TESTS PASSED`
+marker. The driver carries no test hooks — injection happens at the
+hardware boundary, so the whole stack (device DMA → decode → IPC →
+consumer) is exercised as in production. Both arches use
+`virtio-keyboard-pci`.
+
+Enable it like the other recipe harnesses, then run `test-input` (not
+`run-parallel`, which cannot inject):
+
+```sh
+cargo xtask build
+cp sysroot/config/svcmgr/tests/inputtest.svc sysroot/config/svcmgr/services/
+cargo xtask mkdisk
+cargo xtask test-input
+```
+
+This QMP-injection mechanism is the reusable foundation for future
+interactive tests (terminal, shell, line editing).
+
 ### One shutdown-invoking harness per boot
 
-`svctest` and `usertest` both invoke `pwrmgr` shutdown on completion. Two
-such harnesses staged together race on shutdown — the slower one may not
-finish. Per boot, exactly one *shutdown-invoking* harness recipe MUST be
-staged in `/config/svcmgr/services/`.
+`svctest`, `usertest`, and `inputtest` all invoke `pwrmgr` shutdown on
+completion. Two such harnesses staged together race on shutdown — the
+slower one may not finish. Per boot, exactly one *shutdown-invoking*
+harness recipe MUST be staged in `/config/svcmgr/services/`.
 
 Non-shutdown fixtures may co-stage alongside one harness. `crasher`
 (`restart = always`, never shuts down) is co-staged with `svctest` in

@@ -178,6 +178,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "virtio-input",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: None,
+    },
+    Spec {
         name: "serial",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -267,6 +274,13 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "usertest",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Tests,
+        arch_only: None,
+    },
+    Spec {
+        name: "inputtest",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::Tests,

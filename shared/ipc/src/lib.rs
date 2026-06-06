@@ -1135,7 +1135,7 @@ pub mod fs_labels
     pub const FS_TRUNCATE: u64 = 17;
 }
 
-pub const DEVMGR_LABELS_VERSION: u32 = 6;
+pub const DEVMGR_LABELS_VERSION: u32 = 7;
 /// IPC labels for the device manager (`devmgr`).
 pub mod devmgr_labels
 {
@@ -1274,6 +1274,18 @@ pub mod devmgr_labels
     /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails or
     /// the platform authority cap is absent.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
+
+    /// Query for the keyboard/input device endpoint.
+    ///
+    /// Mints an `input_labels::READ_AUTHORITY`-badged `SEND_GRANT` cap on
+    /// the input driver's service endpoint to the caller. Caller's badge
+    /// must have [`REGISTRY_QUERY_AUTHORITY`] set; the handler replies
+    /// `UNAUTHORIZED` otherwise. Mirrors [`QUERY_SERIAL_DEVICE`]. The verb
+    /// is transport-agnostic: any keyboard backend (virtio-input today,
+    /// USB HID / PS-2 later) registers this one slot, so consumers never
+    /// learn the transport. Value 11 — 9 and 10 are the TODO(#165) test
+    /// labels below.
+    pub const QUERY_INPUT_DEVICE: u64 = 11;
 
     /// TODO(#165): remove with the devmgr enumeration redesign. Test-only
     /// label: trigger devmgr's spawn-orphan fault-injection shim (#176). The
@@ -1475,6 +1487,123 @@ pub mod fb_errors
     /// today — `FB_LABELS_VERSION` is marker-only and covered by
     /// `PROCESS_ABI_VERSION` at process startup.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
+}
+
+pub const INPUT_LABELS_VERSION: u32 = 1;
+/// IPC labels for the keyboard/input device driver
+/// (`services/drivers/virtio/input` today; future USB / PS-2 backends reuse
+/// this same protocol).
+///
+/// The driver decodes hardware key events into a **keysym stream** and
+/// answers a single read operation. It owns its transport device end-to-end
+/// (virtio-input PCI today) and is the sole driver-mediated source of
+/// keyboard input. devmgr spawns it and hands clients an
+/// [`input_labels::READ_AUTHORITY`]-badged SEND via
+/// [`devmgr_labels::QUERY_INPUT_DEVICE`]. Key-repeat configuration, layout
+/// switching, pointer/mouse events, and multi-device fan-out are out of
+/// scope (see the driver `README.md`); they are not on the wire.
+pub mod input_labels
+{
+    /// Read a batch of pending keyboard events (blocking).
+    ///
+    /// Request: empty body; the caller's badge must carry [`READ_AUTHORITY`].
+    /// The driver blocks until at least one event is available, then replies
+    /// with up to [`super::keysym::INPUT_MAX_EVENTS_PER_READ`] events.
+    ///
+    /// Reply ([`super::input_errors::SUCCESS`]): `word[0]` = event count `n`
+    /// (`1..=INPUT_MAX_EVENTS_PER_READ`); `word[1 + i]` = event `i` packed via
+    /// [`super::keysym::pack_event`] (keysym in bits 0-31, modifier mask in
+    /// bits 32-62, press/release in bit 63). Consumers decode with
+    /// [`super::keysym::unpack_event`].
+    pub const INPUT_READ_EVENTS: u64 = 1;
+
+    /// Authority bit in the input-service-endpoint badge's high u64 bit. Set
+    /// on caps devmgr mints in response to
+    /// [`devmgr_labels::QUERY_INPUT_DEVICE`]; gates [`INPUT_READ_EVENTS`]. A
+    /// verb ("may read"), not an identity.
+    pub const READ_AUTHORITY: u64 = 1u64 << 63;
+}
+
+/// Error replies from the input device driver.
+pub mod input_errors
+{
+    pub const SUCCESS: u64 = 0;
+    /// Driver received a label it does not implement.
+    pub const UNKNOWN_OPCODE: u64 = 2;
+    /// Reserved for a future per-message version handshake. Unused today —
+    /// `INPUT_LABELS_VERSION` is marker-only and covered by
+    /// `PROCESS_ABI_VERSION` at process startup.
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
+}
+
+/// Keysym numbering, modifier mask bits, and the
+/// [`input_labels::INPUT_READ_EVENTS`] event wire encoding — the
+/// transport-agnostic contract shared by every keyboard driver and every
+/// input consumer.
+///
+/// Keysyms follow X11 numbering: a printable Latin-1 keysym *is* its Unicode
+/// codepoint (`a` = 0x61, `A` = 0x41, `1` = 0x31), and named keys use the
+/// `0xFF00`+ function range. The driver resolves Shift/Caps into the keysym
+/// (`A` vs `a`) and reports the full modifier mask so consumers can form
+/// Ctrl/Alt combinations without the driver encoding terminal policy.
+pub mod keysym
+{
+    // Named keys (X11 function-key range). Printable keys are not enumerated;
+    // their keysym equals their Unicode codepoint.
+    pub const BACKSPACE: u32 = 0xFF08;
+    pub const TAB: u32 = 0xFF09;
+    pub const RETURN: u32 = 0xFF0D;
+    pub const ESCAPE: u32 = 0xFF1B;
+    pub const HOME: u32 = 0xFF50;
+    pub const LEFT: u32 = 0xFF51;
+    pub const UP: u32 = 0xFF52;
+    pub const RIGHT: u32 = 0xFF53;
+    pub const DOWN: u32 = 0xFF54;
+    pub const END: u32 = 0xFF57;
+    pub const DELETE: u32 = 0xFFFF;
+
+    // Modifier keys are delivered as their own press/release events too, so
+    // consumers can observe modifier state changes directly.
+    pub const SHIFT_L: u32 = 0xFFE1;
+    pub const SHIFT_R: u32 = 0xFFE2;
+    pub const CONTROL_L: u32 = 0xFFE3;
+    pub const CONTROL_R: u32 = 0xFFE4;
+    pub const CAPS_LOCK: u32 = 0xFFE5;
+    pub const ALT_L: u32 = 0xFFE9;
+    pub const ALT_R: u32 = 0xFFEA;
+
+    // Modifier mask bits (X11 state-mask values: Shift=1, Lock=2, Control=4,
+    // Mod1=8). Reported in bits 32-62 of a packed event.
+    pub const MOD_SHIFT: u32 = 1 << 0;
+    pub const MOD_CAPS: u32 = 1 << 1;
+    pub const MOD_CTRL: u32 = 1 << 2;
+    pub const MOD_ALT: u32 = 1 << 3;
+
+    /// Maximum events returned by one
+    /// [`super::input_labels::INPUT_READ_EVENTS`] reply. Bounded so `word[0]`
+    /// (count) plus `n` event words fit the 64-word IPC data area with
+    /// headroom.
+    pub const INPUT_MAX_EVENTS_PER_READ: usize = 32;
+
+    /// Pack a key event into one IPC data word: keysym in bits 0-31, the
+    /// modifier mask in bits 32-62, and `pressed` (true = down) in bit 63.
+    #[must_use]
+    pub const fn pack_event(keysym: u32, modifiers: u32, pressed: bool) -> u64
+    {
+        // `as` (not `u64::from`) because `From` is not const-callable; the
+        // crate-level allow covers the (non-)truncating int casts.
+        (keysym as u64) | (((modifiers & 0x7FFF_FFFF) as u64) << 32) | ((pressed as u64) << 63)
+    }
+
+    /// Inverse of [`pack_event`]: returns `(keysym, modifiers, pressed)`.
+    #[must_use]
+    pub const fn unpack_event(word: u64) -> (u32, u32, bool)
+    {
+        let keysym = (word & 0xFFFF_FFFF) as u32;
+        let modifiers = ((word >> 32) & 0x7FFF_FFFF) as u32;
+        let pressed = (word >> 63) & 1 != 0;
+        (keysym, modifiers, pressed)
+    }
 }
 
 pub const STREAM_LABELS_VERSION: u32 = 1;

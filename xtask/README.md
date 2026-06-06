@@ -251,6 +251,30 @@ discarded.
 
 ---
 
+### `cargo xtask test-input`
+
+Boot the virtio-input keyboard driver's interactive smoke test. Launches
+QEMU headless with a QMP control socket, waits for the guest `inputtest`
+service to print `inputtest: READY for injection` on the serial log,
+injects a known key sequence (`a`, Shift+`a`, Return) via QMP
+`input-send-event`, and asserts the guest reports `ALL TESTS PASSED`.
+Exits non-zero on a guest `SOME TESTS FAILED`, an injection error, or the
+180 s timeout.
+
+A pure runner — it neither builds nor stages. Stage the recipe and repack
+the disk first (as for the other recipe harnesses):
+
+```sh
+cargo xtask build
+cp sysroot/config/svcmgr/tests/inputtest.svc sysroot/config/svcmgr/services/
+cargo xtask mkdisk
+cargo xtask test-input [--arch x86_64|riscv64] [--cpus N]
+```
+
+See [docs/testing.md](../docs/testing.md) for the harness model.
+
+---
+
 ## Sub-crates
 
 | Sub-crate | Purpose |

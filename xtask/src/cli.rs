@@ -60,12 +60,13 @@ pub enum CliCommand
     /// Requires a populated sysroot from a prior `cargo xtask build`.
     ComposeBundle(ComposeBundleArgs),
 
-    /// Boot the virtio-input interactive smoke test: launch QEMU with a QMP
-    /// control socket, wait for the guest's READY marker, inject a known key
-    /// sequence, and assert the guest reports `ALL TESTS PASSED`. Requires the
-    /// `inputtest` recipe staged into `sysroot/config/svcmgr/services/` and
-    /// `disk.img` repacked (`cargo xtask mkdisk`) — see xtask/README.md.
-    TestInput(TestInputArgs),
+    /// Boot the terminal interactive test: launch QEMU with a QMP control
+    /// socket, wait for the guest terminal's READY marker, inject a known key
+    /// sequence through the virtio-input driver, and assert the echoed input
+    /// and the relayed child output appear on the serial stream. Requires a
+    /// populated sysroot with `terminal.svc` staged (the default boot set
+    /// already includes it) and `disk.img` repacked — see xtask/README.md.
+    TestTerminal(TestTerminalArgs),
 }
 
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -121,6 +122,8 @@ pub enum BuildComponent
     Hello,
     HelloTester,
     FbCharset,
+    Terminal,
+    Echosh,
     Fsbench,
     Pipefault,
     Stackoverflow,
@@ -176,12 +179,19 @@ pub struct MkdiskArgs
     /// Target architecture — must match the existing sysroot's arch tag.
     #[arg(long, default_value = "x86_64")]
     pub arch: Arch,
+
+    /// Repack `disk.img` from the sysroot exactly as it is, skipping the
+    /// `rootfs/` re-mirror. Use after editing the staged sysroot directly
+    /// (e.g. adding a test recipe and removing a default one) when the
+    /// additive re-mirror would otherwise restore the removed file.
+    #[arg(long)]
+    pub repack_only: bool,
 }
 
-// ── TestInput ───────────────────────────────────────────────────────────────
+// ── TestTerminal ──────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-pub struct TestInputArgs
+pub struct TestTerminalArgs
 {
     /// Target architecture.
     #[arg(long, default_value = "x86_64")]

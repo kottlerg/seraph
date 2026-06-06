@@ -9,6 +9,12 @@
 //! were edited outside the cargo flow (notably: staging a test recipe
 //! by copying it from `sysroot/config/svcmgr/tests/` into
 //! `sysroot/config/svcmgr/services/`).
+//!
+//! `--repack-only` skips the `rootfs/` re-mirror and packs the sysroot as it
+//! stands. The mirror is additive (it copies rootfs files over the sysroot but
+//! never deletes), so a default recipe removed from the staged sysroot would be
+//! restored by a normal repack; `--repack-only` lets a test boot compose an
+//! exact service set by removing such a recipe and packing without the restore.
 
 use anyhow::Result;
 
@@ -25,7 +31,10 @@ use crate::util::step;
 pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
 {
     sysroot::check_arch(ctx, args.arch)?;
-    sysroot::install_rootfs(ctx)?;
+    if !args.repack_only
+    {
+        sysroot::install_rootfs(ctx)?;
+    }
     disk::create_disk_image(ctx, args.arch)?;
     step(&format!("mkdisk complete ({})", args.arch));
     Ok(())

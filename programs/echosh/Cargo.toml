@@ -1,17 +1,13 @@
 [package]
-name = "inputtest"
+name = "echosh"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "inputtest"
+name = "echosh"
 path = "src/main.rs"
 test = false
-
-[dependencies]
-ipc = { path = "../../shared/ipc" }
-syscall = { path = "../../shared/syscall" }
 
 [lints]
 workspace = true

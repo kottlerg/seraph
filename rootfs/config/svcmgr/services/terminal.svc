@@ -1,0 +1,21 @@
+# /programs/terminal — userspace terminal (v0.0.1, #111).
+#
+# Autostarts on a normal boot. Relays the virtio-input keyboard to a child's
+# stdin and the child's stdout to the framebuffer + serial TX, with a minimal
+# line discipline (local echo, single-line backspace, CR->LF). Persistent and
+# non-bootstrap: critical = no, restart = never (svcmgr supervises it but does
+# not auto-restart it; a post-login session model owns terminal lifecycle in a
+# later release). It is never in the ESP bundle and init never loads it.
+#
+# argv[1] is the child binary the terminal spawns; #112 retargets this to
+# /programs/shell. namespace = universal + cwd = /data so the terminal can
+# resolve and spawn the child via procmgr (mirrors the program-spawning test
+# harnesses). seed = devmgr.registry is the REGISTRY_QUERY_AUTHORITY SEND used
+# for QUERY_INPUT_DEVICE / QUERY_FRAMEBUFFER_DEVICE / QUERY_SERIAL_DEVICE.
+binary    = /programs/terminal
+argv      = terminal /programs/echosh
+restart   = never
+critical  = no
+namespace = universal
+cwd       = /data
+seed      = devmgr.registry

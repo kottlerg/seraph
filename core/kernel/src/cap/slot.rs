@@ -324,7 +324,7 @@ pub fn violates_wx(rights: Rights) -> bool
 /// ```text
 ///  offset  size  field
 ///       0     1  tag
-///       1     3  pad   (aligns rights to offset 4)
+///       1     3  pad   (aligns rights to offset 4; pad[0] = free-list marker)
 ///       4     4  rights
 ///       8     8  badge  (caller-identifying label; 0 = unbadged)
 ///      16     8  object (naturally 8-byte aligned at offset 16)
@@ -347,6 +347,9 @@ pub struct CapabilitySlot
     /// Capability type; `Null` means the slot is empty.
     pub tag: CapTag,
     /// Explicit padding: aligns `rights` to offset 4 and `badge` to offset 8.
+    /// `pad[0]` doubles as the intrusive free-list membership marker
+    /// ([`FREE_LIST_MARKER`] when the Null slot is linked on a `CSpace` free
+    /// list); `pad[1..]` are always zero.
     pad: [u8; 3],
     /// Rights bitmask (type-specific).
     pub rights: Rights,
@@ -374,6 +377,13 @@ pub struct CapabilitySlot
 unsafe impl Send for CapabilitySlot {}
 // SAFETY: CapabilitySlot is accessed only under CSpace lock; no Sync violation.
 unsafe impl Sync for CapabilitySlot {}
+
+/// Value stamped into `CapabilitySlot::pad[0]` while a Null slot is linked on a
+/// `CSpace` intrusive free list. A free-list **tail** slot has `deriv_parent ==
+/// None`, identical to a freshly-allocated-but-unpopulated Null slot; this
+/// marker is the O(1) discriminator that lets `free_slot` reject a double-free
+/// of any slot, not just the current free-list head.
+const FREE_LIST_MARKER: u8 = 1;
 
 impl CapabilitySlot
 {
@@ -420,10 +430,16 @@ impl CapabilitySlot
     /// the free-list reader only consults `index`. A live derivation link is
     /// always stamped with the registry's non-zero epoch, so `epoch == 0`
     /// unambiguously distinguishes the two encodings.
+    ///
+    /// Stamps the [`FREE_LIST_MARKER`] into `pad[0]` so [`is_on_free_list`]
+    /// can recognise this slot as a free-list member regardless of whether it
+    /// is the list tail.
+    ///
+    /// [`is_on_free_list`]: Self::is_on_free_list
     pub fn set_next_free(&mut self, next: Option<NonZeroU32>)
     {
         self.tag = CapTag::Null;
-        self.pad = [0; 3];
+        self.pad = [FREE_LIST_MARKER, 0, 0];
         self.rights = Rights::NONE;
         self.badge = 0;
         self.object = None;
@@ -447,6 +463,20 @@ impl CapabilitySlot
             "next_free called on occupied slot"
         );
         self.deriv_parent.map(|s| s.index)
+    }
+
+    /// Return `true` if this slot is currently linked on a `CSpace` free list.
+    ///
+    /// True iff the slot is Null-tagged with [`FREE_LIST_MARKER`] set by
+    /// [`set_next_free`]. The tag gate keeps a stale marker on a repopulated
+    /// slot from reading as on-list. Used by `free_slot` to reject a
+    /// double-free of any slot and by `allocate_slot` to assert the popped
+    /// slot was a genuine free-list member.
+    ///
+    /// [`set_next_free`]: Self::set_next_free
+    pub fn is_on_free_list(&self) -> bool
+    {
+        self.tag == CapTag::Null && self.pad[0] == FREE_LIST_MARKER
     }
 }
 
@@ -555,6 +585,7 @@ mod tests
         s.set_next_free(Some(next));
         assert_eq!(s.next_free(), Some(next));
         assert_eq!(s.tag, CapTag::Null);
+        assert!(s.is_on_free_list());
     }
 
     #[test]
@@ -563,6 +594,25 @@ mod tests
         let mut s = CapabilitySlot::null();
         s.set_next_free(None);
         assert_eq!(s.next_free(), None);
+        // The list tail is byte-identical to a cleared slot except for the
+        // marker — that is the whole point of the marker.
+        assert!(s.is_on_free_list());
+    }
+
+    #[test]
+    fn free_list_marker_distinguishes_membership()
+    {
+        // A canonical null slot is off the list.
+        let mut s = CapabilitySlot::null();
+        assert!(!s.is_on_free_list());
+
+        // Linking sets the marker even at the list tail (next == None).
+        s.set_next_free(None);
+        assert!(s.is_on_free_list());
+
+        // clear() (the allocate-on-pop path) drops the marker.
+        s.clear();
+        assert!(!s.is_on_free_list());
     }
 
     #[test]

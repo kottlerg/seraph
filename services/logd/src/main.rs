@@ -567,25 +567,37 @@ fn resolve_fb_cap(ipc_buf: *mut u64) -> u32
     if registry == 0
     {
         // Registry not recorded yet (serial_init sets it before the drain
-        // loop); retry once it is, without consuming the single attempt.
+        // loop); retry once it is.
         return 0;
     }
-    // Single attempt: cache the outcome either way so the drain loop issues at
-    // most one QUERY_FRAMEBUFFER_DEVICE. The framebuffer driver, when present,
-    // is spawned by devmgr before svcmgr launches logd, so this first attempt
-    // resolves it; on a headless boot there is no driver and the attempt caches
-    // FB_UNAVAILABLE.
     let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let cap = match unsafe { ipc::ipc_call(registry, &msg, ipc_buf) }
+    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
+    else
     {
-        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS =>
-        {
-            reply.caps().first().copied().unwrap_or(0)
-        }
-        _ => 0,
+        // Could not complete the query (transient — the call returned rather
+        // than blocking, so this is not the logd↔devmgr deadlock path). Leave
+        // the cache unset and retry on the next line, matching
+        // resolve_serial_cap; the serial cap resolves on this same registry
+        // endpoint, so a hard failure here does not recur in practice.
+        return 0;
+    };
+    // devmgr answered. Latch the outcome so the drain loop issues at most one
+    // more QUERY_FRAMEBUFFER_DEVICE: the resolved cap, or FB_UNAVAILABLE when
+    // devmgr reports no framebuffer driver (headless boot). The driver, when
+    // present, is spawned before svcmgr launches logd, so this resolves it.
+    // Latching the no-driver answer is what prevents a per-line re-query, which
+    // would open a deadlock window against devmgr's own logging (devmgr →
+    // log_ep → logd, while logd blocks here on devmgr's reply).
+    let cap = if reply.label == ipc::devmgr_errors::SUCCESS
+    {
+        reply.caps().first().copied().unwrap_or(0)
+    }
+    else
+    {
+        0
     };
     FB_CAP.store(
         if cap == 0 { FB_UNAVAILABLE } else { cap },

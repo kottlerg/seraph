@@ -23,8 +23,6 @@
 //! source (#66 RX is unimplemented), signals/cooked-raw/job-control/
 //! multi-session (#29), and the real interactive shell (#112).
 
-#![allow(clippy::cast_possible_truncation)]
-
 mod input;
 mod output;
 
@@ -129,12 +127,12 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &Sink) -> !
         if let Some(out) = child.stdout.take()
         {
             let relay_tx = tx.clone();
-            std::thread::spawn(move || relay_reader(out, &relay_tx, true));
+            std::thread::spawn(move || relay_stdout(out, &relay_tx));
         }
         if let Some(err) = child.stderr.take()
         {
             let relay_tx = tx.clone();
-            std::thread::spawn(move || relay_reader(err, &relay_tx, false));
+            std::thread::spawn(move || relay_stderr(err, &relay_tx));
         }
 
         let mut line = Vec::new();
@@ -194,10 +192,9 @@ fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &Sink, mut stdin: Option<&
     }
 }
 
-/// Forward a child stream to the consumer as [`Msg::Output`]. On EOF, the
-/// stdout relay (`signal_exit`) posts [`Msg::ChildExited`] so the consumer
-/// stops and respawns; the stderr relay just ends.
-fn relay_reader<R: std::io::Read>(mut reader: R, tx: &Sender<Msg>, signal_exit: bool)
+/// Forward a child stream to the consumer as [`Msg::Output`] until EOF or a
+/// read/channel error.
+fn pump_stream<R: std::io::Read>(mut reader: R, tx: &Sender<Msg>)
 {
     let mut buf = [0u8; 512];
     loop
@@ -209,15 +206,26 @@ fn relay_reader<R: std::io::Read>(mut reader: R, tx: &Sender<Msg>, signal_exit: 
             {
                 if tx.send(Msg::Output(buf[..n].to_vec())).is_err()
                 {
-                    return;
+                    break;
                 }
             }
         }
     }
-    if signal_exit
-    {
-        let _ = tx.send(Msg::ChildExited);
-    }
+}
+
+/// Relay the child's stdout, then post [`Msg::ChildExited`] on EOF so the
+/// consumer reaps and respawns the child.
+fn relay_stdout<R: std::io::Read>(reader: R, tx: &Sender<Msg>)
+{
+    pump_stream(reader, tx);
+    let _ = tx.send(Msg::ChildExited);
+}
+
+/// Relay the child's stderr. No exit signal — stdout's EOF drives respawn, so
+/// that a single channel message marks the child gone.
+fn relay_stderr<R: std::io::Read>(reader: R, tx: &Sender<Msg>)
+{
+    pump_stream(reader, tx);
 }
 
 /// Pull the single bootstrap round; expect `caps[0]` from the recipe's

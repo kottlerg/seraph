@@ -69,6 +69,9 @@ feeding the same channel with raw bytes (see deferrals).
   interleaves with logd (serial) and the boot-time `fb-charset` dump
   (framebuffer). Cosmetic until a broker exists.
 - Non-printable named keys (arrows, Home/End/Delete, Tab, Escape) are ignored.
+- Backspace is byte-wise: it erases one byte of the current line, so
+  backspacing a multi-byte UTF-8 character is incorrect. Grapheme-aware editing
+  is part of line-discipline maturity ([#29]).
 
 ## Testing
 

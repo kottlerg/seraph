@@ -42,7 +42,11 @@ pub fn keyboard_loop(input_cap: u32, tx: &Sender<Msg>)
             std::os::seraph::log!("terminal: INPUT_READ_EVENTS error label={:#x}", reply.label);
             return;
         }
-        let count = reply.word(0) as usize;
+        // The count is an external (wire) value; clamp it to the ABI maximum so
+        // a misbehaving driver cannot drive an out-of-bounds word index.
+        let count = usize::try_from(reply.word(0))
+            .unwrap_or(0)
+            .min(keysym::INPUT_MAX_EVENTS_PER_READ);
         let mut bytes = Vec::new();
         for i in 0..count
         {

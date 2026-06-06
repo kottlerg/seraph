@@ -220,6 +220,34 @@ fn subpage_link_ok(link: u64, memory_size: u64) -> bool
     link == FREE_LIST_END || (link < memory_size && link.is_multiple_of(BIN_128))
 }
 
+/// Validate a SEED-scratch free request and return the in-region offset.
+///
+/// Returns `Some(offset)` iff `[phys, phys + round_to_class(bytes))` lies wholly
+/// within `[base, base + size)` — i.e. `phys` is a real lease into the region and
+/// the rounded span does not run off the top. Returns `None` for any corrupt
+/// pointer: `phys < base` (which would underflow the offset), a zero-byte span,
+/// or a span whose top exceeds `base + size`.
+///
+/// Pure and `cfg`-independent (mirrors [`subpage_link_ok`]) so the host
+/// `#[cfg(test)]` suite can exercise it even though its sole runtime caller
+/// `free_seed_scratch` is `cfg(target_arch = "x86_64")`-gated.
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
+fn seed_scratch_offset(phys: u64, base: u64, size: u64, bytes: u64) -> Option<u64>
+{
+    let need = round_to_class(bytes);
+    if need == 0
+    {
+        return None;
+    }
+    let offset = phys.checked_sub(base)?;
+    let top = offset.checked_add(need)?;
+    if top > size
+    {
+        return None;
+    }
+    Some(offset)
+}
+
 /// Try to pop a slot from the bin's free list. Returns the offset if a slot
 /// was reused, or `None` if the list is empty.
 ///
@@ -589,6 +617,18 @@ pub fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 {
     let need = round_to_class(bytes);
 
+    // Defense-in-depth: every caller is a trusted internal dealloc path passing a
+    // kernel-computed offset, so an out-of-region (offset, bytes) is a kernel
+    // logic regression — caught here in debug/test at no release cost. Untrusted
+    // input is filtered upstream (e.g. `seed_scratch_offset` for SEED scratch).
+    debug_assert!(
+        offset.saturating_add(need) <= memory.size,
+        "retype_free out of range: offset=0x{:x} need=0x{:x} size=0x{:x}",
+        offset,
+        need,
+        memory.size
+    );
+
     // Read-lock the cap for the duration: the drain-reset below compares
     // `prev_avail + need` against `memory.size`, and a concurrent
     // `sys_memory_split`/`sys_memory_merge` mutates `memory.size` under the cap
@@ -758,10 +798,49 @@ pub fn alloc_seed_scratch(bytes: u64) -> Result<*mut u8, SyscallError>
 pub fn free_seed_scratch(ptr: *mut u8, bytes: u64)
 {
     let seed = crate::cap::seed_memory_ref();
-    let phys = crate::mm::paging::virt_to_phys(ptr as u64);
-    let offset = phys - seed.base;
-    retype_free(seed, offset, bytes);
-    seed.header.dec_ref();
+    let virt = ptr as u64;
+
+    // A valid lease is `phys_to_virt(seed.base + offset)`, always
+    // >= DIRECT_MAP_BASE. A virt below it is a corrupt/garbage iopb pointer
+    // (e.g. a clobbered userspace address); `virt_to_phys` would underflow.
+    let Some(phys) = virt.checked_sub(crate::mm::paging::DIRECT_MAP_BASE)
+    else
+    {
+        crate::kprintln!(
+            "SEED SCRATCH FREE CORRUPT: ptr=0x{:x} bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
+            virt,
+            bytes,
+            seed.base,
+            seed.size
+        );
+        return;
+    };
+
+    // Skip both `retype_free` and `dec_ref` on a corrupt pointer: feeding a bogus
+    // offset to the allocator would corrupt SEED, and a lone `dec_ref` would
+    // unbalance the lease refcount. The lease is leaked instead — SEED is
+    // statically pinned (initial refcount 1 + Phase-7 pin), so the imbalance is
+    // inert. This turns the former underflow panic/wrap into a logged,
+    // survivable anomaly.
+    match seed_scratch_offset(phys, seed.base, seed.size, bytes)
+    {
+        Some(offset) =>
+        {
+            retype_free(seed, offset, bytes);
+            seed.header.dec_ref();
+        }
+        None =>
+        {
+            crate::kprintln!(
+                "SEED SCRATCH FREE CORRUPT: ptr=0x{:x} phys=0x{:x} bytes=0x{:x} base=0x{:x} size=0x{:x} (out of range)",
+                virt,
+                phys,
+                bytes,
+                seed.base,
+                seed.size
+            );
+        }
+    }
 }
 
 /// Per-`ObjectType` retype dispatch entry.
@@ -951,6 +1030,52 @@ mod tests
         // In range but misaligned (not a multiple of BIN_128).
         assert!(!subpage_link_ok(BIN_128 - 8, size));
         assert!(!subpage_link_ok(0x40, size));
+    }
+
+    #[test]
+    fn seed_scratch_offset_accepts_in_range()
+    {
+        let base: u64 = 0x1_0000;
+        let size: u64 = 512 * 1024; // SEED_RESERVE_BYTES
+        let need = round_to_class(8192); // IOPB_SIZE rounds to 0x2000
+
+        // Lease at the very start of the region.
+        assert_eq!(seed_scratch_offset(base, base, size, 8192), Some(0));
+        // Lease mid-region.
+        assert_eq!(
+            seed_scratch_offset(base + 0x4000, base, size, 8192),
+            Some(0x4000)
+        );
+        // Lease whose rounded span ends exactly at the region top.
+        assert_eq!(
+            seed_scratch_offset(base + size - need, base, size, 8192),
+            Some(size - need)
+        );
+    }
+
+    #[test]
+    fn seed_scratch_offset_rejects_corrupt_pointers()
+    {
+        let base: u64 = 0x1_0000;
+        let size: u64 = 512 * 1024;
+
+        // phys below base: would underflow phys - base; must be rejected.
+        assert_eq!(seed_scratch_offset(base - 0x1000, base, size, 8192), None);
+        assert_eq!(seed_scratch_offset(0, base, size, 8192), None);
+        // Rounded span runs off the top of the region.
+        assert_eq!(
+            seed_scratch_offset(base + size - 0x1000, base, size, 8192),
+            None
+        );
+        assert_eq!(seed_scratch_offset(base + size, base, size, 8192), None);
+        // A userspace-stack-looking pointer: as a raw phys it is
+        // astronomically larger than base + size.
+        assert_eq!(
+            seed_scratch_offset(0x0000_7FFF_FFFF_D048, base, size, 8192),
+            None
+        );
+        // Zero-byte free is rejected (need == 0).
+        assert_eq!(seed_scratch_offset(base, base, size, 0), None);
     }
 
     #[test]

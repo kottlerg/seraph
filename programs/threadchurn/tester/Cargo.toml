@@ -1,0 +1,13 @@
+[package]
+name = "threadchurn-tester"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "threadchurn-tester"
+path = "src/main.rs"
+test = false
+
+[lints]
+workspace = true

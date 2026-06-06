@@ -122,6 +122,8 @@ pub enum BuildComponent
     StdiotestTester,
     Threadstack,
     ThreadstackTester,
+    Threadchurn,
+    ThreadchurnTester,
     All,
 }
 

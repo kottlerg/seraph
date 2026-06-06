@@ -303,7 +303,7 @@ pub mod procmgr_labels
     pub const INIT_REAP_CORRELATOR: u32 = u32::MAX;
 }
 
-pub const MEMMGR_LABELS_VERSION: u32 = 4;
+pub const MEMMGR_LABELS_VERSION: u32 = 5;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -332,10 +332,29 @@ pub mod memmgr_labels
     /// syscalls; memmgr derives reply caps with `RIGHTS_ALL`, which
     /// preserves the RETYPE bit stamped at boot by the kernel.
     pub const REQUEST_MEMORY_CAPS: u64 = 1;
-    /// Voluntarily return Memory caps to the pool. Callable from any
-    /// badged cap. Wire format: `data[0]` = `cap_count`; `data[1+i]` =
-    /// `page_count_for_cap_i`; `caps[0..cap_count]` = Memory caps to release.
-    /// memmgr verifies each cap was previously issued to the caller's badge.
+    /// Voluntarily return previously-granted Memory caps to the pool
+    /// mid-life. Callable from any badged cap. The caller names each region
+    /// by the `phys_base` memmgr reported in the granting
+    /// `REQUEST_MEMORY_CAPS` reply, not by transferring the cap: a caller
+    /// that retyped the region (e.g. into a Thread) and dropped the inner cap
+    /// no longer holds a cap to send back. Wire format:
+    ///
+    /// * `data[0]` — `count: u32`.
+    /// * `data[1+i]` — `phys_base_i: u64`, the physical base of the region to
+    ///   release (the grant reply reports it at `data[1 + cap_count + i]`).
+    /// * `caps[..]` — any inner caps the caller still holds; dropped
+    ///   defensively.
+    ///
+    /// memmgr matches each `phys_base` against the caller's own outstanding
+    /// grants (badge-scoped), returns the backing run to the free pool, and
+    /// credits `free_bytes`. Unmatched bases are ignored (idempotent, like
+    /// `PROCESS_DIED`). The caller MUST have already deleted every kernel
+    /// object retyped from the region; releasing a region with a live retype
+    /// is correctness-safe (the kernel refuses to re-hand-out live bytes) but
+    /// strands the run until that retype is freed.
+    ///
+    /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` if the caller's
+    /// badge is unknown.
     pub const RELEASE_MEMORY_CAPS: u64 = 2;
     /// Procmgr-only: register a new process. memmgr allocates a per-process
     /// tracking entry and replies with a badged SEND cap on its endpoint
@@ -474,8 +493,9 @@ pub mod memmgr_errors
     /// exhausted. Per-process region and frame counts are otherwise RAM-bound,
     /// not capped by a constant.
     pub const QUOTA: u64 = 3;
-    /// `want_pages == 0`, reserved flag bits set, page-count mismatch on
-    /// `RELEASE_MEMORY_CAPS`, or badge unknown.
+    /// `want_pages == 0`, reserved flag bits set, or badge unknown
+    /// (`REQUEST_MEMORY_CAPS` / `RELEASE_MEMORY_CAPS` from an unregistered
+    /// badge).
     pub const INVALID_ARGUMENT: u64 = 4;
     /// Procmgr-only label called over a non-procmgr badge.
     pub const UNAUTHORIZED: u64 = 5;

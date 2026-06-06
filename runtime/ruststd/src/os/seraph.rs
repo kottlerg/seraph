@@ -700,6 +700,15 @@ pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
     pal_alloc::object_slab_acquire(min_bytes)
 }
 
+/// memmgr's current free-pool size in bytes, or `None` if memmgr is
+/// unreachable. Thin wrapper over the `QUERY_POOL_STATUS` aggregate query;
+/// used by tests asserting that a churn loop holds a bounded memmgr-pool
+/// footprint.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn memmgr_pool_free_bytes() -> Option<u64> {
+    pal_alloc::memmgr_query_free_bytes()
+}
+
 /// Fund `self_aspace`'s page-table growth budget to cover mapping a
 /// `region_pages`-page foreign-memory region (MMIO, DMA) into a
 /// retype-backed `AddressSpace`.

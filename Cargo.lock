@@ -289,6 +289,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "echosh"
+version = "0.1.0"
+
+[[package]]
 name = "elf"
 version = "0.1.0"
 dependencies = [
@@ -510,14 +514,6 @@ dependencies = [
 [[package]]
 name = "init-protocol"
 version = "0.1.0"
-
-[[package]]
-name = "inputtest"
-version = "0.1.0"
-dependencies = [
- "ipc",
- "syscall",
-]
 
 [[package]]
 name = "ipc"
@@ -978,6 +974,14 @@ name = "syscall-abi"
 version = "0.1.0"
 dependencies = [
  "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "terminal"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "syscall",
 ]
 
 [[package]]

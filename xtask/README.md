@@ -251,24 +251,26 @@ discarded.
 
 ---
 
-### `cargo xtask test-input`
+### `cargo xtask test-terminal`
 
-Boot the virtio-input keyboard driver's interactive smoke test. Launches
-QEMU headless with a QMP control socket, waits for the guest `inputtest`
-service to print `inputtest: READY for injection` on the serial log,
-injects a known key sequence (`a`, Shift+`a`, Return) via QMP
-`input-send-event`, and asserts the guest reports `ALL TESTS PASSED`.
-Exits non-zero on a guest `SOME TESTS FAILED`, an injection error, or the
-180 s timeout.
+Boot the terminal interactive test, exercising keyboard input end-to-end
+through the live virtio-input driver and the autostarted `terminal`. Launches
+QEMU headless with a QMP control socket, waits for the guest to print
+`terminal: READY for injection` on the serial log, injects a known key
+sequence (`a`, Shift+`a`, `b`, Backspace, Return) via QMP `input-send-event`,
+and asserts — host-side — that the terminal's local echo and the relayed child
+output (`[echosh] aA`) appear on the serial stream. Exits non-zero on an
+injection error or the 180 s timeout. This subsumes the former standalone
+keyboard smoke test: the echoed `a`/`A` prove keysym/modifier decode, and
+Return/Backspace prove the named-key decodes.
 
-A pure runner — it neither builds nor stages. Stage the recipe and repack
-the disk first (as for the other recipe harnesses):
+A pure runner — it neither builds nor stages. `terminal.svc` is in the default
+boot set, so the terminal autostarts; just build and repack:
 
 ```sh
 cargo xtask build
-cp sysroot/config/svcmgr/tests/inputtest.svc sysroot/config/svcmgr/services/
 cargo xtask mkdisk
-cargo xtask test-input [--arch x86_64|riscv64] [--cpus N]
+cargo xtask test-terminal [--arch x86_64|riscv64] [--cpus N]
 ```
 
 See [docs/testing.md](../docs/testing.md) for the harness model.

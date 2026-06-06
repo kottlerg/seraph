@@ -12,8 +12,13 @@
 //! Uses the `shared/font` crate's 9×20 bitmap font for text rendering.
 //! Output is best-effort: silently no-ops if no framebuffer is available.
 
-use font::{FONT_9X20, GLYPH_HEIGHT, GLYPH_WIDTH};
+use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 use init_protocol::{CapDescriptor, CapType, InitInfo};
+use text::{DecodeOutcome, Utf8Decoder};
+
+/// `U+FFFD` replacement character, rendered for any byte that does not
+/// extend a valid UTF-8 sequence.
+const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
 
 /// Seraph Framebuffer Descriptor magic: `"SFBD"` as little-endian u32.
 const SFBD_MAGIC: u32 = 0x4442_4653;
@@ -34,6 +39,7 @@ static mut STATE: FbState = FbState {
     max_rows: 0,
     col: 0,
     row: 0,
+    decoder: Utf8Decoder::new(),
 };
 
 struct FbState
@@ -45,6 +51,7 @@ struct FbState
     max_rows: u32,
     col: u32,
     row: u32,
+    decoder: Utf8Decoder,
 }
 
 // ── Cap discovery ────────────────────────────────────────────────────────────
@@ -214,6 +221,19 @@ pub fn newline()
     {
         return;
     }
+    // SAFETY: single-threaded; framebuffer is mapped.
+    unsafe {
+        newline_locked();
+    }
+}
+
+/// Advance to the start of the next row, scrolling if the last row is
+/// filled. Assumes the framebuffer is ready.
+///
+/// # Safety
+/// Framebuffer must be mapped.
+unsafe fn newline_locked()
+{
     // SAFETY: single-threaded cursor mutation; framebuffer is mapped.
     unsafe {
         STATE.col = 0;
@@ -225,7 +245,7 @@ pub fn newline()
     }
 }
 
-/// Write a single byte to the framebuffer.
+/// Write a single byte of a UTF-8 stream to the framebuffer.
 fn write_byte(byte: u8)
 {
     // SAFETY: single-threaded access to STATE; framebuffer is mapped and
@@ -235,44 +255,57 @@ fn write_byte(byte: u8)
         {
             b'\n' =>
             {
-                STATE.col = 0;
-                STATE.row += 1;
-                if STATE.row >= STATE.max_rows
-                {
-                    scroll();
-                }
+                STATE.decoder = Utf8Decoder::new();
+                newline_locked();
             }
             b'\r' =>
             {
+                STATE.decoder = Utf8Decoder::new();
                 STATE.col = 0;
             }
-            0x20..=0xFF =>
+            _ =>
             {
-                draw_glyph(byte);
-                STATE.col += 1;
-                if STATE.col >= STATE.max_cols
+                // Copy the decoder out by value (it is `Copy`) so no
+                // reference to the `static mut` is formed, then write it back.
+                let mut decoder = STATE.decoder;
+                let outcome = decoder.push(byte);
+                STATE.decoder = decoder;
+                match outcome
                 {
-                    STATE.col = 0;
-                    STATE.row += 1;
-                    if STATE.row >= STATE.max_rows
-                    {
-                        scroll();
-                    }
+                    DecodeOutcome::Codepoint(cp) => draw_codepoint(cp),
+                    DecodeOutcome::Invalid => draw_codepoint(REPLACEMENT_CODEPOINT),
+                    DecodeOutcome::NeedMore =>
+                    {}
                 }
             }
-            _ =>
-            {}
         }
     }
 }
 
-/// Draw a single glyph at the current cursor position.
+/// Resolve `cp` to one or more 9×20 glyph bitmaps and blit them at the
+/// cursor, advancing one column per emitted glyph.
 ///
 /// # Safety
 /// Framebuffer must be mapped and cursor within bounds.
-unsafe fn draw_glyph(byte: u8)
+unsafe fn draw_codepoint(cp: u32)
 {
-    let glyph_idx = byte as usize;
+    text::render_codepoint(cp, &mut |bitmap| {
+        // SAFETY: framebuffer is mapped; bitmap is a 20-entry glyph slice
+        // from the shared font tables.
+        unsafe {
+            draw_glyph_bitmap(bitmap);
+        }
+    });
+}
+
+/// Blit a 9×20 glyph bitmap at the current cursor and advance one column,
+/// wrapping at the right margin. Greyscale output is identical for Rgbx8
+/// and Bgrx8, so no per-format branch is needed.
+///
+/// # Safety
+/// Framebuffer must be mapped and cursor within bounds.
+unsafe fn draw_glyph_bitmap(bitmap: &[u16])
+{
     // SAFETY: single-threaded; STATE fields are valid after init.
     let (base, stride, pixel_x, pixel_y) = unsafe {
         (
@@ -283,9 +316,8 @@ unsafe fn draw_glyph(byte: u8)
         )
     };
 
-    for row_idx in 0..GLYPH_HEIGHT as usize
+    for (row_idx, &bits) in bitmap.iter().enumerate().take(GLYPH_HEIGHT as usize)
     {
-        let bits = FONT_9X20[glyph_idx * GLYPH_HEIGHT as usize + row_idx];
         let row_base = (pixel_y + row_idx) * stride;
 
         for col_idx in 0..GLYPH_WIDTH as usize
@@ -303,6 +335,15 @@ unsafe fn draw_glyph(byte: u8)
                 core::ptr::write_volatile(p.add(2), intensity);
                 core::ptr::write_volatile(p.add(3), 0);
             }
+        }
+    }
+
+    // SAFETY: single-threaded cursor mutation; framebuffer is mapped.
+    unsafe {
+        STATE.col += 1;
+        if STATE.col >= STATE.max_cols
+        {
+            newline_locked();
         }
     }
 }

@@ -110,6 +110,7 @@ dependencies = [
  "boot-protocol",
  "elf",
  "font",
+ "text",
 ]
 
 [[package]]
@@ -552,6 +553,7 @@ dependencies = [
  "init-protocol",
  "mmio",
  "syscall-abi",
+ "text",
 ]
 
 [[package]]
@@ -563,6 +565,7 @@ dependencies = [
  "ipc",
  "syscall",
  "syscall-abi",
+ "text",
 ]
 
 [[package]]

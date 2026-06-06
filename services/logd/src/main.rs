@@ -450,6 +450,11 @@ static DEVMGR_REGISTRY_EP: AtomicU32 = AtomicU32::new(0);
 /// Resolved SEND cap on the serial driver's service endpoint, cached after
 /// the first successful `QUERY_SERIAL_DEVICE`. Zero = unresolved.
 static SERIAL_CAP: AtomicU32 = AtomicU32::new(0);
+/// Resolved SEND cap on the framebuffer driver's service endpoint, cached
+/// after the first successful `QUERY_FRAMEBUFFER_DEVICE`. Zero = unresolved
+/// (headless boot, or the driver not yet spawned); framebuffer mirroring is
+/// then skipped so serial stays the authoritative channel.
+static FB_CAP: AtomicU32 = AtomicU32::new(0);
 /// logd's registered IPC buffer pointer, stashed so the emit path can issue
 /// the serial `ipc_call` without threading it through every formatter.
 static IPC_BUF_PTR: AtomicU64 = AtomicU64::new(0);
@@ -529,6 +534,78 @@ fn serial_write(bytes: &[u8])
         // safe here: a received `STREAM_BYTES` is already snapshotted into a
         // stack `IpcMessage`, and the kernel preserves the pending reply to
         // the log sender across this call (same pattern as vfsd → blk).
+        let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
+        off = end;
+    }
+}
+
+/// Resolve (and cache) the framebuffer driver's SEND cap via devmgr's
+/// `QUERY_FRAMEBUFFER_DEVICE`. Returns 0 while the driver is not yet
+/// resolvable (devmgr unreachable, headless boot, or driver not spawned);
+/// the caller then skips the framebuffer mirror. Reuses the same registry
+/// cap and IPC buffer the serial path resolved through.
+fn resolve_fb_cap(ipc_buf: *mut u64) -> u32
+{
+    let cached = FB_CAP.load(Ordering::Acquire);
+    if cached != 0
+    {
+        return cached;
+    }
+    let registry = DEVMGR_REGISTRY_EP.load(Ordering::Acquire);
+    if registry == 0
+    {
+        return 0;
+    }
+    let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
+    else
+    {
+        return 0;
+    };
+    if reply.label != ipc::devmgr_errors::SUCCESS
+    {
+        return 0;
+    }
+    let reply_caps = reply.caps();
+    if reply_caps.is_empty()
+    {
+        return 0;
+    }
+    let cap = reply_caps[0];
+    FB_CAP.store(cap, Ordering::Release);
+    cap
+}
+
+/// Mirror a fully-formatted line to the framebuffer driver via one or more
+/// `FB_WRITE_BYTES` calls. Silently skips the mirror if the driver is not
+/// resolvable, so serial remains the always-present, authoritative channel
+/// (CI scrapes serial; the framebuffer is an on-screen convenience).
+fn fb_write(bytes: &[u8])
+{
+    let ipc_buf = IPC_BUF_PTR.load(Ordering::Acquire) as *mut u64;
+    if ipc_buf.is_null()
+    {
+        return;
+    }
+    let cap = resolve_fb_cap(ipc_buf);
+    if cap == 0
+    {
+        return;
+    }
+    let mut off = 0;
+    while off < bytes.len()
+    {
+        let end = (off + SERIAL_CHUNK).min(bytes.len());
+        let chunk = &bytes[off..end];
+        let label = ipc::fb_labels::FB_WRITE_BYTES | ((chunk.len() as u64) << 16);
+        let msg = IpcMessage::builder(label).bytes(0, chunk).build();
+        // SAFETY: ipc_buf is the registered IPC buffer page. Same nested-IPC
+        // reasoning as serial_write: the received STREAM_BYTES is already
+        // snapshotted and the kernel preserves the pending reply to the log
+        // sender across this call.
         let _ = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) };
         off = end;
     }
@@ -630,6 +707,7 @@ impl LineBuf
     fn flush(&self)
     {
         serial_write(&self.buf[..self.len]);
+        fb_write(&self.buf[..self.len]);
     }
 }
 

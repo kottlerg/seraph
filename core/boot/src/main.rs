@@ -326,7 +326,15 @@ unsafe fn step1_locate_uefi_protocols(
     }
     if framebuffer.physical_base != 0
     {
-        bprintln!("[--------] boot: GOP: present");
+        // SAFETY: the serial console backend is initialized before this step,
+        // so direct console writes are valid here.
+        unsafe {
+            crate::console::console_write_str("[--------] boot: GOP: present ");
+            crate::console::console_write_dec32(framebuffer.width);
+            crate::console::console_write_str("x");
+            crate::console::console_write_dec32(framebuffer.height);
+            crate::console::console_write_str("\r\n");
+        }
     }
     else
     {

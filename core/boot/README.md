@@ -1,7 +1,8 @@
 # boot
 
-UEFI bootloader for Seraph. Reads boot configuration from `\EFI\seraph\boot.conf`,
-loads the kernel ELF and boot modules, parses init's ELF into `InitImage`, establishes
+UEFI bootloader for Seraph. Loads the kernel ELF and the
+`\EFI\seraph\bootstrap.bundle` (init plus boot modules) from hardcoded ESP paths,
+parses init's ELF into `InitImage`, establishes
 initial page tables with W^X enforcement, discovers firmware table addresses (ACPI
 RSDP / Device Tree blob) for passthrough to userspace, and jumps to the kernel entry
 point.
@@ -24,7 +25,6 @@ boot/
 │   └── riscv64-uefi.ld         # Linker script for RISC-V PE/COFF pipeline
 └── src/
     ├── main.rs                 # efi_main — boot sequence orchestrator
-    ├── config.rs               # Boot configuration file parser (boot.conf)
     ├── uefi.rs                 # UEFI protocol wrappers and memory services
     ├── elf.rs                  # UEFI-allocation layer over `shared/elf` + InitImage construction
     ├── firmware.rs             # ACPI / Device Tree address discovery (dispatch)
@@ -143,8 +143,8 @@ The CPU state established at the kernel entry point is specified in
   with firmware-advertised PCI windows. No per-device descriptors, no
   IRQ descriptors, no PCI enumeration. Namespace evaluation and
   device-level assignment are userspace's responsibility.
-- **No boot menu or interactive UI.** File paths come from `boot.conf`; the kernel
-  command line is an opaque string passed through to `BootInfo`.
+- **No boot menu or interactive UI.** The kernel and bundle ESP paths are
+  hardcoded; there is no boot configuration file and no kernel command line.
 - **No permanent page tables.** The initial tables are minimal and temporary; the
   kernel replaces them during Phase 3 of its initialisation sequence.
 

@@ -7,8 +7,9 @@
 //!
 //! Reserves a contiguous VA range and maps the bootloader-discovered
 //! GOP linear-framebuffer `Mmio` cap into it. On QEMU virt the
-//! framebuffer comes from `-device ramfb`; the bootloader captured its
-//! base via UEFI GOP before `ExitBootServices`.
+//! framebuffer comes from `-device VGA` (QEMU std VGA, matching x86-64's
+//! default adapter); the bootloader captured its base via UEFI GOP before
+//! `ExitBootServices`.
 
 use std::os::seraph::{fund_aspace_pt_budget, reserve_pages};
 

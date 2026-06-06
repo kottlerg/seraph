@@ -5,12 +5,15 @@
 
 //! Direct framebuffer output for ktest.
 //!
-//! Probes initial capabilities for a Seraph Framebuffer Descriptor (SFBD)
-//! `PlatformTable` page, reads display metadata from it, then maps the
-//! framebuffer pixel memory via its `Mmio` capability.
+//! Reads the framebuffer geometry the kernel forwards in
+//! `InitInfo.framebuffer` (the bootloader's GOP capture), finds the MMIO
+//! aperture capability whose range covers the framebuffer pixels, carves
+//! that sub-range out, and maps it. Decodes a UTF-8 byte stream and
+//! resolves glyphs through `shared/text::render_codepoint`, matching the
+//! userspace framebuffer driver and the kernel/bootloader consoles.
 //!
-//! Uses the `shared/font` crate's 9×20 bitmap font for text rendering.
-//! Output is best-effort: silently no-ops if no framebuffer is available.
+//! Output is best-effort: silently no-ops if no framebuffer is present
+//! (headless boot) or the covering aperture cannot be carved.
 
 use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 use init_protocol::{CapDescriptor, CapType, InitInfo};
@@ -19,12 +22,6 @@ use text::{DecodeOutcome, Utf8Decoder};
 /// `U+FFFD` replacement character, rendered for any byte that does not
 /// extend a valid UTF-8 sequence.
 const REPLACEMENT_CODEPOINT: u32 = 0xFFFD;
-
-/// Seraph Framebuffer Descriptor magic: `"SFBD"` as little-endian u32.
-const SFBD_MAGIC: u32 = 0x4442_4653;
-
-/// VA where the descriptor probe page is temporarily mapped.
-const PROBE_VA: u64 = 0x1000_0000;
 
 /// VA where the framebuffer pixel memory is mapped.
 const FB_VA: u64 = 0x1000_1000;
@@ -74,102 +71,75 @@ fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     }
 }
 
-/// Find a `CapDescriptor` by type and `aux0` value.
-fn find_cap_by_aux0(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u32>
+/// Carve a cap for exactly `[phys, phys + size)` out of the MMIO aperture
+/// that contains it, returning the carved slot.
+///
+/// Mirrors devmgr's `carve_subrange`: the covering aperture is found by
+/// range containment, any prefix below `phys` is split off and discarded,
+/// then the `size`-byte head is split from the remainder. `phys` and
+/// `size` must be page-aligned.
+fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u32>
 {
-    for d in descriptors(info)
+    let covering = descriptors(info).iter().find(|d| {
+        d.cap_type == CapType::Mmio && phys >= d.aux0 && phys + size <= d.aux0 + d.aux1
+    })?;
+
+    let mut cap = covering.slot;
+
+    // Drop the prefix [aux0, phys) when the aperture starts below the
+    // framebuffer; keep the upper portion.
+    let offset = phys - covering.aux0;
+    if offset > 0
     {
-        if d.cap_type == wanted_type && d.aux0 == wanted_aux0
-        {
-            return Some(d.slot);
-        }
+        let (lower, upper) = syscall::mmio_split(cap, offset).ok()?;
+        let _ = syscall::cap_delete(lower);
+        cap = upper;
     }
-    None
+
+    // `cap` now starts at `phys`. Split off the framebuffer-sized head and
+    // discard any upper remainder. A split error means the region is
+    // already exactly `size`, so use the cap as-is.
+    match syscall::mmio_split(cap, size)
+    {
+        Ok((head, rest)) =>
+        {
+            let _ = syscall::cap_delete(rest);
+            Some(head)
+        }
+        Err(_) => Some(cap),
+    }
 }
 
 // ── Initialisation ───────────────────────────────────────────────────────────
 
-/// Probe for a framebuffer and map it if found.
-///
-/// Scans Memory caps for a page containing the SFBD magic, reads metadata,
-/// then maps the corresponding `Mmio` for pixel access.
+/// Map the framebuffer described by `InitInfo.framebuffer` and ready the
+/// renderer.
 ///
 /// # Safety
 /// Must be called once during early ktest startup, single-threaded.
 pub unsafe fn init(info: &InitInfo, aspace_cap: u32)
 {
-    let descs = descriptors(info);
-
-    // Phase 1: find the SFBD descriptor page among Memory caps.
-    let mut fb_phys: u64 = 0;
-    let mut fb_width: u32 = 0;
-    let mut fb_height: u32 = 0;
-    let mut fb_stride: u32 = 0;
-
-    for d in descs
-    {
-        if d.cap_type != CapType::Memory || d.aux1 != 4096
-        {
-            continue;
-        }
-
-        if syscall::mem_map(d.slot, aspace_cap, PROBE_VA, 0, 1, syscall::MAP_READONLY).is_err()
-        {
-            continue;
-        }
-
-        // SAFETY: PROBE_VA is mapped to a valid 4096-byte page by mem_map above.
-        let magic = unsafe { core::ptr::read_volatile(PROBE_VA as *const u32) };
-        if magic == SFBD_MAGIC
-        {
-            // SAFETY: descriptor page mapped; reading documented SFBD offsets.
-            // cast_ptr_alignment: PROBE_VA is page-aligned (4096); all field
-            // offsets (8, 16, 20, 24) satisfy u32/u64 alignment.
-            #[allow(clippy::cast_ptr_alignment)]
-            unsafe {
-                let ptr = PROBE_VA as *const u8;
-                fb_phys = core::ptr::read_volatile(ptr.add(8).cast::<u64>());
-                fb_width = core::ptr::read_volatile(ptr.add(16).cast::<u32>());
-                fb_height = core::ptr::read_volatile(ptr.add(20).cast::<u32>());
-                fb_stride = core::ptr::read_volatile(ptr.add(24).cast::<u32>());
-                // pixel_format read but not stored — greyscale rendering is
-                // identical for both Rgbx8 and Bgrx8.
-            }
-            syscall::mem_unmap(aspace_cap, PROBE_VA, 1).ok();
-            break;
-        }
-
-        syscall::mem_unmap(aspace_cap, PROBE_VA, 1).ok();
-    }
-
-    if fb_phys == 0 || fb_width == 0 || fb_height == 0 || fb_stride == 0
+    // Geometry comes from InitInfo.framebuffer (the kernel forwards the
+    // bootloader's GOP capture). A zeroed base means a headless boot.
+    let fb = info.framebuffer;
+    if fb.physical_base == 0 || fb.width == 0 || fb.height == 0 || fb.stride == 0
     {
         return;
     }
 
-    // Phase 2: find and map the framebuffer Mmio.
-    //
-    // The MMIO region cap may cover the entire PCI MMIO window (1+ GiB on
-    // QEMU q35). Mapping all of it would consume a huge VA range and collide
-    // with ktest test addresses. Split the region down to just the
-    // framebuffer pixels (stride × height, page-aligned) before mapping.
-    let Some(mmio_slot) = find_cap_by_aux0(info, CapType::Mmio, fb_phys)
+    // The framebuffer pixels sit inside one of the coarse MMIO apertures
+    // delivered to init. Carve the page-aligned pixel span out of the
+    // covering aperture so only the framebuffer is mapped — the aperture
+    // itself may span the entire PCI MMIO window (1+ GiB on QEMU q35).
+    let base_aligned = fb.physical_base & !0xFFF;
+    let fb_bytes = u64::from(fb.stride) * u64::from(fb.height);
+    let span_end = (fb.physical_base + fb_bytes + 0xFFF) & !0xFFF;
+    let map_bytes = span_end - base_aligned;
+
+    let Some(fb_cap) = carve_framebuffer_cap(info, base_aligned, map_bytes)
     else
     {
         return;
-    };
-
-    let fb_bytes = u64::from(fb_stride) * u64::from(fb_height);
-    let fb_pages_bytes = (fb_bytes + 0xFFF) & !0xFFF; // round up to page
-    let fb_cap = match syscall::mmio_split(mmio_slot, fb_pages_bytes)
-    {
-        Ok((first, _second)) => first,
-        Err(_) =>
-        {
-            // Split failed (region already small enough, or error). Try the
-            // original cap — it will map fine if the region is ≤ fb size.
-            mmio_slot
-        }
     };
 
     if syscall::mmio_map(aspace_cap, fb_cap, FB_VA, 0).is_err()
@@ -177,18 +147,26 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u32)
         return;
     }
 
+    // The framebuffer may begin at a page offset within the mapped span.
+    let pixel_base = FB_VA + (fb.physical_base - base_aligned);
+
     // Clear the screen to black.
-    // SAFETY: FB_VA is mapped and writable (Mmio cap has MAP|WRITE).
+    // SAFETY: the mapped span covers stride × height bytes from pixel_base;
+    // the Mmio cap carries MAP|WRITE.
     unsafe {
-        core::ptr::write_bytes(FB_VA as *mut u8, 0, fb_stride as usize * fb_height as usize);
+        core::ptr::write_bytes(
+            pixel_base as *mut u8,
+            0,
+            fb.stride as usize * fb.height as usize,
+        );
     }
 
     // SAFETY: single-threaded init; all values validated above.
     unsafe {
-        STATE.base = FB_VA;
-        STATE.stride = fb_stride;
-        STATE.max_cols = fb_width / GLYPH_WIDTH;
-        STATE.max_rows = fb_height / GLYPH_HEIGHT;
+        STATE.base = pixel_base;
+        STATE.stride = fb.stride;
+        STATE.max_cols = fb.width / GLYPH_WIDTH;
+        STATE.max_rows = fb.height / GLYPH_HEIGHT;
         STATE.col = 0;
         STATE.row = 0;
         STATE.ready = true;

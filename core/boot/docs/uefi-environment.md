@@ -25,7 +25,7 @@ acquisition, `ExitBootServices`, and error handling.
 zeroing the `framebuffer.physical_base` field in `BootInfo`. A headless system or a
 virtual machine without a GOP framebuffer is a valid configuration.
 
-When GOP is present, the bootloader requests a fixed 1024x768 mode via `SetMode`
+When GOP is present, the bootloader requests a fixed 1280x720 mode via `SetMode`
 before recording the active mode for handoff (`TARGET_FB_WIDTH` /
 `TARGET_FB_HEIGHT` in [`boot/src/uefi.rs`](../src/uefi.rs)). Both architectures
 acquire the framebuffer through this same GOP path, so the fixed request yields a

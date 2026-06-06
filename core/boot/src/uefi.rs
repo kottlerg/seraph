@@ -884,13 +884,12 @@ pub unsafe fn exit_boot_services(
 /// Both architectures acquire the framebuffer through the same UEFI GOP path,
 /// so issuing one `SetMode` request here gives a consistent framebuffer — and
 /// QEMU window — size across x86-64 and RISC-V, independent of firmware or
-/// QEMU-version defaults. 1024x768 is a near-universal VESA mode offered by
-/// both arches' GOP (under QEMU both run std VGA, same `QemuVideoDxe` mode
-/// table). When a firmware does not offer it, `set_target_mode` leaves the
-/// active mode untouched and boot proceeds at whatever resolution firmware
-/// selected.
-const TARGET_FB_WIDTH: u32 = 1024;
-const TARGET_FB_HEIGHT: u32 = 768;
+/// QEMU-version defaults. 1280x720 (720p) is present in both arches' std VGA
+/// GOP mode table (`QemuVideoDxe`). When a firmware does not offer it,
+/// `set_target_mode` leaves the active mode untouched and boot proceeds at
+/// whatever resolution firmware selected.
+const TARGET_FB_WIDTH: u32 = 1280;
+const TARGET_FB_HEIGHT: u32 = 720;
 
 /// Classify a GOP mode's pixel layout as a supported [`PixelFormat`].
 ///
@@ -998,7 +997,8 @@ unsafe fn set_target_mode(bs: *mut EfiBootServices, gop: *mut EfiGraphicsOutputP
 /// Enumerates all handles supporting GOP via `LocateHandleBuffer(ByProtocol)` and
 /// returns the first that exposes a linear framebuffer with a supported pixel format
 /// (RGBX or BGRX). Handles reporting `PixelBltOnly` (format 3, no physical address)
-/// or `PixelBitMask` (format 2, custom layout) are skipped.
+/// are skipped, as are `PixelBitMask` (format 2) layouts other than the standard
+/// 8bpc RGBX / BGRX masks (see `classify_pixel_format`).
 ///
 /// Returns `None` if no usable GOP handle exists. This is not an error — the boot
 /// proceeds with `framebuffer.physical_base == 0`.

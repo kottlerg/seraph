@@ -37,6 +37,15 @@ the one-time init-logd history pull is skipped on restart.
   init-logd's direct-UART fallback. See
   [docs/console-model.md](../../docs/console-model.md).
 
+* **Driver-mediated framebuffer mirror.** logd also mirrors each line
+  it writes to serial onto the framebuffer, resolved at most once via
+  devmgr's `QUERY_FRAMEBUFFER_DEVICE` and written with `FB_WRITE_BYTES`,
+  so the steady-state userspace log stream reaches the screen as well as
+  the UART (matching the early-kernel console). The mirror soft-degrades
+  to a no-op when no framebuffer driver is present (headless boot),
+  leaving serial the authoritative channel; the resolution is attempted
+  exactly once so a headless boot does not re-query devmgr per line.
+
 * **History buffer.** logd maintains a per-sender ring of completed
   log lines, populated by every `STREAM_BYTES`-derived flush and
   seeded at startup from init-logd's handover payload. Lines stay in
@@ -73,7 +82,8 @@ logd/
 │   └── ipc-interface.md        # IPC labels logd handles
 └── src/
     ├── main.rs                 # entry, bootstrap, event loop,
-    │                           # driver-mediated serial emit, self_log
+    │                           # driver-mediated serial + framebuffer
+    │                           # emit, self_log
     ├── handover.rs             # HANDOVER_PULL caller
     └── slot.rs                 # SlotTable: HashMap<badge, Slot>
                                 # with per-sender history ring
@@ -90,14 +100,15 @@ endpoint, procmgr `SEND|GRANT`, devmgr registry):
 | 0 | RECV on the master log endpoint |
 | 1 | SEND on the master log endpoint (single-use; carries `HANDOVER_PULL` for the history drain then the terminal `HANDOVER_RELEASE`, then deleted). `0` on a restart — there is no init-logd left to pull from, so logd skips the handover |
 | 2 | Badged SEND on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
-| 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE`) |
+| 3 | Badged SEND on devmgr's registry endpoint carrying `REGISTRY_QUERY_AUTHORITY` (to resolve the serial driver via `QUERY_SERIAL_DEVICE` and the framebuffer driver via `QUERY_FRAMEBUFFER_DEVICE`) |
 
 logd registers its death-EQ with procmgr before the handover pull (while
 init-logd still drains the endpoint and procmgr is not yet reaping init),
 then pulls cap[1] and deletes it (no other use for a SEND cap on its own
 endpoint). The devmgr-registry cap is kept for the lifetime of the
-process; logd uses it once to resolve and cache the serial driver's write
-endpoint.
+process; logd uses it to resolve and cache the serial driver's write
+endpoint and, when a framebuffer driver is present, the framebuffer
+driver's.
 
 ## Relevant Design Documents
 
@@ -107,7 +118,7 @@ endpoint.
 | [docs/bootstrap.md](../../docs/bootstrap.md) | init-logd's boot role and the init → svcmgr handover that precedes logd's launch |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Death-notification cascade logd subscribes to |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | Endpoint identity, cap transfer semantics that make the init-logd handover possible |
-| [docs/console-model.md](../../docs/console-model.md) | Console output ownership; logd as the serial driver's primary client |
+| [docs/console-model.md](../../docs/console-model.md) | Console output ownership; logd as the serial driver's primary client and a framebuffer-driver consumer |
 | [services/init/README.md](../init/README.md) | init-logd's role + termination, and the reserved log-sink sources init endows svcmgr |
 | [services/svcmgr/README.md](../svcmgr/README.md) | svcmgr's launch + supervision of logd from the `log_sink` recipe |
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler + retroactive bind |

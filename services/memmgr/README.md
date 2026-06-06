@@ -44,6 +44,10 @@ address space at virtual addresses they choose themselves.
   caps memmgr has handed out, keyed on a procmgr-minted badge.
 - **Reclamation on process death** — on `PROCESS_DIED` from procmgr,
   reclaim the dead process's memory caps into the free pool.
+- **Mid-life reclamation** — on `RELEASE_MEMORY_CAPS` (or `UNREGISTER_REGION`
+  for a demand-paged region) from a live process, return the named grant to the
+  free pool so a per-unit-of-work retype loop holds a bounded footprint without
+  waiting for process death.
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments.
@@ -72,7 +76,7 @@ The full memmgr IPC specification is in
 [`docs/ipc-interface.md`](docs/ipc-interface.md). Key operations:
 
 - `REQUEST_MEMORY_CAPS(want_pages, flags) → memory_caps[..]`
-- `RELEASE_MEMORY_CAPS(memory_caps[..])`
+- `RELEASE_MEMORY_CAPS(phys_base[..])` — return granted regions mid-life
 - `REGISTER_PROCESS(...) → badged_endpoint_cap` (procmgr-only)
 - `PROCESS_DIED(badge)` (procmgr-only)
 

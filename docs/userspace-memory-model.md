@@ -187,9 +187,12 @@ memmgr serves frame requests over IPC. The contract:
 - **Caller maps.** Every returned Memory cap is mapped at a caller-
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).
-- **Caller releases.** `RELEASE_MEMORY_CAPS` returns specific caps to the
-  pool. Process death triggers automatic reclamation via procmgr's
-  `PROCESS_DIED` notification to memmgr.
+- **Caller releases.** `RELEASE_MEMORY_CAPS` returns a granted region to the
+  pool mid-life, named by the `phys_base` memmgr reported at grant (the caller
+  need not still hold the cap — it may have retyped the region and dropped its
+  copy). This keeps a per-unit-of-work retype loop (e.g. ruststd's Thread
+  slab per spawn) at a bounded pool footprint. Process death triggers automatic
+  reclamation via procmgr's `PROCESS_DIED` notification to memmgr.
 
 Authoritative wire shape lives in
 [`services/memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md).

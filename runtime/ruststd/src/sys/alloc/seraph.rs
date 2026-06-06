@@ -33,7 +33,7 @@ use crate::os::seraph::current_ipc_buf;
 use crate::ptr::{NonNull, null_mut};
 use crate::sync::atomic::{AtomicBool, Ordering};
 
-use ipc::memmgr_labels::REQUEST_MEMORY_CAPS;
+use ipc::memmgr_labels::{QUERY_POOL_STATUS, RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
 // Heap-zone VAs are private to the std-overlay allocator. They sit
@@ -378,13 +378,16 @@ impl Heap {
         // Augment: request 1 page from memmgr, feed to cap_create_aspace
         // in augment mode (target = self_aspace). Single page covers
         // ~511 new PT-entries' worth of mappable VA.
-        let Some(aug_memory) = slab_acquire_fresh(PAGE_SIZE, 2) else {
+        let Some(aug) = slab_acquire_fresh(PAGE_SIZE, 2) else {
             return false;
         };
+        let aug_memory = aug.cap;
         if syscall::cap_create_aspace(aug_memory, self.self_aspace, 1).is_err() {
             // Augment-mode returns 0 on success; treat any error as fatal
-            // for this grow. Drop the unused Memory cap.
+            // for this grow. Drop the unused (virgin) Memory cap and return its
+            // run to memmgr's pool.
             let _ = syscall::cap_delete(aug_memory);
+            slab_release_fresh(aug.phys);
             return false;
         }
         // The augment cap is consumed by cap_create_aspace; do not delete.
@@ -571,9 +574,11 @@ fn slab_round_to_class(bytes: u64) -> u64 {
 /// to the first returned cap (any cap unblocks sub-page retypes; a too-small
 /// cap simply means the next page-sized retype request triggers a refresh).
 ///
-/// Returns `Some((slot, pages))` on success, `None` on IPC failure or empty
-/// reply.
-fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64)> {
+/// Returns `Some((slot, pages, phys))` on success, `None` on IPC failure or
+/// empty reply. `phys` is the chosen cap's physical base, which memmgr reports
+/// at `data[1 + returned + i]`; the caller passes it to [`slab_release_fresh`]
+/// to return the run to memmgr's pool mid-life.
+fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64, u64)> {
     let ipc_buf = current_ipc_buf();
     if ipc_buf.is_null() {
         return None;
@@ -589,15 +594,16 @@ fn slab_request_pages(memmgr_ep: u32, min_pages: u64) -> Option<(u32, u64)> {
         return None;
     }
     let caps = reply.caps();
+    // Reply layout: data[1+i] = page_count_i, data[1+returned+i] = phys_base_i.
     // Prefer the first cap that already covers `min_pages`.
     for i in 0..returned {
         let pages = reply.word(1 + i);
         if pages >= min_pages {
-            return Some((caps[i], pages));
+            return Some((caps[i], pages, reply.word(1 + returned + i)));
         }
     }
     // Fallback: take the first (smaller) cap so sub-page retypes still work.
-    Some((caps[0], reply.word(1)))
+    Some((caps[0], reply.word(1), reply.word(1 + returned)))
 }
 
 /// Number of pages to request when refilling the object slab.
@@ -628,7 +634,7 @@ fn slab_acquire_pooled(pool: &ObjectSlab, need: u64, want_pages: u64) -> Option<
         if ep == 0 {
             return None;
         }
-        let (new_cap, cap_pages) = slab_request_pages(ep, want_pages)?;
+        let (new_cap, cap_pages, _phys) = slab_request_pages(ep, want_pages)?;
         const ALLOCATOR_METADATA_RESERVE: u64 = 64;
         let total = cap_pages.saturating_mul(PAGE_SIZE);
         let usable = total.saturating_sub(ALLOCATOR_METADATA_RESERVE);
@@ -648,24 +654,61 @@ fn slab_acquire_pooled(pool: &ObjectSlab, need: u64, want_pages: u64) -> Option<
     res
 }
 
+/// A freshly-acquired dedicated Memory cap plus the identity memmgr needs to
+/// reclaim its backing run mid-life. `phys` is the physical base memmgr
+/// reported in the grant reply; pass it to [`slab_release_fresh`] once every
+/// kernel object retyped from `cap` has been deleted.
+#[derive(Clone, Copy)]
+pub struct SlabGrant {
+    pub cap: u32,
+    pub phys: u64,
+}
+
 /// Acquire a fresh, dedicated Memory cap for a page-aligned retype. No
 /// caching — the cap is consumed entirely by the caller's single retype
 /// (or by a few retypes against the leftover sub-page tail, which the
 /// caller manages). Used by variable-size types (`EventQueue`, `Thread`,
 /// `AddressSpace`, `CSpace`) where caching offers no benefit.
-fn slab_acquire_fresh(need: u64, want_pages: u64) -> Option<u32> {
+fn slab_acquire_fresh(need: u64, want_pages: u64) -> Option<SlabGrant> {
     let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
     if ep == 0 {
         return None;
     }
-    let (new_cap, cap_pages) = slab_request_pages(ep, want_pages)?;
+    let (new_cap, cap_pages, phys) = slab_request_pages(ep, want_pages)?;
     const ALLOCATOR_METADATA_RESERVE: u64 = 64;
     let total = cap_pages.saturating_mul(PAGE_SIZE);
     if total.saturating_sub(ALLOCATOR_METADATA_RESERVE) < need {
+        // Too small for this request. Delete the inner cap and return the run
+        // to memmgr's pool — the slab is virgin (nothing retyped yet), and
+        // deleting the inner alone would strand the run in memmgr's
+        // per-process accounting until process death.
         let _ = syscall::cap_delete(new_cap);
+        slab_release_fresh(phys);
         return None;
     }
-    Some(new_cap)
+    Some(SlabGrant { cap: new_cap, phys })
+}
+
+/// Return a fresh slab's backing run to memmgr's pool, naming it by the `phys`
+/// base recorded in its [`SlabGrant`]. Best-effort: a failed IPC just leaves
+/// the run accounted to this process until it dies (the prior behaviour).
+///
+/// The caller MUST have already deleted every kernel object retyped from the
+/// slab; releasing while a retype is live is correctness-safe (the kernel
+/// refuses to re-hand-out live bytes) but strands the run until the retype is
+/// freed.
+pub fn slab_release_fresh(phys: u64) {
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    if ep == 0 {
+        return;
+    }
+    let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return;
+    }
+    let msg = ipc::IpcMessage::builder(RELEASE_MEMORY_CAPS).word(0, 1).word(1, phys).build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
 }
 
 /// Return a Memory-cap slot with at least `min_bytes` of `available_bytes`
@@ -691,8 +734,41 @@ pub fn object_slab_acquire(min_bytes: u64) -> Option<u32> {
     } else if need <= 512 {
         slab_acquire_pooled(&SLAB_BIN_512, need, want_pages)
     } else {
-        slab_acquire_fresh(need, want_pages)
+        slab_acquire_fresh(need, want_pages).map(|g| g.cap)
     }
+}
+
+/// Like [`object_slab_acquire`] but always takes a fresh, dedicated cap and
+/// returns the [`SlabGrant`] identity, so the caller can return the run to
+/// memmgr's pool mid-life via [`slab_release_fresh`] once every object retyped
+/// from the slab is deleted. For a per-unit-of-work retype (e.g. one Thread
+/// slab per spawn) this keeps the process's memmgr-pool footprint bounded
+/// instead of leaking a run per iteration until process death.
+pub fn object_slab_acquire_fresh(min_bytes: u64) -> Option<SlabGrant> {
+    let need = slab_round_to_class(min_bytes);
+    let want_pages = need.div_ceil(PAGE_SIZE).max(1) + 1;
+    slab_acquire_fresh(need, want_pages)
+}
+
+/// memmgr's current free-pool size in bytes (`QUERY_POOL_STATUS`, reply
+/// `data[3]`). `None` if memmgr is unreachable. A read-only aggregate query;
+/// used by the threadchurn regression to assert a bounded pool footprint.
+pub fn memmgr_query_free_bytes() -> Option<u64> {
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    if ep == 0 {
+        return None;
+    }
+    let ipc_buf = current_ipc_buf();
+    if ipc_buf.is_null() {
+        return None;
+    }
+    let msg = ipc::IpcMessage::builder(QUERY_POOL_STATUS).build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) }.ok()?;
+    if reply.label != 0 {
+        return None;
+    }
+    Some(reply.word(3))
 }
 
 /// Fund `self_aspace`'s page-table growth budget to cover mapping a

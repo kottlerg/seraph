@@ -166,8 +166,20 @@ caller-side derivation copies of the Memory caps become unreachable as part
 of that teardown; memmgr's intermediary copies remain valid and are what the
 free-pool insertion uses.
 
-`RELEASE_MEMORY_CAPS` from a live process follows the same path for the
-listed slots without touching the per-process entry's other records.
+`RELEASE_MEMORY_CAPS` from a live process is the mid-life counterpart for a
+caller-owned grant. The caller usually cannot transfer the cap back — having
+retyped the region (e.g. into a Thread) and dropped its inner copy, it no
+longer holds one — so it names each region by the `phys_base` memmgr reported
+at grant. memmgr matches that base against the entry's frame list
+(`FRAME_VA_UNMAPPED` grants only; demand-mapped chunks are reclaimed by
+`UNREGISTER_REGION`), inserts the retained intermediary cap back into the pool,
+and frees the node, leaving the entry's other records untouched. Unmatched
+bases are ignored, so release is idempotent (a racing join-plus-reaper
+double-release is harmless). The caller must have deleted every object retyped
+from the region first; releasing a still-retyped region is correctness-safe
+(the kernel refuses to re-hand-out live bytes) but the run is only re-grantable
+whole — its retype bump pointer blocks `memory_split` — until the retype is
+freed.
 
 `UNREGISTER_REGION` from a live process is the mid-life counterpart for a
 demand-paged region: memmgr removes the region node, and for each frame it
@@ -193,10 +205,15 @@ cap. Eligibility:
   the original boot-time ingest guarantees for caps derived from the
   same `BootInfo` Memory cap.
 
-Coalescing runs after every `PROCESS_DIED` reclamation and after every
-`RELEASE_MEMORY_CAPS` whose freed range adjoins another free run. It is
-bounded: a single reclamation that frees `K` pages can produce at most
-`K` coalesce operations, each O(log pool_size) to update bucket indices.
+Coalescing runs explicitly after every `PROCESS_DIED` reclamation. The
+mid-life paths (`RELEASE_MEMORY_CAPS`, `UNREGISTER_REGION`) reinsert through a
+coalesce-on-demand push that folds runs only when the free-pool array is full,
+so steady-state churn pays no per-release coalescing cost. A "dirty" released
+run — one whose source `MemoryObject` kept its retype bump pointer advanced —
+declines `memory_merge` (the kernel requires a virgin tail) and stays a
+discrete, re-grantable-whole run. Coalescing is bounded: a single reclamation
+that frees `K` pages can produce at most `K` coalesce operations, each
+O(log pool_size) to update bucket indices.
 
 Coalescing across boot-time ingest boundaries (between two distinct
 `BootInfo` Memory caps) is not attempted — those caps have no common

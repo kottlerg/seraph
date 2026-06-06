@@ -162,7 +162,12 @@ pub struct DriverSpawnConfig<'a>
 {
     pub procmgr_ep: u32,
     pub bootstrap_ep: u32,
-    pub module_cap: u32,
+    /// ELF source for the child: a boot-module Memory cap
+    /// ([`CreateSource::Module`], the bootstrap-essential PCI drivers) or a
+    /// rootfs file cap ([`CreateSource::File`], for on-disk PCI drivers loaded
+    /// after vfsd-mount, e.g. virtio-input). Both spawn `CREATE_PINNED` — a PCI
+    /// device with a BAR/IRQ is DMA-capable and must be eager-mapped.
+    pub source: CreateSource,
     pub bars: BarSpec<'a>,
     pub irq_cap: Option<u32>,
     pub service_ep: u32,
@@ -189,31 +194,29 @@ pub struct DriverSpawnConfig<'a>
 // requires passing the same `DriverSpawnConfig` to each. The linear
 // presentation matches the bootstrap protocol one-to-one.
 #[allow(clippy::too_many_lines)]
-pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
+pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64) -> bool
 {
     let _ = config.bars.bases;
     let _ = config.bars.sizes;
 
-    // Release the module cap on every exit before CREATE_PROCESS consumes it
-    // (missing BAR/IRQ, badge-derive failure, ipc_call failure). Disarmed once
-    // the ipc_call returns, which transfers the cap to procmgr.
-    let mut module_guard = ModuleCapGuard::new(config.module_cap);
+    // Release the source ELF cap on every exit before the create call consumes
+    // it (missing BAR/IRQ, badge-derive failure, ipc_call failure). Disarmed
+    // once the ipc_call returns, which transfers the cap to procmgr.
+    let source_cap = match config.source
+    {
+        CreateSource::Module(m) => m,
+        CreateSource::File { file_cap, .. } => file_cap,
+    };
+    let mut module_guard = ModuleCapGuard::new(source_cap);
 
     let Some(bar_cap) = config.bars.caps.first().copied()
     else
     {
         std::os::seraph::log!("driver spawn: no BAR cap");
-        return;
-    };
-    let Some(irq_slot) = config.irq_cap
-    else
-    {
-        std::os::seraph::log!("driver spawn: no IRQ cap");
-        return;
+        return false;
     };
     let procmgr_ep = config.procmgr_ep;
     let bootstrap_ep = config.bootstrap_ep;
-    let module_cap = config.module_cap;
     let service_ep = config.service_ep;
     let registry_ep = config.registry_ep;
     let device_badge = config.device_badge;
@@ -225,45 +228,59 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     else
     {
         std::os::seraph::log!("driver spawn: badged creator derivation failed");
-        return;
+        return false;
     };
 
-    // CREATE_PROCESS via procmgr. Caps [module, creator]. The child has no
-    // stdio wired by default — it logs through `seraph::log!` via the
-    // discovery cap procmgr installs in `ProcessInfo`.
+    // Create the process via procmgr. Caps [source, creator]. The child has no
+    // stdio wired by default — it logs through `seraph::log!` via the discovery
+    // cap procmgr installs in `ProcessInfo`.
     //
-    // CREATE_PINNED: drivers reached through `spawn_driver` are PCI devices
-    // with BAR + IRQ — the DMA-capable class. A device may write driver memory
-    // before a demand fault could back it (the kernel never pins), so these
-    // must be eager-mapped, not demand-paged. Keyed off the spawn path for now;
-    // #165 replaces this with an explicit per-driver DMA attribute.
-    let create_msg =
-        IpcMessage::builder(procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_PINNED)
-            .cap(module_cap)
-            .cap(badged_creator)
-            .build();
+    // CREATE_PINNED: drivers reached through `spawn_driver` are PCI devices with
+    // BAR + IRQ — the DMA-capable class. A device may write driver memory before
+    // a demand fault could back it (the kernel never pins), so these must be
+    // eager-mapped, not demand-paged. Applies to both the boot-module and the
+    // on-disk (`CREATE_FROM_FILE`) source. #165 replaces the spawn-path keying
+    // with an explicit per-driver DMA attribute.
+    let create_msg = match config.source
+    {
+        CreateSource::Module(module_cap) =>
+        {
+            IpcMessage::builder(procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_PINNED)
+                .cap(module_cap)
+                .cap(badged_creator)
+                .build()
+        }
+        CreateSource::File { file_cap, size } =>
+        {
+            IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PINNED)
+                .word(0, size)
+                .cap(file_cap)
+                .cap(badged_creator)
+                .build()
+        }
+    };
     // SAFETY: ipc_buf is the registered IPC buffer.
     let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
     else
     {
-        std::os::seraph::log!("driver CREATE_PROCESS ipc_call failed");
-        return;
+        std::os::seraph::log!("driver create ipc_call failed");
+        return false;
     };
-    // ipc_call returned: the module cap was transferred to procmgr regardless of
+    // ipc_call returned: the source cap was transferred to procmgr regardless of
     // the reply label (procmgr owns its teardown on its own failure). Disarm so
     // the guard does not free the now-reused slot.
     module_guard.disarm();
     if reply.label != 0
     {
-        std::os::seraph::log!("driver CREATE_PROCESS failed");
-        return;
+        std::os::seraph::log!("driver create failed");
+        return false;
     }
 
     let reply_caps = reply.caps();
     if reply_caps.len() < 2
     {
         std::os::seraph::log!("driver CREATE_PROCESS reply missing caps");
-        return;
+        return false;
     }
     let process_handle = reply_caps[0];
     let thread_cap = reply_caps[1];
@@ -278,14 +295,25 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     else
     {
         std::os::seraph::log!("driver bar cap derivation failed");
-        return;
+        return false;
     };
-    let Ok(irq_copy) = syscall::cap_derive(irq_slot, syscall::RIGHTS_ALL)
-    else
+    // IRQ is optional. A device sharing an INTx line (so devmgr could not carve
+    // it a private IRQ cap) is delivered a null IRQ slot; the driver then polls
+    // its queue instead of waiting on interrupts.
+    let irq_copy = match config.irq_cap
     {
-        std::os::seraph::log!("driver irq cap derivation failed");
-        let _ = syscall::cap_delete(bar_copy);
-        return;
+        Some(slot) =>
+        {
+            let Ok(c) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+            else
+            {
+                std::os::seraph::log!("driver irq cap derivation failed");
+                let _ = syscall::cap_delete(bar_copy);
+                return false;
+            };
+            c
+        }
+        None => 0,
     };
     let service_copy = if service_ep != 0
     {
@@ -306,7 +334,7 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
         {
             let _ = syscall::cap_delete(service_copy);
         }
-        return;
+        return false;
     };
 
     // Best-effort release of every derived per-child cap. Deleting a slot a
@@ -333,26 +361,32 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     {
         std::os::seraph::log!("driver START_PROCESS failed");
         drop_derived();
-        return;
+        return false;
     }
 
-    // Serve bootstrap round 1: [bar, irq, service].
+    // Serve bootstrap round 1. With an IRQ: [bar, irq, service] (the original
+    // shape virtio-blk decodes). Without: [bar, service] — a null IRQ slot
+    // cannot be transferred, so it is omitted and the driver infers "no IRQ"
+    // from the 2-cap round and polls instead.
+    let round1_with_irq = [bar_copy, irq_copy, service_copy];
+    let round1_no_irq = [bar_copy, service_copy];
+    let round1_caps: &[u32] = if irq_copy != 0
+    {
+        &round1_with_irq
+    }
+    else
+    {
+        &round1_no_irq
+    };
     // SAFETY: ipc_buf is the registered IPC buffer.
     if unsafe {
-        ipc::bootstrap::serve_round(
-            bootstrap_ep,
-            child_badge,
-            ipc_buf,
-            false,
-            &[bar_copy, irq_copy, service_copy],
-            &[],
-        )
+        ipc::bootstrap::serve_round(bootstrap_ep, child_badge, ipc_buf, false, round1_caps, &[])
     }
     .is_err()
     {
         std::os::seraph::log!("driver bootstrap round 1 failed");
         drop_derived();
-        return;
+        return false;
     }
 
     // Round 2: [devmgr_query], done.
@@ -371,12 +405,13 @@ pub fn spawn_driver(config: &DriverSpawnConfig, ipc_buf: *mut u64)
     {
         std::os::seraph::log!("driver bootstrap round 2 failed");
         drop_derived();
-        return;
+        return false;
     }
 
     // Child owns its full cap set: keep it alive, but release devmgr's handles.
     child_guard.disarm();
     std::os::seraph::log!("driver started");
+    true
 }
 
 /// Spawn a non-PCI platform device driver with a minimal capability set: a

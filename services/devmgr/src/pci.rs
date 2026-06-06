@@ -314,6 +314,16 @@ pub fn is_virtio_blk(dev: &PciDevice) -> bool
     dev.vendor_id == 0x1AF4 && (dev.device_id == 0x1001 || dev.device_id == 0x1042)
 }
 
+/// Check if a PCI device is a `VirtIO` input device (keyboard / pointer).
+///
+/// virtio-input is virtio device type 18: modern PCI device ID `0x1052`,
+/// legacy/transitional `0x1012`. QEMU's `virtio-keyboard-pci` with
+/// `disable-legacy=on` presents as `0x1052`.
+pub fn is_virtio_input(dev: &PciDevice) -> bool
+{
+    dev.vendor_id == 0x1AF4 && (dev.device_id == 0x1012 || dev.device_id == 0x1052)
+}
+
 /// Walk the PCI capability list for a `VirtIO` device and populate
 /// `VirtioPciStartupInfo` with the locations of the four register regions.
 ///

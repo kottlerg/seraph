@@ -42,6 +42,10 @@ pub struct QemuLaunchSpec<'a>
     pub cpus: u32,
     pub headless: bool,
     pub gdb: bool,
+    /// When set, expose a QMP control socket at this path
+    /// (`-qmp unix:<path>,server,nowait`) so a host harness can drive the
+    /// guest — the interactive-input test injects keys this way.
+    pub qmp_socket: Option<&'a Path>,
 }
 
 /// Construct the full QEMU argv for a launch spec.
@@ -62,6 +66,11 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Vec<String>
         ),
         "-device".into(),
         "virtio-blk-pci,drive=hd0,disable-legacy=on".into(),
+        // Keyboard back-end for the virtio-input driver. PCI on both arches
+        // (the riscv64 `virt` machine has a PCIe bridge, same as virtio-blk).
+        // `id=kbd0` lets the QMP interactive-test harness target it.
+        "-device".into(),
+        "virtio-keyboard-pci,disable-legacy=on,id=kbd0".into(),
         "-serial".into(),
         "stdio".into(),
         "-no-reboot".into(),
@@ -70,6 +79,14 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Vec<String>
     if spec.headless
     {
         args.extend(["-display".into(), "none".into()]);
+    }
+
+    if let Some(sock) = spec.qmp_socket
+    {
+        args.extend([
+            "-qmp".into(),
+            format!("unix:{},server,nowait", sock.display()),
+        ]);
     }
 
     if spec.gdb

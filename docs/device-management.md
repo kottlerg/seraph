@@ -168,9 +168,10 @@ devmgr loads driver binaries from one of two places:
   `ipc_recv`. The spawn is at-most-once per boot; on failure
   (binary missing, ELF corrupt, hardware-carve failure, OOM, etc.)
   devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
-  `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients (timed,
-  and the terminal once it lands) degrade to their no-device path. Growing the boot bundle with non-essentials would
-  waste permanently-leaked post-`ExitBootServices` UEFI allocation
+  `QUERY_RTC_DEVICE` / `QUERY_INPUT_DEVICE` calls and clients (timed
+  today; future input consumers) degrade to their no-device path.
+  Growing the boot bundle with non-essentials would waste
+  permanently-leaked post-`ExitBootServices` UEFI allocation
   (see `core/boot/src/main.rs`), so on-disk loading is preferred for
   anything not on the read-the-disk-in-the-first-place critical path.
 

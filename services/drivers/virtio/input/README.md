@@ -99,3 +99,9 @@ fan-out. Each is a separate effort if filed.
 | [docs/device-management.md](../../../../docs/device-management.md) | Driver lifecycle, on-disk loading, DMA safety |
 | [docs/ipc-design.md](../../../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
 | [docs/capability-model.md](../../../../docs/capability-model.md) | Capability types, rights, delegation, badges |
+
+---
+
+## Summarized By
+
+[docs/device-management.md](../../../../docs/device-management.md)

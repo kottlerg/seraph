@@ -1545,7 +1545,10 @@ pub mod input_errors
 /// codepoint (`a` = 0x61, `A` = 0x41, `1` = 0x31), and named keys use the
 /// `0xFF00`+ function range. The driver resolves Shift/Caps into the keysym
 /// (`A` vs `a`) and reports the full modifier mask so consumers can form
-/// Ctrl/Alt combinations without the driver encoding terminal policy.
+/// Ctrl/Alt combinations without the driver encoding terminal policy. The mask
+/// reflects state *after* the event is applied, so a modifier key's own press
+/// event carries its bit (a Shift press reports `MOD_SHIFT` next to keysym
+/// `SHIFT_L`); its release clears it.
 pub mod keysym
 {
     // Named keys (X11 function-key range). Printable keys are not enumerated;

@@ -204,6 +204,13 @@ impl CSpace
         // mutable borrow so the borrow checker is satisfied.
         let next = {
             let slot = self.slot(idx.get()).ok_or(CapError::InvalidIndex)?;
+            // The free-time guard prevents an occupied slot from ever entering
+            // the list; this catches any other corruption source before we hand
+            // the slot out, so `allocate_slot` never returns an occupied slot.
+            debug_assert!(
+                slot.is_on_free_list(),
+                "allocate_slot popped a slot not on the free list"
+            );
             slot.next_free()
         };
 
@@ -344,12 +351,14 @@ impl CSpace
     ///
     /// Silently ignores an out-of-range, unmapped, or zero index.
     ///
-    /// Rejects re-freeing the current `free_head`: pushing it again would
-    /// set `slot.next_free = slot`, a self-loop that turns the next
-    /// `allocate_slot` into an unbounded spin under IRQs-off cspace.lock.
-    /// A Null tag alone is not a "double-free" notification — `allocate_slot`
-    /// clears the slot on pop, so a freshly-allocated, not-yet-populated
-    /// slot is also Null-tagged but legitimately off the list.
+    /// Rejects a double-free of any slot: [`CapabilitySlot::is_on_free_list`]
+    /// is true for every slot currently linked on the list (head, interior, or
+    /// tail), so re-freeing one is detected and dropped. Pushing an already-on-
+    /// list slot would splice it in a second time, creating a cycle the next
+    /// `allocate_slot` would walk into — handing out an occupied slot. A Null
+    /// tag alone is not enough to detect this (`allocate_slot` clears the slot
+    /// on pop, so a freshly-allocated, not-yet-populated slot is also Null);
+    /// the free-list marker is the discriminator.
     pub fn free_slot(&mut self, index: u32)
     {
         let Some(nz_index) = NonZeroU32::new(index)
@@ -357,22 +366,24 @@ impl CSpace
         {
             return;
         };
-        if self.free_head == Some(nz_index)
+        let old_head = self.free_head;
+        let Some(slot) = self.slot_mut(index)
+        else
+        {
+            return;
+        };
+        if slot.is_on_free_list()
         {
             #[cfg(not(test))]
             crate::kprintln!(
-                "free_slot: double-free index={} ignored (already free-list head)",
+                "free_slot: double-free index={} ignored (already on free list)",
                 index
             );
             return;
         }
-        let old_head = self.free_head;
-        if let Some(slot) = self.slot_mut(index)
-        {
-            slot.set_next_free(old_head);
-            self.free_head = Some(nz_index);
-            self.free_count += 1;
-        }
+        slot.set_next_free(old_head);
+        self.free_head = Some(nz_index);
+        self.free_count += 1;
     }
 
     /// Allocate a slot, populate it with the given capability, and return the
@@ -434,6 +445,12 @@ impl CSpace
                 .and_then(super::slot::CapabilitySlot::next_free);
             self.free_head = next;
             self.free_count -= 1;
+            // Drop the free-list marker so the unlinked slot is canonical
+            // off-list (same state as an `allocate_slot` pop).
+            if let Some(slot) = self.slot_mut(target)
+            {
+                slot.clear();
+            }
             return true;
         }
         // Walk the list looking for the predecessor.
@@ -464,6 +481,11 @@ impl CSpace
                 };
                 cur_slot.set_next_free(after);
                 self.free_count -= 1;
+                // Drop the free-list marker on the spliced-out slot.
+                if let Some(slot) = self.slot_mut(target)
+                {
+                    slot.clear();
+                }
                 return true;
             }
             cur_idx = next_idx;
@@ -799,5 +821,49 @@ mod tests
                 expected
             );
         }
+    }
+
+    #[test]
+    fn double_free_non_head_does_not_corrupt_freelist()
+    {
+        // Small CSpace so the entire free list fits in one page and the drain
+        // below is bounded.
+        let mut cs = CSpace::new(0, 5);
+        let a = cs.allocate_slot().unwrap();
+        let b = cs.allocate_slot().unwrap();
+        let c = cs.allocate_slot().unwrap();
+
+        // Build a multi-entry free list: head = a -> b -> c -> (rest).
+        cs.free_slot(c.get());
+        cs.free_slot(b.get());
+        cs.free_slot(a.get());
+        assert_eq!(cs.free_head, Some(a), "a should be the free-list head");
+
+        let free_before = cs.free_count;
+        // Double-free a NON-head slot (b; the head is a). The old head-only
+        // guard missed this and spliced b in a second time, cycling the list.
+        cs.free_slot(b.get());
+        assert_eq!(
+            cs.free_count, free_before,
+            "non-head double-free must be rejected, not re-pushed"
+        );
+
+        // Drain the whole free list. A cycle would hand out a duplicate index
+        // (and inflate the count); every popped index must be unique.
+        let mut seen = Vec::new();
+        while let Ok(idx) = cs.allocate_slot()
+        {
+            assert!(
+                !seen.contains(&idx),
+                "allocate_slot returned duplicate index {} — free list corrupted",
+                idx.get()
+            );
+            seen.push(idx);
+        }
+        assert_eq!(
+            seen.len(),
+            free_before,
+            "drain must recover every free slot exactly once"
+        );
     }
 }

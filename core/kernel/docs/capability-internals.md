@@ -67,20 +67,36 @@ permanently locked to the null capability, enforced at the lookup level.
 
 ### Free Slot Tracking
 
-A free list of available slot indices is maintained separately:
+A free list of available slot indices is maintained intrusively, with its head in
+kernel memory:
 
 ```rust
 pub struct CSpace
 {
     // ... (above fields)
-    free_head: Option<usize>,  // head of intrusive free list of slot indices
+    free_head: Option<NonZeroU32>, // head of the intrusive free list (None = empty)
+    free_count: usize,             // slots currently on the free list (O(1) queries)
 }
 ```
 
-Free slots store their `next` index in their `CapabilitySlot.tag` field (repurposed
-when the slot is empty). Allocation pops from the free list; deallocation pushes. If
-the free list is empty and more slots are needed, the next L2 page is allocated and
-all its slots are pushed onto the free list.
+A free slot is `CapTag::Null` and encodes its successor's index in the `deriv_parent`
+field (the derivation parent is meaningless on an empty slot); `None` marks the list
+tail. The encoded `SlotId` carries `epoch == 0`, which a live derivation link never
+does, so the two uses of `deriv_parent` stay distinguishable. Allocation pops
+`free_head` and clears the slot; deallocation pushes onto the head. When the list is
+empty and more slots are needed, the next L2 page is allocated and all its usable
+slots are threaded onto the list.
+
+A `Null` tag alone cannot tell a slot that is *linked on the free list* from one that
+was just allocated and not yet populated, and the list tail is byte-identical to a
+cleared slot. Each linked slot therefore also carries an on-free-list marker in
+`CapabilitySlot.pad[0]`; `is_on_free_list()` reports membership in O(1) from
+`tag == Null && pad[0] == marker`. `free_slot` consults it to reject a double-free of
+any slot — re-pushing a slot already on the list would splice it in twice and cycle
+the list, after which allocation could hand back an occupied slot. The marker is set
+when a slot is linked (`set_next_free`) and cleared when it leaves the list (on
+allocation, and when `remove_from_free_list` unlinks a specific index);
+`allocate_slot` debug-asserts the popped slot was a genuine member.
 
 This gives amortised O(1) allocation and O(1) deallocation.
 

@@ -450,11 +450,19 @@ static DEVMGR_REGISTRY_EP: AtomicU32 = AtomicU32::new(0);
 /// Resolved SEND cap on the serial driver's service endpoint, cached after
 /// the first successful `QUERY_SERIAL_DEVICE`. Zero = unresolved.
 static SERIAL_CAP: AtomicU32 = AtomicU32::new(0);
-/// Resolved SEND cap on the framebuffer driver's service endpoint, cached
-/// after the first successful `QUERY_FRAMEBUFFER_DEVICE`. Zero = unresolved
-/// (headless boot, or the driver not yet spawned); framebuffer mirroring is
-/// then skipped so serial stays the authoritative channel.
+/// Resolved SEND cap on the framebuffer driver's service endpoint. `0` =
+/// not yet attempted; [`FB_UNAVAILABLE`] = attempted and no driver present
+/// (headless boot); any other value = the resolved cap. The resolve runs at
+/// most once, caching its outcome either way so framebuffer mirroring stays a
+/// no-op on a headless boot without re-querying devmgr.
 static FB_CAP: AtomicU32 = AtomicU32::new(0);
+
+/// Sentinel stored in [`FB_CAP`] once a resolution attempt finds no
+/// framebuffer driver. Repeating the `QUERY_FRAMEBUFFER_DEVICE` per log line
+/// would open a deadlock window against devmgr's own logging — devmgr →
+/// `log_ep` → logd, while logd blocks here on devmgr's reply — so the attempt
+/// is made exactly once. `u32::MAX` is never a valid `CSpace` slot.
+const FB_UNAVAILABLE: u32 = u32::MAX;
 /// logd's registered IPC buffer pointer, stashed so the emit path can issue
 /// the serial `ipc_call` without threading it through every formatter.
 static IPC_BUF_PTR: AtomicU64 = AtomicU64::new(0);
@@ -547,6 +555,10 @@ fn serial_write(bytes: &[u8])
 fn resolve_fb_cap(ipc_buf: *mut u64) -> u32
 {
     let cached = FB_CAP.load(Ordering::Acquire);
+    if cached == FB_UNAVAILABLE
+    {
+        return 0;
+    }
     if cached != 0
     {
         return cached;
@@ -554,28 +566,31 @@ fn resolve_fb_cap(ipc_buf: *mut u64) -> u32
     let registry = DEVMGR_REGISTRY_EP.load(Ordering::Acquire);
     if registry == 0
     {
+        // Registry not recorded yet (serial_init sets it before the drain
+        // loop); retry once it is, without consuming the single attempt.
         return 0;
     }
+    // Single attempt: cache the outcome either way so the drain loop issues at
+    // most one QUERY_FRAMEBUFFER_DEVICE. The framebuffer driver, when present,
+    // is spawned by devmgr before svcmgr launches logd, so this first attempt
+    // resolves it; on a headless boot there is no driver and the attempt caches
+    // FB_UNAVAILABLE.
     let msg = IpcMessage::builder(ipc::devmgr_labels::QUERY_FRAMEBUFFER_DEVICE)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(registry, &msg, ipc_buf) })
-    else
+    let cap = match unsafe { ipc::ipc_call(registry, &msg, ipc_buf) }
     {
-        return 0;
+        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS =>
+        {
+            reply.caps().first().copied().unwrap_or(0)
+        }
+        _ => 0,
     };
-    if reply.label != ipc::devmgr_errors::SUCCESS
-    {
-        return 0;
-    }
-    let reply_caps = reply.caps();
-    if reply_caps.is_empty()
-    {
-        return 0;
-    }
-    let cap = reply_caps[0];
-    FB_CAP.store(cap, Ordering::Release);
+    FB_CAP.store(
+        if cap == 0 { FB_UNAVAILABLE } else { cap },
+        Ordering::Release,
+    );
     cap
 }
 

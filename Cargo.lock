@@ -985,6 +985,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadchurn"
+version = "0.1.0"
+dependencies = [
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "threadchurn-tester"
+version = "0.1.0"
+
+[[package]]
 name = "threadstack"
 version = "0.1.0"
 

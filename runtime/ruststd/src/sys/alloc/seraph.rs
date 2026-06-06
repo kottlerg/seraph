@@ -717,16 +717,33 @@ pub fn fund_aspace_pt_budget(self_aspace: u32, region_pages: u64) -> bool {
     // `region_pages`: one last-level table per 512 pages plus a boundary
     // span, and the upper levels (PD/PDPT/root) with their spans (+4).
     let pt_pages = region_pages.div_ceil(512) + 4;
-    let Some(frame) = object_slab_acquire(pt_pages * PAGE_SIZE) else {
+    let need_bytes = pt_pages * PAGE_SIZE;
+
+    // Reuse the existing PT growth budget. Demand-stack VAs are reused — the
+    // reserve allocator coalesces and re-hands a freed range — so a reused
+    // stack's intermediate page tables persist and the budget stabilises after
+    // the first few spawns. Funding only the shortfall (and nothing once the
+    // budget already covers the region) keeps a spawn/join loop from leaking a
+    // CSpace slot + PT pages on every spawn.
+    let have = syscall::cap_info(self_aspace, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0);
+    if have >= need_bytes {
+        return true;
+    }
+    let shortfall_pages = (need_bytes - have).div_ceil(PAGE_SIZE).max(1);
+
+    let Some(frame) = object_slab_acquire(shortfall_pages * PAGE_SIZE) else {
         return false;
     };
-    if syscall::cap_create_aspace(frame, self_aspace, pt_pages).is_err() {
+    if syscall::cap_create_aspace(frame, self_aspace, shortfall_pages).is_err() {
         let _ = syscall::cap_delete(frame);
         return false;
     }
-    // The augment retypes the budget out of `frame`; the AS chunk holds its
-    // own reference, so the cap is not deleted (mirrors the heap augment
-    // path). The sub-page tail is reclaimed when the process dies.
+    // The augment bumped the source MemoryObject's refcount into the AS's PT
+    // chunk (`add_chunk` in `sys_cap_create_aspace`), so the chunk keeps the
+    // backing alive on its own — the `frame` cap slot is now dead weight.
+    // Delete it to reclaim the slot; the bytes are reclaimed with the AS at
+    // process death.
+    let _ = syscall::cap_delete(frame);
     true
 }
 

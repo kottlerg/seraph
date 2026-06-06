@@ -49,6 +49,8 @@ members = [
     "programs/stackoverflow",
     "programs/stdiotest",
     "programs/stdiotest/tester",
+    "programs/threadchurn",
+    "programs/threadchurn/tester",
     "programs/threadstack",
     "programs/threadstack/tester",
     "xtask",

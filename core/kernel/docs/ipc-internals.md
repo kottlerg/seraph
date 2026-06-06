@@ -438,11 +438,32 @@ waitset_notify(wait_set, member_idx):
    b. members[member_idx].pending = false
    c. badge = members[member_idx].badge
    d. Release lock; return badge
-3. else:
+3. Level-readiness self-heal: for each member, if source_is_ready(source)
+   right now, Release lock and return its badge.
+4. else:
    a. waiter = current_tcb
    b. Release lock
    c. Block current thread; return wakeup_badge when woken
 ```
+
+**Why step 3 exists, and its memory-ordering requirement.** Readiness
+notifications (`waitset_notify`) are *edge-triggered*: `event_queue_post` fires
+only on the empty→non-empty `count` transition and `endpoint_call` only on the
+empty→non-empty send-queue transition. A second item that arrives while a first
+is still queued therefore fires no notify, and — for a consumer that handles one
+item per wakeup — would be invisible without the level re-check in step 3.
+
+The self-heal reads source readiness **without taking the source lock**: taking
+it here would acquire `source.lock` while holding `ws.lock`, inverting the
+`source.lock → ws.lock` order `waitset_notify` uses (it runs under the source
+lock and acquires `ws.lock`) and deadlocking. Because the read is lockless, each
+source's readiness signal MUST be an atomic that the self-heal reads with
+`Acquire`, paired with `Release` mutations under the source lock — otherwise a
+weak-memory target (riscv64) can observe a stale not-ready and strand a queued
+sender/event whose enqueue fired no edge notify (lost wakeup). The readiness
+signals are: `NotificationState::bits` (`AtomicU64`), `EventQueueState::count`
+(`AtomicU32`), and `EndpointState::send_nonempty` (`AtomicU32`, a shadow of
+`send_head != null` republished under `ep.lock` at every send-queue mutation).
 
 ### Wait Set Add/Remove
 

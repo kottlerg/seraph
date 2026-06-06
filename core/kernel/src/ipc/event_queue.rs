@@ -42,8 +42,15 @@ pub struct EventQueueState
     pub ring: *mut u64,
     /// User-visible capacity (max concurrent entries).
     pub capacity: u32,
-    /// Current number of entries in the ring.
-    pub count: u32,
+    /// Current number of entries in the ring. Atomic so the wait-set
+    /// level-readiness self-heal (`wait_set::source_is_ready`) can observe it
+    /// with `Acquire` ordering without taking `lock` — the source lock cannot
+    /// be acquired there (it would invert the `source.lock → ws.lock` order
+    /// `waitset_notify` takes, deadlocking). All mutations occur under `lock`;
+    /// the `Release` stores below pair with that Acquire load so a level-ready
+    /// queue is never missed on weak-memory targets (#285-adjacent). Mirrors
+    /// `NotificationState::bits`.
+    pub count: core::sync::atomic::AtomicU32,
     /// Write index into `ring` (next slot to write).
     pub write_idx: u32,
     /// Read index into `ring` (next slot to read).
@@ -88,7 +95,7 @@ impl EventQueueState
         Self {
             ring,
             capacity,
-            count: 0,
+            count: core::sync::atomic::AtomicU32::new(0),
             write_idx: 0,
             read_idx: 0,
             waiter: core::ptr::null_mut(),
@@ -162,8 +169,8 @@ pub unsafe fn event_queue_post(
         return Ok(Some(waiter));
     }
 
-    // Queue full?
-    if eq.count >= eq.capacity
+    // Queue full? Read under `lock`; Relaxed suffices (the lock orders it).
+    if eq.count.load(core::sync::atomic::Ordering::Relaxed) >= eq.capacity
     {
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
@@ -178,10 +185,11 @@ pub unsafe fn event_queue_post(
         *eq.ring.add(eq.write_idx as usize) = payload;
     }
     eq.write_idx = (eq.write_idx + 1) % ring_len;
-    eq.count += 1;
+    // Release: publishes the new level to the lockless `source_is_ready` reader.
+    let prev = eq.count.fetch_add(1, core::sync::atomic::Ordering::Release);
 
     // Notify a registered wait set on the transition empty → non-empty.
-    if eq.count == 1 && !eq.wait_set.is_null()
+    if prev == 0 && !eq.wait_set.is_null()
     {
         // SAFETY: wait_set is a valid *mut WaitSetState.
         unsafe { crate::ipc::wait_set::waitset_notify(eq.wait_set, eq.wait_set_member_idx) };
@@ -212,13 +220,15 @@ pub unsafe fn event_queue_recv(
     // SAFETY: lock serialises post/recv; paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
 
-    if eq.count > 0
+    if eq.count.load(core::sync::atomic::Ordering::Relaxed) > 0
     {
         let ring_len = eq.capacity + 1;
         // SAFETY: read_idx < ring_len (invariant); ring is valid.
         let payload = unsafe { *eq.ring.add(eq.read_idx as usize) };
         eq.read_idx = (eq.read_idx + 1) % ring_len;
-        eq.count -= 1;
+        // Release: publishes the drained level (possibly →0) to the lockless
+        // `source_is_ready` reader so it cannot see a stale non-empty.
+        eq.count.fetch_sub(1, core::sync::atomic::Ordering::Release);
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
         return Ok(payload);

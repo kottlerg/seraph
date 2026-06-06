@@ -697,8 +697,14 @@ unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
         WaitSetSourceTag::Endpoint =>
         {
             let ep = source_ptr.cast::<crate::ipc::endpoint::EndpointState>();
-            // SAFETY: ep is a valid EndpointState.
-            !unsafe { (*ep).send_head.is_null() }
+            // Acquire-load the atomic send-queue-non-empty shadow rather than the
+            // plain `send_head` pointer: this runs without `ep.lock` (taking it
+            // would invert the `ep.lock → ws.lock` order and deadlock), so a
+            // plain read could observe a stale empty on weak-memory targets and
+            // strand a queued sender whose enqueue fired no edge notify. The
+            // shadow is Release-stored under `ep.lock` at every `send_head`
+            // mutation. SAFETY: ep is a valid EndpointState.
+            unsafe { (*ep).send_nonempty.load(Ordering::Acquire) != 0 }
         }
         WaitSetSourceTag::Notification =>
         {
@@ -709,8 +715,11 @@ unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
         WaitSetSourceTag::EventQueue =>
         {
             let eq = source_ptr.cast::<crate::ipc::event_queue::EventQueueState>();
+            // Acquire-load pairs with the Release count mutations in
+            // event_queue_post/recv so this lockless check never sees a stale
+            // level (see the field doc on `EventQueueState::count`).
             // SAFETY: eq is a valid EventQueueState.
-            unsafe { (*eq).count > 0 }
+            unsafe { (*eq).count.load(Ordering::Acquire) > 0 }
         }
     }
 }

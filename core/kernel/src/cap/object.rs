@@ -1543,6 +1543,10 @@ unsafe fn dealloc_object_one(
                                     &mut ep.send_head,
                                     &mut ep.send_tail,
                                 );
+                                // Republish send-queue level (#285-adjacent):
+                                // this unlink can empty the queue, and the
+                                // wait-set self-heal reads the shadow locklessly.
+                                ep.refresh_send_ready();
                                 ep.lock.unlock_raw(saved);
                             }
                             IpcThreadState::BlockedOnRecv =>
@@ -2086,6 +2090,9 @@ unsafe fn dealloc_object_one(
                     }
                     ep.send_head = core::ptr::null_mut();
                     ep.send_tail = core::ptr::null_mut();
+                    // Keep the send-ready shadow consistent with send_head even
+                    // on the dealloc drain path (#285-adjacent).
+                    ep.refresh_send_ready();
                     // Wake receivers.
                     let mut tcb = ep.recv_head;
                     while !tcb.is_null()
@@ -2111,8 +2118,13 @@ unsafe fn dealloc_object_one(
             use crate::cap::retype::{dispatch_for, retype_free};
             // dispatch_for is total over the kernel's retypable types; the
             // Endpoint arm always returns Some. Unwrap-or-fall-through with
-            // a fallback raw size keeps the lint quiet without panicking.
-            let raw_bytes = dispatch_for(ObjectType::Endpoint, 0).map_or(88, |e| e.raw_bytes);
+            // a fallback raw size keeps the lint quiet without panicking. The
+            // fallback mirrors dispatch_for's computed value (24 wrapper +
+            // EndpointState) so it cannot drift from the alloc-side size.
+            let raw_bytes = dispatch_for(ObjectType::Endpoint, 0).map_or(
+                24 + core::mem::size_of::<crate::ipc::endpoint::EndpointState>() as u64,
+                |e| e.raw_bytes,
+            );
 
             // SAFETY: ancestor_ptr is non-null; it was set by `with_ancestor`
             // at retype time and points at the source MemoryObject's header.

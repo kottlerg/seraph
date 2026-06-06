@@ -47,10 +47,18 @@ address space at virtual addresses they choose themselves.
 - **Mid-life reclamation** — on `RELEASE_MEMORY_CAPS` (or `UNREGISTER_REGION`
   for a demand-paged region) from a live process, return the named grant to the
   free pool so a per-unit-of-work retype loop holds a bounded footprint without
-  waiting for process death.
+  waiting for process death. Best-fit best-effort selection (reuse a freed run
+  of the requested size rather than re-split a larger one) plus a coalesce after
+  every reclamation bound this on both sides: the caller's pool footprint *and*
+  memmgr's own per-run tracking-anchor (CSpace) footprint. A high-volume
+  spawn/free churn — e.g. ruststd thread creation, which grants and frees a
+  fresh Thread-retype slab per spawn — therefore cannot drift memmgr's CSpace
+  toward exhaustion even though its RAM stays flat.
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
-  `REQUIRE_CONTIGUOUS` requests as the pool fragments.
+  `REQUIRE_CONTIGUOUS` requests as the pool fragments. Runs after every
+  reclamation (death, release, unregister), so reclaimed runs rejoin their
+  physical neighbours instead of accumulating as discrete parked runs.
 
 ## What memmgr deliberately does NOT do
 

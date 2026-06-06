@@ -1215,7 +1215,19 @@ fn select_memory_caps(
         return Ok((granted, 1));
     }
 
-    // Best-effort: greedy, largest-first, bounded by reply slots.
+    // Best-effort: a single best-fit run satisfies the request with the fewest
+    // caps and reuses a freed run of the requested size instead of re-splitting
+    // a larger one, so churn that frees and re-requests a fixed size cycles the
+    // same run (and the same anchor slot) rather than leaking one per request.
+    // Fall back to greedy largest-first only when no single run is large enough.
+    if let Some(idx) = pool.smallest_fit(want_pages)
+        && let Some((outer, phys)) = take_exactly(pool, idx, want_pages)
+    {
+        granted[0] = (outer, want_pages, phys);
+        return Ok((granted, 1));
+    }
+
+    // Fallback: greedy, largest-first across multiple runs, bounded by reply slots.
     let mut count: usize = 0;
     let mut remaining = want_pages;
     while remaining > 0 && count < MAX_REPLY_CAPS
@@ -1405,6 +1417,11 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         let phys = req.word(1 + i);
         let _ = record.release_frame_by_phys(phys, pool);
     }
+    // Restore contiguity across the released runs. As in `handle_unregister_region`,
+    // `push_or_coalesce` only coalesces under slot pressure, so a release-heavy
+    // churn (ruststd returning Thread-retype slabs on join/reap) would otherwise
+    // fragment the pool monotonically.
+    pool.coalesce();
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
@@ -1703,6 +1720,12 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
     let end = region.va_base.saturating_add(region.len);
     let aspace_cap = record.aspace_cap;
     record.reclaim_frames_in(region.va_base, end, aspace_cap, pool);
+    // Restore contiguity across the reclaimed runs. The per-frame
+    // `push_or_coalesce` only fires `coalesce` under slot pressure, so a churn
+    // working set that never fills the array would otherwise leave the pool more
+    // fragmented after each register/unregister cycle, drifting the run (and
+    // tracking-anchor) count up monotonically across a long run.
+    pool.coalesce();
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 

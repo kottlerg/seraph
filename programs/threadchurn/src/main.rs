@@ -3,38 +3,45 @@
 
 // programs/threadchurn/src/main.rs
 
-//! `CSpace`-slot reclaim fixture for the usertest `threadchurn` tester (#240).
+//! `CSpace`-slot and memmgr-pool reclaim fixture for the usertest
+//! `threadchurn` tester (#240, #274).
 //!
-//! Spawns and joins, then spawns and detaches, batches of threads, sampling the
-//! process's populated `CSpace`-slot count via `CAP_INFO_CSPACE_USED`
-//! before and after. With the reclaim fixes — `thread_slab` deleted on the
-//! `Thread::new` success path, the Thread cap deleted on `join`, and the
-//! detached-thread reaper freeing dropped handles on their death-post — the slot
-//! count stays flat. Before the fix it grew ~2-3 slots per spawn and exhausted
-//! the process `CSpace` within a few dozen spawns (`thread cap alloc failed`).
+//! Spawns and joins, then spawns and detaches, batches of threads, sampling two
+//! quantities before and after: the process's populated `CSpace`-slot count
+//! (`CAP_INFO_CSPACE_USED`) and memmgr's free-pool size (`QUERY_POOL_STATUS`).
 //!
-//! The high-count join phase (`JOIN_CHURN`) deliberately runs far past the
-//! pre-#274 ~340-spawn memmgr-pool ceiling. memmgr now returns a process's
-//! granted Memory caps to its pool mid-life (`RELEASE_MEMORY_CAPS`), and
-//! ruststd returns each reclaimed thread's Thread-retype slab on join/reap, so
-//! the pool footprint stays bounded across the churn. The fixture samples
-//! memmgr's free-pool size (`QUERY_POOL_STATUS`) before and after and asserts
-//! the drop stays within `POOL_SLACK_BYTES` — before the fix the pool drained
-//! by `JOIN_CHURN * ~6` pages until the worker's demand-stack fault could no
-//! longer be backed (#274).
+//! Reclaim runs at three sites — `thread_slab` freed on the `Thread::new`
+//! success path, the Thread cap deleted on `join`, and the detached-thread
+//! reaper freeing dropped handles on their death-post. The slab returns to
+//! memmgr's pool mid-life via `RELEASE_MEMORY_CAPS`; the Thread cap and
+//! demand-stack VA are reused. So across the churn both the slot count and the
+//! pool footprint stay flat.
 //!
-//! Idiomatic `std` for the threading; only the slot sampling reaches the Seraph
-//! `cap_info` surface.
+//! The fixture asserts that flatness: slot growth within `SLACK`, free-pool
+//! drop within `POOL_SLACK_BYTES`. A per-spawn slot leak would grow the slot
+//! count ~2-3 slots per spawn; a per-spawn slab leak would drop the free pool
+//! by `JOIN_CHURN * ~6` pages — either trips its bound. The high `JOIN_CHURN`
+//! also runs past the count at which an unbounded memmgr tracking-anchor
+//! footprint live-locks the service, so completing the run at all proves that
+//! footprint stays bounded (#274); a regression there surfaces as a HANG, which
+//! the periodic heartbeat keeps visible against slow progress.
+//!
+//! Idiomatic `std` for the threading; only the sampling reaches the Seraph
+//! `cap_info` / memmgr surfaces.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::os::seraph::log;
 use std::process::ExitCode;
 
-/// Threads per high-count spawn+join churn phase. Runs well past the pre-#274
-/// ~340-spawn memmgr-pool ceiling to prove mid-life slab reclaim keeps the
-/// pool footprint bounded.
-const JOIN_CHURN: u64 = 400;
+/// Threads per spawn+join churn phase. Runs well past the ~250-spawn count at
+/// which an unbounded memmgr tracking-anchor (`CSpace`) footprint live-locks the
+/// service, so completing the run is itself the criterion-2 termination proof
+/// (#274). Also sized so a per-spawn slab RAM leak drops memmgr's free pool
+/// several times past `POOL_SLACK_BYTES` (criterion 1). Completes within the CI
+/// run timeout under TCG (each iteration is a spawn + demand-fault +
+/// REQUEST/RELEASE round-trip).
+const JOIN_CHURN: u64 = 600;
 /// Threads per reaping churn (detach-burst cleanup). Kept small: its job is to
 /// drive reaper sweeps, not to stress the pool.
 const REAP_CHURN: u64 = 50;
@@ -45,11 +52,12 @@ const DETACH_BATCH: u64 = 48;
 /// slabs) that may not have settled at the baseline. Steady-state growth is 0.
 const SLACK: u64 = 12;
 /// Allowed memmgr free-pool drop across the churn (#274). With mid-life slab
-/// reclaim the steady-state footprint is flat (~0 drop); the pre-fix leak would
-/// drop free memory by `JOIN_CHURN * ~6` pages (~9 MiB at 400), so this 2-MiB
-/// bound cleanly separates fixed from leaking while absorbing the handful of
-/// pages other services churn during the run.
-const POOL_SLACK_BYTES: u64 = 2 * 1024 * 1024;
+/// reclaim the steady-state footprint stays flat (a passing run stays far under
+/// this bound); a per-spawn slab RAM leak would drop free memory by
+/// `JOIN_CHURN * ~6` pages (~14 MiB at 600), so this 1-MiB bound cleanly
+/// separates a bounded footprint from a leaking one while absorbing the handful
+/// of pages other services churn during the run.
+const POOL_SLACK_BYTES: u64 = 1024 * 1024;
 
 fn used_slots(cspace: u32) -> u64
 {
@@ -89,13 +97,19 @@ fn main() -> ExitCode
     let baseline_free = std::os::seraph::memmgr_pool_free_bytes();
     log!("baseline slots {baseline} free {baseline_free:?}");
 
-    // High-count join churn. Each join reclaims thread_slab — returned to
-    // memmgr's pool mid-life (#274) — plus thread_cap and done_notification; the
-    // demand-stack VA (and its page tables) is reused. Runs past the pre-#274
-    // pool ceiling, so a per-spawn slab leak would exhaust the pool here.
+    // Join churn. Each join reclaims thread_slab — returned to memmgr's pool
+    // mid-life (#274) — plus thread_cap and done_notification; the demand-stack
+    // VA (and its page tables) is reused. A per-spawn slab leak would surface as
+    // a free-pool drop past POOL_SLACK_BYTES in the assertion below. The
+    // periodic heartbeat keeps a HANG distinguishable from slow progress in the
+    // run-parallel log.
     for i in 0..JOIN_CHURN
     {
         spawn_join(i);
+        if i % 25 == 24
+        {
+            log!("join-churn progress {}/{JOIN_CHURN}", i + 1);
+        }
     }
     let after_a = used_slots(cspace);
     log!("after join-churn slots {after_a}");

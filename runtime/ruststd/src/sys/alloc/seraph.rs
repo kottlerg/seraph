@@ -691,7 +691,7 @@ fn slab_acquire_fresh(need: u64, want_pages: u64) -> Option<SlabGrant> {
 
 /// Return a fresh slab's backing run to memmgr's pool, naming it by the `phys`
 /// base recorded in its [`SlabGrant`]. Best-effort: a failed IPC just leaves
-/// the run accounted to this process until it dies (the prior behaviour).
+/// the run accounted to this process until it dies.
 ///
 /// The caller MUST have already deleted every kernel object retyped from the
 /// slab; releasing while a retype is live is correctness-safe (the kernel

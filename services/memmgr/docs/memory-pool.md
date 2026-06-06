@@ -76,11 +76,17 @@ constraint.
    `OutOfMemory{contiguous}`. memmgr does not migrate live pages to
    produce a contiguous run; coalescing is the only mechanism that
    restores contiguity.
-2. **Best-effort.** Walk buckets to satisfy the request from one or
-   more runs. Prefer larger runs first to minimise the returned-cap
-   count. Bound the returned-cap count by the IPC reply-side cap-slot
-   limit; if the pool cannot satisfy `want_pages` within that bound,
-   return `OutOfMemory{best_effort}`.
+2. **Best-effort.** First try a single best-fit run — the smallest run
+   that covers `want_pages` whole. One run is the fewest possible caps,
+   and best-fit reuses a freed run of the requested size instead of
+   re-splitting a larger one, so a workload that repeatedly frees and
+   re-requests a fixed size (e.g. ruststd's per-thread Thread-retype slab)
+   cycles the same run — and the same tracking anchor — rather than minting
+   a fresh anchor each request. Only when no single run is large enough,
+   fall back to satisfying the request greedily from multiple runs, largest
+   first. Bound the returned-cap count by the IPC reply-side cap-slot limit;
+   if the pool cannot satisfy `want_pages` within that bound, return
+   `OutOfMemory{best_effort}`.
 
 Each Memory cap returned to the caller is a derive-twice copy: memmgr
 retains an intermediary in its own CSpace and hands the second derivation
@@ -173,22 +179,22 @@ longer holds one — so it names each region by the `phys_base` memmgr reported
 at grant. memmgr matches that base against the entry's frame list
 (`FRAME_VA_UNMAPPED` grants only; demand-mapped chunks are reclaimed by
 `UNREGISTER_REGION`), inserts the retained intermediary cap back into the pool,
-and frees the node, leaving the entry's other records untouched. Unmatched
-bases are ignored, so release is idempotent (a racing join-plus-reaper
-double-release is harmless). The caller must have deleted every object retyped
-from the region first; releasing a still-retyped region is correctness-safe
-(the kernel refuses to re-hand-out live bytes) but the run is only re-grantable
-whole — its retype bump pointer blocks `memory_split` — until the retype is
-freed.
+frees the node, and coalesces the freed runs with their physical neighbours,
+leaving the entry's other records untouched. Unmatched bases are ignored, so
+release is idempotent (a racing join-plus-reaper double-release is harmless).
+The caller must have deleted every object retyped from the region first;
+releasing a still-retyped region is correctness-safe (the kernel refuses to
+re-hand-out live bytes) but the run is only re-grantable whole — its retype
+bump pointer blocks `memory_split` — until the retype is freed.
 
 `UNREGISTER_REGION` from a live process is the mid-life counterpart for a
 demand-paged region: memmgr removes the region node, and for each frame it
 backed inside that region **actively unmaps** the page from the delegated
 child `AddressSpace` (the process is still alive, so the mapping must be
 removed before the frame returns to the pool), inserts the cap back into the
-pool, and frees the node. Frames the caller mapped itself are left untouched.
-This is the reclamation path the ruststd guarded-stack consumer uses on
-`join()`.
+pool, frees the node, and coalesces the freed runs with their physical
+neighbours. Frames the caller mapped itself are left untouched. This is the
+reclamation path the ruststd guarded-stack consumer uses on `join()`.
 
 ---
 
@@ -205,15 +211,23 @@ cap. Eligibility:
   the original boot-time ingest guarantees for caps derived from the
   same `BootInfo` Memory cap.
 
-Coalescing runs explicitly after every `PROCESS_DIED` reclamation. The
-mid-life paths (`RELEASE_MEMORY_CAPS`, `UNREGISTER_REGION`) reinsert through a
-coalesce-on-demand push that folds runs only when the free-pool array is full,
-so steady-state churn pays no per-release coalescing cost. A "dirty" released
-run — one whose source `MemoryObject` kept its retype bump pointer advanced —
-declines `memory_merge` (the kernel requires a virgin tail) and stays a
-discrete, re-grantable-whole run. Coalescing is bounded: a single reclamation
-that frees `K` pages can produce at most `K` coalesce operations, each
-O(log pool_size) to update bucket indices.
+Coalescing runs explicitly after every reclamation — `PROCESS_DIED`,
+`RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` alike — so a freed run rejoins
+its physical neighbours immediately rather than parking discrete until the
+free-pool array fills. Together with best-fit best-effort selection (above),
+this bounds the pool's run count under long spawn/free/die churn, and with it
+the per-run tracking anchor memmgr holds in its own CSpace: best-fit keeps a
+fixed-size churn cycling one run, and the explicit merge keeps residual
+fragmentation from drifting the run (and anchor) count up over time. Left
+un-coalesced, reclaimed runs park discrete and their anchors persist, slowly
+consuming memmgr's CSpace even while its RAM footprint stays bounded. The
+per-insert push still folds opportunistically when the array is full; the
+explicit pass is what holds the steady state under churn that never fills it. A
+"dirty" released run — one whose source `MemoryObject` kept its retype bump
+pointer advanced — declines `memory_merge` (the kernel requires a virgin tail)
+and stays a discrete, re-grantable-whole run. Coalescing cost scales with the
+live run count, which best-fit and this pass jointly keep small, so the
+per-reclamation merge is negligible.
 
 Coalescing across boot-time ingest boundaries (between two distinct
 `BootInfo` Memory caps) is not attempted — those caps have no common

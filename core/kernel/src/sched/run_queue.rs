@@ -48,30 +48,43 @@ impl RunQueue
     /// A non-`None` `tcb.run_queue_next` on entry or `tail == Some(tcb)`
     /// indicates the caller is attempting a double-enqueue of a thread
     /// that is already linked — the intrusive list would become a
-    /// self-cycle (`tail.next = Some(tail)`). The two debug-only
-    /// `debug_assert!`s below are tripwires for issue #117 family races;
-    /// the original site reproduced as `head=tail=tcb` (single-element
-    /// queue, second enqueue from a duplicate wake source).
-    /// `#[track_caller]` propagates the panic location to the kernel's
-    /// panic handler (`core/kernel/src/main.rs:1186-1198`), so the panic
-    /// banner names the call site (e.g. `sched/mod.rs:1607` for
-    /// `enqueue_and_wake`).
+    /// self-cycle (`tail.next = Some(tail)`). The debug-only tripwire
+    /// below catches issue #117/#244 family races; the original site
+    /// reproduced as `head=tail=tcb` (single-element queue, second enqueue
+    /// from a duplicate wake source). It reports the prior link's breadcrumb
+    /// (recorded by [`PerCpuScheduler::enqueue`]) so the racing call site is
+    /// named alongside the current one. `#[track_caller]` propagates the
+    /// panic location to the kernel's panic handler
+    /// (`core/kernel/src/main.rs:1186-1198`), so the panic banner names the
+    /// current call site (e.g. `sched/mod.rs:1806` for `enqueue_and_wake`).
     #[track_caller]
     fn enqueue(&mut self, tcb: *mut ThreadControlBlock)
     {
-        // SAFETY: tcb is a valid heap-allocated TCB pointer; caller holds
-        // the owning scheduler.lock so run_queue_next/thread_id are stable.
-        // Both reads are debug-only inputs to the assertions below.
-        let (already_linked, tid) = unsafe { ((*tcb).run_queue_next.is_some(), (*tcb).thread_id) };
-        debug_assert!(
-            !already_linked,
-            "run_queue::enqueue: tcb {tcb:p} tid={tid} already linked (run_queue_next != None) — double-enqueue",
-        );
-        debug_assert!(
-            self.tail != Some(tcb),
-            "run_queue::enqueue: tcb {tcb:p} tid={tid} is already this queue's tail (head={:?}) — double-enqueue or stale tail",
-            self.head,
-        );
+        // Double-enqueue tripwire (issue #244). Gated on `debug_assertions`
+        // rather than `debug_assert!` so it can read the debug-only
+        // `last_enqueue` breadcrumb field, which is absent in release.
+        #[cfg(debug_assertions)]
+        // SAFETY: tcb is a valid heap-allocated TCB pointer; the caller holds
+        // the owning scheduler.lock so these fields are stable.
+        unsafe {
+            let tid = (*tcb).thread_id;
+            let prior = (*tcb).last_enqueue;
+            let cur_ipc = (*tcb).ipc_state;
+            let cur_pref = (*tcb).preferred_cpu;
+            assert!(
+                (*tcb).run_queue_next.is_none(),
+                "run_queue::enqueue: tcb {tcb:p} tid={tid} already linked \
+                 (run_queue_next != None) — double-enqueue; \
+                 prior={prior:?}; now ipc={cur_ipc:?} pref={cur_pref}",
+            );
+            assert!(
+                self.tail != Some(tcb),
+                "run_queue::enqueue: tcb {tcb:p} tid={tid} is already this \
+                 queue's tail (head={head:?}) — double-enqueue or stale tail; \
+                 prior={prior:?}; now ipc={cur_ipc:?} pref={cur_pref}",
+                head = self.head,
+            );
+        }
         // SAFETY: tcb is a valid heap-allocated TCB pointer.
         unsafe { (*tcb).run_queue_next = None };
 
@@ -109,6 +122,17 @@ impl RunQueue
     fn is_empty(&self) -> bool
     {
         self.head.is_none()
+    }
+
+    /// True iff `tcb` is this queue's tail. Used only by the release-safe
+    /// double-link guard in [`PerCpuScheduler::enqueue`]; in debug builds the
+    /// `RunQueue::enqueue` tripwire checks `self.tail` directly, so this
+    /// accessor is release-only. Reads only this queue's own `tail`, so it is
+    /// sound under the owning scheduler.lock.
+    #[cfg(not(debug_assertions))]
+    fn is_tail(&self, tcb: *mut ThreadControlBlock) -> bool
+    {
+        self.tail == Some(tcb)
     }
 
     /// Find the first TCB in this queue satisfying `pred`. Returns the TCB
@@ -257,7 +281,13 @@ impl PerCpuScheduler
 
     /// Enqueue `tcb` at the given `priority` level.
     ///
-    /// Sets bit `priority` in `non_empty` and increments load counter.
+    /// Sets bit `priority` in `non_empty` and increments the load counter.
+    ///
+    /// Enforces the "Ready ⇒ linked on exactly one queue" invariant at this
+    /// chokepoint (issue #244): a `tcb` already linked on a run queue is a
+    /// double-link that would self-cycle the intrusive list. Debug builds panic
+    /// (the `RunQueue::enqueue` tripwire); release builds skip the redundant
+    /// link. See the guard below.
     #[track_caller]
     pub fn enqueue(&mut self, tcb: *mut ThreadControlBlock, priority: u8)
     {
@@ -276,8 +306,46 @@ impl PerCpuScheduler
             p < NUM_PRIORITY_LEVELS,
             "priority {p} out of range [0, {NUM_PRIORITY_LEVELS})"
         );
+
+        // Release-safe double-link guard (issue #244). A non-`None`
+        // `run_queue_next`, or `tcb` already being this priority queue's tail,
+        // means `tcb` is already linked on a run queue; re-linking it would
+        // self-cycle the intrusive list (`tail.next = Some(tail)`) and corrupt
+        // it. This is the exact condition the `RunQueue::enqueue` tripwire
+        // asserts on, read under the same owning scheduler.lock — so it
+        // identifies only genuine double-links. In debug the tripwire still
+        // panics below (naming the racing pair via the `last_enqueue`
+        // breadcrumb); in release, skip the link so the "Ready ⇒ linked on
+        // exactly one queue" invariant holds by construction instead of
+        // corrupting. The skip is lossless: `tcb` is already Ready and linked,
+        // so it is dispatched and consumes its wakeup payload from where it is
+        // already queued; no wake is lost. Placed before `increment_load` so a
+        // skipped link leaves the load counter exact.
+        #[cfg(not(debug_assertions))]
+        // SAFETY: tcb is valid; the caller holds this scheduler's lock, so
+        // run_queue_next is stable for this read.
+        if unsafe { (*tcb).run_queue_next.is_some() } || self.queues[p].is_tail(tcb)
+        {
+            return;
+        }
+
         self.increment_load();
         self.queues[p].enqueue(tcb);
+        // Record the link breadcrumb (issue #244 diagnosis) under the owning
+        // scheduler.lock, after the inner enqueue so a tripping case still
+        // observes the *prior* breadcrumb. `Location::caller()` resolves
+        // through the `#[track_caller]` chain to the wake/requeue call site.
+        // Stripped in release; skipped in host tests (no per-CPU arch context).
+        #[cfg(all(debug_assertions, not(test)))]
+        // SAFETY: tcb is valid; the caller holds this scheduler's lock.
+        unsafe {
+            (*tcb).last_enqueue = Some(super::thread::EnqueueBreadcrumb {
+                site: core::panic::Location::caller(),
+                cpu: crate::arch::current::cpu::current_cpu(),
+                ipc_state: (*tcb).ipc_state,
+                preferred_cpu: (*tcb).preferred_cpu,
+            });
+        }
         // Release: publishes the queue write and the increment_load store to any
         // CPU that observes this bit via Acquire in `has_runnable`. The idle
         // loop relies on this: it is lockless, so the Acquire load of
@@ -484,8 +552,11 @@ mod tests
 
     /// Allocate a zero-initialized TCB for tests with magic cookie set.
     ///
-    /// SAFETY: only `run_queue_next` and `magic` are accessed by
-    /// RunQueue/PerCpuScheduler; all other TCB fields remain zero/null.
+    /// SAFETY: only `run_queue_next`, `last_enqueue`, `ipc_state`,
+    /// `preferred_cpu`, and `magic` are accessed by RunQueue/PerCpuScheduler;
+    /// all other TCB fields remain zero/null. The debug-only `last_enqueue:
+    /// Option<EnqueueBreadcrumb>` field zeroes to `None` via the null-pointer
+    /// niche of its `&'static Location`, so the tripwire reads a valid `None`.
     fn make_tcb() -> Box<ThreadControlBlock>
     {
         let mut tcb: ThreadControlBlock = unsafe { core::mem::zeroed() };

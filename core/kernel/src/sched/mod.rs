@@ -951,6 +951,8 @@ pub fn init(cpu_count: u32) -> u32
                     cpu_affinity: cpu as u32,
                     preferred_cpu: cpu as u32,
                     run_queue_next: None,
+                    #[cfg(debug_assertions)]
+                    last_enqueue: None,
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),

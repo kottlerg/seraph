@@ -1049,6 +1049,8 @@ unsafe fn kernel_entry_post_rebase(
                         cpu_affinity: sched::AFFINITY_ANY,
                         preferred_cpu: 0,
                         run_queue_next: None,
+                        #[cfg(debug_assertions)]
+                        last_enqueue: None,
                         ipc_state: sched::thread::IpcThreadState::None,
                         ipc_msg: ipc::message::Message::default(),
                         reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
